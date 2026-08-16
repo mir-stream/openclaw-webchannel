@@ -18,6 +18,7 @@ import {
 } from "./conversation-key-store.js";
 import {
   ConversationKeyReadbackError,
+  ConversationKeyTargetDigestMismatchError,
   OfflineConversationKeyRotator,
 } from "./offline-conversation-key-rotation.js";
 import {
@@ -82,6 +83,13 @@ function createRotator(
   });
 }
 
+function rotateReviewedAccount(
+  rotator: OfflineConversationKeyRotator = createRotator(),
+) {
+  const preview = rotator.previewAccountRotation();
+  return rotator.rotateAccountVerified(preview.targetDigest);
+}
+
 function paths() {
   return tupleStoragePaths({ tenant: TENANT, accountId: ACCOUNT, home });
 }
@@ -110,6 +118,16 @@ function seedPeers(count: number): string[] {
     peerIds.push(peerId);
   }
   return peerIds;
+}
+
+function seedNamedPeers(
+  tenant: string,
+  accountId: string,
+  peerIds: readonly string[],
+): OfflineConversationKeyRotator {
+  const store = new ConversationKeyStore({ tenant, accountId, home });
+  for (const peerId of peerIds) store.getOrCreate(peerId);
+  return new OfflineConversationKeyRotator({ tenant, accountId, home });
 }
 
 type WriteCounter = {
@@ -141,7 +159,7 @@ describe("account-wide rotation commit count", () => {
       const counter = writeCounter();
       const rotator = createRotator(counter.seams);
 
-      const summary = rotator.rotateAccountVerified();
+      const summary = rotateReviewedAccount(rotator);
 
       expect(summary.peerCount).toBe(peerCount);
       expect(counter.keyWrites).toBe(1);
@@ -158,7 +176,7 @@ describe("account-wide rotation commit count", () => {
       home = mkdtempSync(join(tmpdir(), "webchannel-account-rotation-"));
       seedPeers(peerCount);
       const counter = writeCounter();
-      createRotator(counter.seams).rotateAccountVerified();
+      rotateReviewedAccount(createRotator(counter.seams));
       counts.push(counter.keyWrites + counter.generationWrites);
     }
     expect(counts[0]).toBe(counts[1]);
@@ -167,7 +185,7 @@ describe("account-wide rotation commit count", () => {
 
   it("leaves no unpublished temp artifacts behind", () => {
     seedPeers(8);
-    createRotator().rotateAccountVerified();
+    rotateReviewedAccount();
     const residue = readdirSync(paths().directory).filter((entry) =>
       entry.includes(".tmp-"),
     );
@@ -180,7 +198,7 @@ describe("account-wide rotation semantics", () => {
     const peerIds = seedPeers(5);
     const before = { ...durableKeys() };
 
-    createRotator().rotateAccountVerified();
+    rotateReviewedAccount();
 
     const after = durableKeys();
     expect(Object.keys(after).sort()).toEqual([...peerIds].sort());
@@ -202,7 +220,7 @@ describe("account-wide rotation semantics", () => {
     ]);
     writeGenerationsDocument(seeded);
 
-    createRotator().rotateAccountVerified();
+    rotateReviewedAccount();
 
     const generations = durableGenerations();
     expect(generations.get(peerIds[0] as string)?.epoch).toBe(8);
@@ -217,7 +235,7 @@ describe("account-wide rotation semantics", () => {
     const peerIds = seedPeers(2);
     const before = createStore().get(peerIds[0] as string);
 
-    createRotator().rotateAccountVerified();
+    rotateReviewedAccount();
 
     const after = createStore().get(peerIds[0] as string);
     expect(after).not.toBeNull();
@@ -231,7 +249,7 @@ describe("account-wide rotation semantics", () => {
 
   it("refuses an account with no stored key instead of creating one", () => {
     const rotator = createRotator();
-    expect(() => rotator.rotateAccountVerified()).toThrow(/no target/);
+    expect(() => rotateReviewedAccount(rotator)).toThrow(/no target/);
     expect(existsSync(paths().conversationKeyPath)).toBe(false);
   });
 
@@ -240,7 +258,7 @@ describe("account-wide rotation semantics", () => {
     const before = { ...durableKeys() };
 
     const rotator = createRotator({ maxKeys: 2 });
-    expect(() => rotator.rotateAccountVerified()).toThrow(
+    expect(() => rotateReviewedAccount(rotator)).toThrow(
       ConversationKeyGenerationCapacityError,
     );
 
@@ -250,7 +268,7 @@ describe("account-wide rotation semantics", () => {
 
   it("returns no key material to the caller", () => {
     seedPeers(2);
-    const summary = createRotator().rotateAccountVerified() as Record<
+    const summary = rotateReviewedAccount() as Record<
       string,
       unknown
     >;
@@ -259,6 +277,40 @@ describe("account-wide rotation semantics", () => {
       "rotatedAtSec",
       "targetDigest",
     ]);
+  });
+});
+
+describe("tuple-bound account review digest", () => {
+  it("changes when either validated tuple component changes", () => {
+    const peers = ["peer-a", "peer-b"];
+    const original = seedNamedPeers(TENANT, ACCOUNT, peers)
+      .previewAccountRotation().targetDigest;
+    const otherTenant = seedNamedPeers("tenant-B", ACCOUNT, peers)
+      .previewAccountRotation().targetDigest;
+    const otherAccount = seedNamedPeers(TENANT, "acct-b", peers)
+      .previewAccountRotation().targetDigest;
+
+    expect(new Set([original, otherTenant, otherAccount]).size).toBe(3);
+  });
+
+  it("rechecks the reviewed digest against a fresh snapshot before writes", () => {
+    seedPeers(2);
+    const rotator = createRotator();
+    const reviewed = rotator.previewAccountRotation().targetDigest;
+    createStore().getOrCreate("peer-late");
+    const keysBefore = readFileSync(paths().conversationKeyPath, "utf8");
+    const generationsBefore = readFileSync(
+      paths().conversationKeyGenerationsPath,
+      "utf8",
+    );
+
+    expect(() => rotator.rotateAccountVerified(reviewed)).toThrow(
+      ConversationKeyTargetDigestMismatchError,
+    );
+    expect(readFileSync(paths().conversationKeyPath, "utf8")).toBe(keysBefore);
+    expect(readFileSync(paths().conversationKeyGenerationsPath, "utf8")).toBe(
+      generationsBefore,
+    );
   });
 });
 
@@ -272,7 +324,7 @@ describe("readback verification", () => {
         unlinkSync(paths().conversationKeyGenerationsPath);
       },
     });
-    expect(() => rotator.rotateAccountVerified()).toThrow(
+    expect(() => rotateReviewedAccount(rotator)).toThrow(
       ConversationKeyReadbackError,
     );
   });
@@ -292,7 +344,7 @@ describe("readback verification", () => {
         );
       },
     });
-    expect(() => rotator.rotateAccountVerified()).toThrow(
+    expect(() => rotateReviewedAccount(rotator)).toThrow(
       /generation label did not match/,
     );
   });
@@ -423,7 +475,7 @@ describe("previews", () => {
     expect(createRotator().previewAccountRotation().targetDigest).toBe(first);
 
     // Rotation replaces key MATERIAL, not membership: the digest must survive.
-    createRotator().rotateAccountVerified();
+    rotateReviewedAccount();
     expect(createRotator().previewAccountRotation().targetDigest).toBe(first);
 
     createStore().getOrCreate("peer-9999");
@@ -433,7 +485,7 @@ describe("previews", () => {
   it("matches the digest an account-wide rotation reports", () => {
     seedPeers(3);
     const preview = createRotator().previewAccountRotation();
-    const summary = createRotator().rotateAccountVerified();
+    const summary = rotateReviewedAccount();
     expect(summary.targetDigest).toBe(preview.targetDigest);
   });
 });

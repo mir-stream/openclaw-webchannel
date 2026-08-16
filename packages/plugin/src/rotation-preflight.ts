@@ -16,13 +16,15 @@
  *
  * What the two checks here do catch is narrow and worth stating exactly:
  *
- *   1. CONCURRENT ROTATION. The lock is a real mutual exclusion between
- *      invocations of this command. Two operators rotating the same tuple at
- *      once would otherwise lose one of the two K sets with no error.
- *   2. A WRITER CAUGHT MID-WRITE. `atomicWritePrivateFile` cleans its temp file
- *      up in a `finally`, so a leftover `*.tmp-<pid>-<hex>` whose pid is alive
- *      means some process is inside a write to this tuple right now. This is a
- *      genuine signal and a very small window; its absence proves nothing.
+ *   1. CONCURRENT OR UNRESOLVED ROTATION. Any existing lock is a hard refusal.
+ *      The tuple may be on shared storage, where its recorded pid belongs to a
+ *      different host/pod and is meaningless to this process. This command
+ *      never steals or archives the lock automatically.
+ *   2. A POSSIBLE WRITER ARTIFACT. `atomicWritePrivateFile` normally cleans its
+ *      `*.tmp-<pid>-<hex>` file in a `finally`, but on shared storage a pid that
+ *      is not observable locally can still be live remotely. Every matching
+ *      artifact is therefore reported. Only the operator's explicit
+ *      `--ignore-live-writers` override may bypass that conservative signal.
  *
  * Neither check is evidence about replica count. Do not add a third check and
  * let the total start reading as proof.
@@ -32,7 +34,7 @@ import { randomBytes } from "node:crypto";
 import { readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
-import { archiveFileNoReplace, atomicWritePrivateFile } from "./private-file.js";
+import { atomicWritePrivateFile } from "./private-file.js";
 
 /** Owner-only lock file, created inside the tuple's own storage directory. */
 export const ROTATION_LOCK_FILE_NAME = "conversation-key-rotation.lock";
@@ -50,7 +52,7 @@ type RotationLockFile = {
   token: string;
 };
 
-/** A preflight check refused the operation. Never thrown after a commit. */
+/** A lock/probe operation refused or failed. Callers track commit state. */
 export class RotationPreflightError extends Error {
   readonly findings: readonly string[];
 
@@ -86,10 +88,20 @@ export function probeLiveTupleWriters(directory: string): string[] {
     const match = TEMP_ARTIFACT_PATTERN.exec(entry);
     if (!match) continue;
     const pid = Number(match[1]);
-    if (!processIsAlive(pid)) continue;
+    if (!Number.isSafeInteger(pid) || pid <= 0) {
+      findings.push(
+        "an atomic-write temp artifact has an invalid recorded pid and may " +
+          "belong to a remote or interrupted writer",
+      );
+      continue;
+    }
     findings.push(
-      `an atomic-write temp file owned by live pid ${pid} is present in the ` +
-        `tuple directory (a process is writing this account's state now)`,
+      processIsAlive(pid)
+        ? `an atomic-write temp artifact has locally live pid ${pid}; a ` +
+          `process may be writing this tuple now`
+        : `an atomic-write temp artifact records pid ${pid}, which is not ` +
+          `observable locally but may be live on another host/pod or may be ` +
+          `stale`,
     );
   }
   return findings;
@@ -98,9 +110,9 @@ export function probeLiveTupleWriters(directory: string): string[] {
 /**
  * Take the tuple's rotation lock, or refuse.
  *
- * A lock whose owner is still alive is a hard refusal: it is another rotation,
- * and there is no safe way to interleave two of them. A lock whose owner is
- * gone is archived and retaken, so a crashed rotation does not wedge the tuple.
+ * Every existing lock is a hard refusal. The tuple can live on shared storage,
+ * so a recorded pid that is absent locally may still own the lock on another
+ * host/pod. The command never archives, deletes, or takes over an existing lock.
  */
 export function acquireRotationLock(directory: string): RotationLock {
   const path = join(directory, ROTATION_LOCK_FILE_NAME);
@@ -111,58 +123,45 @@ export function acquireRotationLock(directory: string): RotationLock {
     token,
   } satisfies RotationLockFile);
 
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    try {
-      atomicWritePrivateFile(path, serialized, {
-        replace: false,
-        enforceDirectoryMode: true,
-      });
-      return Object.freeze({ path, token });
-    } catch (error) {
-      if (!isEexist(error)) {
-        throw new RotationPreflightError(
-          `webchannel: could not take the rotation lock at ${path}`,
-        );
-      }
-    }
-
-    const owner = readRotationLock(path);
-    if (owner === null) {
-      // Unreadable lock content is not authority to steal the lock. Refuse and
-      // let the operator look at the file.
+  try {
+    atomicWritePrivateFile(path, serialized, {
+      replace: false,
+      enforceDirectoryMode: true,
+    });
+    return Object.freeze({ path, token });
+  } catch (error) {
+    if (!isEexist(error)) {
       throw new RotationPreflightError(
-        `webchannel: the rotation lock at ${path} is unreadable; ` +
-          `inspect it manually before rotating`,
-      );
-    }
-    if (processIsAlive(owner.ownerPid)) {
-      throw new RotationPreflightError(
-        `webchannel: another rotation is in progress (lock owner pid ` +
-          `${owner.ownerPid} is alive); wait for it to finish`,
-      );
-    }
-    try {
-      archiveFileNoReplace(
-        path,
-        `${path}.stale-${owner.ownerPid}-${randomBytes(8).toString("hex")}`,
-      );
-    } catch (error) {
-      if (isEnoent(error)) continue;
-      throw new RotationPreflightError(
-        `webchannel: could not clear a stale rotation lock at ${path}`,
+        `webchannel: could not take the rotation lock at ${path}`,
       );
     }
   }
+
+  const owner = readRotationLock(path);
+  if (owner === null) {
+    throw new RotationPreflightError(
+      `webchannel: the rotation lock at ${path} already exists and is ` +
+        `unreadable; leave it untouched, keep every replica stopped, and ` +
+        `inspect or escalate before rotating`,
+    );
+  }
+  const ownerState = processIsAlive(owner.ownerPid)
+    ? `owner pid ${owner.ownerPid} is alive on this host`
+    : `owner pid ${owner.ownerPid} is not observable locally and may be live ` +
+      `on another host/pod or may be stale`;
   throw new RotationPreflightError(
-    `webchannel: could not take the rotation lock at ${path}`,
+    `webchannel: the rotation lock at ${path} already exists (${ownerState}); ` +
+      `leave it untouched, keep every replica stopped, and inspect or ` +
+      `escalate before rotating`,
   );
 }
 
 /**
  * Release a lock this process owns.
  *
- * Releasing runs in a `finally`, i.e. also on the failure path, so it must not
- * mask the original error: it reports a mismatch and otherwise stays quiet.
+ * The CLI invokes this explicit cleanup after both successful and failed
+ * mutation attempts. A release error is surfaced so the caller can preserve
+ * the primary apply outcome and report the additional cleanup failure.
  */
 export function releaseRotationLock(lock: RotationLock): void {
   const owner = readRotationLock(lock.path);

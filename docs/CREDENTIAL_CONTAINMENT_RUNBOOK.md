@@ -3,8 +3,8 @@
 **You are here because a browser credential, an agent credential, or a
 conversation key K may have leaked.** This document is the operator procedure.
 Follow it top to bottom: the deployment-class question comes first because the
-correct order of operations differs by class, and doing step ② before step ①
-re-opens the hole you are closing.
+correct order of operations differs by class and scope. K containment is
+stop-first; an exact credential-only revocation can happen live.
 
 Related: [`AUTH.md`](AUTH.md) (register hop, agent identity-key lifecycle,
 offline re-key), [`ISSUE_72_CONTAINMENT_PLAN.md`](ISSUE_72_CONTAINMENT_PLAN.md)
@@ -53,10 +53,11 @@ because the thing it names does not exist. The correction:
 [`packages/plugin/README.md`](../packages/plugin/README.md) forbids moving or
 deleting the plugin's state files as normal operations, because doing so breaks
 encrypted-history continuity and can strand live devices. **This runbook is the
-exception that rule anticipates.** During a confirmed containment you will move
-`credentials.json` aside (step ④-bis, per `AUTH.md`) and you will replace K in
-`conversation-keys.json` (step ④). Both are done through the documented paths
-below, with the gateway stopped. Outside an incident, the README rule stands:
+exception that rule anticipates.** During a confirmed containment you may move
+`credentials.json` aside when the current agent credential was revoked (step
+④-bis, per `AUTH.md`), and you replace K in `conversation-keys.json` only when K
+is in scope (step ④). Both mutations use the documented paths below with the
+gateway stopped. Outside an incident, the README rule stands:
 do not hand-edit or delete these files, and in particular **never delete
 `conversation-keys.json` to "rotate" K** — that destroys every peer's key at
 once and is exactly the destructive, unauditable action step ④ exists to
@@ -78,7 +79,7 @@ Answer this first. The rest of the document branches on it.
 | | How to tell | Go to |
 |---|---|---|
 | **A — Managed NATS** | Your trust chain was built with `externalNatsAccount` (Synadia Cloud / NGS). `natsConfig.mode === "external"`; there is no operator JWT, no account JWT and no resolver config in your persisted chain. | [§3](#3-class-a--managed-nats) |
-| **B — Self-contained, revocation available** | You run your own `nats-server` from this repo's generated config, **and** you hold the operator seed (`private.operatorSeed`, `SO…`) **and** you can fetch the currently accepted exact account JWT, apply its replacement, and verify acceptance. For a full/Dir resolver, the generated system-account `.creds` must allow this account's exact `CLAIMS.LOOKUP`; for MEMORY, you need write access to the live `resolver_preload` source. | [§4](#4-class-b--self-contained-stop-first-containment) |
+| **B — Self-contained, revocation available** | You run your own `nats-server` from this repo's generated config, **and** you hold the operator seed (`private.operatorSeed`, `SO…`) **and** you can fetch the currently accepted exact account JWT, apply its replacement, and verify acceptance. For a full/Dir resolver, the generated system-account `.creds` must allow this account's exact `CLAIMS.LOOKUP`; for MEMORY, you need write access to the live `resolver_preload` source. | [§4](#4-class-b--self-contained-containment-routes) |
 | **C — No working revocation channel** | Self-contained but you cannot fetch, apply, and verify a replacement account JWT right now (missing/old system credential without exact lookup, resolver unreachable/unhealthy, config not writable), or managed but you cannot reach the provider's revocation control in time. | [§5](#5-class-c--degraded-containment) |
 | **D — `static` / bring-your-own NATS** | You configured the plugin with NATS credentials it did not mint (`nats.credentials.mode: "static"`, `credsFile`, `WEBCHANNEL_NATS_CREDS`, …). | **This is not a running state.** Static/BYO **serving** was removed in P0-2: any static credential signal is rejected at account resolution with a targeted error, so such a deployment does not start. If you are here anyway, you are in class A or C — this package cannot revoke a credential it did not mint, so revocation belongs to whoever operates that NATS, and K rotation (§4 ①, ④–⑥) still applies unchanged. Return of the mode is tracked as P0-3 (see `packages/plugin/README.md`, "Bring-your-own NATS"). |
 
@@ -109,60 +110,86 @@ Answer this first. The rest of the document branches on it.
 These are two independent controls, and conflating them either leaves a hole or
 causes an unnecessary outage.
 
-| What leaked | Revoke credential (§4 ②–③) | Rotate K (§4 ④) |
-|---|---|---|
-| A browser's NATS credential only | **yes** | no |
-| The agent's NATS credential only | **yes** (plus ④-bis) | no |
-| A conversation key K only | no | **yes** |
-| Storage/host compromise, or you cannot bound what was read | **yes** | **yes** |
+| What leaked | Revoke credential (§4 ②–③) | Rotate K (§4 ④) | Fresh browser bootstrap (§4 ⑥) |
+|---|---|---|---|
+| A browser's NATS credential only | **yes** | no | affected browser/device |
+| The agent's NATS credential only | **yes** (plus ④-bis) | no | **every browser in the account** after ④-bis identity-key replacement |
+| A conversation key K only | no | **yes** | every peer whose K changed |
+| Storage/host compromise, or you cannot bound what was read | **yes** | **yes** | every affected browser; **all account browsers** if ④-bis runs |
 
-- **Credential-only containment does not require stopping the gateway.** Revoke,
-  confirm the resolver accepted it, confirm the target's live connection dropped
-  and that non-target connections stayed up. That is the whole procedure
-  (`ISSUE_72_CONTAINMENT_PLAN.md` §2.7).
-- **Anything involving K requires the stop-first order in §4.** The reason is in
-  §4 ① and it is not a formality.
+Choose one executable route:
+
+- **Exact browser credential only:** run ②–③ live, including target disconnect,
+  non-target continuity, and failed old-credential reconnect. Then force only
+  the affected browser through a fresh bootstrap (§4 ⑥). Do not stop the
+  gateway or rotate K.
+- **Current agent credential only, exact agent key or wildcard:** run ②–③ live.
+  Then suspend every replica and confirm zero before moving
+  `credentials.json`; run ④-bis and restart/continue service at ⑤. That offline
+  re-enrollment replaces the active agent identity key as well as the NATS
+  credential, so force **every browser in the account** through ⑥ even for an
+  exact old-agent-key revocation. Do not rotate K.
+- **K only:** skip revocation entirely. Run ① (including the topology check), ④,
+  ⑤, and ⑥ for every peer whose K changed.
+- **Credential + K:** run the combined stop-first sequence: ①; ②–③ for the
+  credential; ④; ④-bis if the current agent credential was targeted, whether by
+  its exact key or by `"*"`; then ⑤–⑥. If ④-bis runs, its identity-key
+  replacement expands ⑥ to every browser in the account.
+
+Credential-only revocation can happen live. Anything involving K requires the
+stop-first order in §4; that requirement is not a formality.
 
 ---
 
 ## 3. Class A — managed NATS
 
-1. Revoke the affected user credential through your provider's own console or
-   API (Synadia Cloud / NGS). This package holds no operator seed for a managed
-   account and cannot revoke on your behalf.
-2. Confirm with the provider's tooling that the credential is refused and that
-   the target's live connection is gone.
-3. If K also leaked, continue at **§4 step ①** — the stop-first order and the
-   rotation command apply unchanged. Steps ② and ③ are replaced by what you
-   just did here.
-4. If your provider-side revocation was account-wide rather than one exact
-   credential, it cut the agent's credential too: **§4 step ④-bis applies**, with
-   your provider's replacement credential in place of a re-mint, and with the
-   provider's own floor in place of `floorSec`.
+1. If a credential is in scope, revoke its exact user key through your
+   provider's console/API (Synadia Cloud / NGS), or use the provider's reviewed
+   broader target when the exact key is unknown. This package has no operator
+   seed for a managed account and cannot revoke on your behalf. For K-only,
+   skip this and the next step.
+2. Confirm with provider tooling that the target's live connection is gone,
+   non-target connections remain, and the old credential cannot reconnect. An
+   exact-browser-credential-only incident then needs only the affected fresh
+   bootstrap in §4 ⑥.
+3. If K is in scope, continue at §4 ①. The stop/topology check and steps ④–⑥
+   apply unchanged; provider revocation replaces ②–③ when credentials are also
+   in scope, while K-only skips ②–③ entirely.
+4. If provider revocation targeted the current agent credential, whether by its
+   exact key or an account-wide target, follow §4 ④-bis before restart or
+   continued service. That documented path performs SaaS active identity-key
+   replacement and re-enrollment, not only a NATS JWT swap, so every browser in
+   the account must then complete §4 ⑥ to pin the new agent identity key. Use the
+   provider's replacement credential and issuance rules; an account-wide floor
+   still requires its replacement `iat` to be strictly above that floor.
 
 ---
 
-## 4. Class B — self-contained, stop-first containment
+## 4. Class B — self-contained containment routes
 
-**If §2 put you in credential-only scope, do not run this whole sequence.** Skip
-① and ④–⑥ entirely: run ② and ③, and stop. A credential-only revocation does not
-stop the gateway and does not touch K; taking the service down for it is an
-outage you did not need. Everything below assumes K is in scope.
-
-The order below is load-bearing. Each step says why, so that a later reader does
-not "optimize" one away.
+Use the route selected in §2; not every incident runs every numbered step.
+Stopping first is load-bearing whenever K is in scope. Credential-only
+revocation itself can happen live, but an agent-credential replacement still
+requires suspending every replica before moving tuple credentials.
 
 ```text
-① stop every process/replica     ← closes the post-floor → K_old window
-② revoke                         ← fixed floorSec, reviewed target
-③ confirm resolver acceptance    ← a candidate JWT is not a revocation
-④ rotate K                       ← offline command, gateway down
-④-bis reissue agent credentials  ← only if you used the "*" wildcard
-⑤ restart
-⑥ force every peer to re-bootstrap
+K only:                 ① stop/topology → ④ rotate K → ⑤ restart → ⑥ bootstrap
+browser credential:     ② revoke → ③ readback/enforcement → ⑥ affected bootstrap
+agent credential:       ② revoke → ③ readback/enforcement → suspend/zero →
+                        ④-bis reissue NATS + identity key → ⑤ restart →
+                        ⑥ ALL account browsers bootstrap
+credential + K:         ① stop/topology → ② revoke → ③ readback → ④ rotate K →
+                        [④-bis if agent targeted] → ⑤ restart → ⑥ bootstrap
 ```
 
+Whenever ④-bis runs, its SaaS active identity-key replacement changes the agent
+key browsers pin. Therefore ⑥ covers every browser in the account for both exact
+agent-key and wildcard routes; this is not merely a NATS JWT swap.
+
 ### ① Stop every process and replica, and confirm an observed zero
+
+Run this step before any K rotation. For agent-credential-only containment, run
+②–③ live first, then return here before moving `credentials.json` in ④-bis.
 
 Suspend auto-restart or set desired replicas to 0 for **every** gateway
 controller and replica serving the affected account, then confirm the observed
@@ -177,8 +204,9 @@ volume: every run generates a different K_new and silently leaves the replicas
 divergent. If the replicas do not share the tuple store, keep them stopped and
 escalate; step ④ has no supported procedure for that topology.
 
-**Why this is first, and why it is a human discipline.** A revocation floor is a
-lower bound in time, not an eviction. If a gateway is alive when you revoke,
+**Why this is first when K is in scope, and why it is a human discipline.** A
+revocation floor is a lower bound in time, not an eviction. If a gateway is alive
+when you revoke during combined containment,
 a credential minted for a *new* public key after the floor is still valid, and
 that new session can complete a register hop and be handed the K you have not
 rotated yet. Rotating afterwards does not fix it: a healthy relay socket does not
@@ -186,14 +214,16 @@ re-register on its own, so you are left with a session holding a valid credentia
 and K_old. An observed zero is what closes that window
 (`ISSUE_72_CONTAINMENT_PLAN.md` §2.7).
 
-**Nothing in this repository can prove for you that you did this.** The rotation
-command in step ④ refuses if it can see another rotation in progress or a
-process caught mid-write, and it will tell you plainly that this is a safety net
-and not a quiescence proof. It cannot see a gateway that is up but idle: the
-plugin holds no lease and no pidfile, and this is a library — it does not know
-what supervisor you run it under. The original #158 design required the
-controller to attest a zero replica count; that was dropped on 2026-08-16 for
-exactly this reason, and the obligation moved here, to you.
+**Nothing in this repository can prove for you that you did this.** Every apply
+invocation in step ④ refuses a pre-existing rotation lock. By default, both dry
+run and apply refuse every matching atomic-write temp artifact. On a shared
+store, a pid recorded by another host/pod is not meaningful locally, so the
+command never declares such an artifact stale or removes it automatically.
+These are conservative safety signals, not cross-host liveness or quiescence
+proof. The command still cannot see a gateway that is up but idle: the plugin
+holds no lease and no pidfile, and this library does not know what supervisor
+you run it under. The original #158 controller attestation was dropped on
+2026-08-16; the observed-zero obligation belongs to the operator.
 
 **If you rotate while a replica is alive**, that replica keeps serving the K it
 already holds in memory to already-connected browsers, while the command commits
@@ -205,10 +235,12 @@ reports the split. If you cannot bring the count to zero, **stop and escalate**
 
 Decide the target first:
 
-- **Exact key.** If you know the leaked browser's `userPubkey` (`U…`), revoke
-  that key. Blast radius: one credential. Take it from the minting path
+- **Exact key.** If you know the leaked browser's or current agent's
+  `userPubkey` (`U…`), revoke that key. Blast radius: that user key. Identify it
+  from the minting path
   (`MintedNatsUserCreds.userPubkey` / `NatsUserCredentials.userPubkey` /
-  `BrowserCredentials.userPubkey`).
+  `BrowserCredentials.userPubkey`). If it is the current agent key, ④-bis is
+  required before continued service.
 - **Wildcard `"*"`.** If you do not know it, `"*"` revokes **every user
   credential of the account** — including **the agent's own**, because browser
   and agent credentials are minted from the same `accountSeed`
@@ -256,13 +288,30 @@ const currentClaim = decode(currentAccountJwt);
 if (currentClaim.sub !== chain.natsConfig.accountPublicKey) {
   throw new Error("resolver returned a different account claim");
 }
+if (!Number.isSafeInteger(currentClaim.iat) || currentClaim.iat <= 0) {
+  throw new Error("accepted account claim has no valid iat");
+}
 const floorSec = Math.floor(Date.now() / 1000);   // UNIX SECONDS. See §6.1.
+
+// Account-claim updates also need strictly increasing iat ordering. Keep the
+// floor above fixed, but do not sign until a new claim can be newer than the
+// resolver's currently accepted claim.
+while (Math.floor(Date.now() / 1000) <= currentClaim.iat) {
+  await new Promise((resolve) => setTimeout(resolve, 250));
+}
 const updatedAccountJwt = await addRevocation(
   currentAccountJwt,             // resolver/preload's CURRENT accepted JWT
   chain.private.operatorSeed,    // 'SO…' — the operator seed, NOT the account seed 'SA…'
   userPubkey,                    // 'U…' exact key, or '*'
   floorSec,
 );
+const updatedClaim = decode(updatedAccountJwt);
+if (
+  !Number.isSafeInteger(updatedClaim.iat) ||
+  updatedClaim.iat <= currentClaim.iat
+) {
+  throw new Error("candidate account claim is not newer than accepted claim");
+}
 writeFileSync("./updated-account.jwt", updatedAccountJwt, { mode: 0o600 });
 ```
 
@@ -276,10 +325,18 @@ Notes that will bite you otherwise:
   an existing floor. That preservation applies only to floors present in
   `currentAccountJwt`, which is why the accepted-claim fetch above is mandatory
   on every incident.
+- A resolver accepts account-claim updates by claim ordering. The candidate
+  account JWT's `iat` must be **strictly greater** than the currently accepted
+  account JWT's `iat`; the wait and decoded assertion above enforce that while
+  keeping `floorSec` fixed. For sequential revocations, repeat the exact-current
+  lookup, wait, and candidate-`iat` assertion every time, using the last accepted
+  JWT as the next input.
 - NATS applies the floor **inclusively** — a credential is refused when
   `floorSec >= credential.iat`. Any replacement credential must therefore have
   an `iat` **strictly greater** than `floorSec`. If it lands in the same second,
-  wait for the next second and re-mint (see ④-bis).
+  wait for the next second and re-mint (see ④-bis). This is the replacement
+  **user credential** rule; it is distinct from the account-claim ordering rule
+  in the previous bullet.
 - `addRevocation` returns a **candidate**. Nothing has been revoked yet.
 
 ### ③ Apply the candidate and confirm the resolver accepted it
@@ -325,6 +382,12 @@ accepted value as the input to any immediately following revocation; do not
 start again from `chain.natsConfig.accountJwt`. Remove the temporary JWT and
 `.creds` files when the incident procedure is complete.
 
+After that Full/Dir readback, verify enforcement too, in this order:
+
+1. the targeted live connection is gone;
+2. non-target live connections are still up;
+3. a reconnect attempt with the old credential fails.
+
 **MEMORY resolver.** Replace the same authoritative live `resolver_preload`
 source from which you copied `current-account.jwt`, then reload:
 
@@ -348,11 +411,12 @@ disconnect a session that the floor does not catch, that session survives (§6.3
 
 ### ④ Rotate K with the offline command
 
-Only after ① is observed and ③ is confirmed. ClawHub installs the plugin as a
-managed artifact; it does **not** put the package's npm `bin` on your shell PATH,
-and there is no npm package named `openclaw-webchannel-rotate-key`. Resolve the
-installed artifact through OpenClaw's inspection API and run its dedicated entry
-with Node:
+Only after ① is observed. If a credential is also in scope, ③ must be confirmed
+first; for K-only, ②–③ are deliberately skipped. ClawHub installs the plugin as
+a managed artifact; it does **not** put the package's npm `bin` on your shell
+PATH, and there is no npm package named `openclaw-webchannel-rotate-key`.
+Resolve the installed artifact through OpenClaw's inspection API and run its
+dedicated entry with Node:
 
 ```bash
 PLUGIN_ROOT="$(
@@ -387,35 +451,51 @@ The whole account (only when you cannot bound the exposure to specific peers):
 
 ```bash
 node "$PLUGIN_ROOT/dist/rotate-key-entry.js" --tenant <tenant> --account <accountId> --all-peers
-# review the peer count and the target digest it prints, then:
+# review the peer count and tuple+target-set digest it prints, then:
 node "$PLUGIN_ROOT/dist/rotate-key-entry.js" --tenant <tenant> --account <accountId> --all-peers \
   --apply --confirm-digest <digest-from-the-dry-run>
 ```
 
 - The target is always explicit. There is no default and account-wide is never
   implied — you type the tuple by hand.
-- The account-wide dry run prints a peer **count** and a **digest** of the target
-  set, not a list of peer identifiers, and never any key material. `--apply`
-  requires that digest back, so a set that changed since you reviewed it is
-  refused instead of silently re-keyed.
+- The account-wide dry run prints a peer **count** and a digest bound to the
+  exact `(tenant, accountId)` tuple **and** target set, not a list of peer
+  identifiers, and never any key material. `--apply` requires that digest back,
+  so a digest copied from another tuple or a set that changed after review is
+  refused before either document is written.
 - The command verifies its own write by reading both documents back from disk
   in full (all keys and all generation-sidecar entries, including cardinality)
-  before it reports success. If it fails, it fails — it starts nothing and has
-  no fallback path. Re-run after fixing the cause, or escalate.
+  before it reports success. On failure, read the explicit `APPLY OUTCOME`:
+  pre-commit refusal, committed-but-readback-unverified, and
+  committed-and-verified-but-lock-cleanup-failed require different recovery.
+  Never blindly rerun after a possible or known commit; keep replicas stopped,
+  inspect the complete tuple and lock, and escalate as directed.
+- Any existing rotation lock is left untouched and blocks every apply invocation,
+  even when its pid looks dead locally; it may belong to another host/pod. Every
+  matching atomic-write temp artifact also blocks by default. Only
+  `--ignore-live-writers` bypasses the temp-artifact signal after external
+  inspection; it never bypasses a lock and proves no cross-host liveness.
 - `--storage-root` only if your deployment moved the v2 storage root. The dry run
   prints the tuple directory it resolved, which is also how you find
   `<v2_namespace>` for step ④-bis.
 - Read `--help`. It states, in full, what the command does not guarantee.
 
-### ④-bis Reissue the agent's credentials — only if you revoked with `"*"`
+### ④-bis Reissue the agent's credentials — if its exact key or `"*"` was revoked
 
-The wildcard cut the agent's own credential too. Until you replace it, the agent
-cannot authenticate to the relay and the gateway will not come back.
+An exact revocation of the current agent user key and an account-wide wildcard
+both require replacement before the gateway can continue authenticating. An
+exact browser-only revocation does not run this step. This procedure moves the
+tuple's complete `credentials.json`, performs the SaaS active identity-key
+replacement, and re-enrolls; it changes the agent identity key/pin as well as
+the NATS credential. It is not a NATS-JWT-only swap.
 
 Follow **[`AUTH.md` → "Offline re-key after revocation"](AUTH.md#offline-re-key-after-revocation)**;
 the sequence, with the additions this incident requires:
 
-1. Gateway already stopped (step ①).
+1. Confirm every gateway replica is stopped. A K/combined route already did
+   this at ①. For agent-credential-only containment, revocation and enforcement
+   verification happened live at ②–③; suspend/zero the replicas now, before
+   touching the tuple credential file.
 2. Move the exact tuple `credentials.json` aside to an operator-chosen backup
    path. **Move, do not delete or overwrite.** (This is the §0.3 exception.)
 3. Complete the SaaS-side active-key replacement.
@@ -423,11 +503,21 @@ the sequence, with the additions this incident requires:
    the enrollment. **Note:** with an `enrolled` source, `channels add` *skips*
    when the exact tuple's `credentials.json` is still present — that is why step
    2 comes first. No single command guarantees a re-mint.
-5. **Decode the new agent JWT and confirm its `iat` is strictly greater than the
-   `floorSec` you fixed in step ②.** If they are equal, wait for the next second
-   and re-mint. Do not "fix" this by issuing a newer floor.
-6. Confirm the new agent authenticates to the relay **before** you restart the
-   gateway.
+5. Validate the replacement according to the revocation target:
+   - **Wildcard `"*"`:** decode the new agent JWT and confirm its `iat` is
+     strictly greater than the fixed `floorSec`. If they are equal, wait for the
+     next second and re-mint. Do not "fix" this by issuing a newer floor.
+   - **Exact old agent key:** require a newly generated NATS user key and confirm
+     the replacement JWT's `sub` differs from the revoked `U…` key. The old
+     exact-key floor does not bind this new key, so its `iat` need not exceed
+     that exact floor (though any separate wildcard floor in the accepted claim
+     still applies).
+6. In either case, confirm the new agent credential authenticates to the relay
+   **before** restarting or continuing gateway service.
+7. Because the active agent identity key changed, force **every browser in this
+   account** through fresh bootstrap at ⑥ so it receives and pins the new key.
+   This applies to both exact-agent-key and wildcard revocation routes. The NATS
+   replacement-credential `iat` checks in step 5 remain mandatory.
 
 If the agent's credentials come from an operator-supplied source rather than
 enrollment, install the replacement credential you were given, then continue at
@@ -435,19 +525,26 @@ step 5 (`ISSUE_72_CONTAINMENT_PLAN.md` §2.4).
 
 ### ⑤ Restart
 
-Bring the gateway controllers/replicas back only after ④ (and ④-bis, if it
-applied) are complete and verified.
+Bring the gateway controllers/replicas back after every in-scope offline control
+is complete: ④ when K was rotated, and ④-bis when the current agent credential
+was revoked. Exact browser-credential-only containment never stopped them.
 
 ### ⑥ Force every affected browser through a fresh bootstrap
 
 **This is not optional, and it is the step most often skipped.** Neither a
 gateway restart nor a relay disconnect makes a browser register again — a healthy
 relay websocket survives a gateway restart, and a revoked client can end up in a
-terminal state rather than a retrying one. A browser only picks up K_new by
-starting over: fresh app bootstrap → new credential → new register.
+terminal state rather than a retrying one. Starting over — fresh app bootstrap →
+new credential → new register — gives a revoked browser its replacement
+credential, gives a K-rotation target K_new, and after ④-bis replaces the pinned
+agent identity key.
 
 Scope:
 
+- exact browser credential revoked → that browser/device;
+- wildcard revoked → every affected browser in the account;
+- ④-bis ran for an exact or wildcard agent credential → **every browser in the
+  account**, because the SaaS active identity key/pin changed;
 - rotated one peer → every device of that peer;
 - rotated `--all-peers` → every browser of that account.
 
@@ -457,11 +554,12 @@ register. The forced refresh is what makes that happen.
 
 ### Done — what you can now claim
 
-- Credentials issued at or before `floorSec` for the revoked target are refused
-  by the server, and you read that back from the resolver.
-- Conversation envelopes created after the rotation cannot be decrypted with
-  K_old: K_new is fresh random material, so the separation comes from the keys
-  themselves.
+- If a credential was in scope, credentials issued at or before `floorSec` for
+  the revoked target are refused by the server, and you read that back from the
+  resolver and verified enforcement.
+- If K was in scope, conversation envelopes created after rotation cannot be
+  decrypted with K_old: K_new is fresh random material, so the separation comes
+  from the keys themselves.
 - **You cannot claim** anything about material exposed before you started (§0.1),
   and you cannot claim the gateway was quiesced at step ④ — you asserted it, the
   tooling did not prove it.
@@ -476,20 +574,25 @@ actually did for #54. It trades availability for containment, deliberately.
 1. **Disable the affected plugin account** (`enabled: false`) so it is not served.
 2. **Suspend every gateway controller/replica** for that account and confirm the
    observed count is zero and stable.
-3. **If the leaked NATS credential itself must be refused before you can restore
-   a revocation channel**, isolate or stop the relay/account, or block access with
-   provider or network controls. A disabled plugin account does not stop a leaked
-   credential from connecting to a relay that is still up.
-4. **Then** restore the revocation channel — recover the system-account
-   credentials or resolver access — or plan a full trust-chain replacement. Only
-   after that can you run §4 ②–③.
-5. If K also leaked, you may rotate it now only after confirming the supported
-   shared/single-store topology in §4 ①: the stop condition is already satisfied
-   by 2, and step ④ does not need a relay. Keep the account disabled until
-   §4 ②–③ complete.
-6. Keep every affected account disabled until containment is finished. Deleting
-   the old configuration, restarting only some replicas, or waiting for token
-   expiry is **not** revocation.
+3. **If a NATS credential is in scope**, isolate or stop the relay/account, or
+   block access with provider/network controls until revocation is restored. A
+   disabled plugin account does not stop a leaked credential from connecting to
+   a relay that is still up. For K-only, this control is irrelevant.
+4. **If K is in scope**, confirm the supported shared/single-store topology in
+   §4 ① and run ④ while replicas remain at zero. Step ④ needs no relay and K-only
+   does not require restoring a revocation channel.
+5. **Only when a credential is in scope**, restore the exact revocation/readback
+   channel or replace the whole trust chain, then run §4 ②–③. If that revocation
+   targeted the current agent exact key or `"*"`, run ④-bis while replicas are
+   still stopped.
+6. Re-enable/restart only after every control selected in §2 is complete and
+   verified. Then run §4 ⑥ for affected browsers; if ④-bis replaced the active
+   agent identity key, that means **every browser in the account**, whether the
+   agent credential revocation was exact or wildcard. A K-only incident may
+   finish after ④–⑥ even if the otherwise irrelevant revocation channel is
+   still unavailable.
+7. Deleting old configuration, restarting only some replicas, or waiting for
+   token expiry is **not** revocation.
 
 `AgentKeyRegistry` identity-key revocation is **not** NATS credential
 revocation: it tombstones the active identity key so future bootstrap requests
@@ -508,8 +611,18 @@ the value is a finite, positive integer — **it does not check an upper bound**
 (`packages/saas/src/account-revocation.ts`, the `at` validation). A millisecond
 value places the floor somewhere around the year 58,500, so that key — or, with
 `"*"`, **every credential of the account, forever** — is refused permanently, and
-the floor is monotonic so you cannot lower it back. The only recovery is
-regenerating the trust chain.
+the floor is monotonic so you cannot lower it back. Recovery depends on the
+target:
+
+- **Exact `U…` key:** that old user key can never be made usable again, but the
+  account remains usable. Issue/re-enroll a replacement with a **new NATS user
+  key**. If the poisoned key was the current agent, follow ④-bis; its active
+  identity-key replacement also requires every account browser to bootstrap at
+  ⑥.
+- **Wildcard `"*"`:** the account-wide floor cannot be lowered and applies to
+  every user key whose credential `iat` is below that future value. Recover
+  through a controlled account/trust-chain replacement; simply minting another
+  user key under the same poisoned account does not undo the wildcard floor.
 
 Compute it as `Math.floor(Date.now() / 1000)` and check the magnitude before you
 publish.
@@ -518,6 +631,10 @@ publish.
 
 Browser and agent credentials come from the same `accountSeed`. The wildcard is
 an account-wide kill switch, not a browser-only one. Plan ④-bis before you use it.
+An exact revocation of the current agent `U…` key also requires ④-bis, but its
+replacement must use a new user key and is not bound by the old key's floor.
+Because ④-bis replaces the active agent identity key too, both routes require
+every browser in the account to complete fresh bootstrap at ⑥.
 
 ### 6.3 `--signal reload` is not a restart
 

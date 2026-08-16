@@ -14,10 +14,11 @@
  * WHAT THIS COMMAND DOES NOT GUARANTEE. It cannot prove that no gateway is
  * running. This is a library; it does not know what the deployer runs it under,
  * so the controller-attestation design in #158's original body was dropped
- * (decision of 2026-08-16). `rotation-preflight.ts` catches a concurrent
- * rotation and a writer caught mid-write, and that is all it catches — an idle
- * but running gateway is invisible to it. Bringing observed replicas to zero
- * first is an operator obligation, imposed by step ① of
+ * (decision of 2026-08-16). `rotation-preflight.ts` refuses any existing lock
+ * and, by default, any atomic-write temp artifact, including artifacts whose
+ * pid could belong to another host/pod. That is all it catches — an idle but
+ * running gateway is invisible to it. Bringing observed replicas to zero first
+ * is an operator obligation, imposed by step ① of
  * `docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md`. Violating it does not fail loudly:
  * the old process keeps serving a cached K_old to live devices while this
  * command commits K_new, and the two disagree until the old process dies.
@@ -31,6 +32,8 @@
 
 import {
   type AccountRotationSummary,
+  ConversationKeyReadbackError,
+  ConversationKeyTargetDigestMismatchError,
   type PeerRotationSummary,
   OfflineConversationKeyRotator,
 } from "./offline-conversation-key-rotation.js";
@@ -38,6 +41,7 @@ import {
   acquireRotationLock,
   probeLiveTupleWriters,
   releaseRotationLock,
+  RotationPreflightError,
 } from "./rotation-preflight.js";
 import { tupleStoragePaths } from "./storage-paths.js";
 
@@ -75,13 +79,13 @@ OPTIONS
                           Never implied — you have to ask for it.
   --apply                 Commit K replacement. Without it, no K is rotated;
                           the one-time migration exception above still applies.
-  --confirm-digest <hex>  Required with "--all-peers --apply": the target digest
-                          printed by the matching dry run. If the peer set has
-                          changed since you reviewed it, the digest no longer
-                          matches and the rotation is refused.
+  --confirm-digest <hex>  Required with "--all-peers --apply": the tuple+target-
+                          set digest printed by the matching dry run. A digest
+                          from another tuple, or a changed peer set, is refused
+                          before either document is written.
   --storage-root <dir>    Override the v2 storage root. Only for deployments
                           that moved it; the tuple layout underneath is fixed.
-  --ignore-live-writers   Skip the in-flight-writer probe (see below).
+  --ignore-live-writers   Bypass the temp-artifact refusal (see below).
   --help, -h              Print this and exit.
 
 WHAT THIS COMMAND CANNOT DO
@@ -91,8 +95,11 @@ WHAT THIS COMMAND CANNOT DO
   each run generates a different K_new and leaves the replicas divergent. Stop
   and escalate instead.
 
-  It cannot prove that no gateway is running. It refuses if it can see another
-  rotation in progress, or a process caught mid-write on this account's files.
+  It cannot prove that no gateway is running. Every APPLY refuses a pre-existing
+  rotation lock. By default, both a dry run and an apply refuse every matching
+  atomic-write temp artifact. A pid is only meaningful on its own host/pod, so
+  this tool never calls a remote-looking lock or artifact stale and never removes
+  a pre-existing lock automatically.
   A gateway that is up but momentarily idle looks exactly like a stopped one:
   this plugin holds no lease and no pidfile, and a library cannot know what
   process supervisor it lives under. Stopping every replica and confirming an
@@ -101,11 +108,18 @@ WHAT THIS COMMAND CANNOT DO
   in memory to already-connected browsers while this command commits the new
   one, and nothing reports the split.
 
-  --ignore-live-writers gives up the only automatic local signal that something
-  was writing to this account. It exists because a leftover temp file whose pid
-  has been recycled can produce a false positive. Using it means the refusal is
-  now entirely your own judgement, made from the replica count you observed
-  outside this tool. It does not make the rotation safer or more proven.
+  --ignore-live-writers bypasses only the temp-artifact refusal after you have
+  inspected those artifacts and verified the deployment externally. It never
+  bypasses or removes a pre-existing rotation lock. Using it makes the writer
+  decision your own judgement, based on the replica count and shared-store state
+  you observed outside this tool. It does not make the rotation safer or prove
+  liveness.
+
+ON APPLY FAILURE
+  Read the explicit APPLY OUTCOME. A pre-commit refusal, a commit whose complete
+  durable readback did not verify, and a verified commit whose lock cleanup
+  failed are different states. After a possible or known commit, keep replicas
+  stopped and inspect/escalate; never rerun blindly.
 
 AFTER A SUCCESSFUL ROTATION
   Rotating K does not disconnect anyone and does not revoke any credential. Every
@@ -139,6 +153,50 @@ const BOOLEAN_FLAGS = new Set([
   "--ignore-live-writers",
 ]);
 
+type RotateCliRuntime = Readonly<{
+  home?: string;
+  /** @internal Test-only fault seam after document publication, before readback. */
+  _beforeVerifiedReadback?: () => void;
+  /** @internal Test-only fault seam immediately before lock release. */
+  _beforeLockRelease?: () => void;
+}>;
+
+type ApplyFailureState =
+  | "no-verified-commit"
+  | "committed-unverified"
+  | "committed-verified-review-mismatch"
+  | "committed-verified-cleanup-failed";
+
+class RotationApplyOutcomeError extends Error {
+  readonly state: ApplyFailureState;
+  readonly cleanupFailed: boolean;
+  private readonly detail: string;
+
+  constructor(
+    state: ApplyFailureState,
+    error: unknown,
+    cleanupError?: unknown,
+  ) {
+    const detail = describeError(error);
+    const cleanupDetail = cleanupError === undefined
+      ? null
+      : describeError(cleanupError);
+    super(
+      cleanupDetail === null
+        ? detail
+        : `${detail}; rotation-lock cleanup also failed (${cleanupDetail})`,
+    );
+    this.name = "RotationApplyOutcomeError";
+    this.state = state;
+    this.cleanupFailed = cleanupDetail !== null;
+    this.detail = detail;
+  }
+
+  withCleanupFailure(error: unknown): RotationApplyOutcomeError {
+    return new RotationApplyOutcomeError(this.state, this.detail, error);
+  }
+}
+
 /**
  * Run the command. `argv` excludes the node binary and the script path.
  *
@@ -148,8 +206,7 @@ const BOOLEAN_FLAGS = new Set([
 export function runRotateConversationKeyCli(
   argv: readonly string[],
   streams: RotateCliStreams,
-  /** @internal Test-only default-home seam for legacy migration coverage. */
-  runtime: Readonly<{ home?: string }> = {},
+  runtime: RotateCliRuntime = {},
 ): number {
   const parsed = parseInvocation(argv);
   if (parsed.kind === "help") {
@@ -166,13 +223,7 @@ export function runRotateConversationKeyCli(
     return execute(parsed, streams, runtime);
   } catch (error) {
     streams.err(`${ROTATE_CLI_COMMAND}: ${describeError(error)}`);
-    // Requirement: a failure ends here. This command starts nothing, has no
-    // fallback path, and must not leave the operator thinking a partial result
-    // is a result.
-    streams.err(
-      "Rotation did NOT complete. Nothing was started. Re-run after resolving " +
-        "the cause, or escalate through your incident-response process.",
-    );
+    reportFailureOutcome(parsed, error, streams);
     return ROTATE_CLI_EXIT_FAILED;
   }
 }
@@ -180,7 +231,7 @@ export function runRotateConversationKeyCli(
 function execute(
   invocation: Extract<ParsedInvocation, { kind: "run" }>,
   streams: RotateCliStreams,
-  runtime: Readonly<{ home?: string }>,
+  runtime: RotateCliRuntime,
 ): number {
   const paths = tupleStoragePaths({
     tenant: invocation.tenant,
@@ -194,9 +245,13 @@ function execute(
   if (!invocation.ignoreLiveWriters) {
     const findings = probeLiveTupleWriters(paths.directory);
     if (findings.length > 0) {
-      for (const finding of findings) streams.err(`  live writer: ${finding}`);
-      throw new Error(
-        "refusing to rotate: a process is writing this account's state",
+      for (const finding of findings) {
+        streams.err(`  possible writer artifact: ${finding}`);
+      }
+      throw new RotationPreflightError(
+        "refusing to rotate while atomic-write temp artifacts exist; leave " +
+          "them untouched, keep every replica stopped, and inspect or escalate",
+        findings,
       );
     }
   }
@@ -208,6 +263,9 @@ function execute(
       ? { storageRoot: invocation.storageRoot }
       : {}),
     ...(runtime.home !== undefined ? { home: runtime.home } : {}),
+    ...(runtime._beforeVerifiedReadback !== undefined
+      ? { _beforeCachePublish: runtime._beforeVerifiedReadback }
+      : {}),
   });
 
   // Migrate first, then refuse a missing explicit target BEFORE taking a lock.
@@ -221,7 +279,7 @@ function execute(
   streams.out(`  directory: ${paths.directory}`);
 
   return invocation.apply
-    ? applyRotation(invocation, rotator, paths.directory, streams)
+    ? applyRotation(invocation, rotator, paths.directory, streams, runtime)
     : previewRotation(invocation, rotator, streams);
 }
 
@@ -286,7 +344,7 @@ function previewRotation(
   streams.out(`  digest:    ${preview.targetDigest}`);
   streams.out(
     "  note:      peer identifiers are deliberately not listed. The digest " +
-      "commits to the exact target set.",
+      "commits to this exact tuple and target set.",
   );
   streams.out("");
   streams.out(
@@ -300,12 +358,13 @@ function applyRotation(
   rotator: OfflineConversationKeyRotator,
   directory: string,
   streams: RotateCliStreams,
+  runtime: RotateCliRuntime,
 ): number {
   streams.out("  mode:      APPLY");
 
   const lock = acquireRotationLock(directory);
-  let summary: PeerRotationSummary | AccountRotationSummary;
-  let released = false;
+  let summary: PeerRotationSummary | AccountRotationSummary | null = null;
+  let failure: unknown = null;
   try {
     if (invocation.target.kind === "peer") {
       streams.out(`  target:    peer ${invocation.target.peerId}`);
@@ -315,38 +374,58 @@ function applyRotation(
       // check and the commit contains no other rotation.
       const preview = rotator.previewAccountRotation();
       if (preview.targetDigest !== invocation.confirmDigest) {
-        throw new Error(
-          `--confirm-digest does not match this account's current target set ` +
-            `(${preview.peerCount} peers, digest ${preview.targetDigest}); ` +
-            `re-run the dry run and review it again`,
+        throw new ConversationKeyTargetDigestMismatchError(
+          preview.peerCount,
+          preview.targetDigest,
         );
       }
       streams.out(`  target:    ALL peers in this account`);
-      const accountSummary = rotator.rotateAccountVerified();
+      const accountSummary = rotator.rotateAccountVerified(
+        invocation.confirmDigest as string,
+      );
+      summary = accountSummary;
       if (accountSummary.targetDigest !== invocation.confirmDigest) {
-        // The set changed between the confirmed preview and the commit, i.e.
-        // something else wrote to this tuple while the lock was held. The
-        // rotation is durable; what it covered is not what was reviewed.
-        throw new Error(
-          `the target set changed during the rotation (committed digest ` +
-            `${accountSummary.targetDigest}); the rotation IS committed but ` +
-            `did not cover the reviewed set — treat this account as unquiesced`,
+        // The batch method rechecks the same digest before either write. This
+        // remains a defense against a broken/future implementation returning a
+        // different verified summary after it committed.
+        throw new RotationApplyOutcomeError(
+          "committed-verified-review-mismatch",
+          `committed tuple+target-set digest ${accountSummary.targetDigest} ` +
+            `did not match the reviewed digest`,
         );
       }
-      summary = accountSummary;
     }
+  } catch (error) {
+    failure = error instanceof ConversationKeyReadbackError
+      ? new RotationApplyOutcomeError("committed-unverified", error)
+      : error;
+  }
+
+  try {
+    runtime._beforeLockRelease?.();
     releaseRotationLock(lock);
-    released = true;
-  } finally {
-    // On the failure path the lock still has to go, but a release problem must
-    // never replace the error that actually stopped the rotation.
-    if (!released) {
-      try {
-        releaseRotationLock(lock);
-      } catch (error) {
-        streams.err(`${ROTATE_CLI_COMMAND}: ${describeError(error)}`);
-      }
+  } catch (cleanupError) {
+    if (failure instanceof RotationApplyOutcomeError) {
+      failure = failure.withCleanupFailure(cleanupError);
+    } else if (failure !== null) {
+      failure = new RotationApplyOutcomeError(
+        "no-verified-commit",
+        failure,
+        cleanupError,
+      );
+    } else {
+      failure = new RotationApplyOutcomeError(
+        "committed-verified-cleanup-failed",
+        cleanupError,
+      );
     }
+  }
+  if (failure !== null) throw failure;
+  if (summary === null) {
+    throw new RotationApplyOutcomeError(
+      "no-verified-commit",
+      "rotation returned no verified summary",
+    );
   }
 
   if ("peerId" in summary) {
@@ -364,6 +443,82 @@ function applyRotation(
       "the new key. See docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md.",
   );
   return ROTATE_CLI_EXIT_OK;
+}
+
+function reportFailureOutcome(
+  invocation: Extract<ParsedInvocation, { kind: "run" }>,
+  error: unknown,
+  streams: RotateCliStreams,
+): void {
+  if (!invocation.apply) {
+    streams.err(
+      "DRY-RUN OUTCOME: no K was rotated; the one-time legacy migration may " +
+        "have completed. Resolve the reported cause before another dry run.",
+    );
+    return;
+  }
+
+  if (error instanceof RotationApplyOutcomeError) {
+    switch (error.state) {
+      case "committed-unverified":
+        streams.err(
+          "APPLY OUTCOME: the rotation commit path completed, but complete " +
+            "durable readback did not verify. Treat tuple state as changed and " +
+            "unverified; keep every replica stopped, inspect both documents, " +
+            "and escalate. Do not rerun blindly.",
+        );
+        break;
+      case "committed-verified-review-mismatch":
+        streams.err(
+          "APPLY OUTCOME: rotation committed and complete durable readback " +
+            "verified, but the committed tuple+target set did not match the " +
+            "reviewed digest. K is rotated; keep every replica stopped and " +
+            "treat the tuple as unquiesced. Do not rerun blindly.",
+        );
+        break;
+      case "committed-verified-cleanup-failed":
+        streams.err(
+          "APPLY OUTCOME: K rotation committed; complete durable readback " +
+            "verified, but rotation-lock cleanup failed. K is rotated; leave " +
+            "the lock untouched, keep every replica stopped, and inspect or " +
+            "escalate. Do not rerun.",
+        );
+        break;
+      case "no-verified-commit":
+        streams.err(
+          "APPLY OUTCOME: no verified commit was established and durable tuple " +
+            "state may have changed. Keep every replica stopped, inspect both " +
+            "documents and the lock, and escalate. Do not rerun blindly.",
+        );
+        break;
+    }
+    if (error.cleanupFailed) {
+      streams.err(
+        "Rotation-lock cleanup also failed. Leave the lock untouched until its " +
+          "ownership and the durable tuple state have been inspected.",
+      );
+    }
+    return;
+  }
+
+  if (
+    error instanceof RotationPreflightError ||
+    error instanceof ConversationKeyTargetDigestMismatchError
+  ) {
+    streams.err(
+      "APPLY OUTCOME: no rotation commit was attempted. K was not changed by " +
+        "this invocation; legacy migration may have completed. Keep every " +
+        "replica stopped and inspect the reported lock, artifact, or target " +
+        "before deciding whether a new dry run is safe.",
+    );
+    return;
+  }
+
+  streams.err(
+    "APPLY OUTCOME: no verified commit was established and durable tuple state " +
+      "may have changed. Keep every replica stopped, inspect both documents " +
+      "and the lock, and escalate. Do not rerun blindly.",
+  );
 }
 
 function parseInvocation(argv: readonly string[]): ParsedInvocation {
@@ -472,6 +627,7 @@ function parseInvocation(argv: readonly string[]): ParsedInvocation {
 }
 
 function describeError(error: unknown): string {
+  if (typeof error === "string") return error;
   if (error instanceof Error) {
     return error.message.startsWith("webchannel: ")
       ? error.message.slice("webchannel: ".length)

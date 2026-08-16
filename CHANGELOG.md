@@ -13,9 +13,13 @@
   Node. It is deliberately a separate process from the gateway: it cannot open
   a transport, and the account-wide mutation module is absent from the gateway
   bundle. A dry run is the default; account-wide is never implied and its
-  `--apply` requires the target digest printed by the matching dry run. An
+  `--apply` requires the tuple-and-target-set digest printed by the matching dry
+  run; a digest from another tenant/account is refused before writes. An
   account-wide rotation commits each document exactly once regardless of peer
-  count, which a regression test pins.
+  count, which a regression test pins. Existing locks and atomic-write temp
+  artifacts on a shared store now fail closed without local-PID takeover or
+  automatic cleanup, and apply failures distinguish unverified durable state
+  from a verified commit whose lock cleanup failed.
 
   It does **not** prove that the gateway is stopped, and does not claim to:
   this is a library and cannot know your deployment topology, so the controller

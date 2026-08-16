@@ -40,7 +40,7 @@ export type PeerRotationPreview = Readonly<{
   generation: ConversationKeyGeneration | null;
 }>;
 
-/** Non-secret count and commitment to an account-wide target set. */
+/** Non-secret count and commitment to one exact tuple and target set. */
 export type AccountRotationPreview = Readonly<{
   peerCount: number;
   targetDigest: string;
@@ -69,6 +69,22 @@ export class ConversationKeyReadbackError extends Error {
         `durable state is unverified`,
     );
     this.name = "ConversationKeyReadbackError";
+  }
+}
+
+/** The reviewed tuple+target-set digest no longer matches; no write occurred. */
+export class ConversationKeyTargetDigestMismatchError extends Error {
+  readonly peerCount: number;
+  readonly targetDigest: string;
+
+  constructor(peerCount: number, targetDigest: string) {
+    super(
+      `webchannel: reviewed tuple+target-set digest does not match the current ` +
+        `rotation target (${peerCount} peers, digest ${targetDigest})`,
+    );
+    this.name = "ConversationKeyTargetDigestMismatchError";
+    this.peerCount = peerCount;
+    this.targetDigest = targetDigest;
   }
 }
 
@@ -123,7 +139,7 @@ export class OfflineConversationKeyRotator {
     const keys = this.readKeysOrEmpty();
     return Object.freeze({
       peerCount: keys.size,
-      targetDigest: rotationTargetDigest(keys.keys()),
+      targetDigest: rotationTargetDigest(this.scope, keys.keys()),
     });
   }
 
@@ -165,12 +181,21 @@ export class OfflineConversationKeyRotator {
    * are serialized before publication and each document is replaced once,
    * independent of the peer count.
    */
-  rotateAccountVerified(): AccountRotationSummary {
+  rotateAccountVerified(
+    reviewedTargetDigest: string,
+  ): AccountRotationSummary {
     this.prepareMigration();
     const freshKeys = this.readKeysOrEmpty();
     if (freshKeys.size === 0) {
       throw new Error(
         "webchannel: conversation-key account rotation has no target",
+      );
+    }
+    const freshTargetDigest = rotationTargetDigest(this.scope, freshKeys.keys());
+    if (freshTargetDigest !== reviewedTargetDigest) {
+      throw new ConversationKeyTargetDigestMismatchError(
+        freshKeys.size,
+        freshTargetDigest,
       );
     }
     const freshGenerations = compactStaleGenerations(
@@ -214,7 +239,7 @@ export class OfflineConversationKeyRotator {
 
     return Object.freeze({
       peerCount: nextKeys.size,
-      targetDigest: rotationTargetDigest(nextKeys.keys()),
+      targetDigest: freshTargetDigest,
       rotatedAtSec,
     });
   }
@@ -391,15 +416,24 @@ function compactStaleGenerations(
   return compacted;
 }
 
-function rotationTargetDigest(peerIds: Iterable<string>): string {
-  const encoded = [...peerIds]
-    .sort()
-    .map((peerId) => `${Buffer.byteLength(peerId, "utf8")}:${peerId}`)
-    .join("");
-  return createHash("sha256")
-    .update("webchannel-conversation-key-rotation-targets-v1")
-    .update(encoded, "utf8")
-    .digest("hex");
+function rotationTargetDigest(
+  scope: StorageScopeIdentity,
+  peerIds: Iterable<string>,
+): string {
+  const hash = createHash("sha256");
+  hash.update(frameUtf8("openclaw-webchannel/rotation-target/v2"));
+  hash.update(frameUtf8(scope.tenant));
+  hash.update(frameUtf8(scope.accountId));
+  for (const peerId of [...peerIds].sort()) hash.update(frameUtf8(peerId));
+  return hash.digest("hex");
+}
+
+/** Unambiguous length framing for every UTF-8 digest component. */
+function frameUtf8(value: string): Buffer {
+  const bytes = Buffer.from(value, "utf8");
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(bytes.length);
+  return Buffer.concat([length, bytes]);
 }
 
 function nextEpoch(epoch: number): number {

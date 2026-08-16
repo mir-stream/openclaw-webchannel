@@ -207,7 +207,10 @@ authoritative store shared by every replica; independent per-replica volumes are
 not supported and must not be rotated separately. Deleting
 `conversation-keys.json` is still never the way to rotate: it destroys every
 peer's key at once and leaves no audit trail, which is exactly what the offline
-entry replaces.
+entry replaces. Account-wide confirmation digests bind the exact tenant,
+account, and peer set. On a shared store, every existing rotation lock or
+atomic-write temp artifact is treated as potentially remote/live and left
+untouched; consult the command's explicit apply outcome before any retry.
 
 ### Account-sharding runbook
 

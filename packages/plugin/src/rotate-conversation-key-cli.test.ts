@@ -69,7 +69,11 @@ function run(...argv: string[]): CliRun {
 
 function runWithRuntime(
   argv: readonly string[],
-  runtime: Readonly<{ home?: string }> = {},
+  runtime: Readonly<{
+    home?: string;
+    _beforeVerifiedReadback?: () => void;
+    _beforeLockRelease?: () => void;
+  }> = {},
 ): CliRun {
   const out: string[] = [];
   const err: string[] = [];
@@ -121,6 +125,32 @@ function seedAccount(peerCount: number): string[] {
   }
   writeFileSync(paths().credentialPath, credentialDocument(), { mode: 0o600 });
   return peerIds;
+}
+
+function seedTuple(
+  tenant: string,
+  accountId: string,
+  peerCount: number,
+): string[] {
+  const store = new ConversationKeyStore({ tenant, accountId, storageRoot });
+  const peerIds: string[] = [];
+  for (let index = 0; index < peerCount; index += 1) {
+    const peerId = `peer-${index}`;
+    store.getOrCreate(peerId);
+    peerIds.push(peerId);
+  }
+  return peerIds;
+}
+
+function tupleArgsFor(tenant: string, accountId: string): string[] {
+  return [
+    "--tenant",
+    tenant,
+    "--account",
+    accountId,
+    "--storage-root",
+    storageRoot,
+  ];
 }
 
 /**
@@ -195,9 +225,17 @@ describe("invocation", () => {
     expect(result.code, result.err).toBe(ROTATE_CLI_EXIT_OK);
     expect(result.out).toContain("WHAT THIS COMMAND CANNOT DO");
     expect(result.out).toContain("cannot prove that no gateway is running");
+    expect(result.out).toContain("Every APPLY refuses a pre-existing");
+    expect(result.out).toContain("both a dry run and an apply refuse");
     expect(result.out).toContain("per-replica volumes are unsupported");
     expect(result.out).toContain("Do not run this command once per volume");
-    expect(result.out).toContain("--ignore-live-writers gives up");
+    expect(result.out).toContain("--ignore-live-writers bypasses only");
+    expect(result.out).toContain("a pre-existing lock automatically");
+    expect(result.out).toContain(
+      "never\n  bypasses or removes a pre-existing rotation lock",
+    );
+    expect(result.out).toContain("ON APPLY FAILURE");
+    expect(result.out).toContain("never rerun blindly");
   });
 
   it("requires an exact tenant and account", () => {
@@ -276,13 +314,14 @@ describe("dry run", () => {
     expect(readFileSync(paths().conversationKeyPath, "utf8")).toBe(before);
   });
 
-  it("shows an account as a count and a digest, never a peer list", () => {
+  it("shows an account as a count and tuple+target-set digest, never a peer list", () => {
     const peerIds = seedAccount(3);
     const result = run(...tupleArgs(), "--all-peers");
 
     expect(result.code).toBe(ROTATE_CLI_EXIT_OK);
     expect(result.out).toContain("peers:     3");
     expect(result.out).toMatch(/digest:    [0-9a-f]{64}/);
+    expect(result.out).toContain("commits to this exact tuple and target set");
     for (const peerId of peerIds) {
       expect(result.out).not.toContain(peerId);
     }
@@ -433,8 +472,83 @@ describe("apply", () => {
 
     expect(result.code).toBe(ROTATE_CLI_EXIT_FAILED);
     expect(result.err).toContain("does not match");
-    expect(result.err).toContain("Rotation did NOT complete");
+    expect(result.err).toContain("no rotation commit was attempted");
     expect(durableKeyMaterial()).toEqual(before);
+  });
+
+  it("refuses a tuple+target-set digest copied from another tuple before writes", () => {
+    seedAccount(2);
+    seedTuple("tenant-B", "acct-b", 2);
+    const localDigest = /digest:    ([0-9a-f]{64})/.exec(
+      run(...tupleArgs(), "--all-peers").out,
+    )?.[1] as string;
+    const foreignDigest = /digest:    ([0-9a-f]{64})/.exec(
+      run(...tupleArgsFor("tenant-B", "acct-b"), "--all-peers").out,
+    )?.[1] as string;
+    const before = durableKeyMaterial();
+
+    expect(foreignDigest).not.toBe(localDigest);
+    const result = run(
+      ...tupleArgs(),
+      "--all-peers",
+      "--apply",
+      "--confirm-digest",
+      foreignDigest,
+    );
+
+    expect(result.code).toBe(ROTATE_CLI_EXIT_FAILED);
+    expect(result.err).toContain("tuple+target-set digest does not match");
+    expect(result.err).toContain("no rotation commit was attempted");
+    expect(durableKeyMaterial()).toEqual(before);
+  });
+
+  it("reports committed-but-unverified when complete readback fails", () => {
+    seedAccount(2);
+    const before = durableKeyMaterial();
+    const result = runWithRuntime(
+      [...tupleArgs(), "--peer", "peer-0", "--apply"],
+      {
+        _beforeVerifiedReadback: () => {
+          const document = JSON.parse(
+            readFileSync(paths().conversationKeyPath, "utf8"),
+          ) as { keys: Record<string, string> };
+          document.keys["peer-1"] = Buffer.alloc(32, 0x5a).toString("base64url");
+          writeFileSync(
+            paths().conversationKeyPath,
+            JSON.stringify(document),
+            { mode: 0o600 },
+          );
+        },
+      },
+    );
+
+    expect(result.code).toBe(ROTATE_CLI_EXIT_FAILED);
+    expect(result.err).toContain("rotation commit path completed");
+    expect(result.err).toContain("durable readback did not verify");
+    expect(result.err).toContain("Do not rerun blindly");
+    expect(result.err).not.toContain("Nothing was started");
+    expectNoSecrets(result, [...before, ...durableKeyMaterial()]);
+  });
+
+  it("reports committed-and-verified when lock cleanup fails", () => {
+    seedAccount(1);
+    const before = durableKeyMaterial();
+    const result = runWithRuntime(
+      [...tupleArgs(), "--peer", "peer-0", "--apply"],
+      { _beforeLockRelease: () => writeLock(process.pid) },
+    );
+
+    expect(result.code).toBe(ROTATE_CLI_EXIT_FAILED);
+    expect(result.err).toContain("rotation committed");
+    expect(result.err).toContain("durable readback verified");
+    expect(result.err).toContain("lock cleanup failed");
+    expect(result.err).toContain("K is rotated");
+    expect(result.err).toContain("Do not rerun");
+    expect(durableKeyMaterial()[0]).not.toBe(before[0]);
+    expect(existsSync(join(paths().directory, ROTATION_LOCK_FILE_NAME))).toBe(
+      true,
+    );
+    expectNoSecrets(result, [...before, ...durableKeyMaterial()]);
   });
 
   it("releases the rotation lock on success and on failure", () => {
@@ -461,21 +575,25 @@ describe("preflight", () => {
     const result = run(...tupleArgs(), "--peer", "peer-0", "--apply");
 
     expect(result.code).toBe(ROTATE_CLI_EXIT_FAILED);
-    expect(result.err).toContain("another rotation is in progress");
+    expect(result.err).toContain("rotation lock");
+    expect(result.err).toContain("alive on this host");
   });
 
-  it("takes over a lock whose owner is gone", () => {
+  it("leaves a dead/local-looking lock untouched and refuses", () => {
     seedAccount(1);
     const lockPath = writeLock(deadPid());
+    const before = readFileSync(lockPath, "utf8");
 
     const result = run(...tupleArgs(), "--peer", "peer-0", "--apply");
 
-    expect(result.code).toBe(ROTATE_CLI_EXIT_OK);
-    expect(existsSync(lockPath)).toBe(false);
+    expect(result.code).toBe(ROTATE_CLI_EXIT_FAILED);
+    expect(result.err).toContain("not observable locally");
+    expect(result.err).toContain("another host/pod");
+    expect(readFileSync(lockPath, "utf8")).toBe(before);
     const archived = readdirSync(paths().directory).filter((entry) =>
       entry.includes(`${ROTATION_LOCK_FILE_NAME}.stale-`),
     );
-    expect(archived).toHaveLength(1);
+    expect(archived).toHaveLength(0);
   });
 
   it("refuses when a live process is mid-write on this account", () => {
@@ -490,20 +608,44 @@ describe("preflight", () => {
     const result = run(...tupleArgs(), "--peer", "peer-0", "--apply");
 
     expect(result.code).toBe(ROTATE_CLI_EXIT_FAILED);
-    expect(result.err).toContain("a process is writing this account's state");
-    expect(result.err).toContain(`live pid ${process.pid}`);
+    expect(result.err).toContain("atomic-write temp artifact");
+    expect(result.err).toContain(`locally live pid ${process.pid}`);
   });
 
-  it("ignores a temp artifact whose owner is gone", () => {
+  it("refuses a remote/stale-looking temp artifact by default", () => {
     seedAccount(1);
+    const artifact =
+      `${paths().conversationKeyPath}.tmp-${deadPid()}-${"cd".repeat(12)}`;
     writeFileSync(
-      `${paths().conversationKeyPath}.tmp-${deadPid()}-${"cd".repeat(12)}`,
+      artifact,
       "partial",
       { mode: 0o600 },
     );
-    expect(run(...tupleArgs(), "--peer", "peer-0", "--apply").code).toBe(
-      ROTATE_CLI_EXIT_OK,
-    );
+    const result = run(...tupleArgs(), "--peer", "peer-0", "--apply");
+    expect(result.code).toBe(ROTATE_CLI_EXIT_FAILED);
+    expect(result.err).toContain("not observable locally");
+    expect(result.err).toContain("another host/pod");
+    expect(readFileSync(artifact, "utf8")).toBe("partial");
+  });
+
+  it("reports every temp artifact without echoing arbitrary filenames", () => {
+    seedAccount(1);
+    const filenameSecrets = ["SECRET-FIRST", "SECRET-SECOND"];
+    for (const [index, secret] of filenameSecrets.entries()) {
+      writeFileSync(
+        join(
+          paths().directory,
+          `${secret}.tmp-${deadPid()}-${String(index + 1).repeat(24)}`,
+        ),
+        "partial",
+        { mode: 0o600 },
+      );
+    }
+
+    const result = run(...tupleArgs(), "--peer", "peer-0", "--apply");
+    expect(result.code).toBe(ROTATE_CLI_EXIT_FAILED);
+    expect(result.err.match(/possible writer artifact:/g)).toHaveLength(2);
+    for (const secret of filenameSecrets) expect(result.all).not.toContain(secret);
   });
 
   it("lets --ignore-live-writers past the writer probe", () => {
@@ -525,8 +667,8 @@ describe("preflight", () => {
   });
 
   it("does not let --ignore-live-writers past a live rotation lock", () => {
-    // The bypass covers a probe that can produce false positives. It must not
-    // also disarm mutual exclusion, where a bypass loses one of two K sets.
+    // The bypass covers only temp artifacts. It must not disarm mutual
+    // exclusion or delete an unresolved lock from any host.
     seedAccount(1);
     writeLock(process.pid);
     const result = run(
@@ -537,6 +679,7 @@ describe("preflight", () => {
       "--ignore-live-writers",
     );
     expect(result.code).toBe(ROTATE_CLI_EXIT_FAILED);
-    expect(result.err).toContain("another rotation is in progress");
+    expect(result.err).toContain("rotation lock");
+    expect(result.err).toContain("alive on this host");
   });
 });
