@@ -2,8 +2,8 @@
  * Core types for the SaaS trust chain.
  *
  * This module defines the immutable artifacts produced by setupTrustChain:
- *  - saasTrustChain: The SaaS's RS256 keypair + NATS account signing seed
- *  - natsAccountConfig: operator/account JWT + resolver config for real nats-server
+ *  - saasTrustChain: RS256 keypair + NATS tenant seed + system credential
+ *  - natsAccountConfig: operator/account JWTs + resolver config for real nats-server
  *  - jwksDocument: JWKS public key set for JWT verification
  *
  * These artifacts are the single source of truth for the control plane.
@@ -45,6 +45,17 @@ export type SaasTrustChainPrivate = {
    * in the same 0600 store as natsAccountSeed.
    */
   operatorSeed?: string;
+
+  /**
+   * NATS `.creds` contents for the narrowly-scoped system-account user that
+   * may publish account JWTs to `$SYS.REQ.CLAIMS.UPDATE` and receive the
+   * request reply on `_INBOX.>`. Present only in self-contained mode.
+   *
+   * This contains a user NKEY seed. Treat it as a high-value secret: persist
+   * it only in an owner-readable store, never log it, and never publish it as
+   * part of the public NATS configuration.
+   */
+  systemAccountCredentials?: string;
 };
 
 /**
@@ -121,15 +132,15 @@ export type NatsAccountClaims = {
  * The resolver maps account public keys to their JWTs. This config is loaded
  * by nats-server to enforce account-level authentication and authorization.
  *
- * Format: https://docs.nats.io/running-a-nats-service/configuration/resolver#memory-resolver
+ * Format: https://docs.nats.io/running-a-nats-service/configuration/securing_nats/auth_intro/jwt/resolver
  */
 export type NatsResolverConfig = {
   /**
    * Map of account public NKEY to account JWT.
    *
    * nats-server loads this at startup and uses it to verify user JWTs issued
-   * for this account. The resolver URL can be omitted (memory resolver) for
-   * static configurations.
+   * for this account. Self-contained servers preload these JWTs into their
+   * writable full/Dir resolver at startup.
    */
   [accountPublicKey: string]: string; // account JWT (signed JWT string)
 };
@@ -168,8 +179,7 @@ export type NatsSelfContainedAccountConfig = {
   /**
    * Resolver config mapping account public NKEY to account JWT.
    *
-   * This can be embedded directly in nats.conf (memory resolver) or hosted
-   * as a static file/service URL.
+   * These entries seed the writable full/Dir resolver in nats.conf.
    */
   resolverConfig: NatsResolverConfig;
 
@@ -180,6 +190,13 @@ export type NatsSelfContainedAccountConfig = {
    * nats-server configuration.
    */
   accountPublicKey: string;
+
+  /**
+   * Public NKEY of the dedicated NATS system account. The operator JWT names
+   * the same account as its system account, and the full resolver is seeded
+   * with that account's JWT.
+   */
+  systemAccountPublicKey: string;
 };
 
 /**

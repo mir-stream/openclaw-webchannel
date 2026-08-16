@@ -2,22 +2,28 @@
  * NATS relay boot — assemble a JWT-auth nats-server from the PUBLIC natsConfig.
  *
  * `loadOrCreateTrustChain(...).natsConfig` is the public
- * `NatsSelfContainedAccountConfig` (operatorJwt + resolverConfig +
- * accountPublicKey). Standard operations: write operator.jwt + resolver.json,
- * assemble a nats.conf with a MEMORY resolver preload, spawn `nats-server`.
+ * `NatsSelfContainedAccountConfig` (operatorJwt + resolverConfig + system
+ * account). Standard operations: write the trust artifacts, assemble a
+ * nats.conf with a writable full/Dir resolver, spawn `nats-server`.
  *
- * This file imports NOTHING from the packages — it only consumes the plain
- * config object the SaaS backend hands it, so it stays public-API-clean.
+ * This file imports only the published SaaS package API — no repository-relative
+ * or deep internal package paths — so the example stays public-API-clean.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { NatsSelfContainedAccountConfig } from "@mir-stream/webchannel-saas";
+import {
+  atomicWritePrivateFile,
+  prepareFullResolverNatsConfig,
+  type NatsSelfContainedAccountConfig,
+} from "@mir-stream/webchannel-saas";
 
 export type NatsBootOptions = {
   /** Public self-contained NATS config from the trust chain. */
   natsConfig: NatsSelfContainedAccountConfig;
+  /** Private system-account `.creds` contents; written owner-readable only. */
+  systemAccountCredentials: string;
   /** Directory to write operator.jwt / resolver.json / nats.conf into. */
   configDir: string;
   /** WebSocket port the browser dials. */
@@ -38,30 +44,24 @@ export type NatsHandle = {
  * Requires the `nats-server` binary on PATH.
  */
 export function bootNatsServer(opts: NatsBootOptions): NatsHandle {
-  mkdirSync(opts.configDir, { recursive: true });
+  mkdirSync(opts.configDir, { recursive: true, mode: 0o700 });
   const operatorJwtPath = join(opts.configDir, "operator.jwt");
   writeFileSync(operatorJwtPath, opts.natsConfig.operatorJwt);
   writeFileSync(
     join(opts.configDir, "resolver.json"),
     JSON.stringify(opts.natsConfig.resolverConfig, null, 2),
   );
+  const systemCredentialsPath = join(opts.configDir, "system-account.creds");
+  atomicWritePrivateFile(systemCredentialsPath, opts.systemAccountCredentials);
 
-  const preload = Object.entries(opts.natsConfig.resolverConfig)
-    .map(([k, v]) => `  ${k}: "${v}"`)
-    .join("\n");
-  const conf = [
-    `port: ${opts.tcpPort}`,
-    `websocket {`,
-    `  port: ${opts.wsPort}`,
-    `  no_tls: true`,
-    `}`,
-    `operator: "${operatorJwtPath}"`,
-    `resolver: MEMORY`,
-    `resolver_preload: {`,
-    preload,
-    `}`,
-    "",
-  ].join("\n");
+  const { config: conf } = prepareFullResolverNatsConfig({
+    configDir: opts.configDir,
+    operatorJwtPath,
+    systemAccountPublicKey: opts.natsConfig.systemAccountPublicKey,
+    resolverConfig: opts.natsConfig.resolverConfig,
+    tcpPort: opts.tcpPort,
+    websocketPort: opts.wsPort,
+  });
   const confPath = join(opts.configDir, "nats.conf");
   writeFileSync(confPath, conf);
 

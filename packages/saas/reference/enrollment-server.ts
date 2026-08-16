@@ -45,6 +45,7 @@ import { buildBootstrapClaims } from "../src/bootstrap-claims.js";
 import { DemoUserDirectory, seedDemoUsers, type DemoUser } from "../src/demo-users.js";
 import { mintNatsUserCreds, issueBrowserCredentials, type NatsUserRole } from "../src/nats-user-creds.js";
 import { assertValidSubjectToken } from "../src/subject-token.js";
+import { atomicWritePrivateFile } from "../src/private-file.js";
 import type { EnrollmentRequest, PollRequest } from "../src/device-flow-types.js";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
@@ -90,9 +91,9 @@ const DEMO_GW_URL = process.env.DEMO_GW_URL || "";
 const DEMO_ACCOUNT_ID = process.env.DEMO_ACCOUNT_ID || "default-agent";
 const DEMO_TENANT = process.env.DEMO_TENANT || "default-tenant";
 const DEMO_PEER_ID = process.env.DEMO_PEER_ID || "web-allreal-peer";
-// When set, the operator JWT + memory-resolver config are written here at boot so
-// a harness can build a JWT-auth nats.conf from the SAME trust chain this issuer
-// uses. Only public NATS config is written — never the RSA key or account seed.
+// When set, the operator JWT + resolver seed + owner-readable system credential
+// are written here at boot so a harness can build a JWT-auth nats.conf from the
+// SAME trust chain this issuer uses. RSA and account-signing seeds are not emitted.
 const NATS_CONFIG_OUT = process.env.NATS_CONFIG_OUT || "";
 // When set, the trust chain is PERSISTED here (generated once, reloaded verbatim
 // on every later boot) instead of regenerated each start. A long-lived / launchd
@@ -120,6 +121,9 @@ const trustChainOptions = {
   operatorName: "reference-operator",
   accountName: "reference-account",
   externalNatsAccount: EXTERNAL_NATS_ACCOUNT,
+  // The e2e harness must be able to sign an updated account JWT. This remains
+  // an explicit opt-in; setupTrustChain's safer general-purpose default is false.
+  returnOperatorSeed: true,
 };
 const trustChain = TRUST_CHAIN_PATH
   ? await loadOrCreateTrustChain(TRUST_CHAIN_PATH, trustChainOptions)
@@ -132,12 +136,12 @@ const natsIssuerAccountId =
   mockNatsConfig.mode === "external" ? mockNatsConfig.accountPublicKey : undefined;
 
 // ---------------------------------------------------------------------------
-// Publish public NATS config (operator JWT + memory resolver) for a harness
+// Publish NATS server artifacts for a harness
 // ---------------------------------------------------------------------------
 //
 // A JWT-auth nats-server must trust the SAME operator/account this issuer mints
-// user creds for. When NATS_CONFIG_OUT is set we write the two PUBLIC artifacts
-// the server needs — never any private material.
+// user creds for. The operator/resolver files are public. The system-account
+// credential is private, owner-readable only, and deliberately never logged.
 if (NATS_CONFIG_OUT) {
   if (mockNatsConfig.mode === "external") {
     // Synadia hosts the nats-server and already trusts the account — there is no
@@ -146,13 +150,20 @@ if (NATS_CONFIG_OUT) {
       "[nats-config] external mode — skipping operator/resolver output (Synadia hosts the server)",
     );
   } else {
-    mkdirSync(NATS_CONFIG_OUT, { recursive: true });
+    mkdirSync(NATS_CONFIG_OUT, { recursive: true, mode: 0o700 });
     const operatorJwtPath = join(NATS_CONFIG_OUT, "operator.jwt");
     const resolverPath = join(NATS_CONFIG_OUT, "resolver.json");
+    const systemCredentialsPath = join(NATS_CONFIG_OUT, "system-account.creds");
+    if (!mockTrustChain.systemAccountCredentials) {
+      throw new Error("self-contained trust chain is missing its system-account credential");
+    }
     writeFileSync(operatorJwtPath, mockNatsConfig.operatorJwt);
+    atomicWritePrivateFile(systemCredentialsPath, mockTrustChain.systemAccountCredentials);
+    // resolver.json is the harness readiness barrier, so publish it only after
+    // the private credential has been written and permission-hardened.
     writeFileSync(resolverPath, JSON.stringify(mockNatsConfig.resolverConfig, null, 2));
     console.log(`[nats-config] wrote operator JWT → ${operatorJwtPath}`);
-    console.log(`[nats-config] wrote memory resolver (${Object.keys(mockNatsConfig.resolverConfig).length} account) → ${resolverPath}`);
+    console.log(`[nats-config] wrote resolver seed (${Object.keys(mockNatsConfig.resolverConfig).length} accounts) → ${resolverPath}`);
   }
 }
 

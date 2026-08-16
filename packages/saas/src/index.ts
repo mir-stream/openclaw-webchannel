@@ -31,6 +31,14 @@ export { setupTrustChain } from "./setup-trust-chain.js";
 export { generateRsaKeypair } from "./setup-trust-chain.js";
 export { loadOrCreateTrustChain } from "./persistent-trust-chain.js";
 export {
+  prepareFullResolverNatsConfig,
+  renderFullResolverNatsConfig,
+  type FullResolverNatsConfigOptions,
+  type PrepareFullResolverNatsConfigOptions,
+  type PreparedFullResolverNatsConfig,
+} from "./nats-server-config.js";
+export { atomicWritePrivateFile } from "./private-file.js";
+export {
   DeviceFlowEnrollment,
   EnrollmentValidationError,
   type ApproveOutcome,

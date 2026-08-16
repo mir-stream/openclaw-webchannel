@@ -10,7 +10,7 @@ const KEY_B = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 const account = createAccount();
 const base = {
   saasTrustChain: { rsaPrivateKeyPem: "-----BEGIN PRIVATE KEY-----\nTEST\n-----END PRIVATE KEY-----", natsAccountSeed: new TextDecoder().decode(account.getSeed()) },
-  natsAccountConfig: { operatorJwt: "op", accountJwt: "acct", resolverConfig: {}, accountPublicKey: "pub" },
+  natsAccountConfig: { operatorJwt: "op", accountJwt: "acct", resolverConfig: {}, accountPublicKey: "pub", systemAccountPublicKey: "sys" },
   saasBaseUrl: "https://saas.test", jwksUrl: "https://saas.test/jwks", bootstrapUrl: "https://saas.test/bootstrap",
   natsUrl: "wss://nats.test", expirationSeconds: 600, pollIntervalSeconds: 5,
 };

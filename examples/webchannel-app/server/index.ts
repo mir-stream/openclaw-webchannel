@@ -23,7 +23,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -43,6 +42,7 @@ import {
 import esbuild from "esbuild";
 
 import { bootNatsServer, type NatsHandle } from "./nats.js";
+import { resolveWebchannelAppStatePaths } from "./runtime-paths.js";
 import { login, canAccess, newSessionToken, type AppUser } from "./users.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -68,9 +68,10 @@ const SAAS_BASE_URL = process.env.SAAS_BASE_URL || `http://127.0.0.1:${PORT}`;
 // The bootstrap-JWT `iss`. Defaults to the base URL (the plugin derives the
 // expected issuer from the SaaS anchor), so a zero-config boot self-matches.
 const SAAS_ISSUER = process.env.SAAS_ISSUER || SAAS_BASE_URL;
-const TRUST_CHAIN_PATH =
-  process.env.TRUST_CHAIN_PATH || join(tmpdir(), `webchannel-app-trust-${process.pid}.json`);
-const CONFIG_DIR = process.env.NATS_CONFIG_OUT || join(tmpdir(), `webchannel-app-nats-${process.pid}`);
+const {
+  trustChainPath: TRUST_CHAIN_PATH,
+  natsConfigDir: CONFIG_DIR,
+} = resolveWebchannelAppStatePaths(process.env);
 // Admin token gating for approve/deny/revoke. It deliberately fails closed when
 // unset because approval hands back tenant-wide agent credentials.
 const ENROLLMENT_ADMIN_TOKEN = process.env.ENROLLMENT_ADMIN_TOKEN;
@@ -130,10 +131,14 @@ async function setupRelay(): Promise<RelaySetup> {
     operatorName: "example-operator",
     accountName: "example-account",
   });
+  if (!trustChain.private.systemAccountCredentials) {
+    throw new Error("self-contained trust chain is missing its system-account credential");
+  }
   // Overload without `externalNatsAccount` narrows natsConfig to the
   // self-contained shape bootNatsServer needs.
   const natsHandle = bootNatsServer({
     natsConfig: trustChain.natsConfig,
+    systemAccountCredentials: trustChain.private.systemAccountCredentials,
     configDir: CONFIG_DIR,
     wsPort: NATS_WS,
     tcpPort: NATS_TCP,

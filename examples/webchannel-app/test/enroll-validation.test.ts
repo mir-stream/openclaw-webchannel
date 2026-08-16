@@ -1,12 +1,16 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { DeviceFlowEnrollment } from "@mir-stream/webchannel-saas";
 import { createAccount } from "@nats-io/nkeys";
 import { exampleAssert as assert, exampleTest } from "../../../scripts/example-test-guard.mjs";
 
 exampleTest("I132-E4: webchannel app preserves enrollment validation semantics", async () => {
 
-process.env.TRUST_CHAIN_PATH = `/tmp/openclaw-example-enroll-validation-${process.pid}.json`;
+const trustRoot = mkdtempSync(join(tmpdir(), "openclaw-example-enroll-validation-"));
+process.env.TRUST_CHAIN_PATH = join(trustRoot, "trust-chain.json");
 process.env.RELAY = "synadia";
 process.env.NATS_URL = "wss://example.invalid";
 process.env.NATS_ACCOUNT_ID = createAccount().getPublicKey();
@@ -81,5 +85,7 @@ try {
 } catch (error) {
   console.error(error);
   throw error;
+} finally {
+  rmSync(trustRoot, { recursive: true, force: true });
 }
 });

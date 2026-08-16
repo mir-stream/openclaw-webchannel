@@ -27,19 +27,40 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
-import { fromSeed, createUser } from "@nats-io/nkeys";
-import { encodeUser } from "@nats-io/jwt";
+import {
+  createAccount,
+  createOperator,
+  createUser,
+  fromPublic,
+  fromSeed,
+} from "@nats-io/nkeys";
+import {
+  decode,
+  encodeAccount,
+  encodeOperator,
+  encodeUser,
+  parseCreds,
+} from "@nats-io/jwt";
 
 import { setupTrustChain } from "./setup-trust-chain.js";
+import {
+  prepareFullResolverNatsConfig,
+  renderFullResolverNatsConfig,
+} from "./nats-server-config.js";
 import type { SetupTrustChainResult, NatsSelfContainedAccountConfig } from "./types.js";
 import { DeviceFlowEnrollment } from "./device-flow-enrollment.js";
 import { MemoryEnrollmentRepository } from "./enrollment-repository.js";
@@ -48,6 +69,7 @@ import { mintNatsUserCreds } from "./nats-user-creds.js";
 import { makeNkeySigningCallback } from "../../plugin/src/nkey-sign.js";
 import { NatsTransport } from "../../plugin/src/nats-transport.js";
 import { dialRelayForPreflight } from "../../plugin/src/preflight.js";
+import { resolveWebchannelAppStatePaths } from "../../../examples/webchannel-app/server/runtime-paths.js";
 
 // ---------------------------------------------------------------------------
 // Locate the nats-server binary
@@ -186,8 +208,9 @@ async function connectWithJwt(
   jwt: string,
   seed: string,
   _clientName: string,
+  url = wsUrl,
 ): Promise<{ ws: WebSocket; ready: Promise<void> }> {
-  const ws = new WebSocket(wsUrl);
+  const ws = new WebSocket(url);
   const userKp = fromSeed(new TextEncoder().encode(seed));
 
   const ready = new Promise<void>((resolve, reject) => {
@@ -235,6 +258,145 @@ async function connectWithJwt(
   return { ws, ready };
 }
 
+/** Send one NATS request over the already-tested raw WebSocket protocol. */
+async function requestWithJwt(
+  jwt: string,
+  seed: string,
+  subject: string,
+  payload: string,
+  url = wsUrl,
+): Promise<string> {
+  const { ws, ready } = await connectWithJwt(jwt, seed, "system-request", url);
+  await ready;
+
+  const inbox = `_INBOX.claims_update.${randomUUID().replaceAll("-", "")}`;
+  const response = new Promise<string>((resolve, reject) => {
+    let protocol = "";
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("CLAIMS.UPDATE request timed out without a reply"));
+    }, 4000);
+
+    const cleanup = () => {
+      clearTimeout(timeout);
+      ws.off("message", onMessage);
+    };
+    const onMessage = (data: Buffer) => {
+      protocol += data.toString();
+      if (protocol.includes("-ERR")) {
+        cleanup();
+        reject(new Error(protocol.trim()));
+        return;
+      }
+
+      const marker = `MSG ${inbox} 1 `;
+      const headerStart = protocol.indexOf(marker);
+      if (headerStart < 0) return;
+      const headerEnd = protocol.indexOf("\r\n", headerStart);
+      if (headerEnd < 0) return;
+      const size = Number(protocol.slice(headerStart + marker.length, headerEnd));
+      if (!Number.isInteger(size) || size < 0) {
+        cleanup();
+        reject(new Error("CLAIMS.UPDATE reply has an invalid NATS MSG size"));
+        return;
+      }
+      const bodyStart = headerEnd + 2;
+      if (protocol.length < bodyStart + size + 2) return;
+      cleanup();
+      resolve(protocol.slice(bodyStart, bodyStart + size));
+    };
+    ws.on("message", onMessage);
+  });
+
+  ws.send(`SUB ${inbox} 1\r\n`);
+  ws.send(
+    `PUB ${subject} ${inbox} ${Buffer.byteLength(payload)}\r\n${payload}\r\nPING\r\n`,
+  );
+  try {
+    return await response;
+  } finally {
+    ws.close();
+  }
+}
+
+type RestartProbeServer = {
+  proc: ChildProcess;
+  wsUrl: string;
+  resolverDir: string;
+  config: string;
+};
+
+async function startRestartProbeServer(options: {
+  configDir: string;
+  operatorJwtPath: string;
+  systemAccountPublicKey: string;
+  resolverConfig: Record<string, string>;
+  bootName: string;
+}): Promise<RestartProbeServer> {
+  const portsDir = join(options.configDir, `ports-${options.bootName}`);
+  mkdirSync(portsDir, { recursive: true });
+  const prepared = prepareFullResolverNatsConfig({
+    configDir: options.configDir,
+    operatorJwtPath: options.operatorJwtPath,
+    systemAccountPublicKey: options.systemAccountPublicKey,
+    resolverConfig: options.resolverConfig,
+    tcpPort: -1,
+    websocketPort: -1,
+    host: "127.0.0.1",
+  });
+  const confPath = join(options.configDir, `nats-${options.bootName}.conf`);
+  writeFileSync(confPath, prepared.config);
+
+  const proc = spawn(
+    NATS_SERVER_BIN!,
+    ["-c", confPath, "--ports_file_dir", portsDir],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let ready = false;
+  let serverLog = "";
+  const onData = (buf: Buffer) => {
+    serverLog += buf.toString();
+    if (buf.toString().includes("Server is ready")) ready = true;
+  };
+  proc.stdout?.on("data", onData);
+  proc.stderr?.on("data", onData);
+
+  try {
+    const websocketPort = await waitForNatsListenerPort(
+      portsDir,
+      "websocket",
+      () => ready,
+      10000,
+      100,
+    );
+    return {
+      proc,
+      wsUrl: `ws://127.0.0.1:${websocketPort}`,
+      resolverDir: prepared.resolverDir,
+      config: prepared.config,
+    };
+  } catch (error) {
+    proc.kill("SIGKILL");
+    throw new Error(
+      `restart-probe nats-server did not become ready:\n${serverLog}\n${String(error)}`,
+    );
+  }
+}
+
+async function stopNatsServer(proc: ChildProcess): Promise<void> {
+  if (proc.exitCode !== null || proc.signalCode !== null) return;
+  const exited = new Promise<void>((resolve) => proc.once("exit", () => resolve()));
+  proc.kill("SIGTERM");
+  const stopped = await Promise.race([
+    exited.then(() => true),
+    new Promise<false>((resolve) => setTimeout(() => resolve(false), 5000)),
+  ]);
+  if (!stopped) {
+    proc.kill("SIGKILL");
+    await exited;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Test setup
 // ---------------------------------------------------------------------------
@@ -249,11 +411,23 @@ beforeAll(async () => {
   trustChain = await setupTrustChain({
     operatorName: "test-operator",
     accountName: "test-account",
+    returnOperatorSeed: true,
   });
 
   // Write operator JWT
   const operatorJwtPath = join(testDir, "operator.jwt");
   writeFileSync(operatorJwtPath, trustChain.natsConfig.operatorJwt);
+  const systemCredentialsPath = join(testDir, "system-account.creds");
+  if (!trustChain.private.systemAccountCredentials) {
+    throw new Error("self-contained trust chain is missing its system-account credential");
+  }
+  writeFileSync(systemCredentialsPath, trustChain.private.systemAccountCredentials, {
+    mode: 0o600,
+  });
+  chmodSync(systemCredentialsPath, 0o600);
+  if ((statSync(systemCredentialsPath).mode & 0o777) !== 0o600) {
+    throw new Error("system-account credential file is not owner-readable only");
+  }
 
   // Configure enrollment service
   enrollment = new DeviceFlowEnrollment({
@@ -266,30 +440,22 @@ beforeAll(async () => {
     natsUrl: "wss://nats.test.com",
   });
 
-  // Create nats-server config with JWT authentication. A real nats-server needs
-  // a trusted `operator` JWT plus a MEMORY resolver preloaded with each account
-  // JWT keyed by its public NKEY (not a bare file path).
-  const preload = Object.entries(trustChain.natsConfig.resolverConfig)
-    .map(([accPub, accJwt]) => `  ${accPub}: "${accJwt}"`)
-    .join("\n");
+  // Create nats-server config with JWT authentication and a writable full/Dir
+  // resolver. The directory is unique to this run, so no prior JWT can seed a
+  // false-positive test result.
+  const resolverDir = mkdtempSync(join(testDir, "resolver-jwt-"));
   const confPath = join(testDir, "nats.conf");
   writeFileSync(
     confPath,
-    [
-      `host: "127.0.0.1"`,
-      `port: -1`,
-      `websocket {`,
-      `  host: "127.0.0.1"`,
-      `  port: -1`,
-      `  no_tls: true`,
-      `}`,
-      `operator: "${operatorJwtPath}"`,
-      `resolver: MEMORY`,
-      `resolver_preload: {`,
-      preload,
-      `}`,
-      "",
-    ].join("\n"),
+    renderFullResolverNatsConfig({
+      operatorJwtPath,
+      resolverDir,
+      systemAccountPublicKey: trustChain.natsConfig.systemAccountPublicKey,
+      resolverConfig: trustChain.natsConfig.resolverConfig,
+      tcpPort: -1,
+      websocketPort: -1,
+      host: "127.0.0.1",
+    }),
   );
 
   // Start nats-server
@@ -334,6 +500,7 @@ afterAll(async () => {
     server.kill("SIGKILL");
     server = null;
   }
+  if (testDir) rmSync(testDir, { recursive: true, force: true });
   testDir = null;
   trustChain = null;
   enrollment = null;
@@ -487,9 +654,234 @@ describe.skipIf(!NATS_SERVER_BIN)(
       expect(trustChain!.natsConfig.accountJwt).toBeTruthy();
     });
 
+    it("accepts an operator-signed account JWT over $SYS.REQ.CLAIMS.UPDATE", async () => {
+      const chain = trustChain!;
+      const operatorSeed = chain.private.operatorSeed;
+      const systemCredentials = chain.private.systemAccountCredentials;
+      expect(operatorSeed).toMatch(/^SO/);
+      expect(systemCredentials).toBeTruthy();
+
+      // Ensure the replacement claim has a later `iat`, as a real control-plane
+      // update would. The payload change is deliberately non-revocation scope.
+      const original = decode(chain.natsConfig.accountJwt);
+      while (Math.floor(Date.now() / 1000) <= original.iat) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      const updatedAccountJwt = await encodeAccount(
+        "test-account",
+        fromPublic(chain.natsConfig.accountPublicKey),
+        {
+          description: "runtime resolver update acceptance probe",
+          limits: {
+            conn: -1,
+            subs: -1,
+            data: -1,
+            payload: -1,
+            imports: -1,
+            exports: -1,
+            wildcards: true,
+            leaf: -1,
+          },
+        },
+        { signer: fromSeed(new TextEncoder().encode(operatorSeed!)) },
+      );
+      expect(updatedAccountJwt).not.toBe(chain.natsConfig.accountJwt);
+
+      const credentials = await parseCreds(new TextEncoder().encode(systemCredentials!));
+      const rawReply = await requestWithJwt(
+        credentials.jwt,
+        credentials.key,
+        "$SYS.REQ.CLAIMS.UPDATE",
+        updatedAccountJwt,
+      );
+      const reply = JSON.parse(rawReply) as {
+        data?: { account?: string; code?: number; message?: string };
+      };
+      expect(reply.data).toMatchObject({
+        account: chain.natsConfig.accountPublicKey,
+        code: 200,
+        message: expect.stringMatching(/updated/i),
+      });
+    });
+
+    it("preserves an accepted account claim across config regeneration and restart", async () => {
+      // Mirror two full example-app boots: a persisted trust chain with no
+      // explicit NATS_CONFIG_OUT must resolve to the same state root each time.
+      const explicitTrustChainPath = join(testDir!, "example-trust-chain.json");
+      const firstAppPaths = resolveWebchannelAppStatePaths(
+        { TRUST_CHAIN_PATH: explicitTrustChainPath },
+        testDir!,
+      );
+      expect(firstAppPaths.natsConfigDir).toBe(`${explicitTrustChainPath}.nats`);
+      const callerOwnedConfigDir = join(testDir!, "caller-owned-nats-config");
+      expect(
+        resolveWebchannelAppStatePaths(
+          {
+            TRUST_CHAIN_PATH: explicitTrustChainPath,
+            NATS_CONFIG_OUT: callerOwnedConfigDir,
+          },
+          testDir!,
+        ).natsConfigDir,
+      ).toBe(callerOwnedConfigDir);
+      const configDir = firstAppPaths.natsConfigDir;
+      mkdirSync(configDir, { recursive: true });
+
+      const ephemeralFirst = resolveWebchannelAppStatePaths({}, testDir!);
+      const ephemeralSecond = resolveWebchannelAppStatePaths({}, testDir!);
+      expect(ephemeralFirst.ephemeralRoot).not.toBe(ephemeralSecond.ephemeralRoot);
+      expect(statSync(ephemeralFirst.ephemeralRoot!).mode & 0o777).toBe(0o700);
+      expect(statSync(ephemeralSecond.ephemeralRoot!).mode & 0o777).toBe(0o700);
+
+      // This isolated chain deliberately grants lookup only to the test probe.
+      // Production's temporary global-update credential remains unchanged; the
+      // final scoped publisher and rotation protocol belong to the next phase.
+      const operatorKp = createOperator();
+      const accountKp = createAccount();
+      const systemAccountKp = createAccount();
+      const systemUserKp = createUser();
+      const accountPublicKey = accountKp.getPublicKey();
+      const systemAccountPublicKey = systemAccountKp.getPublicKey();
+      const accountLimits = {
+        conn: -1,
+        subs: -1,
+        data: -1,
+        payload: -1,
+        imports: -1,
+        exports: -1,
+        wildcards: true,
+        leaf: -1,
+      };
+      const operatorJwt = await encodeOperator("restart-probe-operator", operatorKp, {
+        system_account: systemAccountPublicKey,
+      });
+      const originalAccountJwt = await encodeAccount(
+        "restart-probe-account",
+        accountKp,
+        { limits: accountLimits },
+        { signer: operatorKp },
+      );
+      const systemAccountJwt = await encodeAccount(
+        "restart-probe-system-account",
+        systemAccountKp,
+        { limits: accountLimits },
+        { signer: operatorKp },
+      );
+      const lookupSubject =
+        `$SYS.REQ.ACCOUNT.${accountPublicKey}.CLAIMS.LOOKUP`;
+      const systemUserJwt = await encodeUser(
+        "restart-probe-system-user",
+        systemUserKp,
+        systemAccountKp,
+        {
+          pub: { allow: ["$SYS.REQ.CLAIMS.UPDATE", lookupSubject] },
+          sub: { allow: ["_INBOX.>"] },
+        },
+      );
+      const systemUserSeed = new TextDecoder().decode(systemUserKp.getSeed());
+      const operatorJwtPath = join(configDir, "operator.jwt");
+      writeFileSync(operatorJwtPath, operatorJwt);
+      const resolverConfig = {
+        [accountPublicKey]: originalAccountJwt,
+        [systemAccountPublicKey]: systemAccountJwt,
+      };
+
+      let firstBoot: RestartProbeServer | null = null;
+      let secondBoot: RestartProbeServer | null = null;
+      try {
+        firstBoot = await startRestartProbeServer({
+          configDir,
+          operatorJwtPath,
+          systemAccountPublicKey,
+          resolverConfig,
+          bootName: "first",
+        });
+        expect(statSync(firstBoot.resolverDir).mode & 0o777).toBe(0o700);
+
+        const original = decode(originalAccountJwt);
+        while (Math.floor(Date.now() / 1000) <= original.iat) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        const updatedAccountJwt = await encodeAccount(
+          "restart-probe-account",
+          fromPublic(accountPublicKey),
+          {
+            description: "restart persistence probe",
+            limits: accountLimits,
+          },
+          { signer: operatorKp },
+        );
+        expect(updatedAccountJwt).not.toBe(originalAccountJwt);
+
+        const rawUpdateReply = await requestWithJwt(
+          systemUserJwt,
+          systemUserSeed,
+          "$SYS.REQ.CLAIMS.UPDATE",
+          updatedAccountJwt,
+          firstBoot.wsUrl,
+        );
+        const updateReply = JSON.parse(rawUpdateReply) as {
+          data?: { account?: string; code?: number; message?: string };
+        };
+        expect(updateReply.data).toMatchObject({
+          account: accountPublicKey,
+          code: 200,
+          message: expect.stringMatching(/updated/i),
+        });
+
+        const persistedAccountJwtPath = join(
+          firstBoot.resolverDir,
+          `${accountPublicKey}.jwt`,
+        );
+        await waitFor(
+          () =>
+            existsSync(persistedAccountJwtPath) &&
+            readFileSync(persistedAccountJwtPath, "utf8").trim() === updatedAccountJwt,
+          5000,
+          50,
+        );
+        await stopNatsServer(firstBoot.proc);
+
+        // Regenerate the config exactly as a caller restart does. The helper
+        // must reuse the resolver directory and omit stale bootstrap preloads.
+        // Simulate an interrupted first boot by removing only the system-account
+        // file: missing accounts should still be seeded without replaying the
+        // older tenant claim that remains present.
+        rmSync(join(firstBoot.resolverDir, `${systemAccountPublicKey}.jwt`));
+        const secondAppPaths = resolveWebchannelAppStatePaths(
+          { TRUST_CHAIN_PATH: explicitTrustChainPath },
+          testDir!,
+        );
+        expect(secondAppPaths.natsConfigDir).toBe(firstAppPaths.natsConfigDir);
+        secondBoot = await startRestartProbeServer({
+          configDir: secondAppPaths.natsConfigDir,
+          operatorJwtPath,
+          systemAccountPublicKey,
+          resolverConfig,
+          bootName: "second",
+        });
+        expect(secondBoot.resolverDir).toBe(firstBoot.resolverDir);
+        expect(secondBoot.config).toContain(systemAccountJwt);
+        expect(secondBoot.config).not.toContain(originalAccountJwt);
+        expect(secondBoot.config).not.toContain(updatedAccountJwt);
+
+        const readBackJwt = await requestWithJwt(
+          systemUserJwt,
+          systemUserSeed,
+          lookupSubject,
+          "",
+          secondBoot.wsUrl,
+        );
+        expect(readBackJwt).toBe(updatedAccountJwt);
+        expect(decode(readBackJwt).jti).toBe(decode(updatedAccountJwt).jti);
+      } finally {
+        if (secondBoot) await stopNatsServer(secondBoot.proc);
+        if (firstBoot) await stopNatsServer(firstBoot.proc);
+      }
+    }, 30000);
+
     it("a connection WITHOUT NATS credentials is refused by the JWT-auth server", async () => {
       // authN invariant (previously covered by the deleted e2e/enrolled-jwt-roundtrip.test.ts):
-      // the operator + MEMORY-resolver server grants NO anonymous access, so a CONNECT carrying
+      // the operator + full-resolver server grants NO anonymous access, so a CONNECT carrying
       // no JWT and no signature must be rejected — never flipped to connected.
       const ws = new WebSocket(wsUrl);
       const outcome = await new Promise<"refused" | "connected">((resolve, reject) => {

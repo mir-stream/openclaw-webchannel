@@ -90,7 +90,7 @@ async function main() {
   console.log("\n🚀 Trust chain ready!");
   console.log("\nNext steps:");
   console.log("  1. Store saas-private.json securely (env var, secret manager, HSM)");
-  console.log("  2. Load nats-config.json into nats-server (memory resolver or URL)");
+  console.log("  2. Seed a nats-server full/Dir resolver from nats-config.json");
   console.log("  3. Publish jwks.json at your SaaS JWKS endpoint");
   console.log("  4. Verify nats-server starts with the new config");
   console.log("  5. Test plugin enrollment with the new trust chain\n");

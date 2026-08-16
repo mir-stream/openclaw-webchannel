@@ -94,7 +94,7 @@ pkill -f "echo-openai-server.mjs $ECHO_A_PORT" 2>/dev/null || true
 pkill -f "echo-openai-server.mjs $ECHO_B_PORT" 2>/dev/null || true
 pkill -f "gateway --port $GW_PORT" 2>/dev/null || true
 rm -rf "$OCH"
-mkdir -p "$OCH/.openclaw"
+harness_prepare_private_root "$OCH"
 
 # ---------------------------------------------------------------------------
 # 0a. Build the plugin bundle from the working tree (#125).
@@ -135,12 +135,8 @@ for i in $(seq 1 120); do
   kill -0 "$ISSUER_PID" 2>/dev/null || { cat "$OCH/issuer.log"; exit 2; }
   sleep 0.25
 done
-OCH="$OCH" NATS_TCP="$NATS_TCP" NATS_WS="$NATS_WS" node -e '
-  const fs=require("fs"), d=process.env.OCH;
-  const r=JSON.parse(fs.readFileSync(d+"/resolver.json","utf8"));
-  const preload=Object.entries(r).map(([k,v])=>`  ${k}: "${v}"`).join("\n");
-  fs.writeFileSync(d+"/nats.conf", `port: ${process.env.NATS_TCP}\nwebsocket { port: ${process.env.NATS_WS}, no_tls: true }\noperator: "${d}/operator.jwt"\nresolver: MEMORY\nresolver_preload: {\n${preload}\n}\n`);
-'
+NATS_CONFIG_DIR="$OCH" NATS_TCP="$NATS_TCP" NATS_WS="$NATS_WS" \
+  node --import tsx "$REPO/scripts/generate-nats-server-config.mjs"
 nats-server -c "$OCH/nats.conf" >"$OCH/nats.log" 2>&1 &
 NATS_PID=$!
 echo "[run-two-acct] nats-server pid=$NATS_PID (ws://127.0.0.1:$NATS_WS)"

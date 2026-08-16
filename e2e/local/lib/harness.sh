@@ -50,6 +50,62 @@ _harness_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # e2e/local/l
 HARNESS_REPO="$(cd "$_harness_lib_dir/../../.." && pwd)"           # repo root
 HARNESS_PORTS_JSON="$_harness_lib_dir/../ports.json"               # e2e/local/ports.json
 
+# harness_prepare_private_root <root>
+#
+# Creates the per-run OpenClaw layout without deleting anything, then makes the
+# root owner-only. Callers retain their explicit, narrowly scoped pre-clean so
+# this helper can never turn an empty or malformed argument into an `rm` target.
+harness_prepare_private_root() {
+  if [ "$#" -ne 1 ] || [ -z "${1:-}" ]; then
+    echo "[harness] FATAL: harness_prepare_private_root requires one non-empty root path" >&2
+    return 2
+  fi
+
+  local root
+  root="$(node -e '
+    const { resolve } = require("node:path");
+    process.stdout.write(resolve(process.argv[1]));
+  ' "$1")" || {
+    echo "[harness] FATAL: could not resolve private root: $1" >&2
+    return 2
+  }
+
+  if [ "$root" = "/" ]; then
+    echo "[harness] FATAL: refusing unsafe private root target: $1" >&2
+    return 2
+  fi
+  if [ -L "$root" ]; then
+    echo "[harness] FATAL: private root must not be a symlink: $root" >&2
+    return 2
+  fi
+
+  mkdir -p "$root/.openclaw" || {
+    echo "[harness] FATAL: could not create private root layout: $root" >&2
+    return 2
+  }
+  if [ -L "$root" ] || [ ! -d "$root" ]; then
+    echo "[harness] FATAL: private root is not a real directory: $root" >&2
+    return 2
+  fi
+  chmod 0700 "$root" || {
+    echo "[harness] FATAL: could not set private root mode 0700: $root" >&2
+    return 2
+  }
+
+  local mode
+  mode="$(node -e '
+    const fs = require("node:fs");
+    process.stdout.write((fs.statSync(process.argv[1]).mode & 0o777).toString(8));
+  ' "$root")" || {
+    echo "[harness] FATAL: could not verify private root mode: $root" >&2
+    return 2
+  }
+  if [ "$mode" != "700" ]; then
+    echo "[harness] FATAL: private root mode is $mode, expected 700: $root" >&2
+    return 2
+  fi
+}
+
 # harness_ports <harness-name> [log-tag]
 #
 # Exports every port in e2e/local/ports.json under harnesses.<harness-name> as a
