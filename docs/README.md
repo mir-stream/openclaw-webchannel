@@ -12,6 +12,7 @@ seed(`.ouroboros/*`)·평가 점수에 "AC 100% / complete"가 보여도, 그것
 | [`REVIEW_2026-07-15.md`](REVIEW_2026-07-15.md) | 저장소 전체 리뷰와 우선순위 실행안. auto-admission·Gateway-WS 완전 삭제, 전달 보장, account-scoped agent identity/key lifecycle·agent replica key 불변식·issuer HA 및 reference hardening | 실행 인덱스 (후속 PLAN 결정 우선) |
 | [`archive/PLAN.md`](archive/PLAN.md) | 초기 범위·아키텍처·단계 | 보관된 설계 기록 |
 | [`archive/ISSUE_54_ACCOUNT_BOUND_AUDIENCE_PLAN.md`](archive/ISSUE_54_ACCOUNT_BOUND_AUDIENCE_PLAN.md) | account-bound JWT audience 보안 변경의 최종 v11 기획·리뷰 기록 | 보관된 구현 설계 (#76 완료) |
+| [`CREDENTIAL_CONTAINMENT_RUNBOOK.md`](CREDENTIAL_CONTAINMENT_RUNBOOK.md) | 브라우저/에이전트 크레덴셜 또는 대화 열쇠 K 유출 시 운영자 봉쇄 절차 (#83) | **운영 런북 · 사고 시 진입점** |
 | [`AUTH.md`](AUTH.md) | 인증·신원 모델 (`assertJwtAuthConfig` + NATS register-hop 검증) | 설계 (라이브 검증됨) |
 | [`TRUST_AND_ONBOARDING.md`](TRUST_AND_ONBOARDING.md) | E2E NATS relay 신뢰 결합 + 디바이스-플로우 온보딩 | ✅ 라이브 검증됨 (live-proven) |
 | [`PACKAGING.md`](PACKAGING.md) | 패키지 구조·배포/ClawHub 체크리스트 | 일부 미완 |

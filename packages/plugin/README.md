@@ -193,9 +193,17 @@ previously unseen peers receive terminal `capacity_exceeded` code 507.
 
 Do not delete entries or the whole `conversation-keys.json`, and do not raise
 the cap: either action can break encrypted-history continuity. There is no
-automatic deletion or supported key-retention/revocation workflow yet. A
-capacity warning or rejection should first be treated as a routing incident:
-inspect issuer, scalar audience, account mapping, and unexpected `sub` churn.
+automatic key-retention workflow. A capacity warning or rejection should first be
+treated as a routing incident: inspect issuer, scalar audience, account mapping,
+and unexpected `sub` churn.
+
+**The one exception is a confirmed containment.** If a conversation key K leaked,
+replace it with the offline `openclaw-webchannel-rotate-key` command — with the
+gateway stopped — and follow
+[`docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md`](../../docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md)
+for the order of operations. Deleting `conversation-keys.json` is still never the
+way to rotate: it destroys every peer's key at once and leaves no audit trail,
+which is exactly what that command replaces.
 
 ### Account-sharding runbook
 

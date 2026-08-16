@@ -20,6 +20,11 @@
   Bringing observed replicas to zero first is an operator obligation, imposed by
   step ① of `docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md`.
 
+- **New: `docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md` (issue #83)** — the operator
+  procedure for a leaked browser credential, agent credential, or conversation
+  key. It branches by deployment class on the first screen, because the correct
+  order differs by class, and it marks the stop-first order as load-bearing.
+
 - Reasoning delivery now suppresses the pinned CLI runtime's exact durable
   replay only while its matching live burst remains open and its live send
   succeeded. A rejected live send retains the durable fallback. Independent
@@ -87,15 +92,33 @@ exposed.
 
 Before re-enabling an affected account, drain and stop **every** vulnerable
 replica and keep all affected accounts disabled. Revoke the affected issuer and
-relay bootstrap/NATS authorizations and active sessions, then rotate K and
-invalidate the old encrypted peer state through a verified control. Review the
-full exposure window and history as an incident. Deleting the old configuration,
-restarting only some replicas, or waiting for token expiry is **not** revocation.
+relay bootstrap/NATS authorizations and active sessions, then rotate K. Review
+the full exposure window and history as an incident. Deleting the old
+configuration, restarting only some replicas, or waiting for token expiry is
+**not** revocation.
 
-Integrated, verified K rotation/state invalidation is tracked by #72. If that
-control is not available for a deployment, do not improvise by deleting files or
-running an unverified migration: keep the accounts disabled and escalate through
-the service's incident-response process.
+**Correction.** An earlier revision of this entry also told operators to
+"invalidate the old encrypted peer state through a verified control". There is
+no such state, so an operator following that instruction had nowhere to go. K
+seals no history at rest: the history authority is OpenClaw core's session
+transcript (plaintext JSONL, owner-only), and `sendHistory` seals each frame with
+the **current** K at delivery time, so replacing K needs no invalidation pass —
+the next read-and-deliver reseals. What this plugin writes at rest is
+`credentials.json`, `conversation-keys.json`, the generation sidecar, and legacy
+migration artifacts, and nothing else.
+
+**The #72 deferral is now resolved for the containment path.** Revocation is
+available to a self-contained deployment that holds its operator seed
+(`addRevocation` plus the full/Dir resolver's `$SYS.REQ.CLAIMS.UPDATE`, with
+readback), and K rotation is available as the offline
+`openclaw-webchannel-rotate-key` command. Both are procedures, not automation:
+`docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md` is the operator runbook and is the
+document this entry now points to. What remains unproven is stated there —
+nothing in this repository can verify that every replica was stopped before K was
+rotated; that precondition is enforced by the operator, not by tooling. If you
+cannot follow that runbook for a deployment, the original guidance stands: do not
+improvise by deleting files or running an unverified migration — keep the
+accounts disabled and escalate through the service's incident-response process.
 
 - Each enabled account now completes pure account planning and immutable,
   account-bound auth preparation before that account consumes transport
