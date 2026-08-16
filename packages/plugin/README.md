@@ -104,7 +104,9 @@ tenant, account, SaaS base, delivered issuer/relay, and local public key.
   low-level `credentialPath` API remains one absolute exact credential file;
   relative overrides are rejected rather than resolved against the process
   working directory. When both are supplied, it does not relocate conversation
-  keys.
+  keys. The offline rotation entry accepts the same exact value as
+  `--credential-path`; use that option only when the deployment configured the
+  low-level override. Its value is never printed.
 - **Root changes:** `storageRoot` is not a live v2-to-v2 migration switch. Stop
   the gateway before moving the complete opaque tuple directory with its
   `0700`/`0600` permissions, or re-enroll and let browsers re-register.
@@ -131,7 +133,10 @@ renamed to an `.ambiguous-v2-*` archive and never adopted. That tuple starts wit
 an empty v2 key store, so browsers must re-register and receive a fresh K. A
 claim conflict, failed archive, destination mismatch, incomplete credential
 binding, or incomplete migration fails closed; do not run old and new binaries
-concurrently to work around it.
+concurrently to work around it. The offline rotation entry is deliberately more
+conservative: it preserves ownership-ambiguous legacy K and refuses the preview,
+so omitting or mistyping a configured exact `--credential-path` cannot silently
+turn the intended rotation target into an empty v2 store.
 
 ## E2E security model (admission + key establishment)
 

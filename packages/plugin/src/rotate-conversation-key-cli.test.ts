@@ -187,6 +187,51 @@ function credentialDocument(): string {
   });
 }
 
+function legacyCredentialDocument(): string {
+  const document = JSON.parse(credentialDocument()) as Record<string, unknown>;
+  delete document.credentialIdentity;
+  return JSON.stringify(document, null, 2);
+}
+
+function seedExactOverrideLegacyState(): {
+  legacy: ReturnType<typeof legacyTuplePaths>;
+  destination: ReturnType<typeof tupleStoragePaths>;
+  credentialPath: string;
+  credentialBytes: Buffer;
+  oldKey: string;
+} {
+  const legacy = legacyTuplePaths(ACCOUNT, storageRoot);
+  mkdirSync(legacy.directory, { recursive: true, mode: 0o700 });
+  const oldKey = Buffer.alloc(32, 0x45).toString("base64url");
+  writeFileSync(
+    legacy.conversationKeyPath,
+    JSON.stringify({ version: 1, keys: { "legacy-peer": oldKey } }),
+    { mode: 0o600 },
+  );
+  const credentialPath = join(
+    storageRoot,
+    "configured-exact-credentials",
+    "account.json",
+  );
+  mkdirSync(join(storageRoot, "configured-exact-credentials"), {
+    recursive: true,
+    mode: 0o700,
+  });
+  const credentialBytes = Buffer.from(legacyCredentialDocument());
+  writeFileSync(credentialPath, credentialBytes, { mode: 0o600 });
+  return {
+    legacy,
+    destination: tupleStoragePaths({
+      tenant: TENANT,
+      accountId: ACCOUNT,
+      home: storageRoot,
+    }),
+    credentialPath,
+    credentialBytes,
+    oldKey,
+  };
+}
+
 function durableKeyMaterial(): string[] {
   const document = JSON.parse(
     readFileSync(paths().conversationKeyPath, "utf8"),
@@ -236,6 +281,9 @@ describe("invocation", () => {
     );
     expect(result.out).toContain("ON APPLY FAILURE");
     expect(result.out).toContain("never rerun blindly");
+    expect(result.out).toContain("--credential-path <file>");
+    expect(result.out).toContain("low-level runtime credentialPath");
+    expect(result.out).toContain("never printed");
   });
 
   it("requires an exact tenant and account", () => {
@@ -295,6 +343,31 @@ describe("invocation", () => {
     expect(
       run(...tupleArgs(), "--all-peers", "--confirm-digest", "abc").code,
     ).toBe(ROTATE_CLI_EXIT_USAGE);
+  });
+
+  it("pins the managed combined route to stop before provider revocation", () => {
+    const runbook = readFileSync(
+      new URL(
+        "../../../docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    const classA = runbook
+      .split("## 3. Class A — managed NATS\n", 2)[1]
+      ?.split("\n## 4. Class B", 1)[0];
+    expect(classA).toBeDefined();
+    const combined = classA
+      ?.split("3. **Credential + K:**", 2)[1]
+      ?.split("\n\nFor an agent credential replacement", 1)[0];
+    expect(combined).toBeDefined();
+    const stopFirst = combined?.indexOf("go to §4 ① **before provider revocation**")
+      ?? -1;
+    const providerRevoke = combined?.indexOf(
+      "Only then revoke through the provider",
+    ) ?? -1;
+    expect(stopFirst).toBeGreaterThanOrEqual(0);
+    expect(providerRevoke).toBeGreaterThan(stopFirst);
   });
 });
 
@@ -388,6 +461,146 @@ describe("dry run", () => {
         keys: Record<string, string>;
       }).keys["legacy-peer"],
     ).toBe(oldKey);
+  });
+
+  it("preserves legacy K when an exact credential override is omitted or wrong", () => {
+    const state = seedExactOverrideLegacyState();
+    const legacyKeyBytes = readFileSync(state.legacy.conversationKeyPath);
+
+    const omitted = runWithRuntime(
+      [
+        "--tenant",
+        TENANT,
+        "--account",
+        ACCOUNT,
+        "--peer",
+        "legacy-peer",
+      ],
+      { home: storageRoot },
+    );
+    const wrongCredentialPath = join(
+      storageRoot,
+      "wrong-exact-credentials",
+      "account.json",
+    );
+    const wrong = runWithRuntime(
+      [
+        "--tenant",
+        TENANT,
+        "--account",
+        ACCOUNT,
+        "--credential-path",
+        wrongCredentialPath,
+        "--peer",
+        "legacy-peer",
+      ],
+      { home: storageRoot },
+    );
+
+    for (const result of [omitted, wrong]) {
+      expect(result.code).toBe(ROTATE_CLI_EXIT_FAILED);
+      expect(result.err).toContain("--credential-path");
+      expect(result.err).toContain("No legacy K was moved");
+    }
+    expect(readFileSync(state.legacy.conversationKeyPath)).toEqual(
+      legacyKeyBytes,
+    );
+    expect(readFileSync(state.credentialPath)).toEqual(state.credentialBytes);
+    expect(existsSync(state.destination.conversationKeyPath)).toBe(false);
+    expect(
+      readdirSync(state.legacy.directory).some((name) =>
+        name.startsWith("conversation-keys.json.ambiguous-v2-"),
+      ),
+    ).toBe(false);
+    expect(omitted.all).not.toContain(state.credentialPath);
+    expect(wrong.all).not.toContain(state.credentialPath);
+    expect(wrong.all).not.toContain(wrongCredentialPath);
+    const privateKey = (
+      JSON.parse(state.credentialBytes.toString("utf8")) as {
+        identityKey: { privateKey: string };
+      }
+    ).identityKey.privateKey;
+    expectNoSecrets(omitted, [state.oldKey, privateKey]);
+    expectNoSecrets(wrong, [state.oldKey, privateKey]);
+  });
+
+  it("migrates and previews legacy K with the exact credential override", () => {
+    const state = seedExactOverrideLegacyState();
+
+    const result = runWithRuntime(
+      [
+        "--tenant",
+        TENANT,
+        "--account",
+        ACCOUNT,
+        "--credential-path",
+        state.credentialPath,
+        "--peer",
+        "legacy-peer",
+      ],
+      { home: storageRoot },
+    );
+
+    expect(result.code, result.err).toBe(ROTATE_CLI_EXIT_OK);
+    expect(result.out).toContain("DRY RUN");
+    expect(
+      (JSON.parse(
+        readFileSync(state.destination.conversationKeyPath, "utf8"),
+      ) as { keys: Record<string, string> }).keys["legacy-peer"],
+    ).toBe(state.oldKey);
+    expect(existsSync(state.legacy.conversationKeyPath)).toBe(false);
+    expect(readFileSync(state.credentialPath, "utf8")).toContain(
+      '"credentialIdentity"',
+    );
+    expect(result.all).not.toContain(state.credentialPath);
+    const privateKey = (
+      JSON.parse(state.credentialBytes.toString("utf8")) as {
+        identityKey: { privateKey: string };
+      }
+    ).identityKey.privateKey;
+    expectNoSecrets(result, [state.oldKey, privateKey]);
+  });
+
+  it("rejects a relative credential override before any migration mutation", () => {
+    const state = seedExactOverrideLegacyState();
+    const legacyKeyBytes = readFileSync(state.legacy.conversationKeyPath);
+    const relativeCredentialPath =
+      "configured-exact-credentials/account.json";
+
+    const result = runWithRuntime(
+      [
+        "--tenant",
+        TENANT,
+        "--account",
+        ACCOUNT,
+        "--credential-path",
+        relativeCredentialPath,
+        "--peer",
+        "legacy-peer",
+      ],
+      { home: storageRoot },
+    );
+
+    expect(result.code).toBe(ROTATE_CLI_EXIT_USAGE);
+    expect(result.err).toContain("must be an absolute filesystem path");
+    expect(readFileSync(state.legacy.conversationKeyPath)).toEqual(
+      legacyKeyBytes,
+    );
+    expect(readFileSync(state.credentialPath)).toEqual(state.credentialBytes);
+    expect(existsSync(state.destination.conversationKeyPath)).toBe(false);
+    expect(
+      readdirSync(state.legacy.directory).some((name) =>
+        name.startsWith("conversation-keys.json.ambiguous-v2-"),
+      ),
+    ).toBe(false);
+    expect(result.all).not.toContain(state.credentialPath);
+    expect(result.all).not.toContain(relativeCredentialPath);
+    const privateKey = (
+      JSON.parse(state.credentialBytes.toString("utf8")) as {
+        identityKey: { privateKey: string };
+      }
+    ).identityKey.privateKey;
+    expectNoSecrets(result, [state.oldKey, privateKey]);
   });
 
   it("prints no key material or seed", () => {

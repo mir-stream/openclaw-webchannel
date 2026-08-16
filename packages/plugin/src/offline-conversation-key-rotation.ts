@@ -249,6 +249,10 @@ export class OfflineConversationKeyRotator {
     migrateLegacyTupleState({
       tenant: this.options.tenant,
       accountId: this.options.accountId,
+      // Unlike live startup, an incident-response preview must not quarantine
+      // a K merely because the operator omitted/mistyped an exact credential
+      // override. Preserve it until ownership can be proven explicitly.
+      ambiguousConversationKeyPolicy: "preserve",
       ...(this.options.storageRoot !== undefined
         ? { storageRoot: this.options.storageRoot }
         : {}),

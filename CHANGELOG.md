@@ -19,7 +19,11 @@
   count, which a regression test pins. Existing locks and atomic-write temp
   artifacts on a shared store now fail closed without local-PID takeover or
   automatic cleanup, and apply failures distinguish unverified durable state
-  from a verified commit whose lock cleanup failed.
+  from a verified commit whose lock cleanup failed. Deployments using the
+  low-level exact credential-file override can pass the same absolute path as
+  `--credential-path`; offline previews preserve and refuse ownership-ambiguous
+  legacy K when that option is omitted or wrong instead of quarantining it and
+  publishing an empty v2 key store.
 
   It does **not** prove that the gateway is stopped, and does not claim to:
   this is a library and cannot know your deployment topology, so the controller

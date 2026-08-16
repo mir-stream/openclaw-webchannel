@@ -30,6 +30,8 @@
  * The CLI never holds a K to leak.
  */
 
+import { isAbsolute } from "node:path";
+
 import {
   type AccountRotationSummary,
   ConversationKeyReadbackError,
@@ -85,6 +87,11 @@ OPTIONS
                           before either document is written.
   --storage-root <dir>    Override the v2 storage root. Only for deployments
                           that moved it; the tuple layout underneath is fixed.
+  --credential-path <file>
+                          Exact absolute low-level runtime credentialPath. Use
+                          only when this deployment configured that override;
+                          it proves ownership during legacy migration and is
+                          never printed.
   --ignore-live-writers   Bypass the temp-artifact refusal (see below).
   --help, -h              Print this and exit.
 
@@ -137,6 +144,7 @@ type ParsedInvocation =
       apply: boolean;
       confirmDigest: string | null;
       storageRoot: string | null;
+      credentialPath: string | null;
       ignoreLiveWriters: boolean;
     };
 
@@ -146,6 +154,7 @@ const VALUE_FLAGS = new Set([
   "--peer",
   "--confirm-digest",
   "--storage-root",
+  "--credential-path",
 ]);
 const BOOLEAN_FLAGS = new Set([
   "--all-peers",
@@ -261,6 +270,9 @@ function execute(
     accountId: invocation.accountId,
     ...(invocation.storageRoot !== null
       ? { storageRoot: invocation.storageRoot }
+      : {}),
+    ...(invocation.credentialPath !== null
+      ? { credentialPath: invocation.credentialPath }
       : {}),
     ...(runtime.home !== undefined ? { home: runtime.home } : {}),
     ...(runtime._beforeVerifiedReadback !== undefined
@@ -577,6 +589,14 @@ function parseInvocation(argv: readonly string[]): ParsedInvocation {
     };
   }
 
+  const credentialPath = values.get("--credential-path");
+  if (credentialPath !== undefined && !isAbsolute(credentialPath)) {
+    return {
+      kind: "usage-error",
+      message: "--credential-path must be an absolute filesystem path",
+    };
+  }
+
   const peerId = values.get("--peer");
   const allPeers = flags.has("--all-peers");
   if (peerId === undefined && !allPeers) {
@@ -622,6 +642,7 @@ function parseInvocation(argv: readonly string[]): ParsedInvocation {
     apply,
     confirmDigest: confirmDigest ?? null,
     storageRoot: values.get("--storage-root") ?? null,
+    credentialPath: credentialPath ?? null,
     ignoreLiveWriters: flags.has("--ignore-live-writers"),
   };
 }

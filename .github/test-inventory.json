@@ -125,7 +125,7 @@
     "packages/plugin/src/reasoning-opt-out.test.ts": 22,
     "packages/plugin/src/register-pop-gate.test.ts": 3,
     "packages/plugin/src/relay-opacity.test.ts": 13,
-    "packages/plugin/src/rotate-conversation-key-cli.test.ts": 30,
+    "packages/plugin/src/rotate-conversation-key-cli.test.ts": 34,
     "packages/plugin/src/rotate-key-gateway-isolation.test.ts": 5,
     "packages/plugin/src/session-route-tenant-isolation.test.ts": 14,
     "packages/plugin/src/session-route.test.ts": 6,

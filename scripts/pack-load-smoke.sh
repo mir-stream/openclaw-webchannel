@@ -195,7 +195,11 @@ if [ ! -f "$PLUGIN_ROOT/dist/rotate-key-entry.js" ]; then
 fi
 
 echo "==> Executing managed rotation entry --help …"
-node "$PLUGIN_ROOT/dist/rotate-key-entry.js" --help >/dev/null
+ROTATE_HELP=$(node "$PLUGIN_ROOT/dist/rotate-key-entry.js" --help)
+if ! printf '%s' "$ROTATE_HELP" | grep -qF -- '--credential-path <file>'; then
+  echo "ERROR: managed rotation entry help lacks --credential-path." >&2
+  exit 1
+fi
 
 # ── Exercise packed dry run, apply, and complete durable readback ───────
 ROTATE_STORAGE_ROOT="$WORK/rotation-store"

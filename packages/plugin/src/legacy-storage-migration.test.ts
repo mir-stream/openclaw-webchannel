@@ -561,7 +561,12 @@ describe("legacy tuple storage migration", () => {
     ).toThrow(simulatedCrash);
 
     expect(
-      migrateLegacyTupleState({ ...SCOPE, home, credentialPath }),
+      migrateLegacyTupleState({
+        ...SCOPE,
+        home,
+        credentialPath,
+        ambiguousConversationKeyPolicy: "preserve",
+      }),
     ).toMatchObject({ status: "resumed", credential: "migrated" });
     expect(existsSync(credentialPath)).toBe(true);
     expect(existsSync(legacy.directory)).toBe(false);

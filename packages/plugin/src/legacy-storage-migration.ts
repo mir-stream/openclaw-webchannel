@@ -115,6 +115,13 @@ export type LegacyMigrationResult = Readonly<{
 }>;
 
 export type LegacyMigrationOptions = CredentialPathOptions & {
+  /**
+   * How to handle a live legacy key document whose tuple owner cannot be
+   * proven. Runtime stores retain the historical quarantine-and-re-enroll
+   * behavior. Offline rotation uses `preserve` so an omitted or wrong exact
+   * credential override cannot move the K an operator intended to rotate.
+   */
+  ambiguousConversationKeyPolicy?: "quarantine" | "preserve";
   /** @internal Test-only seam before an exact source acquires its account mutex. */
   _beforeExactAccountMutex?: () => void;
   /** @internal Test-only seam inside the account claim critical section. */
@@ -300,6 +307,16 @@ export function migrateLegacyTupleState(
         credential: "absent",
         conversationKeys: "absent",
       });
+    }
+    if (options.ambiguousConversationKeyPolicy === "preserve") {
+      throw new Error(
+        "webchannel: offline rotation cannot prove which tuple owns the " +
+          "legacy conversation keys. If this deployment configured the " +
+          "low-level credentialPath override, pass that exact absolute file " +
+          "with --credential-path. No legacy K was moved and no empty v2 key " +
+          "document was published; keep every replica stopped and inspect or " +
+          "escalate",
+      );
     }
     if (existsSync(destination.conversationKeyPath)) {
       const existing = parseConversationKeyDocument(

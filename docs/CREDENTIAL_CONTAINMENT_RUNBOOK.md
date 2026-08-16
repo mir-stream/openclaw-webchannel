@@ -143,25 +143,36 @@ stop-first order in §4; that requirement is not a formality.
 
 ## 3. Class A — managed NATS
 
-1. If a credential is in scope, revoke its exact user key through your
-   provider's console/API (Synadia Cloud / NGS), or use the provider's reviewed
-   broader target when the exact key is unknown. This package has no operator
-   seed for a managed account and cannot revoke on your behalf. For K-only,
-   skip this and the next step.
-2. Confirm with provider tooling that the target's live connection is gone,
-   non-target connections remain, and the old credential cannot reconnect. An
-   exact-browser-credential-only incident then needs only the affected fresh
-   bootstrap in §4 ⑥.
-3. If K is in scope, continue at §4 ①. The stop/topology check and steps ④–⑥
-   apply unchanged; provider revocation replaces ②–③ when credentials are also
-   in scope, while K-only skips ②–③ entirely.
-4. If provider revocation targeted the current agent credential, whether by its
-   exact key or an account-wide target, follow §4 ④-bis before restart or
-   continued service. That documented path performs SaaS active identity-key
-   replacement and re-enrollment, not only a NATS JWT swap, so every browser in
-   the account must then complete §4 ⑥ to pin the new agent identity key. Use the
-   provider's replacement credential and issuance rules; an account-wide floor
-   still requires its replacement `iat` to be strictly above that floor.
+Select the incident scope from §2 **before taking any action**. This determines
+whether the provider revocation can happen live or must follow the stop/topology
+gate:
+
+1. **Credential only:** revoke the exact user key through the provider's
+   console/API (Synadia Cloud / NGS), or use the provider's reviewed broader
+   target when the exact key is unknown. This package has no operator seed for
+   a managed account and cannot revoke on your behalf. Confirm with provider
+   tooling that the target's live connection is gone, non-target connections
+   remain, and the old credential cannot reconnect. An exact browser target
+   then needs only its affected fresh bootstrap in §4 ⑥. If the target is the
+   current agent credential (exact key or account-wide target), revoke and
+   verify live first, then suspend every replica and confirm zero before §4
+   ④-bis; continue through ⑤–⑥. Because ④-bis replaces the SaaS active identity
+   key as well as the NATS credential, every browser in the account must
+   bootstrap again.
+2. **K only:** do not ask the provider to revoke anything. Go directly to §4 ①,
+   including the topology check, then run ④ → ⑤ → ⑥.
+3. **Credential + K:** go to §4 ① **before provider revocation** and observe
+   every gateway replica at zero. Only then revoke through the provider and
+   verify provider acceptance and enforcement while the gateways remain
+   stopped: an old credential reconnect must fail, and for a browser target
+   confirm target disconnect plus non-target continuity. Continue with ④,
+   [④-bis if the current agent credential was targeted], then ⑤–⑥. This
+   stop-first order closes the K_old handout window explained under ①; a live
+   provider revocation followed by a later stop is not the combined route.
+
+For an agent credential replacement, use the provider's issuance rules. An
+account-wide floor still requires its replacement `iat` to be strictly above
+that floor.
 
 ---
 
@@ -455,6 +466,16 @@ node "$PLUGIN_ROOT/dist/rotate-key-entry.js" --tenant <tenant> --account <accoun
 node "$PLUGIN_ROOT/dist/rotate-key-entry.js" --tenant <tenant> --account <accountId> --all-peers \
   --apply --confirm-digest <digest-from-the-dry-run>
 ```
+
+If this deployment configured the low-level runtime `credentialPath` override,
+append `--credential-path "$ABSOLUTE_CREDENTIAL_PATH"` to **both** the dry run
+and apply. It must be the exact absolute file configured for this tuple; do not
+guess or point it at a copied credential. The command never prints that value.
+During a legacy-only migration, an omitted or wrong override cannot prove who
+owns the collocated K, so the offline command refuses before moving legacy K or
+publishing an empty v2 key document. Keep replicas stopped, supply the exact
+configured path, or inspect and escalate. Deployments that did not configure
+the low-level override should not add this option.
 
 - The target is always explicit. There is no default and account-wide is never
   implied — you type the tuple by hand.
