@@ -18,6 +18,7 @@ import {
 type Broken =
   | "overwrite_on_duplicate"
   | "aliased_reads"
+  | "leaky_list_projection"
   | "sweep_immortal"
   | "retention_ignored"
   | "page_limit_ignored"
@@ -63,6 +64,7 @@ function findCase(prefix: string): BrowserCredentialLedgerConformanceCase {
 function breakLedger(inner: ControlledMemoryBrowserCredentialLedger, defect: Broken, state: BrokenState): BrowserCredentialLedger {
   const shadow = new Map<string, BrowserCredentialRecord>();
   const known = new Map<string, BrowserCredentialRecord>();
+  const leakyRows = new Map<string, Record<string, unknown>>();
   const hidden = new Set<string>();
   return new Proxy(inner, {
     get(target, property, receiver) {
@@ -88,6 +90,25 @@ function breakLedger(inner: ControlledMemoryBrowserCredentialLedger, defect: Bro
           throw new BrowserCredentialCollisionError(issuance.userPubkey);
         };
         if (property === "get") return async (userPubkey: string) => shadow.get(userPubkey) ?? target.get(userPubkey);
+      }
+
+      // A durable adapter that persists the structurally wider input, projects
+      // INSERT/get through a clean column list, but later returns SELECT *.
+      if (defect === "leaky_list_projection") {
+        if (property === "recordIssuance") return async (issuance: BrowserCredentialIssuance) => {
+          const outcome = await target.recordIssuance(issuance);
+          if (outcome.kind === "recorded") {
+            leakyRows.set(issuance.userPubkey, {
+              ...outcome.record,
+              ...(issuance as unknown as Record<string, unknown>),
+            });
+          }
+          return outcome;
+        };
+        if (property === "list") return async (...args: Parameters<BrowserCredentialLedger["list"]>) => {
+          const page = await target.list(...args);
+          return { ...page, records: page.records.map((record) => leakyRows.get(record.userPubkey) ?? record) };
+        };
       }
 
       // A driver that normalizes expiry into an integer column instead of
@@ -313,6 +334,7 @@ describe("BrowserCredentialLedger conformance harness self-tests", () => {
   for (const [prefix, defect, killedBy] of [
     ["1:", "overwrite_on_duplicate", "duplicate issuance overwrote the original record"],
     ["1:", "aliased_reads", "a returned record is aliased to the ledger's own state"],
+    ["1:", "leaky_list_projection", "list did not project the exact secret-free contract page"],
     ["1:", "nowsec_milliseconds", "ledger.nowSec is not a positive integer in unix SECONDS below the millisecond tripwire"],
     ["2:", "floor_fractional_expiry", "fractional expiresAtSec was accepted"],
     ["3:", "unknown_scope_as_account", "an unknown scope kind was accepted by list as an account-wide query"],
@@ -324,12 +346,21 @@ describe("BrowserCredentialLedger conformance harness self-tests", () => {
     ["5:", "revoke_each_row_transaction", "markRevoked left a partially revoked scope after an injected transactional failure"],
     ["6:", "retention_ignored", "configured retention was ignored one second past the boundary"],
     ["6:", "stale_public_now", "controlled clock does not agree exactly with ledger.nowSec"],
-    ["7:", "sweep_immortal", "sweep removed an active non-expiring credential"],
   ] as const) {
     it(`rejects the deliberately broken ${defect} adapter on its targeted assertion`, async () => {
       await expect(findCase(prefix).run(controlled(defect))).rejects.toThrow(`BrowserCredentialLedger conformance: ${killedBy}`);
     });
   }
+
+  it("rejects sweep_immortal in core case 7 without a controlled clock fixture", async () => {
+    const instance = controlled("sweep_immortal");
+    const withoutClock = { ledger: instance.ledger, close: instance.close, atomicity: instance.atomicity };
+    try {
+      await expect(findCase("7:").run(withoutClock)).rejects.toThrow(
+        "BrowserCredentialLedger conformance: sweep removed an active non-expiring credential",
+      );
+    } finally { await instance.close(); }
+  });
 
   it("fails a directly selected clock case loudly and visibly skips clock cases in the convenience runner", async () => {
     const withoutClock = () => {
@@ -344,6 +375,7 @@ describe("BrowserCredentialLedger conformance harness self-tests", () => {
     const skips: string[] = [];
     const report = await runBrowserCredentialLedgerConformance({ create: async () => withoutClock(), reportSkip: (message) => skips.push(message) });
     expect(report.skipped).toHaveLength(browserCredentialLedgerConformanceCases.filter((candidate) => candidate.suite === "clock").length);
+    expect(report.passed).toContain(findCase("7:").name);
     expect(skips).toHaveLength(report.skipped.length);
     expect(skips.every((message) => message.includes("SKIP") && message.includes("controlled clock"))).toBe(true);
   });

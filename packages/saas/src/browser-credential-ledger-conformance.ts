@@ -178,15 +178,29 @@ export const browserCredentialLedgerConformanceCases: readonly BrowserCredential
     // A caller handing over a wider object must not be able to widen the record.
     const withSecrets = { ...input, userJwt: "header.payload.signature", userSeedRaw: "RAW-SEED", userSeed: "SUSEED" } as BrowserCredentialIssuance;
     const outcome = await ledger.recordIssuance(withSecrets);
+    const expectedRecord = { ...input, status: "active", revokedAtSec: null } as const;
     invariant(outcome.kind === "recorded", "a ledger with no fence store answered something other than recorded");
-    invariant(same(outcome.record, { ...input, status: "active", revokedAtSec: null }), "recorded record is not exactly the issuance plus an active status");
+    invariant(same(outcome.record, expectedRecord), "recorded record is not exactly the issuance plus an active status");
     invariant(same(Object.keys(outcome.record).sort(), [...RECORD_FIELDS].sort()), "recorded record does not carry exactly the nine contract fields");
     const serialized = JSON.stringify(outcome.record);
-    for (const secret of ["header.payload.signature", "RAW-SEED", "SUSEED", "userJwt", "userSeed"]) {
+    const prohibited = ["header.payload.signature", "RAW-SEED", "SUSEED", "userJwt", "userSeedRaw", "userSeed"];
+    for (const secret of prohibited) {
       invariant(!serialized.includes(secret), `recorded record leaked ${secret}`);
     }
     invariant(same(await ledger.get(input.userPubkey), outcome.record), "get disagrees with the recorded record");
     invariant(await ledger.get(`U${"9".repeat(55)}`) === null, "unknown userPubkey did not read back null");
+
+    // A durable adapter can store the caller's wider object while projecting
+    // clean INSERT/point-read responses, then leak the stored columns from a
+    // SELECT * list path. Certify the query projection independently.
+    const queried = await ledger.list({ kind: "credential", userPubkey: input.userPubkey }, { limit: 1 });
+    invariant(same(queried, { records: [expectedRecord], cursor: null }),
+      "list did not project the exact secret-free contract page");
+    invariant(same(Object.keys(queried).sort(), ["cursor", "records"])
+      && same(Object.keys(queried.records[0] ?? {}).sort(), [...RECORD_FIELDS].sort()),
+      "list page/record does not carry exactly the contract fields");
+    const serializedQuery = JSON.stringify(queried);
+    for (const secret of prohibited) invariant(!serializedQuery.includes(secret), `list query leaked ${secret}`);
 
     // `readonly` is a compile-time promise only. A record handed back by
     // reference lets a JS consumer rewrite the ledger's own answer to "what do
@@ -430,20 +444,23 @@ export const browserCredentialLedgerConformanceCases: readonly BrowserCredential
     invariant(drained.length === 0, "swept records are still enumerable");
   } },
 
-  { name: "7: an ACTIVE non-expiring credential is never swept, at any age", suite: "clock", async run(instance) {
-    const { ledger } = instance; const clock = requireClock(instance, "case 7");
-    const t0 = await fixtureNow(instance);
+  { name: "7: an old ACTIVE non-expiring credential survives an active sweep", suite: "core", async run(instance) {
+    const { ledger } = instance;
+    const now = await fixtureNow(instance);
+    invariant(now > CONFORMANCE_RETENTION_SEC + 2, "case 7 ledger.nowSec is too close to the unix epoch to construct an old live fixture");
+    const expiredAtSec = now - CONFORMANCE_RETENTION_SEC - 1;
+    const issuedAtSec = expiredAtSec - 1;
     const immortal = `U${"2".repeat(55)}`;
     const expiring = `U${"1".repeat(55)}`;
-    await ledger.recordIssuance(issuance({ userPubkey: immortal, issuedAtSec: t0, expiresAtSec: null }));
-    await ledger.recordIssuance(issuance({ userPubkey: expiring, issuedAtSec: t0, expiresAtSec: t0 + 10 }));
+    await ledger.recordIssuance(issuance({ userPubkey: immortal, issuedAtSec, expiresAtSec: null }));
+    await ledger.recordIssuance(issuance({ userPubkey: expiring, issuedAtSec, expiresAtSec: expiredAtSec }));
     // The property the whole SPI exists for. The reference login path mints
     // non-expiring credentials; a forgotten one is indistinguishable from
-    // "there was nothing to cut", so no amount of elapsed time may drop it.
-    await advanceClock(instance, clock, 10_000_000);
+    // "there was nothing to cut". The expired companion proves sweep is active
+    // without requiring the optional controlled-clock capability.
     invariant(await ledger.sweep() === 1, "sweep removed an active non-expiring credential");
     const survivor = await ledger.get(immortal);
-    invariant(survivor?.status === "active" && survivor.expiresAtSec === null, "an active non-expiring credential did not survive unbounded time");
+    invariant(survivor?.status === "active" && survivor.expiresAtSec === null, "an old active non-expiring credential did not survive sweep");
     invariant(await ledger.get(expiring) === null, "the expired companion was not swept, so the case proved nothing");
     invariant(await ledger.sweep() === 0, "a repeated sweep removed the surviving non-expiring credential");
     const listed = await drain(ledger, { kind: "peer", natsAccountPublicKey: ACCOUNT, peerId: "peer" }, { limit: 10 });
