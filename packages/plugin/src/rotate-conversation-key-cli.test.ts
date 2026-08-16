@@ -345,7 +345,7 @@ describe("invocation", () => {
     ).toBe(ROTATE_CLI_EXIT_USAGE);
   });
 
-  it("pins the managed combined route to stop before provider revocation", () => {
+  it("pins load-bearing runbook ordering and cumulative floor semantics", () => {
     const runbook = readFileSync(
       new URL(
         "../../../docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md",
@@ -368,6 +368,38 @@ describe("invocation", () => {
     ) ?? -1;
     expect(stopFirst).toBeGreaterThanOrEqual(0);
     expect(providerRevoke).toBeGreaterThan(stopFirst);
+
+    const revocationSteps = runbook
+      .split(
+        "### ② Revoke, with a target and a floor you fixed in advance\n",
+        2,
+      )[1]
+      ?.split("\n### ④ Rotate K", 1)[0];
+    expect(revocationSteps).toBeDefined();
+    expect(revocationSteps).toContain(
+      "const existingTargetFloor = currentClaim.nats?.revocations?.[userPubkey]",
+    );
+    expect(revocationSteps).toContain(
+      "const expectedFloorSec = Math.max(\n" +
+        "  existingTargetFloor ?? floorSec,\n" +
+        "  floorSec,\n" +
+        ");",
+    );
+    expect(revocationSteps).toContain(
+      "updatedClaim.nats?.revocations?.[userPubkey] !== expectedFloorSec",
+    );
+    expect(revocationSteps).toContain(
+      "with exactly\n`expectedFloorSec` from step ②",
+    );
+    expect(revocationSteps).not.toContain(
+      "with exactly the `floorSec` you fixed",
+    );
+    expect(runbook).toContain(
+      "strictly greater than the effective accepted wildcard floor",
+    );
+    expect(runbook).toContain(
+      "effective\n  accepted target floor (`expectedFloorSec`)",
+    );
   });
 });
 

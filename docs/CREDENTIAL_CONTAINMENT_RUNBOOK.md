@@ -303,6 +303,19 @@ if (!Number.isSafeInteger(currentClaim.iat) || currentClaim.iat <= 0) {
   throw new Error("accepted account claim has no valid iat");
 }
 const floorSec = Math.floor(Date.now() / 1000);   // UNIX SECONDS. See §6.1.
+const existingTargetFloor = currentClaim.nats?.revocations?.[userPubkey];
+if (
+  existingTargetFloor !== undefined &&
+  (!Number.isSafeInteger(existingTargetFloor) || existingTargetFloor <= 0)
+) {
+  throw new Error("accepted account claim has an invalid target floor");
+}
+// floorSec remains this incident's immutable requested time. Readback must
+// expect the stronger of that request and an already accepted target floor.
+const expectedFloorSec = Math.max(
+  existingTargetFloor ?? floorSec,
+  floorSec,
+);
 
 // Account-claim updates also need strictly increasing iat ordering. Keep the
 // floor above fixed, but do not sign until a new claim can be newer than the
@@ -323,6 +336,9 @@ if (
 ) {
   throw new Error("candidate account claim is not newer than accepted claim");
 }
+if (updatedClaim.nats?.revocations?.[userPubkey] !== expectedFloorSec) {
+  throw new Error("candidate account claim has an unexpected target floor");
+}
 writeFileSync("./updated-account.jwt", updatedAccountJwt, { mode: 0o600 });
 ```
 
@@ -332,22 +348,24 @@ Notes that will bite you otherwise:
   account JWT's `iss`. Passing the account seed (`SA…`) is the classic footgun
   and is rejected outright; `addRevocation` also rejects a different/stale
   operator issuer.
-- The floor is `max(existingFloor, requestedAt)`: an older request never lowers
-  an existing floor. That preservation applies only to floors present in
+- `floorSec` is the immutable requested incident time. `expectedFloorSec` is
+  `max(existingTargetFloor, floorSec)`: an older request never lowers an
+  existing target floor. That preservation applies only to floors present in
   `currentAccountJwt`, which is why the accepted-claim fetch above is mandatory
-  on every incident.
+  on every incident. Keep both non-secret values in the incident record.
 - A resolver accepts account-claim updates by claim ordering. The candidate
   account JWT's `iat` must be **strictly greater** than the currently accepted
   account JWT's `iat`; the wait and decoded assertion above enforce that while
   keeping `floorSec` fixed. For sequential revocations, repeat the exact-current
   lookup, wait, and candidate-`iat` assertion every time, using the last accepted
   JWT as the next input.
-- NATS applies the floor **inclusively** — a credential is refused when
-  `floorSec >= credential.iat`. Any replacement credential must therefore have
-  an `iat` **strictly greater** than `floorSec`. If it lands in the same second,
-  wait for the next second and re-mint (see ④-bis). This is the replacement
-  **user credential** rule; it is distinct from the account-claim ordering rule
-  in the previous bullet.
+- NATS applies the effective accepted target floor **inclusively** — a covered
+  credential is refused when `expectedFloorSec >= credential.iat`. A
+  replacement still covered by that target (notably a wildcard) must therefore
+  have an `iat` **strictly greater** than `expectedFloorSec`. If it does not,
+  wait until it can and re-mint (see ④-bis). This is the replacement **user
+  credential** rule; it is distinct from the account-claim ordering rule in the
+  previous bullet.
 - `addRevocation` returns a **candidate**. Nothing has been revoked yet.
 
 ### ③ Apply the candidate and confirm the resolver accepted it
@@ -386,12 +404,15 @@ nats --server "$NATS_URL" --creds ./sys.creds request --raw \
 chmod 0600 ./accepted-account.jwt
 ```
 
-Decode the returned JWT and confirm `nats.revocations` contains your target key
-(or `"*"`) with exactly the `floorSec` you fixed in step ②. Do not decode it
-into a shared log. Also confirm its `sub` is `$ACCOUNT_PUBLIC_KEY`. Keep this
-accepted value as the input to any immediately following revocation; do not
-start again from `chain.natsConfig.accountJwt`. Remove the temporary JWT and
-`.creds` files when the incident procedure is complete.
+Decode both the candidate and returned JWT and confirm the accepted claim is
+that candidate (same `jti`), its `sub` is `$ACCOUNT_PUBLIC_KEY`, and
+`nats.revocations` contains your target key (or `"*"`) with exactly
+`expectedFloorSec` from step ②. Compare against the candidate/effective floor,
+**not** raw `floorSec`: a higher pre-existing same-target floor is a safe,
+stronger result and must remain unchanged. Do not decode either JWT into a
+shared log. Keep the accepted value as the input to any immediately following
+revocation; do not start again from `chain.natsConfig.accountJwt`. Remove the
+temporary JWT and `.creds` files when the incident procedure is complete.
 
 After that Full/Dir readback, verify enforcement too, in this order:
 
@@ -526,8 +547,10 @@ the sequence, with the additions this incident requires:
    2 comes first. No single command guarantees a re-mint.
 5. Validate the replacement according to the revocation target:
    - **Wildcard `"*"`:** decode the new agent JWT and confirm its `iat` is
-     strictly greater than the fixed `floorSec`. If they are equal, wait for the
-     next second and re-mint. Do not "fix" this by issuing a newer floor.
+     strictly greater than the effective accepted wildcard floor
+     (`expectedFloorSec` confirmed in step ③), not merely the requested
+     `floorSec`. If it is not greater, wait until it can be and re-mint. Do not
+     "fix" this by issuing a newer floor.
    - **Exact old agent key:** require a newly generated NATS user key and confirm
      the replacement JWT's `sub` differs from the revoked `U…` key. The old
      exact-key floor does not bind this new key, so its `iat` need not exceed
@@ -575,9 +598,11 @@ register. The forced refresh is what makes that happen.
 
 ### Done — what you can now claim
 
-- If a credential was in scope, credentials issued at or before `floorSec` for
-  the revoked target are refused by the server, and you read that back from the
-  resolver and verified enforcement.
+- If a credential was in scope, credentials issued at or before the effective
+  accepted target floor (`expectedFloorSec`) are refused by the server, and you
+  read that floor back from the resolver and verified enforcement. `floorSec`
+  remains the requested incident time; it may be lower than the preserved
+  accepted floor.
 - If K was in scope, conversation envelopes created after rotation cannot be
   decrypted with K_old: K_new is fresh random material, so the separation comes
   from the keys themselves.
