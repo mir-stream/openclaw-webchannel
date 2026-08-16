@@ -1,13 +1,28 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO = join(HERE, "..", "..");
 const HARNESS = join(HERE, "lib", "harness.sh");
+
+function gateScripts(): string[] {
+  return readdirSync(HERE)
+    .filter((file) => file.startsWith("run-") && file.endsWith(".sh"))
+    .sort();
+}
 
 let testDir: string;
 let dist: string;
@@ -61,6 +76,53 @@ function assertLoadedRecords(records: PluginSource[]) {
 function assertLoaded(source: string, plugin = "webchannel") {
   return assertLoadedRecords([{ source, plugin }]);
 }
+
+describe("harness_prepare_private_root", () => {
+  it("makes an umask-0002 root exactly 0700 without deleting existing contents", () => {
+    const root = join(testDir, "private-root");
+    const result = spawnSync(
+      "bash",
+      [
+        "-c",
+        [
+          "set -euo pipefail",
+          "umask 0002",
+          'mkdir -p "$2"',
+          'printf preserved > "$2/sentinel"',
+          '. "$1"',
+          'harness_prepare_private_root "$2"',
+          'test "$(cat "$2/sentinel")" = preserved',
+          'if harness_prepare_private_root ""; then exit 31; fi',
+          'if harness_prepare_private_root "/"; then exit 32; fi',
+        ].join("\n"),
+        "harness-private-root-test",
+        HARNESS,
+        root,
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(statSync(root).mode & 0o777).toBe(0o700);
+    expect(statSync(join(root, ".openclaw")).isDirectory()).toBe(true);
+    expect(readFileSync(join(root, "sentinel"), "utf8")).toBe("preserved");
+    expect(result.stderr).toContain("requires one non-empty root path");
+    expect(result.stderr).toContain("refusing unsafe private root target");
+  });
+
+  it("keeps every live gate and the demo on the private-root preparation path", () => {
+    for (const script of gateScripts()) {
+      const source = readFileSync(join(HERE, script), "utf8");
+      expect(source, script).toMatch(/^harness_prepare_private_root "\$OCH"$/m);
+      expect(source, script).not.toMatch(/^mkdir -p "\$OCH\/\.openclaw"$/m);
+    }
+
+    const demo = readFileSync(join(REPO, "demo", "run.sh"), "utf8");
+    expect(demo).toMatch(
+      /mkdir -p "\$OCH\/\.openclaw"\s*\nchmod 0700 "\$OCH"/,
+    );
+  });
+});
 
 describe("harness_assert_loaded_dist", () => {
   it("accepts an exact webchannel bundle source", () => {

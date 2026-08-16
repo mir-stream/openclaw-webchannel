@@ -29,7 +29,7 @@
  *                        expected issuer from the SaaS URL, so leave it UNSET for
  *                        the zero-config trust-anchor path (§4 change 3).
  *   NATS_URL             relay ws:// URL delivered WITH minted creds
- *   NATS_CONFIG_OUT      dir to write operator.jwt + resolver.json (for nats-server)
+ *   NATS_CONFIG_OUT      dir to write nats-server trust artifacts
  *   TRUST_CHAIN_PATH     persist the trust chain here (stable across restarts)
  *   DEMO_TENANT          tenant scope (default demo-tenant)
  *   DEMO_ACCOUNTS        JSON object keyed by accountId (value ignored, e.g.
@@ -59,11 +59,19 @@ import {
 } from "../packages/saas/src/demo-users.js";
 import { mintNatsUserCreds, issueBrowserCredentials, type NatsUserRole } from "../packages/saas/src/nats-user-creds.js";
 import { assertValidSubjectToken } from "../packages/saas/src/subject-token.js";
+import { atomicWritePrivateFile } from "../packages/saas/src/private-file.js";
 import type { EnrollmentRequest, PollRequest } from "../packages/saas/src/device-flow-types.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createDemoEnrollmentHttpHandler } from "../packages/saas/src/enrollment-http-handler.js";
 import { serializeBootstrapResponse, serializeEnrollmentResponse } from "../packages/saas/src/p1-1-wire-adapter.js";
-import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  mkdirSync,
+  readFileSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -174,24 +182,35 @@ const externalNatsAccount =
 const trustChainOptions = {
   operatorName: "demo-operator",
   accountName: "demo-account",
+  // The demo exercises the runtime claim-update channel, so it explicitly
+  // opts into retaining the operator root. The general API default stays false.
+  returnOperatorSeed: true,
   ...(externalNatsAccount ? { externalNatsAccount } : {}),
 };
 // Separate persisted file per relay mode so a self-contained chain is never
 // reused as an external one (they share the RSA key but differ in NATS account).
 const trustChainPath =
-  TRUST_CHAIN_PATH ?? join(tmpdir(), `demo-trust-${DEMO_RELAY}-${process.pid}.json`);
+  TRUST_CHAIN_PATH || createEphemeralTrustChainPath();
 const trustChain = await loadOrCreateTrustChain(trustChainPath, trustChainOptions);
 const privateChain = trustChain.private;
 const natsConfig = trustChain.natsConfig;
 // self-contained → no external issuer_account; synadia → the managed account id.
 const natsIssuerAccountId: string | undefined = externalNatsAccount?.accountId;
 
-// Publish the public NATS config (operator JWT + memory resolver) so run.sh can
+// Publish the NATS trust artifacts so run.sh can
 // assemble a JWT-auth nats-server that trusts the SAME account this SaaS mints for.
-// Only meaningful for a self-contained account — a managed relay runs its own server.
+// The system credential is written 0600 and is never logged. Only meaningful
+// for a self-contained account — a managed relay runs its own server.
 if (NATS_CONFIG_OUT && natsConfig.mode !== "external") {
-  mkdirSync(NATS_CONFIG_OUT, { recursive: true });
+  mkdirSync(NATS_CONFIG_OUT, { recursive: true, mode: 0o700 });
+  if (!privateChain.systemAccountCredentials) {
+    throw new Error("self-contained trust chain is missing its system-account credential");
+  }
   writeFileSync(join(NATS_CONFIG_OUT, "operator.jwt"), natsConfig.operatorJwt);
+  const systemCredentialsPath = join(NATS_CONFIG_OUT, "system-account.creds");
+  atomicWritePrivateFile(systemCredentialsPath, privateChain.systemAccountCredentials);
+  // resolver.json is run.sh's readiness barrier, so write it only after the
+  // credential exists with its final owner-only permissions.
   writeFileSync(
     join(NATS_CONFIG_OUT, "resolver.json"),
     JSON.stringify(natsConfig.resolverConfig, null, 2),
@@ -199,6 +218,19 @@ if (NATS_CONFIG_OUT && natsConfig.mode !== "external") {
   console.log(`[demo-saas] wrote operator.jwt + resolver.json → ${NATS_CONFIG_OUT}`);
 }
 console.log(`[demo-saas] relay mode: ${DEMO_RELAY}${externalNatsAccount ? ` (account ${externalNatsAccount.accountId.slice(0, 8)}…)` : ""} → ${NATS_URL}`);
+
+function createEphemeralTrustChainPath(): string {
+  const root = mkdtempSync(join(tmpdir(), `demo-trust-${DEMO_RELAY}-`));
+  chmodSync(root, 0o700);
+  process.once("exit", () => {
+    try {
+      rmSync(root, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup of an intentionally ephemeral trust root.
+    }
+  });
+  return join(root, "trust-chain.json");
+}
 
 // ---------------------------------------------------------------------------
 // RS256 bootstrap-JWT signing — reuses THIS SaaS's trust chain RSA key.

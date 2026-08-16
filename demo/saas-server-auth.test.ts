@@ -1,11 +1,19 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
-import { describe, expect, it, vi } from "vitest";
+import { rmSync } from "node:fs";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
-vi.hoisted(() => {
-  process.env.TRUST_CHAIN_PATH = `/tmp/openclaw-demo-auth-${process.pid}.json`;
+const trustRoot = await vi.hoisted(async () => {
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const root = mkdtempSync(join(tmpdir(), "openclaw-demo-auth-"));
+  process.env.TRUST_CHAIN_PATH = join(root, "trust-chain.json");
+  return root;
 });
 import { demoSaasRequestHandler } from "./saas-server.js";
+
+afterAll(() => rmSync(trustRoot, { recursive: true, force: true }));
 
 async function invoke(path: string, body: string, headers: Record<string, string> = {}) {
   const req = Readable.from([body]) as IncomingMessage;

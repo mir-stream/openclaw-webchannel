@@ -116,7 +116,7 @@ describe("EnrollmentClient", () => {
       const saas = new DeviceFlowEnrollment({
         repository,
         saasTrustChain: { rsaPrivateKeyPem: "unused", natsAccountSeed: "unused" },
-        natsAccountConfig: { operatorJwt: "unused", accountJwt: "unused", resolverConfig: {}, accountPublicKey: "unused" },
+        natsAccountConfig: { operatorJwt: "unused", accountJwt: "unused", resolverConfig: {}, accountPublicKey: "unused", systemAccountPublicKey: "unused" },
         saasBaseUrl: "https://saas.com", jwksUrl: "https://saas.com/jwks", bootstrapUrl: "https://saas.com/bootstrap", natsUrl: "wss://nats.saas.com",
       });
       mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({
