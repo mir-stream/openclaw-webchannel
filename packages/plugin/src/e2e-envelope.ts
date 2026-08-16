@@ -45,7 +45,8 @@
  * past messages from OpenClaw core's session transcript, then
  * `NatsChannel.sendHistory` seals the resulting `{ type: "history" }` payload
  * as a `MessageEnvelope`. The agent keeps no at-rest ciphertext store of its
- * own — `history-store.ts` has no production caller.
+ * own; the unreachable in-memory one this note used to cite was deleted in
+ * #153.
  */
 
 import { encrypt, decrypt } from "./e2e-crypto.js";

@@ -25,9 +25,10 @@
  * `getSessionMessages`; `NatsChannel.sendHistory` seals the resulting frame
  * with the CURRENT K at delivery time, so replacing K costs no
  * re-encryption: the next read-and-deliver cycle reseals
- * (`docs/ISSUE_72_CONTAINMENT_PLAN.md` §1.4, RETAIN + RESEAL). The agent-side
- * ciphertext store an earlier revision of this comment described is
- * `history-store.ts`, which has no production caller.
+ * (`docs/ISSUE_72_CONTAINMENT_PLAN.md` §1.4, RETAIN + RESEAL). There is no
+ * agent-side ciphertext store at all: the in-memory one an earlier revision of
+ * this comment pointed at was never reachable from production and was deleted
+ * in #153.
  *
  * File shape: `{ "version": 2, "storageIdentity": { ... }, "keys": { ... } }`.
  * Writes are atomic (tmp + rename), file mode 0600, directory mode 0700.

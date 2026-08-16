@@ -201,7 +201,15 @@ Client today: `keyPair` + `sessionKey` set from the registration
 
 Already done and reusable: wrap/unwrap/decryptBacklog (`late-join-decryptor.ts`),
 broadcast fan-out model (`multidevice-broadcast.test.ts` — exactly-once per device,
-identical ciphertext, cross-user isolation), at-rest store (`history-store.ts`).
+identical ciphertext, cross-user isolation).
+
+> **Status update (#153):** the at-rest store (`history-store.ts`) listed here was
+> IMPLEMENTED AND THEN REMOVED. It never acquired a production caller and its
+> backing was a plain in-memory `Map`, so it was never durable; the production
+> history authority is OpenClaw core's session transcript, read through
+> `history.ts` (`pageBefore` cursor pagination). Late-join hydration is served by
+> `sendHistory` + `late-join-decryptor.ts`. The design below is retained as the
+> record of the decision, not as a description of the current tree.
 
 ---
 
@@ -280,9 +288,9 @@ to eliminate. No offsetting benefit once ①'s scope fear is disproven.
   the strictly-more-powerful NATS user seed; `account-config.ts:304-312`). K-at-rest
   encryption DEFERRED (co-located master key = theater). NOT the openclaw config
   store (dump/patch leakage), NOT a new storage seam (none exists in the plugin).
-  Note: `HistoryStore` is in-memory (`history-store.ts:110`) — so K persistence's
-  Phase-6 purpose is keeping live devices' unwrapped K valid across gateway restarts
-  (+ future-proofing for when history persistence lands).
+  Note: `HistoryStore` was in-memory only, which is part of why #153 removed it — so
+  K persistence's Phase-6 purpose is keeping live devices' unwrapped K valid across
+  gateway restarts (+ future-proofing for when history persistence lands).
 - **Reconnect/rehydrate semantics** → **DECIDED (engineering): STATELESS register.**
   Every register (first join, page reload, socket reconnect — client already
   re-registers per connection epoch) unconditionally re-wraps K to the presented cnf
@@ -390,3 +398,42 @@ attempted.
 
 **D. Existing suites stay green** (168 client / 748 plugin / 115 saas at time of
 writing) + full typecheck.
+
+---
+
+## 13. Removed in #153 — design records retained
+
+Two Phase 6 modules were implemented, never wired to production, and deleted in
+#153. Their code is recoverable from git history; the reason they existed is
+recorded here so the next person re-derives neither the design nor the decision.
+
+### 13.1 `history-store.ts` — genuinely redundant
+
+An in-memory ciphertext store with `loadHistory` cursor pagination (Sub-AC 2a).
+Backed by a plain `Map`, so it was never durable, and it had no production
+caller: `history.ts` reads OpenClaw core's session transcript (on disk, 0600)
+and paginates with `pageBefore`, while late-joining devices are served by
+`NatsChannel.sendHistory` + `late-join-decryptor.ts`. Nothing was lost.
+
+### 13.2 `typing-indicator.ts` — a feature we chose not to build
+
+NOT redundant — unbuilt. It was the browser → *the same user's other devices*
+typing signal. The production `NatsChannel.sendTyping` / `setTypingEnabled` pair
+runs the opposite direction (agent → browser), so the two never overlapped.
+**Decision: not building it now.** The design, should it come back:
+
+- Typing rides the existing `MessageEnvelope` wire format with
+  `envelopeType === "typing"`, over the same E2E-encrypted NATS bus as
+  conversation messages. The relay operator sees ciphertext plus routing
+  metadata only; `{ typing: true }` is not observable without the session key.
+- One choke point decides persistence: ephemeral envelopes are forwarded to live
+  listeners and skipped on append; everything else is forwarded AND appended.
+- Invariants: a typing signal fired while a peer is connected IS delivered live;
+  it is NEVER present in history output; it is NEVER replayed to a late-joining
+  device.
+- Rate-limiting/debouncing is a UI concern for the client integration layer, not
+  a transport primitive.
+
+Reintroducing it costs one new frame type, which is explicitly NOT a protocol
+version bump — see the bump rules in both `protocol.ts` files (#160) and the
+measured evidence that both directions ignore frame types they do not know.

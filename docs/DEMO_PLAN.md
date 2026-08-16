@@ -350,9 +350,12 @@ gap (below).
   register reply and hydrates those encrypted frames idempotently.
 
   Verified end-to-end (`demo/verify-e2e.mjs`, now a HARD criterion): reload restores
-  the prior turn. Not the plugin-side `HistoryStore` (that serves late-join/multi-device,
-  Phase 6). No upstream dependency; the openclaw `getSessionMessages`/`deleteSession`
-  asymmetry remains worth filing but is no longer blocking.
+  the prior turn. (This paragraph used to contrast it with a plugin-side
+  `HistoryStore`; that module never had a production caller and was deleted in
+  #153 — late-join/multi-device is served by `sendHistory` +
+  `late-join-decryptor.ts`.) No upstream dependency; the openclaw
+  `getSessionMessages`/`deleteSession` asymmetry remains worth filing but is no
+  longer blocking.
 
 ## Phase 2 status (2026-07-03) — fleet built + verified
 

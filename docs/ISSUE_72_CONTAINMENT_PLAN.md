@@ -107,7 +107,7 @@ reference/demo의 admin·chaos 기본 경로도 role이 browser라면 예외 없
 
 ### 1.4 production history authority
 
-`HistoryStore`는 production snapshot authority가 아니다. production register/load-history는
+`HistoryStore`(#153 에서 삭제됨)는 production snapshot authority가 아니었다. production register/load-history는
 `packages/plugin/src/nats-account-runtime.ts`에서 `history.ts`의 `getSessionMessages`를 호출해
 OpenClaw core session transcript를 읽고 현재 K로 snapshot을 다시 봉인한다.
 
@@ -119,7 +119,9 @@ OpenClaw core session transcript를 읽고 현재 K로 snapshot을 다시 봉인
 - gateway restart는 core transcript를 purge하지 않으며 history loss를 만들지 않는다.
 - 이것은 과거에 노출된 평문/ciphertext의 retroactive secrecy를 제공하지 않는다.
 
-test-only/dead `HistoryStore` 정리는 이 이슈의 범위 밖이다.
+test-only/dead `HistoryStore` 정리는 이 이슈의 범위 밖이었다 — #153 이 별도로 처리해
+`history-store.ts` 를 삭제했다. 이 절의 결론(production authority 는 core session
+transcript 다)은 그대로다.
 
 ## 2. Track C — 지금 실행 가능한 봉쇄 런북
 
@@ -938,6 +940,7 @@ v8은 이전 리뷰 기록의 다음 결론을 명시적으로 폐기했다.
 
 - MEMORY reload가 claim/live connection에 효과가 없고 restart가 필수라는 결론
 - `HistoryStore` purge가 production history loss/rotation 계약이라는 결론
+  (그 클래스 자체가 #153 에서 삭제됐다)
 - record-before-mint 또는 ledger clock으로 `iat`/`exp`를 유도하는 설계
 - process-local mutex와 key별 publish로 batch revoke를 충분히 구현할 수 있다는 설계
 - 무상태 MAC confirmation 권고

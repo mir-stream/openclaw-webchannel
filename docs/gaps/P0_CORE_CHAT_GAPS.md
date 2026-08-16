@@ -533,8 +533,9 @@ is **now wired on the NATS path** (#26) — the off toggle is honored, not silen
   `resolveTypingEnabled` (`src/account-config.ts:271-276`) reads the **per-account** resolved config
   = `(capabilities?.typing ?? "on") !== "off"`. So `capabilities.typing:"off"` now suppresses the
   frame on NATS.
-- (Note: `src/typing-indicator.ts` is an **unrelated** feature — ephemeral client↔client typing
-  envelopes — not this agent→browser gate.)
+- (Note: `src/typing-indicator.ts` was an **unrelated** feature — ephemeral client↔client typing
+  envelopes, not this agent→browser gate. It was never wired to production and was deleted in
+  #153; its design is retained in `docs/PHASE6_MULTIDEVICE_PLAN.md` §13.2.)
 
 **Telegram reference.** `sendchataction-401-backoff.ts` (typing = `sendChatAction` with 401 backoff).
 The backoff machinery is Telegram-specific; we only need the on/off signal.
