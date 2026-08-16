@@ -147,7 +147,7 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   "nats-account-runtime.ts": { statements: 22, interpolations: 44 },
   "auth.ts": { statements: 16, interpolations: 5 },
   "nats-channel.ts": { statements: 22, interpolations: 33 },
-  "history.ts": { statements: 2, interpolations: 4 },
+  "history.ts": { statements: 5, interpolations: 4 },
   "nats-register.ts": { statements: 18, interpolations: 20 },
 };
 

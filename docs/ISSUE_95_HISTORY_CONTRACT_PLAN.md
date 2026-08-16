@@ -165,4 +165,4 @@ client hydration은 raw transcript가 아니라 plugin이 보낸 **normalized hi
 | delivery-only 교환의 transcript 누락 | #114 | 현재 delivery mirror가 없음 |
 | live bubble과 stored row의 대응 개선 | #111 | live delivery 정책과 함께 결정해야 함 |
 | 실제 tool-calling 실행과 합성 fixture 비교 | #109 이후 | 합성 characterization을 실측으로 가장하지 않기 위해 별도 확인 |
-| `__openclaw.seq` / 합성 id 은퇴 | 후속 | untyped envelope 의존과 cursor compatibility 검토 필요 |
+| `__openclaw.id` / 합성 id 의존 | #128 후속 처리 | 공개 SDK는 identity/order key 없이 `messages: unknown[]`만 제공한다. 같은 비공개 봉투의 `seq`를 대안으로 채택하지 않고, `.id` shape drift와 기존 `h-<timestamp>-<window-index>` 합성 cursor miss를 명시적으로 진단한다. |
