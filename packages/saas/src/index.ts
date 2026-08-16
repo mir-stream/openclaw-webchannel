@@ -91,6 +91,39 @@ export {
   type IssueBrowserCredentialsOptions,
 } from "./nats-user-creds.js";
 export { addRevocation } from "./account-revocation.js";
+// #84 sub-task 2: the browser-credential issuance ledger SPI. The record shape
+// and the fail-closed issuance ordering are docs/ISSUE_72_CONTAINMENT_PLAN.md §3.
+export {
+  MemoryBrowserCredentialLedger,
+  BrowserCredentialCollisionError,
+  BrowserCredentialCursorError,
+  BrowserCredentialLedgerInputError,
+  assertBrowserCredentialIssuance,
+  assertBrowserCredentialScope,
+  assertTimestampSec,
+  MAX_TIMESTAMP_SEC,
+  type BrowserCredentialLedger,
+  type BrowserCredentialRecord,
+  type BrowserCredentialIssuance,
+  type BrowserCredentialStatus,
+  type BrowserCredentialScope,
+  type BrowserCredentialQuery,
+  type BrowserCredentialPage,
+  type RecordIssuanceOutcome,
+  type MarkRevokedResult,
+  type MemoryBrowserCredentialLedgerOptions,
+} from "./browser-credential-ledger.js";
+export {
+  runBrowserCredentialLedgerConformance,
+  browserCredentialLedgerConformanceCases,
+  interposeBrowserCredentialLedger,
+  CONFORMANCE_RETENTION_SEC,
+  type BrowserCredentialLedgerInterposeHooks,
+  type BrowserCredentialLedgerFaultControl,
+  type BrowserCredentialLedgerConformanceOptions,
+  type BrowserCredentialLedgerConformanceCase,
+  type BrowserCredentialLedgerConformanceReport,
+} from "./browser-credential-ledger-conformance.js";
 export type {
   SetupTrustChainResult,
   SaasTrustChainPrivate,

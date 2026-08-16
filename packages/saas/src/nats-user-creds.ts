@@ -39,9 +39,10 @@
  */
 
 import { createUser, fromSeed, fromPublic } from "@nats-io/nkeys";
-import { encodeUser } from "@nats-io/jwt";
+import { encodeUser, decode, type User } from "@nats-io/jwt";
 
 import { assertValidSubjectToken } from "./subject-token.js";
+import type { BrowserCredentialLedger } from "./browser-credential-ledger.js";
 
 /**
  * Logical role of the minted peer. Unlike the original design (perms identical
@@ -258,7 +259,46 @@ export type IssueBrowserCredentialsOptions = {
    * credential.
    */
   ttlSeconds?: number;
+  /**
+   * Issuance ledger (#84). When present, the minted credential's revocation key
+   * is recorded BEFORE anything is returned, and the call is FAIL-CLOSED: if the
+   * record cannot be written, the JWT and seed are destroyed unreturned and this
+   * throws. See {@link BrowserCredentialLedger} and the ordering note on
+   * {@link issueBrowserCredentials}.
+   *
+   * Optional only so the existing callers keep compiling; a production deployment
+   * that omits it can mint credentials it has no way to enumerate or revoke.
+   * Requires {@link accountContext}.
+   */
+  ledger?: BrowserCredentialLedger;
+  /**
+   * Audit label for the authorization context this credential was issued under
+   * (plan §4.1). REQUIRED whenever `ledger` is present, and never used as the
+   * NATS account identity — the identity is decoded from the credential itself.
+   */
+  accountContext?: string;
 };
+
+/**
+ * Decode the credential we just minted. Wrapped because `@nats-io/jwt`'s
+ * `decode` embeds the WHOLE JWT in its chunk-count error message: letting that
+ * escape would put a live credential in a log or an error report, which is
+ * precisely what this ledger exists to prevent.
+ */
+function decodeMintedUserClaim(userJwt: string): { sub: string; iat: number; exp: number | null; natsAccountPublicKey: string } {
+  let claim;
+  try { claim = decode<User>(userJwt); }
+  catch { throw new Error("issueBrowserCredentials: the freshly minted user JWT did not decode (credential withheld)"); }
+  // In external mode the account IDENTITY is `nats.issuer_account` and `iss` is
+  // only the signing key; in self-contained mode `iss` IS the account. Take it
+  // from the credential rather than from the options so the ledger records the
+  // account a nats-server will actually check revocations against.
+  const natsAccountPublicKey = claim.nats?.issuer_account ?? claim.iss;
+  if (typeof claim.sub !== "string" || typeof natsAccountPublicKey !== "string" || !Number.isInteger(claim.iat)) {
+    throw new Error("issueBrowserCredentials: the freshly minted user JWT lacks a usable sub/iss/iat (credential withheld)");
+  }
+  return { sub: claim.sub, iat: claim.iat, exp: claim.exp ?? null, natsAccountPublicKey };
+}
 
 /**
  * Mint browser-login NATS credentials — the first public path for issuing a
@@ -269,6 +309,16 @@ export type IssueBrowserCredentialsOptions = {
  *
  * The raw NKEY mint / role selection stays internal — an operator can only ever
  * mint a correctly-scoped browser credential through this door.
+ *
+ * ISSUANCE ORDERING when a `ledger` is supplied (plan §3.2) — mint privately →
+ * decode the REAL user JWT → persist the secret-free record from the decoded
+ * `sub`/`iat`/`exp` → only then return the credential. The order is FAIL-CLOSED
+ * in both directions: nothing is recorded for a credential that does not exist
+ * (no record-before-mint), and nothing escapes that was not recorded. A ledger
+ * failure therefore fails the login rather than producing a credential nobody
+ * can revoke — the deliberate opposite of the audit sidecar in plan §3.3, which
+ * is fail-OPEN because losing an audit note is not a security outcome, whereas
+ * "we cannot say what to cut" is.
  */
 export async function issueBrowserCredentials(
   o: IssueBrowserCredentialsOptions,
@@ -283,6 +333,13 @@ export async function issueBrowserCredentials(
   if (!o.peerId) {
     throw new Error("issueBrowserCredentials: peerId is required (the authenticated session subject)");
   }
+  // Checked BEFORE minting: a ledger wired up without its audit label would
+  // otherwise mint a credential only to withhold it, and the operator would read
+  // the resulting login failure as a NATS problem rather than a config one.
+  if (o.ledger && !o.accountContext) {
+    throw new Error("issueBrowserCredentials: accountContext is required whenever ledger is provided (the audit label for this issuance)");
+  }
+  const binding = o.ledger && o.accountContext ? { ledger: o.ledger, accountContext: o.accountContext } : null;
   const minted = await mintNatsUserCreds({
     role: "browser",
     accountSeed: o.accountSeed,
@@ -291,6 +348,35 @@ export async function issueBrowserCredentials(
     ...(o.issuerAccountId ? { issuerAccountId: o.issuerAccountId } : {}),
     ...(o.ttlSeconds ? { ttlSeconds: o.ttlSeconds } : {}),
   });
+  if (binding) {
+    const claim = decodeMintedUserClaim(minted.userJwt);
+    // The ledger's whole value is that its key is THE key nats-server refuses.
+    // If the JWT subject and the returned pubkey could ever diverge we would be
+    // recording a key that revokes nothing, so prove it here rather than assume.
+    if (claim.sub !== minted.userPubkey) {
+      throw new Error("issueBrowserCredentials: minted JWT subject does not match the minted user public key (credential withheld)");
+    }
+    let outcome;
+    try {
+      outcome = await binding.ledger.recordIssuance({
+        tenant: o.tenant,
+        accountContext: binding.accountContext,
+        natsAccountPublicKey: claim.natsAccountPublicKey,
+        peerId: o.peerId,
+        userPubkey: minted.userPubkey,
+        issuedAtSec: claim.iat,
+        expiresAtSec: claim.exp,
+      });
+    } catch (error) {
+      // Re-wrapped so the failure reads as "credential withheld" at the call
+      // site. `cause` carries the adapter's own error, which by contract carries
+      // scope identifiers only — never a JWT, seed or key.
+      throw new Error("issueBrowserCredentials: issuance ledger write failed; the minted credential was destroyed unreturned", { cause: error });
+    }
+    if (outcome.kind !== "recorded") {
+      throw new Error(`issueBrowserCredentials: issuance is fenced at ${outcome.scope} scope; the minted credential was destroyed unreturned`);
+    }
+  }
   return {
     userJwt: minted.userJwt,
     userPubkey: minted.userPubkey,
