@@ -120,6 +120,7 @@ export {
   CONFORMANCE_RETENTION_SEC,
   type BrowserCredentialLedgerInterposeHooks,
   type BrowserCredentialLedgerFaultControl,
+  type BrowserCredentialLedgerAtomicityControl,
   type BrowserCredentialLedgerConformanceOptions,
   type BrowserCredentialLedgerConformanceCase,
   type BrowserCredentialLedgerConformanceReport,

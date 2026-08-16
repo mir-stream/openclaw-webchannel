@@ -7,10 +7,12 @@ import {
 } from "./browser-credential-ledger-conformance.js";
 import {
   BrowserCredentialCollisionError,
+  BrowserCredentialCursorError,
   MemoryBrowserCredentialLedger,
   type BrowserCredentialIssuance,
   type BrowserCredentialLedger,
   type BrowserCredentialRecord,
+  type BrowserCredentialScope,
 } from "./browser-credential-ledger.js";
 
 type Broken =
@@ -20,7 +22,28 @@ type Broken =
   | "retention_ignored"
   | "page_limit_ignored"
   | "cursor_unbound"
-  | "revoke_scope_leak";
+  | "offset_pagination"
+  | "revoke_scope_leak"
+  | "revoke_each_row_transaction"
+  | "floor_fractional_expiry"
+  | "unknown_scope_as_account";
+
+type BrokenState = { failBeforeCommit: boolean };
+
+/** The real memory transaction with a failure injected at its internal staging seam. */
+class ControlledMemoryBrowserCredentialLedger extends MemoryBrowserCredentialLedger {
+  private failBeforeCommit = false;
+
+  failNextMarkRevokedBeforeCommit(): void {
+    this.failBeforeCommit = true;
+  }
+
+  protected override beforeMarkRevokedCommitForConformance(): void {
+    if (!this.failBeforeCommit) return;
+    this.failBeforeCommit = false;
+    throw new Error("webchannel conformance: injected markRevoked transaction failure");
+  }
+}
 
 function findCase(prefix: string): BrowserCredentialLedgerConformanceCase {
   const found = browserCredentialLedgerConformanceCases.find((candidate) => candidate.name.startsWith(prefix));
@@ -34,7 +57,7 @@ function findCase(prefix: string): BrowserCredentialLedgerConformanceCase {
  * reason to keep", a driver-side limit, an unvalidated cursor, a scope
  * predicate missing its peer term, and a hard-coded retention.
  */
-function breakLedger(inner: MemoryBrowserCredentialLedger, defect: Broken): BrowserCredentialLedger {
+function breakLedger(inner: ControlledMemoryBrowserCredentialLedger, defect: Broken, state: BrokenState): BrowserCredentialLedger {
   const shadow = new Map<string, BrowserCredentialRecord>();
   const known = new Map<string, BrowserCredentialRecord>();
   const hidden = new Set<string>();
@@ -52,6 +75,15 @@ function breakLedger(inner: MemoryBrowserCredentialLedger, defect: Broken): Brow
           throw new BrowserCredentialCollisionError(issuance.userPubkey);
         };
         if (property === "get") return async (userPubkey: string) => shadow.get(userPubkey) ?? target.get(userPubkey);
+      }
+
+      // A driver that normalizes expiry into an integer column instead of
+      // rejecting the caller's malformed seconds timestamp.
+      if (defect === "floor_fractional_expiry" && property === "recordIssuance") {
+        return async (issuance: BrowserCredentialIssuance) => target.recordIssuance({
+          ...issuance,
+          expiresAtSec: issuance.expiresAtSec === null ? null : Math.floor(issuance.expiresAtSec),
+        });
       }
 
       // An adapter with an in-process cache that hands out the cached object.
@@ -108,10 +140,86 @@ function breakLedger(inner: MemoryBrowserCredentialLedger, defect: Broken): Brow
         } catch { return target.list(scope, query); }
       };
 
+      // A realistic OFFSET adapter: the cursor is correctly bound and opaque,
+      // and an unchanged dataset pages perfectly, but a new first row shifts
+      // every later offset.
+      if (defect === "offset_pagination" && property === "list") return async (...args: Parameters<BrowserCredentialLedger["list"]>) => {
+        const [scope, query = {}] = args;
+        // Delegate ordinary scope/limit validation to the real adapter.
+        await target.list(scope, { ...query, cursor: null });
+        const key = JSON.stringify(scope);
+        const status = query.status ?? null;
+        let offset = 0;
+        if (query.cursor != null) {
+          let cursor: { k?: unknown; s?: unknown; o?: unknown };
+          try { cursor = JSON.parse(Buffer.from(query.cursor, "base64url").toString()) as typeof cursor; }
+          catch { throw new BrowserCredentialCursorError("webchannel: browser credential cursor is not a cursor this ledger issued"); }
+          if (cursor.k !== key || (cursor.s ?? null) !== status || !Number.isInteger(cursor.o) || (cursor.o as number) < 1) {
+            throw new BrowserCredentialCursorError();
+          }
+          offset = cursor.o as number;
+        }
+        const all: BrowserCredentialRecord[] = [];
+        let targetCursor: string | null = null;
+        do {
+          const page = await target.list(scope, { status: query.status, limit: 1_000, cursor: targetCursor });
+          all.push(...page.records); targetCursor = page.cursor;
+        } while (targetCursor !== null);
+        const limit = query.limit ?? 200;
+        const records = all.slice(offset, offset + limit);
+        const nextOffset = offset + records.length;
+        const cursor = nextOffset < all.length
+          ? Buffer.from(JSON.stringify({ k: key, s: status, o: nextOffset })).toString("base64url")
+          : null;
+        return { records, cursor };
+      };
+
       if (defect === "revoke_scope_leak" && property === "markRevoked") return async (...args: Parameters<BrowserCredentialLedger["markRevoked"]>) => {
         const [scope, revokedAtSec] = args;
         return target.markRevoked(scope.kind === "peer" ? { kind: "account", natsAccountPublicKey: scope.natsAccountPublicKey } : scope, revokedAtSec);
       };
+
+      // Runtime union handling that defaults any unknown discriminator to the
+      // broadest branch, reproducing the account-wide typo failure.
+      if (defect === "unknown_scope_as_account" && (property === "list" || property === "markRevoked")) {
+        return async (scope: BrowserCredentialScope, ...rest: unknown[]) => {
+          const runtime = scope as unknown as { kind?: unknown; natsAccountPublicKey?: unknown };
+          const knownKind = runtime.kind === "credential" || runtime.kind === "peer" || runtime.kind === "account";
+          const normalized = knownKind ? scope : {
+            kind: "account",
+            natsAccountPublicKey: runtime.natsAccountPublicKey,
+          } as BrowserCredentialScope;
+          if (property === "list") {
+            return target.list(normalized, ...(rest as [Parameters<BrowserCredentialLedger["list"]>[1]]));
+          }
+          return target.markRevoked(normalized, ...(rest as [number]));
+        };
+      }
+
+      // Each credential is committed in its own transaction. Serial tests see
+      // the right final result; an injected failure after one commit exposes
+      // the partial scope that the SPI forbids.
+      if (defect === "revoke_each_row_transaction" && property === "markRevoked") {
+        return async (scope: BrowserCredentialScope, revokedAtSec: number) => {
+          const matched: BrowserCredentialRecord[] = [];
+          let cursor: string | null = null;
+          do {
+            const page = await target.list(scope, { limit: 100, cursor });
+            matched.push(...page.records); cursor = page.cursor;
+          } while (cursor !== null);
+          let marked = 0; let alreadyRevoked = 0;
+          for (const record of matched) {
+            if (record.status === "revoked") { alreadyRevoked++; continue; }
+            await target.markRevoked({ kind: "credential", userPubkey: record.userPubkey }, revokedAtSec);
+            marked++;
+            if (state.failBeforeCommit) {
+              state.failBeforeCommit = false;
+              throw new Error("webchannel conformance mutant: row transaction failed");
+            }
+          }
+          return { marked, alreadyRevoked };
+        };
+      }
 
       return value.bind(target);
     },
@@ -120,16 +228,23 @@ function breakLedger(inner: MemoryBrowserCredentialLedger, defect: Broken): Brow
 
 function controlled(defect?: Broken, retentionSec: number = CONFORMANCE_RETENTION_SEC) {
   let nowSec = 1_700_000_000;
+  const state: BrokenState = { failBeforeCommit: false };
   // The retention defect deliberately discards the harness-supplied horizon.
-  const inner = new MemoryBrowserCredentialLedger({
+  const inner = new ControlledMemoryBrowserCredentialLedger({
     autoSweep: false,
     retentionSec: defect === "retention_ignored" ? 5_000 : retentionSec,
     clockSec: () => nowSec,
   });
   return {
-    ledger: defect ? breakLedger(inner, defect) : inner,
+    ledger: defect ? breakLedger(inner, defect, state) : inner,
     close: async () => inner.close(),
     clock: { nowSec: () => nowSec, advance: async (sec: number) => { nowSec += sec; } },
+    atomicity: {
+      failNextMarkRevokedBeforeCommit: async () => {
+        if (defect === "revoke_each_row_transaction") state.failBeforeCommit = true;
+        else inner.failNextMarkRevokedBeforeCommit();
+      },
+    },
   };
 }
 
@@ -146,9 +261,13 @@ describe("BrowserCredentialLedger conformance harness self-tests", () => {
   for (const [prefix, defect, killedBy] of [
     ["1:", "overwrite_on_duplicate", "duplicate issuance overwrote the original record"],
     ["1:", "aliased_reads", "a returned record is aliased to the ledger's own state"],
+    ["2:", "floor_fractional_expiry", "fractional expiresAtSec was accepted"],
+    ["3:", "unknown_scope_as_account", "an unknown scope kind was accepted by list as an account-wide query"],
     ["4:", "page_limit_ignored", "page exceeded the requested limit"],
     ["4:", "cursor_unbound", "a cursor from a different scope was accepted"],
+    ["4:", "offset_pagination", "cursor resumed by page offset after a newer issuance (duplicated, skipped, or admitted a before-anchor record)"],
     ["5:", "revoke_scope_leak", "peer revocation did not mark exactly its scope"],
+    ["5:", "revoke_each_row_transaction", "markRevoked left a partially revoked scope after an injected transactional failure"],
     ["6:", "retention_ignored", "configured retention was ignored one second past the boundary"],
     ["7:", "sweep_immortal", "sweep removed an active non-expiring credential"],
   ] as const) {
@@ -159,8 +278,12 @@ describe("BrowserCredentialLedger conformance harness self-tests", () => {
 
   it("fails a directly selected clock case loudly and visibly skips clock cases in the convenience runner", async () => {
     const withoutClock = () => {
-      const ledger = new MemoryBrowserCredentialLedger({ autoSweep: false, retentionSec: CONFORMANCE_RETENTION_SEC, clockSec: () => 1_700_000_000 });
-      return { ledger, close: async () => ledger.close() };
+      const ledger = new ControlledMemoryBrowserCredentialLedger({ autoSweep: false, retentionSec: CONFORMANCE_RETENTION_SEC, clockSec: () => 1_700_000_000 });
+      return {
+        ledger,
+        close: async () => ledger.close(),
+        atomicity: { failNextMarkRevokedBeforeCommit: async () => ledger.failNextMarkRevokedBeforeCommit() },
+      };
     };
     await expect(findCase("6:").run(withoutClock())).rejects.toThrow("case 6 requires the optional controlled clock capability");
     const skips: string[] = [];

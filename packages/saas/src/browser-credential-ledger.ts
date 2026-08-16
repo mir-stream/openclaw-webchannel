@@ -183,14 +183,24 @@ const timestampMessage = (field: string): string =>
   `browser credential ${field} must be a positive integer below ${MAX_TIMESTAMP_SEC} unix SECONDS (a millisecond value is the recorded trap on this path)`;
 
 export function assertBrowserCredentialScope(scope: BrowserCredentialScope): void {
-  const fields = scope.kind === "credential"
-    ? (["userPubkey"] as const)
-    : scope.kind === "peer"
-      ? (["natsAccountPublicKey", "peerId"] as const)
-      : (["natsAccountPublicKey"] as const);
+  if (scope === null || typeof scope !== "object") {
+    throw new BrowserCredentialLedgerInputError("browser credential scope must be an object with kind credential, peer, or account");
+  }
+  const candidate = scope as unknown as Record<string, unknown>;
+  let fields: readonly string[];
+  switch (candidate.kind) {
+    case "credential": fields = ["userPubkey"]; break;
+    case "peer": fields = ["natsAccountPublicKey", "peerId"]; break;
+    case "account": fields = ["natsAccountPublicKey"]; break;
+    default:
+      // Never default an untrusted discriminator to the broadest scope. A
+      // misspelled peer scope becoming an account scope would turn one cut into
+      // an account-wide operation.
+      throw new BrowserCredentialLedgerInputError("browser credential scope kind must be credential, peer, or account");
+  }
   for (const field of fields) {
-    if (!isIdentifier((scope as Record<string, unknown>)[field])) {
-      throw new BrowserCredentialLedgerInputError(`browser credential scope ${scope.kind}.${field} must be a non-empty string`);
+    if (!isIdentifier(candidate[field])) {
+      throw new BrowserCredentialLedgerInputError(`browser credential scope ${candidate.kind as string}.${field} must be a non-empty string`);
     }
   }
 }
@@ -276,15 +286,23 @@ const DEFAULT_RETENTION_SEC = 30 * 24 * 60 * 60;
 const DEFAULT_SWEEP_INTERVAL_MS = 3_600_000;
 const DEFAULT_LIMIT = 200;
 
-const scopeKey = (scope: BrowserCredentialScope): string =>
-  scope.kind === "credential" ? `c ${scope.userPubkey}`
-    : scope.kind === "peer" ? `p ${scope.natsAccountPublicKey} ${scope.peerId}`
-      : `a ${scope.natsAccountPublicKey}`;
+const scopeKey = (scope: BrowserCredentialScope): string => {
+  switch (scope.kind) {
+    case "credential": return `c ${scope.userPubkey}`;
+    case "peer": return `p ${scope.natsAccountPublicKey} ${scope.peerId}`;
+    case "account": return `a ${scope.natsAccountPublicKey}`;
+    default: throw new BrowserCredentialLedgerInputError("browser credential scope kind must be credential, peer, or account");
+  }
+};
 
-const inScope = (record: BrowserCredentialRecord, scope: BrowserCredentialScope): boolean =>
-  scope.kind === "credential" ? record.userPubkey === scope.userPubkey
-    : scope.kind === "peer" ? record.natsAccountPublicKey === scope.natsAccountPublicKey && record.peerId === scope.peerId
-      : record.natsAccountPublicKey === scope.natsAccountPublicKey;
+const inScope = (record: BrowserCredentialRecord, scope: BrowserCredentialScope): boolean => {
+  switch (scope.kind) {
+    case "credential": return record.userPubkey === scope.userPubkey;
+    case "peer": return record.natsAccountPublicKey === scope.natsAccountPublicKey && record.peerId === scope.peerId;
+    case "account": return record.natsAccountPublicKey === scope.natsAccountPublicKey;
+    default: throw new BrowserCredentialLedgerInputError("browser credential scope kind must be credential, peer, or account");
+  }
+};
 
 // issuedAtSec DESC, then userPubkey ASC. userPubkey is unique, so this is a
 // TOTAL order — the property a keyset cursor needs to be exact.
@@ -310,7 +328,7 @@ const clone = (record: BrowserCredentialRecord): BrowserCredentialRecord => ({ .
  * demos, and as the executable spelling of the contract.
  */
 export class MemoryBrowserCredentialLedger implements BrowserCredentialLedger {
-  private readonly records = new Map<string, BrowserCredentialRecord>();
+  private records = new Map<string, BrowserCredentialRecord>();
   private readonly clockSec: () => number;
   private readonly retentionSec: number;
   private readonly defaultLimit: number;
@@ -400,17 +418,24 @@ export class MemoryBrowserCredentialLedger implements BrowserCredentialLedger {
     assertBrowserCredentialScope(scope);
     assertTimestampSec(revokedAtSec, "revokedAtSec");
     let marked = 0; let alreadyRevoked = 0;
-    // No await between the survey and the writes: this whole method is the
-    // serialization boundary. A durable adapter must make it one transaction —
-    // a partially revoked scope is exactly the state an operator cannot act on.
+    // Stage into a private copy and publish the whole map with one reference
+    // replacement. Besides making concurrent reads all-before/all-after, this
+    // leaves the authoritative map untouched if staging itself throws. A
+    // durable adapter must spell the equivalent as one database transaction.
+    const staged = new Map(this.records);
     for (const [key, record] of this.records) {
       if (!inScope(record, scope)) continue;
       if (record.status === "revoked") { alreadyRevoked++; continue; }
-      this.records.set(key, { ...record, status: "revoked", revokedAtSec });
+      staged.set(key, { ...record, status: "revoked", revokedAtSec });
       marked++;
     }
+    if (marked > 0) this.beforeMarkRevokedCommitForConformance();
+    this.records = staged;
     return { marked, alreadyRevoked };
   }
+
+  /** @internal A no-op seam used only to fail the real staged transaction immediately before commit in conformance tests. */
+  protected beforeMarkRevokedCommitForConformance(): void {}
 
   async sweep(): Promise<number> {
     const now = Math.floor(this.clockSec()); let removed = 0;

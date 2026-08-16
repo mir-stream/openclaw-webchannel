@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 import { createAccount } from "@nats-io/nkeys";
 
 import { setupTrustChain } from "./setup-trust-chain.js";
-import { issueBrowserCredentials } from "./nats-user-creds.js";
+import { issueBrowserCredentials, type IssueBrowserCredentialsOptions } from "./nats-user-creds.js";
 import {
   MemoryBrowserCredentialLedger,
   type BrowserCredentialIssuance,
@@ -75,6 +75,51 @@ describe("issueBrowserCredentials × BrowserCredentialLedger", () => {
 
     // Exactly one — not zero, not two.
     expect(await all(ledger, record?.natsAccountPublicKey as string, "peer-1")).toHaveLength(1);
+  });
+
+  it("snapshots every issuance option before asynchronous minting can yield", async () => {
+    const built = await chain();
+    const ledger = ledgerOf();
+    const replacementLedger = ledgerOf();
+    const replacementIdentity = createAccount().getPublicKey();
+    const options: IssueBrowserCredentialsOptions = {
+      accountSeed: built.private.natsAccountSeed,
+      tenant: "tenant-original",
+      peerId: "peer-original",
+      ttlSeconds: 3_600,
+      ledger,
+      accountContext: "context-original",
+    };
+
+    // `issueBrowserCredentials` reaches its mint await before returning this
+    // promise. Mutate every field synchronously while that await is pending;
+    // the JWT, permissions, and row must all stay on the first snapshot.
+    const pending = issueBrowserCredentials(options);
+    options.accountSeed = "mutated-account-seed";
+    options.tenant = "tenant-mutated";
+    options.peerId = "peer-mutated";
+    options.issuerAccountId = replacementIdentity;
+    options.ttlSeconds = 0.5;
+    options.ledger = replacementLedger;
+    options.accountContext = "context-mutated";
+
+    const creds = await pending;
+    const payload = JSON.parse(Buffer.from(creds.userJwt.split(".")[1] as string, "base64url").toString());
+    const record = await ledger.get(creds.userPubkey);
+    expect(creds.permissions.pub).toEqual(["webchannel.tenant-original.*.peer-original.>"]);
+    // `exp` is computed immediately before the async encoder stamps `iat`, so
+    // a saturated test worker can cross a wall-clock second between the two.
+    // The original one-hour TTL remains unmistakable from the mutated 0.5s.
+    expect(payload.exp - payload.iat).toBeGreaterThan(3_500);
+    expect(payload.exp - payload.iat).toBeLessThanOrEqual(3_600);
+    expect(record).toMatchObject({
+      tenant: "tenant-original",
+      peerId: "peer-original",
+      accountContext: "context-original",
+      natsAccountPublicKey: payload.iss,
+      userPubkey: payload.sub,
+    });
+    expect(await replacementLedger.get(creds.userPubkey)).toBeNull();
   });
 
   it("keeps every secret out of the record, its serialization, and a query response", async () => {

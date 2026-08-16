@@ -323,30 +323,35 @@ function decodeMintedUserClaim(userJwt: string): { sub: string; iat: number; exp
 export async function issueBrowserCredentials(
   o: IssueBrowserCredentialsOptions,
 ): Promise<BrowserCredentials> {
-  if (o.ttlSeconds !== undefined && !(Number.isFinite(o.ttlSeconds) && o.ttlSeconds > 0)) {
+  // Options are ordinary runtime objects despite their TypeScript shape. Read
+  // every issuance input exactly once before minting yields: reusing/mutating a
+  // pending options object must not bind a JWT minted for one peer to a ledger
+  // row naming another.
+  const { accountSeed, tenant, peerId, issuerAccountId, ttlSeconds, ledger, accountContext } = o;
+  if (ttlSeconds !== undefined && !(Number.isFinite(ttlSeconds) && ttlSeconds > 0)) {
     // NaN/Infinity/fractional-or-negative all slip past a naive `<= 0` check and
     // would mint a silently non-expiring or malformed-exp credential.
     throw new Error(
       "issueBrowserCredentials: ttlSeconds must be a finite positive number when provided (0/NaN/Infinity/negative would mint a non-expiring or malformed credential)",
     );
   }
-  if (!o.peerId) {
+  if (!peerId) {
     throw new Error("issueBrowserCredentials: peerId is required (the authenticated session subject)");
   }
   // Checked BEFORE minting: a ledger wired up without its audit label would
   // otherwise mint a credential only to withhold it, and the operator would read
   // the resulting login failure as a NATS problem rather than a config one.
-  if (o.ledger && !o.accountContext) {
+  if (ledger && !accountContext) {
     throw new Error("issueBrowserCredentials: accountContext is required whenever ledger is provided (the audit label for this issuance)");
   }
-  const binding = o.ledger && o.accountContext ? { ledger: o.ledger, accountContext: o.accountContext } : null;
+  const binding = ledger && accountContext ? { ledger, accountContext } : null;
   const minted = await mintNatsUserCreds({
     role: "browser",
-    accountSeed: o.accountSeed,
-    tenant: o.tenant,
-    peerId: o.peerId,
-    ...(o.issuerAccountId ? { issuerAccountId: o.issuerAccountId } : {}),
-    ...(o.ttlSeconds ? { ttlSeconds: o.ttlSeconds } : {}),
+    accountSeed,
+    tenant,
+    peerId,
+    ...(issuerAccountId ? { issuerAccountId } : {}),
+    ...(ttlSeconds ? { ttlSeconds } : {}),
   });
   if (binding) {
     const claim = decodeMintedUserClaim(minted.userJwt);
@@ -359,10 +364,10 @@ export async function issueBrowserCredentials(
     let outcome;
     try {
       outcome = await binding.ledger.recordIssuance({
-        tenant: o.tenant,
+        tenant,
         accountContext: binding.accountContext,
         natsAccountPublicKey: claim.natsAccountPublicKey,
-        peerId: o.peerId,
+        peerId,
         userPubkey: minted.userPubkey,
         issuedAtSec: claim.iat,
         expiresAtSec: claim.exp,

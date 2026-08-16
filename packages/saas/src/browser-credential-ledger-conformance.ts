@@ -27,6 +27,20 @@ export type BrowserCredentialLedgerInterposeHooks =
 
 export type BrowserCredentialLedgerFaultControl = { remaining(): number; clear(): void };
 
+/**
+ * Required adapter-owned fault injection for certifying `markRevoked` atomicity.
+ *
+ * The next `markRevoked` that matches an ACTIVE row must fail one-shot after
+ * the real scoped mutation has been attempted/staged inside its operation-wide
+ * transaction and immediately before commit. This is intentionally compatible
+ * with a set-based SQL `UPDATE`: the adapter need not split it into artificial
+ * per-row writes. Throwing in a decorator before or after the public call does
+ * not satisfy this contract because it cannot prove transaction rollback.
+ */
+export type BrowserCredentialLedgerAtomicityControl = {
+  failNextMarkRevokedBeforeCommit(): void | Promise<void>;
+};
+
 /** Harness-owned decorator: adapters need no test-only failpoint capability. */
 export function interposeBrowserCredentialLedger(
   ledger: BrowserCredentialLedger,
@@ -58,6 +72,7 @@ export type BrowserCredentialLedgerConformanceOptions = {
     ledger: BrowserCredentialLedger;
     close(): Promise<void>;
     clock?: { nowSec(): number; advance(sec: number): Promise<void> };
+    atomicity: BrowserCredentialLedgerAtomicityControl;
   }>;
   /** Receives the same visible message emitted by the default console reporter. */
   reportSkip?(message: string): void;
@@ -94,6 +109,7 @@ const same = (left: unknown, right: unknown): boolean => JSON.stringify(canonica
 
 const ACCOUNT = "A".repeat(56);
 const OTHER_ACCOUNT = "B".repeat(56);
+const ATOMIC_ACCOUNT = "C".repeat(56);
 const RECORD_FIELDS = [
   "tenant", "accountContext", "natsAccountPublicKey", "peerId",
   "userPubkey", "issuedAtSec", "expiresAtSec", "status", "revokedAtSec",
@@ -189,6 +205,7 @@ export const browserCredentialLedgerConformanceCases: readonly BrowserCredential
       ["millisecond expiresAtSec", { ...base, expiresAtSec: 1_800_000_000_000 }],
       ["boundary issuedAtSec", { ...base, issuedAtSec: MAX_TIMESTAMP_SEC }],
       ["fractional issuedAtSec", { ...base, issuedAtSec: now + 0.5 }],
+      ["fractional expiresAtSec", { ...base, expiresAtSec: now + 0.5 }],
       ["zero issuedAtSec", { ...base, issuedAtSec: 0 }],
       ["negative expiresAtSec", { ...base, expiresAtSec: -1 }],
       ["NaN issuedAtSec", { ...base, issuedAtSec: Number.NaN }],
@@ -235,6 +252,16 @@ export const browserCredentialLedgerConformanceCases: readonly BrowserCredential
     invariant(single.length === 1 && single[0]?.userPubkey === peerKeys[1], "credential scope did not return exactly its one record");
     const other = await drain(ledger, { kind: "account", natsAccountPublicKey: OTHER_ACCOUNT }, { limit: 10 });
     invariant(same(other.map((r) => r.userPubkey), [foreign]), "a foreign account's records crossed the account scope");
+
+    // TypeScript's union is not runtime validation. In particular, an unknown
+    // discriminator must never fall through to the broad account branch: a
+    // typo in a peer cut would otherwise enumerate/revoke both sibling peers.
+    const misspelledPeer = { kind: "peeer", natsAccountPublicKey: ACCOUNT, peerId: "peer" } as unknown as BrowserCredentialScope;
+    await expectNamedError(() => ledger.list(misspelledPeer), "BrowserCredentialLedgerInputError",
+      "an unknown scope kind was accepted by list as an account-wide query");
+    await expectNamedError(() => ledger.markRevoked(misspelledPeer, now + 10), "BrowserCredentialLedgerInputError",
+      "an unknown scope kind was accepted by markRevoked as an account-wide operation");
+    invariant((await ledger.get(sibling))?.status === "active", "a malformed peer scope revoked its sibling before it was rejected");
   } },
 
   { name: "4: pagination is a stable total order with exact keyset resume", suite: "core", async run(instance) {
@@ -269,6 +296,24 @@ export const browserCredentialLedgerConformanceCases: readonly BrowserCredential
       "BrowserCredentialCursorError", "a fabricated cursor was accepted");
     const lastPage = await ledger.list(scope, { limit: 50 });
     invariant(lastPage.cursor === null && lastPage.records.length === expected.length, "an exhausted scope did not return a null cursor");
+
+    // A stable dataset cannot distinguish a keyset cursor from OFFSET. Insert a
+    // row ahead of the original anchor between page requests: resuming the old
+    // cursor must return the rest of the original walk exactly once and must
+    // not admit the newly inserted before-anchor row.
+    const insertedAhead = `U${"6".repeat(55)}`;
+    await ledger.recordIssuance(issuance({ userPubkey: insertedAhead, issuedAtSec: now + 4 }));
+    const interleavedWalk = [...firstPage.records];
+    let resume: string | null = firstPage.cursor;
+    for (let page = 0; resume !== null && page < 100; page++) {
+      const next = await ledger.list(scope, { limit: 2, cursor: resume });
+      invariant(next.cursor === null || next.records.length > 0, "non-null cursor returned with an empty page after issuance interleaving");
+      interleavedWalk.push(...next.records);
+      resume = next.cursor;
+    }
+    invariant(resume === null, "pagination did not terminate after issuance interleaving");
+    invariant(same(interleavedWalk.map((record) => record.userPubkey), expected),
+      "cursor resumed by page offset after a newer issuance (duplicated, skipped, or admitted a before-anchor record)");
   } },
 
   { name: "5: markRevoked is scoped, atomic, idempotent, and monotonic", suite: "core", async run(instance) {
@@ -306,6 +351,26 @@ export const browserCredentialLedgerConformanceCases: readonly BrowserCredential
     invariant(active.length === 0, "status filter still reports revoked records as active");
     const revoked = await drain(ledger, { kind: "account", natsAccountPublicKey: ACCOUNT }, { limit: 1, status: "revoked" });
     invariant(revoked.length === 3 && revoked.every((r) => r.status === "revoked"), "status filter did not page exactly the revoked set");
+
+    // Final-state-only checks let an adapter commit one credential at a time.
+    // Fail after the real scoped mutation is staged but immediately before its
+    // operation-wide commit, then require rollback of the whole scope. A
+    // decorator-level throw would not exercise this state.
+    const atomicKeys = [`U${"5".repeat(55)}`, `U${"6".repeat(55)}`];
+    for (const userPubkey of atomicKeys) {
+      await ledger.recordIssuance(issuance({ userPubkey, natsAccountPublicKey: ATOMIC_ACCOUNT, peerId: "atomic-peer", issuedAtSec: now }));
+    }
+    const atomicScope = { kind: "peer", natsAccountPublicKey: ATOMIC_ACCOUNT, peerId: "atomic-peer" } as const;
+    await instance.atomicity.failNextMarkRevokedBeforeCommit();
+    let interrupted = false;
+    try { await ledger.markRevoked(atomicScope, now + 20); }
+    catch { interrupted = true; }
+    invariant(interrupted, "markRevoked atomicity fault control did not interrupt the transaction");
+    const afterFailure = await Promise.all(atomicKeys.map((userPubkey) => ledger.get(userPubkey)));
+    invariant(afterFailure.every((record) => record?.status === "active" && record.revokedAtSec === null),
+      "markRevoked left a partially revoked scope after an injected transactional failure");
+    invariant(same(await ledger.markRevoked(atomicScope, now + 21), { marked: 2, alreadyRevoked: 0 }),
+      "markRevoked did not recover after the one-shot atomicity fault");
   } },
 
   { name: "6: both removable classes retain at equality and drop one second later", suite: "clock", async run(instance) {
