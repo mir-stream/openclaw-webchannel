@@ -27,6 +27,9 @@ describe("tuple storage paths", () => {
     expect(paths.conversationKeyPath).toBe(
       join(paths.directory, "conversation-keys.json"),
     );
+    expect(paths.conversationKeyGenerationsPath).toBe(
+      join(paths.directory, "conversation-key-generations.json"),
+    );
   });
 
   it("separates exact case-sensitive tuples without exposing raw tenant in paths", () => {

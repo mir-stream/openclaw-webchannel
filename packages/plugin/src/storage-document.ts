@@ -6,7 +6,10 @@ import {
   type StorageScopeIdentity,
 } from "./storage-identity.js";
 
-export type SecretDocumentKind = "credentials" | "conversation-keys";
+export type SecretDocumentKind =
+  | "credentials"
+  | "conversation-keys"
+  | "conversation-key-generations";
 
 export type StorageDocumentErrorCode =
   | "identity-unbound"
