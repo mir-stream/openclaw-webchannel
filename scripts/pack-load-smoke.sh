@@ -200,6 +200,11 @@ if ! printf '%s' "$ROTATE_HELP" | grep -qF -- '--credential-path <file>'; then
   echo "ERROR: managed rotation entry help lacks --credential-path." >&2
   exit 1
 fi
+if ! printf '%s' "$ROTATE_HELP" | \
+  grep -qF -- 'SERVICE CONTEXT IS PART OF THE TARGET'; then
+  echo "ERROR: managed rotation entry help lacks the service-context warning." >&2
+  exit 1
+fi
 
 # ── Exercise packed dry run, apply, and complete durable readback ───────
 ROTATE_STORAGE_ROOT="$WORK/rotation-store"

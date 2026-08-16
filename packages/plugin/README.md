@@ -207,7 +207,10 @@ replace it with the installed plugin's offline rotation entry — with every
 gateway replica stopped — and follow
 [`docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md`](../../docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md)
 for the supported `openclaw plugins inspect webchannel --json` invocation and
-the order of operations. Rotation supports one local tuple store or one
+the order of operations. Resolve and run it as the stopped gateway's same OS
+service identity/HOME, mount/container namespace, and OpenClaw profile or
+explicit state/config selection; compare the dry-run tuple directory with the
+deployment before apply. Rotation supports one local tuple store or one
 authoritative store shared by every replica; independent per-replica volumes are
 not supported and must not be rotated separately. Deleting
 `conversation-keys.json` is still never the way to rotate: it destroys every
@@ -215,7 +218,9 @@ peer's key at once and leaves no audit trail, which is exactly what the offline
 entry replaces. Account-wide confirmation digests bind the exact tenant,
 account, and peer set. On a shared store, every existing rotation lock or
 atomic-write temp artifact is treated as potentially remote/live and left
-untouched; consult the command's explicit apply outcome before any retry.
+untouched; consult the command's explicit apply outcome before any retry. An
+exact `--storage-root` can bridge another invocation HOME only for already-v2
+state; legacy discovery still requires the gateway's original service context.
 
 ### Account-sharding runbook
 

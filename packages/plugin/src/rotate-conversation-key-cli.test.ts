@@ -284,6 +284,17 @@ describe("invocation", () => {
     expect(result.out).toContain("--credential-path <file>");
     expect(result.out).toContain("low-level runtime credentialPath");
     expect(result.out).toContain("never printed");
+    expect(result.out).toContain("SERVICE CONTEXT IS PART OF THE TARGET");
+    expect(result.out).toContain("same OS service\n  identity/HOME");
+    expect(result.out).toContain(
+      "OPENCLAW_STATE_DIR/OPENCLAW_CONFIG_PATH selection",
+    );
+    expect(result.out).toContain(
+      "compare the dry run's printed \"directory:\"",
+    );
+    expect(result.out).toContain(
+      "legacy migration still\n  requires the gateway's HOME/service context",
+    );
   });
 
   it("requires an exact tenant and account", () => {
@@ -368,6 +379,10 @@ describe("invocation", () => {
     ) ?? -1;
     expect(stopFirst).toBeGreaterThanOrEqual(0);
     expect(providerRevoke).toBeGreaterThan(stopFirst);
+    expect(classA).toContain("providerEffectiveFloorSec");
+    expect(classA).toContain(
+      "Never invent or substitute Class B's\n`expectedFloorSec`",
+    );
 
     const revocationSteps = runbook
       .split(
@@ -398,7 +413,44 @@ describe("invocation", () => {
       "strictly greater than the effective accepted wildcard floor",
     );
     expect(runbook).toContain(
-      "effective\n  accepted target floor (`expectedFloorSec`)",
+      "effective accepted target floor (`expectedFloorSec`)",
+    );
+    expect(runbook).toContain(
+      "**Class C is the deliberate exception:** it may\n" +
+        "enter ④ only after §5 steps 1–3",
+    );
+    expect(runbook).toContain(
+      "Its credential revocation remains pending;\n" +
+        "keep the account disabled and replicas stopped, and do not restart",
+    );
+    expect(runbook).toContain(
+      "**Wildcard/account-wide target, Class A:**",
+    );
+    expect(runbook).toContain(
+      "**Managed Class C:** restore provider control",
+    );
+    expect(runbook).toContain(
+      "Do **not** run\n     the self-contained §4 ②–③ resolver procedure",
+    );
+    expect(runbook).toContain(
+      "same OS service identity/HOME and in the same\n" +
+        "mount/container namespace",
+    );
+    expect(runbook).toContain(
+      '"${OPENCLAW[@]}" plugins inspect webchannel --json',
+    );
+    expect(runbook).toContain(
+      '"${OPENCLAW[@]}" channels add --channel webchannel',
+    );
+    expect(runbook).toContain("OPENCLAW=(openclaw)\n");
+    expect(runbook).toContain(
+      '# OPENCLAW=(openclaw --profile "<gateway-profile>")',
+    );
+    expect(runbook).not.toContain(
+      'OPENCLAW=(openclaw --profile "$GATEWAY_PROFILE")',
+    );
+    expect(runbook).toContain(
+      "compare the dry run's printed `directory:` with the stopped",
     );
   });
 });

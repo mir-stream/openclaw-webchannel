@@ -110,7 +110,7 @@ Answer this first. The rest of the document branches on it.
 These are two independent controls, and conflating them either leaves a hole or
 causes an unnecessary outage.
 
-| What leaked | Revoke credential (§4 ②–③) | Rotate K (§4 ④) | Fresh browser bootstrap (§4 ⑥) |
+| What leaked | Revoke credential (Class A §3 / Class B §4 ②–③) | Rotate K (§4 ④) | Fresh browser bootstrap (§4 ⑥) |
 |---|---|---|---|
 | A browser's NATS credential only | **yes** | no | affected browser/device |
 | The agent's NATS credential only | **yes** (plus ④-bis) | no | **every browser in the account** after ④-bis identity-key replacement |
@@ -119,22 +119,25 @@ causes an unnecessary outage.
 
 Choose one executable route:
 
-- **Exact browser credential only:** run ②–③ live, including target disconnect,
-  non-target continuity, and failed old-credential reconnect. Then force only
-  the affected browser through a fresh bootstrap (§4 ⑥). Do not stop the
-  gateway or rotate K.
-- **Current agent credential only, exact agent key or wildcard:** run ②–③ live.
-  Then suspend every replica and confirm zero before moving
+- **Exact browser credential only:** run the Class A §3 provider route or Class B
+  §4 ②–③ live, including target disconnect, non-target continuity, and failed
+  old-credential reconnect. Then force only the affected browser through a
+  fresh bootstrap (§4 ⑥). Do not stop the gateway or rotate K.
+- **Current agent credential only, exact agent key or wildcard:** run the Class A
+  §3 provider route or Class B §4 ②–③ live. Then suspend every replica and
+  confirm zero before moving
   `credentials.json`; run ④-bis and restart/continue service at ⑤. That offline
   re-enrollment replaces the active agent identity key as well as the NATS
   credential, so force **every browser in the account** through ⑥ even for an
   exact old-agent-key revocation. Do not rotate K.
 - **K only:** skip revocation entirely. Run ① (including the topology check), ④,
   ⑤, and ⑥ for every peer whose K changed.
-- **Credential + K:** run the combined stop-first sequence: ①; ②–③ for the
-  credential; ④; ④-bis if the current agent credential was targeted, whether by
-  its exact key or by `"*"`; then ⑤–⑥. If ④-bis runs, its identity-key
-  replacement expands ⑥ to every browser in the account.
+- **Credential + K:** run the combined stop-first sequence: ①; the Class A §3
+  provider control or Class B §4 ②–③ for the credential; ④; ④-bis if the current
+  agent credential was targeted, whether by its exact key or by `"*"`; then
+  ⑤–⑥. If ④-bis runs, its identity-key replacement expands ⑥ to every browser
+  in the account. Class C instead follows §5's disable/isolate → rotate K →
+  restore credential control order and must not restart between those stages.
 
 Credential-only revocation can happen live. Anything involving K requires the
 stop-first order in §4; that requirement is not a formality.
@@ -146,6 +149,15 @@ stop-first order in §4; that requirement is not a formality.
 Select the incident scope from §2 **before taking any action**. This determines
 whether the provider revocation can happen live or must follow the stop/topology
 gate:
+
+For every managed credential revocation, retain the provider's acceptance and
+enforcement evidence. If the provider exposes an effective floor for the target
+that its documentation defines as positive safe-integer Unix seconds comparable
+to JWT `iat`, validate and record it as `providerEffectiveFloorSec`. If it
+exposes no comparable numeric floor, record that fact and use the provider's
+reviewed issuance and replacement rules. Never invent or substitute Class B's
+`expectedFloorSec`; that name exists only for the self-contained resolver
+procedure in §4 ②–③.
 
 1. **Credential only:** revoke the exact user key through the provider's
    console/API (Synadia Cloud / NGS), or use the provider's reviewed broader
@@ -170,9 +182,10 @@ gate:
    stop-first order closes the K_old handout window explained under ①; a live
    provider revocation followed by a later stop is not the combined route.
 
-For an agent credential replacement, use the provider's issuance rules. An
-account-wide floor still requires its replacement `iat` to be strictly above
-that floor.
+For an agent credential replacement, use the provider's issuance rules. If the
+provider exposed a numeric account-wide `providerEffectiveFloorSec`, the
+replacement `iat` must be strictly above it; otherwise follow the provider's
+reviewed replacement rule without inventing a floor.
 
 ---
 
@@ -199,8 +212,9 @@ agent-key and wildcard routes; this is not merely a NATS JWT swap.
 
 ### ① Stop every process and replica, and confirm an observed zero
 
-Run this step before any K rotation. For agent-credential-only containment, run
-②–③ live first, then return here before moving `credentials.json` in ④-bis.
+Run this step before any K rotation. For agent-credential-only containment,
+complete the Class A §3 provider route or Class B ②–③ live first, then return
+here before moving `credentials.json` in ④-bis.
 
 Suspend auto-restart or set desired replicas to 0 for **every** gateway
 controller and replica serving the affected account, then confirm the observed
@@ -443,16 +457,49 @@ disconnect a session that the floor does not catch, that session survives (§6.3
 
 ### ④ Rotate K with the offline command
 
-Only after ① is observed. If a credential is also in scope, ③ must be confirmed
-first; for K-only, ②–③ are deliberately skipped. ClawHub installs the plugin as
-a managed artifact; it does **not** put the package's npm `bin` on your shell
-PATH, and there is no npm package named `openclaw-webchannel-rotate-key`.
-Resolve the installed artifact through OpenClaw's inspection API and run its
+Only after ① is observed. If a credential is also in scope, Class A must first
+confirm §3 provider acceptance/enforcement and Class B must first confirm §4 ③
+resolver readback/enforcement. **Class C is the deliberate exception:** it may
+enter ④ only after §5 steps 1–3 have disabled the account, stopped every replica,
+and isolated relay/account access. Its credential revocation remains pending;
+keep the account disabled and replicas stopped, and do not restart until §5
+steps 5–6 complete it. For K-only, every credential route is deliberately
+skipped. ClawHub installs the plugin as a managed artifact; it does **not** put
+the package's npm `bin` on your shell PATH, and there is no npm package named
+`openclaw-webchannel-rotate-key`.
+
+**The stopped gateway's service context is part of the rotation target.** Open a
+shell or one-shot job as the same OS service identity/HOME and in the same
+mount/container namespace as that gateway. Use the exact same OpenClaw
+selection for the inspection below and for any later `channels add`: either the
+same global `--profile <name>`, or the same
+`OPENCLAW_STATE_DIR`/`OPENCLAW_CONFIG_PATH` values. If you cannot enter that
+context or see the same mounts, stop and escalate. The rotation CLI cannot
+attest any of this.
+
+Set one command prefix in that service context and keep it for the whole
+procedure:
+
+```bash
+# For an explicit state/config deployment, export the exact service values:
+# export OPENCLAW_STATE_DIR=...
+# export OPENCLAW_CONFIG_PATH=...
+
+# Default profile, or after inheriting/exporting the exact service env:
+OPENCLAW=(openclaw)
+
+# For a named-profile deployment, replace the active line above with this
+# global-option prefix (choose exactly one; do not run an unset placeholder):
+# OPENCLAW=(openclaw --profile "<gateway-profile>")
+```
+
+Do not mix the two examples or change the selection between commands. Resolve
+the installed artifact through that selected OpenClaw instance and run its
 dedicated entry with Node:
 
 ```bash
 PLUGIN_ROOT="$(
-  openclaw plugins inspect webchannel --json |
+  "${OPENCLAW[@]}" plugins inspect webchannel --json |
   node --input-type=module -e '
     import { isAbsolute } from "node:path";
     const chunks = [];
@@ -469,6 +516,11 @@ The entry is deliberately a separate process: it can neither open a NATS
 transport nor install a register subscription, and its offline account-wide
 mutation module is absent from the running gateway's bundle. If inspection or
 the file check fails, stop; do not substitute `npx` or a source-tree path.
+
+Node derives both default v2 and legacy roots from this invocation's own OS
+homedir. Running as another user, with another HOME, or outside the gateway's
+mount/container namespace can select a different or empty tuple even when the
+tenant/account text matches.
 
 **Dry run first — it is the default.** Nothing is rotated without `--apply`.
 
@@ -498,6 +550,14 @@ publishing an empty v2 key document. Keep replicas stopped, supply the exact
 configured path, or inspect and escalate. Deployments that did not configure
 the low-level override should not add this option.
 
+If the deployment configured `storageRoot`, append its exact absolute value as
+`--storage-root "$ABSOLUTE_STORAGE_ROOT"` to **every** dry-run and apply
+invocation. An exact deployed v2 root can bridge a different invocation HOME
+only when state is already v2; legacy discovery still uses the gateway's
+homedir/context, so a legacy migration must run in that original service
+context. Keep both configured overrides byte-for-byte identical between the dry
+run and apply.
+
 - The target is always explicit. There is no default and account-wide is never
   implied — you type the tuple by hand.
 - The account-wide dry run prints a peer **count** and a digest bound to the
@@ -517,9 +577,10 @@ the low-level override should not add this option.
   matching atomic-write temp artifact also blocks by default. Only
   `--ignore-live-writers` bypasses the temp-artifact signal after external
   inspection; it never bypasses a lock and proves no cross-host liveness.
-- `--storage-root` only if your deployment moved the v2 storage root. The dry run
-  prints the tuple directory it resolved, which is also how you find
-  `<v2_namespace>` for step ④-bis.
+- Before `--apply`, compare the dry run's printed `directory:` with the stopped
+  deployment's actual tuple directory. It must match exactly. This comparison is
+  an operator check; the CLI cannot attest its own HOME/profile/mount context.
+  The confirmed directory is also how you find `<v2_namespace>` for step ④-bis.
 - Read `--help`. It states, in full, what the command does not guarantee.
 
 ### ④-bis Reissue the agent's credentials — if its exact key or `"*"` was revoked
@@ -534,23 +595,36 @@ the NATS credential. It is not a NATS-JWT-only swap.
 Follow **[`AUTH.md` → "Offline re-key after revocation"](AUTH.md#offline-re-key-after-revocation)**;
 the sequence, with the additions this incident requires:
 
+The service-context rule in ④ is load-bearing here too. Before moving
+`credentials.json` in step 2, enter the same service identity/HOME and
+mount/container namespace and select the same OpenClaw profile or explicit
+state/config. Reuse the `OPENCLAW` prefix from ④, or establish it now if this
+credential-only route skipped K rotation.
+
 1. Confirm every gateway replica is stopped. A K/combined route already did
    this at ①. For agent-credential-only containment, revocation and enforcement
-   verification happened live at ②–③; suspend/zero the replicas now, before
-   touching the tuple credential file.
+   verification happened live through Class A §3 or Class B §4 ②–③;
+   suspend/zero the replicas now, before touching the tuple credential file.
 2. Move the exact tuple `credentials.json` aside to an operator-chosen backup
    path. **Move, do not delete or overwrite.** (This is the §0.3 exception.)
 3. Complete the SaaS-side active-key replacement.
-4. `openclaw channels add --channel webchannel --account <account>`, then approve
-   the enrollment. **Note:** with an `enrolled` source, `channels add` *skips*
-   when the exact tuple's `credentials.json` is still present — that is why step
-   2 comes first. No single command guarantees a re-mint.
+4. From the service identity/HOME, mount/container namespace, and OpenClaw
+   profile/state/config selection established above (and used at ④ when K was
+   rotated), run
+   `"${OPENCLAW[@]}" channels add --channel webchannel --account <account>`, then
+   approve the enrollment. **Note:** with an `enrolled` source, `channels add`
+   *skips* when the exact tuple's `credentials.json` is still present — that is
+   why step 2 comes first. No single command guarantees a re-mint.
 5. Validate the replacement according to the revocation target:
-   - **Wildcard `"*"`:** decode the new agent JWT and confirm its `iat` is
+   - **Wildcard `"*"`, Class B:** decode the new agent JWT and confirm its `iat` is
      strictly greater than the effective accepted wildcard floor
      (`expectedFloorSec` confirmed in step ③), not merely the requested
      `floorSec`. If it is not greater, wait until it can be and re-mint. Do not
      "fix" this by issuing a newer floor.
+   - **Wildcard/account-wide target, Class A:** if the provider exposed a numeric
+     `providerEffectiveFloorSec`, require the new JWT's `iat` to be strictly
+     greater. If it exposed no numeric floor, apply the provider's reviewed
+     issuance/replacement rule. Do not substitute Class B's `expectedFloorSec`.
    - **Exact old agent key:** require a newly generated NATS user key and confirm
      the replacement JWT's `sub` differs from the revoked `U…` key. The old
      exact-key floor does not bind this new key, so its `iat` need not exceed
@@ -598,11 +672,21 @@ register. The forced refresh is what makes that happen.
 
 ### Done — what you can now claim
 
-- If a credential was in scope, credentials issued at or before the effective
-  accepted target floor (`expectedFloorSec`) are refused by the server, and you
-  read that floor back from the resolver and verified enforcement. `floorSec`
-  remains the requested incident time; it may be lower than the preserved
-  accepted floor.
+- **Class A credential containment:** claim only what the provider evidence
+  proves: provider acceptance and enforcement for the reviewed target, plus a
+  replacement that passed the provider rule. If it exposed a numeric
+  `providerEffectiveFloorSec`, you may also record that floor; otherwise do not
+  invent one or claim Class B resolver readback.
+- **Class B credential containment:** credentials issued at or before the
+  effective accepted target floor (`expectedFloorSec`) are refused by the
+  server, and you read that candidate/floor back from the resolver and verified
+  enforcement. `floorSec` remains the requested incident time; it may be lower
+  than the preserved accepted floor.
+- **Class C credential containment:** while the revocation channel remains
+  unavailable, claim only that the plugin is disabled and relay/account access
+  is isolated—not that the credential was revoked. After recovery, claim the
+  matching Class A provider evidence or Class B resolver/whole-chain evidence
+  completed in §5 step 5.
 - If K was in scope, conversation envelopes created after rotation cannot be
   decrypted with K_old: K_new is fresh random material, so the separation comes
   from the keys themselves.
@@ -627,10 +711,16 @@ actually did for #54. It trades availability for containment, deliberately.
 4. **If K is in scope**, confirm the supported shared/single-store topology in
    §4 ① and run ④ while replicas remain at zero. Step ④ needs no relay and K-only
    does not require restoring a revocation channel.
-5. **Only when a credential is in scope**, restore the exact revocation/readback
-   channel or replace the whole trust chain, then run §4 ②–③. If that revocation
-   targeted the current agent exact key or `"*"`, run ④-bis while replicas are
-   still stopped.
+5. **Only when a credential is in scope**, recover according to its deployment
+   class while the account remains disabled and replicas remain stopped:
+   - **Managed Class C:** restore provider control, then complete the matching
+     §3 provider revocation, acceptance, and enforcement route. Do **not** run
+     the self-contained §4 ②–③ resolver procedure.
+   - **Self-contained Class C:** either restore the exact revocation/readback
+     channel and run §4 ②–③, or complete a controlled whole-trust-chain
+     replacement and verify old credentials are rejected.
+   If that control targeted the current agent exact key or `"*"`, or whole-chain
+   replacement invalidated it, run ④-bis while replicas are still stopped.
 6. Re-enable/restart only after every control selected in §2 is complete and
    verified. Then run §4 ⑥ for affected browsers; if ④-bis replaced the active
    agent identity key, that means **every browser in the account**, whether the

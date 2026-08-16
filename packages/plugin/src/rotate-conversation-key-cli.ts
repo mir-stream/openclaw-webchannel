@@ -85,15 +85,30 @@ OPTIONS
                           set digest printed by the matching dry run. A digest
                           from another tuple, or a changed peer set, is refused
                           before either document is written.
-  --storage-root <dir>    Override the v2 storage root. Only for deployments
-                          that moved it; the tuple layout underneath is fixed.
+  --storage-root <dir>    Exact deployed v2 storage root. It can bridge a
+                          different invocation HOME only for already-v2 state;
+                          legacy discovery still uses the invocation's homedir.
   --credential-path <file>
                           Exact absolute low-level runtime credentialPath. Use
                           only when this deployment configured that override;
-                          it proves ownership during legacy migration and is
-                          never printed.
+                          it proves ownership during legacy migration, must be
+                          identical on dry run/apply, and is never printed.
   --ignore-live-writers   Bypass the temp-artifact refusal (see below).
   --help, -h              Print this and exit.
+
+SERVICE CONTEXT IS PART OF THE TARGET
+  Resolve and run this installed entry as the stopped gateway's same OS service
+  identity/HOME and in its same mount/container namespace. Use the exact same
+  OpenClaw --profile, or OPENCLAW_STATE_DIR/OPENCLAW_CONFIG_PATH selection, for
+  "plugins inspect" and any later "channels add". Node derives its default v2
+  and legacy roots from this invocation's OS homedir; another context can select
+  different state, and this command cannot attest that the context is correct.
+
+  Before --apply, compare the dry run's printed "directory:" with the stopped
+  deployment's actual tuple directory. Pass identical --storage-root and
+  --credential-path values on dry run and apply. An exact --storage-root can
+  bridge a different HOME only for already-v2 state; legacy migration still
+  requires the gateway's HOME/service context.
 
 WHAT THIS COMMAND CANNOT DO
   Rotation is supported only when this account has one local tuple store, or

@@ -23,7 +23,10 @@
   low-level exact credential-file override can pass the same absolute path as
   `--credential-path`; offline previews preserve and refuse ownership-ambiguous
   legacy K when that option is omitted or wrong instead of quarantining it and
-  publishing an empty v2 key store.
+  publishing an empty v2 key store. Operators must resolve and invoke the entry
+  in the stopped gateway's same service identity/HOME, mount namespace, and
+  OpenClaw profile/state/config selection, then match the dry-run tuple directory
+  before apply; an explicit v2 root does not relocate legacy discovery.
 
   It does **not** prove that the gateway is stopped, and does not claim to:
   this is a library and cannot know your deployment topology, so the controller
