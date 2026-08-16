@@ -349,7 +349,14 @@ export class MemoryBrowserCredentialLedger implements BrowserCredentialLedger {
   }
   close(): void { if (this.sweepTimer) clearInterval(this.sweepTimer); this.sweepTimer = undefined; }
 
-  async nowSec(): Promise<number> { return Math.floor(this.clockSec()); }
+  /** Sample once, preserve fractional-seconds sources, then apply the shared seconds tripwire. */
+  private readClockSec(): number {
+    const now = Math.floor(this.clockSec());
+    assertTimestampSec(now, "nowSec");
+    return now;
+  }
+
+  async nowSec(): Promise<number> { return this.readClockSec(); }
 
   async recordIssuance(issuance: BrowserCredentialIssuance): Promise<RecordIssuanceOutcome> {
     assertBrowserCredentialIssuance(issuance);
@@ -438,7 +445,9 @@ export class MemoryBrowserCredentialLedger implements BrowserCredentialLedger {
   protected beforeMarkRevokedCommitForConformance(): void {}
 
   async sweep(): Promise<number> {
-    const now = Math.floor(this.clockSec()); let removed = 0;
+    // Validate before the first mutation. A millisecond/NaN/invalid custom
+    // clock must fail closed instead of making every credential look ancient.
+    const now = this.readClockSec(); let removed = 0;
     for (const [key, record] of this.records) {
       const expired = record.expiresAtSec !== null && now > record.expiresAtSec + this.retentionSec;
       const cut = record.status === "revoked" && record.revokedAtSec !== null && now > record.revokedAtSec + this.retentionSec;

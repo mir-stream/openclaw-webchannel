@@ -281,6 +281,32 @@ describe("BrowserCredentialLedger conformance harness self-tests", () => {
     expect(report.passed).toHaveLength(browserCredentialLedgerConformanceCases.length);
   });
 
+  it("Memory rejects a millisecond clock before nowSec exposure or destructive sweep", async () => {
+    const seconds = 1_700_000_000;
+    let clock = seconds + 0.75;
+    const ledger = new MemoryBrowserCredentialLedger({ autoSweep: false, retentionSec: 0, clockSec: () => clock });
+    const userPubkey = `U${"8".repeat(55)}`;
+
+    // Fractional seconds remain a supported clock source and are floored once.
+    expect(await ledger.nowSec()).toBe(seconds);
+    await ledger.recordIssuance({
+      tenant: "tenant",
+      accountContext: "context",
+      natsAccountPublicKey: "A".repeat(56),
+      peerId: "peer",
+      userPubkey,
+      issuedAtSec: seconds,
+      expiresAtSec: seconds + 60,
+    });
+
+    // Date.now()-shaped milliseconds would previously classify this live row
+    // as ancient and delete it. Both public time and sweep must reject first.
+    clock = 1_700_000_000_000;
+    await expect(ledger.nowSec()).rejects.toMatchObject({ name: "BrowserCredentialLedgerInputError" });
+    await expect(ledger.sweep()).rejects.toMatchObject({ name: "BrowserCredentialLedgerInputError" });
+    expect(await ledger.get(userPubkey)).toMatchObject({ status: "active", expiresAtSec: seconds + 60 });
+  });
+
   // Each mutant must die on the EXACT assertion built to catch its defect — a
   // generic "some conformance error" match would let fixture drift (the mutant
   // failing earlier for an unrelated reason) masquerade as mutation coverage.
