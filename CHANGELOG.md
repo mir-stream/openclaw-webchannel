@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **New: `openclaw-webchannel-rotate-key`, an offline conversation-key rotation
+  command (issue #158).** Until now the only way an operator could replace a
+  leaked K was to delete state files by hand — destructive, account-wide, and
+  unauditable. The plugin package now ships a `bin` that rotates one named peer,
+  or one reviewed account, through the §8.2 commit protocol and verifies the
+  write by reading it back. It is deliberately a separate process from the
+  gateway: it cannot open a transport, and nothing in a running gateway can
+  invoke it. A dry run is the default; account-wide is never implied and its
+  `--apply` requires the target digest printed by the matching dry run. An
+  account-wide rotation commits each document exactly once regardless of peer
+  count, which a regression test pins.
+
+  It does **not** prove that the gateway is stopped, and does not claim to:
+  this is a library and cannot know your deployment topology, so the controller
+  attestation originally proposed in #158 was dropped (decision of 2026-08-16).
+  Bringing observed replicas to zero first is an operator obligation, imposed by
+  step ① of `docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md`.
+
 - Reasoning delivery now suppresses the pinned CLI runtime's exact durable
   replay only while its matching live burst remains open and its live send
   succeeded. A rejected live send retains the durable fallback. Independent

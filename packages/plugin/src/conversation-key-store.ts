@@ -47,7 +47,7 @@
  * degradation and still admits registrations; only version-too-new stops.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 
 import { formatCapacityWarning, type CapacityStatus } from "./capacity-status.js";
@@ -82,6 +82,60 @@ export { formatCapacityWarning } from "./capacity-status.js";
 export type ConversationKeyRotationResult = ConversationKeyGeneration & {
   key: Uint8Array;
 };
+
+/**
+ * Blast-radius preview for ONE named peer. Carries no key material: the
+ * generation label is the audit-only sidecar value, which is a diagnostic and
+ * never a lock, writer census, or proof that no gateway is running.
+ */
+export type PeerRotationPreview = Readonly<{
+  peerId: string;
+  present: boolean;
+  generation: ConversationKeyGeneration | null;
+}>;
+
+/**
+ * Blast-radius preview for a WHOLE account. Deliberately count + digest only.
+ *
+ * The peerId list never leaves the store: an account-wide preview exists to let
+ * an operator confirm the size and identity of the target set, and printing the
+ * membership would put user identifiers into an incident-response terminal and
+ * its scrollback for no operational gain. `targetDigest` commits to the exact
+ * sorted peerId set, so the operator can confirm at `--apply` time that the set
+ * has not changed since it was reviewed.
+ */
+export type AccountRotationPreview = Readonly<{
+  peerCount: number;
+  targetDigest: string;
+}>;
+
+/** Post-commit, post-readback result for one peer. Carries no key material. */
+export type PeerRotationSummary = ConversationKeyGeneration & {
+  peerId: string;
+};
+
+/** Post-commit, post-readback result for an account. Carries no key material. */
+export type AccountRotationSummary = Readonly<{
+  peerCount: number;
+  targetDigest: string;
+  rotatedAtSec: number;
+}>;
+
+/**
+ * A rotation committed, but re-reading it from disk did not return what was
+ * written. The key material is NOT reported back to the caller in this state:
+ * the durable outcome is unknown, and the operator must re-inspect rather than
+ * treat the rotation as done.
+ */
+export class ConversationKeyReadbackError extends Error {
+  constructor(detail: string) {
+    super(
+      `webchannel: conversation-key rotation readback failed (${detail}); ` +
+        `durable state is unverified`,
+    );
+    this.name = "ConversationKeyReadbackError";
+  }
+}
 
 /**
  * S2 posture: ceiling on stored keys per account. peerIds on the register path
@@ -368,6 +422,214 @@ export class ConversationKeyStore {
     }
     this.keys = nextKeys;
     return { key: new Uint8Array(key), epoch, rotatedAtSec };
+  }
+
+  // -------------------------------------------------------------------------
+  // Offline operator rotation (#158)
+  //
+  // These members exist for the offline `openclaw-webchannel-rotate-key`
+  // command and are the reason it never has to hold key material: a preview
+  // returns non-secret metadata, and a rotation returns a summary AFTER it has
+  // verified the write by reading it back. Nothing here opens a transport,
+  // installs a subscription, or is reachable from the in-gateway entrypoints.
+  //
+  // The previews rotate nothing and write no key document. They DO run the
+  // one-time legacy-tuple migration, exactly as every other entry point does —
+  // a preview that read pre-migration state would disagree with the rotation it
+  // is previewing, which is the one thing a dry run must not do.
+  // -------------------------------------------------------------------------
+
+  /** Non-secret blast-radius preview for one named peer. Rotates nothing. */
+  previewPeerRotation(peerId: string): PeerRotationPreview {
+    assertPeerId(peerId);
+    this.prepareMigration();
+    const freshKeys = this.readFresh();
+    if (!freshKeys.has(peerId)) {
+      return Object.freeze({ peerId, present: false, generation: null });
+    }
+    const generation = this.readGenerationsAuditOnly().get(peerId) ?? null;
+    return Object.freeze({
+      peerId,
+      present: true,
+      generation: generation
+        ? { epoch: generation.epoch, rotatedAtSec: generation.rotatedAtSec }
+        : null,
+    });
+  }
+
+  /** Non-secret blast-radius preview for the whole account. Rotates nothing. */
+  previewAccountRotation(): AccountRotationPreview {
+    this.prepareMigration();
+    const freshKeys = this.readFresh();
+    return Object.freeze({
+      peerCount: freshKeys.size,
+      targetDigest: rotationTargetDigest(freshKeys.keys()),
+    });
+  }
+
+  /**
+   * Rotate one peer through the committed §8.2 protocol, then verify the
+   * durable result by re-reading both documents from disk.
+   *
+   * The commit itself is `rotate()` — deliberately CALLED, not reimplemented,
+   * so the offline command and the in-process path can never drift apart on
+   * the crash contract.
+   */
+  rotatePeerVerified(peerId: string): PeerRotationSummary {
+    const result = this.rotate(peerId);
+    // rotate() publishes the cache before returning; a null here would mean the
+    // commit protocol changed under this caller, which must not report success.
+    const published = this.keys;
+    if (!published) {
+      throw new ConversationKeyReadbackError(
+        "rotation did not publish an in-process key set",
+      );
+    }
+    this.verifyRotationReadback(
+      new Map([[peerId, { key: result.key, generation: result }]]),
+      published.size,
+    );
+    return { peerId, epoch: result.epoch, rotatedAtSec: result.rotatedAtSec };
+  }
+
+  /**
+   * Rotate EVERY peer in this account as a single commit, then verify by
+   * readback.
+   *
+   * WHY THIS IS NOT A `rotate(peerId)` LOOP. Each `rotate()` call rewrites both
+   * whole documents, so N calls are O(N²) bytes — measured at ~4.2s for 500
+   * peers against a 10,000-peer ceiling, and one of the two reasons boot-time
+   * rotation was cut from PR #156. `docs/ISSUE_72_CONTAINMENT_PLAN.md` §8.2
+   * therefore requires an account-wide rotation to build the ENTIRE candidate
+   * pair in memory and commit each document exactly once. The commit-count
+   * regression test is what keeps that property from being refactored away.
+   *
+   * The step order below is §8.2's, unchanged: both candidates are built and
+   * serialized before anything is published, the audit sidecar lands first
+   * (sidecar-ahead is an allowed asymmetry; an unauditable K_new is not), and
+   * the in-process cache is published last.
+   */
+  rotateAccountVerified(): AccountRotationSummary {
+    this.prepareMigration();
+
+    // Steps 1-2: durable reads authorize the commit; the cache cannot.
+    const freshKeys = this.readFresh();
+    if (freshKeys.size === 0) {
+      throw new Error(
+        "webchannel: conversation-key account rotation has no target",
+      );
+    }
+    const freshGenerations = compactStaleGenerations(
+      this.readGenerationsAuditOnly(),
+      freshKeys,
+    );
+
+    // Step 3: every target ends up with a durable entry, so the resulting
+    // sidecar is exactly as large as the key document. Only a lowered ceiling
+    // can trip this, and it must trip BEFORE any key changes.
+    if (freshKeys.size > this.maxKeys) {
+      throw new ConversationKeyGenerationCapacityError(
+        freshKeys.size,
+        this.maxKeys,
+      );
+    }
+
+    // Step 4: one whole candidate pair in memory. No publication yet.
+    const rotatedAtSec = this.readNowSec();
+    const nextGenerations = new Map<string, ConversationKeyGeneration>();
+    const nextKeys = new Map<string, Uint8Array>();
+    for (const peerId of freshKeys.keys()) {
+      const currentGeneration = freshGenerations.get(peerId);
+      nextGenerations.set(peerId, {
+        epoch: currentGeneration ? nextEpoch(currentGeneration.epoch) : 1,
+        rotatedAtSec,
+      });
+      nextKeys.set(peerId, this.makeRandomKey());
+    }
+    const serializedGenerations = serializeConversationKeyGenerationsDocument(
+      this.scope,
+      nextGenerations,
+    );
+    const serializedKeys = serializeConversationKeyDocument(
+      this.scope,
+      nextKeys,
+    );
+
+    // Steps 5-6: exactly one write per document, whatever N is.
+    this.persistSerializedGenerations(serializedGenerations);
+    this.persistSerializedKeys(serializedKeys);
+
+    // Step 7, with rotate()'s cache-invalidation contract on the crash seam.
+    try {
+      this.beforeCachePublish?.();
+    } catch (error) {
+      this.keys = null;
+      throw error;
+    }
+    this.keys = nextKeys;
+
+    const targets = new Map<
+      string,
+      { key: Uint8Array; generation: ConversationKeyGeneration }
+    >();
+    for (const [peerId, key] of nextKeys) {
+      targets.set(peerId, {
+        key,
+        generation: nextGenerations.get(peerId) as ConversationKeyGeneration,
+      });
+    }
+    this.verifyRotationReadback(targets, nextKeys.size);
+
+    return Object.freeze({
+      peerCount: nextKeys.size,
+      targetDigest: rotationTargetDigest(nextKeys.keys()),
+      rotatedAtSec,
+    });
+  }
+
+  /**
+   * Re-read both documents from disk and prove they hold what was committed.
+   *
+   * Reads bypass both the in-process cache and the sidecar's audit-only
+   * fail-open: after a rotation, a missing or unreadable sidecar is a failed
+   * verification, not an empty audit state.
+   */
+  private verifyRotationReadback(
+    targets: ReadonlyMap<
+      string,
+      { key: Uint8Array; generation: ConversationKeyGeneration }
+    >,
+    expectedTotalKeys: number,
+  ): void {
+    let keys: Map<string, Uint8Array>;
+    let generations: Map<string, ConversationKeyGeneration>;
+    try {
+      keys = this.readStoreFile();
+      generations = this.readGenerationFile();
+    } catch {
+      throw new ConversationKeyReadbackError("documents could not be re-read");
+    }
+    if (keys.size !== expectedTotalKeys) {
+      throw new ConversationKeyReadbackError("key count changed after commit");
+    }
+    for (const [peerId, expected] of targets) {
+      const storedKey = keys.get(peerId);
+      if (
+        !storedKey ||
+        storedKey.length !== expected.key.length ||
+        !timingSafeEqual(storedKey, expected.key)
+      ) {
+        throw new ConversationKeyReadbackError("key material did not match");
+      }
+      const storedGeneration = generations.get(peerId);
+      if (
+        !storedGeneration ||
+        storedGeneration.epoch !== expected.generation.epoch ||
+        storedGeneration.rotatedAtSec !== expected.generation.rotatedAtSec
+      ) {
+        throw new ConversationKeyReadbackError("generation label did not match");
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -671,6 +933,26 @@ function compactStaleGenerations(
     if (keys.has(peerId)) compacted.set(peerId, generation);
   }
   return compacted;
+}
+
+/**
+ * Commit to the exact sorted peerId set of an account-wide rotation.
+ *
+ * This is an operator confirmation aid, not an authorization token: it exists
+ * so a reviewed `--all-peers` dry run can be pinned to the set that is actually
+ * committed later. Entries are length-prefixed so no two distinct sets can
+ * encode identically, and the domain prefix keeps the value from colliding
+ * with any other digest this repo prints.
+ */
+function rotationTargetDigest(peerIds: Iterable<string>): string {
+  const encoded = [...peerIds]
+    .sort()
+    .map((peerId) => `${Buffer.byteLength(peerId, "utf8")}:${peerId}`)
+    .join("");
+  return createHash("sha256")
+    .update("webchannel-conversation-key-rotation-targets-v1")
+    .update(encoded, "utf8")
+    .digest("hex");
 }
 
 function nextEpoch(epoch: number): number {

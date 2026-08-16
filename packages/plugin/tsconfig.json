@@ -19,6 +19,12 @@
   // config extensions (`nats`/`saas`), so the entry narrows `api.config` once via
   // its local `WebchannelChannelConfig` — keep new top-level config reads on that
   // seam, not fresh casts.
-  "include": ["index.ts", "setup-entry.ts", "index-nats.ts", "src/**/*.ts"],
+  "include": [
+    "index.ts",
+    "setup-entry.ts",
+    "index-nats.ts",
+    "rotate-key-entry.ts",
+    "src/**/*.ts"
+  ],
   "exclude": ["node_modules"]
 }
