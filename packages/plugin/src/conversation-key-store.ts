@@ -46,6 +46,11 @@ import {
   parseConversationKeyDocument,
   serializeConversationKeyDocument,
 } from "./conversation-key-document.js";
+import {
+  parseConversationKeyGenerationsDocument,
+  serializeConversationKeyGenerationsDocument,
+  type ConversationKeyGeneration,
+} from "./conversation-key-generations-document.js";
 import { migrateLegacyTupleState } from "./legacy-storage-migration.js";
 import {
   archiveFileNoReplace,
@@ -60,6 +65,10 @@ import { StorageDocumentError } from "./storage-document.js";
 
 export type { CapacityStatus } from "./capacity-status.js";
 export { formatCapacityWarning } from "./capacity-status.js";
+
+export type ConversationKeyRotationResult = ConversationKeyGeneration & {
+  key: Uint8Array;
+};
 
 /**
  * S2 posture: ceiling on stored keys per account. peerIds on the register path
@@ -88,8 +97,16 @@ export type ConversationKeyStoreOptions = {
   maxKeys?: number;
   /** Best-effort operational signal; does not alter the fixed ceiling. */
   onCapacityWarning?: (status: CapacityStatus) => void;
-  /** @internal Test-only failure seam immediately before an atomic write. */
+  /** @internal Test-only failure seam before a key-document atomic write. */
   _beforePersist?: () => void;
+  /** @internal Test-only failure seam before a generation atomic write. */
+  _beforeGenerationPersist?: () => void;
+  /** @internal Test-only crash seam after key rename, before cache publish. */
+  _beforeCachePublish?: () => void;
+  /** @internal Test-only CSPRNG seam. */
+  _randomBytes?: (size: number) => Uint8Array;
+  /** @internal Test-only unix-seconds audit clock. */
+  _nowSec?: () => number;
 };
 
 export class ConversationKeyCapacityError extends Error {
@@ -109,6 +126,21 @@ export class ConversationKeyCapacityError extends Error {
   }
 }
 
+export class ConversationKeyGenerationCapacityError extends Error {
+  readonly currentGenerations: number;
+  readonly maxGenerations: number;
+
+  constructor(currentGenerations: number, maxGenerations: number) {
+    super(
+      `webchannel: conversation-key generation capacity ` +
+        `${currentGenerations}/${maxGenerations}; key material unchanged`,
+    );
+    this.name = "ConversationKeyGenerationCapacityError";
+    this.currentGenerations = currentGenerations;
+    this.maxGenerations = maxGenerations;
+  }
+}
+
 /**
  * Per-account persistent store of agent-owned conversation keys, keyed by
  * peerId. One instance per register-admission `NatsChannel`.
@@ -120,10 +152,15 @@ export class ConversationKeyStore {
   private readonly scope: StorageScopeIdentity;
   private readonly accountId: string;
   private readonly filePath: string;
+  private readonly generationsFilePath: string;
   private readonly migrationOptions: CredentialPathOptions;
   private readonly maxKeys: number;
   private readonly onCapacityWarning?: (status: CapacityStatus) => void;
   private readonly beforePersist?: () => void;
+  private readonly beforeGenerationPersist?: () => void;
+  private readonly beforeCachePublish?: () => void;
+  private readonly randomKeyBytes: (size: number) => Uint8Array;
+  private readonly nowSec: () => number;
   /** Lazily loaded on first access. Entries are never removed by this store. */
   private keys: Map<string, Uint8Array> | null = null;
   private capacityWarningEmitted = false;
@@ -145,6 +182,7 @@ export class ConversationKeyStore {
     this.scope = paths.scope;
     this.accountId = options.accountId;
     this.filePath = paths.conversationKeyPath;
+    this.generationsFilePath = paths.conversationKeyGenerationsPath;
     this.migrationOptions = {
       tenant: options.tenant,
       accountId: options.accountId,
@@ -159,6 +197,10 @@ export class ConversationKeyStore {
     this.maxKeys = maxKeys;
     this.onCapacityWarning = options.onCapacityWarning;
     this.beforePersist = options._beforePersist;
+    this.beforeGenerationPersist = options._beforeGenerationPersist;
+    this.beforeCachePublish = options._beforeCachePublish;
+    this.randomKeyBytes = options._randomBytes ?? ((size) => randomBytes(size));
+    this.nowSec = options._nowSec ?? (() => Math.floor(Date.now() / 1_000));
   }
 
   /**
@@ -203,6 +245,11 @@ export class ConversationKeyStore {
     this.persist(next);
     this.keys = next;
     this.maybeWarnCapacity(next.size);
+    // Register admission is security-authoritative; the sidecar is audit-only.
+    // The intentional order is therefore the reverse of rotate(): publish K
+    // first, then best-effort its initial label. A crash in between leaves an
+    // entry-less durable K which a later rotate() self-heals before changing K.
+    this.recordInitialGenerationBestEffort(peerId);
     return key;
   }
 
@@ -211,6 +258,90 @@ export class ConversationKeyStore {
     const keys = this.load();
     this.maybeWarnCapacity(keys.size);
     return keys.get(peerId) ?? null;
+  }
+
+  /**
+   * Return the audit-only generation label for `peerId`, or `null` when absent.
+   * This diagnostic is not a lock, writer census, or proof of quiescence.
+   */
+  generationOf(peerId: string): ConversationKeyGeneration | null {
+    assertPeerId(peerId);
+    this.prepareMigration();
+    const generation = this.readGenerationsAuditOnly().get(peerId);
+    return generation
+      ? { epoch: generation.epoch, rotatedAtSec: generation.rotatedAtSec }
+      : null;
+  }
+
+  /**
+   * Replace one existing peer's K using the generations-first commit protocol.
+   * Rotation is per-peer and is not a create API.
+   */
+  rotate(peerId: string): ConversationKeyRotationResult {
+    assertPeerId(peerId);
+    this.prepareMigration();
+
+    // Fresh durable reads are load-bearing: neither the monotonic key cache nor
+    // any previous sidecar observation can authorize this commit.
+    const freshKeys = this.readFresh();
+    if (!freshKeys.has(peerId)) {
+      throw new Error(
+        "webchannel: conversation-key rotation target does not exist",
+      );
+    }
+    const freshGenerations = compactStaleGenerations(
+      this.readGenerationsAuditOnly(),
+      freshKeys,
+    );
+    const currentGeneration = freshGenerations.get(peerId);
+    const generationCapacityExceeded = currentGeneration
+      ? freshGenerations.size > this.maxKeys
+      : freshGenerations.size >= this.maxKeys;
+    if (generationCapacityExceeded) {
+      throw new ConversationKeyGenerationCapacityError(
+        freshGenerations.size,
+        this.maxKeys,
+      );
+    }
+
+    const epoch = currentGeneration
+      ? nextEpoch(currentGeneration.epoch)
+      : 1;
+    const rotatedAtSec = this.readNowSec();
+    const key = this.makeRandomKey();
+
+    const nextGenerations = new Map(freshGenerations);
+    nextGenerations.set(peerId, { epoch, rotatedAtSec });
+    const nextKeys = new Map(freshKeys);
+    nextKeys.set(peerId, key);
+
+    // Step 4 builds and validates BOTH complete candidate documents in memory.
+    // No durable publication happens until both serializers have succeeded.
+    const serializedGenerations = serializeConversationKeyGenerationsDocument(
+      this.scope,
+      nextGenerations,
+    );
+    const serializedKeys = serializeConversationKeyDocument(
+      this.scope,
+      nextKeys,
+    );
+
+    // Steps 5 and 6. The order is the crash contract: sidecar-ahead is an
+    // allowed audit asymmetry; key-ahead (an unauditable K_new) is forbidden.
+    this.persistSerializedGenerations(serializedGenerations);
+    this.persistSerializedKeys(serializedKeys);
+
+    // A production crash here kills the stale cache with the process. The
+    // test-only seam throws without killing it, so invalidate rather than let a
+    // caller catch the simulated crash and continue serving K_old over K_new.
+    try {
+      this.beforeCachePublish?.();
+    } catch (error) {
+      this.keys = null;
+      throw error;
+    }
+    this.keys = nextKeys;
+    return { key: new Uint8Array(key), epoch, rotatedAtSec };
   }
 
   // -------------------------------------------------------------------------
@@ -251,6 +382,7 @@ export class ConversationKeyStore {
       }
       this.keys = new Map();
       this.persist(this.keys);
+      this.resetGenerationsAfterKeyQuarantine();
     }
     return this.keys;
   }
@@ -280,11 +412,17 @@ export class ConversationKeyStore {
   }
 
   private persist(keys: ReadonlyMap<string, Uint8Array>): void {
+    this.persistSerializedKeys(
+      serializeConversationKeyDocument(this.scope, keys),
+    );
+  }
+
+  private persistSerializedKeys(serialized: string): void {
     this.beforePersist?.();
     try {
       atomicWritePrivateFile(
         this.filePath,
-        serializeConversationKeyDocument(this.scope, keys),
+        serialized,
         { replace: true, enforceDirectoryMode: true },
       );
     } catch (error) {
@@ -293,6 +431,123 @@ export class ConversationKeyStore {
         "conversation-keys",
         "storage-io-failed",
       );
+    }
+  }
+
+  private readGenerationFile(): Map<string, ConversationKeyGeneration> {
+    let serialized: string;
+    try {
+      serialized = readFileSync(this.generationsFilePath, "utf8");
+    } catch (error) {
+      if (isEnoent(error)) throw error;
+      throw new StorageDocumentError(
+        "conversation-key-generations",
+        "storage-io-failed",
+      );
+    }
+    return parseConversationKeyGenerationsDocument(this.scope, serialized);
+  }
+
+  /** Sidecar failure is audit-only: report a fixed diagnostic and start empty. */
+  private readGenerationsAuditOnly(): Map<string, ConversationKeyGeneration> {
+    try {
+      return this.readGenerationFile();
+    } catch (error) {
+      const code = isEnoent(error)
+        ? "missing"
+        : error instanceof StorageDocumentError
+          ? error.code
+          : "storage-io-failed";
+      this.logGenerationAuditFailure(code, "empty-state");
+      return new Map();
+    }
+  }
+
+  private persistGenerations(
+    generations: ReadonlyMap<string, ConversationKeyGeneration>,
+  ): void {
+    this.persistSerializedGenerations(
+      serializeConversationKeyGenerationsDocument(this.scope, generations),
+    );
+  }
+
+  private persistSerializedGenerations(serialized: string): void {
+    this.beforeGenerationPersist?.();
+    try {
+      atomicWritePrivateFile(this.generationsFilePath, serialized, {
+        replace: true,
+        enforceDirectoryMode: true,
+      });
+    } catch (error) {
+      if (error instanceof StorageDocumentError) throw error;
+      throw new StorageDocumentError(
+        "conversation-key-generations",
+        "storage-io-failed",
+      );
+    }
+  }
+
+  private recordInitialGenerationBestEffort(peerId: string): void {
+    try {
+      let generations = this.readGenerationsAuditOnly();
+      if (generations.has(peerId)) return;
+
+      // The key was durably committed first, so this fresh read includes the
+      // target and gives stale-entry compaction an exact authority snapshot.
+      const freshKeys = this.readFresh();
+      generations = compactStaleGenerations(generations, freshKeys);
+      if (generations.size >= this.maxKeys) {
+        this.logGenerationAuditFailure("capacity-full", "entry-omitted");
+        return;
+      }
+      const next = new Map(generations);
+      next.set(peerId, { epoch: 1, rotatedAtSec: this.readNowSec() });
+      this.persistGenerations(next);
+    } catch {
+      // Registration already committed K. An audit write must never roll that
+      // result back or turn a successful admission into a failure.
+      this.logGenerationAuditFailure("write-failed", "entry-omitted");
+    }
+  }
+
+  private resetGenerationsAfterKeyQuarantine(): void {
+    try {
+      this.persistGenerations(new Map());
+    } catch {
+      // The key authority was safely quarantined and reset. Its audit-only
+      // sidecar must not be allowed to turn that recovery into an outage.
+      this.logGenerationAuditFailure("write-failed", "quarantine-reset-skipped");
+    }
+  }
+
+  private makeRandomKey(): Uint8Array {
+    const bytes = new Uint8Array(this.randomKeyBytes(CONVERSATION_KEY_BYTES));
+    if (bytes.length !== CONVERSATION_KEY_BYTES) {
+      throw new Error(
+        "webchannel: conversation-key CSPRNG returned an invalid length",
+      );
+    }
+    return bytes;
+  }
+
+  private readNowSec(): number {
+    const value = this.nowSec();
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(
+        "webchannel: conversation-key audit clock must return positive unix seconds",
+      );
+    }
+    return value;
+  }
+
+  private logGenerationAuditFailure(code: string, action: string): void {
+    try {
+      console.error(
+        `[conversation-key-store] document=conversation-key-generations ` +
+          `code=${code} action=${action}`,
+      );
+    } catch {
+      // The audit sidecar and its diagnostics cannot own key availability.
     }
   }
 
@@ -332,6 +587,32 @@ export class ConversationKeyStore {
       }
     }
   }
+}
+
+function assertPeerId(peerId: string): void {
+  if (!peerId || typeof peerId !== "string") {
+    throw new Error("webchannel: peerId must be a non-empty string");
+  }
+}
+
+function compactStaleGenerations(
+  generations: ReadonlyMap<string, ConversationKeyGeneration>,
+  keys: ReadonlyMap<string, Uint8Array>,
+): Map<string, ConversationKeyGeneration> {
+  const compacted = new Map<string, ConversationKeyGeneration>();
+  for (const [peerId, generation] of generations) {
+    if (keys.has(peerId)) compacted.set(peerId, generation);
+  }
+  return compacted;
+}
+
+function nextEpoch(epoch: number): number {
+  if (!Number.isSafeInteger(epoch) || epoch <= 0 || epoch >= Number.MAX_SAFE_INTEGER) {
+    throw new Error(
+      "webchannel: conversation-key generation cannot advance safely",
+    );
+  }
+  return epoch + 1;
 }
 
 function isEnoent(err: unknown): boolean {

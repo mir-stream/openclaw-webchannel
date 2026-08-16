@@ -34,6 +34,7 @@ import { ConversationKeyStore } from "./conversation-key-store.js";
 import { derivePublicKey } from "./e2e-crypto.js";
 import { migrateLegacyTupleState } from "./legacy-storage-migration.js";
 import {
+  CONVERSATION_KEY_GENERATIONS_FILE_NAME,
   legacyTuplePaths,
   tupleStoragePaths,
 } from "./storage-paths.js";
@@ -298,6 +299,73 @@ describe("legacy tuple storage migration", () => {
     const restarted = new ConversationKeyStore({ ...SCOPE, home });
     expect(Buffer.from(restarted.getOrCreate("same-peer"))).toEqual(LEGACY_K);
   });
+
+  it.each(["absent", "stale"] as const)(
+    "handles a legacy generation sidecar that is %s, then registers and rotates safely",
+    (sidecarState) => {
+      const legacy = writeLegacyState();
+      const legacySidecar = join(
+        legacy.directory,
+        CONVERSATION_KEY_GENERATIONS_FILE_NAME,
+      );
+      if (sidecarState === "stale") {
+        writeFileSync(
+          legacySidecar,
+          JSON.stringify({
+            version: 1,
+            storageIdentity: createStorageIdentityV2(SCOPE),
+            generations: {
+              "same-peer": { epoch: 99, rotatedAtSec: 1_600_000_000 },
+            },
+          }),
+          { mode: 0o644 },
+        );
+      }
+
+      expect(migrateLegacyTupleState({ ...SCOPE, home }).status).toBe(
+        "migrated",
+      );
+      const destination = tupleStoragePaths({ ...SCOPE, home });
+      expect(existsSync(destination.conversationKeyGenerationsPath)).toBe(false);
+
+      if (sidecarState === "stale") {
+        const backups = readdirSync(
+          join(legacy.root, ".legacy-v1-backups"),
+          { withFileTypes: true },
+        ).filter((entry) => entry.isDirectory());
+        expect(backups).toHaveLength(1);
+        const archivedSource = join(
+          legacy.root,
+          ".legacy-v1-backups",
+          backups[0]!.name,
+          "source",
+        );
+        // The unrecognised audit-only file is not adopted into v2. It remains
+        // contained by the migration archive's owner-only directory boundary.
+        expect(statSync(archivedSource).mode & 0o777).toBe(0o700);
+        expect(
+          existsSync(join(archivedSource, CONVERSATION_KEY_GENERATIONS_FILE_NAME)),
+        ).toBe(true);
+      }
+
+      const store = new ConversationKeyStore({ ...SCOPE, home });
+      const registeredKey = store.getOrCreate("same-peer");
+      expect(Buffer.from(registeredKey)).toEqual(LEGACY_K);
+      // Existing getOrCreate is a read: it must not invent a label for the
+      // migrated key. rotate() owns the durable self-heal.
+      expect(existsSync(destination.conversationKeyGenerationsPath)).toBe(false);
+
+      const rotated = store.rotate("same-peer");
+      expect(rotated.epoch).toBe(1);
+      expect(Buffer.from(rotated.key).equals(LEGACY_K)).toBe(false);
+      expect(store.generationOf("same-peer")).toEqual({
+        epoch: 1,
+        rotatedAtSec: rotated.rotatedAtSec,
+      });
+      expect(statSync(destination.conversationKeyGenerationsPath).mode & 0o777)
+        .toBe(0o600);
+    },
+  );
 
   it("preserves an existing exact credential-path parent mode during migration", () => {
     writeLegacyState();
