@@ -23,10 +23,13 @@ type Broken =
   | "page_limit_ignored"
   | "cursor_unbound"
   | "offset_pagination"
+  | "high_water_offset_pagination"
   | "revoke_scope_leak"
   | "revoke_each_row_transaction"
   | "floor_fractional_expiry"
-  | "unknown_scope_as_account";
+  | "unknown_scope_as_account"
+  | "nowsec_milliseconds"
+  | "stale_public_now";
 
 type BrokenState = { failBeforeCommit: boolean };
 
@@ -65,6 +68,16 @@ function breakLedger(inner: ControlledMemoryBrowserCredentialLedger, defect: Bro
     get(target, property, receiver) {
       const value = Reflect.get(target, property, receiver);
       if (typeof value !== "function") return value;
+
+      // A fixture-controlled backing clock can conceal a broken public SPI if
+      // conformance reads only the fixture. These two mutants keep the backing
+      // clock honest while corrupting only the adapter's public answer.
+      if (defect === "nowsec_milliseconds" && property === "nowSec") {
+        return async () => 1_700_000_000_000;
+      }
+      if (defect === "stale_public_now" && property === "nowSec") {
+        return async () => 1_700_000_000;
+      }
 
       if (defect === "overwrite_on_duplicate") {
         // An UPSERT that writes first and only then notices the row existed:
@@ -140,24 +153,29 @@ function breakLedger(inner: ControlledMemoryBrowserCredentialLedger, defect: Bro
         } catch { return target.list(scope, query); }
       };
 
-      // A realistic OFFSET adapter: the cursor is correctly bound and opaque,
-      // and an unchanged dataset pages perfectly, but a new first row shifts
-      // every later offset.
-      if (defect === "offset_pagination" && property === "list") return async (...args: Parameters<BrowserCredentialLedger["list"]>) => {
+      // Both adapters use a correctly bound opaque OFFSET cursor. The second
+      // also freezes the original newest key, so it survives insertions ahead
+      // of page 1 but still shifts when a returned row leaves a status filter.
+      if ((defect === "offset_pagination" || defect === "high_water_offset_pagination") && property === "list") return async (...args: Parameters<BrowserCredentialLedger["list"]>) => {
         const [scope, query = {}] = args;
         // Delegate ordinary scope/limit validation to the real adapter.
         await target.list(scope, { ...query, cursor: null });
         const key = JSON.stringify(scope);
         const status = query.status ?? null;
         let offset = 0;
+        let highWater: { issuedAtSec: number; userPubkey: string } | null = null;
         if (query.cursor != null) {
-          let cursor: { k?: unknown; s?: unknown; o?: unknown };
+          let cursor: { k?: unknown; s?: unknown; o?: unknown; i?: unknown; u?: unknown };
           try { cursor = JSON.parse(Buffer.from(query.cursor, "base64url").toString()) as typeof cursor; }
           catch { throw new BrowserCredentialCursorError("webchannel: browser credential cursor is not a cursor this ledger issued"); }
           if (cursor.k !== key || (cursor.s ?? null) !== status || !Number.isInteger(cursor.o) || (cursor.o as number) < 1) {
             throw new BrowserCredentialCursorError();
           }
           offset = cursor.o as number;
+          if (defect === "high_water_offset_pagination") {
+            if (!Number.isInteger(cursor.i) || typeof cursor.u !== "string") throw new BrowserCredentialCursorError();
+            highWater = { issuedAtSec: cursor.i as number, userPubkey: cursor.u };
+          }
         }
         const all: BrowserCredentialRecord[] = [];
         let targetCursor: string | null = null;
@@ -165,11 +183,19 @@ function breakLedger(inner: ControlledMemoryBrowserCredentialLedger, defect: Bro
           const page = await target.list(scope, { status: query.status, limit: 1_000, cursor: targetCursor });
           all.push(...page.records); targetCursor = page.cursor;
         } while (targetCursor !== null);
+        if (defect === "high_water_offset_pagination" && query.cursor == null) {
+          const first = all[0];
+          highWater = first ? { issuedAtSec: first.issuedAtSec, userPubkey: first.userPubkey } : null;
+        }
+        const visible = highWater === null ? all : all.filter((record) =>
+          record.issuedAtSec < highWater.issuedAtSec
+          || (record.issuedAtSec === highWater.issuedAtSec && record.userPubkey >= highWater.userPubkey));
         const limit = query.limit ?? 200;
-        const records = all.slice(offset, offset + limit);
+        const records = visible.slice(offset, offset + limit);
         const nextOffset = offset + records.length;
-        const cursor = nextOffset < all.length
-          ? Buffer.from(JSON.stringify({ k: key, s: status, o: nextOffset })).toString("base64url")
+        const cursor = nextOffset < visible.length
+          ? Buffer.from(JSON.stringify({ k: key, s: status, o: nextOffset,
+            ...(highWater ? { i: highWater.issuedAtSec, u: highWater.userPubkey } : {}) })).toString("base64url")
           : null;
         return { records, cursor };
       };
@@ -261,14 +287,17 @@ describe("BrowserCredentialLedger conformance harness self-tests", () => {
   for (const [prefix, defect, killedBy] of [
     ["1:", "overwrite_on_duplicate", "duplicate issuance overwrote the original record"],
     ["1:", "aliased_reads", "a returned record is aliased to the ledger's own state"],
+    ["1:", "nowsec_milliseconds", "ledger.nowSec is not a positive integer in unix SECONDS below the millisecond tripwire"],
     ["2:", "floor_fractional_expiry", "fractional expiresAtSec was accepted"],
     ["3:", "unknown_scope_as_account", "an unknown scope kind was accepted by list as an account-wide query"],
     ["4:", "page_limit_ignored", "page exceeded the requested limit"],
     ["4:", "cursor_unbound", "a cursor from a different scope was accepted"],
     ["4:", "offset_pagination", "cursor resumed by page offset after a newer issuance (duplicated, skipped, or admitted a before-anchor record)"],
+    ["4:", "high_water_offset_pagination", "status-filtered cursor resumed by offset after a returned row was revoked (skipped or duplicated an unaffected after-anchor row)"],
     ["5:", "revoke_scope_leak", "peer revocation did not mark exactly its scope"],
     ["5:", "revoke_each_row_transaction", "markRevoked left a partially revoked scope after an injected transactional failure"],
     ["6:", "retention_ignored", "configured retention was ignored one second past the boundary"],
+    ["6:", "stale_public_now", "controlled clock does not agree exactly with ledger.nowSec"],
     ["7:", "sweep_immortal", "sweep removed an active non-expiring credential"],
   ] as const) {
     it(`rejects the deliberately broken ${defect} adapter on its targeted assertion`, async () => {

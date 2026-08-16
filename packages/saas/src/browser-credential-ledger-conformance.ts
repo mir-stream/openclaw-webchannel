@@ -95,7 +95,22 @@ function requireClock(instance: Instance, caseName: string): Clock {
   invariant(instance.clock, `${caseName} requires the optional controlled clock capability`);
   return instance.clock;
 }
-const fixtureNow = async (instance: Instance): Promise<number> => instance.clock?.nowSec() ?? instance.ledger.nowSec();
+async function fixtureNow(instance: Instance): Promise<number> {
+  // Always exercise the public SPI. A controlled-clock fixture that supplies
+  // correct timestamps out of band must not certify an adapter whose own clock
+  // returns milliseconds or stops advancing.
+  const now = await instance.ledger.nowSec();
+  invariant(Number.isInteger(now) && now > 0 && now < MAX_TIMESTAMP_SEC,
+    "ledger.nowSec is not a positive integer in unix SECONDS below the millisecond tripwire");
+  if (instance.clock) {
+    invariant(now === instance.clock.nowSec(), "controlled clock does not agree exactly with ledger.nowSec");
+  }
+  return now;
+}
+async function advanceClock(instance: Instance, clock: Clock, sec: number): Promise<number> {
+  await clock.advance(sec);
+  return fixtureNow(instance);
+}
 // Property order is NOT part of the contract — an adapter that builds records
 // from a SELECT has whatever order its driver hands back — so comparisons
 // canonicalize object keys first. Array order is preserved: the list order IS
@@ -158,7 +173,6 @@ export const browserCredentialLedgerConformanceCases: readonly BrowserCredential
   { name: "1: issuance is insert-only, exact, and carries no caller-supplied extras", suite: "core", async run(instance) {
     const { ledger } = instance;
     const now = await fixtureNow(instance);
-    invariant(Number.isInteger(now) && now > 0 && now < MAX_TIMESTAMP_SEC, "nowSec is not a positive integer in unix SECONDS below the millisecond tripwire");
 
     const input = issuance({ userPubkey: `U${"1".repeat(55)}`, issuedAtSec: now, expiresAtSec: now + 86_400 });
     // A caller handing over a wider object must not be able to widen the record.
@@ -314,6 +328,27 @@ export const browserCredentialLedgerConformanceCases: readonly BrowserCredential
     invariant(resume === null, "pagination did not terminate after issuance interleaving");
     invariant(same(interleavedWalk.map((record) => record.userPubkey), expected),
       "cursor resumed by page offset after a newer issuance (duplicated, skipped, or admitted a before-anchor record)");
+
+    // A high-water mark can make OFFSET survive insertions ahead of page 1,
+    // but it still shifts when the status-filtered set loses an already-returned
+    // row. Revoke the row before the page-1 anchor, then resume that exact
+    // status cursor: every unaffected row after the anchor must remain.
+    const activeAtFirstPage = [insertedAhead, ...expected];
+    const activeFirstPage = await ledger.list(scope, { status: "active", limit: 2 });
+    invariant(activeFirstPage.cursor !== null && same(activeFirstPage.records.map((record) => record.userPubkey), activeAtFirstPage.slice(0, 2)),
+      "status-filtered page 1 did not establish the expected pagination anchor");
+    await ledger.markRevoked({ kind: "credential", userPubkey: activeFirstPage.records[0]!.userPubkey }, now + 10);
+    const activeAfterAnchor: BrowserCredentialRecord[] = [];
+    let activeResume: string | null = activeFirstPage.cursor;
+    for (let page = 0; activeResume !== null && page < 100; page++) {
+      const next = await ledger.list(scope, { status: "active", limit: 2, cursor: activeResume });
+      invariant(next.cursor === null || next.records.length > 0, "non-null active cursor returned with an empty page after status interleaving");
+      activeAfterAnchor.push(...next.records);
+      activeResume = next.cursor;
+    }
+    invariant(activeResume === null, "active pagination did not terminate after status interleaving");
+    invariant(same(activeAfterAnchor.map((record) => record.userPubkey), activeAtFirstPage.slice(2)),
+      "status-filtered cursor resumed by offset after a returned row was revoked (skipped or duplicated an unaffected after-anchor row)");
   } },
 
   { name: "5: markRevoked is scoped, atomic, idempotent, and monotonic", suite: "core", async run(instance) {
@@ -375,20 +410,20 @@ export const browserCredentialLedgerConformanceCases: readonly BrowserCredential
 
   { name: "6: both removable classes retain at equality and drop one second later", suite: "clock", async run(instance) {
     const { ledger } = instance; const clock = requireClock(instance, "case 6");
-    const t0 = clock.nowSec();
+    const t0 = await fixtureNow(instance);
     const expiring = `U${"1".repeat(55)}`;
     const cut = `U${"3".repeat(55)}`;
     await ledger.recordIssuance(issuance({ userPubkey: expiring, issuedAtSec: t0, expiresAtSec: t0 + 10 }));
     await ledger.recordIssuance(issuance({ userPubkey: cut, issuedAtSec: t0, expiresAtSec: null }));
-    await clock.advance(10);
-    await ledger.markRevoked({ kind: "credential", userPubkey: cut }, clock.nowSec());
+    const revokedAtSec = await advanceClock(instance, clock, 10);
+    await ledger.markRevoked({ kind: "credential", userPubkey: cut }, revokedAtSec);
 
     // Both removable classes now share the boundary t0 + 10 + retention: one
     // aged from expiresAtSec, one from revokedAtSec.
-    await clock.advance(CONFORMANCE_RETENTION_SEC);
+    await advanceClock(instance, clock, CONFORMANCE_RETENTION_SEC);
     invariant(await ledger.sweep() === 0, "configured retention evicted at the equality boundary");
     invariant(await ledger.get(expiring) !== null && await ledger.get(cut) !== null, "equality sweep removed a still-live record");
-    await clock.advance(1);
+    await advanceClock(instance, clock, 1);
     invariant(await ledger.sweep() === 2, "configured retention was ignored one second past the boundary");
     invariant(await ledger.get(expiring) === null && await ledger.get(cut) === null, "sweep reported removals it did not make");
     const drained = await drain(ledger, { kind: "peer", natsAccountPublicKey: ACCOUNT, peerId: "peer" }, { limit: 10 });
@@ -397,7 +432,7 @@ export const browserCredentialLedgerConformanceCases: readonly BrowserCredential
 
   { name: "7: an ACTIVE non-expiring credential is never swept, at any age", suite: "clock", async run(instance) {
     const { ledger } = instance; const clock = requireClock(instance, "case 7");
-    const t0 = clock.nowSec();
+    const t0 = await fixtureNow(instance);
     const immortal = `U${"2".repeat(55)}`;
     const expiring = `U${"1".repeat(55)}`;
     await ledger.recordIssuance(issuance({ userPubkey: immortal, issuedAtSec: t0, expiresAtSec: null }));
@@ -405,7 +440,7 @@ export const browserCredentialLedgerConformanceCases: readonly BrowserCredential
     // The property the whole SPI exists for. The reference login path mints
     // non-expiring credentials; a forgotten one is indistinguishable from
     // "there was nothing to cut", so no amount of elapsed time may drop it.
-    await clock.advance(10_000_000);
+    await advanceClock(instance, clock, 10_000_000);
     invariant(await ledger.sweep() === 1, "sweep removed an active non-expiring credential");
     const survivor = await ledger.get(immortal);
     invariant(survivor?.status === "active" && survivor.expiresAtSec === null, "an active non-expiring credential did not survive unbounded time");
