@@ -10,6 +10,7 @@ import {
   probeWebchannelAccount,
   type DoctorCheckId,
 } from "./doctor.js";
+import { StorageDocumentError } from "./storage-document.js";
 
 const cfg = (webchannel: Record<string, unknown>): OpenClawConfig => ({ channels: { webchannel } } as never);
 const identityKey = { publicKey: new Uint8Array(32), privateKey: new Uint8Array(32) };
@@ -254,6 +255,35 @@ describe("evaluateWebchannelDoctor findings", () => {
     ]);
     expect(formatDoctorWarning(findings[0]!)).toMatch(
       /channels\.webchannel\.default.*\[configuration-invalid\]/,
+    );
+  });
+
+  it("keeps future credential remediation free of contradictory re-enrollment advice", () => {
+    const findings = evaluateWebchannelDoctor(
+      cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }),
+      {
+        env: {},
+        loadPersistedEnrolledCreds: () => {
+          throw new StorageDocumentError("credentials", "version-too-new");
+        },
+      },
+    );
+
+    const finding = findings.find(
+      (item) => item.checkId === "credential-storage-failed",
+    );
+    expect(finding).toMatchObject({
+      accountId: "default",
+      severity: "error",
+      message: expect.stringContaining(
+        "Run the plugin version that wrote it (or newer)",
+      ),
+      fix: expect.stringContaining(
+        "Run the plugin version that wrote it (or newer)",
+      ),
+    });
+    expect(`${finding?.message}\n${finding?.fix}`).not.toMatch(
+      /archive|re-enroll|legacy backup|then retry/i,
     );
   });
 

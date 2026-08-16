@@ -119,6 +119,12 @@ export function isVersionTooNew(error: unknown): error is StorageDocumentError {
 export function credentialStorageFailureDiagnostic(
   error: StorageDocumentError,
 ): { code: string; detail: string } {
+  if (error.code === "version-too-new") {
+    return {
+      code: `${error.document}-version-too-new`,
+      detail: error.message,
+    };
+  }
   return {
     code: `credential-storage-${error.code}`,
     detail:

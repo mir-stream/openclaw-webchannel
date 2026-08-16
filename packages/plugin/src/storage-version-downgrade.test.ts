@@ -44,9 +44,12 @@ import {
   CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION,
   parseConversationKeyGenerationsDocument,
 } from "./conversation-key-generations-document.js";
-import { loadCredentialDocumentAtPath } from "./account-config.js";
+import { loadPersistedCredentialDocument } from "./account-config.js";
 import { generateKeyPair } from "./e2e-crypto.js";
-import { StorageDocumentError } from "./storage-document.js";
+import {
+  credentialStorageFailureDiagnostic,
+  StorageDocumentError,
+} from "./storage-document.js";
 import { STORAGE_IDENTITY_VERSION } from "./storage-identity.js";
 import { tupleStoragePaths } from "./storage-paths.js";
 
@@ -125,6 +128,45 @@ function generationsDocument(
         storage: { ...SCOPE },
       },
       generations: { [PEER]: { epoch: 4, rotatedAtSec: 1_700_000_000 } },
+    },
+    null,
+    2,
+  );
+}
+
+function credentialDocument(identityVersion: unknown): string {
+  const pair = generateKeyPair();
+  const publicKey = Buffer.from(pair.publicKey).toString("base64url");
+  return JSON.stringify(
+    {
+      tenant: TENANT,
+      accountId: ACCOUNT,
+      saasEnrollUrl: "https://saas.example/api/enroll",
+      saasPollUrl: "https://saas.example/api/poll",
+      identityKey: {
+        publicKey,
+        privateKey: Buffer.from(pair.privateKey).toString("base64url"),
+      },
+      enrollment: {
+        creds: {
+          userJwt: "jwt-placeholder",
+          userSeed: "seed-placeholder",
+        },
+        peerId: "peer-1",
+        jwksUrl: "https://saas.example/.well-known/jwks.json",
+        bootstrapUrl: "https://saas.example/api/bootstrap",
+        natsUrl: "wss://relay.example",
+      },
+      credentialIdentity: {
+        identityVersion,
+        storage: { ...SCOPE },
+        binding: {
+          saasBaseUrl: "https://saas.example",
+          deliveredIssuer: null,
+          relayUrl: "wss://relay.example",
+          agentPublicKey: publicKey,
+        },
+      },
     },
     null,
     2,
@@ -417,66 +459,115 @@ describe("#159 non-mutating startup compatibility probe", () => {
   });
 });
 
-describe("#159 credentials.json was already fail-closed — proving it stays so", () => {
-  /**
-   * This document carries no top-level `version`; its version field is the
-   * binding identity's `identityVersion`. The load API returns a sanitized
-   * non-match for an unsupported one and every credential write is create-only
-   * (`replace: false`), so no code change was needed here — only the evidence
-   * that the property holds, so a future edit cannot quietly remove it.
-   */
-  it("reports an unsupported identityVersion without touching the file", () => {
+describe("#159 credentials and migration preflight diagnostics", () => {
+  it("fails a future credential closed with downgrade guidance and byte identity", () => {
     const { credentialPath } = paths();
-    const pair = generateKeyPair();
-    const publicKey = Buffer.from(pair.publicKey).toString("base64url");
-    // Everything except the identity version is valid, so the payload parser
-    // cannot be what rejects this document.
     const before = writeRaw(
       credentialPath,
-      JSON.stringify(
-        {
-          tenant: TENANT,
-          accountId: ACCOUNT,
-          saasEnrollUrl: "https://saas.example/api/enroll",
-          saasPollUrl: "https://saas.example/api/poll",
-          identityKey: {
-            publicKey,
-            privateKey: Buffer.from(pair.privateKey).toString("base64url"),
-          },
-          enrollment: {
-            creds: { userJwt: "jwt-placeholder", userSeed: "seed-placeholder" },
-            peerId: "peer-1",
-            jwksUrl: "https://saas.example/.well-known/jwks.json",
-            bootstrapUrl: "https://saas.example/api/bootstrap",
-            natsUrl: "wss://relay.example",
-          },
-          credentialIdentity: {
-            identityVersion: STORAGE_IDENTITY_VERSION + 1,
-            storage: { ...SCOPE },
-            binding: {
-              saasBaseUrl: "https://saas.example",
-              deliveredIssuer: null,
-              relayUrl: "wss://relay.example",
-              agentPublicKey: publicKey,
-            },
-          },
-        },
-        null,
-        2,
-      ),
+      credentialDocument(STORAGE_IDENTITY_VERSION + 1),
     );
 
-    const loaded = loadCredentialDocumentAtPath(
-      {
+    let caught: unknown;
+    try {
+      loadPersistedCredentialDocument({
         tenant: TENANT,
         accountId: ACCOUNT,
         saasBaseUrl: "https://saas.example",
-      },
+      }, { home });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      document: "credentials",
+      code: "version-too-new",
+    });
+    const diagnostic = credentialStorageFailureDiagnostic(
+      caught as StorageDocumentError,
+    );
+    expect(diagnostic.code).toBe("credentials-version-too-new");
+    expect(diagnostic.detail).toContain("version downgrade");
+    expect(diagnostic.detail).toContain(
+      "Run the plugin version that wrote it (or newer)",
+    );
+    expect(diagnostic.detail).toContain("restore this account's state");
+    expect(diagnostic.detail).not.toContain("archive");
+    expect(diagnostic.detail).not.toContain("re-enroll");
+    for (const forbidden of [
+      "jwt-placeholder",
+      "seed-placeholder",
+      "peer-1",
+      PEER,
+      TENANT,
+      ACCOUNT,
       credentialPath,
+      home,
+    ]) {
+      expect(diagnostic.detail).not.toContain(forbidden);
+    }
+    expect(readFileSync(credentialPath).equals(before)).toBe(true);
+    expect(quarantineSiblings(credentialPath)).toEqual([]);
+  });
+
+  it("keeps an older credential identity on the existing unsupported path", () => {
+    const { credentialPath } = paths();
+    const before = writeRaw(
+      credentialPath,
+      credentialDocument(STORAGE_IDENTITY_VERSION - 1),
     );
 
-    expect(loaded.status).toBe("invalid");
-    expect(loaded).toMatchObject({ code: "unsupported-version" });
+    const loaded = loadPersistedCredentialDocument({
+      tenant: TENANT,
+      accountId: ACCOUNT,
+      saasBaseUrl: "https://saas.example",
+    }, { home });
+
+    expect(loaded).toMatchObject({
+      status: "invalid",
+      code: "unsupported-version",
+    });
     expect(readFileSync(credentialPath).equals(before)).toBe(true);
+  });
+
+  it("retains a future key's diagnostic through the real credential migration gate", () => {
+    const { credentialPath, conversationKeyPath } = paths();
+    const credentialBefore = writeRaw(
+      credentialPath,
+      credentialDocument(STORAGE_IDENTITY_VERSION),
+    );
+    const keyBefore = writeRaw(
+      conversationKeyPath,
+      keyDocument(CONVERSATION_KEY_DOCUMENT_VERSION + 1),
+    );
+
+    let caught: unknown;
+    try {
+      loadPersistedCredentialDocument({
+        tenant: TENANT,
+        accountId: ACCOUNT,
+        saasBaseUrl: "https://saas.example",
+      }, { home });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      document: "conversation-keys",
+      code: "version-too-new",
+    });
+    const diagnostic = credentialStorageFailureDiagnostic(
+      caught as StorageDocumentError,
+    );
+    expect(diagnostic).toMatchObject({
+      code: "conversation-keys-version-too-new",
+      detail: expect.stringContaining(
+        "Run the plugin version that wrote it (or newer)",
+      ),
+    });
+    expect(diagnostic.detail).not.toContain("legacy backup");
+    expect(diagnostic.detail).not.toContain("retry");
+    expect(readFileSync(credentialPath).equals(credentialBefore)).toBe(true);
+    expect(readFileSync(conversationKeyPath).equals(keyBefore)).toBe(true);
+    expect(quarantineSiblings(conversationKeyPath)).toEqual([]);
   });
 });

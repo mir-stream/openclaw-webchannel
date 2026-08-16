@@ -244,8 +244,10 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
             severity: "error",
             message: `${diagnostic.detail}.`,
             fix:
-              "Stop all old WebChannel plugin processes for this account, inspect the " +
-              "recoverable legacy backup if present, then retry.",
+              err.code === "version-too-new"
+                ? diagnostic.detail
+                : "Stop all old WebChannel plugin processes for this account, inspect the " +
+                  "recoverable legacy backup if present, then retry.",
           });
           continue;
         }

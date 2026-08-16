@@ -240,8 +240,25 @@ describe("Storage Identity v2 contract", () => {
       }),
     ).toEqual({
       status: "invalid",
-      code: "unsupported-version",
+      code: "version-too-new",
       fields: ["identityVersion"],
+    });
+    for (const identityVersion of [1, "3", 2.5, null]) {
+      expect(
+        inspectCredentialBindingIdentityV2(expected, {
+          ...cloneIdentity(),
+          identityVersion,
+        }),
+      ).toEqual({
+        status: "invalid",
+        code: "unsupported-version",
+        fields: ["identityVersion"],
+      });
+    }
+    const absentVersion = cloneIdentity();
+    delete absentVersion.identityVersion;
+    expect(inspectCredentialBindingIdentityV2(expected, absentVersion)).toEqual({
+      status: "unbound",
     });
     expect(inspectCredentialBindingIdentityV2(expected, [])).toEqual({
       status: "invalid",
@@ -351,6 +368,26 @@ describe("Storage Identity v2 contract", () => {
     ).toEqual({
       status: "mismatch",
       fields: ["storage.tenant"],
+    });
+    expect(
+      inspectStorageIdentityV2(expected, {
+        ...expected,
+        identityVersion: STORAGE_IDENTITY_VERSION + 1,
+      }),
+    ).toEqual({
+      status: "invalid",
+      code: "version-too-new",
+      fields: ["identityVersion"],
+    });
+    expect(
+      inspectStorageIdentityV2(expected, {
+        ...expected,
+        identityVersion: STORAGE_IDENTITY_VERSION - 1,
+      }),
+    ).toEqual({
+      status: "invalid",
+      code: "unsupported-version",
+      fields: ["identityVersion"],
     });
   });
 });

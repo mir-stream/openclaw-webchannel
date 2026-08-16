@@ -76,6 +76,30 @@ describe("index-nats.ts wiring contract — account-bound auth and startup", () 
     );
   });
 
+  it("reports future credential storage before key probing or publication", () => {
+    const credentialLoad = RUNTIME_SOURCE.indexOf(
+      "credentialLoad = loadPersistedCredentialDocument(",
+    );
+    const storageDiagnostic = RUNTIME_SOURCE.indexOf(
+      "const diagnostic = credentialStorageFailureDiagnostic(error);",
+      credentialLoad,
+    );
+    const keyStoreProbe = RUNTIME_SOURCE.indexOf(
+      "keyStore.assertNoFutureDocuments()",
+      storageDiagnostic,
+    );
+    const publication = RUNTIME_SOURCE.indexOf(
+      "commitAccountPublication<AccountRuntime>",
+      keyStoreProbe,
+    );
+    expect(storageDiagnostic).toBeGreaterThan(credentialLoad);
+    expect(keyStoreProbe).toBeGreaterThan(storageDiagnostic);
+    expect(publication).toBeGreaterThan(keyStoreProbe);
+    expect(
+      RUNTIME_SOURCE.slice(storageDiagnostic, keyStoreProbe),
+    ).toMatch(/reportPermanent\(accountId, diagnostic\.code, diagnostic\.detail\)[\s\S]*?return undefined/);
+  });
+
   it("wires the prepared token-only verifier and strict PoP policy", () => {
     expect(RUNTIME_SOURCE).toMatch(/verifyIdentity:\s*accountAuth\.verifyIdentity/);
     expect(RUNTIME_SOURCE).toMatch(/requirePoP:\s*accountAuth\.requirePoP/);
