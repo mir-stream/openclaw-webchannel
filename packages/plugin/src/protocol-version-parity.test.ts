@@ -11,6 +11,14 @@
  * bare `export const` with no imports, so it typechecks cleanly under the plugin's
  * Node lib set. The reverse direction would not: the plugin's `protocol.ts` pulls
  * in `node:module` for `readPluginVersion`.
+ *
+ * #160: THIS TEST IS THE ENFORCEMENT BOTH `protocol.ts` HEADERS POINT AT. Each
+ * of them documents the lockstep and the bump rule in prose; a rule with no
+ * executable guard is how #122 and #115 happened. If this file is renamed,
+ * moved, or deleted, update both headers in the same change — they name it by
+ * filename precisely so a move stays greppable. `e2e/protocol-version-
+ * lockstep.test.ts` makes the same comparison from the e2e side; the two are
+ * deliberate redundancy across suites, not a duplicate to clean up.
  */
 
 import { describe, it, expect } from "vitest";

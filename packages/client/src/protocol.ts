@@ -1,21 +1,37 @@
 /**
  * WebChannel wire-protocol version — the client↔plugin register handshake.
  *
- * This integer is bumped whenever the client↔plugin register wire contract
- * changes in a way that is NOT backward-compatible (frame shapes, the register
- * challenge/response fields, key-delivery semantics). It rides the `register`
- * request and the register success reply so a mismatch fails LOUDLY and is
- * diagnosable, instead of silently breaking at runtime (the F2 lesson).
+ * This integer rides the `register` request and the register success reply so a
+ * mismatch fails LOUDLY and is diagnosable, instead of silently breaking at
+ * runtime (the F2 lesson).
  *
  * There is no shared package between the client and the plugin, so the plugin
  * declares its OWN equal constant (see packages/plugin/src/protocol.ts). The
- * handshake itself catches any drift between the two. The current version is
- * mandatory in both directions; neither side accepts an absent or mismatched
- * version.
+ * handshake catches drift at runtime, and two tests catch it at CI time:
+ * `protocol-version-parity.test.ts` and `protocol-version-lockstep.test.ts`
+ * each import BOTH constants and compare them, so editing one side alone turns
+ * CI red. Named by filename, not path, so a moved file is still one grep away.
  *
  * v3 (breaking): the register request carries a mandatory browser-chosen
  * `clientNonce` bound into the wrapped-conversation-key AAD (freshness anchor
  * against a replayed register reply), and `unregister` requires a PoP proof.
+ *
+ * When to bump (#160)
+ * ───────────────────
+ * Bumping is breaking for every deployment simultaneously: both sides reject a
+ * mismatch, so after publication a bump means every consumer must redeploy the
+ * gateway AND every browser bundle at the same time. Keep the trigger narrow.
+ *
+ *  - BUMP when the register handshake contract changes: required request or
+ *    reply fields, challenge/response semantics, or what the key delivery is
+ *    bound to. v3 above is the worked example.
+ *  - DO NOT BUMP to add a new frame type. Measured, not assumed: this side has
+ *    no dispatch switch at all — `deliverInbound` (nats-client.ts) matches two
+ *    specific types and forwards EVERY frame, known or not, to its message
+ *    listeners; the plugin's inbound dispatch ends in a `default:` that only
+ *    warns and drops the frame (`nats-channel.ts`). A new type therefore
+ *    reaches updated peers and is inert on old ones. `InboundMessage["type"]`
+ *    is a compile-time union only and rejects nothing at runtime.
  *
  * NOTE: this is a DIFFERENT layer from the E2E message-envelope version
  * (`ENVELOPE_VERSION` / `v:1`), which versions the encrypted payload format.
