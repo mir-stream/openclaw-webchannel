@@ -168,7 +168,7 @@ describe("index-nats.ts wiring contract — ingress dedupe onFlush (P0-7a)", () 
 });
 
 describe("index-nats.ts wiring contract — ingress ack (P0-7b)", () => {
-  it("wires sendAck into the onFlush factory, the debouncer onCancel, and the control-lane branch", () => {
+  it("wires ACK plus stable-id admission into every ingress lane", () => {
     // The onFlush factory must be handed a sendAck so admitted (fresh + duplicate)
     // ids drain the client's replay ledger.
     expect(RUNTIME_SOURCE).toMatch(
@@ -178,11 +178,20 @@ describe("index-nats.ts wiring contract — ingress ack (P0-7b)", () => {
     // the tested helper (else a reconnect replays text the user aborted).
     expect(RUNTIME_SOURCE).toMatch(/onCancel:/);
     expect(RUNTIME_SOURCE).toMatch(/recordCancelledInboundItems\(/);
-    // The control-lane branch bypasses the debouncer/onFlush, so it acks its own
-    // id-carrying frame directly (else its ledger entry never drains).
+    // The control-lane branch bypasses the debouncer/onFlush, so it owns both
+    // stable-inner-id admission and its ACK. A duplicate must ACK+return before
+    // the destructive buffer-drop predicate can run.
+    expect(RUNTIME_SOURCE).toMatch(/createControlLaneRetryGuard\(/);
     expect(RUNTIME_SOURCE).toMatch(
-      /if\s*\(message\.id\s*&&\s*!channel\.sendAck\(peerId,\s*\[message\.id\]\)\)/,
+      /if\s*\(id\s*&&\s*!channel\.sendAck\(peerId,\s*\[id\]\)\)/,
     );
+    expect(RUNTIME_SOURCE).toMatch(
+      /if \(retryAdmission\.status === "duplicate"\) \{[\s\S]*?acknowledgeControlLane\(peerId, message\.id\);[\s\S]*?return;/,
+    );
+    expect(RUNTIME_SOURCE.indexOf('retryAdmission.status === "duplicate"')).toBeLessThan(
+      RUNTIME_SOURCE.indexOf("shouldDropBufferedInputOnStop(message, commandGate, peerId)"),
+    );
+    expect(RUNTIME_SOURCE).toContain("void retryAdmission.persisted");
     expect(RUNTIME_SOURCE.match(/control-lane ack failed/g)).toHaveLength(1);
   });
 });

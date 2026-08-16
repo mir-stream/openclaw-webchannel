@@ -10,9 +10,11 @@ import {
 import { resolveCommandGate } from "./command-gate.js";
 import { createSerializedInboundDispatcher, coalesceUserMessages } from "./inbound-queue.js";
 import {
+  createControlLaneRetryGuard,
   createIngressOnFlush,
   recordCancelledInboundItems,
 } from "./ingress-dedupe.js";
+import type { IngressOutcomeStore, OutcomeRecordResult } from "./ingress-outcome.js";
 import type { InboundWsMessage } from "./channel-contract.js";
 
 /**
@@ -115,6 +117,129 @@ describe("shouldDropBufferedInputOnStop", () => {
   });
 });
 
+describe("control-lane stable-id retry guard", () => {
+  function delayedOutcomeStore() {
+    const hot = new Set<string>();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const record = vi.fn(async (accountId: string, key: string): Promise<OutcomeRecordResult> => {
+      await gate;
+      const scoped = `${accountId}:${key}`;
+      const created = !hot.has(scoped);
+      return {
+        status: "recorded",
+        durability: "durable",
+        write: {
+          outcome: "accepted",
+          created,
+          durability: "durable",
+          commit: () => { hot.add(scoped); },
+          rollback: async () => false,
+        },
+      };
+    });
+    const store = {
+      peek: (accountId: string, key: string) =>
+        hot.has(`${accountId}:${key}`) ? "accepted" as const : undefined,
+      record,
+    } as Pick<IngressOutcomeStore, "peek" | "record">;
+    return { store, record, release };
+  }
+
+  it("suppresses the same inner id while persistence is pending and after it commits", async () => {
+    const { store, record, release } = delayedOutcomeStore();
+    const guard = createControlLaneRetryGuard({ accountId: "acct", outcomeStore: store });
+
+    const first = guard.admit("peer", "stop-1");
+    expect(first.status).toBe("fresh");
+    expect(guard.admit("peer", "stop-1")).toEqual({ status: "duplicate" });
+    expect(record).toHaveBeenNthCalledWith(1, "acct", "peer:stop-1", "accepted");
+    expect(record).toHaveBeenCalledTimes(1);
+
+    release();
+    if (first.status === "fresh") await first.persisted;
+    expect(guard.admit("peer", "stop-1")).toEqual({ status: "duplicate" });
+    expect(record).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps peers isolated and leaves id-less control frames untracked", async () => {
+    const { store, record, release } = delayedOutcomeStore();
+    const guard = createControlLaneRetryGuard({ accountId: "acct", outcomeStore: store });
+
+    const peerA = guard.admit("peer-a", "same-id");
+    const peerB = guard.admit("peer-b", "same-id");
+    expect(peerA.status).toBe("fresh");
+    expect(peerB.status).toBe("fresh");
+    expect(guard.admit("peer-a", undefined)).toEqual({ status: "untracked" });
+    expect(record).toHaveBeenCalledTimes(2);
+
+    release();
+    if (peerA.status === "fresh") await peerA.persisted;
+    if (peerB.status === "fresh") await peerB.persisted;
+  });
+
+  it("bounds unresolved marker writes and preserves fast-abort availability at pressure", async () => {
+    const { store, record, release } = delayedOutcomeStore();
+    const warned = vi.fn();
+    const guard = createControlLaneRetryGuard({
+      accountId: "acct",
+      outcomeStore: store,
+      maxPending: 1,
+      onPersistenceFailure: warned,
+    });
+
+    const first = guard.admit("peer", "stop-1");
+    expect(first.status).toBe("fresh");
+    expect(guard.admit("peer", "stop-2")).toEqual({ status: "untracked" });
+    expect(record).toHaveBeenCalledTimes(1);
+    expect(warned).toHaveBeenCalledTimes(1);
+
+    release();
+    if (first.status === "fresh") await first.persisted;
+  });
+
+  it("acks but does not repeat destructive work for a re-sealed duplicate", async () => {
+    const hot = new Set<string>();
+    const store = {
+      peek: (accountId: string, key: string) =>
+        hot.has(`${accountId}:${key}`) ? "accepted" as const : undefined,
+      record: vi.fn(async (accountId: string, key: string): Promise<OutcomeRecordResult> => {
+        const scoped = `${accountId}:${key}`;
+        const created = !hot.has(scoped);
+        return {
+          status: "recorded",
+          durability: "durable",
+          write: {
+            outcome: "accepted",
+            created,
+            durability: "durable",
+            commit: () => { hot.add(scoped); },
+            rollback: async () => false,
+          },
+        };
+      }),
+    } as Pick<IngressOutcomeStore, "peek" | "record">;
+    const guard = createControlLaneRetryGuard({ accountId: "acct", outcomeStore: store });
+    const effects = { acks: 0, bufferDrops: 0, dispatches: 0 };
+    const route = (
+      message: Extract<InboundWsMessage, { type: "user_message" }>,
+    ) => {
+      const admission = guard.admit("peer", message.id);
+      if (message.id) effects.acks++;
+      if (admission.status === "duplicate") return admission;
+      effects.bufferDrops++;
+      effects.dispatches++;
+      return admission;
+    };
+
+    const first = route({ type: "user_message", text: "/stop", id: "stable-stop-id" });
+    if (first.status === "fresh") await first.persisted;
+    route({ type: "user_message", text: "/stop", id: "stable-stop-id" });
+
+    expect(effects).toEqual({ acks: 2, bufferDrops: 1, dispatches: 1 });
+  });
+});
+
 describe("control-lane bypass of the per-session FIFO", () => {
   /**
    * The exact routing branch index-nats.ts runs per inbound frame: abort frames
@@ -168,10 +293,10 @@ describe("control-lane bypass of the per-session FIFO", () => {
 
 describe("control-lane /stop ingress ack (P0-7b)", () => {
   /**
-   * The control lane bypasses the debouncer/onFlush, so it is never deduped and
-   * never acked there. index-nats.ts acks the control-lane frame directly when it
-   * carries an id, so the client's unacked ledger entry drains (else every
-   * reconnect would replay the /stop). Mirror that routing branch's ack step.
+   * The control lane bypasses the debouncer/onFlush, so its stable-id retry guard
+   * and ACK both live in the runtime branch. The branch acks every id-carrying
+   * first delivery or duplicate so the client's unacked ledger drains. Mirror
+   * that ACK step here; retry suppression is covered above.
    */
   function routeControlLane(
     message: InboundWsMessage & { id?: string },

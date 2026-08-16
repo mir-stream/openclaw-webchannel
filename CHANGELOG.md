@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Fixed ACK-loss retries of `/stop` re-running the control lane. The plugin now
+  keys retry suppression on the stable authenticated inner message id: a
+  recognized live re-sealed duplicate is ACKed so the client ledger drains, but
+  it cannot abort a later turn or clear that turn's buffered input. The bounded
+  outer-envelope LRU remains a best-effort filter; no wire-protocol change is
+  required.
+
 - **Breaking (wire protocol v3):** the client↔plugin register hop changed in four
   ways. `WEBCHANNEL_PROTOCOL_VERSION` goes 2 → 3, and the plugin, client, and SaaS
   packages must be released together at `0.4.0`. A v2 browser against a v3 agent is

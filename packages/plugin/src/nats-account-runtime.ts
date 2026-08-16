@@ -48,6 +48,7 @@ import { resolveCommandGate } from "./command-gate.js";
 import { resolveInboundDebounceMs } from "openclaw/plugin-sdk/reply-runtime";
 import {
   CancelledInboundFallbackTombstones,
+  createControlLaneRetryGuard,
   createIngressOnFlush,
   recordCancelledInboundItems,
 } from "./ingress-dedupe.js";
@@ -1035,6 +1036,20 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // send the peer a hedged notice. See src/command-gate.ts for the traced
       // core paths (all testable logic lives in the imported typed helpers).
       const commandGate = resolveCommandGate(api.config, accountId);
+      const controlLaneRetryGuard = createControlLaneRetryGuard({
+        accountId,
+        outcomeStore: processIngressOutcomes,
+        onPersistenceFailure: () => api.logger?.warn?.(
+          "webchannel: control-lane retry marker unavailable; a later ACK-loss retry may be re-admitted",
+        ),
+      });
+      const acknowledgeControlLane = (peerId: string, id: string | undefined): void => {
+        if (id && !channel.sendAck(peerId, [id])) {
+          api.logger?.warn?.(
+            `webchannel: control-lane ack failed for peer=${peerId} id=${id}`,
+          );
+        }
+      };
       channel.setMessageHandler((peerId, message) => {
         if (!runtimeActive) return;
         if (message.type !== "user_message") return; // approvals routed below
@@ -1085,6 +1100,21 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           //     dropping, so its only error is skipping cleanup for a peer whose
           //     abort actually succeeded (their follow-up runs after the abort) —
           //     accepted over destroying input for a peer whose turn survives.
+          const retryAdmission = controlLaneRetryGuard.admit(peerId, message.id);
+          if (retryAdmission.status === "duplicate") {
+            // The stable inner id, unlike the freshly re-sealed outer envelope
+            // id, identifies an ACK-loss retry. ACK it again so the client ledger
+            // drains, but do not repeat the abort or its destructive buffer drop.
+            acknowledgeControlLane(peerId, message.id);
+            api.logger?.info?.("webchannel: ignored duplicate control-lane retry");
+            return;
+          }
+          if (retryAdmission.status === "fresh") {
+            // Marker persistence stays in the background so a later same-peer
+            // message cannot overtake the fast-abort path. The guard's bounded
+            // in-flight key suppresses retries until the hot marker commits.
+            void retryAdmission.persisted;
+          }
           if (shouldDropBufferedInputOnStop(message, commandGate, peerId)) {
             const debounceCancelled = inboundDebouncer!.cancelKey(peerId, { notify: true });
             const pendingDropped = inboundDispatcher!.clearPending(peerId);
@@ -1094,16 +1124,11 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
               );
             }
           }
-          // P0-7b: ack the control-lane frame here too. It bypasses the
-          // debouncer/onFlush (and is never deduped), so without this its
-          // client-side ledger entry would never drain and every reconnect would
-          // replay the /stop. A replayed /stop that lands before this ack is a
-          // harmless no-op abort (accepted).
-          if (message.id && !channel.sendAck(peerId, [message.id])) {
-            api.logger?.warn?.(
-              `webchannel: control-lane ack failed for peer=${peerId} id=${message.id}`,
-            );
-          }
+          // P0-7b: ack the admitted control-lane frame here too. It bypasses the
+          // debouncer/onFlush, so without this its client-side ledger entry would
+          // never drain. A lost ACK is safe: the stable-id guard above re-ACKs
+          // the retry without dispatching or clearing buffers again.
+          acknowledgeControlLane(peerId, message.id);
           void handleInboundMessage(
             api,
             channel,

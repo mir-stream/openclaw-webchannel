@@ -65,6 +65,11 @@ keep the accounts disabled and escalate through incident response.
 
 ### Fixed
 
+- ACK-loss retries of `/stop` now use the stable inner message id already carried
+  by the client ledger. A recognized live duplicate is ACKed without dispatching
+  the abort or clearing buffered input again. Admission reuses the existing
+  ingress outcome hot marker plus a bounded transient in-flight key while still
+  bypassing the debouncer/FIFO; the outer-envelope LRU remains best-effort.
 - Added per-account pure planning and immutable account-bound auth preparation
   before that account consumes transport credentials or performs network I/O,
   token-only prepared verifiers, Gate-B-before-subscribe activation,

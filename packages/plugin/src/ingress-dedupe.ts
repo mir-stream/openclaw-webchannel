@@ -57,6 +57,75 @@ export function ingressDedupeKey(item: IngressDedupeItem): string | undefined {
     : undefined;
 }
 
+export type ControlLaneRetryAdmission =
+  | { status: "fresh"; persisted: Promise<void> }
+  | { status: "duplicate" }
+  | { status: "untracked" };
+
+export type ControlLaneRetryGuard = {
+  admit(peerId: string, id: string | undefined): ControlLaneRetryAdmission;
+};
+
+const DEFAULT_MAX_PENDING_CONTROL_MARKERS = 256;
+
+/**
+ * Classify control-lane retries by the same stable inner id as ordinary ingress.
+ *
+ * The outcome store's synchronous hot marker handles completed writes. A small
+ * bounded in-flight set closes only the interval before a first marker commits,
+ * allowing destructive control effects to remain synchronous and ahead of later
+ * same-peer input. This is transient admission state, not a second long-lived
+ * replay cache; cold-cache/restart behavior remains an explicit residual.
+ */
+export function createControlLaneRetryGuard(options: {
+  accountId: string;
+  outcomeStore: Pick<IngressOutcomeStore, "peek" | "record">;
+  onPersistenceFailure?: () => void;
+  maxPending?: number;
+}): ControlLaneRetryGuard {
+  const pending = new Set<string>();
+  const maxPending = Math.max(1, options.maxPending ?? DEFAULT_MAX_PENDING_CONTROL_MARKERS);
+  let warned = false;
+  const reportPersistenceFailure = () => {
+    if (warned) return;
+    warned = true;
+    try { options.onPersistenceFailure?.(); } catch { /* diagnostics never affect routing */ }
+  };
+
+  return {
+    admit(peerId, id) {
+      const key = ingressDedupeKey({ peerId, message: { id } });
+      if (!key) return { status: "untracked" };
+      if (pending.has(key) || options.outcomeStore.peek(options.accountId, key) === "accepted") {
+        return { status: "duplicate" };
+      }
+      if (pending.size >= maxPending) {
+        reportPersistenceFailure();
+        return { status: "untracked" };
+      }
+
+      pending.add(key);
+      const persisted = options.outcomeStore
+        .record(options.accountId, key, "accepted")
+        .then((result) => {
+          if (result.status !== "recorded") {
+            reportPersistenceFailure();
+            return;
+          }
+          result.write.commit();
+        })
+        .catch(() => {
+          reportPersistenceFailure();
+        })
+        .finally(() => {
+          pending.delete(key);
+        });
+
+      return { status: "fresh", persisted };
+    },
+  };
+}
+
 /** Per-account, insertion-ordered safety net for cancelled-item record failures. */
 export class CancelledInboundFallbackTombstones {
   private readonly keys = new Map<string, number>();
@@ -269,9 +338,11 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
  *    first survivor's peer is the whole batch's peer.
  *
  * CONTROL-LANE NOTE: `/stop` (and the NL abort vocabulary) BYPASS the debouncer
- * entirely in setMessageHandler, so aborts never reach this path and are never
- * deduped — a duplicate abort is a harmless cosmetic double-bubble, and the abort
- * must not wait on SQLite. The control-lane branch acks its own frame separately.
+ * entirely in setMessageHandler, so aborts never reach this path and must not
+ * wait behind its FIFO. The runtime instead applies
+ * `createControlLaneRetryGuard`: it uses this same outcome store to classify the
+ * stable inner id before destructive control effects, then ACKs duplicates
+ * without dispatch. The control-lane branch acks its own frame separately.
  *
  * In that legacy branch, per-id recording happens inside
  * `filterFreshInboundItems` before coalesce/dispatch. Production does not use

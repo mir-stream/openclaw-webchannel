@@ -92,17 +92,18 @@ export type NatsChannelLimits = {
    * F4 anti-replay: half-width of the accepted inbound `ts` skew window, in ms
    * (default 10 min). A sealed frame whose authenticated `ts` (browser wall
    * clock) is more than this before/after the agent's `now` is dropped as a
-   * replay-or-skew. Generous by design — the messageId LRU is the PRIMARY
-   * defense; this window is the coarse secondary bound that also caps how far
-   * back the LRU must remember (see `maxSeenMessageIdsPerPeer`).
+   * replay-or-skew. Generous by design for browser clock tolerance; together
+   * with the bounded messageId LRU it is only an outer best-effort freshness
+   * filter, ahead of message-type-specific stable-id idempotency.
    */
   replayWindowMs?: number;
   /**
    * F4 anti-replay: per-peer cap on remembered seen-messageIds before the
    * oldest is LRU-evicted (default 2_000). Strictly per-peer so one peer's
-   * churn can never evict another peer's window. Safe to evict the oldest: a
-   * genuine replay of an evicted (old) messageId is re-caught by the `ts`
-   * window, which by construction only admits frames newer than the window.
+   * churn can never evict another peer's window. This is a bounded best-effort
+   * pre-dispatch filter, not a promise to retain every id for the full timestamp
+   * window: an evicted id whose `ts` is still in-window can be admitted again.
+   * User-message effects rely on their stable inner-id idempotency at ingress.
    */
   maxSeenMessageIdsPerPeer?: number;
 };
@@ -111,9 +112,9 @@ export type NatsChannelLimits = {
 const DEFAULT_MAX_PEERS = 10_000;
 const DEFAULT_MAX_APPROVAL_RESOLUTIONS = 10_000;
 /**
- * F4 defaults. The ±10-min window tolerates a badly-skewed browser clock while
- * still bounding replay memory; 2_000 remembered ids/peer covers a very busy
- * conversation within that window without unbounded growth.
+ * F4 defaults. The ±10-min window tolerates a badly-skewed browser clock;
+ * 2_000 remembered ids/peer suppresses ordinary duplicates without unbounded
+ * growth, but deliberately does not guarantee full-window retention.
  */
 const DEFAULT_REPLAY_WINDOW_MS = 10 * 60 * 1_000;
 const DEFAULT_MAX_SEEN_MESSAGE_IDS_PER_PEER = 2_000;
@@ -154,17 +155,14 @@ export class NatsChannel implements WebChannelPeerChannel {
 
   /**
    * F4 anti-replay state. The untrusted relay can re-publish a captured sealed
-   * `user_message` verbatim; it decrypts under the same per-peer key with an
-   * unchanged AAD, so nothing downstream distinguishes it from a genuine send —
-   * the agent would RE-RUN the turn (duplicate tool calls / side effects / cost).
-   * We enforce freshness on the AUTHENTICATED envelope fields (`messageId`,
-   * `ts`, both inside the AEAD-bound AAD, so a relay can't forge them):
-   *  - a per-peer sliding window of seen messageIds (PRIMARY defense), and
-   *  - a generous ±`replayWindowMs` bound on `ts` (SECONDARY — tolerates a
-   *    skewed browser clock, and caps how far back the LRU must remember).
-   * NOTE: this cache is IN-MEMORY. A replay that arrives AFTER an agent restart
-   * (empty cache) is only stopped by the `ts` window — replay within that window
-   * across a restart is the accepted residual, bounded to `replayWindowMs`.
+   * frame verbatim. We cheaply suppress the common byte-identical duplicate on
+   * the AUTHENTICATED envelope fields (`messageId`, `ts`, both inside the
+   * AEAD-bound AAD, so a relay cannot mutate them):
+   *  - a bounded per-peer set of recently seen messageIds; and
+   *  - a generous ±`replayWindowMs` timestamp-skew bound.
+   * This cache is intentionally IN-MEMORY and best-effort. Cap eviction or an
+   * agent restart can re-admit an otherwise valid captured envelope; semantic
+   * user-message idempotency is keyed on the stable authenticated inner id.
    * Keyed per-peer (peerId -> insertion-ordered messageId -> ts) so eviction is
    * strictly local; cleaned up alongside `peerSessionKeys`.
    */
@@ -903,14 +901,12 @@ export class NatsChannel implements WebChannelPeerChannel {
   /**
    * F4 freshness gate for an already-decrypted inbound envelope.
    *
-   * Returns false (caller drops) when the frame is a replay: either its
-   * `messageId` was already seen from this peer, or its `ts` falls outside the
-   * ±`replayWindowMs` window. The messageId LRU is the PRIMARY defense; the ts
-   * window is a generous secondary bound tolerating a skewed browser clock and
-   * capping how far back the LRU must remember. Logging distinguishes the two so
-   * a chronically-skewed client (every frame ts-rejected) is diagnosable versus
-   * a genuine duplicate-id replay. Strictly per-peer: one peer's window can
-   * never evict or admit another's.
+   * Returns false when the frame's `messageId` is currently remembered for this
+   * peer, or its `ts` falls outside the ±`replayWindowMs` window. The bounded LRU
+   * does not retain every id for that entire window; it is a fast duplicate
+   * filter ahead of the stable-inner-id ingress guards. Logging distinguishes a
+   * chronically-skewed client from a currently remembered duplicate. Strictly
+   * per-peer: one peer's traffic never evicts another peer's entries.
    */
   private acceptFreshInbound(peerId: string, messageId: string, ts: number): boolean {
     const skew = Date.now() - ts;
@@ -933,10 +929,10 @@ export class NatsChannel implements WebChannelPeerChannel {
       return false;
     }
     seen.set(messageId, ts);
-    // Per-peer LRU eviction. Map is insertion-ordered, so the first key is the
-    // oldest-recorded; dropping it is safe because the ts window (which only
-    // admits frames within ±replayWindowMs of now) re-catches any replay of an
-    // evicted old messageId.
+    // Per-peer bounded best-effort eviction. Map is insertion-ordered, so the
+    // first key is the oldest-recorded. If its authenticated ts is still inside
+    // the accepted skew window, a later replay can pass this outer filter and is
+    // left to the message-type-specific stable-id/idempotency boundary.
     while (seen.size > this.maxSeenMessageIdsPerPeer) {
       const oldest = seen.keys().next().value as string | undefined;
       if (oldest === undefined) break;
