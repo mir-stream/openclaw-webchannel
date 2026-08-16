@@ -19,6 +19,7 @@
  */
 
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -51,7 +52,7 @@ import {
   StorageDocumentError,
 } from "./storage-document.js";
 import { STORAGE_IDENTITY_VERSION } from "./storage-identity.js";
-import { tupleStoragePaths } from "./storage-paths.js";
+import { legacyTuplePaths, tupleStoragePaths } from "./storage-paths.js";
 
 const TENANT = "tenant-A";
 const ACCOUNT = "acct-a";
@@ -182,6 +183,108 @@ function quarantineSiblings(path: string): string[] {
 }
 
 describe("#159 conversation-keys.json written by a newer release", () => {
+  it.each([
+    [
+      "current key",
+      "conversation-keys",
+      () =>
+        parseConversationKeyDocument(
+          SCOPE,
+          keyDocument(
+            CONVERSATION_KEY_DOCUMENT_VERSION,
+            STORAGE_IDENTITY_VERSION + 1,
+          ),
+        ),
+    ],
+    [
+      "legacy key",
+      "conversation-keys",
+      () =>
+        parseLegacyConversationKeyDocument(
+          SCOPE,
+          keyDocument(
+            LEGACY_CONVERSATION_KEY_DOCUMENT_VERSION,
+            STORAGE_IDENTITY_VERSION + 1,
+          ),
+        ),
+    ],
+    [
+      "generation sidecar",
+      "conversation-key-generations",
+      () =>
+        parseConversationKeyGenerationsDocument(
+          SCOPE,
+          generationsDocument(
+            CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION,
+            STORAGE_IDENTITY_VERSION + 1,
+          ),
+        ),
+    ],
+  ] as const)(
+    "preserves a future identity classification in a current %s envelope",
+    (_name, document, parse) => {
+      let caught: unknown;
+      try {
+        parse();
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toMatchObject({
+        document,
+        code: "version-too-new",
+        fields: ["identityVersion"],
+      });
+    },
+  );
+
+  it("preserves all non-future identity classifications at the parser boundary", () => {
+    const parseIdentity = (storageIdentity: unknown): StorageDocumentError => {
+      const serialized = JSON.stringify({
+        version: CONVERSATION_KEY_DOCUMENT_VERSION,
+        storageIdentity,
+        keys: {},
+      });
+      try {
+        parseConversationKeyDocument(SCOPE, serialized);
+        throw new Error("expected identity parsing to fail");
+      } catch (error) {
+        return error as StorageDocumentError;
+      }
+    };
+
+    for (const identityVersion of [
+      STORAGE_IDENTITY_VERSION - 1,
+      String(STORAGE_IDENTITY_VERSION + 1),
+      STORAGE_IDENTITY_VERSION + 0.5,
+    ]) {
+      expect(
+        parseIdentity({ identityVersion, storage: { ...SCOPE } }),
+      ).toMatchObject({ code: "identity-invalid" });
+    }
+    expect(parseIdentity({ storage: { ...SCOPE } })).toMatchObject({
+      code: "identity-unbound",
+    });
+    expect(
+      parseIdentity({ identityVersion: STORAGE_IDENTITY_VERSION }),
+    ).toMatchObject({ code: "identity-incomplete" });
+    expect(
+      parseIdentity({
+        identityVersion: STORAGE_IDENTITY_VERSION,
+        storage: { tenant: TENANT, accountId: "someone-else" },
+      }),
+    ).toMatchObject({ code: "identity-mismatch" });
+    expect(
+      parseConversationKeyDocument(
+        SCOPE,
+        keyDocument(
+          CONVERSATION_KEY_DOCUMENT_VERSION,
+          STORAGE_IDENTITY_VERSION,
+        ),
+      ).size,
+    ).toBe(1);
+  });
+
   it("fails closed and leaves the file byte-identical, with nothing quarantined", () => {
     const path = paths().conversationKeyPath;
     const before = writeRaw(
@@ -292,6 +395,33 @@ describe("#159 the v1 legacy reader answers the same question", () => {
     });
     expect(parseLegacyConversationKeyDocument(SCOPE, serialized).size).toBe(1);
   });
+
+  it("leaves a current legacy envelope with a future identity in place during migration", () => {
+    const legacy = legacyTuplePaths(ACCOUNT, home);
+    const destination = paths();
+    const before = writeRaw(
+      legacy.conversationKeyPath,
+      keyDocument(
+        LEGACY_CONVERSATION_KEY_DOCUMENT_VERSION,
+        STORAGE_IDENTITY_VERSION + 1,
+      ),
+    );
+    const beforePersist = vi.fn();
+    const beforeGenerationPersist = vi.fn();
+
+    expect(() =>
+      store({
+        _beforePersist: beforePersist,
+        _beforeGenerationPersist: beforeGenerationPersist,
+      }).getOrCreate(PEER),
+    ).toThrow(/conversation-keys version-too-new/);
+
+    expect(readFileSync(legacy.conversationKeyPath).equals(before)).toBe(true);
+    expect(quarantineSiblings(legacy.conversationKeyPath)).toEqual([]);
+    expect(beforePersist).not.toHaveBeenCalled();
+    expect(beforeGenerationPersist).not.toHaveBeenCalled();
+    expect(existsSync(destination.conversationKeyPath)).toBe(false);
+  });
 });
 
 describe("#159 the generation sidecar (audit-only, but never overwritten)", () => {
@@ -311,43 +441,76 @@ describe("#159 the generation sidecar (audit-only, but never overwritten)", () =
     ).toBe(true);
   });
 
-  it("fails closed BEFORE a key is minted — nothing is published either", () => {
+  it.each([
+    [
+      "future envelope and identity",
+      CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION + 1,
+      STORAGE_IDENTITY_VERSION + 1,
+    ],
+    [
+      "current envelope with future identity",
+      CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION,
+      STORAGE_IDENTITY_VERSION + 1,
+    ],
+  ] as const)("fails closed BEFORE a key is minted for %s", (_case, version, identityVersion) => {
     const { conversationKeyPath, conversationKeyGenerationsPath } = paths();
     const before = writeRaw(
       conversationKeyGenerationsPath,
-      generationsDocument(
-        CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION + 1,
-        STORAGE_IDENTITY_VERSION + 1,
-      ),
+      generationsDocument(version, identityVersion),
     );
+    const beforePersist = vi.fn();
+    const beforeGenerationPersist = vi.fn();
 
-    expect(() => store().getOrCreate(PEER)).toThrow(/version-too-new/);
+    expect(() =>
+      store({ _beforePersist: beforePersist, _beforeGenerationPersist: beforeGenerationPersist })
+        .getOrCreate(PEER),
+    ).toThrow(/version-too-new/);
 
     expect(
       readFileSync(conversationKeyGenerationsPath).equals(before),
     ).toBe(true);
     expect(quarantineSiblings(conversationKeyGenerationsPath)).toEqual([]);
+    expect(beforePersist).not.toHaveBeenCalled();
+    expect(beforeGenerationPersist).not.toHaveBeenCalled();
     expect(readdirSync(dirname(conversationKeyPath))).not.toContain(
       "conversation-keys.json",
     );
   });
 
-  it("still refuses rotation rather than replacing a future sidecar", () => {
+  it.each([
+    [
+      "future envelope",
+      CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION + 1,
+      STORAGE_IDENTITY_VERSION,
+    ],
+    [
+      "future identity",
+      CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION,
+      STORAGE_IDENTITY_VERSION + 1,
+    ],
+  ] as const)("still refuses rotation rather than replacing a %s sidecar", (_case, version, identityVersion) => {
     const { conversationKeyPath, conversationKeyGenerationsPath } = paths();
     // Mint K with a healthy sidecar, then simulate the rollback.
     store().getOrCreate(PEER);
     const keysBefore = readFileSync(conversationKeyPath);
     const before = writeRaw(
       conversationKeyGenerationsPath,
-      generationsDocument(CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION + 1),
+      generationsDocument(version, identityVersion),
     );
+    const beforePersist = vi.fn();
+    const beforeGenerationPersist = vi.fn();
 
-    expect(() => store().rotate(PEER)).toThrow(/version-too-new/);
+    expect(() =>
+      store({ _beforePersist: beforePersist, _beforeGenerationPersist: beforeGenerationPersist })
+        .rotate(PEER),
+    ).toThrow(/version-too-new/);
 
     expect(
       readFileSync(conversationKeyGenerationsPath).equals(before),
     ).toBe(true);
     expect(readFileSync(conversationKeyPath).equals(keysBefore)).toBe(true);
+    expect(beforePersist).not.toHaveBeenCalled();
+    expect(beforeGenerationPersist).not.toHaveBeenCalled();
   });
 
   it("keeps admitting registrations when the sidecar is merely CORRUPT", () => {
@@ -383,22 +546,25 @@ describe("#159 the generation sidecar (audit-only, but never overwritten)", () =
 
 describe("#159 non-mutating startup compatibility probe", () => {
   it.each([
-    ["key", "conversation-keys"],
-    ["generation", "conversation-key-generations"],
+    ["key", "future envelope and identity", "conversation-keys", true],
+    ["generation", "future envelope and identity", "conversation-key-generations", true],
+    ["key", "current envelope with future identity", "conversation-keys", false],
+    ["generation", "current envelope with future identity", "conversation-key-generations", false],
   ] as const)(
-    "rejects a future %s document without writes, quarantine, or lazy recovery",
-    (target, expectedDocument) => {
+    "rejects a future %s document (%s) without writes, quarantine, or lazy recovery",
+    (target, _case, expectedDocument, futureEnvelope) => {
       const { conversationKeyPath, conversationKeyGenerationsPath } = paths();
       const targetPath =
         target === "key" ? conversationKeyPath : conversationKeyGenerationsPath;
       const serialized =
         target === "key"
           ? keyDocument(
-              CONVERSATION_KEY_DOCUMENT_VERSION + 1,
+              CONVERSATION_KEY_DOCUMENT_VERSION + (futureEnvelope ? 1 : 0),
               STORAGE_IDENTITY_VERSION + 1,
             )
           : generationsDocument(
-              CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION + 1,
+              CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION +
+                (futureEnvelope ? 1 : 0),
               STORAGE_IDENTITY_VERSION + 1,
             );
       const before = writeRaw(targetPath, serialized);
@@ -529,7 +695,10 @@ describe("#159 credentials and migration preflight diagnostics", () => {
     expect(readFileSync(credentialPath).equals(before)).toBe(true);
   });
 
-  it("retains a future key's diagnostic through the real credential migration gate", () => {
+  it.each([
+    ["future envelope", CONVERSATION_KEY_DOCUMENT_VERSION + 1, STORAGE_IDENTITY_VERSION],
+    ["future identity", CONVERSATION_KEY_DOCUMENT_VERSION, STORAGE_IDENTITY_VERSION + 1],
+  ] as const)("retains a key's %s diagnostic through the real credential migration gate", (_case, version, identityVersion) => {
     const { credentialPath, conversationKeyPath } = paths();
     const credentialBefore = writeRaw(
       credentialPath,
@@ -537,7 +706,7 @@ describe("#159 credentials and migration preflight diagnostics", () => {
     );
     const keyBefore = writeRaw(
       conversationKeyPath,
-      keyDocument(CONVERSATION_KEY_DOCUMENT_VERSION + 1),
+      keyDocument(version, identityVersion),
     );
 
     let caught: unknown;

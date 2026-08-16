@@ -163,7 +163,9 @@ function inspectionError(
     case "invalid":
       return new StorageDocumentError(
         document,
-        "identity-invalid",
+        inspection.code === "version-too-new"
+          ? "version-too-new"
+          : "identity-invalid",
         inspection.fields,
       );
     case "mismatch":

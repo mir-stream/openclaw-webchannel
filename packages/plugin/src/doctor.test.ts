@@ -1,7 +1,20 @@
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import { assertValidAccountId, type PersistedEnrolledCreds } from "./account-config.js";
+import { CONVERSATION_KEY_DOCUMENT_VERSION } from "./conversation-key-document.js";
+import { CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION } from "./conversation-key-generations-document.js";
+import { createCredentialIdentityForEnrollment } from "./credential-document.js";
 import {
   createWebchannelDoctorAdapter,
   createWebchannelStatusAdapter,
@@ -10,7 +23,10 @@ import {
   probeWebchannelAccount,
   type DoctorCheckId,
 } from "./doctor.js";
+import { generateKeyPair } from "./e2e-crypto.js";
 import { StorageDocumentError } from "./storage-document.js";
+import { STORAGE_IDENTITY_VERSION } from "./storage-identity.js";
+import { tupleStoragePaths } from "./storage-paths.js";
 
 const cfg = (webchannel: Record<string, unknown>): OpenClawConfig => ({ channels: { webchannel } } as never);
 const identityKey = { publicKey: new Uint8Array(32), privateKey: new Uint8Array(32) };
@@ -25,6 +41,115 @@ const removedDevModeKey = ["dev", "Open"].join("");
 const removedDevModeSetting = ["nats.", removedDevModeKey].join("");
 const ids = (config: OpenClawConfig, env: Record<string, string | undefined> = {}, load: () => PersistedEnrolledCreds | undefined = () => persisted) =>
   evaluateWebchannelDoctor(config, { env, loadPersistedEnrolledCreds: load }).map((finding) => finding.checkId);
+
+const FUTURE_FIXTURE_TENANT = "future-storage-tenant";
+const FUTURE_FIXTURE_ACCOUNT = "default";
+const FUTURE_FIXTURE_SAAS = "https://saas.example";
+
+function futureTupleFixture(
+  target: "key" | "generation",
+): Readonly<{
+  config: OpenClawConfig;
+  storageRoot: string;
+  targetPath: string;
+  before: Buffer;
+  cleanup: () => void;
+}> {
+  const storageRoot = mkdtempSync(join(tmpdir(), "webchannel-doctor-future-"));
+  const paths = tupleStoragePaths({
+    tenant: FUTURE_FIXTURE_TENANT,
+    accountId: FUTURE_FIXTURE_ACCOUNT,
+    storageRoot,
+  });
+  const pair = generateKeyPair();
+  const publicKey = Buffer.from(pair.publicKey).toString("base64url");
+  const credential = JSON.stringify({
+    credentialIdentity: createCredentialIdentityForEnrollment({
+      tenant: FUTURE_FIXTURE_TENANT,
+      accountId: FUTURE_FIXTURE_ACCOUNT,
+      saasBaseUrl: FUTURE_FIXTURE_SAAS,
+      relayUrl: "wss://relay.example",
+      agentPublicKey: publicKey,
+    }),
+    identityKey: {
+      publicKey,
+      privateKey: Buffer.from(pair.privateKey).toString("base64url"),
+    },
+    enrollment: {
+      creds: { userJwt: "fixture-jwt-secret", userSeed: "fixture-seed-secret" },
+      peerId: "fixture-peer-secret",
+      jwksUrl: "https://issuer.example/jwks",
+      bootstrapUrl: "https://saas.example/api/bootstrap",
+      natsUrl: "wss://relay.example",
+    },
+    tenant: FUTURE_FIXTURE_TENANT,
+    accountId: FUTURE_FIXTURE_ACCOUNT,
+    saasEnrollUrl: `${FUTURE_FIXTURE_SAAS}/api/enroll`,
+    saasPollUrl: `${FUTURE_FIXTURE_SAAS}/api/poll`,
+  });
+  const storageIdentity = {
+    identityVersion: STORAGE_IDENTITY_VERSION + 1,
+    storage: {
+      tenant: FUTURE_FIXTURE_TENANT,
+      accountId: FUTURE_FIXTURE_ACCOUNT,
+    },
+  };
+  const serialized = JSON.stringify(
+    target === "key"
+      ? {
+          version: CONVERSATION_KEY_DOCUMENT_VERSION,
+          storageIdentity,
+          keys: {},
+          futurePayload: { keep: "opaque" },
+        }
+      : {
+          version: CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION,
+          storageIdentity,
+          generations: {},
+          futurePayload: { keep: "opaque" },
+        },
+    null,
+    2,
+  );
+  const targetPath = target === "key"
+    ? paths.conversationKeyPath
+    : paths.conversationKeyGenerationsPath;
+  mkdirSync(dirname(paths.credentialPath), { recursive: true, mode: 0o700 });
+  writeFileSync(paths.credentialPath, credential, { mode: 0o600 });
+  writeFileSync(targetPath, serialized, { mode: 0o600 });
+
+  return Object.freeze({
+    config: cfg({
+      tenant: FUTURE_FIXTURE_TENANT,
+      saas: { baseUrl: FUTURE_FIXTURE_SAAS },
+      storageRoot,
+      auth: {
+        strategy: "jwt",
+        jwt: {
+          issuer: "https://issuer.example",
+          jwksUrl: "https://issuer.example/jwks",
+        },
+      },
+      dmSecurity: "allowlist",
+    }),
+    storageRoot,
+    targetPath,
+    before: readFileSync(targetPath),
+    cleanup: () => rmSync(storageRoot, { recursive: true, force: true }),
+  });
+}
+
+function expectFutureFixtureUntouched(
+  fixture: ReturnType<typeof futureTupleFixture>,
+): void {
+  expect(readFileSync(fixture.targetPath).equals(fixture.before)).toBe(true);
+  const name = basename(fixture.targetPath);
+  expect(
+    readdirSync(dirname(fixture.targetPath)).filter(
+      (entry) => entry.startsWith(`${name}.`),
+    ),
+  ).toEqual([]);
+}
 
 describe("evaluateWebchannelDoctor findings", () => {
   const cases: Array<[DoctorCheckId, OpenClawConfig, Record<string, string | undefined>, () => PersistedEnrolledCreds | undefined]> = [
@@ -287,6 +412,48 @@ describe("evaluateWebchannelDoctor findings", () => {
     );
   });
 
+  it.each([
+    ["key", "conversation-keys"],
+    ["generation", "conversation-key-generations"],
+  ] as const)(
+    "finds a future %s tuple document without changing or quarantining it",
+    (target, document) => {
+      const fixture = futureTupleFixture(target);
+      try {
+        const findings = evaluateWebchannelDoctor(fixture.config, { env: {} });
+        const finding = findings.find(
+          (candidate) => candidate.checkId === "credential-storage-failed",
+        );
+
+        expect(finding).toMatchObject({
+          accountId: FUTURE_FIXTURE_ACCOUNT,
+          severity: "error",
+          message: expect.stringContaining(`${document} version-too-new`),
+          fix: expect.stringContaining(
+            "Run the plugin version that wrote it (or newer)",
+          ),
+        });
+        expect(findings).not.toEqual([]);
+        const diagnostic = `${finding?.message}\n${finding?.fix}`;
+        for (const forbidden of [
+          FUTURE_FIXTURE_TENANT,
+          FUTURE_FIXTURE_ACCOUNT,
+          fixture.storageRoot,
+          fixture.targetPath,
+          "fixture-jwt-secret",
+          "fixture-seed-secret",
+          "fixture-peer-secret",
+        ]) {
+          expect(diagnostic).not.toContain(forbidden);
+        }
+        expect(diagnostic).not.toMatch(/archive|re-enroll|legacy backup|then retry/i);
+        expectFutureFixtureUntouched(fixture);
+      } finally {
+        fixture.cleanup();
+      }
+    },
+  );
+
   it("isolates a malformed account credential path and still diagnoses its sibling", () => {
     const findings = evaluateWebchannelDoctor(cfg({
       accounts: {
@@ -349,6 +516,57 @@ describe("evaluateWebchannelDoctor findings", () => {
 });
 
 describe("status probe", () => {
+  it.each([
+    ["key", "conversation-keys"],
+    ["generation", "conversation-key-generations"],
+  ] as const)(
+    "rejects a future %s tuple document before relay or JWKS I/O",
+    async (target, document) => {
+      const fixture = futureTupleFixture(target);
+      const dial = vi.fn(async () => ({ ok: true as const }));
+      const fetchImpl = vi.fn(async () =>
+        new Response(JSON.stringify({ keys: [{ kty: "RSA" }] })),
+      );
+      try {
+        const result = await probeWebchannelAccount(
+          {
+            account: { accountId: FUTURE_FIXTURE_ACCOUNT },
+            timeoutMs: 50,
+            cfg: fixture.config,
+          },
+          { env: {}, dial, fetchImpl },
+        );
+
+        expect(result).toMatchObject({
+          ok: false,
+          accountId: FUTURE_FIXTURE_ACCOUNT,
+          admission: "register-hop",
+          error: expect.stringContaining(`${document}-version-too-new`),
+        });
+        expect(result.error).toContain(
+          "Run the plugin version that wrote it (or newer)",
+        );
+        for (const forbidden of [
+          FUTURE_FIXTURE_TENANT,
+          FUTURE_FIXTURE_ACCOUNT,
+          fixture.storageRoot,
+          fixture.targetPath,
+          "fixture-jwt-secret",
+          "fixture-seed-secret",
+          "fixture-peer-secret",
+        ]) {
+          expect(result.error).not.toContain(forbidden);
+        }
+        expect(result.error).not.toMatch(/archive|re-enroll|legacy backup|then retry/i);
+        expect(dial).not.toHaveBeenCalled();
+        expect(fetchImpl).not.toHaveBeenCalled();
+        expectFutureFixtureUntouched(fixture);
+      } finally {
+        fixture.cleanup();
+      }
+    },
+  );
+
   it("probes inline effective JWKS plus relay and returns success", async () => {
     const dial = vi.fn(async () => ({ ok: true as const }));
     const result = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => persisted, dial });
