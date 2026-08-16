@@ -35,6 +35,15 @@
  * Ordinary corrupt content is archived and starts fresh only after quarantine
  * succeeds. Identity mismatch/unbound/invalid metadata always fails closed and
  * is never treated as ordinary corruption.
+ *
+ * A document `version` ABOVE the one this build writes fails closed too (#159).
+ * It means a newer release wrote the file and the deployer then rolled back, so
+ * quarantining it would archive every live device's K and issue fresh keys on
+ * the next register — an unrecoverable outage dressed up as recovery. That rule
+ * covers the audit-only generation sidecar as well: the sidecar is written with
+ * `replace: true` and is never archived, so overwriting a future sidecar would
+ * destroy the bytes outright. A MISSING or CORRUPT sidecar keeps its audit-only
+ * degradation and still admits registrations; only version-too-new stops.
  */
 
 import { randomBytes } from "node:crypto";
@@ -61,7 +70,10 @@ import {
   type CredentialPathOptions,
 } from "./storage-paths.js";
 import type { StorageScopeIdentity } from "./storage-identity.js";
-import { StorageDocumentError } from "./storage-document.js";
+import {
+  isVersionTooNew,
+  StorageDocumentError,
+} from "./storage-document.js";
 
 export type { CapacityStatus } from "./capacity-status.js";
 export { formatCapacityWarning } from "./capacity-status.js";
@@ -351,6 +363,7 @@ export class ConversationKeyStore {
   private load(): Map<string, Uint8Array> {
     if (this.keys) return this.keys;
     this.prepareMigration();
+    this.assertGenerationsNotFromFuture();
     try {
       this.keys = this.readStoreFile();
     } catch (err) {
@@ -448,11 +461,35 @@ export class ConversationKeyStore {
     return parseConversationKeyGenerationsDocument(this.scope, serialized);
   }
 
-  /** Sidecar failure is audit-only: report a fixed diagnostic and start empty. */
+  /**
+   * Fail closed before the key path can mutate anything when the sidecar was
+   * written by a newer release (#159).
+   *
+   * This runs at the head of the lazy load, ahead of key quarantine and ahead
+   * of every sidecar write, so a downgraded process neither resets nor replaces
+   * a future sidecar. Missing, corrupt, and unreadable sidecars are NOT this
+   * guard's business — they stay audit-only and are handled where they are read.
+   */
+  private assertGenerationsNotFromFuture(): void {
+    try {
+      this.readGenerationFile();
+    } catch (error) {
+      if (isVersionTooNew(error)) throw error;
+    }
+  }
+
+  /**
+   * Sidecar failure is audit-only: report a fixed diagnostic and start empty.
+   *
+   * The one exception is version-too-new. Swallowing it would hand an empty map
+   * to a caller that then writes the sidecar back at this build's version,
+   * erasing a newer release's file with no archive behind it.
+   */
   private readGenerationsAuditOnly(): Map<string, ConversationKeyGeneration> {
     try {
       return this.readGenerationFile();
     } catch (error) {
+      if (isVersionTooNew(error)) throw error;
       const code = isEnoent(error)
         ? "missing"
         : error instanceof StorageDocumentError
@@ -505,11 +542,18 @@ export class ConversationKeyStore {
       this.persistGenerations(next);
     } catch {
       // Registration already committed K. An audit write must never roll that
-      // result back or turn a successful admission into a failure.
+      // result back or turn a successful admission into a failure. A sidecar
+      // that turned version-too-new since the load-time probe lands here too:
+      // the read throws BEFORE any write, so the future file keeps its bytes.
       this.logGenerationAuditFailure("write-failed", "entry-omitted");
     }
   }
 
+  /**
+   * The only sidecar write with no read in front of it. It is reachable solely
+   * from the lazy-load quarantine branch, which `assertGenerationsNotFromFuture`
+   * already gated, so it cannot replace a newer release's sidecar.
+   */
   private resetGenerationsAfterKeyQuarantine(): void {
     try {
       this.persistGenerations(new Map());

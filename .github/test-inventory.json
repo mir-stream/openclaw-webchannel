@@ -1,5 +1,5 @@
 {
-  "note": "Collected (non-skipped) test count per file, from 'vitest list'. Checked EXACTLY by scripts/check-test-inventory.mjs in the e2e gate: a drop is a deleted or skipped test, a rise means this file is stale. Regenerate with 'npm run test:inventory:update'. No totals field on purpose — see the script's SHAPE note.",
+  "note": "Collected (non-skipped) test count per file, from 'vitest list'. Checked EXACTLY by scripts/check-test-inventory.mjs in the e2e gate: a drop is a deleted or skipped test, a rise means this file is stale. Regenerate with 'npm run test:inventory:update'. No totals field on purpose \u2014 see the script's SHAPE note.",
   "files": {
     "demo/enroll-validation.test.ts": 2,
     "demo/saas-server-auth.test.ts": 1,
@@ -130,6 +130,7 @@
     "packages/plugin/src/setup.test.ts": 36,
     "packages/plugin/src/storage-identity.test.ts": 25,
     "packages/plugin/src/storage-paths.test.ts": 6,
+    "packages/plugin/src/storage-version-downgrade.test.ts": 14,
     "packages/plugin/src/subject-token.test.ts": 8,
     "packages/plugin/src/typing-indicator.test.ts": 10,
     "packages/saas/src/ac6-device-flow-e2e.test.ts": 15,

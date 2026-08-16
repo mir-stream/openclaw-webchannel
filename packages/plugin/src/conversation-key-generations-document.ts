@@ -5,6 +5,7 @@ import {
 } from "./storage-identity.js";
 import {
   assertDocumentStorageIdentity,
+  assertSupportedDocumentVersion,
   StorageDocumentError,
 } from "./storage-document.js";
 
@@ -43,9 +44,11 @@ export function parseConversationKeyGenerationsDocument(
       document[CONVERSATION_KEY_GENERATIONS_IDENTITY_FIELD],
     );
   }
-  if (document.version !== CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION) {
-    throw invalidDocument();
-  }
+  assertSupportedDocumentVersion(
+    "conversation-key-generations",
+    CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION,
+    document.version,
+  );
   if (!hasIdentity) {
     assertDocumentStorageIdentity(
       "conversation-key-generations",

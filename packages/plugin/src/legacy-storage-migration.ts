@@ -1046,7 +1046,7 @@ function migrateProvenArchive(input: {
       ),
     );
   } catch (error) {
-    if (isStorageIdentityError(error)) throw error;
+    if (isFailClosedStorageError(error)) throw error;
     throw new StorageDocumentError("credentials", "legacy-migration-failed");
   }
 
@@ -1340,7 +1340,7 @@ function inspectLegacyCredential(
       if (error instanceof StorageDocumentError) throw error;
       throw new StorageDocumentError("credentials", "legacy-migration-failed");
     }
-    if (isStorageIdentityError(error)) throw error;
+    if (isFailClosedStorageError(error)) throw error;
     return { status: "invalid" };
   }
 }
@@ -1364,14 +1364,22 @@ function readLegacyConversationKeys(
   try {
     return parseLegacyConversationKeyDocument(scope, serialized);
   } catch (error) {
-    if (isStorageIdentityError(error)) throw error;
+    if (isFailClosedStorageError(error)) throw error;
     // Ordinary malformed key material is retained in the recoverable archive
     // but never adopted into a v2 tuple.
     return null;
   }
 }
 
-function isStorageIdentityError(
+/**
+ * Storage failures migration must NEVER downgrade to "ordinary malformed".
+ *
+ * Identity failures say the document belongs to someone else; version-too-new
+ * says a newer release wrote it and the deployer rolled back (#159). Neither is
+ * corruption, and swallowing either one would let migration archive the source
+ * and publish an empty store over live key material.
+ */
+function isFailClosedStorageError(
   error: unknown,
 ): error is StorageDocumentError {
   return (
@@ -1379,7 +1387,8 @@ function isStorageIdentityError(
     (error.code === "identity-unbound" ||
       error.code === "identity-incomplete" ||
       error.code === "identity-invalid" ||
-      error.code === "identity-mismatch")
+      error.code === "identity-mismatch" ||
+      error.code === "version-too-new")
   );
 }
 
@@ -1705,8 +1714,9 @@ function verifyExistingDestinations(
       );
     } catch (error) {
       // The store's established corruption policy owns ordinary malformed
-      // content. Migration only intercepts identity failures, which must never
-      // be mistaken for permission to quarantine and start serving.
+      // content. Migration intercepts everything else — identity failures and a
+      // version written by a newer release (#159) — because neither may be
+      // mistaken for permission to quarantine and start serving.
       if (
         error instanceof StorageDocumentError &&
         error.code === "invalid-document"

@@ -5,6 +5,7 @@ import {
 } from "./storage-identity.js";
 import {
   assertDocumentStorageIdentity,
+  assertSupportedDocumentVersion,
   StorageDocumentError,
 } from "./storage-document.js";
 
@@ -38,9 +39,11 @@ export function parseConversationKeyDocument(
       document[CONVERSATION_KEY_IDENTITY_FIELD],
     );
   }
-  if (document.version !== CONVERSATION_KEY_DOCUMENT_VERSION) {
-    throw new StorageDocumentError("conversation-keys", "invalid-document");
-  }
+  assertSupportedDocumentVersion(
+    "conversation-keys",
+    CONVERSATION_KEY_DOCUMENT_VERSION,
+    document.version,
+  );
   if (!hasIdentity) {
     assertDocumentStorageIdentity("conversation-keys", scope, undefined);
   }
@@ -66,9 +69,14 @@ export function parseLegacyConversationKeyDocument(
       document[CONVERSATION_KEY_IDENTITY_FIELD],
     );
   }
-  if (document.version !== LEGACY_CONVERSATION_KEY_DOCUMENT_VERSION) {
-    throw new StorageDocumentError("conversation-keys", "invalid-document");
-  }
+  // The v1 reader answers the same question as the v2 one: a version above the
+  // one it understands is a downgrade signal, not malformed key material, and
+  // must not be adopted-or-discarded as ordinary corruption (#159).
+  assertSupportedDocumentVersion(
+    "conversation-keys",
+    LEGACY_CONVERSATION_KEY_DOCUMENT_VERSION,
+    document.version,
+  );
   return parseKeys(document.keys);
 }
 
