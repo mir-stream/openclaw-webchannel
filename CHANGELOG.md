@@ -5,11 +5,14 @@
 - **New: `openclaw-webchannel-rotate-key`, an offline conversation-key rotation
   command (issue #158).** Until now the only way an operator could replace a
   leaked K was to delete state files by hand — destructive, account-wide, and
-  unauditable. The plugin package now ships a `bin` that rotates one named peer,
-  or one reviewed account, through the §8.2 commit protocol and verifies the
-  write by reading it back. It is deliberately a separate process from the
-  gateway: it cannot open a transport, and nothing in a running gateway can
-  invoke it. A dry run is the default; account-wide is never implied and its
+  unauditable. The plugin package now ships a dedicated entry that rotates one
+  named peer, or one reviewed account, through the §8.2 commit protocol and
+  verifies both complete durable documents by reading them back. ClawHub does
+  not expose npm bins on the shell PATH; the runbook resolves the installed root
+  with `openclaw plugins inspect webchannel --json` and invokes the entry with
+  Node. It is deliberately a separate process from the gateway: it cannot open
+  a transport, and the account-wide mutation module is absent from the gateway
+  bundle. A dry run is the default; account-wide is never implied and its
   `--apply` requires the target digest printed by the matching dry run. An
   account-wide rotation commits each document exactly once regardless of peer
   count, which a regression test pins.
@@ -18,7 +21,9 @@
   this is a library and cannot know your deployment topology, so the controller
   attestation originally proposed in #158 was dropped (decision of 2026-08-16).
   Bringing observed replicas to zero first is an operator obligation, imposed by
-  step ① of `docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md`.
+  step ① of `docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md`. Rotation is supported
+  only for one local tuple store or one authoritative tuple store shared by all
+  replicas; independent replica volumes must be escalated, not rotated in turn.
 
 - **New: `docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md` (issue #83)** — the operator
   procedure for a leaked browser credential, agent credential, or conversation

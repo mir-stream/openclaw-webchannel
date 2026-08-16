@@ -7,6 +7,7 @@
  *   - RS256 private key (PEM) — signs bootstrap JWTs
  *   - NATS tenant-account signing seed (NKEY) — signs enrolled user JWTs
  *   - NATS system-account credential — publishes runtime account-claim updates
+ *     and reads back this chain's exact tenant-account claim
  *
  *  PUBLIC (nats-server + JWKS endpoint):
  *   - NATS operator JWT (signed by operator NKEY)
@@ -530,8 +531,8 @@ export async function setupTrustChain(
   );
 
   // A writable full resolver accepts account-claim updates on the system
-  // account. Keep the system user intentionally narrow: it may publish only
-  // the update request and subscribe only to request/reply inboxes.
+  // account. Keep the system user intentionally narrow: it may publish the
+  // global update request and read back only THIS generated tenant account.
   const systemAccountJwt = await encodeAccount(
     `${operatorName}-system-account`,
     systemAccountKp,
@@ -554,7 +555,12 @@ export async function setupTrustChain(
     systemUserKp,
     systemAccountKp,
     {
-      pub: { allow: ["$SYS.REQ.CLAIMS.UPDATE"] },
+      pub: {
+        allow: [
+          "$SYS.REQ.CLAIMS.UPDATE",
+          `$SYS.REQ.ACCOUNT.${natsAccountPublicKey}.CLAIMS.LOOKUP`,
+        ],
+      },
       sub: { allow: ["_INBOX.>"] },
     },
   );

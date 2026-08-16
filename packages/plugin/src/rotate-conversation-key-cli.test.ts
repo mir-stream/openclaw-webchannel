@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -21,7 +22,7 @@ import {
   runRotateConversationKeyCli,
 } from "./rotate-conversation-key-cli.js";
 import { ROTATION_LOCK_FILE_NAME } from "./rotation-preflight.js";
-import { tupleStoragePaths } from "./storage-paths.js";
+import { legacyTuplePaths, tupleStoragePaths } from "./storage-paths.js";
 
 /**
  * #158 — the offline rotation command, exercised end to end against real files
@@ -63,12 +64,23 @@ afterEach(() => {
 type CliRun = { code: number; out: string; err: string; all: string };
 
 function run(...argv: string[]): CliRun {
+  return runWithRuntime(argv);
+}
+
+function runWithRuntime(
+  argv: readonly string[],
+  runtime: Readonly<{ home?: string }> = {},
+): CliRun {
   const out: string[] = [];
   const err: string[] = [];
-  const code = runRotateConversationKeyCli(argv, {
-    out: (line) => out.push(line),
-    err: (line) => err.push(line),
-  });
+  const code = runRotateConversationKeyCli(
+    argv,
+    {
+      out: (line) => out.push(line),
+      err: (line) => err.push(line),
+    },
+    runtime,
+  );
   const outText = out.join("\n");
   const errText = err.join("\n");
   return {
@@ -141,6 +153,7 @@ function credentialDocument(): string {
     tenant: TENANT,
     accountId: ACCOUNT,
     saasEnrollUrl: "https://saas.example/api/enroll",
+    saasPollUrl: "https://saas.example/api/poll",
   });
 }
 
@@ -179,9 +192,11 @@ function writeLock(ownerPid: number): string {
 describe("invocation", () => {
   it("prints usage on --help and states what it cannot prove", () => {
     const result = run("--help");
-    expect(result.code).toBe(ROTATE_CLI_EXIT_OK);
+    expect(result.code, result.err).toBe(ROTATE_CLI_EXIT_OK);
     expect(result.out).toContain("WHAT THIS COMMAND CANNOT DO");
     expect(result.out).toContain("cannot prove that no gateway is running");
+    expect(result.out).toContain("per-replica volumes are unsupported");
+    expect(result.out).toContain("Do not run this command once per volume");
     expect(result.out).toContain("--ignore-live-writers gives up");
   });
 
@@ -254,7 +269,7 @@ describe("dry run", () => {
 
     expect(result.code).toBe(ROTATE_CLI_EXIT_OK);
     expect(result.out).toContain(
-      "DRY RUN — no key is rotated, no key file is written",
+      "DRY RUN — no key is rotated (legacy migration may complete)",
     );
     expect(result.out).toContain("generation epoch=1");
     expect(result.out).toContain("Re-run with --apply to commit.");
@@ -286,8 +301,54 @@ describe("dry run", () => {
   it("refuses a tuple that has no stored state", () => {
     const result = run(...tupleArgs(), "--peer", "peer-0");
     expect(result.code).toBe(ROTATE_CLI_EXIT_FAILED);
-    expect(result.err).toContain("no conversation-key document");
+    expect(result.err).toContain("has no stored conversation key");
     expect(existsSync(paths().directory)).toBe(false);
+  });
+
+  it("refuses no-state apply without creating a lock directory", () => {
+    const result = run(...tupleArgs(), "--peer", "peer-0", "--apply");
+    expect(result.code).toBe(ROTATE_CLI_EXIT_FAILED);
+    expect(result.err).toContain("has no stored conversation key");
+    expect(existsSync(paths().directory)).toBe(false);
+  });
+
+  it("migrates valid legacy-only state before a dry-run preview", () => {
+    const legacy = legacyTuplePaths(ACCOUNT, storageRoot);
+    mkdirSync(legacy.directory, { recursive: true, mode: 0o700 });
+    writeFileSync(legacy.credentialPath, credentialDocument(), { mode: 0o600 });
+    const oldKey = Buffer.alloc(32, 0x31).toString("base64url");
+    writeFileSync(
+      legacy.conversationKeyPath,
+      JSON.stringify({ version: 1, keys: { "legacy-peer": oldKey } }),
+      { mode: 0o600 },
+    );
+    const destination = tupleStoragePaths({
+      tenant: TENANT,
+      accountId: ACCOUNT,
+      home: storageRoot,
+    });
+
+    const result = runWithRuntime(
+      [
+        "--tenant",
+        TENANT,
+        "--account",
+        ACCOUNT,
+        "--peer",
+        "legacy-peer",
+      ],
+      { home: storageRoot },
+    );
+
+    expect(result.code, result.err).toBe(ROTATE_CLI_EXIT_OK);
+    expect(result.out).toContain("DRY RUN");
+    expect(result.out).toContain("no generation label recorded");
+    expect(existsSync(destination.conversationKeyPath)).toBe(true);
+    expect(
+      (JSON.parse(readFileSync(destination.conversationKeyPath, "utf8")) as {
+        keys: Record<string, string>;
+      }).keys["legacy-peer"],
+    ).toBe(oldKey);
   });
 
   it("prints no key material or seed", () => {

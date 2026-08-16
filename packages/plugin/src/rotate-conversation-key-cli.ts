@@ -29,13 +29,11 @@
  * The CLI never holds a K to leak.
  */
 
-import { existsSync } from "node:fs";
-
 import {
-  ConversationKeyStore,
   type AccountRotationSummary,
   type PeerRotationSummary,
-} from "./conversation-key-store.js";
+  OfflineConversationKeyRotator,
+} from "./offline-conversation-key-rotation.js";
 import {
   acquireRotationLock,
   probeLiveTupleWriters,
@@ -62,10 +60,11 @@ USAGE
   ${ROTATE_CLI_COMMAND} --tenant <tenant> --account <accountId> --peer <peerId>
   ${ROTATE_CLI_COMMAND} --tenant <tenant> --account <accountId> --all-peers
 
-  Without --apply this is a DRY RUN: it rotates nothing and writes no key file.
-  That is the default on purpose — review the blast radius, then commit it. (A
-  dry run does complete the one-time pre-v2 storage migration if this tuple
-  still needs it, so that what you review is what would be rotated.)
+  Without --apply this is a DRY RUN: it rotates nothing. That is the default on
+  purpose — review the blast radius, then commit it. A dry run DOES complete the
+  one-time pre-v2 storage migration if this tuple still needs it; that migration
+  may move legacy files and publish their v2 destinations, but it does not
+  replace K. What you review is therefore exactly what apply would rotate.
 
 OPTIONS
   --tenant <tenant>       Exact tenant. Required. There is no default tenant.
@@ -74,7 +73,8 @@ OPTIONS
                           API: an unknown peerId is refused, never registered.
   --all-peers             Rotate EVERY peer of this account as one commit.
                           Never implied — you have to ask for it.
-  --apply                 Commit. Without it, nothing is written.
+  --apply                 Commit K replacement. Without it, no K is rotated;
+                          the one-time migration exception above still applies.
   --confirm-digest <hex>  Required with "--all-peers --apply": the target digest
                           printed by the matching dry run. If the peer set has
                           changed since you reviewed it, the digest no longer
@@ -85,6 +85,12 @@ OPTIONS
   --help, -h              Print this and exit.
 
 WHAT THIS COMMAND CANNOT DO
+  Rotation is supported only when this account has one local tuple store, or
+  when every replica uses the SAME authoritative tuple store. Independent
+  per-replica volumes are unsupported. Do not run this command once per volume:
+  each run generates a different K_new and leaves the replicas divergent. Stop
+  and escalate instead.
+
   It cannot prove that no gateway is running. It refuses if it can see another
   rotation in progress, or a process caught mid-write on this account's files.
   A gateway that is up but momentarily idle looks exactly like a stopped one:
@@ -142,6 +148,8 @@ const BOOLEAN_FLAGS = new Set([
 export function runRotateConversationKeyCli(
   argv: readonly string[],
   streams: RotateCliStreams,
+  /** @internal Test-only default-home seam for legacy migration coverage. */
+  runtime: Readonly<{ home?: string }> = {},
 ): number {
   const parsed = parseInvocation(argv);
   if (parsed.kind === "help") {
@@ -155,7 +163,7 @@ export function runRotateConversationKeyCli(
   }
 
   try {
-    return execute(parsed, streams);
+    return execute(parsed, streams, runtime);
   } catch (error) {
     streams.err(`${ROTATE_CLI_COMMAND}: ${describeError(error)}`);
     // Requirement: a failure ends here. This command starts nothing, has no
@@ -172,6 +180,7 @@ export function runRotateConversationKeyCli(
 function execute(
   invocation: Extract<ParsedInvocation, { kind: "run" }>,
   streams: RotateCliStreams,
+  runtime: Readonly<{ home?: string }>,
 ): number {
   const paths = tupleStoragePaths({
     tenant: invocation.tenant,
@@ -179,16 +188,8 @@ function execute(
     ...(invocation.storageRoot !== null
       ? { storageRoot: invocation.storageRoot }
       : {}),
+    ...(runtime.home !== undefined ? { home: runtime.home } : {}),
   });
-
-  // An explicit target that does not exist is an error, not an empty success.
-  // Creating state here would turn a typo into a new account directory.
-  if (!existsSync(paths.conversationKeyPath)) {
-    throw new Error(
-      `no conversation-key document for tenant "${invocation.tenant}" ` +
-        `account "${invocation.accountId}" at ${paths.conversationKeyPath}`,
-    );
-  }
 
   if (!invocation.ignoreLiveWriters) {
     const findings = probeLiveTupleWriters(paths.directory);
@@ -200,13 +201,19 @@ function execute(
     }
   }
 
-  const store = new ConversationKeyStore({
+  const rotator = new OfflineConversationKeyRotator({
     tenant: invocation.tenant,
     accountId: invocation.accountId,
     ...(invocation.storageRoot !== null
       ? { storageRoot: invocation.storageRoot }
       : {}),
+    ...(runtime.home !== undefined ? { home: runtime.home } : {}),
   });
+
+  // Migrate first, then refuse a missing explicit target BEFORE taking a lock.
+  // The lock lives inside the v2 tuple directory, so taking it first would turn
+  // a typo/no-state apply into a surprising empty directory.
+  if (invocation.apply) assertApplyTargetExists(invocation, rotator);
 
   streams.out(`${ROTATE_CLI_COMMAND}`);
   streams.out(`  tenant:    ${invocation.tenant}`);
@@ -214,18 +221,38 @@ function execute(
   streams.out(`  directory: ${paths.directory}`);
 
   return invocation.apply
-    ? applyRotation(invocation, store, paths.directory, streams)
-    : previewRotation(invocation, store, streams);
+    ? applyRotation(invocation, rotator, paths.directory, streams)
+    : previewRotation(invocation, rotator, streams);
+}
+
+function assertApplyTargetExists(
+  invocation: Extract<ParsedInvocation, { kind: "run" }>,
+  rotator: OfflineConversationKeyRotator,
+): void {
+  if (invocation.target.kind === "peer") {
+    if (!rotator.previewPeerRotation(invocation.target.peerId).present) {
+      throw new Error(
+        `peer "${invocation.target.peerId}" has no stored conversation key; ` +
+          `rotation is not a create API`,
+      );
+    }
+    return;
+  }
+  if (rotator.previewAccountRotation().peerCount === 0) {
+    throw new Error("this account has no stored conversation key to rotate");
+  }
 }
 
 function previewRotation(
   invocation: Extract<ParsedInvocation, { kind: "run" }>,
-  store: ConversationKeyStore,
+  rotator: OfflineConversationKeyRotator,
   streams: RotateCliStreams,
 ): number {
-  streams.out("  mode:      DRY RUN — no key is rotated, no key file is written");
+  streams.out(
+    "  mode:      DRY RUN — no key is rotated (legacy migration may complete)",
+  );
   if (invocation.target.kind === "peer") {
-    const preview = store.previewPeerRotation(invocation.target.peerId);
+    const preview = rotator.previewPeerRotation(invocation.target.peerId);
     streams.out(`  target:    peer ${preview.peerId}`);
     if (!preview.present) {
       throw new Error(
@@ -250,7 +277,7 @@ function previewRotation(
     return ROTATE_CLI_EXIT_OK;
   }
 
-  const preview = store.previewAccountRotation();
+  const preview = rotator.previewAccountRotation();
   streams.out("  target:    ALL peers in this account");
   if (preview.peerCount === 0) {
     throw new Error("this account has no stored conversation key to rotate");
@@ -270,7 +297,7 @@ function previewRotation(
 
 function applyRotation(
   invocation: Extract<ParsedInvocation, { kind: "run" }>,
-  store: ConversationKeyStore,
+  rotator: OfflineConversationKeyRotator,
   directory: string,
   streams: RotateCliStreams,
 ): number {
@@ -282,11 +309,11 @@ function applyRotation(
   try {
     if (invocation.target.kind === "peer") {
       streams.out(`  target:    peer ${invocation.target.peerId}`);
-      summary = store.rotatePeerVerified(invocation.target.peerId);
+      summary = rotator.rotatePeerVerified(invocation.target.peerId);
     } else {
       // Confirm the reviewed set INSIDE the lock, so the window between the
       // check and the commit contains no other rotation.
-      const preview = store.previewAccountRotation();
+      const preview = rotator.previewAccountRotation();
       if (preview.targetDigest !== invocation.confirmDigest) {
         throw new Error(
           `--confirm-digest does not match this account's current target set ` +
@@ -295,7 +322,7 @@ function applyRotation(
         );
       }
       streams.out(`  target:    ALL peers in this account`);
-      const accountSummary = store.rotateAccountVerified();
+      const accountSummary = rotator.rotateAccountVerified();
       if (accountSummary.targetDigest !== invocation.confirmDigest) {
         // The set changed between the confirmed preview and the commit, i.e.
         // something else wrote to this tuple while the lock was held. The

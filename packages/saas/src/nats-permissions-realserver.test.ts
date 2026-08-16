@@ -42,8 +42,6 @@ import { delimiter, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
 import {
-  createAccount,
-  createOperator,
   createUser,
   fromPublic,
   fromSeed,
@@ -51,12 +49,13 @@ import {
 import {
   decode,
   encodeAccount,
-  encodeOperator,
   encodeUser,
   parseCreds,
+  type Account,
 } from "@nats-io/jwt";
 
 import { setupTrustChain } from "./setup-trust-chain.js";
+import { addRevocation } from "./account-revocation.js";
 import {
   prepareFullResolverNatsConfig,
   renderFullResolverNatsConfig,
@@ -274,7 +273,7 @@ async function requestWithJwt(
     let protocol = "";
     const timeout = setTimeout(() => {
       cleanup();
-      reject(new Error("CLAIMS.UPDATE request timed out without a reply"));
+      reject(new Error("claims request timed out without a reply"));
     }, 4000);
 
     const cleanup = () => {
@@ -297,7 +296,7 @@ async function requestWithJwt(
       const size = Number(protocol.slice(headerStart + marker.length, headerEnd));
       if (!Number.isInteger(size) || size < 0) {
         cleanup();
-        reject(new Error("CLAIMS.UPDATE reply has an invalid NATS MSG size"));
+        reject(new Error("claims reply has an invalid NATS MSG size"));
         return;
       }
       const bodyStart = headerEnd + 2;
@@ -654,54 +653,69 @@ describe.skipIf(!NATS_SERVER_BIN)(
       expect(trustChain!.natsConfig.accountJwt).toBeTruthy();
     });
 
-    it("accepts an operator-signed account JWT over $SYS.REQ.CLAIMS.UPDATE", async () => {
+    it("updates and reads back two sequential revocation floors with the generated credential", async () => {
       const chain = trustChain!;
       const operatorSeed = chain.private.operatorSeed;
       const systemCredentials = chain.private.systemAccountCredentials;
       expect(operatorSeed).toMatch(/^SO/);
       expect(systemCredentials).toBeTruthy();
-
-      // Ensure the replacement claim has a later `iat`, as a real control-plane
-      // update would. The payload change is deliberately non-revocation scope.
-      const original = decode(chain.natsConfig.accountJwt);
-      while (Math.floor(Date.now() / 1000) <= original.iat) {
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-      const updatedAccountJwt = await encodeAccount(
-        "test-account",
-        fromPublic(chain.natsConfig.accountPublicKey),
-        {
-          description: "runtime resolver update acceptance probe",
-          limits: {
-            conn: -1,
-            subs: -1,
-            data: -1,
-            payload: -1,
-            imports: -1,
-            exports: -1,
-            wildcards: true,
-            leaf: -1,
-          },
-        },
-        { signer: fromSeed(new TextEncoder().encode(operatorSeed!)) },
-      );
-      expect(updatedAccountJwt).not.toBe(chain.natsConfig.accountJwt);
-
       const credentials = await parseCreds(new TextEncoder().encode(systemCredentials!));
-      const rawReply = await requestWithJwt(
+      const lookupSubject =
+        `$SYS.REQ.ACCOUNT.${chain.natsConfig.accountPublicKey}.CLAIMS.LOOKUP`;
+      const firstUser = createUser().getPublicKey();
+      const secondUser = createUser().getPublicKey();
+      const firstFloor = 1_700_000_001;
+      const secondFloor = 1_700_000_002;
+
+      // Load the resolver's accepted claim before every mutation. Starting a
+      // later incident from natsConfig.accountJwt would erase earlier floors.
+      let acceptedJwt = await requestWithJwt(
         credentials.jwt,
         credentials.key,
-        "$SYS.REQ.CLAIMS.UPDATE",
-        updatedAccountJwt,
+        lookupSubject,
+        "",
       );
-      const reply = JSON.parse(rawReply) as {
-        data?: { account?: string; code?: number; message?: string };
-      };
-      expect(reply.data).toMatchObject({
-        account: chain.natsConfig.accountPublicKey,
-        code: 200,
-        message: expect.stringMatching(/updated/i),
-      });
+      expect(decode(acceptedJwt).sub).toBe(chain.natsConfig.accountPublicKey);
+
+      for (const [userPubkey, floor] of [
+        [firstUser, firstFloor],
+        [secondUser, secondFloor],
+      ] as const) {
+        while (Math.floor(Date.now() / 1000) <= decode(acceptedJwt).iat) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        const candidate = await addRevocation(
+          acceptedJwt,
+          operatorSeed!,
+          userPubkey,
+          floor,
+        );
+        const rawReply = await requestWithJwt(
+          credentials.jwt,
+          credentials.key,
+          "$SYS.REQ.CLAIMS.UPDATE",
+          candidate,
+        );
+        const reply = JSON.parse(rawReply) as {
+          data?: { account?: string; code?: number; message?: string };
+        };
+        expect(reply.data).toMatchObject({
+          account: chain.natsConfig.accountPublicKey,
+          code: 200,
+          message: expect.stringMatching(/updated/i),
+        });
+        acceptedJwt = await requestWithJwt(
+          credentials.jwt,
+          credentials.key,
+          lookupSubject,
+          "",
+        );
+        expect(acceptedJwt).toBe(candidate);
+      }
+
+      const acceptedRevocations = decode<Account>(acceptedJwt).nats.revocations;
+      expect(acceptedRevocations?.[firstUser]).toBe(firstFloor);
+      expect(acceptedRevocations?.[secondUser]).toBe(secondFloor);
     });
 
     it("preserves an accepted account claim across config regeneration and restart", async () => {
@@ -732,52 +746,33 @@ describe.skipIf(!NATS_SERVER_BIN)(
       expect(statSync(ephemeralFirst.ephemeralRoot!).mode & 0o777).toBe(0o700);
       expect(statSync(ephemeralSecond.ephemeralRoot!).mode & 0o777).toBe(0o700);
 
-      // This isolated chain deliberately grants lookup only to the test probe.
-      // Production's temporary global-update credential remains unchanged; the
-      // final scoped publisher and rotation protocol belong to the next phase.
-      const operatorKp = createOperator();
-      const accountKp = createAccount();
-      const systemAccountKp = createAccount();
-      const systemUserKp = createUser();
-      const accountPublicKey = accountKp.getPublicKey();
-      const systemAccountPublicKey = systemAccountKp.getPublicKey();
-      const accountLimits = {
-        conn: -1,
-        subs: -1,
-        data: -1,
-        payload: -1,
-        imports: -1,
-        exports: -1,
-        wildcards: true,
-        leaf: -1,
-      };
-      const operatorJwt = await encodeOperator("restart-probe-operator", operatorKp, {
-        system_account: systemAccountPublicKey,
+      // Exercise the actual generated credential, including its exact-account
+      // lookup permission. No broader test-only system user is minted here.
+      const restartChain = await setupTrustChain({
+        operatorName: "restart-probe-operator",
+        accountName: "restart-probe-account",
+        returnOperatorSeed: true,
       });
-      const originalAccountJwt = await encodeAccount(
-        "restart-probe-account",
-        accountKp,
-        { limits: accountLimits },
-        { signer: operatorKp },
-      );
-      const systemAccountJwt = await encodeAccount(
-        "restart-probe-system-account",
-        systemAccountKp,
-        { limits: accountLimits },
-        { signer: operatorKp },
-      );
+      const accountPublicKey = restartChain.natsConfig.accountPublicKey;
+      const systemAccountPublicKey =
+        restartChain.natsConfig.systemAccountPublicKey;
+      const operatorJwt = restartChain.natsConfig.operatorJwt;
+      const originalAccountJwt = restartChain.natsConfig.accountJwt;
+      const systemAccountJwt =
+        restartChain.natsConfig.resolverConfig[systemAccountPublicKey] as string;
       const lookupSubject =
         `$SYS.REQ.ACCOUNT.${accountPublicKey}.CLAIMS.LOOKUP`;
-      const systemUserJwt = await encodeUser(
-        "restart-probe-system-user",
-        systemUserKp,
-        systemAccountKp,
-        {
-          pub: { allow: ["$SYS.REQ.CLAIMS.UPDATE", lookupSubject] },
-          sub: { allow: ["_INBOX.>"] },
-        },
+      const generatedSystemCredentials = await parseCreds(
+        new TextEncoder().encode(
+          restartChain.private.systemAccountCredentials as string,
+        ),
       );
-      const systemUserSeed = new TextDecoder().decode(systemUserKp.getSeed());
+      const systemUserJwt = generatedSystemCredentials.jwt;
+      const systemUserSeed = generatedSystemCredentials.key;
+      const operatorKp = fromSeed(
+        new TextEncoder().encode(restartChain.private.operatorSeed as string),
+      );
+      const accountLimits = decode<Account>(originalAccountJwt).nats.limits;
       const operatorJwtPath = join(configDir, "operator.jwt");
       writeFileSync(operatorJwtPath, operatorJwt);
       const resolverConfig = {

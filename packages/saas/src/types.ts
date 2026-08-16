@@ -48,8 +48,9 @@ export type SaasTrustChainPrivate = {
 
   /**
    * NATS `.creds` contents for the narrowly-scoped system-account user that
-   * may publish account JWTs to `$SYS.REQ.CLAIMS.UPDATE` and receive the
-   * request reply on `_INBOX.>`. Present only in self-contained mode.
+   * may publish account JWTs to `$SYS.REQ.CLAIMS.UPDATE`, read back only this
+   * chain's exact `$SYS.REQ.ACCOUNT.<account>.CLAIMS.LOOKUP` subject, and
+   * receive request replies on `_INBOX.>`. Present only in self-contained mode.
    *
    * This contains a user NKEY seed. Treat it as a high-value secret: persist
    * it only in an owner-readable store, never log it, and never publish it as

@@ -78,12 +78,15 @@ Answer this first. The rest of the document branches on it.
 | | How to tell | Go to |
 |---|---|---|
 | **A — Managed NATS** | Your trust chain was built with `externalNatsAccount` (Synadia Cloud / NGS). `natsConfig.mode === "external"`; there is no operator JWT, no account JWT and no resolver config in your persisted chain. | [§3](#3-class-a--managed-nats) |
-| **B — Self-contained, revocation available** | You run your own `nats-server` from this repo's generated config, **and** you hold the operator seed (`private.operatorSeed`, `SO…`) **and** you can apply a new account JWT to the resolver (system-account `.creds` for a full/Dir resolver, or write access to the `resolver_preload` config for MEMORY). | [§4](#4-class-b--self-contained-stop-first-containment) |
-| **C — No working revocation channel** | Self-contained but you cannot apply a replacement account JWT right now (no system-account credentials, resolver unreachable/unhealthy, config not writable), or managed but you cannot reach the provider's revocation control in time. | [§5](#5-class-c--degraded-containment) |
+| **B — Self-contained, revocation available** | You run your own `nats-server` from this repo's generated config, **and** you hold the operator seed (`private.operatorSeed`, `SO…`) **and** you can fetch the currently accepted exact account JWT, apply its replacement, and verify acceptance. For a full/Dir resolver, the generated system-account `.creds` must allow this account's exact `CLAIMS.LOOKUP`; for MEMORY, you need write access to the live `resolver_preload` source. | [§4](#4-class-b--self-contained-stop-first-containment) |
+| **C — No working revocation channel** | Self-contained but you cannot fetch, apply, and verify a replacement account JWT right now (missing/old system credential without exact lookup, resolver unreachable/unhealthy, config not writable), or managed but you cannot reach the provider's revocation control in time. | [§5](#5-class-c--degraded-containment) |
 | **D — `static` / bring-your-own NATS** | You configured the plugin with NATS credentials it did not mint (`nats.credentials.mode: "static"`, `credsFile`, `WEBCHANNEL_NATS_CREDS`, …). | **This is not a running state.** Static/BYO **serving** was removed in P0-2: any static credential signal is rejected at account resolution with a targeted error, so such a deployment does not start. If you are here anyway, you are in class A or C — this package cannot revoke a credential it did not mint, so revocation belongs to whoever operates that NATS, and K rotation (§4 ①, ④–⑥) still applies unchanged. Return of the mode is tracked as P0-3 (see `packages/plugin/README.md`, "Bring-your-own NATS"). |
 
-> **Class B needs both halves.** Holding the operator seed without a way to
-> apply the re-signed account JWT gets you a candidate JWT and no revocation.
+> **Class B needs the complete channel.** Holding the operator seed without a
+> way to fetch the accepted claim and apply its replacement gets you either a
+> stale candidate or no revocation. A system credential created before exact
+> `CLAIMS.LOOKUP` was added is not a working verified channel: replace it through
+> your trust-chain procedure or treat the deployment as class C.
 > `addRevocation` **only builds a candidate**; nothing is revoked until the
 > resolver has accepted it and you have read it back (step ③).
 
@@ -166,6 +169,14 @@ controller and replica serving the affected account, then confirm the observed
 count is zero and stays zero. Do not proceed on a request you sent; proceed on a
 count you observed.
 
+Before rotating, also establish the storage topology. Rotation is supported only
+for either one gateway instance with one local tuple store, or multiple replicas
+that all use the **same authoritative tuple store** for this account. Independent
+per-replica volumes are unsupported. Do not run the command separately on each
+volume: every run generates a different K_new and silently leaves the replicas
+divergent. If the replicas do not share the tuple store, keep them stopped and
+escalate; step ④ has no supported procedure for that topology.
+
 **Why this is first, and why it is a human discipline.** A revocation floor is a
 lower bound in time, not an eviction. If a gateway is alive when you revoke,
 a credential minted for a *new* public key after the floor is still valid, and
@@ -206,28 +217,65 @@ Decide the target first:
   `issueBrowserCredentials` mints the browser from the same account seed). That
   is what step ④-bis is for. Review this blast radius before you use it.
 
-Fix one `floorSec` now and use that same value for the rest of the operation. Do
-not re-derive it later:
+First obtain the exact account JWT that the resolver accepts **now**. The
+persisted bootstrap value at `chain.natsConfig.accountJwt` does not advance when
+a full/Dir resolver accepts an update. Starting a later incident from that value
+can publish a newer-`iat` claim that omits and therefore erases earlier
+revocation floors.
+
+For a full/Dir resolver, write the generated credential to `sys.creds`, then use
+its exact-account lookup permission. `--raw` and redirection are load-bearing:
+the JWT goes to an owner-only file, not terminal scrollback.
+
+```bash
+umask 077
+# sys.creds <- chain.private.systemAccountCredentials
+nats --server "$NATS_URL" --creds ./sys.creds request --raw \
+  "\$SYS.REQ.ACCOUNT.$ACCOUNT_PUBLIC_KEY.CLAIMS.LOOKUP" "" \
+  > ./current-account.jwt
+chmod 0600 ./current-account.jwt
+```
+
+For a MEMORY resolver, copy the exact current JWT from the source used by the
+**live** `resolver_preload` entry for `$ACCOUNT_PUBLIC_KEY` into the same
+owner-only `current-account.jwt` file. Do not use the persisted trust-chain
+bootstrap copy, an old generated config, or a different replica's stale config.
+If you cannot identify one authoritative live preload source, you do not have a
+working verified revocation channel; use class C.
+
+Now fix one `floorSec` and build the candidate from that fetched JWT. Do not
+re-derive the floor later:
 
 ```js
+import { readFileSync, writeFileSync } from "node:fs";
+import { decode } from "@nats-io/jwt";
 import { addRevocation } from "@mir-stream/webchannel-saas";
 
+const currentAccountJwt = readFileSync("./current-account.jwt", "utf8").trim();
+const currentClaim = decode(currentAccountJwt);
+if (currentClaim.sub !== chain.natsConfig.accountPublicKey) {
+  throw new Error("resolver returned a different account claim");
+}
 const floorSec = Math.floor(Date.now() / 1000);   // UNIX SECONDS. See §6.1.
 const updatedAccountJwt = await addRevocation(
-  chain.natsConfig.accountJwt,   // current account JWT
+  currentAccountJwt,             // resolver/preload's CURRENT accepted JWT
   chain.private.operatorSeed,    // 'SO…' — the operator seed, NOT the account seed 'SA…'
   userPubkey,                    // 'U…' exact key, or '*'
   floorSec,
 );
+writeFileSync("./updated-account.jwt", updatedAccountJwt, { mode: 0o600 });
 ```
 
 Notes that will bite you otherwise:
 
 - `operatorSeed` must be the seed whose public key **exactly equals** the current
   account JWT's `iss`. Passing the account seed (`SA…`) is the classic footgun
-  and is rejected outright.
+  and is rejected outright; `addRevocation` also rejects a different/stale
+  operator issuer.
 - The floor is `max(existingFloor, requestedAt)`: an older request never lowers
-  an existing floor.
+  an existing floor. That preservation applies only to floors present in
+  `currentAccountJwt`, which is why the accepted-claim fetch above is mandatory
+  on every incident.
 - NATS applies the floor **inclusively** — a credential is refused when
   `floorSec >= credential.iat`. Any replacement credential must therefore have
   an `iat` **strictly greater** than `floorSec`. If it lands in the same second,
@@ -243,7 +291,8 @@ against `nats-server` v2.14.
 
 **Full/Dir resolver.** Publish the updated account JWT with the narrowly-scoped
 system-account credentials from `chain.private.systemAccountCredentials` (that
-user is allowed exactly `$SYS.REQ.CLAIMS.UPDATE` and `_INBOX.>`):
+user may publish `$SYS.REQ.CLAIMS.UPDATE`, this account's exact
+`$SYS.REQ.ACCOUNT.<account>.CLAIMS.LOOKUP`, and subscribe to `_INBOX.>`):
 
 ```bash
 # Write both to owner-only files first, and delete them when you are done:
@@ -259,20 +308,25 @@ A successful reply carries `data.account` equal to your account public key,
 anything else — including no reply — as a failed publish, and **do not report
 the revocation as done**.
 
-Then read it back, from the server, and check the stored claim really contains
-your floor:
+Then read it back from the server into another owner-only file and check the
+stored claim really contains your floor:
 
 ```bash
-nats --server "$NATS_URL" --creds ./sys.creds \
-  request "\$SYS.REQ.ACCOUNT.$ACCOUNT_PUBLIC_KEY.CLAIMS.LOOKUP" ""
+nats --server "$NATS_URL" --creds ./sys.creds request --raw \
+  "\$SYS.REQ.ACCOUNT.$ACCOUNT_PUBLIC_KEY.CLAIMS.LOOKUP" "" \
+  > ./accepted-account.jwt
+chmod 0600 ./accepted-account.jwt
 ```
 
 Decode the returned JWT and confirm `nats.revocations` contains your target key
 (or `"*"`) with exactly the `floorSec` you fixed in step ②. Do not decode it
-into a shared log.
+into a shared log. Also confirm its `sub` is `$ACCOUNT_PUBLIC_KEY`. Keep this
+accepted value as the input to any immediately following revocation; do not
+start again from `chain.natsConfig.accountJwt`. Remove the temporary JWT and
+`.creds` files when the incident procedure is complete.
 
-**MEMORY resolver.** Rewrite the account JWT that `resolver_preload` references,
-then reload:
+**MEMORY resolver.** Replace the same authoritative live `resolver_preload`
+source from which you copied `current-account.jwt`, then reload:
 
 ```bash
 nats-server --signal reload=<pid>      # or: kill -HUP <pid>
@@ -294,26 +348,47 @@ disconnect a session that the floor does not catch, that session survives (§6.3
 
 ### ④ Rotate K with the offline command
 
-Only after ① is observed and ③ is confirmed. The command ships as a `bin` of the
-installed plugin package. It is deliberately a separate process: it can neither
-open a NATS transport nor install a register subscription, and nothing inside a
-running gateway can invoke it.
+Only after ① is observed and ③ is confirmed. ClawHub installs the plugin as a
+managed artifact; it does **not** put the package's npm `bin` on your shell PATH,
+and there is no npm package named `openclaw-webchannel-rotate-key`. Resolve the
+installed artifact through OpenClaw's inspection API and run its dedicated entry
+with Node:
+
+```bash
+PLUGIN_ROOT="$(
+  openclaw plugins inspect webchannel --json |
+  node --input-type=module -e '
+    import { isAbsolute } from "node:path";
+    const chunks = [];
+    for await (const chunk of process.stdin) chunks.push(chunk);
+    const root = JSON.parse(chunks.join("")).plugin?.rootDir;
+    if (typeof root !== "string" || !isAbsolute(root)) process.exit(2);
+    process.stdout.write(root);
+  '
+)"
+test -f "$PLUGIN_ROOT/dist/rotate-key-entry.js"
+```
+
+The entry is deliberately a separate process: it can neither open a NATS
+transport nor install a register subscription, and its offline account-wide
+mutation module is absent from the running gateway's bundle. If inspection or
+the file check fails, stop; do not substitute `npx` or a source-tree path.
 
 **Dry run first — it is the default.** Nothing is rotated without `--apply`.
 
 One peer:
 
 ```bash
-npx openclaw-webchannel-rotate-key --tenant <tenant> --account <accountId> --peer <peerId>
-npx openclaw-webchannel-rotate-key --tenant <tenant> --account <accountId> --peer <peerId> --apply
+node "$PLUGIN_ROOT/dist/rotate-key-entry.js" --tenant <tenant> --account <accountId> --peer <peerId>
+node "$PLUGIN_ROOT/dist/rotate-key-entry.js" --tenant <tenant> --account <accountId> --peer <peerId> --apply
 ```
 
 The whole account (only when you cannot bound the exposure to specific peers):
 
 ```bash
-npx openclaw-webchannel-rotate-key --tenant <tenant> --account <accountId> --all-peers
+node "$PLUGIN_ROOT/dist/rotate-key-entry.js" --tenant <tenant> --account <accountId> --all-peers
 # review the peer count and the target digest it prints, then:
-npx openclaw-webchannel-rotate-key --tenant <tenant> --account <accountId> --all-peers \
+node "$PLUGIN_ROOT/dist/rotate-key-entry.js" --tenant <tenant> --account <accountId> --all-peers \
   --apply --confirm-digest <digest-from-the-dry-run>
 ```
 
@@ -324,8 +399,9 @@ npx openclaw-webchannel-rotate-key --tenant <tenant> --account <accountId> --all
   requires that digest back, so a set that changed since you reviewed it is
   refused instead of silently re-keyed.
 - The command verifies its own write by reading both documents back from disk
-  before it reports success. If it fails, it fails — it starts nothing and has no
-  fallback path. Re-run after fixing the cause, or escalate.
+  in full (all keys and all generation-sidecar entries, including cardinality)
+  before it reports success. If it fails, it fails — it starts nothing and has
+  no fallback path. Re-run after fixing the cause, or escalate.
 - `--storage-root` only if your deployment moved the v2 storage root. The dry run
   prints the tuple directory it resolved, which is also how you find
   `<v2_namespace>` for step ④-bis.
@@ -407,8 +483,10 @@ actually did for #54. It trades availability for containment, deliberately.
 4. **Then** restore the revocation channel — recover the system-account
    credentials or resolver access — or plan a full trust-chain replacement. Only
    after that can you run §4 ②–③.
-5. If K also leaked, you may rotate it now: step ① is already satisfied by 2, and
-   step ④ does not need a relay. Keep the account disabled until §4 ②–③ complete.
+5. If K also leaked, you may rotate it now only after confirming the supported
+   shared/single-store topology in §4 ①: the stop condition is already satisfied
+   by 2, and step ④ does not need a relay. Keep the account disabled until
+   §4 ②–③ complete.
 6. Keep every affected account disabled until containment is finished. Deleting
    the old configuration, restarting only some replicas, or waiting for token
    expiry is **not** revocation.
@@ -471,15 +549,38 @@ instruction is wrong, not your deployment.
 
 ## 7. Recovering from a fail-closed account-startup error
 
-<!-- PENDING — lane 1 (#159). This section covers the fail-closed error raised
-     when a stored document's `version` is higher than the running plugin
-     supports (i.e. the plugin was rolled back), which makes the account fail
-     closed at startup instead of being quarantined. The exact error text and
-     the operator recovery steps come from #159's PR body and will be filled in
-     here before this runbook merges. Do not invent them. -->
+After a plugin rollback, an account can fail to start because the installed
+build cannot safely interpret a document written by the newer build. The
+sanitized error begins with either `webchannel conversation-keys
+version-too-new` or `webchannel conversation-key-generations version-too-new`,
+followed by this remediation:
 
-*(To be filled in from lane 1 / issue #159 — see the comment in the source of
-this section.)*
+> this file was written by a NEWER webchannel release than this build supports,
+> so this is a version downgrade, not corruption. The file was left unchanged.
+> Run the plugin version that wrote it (or newer), or restore this account's
+> state from your own backup before downgrading
+
+The important fact is **the file was left unchanged**. Do not treat it as
+corruption and do not run a quarantine/delete procedure.
+
+1. Preferred recovery: undo the rollback and run the version that wrote the
+   document, or a newer compatible version. This preserves both K and its audit
+   labels.
+2. If only `conversation-key-generations.json` is too new and forward recovery
+   is impossible, stop every replica for the account and move that sidecar to an
+   operator-chosen owner-only backup outside the live tuple. This deliberately
+   loses the generation audit labels; it does not rotate K. This is a narrow
+   recovery exception, not a normal sidecar reset procedure.
+3. **Never move, delete, quarantine, or recreate `conversation-keys.json` to get
+   past this error.** That document is the live K authority. Removing it strands
+   existing browsers and can mint unrelated fresh keys on later registration.
+4. If downgrade is mandatory and the key document itself is too new, restore a
+   complete, operator-owned, version-compatible snapshot of the tuple while all
+   replicas are stopped. The snapshot must be from after the latest successful
+   containment/K rotation; §6.4 still forbids restoring a pre-rotation forensic
+   backup because that reactivates K_old. If no such compatible snapshot exists,
+   keep the account stopped and escalate. There is no safe partial reconstruction
+   procedure.
 
 ---
 

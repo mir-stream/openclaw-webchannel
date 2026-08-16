@@ -13,10 +13,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ConversationKeyGenerationCapacityError,
-  ConversationKeyReadbackError,
   ConversationKeyStore,
   type ConversationKeyStoreOptions,
 } from "./conversation-key-store.js";
+import {
+  ConversationKeyReadbackError,
+  OfflineConversationKeyRotator,
+} from "./offline-conversation-key-rotation.js";
 import {
   parseConversationKeyGenerationsDocument,
   serializeConversationKeyGenerationsDocument,
@@ -25,7 +28,7 @@ import {
 import { tupleStoragePaths } from "./storage-paths.js";
 
 /**
- * #158 — the offline operator rotation surface on `ConversationKeyStore`.
+ * #158 — the physically separate offline operator rotation surface.
  *
  * The load-bearing test in this file is the COMMIT COUNT one. An account-wide
  * rotation implemented as a `rotate(peerId)` loop rewrites both whole documents
@@ -59,6 +62,18 @@ function createStore(
   options: Partial<ConversationKeyStoreOptions> = {},
 ): ConversationKeyStore {
   return new ConversationKeyStore({
+    tenant: TENANT,
+    accountId: ACCOUNT,
+    home,
+    _nowSec: () => NOW_SEC,
+    ...options,
+  });
+}
+
+function createRotator(
+  options: Partial<ConversationKeyStoreOptions> = {},
+): OfflineConversationKeyRotator {
+  return new OfflineConversationKeyRotator({
     tenant: TENANT,
     accountId: ACCOUNT,
     home,
@@ -124,9 +139,9 @@ describe("account-wide rotation commit count", () => {
     it(`writes each document exactly once for ${peerCount} peers`, () => {
       seedPeers(peerCount);
       const counter = writeCounter();
-      const store = createStore(counter.seams);
+      const rotator = createRotator(counter.seams);
 
-      const summary = store.rotateAccountVerified();
+      const summary = rotator.rotateAccountVerified();
 
       expect(summary.peerCount).toBe(peerCount);
       expect(counter.keyWrites).toBe(1);
@@ -143,7 +158,7 @@ describe("account-wide rotation commit count", () => {
       home = mkdtempSync(join(tmpdir(), "webchannel-account-rotation-"));
       seedPeers(peerCount);
       const counter = writeCounter();
-      createStore(counter.seams).rotateAccountVerified();
+      createRotator(counter.seams).rotateAccountVerified();
       counts.push(counter.keyWrites + counter.generationWrites);
     }
     expect(counts[0]).toBe(counts[1]);
@@ -152,7 +167,7 @@ describe("account-wide rotation commit count", () => {
 
   it("leaves no unpublished temp artifacts behind", () => {
     seedPeers(8);
-    createStore().rotateAccountVerified();
+    createRotator().rotateAccountVerified();
     const residue = readdirSync(paths().directory).filter((entry) =>
       entry.includes(".tmp-"),
     );
@@ -165,7 +180,7 @@ describe("account-wide rotation semantics", () => {
     const peerIds = seedPeers(5);
     const before = { ...durableKeys() };
 
-    createStore().rotateAccountVerified();
+    createRotator().rotateAccountVerified();
 
     const after = durableKeys();
     expect(Object.keys(after).sort()).toEqual([...peerIds].sort());
@@ -187,7 +202,7 @@ describe("account-wide rotation semantics", () => {
     ]);
     writeGenerationsDocument(seeded);
 
-    createStore().rotateAccountVerified();
+    createRotator().rotateAccountVerified();
 
     const generations = durableGenerations();
     expect(generations.get(peerIds[0] as string)?.epoch).toBe(8);
@@ -198,14 +213,13 @@ describe("account-wide rotation semantics", () => {
     }
   });
 
-  it("publishes the new keys to the in-process cache", () => {
+  it("makes a freshly opened store observe the committed keys", () => {
     const peerIds = seedPeers(2);
-    const store = createStore();
-    const before = store.get(peerIds[0] as string);
+    const before = createStore().get(peerIds[0] as string);
 
-    store.rotateAccountVerified();
+    createRotator().rotateAccountVerified();
 
-    const after = store.get(peerIds[0] as string);
+    const after = createStore().get(peerIds[0] as string);
     expect(after).not.toBeNull();
     expect(Buffer.from(after as Uint8Array)).not.toEqual(
       Buffer.from(before as Uint8Array),
@@ -216,8 +230,8 @@ describe("account-wide rotation semantics", () => {
   });
 
   it("refuses an account with no stored key instead of creating one", () => {
-    const store = createStore();
-    expect(() => store.rotateAccountVerified()).toThrow(/no target/);
+    const rotator = createRotator();
+    expect(() => rotator.rotateAccountVerified()).toThrow(/no target/);
     expect(existsSync(paths().conversationKeyPath)).toBe(false);
   });
 
@@ -225,8 +239,8 @@ describe("account-wide rotation semantics", () => {
     const peerIds = seedPeers(3);
     const before = { ...durableKeys() };
 
-    const store = createStore({ maxKeys: 2 });
-    expect(() => store.rotateAccountVerified()).toThrow(
+    const rotator = createRotator({ maxKeys: 2 });
+    expect(() => rotator.rotateAccountVerified()).toThrow(
       ConversationKeyGenerationCapacityError,
     );
 
@@ -236,7 +250,7 @@ describe("account-wide rotation semantics", () => {
 
   it("returns no key material to the caller", () => {
     seedPeers(2);
-    const summary = createStore().rotateAccountVerified() as Record<
+    const summary = createRotator().rotateAccountVerified() as Record<
       string,
       unknown
     >;
@@ -251,21 +265,21 @@ describe("account-wide rotation semantics", () => {
 describe("readback verification", () => {
   it("fails when the committed documents cannot be re-read", () => {
     seedPeers(2);
-    const store = createStore({
-      // Runs after both documents are committed and before the cache publish,
+    const rotator = createRotator({
+      // Runs after both documents are committed and before readback,
       // so this simulates the sidecar disappearing under a successful write.
       _beforeCachePublish: () => {
         unlinkSync(paths().conversationKeyGenerationsPath);
       },
     });
-    expect(() => store.rotateAccountVerified()).toThrow(
+    expect(() => rotator.rotateAccountVerified()).toThrow(
       ConversationKeyReadbackError,
     );
   });
 
   it("fails when disk no longer holds what was committed", () => {
     const peerIds = seedPeers(2);
-    const store = createStore({
+    const rotator = createRotator({
       _beforeCachePublish: () => {
         // A foreign writer replaces the sidecar with a stale-but-valid one.
         writeGenerationsDocument(
@@ -278,7 +292,7 @@ describe("readback verification", () => {
         );
       },
     });
-    expect(() => store.rotateAccountVerified()).toThrow(
+    expect(() => rotator.rotateAccountVerified()).toThrow(
       /generation label did not match/,
     );
   });
@@ -287,7 +301,7 @@ describe("readback verification", () => {
     const peerIds = seedPeers(3);
     const before = { ...durableKeys() };
 
-    const summary = createStore().rotatePeerVerified(peerIds[1] as string);
+    const summary = createRotator().rotatePeerVerified(peerIds[1] as string);
 
     expect(Object.keys(summary).sort()).toEqual([
       "epoch",
@@ -301,9 +315,66 @@ describe("readback verification", () => {
     expect(after[peerIds[2] as string]).toBe(before[peerIds[2] as string]);
   });
 
+  it("rejects a same-cardinality non-target key mutation after peer commit", () => {
+    const peerIds = seedPeers(3);
+    const rotator = createRotator({
+      _beforeCachePublish: () => {
+        const document = JSON.parse(
+          readFileSync(paths().conversationKeyPath, "utf8"),
+        ) as { keys: Record<string, string> };
+        document.keys[peerIds[0] as string] = Buffer.alloc(32, 0x5a).toString(
+          "base64url",
+        );
+        writeFileSync(paths().conversationKeyPath, JSON.stringify(document), {
+          mode: 0o600,
+        });
+      },
+    });
+
+    expect(() => rotator.rotatePeerVerified(peerIds[1] as string)).toThrow(
+      /key material did not match/,
+    );
+  });
+
+  it("rejects a same-cardinality non-target sidecar mutation after peer commit", () => {
+    const peerIds = seedPeers(3);
+    const rotator = createRotator({
+      _beforeCachePublish: () => {
+        const generations = durableGenerations();
+        generations.set(peerIds[0] as string, {
+          epoch: 99,
+          rotatedAtSec: 1_600_000_000,
+        });
+        writeGenerationsDocument(generations);
+      },
+    });
+
+    expect(() => rotator.rotatePeerVerified(peerIds[1] as string)).toThrow(
+      /generation label did not match/,
+    );
+  });
+
+  it("rejects generation sidecar cardinality changes after peer commit", () => {
+    const peerIds = seedPeers(2);
+    const rotator = createRotator({
+      _beforeCachePublish: () => {
+        const generations = durableGenerations();
+        generations.set("foreign-entry", {
+          epoch: 1,
+          rotatedAtSec: 1_600_000_000,
+        });
+        writeGenerationsDocument(generations);
+      },
+    });
+
+    expect(() => rotator.rotatePeerVerified(peerIds[1] as string)).toThrow(
+      /sidecar cardinality changed/,
+    );
+  });
+
   it("refuses a per-peer rotation of an unknown peer", () => {
     seedPeers(1);
-    expect(() => createStore().rotatePeerVerified("nobody")).toThrow(
+    expect(() => createRotator().rotatePeerVerified("nobody")).toThrow(
       /does not exist/,
     );
   });
@@ -314,7 +385,7 @@ describe("previews", () => {
     const peerIds = seedPeers(1);
     const before = readFileSync(paths().conversationKeyPath, "utf8");
 
-    const preview = createStore().previewPeerRotation(peerIds[0] as string);
+    const preview = createRotator().previewPeerRotation(peerIds[0] as string);
 
     expect(preview).toEqual({
       peerId: peerIds[0],
@@ -326,7 +397,7 @@ describe("previews", () => {
 
   it("reports an absent peer without registering it", () => {
     seedPeers(1);
-    const preview = createStore().previewPeerRotation("nobody");
+    const preview = createRotator().previewPeerRotation("nobody");
     expect(preview).toEqual({
       peerId: "nobody",
       present: false,
@@ -337,7 +408,7 @@ describe("previews", () => {
 
   it("reports an account as a count and a digest, never a peer list", () => {
     const peerIds = seedPeers(4);
-    const preview = createStore().previewAccountRotation();
+    const preview = createRotator().previewAccountRotation();
 
     expect(preview.peerCount).toBe(4);
     expect(preview.targetDigest).toMatch(/^[0-9a-f]{64}$/);
@@ -348,21 +419,21 @@ describe("previews", () => {
 
   it("keeps the digest stable for a set and changes it when the set does", () => {
     seedPeers(3);
-    const first = createStore().previewAccountRotation().targetDigest;
-    expect(createStore().previewAccountRotation().targetDigest).toBe(first);
+    const first = createRotator().previewAccountRotation().targetDigest;
+    expect(createRotator().previewAccountRotation().targetDigest).toBe(first);
 
     // Rotation replaces key MATERIAL, not membership: the digest must survive.
-    createStore().rotateAccountVerified();
-    expect(createStore().previewAccountRotation().targetDigest).toBe(first);
+    createRotator().rotateAccountVerified();
+    expect(createRotator().previewAccountRotation().targetDigest).toBe(first);
 
     createStore().getOrCreate("peer-9999");
-    expect(createStore().previewAccountRotation().targetDigest).not.toBe(first);
+    expect(createRotator().previewAccountRotation().targetDigest).not.toBe(first);
   });
 
   it("matches the digest an account-wide rotation reports", () => {
     seedPeers(3);
-    const preview = createStore().previewAccountRotation();
-    const summary = createStore().rotateAccountVerified();
+    const preview = createRotator().previewAccountRotation();
+    const summary = createRotator().rotateAccountVerified();
     expect(summary.targetDigest).toBe(preview.targetDigest);
   });
 });

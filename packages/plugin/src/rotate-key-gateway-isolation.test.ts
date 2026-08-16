@@ -32,6 +32,7 @@ const GATEWAY_ENTRIES = ["index-nats.ts", "setup-entry.ts"];
 /** Modules that are the whole point of the separation. */
 const ROTATION_MODULES = [
   "src/rotate-conversation-key-cli.ts",
+  "src/offline-conversation-key-rotation.ts",
   "src/rotation-preflight.ts",
 ];
 
@@ -92,6 +93,9 @@ describe("offline rotation is a separate process from the gateway", () => {
 
     // Guard the guard: a closure that failed to walk would pass everything.
     expect(closure.files.has("src/rotate-conversation-key-cli.ts")).toBe(true);
+    expect(closure.files.has("src/offline-conversation-key-rotation.ts")).toBe(
+      true,
+    );
     expect(closure.files.has("src/conversation-key-store.ts")).toBe(true);
 
     const offending = [...closure.bare].filter((specifier) =>
@@ -116,6 +120,17 @@ describe("offline rotation is a separate process from the gateway", () => {
       }
     });
   }
+
+  it("keeps account-wide mutation out of the gateway store implementation", () => {
+    const source = readFileSync(
+      resolve(PACKAGE_DIR, "src/conversation-key-store.ts"),
+      "utf8",
+    );
+    expect(source).not.toContain("rotateAccountVerified");
+    expect(source).not.toContain(
+      "conversation-key account rotation has no target",
+    );
+  });
 
   it("keeps the rotation entry out of the plugin's loaded extensions", () => {
     const manifest = JSON.parse(
