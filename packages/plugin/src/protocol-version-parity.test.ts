@@ -16,9 +16,10 @@
  * of them documents the lockstep and the bump rule in prose; a rule with no
  * executable guard is how #122 and #115 happened. If this file is renamed,
  * moved, or deleted, update both headers in the same change — they name it by
- * filename precisely so a move stays greppable. `e2e/protocol-version-
- * lockstep.test.ts` makes the same comparison from the e2e side; the two are
- * deliberate redundancy across suites, not a duplicate to clean up.
+ * filename precisely so a move stays greppable.
+ * `protocol-version-lockstep.test.ts` makes the same comparison from the e2e
+ * side; the two are deliberate redundancy across suites, not a duplicate to
+ * clean up.
  */
 
 import { describe, it, expect } from "vitest";

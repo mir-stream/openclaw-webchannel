@@ -25,13 +25,16 @@
  *  - BUMP when the register handshake contract changes: required request or
  *    reply fields, challenge/response semantics, or what the key delivery is
  *    bound to. v3 above is the worked example.
- *  - DO NOT BUMP to add a new frame type. Measured, not assumed: this side has
- *    no dispatch switch at all — `deliverInbound` (nats-client.ts) matches two
+ *  - DO NOT BUMP for a new frame type only when its semantics are optional and
+ *    safely ignorable by an old peer. Measured, not assumed: this side has no
+ *    dispatch switch at all — `deliverInbound` (nats-client.ts) matches two
  *    specific types and forwards EVERY frame, known or not, to its message
  *    listeners; the plugin's inbound dispatch ends in a `default:` that only
- *    warns and drops the frame (`nats-channel.ts`). A new type therefore
- *    reaches updated peers and is inert on old ones. `InboundMessage["type"]`
- *    is a compile-time union only and rejects nothing at runtime.
+ *    warns and drops the frame (`nats-channel.ts`). That proves wire tolerance,
+ *    not semantic compatibility. If correctness requires the peer to act on a
+ *    new frame (for example reset or revocation), BUMP or negotiate a capability.
+ *    `InboundMessage["type"]` is a compile-time union only and rejects nothing
+ *    at runtime.
  *
  * NOTE: this is a DIFFERENT layer from the E2E message-envelope version
  * (`ENVELOPE_VERSION` / `v:1`), which versions the encrypted payload format.

@@ -30,7 +30,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ConversationKeyStore } from "./conversation-key-store.js";
+import {
+  ConversationKeyStore,
+  type ConversationKeyStoreOptions,
+} from "./conversation-key-store.js";
 import {
   CONVERSATION_KEY_DOCUMENT_VERSION,
   LEGACY_CONVERSATION_KEY_DOCUMENT_VERSION,
@@ -70,11 +73,14 @@ function paths(): ReturnType<typeof tupleStoragePaths> {
   return tupleStoragePaths({ tenant: TENANT, accountId: ACCOUNT, home });
 }
 
-function store(): ConversationKeyStore {
+function store(
+  options: Partial<ConversationKeyStoreOptions> = {},
+): ConversationKeyStore {
   return new ConversationKeyStore({
     tenant: TENANT,
     accountId: ACCOUNT,
     home,
+    ...options,
   });
 }
 
@@ -85,12 +91,15 @@ function writeRaw(path: string, contents: string): Buffer {
   return readFileSync(path);
 }
 
-function keyDocument(version: number): string {
+function keyDocument(
+  version: number,
+  identityVersion: number = STORAGE_IDENTITY_VERSION,
+): string {
   return JSON.stringify(
     {
       version,
       storageIdentity: {
-        identityVersion: STORAGE_IDENTITY_VERSION,
+        identityVersion,
         storage: { ...SCOPE },
       },
       keys: { [PEER]: Buffer.alloc(32, 7).toString("base64url") },
@@ -104,12 +113,15 @@ function keyDocument(version: number): string {
   );
 }
 
-function generationsDocument(version: number): string {
+function generationsDocument(
+  version: number,
+  identityVersion: number = STORAGE_IDENTITY_VERSION,
+): string {
   return JSON.stringify(
     {
       version,
       storageIdentity: {
-        identityVersion: STORAGE_IDENTITY_VERSION,
+        identityVersion,
         storage: { ...SCOPE },
       },
       generations: { [PEER]: { epoch: 4, rotatedAtSec: 1_700_000_000 } },
@@ -132,7 +144,10 @@ describe("#159 conversation-keys.json written by a newer release", () => {
     const path = paths().conversationKeyPath;
     const before = writeRaw(
       path,
-      keyDocument(CONVERSATION_KEY_DOCUMENT_VERSION + 1),
+      keyDocument(
+        CONVERSATION_KEY_DOCUMENT_VERSION + 1,
+        STORAGE_IDENTITY_VERSION + 1,
+      ),
     );
 
     expect(() => store().getOrCreate(PEER)).toThrow(
@@ -214,6 +229,10 @@ describe("#159 the v1 legacy reader answers the same question", () => {
   it("reports version-too-new above the version it understands", () => {
     const serialized = JSON.stringify({
       version: LEGACY_CONVERSATION_KEY_DOCUMENT_VERSION + 1,
+      storageIdentity: {
+        identityVersion: STORAGE_IDENTITY_VERSION + 1,
+        storage: { ...SCOPE },
+      },
       keys: {},
     });
     try {
@@ -252,13 +271,20 @@ describe("#159 the generation sidecar (audit-only, but never overwritten)", () =
 
   it("fails closed BEFORE a key is minted — nothing is published either", () => {
     const { conversationKeyPath, conversationKeyGenerationsPath } = paths();
-    writeRaw(
+    const before = writeRaw(
       conversationKeyGenerationsPath,
-      generationsDocument(CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION + 1),
+      generationsDocument(
+        CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION + 1,
+        STORAGE_IDENTITY_VERSION + 1,
+      ),
     );
 
     expect(() => store().getOrCreate(PEER)).toThrow(/version-too-new/);
 
+    expect(
+      readFileSync(conversationKeyGenerationsPath).equals(before),
+    ).toBe(true);
+    expect(quarantineSiblings(conversationKeyGenerationsPath)).toEqual([]);
     expect(readdirSync(dirname(conversationKeyPath))).not.toContain(
       "conversation-keys.json",
     );
@@ -310,6 +336,84 @@ describe("#159 the generation sidecar (audit-only, but never overwritten)", () =
       generationsDocument(CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION),
     );
     expect(parsed.get(PEER)?.epoch).toBe(4);
+  });
+});
+
+describe("#159 non-mutating startup compatibility probe", () => {
+  it.each([
+    ["key", "conversation-keys"],
+    ["generation", "conversation-key-generations"],
+  ] as const)(
+    "rejects a future %s document without writes, quarantine, or lazy recovery",
+    (target, expectedDocument) => {
+      const { conversationKeyPath, conversationKeyGenerationsPath } = paths();
+      const targetPath =
+        target === "key" ? conversationKeyPath : conversationKeyGenerationsPath;
+      const serialized =
+        target === "key"
+          ? keyDocument(
+              CONVERSATION_KEY_DOCUMENT_VERSION + 1,
+              STORAGE_IDENTITY_VERSION + 1,
+            )
+          : generationsDocument(
+              CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION + 1,
+              STORAGE_IDENTITY_VERSION + 1,
+            );
+      const before = writeRaw(targetPath, serialized);
+      const beforePersist = vi.fn();
+      const beforeGenerationPersist = vi.fn();
+      const candidate = store({
+        _beforePersist: beforePersist,
+        _beforeGenerationPersist: beforeGenerationPersist,
+      });
+
+      let caught: unknown;
+      try {
+        candidate.assertNoFutureDocuments();
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toMatchObject({
+        code: "version-too-new",
+        document: expectedDocument,
+      });
+      expect(readFileSync(targetPath).equals(before)).toBe(true);
+      expect(quarantineSiblings(targetPath)).toEqual([]);
+      expect(beforePersist).not.toHaveBeenCalled();
+      expect(beforeGenerationPersist).not.toHaveBeenCalled();
+      expect(candidate["migrationPrepared"]).toBe(false);
+      if (target === "generation") {
+        expect(readdirSync(dirname(conversationKeyPath))).not.toContain(
+          "conversation-keys.json",
+        );
+      }
+    },
+  );
+
+  it("does not turn ordinary corruption into startup recovery or mutation", () => {
+    const { conversationKeyPath, conversationKeyGenerationsPath } = paths();
+    const keyBefore = writeRaw(conversationKeyPath, "{ corrupt key");
+    const generationBefore = writeRaw(
+      conversationKeyGenerationsPath,
+      "{ corrupt generation",
+    );
+    const candidate = store();
+
+    expect(() => candidate.assertNoFutureDocuments()).not.toThrow();
+
+    expect(readFileSync(conversationKeyPath).equals(keyBefore)).toBe(true);
+    expect(
+      readFileSync(conversationKeyGenerationsPath).equals(generationBefore),
+    ).toBe(true);
+    expect(quarantineSiblings(conversationKeyPath)).toEqual([]);
+    expect(quarantineSiblings(conversationKeyGenerationsPath)).toEqual([]);
+    expect(candidate["migrationPrepared"]).toBe(false);
+
+    // The probe did not consume lazy recovery: the normal first key access
+    // still owns ordinary-corruption quarantine and sidecar degradation.
+    expect(candidate.getOrCreate(PEER)).toHaveLength(32);
+    expect(quarantineSiblings(conversationKeyPath)).toHaveLength(1);
   });
 });
 

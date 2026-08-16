@@ -217,6 +217,19 @@ export class ConversationKeyStore {
   }
 
   /**
+   * Non-mutating startup probe for the one compatibility state that makes this
+   * build unsafe to serve: a key or generation document from a newer release.
+   *
+   * Missing, corrupt, unreadable, or foreign documents deliberately keep their
+   * existing lazy-load policy. In particular this method does not migrate,
+   * quarantine, create keys, or write either document.
+   */
+  assertNoFutureDocuments(): void {
+    this.assertKeysNotFromFuture();
+    this.assertGenerationsNotFromFuture();
+  }
+
+  /**
    * Return the stable conversation key for `peerId`, generating + persisting a
    * fresh random 32-byte key on first sight. NEVER regenerates an existing key
    * — stability across devices and restarts is the whole point.
@@ -460,6 +473,15 @@ export class ConversationKeyStore {
       );
     }
     return parseConversationKeyGenerationsDocument(this.scope, serialized);
+  }
+
+  /** Non-mutating counterpart to the key document's lazy-load policy. */
+  private assertKeysNotFromFuture(): void {
+    try {
+      this.readStoreFile();
+    } catch (error) {
+      if (isVersionTooNew(error)) throw error;
+    }
   }
 
   /**

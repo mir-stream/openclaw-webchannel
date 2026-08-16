@@ -73,6 +73,48 @@ describe("P0-6 — NatsChannel typing gate", () => {
   });
 });
 
+describe("#153 — live inbound typing/history boundary", () => {
+  it("drops an inbound typing frame before the user-message or history handlers", () => {
+    const transport = new RecordingTransport();
+    const channel = new NatsChannel(
+      transport as unknown as NatsTransport,
+      "acct",
+      "tenant",
+    );
+    const onUserMessage = vi.fn();
+    const onLoadHistory = vi.fn();
+    channel.setMessageHandler(onUserMessage);
+    channel.setLoadHistoryHandler(onLoadHistory);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const subject = "webchannel.tenant.acct.peer-0.in";
+    const deliver = (message: unknown) =>
+      transport.emit("message", {
+        subject,
+        payload: Buffer.from(JSON.stringify(message)),
+      });
+
+    deliver({ type: "typing", typing: true });
+
+    expect(onUserMessage).not.toHaveBeenCalled();
+    expect(onLoadHistory).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Unknown message type: "typing"'),
+    );
+
+    // Positive controls prove this drove NatsChannel's real dispatch boundary:
+    // user input reaches the live turn handler, while history stays delegated
+    // to the core-transcript load handler rather than any deleted local store.
+    deliver({ type: "user_message", text: "hello", id: "turn-1" });
+    deliver({ type: "load_history", before: "cursor-1", limit: 10 });
+    expect(onUserMessage).toHaveBeenCalledOnce();
+    expect(onLoadHistory).toHaveBeenCalledWith("peer-0", {
+      before: "cursor-1",
+      limit: 10,
+    });
+    warnSpy.mockRestore();
+  });
+});
+
 describe("approval decision reverse path", () => {
   it("dispatches a decoded decision with peer/id/decision and rejects malformed input", () => {
     const transport = new RecordingTransport();

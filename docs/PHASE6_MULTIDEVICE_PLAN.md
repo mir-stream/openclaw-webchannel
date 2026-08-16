@@ -434,6 +434,8 @@ runs the opposite direction (agent → browser), so the two never overlapped.
 - Rate-limiting/debouncing is a UI concern for the client integration layer, not
   a transport primitive.
 
-Reintroducing it costs one new frame type, which is explicitly NOT a protocol
-version bump — see the bump rules in both `protocol.ts` files (#160) and the
-measured evidence that both directions ignore frame types they do not know.
+Reintroducing it costs one new frame type. That needs no protocol version bump
+only if the signal remains optional and safely ignorable by old peers; the
+measured evidence shows both directions can ignore unknown frames, not that all
+future frame semantics are compatible. Required semantics need a version bump
+or capability negotiation — see both `protocol.ts` files (#160).

@@ -82,6 +82,24 @@ export function assertSupportedDocumentVersion(
   value: unknown,
 ): void {
   if (value === supported) return;
+  assertDocumentVersionNotFromFuture(document, supported, value);
+  throw new StorageDocumentError(document, "invalid-document");
+}
+
+/**
+ * Reject only a well-formed top-level version from a newer release.
+ *
+ * Secret documents call this before identity validation so a future release
+ * that advances both version domains is still recognized as a downgrade. The
+ * full version assertion remains after identity validation, preserving the
+ * identity-first classification of explicit markers for current, older, and
+ * malformed versions.
+ */
+export function assertDocumentVersionNotFromFuture(
+  document: SecretDocumentKind,
+  supported: number,
+  value: unknown,
+): void {
   if (
     typeof value === "number" &&
     Number.isSafeInteger(value) &&
@@ -89,7 +107,6 @@ export function assertSupportedDocumentVersion(
   ) {
     throw new StorageDocumentError(document, "version-too-new");
   }
-  throw new StorageDocumentError(document, "invalid-document");
 }
 
 /** True for the one code that means "a newer release wrote this file". */

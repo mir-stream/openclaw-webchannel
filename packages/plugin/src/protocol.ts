@@ -11,12 +11,12 @@
  * `clientNonce` which is bound into the wrapped-conversation-key AAD (freshness
  * anchor, see client-nonce.ts), and `unregister` requires a PoP proof (#51).
  *
- * The lockstep is ENFORCED, not just asserted here: `protocol-version-parity.
- * test.ts` (this package) and `protocol-version-lockstep.test.ts` (the e2e
- * suite) each import BOTH constants and compare them, so editing one side alone
- * fails CI. Those two tests are what this paragraph is worth — prose alone was
- * the #122/#115 failure mode. Named by filename, not path, so a moved file is
- * still one grep away.
+ * The lockstep is ENFORCED, not just asserted here:
+ * `protocol-version-parity.test.ts` (this package) and
+ * `protocol-version-lockstep.test.ts` (the e2e suite) each import BOTH constants
+ * and compare them, so editing one side alone fails CI. Those two tests are what
+ * this paragraph is worth — prose alone was the #122/#115 failure mode. Named
+ * by filename, not path, so a moved file is still one grep away.
  *
  * When to bump (#160)
  * ───────────────────
@@ -28,13 +28,15 @@
  *    reply fields, challenge/response semantics, or what the key delivery is
  *    bound to. v3 is the worked example — a newly mandatory `clientNonce` plus
  *    a PoP proof on unregister.
- *  - DO NOT BUMP to add a new frame type. Measured, not assumed: this side's
- *    inbound dispatch ends in a `default:` that only `console.warn`s and drops
- *    the frame (`nats-channel.ts`), and the client has no dispatch switch at
- *    all — `deliverInbound` matches two specific types and forwards EVERY
- *    frame, known or not, to its message listeners (`nats-client.ts`). A new
- *    type therefore reaches updated peers and is inert on old ones, which is
- *    exactly what "not breaking" means here.
+ *  - DO NOT BUMP for a new frame type only when its semantics are optional and
+ *    safely ignorable by an old peer. Measured, not assumed: this side's inbound
+ *    dispatch ends in a `default:` that only `console.warn`s and drops the frame
+ *    (`nats-channel.ts`), and the client has no dispatch switch at all —
+ *    `deliverInbound` matches two specific types and forwards EVERY frame, known
+ *    or not, to its message listeners (`nats-client.ts`). That proves wire
+ *    tolerance, not semantic compatibility. If correctness requires the peer to
+ *    act on a new frame (for example reset or revocation), BUMP or negotiate a
+ *    capability.
  *
  * NOTE: this is a DIFFERENT layer from the E2E envelope version
  * (`ENVELOPE_VERSION` / `v:1`), which versions the encrypted payload format.

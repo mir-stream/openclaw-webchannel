@@ -98,6 +98,33 @@ describe("index-nats.ts wiring contract — account-bound auth and startup", () 
     expect(publication).toBeGreaterThan(readiness);
     expect(RUNTIME_SOURCE).toContain("if (!published) return;");
   });
+
+  it("rejects future key state before channel construction, readiness, or publication", () => {
+    const store = RUNTIME_SOURCE.lastIndexOf(
+      "const keyStore = new ConversationKeyStore({",
+    );
+    const compatibilityProbe = RUNTIME_SOURCE.lastIndexOf(
+      "keyStore.assertNoFutureDocuments()",
+    );
+    const channel = RUNTIME_SOURCE.lastIndexOf(
+      "channel = new NatsChannel(transport, accountId, tenant, {",
+    );
+    const readiness = RUNTIME_SOURCE.lastIndexOf(
+      "const readiness = formatAccountReadiness({",
+    );
+    const publication = RUNTIME_SOURCE.lastIndexOf(
+      "commitAccountPublication<AccountRuntime>",
+    );
+
+    expect(store).toBeGreaterThan(-1);
+    expect(compatibilityProbe).toBeGreaterThan(store);
+    expect(channel).toBeGreaterThan(compatibilityProbe);
+    expect(readiness).toBeGreaterThan(channel);
+    expect(publication).toBeGreaterThan(readiness);
+    expect(RUNTIME_SOURCE).toMatch(
+      /isVersionTooNew\(err\)[\s\S]{0,300}?kind: "permanent"[\s\S]{0,300}?code: `\$\{err\.document\}-version-too-new`[\s\S]{0,300}?operatorMessage: err\.message/,
+    );
+  });
 });
 
 describe("nats-account-runtime.ts wiring contract — capacity diagnostics", () => {

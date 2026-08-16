@@ -5,6 +5,7 @@ import {
 } from "./storage-identity.js";
 import {
   assertDocumentStorageIdentity,
+  assertDocumentVersionNotFromFuture,
   assertSupportedDocumentVersion,
   StorageDocumentError,
 } from "./storage-document.js";
@@ -33,10 +34,15 @@ export function parseConversationKeyGenerationsDocument(
     document,
     CONVERSATION_KEY_GENERATIONS_IDENTITY_FIELD,
   );
+  assertDocumentVersionNotFromFuture(
+    "conversation-key-generations",
+    CONVERSATION_KEY_GENERATIONS_DOCUMENT_VERSION,
+    document.version,
+  );
   // As with the key document, an explicit identity marker remains
-  // authoritative even when another field is malformed. The caller may apply
-  // the sidecar's audit-only recovery policy after this validation reports the
-  // mismatch, but a foreign identity is never silently accepted as matching.
+  // authoritative for current, older, and malformed top-level versions. A
+  // valid future version is the one exception: recognize the downgrade before
+  // a future identity schema can be misclassified as ordinary audit damage.
   if (hasIdentity) {
     assertDocumentStorageIdentity(
       "conversation-key-generations",

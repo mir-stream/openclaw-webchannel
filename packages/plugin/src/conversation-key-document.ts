@@ -5,6 +5,7 @@ import {
 } from "./storage-identity.js";
 import {
   assertDocumentStorageIdentity,
+  assertDocumentVersionNotFromFuture,
   assertSupportedDocumentVersion,
   StorageDocumentError,
 } from "./storage-document.js";
@@ -29,9 +30,14 @@ export function parseConversationKeyDocument(
     document,
     CONVERSATION_KEY_IDENTITY_FIELD,
   );
+  assertDocumentVersionNotFromFuture(
+    "conversation-keys",
+    CONVERSATION_KEY_DOCUMENT_VERSION,
+    document.version,
+  );
   // An explicit identity marker is authoritative even when the surrounding
-  // document version is malformed or unsupported. Otherwise a foreign-scope
-  // document could be downgraded to "ordinary corruption" and moved aside.
+  // document version is current, older, or malformed. A valid future version
+  // is checked first because its newer identity schema may not parse here.
   if (hasIdentity) {
     assertDocumentStorageIdentity(
       "conversation-keys",
@@ -55,6 +61,11 @@ export function parseLegacyConversationKeyDocument(
   serialized: string,
 ): Map<string, Uint8Array> {
   const document = parseRecord(serialized);
+  assertDocumentVersionNotFromFuture(
+    "conversation-keys",
+    LEGACY_CONVERSATION_KEY_DOCUMENT_VERSION,
+    document.version,
+  );
   if (
     Object.prototype.hasOwnProperty.call(
       document,
@@ -62,7 +73,8 @@ export function parseLegacyConversationKeyDocument(
     )
   ) {
     // A v1 envelope normally has no marker. If one is explicitly present, it is
-    // authoritative and must be checked before version or key parsing.
+    // authoritative for every non-future version and must be checked before
+    // full version or key parsing.
     assertDocumentStorageIdentity(
       "conversation-keys",
       scope,
