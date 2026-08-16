@@ -94,7 +94,7 @@ pkill -f "echo-openai-server.mjs $ECHO_A_PORT" 2>/dev/null || true
 pkill -f "echo-openai-server.mjs $ECHO_B_PORT" 2>/dev/null || true
 pkill -f "gateway --port $GW_PORT" 2>/dev/null || true
 rm -rf "$OCH"
-mkdir -p "$OCH/.openclaw"
+harness_prepare_private_root "$OCH"
 
 # ---------------------------------------------------------------------------
 # 0a. Build the plugin bundle from the working tree (#125).

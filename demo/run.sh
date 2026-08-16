@@ -116,6 +116,7 @@ pkill -f "echo-openai-server.mjs $ECHO_PORT" 2>/dev/null || true
 for pair in "${FLEET[@]}"; do pkill -f "gateway --port ${pair##*:}" 2>/dev/null || true; done
 rm -rf "$OCH"
 mkdir -p "$OCH/.openclaw"
+chmod 0700 "$OCH"
 
 # --live requires a real model — fail fast with a friendly message rather than
 # silently booting the echo LLM (which would defeat the point of --live).

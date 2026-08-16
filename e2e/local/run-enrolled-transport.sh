@@ -69,7 +69,7 @@ pkill -f "echo-openai-server.mjs $ECHO_PORT" 2>/dev/null || true
 # No broad enrollment-server pkill — see cleanup() note (would kill unrelated runs).
 pkill -f "gateway --port $GW_PORT" 2>/dev/null || true
 rm -rf "$OCH"
-mkdir -p "$OCH/.openclaw"
+harness_prepare_private_root "$OCH"
 
 # ---------------------------------------------------------------------------
 # 0. Build the plugin bundle from the working tree (#125).
