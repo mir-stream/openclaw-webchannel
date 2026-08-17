@@ -105,10 +105,9 @@ let consecutivePhase1 = 0;
  * runtime preamble instead of what the user typed, and every echo-based e2e
  * assertion fails.
  *
- * The predicate mirrors core's own `isRuntimeContextPromptHeader` +
- * preface check, verified at 2026.7.1-2 in
- * `node_modules/openclaw/dist/internal-runtime-context-BW7WOTKc.js:125-127`
- * (the two accepted headers) and `:134` (the mandatory second line).
+ * The predicate mirrors core's own `isRuntimeContextPromptHeader` + preface
+ * check: two accepted headers and a mandatory second line (internal behavior
+ * verified at 2026.7.1-2).
  */
 function isRuntimeContextText(text) {
   const [first = "", second = ""] = text.split(/\r?\n/);
