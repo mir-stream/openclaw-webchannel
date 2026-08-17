@@ -445,12 +445,19 @@ export class NatsChannel implements WebChannelPeerChannel {
   /**
    * Send text message to peer.
    */
-  sendText(peerId: string, text: string, id?: string, turnId?: string): boolean {
+  sendText(
+    peerId: string,
+    text: string,
+    id?: string,
+    turnId?: string,
+    assistantMessageIndex?: number,
+  ): boolean {
     const payload: OutboundWsMessage = {
       type: "agent_message",
       text,
       ...(id ? { id } : {}),
       ...(turnId ? { turnId } : {}),
+      ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
     };
     return this.sendToPeer(peerId, payload);
   }
@@ -466,8 +473,14 @@ export class NatsChannel implements WebChannelPeerChannel {
   /**
    * Finalize progress draft to final answer.
    */
-  finalizeDraft(peerId: string, id: string, text: string, turnId?: string): boolean {
-    return this.sendText(peerId, text, id, turnId);
+  finalizeDraft(
+    peerId: string,
+    id: string,
+    text: string,
+    turnId?: string,
+    assistantMessageIndex?: number,
+  ): boolean {
+    return this.sendText(peerId, text, id, turnId, assistantMessageIndex);
   }
 
   sendReasoning(peerId: string, id: string, turnId: string, text: string): boolean {
