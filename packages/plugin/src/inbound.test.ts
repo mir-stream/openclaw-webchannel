@@ -94,7 +94,7 @@ type AssembledTurnLike = {
         isFallbackNotice?: boolean;
         isCompactionNotice?: boolean;
       },
-      info?: { kind?: string },
+      info?: { kind?: string; assistantMessageIndex?: number },
     ) => Promise<{ visibleReplySent: boolean }>;
   };
 };
@@ -191,14 +191,18 @@ function makeFakeTransport(options?: {
   throwSettleFor?: readonly string[];
 }): {
   transport: WebChannelPeerChannel;
-  finalizes: Array<{ id: string; text: string }>;
+  finalizes: Array<{ id: string; text: string; assistantMessageIndex?: number }>;
   progress: Array<{ id: string; text: string }>;
   typing: string[];
   settles: Array<"ok" | "error">;
   /** #99: the full settle frames, in emission order — turnId matters per member. */
   settleFrames: Array<{ turnId: string; outcome: "ok" | "error" }>;
 } {
-  const finalizes: Array<{ id: string; text: string }> = [];
+  const finalizes: Array<{
+    id: string;
+    text: string;
+    assistantMessageIndex?: number;
+  }> = [];
   const progress: Array<{ id: string; text: string }> = [];
   const typing: string[] = [];
   const settles: Array<"ok" | "error"> = [];
@@ -222,8 +226,18 @@ function makeFakeTransport(options?: {
       progress.push({ id, text });
       return true;
     },
-    finalizeDraft: (_sessionKey: string, id: string, text: string) => {
-      finalizes.push({ id, text });
+    finalizeDraft: (
+      _sessionKey: string,
+      id: string,
+      text: string,
+      _turnId?: string,
+      assistantMessageIndex?: number,
+    ) => {
+      finalizes.push({
+        id,
+        text,
+        ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
+      });
       return true;
     },
     sendHistory: () => true,
@@ -392,6 +406,65 @@ describe("handleInboundMessage — terminal draft drain", () => {
     expect(finalizes).toHaveLength(1);
     expect(finalizes[0]!.text).toBe("Final answer complete");
     expect(finalizes[0]!.text).not.toContain("Stopped");
+  });
+});
+
+describe("handleInboundMessage — #111 delivery identity", () => {
+  it("stamps a valid block identity on the finalized assistant frame", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver(
+          { text: "indexed block" },
+          { kind: "block", assistantMessageIndex: 1 },
+        );
+      },
+    });
+    const { transport, finalizes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "answer in blocks",
+      id: "turn-block",
+    });
+
+    expect(finalizes).toEqual([
+      expect.objectContaining({
+        text: "indexed block",
+        assistantMessageIndex: 1,
+      }),
+    ]);
+  });
+
+  it("never stamps the repeated turn-level index from a multi-retained-final turn", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      runImpl: async (turn) => {
+        // Core stamps the LAST message's turn-level value on both retained
+        // finals. Treating either as a per-message identity would misattribute A.
+        await turn.delivery.deliver(
+          { text: "retained A" },
+          { kind: "final", assistantMessageIndex: 2 },
+        );
+        await turn.delivery.deliver(
+          { text: "retained B" },
+          { kind: "final", assistantMessageIndex: 2 },
+        );
+      },
+    });
+    const { transport, finalizes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "produce two retained answers",
+      id: "turn-finals",
+    });
+
+    expect(finalizes.map((frame) => frame.text)).toEqual(["retained A", "retained B"]);
+    expect(finalizes).toHaveLength(2);
+    for (const frame of finalizes) {
+      expect(frame).not.toHaveProperty("assistantMessageIndex");
+    }
   });
 });
 

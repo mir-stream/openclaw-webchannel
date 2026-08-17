@@ -265,8 +265,8 @@ describe("#95 WP A — no terminal-turn failure signal", () => {
     ]);
     expect(out.map((m) => Object.keys(m).sort())).toEqual([
       ["id", "role", "text", "ts"],
-      ["id", "role", "text", "ts"],
-      ["id", "role", "text", "ts"],
+      ["assistantMessageIndex", "id", "role", "text", "ts"],
+      ["assistantMessageIndex", "id", "role", "text", "ts"],
     ]);
   });
 
@@ -294,7 +294,7 @@ describe("#95 WP A — no terminal-turn failure signal", () => {
     ]);
     expect(out.map((m) => Object.keys(m).sort())).toEqual([
       ["id", "role", "text", "ts"],
-      ["id", "role", "text", "ts"],
+      ["assistantMessageIndex", "id", "role", "text", "ts"],
     ]);
   });
 });

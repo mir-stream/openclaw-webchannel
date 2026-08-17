@@ -103,7 +103,13 @@ describe("history — recent (AC2)", () => {
 
     expect(out).toEqual([
       { id: "m-1", role: "user", text: "hi", ts: 1700000000000 },
-      { id: "m-2", role: "agent", text: "hello there", ts: 1700000001000 },
+      {
+        id: "m-2",
+        role: "agent",
+        text: "hello there",
+        ts: 1700000001000,
+        assistantMessageIndex: 1,
+      },
     ]);
     expect(getSessionMessages).toHaveBeenCalledWith({
       sessionKey: SESSION_KEY,
@@ -667,6 +673,9 @@ describe("history — read-time sanitization (live/history text parity)", () => 
     const out = await recent(api, SESSION_KEY, 10);
     expect(out.map((m) => m.id)).toEqual(["u-1", "a-2"]);
     expect(out.map((m) => m.text)).toEqual(["hi", "real reply"]);
+    // The filtered assistant still consumed core's first message identity. The
+    // visible reply is therefore index 2, never "visible lane 1".
+    expect(out.map((m) => m.assistantMessageIndex)).toEqual([undefined, 2]);
   });
 
   it("strips injected metadata blocks + timestamp from a raw user message, keeping only the body", async () => {

@@ -33,12 +33,12 @@ function nextMessageId(): string {
 /**
  * Build a `MessageReceipt` whose primary/only platform id is `id`.
  *
- * `MessageReceipt` (verified: dist/plugin-sdk/types-Dcn9-crA.d.ts:46-56) requires
+ * `MessageReceipt` (stable export:
+ * `node_modules/openclaw/dist/plugin-sdk/channel-outbound.d.ts`) requires
  * `platformMessageIds: string[]`, `parts: MessageReceiptPart[]`, `sentAt: number`;
  * `primaryPlatformMessageId` is the stable editable id. We delegate to
- * `createMessageReceiptFromOutboundResults` (verified:
- * dist/plugin-sdk/channel-outbound-DOdV8JXV.d.ts:341-347) so the receipt is shaped
- * exactly as core expects from one text part.
+ * `createMessageReceiptFromOutboundResults` (same stable export) so the receipt
+ * is shaped exactly as core expects from one text part.
  */
 export function buildClawReceipt(id: string): MessageReceipt {
   return createMessageReceiptFromOutboundResults({
@@ -54,14 +54,14 @@ export function buildClawReceipt(id: string): MessageReceipt {
  * Why it exists alongside the lean `outbound.attachedResults` (see channel.ts):
  *
  *  - `base.message` (a `ChannelMessageAdapter`) and a legacy `outbound` block are
- *    allowed to COEXIST — the bundled SMS channel ships both
- *    (dist/extensions/sms/channel-plugin-api.js:1242 attaches `message:
- *    smsMessageAdapter` while also defining `outbound`). We keep `outbound` for
+ *    allowed to COEXIST — the bundled SMS channel ships both (observed internal
+ *    behavior, verified at OpenClaw 2026.7.1-2). We keep `outbound` for
  *    core-initiated sends and add this adapter to declare our live capabilities.
  *
  *  - The `live` facet declares the progress-draft capabilities
  *    (`draftPreview`/`progressUpdates`/`previewFinalization`,
- *    ChannelMessageLiveCapability, dist/plugin-sdk/types-Dcn9-crA.d.ts:239-241).
+ *    `ChannelMessageLiveCapability`, stable export:
+ *    `node_modules/openclaw/dist/plugin-sdk/channel-outbound.d.ts`).
  *
  * IMPORTANT (verified by tracing the runtime): core does NOT auto-drive a
  * plugin's `message.live` adapter to produce progress drafts. The live
@@ -69,22 +69,24 @@ export function buildClawReceipt(id: string): MessageReceipt {
  * monitor/message-handler using the shared helpers
  * (`createChannelProgressDraftCompositor`, `createDraftStreamLoop`, ...). The
  * built-in path lives entirely under `extensions/discord/src/monitor/...`
- * (dist/message-handler.process-DGX1-IzX.js, all `#region` markers are Discord)
- * and calls Discord REST `editChannelMessage`/`createChannelMessage` directly.
+ * and calls Discord REST `editChannelMessage`/`createChannelMessage` directly
+ * (observed internal behavior, verified at OpenClaw 2026.7.1-2).
  *
  * For a PLUGIN channel the generic seam is the inbound turn's reply dispatcher:
  * the `AssembledChannelTurn` we return from `resolveTurn` accepts
  * `replyOptions?: Omit<GetReplyOptions, "onBlockReply">` and `dispatcherOptions`
- * (AssembledChannelTurn, dist/plugin-sdk/types-BVAOMoZy.d.ts:5811-5813). Those
- * carry `onToolStart`/`onItemEvent`/`onPartialReply` (GetReplyOptions,
- * dist/plugin-sdk/types-BYvUZFDr.d.ts:274-304). We hook them to drive our own
- * draft (see `createProgressDraftController`) and emit WS `progress` frames,
- * then finalize through the turn's `delivery.deliver`. See src/inbound.ts.
+ * (structurally checked through the stable `OpenClawPluginApi` export in
+ * `node_modules/openclaw/dist/plugin-sdk/channel-core.d.ts`). Those carry
+ * `onToolStart`/`onItemEvent`/`onPartialReply` through `GetReplyOptions` (stable
+ * export: `node_modules/openclaw/dist/plugin-sdk/reply-runtime.d.ts`). We hook
+ * them to drive our own draft (see `createProgressDraftController`) and emit WS
+ * `progress` frames, then finalize through the turn's `delivery.deliver`. See
+ * src/inbound.ts.
  *
  * `send.text` must return `ChannelMessageSendResult = { receipt; messageId? }`
- * (dist/plugin-sdk/types-Dcn9-crA.d.ts:161-164). We return a real receipt whose
- * primary id is our generated per-message id; this is also the fallback send
- * used if core ever drives the adapter directly.
+ * (stable export: `node_modules/openclaw/dist/plugin-sdk/channel-outbound.d.ts`).
+ * We return a real receipt whose primary id is our generated per-message id;
+ * this is also the fallback send used if core ever drives the adapter directly.
  */
 export function createClawMessageAdapter(transport: WebChannelPeerChannel) {
   return defineChannelMessageAdapter({
@@ -138,9 +140,9 @@ export function resolveStreamingMode(
 ): StreamingMode {
   // `entry` is the channel config section; the SDK reads `entry.streaming.mode`
   // (or legacy preview fields). Default "off" so non-progress configs keep the
-  // plain no-draft path. Verified: resolveChannelPreviewStreamMode(entry,
-  // defaultMode) -> StreamingMode, dist/plugin-sdk/streaming-DZCVNyI3.d.ts:152;
-  // StreamingMode = "off"|"partial"|"block"|"progress" (types.base-CrXPFJf5.d.ts:23).
+  // plain no-draft path. `resolveChannelPreviewStreamMode` and `StreamingMode`
+  // are stable exports of
+  // `node_modules/openclaw/dist/plugin-sdk/channel-outbound.d.ts`.
   return resolveChannelPreviewStreamMode(
     channelConfig as never,
     "off",
@@ -503,6 +505,8 @@ export type ProgressDraftController = {
   /** Deliver an authorized block independently from every assistant lane. */
   deliverAuthorizedBlock(input: {
     text: string;
+    /** Runtime identity from this authorized block delivery, when valid. */
+    assistantMessageIndex?: number;
     isStatusNotice?: boolean;
     isFallbackNotice?: boolean;
     isCompactionNotice?: boolean;
@@ -775,7 +779,10 @@ export function createProgressDraftController(params: {
     return false;
   };
 
-  const sendIndependent = (text: string): boolean => {
+  const sendIndependent = (
+    text: string,
+    assistantMessageIndex?: number,
+  ): boolean => {
     if (!text) {
       warn("independent delivery skipped empty text without a transport attempt");
       return false;
@@ -786,7 +793,16 @@ export function createProgressDraftController(params: {
     let sent = false;
     let failure: DeliveryFailureKind | undefined;
     try {
-      sent = transport.finalizeDraft(sessionKey, reservation.id, text, params.turnId) === true;
+      sent =
+        (assistantMessageIndex === undefined
+          ? transport.finalizeDraft(sessionKey, reservation.id, text, params.turnId)
+          : transport.finalizeDraft(
+              sessionKey,
+              reservation.id,
+              text,
+              params.turnId,
+              assistantMessageIndex,
+            )) === true;
       if (!sent) failure = "false";
     } catch {
       failure = "throw";
@@ -1107,11 +1123,11 @@ export function createProgressDraftController(params: {
    * IT DOES NOT ALWAYS FIRE, and that is the correction the fixtures forced. The
    * dispatcher really is strictly serial —
    * `sendChain = sendChain.then(… deliver …).catch(…).finally(… onDeliverySettled …)`
-   * (reply-dispatcher.types-CVYQHGPk.js:95-131), with the block pipeline
-   * enqueueing onto its own serial chain the same way
-   * (block-reply-pipeline-CsIUOKQ6.js:241) — so an earlier message's block is
-   * delivered AND settled before a later message's payload arrives, and that is
-   * why emitting held text ahead of the arriving payload is SAFE WHEN IT FIRES.
+   * with the block pipeline enqueueing onto its own serial chain the same way
+   * (observed internal behavior, verified at OpenClaw 2026.7.1-2) — so an
+   * earlier message's block is delivered AND settled before a later message's
+   * payload arrives, and that is why emitting held text ahead of the arriving
+   * payload is SAFE WHEN IT FIRES.
    * It is not a reason to fire unconditionally, because "a block is still
    * outstanding" is reachable at this API regardless, and then the arriving
    * payload may BE that earlier message's block — which has to land ABOVE the
@@ -1608,13 +1624,13 @@ export function createProgressDraftController(params: {
             return;
           }
 
-          // Mirror core's own partial hygiene exactly (verified:
-          // dist/message-handler.process-CcPQD8zK.js:685-698): strip reasoning +
+          // Mirror core's observed partial hygiene exactly: strip reasoning +
           // inline-directive tags, drop a "Reasoning:\n"-prefixed partial, skip
           // an identical text, and ignore a SHRINKING cumulative text (a shorter
-          // prefix of the current one) to avoid backwards flicker. Restored from
-          // `develop` — the lane rewrite (34da088) dropped the first and third
-          // of those while keeping the strip itself.
+          // prefix of the current one) to avoid backwards flicker. The empirical
+          // contract is pinned by `message-adapter.test.ts` M7c/M7i. Restored
+          // from `develop` — the lane rewrite (34da088) dropped the first and
+          // third of those while keeping the strip itself.
           let visibleRaw = deferredResult.visibleText;
           let cleaned = cleanPartialAnswerText(visibleRaw);
           // Deliberately does NOT touch the raw baseline. A reasoning payload is
@@ -1723,12 +1739,11 @@ export function createProgressDraftController(params: {
           //    onAssistantMessageStart exactly ONCE per run"; the live harness
           //    later showed it firing per assistant message. And a boundary
           //    cannot arrive late for its OWN message: core fires it before that
-          //    message's first chunk is processed (selection-BfRwHcjH.js:3788
-          //    `handleMessageStart`, and :3859-3867 where a stream-item-id change
-          //    fires the boundary and only then handles the chunk), and this seam
-          //    enqueues boundaries and partials onto one FIFO, so neither can
-          //    overtake the other. The counter therefore never consumed a
-          //    duplicate — it consumed the NEXT message's real boundary.
+          //    message's first chunk is processed (observed internal ordering,
+          //    verified at OpenClaw 2026.7.1-2), and this seam enqueues boundaries
+          //    and partials onto one FIFO, so neither can overtake the other. The
+          //    counter therefore never consumed a duplicate — it consumed the
+          //    NEXT message's real boundary.
           //  - the failure modes inverted. Under lanes, swallowing a boundary
           //    does not merge two paragraphs: the next message's final lands on
           //    the previous message's lane and OVERWRITES it. Deleting the
@@ -1821,7 +1836,7 @@ export function createProgressDraftController(params: {
           });
           if (!input.text) return false;
           emitHeldLaneTextBeforeIndependentDelivery();
-          return sendIndependent(input.text);
+          return sendIndependent(input.text, input.assistantMessageIndex);
         },
         false,
       ),
@@ -1987,7 +2002,8 @@ export function createProgressDraftController(params: {
 /**
  * One `onReasoningStream` payload, narrowed to the fields we consume. The pinned
  * OpenClaw callback delivers `{ text?; mediaUrls?; isReasoningSnapshot? }`
- * (verified: dist/plugin-sdk/types-B70zVumi.d.ts:1737-1741). `mediaUrls` is
+ * through `GetReplyOptions` (stable export:
+ * `node_modules/openclaw/dist/plugin-sdk/reply-runtime.d.ts`). `mediaUrls` is
  * intentionally ignored — the webchannel reasoning lane is text-only.
  */
 export type ReasoningStreamUpdate = {
@@ -2017,32 +2033,33 @@ export type ReasoningDraftController = {
  * never deduplicated. If the live transport rejected its latest snapshot, the
  * durable block remains the fallback and is emitted normally.
  *
- * VERIFIED CONTRACT (pinned OpenClaw v2026.6.x): every emitter sends either a
- * snapshot or the cumulative FULL text so far — NEVER a bare delta:
+ * VERIFIED INTERNAL BEHAVIOR (OpenClaw 2026.7.1-2): every emitter sends either
+ * a snapshot or the cumulative FULL text so far — NEVER a bare delta:
  *  - the ACP runner emits the full accumulated text with `isReasoningSnapshot:
- *    true` (dist/run-attempt-DRhLt3eF.js:4114-4117);
+ *    true`;
  *  - the btw runner emits cumulative full text (`reasoningText += delta` then
- *    emits `reasoningText`, no snapshot flag) (dist/btw-CDO5476N.js:617-627).
+ *    emits `reasoningText`, no snapshot flag).
  * So normalization is a plain REPLACE: ignore empty/non-string text, no-op an
  * exact duplicate of the current text, otherwise replace and send. No
  * snapshot/startsWith/endsWith/concat heuristic is needed.
  *
  * btw STALE-BURST DEFENSE: the btw `reasoningText` accumulator (declared
- * dist/btw-CDO5476N.js:563) is NEVER reset at `thinking_end` (:626), even though
- * that same event fires `onReasoningEnd`. So a SECOND thinking burst in one
- * attempt emits cumulative text that still carries burst 1's full text as a raw
- * prefix (btw concatenates raw deltas, whitespace and all). Under our per-burst id
+ * internally and verified at OpenClaw 2026.7.1-2) is NEVER reset at
+ * `thinking_end`, even though that same event fires `onReasoningEnd`. So a
+ * SECOND thinking burst in one attempt emits cumulative text that still carries
+ * burst 1's full text as a raw prefix (btw concatenates raw deltas, whitespace
+ * and all). Under our per-burst id
  * rotation that would render burst 1 duplicated inside burst 2's lane. We defend
  * with a `stalePrefix`: on `endBurst` we set it to the just-closed burst's LAST
  * RAW payload (that raw cumulative text already contains every prior burst — so
  * assign, don't append our trimmed display text, which loses inter-burst
  * whitespace and misfires from burst 3 on), and on `push` we strip that prefix
  * (plus any leading whitespace) from an incoming cumulative payload before the
- * replace logic runs. The ACP runner cannot hit this — its
- * `maybeEndReasoning` (dist/run-attempt-DRhLt3eF.js:4520-4524) fires
- * `onReasoningEnd` at most once per attempt (a `reasoningEnded` guard). The strip
- * is conservative: a payload that does NOT start with the accumulated prefix
- * falls through unchanged, so the worst case is the pre-fix duplicated display,
+ * replace logic runs. The ACP runner cannot hit this — its internal
+ * `maybeEndReasoning` fires `onReasoningEnd` at most once per attempt (a
+ * `reasoningEnded` guard), verified at OpenClaw 2026.7.1-2. The strip is
+ * conservative: a payload that does NOT start with the accumulated prefix falls
+ * through unchanged, so the worst case is the pre-fix duplicated display,
  * never lost text — as long as the emitter's accumulator persists for the
  * controller's lifetime (the pinned single-invocation contract). A fresh runner
  * re-streaming byte-identical reasoning into a reused controller could jump-strip

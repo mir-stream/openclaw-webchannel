@@ -172,6 +172,8 @@ export type InboundMessage = {
   reason?: "overloaded";
   text?: string;
   turnId?: string;
+  /** Optional run-local identity for a trustworthy assistant block delivery. */
+  assistantMessageIndex?: number;
   /**
    * P0-4 (additive; older plugins omit it): on a `turn_settled` frame, whether
    * the turn settled cleanly. `"ok"` promotes the message whose wire id exactly
@@ -191,7 +193,13 @@ export type InboundMessage = {
   options?: Array<{ decision: string; label: string; style: string }>;
   expiresAtMs?: number;
   decision?: string;
-  messages?: Array<{ id: string; role: string; text: string; ts?: number }>;
+  messages?: Array<{
+    id: string;
+    role: string;
+    text: string;
+    ts?: number;
+    assistantMessageIndex?: number;
+  }>;
   /** #15: the still-pending approval set on an `approval_snapshot` frame. */
   approvals?: Array<{
     id: string;

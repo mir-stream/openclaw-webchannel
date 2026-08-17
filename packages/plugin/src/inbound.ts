@@ -79,6 +79,19 @@ export type FinalReconciliationState = {
 };
 
 /**
+ * Read the wider runtime dispatch info without pretending the public delivery
+ * type declares it. Missing or malformed identity is the ordinary old-core
+ * case and intentionally falls back to the pre-#111 path.
+ */
+function deliveryAssistantMessageIndex(info: unknown): number | undefined {
+  if (!info || typeof info !== "object" || Array.isArray(info)) return undefined;
+  const value = (info as { assistantMessageIndex?: unknown }).assistantMessageIndex;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+/**
  * Route one draft-mode final without consuming a lane more than once.
  *
  * Notice classification is the only guard here that the downstream lane state
@@ -944,9 +957,22 @@ export async function handleInboundMessage(
                 // message's fate, not answer delivery). The dropped answer text is
                 // recovered by the register-time history snapshot (recovery lanes
                 // §5 L3/L6), never by faking the turn outcome.
+                //
+                // #111: only a BLOCK carries a true per-assistant-message
+                // identity. Final payloads may all repeat one turn-level index,
+                // so reading it there would silently attribute retained A to B.
+                // Notices/errors are not assistant transcript rows either and
+                // stay on the identity-less compatibility path.
+                const assistantMessageIndex =
+                  kind === "block" && payload.isError !== true && !isNotice
+                    ? deliveryAssistantMessageIndex(info)
+                    : undefined;
                 if (draft && kind === "block") {
                   const sent = await draft.deliverAuthorizedBlock({
                     text,
+                    ...(assistantMessageIndex !== undefined
+                      ? { assistantMessageIndex }
+                      : {}),
                     ...noticeFlags,
                   });
                   return { visibleReplySent: sent };
@@ -961,7 +987,16 @@ export async function handleInboundMessage(
                   if (sent) finalReplyDelivered = true;
                   return { visibleReplySent: sent };
                 }
-                const sent = transport.sendText(wsKey, text, undefined, turnId);
+                const sent =
+                  assistantMessageIndex === undefined
+                    ? transport.sendText(wsKey, text, undefined, turnId)
+                    : transport.sendText(
+                        wsKey,
+                        text,
+                        undefined,
+                        turnId,
+                        assistantMessageIndex,
+                      );
                 if (sent && kind === "final") finalReplyDelivered = true;
                 return { visibleReplySent: sent };
               },

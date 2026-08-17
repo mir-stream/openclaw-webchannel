@@ -103,6 +103,13 @@ export type ChatMessage = {
   ts?: number;
   working?: boolean;
   /**
+   * Core's run-local assistant-message identity. Present only when the server
+   * could attribute a block delivery or reconstruct the corresponding history
+   * row. The history reconciler scopes it through `turnId`; absence keeps the
+   * legacy heuristic path.
+   */
+  assistantMessageIndex?: number;
+  /**
    * P0-7b: the stable wire `id` the client stamped on the outbound
    * `user_message` this bubble echoes (user role only). Set at send/release time
    * so an `ack` frame's `accepted` transition can find the bubble. Absent on

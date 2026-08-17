@@ -17,6 +17,8 @@ export type HistoryMessage = {
   role: "user" | "agent";
   text: string;
   ts: number;
+  /** Core's run-local assistant ordinal, when the fetched window proves it. */
+  assistantMessageIndex?: number;
 };
 
 /** Resolved `channels.webchannel.history` config block. */
@@ -190,7 +192,12 @@ function extractId(
   return `h-${ts}-${idx}`;
 }
 
-function normalize(raw: unknown, idx: number, logger?: LoggerLike): HistoryMessage | null {
+function normalize(
+  raw: unknown,
+  idx: number,
+  assistantMessageIndex: number | undefined,
+  logger?: LoggerLike,
+): HistoryMessage | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const r = raw as RawSessionMessage;
   // Inspect identity before projection filters so drift on a transcript entry
@@ -211,6 +218,9 @@ function normalize(raw: unknown, idx: number, logger?: LoggerLike): HistoryMessa
     role,
     text,
     ts,
+    ...(role === "agent" && assistantMessageIndex !== undefined
+      ? { assistantMessageIndex }
+      : {}),
   };
 }
 
@@ -219,8 +229,28 @@ function normalizeAll(
   logger?: LoggerLike,
 ): HistoryMessage[] {
   const out: HistoryMessage[] = [];
+  // Core's delivery identity is the 1-based assistant-message ordinal within
+  // one run, not a lane position or a transcript-global offset. Reconstruct it
+  // only after this fetched window has shown the user boundary that starts the
+  // turn. A page beginning mid-turn deliberately leaves the field absent: the
+  // client then uses its existing heuristic instead of trusting a guessed base.
+  let userBoundarySeen = false;
+  let assistantMessageIndex = 0;
   for (let i = 0; i < rawMessages.length; i++) {
-    const m = normalize(rawMessages[i], i, logger);
+    const raw = rawMessages[i];
+    const rawRole =
+      raw && typeof raw === "object" && !Array.isArray(raw)
+        ? normalizeRole((raw as RawSessionMessage).role)
+        : null;
+    let rowAssistantMessageIndex: number | undefined;
+    if (rawRole === "user") {
+      userBoundarySeen = true;
+      assistantMessageIndex = 0;
+    } else if (rawRole === "agent" && userBoundarySeen) {
+      assistantMessageIndex += 1;
+      rowAssistantMessageIndex = assistantMessageIndex;
+    }
+    const m = normalize(raw, i, rowAssistantMessageIndex, logger);
     if (m) out.push(m);
   }
   return out;

@@ -162,6 +162,83 @@ describe("#95 WP B — cold reload is a faithful reconstruction of the row seque
 });
 
 describe("#95 WP B — live timeline converges to the row sequence", () => {
+  it("#111 tier 0 adopts the exact indexed bubble once when text and position both differ", () => {
+    const w = makeWrapper();
+    w.send("which result?");
+    const turnId = w.getState().messages[0]?.turnId;
+    expect(turnId).toBeTruthy();
+
+    // A local-only assistant bubble sits first, so the old positional tier
+    // would adopt the snapshot row onto the wrong bubble. The authoritative
+    // row belongs to the second live bubble and carries its exact identity.
+    deliver(w, {
+      type: "agent_message",
+      id: "webchannel-unrelated",
+      turnId,
+      assistantMessageIndex: 1,
+      text: "unrelated live bubble",
+    });
+    deliver(w, {
+      type: "agent_message",
+      id: "webchannel-target",
+      turnId,
+      assistantMessageIndex: 2,
+      text: "LIVE target text",
+    });
+
+    deliver(
+      w,
+      history(
+        { id: "core-user", role: "user", text: "which result?", ts: 1 },
+        {
+          id: "core-target",
+          role: "agent",
+          text: "STORED target text",
+          ts: 2,
+          assistantMessageIndex: 2,
+        },
+      ),
+    );
+
+    const messages = w.getState().messages;
+    expect(messages.map((m) => m.id)).toEqual([
+      "core-user",
+      "webchannel-unrelated",
+      "core-target",
+    ]);
+    expect(messages.find((m) => m.id === "webchannel-unrelated")?.text).toBe(
+      "unrelated live bubble",
+    );
+    expect(messages.filter((m) => m.assistantMessageIndex === 2)).toHaveLength(1);
+  });
+
+  it("#111 falls through to the unchanged positional heuristic when identity is absent", () => {
+    const w = makeWrapper();
+    w.send("old server question");
+    deliver(w, {
+      type: "agent_message",
+      id: "webchannel-old",
+      text: "LIVE reformatted old-server answer",
+    });
+
+    deliver(
+      w,
+      history(
+        { id: "core-old-user", role: "user", text: "old server question", ts: 1 },
+        { id: "core-old-agent", role: "agent", text: "STORED old-server answer", ts: 2 },
+      ),
+    );
+
+    expect(timeline(w)).toEqual([
+      "user:old server question",
+      "agent:STORED old-server answer",
+    ]);
+    expect(w.getState().messages.map((m) => m.id)).toEqual([
+      "core-old-user",
+      "core-old-agent",
+    ]);
+  });
+
   /**
    * The simple case: live text equals stored text. Tier 2 adopts, and the
    * reloaded and live timelines agree exactly.

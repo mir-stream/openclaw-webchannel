@@ -81,6 +81,12 @@ type DeferredReplacementOperation =
   | { kind: "approval-decision"; id: string; decision: ApprovalDecision }
   | { kind: "load-history"; before?: string; limit?: number }
   | { kind: "load-commands" };
+
+function normalizeAssistantMessageIndex(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
 // P1-9: the client-side mirror of core's abort predicate (§3.3). Intentionally
 // NOT re-exported from the public barrel; imported directly here and by the
 // plugin-side contract test.
@@ -1955,7 +1961,10 @@ export class WebChannelNATSClient {
         //     from nextMessageId(), or `a-<n>` when a frame had no id) — the
         //     core transcript NEVER stores that platform id, so history ids
         //     can never match live ids for agent messages either.
-        // Matching happens in three tiers, in snapshot order:
+        // Matching happens in four tiers, in snapshot order:
+        //   0. assistant identity — a trustworthy run-local assistant index,
+        //      scoped through the live turnId preserved on the matched user /
+        //      preceding-agent anchor, adopts exactly even when text differs;
         //   1. id — a message whose canonical id we already hold (a prior
         //      snapshot placed or adopted it) is a no-op;
         //   2. exact text+role — adopt the server id onto the first
@@ -1999,18 +2008,35 @@ export class WebChannelNATSClient {
             ? m.id.startsWith("u-") && m.pending !== true && m.retracted !== true
             : !m.working && (m.id.startsWith("a-") || m.id.startsWith("webchannel-"));
         const adoptKey = (role: string, text: string): string => `${role} ${text}`;
+        const assistantIdentityKey = (turnId: string, assistantMessageIndex: number): string =>
+          JSON.stringify([turnId, assistantMessageIndex]);
 
         const next = existing.slice();
         const localIndexById = new Map<string, number>();
         next.forEach((m, i) => localIndexById.set(m.id, i));
         const claimed = new Set<number>();
         const adoptable = new Map<string, number[]>();
+        const adoptableByAssistantIdentity = new Map<string, number[]>();
         next.forEach((m, i) => {
           if ((m.role === "user" || m.role === "agent") && isLocalLiveId(m)) {
             const key = adoptKey(m.role, m.text);
             const idxs = adoptable.get(key) ?? [];
             idxs.push(i);
             adoptable.set(key, idxs);
+            const assistantMessageIndex = normalizeAssistantMessageIndex(
+              m.assistantMessageIndex,
+            );
+            if (
+              m.role === "agent" &&
+              assistantMessageIndex !== undefined &&
+              typeof m.turnId === "string" &&
+              m.turnId.length > 0
+            ) {
+              const identityKey = assistantIdentityKey(m.turnId, assistantMessageIndex);
+              const identityIdxs = adoptableByAssistantIdentity.get(identityKey) ?? [];
+              identityIdxs.push(i);
+              adoptableByAssistantIdentity.set(identityKey, identityIdxs);
+            }
           }
         });
 
@@ -2035,10 +2061,27 @@ export class WebChannelNATSClient {
          */
         let cursor = 0;
 
-        const adoptAt = (idx: number, m: { id: string; text: string; ts?: number }): void => {
+        const adoptAt = (
+          idx: number,
+          m: {
+            id: string;
+            text: string;
+            ts?: number;
+            assistantMessageIndex?: unknown;
+          },
+        ): void => {
           // Keep the canonical stored text on adoption, so this device
           // converges to exactly what a reloading device would render.
-          next[idx] = { ...next[idx], id: m.id, text: m.text, ts: m.ts };
+          const assistantMessageIndex = normalizeAssistantMessageIndex(
+            m.assistantMessageIndex,
+          );
+          next[idx] = {
+            ...next[idx],
+            id: m.id,
+            text: m.text,
+            ts: m.ts,
+            ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
+          };
           claimed.add(idx);
           localIndexById.set(m.id, idx);
           adopted = true;
@@ -2063,6 +2106,35 @@ export class WebChannelNATSClient {
           }
 
           seen.add(m.id);
+          // Tier 0: exact assistant-message identity. The numeric index resets
+          // each run, so the preceding matched/adopted row supplies the live
+          // turnId; without that scope we deliberately fall through rather
+          // than letting an old page steal a same-index bubble from a new turn.
+          const assistantMessageIndex = normalizeAssistantMessageIndex(
+            m.assistantMessageIndex,
+          );
+          const anchorTurnId = anchor === null ? undefined : next[anchor]?.turnId;
+          if (
+            m.role === "agent" &&
+            assistantMessageIndex !== undefined &&
+            typeof anchorTurnId === "string" &&
+            anchorTurnId.length > 0
+          ) {
+            const identityIdxs = adoptableByAssistantIdentity.get(
+              assistantIdentityKey(anchorTurnId, assistantMessageIndex),
+            );
+            while (
+              identityIdxs &&
+              identityIdxs.length > 0 &&
+              claimed.has(identityIdxs[0])
+            ) {
+              identityIdxs.shift();
+            }
+            if (identityIdxs && identityIdxs.length > 0) {
+              adoptAt(identityIdxs.shift()!, m);
+              continue;
+            }
+          }
           // Tier 2: exact text+role.
           const idxs = adoptable.get(adoptKey(m.role, m.text));
           while (idxs && idxs.length > 0 && claimed.has(idxs[0])) idxs.shift();
@@ -2106,6 +2178,7 @@ export class WebChannelNATSClient {
             text: m.text,
             ts: m.ts,
             working: false,
+            ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
           });
           inserts.set(cursor, atCursor);
           anchor = null;
@@ -2336,10 +2409,26 @@ export class WebChannelNATSClient {
       case "progress": {
         const { id } = msg;
         const text = msg.text ?? "";
+        const assistantMessageIndex = normalizeAssistantMessageIndex(
+          msg.assistantMessageIndex,
+        );
         this.upsertMessage(
           id ?? "",
-          (prev) => ({ ...prev, text, working: true, turnId: msg.turnId ?? prev.turnId }),
-          { id: id ?? "", role: "agent", text, working: true, turnId: msg.turnId },
+          (prev) => ({
+            ...prev,
+            text,
+            working: true,
+            turnId: msg.turnId ?? prev.turnId,
+            ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
+          }),
+          {
+            id: id ?? "",
+            role: "agent",
+            text,
+            working: true,
+            turnId: msg.turnId,
+            ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
+          },
         );
         this.setState({ isTyping: false });
         // P1-9 §3.6.2: a progress upsert on a watched draft proves the turn is
@@ -2400,13 +2489,29 @@ export class WebChannelNATSClient {
 
       case "agent_message": {
         const { text, id } = msg;
+        const assistantMessageIndex = normalizeAssistantMessageIndex(
+          msg.assistantMessageIndex,
+        );
         this.setState({ isTyping: false });
 
         if (id) {
           this.upsertMessage(
             id,
-            (prev) => ({ ...prev, text: text ?? "", working: false, turnId: msg.turnId ?? prev.turnId }),
-            { id, role: "agent", text: text ?? "", working: false, turnId: msg.turnId },
+            (prev) => ({
+              ...prev,
+              text: text ?? "",
+              working: false,
+              turnId: msg.turnId ?? prev.turnId,
+              ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
+            }),
+            {
+              id,
+              role: "agent",
+              text: text ?? "",
+              working: false,
+              turnId: msg.turnId,
+              ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
+            },
           );
           // P1-9 §3.6.2: the final upsert also proves liveness — disarm.
           this.staleDraftWatch.delete(id);
@@ -2418,6 +2523,7 @@ export class WebChannelNATSClient {
           role: "agent",
           text: text ?? "",
           turnId: msg.turnId,
+          ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
         });
         return;
       }
