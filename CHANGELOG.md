@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
 - **New: `openclaw-webchannel-rotate-key`, an offline conversation-key rotation
   command (issue #158).** Until now the only way an operator could replace a
@@ -46,6 +46,8 @@
   succeeded. A rejected live send retains the durable fallback. Independent
   durable blocks — including equal or shared-prefix text — still render in full
   under distinct reasoning ids and never enter the answer lane.
+
+## 0.4.0
 
 - **Breaking (wire protocol v3):** the client↔plugin register hop changed in four
   ways. `WEBCHANNEL_PROTOCOL_VERSION` goes 2 → 3, and the plugin, client, and SaaS
