@@ -1,5 +1,5 @@
 {
-  "note": "Collected (non-skipped) test count per file, from 'vitest list'. Checked EXACTLY by scripts/check-test-inventory.mjs in the e2e gate: a drop is a deleted or skipped test, a rise means this file is stale. Regenerate with 'npm run test:inventory:update'. No totals field on purpose \u2014 see the script's SHAPE note.",
+  "note": "Collected (non-skipped) test count per file, from 'vitest list'. Checked EXACTLY by scripts/check-test-inventory.mjs in the e2e gate: a drop is a deleted or skipped test, a rise means this file is stale. Regenerate with 'npm run test:inventory:update'. No totals field on purpose — see the script's SHAPE note.",
   "files": {
     "demo/enroll-validation.test.ts": 2,
     "demo/saas-server-auth.test.ts": 1,
@@ -9,7 +9,7 @@
     "demo/web/src/presentation.dom.test.ts": 4,
     "demo/web/src/presentation.test.ts": 2,
     "e2e/conversation-key-rotation-reconnect.test.ts": 1,
-    "e2e/local/harness.test.ts": 10,
+    "e2e/local/harness.test.ts": 12,
     "e2e/local/ports.test.ts": 21,
     "e2e/protocol-version-lockstep.test.ts": 1,
     "packages/client/src/browser-jwt-entry.test.ts": 4,
@@ -82,7 +82,7 @@
     "packages/plugin/src/inbound-queue.test.ts": 39,
     "packages/plugin/src/inbound-retention.test.ts": 3,
     "packages/plugin/src/inbound.test.ts": 70,
-    "packages/plugin/src/index-nats-wiring.test.ts": 23,
+    "packages/plugin/src/index-nats-wiring.test.ts": 24,
     "packages/plugin/src/ingress-dedupe.test.ts": 61,
     "packages/plugin/src/ingress-outcome.test.ts": 15,
     "packages/plugin/src/ingress-result-chunks.test.ts": 2,

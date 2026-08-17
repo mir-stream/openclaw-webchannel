@@ -215,6 +215,12 @@ export const ALLOWED_RAW_INTERPOLATIONS: readonly AllowedRawInterpolation[] = [
     expression: "attempt",
     reason: "attempt counter (number)",
   },
+  {
+    file: "nats-account-runtime.ts",
+    site: "webchannel: loaded plugin bundle (plugin=webchannel, source=)",
+    expression: "LOADED_PLUGIN_BUNDLE_PATH",
+    reason: "fileURLToPath(import.meta.url) of the running local module; not peer-controlled",
+  },
 ] as const;
 
 export function rawInterpolationAllowanceKey(

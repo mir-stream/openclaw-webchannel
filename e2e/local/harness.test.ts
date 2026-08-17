@@ -41,18 +41,15 @@ afterEach(() => {
   rmSync(testDir, { recursive: true, force: true });
 });
 
-type PluginSource = { source: string; plugin?: string };
+type ProvenanceEmitter = "plugin" | "core";
+type PluginSource = {
+  source: string;
+  plugin?: string;
+  emitter?: ProvenanceEmitter;
+};
 
-function assertLoadedRecords(records: PluginSource[]) {
-  writeFileSync(
-    gatewayLog,
-    records
-      .map(
-        ({ source, plugin = "webchannel" }) =>
-          `[plugins] channel registered (plugin=${plugin}, source=${source})`,
-      )
-      .join("\n") + "\n",
-  );
+function assertLoadedLog(lines: string[]) {
+  writeFileSync(gatewayLog, `${lines.join("\n")}\n`);
   return spawnSync(
     "bash",
     [
@@ -70,6 +67,18 @@ function assertLoadedRecords(records: PluginSource[]) {
         HARNESS_DIST_SHA: distSha,
       },
     },
+  );
+}
+
+function assertLoadedRecords(records: PluginSource[]) {
+  return assertLoadedLog(
+    records
+      .map(
+        ({ source, plugin = "webchannel", emitter = "plugin" }) =>
+          emitter === "plugin"
+            ? `webchannel: loaded plugin bundle (plugin=${plugin}, source=${source})`
+            : `[plugins] channel "webchannel" registered (plugin=${plugin}, source=${source})`,
+      ),
   );
 }
 
@@ -125,14 +134,14 @@ describe("harness_prepare_private_root", () => {
 });
 
 describe("harness_assert_loaded_dist", () => {
-  it("accepts an exact webchannel bundle source", () => {
+  it("accepts plugin provenance with zero core diagnostics", () => {
     const result = assertLoaded(dist);
 
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain("DIST-ASSERT: gateway loaded the bundle");
   });
 
-  it("accepts an exact source path containing parentheses", () => {
+  it("accepts an exact plugin source path containing spaces and parentheses", () => {
     const parenthesizedDir = join(testDir, "bundle (candidate)");
     mkdirSync(parenthesizedDir);
     dist = join(parenthesizedDir, "index-nats.js");
@@ -144,15 +153,27 @@ describe("harness_assert_loaded_dist", () => {
     expect(result.stdout).toContain(`source=${dist}`);
   });
 
+  it("accepts corroborating plugin and core records for the same source", () => {
+    const result = assertLoadedRecords([
+      { source: dist, emitter: "plugin" },
+      { source: dist, emitter: "core" },
+    ]);
+
+    expect(result.status, result.stderr).toBe(0);
+  });
+
   it("accepts duplicate identical webchannel source records", () => {
     const result = assertLoadedRecords([{ source: dist }, { source: dist }]);
 
     expect(result.status, result.stderr).toBe(0);
   });
 
-  it("rejects exact then wrong webchannel sources and reports both", () => {
-    const wrong = `${dist}.backup`;
-    const result = assertLoadedRecords([{ source: dist }, { source: wrong }]);
+  it("rejects an exact plugin source plus a foreign core source containing spaces and parentheses", () => {
+    const wrong = join(testDir, "foreign dist (copy)", "index-nats.js");
+    const result = assertLoadedRecords([
+      { source: dist, emitter: "plugin" },
+      { source: wrong, emitter: "core" },
+    ]);
 
     expect(result.status).toBe(2);
     expect(result.stderr).toContain(`source=${dist}\n`);
@@ -185,6 +206,18 @@ describe("harness_assert_loaded_dist", () => {
     const result = assertLoaded(dist, "another-plugin");
 
     expect(result.status).toBe(2);
-    expect(result.stderr).toContain("no source for plugin=webchannel");
+    expect(result.stderr).toContain("no provenance record for plugin=webchannel");
+  });
+
+  it("rejects a log with neither plugin nor core provenance", () => {
+    const result = assertLoadedLog([
+      "webchannel: gateway setup completed",
+      "[gateway] ready",
+    ]);
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain(
+      "(none — no provenance record for plugin=webchannel)",
+    );
   });
 });
