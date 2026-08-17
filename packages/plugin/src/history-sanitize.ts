@@ -21,17 +21,13 @@ import {
  * merge tolerates residual differences. We only remove user-visible noise so
  * the re-hydrated bubbles converge to what the reader already saw.
  *
- * Ground truth for the envelope shapes (verified against the installed core):
- *  - `node_modules/openclaw/dist/strip-inbound-meta-BI3m2RBP.js`
- *    (`INBOUND_META_SENTINELS`, `parseInboundMetaBlock`, `stripInboundMetadata`,
- *    `stripActiveMemoryPromptPrefixBlocks`, `isMessageToolDeliveryHintLine`,
- *    `LEADING_TIMESTAMP_PREFIX_RE`, `shouldStripTrailingUntrustedContext`)
- *  - `node_modules/openclaw/dist/get-reply-_h6-ZfbL.js`
- *    (`formatUntrustedJsonBlock`, `buildInboundUserContextPrefix`)
- *  - `node_modules/openclaw/dist/extensions/active-memory/index.js`
- *    (`buildPromptPrefix` — header + `<active_memory_plugin>` block)
- *  - `node_modules/openclaw/dist/tokens-DD1fz8gG.js` (silent-token regexes)
- *  - `node_modules/openclaw/dist/message-tool-delivery-hints-BSLgiMlM.js`
+ * The mirrored envelope shapes are locked empirically by
+ * `packages/plugin/src/history-sanitize.test.ts`: inbound metadata blocks,
+ * active-memory prefixes, silent tokens, delivery hints, timestamps, and
+ * trailing untrusted context each have a firing assertion. The shapes were
+ * re-verified against installed core behavior at 2026.7.1-2. The SDK contract
+ * used directly here remains `sanitizeAssistantVisibleText` from
+ * `openclaw/plugin-sdk/text-runtime`.
  */
 
 /**
@@ -84,7 +80,7 @@ const ACTIVE_MEMORY_CLOSE_TAG = "</active_memory_plugin>";
 /**
  * Message-tool delivery hint lines core injects and then strips from
  * user-visible text. Copied verbatim from core's `MESSAGE_TOOL_DELIVERY_HINTS`
- * (`message-tool-delivery-hints-BSLgiMlM.js`); a surviving hint line also blocks
+ * and locked by `history-sanitize.test.ts`; a surviving hint line also blocks
  * the head-anchored timestamp re-strip, so mirroring the removal matters.
  */
 const MESSAGE_TOOL_DELIVERY_HINTS = [
@@ -94,8 +90,8 @@ const MESSAGE_TOOL_DELIVERY_HINTS = [
 ];
 
 /**
- * Internal runtime-context block delimiters (inclusive). Markers verified in
- * core `internal-runtime-context-BH_40W4f.js`.
+ * Internal runtime-context block delimiters (inclusive), locked by
+ * `history-sanitize.test.ts` and re-verified against core at 2026.7.1-2.
  */
 const INTERNAL_CONTEXT_BEGIN = "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>";
 const INTERNAL_CONTEXT_END = "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";

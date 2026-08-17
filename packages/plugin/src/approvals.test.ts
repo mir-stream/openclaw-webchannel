@@ -52,9 +52,9 @@ import { resolveWebchannelSessionRoute } from "./session-route.js";
 import { decodeStrictLogfmt } from "./test-fixtures/strict-logfmt.js";
 
 // A minimal valid pending exec approval view (the shape core hands to
-// `presentation.buildPendingPayload`). Verified fields:
-// dist/plugin-sdk/approval-handler-runtime-types-CL_Nb7hO.d.ts:258-286 (base +
-// exec pending) and :246-252 (ApprovalActionView).
+// `presentation.buildPendingPayload`). Contract: the
+// `openclaw/plugin-sdk/approval-handler-runtime` barrel exports
+// `ExecApprovalPendingView` and `ApprovalActionView`.
 function fakePendingExecView(id = "exec-1"): any {
   return {
     approvalId: id,

@@ -87,6 +87,13 @@ jobs:
         run: npm ci
 
       # ──────────────────────────────────────────────────────────────────────
+      # 4a. Keep documentation and source comments bound to durable contracts.
+      #     Hash-named OpenClaw bundles are replaced on every core build.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Lint durable OpenClaw citations
+        run: npm run lint:citations
+
+      # ──────────────────────────────────────────────────────────────────────
       # 4b. Install Playwright Chromium for E2E tests
       #
       # The E2E gate drives a real headless Chromium browser through the NATS

@@ -2,10 +2,9 @@ import {
   createChannelApprovalNativeRuntimeAdapter,
   resolveApprovalOverGateway,
   // Runtime-context capability key channels register so core's approval
-  // bootstrap starts the native handler. Re-exported from this barrel; the
-  // canonical declaration is
-  // dist/plugin-sdk/approval-handler-adapter-runtime-BLQ3gGQv.d.ts:5
-  // (`CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY = "approval.native"`).
+  // bootstrap starts the native handler. Contract:
+  // `openclaw/plugin-sdk/approval-handler-runtime` exports
+  // `CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY` (`"approval.native"`).
   CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY,
 } from "openclaw/plugin-sdk/approval-handler-runtime";
 import type {
@@ -14,48 +13,50 @@ import type {
   ChannelApprovalNativeRuntimeSpec,
   ChannelApprovalNativeFinalAction,
   // Erased runtime-adapter type the capability's `nativeRuntime` field carries
-  // (dist/plugin-sdk/approval-handler-runtime-types-D7Tw1EQA.js). The strongly
-  // typed adapter we build from createClawApprovalNativeRuntimeSpec is widened
-  // to this via `as unknown as` in createClawApprovalCapability.load().
+  // (`ChannelApprovalNativeRuntimeAdapter`, exported by
+  // `openclaw/plugin-sdk/approval-handler-runtime`). The strongly typed adapter
+  // we build from createClawApprovalNativeRuntimeSpec is widened to this via
+  // `as unknown as` in createClawApprovalCapability.load().
   ChannelApprovalNativeRuntimeAdapter,
 } from "openclaw/plugin-sdk/approval-handler-runtime";
 // Lazy adapter: heavy channel delivery code only loads when the runtime hooks
 // actually run, so cold startup doesn't pay for it. Mirrors Discord's
-// approval-native.ts. Verified:
-// dist/plugin-sdk/approval-handler-adapter-runtime-BLQ3gGQv.d.ts:7-13.
+// approval-native.ts. Contract: `openclaw/plugin-sdk/approval-handler-adapter-runtime`
+// exports `createLazyChannelApprovalNativeRuntimeAdapter`.
 import { createLazyChannelApprovalNativeRuntimeAdapter } from "openclaw/plugin-sdk/approval-handler-adapter-runtime";
 // The canonical approver-restricted capability builder. Replaces the prior
 // hand-rolled `createChannelApprovalCapability({ authorizeActorAction: () =>
 // ({authorized:true}) })` stub (Phase 1 OPEN auth) with the SDK's per-peer
-// authorization path. Verified:
-// dist/plugin-sdk/approval-delivery-helpers-C2DqZtvB.d.ts:33-65
-// (ApproverRestrictedNativeApprovalParams) and :108 (factory).
+// authorization path. Contract: `openclaw/plugin-sdk/approval-delivery-runtime`
+// exports `createApproverRestrictedNativeApprovalCapability`; its parameter type
+// is the approver-restricted native approval contract.
 import { createApproverRestrictedNativeApprovalCapability } from "openclaw/plugin-sdk/approval-delivery-runtime";
 // Account/channel match gate used by shouldHandleWebChannelApprovalRequest.
-// Verified: dist/plugin-sdk/approval-request-account-binding-DUl0SBjl.d.ts:19-24
+// Contract: `openclaw/plugin-sdk/approval-native-runtime` exports
+// `doesApprovalRequestMatchChannelAccount`.
 // (S1: we now pass the handler's accountId so it is compared against the
 // request's turnSourceAccountId — stamped by src/inbound.ts buildContext).
 import { doesApprovalRequestMatchChannelAccount } from "openclaw/plugin-sdk/approval-native-runtime";
 // Idiomatic helper that decides whether a channel-native exec approval route
-// replaces (suppresses) the local in-band `/approve …` text prompt. Verified:
-// dist/plugin-sdk/approval-native-helpers-n_-eGDqh.d.ts (re-exported from the
-// approval-native-runtime barrel). Its impl returns true only when
+// replaces (suppresses) the local in-band `/approve …` text prompt. Contract:
+// `openclaw/plugin-sdk/approval-native-runtime` exports
+// `shouldSuppressLocalNativeExecApprovalPrompt`. Its behavior requires
 // `hint.nativeRouteActive === true` (proof the native runtime handler is live)
 // AND native delivery is enabled for our config.
 import { shouldSuppressLocalNativeExecApprovalPrompt } from "openclaw/plugin-sdk/approval-native-runtime";
-// Dedupe/validate approver ids from config + ownerAllowFrom fallback. Verified:
-// dist/plugin-sdk/approval-auth-helpers-D7LdqjtP.d.ts:5-12.
+// Dedupe/validate approver ids from config + ownerAllowFrom fallback. Contract:
+// `openclaw/plugin-sdk/approval-auth-runtime` exports `resolveApprovalApprovers`.
 import { resolveApprovalApprovers } from "openclaw/plugin-sdk/approval-auth-runtime";
 // enabled + approver-count gate and agent/session filter matcher used by
-// shouldHandleWebChannelApprovalRequest. Verified:
-// dist/plugin-sdk/approval-client-helpers-CUOhLj5r.d.ts:40-43 (:18-23).
+// shouldHandleWebChannelApprovalRequest. Contract:
+// `openclaw/plugin-sdk/approval-client-runtime` exports both helpers.
 import {
   isChannelExecApprovalClientEnabledFromConfig,
   matchesApprovalRequestFilters,
 } from "openclaw/plugin-sdk/approval-client-runtime";
-// Request types for the shouldHandle predicate. Verified:
-// dist/plugin-sdk/approval-runtime.d.ts:14 (re-exports ExecApprovalRequest,
-// PluginApprovalRequest).
+// Request types for the shouldHandle predicate. Contract:
+// `openclaw/plugin-sdk/approval-runtime` exports `ExecApprovalRequest` and
+// `PluginApprovalRequest`.
 import type {
   ExecApprovalRequest,
   ExecApprovalSessionTarget,
@@ -70,8 +71,8 @@ import type {
 import { resolveApprovalRequestOriginTarget } from "openclaw/plugin-sdk/approval-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 // `ChannelApprovalCapability` (the `nativeRuntime` field's erased type) is
-// re-exported here, not from the approval-runtime barrel. Verified:
-// dist/plugin-sdk/channel-runtime.d.ts:19.
+// exported by `openclaw/plugin-sdk/channel-runtime`, not from the
+// approval-runtime barrel.
 import type {
   ChannelApprovalCapability,
   ChannelGatewayContext,
@@ -446,8 +447,8 @@ export const __resolvedApprovalsTestHook = {
  *
  * PATH: idiomatic `approvalCapability.nativeRuntime`. When a tool/exec needs
  * approval the agent run blocks and core surfaces an approval prompt; core's
- * channel-approval bootstrap (dist/server-channels-g1oRRKIH.js:429
- * `startChannelApprovalHandlerBootstrap`, which fires automatically for any
+ * channel-approval bootstrap (`startChannelApprovalHandlerBootstrap`, verified
+ * at 2026.7.1-2), which fires automatically for any
  * channel whose `config.isConfigured` is true and whose plugin exposes
  * `approvalCapability.nativeRuntime`) opens the operator approvals gateway
  * client and drives THIS adapter:
@@ -462,7 +463,8 @@ export const __resolvedApprovalsTestHook = {
  * The reverse direction (widget button click) is owned by us, NOT by the native
  * runtime: the widget sends `approval_decision`, the transport routes it to
  * `handleApprovalDecision` below, which calls the unified
- * `resolveApprovalOverGateway` (dist/plugin-sdk/approval-gateway-runtime-CsiA6CDb.d.ts)
+ * `resolveApprovalOverGateway` contract exported by
+ * `openclaw/plugin-sdk/approval-gateway-runtime`
  * to resolve the exec/plugin approval over the gateway so the run continues.
  *
  * AUTHORIZATION: the capability is built by the SDK's
@@ -476,14 +478,16 @@ export const __resolvedApprovalsTestHook = {
  *
  * Verified SDK shapes:
  *  - ChannelApprovalNativeRuntimeSpec (presentation/transport/availability):
- *    dist/plugin-sdk/approval-handler-runtime-types-D7Tw1EQA.d.ts.
+ *    `openclaw/plugin-sdk/approval-handler-runtime` export.
  *  - PendingApprovalView (approvalId, approvalKind, title, description,
- *    metadata[], expiresAtMs, actions: ApprovalActionView[]).
+ *    metadata[], expiresAtMs, actions: ApprovalActionView[]) and
+ *    ApprovalActionView: exports from that same contract.
  *  - ApproverRestrictedNativeApprovalParams:
- *    dist/plugin-sdk/approval-delivery-helpers-C2DqZtvB.d.ts:33-65; factory
- *    :108. The capability's `native` adapter (describeDeliveryCapabilities +
+ *    the parameter accepted by `createApproverRestrictedNativeApprovalCapability`
+ *    from `openclaw/plugin-sdk/approval-delivery-runtime`. The capability's
+ *    `native` adapter (describeDeliveryCapabilities +
  *    resolveOriginTarget) is built by the factory from the `resolveOriginTarget`
- *    we pass in (dist/approval-native-runtime delivery plan reads it).
+ *    we pass in.
  */
 
 /**
@@ -1065,7 +1069,7 @@ function resolveWebchannelFallbackOriginTarget(params: {
  *
  * AUTHORIZATION SCOPE — read carefully. This capability's `authorizeActorAction`
  * (wired by the SDK helper from `isExecAuthorizedSender`) only protects the chat
- * `/approve` TEXT-COMMAND path (dist/commands-handlers.runtime-DIVsKJOl.js:784),
+ * `/approve` TEXT-COMMAND path (verified at 2026.7.1-2),
  * which webchannel's widget never sends. The WIDGET-CLICK path
  * (`approval_decision` frame → `handleApprovalDecision`) is NOT routed through
  * `authorizeActorAction`; its enforcement lives in `handleApprovalDecision`
@@ -1095,8 +1099,8 @@ export function createClawApprovalCapability(
       // The capability's nativeRuntime field is generic-erased (all unknown),
       // so widen with a cast. Pure generic-erasure — core calls the hooks with
       // the exact runtime values we produce. (See the former cast at the old
-      // createClawApprovalCapability, and the SDK type citation:
-      // dist/plugin-sdk/types.adapters-772EgiLZ.d.ts:604.)
+      // createClawApprovalCapability and the `ChannelApprovalNativeRuntimeAdapter`
+      // contract exported by `openclaw/plugin-sdk/approval-handler-runtime`.)
       const adapter = createChannelApprovalNativeRuntimeAdapter(spec);
       return adapter as unknown as ChannelApprovalNativeRuntimeAdapter;
     },
@@ -1199,25 +1203,26 @@ export function shouldSuppressClawNativeExecApprovalPrompt(params: {
  * (presentation.buildPendingPayload / transport.deliverPending).
  *
  * Why a gateway monitor (not `registerFull`): the bootstrap that WATCHES for
- * this context (dist/server-channels-g1oRRKIH.js:112-116, started :429
- * `startChannelApprovalHandlerBootstrap`) runs ONLY inside
+ * this context (`startChannelApprovalHandlerBootstrap`, verified at 2026.7.1-2)
+ * runs ONLY inside
  * `startChannelInternal`, which short-circuits unless the plugin provides
- * `gateway.startAccount` (:330-331) AND `listAccountIds` returns ≥1 account
- * (:339-341). It then hands `startAccount` the SAME task-scoped `channelRuntime`
- * it watches (:433 vs :465), and the context registry is a per-runtime Map (NOT
- * a global singleton — dist/runtime-channel-DiQw75-a.js:61), so the registration
- * must go through `ctx.channelRuntime.runtimeContexts.register`. Registering via
+ * `gateway.startAccount` AND `listAccountIds` returns ≥1 account. It then hands
+ * `startAccount` the SAME task-scoped `channelRuntime` it watches, and the context
+ * registry is a per-runtime Map, not a global singleton (verified at
+ * 2026.7.1-2), so the registration must go through
+ * `ctx.channelRuntime.runtimeContexts.register`. Registering via
  * `api.runtime.channel.runtimeContexts` in `registerFull` targets a DIFFERENT
  * registry instance the bootstrap never reads — it would not work.
  *
- * `register` params/return verified:
- * dist/plugin-sdk/channel-runtime-surface.types.d.ts
- * (`ChannelRuntimeContextRegistry.register(key & {context; abortSignal?}) =>
- * {dispose}`). We scope `accountId` to `ctx.accountId` so it matches the
+ * The public `ChannelRuntimeSurface` contract exported by
+ * `openclaw/plugin-sdk/channel-contract` carries the runtime-context registry;
+ * `openclaw/plugin-sdk/channel-runtime-context` exports its registration helper.
+ * Registration returns `{dispose}` and accepts `{context; abortSignal?}`. We
+ * scope `accountId` to `ctx.accountId` so it matches the
  * watcher's account filter exactly and pass `ctx.abortSignal` so the lease is
  * torn down on channel stop. We then keep `startAccount` alive until abort
  * (returning early would make core log "channel exited" and tear the bootstrap
- * down — server-channels:472-488).
+ * down (verified at 2026.7.1-2).
  */
 export async function startClawApprovalMonitor(
   ctx: ChannelGatewayContext,
@@ -1264,11 +1269,10 @@ function waitForAbort(signal: AbortSignal): Promise<void> {
  * THIS FUNCTION IS THE AUTHORIZATION ENFORCEMENT POINT for the widget-click
  * path. The capability's `authorizeActorAction` hook does NOT protect this path:
  * `resolveApprovalOverGateway` only forwards `{id, decision}` to the gateway RPC
- * and uses `senderId` purely for `clientDisplayName` (verified:
- * dist/approval-gateway-resolver-DNNKgGbF.js:5-28). `authorizeActorAction` is
- * invoked solely from the chat `/approve` text-command path
- * (dist/commands-handlers.runtime-DIVsKJOl.js:784), which the widget never
- * sends. So we fail-closed HERE, at the channel boundary, before the RPC leaves
+ * and uses `senderId` purely for `clientDisplayName`; `authorizeActorAction` is
+ * invoked solely from the chat `/approve` text-command path (both verified at
+ * 2026.7.1-2), which the widget never sends. So we fail-closed HERE, at the
+ * channel boundary, before the RPC leaves
  * the process: only peers in `channels.webchannel.execApprovals.approvers`
  * (falling back to `commands.ownerAllowFrom`) may resolve an approval. The prior
  * default of `ANON_PEER_ID` is dropped so no caller can bypass this check.

@@ -348,25 +348,22 @@ function releaseAgentLifecycleSubscription(options: {
  * and the recorded `reply.to` carries that same peer, so per-peer routing
  * flows through this seam unchanged.
  *
- * This mirrors the bundled SMS channel's inbound path
- * (`dist/extensions/sms/channel-plugin-api.js`, `channelRuntime.inbound.run`).
+ * This mirrors the bundled SMS channel's `channelRuntime.inbound.run` path,
+ * verified at 2026.7.1-2.
  *
- * Verified signatures (OpenClaw v2026.6.6):
- *  - api.runtime.channel.routing.resolveAgentRoute(input): ResolvedAgentRoute
- *      dist/plugin-sdk/resolve-route-BCF-LST9.d.ts:46 / :11-29
- *  - api.runtime.channel.inbound.run = runChannelInboundEvent(params:
- *      RunChannelTurnParams<TRaw>): dist/types-C0dQmare.d.ts:6111-6116,
- *      dist/plugin-sdk/types-BVAOMoZy.d.ts:5894-5900 (RunChannelTurnParams),
- *      :5885-5892 (ChannelTurnAdapter), :5799-5823 (AssembledChannelTurn).
- *  - api.runtime.channel.inbound.buildContext = buildChannelInboundEventContext:
- *      dist/plugin-sdk/types-BVAOMoZy.d.ts:5924-5947 (params), :5953 (result).
- *  - api.runtime.channel.session.{recordInboundSession,resolveStorePath}:
- *      dist/types-C0dQmare.d.ts:6075,6078.
- *  - api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher:
- *      dist/types-C0dQmare.d.ts:6022.
- *  - ChannelEventDeliveryAdapter.deliver(payload: ReplyPayload, info):
- *      dist/plugin-sdk/types-BVAOMoZy.d.ts:5760-5769; ReplyPayload.text:
- *      dist/plugin-sdk/types-BYvUZFDr.d.ts:8-9.
+ * Durable SDK contracts (verified at the current pin):
+ *  - `openclaw/plugin-sdk/routing` exports `resolveAgentRoute` and
+ *    `ResolvedAgentRoute`.
+ *  - `openclaw/plugin-sdk/channel-inbound` exports `runChannelInboundEvent`,
+ *    `ChannelInboundEventRunnerParams`, `AssembledInboundReply`, and
+ *    `buildChannelInboundEventContext`.
+ *  - `openclaw/plugin-sdk/conversation-runtime` exports `recordInboundSession`;
+ *    `openclaw/plugin-sdk/config-runtime` exports `resolveStorePath`.
+ *  - `openclaw/plugin-sdk/reply-runtime` exports
+ *    `dispatchReplyWithBufferedBlockDispatcher`, `GetReplyOptions`, and
+ *    `ReplyPayload`. The `OpenClawPluginApi` contract exported by
+ *    `openclaw/plugin-sdk/channel-core` exposes those operations through
+ *    `api.runtime.channel`.
  *
  * `servingTenant` is the immutable tenant captured by the account's startup
  * plan. It is required rather than re-resolved here because this function runs
@@ -450,15 +447,15 @@ export async function handleInboundMessage(
   // plugin's `message.live` adapter; the generic seam for a plugin channel is
   // the inbound turn's reply dispatcher callbacks. We build a per-turn draft
   // controller and hook `onToolStart`/`onItemEvent`/`onPartialReply`
-  // (GetReplyOptions, dist/plugin-sdk/types-BYvUZFDr.d.ts:274-304) via the turn's
-  // `replyOptions` (Omit<GetReplyOptions,"onBlockReply">, AssembledChannelTurn,
-  // dist/plugin-sdk/types-BVAOMoZy.d.ts:5813). Each event refreshes a single
+  // (`GetReplyOptions`, exported by `openclaw/plugin-sdk/reply-runtime`) via the
+  // turn's `replyOptions` on the `AssembledInboundReply` contract exported by
+  // `openclaw/plugin-sdk/channel-inbound`. Each event refreshes a single
   // rolling draft pushed to the widget as a `progress` frame; the final answer
   // (delivered through `delivery.deliver`) finalizes that same draft id.
   //
   // `channels.webchannel.streaming.mode` selects WHAT streams, mirroring core's
-  // own distinction (`onPartialReply` is wired only when `draftStream &&
-  // !isProgressMode`, verified: dist/message-handler.process-CcPQD8zK.js:1357):
+  // own distinction. Our wiring is locked by the
+  // `channel.test.ts` "does NOT stream answer text in progress mode" gate:
   //  - "partial": stream ANSWER TEXT. Draft is created; `onPartialReply` feeds
   //    `pushAnswerText`, and tool/item events stay wired too, so a mixed turn
   //    shows "Working… + tool lines" until the first answer text arrives, then
@@ -777,9 +774,9 @@ export async function handleInboundMessage(
                     // agent run and feed the rolling draft. We also set
                     // `suppressDefaultToolProgressMessages` so the agent's own tool
                     // progress text isn't ALSO delivered as separate messages (it
-                    // lives inside our draft instead — GetReplyOptions
-                    // .suppressDefaultToolProgressMessages, dist/plugin-sdk/
-                    // types-BYvUZFDr.d.ts:261-265).
+                    // lives inside our draft instead — `GetReplyOptions` field
+                    // `suppressDefaultToolProgressMessages`, exported through
+                    // `openclaw/plugin-sdk/reply-runtime`).
                     ...(draft
                       ? {
                           suppressDefaultToolProgressMessages: true,
