@@ -5,6 +5,8 @@ import {
 } from "./storage-identity.js";
 import {
   assertDocumentStorageIdentity,
+  assertDocumentVersionNotFromFuture,
+  assertSupportedDocumentVersion,
   StorageDocumentError,
 } from "./storage-document.js";
 
@@ -28,9 +30,14 @@ export function parseConversationKeyDocument(
     document,
     CONVERSATION_KEY_IDENTITY_FIELD,
   );
+  assertDocumentVersionNotFromFuture(
+    "conversation-keys",
+    CONVERSATION_KEY_DOCUMENT_VERSION,
+    document.version,
+  );
   // An explicit identity marker is authoritative even when the surrounding
-  // document version is malformed or unsupported. Otherwise a foreign-scope
-  // document could be downgraded to "ordinary corruption" and moved aside.
+  // document version is current, older, or malformed. A valid future version
+  // is checked first because its newer identity schema may not parse here.
   if (hasIdentity) {
     assertDocumentStorageIdentity(
       "conversation-keys",
@@ -38,9 +45,11 @@ export function parseConversationKeyDocument(
       document[CONVERSATION_KEY_IDENTITY_FIELD],
     );
   }
-  if (document.version !== CONVERSATION_KEY_DOCUMENT_VERSION) {
-    throw new StorageDocumentError("conversation-keys", "invalid-document");
-  }
+  assertSupportedDocumentVersion(
+    "conversation-keys",
+    CONVERSATION_KEY_DOCUMENT_VERSION,
+    document.version,
+  );
   if (!hasIdentity) {
     assertDocumentStorageIdentity("conversation-keys", scope, undefined);
   }
@@ -52,6 +61,11 @@ export function parseLegacyConversationKeyDocument(
   serialized: string,
 ): Map<string, Uint8Array> {
   const document = parseRecord(serialized);
+  assertDocumentVersionNotFromFuture(
+    "conversation-keys",
+    LEGACY_CONVERSATION_KEY_DOCUMENT_VERSION,
+    document.version,
+  );
   if (
     Object.prototype.hasOwnProperty.call(
       document,
@@ -59,16 +73,22 @@ export function parseLegacyConversationKeyDocument(
     )
   ) {
     // A v1 envelope normally has no marker. If one is explicitly present, it is
-    // authoritative and must be checked before version or key parsing.
+    // authoritative for every non-future version and must be checked before
+    // full version or key parsing.
     assertDocumentStorageIdentity(
       "conversation-keys",
       scope,
       document[CONVERSATION_KEY_IDENTITY_FIELD],
     );
   }
-  if (document.version !== LEGACY_CONVERSATION_KEY_DOCUMENT_VERSION) {
-    throw new StorageDocumentError("conversation-keys", "invalid-document");
-  }
+  // The v1 reader answers the same question as the v2 one: a version above the
+  // one it understands is a downgrade signal, not malformed key material, and
+  // must not be adopted-or-discarded as ordinary corruption (#159).
+  assertSupportedDocumentVersion(
+    "conversation-keys",
+    LEGACY_CONVERSATION_KEY_DOCUMENT_VERSION,
+    document.version,
+  );
   return parseKeys(document.keys);
 }
 

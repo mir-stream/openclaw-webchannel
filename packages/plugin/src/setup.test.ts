@@ -508,6 +508,41 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     expect(acquireMock).not.toHaveBeenCalled();
   });
 
+  it("preserves future-document remediation instead of suggesting migration retry", async () => {
+    migrationMock.mockImplementationOnce(() => {
+      throw new StorageDocumentError(
+        "conversation-keys",
+        "version-too-new",
+      );
+    });
+    const runtime = makeRuntime();
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: { tenant: "tA", saas: { baseUrl: "http://s" } },
+          },
+        },
+      },
+    } as never;
+
+    await webchannelSetup.afterAccountConfigWritten({
+      previousCfg: cfg,
+      cfg,
+      accountId: "accta",
+      input: {},
+      runtime,
+    });
+
+    const output = runtime.log.mock.calls.flat().join("\n");
+    expect(output).toContain("code=conversation-keys-version-too-new");
+    expect(output).toContain("Run the plugin version that wrote it (or newer)");
+    expect(output).not.toContain("recoverable legacy backup");
+    expect(output).not.toContain("then retry");
+    expect(output).not.toContain("archive the account credential file");
+    expect(acquireMock).not.toHaveBeenCalled();
+  });
+
   it("echoes the RESOLVED identity (non-secret) so the generic-flag mapping is not silent", async () => {
     const runtime = makeRuntime();
     const cfg = { channels: { webchannel: { accounts: { accta: {} } } } } as never;

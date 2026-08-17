@@ -275,7 +275,7 @@ describe("ConversationKeyStore", () => {
     const candidate = JSON.parse(
       readFileSync(storePath(), "utf8"),
     ) as Record<string, unknown>;
-    candidate.version = 999;
+    candidate.version = "999";
     const targetBytes = Buffer.from(JSON.stringify(candidate));
     const targetPath = storePath(ACCOUNT, "tenant-B");
     mkdirSync(dirname(targetPath), { recursive: true, mode: 0o700 });

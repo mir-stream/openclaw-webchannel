@@ -66,6 +66,7 @@ export type CredentialBindingField =
 
 export type StorageIdentityErrorCode =
   | "invalid-shape"
+  | "version-too-new"
   | "unsupported-version"
   | "invalid-field";
 
@@ -335,11 +336,20 @@ function requireRecord(value: unknown): Record<string, unknown> {
 }
 
 function requireVersion(record: Record<string, unknown>): void {
-  if (record.identityVersion !== STORAGE_IDENTITY_VERSION) {
-    throw new StorageIdentityContractError("unsupported-version", [
+  const version = record.identityVersion;
+  if (version === STORAGE_IDENTITY_VERSION) return;
+  if (
+    typeof version === "number" &&
+    Number.isSafeInteger(version) &&
+    version > STORAGE_IDENTITY_VERSION
+  ) {
+    throw new StorageIdentityContractError("version-too-new", [
       "identityVersion",
     ]);
   }
+  throw new StorageIdentityContractError("unsupported-version", [
+    "identityVersion",
+  ]);
 }
 
 function parseStorageScope(

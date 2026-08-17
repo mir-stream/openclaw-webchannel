@@ -482,7 +482,7 @@ describe("decryptBacklog — full late-join round-trip (Sub-AC 2b primary assert
       const { envelopes, plaintexts } = buildBacklog(convKey, M);
       const deviceKP = generateKeyPair();
 
-      // Simulate page stitching (as would happen with HistoryStore.loadHistory pagination).
+      // Simulate page stitching (as `history.ts` does with `pageBefore` cursors).
       const pages: MessageEnvelope[][] = [];
       for (let p = 0; p < M; p += PAGE_SIZE) {
         pages.push(envelopes.slice(p, p + PAGE_SIZE));

@@ -96,6 +96,7 @@ import {
 } from "./account-config.js";
 import {
   credentialStorageFailureDiagnostic,
+  isVersionTooNew,
   StorageDocumentError,
 } from "./storage-document.js";
 import type { KeyPair } from "./e2e-crypto.js";
@@ -826,23 +827,38 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // accountId is the wire identity (one namespace per account).
       let channel: NatsChannel;
       try {
+        const keyStore = new ConversationKeyStore({
+          tenant,
+          accountId,
+          ...(plan.storageRoot !== undefined
+            ? { storageRoot: plan.storageRoot }
+            : {}),
+          onCapacityWarning: capacityDiagnostics.onCapacityWarning,
+        });
+        // #159: do not publish a serving runtime that will fail its first
+        // registration after discovering state written by a newer release.
+        // This probe is version-only and non-mutating; ordinary corruption
+        // keeps the key store's existing lazy quarantine/audit policy.
+        keyStore.assertNoFutureDocuments();
         channel = new NatsChannel(transport, accountId, tenant, {
           ...cryptoOptions,
-          keyStore: new ConversationKeyStore({
-            tenant,
-            accountId,
-            ...(plan.storageRoot !== undefined
-              ? { storageRoot: plan.storageRoot }
-              : {}),
-            onCapacityWarning: capacityDiagnostics.onCapacityWarning,
-          }),
+          keyStore,
           identityKeyPair: attemptIdentityKey,
         });
       } catch (err) {
         try { detachTransportListeners?.(); } catch { /* close still owns cleanup */ }
         const closeReport = await transport.closeGracefully();
         attemptAbort.dispose();
-        return { kind: "failed" as const, cause: err, closeReport };
+        const cause = isVersionTooNew(err)
+          ? new AccountStartupError({
+              kind: "permanent",
+              code: `${err.document}-version-too-new`,
+              phase: "preflight",
+              cause: err,
+              operatorMessage: err.message,
+            })
+          : err;
+        return { kind: "failed" as const, cause, closeReport };
       }
       log("info",
         `[webchannel] account "${accountId}" ✓ encrypted NATS channel (tenant=${tenant}, accountId=${accountId})`,

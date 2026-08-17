@@ -26,6 +26,7 @@ import {
 import { createMemoizedPersistedAccessor, prepareAccountAuth } from "./account-auth.js";
 import type { AuthConfig, ResolvedJwtVerifierConfig } from "./auth.js";
 import { resolveDialMaterial, type DialMaterial } from "./consume-credentials.js";
+import { ConversationKeyStore } from "./conversation-key-store.js";
 import { resolveEncryptionPolicy, type WebchannelEncryptionConfig } from "./encryption-policy.js";
 import { JWKSCache, type JsonWebKeySet } from "./jwks.js";
 import {
@@ -43,6 +44,7 @@ import {
 } from "./credential-document.js";
 import {
   credentialStorageFailureDiagnostic,
+  isVersionTooNew,
   StorageDocumentError,
 } from "./storage-document.js";
 
@@ -80,6 +82,20 @@ export type DoctorDeps = {
 
 const reEnrollFix = (accountId: string) =>
   `Run: openclaw channels add --channel webchannel --account ${accountId}`;
+
+function futureConversationKeyDiagnostic(input: {
+  tenant: string;
+  accountId: string;
+  storageRoot?: string;
+}): ReturnType<typeof credentialStorageFailureDiagnostic> | undefined {
+  try {
+    new ConversationKeyStore(input).assertNoFutureDocuments();
+    return undefined;
+  } catch (error) {
+    if (!isVersionTooNew(error)) throw error;
+    return credentialStorageFailureDiagnostic(error);
+  }
+}
 
 export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): DoctorFinding[] {
   const env = deps.env ?? process.env;
@@ -244,8 +260,10 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
             severity: "error",
             message: `${diagnostic.detail}.`,
             fix:
-              "Stop all old WebChannel plugin processes for this account, inspect the " +
-              "recoverable legacy backup if present, then retry.",
+              err.code === "version-too-new"
+                ? diagnostic.detail
+                : "Stop all old WebChannel plugin processes for this account, inspect the " +
+                  "recoverable legacy backup if present, then retry.",
           });
           continue;
         }
@@ -271,6 +289,35 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
           message: "The enrolled credentials carry no attested agent identity key; the account is skipped.",
           fix: `${reEnrollFix(accountId)} to mint an attested identity key.`,
         });
+      }
+    }
+
+    // An injected credential reader is a complete persistence seam for doctor
+    // tests/embedders. Production has no injection and inspects the real tuple,
+    // matching runtime's non-mutating pre-publication compatibility gate.
+    if (!injectedLoadCreds) {
+      try {
+        const diagnostic = futureConversationKeyDiagnostic({
+          tenant,
+          accountId,
+          ...(plan.storageRoot !== undefined
+            ? { storageRoot: plan.storageRoot }
+            : {}),
+        });
+        if (diagnostic) {
+          findings.push({
+            accountId,
+            checkId: "credential-storage-failed",
+            kind: "auth",
+            severity: "error",
+            message: `${diagnostic.detail}.`,
+            fix: diagnostic.detail,
+          });
+          continue;
+        }
+      } catch (err) {
+        findings.push(configurationInvalidFinding(accountId, err));
+        continue;
       }
     }
 
@@ -452,6 +499,26 @@ export async function probeWebchannelAccount(params: {
           error: credentialLoad.status === "absent"
             ? `no enrolled credentials for ${accountId}`
             : formatCredentialInspection(credentialLoad),
+          accountId,
+          admission: "register-hop",
+        };
+      }
+    }
+    // `loadCreds` is a complete injected persistence seam. The production
+    // adapter has no injection and checks the same tuple documents runtime
+    // gates before publication, before any relay or JWKS network operation.
+    if (!deps.loadCreds) {
+      const diagnostic = futureConversationKeyDiagnostic({
+        tenant: plan.tenant,
+        accountId,
+        ...(plan.storageRoot !== undefined
+          ? { storageRoot: plan.storageRoot }
+          : {}),
+      });
+      if (diagnostic) {
+        return {
+          ok: false,
+          error: `${diagnostic.code}: ${diagnostic.detail}`,
           accountId,
           admission: "register-hop",
         };

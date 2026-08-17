@@ -259,11 +259,68 @@ describe("credential document semantic binding", () => {
     });
 
     const unsupported = cloneDocument();
-    unsupported.credentialIdentity.identityVersion = 99;
+    unsupported.credentialIdentity.identityVersion = 1;
     expect(inspectCredentialDocument(EXPECTED, unsupported)).toEqual({
       status: "invalid",
       code: "unsupported-version",
       fields: ["identityVersion"],
+    });
+  });
+
+  it("classifies a future identity before payload fields unknown to this build", () => {
+    const candidate = cloneDocument();
+    candidate.credentialIdentity.identityVersion = 99;
+    delete candidate.enrollment.natsUrl;
+    candidate.identityKey.privateKey = "future-private-key-shape";
+
+    expect(inspectCredentialDocument(EXPECTED, candidate)).toEqual({
+      status: "invalid",
+      code: "version-too-new",
+      fields: ["identityVersion"],
+    });
+    let thrown: unknown;
+    try {
+      loadBoundCredentialDocument(EXPECTED, candidate);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({
+      document: "credentials",
+      code: "version-too-new",
+    });
+    expect(String(thrown)).not.toContain("future-private-key-shape");
+  });
+
+  it.each([1, "3", 2.5, null])(
+    "keeps lower or malformed identity version %j unsupported",
+    (version) => {
+      const candidate = cloneDocument();
+      candidate.credentialIdentity.identityVersion = version;
+      expect(inspectCredentialDocument(EXPECTED, candidate)).toEqual({
+        status: "invalid",
+        code: "unsupported-version",
+        fields: ["identityVersion"],
+      });
+    },
+  );
+
+  it("keeps an absent identity version on the existing unbound path", () => {
+    const candidate = cloneDocument();
+    delete candidate.credentialIdentity.identityVersion;
+    expect(inspectCredentialDocument(EXPECTED, candidate)).toEqual({
+      status: "unbound",
+    });
+  });
+
+  it("keeps malformed payload precedence for a nonnumeric identity version", () => {
+    const candidate = cloneDocument();
+    candidate.credentialIdentity.identityVersion = "3";
+    delete candidate.enrollment.natsUrl;
+
+    expect(inspectCredentialDocument(EXPECTED, candidate)).toEqual({
+      status: "invalid",
+      code: "invalid-document",
+      fields: ["enrollment.natsUrl"],
     });
   });
 

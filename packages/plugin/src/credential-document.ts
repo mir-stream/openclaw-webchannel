@@ -12,6 +12,7 @@ import { deriveEnrollmentEndpoints } from "./saas-authority.js";
 import {
   createCredentialBindingIdentityV2,
   inspectCredentialBindingIdentityV2,
+  STORAGE_IDENTITY_VERSION,
   type CredentialBindingField,
   type CredentialBindingIdentityV2,
   type IdentityInspection,
@@ -255,6 +256,7 @@ export function assertCredentialDocumentStorage(
   if (!isRecord(candidate)) {
     throw new StorageDocumentError("credentials", "invalid-document");
   }
+  assertCredentialIdentityVersionNotFromFuture(candidate);
   assertDocumentStorageIdentity(
     "credentials",
     scope,
@@ -304,6 +306,7 @@ export function upgradeLegacyCredentialDocument(
   if (!isRecord(candidate)) {
     throw new StorageDocumentError("credentials", "invalid-document");
   }
+  assertCredentialIdentityVersionNotFromFuture(candidate);
   if (!legacyCredentialProvesScope(scope, candidate)) {
     throw new StorageDocumentError("credentials", "identity-mismatch", [
       "storage.tenant",
@@ -404,7 +407,15 @@ export function loadBoundCredentialDocument(
   candidate: unknown,
 ): BoundCredentialLoadResult {
   const evaluated = evaluateCredentialDocument(expected, candidate);
-  if (!("payload" in evaluated)) return evaluated.inspection;
+  if (!("payload" in evaluated)) {
+    if (
+      evaluated.inspection.status === "invalid" &&
+      evaluated.inspection.code === "version-too-new"
+    ) {
+      throw new StorageDocumentError("credentials", "version-too-new");
+    }
+    return evaluated.inspection;
+  }
   const document = {
     ...evaluated.payload.document,
     enrollment: evaluated.payload.document.enrollment!,
@@ -441,6 +452,14 @@ function evaluateCredentialDocument(
   expected: CredentialBindingExpectation,
   candidate: unknown,
 ): Evaluation {
+  // A newer identity schema may legitimately change fields this build's payload
+  // parser requires. Recognize only a well-formed future integer before payload
+  // validation; every lower or malformed version keeps its existing precedence.
+  if (hasFutureCredentialIdentityVersion(candidate)) {
+    return {
+      inspection: invalidInspection("version-too-new", ["identityVersion"]),
+    };
+  }
   let payload: ParsedPayload;
   try {
     payload = parsePayload(candidate);
@@ -693,6 +712,34 @@ function parseJson(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasFutureCredentialIdentityVersion(candidate: unknown): boolean {
+  if (
+    !isRecord(candidate) ||
+    !Object.prototype.hasOwnProperty.call(
+      candidate,
+      CREDENTIAL_BINDING_IDENTITY_FIELD,
+    )
+  ) {
+    return false;
+  }
+  const identity = candidate[CREDENTIAL_BINDING_IDENTITY_FIELD];
+  if (!isRecord(identity)) return false;
+  const version = identity.identityVersion;
+  return (
+    typeof version === "number" &&
+    Number.isSafeInteger(version) &&
+    version > STORAGE_IDENTITY_VERSION
+  );
+}
+
+function assertCredentialIdentityVersionNotFromFuture(
+  candidate: unknown,
+): void {
+  if (hasFutureCredentialIdentityVersion(candidate)) {
+    throw new StorageDocumentError("credentials", "version-too-new");
+  }
 }
 
 function isStringArray(value: unknown): value is string[] {
