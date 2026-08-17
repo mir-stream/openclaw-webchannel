@@ -294,10 +294,9 @@ reconnect window, not just agent death.
 **Rejected approach (v2), for the record:** finalize the draft from the
 register history snapshot via tier-3 positional adoption. Its premise —
 "the finalized row exists in the snapshot iff the turn already completed" —
-is FALSE by dist evidence: core appends user/assistant/toolResult messages to
-the session transcript **per `message_end` event, mid-run**
-(`node_modules/openclaw/dist/sessions-BY13LxNc.js:9705-9710`
-`if (event.type === "message_end") … sessionManager.appendMessage(…)`), and an
+is FALSE by pinned-core observation: core appends user/assistant/toolResult
+messages to the session transcript **per `message_end` event, mid-run**
+(internal behavior verified at 2026.7.1-2), and an
 agentic turn emits multiple assistant messages around tool calls. Since a
 snapshot is broadcast to EVERY device whenever ANY device registers
 (`nats-client-wrapper.ts:279-283`), a mid-turn snapshot with intermediate

@@ -31,20 +31,23 @@ fix hint, instead of a silent log skip.
 status/probe surfaces (§3.3–3.4) are **Phase 2**, built on the same engine,
 landed as separate commits so Phase 1 stands alone if Phase 2 hits an SDK wall.
 
-## 2. Dist-verified SDK contract (openclaw 2026.6.10)
+## 2. Durable SDK contract + version-stamped internals
 
 > Past incident (P0 round-1): a plan doc cited a fabricated runtime field.
-> Everything below was grepped from `node_modules/openclaw/dist` on 2026-07-15.
-> Note: openclaw ships bundled dist only — `.ts` source citations from the gap
-> doc are unverifiable; all citations here are dist file:line.
+> Contract claims below bind to stable `openclaw/plugin-sdk/*` exports. Internal
+> routing behavior has no durable declaration, so it is explicitly stamped
+> `verified at 2026.7.1-2` instead of citing a hash-named bundle.
 
 **Correction to the gap doc.** The real `ChannelDoctorAdapter` is **not** a
 scanner registry — it is config-repair/warning hooks. `ChannelStatusIssue` and
 `BaseProbeResult` belong to the **separate** `ChannelStatusAdapter`. Two sibling
 slots on `ChannelPlugin`:
 
-- `doctor?: ChannelDoctorAdapter` — `dist/types.plugin-CTcdBrrg.d.ts:52`
-- `status?: ChannelStatusAdapter<ResolvedAccount, Probe, Audit>` — `:41`
+- `doctor?: ChannelDoctorAdapter`
+- `status?: ChannelStatusAdapter<ResolvedAccount, Probe, Audit>`
+
+Contract: `openclaw/plugin-sdk/channel-runtime` exports `ChannelPlugin`,
+`ChannelDoctorAdapter`, and `ChannelStatusAdapter`.
 
 There is no standalone `probe` slot — probe = `status.probeAccount`.
 
@@ -52,12 +55,13 @@ There is no standalone `probe` slot — probe = `status.probeAccount`.
 
 **Path A — static config scan (works with the gateway DOWN).**
 `openclaw doctor` → `collectChannelDoctorPreviewWarnings`
-(`dist/channel-doctor-BII-6bFB.js:209-227`) → `listChannelDoctorEntries`
-(`:105-127`), which merges the `doctor` slot from (a) read-only-resolved plugins
+→ `listChannelDoctorEntries`, which merges the `doctor` slot from (a)
+read-only-resolved plugins
 (`resolveReadOnlyChannelPluginsForConfig` — loads external plugins including the
 **setup entry** fallback), (b) the loaded plugin registry, (c) bundled plugins.
 Gating: channel key present under `cfg.channels` and not `enabled:false`,
-plugins enabled (`collectConfiguredChannelIds`, `:30-41`).
+plugins enabled (`collectConfiguredChannelIds`). Internal routing verified at
+2026.7.1-2.
 
 Hook we implement:
 
@@ -69,18 +73,19 @@ collectPreviewWarnings?: (params: {
 }) => string[] | Promise<string[]>;
 ```
 
-(`dist/plugin-sdk/types.adapters-COgmKWsA.d.ts:502-506`; full adapter `:493-525`.)
+Contract: `ChannelDoctorAdapter`, exported by
+`openclaw/plugin-sdk/channel-contract`.
 NOT used in v1: `repairConfig`/`cleanStaleConfig`/`runConfigSequence`/
 `legacyConfigRules` (config mutations — §6), allowlist hooks (core generics
 already cover our `security.dm`).
 
 **Path B — gateway-gated health contribution.** `doctorCommand` →
-`runDoctorHealthContributions` → `dist/doctor-gateway-health-BxyJycIT.js:47`
-calls the gateway RPC `channels.status { probe: true }`; gateway-side,
-`dist/channels-status-issues-DMG35Dnw.js:62-71` iterates `listChannelPlugins()`
-and calls each `plugin.status?.collectStatusIssues(accounts)`, rendered under
-"Channel warnings". Requires a running gateway; RPC failure is silently
-swallowed (try/catch).
+`runDoctorHealthContributions` calls the gateway RPC
+`channels.status { probe: true }`; gateway-side, core iterates
+`listChannelPlugins()` and calls each
+`plugin.status?.collectStatusIssues(accounts)`, rendered under "Channel
+warnings". Requires a running gateway; RPC failure is silently swallowed
+(try/catch). Internal routing verified at 2026.7.1-2.
 
 **Design consequence.** Config findings (C-catalog) live in Path A — they must
 be visible exactly when misconfig prevents the gateway from serving. The status
@@ -89,51 +94,51 @@ when a gateway is up.
 
 ### 2.2 The status surfaces — command-by-command (review finding 4)
 
+This internal routing matrix was verified at 2026.7.1-2.
+
 | Surface | Snapshot builder | `collectStatusIssues`? | `probeAccount`? |
 |---|---|---|---|
-| plain `openclaw status` scan | `dist/account-inspection-BbD3BIbX.js:14` — `enabled/configured` + safe projected fields + **`config.describeAccount` spread**; does NOT call `status.buildAccountSnapshot` | YES — `dist/status.scan.runtime-E0ZqAgVu.js:352`; non-empty result flips channel state to `warn`, `issues[0].message` is the detail (`:355-373`) | no |
-| `channels status` | plugin-aware builder `dist/status-j1x1APRa.js:10-46` (prefers `status.buildAccountSnapshot`; attaches `probe` onto the snapshot when present, `:35`) | **no** (`channels-nLP6UG29.js` never calls it) | with `--probe`: `channels-nLP6UG29.js:224-238` |
-| health | plugin-aware builder (`health-CZIAreXu.js:395`) | no | gated by `doProbe` (`:372-374`) |
-| gateway RPC `channels.status {probe:true}` (doctor Path B) | gateway-side live accounts | YES — `channels-status-issues-DMG35Dnw.js:62-71` | yes (probe:true) |
+| plain `openclaw status` scan | account inspection: `enabled/configured` + safe projected fields + **`config.describeAccount` spread**; does NOT call `status.buildAccountSnapshot` | YES; non-empty result flips channel state to `warn`, `issues[0].message` is the detail | no |
+| `channels status` | plugin-aware builder (prefers `status.buildAccountSnapshot`; attaches `probe` onto the snapshot when present) | **no** | with `--probe` |
+| health | plugin-aware builder | no | gated by `doProbe` |
+| gateway RPC `channels.status {probe:true}` (doctor Path B) | gateway-side live accounts | YES | yes (probe:true) |
 
-There is **no dist-verified path** where `status.buildAccountSnapshot` output
+There is **no verified path** where `status.buildAccountSnapshot` output
 subsequently reaches `collectStatusIssues` on the plain scan — rev1's
 "embed findings in snapshots" pipeline is structurally invalid and is
-**abandoned** (review findings 1–3). `ChannelAccountSnapshot`
-(`types.core-BMp7ngzJ.d.ts:213`) has no index signature; no invented extension
-keys.
+**abandoned** (review findings 1–3). The `ChannelAccountSnapshot` contract,
+exported by `openclaw/plugin-sdk/channel-contract`, has no index signature; no
+invented extension keys.
 
 ### 2.3 Wire types + import path + SDK helper
 
 ```ts
-// types.core-BMp7ngzJ.d.ts:176 — NO severity field; kind is the classifier
+// ChannelStatusIssue contract — NO severity field; kind is the classifier
 type ChannelStatusIssue = {
   channel: ChannelId; accountId: string;
   kind: "intent" | "permissions" | "config" | "auth" | "runtime";
   message: string; fix?: string;
 };
-// :816
 type BaseProbeResult<TError = string | null> = { ok: boolean; error?: TError };
 ```
 
 - Import the adapter/wire types from **`openclaw/plugin-sdk/channel-contract`**
-  (`dist/plugin-sdk/channel-contract.d.ts:6`) — `channel-core` (what
-  `src/channel.ts` imports today) does not export them.
+  — its stable declaration exports `ChannelStatusIssue`, `BaseProbeResult`,
+  `ChannelDoctorAdapter`, and `ChannelStatusAdapter`; `channel-core` does not.
 - SDK helper `createComputedAccountStatusAdapter` is publicly exported from
-  `openclaw/plugin-sdk/status-helpers` (`status-helpers.d.ts:5`, signature
-  `status-helpers-Dkr4y56M.d.ts:221`) — the pattern Telegram uses
-  (`dist/channel-hdL45_1j.js:1037`). Use it for the status adapter if its
-  composed behavior fits; else hand-roll the two hooks.
-- Telegram reference (corrected dist locations): `telegramDoctor`
-  `dist/channel.setup-DCwynIzw.js:902` (attached `:1030`); `probeTelegram`
-  `dist/probe-GGcI5Ri9.js:600`; `collectTelegramStatusIssues`
-  `dist/channel-hdL45_1j.js:433`.
+  `openclaw/plugin-sdk/status-helpers` — a stable contract used by Telegram's
+  bundled status adapter (usage verified at 2026.7.1-2). Use it if its composed
+  behavior fits; else hand-roll the two hooks.
+- Telegram's bundled `telegramDoctor`, `probeTelegram`, and
+  `collectTelegramStatusIssues` remain implementation references only; their
+  attachment and call pattern were verified at 2026.7.1-2.
 
 ### 2.4 Attachment point
 
-`ChatChannelPluginBase = Omit<ChannelPlugin, "security"|"pairing"|"threading"|"outbound"> & …`
-(`dist/plugin-sdk/core-C3b8PKLj.d.ts:169`) — `doctor`/`status` flow through the
-same `Object.assign(createChannelPluginBase({...}), {...})` mechanism
+The `createChatChannelPlugin` contract exported by
+`openclaw/plugin-sdk/channel-core` accepts a `base` derived from `ChannelPlugin`;
+`doctor`/`status` flow through the same
+`Object.assign(createChannelPluginBase({...}), {...})` mechanism
 `message`/`approvalCapability`/`gateway` already use (`src/channel.ts:111-171`).
 `setup-entry.ts:15` calls the same `createWebChannelPlugin(transport)`, so ONE
 attach covers the doctor CLI's read-only/setup-fallback load path. Do NOT attach
@@ -172,8 +177,8 @@ createWebchannelDoctorAdapter() → ChannelDoctorAdapter  // { collectPreviewWar
 `deps` injects the fs/env seams (`loadPersistedEnrolledCreds`, `env`) so tests
 never touch the real home dir. `collectPreviewWarnings` performs **no network
 I/O** (doctor stays fast and offline; live legs belong to the probe). Warning
-lines are prefixed `- channels.webchannel.<account>: …` matching core's list
-style (`channel-doctor-BII-6bFB.js:222`).
+lines are prefixed `- channels.webchannel.<account>: …`, matching core's list
+style verified at 2026.7.1-2.
 
 Config-layout warnings are NOT string-routed from `planAccounts`' warn sink
 (rev2 finding 6): the doctor calls dedicated structured detectors — C10's
@@ -299,9 +304,9 @@ type WebchannelProbe = BaseProbeResult & {
   locally. Report `source` so the operator knows WHICH one was tested. Skipped
   for `auto`-admission accounts (no verifier by construction).
 - Fail-soft: always **return** `{ ok:false, error }`, never throw (consumers
-  catch anyway — `channels-qFKnilin.js:440-449` — but a returned shape renders
-  better). `ok` = every applicable leg passed. `credentials.mode:"open"` runs a
-  plain connect and must not fail for lacking creds.
+  catch anyway, verified at 2026.7.1-2, but a returned shape renders better).
+  `ok` = every applicable leg passed. `credentials.mode:"open"` runs a plain
+  connect and must not fail for lacking creds.
 
 ### 3.4 `collectStatusIssues` — runtime truth only — Phase 2
 
@@ -309,24 +314,22 @@ No config-finding smuggling (review findings 1–3). The hook consumes **declare
 snapshot fields plus the runtime-attached `probe`**:
 
 1. `lastError` → `runtime` issue via the SDK helper
-   `collectStatusIssuesFromLastError` (`dist/plugin-sdk/status-helpers.d.ts:5`;
-   pattern: bundled iMessage, `dist/channel-CkUa8UjT.js:597`).
+   `collectStatusIssuesFromLastError`, exported by
+   `openclaw/plugin-sdk/status-helpers`; the bundled iMessage usage pattern was
+   verified at 2026.7.1-2.
 2. A failed attached probe (`snapshot.probe.ok === false`) → `runtime`/`auth`
    issue with the probe's per-leg error and a fix hint.
 3. On the plain scan path snapshots carry neither — the hook returns `[]`
    there; config findings are Path A's job.
 
-**The probe→issues pipeline is dist-proven end-to-end** (rev2 finding 3,
-resolved by trace): the gateway `channels.status` handler
-(`dist/channels-nLP6UG29.js:188`) with `probe:true` (a) runs
-`plugin.status.probeAccount` (`:224-238`), (b) builds each snapshot via the
-plugin-aware builder passing `probe: probeResult` (`:261-268`; the builder
-attaches it — `status-j1x1APRa.js:35`), (c) **copies a failed hook's error into
-`snapshot.lastError`** (`:270-271` `hookError … if (hookError &&
-!snapshot.lastError) snapshot.lastError = hookError`), (d) assembles
-`payload.channelAccounts` from those snapshots (`:332-336`). Doctor Path B then
-feeds exactly that payload to `plugin.status.collectStatusIssues(accounts)`
-(`channels-status-issues-DMG35Dnw.js:62-71`). Consequence: even with hook (2)
+**The probe→issues pipeline was verified end-to-end at 2026.7.1-2** (rev2
+finding 3, resolved by trace): the gateway `channels.status` handler with
+`probe:true` (a) runs `plugin.status.probeAccount`, (b) builds each snapshot via
+the plugin-aware builder passing `probe: probeResult`, (c) **copies a failed
+hook's error into `snapshot.lastError`** when no error is already present, and
+(d) assembles `payload.channelAccounts` from those snapshots. Doctor Path B
+then feeds exactly that payload to
+`plugin.status.collectStatusIssues(accounts)`. Consequence: even with hook (2)
 absent, a failed probe already surfaces via (1)'s `lastError`; hook (2) only
 upgrades the message to per-leg detail (which JWKS source failed, relay URL).
 Read `snapshot.probe` defensively (untyped attachment).
@@ -487,7 +490,7 @@ prepared verifier supplies its own immutable runtime account id as expected
 |---|-----|-------------|
 | 1 | MAJOR | §3.2 declared strictly behavior-preserving; exact inputs specified; impossible `nats.credentials.saasBaseUrl` test claim removed; auth-vs-credential base-URL divergence documented as fact (follow-up warn OUT) |
 | 2 | MAJOR | `resolveDialMaterial` fully specified: discriminated union, 3-step algorithm, `persisted.natsUrl ?? source.url` precedence, test matrix |
-| 3 | MAJOR | Gateway probe pipeline traced definitively (`channels-nLP6UG29.js:188-336`): probe attaches to snapshots AND failed-hook error copies into `lastError`; §3.4 rewritten with no conditional "verify later" |
+| 3 | MAJOR | Gateway probe pipeline traced definitively (verified at 2026.7.1-2): probe attaches to snapshots AND failed-hook error copies into `lastError`; §3.4 rewritten with no conditional "verify later" |
 | 4 | MAJOR | C3a fix text: remove ALL static signals (config + env) then enroll, or admission:"auto"; remediation-clears-finding test added |
 | 5 | MAJOR | C4 via new exported side-effect-free `validateJwtVerifierConfig` shared with `makeJwtVerifier` — no JWKS-cache mutation from offline scans |
 | 6 | MINOR | C10 narrowed to structured `detectOrphanedDefault`; env-deprecation split into new C11 with its own fix text (and no once-only-latch suppression) |
