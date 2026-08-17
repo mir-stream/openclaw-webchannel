@@ -42,6 +42,14 @@ function normalizeDistPath(citation) {
   return distOffset === -1 ? citation : citation.slice(distOffset);
 }
 
+// Pinned OpenClaw places generated chunks at the dist root, plus hashed control
+// UI assets here. Other nested trees use stable semantic basenames, where an
+// eight-letter word such as `provider` or `identity` is not a hash signal.
+function isAmbiguousRollupHashLocation(normalized) {
+  const directory = normalized.slice(0, normalized.lastIndexOf("/"));
+  return directory === "dist" || directory === "dist/control-ui/assets";
+}
+
 /**
  * Return the dist files OpenClaw exposes as durable package entrypoints.
  *
@@ -101,6 +109,7 @@ export function isHashNamedDistPath(citation, stableDistPaths = new Set()) {
 
   const basename = normalized.slice(normalized.lastIndexOf("/") + 1);
   const stem = basename.replace(DIST_ASSET_EXTENSION_RE, "");
+  const acceptsAmbiguousHash = isAmbiguousRollupHashLocation(normalized);
 
   for (let index = stem.indexOf("-"); index !== -1; index = stem.indexOf("-", index + 1)) {
     const suffix = stem.slice(index + 1);
@@ -111,7 +120,7 @@ export function isHashNamedDistPath(citation, stableDistPaths = new Set()) {
     ) {
       return true;
     }
-    if (LOWERCASE_ROLLUP_HASH_RE.test(suffix)) return true;
+    if (acceptsAmbiguousHash && LOWERCASE_ROLLUP_HASH_RE.test(suffix)) return true;
   }
   return false;
 }

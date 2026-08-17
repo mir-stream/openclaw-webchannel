@@ -56,6 +56,9 @@ describe("hash-named OpenClaw dist citation classification", () => {
       "dist/rotate-key-entry.js",
       "dist/pop-register.d.ts",
       "dist/export-html/template.css",
+      "dist/extensions/google/speech-provider.js",
+      "dist/acp-core/runtime/session-identity.d.ts",
+      "dist/extensions/elevenlabs/doctor-contract.js",
       "dist/plugin-sdk/channel-contract.d.ts",
       "node_modules/openclaw/dist/plugin-sdk/channel-outbound.js",
     ]) {
