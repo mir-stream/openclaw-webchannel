@@ -1,5 +1,43 @@
 import { describe, expect, it } from "vitest";
-import { orderConversationPresentation } from "./presentation.js";
+import { orderConversationPresentation, composerInFlight } from "./presentation.js";
+
+describe("composerInFlight (#96 — Stop affordance survives between bubbles)", () => {
+  it("is true while the agent is typing", () => {
+    expect(composerInFlight({ isTyping: true, messages: [] })).toBe(true);
+  });
+
+  it("is true while a working draft is live", () => {
+    expect(
+      composerInFlight({ messages: [{ id: "a1", role: "agent", text: "…", working: true }] }),
+    ).toBe(true);
+  });
+
+  it("stays true in the gap between bubbles — isTyping cleared, no working draft, turn still open", () => {
+    // The exact #96 hole: first bubble has settled (working:false) and the
+    // server-pushed typing was cleared, but the turn has not settled yet.
+    expect(
+      composerInFlight({
+        isTyping: false,
+        turnActive: true,
+        messages: [{ id: "a1", role: "agent", text: "first answer", working: false }],
+      }),
+    ).toBe(true);
+  });
+
+  it("is false once the turn settles (turnActive false, nothing typing/working)", () => {
+    expect(
+      composerInFlight({
+        isTyping: false,
+        turnActive: false,
+        messages: [{ id: "a1", role: "agent", text: "answer", working: false }],
+      }),
+    ).toBe(false);
+  });
+
+  it("is false for a fresh idle client (turnActive absent)", () => {
+    expect(composerInFlight({ messages: [] })).toBe(false);
+  });
+});
 
 describe("orderConversationPresentation", () => {
   it("keeps two turns' reasoning between each user and answer", () => {

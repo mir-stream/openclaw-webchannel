@@ -1,5 +1,30 @@
 import type { ChatMessage, ReasoningItem } from "../../../packages/client/src/types.js";
 
+/**
+ * #96: whether the composer should show an in-flight affordance (the Stop
+ * button). `isTyping`/`working` cover "an answer is being composed right now",
+ * but they both go false in the gaps between bubbles of a multi-step turn (more
+ * tool calls, another assistant message, an approval wait), which is exactly the
+ * "silence indistinguishable from completion" #96 reports. `turnActive` is the
+ * client-owned, turn-scoped signal that stays true across those gaps until the
+ * turn settles (see `WebChannelState.turnActive`), so folding it in here keeps
+ * the affordance alive for the whole turn. This is the widget-side consumption
+ * of a capability the client library already exposes; `turnActive` is advisory
+ * and deliberately NOT part of the library's `turnInFlight()` (that predicate
+ * gates held-send + the #81 stall detector), so the wiring lives here, not there.
+ */
+export function composerInFlight(state: {
+  isTyping?: boolean;
+  turnActive?: boolean;
+  messages: readonly ChatMessage[];
+}): boolean {
+  return (
+    state.isTyping === true ||
+    state.turnActive === true ||
+    state.messages.some((m) => m.working)
+  );
+}
+
 export type ConversationPresentationItem =
   | { kind: "message"; value: ChatMessage }
   | { kind: "reasoning"; value: ReasoningItem };

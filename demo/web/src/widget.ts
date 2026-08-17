@@ -28,6 +28,7 @@ import {
   orderConversationPresentation,
   captureOpenReasoningIds,
   buildReasoningDetails,
+  composerInFlight,
 } from "./presentation.js";
 
 const STATUS_LABEL: Record<WebChannelState["status"], string> = {
@@ -251,14 +252,15 @@ export async function createWidget(
       sendBtn.disabled = false;
     }
 
-    // Stop button (P1-8a): while a turn is in flight — the agent is typing, or a
-    // working (unfinalized) progress bubble is live — the primary button becomes
-    // a Stop button. Clicking it sends the literal "/stop" (wire choice (a): the
-    // typed command and the button share one server path). It restores to "Send"
-    // automatically once the terminal frame settles isTyping/working back to
-    // false. In the error state the button is disabled (above), so leave it.
+    // Stop button (P1-8a): while a turn is in flight — the agent is typing, a
+    // working (unfinalized) progress bubble is live, or the turn is still open
+    // between bubbles (#96, `turnActive`) — the primary button becomes a Stop
+    // button. Clicking it sends the literal "/stop" (wire choice (a): the typed
+    // command and the button share one server path). It restores to "Send"
+    // automatically once the turn settles. In the error state the button is
+    // disabled (above), so leave it.
     if (state.status !== "error") {
-      const inFlight = state.isTyping === true || state.messages.some((m) => m.working);
+      const inFlight = composerInFlight(state);
       sendBtn.dataset.mode = inFlight ? "stop" : "send";
       sendBtn.textContent = inFlight ? "Stop" : "Send";
     }
@@ -324,10 +326,23 @@ export async function createWidget(
     const reasoningReplacesTypingText = Boolean(
       latestUser?.turnId && state.reasoning.some((item) => item.turnId === latestUser.turnId),
     );
-    if (state.isTyping && !reasoningReplacesTypingText) {
-      bubbles.push(
-        el("div", { style: "align-self:flex-start;font-size:12px;color:var(--muted)" }, ["agent is typing…"]),
-      );
+    // Activity hint. `isTyping` is "an answer is being composed right now"; when
+    // it clears between bubbles of a still-open turn (#96, `turnActive`) — a tool
+    // round, another assistant message, an approval wait — show a softer "still
+    // working…" so the gap is not a silence indistinguishable from completion. A
+    // live `working` draft already renders its own in-progress bubble, so it
+    // needs no separate line; a live reasoning lane is itself the activity signal.
+    if (!reasoningReplacesTypingText) {
+      const hint = state.isTyping
+        ? "agent is typing…"
+        : state.turnActive === true && !state.messages.some((m) => m.working)
+          ? "still working…"
+          : null;
+      if (hint) {
+        bubbles.push(
+          el("div", { style: "align-self:flex-start;font-size:12px;color:var(--muted)" }, [hint]),
+        );
+      }
     }
     list.replaceChildren(...bubbles);
     mdCache = nextMdCache;
