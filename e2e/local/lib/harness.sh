@@ -227,12 +227,18 @@ harness_build_plugin() {
 #
 # WHY THIS AND NOT THE PROVENANCE LINE (#125 review): building the right file and
 # the gateway LOADING that file are two different claims, and only the first was
-# ever checked. Core logs its resolution as
+# ever checked. The full-registration callback behind `index-nats.ts`, in
+# `packages/plugin/src/nats-account-runtime.ts`, always self-reports the running
+# module path (resolved from `import.meta.url`) as
+#   webchannel: loaded plugin bundle (plugin=webchannel, source=<path>)
+# Pinned core may also log its resolution as
 #   [plugins] channel "webchannel" registered … (plugin=webchannel, source=<path>)
-# so the gate can read the second claim straight from the horse's mouth. This
-# catches a core update that changes plugin resolution (e.g. one that starts
-# honouring the .ts entry, or resolves an installed copy instead of the
-# workspace) — the whole class of "your build was fine and irrelevant".
+# That core diagnostic is corroborating when present, while the plugin-owned
+# record is the guaranteed healthy-load signal. Both carry the same
+# parenthetical, so the complete parsed source set still catches a core update
+# that changes plugin resolution (e.g. one that starts honouring the .ts entry,
+# or resolves an installed copy instead of the workspace) — the whole class of
+# "your build was fine and irrelevant".
 #
 # It also re-hashes the bundle to catch anything that rewrote dist/ between the
 # build and gateway start (a concurrent gate, a stray watch process).
@@ -250,7 +256,12 @@ harness_assert_loaded_dist() {
     return 2
   fi
 
-  local loaded_sources
+  local plugin_loaded_sources loaded_sources
+  plugin_loaded_sources="$(
+    sed -nE '
+      s/^.*webchannel: loaded plugin bundle \(plugin=webchannel, source=(.*)\)[[:space:]]*$/\1/p
+    ' "$gwlog" | sort -u
+  )"
   loaded_sources="$(
     sed -nE '
       /[(,][[:space:]]*plugin=webchannel[[:space:]]*[,)]/ {
@@ -269,7 +280,21 @@ harness_assert_loaded_dist() {
     if [ -n "$loaded_sources" ]; then
       printf '%s\n' "$loaded_sources" | sed "s|^|[$tag]     source=|" >&2
     else
-      echo "[$tag]     (none — core logged no source for plugin=webchannel)" >&2
+      echo "[$tag]     (none — no provenance record for plugin=webchannel)" >&2
+    fi
+    return 2
+  fi
+
+  # Core can report the same parenthetical for both successful registration and
+  # load failures. Only this plugin-owned marker proves full registration ran.
+  if [ "$plugin_loaded_sources" != "$HARNESS_DIST" ]; then
+    echo "[$tag] DIST-ASSERT FAIL: no plugin-owned healthy-load marker for the bundle this gate built." >&2
+    echo "[$tag]   expected marker: webchannel: loaded plugin bundle (plugin=webchannel, source=$HARNESS_DIST)" >&2
+    echo "[$tag]   plugin-reported loaded sources:" >&2
+    if [ -n "$plugin_loaded_sources" ]; then
+      printf '%s\n' "$plugin_loaded_sources" | sed "s|^|[$tag]     source=|" >&2
+    else
+      echo "[$tag]     (none — no plugin-owned loaded-bundle marker)" >&2
     fi
     return 2
   fi

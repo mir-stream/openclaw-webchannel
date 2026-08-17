@@ -10,6 +10,7 @@
  */
 
 import { AsyncResource } from "node:async_hooks";
+import { fileURLToPath } from "node:url";
 
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 
@@ -128,6 +129,11 @@ import {
   isWebchannelAccountEnabled,
   listWebchannelAccountIds,
 } from "./account-config.js";
+
+// In the published single-file bundle, import.meta.url is the URL of the
+// dist/index-nats.js module the host actually evaluated. Keep this runtime
+// self-report separate from build provenance: the live module names itself.
+const LOADED_PLUGIN_BUNDLE_PATH = fileURLToPath(import.meta.url);
 
 export {
   NatsAccountRuntimeCoordinator,
@@ -1588,5 +1594,8 @@ export default defineChannelPluginEntry({
       },
     });
     accountCoordinator.installFull(api);
+    api.logger.info(
+      `webchannel: loaded plugin bundle (plugin=webchannel, source=${LOADED_PLUGIN_BUNDLE_PATH})`,
+    );
   },
 });

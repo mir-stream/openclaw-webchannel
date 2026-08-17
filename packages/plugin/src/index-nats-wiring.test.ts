@@ -254,6 +254,23 @@ describe("index-nats.ts browser-route absence", () => {
 });
 
 describe("index-nats.ts account lifecycle ownership", () => {
+  it("self-reports the loaded bundle through the full-registration logger", () => {
+    expect(RUNTIME_SOURCE).toContain(
+      "const LOADED_PLUGIN_BUNDLE_PATH = fileURLToPath(import.meta.url);",
+    );
+    expect(RUNTIME_SOURCE).toMatch(
+      /api\.logger\.info\(\s*`webchannel: loaded plugin bundle \(plugin=webchannel, source=\$\{LOADED_PLUGIN_BUNDLE_PATH\}\)`\s*,?\s*\)/,
+    );
+    expect(
+      RUNTIME_SOURCE.match(/webchannel: loaded plugin bundle \(plugin=/g),
+    ).toHaveLength(1);
+    expect(
+      RUNTIME_SOURCE.indexOf("accountCoordinator.installFull(api);"),
+    ).toBeLessThan(
+      RUNTIME_SOURCE.indexOf("`webchannel: loaded plugin bundle (plugin="),
+    );
+  });
+
   it("keeps registerFull synchronous and network-free", () => {
     // The guard clause still comes first, and account work is still delegated
     // wholesale to the coordinator. Registration-time hooks may sit between the
