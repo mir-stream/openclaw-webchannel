@@ -8,6 +8,7 @@
     "examples/*"
   ],
   "scripts": {
+    "lint:citations": "node scripts/lint-citations.mjs",
     "test": "vitest run",
     "test:inventory": "node scripts/check-test-inventory.mjs",
     "test:inventory:update": "node scripts/check-test-inventory.mjs --update",

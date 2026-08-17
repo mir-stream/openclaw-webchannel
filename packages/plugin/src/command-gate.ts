@@ -23,9 +23,9 @@
  * extra hedged notice; the harm we avoid is the opposite — suppressing the
  * notice when the abort really did silently fail).
  *
- * TRACED CORE PATHS (node_modules/openclaw/dist/command-auth-DskH_Lgk.js)
- * ----------------------------------------------------------------------
- * `resolveCommandSenderAuthorization` (line 283) is the decision:
+ * TRACED CORE BEHAVIOR (locked by `packages/plugin/src/command-gate.test.ts`)
+ * -------------------------------------------------------------------------
+ * `resolveCommandSenderAuthorization` is the decision:
  *   1. `if (enforceOwnerForCommands && !isOwnerForCommands) return false;`
  *      — `enforceOwnerForCommands` is the PLUGIN flag
  *      (`plugin.commands.enforceOwnerForCommands`); webchannel's plugin does not
@@ -37,31 +37,30 @@
  *   3. `return commandAuthorized && (isOwnerForCommands || nativeCommandAuthorized);`
  *      — the default path where our stamp (`commandAuthorized === true`) is
  *      honored, PROVIDED `isOwnerForCommands` is true. `isOwnerForCommands`
- *      (line 398) collapses to `true` UNLESS an owner allowlist is configured
+ *      collapses to `true` UNLESS an owner allowlist is configured
  *      (`requireOwner`), in which case a non-owner sender yields false and the
  *      stamp is again neutralized.
  *
  * So core IGNORES our stamp when EITHER:
  *   (A) a commands allowFrom list resolves for this channel
- *       (`commandsAllowFromList !== null`, `resolveCommandsAllowFromList` line
- *       221), OR
+ *       (`commandsAllowFromList !== null`), OR
  *   (B) an owner allowlist is configured (`cfg.commands.ownerAllowFrom`,
- *       `resolveOwnerAllowFromList` line 190 → `ownerAllowlistConfigured` →
- *       `requireOwner` line 397).
+ *       `resolveOwnerAllowFromList` → `ownerAllowlistConfigured` →
+ *       `requireOwner`).
  * We treat the `providerResolutionError` sub-clause of (A) as inapplicable: our
  * control-lane turns always stamp `Provider = "webchannel"` (inbound.ts
  * buildContext), so core resolves the provider cleanly and never takes that
  * error branch.
  *
  * CONFIG PATHS that feed those lists (both are GLOBAL `cfg.commands`, NOT
- * per-channel or per-account blocks — verified in the dist):
+ * per-channel or per-account blocks; verified at 2026.7.1-2):
  *   - (A) `cfg.commands.allowFrom` is a MAP keyed by channel id (or "*"):
- *     `resolveCommandsAllowFromList` (line 221-235) reads
+ *     `resolveCommandsAllowFromList` reads
  *     `commandsAllowFrom[providerId] ?? commandsAllowFrom["*"]` where
  *     `providerId === "webchannel"`. There is NO
  *     `channels.webchannel.commands.allowFrom` path — that shape is never read.
  *   - (B) `cfg.commands.ownerAllowFrom` is a flat list; entries may be bare or
- *     `channel:remainder`-prefixed (line 197-206 strips a matching channel
+ *     `channel:remainder`-prefixed (core strips a matching channel
  *     prefix, drops a non-matching one).
  * `accountId` does not currently change either lookup (core keys commands config
  * by channel, and webchannel's plugin defines no `config.formatAllowFrom`, so
@@ -72,10 +71,10 @@
  * CANDIDATE / ENTRY NORMALIZATION
  * -------------------------------
  * Core normalizes BOTH the allowFrom list entries AND the sender candidates
- * through `formatAllowFromList` (line 88). webchannel's plugin exposes no
+ * through `formatAllowFromList`. webchannel's plugin exposes no
  * `config.formatAllowFrom`, so that falls back to `normalizeStringEntries`
- * (string-normalization dist): coerce to string, TRIM, drop empty — no
- * lowercasing, no channel prefix. `resolveSenderCandidates` (line 293) pushes
+ * (coerce to string, TRIM, drop empty) — no lowercasing, no channel prefix.
+ * `resolveSenderCandidates` pushes
  * `SenderId` first; for our turns that is the peerId verbatim (inbound.ts sets
  * `sender.id = wsKey`), and NO `webchannel:`-prefixed candidate form is ever
  * synthesized. So membership is an EXACT, case-sensitive, trimmed match of the

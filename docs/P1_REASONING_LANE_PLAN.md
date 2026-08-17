@@ -54,16 +54,16 @@ combination is diagnosed instead of showing an empty section.
 - Partial answer text enters through `onPartialReply`; tool lifecycle events enter
   through `onToolStart` / `onItemEvent`.
 - OpenClaw has a purpose-built `onReasoningStream(payload)` callback and an
-  `onReasoningEnd()` boundary. The pinned payload is exactly
-  `{ text?: string; mediaUrls?: string[]; isReasoningSnapshot?: boolean }`
-  (verified: `dist/plugin-sdk/types-B70zVumi.d.ts:1737-1741`). We consume `text`
-  and `isReasoningSnapshot`; `mediaUrls` is ignored (text-only lane). Do not
+  `onReasoningEnd()` boundary. Contract: `GetReplyOptions`, exported by
+  `openclaw/plugin-sdk/reply-runtime`, declares `onReasoningStream` with `text`,
+  `mediaUrls`, `isReasoning`, `isReasoningSnapshot`, and
+  `requiresReasoningProgressOptIn` fields. We consume `text` and
+  `isReasoningSnapshot`; the others are ignored by the text-only lane. Do not
   depend on `isReasoning`, which is not forwarded by every runner path.
 - The plugin dispatch path forwards `onReasoningStream` with NO reasoning-level
-  gate of its own (`dist/dispatch-B2e1grFo.js:1658-1710`): the ACP runner always
-  emits a full-text snapshot (`dist/run-attempt-DRhLt3eF.js:4100-4117`) and the
-  btw runner emits cumulative full text whenever the resolved level is not `off`,
-  i.e. it emits at level `on` too (`dist/btw-CDO5476N.js:617-627`). WHETHER a
+  gate of its own: the ACP runner emits a full-text snapshot and the btw runner
+  emits cumulative full text whenever the resolved level is not `off`, i.e. it
+  emits at level `on` too (internal behaviors verified at 2026.7.1-2). WHETHER a
   channel shows reasoning to its client is therefore CHANNEL-OWNED display policy.
 - `streamReasoningInNonStreamModes` and `requiresReasoningProgressOptIn` DO exist,
   as public reply-options fields declared next to `onReasoningStream` on the
@@ -285,12 +285,11 @@ the addition is optional and forward-compatible.
 The transport frame always carries the full reasoning text accumulated so far.
 The browser reducer therefore always replaces by id; it never appends deltas.
 
-VERIFIED CONTRACT (pinned OpenClaw v2026.6.x): every emitter sends either a
-snapshot or the cumulative FULL text so far — NEVER a bare delta. The ACP runner
-emits the full accumulated text with `isReasoningSnapshot: true`
-(`dist/run-attempt-DRhLt3eF.js:4100-4117`); the btw runner accumulates
-`reasoningText += delta` and emits `reasoningText` with no snapshot flag
-(`dist/btw-CDO5476N.js:617-627`). No provider path emits a bare delta.
+VERSION-STAMPED CORE BEHAVIOR (verified at 2026.7.1-2): every emitter sends
+either a snapshot or the cumulative FULL text so far — NEVER a bare delta. The
+ACP runner emits the full accumulated text with `isReasoningSnapshot: true`; the
+btw runner accumulates `reasoningText += delta` and emits `reasoningText` with no
+snapshot flag. No provider path emits a bare delta.
 
 The per-turn plugin controller therefore maintains `currentText` with a plain
 REPLACE — no snapshot/startsWith/endsWith/concat heuristic:
@@ -573,9 +572,9 @@ silently enable tool progress or answer partials.
 These are code-contract checks, not product decisions:
 
 1. RESOLVED: the pinned OpenClaw runtime never sends bare deltas — ACP emits
-   full-text snapshots (`dist/run-attempt-DRhLt3eF.js:4100-4117`) and btw emits
-   cumulative full text (`dist/btw-CDO5476N.js:617-627`). The controller uses a
-   plain REPLACE, locked by `message-adapter.test.ts`.
+   full-text snapshots and btw emits cumulative full text (internal behaviors
+   verified at 2026.7.1-2). The controller uses a plain REPLACE, locked by
+   `message-adapter.test.ts`.
 2. Enumerate every independent wire union and transport mock before editing; this
    repository intentionally duplicates browser/server protocol types.
 3. Trace the inbound `user_message.id` through both NATS and legacy WebSocket

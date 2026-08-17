@@ -35,7 +35,7 @@ import {
 // Single default account id for Phase 1. `listAccountIds` MUST return ≥1 entry
 // and the plugin MUST expose `gateway.startAccount`, otherwise core's channel
 // monitor (`startChannelInternal`) short-circuits and never starts the native
-// approval bootstrap (dist/server-channels-g1oRRKIH.js:330-331, :339-341). We
+// approval bootstrap (verified at 2026.7.1-2). We
 // register the `approval.native` runtime context from that monitor; see
 // startClawApprovalMonitor in src/approvals.ts.
 //
@@ -58,8 +58,9 @@ type ResolvedAccount = {
 // but `createChannelPluginBase`'s return type weakens it to optional
 // (CreatedChannelPluginBase makes capabilities Partial). We pass capabilities in,
 // so at runtime it is present; the helper below documents the SDK type mismatch.
-// Verified: dist/plugin-sdk/core-HhTaqQ72.d.ts:142 (CreatedChannelPluginBase
-// optional capabilities) vs :169/:228 (ChatChannelPluginBase requires capabilities).
+// Contract: both helpers are exported by `openclaw/plugin-sdk/channel-core`; the
+// required `base` shape is derived below from `createChatChannelPlugin`'s public
+// parameter type rather than naming an internal declaration.
 type WebchannelAdapters = {
   doctor: ChannelDoctorAdapter;
   status: ChannelStatusAdapter<ResolvedAccount, WebchannelProbe>;
@@ -128,8 +129,9 @@ function isWebchannelAccountConfigured(
  * The `attachedResults` form returns `Omit<OutboundDeliveryResult, "channel">`,
  * i.e. `{ messageId }`. The `attachedResults.channel` field is required by the
  * SDK type (the acme-chat doc example omits it, but the .d.ts requires it).
- * Verified: dist/plugin-sdk/core-HhTaqQ72.d.ts:211-219 (ChatChannelAttachedOutboundOptions)
- * and dist/plugin-sdk/outbound.types-BEZiz165.d.ts:105-127 (ChannelOutboundContext).
+ * Contract: `createChatChannelPlugin` is exported by
+ * `openclaw/plugin-sdk/channel-core`, and `ChannelOutboundContext` is exported
+ * by `openclaw/plugin-sdk/channel-contract`.
  */
 export function createWebChannelPlugin(
   transport: WebChannelPeerChannel,
@@ -149,25 +151,24 @@ export function createWebChannelPlugin(
     // `message` (ChannelMessageAdapter) declares our outbound text send plus the
     // `live` progress-draft capabilities. It is attached on the base object here
     // (rather than passed into `createChannelPluginBase`, whose typed options
-    // omit `message`: core-HhTaqQ72.d.ts:124-141) because `ChatChannelPluginBase`
-    // = Omit<ChannelPlugin,...> & Partial<...> DOES carry `message`
-    // (core-HhTaqQ72.d.ts:169). It COEXISTS with the legacy `outbound` block
-    // below — the bundled SMS channel ships both (dist/extensions/sms/
-    // channel-plugin-api.js:1242 attaches `message` while also defining
-    // `outbound`). See src/message-adapter.ts for why core does not auto-drive
+    // omit `message`) because the public `createChatChannelPlugin` `base`
+    // parameter DOES carry `message`. It COEXISTS with the legacy `outbound`
+    // block; the bundled SMS channel shipped both at 2026.7.1-2. See
+    // src/message-adapter.ts for why core does not auto-drive
     // `message.live` for plugin channels and how drafts fire via the inbound
     // turn's reply callbacks instead.
     base: asWebchannelChatBase(Object.assign(withRequiredCapabilities(createChannelPluginBase<ResolvedAccount>({
       id: WEBCHANNEL_ID,
-      // `capabilities` is required on ChannelPlugin (verified:
-      // dist/types.plugin-BIHyhl5u.d.ts:22). One web chat surface => direct chats.
+      // Contract: `ChannelPlugin`, exported by
+      // `openclaw/plugin-sdk/channel-runtime`, requires `capabilities`. One web
+      // chat surface => direct chats.
       capabilities: { chatTypes: ["direct"], media: false },
       // NOTE: account resolution lives on `config` (ChannelConfigAdapter), NOT on
       // `setup` (ChannelSetupAdapter, which is for config writes). The acme-chat
       // doc example placed resolveAccount/inspectAccount under `setup`, which does
-      // not match the real types. Verified:
-      // dist/types.adapters-B6PMXit1.d.ts:127 (ChannelConfigAdapter) and
-      // dist/types.plugin-BIHyhl5u.d.ts:33-35 (config required, setup optional).
+      // not match the real types. Contract: `ChannelConfigAdapter`,
+      // `ChannelSetupAdapter`, and `ChannelPlugin` are exported by
+      // `openclaw/plugin-sdk/channel-runtime` (`config` required, `setup` optional).
       config: {
         // 가-1: list the configured accounts. A flat (legacy) config yields the
         // single `"default"` account; a per-account config lists its children.
@@ -211,12 +212,12 @@ export function createWebChannelPlugin(
       doctor: createWebchannelDoctorAdapter(),
       status: createWebchannelStatusAdapter(),
       // `approvalCapability` is a top-level ChannelPlugin field (sibling of
-      // outbound/security/message). `createChatChannelPlugin` spreads `base`
-      // into the returned plugin (dist/core-DSxVv-v1.js:255-266) and
-      // `ChatChannelPluginBase` does NOT omit `approvalCapability`
-      // (core-HhTaqQ72.d.ts:169), so attaching it here flows through — same
-      // mechanism the `message` adapter uses. The HITL native runtime delivers
-      // approval prompts over our WebSocket; see src/approvals.ts.
+      // outbound/security/message). The public `createChatChannelPlugin` base
+      // contract includes it, and the helper carries that base field into the
+      // returned plugin (runtime behavior verified at 2026.7.1-2). Attaching it
+      // here therefore flows through by the same mechanism as the `message`
+      // adapter. The HITL native runtime delivers approval prompts over our
+      // WebSocket; see src/approvals.ts.
       approvalCapability: createClawApprovalCapability(
         transport,
         opts?.resolveApprovalTransport,
@@ -225,10 +226,10 @@ export function createWebChannelPlugin(
       // account. We use it solely to register the `approval.native` runtime
       // context (which arms the native approval handler) and then stay alive for
       // the channel's lifetime. `gateway` is a top-level ChannelPlugin field that
-      // ChatChannelPluginBase does NOT omit (core-HhTaqQ72.d.ts:169), so it flows
+      // the public `createChatChannelPlugin` base contract preserves, so it flows
       // through the same way `message`/`approvalCapability` do.
-      // ChannelGatewayAdapter.startAccount signature verified:
-      // dist/plugin-sdk/types.adapters-BRNttHis.d.ts:330-331.
+      // Contract: `ChannelGatewayAdapter` is exported by
+      // `openclaw/plugin-sdk/channel-runtime`.
       gateway: {
         startAccount: (ctx: any) => opts?.startNatsAccount
           ? composeAccountLifecycles(ctx, opts.startNatsAccount)
@@ -282,14 +283,16 @@ export function createWebChannelPlugin(
         },
       },
       // No media in Phase 0. `deliveryMode` is required on the outbound base
-      // (verified: dist/plugin-sdk/outbound.types-BEZiz165.d.ts:204). We deliver
-      // directly over our own WebSocket, so "direct".
+      // (`ChannelOutboundAdapter`, exported by
+      // `openclaw/plugin-sdk/channel-contract`). We deliver directly over our
+      // own WebSocket, so "direct".
       //
       // GATE 2: `shouldSuppressLocalPayloadPrompt` lets us drop the in-band
       // `/approve …` text once the native approval route is live (core passes
       // `hint.nativeRouteActive === true`). Without this, native widget buttons
-      // AND the slash-command text would both appear. Hook verified:
-      // dist/plugin-sdk/outbound.types-BEZiz165.d.ts:227-232. We delegate to the
+      // AND the slash-command text would both appear. The hook is part of the
+      // `ChannelOutboundAdapter` contract exported by
+      // `openclaw/plugin-sdk/channel-contract`. We delegate to the
       // SDK helper via shouldSuppressClawNativeExecApprovalPrompt (src/approvals.ts).
       base: {
         deliveryMode: "direct",

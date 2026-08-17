@@ -7,8 +7,8 @@ import type { CommandGateConfig } from "./command-gate.js";
  * P1-8a follow-up — the command-gate MIRROR.
  *
  * `resolveCommandGate` is a best-effort, UX-only mirror of core's
- * `resolveCommandSenderAuthorization` (node_modules/openclaw/dist/
- * command-auth-DskH_Lgk.js). It answers ONE question for the widget: when an
+ * `resolveCommandSenderAuthorization` behavior, verified at 2026.7.1-2. It
+ * answers ONE question for the widget: when an
  * operator has configured a commands/owner allowlist, core IGNORES our
  * `access.commands.authorized` stamp, so a non-listed peer's `/stop` silently
  * fails — and the caller should send a hedged notice. These tests pin the
