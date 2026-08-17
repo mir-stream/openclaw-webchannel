@@ -1581,9 +1581,6 @@ export default defineChannelPluginEntry({
   plugin: webChannelPlugin,
   registerFull(api) {
     if (api.registrationMode !== "full") return;
-    api.logger.info(
-      `webchannel: loaded plugin bundle (plugin=webchannel, source=${LOADED_PLUGIN_BUNDLE_PATH})`,
-    );
     // #87: one lifecycle subscription per plugin generation, owned here so the
     // host can tear it down. `onAgentEvent` registers on a process-global
     // listener set, so without this a reload would stack a listener per
@@ -1597,5 +1594,8 @@ export default defineChannelPluginEntry({
       },
     });
     accountCoordinator.installFull(api);
+    api.logger.info(
+      `webchannel: loaded plugin bundle (plugin=webchannel, source=${LOADED_PLUGIN_BUNDLE_PATH})`,
+    );
   },
 });

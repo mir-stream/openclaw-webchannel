@@ -162,6 +162,17 @@ describe("harness_assert_loaded_dist", () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
+  it("rejects a matching-source core load failure without the plugin marker", () => {
+    const result = assertLoadedLog([
+      `[plugins] failed to load plugin: Error: boom (plugin=webchannel, source=${dist})`,
+    ]);
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain(
+      "(none — no plugin-owned loaded-bundle marker)",
+    );
+  });
+
   it("accepts duplicate identical webchannel source records", () => {
     const result = assertLoadedRecords([{ source: dist }, { source: dist }]);
 

@@ -256,7 +256,12 @@ harness_assert_loaded_dist() {
     return 2
   fi
 
-  local loaded_sources
+  local plugin_loaded_sources loaded_sources
+  plugin_loaded_sources="$(
+    sed -nE '
+      s/^.*webchannel: loaded plugin bundle \(plugin=webchannel, source=(.*)\)[[:space:]]*$/\1/p
+    ' "$gwlog" | sort -u
+  )"
   loaded_sources="$(
     sed -nE '
       /[(,][[:space:]]*plugin=webchannel[[:space:]]*[,)]/ {
@@ -276,6 +281,20 @@ harness_assert_loaded_dist() {
       printf '%s\n' "$loaded_sources" | sed "s|^|[$tag]     source=|" >&2
     else
       echo "[$tag]     (none — no provenance record for plugin=webchannel)" >&2
+    fi
+    return 2
+  fi
+
+  # Core can report the same parenthetical for both successful registration and
+  # load failures. Only this plugin-owned marker proves full registration ran.
+  if [ "$plugin_loaded_sources" != "$HARNESS_DIST" ]; then
+    echo "[$tag] DIST-ASSERT FAIL: no plugin-owned healthy-load marker for the bundle this gate built." >&2
+    echo "[$tag]   expected marker: webchannel: loaded plugin bundle (plugin=webchannel, source=$HARNESS_DIST)" >&2
+    echo "[$tag]   plugin-reported loaded sources:" >&2
+    if [ -n "$plugin_loaded_sources" ]; then
+      printf '%s\n' "$plugin_loaded_sources" | sed "s|^|[$tag]     source=|" >&2
+    else
+      echo "[$tag]     (none — no plugin-owned loaded-bundle marker)" >&2
     fi
     return 2
   fi

@@ -264,6 +264,11 @@ describe("index-nats.ts account lifecycle ownership", () => {
     expect(
       RUNTIME_SOURCE.match(/webchannel: loaded plugin bundle \(plugin=/g),
     ).toHaveLength(1);
+    expect(
+      RUNTIME_SOURCE.indexOf("accountCoordinator.installFull(api);"),
+    ).toBeLessThan(
+      RUNTIME_SOURCE.indexOf("`webchannel: loaded plugin bundle (plugin="),
+    );
   });
 
   it("keeps registerFull synchronous and network-free", () => {

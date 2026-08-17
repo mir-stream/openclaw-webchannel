@@ -9,7 +9,7 @@
     "demo/web/src/presentation.dom.test.ts": 4,
     "demo/web/src/presentation.test.ts": 2,
     "e2e/conversation-key-rotation-reconnect.test.ts": 1,
-    "e2e/local/harness.test.ts": 12,
+    "e2e/local/harness.test.ts": 13,
     "e2e/local/ports.test.ts": 21,
     "e2e/protocol-version-lockstep.test.ts": 1,
     "packages/client/src/browser-jwt-entry.test.ts": 4,
