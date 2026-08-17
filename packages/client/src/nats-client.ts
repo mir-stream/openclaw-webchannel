@@ -173,6 +173,12 @@ export type InboundMessage = {
   text?: string;
   turnId?: string;
   /**
+   * Optional observed run/attempt-local ordinal on an `agent_message` emitted
+   * for an authorized block. It can repeat after fallback and is not a durable
+   * hydration key.
+   */
+  assistantMessageIndex?: number;
+  /**
    * P0-4 (additive; older plugins omit it): on a `turn_settled` frame, whether
    * the turn settled cleanly. `"ok"` promotes the message whose wire id exactly
    * matches `turnId` from `accepted → completed`; `"error"` fails that message

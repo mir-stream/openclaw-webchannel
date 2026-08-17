@@ -94,7 +94,7 @@ type AssembledTurnLike = {
         isFallbackNotice?: boolean;
         isCompactionNotice?: boolean;
       },
-      info?: { kind?: string },
+      info?: { kind?: string; assistantMessageIndex?: number },
     ) => Promise<{ visibleReplySent: boolean }>;
   };
 };
@@ -191,14 +191,20 @@ function makeFakeTransport(options?: {
   throwSettleFor?: readonly string[];
 }): {
   transport: WebChannelPeerChannel;
-  finalizes: Array<{ id: string; text: string }>;
+  finalizes: Array<{ id: string; text: string; assistantMessageIndex?: number }>;
+  texts: Array<{ text: string; assistantMessageIndex?: number }>;
   progress: Array<{ id: string; text: string }>;
   typing: string[];
   settles: Array<"ok" | "error">;
   /** #99: the full settle frames, in emission order — turnId matters per member. */
   settleFrames: Array<{ turnId: string; outcome: "ok" | "error" }>;
 } {
-  const finalizes: Array<{ id: string; text: string }> = [];
+  const finalizes: Array<{
+    id: string;
+    text: string;
+    assistantMessageIndex?: number;
+  }> = [];
+  const texts: Array<{ text: string; assistantMessageIndex?: number }> = [];
   const progress: Array<{ id: string; text: string }> = [];
   const typing: string[] = [];
   const settles: Array<"ok" | "error"> = [];
@@ -208,7 +214,19 @@ function makeFakeTransport(options?: {
       typing.push(sessionKey);
       return true;
     },
-    sendText: () => true,
+    sendText: (
+      _sessionKey: string,
+      text: string,
+      _id?: string,
+      _turnId?: string,
+      assistantMessageIndex?: number,
+    ) => {
+      texts.push({
+        text,
+        ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
+      });
+      return true;
+    },
     sendReasoning: () => true,
     sendTurnSettled: (_sessionKey: string, turnId: string, outcome: "ok" | "error") => {
       settles.push(outcome);
@@ -222,8 +240,18 @@ function makeFakeTransport(options?: {
       progress.push({ id, text });
       return true;
     },
-    finalizeDraft: (_sessionKey: string, id: string, text: string) => {
-      finalizes.push({ id, text });
+    finalizeDraft: (
+      _sessionKey: string,
+      id: string,
+      text: string,
+      _turnId?: string,
+      assistantMessageIndex?: number,
+    ) => {
+      finalizes.push({
+        id,
+        text,
+        ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
+      });
       return true;
     },
     sendHistory: () => true,
@@ -231,7 +259,7 @@ function makeFakeTransport(options?: {
     sendApprovalResolved: () => true,
     sendApprovalSnapshot: () => true,
   } as WebChannelPeerChannel;
-  return { transport, finalizes, progress, typing, settles, settleFrames };
+  return { transport, finalizes, texts, progress, typing, settles, settleFrames };
 }
 
 const userMessage = { type: "user_message" as const, text: "/stop" };
@@ -392,6 +420,93 @@ describe("handleInboundMessage — terminal draft drain", () => {
     expect(finalizes).toHaveLength(1);
     expect(finalizes[0]!.text).toBe("Final answer complete");
     expect(finalizes[0]!.text).not.toContain("Stopped");
+  });
+});
+
+describe("handleInboundMessage — #111 live block ordinal", () => {
+  it("stamps only a valid block ordinal and preserves the compatibility path", async () => {
+    for (const streamingMode of ["partial", "off"] as const) {
+      for (const testCase of [
+        { label: "valid", info: { kind: "block", assistantMessageIndex: 1 }, expected: 1 },
+        { label: "missing", info: { kind: "block" }, expected: undefined },
+        {
+          label: "malformed",
+          info: {
+            kind: "block",
+            assistantMessageIndex: "1" as unknown as number,
+          },
+          expected: undefined,
+        },
+      ]) {
+        const { api } = makeFakeApi({
+          streamingMode,
+          runImpl: async (turn) => {
+            await turn.delivery.deliver(
+              { text: `${testCase.label} block` },
+              testCase.info,
+            );
+          },
+        });
+        const { transport, finalizes, texts } = makeFakeTransport();
+
+        await handleInboundMessage(api, transport, "peer-1", {
+          type: "user_message",
+          text: "answer in blocks",
+          id: `turn-${streamingMode}-${testCase.label}`,
+        });
+
+        const frames = streamingMode === "partial" ? finalizes : texts;
+        expect(frames).toHaveLength(1);
+        if (testCase.expected === undefined) {
+          expect(frames[0]).not.toHaveProperty("assistantMessageIndex");
+        } else {
+          expect(frames[0]).toHaveProperty(
+            "assistantMessageIndex",
+            testCase.expected,
+          );
+        }
+      }
+    }
+  });
+
+  it("never stamps the ordinal on finals, notices, or errors", async () => {
+    for (const streamingMode of ["partial", "off"] as const) {
+      for (const testCase of [
+        {
+          label: "final",
+          payload: { text: "ordinary final" },
+          info: { kind: "final", assistantMessageIndex: 2 },
+        },
+        {
+          label: "notice",
+          payload: { text: "status notice", isStatusNotice: true },
+          info: { kind: "block", assistantMessageIndex: 2 },
+        },
+        {
+          label: "error",
+          payload: { text: "block error", isError: true },
+          info: { kind: "block", assistantMessageIndex: 2 },
+        },
+      ] as const) {
+        const { api } = makeFakeApi({
+          streamingMode,
+          runImpl: async (turn) => {
+            await turn.delivery.deliver(testCase.payload, testCase.info);
+          },
+        });
+        const { transport, finalizes, texts } = makeFakeTransport();
+
+        await handleInboundMessage(api, transport, "peer-1", {
+          type: "user_message",
+          text: `produce ${testCase.label}`,
+          id: `turn-${streamingMode}-${testCase.label}`,
+        });
+
+        const frames = streamingMode === "partial" ? finalizes : texts;
+        expect(frames).toHaveLength(1);
+        expect(frames[0]).not.toHaveProperty("assistantMessageIndex");
+      }
+    }
   });
 });
 

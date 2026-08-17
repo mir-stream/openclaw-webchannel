@@ -162,6 +162,31 @@ describe("NatsChannel keyStore mode (register admission)", () => {
     expect(device.decrypted).toEqual([{ type: "agent_message", text: "hello" }]);
   });
 
+  it("#111 carries a supplied block ordinal and omits it on the compatibility path", () => {
+    const broker = new FakeBroker();
+    const { channel, store } = makeKeyStoreChannel(broker);
+    const device = makeDevice(broker, () => store.get(PEER));
+
+    channel.registerPeer(PEER);
+    expect(channel.finalizeDraft(PEER, "draft-2", "indexed", "turn-1", 2)).toBe(true);
+    expect(channel.sendText(PEER, "identity absent", undefined, "turn-2")).toBe(true);
+
+    expect(device.decrypted).toEqual([
+      {
+        type: "agent_message",
+        id: "draft-2",
+        text: "indexed",
+        turnId: "turn-1",
+        assistantMessageIndex: 2,
+      },
+      {
+        type: "agent_message",
+        text: "identity absent",
+        turnId: "turn-2",
+      },
+    ]);
+  });
+
   it("P0 regression: a second device's register does NOT rotate the first device's key", () => {
     const broker = new FakeBroker();
     const { channel, store } = makeKeyStoreChannel(broker);

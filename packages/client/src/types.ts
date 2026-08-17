@@ -103,6 +103,12 @@ export type ChatMessage = {
   ts?: number;
   working?: boolean;
   /**
+   * Observed run/attempt-local ordinal for an authorized block delivery. It can
+   * repeat within one user turn after model fallback, is not globally unique,
+   * and must not be used as a durable history/hydration key.
+   */
+  assistantMessageIndex?: number;
+  /**
    * P0-7b: the stable wire `id` the client stamped on the outbound
    * `user_message` this bubble echoes (user role only). Set at send/release time
    * so an `ack` frame's `accepted` transition can find the bubble. Absent on

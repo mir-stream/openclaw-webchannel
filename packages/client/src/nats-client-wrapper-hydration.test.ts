@@ -190,7 +190,12 @@ describe("#95 WP B — live timeline converges to the row sequence", () => {
   it("tier 3 adopts positionally when live text differs from stored text", () => {
     const w = makeWrapper();
     w.send("which agents are configured?");
-    deliver(w, { type: "agent_message", id: "webchannel-1", text: "LIVE reformatted answer" });
+    deliver(w, {
+      type: "agent_message",
+      id: "webchannel-1",
+      text: "LIVE reformatted answer",
+      assistantMessageIndex: 1,
+    });
 
     deliver(
       w,
@@ -204,6 +209,7 @@ describe("#95 WP B — live timeline converges to the row sequence", () => {
     // stored text won.
     expect(timeline(w)).toEqual(["user:which agents are configured?", "agent:STORED raw answer"]);
     expect(w.getState().messages.map((m) => m.id)).toEqual(["core-1", "core-2"]);
+    expect(w.getState().messages[1]).not.toHaveProperty("assistantMessageIndex");
   });
 
   /**

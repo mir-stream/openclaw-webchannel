@@ -81,6 +81,12 @@ type DeferredReplacementOperation =
   | { kind: "approval-decision"; id: string; decision: ApprovalDecision }
   | { kind: "load-history"; before?: string; limit?: number }
   | { kind: "load-commands" };
+
+function normalizeAssistantMessageIndex(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
 // P1-9: the client-side mirror of core's abort predicate (§3.3). Intentionally
 // NOT re-exported from the public barrel; imported directly here and by the
 // plugin-side contract test.
@@ -2037,8 +2043,16 @@ export class WebChannelNATSClient {
 
         const adoptAt = (idx: number, m: { id: string; text: string; ts?: number }): void => {
           // Keep the canonical stored text on adoption, so this device
-          // converges to exactly what a reloading device would render.
-          next[idx] = { ...next[idx], id: m.id, text: m.text, ts: m.ts };
+          // converges to exactly what a reloading device would render. The
+          // observed live block ordinal is deliberately discarded: history
+          // cannot validate or persist this run/attempt-local metadata.
+          const { assistantMessageIndex: _liveOrdinal, ...adoptedMessage } = next[idx];
+          next[idx] = {
+            ...adoptedMessage,
+            id: m.id,
+            text: m.text,
+            ts: m.ts,
+          };
           claimed.add(idx);
           localIndexById.set(m.id, idx);
           adopted = true;
@@ -2400,13 +2414,29 @@ export class WebChannelNATSClient {
 
       case "agent_message": {
         const { text, id } = msg;
+        const assistantMessageIndex = normalizeAssistantMessageIndex(
+          msg.assistantMessageIndex,
+        );
         this.setState({ isTyping: false });
 
         if (id) {
           this.upsertMessage(
             id,
-            (prev) => ({ ...prev, text: text ?? "", working: false, turnId: msg.turnId ?? prev.turnId }),
-            { id, role: "agent", text: text ?? "", working: false, turnId: msg.turnId },
+            (prev) => ({
+              ...prev,
+              text: text ?? "",
+              working: false,
+              turnId: msg.turnId ?? prev.turnId,
+              ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
+            }),
+            {
+              id,
+              role: "agent",
+              text: text ?? "",
+              working: false,
+              turnId: msg.turnId,
+              ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
+            },
           );
           // P1-9 §3.6.2: the final upsert also proves liveness — disarm.
           this.staleDraftWatch.delete(id);
@@ -2418,6 +2448,7 @@ export class WebChannelNATSClient {
           role: "agent",
           text: text ?? "",
           turnId: msg.turnId,
+          ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
         });
         return;
       }
