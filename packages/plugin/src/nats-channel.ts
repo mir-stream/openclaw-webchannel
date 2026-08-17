@@ -465,20 +465,8 @@ export class NatsChannel implements WebChannelPeerChannel {
   /**
    * Send progress update to peer.
    */
-  sendProgress(
-    peerId: string,
-    id: string,
-    text: string,
-    turnId?: string,
-    assistantMessageIndex?: number,
-  ): boolean {
-    const payload: OutboundWsMessage = {
-      type: "progress",
-      id,
-      text,
-      ...(turnId ? { turnId } : {}),
-      ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
-    };
+  sendProgress(peerId: string, id: string, text: string, turnId?: string): boolean {
+    const payload: OutboundWsMessage = { type: "progress", id, text, ...(turnId ? { turnId } : {}) };
     return this.sendToPeer(peerId, payload);
   }
 

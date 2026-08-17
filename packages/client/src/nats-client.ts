@@ -172,7 +172,11 @@ export type InboundMessage = {
   reason?: "overloaded";
   text?: string;
   turnId?: string;
-  /** Optional run-local identity for a trustworthy assistant block delivery. */
+  /**
+   * Optional observed run/attempt-local ordinal on an `agent_message` emitted
+   * for an authorized block. It can repeat after fallback and is not a durable
+   * hydration key.
+   */
   assistantMessageIndex?: number;
   /**
    * P0-4 (additive; older plugins omit it): on a `turn_settled` frame, whether
@@ -193,13 +197,7 @@ export type InboundMessage = {
   options?: Array<{ decision: string; label: string; style: string }>;
   expiresAtMs?: number;
   decision?: string;
-  messages?: Array<{
-    id: string;
-    role: string;
-    text: string;
-    ts?: number;
-    assistantMessageIndex?: number;
-  }>;
+  messages?: Array<{ id: string; role: string; text: string; ts?: number }>;
   /** #15: the still-pending approval set on an `approval_snapshot` frame. */
   approvals?: Array<{
     id: string;

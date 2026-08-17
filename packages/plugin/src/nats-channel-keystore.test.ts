@@ -162,7 +162,7 @@ describe("NatsChannel keyStore mode (register admission)", () => {
     expect(device.decrypted).toEqual([{ type: "agent_message", text: "hello" }]);
   });
 
-  it("#111 carries a supplied assistant identity and omits it on the compatibility path", () => {
+  it("#111 carries a supplied block ordinal and omits it on the compatibility path", () => {
     const broker = new FakeBroker();
     const { channel, store } = makeKeyStoreChannel(broker);
     const device = makeDevice(broker, () => store.get(PEER));

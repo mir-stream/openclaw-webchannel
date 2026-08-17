@@ -1961,10 +1961,7 @@ export class WebChannelNATSClient {
         //     from nextMessageId(), or `a-<n>` when a frame had no id) — the
         //     core transcript NEVER stores that platform id, so history ids
         //     can never match live ids for agent messages either.
-        // Matching happens in four tiers, in snapshot order:
-        //   0. assistant identity — a trustworthy run-local assistant index,
-        //      scoped through the live turnId preserved on the matched user /
-        //      preceding-agent anchor, adopts exactly even when text differs;
+        // Matching happens in three tiers, in snapshot order:
         //   1. id — a message whose canonical id we already hold (a prior
         //      snapshot placed or adopted it) is a no-op;
         //   2. exact text+role — adopt the server id onto the first
@@ -2008,35 +2005,18 @@ export class WebChannelNATSClient {
             ? m.id.startsWith("u-") && m.pending !== true && m.retracted !== true
             : !m.working && (m.id.startsWith("a-") || m.id.startsWith("webchannel-"));
         const adoptKey = (role: string, text: string): string => `${role} ${text}`;
-        const assistantIdentityKey = (turnId: string, assistantMessageIndex: number): string =>
-          JSON.stringify([turnId, assistantMessageIndex]);
 
         const next = existing.slice();
         const localIndexById = new Map<string, number>();
         next.forEach((m, i) => localIndexById.set(m.id, i));
         const claimed = new Set<number>();
         const adoptable = new Map<string, number[]>();
-        const adoptableByAssistantIdentity = new Map<string, number[]>();
         next.forEach((m, i) => {
           if ((m.role === "user" || m.role === "agent") && isLocalLiveId(m)) {
             const key = adoptKey(m.role, m.text);
             const idxs = adoptable.get(key) ?? [];
             idxs.push(i);
             adoptable.set(key, idxs);
-            const assistantMessageIndex = normalizeAssistantMessageIndex(
-              m.assistantMessageIndex,
-            );
-            if (
-              m.role === "agent" &&
-              assistantMessageIndex !== undefined &&
-              typeof m.turnId === "string" &&
-              m.turnId.length > 0
-            ) {
-              const identityKey = assistantIdentityKey(m.turnId, assistantMessageIndex);
-              const identityIdxs = adoptableByAssistantIdentity.get(identityKey) ?? [];
-              identityIdxs.push(i);
-              adoptableByAssistantIdentity.set(identityKey, identityIdxs);
-            }
           }
         });
 
@@ -2061,26 +2041,17 @@ export class WebChannelNATSClient {
          */
         let cursor = 0;
 
-        const adoptAt = (
-          idx: number,
-          m: {
-            id: string;
-            text: string;
-            ts?: number;
-            assistantMessageIndex?: unknown;
-          },
-        ): void => {
+        const adoptAt = (idx: number, m: { id: string; text: string; ts?: number }): void => {
           // Keep the canonical stored text on adoption, so this device
-          // converges to exactly what a reloading device would render.
-          const assistantMessageIndex = normalizeAssistantMessageIndex(
-            m.assistantMessageIndex,
-          );
+          // converges to exactly what a reloading device would render. The
+          // observed live block ordinal is deliberately discarded: history
+          // cannot validate or persist this run/attempt-local metadata.
+          const { assistantMessageIndex: _liveOrdinal, ...adoptedMessage } = next[idx];
           next[idx] = {
-            ...next[idx],
+            ...adoptedMessage,
             id: m.id,
             text: m.text,
             ts: m.ts,
-            ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
           };
           claimed.add(idx);
           localIndexById.set(m.id, idx);
@@ -2106,35 +2077,6 @@ export class WebChannelNATSClient {
           }
 
           seen.add(m.id);
-          // Tier 0: exact assistant-message identity. The numeric index resets
-          // each run, so the preceding matched/adopted row supplies the live
-          // turnId; without that scope we deliberately fall through rather
-          // than letting an old page steal a same-index bubble from a new turn.
-          const assistantMessageIndex = normalizeAssistantMessageIndex(
-            m.assistantMessageIndex,
-          );
-          const anchorTurnId = anchor === null ? undefined : next[anchor]?.turnId;
-          if (
-            m.role === "agent" &&
-            assistantMessageIndex !== undefined &&
-            typeof anchorTurnId === "string" &&
-            anchorTurnId.length > 0
-          ) {
-            const identityIdxs = adoptableByAssistantIdentity.get(
-              assistantIdentityKey(anchorTurnId, assistantMessageIndex),
-            );
-            while (
-              identityIdxs &&
-              identityIdxs.length > 0 &&
-              claimed.has(identityIdxs[0])
-            ) {
-              identityIdxs.shift();
-            }
-            if (identityIdxs && identityIdxs.length > 0) {
-              adoptAt(identityIdxs.shift()!, m);
-              continue;
-            }
-          }
           // Tier 2: exact text+role.
           const idxs = adoptable.get(adoptKey(m.role, m.text));
           while (idxs && idxs.length > 0 && claimed.has(idxs[0])) idxs.shift();
@@ -2178,7 +2120,6 @@ export class WebChannelNATSClient {
             text: m.text,
             ts: m.ts,
             working: false,
-            ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
           });
           inserts.set(cursor, atCursor);
           anchor = null;
@@ -2409,26 +2350,10 @@ export class WebChannelNATSClient {
       case "progress": {
         const { id } = msg;
         const text = msg.text ?? "";
-        const assistantMessageIndex = normalizeAssistantMessageIndex(
-          msg.assistantMessageIndex,
-        );
         this.upsertMessage(
           id ?? "",
-          (prev) => ({
-            ...prev,
-            text,
-            working: true,
-            turnId: msg.turnId ?? prev.turnId,
-            ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
-          }),
-          {
-            id: id ?? "",
-            role: "agent",
-            text,
-            working: true,
-            turnId: msg.turnId,
-            ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
-          },
+          (prev) => ({ ...prev, text, working: true, turnId: msg.turnId ?? prev.turnId }),
+          { id: id ?? "", role: "agent", text, working: true, turnId: msg.turnId },
         );
         this.setState({ isTyping: false });
         // P1-9 §3.6.2: a progress upsert on a watched draft proves the turn is

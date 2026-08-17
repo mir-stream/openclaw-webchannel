@@ -103,10 +103,9 @@ export type ChatMessage = {
   ts?: number;
   working?: boolean;
   /**
-   * Core's run-local assistant-message identity. Present only when the server
-   * could attribute a block delivery or reconstruct the corresponding history
-   * row. The history reconciler scopes it through `turnId`; absence keeps the
-   * legacy heuristic path.
+   * Observed run/attempt-local ordinal for an authorized block delivery. It can
+   * repeat within one user turn after model fallback, is not globally unique,
+   * and must not be used as a durable history/hydration key.
    */
   assistantMessageIndex?: number;
   /**

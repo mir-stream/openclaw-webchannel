@@ -192,6 +192,7 @@ function makeFakeTransport(options?: {
 }): {
   transport: WebChannelPeerChannel;
   finalizes: Array<{ id: string; text: string; assistantMessageIndex?: number }>;
+  texts: Array<{ text: string; assistantMessageIndex?: number }>;
   progress: Array<{ id: string; text: string }>;
   typing: string[];
   settles: Array<"ok" | "error">;
@@ -203,6 +204,7 @@ function makeFakeTransport(options?: {
     text: string;
     assistantMessageIndex?: number;
   }> = [];
+  const texts: Array<{ text: string; assistantMessageIndex?: number }> = [];
   const progress: Array<{ id: string; text: string }> = [];
   const typing: string[] = [];
   const settles: Array<"ok" | "error"> = [];
@@ -212,7 +214,19 @@ function makeFakeTransport(options?: {
       typing.push(sessionKey);
       return true;
     },
-    sendText: () => true,
+    sendText: (
+      _sessionKey: string,
+      text: string,
+      _id?: string,
+      _turnId?: string,
+      assistantMessageIndex?: number,
+    ) => {
+      texts.push({
+        text,
+        ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
+      });
+      return true;
+    },
     sendReasoning: () => true,
     sendTurnSettled: (_sessionKey: string, turnId: string, outcome: "ok" | "error") => {
       settles.push(outcome);
@@ -245,7 +259,7 @@ function makeFakeTransport(options?: {
     sendApprovalResolved: () => true,
     sendApprovalSnapshot: () => true,
   } as WebChannelPeerChannel;
-  return { transport, finalizes, progress, typing, settles, settleFrames };
+  return { transport, finalizes, texts, progress, typing, settles, settleFrames };
 }
 
 const userMessage = { type: "user_message" as const, text: "/stop" };
@@ -409,61 +423,89 @@ describe("handleInboundMessage — terminal draft drain", () => {
   });
 });
 
-describe("handleInboundMessage — #111 delivery identity", () => {
-  it("stamps a valid block identity on the finalized assistant frame", async () => {
-    const { api } = makeFakeApi({
-      streamingMode: "partial",
-      runImpl: async (turn) => {
-        await turn.delivery.deliver(
-          { text: "indexed block" },
-          { kind: "block", assistantMessageIndex: 1 },
-        );
-      },
-    });
-    const { transport, finalizes } = makeFakeTransport();
+describe("handleInboundMessage — #111 live block ordinal", () => {
+  it("stamps only a valid block ordinal and preserves the compatibility path", async () => {
+    for (const streamingMode of ["partial", "off"] as const) {
+      for (const testCase of [
+        { label: "valid", info: { kind: "block", assistantMessageIndex: 1 }, expected: 1 },
+        { label: "missing", info: { kind: "block" }, expected: undefined },
+        {
+          label: "malformed",
+          info: {
+            kind: "block",
+            assistantMessageIndex: "1" as unknown as number,
+          },
+          expected: undefined,
+        },
+      ]) {
+        const { api } = makeFakeApi({
+          streamingMode,
+          runImpl: async (turn) => {
+            await turn.delivery.deliver(
+              { text: `${testCase.label} block` },
+              testCase.info,
+            );
+          },
+        });
+        const { transport, finalizes, texts } = makeFakeTransport();
 
-    await handleInboundMessage(api, transport, "peer-1", {
-      type: "user_message",
-      text: "answer in blocks",
-      id: "turn-block",
-    });
+        await handleInboundMessage(api, transport, "peer-1", {
+          type: "user_message",
+          text: "answer in blocks",
+          id: `turn-${streamingMode}-${testCase.label}`,
+        });
 
-    expect(finalizes).toEqual([
-      expect.objectContaining({
-        text: "indexed block",
-        assistantMessageIndex: 1,
-      }),
-    ]);
+        const frames = streamingMode === "partial" ? finalizes : texts;
+        expect(frames).toHaveLength(1);
+        if (testCase.expected === undefined) {
+          expect(frames[0]).not.toHaveProperty("assistantMessageIndex");
+        } else {
+          expect(frames[0]).toHaveProperty(
+            "assistantMessageIndex",
+            testCase.expected,
+          );
+        }
+      }
+    }
   });
 
-  it("never stamps the repeated turn-level index from a multi-retained-final turn", async () => {
-    const { api } = makeFakeApi({
-      streamingMode: "partial",
-      runImpl: async (turn) => {
-        // Core stamps the LAST message's turn-level value on both retained
-        // finals. Treating either as a per-message identity would misattribute A.
-        await turn.delivery.deliver(
-          { text: "retained A" },
-          { kind: "final", assistantMessageIndex: 2 },
-        );
-        await turn.delivery.deliver(
-          { text: "retained B" },
-          { kind: "final", assistantMessageIndex: 2 },
-        );
-      },
-    });
-    const { transport, finalizes } = makeFakeTransport();
+  it("never stamps the ordinal on finals, notices, or errors", async () => {
+    for (const streamingMode of ["partial", "off"] as const) {
+      for (const testCase of [
+        {
+          label: "final",
+          payload: { text: "ordinary final" },
+          info: { kind: "final", assistantMessageIndex: 2 },
+        },
+        {
+          label: "notice",
+          payload: { text: "status notice", isStatusNotice: true },
+          info: { kind: "block", assistantMessageIndex: 2 },
+        },
+        {
+          label: "error",
+          payload: { text: "block error", isError: true },
+          info: { kind: "block", assistantMessageIndex: 2 },
+        },
+      ] as const) {
+        const { api } = makeFakeApi({
+          streamingMode,
+          runImpl: async (turn) => {
+            await turn.delivery.deliver(testCase.payload, testCase.info);
+          },
+        });
+        const { transport, finalizes, texts } = makeFakeTransport();
 
-    await handleInboundMessage(api, transport, "peer-1", {
-      type: "user_message",
-      text: "produce two retained answers",
-      id: "turn-finals",
-    });
+        await handleInboundMessage(api, transport, "peer-1", {
+          type: "user_message",
+          text: `produce ${testCase.label}`,
+          id: `turn-${streamingMode}-${testCase.label}`,
+        });
 
-    expect(finalizes.map((frame) => frame.text)).toEqual(["retained A", "retained B"]);
-    expect(finalizes).toHaveLength(2);
-    for (const frame of finalizes) {
-      expect(frame).not.toHaveProperty("assistantMessageIndex");
+        const frames = streamingMode === "partial" ? finalizes : texts;
+        expect(frames).toHaveLength(1);
+        expect(frames[0]).not.toHaveProperty("assistantMessageIndex");
+      }
     }
   });
 });

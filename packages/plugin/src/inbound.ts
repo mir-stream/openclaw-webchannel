@@ -1,7 +1,10 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 // #113: the reply-options contract, used to compile-check the reasoning fragment
 // below against the SDK rather than trusting the field name by eye.
-import type { GetReplyOptions } from "openclaw/plugin-sdk/reply-runtime";
+import type {
+  GetReplyOptions,
+  ReplyDispatcherOptions,
+} from "openclaw/plugin-sdk/reply-runtime";
 import {
   isReplyPayloadNonTerminalToolErrorWarning,
   type ReplyPayload,
@@ -78,14 +81,20 @@ export type FinalReconciliationState = {
   leadingTerminalErrorSeen: boolean;
 };
 
+type ReplyDispatchRuntimeInfo = Parameters<
+  NonNullable<ReplyDispatcherOptions["beforeDeliver"]>
+>[1];
+
 /**
- * Read the wider runtime dispatch info without pretending the public delivery
- * type declares it. Missing or malformed identity is the ordinary old-core
- * case and intentionally falls back to the pre-#111 path.
+ * `ChannelDeliveryInfo` publicly narrows this callback argument to `{ kind }`,
+ * while the pinned runtime forwards the wider public dispatcher-info object.
+ * Derive that object's shape from `ReplyDispatcherOptions` so SDK drift fails
+ * at our development pin. Missing or malformed identity remains an ordinary
+ * compatibility case and intentionally follows the pre-#111 path.
  */
 function deliveryAssistantMessageIndex(info: unknown): number | undefined {
   if (!info || typeof info !== "object" || Array.isArray(info)) return undefined;
-  const value = (info as { assistantMessageIndex?: unknown }).assistantMessageIndex;
+  const value = (info as Partial<ReplyDispatchRuntimeInfo>).assistantMessageIndex;
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value
     : undefined;
@@ -958,11 +967,12 @@ export async function handleInboundMessage(
                 // recovered by the register-time history snapshot (recovery lanes
                 // §5 L3/L6), never by faking the turn outcome.
                 //
-                // #111: only a BLOCK carries a true per-assistant-message
-                // identity. Final payloads may all repeat one turn-level index,
-                // so reading it there would silently attribute retained A to B.
-                // Notices/errors are not assistant transcript rows either and
-                // stay on the identity-less compatibility path.
+                // #111: only an authorized BLOCK may expose the pinned
+                // runtime's observed assistant ordinal. It is attempt-local and
+                // may repeat inside one user turn after model fallback, so it is
+                // metadata for this live block only — never a hydration key.
+                // Finals may all repeat one turn-level value; notices/errors are
+                // not assistant transcript rows. All stay identity-less.
                 const assistantMessageIndex =
                   kind === "block" && payload.isError !== true && !isNotice
                     ? deliveryAssistantMessageIndex(info)

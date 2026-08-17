@@ -505,7 +505,7 @@ export type ProgressDraftController = {
   /** Deliver an authorized block independently from every assistant lane. */
   deliverAuthorizedBlock(input: {
     text: string;
-    /** Runtime identity from this authorized block delivery, when valid. */
+    /** Observed run/attempt-local block ordinal; never a durable history key. */
     assistantMessageIndex?: number;
     isStatusNotice?: boolean;
     isFallbackNotice?: boolean;
