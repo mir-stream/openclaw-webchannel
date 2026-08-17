@@ -33,7 +33,8 @@ Generates the complete SaaS trust-chain artifacts:
 **PRIVATE** (`SaasTrustChainPrivate`, SaaS-only infrastructure):
 - RS256 private key (PKCS#8 PEM) — signs bootstrap JWTs
 - NATS account signing seed (NKEY, `SA…`) — signs NATS operator/account JWTs
-- System-account user credential — publishes runtime account-claim updates
+- System-account user credential — publishes runtime account-claim updates and
+  reads back this trust chain's exact tenant-account claim
 
 **PUBLIC** (`NatsAccountConfig` + `JwksDocument`, for nats-server + JWKS endpoint):
 - NATS operator JWT (signed by operator NKEY)

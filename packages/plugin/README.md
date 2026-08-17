@@ -104,7 +104,9 @@ tenant, account, SaaS base, delivered issuer/relay, and local public key.
   low-level `credentialPath` API remains one absolute exact credential file;
   relative overrides are rejected rather than resolved against the process
   working directory. When both are supplied, it does not relocate conversation
-  keys.
+  keys. The offline rotation entry accepts the same exact value as
+  `--credential-path`; use that option only when the deployment configured the
+  low-level override. Its value is never printed.
 - **Root changes:** `storageRoot` is not a live v2-to-v2 migration switch. Stop
   the gateway before moving the complete opaque tuple directory with its
   `0700`/`0600` permissions, or re-enroll and let browsers re-register.
@@ -131,7 +133,10 @@ renamed to an `.ambiguous-v2-*` archive and never adopted. That tuple starts wit
 an empty v2 key store, so browsers must re-register and receive a fresh K. A
 claim conflict, failed archive, destination mismatch, incomplete credential
 binding, or incomplete migration fails closed; do not run old and new binaries
-concurrently to work around it.
+concurrently to work around it. The offline rotation entry is deliberately more
+conservative: it preserves ownership-ambiguous legacy K and refuses the preview,
+so omitting or mistyping a configured exact `--credential-path` cannot silently
+turn the intended rotation target into an empty v2 store.
 
 ## E2E security model (admission + key establishment)
 
@@ -193,9 +198,29 @@ previously unseen peers receive terminal `capacity_exceeded` code 507.
 
 Do not delete entries or the whole `conversation-keys.json`, and do not raise
 the cap: either action can break encrypted-history continuity. There is no
-automatic deletion or supported key-retention/revocation workflow yet. A
-capacity warning or rejection should first be treated as a routing incident:
-inspect issuer, scalar audience, account mapping, and unexpected `sub` churn.
+automatic key-retention workflow. A capacity warning or rejection should first be
+treated as a routing incident: inspect issuer, scalar audience, account mapping,
+and unexpected `sub` churn.
+
+**The one exception is a confirmed containment.** If a conversation key K leaked,
+replace it with the installed plugin's offline rotation entry — with every
+gateway replica stopped — and follow
+[`docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md`](../../docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md)
+for the supported `openclaw plugins inspect webchannel --json` invocation and
+the order of operations. Resolve and run it as the stopped gateway's same OS
+service identity/HOME, mount/container namespace, and OpenClaw profile or
+explicit state/config selection; compare the dry-run tuple directory with the
+deployment before apply. Rotation supports one local tuple store or one
+authoritative store shared by every replica; independent per-replica volumes are
+not supported and must not be rotated separately. Deleting
+`conversation-keys.json` is still never the way to rotate: it destroys every
+peer's key at once and leaves no audit trail, which is exactly what the offline
+entry replaces. Account-wide confirmation digests bind the exact tenant,
+account, and peer set. On a shared store, every existing rotation lock or
+atomic-write temp artifact is treated as potentially remote/live and left
+untouched; consult the command's explicit apply outcome before any retry. An
+exact `--storage-root` can bridge another invocation HOME only for already-v2
+state; legacy discovery still requires the gateway's original service context.
 
 ### Account-sharding runbook
 

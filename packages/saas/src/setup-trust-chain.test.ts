@@ -124,7 +124,7 @@ describe("setupTrustChain (AC 1)", () => {
     expect(systemPayload.sub).toBe(result.natsConfig.systemAccountPublicKey);
     expect(systemPayload.iss).toMatch(/^O/);
 
-    // The update user credential stays in the private half and is canonical
+    // The update/readback credential stays in the private half and is canonical
     // NATS `.creds` material (including a user seed).
     const systemCredentialText = result.private.systemAccountCredentials;
     expect(systemCredentialText).toContain("BEGIN NATS USER JWT");
@@ -134,7 +134,13 @@ describe("setupTrustChain (AC 1)", () => {
       new TextEncoder().encode(systemCredentialText),
     );
     expect(systemCredentials.aid).toBe(result.natsConfig.systemAccountPublicKey);
-    expect(systemCredentials.uc.nats.pub?.allow).toEqual(["$SYS.REQ.CLAIMS.UPDATE"]);
+    expect(systemCredentials.uc.nats.pub?.allow).toEqual([
+      "$SYS.REQ.CLAIMS.UPDATE",
+      `$SYS.REQ.ACCOUNT.${result.natsConfig.accountPublicKey}.CLAIMS.LOOKUP`,
+    ]);
+    expect(systemCredentials.uc.nats.pub?.allow).not.toContain(
+      "$SYS.REQ.ACCOUNT.*.CLAIMS.LOOKUP",
+    );
     expect(systemCredentials.uc.nats.sub?.allow).toEqual(["_INBOX.>"]);
   });
 
