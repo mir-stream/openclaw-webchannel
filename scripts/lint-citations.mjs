@@ -16,7 +16,8 @@ const OPENCLAW_PACKAGE_JSON = path.join(
 // generated Rollup suffix is normally eight base64url characters. Most hashes
 // contain an uppercase letter, digit, or underscore, but lowercase-only hashes
 // are valid too (and do occur in the pinned package).
-const DIST_PATH_RE = /(?:node_modules\/openclaw\/)?dist\/[A-Za-z0-9._/-]+\.(?:js|d\.ts)/g;
+const DIST_PATH_RE = /(?:node_modules\/openclaw\/)?dist\/[A-Za-z0-9._/-]+\.(?:d\.ts|js|css)/g;
+const DIST_ASSET_EXTENSION_RE = /\.(?:d\.ts|js|css)$/;
 const HASH_ENTROPY_RE = /[A-Z0-9_]/;
 const HASH_CHARS_RE = /^[A-Za-z0-9_-]+$/;
 const LOWERCASE_ROLLUP_HASH_RE = /^[a-z-]{8}$/;
@@ -57,7 +58,7 @@ export function stableDistPathsFromExports(packageExports) {
       const normalized = value.startsWith("./") ? value.slice(2) : value;
       if (
         normalized.startsWith("dist/") &&
-        (normalized.endsWith(".js") || normalized.endsWith(".d.ts"))
+        DIST_ASSET_EXTENSION_RE.test(normalized)
       ) {
         stablePaths.add(normalized);
       }
@@ -99,9 +100,7 @@ export function isHashNamedDistPath(citation, stableDistPaths = new Set()) {
   if (stableDistPaths.has(normalized)) return false;
 
   const basename = normalized.slice(normalized.lastIndexOf("/") + 1);
-  const stem = basename.endsWith(".d.ts")
-    ? basename.slice(0, -".d.ts".length)
-    : basename.slice(0, -".js".length);
+  const stem = basename.replace(DIST_ASSET_EXTENSION_RE, "");
 
   for (let index = stem.indexOf("-"); index !== -1; index = stem.indexOf("-", index + 1)) {
     const suffix = stem.slice(index + 1);

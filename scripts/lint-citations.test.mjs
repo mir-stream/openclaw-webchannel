@@ -20,13 +20,14 @@ afterEach(async () => {
 });
 
 describe("hash-named OpenClaw dist citation classification", () => {
-  it("rejects generated suffixes made entirely of lowercase letters", () => {
+  it("rejects generated Rollup suffixes across supported asset types", () => {
     const paths = [
       ["dist/exec-approvals-", "bouecjdj", ".d.ts"].join(""),
       ["dist/web-provider-runtime-shared-", "bduftxrn", ".js"].join(""),
       ["node_modules/openclaw/dist/sqlite-store-", "guctwyfg", ".js"].join(""),
       ["dist/exec-approval-channel-runtime-", "t-dyeapo", ".d.ts"].join(""),
       ["dist/message-handler.process-", "CcPQD8zK", ".js"].join(""),
+      ["dist/control-ui/assets/index-", "LH4ofOKi", ".css"].join(""),
     ];
 
     for (const citation of paths) {
@@ -54,6 +55,7 @@ describe("hash-named OpenClaw dist citation classification", () => {
     for (const citation of [
       "dist/rotate-key-entry.js",
       "dist/pop-register.d.ts",
+      "dist/export-html/template.css",
       "dist/plugin-sdk/channel-contract.d.ts",
       "node_modules/openclaw/dist/plugin-sdk/channel-outbound.js",
     ]) {
@@ -66,7 +68,11 @@ describe("repository citation scan", () => {
   it("covers every first-party documentation and source surface", async () => {
     const repoRoot = await mkdtemp(path.join(tmpdir(), "citation-lint-"));
     temporaryDirectories.push(repoRoot);
-    const citation = ["node_modules/openclaw/dist/runtime-context-", "abcdefgh", ".js"].join("");
+    const citation = [
+      "node_modules/openclaw/dist/control-ui/assets/index-",
+      "LH4ofOKi",
+      ".css",
+    ].join("");
     const includedFiles = [
       "README.md",
       "docs/plan.md",
