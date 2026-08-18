@@ -166,6 +166,24 @@ export type ReasoningItem = {
   text: string;
 };
 
+/**
+ * #97: one live, turn-scoped tool-call activity item. Structured per-tool
+ * surface (name/phase/status/summary/argKeys) delivered on its own
+ * `tool_activity` wire frame — independent of the progress-draft text path, so
+ * short tool calls that never flush a draft are still visible. Like
+ * `ReasoningItem`, it is ephemeral and NOT durable history. `argKeys` carries
+ * ONLY the argument KEY NAMES — never arg values.
+ */
+export type ToolActivityItem = {
+  id: string;
+  turnId: string;
+  name?: string;
+  phase?: string;
+  status?: string;
+  summary?: string;
+  argKeys?: string[];
+};
+
 /** Native HITL approval decision; mirrors the plugin/SDK union. */
 export type ApprovalDecision = "allow-once" | "allow-always" | "deny";
 
@@ -290,6 +308,8 @@ export type WebChannelState = {
   messages: ChatMessage[];
   /** Ephemeral, non-history reasoning previews, bounded by the clients. */
   reasoning: ReasoningItem[];
+  /** Ephemeral, non-history tool-call activity, bounded by the clients (#97). */
+  toolActivity: ToolActivityItem[];
   approvals: ApprovalRequest[];
   status: ConnectionStatus;
   /** Convenience mirror of `status === "connected"`. */

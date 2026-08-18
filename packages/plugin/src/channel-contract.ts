@@ -65,6 +65,16 @@ export type OutboundWsMessage =
     }
   | { type: "progress"; id: string; text: string; turnId?: string }
   | { type: "reasoning"; id: string; turnId: string; text: string }
+  | {
+      type: "tool_activity";
+      turnId: string;
+      id: string;
+      name?: string;
+      phase?: string;
+      status?: string;
+      summary?: string;
+      argKeys?: string[];
+    }
   | { type: "turn_settled"; turnId: string; outcome: "ok" | "error" }
   | ({ type: "approval_request" } & ApprovalRequestPayload)
   | { type: "approval_resolved"; id: string; decision: ApprovalDecision }
@@ -92,6 +102,18 @@ export interface WebChannelPeerChannel {
     assistantMessageIndex?: number,
   ): boolean;
   sendReasoning(peerId: string, id: string, turnId: string, text: string): boolean;
+  sendToolActivity(
+    peerId: string,
+    activity: {
+      id: string;
+      turnId: string;
+      name?: string;
+      phase?: string;
+      status?: string;
+      summary?: string;
+      argKeys?: string[];
+    },
+  ): boolean;
   sendTurnSettled(peerId: string, turnId: string, outcome: "ok" | "error"): boolean;
   sendTyping(peerId: string): boolean;
   sendHistory(peerId: string, messages: HistoryMessage[]): boolean;
@@ -107,6 +129,7 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendProgress(_peerId: string, _id: string, _text: string, _turnId?: string): boolean { return false; }
   finalizeDraft(_peerId: string, _id: string, _text: string, _turnId?: string, _assistantMessageIndex?: number): boolean { return false; }
   sendReasoning(_peerId: string, _id: string, _turnId: string, _text: string): boolean { return false; }
+  sendToolActivity(_peerId: string, _activity: { id: string; turnId: string; name?: string; phase?: string; status?: string; summary?: string; argKeys?: string[] }): boolean { return false; }
   sendTurnSettled(_peerId: string, _turnId: string, _outcome: "ok" | "error"): boolean { return false; }
   sendTyping(_peerId: string): boolean { return false; }
   sendHistory(_peerId: string, _messages: HistoryMessage[]): boolean { return false; }

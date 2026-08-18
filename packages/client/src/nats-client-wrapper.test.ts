@@ -1916,6 +1916,85 @@ describe("WebChannelNATSClient — reasoning lane", () => {
   });
 });
 
+describe("WebChannelNATSClient — #97 tool activity lane", () => {
+  function makeWrapper(): WebChannelNATSClient {
+    return new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: "jwt",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+      registration,
+    });
+  }
+
+  function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
+    (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(frame);
+  }
+
+  it("upserts a tool_activity frame into state.toolActivity with structured fields", () => {
+    const wrapper = makeWrapper();
+    deliver(wrapper, {
+      type: "tool_activity",
+      id: "tc1",
+      turnId: "t1",
+      name: "get_weather",
+      phase: "start",
+      argKeys: ["city", "days"],
+    });
+    const list = wrapper.getState().toolActivity;
+    expect(list).toHaveLength(1);
+    expect(list[0]).toMatchObject({
+      id: "tc1",
+      turnId: "t1",
+      name: "get_weather",
+      phase: "start",
+      argKeys: ["city", "days"],
+    });
+  });
+
+  it("coalesces a same-id frame in place (no duplicate) and appends a new id", () => {
+    const wrapper = makeWrapper();
+    deliver(wrapper, { type: "tool_activity", id: "tc1", turnId: "t1", name: "bash", phase: "start" });
+    deliver(wrapper, { type: "tool_activity", id: "tc1", turnId: "t1", name: "bash", status: "completed", summary: "done" });
+    let list = wrapper.getState().toolActivity;
+    expect(list).toHaveLength(1);
+    expect(list[0]).toMatchObject({ id: "tc1", status: "completed", summary: "done" });
+
+    deliver(wrapper, { type: "tool_activity", id: "tc2", turnId: "t1", name: "grep" });
+    list = wrapper.getState().toolActivity;
+    expect(list).toHaveLength(2);
+    expect(list.map((a) => a.id)).toEqual(["tc1", "tc2"]);
+  });
+
+  it("drops a frame missing id or turnId", () => {
+    const wrapper = makeWrapper();
+    deliver(wrapper, { type: "tool_activity", turnId: "t1", name: "x" } as InboundMessage);
+    deliver(wrapper, { type: "tool_activity", id: "tc1", name: "x" } as InboundMessage);
+    deliver(wrapper, { type: "tool_activity", id: "", turnId: "t1", name: "x" });
+    deliver(wrapper, { type: "tool_activity", id: "tc1", turnId: "", name: "x" });
+    expect(wrapper.getState().toolActivity).toHaveLength(0);
+  });
+
+  it("bounds the list to the last 100 entries", () => {
+    const wrapper = makeWrapper();
+    for (let i = 0; i < 105; i++) {
+      deliver(wrapper, { type: "tool_activity", id: `tc${i}`, turnId: `t${i}`, name: "n" });
+    }
+    const list = wrapper.getState().toolActivity;
+    expect(list).toHaveLength(100);
+    expect(list[0].id).toBe("tc5");
+    expect(list.at(-1)?.id).toBe("tc104");
+  });
+
+  it("does NOT clear toolActivity on turn_settled (ephemeral, live-not-durable)", () => {
+    const wrapper = makeWrapper();
+    deliver(wrapper, { type: "tool_activity", id: "tc1", turnId: "t1", name: "bash" });
+    deliver(wrapper, { type: "turn_settled", turnId: "t1" });
+    expect(wrapper.getState().toolActivity).toHaveLength(1);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // P1-9 wire-order harness — register-delivered conversation key over a fake NATS
 // socket. P0-2 removed the legacy `.handshake` negotiation, so the two

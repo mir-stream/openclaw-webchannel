@@ -194,6 +194,17 @@ function makeFakeTransport(options?: {
   finalizes: Array<{ id: string; text: string; assistantMessageIndex?: number }>;
   texts: Array<{ text: string; assistantMessageIndex?: number }>;
   progress: Array<{ id: string; text: string }>;
+  /** #97: the structured tool-activity frames, in emission order. */
+  toolActivities: Array<{
+    sessionKey: string;
+    id: string;
+    turnId: string;
+    name?: string;
+    phase?: string;
+    status?: string;
+    summary?: string;
+    argKeys?: string[];
+  }>;
   typing: string[];
   settles: Array<"ok" | "error">;
   /** #99: the full settle frames, in emission order — turnId matters per member. */
@@ -209,6 +220,16 @@ function makeFakeTransport(options?: {
   const typing: string[] = [];
   const settles: Array<"ok" | "error"> = [];
   const settleFrames: Array<{ turnId: string; outcome: "ok" | "error" }> = [];
+  const toolActivities: Array<{
+    sessionKey: string;
+    id: string;
+    turnId: string;
+    name?: string;
+    phase?: string;
+    status?: string;
+    summary?: string;
+    argKeys?: string[];
+  }> = [];
   const transport = {
     sendTyping: (sessionKey: string) => {
       typing.push(sessionKey);
@@ -228,6 +249,21 @@ function makeFakeTransport(options?: {
       return true;
     },
     sendReasoning: () => true,
+    sendToolActivity: (
+      sessionKey: string,
+      activity: {
+        id: string;
+        turnId: string;
+        name?: string;
+        phase?: string;
+        status?: string;
+        summary?: string;
+        argKeys?: string[];
+      },
+    ) => {
+      toolActivities.push({ sessionKey, ...activity });
+      return true;
+    },
     sendTurnSettled: (_sessionKey: string, turnId: string, outcome: "ok" | "error") => {
       settles.push(outcome);
       settleFrames.push({ turnId, outcome });
@@ -259,7 +295,7 @@ function makeFakeTransport(options?: {
     sendApprovalResolved: () => true,
     sendApprovalSnapshot: () => true,
   } as WebChannelPeerChannel;
-  return { transport, finalizes, texts, progress, typing, settles, settleFrames };
+  return { transport, finalizes, texts, progress, toolActivities, typing, settles, settleFrames };
 }
 
 const userMessage = { type: "user_message" as const, text: "/stop" };
@@ -420,6 +456,112 @@ describe("handleInboundMessage — terminal draft drain", () => {
     expect(finalizes).toHaveLength(1);
     expect(finalizes[0]!.text).toBe("Final answer complete");
     expect(finalizes[0]!.text).not.toContain("Stopped");
+  });
+});
+
+describe("handleInboundMessage — #97 structured tool activity", () => {
+  it("emits a structured tool_activity frame on onToolStart with argKeys (names only) and correct id/turnId", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "progress",
+      runImpl: async (turn) => {
+        turn.replyOptions?.onToolStart?.({
+          itemId: "i1",
+          toolCallId: "t1",
+          name: "get_weather",
+          phase: "start",
+          args: { city: "Paris", days: 3 },
+        });
+      },
+    });
+    const { transport, toolActivities } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "weather please",
+      id: "turn-97a",
+    });
+
+    const start = toolActivities.find((a) => a.name === "get_weather");
+    expect(start).toBeDefined();
+    expect(start!.sessionKey).toBe("peer-1");
+    expect(start!.turnId).toBe("turn-97a");
+    expect(start!.id).toBe("t1"); // toolCallId wins the id fallback
+    expect(start!.phase).toBe("start");
+    // Security: KEY NAMES only — never the values ("Paris"/3).
+    expect(start!.argKeys).toEqual(["city", "days"]);
+    const wireBlob = JSON.stringify(toolActivities);
+    expect(wireBlob).not.toContain("Paris");
+    expect(wireBlob).not.toContain("\"days\":3");
+  });
+
+  it("emits a structured tool_activity frame on onItemEvent with status/summary and item id fallback", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "progress",
+      runImpl: async (turn) => {
+        turn.replyOptions?.onItemEvent?.({
+          itemId: "i9",
+          kind: "tool",
+          name: "bash",
+          phase: "end",
+          status: "completed",
+          summary: "ran ls",
+        });
+      },
+    });
+    const { transport, toolActivities } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "list files",
+      id: "turn-97b",
+    });
+
+    const item = toolActivities.find((a) => a.status === "completed");
+    expect(item).toBeDefined();
+    expect(item!.turnId).toBe("turn-97b");
+    expect(item!.id).toBe("i9"); // no toolCallId → itemId fallback
+    expect(item!.name).toBe("bash");
+    expect(item!.status).toBe("completed");
+    expect(item!.summary).toBe("ran ls");
+  });
+
+  it("#97 core fix: a short tool call emits a structured frame that survives turn settlement", async () => {
+    // The run fires a SINGLE tool event then resolves immediately with no final
+    // answer. Today the only trace of such a short call is the rolling progress
+    // DRAFT text, which is destroyed/replaced when the turn settles (finalized) —
+    // so it shows nothing durable. The structured tool_activity frame is emitted
+    // DIRECTLY on the wire (not via the draft), so it is visible regardless.
+    const { api } = makeFakeApi({
+      streamingMode: "progress",
+      runImpl: async (turn) => {
+        turn.replyOptions?.onToolStart?.({
+          toolCallId: "t-short",
+          name: "ping",
+          phase: "start",
+          args: { host: "example.com" },
+        });
+      },
+    });
+    const { transport, toolActivities, settleFrames } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "ping it",
+      id: "turn-97c",
+    });
+
+    // The turn actually settled — assert it non-vacuously, so "survives
+    // settlement" below is a real claim and not a tautology.
+    expect(settleFrames.some((f) => f.turnId === "turn-97c")).toBe(true);
+    // The structured tool activity crossed the wire independently of the draft
+    // and remains observable after the turn settled.
+    const short = toolActivities.find((a) => a.id === "t-short");
+    expect(short).toBeDefined();
+    expect(short!.turnId).toBe("turn-97c");
+    expect(short!.name).toBe("ping");
+    expect(short!.argKeys).toEqual(["host"]);
+    // No arg value ANYWHERE on the wire — key names only.
+    expect(JSON.stringify(toolActivities)).not.toContain("example.com");
   });
 });
 

@@ -28,6 +28,7 @@ import {
   orderConversationPresentation,
   captureOpenReasoningIds,
   buildReasoningDetails,
+  buildToolActivityChip,
 } from "./presentation.js";
 
 const STATUS_LABEL: Record<WebChannelState["status"], string> = {
@@ -268,7 +269,11 @@ export async function createWidget(
     const nextMdCache = new Map<string, HTMLElement>();
     const openReasoningIds = captureOpenReasoningIds(list);
     const bubbles: HTMLElement[] = [];
-    for (const presentation of orderConversationPresentation(state.messages, state.reasoning)) {
+    for (const presentation of orderConversationPresentation(
+      state.messages,
+      state.reasoning,
+      state.toolActivity,
+    )) {
       if (presentation.kind === "reasoning") {
         const item = presentation.value;
         const key = `reasoning:${item.id}\n${item.text}`;
@@ -277,6 +282,11 @@ export async function createWidget(
         bubbles.push(
           buildReasoningDetails(item, rendered, openReasoningIds.has(item.id)),
         );
+        continue;
+      }
+      // #97: minimal, muted tool-activity chip (structured lane, not history).
+      if (presentation.kind === "tool_activity") {
+        bubbles.push(buildToolActivityChip(presentation.value));
         continue;
       }
       const m = presentation.value;

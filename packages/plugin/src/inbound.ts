@@ -781,6 +781,21 @@ export async function handleInboundMessage(
                       ? {
                           suppressDefaultToolProgressMessages: true,
                           onToolStart: (p) => {
+                            // #97: emit structured tool activity DIRECTLY on the
+                            // wire, independent of the progress-draft text path.
+                            // This is NOT gated on the draft's `scaffoldWriter`
+                            // state, so a short tool call that finishes before any
+                            // draft is flushed still produces a visible frame.
+                            // Only argument KEY NAMES cross the wire — never arg
+                            // VALUES (arg values can carry secrets; the value
+                            // redactor is a deliberate follow-up).
+                            transport.sendToolActivity(wsKey, {
+                              turnId,
+                              id: p.toolCallId ?? p.itemId ?? p.name ?? "tool",
+                              name: p.name,
+                              phase: p.phase,
+                              argKeys: p.args ? Object.keys(p.args) : undefined,
+                            });
                             draft!.pushEvent({
                               event: "tool",
                               itemId: p.itemId,
@@ -791,6 +806,21 @@ export async function handleInboundMessage(
                             });
                           },
                           onItemEvent: (p) => {
+                            // #97: see onToolStart — structured, direct-to-wire,
+                            // ungated. No arg values here either.
+                            transport.sendToolActivity(wsKey, {
+                              turnId,
+                              // Same id-fallback chain as onToolStart so a
+                              // start and its follow-up item events for one call
+                              // coalesce onto a single entry even in the
+                              // (contract-violating) case where core omits both
+                              // toolCallId and itemId.
+                              id: p.toolCallId ?? p.itemId ?? p.name ?? "tool",
+                              name: p.name,
+                              phase: p.phase,
+                              status: p.status,
+                              summary: p.summary ?? p.progressText,
+                            });
                             draft!.pushEvent({
                               event: "item",
                               itemId: p.itemId,
