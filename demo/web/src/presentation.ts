@@ -55,7 +55,9 @@ export function composerButtonMode(
  * In the gap (`turnActive` true, nothing typing) the line softens to "still
  * working…", except when something louder already speaks for the turn: a live
  * `working` draft renders its own in-progress bubble, and an unresolved approval
- * card takes priority over both (the turn is blocked on the USER, not working).
+ * card takes priority over the gap hint (the turn is blocked on the USER, not
+ * working). The approval check is scoped to the gap hint alone — the typing line
+ * keeps its base behavior, where an approval frame clears `isTyping` anyway.
  */
 export function activityHint(state: {
   isTyping?: boolean;

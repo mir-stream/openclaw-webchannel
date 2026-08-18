@@ -219,6 +219,9 @@ export async function createWidget(
       input.focus();
       client?.retract(m.id);
       renderMenu();
+      // Every writer of `input.value` re-derives the Send/Stop label, because a
+      // programmatic write fires no `oninput` (see `applyComposerMode`).
+      refreshComposerMode();
     };
     const dismiss = el("button", {
       title: "dismiss",
@@ -409,6 +412,7 @@ export async function createWidget(
           input.value = `/${c.name} `;
           input.focus();
           renderMenu();
+          refreshComposerMode(); // same reason as the retract restore, above
         };
         return item;
       }),
