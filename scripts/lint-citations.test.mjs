@@ -15,6 +15,9 @@ import {
 } from "./lint-citations.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("../", import.meta.url));
+// The real CLI run over this repository takes ~0.4s; this only has to be large
+// enough that a healthy run never trips it.
+const CLI_TIMEOUT_MS = 3_000;
 const temporaryDirectories = [];
 
 async function runCitationLint(script, cwd, label) {
@@ -28,13 +31,34 @@ async function runCitationLint(script, cwd, label) {
   ]);
   let code;
   try {
+    // The helper owns the timeout so a hung CLI is killed and awaited here. If
+    // Vitest's own timeout fired instead, the child would outlive the run.
     code = await new Promise((resolve, reject) => {
       const child = spawn(process.execPath, [script], {
         cwd,
         stdio: ["ignore", stdoutFile.fd, stderrFile.fd],
       });
-      child.on("error", reject);
-      child.on("close", resolve);
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, CLI_TIMEOUT_MS);
+      child.once("error", (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+      child.once("close", (exitCode) => {
+        clearTimeout(timer);
+        if (timedOut) {
+          reject(
+            new Error(
+              `citation lint CLI did not exit within ${CLI_TIMEOUT_MS}ms; killed and awaited exit`,
+            ),
+          );
+          return;
+        }
+        resolve(exitCode);
+      });
     });
   } finally {
     await Promise.all([stdoutFile.close(), stderrFile.close()]);
@@ -442,6 +466,24 @@ describe("repository citation scan", () => {
       { citation: dashTerminatedInternal, file: "valid.md", line: 2 },
       { citation: pluginSdkIndex, file: "valid.md", line: 3 },
     ]);
+  });
+
+  // The matcher must not settle for a shorter valid-looking prefix of a longer
+  // malformed token: reporting `...openclaw.plugin` for a file that says
+  // `...openclaw.plugin.json-extra` would quote a string the file never wrote.
+  // Both the truncated stem and the real path are internal here, so a matcher
+  // that backtracks into either one produces a finding and fails this test.
+  // The whole-token rule is what makes the answer "no citation at all".
+  it("never truncates a malformed token onto a shorter internal path", async () => {
+    const repoRoot = await mkdtemp(path.join(tmpdir(), "citation-lint-truncation-"));
+    temporaryDirectories.push(repoRoot);
+    const truncatedStem = jsonInternal.slice(0, jsonInternal.lastIndexOf("."));
+    const policy = {
+      openclawInternalPaths: new Set([jsonInternal, truncatedStem]),
+    };
+    await writeFile(path.join(repoRoot, "malformed.md"), `${jsonInternal}-extra\n`, "utf8");
+
+    await expect(findCitationFindings(repoRoot, policy)).resolves.toEqual([]);
   });
 
   it("matches internal basenames whose hashes end in dash or underscore", async () => {

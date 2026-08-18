@@ -96,8 +96,13 @@ export function repoOwnedDistPaths(repoRoot, repositoryFiles) {
  * Enumerate the files present in OpenClaw's internal `dist/` tree, as normalized
  * `dist/...` paths. Membership here is the provenance signal for "OpenClaw
  * internal build output" -- these are not durable evidence, regardless of how
- * semantic or hash-shaped their basenames look. The configured tree must be
- * enumerated completely; any missing entry makes the gate fail closed.
+ * semantic or hash-shaped their basenames look.
+ *
+ * An ENOENT anywhere in the walk aborts it: a partially enumerated tree would
+ * make the gate pass on provenance it does not have. Entries that are neither a
+ * file nor a directory -- a symlink, under `withFileTypes` -- are skipped
+ * instead, so a path reachable only through a symlinked alias is not recorded.
+ * The pinned tree has no symlinks under `dist/`; see #193.
  */
 export async function openclawInternalDistPaths(openclawDistDir) {
   const internalPaths = new Set();
