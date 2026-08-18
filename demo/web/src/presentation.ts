@@ -1,4 +1,8 @@
-import type { ChatMessage, ReasoningItem } from "../../../packages/client/src/types.js";
+import type {
+  ApprovalRequest,
+  ChatMessage,
+  ReasoningItem,
+} from "../../../packages/client/src/types.js";
 
 /**
  * #96: whether the composer should show an in-flight affordance (the Stop
@@ -23,6 +27,22 @@ export function composerInFlight(state: {
 }
 
 /**
+ * Which affordance the primary composer button offers, for the given state AND
+ * the current draft. Text in the composer is unambiguous Send intent — Enter
+ * already sends it — so the button only offers Stop on an empty composer.
+ * Deriving the label from the draft (rather than guarding inside the click
+ * handler) is what keeps the label honest: it always states exactly what a click
+ * will do, so a user who means to abort never publishes a stray message and a
+ * user who means to send never aborts the turn.
+ */
+export function composerButtonMode(
+  state: { isTyping?: boolean; turnActive?: boolean; messages: readonly ChatMessage[] },
+  draft: string,
+): "send" | "stop" {
+  return draft.trim() === "" && composerInFlight(state) ? "stop" : "send";
+}
+
+/**
  * #96: the transcript-tail activity line, or `null` for none.
  *
  * `isTyping` ("an answer is being composed right now") keeps its base behavior
@@ -42,18 +62,20 @@ export function activityHint(state: {
   turnActive?: boolean;
   messages: readonly ChatMessage[];
   reasoning: readonly ReasoningItem[];
-  approvals: readonly { resolvedDecision?: unknown }[];
+  approvals: readonly Pick<ApprovalRequest, "resolvedDecision">[];
 }): string | null {
-  // P1-9: skip pending/retracted user bubbles — they have no turnId, and letting
-  // one become `latestUser` would resurrect the "agent is typing…" line next to
-  // a live reasoning lane.
-  const latestUser = [...state.messages].reverse().find(
-    (m) => m.role === "user" && !m.pending && !m.retracted,
-  );
-  const reasoningReplacesTyping = Boolean(
-    latestUser?.turnId && state.reasoning.some((item) => item.turnId === latestUser.turnId),
-  );
-  if (state.isTyping === true) return reasoningReplacesTyping ? null : "agent is typing…";
+  if (state.isTyping === true) {
+    // P1-9: skip pending/retracted user bubbles — they have no turnId, and
+    // letting one become `latestUser` would resurrect the "agent is typing…"
+    // line next to a live reasoning lane.
+    const latestUser = [...state.messages].reverse().find(
+      (m) => m.role === "user" && !m.pending && !m.retracted,
+    );
+    const reasoningReplacesTyping = Boolean(
+      latestUser?.turnId && state.reasoning.some((item) => item.turnId === latestUser.turnId),
+    );
+    return reasoningReplacesTyping ? null : "agent is typing…";
+  }
   if (state.turnActive !== true) return null;
   if (state.messages.some((m) => m.working)) return null;
   if (state.approvals.some((a) => a.resolvedDecision === undefined)) return null;

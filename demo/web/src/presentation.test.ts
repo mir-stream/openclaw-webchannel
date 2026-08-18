@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { activityHint, orderConversationPresentation, composerInFlight } from "./presentation.js";
+import {
+  activityHint,
+  composerButtonMode,
+  composerInFlight,
+  orderConversationPresentation,
+} from "./presentation.js";
 
 describe("composerInFlight (#96 — Stop affordance survives between bubbles)", () => {
   it("is true while the agent is typing", () => {
@@ -36,6 +41,42 @@ describe("composerInFlight (#96 — Stop affordance survives between bubbles)", 
 
   it("is false for a fresh idle client (turnActive absent)", () => {
     expect(composerInFlight({ messages: [] })).toBe(false);
+  });
+});
+
+describe("composerButtonMode (#96 — the label states what a click does)", () => {
+  const settled = { id: "a1", role: "agent" as const, text: "answer", working: false };
+  const gap = { isTyping: false, turnActive: true, messages: [settled] };
+  const idle = { isTyping: false, turnActive: false, messages: [settled] };
+
+  it("offers Stop in the between-bubble gap when the composer is empty", () => {
+    expect(composerButtonMode(gap, "")).toBe("stop");
+  });
+
+  it("offers Send while a draft is in the composer, even mid-turn", () => {
+    // The draft is unambiguous Send intent (Enter already sends it). If the
+    // label said Stop here, a click would abort the turn AND strand the text —
+    // and a user who did mean to abort would publish a message instead.
+    expect(composerButtonMode(gap, "a follow-up")).toBe("send");
+  });
+
+  it("treats a whitespace-only draft as empty, matching submit()'s own check", () => {
+    // Otherwise the button would offer a Send that no-ops.
+    expect(composerButtonMode(gap, "   \n ")).toBe("stop");
+  });
+
+  it("offers Send once the turn has settled", () => {
+    expect(composerButtonMode(idle, "")).toBe("send");
+    expect(composerButtonMode(idle, "next question")).toBe("send");
+  });
+
+  it("takes in-flight from typing and working drafts too, not just turnActive", () => {
+    const typing = { isTyping: true, messages: [settled] };
+    const working = { messages: [{ id: "a2", role: "agent" as const, text: "…", working: true }] };
+    expect(composerButtonMode(typing, "")).toBe("stop");
+    expect(composerButtonMode(typing, "draft")).toBe("send");
+    expect(composerButtonMode(working, "")).toBe("stop");
+    expect(composerButtonMode(working, "draft")).toBe("send");
   });
 });
 
@@ -78,8 +119,20 @@ describe("activityHint (#96 — the transcript-tail activity line)", () => {
 
   it("resumes the gap hint once every approval is resolved", () => {
     expect(
-      activityHint({ ...gap, reasoning, approvals: [{ resolvedDecision: "approve" }] }),
+      activityHint({ ...gap, reasoning, approvals: [{ resolvedDecision: "allow-once" }] }),
     ).toBe("still working…");
+  });
+
+  it("is silent when only SOME of the approvals are resolved", () => {
+    // Any one unresolved card is actionable, so "every resolved" is the wrong
+    // question — a resolved card ahead of it must not unmute the hint.
+    expect(
+      activityHint({
+        ...gap,
+        reasoning,
+        approvals: [{ resolvedDecision: "deny" }, { resolvedDecision: undefined }],
+      }),
+    ).toBeNull();
   });
 
   it("is silent while a working draft renders its own in-progress bubble", () => {
