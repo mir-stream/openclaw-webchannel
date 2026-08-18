@@ -40,8 +40,9 @@ import { JWKSCache } from "../../plugin/src/jwks.js";
 // own real HTTP socket, composed from the SAME primitives the reference server
 // uses. Its lifetime is the ordinary 600s default — the isolation is NOT a shorter
 // expiry but an INJECTED REPOSITORY CLOCK, which the shared spawned server does not
-// expose. That clock is what lets the deadline be crossed instantly, and the
-// separate socket is what keeps the jump from disturbing the shared server.
+// expose. That clock is what lets the deadline be crossed instantly; it is read
+// only by this fixture's own repository instance, so the jump is invisible to the
+// separately spawned shared server.
 import { DeviceFlowEnrollment } from "../src/device-flow-enrollment.js";
 import { MemoryEnrollmentRepository } from "../src/enrollment-repository.js";
 import { createReferenceEnrollmentHttpHandler } from "../src/enrollment-http-handler.js";
@@ -820,7 +821,6 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     const trust = await setupTrustChain({
       operatorName: "expiry-test-operator",
       accountName: "expiry-test-account",
-      returnOperatorSeed: true,
     });
     const expiryBaseUrl = "http://expiry-enrollment.invalid";
     const enrollment = new DeviceFlowEnrollment({
