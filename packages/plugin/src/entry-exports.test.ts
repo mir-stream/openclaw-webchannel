@@ -39,6 +39,11 @@ function readJson(relative: string): Record<string, unknown> {
 
 const MANIFEST = readJson("../openclaw.plugin.json");
 const PACKAGE = readJson("../package.json");
+const CATALOG_CHANNEL = (
+  PACKAGE.openclaw as {
+    channel?: Record<string, unknown>;
+  }
+).channel as Record<string, unknown>;
 
 describe("full entry object (openclaw.extensions → dist/index-nats.js)", () => {
   it("keeps every member the host reads off a defined channel entry", () => {
@@ -67,8 +72,30 @@ describe("setup entry object (openclaw.setupEntry → dist/setup-entry.js)", () 
 
 describe("channel id agreement across the published artifacts", () => {
   it("package.json openclaw.channel.id matches the code constant", () => {
-    const openclaw = PACKAGE.openclaw as { channel?: { id?: unknown } };
-    expect(openclaw.channel?.id).toBe(WEBCHANNEL_ID);
+    expect(CATALOG_CHANNEL.id).toBe(WEBCHANNEL_ID);
+  });
+
+  it("package.json openclaw.channel presents the channel exactly as plugin.meta does", () => {
+    // #170: The same four values also live in `package.json` → `openclaw.channel`.
+    // Core's `toChannelMeta()` reads all four from that block, defaulting
+    // `selectionLabel` to `label` and `docsPath` to `/channels/<id>` when
+    // absent, so the block is not limited to `id`/`label`/`blurb`. It is how
+    // the channel presents itself on surfaces where the plugin bundle is not
+    // loaded. An omission there therefore does not defer to runtime meta; it
+    // ships a second, different presentation of the same channel. Both
+    // surfaces must carry the same four values, so this test cross-asserts them
+    // instead of re-typing the literals.
+    const meta = entry.channelPlugin.meta;
+    // Guard the comparison below against passing vacuously: `undefined` on both
+    // sides is the exact bug (a field core then fills with its own fallback).
+    for (const field of ["label", "selectionLabel", "docsPath", "blurb"] as const) {
+      expect(typeof meta[field], `plugin.meta.${field}`).toBe("string");
+      expect((meta[field] as string).length, `plugin.meta.${field}`).toBeGreaterThan(0);
+    }
+    expect(CATALOG_CHANNEL.label).toBe(meta.label);
+    expect(CATALOG_CHANNEL.selectionLabel).toBe(meta.selectionLabel);
+    expect(CATALOG_CHANNEL.docsPath).toBe(meta.docsPath);
+    expect(CATALOG_CHANNEL.blurb).toBe(meta.blurb);
   });
 
   it("openclaw.plugin.json declares exactly this one channel", () => {

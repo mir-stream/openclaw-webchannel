@@ -159,6 +159,32 @@ export function createWebChannelPlugin(
     // turn's reply callbacks instead.
     base: asWebchannelChatBase(Object.assign(withRequiredCapabilities(createChannelPluginBase<ResolvedAccount>({
       id: WEBCHANNEL_ID,
+      // Channel-presentation metadata (`ChannelMeta`, exported by
+      // `openclaw/plugin-sdk/channel-contract`). `createChannelPluginBase` merges
+      // this into `plugin.meta`, which the pinned core (2026.7.1-2) reads at
+      // registration (`normalizeRegisteredChannelPlugin` →
+      // `collectMissingChannelMetaFields`). WebChannel is not a bundled core
+      // channel, so `resolveSdkChatChannelMeta("webchannel")` returns nothing:
+      // without these four fields core fills defaults and emits an "incomplete
+      // metadata" diagnostic on EVERY gateway boot. Supplying them stops that
+      // per-boot diagnostic and gives the operator's channel picker real
+      // presentation copy. Values are owner-approved — do not reword.
+      //
+      // The same four values also live in `package.json` → `openclaw.channel`.
+      // Core's `toChannelMeta()` reads all four from that block, defaulting
+      // `selectionLabel` to `label` and `docsPath` to `/channels/<id>` when
+      // absent, so the block is not limited to `id`/`label`/`blurb`. It is how
+      // the channel presents itself on surfaces where the plugin bundle is not
+      // loaded. An omission there therefore does not defer to runtime meta; it
+      // ships a second, different presentation of the same channel. Both
+      // surfaces must carry the same four values; `entry-exports.test.ts`
+      // cross-asserts them. See #170.
+      meta: {
+        label: "WebChannel",
+        selectionLabel: "WebChannel (self-hosted web chat)",
+        docsPath: "https://github.com/mir-stream/openclaw-webchannel#readme",
+        blurb: "Self-hosted, end-to-end encrypted browser chat over NATS.",
+      },
       // Contract: `ChannelPlugin`, exported by
       // `openclaw/plugin-sdk/channel-runtime`, requires `capabilities`. One web
       // chat surface => direct chats.

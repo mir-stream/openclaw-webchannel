@@ -27,7 +27,9 @@
     "channel": {
       "id": "webchannel",
       "label": "WebChannel",
-      "blurb": "End-to-end encrypted web chat over an outbound NATS relay."
+      "selectionLabel": "WebChannel (self-hosted web chat)",
+      "docsPath": "https://github.com/mir-stream/openclaw-webchannel#readme",
+      "blurb": "Self-hosted, end-to-end encrypted browser chat over NATS."
     },
     "compat": {
       "pluginApi": ">=2026.7.1",
