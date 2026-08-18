@@ -1,8 +1,9 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { copyFile, mkdtemp, mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildCitationPolicy,
   findCitationFindings,
@@ -15,6 +16,35 @@ import {
 
 const REPO_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const temporaryDirectories = [];
+
+async function runCitationLint(script, cwd, label) {
+  const captureDir = path.join(cwd, "coverage");
+  await mkdir(captureDir, { recursive: true });
+  const stdoutPath = path.join(captureDir, `${label}.stdout`);
+  const stderrPath = path.join(captureDir, `${label}.stderr`);
+  const [stdoutFile, stderrFile] = await Promise.all([
+    open(stdoutPath, "w"),
+    open(stderrPath, "w"),
+  ]);
+  let code;
+  try {
+    code = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [script], {
+        cwd,
+        stdio: ["ignore", stdoutFile.fd, stderrFile.fd],
+      });
+      child.on("error", reject);
+      child.on("close", resolve);
+    });
+  } finally {
+    await Promise.all([stdoutFile.close(), stderrFile.close()]);
+  }
+  return {
+    code,
+    stderr: await readFile(stderrPath, "utf8"),
+    stdout: await readFile(stdoutPath, "utf8"),
+  };
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -283,8 +313,35 @@ describe("policy derivation", () => {
     const missingDist = path.join(parent, "node_modules", "openclaw", "dist");
 
     await expect(openclawInternalDistPaths(missingDist)).rejects.toThrow(
-      `OpenClaw dist directory is missing at ${missingDist}; run npm ci`,
+      `OpenClaw dist tree is missing or incomplete at ${missingDist}; run npm ci`,
     );
+  });
+
+  it("fails when a nested dist directory disappears during enumeration", async () => {
+    const distDir = await mkdtemp(path.join(tmpdir(), "incomplete-oc-dist-"));
+    temporaryDirectories.push(distDir);
+    const missingNested = path.join(distDir, "extensions");
+    await mkdir(missingNested);
+    const realFs = await vi.importActual("node:fs/promises");
+    vi.doMock("node:fs/promises", () => ({
+      ...realFs,
+      readdir: async (directory, options) => {
+        if (directory === missingNested) {
+          throw Object.assign(new Error(`ENOENT: ${directory}`), { code: "ENOENT" });
+        }
+        return realFs.readdir(directory, options);
+      },
+    }));
+
+    try {
+      const isolatedModule = await import("./lint-citations.mjs?nested-enoent");
+      await expect(isolatedModule.openclawInternalDistPaths(distDir)).rejects.toThrow(
+        `OpenClaw dist tree is missing or incomplete at ${distDir}; run npm ci`,
+      );
+    } finally {
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
   });
 
   it("assembles the real citation policy used by the CLI", async () => {
@@ -308,6 +365,45 @@ describe("policy derivation", () => {
     await expect(findCitationFindings(scratchRoot, policy)).resolves.toEqual([
       { citation: speechProvider, file: "citations.md", line: 1 },
     ]);
+  });
+});
+
+describe("citation lint CLI", () => {
+  it("exits nonzero for an internal citation and zero after it is removed", async () => {
+    const scratchRoot = await mkdtemp(path.join(tmpdir(), "citation-cli-"));
+    temporaryDirectories.push(scratchRoot);
+    const scriptDir = path.join(scratchRoot, "scripts");
+    const openclawRoot = path.join(scratchRoot, "node_modules", "openclaw");
+    const internalFile = path.join(
+      openclawRoot,
+      "dist",
+      "extensions",
+      "google",
+      "speech-provider.js",
+    );
+    await mkdir(scriptDir, { recursive: true });
+    await mkdir(path.dirname(internalFile), { recursive: true });
+    const script = path.join(scriptDir, "lint-citations.mjs");
+    await copyFile(path.join(REPO_ROOT, "scripts", "lint-citations.mjs"), script);
+    await copyFile(
+      path.join(REPO_ROOT, "node_modules", "openclaw", "package.json"),
+      path.join(openclawRoot, "package.json"),
+    );
+    await writeFile(internalFile, "", "utf8");
+    const citationFile = path.join(scratchRoot, "evidence.md");
+    await writeFile(citationFile, `${speechProvider}\n`, "utf8");
+
+    const rejected = await runCitationLint(script, scratchRoot, "rejected");
+    expect(rejected.code).toBe(1);
+    expect(rejected.stderr).toContain(`evidence.md:1: ${speechProvider}`);
+    expect(rejected.stderr).toContain("Found 1 forbidden citation(s).");
+
+    await writeFile(citationFile, "", "utf8");
+    const accepted = await runCitationLint(script, scratchRoot, "accepted");
+    expect(accepted.code).toBe(0);
+    expect(accepted.stdout).toContain(
+      "Citation lint passed: no OpenClaw internal dist citations found in repository-owned files.",
+    );
   });
 });
 

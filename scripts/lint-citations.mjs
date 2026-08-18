@@ -96,9 +96,8 @@ export function repoOwnedDistPaths(repoRoot, repositoryFiles) {
  * Enumerate the files present in OpenClaw's internal `dist/` tree, as normalized
  * `dist/...` paths. Membership here is the provenance signal for "OpenClaw
  * internal build output" -- these are not durable evidence, regardless of how
- * semantic or hash-shaped their basenames look. The configured root must exist;
- * nested entries that disappear during the walk are tolerated as a filesystem
- * race.
+ * semantic or hash-shaped their basenames look. The configured tree must be
+ * enumerated completely; any missing entry makes the gate fail closed.
  */
 export async function openclawInternalDistPaths(openclawDistDir) {
   const internalPaths = new Set();
@@ -109,9 +108,8 @@ export async function openclawInternalDistPaths(openclawDistDir) {
       entries = await readdir(directory, { withFileTypes: true });
     } catch (error) {
       if (error && error.code === "ENOENT") {
-        if (directory !== openclawDistDir) return;
         throw new Error(
-          `OpenClaw dist directory is missing at ${openclawDistDir}; run npm ci to install pinned dependencies.`,
+          `OpenClaw dist tree is missing or incomplete at ${openclawDistDir}; run npm ci to install pinned dependencies.`,
           { cause: error },
         );
       }

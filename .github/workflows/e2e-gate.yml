@@ -88,7 +88,11 @@ jobs:
 
       # ──────────────────────────────────────────────────────────────────────
       # 4a. Keep documentation and source comments bound to durable contracts.
-      #     Hash-named OpenClaw bundles are replaced on every core build.
+      #     A citation is judged by provenance, not by how its basename looks:
+      #     OpenClaw's declared package exports are durable, anything else in
+      #     its dist/ tree is internal build output that a core build replaces.
+      #     Runs after `npm ci` on purpose -- the gate reads the installed
+      #     dist/ tree and fails closed if it is missing or incomplete.
       # ──────────────────────────────────────────────────────────────────────
       - name: Lint durable OpenClaw citations
         run: npm run lint:citations
