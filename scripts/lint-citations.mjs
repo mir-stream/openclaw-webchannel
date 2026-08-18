@@ -13,16 +13,17 @@ const OPENCLAW_DIST_DIR = path.join(OPENCLAW_ROOT, "dist");
 // The trust decision is made afterwards from provenance, not from the shape of
 // the basename, so the pattern deliberately accepts any extension, hash length,
 // case, or nested location -- none of those can be used to bypass the policy.
-// The match must both start and END on an alphanumeric so a path that ends a
-// sentence (`...speech-provider.js.`) is captured without the trailing period,
-// while multi-dot stems and extensions (`a.b.c.js`, `.d.ts`, `.plugin.json`)
-// are still captured in full.
+// The extension must start and the whole match must END on an alphanumeric so
+// a path that ends a sentence (`...speech-provider.js.`) is captured without
+// the trailing period. Stems may end in `-` or `_`, and multi-dot stems and
+// extensions (`a.b.c.js`, `.d.ts`, `.plugin.json`) are captured in full.
 const DIST_PATH_RE =
-  /(?:node_modules\/openclaw\/)?dist\/[A-Za-z0-9._/-]*[A-Za-z0-9]\.[A-Za-z0-9](?:[A-Za-z0-9.]*[A-Za-z0-9])?/g;
+  /(?:node_modules\/openclaw\/)?dist\/[A-Za-z0-9._/-]*[A-Za-z0-9_-]\.[A-Za-z0-9](?:[A-Za-z0-9.]*[A-Za-z0-9])?/g;
 
 // Source extensions whose tsc/rollup outputs land next to a package `dist/`
-// entrypoint. Used only to back this repository's own outputs by their sources.
-const REPO_SOURCE_RE = /^packages\/[^/]+\/src\/(.+)\.(?:[cm]?[jt]sx?)$/;
+// entrypoint. Sources may live under `src/` or at the package root.
+const REPO_SOURCE_RE =
+  /^packages\/[^/]+\/(?:src\/(.+)|([^/]+))\.(?:[cm]?[jt]sx?)$/;
 
 // Scan every repository-owned surface while avoiding installed dependencies,
 // generated outputs, and version-control metadata. Directory names are used so
@@ -41,7 +42,9 @@ const IGNORED_PATH_NAMES = new Set([
 
 function normalizeDistPath(citation) {
   const distOffset = citation.indexOf("dist/");
-  return distOffset === -1 ? citation : citation.slice(distOffset);
+  if (distOffset === -1) return null;
+  const normalized = path.posix.normalize(citation.slice(distOffset));
+  return normalized.startsWith("dist/") ? normalized : null;
 }
 
 /**
@@ -77,9 +80,10 @@ export function publicExportDistPaths(packageExports) {
 /**
  * Return the conventional tsc outputs backed by this repository's own package
  * sources. These are local artifacts: legal when backed by our own package
- * metadata/source. Deriving them from `packages/*\/src` also lets a repo-owned
- * output win over any OpenClaw internal path that happens to share its
- * normalized `dist/` form.
+ * metadata/source. They are derived from both `packages/*\/src/...` sources and
+ * package-root entrypoints shaped like `packages/*\/<name>.<ext>`. An
+ * unprefixed repo-owned output wins over any OpenClaw internal path that happens
+ * to share its normalized `dist/` form.
  */
 export function repoOwnedDistPaths(repoRoot, repositoryFiles) {
   const ownedPaths = new Set();
@@ -87,8 +91,9 @@ export function repoOwnedDistPaths(repoRoot, repositoryFiles) {
     const relative = path.relative(repoRoot, file).split(path.sep).join("/");
     const match = relative.match(REPO_SOURCE_RE);
     if (!match) continue;
-    ownedPaths.add(`dist/${match[1]}.js`);
-    ownedPaths.add(`dist/${match[1]}.d.ts`);
+    const sourcePath = match[1] ?? match[2];
+    ownedPaths.add(`dist/${sourcePath}.js`);
+    ownedPaths.add(`dist/${sourcePath}.d.ts`);
   }
   return ownedPaths;
 }
@@ -133,10 +138,15 @@ export async function openclawInternalDistPaths(openclawDistDir) {
  *
  * The decision is made purely from provenance:
  *   1. a declared OpenClaw public export is legal;
- *   2. a repository-owned package output is legal;
- *   3. a file that exists in OpenClaw's internal `dist/` tree (and is neither of
- *      the above) is forbidden -- it is internal build output, not contract;
- *   4. anything else is not an OpenClaw citation at all and is ignored.
+ *   2. any other explicitly `node_modules/openclaw/`-prefixed citation is
+ *      forbidden, even when absent from the pinned internal tree;
+ *   3. an unprefixed repository-owned package output is legal;
+ *   4. an unprefixed file present in OpenClaw's internal `dist/` tree is
+ *      forbidden;
+ *   5. any other unprefixed `dist/` path is ignored on purpose. Bare paths also
+ *      name legitimate repository and third-party outputs, so treating every
+ *      unknown bare path as OpenClaw-owned would create false positives; that
+ *      broader policy is deferred.
  *
  * No basename shape, hash length, case, or extension is consulted, so none of
  * those can create a bypass.
@@ -148,8 +158,11 @@ export function isForbiddenDistCitation(citation, policy = {}) {
     openclawInternalPaths = new Set(),
   } = policy;
 
+  const explicitlyOpenClaw = citation.startsWith("node_modules/openclaw/");
   const normalized = normalizeDistPath(citation);
+  if (normalized === null) return false;
   if (publicExports.has(normalized)) return false;
+  if (explicitlyOpenClaw) return true;
   if (repoOwnedOutputs.has(normalized)) return false;
   return openclawInternalPaths.has(normalized);
 }

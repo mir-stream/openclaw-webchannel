@@ -1,15 +1,18 @@
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   findCitationFindings,
   isForbiddenDistCitation,
+  listRepositoryFiles,
   openclawInternalDistPaths,
   publicExportDistPaths,
   repoOwnedDistPaths,
 } from "./lint-citations.mjs";
 
+const REPO_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const temporaryDirectories = [];
 
 afterEach(async () => {
@@ -20,15 +23,21 @@ afterEach(async () => {
   );
 });
 
-// Internal-path string literals are assembled at runtime so the repository-wide
-// citation scan (npm run lint:citations) does not flag this test file's own
-// example paths that resolve into the installed OpenClaw dist tree.
+// Forbidden citation literals are assembled at runtime so the repository-wide
+// scan (npm run lint:citations) does not flag this test file's own cases. These
+// include installed internal paths and explicit non-exports that are absent.
 const speechProvider = ["dist/extensions/google/", "speech-provider", ".js"].join("");
 const doctorContract = ["dist/extensions/elevenlabs/", "doctor-contract", ".js"].join("");
 const sessionIdentity = ["dist/acp-core/runtime/", "session-identity", ".d.ts"].join("");
 const exportTemplate = ["dist/export-html/", "template", ".css"].join("");
 const hashedInternal = ["dist/message-handler.process-", "CcPQD8zK", ".js"].join("");
 const jsonInternal = ["dist/extensions/telegram/", "openclaw.plugin", ".json"].join("");
+const dashTerminatedInternal = ["dist/nix-", "DxyfQZE-", ".js"].join("");
+const underscoreTerminatedInternal = ["dist/safe-buffer-", "Ce0qmGn_", ".js"].join("");
+const speechProviderDotAlias = ["dist/extensions/google/./", "speech-provider", ".js"].join("");
+const indexTypes = ["dist/index", ".d.ts"].join("");
+const prefixedIndexTypes = `node_modules/openclaw/${indexTypes}`;
+const missingInternal = ["dist/does-not-exist-", "CcPQD8zK", ".js"].join("");
 
 // A public export whose basename is deliberately hash-shaped, proving the trust
 // decision is provenance (declared export) and not basename shape.
@@ -47,8 +56,9 @@ function buildPolicy() {
   });
 
   const repoOwnedOutputs = repoOwnedDistPaths("/repo", [
+    "/repo/packages/client/src/index.ts",
     "/repo/packages/client/src/pop-register.ts",
-    "/repo/packages/plugin/src/index-nats.ts",
+    "/repo/packages/plugin/index-nats.ts",
     "/repo/packages/saas/reference/enrollment-server.ts",
   ]);
 
@@ -64,6 +74,7 @@ function buildPolicy() {
     // Collisions: these normalized paths ALSO exist internally, but provenance
     // (a public export / a repo-owned output) must win over internal existence.
     "dist/index.js",
+    indexTypes,
     "dist/index-nats.js",
   ]);
 
@@ -100,6 +111,11 @@ const CITATION_MATRIX = [
     forbidden: true,
   },
   {
+    form: "internal dist through a normalized ./ alias",
+    citation: speechProviderDotAlias,
+    forbidden: true,
+  },
+  {
     form: "internal dist with semantic basename",
     citation: sessionIdentity,
     forbidden: true,
@@ -123,6 +139,23 @@ const CITATION_MATRIX = [
     form: "internal dist, openclaw-prefixed",
     citation: `node_modules/openclaw/${hashedInternal}`,
     forbidden: true,
+  },
+  {
+    form: "non-export internal, openclaw-prefixed repo-owned collision",
+    citation: prefixedIndexTypes,
+    forbidden: true,
+  },
+  // An explicit OpenClaw non-export is rejected even when stale; the same bare
+  // path stays ignored because it has no OpenClaw provenance.
+  {
+    form: "openclaw-prefixed non-export absent from the internal tree",
+    citation: `node_modules/openclaw/${missingInternal}`,
+    forbidden: true,
+  },
+  {
+    form: "unprefixed path absent from the internal tree",
+    citation: missingInternal,
+    forbidden: false,
   },
   // Not an OpenClaw citation at all -> ignored (no false positives).
   { form: "unrelated dependency bin", citation: "dist/cli.js", forbidden: false },
@@ -173,20 +206,34 @@ describe("policy derivation", () => {
   });
 
   it("derives repo-owned outputs from package sources", () => {
-    const owned = repoOwnedDistPaths("/repo", [
-      "/repo/packages/plugin/src/index-nats.ts",
-      "/repo/packages/client/src/pop-register.tsx",
-      "/repo/packages/example/README.md",
-      "/repo/apps/web/src/main.ts",
+    const owned = repoOwnedDistPaths(REPO_ROOT, [
+      path.join(REPO_ROOT, "packages/plugin/index-nats.ts"),
+      path.join(REPO_ROOT, "packages/plugin/setup-entry.ts"),
+      path.join(REPO_ROOT, "packages/plugin/rotate-key-entry.ts"),
+      path.join(REPO_ROOT, "packages/client/src/pop-register.ts"),
+      path.join(REPO_ROOT, "packages/client/README.md"),
     ]);
     expect(owned).toEqual(
       new Set([
         "dist/index-nats.js",
         "dist/index-nats.d.ts",
+        "dist/setup-entry.js",
+        "dist/setup-entry.d.ts",
+        "dist/rotate-key-entry.js",
+        "dist/rotate-key-entry.d.ts",
         "dist/pop-register.js",
         "dist/pop-register.d.ts",
       ]),
     );
+  });
+
+  it("derives shipped plugin entry outputs from the actual repository file list", async () => {
+    const repositoryFiles = await listRepositoryFiles(REPO_ROOT);
+    const owned = repoOwnedDistPaths(REPO_ROOT, repositoryFiles);
+
+    expect(owned.has("dist/index-nats.js")).toBe(true);
+    expect(owned.has("dist/setup-entry.js")).toBe(true);
+    expect(owned.has("dist/rotate-key-entry.js")).toBe(true);
   });
 
   it("enumerates OpenClaw internal dist files as normalized paths", async () => {
@@ -215,6 +262,25 @@ describe("policy derivation", () => {
 });
 
 describe("repository citation scan", () => {
+  it("matches internal basenames whose hashes end in dash or underscore", async () => {
+    const repoRoot = await mkdtemp(path.join(tmpdir(), "citation-lint-hash-end-"));
+    temporaryDirectories.push(repoRoot);
+    const policy = {
+      openclawInternalPaths: new Set([dashTerminatedInternal, underscoreTerminatedInternal]),
+    };
+    await writeFile(
+      path.join(repoRoot, "hashes.md"),
+      `${dashTerminatedInternal}\n${underscoreTerminatedInternal}\n`,
+      "utf8",
+    );
+
+    const findings = await findCitationFindings(repoRoot, policy);
+    expect(findings).toEqual([
+      { citation: dashTerminatedInternal, file: "hashes.md", line: 1 },
+      { citation: underscoreTerminatedInternal, file: "hashes.md", line: 2 },
+    ]);
+  });
+
   it("covers every first-party documentation and source surface", async () => {
     const repoRoot = await mkdtemp(path.join(tmpdir(), "citation-lint-"));
     temporaryDirectories.push(repoRoot);
