@@ -217,7 +217,6 @@ api.registerHttpRoute({
 
 ### 번들 채널 (이 설치본 `dist/extensions/`)
 존재 확인된 채널: `telegram`, `signal`, `sms`, `imessage`, `irc`, `mattermost`, `clickclack`, `microsoft`, `google` ✅
-- `dist/extensions/telegram/openclaw.plugin.json` 존재 확인 ✅
 - **webhook/HTTP inbound 패턴 참고:** `microsoft`(Teams), `google`(Chat), `mattermost` — WebChannel의 라우트-기반 inbound와 형태 유사. (문서가 Teams/Google Chat을 inbound 예제로 지목)
 - ⚠️ 번들은 minified 빌드물. 원본 가독 소스는 GitHub `openclaw/openclaw` 레포의 해당 채널 참고 권장.
 

@@ -5,22 +5,24 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = fileURLToPath(new URL("../", import.meta.url));
-const OPENCLAW_PACKAGE_JSON = path.join(
-  REPO_ROOT,
-  "node_modules",
-  "openclaw",
-  "package.json",
-);
+const OPENCLAW_ROOT = path.join(REPO_ROOT, "node_modules", "openclaw");
+const OPENCLAW_PACKAGE_JSON = path.join(OPENCLAW_ROOT, "package.json");
+const OPENCLAW_DIST_DIR = path.join(OPENCLAW_ROOT, "dist");
 
-// Match candidate dist paths first, then classify the basename. OpenClaw's
-// generated Rollup suffix is normally eight base64url characters. Most hashes
-// contain an uppercase letter, digit, or underscore, but lowercase-only hashes
-// are valid too (and do occur in the pinned package).
-const DIST_PATH_RE = /(?:node_modules\/openclaw\/)?dist\/[A-Za-z0-9._/-]+\.(?:d\.ts|js|css)/g;
-const DIST_ASSET_EXTENSION_RE = /\.(?:d\.ts|js|css)$/;
-const HASH_ENTROPY_RE = /[A-Z0-9_]/;
-const HASH_CHARS_RE = /^[A-Za-z0-9_-]+$/;
-const LOWERCASE_ROLLUP_HASH_RE = /^[a-z-]{8}$/;
+// Match candidate `dist/` file citations anywhere in a repository-owned file.
+// The trust decision is made afterwards from provenance, not from the shape of
+// the basename, so the pattern deliberately accepts any extension, hash length,
+// case, or nested location -- none of those can be used to bypass the policy.
+// The match must both start and END on an alphanumeric so a path that ends a
+// sentence (`...speech-provider.js.`) is captured without the trailing period,
+// while multi-dot stems and extensions (`a.b.c.js`, `.d.ts`, `.plugin.json`)
+// are still captured in full.
+const DIST_PATH_RE =
+  /(?:node_modules\/openclaw\/)?dist\/[A-Za-z0-9._/-]*[A-Za-z0-9]\.[A-Za-z0-9](?:[A-Za-z0-9.]*[A-Za-z0-9])?/g;
+
+// Source extensions whose tsc/rollup outputs land next to a package `dist/`
+// entrypoint. Used only to back this repository's own outputs by their sources.
+const REPO_SOURCE_RE = /^packages\/[^/]+\/src\/(.+)\.(?:[cm]?[jt]sx?)$/;
 
 // Scan every repository-owned surface while avoiding installed dependencies,
 // generated outputs, and version-control metadata. Directory names are used so
@@ -42,34 +44,21 @@ function normalizeDistPath(citation) {
   return distOffset === -1 ? citation : citation.slice(distOffset);
 }
 
-// Pinned OpenClaw places generated chunks at the dist root, plus hashed control
-// UI assets here. Other nested trees use stable semantic basenames, where an
-// eight-letter word such as `provider` or `identity` is not a hash signal.
-function isAmbiguousRollupHashLocation(normalized) {
-  const directory = normalized.slice(0, normalized.lastIndexOf("/"));
-  return directory === "dist" || directory === "dist/control-ui/assets";
-}
-
 /**
- * Return the dist files OpenClaw exposes as durable package entrypoints.
+ * Return the `dist/` paths OpenClaw declares as durable public entrypoints.
  *
- * An eight-letter lowercase suffix is inherently ambiguous (for example,
- * `contract` has the same shape as a Rollup hash). Deriving the exceptions from
- * the installed package's exports keeps public SDK entrypoints legal without a
- * hand-maintained allowlist of internal bundles.
+ * These are read from the installed package's `exports` map, so they track the
+ * contract the package actually publishes rather than a hand-maintained
+ * allowlist. A citation resolving to one of these is legal even if its basename
+ * happens to look hash-shaped -- provenance, not shape, is what makes it stable.
  */
-export function stableDistPathsFromExports(packageExports) {
-  const stablePaths = new Set();
+export function publicExportDistPaths(packageExports) {
+  const exportedPaths = new Set();
 
   function visit(value) {
     if (typeof value === "string") {
       const normalized = value.startsWith("./") ? value.slice(2) : value;
-      if (
-        normalized.startsWith("dist/") &&
-        DIST_ASSET_EXTENSION_RE.test(normalized)
-      ) {
-        stablePaths.add(normalized);
-      }
+      if (normalized.startsWith("dist/")) exportedPaths.add(normalized);
       return;
     }
     if (Array.isArray(value)) {
@@ -82,47 +71,87 @@ export function stableDistPathsFromExports(packageExports) {
   }
 
   visit(packageExports);
-  return stablePaths;
+  return exportedPaths;
 }
 
 /**
  * Return the conventional tsc outputs backed by this repository's own package
- * sources. Bare `dist/foo.js` references do not identify their package, so
- * these paths prevent a stable local source name such as `pop-register` from
- * being mistaken for an all-lowercase OpenClaw hash.
+ * sources. These are local artifacts: legal when backed by our own package
+ * metadata/source. Deriving them from `packages/*\/src` also lets a repo-owned
+ * output win over any OpenClaw internal path that happens to share its
+ * normalized `dist/` form.
  */
-export function stableDistPathsFromSources(repoRoot, repositoryFiles) {
-  const stablePaths = new Set();
+export function repoOwnedDistPaths(repoRoot, repositoryFiles) {
+  const ownedPaths = new Set();
   for (const file of repositoryFiles) {
     const relative = path.relative(repoRoot, file).split(path.sep).join("/");
-    const match = relative.match(/^packages\/[^/]+\/src\/(.+)\.(?:[cm]?[jt]sx?)$/);
+    const match = relative.match(REPO_SOURCE_RE);
     if (!match) continue;
-    stablePaths.add(`dist/${match[1]}.js`);
-    stablePaths.add(`dist/${match[1]}.d.ts`);
+    ownedPaths.add(`dist/${match[1]}.js`);
+    ownedPaths.add(`dist/${match[1]}.d.ts`);
   }
-  return stablePaths;
+  return ownedPaths;
 }
 
-export function isHashNamedDistPath(citation, stableDistPaths = new Set()) {
-  const normalized = normalizeDistPath(citation);
-  if (stableDistPaths.has(normalized)) return false;
+/**
+ * Enumerate the files present in OpenClaw's internal `dist/` tree, as normalized
+ * `dist/...` paths. Membership here is the provenance signal for "OpenClaw
+ * internal build output" -- these are not durable evidence, regardless of how
+ * semantic or hash-shaped their basenames look.
+ */
+export async function openclawInternalDistPaths(openclawDistDir) {
+  const internalPaths = new Set();
 
-  const basename = normalized.slice(normalized.lastIndexOf("/") + 1);
-  const stem = basename.replace(DIST_ASSET_EXTENSION_RE, "");
-  const acceptsAmbiguousHash = isAmbiguousRollupHashLocation(normalized);
-
-  for (let index = stem.indexOf("-"); index !== -1; index = stem.indexOf("-", index + 1)) {
-    const suffix = stem.slice(index + 1);
-    if (
-      suffix.length >= 6 &&
-      HASH_CHARS_RE.test(suffix) &&
-      HASH_ENTROPY_RE.test(suffix)
-    ) {
-      return true;
+  async function walk(directory) {
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error && error.code === "ENOENT") return;
+      throw error;
     }
-    if (acceptsAmbiguousHash && LOWERCASE_ROLLUP_HASH_RE.test(suffix)) return true;
+    for (const entry of entries) {
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await walk(absolute);
+      } else if (entry.isFile()) {
+        const relative = path
+          .relative(openclawDistDir, absolute)
+          .split(path.sep)
+          .join("/");
+        internalPaths.add(`dist/${relative}`);
+      }
+    }
   }
-  return false;
+
+  await walk(openclawDistDir);
+  return internalPaths;
+}
+
+/**
+ * Decide whether a `dist/` citation is a forbidden OpenClaw internal reference.
+ *
+ * The decision is made purely from provenance:
+ *   1. a declared OpenClaw public export is legal;
+ *   2. a repository-owned package output is legal;
+ *   3. a file that exists in OpenClaw's internal `dist/` tree (and is neither of
+ *      the above) is forbidden -- it is internal build output, not contract;
+ *   4. anything else is not an OpenClaw citation at all and is ignored.
+ *
+ * No basename shape, hash length, case, or extension is consulted, so none of
+ * those can create a bypass.
+ */
+export function isForbiddenDistCitation(citation, policy = {}) {
+  const {
+    publicExports = new Set(),
+    repoOwnedOutputs = new Set(),
+    openclawInternalPaths = new Set(),
+  } = policy;
+
+  const normalized = normalizeDistPath(citation);
+  if (publicExports.has(normalized)) return false;
+  if (repoOwnedOutputs.has(normalized)) return false;
+  return openclawInternalPaths.has(normalized);
 }
 
 function lineNumberAt(text, offset) {
@@ -156,11 +185,7 @@ export async function listRepositoryFiles(repoRoot) {
   return files;
 }
 
-export async function findCitationFindings(
-  repoRoot,
-  stableDistPaths = new Set(),
-  repositoryFiles,
-) {
+export async function findCitationFindings(repoRoot, policy = {}, repositoryFiles) {
   const findings = [];
   const files = repositoryFiles ?? await listRepositoryFiles(repoRoot);
 
@@ -170,7 +195,7 @@ export async function findCitationFindings(
     if (contents.includes("\0")) continue;
 
     for (const match of contents.matchAll(DIST_PATH_RE)) {
-      if (!isHashNamedDistPath(match[0], stableDistPaths)) continue;
+      if (!isForbiddenDistCitation(match[0], policy)) continue;
       findings.push({
         citation: match[0],
         file: path.relative(repoRoot, file).split(path.sep).join("/"),
@@ -190,22 +215,20 @@ export async function findCitationFindings(
 
 async function main() {
   const openclawPackage = JSON.parse(await readFile(OPENCLAW_PACKAGE_JSON, "utf8"));
-  const stableDistPaths = stableDistPathsFromExports(openclawPackage.exports);
   const repositoryFiles = await listRepositoryFiles(REPO_ROOT);
-  for (const localPath of stableDistPathsFromSources(REPO_ROOT, repositoryFiles)) {
-    stableDistPaths.add(localPath);
-  }
-  const findings = await findCitationFindings(
-    REPO_ROOT,
-    stableDistPaths,
-    repositoryFiles,
-  );
+  const policy = {
+    publicExports: publicExportDistPaths(openclawPackage.exports),
+    repoOwnedOutputs: repoOwnedDistPaths(REPO_ROOT, repositoryFiles),
+    openclawInternalPaths: await openclawInternalDistPaths(OPENCLAW_DIST_DIR),
+  };
+  const findings = await findCitationFindings(REPO_ROOT, policy, repositoryFiles);
 
   if (findings.length > 0) {
     console.error(
-      "Citation lint failed: hash-named OpenClaw dist citations are unstable; " +
-        "replace each with a stable plugin-sdk contract, an asserting test/gate, " +
-        'or an internal-behavior note stamped "verified at <version>".',
+      "Citation lint failed: OpenClaw internal dist/ files are not durable " +
+        "evidence. Replace each with a stable plugin-sdk / package-export " +
+        "contract, an asserting test/gate, or an internal-behavior note stamped " +
+        '"verified at <version>" that does not cite the internal bundle path.',
     );
     for (const finding of findings) {
       console.error(`  ${finding.file}:${finding.line}: ${finding.citation}`);
@@ -214,7 +237,7 @@ async function main() {
     process.exitCode = 1;
   } else {
     console.log(
-      "Citation lint passed: no hash-named OpenClaw dist citations found in " +
+      "Citation lint passed: no OpenClaw internal dist citations found in " +
         "repository-owned files.",
     );
   }
