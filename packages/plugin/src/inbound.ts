@@ -75,6 +75,22 @@ type ToolActivityCall = {
   active: boolean;
 };
 
+function toolActivityUpstreamIds(
+  input: ToolActivityCorrelationInput,
+): string[] {
+  return [input.toolCallId, input.itemId].filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  );
+}
+
+function toolActivityAliasKeys(
+  input: ToolActivityCorrelationInput,
+): string[] {
+  return toolActivityUpstreamIds(input).map(
+    (id) => `${input.scope ?? ""}\u0000${id}`,
+  );
+}
+
 /**
  * Correlate OpenClaw's optional agent-event identities to one public activity id.
  *
@@ -91,14 +107,6 @@ function createToolActivityCorrelation() {
   const usedPublicIds = new Set<string>();
   let generatedSequence = 0;
 
-  const upstreamIds = (input: ToolActivityCorrelationInput): string[] =>
-    [input.toolCallId, input.itemId].filter(
-      (value): value is string => typeof value === "string" && value.length > 0,
-    );
-
-  const aliasKeys = (input: ToolActivityCorrelationInput): string[] =>
-    upstreamIds(input).map((id) => `${input.scope ?? ""}\u0000${id}`);
-
   const nextGeneratedId = (): string => {
     let id: string;
     do {
@@ -112,7 +120,7 @@ function createToolActivityCorrelation() {
     input: ToolActivityCorrelationInput,
     active: boolean,
   ): ToolActivityCall => {
-    const preferred = upstreamIds(input)[0];
+    const preferred = toolActivityUpstreamIds(input)[0];
     const id = preferred && !usedPublicIds.has(preferred)
       ? preferred
       : nextGeneratedId();
@@ -132,7 +140,7 @@ function createToolActivityCorrelation() {
     input: ToolActivityCorrelationInput,
     replace = false,
   ): void => {
-    for (const key of aliasKeys(input)) {
+    for (const key of toolActivityAliasKeys(input)) {
       const bound = byUpstreamId.get(key);
       if (replace || bound === undefined || (call.active && !bound.active)) {
         byUpstreamId.set(key, call);
@@ -143,7 +151,7 @@ function createToolActivityCorrelation() {
 
   const aliasedCall = (input: ToolActivityCorrelationInput): ToolActivityCall | undefined => {
     const matches = new Set(
-      aliasKeys(input)
+      toolActivityAliasKeys(input)
         .map((key) => byUpstreamId.get(key))
         .filter((call): call is ToolActivityCall => call !== undefined),
     );
@@ -169,7 +177,7 @@ function createToolActivityCorrelation() {
   };
 
   const start = (input: ToolActivityCorrelationInput): string => {
-    const upstream = upstreamIds(input);
+    const upstream = toolActivityUpstreamIds(input);
     const existing = aliasedCall(input);
     // A repeated explicit start for an active upstream id is the same event
     // replay. An id re-used after completion is a new invocation and receives a
@@ -197,6 +205,71 @@ function createToolActivityCorrelation() {
   };
 
   return { start, update, complete };
+}
+
+type HiddenToolActivityInvocation = {
+  aliases: Set<string>;
+};
+
+/**
+ * Remember a hidden invocation across the pinned embedded runtime's unflagged
+ * derived command/patch companions. Aliases learned on any companion join the
+ * same marker so a later alias-only frame cannot escape. A new canonical start
+ * retires the whole marker, allowing safe upstream-id reuse in the same run.
+ */
+function createHiddenToolActivityTracker() {
+  const byAlias = new Map<string, HiddenToolActivityInvocation>();
+
+  const matching = (
+    input: ToolActivityCorrelationInput,
+  ): Set<HiddenToolActivityInvocation> => new Set(
+    toolActivityAliasKeys(input)
+      .map((key) => byAlias.get(key))
+      .filter((marker): marker is HiddenToolActivityInvocation => marker !== undefined),
+  );
+
+  const bind = (
+    input: ToolActivityCorrelationInput,
+    create: boolean,
+  ): HiddenToolActivityInvocation | undefined => {
+    const keys = toolActivityAliasKeys(input);
+    if (keys.length === 0) return undefined;
+    const matches = matching(input);
+    const marker = matches.values().next().value ?? (
+      create ? { aliases: new Set<string>() } : undefined
+    );
+    if (!marker) return undefined;
+
+    for (const other of matches) {
+      if (other === marker) continue;
+      for (const alias of other.aliases) {
+        marker.aliases.add(alias);
+        if (byAlias.get(alias) === other) byAlias.set(alias, marker);
+      }
+    }
+    for (const key of keys) {
+      marker.aliases.add(key);
+      byAlias.set(key, marker);
+    }
+    return marker;
+  };
+
+  const retire = (input: ToolActivityCorrelationInput): void => {
+    for (const marker of matching(input)) {
+      for (const alias of marker.aliases) {
+        if (byAlias.get(alias) === marker) byAlias.delete(alias);
+      }
+    }
+  };
+
+  return {
+    hide: (input: ToolActivityCorrelationInput): void => {
+      bind(input, true);
+    },
+    suppresses: (input: ToolActivityCorrelationInput): boolean =>
+      bind(input, false) !== undefined,
+    retire,
+  };
 }
 
 const TOOL_ITEM_KINDS = new Set(["tool", "command", "patch", "search"]);
@@ -297,6 +370,7 @@ function createAgentToolActivitySink(params: {
   send: (activity: ToolActivityPayload) => void;
 }): AgentToolActivitySink {
   const correlation = createToolActivityCorrelation();
+  const hiddenInvocations = createHiddenToolActivityTracker();
 
   const identity = (
     runId: string,
@@ -336,10 +410,27 @@ function createAgentToolActivitySink(params: {
       return;
     }
     const data = rawData as Record<string, unknown>;
-    if (data.hideFromChannelProgress === true) return;
-
     const phase = readEventString(data, "phase");
     const name = readEventString(data, "name");
+    const kind = event.stream === "item" ? readEventString(data, "kind") : undefined;
+    const invocation = identity(runId, data);
+    const tracksInvocation =
+      event.stream === "tool" ||
+      event.stream === "command_output" ||
+      event.stream === "patch" ||
+      (event.stream === "item" && kind !== undefined && TOOL_ITEM_KINDS.has(kind));
+    const canonicalStart = phase === "start" && (
+      event.stream === "tool" || (event.stream === "item" && kind === "tool")
+    );
+
+    if (tracksInvocation && canonicalStart && data.hideFromChannelProgress !== true) {
+      hiddenInvocations.retire(invocation);
+    }
+    if (data.hideFromChannelProgress === true) {
+      if (tracksInvocation) hiddenInvocations.hide(invocation);
+      return;
+    }
+    if (tracksInvocation && hiddenInvocations.suppresses(invocation)) return;
 
     if (event.stream === "tool") {
       if (!phase || !TOOL_EVENT_PHASES.has(phase)) return;
@@ -366,7 +457,6 @@ function createAgentToolActivitySink(params: {
       // not emit a companion normalized tool event for them. Preserve that
       // privacy boundary while letting ordinary companion `tool` events flow.
       if (data.suppressChannelProgress === true) return;
-      const kind = readEventString(data, "kind");
       if (!kind || !TOOL_ITEM_KINDS.has(kind) || !phase || !TOOL_EVENT_PHASES.has(phase)) {
         return;
       }

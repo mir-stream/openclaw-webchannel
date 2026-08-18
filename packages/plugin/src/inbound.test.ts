@@ -838,6 +838,253 @@ describe("handleInboundMessage — #97 structured tool activity", () => {
     expect(JSON.stringify(toolActivities)).not.toContain("secret");
   });
 
+  it.each([
+    { toolName: "exec", derivedKind: "command", specialized: "command_output" },
+    { toolName: "bash", derivedKind: "command", specialized: "command_output" },
+    { toolName: "apply_patch", derivedKind: "patch", specialized: "patch" },
+  ] as const)(
+    "keeps hidden $toolName companions private and permits later visible id reuse",
+    async ({ toolName, derivedKind, specialized }) => {
+      const recorded = makeFakeTransport();
+      const runId = `run-hidden-${toolName}`;
+      const toolCallId = "reused-call";
+      const toolItemId = `tool:${toolCallId}`;
+      const derivedItemId = `${derivedKind}:${toolCallId}`;
+      let hiddenFrameCountAtReuse = -1;
+      const made = makeActivityApi(async (turn, emit) => {
+        turn.replyOptions?.onAgentRunStart?.(runId);
+
+        // Pinned embedded order: primary tool/tool-item events retain the hide
+        // flag, while derived command/patch companions do not.
+        emit({
+          stream: "tool",
+          runId,
+          data: {
+            toolCallId,
+            name: toolName,
+            phase: "start",
+            args: { payload: "hidden-start-secret" },
+            hideFromChannelProgress: true,
+          },
+        });
+        emit({
+          stream: "item",
+          runId,
+          data: {
+            itemId: toolItemId,
+            toolCallId,
+            kind: "tool",
+            name: toolName,
+            phase: "start",
+            status: "running",
+            hideFromChannelProgress: true,
+          },
+        });
+        emit({
+          stream: "item",
+          runId,
+          data: {
+            itemId: derivedItemId,
+            toolCallId,
+            kind: derivedKind,
+            name: toolName,
+            phase: "start",
+            status: "running",
+          },
+        });
+        emit({
+          stream: "tool",
+          runId,
+          data: {
+            toolCallId,
+            name: toolName,
+            phase: "update",
+            partialResult: "hidden-update-secret",
+            hideFromChannelProgress: true,
+          },
+        });
+        emit({
+          stream: "item",
+          runId,
+          data: {
+            itemId: toolItemId,
+            toolCallId,
+            kind: "tool",
+            name: toolName,
+            phase: "update",
+            status: "running",
+            hideFromChannelProgress: true,
+          },
+        });
+        if (specialized === "command_output") {
+          emit({
+            stream: "item",
+            runId,
+            data: {
+              itemId: derivedItemId,
+              toolCallId,
+              kind: "command",
+              name: toolName,
+              phase: "update",
+              status: "running",
+              progressText: "hidden-command-secret",
+            },
+          });
+          emit({
+            stream: "command_output",
+            runId,
+            data: {
+              itemId: derivedItemId,
+              toolCallId,
+              name: toolName,
+              phase: "delta",
+              status: "running",
+              output: "hidden-command-secret",
+            },
+          });
+        }
+        emit({
+          stream: "tool",
+          runId,
+          data: {
+            toolCallId,
+            name: toolName,
+            phase: "result",
+            isError: false,
+            result: { output: "hidden-result-secret" },
+            hideFromChannelProgress: true,
+          },
+        });
+        emit({
+          stream: "item",
+          runId,
+          data: {
+            itemId: toolItemId,
+            toolCallId,
+            kind: "tool",
+            name: toolName,
+            phase: "end",
+            status: "completed",
+            hideFromChannelProgress: true,
+          },
+        });
+        emit({
+          stream: "item",
+          runId,
+          data: {
+            itemId: derivedItemId,
+            toolCallId,
+            kind: derivedKind,
+            name: toolName,
+            phase: "end",
+            status: "completed",
+            summary: "hidden-derived-secret",
+          },
+        });
+        if (specialized === "command_output") {
+          emit({
+            stream: "command_output",
+            runId,
+            data: {
+              itemId: derivedItemId,
+              toolCallId,
+              name: toolName,
+              phase: "end",
+              status: "completed",
+              output: "hidden-command-secret",
+            },
+          });
+        } else {
+          emit({
+            stream: "patch",
+            runId,
+            data: {
+              itemId: derivedItemId,
+              toolCallId,
+              name: toolName,
+              phase: "end",
+              modified: ["hidden/path.ts"],
+              summary: "hidden-patch-secret",
+            },
+          });
+        }
+
+        hiddenFrameCountAtReuse = recorded.toolActivities.length;
+
+        // A canonical visible start definitively begins a new invocation even
+        // when the upstream id is reused. The alias-only derived update proves
+        // retirement removed `command:<id>` / `patch:<id>` as well as `<id>`.
+        emit({
+          stream: "tool",
+          runId,
+          data: {
+            toolCallId,
+            name: toolName,
+            phase: "start",
+            args: { payload: "visible-value-secret" },
+          },
+        });
+        emit({
+          stream: "item",
+          runId,
+          data: {
+            itemId: derivedItemId,
+            kind: derivedKind,
+            name: toolName,
+            phase: "update",
+            status: "running",
+          },
+        });
+        emit({
+          stream: "tool",
+          runId,
+          data: {
+            toolCallId,
+            name: toolName,
+            phase: "result",
+            isError: false,
+            result: { output: "visible-result-secret" },
+          },
+        });
+      });
+
+      await handleInboundMessage(made.api, recorded.transport, "peer-1", {
+        type: "user_message",
+        text: `hide then reuse ${toolName}`,
+        id: `turn-hidden-${toolName}`,
+      });
+
+      expect(hiddenFrameCountAtReuse).toBe(0);
+      expect(recorded.toolActivities).toHaveLength(3);
+      expect(recorded.toolActivities.map((frame) => frame.phase)).toEqual([
+        "start",
+        "update",
+        "result",
+      ]);
+      expect(new Set(recorded.toolActivities.map((frame) => frame.id))).toEqual(
+        new Set([toolCallId]),
+      );
+      expect(recorded.toolActivities[0]).toMatchObject({
+        name: toolName,
+        argKeys: ["payload"],
+      });
+      expect(recorded.toolActivities[2]).toMatchObject({
+        name: toolName,
+        status: "completed",
+      });
+      const wire = JSON.stringify(recorded.toolActivities);
+      expect(wire).not.toContain("hidden-start-secret");
+      expect(wire).not.toContain("hidden-update-secret");
+      expect(wire).not.toContain("hidden-command-secret");
+      expect(wire).not.toContain("hidden-result-secret");
+      expect(wire).not.toContain("hidden-derived-secret");
+      expect(wire).not.toContain("hidden-patch-secret");
+      expect(wire).not.toContain("hidden/path.ts");
+      expect(wire).not.toContain("visible-value-secret");
+      expect(wire).not.toContain("visible-result-secret");
+    },
+  );
+
   it("filters non-tool and hidden events, malformed data, and unsupported phases", async () => {
     const made = makeActivityApi(async (turn, emit) => {
       turn.replyOptions?.onAgentRunStart?.("run-filter");
