@@ -170,17 +170,15 @@ export function createWebChannelPlugin(
       // per-boot diagnostic and gives the operator's channel picker real
       // presentation copy. Values are owner-approved — do not reword.
       //
-      // These four values are NOT the only copy of themselves: the same four
-      // live in `package.json` → `openclaw.channel`, which core's channel
-      // catalog reads BEFORE the plugin bundle is loaded. That block is not
-      // limited to `id`/`label`/`blurb` — core uses `selectionLabel` to label and order
-      // setup-picker options; `docsPath` is rendered in the docs-aware line for
-      // already-selected channels. `toChannelMeta()` defaults them to `label` and
-      // `/channels/<id>`. So a value present here but missing there ships
-      // two different presentations of one channel (a bare "WebChannel" and a
-      // synthesized docs path pre-load, this copy post-load). The two surfaces
-      // must carry the same four values; `entry-exports.test.ts` cross-asserts
-      // them. See #170.
+      // The same four values also live in `package.json` → `openclaw.channel`.
+      // Core's `toChannelMeta()` reads all four from that block, defaulting
+      // `selectionLabel` to `label` and `docsPath` to `/channels/<id>` when
+      // absent, so the block is not limited to `id`/`label`/`blurb`. It is how
+      // the channel presents itself on surfaces where the plugin bundle is not
+      // loaded. An omission there therefore does not defer to runtime meta; it
+      // ships a second, different presentation of the same channel. Both
+      // surfaces must carry the same four values; `entry-exports.test.ts`
+      // cross-asserts them. See #170.
       meta: {
         label: "WebChannel",
         selectionLabel: "WebChannel (self-hosted web chat)",

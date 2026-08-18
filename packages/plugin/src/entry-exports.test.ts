@@ -76,18 +76,15 @@ describe("channel id agreement across the published artifacts", () => {
   });
 
   it("package.json openclaw.channel presents the channel exactly as plugin.meta does", () => {
-    // #170: the package.json openclaw.channel block is a live pre-load catalog
-    // presentation source (read by core's channel-catalog registry), SEPARATE
-    // from the runtime plugin.meta that `createChannelPluginBase` builds. It is
-    // NOT limited to id/label/blurb: core uses `selectionLabel` to label and order
-    // setup-picker options; `docsPath` is rendered in the docs-aware line for
-    // already-selected channels. `toChannelMeta()` defaults them to `label` and
-    // `/channels/<id>`. So an omission here does not defer to the runtime
-    // meta — it ships a SECOND, different presentation of one channel that
-    // operators see before the bundle ever loads.
-    //
-    // Asserted against the runtime meta rather than re-typed literals: a second
-    // copy of the strings is exactly the drift this test exists to catch.
+    // #170: The same four values also live in `package.json` → `openclaw.channel`.
+    // Core's `toChannelMeta()` reads all four from that block, defaulting
+    // `selectionLabel` to `label` and `docsPath` to `/channels/<id>` when
+    // absent, so the block is not limited to `id`/`label`/`blurb`. It is how
+    // the channel presents itself on surfaces where the plugin bundle is not
+    // loaded. An omission there therefore does not defer to runtime meta; it
+    // ships a second, different presentation of the same channel. Both
+    // surfaces must carry the same four values, so this test cross-asserts them
+    // instead of re-typing the literals.
     const meta = entry.channelPlugin.meta;
     // Guard the comparison below against passing vacuously: `undefined` on both
     // sides is the exact bug (a field core then fills with its own fallback).
