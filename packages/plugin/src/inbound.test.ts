@@ -101,7 +101,7 @@ type AssembledTurnLike = {
   };
 };
 
-type LifecycleEvent = { stream?: string; runId?: string; data?: Record<string, unknown> };
+type LifecycleEvent = { stream?: string; runId?: string; data?: unknown };
 type LifecycleListener = (evt: LifecycleEvent) => void;
 
 function makeFakeApi(params: {
@@ -462,308 +462,729 @@ describe("handleInboundMessage — terminal draft drain", () => {
 });
 
 describe("handleInboundMessage — #97 structured tool activity", () => {
-  it("emits a structured tool_activity frame on onToolStart with argKeys (names only) and correct id/turnId", async () => {
-    const { api } = makeFakeApi({
-      streamingMode: "progress",
-      runImpl: async (turn) => {
-        turn.replyOptions?.onToolStart?.({
-          itemId: "i1",
-          toolCallId: "t1",
-          name: "get_weather",
+  type EmitAgentEvent = (event: LifecycleEvent) => void;
+
+  function makeActivityApi(
+    runImpl: (turn: AssembledTurnLike, emit: EmitAgentEvent) => Promise<void>,
+    streamingMode: "off" | "partial" | "progress" = "progress",
+  ) {
+    const holder: { emit?: EmitAgentEvent } = {};
+    const made = makeFakeApi({
+      streamingMode,
+      withAgentEvents: true,
+      runImpl: async (turn) => runImpl(turn, (event) => holder.emit?.(event)),
+    });
+    holder.emit = made.emitLifecycle;
+    startAgentLifecycleSubscription(made.api);
+    return made;
+  }
+
+  function deferred(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void;
+    const promise = new Promise<void>((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  }
+
+  afterEach(() => stopAgentLifecycleSubscription());
+
+  it("uses run-scoped global tool events as the sole structured source while preserving reply draft callbacks", async () => {
+    const made = makeActivityApi(async (turn, emit) => {
+      // Pinned ordering: the global lifecycle start precedes the local callback
+      // that publishes the run id; only later tool events can reach this turn.
+      emit({ stream: "lifecycle", runId: "run-cli", data: { phase: "start" } });
+      emit({
+        stream: "tool",
+        runId: "run-cli",
+        data: { phase: "start", name: "too-early", toolCallId: "early" },
+      });
+      turn.replyOptions?.onAgentRunStart?.("run-cli");
+
+      // These callbacks still drive draft.pushEvent, but no longer duplicate
+      // structured activity.
+      turn.replyOptions?.onToolStart?.({
+        toolCallId: "cli-1",
+        name: "bash",
+        phase: "start",
+        args: { command: "printf callback-secret" },
+      });
+      turn.replyOptions?.onItemEvent?.({
+        itemId: "tool:cli-1",
+        toolCallId: "cli-1",
+        kind: "tool",
+        name: "bash",
+        phase: "start",
+        status: "running",
+      });
+
+      emit({
+        stream: "tool",
+        runId: "run-cli",
+        data: {
           phase: "start",
-          args: { city: "Paris", days: 3 },
-        });
-      },
-    });
-    const { transport, toolActivities } = makeFakeTransport();
-
-    await handleInboundMessage(api, transport, "peer-1", {
-      type: "user_message",
-      text: "weather please",
-      id: "turn-97a",
-    });
-
-    const start = toolActivities.find((a) => a.name === "get_weather");
-    expect(start).toBeDefined();
-    expect(start!.sessionKey).toBe("peer-1");
-    expect(start!.turnId).toBe("turn-97a");
-    expect(start!.id).toBe("t1"); // toolCallId wins the id fallback
-    expect(start!.phase).toBe("start");
-    // Security: KEY NAMES only — never the values ("Paris"/3).
-    expect(start!.argKeys).toEqual(["city", "days"]);
-    const wireBlob = JSON.stringify(toolActivities);
-    expect(wireBlob).not.toContain("Paris");
-    expect(wireBlob).not.toContain("\"days\":3");
-  });
-
-  it("emits a structured tool_activity frame on onItemEvent with status/summary and item id fallback", async () => {
-    const { api } = makeFakeApi({
-      streamingMode: "progress",
-      runImpl: async (turn) => {
-        turn.replyOptions?.onItemEvent?.({
-          itemId: "i9",
-          kind: "tool",
           name: "bash",
-          phase: "end",
-          status: "completed",
-          summary: "ran ls",
-        });
-      },
+          toolCallId: "cli-1",
+          args: { command: "printf global-secret", cwd: "/secret/path" },
+        },
+      });
+      emit({
+        stream: "tool",
+        runId: "run-cli",
+        data: {
+          phase: "result",
+          name: "bash",
+          toolCallId: "cli-1",
+          isError: false,
+          result: { output: "global-secret output" },
+        },
+      });
     });
-    const { transport, toolActivities } = makeFakeTransport();
+    const { transport, toolActivities, settleFrames } = makeFakeTransport();
 
-    await handleInboundMessage(api, transport, "peer-1", {
+    await handleInboundMessage(made.api, transport, "peer-1", {
       type: "user_message",
-      text: "list files",
-      id: "turn-97b",
+      text: "run it",
+      id: "turn-cli",
     });
 
-    const item = toolActivities.find((a) => a.status === "completed");
-    expect(item).toBeDefined();
-    expect(item!.turnId).toBe("turn-97b");
-    expect(item!.id).toBe("i9"); // no toolCallId → itemId fallback
-    expect(item!.name).toBe("bash");
-    expect(item!.status).toBe("completed");
-    expect(item!.summary).toBe("ran ls");
+    expect(toolActivities).toEqual([
+      {
+        sessionKey: "peer-1",
+        turnId: "turn-cli",
+        id: "cli-1",
+        name: "bash",
+        phase: "start",
+        argKeys: ["command", "cwd"],
+      },
+      {
+        sessionKey: "peer-1",
+        turnId: "turn-cli",
+        id: "cli-1",
+        name: "bash",
+        phase: "result",
+        status: "completed",
+      },
+    ]);
+    expect(settleFrames).toContainEqual({ turnId: "turn-cli", outcome: "ok" });
+    const wire = JSON.stringify(toolActivities);
+    expect(wire).not.toContain("callback-secret");
+    expect(wire).not.toContain("global-secret");
+    expect(wire).not.toContain("/secret/path");
   });
 
-  it("does not turn preamble, analysis, or status item events into tool activity", async () => {
-    const { api } = makeFakeApi({
-      streamingMode: "progress",
-      runImpl: async (turn) => {
-        // These are representative of the non-tool events the pinned runtime
-        // still forwards through onItemEvent while native tool items are
-        // suppressed in favour of lifecycle-specific callbacks.
-        for (const kind of ["preamble", "analysis", "status"]) {
-          turn.replyOptions?.onItemEvent?.({
-            itemId: `${kind}-1`,
-            kind,
-            phase: "update",
-            progressText: `${kind} text`,
-          });
-        }
+  it("coalesces pinned Codex native item + normalized tool events and includes item-only dynamic tools", async () => {
+    const nativeCalls = [
+      {
+        id: "native-file",
+        kind: "patch",
+        name: "apply_patch",
+        args: { changes: [{ path: "secret-file.ts", kind: "update" }] },
+        status: "completed",
+        isError: false,
       },
+      {
+        id: "native-search",
+        kind: "search",
+        name: "web_search",
+        args: { query: "secret query" },
+        status: "completed",
+        isError: false,
+      },
+      {
+        id: "native-mcp",
+        kind: "tool",
+        name: "server.lookup",
+        args: { token: "secret token" },
+        status: "blocked",
+        isError: true,
+      },
+    ] as const;
+    const made = makeActivityApi(async (turn, emit) => {
+      turn.replyOptions?.onAgentRunStart?.("run-codex");
+      for (const call of nativeCalls) {
+        emit({
+          stream: "item",
+          runId: "run-codex",
+          data: {
+            itemId: call.id,
+            phase: "start",
+            kind: call.kind,
+            status: "running",
+            name: call.name,
+            suppressChannelProgress: true,
+          },
+        });
+        emit({
+          stream: "tool",
+          runId: "run-codex",
+          data: {
+            phase: "start",
+            name: call.name,
+            itemId: call.id,
+            toolCallId: call.id,
+            args: call.args,
+          },
+        });
+        emit({
+          stream: "item",
+          runId: "run-codex",
+          data: {
+            itemId: call.id,
+            phase: "end",
+            kind: call.kind,
+            status: call.status,
+            name: call.name,
+            suppressChannelProgress: true,
+          },
+        });
+        emit({
+          stream: "tool",
+          runId: "run-codex",
+          data: {
+            phase: "result",
+            name: call.name,
+            itemId: call.id,
+            toolCallId: call.id,
+            status: call.status,
+            isError: call.isError,
+            result: { body: "secret result" },
+          },
+        });
+      }
+      // dynamicToolCall is deliberately item-only in the pinned projector.
+      emit({
+        stream: "item",
+        runId: "run-codex",
+        data: {
+          itemId: "dynamic-1",
+          phase: "start",
+          kind: "tool",
+          status: "running",
+          name: "dynamic_action",
+          suppressChannelProgress: true,
+        },
+      });
+      emit({
+        stream: "item",
+        runId: "run-codex",
+        data: {
+          itemId: "dynamic-1",
+          phase: "end",
+          kind: "tool",
+          status: "completed",
+          name: "dynamic_action",
+          suppressChannelProgress: true,
+        },
+      });
     });
     const { transport, toolActivities } = makeFakeTransport();
 
-    await handleInboundMessage(api, transport, "peer-1", {
+    await handleInboundMessage(made.api, transport, "peer-1", {
       type: "user_message",
-      text: "think, then work",
-      id: "turn-non-tools",
+      text: "native tools",
+      id: "turn-codex",
+    });
+
+    for (const call of nativeCalls) {
+      const frames = toolActivities.filter((frame) => frame.name === call.name);
+      expect(frames).toHaveLength(4);
+      expect(new Set(frames.map((frame) => frame.id)).size).toBe(1);
+      expect(frames.at(-1)?.status).toBe(call.status);
+      expect(frames.find((frame) => frame.argKeys)?.argKeys).toEqual(
+        Object.keys(call.args),
+      );
+    }
+    const dynamic = toolActivities.filter((frame) => frame.name === "dynamic_action");
+    expect(dynamic).toHaveLength(2);
+    expect(dynamic[0]!.id).toBe(dynamic[1]!.id);
+    expect(dynamic[1]!.status).toBe("completed");
+    expect(new Set(toolActivities.map((frame) => frame.id)).size).toBe(4);
+    const wire = JSON.stringify(toolActivities);
+    expect(wire).not.toContain("secret-file.ts");
+    expect(wire).not.toContain("secret query");
+    expect(wire).not.toContain("secret token");
+    expect(wire).not.toContain("secret result");
+  });
+
+  it("filters non-tool and hidden events, malformed data, and unsupported phases", async () => {
+    const made = makeActivityApi(async (turn, emit) => {
+      turn.replyOptions?.onAgentRunStart?.("run-filter");
+      for (const kind of ["preamble", "analysis", "status"]) {
+        emit({
+          stream: "item",
+          runId: "run-filter",
+          data: { itemId: kind, kind, phase: "update", summary: "not a tool" },
+        });
+      }
+      emit({
+        stream: "tool",
+        runId: "run-filter",
+        data: {
+          toolCallId: "hidden-tool",
+          name: "hidden",
+          phase: "start",
+          hideFromChannelProgress: true,
+        },
+      });
+      emit({
+        stream: "item",
+        runId: "run-filter",
+        data: {
+          itemId: "hidden-item",
+          kind: "tool",
+          name: "hidden",
+          phase: "end",
+          hideFromChannelProgress: true,
+        },
+      });
+      emit({ stream: "tool", runId: "run-filter", data: "not-an-object" });
+      emit({
+        stream: "tool",
+        runId: "run-filter",
+        data: { toolCallId: "delta", name: "nope", phase: "delta" },
+      });
+    });
+    const { transport, toolActivities } = makeFakeTransport();
+
+    await handleInboundMessage(made.api, transport, "peer-1", {
+      type: "user_message",
+      text: "filter",
+      id: "turn-filter",
     });
 
     expect(toolActivities).toEqual([]);
   });
 
-  it("coalesces command and patch terminal callbacks without leaking raw output or argument values", async () => {
-    const { api } = makeFakeApi({
-      streamingMode: "progress",
-      runImpl: async (turn) => {
-        turn.replyOptions?.onToolStart?.({
+  it("uses command_output and patch only as safe terminal refinements", async () => {
+    const made = makeActivityApi(async (turn, emit) => {
+      turn.replyOptions?.onAgentRunStart?.("run-specialized");
+      emit({
+        stream: "tool",
+        runId: "run-specialized",
+        data: {
           toolCallId: "command-call",
           name: "bash",
           phase: "start",
-          args: { command: "printf super-secret" },
-        });
-        turn.replyOptions?.onCommandOutput?.({
-          itemId: "command-command-call",
+          args: { command: "printf command-secret" },
+        },
+      });
+      emit({
+        stream: "command_output",
+        runId: "run-specialized",
+        data: {
+          itemId: "command:command-call",
+          toolCallId: "command-call",
+          name: "bash",
+          phase: "delta",
+          status: "running",
+          output: "command-secret delta",
+        },
+      });
+      emit({
+        stream: "command_output",
+        runId: "run-specialized",
+        data: {
+          itemId: "command:command-call",
           toolCallId: "command-call",
           name: "bash",
           phase: "end",
-          status: "completed",
-          output: "super-secret output",
-          exitCode: 0,
-        });
-        turn.replyOptions?.onToolStart?.({
+          status: "failed",
+          output: "command-secret output",
+        },
+      });
+      emit({
+        stream: "tool",
+        runId: "run-specialized",
+        data: {
           toolCallId: "patch-call",
           name: "apply_patch",
           phase: "start",
           args: { patch: "secret patch body" },
-        });
-        turn.replyOptions?.onPatchSummary?.({
-          itemId: "patch-patch-call",
+        },
+      });
+      emit({
+        stream: "item",
+        runId: "run-specialized",
+        data: {
+          itemId: "patch:patch-call",
+          toolCallId: "patch-call",
+          kind: "patch",
+          name: "apply_patch",
+          phase: "end",
+          status: "failed",
+        },
+      });
+      emit({
+        stream: "patch",
+        runId: "run-specialized",
+        data: {
+          itemId: "patch:patch-call",
           toolCallId: "patch-call",
           name: "apply_patch",
           phase: "end",
-          modified: ["src/a.ts"],
+          modified: ["secret-file.ts"],
           summary: "Updated 1 file",
-        });
-      },
+        },
+      });
     });
     const { transport, toolActivities } = makeFakeTransport();
 
-    await handleInboundMessage(api, transport, "peer-1", {
+    await handleInboundMessage(made.api, transport, "peer-1", {
       type: "user_message",
       text: "run and patch",
       id: "turn-specialized",
     });
 
-    const command = toolActivities.filter((item) => item.id === "command-call");
-    expect(command).toHaveLength(2);
-    expect(command[1]).toMatchObject({
-      turnId: "turn-specialized",
-      name: "bash",
-      phase: "end",
-      status: "completed",
-    });
-    const patch = toolActivities.filter((item) => item.id === "patch-call");
-    expect(patch).toHaveLength(2);
-    expect(patch[1]).toMatchObject({
-      turnId: "turn-specialized",
-      name: "apply_patch",
-      phase: "end",
-      summary: "Updated 1 file",
-    });
-    const wireBlob = JSON.stringify(toolActivities);
-    expect(wireBlob).not.toContain("super-secret");
-    expect(wireBlob).not.toContain("secret patch body");
+    expect(toolActivities.filter((frame) => frame.id === "command-call")).toHaveLength(2);
+    expect(toolActivities.find(
+      (frame) => frame.id === "command-call" && frame.phase === "end",
+    )?.status).toBe("failed");
+    const patch = toolActivities.filter((frame) => frame.id === "patch-call");
+    expect(patch).toHaveLength(3);
+    expect(patch[1]).toMatchObject({ phase: "end", status: "failed" });
+    expect(patch[2]).toMatchObject({ phase: "end", summary: "Updated 1 file" });
+    // Pinned patch summaries have no status/isError. The sparse refinement must
+    // not overwrite the preceding failed item status with a guessed success.
+    expect(patch[2]!.status).toBeUndefined();
+    const wire = JSON.stringify(toolActivities);
+    expect(wire).not.toContain("command-secret");
+    expect(wire).not.toContain("secret patch body");
+    expect(wire).not.toContain("secret-file.ts");
   });
 
-  it("gives repeated same-name and unnamed id-less starts distinct public ids", async () => {
-    const { api } = makeFakeApi({
-      streamingMode: "progress",
-      runImpl: async (turn) => {
-        turn.replyOptions?.onToolStart?.({ name: "bash", phase: "start", args: {} });
-        turn.replyOptions?.onToolStart?.({ name: "bash", phase: "start", args: {} });
-        turn.replyOptions?.onToolStart?.({ phase: "start", args: {} });
-        turn.replyOptions?.onToolStart?.({ phase: "start", args: {} });
-      },
+  it("gives repeated same-name and unnamed id-less starts distinct ids and correlates sequential terminals", async () => {
+    const made = makeActivityApi(async (turn, emit) => {
+      turn.replyOptions?.onAgentRunStart?.("run-idless");
+      emit({ stream: "tool", runId: "run-idless", data: { name: "bash", phase: "start" } });
+      emit({ stream: "tool", runId: "run-idless", data: { name: "bash", phase: "result" } });
+      emit({ stream: "tool", runId: "run-idless", data: { name: "bash", phase: "start" } });
+      emit({ stream: "tool", runId: "run-idless", data: { name: "bash", phase: "result", isError: true } });
+      emit({ stream: "tool", runId: "run-idless", data: { phase: "start" } });
+      emit({ stream: "tool", runId: "run-idless", data: { phase: "result" } });
+      emit({ stream: "tool", runId: "run-idless", data: { phase: "start" } });
+      emit({ stream: "tool", runId: "run-idless", data: { phase: "result" } });
+      // Concurrent id-less starts are distinct, and an ambiguous terminal must
+      // become its own record rather than completing an arbitrary invocation.
+      emit({ stream: "tool", runId: "run-idless", data: { name: "grep", phase: "start" } });
+      emit({ stream: "tool", runId: "run-idless", data: { name: "grep", phase: "start" } });
+      emit({ stream: "tool", runId: "run-idless", data: { phase: "start" } });
+      emit({ stream: "tool", runId: "run-idless", data: { phase: "start" } });
+      emit({ stream: "tool", runId: "run-idless", data: { name: "grep", phase: "result" } });
     });
     const { transport, toolActivities } = makeFakeTransport();
 
-    await handleInboundMessage(api, transport, "peer-1", {
+    await handleInboundMessage(made.api, transport, "peer-1", {
       type: "user_message",
-      text: "repeat tools",
+      text: "repeat",
       id: "turn-idless",
     });
 
-    expect(toolActivities).toHaveLength(4);
-    expect(new Set(toolActivities.map((item) => item.id)).size).toBe(4);
-    expect(toolActivities.map((item) => item.id)).not.toContain("bash");
-    expect(toolActivities.map((item) => item.id)).not.toContain("tool");
+    expect(toolActivities).toHaveLength(13);
+    for (let index = 0; index < 8; index += 2) {
+      expect(toolActivities[index]!.id).toBe(toolActivities[index + 1]!.id);
+    }
+    expect(new Set(toolActivities.slice(0, 8).filter((_, i) => i % 2 === 0).map((frame) => frame.id)).size).toBe(4);
+    expect(new Set(toolActivities.slice(8).map((frame) => frame.id)).size).toBe(5);
+    expect(toolActivities[3]!.status).toBe("failed");
+    expect(toolActivities.map((frame) => frame.id)).not.toContain("bash");
+    expect(toolActivities.map((frame) => frame.id)).not.toContain("tool");
   });
 
-  it("correlates an id-less terminal callback only to the sole active invocation", async () => {
-    const { api } = makeFakeApi({
-      streamingMode: "progress",
-      runImpl: async (turn) => {
-        turn.replyOptions?.onToolStart?.({ name: "bash", phase: "start", args: {} });
-        turn.replyOptions?.onCommandOutput?.({
+  it("prefers the sole active alias when an upstream id is reused", async () => {
+    const made = makeActivityApi(async (turn, emit) => {
+      turn.replyOptions?.onAgentRunStart?.("run-alias");
+      emit({
+        stream: "tool",
+        runId: "run-alias",
+        data: { toolCallId: "X", name: "bash", phase: "start" },
+      });
+      emit({
+        stream: "item",
+        runId: "run-alias",
+        data: {
+          itemId: "tool:X",
+          toolCallId: "X",
+          kind: "tool",
+          name: "bash",
+          phase: "start",
+          status: "running",
+        },
+      });
+      emit({
+        stream: "tool",
+        runId: "run-alias",
+        data: { toolCallId: "X", name: "bash", phase: "result" },
+      });
+      // X now points at the new active call while tool:X still points at the
+      // completed predecessor. The mixed-alias replay must choose the active.
+      emit({
+        stream: "tool",
+        runId: "run-alias",
+        data: { toolCallId: "X", name: "bash", phase: "start" },
+      });
+      emit({
+        stream: "item",
+        runId: "run-alias",
+        data: {
+          itemId: "tool:X",
+          toolCallId: "X",
+          kind: "tool",
+          name: "bash",
+          phase: "start",
+          status: "running",
+        },
+      });
+      emit({
+        stream: "item",
+        runId: "run-alias",
+        data: {
+          itemId: "tool:X",
+          kind: "tool",
           name: "bash",
           phase: "end",
           status: "completed",
-          output: "ignored",
-        });
-        turn.replyOptions?.onToolStart?.({ name: "bash", phase: "start", args: {} });
-        turn.replyOptions?.onCommandOutput?.({
-          name: "bash",
-          phase: "end",
-          status: "failed",
-          output: "also ignored",
-        });
-      },
+        },
+      });
     });
     const { transport, toolActivities } = makeFakeTransport();
 
-    await handleInboundMessage(api, transport, "peer-1", {
+    await handleInboundMessage(made.api, transport, "peer-1", {
       type: "user_message",
-      text: "run sequentially",
-      id: "turn-idless-terminal",
+      text: "reuse",
+      id: "turn-alias",
+    });
+
+    expect(new Set(toolActivities.slice(0, 3).map((frame) => frame.id)).size).toBe(1);
+    expect(new Set(toolActivities.slice(3).map((frame) => frame.id)).size).toBe(1);
+    expect(toolActivities[0]!.id).not.toBe(toolActivities[3]!.id);
+  });
+
+  it("namespaces reused upstream ids across fallback run ids and cleans every run at turn settlement", async () => {
+    let emitAfterSettlement!: EmitAgentEvent;
+    const made = makeActivityApi(async (turn, emit) => {
+      emitAfterSettlement = emit;
+      for (const runId of ["fallback-a", "fallback-b"]) {
+        emit({ stream: "lifecycle", runId, data: { phase: "start" } });
+        turn.replyOptions?.onAgentRunStart?.(runId);
+        emit({
+          stream: "tool",
+          runId,
+          data: { toolCallId: "same-id", name: "bash", phase: "start" },
+        });
+        emit({
+          stream: "tool",
+          runId,
+          data: { toolCallId: "same-id", name: "bash", phase: "result" },
+        });
+      }
+    });
+    const { transport, toolActivities } = makeFakeTransport();
+
+    await handleInboundMessage(made.api, transport, "peer-1", {
+      type: "user_message",
+      text: "fallback",
+      id: "turn-fallback",
     });
 
     expect(toolActivities).toHaveLength(4);
     expect(toolActivities[0]!.id).toBe(toolActivities[1]!.id);
     expect(toolActivities[2]!.id).toBe(toolActivities[3]!.id);
     expect(toolActivities[0]!.id).not.toBe(toolActivities[2]!.id);
+    emitAfterSettlement({
+      stream: "tool",
+      runId: "fallback-a",
+      data: { toolCallId: "late", name: "late", phase: "start" },
+    });
+    expect(toolActivities).toHaveLength(4);
   });
 
-  it("does not attach an id-less terminal callback to an ambiguous active call", async () => {
-    const { api } = makeFakeApi({
+  it("isolates concurrent turns by run id", async () => {
+    const started = [deferred(), deferred()];
+    const release = [deferred(), deferred()];
+    const holder: { emit?: EmitAgentEvent } = {};
+    let index = 0;
+    const made = makeFakeApi({
       streamingMode: "progress",
+      withAgentEvents: true,
       runImpl: async (turn) => {
-        turn.replyOptions?.onToolStart?.({ name: "bash", phase: "start", args: {} });
-        turn.replyOptions?.onToolStart?.({ name: "bash", phase: "start", args: {} });
-        turn.replyOptions?.onCommandOutput?.({
-          name: "bash",
-          phase: "end",
-          status: "completed",
-          output: "ignored",
-        });
+        const own = index++;
+        const runId = `concurrent-${own}`;
+        holder.emit?.({ stream: "lifecycle", runId, data: { phase: "start" } });
+        turn.replyOptions?.onAgentRunStart?.(runId);
+        started[own]!.resolve();
+        await release[own]!.promise;
       },
     });
+    holder.emit = made.emitLifecycle;
+    startAgentLifecycleSubscription(made.api);
     const { transport, toolActivities } = makeFakeTransport();
 
-    await handleInboundMessage(api, transport, "peer-1", {
+    const first = handleInboundMessage(made.api, transport, "peer-a", {
       type: "user_message",
-      text: "run concurrently",
-      id: "turn-idless-ambiguous",
+      text: "first",
+      id: "turn-a",
     });
+    await started[0]!.promise;
+    const second = handleInboundMessage(made.api, transport, "peer-b", {
+      type: "user_message",
+      text: "second",
+      id: "turn-b",
+    });
+    await started[1]!.promise;
+    holder.emit({
+      stream: "tool",
+      runId: "concurrent-1",
+      data: { toolCallId: "shared", name: "second-tool", phase: "start" },
+    });
+    holder.emit({
+      stream: "tool",
+      runId: "concurrent-0",
+      data: { toolCallId: "shared", name: "first-tool", phase: "start" },
+    });
+    release[0]!.resolve();
+    release[1]!.resolve();
+    await Promise.all([first, second]);
 
-    expect(toolActivities).toHaveLength(3);
-    expect(new Set(toolActivities.map((item) => item.id)).size).toBe(3);
+    expect(toolActivities).toEqual([
+      expect.objectContaining({ sessionKey: "peer-b", turnId: "turn-b", name: "second-tool" }),
+      expect.objectContaining({ sessionKey: "peer-a", turnId: "turn-a", name: "first-tool" }),
+    ]);
+    // Public identity is turn-scoped; the same upstream id may be reused safely.
+    expect(toolActivities[0]!.id).toBe("shared");
+    expect(toolActivities[1]!.id).toBe("shared");
   });
 
-  it("scopes generated fallback identity to each turn", async () => {
-    const { api } = makeFakeApi({
-      streamingMode: "progress",
-      runImpl: async (turn) => {
-        turn.replyOptions?.onToolStart?.({ name: "bash", phase: "start", args: {} });
-      },
+  it("preserves active run sinks across listener replacement and rejects stale listener callbacks", async () => {
+    const started = deferred();
+    const release = deferred();
+    const original = makeActivityApi(async (turn) => {
+      turn.replyOptions?.onAgentRunStart?.("replace-run");
+      started.resolve();
+      await release.promise;
     });
     const { transport, toolActivities } = makeFakeTransport();
+    const pending = handleInboundMessage(original.api, transport, "peer-1", {
+      type: "user_message",
+      text: "replace",
+      id: "turn-replace",
+    });
+    await started.promise;
 
-    for (const id of ["turn-one", "turn-two"]) {
-      await handleInboundMessage(api, transport, "peer-1", {
-        type: "user_message",
-        text: "run once",
-        id,
-      });
-    }
+    const replacement = makeFakeApi({
+      streamingMode: "progress",
+      withAgentEvents: true,
+      runImpl: async () => {},
+    });
+    startAgentLifecycleSubscription(replacement.api);
+    // The fake host intentionally retains the old callback after unsubscribe.
+    // The generation fence must reject it.
+    original.emitLifecycle({
+      stream: "tool",
+      runId: "replace-run",
+      data: { toolCallId: "old", name: "stale", phase: "start" },
+    });
+    replacement.emitLifecycle({
+      stream: "tool",
+      runId: "replace-run",
+      data: { toolCallId: "new", name: "current", phase: "start" },
+    });
+    release.resolve();
+    await pending;
 
+    expect(toolActivities).toEqual([
+      expect.objectContaining({ turnId: "turn-replace", id: "new", name: "current" }),
+    ]);
+  });
+
+  it("teardown drops active sinks and a stale finally cannot delete a newer same-run owner", async () => {
+    const started = [deferred(), deferred()];
+    const release = [deferred(), deferred()];
+    let index = 0;
+    let newerTurn: AssembledTurnLike | undefined;
+    const holder: { emit?: EmitAgentEvent } = {};
+    const made = makeFakeApi({
+      streamingMode: "progress",
+      withAgentEvents: true,
+      runImpl: async (turn) => {
+        const own = index++;
+        if (own === 1) newerTurn = turn;
+        turn.replyOptions?.onAgentRunStart?.("reused-run");
+        started[own]!.resolve();
+        await release[own]!.promise;
+      },
+    });
+    holder.emit = made.emitLifecycle;
+    startAgentLifecycleSubscription(made.api);
+    const { transport, toolActivities } = makeFakeTransport();
+
+    const oldTurn = handleInboundMessage(made.api, transport, "peer-old", {
+      type: "user_message",
+      text: "old",
+      id: "turn-old",
+    });
+    await started[0]!.promise;
+    const newTurn = handleInboundMessage(made.api, transport, "peer-new", {
+      type: "user_message",
+      text: "new",
+      id: "turn-new",
+    });
+    await started[1]!.promise;
+    holder.emit({
+      stream: "tool",
+      runId: "reused-run",
+      data: { toolCallId: "same-run-call", name: "owned-by-new", phase: "start" },
+    });
+    release[0]!.resolve();
+    await oldTurn;
+    holder.emit({
+      stream: "tool",
+      runId: "reused-run",
+      data: { toolCallId: "same-run-call", name: "owned-by-new", phase: "result" },
+    });
+    expect(toolActivities.map((frame) => frame.turnId)).toEqual(["turn-new", "turn-new"]);
+
+    stopAgentLifecycleSubscription();
+    startAgentLifecycleSubscription(made.api);
+    // A fallback callback from the pre-teardown turn must not republish its
+    // sink into the new subscription generation.
+    newerTurn?.replyOptions?.onAgentRunStart?.("post-stop-fallback");
+    holder.emit({
+      stream: "tool",
+      runId: "post-stop-fallback",
+      data: { toolCallId: "after-stop", name: "hidden", phase: "start" },
+    });
     expect(toolActivities).toHaveLength(2);
-    expect(toolActivities.map((item) => item.turnId)).toEqual(["turn-one", "turn-two"]);
-    // Reuse is safe and intentional: the public identity is the pair
-    // (turnId,id), not a process-global fallback string.
-    expect(toolActivities[0]!.id).toBe(toolActivities[1]!.id);
+    release[1]!.resolve();
+    await newTurn;
   });
 
-  it("#97 core fix: a short tool call emits a structured frame that survives turn settlement", async () => {
-    // The run fires a SINGLE tool event then resolves immediately with no final
-    // answer. Today the only trace of such a short call is the rolling progress
-    // DRAFT text, which is destroyed/replaced when the turn settles (finalized) —
-    // so it shows nothing durable. The structured tool_activity frame is emitted
-    // DIRECTLY on the wire (not via the draft), so it is visible regardless.
-    const { api } = makeFakeApi({
-      streamingMode: "progress",
-      runImpl: async (turn) => {
-        turn.replyOptions?.onToolStart?.({
-          toolCallId: "t-short",
-          name: "ping",
-          phase: "start",
-          args: { host: "example.com" },
+  it("does not create structured activity in off or control-lane turns", async () => {
+    for (const testCase of [
+      { mode: "off" as const, controlLane: false, turnId: "turn-off" },
+      { mode: "progress" as const, controlLane: true, turnId: "turn-control" },
+    ]) {
+      const made = makeActivityApi(async (turn, emit) => {
+        turn.replyOptions?.onAgentRunStart?.(`run-${testCase.turnId}`);
+        emit({
+          stream: "tool",
+          runId: `run-${testCase.turnId}`,
+          data: { toolCallId: "call", name: "bash", phase: "start" },
         });
-      },
-    });
-    const { transport, toolActivities, settleFrames } = makeFakeTransport();
+      }, testCase.mode);
+      const { transport, toolActivities } = makeFakeTransport();
 
-    await handleInboundMessage(api, transport, "peer-1", {
-      type: "user_message",
-      text: "ping it",
-      id: "turn-97c",
-    });
+      await handleInboundMessage(
+        made.api,
+        transport,
+        "peer-1",
+        { type: "user_message", text: "no activity", id: testCase.turnId },
+        "default",
+        { controlLane: testCase.controlLane },
+      );
 
-    // The turn actually settled — assert it non-vacuously, so "survives
-    // settlement" below is a real claim and not a tautology.
-    expect(settleFrames.some((f) => f.turnId === "turn-97c")).toBe(true);
-    // The structured tool activity crossed the wire independently of the draft
-    // and remains observable after the turn settled.
-    const short = toolActivities.find((a) => a.id === "t-short");
-    expect(short).toBeDefined();
-    expect(short!.turnId).toBe("turn-97c");
-    expect(short!.name).toBe("ping");
-    expect(short!.argKeys).toEqual(["host"]);
-    // No arg value ANYWHERE on the wire — key names only.
-    expect(JSON.stringify(toolActivities)).not.toContain("example.com");
+      expect(toolActivities).toEqual([]);
+    }
   });
 });
 
@@ -1804,9 +2225,14 @@ describe("agent lifecycle subscription lifetime", () => {
   });
 
   it("is a no-op on a host with no events surface", () => {
+    const host = makeEventsHost();
+    startAgentLifecycleSubscription(host.api);
     const api = { runtime: {} } as unknown as OpenClawPluginApi;
     expect(() => startAgentLifecycleSubscription(api)).not.toThrow();
+    expect(host.count()).toBe(1);
+    expect(host.unsubscribes()).toBe(0);
     expect(() => stopAgentLifecycleSubscription()).not.toThrow();
+    expect(host.count()).toBe(0);
   });
 });
 

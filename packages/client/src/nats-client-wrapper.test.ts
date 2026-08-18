@@ -1982,10 +1982,31 @@ describe("WebChannelNATSClient — #97 tool activity lane", () => {
       summary: "done",
     });
 
+    deliver(wrapper, {
+      type: "tool_activity",
+      id: "patch1",
+      turnId: "t1",
+      name: "apply_patch",
+      phase: "end",
+      status: "failed",
+    });
+    deliver(wrapper, {
+      type: "tool_activity",
+      id: "patch1",
+      turnId: "t1",
+      phase: "end",
+      summary: "Updated 1 file",
+    });
+    expect(wrapper.getState().toolActivity.find((item) => item.id === "patch1")).toMatchObject({
+      name: "apply_patch",
+      status: "failed",
+      summary: "Updated 1 file",
+    });
+
     deliver(wrapper, { type: "tool_activity", id: "tc2", turnId: "t1", name: "grep" });
     list = wrapper.getState().toolActivity;
-    expect(list).toHaveLength(2);
-    expect(list.map((a) => a.id)).toEqual(["tc1", "tc2"]);
+    expect(list).toHaveLength(3);
+    expect(list.map((a) => a.id)).toEqual(["tc1", "patch1", "tc2"]);
   });
 
   it("keeps the same id in different turns as distinct calls", () => {
