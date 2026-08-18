@@ -117,11 +117,16 @@ export type WebChannelNATSClientOptions = Omit<WebChannelOptions, "bootstrapJwt"
     bootstrapJwt: string;
   };
 
+/** Public state is additive; this wrapper's live snapshots always own the lane. */
+type InitializedWebChannelState = Omit<WebChannelState, "toolActivity"> & {
+  toolActivity: ToolActivityItem[];
+};
+
 export class WebChannelNATSClient {
   private readonly natsOptions: DirectClientOptions;
   private readonly client: WebChannelNatsClient;
 
-  private state: WebChannelState = {
+  private state: InitializedWebChannelState = {
     messages: [],
     reasoning: [],
     toolActivity: [],
@@ -1628,7 +1633,7 @@ export class WebChannelNATSClient {
    * Public state listeners are isolated so an embedder render bug cannot abort a
    * send, a staged-bubble exposure, or a held drain midway through its FIFO commit.
    */
-  private setState(patch: Partial<WebChannelState>): void {
+  private setState(patch: Partial<InitializedWebChannelState>): void {
     this.state = { ...this.state, ...patch };
     this.notifyStateListeners();
   }
@@ -1656,7 +1661,7 @@ export class WebChannelNATSClient {
    */
   private stageReceiptStateThenCommit(
     receiptKey: string,
-    patch: Partial<WebChannelState>,
+    patch: Partial<InitializedWebChannelState>,
     commit: () => void,
   ): void {
     const notificationSeq = this.stateNotificationSeq;
@@ -1917,7 +1922,7 @@ export class WebChannelNATSClient {
   private patchBubbleByReceiptKey(
     receiptKey: string,
     patch: Partial<ChatMessage>,
-    extraState?: Partial<WebChannelState>,
+    extraState?: Partial<InitializedWebChannelState>,
   ): void {
     const idx = this.state.messages.findIndex((m) => m.receiptKey === receiptKey);
     if (idx === -1) {

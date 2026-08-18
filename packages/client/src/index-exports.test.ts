@@ -19,6 +19,7 @@ import {
   type ToolActivityItem,
   type WebChannelErrorCause,
   type WebChannelNATSClientOptions,
+  type WebChannelState,
 } from "./index.js";
 import * as publicApi from "./index.js";
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
@@ -37,6 +38,15 @@ const _toolActivityExported: ToolActivityItem = {
   name: "bash",
 };
 void _toolActivityExported;
+const legacyStateWithoutToolActivity = {
+  messages: [],
+  reasoning: [],
+  approvals: [],
+  status: "connecting",
+  connected: false,
+  agentProtocolVersion: null,
+  agentPluginVersion: null,
+} satisfies WebChannelState;
 const registration = {
   devicePrivateKey: {} as CryptoKey,
   deviceX25519PrivateKey: {} as CryptoKey,
@@ -64,6 +74,10 @@ function validPayload(): BootstrapPayload {
 }
 
 describe("public export surface (package entry)", () => {
+  it("keeps legacy WebChannelState literals valid without toolActivity", () => {
+    expect("toolActivity" in legacyStateWithoutToolActivity).toBe(false);
+  });
+
   it("does not export the removed gateway client", () => {
     const removedExport = "WebChannel" + "Client";
     expect(removedExport in publicApi).toBe(false);

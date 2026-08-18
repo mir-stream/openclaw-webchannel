@@ -1932,8 +1932,13 @@ describe("WebChannelNATSClient — #97 tool activity lane", () => {
     (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(frame);
   }
 
+  function toolActivityOf(wrapper: WebChannelNATSClient) {
+    return wrapper.getState().toolActivity ?? [];
+  }
+
   it("upserts a tool_activity frame into state.toolActivity with structured fields", () => {
     const wrapper = makeWrapper();
+    expect(wrapper.getState()).toMatchObject({ toolActivity: [] });
     deliver(wrapper, {
       type: "tool_activity",
       id: "tc1",
@@ -1942,7 +1947,7 @@ describe("WebChannelNATSClient — #97 tool activity lane", () => {
       phase: "start",
       argKeys: ["city", "days"],
     });
-    const list = wrapper.getState().toolActivity;
+    const list = toolActivityOf(wrapper);
     expect(list).toHaveLength(1);
     expect(list[0]).toMatchObject({
       id: "tc1",
@@ -1970,7 +1975,7 @@ describe("WebChannelNATSClient — #97 tool activity lane", () => {
       status: "completed",
       summary: "done",
     });
-    let list = wrapper.getState().toolActivity;
+    let list = toolActivityOf(wrapper);
     expect(list).toHaveLength(1);
     expect(list[0]).toMatchObject({
       id: "tc1",
@@ -1997,14 +2002,14 @@ describe("WebChannelNATSClient — #97 tool activity lane", () => {
       phase: "end",
       summary: "Updated 1 file",
     });
-    expect(wrapper.getState().toolActivity.find((item) => item.id === "patch1")).toMatchObject({
+    expect(toolActivityOf(wrapper).find((item) => item.id === "patch1")).toMatchObject({
       name: "apply_patch",
       status: "failed",
       summary: "Updated 1 file",
     });
 
     deliver(wrapper, { type: "tool_activity", id: "tc2", turnId: "t1", name: "grep" });
-    list = wrapper.getState().toolActivity;
+    list = toolActivityOf(wrapper);
     expect(list).toHaveLength(3);
     expect(list.map((a) => a.id)).toEqual(["tc1", "patch1", "tc2"]);
   });
@@ -2034,7 +2039,7 @@ describe("WebChannelNATSClient — #97 tool activity lane", () => {
       status: "completed",
     });
 
-    const list = wrapper.getState().toolActivity;
+    const list = toolActivityOf(wrapper);
     expect(list).toHaveLength(2);
     expect(list[0]).toMatchObject({
       id: "tool-activity-1",
@@ -2057,7 +2062,7 @@ describe("WebChannelNATSClient — #97 tool activity lane", () => {
     deliver(wrapper, { type: "tool_activity", id: "tc1", name: "x" } as InboundMessage);
     deliver(wrapper, { type: "tool_activity", id: "", turnId: "t1", name: "x" });
     deliver(wrapper, { type: "tool_activity", id: "tc1", turnId: "", name: "x" });
-    expect(wrapper.getState().toolActivity).toHaveLength(0);
+    expect(toolActivityOf(wrapper)).toHaveLength(0);
   });
 
   it("bounds the list to the last 100 entries", () => {
@@ -2065,7 +2070,7 @@ describe("WebChannelNATSClient — #97 tool activity lane", () => {
     for (let i = 0; i < 105; i++) {
       deliver(wrapper, { type: "tool_activity", id: `tc${i}`, turnId: `t${i}`, name: "n" });
     }
-    const list = wrapper.getState().toolActivity;
+    const list = toolActivityOf(wrapper);
     expect(list).toHaveLength(100);
     expect(list[0].id).toBe("tc5");
     expect(list.at(-1)?.id).toBe("tc104");
@@ -2075,7 +2080,7 @@ describe("WebChannelNATSClient — #97 tool activity lane", () => {
     const wrapper = makeWrapper();
     deliver(wrapper, { type: "tool_activity", id: "tc1", turnId: "t1", name: "bash" });
     deliver(wrapper, { type: "turn_settled", turnId: "t1" });
-    expect(wrapper.getState().toolActivity).toHaveLength(1);
+    expect(toolActivityOf(wrapper)).toHaveLength(1);
   });
 });
 

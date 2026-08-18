@@ -15,7 +15,7 @@
     "packages/client/src/browser-jwt-entry.test.ts": 4,
     "packages/client/src/chacha20poly1305.test.ts": 17,
     "packages/client/src/command-filter.test.ts": 8,
-    "packages/client/src/index-exports.test.ts": 9,
+    "packages/client/src/index-exports.test.ts": 10,
     "packages/client/src/nats-client-agent-liveness.test.ts": 22,
     "packages/client/src/nats-client-crypto.test.ts": 10,
     "packages/client/src/nats-client-liveness.test.ts": 7,

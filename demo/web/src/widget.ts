@@ -293,7 +293,7 @@ export async function createWidget(
     for (const presentation of orderConversationPresentation(
       state.messages,
       state.reasoning,
-      state.toolActivity,
+      state.toolActivity ?? [],
     )) {
       if (presentation.kind === "reasoning") {
         const item = presentation.value;

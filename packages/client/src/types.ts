@@ -308,8 +308,12 @@ export type WebChannelState = {
   messages: ChatMessage[];
   /** Ephemeral, non-history reasoning previews, bounded by the clients. */
   reasoning: ReasoningItem[];
-  /** Ephemeral, non-history tool-call activity, bounded by the clients (#97). */
-  toolActivity: ToolActivityItem[];
+  /**
+   * Ephemeral, non-history tool-call activity, bounded by the clients (#97).
+   * Optional so existing `WebChannelState` object literals remain source
+   * compatible; current wrapper snapshots always initialize this to an array.
+   */
+  toolActivity?: ToolActivityItem[];
   approvals: ApprovalRequest[];
   status: ConnectionStatus;
   /** Convenience mirror of `status === "connected"`. */
