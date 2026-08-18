@@ -386,9 +386,13 @@ debounce/coalesce (P1-8b, #29). Both close a Telegram parity gap.
   typing (`inbound.ts:136,183`). A started working draft is finalized when the run resolves without a
   final delivery (`inbound.ts` on-settle path); core's own `/stop` turn delivers "⚙️ Agent was
   aborted."
-- **Client Stop button.** `widget.ts:182-186` flips the primary button to **Stop** while `isTyping ||
-  any m.working`; clicking it sends the literal `/stop` as a `user_message` (`:381-386`), so the
-  typed command and the button share one path.
+- **Client Stop button.** The primary button flips to **Stop** while the turn is in flight *and* the
+  composer is empty — `composerButtonMode` / `composerInFlight` in `demo/web/src/presentation.ts`,
+  applied by `applyComposerMode` in `widget.ts`. In-flight is `isTyping || turnActive ||
+  any m.working`; `turnActive` was folded in for #96 so the affordance survives the gaps between a
+  multi-step turn's bubbles, and the blank-composer condition keeps the label honest (a draft is
+  Send intent, and Enter already sends it). Clicking Stop sends the literal `/stop` as a
+  `user_message`, so the typed command and the button share one path.
 
 > **Decision record — /stop wire choice (a), and explicit-`/stop`-only buffer drop.**
 > - **Wire choice (a)** (send the literal `/stop` as a `user_message`, server detects it) was chosen
