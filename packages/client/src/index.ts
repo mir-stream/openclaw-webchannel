@@ -32,6 +32,7 @@ export type {
   ChatRole,
   ChatMessage,
   ReasoningItem,
+  ToolActivityItem,
   ApprovalDecision,
   ApprovalOption,
   ApprovalRequest,

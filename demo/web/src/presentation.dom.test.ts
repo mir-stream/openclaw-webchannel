@@ -12,6 +12,7 @@ import {
   orderConversationPresentation,
   captureOpenReasoningIds,
   buildReasoningDetails,
+  buildToolActivityChip,
 } from "./presentation.js";
 import { renderMarkdown } from "./markdown.js";
 import type { ChatMessage, ReasoningItem } from "../../../packages/client/src/types.js";
@@ -32,6 +33,8 @@ function renderInto(
     if (presentation.kind === "reasoning") {
       const item = presentation.value;
       bubbles.push(buildReasoningDetails(item, renderMarkdown(item.text), openIds.has(item.id)));
+    } else if (presentation.kind === "tool_activity") {
+      bubbles.push(buildToolActivityChip(presentation.value));
     } else {
       const div = document.createElement("div");
       div.textContent = presentation.value.text;
@@ -95,6 +98,36 @@ describe("reasoning lane DOM", () => {
     const list = document.createElement("div");
     renderInto(list, [user("u1", "t1")], []);
     expect(list.querySelector("details[data-reasoning-id]")).toBeNull();
+  });
+
+  it("#97 renders a tool-activity chip with name/status/arg KEYS and no arg values", () => {
+    const chip = buildToolActivityChip({
+      id: "tc1",
+      turnId: "t1",
+      name: "get_weather",
+      status: "completed",
+      argKeys: ["city", "days"],
+    });
+    expect(chip.dataset.toolActivityId).toBe("tc1");
+    expect(chip.textContent).toContain("get_weather");
+    expect(chip.textContent).toContain("completed");
+    // Argument KEY names are shown...
+    expect(chip.textContent).toContain("city");
+    expect(chip.textContent).toContain("days");
+    // ...but no arg VALUES can appear — they never reached the client.
+    expect(chip.textContent).not.toContain("Paris");
+  });
+
+  it("#97 tool-activity chip is text-only DOM (no innerHTML injection from summary)", () => {
+    const chip = buildToolActivityChip({
+      id: "tc1",
+      turnId: "t1",
+      name: "bash",
+      summary: "<img src=x onerror=alert(1)>",
+    });
+    // The summary lands as inert text, never a live element.
+    expect(chip.querySelector("img")).toBeNull();
+    expect(chip.textContent).toContain("<img src=x onerror=alert(1)>");
   });
 
   it("yields inert DOM for hostile markdown/HTML in reasoning text (no script/onerror)", () => {

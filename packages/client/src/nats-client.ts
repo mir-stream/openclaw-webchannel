@@ -152,6 +152,10 @@ export type InboundMessage = {
     | "agent_message"
     | "progress"
     | "reasoning"
+    // #97: structured, live, turn-scoped tool-call activity. Carries
+    // name/phase/status/summary/argKeys. Ephemeral (like `reasoning`), not
+    // durable history. `argKeys` are argument KEY NAMES only — never values.
+    | "tool_activity"
     | "turn_settled"
     | "approval_request"
     | "approval_resolved"
@@ -192,6 +196,16 @@ export type InboundMessage = {
   outcome?: "ok" | "error";
   kind?: "exec" | "plugin";
   title?: string;
+  /**
+   * #97: tool-activity fields on a `tool_activity` frame. `name`/`phase`/
+   * `status`/`summary` are core-provided display strings; `argKeys` carries
+   * argument KEY NAMES only (never values).
+   */
+  name?: string;
+  phase?: string;
+  status?: string;
+  summary?: string;
+  argKeys?: string[];
   description?: string;
   prompt?: string;
   options?: Array<{ decision: string; label: string; style: string }>;

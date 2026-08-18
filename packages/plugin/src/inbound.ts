@@ -60,6 +60,453 @@ type NoticeFlagPayload = {
   isCompactionNotice?: boolean;
 };
 
+type ToolActivityCorrelationInput = {
+  /** Run-local namespace: providers may reuse the same ids after fallback. */
+  scope?: string;
+  itemId?: string;
+  toolCallId?: string;
+  name?: string;
+};
+
+type ToolActivityCall = {
+  id: string;
+  scope?: string;
+  name?: string;
+  active: boolean;
+};
+
+function toolActivityUpstreamIds(
+  input: ToolActivityCorrelationInput,
+): string[] {
+  return [input.toolCallId, input.itemId].filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  );
+}
+
+function toolActivityAliasKeys(
+  input: ToolActivityCorrelationInput,
+): string[] {
+  return toolActivityUpstreamIds(input).map(
+    (id) => `${input.scope ?? ""}\u0000${id}`,
+  );
+}
+
+/**
+ * Correlate OpenClaw's optional agent-event identities to one public activity id.
+ *
+ * Current pinned emitters normally supply an item or tool-call id, but the
+ * event contract leaves them optional and a tool name can never be an identity:
+ * two consecutive `bash` calls (or two unnamed calls) are distinct work. Each
+ * defensive id-less start therefore gets a fresh turn-local id. An id-less
+ * update/end is attached only when exactly one compatible invocation is active;
+ * ambiguity creates a separate record instead of overwriting an arbitrary call.
+ */
+function createToolActivityCorrelation() {
+  const calls: ToolActivityCall[] = [];
+  const byUpstreamId = new Map<string, ToolActivityCall>();
+  const usedPublicIds = new Set<string>();
+  let generatedSequence = 0;
+
+  const nextGeneratedId = (): string => {
+    let id: string;
+    do {
+      generatedSequence += 1;
+      id = `tool-activity-${generatedSequence}`;
+    } while (usedPublicIds.has(id));
+    return id;
+  };
+
+  const createCall = (
+    input: ToolActivityCorrelationInput,
+    active: boolean,
+  ): ToolActivityCall => {
+    const preferred = toolActivityUpstreamIds(input)[0];
+    const id = preferred && !usedPublicIds.has(preferred)
+      ? preferred
+      : nextGeneratedId();
+    const call: ToolActivityCall = {
+      id,
+      scope: input.scope,
+      name: input.name,
+      active,
+    };
+    calls.push(call);
+    usedPublicIds.add(id);
+    return call;
+  };
+
+  const bind = (
+    call: ToolActivityCall,
+    input: ToolActivityCorrelationInput,
+    replace = false,
+  ): void => {
+    for (const key of toolActivityAliasKeys(input)) {
+      const bound = byUpstreamId.get(key);
+      if (replace || bound === undefined || (call.active && !bound.active)) {
+        byUpstreamId.set(key, call);
+      }
+    }
+    if (call.name === undefined && input.name !== undefined) call.name = input.name;
+  };
+
+  const aliasedCall = (input: ToolActivityCorrelationInput): ToolActivityCall | undefined => {
+    const matches = new Set(
+      toolActivityAliasKeys(input)
+        .map((key) => byUpstreamId.get(key))
+        .filter((call): call is ToolActivityCall => call !== undefined),
+    );
+    const activeMatches = [...matches].filter((call) => call.active);
+    // When an upstream id is reused, a derived item alias can still point at
+    // the completed predecessor. Prefer the one live match over stale aliases
+    // so the new invocation does not split into two public ids.
+    if (activeMatches.length === 1) return activeMatches[0];
+    return matches.size === 1 ? [...matches][0] : undefined;
+  };
+
+  const soleActiveCall = (input: ToolActivityCorrelationInput): ToolActivityCall | undefined => {
+    const active = calls.filter(
+      (call) => call.active && call.scope === input.scope,
+    );
+    if (input.name !== undefined) {
+      const sameName = active.filter(
+        (call) => call.name === undefined || call.name === input.name,
+      );
+      return sameName.length === 1 ? sameName[0] : undefined;
+    }
+    return active.length === 1 ? active[0] : undefined;
+  };
+
+  const start = (input: ToolActivityCorrelationInput): string => {
+    const upstream = toolActivityUpstreamIds(input);
+    const existing = aliasedCall(input);
+    // A repeated explicit start for an active upstream id is the same event
+    // replay. An id re-used after completion is a new invocation and receives a
+    // generated public id so the earlier call remains visible.
+    const call = existing?.active
+      ? existing
+      : createCall(input, true);
+    call.active = true;
+    bind(call, input, upstream.length > 0 && existing?.active !== true);
+    return call.id;
+  };
+
+  const update = (input: ToolActivityCorrelationInput): string => {
+    const call = aliasedCall(input) ?? soleActiveCall(input) ?? createCall(input, true);
+    call.active = true;
+    bind(call, input);
+    return call.id;
+  };
+
+  const complete = (input: ToolActivityCorrelationInput): string => {
+    const call = aliasedCall(input) ?? soleActiveCall(input) ?? createCall(input, false);
+    call.active = false;
+    bind(call, input);
+    return call.id;
+  };
+
+  return { start, update, complete };
+}
+
+type HiddenToolActivityInvocation = {
+  aliases: Set<string>;
+};
+
+/**
+ * Remember a hidden invocation across the pinned embedded runtime's unflagged
+ * derived command/patch companions. Aliases learned on any companion join the
+ * same marker so a later alias-only frame cannot escape. A new canonical start
+ * retires the whole marker, allowing safe upstream-id reuse in the same run.
+ */
+function createHiddenToolActivityTracker() {
+  const byAlias = new Map<string, HiddenToolActivityInvocation>();
+
+  const matching = (
+    input: ToolActivityCorrelationInput,
+  ): Set<HiddenToolActivityInvocation> => new Set(
+    toolActivityAliasKeys(input)
+      .map((key) => byAlias.get(key))
+      .filter((marker): marker is HiddenToolActivityInvocation => marker !== undefined),
+  );
+
+  const bind = (
+    input: ToolActivityCorrelationInput,
+    create: boolean,
+  ): HiddenToolActivityInvocation | undefined => {
+    const keys = toolActivityAliasKeys(input);
+    if (keys.length === 0) return undefined;
+    const matches = matching(input);
+    const marker = matches.values().next().value ?? (
+      create ? { aliases: new Set<string>() } : undefined
+    );
+    if (!marker) return undefined;
+
+    for (const other of matches) {
+      if (other === marker) continue;
+      for (const alias of other.aliases) {
+        marker.aliases.add(alias);
+        if (byAlias.get(alias) === other) byAlias.set(alias, marker);
+      }
+    }
+    for (const key of keys) {
+      marker.aliases.add(key);
+      byAlias.set(key, marker);
+    }
+    return marker;
+  };
+
+  const retire = (input: ToolActivityCorrelationInput): void => {
+    for (const marker of matching(input)) {
+      for (const alias of marker.aliases) {
+        if (byAlias.get(alias) === marker) byAlias.delete(alias);
+      }
+    }
+  };
+
+  return {
+    hide: (input: ToolActivityCorrelationInput): void => {
+      bind(input, true);
+    },
+    suppresses: (input: ToolActivityCorrelationInput): boolean =>
+      bind(input, false) !== undefined,
+    retire,
+  };
+}
+
+const TOOL_ITEM_KINDS = new Set(["tool", "command", "patch", "search"]);
+const TOOL_EVENT_PHASES = new Set(["start", "update", "result", "end", "error"]);
+
+type AgentEventLike = {
+  runId?: string;
+  stream?: string;
+  data?: unknown;
+};
+
+type ToolActivityPayload = Parameters<
+  WebChannelPeerChannel["sendToolActivity"]
+>[1];
+
+type AgentToolActivitySink = (event: AgentEventLike) => void;
+
+function isTerminalToolActivity(payload: { phase?: string; status?: string }): boolean {
+  return (
+    payload.phase === "end" ||
+    payload.phase === "result" ||
+    payload.phase === "error" ||
+    payload.status === "completed" ||
+    payload.status === "failed" ||
+    payload.status === "error" ||
+    payload.status === "blocked"
+  );
+}
+
+function readEventString(
+  data: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const value = data[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+const PINNED_PATCH_SUMMARY_MAX_LENGTH = 96;
+const PINNED_PATCH_SUMMARY_PATTERN = /^(?:no file changes recorded|[1-9]\d{0,9} added(?:, [1-9]\d{0,9} modified)?(?:, [1-9]\d{0,9} deleted)?|[1-9]\d{0,9} modified(?:, [1-9]\d{0,9} deleted)?|[1-9]\d{0,9} deleted)$/u;
+
+/**
+ * Reduce patch metadata to the pinned producer's count-only presentation.
+ * Array elements are deliberately never read: they are file paths and stay
+ * outside the structured wire boundary. If the arrays are absent, accept only
+ * the exact count grammar emitted by the pinned runtime.
+ */
+function readSafePatchSummary(
+  data: Record<string, unknown>,
+): string | undefined {
+  const added = Array.isArray(data.added) ? data.added.length : undefined;
+  const modified = Array.isArray(data.modified) ? data.modified.length : undefined;
+  const deleted = Array.isArray(data.deleted) ? data.deleted.length : undefined;
+
+  if (added !== undefined || modified !== undefined || deleted !== undefined) {
+    const parts: string[] = [];
+    if ((added ?? 0) > 0) parts.push(`${added} added`);
+    if ((modified ?? 0) > 0) parts.push(`${modified} modified`);
+    if ((deleted ?? 0) > 0) parts.push(`${deleted} deleted`);
+    return parts.length > 0 ? parts.join(", ") : "no file changes recorded";
+  }
+
+  const summary = readEventString(data, "summary");
+  if (
+    !summary ||
+    summary.length > PINNED_PATCH_SUMMARY_MAX_LENGTH ||
+    !PINNED_PATCH_SUMMARY_PATTERN.test(summary)
+  ) {
+    return undefined;
+  }
+  return summary;
+}
+
+function terminalToolStatus(
+  data: Record<string, unknown>,
+  phase: string | undefined,
+): string {
+  return explicitTerminalToolStatus(data, phase) ?? "completed";
+}
+
+function explicitTerminalToolStatus(
+  data: Record<string, unknown>,
+  phase: string | undefined,
+): string | undefined {
+  const status = readEventString(data, "status");
+  if (status) return status === "error" ? "failed" : status;
+  if (data.isError === true || phase === "error") return "failed";
+  if (data.isError === false) return "completed";
+  return undefined;
+}
+
+/**
+ * Project the process-global, run-scoped agent event stream onto #97's narrow
+ * metadata wire surface. This is the canonical structured lane: reply
+ * callbacks remain responsible only for the pre-existing progress draft.
+ */
+function createAgentToolActivitySink(params: {
+  turnId: string;
+  send: (activity: ToolActivityPayload) => void;
+}): AgentToolActivitySink {
+  const correlation = createToolActivityCorrelation();
+  const hiddenInvocations = createHiddenToolActivityTracker();
+
+  const identity = (
+    runId: string,
+    data: Record<string, unknown>,
+  ): ToolActivityCorrelationInput => ({
+    scope: runId,
+    itemId: readEventString(data, "itemId"),
+    toolCallId: readEventString(data, "toolCallId"),
+    name: readEventString(data, "name"),
+  });
+
+  const correlatedId = (
+    runId: string,
+    data: Record<string, unknown>,
+    phase: string | undefined,
+  ): string => {
+    const input = identity(runId, data);
+    if (isTerminalToolActivity({
+      phase,
+      status: readEventString(data, "status"),
+    })) {
+      return correlation.complete(input);
+    }
+    if (phase === "start") return correlation.start(input);
+    return correlation.update(input);
+  };
+
+  return (event) => {
+    const runId = event.runId;
+    const rawData = event.data;
+    if (
+      !runId ||
+      !rawData ||
+      typeof rawData !== "object" ||
+      Array.isArray(rawData)
+    ) {
+      return;
+    }
+    const data = rawData as Record<string, unknown>;
+    const phase = readEventString(data, "phase");
+    const name = readEventString(data, "name");
+    const kind = event.stream === "item" ? readEventString(data, "kind") : undefined;
+    const invocation = identity(runId, data);
+    const tracksInvocation =
+      event.stream === "tool" ||
+      event.stream === "command_output" ||
+      event.stream === "patch" ||
+      (event.stream === "item" && kind !== undefined && TOOL_ITEM_KINDS.has(kind));
+    const canonicalStart = phase === "start" && (
+      event.stream === "tool" || (event.stream === "item" && kind === "tool")
+    );
+
+    if (tracksInvocation && canonicalStart && data.hideFromChannelProgress !== true) {
+      hiddenInvocations.retire(invocation);
+    }
+    if (data.hideFromChannelProgress === true) {
+      if (tracksInvocation) hiddenInvocations.hide(invocation);
+      return;
+    }
+    if (tracksInvocation && hiddenInvocations.suppresses(invocation)) return;
+
+    if (event.stream === "tool") {
+      if (!phase || !TOOL_EVENT_PHASES.has(phase)) return;
+      const terminal = isTerminalToolActivity({
+        phase,
+        status: readEventString(data, "status"),
+      });
+      const args = data.args;
+      params.send({
+        turnId: params.turnId,
+        id: correlatedId(runId, data, phase),
+        name,
+        phase,
+        ...(terminal ? { status: terminalToolStatus(data, phase) } : {}),
+        ...(!terminal && args && typeof args === "object" && !Array.isArray(args)
+          ? { argKeys: Object.keys(args) }
+          : {}),
+      });
+      return;
+    }
+
+    if (event.stream === "item") {
+      // Core marks transcript/channel-hidden messaging items this way and does
+      // not emit a companion normalized tool event for them. Preserve that
+      // privacy boundary while letting ordinary companion `tool` events flow.
+      if (data.suppressChannelProgress === true) return;
+      if (!kind || !TOOL_ITEM_KINDS.has(kind) || !phase || !TOOL_EVENT_PHASES.has(phase)) {
+        return;
+      }
+      const terminal = isTerminalToolActivity({
+        phase,
+        status: readEventString(data, "status"),
+      });
+      const summary = kind === "patch" ? readSafePatchSummary(data) : undefined;
+      params.send({
+        turnId: params.turnId,
+        id: correlatedId(runId, data, phase),
+        name,
+        phase,
+        ...(terminal
+          ? { status: terminalToolStatus(data, phase) }
+          : readEventString(data, "status")
+            ? { status: readEventString(data, "status") }
+            : {}),
+        // Command/tool/search summaries may contain output or query/result
+        // bodies. Patch summaries are admitted only after count sanitization.
+        ...(summary ? { summary } : {}),
+      });
+      return;
+    }
+
+    if (event.stream === "command_output" || event.stream === "patch") {
+      if (!isTerminalToolActivity({
+        phase,
+        status: readEventString(data, "status"),
+      })) {
+        return;
+      }
+      const status = event.stream === "patch"
+        ? explicitTerminalToolStatus(data, phase)
+        : terminalToolStatus(data, phase);
+      const summary = event.stream === "patch"
+        ? readSafePatchSummary(data)
+        : undefined;
+      params.send({
+        turnId: params.turnId,
+        id: correlatedId(runId, data, phase),
+        name,
+        phase,
+        ...(status ? { status } : {}),
+        ...(summary ? { summary } : {}),
+      });
+    }
+  };
+}
+
 function noticeFlagsOf(payload: NoticeFlagPayload): NoticeFlagPayload {
   return {
     isStatusNotice: payload.isStatusNotice,
@@ -178,14 +625,47 @@ type AgentRunVerdict = "ok" | "error" | "aborted";
 
 /** Terminal verdict per agent run, drained by the turn that owns the run. */
 const agentRunVerdicts = new Map<string, AgentRunVerdict>();
+/** Structured activity destination for each run currently owned by a turn. */
+const agentRunToolActivitySinks = new Map<string, AgentToolActivitySink>();
 /** Live subscription, so a reload replaces rather than stacks listeners. */
 let lifecycleUnsubscribe: (() => void) | undefined;
+/** Invalidates callbacks retained by a host after unsubscribe/reload. */
+let lifecycleSubscriptionGeneration = 0;
+/** Explicit teardown fence; listener replacement does not advance this. */
+let toolActivityTeardownGeneration = 0;
+/** False between explicit teardown and the next successful subscription. */
+let toolActivitySubscriptionActive = false;
 /**
  * Backstop only. Entries are deleted by the settling turn, so this cap is never
  * reached in normal operation — it bounds the leak if a run terminates for a
  * turn that never settles (a control-lane turn, or a crashed dispatch).
  */
 const MAX_TRACKED_RUNS = 512;
+
+function registerAgentRunToolActivitySink(
+  runId: string,
+  sink: AgentToolActivitySink,
+): void {
+  if (
+    agentRunToolActivitySinks.size >= MAX_TRACKED_RUNS &&
+    !agentRunToolActivitySinks.has(runId)
+  ) {
+    const oldest = agentRunToolActivitySinks.keys().next();
+    if (!oldest.done) agentRunToolActivitySinks.delete(oldest.value);
+  }
+  agentRunToolActivitySinks.set(runId, sink);
+}
+
+function unregisterAgentRunToolActivitySink(
+  runId: string,
+  sink: AgentToolActivitySink,
+): void {
+  // A defensive identity check keeps an old turn's delayed finally from
+  // deleting a newer owner if an upstream runtime ever reuses a run id.
+  if (agentRunToolActivitySinks.get(runId) === sink) {
+    agentRunToolActivitySinks.delete(runId);
+  }
+}
 
 /**
  * #113: accounts that have already been told their reasoning lane is coming up
@@ -218,7 +698,8 @@ const reasoningEmptyLaneWarned = new Set<string>();
 const MAX_WARNED_ACCOUNTS = 512;
 
 /**
- * Subscribe to the lifecycle stream. A no-op when the host predates the API.
+ * Subscribe to the process-global agent stream for lifecycle verdicts and
+ * run-scoped structured tool activity. A no-op when the host predates the API.
  *
  * `onAgentEvent` registers on a PROCESS-GLOBAL listener set
  * (agent-events-*.js:227), while a reload hands the plugin a fresh
@@ -238,13 +719,29 @@ export function startAgentLifecycleSubscription(api: OpenClawPluginApi): void {
   getApprovalOriginRegistry();
   const events = api.runtime?.events;
   if (!events || typeof events.onAgentEvent !== "function") return;
-  // Replace, don't stack. NOT a teardown: this must not re-arm the #113
-  // empty-lane warning (see releaseAgentLifecycleSubscription).
-  releaseAgentLifecycleSubscription({ rearmDiagnostics: false });
+  // Replace, don't stack. NOT a teardown: active turns can outlive a plugin
+  // facade replacement, so their run-scoped sinks and verdicts remain owned by
+  // those turns until their `finally` blocks drain them.
+  releaseAgentLifecycleSubscription({
+    rearmDiagnostics: false,
+    clearRunState: false,
+  });
+  toolActivitySubscriptionActive = false;
+  const generation = lifecycleSubscriptionGeneration;
   lifecycleUnsubscribe = events.onAgentEvent((evt) => {
-    if (evt?.stream !== "lifecycle") return;
+    if (generation !== lifecycleSubscriptionGeneration) return;
     const runId = evt.runId;
     if (!runId) return;
+    const activitySink = agentRunToolActivitySinks.get(runId);
+    if (activitySink) {
+      try {
+        activitySink(evt);
+      } catch {
+        // One malformed activity event must not interrupt lifecycle verdicts or
+        // other process-global listeners. The projector itself is fail-closed.
+      }
+    }
+    if (evt?.stream !== "lifecycle") return;
     const data = evt.data as { phase?: unknown; aborted?: unknown } | undefined;
     const phase = data?.phase;
     if (phase !== "end" && phase !== "error") return;
@@ -270,16 +767,21 @@ export function startAgentLifecycleSubscription(api: OpenClawPluginApi): void {
       aborted ? "aborted" : phase === "error" ? "error" : "ok",
     );
   });
+  toolActivitySubscriptionActive = true;
 }
 
 /**
- * Release the lifecycle subscription and drop any verdicts still pending.
+ * Release the agent-event subscription and drop pending run verdict/activity
+ * state at an explicit host teardown.
  *
  * #113: also re-arms the empty-reasoning-lane warning. Teardown is where config
  * can change, so the next generation gets to say its piece once more.
  */
 export function stopAgentLifecycleSubscription(): void {
-  releaseAgentLifecycleSubscription({ rearmDiagnostics: true });
+  releaseAgentLifecycleSubscription({
+    rearmDiagnostics: true,
+    clearRunState: true,
+  });
 }
 
 /**
@@ -295,10 +797,18 @@ export function stopAgentLifecycleSubscription(): void {
  */
 function releaseAgentLifecycleSubscription(options: {
   rearmDiagnostics: boolean;
+  clearRunState: boolean;
 }): void {
-  lifecycleUnsubscribe?.();
+  lifecycleSubscriptionGeneration += 1;
+  const unsubscribe = lifecycleUnsubscribe;
   lifecycleUnsubscribe = undefined;
-  agentRunVerdicts.clear();
+  unsubscribe?.();
+  if (options.clearRunState) {
+    toolActivitySubscriptionActive = false;
+    toolActivityTeardownGeneration += 1;
+    agentRunVerdicts.clear();
+    agentRunToolActivitySinks.clear();
+  }
   if (options.rearmDiagnostics) reasoningEmptyLaneWarned.clear();
   // #93: host teardown draws a new approval-origin barrier. Any request the
   // gateway replays from BEFORE this point can no longer be attributed to a
@@ -387,8 +897,10 @@ export async function handleInboundMessage(
   // falls back to ANON_PEER_ID).
   const wsKey = peerId || ANON_PEER_ID;
 
-  /** The agent run this turn owns, learned from `onAgentRunStart`. */
+  /** The last agent run this turn owns, learned from `onAgentRunStart`. */
   let agentRunId: string | undefined;
+  /** Every fallback/retry run owned by this turn, all cleaned in `finally`. */
+  const agentRunIds = new Set<string>();
 
   // Control lane (P1-8a): an out-of-band abort turn ("/stop"). It reaches here
   // directly (NOT via the per-session FIFO) so core's fast-abort can cancel the
@@ -401,7 +913,9 @@ export async function handleInboundMessage(
   const turnId =
     message.id ??
     `webchannel-turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const activityGenerationAtTurnStart = toolActivityTeardownGeneration;
   let draft: ProgressDraftController | undefined;
+  let toolActivitySink: AgentToolActivitySink | undefined;
   let reasoning: ReasoningDraftController | undefined;
   // #113: did core hand us even ONE reasoning payload this turn? Counted at the
   // native callback / durable-delivery boundaries, NOT inside the controller:
@@ -502,6 +1016,12 @@ export async function handleInboundMessage(
       turnId,
       channelConfig,
       logger: api.logger,
+    });
+    toolActivitySink = createAgentToolActivitySink({
+      turnId,
+      send: (activity) => {
+        transport.sendToolActivity(wsKey, activity);
+      },
     });
   }
   // Reasoning lane is created after route resolution (below), alongside the other
@@ -714,6 +1234,14 @@ export async function handleInboundMessage(
                     // `presence`, so it is recorded but never selectable.
                     onAgentRunStart: (runId) => {
                       agentRunId = runId;
+                      agentRunIds.add(runId);
+                      if (
+                        toolActivitySink &&
+                        toolActivitySubscriptionActive &&
+                        activityGenerationAtTurnStart === toolActivityTeardownGeneration
+                      ) {
+                        registerAgentRunToolActivitySink(runId, toolActivitySink);
+                      }
                       originLease?.activate();
                     },
                     // Reasoning callbacks and durable reasoning payloads are
@@ -778,7 +1306,7 @@ export async function handleInboundMessage(
                     // `suppressDefaultToolProgressMessages`, exported through
                     // `openclaw/plugin-sdk/reply-runtime`).
                     ...(draft
-                      ? {
+                      ? ({
                           suppressDefaultToolProgressMessages: true,
                           onToolStart: (p) => {
                             draft!.pushEvent({
@@ -831,7 +1359,15 @@ export async function handleInboundMessage(
                                 },
                               }
                             : {}),
-                        }
+                        } satisfies Pick<
+                          GetReplyOptions,
+                          | "suppressDefaultToolProgressMessages"
+                          | "onToolStart"
+                          | "onItemEvent"
+                          | "onPartialReply"
+                          | "onAssistantMessageStart"
+                          | "onBlockReplyQueued"
+                        >)
                       : {}),
             },
             ...(draft
@@ -1066,6 +1602,11 @@ export async function handleInboundMessage(
     // here; the claim is removed by its own id, so a run retained across a
     // teardown rotation releases only itself.
     originLease?.release();
+    if (toolActivitySink) {
+      for (const runId of agentRunIds) {
+        unregisterAgentRunToolActivitySink(runId, toolActivitySink);
+      }
+    }
     // Always halt the throttled draft loop so a late background flush can't race
     // the error handling (or linger after a normal finalize). Idempotent and a
     // no-op when no draft was created or it was already stopped by finalize().
@@ -1090,7 +1631,7 @@ export async function handleInboundMessage(
     // turn that then timed out), so when it is present the payload heuristics
     // below are not consulted at all.
     const verdict = agentRunId ? agentRunVerdicts.get(agentRunId) : undefined;
-    if (agentRunId) agentRunVerdicts.delete(agentRunId);
+    for (const runId of agentRunIds) agentRunVerdicts.delete(runId);
     if (verdict === "error") {
       turnOutcome = "error";
     } else if (verdict === undefined && terminalErrorSeen) {

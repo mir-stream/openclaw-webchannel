@@ -487,6 +487,31 @@ export class NatsChannel implements WebChannelPeerChannel {
     return this.sendToPeer(peerId, { type: "reasoning", id, turnId, text });
   }
 
+  sendToolActivity(
+    peerId: string,
+    activity: {
+      id: string;
+      turnId: string;
+      name?: string;
+      phase?: string;
+      status?: string;
+      summary?: string;
+      argKeys?: string[];
+    },
+  ): boolean {
+    const payload: OutboundWsMessage = {
+      type: "tool_activity",
+      id: activity.id,
+      turnId: activity.turnId,
+      ...(activity.name !== undefined ? { name: activity.name } : {}),
+      ...(activity.phase !== undefined ? { phase: activity.phase } : {}),
+      ...(activity.status !== undefined ? { status: activity.status } : {}),
+      ...(activity.summary !== undefined ? { summary: activity.summary } : {}),
+      ...(activity.argKeys !== undefined ? { argKeys: activity.argKeys } : {}),
+    };
+    return this.sendToPeer(peerId, payload);
+  }
+
   sendTurnSettled(peerId: string, turnId: string, outcome: "ok" | "error"): boolean {
     return this.sendToPeer(peerId, { type: "turn_settled", turnId, outcome });
   }

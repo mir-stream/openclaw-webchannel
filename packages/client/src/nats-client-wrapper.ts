@@ -20,6 +20,7 @@ import type {
   ApprovalOption,
   ChatMessage,
   ReasoningItem,
+  ToolActivityItem,
   ApprovalRequest,
   SendReceipt,
   SendFailure,
@@ -116,13 +117,19 @@ export type WebChannelNATSClientOptions = Omit<WebChannelOptions, "bootstrapJwt"
     bootstrapJwt: string;
   };
 
+/** Public state is additive; this wrapper's live snapshots always own the lane. */
+type InitializedWebChannelState = Omit<WebChannelState, "toolActivity"> & {
+  toolActivity: ToolActivityItem[];
+};
+
 export class WebChannelNATSClient {
   private readonly natsOptions: DirectClientOptions;
   private readonly client: WebChannelNatsClient;
 
-  private state: WebChannelState = {
+  private state: InitializedWebChannelState = {
     messages: [],
     reasoning: [],
+    toolActivity: [],
     approvals: [],
     status: "connecting",
     connected: false,
@@ -1436,6 +1443,8 @@ export class WebChannelNATSClient {
         msg.type !== "typing"
         && msg.type !== "progress"
         && msg.type !== "reasoning"
+        // #97: a tool_activity frame, like reasoning, proves the turn is alive.
+        && msg.type !== "tool_activity"
         && msg.type !== "agent_message"
       )
     ) {
@@ -1624,7 +1633,7 @@ export class WebChannelNATSClient {
    * Public state listeners are isolated so an embedder render bug cannot abort a
    * send, a staged-bubble exposure, or a held drain midway through its FIFO commit.
    */
-  private setState(patch: Partial<WebChannelState>): void {
+  private setState(patch: Partial<InitializedWebChannelState>): void {
     this.state = { ...this.state, ...patch };
     this.notifyStateListeners();
   }
@@ -1652,7 +1661,7 @@ export class WebChannelNATSClient {
    */
   private stageReceiptStateThenCommit(
     receiptKey: string,
-    patch: Partial<WebChannelState>,
+    patch: Partial<InitializedWebChannelState>,
     commit: () => void,
   ): void {
     const notificationSeq = this.stateNotificationSeq;
@@ -1677,6 +1686,21 @@ export class WebChannelNATSClient {
       ? [...current, item]
       : current.map((entry, i) => (i === idx ? item : entry));
     this.setState({ reasoning: next.slice(-100) });
+  }
+
+  // #97: upsert a tool-activity item by turn-scoped `(turnId, id)`. A later
+  // sparse lifecycle frame refines the same call without erasing name/argKeys
+  // learned at start. Bounded like `reasoning`; ephemeral, NOT cleared on
+  // turn_settled (a live-not-durable surface).
+  private upsertToolActivity(item: ToolActivityItem): void {
+    const current = this.state.toolActivity;
+    const idx = current.findIndex(
+      (entry) => entry.turnId === item.turnId && entry.id === item.id,
+    );
+    const next = idx === -1
+      ? [...current, item]
+      : current.map((entry, i) => (i === idx ? { ...entry, ...item } : entry));
+    this.setState({ toolActivity: next.slice(-100) });
   }
 
   private upsertMessage(
@@ -1898,7 +1922,7 @@ export class WebChannelNATSClient {
   private patchBubbleByReceiptKey(
     receiptKey: string,
     patch: Partial<ChatMessage>,
-    extraState?: Partial<WebChannelState>,
+    extraState?: Partial<InitializedWebChannelState>,
   ): void {
     const idx = this.state.messages.findIndex((m) => m.receiptKey === receiptKey);
     if (idx === -1) {
@@ -2367,6 +2391,31 @@ export class WebChannelNATSClient {
         this.upsertReasoning({ id: msg.id, turnId: msg.turnId, text: msg.text });
         // P1-9 §3.6.2: reasoning correlates by turnId — disarm any watched draft
         // for this turn (the turn is demonstrably still producing frames).
+        this.disarmStaleDraftsByTurn(msg.turnId);
+        return;
+      }
+
+      case "tool_activity": {
+        // #97: structured tool-call activity. Required correlation keys `id` and
+        // `turnId` must be non-empty strings; drop otherwise. Only the KEY NAMES
+        // in `argKeys` are carried — no arg values ever reach state.
+        if (typeof msg.id !== "string" || msg.id.length === 0) return;
+        if (typeof msg.turnId !== "string" || msg.turnId.length === 0) return;
+        this.upsertToolActivity({
+          id: msg.id,
+          turnId: msg.turnId,
+          ...(typeof msg.name === "string" ? { name: msg.name } : {}),
+          ...(typeof msg.phase === "string" ? { phase: msg.phase } : {}),
+          ...(typeof msg.status === "string" ? { status: msg.status } : {}),
+          ...(typeof msg.summary === "string" ? { summary: msg.summary } : {}),
+          // Trust boundary: the wire is untrusted; keep only string key names
+          // (the "argKeys are key names only" contract) and drop anything else.
+          ...(Array.isArray(msg.argKeys)
+            ? { argKeys: msg.argKeys.filter((k): k is string => typeof k === "string") }
+            : {}),
+        });
+        // Like reasoning, a tool_activity frame correlates by turnId and proves
+        // the turn is still producing frames — disarm any watched stale draft.
         this.disarmStaleDraftsByTurn(msg.turnId);
         return;
       }
