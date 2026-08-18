@@ -105,7 +105,9 @@ const EXPECTED: Record<string, InventoryEntry> = {
     count: 2, classification: "session-authorized issuer plus gated test issuer",
   },
   "packages/saas/src/ac6-device-flow-e2e.test.ts :: /bootstrap template": {
-    count: 4, classification: "standalone fixed-tuple integration fixtures",
+    count: 5,
+    classification:
+      "standalone fixed-tuple integration fixtures plus expiry-fixture enrollment bootstrapUrl metadata (unreachable .invalid host, never called)",
   },
   "packages/saas/src/ac6-device-flow-e2e.test.ts :: /test/bootstrap-jwt template": {
     count: 3, classification: "explicitly gated reference-server fixtures including malformed peer rejection",
