@@ -79,10 +79,10 @@ describe("channel id agreement across the published artifacts", () => {
     // #170: the package.json openclaw.channel block is a live pre-load catalog
     // presentation source (read by core's channel-catalog registry), SEPARATE
     // from the runtime plugin.meta that `createChannelPluginBase` builds. It is
-    // NOT limited to id/label/blurb: core's `toChannelMeta()` also reads
-    // `selectionLabel` and `docsPath` off this block, falling back to `label`
-    // and `/channels/<id>` when they are absent, and the onboarding channel
-    // picker renders both. So an omission here does not defer to the runtime
+    // NOT limited to id/label/blurb: core uses `selectionLabel` to label and order
+    // setup-picker options; `docsPath` is rendered in the docs-aware line for
+    // already-selected channels. `toChannelMeta()` defaults them to `label` and
+    // `/channels/<id>`. So an omission here does not defer to the runtime
     // meta — it ships a SECOND, different presentation of one channel that
     // operators see before the bundle ever loads.
     //

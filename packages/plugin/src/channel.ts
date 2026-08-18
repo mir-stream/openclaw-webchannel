@@ -173,10 +173,10 @@ export function createWebChannelPlugin(
       // These four values are NOT the only copy of themselves: the same four
       // live in `package.json` → `openclaw.channel`, which core's channel
       // catalog reads BEFORE the plugin bundle is loaded. That block is not
-      // limited to `id`/`label`/`blurb` — core's `toChannelMeta()` also reads
-      // `selectionLabel` and `docsPath` from it, falling back to `label` and
-      // `/channels/<id>` when they are absent, and the onboarding channel
-      // picker renders both. So a value present here but missing there ships
+      // limited to `id`/`label`/`blurb` — core uses `selectionLabel` to label and order
+      // setup-picker options; `docsPath` is rendered in the docs-aware line for
+      // already-selected channels. `toChannelMeta()` defaults them to `label` and
+      // `/channels/<id>`. So a value present here but missing there ships
       // two different presentations of one channel (a bare "WebChannel" and a
       // synthesized docs path pre-load, this copy post-load). The two surfaces
       // must carry the same four values; `entry-exports.test.ts` cross-asserts
