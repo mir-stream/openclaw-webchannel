@@ -60,6 +60,137 @@ type NoticeFlagPayload = {
   isCompactionNotice?: boolean;
 };
 
+type ToolActivityCorrelationInput = {
+  itemId?: string;
+  toolCallId?: string;
+  name?: string;
+};
+
+type ToolActivityCall = {
+  id: string;
+  name?: string;
+  active: boolean;
+};
+
+/**
+ * Correlate OpenClaw's optional callback identities to one public activity id.
+ *
+ * The pinned CLI bridge omits both ids, so a tool name cannot be an identity:
+ * two consecutive `bash` calls (or two unnamed calls) are distinct work. Each
+ * id-less start therefore gets a fresh turn-local id. An id-less update/end is
+ * attached only when exactly one compatible invocation is active; ambiguity
+ * creates a separate record instead of overwriting an arbitrary call.
+ */
+function createToolActivityCorrelation() {
+  const calls: ToolActivityCall[] = [];
+  const byUpstreamId = new Map<string, ToolActivityCall>();
+  const usedPublicIds = new Set<string>();
+  let generatedSequence = 0;
+
+  const upstreamIds = (input: ToolActivityCorrelationInput): string[] =>
+    [input.toolCallId, input.itemId].filter(
+      (value): value is string => typeof value === "string" && value.length > 0,
+    );
+
+  const nextGeneratedId = (): string => {
+    let id: string;
+    do {
+      generatedSequence += 1;
+      id = `tool-activity-${generatedSequence}`;
+    } while (usedPublicIds.has(id));
+    return id;
+  };
+
+  const createCall = (
+    input: ToolActivityCorrelationInput,
+    active: boolean,
+  ): ToolActivityCall => {
+    const preferred = upstreamIds(input)[0];
+    const id = preferred && !usedPublicIds.has(preferred)
+      ? preferred
+      : nextGeneratedId();
+    const call: ToolActivityCall = { id, name: input.name, active };
+    calls.push(call);
+    usedPublicIds.add(id);
+    return call;
+  };
+
+  const bind = (
+    call: ToolActivityCall,
+    input: ToolActivityCorrelationInput,
+    replace = false,
+  ): void => {
+    for (const id of upstreamIds(input)) {
+      if (replace || !byUpstreamId.has(id)) byUpstreamId.set(id, call);
+    }
+    if (call.name === undefined && input.name !== undefined) call.name = input.name;
+  };
+
+  const aliasedCall = (input: ToolActivityCorrelationInput): ToolActivityCall | undefined => {
+    const matches = new Set(
+      upstreamIds(input)
+        .map((id) => byUpstreamId.get(id))
+        .filter((call): call is ToolActivityCall => call !== undefined),
+    );
+    return matches.size === 1 ? [...matches][0] : undefined;
+  };
+
+  const soleActiveCall = (input: ToolActivityCorrelationInput): ToolActivityCall | undefined => {
+    const active = calls.filter((call) => call.active);
+    if (input.name !== undefined) {
+      const sameName = active.filter(
+        (call) => call.name === undefined || call.name === input.name,
+      );
+      return sameName.length === 1 ? sameName[0] : undefined;
+    }
+    return active.length === 1 ? active[0] : undefined;
+  };
+
+  const start = (input: ToolActivityCorrelationInput): string => {
+    const upstream = upstreamIds(input);
+    const existing = aliasedCall(input);
+    // A repeated explicit start for an active upstream id is the same callback
+    // replay. An id re-used after completion is a new invocation and receives a
+    // generated public id so the earlier call remains visible.
+    const call = existing?.active
+      ? existing
+      : createCall(input, true);
+    call.active = true;
+    bind(call, input, upstream.length > 0 && existing?.active !== true);
+    return call.id;
+  };
+
+  const update = (input: ToolActivityCorrelationInput): string => {
+    const call = aliasedCall(input) ?? soleActiveCall(input) ?? createCall(input, true);
+    call.active = true;
+    bind(call, input);
+    return call.id;
+  };
+
+  const complete = (input: ToolActivityCorrelationInput): string => {
+    const call = aliasedCall(input) ?? soleActiveCall(input) ?? createCall(input, false);
+    call.active = false;
+    bind(call, input);
+    return call.id;
+  };
+
+  return { start, update, complete };
+}
+
+const TOOL_ITEM_KINDS = new Set(["tool", "command", "patch", "search"]);
+
+function isTerminalToolActivity(payload: { phase?: string; status?: string }): boolean {
+  return (
+    payload.phase === "end" ||
+    payload.phase === "result" ||
+    payload.phase === "error" ||
+    payload.status === "completed" ||
+    payload.status === "failed" ||
+    payload.status === "error" ||
+    payload.status === "blocked"
+  );
+}
+
 function noticeFlagsOf(payload: NoticeFlagPayload): NoticeFlagPayload {
   return {
     isStatusNotice: payload.isStatusNotice,
@@ -401,6 +532,7 @@ export async function handleInboundMessage(
   const turnId =
     message.id ??
     `webchannel-turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const toolActivityCorrelation = createToolActivityCorrelation();
   let draft: ProgressDraftController | undefined;
   let reasoning: ReasoningDraftController | undefined;
   // #113: did core hand us even ONE reasoning payload this turn? Counted at the
@@ -778,7 +910,7 @@ export async function handleInboundMessage(
                     // `suppressDefaultToolProgressMessages`, exported through
                     // `openclaw/plugin-sdk/reply-runtime`).
                     ...(draft
-                      ? {
+                      ? ({
                           suppressDefaultToolProgressMessages: true,
                           onToolStart: (p) => {
                             // #97: emit structured tool activity DIRECTLY on the
@@ -789,9 +921,14 @@ export async function handleInboundMessage(
                             // Only argument KEY NAMES cross the wire — never arg
                             // VALUES (arg values can carry secrets; the value
                             // redactor is a deliberate follow-up).
+                            const id = isTerminalToolActivity(p)
+                              ? toolActivityCorrelation.complete(p)
+                              : p.phase === "update"
+                                ? toolActivityCorrelation.update(p)
+                                : toolActivityCorrelation.start(p);
                             transport.sendToolActivity(wsKey, {
                               turnId,
-                              id: p.toolCallId ?? p.itemId ?? p.name ?? "tool",
+                              id,
                               name: p.name,
                               phase: p.phase,
                               argKeys: p.args ? Object.keys(p.args) : undefined,
@@ -806,21 +943,32 @@ export async function handleInboundMessage(
                             });
                           },
                           onItemEvent: (p) => {
-                            // #97: see onToolStart — structured, direct-to-wire,
-                            // ungated. No arg values here either.
-                            transport.sendToolActivity(wsKey, {
-                              turnId,
-                              // Same id-fallback chain as onToolStart so a
-                              // start and its follow-up item events for one call
-                              // coalesce onto a single entry even in the
-                              // (contract-violating) case where core omits both
-                              // toolCallId and itemId.
-                              id: p.toolCallId ?? p.itemId ?? p.name ?? "tool",
-                              name: p.name,
-                              phase: p.phase,
-                              status: p.status,
-                              summary: p.summary ?? p.progressText,
-                            });
+                            // `onItemEvent` is also core's commentary/status
+                            // lane. Only pinned actual tool kinds become
+                            // structured activity; every event still reaches
+                            // the pre-existing progress-draft compositor below.
+                            if (p.kind && TOOL_ITEM_KINDS.has(p.kind)) {
+                              const id = isTerminalToolActivity(p)
+                                ? toolActivityCorrelation.complete(p)
+                                : p.phase === "start"
+                                  ? toolActivityCorrelation.start(p)
+                                  : toolActivityCorrelation.update(p);
+                              transport.sendToolActivity(wsKey, {
+                                turnId,
+                                id,
+                                name: p.name,
+                                phase: p.phase,
+                                status: p.status,
+                                // Command progressText/summary is command
+                                // output. Keep raw output off this metadata-only
+                                // wire surface; the dedicated callback below
+                                // forwards lifecycle fields only.
+                                summary:
+                                  p.kind === "command"
+                                    ? undefined
+                                    : p.summary ?? p.progressText,
+                              });
+                            }
                             draft!.pushEvent({
                               event: "item",
                               itemId: p.itemId,
@@ -832,6 +980,32 @@ export async function handleInboundMessage(
                               summary: p.summary,
                               progressText: p.progressText,
                               meta: p.meta,
+                            });
+                          },
+                          onCommandOutput: (p) => {
+                            // The callback also carries raw `output`; never put
+                            // it on the structured metadata wire surface. Tool
+                            // starts/updates already have their own callback;
+                            // this seam exists specifically for the terminal
+                            // command state suppressed from onItemEvent.
+                            if (!isTerminalToolActivity(p)) return;
+                            const id = toolActivityCorrelation.complete(p);
+                            transport.sendToolActivity(wsKey, {
+                              turnId,
+                              id,
+                              name: p.name,
+                              phase: p.phase,
+                              status: p.status,
+                            });
+                          },
+                          onPatchSummary: (p) => {
+                            const id = toolActivityCorrelation.complete(p);
+                            transport.sendToolActivity(wsKey, {
+                              turnId,
+                              id,
+                              name: p.name,
+                              phase: p.phase,
+                              summary: p.summary,
                             });
                           },
                           // Answer-text streaming remains PARTIAL MODE ONLY.
@@ -861,7 +1035,17 @@ export async function handleInboundMessage(
                                 },
                               }
                             : {}),
-                        }
+                        } satisfies Pick<
+                          GetReplyOptions,
+                          | "suppressDefaultToolProgressMessages"
+                          | "onToolStart"
+                          | "onItemEvent"
+                          | "onCommandOutput"
+                          | "onPatchSummary"
+                          | "onPartialReply"
+                          | "onAssistantMessageStart"
+                          | "onBlockReplyQueued"
+                        >)
                       : {}),
             },
             ...(draft

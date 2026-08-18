@@ -16,6 +16,7 @@ import {
   WEBCHANNEL_PROTOCOL_VERSION,
   type BootstrapPayload,
   type PinnedKeys,
+  type ToolActivityItem,
   type WebChannelErrorCause,
   type WebChannelNATSClientOptions,
 } from "./index.js";
@@ -30,6 +31,12 @@ const _errorCauseExported: WebChannelErrorCause = "protocol-mismatch";
 void _errorCauseExported;
 const _capacityCauseExported: WebChannelErrorCause = "capacity";
 void _capacityCauseExported;
+const _toolActivityExported: ToolActivityItem = {
+  id: "call-1",
+  turnId: "turn-1",
+  name: "bash",
+};
+void _toolActivityExported;
 const registration = {
   devicePrivateKey: {} as CryptoKey,
   deviceX25519PrivateKey: {} as CryptoKey,

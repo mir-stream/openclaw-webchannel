@@ -1683,16 +1683,18 @@ export class WebChannelNATSClient {
     this.setState({ reasoning: next.slice(-100) });
   }
 
-  // #97: upsert a tool-activity item by `id` (a later frame for the same tool
-  // call coalesces in place, so name/phase/status/summary/argKeys refine the
-  // same entry rather than duplicating). Bounded like `reasoning`; ephemeral,
-  // NOT cleared on turn_settled (a live-not-durable surface).
+  // #97: upsert a tool-activity item by turn-scoped `(turnId, id)`. A later
+  // sparse lifecycle frame refines the same call without erasing name/argKeys
+  // learned at start. Bounded like `reasoning`; ephemeral, NOT cleared on
+  // turn_settled (a live-not-durable surface).
   private upsertToolActivity(item: ToolActivityItem): void {
     const current = this.state.toolActivity;
-    const idx = current.findIndex((entry) => entry.id === item.id);
+    const idx = current.findIndex(
+      (entry) => entry.turnId === item.turnId && entry.id === item.id,
+    );
     const next = idx === -1
       ? [...current, item]
-      : current.map((entry, i) => (i === idx ? item : entry));
+      : current.map((entry, i) => (i === idx ? { ...entry, ...item } : entry));
     this.setState({ toolActivity: next.slice(-100) });
   }
 

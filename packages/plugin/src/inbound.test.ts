@@ -82,6 +82,8 @@ type AssembledTurnLike = {
     onAgentRunStart?: (runId: string) => void;
     onToolStart?: (p: unknown) => void;
     onItemEvent?: (p: unknown) => void;
+    onCommandOutput?: (p: unknown) => void;
+    onPatchSummary?: (p: unknown) => void;
     onPartialReply?: (p: { text?: string }) => void;
     onAssistantMessageStart?: () => void;
   };
@@ -523,6 +525,206 @@ describe("handleInboundMessage — #97 structured tool activity", () => {
     expect(item!.name).toBe("bash");
     expect(item!.status).toBe("completed");
     expect(item!.summary).toBe("ran ls");
+  });
+
+  it("does not turn preamble, analysis, or status item events into tool activity", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "progress",
+      runImpl: async (turn) => {
+        // These are representative of the non-tool events the pinned runtime
+        // still forwards through onItemEvent while native tool items are
+        // suppressed in favour of lifecycle-specific callbacks.
+        for (const kind of ["preamble", "analysis", "status"]) {
+          turn.replyOptions?.onItemEvent?.({
+            itemId: `${kind}-1`,
+            kind,
+            phase: "update",
+            progressText: `${kind} text`,
+          });
+        }
+      },
+    });
+    const { transport, toolActivities } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "think, then work",
+      id: "turn-non-tools",
+    });
+
+    expect(toolActivities).toEqual([]);
+  });
+
+  it("coalesces command and patch terminal callbacks without leaking raw output or argument values", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "progress",
+      runImpl: async (turn) => {
+        turn.replyOptions?.onToolStart?.({
+          toolCallId: "command-call",
+          name: "bash",
+          phase: "start",
+          args: { command: "printf super-secret" },
+        });
+        turn.replyOptions?.onCommandOutput?.({
+          itemId: "command-command-call",
+          toolCallId: "command-call",
+          name: "bash",
+          phase: "end",
+          status: "completed",
+          output: "super-secret output",
+          exitCode: 0,
+        });
+        turn.replyOptions?.onToolStart?.({
+          toolCallId: "patch-call",
+          name: "apply_patch",
+          phase: "start",
+          args: { patch: "secret patch body" },
+        });
+        turn.replyOptions?.onPatchSummary?.({
+          itemId: "patch-patch-call",
+          toolCallId: "patch-call",
+          name: "apply_patch",
+          phase: "end",
+          modified: ["src/a.ts"],
+          summary: "Updated 1 file",
+        });
+      },
+    });
+    const { transport, toolActivities } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "run and patch",
+      id: "turn-specialized",
+    });
+
+    const command = toolActivities.filter((item) => item.id === "command-call");
+    expect(command).toHaveLength(2);
+    expect(command[1]).toMatchObject({
+      turnId: "turn-specialized",
+      name: "bash",
+      phase: "end",
+      status: "completed",
+    });
+    const patch = toolActivities.filter((item) => item.id === "patch-call");
+    expect(patch).toHaveLength(2);
+    expect(patch[1]).toMatchObject({
+      turnId: "turn-specialized",
+      name: "apply_patch",
+      phase: "end",
+      summary: "Updated 1 file",
+    });
+    const wireBlob = JSON.stringify(toolActivities);
+    expect(wireBlob).not.toContain("super-secret");
+    expect(wireBlob).not.toContain("secret patch body");
+  });
+
+  it("gives repeated same-name and unnamed id-less starts distinct public ids", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "progress",
+      runImpl: async (turn) => {
+        turn.replyOptions?.onToolStart?.({ name: "bash", phase: "start", args: {} });
+        turn.replyOptions?.onToolStart?.({ name: "bash", phase: "start", args: {} });
+        turn.replyOptions?.onToolStart?.({ phase: "start", args: {} });
+        turn.replyOptions?.onToolStart?.({ phase: "start", args: {} });
+      },
+    });
+    const { transport, toolActivities } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "repeat tools",
+      id: "turn-idless",
+    });
+
+    expect(toolActivities).toHaveLength(4);
+    expect(new Set(toolActivities.map((item) => item.id)).size).toBe(4);
+    expect(toolActivities.map((item) => item.id)).not.toContain("bash");
+    expect(toolActivities.map((item) => item.id)).not.toContain("tool");
+  });
+
+  it("correlates an id-less terminal callback only to the sole active invocation", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "progress",
+      runImpl: async (turn) => {
+        turn.replyOptions?.onToolStart?.({ name: "bash", phase: "start", args: {} });
+        turn.replyOptions?.onCommandOutput?.({
+          name: "bash",
+          phase: "end",
+          status: "completed",
+          output: "ignored",
+        });
+        turn.replyOptions?.onToolStart?.({ name: "bash", phase: "start", args: {} });
+        turn.replyOptions?.onCommandOutput?.({
+          name: "bash",
+          phase: "end",
+          status: "failed",
+          output: "also ignored",
+        });
+      },
+    });
+    const { transport, toolActivities } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "run sequentially",
+      id: "turn-idless-terminal",
+    });
+
+    expect(toolActivities).toHaveLength(4);
+    expect(toolActivities[0]!.id).toBe(toolActivities[1]!.id);
+    expect(toolActivities[2]!.id).toBe(toolActivities[3]!.id);
+    expect(toolActivities[0]!.id).not.toBe(toolActivities[2]!.id);
+  });
+
+  it("does not attach an id-less terminal callback to an ambiguous active call", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "progress",
+      runImpl: async (turn) => {
+        turn.replyOptions?.onToolStart?.({ name: "bash", phase: "start", args: {} });
+        turn.replyOptions?.onToolStart?.({ name: "bash", phase: "start", args: {} });
+        turn.replyOptions?.onCommandOutput?.({
+          name: "bash",
+          phase: "end",
+          status: "completed",
+          output: "ignored",
+        });
+      },
+    });
+    const { transport, toolActivities } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "run concurrently",
+      id: "turn-idless-ambiguous",
+    });
+
+    expect(toolActivities).toHaveLength(3);
+    expect(new Set(toolActivities.map((item) => item.id)).size).toBe(3);
+  });
+
+  it("scopes generated fallback identity to each turn", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "progress",
+      runImpl: async (turn) => {
+        turn.replyOptions?.onToolStart?.({ name: "bash", phase: "start", args: {} });
+      },
+    });
+    const { transport, toolActivities } = makeFakeTransport();
+
+    for (const id of ["turn-one", "turn-two"]) {
+      await handleInboundMessage(api, transport, "peer-1", {
+        type: "user_message",
+        text: "run once",
+        id,
+      });
+    }
+
+    expect(toolActivities).toHaveLength(2);
+    expect(toolActivities.map((item) => item.turnId)).toEqual(["turn-one", "turn-two"]);
+    // Reuse is safe and intentional: the public identity is the pair
+    // (turnId,id), not a process-global fallback string.
+    expect(toolActivities[0]!.id).toBe(toolActivities[1]!.id);
   });
 
   it("#97 core fix: a short tool call emits a structured frame that survives turn settlement", async () => {

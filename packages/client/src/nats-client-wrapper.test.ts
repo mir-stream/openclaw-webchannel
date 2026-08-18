@@ -1953,18 +1953,81 @@ describe("WebChannelNATSClient — #97 tool activity lane", () => {
     });
   });
 
-  it("coalesces a same-id frame in place (no duplicate) and appends a new id", () => {
+  it("merges a sparse same-call frame without discarding start fields", () => {
     const wrapper = makeWrapper();
-    deliver(wrapper, { type: "tool_activity", id: "tc1", turnId: "t1", name: "bash", phase: "start" });
-    deliver(wrapper, { type: "tool_activity", id: "tc1", turnId: "t1", name: "bash", status: "completed", summary: "done" });
+    deliver(wrapper, {
+      type: "tool_activity",
+      id: "tc1",
+      turnId: "t1",
+      name: "bash",
+      phase: "start",
+      argKeys: ["command", "cwd"],
+    });
+    deliver(wrapper, {
+      type: "tool_activity",
+      id: "tc1",
+      turnId: "t1",
+      status: "completed",
+      summary: "done",
+    });
     let list = wrapper.getState().toolActivity;
     expect(list).toHaveLength(1);
-    expect(list[0]).toMatchObject({ id: "tc1", status: "completed", summary: "done" });
+    expect(list[0]).toMatchObject({
+      id: "tc1",
+      turnId: "t1",
+      name: "bash",
+      phase: "start",
+      argKeys: ["command", "cwd"],
+      status: "completed",
+      summary: "done",
+    });
 
     deliver(wrapper, { type: "tool_activity", id: "tc2", turnId: "t1", name: "grep" });
     list = wrapper.getState().toolActivity;
     expect(list).toHaveLength(2);
     expect(list.map((a) => a.id)).toEqual(["tc1", "tc2"]);
+  });
+
+  it("keeps the same id in different turns as distinct calls", () => {
+    const wrapper = makeWrapper();
+    deliver(wrapper, {
+      type: "tool_activity",
+      id: "tool-activity-1",
+      turnId: "turn-one",
+      name: "bash",
+      phase: "start",
+      argKeys: ["command"],
+    });
+    deliver(wrapper, {
+      type: "tool_activity",
+      id: "tool-activity-1",
+      turnId: "turn-two",
+      name: "bash",
+      phase: "start",
+      argKeys: ["command"],
+    });
+    deliver(wrapper, {
+      type: "tool_activity",
+      id: "tool-activity-1",
+      turnId: "turn-two",
+      status: "completed",
+    });
+
+    const list = wrapper.getState().toolActivity;
+    expect(list).toHaveLength(2);
+    expect(list[0]).toMatchObject({
+      id: "tool-activity-1",
+      turnId: "turn-one",
+      phase: "start",
+    });
+    expect(list[0]!.status).toBeUndefined();
+    expect(list[1]).toMatchObject({
+      id: "tool-activity-1",
+      turnId: "turn-two",
+      name: "bash",
+      argKeys: ["command"],
+      status: "completed",
+    });
   });
 
   it("drops a frame missing id or turnId", () => {
