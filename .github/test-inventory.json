@@ -54,7 +54,7 @@
     "packages/plugin/src/bounded-inbound-debouncer.test.ts": 16,
     "packages/plugin/src/capacity-diagnostics.test.ts": 3,
     "packages/plugin/src/capacity-status.test.ts": 2,
-    "packages/plugin/src/channel.test.ts": 126,
+    "packages/plugin/src/channel.test.ts": 127,
     "packages/plugin/src/client-nonce.test.ts": 20,
     "packages/plugin/src/command-gate.test.ts": 16,
     "packages/plugin/src/commands-catalog.test.ts": 11,

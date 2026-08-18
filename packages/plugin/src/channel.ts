@@ -159,6 +159,22 @@ export function createWebChannelPlugin(
     // turn's reply callbacks instead.
     base: asWebchannelChatBase(Object.assign(withRequiredCapabilities(createChannelPluginBase<ResolvedAccount>({
       id: WEBCHANNEL_ID,
+      // Channel-presentation metadata (`ChannelMeta`, exported by
+      // `openclaw/plugin-sdk/channel-contract`). `createChannelPluginBase` merges
+      // this into `plugin.meta`, which the pinned core (2026.7.1-2) reads at
+      // registration (`normalizeRegisteredChannelPlugin` →
+      // `collectMissingChannelMetaFields`). WebChannel is not a bundled core
+      // channel, so `resolveSdkChatChannelMeta("webchannel")` returns nothing:
+      // without these four fields core fills defaults and emits an "incomplete
+      // metadata" diagnostic on EVERY gateway boot. Supplying them stops that
+      // per-boot diagnostic and gives the operator's channel picker real
+      // presentation copy. Values are owner-approved — do not reword. See #170.
+      meta: {
+        label: "WebChannel",
+        selectionLabel: "WebChannel (self-hosted web chat)",
+        docsPath: "https://github.com/mir-stream/openclaw-webchannel#readme",
+        blurb: "Self-hosted, end-to-end encrypted browser chat over NATS.",
+      },
       // Contract: `ChannelPlugin`, exported by
       // `openclaw/plugin-sdk/channel-runtime`, requires `capabilities`. One web
       // chat surface => direct chats.

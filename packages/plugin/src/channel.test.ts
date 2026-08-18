@@ -142,6 +142,28 @@ describe("webchannel plugin", () => {
     }
   });
 
+  it("registers complete channel-presentation metadata (#170)", () => {
+    // Core (2026.7.1-2) reads plugin.meta at registration and warns per-boot when
+    // label/selectionLabel/docsPath/blurb are missing. These exact values are
+    // owner-approved; a drop here re-arms the "incomplete metadata" diagnostic.
+    const plugin = createWebChannelPlugin(new FakePeerChannel()) as any;
+    expect(plugin.meta).toMatchObject({
+      id: "webchannel",
+      label: "WebChannel",
+      selectionLabel: "WebChannel (self-hosted web chat)",
+      docsPath: "https://github.com/mir-stream/openclaw-webchannel#readme",
+      blurb: "Self-hosted, end-to-end encrypted browser chat over NATS.",
+    });
+    // Guard the exact fields core's collectMissingChannelMetaFields() checks.
+    expect(typeof plugin.meta.label).toBe("string");
+    expect(plugin.meta.label.length).toBeGreaterThan(0);
+    expect(typeof plugin.meta.selectionLabel).toBe("string");
+    expect(plugin.meta.selectionLabel.length).toBeGreaterThan(0);
+    expect(typeof plugin.meta.docsPath).toBe("string");
+    expect(plugin.meta.docsPath.length).toBeGreaterThan(0);
+    expect(typeof plugin.meta.blurb).toBe("string");
+  });
+
   it("resolves an account from config", () => {
     const transport = new FakePeerChannel();
     const plugin = createWebChannelPlugin(transport);

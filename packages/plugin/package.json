@@ -27,7 +27,7 @@
     "channel": {
       "id": "webchannel",
       "label": "WebChannel",
-      "blurb": "End-to-end encrypted web chat over an outbound NATS relay."
+      "blurb": "Self-hosted, end-to-end encrypted browser chat over NATS."
     },
     "compat": {
       "pluginApi": ">=2026.7.1",

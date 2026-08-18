@@ -67,8 +67,18 @@ describe("setup entry object (openclaw.setupEntry → dist/setup-entry.js)", () 
 
 describe("channel id agreement across the published artifacts", () => {
   it("package.json openclaw.channel.id matches the code constant", () => {
-    const openclaw = PACKAGE.openclaw as { channel?: { id?: unknown } };
+    const openclaw = PACKAGE.openclaw as {
+      channel?: { id?: unknown; blurb?: unknown };
+    };
     expect(openclaw.channel?.id).toBe(WEBCHANNEL_ID);
+    // #170: the package.json openclaw.channel block is a live pre-load catalog
+    // presentation source (read by core's channel-catalog registry), SEPARATE
+    // from the runtime plugin.meta. Its blurb must stay the owner-approved
+    // canonical copy so the catalog surface and plugin.meta agree — a drift here
+    // ships two different blurbs for the same channel.
+    expect(openclaw.channel?.blurb).toBe(
+      "Self-hosted, end-to-end encrypted browser chat over NATS.",
+    );
   });
 
   it("openclaw.plugin.json declares exactly this one channel", () => {
