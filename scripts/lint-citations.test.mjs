@@ -30,7 +30,8 @@ const speechProvider = ["dist/extensions/google/", "speech-provider", ".js"].joi
 const doctorContract = ["dist/extensions/elevenlabs/", "doctor-contract", ".js"].join("");
 const sessionIdentity = ["dist/acp-core/runtime/", "session-identity", ".d.ts"].join("");
 const exportTemplate = ["dist/export-html/", "template", ".css"].join("");
-const hashedInternal = ["dist/message-handler.process-", "CcPQD8zK", ".js"].join("");
+const messageHandlerStem = "dist/message-handler.process";
+const hashedInternal = [messageHandlerStem, "-", "CcPQD8zK", ".js"].join("");
 const jsonInternal = ["dist/extensions/telegram/", "openclaw.plugin", ".json"].join("");
 const dashTerminatedInternal = ["dist/nix-", "DxyfQZE-", ".js"].join("");
 const underscoreTerminatedInternal = ["dist/safe-buffer-", "Ce0qmGn_", ".js"].join("");
@@ -38,6 +39,14 @@ const speechProviderDotAlias = ["dist/extensions/google/./", "speech-provider", 
 const indexTypes = ["dist/index", ".d.ts"].join("");
 const prefixedIndexTypes = `node_modules/openclaw/${indexTypes}`;
 const missingInternal = ["dist/does-not-exist-", "CcPQD8zK", ".js"].join("");
+const traversalInternal = [messageHandlerStem, "-", "C5Yiltgh", ".js"].join("");
+const traversalCitation = [
+  "node_modules/openclaw/",
+  "dist/../../openclaw/",
+  traversalInternal,
+].join("");
+const pluginSdkIndex = ["dist/plugin-sdk/index", ".d.ts"].join("");
+const customDist = ["dist/custom", ".js"].join("");
 
 // A public export whose basename is deliberately hash-shaped, proving the trust
 // decision is provenance (declared export) and not basename shape.
@@ -71,6 +80,7 @@ function buildPolicy() {
     jsonInternal,
     // A currently hash-shaped internal chunk.
     hashedInternal,
+    traversalInternal,
     // Collisions: these normalized paths ALSO exist internally, but provenance
     // (a public export / a repo-owned output) must win over internal existence.
     "dist/index.js",
@@ -138,6 +148,11 @@ const CITATION_MATRIX = [
   {
     form: "internal dist, openclaw-prefixed",
     citation: `node_modules/openclaw/${hashedInternal}`,
+    forbidden: true,
+  },
+  {
+    form: "canonicalized openclaw-prefixed internal traversal",
+    citation: traversalCitation,
     forbidden: true,
   },
   {
@@ -262,6 +277,42 @@ describe("policy derivation", () => {
 });
 
 describe("repository citation scan", () => {
+  it("captures whole tokens while preserving supported citation delimiters", async () => {
+    const repoRoot = await mkdtemp(path.join(tmpdir(), "citation-lint-boundaries-"));
+    temporaryDirectories.push(repoRoot);
+    const policy = {
+      openclawInternalPaths: new Set([
+        speechProvider,
+        dashTerminatedInternal,
+        pluginSdkIndex,
+        jsonInternal,
+        customDist,
+      ]),
+    };
+    await writeFile(
+      path.join(repoRoot, "valid.md"),
+      [`./${speechProvider}`, `${dashTerminatedInternal}.`, `${pluginSdkIndex}:691`].join("\n"),
+      "utf8",
+    );
+    await writeFile(
+      path.join(repoRoot, "invalid.md"),
+      [
+        `non${speechProvider}`,
+        `${jsonInternal}-extra`,
+        `xnode_modules/openclaw/${customDist}`,
+        ["node_modules/openclaw/", "dist/index", ".js-extra"].join(""),
+      ].join("\n"),
+      "utf8",
+    );
+
+    const findings = await findCitationFindings(repoRoot, policy);
+    expect(findings).toEqual([
+      { citation: speechProvider, file: "valid.md", line: 1 },
+      { citation: dashTerminatedInternal, file: "valid.md", line: 2 },
+      { citation: pluginSdkIndex, file: "valid.md", line: 3 },
+    ]);
+  });
+
   it("matches internal basenames whose hashes end in dash or underscore", async () => {
     const repoRoot = await mkdtemp(path.join(tmpdir(), "citation-lint-hash-end-"));
     temporaryDirectories.push(repoRoot);

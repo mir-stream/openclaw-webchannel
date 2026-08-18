@@ -17,8 +17,12 @@ const OPENCLAW_DIST_DIR = path.join(OPENCLAW_ROOT, "dist");
 // a path that ends a sentence (`...speech-provider.js.`) is captured without
 // the trailing period. Stems may end in `-` or `_`, and multi-dot stems and
 // extensions (`a.b.c.js`, `.d.ts`, `.plugin.json`) are captured in full.
+// `/` remains a valid left delimiter for `./dist/...` and package paths; `.`
+// and `:` remain valid right delimiters for sentence punctuation and line refs.
+// The adjacent assertions prevent retrying inside a malformed explicit prefix
+// or backtracking a longer multi-dot token into a shorter candidate.
 const DIST_PATH_RE =
-  /(?:node_modules\/openclaw\/)?dist\/[A-Za-z0-9._/-]*[A-Za-z0-9_-]\.[A-Za-z0-9](?:[A-Za-z0-9.]*[A-Za-z0-9])?/g;
+  /(?<![A-Za-z0-9._-])(?<!node_modules\/openclaw\/)(?:node_modules\/openclaw\/)?dist\/[A-Za-z0-9._/-]*[A-Za-z0-9_-]\.[A-Za-z0-9](?:[A-Za-z0-9.]*[A-Za-z0-9])?(?!\.[A-Za-z0-9._/-])(?![A-Za-z0-9_/-])/g;
 
 // Source extensions whose tsc/rollup outputs land next to a package `dist/`
 // entrypoint. Sources may live under `src/` or at the package root.
@@ -39,13 +43,6 @@ const IGNORED_PATH_NAMES = new Set([
   "dist",
   "node_modules",
 ]);
-
-function normalizeDistPath(citation) {
-  const distOffset = citation.indexOf("dist/");
-  if (distOffset === -1) return null;
-  const normalized = path.posix.normalize(citation.slice(distOffset));
-  return normalized.startsWith("dist/") ? normalized : null;
-}
 
 /**
  * Return the `dist/` paths OpenClaw declares as durable public entrypoints.
@@ -158,13 +155,14 @@ export function isForbiddenDistCitation(citation, policy = {}) {
     openclawInternalPaths = new Set(),
   } = policy;
 
-  const explicitlyOpenClaw = citation.startsWith("node_modules/openclaw/");
-  const normalized = normalizeDistPath(citation);
-  if (normalized === null) return false;
-  if (publicExports.has(normalized)) return false;
+  const openclawPrefix = "node_modules/openclaw/";
+  const normalizedCitation = path.posix.normalize(citation);
+  const explicitlyOpenClaw = normalizedCitation.startsWith(openclawPrefix);
+  const distPath = normalizedCitation.slice(explicitlyOpenClaw ? openclawPrefix.length : 0);
+  if (publicExports.has(distPath)) return false;
   if (explicitlyOpenClaw) return true;
-  if (repoOwnedOutputs.has(normalized)) return false;
-  return openclawInternalPaths.has(normalized);
+  if (repoOwnedOutputs.has(distPath)) return false;
+  return openclawInternalPaths.has(distPath);
 }
 
 function lineNumberAt(text, offset) {
