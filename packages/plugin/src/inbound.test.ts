@@ -573,7 +573,7 @@ describe("handleInboundMessage — #97 structured tool activity", () => {
     expect(wire).not.toContain("/secret/path");
   });
 
-  it("coalesces pinned Codex native item + normalized tool events and includes item-only dynamic tools", async () => {
+  it("drops suppressed Codex items while retaining their normalized native and dynamic tool events", async () => {
     const nativeCalls = [
       {
         id: "native-file",
@@ -652,7 +652,9 @@ describe("handleInboundMessage — #97 structured tool activity", () => {
           },
         });
       }
-      // dynamicToolCall is deliberately item-only in the pinned projector.
+      // The pinned app-server projector emits the suppressed standard item;
+      // the dynamic bridge/runner emits a normalized companion with only its
+      // tool-call identity.
       emit({
         stream: "item",
         runId: "run-codex",
@@ -663,6 +665,16 @@ describe("handleInboundMessage — #97 structured tool activity", () => {
           status: "running",
           name: "dynamic_action",
           suppressChannelProgress: true,
+        },
+      });
+      emit({
+        stream: "tool",
+        runId: "run-codex",
+        data: {
+          phase: "start",
+          name: "dynamic_action",
+          toolCallId: "dynamic-1",
+          args: { token: "dynamic secret" },
         },
       });
       emit({
@@ -677,6 +689,18 @@ describe("handleInboundMessage — #97 structured tool activity", () => {
           suppressChannelProgress: true,
         },
       });
+      emit({
+        stream: "tool",
+        runId: "run-codex",
+        data: {
+          phase: "result",
+          name: "dynamic_action",
+          toolCallId: "dynamic-1",
+          status: "completed",
+          isError: false,
+          result: { body: "dynamic result secret" },
+        },
+      });
     });
     const { transport, toolActivities } = makeFakeTransport();
 
@@ -688,7 +712,7 @@ describe("handleInboundMessage — #97 structured tool activity", () => {
 
     for (const call of nativeCalls) {
       const frames = toolActivities.filter((frame) => frame.name === call.name);
-      expect(frames).toHaveLength(4);
+      expect(frames).toHaveLength(2);
       expect(new Set(frames.map((frame) => frame.id)).size).toBe(1);
       expect(frames.at(-1)?.status).toBe(call.status);
       expect(frames.find((frame) => frame.argKeys)?.argKeys).toEqual(
@@ -705,6 +729,113 @@ describe("handleInboundMessage — #97 structured tool activity", () => {
     expect(wire).not.toContain("secret query");
     expect(wire).not.toContain("secret token");
     expect(wire).not.toContain("secret result");
+    expect(wire).not.toContain("dynamic secret");
+    expect(wire).not.toContain("dynamic result secret");
+  });
+
+  it("drops exact suppressed messaging items that have no companion tool stream", async () => {
+    const messagingNames = [
+      "message",
+      "messages",
+      "reply",
+      "send",
+      "reaction",
+      "react",
+      "typing",
+    ];
+    const made = makeActivityApi(async (turn, emit) => {
+      turn.replyOptions?.onAgentRunStart?.("run-messaging");
+
+      // A normal dynamic tool proves the run sink is live: the projector emits
+      // its suppressed standard item and the dynamic bridge/runner emits this
+      // toolCallId-only companion pair.
+      emit({
+        stream: "item",
+        runId: "run-messaging",
+        data: {
+          itemId: "visible-dynamic",
+          phase: "start",
+          kind: "tool",
+          status: "running",
+          name: "normal_action",
+          suppressChannelProgress: true,
+        },
+      });
+      emit({
+        stream: "tool",
+        runId: "run-messaging",
+        data: {
+          toolCallId: "visible-dynamic",
+          phase: "start",
+          name: "normal_action",
+          args: { value: "secret" },
+        },
+      });
+      emit({
+        stream: "item",
+        runId: "run-messaging",
+        data: {
+          itemId: "visible-dynamic",
+          phase: "end",
+          kind: "tool",
+          status: "completed",
+          name: "normal_action",
+          suppressChannelProgress: true,
+        },
+      });
+      emit({
+        stream: "tool",
+        runId: "run-messaging",
+        data: {
+          toolCallId: "visible-dynamic",
+          phase: "result",
+          name: "normal_action",
+          status: "completed",
+        },
+      });
+
+      // These exact names intentionally receive no normalized tool companion.
+      for (const name of messagingNames) {
+        for (const phase of ["start", "end"] as const) {
+          emit({
+            stream: "item",
+            runId: "run-messaging",
+            data: {
+              itemId: `messaging-${name}`,
+              phase,
+              kind: "tool",
+              status: phase === "start" ? "running" : "completed",
+              name,
+              suppressChannelProgress: true,
+            },
+          });
+        }
+      }
+    });
+    const { transport, toolActivities } = makeFakeTransport();
+
+    await handleInboundMessage(made.api, transport, "peer-1", {
+      type: "user_message",
+      text: "send privately",
+      id: "turn-messaging",
+    });
+
+    expect(toolActivities).toHaveLength(2);
+    expect(toolActivities.map((frame) => frame.name)).toEqual([
+      "normal_action",
+      "normal_action",
+    ]);
+    expect(toolActivities[0]).toMatchObject({
+      id: "visible-dynamic",
+      phase: "start",
+      argKeys: ["value"],
+    });
+    expect(toolActivities[1]).toMatchObject({
+      id: "visible-dynamic",
+      phase: "result",
+      status: "completed",
+    });
+    expect(JSON.stringify(toolActivities)).not.toContain("secret");
   });
 
   it("filters non-tool and hidden events, malformed data, and unsupported phases", async () => {
@@ -813,6 +944,7 @@ describe("handleInboundMessage — #97 structured tool activity", () => {
           name: "apply_patch",
           phase: "end",
           status: "failed",
+          summary: "modified secret/item.ts; output=item-secret",
         },
       });
       emit({
@@ -823,8 +955,37 @@ describe("handleInboundMessage — #97 structured tool activity", () => {
           toolCallId: "patch-call",
           name: "apply_patch",
           phase: "end",
-          modified: ["secret-file.ts"],
-          summary: "Updated 1 file",
+          added: ["secret/added.ts"],
+          modified: ["secret/one.ts", "secret/two.ts"],
+          deleted: ["secret/deleted.ts"],
+          summary: "modified secret/a.ts; output=patch-secret",
+        },
+      });
+      emit({
+        stream: "item",
+        runId: "run-specialized",
+        data: {
+          itemId: "patch:count-only",
+          toolCallId: "count-only",
+          kind: "patch",
+          name: "apply_patch",
+          phase: "end",
+          status: "completed",
+          summary: "2 modified, 1 deleted",
+        },
+      });
+      emit({
+        stream: "patch",
+        runId: "run-specialized",
+        data: {
+          itemId: "patch:zero-counts",
+          toolCallId: "zero-counts",
+          name: "apply_patch",
+          phase: "end",
+          added: [],
+          modified: [],
+          deleted: [],
+          summary: "output=zero-count-secret",
         },
       });
     });
@@ -843,14 +1004,35 @@ describe("handleInboundMessage — #97 structured tool activity", () => {
     const patch = toolActivities.filter((frame) => frame.id === "patch-call");
     expect(patch).toHaveLength(3);
     expect(patch[1]).toMatchObject({ phase: "end", status: "failed" });
-    expect(patch[2]).toMatchObject({ phase: "end", summary: "Updated 1 file" });
+    expect(patch[1]!.summary).toBeUndefined();
+    expect(patch[2]).toMatchObject({
+      phase: "end",
+      summary: "1 added, 2 modified, 1 deleted",
+    });
     // Pinned patch summaries have no status/isError. The sparse refinement must
     // not overwrite the preceding failed item status with a guessed success.
     expect(patch[2]!.status).toBeUndefined();
+    expect(toolActivities.find((frame) => frame.id === "count-only")).toMatchObject({
+      status: "completed",
+      summary: "2 modified, 1 deleted",
+    });
+    expect(toolActivities.find((frame) => frame.id === "zero-counts")).toMatchObject({
+      summary: "no file changes recorded",
+    });
+    expect(toolActivities.find((frame) => frame.id === "zero-counts")!.status)
+      .toBeUndefined();
     const wire = JSON.stringify(toolActivities);
     expect(wire).not.toContain("command-secret");
     expect(wire).not.toContain("secret patch body");
-    expect(wire).not.toContain("secret-file.ts");
+    expect(wire).not.toContain("secret/item.ts");
+    expect(wire).not.toContain("secret/added.ts");
+    expect(wire).not.toContain("secret/one.ts");
+    expect(wire).not.toContain("secret/two.ts");
+    expect(wire).not.toContain("secret/deleted.ts");
+    expect(wire).not.toContain("secret/a.ts");
+    expect(wire).not.toContain("item-secret");
+    expect(wire).not.toContain("patch-secret");
+    expect(wire).not.toContain("zero-count-secret");
   });
 
   it("gives repeated same-name and unnamed id-less starts distinct ids and correlates sequential terminals", async () => {

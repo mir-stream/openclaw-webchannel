@@ -234,6 +234,41 @@ function readEventString(
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+const PINNED_PATCH_SUMMARY_MAX_LENGTH = 96;
+const PINNED_PATCH_SUMMARY_PATTERN = /^(?:no file changes recorded|[1-9]\d{0,9} added(?:, [1-9]\d{0,9} modified)?(?:, [1-9]\d{0,9} deleted)?|[1-9]\d{0,9} modified(?:, [1-9]\d{0,9} deleted)?|[1-9]\d{0,9} deleted)$/u;
+
+/**
+ * Reduce patch metadata to the pinned producer's count-only presentation.
+ * Array elements are deliberately never read: they are file paths and stay
+ * outside the structured wire boundary. If the arrays are absent, accept only
+ * the exact count grammar emitted by the pinned runtime.
+ */
+function readSafePatchSummary(
+  data: Record<string, unknown>,
+): string | undefined {
+  const added = Array.isArray(data.added) ? data.added.length : undefined;
+  const modified = Array.isArray(data.modified) ? data.modified.length : undefined;
+  const deleted = Array.isArray(data.deleted) ? data.deleted.length : undefined;
+
+  if (added !== undefined || modified !== undefined || deleted !== undefined) {
+    const parts: string[] = [];
+    if ((added ?? 0) > 0) parts.push(`${added} added`);
+    if ((modified ?? 0) > 0) parts.push(`${modified} modified`);
+    if ((deleted ?? 0) > 0) parts.push(`${deleted} deleted`);
+    return parts.length > 0 ? parts.join(", ") : "no file changes recorded";
+  }
+
+  const summary = readEventString(data, "summary");
+  if (
+    !summary ||
+    summary.length > PINNED_PATCH_SUMMARY_MAX_LENGTH ||
+    !PINNED_PATCH_SUMMARY_PATTERN.test(summary)
+  ) {
+    return undefined;
+  }
+  return summary;
+}
+
 function terminalToolStatus(
   data: Record<string, unknown>,
   phase: string | undefined,
@@ -327,6 +362,10 @@ function createAgentToolActivitySink(params: {
     }
 
     if (event.stream === "item") {
+      // Core marks transcript/channel-hidden messaging items this way and does
+      // not emit a companion normalized tool event for them. Preserve that
+      // privacy boundary while letting ordinary companion `tool` events flow.
+      if (data.suppressChannelProgress === true) return;
       const kind = readEventString(data, "kind");
       if (!kind || !TOOL_ITEM_KINDS.has(kind) || !phase || !TOOL_EVENT_PHASES.has(phase)) {
         return;
@@ -335,6 +374,7 @@ function createAgentToolActivitySink(params: {
         phase,
         status: readEventString(data, "status"),
       });
+      const summary = kind === "patch" ? readSafePatchSummary(data) : undefined;
       params.send({
         turnId: params.turnId,
         id: correlatedId(runId, data, phase),
@@ -346,10 +386,8 @@ function createAgentToolActivitySink(params: {
             ? { status: readEventString(data, "status") }
             : {}),
         // Command/tool/search summaries may contain output or query/result
-        // bodies. Patch summaries are generated counts, not file contents.
-        ...(kind === "patch" && readEventString(data, "summary")
-          ? { summary: readEventString(data, "summary") }
-          : {}),
+        // bodies. Patch summaries are admitted only after count sanitization.
+        ...(summary ? { summary } : {}),
       });
       return;
     }
@@ -364,15 +402,16 @@ function createAgentToolActivitySink(params: {
       const status = event.stream === "patch"
         ? explicitTerminalToolStatus(data, phase)
         : terminalToolStatus(data, phase);
+      const summary = event.stream === "patch"
+        ? readSafePatchSummary(data)
+        : undefined;
       params.send({
         turnId: params.turnId,
         id: correlatedId(runId, data, phase),
         name,
         phase,
         ...(status ? { status } : {}),
-        ...(event.stream === "patch" && readEventString(data, "summary")
-          ? { summary: readEventString(data, "summary") }
-          : {}),
+        ...(summary ? { summary } : {}),
       });
     }
   };
