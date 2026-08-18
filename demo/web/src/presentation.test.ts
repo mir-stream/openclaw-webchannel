@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { orderConversationPresentation, composerInFlight } from "./presentation.js";
+import { activityHint, orderConversationPresentation, composerInFlight } from "./presentation.js";
 
 describe("composerInFlight (#96 — Stop affordance survives between bubbles)", () => {
   it("is true while the agent is typing", () => {
@@ -36,6 +36,81 @@ describe("composerInFlight (#96 — Stop affordance survives between bubbles)", 
 
   it("is false for a fresh idle client (turnActive absent)", () => {
     expect(composerInFlight({ messages: [] })).toBe(false);
+  });
+});
+
+describe("activityHint (#96 — the transcript-tail activity line)", () => {
+  const user = { id: "u1", role: "user" as const, text: "go", turnId: "t1" };
+  const answer = { id: "a1", role: "agent" as const, text: "first answer", turnId: "t1" };
+  const reasoning = [{ id: "r1", turnId: "t1", text: "thinking" }];
+  const gap = { isTyping: false, turnActive: true, messages: [user, answer] };
+
+  it("says the agent is typing when nothing richer is on screen", () => {
+    expect(
+      activityHint({ isTyping: true, messages: [user], reasoning: [], approvals: [] }),
+    ).toBe("agent is typing…");
+  });
+
+  it("yields the typing line to a reasoning lane for the latest user turn", () => {
+    expect(
+      activityHint({ isTyping: true, messages: [user], reasoning, approvals: [] }),
+    ).toBeNull();
+  });
+
+  it("still shows the gap hint when the turn already produced reasoning", () => {
+    // The Fix-1 regression: `state.reasoning` is a rolling buffer with no
+    // liveness notion, so gating the WHOLE hint on it would suppress "still
+    // working…" for the rest of any turn that ever emitted one reasoning frame
+    // — i.e. never render it on a default (reasoning-on) deployment.
+    expect(activityHint({ ...gap, reasoning, approvals: [] })).toBe("still working…");
+  });
+
+  it("shows the gap hint when the turn produced no reasoning", () => {
+    expect(activityHint({ ...gap, reasoning: [], approvals: [] })).toBe("still working…");
+  });
+
+  it("is silent while an unresolved approval card is actionable", () => {
+    // The turn is blocked on the USER, not working — the card takes priority.
+    expect(
+      activityHint({ ...gap, reasoning, approvals: [{ resolvedDecision: undefined }] }),
+    ).toBeNull();
+  });
+
+  it("resumes the gap hint once every approval is resolved", () => {
+    expect(
+      activityHint({ ...gap, reasoning, approvals: [{ resolvedDecision: "approve" }] }),
+    ).toBe("still working…");
+  });
+
+  it("is silent while a working draft renders its own in-progress bubble", () => {
+    expect(
+      activityHint({
+        isTyping: false,
+        turnActive: true,
+        messages: [user, { id: "a2", role: "agent", text: "…", working: true, turnId: "t1" }],
+        reasoning: [],
+        approvals: [],
+      }),
+    ).toBeNull();
+  });
+
+  it("is silent once the turn settles", () => {
+    expect(
+      activityHint({ isTyping: false, turnActive: false, messages: [user, answer], reasoning: [], approvals: [] }),
+    ).toBeNull();
+  });
+
+  it("P1-9: a pending or retracted user bubble never becomes the latest user turn", () => {
+    // Both carry no turnId, so treating one as `latestUser` would drop the
+    // reasoning gate and resurrect "agent is typing…" beside a live lane.
+    for (const tail of [
+      { id: "u2", role: "user" as const, text: "queued", pending: true },
+      { id: "u2", role: "user" as const, text: "not sent", retracted: true },
+    ]) {
+      expect(
+        activityHint({ isTyping: true, messages: [user, tail], reasoning, approvals: [] }),
+      ).toBeNull();
+    }
   });
 });
 

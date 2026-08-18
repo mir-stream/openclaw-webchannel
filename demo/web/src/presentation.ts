@@ -2,16 +2,13 @@ import type { ChatMessage, ReasoningItem } from "../../../packages/client/src/ty
 
 /**
  * #96: whether the composer should show an in-flight affordance (the Stop
- * button). `isTyping`/`working` cover "an answer is being composed right now",
- * but they both go false in the gaps between bubbles of a multi-step turn (more
- * tool calls, another assistant message, an approval wait), which is exactly the
- * "silence indistinguishable from completion" #96 reports. `turnActive` is the
- * client-owned, turn-scoped signal that stays true across those gaps until the
- * turn settles (see `WebChannelState.turnActive`), so folding it in here keeps
- * the affordance alive for the whole turn. This is the widget-side consumption
- * of a capability the client library already exposes; `turnActive` is advisory
- * and deliberately NOT part of the library's `turnInFlight()` (that predicate
- * gates held-send + the #81 stall detector), so the wiring lives here, not there.
+ * button). `isTyping`/`working` both go false in the gaps between bubbles of a
+ * multi-step turn, which is the "silence indistinguishable from completion" #96
+ * reports; `turnActive` stays true across those gaps until the turn settles.
+ * Semantics live in `WebChannelState.turnActive` + the client README's "Turn
+ * activity" section — this is only the widget-side consumption. `turnActive` is
+ * advisory and deliberately NOT part of the library's `turnInFlight()`, so the
+ * wiring belongs here, not there.
  */
 export function composerInFlight(state: {
   isTyping?: boolean;
@@ -23,6 +20,44 @@ export function composerInFlight(state: {
     state.turnActive === true ||
     state.messages.some((m) => m.working)
   );
+}
+
+/**
+ * #96: the transcript-tail activity line, or `null` for none.
+ *
+ * `isTyping` ("an answer is being composed right now") keeps its base behavior
+ * exactly: the reasoning gate belongs to the "agent is typing…" line ALONE,
+ * because a live reasoning lane is that same signal in richer form. It must NOT
+ * gate the gap hint: `state.reasoning` is a rolling buffer with no liveness
+ * notion, so one reasoning frame anywhere in the turn would otherwise suppress
+ * the gap hint for the rest of it — exactly the case #96 is about.
+ *
+ * In the gap (`turnActive` true, nothing typing) the line softens to "still
+ * working…", except when something louder already speaks for the turn: a live
+ * `working` draft renders its own in-progress bubble, and an unresolved approval
+ * card takes priority over both (the turn is blocked on the USER, not working).
+ */
+export function activityHint(state: {
+  isTyping?: boolean;
+  turnActive?: boolean;
+  messages: readonly ChatMessage[];
+  reasoning: readonly ReasoningItem[];
+  approvals: readonly { resolvedDecision?: unknown }[];
+}): string | null {
+  // P1-9: skip pending/retracted user bubbles — they have no turnId, and letting
+  // one become `latestUser` would resurrect the "agent is typing…" line next to
+  // a live reasoning lane.
+  const latestUser = [...state.messages].reverse().find(
+    (m) => m.role === "user" && !m.pending && !m.retracted,
+  );
+  const reasoningReplacesTyping = Boolean(
+    latestUser?.turnId && state.reasoning.some((item) => item.turnId === latestUser.turnId),
+  );
+  if (state.isTyping === true) return reasoningReplacesTyping ? null : "agent is typing…";
+  if (state.turnActive !== true) return null;
+  if (state.messages.some((m) => m.working)) return null;
+  if (state.approvals.some((a) => a.resolvedDecision === undefined)) return null;
+  return "still working…";
 }
 
 export type ConversationPresentationItem =

@@ -29,6 +29,7 @@ import {
   captureOpenReasoningIds,
   buildReasoningDetails,
   composerInFlight,
+  activityHint,
 } from "./presentation.js";
 
 const STATUS_LABEL: Record<WebChannelState["status"], string> = {
@@ -317,32 +318,17 @@ export async function createWidget(
       ));
     }
 
-    // P1-9: skip pending/retracted bubbles — they have no turnId, and letting one
-    // become `latestUser` would resurrect the "agent is typing…" line next to a
-    // live reasoning lane.
-    const latestUser = [...state.messages].reverse().find(
-      (m) => m.role === "user" && !m.pending && !m.retracted,
-    );
-    const reasoningReplacesTypingText = Boolean(
-      latestUser?.turnId && state.reasoning.some((item) => item.turnId === latestUser.turnId),
-    );
-    // Activity hint. `isTyping` is "an answer is being composed right now"; when
-    // it clears between bubbles of a still-open turn (#96, `turnActive`) — a tool
-    // round, another assistant message, an approval wait — show a softer "still
-    // working…" so the gap is not a silence indistinguishable from completion. A
-    // live `working` draft already renders its own in-progress bubble, so it
-    // needs no separate line; a live reasoning lane is itself the activity signal.
-    if (!reasoningReplacesTypingText) {
-      const hint = state.isTyping
-        ? "agent is typing…"
-        : state.turnActive === true && !state.messages.some((m) => m.working)
-          ? "still working…"
-          : null;
-      if (hint) {
-        bubbles.push(
-          el("div", { style: "align-self:flex-start;font-size:12px;color:var(--muted)" }, [hint]),
-        );
-      }
+    // Activity hint (#96). `activityHint` owns the decision: the reasoning lane
+    // replaces the "agent is typing…" line only (it is that signal in richer
+    // form), while the gap hint "still working…" — shown when `turnActive` keeps
+    // a turn open between bubbles, so the gap is not a silence indistinguishable
+    // from completion — yields to a live `working` draft (it has its own bubble)
+    // and to an unresolved approval card (the turn is blocked on the user).
+    const hint = activityHint(state);
+    if (hint) {
+      bubbles.push(
+        el("div", { style: "align-self:flex-start;font-size:12px;color:var(--muted)" }, [hint]),
+      );
     }
     list.replaceChildren(...bubbles);
     mdCache = nextMdCache;
@@ -530,7 +516,10 @@ export async function createWidget(
   // turn is in flight (render() flips `dataset.mode`). Stop sends the literal
   // "/stop" through the SAME send path a typed "/stop" would take.
   sendBtn.onclick = () => {
-    if (sendBtn.dataset.mode === "stop") {
+    // Typed text is unambiguous intent and Enter already sends it, so a click on
+    // the same composer must not silently discard it and abort the turn instead.
+    // Stop therefore fires only on an empty composer.
+    if (sendBtn.dataset.mode === "stop" && input.value.trim() === "") {
       client?.send("/stop");
       return;
     }
