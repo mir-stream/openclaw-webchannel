@@ -36,10 +36,12 @@ import { setTimeout } from "node:timers/promises";
 import { verifyJwt } from "../../plugin/src/jwt.js";
 import { JWKSCache } from "../../plugin/src/jwks.js";
 
-// Test 9 (enrollment expiration) stands up a dedicated short-lifetime enrollment
-// service on its own real HTTP socket, composed from the SAME primitives the
-// reference server uses, so expiry is exercised over real HTTP without disturbing
-// the 600s-lifetime server the rest of the suite shares.
+// Test 9 (enrollment expiration) stands up a dedicated enrollment service on its
+// own real HTTP socket, composed from the SAME primitives the reference server
+// uses. Its lifetime is the ordinary 600s default — the isolation is NOT a shorter
+// expiry but an INJECTED REPOSITORY CLOCK, which the shared spawned server does not
+// expose. That clock is what lets the deadline be crossed instantly, and the
+// separate socket is what keeps the jump from disturbing the shared server.
 import { DeviceFlowEnrollment } from "../src/device-flow-enrollment.js";
 import { MemoryEnrollmentRepository } from "../src/enrollment-repository.js";
 import { createReferenceEnrollmentHttpHandler } from "../src/enrollment-http-handler.js";
@@ -802,13 +804,17 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     // This version drives a REAL enrollment code through a pending→expired transition
     // and asserts the expired path is DISTINGUISHABLE from the unknown-code path.
     //
-    // Mechanism: a dedicated short-lifetime enrollment service on its own real HTTP
-    // socket (OS-assigned port), backed by the SAME DeviceFlowEnrollment +
-    // MemoryEnrollmentRepository + reference HTTP handler the shared server composes —
-    // but with an INJECTED CLOCK so expiry is reached deterministically with no
+    // Mechanism: a dedicated enrollment service on its own real HTTP socket
+    // (OS-assigned port), backed by the SAME DeviceFlowEnrollment +
+    // MemoryEnrollmentRepository the reference server uses, fronted by the reference
+    // HTTP handler (which that server delegates /approve to; it serves enroll/poll
+    // from its own inline routes over the identical enrollment.enroll/poll calls).
+    // This fixture keeps the ordinary 600s lifetime — expiry is reached NOT by a
+    // shorter expiry but by an INJECTED CLOCK, deterministically and with no
     // wall-clock sleep. The issue's acceptance criteria explicitly endorse an
-    // injectable/fake clock and forbid a long wall-clock sleep; the shared 600s server
-    // exposes no per-request expiry or clock hook, so a dedicated instance is required.
+    // injectable/fake clock and forbid a long wall-clock sleep; the shared spawned
+    // server exposes no per-request expiry or clock hook, so a dedicated instance is
+    // required. Hence the clock jump below is 600s, not one second.
     let fakeNow = Date.now();
     const repository = new MemoryEnrollmentRepository({ clock: () => fakeNow, autoSweep: false });
     const trust = await setupTrustChain({
