@@ -39,6 +39,11 @@ function readJson(relative: string): Record<string, unknown> {
 
 const MANIFEST = readJson("../openclaw.plugin.json");
 const PACKAGE = readJson("../package.json");
+const CATALOG_CHANNEL = (
+  PACKAGE.openclaw as {
+    channel?: Record<string, unknown>;
+  }
+).channel as Record<string, unknown>;
 
 describe("full entry object (openclaw.extensions → dist/index-nats.js)", () => {
   it("keeps every member the host reads off a defined channel entry", () => {
@@ -67,18 +72,33 @@ describe("setup entry object (openclaw.setupEntry → dist/setup-entry.js)", () 
 
 describe("channel id agreement across the published artifacts", () => {
   it("package.json openclaw.channel.id matches the code constant", () => {
-    const openclaw = PACKAGE.openclaw as {
-      channel?: { id?: unknown; blurb?: unknown };
-    };
-    expect(openclaw.channel?.id).toBe(WEBCHANNEL_ID);
+    expect(CATALOG_CHANNEL.id).toBe(WEBCHANNEL_ID);
+  });
+
+  it("package.json openclaw.channel presents the channel exactly as plugin.meta does", () => {
     // #170: the package.json openclaw.channel block is a live pre-load catalog
     // presentation source (read by core's channel-catalog registry), SEPARATE
-    // from the runtime plugin.meta. Its blurb must stay the owner-approved
-    // canonical copy so the catalog surface and plugin.meta agree — a drift here
-    // ships two different blurbs for the same channel.
-    expect(openclaw.channel?.blurb).toBe(
-      "Self-hosted, end-to-end encrypted browser chat over NATS.",
-    );
+    // from the runtime plugin.meta that `createChannelPluginBase` builds. It is
+    // NOT limited to id/label/blurb: core's `toChannelMeta()` also reads
+    // `selectionLabel` and `docsPath` off this block, falling back to `label`
+    // and `/channels/<id>` when they are absent, and the onboarding channel
+    // picker renders both. So an omission here does not defer to the runtime
+    // meta — it ships a SECOND, different presentation of one channel that
+    // operators see before the bundle ever loads.
+    //
+    // Asserted against the runtime meta rather than re-typed literals: a second
+    // copy of the strings is exactly the drift this test exists to catch.
+    const meta = entry.channelPlugin.meta;
+    // Guard the comparison below against passing vacuously: `undefined` on both
+    // sides is the exact bug (a field core then fills with its own fallback).
+    for (const field of ["label", "selectionLabel", "docsPath", "blurb"] as const) {
+      expect(typeof meta[field], `plugin.meta.${field}`).toBe("string");
+      expect((meta[field] as string).length, `plugin.meta.${field}`).toBeGreaterThan(0);
+    }
+    expect(CATALOG_CHANNEL.label).toBe(meta.label);
+    expect(CATALOG_CHANNEL.selectionLabel).toBe(meta.selectionLabel);
+    expect(CATALOG_CHANNEL.docsPath).toBe(meta.docsPath);
+    expect(CATALOG_CHANNEL.blurb).toBe(meta.blurb);
   });
 
   it("openclaw.plugin.json declares exactly this one channel", () => {

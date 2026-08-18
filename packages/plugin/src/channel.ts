@@ -168,7 +168,19 @@ export function createWebChannelPlugin(
       // without these four fields core fills defaults and emits an "incomplete
       // metadata" diagnostic on EVERY gateway boot. Supplying them stops that
       // per-boot diagnostic and gives the operator's channel picker real
-      // presentation copy. Values are owner-approved — do not reword. See #170.
+      // presentation copy. Values are owner-approved — do not reword.
+      //
+      // These four values are NOT the only copy of themselves: the same four
+      // live in `package.json` → `openclaw.channel`, which core's channel
+      // catalog reads BEFORE the plugin bundle is loaded. That block is not
+      // limited to `id`/`label`/`blurb` — core's `toChannelMeta()` also reads
+      // `selectionLabel` and `docsPath` from it, falling back to `label` and
+      // `/channels/<id>` when they are absent, and the onboarding channel
+      // picker renders both. So a value present here but missing there ships
+      // two different presentations of one channel (a bare "WebChannel" and a
+      // synthesized docs path pre-load, this copy post-load). The two surfaces
+      // must carry the same four values; `entry-exports.test.ts` cross-asserts
+      // them. See #170.
       meta: {
         label: "WebChannel",
         selectionLabel: "WebChannel (self-hosted web chat)",
