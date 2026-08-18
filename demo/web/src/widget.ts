@@ -28,6 +28,8 @@ import {
   orderConversationPresentation,
   captureOpenReasoningIds,
   buildReasoningDetails,
+  composerButtonMode,
+  activityHint,
 } from "./presentation.js";
 
 const STATUS_LABEL: Record<WebChannelState["status"], string> = {
@@ -118,6 +120,30 @@ export async function createWidget(
   // live transcript.
   let mdCache = new Map<string, HTMLElement>();
 
+  /**
+   * Stop button (P1-8a): while a turn is in flight — the agent is typing, a
+   * working (unfinalized) progress bubble is live, or the turn is still open
+   * between bubbles (#96, `turnActive`) — the primary button becomes a Stop
+   * button, which sends the literal "/stop" (wire choice (a): the typed command
+   * and the button share one server path). It restores to "Send" once the turn
+   * settles OR the user types, because `composerButtonMode` reads the draft too:
+   * the label must always state exactly what a click does, and a draft is Send
+   * intent. That makes the composer TEXT a second input to the label, so this
+   * runs on every draft change as well as every state change — render() alone
+   * would leave a stale "Stop" on a composer that now sends.
+   */
+  const applyComposerMode = (state: WebChannelState): void => {
+    if (state.status === "error") return; // the error branch disables the button; leave it
+    const mode = composerButtonMode(state, input.value);
+    sendBtn.dataset.mode = mode;
+    sendBtn.textContent = mode === "stop" ? "Stop" : "Send";
+  };
+  /** Re-apply the button mode after a draft change, outside a state callback. */
+  const refreshComposerMode = (): void => {
+    const s = client?.getState();
+    if (s) applyComposerMode(s);
+  };
+
   // ── Render ───────────────────────────────────────────────────────────────
   function renderApproval(a: ApprovalRequest): HTMLElement {
     const resolved = a.resolvedDecision !== undefined;
@@ -193,6 +219,9 @@ export async function createWidget(
       input.focus();
       client?.retract(m.id);
       renderMenu();
+      // Every writer of `input.value` re-derives the Send/Stop label, because a
+      // programmatic write fires no `oninput` (see `applyComposerMode`).
+      refreshComposerMode();
     };
     const dismiss = el("button", {
       title: "dismiss",
@@ -251,17 +280,9 @@ export async function createWidget(
       sendBtn.disabled = false;
     }
 
-    // Stop button (P1-8a): while a turn is in flight — the agent is typing, or a
-    // working (unfinalized) progress bubble is live — the primary button becomes
-    // a Stop button. Clicking it sends the literal "/stop" (wire choice (a): the
-    // typed command and the button share one server path). It restores to "Send"
-    // automatically once the terminal frame settles isTyping/working back to
-    // false. In the error state the button is disabled (above), so leave it.
-    if (state.status !== "error") {
-      const inFlight = state.isTyping === true || state.messages.some((m) => m.working);
-      sendBtn.dataset.mode = inFlight ? "stop" : "send";
-      sendBtn.textContent = inFlight ? "Stop" : "Send";
-    }
+    // Send/Stop label for the new state (see `applyComposerMode`). In the error
+    // state the button is disabled (above), so it leaves the label alone.
+    applyComposerMode(state);
 
     // Carry markdown hits over from the previous pass; misses re-parse. Assigned
     // to `mdCache` after the list is built so it tracks only the live transcript.
@@ -315,18 +336,16 @@ export async function createWidget(
       ));
     }
 
-    // P1-9: skip pending/retracted bubbles — they have no turnId, and letting one
-    // become `latestUser` would resurrect the "agent is typing…" line next to a
-    // live reasoning lane.
-    const latestUser = [...state.messages].reverse().find(
-      (m) => m.role === "user" && !m.pending && !m.retracted,
-    );
-    const reasoningReplacesTypingText = Boolean(
-      latestUser?.turnId && state.reasoning.some((item) => item.turnId === latestUser.turnId),
-    );
-    if (state.isTyping && !reasoningReplacesTypingText) {
+    // Activity hint (#96). `activityHint` owns the decision: the reasoning lane
+    // replaces the "agent is typing…" line only (it is that signal in richer
+    // form), while the gap hint "still working…" — shown when `turnActive` keeps
+    // a turn open between bubbles, so the gap is not a silence indistinguishable
+    // from completion — yields to a live `working` draft (it has its own bubble)
+    // and to an unresolved approval card (the turn is blocked on the user).
+    const hint = activityHint(state);
+    if (hint) {
       bubbles.push(
-        el("div", { style: "align-self:flex-start;font-size:12px;color:var(--muted)" }, ["agent is typing…"]),
+        el("div", { style: "align-self:flex-start;font-size:12px;color:var(--muted)" }, [hint]),
       );
     }
     list.replaceChildren(...bubbles);
@@ -393,6 +412,7 @@ export async function createWidget(
           input.value = `/${c.name} `;
           input.focus();
           renderMenu();
+          refreshComposerMode(); // same reason as the retract restore, above
         };
         return item;
       }),
@@ -510,10 +530,16 @@ export async function createWidget(
     client?.send(text);
     input.value = "";
     renderMenu(); // hide the typeahead once the message is sent
+    // Clearing the draft programmatically fires no `oninput`, and send()'s own
+    // synchronous re-render ran BEFORE the clear (so it saw the stale draft) —
+    // without this the button would stay "Send" through the turn it just opened.
+    refreshComposerMode();
   };
   // The primary button is a Send button by default and a Stop button while a
-  // turn is in flight (render() flips `dataset.mode`). Stop sends the literal
-  // "/stop" through the SAME send path a typed "/stop" would take.
+  // turn is in flight AND the composer is empty (`applyComposerMode` flips
+  // `dataset.mode`). The mode is the single guard, so the label and this handler
+  // can never disagree. Stop sends the literal "/stop" through the SAME send
+  // path a typed "/stop" would take.
   sendBtn.onclick = () => {
     if (sendBtn.dataset.mode === "stop") {
       client?.send("/stop");
@@ -526,6 +552,9 @@ export async function createWidget(
   input.oninput = () => {
     menuDismissed = false;
     renderMenu();
+    // The draft is half of the Send/Stop decision, and typing changes no client
+    // state — so nothing else would re-run the label.
+    refreshComposerMode();
   };
   input.onkeydown = (e) => {
     const key = (e as KeyboardEvent).key;

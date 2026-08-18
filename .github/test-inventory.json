@@ -7,7 +7,7 @@
     "demo/web/src/markdown.dom.test.ts": 10,
     "demo/web/src/markdown.test.ts": 26,
     "demo/web/src/presentation.dom.test.ts": 4,
-    "demo/web/src/presentation.test.ts": 2,
+    "demo/web/src/presentation.test.ts": 22,
     "e2e/conversation-key-rotation-reconnect.test.ts": 1,
     "e2e/local/harness.test.ts": 13,
     "e2e/local/ports.test.ts": 21,
