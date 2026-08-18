@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  buildCitationPolicy,
   findCitationFindings,
   isForbiddenDistCitation,
   listRepositoryFiles,
@@ -70,22 +71,30 @@ function buildPolicy() {
     "/repo/packages/plugin/index-nats.ts",
     "/repo/packages/saas/reference/enrollment-server.ts",
   ]);
+  // Keep the public `dist/index.js` row isolated from repo-owned provenance;
+  // its `.d.ts` sibling remains a synthetic repo-owned/internal collision.
+  repoOwnedOutputs.delete("dist/index.js");
 
   const openclawInternalPaths = new Set([
-    // Semantic basenames that nonetheless live in OpenClaw's internal dist tree.
+    // Synthetic internal membership exercises the forbidden branch directly;
+    // `hashedInternal` deliberately models a stale hash absent from this pin.
     speechProvider,
     doctorContract,
     sessionIdentity,
     exportTemplate,
     jsonInternal,
-    // A currently hash-shaped internal chunk.
     hashedInternal,
     traversalInternal,
-    // Collisions: these normalized paths ALSO exist internally, but provenance
-    // (a public export / a repo-owned output) must win over internal existence.
+    // The test constructs collisions for every public-export and repo-owned
+    // matrix row, so only the provenance branch named by the row can make it
+    // legal. `dist/index-nats.js`, among others, is not internal in this pin.
     "dist/index.js",
-    indexTypes,
+    "dist/plugin-sdk/channel-contract.js",
+    "dist/plugin-sdk/channel-contract.d.ts",
+    hashShapedExport,
     "dist/index-nats.js",
+    "dist/pop-register.d.ts",
+    indexTypes,
   ]);
 
   return { publicExports, repoOwnedOutputs, openclawInternalPaths };
@@ -188,13 +197,13 @@ describe("provenance-based OpenClaw dist citation classification", () => {
   }
 
   it("lets a public export win over internal existence on a path collision", () => {
-    // `dist/index.js` is both a declared export and present internally.
+    // The fixture deliberately constructs this public/internal collision.
     expect(isForbiddenDistCitation("dist/index.js", policy)).toBe(false);
     expect(policy.openclawInternalPaths.has("dist/index.js")).toBe(true);
   });
 
   it("lets a repo-owned output win over internal existence on a path collision", () => {
-    // `dist/index-nats.js` is both a repo-owned output and present internally.
+    // The fixture deliberately constructs this repo-owned/internal collision.
     expect(isForbiddenDistCitation("dist/index-nats.js", policy)).toBe(false);
     expect(policy.openclawInternalPaths.has("dist/index-nats.js")).toBe(true);
   });
@@ -268,11 +277,37 @@ describe("policy derivation", () => {
     );
   });
 
-  it("treats a missing OpenClaw dist directory as an empty internal set", async () => {
-    const internal = await openclawInternalDistPaths(
-      path.join(tmpdir(), "does-not-exist-openclaw-dist"),
+  it("fails loudly when the configured OpenClaw dist root is missing", async () => {
+    const parent = await mkdtemp(path.join(tmpdir(), "missing-oc-dist-"));
+    temporaryDirectories.push(parent);
+    const missingDist = path.join(parent, "node_modules", "openclaw", "dist");
+
+    await expect(openclawInternalDistPaths(missingDist)).rejects.toThrow(
+      `OpenClaw dist directory is missing at ${missingDist}; run npm ci`,
     );
-    expect(internal).toEqual(new Set());
+  });
+
+  it("assembles the real citation policy used by the CLI", async () => {
+    const repositoryFiles = await listRepositoryFiles(REPO_ROOT);
+    const policy = await buildCitationPolicy(REPO_ROOT, repositoryFiles);
+    const scratchRoot = await mkdtemp(path.join(tmpdir(), "citation-policy-e2e-"));
+    temporaryDirectories.push(scratchRoot);
+    await writeFile(
+      path.join(scratchRoot, "citations.md"),
+      [
+        speechProvider,
+        "dist/plugin-sdk/channel-contract.js",
+        "dist/index-nats.js",
+        // A real OpenClaw-internal/repo-owned collision makes omission of the
+        // repo-owned set observable; index-nats itself is not internal.
+        indexTypes,
+      ].join("\n"),
+      "utf8",
+    );
+
+    await expect(findCitationFindings(scratchRoot, policy)).resolves.toEqual([
+      { citation: speechProvider, file: "citations.md", line: 1 },
+    ]);
   });
 });
 

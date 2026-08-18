@@ -5,9 +5,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = fileURLToPath(new URL("../", import.meta.url));
-const OPENCLAW_ROOT = path.join(REPO_ROOT, "node_modules", "openclaw");
-const OPENCLAW_PACKAGE_JSON = path.join(OPENCLAW_ROOT, "package.json");
-const OPENCLAW_DIST_DIR = path.join(OPENCLAW_ROOT, "dist");
 
 // Match candidate `dist/` file citations anywhere in a repository-owned file.
 // The trust decision is made afterwards from provenance, not from the shape of
@@ -99,7 +96,9 @@ export function repoOwnedDistPaths(repoRoot, repositoryFiles) {
  * Enumerate the files present in OpenClaw's internal `dist/` tree, as normalized
  * `dist/...` paths. Membership here is the provenance signal for "OpenClaw
  * internal build output" -- these are not durable evidence, regardless of how
- * semantic or hash-shaped their basenames look.
+ * semantic or hash-shaped their basenames look. The configured root must exist;
+ * nested entries that disappear during the walk are tolerated as a filesystem
+ * race.
  */
 export async function openclawInternalDistPaths(openclawDistDir) {
   const internalPaths = new Set();
@@ -109,7 +108,13 @@ export async function openclawInternalDistPaths(openclawDistDir) {
     try {
       entries = await readdir(directory, { withFileTypes: true });
     } catch (error) {
-      if (error && error.code === "ENOENT") return;
+      if (error && error.code === "ENOENT") {
+        if (directory !== openclawDistDir) return;
+        throw new Error(
+          `OpenClaw dist directory is missing at ${openclawDistDir}; run npm ci to install pinned dependencies.`,
+          { cause: error },
+        );
+      }
       throw error;
     }
     for (const entry of entries) {
@@ -128,6 +133,19 @@ export async function openclawInternalDistPaths(openclawDistDir) {
 
   await walk(openclawDistDir);
   return internalPaths;
+}
+
+/** Assemble the provenance policy used by the citation lint CLI. */
+export async function buildCitationPolicy(repoRoot, repositoryFiles) {
+  const openclawRoot = path.join(repoRoot, "node_modules", "openclaw");
+  const openclawPackage = JSON.parse(
+    await readFile(path.join(openclawRoot, "package.json"), "utf8"),
+  );
+  return {
+    publicExports: publicExportDistPaths(openclawPackage.exports),
+    repoOwnedOutputs: repoOwnedDistPaths(repoRoot, repositoryFiles),
+    openclawInternalPaths: await openclawInternalDistPaths(path.join(openclawRoot, "dist")),
+  };
 }
 
 /**
@@ -225,13 +243,8 @@ export async function findCitationFindings(repoRoot, policy = {}, repositoryFile
 }
 
 async function main() {
-  const openclawPackage = JSON.parse(await readFile(OPENCLAW_PACKAGE_JSON, "utf8"));
   const repositoryFiles = await listRepositoryFiles(REPO_ROOT);
-  const policy = {
-    publicExports: publicExportDistPaths(openclawPackage.exports),
-    repoOwnedOutputs: repoOwnedDistPaths(REPO_ROOT, repositoryFiles),
-    openclawInternalPaths: await openclawInternalDistPaths(OPENCLAW_DIST_DIR),
-  };
+  const policy = await buildCitationPolicy(REPO_ROOT, repositoryFiles);
   const findings = await findCitationFindings(REPO_ROOT, policy, repositoryFiles);
 
   if (findings.length > 0) {
