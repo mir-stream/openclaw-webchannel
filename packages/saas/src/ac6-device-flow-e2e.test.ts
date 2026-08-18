@@ -22,6 +22,8 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { readFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,6 +35,15 @@ import { setTimeout } from "node:timers/promises";
 // reference bootstrap-server issues, against the JWKS it serves.
 import { verifyJwt } from "../../plugin/src/jwt.js";
 import { JWKSCache } from "../../plugin/src/jwks.js";
+
+// Test 9 (enrollment expiration) stands up a dedicated short-lifetime enrollment
+// service on its own real HTTP socket, composed from the SAME primitives the
+// reference server uses, so expiry is exercised over real HTTP without disturbing
+// the 600s-lifetime server the rest of the suite shares.
+import { DeviceFlowEnrollment } from "../src/device-flow-enrollment.js";
+import { MemoryEnrollmentRepository } from "../src/enrollment-repository.js";
+import { createReferenceEnrollmentHttpHandler } from "../src/enrollment-http-handler.js";
+import { setupTrustChain } from "../src/setup-trust-chain.js";
 
 // ---------------------------------------------------------------------------
 // Test configuration
@@ -783,36 +794,103 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
   // -------------------------------------------------------------------------
 
   it("should enforce enrollment expiration", async () => {
-    const pluginKeyPair = await generatePluginKeyPair();
+    // #150: the previous version of this test created a normal (600s) enrollment,
+    // THREW AWAY its codes, then POSTed a hardcoded unknown user_code ("EXPIRED-CODE")
+    // to /approve and asserted the ordinary unknown-code 404. That proved unknown-code
+    // rejection, NOT expiration — a real regression in expiry enforcement stayed green.
+    //
+    // This version drives a REAL enrollment code through a pending→expired transition
+    // and asserts the expired path is DISTINGUISHABLE from the unknown-code path.
+    //
+    // Mechanism: a dedicated short-lifetime enrollment service on its own real HTTP
+    // socket (OS-assigned port), backed by the SAME DeviceFlowEnrollment +
+    // MemoryEnrollmentRepository + reference HTTP handler the shared server composes —
+    // but with an INJECTED CLOCK so expiry is reached deterministically with no
+    // wall-clock sleep. The issue's acceptance criteria explicitly endorse an
+    // injectable/fake clock and forbid a long wall-clock sleep; the shared 600s server
+    // exposes no per-request expiry or clock hook, so a dedicated instance is required.
+    let fakeNow = Date.now();
+    const repository = new MemoryEnrollmentRepository({ clock: () => fakeNow, autoSweep: false });
+    const trust = await setupTrustChain({
+      operatorName: "expiry-test-operator",
+      accountName: "expiry-test-account",
+      returnOperatorSeed: true,
+    });
+    const expiryBaseUrl = "http://expiry-enrollment.invalid";
+    const enrollment = new DeviceFlowEnrollment({
+      saasTrustChain: trust.private,
+      natsAccountConfig: trust.natsConfig,
+      saasBaseUrl: expiryBaseUrl,
+      jwksUrl: `${expiryBaseUrl}/.well-known/jwks.json`,
+      bootstrapUrl: `${expiryBaseUrl}/bootstrap`,
+      natsUrl: NATS_URL,
+      pollIntervalSeconds: 0,
+      repository,
+    });
+    const handler = createReferenceEnrollmentHttpHandler({
+      adminToken: "test-admin-token",
+      enrollment,
+      registry: repository,
+    });
+    const expiryServer = createServer((req, res) => {
+      void handler(req, res);
+    });
+    await new Promise<void>((resolve) => expiryServer.listen(0, "127.0.0.1", () => resolve()));
+    const base = `http://127.0.0.1:${(expiryServer.address() as AddressInfo).port}`;
 
-    // Initiate enrollment with very short expiration (1 second)
-    const enrollResponse = await postJson(
-      `${SAAS_BASE_URL}/api/enroll`,
-      {
+    try {
+      const pluginKeyPair = await generatePluginKeyPair();
+
+      // Create an enrollment and CAPTURE the real codes (the old test discarded them).
+      const enrollResponse = await postJson(`${base}/enroll`, {
         agentPublicKey: pluginKeyPair.publicKey,
         tenant: TEST_TENANT,
         accountId: TEST_ACCOUNT_ID,
-      },
-    ) as {
-      device_code: string;
-    };
+      }) as { device_code: string; user_code: string; expires_in: number };
 
-    // Approving an unknown/expired user_code returns success:false with a 404,
-    // so call fetch directly (postJson throws on non-2xx).
-    const approveRaw = await fetch(`${SAAS_BASE_URL}/approve`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: "Bearer test-admin-token" },
-      body: JSON.stringify({ user_code: "EXPIRED-CODE" }),
-    });
-    expect(approveRaw.status).toBe(404);
-    const approveResponse = await approveRaw.json();
+      const { device_code, user_code, expires_in } = enrollResponse;
+      expect(device_code).toBeTruthy();
+      expect(user_code).toMatch(/^\w{4}-\w{4}$/);
 
-    // Approval should fail (not found or expired)
-    expect(approveResponse).toMatchObject({
-      success: false,
-    });
+      // BEFORE expiry: the REAL device code is live and pending — not expired, not unknown.
+      const pendingPoll = await postJson(`${base}/poll`, { device_code }) as { error?: string };
+      expect(pendingPoll.error).toBe("authorization_pending");
 
-    console.log(`[AC6 E2E] Enrollment expiration correctly enforced`);
+      // Baseline for the distinction: an UNKNOWN device code is rejected as
+      // "invalid_device_code" — the ordinary unknown-code response the old test
+      // conflated with expiry.
+      const unknownPoll = await postJson(`${base}/poll`, { device_code: "no-such-device-code" }) as { error?: string };
+      expect(unknownPoll.error).toBe("invalid_device_code");
+
+      // Drive the REAL enrollment past its lifetime via the injected clock.
+      fakeNow += expires_in * 1000 + 1;
+
+      // AFTER expiry: polling the SAME real device code now returns the documented
+      // expiry error "expired_token" — DISTINCT from the unknown-code error above. A
+      // regression that failed to enforce expiration would leave this
+      // "authorization_pending" and turn the assertion red.
+      const expiredPoll = await postJson(`${base}/poll`, { device_code }) as { error?: string };
+      expect(expiredPoll.error).toBe("expired_token");
+      expect(expiredPoll.error).not.toBe(unknownPoll.error);
+
+      // AFTER expiry: approving the REAL user code is rejected (404, success:false).
+      // An expired code cannot be approved into live credentials. (postJson would
+      // return the body regardless of status, but assert the 404 explicitly.)
+      const approveRaw = await fetch(`${base}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer test-admin-token" },
+        body: JSON.stringify({ user_code }),
+      });
+      expect(approveRaw.status).toBe(404);
+      expect(await approveRaw.json()).toMatchObject({ success: false });
+
+      console.log(
+        `[AC6 E2E] Expiration enforced on a REAL code (pending→expired), distinct from unknown-code rejection`,
+      );
+    } finally {
+      await new Promise<void>((resolve) => expiryServer.close(() => resolve()));
+      repository.close();
+    }
   });
 
   // -------------------------------------------------------------------------
