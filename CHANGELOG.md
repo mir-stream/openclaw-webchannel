@@ -1,5 +1,94 @@
 # Changelog
 
+## 0.6.0
+
+- **New: a structured tool-activity surface on the channel (issue #97).** Until
+  now the only thing a browser peer learned about the agent's tool work was
+  whatever the progress draft happened to be showing: transient text, on a path a
+  short tool call can complete without ever flushing, and that turn settlement
+  replaces with the final answer. An embedder had nothing it could style, count,
+  or correlate. The plugin now emits an additive `tool_activity` frame per tool
+  call — `{turnId, id, name?, phase?, status?, summary?, argKeys?}` — and the
+  client exposes it as `WebChannelState.toolActivity: ToolActivityItem[]` (new
+  exported type `ToolActivityItem`). It mirrors the reasoning lane end to end:
+  sourced directly from the agent event stream rather than from the
+  progress-draft writer, upserted by id and correlated by `turnId` across a
+  call's start/update/terminal phases, bounded (the wrapper retains the most
+  recent 100), and **ephemeral — it is not durable history and does not survive
+  a reload or a register-time history snapshot.** The pre-existing progress-text
+  path is byte-for-byte unchanged, so nothing that renders it today moves.
+
+  **`argKeys` carries argument KEY NAMES only, never argument values**, because
+  tool arguments routinely hold file contents, paths, and secrets. The same
+  boundary governs the rest of the frame: an item core marks hidden from channel
+  progress is suppressed along with the derived command/patch companions that
+  the pinned runtime does not itself flag; patch summaries are admitted only
+  after reduction to the runtime's count-only grammar (`3 added, 1 modified`),
+  never file paths; and command, tool, and search summaries — which can carry
+  output or query bodies — are withheld entirely.
+
+  There is **no config gate and no opt-out**: unlike the reasoning lane, tool
+  activity is always on for every peer the channel serves. Consider that before
+  upgrading if your browser peers are less trusted than your operators. The
+  surface is deliberately narrow metadata, but a tool *name* still describes
+  what the agent is doing. The value redactor, the full tool outcome
+  (`onToolResult` / `onCommandOutput` / `onPatchSummary`), non-streaming-mode
+  wiring, and a durable after-settle record are deliberate follow-ups, not
+  oversights.
+
+- **Stable assistant-message identity on the wire (issue #111).** `agent_message`
+  frames now carry an optional `assistantMessageIndex`, and `ChatMessage`
+  exposes it, so a client can reconcile a register-time history snapshot against
+  the bubbles already on screen by exact match instead of the text/positional
+  heuristic. It is populated **only** for authorized block deliveries, where
+  core's runtime dispatch info carries a true per-assistant-message identity.
+  Final, notice, and error deliveries omit it, because core stamps one
+  turn-level index on every retained final payload and reading it there would
+  misattribute one retained message to another. It is **live-only and not a
+  durable key**: the ordinal is run/attempt-local, can repeat within one user
+  turn after model fallback, and is deliberately absent from `HistoryMessage`.
+  The client uses it as a tier-0 match scoped through the anchor's live `turnId`
+  and falls back to the existing heuristic, untouched, whenever the field is
+  absent.
+
+- **No protocol break in this release.** `WEBCHANNEL_PROTOCOL_VERSION` stays
+  `3`. Both wire additions above are optional and additive in both directions —
+  an older client ignores the new frame and the new field, and an older agent
+  simply never sends them — so no lockstep upgrade is imposed by the protocol.
+  The plugin, client, and SaaS packages still move together at `0.6.0`, and you
+  need both sides upgraded to actually see the new surface.
+
+- **All three published packages are now MIT licensed.** `openclaw-webchannel`
+  previously declared no `license` field at all, and
+  `@mir-stream/webchannel-client` and `@mir-stream/webchannel-saas` were marked
+  `UNLICENSED`. Each package now declares `MIT` and ships a `LICENSE` file
+  inside its published tarball.
+
+- **The source repository is public, and `openclaw-webchannel` now publishes
+  with npm provenance.** The package had been installable from public npm for
+  several releases while its source repository was private, so nothing tied a
+  published tarball to the code that produced it — and `docsPath` pointed at a
+  repository nobody outside the org could open (issue #188). Both follow from
+  the repository going public. Provenance attestation is restricted to public
+  source repositories, so from 0.6.0 every release carries a signed link back to
+  the workflow run that built it, verifiable with `npm audit signatures`.
+
+- The channel now registers complete presentation metadata (issue #170). Pinned
+  openclaw `2026.7.1-2` was filling in the missing `label`, `selectionLabel`,
+  `docsPath`, and `blurb` itself and emitting a warning-shaped "registered
+  incomplete metadata" diagnostic on **every** gateway boot; supplying all four
+  stops it. The separate pre-load `openclaw.channel` catalog block in
+  `package.json` — which is what represents this channel to an operator while
+  the bundle is not loaded at all — now carries the same four values, and a
+  cross-assertion keeps the two surfaces from drifting apart again.
+
+- The demo widget's composer keeps its in-flight affordance alive across the
+  whole of a multi-step turn (issue #96). The Send/Stop label is re-derived from
+  the live draft by every writer instead of being latched by a guard in the
+  handler, so it no longer reverts between agent bubbles; the gap hint is
+  actually reachable; and a follow-up typed while a turn is still running is no
+  longer swallowed.
+
 ## 0.5.0
 
 - **New: `openclaw-webchannel-rotate-key`, an offline conversation-key rotation
@@ -158,6 +247,15 @@ accounts disabled and escalate through the service's incident-response process.
 - Hardened both NATS WebSocket transports with stable subscription replay,
   byte-accurate bounded framing, per-phase handshake deadlines, and stale
   async-connection generation guards.
+- **Breaking:** replace `EnrollmentStore`, `MemoryEnrollmentStore`, and
+  `MemoryAgentKeyRegistry` with the required atomic `EnrollmentRepository` and
+  `MemoryEnrollmentRepository`; adapters must implement the repository-authoritative
+  asynchronous `now()` clock accessor.
+- **Breaking:** `ApproveOutcome` adds `in_progress`; operator HTTP adapters map
+  it to `409 approval_in_progress`. Deny may now terminate an approving lease,
+  preempting an approve still in flight on the same instance.
+- Polling an approved record after `expiresAt` returns its credentials during
+  retention instead of overwriting approval with expiry.
 
 ## 0.3.0
 
@@ -178,14 +276,3 @@ accounts disabled and escalate through the service's incident-response process.
 - Wire protocol v2 is a breaking lockstep client/plugin upgrade: register versions are mandatory in both directions and bounded ingress overload has an explicit terminal `inbound_rejected` result.
 
 The plugin, client, and SaaS packages must be released together at version `0.3.0`.
-# Unreleased
-
-- **Breaking:** replace `EnrollmentStore`, `MemoryEnrollmentStore`, and
-  `MemoryAgentKeyRegistry` with the required atomic `EnrollmentRepository` and
-  `MemoryEnrollmentRepository`; adapters must implement the repository-authoritative
-  asynchronous `now()` clock accessor.
-- **Breaking:** `ApproveOutcome` adds `in_progress`; operator HTTP adapters map
-  it to `409 approval_in_progress`. Deny may now terminate an approving lease,
-  preempting an approve still in flight on the same instance.
-- Polling an approved record after `expiresAt` returns its credentials during
-  retention instead of overwriting approval with expiry.

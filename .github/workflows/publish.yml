@@ -254,13 +254,21 @@ jobs:
         if: steps.already.outputs.skip != 'true'
         # No NODE_AUTH_TOKEN: with a configured Trusted Publisher and npm >=
         # 11.5.1, `npm publish` performs the OIDC exchange itself.
-        # NO --provenance: provenance attestation is restricted to PUBLIC source
-        # repos (and needs a matching package.json `repository`); this repo is
-        # private, and `npm publish --provenance` CANCELS the whole publish if
-        # provenance generation fails. Trusted-publishing auth still works on a
-        # private repo — only the provenance attestation is gated. Add
-        # --provenance here only after the repo is public.
-        run: npm publish -w packages/plugin --access public
+        #
+        # --provenance was held back while the repo was private, because the
+        # attestation is restricted to PUBLIC source repos and `npm publish
+        # --provenance` CANCELS the whole publish if generation fails. The repo
+        # went public on 2026-08-19, so the gate is lifted and every release from
+        # 0.6.0 on carries a signed link back to the workflow run that built it.
+        # The other prerequisites were already in place: `id-token: write` above,
+        # npm upgraded in the step near the top of this job, and packages/plugin
+        # declares the matching `repository` field.
+        #
+        # If this ever fails, the failure is contained: the npm leg cancels with
+        # nothing published, so drop the flag, delete the tag, and re-push it.
+        # The GitHub Packages leg that ran before this one is idempotent and will
+        # skip on the retry.
+        run: npm publish -w packages/plugin --access public --provenance
 
   # ---------------------------------------------------------------------------
   # Plugin leg #2: publish the openclaw-webchannel code-plugin to ClawHub.

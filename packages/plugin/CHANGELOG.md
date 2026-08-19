@@ -2,32 +2,90 @@
 
 ## Unreleased
 
+## 0.6.0
+
+### Added
+
+- **A structured tool-activity surface on the channel (#97).** Until now the
+  only thing a browser peer learned about the agent's tool work was whatever the
+  progress draft happened to be showing: transient text, on a path a short tool
+  call can complete without ever flushing, and that turn settlement replaces
+  with the final answer. The channel now emits an additive `tool_activity`
+  frame per tool call — `{turnId, id, name?, phase?, status?, summary?,
+  argKeys?}` — sealed and delivered on the same encrypted peer path as every
+  other outbound frame. It is sourced **directly from the run-scoped agent event
+  stream**, not from the progress-draft `scaffoldWriter` gate, so the
+  pre-existing progress-text path is byte-for-byte unchanged and short calls
+  that never flush a draft are still visible. Ids are correlated across a
+  call's start/update/terminal phases (by `itemId`/`toolCallId`/`name` within
+  the run), so a consumer can upsert one item per call rather than accumulate
+  fragments. The lane is ephemeral live state: it is **not** durable history and
+  never enters `sendHistory`.
+  - **`argKeys` carries argument KEY NAMES only, never argument values.** Tool
+    arguments routinely hold file contents, paths, and secrets, so only
+    `Object.keys(args)` crosses the wire, and only on non-terminal phases.
+  - The same boundary governs everything else on the frame. An item core marks
+    `hideFromChannelProgress` is suppressed, and so are the derived
+    command/patch companions the pinned runtime emits without re-flagging them —
+    the tracker remembers the hidden invocation and its aliases across those
+    companions, and retires it only on a fresh unhidden canonical start. Items
+    marked `suppressChannelProgress` are dropped. Patch summaries are admitted
+    only after reduction to the pinned producer's count-only grammar
+    (`3 added, 1 modified`); the path arrays are never read. Command, tool, and
+    search summaries can carry output or query/result bodies and are withheld
+    entirely.
+  - **There is no config gate and no opt-out.** Unlike the reasoning lane, tool
+    activity is on for every peer the channel serves. Consider that before
+    upgrading if your browser peers are less trusted than your operators: the
+    surface is deliberately narrow metadata, but a tool *name* still describes
+    what the agent is doing.
+  - Deliberate follow-ups, not oversights: the argument-value redactor, the full
+    tool outcome (`onToolResult` / `onCommandOutput` / `onPatchSummary`),
+    non-streaming-mode wiring, and a durable after-settle record.
+- **Stable assistant-message identity on the wire (#111).** `agent_message`
+  frames now carry an optional `assistantMessageIndex`, and the
+  `WebChannelPeerChannel` methods `sendText` and `finalizeDraft` take it as a
+  trailing optional parameter. It lets a client reconcile a register-time
+  history snapshot against the bubbles already on screen by exact match instead
+  of a text/positional heuristic. It is populated **only** for authorized block
+  deliveries, where core's runtime dispatch info carries a true
+  per-assistant-message identity; final, notice, and error deliveries omit it,
+  because core stamps one turn-level index on every retained final payload and
+  reading it there would misattribute one retained message to another. The
+  ordinal is run/attempt-local and can repeat within a single user turn after
+  model fallback, so it is **live-only and deliberately absent from
+  `HistoryMessage`** — it must not be used as a durable history/hydration key.
+  - Implementers of `WebChannelPeerChannel` outside this package must widen
+    `sendText`/`finalizeDraft` and add `sendToolActivity`. The interface gained
+    a required member, so a hand-written implementation will not typecheck until
+    it does; `NullPeerChannel` is updated accordingly.
+- **Channel-presentation metadata is now complete (#170).** The plugin
+  registered without the four channel-presentation fields, so pinned
+  openclaw `2026.7.1-2` filled the defaults itself and emitted a
+  warning-shaped `channel "webchannel" registered incomplete metadata; filled
+  missing label, selectionLabel, docsPath, blurb` diagnostic on **every**
+  gateway boot. All four are now supplied on the runtime `plugin.meta` that core
+  reads at registration. The separate pre-load `openclaw.channel` catalog block
+  in `package.json` — which is what represents this channel to an operator while
+  the bundle is not loaded at all — carries the same four values, and a
+  cross-assertion of the shipped entry against that block keeps the two surfaces
+  from drifting apart again.
+- The package is now **MIT licensed**. It previously declared no `license` field
+  at all; it now declares `MIT` and ships a `LICENSE` file in the tarball.
+
+### Notes
+
+- **No protocol break.** `WEBCHANNEL_PROTOCOL_VERSION` stays `3`. Both wire
+  additions are optional and additive in both directions: an older client
+  ignores the new frame type and the new field, and an older agent simply never
+  sends them. Lockstep with `@mir-stream/webchannel-client` at `0.6.0` is still
+  the supported configuration, and both sides must be upgraded to see the new
+  surface — but nothing in this release refuses a mismatched peer.
+
+## 0.5.0
+
 ### BREAKING
 
-- **Protocol v3 — register-hop wire break.** Ships lockstep with client/SaaS
-  `0.4.0`; `WEBCHANNEL_PROTOCOL_VERSION` is `3` and a mismatched request is
-  refused with a terminal `protocol_mismatch` (426) before PoP or key work.
-  - Authenticated register requests require a new `clientNonce` (base64url, ≥16
-    bytes of entropy), which is bound with the peer id into the
-    wrapped-conversation-key AAD. The wrapped key was authenticated but not
-    fresh, so a hostile relay could capture a register reply and re-serve it
-    verbatim; that is inert only while K never rotates. Validation runs **after**
-    the version check, so an outdated browser gets a terminal 426 instead of a
-    401 that its embedder would route into a re-login loop.
-  - `unregister` now requires the same single-use PoP proof as `register`
-    (issue #51), gated on `auth.requirePoP` identically. The bootstrap JWT
-    crosses the untrusted relay in plaintext, so a token-only teardown could be
-    captured and replayed until the JWT expired, dropping the victim's
-    subscription and session key each time with no signal to the victim. Every
-    failure remains a silent no-op with no reply.
-  - The PoP signed message is now `webchannel-pop:{op}:{peerId}:{nonce}`. Both
-    operations draw from the same per-peer nonce bucket, so without the op a
-    `register` proof also authorized a teardown — obtainable without any replay
-    by *suppressing* the register frame, which is indistinguishable from the
-    dropped frame the client retry loop absorbs.
-- Removed configurable `auth.jwt.audience`. The account-bound verifier always
-  expects the runtime account id, and a raw removed key is rejected before any
-  credential or relay I/O. Delete the key from shared and named account blocks.
 - **Reasoning is now streamed to browser peers by DEFAULT** (#113). The lane is
   gated on a new channel-private `channels.webchannel.capabilities.reasoning`,
   and an ABSENT key means ON, so every existing deployment starts sending the
@@ -64,11 +122,6 @@
     turns unauthorized by default, while still supporting operators who
     deliberately authorize named peers through core's command allowlist.
     Requires openclaw `>=2026.7.1`.
-- Generic/shared IdP audiences are no longer accepted. `aud` is the account id
-  or an array of authorized account ids in one tenant; this supersedes #65's
-  partial audience-pin proposal.
-- Register admission now requires a non-empty signed tenant claim matching the
-  configured tenant for challenge, register, and unregister.
 - **The tenant is now part of the session-key derivation, so EVERY existing
   session key changes on upgrade** (#112). Webchannel keyed sessions on
   (agent, channel, account, peer) only, but the protocol permits the same
@@ -117,35 +170,6 @@
     every deployment that *had* configured a tenant — the entire population the
     bug can affect — breaks either way, so the exception would buy no security
     and would leave a confidentiality boundary conditional on a magic value.
-- **Protocol v2:** authenticated register requests require v2 and bounded
-  retained-work overload uses `inbound_rejected`; client and plugin must upgrade
-  together.
-- Bound debounce waiting/in-flight plus busy dispatcher pending work by shared
-  process and per-session count/charged-byte budgets. Preserve admitted work and
-  reject only the newest overflow with durable outcome dedupe.
-- `/stop` now cancellation-records and ACKs the exact waiting/in-flight union
-  before releasing its reservations; failed suppression writes recover through
-  the bounded replay tombstone path. Every ACK/rejection producer shares the
-  same 64-id, 64-KiB, effective-`max_payload` result boundary.
-
-### Security upgrade / incident response
-
-A prior deployment that served multiple accounts under the same issuer and
-shared audience must be treated as potentially exposed: a token for one account
-may have admitted another peer and disclosed that peer's conversation key K and
-history. This release prevents new cross-account admission, but cannot make
-previously exposed keys or ciphertext secret again.
-
-Drain and stop every vulnerable plugin replica and keep the affected accounts
-disabled. Revoke affected issuer/relay bootstrap and NATS authorizations plus
-active sessions. Review the complete exposure window and history. Rotate K and
-invalidate old encrypted peer state only through a verified control. Removing
-`auth.jwt.audience`, partially restarting the fleet, or waiting for token expiry
-is not revocation.
-
-The integrated verified rotation/state-invalidation path is tracked by #72. If
-it is unavailable, do not invent file-deletion or ad-hoc migration commands;
-keep the accounts disabled and escalate through incident response.
 
 ### Fixed
 
@@ -187,6 +211,72 @@ keep the accounts disabled and escalate through incident response.
     turnId only, so a member frame is a no-op there). Fixing this on the client
     instead would have required inferring terminality from ordering, which a
     delivery contract must not do.
+
+## 0.4.0
+
+### BREAKING
+
+- **Protocol v3 — register-hop wire break.** Ships lockstep with client/SaaS
+  `0.4.0`; `WEBCHANNEL_PROTOCOL_VERSION` is `3` and a mismatched request is
+  refused with a terminal `protocol_mismatch` (426) before PoP or key work.
+  - Authenticated register requests require a new `clientNonce` (base64url, ≥16
+    bytes of entropy), which is bound with the peer id into the
+    wrapped-conversation-key AAD. The wrapped key was authenticated but not
+    fresh, so a hostile relay could capture a register reply and re-serve it
+    verbatim; that is inert only while K never rotates. Validation runs **after**
+    the version check, so an outdated browser gets a terminal 426 instead of a
+    401 that its embedder would route into a re-login loop.
+  - `unregister` now requires the same single-use PoP proof as `register`
+    (issue #51), gated on `auth.requirePoP` identically. The bootstrap JWT
+    crosses the untrusted relay in plaintext, so a token-only teardown could be
+    captured and replayed until the JWT expired, dropping the victim's
+    subscription and session key each time with no signal to the victim. Every
+    failure remains a silent no-op with no reply.
+  - The PoP signed message is now `webchannel-pop:{op}:{peerId}:{nonce}`. Both
+    operations draw from the same per-peer nonce bucket, so without the op a
+    `register` proof also authorized a teardown — obtainable without any replay
+    by *suppressing* the register frame, which is indistinguishable from the
+    dropped frame the client retry loop absorbs.
+- Removed configurable `auth.jwt.audience`. The account-bound verifier always
+  expects the runtime account id, and a raw removed key is rejected before any
+  credential or relay I/O. Delete the key from shared and named account blocks.
+- Generic/shared IdP audiences are no longer accepted. `aud` is the account id
+  or an array of authorized account ids in one tenant; this supersedes #65's
+  partial audience-pin proposal.
+- Register admission now requires a non-empty signed tenant claim matching the
+  configured tenant for challenge, register, and unregister.
+- **Protocol v2:** authenticated register requests require v2 and bounded
+  retained-work overload uses `inbound_rejected`; client and plugin must upgrade
+  together.
+- Bound debounce waiting/in-flight plus busy dispatcher pending work by shared
+  process and per-session count/charged-byte budgets. Preserve admitted work and
+  reject only the newest overflow with durable outcome dedupe.
+- `/stop` now cancellation-records and ACKs the exact waiting/in-flight union
+  before releasing its reservations; failed suppression writes recover through
+  the bounded replay tombstone path. Every ACK/rejection producer shares the
+  same 64-id, 64-KiB, effective-`max_payload` result boundary.
+
+### Security upgrade / incident response
+
+A prior deployment that served multiple accounts under the same issuer and
+shared audience must be treated as potentially exposed: a token for one account
+may have admitted another peer and disclosed that peer's conversation key K and
+history. This release prevents new cross-account admission, but cannot make
+previously exposed keys or ciphertext secret again.
+
+Drain and stop every vulnerable plugin replica and keep the affected accounts
+disabled. Revoke affected issuer/relay bootstrap and NATS authorizations plus
+active sessions. Review the complete exposure window and history. Rotate K and
+invalidate old encrypted peer state only through a verified control. Removing
+`auth.jwt.audience`, partially restarting the fleet, or waiting for token expiry
+is not revocation.
+
+The integrated verified rotation/state-invalidation path is tracked by #72. If
+it is unavailable, do not invent file-deletion or ad-hoc migration commands;
+keep the accounts disabled and escalate through incident response.
+
+### Fixed
+
 - Added per-account pure planning and immutable account-bound auth preparation
   before that account consumes transport credentials or performs network I/O,
   token-only prepared verifiers, Gate-B-before-subscribe activation,

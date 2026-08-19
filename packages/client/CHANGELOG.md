@@ -2,49 +2,56 @@
 
 ## Unreleased
 
-### BREAKING
+## 0.6.0
 
-- **Protocol v3 — register-hop wire break.** Ships lockstep with plugin/SaaS
-  `0.4.0`. Four changes, all mandatory:
-  1. The register request carries a new required `clientNonce`: a fresh random
-     value this package generates per register *attempt*, which the agent binds
-     into the wrapped-conversation-key AAD. It closes a register-reply replay:
-     the wrapped key was authenticated but not fresh, so a hostile relay could
-     re-serve a captured reply. The agent never echoes it and the client never
-     reads it back off the wire.
-  2. `unregister` now requires the same proof-of-possession as `register`; a
-     token-only teardown was replayable off the relay. Use the new
-     `unregisterWithPop()` — a hand-rolled token-only `unregister` against a v3
-     agent is a **silent no-op** (fire-and-forget, no reply on any path, and the
-     version check sits after the unregister branch, so there is no 426).
-  3. **Exported signatures changed:** `popSignedMessage(peerId, nonce)` →
-     `popSignedMessage(op, peerId, nonce)` and `signPop(key, peerId, nonce)` →
-     `signPop(key, op, peerId, nonce)`. The signed message is now
-     `webchannel-pop:{op}:{peerId}:{nonce}`. Without the op a proof minted for
-     `register` also authorized an `unregister`, since both verify against the
-     same per-peer nonce bucket.
-  4. `WEBCHANNEL_PROTOCOL_VERSION` is `3`; a mismatch in either direction is a
-     terminal `protocol-mismatch`.
-  New export: `unregisterWithPop` (+ `PopOp`, `UnregisterWithPopOptions`,
-  `RegisterPublishFn`). `generateClientNonce` is intentionally **not** exported —
-  the anchor has exactly one legitimate producer, `registerWithPop`.
-- Reference JWT bootstrap consumers no longer submit a tenant/account choice.
-  They require the server-returned fixed tuple and treat optional caller values
-  only as pre-construction test assertions. This ships lockstep with plugin/SaaS
-  `0.4.0` (incident context #72; durable storage follow-up #71).
-- **Protocol v2:** a matching plugin is required; missing, malformed, or
-  mismatched register reply versions and authenticated 426 replies are terminal
-  `protocol-mismatch` failures. `inbound_rejected` maps
-  overload to `failed{reason:"overloaded",retryable:true}`. Published unresolved
-  ids are live-retried with one capped exponential-backoff timer.
-- **P0-4 send-result contract.** `ChatMessage.delivered?: boolean` is **removed**,
-  replaced by `sendState?: "queued" | "sent" | "accepted" | "completed" | "failed"`
-  and `sendFailure?: SendFailure`. Migration: `delivered === true` ↔
-  `sendState === "accepted" || sendState === "completed"`. Lockstep with
-  `@mir-stream/webchannel-plugin` — upgrade both together.
-- `WebChannelErrorCause` adds the `"capacity"` member. This is wire-compatible,
-  but downstream exhaustive switches over the union must add the new terminal,
-  non-reauth case.
+### Added
+
+- **Live tool activity is now a first-class client surface (#97).**
+  `WebChannelState` adds optional `toolActivity?: ToolActivityItem[]`, and the
+  new exported type `ToolActivityItem` (`{ id, turnId, name?, phase?, status?,
+  summary?, argKeys? }`) describes one tool call the agent is making. Until now
+  the only signal a product could render was the agent's progress-draft text — a
+  transient string a short tool call can finish without ever producing, and
+  which turn settlement replaces with the final answer. The lane arrives on its
+  own additive `tool_activity` frame, independent of the progress-draft path, so
+  the existing progress text is unchanged.
+  - It behaves like `reasoning[]`, not like `messages[]`: items are upserted by
+    `id`, correlated by `turnId`, bounded to the most recent 100, and
+    **ephemeral**. This is NOT durable history — it does not survive a reload
+    and does not come back in a register-time history snapshot. Render it as
+    live decoration, never as the record of what happened.
+  - `argKeys` carries argument **key names only**, never argument values. Tool
+    arguments can hold file contents, paths, and secrets, so the agent never
+    puts values on the wire; do not present `argKeys` as if it were the call's
+    input.
+  - The field is optional on `WebChannelState` purely so existing
+    `WebChannelState` object literals stay source compatible. Snapshots produced
+    by the high-level wrapper always initialize it to an array, so a consumer
+    reading `state.toolActivity` from a real client never sees `undefined`.
+- **`ChatMessage.assistantMessageIndex?: number` (#111).** `agent_message`
+  frames may now carry an observed per-assistant-message ordinal, and the client
+  uses it as a tier-0 exact match — scoped through the anchor's live `turnId` —
+  when reconciling a history snapshot against the bubbles already on screen,
+  falling back to the existing text/positional heuristic, untouched, whenever
+  the field is absent. The agent populates it only for authorized block
+  deliveries; final, notice, and error deliveries omit it.
+  - **It is not an identifier.** The ordinal is run/attempt-local, can repeat
+    within one user turn after model fallback, is not globally unique, and is
+    deliberately not part of `HistoryMessage`. Do not use it as a durable
+    history or hydration key.
+- The package is now **MIT licensed** — it was previously published as
+  `UNLICENSED` — and ships a `LICENSE` file in the tarball.
+
+### Notes
+
+- **No protocol break.** `WEBCHANNEL_PROTOCOL_VERSION` stays `3`. Both additions
+  are optional and additive in both directions: this client ignores their
+  absence against an older agent, and an older client ignores them against a
+  `0.6.0` agent. Lockstep with `@mir-stream/webchannel-plugin` at `0.6.0` is
+  still the supported configuration and is required to see the new surface, but
+  nothing in this release refuses a mismatched peer.
+
+## 0.5.0
 
 ### Added
 
@@ -118,6 +125,54 @@
   registration, key installation, and ledger replay. A raw-open socket remains
   `connecting/false` initially or `reconnecting/false` after a prior session;
   this readiness correction is active even when `ackStallTimeoutMs` is `0`.
+
+## 0.4.0
+
+### BREAKING
+
+- **Protocol v3 — register-hop wire break.** Ships lockstep with plugin/SaaS
+  `0.4.0`. Four changes, all mandatory:
+  1. The register request carries a new required `clientNonce`: a fresh random
+     value this package generates per register *attempt*, which the agent binds
+     into the wrapped-conversation-key AAD. It closes a register-reply replay:
+     the wrapped key was authenticated but not fresh, so a hostile relay could
+     re-serve a captured reply. The agent never echoes it and the client never
+     reads it back off the wire.
+  2. `unregister` now requires the same proof-of-possession as `register`; a
+     token-only teardown was replayable off the relay. Use the new
+     `unregisterWithPop()` — a hand-rolled token-only `unregister` against a v3
+     agent is a **silent no-op** (fire-and-forget, no reply on any path, and the
+     version check sits after the unregister branch, so there is no 426).
+  3. **Exported signatures changed:** `popSignedMessage(peerId, nonce)` →
+     `popSignedMessage(op, peerId, nonce)` and `signPop(key, peerId, nonce)` →
+     `signPop(key, op, peerId, nonce)`. The signed message is now
+     `webchannel-pop:{op}:{peerId}:{nonce}`. Without the op a proof minted for
+     `register` also authorized an `unregister`, since both verify against the
+     same per-peer nonce bucket.
+  4. `WEBCHANNEL_PROTOCOL_VERSION` is `3`; a mismatch in either direction is a
+     terminal `protocol-mismatch`.
+  New export: `unregisterWithPop` (+ `PopOp`, `UnregisterWithPopOptions`,
+  `RegisterPublishFn`). `generateClientNonce` is intentionally **not** exported —
+  the anchor has exactly one legitimate producer, `registerWithPop`.
+- Reference JWT bootstrap consumers no longer submit a tenant/account choice.
+  They require the server-returned fixed tuple and treat optional caller values
+  only as pre-construction test assertions. This ships lockstep with plugin/SaaS
+  `0.4.0` (incident context #72; durable storage follow-up #71).
+- **Protocol v2:** a matching plugin is required; missing, malformed, or
+  mismatched register reply versions and authenticated 426 replies are terminal
+  `protocol-mismatch` failures. `inbound_rejected` maps
+  overload to `failed{reason:"overloaded",retryable:true}`. Published unresolved
+  ids are live-retried with one capped exponential-backoff timer.
+- **P0-4 send-result contract.** `ChatMessage.delivered?: boolean` is **removed**,
+  replaced by `sendState?: "queued" | "sent" | "accepted" | "completed" | "failed"`
+  and `sendFailure?: SendFailure`. Migration: `delivered === true` ↔
+  `sendState === "accepted" || sendState === "completed"`. Lockstep with
+  `@mir-stream/webchannel-plugin` — upgrade both together.
+- `WebChannelErrorCause` adds the `"capacity"` member. This is wire-compatible,
+  but downstream exhaustive switches over the union must add the new terminal,
+  non-reauth case.
+
+### Added
 
 - Agent account capacity replies (`capacity_exceeded`, code 507) now surface as
   terminal `WebChannelErrorCause: "capacity"` and do not enter a retry or
