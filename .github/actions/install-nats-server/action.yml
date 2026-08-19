@@ -11,16 +11,17 @@ inputs:
 
 # NO SUDO ANYWHERE IN THIS ACTION.
 #
-# It used to install to /usr/local/bin via `sudo mv`, which worked only because
-# the original self-hosted lane happened to have passwordless sudo. The publish
-# jobs moved to the dedicated `deploy` lane (runner cutover, PR #50) and that
-# runner does not, so BOTH halves failed there: `actions/cache` could not restore
-# into /usr/local/bin ("Cannot open: Permission denied") and the download
-# fallback died on `sudo: a password is required`.
-#
 # Installing under $RUNNER_TOOL_CACHE and exporting it via $GITHUB_PATH needs no
-# elevation, works identically on every runner, and removes a root requirement
-# from the lane that holds the publish credentials. Do not reintroduce sudo here.
+# elevation and works identically on every runner. Do not reintroduce sudo here:
+# it buys nothing, and it puts a root requirement on the lane that holds the
+# publish credentials.
+#
+# (History, so the rule is not re-litigated: this installed to /usr/local/bin via
+# `sudo mv` back when every lane was self-hosted with passwordless sudo. The
+# publish lane did not have it, and both halves broke there — `actions/cache`
+# could not restore into /usr/local/bin, and the download fallback died on
+# `sudo: a password is required`. All lanes are GitHub-hosted now, which would
+# tolerate sudo again; the rule stays because it is simply the portable one.)
 runs:
   using: composite
   steps:
@@ -28,9 +29,10 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        # RUNNER_TOOL_CACHE is always writable by the runner user and survives
-        # between jobs on a self-hosted host; fall back to HOME on the rare
-        # runner that leaves it unset.
+        # RUNNER_TOOL_CACHE is always writable by the runner user; fall back to
+        # HOME on the rare runner that leaves it unset. On hosted runners the
+        # directory is ephemeral, so `actions/cache` below — not the location —
+        # is what makes this survive between runs.
         DIR="${RUNNER_TOOL_CACHE:-$HOME/.cache}/nats-server/${{ inputs.version }}"
         mkdir -p "$DIR"
         echo "NATS_SERVER_DIR=$DIR" >> "$GITHUB_ENV"

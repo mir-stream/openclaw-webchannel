@@ -46,12 +46,15 @@ permissions:
 
 jobs:
   publish:
-    runs-on: deploy  # 러너 신축 D7 — deploy 레인 단독 라벨(기본 라벨 러너에 안 실림)
+    runs-on: ubuntu-latest  # 공개 저장소 전환(자체 호스팅 러너 폐지)
     steps:
-      # ── 컷오버 조상 가드 (러너 신축 설계 §6-4) ──
-      # 구 커밋 재태그(전환 이전 세계의 파일·크레덴셜 전제)가 deploy 레인에서 도는 것을 차단한다.
+      # ── 컷오버 조상 가드 ──
+      # 구 커밋 재태그(전환 이전 세계의 파일·크레덴셜 전제)가 크레덴셜에 닿기 전에 차단한다.
       # 체크아웃 불필요: API compare 한 방. GITHUB_REF_NAME(태그명) 비교라 annotated 태그 역참조 문제 없음.
       # 후속 2잡은 needs: publish 라 이 가드 하나로 전부 차단된다.
+      # 알려진 잔여 구간: 이 SHA 이후·호스티드 러너 전환 이전 커밋을 재태그하면 가드는 통과하지만
+      # 워크플로가 그 시점 파일(`runs-on: deploy`)로 돌아 존재하지 않는 라벨에 영원히 큐잉된다.
+      # 그 태그를 실제로 다시 팔 일이 생기면 SHA 를 전환 커밋으로 올려 실패를 시끄럽게 만들 것.
       - name: cutover ancestry guard
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -177,7 +180,7 @@ jobs:
     name: Publish plugin to npm (public, OIDC)
     needs: publish
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: deploy  # 러너 신축 D7 — deploy 레인 단독 라벨(기본 라벨 러너에 안 실림)
+    runs-on: ubuntu-latest  # 공개 저장소 전환(자체 호스팅 러너 폐지)
     permissions:
       contents: read
       # OIDC trusted publishing: npm exchanges this id-token for a short-lived
@@ -289,7 +292,7 @@ jobs:
       github.event_name == 'push'
       && startsWith(github.ref, 'refs/tags/v')
       && vars.PUBLISH_CLAWHUB == 'true'
-    runs-on: deploy  # 러너 신축 D7 — deploy 레인 단독 라벨(기본 라벨 러너에 안 실림)
+    runs-on: ubuntu-latest  # 공개 저장소 전환(자체 호스팅 러너 폐지)
     permissions:
       contents: read
       # Kept wired for forward-compat: the clawhub CLI tries an OIDC mint
@@ -326,7 +329,7 @@ jobs:
           node-version: 22
 
       # Job-scoped only: installs into RUNNER_TEMP and prepends via GITHUB_PATH,
-      # so the shared self-hosted runner's global npm is never mutated.
+      # so no global npm is mutated and the pin cannot leak into another step.
       - name: Pin npm for the ClawHub CLI (see CLAWHUB_NPM_PIN)
         run: |
           set -euo pipefail

@@ -38,7 +38,13 @@ concurrency:
 jobs:
   gate:
     name: E2E Gate (nats-server v2.14 + Typecheck + Tests)
-    runs-on: [self-hosted, linux, x64]
+    # GitHub-hosted, NOT self-hosted. This gate triggers on `pull_request`, has
+    # no fork guard, and checks out the PR merge ref — on a public repository a
+    # self-hosted runner would therefore execute fork-authored code on the
+    # maintainer's own machine, on a non-ephemeral host that also carries the
+    # publish lane. Hosted runners are ephemeral and free for public repos, so
+    # the exposure and the CI cost both disappear. Do not move this back.
+    runs-on: ubuntu-latest
 
     # Pin the Node.js version — must match the engines.node range declared
     # in each published package.json.
