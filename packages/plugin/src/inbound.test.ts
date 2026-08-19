@@ -10,6 +10,8 @@ vi.mock("openclaw/plugin-sdk/reply-payload", () => ({
     typeof payload?.text === "string" && payload.text.includes(WARNING_SENTINEL),
 }));
 
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 import {
@@ -27,6 +29,7 @@ import {
   ApprovalOriginLeaseRegistry,
 } from "./approval-origin.js";
 import { resolveWebchannelSessionRoute } from "./session-route.js";
+import { recent as historyRecent } from "./history.js";
 import {
   MAX_COALESCED_MEMBER_ID_LENGTH,
   normalizeInboundUserMessage,
@@ -118,6 +121,12 @@ function makeFakeApi(params: {
    * and `history.recent` yields [] (no keyframe sent).
    */
   sessionMessages?: unknown[];
+  /**
+   * #173: invoked at the start of every `getSessionMessages` read. Throwing
+   * models the gateway rejecting `sessions.get` for the caller's ambient
+   * operator client — the failure mode `runDetachedHistoryRead` exists to avoid.
+   */
+  onSessionMessagesRead?: () => void;
 }): {
   api: OpenClawPluginApi;
   captured: { buildContext?: BuildContextParams };
@@ -181,7 +190,10 @@ function makeFakeApi(params: {
 
   const subagent = params.sessionMessages
     ? {
-        getSessionMessages: async () => ({ messages: params.sessionMessages }),
+        getSessionMessages: async () => {
+          params.onSessionMessagesRead?.();
+          return { messages: params.sessionMessages };
+        },
       }
     : undefined;
 
@@ -1896,6 +1908,31 @@ describe("#173 keyframe resync — signature detection", () => {
     expect(isResyncKeyframeRequired(state)).toBe(false);
   });
 
+  it("does NOT count a final the controller refused to send", async () => {
+    // `finalize` returns false on the re-entrant-settle, already-settled and
+    // empty-text paths: nothing reached the wire and no lane was overwritten,
+    // so that payload is not part of the signature at all.
+    const finalize = vi.fn(async () => false);
+    const draft = {
+      finalize,
+      deliverIndependentFinal: vi.fn(async () => true),
+      noteLeadingTerminalError: vi.fn(),
+    } as unknown as ProgressDraftController;
+    const state = freshState();
+
+    const first = await deliverDraftFinalPayload(draft, { text: "A" }, "A", state);
+    expect(first.sent).toBe(false);
+    expect(state.ordinaryNonErrorFinalCount).toBe(0);
+    expect(state.firstOrdinaryNonErrorFinalNonIndependent).toBe(false);
+
+    // The next ordinary final is the first one actually DELIVERED — and it goes
+    // out independent (the lane is spent), so there is no overwrite to repair.
+    await deliverDraftFinalPayload(draft, { text: "B" }, "B", state);
+    expect(state.ordinaryNonErrorFinalCount).toBe(1);
+    expect(state.firstOrdinaryNonErrorFinalNonIndependent).toBe(false);
+    expect(isResyncKeyframeRequired(state)).toBe(false);
+  });
+
   it("does NOT set the flag for notice-only finals", async () => {
     const { draft } = makeDraft();
     const state = freshState();
@@ -1927,9 +1964,11 @@ describe("handleInboundMessage — #173 keyframe resync at settlement", () => {
   const ordinary = { type: "user_message" as const, text: "do the thing" };
 
   const twoOrdinaryFinals = async (turn: AssembledTurnLike) => {
-    // Tool-only turn: two ordinary non-error finals. In partial mode the first
-    // routes through finalize (overwrites the live answer bubble), the second
-    // delivers independent → the LIVE view is [A,A,B].
+    // Tool-only turn: answer text streams first (that live bubble is what the
+    // overwrite destroys), then two ordinary non-error finals. In partial mode
+    // the first routes through finalize (overwrites the streamed bubble), the
+    // second delivers independent → the LIVE view is [A,A,B].
+    turn.replyOptions?.onPartialReply?.({ text: "first ans" });
     await turn.delivery.deliver({ text: "first answer" }, { kind: "final" });
     await turn.delivery.deliver({ text: "second answer" }, { kind: "final" });
   };
@@ -1973,6 +2012,7 @@ describe("handleInboundMessage — #173 keyframe resync at settlement", () => {
       streamingMode: "partial",
       sessionMessages: [{ role: "assistant", text: "only answer", __openclaw: { id: "A" } }],
       runImpl: async (turn) => {
+        turn.replyOptions?.onPartialReply?.({ text: "only ans" });
         await turn.delivery.deliver({ text: "only answer" }, { kind: "final" });
       },
     });
@@ -1981,6 +2021,80 @@ describe("handleInboundMessage — #173 keyframe resync at settlement", () => {
     await handleInboundMessage(api, transport, "peer-1", ordinary);
 
     expect(keyframes).toHaveLength(0);
+  });
+
+  it("does NOT emit a keyframe in partial mode when NO answer text ever streamed", async () => {
+    // Partial mode is only the PERMISSION to stream answer text; a provider that
+    // emitted none (tool lines only) left no live answer bubble, so the same two
+    // finals render [A,B] correctly and a keyframe would be a pure false
+    // positive — an unnecessary full replace that truncates scrollback.
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "first answer" }, { kind: "final" });
+        await turn.delivery.deliver({ text: "second answer" }, { kind: "final" });
+      },
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(0);
+  });
+
+  it("does NOT emit a keyframe when the first ordinary final was never actually sent", async () => {
+    // The controller refuses the finalize (here: its terminal frame fails to
+    // leave), so no lane was overwritten — the second final is simply the first
+    // one the reader saw. The signature must follow the DELIVERY, not the
+    // payload sequence.
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: twoOrdinaryFinals,
+    });
+    const { transport, keyframes } = makeFakeTransport();
+    transport.finalizeDraft = () => false;
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(0);
+  });
+
+  it("reads the transcript in a DETACHED async scope, so the inbound request scope cannot reject it", async () => {
+    // Models the gateway seam this workaround exists for: `sessions.get`
+    // authorizes against whatever operator client is ambient in the CALLING
+    // context, and the inbound dispatch's client has no `operator.read`. The
+    // read must therefore run in the module-level detached scope, where no
+    // request client is ambient at all.
+    const ambientOperatorClient = new AsyncLocalStorage<{ scopes: readonly string[] }>();
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: twoOrdinaryFinals,
+      onSessionMessagesRead: () => {
+        const client = ambientOperatorClient.getStore();
+        if (client && !client.scopes.includes("operator.read")) {
+          throw new Error("missing scope: operator.read");
+        }
+      },
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await ambientOperatorClient.run({ scopes: [] }, async () => {
+      await handleInboundMessage(api, transport, "peer-1", ordinary);
+    });
+
+    expect(keyframes).toHaveLength(1);
+    expect(keyframes[0].messages.map((m) => m.id)).toEqual(["A", "B"]);
+
+    // Control — proves the rejection above is real and this test can fail: the
+    // SAME read made directly from that scope is rejected, and `history.recent`
+    // swallows the rejection into `[]` (which would silently skip the keyframe).
+    const undetached = await ambientOperatorClient.run({ scopes: [] }, () =>
+      historyRecent(api, "agent:agent1:seed", 50, api.logger),
+    );
+    expect(undetached).toEqual([]);
   });
 });
 

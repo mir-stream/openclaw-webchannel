@@ -1,3 +1,5 @@
+import { AsyncResource } from "node:async_hooks";
+
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 import { sanitizeHistoryText } from "./history-sanitize.js";
@@ -225,6 +227,39 @@ function normalizeAll(
   }
   return out;
 }
+
+/**
+ * Detached async-context for history self-reads.
+ *
+ * History hydration calls `api.runtime.subagent.getSessionMessages`, which
+ * dispatches the gateway `sessions.get` method — and that method authorizes
+ * against whatever operator client is ambient in the current gateway-request
+ * scope. The initial-snapshot read happens inside the register-request handler,
+ * whose ambient client is the plugin-auth client (no `operator.read`), so the
+ * dispatch is rejected with `missing scope: operator.read` and history silently
+ * degrades to `[]`.
+ *
+ * openclaw's own `deleteSession` sidesteps this by forcing a synthetic operator
+ * client, but `getSessionMessages` exposes no such option to plugins. The one
+ * lever a plugin has is the *calling context*: with NO ambient scoped client the
+ * dispatcher falls through to a synthetic `operator.write` client (which implies
+ * `operator.read`) and the read succeeds.
+ *
+ * This `AsyncResource` is constructed at module-evaluation time — before any
+ * request scope can exist — so `runInAsyncScope` re-establishes that clean,
+ * client-less context. Running the history read inside it escapes the request's
+ * restricted client without touching openclaw core. See `docs/DEMO_PLAN.md`.
+ *
+ * EVERY history self-read must go through this, not just the register-time
+ * snapshot and `load_history` paging: the #173 settlement keyframe reads the
+ * transcript from inside the inbound NATS dispatch request scope, which is a
+ * restricted-client scope for exactly the same reason. Without the detour that
+ * read is rejected, `recent` swallows the rejection and returns `[]`, and the
+ * keyframe is silently never sent.
+ */
+const historyReadScope = new AsyncResource("webchannel:history-read");
+export const runDetachedHistoryRead = <T>(fn: () => Promise<T>): Promise<T> =>
+  historyReadScope.runInAsyncScope(fn);
 
 /**
  * Inner store call. Uses the SDK's `runtime.subagent.getSessionMessages` —

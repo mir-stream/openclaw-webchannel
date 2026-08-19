@@ -21,7 +21,11 @@ import { resolveWebchannelSessionRoute } from "./session-route.js";
 // #173: the keyframe re-uses the history projection path (transcript read +
 // normalization) so a settlement-time resync renders exactly what a fresh
 // reload would — no new transcript reader.
-import { recent as historyRecent, resolveHistoryConfig } from "./history.js";
+import {
+  recent as historyRecent,
+  resolveHistoryConfig,
+  runDetachedHistoryRead,
+} from "./history.js";
 import {
   hasExplicitSessionReasoningOptOut,
   type ReasoningOptOutStoreAccess,
@@ -538,11 +542,16 @@ export type FinalReconciliationState = {
   // that shape — a first ordinary non-error final delivered non-independent,
   // followed by at least one more ordinary non-error final — and emit a
   // keyframe resync. Deliberately NO text/body comparison: the routing shape is
-  // the whole signal.
-  /** Count of ordinary (non-notice, non-error) finals delivered this turn. */
+  // the whole signal. Both count only finals whose send actually SUCCEEDED — a
+  // final the controller refused (already settled, re-entrant, empty text) put
+  // nothing on the wire and overwrote no lane.
+  /** Count of ordinary (non-notice, non-error) finals this turn actually
+   * DELIVERED (the send reported success). */
   ordinaryNonErrorFinalCount: number;
-  /** Was the FIRST ordinary non-error final delivered via the finalize
-   * (non-independent) path — i.e. did it consume/overwrite the live lane. */
+  /** Did the first ordinary non-error final that was actually DELIVERED take the
+   * finalize (non-independent) path — i.e. did it consume/overwrite the live
+   * lane. Finals that were refused by the controller are not candidates: they
+   * rendered nothing, so the next delivered one is the true first. */
   firstOrdinaryNonErrorFinalNonIndependent: boolean;
 };
 
@@ -598,21 +607,27 @@ export async function deliverDraftFinalPayload(
     state.leadingTerminalErrorSeen ||
     state.ordinaryAnswerFinalSeen;
   if (!independent) state.ordinaryAnswerFinalSeen = true;
+  const sent = independent
+    ? await draft.deliverIndependentFinal({ text, ...noticeFlagsOf(payload) })
+    : await draft.finalize(text);
   // #173: an ordinary non-error final is exactly the payload class that consumes
   // the current lane on its FIRST occurrence (the finalize path). Record the
   // routing of the first one and count them, so settlement can recognise the
   // tool-only-turn overwrite signature ([A,A,B] live) without any text compare.
+  //
+  // Recorded AFTER the send and only when it reported success: `finalize`
+  // returns false on the re-entrant-settle, already-settled and empty-text
+  // paths, and `deliverIndependentFinal` on a failed transport send. Nothing
+  // was rendered in those cases and no lane was overwritten, so counting them
+  // would manufacture the signature for a turn the reader saw correctly.
   const isOrdinaryNonErrorFinal =
     !isCoreNoticePayload(payload) && payload.isError !== true;
-  if (isOrdinaryNonErrorFinal) {
+  if (isOrdinaryNonErrorFinal && sent) {
     if (state.ordinaryNonErrorFinalCount === 0) {
       state.firstOrdinaryNonErrorFinalNonIndependent = independent === false;
     }
     state.ordinaryNonErrorFinalCount += 1;
   }
-  const sent = independent
-    ? await draft.deliverIndependentFinal({ text, ...noticeFlagsOf(payload) })
-    : await draft.finalize(text);
   return { sent, independent };
 }
 
@@ -949,12 +964,15 @@ export async function handleInboundMessage(
   // read.
   let settlementSessionKey: string | undefined;
   let settlementHistoryLimit: number | undefined;
-  // #173: was ANSWER-TEXT streaming on this turn (partial mode)? The overwrite
-  // glitch is reachable ONLY then — that is the only mode with a live answer
-  // bubble to overwrite. In "progress"/"off"/"block" no answer bubble streams,
-  // so two ordinary finals render [A,B] correctly and a keyframe would be a pure
-  // false-positive (an unnecessary full replace that also truncates paginated
-  // scrollback to the history window). Default false.
+  // #173: did answer TEXT actually stream on this turn? An OBSERVATION, not the
+  // config decision — set from the `onPartialReply` handler, which is wired in
+  // partial mode only. The overwrite glitch needs a live answer bubble to
+  // overwrite, and only a delivered answer partial creates one. Modes that never
+  // stream answer text ("progress"/"off"/"block") therefore never set it, and
+  // neither does a PARTIAL-mode turn whose provider emitted no answer partials
+  // (tool lines only): both render two ordinary finals as [A,B] correctly, so a
+  // keyframe there is a pure false positive (an unnecessary full replace that
+  // also truncates paginated scrollback to the history window).
   let settlementAnswerStreamed = false;
 
   /** The last agent run this turn owns, learned from `onAgentRunStart`. */
@@ -1074,8 +1092,6 @@ export async function handleInboundMessage(
   const draftEnabled =
     (streamingMode === "progress" || streamingMode === "partial") && !controlLane;
   const answerStreamingEnabled = streamingMode === "partial";
-  // #173: expose the partial-mode decision to the settlement `finally`.
-  settlementAnswerStreamed = answerStreamingEnabled;
   if (draftEnabled) {
     draft = createProgressDraftController({
       transport,
@@ -1406,6 +1422,11 @@ export async function handleInboundMessage(
                           ...(answerStreamingEnabled
                             ? {
                                 onPartialReply: (p) => {
+                                  // #173: the settlement keyframe's precondition
+                                  // — an answer bubble the finalize path can
+                                  // overwrite exists only once answer text has
+                                  // actually streamed.
+                                  settlementAnswerStreamed = true;
                                   draft!.pushAnswerText({
                                     text: p.text,
                                     delta: p.delta,
@@ -1867,25 +1888,42 @@ export async function handleInboundMessage(
     // path — the corrupt delivery still happened; the keyframe corrects the
     // rendered result after settlement.
     //
-    // Gated on `settlementAnswerStreamed` (partial mode): the glitch needs a
-    // live answer bubble to overwrite, which only that mode produces. In every
-    // other mode two ordinary finals render [A,B] correctly, so a keyframe there
-    // would be a false-positive full replace that also truncates scrollback.
+    // Gated on `settlementAnswerStreamed`: the glitch needs a live answer bubble
+    // to overwrite, and only an answer partial that actually streamed produces
+    // one. Without one — a non-partial mode, or a partial-mode turn the provider
+    // streamed no answer text on — two ordinary finals render [A,B] correctly,
+    // so a keyframe there would be a false-positive full replace that also
+    // truncates scrollback.
+    //
+    // Read into consts so the `undefined` checks still narrow inside the
+    // detached-scope callback below (a captured `let` would widen again).
+    const keyframeSessionKey = settlementSessionKey;
+    const keyframeHistoryLimit = settlementHistoryLimit;
     if (
       settlementAnswerStreamed &&
       isResyncKeyframeRequired(finalReconciliation) &&
-      settlementSessionKey !== undefined &&
-      settlementHistoryLimit !== undefined
+      keyframeSessionKey !== undefined &&
+      keyframeHistoryLimit !== undefined
     ) {
+      // `runDetachedHistoryRead` is MANDATORY here, not decoration: this runs
+      // inside the inbound dispatch request scope, whose ambient operator client
+      // lacks `operator.read`, so an undetached `sessions.get` is rejected —
+      // and `historyRecent` swallows that rejection (best-effort contract), so
+      // the failure would surface only as a keyframe that never arrives.
+      //
       // `historyRecent` catches its own store errors and returns [] (best-effort,
       // matching the register-time snapshot). An empty read would REPLACE the
       // client with nothing and wipe good bubbles, so the keyframe is sent ONLY
       // when the projection actually yielded rows.
-      const messages = await historyRecent(
-        api,
-        settlementSessionKey,
-        settlementHistoryLimit,
-        api.logger,
+      //
+      // AWAITED ON PURPOSE — do not detach this. Awaiting inside `finally`
+      // holds the per-session FIFO (`inbound-queue.ts`) until the keyframe is on
+      // the wire, so the NEXT turn cannot begin streaming before it lands. That
+      // ordering is what keeps #199 unreachable: a keyframe overtaken by the
+      // next turn would wipe that turn's live `working:true` draft, flip the
+      // client's `turnInFlight()` and release P1-9 held sends mid-turn.
+      const messages = await runDetachedHistoryRead(() =>
+        historyRecent(api, keyframeSessionKey, keyframeHistoryLimit, api.logger),
       );
       if (messages.length > 0) {
         let delivered = false;
