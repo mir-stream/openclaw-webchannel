@@ -15,6 +15,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 import {
   deliverDraftFinalPayload,
   handleInboundMessage as handleInboundMessageForServingTenant,
+  isResyncKeyframeRequired,
   startAgentLifecycleSubscription,
   stopAgentLifecycleSubscription,
   type FinalReconciliationState,
@@ -111,6 +112,12 @@ function makeFakeApi(params: {
   withAgentEvents?: boolean;
   /** Extra `channels.webchannel` keys, e.g. the DM allowlist (#99 denial case). */
   channelConfig?: Record<string, unknown>;
+  /**
+   * #173: the raw transcript rows `runtime.subagent.getSessionMessages` returns,
+   * so a settlement keyframe has something to read. Omitted → no subagent seam,
+   * and `history.recent` yields [] (no keyframe sent).
+   */
+  sessionMessages?: unknown[];
 }): {
   api: OpenClawPluginApi;
   captured: { buildContext?: BuildContextParams };
@@ -172,10 +179,16 @@ function makeFakeApi(params: {
       }
     : undefined;
 
+  const subagent = params.sessionMessages
+    ? {
+        getSessionMessages: async () => ({ messages: params.sessionMessages }),
+      }
+    : undefined;
+
   const api = {
     config,
     logger: { info: () => {}, warn: () => {}, error: () => {} },
-    runtime: { channel, ...(events ? { events } : {}) },
+    runtime: { channel, ...(events ? { events } : {}), ...(subagent ? { subagent } : {}) },
   } as unknown as OpenClawPluginApi;
 
   const emitLifecycle = (evt: LifecycleEvent): void => {
@@ -211,6 +224,11 @@ function makeFakeTransport(options?: {
   settles: Array<"ok" | "error">;
   /** #99: the full settle frames, in emission order — turnId matters per member. */
   settleFrames: Array<{ turnId: string; outcome: "ok" | "error" }>;
+  /** #173: authoritative-replace keyframe frames, in emission order. */
+  keyframes: Array<{
+    peerId: string;
+    messages: Array<{ id: string; role: string; text: string; ts?: number }>;
+  }>;
 } {
   const finalizes: Array<{
     id: string;
@@ -222,6 +240,10 @@ function makeFakeTransport(options?: {
   const typing: string[] = [];
   const settles: Array<"ok" | "error"> = [];
   const settleFrames: Array<{ turnId: string; outcome: "ok" | "error" }> = [];
+  const keyframes: Array<{
+    peerId: string;
+    messages: Array<{ id: string; role: string; text: string; ts?: number }>;
+  }> = [];
   const toolActivities: Array<{
     sessionKey: string;
     id: string;
@@ -293,11 +315,18 @@ function makeFakeTransport(options?: {
       return true;
     },
     sendHistory: () => true,
+    sendKeyframe: (
+      peerId: string,
+      messages: Array<{ id: string; role: string; text: string; ts?: number }>,
+    ) => {
+      keyframes.push({ peerId, messages });
+      return true;
+    },
     sendApprovalRequest: () => true,
     sendApprovalResolved: () => true,
     sendApprovalSnapshot: () => true,
   } as WebChannelPeerChannel;
-  return { transport, finalizes, texts, progress, toolActivities, typing, settles, settleFrames };
+  return { transport, finalizes, texts, progress, toolActivities, typing, settles, settleFrames, keyframes };
 }
 
 const userMessage = { type: "user_message" as const, text: "/stop" };
@@ -1721,22 +1750,42 @@ describe("deliverDraftFinalPayload — independent routing policy", () => {
     {
       reason: "isNotice",
       payload: { text: "notice", isFallbackNotice: true },
-      state: { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: false },
+      state: {
+        leadingTerminalErrorSeen: false,
+        ordinaryAnswerFinalSeen: false,
+        ordinaryNonErrorFinalCount: 0,
+        firstOrdinaryNonErrorFinalNonIndependent: false,
+      },
     },
     {
       reason: "payload.isError",
       payload: { text: WARNING_SENTINEL, isError: true },
-      state: { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: false },
+      state: {
+        leadingTerminalErrorSeen: false,
+        ordinaryAnswerFinalSeen: false,
+        ordinaryNonErrorFinalCount: 0,
+        firstOrdinaryNonErrorFinalNonIndependent: false,
+      },
     },
     {
       reason: "leadingTerminalErrorSeen",
       payload: { text: "retained answer" },
-      state: { leadingTerminalErrorSeen: true, ordinaryAnswerFinalSeen: false },
+      state: {
+        leadingTerminalErrorSeen: true,
+        ordinaryAnswerFinalSeen: false,
+        ordinaryNonErrorFinalCount: 0,
+        firstOrdinaryNonErrorFinalNonIndependent: false,
+      },
     },
     {
       reason: "ordinaryAnswerFinalSeen",
       payload: { text: "extra answer" },
-      state: { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: true },
+      state: {
+        leadingTerminalErrorSeen: false,
+        ordinaryAnswerFinalSeen: true,
+        ordinaryNonErrorFinalCount: 1,
+        firstOrdinaryNonErrorFinalNonIndependent: true,
+      },
     },
   ] satisfies Array<{
     reason: string;
@@ -1762,6 +1811,8 @@ describe("deliverDraftFinalPayload — independent routing policy", () => {
     const state: FinalReconciliationState = {
       leadingTerminalErrorSeen: false,
       ordinaryAnswerFinalSeen: false,
+      ordinaryNonErrorFinalCount: 0,
+      firstOrdinaryNonErrorFinalNonIndependent: false,
     };
 
     await deliverDraftFinalPayload(
@@ -1773,6 +1824,163 @@ describe("deliverDraftFinalPayload — independent routing policy", () => {
 
     expect(state.leadingTerminalErrorSeen).toBe(true);
     expect(h.noteLeadingTerminalError).toHaveBeenCalledOnce();
+  });
+});
+
+/**
+ * #173 — the tool-only-turn overwrite SIGNATURE.
+ *
+ * When the last assistant message of a turn is tool-only, core emits >=2
+ * ordinary non-error finals [A,B]; the first routes through `draft.finalize`
+ * (non-independent) and overwrites the live lane's streamed bubble, so the LIVE
+ * view renders [A,A,B]. The signature is exactly that routing shape — a first
+ * ordinary non-error final delivered non-independent, followed by at least one
+ * more ordinary non-error final — with NO text/body comparison. Anything else
+ * (single final, leading terminal error, notices) must not trip it.
+ */
+describe("#173 keyframe resync — signature detection", () => {
+  const makeDraft = () => {
+    const finalize = vi.fn(async () => true);
+    const deliverIndependentFinal = vi.fn(async () => true);
+    const noteLeadingTerminalError = vi.fn();
+    const draft = {
+      finalize,
+      deliverIndependentFinal,
+      noteLeadingTerminalError,
+    } as unknown as ProgressDraftController;
+    return { draft };
+  };
+  const freshState = (): FinalReconciliationState => ({
+    ordinaryAnswerFinalSeen: false,
+    leadingTerminalErrorSeen: false,
+    ordinaryNonErrorFinalCount: 0,
+    firstOrdinaryNonErrorFinalNonIndependent: false,
+  });
+
+  it("sets the flag ONLY once a SECOND ordinary final follows a non-independent first", async () => {
+    const { draft } = makeDraft();
+    const state = freshState();
+
+    await deliverDraftFinalPayload(draft, { text: "A" }, "A", state);
+    // First ordinary final took the finalize (overwrite) path, but one final
+    // alone is not the [A,A,B] signature yet.
+    expect(state.firstOrdinaryNonErrorFinalNonIndependent).toBe(true);
+    expect(isResyncKeyframeRequired(state)).toBe(false);
+
+    await deliverDraftFinalPayload(draft, { text: "B" }, "B", state);
+    expect(state.ordinaryNonErrorFinalCount).toBe(2);
+    expect(isResyncKeyframeRequired(state)).toBe(true);
+  });
+
+  it("does NOT set the flag for a single ordinary final turn", async () => {
+    const { draft } = makeDraft();
+    const state = freshState();
+
+    await deliverDraftFinalPayload(draft, { text: "A" }, "A", state);
+
+    expect(isResyncKeyframeRequired(state)).toBe(false);
+  });
+
+  it("does NOT set the flag for a leading terminal error then ordinary finals", async () => {
+    const { draft } = makeDraft();
+    const state = freshState();
+
+    // A leading terminal error makes EVERY later ordinary final independent, so
+    // the first ordinary final never takes the overwrite path.
+    await deliverDraftFinalPayload(draft, { text: "boom", isError: true }, "boom", state);
+    await deliverDraftFinalPayload(draft, { text: "A" }, "A", state);
+    await deliverDraftFinalPayload(draft, { text: "B" }, "B", state);
+
+    expect(state.ordinaryNonErrorFinalCount).toBe(2);
+    expect(state.firstOrdinaryNonErrorFinalNonIndependent).toBe(false);
+    expect(isResyncKeyframeRequired(state)).toBe(false);
+  });
+
+  it("does NOT set the flag for notice-only finals", async () => {
+    const { draft } = makeDraft();
+    const state = freshState();
+
+    await deliverDraftFinalPayload(
+      draft,
+      { text: "status", isStatusNotice: true },
+      "status",
+      state,
+    );
+    await deliverDraftFinalPayload(
+      draft,
+      { text: "fallback", isFallbackNotice: true },
+      "fallback",
+      state,
+    );
+
+    expect(state.ordinaryNonErrorFinalCount).toBe(0);
+    expect(isResyncKeyframeRequired(state)).toBe(false);
+  });
+});
+
+/**
+ * #173 — the keyframe is emitted at settlement IFF the signature fired, and it
+ * carries the transcript projection (the same read the register-time history
+ * snapshot uses), so the client can re-establish ground truth.
+ */
+describe("handleInboundMessage — #173 keyframe resync at settlement", () => {
+  const ordinary = { type: "user_message" as const, text: "do the thing" };
+
+  const twoOrdinaryFinals = async (turn: AssembledTurnLike) => {
+    // Tool-only turn: two ordinary non-error finals. In partial mode the first
+    // routes through finalize (overwrites the live answer bubble), the second
+    // delivers independent → the LIVE view is [A,A,B].
+    await turn.delivery.deliver({ text: "first answer" }, { kind: "final" });
+    await turn.delivery.deliver({ text: "second answer" }, { kind: "final" });
+  };
+  const transcriptRows = [
+    { role: "assistant", text: "first answer", __openclaw: { id: "A" } },
+    { role: "assistant", text: "second answer", __openclaw: { id: "B" } },
+  ];
+
+  it("emits a keyframe carrying the transcript for the overwrite signature (partial mode)", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: twoOrdinaryFinals,
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(1);
+    expect(keyframes[0].peerId).toBe("peer-1");
+    expect(keyframes[0].messages.map((m) => m.id)).toEqual(["A", "B"]);
+  });
+
+  it("does NOT emit a keyframe for the SAME two finals in progress mode (no live answer bubble to overwrite)", async () => {
+    // `progress` mode never streams answer text, so [A,A,B] cannot occur and the
+    // signature — though it still fires on the routing shape — must not resync.
+    const { api } = makeFakeApi({
+      streamingMode: "progress",
+      sessionMessages: transcriptRows,
+      runImpl: twoOrdinaryFinals,
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(0);
+  });
+
+  it("does NOT emit a keyframe for a single-final turn", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: [{ role: "assistant", text: "only answer", __openclaw: { id: "A" } }],
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "only answer" }, { kind: "final" });
+      },
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(0);
   });
 });
 
