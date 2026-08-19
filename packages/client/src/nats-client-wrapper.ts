@@ -2229,7 +2229,7 @@ export class WebChannelNATSClient {
         const keptPrefix = anchor > 0 ? this.state.messages.slice(0, anchor) : [];
 
         // PRESERVE, from the COVERED region only, user bubbles the keyframe's
-        // source transcript cannot account for. Two disjoint reasons, each
+        // source transcript cannot account for. Three disjoint reasons, each
         // decided from this client's own records — never from message text or
         // position, and never by matching a bubble to a row.
         //
@@ -2252,6 +2252,34 @@ export class WebChannelNATSClient {
         //      Receipts are never deleted, so the lookup is safe; a bubble with
         //      no receipt (server-hydrated, or an agent row) is not ours to keep.
         //
+        //  (c) A send that FAILED. A failure is this client's record that the
+        //      send did not become transcript material: rejected at ingress
+        //      (`overloaded`), never published on a retired/failed connection
+        //      (`closed`, `terminal`), dropped from our own unacked ledger
+        //      (`evicted`), or cancelled (`cancelled`). The keyframe's source
+        //      transcript therefore cannot carry the row, and dropping the
+        //      bubble would delete the user's typed text together with the
+        //      failure/retry affordance it is attached to.
+        //      `turn-failed` is the SINGLE exclusion, and the ground for
+        //      excluding it is WHERE THE REASON COMES FROM, not which word it
+        //      is: it is the one reason produced BY a settle
+        //      (`turn_settled{outcome:"error"}`), so the turn provably ran and
+        //      the transcript provably has the row — preserving it would
+        //      double-render. Do not extend this exclusion by listing more
+        //      reasons; a reason belongs here only if a settle is what emits it.
+        //      `settlementEligible` is deliberately NOT consulted on this
+        //      branch. A #96 control-lane send is `settlementEligible: false`,
+        //      but a FAILED one was never delivered either, so it must be kept;
+        //      that discriminator answers "not run yet vs. never settles" among
+        //      UN-failed published sends, which is a different question.
+        //
+        // ACCEPTED RESIDUAL RISK: `overloaded` can also come back for a message
+        // the agent had ALREADY admitted — the live-retry of an unacked id whose
+        // accepted-marker was evicted, documented in full on the `turnClosed`
+        // hook above. In that rare case the transcript DOES carry the row and
+        // the bubble preserved by (c) is a permanent duplicate. Accepted for the
+        // same reason the rest of this predicate errs toward keeping (below).
+        //
         // ACCEPTED RESIDUAL RISK: if the `turn_settled` frame for a coalesced
         // member is lost, that eligible send stays at `accepted` (see
         // `promoteAnchor` and the `turn_settled` reducer, both of which describe
@@ -2265,13 +2293,14 @@ export class WebChannelNATSClient {
         const preserved = covered.filter((m) => {
           if (m.role !== "user") return false;
           if (m.pending === true || m.retracted === true) return true;
+          // No receipt → server-hydrated, not ours to keep. Ahead of (c): a
+          // bubble we have no record of publishing cannot claim a failure.
+          if (m.receiptKey === undefined) return false;
+          if (m.sendState === "failed") return m.sendFailure?.reason !== "turn-failed";
           if (m.sendState !== "queued" && m.sendState !== "sent" && m.sendState !== "accepted") {
             return false;
           }
-          return (
-            m.receiptKey !== undefined
-            && this.receipts.get(m.receiptKey)?.settlementEligible === true
-          );
+          return this.receipts.get(m.receiptKey)?.settlementEligible === true;
         });
 
         // Idempotent: re-applying the same keyframe re-finds the anchor at the

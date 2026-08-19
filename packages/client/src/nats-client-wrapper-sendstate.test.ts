@@ -2083,6 +2083,119 @@ describe("#173 — a keyframe must not delete an already-transmitted send", () =
     expect(after.map((m) => m.id)).toEqual(["core-0", "core-1", "core-A"]);
     h.wrapper.close();
   });
+
+  // A FAILED send is normally absent from the transcript — an `inbound_rejected`
+  // under retained-work pressure never reached a turn at all — so the keyframe
+  // cannot account for it and dropping it would delete the user's typed text
+  // along with the retry affordance.
+  const rejectedSetup = async (): Promise<{
+    h: Setup;
+    rejected: ChatMessage;
+    rows: Record<string, unknown>[];
+  }> => {
+    const h = await connectWrapper();
+    // An older row, so the keyframe below anchors instead of full-replacing.
+    deliverOut(h.K, {
+      type: "history",
+      messages: [{ id: "core-0", role: "agent", text: "earlier", ts: 0 }],
+    });
+    await settle();
+    h.wrapper.send("over capacity");
+    await settle();
+    const sent = userBubble(h.wrapper, "over capacity")!;
+    expect(sent.sendState).toBe("accepted");
+
+    // Ingress rejects it: this send never became transcript material.
+    deliverOut(h.K, { type: "inbound_rejected", ids: [sent.wireId!], reason: "overloaded" });
+    await settle();
+    const rejected = userBubble(h.wrapper, "over capacity")!;
+    expect(rejected.sendState).toBe("failed");
+    expect(rejected.sendFailure?.reason).toBe("overloaded");
+
+    // The covering keyframe — anchored on the rendered row, and (correctly)
+    // carrying no row for the rejected text.
+    const rows = [
+      { id: "core-0", role: "agent", text: "earlier", ts: 0 },
+      { id: "core-1", role: "user", text: "a later message", ts: 1 },
+      { id: "core-A", role: "agent", text: "reply", ts: 2 },
+    ];
+    return { h, rejected, rows };
+  };
+
+  it("keeps a send the agent rejected at ingress — the transcript cannot carry it", async () => {
+    const { h, rejected, rows } = await rejectedSetup();
+    deliverOut(h.K, { type: "keyframe", messages: rows });
+    await settle();
+
+    const after = h.wrapper.getState().messages;
+    expect(after.map((m) => `${m.role}:${m.text}`)).toEqual([
+      "agent:earlier",
+      "user:a later message",
+      "agent:reply",
+      "user:over capacity",
+    ]);
+    const tail = after[after.length - 1];
+    expect(tail.id).toBe(rejected.id);
+    expect(tail.text).toBe("over capacity");
+    expect(tail.sendState).toBe("failed");
+    expect(tail.sendFailure?.reason).toBe("overloaded"); // retry affordance intact
+    h.wrapper.close();
+  });
+
+  // The UPPER bound of the (c) branch: `turn-failed` is the one failure reason
+  // produced BY a settle, so its turn provably ran and the keyframe owns the row.
+  // Without this, keeping every failure unconditionally would go unnoticed.
+  it("does not re-append a turn-failed send — its turn ran, so the keyframe owns it", async () => {
+    const h = await connectWrapper();
+    // An older row, so the keyframe below anchors instead of full-replacing.
+    deliverOut(h.K, {
+      type: "history",
+      messages: [{ id: "core-0", role: "agent", text: "earlier", ts: 0 }],
+    });
+    await settle();
+    h.wrapper.send("first question");
+    await settle();
+    const sent = userBubble(h.wrapper, "first question")!;
+    expect(sent.sendState).toBe("accepted");
+
+    // ITS turn was admitted, ran, and settled with an error.
+    deliverOut(h.K, { type: "turn_settled", turnId: sent.wireId!, outcome: "error" });
+    await settle();
+    const failed = userBubble(h.wrapper, "first question")!;
+    expect(failed.sendState).toBe("failed");
+    expect(failed.sendFailure?.reason).toBe("turn-failed");
+
+    // …so the keyframe DOES carry it as a canonical row.
+    deliverOut(h.K, {
+      type: "keyframe",
+      messages: [
+        { id: "core-0", role: "agent", text: "earlier", ts: 0 },
+        { id: "core-1", role: "user", text: "first question", ts: 1 },
+        { id: "core-A", role: "agent", text: "sorry, that failed", ts: 2 },
+      ],
+    });
+    await settle();
+
+    const after = h.wrapper.getState().messages;
+    expect(after.filter((m) => m.text === "first question")).toHaveLength(1);
+    expect(after.map((m) => m.id)).toEqual(["core-0", "core-1", "core-A"]);
+    h.wrapper.close();
+  });
+
+  // A preserved failure must not accumulate: re-applying the same keyframe
+  // re-derives the identical array.
+  it("keeps the rejected send exactly once across a repeated keyframe", async () => {
+    const { h, rejected, rows } = await rejectedSetup();
+    deliverOut(h.K, { type: "keyframe", messages: rows });
+    await settle();
+    deliverOut(h.K, { type: "keyframe", messages: rows });
+    await settle();
+
+    const after = h.wrapper.getState().messages;
+    expect(after.filter((m) => m.text === "over capacity")).toHaveLength(1);
+    expect(after.map((m) => m.id)).toEqual(["core-0", "core-1", "core-A", rejected.id]);
+    h.wrapper.close();
+  });
 });
 
 // ---------------------------------------------------------------------------
