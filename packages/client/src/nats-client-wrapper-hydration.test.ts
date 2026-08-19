@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
 
@@ -294,6 +294,9 @@ describe("#173 WP — keyframe is an authoritative replace", () => {
 
   it("a keyframe [A,B] over a live [A,A,B] yields [A,B] — the extra bubble is gone", () => {
     const w = makeWrapper();
+    // Live ids never match transcript ids, so these fixtures take the anchorless
+    // full-replace path and log; absorb it (that fallback has its own test below).
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     seedCorruptLiveView(w);
 
     deliver(w, keyframe(...KEYFRAME_ROWS));
@@ -303,9 +306,11 @@ describe("#173 WP — keyframe is an authoritative replace", () => {
     const messages = w.getState().messages;
     expect(messages.map((m) => m.id)).toEqual(["A", "B"]);
     expect(messages.every((m) => m.working === false)).toBe(true);
+    warn.mockRestore();
   });
 
   it("ordering and content equal a fresh reload of the same rows", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const live = makeWrapper();
     seedCorruptLiveView(live);
     deliver(live, keyframe(...KEYFRAME_ROWS));
@@ -318,6 +323,7 @@ describe("#173 WP — keyframe is an authoritative replace", () => {
     expect(live.getState().messages.map((m) => m.id)).toEqual(
       cold.getState().messages.map((m) => m.id),
     );
+    warn.mockRestore();
   });
 
   it("preserves paginated older scrollback outside the keyframe window", () => {
@@ -373,25 +379,130 @@ describe("#173 WP — keyframe is an authoritative replace", () => {
     ]);
   });
 
+  /**
+   * ACCEPTED, not desired: with no anchor there is no boundary to splice at, so
+   * the replace is total — paginated scrollback included. The test carries a real
+   * multi-page backlog rather than one stale bubble so the cost is visible: this
+   * is a scroll-back reset, equivalent to what a reload would show, and it is why
+   * the reducer logs when it happens.
+   */
   it("falls back to a full replace when the keyframe's oldest id is absent (no overlap)", () => {
     const w = makeWrapper();
-    // A live bubble whose id the keyframe does not cover.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Two pages of older conversation the user scrolled back to load…
+    deliver(
+      w,
+      history(
+        { id: "p2-1", role: "user", text: "q3", ts: 5 },
+        { id: "p2-2", role: "agent", text: "r3", ts: 6 },
+      ),
+    );
+    deliver(
+      w,
+      history(
+        { id: "p1-1", role: "user", text: "q1", ts: 1 },
+        { id: "p1-2", role: "agent", text: "r1", ts: 2 },
+        { id: "p1-3", role: "user", text: "q2", ts: 3 },
+        { id: "p1-4", role: "agent", text: "r2", ts: 4 },
+      ),
+    );
+    // …plus a live bubble. NONE of these ids appear in the keyframe below.
     deliver(w, { type: "agent_message", id: "live-x", text: "stale" });
+    expect(w.getState().messages).toHaveLength(7);
 
     deliver(
       w,
       keyframe(
-        { id: "N1", role: "user", text: "hi", ts: 1 },
-        { id: "N2", role: "agent", text: "yo", ts: 2 },
+        { id: "N1", role: "user", text: "hi", ts: 7 },
+        { id: "N2", role: "agent", text: "yo", ts: 8 },
       ),
     );
 
-    // No overlap → full replace with the keyframe rows.
+    // No overlap → full replace: every paginated page is gone too, not just the
+    // stale live bubble.
     expect(w.getState().messages.map((m) => m.id)).toEqual(["N1", "N2"]);
     expect(timeline(w)).toEqual(["user:hi", "agent:yo"]);
+    // A whole-timeline reset is not silent. Counts only — never message text.
+    const logged = warn.mock.calls.map((c) => String(c[0]));
+    expect(logged.some((line) => line.includes("keyframe anchor not found"))).toBe(true);
+    expect(logged.join("\n")).not.toContain("q1");
+    warn.mockRestore();
+  });
+
+  it("does not log a full-replace warning when there was nothing on screen", () => {
+    const w = makeWrapper();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    deliver(w, keyframe(...KEYFRAME_ROWS));
+
+    // Hydration into empty state replaces nothing — no reset to report.
+    expect(warn).not.toHaveBeenCalled();
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["A", "B"]);
+    warn.mockRestore();
+  });
+
+  /**
+   * An empty (or fully invalid) keyframe carries no ground truth, and this
+   * reducer REPLACES — so applying one blanks the screen. The guard lives here,
+   * at the receiving end, and not in a premise about what senders emit.
+   */
+  it("ignores a keyframe with no usable rows instead of blanking the timeline", () => {
+    for (const frame of [
+      keyframe(),
+      { type: "keyframe" } as AnyFrame,
+      { type: "keyframe", messages: "nope" } as AnyFrame,
+      keyframe({ id: "", role: "agent", text: "x" }, { id: "ok", role: "system", text: "x" }),
+    ]) {
+      const w = makeWrapper();
+      seedCorruptLiveView(w);
+      const before = w.getState().messages;
+
+      deliver(w, frame);
+
+      expect(w.getState().messages).toEqual(before);
+    }
+  });
+
+  /**
+   * A /stop chip is a permanent in-timeline marker (it survives until
+   * `retract()`), so one sitting in the region the keyframe does NOT cover must
+   * stay where the user left it. Sweeping every local chip to the tail rewrites
+   * scrollback the keyframe never spoke about.
+   */
+  it("leaves a retracted chip in the uncovered prefix exactly where it sits", () => {
+    const w = makeWrapper();
+    deliver(w, history({ id: "o1", role: "user", text: "q1", ts: 1 }));
+    // A held send the user then cancelled with /stop → a retracted marker
+    // (text preserved), followed by the published /stop itself.
+    deliver(w, { type: "typing" });
+    w.send("later question");
+    w.send("/stop");
+    const chip = w.getState().messages.find((m) => m.retracted === true)!;
+    expect(chip.text).toBe("later question");
+    // …then a later turn's replies land after it.
+    deliver(w, { type: "agent_message", id: "o2", text: "r1" });
+    deliver(w, { type: "agent_message", id: "o3", text: "r2" });
+    const before = w.getState().messages.map((m) => m.id);
+    expect(before.slice(-2)).toEqual(["o2", "o3"]);
+
+    // The keyframe covers only that later turn (anchor = o2).
+    deliver(
+      w,
+      keyframe(
+        { id: "o2", role: "agent", text: "r1", ts: 2 },
+        { id: "o3", role: "agent", text: "r2", ts: 3 },
+      ),
+    );
+
+    // Untouched: same ids, same order — the chip did NOT move to the tail.
+    expect(w.getState().messages.map((m) => m.id)).toEqual(before);
+    const after = w.getState().messages.find((m) => m.id === chip.id)!;
+    expect(after.retracted).toBe(true);
+    expect(after.text).toBe("later question");
   });
 
   it("applying the same keyframe twice is idempotent", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const w = makeWrapper();
     seedCorruptLiveView(w);
 
@@ -400,10 +511,14 @@ describe("#173 WP — keyframe is an authoritative replace", () => {
     deliver(w, keyframe(...KEYFRAME_ROWS));
 
     expect(w.getState().messages).toEqual(once);
+    warn.mockRestore();
   });
 
   it("preserves a pending local user chip at the tail", () => {
     const w = makeWrapper();
+    // These rows share no id with the live view → the full-replace warning fires;
+    // absorb it (the fallback itself has its own test above).
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     seedCorruptLiveView(w);
     // A turn is in flight (typing), so the next send is HELD as a local-only
     // pending chip — never on the wire, absent from the transcript a keyframe
@@ -427,5 +542,6 @@ describe("#173 WP — keyframe is an authoritative replace", () => {
     const tail = after[after.length - 1];
     expect(tail.pending).toBe(true);
     expect(tail.id).toBe(pending!.id);
+    warn.mockRestore();
   });
 });

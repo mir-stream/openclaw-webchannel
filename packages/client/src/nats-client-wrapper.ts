@@ -2176,14 +2176,6 @@ export class WebChannelNATSClient {
         // region — so there is no per-bubble identity mapping to get wrong.
         const incoming = Array.isArray(msg.messages) ? msg.messages : [];
 
-        // PRESERVE local-only user chips (pending or /stop-retracted): they were
-        // never on the wire and are absent from the transcript the keyframe
-        // rebuilds from, so a replace would drop them. Original order is kept
-        // (filter is stable), and they are re-appended at the tail below.
-        const preserved = this.state.messages.filter(
-          (m) => m.role === "user" && (m.pending === true || m.retracted === true),
-        );
-
         // Rebuild the keyframe rows using the SAME ordered, one-bubble-per-row
         // insert the empty-state history hydration uses (working:false), so the
         // covered region equals what a reloading device would render. Same row
@@ -2203,31 +2195,84 @@ export class WebChannelNATSClient {
           });
         }
 
+        // An empty rebuild carries no ground truth to replace anything WITH, and
+        // a replace that finds no anchor wipes the timeline — so a stray or
+        // fully-invalid frame would blank the screen. Guard at the RECEIVING
+        // end, symmetrical with the `history` reducer's empty-frame guard above:
+        // this reducer's failure mode is a white page, and that must not depend
+        // on what any particular sender happens to gate on.
+        if (rebuilt.length === 0) return;
+
         // The keyframe covers the transcript from its OLDEST row forward. Older
         // loaded history bubbles carry the SAME transcript ids, so the boundary
         // lines up: find where this keyframe's oldest row sits in the current
-        // timeline. No valid rows (never sent by the plugin — it gates on a
-        // non-empty read) leaves `oldestKfId` undefined → no anchor → full replace.
-        const oldestKfId = rebuilt[0]?.id;
-        const anchor =
-          oldestKfId === undefined
-            ? -1
-            : this.state.messages.findIndex((m) => m.id === oldestKfId);
+        // timeline.
+        const oldestKfId = rebuilt[0].id;
+        const anchor = this.state.messages.findIndex((m) => m.id === oldestKfId);
+
+        // No overlap (fresh session, or the device's coverage is shorter than
+        // the window) → anchor -1 → keep nothing: a full replace. The result is
+        // equivalent to a reload and happens at most once per keyframe, so it is
+        // accepted — but it resets everything on screen, so say so. Counts only:
+        // this log must never carry message text.
+        if (anchor === -1 && this.state.messages.length > 0) {
+          console.warn(
+            `[nats-wrapper] keyframe anchor not found — replacing all ${this.state.messages.length} rendered message(s) with ${rebuilt.length} keyframe row(s)`,
+          );
+        }
 
         // Keep strictly-older scrollback the keyframe does NOT cover (everything
-        // before the anchor), minus any local chips (re-appended at the tail, so
-        // never duplicated into the kept prefix). No overlap (fresh session, or
-        // the device's coverage is shorter than the window) → anchor -1 → keep
-        // nothing: a safe full replace, the prior behaviour for those cases.
-        const keptPrefix =
-          anchor > 0
-            ? this.state.messages
-                .slice(0, anchor)
-                .filter(
-                  (m) =>
-                    !(m.role === "user" && (m.pending === true || m.retracted === true)),
-                )
-            : [];
+        // before the anchor) EXACTLY as it stands — local chips up there are left
+        // in place rather than swept to the tail (a /stop chip is a permanent
+        // in-timeline marker until `retract()`, so moving it rewrites history the
+        // keyframe never spoke about).
+        const keptPrefix = anchor > 0 ? this.state.messages.slice(0, anchor) : [];
+
+        // PRESERVE, from the COVERED region only, user bubbles the keyframe's
+        // source transcript cannot account for. Two disjoint reasons, each
+        // decided from this client's own records — never from message text or
+        // position, and never by matching a bubble to a row.
+        //
+        //  (a) A held (pending) or /stop-retracted chip is LOCAL-ONLY: it was
+        //      never published, so no transcript can contain it, and its text
+        //      exists nowhere else — dropping it destroys user input. Neither
+        //      flag can appear on a published bubble (`publish` sets neither, and
+        //      only held entries are ever flipped to `retracted`).
+        //
+        //  (b) A published send that has not reached a settled outcome yet.
+        //      `sendState` ALONE is the wrong test: #96 control-lane publishes
+        //      (`/stop` and the whole NL abort vocabulary) are dispatched with
+        //      `settlementEligible: false`, so they NEVER receive a
+        //      `turn_settled` and stick at `accepted` forever — preserving on
+        //      state alone would re-append such a bubble at every keyframe and
+        //      double-render it against its own transcript row, permanently.
+        //      The receipt's `settlementEligible` is the discriminator: it says
+        //      whether an outcome is COMING, which is exactly what makes "not
+        //      settled yet" mean "not run yet" instead of "never settles".
+        //      Receipts are never deleted, so the lookup is safe; a bubble with
+        //      no receipt (server-hydrated, or an agent row) is not ours to keep.
+        //
+        // ACCEPTED RESIDUAL RISK: if the `turn_settled` frame for a coalesced
+        // member is lost, that eligible send stays at `accepted` (see
+        // `promoteAnchor` and the `turn_settled` reducer, both of which describe
+        // this state as reachable) and is preserved here even though the keyframe
+        // carries its row — a duplicate bubble. Deliberate: a duplicate is
+        // corrected by the next snapshot, a deleted send is not recoverable at
+        // all, so this predicate errs toward keeping.
+        //
+        // Order is kept (filter is stable) and these are re-appended at the tail.
+        const covered = anchor >= 0 ? this.state.messages.slice(anchor) : this.state.messages;
+        const preserved = covered.filter((m) => {
+          if (m.role !== "user") return false;
+          if (m.pending === true || m.retracted === true) return true;
+          if (m.sendState !== "queued" && m.sendState !== "sent" && m.sendState !== "accepted") {
+            return false;
+          }
+          return (
+            m.receiptKey !== undefined
+            && this.receipts.get(m.receiptKey)?.settlementEligible === true
+          );
+        });
 
         // Idempotent: re-applying the same keyframe re-finds the anchor at the
         // same boundary, so `keptPrefix` ends right before the oldest row and
