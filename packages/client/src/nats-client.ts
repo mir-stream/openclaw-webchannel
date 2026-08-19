@@ -182,12 +182,15 @@ export type InboundMessage = {
     //    per the next bullet. Accepted, and logged by the reducer rather than
     //    silent.
     //
-    //  - The replace discards a rendered user bubble ONLY when the reader knows
-    //    its send ran — that is, a settle named it (`turn_settled`). Everything
-    //    else is KEPT: local-only chips (held or /stop-retracted, never
-    //    published), sends still in flight, control-lane sends that never
-    //    settle, and failed sends. The sender reads the transcript at settlement,
-    //    so a turn dispatched after that read, a message the agent never admitted,
+    //  - Of the reader's OWN sends, the replace discards a rendered user bubble
+    //    only when it knows that send ran — that is, a settle named it
+    //    (`turn_settled`). Everything else of its own is KEPT: local-only chips
+    //    (held or /stop-retracted, never published), sends still in flight,
+    //    control-lane sends that never settle, and failed sends. (A user bubble
+    //    the reader did not send — hydrated from `history`, or another device's
+    //    message — carries no local send record, so inside the covered region it
+    //    is simply rebuilt from these rows.) The sender reads the transcript at
+    //    settlement, so a turn dispatched after that read, a message the agent never admitted,
     //    and an abort core consumed without an agent run are all absent from
     //    these rows. The residual error is therefore always a DUPLICATE bubble,
     //    never a deletion. A duplicate persists for the life of the page — no

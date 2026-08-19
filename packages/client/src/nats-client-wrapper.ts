@@ -2181,11 +2181,30 @@ export class WebChannelNATSClient {
         // Rebuild the keyframe rows using the SAME ordered, one-bubble-per-row
         // insert the empty-state history hydration uses (working:false), so the
         // covered region equals what a reloading device would render. Same row
-        // validation as the `history` reducer above — including its in-frame id
-        // dedupe: that reducer's `seen` Set makes a repeated id impossible, and
-        // without the same Set here a frame carrying [A,B,A] would render A
-        // twice, unrepairable afterwards (a later `history` dedups by id and can
-        // only ADD). Same receiving-end argument as the empty-frame guard below.
+        // validation as the `history` reducer above, and the same guarantee it
+        // gets from its own `seen` Set — scoped to what this frame BUILDS: no id
+        // is rendered twice across `keptPrefix ++ rebuilt`. It does NOT extend to
+        // the preserved tail, which may legitimately re-append a bubble whose row
+        // the frame also carries (accepted residual cases 1 and 4 below); that
+        // duplicate is the deliberate price of never deleting a send.
+        //
+        // That reducer seeds `seen` from EXISTING STATE, so one Set buys it both
+        // halves at once. This reducer needs two, because it emits two segments:
+        //  - this in-frame Set stops a frame carrying [A,B,A] from rendering A
+        //    twice within `rebuilt`;
+        //  - the `keptPrefix` filter below stops a row from colliding with a
+        //    bubble that survives IN FRONT of `rebuilt`.
+        // Both are exact-id lookups, and both matter for the same reason: a
+        // duplicate ID is unrepairable afterwards. `upsertMessage` and
+        // `patchBubbleByReceiptKey` patch only the FIRST match, the next
+        // keyframe's anchor `findIndex` would latch the wrong occurrence and
+        // mis-scope its region, and an embedder's React keys collide. Same
+        // receiving-end argument as the empty-frame guard below.
+        //
+        // The FIRST occurrence wins. Under the contract just stated that is the
+        // older copy, so a sender re-emitting a corrected row later in the same
+        // frame has its correction dropped — harmless while the contract holds,
+        // and the contract is what makes it a non-case.
         const rebuilt: ChatMessage[] = [];
         const seen = new Set<string>();
         for (const m of incoming) {
@@ -2231,7 +2250,23 @@ export class WebChannelNATSClient {
         // in place rather than swept to the tail (a /stop chip is a permanent
         // in-timeline marker until `retract()`, so moving it rewrites history the
         // keyframe never spoke about).
-        const keptPrefix = anchor > 0 ? this.state.messages.slice(0, anchor) : [];
+        //
+        // …minus any bubble whose id this frame also rebuilds. Rendered order can
+        // legitimately diverge from transcript order: this reducer re-appends a
+        // preserved user bubble AT THE TAIL, and once `history` has adopted that
+        // bubble it carries a CANONICAL id. A later keyframe anchoring on that id
+        // then finds intervening canonical rows sitting in front of the anchor —
+        // in `keptPrefix` AND in `rebuilt`. No sender defect required; the
+        // keyframe row is the authoritative copy, so the prefix yields.
+        //
+        // Chips are EXEMPT unconditionally. A bare `!seen.has(m.id)` would let a
+        // frame that happened to carry a local id (`u-0`) DELETE local-only text
+        // from the prefix, and nothing in this reducer may ever delete that. It
+        // is also what the promise above — chips up there stay exactly as they
+        // stand — actually requires.
+        const keptPrefix = (anchor > 0 ? this.state.messages.slice(0, anchor) : []).filter(
+          (m) => m.pending === true || m.retracted === true || !seen.has(m.id),
+        );
 
         // PRESERVE, from the COVERED region only, user bubbles the keyframe's
         // source transcript cannot account for. THE RULE: a covered user bubble
@@ -2315,13 +2350,18 @@ export class WebChannelNATSClient {
           return true;
         });
 
-        // The anchor-miss reset, reported with the numbers that actually hold:
-        // what the replace DROPPED, and what the filter kept anyway. Counts only
-        // — this log must never carry message text.
+        // The anchor-miss reset, reported with what this reducer actually KNOWS.
+        // It does NOT know what was lost: an anchor miss frequently rebuilds the
+        // very ids it replaced — including the benign short-coverage case named
+        // above, where the window simply reaches further back than this device
+        // does and nothing goes missing at all. So report sizes, not loss.
+        // `incoming` vs `rebuilt` is the other half of the diagnostic: when a
+        // malformed sender is the problem, the gap between rows RECEIVED and rows
+        // USABLE is what shows it. Counts only — never message text.
         if (anchor === -1 && this.state.messages.length > 0) {
           const total = this.state.messages.length;
           console.warn(
-            `[nats-wrapper] keyframe anchor not found — dropping ${total - preserved.length} of ${total} rendered message(s) for ${rebuilt.length} keyframe row(s), keeping ${preserved.length} local`,
+            `[nats-wrapper] keyframe anchor not found — replacing the whole timeline: ${total} rendered, ${incoming.length} row(s) received (${rebuilt.length} usable), ${preserved.length} local kept`,
           );
         }
 

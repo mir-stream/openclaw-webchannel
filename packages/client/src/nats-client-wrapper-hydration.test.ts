@@ -427,7 +427,9 @@ describe("#173 WP — keyframe is an authoritative replace", () => {
     expect(logged.some((line) => line.includes("keyframe anchor not found"))).toBe(true);
     expect(
       logged.some((line) =>
-        line.includes("dropping 7 of 7 rendered message(s) for 2 keyframe row(s), keeping 0 local"),
+        line.includes(
+          "replacing the whole timeline: 7 rendered, 2 row(s) received (2 usable), 0 local kept",
+        ),
       ),
     ).toBe(true);
     expect(logged.join("\n")).not.toContain("q1");
@@ -548,13 +550,14 @@ describe("#173 WP — keyframe is an authoritative replace", () => {
     expect(tail.pending).toBe(true);
     expect(tail.id).toBe(pending!.id);
 
-    // The reset warning must count what was actually DROPPED, not everything on
-    // screen: 4 rendered, the chip kept → 3 dropped. A count that included the
-    // preserved chip would overstate the reset. Counts only — never text.
+    // The reset warning reports sizes, not loss — 4 rendered, 2 rows in, 1 local
+    // kept. Counts only — never text.
     const logged = warn.mock.calls.map((c) => String(c[0]));
     expect(
       logged.some((line) =>
-        line.includes("dropping 3 of 4 rendered message(s) for 2 keyframe row(s), keeping 1 local"),
+        line.includes(
+          "replacing the whole timeline: 4 rendered, 2 row(s) received (2 usable), 1 local kept",
+        ),
       ),
     ).toBe(true);
     expect(logged.join("\n")).not.toContain("unsent draft");
@@ -620,5 +623,118 @@ describe("#173 WP — keyframe is an authoritative replace", () => {
 
     expect(w.getState().messages.map((m) => m.id)).toEqual(["A", "B"]);
     expect(timeline(w)).toEqual(["agent:A", "agent:B"]);
+  });
+
+  /**
+   * The other half of "no id renders twice", and this one needs NO sender defect
+   * — it chains off this reducer's own tail preservation. Rendered order legally
+   * diverges from transcript order once a preserved bubble is re-appended at the
+   * tail and `history` adopts it onto a canonical id; a later keyframe anchoring
+   * there finds intervening canonical rows sitting in FRONT of the anchor, i.e.
+   * in `keptPrefix` and in `rebuilt` at once.
+   *
+   * A duplicate ID is worse than a duplicate bubble: `upsertMessage` and
+   * `patchBubbleByReceiptKey` patch only the first match, and the next keyframe's
+   * anchor lookup latches the wrong occurrence.
+   */
+  it("does not render a keyframe row that is already in the uncovered prefix", () => {
+    const w = makeWrapper();
+    // Rendered order diverges from transcript order: core-X sits FIRST on screen
+    // while the keyframe below places it second.
+    deliver(
+      w,
+      history(
+        { id: "core-X", role: "user", text: "x", ts: 3 },
+        { id: "core-A", role: "agent", text: "a", ts: 1 },
+        { id: "core-B", role: "agent", text: "b", ts: 2 },
+      ),
+    );
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["core-X", "core-A", "core-B"]);
+
+    // Anchors at core-A (index 1) → core-X lands in keptPrefix AND in rebuilt.
+    deliver(
+      w,
+      keyframe(
+        { id: "core-A", role: "agent", text: "a", ts: 1 },
+        { id: "core-X", role: "user", text: "x", ts: 3 },
+        { id: "core-B", role: "agent", text: "b", ts: 2 },
+      ),
+    );
+
+    // The keyframe row is authoritative, so the prefix copy yields — core-X once.
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["core-A", "core-X", "core-B"]);
+  });
+
+  /**
+   * …but the prefix filter must never become a deletion path for local text. A
+   * frame carrying a local id (crafted, or a sender bug) would otherwise remove
+   * an unsent chip from the prefix — the one thing this reducer may never do.
+   */
+  it("keeps a prefix chip even when the keyframe carries its id", () => {
+    const w = makeWrapper();
+    deliver(w, history({ id: "o1", role: "agent", text: "r0", ts: 1 }));
+    // A held chip, then a later turn's reply after it.
+    deliver(w, { type: "typing" });
+    w.send("unsent secret");
+    const chip = w.getState().messages.find((m) => m.pending === true)!;
+    deliver(w, { type: "agent_message", id: "o2", text: "r1" });
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["o1", chip.id, "o2"]);
+
+    // The frame anchors at o2 (so the chip is in the PREFIX) and also carries the
+    // chip's own local id.
+    deliver(
+      w,
+      keyframe(
+        { id: "o2", role: "agent", text: "r1", ts: 2 },
+        { id: chip.id, role: "user", text: "unsent secret", ts: 3 },
+      ),
+    );
+
+    // The chip is still there, still local, still where the user left it.
+    const after = w.getState().messages;
+    const kept = after.find((m) => m.id === chip.id && m.pending === true);
+    expect(kept).toBeDefined();
+    expect(kept!.text).toBe("unsent secret");
+  });
+
+  /**
+   * The BENIGN anchor miss: the keyframe window simply reaches further back than
+   * this device does, so `findIndex` misses and every rendered id is rebuilt —
+   * nothing is lost. The warning must not claim otherwise.
+   */
+  it("reports sizes, not loss, when a short-coverage anchor miss loses nothing", () => {
+    const w = makeWrapper();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    deliver(
+      w,
+      history(
+        { id: "core-19", role: "agent", text: "r19", ts: 19 },
+        { id: "core-20", role: "agent", text: "r20", ts: 20 },
+      ),
+    );
+
+    deliver(
+      w,
+      keyframe(
+        { id: "core-18", role: "agent", text: "r18", ts: 18 },
+        { id: "core-19", role: "agent", text: "r19", ts: 19 },
+        { id: "core-20", role: "agent", text: "r20", ts: 20 },
+      ),
+    );
+
+    // Anchor missed, yet nothing went missing — the rows superset the timeline.
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["core-18", "core-19", "core-20"]);
+    const logged = warn.mock.calls.map((c) => String(c[0]));
+    expect(
+      logged.some((line) =>
+        line.includes(
+          "replacing the whole timeline: 2 rendered, 3 row(s) received (3 usable), 0 local kept",
+        ),
+      ),
+    ).toBe(true);
+    // No claim of loss, and no message text.
+    expect(logged.join("\n")).not.toContain("dropping");
+    expect(logged.join("\n")).not.toContain("r19");
+    warn.mockRestore();
   });
 });
