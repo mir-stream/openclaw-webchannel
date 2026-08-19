@@ -167,10 +167,24 @@ export type InboundMessage = {
     // `history`). Applied as a REPLACE, but ONLY over the region these rows
     // cover: from the oldest row forward the client discards its rendered
     // agent/settled-user bubbles and rebuilds from these rows, as a fresh reload
-    // would. Strictly-older scrollback outside that region is RETAINED — the
-    // sender ships a bounded tail window (the history limit), so a blanket
-    // replace would collapse a paginated timeline down to that window. Corrects
-    // the tool-only-turn live-overwrite glitch ([A,A,B]).
+    // would. Corrects the tool-only-turn live-overwrite glitch ([A,A,B]).
+    //
+    // The region is found by locating the OLDEST row's id in the rendered
+    // timeline, and the two exceptions to a plain replace both follow from that:
+    //
+    //  - Strictly-older scrollback before that boundary is RETAINED. The sender
+    //    ships a bounded tail window (the history limit), so a blanket replace
+    //    would collapse a paginated timeline down to that window. This holds
+    //    ONLY when the boundary is found: an id that matches nothing on screen
+    //    (long live session, or ids the reader synthesized) leaves no boundary
+    //    to splice at, and the replace is then total — equivalent to a reload,
+    //    accepted, and logged by the reducer rather than silent.
+    //
+    //  - Sends the source transcript cannot account for are KEPT: local-only
+    //    chips (held or /stop-retracted, never published) and published sends
+    //    still awaiting a settled outcome. The sender reads the transcript at
+    //    settlement, and a turn dispatched after that read is absent from these
+    //    rows, so replacing over them would delete a message already on the wire.
     | "keyframe"
     // P0-3: slash-command discovery catalog (carries `commands`).
     | "commands"
