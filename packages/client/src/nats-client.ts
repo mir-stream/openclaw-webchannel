@@ -163,6 +163,15 @@ export type InboundMessage = {
     | "approval_snapshot"
     | "typing"
     | "history"
+    // #173: authoritative-replace snapshot (carries `messages`, same shape as
+    // `history`). Applied as a REPLACE, but ONLY over the region these rows
+    // cover: from the oldest row forward the client discards its rendered
+    // agent/settled-user bubbles and rebuilds from these rows, as a fresh reload
+    // would. Strictly-older scrollback outside that region is RETAINED — the
+    // sender ships a bounded tail window (the history limit), so a blanket
+    // replace would collapse a paginated timeline down to that window. Corrects
+    // the tool-only-turn live-overwrite glitch ([A,A,B]).
+    | "keyframe"
     // P0-3: slash-command discovery catalog (carries `commands`).
     | "commands"
     // P0-7b: ingress acknowledgement (carries `ids`). The agent acks every
@@ -211,6 +220,10 @@ export type InboundMessage = {
   options?: Array<{ decision: string; label: string; style: string }>;
   expiresAtMs?: number;
   decision?: string;
+  /**
+   * Transcript rows on a `history` (additive merge) or #173 `keyframe`
+   * (region-scoped replace, see the `keyframe` type above) frame.
+   */
   messages?: Array<{ id: string; role: string; text: string; ts?: number }>;
   /** #15: the still-pending approval set on an `approval_snapshot` frame. */
   approvals?: Array<{
