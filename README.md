@@ -115,4 +115,5 @@ excluded from that sweep and is guarded only by each example's own `npm test`.
 
 ## License
 
-See individual package manifests.
+[MIT](LICENSE) — all three published packages (`openclaw-webchannel`,
+`@mir-stream/webchannel-client`, `@mir-stream/webchannel-saas`).
