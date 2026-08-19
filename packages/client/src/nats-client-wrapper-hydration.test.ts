@@ -419,12 +419,17 @@ describe("#173 WP — keyframe is an authoritative replace", () => {
     );
 
     // No overlap → full replace: every paginated page is gone too, not just the
-    // stale live bubble.
+    // stale live bubble. Nothing here is local, so nothing is preserved.
     expect(w.getState().messages.map((m) => m.id)).toEqual(["N1", "N2"]);
     expect(timeline(w)).toEqual(["user:hi", "agent:yo"]);
     // A whole-timeline reset is not silent. Counts only — never message text.
     const logged = warn.mock.calls.map((c) => String(c[0]));
     expect(logged.some((line) => line.includes("keyframe anchor not found"))).toBe(true);
+    expect(
+      logged.some((line) =>
+        line.includes("dropping 7 of 7 rendered message(s) for 2 keyframe row(s), keeping 0 local"),
+      ),
+    ).toBe(true);
     expect(logged.join("\n")).not.toContain("q1");
     warn.mockRestore();
   });
@@ -542,6 +547,78 @@ describe("#173 WP — keyframe is an authoritative replace", () => {
     const tail = after[after.length - 1];
     expect(tail.pending).toBe(true);
     expect(tail.id).toBe(pending!.id);
+
+    // The reset warning must count what was actually DROPPED, not everything on
+    // screen: 4 rendered, the chip kept → 3 dropped. A count that included the
+    // preserved chip would overstate the reset. Counts only — never text.
+    const logged = warn.mock.calls.map((c) => String(c[0]));
+    expect(
+      logged.some((line) =>
+        line.includes("dropping 3 of 4 rendered message(s) for 2 keyframe row(s), keeping 1 local"),
+      ),
+    ).toBe(true);
+    expect(logged.join("\n")).not.toContain("unsent draft");
     warn.mockRestore();
+  });
+
+  /**
+   * The COVERED-region counterpart of the uncovered-prefix chip test above, and
+   * the shape #173's own scenario produces: the user hits /stop mid-turn, and the
+   * keyframe emitted for that turn covers from its first row — so the chip sits
+   * INSIDE the replaced region. It is local-only text the transcript can never
+   * carry, so it survives, re-appended at the tail.
+   */
+  it("preserves a retracted chip that sits inside the covered region", () => {
+    const w = makeWrapper();
+    deliver(w, history({ id: "o1", role: "agent", text: "r0", ts: 1 }));
+    // A turn is running; the held send is then cancelled by /stop → a retracted
+    // marker keeping the user's text.
+    deliver(w, { type: "typing" });
+    w.send("later question");
+    w.send("/stop");
+    const chip = w.getState().messages.find((m) => m.retracted === true)!;
+    expect(chip.text).toBe("later question");
+    const stop = w.getState().messages.find((m) => m.text === "/stop")!;
+    // That turn's replies land AFTER the chip, so the keyframe below (anchored at
+    // o1, the oldest rendered row) covers the chip's position.
+    deliver(w, { type: "agent_message", id: "o2", text: "r1" });
+
+    deliver(
+      w,
+      keyframe(
+        { id: "o1", role: "agent", text: "r0", ts: 1 },
+        { id: "o2", role: "agent", text: "r1", ts: 2 },
+      ),
+    );
+
+    // Rebuilt rows first, then the preserved locals in their original order: the
+    // retracted chip, then the /stop that retracted it (a control-lane send with
+    // no evidence it ran, kept by the same rule).
+    const after = w.getState().messages;
+    expect(after.map((m) => m.id)).toEqual(["o1", "o2", chip.id, stop.id]);
+    const kept = after.find((m) => m.id === chip.id)!;
+    expect(kept.retracted).toBe(true);
+    expect(kept.text).toBe("later question");
+  });
+
+  /**
+   * The reducer REPLACES, so a duplicate id it renders is unrepairable: a later
+   * `history` dedups by id and can only ADD, leaving [A,B,A] → [A,B,C,A]. The
+   * `history` reducer's in-frame `seen` Set makes that impossible there; this
+   * reducer must hold the same line.
+   */
+  it("renders a repeated id once when a keyframe carries it twice", () => {
+    const w = makeWrapper();
+    deliver(
+      w,
+      keyframe(
+        { id: "A", role: "agent", text: "A", ts: 1 },
+        { id: "B", role: "agent", text: "B", ts: 2 },
+        { id: "A", role: "agent", text: "A", ts: 1 },
+      ),
+    );
+
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["A", "B"]);
+    expect(timeline(w)).toEqual(["agent:A", "agent:B"]);
   });
 });

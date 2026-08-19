@@ -2176,16 +2176,25 @@ export class WebChannelNATSClient {
         // region — so there is no per-bubble identity mapping to get wrong.
         const incoming = Array.isArray(msg.messages) ? msg.messages : [];
 
+        // SENDER INPUT CONTRACT: rows carry unique ids and run oldest→newest.
+        //
         // Rebuild the keyframe rows using the SAME ordered, one-bubble-per-row
         // insert the empty-state history hydration uses (working:false), so the
         // covered region equals what a reloading device would render. Same row
-        // validation as the `history` reducer above. Rows are oldest→newest.
+        // validation as the `history` reducer above — including its in-frame id
+        // dedupe: that reducer's `seen` Set makes a repeated id impossible, and
+        // without the same Set here a frame carrying [A,B,A] would render A
+        // twice, unrepairable afterwards (a later `history` dedups by id and can
+        // only ADD). Same receiving-end argument as the empty-frame guard below.
         const rebuilt: ChatMessage[] = [];
+        const seen = new Set<string>();
         for (const m of incoming) {
           if (!m || typeof m !== "object") continue;
           if (typeof m.id !== "string" || m.id.length === 0) continue;
           if (m.role !== "user" && m.role !== "agent") continue;
           if (typeof m.text !== "string") continue;
+          if (seen.has(m.id)) continue;
+          seen.add(m.id);
           rebuilt.push({
             id: m.id,
             role: m.role,
@@ -2211,15 +2220,11 @@ export class WebChannelNATSClient {
         const anchor = this.state.messages.findIndex((m) => m.id === oldestKfId);
 
         // No overlap (fresh session, or the device's coverage is shorter than
-        // the window) → anchor -1 → keep nothing: a full replace. The result is
-        // equivalent to a reload and happens at most once per keyframe, so it is
-        // accepted — but it resets everything on screen, so say so. Counts only:
-        // this log must never carry message text.
-        if (anchor === -1 && this.state.messages.length > 0) {
-          console.warn(
-            `[nats-wrapper] keyframe anchor not found — replacing all ${this.state.messages.length} rendered message(s) with ${rebuilt.length} keyframe row(s)`,
-          );
-        }
+        // the window) → anchor -1 → the covered region is the WHOLE timeline. It
+        // happens at most once per keyframe and is accepted — but it resets
+        // essentially everything on screen, so say so. The warning is emitted
+        // BELOW, once `preserved` is known: bubbles the filter keeps are not
+        // dropped, and a count that includes them overstates the reset.
 
         // Keep strictly-older scrollback the keyframe does NOT cover (everything
         // before the anchor) EXACTLY as it stands — local chips up there are left
@@ -2274,21 +2279,34 @@ export class WebChannelNATSClient {
         //     its row;
         //  2. `overloaded` returned for a message the agent had ALREADY admitted
         //     — the live-retry of an unacked id whose accepted-marker was evicted
-        //     (documented in full on the `turnClosed` hook above);
+        //     (documented in full on the turn-closing hook in
+        //     `receiptTransition`, which is where a terminal receipt outcome
+        //     decides whether to close the turn);
         //  3. `evicted` is a CLIENT-side unacked-ledger cap drop, NOT evidence of
-        //     non-delivery (see ~`evicted` on that same hook: the message may
-        //     have reached the agent, been coalesced, and be the very id its turn
-        //     settles under) — it is kept because we lack evidence either way;
+        //     non-delivery (see the `evicted` note on that same hook: the message
+        //     may have reached the agent, been coalesced, and be the very id its
+        //     turn settles under) — it is kept because we lack evidence either
+        //     way;
         //  4. a control-lane send that fell THROUGH to an ordinary agent turn: its
         //     row is in the transcript, and no settle will ever arrive to promote
-        //     it, so the duplicate is permanent.
-        // Deliberate in every case: a duplicate is corrected by the next snapshot
-        // or a reload; a deleted send is not recoverable at all.
+        //     it.
+        // In ALL FOUR the duplicate is permanent for the life of the page: no
+        // later frame removes it. `history` is additive and dedups by id, so it
+        // can never delete the extra bubble; a repeat keyframe re-derives the
+        // identical preserve, because the bubble's `sendState` never changes
+        // again. Only a RELOAD clears it. Deliberate even so: a reload does fix a
+        // duplicate, while text that never entered the transcript is gone for
+        // good once deleted — not recoverable by a reload or anything else.
         //
         // Order is kept (filter is stable) and these are re-appended at the tail.
         const covered = anchor >= 0 ? this.state.messages.slice(anchor) : this.state.messages;
         const preserved = covered.filter((m) => {
           if (m.role !== "user") return false;
+          // Redundant TODAY — every local chip carries a receiptKey, a pending
+          // one is `queued` and a retracted one is `failed{cancelled}`, so the
+          // rule below already keeps both. Kept deliberately: (a) is an
+          // invariant about local-only TEXT, not a consequence of the sendState
+          // rules, and must not vanish silently if those rules change.
           if (m.pending === true || m.retracted === true) return true;
           if (m.receiptKey === undefined) return false;
           // Keep unless this client holds POSITIVE evidence the send ran.
@@ -2296,6 +2314,16 @@ export class WebChannelNATSClient {
           if (m.sendState === "failed" && m.sendFailure?.reason === "turn-failed") return false;
           return true;
         });
+
+        // The anchor-miss reset, reported with the numbers that actually hold:
+        // what the replace DROPPED, and what the filter kept anyway. Counts only
+        // — this log must never carry message text.
+        if (anchor === -1 && this.state.messages.length > 0) {
+          const total = this.state.messages.length;
+          console.warn(
+            `[nats-wrapper] keyframe anchor not found — dropping ${total - preserved.length} of ${total} rendered message(s) for ${rebuilt.length} keyframe row(s), keeping ${preserved.length} local`,
+          );
+        }
 
         // Idempotent: re-applying the same keyframe re-finds the anchor at the
         // same boundary, so `keptPrefix` ends right before the oldest row and

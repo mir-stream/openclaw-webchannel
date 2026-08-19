@@ -177,8 +177,10 @@ export type InboundMessage = {
     //    would collapse a paginated timeline down to that window. This holds
     //    ONLY when the boundary is found: an id that matches nothing on screen
     //    (long live session, or ids the reader synthesized) leaves no boundary
-    //    to splice at, and the replace is then total — equivalent to a reload,
-    //    accepted, and logged by the reducer rather than silent.
+    //    to splice at, and the covered region is then the WHOLE timeline —
+    //    equivalent to a reload EXCEPT that local-only chips are still preserved
+    //    per the next bullet. Accepted, and logged by the reducer rather than
+    //    silent.
     //
     //  - The replace discards a rendered user bubble ONLY when the reader knows
     //    its send ran — that is, a settle named it (`turn_settled`). Everything
@@ -188,8 +190,11 @@ export type InboundMessage = {
     //    so a turn dispatched after that read, a message the agent never admitted,
     //    and an abort core consumed without an agent run are all absent from
     //    these rows. The residual error is therefore always a DUPLICATE bubble,
-    //    corrected by the next snapshot — never a deletion, which is not
-    //    recoverable.
+    //    never a deletion. A duplicate persists for the life of the page — no
+    //    later `history` (additive, id-deduped) or `keyframe` (re-derives the
+    //    same preserve) removes it, only a RELOAD does. That is still the right
+    //    trade: a reload fixes a duplicate, while text that never entered the
+    //    transcript is unrecoverable once deleted.
     | "keyframe"
     // P0-3: slash-command discovery catalog (carries `commands`).
     | "commands"
