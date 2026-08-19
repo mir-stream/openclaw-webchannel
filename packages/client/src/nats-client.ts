@@ -175,7 +175,11 @@ export type InboundMessage = {
     //
     //  - Strictly-older scrollback before that boundary is RETAINED — except for
     //    a bubble whose id these rows also carry, which yields to the row so no
-    //    id is rendered twice. The sender ships a bounded tail window (the
+    //    id is rendered twice. That precedence REVERSES for the reader's own
+    //    local-only chips: a row claiming one of those ids is dropped instead,
+    //    because that id namespace belongs to the reader and no transcript row
+    //    can legitimately hold one. Unsent text is never displaced by a row.
+    //    The sender ships a bounded tail window (the
     //    history limit), so a blanket replace would collapse a paginated timeline
     //    down to that window. This holds ONLY when the boundary is found: an id
     //    that matches nothing on screen (long live session, or ids the reader

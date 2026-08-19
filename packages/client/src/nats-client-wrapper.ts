@@ -2191,7 +2191,10 @@ export class WebChannelNATSClient {
         // covered region equals what a reloading device would render. Same row
         // validation as the `history` reducer above, and the same guarantee it
         // gets from its own `seen` Set — scoped to what this frame BUILDS: no id
-        // is rendered twice across `keptPrefix ++ rebuilt`, unconditionally. It
+        // THIS FRAME rebuilds is rendered twice across `keptPrefix ++ rebuilt`.
+        // Two things it does not claim: a duplicate that was already sitting in
+        // the prefix is carried through untouched (`keptPrefix` copies it
+        // verbatim), and the guarantee
         // does NOT extend to the preserved tail, which may legitimately re-append
         // a bubble whose row the frame also carries (accepted residual cases 1, 4
         // and 5 below); that duplicate is the deliberate price of never deleting
@@ -2359,8 +2362,10 @@ export class WebChannelNATSClient {
         // In 1-4 the duplicate is permanent for the life of the page: no later
         // frame removes it. `history` is additive and dedups by id, so it can
         // never delete the extra bubble; a repeat keyframe re-derives the
-        // identical preserve, because in those four the bubble's `sendState` is
-        // genuinely terminal and never changes again. Only a RELOAD clears them.
+        // identical preserve, because nothing can promote those bubbles: 2 and 3
+        // sit at `failed`, which `receiptAdvances` treats as absolutely terminal,
+        // while 1 and 4 sit at the non-terminal `accepted` with no settle that
+        // can ever name them. Only a RELOAD clears them.
         // Source 5 is the exception in both directions: the late `turn_settled`
         // DOES promote the bubble to `completed`, so the NEXT keyframe drops it.
         // Deliberate even so: a duplicate is fixed by a reload or a later
