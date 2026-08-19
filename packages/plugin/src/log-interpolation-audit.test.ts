@@ -141,7 +141,10 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
  * DELIBERATELY — that is the point.
  */
 const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: number }> = {
-  "inbound.ts": { statements: 7, interpolations: 14 },
+  // #173 raised this from 7/14: the settlement keyframe adds a timed-out warn
+  // (4 interpolations) and an empty-projection warn (3). Both are the whole
+  // point of that change — a resync that skips must never do so in silence.
+  "inbound.ts": { statements: 9, interpolations: 21 },
   "ingress-dedupe.ts": { statements: 13, interpolations: 7 },
   "approvals.ts": { statements: 9, interpolations: 24 },
   "nats-account-runtime.ts": { statements: 23, interpolations: 45 },

@@ -632,6 +632,26 @@ export async function deliverDraftFinalPayload(
 }
 
 /**
+ * #173: how long the settlement keyframe's transcript read may hold the
+ * per-session inbound FIFO before it is abandoned.
+ *
+ * The read is awaited on purpose (see the emit site), which puts it on the
+ * critical path for the NEXT message from this peer, and the session read it
+ * dispatches carries no deadline of its own. So it needs one here.
+ *
+ * A few seconds: long enough that an ordinary transcript read on a loaded host
+ * finishes well inside it (the register-time snapshot does the same read on
+ * every connect), short enough that a stuck read costs one turn's worth of
+ * queueing latency rather than a permanently wedged peer. The keyframe is a
+ * cosmetic correction to an already-settled turn, so skipping it is cheap;
+ * blocking the peer is not.
+ */
+export const KEYFRAME_HISTORY_READ_TIMEOUT_MS = 5_000;
+
+/** Resolved by the timeout arm of the keyframe read race — never a value. */
+const KEYFRAME_READ_TIMED_OUT = Symbol("webchannel:keyframe-history-read-timeout");
+
+/**
  * #173: the tool-only-turn overwrite signature. True iff the turn delivered
  * >=2 ordinary non-error finals AND the first was delivered non-independent
  * (the finalize path, which overwrites the live lane's streamed bubble). That
@@ -964,16 +984,29 @@ export async function handleInboundMessage(
   // read.
   let settlementSessionKey: string | undefined;
   let settlementHistoryLimit: number | undefined;
-  // #173: did answer TEXT actually stream on this turn? An OBSERVATION, not the
-  // config decision — set from the `onPartialReply` handler, which is wired in
-  // partial mode only. The overwrite glitch needs a live answer bubble to
-  // overwrite, and only a delivered answer partial creates one. Modes that never
-  // stream answer text ("progress"/"off"/"block") therefore never set it, and
-  // neither does a PARTIAL-mode turn whose provider emitted no answer partials
-  // (tool lines only): both render two ordinary finals as [A,B] correctly, so a
-  // keyframe there is a pure false positive (an unnecessary full replace that
-  // also truncates paginated scrollback to the history window).
-  let settlementAnswerStreamed = false;
+  // #173: how many DISTINCT answer lanes streamed text this turn? An
+  // OBSERVATION counted at the `onPartialReply` / `onAssistantMessageStart`
+  // callbacks (both wired in partial mode only), never a config decision.
+  //
+  // Two-or-more is the discriminator for the glitch, and the routing shape alone
+  // is not. #173 is defined over retained finals [A,B] where BOTH LANES HAVE
+  // ALREADY STREAMED: the first final finalizes lane 2 — overwriting the text
+  // lane 2 streamed — and the second appends, so the reader sees [A,A,B].
+  //
+  // The benign shapes that share the routing shape all stream exactly ONE lane,
+  // because the extra payload never streams at all: core's final-payload array
+  // reachably carries plain payloads that are neither notices nor errors — a
+  // per-messaging-tool source-reply mirror pushed BEFORE the answer, or a
+  // trailing plugin-status / raw-trace payload appended AFTER it under `/trace`
+  // or verbose. `[answer, status]` in partial mode routes exactly like the
+  // glitch (finalize, then independent) but RENDERS CORRECTLY, and a keyframe
+  // there would delete the status/trace bubble the operator switched on — the
+  // client's keyframe reducer rebuilds the covered region from transcript rows
+  // and keeps only `role === "user"` bubbles. Counting streamed lanes separates
+  // the two without any text/body comparison (that ban stands).
+  let streamedAnswerLaneCount = 0;
+  /** Has the CURRENT assistant lane streamed yet — reset at each boundary. */
+  let currentLaneStreamed = false;
 
   /** The last agent run this turn owns, learned from `onAgentRunStart`. */
   let agentRunId: string | undefined;
@@ -1422,11 +1455,13 @@ export async function handleInboundMessage(
                           ...(answerStreamingEnabled
                             ? {
                                 onPartialReply: (p) => {
-                                  // #173: the settlement keyframe's precondition
-                                  // — an answer bubble the finalize path can
-                                  // overwrite exists only once answer text has
-                                  // actually streamed.
-                                  settlementAnswerStreamed = true;
+                                  // #173: count this lane once, on its first
+                                  // partial — a lane that streamed text is a
+                                  // lane a later finalize can overwrite.
+                                  if (!currentLaneStreamed) {
+                                    currentLaneStreamed = true;
+                                    streamedAnswerLaneCount += 1;
+                                  }
                                   draft!.pushAnswerText({
                                     text: p.text,
                                     delta: p.delta,
@@ -1434,6 +1469,12 @@ export async function handleInboundMessage(
                                   });
                                 },
                                 onAssistantMessageStart: () => {
+                                  // #173: a new assistant message opens a new
+                                  // answer lane, so the next partial counts
+                                  // again. Core fires this before that message's
+                                  // first chunk, and the two callbacks share one
+                                  // FIFO, so neither can overtake the other.
+                                  currentLaneStreamed = false;
                                   draft!.handleAssistantMessageBoundary();
                                 },
                                 onBlockReplyQueued: (payload, context) => {
@@ -1888,28 +1929,33 @@ export async function handleInboundMessage(
     // path — the corrupt delivery still happened; the keyframe corrects the
     // rendered result after settlement.
     //
-    // Gated on `settlementAnswerStreamed`: the glitch needs a live answer bubble
-    // to overwrite, and only an answer partial that actually streamed produces
-    // one. Without one — a non-partial mode, or a partial-mode turn the provider
-    // streamed no answer text on — two ordinary finals render [A,B] correctly,
-    // so a keyframe there would be a false-positive full replace that also
-    // truncates scrollback.
+    // Gated on `streamedAnswerLaneCount >= 2`: the glitch is a finalize landing
+    // on a lane that ALREADY streamed its own text while an earlier streamed
+    // lane is retained — so it takes two streamed answer lanes, and the benign
+    // same-routing shapes (an extra plain non-notice, non-error payload before
+    // or after the answer) stream only one. Fewer than two lanes streamed means
+    // the two finals rendered correctly, and a keyframe would be an unnecessary
+    // full replace of a correctly-rendered region.
     //
     // Read into consts so the `undefined` checks still narrow inside the
     // detached-scope callback below (a captured `let` would widen again).
     const keyframeSessionKey = settlementSessionKey;
     const keyframeHistoryLimit = settlementHistoryLimit;
     if (
-      settlementAnswerStreamed &&
+      streamedAnswerLaneCount >= 2 &&
       isResyncKeyframeRequired(finalReconciliation) &&
       keyframeSessionKey !== undefined &&
       keyframeHistoryLimit !== undefined
     ) {
-      // `runDetachedHistoryRead` is MANDATORY here, not decoration: this runs
-      // inside the inbound dispatch request scope, whose ambient operator client
-      // lacks `operator.read`, so an undetached `sessions.get` is rejected —
-      // and `historyRecent` swallows that rejection (best-effort contract), so
-      // the failure would surface only as a keyframe that never arrives.
+      // Why the detached scope. The gateway dispatch reads an ambient operator
+      // client out of an async-context request scope as the first step of its
+      // dispatch path, and falls through to a synthetic privileged client when
+      // NO client is ambient; a client that lacks `operator.read` gets the
+      // `sessions.get` rejected, and `historyRecent` swallows that rejection
+      // into `[]` — so the failure would be invisible except as a keyframe that
+      // never arrives. Whether this callback actually runs under such a scope is
+      // not established here. The detour is required if it does and costs
+      // nothing if it does not, which is why it is unconditional.
       //
       // `historyRecent` catches its own store errors and returns [] (best-effort,
       // matching the register-time snapshot). An empty read would REPLACE the
@@ -1922,10 +1968,36 @@ export async function handleInboundMessage(
       // ordering is what keeps #199 unreachable: a keyframe overtaken by the
       // next turn would wipe that turn's live `working:true` draft, flip the
       // client's `turnInFlight()` and release P1-9 held sends mid-turn.
-      const messages = await runDetachedHistoryRead(() =>
-        historyRecent(api, keyframeSessionKey, keyframeHistoryLimit, api.logger),
-      );
-      if (messages.length > 0) {
+      //
+      // BUT BOUNDED. This is the only awaited history read in the plugin, and
+      // the underlying session read carries no deadline of its own, so a read
+      // that never settles would wedge this peer's FIFO forever — after
+      // `turn_settled` already went out, so the widget would look idle while
+      // every later message buffered and was finally rejected as overloaded.
+      // Racing a timer converts that permanent wedge into one skipped keyframe.
+      let readTimer: ReturnType<typeof setTimeout> | undefined;
+      const messages = await Promise.race([
+        runDetachedHistoryRead(() =>
+          historyRecent(api, keyframeSessionKey, keyframeHistoryLimit, api.logger),
+        ),
+        new Promise<typeof KEYFRAME_READ_TIMED_OUT>((resolve) => {
+          readTimer = setTimeout(
+            () => resolve(KEYFRAME_READ_TIMED_OUT),
+            KEYFRAME_HISTORY_READ_TIMEOUT_MS,
+          );
+          // A pending keyframe read must never be the reason the process stays
+          // up; the shutdown path does not know about this timer.
+          readTimer.unref?.();
+        }),
+      ]).finally(() => {
+        // Cleared on BOTH arms — the read winning must not leave a live timer.
+        if (readTimer !== undefined) clearTimeout(readTimer);
+      });
+      if (messages === KEYFRAME_READ_TIMED_OUT) {
+        api.logger?.warn?.(
+          `webchannel: #173 keyframe resync history read timed out for peer=${logSafe(wsKey)} turn=${logSafe(turnId)} session=${logSafe(keyframeSessionKey)} timeoutMs=${logSafe(KEYFRAME_HISTORY_READ_TIMEOUT_MS)}`,
+        );
+      } else if (messages.length > 0) {
         let delivered = false;
         try {
           delivered = transport.sendKeyframe(wsKey, messages);
@@ -1937,6 +2009,14 @@ export async function handleInboundMessage(
             `webchannel: #173 keyframe resync was not delivered for peer=${logSafe(wsKey)} turn=${logSafe(turnId)}`,
           );
         }
+      } else {
+        // The signature fired and the projection came back EMPTY. `historyRecent`
+        // only warns when it catches a throw, so a successful-but-empty read is
+        // otherwise silent — and silence here is exactly the failure mode this
+        // whole change exists to remove: the feature goes inert with no signal.
+        api.logger?.warn?.(
+          `webchannel: #173 keyframe resync skipped — history projection was empty for peer=${logSafe(wsKey)} turn=${logSafe(turnId)} session=${logSafe(keyframeSessionKey)}`,
+        );
       }
     }
   }

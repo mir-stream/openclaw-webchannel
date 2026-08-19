@@ -231,31 +231,35 @@ function normalizeAll(
 /**
  * Detached async-context for history self-reads.
  *
- * History hydration calls `api.runtime.subagent.getSessionMessages`, which
- * dispatches the gateway `sessions.get` method — and that method authorizes
+ * THE RULE: every history self-read in this plugin runs inside this scope. Not
+ * a per-caller workaround — the exported contract for reaching the transcript.
+ *
+ * WHY. A history read calls `api.runtime.subagent.getSessionMessages`, which
+ * dispatches the gateway `sessions.get` method, and that method authorizes
  * against whatever operator client is ambient in the current gateway-request
- * scope. The initial-snapshot read happens inside the register-request handler,
- * whose ambient client is the plugin-auth client (no `operator.read`), so the
- * dispatch is rejected with `missing scope: operator.read` and history silently
- * degrades to `[]`.
+ * scope. A caller running under a scope whose client lacks `operator.read` has
+ * its dispatch rejected, and because the public wrappers below are best-effort
+ * (they catch and return `[]`) the rejection is INVISIBLE: history just goes
+ * quietly empty. Reads are made from several handlers and a handler's ambient
+ * client is not something the call site can inspect, so the rule is
+ * unconditional rather than case-by-case — the detour is free when the caller
+ * was already privileged.
  *
- * openclaw's own `deleteSession` sidesteps this by forcing a synthetic operator
- * client, but `getSessionMessages` exposes no such option to plugins. The one
- * lever a plugin has is the *calling context*: with NO ambient scoped client the
- * dispatcher falls through to a synthetic `operator.write` client (which implies
- * `operator.read`) and the read succeeds.
+ * The register-time snapshot is the case that first showed it: it reads inside
+ * the register-request handler, whose ambient client is the plugin-auth client
+ * with no `operator.read`, and history degraded to `[]` with `missing scope:
+ * operator.read` and nothing else. `load_history` paging and the #173
+ * settlement keyframe read from their own handlers and take the same route.
  *
- * This `AsyncResource` is constructed at module-evaluation time — before any
- * request scope can exist — so `runInAsyncScope` re-establishes that clean,
- * client-less context. Running the history read inside it escapes the request's
- * restricted client without touching openclaw core. See `docs/DEMO_PLAN.md`.
- *
- * EVERY history self-read must go through this, not just the register-time
- * snapshot and `load_history` paging: the #173 settlement keyframe reads the
- * transcript from inside the inbound NATS dispatch request scope, which is a
- * restricted-client scope for exactly the same reason. Without the detour that
- * read is rejected, `recent` swallows the rejection and returns `[]`, and the
- * keyframe is silently never sent.
+ * HOW. openclaw's own `deleteSession` sidesteps this by forcing a synthetic
+ * operator client, but `getSessionMessages` exposes no such option to plugins.
+ * The one lever a plugin has is the *calling context*: with NO ambient scoped
+ * client the dispatcher falls through to a synthetic `operator.write` client
+ * (which implies `operator.read`) and the read succeeds. This `AsyncResource`
+ * is constructed at module-evaluation time — before any request scope can exist
+ * — so `runInAsyncScope` re-establishes that clean, client-less context,
+ * escaping the request's restricted client without touching openclaw core.
+ * See `docs/DEMO_PLAN.md`.
  */
 const historyReadScope = new AsyncResource("webchannel:history-read");
 export const runDetachedHistoryRead = <T>(fn: () => Promise<T>): Promise<T> =>

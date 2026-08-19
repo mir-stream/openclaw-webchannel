@@ -18,6 +18,7 @@ import {
   deliverDraftFinalPayload,
   handleInboundMessage as handleInboundMessageForServingTenant,
   isResyncKeyframeRequired,
+  KEYFRAME_HISTORY_READ_TIMEOUT_MS,
   startAgentLifecycleSubscription,
   stopAgentLifecycleSubscription,
   type FinalReconciliationState,
@@ -127,13 +128,22 @@ function makeFakeApi(params: {
    * operator client — the failure mode `runDetachedHistoryRead` exists to avoid.
    */
   onSessionMessagesRead?: () => void;
+  /**
+   * #173: make `getSessionMessages` NEVER settle. The gateway session read
+   * carries no deadline of its own, which is why the awaited keyframe read
+   * needs one — without a bound this wedges the peer's inbound FIFO forever.
+   */
+  sessionMessagesNeverSettle?: boolean;
 }): {
   api: OpenClawPluginApi;
   captured: { buildContext?: BuildContextParams };
+  /** Every `logger.warn` record this api emitted, in order. */
+  warnings: string[];
   /** Push a lifecycle event to whatever the plugin subscribed. */
   emitLifecycle: (evt: LifecycleEvent) => void;
 } {
   const captured: { buildContext?: BuildContextParams } = {};
+  const warnings: string[] = [];
 
   const config = {
     channels: {
@@ -188,18 +198,26 @@ function makeFakeApi(params: {
       }
     : undefined;
 
-  const subagent = params.sessionMessages
-    ? {
-        getSessionMessages: async () => {
-          params.onSessionMessagesRead?.();
-          return { messages: params.sessionMessages };
-        },
-      }
-    : undefined;
+  const subagent =
+    params.sessionMessages || params.sessionMessagesNeverSettle
+      ? {
+          getSessionMessages: async () => {
+            params.onSessionMessagesRead?.();
+            if (params.sessionMessagesNeverSettle) return new Promise<never>(() => {});
+            return { messages: params.sessionMessages };
+          },
+        }
+      : undefined;
 
   const api = {
     config,
-    logger: { info: () => {}, warn: () => {}, error: () => {} },
+    logger: {
+      info: () => {},
+      warn: (message: string) => {
+        warnings.push(message);
+      },
+      error: () => {},
+    },
     runtime: { channel, ...(events ? { events } : {}), ...(subagent ? { subagent } : {}) },
   } as unknown as OpenClawPluginApi;
 
@@ -207,7 +225,7 @@ function makeFakeApi(params: {
     for (const l of [...listeners]) l(evt);
   };
 
-  return { api, captured, emitLifecycle };
+  return { api, captured, warnings, emitLifecycle };
 }
 
 /** A transport that records finalize frames and accepts progress/typing/text. */
@@ -1963,12 +1981,48 @@ describe("#173 keyframe resync — signature detection", () => {
 describe("handleInboundMessage — #173 keyframe resync at settlement", () => {
   const ordinary = { type: "user_message" as const, text: "do the thing" };
 
-  const twoOrdinaryFinals = async (turn: AssembledTurnLike) => {
-    // Tool-only turn: answer text streams first (that live bubble is what the
-    // overwrite destroys), then two ordinary non-error finals. In partial mode
-    // the first routes through finalize (overwrites the streamed bubble), the
-    // second delivers independent → the LIVE view is [A,A,B].
-    turn.replyOptions?.onPartialReply?.({ text: "first ans" });
+  /**
+   * A fixture helper found its callback missing.
+   *
+   * Recorded rather than only thrown: a `runImpl` throw is swallowed by
+   * `handleInboundMessage`'s own catch (it becomes an `error` turn outcome), so
+   * a broken fixture would otherwise surface as an unexplained zero-keyframe
+   * result — a fixture bug wearing the costume of a passing negative test. The
+   * `afterEach` below re-raises it with the actual reason.
+   */
+  let fixtureFailure: string | undefined;
+  beforeEach(() => {
+    fixtureFailure = undefined;
+  });
+  afterEach(() => {
+    if (fixtureFailure !== undefined) throw new Error(fixtureFailure);
+  });
+  const requireCallback = <T>(callback: T | undefined, what: string): T => {
+    if (typeof callback !== "function") {
+      fixtureFailure = `fixture: ${what} is not wired — this turn cannot exercise answer lanes`;
+      throw new Error(fixtureFailure);
+    }
+    return callback;
+  };
+
+  /** Stream answer text for the CURRENT assistant lane. */
+  const streamAnswerLane = (turn: AssembledTurnLike, text: string) => {
+    requireCallback(turn.replyOptions?.onPartialReply, "onPartialReply")({ text });
+  };
+  /** Open the NEXT assistant lane (core fires this before its first chunk). */
+  const openNextAnswerLane = (turn: AssembledTurnLike) => {
+    requireCallback(turn.replyOptions?.onAssistantMessageStart, "onAssistantMessageStart")();
+  };
+
+  const twoStreamedLanesThenTwoFinals = async (turn: AssembledTurnLike) => {
+    // The real #173 shape: the turn's last assistant message is tool-only, so
+    // core retains finals [A,B] for two assistant messages that BOTH already
+    // streamed their text. The first final routes through finalize and
+    // overwrites lane 2's streamed bubble with A; the second delivers
+    // independent → the LIVE view is [A,A,B] while the transcript is [A,B].
+    streamAnswerLane(turn, "first ans");
+    openNextAnswerLane(turn);
+    streamAnswerLane(turn, "second ans");
     await turn.delivery.deliver({ text: "first answer" }, { kind: "final" });
     await turn.delivery.deliver({ text: "second answer" }, { kind: "final" });
   };
@@ -1981,7 +2035,7 @@ describe("handleInboundMessage — #173 keyframe resync at settlement", () => {
     const { api } = makeFakeApi({
       streamingMode: "partial",
       sessionMessages: transcriptRows,
-      runImpl: twoOrdinaryFinals,
+      runImpl: twoStreamedLanesThenTwoFinals,
     });
     const { transport, keyframes } = makeFakeTransport();
 
@@ -1992,13 +2046,18 @@ describe("handleInboundMessage — #173 keyframe resync at settlement", () => {
     expect(keyframes[0].messages.map((m) => m.id)).toEqual(["A", "B"]);
   });
 
-  it("does NOT emit a keyframe for the SAME two finals in progress mode (no live answer bubble to overwrite)", async () => {
-    // `progress` mode never streams answer text, so [A,A,B] cannot occur and the
-    // signature — though it still fires on the routing shape — must not resync.
+  it("does NOT emit a keyframe for the SAME two finals in progress mode (no answer lane streams at all)", async () => {
+    // `progress` mode never wires answer-text streaming — that is the mode
+    // distinction — so no lane can stream, [A,A,B] cannot occur, and the
+    // signature (which still fires on the routing shape) must not resync.
     const { api } = makeFakeApi({
       streamingMode: "progress",
       sessionMessages: transcriptRows,
-      runImpl: twoOrdinaryFinals,
+      runImpl: async (turn) => {
+        expect(turn.replyOptions?.onPartialReply).toBeUndefined();
+        await turn.delivery.deliver({ text: "first answer" }, { kind: "final" });
+        await turn.delivery.deliver({ text: "second answer" }, { kind: "final" });
+      },
     });
     const { transport, keyframes } = makeFakeTransport();
 
@@ -2012,7 +2071,7 @@ describe("handleInboundMessage — #173 keyframe resync at settlement", () => {
       streamingMode: "partial",
       sessionMessages: [{ role: "assistant", text: "only answer", __openclaw: { id: "A" } }],
       runImpl: async (turn) => {
-        turn.replyOptions?.onPartialReply?.({ text: "only ans" });
+        streamAnswerLane(turn, "only ans");
         await turn.delivery.deliver({ text: "only answer" }, { kind: "final" });
       },
     });
@@ -2026,14 +2085,40 @@ describe("handleInboundMessage — #173 keyframe resync at settlement", () => {
   it("does NOT emit a keyframe in partial mode when NO answer text ever streamed", async () => {
     // Partial mode is only the PERMISSION to stream answer text; a provider that
     // emitted none (tool lines only) left no live answer bubble, so the same two
-    // finals render [A,B] correctly and a keyframe would be a pure false
-    // positive — an unnecessary full replace that truncates scrollback.
+    // finals render [A,B] correctly and a keyframe would be an unnecessary full
+    // replace of a correctly-rendered region.
     const { api } = makeFakeApi({
       streamingMode: "partial",
       sessionMessages: transcriptRows,
       runImpl: async (turn) => {
         await turn.delivery.deliver({ text: "first answer" }, { kind: "final" });
         await turn.delivery.deliver({ text: "second answer" }, { kind: "final" });
+      },
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(0);
+  });
+
+  it("does NOT emit a keyframe when only ONE answer lane streamed (benign extra final)", async () => {
+    // The shape a keyframe must never touch. Core's final-payload array
+    // reachably carries an extra plain payload that is neither a notice nor an
+    // error — a trailing plugin-status / raw-trace line under `/trace` or
+    // verbose, or a leading per-messaging-tool source-reply mirror. Only ONE
+    // lane streamed, so `[answer, status]` routes exactly like the glitch
+    // (finalize, then independent) yet renders CORRECTLY. A keyframe here would
+    // delete the status bubble the operator switched on, because the client's
+    // reducer rebuilds the covered region from transcript rows and keeps only
+    // `role === "user"` bubbles.
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: async (turn) => {
+        streamAnswerLane(turn, "the ans");
+        await turn.delivery.deliver({ text: "the answer" }, { kind: "final" });
+        await turn.delivery.deliver({ text: "plugin status: trace on" }, { kind: "final" });
       },
     });
     const { transport, keyframes } = makeFakeTransport();
@@ -2051,7 +2136,7 @@ describe("handleInboundMessage — #173 keyframe resync at settlement", () => {
     const { api } = makeFakeApi({
       streamingMode: "partial",
       sessionMessages: transcriptRows,
-      runImpl: twoOrdinaryFinals,
+      runImpl: twoStreamedLanesThenTwoFinals,
     });
     const { transport, keyframes } = makeFakeTransport();
     transport.finalizeDraft = () => false;
@@ -2059,6 +2144,57 @@ describe("handleInboundMessage — #173 keyframe resync at settlement", () => {
     await handleInboundMessage(api, transport, "peer-1", ordinary);
 
     expect(keyframes).toHaveLength(0);
+  });
+
+  it("does not hang and sends no keyframe when the transcript read never settles", async () => {
+    // The read is awaited on purpose (it holds the per-session FIFO so the next
+    // turn cannot overtake the keyframe), which puts it on that queue's critical
+    // path. The underlying session read has no deadline, so an unbounded await
+    // would wedge this peer permanently — AFTER `turn_settled` already went out,
+    // so the widget would look idle while everything behind it buffered.
+    const { api, warnings } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessagesNeverSettle: true,
+      runImpl: twoStreamedLanesThenTwoFinals,
+    });
+    const { transport, keyframes, settles } = makeFakeTransport();
+
+    vi.useFakeTimers();
+    try {
+      const pending = handleInboundMessage(api, transport, "peer-1", ordinary);
+      // Reaches the race, then the deadline fires. Without the bound this await
+      // never returns and the test times out.
+      await vi.advanceTimersByTimeAsync(KEYFRAME_HISTORY_READ_TIMEOUT_MS);
+      await pending;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(keyframes).toHaveLength(0);
+    // The turn itself still settled normally — only the cosmetic resync is lost.
+    expect(settles).toEqual(["ok"]);
+    expect(warnings.some((w) => w.includes("keyframe resync history read timed out"))).toBe(true);
+  });
+
+  it("warns instead of going silently inert when the projection comes back empty", async () => {
+    // A successful-but-EMPTY read logs nothing of its own, and the `length > 0`
+    // guard then skips the send. Silence there is the same invisible-failure
+    // mode this whole change exists to remove.
+    const { api, warnings } = makeFakeApi({
+      streamingMode: "partial",
+      // Present (so the read seam exists) but projecting to nothing: neither row
+      // survives normalization, so `history.recent` succeeds with [].
+      sessionMessages: [{ role: "assistant", text: "" }, { role: "tool", text: "x" }],
+      runImpl: twoStreamedLanesThenTwoFinals,
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(0);
+    expect(
+      warnings.some((w) => w.includes("keyframe resync skipped — history projection was empty")),
+    ).toBe(true);
   });
 
   it("reads the transcript in a DETACHED async scope, so the inbound request scope cannot reject it", async () => {
@@ -2071,7 +2207,7 @@ describe("handleInboundMessage — #173 keyframe resync at settlement", () => {
     const { api } = makeFakeApi({
       streamingMode: "partial",
       sessionMessages: transcriptRows,
-      runImpl: twoOrdinaryFinals,
+      runImpl: twoStreamedLanesThenTwoFinals,
       onSessionMessagesRead: () => {
         const client = ambientOperatorClient.getStore();
         if (client && !client.scopes.includes("operator.read")) {
