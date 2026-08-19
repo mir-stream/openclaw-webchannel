@@ -984,29 +984,24 @@ export async function handleInboundMessage(
   // read.
   let settlementSessionKey: string | undefined;
   let settlementHistoryLimit: number | undefined;
-  // #173: how many DISTINCT answer lanes streamed text this turn? An
-  // OBSERVATION counted at the `onPartialReply` / `onAssistantMessageStart`
-  // callbacks (both wired in partial mode only), never a config decision.
+  // #173: how many DISTINCT answer lanes streamed text this turn is NOT tracked
+  // here anymore. It is now read from the controller's authoritative lane state
+  // at settlement (`draft.streamedVisibleAnswerLaneCount()`), which counts BOTH
+  // rotation paths — including the divergence fail-safe `closeAndRotate`, which
+  // opens a new visible lane with NO `onAssistantMessageStart` boundary — and
+  // sets its per-lane flag only AFTER the reasoning filter, so a reasoning-only
+  // partial can never inflate the count. The old raw-callback bookkeeping missed
+  // the fail-safe lane (false negative) and counted filtered reasoning partials
+  // (false positive → a keyframe on a healthy turn deletes covered notices).
   //
-  // Two-or-more is the discriminator for the glitch, and the routing shape alone
-  // is not. #173 is defined over retained finals [A,B] where BOTH LANES HAVE
-  // ALREADY STREAMED: the first final finalizes lane 2 — overwriting the text
-  // lane 2 streamed — and the second appends, so the reader sees [A,A,B].
-  //
-  // The benign shapes that share the routing shape all stream exactly ONE lane,
-  // because the extra payload never streams at all: core's final-payload array
-  // reachably carries plain payloads that are neither notices nor errors — a
-  // per-messaging-tool source-reply mirror pushed BEFORE the answer, or a
-  // trailing plugin-status / raw-trace payload appended AFTER it under `/trace`
-  // or verbose. `[answer, status]` in partial mode routes exactly like the
+  // Two-or-more remains the discriminator for the glitch: #173 is defined over
+  // retained finals [A,B] where BOTH LANES HAVE ALREADY STREAMED: the first
+  // final finalizes lane 2 — overwriting the text lane 2 streamed — and the
+  // second appends, so the reader sees [A,A,B]. The benign shapes that share the
+  // routing shape all stream exactly ONE lane, because the extra payload never
+  // streams at all: `[answer, status]` in partial mode routes exactly like the
   // glitch (finalize, then independent) but RENDERS CORRECTLY, and a keyframe
-  // there would delete the status/trace bubble the operator switched on — the
-  // client's keyframe reducer rebuilds the covered region from transcript rows
-  // and keeps only `role === "user"` bubbles. Counting streamed lanes separates
-  // the two without any text/body comparison (that ban stands).
-  let streamedAnswerLaneCount = 0;
-  /** Has the CURRENT assistant lane streamed yet — reset at each boundary. */
-  let currentLaneStreamed = false;
+  // there would delete the status/trace bubble the operator switched on.
 
   /** The last agent run this turn owns, learned from `onAgentRunStart`. */
   let agentRunId: string | undefined;
@@ -1455,13 +1450,11 @@ export async function handleInboundMessage(
                           ...(answerStreamingEnabled
                             ? {
                                 onPartialReply: (p) => {
-                                  // #173: count this lane once, on its first
-                                  // partial — a lane that streamed text is a
-                                  // lane a later finalize can overwrite.
-                                  if (!currentLaneStreamed) {
-                                    currentLaneStreamed = true;
-                                    streamedAnswerLaneCount += 1;
-                                  }
+                                  // #173: the streamed-lane count is no longer
+                                  // kept here — it is read from the controller's
+                                  // authoritative lane state at settlement, which
+                                  // sets its per-lane flag only after the adapter
+                                  // filters reasoning partials.
                                   draft!.pushAnswerText({
                                     text: p.text,
                                     delta: p.delta,
@@ -1469,12 +1462,9 @@ export async function handleInboundMessage(
                                   });
                                 },
                                 onAssistantMessageStart: () => {
-                                  // #173: a new assistant message opens a new
-                                  // answer lane, so the next partial counts
-                                  // again. Core fires this before that message's
-                                  // first chunk, and the two callbacks share one
-                                  // FIFO, so neither can overtake the other.
-                                  currentLaneStreamed = false;
+                                  // Core fires this before that message's first
+                                  // chunk, and the two callbacks share one FIFO,
+                                  // so neither can overtake the other.
                                   draft!.handleAssistantMessageBoundary();
                                 },
                                 onBlockReplyQueued: (payload, context) => {
@@ -1866,6 +1856,14 @@ export async function handleInboundMessage(
       );
     }
 
+    // #173 (Finding 2): the client requires the anchor `turn_settled` BEFORE the
+    // `keyframe` for the settling turn. If the anchor settle failed to ship, a
+    // keyframe that goes out anyway duplicates the settling turn's own user row
+    // (PR2 reducer residual-source-5). Track whether the anchor settle — the
+    // iteration where `settleId === turnId`, pushed last — was actually
+    // delivered, and gate the keyframe on it. Defaults false, so a turn that is
+    // not settlement-eligible (no anchor settle sent) never emits a keyframe.
+    let anchorSettleDelivered = false;
     if (settlementEligible) {
       // #99: this turn may be the merge of N buffered user messages (P1-8b layer
       // (b) coalescing). Each of them was ACKed and holds its own P0-4 receipt,
@@ -1917,6 +1915,10 @@ export async function handleInboundMessage(
             `webchannel: turn_settled was not delivered for peer=${logSafe(wsKey)} turn=${logSafe(settleId)} outcome=${turnOutcome}`,
           );
         }
+        // #173 (Finding 2): remember the ANCHOR settle's fate specifically. The
+        // anchor is this turn's own id, pushed last, and it is the frame the
+        // keyframe must not overtake.
+        if (settleId === turnId) anchorSettleDelivered = delivered;
       }
     }
 
@@ -1929,9 +1931,10 @@ export async function handleInboundMessage(
     // path — the corrupt delivery still happened; the keyframe corrects the
     // rendered result after settlement.
     //
-    // Gated on `streamedAnswerLaneCount >= 2`: the glitch is a finalize landing
-    // on a lane that ALREADY streamed its own text while an earlier streamed
-    // lane is retained — so it takes two streamed answer lanes, and the benign
+    // Gated on `draft.streamedVisibleAnswerLaneCount() >= 2`: the glitch is a
+    // finalize landing on a lane that ALREADY streamed its own text while an
+    // earlier streamed lane is retained — so it takes two streamed answer lanes,
+    // read from the controller's authoritative lane state; the benign
     // same-routing shapes (an extra plain non-notice, non-error payload before
     // or after the answer) stream only one. Fewer than two lanes streamed means
     // the two finals rendered correctly, and a keyframe would be an unnecessary
@@ -1941,9 +1944,19 @@ export async function handleInboundMessage(
     // detached-scope callback below (a captured `let` would widen again).
     const keyframeSessionKey = settlementSessionKey;
     const keyframeHistoryLimit = settlementHistoryLimit;
+    // #173 (Finding 1): the streamed-lane count comes from the controller's
+    // authoritative lane state, which tracks BOTH rotation paths (including the
+    // divergence fail-safe `closeAndRotate`, with no boundary callback) and only
+    // counts lanes that streamed visible answer text past the reasoning filter.
+    // A missing draft (setup-failure paths) is treated as count 0 → no keyframe.
+    const streamedVisibleAnswerLaneCount =
+      draft?.streamedVisibleAnswerLaneCount() ?? 0;
     if (
-      streamedAnswerLaneCount >= 2 &&
+      streamedVisibleAnswerLaneCount >= 2 &&
       isResyncKeyframeRequired(finalReconciliation) &&
+      // #173 (Finding 2): never overtake the anchor turn_settled. If it failed to
+      // ship, the keyframe would duplicate the settling turn's user row.
+      anchorSettleDelivered &&
       keyframeSessionKey !== undefined &&
       keyframeHistoryLimit !== undefined
     ) {

@@ -2232,6 +2232,96 @@ describe("handleInboundMessage — #173 keyframe resync at settlement", () => {
     );
     expect(undetached).toEqual([]);
   });
+
+  // Finding 1 (false negative): the controller can open a NEW visible lane
+  // WITHOUT an `onAssistantMessageStart` boundary — the divergence fail-safe
+  // `closeAndRotate` fires when the cumulative partial diverges. The old raw-
+  // callback counter reset only on the boundary callback, so it stayed at 1 for
+  // this shape and no keyframe fired. Sourcing the count from the controller's
+  // lane state (which rotates on BOTH paths) counts both lanes.
+  it("emits a keyframe when the second lane opened via the divergence fail-safe (no boundary callback)", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: async (turn) => {
+        // Lane 1 streams its text.
+        streamAnswerLane(turn, "Lane one is present");
+        // A DIVERGENT cumulative partial — not a prefix-extension of lane 1 and
+        // no `replace` flag — makes the adapter rotate defensively via
+        // `closeAndRotate`, opening lane 2 with NO `onAssistantMessageStart`.
+        streamAnswerLane(turn, "Wholly different second lane");
+        // Lane 2 keeps streaming (a faithful prefix-extension, so it does not
+        // re-rotate).
+        streamAnswerLane(turn, "Wholly different second lane, extended");
+        // The [A,A,B] routing: first final finalizes lane 2 (non-independent),
+        // second delivers independent.
+        await turn.delivery.deliver({ text: "first answer" }, { kind: "final" });
+        await turn.delivery.deliver({ text: "second answer" }, { kind: "final" });
+      },
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(1);
+    expect(keyframes[0].messages.map((m) => m.id)).toEqual(["A", "B"]);
+  });
+
+  // Finding 1 (false positive): the old counter incremented in `onPartialReply`
+  // BEFORE the adapter filters reasoning partials, so a `Reasoning:\n` partial
+  // followed by a boundary and one real answer inflated the count to 2 — and the
+  // benign `[answer, status]` routing shape then wrongly fired a keyframe,
+  // deleting the covered status/trace bubble. Sourcing the count past the
+  // reasoning filter keeps it at 1 (the one lane that streamed VISIBLE text).
+  it("does NOT emit a keyframe when a filtered reasoning partial precedes the single visible answer lane", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: async (turn) => {
+        // A reasoning-prefixed partial the adapter drops (never sets a lane's
+        // visible-answer flag).
+        streamAnswerLane(turn, "Reasoning:\nthinking hard about the request");
+        // The boundary the old inbound counter reset on — it is what let the
+        // real answer inflate the raw count to 2.
+        openNextAnswerLane(turn);
+        // Exactly ONE lane streams visible answer text.
+        streamAnswerLane(turn, "the real answer");
+        // The benign `[answer, status]` shape: same finalize-then-independent
+        // routing as the glitch, but only one lane streamed, so it renders
+        // correctly and must not be keyframed.
+        await turn.delivery.deliver({ text: "the real answer" }, { kind: "final" });
+        await turn.delivery.deliver({ text: "plugin status: trace on" }, { kind: "final" });
+      },
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(0);
+  });
+
+  // Finding 2: the client requires the anchor `turn_settled` BEFORE the keyframe
+  // for the settling turn; if the settle frame failed but the keyframe still
+  // went out, the settling turn's own user row is duplicated. An otherwise
+  // glitch-shaped turn whose anchor settle fails must skip the keyframe.
+  it("does NOT emit a keyframe when the anchor turn_settled failed to deliver", async () => {
+    const glitchTurn = { type: "user_message" as const, text: "do the thing", id: "turn-anchor-fail" };
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: twoStreamedLanesThenTwoFinals,
+    });
+    const { transport, keyframes, settles } = makeFakeTransport({
+      failSettleFor: ["turn-anchor-fail"],
+    });
+
+    await handleInboundMessage(api, transport, "peer-1", glitchTurn);
+
+    // The settle frame was attempted (and reported failed); the keyframe is
+    // skipped so it cannot overtake the missing settle.
+    expect(settles).toEqual(["ok"]);
+    expect(keyframes).toHaveLength(0);
+  });
 });
 
 /**
