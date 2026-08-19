@@ -52,6 +52,7 @@ done
 
 # Pin the complete publish surface. npm prefixes every tar entry with package/.
 EXPECTED_FILES=$(cat <<'EOF'
+LICENSE
 README.md
 dist/abort-mirror.d.ts
 dist/abort-mirror.js

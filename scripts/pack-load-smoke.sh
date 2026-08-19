@@ -76,6 +76,7 @@ NODE
 
 # Pin the complete tarball surface. npm prefixes entries with `package/`.
 EXPECTED_FILES=$(cat <<'EOF'
+LICENSE
 README.md
 dist/index-nats.js
 dist/rotate-key-entry.js
