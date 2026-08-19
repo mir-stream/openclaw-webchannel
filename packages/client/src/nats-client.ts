@@ -180,11 +180,16 @@ export type InboundMessage = {
     //    to splice at, and the replace is then total — equivalent to a reload,
     //    accepted, and logged by the reducer rather than silent.
     //
-    //  - Sends the source transcript cannot account for are KEPT: local-only
-    //    chips (held or /stop-retracted, never published) and published sends
-    //    still awaiting a settled outcome. The sender reads the transcript at
-    //    settlement, and a turn dispatched after that read is absent from these
-    //    rows, so replacing over them would delete a message already on the wire.
+    //  - The replace discards a rendered user bubble ONLY when the reader knows
+    //    its send ran — that is, a settle named it (`turn_settled`). Everything
+    //    else is KEPT: local-only chips (held or /stop-retracted, never
+    //    published), sends still in flight, control-lane sends that never
+    //    settle, and failed sends. The sender reads the transcript at settlement,
+    //    so a turn dispatched after that read, a message the agent never admitted,
+    //    and an abort core consumed without an agent run are all absent from
+    //    these rows. The residual error is therefore always a DUPLICATE bubble,
+    //    corrected by the next snapshot — never a deletion, which is not
+    //    recoverable.
     | "keyframe"
     // P0-3: slash-command discovery catalog (carries `commands`).
     | "commands"

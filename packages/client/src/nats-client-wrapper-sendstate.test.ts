@@ -2034,11 +2034,15 @@ describe("#173 — a keyframe must not delete an already-transmitted send", () =
     h.wrapper.close();
   });
 
-  // Regression for the control-lane hole: an NL abort word publishes with
-  // `settlementEligible: false`, so it NEVER receives a turn_settled and stays at
-  // `accepted` for the life of the session. Preserving on sendState alone would
-  // re-append it at every keyframe — permanently doubled against its own row.
-  it("does not duplicate a control-lane send that can never settle", async () => {
+  // Regression for the control-lane hole. A `/stop`-shaped send publishes on the
+  // control lane and never receives a `turn_settled`, so it sits at `accepted`
+  // forever. In its NORMAL case core's fast-abort consumes it and no agent run
+  // happens, so NOTHING is appended to the transcript (the fall-through to an
+  // ordinary turn is the other branch of that disjunction — see the `/stop` note
+  // in packages/plugin/src/inbound.ts). Keying preservation on "will an outcome
+  // arrive?" deleted this bubble permanently; the rule is "did it run?", and we
+  // have no evidence it did — so it is kept, and kept exactly once.
+  it("keeps a fast-abort-consumed control-lane send, exactly once", async () => {
     const h = await connectWrapper();
     // An older row, so the keyframe below anchors instead of full-replacing.
     deliverOut(h.K, {
@@ -2061,26 +2065,27 @@ describe("#173 — a keyframe must not delete an already-transmitted send", () =
     await settle();
     expect(userBubble(h.wrapper, "stop")!.sendState).toBe("accepted"); // never promoted
 
-    // The core stored the abort text, so the keyframe covers it too.
+    // Core's fast-abort consumed it, so the transcript has NO row for it — the
+    // covering keyframe carries only the turn it aborted.
     const rows = [
       { id: "core-0", role: "agent", text: "earlier", ts: 0 },
-      { id: "core-1", role: "user", text: "stop", ts: 1 },
       { id: "core-A", role: "agent", text: "A", ts: 2 },
     ];
     deliverOut(h.K, { type: "keyframe", messages: rows });
     await settle();
     expect(h.wrapper.getState().messages.map((m) => `${m.role}:${m.text}`)).toEqual([
       "agent:earlier",
-      "user:stop",
       "agent:A",
+      "user:stop",
     ]);
 
-    // …and it stays that way: an unpromotable bubble would accumulate otherwise.
+    // …and it does not accumulate: an unpromotable bubble is re-derived, not re-added.
     deliverOut(h.K, { type: "keyframe", messages: rows });
     await settle();
     const after = h.wrapper.getState().messages;
     expect(after.filter((m) => m.text === "stop")).toHaveLength(1);
-    expect(after.map((m) => m.id)).toEqual(["core-0", "core-1", "core-A"]);
+    expect(after.map((m) => m.id)).toEqual(["core-0", "core-A", abort.id]);
+    expect(after[after.length - 1].sendState).toBe("accepted");
     h.wrapper.close();
   });
 

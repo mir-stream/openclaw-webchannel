@@ -2229,9 +2229,12 @@ export class WebChannelNATSClient {
         const keptPrefix = anchor > 0 ? this.state.messages.slice(0, anchor) : [];
 
         // PRESERVE, from the COVERED region only, user bubbles the keyframe's
-        // source transcript cannot account for. Three disjoint reasons, each
-        // decided from this client's own records — never from message text or
-        // position, and never by matching a bubble to a row.
+        // source transcript cannot account for. THE RULE: a covered user bubble
+        // is dropped only when this client holds POSITIVE EVIDENCE that its send
+        // ran and therefore became transcript material — and only a settle
+        // produces that evidence. Everything else is kept. Decided from this
+        // client's own records — never from message text or position, and never
+        // by matching a bubble to a row. Two reasons to keep:
         //
         //  (a) A held (pending) or /stop-retracted chip is LOCAL-ONLY: it was
         //      never published, so no transcript can contain it, and its text
@@ -2239,68 +2242,59 @@ export class WebChannelNATSClient {
         //      flag can appear on a published bubble (`publish` sets neither, and
         //      only held entries are ever flipped to `retracted`).
         //
-        //  (b) A published send that has not reached a settled outcome yet.
-        //      `sendState` ALONE is the wrong test: #96 control-lane publishes
-        //      (`/stop` and the whole NL abort vocabulary) are dispatched with
-        //      `settlementEligible: false`, so they NEVER receive a
-        //      `turn_settled` and stick at `accepted` forever — preserving on
-        //      state alone would re-append such a bubble at every keyframe and
-        //      double-render it against its own transcript row, permanently.
-        //      The receipt's `settlementEligible` is the discriminator: it says
-        //      whether an outcome is COMING, which is exactly what makes "not
-        //      settled yet" mean "not run yet" instead of "never settles".
-        //      Receipts are never deleted, so the lookup is safe; a bubble with
-        //      no receipt (server-hydrated, or an agent row) is not ours to keep.
+        //  (b) A published send with no evidence that it ran. That covers a send
+        //      still in flight (`queued`/`sent`/`accepted`), a #96 control-lane
+        //      publish (`/stop` and the NL abort vocabulary) which sticks at
+        //      `accepted` for the life of the session, and a FAILED one
+        //      (`overloaded`/`closed`/`terminal`/`evicted`/`cancelled`) — a
+        //      failure is simply one more case with no evidence of a run, and
+        //      dropping it would delete the user's text along with the retry
+        //      affordance attached to it. A bubble with no receipt
+        //      (server-hydrated, or an agent row) is not ours to keep.
+        //      `settlementEligible` was the old discriminator here and is GONE:
+        //      it answers "is an outcome COMING?", which is not the question.
+        //      A control-lane send is permanently ineligible, yet in its normal
+        //      case it never ran at all — core's fast-abort consumes it and
+        //      nothing is appended (the fall-through to an ordinary agent turn
+        //      is the OTHER branch of that disjunction; see the `/stop` note in
+        //      `packages/plugin/src/inbound.ts`). Keying on eligibility deleted
+        //      every Stop the user ever pressed.
         //
-        //  (c) A send that FAILED. A failure is this client's record that the
-        //      send did not become transcript material: rejected at ingress
-        //      (`overloaded`), never published on a retired/failed connection
-        //      (`closed`, `terminal`), dropped from our own unacked ledger
-        //      (`evicted`), or cancelled (`cancelled`). The keyframe's source
-        //      transcript therefore cannot carry the row, and dropping the
-        //      bubble would delete the user's typed text together with the
-        //      failure/retry affordance it is attached to.
-        //      `turn-failed` is the SINGLE exclusion, and the ground for
-        //      excluding it is WHERE THE REASON COMES FROM, not which word it
-        //      is: it is the one reason produced BY a settle
-        //      (`turn_settled{outcome:"error"}`), so the turn provably ran and
-        //      the transcript provably has the row — preserving it would
-        //      double-render. Do not extend this exclusion by listing more
-        //      reasons; a reason belongs here only if a settle is what emits it.
-        //      `settlementEligible` is deliberately NOT consulted on this
-        //      branch. A #96 control-lane send is `settlementEligible: false`,
-        //      but a FAILED one was never delivered either, so it must be kept;
-        //      that discriminator answers "not run yet vs. never settles" among
-        //      UN-failed published sends, which is a different question.
+        // The two exclusions are grounded in WHERE the evidence comes from — a
+        // settle — not in a list of state names: `completed` comes from
+        // `turn_settled{outcome:"ok"}`, `failed{turn-failed}` from
+        // `turn_settled{outcome:"error"}`. Do not extend the list with anything
+        // a settle does not emit.
         //
-        // ACCEPTED RESIDUAL RISK: `overloaded` can also come back for a message
-        // the agent had ALREADY admitted — the live-retry of an unacked id whose
-        // accepted-marker was evicted, documented in full on the `turnClosed`
-        // hook above. In that rare case the transcript DOES carry the row and
-        // the bubble preserved by (c) is a permanent duplicate. Accepted for the
-        // same reason the rest of this predicate errs toward keeping (below).
-        //
-        // ACCEPTED RESIDUAL RISK: if the `turn_settled` frame for a coalesced
-        // member is lost, that eligible send stays at `accepted` (see
-        // `promoteAnchor` and the `turn_settled` reducer, both of which describe
-        // this state as reachable) and is preserved here even though the keyframe
-        // carries its row — a duplicate bubble. Deliberate: a duplicate is
-        // corrected by the next snapshot, a deleted send is not recoverable at
-        // all, so this predicate errs toward keeping.
+        // ACCEPTED RESIDUAL RISK — this predicate's only failure mode is a
+        // DUPLICATE bubble, never a deletion. Four sources:
+        //  1. a coalesced member's `turn_settled` is lost → that send sits at
+        //     `accepted` forever (`promoteAnchor` and the `turn_settled` reducer
+        //     both document that state as reachable) while the keyframe carries
+        //     its row;
+        //  2. `overloaded` returned for a message the agent had ALREADY admitted
+        //     — the live-retry of an unacked id whose accepted-marker was evicted
+        //     (documented in full on the `turnClosed` hook above);
+        //  3. `evicted` is a CLIENT-side unacked-ledger cap drop, NOT evidence of
+        //     non-delivery (see ~`evicted` on that same hook: the message may
+        //     have reached the agent, been coalesced, and be the very id its turn
+        //     settles under) — it is kept because we lack evidence either way;
+        //  4. a control-lane send that fell THROUGH to an ordinary agent turn: its
+        //     row is in the transcript, and no settle will ever arrive to promote
+        //     it, so the duplicate is permanent.
+        // Deliberate in every case: a duplicate is corrected by the next snapshot
+        // or a reload; a deleted send is not recoverable at all.
         //
         // Order is kept (filter is stable) and these are re-appended at the tail.
         const covered = anchor >= 0 ? this.state.messages.slice(anchor) : this.state.messages;
         const preserved = covered.filter((m) => {
           if (m.role !== "user") return false;
           if (m.pending === true || m.retracted === true) return true;
-          // No receipt → server-hydrated, not ours to keep. Ahead of (c): a
-          // bubble we have no record of publishing cannot claim a failure.
           if (m.receiptKey === undefined) return false;
-          if (m.sendState === "failed") return m.sendFailure?.reason !== "turn-failed";
-          if (m.sendState !== "queued" && m.sendState !== "sent" && m.sendState !== "accepted") {
-            return false;
-          }
-          return this.receipts.get(m.receiptKey)?.settlementEligible === true;
+          // Keep unless this client holds POSITIVE evidence the send ran.
+          if (m.sendState === "completed") return false;
+          if (m.sendState === "failed" && m.sendFailure?.reason === "turn-failed") return false;
+          return true;
         });
 
         // Idempotent: re-applying the same keyframe re-finds the anchor at the
