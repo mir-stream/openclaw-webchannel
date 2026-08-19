@@ -2164,6 +2164,78 @@ export class WebChannelNATSClient {
         return;
       }
 
+      case "keyframe": {
+        // #173: an AUTHORITATIVE REPLACE, not the additive merge `history` does.
+        // The plugin sends this at settlement when it detected the tool-only-turn
+        // overwrite path corrupted the live view ([A,A,B]). We re-establish ground
+        // truth from the transcript exactly as a fresh reload would — but only for
+        // the REGION the keyframe covers. The plugin sends a tail window (<= the
+        // history limit), so a device that paginated OLDER scrollback in must keep
+        // it; a blanket replace would collapse the timeline to the window. The
+        // keyframe does NOT merge/dedup row-by-row — it REPLACES its covered
+        // region — so there is no per-bubble identity mapping to get wrong.
+        const incoming = Array.isArray(msg.messages) ? msg.messages : [];
+
+        // PRESERVE local-only user chips (pending or /stop-retracted): they were
+        // never on the wire and are absent from the transcript the keyframe
+        // rebuilds from, so a replace would drop them. Original order is kept
+        // (filter is stable), and they are re-appended at the tail below.
+        const preserved = this.state.messages.filter(
+          (m) => m.role === "user" && (m.pending === true || m.retracted === true),
+        );
+
+        // Rebuild the keyframe rows using the SAME ordered, one-bubble-per-row
+        // insert the empty-state history hydration uses (working:false), so the
+        // covered region equals what a reloading device would render. Same row
+        // validation as the `history` reducer above. Rows are oldest→newest.
+        const rebuilt: ChatMessage[] = [];
+        for (const m of incoming) {
+          if (!m || typeof m !== "object") continue;
+          if (typeof m.id !== "string" || m.id.length === 0) continue;
+          if (m.role !== "user" && m.role !== "agent") continue;
+          if (typeof m.text !== "string") continue;
+          rebuilt.push({
+            id: m.id,
+            role: m.role,
+            text: m.text,
+            ts: m.ts,
+            working: false,
+          });
+        }
+
+        // The keyframe covers the transcript from its OLDEST row forward. Older
+        // loaded history bubbles carry the SAME transcript ids, so the boundary
+        // lines up: find where this keyframe's oldest row sits in the current
+        // timeline. No valid rows (never sent by the plugin — it gates on a
+        // non-empty read) leaves `oldestKfId` undefined → no anchor → full replace.
+        const oldestKfId = rebuilt[0]?.id;
+        const anchor =
+          oldestKfId === undefined
+            ? -1
+            : this.state.messages.findIndex((m) => m.id === oldestKfId);
+
+        // Keep strictly-older scrollback the keyframe does NOT cover (everything
+        // before the anchor), minus any local chips (re-appended at the tail, so
+        // never duplicated into the kept prefix). No overlap (fresh session, or
+        // the device's coverage is shorter than the window) → anchor -1 → keep
+        // nothing: a safe full replace, the prior behaviour for those cases.
+        const keptPrefix =
+          anchor > 0
+            ? this.state.messages
+                .slice(0, anchor)
+                .filter(
+                  (m) =>
+                    !(m.role === "user" && (m.pending === true || m.retracted === true)),
+                )
+            : [];
+
+        // Idempotent: re-applying the same keyframe re-finds the anchor at the
+        // same boundary, so `keptPrefix` ends right before the oldest row and
+        // `rebuilt`/`preserved` re-derive identically, yielding the same array.
+        this.setState({ messages: [...keptPrefix, ...rebuilt, ...preserved] });
+        return;
+      }
+
       case "typing": {
         this.setState({ isTyping: true });
         return;

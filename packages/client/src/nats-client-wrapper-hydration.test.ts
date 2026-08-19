@@ -265,3 +265,167 @@ describe("#95 WP B — live timeline converges to the row sequence", () => {
     expect(draftAfter?.id).toBe("draft-1");
   });
 });
+
+/**
+ * #173 — the keyframe is an AUTHORITATIVE REPLACE of the region it COVERS, not
+ * the additive merge `history` performs and not a blanket wipe. The plugin emits
+ * it at settlement when it detected the tool-only-turn overwrite path corrupted
+ * the live view ([A,A,B]). The client rebuilds the covered region from the rows
+ * exactly as a fresh reload would, keeps any strictly-older paginated scrollback
+ * the window does not carry, and re-appends its local not-yet-transmitted chips.
+ */
+describe("#173 WP — keyframe is an authoritative replace", () => {
+  function keyframe(...messages: Row[]): AnyFrame {
+    return { type: "keyframe", messages };
+  }
+
+  const KEYFRAME_ROWS: Row[] = [
+    { id: "A", role: "agent", text: "A", ts: 1 },
+    { id: "B", role: "agent", text: "B", ts: 2 },
+  ];
+
+  /** The live-corruption shape #173 describes: A finalized twice, then B. */
+  function seedCorruptLiveView(w: WebChannelNATSClient): void {
+    deliver(w, { type: "agent_message", id: "live-1", text: "A" });
+    deliver(w, { type: "agent_message", id: "live-2", text: "A" });
+    deliver(w, { type: "agent_message", id: "live-3", text: "B" });
+    expect(timeline(w)).toEqual(["agent:A", "agent:A", "agent:B"]);
+  }
+
+  it("a keyframe [A,B] over a live [A,A,B] yields [A,B] — the extra bubble is gone", () => {
+    const w = makeWrapper();
+    seedCorruptLiveView(w);
+
+    deliver(w, keyframe(...KEYFRAME_ROWS));
+
+    expect(timeline(w)).toEqual(["agent:A", "agent:B"]);
+    // Canonical transcript ids and working:false — the corrupt live ids are gone.
+    const messages = w.getState().messages;
+    expect(messages.map((m) => m.id)).toEqual(["A", "B"]);
+    expect(messages.every((m) => m.working === false)).toBe(true);
+  });
+
+  it("ordering and content equal a fresh reload of the same rows", () => {
+    const live = makeWrapper();
+    seedCorruptLiveView(live);
+    deliver(live, keyframe(...KEYFRAME_ROWS));
+
+    // A cold reload hydrates the SAME rows via history into empty state.
+    const cold = makeWrapper();
+    deliver(cold, history(...KEYFRAME_ROWS));
+
+    expect(timeline(live)).toEqual(timeline(cold));
+    expect(live.getState().messages.map((m) => m.id)).toEqual(
+      cold.getState().messages.map((m) => m.id),
+    );
+  });
+
+  it("preserves paginated older scrollback outside the keyframe window", () => {
+    const w = makeWrapper();
+    // Older scrollback the device paginated in (canonical transcript ids)…
+    deliver(
+      w,
+      history(
+        { id: "older1", role: "user", text: "q1", ts: 1 },
+        { id: "older2", role: "agent", text: "r1", ts: 2 },
+        { id: "older3", role: "user", text: "q2", ts: 3 },
+        { id: "older4", role: "agent", text: "r2", ts: 4 },
+        { id: "older5", role: "user", text: "q3", ts: 5 },
+      ),
+    );
+    // …then the corrupt live tail ([A,A,B]).
+    deliver(w, { type: "agent_message", id: "live-1", text: "A" });
+    deliver(w, { type: "agent_message", id: "live-2", text: "A" });
+    deliver(w, { type: "agent_message", id: "live-3", text: "B" });
+    expect(w.getState().messages.map((m) => m.id)).toEqual([
+      "older1",
+      "older2",
+      "older3",
+      "older4",
+      "older5",
+      "live-1",
+      "live-2",
+      "live-3",
+    ]);
+
+    // The keyframe is a tail window that OVERLAPS at older4 and carries the
+    // corrected tail.
+    deliver(
+      w,
+      keyframe(
+        { id: "older4", role: "agent", text: "r2", ts: 4 },
+        { id: "older5", role: "user", text: "q3", ts: 5 },
+        { id: "A", role: "agent", text: "A", ts: 6 },
+        { id: "B", role: "agent", text: "B", ts: 7 },
+      ),
+    );
+
+    // older1..3 kept (uncovered scrollback), older4/5 rebuilt from the keyframe,
+    // the extra bubble gone — no truncation to the window.
+    expect(w.getState().messages.map((m) => m.id)).toEqual([
+      "older1",
+      "older2",
+      "older3",
+      "older4",
+      "older5",
+      "A",
+      "B",
+    ]);
+  });
+
+  it("falls back to a full replace when the keyframe's oldest id is absent (no overlap)", () => {
+    const w = makeWrapper();
+    // A live bubble whose id the keyframe does not cover.
+    deliver(w, { type: "agent_message", id: "live-x", text: "stale" });
+
+    deliver(
+      w,
+      keyframe(
+        { id: "N1", role: "user", text: "hi", ts: 1 },
+        { id: "N2", role: "agent", text: "yo", ts: 2 },
+      ),
+    );
+
+    // No overlap → full replace with the keyframe rows.
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["N1", "N2"]);
+    expect(timeline(w)).toEqual(["user:hi", "agent:yo"]);
+  });
+
+  it("applying the same keyframe twice is idempotent", () => {
+    const w = makeWrapper();
+    seedCorruptLiveView(w);
+
+    deliver(w, keyframe(...KEYFRAME_ROWS));
+    const once = w.getState().messages;
+    deliver(w, keyframe(...KEYFRAME_ROWS));
+
+    expect(w.getState().messages).toEqual(once);
+  });
+
+  it("preserves a pending local user chip at the tail", () => {
+    const w = makeWrapper();
+    seedCorruptLiveView(w);
+    // A turn is in flight (typing), so the next send is HELD as a local-only
+    // pending chip — never on the wire, absent from the transcript a keyframe
+    // rebuilds from.
+    deliver(w, { type: "typing" });
+    w.send("unsent draft");
+    const pending = w
+      .getState()
+      .messages.find((m) => m.pending === true && m.role === "user");
+    expect(pending).toBeDefined();
+
+    deliver(w, keyframe(...KEYFRAME_ROWS));
+
+    const after = w.getState().messages;
+    // Agent rows rebuilt from the keyframe, the pending chip re-appended at the tail.
+    expect(after.map((m) => `${m.role}:${m.text}`)).toEqual([
+      "agent:A",
+      "agent:B",
+      "user:unsent draft",
+    ]);
+    const tail = after[after.length - 1];
+    expect(tail.pending).toBe(true);
+    expect(tail.id).toBe(pending!.id);
+  });
+});
