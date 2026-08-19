@@ -124,10 +124,21 @@ jobs:
         run: |
           node node_modules/openclaw/node_modules/playwright-core/cli.js install chromium
 
-      - name: Install Playwright Chromium system dependencies
-        # Always install system deps — they live outside the browser cache.
-        run: |
-          node node_modules/openclaw/node_modules/playwright-core/cli.js install-deps chromium
+      # Verify rather than provision. `install-deps chromium` used to run here on
+      # the reasoning that host packages live outside the browser cache and so
+      # must be reinstalled every run. True — but on the hosted ubuntu image all
+      # 26 libraries Chromium links are already present, so the command spent
+      # ~130s on an `apt-get update` (11.4 MB of indexes) only to report
+      # "already the newest version" 26 times, then installed 9 CJK/X font
+      # packages. Nothing in this gate renders text: the Chromium peer asserts
+      # NATS frames and ids, never pixels.
+      #
+      # Booting the same binary with the same flags proves more than the install
+      # did, in ~1s. If a runner image ever does drop a library this fails here
+      # with Playwright's own diagnostic naming it — install exactly that, and do
+      # not restore the blanket install-deps.
+      - name: Verify Chromium launches with the e2e flags
+        run: node scripts/check-chromium-launchable.mjs
 
       # ──────────────────────────────────────────────────────────────────────
       # 5. Typecheck — all 3 packages must be clean
