@@ -2176,17 +2176,26 @@ export class WebChannelNATSClient {
         // region — so there is no per-bubble identity mapping to get wrong.
         const incoming = Array.isArray(msg.messages) ? msg.messages : [];
 
-        // SENDER INPUT CONTRACT: rows carry unique ids and run oldest→newest.
+        // SENDER INPUT CONTRACT:
+        //  - rows carry unique ids and run oldest→newest;
+        //  - for a given settlement, `turn_settled` must reach the client BEFORE
+        //    the `keyframe`. The sender reads the transcript AT settlement, so
+        //    the frame already carries the settling turn's own user row; the
+        //    client must therefore already know that send ran, or the predicate
+        //    below has no evidence, keeps the local bubble, and renders the
+        //    user's message twice. This one is not an anomaly — reverse the two
+        //    frames and it fires on EVERY settled turn (residual source 5).
         //
         // Rebuild the keyframe rows using the SAME ordered, one-bubble-per-row
         // insert the empty-state history hydration uses (working:false), so the
         // covered region equals what a reloading device would render. Same row
         // validation as the `history` reducer above, and the same guarantee it
         // gets from its own `seen` Set — scoped to what this frame BUILDS: no id
-        // is rendered twice across `keptPrefix ++ rebuilt`. It does NOT extend to
-        // the preserved tail, which may legitimately re-append a bubble whose row
-        // the frame also carries (accepted residual cases 1 and 4 below); that
-        // duplicate is the deliberate price of never deleting a send.
+        // is rendered twice across `keptPrefix ++ rebuilt`, unconditionally. It
+        // does NOT extend to the preserved tail, which may legitimately re-append
+        // a bubble whose row the frame also carries (accepted residual cases 1, 4
+        // and 5 below); that duplicate is the deliberate price of never deleting
+        // a send.
         //
         // That reducer seeds `seen` from EXISTING STATE, so one Set buys it both
         // halves at once. This reducer needs two, because it emits two segments:
@@ -2205,6 +2214,19 @@ export class WebChannelNATSClient {
         // older copy, so a sender re-emitting a corrected row later in the same
         // frame has its correction dropped — harmless while the contract holds,
         // and the contract is what makes it a non-case.
+        //
+        // A row claiming a rendered LOCAL-ONLY id is not transcript material —
+        // that namespace (`u-<n>`) is this client's own, while transcript rows
+        // carry core ids from the envelope (or `h-…` from the history fallback).
+        // Such a row is crafted or a sender bug, so skipping it deletes nothing.
+        // This is what lets `keptPrefix` keep chips with NO carve-out, which is
+        // what makes the no-duplicate-id guarantee above hold unconditionally.
+        const localOnlyIds = new Set(
+          this.state.messages
+            .filter((m) => m.pending === true || m.retracted === true)
+            .map((m) => m.id),
+        );
+
         const rebuilt: ChatMessage[] = [];
         const seen = new Set<string>();
         for (const m of incoming) {
@@ -2212,6 +2234,7 @@ export class WebChannelNATSClient {
           if (typeof m.id !== "string" || m.id.length === 0) continue;
           if (m.role !== "user" && m.role !== "agent") continue;
           if (typeof m.text !== "string") continue;
+          if (localOnlyIds.has(m.id)) continue;
           if (seen.has(m.id)) continue;
           seen.add(m.id);
           rebuilt.push({
@@ -2259,13 +2282,13 @@ export class WebChannelNATSClient {
         // in `keptPrefix` AND in `rebuilt`. No sender defect required; the
         // keyframe row is the authoritative copy, so the prefix yields.
         //
-        // Chips are EXEMPT unconditionally. A bare `!seen.has(m.id)` would let a
-        // frame that happened to carry a local id (`u-0`) DELETE local-only text
-        // from the prefix, and nothing in this reducer may ever delete that. It
-        // is also what the promise above — chips up there stay exactly as they
-        // stand — actually requires.
+        // Chips need no carve-out here, and must not have one: `seen` cannot
+        // contain a chip id, because `localOnlyIds` already dropped any row that
+        // claimed one. The filter is therefore uniform, and a chip up here still
+        // stays exactly where it stands — the promise above holds by that skip
+        // rather than by an exception in this line.
         const keptPrefix = (anchor > 0 ? this.state.messages.slice(0, anchor) : []).filter(
-          (m) => m.pending === true || m.retracted === true || !seen.has(m.id),
+          (m) => !seen.has(m.id),
         );
 
         // PRESERVE, from the COVERED region only, user bubbles the keyframe's
@@ -2307,7 +2330,7 @@ export class WebChannelNATSClient {
         // a settle does not emit.
         //
         // ACCEPTED RESIDUAL RISK — this predicate's only failure mode is a
-        // DUPLICATE bubble, never a deletion. Four sources:
+        // DUPLICATE bubble, never a deletion. Five sources:
         //  1. a coalesced member's `turn_settled` is lost → that send sits at
         //     `accepted` forever (`promoteAnchor` and the `turn_settled` reducer
         //     both document that state as reachable) while the keyframe carries
@@ -2324,14 +2347,25 @@ export class WebChannelNATSClient {
         //     way;
         //  4. a control-lane send that fell THROUGH to an ordinary agent turn: its
         //     row is in the transcript, and no settle will ever arrive to promote
-        //     it.
-        // In ALL FOUR the duplicate is permanent for the life of the page: no
-        // later frame removes it. `history` is additive and dedups by id, so it
-        // can never delete the extra bubble; a repeat keyframe re-derives the
-        // identical preserve, because the bubble's `sendState` never changes
-        // again. Only a RELOAD clears it. Deliberate even so: a reload does fix a
-        // duplicate, while text that never entered the transcript is gone for
-        // good once deleted — not recoverable by a reload or anything else.
+        //     it;
+        //  5. FRAME ORDERING — a `keyframe` that arrives BEFORE the
+        //     `turn_settled` for the settlement that produced it. The frame
+        //     carries the settling turn's own user row, but the bubble is not yet
+        //     `completed`, so there is no evidence it ran and it is kept. Unlike
+        //     1-4 this is not an anomaly: get the order wrong and it fires on
+        //     EVERY settled turn. It is why the ordering is now a stated sender
+        //     obligation (see the SENDER INPUT CONTRACT above). No client-side
+        //     defence here — detecting it needs the snapshot boundary (#197).
+        // In 1-4 the duplicate is permanent for the life of the page: no later
+        // frame removes it. `history` is additive and dedups by id, so it can
+        // never delete the extra bubble; a repeat keyframe re-derives the
+        // identical preserve, because in those four the bubble's `sendState` is
+        // genuinely terminal and never changes again. Only a RELOAD clears them.
+        // Source 5 is the exception in both directions: the late `turn_settled`
+        // DOES promote the bubble to `completed`, so the NEXT keyframe drops it.
+        // Deliberate even so: a duplicate is fixed by a reload or a later
+        // snapshot, while text that never entered the transcript is gone for good
+        // once deleted — not recoverable by a reload or anything else.
         //
         // Order is kept (filter is stable) and these are re-appended at the tail.
         const covered = anchor >= 0 ? this.state.messages.slice(anchor) : this.state.messages;

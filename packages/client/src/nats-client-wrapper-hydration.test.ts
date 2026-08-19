@@ -626,12 +626,16 @@ describe("#173 WP — keyframe is an authoritative replace", () => {
   });
 
   /**
-   * The other half of "no id renders twice", and this one needs NO sender defect
-   * — it chains off this reducer's own tail preservation. Rendered order legally
-   * diverges from transcript order once a preserved bubble is re-appended at the
-   * tail and `history` adopts it onto a canonical id; a later keyframe anchoring
-   * there finds intervening canonical rows sitting in FRONT of the anchor, i.e.
-   * in `keptPrefix` and in `rebuilt` at once.
+   * The other half of "no id renders twice": a row whose id sits in the uncovered
+   * prefix.
+   *
+   * This fixture INDUCES the divergence directly, with an out-of-order `history`
+   * frame — the shortest way to put a keyframe row in front of the anchor. It is
+   * not a claim that a sender defect is required: the reachable-without-a-defect
+   * chain (a preserved bubble re-appended at the tail, adopted onto a canonical
+   * id by `history`, then a later keyframe anchoring there) is documented on
+   * `keptPrefix` in the reducer. What is asserted here is the reducer's response,
+   * which is identical either way.
    *
    * A duplicate ID is worse than a duplicate bubble: `upsertMessage` and
    * `patchBubbleByReceiptKey` patch only the first match, and the next keyframe's
@@ -667,10 +671,12 @@ describe("#173 WP — keyframe is an authoritative replace", () => {
 
   /**
    * …but the prefix filter must never become a deletion path for local text. A
-   * frame carrying a local id (crafted, or a sender bug) would otherwise remove
-   * an unsent chip from the prefix — the one thing this reducer may never do.
+   * frame carrying a local id (crafted, or a sender bug) must neither remove the
+   * unsent chip from the prefix — the one thing this reducer may never do — NOR
+   * render that id twice. Both are covered by dropping the ROW: the `u-<n>`
+   * namespace is the client's own, so such a row is never transcript material.
    */
-  it("keeps a prefix chip even when the keyframe carries its id", () => {
+  it("keeps a prefix chip exactly once when the keyframe carries its id", () => {
     const w = makeWrapper();
     deliver(w, history({ id: "o1", role: "agent", text: "r0", ts: 1 }));
     // A held chip, then a later turn's reply after it.
@@ -690,8 +696,11 @@ describe("#173 WP — keyframe is an authoritative replace", () => {
       ),
     );
 
-    // The chip is still there, still local, still where the user left it.
+    // The chip is still there, still local, still where the user left it — and
+    // rendered ONCE. The frame's row for that id was dropped, not merged.
     const after = w.getState().messages;
+    expect(after.map((m) => m.id)).toEqual(["o1", chip.id, "o2"]);
+    expect(after.filter((m) => m.id === chip.id)).toHaveLength(1);
     const kept = after.find((m) => m.id === chip.id && m.pending === true);
     expect(kept).toBeDefined();
     expect(kept!.text).toBe("unsent secret");
