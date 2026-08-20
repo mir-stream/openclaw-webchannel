@@ -544,6 +544,16 @@ export class NatsChannel implements WebChannelPeerChannel {
   }
 
   /**
+   * #173: send an authoritative-replace keyframe. Same projection and sealed
+   * `.out` path as `sendHistory`; the frame type tells the client to REPLACE its
+   * rendered state from these rows rather than merge them additively.
+   */
+  sendKeyframe(peerId: string, messages: HistoryMessage[]): boolean {
+    const payload: OutboundWsMessage = { type: "keyframe", messages };
+    return this.sendToPeer(peerId, payload);
+  }
+
+  /**
    * Send the slash-command catalog to peer (P0-3 discovery). Rides the same
    * sealed `.out` path as every other outbound frame.
    */

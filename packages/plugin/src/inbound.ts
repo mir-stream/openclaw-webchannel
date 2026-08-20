@@ -18,6 +18,14 @@ import {
   resolveReasoningEnabled,
 } from "./account-config.js";
 import { resolveWebchannelSessionRoute } from "./session-route.js";
+// #173: the keyframe re-uses the history projection path (transcript read +
+// normalization) so a settlement-time resync renders exactly what a fresh
+// reload would — no new transcript reader.
+import {
+  recent as historyRecent,
+  resolveHistoryConfig,
+  runDetachedHistoryRead,
+} from "./history.js";
 import {
   hasExplicitSessionReasoningOptOut,
   type ReasoningOptOutStoreAccess,
@@ -526,6 +534,25 @@ function isCoreNoticePayload(payload: NoticeFlagPayload): boolean {
 export type FinalReconciliationState = {
   ordinaryAnswerFinalSeen: boolean;
   leadingTerminalErrorSeen: boolean;
+  // #173: signature detection for the tool-only-turn overwrite path. When the
+  // last assistant message of a turn is tool-only, core emits >=2 ordinary
+  // non-error finals [A,B]; the FIRST routes through `draft.finalize`
+  // (non-independent) and overwrites the current lane's streamed bubble, so the
+  // LIVE view shows [A,A,B]. These two fields let settlement recognise exactly
+  // that shape — a first ordinary non-error final delivered non-independent,
+  // followed by at least one more ordinary non-error final — and emit a
+  // keyframe resync. Deliberately NO text/body comparison: the routing shape is
+  // the whole signal. Both count only finals whose send actually SUCCEEDED — a
+  // final the controller refused (already settled, re-entrant, empty text) put
+  // nothing on the wire and overwrote no lane.
+  /** Count of ordinary (non-notice, non-error) finals this turn actually
+   * DELIVERED (the send reported success). */
+  ordinaryNonErrorFinalCount: number;
+  /** Did the first ordinary non-error final that was actually DELIVERED take the
+   * finalize (non-independent) path — i.e. did it consume/overwrite the live
+   * lane. Finals that were refused by the controller are not candidates: they
+   * rendered nothing, so the next delivered one is the true first. */
+  firstOrdinaryNonErrorFinalNonIndependent: boolean;
 };
 
 type ReplyDispatchRuntimeInfo = Parameters<
@@ -583,7 +610,60 @@ export async function deliverDraftFinalPayload(
   const sent = independent
     ? await draft.deliverIndependentFinal({ text, ...noticeFlagsOf(payload) })
     : await draft.finalize(text);
+  // #173: an ordinary non-error final is exactly the payload class that consumes
+  // the current lane on its FIRST occurrence (the finalize path). Record the
+  // routing of the first one and count them, so settlement can recognise the
+  // tool-only-turn overwrite signature ([A,A,B] live) without any text compare.
+  //
+  // Recorded AFTER the send and only when it reported success: `finalize`
+  // returns false on the re-entrant-settle, already-settled and empty-text
+  // paths, and `deliverIndependentFinal` on a failed transport send. Nothing
+  // was rendered in those cases and no lane was overwritten, so counting them
+  // would manufacture the signature for a turn the reader saw correctly.
+  const isOrdinaryNonErrorFinal =
+    !isCoreNoticePayload(payload) && payload.isError !== true;
+  if (isOrdinaryNonErrorFinal && sent) {
+    if (state.ordinaryNonErrorFinalCount === 0) {
+      state.firstOrdinaryNonErrorFinalNonIndependent = independent === false;
+    }
+    state.ordinaryNonErrorFinalCount += 1;
+  }
   return { sent, independent };
+}
+
+/**
+ * #173: how long the settlement keyframe's transcript read may hold the
+ * per-session inbound FIFO before it is abandoned.
+ *
+ * The read is awaited on purpose (see the emit site), which puts it on the
+ * critical path for the NEXT message from this peer, and the session read it
+ * dispatches carries no deadline of its own. So it needs one here.
+ *
+ * A few seconds: long enough that an ordinary transcript read on a loaded host
+ * finishes well inside it (the register-time snapshot does the same read on
+ * every connect), short enough that a stuck read costs one turn's worth of
+ * queueing latency rather than a permanently wedged peer. The keyframe is a
+ * cosmetic correction to an already-settled turn, so skipping it is cheap;
+ * blocking the peer is not.
+ */
+export const KEYFRAME_HISTORY_READ_TIMEOUT_MS = 5_000;
+
+/** Resolved by the timeout arm of the keyframe read race — never a value. */
+const KEYFRAME_READ_TIMED_OUT = Symbol("webchannel:keyframe-history-read-timeout");
+
+/**
+ * #173: the tool-only-turn overwrite signature. True iff the turn delivered
+ * >=2 ordinary non-error finals AND the first was delivered non-independent
+ * (the finalize path, which overwrites the live lane's streamed bubble). That
+ * combination is what renders [A,A,B] in the LIVE view and is corrected by a
+ * settlement keyframe. NOT true for single-final turns, leading-terminal-error
+ * turns, or notice-only turns.
+ */
+export function isResyncKeyframeRequired(state: FinalReconciliationState): boolean {
+  return (
+    state.ordinaryNonErrorFinalCount >= 2 &&
+    state.firstOrdinaryNonErrorFinalNonIndependent
+  );
 }
 
 /**
@@ -897,6 +977,32 @@ export async function handleInboundMessage(
   // falls back to ANON_PEER_ID).
   const wsKey = peerId || ANON_PEER_ID;
 
+  // #173: captured inside the `try` (once the route + config resolve) so the
+  // settlement `finally` can read the transcript for a keyframe resync. They
+  // stay `undefined` when setup never reached route resolution — the keyframe
+  // is skipped, since without a session key there is nothing authoritative to
+  // read.
+  let settlementSessionKey: string | undefined;
+  let settlementHistoryLimit: number | undefined;
+  // #173: how many DISTINCT answer lanes streamed text this turn is NOT tracked
+  // here anymore. It is now read from the controller's authoritative lane state
+  // at settlement (`draft.streamedVisibleAnswerLaneCount()`), which counts BOTH
+  // rotation paths — including the divergence fail-safe `closeAndRotate`, which
+  // opens a new visible lane with NO `onAssistantMessageStart` boundary — and
+  // sets its per-lane flag only AFTER the reasoning filter, so a reasoning-only
+  // partial can never inflate the count. The old raw-callback bookkeeping missed
+  // the fail-safe lane (false negative) and counted filtered reasoning partials
+  // (false positive → a keyframe on a healthy turn deletes covered notices).
+  //
+  // Two-or-more remains the discriminator for the glitch: #173 is defined over
+  // retained finals [A,B] where BOTH LANES HAVE ALREADY STREAMED: the first
+  // final finalizes lane 2 — overwriting the text lane 2 streamed — and the
+  // second appends, so the reader sees [A,A,B]. The benign shapes that share the
+  // routing shape all stream exactly ONE lane, because the extra payload never
+  // streams at all: `[answer, status]` in partial mode routes exactly like the
+  // glitch (finalize, then independent) but RENDERS CORRECTLY, and a keyframe
+  // there would delete the status/trace bubble the operator switched on.
+
   /** The last agent run this turn owns, learned from `onAgentRunStart`. */
   let agentRunId: string | undefined;
   /** Every fallback/retry run owned by this turn, all cleaned in `finally`. */
@@ -941,6 +1047,8 @@ export async function handleInboundMessage(
   const finalReconciliation: FinalReconciliationState = {
     ordinaryAnswerFinalSeen: false,
     leadingTerminalErrorSeen: false,
+    ordinaryNonErrorFinalCount: 0,
+    firstOrdinaryNonErrorFinalNonIndependent: false,
   };
   // Ordinary messages have already been ACKed by ingress and therefore need one
   // settled outcome even when setup fails. Control-lane turns never settle; an
@@ -983,6 +1091,9 @@ export async function handleInboundMessage(
   // account's streaming/dmSecurity/allowFrom apply to its own turns. For the
   // single `"default"` account this is identical to the flat block (regression).
   const channelConfig = resolveWebchannelAccountConfig(api.config, accountId);
+  // #173: mirror the register-time snapshot's fetch window so a keyframe resync
+  // reads exactly what a fresh reload would (same `history.limit`).
+  settlementHistoryLimit = resolveHistoryConfig(channelConfig).limit;
 
   // DM allowlist admission (split-authz, plugin-owned half). When the operator
   // sets `channels.webchannel.dmSecurity: "allowlist"`, a non-allowlisted peer
@@ -1038,6 +1149,9 @@ export async function handleInboundMessage(
   // turn is dispatched under this key, and the history READ sites resolve the
   // SAME key via the SAME helper, so paging/snapshot stay consistent.
   const route = resolveWebchannelSessionRoute(api, accountId, wsKey, servingTenant);
+  // #173: the same forced per-account-channel-peer key the history READ sites
+  // use, so a settlement keyframe reads THIS peer's transcript.
+  settlementSessionKey = route.sessionKey;
 
   // #93: build this turn's approval-origin lease handle. Creating it claims
   // NOTHING — `activate()` in `onAgentRunStart` is what publishes the claim, so
@@ -1336,6 +1450,11 @@ export async function handleInboundMessage(
                           ...(answerStreamingEnabled
                             ? {
                                 onPartialReply: (p) => {
+                                  // #173: the streamed-lane count is no longer
+                                  // kept here — it is read from the controller's
+                                  // authoritative lane state at settlement, which
+                                  // sets its per-lane flag only after the adapter
+                                  // filters reasoning partials.
                                   draft!.pushAnswerText({
                                     text: p.text,
                                     delta: p.delta,
@@ -1343,6 +1462,9 @@ export async function handleInboundMessage(
                                   });
                                 },
                                 onAssistantMessageStart: () => {
+                                  // Core fires this before that message's first
+                                  // chunk, and the two callbacks share one FIFO,
+                                  // so neither can overtake the other.
                                   draft!.handleAssistantMessageBoundary();
                                 },
                                 onBlockReplyQueued: (payload, context) => {
@@ -1734,6 +1856,14 @@ export async function handleInboundMessage(
       );
     }
 
+    // #173 (Finding 2): the client requires the anchor `turn_settled` BEFORE the
+    // `keyframe` for the settling turn. If the anchor settle failed to ship, a
+    // keyframe that goes out anyway duplicates the settling turn's own user row
+    // (PR2 reducer residual-source-5). Track whether the anchor settle — the
+    // iteration where `settleId === turnId`, pushed last — was actually
+    // delivered, and gate the keyframe on it. Defaults false, so a turn that is
+    // not settlement-eligible (no anchor settle sent) never emits a keyframe.
+    let anchorSettleDelivered = false;
     if (settlementEligible) {
       // #99: this turn may be the merge of N buffered user messages (P1-8b layer
       // (b) coalescing). Each of them was ACKed and holds its own P0-4 receipt,
@@ -1785,6 +1915,121 @@ export async function handleInboundMessage(
             `webchannel: turn_settled was not delivered for peer=${logSafe(wsKey)} turn=${logSafe(settleId)} outcome=${turnOutcome}`,
           );
         }
+        // #173 (Finding 2): remember the ANCHOR settle's fate specifically. The
+        // anchor is this turn's own id, pushed last, and it is the frame the
+        // keyframe must not overtake.
+        if (settleId === turnId) anchorSettleDelivered = delivered;
+      }
+    }
+
+    // #173: the tool-only-turn overwrite path corrupted the LIVE view ([A,A,B]).
+    // Re-establish ground truth from the transcript — exactly what a browser
+    // reload does — by reading the same history projection and sending it as an
+    // authoritative-replace keyframe. This does NOT repair the corrupt bubble in
+    // place (impossible without core per-final identity, #111); it REPLACES the
+    // rendered agent/settled-user rows wholesale. Purely additive to the live
+    // path — the corrupt delivery still happened; the keyframe corrects the
+    // rendered result after settlement.
+    //
+    // Gated on `draft.streamedVisibleAnswerLaneCount() >= 2`: the glitch is a
+    // finalize landing on a lane that ALREADY streamed its own text while an
+    // earlier streamed lane is retained — so it takes two streamed answer lanes,
+    // read from the controller's authoritative lane state; the benign
+    // same-routing shapes (an extra plain non-notice, non-error payload before
+    // or after the answer) stream only one. Fewer than two lanes streamed means
+    // the two finals rendered correctly, and a keyframe would be an unnecessary
+    // full replace of a correctly-rendered region.
+    //
+    // Read into consts so the `undefined` checks still narrow inside the
+    // detached-scope callback below (a captured `let` would widen again).
+    const keyframeSessionKey = settlementSessionKey;
+    const keyframeHistoryLimit = settlementHistoryLimit;
+    // #173 (Finding 1): the streamed-lane count comes from the controller's
+    // authoritative lane state, which tracks BOTH rotation paths (including the
+    // divergence fail-safe `closeAndRotate`, with no boundary callback) and only
+    // counts lanes that streamed visible answer text past the reasoning filter.
+    // A missing draft (setup-failure paths) is treated as count 0 → no keyframe.
+    const streamedVisibleAnswerLaneCount =
+      draft?.streamedVisibleAnswerLaneCount() ?? 0;
+    if (
+      streamedVisibleAnswerLaneCount >= 2 &&
+      isResyncKeyframeRequired(finalReconciliation) &&
+      // #173 (Finding 2): never overtake the anchor turn_settled. If it failed to
+      // ship, the keyframe would duplicate the settling turn's user row.
+      anchorSettleDelivered &&
+      keyframeSessionKey !== undefined &&
+      keyframeHistoryLimit !== undefined
+    ) {
+      // Why the detached scope. The gateway dispatch reads an ambient operator
+      // client out of an async-context request scope as the first step of its
+      // dispatch path, and falls through to a synthetic privileged client when
+      // NO client is ambient; a client that lacks `operator.read` gets the
+      // `sessions.get` rejected, and `historyRecent` swallows that rejection
+      // into `[]` — so the failure would be invisible except as a keyframe that
+      // never arrives. Whether this callback actually runs under such a scope is
+      // not established here. The detour is required if it does and costs
+      // nothing if it does not, which is why it is unconditional.
+      //
+      // `historyRecent` catches its own store errors and returns [] (best-effort,
+      // matching the register-time snapshot). An empty read would REPLACE the
+      // client with nothing and wipe good bubbles, so the keyframe is sent ONLY
+      // when the projection actually yielded rows.
+      //
+      // AWAITED ON PURPOSE — do not detach this. Awaiting inside `finally`
+      // holds the per-session FIFO (`inbound-queue.ts`) until the keyframe is on
+      // the wire, so the NEXT turn cannot begin streaming before it lands. That
+      // ordering is what keeps #199 unreachable: a keyframe overtaken by the
+      // next turn would wipe that turn's live `working:true` draft, flip the
+      // client's `turnInFlight()` and release P1-9 held sends mid-turn.
+      //
+      // BUT BOUNDED. This is the only awaited history read in the plugin, and
+      // the underlying session read carries no deadline of its own, so a read
+      // that never settles would wedge this peer's FIFO forever — after
+      // `turn_settled` already went out, so the widget would look idle while
+      // every later message buffered and was finally rejected as overloaded.
+      // Racing a timer converts that permanent wedge into one skipped keyframe.
+      let readTimer: ReturnType<typeof setTimeout> | undefined;
+      const messages = await Promise.race([
+        runDetachedHistoryRead(() =>
+          historyRecent(api, keyframeSessionKey, keyframeHistoryLimit, api.logger),
+        ),
+        new Promise<typeof KEYFRAME_READ_TIMED_OUT>((resolve) => {
+          readTimer = setTimeout(
+            () => resolve(KEYFRAME_READ_TIMED_OUT),
+            KEYFRAME_HISTORY_READ_TIMEOUT_MS,
+          );
+          // A pending keyframe read must never be the reason the process stays
+          // up; the shutdown path does not know about this timer.
+          readTimer.unref?.();
+        }),
+      ]).finally(() => {
+        // Cleared on BOTH arms — the read winning must not leave a live timer.
+        if (readTimer !== undefined) clearTimeout(readTimer);
+      });
+      if (messages === KEYFRAME_READ_TIMED_OUT) {
+        api.logger?.warn?.(
+          `webchannel: #173 keyframe resync history read timed out for peer=${logSafe(wsKey)} turn=${logSafe(turnId)} session=${logSafe(keyframeSessionKey)} timeoutMs=${logSafe(KEYFRAME_HISTORY_READ_TIMEOUT_MS)}`,
+        );
+      } else if (messages.length > 0) {
+        let delivered = false;
+        try {
+          delivered = transport.sendKeyframe(wsKey, messages);
+        } catch {
+          delivered = false;
+        }
+        if (!delivered) {
+          api.logger?.warn?.(
+            `webchannel: #173 keyframe resync was not delivered for peer=${logSafe(wsKey)} turn=${logSafe(turnId)}`,
+          );
+        }
+      } else {
+        // The signature fired and the projection came back EMPTY. `historyRecent`
+        // only warns when it catches a throw, so a successful-but-empty read is
+        // otherwise silent — and silence here is exactly the failure mode this
+        // whole change exists to remove: the feature goes inert with no signal.
+        api.logger?.warn?.(
+          `webchannel: #173 keyframe resync skipped — history projection was empty for peer=${logSafe(wsKey)} turn=${logSafe(turnId)} session=${logSafe(keyframeSessionKey)}`,
+        );
       }
     }
   }

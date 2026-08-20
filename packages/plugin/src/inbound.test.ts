@@ -10,11 +10,15 @@ vi.mock("openclaw/plugin-sdk/reply-payload", () => ({
     typeof payload?.text === "string" && payload.text.includes(WARNING_SENTINEL),
 }));
 
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 import {
   deliverDraftFinalPayload,
   handleInboundMessage as handleInboundMessageForServingTenant,
+  isResyncKeyframeRequired,
+  KEYFRAME_HISTORY_READ_TIMEOUT_MS,
   startAgentLifecycleSubscription,
   stopAgentLifecycleSubscription,
   type FinalReconciliationState,
@@ -26,6 +30,7 @@ import {
   ApprovalOriginLeaseRegistry,
 } from "./approval-origin.js";
 import { resolveWebchannelSessionRoute } from "./session-route.js";
+import { recent as historyRecent } from "./history.js";
 import {
   MAX_COALESCED_MEMBER_ID_LENGTH,
   normalizeInboundUserMessage,
@@ -111,13 +116,34 @@ function makeFakeApi(params: {
   withAgentEvents?: boolean;
   /** Extra `channels.webchannel` keys, e.g. the DM allowlist (#99 denial case). */
   channelConfig?: Record<string, unknown>;
+  /**
+   * #173: the raw transcript rows `runtime.subagent.getSessionMessages` returns,
+   * so a settlement keyframe has something to read. Omitted → no subagent seam,
+   * and `history.recent` yields [] (no keyframe sent).
+   */
+  sessionMessages?: unknown[];
+  /**
+   * #173: invoked at the start of every `getSessionMessages` read. Throwing
+   * models the gateway rejecting `sessions.get` for the caller's ambient
+   * operator client — the failure mode `runDetachedHistoryRead` exists to avoid.
+   */
+  onSessionMessagesRead?: () => void;
+  /**
+   * #173: make `getSessionMessages` NEVER settle. The gateway session read
+   * carries no deadline of its own, which is why the awaited keyframe read
+   * needs one — without a bound this wedges the peer's inbound FIFO forever.
+   */
+  sessionMessagesNeverSettle?: boolean;
 }): {
   api: OpenClawPluginApi;
   captured: { buildContext?: BuildContextParams };
+  /** Every `logger.warn` record this api emitted, in order. */
+  warnings: string[];
   /** Push a lifecycle event to whatever the plugin subscribed. */
   emitLifecycle: (evt: LifecycleEvent) => void;
 } {
   const captured: { buildContext?: BuildContextParams } = {};
+  const warnings: string[] = [];
 
   const config = {
     channels: {
@@ -172,17 +198,34 @@ function makeFakeApi(params: {
       }
     : undefined;
 
+  const subagent =
+    params.sessionMessages || params.sessionMessagesNeverSettle
+      ? {
+          getSessionMessages: async () => {
+            params.onSessionMessagesRead?.();
+            if (params.sessionMessagesNeverSettle) return new Promise<never>(() => {});
+            return { messages: params.sessionMessages };
+          },
+        }
+      : undefined;
+
   const api = {
     config,
-    logger: { info: () => {}, warn: () => {}, error: () => {} },
-    runtime: { channel, ...(events ? { events } : {}) },
+    logger: {
+      info: () => {},
+      warn: (message: string) => {
+        warnings.push(message);
+      },
+      error: () => {},
+    },
+    runtime: { channel, ...(events ? { events } : {}), ...(subagent ? { subagent } : {}) },
   } as unknown as OpenClawPluginApi;
 
   const emitLifecycle = (evt: LifecycleEvent): void => {
     for (const l of [...listeners]) l(evt);
   };
 
-  return { api, captured, emitLifecycle };
+  return { api, captured, warnings, emitLifecycle };
 }
 
 /** A transport that records finalize frames and accepts progress/typing/text. */
@@ -211,6 +254,11 @@ function makeFakeTransport(options?: {
   settles: Array<"ok" | "error">;
   /** #99: the full settle frames, in emission order — turnId matters per member. */
   settleFrames: Array<{ turnId: string; outcome: "ok" | "error" }>;
+  /** #173: authoritative-replace keyframe frames, in emission order. */
+  keyframes: Array<{
+    peerId: string;
+    messages: Array<{ id: string; role: string; text: string; ts?: number }>;
+  }>;
 } {
   const finalizes: Array<{
     id: string;
@@ -222,6 +270,10 @@ function makeFakeTransport(options?: {
   const typing: string[] = [];
   const settles: Array<"ok" | "error"> = [];
   const settleFrames: Array<{ turnId: string; outcome: "ok" | "error" }> = [];
+  const keyframes: Array<{
+    peerId: string;
+    messages: Array<{ id: string; role: string; text: string; ts?: number }>;
+  }> = [];
   const toolActivities: Array<{
     sessionKey: string;
     id: string;
@@ -293,11 +345,18 @@ function makeFakeTransport(options?: {
       return true;
     },
     sendHistory: () => true,
+    sendKeyframe: (
+      peerId: string,
+      messages: Array<{ id: string; role: string; text: string; ts?: number }>,
+    ) => {
+      keyframes.push({ peerId, messages });
+      return true;
+    },
     sendApprovalRequest: () => true,
     sendApprovalResolved: () => true,
     sendApprovalSnapshot: () => true,
   } as WebChannelPeerChannel;
-  return { transport, finalizes, texts, progress, toolActivities, typing, settles, settleFrames };
+  return { transport, finalizes, texts, progress, toolActivities, typing, settles, settleFrames, keyframes };
 }
 
 const userMessage = { type: "user_message" as const, text: "/stop" };
@@ -1721,22 +1780,42 @@ describe("deliverDraftFinalPayload — independent routing policy", () => {
     {
       reason: "isNotice",
       payload: { text: "notice", isFallbackNotice: true },
-      state: { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: false },
+      state: {
+        leadingTerminalErrorSeen: false,
+        ordinaryAnswerFinalSeen: false,
+        ordinaryNonErrorFinalCount: 0,
+        firstOrdinaryNonErrorFinalNonIndependent: false,
+      },
     },
     {
       reason: "payload.isError",
       payload: { text: WARNING_SENTINEL, isError: true },
-      state: { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: false },
+      state: {
+        leadingTerminalErrorSeen: false,
+        ordinaryAnswerFinalSeen: false,
+        ordinaryNonErrorFinalCount: 0,
+        firstOrdinaryNonErrorFinalNonIndependent: false,
+      },
     },
     {
       reason: "leadingTerminalErrorSeen",
       payload: { text: "retained answer" },
-      state: { leadingTerminalErrorSeen: true, ordinaryAnswerFinalSeen: false },
+      state: {
+        leadingTerminalErrorSeen: true,
+        ordinaryAnswerFinalSeen: false,
+        ordinaryNonErrorFinalCount: 0,
+        firstOrdinaryNonErrorFinalNonIndependent: false,
+      },
     },
     {
       reason: "ordinaryAnswerFinalSeen",
       payload: { text: "extra answer" },
-      state: { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: true },
+      state: {
+        leadingTerminalErrorSeen: false,
+        ordinaryAnswerFinalSeen: true,
+        ordinaryNonErrorFinalCount: 1,
+        firstOrdinaryNonErrorFinalNonIndependent: true,
+      },
     },
   ] satisfies Array<{
     reason: string;
@@ -1762,6 +1841,8 @@ describe("deliverDraftFinalPayload — independent routing policy", () => {
     const state: FinalReconciliationState = {
       leadingTerminalErrorSeen: false,
       ordinaryAnswerFinalSeen: false,
+      ordinaryNonErrorFinalCount: 0,
+      firstOrdinaryNonErrorFinalNonIndependent: false,
     };
 
     await deliverDraftFinalPayload(
@@ -1773,6 +1854,541 @@ describe("deliverDraftFinalPayload — independent routing policy", () => {
 
     expect(state.leadingTerminalErrorSeen).toBe(true);
     expect(h.noteLeadingTerminalError).toHaveBeenCalledOnce();
+  });
+});
+
+/**
+ * #173 — the tool-only-turn overwrite SIGNATURE.
+ *
+ * When the last assistant message of a turn is tool-only, core emits >=2
+ * ordinary non-error finals [A,B]; the first routes through `draft.finalize`
+ * (non-independent) and overwrites the live lane's streamed bubble, so the LIVE
+ * view renders [A,A,B]. The signature is exactly that routing shape — a first
+ * ordinary non-error final delivered non-independent, followed by at least one
+ * more ordinary non-error final — with NO text/body comparison. Anything else
+ * (single final, leading terminal error, notices) must not trip it.
+ */
+describe("#173 keyframe resync — signature detection", () => {
+  const makeDraft = () => {
+    const finalize = vi.fn(async () => true);
+    const deliverIndependentFinal = vi.fn(async () => true);
+    const noteLeadingTerminalError = vi.fn();
+    const draft = {
+      finalize,
+      deliverIndependentFinal,
+      noteLeadingTerminalError,
+    } as unknown as ProgressDraftController;
+    return { draft };
+  };
+  const freshState = (): FinalReconciliationState => ({
+    ordinaryAnswerFinalSeen: false,
+    leadingTerminalErrorSeen: false,
+    ordinaryNonErrorFinalCount: 0,
+    firstOrdinaryNonErrorFinalNonIndependent: false,
+  });
+
+  it("sets the flag ONLY once a SECOND ordinary final follows a non-independent first", async () => {
+    const { draft } = makeDraft();
+    const state = freshState();
+
+    await deliverDraftFinalPayload(draft, { text: "A" }, "A", state);
+    // First ordinary final took the finalize (overwrite) path, but one final
+    // alone is not the [A,A,B] signature yet.
+    expect(state.firstOrdinaryNonErrorFinalNonIndependent).toBe(true);
+    expect(isResyncKeyframeRequired(state)).toBe(false);
+
+    await deliverDraftFinalPayload(draft, { text: "B" }, "B", state);
+    expect(state.ordinaryNonErrorFinalCount).toBe(2);
+    expect(isResyncKeyframeRequired(state)).toBe(true);
+  });
+
+  it("does NOT set the flag for a single ordinary final turn", async () => {
+    const { draft } = makeDraft();
+    const state = freshState();
+
+    await deliverDraftFinalPayload(draft, { text: "A" }, "A", state);
+
+    expect(isResyncKeyframeRequired(state)).toBe(false);
+  });
+
+  it("does NOT set the flag for a leading terminal error then ordinary finals", async () => {
+    const { draft } = makeDraft();
+    const state = freshState();
+
+    // A leading terminal error makes EVERY later ordinary final independent, so
+    // the first ordinary final never takes the overwrite path.
+    await deliverDraftFinalPayload(draft, { text: "boom", isError: true }, "boom", state);
+    await deliverDraftFinalPayload(draft, { text: "A" }, "A", state);
+    await deliverDraftFinalPayload(draft, { text: "B" }, "B", state);
+
+    expect(state.ordinaryNonErrorFinalCount).toBe(2);
+    expect(state.firstOrdinaryNonErrorFinalNonIndependent).toBe(false);
+    expect(isResyncKeyframeRequired(state)).toBe(false);
+  });
+
+  it("does NOT count a final the controller refused to send", async () => {
+    // `finalize` returns false on the re-entrant-settle, already-settled and
+    // empty-text paths: nothing reached the wire and no lane was overwritten,
+    // so that payload is not part of the signature at all.
+    const finalize = vi.fn(async () => false);
+    const draft = {
+      finalize,
+      deliverIndependentFinal: vi.fn(async () => true),
+      noteLeadingTerminalError: vi.fn(),
+    } as unknown as ProgressDraftController;
+    const state = freshState();
+
+    const first = await deliverDraftFinalPayload(draft, { text: "A" }, "A", state);
+    expect(first.sent).toBe(false);
+    expect(state.ordinaryNonErrorFinalCount).toBe(0);
+    expect(state.firstOrdinaryNonErrorFinalNonIndependent).toBe(false);
+
+    // The next ordinary final is the first one actually DELIVERED — and it goes
+    // out independent (the lane is spent), so there is no overwrite to repair.
+    await deliverDraftFinalPayload(draft, { text: "B" }, "B", state);
+    expect(state.ordinaryNonErrorFinalCount).toBe(1);
+    expect(state.firstOrdinaryNonErrorFinalNonIndependent).toBe(false);
+    expect(isResyncKeyframeRequired(state)).toBe(false);
+  });
+
+  it("does NOT set the flag for notice-only finals", async () => {
+    const { draft } = makeDraft();
+    const state = freshState();
+
+    await deliverDraftFinalPayload(
+      draft,
+      { text: "status", isStatusNotice: true },
+      "status",
+      state,
+    );
+    await deliverDraftFinalPayload(
+      draft,
+      { text: "fallback", isFallbackNotice: true },
+      "fallback",
+      state,
+    );
+
+    expect(state.ordinaryNonErrorFinalCount).toBe(0);
+    expect(isResyncKeyframeRequired(state)).toBe(false);
+  });
+});
+
+/**
+ * #173 — the keyframe is emitted at settlement IFF the signature fired, and it
+ * carries the transcript projection (the same read the register-time history
+ * snapshot uses), so the client can re-establish ground truth.
+ */
+describe("handleInboundMessage — #173 keyframe resync at settlement", () => {
+  const ordinary = { type: "user_message" as const, text: "do the thing" };
+
+  /**
+   * A fixture helper found its callback missing.
+   *
+   * Recorded rather than only thrown: a `runImpl` throw is swallowed by
+   * `handleInboundMessage`'s own catch (it becomes an `error` turn outcome), so
+   * a broken fixture would otherwise surface as an unexplained zero-keyframe
+   * result — a fixture bug wearing the costume of a passing negative test. The
+   * `afterEach` below re-raises it with the actual reason.
+   */
+  let fixtureFailure: string | undefined;
+  beforeEach(() => {
+    fixtureFailure = undefined;
+  });
+  afterEach(() => {
+    if (fixtureFailure !== undefined) throw new Error(fixtureFailure);
+  });
+  const requireCallback = <T>(callback: T | undefined, what: string): T => {
+    if (typeof callback !== "function") {
+      fixtureFailure = `fixture: ${what} is not wired — this turn cannot exercise answer lanes`;
+      throw new Error(fixtureFailure);
+    }
+    return callback;
+  };
+
+  /** Stream answer text for the CURRENT assistant lane. */
+  const streamAnswerLane = (turn: AssembledTurnLike, text: string) => {
+    requireCallback(turn.replyOptions?.onPartialReply, "onPartialReply")({ text });
+  };
+  /** Open the NEXT assistant lane (core fires this before its first chunk). */
+  const openNextAnswerLane = (turn: AssembledTurnLike) => {
+    requireCallback(turn.replyOptions?.onAssistantMessageStart, "onAssistantMessageStart")();
+  };
+
+  const twoStreamedLanesThenTwoFinals = async (turn: AssembledTurnLike) => {
+    // The real #173 shape: the turn's last assistant message is tool-only, so
+    // core retains finals [A,B] for two assistant messages that BOTH already
+    // streamed their text. The first final routes through finalize and
+    // overwrites lane 2's streamed bubble with A; the second delivers
+    // independent → the LIVE view is [A,A,B] while the transcript is [A,B].
+    streamAnswerLane(turn, "first ans");
+    openNextAnswerLane(turn);
+    streamAnswerLane(turn, "second ans");
+    await turn.delivery.deliver({ text: "first answer" }, { kind: "final" });
+    await turn.delivery.deliver({ text: "second answer" }, { kind: "final" });
+  };
+  const transcriptRows = [
+    { role: "assistant", text: "first answer", __openclaw: { id: "A" } },
+    { role: "assistant", text: "second answer", __openclaw: { id: "B" } },
+  ];
+
+  it("emits a keyframe carrying the transcript for the overwrite signature (partial mode)", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: twoStreamedLanesThenTwoFinals,
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(1);
+    expect(keyframes[0].peerId).toBe("peer-1");
+    expect(keyframes[0].messages.map((m) => m.id)).toEqual(["A", "B"]);
+  });
+
+  it("does NOT emit a keyframe for the SAME two finals in progress mode (no answer lane streams at all)", async () => {
+    // `progress` mode never wires answer-text streaming — that is the mode
+    // distinction — so no lane can stream, [A,A,B] cannot occur, and the
+    // signature (which still fires on the routing shape) must not resync.
+    const { api } = makeFakeApi({
+      streamingMode: "progress",
+      sessionMessages: transcriptRows,
+      runImpl: async (turn) => {
+        expect(turn.replyOptions?.onPartialReply).toBeUndefined();
+        await turn.delivery.deliver({ text: "first answer" }, { kind: "final" });
+        await turn.delivery.deliver({ text: "second answer" }, { kind: "final" });
+      },
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(0);
+  });
+
+  it("does NOT emit a keyframe for a single-final turn", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: [{ role: "assistant", text: "only answer", __openclaw: { id: "A" } }],
+      runImpl: async (turn) => {
+        streamAnswerLane(turn, "only ans");
+        await turn.delivery.deliver({ text: "only answer" }, { kind: "final" });
+      },
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(0);
+  });
+
+  it("does NOT emit a keyframe in partial mode when NO answer text ever streamed", async () => {
+    // Partial mode is only the PERMISSION to stream answer text; a provider that
+    // emitted none (tool lines only) left no live answer bubble, so the same two
+    // finals render [A,B] correctly and a keyframe would be an unnecessary full
+    // replace of a correctly-rendered region.
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "first answer" }, { kind: "final" });
+        await turn.delivery.deliver({ text: "second answer" }, { kind: "final" });
+      },
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(0);
+  });
+
+  it("does NOT emit a keyframe when only ONE answer lane streamed (benign extra final)", async () => {
+    // The shape a keyframe must never touch. Core's final-payload array
+    // reachably carries an extra plain payload that is neither a notice nor an
+    // error — a trailing plugin-status / raw-trace line under `/trace` or
+    // verbose, or a leading per-messaging-tool source-reply mirror. Only ONE
+    // lane streamed, so `[answer, status]` routes exactly like the glitch
+    // (finalize, then independent) yet renders CORRECTLY. A keyframe here would
+    // delete the status bubble the operator switched on, because the client's
+    // reducer rebuilds the covered region from transcript rows and keeps only
+    // `role === "user"` bubbles.
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: async (turn) => {
+        streamAnswerLane(turn, "the ans");
+        await turn.delivery.deliver({ text: "the answer" }, { kind: "final" });
+        await turn.delivery.deliver({ text: "plugin status: trace on" }, { kind: "final" });
+      },
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(0);
+  });
+
+  it("does NOT emit a keyframe when the first ordinary final was never actually sent", async () => {
+    // The controller refuses the finalize (here: its terminal frame fails to
+    // leave), so no lane was overwritten — the second final is simply the first
+    // one the reader saw. The signature must follow the DELIVERY, not the
+    // payload sequence.
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: twoStreamedLanesThenTwoFinals,
+    });
+    const { transport, keyframes } = makeFakeTransport();
+    transport.finalizeDraft = () => false;
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(0);
+  });
+
+  it("does NOT emit a keyframe when lane A streamed but its progress publish failed (never reached the client)", async () => {
+    // Review P1/P2 false positive: lane A streams, but its progress frame fails
+    // on a transient disconnect and never materializes. After reconnect lane B
+    // streams and both finals deliver, so the client only ever rendered [A,B]
+    // correctly — no overwrite occurred. Counting lanes by streamed text ALONE
+    // would see 2 and fire a destructive keyframe that can delete a trailing
+    // status/trace bubble. Requiring `resolution === "materialized"` drops lane
+    // A (it shipped nothing), leaving the count at 1 → no keyframe.
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: twoStreamedLanesThenTwoFinals,
+    });
+    const { transport, keyframes } = makeFakeTransport();
+    // Lane A's progress publish is the one that fails on the transient
+    // disconnect; every later frame (lane B's stream and both finals) ships.
+    transport.sendProgress = (_sessionKey: string, _id: string, text: string) =>
+      text !== "first ans";
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(0);
+  });
+
+  it("does not hang and sends no keyframe when the transcript read never settles", async () => {
+    // The read is awaited on purpose (it holds the per-session FIFO so the next
+    // turn cannot overtake the keyframe), which puts it on that queue's critical
+    // path. The underlying session read has no deadline, so an unbounded await
+    // would wedge this peer permanently — AFTER `turn_settled` already went out,
+    // so the widget would look idle while everything behind it buffered.
+    const { api, warnings } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessagesNeverSettle: true,
+      runImpl: twoStreamedLanesThenTwoFinals,
+    });
+    const { transport, keyframes, settles } = makeFakeTransport();
+
+    vi.useFakeTimers();
+    try {
+      const pending = handleInboundMessage(api, transport, "peer-1", ordinary);
+      // Reaches the race, then the deadline fires. Without the bound this await
+      // never returns and the test times out.
+      await vi.advanceTimersByTimeAsync(KEYFRAME_HISTORY_READ_TIMEOUT_MS);
+      await pending;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(keyframes).toHaveLength(0);
+    // The turn itself still settled normally — only the cosmetic resync is lost.
+    expect(settles).toEqual(["ok"]);
+    expect(warnings.some((w) => w.includes("keyframe resync history read timed out"))).toBe(true);
+  });
+
+  it("warns instead of going silently inert when the projection comes back empty", async () => {
+    // A successful-but-EMPTY read logs nothing of its own, and the `length > 0`
+    // guard then skips the send. Silence there is the same invisible-failure
+    // mode this whole change exists to remove.
+    const { api, warnings } = makeFakeApi({
+      streamingMode: "partial",
+      // Present (so the read seam exists) but projecting to nothing: neither row
+      // survives normalization, so `history.recent` succeeds with [].
+      sessionMessages: [{ role: "assistant", text: "" }, { role: "tool", text: "x" }],
+      runImpl: twoStreamedLanesThenTwoFinals,
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(0);
+    expect(
+      warnings.some((w) => w.includes("keyframe resync skipped — history projection was empty")),
+    ).toBe(true);
+  });
+
+  it("reads the transcript in a DETACHED async scope, so the inbound request scope cannot reject it", async () => {
+    // Models the gateway seam this workaround exists for: `sessions.get`
+    // authorizes against whatever operator client is ambient in the CALLING
+    // context, and the inbound dispatch's client has no `operator.read`. The
+    // read must therefore run in the module-level detached scope, where no
+    // request client is ambient at all.
+    const ambientOperatorClient = new AsyncLocalStorage<{ scopes: readonly string[] }>();
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: twoStreamedLanesThenTwoFinals,
+      onSessionMessagesRead: () => {
+        const client = ambientOperatorClient.getStore();
+        if (client && !client.scopes.includes("operator.read")) {
+          throw new Error("missing scope: operator.read");
+        }
+      },
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await ambientOperatorClient.run({ scopes: [] }, async () => {
+      await handleInboundMessage(api, transport, "peer-1", ordinary);
+    });
+
+    expect(keyframes).toHaveLength(1);
+    expect(keyframes[0].messages.map((m) => m.id)).toEqual(["A", "B"]);
+
+    // Control — proves the rejection above is real and this test can fail: the
+    // SAME read made directly from that scope is rejected, and `history.recent`
+    // swallows the rejection into `[]` (which would silently skip the keyframe).
+    const undetached = await ambientOperatorClient.run({ scopes: [] }, () =>
+      historyRecent(api, "agent:agent1:seed", 50, api.logger),
+    );
+    expect(undetached).toEqual([]);
+  });
+
+  // Finding 1 (false negative): the controller can open a NEW visible lane
+  // WITHOUT an `onAssistantMessageStart` boundary — the divergence fail-safe
+  // `closeAndRotate` fires when the cumulative partial diverges. The old raw-
+  // callback counter reset only on the boundary callback, so it stayed at 1 for
+  // this shape and no keyframe fired. Sourcing the count from the controller's
+  // lane state (which rotates on BOTH paths) counts both lanes.
+  it("emits a keyframe when the second lane opened via the divergence fail-safe (no boundary callback)", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: async (turn) => {
+        // Lane 1 streams its text.
+        streamAnswerLane(turn, "Lane one is present");
+        // A DIVERGENT cumulative partial — not a prefix-extension of lane 1 and
+        // no `replace` flag — makes the adapter rotate defensively via
+        // `closeAndRotate`, opening lane 2 with NO `onAssistantMessageStart`.
+        streamAnswerLane(turn, "Wholly different second lane");
+        // Lane 2 keeps streaming (a faithful prefix-extension, so it does not
+        // re-rotate).
+        streamAnswerLane(turn, "Wholly different second lane, extended");
+        // The [A,A,B] routing: first final finalizes lane 2 (non-independent),
+        // second delivers independent.
+        await turn.delivery.deliver({ text: "first answer" }, { kind: "final" });
+        await turn.delivery.deliver({ text: "second answer" }, { kind: "final" });
+      },
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(1);
+    expect(keyframes[0].messages.map((m) => m.id)).toEqual(["A", "B"]);
+  });
+
+  // Companion to the divergence-fail-safe test above: the SECOND rotation path.
+  // `handleAssistantMessageBoundary` CONSUMES the first `onAssistantMessageStart`
+  // (message-adapter.ts `firstBoundarySeen`) and only `closeAndRotate`s on the
+  // SECOND+ boundary. Both existing positive fixtures
+  // (`twoStreamedLanesThenTwoFinals` and the divergence test) open lane 2 via the
+  // divergence fail-safe, leaving the genuine STRUCTURED-boundary rotation path
+  // unverified. Here lane 2 opens via a real second boundary — the intervening
+  // partial is a strict PREFIX-EXTENSION of lane 1's text, so the divergence
+  // fail-safe never fires. The fix counts materialized answer lanes independently
+  // of HOW each opened, so the keyframe must still fire.
+  it("emits a keyframe when the second lane opened via a genuine structured boundary (no divergence)", async () => {
+    const { api, warnings } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: async (turn) => {
+        // Lane 1 streams its text.
+        streamAnswerLane(turn, "first ans");
+        // First structured boundary — CONSUMED by `firstBoundarySeen`, no rotation.
+        openNextAnswerLane(turn);
+        // A strict PREFIX-EXTENSION of lane 1's text: `cleaned.startsWith(answerText)`
+        // holds, so the divergence fail-safe does NOT fire — this stays lane 1.
+        streamAnswerLane(turn, "first ans extended");
+        // Second structured boundary — this one genuinely `closeAndRotate`s to lane 2.
+        openNextAnswerLane(turn);
+        // Lane 2 streams its own text.
+        streamAnswerLane(turn, "second ans");
+        // The [A,A,B] routing: first final finalizes lane 2 (non-independent),
+        // second delivers independent.
+        await turn.delivery.deliver({ text: "first answer" }, { kind: "final" });
+        await turn.delivery.deliver({ text: "second answer" }, { kind: "final" });
+      },
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    // The divergence fail-safe must NOT have opened lane 2 — proving lane 2 came
+    // from the structured boundary's `closeAndRotate`, the path under test.
+    expect(warnings.some((w) => w.includes("cumulative partial diverged"))).toBe(false);
+    expect(keyframes).toHaveLength(1);
+    expect(keyframes[0].peerId).toBe("peer-1");
+    expect(keyframes[0].messages.map((m) => m.id)).toEqual(["A", "B"]);
+  });
+
+  // Finding 1 (false positive): the old counter incremented in `onPartialReply`
+  // BEFORE the adapter filters reasoning partials, so a `Reasoning:\n` partial
+  // followed by a boundary and one real answer inflated the count to 2 — and the
+  // benign `[answer, status]` routing shape then wrongly fired a keyframe,
+  // deleting the covered status/trace bubble. Sourcing the count past the
+  // reasoning filter keeps it at 1 (the one lane that streamed VISIBLE text).
+  it("does NOT emit a keyframe when a filtered reasoning partial precedes the single visible answer lane", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: async (turn) => {
+        // A reasoning-prefixed partial the adapter drops (never sets a lane's
+        // visible-answer flag).
+        streamAnswerLane(turn, "Reasoning:\nthinking hard about the request");
+        // The boundary the old inbound counter reset on — it is what let the
+        // real answer inflate the raw count to 2.
+        openNextAnswerLane(turn);
+        // Exactly ONE lane streams visible answer text.
+        streamAnswerLane(turn, "the real answer");
+        // The benign `[answer, status]` shape: same finalize-then-independent
+        // routing as the glitch, but only one lane streamed, so it renders
+        // correctly and must not be keyframed.
+        await turn.delivery.deliver({ text: "the real answer" }, { kind: "final" });
+        await turn.delivery.deliver({ text: "plugin status: trace on" }, { kind: "final" });
+      },
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(0);
+  });
+
+  // Finding 2: the client requires the anchor `turn_settled` BEFORE the keyframe
+  // for the settling turn; if the settle frame failed but the keyframe still
+  // went out, the settling turn's own user row is duplicated. An otherwise
+  // glitch-shaped turn whose anchor settle fails must skip the keyframe.
+  it("does NOT emit a keyframe when the anchor turn_settled failed to deliver", async () => {
+    const glitchTurn = { type: "user_message" as const, text: "do the thing", id: "turn-anchor-fail" };
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: twoStreamedLanesThenTwoFinals,
+    });
+    const { transport, keyframes, settles } = makeFakeTransport({
+      failSettleFor: ["turn-anchor-fail"],
+    });
+
+    await handleInboundMessage(api, transport, "peer-1", glitchTurn);
+
+    // The settle frame was attempted (and reported failed); the keyframe is
+    // skipped so it cannot overtake the missing settle.
+    expect(settles).toEqual(["ok"]);
+    expect(keyframes).toHaveLength(0);
   });
 });
 

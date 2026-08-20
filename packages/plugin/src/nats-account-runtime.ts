@@ -9,7 +9,6 @@
  * - Approvals use NATS first-write-wins exactly-once
  */
 
-import { AsyncResource } from "node:async_hooks";
 import { fileURLToPath } from "node:url";
 
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
@@ -70,7 +69,13 @@ import {
 } from "./account-auth.js";
 import { PopChallengeStore } from "./pop-challenge.js";
 import { handleRegisterRequest } from "./nats-register.js";
-import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig, planHistoryFetch } from "./history.js";
+import {
+  recent as historyRecent,
+  pageBefore as historyPageBefore,
+  resolveHistoryConfig,
+  planHistoryFetch,
+  runDetachedHistoryRead,
+} from "./history.js";
 import { createCommandCatalogProvider } from "./commands-catalog.js";
 import { resolveWebchannelSessionRoute } from "./session-route.js";
 import { WEBCHANNEL_ID, type WebChannelPeerChannel } from "./channel-contract.js";
@@ -266,32 +271,6 @@ function reportServingAggregate(api: any): void {
     logger: api.logger,
   });
 }
-
-/**
- * Detached async-context for history self-reads.
- *
- * History hydration calls `api.runtime.subagent.getSessionMessages`, which
- * dispatches the gateway `sessions.get` method — and that method authorizes
- * against whatever operator client is ambient in the current gateway-request
- * scope. The initial-snapshot read happens inside the register-request handler,
- * whose ambient client is the plugin-auth client (no `operator.read`), so the
- * dispatch is rejected with `missing scope: operator.read` and history silently
- * degrades to `[]`.
- *
- * openclaw's own `deleteSession` sidesteps this by forcing a synthetic operator
- * client, but `getSessionMessages` exposes no such option to plugins. The one
- * lever a plugin has is the *calling context*: with NO ambient scoped client the
- * dispatcher falls through to a synthetic `operator.write` client (which implies
- * `operator.read`) and the read succeeds.
- *
- * This `AsyncResource` is constructed at module-evaluation time — before any
- * request scope can exist — so `runInAsyncScope` re-establishes that clean,
- * client-less context. Running the history read inside it escapes the request's
- * restricted client without touching openclaw core. See `docs/DEMO_PLAN.md`.
- */
-const historyReadScope = new AsyncResource("webchannel:history-read");
-const runDetachedHistoryRead = <T>(fn: () => Promise<T>): Promise<T> =>
-  historyReadScope.runInAsyncScope(fn);
 
 /**
  * Lazy transport facade.

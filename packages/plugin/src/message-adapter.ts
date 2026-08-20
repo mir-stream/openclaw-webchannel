@@ -172,6 +172,19 @@ type AssistantDraftLane = {
   tentativeProvisionalId?: string;
   answerText: string;
   /**
+   * #173: did this lane ever receive non-empty VISIBLE answer text? Set true at
+   * the `lane.answerText = cleaned` assignment, which is AFTER the reasoning
+   * filter's early-return, so a reasoning-only partial never sets it. It is
+   * PERSISTENT: never cleared on close/rotate, because settlement counts how
+   * many distinct lanes streamed visible answer text over the whole turn (the
+   * [A,A,B] overwrite discriminator), and a lane the fail-safe rotated away must
+   * still be counted. This is the controller's authoritative version of the
+   * count inbound used to keep from raw `onPartialReply` callbacks — it tracks
+   * BOTH rotation paths (boundary and the `closeAndRotate` fail-safe) and never
+   * counts a reasoning partial the adapter filtered.
+   */
+  streamedVisibleAnswerText: boolean;
+  /**
    * The last RAW cumulative partial accepted into this lane, before reasoning /
    * inline-directive stripping. Tag stripping makes the CLEANED text
    * non-monotonic (an unclosed `<thinking>` shortens it), so cleaned text alone
@@ -531,6 +544,14 @@ export type ProgressDraftController = {
   }): Promise<boolean>;
   /** Record that a terminal error preceded any ordinary answer final. */
   noteLeadingTerminalError(): void;
+  /**
+   * #173: how many DISTINCT lanes streamed non-empty visible answer text this
+   * turn. Authoritative over inbound's old raw-callback count: it tracks both
+   * rotation paths (`handleAssistantMessageBoundary` and the `closeAndRotate`
+   * fail-safe) and excludes reasoning-only partials (the flag is set only at the
+   * post-filter `answerText = cleaned`). Settlement gates the keyframe on `>= 2`.
+   */
+  streamedVisibleAnswerLaneCount(): number;
   /** Retire tentative state and settle real text (or a lone tool preview). */
   drain(): Promise<void>;
   /**
@@ -564,6 +585,7 @@ export function createProgressDraftController(params: {
   const newLane = (generation: number): AssistantDraftLane => ({
     generation,
     answerText: "",
+    streamedVisibleAnswerText: false,
     lastRawAnswerText: "",
     lastPartialSourceText: "",
     answerRevision: 0,
@@ -1714,6 +1736,11 @@ export function createProgressDraftController(params: {
           lane.deferredAngleMarkerTail = deferredResult.deferred;
           if (!cleaned || cleaned.startsWith("Reasoning:\n")) return;
           lane.answerText = cleaned;
+          // #173: this lane has now streamed visible answer text. Set AFTER the
+          // reasoning-filter early-return above, so a `Reasoning:\n...` partial
+          // never counts. Persistent: settlement counts lanes with this flag to
+          // recognise the [A,A,B] overwrite (see the field's own comment).
+          lane.streamedVisibleAnswerText = true;
           acceptRawBaseline(lane, visibleRaw, { replace: update.replace === true });
           lane.answerRevision += 1;
           if (lane.resolution === "empty" || lane.resolution === "unresolved") {
@@ -1959,6 +1986,20 @@ export function createProgressDraftController(params: {
         () => deliverTerminalIndependent(input.text),
         false,
       ),
+    streamedVisibleAnswerLaneCount: () =>
+      // #173: count only lanes that streamed VISIBLE answer text AND actually
+      // reached the client. `resolution === "materialized"` is set solely inside
+      // `sendLaneFrame`'s `if (sent)` branch, so it is true only once a lane
+      // frame successfully shipped. Requiring it closes the false positive where
+      // a lane streams but its progress publish fails on a transient
+      // disconnect: the client never rendered that lane's overwrite, so a
+      // destructive keyframe (which can delete a trailing status/trace bubble)
+      // must not fire. Both real-glitch paths (the boundary rotation and the
+      // `closeAndRotate` divergence fail-safe) leave both lanes materialized at
+      // settlement, so this does not weaken glitch detection.
+      state.lanes.filter(
+        (lane) => lane.streamedVisibleAnswerText && lane.resolution === "materialized",
+      ).length,
     noteLeadingTerminalError: () => {
       void enqueue(
         "leading terminal error",
