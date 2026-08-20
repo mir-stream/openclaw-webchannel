@@ -54,6 +54,11 @@ runs:
         # is what makes this survive between runs.
         DIR="${RUNNER_TOOL_CACHE:-$HOME/.cache}/nats-server/${{ inputs.version }}"
         mkdir -p "$DIR"
+        # NATS_SERVER_DIR is read back by the CALLER too. e2e-gate.yml's
+        # poisoned-cache guard runs a lookup-only actions/cache/restore probe
+        # that must reproduce this cache's VERSION, which hashes the `path:`
+        # string below. Renaming or dropping this export would leave that probe
+        # resolving an empty path — still green, and answering about nothing.
         echo "NATS_SERVER_DIR=$DIR" >> "$GITHUB_ENV"
         echo "$DIR" >> "$GITHUB_PATH"
 

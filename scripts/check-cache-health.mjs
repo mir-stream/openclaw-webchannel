@@ -4,10 +4,10 @@
  *
  * WHY THIS EXISTS (read before "simplifying" it away):
  * this repository has twice shipped a CI defect that is, by construction,
- * INVISIBLE. An `actions/cache` entry exists under a key but cannot be
- * extracted — the archive is truncated, or was saved from a path layout the
- * restore no longer maps onto. `actions/cache` downloads the entry, `tar`
- * fails, the action SWALLOWS that failure and reports:
+ * INVISIBLE. An `actions/cache` entry exists under a key but the restore does
+ * not produce it — the archive is truncated, or was saved from a path layout
+ * the restore no longer maps onto, or the download simply failed.
+ * `actions/cache` swallows the failure and reports:
  *
  *     Cache not found for input keys: <key>
  *
@@ -27,38 +27,75 @@
  * this repo would have caught it, and the gate is about to fan out into ~9
  * parallel jobs, which multiplies that invisible waste by 9.
  *
- * THE SIGNAL. There is exactly one observable that separates the two cases,
- * and it is not in the job's own logs: whether an entry under that key EXISTS.
+ * ── THE SIGNAL, AND WHY IT IS A PROBE AND NOT THE REST API ─────────────────
  *
- *   - miss + no entry            → cold key. Normal. Must pass.
- *   - miss + entry already there → the restore had something to restore and
- *                                  did not. POISONED. Must fail.
+ * GitHub matches a cache entry by (KEY, VERSION, REF) — not by key. `version`
+ * is a hash of the cached PATH plus the compression method, and it is GitHub's
+ * private implementation detail. So this sequence is entirely legitimate:
  *
- * So the guard reads the repository's cache list over the REST API and
- * compares it against what the cache step reported.
+ *     someone edits `path:` on the cache step (or GitHub changes the
+ *     compressor) → the version changes → the restore correctly MISSES,
+ *     because nothing exists at the new version → an entry with the SAME KEY
+ *     and the same ref is still sitting there from before.
  *
- * THREE THINGS THAT MAKE THIS SUBTLER THAN IT LOOKS:
+ * A guard that read "miss + key exists + visible" as poison would redden the
+ * gate on that, and tell an operator to delete a perfectly healthy cache. And
+ * the version cannot be recomputed here: reconstructing a private hash is the
+ * same trap this script already refuses for setup-node's npm key (below).
+ *
+ * So the guard does not guess — IT ASKS THE ACTION. A second
+ * `actions/cache/restore@v4` step with `lookup-only: true`, given the SAME
+ * `path` and the SAME `key` as the primary, computes the SAME version and
+ * answers the one question REST cannot: does an entry exist at OUR key AND OUR
+ * version, on a ref this run can restore from? Its `cache-hit` is threaded in
+ * as `--probe`, and its `cache-primary-key` as `--probe-key` — the latter is
+ * the only proof that the probe step actually RAN, and parseCacheArgs explains
+ * at length why that is not redundant.
+ *
+ * The verdict rests entirely on those two local, authoritative booleans:
+ *
+ *   primary hit  probe          verdict
+ *   ───────────  ─────────────  ──────────────────────────────────────────────
+ *   true         (not run)      ok
+ *   not true     not true       cold — nothing at our key+version. Covers a
+ *                               genuinely new key AND a path/compression
+ *                               version change. PASS.
+ *   not true     true           POISONED — an entry exists at our exact key and
+ *                               version, and the restore did not produce it.
+ *                               FAIL.
+ *
+ * ── THE REST API IS DIAGNOSTIC ONLY ────────────────────────────────────────
+ *
+ * It must NEVER decide a verdict. It exists to turn "poisoned" into an
+ * actionable message: which entries are sitting under this key, on which refs,
+ * at which versions, how big, how old, and — the part that matters most — their
+ * `id`, because deleting by `?key=` removes the entry on EVERY ref at once and
+ * would destroy healthy siblings.
+ *
+ * Therefore every REST failure — unreachable, timeout, 401/403/404, malformed
+ * body, an unresolvable `default_branch` — is a `::warning::` and never fails
+ * the step. That is a deliberate reversal of an earlier design in which REST
+ * was fail-closed. It was fail-closed because a silently-degraded REST layer
+ * meant a silently-degraded VERDICT. It no longer does: a degraded REST layer
+ * now only means a less detailed message, and reddening a blocking gate over
+ * API reachability buys nothing.
+ *
+ * TWO THINGS THAT MAKE THIS SUBTLER THAN IT LOOKS:
  *
  * 1. `actions/cache@v4` exposes ONLY `cache-hit`. There is no
  *    `cache-primary-key` / `cache-matched-key` output on the main action, so
  *    the key cannot be read back off the step — it must be threaded to this
  *    script explicitly by the workflow. That is why an absent or empty `--key`
  *    is a hard CONFIGURATION ERROR here and not a silent skip: a guard that
- *    quietly checks nothing is precisely the disease being cured.
+ *    quietly checks nothing is precisely the disease being cured. The same
+ *    applies to `--probe` and `--probe-key`.
  *
  * 2. Caches are REF-SCOPED. A run can restore an entry from its own ref, from
  *    its PR base ref, and from the repository default branch — and from
  *    nothing else. The same key routinely exists several times over (once per
- *    branch and once per open PR merge ref). A guard that asked "does this key
- *    exist anywhere in the repo?" would go red on every run whose sibling
- *    branch happens to hold an entry it was never entitled to restore.
- *
- * 3. Caches are created CONCURRENTLY. A job on another ref can legitimately
- *    create the entry while this job is running, after this job's cache step
- *    already (correctly) missed. Only an entry that PREDATES this run's start
- *    can be one this run failed to restore, so `created_at >= run_started_at`
- *    is ignored. An entry with no parseable `created_at` still counts — this
- *    guard fails toward detection, never toward silence.
+ *    branch and once per open PR merge ref). The probe already respects that
+ *    scope, because it is the same action asking the same service; the ref
+ *    filtering here only keeps the printed evidence honest.
  *
  * OUT OF SCOPE ON PURPOSE: `actions/setup-node`'s internal npm cache. Its key
  * format is GitHub's private implementation detail (it composes the runner OS,
@@ -67,10 +104,10 @@
  * guard that checks a key nothing ever writes — green, and meaningless. If that
  * cache ever needs covering, it needs an output from the action, not a guess.
  *
- * Usage (one `--cache/--key/--hit` triple per declared cache):
+ * Usage (one `--cache/--key/--hit/--probe/--probe-key` quint per declared cache):
  *   node scripts/check-cache-health.mjs \
- *     --cache nats       --key "<key>" --hit "<true|false>" \
- *     --cache playwright --key "<key>" --hit "<true|false>"
+ *     --cache nats --key "<key>" --hit "<v>" --probe "<v>" --probe-key "<v>" \
+ *     --cache playwright --key "<key>" --hit "<v>" --probe "<v>" --probe-key "<v>"
  *
  * Environment: GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_REF, GITHUB_BASE_REF,
  * GITHUB_TOKEN, GITHUB_API_URL (default https://api.github.com — honored so
@@ -81,8 +118,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_API_URL = "https://api.github.com";
-// A hung API call must not stall the gate; every request carries this deadline
-// and a timeout is classified as transient (see classifyHttpStatus).
+// A hung API call must not stall the gate; every request carries this deadline.
+// A timeout is a warning like every other REST failure — see githubJson.
 const REQUEST_TIMEOUT_MS = 10_000;
 
 /**
@@ -90,8 +127,8 @@ const REQUEST_TIMEOUT_MS = 10_000;
  *
  * GitHub's restore scope is: the run's own ref, the base ref of a pull request,
  * and the repository default branch. Nothing else — an entry sitting on an
- * unrelated branch is invisible to this run, so finding one there says nothing
- * about the miss and must not be read as poison.
+ * unrelated branch is invisible to this run, so listing one as evidence for
+ * this run's miss would be misleading.
  */
 export function visibleCacheRefs({ ref, baseRef, defaultBranch } = {}) {
   const refs = new Set();
@@ -108,23 +145,19 @@ function parseTimestamp(value) {
 }
 
 /**
- * True when this entry existed before the run started, and is therefore an
- * entry the run's cache step had the opportunity to restore.
+ * True when this entry existed before the run started.
  *
- * Unparseable/absent timestamps on EITHER side count as "older". A guard that
- * treated missing metadata as "probably a race" would be silent in exactly the
- * situation where it has the least information — and silence is the failure
- * mode this whole script replaces.
+ * DEMOTED ON PURPOSE — this no longer gates anything. It used to filter the
+ * entry list, because back when REST decided the verdict a concurrently created
+ * entry could be read as poison. The probe is same-run and same-version, so a
+ * concurrent creation is now self-resolving: if the probe says an entry exists
+ * at our key and version, the restore had it and did not produce it, whenever
+ * it was written. All this does now is LABEL a line of printed evidence so a
+ * reader can tell "this appeared after your job started" from "this was here
+ * the whole time".
  *
- * DO NOT "TIGHTEN" THIS. `run_started_at` is when the WORKFLOW RUN started,
- * which is strictly EARLIER than when the cache step actually ran, so the
- * window between the two is time in which a real poisoned entry is ignored.
- * That skew is deliberate: it errs toward missing poison, never toward
- * inventing it. Moving the boundary later (a step timestamp, "now") would buy
- * a little detection and pay for it with false alarms on entries a concurrent
- * job legitimately created mid-run — turning a gate every branch depends on
- * into a flake. Under-reporting here is recoverable; a flaky blocking gate
- * gets disabled.
+ * Unparseable/absent timestamps on EITHER side count as "older", so the label
+ * is only ever attached when the API positively says so.
  */
 function predatesRun(entry, runStartedAt) {
   const created = parseTimestamp(entry?.created_at);
@@ -134,42 +167,84 @@ function predatesRun(entry, runStartedAt) {
 }
 
 /**
- * Classify one declared cache from the reported hit plus the live entry list.
+ * Classify one declared cache. The two booleans decide; `entries` only decorate.
  *
- * Matching is EXACT on the key. The REST API's `?key=` filter is documented as
- * a PREFIX filter, so it is only ever used to narrow the response — the
- * decision is made here, where `playwright-chromium-abc` cannot be mistaken for
- * `playwright-chromium-abcdef`.
+ * Evidence matching is EXACT on the key. The REST API's `?key=` filter is
+ * documented as a PREFIX filter, so it is only ever used to narrow the response
+ * — the comparison happens here, where `playwright-chromium-abc` cannot be
+ * mistaken for `playwright-chromium-abcdef`.
  */
-export function diagnoseCache({ label, key, hit, entries, visibleRefs, runStartedAt } = {}) {
-  if (hit === true) return { label, key, verdict: "ok", entry: null };
+export function diagnoseCache({
+  label,
+  key,
+  hit,
+  probe,
+  entries,
+  visibleRefs,
+  runStartedAt,
+} = {}) {
+  if (hit === true) return { label, key, verdict: "ok", evidence: [] };
 
   const visible = visibleRefs ?? new Set();
-  const candidates = entries ?? [];
-  const match = candidates.find(
-    (entry) =>
-      entry?.key === key && visible.has(entry?.ref) && predatesRun(entry, runStartedAt),
-  );
+  const evidence = (entries ?? [])
+    .filter((entry) => entry?.key === key && visible.has(entry?.ref))
+    .map((entry) => ({ ...entry, createdAfterRunStarted: !predatesRun(entry, runStartedAt) }));
 
-  if (match) return { label, key, verdict: "poisoned", entry: match };
-  return { label, key, verdict: "cold", entry: null };
+  return { label, key, verdict: probe === true ? "poisoned" : "cold", evidence };
 }
 
+const CACHE_FLAGS = new Set(["--cache", "--key", "--hit", "--probe", "--probe-key"]);
+
 /**
- * Parse the repeated `--cache/--key/--hit` triples.
+ * Parse the repeated `--cache/--key/--hit/--probe/--probe-key` quints.
  *
- * `hit` is true ONLY for the exact string "true": that is what
- * `steps.<id>.outputs.cache-hit` emits on a restore, and every other value
- * ("false", "", an unexpanded expression) is treated as a miss so a broken
- * expansion cannot mute the check.
+ * `hit` and `probe` are true ONLY for the exact string "true": that is what
+ * `steps.<id>.outputs.cache-hit` emits on an exact match, and every other value
+ * is treated as a miss so a broken expansion cannot mute the check.
+ *
+ * ── WHY AN EMPTY `--probe` IS *NOT* A WIRING SIGNAL ────────────────────────
+ *
+ * A previous revision of this file errored on "primary missed but --probe is
+ * empty", reasoning that a skipped step is the only thing that yields "". That
+ * is WRONG, and it would have reddened this blocking gate the first time anyone
+ * upgraded playwright-core or bumped the pinned nats version. From
+ * `actions/cache` `src/restoreImpl.ts`:
+ *
+ *     if (!cacheKey) {
+ *         // `cache-hit` is intentionally not set to `false` here to preserve
+ *         // existing behavior
+ *         // See https://github.com/actions/cache/issues/1466
+ *
+ * `cache-hit` is set ONLY to "true" on an exact match, and to "false" in one
+ * early return (the cache service being unavailable). A probe that RAN and
+ * legitimately found nothing emits "" — byte-identical to a probe that was
+ * skipped. So an empty `--probe` is the NORMAL COLD PATH. Do not reinstate that
+ * error; it cannot distinguish the two cases.
+ *
+ * ── WHAT DOES DISTINGUISH THEM: `--probe-key` ─────────────────────────────
+ *
+ * `actions/cache/restore` runs `restoreOnlyRun` → `new NullStateProvider()`,
+ * whose `setState` maps straight onto `core.setOutput`
+ * (`CachePrimaryKey → Outputs.CachePrimaryKey`). And `restoreImpl.ts` sets it
+ * BEFORE the miss return:
+ *
+ *     stateProvider.setState(State.CachePrimaryKey, primaryKey);   // line 33
+ *     ...
+ *     if (!cacheKey) { ... return; }                               // line 53
+ *
+ * So `cache-primary-key` is non-empty whenever the probe step RAN — hit or miss
+ * — and empty only when it was skipped. That is the "did it run" signal, and
+ * because its value IS the key the probe used, comparing it to `--key` also
+ * catches a probe that silently drifted onto a different key.
  */
 export function parseCacheArgs(argv) {
   const caches = [];
   const errors = [];
+  const warnings = [];
 
   // A flag standing where a value should be is a threading bug, not a value:
   // it yields `undefined` AND is left unconsumed, so the next iteration reads
-  // it as the flag it is rather than silently swallowing the following triple.
+  // it as the flag it is rather than silently swallowing the following quint.
   const readValue = (index) => {
     const value = argv[index + 1];
     if (value === undefined || value.startsWith("--")) return { value: undefined, consumed: 0 };
@@ -178,18 +253,28 @@ export function parseCacheArgs(argv) {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (arg === "--cache" || arg === "--key" || arg === "--hit") {
+    if (CACHE_FLAGS.has(arg)) {
       const { value, consumed } = readValue(index);
       index += consumed;
       if (arg === "--cache") {
         if (value === undefined) errors.push("--cache was given without a label");
-        else caches.push({ label: value, key: undefined, hit: false });
+        else {
+          caches.push({
+            label: value,
+            key: undefined,
+            hit: false,
+            probe: undefined,
+            probeKey: undefined,
+          });
+        }
         continue;
       }
       const current = caches[caches.length - 1];
       if (!current) errors.push(`${arg} appeared before any --cache <label>`);
       else if (arg === "--key") current.key = value ?? "";
-      else current.hit = value === "true";
+      else if (arg === "--hit") current.hit = value === "true";
+      else if (arg === "--probe") current.probe = value ?? "";
+      else current.probeKey = value ?? "";
       continue;
     }
     errors.push(`unrecognized argument: ${arg}`);
@@ -207,37 +292,86 @@ export function parseCacheArgs(argv) {
           "letting this cache go unchecked.",
       );
     }
+    if (cache.probe === undefined) {
+      errors.push(
+        `cache "${cache.label}" was declared with no --probe. The verdict is decided by ` +
+          "the lookup-only `actions/cache/restore@v4` probe, not by the REST API, so " +
+          "without it this cache cannot be classified at all.",
+      );
+    }
+    if (cache.probeKey === undefined) {
+      errors.push(
+        `cache "${cache.label}" was declared with no --probe-key. It is the only proof ` +
+          "that the probe step actually RAN — `cache-hit` is empty both on a genuine " +
+          "miss and when the step is skipped — so without it a probe whose `if:` never " +
+          "fires would read as a cold key and this guard would check nothing.",
+      );
+      continue;
+    }
+
+    // The probe step is `if:`-gated on the primary having missed, so after a HIT
+    // it is correctly skipped and both probe inputs are empty. Nothing to check.
+    if (cache.hit === true) continue;
+
+    if (cache.probeKey === "") {
+      // ONE non-wiring cause of an empty primary key, and it is distinguishable:
+      // `isCacheFeatureAvailable()` failing makes restoreImpl set `cache-hit` to
+      // the LITERAL "false" and return before the primary key is ever recorded.
+      // Our probe passes no `restore-keys`, so a partial match — the only other
+      // producer of a literal "false" — cannot occur. That is a GitHub cache
+      // outage, not a broken workflow: the primary cache step could not restore
+      // either, everything re-provisions, and nothing is poisoned. Reddening a
+      // blocking gate over cache-service availability buys exactly what
+      // reddening it over REST availability buys: nothing.
+      if (cache.probe === "false") {
+        warnings.push(
+          `cache "${cache.label}": the probe reported the Actions cache service as ` +
+            "unavailable, so poison cannot be distinguished from a cold key on this " +
+            "run. Treating it as cold — the primary cache step could not have " +
+            "restored anything either.",
+        );
+        continue;
+      }
+      errors.push(
+        `cache "${cache.label}" reported a MISS but its --probe-key is empty, which ` +
+          "means the probe step never ran. Its `if:` condition must fire on exactly " +
+          "the primary's non-hit; as wired, a poisoned entry would be reported as a " +
+          "cold key and this guard would check nothing.",
+      );
+    } else if (cache.probeKey !== cache.key) {
+      errors.push(
+        `cache "${cache.label}" probed a DIFFERENT key than it declared, so the probe ` +
+          "answered a question about some other cache and its verdict is meaningless:\n" +
+          `      declared (--key)      : ${cache.key}\n` +
+          `      probed (--probe-key)  : ${cache.probeKey}`,
+      );
+    }
   }
 
-  return { caches, errors };
+  return {
+    caches: caches.map((cache) => ({ ...cache, probe: cache.probe === "true" })),
+    errors,
+    warnings,
+  };
 }
 
 class CacheApiError extends Error {
-  constructor(message, { permanent }) {
+  constructor(message) {
     super(message);
     this.name = "CacheApiError";
-    this.permanent = permanent;
   }
 }
 
 /**
- * The API failure split is deliberate and asymmetric.
+ * Every failure mode is the same failure mode now: a warning.
  *
- *   transient (network error, timeout, 5xx, rate limit) → warn and pass.
- *     Making a green gate depend on api.github.com being reachable would add a
- *     brand-new flake source to every job, to defend against a defect that
- *     costs seconds per run. Not worth it.
- *
- *   permanent (401/403/404) → fail.
- *     These mean the guard is MISCONFIGURED — no `actions: read` on the job, a
- *     revoked token, the wrong repository. A guard that 403s on every run and
- *     shrugs would sit green and useless for months, which is the exact disease
- *     this script exists to cure. It must be loud the first time.
+ * There is no permanent/transient split any more, and no header sniffing to
+ * tell a 403-for-permissions from a 403-for-rate-limit. There is nothing left
+ * to classify — REST cannot change a verdict, so the worst a failure here can
+ * do is make a poisoned-cache message less specific. Failing a blocking gate
+ * over api.github.com being reachable would add a brand-new flake source to
+ * every job and defend nothing.
  */
-function classifyHttpStatus(status) {
-  return status === 401 || status === 403 || status === 404;
-}
-
 async function githubJson(url, token) {
   let response;
   try {
@@ -250,31 +384,24 @@ async function githubJson(url, token) {
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch (error) {
-    throw new CacheApiError(`request to ${url} failed: ${error.message}`, {
-      permanent: false,
-    });
+    throw new CacheApiError(`request to ${url} failed: ${error.message}`);
   }
 
   if (!response.ok) {
-    const permanent = classifyHttpStatus(response.status);
     const hint =
       response.status === 403 || response.status === 401
         ? " — the job is most likely missing a job-level `permissions:` block granting " +
           "`actions: read` (this repository's default workflow token is `read`, which " +
           "does NOT include actions), or this is a fork pull request whose token does " +
-          "not carry it"
+          "not carry it. The verdict below still stands; only the entry details are lost"
         : "";
-    throw new CacheApiError(`${url} returned HTTP ${response.status}${hint}`, {
-      permanent,
-    });
+    throw new CacheApiError(`${url} returned HTTP ${response.status}${hint}`);
   }
 
   try {
     return await response.json();
   } catch (error) {
-    throw new CacheApiError(`could not parse the response from ${url}: ${error.message}`, {
-      permanent: false,
-    });
+    throw new CacheApiError(`could not parse the response from ${url}: ${error.message}`);
   }
 }
 
@@ -284,15 +411,16 @@ async function githubJson(url, token) {
  * TWO endpoints, on purpose, and the split is load-bearing. The run object
  * carries `run_started_at`, but its nested `repository` object is a MINIMAL
  * repo reference: it has no `default_branch` key at all. Reading it there
- * yielded `undefined` on every real run, which dropped the default branch out
- * of the visible-ref set and made the guard blind to a poisoned entry sitting
- * on the default branch — while printing "genuinely new" and exiting 0. That
- * is this script's own disease, so the field is now read from
- * `GET /repos/{owner}/{repo}`, which is where it actually lives. Both calls sit
- * inside the scopes the job already grants.
+ * yields `undefined` on every real run, which drops the default branch out of
+ * the visible-ref set — and while that can no longer change a verdict, it would
+ * silently hide the very entry an operator needs to see.
+ *
+ * The two are settled INDEPENDENTLY: one endpoint failing must not throw away
+ * the other's answer, because both are pure diagnostics and half a diagnostic
+ * beats none. Each failure is returned as a warning for the caller to print.
  */
 export async function fetchRunContext({ apiUrl, repository, runId, token }) {
-  const [run, repo] = await Promise.all([
+  const [runResult, repoResult] = await Promise.allSettled([
     githubJson(
       `${apiUrl}/repos/${repository}/actions/runs/${encodeURIComponent(runId)}`,
       token,
@@ -300,23 +428,28 @@ export async function fetchRunContext({ apiUrl, repository, runId, token }) {
     githubJson(`${apiUrl}/repos/${repository}`, token),
   ]);
 
-  const defaultBranch = repo?.default_branch;
-  // FAIL CLOSED. An unresolved default branch does not mean "check fewer refs"
-  // — a narrowed visible set cannot produce a false alarm, it produces false
-  // NEGATIVES, and a guard that under-reports in silence is worth less than no
-  // guard. Degrading here would rebuild the exact defect this fetch fixes, so
-  // an absent default branch is a permanent misconfiguration and stops the run.
-  if (typeof defaultBranch !== "string" || defaultBranch === "") {
-    throw new CacheApiError(
-      `${apiUrl}/repos/${repository} returned no default_branch, so the set of refs ` +
-        "this run can restore from cannot be computed. The guard would check a " +
-        "narrowed ref set and under-report poisoned entries instead of failing, so " +
-        "it stops here rather than passing on an incomplete view.",
-      { permanent: true },
-    );
+  const warnings = [];
+  let runStartedAt;
+  let defaultBranch;
+
+  if (runResult.status === "fulfilled") runStartedAt = runResult.value?.run_started_at;
+  else warnings.push(`this run's start time is unavailable: ${runResult.reason.message}`);
+
+  if (repoResult.status === "fulfilled") {
+    const branch = repoResult.value?.default_branch;
+    if (typeof branch === "string" && branch !== "") defaultBranch = branch;
+    else {
+      warnings.push(
+        `${apiUrl}/repos/${repository} returned no default_branch, so entries visible ` +
+          "to this run only via the default branch will be omitted from the evidence " +
+          "below. The verdict is unaffected — it comes from the probe.",
+      );
+    }
+  } else {
+    warnings.push(`the repository default branch is unavailable: ${repoResult.reason.message}`);
   }
 
-  return { runStartedAt: run?.run_started_at, defaultBranch };
+  return { runStartedAt, defaultBranch, warnings };
 }
 
 export async function fetchCacheEntries({ apiUrl, repository, key, token }) {
@@ -339,30 +472,131 @@ function formatBytes(size) {
   return `${(size / 1e6).toFixed(1)} MB (${size} bytes)`;
 }
 
-function reportPoisoned(finding, { repository, runStartedAt }) {
-  const { label, key, entry } = finding;
-  console.error(`POISONED CACHE: ${label}`);
-  console.error(`  key              : ${key}`);
-  console.error(`  entry ref        : ${entry.ref}`);
-  console.error(`  entry size       : ${formatBytes(entry.size_in_bytes)}`);
-  console.error(`  entry created_at : ${entry.created_at ?? "(absent)"}`);
-  console.error(`  this run started : ${runStartedAt ?? "(unknown)"}`);
-  console.error(
-    "  actions/cache reported a MISS, but an entry under this exact key already\n" +
-      "  exists on a ref this run can restore from and predates this run's start.\n" +
-      "  The only way both are true is that the entry downloaded and failed to\n" +
-      "  extract: actions/cache swallows the tar failure and prints \"Cache not\n" +
-      "  found for input keys\", so the job re-provisions from the network and\n" +
-      "  stays green. It cannot self-heal — the save at the end of the job cannot\n" +
-      "  overwrite a key that already exists, so this entry holds the key and\n" +
-      "  burns the same download on every future run until it is deleted.",
+function describeEntry(entry) {
+  const age = entry.createdAfterRunStarted ? " [created after this run started]" : "";
+  return (
+    `    id ${entry.id ?? "(absent)"} · ref ${entry.ref ?? "(absent)"}\n` +
+    `      version    : ${entry.version ?? "(absent)"}\n` +
+    `      size       : ${formatBytes(entry.size_in_bytes)}\n` +
+    `      created_at : ${entry.created_at ?? "(absent)"}${age}`
   );
-  console.error("  Remedy — delete the entry, then re-run this job:");
-  console.error(`    gh api -X DELETE "repos/${repository}/actions/caches?key=${key}"`);
+}
+
+/**
+ * Report a poisoned entry, claiming ONLY what the probe proves.
+ *
+ * What is proven: an entry exists at this exact key AND version, on a ref this
+ * run can restore from, and the restore did not produce it. What is NOT proven
+ * is corruption — `actions/cache@v4` swallows EVERY non-validation restore
+ * error, not just a tar failure, so a service error, a failed download or a
+ * timeout lands here identically. An earlier revision of this message asserted
+ * "the only way both are true is that the entry downloaded and failed to
+ * extract" and told the operator to delete. That was simply false, and on a
+ * transient blip it destroyed a healthy 263 MB cache for nothing.
+ *
+ * Hence the remedy ORDER: re-run first. A re-run is the cheapest discriminator
+ * there is — a transient failure clears, and poison recurs by construction,
+ * because a poisoned entry can never overwrite itself. Deletion is the second
+ * step, taken only once the re-run has shown it recurs, and it deletes ONE
+ * entry by `id`: the `?key=` form removes the entry on every ref at once, and
+ * this repository routinely carries the same key on both a branch and an open
+ * PR's merge ref.
+ *
+ * The step still exits non-zero regardless. Silence is the disease this guard
+ * exists to cure, and a swallowed transient that repeats every run is worth
+ * seeing too.
+ */
+function reportPoisoned(finding, { repository }) {
+  const { label, key, evidence } = finding;
+  console.error(`POISONED CACHE: ${label}`);
+  console.error(`  key : ${key}`);
+  console.error(
+    "  A lookup-only actions/cache/restore probe — same path, same key, so the same\n" +
+      "  cache VERSION — found an entry, and the restore step did not produce it.\n" +
+      "  Two things do that, and this guard cannot tell them apart from here:\n" +
+      "    - the archive is corrupt or unextractable (truncated, or saved from a\n" +
+      "      path layout the restore no longer maps onto); or\n" +
+      "    - a download or cache-service failure that actions/cache SWALLOWED.\n" +
+      "  Either way the step printed \"Cache not found for input keys\" — identical to\n" +
+      "  a cold key — and the job re-provisioned from the network and stayed green.",
+  );
+
+  if (evidence.length === 0) {
+    console.error(
+      "  No entry details are available (the REST listing above did not resolve), so\n" +
+        "  this report cannot name the entry. Re-run the job first — see below.",
+    );
+  } else {
+    console.error(
+      `  Entries under this key on refs this run can restore from (${evidence.length}):`,
+    );
+    for (const entry of evidence) console.error(describeEntry(entry));
+    if (evidence.length > 1) {
+      console.error(
+        "  More than one entry is listed and this script cannot compute its own cache\n" +
+          "  version (the probe returns only a boolean), so NONE of these is named as\n" +
+          "  the bad one. The candidate is whichever entry's `version` matches this\n" +
+          "  run's — compare against the version printed by the cache step's debug log.",
+      );
+    }
+  }
+
+  console.error("  Remedy, IN THIS ORDER:");
+  console.error(
+    "    1. Re-run this job. That is the cheapest discriminator: a transient\n" +
+      "       download/service failure clears, while poison recurs every single time,\n" +
+      "       because a poisoned entry can never overwrite itself.",
+  );
+  console.error(
+    evidence.length > 1
+      ? "    2. ONLY if it recurs, delete the ONE entry whose version matches this run —\n" +
+          "       one of these, not both:"
+      : "    2. ONLY if it recurs, delete that one entry by id:",
+  );
+  for (const entry of evidence) {
+    console.error(
+      `         gh api -X DELETE "repos/${repository}/actions/caches/${entry.id}"  # ${entry.ref}`,
+    );
+  }
+  if (evidence.length === 0) {
+    console.error(
+      `         gh api "repos/${repository}/actions/caches?key=${key}" --jq '.actions_caches[]'\n` +
+        `         gh api -X DELETE "repos/${repository}/actions/caches/<id>"`,
+    );
+  }
+  console.error(
+    "       Delete by ID, never by `?key=` — the key form removes the entry on EVERY\n" +
+      "       ref at once, and this repository routinely holds the same key on a\n" +
+      "       branch and on an open PR's merge ref simultaneously.",
+  );
+}
+
+function reportCold(finding) {
+  const { label, key, evidence } = finding;
+  console.log(
+    `cache "${label}": the lookup-only probe found nothing at ${key} for this run's ` +
+      "cache version, so the miss is expected.",
+  );
+  if (evidence.length > 0) {
+    // The P1 false positive this model exists to prevent, made visible rather
+    // than merely tolerated: entries under this key DO exist, and they are
+    // still not restorable by this run, because a cache is matched by
+    // (key, version, ref) and `version` hashes the cached path plus the
+    // compression method. Editing `path:` — or GitHub changing its compressor —
+    // strands every older entry under a live key. That is healthy. Do not
+    // delete them; they age out on their own.
+    console.log(
+      `  Note: ${evidence.length} entry/entries exist under this key on refs this run can\n` +
+        "  restore from, at a DIFFERENT cache version — the `path:` or the compression\n" +
+        "  method changed. They are not restorable here and they are not poison. Leave\n" +
+        "  them alone; GitHub evicts them on its own.",
+    );
+    for (const entry of evidence) console.log(describeEntry(entry));
+  }
 }
 
 async function main(argv, env) {
-  const { caches, errors } = parseCacheArgs(argv);
+  const { caches, errors, warnings } = parseCacheArgs(argv);
   const apiUrl = (env.GITHUB_API_URL || DEFAULT_API_URL).replace(/\/+$/, "");
   const repository = env.GITHUB_REPOSITORY;
   const runId = env.GITHUB_RUN_ID;
@@ -379,21 +613,21 @@ async function main(argv, env) {
     for (const error of errors) console.error(`  - ${error}`);
     return 1;
   }
+  for (const warning of warnings) console.log(`::warning::${warning}`);
 
-  // The run context is fetched unconditionally, even when every declared cache
+  // Diagnostics are fetched unconditionally, even when every declared cache
   // reported a hit. It is what exercises `actions: read` on EVERY run, so a
-  // missing permission surfaces immediately instead of lying dormant until the
-  // first miss — which is the run where this guard is the only thing looking.
-  let runContext;
+  // missing permission surfaces as a warning immediately instead of lying
+  // dormant until the first miss — which is the run where an operator most
+  // needs the entry list.
+  let runContext = { runStartedAt: undefined, defaultBranch: undefined, warnings: [] };
   try {
     runContext = await fetchRunContext({ apiUrl, repository, runId, token });
   } catch (error) {
-    if (!error.permanent) {
-      console.log(`::warning::cache health guard skipped: ${error.message}`);
-      return 0;
-    }
-    console.error(`Cache health guard cannot reach the Actions API: ${error.message}`);
-    return 1;
+    runContext.warnings.push(`run context is unavailable: ${error.message}`);
+  }
+  for (const warning of runContext.warnings) {
+    console.log(`::warning::cache health guard diagnostics degraded: ${warning}`);
   }
 
   const visibleRefs = visibleCacheRefs({
@@ -415,29 +649,20 @@ async function main(argv, env) {
           await fetchCacheEntries({ apiUrl, repository, key: cache.key, token }),
         );
       } catch (error) {
-        if (!error.permanent) {
-          console.log(
-            `::warning::cache "${cache.label}" not checked: ${error.message}`,
-          );
-          entriesByKey.set(cache.key, null);
-        } else {
-          console.error(
-            `Cache health guard cannot list caches for "${cache.label}": ${error.message}`,
-          );
-          entriesByKey.set(cache.key, null);
-          failed = true;
-        }
+        console.log(
+          `::warning::cache "${cache.label}": entry details unavailable, so the report ` +
+            `below cannot name entries or ids: ${error.message}`,
+        );
+        entriesByKey.set(cache.key, []);
       }
     }
-
-    const entries = entriesByKey.get(cache.key);
-    if (entries === null) continue;
 
     const finding = diagnoseCache({
       label: cache.label,
       key: cache.key,
       hit: cache.hit,
-      entries,
+      probe: cache.probe,
+      entries: entriesByKey.get(cache.key),
       visibleRefs,
       runStartedAt: runContext.runStartedAt,
     });
@@ -445,12 +670,9 @@ async function main(argv, env) {
     if (finding.verdict === "ok") {
       console.log(`cache "${finding.label}": restored from ${finding.key} — healthy.`);
     } else if (finding.verdict === "cold") {
-      console.log(
-        `cache "${finding.label}": no entry exists for ${finding.key} on any ref this ` +
-          "run can restore from, so the miss is expected — this key is genuinely new.",
-      );
+      reportCold(finding);
     } else {
-      reportPoisoned(finding, { repository, runStartedAt: runContext.runStartedAt });
+      reportPoisoned(finding, { repository });
       failed = true;
     }
   }

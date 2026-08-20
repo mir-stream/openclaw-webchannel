@@ -23,6 +23,13 @@ const CLI_TIMEOUT_MS = 5_000;
 // does not have certifies nothing. If a field moves, re-record it with
 // `gh api <path>` and paste what came back.
 //
+// This matters MORE now than it did then. `id` and `version` are load-bearing:
+// `id` is what the remedy deletes (the `?key=` form would take out healthy
+// siblings on other refs), and `version` is the field whose existence forced
+// the whole verdict model onto the lookup-only probe, because a cache is
+// matched by (key, version, ref) and `version` is a private hash of the cached
+// path plus the compression method.
+//
 // Only the fields the guard reads are transcribed, plus the ones whose ABSENCE
 // is load-bearing. Unrelated fields are omitted rather than invented.
 
@@ -49,26 +56,35 @@ const RUN_PAYLOAD = {
 const KEY =
   "playwright-chromium-b8f20e2c06bcbc1b22fca4dd4d1d7ffbcee94616a3295deced9f0751e6e924c4";
 
+/** The live cache VERSION both entries below carry — same `path:`, same hash. */
+const VERSION = "b11b119dfd10565044882f81f06d3a75b1602bec6f8658ac905dd63583b2a885";
+
 /**
  * GET /repos/{owner}/{repo}/actions/caches?key=<KEY>&per_page=100 — the live
  * response, confirming the `key=` filter works and that the same key really is
- * duplicated across a PR merge ref and a branch ref.
+ * duplicated across a PR merge ref and a branch ref. That duplication is why
+ * the remedy deletes by `id`: `?key=` would take BOTH of these.
  *
  * `created_at` carries NINE fractional digits. Kept verbatim so a future
- * timestamp-parsing change cannot quietly regress these into the
- * "unparseable ⇒ treat as older" branch and turn the race guard into a
- * false-alarm generator.
+ * timestamp-parsing change cannot quietly regress the evidence label that
+ * marks an entry as created after the run started.
  */
 const LIVE_CACHE_ENTRIES = [
   {
+    id: 6776960828,
     ref: "refs/pull/200/merge",
     key: KEY,
+    version: VERSION,
+    last_accessed_at: "2026-08-20T05:56:45.235035000Z",
     created_at: "2026-08-19T08:34:14.020019000Z",
     size_in_bytes: 273962989,
   },
   {
+    id: 6776817145,
     ref: "refs/heads/develop",
     key: KEY,
+    version: VERSION,
+    last_accessed_at: "2026-08-20T03:09:08.301979000Z",
     created_at: "2026-08-19T08:28:57.659366000Z",
     size_in_bytes: 273962419,
   },
@@ -79,6 +95,9 @@ const RUN_STARTED_AT = RUN_PAYLOAD.run_started_at;
 // models an entry this run had the opportunity to restore.
 const BEFORE_RUN = "2026-08-18T22:11:03.884512000Z";
 const AFTER_RUN = LIVE_CACHE_ENTRIES[1].created_at;
+
+/** The live develop-ref entry, back-dated to before this run started. */
+const OLDER_LIVE_ENTRY = { ...LIVE_CACHE_ENTRIES[1], created_at: BEFORE_RUN };
 
 let stubServer;
 
@@ -206,192 +225,276 @@ describe("visibleCacheRefs", () => {
 
 describe("diagnoseCache", () => {
   const visibleRefs = new Set(["refs/heads/develop", "refs/heads/main"]);
-  const poisonedEntry = {
-    ref: "refs/heads/develop",
-    key: KEY,
-    created_at: BEFORE_RUN,
-    size_in_bytes: 273962419,
-  };
 
-  it("reports ok on a hit without consulting the entry list", () => {
+  it("reports ok on a hit without consulting the probe or the entry list", () => {
     expect(
       diagnoseCache({
         label: "playwright",
         key: KEY,
         hit: true,
-        entries: [poisonedEntry],
+        probe: true,
+        entries: [OLDER_LIVE_ENTRY],
         visibleRefs,
         runStartedAt: RUN_STARTED_AT,
       }),
-    ).toEqual({ label: "playwright", key: KEY, verdict: "ok", entry: null });
+    ).toEqual({ label: "playwright", key: KEY, verdict: "ok", evidence: [] });
   });
 
-  it("reports cold on a miss with no entries at all", () => {
+  it("reports cold on a miss when the probe found nothing", () => {
     expect(
       diagnoseCache({
         label: "playwright",
         key: KEY,
         hit: false,
+        probe: false,
         entries: [],
         visibleRefs,
         runStartedAt: RUN_STARTED_AT,
       }),
-    ).toEqual({ label: "playwright", key: KEY, verdict: "cold", entry: null });
+    ).toEqual({ label: "playwright", key: KEY, verdict: "cold", evidence: [] });
   });
 
-  it("reports poisoned on a miss with a matching older entry on a visible ref", () => {
+  it("reports COLD when the key exists but the probe missed — a version change", () => {
+    // THE P1 FALSE POSITIVE. Editing `path:` (or GitHub changing its
+    // compressor) moves the cache VERSION, so the restore correctly misses
+    // while an older entry keeps holding the key. The previous model called
+    // this poison and told the operator to delete a healthy 263 MB cache.
+    const finding = diagnoseCache({
+      label: "playwright",
+      key: KEY,
+      hit: false,
+      probe: false,
+      entries: [OLDER_LIVE_ENTRY],
+      visibleRefs,
+      runStartedAt: RUN_STARTED_AT,
+    });
+    expect(finding.verdict).toBe("cold");
+    // The entry is still surfaced as evidence — cold does not mean invisible.
+    expect(finding.evidence).toHaveLength(1);
+  });
+
+  it("reports poisoned when the probe found an entry at this key and version", () => {
+    const finding = diagnoseCache({
+      label: "playwright",
+      key: KEY,
+      hit: false,
+      probe: true,
+      entries: [OLDER_LIVE_ENTRY],
+      visibleRefs,
+      runStartedAt: RUN_STARTED_AT,
+    });
+    expect(finding.verdict).toBe("poisoned");
+    expect(finding.evidence).toEqual([{ ...OLDER_LIVE_ENTRY, createdAfterRunStarted: false }]);
+  });
+
+  it("reports poisoned from the probe alone when REST produced no entries", () => {
+    // A 403 or an unreachable API costs the message its detail and nothing
+    // else. The verdict is local, so it survives.
     expect(
       diagnoseCache({
         label: "playwright",
         key: KEY,
         hit: false,
-        entries: [poisonedEntry],
+        probe: true,
+        entries: [],
         visibleRefs,
         runStartedAt: RUN_STARTED_AT,
       }),
-    ).toEqual({ label: "playwright", key: KEY, verdict: "poisoned", entry: poisonedEntry });
+    ).toEqual({ label: "playwright", key: KEY, verdict: "poisoned", evidence: [] });
   });
 
-  it("reports poisoned when the entry is visible only via the default branch", () => {
-    // A feature-branch run with no PR base: the default branch is the ONLY
-    // thing keeping this entry in view. Resolving it wrongly made this case
-    // invisible in production while every stub test stayed green.
-    const onDefaultBranch = { ...poisonedEntry, ref: "refs/heads/main" };
-    expect(
-      diagnoseCache({
-        label: "playwright",
-        key: KEY,
-        hit: false,
-        entries: [onDefaultBranch],
-        visibleRefs: visibleCacheRefs({
-          ref: "refs/heads/feature/cache-guard",
-          defaultBranch: "main",
-        }),
-        runStartedAt: RUN_STARTED_AT,
-      }),
-    ).toEqual({ label: "playwright", key: KEY, verdict: "poisoned", entry: onDefaultBranch });
+  it("keeps evidence to entries on refs this run can restore from", () => {
+    const finding = diagnoseCache({
+      label: "playwright",
+      key: KEY,
+      hit: false,
+      probe: true,
+      entries: [OLDER_LIVE_ENTRY, { ...OLDER_LIVE_ENTRY, ref: "refs/pull/999/merge" }],
+      visibleRefs,
+      runStartedAt: RUN_STARTED_AT,
+    });
+    expect(finding.evidence.map((entry) => entry.ref)).toEqual(["refs/heads/develop"]);
   });
 
-  it("reports cold when the only matching entry lives on a ref this run cannot restore", () => {
-    expect(
-      diagnoseCache({
-        label: "playwright",
-        key: KEY,
-        hit: false,
-        entries: [{ ...poisonedEntry, ref: "refs/pull/999/merge" }],
-        visibleRefs,
-        runStartedAt: RUN_STARTED_AT,
-      }).verdict,
-    ).toBe("cold");
-  });
-
-  it("reports cold when a prefix-sibling key is the only entry", () => {
+  it("keeps a prefix-sibling key out of the evidence", () => {
     // `?key=` is a PREFIX filter, so the API legitimately returns neighbours;
-    // the exact comparison is what keeps them from reading as poison.
-    expect(
-      diagnoseCache({
-        label: "playwright",
-        key: KEY,
-        hit: false,
-        entries: [{ ...poisonedEntry, key: `${KEY}-extra` }],
-        visibleRefs,
-        runStartedAt: RUN_STARTED_AT,
-      }).verdict,
-    ).toBe("cold");
+    // the exact comparison is what keeps them out of the delete commands.
+    const finding = diagnoseCache({
+      label: "playwright",
+      key: KEY,
+      hit: false,
+      probe: true,
+      entries: [{ ...OLDER_LIVE_ENTRY, key: `${KEY}-extra` }],
+      visibleRefs,
+      runStartedAt: RUN_STARTED_AT,
+    });
+    expect(finding.evidence).toEqual([]);
   });
 
-  it("reports cold when the matching entry was created after this run started", () => {
-    // Race guard, and the nanosecond-timestamp lock: `created_at` here has the
-    // live API's nine fractional digits. If a parser change ever made that
-    // unparseable it would fall into the "treat as older" branch, this entry
-    // would read as poison, and this test goes red instead of the gate
-    // false-alarming on every concurrently created cache.
-    expect(
-      diagnoseCache({
-        label: "playwright",
-        key: KEY,
-        hit: false,
-        entries: [{ ...poisonedEntry, created_at: AFTER_RUN }],
-        visibleRefs,
-        runStartedAt: RUN_STARTED_AT,
-      }).verdict,
-    ).toBe("cold");
+  it("LABELS an entry created after the run started instead of dropping it", () => {
+    // The race guard, demoted. It used to filter — which mattered when REST
+    // decided the verdict. The probe is same-run, so a concurrent creation is
+    // self-resolving and the timestamp is now only an annotation. The
+    // nanosecond shape is the live one, so a parser regression shows up here.
+    const finding = diagnoseCache({
+      label: "playwright",
+      key: KEY,
+      hit: false,
+      probe: true,
+      entries: [{ ...OLDER_LIVE_ENTRY, created_at: AFTER_RUN }],
+      visibleRefs,
+      runStartedAt: RUN_STARTED_AT,
+    });
+    expect(finding.verdict).toBe("poisoned");
+    expect(finding.evidence[0].createdAfterRunStarted).toBe(true);
   });
 
-  it("reports cold for the recorded live listing, whose entries postdate the run", () => {
-    // Both live entries were created ~3h after run 32219789806 started, so the
-    // correct verdict against real data today is cold. This pins the observed
-    // behaviour so a later change cannot quietly turn it into an alarm.
-    expect(
-      diagnoseCache({
-        label: "playwright",
-        key: KEY,
-        hit: false,
-        entries: LIVE_CACHE_ENTRIES,
-        visibleRefs,
-        runStartedAt: RUN_STARTED_AT,
-      }).verdict,
-    ).toBe("cold");
+  it("does not label an entry whose created_at is missing", () => {
+    const finding = diagnoseCache({
+      label: "playwright",
+      key: KEY,
+      hit: false,
+      probe: true,
+      entries: [{ ...OLDER_LIVE_ENTRY, created_at: undefined }],
+      visibleRefs,
+      runStartedAt: RUN_STARTED_AT,
+    });
+    expect(finding.evidence[0].createdAfterRunStarted).toBe(false);
   });
 
-  it("reports poisoned when created_at is missing (fails toward detection)", () => {
-    const undated = { ...poisonedEntry, created_at: undefined };
-    expect(
-      diagnoseCache({
-        label: "playwright",
-        key: KEY,
-        hit: false,
-        entries: [undated],
-        visibleRefs,
-        runStartedAt: RUN_STARTED_AT,
-      }),
-    ).toEqual({ label: "playwright", key: KEY, verdict: "poisoned", entry: undated });
+  it("carries the live listing through as evidence, ids and versions intact", () => {
+    const finding = diagnoseCache({
+      label: "playwright",
+      key: KEY,
+      hit: false,
+      probe: true,
+      entries: LIVE_CACHE_ENTRIES,
+      visibleRefs: visibleCacheRefs({ ref: "refs/pull/200/merge", baseRef: "develop" }),
+      runStartedAt: RUN_STARTED_AT,
+    });
+    expect(finding.evidence.map((entry) => entry.id)).toEqual([6776960828, 6776817145]);
+    expect(finding.evidence.every((entry) => entry.version === VERSION)).toBe(true);
   });
 });
 
 describe("parseCacheArgs", () => {
-  it("parses repeated triples and treats only the exact string true as a hit", () => {
+  it("parses repeated quints and treats only the exact string true as a hit", () => {
     const { caches, errors } = parseCacheArgs([
-      "--cache", "nats", "--key", "nats-key", "--hit", "true",
-      "--cache", "playwright", "--key", KEY, "--hit", "false",
+      "--cache", "nats", "--key", "nats-key", "--hit", "true", "--probe", "", "--probe-key", "",
+      "--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+      "--probe-key", KEY,
     ]);
     expect(errors).toEqual([]);
     expect(caches).toEqual([
-      { label: "nats", key: "nats-key", hit: true },
-      { label: "playwright", key: KEY, hit: false },
+      { label: "nats", key: "nats-key", hit: true, probe: false, probeKey: "" },
+      { label: "playwright", key: KEY, hit: false, probe: true, probeKey: KEY },
     ]);
   });
 
   it("treats an empty key as a configuration error, never as a skip", () => {
-    const { errors } = parseCacheArgs(["--cache", "nats", "--key", "", "--hit", "false"]);
-    expect(errors).toHaveLength(1);
+    const { errors } = parseCacheArgs([
+      "--cache", "nats", "--key", "", "--hit", "false", "--probe", "false", "--probe-key", "",
+    ]);
     expect(errors[0]).toContain('cache "nats" was declared with no --key');
   });
 
   it("treats a swallowed --key flag as a configuration error", () => {
-    const { errors } = parseCacheArgs(["--cache", "nats", "--key", "--hit", "false"]);
+    const { errors } = parseCacheArgs([
+      "--cache", "nats", "--key", "--hit", "false", "--probe", "false", "--probe-key", "nats-key",
+    ]);
     expect(errors[0]).toContain('cache "nats" was declared with no --key');
+  });
+
+  it("treats a missing --probe as a configuration error", () => {
+    // The verdict comes from the probe. A cache declared without one cannot be
+    // classified at all, which is the "checks nothing" failure this guard is.
+    const { errors } = parseCacheArgs([
+      "--cache", "nats", "--key", "nats-key", "--hit", "false", "--probe-key", "nats-key",
+    ]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('cache "nats" was declared with no --probe');
+  });
+
+  it("treats a missing --probe-key as a configuration error", () => {
+    const { errors } = parseCacheArgs([
+      "--cache", "nats", "--key", "nats-key", "--hit", "false", "--probe", "",
+    ]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('cache "nats" was declared with no --probe-key');
+  });
+
+  it("accepts an empty --probe on a MISS — that is a genuine cold key", () => {
+    // THE GATE-BREAKING BUG. actions/cache never sets `cache-hit` to "false" on
+    // a miss ("intentionally not set ... See issue 1466"), so a probe that RAN
+    // and found nothing is indistinguishable from a skipped one by `cache-hit`
+    // alone. An earlier revision errored here and would have reddened this
+    // blocking gate on every playwright-core upgrade and every nats pin bump.
+    const { errors, caches } = parseCacheArgs([
+      "--cache", "nats", "--key", "nats-key", "--hit", "false", "--probe", "",
+      "--probe-key", "nats-key",
+    ]);
+    expect(errors).toEqual([]);
+    expect(caches[0].probe).toBe(false);
+  });
+
+  it("accepts both probe inputs empty after a HIT", () => {
+    // The probe step is `if:`-gated on the primary missing, so after a hit it is
+    // correctly skipped and neither output exists.
+    const { errors, warnings } = parseCacheArgs([
+      "--cache", "nats", "--key", "k", "--hit", "true", "--probe", "", "--probe-key", "",
+    ]);
+    expect(errors).toEqual([]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("errors when a MISS carries an empty --probe-key: the probe never ran", () => {
+    // `cache-primary-key` is recorded BEFORE restoreImpl's miss return, so it is
+    // non-empty whenever the step ran. Empty here means the `if:` never fired.
+    const { errors } = parseCacheArgs([
+      "--cache", "nats", "--key", "k", "--hit", "false", "--probe", "", "--probe-key", "",
+    ]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("its --probe-key is empty");
+    expect(errors[0]).toContain("never ran");
+  });
+
+  it("errors when the probe answered about a DIFFERENT key, naming both", () => {
+    const { errors } = parseCacheArgs([
+      "--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+      "--probe-key", `${KEY}-drifted`,
+    ]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain(KEY);
+    expect(errors[0]).toContain(`${KEY}-drifted`);
+    expect(errors[0]).toContain("DIFFERENT key");
+  });
+
+  it("warns rather than errors when the cache SERVICE was unavailable", () => {
+    // The one non-wiring cause of an empty primary key, and it is
+    // distinguishable: `isCacheFeatureAvailable()` failing is the only path
+    // that sets `cache-hit` to a LITERAL "false" before recording the key (our
+    // probe passes no restore-keys, so a partial match cannot produce one).
+    // The primary cache step could not have restored anything either, so this
+    // is an outage, not a broken workflow.
+    const { errors, warnings } = parseCacheArgs([
+      "--cache", "nats", "--key", "k", "--hit", "false", "--probe", "false", "--probe-key", "",
+    ]);
+    expect(errors).toEqual([]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("cache service as unavailable");
   });
 });
 
 // The pure functions above are worth nothing if the CLI never reaches them, so
 // every direction is proven end to end against the recorded API shapes: same
-// key, same arguments, only the listing and the run's ref differ.
+// key, same arguments, only the probe result and the listing differ.
 describe("cache health CLI against a stub Actions API", () => {
-  it("exits nonzero and names the key when the entry exists but was missed", async () => {
-    const { origin, requests } = await startStubApi({
-      actionsCaches: [
-        {
-          ref: "refs/heads/develop",
-          key: KEY,
-          created_at: BEFORE_RUN,
-          size_in_bytes: 273962419,
-        },
-      ],
-    });
+  it("fails and prints a delete-BY-ID remedy when the probe finds the entry", async () => {
+    const { origin, requests } = await startStubApi({ actionsCaches: [OLDER_LIVE_ENTRY] });
 
     const result = await runCli(
-      ["--cache", "playwright", "--key", KEY, "--hit", "false"],
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
       cliEnv(origin),
     );
 
@@ -400,7 +503,11 @@ describe("cache health CLI against a stub Actions API", () => {
     expect(output).toContain("POISONED CACHE: playwright");
     expect(output).toContain(KEY);
     expect(output).toContain("refs/heads/develop");
-    expect(output).toContain("actions/caches?key=");
+    expect(output).toContain(VERSION);
+    // The remedy deletes ONE entry by id. The `?key=` form removes the entry on
+    // every ref at once — this repo demonstrably carries this key on two.
+    expect(output).toContain(`actions/caches/${OLDER_LIVE_ENTRY.id}`);
+    expect(output).not.toContain("actions/caches?key=");
     // Proves the CLI actually talked to the API rather than short-circuiting,
     // and that it reads the default branch from the endpoint that has it.
     expect(requests.some((url) => url.includes(`/actions/runs/${RUN_ID}`))).toBe(true);
@@ -408,69 +515,75 @@ describe("cache health CLI against a stub Actions API", () => {
     expect(requests.some((url) => url.includes("/actions/caches?key="))).toBe(true);
   });
 
-  it("detects a poisoned entry reachable ONLY through the default branch", async () => {
-    // The production defect, end to end: a feature-branch run with no PR base,
-    // whose only path to this entry is the repository default branch. With the
-    // default branch unresolved the guard printed "genuinely new" and exited 0.
+  it("claims only what is proven, and orders the remedy re-run FIRST", async () => {
+    // actions/cache@v4 swallows EVERY non-validation restore error, so entry
+    // existence does not prove corruption. Asserting it did — and leading with
+    // "delete" — destroyed healthy caches on a transient blip.
+    const { origin } = await startStubApi({ actionsCaches: [OLDER_LIVE_ENTRY] });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin),
+    );
+
+    const output = `${result.stdout}${result.stderr}`;
+    expect(output).not.toContain("The only way both are true");
+    expect(output).toContain("corrupt or unextractable");
+    expect(output).toContain("SWALLOWED");
+    expect(output.indexOf("1. Re-run this job")).toBeGreaterThan(-1);
+    expect(output.indexOf("1. Re-run this job")).toBeLessThan(
+      output.indexOf("ONLY if it recurs, delete"),
+    );
+  });
+
+  it("passes on the SAME key at a DIFFERENT version — the probe, not the key, decides", async () => {
+    // The P1 false positive, end to end: an entry under this exact key sits on
+    // this run's own ref and predates the run, but it was saved at a different
+    // cache version (`path:` changed), so the restore correctly missed and the
+    // lookup-only probe found nothing. Reading the REST listing as the verdict
+    // would redden the gate here and order a healthy cache deleted.
     const { origin } = await startStubApi({
       actionsCaches: [
         {
-          ref: "refs/heads/main",
-          key: KEY,
-          created_at: BEFORE_RUN,
-          size_in_bytes: 273962419,
+          ...OLDER_LIVE_ENTRY,
+          version: "0f5b3a2d9c1e47a6b8d02f37e5c91a4d6b8e0c2f4a6d8b0e2c4f6a8d0b2e4c6f",
         },
       ],
     });
 
     const result = await runCli(
-      ["--cache", "playwright", "--key", KEY, "--hit", "false"],
-      cliEnv(origin, {
-        GITHUB_REF: "refs/heads/feature/cache-guard",
-        GITHUB_BASE_REF: "",
-      }),
-    );
-
-    expect(result.code).not.toBe(0);
-    const output = `${result.stdout}${result.stderr}`;
-    expect(output).toContain("POISONED CACHE: playwright");
-    expect(output).toContain("refs/heads/main");
-    expect(output).not.toContain("genuinely new");
-  });
-
-  it("fails closed when the repository endpoint yields no default branch", async () => {
-    // Degrading to a narrowed ref set here would produce false NEGATIVES —
-    // exactly the silence this guard exists to end — so it must stop instead.
-    const { origin } = await startStubApi({
-      actionsCaches: [],
-      repoPayload: { full_name: REPOSITORY },
-    });
-
-    const result = await runCli(
-      ["--cache", "playwright", "--key", KEY, "--hit", "false"],
-      cliEnv(origin),
-    );
-
-    expect(result.code).not.toBe(0);
-    expect(result.stderr).toContain("no default_branch");
-    expect(result.stdout).not.toContain("genuinely new");
-  });
-
-  it("exits zero for the same key when no entry exists", async () => {
-    const { origin } = await startStubApi({ actionsCaches: [] });
-
-    const result = await runCli(
-      ["--cache", "playwright", "--key", KEY, "--hit", "false"],
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "false",
+        "--probe-key", KEY],
       cliEnv(origin),
     );
 
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain("this key is genuinely new");
+    expect(result.stdout).toContain("the miss is expected");
+    expect(result.stdout).toContain("DIFFERENT cache version");
     expect(result.stderr).toBe("");
   });
 
-  it("exits nonzero when the API answers 403, instead of passing quietly", async () => {
-    // A guard that 403s forever and reports success is the disease, not a fix.
+  it("exits zero for the same key when no entry exists at all", async () => {
+    const { origin } = await startStubApi({ actionsCaches: [] });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "false",
+        "--probe-key", KEY],
+      cliEnv(origin),
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("the miss is expected");
+    expect(result.stdout).not.toContain("DIFFERENT cache version");
+    expect(result.stderr).toBe("");
+  });
+
+  it("warns and exits ZERO when the API answers 403", async () => {
+    // Inverted deliberately from the previous design. REST was fail-closed
+    // because a degraded REST layer meant a degraded VERDICT; it no longer
+    // does. Reddening a blocking gate over API reachability now buys nothing —
+    // the probe already decided, and all that is lost is entry detail.
     const server = createServer((request, response) => {
       response.statusCode = 403;
       response.setHeader("content-type", "application/json");
@@ -480,23 +593,173 @@ describe("cache health CLI against a stub Actions API", () => {
     await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 
     const result = await runCli(
-      ["--cache", "playwright", "--key", KEY, "--hit", "false"],
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "false",
+        "--probe-key", KEY],
+      cliEnv(`http://127.0.0.1:${server.address().port}`),
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("::warning::");
+    expect(result.stdout).toContain("actions: read");
+    expect(result.stdout).toContain("the miss is expected");
+  });
+
+  it("still fails on a probe hit when the API answers 403", async () => {
+    // The other half of the same reversal: losing REST must not lose the
+    // verdict. The report degrades to "no entry details", not to silence.
+    const server = createServer((request, response) => {
+      response.statusCode = 403;
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ message: "Resource not accessible by integration" }));
+    });
+    stubServer = server;
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
       cliEnv(`http://127.0.0.1:${server.address().port}`),
     );
 
     expect(result.code).not.toBe(0);
-    expect(result.stderr).toContain("actions: read");
+    expect(result.stderr).toContain("POISONED CACHE: playwright");
+    expect(result.stderr).toContain("No entry details are available");
+  });
+
+  it("warns and exits zero when the repository endpoint yields no default branch", async () => {
+    // Also inverted. An unresolved default branch used to be fatal because it
+    // narrowed the ref set the VERDICT was computed over. It now narrows only
+    // the printed evidence, so it is a warning and the probe still decides.
+    const { origin } = await startStubApi({
+      actionsCaches: [],
+      repoPayload: { full_name: REPOSITORY },
+    });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "false",
+        "--probe-key", KEY],
+      cliEnv(origin),
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("::warning::");
+    expect(result.stdout).toContain("no default_branch");
+    expect(result.stdout).toContain("the miss is expected");
+  });
+
+  it("reaches a poisoned verdict even with no default branch resolved", async () => {
+    const { origin } = await startStubApi({
+      actionsCaches: [],
+      repoPayload: { full_name: REPOSITORY },
+    });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).toContain("no default_branch");
+    expect(result.stderr).toContain("POISONED CACHE: playwright");
+  });
+
+  it("PASSES on a miss whose probe legitimately found nothing", async () => {
+    // THE GATE-BREAKING CASE, end to end. A probe that ran and found nothing
+    // emits an empty `cache-hit` — actions/cache never writes "false" on a miss
+    // (restoreImpl.ts, "intentionally not set ... issue 1466"). That is the
+    // ordinary cold path: a new playwright-core version, a bumped nats pin, a
+    // fresh branch. `--probe-key` is what proves the step ran; treating the
+    // empty `--probe` itself as a wiring signal reds this blocking gate on
+    // every routine dependency bump.
+    const { origin } = await startStubApi({ actionsCaches: [] });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "",
+        "--probe-key", KEY],
+      cliEnv(origin),
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("the miss is expected");
+    expect(result.stderr).toBe("");
+  });
+
+  it("PASSES on a hit with both probe inputs empty, as a skipped probe emits", async () => {
+    const { origin } = await startStubApi({ actionsCaches: LIVE_CACHE_ENTRIES });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "true", "--probe", "", "--probe-key", ""],
+      cliEnv(origin),
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("healthy");
+    expect(result.stderr).toBe("");
+  });
+
+  it("exits nonzero when the probe's `if:` never fired (empty --probe-key on a miss)", async () => {
+    const { origin } = await startStubApi({ actionsCaches: [] });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "", "--probe-key", ""],
+      cliEnv(origin),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("checked nothing");
+    expect(result.stderr).toContain("never ran");
+  });
+
+  it("exits nonzero and names both keys when the probe drifted onto another key", async () => {
+    const { origin } = await startStubApi({ actionsCaches: [] });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", "playwright-chromium-STALE"],
+      cliEnv(origin),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("DIFFERENT key");
+    expect(result.stderr).toContain(KEY);
+    expect(result.stderr).toContain("playwright-chromium-STALE");
   });
 
   it("exits nonzero when the workflow fails to thread a key through", async () => {
     const { origin } = await startStubApi({ actionsCaches: [] });
 
     const result = await runCli(
-      ["--cache", "playwright", "--key", "", "--hit", "false"],
+      ["--cache", "playwright", "--key", "", "--hit", "false", "--probe", "false",
+        "--probe-key", ""],
       cliEnv(origin),
     );
 
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain("checked nothing");
+  });
+
+  it("exits nonzero when the workflow fails to thread a probe result through", async () => {
+    const { origin } = await startStubApi({ actionsCaches: [] });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe-key", KEY],
+      cliEnv(origin),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("declared with no --probe");
+  });
+
+  it("exits nonzero when the workflow fails to thread the probe key through", async () => {
+    const { origin } = await startStubApi({ actionsCaches: [] });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true"],
+      cliEnv(origin),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("declared with no --probe-key");
   });
 });
