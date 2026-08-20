@@ -2,162 +2,50 @@
 /**
  * check-cache-health.mjs — detect a POISONED actions/cache entry.
  *
- * WHY THIS EXISTS (read before "simplifying" it away):
- * this repository has shipped a CI defect that is, by construction, INVISIBLE.
- * An `actions/cache` entry exists under a key but the restore does
- * not produce it — the archive is truncated, or was saved from a path layout
- * the restore no longer maps onto, or the download simply failed.
- * `actions/cache` swallows the failure and reports:
+ * `actions/cache` swallows extraction and download failures and prints the
+ * same "Cache not found for input keys" message as a genuinely cold key. The
+ * fallback download succeeds, the job stays green, and the broken entry keeps
+ * holding its key so the end-of-job save cannot replace it.
  *
- *     Cache not found for input keys: <key>
- *
- * which is byte-for-byte what a genuinely cold key prints. The guarded install
- * step (`if: steps.X.outputs.cache-hit != 'true'`) then re-provisions from the
- * network — correct behaviour, so the job goes green — and the save at the end
- * of the job fails with:
- *
- *     Unable to reserve cache with key <key>, another job may be creating this cache.
- *     ... a cache with this key already exists
- *
- * That last part is what makes this permanent rather than a bad day: the
- * poisoned entry HOLDS THE KEY, can never overwrite itself, and burns the same
- * download on every single run, forever, while every run reports success. The
- * most recent instance survived four consecutive green runs at ~13s and 263 MB
- * apiece and was found only by a human reading raw logs. Nothing automated in
- * this repo would have caught it, and the gate is about to fan out into ~9
- * parallel jobs, which multiplies that invisible waste by 9.
- *
- * ── WHAT THIS CLOSES, AND WHAT IT DOES NOT ─────────────────────────────────
- *
- * Two incidents drove this file. It closes ONE of them plus the general
- * fingerprint, and an earlier revision of this header said "twice", which a
- * later maintainer would reasonably read as covering both. It does not.
- *
- * CLOSED — the Playwright entry that matched the key and failed to extract.
- * Verified end to end against recorded fixtures with production-shaped argv:
- * exit 1, naming the entry and its id. It is catchable because the swallowed
- * tar failure leaves the primary's `cache-hit` EMPTY, so the probe's `if:`
- * fires and there is something to compare.
- *
- * NOT CLOSED — the nats entry saved under an absolute /usr/local/bin path
- * (93f2591). Same class of harm, out of reach here for two independent reasons,
- * and the second is the one that matters:
- *
- *   1. It happened in publish.yml. This guard is wired only into e2e-gate.yml.
- *   2. A cache that RESTORES SUCCESSFULLY into a layout the job cannot use is
- *      outside this fingerprint entirely. `cache-hit` is 'true', diagnoseCache
- *      returns `ok` before the probe or the listing is consulted, and nothing
- *      here ever looks at what landed on disk. No amount of probing fixes that:
- *      catching it needs a post-restore assertion on the extracted tree — the
- *      composite action's "Verify nats-server is on PATH" step is the shape of
- *      it — not a cache-existence check.
- *
- * ── THE SIGNAL, AND WHY IT IS A PROBE AND NOT THE REST API ─────────────────
- *
- * GitHub matches a cache entry by (KEY, VERSION, REF) — not by key. `version`
- * is a hash of the cached PATH plus the compression method, and it is GitHub's
- * private implementation detail. So this sequence is entirely legitimate:
- *
- *     someone edits `path:` on the cache step (or GitHub changes the
- *     compressor) → the version changes → the restore correctly MISSES,
- *     because nothing exists at the new version → an entry with the SAME KEY
- *     and the same ref is still sitting there from before.
- *
- * A guard that read "miss + key exists + visible" as poison would redden the
- * gate on that, and tell an operator to delete a perfectly healthy cache. And
- * the version cannot be recomputed here: reconstructing a private hash is the
- * same trap this script already refuses for setup-node's npm key (below).
- *
- * So the guard does not guess — IT ASKS THE ACTION. A second
- * `actions/cache/restore@v4` step with `lookup-only: true`, given the SAME
- * `path` and the SAME `key` as the primary, computes the SAME version and
- * answers the one question REST cannot: does an entry exist at OUR key AND OUR
- * version, on a ref this run can restore from? Its `cache-hit` is threaded in
- * as `--probe`, and its `cache-primary-key` as `--probe-key` — the latter is
- * the only proof that the probe step actually RAN, and parseCacheArgs explains
- * at length why that is not redundant.
- *
- * The verdict rests entirely on those two local, authoritative booleans:
+ * The guard asks `actions/cache/restore@v4` itself. Immediately after a primary
+ * miss, a lookup-only probe reuses the exact same `path:` and `key:` strings,
+ * and therefore the same private cache version. The two in-job booleans decide
+ * the verdict completely:
  *
  *   primary hit  probe          verdict
- *   ───────────  ─────────────  ──────────────────────────────────────────────
  *   true         (not run)      ok
- *   not true     not true       cold — nothing at our key+version. Covers a
- *                               genuinely new key AND a path/compression
- *                               version change. PASS.
- *   not true     true           POISONED — an entry exists at our exact key and
- *                               version, and the restore did not produce it.
- *                               FAIL.
+ *   not true     not true       cold
+ *   not true     true           poisoned
  *
- * There is exactly ONE thing REST can do to that verdict, and it can only ever
- * soften it: if it can show — from a COMPLETE listing — that every visible
- * entry under the key was created after this run started, the probe hit is a
- * concurrent save landing between the restore and the probe, not poison:
- * verdict `raced`, a warning, PASS. "Complete" is a precondition and not a
- * detail; a listing narrowed by a failed lookup can exhibit that shape while
- * hiding the poison. See diagnoseCache for why the downgrade is safe, what it
- * costs, and what it refuses.
+ * `--probe-key` carries the probe's `cache-primary-key`. Unlike `cache-hit`,
+ * which is empty both on a miss and when a step is skipped, it is recorded
+ * before the miss return and proves that the probe actually ran on `--key`.
  *
- * ── THE REST API IS DIAGNOSTIC ONLY ────────────────────────────────────────
+ * The REST API is diagnostics only. It cannot change a verdict; failures and
+ * truncated listings are warnings. Its entry list makes poison actionable by
+ * showing restore-priority order, ref, version, size, creation time, and entry
+ * `id`. The remedy always says to re-run first because a transient restore
+ * failure and real poison are indistinguishable inside one job. Only if the
+ * failure recurs should entries be deleted, one at a time by `id`, never by
+ * `?key=` (which deletes healthy siblings carrying the key on other refs).
  *
- * It must NEVER MANUFACTURE a failure — no REST answer can turn a passing run
- * red, and the `raced` downgrade above is the only direction in which it moves
- * a verdict at all. Its real job is to turn "poisoned" into an actionable
- * message: which entries are sitting under this key, on which refs, at which
- * versions, how big, how old, and — the part that matters most — their `id`,
- * because deleting by `?key=` removes the entry on EVERY ref at once and would
- * destroy healthy siblings.
+ * Caches are ref-scoped, so printed evidence is limited to the run's own ref,
+ * its PR base ref, and the repository default branch. The latter still comes
+ * from `GET /repos/{owner}/{repo}`: the run payload's nested repository object
+ * does not include `default_branch`. Failure to resolve it degrades only the
+ * report, never the verdict.
  *
- * Therefore every REST failure — unreachable, timeout, 401/403/404, malformed
- * body, an unresolvable `default_branch` — is a `::warning::` and never fails
- * the step. That is a deliberate reversal of an earlier design in which REST
- * was fail-closed. It was fail-closed because a silently-degraded REST layer
- * meant a silently-degraded VERDICT. It no longer does: a degraded REST layer
- * costs a less detailed message and the `raced` downgrade — both of which fail
- * SAFE, toward reporting poison — and reddening a blocking gate over API
- * reachability buys nothing.
- *
- * "FAILS SAFE" HAS TO BE ENFORCED, NOT ASSUMED, and PARTIAL degradation is why.
- * A total failure empties the evidence, which is obviously safe. A partial one
- * — one endpoint of the two answering — leaves a SHORTER evidence list that
- * still looks like an answer, and the `raced` downgrade reasons over exactly
- * that list. Losing `default_branch` alone was measured turning a real poisoned
- * entry into `raced` and exit 0. So the downgrade is gated on `scopeComplete`,
- * which certifies that EVERY diagnostic call answered — see diagnoseCache
- * property 3.
- *
- * TWO THINGS THAT MAKE THIS SUBTLER THAN IT LOOKS:
- *
- * 1. `actions/cache@v4` exposes ONLY `cache-hit`. There is no
- *    `cache-primary-key` / `cache-matched-key` output on the main action, so
- *    the key cannot be read back off the step — it must be threaded to this
- *    script explicitly by the workflow. That is why an absent or empty `--key`
- *    is a hard CONFIGURATION ERROR here and not a silent skip: a guard that
- *    quietly checks nothing is precisely the disease being cured. The same
- *    applies to `--probe` and `--probe-key`.
- *
- * 2. Caches are REF-SCOPED. A run can restore an entry from its own ref, from
- *    its PR base ref, and from the repository default branch — and from
- *    nothing else. The same key routinely exists several times over (once per
- *    branch and once per open PR merge ref). The probe already respects that
- *    scope, because it is the same action asking the same service; the ref
- *    filtering here only keeps the printed evidence honest.
- *
- * OUT OF SCOPE ON PURPOSE: `actions/setup-node`'s internal npm cache. Its key
- * format is GitHub's private implementation detail (it composes the runner OS,
- * an internal version prefix and a lockfile hash, and has changed between
- * setup-node majors). Hardcoding a reconstruction of it here would rot into a
- * guard that checks a key nothing ever writes — green, and meaningless. If that
- * cache ever needs covering, it needs an output from the action, not a guess.
+ * `actions/setup-node`'s internal npm cache is intentionally out of scope. Its
+ * key is a private implementation detail; reconstructing it would create a
+ * guard that can drift into checking a key nothing writes.
  *
  * Usage (one `--cache/--key/--hit/--probe/--probe-key` quint per declared cache):
  *   node scripts/check-cache-health.mjs \
  *     --cache nats --key "<key>" --hit "<v>" --probe "<v>" --probe-key "<v>" \
  *     --cache playwright --key "<key>" --hit "<v>" --probe "<v>" --probe-key "<v>"
  *
- * Environment: GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_REF, GITHUB_BASE_REF,
- * GITHUB_TOKEN, GITHUB_API_URL (default https://api.github.com — honored so
- * tests can point at a local stub and so GHES works).
+ * Environment: GITHUB_REPOSITORY, GITHUB_REF, GITHUB_BASE_REF, GITHUB_TOKEN,
+ * GITHUB_API_URL (default https://api.github.com; honored for GHES and tests).
  */
 
 import path from "node:path";
@@ -184,116 +72,14 @@ export function visibleCacheRefs({ ref, baseRef, defaultBranch } = {}) {
   return refs;
 }
 
-function parseTimestamp(value) {
-  if (typeof value !== "string" && typeof value !== "number") return null;
-  const parsed = Date.parse(value);
-  return Number.isNaN(parsed) ? null : parsed;
-}
-
 /**
- * True when this entry existed before the run started.
- *
- * THIS GATES A VERDICT — see the "raced" branch in diagnoseCache. A previous
- * revision demoted it to a decorative label, arguing that "the probe is
- * same-run and same-version, so a concurrent creation is self-resolving". That
- * argument is FALSE, and it produced a reachable false POISONED with nothing
- * wrong anywhere. The probe is same-RUN, not same-INSTANT: the primary restore
- * happens at T0 and the probe at T0+Δ, and Δ is minutes for nats — the primary
- * lives inside .github/actions/install-nats-server while `probe-nats` sits
- * after `npm ci`, `lint:citations` and the whole Playwright cache block. So a
- * concurrent run's END-OF-JOB SAVE can land inside Δ: a PR run legitimately
- * misses a cold key at T0, a develop push writes the entry at T0+60s, and the
- * PR run's probe sees it at T0+90s. Reading that as poison reddens a required
- * check and tells an operator to delete a cache created 30 seconds ago.
- *
- * ONE SUB-SECOND WRINKLE, stated so nobody re-derives it as a bug: measured
- * live, `run_started_at` is truncated to whole seconds while `created_at`
- * carries nine fractional digits, both UTC. An entry created in the same second
- * as the run start therefore reads as post-dating it. That is a ≤1s extension
- * of the checkout-window trade already accepted in diagnoseCache property 4 —
- * same direction, same mitigation (poison is persistent, so it fails properly
- * on the next run), and negligible beside the seconds-to-minutes window that
- * trade already covers.
- *
- * Unparseable/absent timestamps on EITHER side count as "older", so an entry is
- * only ever treated as new when the API positively says so. That direction is
- * deliberate: it keeps the "raced" downgrade unreachable through missing data.
- *
- * BOTH SIDES OF THAT `||` ARE LOAD-BEARING, and they are defended differently.
- * The `created === null` side is the only defence for an entry whose
- * `created_at` is absent or malformed. The `started === null` side overlaps
- * with `scopeComplete`, which independently refuses the downgrade when the runs
- * endpoint did not answer — but the overlap is not total: a `run_started_at`
- * that is PRESENT and unparseable (a GHES quirk, a shape change) satisfies
- * `scopeComplete`, and then this line is the only thing standing between a
- * garbage timestamp and a `raced` pass. Flip either side and evidence is
- * labelled "created after this run started" on no evidence at all.
- */
-function predatesRun(entry, runStartedAt) {
-  const created = parseTimestamp(entry?.created_at);
-  const started = parseTimestamp(runStartedAt);
-  if (created === null || started === null) return true;
-  return created < started;
-}
-
-/**
- * Classify one declared cache. The two booleans decide whether this is a
- * failure; the entries can only ever DOWNGRADE a failure to a warning.
+ * Classify one declared cache. Only the primary and probe booleans decide the
+ * verdict; REST entries are carried through solely for reporting.
  *
  * Evidence matching is EXACT on the key. The REST API's `?key=` filter is
  * documented as a PREFIX filter, so it is only ever used to narrow the response
  * — the comparison happens here, where `playwright-chromium-abc` cannot be
  * mistaken for `playwright-chromium-abcdef`.
- *
- * ── THE "raced" VERDICT ────────────────────────────────────────────────────
- *
- * A probe hit is only poison if the entry was already there when the restore
- * ran. It need not have been: see predatesRun above for the concurrent-save
- * window this closes. So a probe hit whose every visible entry was created
- * AFTER `run_started_at` is reported as `raced` — a warning, exit 0.
- *
- * Four properties hold, and each is load-bearing:
- *
- * 1. EMPTY EVIDENCE IS STILL `poisoned`. REST is diagnostics-only, and a
- *    degraded REST layer must never be able to hide a real poisoning. Empty
- *    evidence means "we could not rule it out", not "no entries exist". This
- *    covers TOTAL degradation only — a partly-degraded lookup returns a
- *    non-empty list that is merely INCOMPLETE, and property 3 is what covers
- *    that. Do not read this line as the whole defence; it was, and the gap was
- *    a live fail-open.
- * 2. ANY ENTRY PREDATING THE RUN IS STILL `poisoned`. One old entry is enough:
- *    it was restorable and was not restored. Hence `every`, not `some`.
- * 3. AN INCOMPLETE EVIDENCE SCOPE IS STILL `poisoned` — `scopeComplete`, and it
- *    is not a formality. `every()` over a set that is missing entries proves
- *    NOTHING, and PARTIAL degradation is what makes the set lie while looking
- *    healthy. Property 1 only covers total degradation. The measured hole this
- *    closes: `GET /repos/{o}/{r}` fails → `defaultBranch` is undefined →
- *    `refs/heads/main` silently drops out of visibleRefs → an OLD poisoned
- *    entry on the default branch is filtered out of `evidence` → the newer
- *    entry that survives on another visible ref makes `every()` true → `raced`,
- *    exit 0, under a warning asserting the opposite of the truth. Same fixtures,
- *    only the repo endpoint changed: healthy → exit 1 POISONED, 500 → exit 0.
- *    So the downgrade requires the caller to certify the whole diagnostic path:
- *    default branch resolved, run start time resolved, the listing fetch for
- *    THIS key not thrown, and the listing not truncated. Absent or non-`true`,
- *    the downgrade is refused — omitting the argument cannot enable it. One
- *    half of that completeness is computed HERE and not by the caller: an entry
- *    whose `ref` is absent is dropped by the ref filter, which narrows the
- *    evidence exactly the way a failed lookup does, so it blocks the downgrade
- *    on the same flag.
- * 4. THIS TRADES A NARROW FALSE NEGATIVE FOR THAT FALSE POSITIVE, and the trade
- *    is not free. `run_started_at` precedes the primary restore step by the
- *    checkout/setup time, so an entry genuinely written in THAT window is real
- *    poison and gets downgraded to `raced` on this run. That is acceptable for
- *    exactly one reason: poison is PERSISTENT BY CONSTRUCTION — a poisoned
- *    entry can never overwrite itself — so on the next run it predates that
- *    run's start and fails properly. The warning text says so explicitly, so an
- *    operator seeing it twice knows it is not a race.
- *
- * `scopeComplete` asks only "did every diagnostic call ANSWER". Whether the
- * answer was USABLE is predatesRun's job: a present-but-unparseable
- * `run_started_at` passes the completeness check and is then caught by that
- * function's fail direction, which is why both layers exist and both are tested.
  */
 export function diagnoseCache({
   label,
@@ -302,8 +88,6 @@ export function diagnoseCache({
   probe,
   entries,
   visibleRefs,
-  runStartedAt,
-  scopeComplete,
   probeUnavailable,
   listingFailed,
 } = {}) {
@@ -311,19 +95,6 @@ export function diagnoseCache({
 
   const visible = visibleRefs ?? new Set();
   const matchingKey = (entries ?? []).filter((entry) => entry?.key === key);
-
-  // AN ENTRY WITH NO USABLE `ref` IS DROPPED, AND THAT DROP IS NOT FREE.
-  // `visible.has(undefined)` is false, so such an entry vanishes from the
-  // evidence silently — and if the one it hid was OLD while a newer one
-  // survived, `every()` goes true and a real poisoning is downgraded to
-  // `raced`, exit 0, over a listing this function otherwise considers complete.
-  // Nobody has shown the live API ever omits `ref`, so this is insurance, not a
-  // fix for an observed outage; it is cheap because it folds into the
-  // completeness flag that already exists rather than adding a branch. An
-  // unparseable listing must not be allowed to certify itself.
-  const droppedForMissingRef = matchingKey.filter(
-    (entry) => typeof entry?.ref !== "string" || entry.ref === "",
-  ).length;
 
   // RESTORE PRIORITY ORDER, and it is load-bearing for the remedy rather than
   // cosmetic. GitHub searches this run's own ref, then the PR base ref, then the
@@ -339,7 +110,6 @@ export function diagnoseCache({
   };
   const evidence = matchingKey
     .filter((entry) => visible.has(entry.ref))
-    .map((entry) => ({ ...entry, createdAfterRunStarted: !predatesRun(entry, runStartedAt) }))
     .sort((left, right) => rankOf(left) - rankOf(right));
 
   // `probeUnavailable` changes NO verdict — an outage is still reported cold,
@@ -355,24 +125,11 @@ export function diagnoseCache({
     };
   }
 
-  const allEntriesPostDateRun =
-    evidence.length > 0 && evidence.every((entry) => entry.createdAfterRunStarted === true);
-  const scopeIsComplete = scopeComplete === true && droppedForMissingRef === 0;
-
-  if (allEntriesPostDateRun && scopeIsComplete) {
-    return { label, key, verdict: "raced", evidence };
-  }
-
-  // Both flags are for the REPORT, not the verdict. `racedSuppressed` explains
-  // why a run is failing over a set of entries that all look like a race;
-  // `listingFailed` separates "the listing did not resolve" from "it resolved
-  // and nothing survived the ref filter", which are different operator actions.
   return {
     label,
     key,
     verdict: "poisoned",
     evidence,
-    racedSuppressed: allEntriesPostDateRun && !scopeIsComplete,
     listingFailed: listingFailed === true,
   };
 }
@@ -620,38 +377,13 @@ async function githubJson(url, token) {
   }
 }
 
-/**
- * Resolve this run's start time and the repository's default branch.
- *
- * TWO endpoints, on purpose, and the split is load-bearing. The run object
- * carries `run_started_at`, but its nested `repository` object is a MINIMAL
- * repo reference: it has no `default_branch` key at all. Reading it there
- * yields `undefined` on every real run, which drops the default branch out of
- * the visible-ref set — and while that can no longer change a verdict, it would
- * silently hide the very entry an operator needs to see.
- *
- * The two are settled INDEPENDENTLY: one endpoint failing must not throw away
- * the other's answer, because both are pure diagnostics and half a diagnostic
- * beats none. Each failure is returned as a warning for the caller to print.
- */
-export async function fetchRunContext({ apiUrl, repository, runId, token }) {
-  const [runResult, repoResult] = await Promise.allSettled([
-    githubJson(
-      `${apiUrl}/repos/${repository}/actions/runs/${encodeURIComponent(runId)}`,
-      token,
-    ),
-    githubJson(`${apiUrl}/repos/${repository}`, token),
-  ]);
-
+/** Resolve the default branch used to keep ref-filtered diagnostics honest. */
+export async function fetchRepositoryContext({ apiUrl, repository, token }) {
   const warnings = [];
-  let runStartedAt;
   let defaultBranch;
-
-  if (runResult.status === "fulfilled") runStartedAt = runResult.value?.run_started_at;
-  else warnings.push(`this run's start time is unavailable: ${runResult.reason.message}`);
-
-  if (repoResult.status === "fulfilled") {
-    const branch = repoResult.value?.default_branch;
+  try {
+    const repositoryDetails = await githubJson(`${apiUrl}/repos/${repository}`, token);
+    const branch = repositoryDetails?.default_branch;
     if (typeof branch === "string" && branch !== "") defaultBranch = branch;
     else {
       warnings.push(
@@ -660,28 +392,14 @@ export async function fetchRunContext({ apiUrl, repository, runId, token }) {
           "below. The verdict is unaffected — it comes from the probe.",
       );
     }
-  } else {
-    warnings.push(`the repository default branch is unavailable: ${repoResult.reason.message}`);
+  } catch (error) {
+    warnings.push(`the repository default branch is unavailable: ${error.message}`);
   }
 
-  return { runStartedAt, defaultBranch, warnings };
+  return { defaultBranch, warnings };
 }
 
-/**
- * List the entries under one key, and say whether the list is COMPLETE.
- *
- * `truncated` is not decoration: an omitted OLD entry is a route into the
- * `raced` downgrade, because `every()` over a short page can be true while the
- * page that was dropped holds the poison. So the completeness of the answer is
- * reported alongside it and feeds `scopeComplete`.
- *
- * Deliberately NO pagination loop. Refusing to downgrade on a truncated answer
- * costs one falsely-reported poison at worst — which a re-run resolves, since
- * poison recurs and a race does not — while a paging loop adds request-count,
- * rate-limit and partial-failure surface to a step that must never flake. A
- * missing or non-numeric `total_count` counts as truncated for the same reason
- * empty evidence counts as poison: it means "could not rule it out".
- */
+/** List the entries under one key and flag a partial diagnostic response. */
 export async function fetchCacheEntries({ apiUrl, repository, key, token }) {
   // `?key=` narrows the response (documented as a PREFIX filter); the exact
   // comparison still happens in diagnoseCache.
@@ -691,7 +409,7 @@ export async function fetchCacheEntries({ apiUrl, repository, key, token }) {
   const body = await githubJson(url, token);
   const entries = Array.isArray(body?.actions_caches) ? body.actions_caches : [];
   const totalCount = typeof body?.total_count === "number" ? body.total_count : null;
-  // `totalCount` is returned as well as the verdict-facing boolean because a
+  // `totalCount` is returned as well as the `truncated` boolean because a
   // truncated listing is a SUCCESSFUL call: nothing else in the run would print
   // a word about it, and "the API said N and gave us fewer" is the only fact an
   // operator can act on when the report tells them the listing is incomplete.
@@ -718,12 +436,11 @@ function countEntries(count) {
 }
 
 function describeEntry(entry) {
-  const age = entry.createdAfterRunStarted ? " [created after this run started]" : "";
   return (
     `    id ${entry.id ?? "(absent)"} · ref ${entry.ref ?? "(absent)"}\n` +
     `      version    : ${entry.version ?? "(absent)"}\n` +
     `      size       : ${formatBytes(entry.size_in_bytes)}\n` +
-    `      created_at : ${entry.created_at ?? "(absent)"}${age}`
+    `      created_at : ${entry.created_at ?? "(absent)"}`
   );
 }
 
@@ -747,34 +464,12 @@ function describeEntry(entry) {
  * this repository routinely carries the same key on both a branch and an open
  * PR's merge ref.
  *
- * ── THE REMEDY IS DRIVEN BY ONE DERIVED LIST, ON PURPOSE ───────────────────
- *
- * `candidates` — the evidence entries that PREDATE the run — is the only thing
- * the remedy branches on. Earlier revisions branched separately on
- * `racedSuppressed`, on `evidence.length === 0` and on `evidence.length > 1`,
- * each with its own prose, and the combinations contradicted each other. The
- * measured one: a suppressed downgrade with two surviving entries printed
- * "the candidate is NOT one of these", then "the candidate is whichever of
- * these matches this run's version", then "delete NOT one of these" — and the
- * middle procedure SUCCEEDS, because the probe hit means an entry really does
- * exist at this run's exact key and version, and on that path the entry is the
- * concurrent save. It fingers a healthy cache created seconds earlier, whose
- * id the report printed eight lines above.
- *
- * The invariant that dissolves all of it: AN ENTRY CREATED AFTER THIS RUN
- * STARTED CANNOT BE THE ONE THE RESTORE FAILED TO PRODUCE, so it is never a
- * deletion target — in any branch, for any reason. Filter once, then let
- * `candidates.length` (0 / 1 / >1) pick the wording. `racedSuppressed` stops
- * being a remedy selector and keeps only its real job: explaining why a run is
- * still failing over a set of entries that all look like a race.
- *
  * The step still exits non-zero regardless. Silence is the disease this guard
  * exists to cure, and a swallowed transient that repeats every run is worth
  * seeing too.
  */
 function reportPoisoned(finding, { repository }) {
-  const { label, key, evidence, racedSuppressed, listingFailed } = finding;
-  const candidates = evidence.filter((entry) => !entry.createdAfterRunStarted);
+  const { label, key, evidence, listingFailed } = finding;
   console.error(`POISONED CACHE: ${label}`);
   console.error(`  key : ${key}`);
   console.error(
@@ -810,22 +505,6 @@ function reportPoisoned(finding, { repository }) {
       `  Entries under this key on refs this run can restore from (${countEntries(evidence.length)}):`,
     );
     for (const entry of evidence) console.error(describeEntry(entry));
-    if (racedSuppressed) {
-      // The one thing `racedSuppressed` still selects, and it is an
-      // EXPLANATION, not a procedure: without it the report contradicts itself,
-      // because every entry it just listed is marked "created after this run
-      // started" — the exact shape that passes as a race.
-      console.error(
-        "  Every entry listed above post-dates this run's start, which on a COMPLETE\n" +
-          "  listing would be reported as a concurrent save and pass. It is not passing\n" +
-          "  here, deliberately: this listing is not known to be complete — EITHER one of\n" +
-          "  the diagnostic calls behind it failed, OR the API reported more entries than\n" +
-          "  it returned. The ::warning:: lines from this step say which. So the list may\n" +
-          "  be MISSING entries, including an older one that would prove poison, and a set\n" +
-          "  that may be incomplete cannot prove every entry is new. Re-run first, as\n" +
-          "  below: it re-runs the diagnostics too.",
-      );
-    }
   }
 
   console.error("  Remedy, IN THIS ORDER:");
@@ -835,22 +514,18 @@ function reportPoisoned(finding, { repository }) {
       "       because a poisoned entry can never overwrite itself.",
   );
 
-  if (candidates.length === 0) {
-    // Covers BOTH "we saw nothing" and "everything we saw post-dates the run".
-    // They were separate branches with separate prose until the combinations
-    // started contradicting each other; the honest sentence is the same for
-    // both, because in both this report cannot name a target it can stand behind.
+  if (evidence.length === 0) {
     console.error(
       "    2. ONLY if it recurs, delete the offending entry. THIS REPORT CANNOT NAME IT:\n" +
-        "       no entry it could see qualifies as a candidate, because an entry created\n" +
-        "       after this run started cannot be the one the restore failed to produce.\n" +
+        "       no entry under this key survived the diagnostic listing and ref filter.\n" +
         "       Re-list once the diagnostics recover. `version` NARROWS the field — an\n" +
         "       entry whose version differs from this run's (see the cache step's debug\n" +
         "       log) was saved under a different `path:` or compressor and is not the one\n" +
         "       — but it does NOT identify a single entry, because a version hashes only\n" +
         "       the path and the compression method and is identical on every ref holding\n" +
-        "       this key. Among whatever survives that filter, delete ONE AT A TIME,\n" +
-        "       oldest first, re-running between and stopping when the gate goes green:",
+        "       this key. Among whatever survives that filter, delete ONE AT A TIME in\n" +
+        "       restore-priority order, re-running between and stopping when the gate\n" +
+        "       goes green:",
     );
     console.error(
       `         gh api "repos/${repository}/actions/caches?key=${key}" --jq '.actions_caches[]'\n` +
@@ -870,14 +545,14 @@ function reportPoisoned(finding, { repository }) {
     //
     // What is genuinely known is ORDER: the restore tried this run's own ref,
     // then the PR base ref, then the default branch, and the evidence arrives
-    // sorted that way. The first candidate is the entry the restore reached
+    // sorted that way. The first entry is the one the restore reached
     // first. That is a likelihood, not a proof — if its version does not match
     // this run's, the restore fell through to the next — which is exactly why
     // the procedure is one-at-a-time with a re-run between rather than a single
     // named id. The asymmetry makes that safe: deleting a healthy entry costs
     // one re-download, leaving the poisoned one costs a permanently red gate.
     console.error(
-      candidates.length > 1
+      evidence.length > 1
         ? "    2. ONLY if it recurs, delete them ONE AT A TIME, in the order listed below,\n" +
             "       re-running this job after each deletion and STOPPING as soon as it goes\n" +
             "       green. Do not delete them all at once, and do not try to pick by\n" +
@@ -890,7 +565,7 @@ function reportPoisoned(finding, { repository }) {
             "       leaving the poisoned one costs a permanently red gate."
         : "    2. ONLY if it recurs, delete that one entry by id:",
     );
-    for (const entry of candidates) {
+    for (const entry of evidence) {
       // An entry the listing returned without an `id` would otherwise render a
       // copy-pasteable `.../actions/caches/undefined`, four lines under a
       // describeEntry that already said `id (absent)`.
@@ -906,35 +581,6 @@ function reportPoisoned(finding, { repository }) {
       "       ref at once, and this repository routinely holds the same key on a\n" +
       "       branch and on an open PR's merge ref simultaneously.",
   );
-}
-
-/**
- * Report a probe hit that every visible entry post-dates: a concurrent save.
- *
- * Warns and does NOT fail. The message has one job beyond describing the race:
- * telling the operator how to tell a race from poison, because the classifier
- * cannot. `run_started_at` precedes the primary restore by the checkout/setup
- * time, so genuine poison written inside that window lands here too — once.
- * Poison cannot overwrite itself, so on the next run it predates that run's
- * start and this comes out `poisoned`. REPETITION IS THE DISCRIMINATOR, and the
- * text has to say so or the warning is just noise someone learns to scroll past.
- */
-function reportRaced(finding) {
-  const { label, key, evidence } = finding;
-  console.log(
-    `::warning::cache "${label}": a lookup-only probe found an entry at ${key} that the ` +
-      "restore step did not produce — the poison fingerprint — but " +
-      (evidence.length === 1
-        ? "the only entry visible to this run was"
-        : `all ${evidence.length} entries visible to this run were`) +
-      " created AFTER this run started, so the most " +
-      "likely cause is a concurrent job's end-of-job save landing between the restore and " +
-      "the probe (they are minutes apart, not simultaneous). Treating it as a race, not as " +
-      "poison, and passing. IF THIS WARNING REPEATS ON A LATER RUN, IT IS NOT A RACE: a " +
-      "poisoned entry can never overwrite itself, so on any subsequent run it predates that " +
-      "run's start and this guard will fail properly. Two of these in a row means real poison.",
-  );
-  for (const entry of evidence) console.log(describeEntry(entry));
 }
 
 function reportCold(finding) {
@@ -1008,13 +654,11 @@ async function main(argv, env) {
   const { caches, errors, warnings } = parseCacheArgs(argv);
   const apiUrl = (env.GITHUB_API_URL || DEFAULT_API_URL).replace(/\/+$/, "");
   const repository = env.GITHUB_REPOSITORY;
-  const runId = env.GITHUB_RUN_ID;
   const token = env.GITHUB_TOKEN;
 
   // Missing wiring is the same class of defect as a missing key: the guard
   // cannot run, and pretending otherwise is how a check becomes decorative.
   if (!repository) errors.push("GITHUB_REPOSITORY is not set");
-  if (!runId) errors.push("GITHUB_RUN_ID is not set");
   if (!token) errors.push("GITHUB_TOKEN is not set (pass secrets.GITHUB_TOKEN in the step env)");
 
   if (errors.length > 0) {
@@ -1029,34 +673,16 @@ async function main(argv, env) {
   // missing permission surfaces as a warning immediately instead of lying
   // dormant until the first miss — which is the run where an operator most
   // needs the entry list.
-  let runContext = { runStartedAt: undefined, defaultBranch: undefined, warnings: [] };
-  try {
-    runContext = await fetchRunContext({ apiUrl, repository, runId, token });
-  } catch (error) {
-    runContext.warnings.push(`run context is unavailable: ${error.message}`);
-  }
-  for (const warning of runContext.warnings) {
+  const repositoryContext = await fetchRepositoryContext({ apiUrl, repository, token });
+  for (const warning of repositoryContext.warnings) {
     console.log(`::warning::cache health guard diagnostics degraded: ${warning}`);
   }
 
   const visibleRefs = visibleCacheRefs({
     ref: env.GITHUB_REF,
     baseRef: env.GITHUB_BASE_REF,
-    defaultBranch: runContext.defaultBranch,
+    defaultBranch: repositoryContext.defaultBranch,
   });
-
-  // THE HALVES OF `scopeComplete` THAT ARE THE SAME FOR EVERY DECLARED CACHE.
-  //
-  // Both are what BUILT visibleRefs and the age labels, so a failure in either
-  // silently narrows the evidence rather than emptying it — which is precisely
-  // how a partial degradation forges an `every()` over a set the poison was
-  // filtered out of. `defaultBranch` missing drops `refs/heads/main`;
-  // `runStartedAt` missing makes every age label meaningless. Neither may
-  // enable a downgrade.
-  const defaultBranchResolved =
-    typeof runContext.defaultBranch === "string" && runContext.defaultBranch !== "";
-  const runStartedAtResolved =
-    typeof runContext.runStartedAt === "string" && runContext.runStartedAt !== "";
 
   let failed = false;
   const entriesByKey = new Map();
@@ -1073,12 +699,8 @@ async function main(argv, env) {
           `::warning::cache "${cache.label}": entry details unavailable, so the report ` +
             `for it cannot name entries or ids: ${error.message}`,
         );
-        // `truncated: true` is the load-bearing half. The empty list alone is
-        // safe only by luck of the `evidence.length > 0` conjunct in
-        // diagnoseCache; saying "this listing is not complete" is what makes
-        // the refusal to downgrade explicit rather than incidental. `failed`
-        // separates it from a truncated-but-successful listing, which needs
-        // different wording in both the warning and the report.
+        // `failed` distinguishes an unavailable listing from a successful one
+        // whose ref filter simply produced no evidence.
         entriesByKey.set(cache.key, {
           entries: [],
           totalCount: null,
@@ -1096,8 +718,6 @@ async function main(argv, env) {
       probe: cache.probe,
       entries: listing.entries,
       visibleRefs,
-      runStartedAt: runContext.runStartedAt,
-      scopeComplete: defaultBranchResolved && runStartedAtResolved && !listing.truncated,
       probeUnavailable: cache.probeUnavailable,
       listingFailed: listing.failed === true,
     });
@@ -1120,8 +740,8 @@ async function main(argv, env) {
               ? "returned no usable total_count"
               : `reported ${listing.totalCount} entries under this key`
           } but this response carried ${listing.entries.length}, so any entry list in ` +
-          "this cache's report is a partial view. This guard will not downgrade a probe " +
-          "hit to a concurrent-save warning on a listing it cannot trust.",
+          "this cache's report is a partial view. The verdict is unaffected because it " +
+          "comes from the primary restore and lookup-only probe.",
       );
     }
 
@@ -1129,8 +749,6 @@ async function main(argv, env) {
       console.log(`cache "${finding.label}": restored from ${finding.key} — healthy.`);
     } else if (finding.verdict === "cold") {
       reportCold(finding);
-    } else if (finding.verdict === "raced") {
-      reportRaced(finding);
     } else {
       reportPoisoned(finding, { repository });
       failed = true;

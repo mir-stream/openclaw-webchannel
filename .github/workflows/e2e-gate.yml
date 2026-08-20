@@ -97,7 +97,7 @@ jobs:
       #    which is why every later step — the run AND step 7's collection —
       #    resolves the binary identically.
       # ──────────────────────────────────────────────────────────────────────
-      #    The `id` is what makes the action's `cache-hit`/`cache-key` outputs
+      #    The `id` is what makes the action's primary and probe cache outputs
       #    reachable by the cache-health guard in step 4c.
       - name: Install nats-server (pinned, cached)
         id: nats
@@ -234,30 +234,6 @@ jobs:
       #     format is GitHub's private implementation detail, and reconstructing
       #     it here would rot into a check of a key nothing writes.
       # ──────────────────────────────────────────────────────────────────────
-      # The nats probe cannot sit next to the cache step it mirrors — that step
-      # lives inside .github/actions/install-nats-server. It is keyed on the
-      # action's exported `cache-key` and pathed on $NATS_SERVER_DIR — and the
-      # composite's own "Resolve install dir and cache key" step is the single
-      # definition of BOTH, writing the path to $GITHUB_ENV and the key to
-      # $GITHUB_OUTPUT before the cache step consumes them. Reading them back
-      # here therefore reproduces the same two strings, and so the same cache
-      # version.
-      #
-      # >>> `path:` AND `key:` BELOW MUST KEEP RESOLVING FROM THAT ONE STEP.
-      # >>> DO NOT INLINE EITHER. <<< A different path string is a different
-      # version, and this probe would then answer a question nobody asked. If
-      # the $GITHUB_ENV export is ever removed or renamed, this resolves to the
-      # empty string and the probe silently starts reporting on a different
-      # path — the two files have to be edited together.
-      - name: Probe the nats-server cache at this run's version
-        id: probe-nats
-        if: steps.nats.outputs.cache-hit != 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.NATS_SERVER_DIR }}
-          key: ${{ steps.nats.outputs.cache-key }}
-          lookup-only: true
-
       - name: Verify cache entries are healthy (poisoned-cache guard)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -266,8 +242,8 @@ jobs:
             --cache nats \
             --key "${{ steps.nats.outputs.cache-key }}" \
             --hit "${{ steps.nats.outputs.cache-hit }}" \
-            --probe "${{ steps.probe-nats.outputs.cache-hit }}" \
-            --probe-key "${{ steps.probe-nats.outputs.cache-primary-key }}" \
+            --probe "${{ steps.nats.outputs.probe-hit }}" \
+            --probe-key "${{ steps.nats.outputs.probe-key }}" \
             --cache playwright \
             --key "${{ env.PLAYWRIGHT_CACHE_KEY }}" \
             --hit "${{ steps.cache-playwright.outputs.cache-hit }}" \

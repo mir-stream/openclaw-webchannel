@@ -9,20 +9,17 @@ inputs:
     # server version silently changes what the real-server suites test against.
     default: "v2.14.0"
 
-# Exported so a caller can audit the cache the way `actions/cache@v4` itself
-# cannot: that action exposes ONLY `cache-hit` — there is no
-# `cache-primary-key` / `cache-matched-key` output on it, so the key cannot be
-# read back off the step and has to be handed out explicitly here.
+# Exported so a caller can audit the primary restore and the adjacent
+# lookup-only probe. `actions/cache@v4` exposes only `cache-hit`; the cache key
+# and the probe's did-it-run signal have to be handed out explicitly here.
 #
 # The key template is spelled ONCE, in the "Resolve install dir and cache key"
-# step below, which writes it to $GITHUB_OUTPUT; both this output and the cache
-# step's `key:` read it back from there. It used to be written out twice, and
-# nothing could have caught a drift between the copies: `--key` and `--probe-key`
-# in the caller both derive from THIS output, so the guard's key-drift check
-# would still pass while every run reported a cold key. A `cache-key` that
-# drifted from the key actually saved makes the caller's poisoned-cache guard
-# check a key nothing ever writes — green, and meaningless, which is the precise
-# failure that guard exists to end.
+# step below, which writes it to $GITHUB_OUTPUT; the `cache-key` output and both
+# cache steps' `key:` fields read it back from there. It used to be written out
+# twice, and nothing could have caught a drift between the copies. A
+# `cache-key` that drifted from the key actually saved makes the poisoned-cache
+# guard check a key nothing ever writes — green, and meaningless, which is the
+# precise failure that guard exists to end.
 outputs:
   cache-hit:
     description: Whether the pinned nats-server binary was restored from cache.
@@ -30,6 +27,12 @@ outputs:
   cache-key:
     description: The cache key this action restores and saves under.
     value: ${{ steps.resolve.outputs.cache-key }}
+  probe-hit:
+    description: Whether the lookup-only probe found the cache after a primary miss.
+    value: ${{ steps.probe-nats.outputs.cache-hit }}
+  probe-key:
+    description: The key recorded by the probe, proving whether the probe ran.
+    value: ${{ steps.probe-nats.outputs.cache-primary-key }}
 
 # NO SUDO ANYWHERE IN THIS ACTION.
 #
@@ -58,11 +61,10 @@ runs:
         # is what makes this survive between runs.
         DIR="${RUNNER_TOOL_CACHE:-$HOME/.cache}/nats-server/${{ inputs.version }}"
         mkdir -p "$DIR"
-        # NATS_SERVER_DIR is read back by the CALLER too. e2e-gate.yml's
-        # poisoned-cache guard runs a lookup-only actions/cache/restore probe
-        # that must reproduce this cache's VERSION, which hashes the `path:`
-        # string below. Renaming or dropping this export would leave that probe
-        # resolving an empty path — still green, and answering about nothing.
+        # NATS_SERVER_DIR is read back by both cache steps below. The probe must
+        # reproduce this cache's VERSION, which hashes the `path:` string.
+        # Renaming or dropping this export would leave both steps answering
+        # about a different path.
         echo "NATS_SERVER_DIR=$DIR" >> "$GITHUB_ENV"
         echo "$DIR" >> "$GITHUB_PATH"
         # THE ONLY PLACE THE CACHE KEY TEMPLATE IS WRITTEN. The cache step below
@@ -81,6 +83,15 @@ runs:
       with:
         path: ${{ env.NATS_SERVER_DIR }}
         key: ${{ steps.resolve.outputs.cache-key }}
+
+    - name: Probe the nats-server cache at this run's version
+      id: probe-nats
+      if: steps.cache-nats.outputs.cache-hit != 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ env.NATS_SERVER_DIR }}
+        key: ${{ steps.resolve.outputs.cache-key }}
+        lookup-only: true
 
     - name: Install nats-server ${{ inputs.version }}
       if: steps.cache-nats.outputs.cache-hit != 'true'
