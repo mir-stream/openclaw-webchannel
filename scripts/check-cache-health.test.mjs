@@ -321,7 +321,13 @@ describe("diagnoseCache", () => {
         visibleRefs,
         runStartedAt: RUN_STARTED_AT,
       }),
-    ).toEqual({ label: "playwright", key: KEY, verdict: "cold", evidence: [] });
+    ).toEqual({
+      label: "playwright",
+      key: KEY,
+      verdict: "cold",
+      evidence: [],
+      probeUnavailable: false,
+    });
   });
 
   it("reports COLD when the key exists but the probe missed — a version change", () => {
@@ -383,6 +389,9 @@ describe("diagnoseCache", () => {
       // with a perfectly complete scope. The two refusals stay distinguishable
       // so the report does not blame a healthy API for this failure.
       racedSuppressed: false,
+      // ...and the listing did not throw, so the report must say "nothing
+      // survived the ref filter", not "the listing did not resolve".
+      listingFailed: false,
     });
   });
 
@@ -514,6 +523,64 @@ describe("diagnoseCache", () => {
     expect(finding.evidence[0].createdAfterRunStarted).toBe(false);
   });
 
+  it("orders evidence by RESTORE PRIORITY, not by the order the API returned", () => {
+    // GitHub searches this run's own ref, then the PR base ref, then the default
+    // branch, and visibleCacheRefs inserts them in exactly that order (Set
+    // iteration preserves insertion). The first surviving entry is therefore the
+    // one the restore actually reached first — which is what makes the
+    // multi-candidate remedy's "in the order listed" instruction meaningful.
+    const finding = diagnoseCache({
+      label: "playwright",
+      key: KEY,
+      hit: false,
+      probe: true,
+      entries: [
+        { ...OLDER_LIVE_ENTRY, id: 1, ref: "refs/heads/main" },
+        { ...OLDER_LIVE_ENTRY, id: 2, ref: "refs/heads/develop" },
+        { ...OLDER_LIVE_ENTRY, id: 3, ref: "refs/pull/200/merge" },
+      ],
+      visibleRefs: visibleCacheRefs({
+        ref: "refs/pull/200/merge",
+        baseRef: "develop",
+        defaultBranch: "main",
+      }),
+      runStartedAt: RUN_STARTED_AT,
+      scopeComplete: true,
+    });
+    expect(finding.evidence.map((entry) => entry.ref)).toEqual([
+      "refs/pull/200/merge",
+      "refs/heads/develop",
+      "refs/heads/main",
+    ]);
+  });
+
+  it("refuses the downgrade when an entry was dropped for a missing ref", () => {
+    // `visible.has(undefined)` is false, so a ref-less entry vanishes from the
+    // evidence silently. If the one it hid was OLD while a newer one survived,
+    // `every()` goes true and a real poisoning passes as `raced` on a listing
+    // otherwise considered complete. Nobody has shown the live API omits `ref`,
+    // so this is insurance — but an unparseable listing must not be able to
+    // certify itself.
+    const finding = diagnoseCache({
+      label: "playwright",
+      key: KEY,
+      hit: false,
+      probe: true,
+      entries: [
+        { ...OLDER_LIVE_ENTRY, id: 1, ref: undefined },
+        { ...OLDER_LIVE_ENTRY, id: 2, created_at: AFTER_RUN },
+      ],
+      visibleRefs,
+      runStartedAt: RUN_STARTED_AT,
+      scopeComplete: true,
+    });
+    expect(finding.verdict).toBe("poisoned");
+    expect(finding.racedSuppressed).toBe(true);
+    // The ref-less entry is still not shown as evidence — it is unplaceable —
+    // it just cannot buy a pass.
+    expect(finding.evidence.map((entry) => entry.id)).toEqual([2]);
+  });
+
   it("stays POISONED when even ONE visible entry predates the run", () => {
     // `every`, not `some`. One entry that was already sitting there when the
     // restore ran is a restorable entry the restore did not produce — poison,
@@ -574,8 +641,10 @@ describe("parseCacheArgs", () => {
     ]);
     expect(errors).toEqual([]);
     expect(caches).toEqual([
-      { label: "nats", key: "nats-key", hit: true, probe: false, probeKey: "" },
-      { label: "playwright", key: KEY, hit: false, probe: true, probeKey: KEY },
+      { label: "nats", key: "nats-key", hit: true, probe: false, probeKey: "",
+        probeUnavailable: false },
+      { label: "playwright", key: KEY, hit: false, probe: true, probeKey: KEY,
+        probeUnavailable: false },
     ]);
   });
 
@@ -591,6 +660,44 @@ describe("parseCacheArgs", () => {
       "--cache", "nats", "--key", "--hit", "false", "--probe", "false", "--probe-key", "nats-key",
     ]);
     expect(errors[0]).toContain('cache "nats" was declared with no --key');
+  });
+
+  it("reports a missing --key ONCE, without a spurious drift error", () => {
+    // The drift check compares --probe-key against --key. Ungated it fires as a
+    // consequence of the missing key and renders the literal
+    // `declared (--key) : undefined`, which reads like a second, independent
+    // wiring fault and sends whoever is fixing it looking for two problems.
+    const { errors } = parseCacheArgs([
+      "--cache", "nats", "--hit", "false", "--probe", "true", "--probe-key", "nats-key",
+    ]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('cache "nats" was declared with no --key');
+    expect(errors.join("\n")).not.toContain("DIFFERENT key");
+    expect(errors.join("\n")).not.toContain("undefined");
+  });
+
+  it("treats a missing --hit as a configuration error, not a silent false", () => {
+    // The last quint member that defaulted silently, against the header's own
+    // doctrine. No false green today — a missing --hit on a genuinely hit run
+    // resurfaces as the empty-`--probe-key` error, because the probe step was
+    // skipped — but relying on one wiring bug to expose another is the
+    // "checks nothing" shape this guard exists to end.
+    const { errors } = parseCacheArgs([
+      "--cache", "nats", "--key", "nats-key", "--probe", "", "--probe-key", "nats-key",
+    ]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('cache "nats" was declared with no --hit');
+  });
+
+  it("still accepts an EMPTY --hit as the ordinary miss", () => {
+    // `--hit ""` is what the workflow expands to on every cold run: the flag is
+    // threaded, the value is empty. That must stay a miss, not an error, or the
+    // gate reddens on every legitimate cache miss.
+    const { errors, caches } = parseCacheArgs([
+      "--cache", "nats", "--key", "nats-key", "--hit", "", "--probe", "", "--probe-key", "nats-key",
+    ]);
+    expect(errors).toEqual([]);
+    expect(caches[0].hit).toBe(false);
   });
 
   it("treats a missing --probe as a configuration error", () => {
@@ -834,10 +941,116 @@ describe("cache health CLI against a stub Actions API", () => {
     // "ONLY if it recurs" is no protection, because poison recurs BY
     // CONSTRUCTION, which is this guard's own premise.
     expect(result.stderr).not.toContain(`actions/caches/${NEWER_OWN_REF_ENTRY.id}`);
-    expect(result.stderr).toContain("NOT one of the");
+    expect(result.stderr).toContain("THIS REPORT CANNOT NAME IT");
     // ...and it must still leave a usable path to the entry it cannot name.
     expect(result.stderr).toContain(`actions/caches?key=${KEY}`);
     expect(result.stderr).toContain("actions/caches/<id>");
+  });
+
+  it("never version-matches a ruled-out entry when TWO race entries survive", async () => {
+    // THE THREE-PARAGRAPH CONTRADICTION. With a suppressed downgrade and more
+    // than one surviving entry, the report used to say, in order: the candidate
+    // is NOT one of these / the candidate is whichever of these matches this
+    // run's version / delete NOT one of these. The middle procedure SUCCEEDS —
+    // the probe hit precisely because an entry exists at this run's key AND
+    // version, and here that entry is the concurrent save — so it positively
+    // fingers a cache created seconds ago whose id is printed just above.
+    const secondRace = { ...NEWER_OWN_REF_ENTRY, id: 6776999003, ref: "refs/pull/200/merge" };
+    const { origin } = await startStubApi({
+      actionsCaches: [DEFAULT_BRANCH_ENTRY, NEWER_OWN_REF_ENTRY, secondRace],
+      fail: ["repo"],
+    });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin, { GITHUB_REF: "refs/pull/200/merge", GITHUB_BASE_REF: "develop" }),
+    );
+
+    expect(result.code).not.toBe(0);
+    // Both races are listed as evidence...
+    expect(result.stderr).toContain(`id ${NEWER_OWN_REF_ENTRY.id}`);
+    expect(result.stderr).toContain(`id ${secondRace.id}`);
+    // ...and NEITHER is offered as a deletion target, nor version-matched.
+    expect(result.stderr).not.toContain(`actions/caches/${NEWER_OWN_REF_ENTRY.id}`);
+    expect(result.stderr).not.toContain(`actions/caches/${secondRace.id}`);
+    expect(result.stderr).not.toContain("The candidate is whichever entry's");
+    expect(result.stderr).toContain("THIS REPORT CANNOT NAME IT");
+  });
+
+  it("does not claim `version` picks between two same-version candidates", async () => {
+    // A cache VERSION hashes the `path:` string plus the compression method and
+    // NOTHING ELSE, so it is ref-independent by construction and identical on
+    // every ref holding this key. LIVE_CACHE_ENTRIES is the recorded proof: one
+    // byte-identical VERSION across `refs/pull/200/merge` and
+    // `refs/heads/develop`. "Delete the ONE whose version matches this run" is
+    // therefore unexecutable on the NORMAL case — on any PR run both match, and
+    // the reader has just been told not to delete all of them. This report
+    // closes by saying the repository routinely holds exactly that pair.
+    //
+    // The develop entry is listed FIRST in the API response on purpose: a naive
+    // implementation prints the API's order, and this run's own ref is the merge
+    // ref, so restore-priority order must reverse it.
+    const { origin } = await startStubApi({
+      actionsCaches: [OLDER_LIVE_ENTRY, OLDER_LIVE_MERGE_ENTRY],
+    });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin, { GITHUB_REF: "refs/pull/200/merge", GITHUB_BASE_REF: "develop" }),
+    );
+
+    expect(result.code).not.toBe(0);
+    const { stderr } = result;
+    // Both versions really are the same — the premise, asserted not assumed.
+    expect(OLDER_LIVE_MERGE_ENTRY.version).toBe(OLDER_LIVE_ENTRY.version);
+
+    // The false discriminator is gone...
+    expect(stderr).not.toContain("delete the ONE entry whose `version` matches");
+    expect(stderr).not.toContain("The candidate is whichever entry's");
+    // ...replaced by the truth and a procedure that can actually be followed.
+    expect(stderr).toContain("ONE AT A TIME");
+    expect(stderr).toContain("IDENTICAL on every ref holding this");
+    expect(stderr).toContain("re-running this job after each deletion");
+
+    // RESTORE PRIORITY ORDER: this run's own ref first, then the PR base ref —
+    // the reverse of the order the API returned them in.
+    const mergeDelete = stderr.indexOf(`actions/caches/${OLDER_LIVE_MERGE_ENTRY.id}`);
+    const developDelete = stderr.indexOf(`actions/caches/${OLDER_LIVE_ENTRY.id}`);
+    expect(mergeDelete).toBeGreaterThan(-1);
+    expect(developDelete).toBeGreaterThan(-1);
+    expect(mergeDelete).toBeLessThan(developDelete);
+    // ...and the evidence listing above it is in that same order.
+    expect(stderr.indexOf(`id ${OLDER_LIVE_MERGE_ENTRY.id}`)).toBeLessThan(
+      stderr.indexOf(`id ${OLDER_LIVE_ENTRY.id}`),
+    );
+  });
+
+  it("offers ONLY the pre-existing entry when one old and one new entry survive", async () => {
+    // The other side of the same filter: a genuine poisoning alongside a
+    // concurrent save. The old entry is the only thing that can be the one the
+    // restore failed to produce, so it is the only id in the remedy — and with
+    // exactly one candidate there is nothing to version-match between.
+    const { origin } = await startStubApi({
+      actionsCaches: [OLDER_LIVE_MERGE_ENTRY, NEWER_OWN_REF_ENTRY],
+    });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin, { GITHUB_REF: "refs/pull/200/merge", GITHUB_BASE_REF: "develop" }),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain(`actions/caches/${OLDER_LIVE_MERGE_ENTRY.id}`);
+    expect(result.stderr).not.toContain(`actions/caches/${NEWER_OWN_REF_ENTRY.id}`);
+    expect(result.stderr).toContain("delete that one entry by id");
+    expect(result.stderr).not.toContain("THIS REPORT CANNOT NAME IT");
+    // The single-candidate render is UNCHANGED by the ordering work: one id,
+    // named directly, with no sequential procedure attached to it.
+    expect(result.stderr).not.toContain("ONE AT A TIME");
+    expect(result.stderr).not.toContain("re-running this job after each deletion");
   });
 
   it("STILL fails when the runs endpoint 500s and every entry looks new", async () => {
@@ -936,6 +1149,114 @@ describe("cache health CLI against a stub Actions API", () => {
     expect(result.code).not.toBe(0);
     expect(result.stdout).toContain("returned no usable total_count");
     expect(result.stderr).toContain("POISONED CACHE: playwright");
+  });
+
+  it("asserts NOTHING about the key when the cache SERVICE was unavailable", async () => {
+    // `--probe false` with an empty `--probe-key` is `isCacheFeatureAvailable()`
+    // returning false: restoreImpl set the literal "false" and returned BEFORE
+    // consulting the service. The probe did not check our key at our version
+    // and come up empty — it did not check. One line under a warning saying
+    // exactly that, the report used to claim "the probe found nothing … so the
+    // miss is expected" and "none of them was restorable AT THIS RUN'S CACHE
+    // VERSION". Same overclaim class already removed twice, on the branch
+    // neither pass covered.
+    const { origin } = await startStubApi({ actionsCaches: [OLDER_LIVE_ENTRY] });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "false",
+        "--probe-key", ""],
+      cliEnv(origin),
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("cache service as unavailable");
+    expect(result.stdout).toContain("THIS RUN DID NOT CHECK");
+    expect(result.stdout).not.toContain("the miss is expected");
+    expect(result.stdout).not.toContain("none of them was restorable");
+    // The entries are still shown — as facts, with no claim attached.
+    expect(result.stdout).toContain("listed as fact and nothing more");
+    expect(result.stdout).toContain(`id ${OLDER_LIVE_ENTRY.id}`);
+  });
+
+  it("does NOT annotate a truncated listing on a run where every cache HIT", async () => {
+    // The verdict is `ok` and never consults the listing, so an annotation here
+    // points at a report that does not exist. Left at fetch time this fires on
+    // fully healthy runs, and a non-numeric `total_count` would annotate every
+    // green run of a gate fanning out to ~9 jobs — which teaches operators to
+    // scroll past this guard's warnings.
+    const { origin } = await startStubApi({
+      actionsCaches: [OLDER_LIVE_ENTRY],
+      totalCount: 7,
+    });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "true", "--probe", "", "--probe-key", ""],
+      cliEnv(origin),
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("healthy");
+    expect(result.stdout).not.toContain("listing is INCOMPLETE");
+    expect(result.stderr).toBe("");
+  });
+
+  it("blames the REF FILTER, not the listing, when the listing resolved fine", async () => {
+    // Measured: the listing resolved AND contained the poisoned entry on
+    // `refs/heads/main`; `visibleCacheRefs` filtered it out because the failed
+    // repo lookup dropped the default branch. Saying "the REST listing did not
+    // resolve" sends the operator to debug `actions: read` while the real gap
+    // is the visible-ref set.
+    const { origin } = await startStubApi({
+      actionsCaches: [DEFAULT_BRANCH_ENTRY],
+      fail: ["repo"],
+    });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin, { GITHUB_REF: "refs/heads/feature/x", GITHUB_BASE_REF: "" }),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("The REST listing resolved");
+    expect(result.stderr).toContain("visible on a ref");
+    expect(result.stderr).not.toContain("the REST listing did not resolve");
+    expect(result.stderr).not.toContain("No entry details are available");
+  });
+
+  it("still says the listing did not resolve when it genuinely did not", async () => {
+    // The other half of that split must keep its original wording.
+    const { origin } = await startStubApi({ actionsCaches: [], fail: ["caches"] });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("No entry details are available");
+    expect(result.stderr).toContain("did not resolve");
+    expect(result.stderr).not.toContain("The REST listing resolved");
+  });
+
+  it("never emits a DELETE command for an entry with no id", async () => {
+    // `describeEntry` already prints `id (absent)`; the remedy used to print a
+    // copy-pasteable `.../actions/caches/undefined` four lines under it.
+    const { origin } = await startStubApi({
+      actionsCaches: [{ ...OLDER_LIVE_ENTRY, id: undefined }],
+    });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("id (absent)");
+    expect(result.stderr).not.toContain("actions/caches/undefined");
+    expect(result.stderr).toContain("has no id in the listing");
   });
 
   it("claims only what is proven, and orders the remedy re-run FIRST", async () => {
