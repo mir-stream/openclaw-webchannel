@@ -2285,14 +2285,42 @@ export class WebChannelNATSClient {
         // in `keptPrefix` AND in `rebuilt`. No sender defect required; the
         // keyframe row is the authoritative copy, so the prefix yields.
         //
-        // Chips need no carve-out here, and must not have one: `seen` cannot
-        // contain a chip id, because `localOnlyIds` already dropped any row that
-        // claimed one. The filter is therefore uniform, and a chip up here still
-        // stays exactly where it stands — the promise above holds by that skip
-        // rather than by an exception in this line.
-        const keptPrefix = (anchor > 0 ? this.state.messages.slice(0, anchor) : []).filter(
-          (m) => !seen.has(m.id),
-        );
+        // Chips need no carve-out for their OWN survival: `seen` cannot contain a
+        // chip id, because `localOnlyIds` already dropped any row that claimed one,
+        // so a chip up here stays exactly where it stands by the plain `!seen`
+        // skip. But `pending`/`retracted` are not the only locally-owned-unresolved
+        // states. A FAILED local send (e.g. `overloaded` — `sendState:"failed"`,
+        // `sendFailure.reason:"overloaded"`, still holding its `receiptKey` and a
+        // retry affordance) is NEITHER pending nor retracted, so `localOnlyIds`
+        // does NOT protect it. If `history` adoption has already canonicalized that
+        // bubble's id and this frame ALSO rebuilds that id, the plain `!seen`
+        // filter would drop the prefix copy and re-create it as a bare history row
+        // — erasing `receiptKey`/`sendState`/`sendFailure` and the user's ability
+        // to retry a send that never ran. So the filter is NOT uniform: it keeps a
+        // row when `!seen`, OR when the row is a locally-owned-unresolved send,
+        // using the SAME predicate `preserved` applies below (keep pending/
+        // retracted; keep a receipted send unless there is positive evidence it ran
+        // — `sendState !== "completed"` and not `failed{turn-failed}`). A plain
+        // server-hydrated/canonical row (no receiptKey, or a completed/turn-failed
+        // send) is NOT locally-owned-unresolved and still yields to `rebuilt` — the
+        // duplicate-id avoidance this reducer intends.
+        //
+        // Keeping the local copy can leave a DUPLICATE id (prefix copy + rebuilt
+        // copy). That is deliberate: the same documented "never delete a send"
+        // tradeoff the ACCEPTED RESIDUAL RISK note below records — a duplicate is
+        // fixed by a reload, but a destroyed retry affordance for a send that never
+        // ran is not recoverable.
+        const keptPrefix = (anchor > 0 ? this.state.messages.slice(0, anchor) : []).filter((m) => {
+          if (!seen.has(m.id)) return true;
+          // id collision with a rebuilt row — yield UNLESS this is a locally-owned
+          // send with an unconsumed retry affordance (same predicate as `preserved`).
+          if (m.role !== "user") return false;
+          if (m.pending === true || m.retracted === true) return true;
+          if (m.receiptKey === undefined) return false;
+          if (m.sendState === "completed") return false;
+          if (m.sendState === "failed" && m.sendFailure?.reason === "turn-failed") return false;
+          return true;
+        });
 
         // PRESERVE, from the COVERED region only, user bubbles the keyframe's
         // source transcript cannot account for. THE RULE: a covered user bubble

@@ -707,6 +707,90 @@ describe("#173 WP — keyframe is an authoritative replace", () => {
   });
 
   /**
+   * PR20-F2 — a FAILED local send in the prefix must not lose its retry
+   * affordance when the keyframe rebuilds its (now-canonical) id.
+   *
+   * `localOnlyIds` protects only pending/retracted chips. An `overloaded` failure
+   * is neither: it carries `receiptKey`, `sendState:"failed"` and
+   * `sendFailure.reason:"overloaded"` (a retry affordance), not a pending flag.
+   * Once `history` adoption canonicalizes that bubble's id and a keyframe rebuilds
+   * the same id, the plain `!seen` prefix filter would drop the local copy and
+   * re-create it as a bare history row — erasing the affordance. The fix keeps the
+   * local copy (accepting a duplicate id, per the "never delete a send" tradeoff).
+   */
+  it("keeps a failed local send in the prefix when the keyframe rebuilds its id — retry affordance survives", () => {
+    const w = makeWrapper();
+    // A user send that FAILED (overloaded) and then had its id canonicalized by
+    // history adoption, so it now sits in the prefix under a transcript id the
+    // keyframe also rebuilds. Model that end state directly on the bubble.
+    deliver(
+      w,
+      history(
+        { id: "core-U", role: "user", text: "please help", ts: 1 },
+        { id: "core-1", role: "agent", text: "r1", ts: 2 },
+      ),
+    );
+    const failed = w.getState().messages.find((m) => m.id === "core-U")! as {
+      receiptKey?: string;
+      sendState?: string;
+      sendFailure?: { reason: string; retryable: boolean };
+    };
+    failed.receiptKey = "rk-1";
+    failed.sendState = "failed";
+    failed.sendFailure = { reason: "overloaded", retryable: true };
+
+    // Anchors at core-1 (so core-U is in the PREFIX) and ALSO rebuilds core-U.
+    deliver(
+      w,
+      keyframe(
+        { id: "core-1", role: "agent", text: "r1", ts: 2 },
+        { id: "core-U", role: "user", text: "please help", ts: 1 },
+      ),
+    );
+
+    // The failed local send SURVIVES with its receiptKey/sendState/sendFailure
+    // intact — the user can still retry a send that never ran.
+    const after = w.getState().messages;
+    const kept = after.find((m) => m.id === "core-U" && m.sendState === "failed");
+    expect(kept).toBeDefined();
+    expect(kept!.receiptKey).toBe("rk-1");
+    expect(kept!.sendFailure).toMatchObject({ reason: "overloaded", retryable: true });
+  });
+
+  /**
+   * Regression guard for the carve-out above: it is scoped to locally-owned
+   * UNRESOLVED sends only. A plain server-hydrated/canonical prefix row (no
+   * receiptKey, not pending/retracted) whose id the keyframe rebuilds must STILL
+   * yield to `rebuilt` — the duplicate-id avoidance the reducer intends.
+   */
+  it("still drops a plain hydrated prefix row when the keyframe rebuilds its id (no carve-out for non-local rows)", () => {
+    const w = makeWrapper();
+    deliver(
+      w,
+      history(
+        { id: "core-X", role: "user", text: "x", ts: 3 },
+        { id: "core-A", role: "agent", text: "a", ts: 1 },
+      ),
+    );
+    // core-X is a plain hydrated row: no receiptKey, not pending/retracted.
+    expect(w.getState().messages.find((m) => m.id === "core-X")!.receiptKey).toBeUndefined();
+
+    // Anchors at core-A (core-X lands in keptPrefix AND in rebuilt).
+    deliver(
+      w,
+      keyframe(
+        { id: "core-A", role: "agent", text: "a", ts: 1 },
+        { id: "core-X", role: "user", text: "x", ts: 3 },
+      ),
+    );
+
+    // Rendered once, from rebuilt — the prefix copy yielded, no duplicate id.
+    const after = w.getState().messages;
+    expect(after.map((m) => m.id)).toEqual(["core-A", "core-X"]);
+    expect(after.filter((m) => m.id === "core-X")).toHaveLength(1);
+  });
+
+  /**
    * The BENIGN anchor miss: the keyframe window simply reaches further back than
    * this device does, so `findIndex` misses and every rendered id is rebuilt —
    * nothing is lost. The warning must not claim otherwise.
