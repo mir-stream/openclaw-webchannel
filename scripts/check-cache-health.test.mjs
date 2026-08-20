@@ -189,12 +189,12 @@ async function startStubApi({
     }
     if (request.url.includes("/actions/caches")) {
       if (outage("caches")) return;
-      response.end(
-        JSON.stringify({
-          total_count: totalCount ?? actionsCaches.length,
-          actions_caches: actionsCaches,
-        }),
-      );
+      const body = { actions_caches: actionsCaches };
+      // `totalCount: null` OMITS the field — a body with no usable count, which
+      // the guard must also treat as incomplete. Undefined keeps the honest
+      // default of "as many as we handed back".
+      if (totalCount !== null) body.total_count = totalCount ?? actionsCaches.length;
+      response.end(JSON.stringify(body));
       return;
     }
     if (request.url === `/repos/${REPOSITORY}`) {
@@ -824,8 +824,20 @@ describe("cache health CLI against a stub Actions API", () => {
     expect(result.stderr).toContain("POISONED CACHE: playwright");
     // The report has to explain itself: every entry it lists post-dates the run,
     // which is the shape that normally passes.
-    expect(result.stderr).toContain("may be MISSING entries");
+    expect(result.stderr).toContain("MISSING entries");
     expect(result.stdout).not.toContain("IF THIS WARNING REPEATS");
+
+    // THE REMEDY MUST NOT NAME A RULED-OUT ENTRY. `NEWER_OWN_REF_ENTRY` is the
+    // concurrent save on `refs/heads/develop`; the poison is the invisible
+    // `refs/heads/main` entry the failed repo lookup hid. Printing the former as
+    // the deletion target destroys a healthy 274 MB cache on the next run —
+    // "ONLY if it recurs" is no protection, because poison recurs BY
+    // CONSTRUCTION, which is this guard's own premise.
+    expect(result.stderr).not.toContain(`actions/caches/${NEWER_OWN_REF_ENTRY.id}`);
+    expect(result.stderr).toContain("NOT one of the");
+    // ...and it must still leave a usable path to the entry it cannot name.
+    expect(result.stderr).toContain(`actions/caches?key=${KEY}`);
+    expect(result.stderr).toContain("actions/caches/<id>");
   });
 
   it("STILL fails when the runs endpoint 500s and every entry looks new", async () => {
@@ -871,12 +883,17 @@ describe("cache health CLI against a stub Actions API", () => {
     expect(result.stdout).not.toContain("IF THIS WARNING REPEATS");
   });
 
-  it("STILL fails when the cache listing is TRUNCATED", async () => {
+  it("STILL fails when the cache listing is TRUNCATED, and SAYS SO", async () => {
     // The API says there are two entries and hands back one. The withheld one
     // may be the old entry that proves poison, so `every()` over the page that
     // arrived proves nothing. Refusing to downgrade costs at most one falsely
     // reported poison, which a re-run resolves; paginating would add
     // rate-limit and partial-failure surface to a step that must not flake.
+    //
+    // The reporting half is what this pins. Every REST call SUCCEEDS here, so
+    // without a warning of its own the run says nothing at all about truncation
+    // while the report sends the operator to "the ::warning:: lines above" —
+    // measured empty. The one actionable fact is the count mismatch.
     const { origin } = await startStubApi({
       actionsCaches: [NEWER_OWN_REF_ENTRY],
       totalCount: 2,
@@ -890,8 +907,35 @@ describe("cache health CLI against a stub Actions API", () => {
 
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain("POISONED CACHE: playwright");
-    expect(result.stderr).toContain("may be MISSING entries");
+    expect(result.stderr).toContain("MISSING entries");
     expect(result.stdout).not.toContain("IF THIS WARNING REPEATS");
+    // The annotation exists, and it names both sides of the mismatch.
+    expect(result.stdout).toContain("::warning::");
+    expect(result.stdout).toContain("listing is INCOMPLETE");
+    expect(result.stdout).toContain("reported 2 entries under this key");
+    expect(result.stdout).toContain("carried 1");
+    // No REST call failed, so the prose must not claim one did.
+    expect(result.stderr).not.toContain("dropped out of scope when the lookup failed");
+  });
+
+  it("says the listing is incomplete when total_count is ABSENT", async () => {
+    // Same refusal, different cause: a body with no usable `total_count` cannot
+    // be shown complete, so it is treated as truncated — and must be explained
+    // rather than silently swallowing the downgrade.
+    const { origin } = await startStubApi({
+      actionsCaches: [NEWER_OWN_REF_ENTRY],
+      totalCount: null,
+    });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).toContain("returned no usable total_count");
+    expect(result.stderr).toContain("POISONED CACHE: playwright");
   });
 
   it("claims only what is proven, and orders the remedy re-run FIRST", async () => {
@@ -939,7 +983,15 @@ describe("cache health CLI against a stub Actions API", () => {
 
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("the miss is expected");
-    expect(result.stdout).toContain("DIFFERENT cache version");
+    expect(result.stdout).toContain("AT THIS RUN'S CACHE VERSION");
+    expect(result.stdout).toContain("leave them alone");
+    // THE NOTE MUST NOT CERTIFY HEALTH. actions/cache swallows a failed lookup
+    // inside the PROBE exactly as it does on the primary, so a transient there
+    // lands here as `cold` — this branch cannot know the entries are innocent.
+    // That is the same overclaim removed from reportPoisoned after it cost a
+    // healthy 263 MB cache.
+    expect(result.stdout).not.toContain("they are not poison");
+    expect(result.stdout).toContain("not the only one");
     expect(result.stderr).toBe("");
   });
 
@@ -954,7 +1006,7 @@ describe("cache health CLI against a stub Actions API", () => {
 
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("the miss is expected");
-    expect(result.stdout).not.toContain("DIFFERENT cache version");
+    expect(result.stdout).not.toContain("AT THIS RUN'S CACHE VERSION");
     expect(result.stderr).toBe("");
   });
 

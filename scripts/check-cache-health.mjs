@@ -3,8 +3,8 @@
  * check-cache-health.mjs — detect a POISONED actions/cache entry.
  *
  * WHY THIS EXISTS (read before "simplifying" it away):
- * this repository has twice shipped a CI defect that is, by construction,
- * INVISIBLE. An `actions/cache` entry exists under a key but the restore does
+ * this repository has shipped a CI defect that is, by construction, INVISIBLE.
+ * An `actions/cache` entry exists under a key but the restore does
  * not produce it — the archive is truncated, or was saved from a path layout
  * the restore no longer maps onto, or the download simply failed.
  * `actions/cache` swallows the failure and reports:
@@ -26,6 +26,31 @@
  * apiece and was found only by a human reading raw logs. Nothing automated in
  * this repo would have caught it, and the gate is about to fan out into ~9
  * parallel jobs, which multiplies that invisible waste by 9.
+ *
+ * ── WHAT THIS CLOSES, AND WHAT IT DOES NOT ─────────────────────────────────
+ *
+ * Two incidents drove this file. It closes ONE of them plus the general
+ * fingerprint, and an earlier revision of this header said "twice", which a
+ * later maintainer would reasonably read as covering both. It does not.
+ *
+ * CLOSED — the Playwright entry that matched the key and failed to extract.
+ * Verified end to end against recorded fixtures with production-shaped argv:
+ * exit 1, naming the entry and its id. It is catchable because the swallowed
+ * tar failure leaves the primary's `cache-hit` EMPTY, so the probe's `if:`
+ * fires and there is something to compare.
+ *
+ * NOT CLOSED — the nats entry saved under an absolute /usr/local/bin path
+ * (93f2591). Same class of harm, out of reach here for two independent reasons,
+ * and the second is the one that matters:
+ *
+ *   1. It happened in publish.yml. This guard is wired only into e2e-gate.yml.
+ *   2. A cache that RESTORES SUCCESSFULLY into a layout the job cannot use is
+ *      outside this fingerprint entirely. `cache-hit` is 'true', diagnoseCache
+ *      returns `ok` before the probe or the listing is consulted, and nothing
+ *      here ever looks at what landed on disk. No amount of probing fixes that:
+ *      catching it needs a post-restore assertion on the extracted tree — the
+ *      composite action's "Verify nats-server is on PATH" step is the shape of
+ *      it — not a cache-existence check.
  *
  * ── THE SIGNAL, AND WHY IT IS A PROBE AND NOT THE REST API ─────────────────
  *
@@ -180,6 +205,15 @@ function parseTimestamp(value) {
  * misses a cold key at T0, a develop push writes the entry at T0+60s, and the
  * PR run's probe sees it at T0+90s. Reading that as poison reddens a required
  * check and tells an operator to delete a cache created 30 seconds ago.
+ *
+ * ONE SUB-SECOND WRINKLE, stated so nobody re-derives it as a bug: measured
+ * live, `run_started_at` is truncated to whole seconds while `created_at`
+ * carries nine fractional digits, both UTC. An entry created in the same second
+ * as the run start therefore reads as post-dating it. That is a ≤1s extension
+ * of the checkout-window trade already accepted in diagnoseCache property 4 —
+ * same direction, same mitigation (poison is persistent, so it fails properly
+ * on the next run), and negligible beside the seconds-to-minutes window that
+ * trade already covers.
  *
  * Unparseable/absent timestamps on EITHER side count as "older", so an entry is
  * only ever treated as new when the API positively says so. That direction is
@@ -578,7 +612,15 @@ export async function fetchCacheEntries({ apiUrl, repository, key, token }) {
   const body = await githubJson(url, token);
   const entries = Array.isArray(body?.actions_caches) ? body.actions_caches : [];
   const totalCount = typeof body?.total_count === "number" ? body.total_count : null;
-  return { entries, truncated: totalCount === null || totalCount > entries.length };
+  // `totalCount` is returned as well as the verdict-facing boolean because a
+  // truncated listing is a SUCCESSFUL call: nothing else in the run would print
+  // a word about it, and "the API said N and gave us fewer" is the only fact an
+  // operator can act on when the report tells them the listing is incomplete.
+  return {
+    entries,
+    totalCount,
+    truncated: totalCount === null || totalCount > entries.length,
+  };
 }
 
 function formatBytes(size) {
@@ -621,6 +663,10 @@ function describeEntry(entry) {
  * this repository routinely carries the same key on both a branch and an open
  * PR's merge ref.
  *
+ * The remedy is BRANCHED on `racedSuppressed`, and that branch is not cosmetic
+ * — see the comment on it below. When the downgrade was refused, the listed
+ * entries are the ones already ruled out, so the report must not name any id.
+ *
  * The step still exits non-zero regardless. Silence is the disease this guard
  * exists to cure, and a swallowed transient that repeats every run is worth
  * seeing too.
@@ -658,11 +704,12 @@ function reportPoisoned(finding, { repository }) {
       console.error(
         "  Every entry listed above post-dates this run's start, which on a COMPLETE\n" +
           "  listing would be reported as a concurrent save and pass. It is not passing\n" +
-          "  here, deliberately: one of the diagnostic calls behind this list failed (see\n" +
-          "  the ::warning:: lines above), so the list may be MISSING entries — including\n" +
-          "  an older one on a ref that dropped out of scope when the lookup failed. A\n" +
-          "  set that may be incomplete cannot prove every entry is new, so the verdict\n" +
-          "  stays poisoned. Re-run first, as below: it re-runs the diagnostics too.",
+          "  here, deliberately: this listing is not known to be complete — EITHER one of\n" +
+          "  the diagnostic calls behind it failed, OR the API reported more entries than\n" +
+          "  it returned. The ::warning:: lines above say which. So the list may be\n" +
+          "  MISSING entries, including an older one that would prove poison, and a set\n" +
+          "  that may be incomplete cannot prove every entry is new. Re-run first, as\n" +
+          "  below: it re-runs the diagnostics too.",
       );
     }
     if (evidence.length > 1) {
@@ -681,22 +728,46 @@ function reportPoisoned(finding, { repository }) {
       "       download/service failure clears, while poison recurs every single time,\n" +
       "       because a poisoned entry can never overwrite itself.",
   );
-  console.error(
-    evidence.length > 1
-      ? "    2. ONLY if it recurs, delete the ONE entry whose version matches this run —\n" +
-          "       one of these, not both:"
-      : "    2. ONLY if it recurs, delete that one entry by id:",
-  );
-  for (const entry of evidence) {
+  // THE DELETION TARGET IS NOT ALWAYS SOMETHING WE CAN NAME, and printing an id
+  // we cannot stand behind is worse than printing none. On a suppressed
+  // downgrade EVERY listed entry has just been EXCLUDED as a candidate — they
+  // all post-date the run — so naming them here would tell an operator to
+  // delete the concurrent save while the poison, which the incomplete listing
+  // hid, survives. That was measured: poison on `refs/heads/main` invisible
+  // because the repo endpoint was down, and `id` of the healthy `develop` save
+  // printed as the thing to delete. "ONLY if it recurs" is no protection —
+  // poison recurs by construction, which is this guard's own premise, so the
+  // precondition is satisfied on the very next run and the wrong cache dies.
+  if (racedSuppressed) {
     console.error(
-      `         gh api -X DELETE "repos/${repository}/actions/caches/${entry.id}"  # ${entry.ref}`,
+      "    2. ONLY if it recurs, delete the offending entry — which is NOT one of the\n" +
+        "       entries listed above. All of them post-date this run's start, and that is\n" +
+        "       exactly what excluded them as candidates. The entry you want is one this\n" +
+        "       incomplete listing did not show, so re-list once the diagnostics recover\n" +
+        "       and pick by id from a listing you can trust:",
     );
-  }
-  if (evidence.length === 0) {
     console.error(
       `         gh api "repos/${repository}/actions/caches?key=${key}" --jq '.actions_caches[]'\n` +
         `         gh api -X DELETE "repos/${repository}/actions/caches/<id>"`,
     );
+  } else {
+    console.error(
+      evidence.length > 1
+        ? "    2. ONLY if it recurs, delete the ONE entry whose version matches this run —\n" +
+            "       one of these, not both:"
+        : "    2. ONLY if it recurs, delete that one entry by id:",
+    );
+    for (const entry of evidence) {
+      console.error(
+        `         gh api -X DELETE "repos/${repository}/actions/caches/${entry.id}"  # ${entry.ref}`,
+      );
+    }
+    if (evidence.length === 0) {
+      console.error(
+        `         gh api "repos/${repository}/actions/caches?key=${key}" --jq '.actions_caches[]'\n` +
+          `         gh api -X DELETE "repos/${repository}/actions/caches/<id>"`,
+      );
+    }
   }
   console.error(
     "       Delete by ID, never by `?key=` — the key form removes the entry on EVERY\n" +
@@ -739,17 +810,31 @@ function reportCold(finding) {
   );
   if (evidence.length > 0) {
     // The P1 false positive this model exists to prevent, made visible rather
-    // than merely tolerated: entries under this key DO exist, and they are
-    // still not restorable by this run, because a cache is matched by
+    // than merely tolerated: entries under this key DO exist, and none of them
+    // is restorable AT THIS RUN'S VERSION, because a cache is matched by
     // (key, version, ref) and `version` hashes the cached path plus the
     // compression method. Editing `path:` — or GitHub changing its compressor —
-    // strands every older entry under a live key. That is healthy. Do not
-    // delete them; they age out on their own.
+    // strands every older entry under a live key.
+    //
+    // WHAT THIS NOTE MUST NOT DO IS ASSERT HEALTH. An earlier revision said
+    // "they are not poison", which this branch cannot know: actions/cache
+    // swallows a failed lookup inside the PROBE exactly as it does on the
+    // primary, so a transient there yields an empty `cache-hit`, lands here as
+    // `cold`, and prints a clean bill of health over an entry that may well be
+    // at this run's version. That is the same overclaim that was removed from
+    // reportPoisoned after it destroyed a healthy 263 MB cache; it must not be
+    // reintroduced on this branch. "Leave them alone" survives regardless —
+    // deleting is never the correct first move under either reading.
     console.log(
       `  Note: ${evidence.length} entry/entries exist under this key on refs this run can\n` +
-        "  restore from, at a DIFFERENT cache version — the `path:` or the compression\n" +
-        "  method changed. They are not restorable here and they are not poison. Leave\n" +
-        "  them alone; GitHub evicts them on its own.",
+        "  restore from, and none of them was restorable AT THIS RUN'S CACHE VERSION.\n" +
+        "  The likely reading is healthy: the `path:` or the compression method changed,\n" +
+        "  which strands older entries under a live key. It is not the only one — the\n" +
+        "  probe swallows a failed lookup just as the primary does, so a transient there\n" +
+        "  produces this same shape while an entry at this run's version sits right\n" +
+        "  here. Either way, leave them alone: deleting is never the right first move,\n" +
+        "  GitHub evicts them on its own, and a re-run separates the two (a version\n" +
+        "  change reproduces this note exactly; a transient does not).",
     );
     for (const entry of evidence) console.log(describeEntry(entry));
   }
@@ -817,10 +902,25 @@ async function main(argv, env) {
   for (const cache of caches) {
     if (!entriesByKey.has(cache.key)) {
       try {
-        entriesByKey.set(
-          cache.key,
-          await fetchCacheEntries({ apiUrl, repository, key: cache.key, token }),
-        );
+        const fetched = await fetchCacheEntries({ apiUrl, repository, key: cache.key, token });
+        // A TRUNCATED LISTING IS A SUCCESSFUL CALL, and that is why it needs its
+        // own annotation: no request failed, so nothing else in this run would
+        // mention it, yet the report below will tell the operator the listing is
+        // incomplete and send them to "the ::warning:: lines above". Without
+        // this line those lines do not exist and the advice dead-ends.
+        if (fetched.truncated) {
+          console.log(
+            `::warning::cache "${cache.label}": the cache listing is INCOMPLETE. The API ` +
+              `${
+                fetched.totalCount === null
+                  ? "returned no usable total_count"
+                  : `reported ${fetched.totalCount} entries under this key`
+              } but this response carried ${fetched.entries.length}. The entries named ` +
+              "below are therefore a partial view, and this guard will not downgrade a " +
+              "probe hit to a concurrent-save warning on a listing it cannot trust.",
+          );
+        }
+        entriesByKey.set(cache.key, fetched);
       } catch (error) {
         console.log(
           `::warning::cache "${cache.label}": entry details unavailable, so the report ` +
