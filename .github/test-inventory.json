@@ -162,7 +162,7 @@
     "packages/saas/src/private-file.test.ts": 3,
     "packages/saas/src/setup-trust-chain.test.ts": 12,
     "packages/saas/src/subject-token.test.ts": 8,
-    "scripts/check-cache-health.test.mjs": 38,
+    "scripts/check-cache-health.test.mjs": 42,
     "scripts/lint-citations.test.mjs": 36,
     "scripts/test-gap-guards.test.mjs": 5
   }

@@ -127,22 +127,38 @@ jobs:
       # dial seam.  playwright-core is bundled with the `openclaw` dependency;
       # we use its CLI to download and cache the managed Chromium binary.
       # ──────────────────────────────────────────────────────────────────────
-      # The key is defined ONCE, here, because it is now read in two places (the
-      # cache step and the cache-health guard). A duplicated hashFiles()
-      # expression is a key that drifts the first time one copy is edited — and
-      # a guard checking a key nothing writes is worse than no guard. Safe at
-      # this position because the cache step already sits AFTER `npm ci`, so the
-      # hashed file exists; the produced string is byte-identical to the inline
-      # expression it replaces, so the live 263 MB entry keeps matching.
-      - name: Define Playwright cache key
+      # The key AND the path are defined ONCE, here, because both are read in
+      # more than one place (the cache step, the lookup-only probe below, and —
+      # for the key — the cache-health guard). A duplicated hashFiles()
+      # expression is a key that drifts the first time one copy is edited, and a
+      # guard checking a key nothing writes is worse than no guard.
+      #
+      # The path is exactly as load-bearing as the key: GitHub matches a cache
+      # by (KEY, VERSION, REF), and `version` hashes the raw `path:` STRING. A
+      # duplicated path therefore drifts into a different cache version — and
+      # unlike key drift, which the guard detects (`--probe-key` != `--key` is a
+      # hard error), path drift is invisible from the script and produces a
+      # PERMANENT false POISONED: it recurs on every re-run, so the remedy's own
+      # "re-run first" discriminator reports poison confirmed and an operator
+      # deletes a healthy 263 MB cache to unblock merges. The nats probe already
+      # avoids this by reading $NATS_SERVER_DIR on both sides.
+      #
+      # Both strings are byte-identical to the literals they replace, so the
+      # live entry keeps matching. `~` must stay literal — tilde expansion does
+      # not occur inside double quotes, and an expanded /home/runner path is a
+      # different string and so a different cache version. Safe at this position
+      # because the cache step already sits AFTER `npm ci`, so the hashed file
+      # exists.
+      - name: Define Playwright cache key and path
         run: |
           echo "PLAYWRIGHT_CACHE_KEY=playwright-chromium-${{ hashFiles('node_modules/openclaw/node_modules/playwright-core/package.json') }}" >> "$GITHUB_ENV"
+          echo "PLAYWRIGHT_CACHE_PATH=~/.cache/ms-playwright" >> "$GITHUB_ENV"
 
       - name: Cache Playwright browsers
         id: cache-playwright
         uses: actions/cache@v4
         with:
-          path: ~/.cache/ms-playwright
+          path: ${{ env.PLAYWRIGHT_CACHE_PATH }}
           # Key includes the playwright-core version so the cache invalidates
           # when playwright is upgraded in the openclaw package.
           key: ${{ env.PLAYWRIGHT_CACHE_KEY }}
@@ -159,10 +175,14 @@ jobs:
       # key, so the same version, and `lookup-only: true` answers existence
       # without downloading anything.
       #
-      # >>> THE `path:` BELOW MUST STAY BYTE-IDENTICAL TO THE STEP ABOVE. <<<
-      # A different path string is a different version, which would silently
-      # turn this into the answer to a question nobody asked. Edit both or
-      # neither.
+      # >>> `path:` AND `key:` BELOW MUST RESOLVE FROM THE SAME $GITHUB_ENV
+      # >>> DEFINITIONS THE CACHE STEP ABOVE USES. <<< Both come from the
+      # "Define Playwright cache key and path" step, so there is ONE definition
+      # of each rather than two copies to hand-synchronise. Do not inline either
+      # one back here: a different path string is a different cache VERSION,
+      # which would silently turn this into the answer to a question nobody
+      # asked — and unlike a drifted key, a drifted path is undetectable from
+      # the guard script.
       #
       # Inert on the happy path: gated on the primary NOT reporting a hit, so a
       # restored cache never pays for it.
@@ -180,7 +200,7 @@ jobs:
         if: steps.cache-playwright.outputs.cache-hit != 'true'
         uses: actions/cache/restore@v4
         with:
-          path: ~/.cache/ms-playwright
+          path: ${{ env.PLAYWRIGHT_CACHE_PATH }}
           key: ${{ env.PLAYWRIGHT_CACHE_KEY }}
           lookup-only: true
 
@@ -216,16 +236,17 @@ jobs:
       # ──────────────────────────────────────────────────────────────────────
       # The nats probe cannot sit next to the cache step it mirrors — that step
       # lives inside .github/actions/install-nats-server. It is keyed on the
-      # action's exported `cache-key` and pathed on $NATS_SERVER_DIR, which the
-      # composite's own "Resolve install dir" step writes to $GITHUB_ENV BEFORE
-      # using it as that cache step's `path:`. Reading the same variable back
-      # here therefore reproduces the same path string, and so the same cache
+      # action's exported `cache-key` and pathed on $NATS_SERVER_DIR — and the
+      # composite's own "Resolve install dir and cache key" step is the single
+      # definition of BOTH, writing the path to $GITHUB_ENV and the key to
+      # $GITHUB_OUTPUT before the cache step consumes them. Reading them back
+      # here therefore reproduces the same two strings, and so the same cache
       # version.
       #
-      # >>> `path:` AND `key:` BELOW MUST STAY BYTE-IDENTICAL TO THE COMPOSITE'S
-      # >>> CACHE STEP. <<< A different path string is a different version, and
-      # this probe would then answer a question nobody asked. If that
-      # $GITHUB_ENV export is ever removed or renamed, this resolves to the
+      # >>> `path:` AND `key:` BELOW MUST KEEP RESOLVING FROM THAT ONE STEP.
+      # >>> DO NOT INLINE EITHER. <<< A different path string is a different
+      # version, and this probe would then answer a question nobody asked. If
+      # the $GITHUB_ENV export is ever removed or renamed, this resolves to the
       # empty string and the probe silently starts reporting on a different
       # path — the two files have to be edited together.
       - name: Probe the nats-server cache at this run's version

@@ -64,21 +64,30 @@
  *                               version, and the restore did not produce it.
  *                               FAIL.
  *
+ * There is exactly ONE thing REST can do to that verdict, and it can only ever
+ * soften it: if it can show that EVERY visible entry under the key was created
+ * after this run started, the probe hit is a concurrent save landing between
+ * the restore and the probe, not poison — verdict `raced`, a warning, PASS. See
+ * diagnoseCache for why that is safe and what it costs.
+ *
  * ── THE REST API IS DIAGNOSTIC ONLY ────────────────────────────────────────
  *
- * It must NEVER decide a verdict. It exists to turn "poisoned" into an
- * actionable message: which entries are sitting under this key, on which refs,
- * at which versions, how big, how old, and — the part that matters most — their
- * `id`, because deleting by `?key=` removes the entry on EVERY ref at once and
- * would destroy healthy siblings.
+ * It must NEVER MANUFACTURE a failure — no REST answer can turn a passing run
+ * red, and the `raced` downgrade above is the only direction in which it moves
+ * a verdict at all. Its real job is to turn "poisoned" into an actionable
+ * message: which entries are sitting under this key, on which refs, at which
+ * versions, how big, how old, and — the part that matters most — their `id`,
+ * because deleting by `?key=` removes the entry on EVERY ref at once and would
+ * destroy healthy siblings.
  *
  * Therefore every REST failure — unreachable, timeout, 401/403/404, malformed
  * body, an unresolvable `default_branch` — is a `::warning::` and never fails
  * the step. That is a deliberate reversal of an earlier design in which REST
  * was fail-closed. It was fail-closed because a silently-degraded REST layer
  * meant a silently-degraded VERDICT. It no longer does: a degraded REST layer
- * now only means a less detailed message, and reddening a blocking gate over
- * API reachability buys nothing.
+ * costs a less detailed message and the `raced` downgrade — both of which fail
+ * SAFE, toward reporting poison — and reddening a blocking gate over API
+ * reachability buys nothing.
  *
  * TWO THINGS THAT MAKE THIS SUBTLER THAN IT LOOKS:
  *
@@ -147,17 +156,22 @@ function parseTimestamp(value) {
 /**
  * True when this entry existed before the run started.
  *
- * DEMOTED ON PURPOSE — this no longer gates anything. It used to filter the
- * entry list, because back when REST decided the verdict a concurrently created
- * entry could be read as poison. The probe is same-run and same-version, so a
- * concurrent creation is now self-resolving: if the probe says an entry exists
- * at our key and version, the restore had it and did not produce it, whenever
- * it was written. All this does now is LABEL a line of printed evidence so a
- * reader can tell "this appeared after your job started" from "this was here
- * the whole time".
+ * THIS GATES A VERDICT — see the "raced" branch in diagnoseCache. A previous
+ * revision demoted it to a decorative label, arguing that "the probe is
+ * same-run and same-version, so a concurrent creation is self-resolving". That
+ * argument is FALSE, and it produced a reachable false POISONED with nothing
+ * wrong anywhere. The probe is same-RUN, not same-INSTANT: the primary restore
+ * happens at T0 and the probe at T0+Δ, and Δ is minutes for nats — the primary
+ * lives inside .github/actions/install-nats-server while `probe-nats` sits
+ * after `npm ci`, `lint:citations` and the whole Playwright cache block. So a
+ * concurrent run's END-OF-JOB SAVE can land inside Δ: a PR run legitimately
+ * misses a cold key at T0, a develop push writes the entry at T0+60s, and the
+ * PR run's probe sees it at T0+90s. Reading that as poison reddens a required
+ * check and tells an operator to delete a cache created 30 seconds ago.
  *
- * Unparseable/absent timestamps on EITHER side count as "older", so the label
- * is only ever attached when the API positively says so.
+ * Unparseable/absent timestamps on EITHER side count as "older", so an entry is
+ * only ever treated as new when the API positively says so. That direction is
+ * deliberate: it keeps the "raced" downgrade unreachable through missing data.
  */
 function predatesRun(entry, runStartedAt) {
   const created = parseTimestamp(entry?.created_at);
@@ -167,12 +181,36 @@ function predatesRun(entry, runStartedAt) {
 }
 
 /**
- * Classify one declared cache. The two booleans decide; `entries` only decorate.
+ * Classify one declared cache. The two booleans decide whether this is a
+ * failure; the entries can only ever DOWNGRADE a failure to a warning.
  *
  * Evidence matching is EXACT on the key. The REST API's `?key=` filter is
  * documented as a PREFIX filter, so it is only ever used to narrow the response
  * — the comparison happens here, where `playwright-chromium-abc` cannot be
  * mistaken for `playwright-chromium-abcdef`.
+ *
+ * ── THE "raced" VERDICT ────────────────────────────────────────────────────
+ *
+ * A probe hit is only poison if the entry was already there when the restore
+ * ran. It need not have been: see predatesRun above for the concurrent-save
+ * window this closes. So a probe hit whose every visible entry was created
+ * AFTER `run_started_at` is reported as `raced` — a warning, exit 0.
+ *
+ * Three properties hold, and each is load-bearing:
+ *
+ * 1. EMPTY EVIDENCE IS STILL `poisoned`. REST is diagnostics-only, and a
+ *    degraded REST layer must never be able to hide a real poisoning. Empty
+ *    evidence means "we could not rule it out", not "no entries exist".
+ * 2. ANY ENTRY PREDATING THE RUN IS STILL `poisoned`. One old entry is enough:
+ *    it was restorable and was not restored. Hence `every`, not `some`.
+ * 3. THIS TRADES A NARROW FALSE NEGATIVE FOR THAT FALSE POSITIVE, and the trade
+ *    is not free. `run_started_at` precedes the primary restore step by the
+ *    checkout/setup time, so an entry genuinely written in THAT window is real
+ *    poison and gets downgraded to `raced` on this run. That is acceptable for
+ *    exactly one reason: poison is PERSISTENT BY CONSTRUCTION — a poisoned
+ *    entry can never overwrite itself — so on the next run it predates that
+ *    run's start and fails properly. The warning text says so explicitly, so an
+ *    operator seeing it twice knows it is not a race.
  */
 export function diagnoseCache({
   label,
@@ -190,7 +228,12 @@ export function diagnoseCache({
     .filter((entry) => entry?.key === key && visible.has(entry?.ref))
     .map((entry) => ({ ...entry, createdAfterRunStarted: !predatesRun(entry, runStartedAt) }));
 
-  return { label, key, verdict: probe === true ? "poisoned" : "cold", evidence };
+  if (probe !== true) return { label, key, verdict: "cold", evidence };
+
+  const raced =
+    evidence.length > 0 && evidence.every((entry) => entry.createdAfterRunStarted === true);
+
+  return { label, key, verdict: raced ? "raced" : "poisoned", evidence };
 }
 
 const CACHE_FLAGS = new Set(["--cache", "--key", "--hit", "--probe", "--probe-key"]);
@@ -571,6 +614,32 @@ function reportPoisoned(finding, { repository }) {
   );
 }
 
+/**
+ * Report a probe hit that every visible entry post-dates: a concurrent save.
+ *
+ * Warns and does NOT fail. The message has one job beyond describing the race:
+ * telling the operator how to tell a race from poison, because the classifier
+ * cannot. `run_started_at` precedes the primary restore by the checkout/setup
+ * time, so genuine poison written inside that window lands here too — once.
+ * Poison cannot overwrite itself, so on the next run it predates that run's
+ * start and this comes out `poisoned`. REPETITION IS THE DISCRIMINATOR, and the
+ * text has to say so or the warning is just noise someone learns to scroll past.
+ */
+function reportRaced(finding) {
+  const { label, key, evidence } = finding;
+  console.log(
+    `::warning::cache "${label}": a lookup-only probe found an entry at ${key} that the ` +
+      `restore step did not produce — the poison fingerprint — but all ${evidence.length} ` +
+      "entry/entries visible to this run were created AFTER this run started, so the most " +
+      "likely cause is a concurrent job's end-of-job save landing between the restore and " +
+      "the probe (they are minutes apart, not simultaneous). Treating it as a race, not as " +
+      "poison, and passing. IF THIS WARNING REPEATS ON A LATER RUN, IT IS NOT A RACE: a " +
+      "poisoned entry can never overwrite itself, so on any subsequent run it predates that " +
+      "run's start and this guard will fail properly. Two of these in a row means real poison.",
+  );
+  for (const entry of evidence) console.log(describeEntry(entry));
+}
+
 function reportCold(finding) {
   const { label, key, evidence } = finding;
   console.log(
@@ -671,6 +740,8 @@ async function main(argv, env) {
       console.log(`cache "${finding.label}": restored from ${finding.key} — healthy.`);
     } else if (finding.verdict === "cold") {
       reportCold(finding);
+    } else if (finding.verdict === "raced") {
+      reportRaced(finding);
     } else {
       reportPoisoned(finding, { repository });
       failed = true;

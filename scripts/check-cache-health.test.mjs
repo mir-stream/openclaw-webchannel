@@ -44,8 +44,18 @@ const REPO_PAYLOAD = { full_name: REPOSITORY, default_branch: "main" };
  *
  * `run_started_at` is present and correct. The nested `repository` object is a
  * MINIMAL repo reference carrying NO `default_branch` — that absence is the
- * point of this fixture, and it is what stops the old defect from ever going
- * green here again.
+ * point of this fixture.
+ *
+ * BUT THE FIXTURE ALONE GUARANTEES NOTHING, and an earlier version of this
+ * comment claimed it did. Reintroducing the exact old defect — reading
+ * `runResult.value?.repository?.default_branch` instead of the repo endpoint's
+ * — left every test in this file green, because they all pin
+ * `GITHUB_REF: refs/heads/develop` with entries on refs reachable without the
+ * default branch, so `defaultBranch` was decorative everywhere. A fixture can
+ * only make a defect OBSERVABLE; an assertion is what makes it FAIL. The test
+ * that actually closes it is "surfaces an entry visible ONLY via the repository
+ * default branch" below, whose single entry is unreachable any other way — it
+ * was confirmed to go red under that mutation and green without it.
  */
 const RUN_PAYLOAD = {
   run_started_at: "2026-08-19T05:32:17Z",
@@ -96,8 +106,32 @@ const RUN_STARTED_AT = RUN_PAYLOAD.run_started_at;
 const BEFORE_RUN = "2026-08-18T22:11:03.884512000Z";
 const AFTER_RUN = LIVE_CACHE_ENTRIES[1].created_at;
 
-/** The live develop-ref entry, back-dated to before this run started. */
+/**
+ * The live develop-ref entry, back-dated to before this run started.
+ *
+ * The back-dating is load-bearing, not cosmetic: an entry created after
+ * `run_started_at` cannot have been there for the restore to miss, so a probe
+ * hit over one is classified `raced` (warning, exit 0) rather than `poisoned`.
+ * Every fixture below that means to model POISON must predate the run.
+ */
 const OLDER_LIVE_ENTRY = { ...LIVE_CACHE_ENTRIES[1], created_at: BEFORE_RUN };
+
+/** The live PR-merge-ref entry, back-dated the same way and for the same reason. */
+const OLDER_LIVE_MERGE_ENTRY = { ...LIVE_CACHE_ENTRIES[0], created_at: BEFORE_RUN };
+
+/**
+ * A poisoned entry reachable ONLY through the repository default branch.
+ *
+ * `main` is neither this run's ref nor its base ref in the test that uses it, so
+ * it enters the visible-ref set only if `default_branch` was read from the
+ * endpoint that actually returns it. Its `id` is what the remedy deletes, and
+ * losing it is what the old defect cost an operator.
+ */
+const DEFAULT_BRANCH_ENTRY = {
+  ...OLDER_LIVE_ENTRY,
+  id: 6776501133,
+  ref: "refs/heads/main",
+};
 
 let stubServer;
 
@@ -289,7 +323,10 @@ describe("diagnoseCache", () => {
 
   it("reports poisoned from the probe alone when REST produced no entries", () => {
     // A 403 or an unreachable API costs the message its detail and nothing
-    // else. The verdict is local, so it survives.
+    // else. The verdict is local, so it survives — and specifically, EMPTY
+    // EVIDENCE MUST NOT BECOME `raced`. Empty means "we could not rule poison
+    // out", not "no entries exist"; a degraded REST layer must never be able to
+    // downgrade a real poisoning to a warning.
     expect(
       diagnoseCache({
         label: "playwright",
@@ -331,11 +368,13 @@ describe("diagnoseCache", () => {
     expect(finding.evidence).toEqual([]);
   });
 
-  it("LABELS an entry created after the run started instead of dropping it", () => {
-    // The race guard, demoted. It used to filter — which mattered when REST
-    // decided the verdict. The probe is same-run, so a concurrent creation is
-    // self-resolving and the timestamp is now only an annotation. The
-    // nanosecond shape is the live one, so a parser regression shows up here.
+  it("reports RACED when EVERY visible entry was created after the run started", () => {
+    // The concurrent-save false positive. The probe is same-RUN, not
+    // same-INSTANT: minutes separate the primary restore from the probe, so a
+    // parallel job's end-of-job save can land in between and turn an honest
+    // cold miss into a probe hit. Calling that poison reddens a required check
+    // and orders a 30-second-old healthy cache deleted. The nanosecond shape is
+    // the live one, so a timestamp-parser regression shows up right here.
     const finding = diagnoseCache({
       label: "playwright",
       key: KEY,
@@ -345,8 +384,26 @@ describe("diagnoseCache", () => {
       visibleRefs,
       runStartedAt: RUN_STARTED_AT,
     });
-    expect(finding.verdict).toBe("poisoned");
+    expect(finding.verdict).toBe("raced");
     expect(finding.evidence[0].createdAfterRunStarted).toBe(true);
+  });
+
+  it("stays POISONED when even ONE visible entry predates the run", () => {
+    // `every`, not `some`. One entry that was already sitting there when the
+    // restore ran is a restorable entry the restore did not produce — poison,
+    // whatever else was created alongside it afterwards. The label still rides
+    // along on the newer entry so the printed evidence stays readable.
+    const finding = diagnoseCache({
+      label: "playwright",
+      key: KEY,
+      hit: false,
+      probe: true,
+      entries: [{ ...OLDER_LIVE_MERGE_ENTRY, created_at: AFTER_RUN }, OLDER_LIVE_ENTRY],
+      visibleRefs: visibleCacheRefs({ ref: "refs/pull/200/merge", baseRef: "develop" }),
+      runStartedAt: RUN_STARTED_AT,
+    });
+    expect(finding.verdict).toBe("poisoned");
+    expect(finding.evidence.map((entry) => entry.createdAfterRunStarted)).toEqual([true, false]);
   });
 
   it("does not label an entry whose created_at is missing", () => {
@@ -363,15 +420,20 @@ describe("diagnoseCache", () => {
   });
 
   it("carries the live listing through as evidence, ids and versions intact", () => {
+    // The two live entries are recorded from a run LATER than the recorded
+    // `run_started_at`, so both are back-dated here — otherwise this models the
+    // `raced` path rather than the poisoned one it is about. Only `created_at`
+    // is touched; `id` and `version`, the fields under assertion, stay verbatim.
     const finding = diagnoseCache({
       label: "playwright",
       key: KEY,
       hit: false,
       probe: true,
-      entries: LIVE_CACHE_ENTRIES,
+      entries: [OLDER_LIVE_MERGE_ENTRY, OLDER_LIVE_ENTRY],
       visibleRefs: visibleCacheRefs({ ref: "refs/pull/200/merge", baseRef: "develop" }),
       runStartedAt: RUN_STARTED_AT,
     });
+    expect(finding.verdict).toBe("poisoned");
     expect(finding.evidence.map((entry) => entry.id)).toEqual([6776960828, 6776817145]);
     expect(finding.evidence.every((entry) => entry.version === VERSION)).toBe(true);
   });
@@ -513,6 +575,77 @@ describe("cache health CLI against a stub Actions API", () => {
     expect(requests.some((url) => url.includes(`/actions/runs/${RUN_ID}`))).toBe(true);
     expect(requests).toContain(`/repos/${REPOSITORY}`);
     expect(requests.some((url) => url.includes("/actions/caches?key="))).toBe(true);
+  });
+
+  it("surfaces an entry visible ONLY via the repository default branch", async () => {
+    // THE ASSERTION THAT CLOSES THE OLD default_branch DEFECT — see the fixture
+    // header. This run is on an unrelated feature branch with no base ref, so
+    // the sole entry is reachable only if `default_branch` came from
+    // GET /repos/{owner}/{repo}. Read it off the run object's nested
+    // `repository` instead (where it has never existed) and the ref set narrows
+    // to the feature branch, the evidence empties, and the report degrades to
+    // "No entry details are available" — the operator loses the `id` the remedy
+    // deletes, on the one run where they need it. Verified to go red under
+    // exactly that mutation.
+    const { origin } = await startStubApi({ actionsCaches: [DEFAULT_BRANCH_ENTRY] });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin, { GITHUB_REF: "refs/heads/feature/x", GITHUB_BASE_REF: "" }),
+    );
+
+    expect(result.code).not.toBe(0);
+    const output = `${result.stdout}${result.stderr}`;
+    expect(output).toContain("POISONED CACHE: playwright");
+    expect(output).toContain("refs/heads/main");
+    expect(output).toContain(`actions/caches/${DEFAULT_BRANCH_ENTRY.id}`);
+    expect(output).not.toContain("No entry details are available");
+  });
+
+  it("WARNS and exits ZERO when every entry post-dates the run — a concurrent save", async () => {
+    // The concurrent-save false positive, end to end. A cold key on a PR run
+    // misses at T0; a develop push saves the entry seconds later; this run's
+    // probe — minutes downstream of its own restore — then sees it. Failing
+    // here blocks merges and orders a brand-new healthy cache deleted. The
+    // warning has to name the discriminator, because the guard cannot: poison
+    // cannot overwrite itself, so a repeat on a later run is not a race.
+    const { origin } = await startStubApi({
+      actionsCaches: [{ ...OLDER_LIVE_ENTRY, created_at: AFTER_RUN }],
+    });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin),
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("::warning::");
+    expect(result.stdout).toContain("created AFTER this run started");
+    expect(result.stdout).toContain("IF THIS WARNING REPEATS");
+    expect(result.stdout).not.toContain("POISONED CACHE");
+    // The evidence is still printed — a warning nobody can act on is noise.
+    expect(result.stdout).toContain(`id ${OLDER_LIVE_ENTRY.id}`);
+  });
+
+  it("still FAILS when only some entries post-date the run", async () => {
+    // One entry that predates the run is one restorable entry the restore did
+    // not produce. A concurrent save alongside it does not launder that.
+    const { origin } = await startStubApi({
+      actionsCaches: [{ ...OLDER_LIVE_MERGE_ENTRY, created_at: AFTER_RUN }, OLDER_LIVE_ENTRY],
+    });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin, { GITHUB_REF: "refs/pull/200/merge", GITHUB_BASE_REF: "develop" }),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("POISONED CACHE: playwright");
+    expect(result.stderr).toContain("[created after this run started]");
   });
 
   it("claims only what is proven, and orders the remedy re-run FIRST", async () => {

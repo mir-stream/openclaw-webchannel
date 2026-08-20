@@ -14,19 +14,22 @@ inputs:
 # `cache-primary-key` / `cache-matched-key` output on it, so the key cannot be
 # read back off the step and has to be handed out explicitly here.
 #
-# `cache-key` is the SAME expression the cache step below is keyed on, and
-# `inputs.version` above stays the one place the pinned version is written. The
-# two spellings of the key template must be edited together: a `cache-key` that
-# drifted from the key actually written would make the caller's poisoned-cache
-# guard check a key nothing ever saves — green, and meaningless, which is the
-# precise failure that guard exists to end.
+# The key template is spelled ONCE, in the "Resolve install dir and cache key"
+# step below, which writes it to $GITHUB_OUTPUT; both this output and the cache
+# step's `key:` read it back from there. It used to be written out twice, and
+# nothing could have caught a drift between the copies: `--key` and `--probe-key`
+# in the caller both derive from THIS output, so the guard's key-drift check
+# would still pass while every run reported a cold key. A `cache-key` that
+# drifted from the key actually saved makes the caller's poisoned-cache guard
+# check a key nothing ever writes — green, and meaningless, which is the precise
+# failure that guard exists to end.
 outputs:
   cache-hit:
     description: Whether the pinned nats-server binary was restored from cache.
     value: ${{ steps.cache-nats.outputs.cache-hit }}
   cache-key:
     description: The cache key this action restores and saves under.
-    value: nats-server-${{ inputs.version }}-linux-amd64-toolcache
+    value: ${{ steps.resolve.outputs.cache-key }}
 
 # NO SUDO ANYWHERE IN THIS ACTION.
 #
@@ -44,7 +47,8 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Resolve install dir
+    - name: Resolve install dir and cache key
+      id: resolve
       shell: bash
       run: |
         set -euo pipefail
@@ -61,16 +65,22 @@ runs:
         # resolving an empty path — still green, and answering about nothing.
         echo "NATS_SERVER_DIR=$DIR" >> "$GITHUB_ENV"
         echo "$DIR" >> "$GITHUB_PATH"
+        # THE ONLY PLACE THE CACHE KEY TEMPLATE IS WRITTEN. The cache step below
+        # is keyed on this output and so is this action's exported `cache-key`,
+        # so the key the caller's poisoned-cache guard checks and the key this
+        # action actually saves under cannot come apart. Bumped (-toolcache)
+        # because the old key's entries were saved with an absolute
+        # /usr/local/bin path and restore into the new location as a stray
+        # nested tree rather than a usable binary. Editing this string strands
+        # the live entry; it is not a formatting choice.
+        echo "cache-key=nats-server-${{ inputs.version }}-linux-amd64-toolcache" >> "$GITHUB_OUTPUT"
 
     - name: Cache nats-server binary
       id: cache-nats
       uses: actions/cache@v4
       with:
         path: ${{ env.NATS_SERVER_DIR }}
-        # Key is bumped (-toolcache) because the old key's cache entries were
-        # saved with an absolute /usr/local/bin path and restore into the new
-        # location as a stray nested tree rather than a usable binary.
-        key: nats-server-${{ inputs.version }}-linux-amd64-toolcache
+        key: ${{ steps.resolve.outputs.cache-key }}
 
     - name: Install nats-server ${{ inputs.version }}
       if: steps.cache-nats.outputs.cache-hit != 'true'
