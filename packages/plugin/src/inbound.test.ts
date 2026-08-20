@@ -2291,6 +2291,50 @@ describe("handleInboundMessage — #173 keyframe resync at settlement", () => {
     expect(keyframes[0].messages.map((m) => m.id)).toEqual(["A", "B"]);
   });
 
+  // Companion to the divergence-fail-safe test above: the SECOND rotation path.
+  // `handleAssistantMessageBoundary` CONSUMES the first `onAssistantMessageStart`
+  // (message-adapter.ts `firstBoundarySeen`) and only `closeAndRotate`s on the
+  // SECOND+ boundary. Both existing positive fixtures
+  // (`twoStreamedLanesThenTwoFinals` and the divergence test) open lane 2 via the
+  // divergence fail-safe, leaving the genuine STRUCTURED-boundary rotation path
+  // unverified. Here lane 2 opens via a real second boundary — the intervening
+  // partial is a strict PREFIX-EXTENSION of lane 1's text, so the divergence
+  // fail-safe never fires. The fix counts materialized answer lanes independently
+  // of HOW each opened, so the keyframe must still fire.
+  it("emits a keyframe when the second lane opened via a genuine structured boundary (no divergence)", async () => {
+    const { api, warnings } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: async (turn) => {
+        // Lane 1 streams its text.
+        streamAnswerLane(turn, "first ans");
+        // First structured boundary — CONSUMED by `firstBoundarySeen`, no rotation.
+        openNextAnswerLane(turn);
+        // A strict PREFIX-EXTENSION of lane 1's text: `cleaned.startsWith(answerText)`
+        // holds, so the divergence fail-safe does NOT fire — this stays lane 1.
+        streamAnswerLane(turn, "first ans extended");
+        // Second structured boundary — this one genuinely `closeAndRotate`s to lane 2.
+        openNextAnswerLane(turn);
+        // Lane 2 streams its own text.
+        streamAnswerLane(turn, "second ans");
+        // The [A,A,B] routing: first final finalizes lane 2 (non-independent),
+        // second delivers independent.
+        await turn.delivery.deliver({ text: "first answer" }, { kind: "final" });
+        await turn.delivery.deliver({ text: "second answer" }, { kind: "final" });
+      },
+    });
+    const { transport, keyframes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    // The divergence fail-safe must NOT have opened lane 2 — proving lane 2 came
+    // from the structured boundary's `closeAndRotate`, the path under test.
+    expect(warnings.some((w) => w.includes("cumulative partial diverged"))).toBe(false);
+    expect(keyframes).toHaveLength(1);
+    expect(keyframes[0].peerId).toBe("peer-1");
+    expect(keyframes[0].messages.map((m) => m.id)).toEqual(["A", "B"]);
+  });
+
   // Finding 1 (false positive): the old counter incremented in `onPartialReply`
   // BEFORE the adapter filters reasoning partials, so a `Reasoning:\n` partial
   // followed by a boundary and one real answer inflated the count to 2 — and the
