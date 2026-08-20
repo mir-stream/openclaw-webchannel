@@ -65,10 +65,13 @@
  *                               FAIL.
  *
  * There is exactly ONE thing REST can do to that verdict, and it can only ever
- * soften it: if it can show that EVERY visible entry under the key was created
- * after this run started, the probe hit is a concurrent save landing between
- * the restore and the probe, not poison — verdict `raced`, a warning, PASS. See
- * diagnoseCache for why that is safe and what it costs.
+ * soften it: if it can show — from a COMPLETE listing — that every visible
+ * entry under the key was created after this run started, the probe hit is a
+ * concurrent save landing between the restore and the probe, not poison:
+ * verdict `raced`, a warning, PASS. "Complete" is a precondition and not a
+ * detail; a listing narrowed by a failed lookup can exhibit that shape while
+ * hiding the poison. See diagnoseCache for why the downgrade is safe, what it
+ * costs, and what it refuses.
  *
  * ── THE REST API IS DIAGNOSTIC ONLY ────────────────────────────────────────
  *
@@ -88,6 +91,15 @@
  * costs a less detailed message and the `raced` downgrade — both of which fail
  * SAFE, toward reporting poison — and reddening a blocking gate over API
  * reachability buys nothing.
+ *
+ * "FAILS SAFE" HAS TO BE ENFORCED, NOT ASSUMED, and PARTIAL degradation is why.
+ * A total failure empties the evidence, which is obviously safe. A partial one
+ * — one endpoint of the two answering — leaves a SHORTER evidence list that
+ * still looks like an answer, and the `raced` downgrade reasons over exactly
+ * that list. Losing `default_branch` alone was measured turning a real poisoned
+ * entry into `raced` and exit 0. So the downgrade is gated on `scopeComplete`,
+ * which certifies that EVERY diagnostic call answered — see diagnoseCache
+ * property 3.
  *
  * TWO THINGS THAT MAKE THIS SUBTLER THAN IT LOOKS:
  *
@@ -172,6 +184,16 @@ function parseTimestamp(value) {
  * Unparseable/absent timestamps on EITHER side count as "older", so an entry is
  * only ever treated as new when the API positively says so. That direction is
  * deliberate: it keeps the "raced" downgrade unreachable through missing data.
+ *
+ * BOTH SIDES OF THAT `||` ARE LOAD-BEARING, and they are defended differently.
+ * The `created === null` side is the only defence for an entry whose
+ * `created_at` is absent or malformed. The `started === null` side overlaps
+ * with `scopeComplete`, which independently refuses the downgrade when the runs
+ * endpoint did not answer — but the overlap is not total: a `run_started_at`
+ * that is PRESENT and unparseable (a GHES quirk, a shape change) satisfies
+ * `scopeComplete`, and then this line is the only thing standing between a
+ * garbage timestamp and a `raced` pass. Flip either side and evidence is
+ * labelled "created after this run started" on no evidence at all.
  */
 function predatesRun(entry, runStartedAt) {
   const created = parseTimestamp(entry?.created_at);
@@ -196,14 +218,32 @@ function predatesRun(entry, runStartedAt) {
  * window this closes. So a probe hit whose every visible entry was created
  * AFTER `run_started_at` is reported as `raced` — a warning, exit 0.
  *
- * Three properties hold, and each is load-bearing:
+ * Four properties hold, and each is load-bearing:
  *
  * 1. EMPTY EVIDENCE IS STILL `poisoned`. REST is diagnostics-only, and a
  *    degraded REST layer must never be able to hide a real poisoning. Empty
- *    evidence means "we could not rule it out", not "no entries exist".
+ *    evidence means "we could not rule it out", not "no entries exist". This
+ *    covers TOTAL degradation only — a partly-degraded lookup returns a
+ *    non-empty list that is merely INCOMPLETE, and property 3 is what covers
+ *    that. Do not read this line as the whole defence; it was, and the gap was
+ *    a live fail-open.
  * 2. ANY ENTRY PREDATING THE RUN IS STILL `poisoned`. One old entry is enough:
  *    it was restorable and was not restored. Hence `every`, not `some`.
- * 3. THIS TRADES A NARROW FALSE NEGATIVE FOR THAT FALSE POSITIVE, and the trade
+ * 3. AN INCOMPLETE EVIDENCE SCOPE IS STILL `poisoned` — `scopeComplete`, and it
+ *    is not a formality. `every()` over a set that is missing entries proves
+ *    NOTHING, and PARTIAL degradation is what makes the set lie while looking
+ *    healthy. Property 1 only covers total degradation. The measured hole this
+ *    closes: `GET /repos/{o}/{r}` fails → `defaultBranch` is undefined →
+ *    `refs/heads/main` silently drops out of visibleRefs → an OLD poisoned
+ *    entry on the default branch is filtered out of `evidence` → the newer
+ *    entry that survives on another visible ref makes `every()` true → `raced`,
+ *    exit 0, under a warning asserting the opposite of the truth. Same fixtures,
+ *    only the repo endpoint changed: healthy → exit 1 POISONED, 500 → exit 0.
+ *    So the downgrade requires the caller to certify the whole diagnostic path:
+ *    default branch resolved, run start time resolved, the listing fetch for
+ *    THIS key not thrown, and the listing not truncated. Absent or non-`true`,
+ *    the downgrade is refused — omitting the argument cannot enable it.
+ * 4. THIS TRADES A NARROW FALSE NEGATIVE FOR THAT FALSE POSITIVE, and the trade
  *    is not free. `run_started_at` precedes the primary restore step by the
  *    checkout/setup time, so an entry genuinely written in THAT window is real
  *    poison and gets downgraded to `raced` on this run. That is acceptable for
@@ -211,6 +251,11 @@ function predatesRun(entry, runStartedAt) {
  *    entry can never overwrite itself — so on the next run it predates that
  *    run's start and fails properly. The warning text says so explicitly, so an
  *    operator seeing it twice knows it is not a race.
+ *
+ * `scopeComplete` asks only "did every diagnostic call ANSWER". Whether the
+ * answer was USABLE is predatesRun's job: a present-but-unparseable
+ * `run_started_at` passes the completeness check and is then caught by that
+ * function's fail direction, which is why both layers exist and both are tested.
  */
 export function diagnoseCache({
   label,
@@ -220,6 +265,7 @@ export function diagnoseCache({
   entries,
   visibleRefs,
   runStartedAt,
+  scopeComplete,
 } = {}) {
   if (hit === true) return { label, key, verdict: "ok", evidence: [] };
 
@@ -230,10 +276,23 @@ export function diagnoseCache({
 
   if (probe !== true) return { label, key, verdict: "cold", evidence };
 
-  const raced =
+  const allEntriesPostDateRun =
     evidence.length > 0 && evidence.every((entry) => entry.createdAfterRunStarted === true);
 
-  return { label, key, verdict: raced ? "raced" : "poisoned", evidence };
+  if (allEntriesPostDateRun && scopeComplete === true) {
+    return { label, key, verdict: "raced", evidence };
+  }
+
+  // Recorded so reportPoisoned can tell the operator WHY it is still failing on
+  // a set of entries that all post-date the run — otherwise that report reads
+  // as a contradiction of the `raced` rule it just refused to apply.
+  return {
+    label,
+    key,
+    verdict: "poisoned",
+    evidence,
+    racedSuppressed: allEntriesPostDateRun && scopeComplete !== true,
+  };
 }
 
 const CACHE_FLAGS = new Set(["--cache", "--key", "--hit", "--probe", "--probe-key"]);
@@ -495,6 +554,21 @@ export async function fetchRunContext({ apiUrl, repository, runId, token }) {
   return { runStartedAt, defaultBranch, warnings };
 }
 
+/**
+ * List the entries under one key, and say whether the list is COMPLETE.
+ *
+ * `truncated` is not decoration: an omitted OLD entry is a route into the
+ * `raced` downgrade, because `every()` over a short page can be true while the
+ * page that was dropped holds the poison. So the completeness of the answer is
+ * reported alongside it and feeds `scopeComplete`.
+ *
+ * Deliberately NO pagination loop. Refusing to downgrade on a truncated answer
+ * costs one falsely-reported poison at worst — which a re-run resolves, since
+ * poison recurs and a race does not — while a paging loop adds request-count,
+ * rate-limit and partial-failure surface to a step that must never flake. A
+ * missing or non-numeric `total_count` counts as truncated for the same reason
+ * empty evidence counts as poison: it means "could not rule it out".
+ */
 export async function fetchCacheEntries({ apiUrl, repository, key, token }) {
   // `?key=` narrows the response (documented as a PREFIX filter); the exact
   // comparison still happens in diagnoseCache.
@@ -502,7 +576,9 @@ export async function fetchCacheEntries({ apiUrl, repository, key, token }) {
     `${apiUrl}/repos/${repository}/actions/caches` +
     `?key=${encodeURIComponent(key)}&per_page=100`;
   const body = await githubJson(url, token);
-  return Array.isArray(body?.actions_caches) ? body.actions_caches : [];
+  const entries = Array.isArray(body?.actions_caches) ? body.actions_caches : [];
+  const totalCount = typeof body?.total_count === "number" ? body.total_count : null;
+  return { entries, truncated: totalCount === null || totalCount > entries.length };
 }
 
 function formatBytes(size) {
@@ -550,7 +626,7 @@ function describeEntry(entry) {
  * seeing too.
  */
 function reportPoisoned(finding, { repository }) {
-  const { label, key, evidence } = finding;
+  const { label, key, evidence, racedSuppressed } = finding;
   console.error(`POISONED CACHE: ${label}`);
   console.error(`  key : ${key}`);
   console.error(
@@ -574,6 +650,21 @@ function reportPoisoned(finding, { repository }) {
       `  Entries under this key on refs this run can restore from (${evidence.length}):`,
     );
     for (const entry of evidence) console.error(describeEntry(entry));
+    if (racedSuppressed) {
+      // Without this the report contradicts itself: every entry it just listed
+      // is marked "created after this run started", which is the exact shape
+      // that passes as a race — so an operator reading only the entries would
+      // conclude the guard is broken.
+      console.error(
+        "  Every entry listed above post-dates this run's start, which on a COMPLETE\n" +
+          "  listing would be reported as a concurrent save and pass. It is not passing\n" +
+          "  here, deliberately: one of the diagnostic calls behind this list failed (see\n" +
+          "  the ::warning:: lines above), so the list may be MISSING entries — including\n" +
+          "  an older one on a ref that dropped out of scope when the lookup failed. A\n" +
+          "  set that may be incomplete cannot prove every entry is new, so the verdict\n" +
+          "  stays poisoned. Re-run first, as below: it re-runs the diagnostics too.",
+      );
+    }
     if (evidence.length > 1) {
       console.error(
         "  More than one entry is listed and this script cannot compute its own cache\n" +
@@ -705,6 +796,19 @@ async function main(argv, env) {
     defaultBranch: runContext.defaultBranch,
   });
 
+  // THE HALVES OF `scopeComplete` THAT ARE THE SAME FOR EVERY DECLARED CACHE.
+  //
+  // Both are what BUILT visibleRefs and the age labels, so a failure in either
+  // silently narrows the evidence rather than emptying it — which is precisely
+  // how a partial degradation forges an `every()` over a set the poison was
+  // filtered out of. `defaultBranch` missing drops `refs/heads/main`;
+  // `runStartedAt` missing makes every age label meaningless. Neither may
+  // enable a downgrade.
+  const defaultBranchResolved =
+    typeof runContext.defaultBranch === "string" && runContext.defaultBranch !== "";
+  const runStartedAtResolved =
+    typeof runContext.runStartedAt === "string" && runContext.runStartedAt !== "";
+
   let failed = false;
   const entriesByKey = new Map();
 
@@ -722,18 +826,24 @@ async function main(argv, env) {
           `::warning::cache "${cache.label}": entry details unavailable, so the report ` +
             `below cannot name entries or ids: ${error.message}`,
         );
-        entriesByKey.set(cache.key, []);
+        // `truncated: true` is the load-bearing half. The empty list alone is
+        // safe only by luck of the `evidence.length > 0` conjunct in
+        // diagnoseCache; saying "this listing is not complete" is what makes
+        // the refusal to downgrade explicit rather than incidental.
+        entriesByKey.set(cache.key, { entries: [], truncated: true });
       }
     }
 
+    const listing = entriesByKey.get(cache.key);
     const finding = diagnoseCache({
       label: cache.label,
       key: cache.key,
       hit: cache.hit,
       probe: cache.probe,
-      entries: entriesByKey.get(cache.key),
+      entries: listing.entries,
       visibleRefs,
       runStartedAt: runContext.runStartedAt,
+      scopeComplete: defaultBranchResolved && runStartedAtResolved && !listing.truncated,
     });
 
     if (finding.verdict === "ok") {

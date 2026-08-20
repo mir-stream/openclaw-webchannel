@@ -133,6 +133,15 @@ const DEFAULT_BRANCH_ENTRY = {
   ref: "refs/heads/main",
 };
 
+/**
+ * A concurrent save: this run's own ref, created after the run started.
+ *
+ * Paired with DEFAULT_BRANCH_ENTRY it reproduces the measured fail-open — the
+ * two together are poison plus a race, and dropping the default branch from the
+ * visible-ref set leaves only the race behind.
+ */
+const NEWER_OWN_REF_ENTRY = { ...LIVE_CACHE_ENTRIES[1], id: 6776999002, created_at: AFTER_RUN };
+
 let stubServer;
 
 afterEach(async () => {
@@ -146,23 +155,50 @@ afterEach(async () => {
 /**
  * Stand up a loopback stand-in for the Actions REST API, routing the three
  * paths the guard calls. `actionsCaches` is returned for every key query.
+ *
+ * `fail` takes any of "runs" | "caches" | "repo" and 500s that endpoint ALONE.
+ * PARTIAL degradation is the point: the earlier stub could only be all-healthy
+ * or all-403, and the fail-open it therefore could not express was the guard
+ * downgrading real poison to `raced` when only `GET /repos/{o}/{r}` was down.
+ *
+ * `totalCount` overrides the count reported alongside the entries, which is how
+ * a TRUNCATED page is modelled — the API says "there are N" and hands back
+ * fewer, and the entry it withheld may be the old one that proves poison.
  */
-async function startStubApi({ actionsCaches, repoPayload = REPO_PAYLOAD }) {
+async function startStubApi({
+  actionsCaches,
+  repoPayload = REPO_PAYLOAD,
+  fail = [],
+  totalCount,
+}) {
+  const failing = new Set(fail);
   const requests = [];
   const server = createServer((request, response) => {
     requests.push(request.url);
     response.setHeader("content-type", "application/json");
+    const outage = (which) => {
+      if (!failing.has(which)) return false;
+      response.statusCode = 500;
+      response.end(JSON.stringify({ message: `stub outage: ${which}` }));
+      return true;
+    };
     if (request.url.includes("/actions/runs/")) {
+      if (outage("runs")) return;
       response.end(JSON.stringify(RUN_PAYLOAD));
       return;
     }
     if (request.url.includes("/actions/caches")) {
+      if (outage("caches")) return;
       response.end(
-        JSON.stringify({ total_count: actionsCaches.length, actions_caches: actionsCaches }),
+        JSON.stringify({
+          total_count: totalCount ?? actionsCaches.length,
+          actions_caches: actionsCaches,
+        }),
       );
       return;
     }
     if (request.url === `/repos/${REPOSITORY}`) {
+      if (outage("repo")) return;
       response.end(JSON.stringify(repoPayload));
       return;
     }
@@ -336,8 +372,18 @@ describe("diagnoseCache", () => {
         entries: [],
         visibleRefs,
         runStartedAt: RUN_STARTED_AT,
+        scopeComplete: true,
       }),
-    ).toEqual({ label: "playwright", key: KEY, verdict: "poisoned", evidence: [] });
+    ).toEqual({
+      label: "playwright",
+      key: KEY,
+      verdict: "poisoned",
+      evidence: [],
+      // Not a suppressed downgrade — an empty set never qualified for one, even
+      // with a perfectly complete scope. The two refusals stay distinguishable
+      // so the report does not blame a healthy API for this failure.
+      racedSuppressed: false,
+    });
   });
 
   it("keeps evidence to entries on refs this run can restore from", () => {
@@ -383,9 +429,89 @@ describe("diagnoseCache", () => {
       entries: [{ ...OLDER_LIVE_ENTRY, created_at: AFTER_RUN }],
       visibleRefs,
       runStartedAt: RUN_STARTED_AT,
+      scopeComplete: true,
     });
     expect(finding.verdict).toBe("raced");
     expect(finding.evidence[0].createdAfterRunStarted).toBe(true);
+  });
+
+  it("REFUSES the downgrade when the evidence scope is incomplete", () => {
+    // The fail-open. `every()` over a set that may be MISSING entries proves
+    // nothing, and a partial REST failure is what makes the set short while
+    // still looking like an answer. Same inputs, only the completeness flag
+    // differs — so this pins the conjunct itself rather than any one cause.
+    const shared = {
+      label: "playwright",
+      key: KEY,
+      hit: false,
+      probe: true,
+      entries: [{ ...OLDER_LIVE_ENTRY, created_at: AFTER_RUN }],
+      visibleRefs,
+      runStartedAt: RUN_STARTED_AT,
+    };
+    expect(diagnoseCache({ ...shared, scopeComplete: true }).verdict).toBe("raced");
+
+    const refused = diagnoseCache({ ...shared, scopeComplete: false });
+    expect(refused.verdict).toBe("poisoned");
+    // Flagged so the report can explain itself; the entries it lists all look
+    // like a race, and an unexplained failure over them reads as a broken guard.
+    expect(refused.racedSuppressed).toBe(true);
+  });
+
+  it("refuses the downgrade when scopeComplete is not passed at all", () => {
+    // Fail-safe default. A caller that forgets to certify the scope must not
+    // thereby certify it — absent is not "complete".
+    const finding = diagnoseCache({
+      label: "playwright",
+      key: KEY,
+      hit: false,
+      probe: true,
+      entries: [{ ...OLDER_LIVE_ENTRY, created_at: AFTER_RUN }],
+      visibleRefs,
+      runStartedAt: RUN_STARTED_AT,
+    });
+    expect(finding.verdict).toBe("poisoned");
+    expect(finding.racedSuppressed).toBe(true);
+  });
+
+  it("treats every entry as pre-existing when the run start time is ABSENT", () => {
+    // predatesRun's fail direction on the `started === null` half, isolated.
+    // `scopeComplete: true` is deliberately a lie here — main would compute
+    // false and refuse the downgrade structurally — precisely so this asserts
+    // predatesRun ALONE and cannot pass on the back of that other guard.
+    // The label assertion is the one that bites: it is upstream of every
+    // verdict rule, so no amount of scope-checking can mask it.
+    const finding = diagnoseCache({
+      label: "playwright",
+      key: KEY,
+      hit: false,
+      probe: true,
+      entries: [{ ...OLDER_LIVE_ENTRY, created_at: AFTER_RUN }],
+      visibleRefs,
+      runStartedAt: undefined,
+      scopeComplete: true,
+    });
+    expect(finding.evidence[0].createdAfterRunStarted).toBe(false);
+    expect(finding.verdict).toBe("poisoned");
+  });
+
+  it("treats every entry as pre-existing when run_started_at is UNPARSEABLE", () => {
+    // The gap `scopeComplete` genuinely cannot cover: the runs endpoint
+    // ANSWERED, so completeness is satisfied, but the answer is garbage (a GHES
+    // quirk, a shape change). predatesRun's fail direction is the only thing
+    // between that and a `raced` pass, and here it is the sole defence.
+    const finding = diagnoseCache({
+      label: "playwright",
+      key: KEY,
+      hit: false,
+      probe: true,
+      entries: [{ ...OLDER_LIVE_ENTRY, created_at: AFTER_RUN }],
+      visibleRefs,
+      runStartedAt: "not-a-timestamp",
+      scopeComplete: true,
+    });
+    expect(finding.verdict).toBe("poisoned");
+    expect(finding.evidence[0].createdAfterRunStarted).toBe(false);
   });
 
   it("stays POISONED when even ONE visible entry predates the run", () => {
@@ -646,6 +772,126 @@ describe("cache health CLI against a stub Actions API", () => {
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain("POISONED CACHE: playwright");
     expect(result.stderr).toContain("[created after this run started]");
+  });
+
+  // ─── PARTIAL REST DEGRADATION MUST NOT BUY A PASS ────────────────────────
+  //
+  // Every test in this block feeds the guard a poisoned cache and breaks ONE
+  // diagnostic call. All four must exit non-zero. The measured fail-open they
+  // close: `raced` reasons with `every()` over an evidence list that REST
+  // itself narrowed, so a partly-degraded lookup can hand it a set the poison
+  // was filtered out of — a shorter list still looks like an answer, where a
+  // total outage merely empties it.
+  const POISON_PLUS_RACE = [DEFAULT_BRANCH_ENTRY, NEWER_OWN_REF_ENTRY];
+
+  it("fails on a default-branch poisoned entry while the repo endpoint is HEALTHY", async () => {
+    // The control half of the reviewer's measurement. Both entries are visible,
+    // the old one on `refs/heads/main` predates the run, so `every()` is false
+    // and this is unambiguous poison. Changing ONLY the repo endpoint between
+    // this test and the next is what isolates the defect.
+    const { origin } = await startStubApi({ actionsCaches: POISON_PLUS_RACE });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("POISONED CACHE: playwright");
+    expect(result.stderr).toContain(`actions/caches/${DEFAULT_BRANCH_ENTRY.id}`);
+  });
+
+  it("STILL fails on that entry when the repo endpoint 500s and hides it", async () => {
+    // THE FAIL-OPEN, end to end, with the identical fixtures. `default_branch`
+    // is lost, so `refs/heads/main` drops out of the visible-ref set and the
+    // poisoned entry is filtered out of the evidence — leaving only the newer
+    // `refs/heads/develop` save, over which `every()` is trivially true. Before
+    // `scopeComplete` this printed a `::warning::` asserting every entry was
+    // new and exited 0, passing the one defect the guard exists to catch.
+    const { origin } = await startStubApi({
+      actionsCaches: POISON_PLUS_RACE,
+      fail: ["repo"],
+    });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("POISONED CACHE: playwright");
+    // The report has to explain itself: every entry it lists post-dates the run,
+    // which is the shape that normally passes.
+    expect(result.stderr).toContain("may be MISSING entries");
+    expect(result.stdout).not.toContain("IF THIS WARNING REPEATS");
+  });
+
+  it("STILL fails when the runs endpoint 500s and every entry looks new", async () => {
+    // `run_started_at` is what every age label is computed against, so losing it
+    // makes "created after this run started" unknowable — not false. Two guards
+    // cover this and both must hold: `scopeComplete` refuses structurally, and
+    // predatesRun's fail direction labels every entry as pre-existing.
+    const { origin } = await startStubApi({
+      actionsCaches: [NEWER_OWN_REF_ENTRY],
+      fail: ["runs"],
+    });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).toContain("run's start time is unavailable");
+    expect(result.stderr).toContain("POISONED CACHE: playwright");
+    expect(result.stdout).not.toContain("IF THIS WARNING REPEATS");
+  });
+
+  it("STILL fails when the cache listing endpoint 500s", async () => {
+    // Belt and braces: the listing throws, so the evidence is empty and the
+    // empty-evidence rule already fails this. `scopeComplete` makes the refusal
+    // explicit instead of incidental — see the assumption noted in the report.
+    const { origin } = await startStubApi({
+      actionsCaches: [NEWER_OWN_REF_ENTRY],
+      fail: ["caches"],
+    });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).toContain("entry details unavailable");
+    expect(result.stderr).toContain("POISONED CACHE: playwright");
+    expect(result.stdout).not.toContain("IF THIS WARNING REPEATS");
+  });
+
+  it("STILL fails when the cache listing is TRUNCATED", async () => {
+    // The API says there are two entries and hands back one. The withheld one
+    // may be the old entry that proves poison, so `every()` over the page that
+    // arrived proves nothing. Refusing to downgrade costs at most one falsely
+    // reported poison, which a re-run resolves; paginating would add
+    // rate-limit and partial-failure surface to a step that must not flake.
+    const { origin } = await startStubApi({
+      actionsCaches: [NEWER_OWN_REF_ENTRY],
+      totalCount: 2,
+    });
+
+    const result = await runCli(
+      ["--cache", "playwright", "--key", KEY, "--hit", "false", "--probe", "true",
+        "--probe-key", KEY],
+      cliEnv(origin),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("POISONED CACHE: playwright");
+    expect(result.stderr).toContain("may be MISSING entries");
+    expect(result.stdout).not.toContain("IF THIS WARNING REPEATS");
   });
 
   it("claims only what is proven, and orders the remedy re-run FIRST", async () => {
