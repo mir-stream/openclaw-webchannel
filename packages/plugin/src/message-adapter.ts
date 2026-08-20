@@ -1987,7 +1987,19 @@ export function createProgressDraftController(params: {
         false,
       ),
     streamedVisibleAnswerLaneCount: () =>
-      state.lanes.filter((lane) => lane.streamedVisibleAnswerText).length,
+      // #173: count only lanes that streamed VISIBLE answer text AND actually
+      // reached the client. `resolution === "materialized"` is set solely inside
+      // `sendLaneFrame`'s `if (sent)` branch, so it is true only once a lane
+      // frame successfully shipped. Requiring it closes the false positive where
+      // a lane streams but its progress publish fails on a transient
+      // disconnect: the client never rendered that lane's overwrite, so a
+      // destructive keyframe (which can delete a trailing status/trace bubble)
+      // must not fire. Both real-glitch paths (the boundary rotation and the
+      // `closeAndRotate` divergence fail-safe) leave both lanes materialized at
+      // settlement, so this does not weaken glitch detection.
+      state.lanes.filter(
+        (lane) => lane.streamedVisibleAnswerText && lane.resolution === "materialized",
+      ).length,
     noteLeadingTerminalError: () => {
       void enqueue(
         "leading terminal error",

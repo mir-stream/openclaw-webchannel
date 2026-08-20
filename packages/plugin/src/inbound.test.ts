@@ -2146,6 +2146,30 @@ describe("handleInboundMessage — #173 keyframe resync at settlement", () => {
     expect(keyframes).toHaveLength(0);
   });
 
+  it("does NOT emit a keyframe when lane A streamed but its progress publish failed (never reached the client)", async () => {
+    // Review P1/P2 false positive: lane A streams, but its progress frame fails
+    // on a transient disconnect and never materializes. After reconnect lane B
+    // streams and both finals deliver, so the client only ever rendered [A,B]
+    // correctly — no overwrite occurred. Counting lanes by streamed text ALONE
+    // would see 2 and fire a destructive keyframe that can delete a trailing
+    // status/trace bubble. Requiring `resolution === "materialized"` drops lane
+    // A (it shipped nothing), leaving the count at 1 → no keyframe.
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      sessionMessages: transcriptRows,
+      runImpl: twoStreamedLanesThenTwoFinals,
+    });
+    const { transport, keyframes } = makeFakeTransport();
+    // Lane A's progress publish is the one that fails on the transient
+    // disconnect; every later frame (lane B's stream and both finals) ships.
+    transport.sendProgress = (_sessionKey: string, _id: string, text: string) =>
+      text !== "first ans";
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(keyframes).toHaveLength(0);
+  });
+
   it("does not hang and sends no keyframe when the transcript read never settles", async () => {
     // The read is awaited on purpose (it holds the per-session FIFO so the next
     // turn cannot overtake the keyframe), which puts it on that queue's critical
