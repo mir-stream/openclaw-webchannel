@@ -2164,6 +2164,253 @@ export class WebChannelNATSClient {
         return;
       }
 
+      case "keyframe": {
+        // #173: an AUTHORITATIVE REPLACE, not the additive merge `history` does.
+        // The plugin sends this at settlement when it detected the tool-only-turn
+        // overwrite path corrupted the live view ([A,A,B]). We re-establish ground
+        // truth from the transcript exactly as a fresh reload would — but only for
+        // the REGION the keyframe covers. The plugin sends a tail window (<= the
+        // history limit), so a device that paginated OLDER scrollback in must keep
+        // it; a blanket replace would collapse the timeline to the window. The
+        // keyframe does NOT merge/dedup row-by-row — it REPLACES its covered
+        // region — so there is no per-bubble identity mapping to get wrong.
+        const incoming = Array.isArray(msg.messages) ? msg.messages : [];
+
+        // SENDER INPUT CONTRACT:
+        //  - rows carry unique ids and run oldest→newest;
+        //  - for a given settlement, `turn_settled` must reach the client BEFORE
+        //    the `keyframe`. The sender reads the transcript AT settlement, so
+        //    the frame already carries the settling turn's own user row; the
+        //    client must therefore already know that send ran, or the predicate
+        //    below has no evidence, keeps the local bubble, and renders the
+        //    user's message twice. This one is not an anomaly — reverse the two
+        //    frames and it fires on EVERY settled turn (residual source 5).
+        //
+        // Rebuild the keyframe rows using the SAME ordered, one-bubble-per-row
+        // insert the empty-state history hydration uses (working:false), so the
+        // covered region equals what a reloading device would render. Same row
+        // validation as the `history` reducer above, and the same guarantee it
+        // gets from its own `seen` Set — scoped to what this frame BUILDS: no id
+        // THIS FRAME rebuilds is rendered twice across `keptPrefix ++ rebuilt`.
+        // Two things it does not claim: a duplicate that was already sitting in
+        // the prefix is carried through untouched (`keptPrefix` copies it
+        // verbatim), and the guarantee
+        // does NOT extend to the preserved tail, which may legitimately re-append
+        // a bubble whose row the frame also carries (accepted residual cases 1, 4
+        // and 5 below); that duplicate is the deliberate price of never deleting
+        // a send.
+        //
+        // That reducer seeds `seen` from EXISTING STATE, so one Set buys it both
+        // halves at once. This reducer needs two, because it emits two segments:
+        //  - this in-frame Set stops a frame carrying [A,B,A] from rendering A
+        //    twice within `rebuilt`;
+        //  - the `keptPrefix` filter below stops a row from colliding with a
+        //    bubble that survives IN FRONT of `rebuilt`.
+        // Both are exact-id lookups, and both matter for the same reason: a
+        // duplicate ID is unrepairable afterwards. `upsertMessage` and
+        // `patchBubbleByReceiptKey` patch only the FIRST match, the next
+        // keyframe's anchor `findIndex` would latch the wrong occurrence and
+        // mis-scope its region, and an embedder's React keys collide. Same
+        // receiving-end argument as the empty-frame guard below.
+        //
+        // The FIRST occurrence wins. Under the contract just stated that is the
+        // older copy, so a sender re-emitting a corrected row later in the same
+        // frame has its correction dropped — harmless while the contract holds,
+        // and the contract is what makes it a non-case.
+        //
+        // A row claiming a rendered LOCAL-ONLY id is not transcript material —
+        // that namespace (`u-<n>`) is this client's own, while transcript rows
+        // carry core ids from the envelope (or `h-…` from the history fallback).
+        // Such a row is crafted or a sender bug, so skipping it deletes nothing.
+        // This is what lets `keptPrefix` keep chips with NO carve-out, which is
+        // what makes the no-duplicate-id guarantee above hold unconditionally.
+        const localOnlyIds = new Set(
+          this.state.messages
+            .filter((m) => m.pending === true || m.retracted === true)
+            .map((m) => m.id),
+        );
+
+        const rebuilt: ChatMessage[] = [];
+        const seen = new Set<string>();
+        for (const m of incoming) {
+          if (!m || typeof m !== "object") continue;
+          if (typeof m.id !== "string" || m.id.length === 0) continue;
+          if (m.role !== "user" && m.role !== "agent") continue;
+          if (typeof m.text !== "string") continue;
+          if (localOnlyIds.has(m.id)) continue;
+          if (seen.has(m.id)) continue;
+          seen.add(m.id);
+          rebuilt.push({
+            id: m.id,
+            role: m.role,
+            text: m.text,
+            ts: m.ts,
+            working: false,
+          });
+        }
+
+        // An empty rebuild carries no ground truth to replace anything WITH, and
+        // a replace that finds no anchor wipes the timeline — so a stray or
+        // fully-invalid frame would blank the screen. Guard at the RECEIVING
+        // end, symmetrical with the `history` reducer's empty-frame guard above:
+        // this reducer's failure mode is a white page, and that must not depend
+        // on what any particular sender happens to gate on.
+        if (rebuilt.length === 0) return;
+
+        // The keyframe covers the transcript from its OLDEST row forward. Older
+        // loaded history bubbles carry the SAME transcript ids, so the boundary
+        // lines up: find where this keyframe's oldest row sits in the current
+        // timeline.
+        const oldestKfId = rebuilt[0].id;
+        const anchor = this.state.messages.findIndex((m) => m.id === oldestKfId);
+
+        // No overlap (fresh session, or the device's coverage is shorter than
+        // the window) → anchor -1 → the covered region is the WHOLE timeline. It
+        // happens at most once per keyframe and is accepted — but it resets
+        // essentially everything on screen, so say so. The warning is emitted
+        // BELOW, once `preserved` is known: bubbles the filter keeps are not
+        // dropped, and a count that includes them overstates the reset.
+
+        // Keep strictly-older scrollback the keyframe does NOT cover (everything
+        // before the anchor) EXACTLY as it stands — local chips up there are left
+        // in place rather than swept to the tail (a /stop chip is a permanent
+        // in-timeline marker until `retract()`, so moving it rewrites history the
+        // keyframe never spoke about).
+        //
+        // …minus any bubble whose id this frame also rebuilds. Rendered order can
+        // legitimately diverge from transcript order: this reducer re-appends a
+        // preserved user bubble AT THE TAIL, and once `history` has adopted that
+        // bubble it carries a CANONICAL id. A later keyframe anchoring on that id
+        // then finds intervening canonical rows sitting in front of the anchor —
+        // in `keptPrefix` AND in `rebuilt`. No sender defect required; the
+        // keyframe row is the authoritative copy, so the prefix yields.
+        //
+        // Chips need no carve-out here, and must not have one: `seen` cannot
+        // contain a chip id, because `localOnlyIds` already dropped any row that
+        // claimed one. The filter is therefore uniform, and a chip up here still
+        // stays exactly where it stands — the promise above holds by that skip
+        // rather than by an exception in this line.
+        const keptPrefix = (anchor > 0 ? this.state.messages.slice(0, anchor) : []).filter(
+          (m) => !seen.has(m.id),
+        );
+
+        // PRESERVE, from the COVERED region only, user bubbles the keyframe's
+        // source transcript cannot account for. THE RULE: a covered user bubble
+        // is dropped only when this client holds POSITIVE EVIDENCE that its send
+        // ran and therefore became transcript material — and only a settle
+        // produces that evidence. Everything else is kept. Decided from this
+        // client's own records — never from message text or position, and never
+        // by matching a bubble to a row. Two reasons to keep:
+        //
+        //  (a) A held (pending) or /stop-retracted chip is LOCAL-ONLY: it was
+        //      never published, so no transcript can contain it, and its text
+        //      exists nowhere else — dropping it destroys user input. Neither
+        //      flag can appear on a published bubble (`publish` sets neither, and
+        //      only held entries are ever flipped to `retracted`).
+        //
+        //  (b) A published send with no evidence that it ran. That covers a send
+        //      still in flight (`queued`/`sent`/`accepted`), a #96 control-lane
+        //      publish (`/stop` and the NL abort vocabulary) which sticks at
+        //      `accepted` for the life of the session, and a FAILED one
+        //      (`overloaded`/`closed`/`terminal`/`evicted`/`cancelled`) — a
+        //      failure is simply one more case with no evidence of a run, and
+        //      dropping it would delete the user's text along with the retry
+        //      affordance attached to it. A bubble with no receipt
+        //      (server-hydrated, or an agent row) is not ours to keep.
+        //      `settlementEligible` was the old discriminator here and is GONE:
+        //      it answers "is an outcome COMING?", which is not the question.
+        //      A control-lane send is permanently ineligible, yet in its normal
+        //      case it never ran at all — core's fast-abort consumes it and
+        //      nothing is appended (the fall-through to an ordinary agent turn
+        //      is the OTHER branch of that disjunction; see the `/stop` note in
+        //      `packages/plugin/src/inbound.ts`). Keying on eligibility deleted
+        //      every Stop the user ever pressed.
+        //
+        // The two exclusions are grounded in WHERE the evidence comes from — a
+        // settle — not in a list of state names: `completed` comes from
+        // `turn_settled{outcome:"ok"}`, `failed{turn-failed}` from
+        // `turn_settled{outcome:"error"}`. Do not extend the list with anything
+        // a settle does not emit.
+        //
+        // ACCEPTED RESIDUAL RISK — this predicate's only failure mode is a
+        // DUPLICATE bubble, never a deletion. Five sources:
+        //  1. a coalesced member's `turn_settled` is lost → that send sits at
+        //     `accepted` forever (`promoteAnchor` and the `turn_settled` reducer
+        //     both document that state as reachable) while the keyframe carries
+        //     its row;
+        //  2. `overloaded` returned for a message the agent had ALREADY admitted
+        //     — the live-retry of an unacked id whose accepted-marker was evicted
+        //     (documented in full on the turn-closing hook in
+        //     `receiptTransition`, which is where a terminal receipt outcome
+        //     decides whether to close the turn);
+        //  3. `evicted` is a CLIENT-side unacked-ledger cap drop, NOT evidence of
+        //     non-delivery (see the `evicted` note on that same hook: the message
+        //     may have reached the agent, been coalesced, and be the very id its
+        //     turn settles under) — it is kept because we lack evidence either
+        //     way;
+        //  4. a control-lane send that fell THROUGH to an ordinary agent turn: its
+        //     row is in the transcript, and no settle will ever arrive to promote
+        //     it;
+        //  5. FRAME ORDERING — a `keyframe` that arrives BEFORE the
+        //     `turn_settled` for the settlement that produced it. The frame
+        //     carries the settling turn's own user row, but the bubble is not yet
+        //     `completed`, so there is no evidence it ran and it is kept. Unlike
+        //     1-4 this is not an anomaly: get the order wrong and it fires on
+        //     EVERY settled turn. It is why the ordering is now a stated sender
+        //     obligation (see the SENDER INPUT CONTRACT above). No client-side
+        //     defence here — detecting it needs the snapshot boundary (#197).
+        // In 1-4 the duplicate is permanent for the life of the page: no later
+        // frame removes it. `history` is additive and dedups by id, so it can
+        // never delete the extra bubble; a repeat keyframe re-derives the
+        // identical preserve, because nothing can promote those bubbles: 2 and 3
+        // sit at `failed`, which `receiptAdvances` treats as absolutely terminal,
+        // while 1 and 4 sit at the non-terminal `accepted` with no settle that
+        // can ever name them. Only a RELOAD clears them.
+        // Source 5 is the exception in both directions: the late `turn_settled`
+        // DOES promote the bubble to `completed`, so the NEXT keyframe drops it.
+        // Deliberate even so: a duplicate is fixed by a reload or a later
+        // snapshot, while text that never entered the transcript is gone for good
+        // once deleted — not recoverable by a reload or anything else.
+        //
+        // Order is kept (filter is stable) and these are re-appended at the tail.
+        const covered = anchor >= 0 ? this.state.messages.slice(anchor) : this.state.messages;
+        const preserved = covered.filter((m) => {
+          if (m.role !== "user") return false;
+          // Redundant TODAY — every local chip carries a receiptKey, a pending
+          // one is `queued` and a retracted one is `failed{cancelled}`, so the
+          // rule below already keeps both. Kept deliberately: (a) is an
+          // invariant about local-only TEXT, not a consequence of the sendState
+          // rules, and must not vanish silently if those rules change.
+          if (m.pending === true || m.retracted === true) return true;
+          if (m.receiptKey === undefined) return false;
+          // Keep unless this client holds POSITIVE evidence the send ran.
+          if (m.sendState === "completed") return false;
+          if (m.sendState === "failed" && m.sendFailure?.reason === "turn-failed") return false;
+          return true;
+        });
+
+        // The anchor-miss reset, reported with what this reducer actually KNOWS.
+        // It does NOT know what was lost: an anchor miss frequently rebuilds the
+        // very ids it replaced — including the benign short-coverage case named
+        // above, where the window simply reaches further back than this device
+        // does and nothing goes missing at all. So report sizes, not loss.
+        // `incoming` vs `rebuilt` is the other half of the diagnostic: when a
+        // malformed sender is the problem, the gap between rows RECEIVED and rows
+        // USABLE is what shows it. Counts only — never message text.
+        if (anchor === -1 && this.state.messages.length > 0) {
+          const total = this.state.messages.length;
+          console.warn(
+            `[nats-wrapper] keyframe anchor not found — replacing the whole timeline: ${total} rendered, ${incoming.length} row(s) received (${rebuilt.length} usable), ${preserved.length} local kept`,
+          );
+        }
+
+        // Idempotent: re-applying the same keyframe re-finds the anchor at the
+        // same boundary, so `keptPrefix` ends right before the oldest row and
+        // `rebuilt`/`preserved` re-derive identically, yielding the same array.
+        this.setState({ messages: [...keptPrefix, ...rebuilt, ...preserved] });
+        return;
+      }
+
       case "typing": {
         this.setState({ isTyping: true });
         return;

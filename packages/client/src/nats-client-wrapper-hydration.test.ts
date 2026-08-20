@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
 
@@ -263,5 +263,487 @@ describe("#95 WP B — live timeline converges to the row sequence", () => {
 
     const draftAfter = w.getState().messages.find((m) => m.working === true);
     expect(draftAfter?.id).toBe("draft-1");
+  });
+});
+
+/**
+ * #173 — the keyframe is an AUTHORITATIVE REPLACE of the region it COVERS, not
+ * the additive merge `history` performs and not a blanket wipe. The plugin emits
+ * it at settlement when it detected the tool-only-turn overwrite path corrupted
+ * the live view ([A,A,B]). The client rebuilds the covered region from the rows
+ * exactly as a fresh reload would, keeps any strictly-older paginated scrollback
+ * the window does not carry, and re-appends its local not-yet-transmitted chips.
+ */
+describe("#173 WP — keyframe is an authoritative replace", () => {
+  function keyframe(...messages: Row[]): AnyFrame {
+    return { type: "keyframe", messages };
+  }
+
+  const KEYFRAME_ROWS: Row[] = [
+    { id: "A", role: "agent", text: "A", ts: 1 },
+    { id: "B", role: "agent", text: "B", ts: 2 },
+  ];
+
+  /** The live-corruption shape #173 describes: A finalized twice, then B. */
+  function seedCorruptLiveView(w: WebChannelNATSClient): void {
+    deliver(w, { type: "agent_message", id: "live-1", text: "A" });
+    deliver(w, { type: "agent_message", id: "live-2", text: "A" });
+    deliver(w, { type: "agent_message", id: "live-3", text: "B" });
+    expect(timeline(w)).toEqual(["agent:A", "agent:A", "agent:B"]);
+  }
+
+  it("a keyframe [A,B] over a live [A,A,B] yields [A,B] — the extra bubble is gone", () => {
+    const w = makeWrapper();
+    // Live ids never match transcript ids, so these fixtures take the anchorless
+    // full-replace path and log; absorb it (that fallback has its own test below).
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    seedCorruptLiveView(w);
+
+    deliver(w, keyframe(...KEYFRAME_ROWS));
+
+    expect(timeline(w)).toEqual(["agent:A", "agent:B"]);
+    // Canonical transcript ids and working:false — the corrupt live ids are gone.
+    const messages = w.getState().messages;
+    expect(messages.map((m) => m.id)).toEqual(["A", "B"]);
+    expect(messages.every((m) => m.working === false)).toBe(true);
+    warn.mockRestore();
+  });
+
+  it("ordering and content equal a fresh reload of the same rows", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const live = makeWrapper();
+    seedCorruptLiveView(live);
+    deliver(live, keyframe(...KEYFRAME_ROWS));
+
+    // A cold reload hydrates the SAME rows via history into empty state.
+    const cold = makeWrapper();
+    deliver(cold, history(...KEYFRAME_ROWS));
+
+    expect(timeline(live)).toEqual(timeline(cold));
+    expect(live.getState().messages.map((m) => m.id)).toEqual(
+      cold.getState().messages.map((m) => m.id),
+    );
+    warn.mockRestore();
+  });
+
+  it("preserves paginated older scrollback outside the keyframe window", () => {
+    const w = makeWrapper();
+    // Older scrollback the device paginated in (canonical transcript ids)…
+    deliver(
+      w,
+      history(
+        { id: "older1", role: "user", text: "q1", ts: 1 },
+        { id: "older2", role: "agent", text: "r1", ts: 2 },
+        { id: "older3", role: "user", text: "q2", ts: 3 },
+        { id: "older4", role: "agent", text: "r2", ts: 4 },
+        { id: "older5", role: "user", text: "q3", ts: 5 },
+      ),
+    );
+    // …then the corrupt live tail ([A,A,B]).
+    deliver(w, { type: "agent_message", id: "live-1", text: "A" });
+    deliver(w, { type: "agent_message", id: "live-2", text: "A" });
+    deliver(w, { type: "agent_message", id: "live-3", text: "B" });
+    expect(w.getState().messages.map((m) => m.id)).toEqual([
+      "older1",
+      "older2",
+      "older3",
+      "older4",
+      "older5",
+      "live-1",
+      "live-2",
+      "live-3",
+    ]);
+
+    // The keyframe is a tail window that OVERLAPS at older4 and carries the
+    // corrected tail.
+    deliver(
+      w,
+      keyframe(
+        { id: "older4", role: "agent", text: "r2", ts: 4 },
+        { id: "older5", role: "user", text: "q3", ts: 5 },
+        { id: "A", role: "agent", text: "A", ts: 6 },
+        { id: "B", role: "agent", text: "B", ts: 7 },
+      ),
+    );
+
+    // older1..3 kept (uncovered scrollback), older4/5 rebuilt from the keyframe,
+    // the extra bubble gone — no truncation to the window.
+    expect(w.getState().messages.map((m) => m.id)).toEqual([
+      "older1",
+      "older2",
+      "older3",
+      "older4",
+      "older5",
+      "A",
+      "B",
+    ]);
+  });
+
+  /**
+   * ACCEPTED, not desired: with no anchor there is no boundary to splice at, so
+   * the replace is total — paginated scrollback included. The test carries a real
+   * multi-page backlog rather than one stale bubble so the cost is visible: this
+   * is a scroll-back reset, equivalent to what a reload would show, and it is why
+   * the reducer logs when it happens.
+   */
+  it("falls back to a full replace when the keyframe's oldest id is absent (no overlap)", () => {
+    const w = makeWrapper();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Two pages of older conversation the user scrolled back to load…
+    deliver(
+      w,
+      history(
+        { id: "p2-1", role: "user", text: "q3", ts: 5 },
+        { id: "p2-2", role: "agent", text: "r3", ts: 6 },
+      ),
+    );
+    deliver(
+      w,
+      history(
+        { id: "p1-1", role: "user", text: "q1", ts: 1 },
+        { id: "p1-2", role: "agent", text: "r1", ts: 2 },
+        { id: "p1-3", role: "user", text: "q2", ts: 3 },
+        { id: "p1-4", role: "agent", text: "r2", ts: 4 },
+      ),
+    );
+    // …plus a live bubble. NONE of these ids appear in the keyframe below.
+    deliver(w, { type: "agent_message", id: "live-x", text: "stale" });
+    expect(w.getState().messages).toHaveLength(7);
+
+    deliver(
+      w,
+      keyframe(
+        { id: "N1", role: "user", text: "hi", ts: 7 },
+        { id: "N2", role: "agent", text: "yo", ts: 8 },
+      ),
+    );
+
+    // No overlap → full replace: every paginated page is gone too, not just the
+    // stale live bubble. Nothing here is local, so nothing is preserved.
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["N1", "N2"]);
+    expect(timeline(w)).toEqual(["user:hi", "agent:yo"]);
+    // A whole-timeline reset is not silent. Counts only — never message text.
+    const logged = warn.mock.calls.map((c) => String(c[0]));
+    expect(logged.some((line) => line.includes("keyframe anchor not found"))).toBe(true);
+    expect(
+      logged.some((line) =>
+        line.includes(
+          "replacing the whole timeline: 7 rendered, 2 row(s) received (2 usable), 0 local kept",
+        ),
+      ),
+    ).toBe(true);
+    expect(logged.join("\n")).not.toContain("q1");
+    warn.mockRestore();
+  });
+
+  it("does not log a full-replace warning when there was nothing on screen", () => {
+    const w = makeWrapper();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    deliver(w, keyframe(...KEYFRAME_ROWS));
+
+    // Hydration into empty state replaces nothing — no reset to report.
+    expect(warn).not.toHaveBeenCalled();
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["A", "B"]);
+    warn.mockRestore();
+  });
+
+  /**
+   * An empty (or fully invalid) keyframe carries no ground truth, and this
+   * reducer REPLACES — so applying one blanks the screen. The guard lives here,
+   * at the receiving end, and not in a premise about what senders emit.
+   */
+  it("ignores a keyframe with no usable rows instead of blanking the timeline", () => {
+    for (const frame of [
+      keyframe(),
+      { type: "keyframe" } as AnyFrame,
+      { type: "keyframe", messages: "nope" } as AnyFrame,
+      keyframe({ id: "", role: "agent", text: "x" }, { id: "ok", role: "system", text: "x" }),
+    ]) {
+      const w = makeWrapper();
+      seedCorruptLiveView(w);
+      const before = w.getState().messages;
+
+      deliver(w, frame);
+
+      expect(w.getState().messages).toEqual(before);
+    }
+  });
+
+  /**
+   * A /stop chip is a permanent in-timeline marker (it survives until
+   * `retract()`), so one sitting in the region the keyframe does NOT cover must
+   * stay where the user left it. Sweeping every local chip to the tail rewrites
+   * scrollback the keyframe never spoke about.
+   */
+  it("leaves a retracted chip in the uncovered prefix exactly where it sits", () => {
+    const w = makeWrapper();
+    deliver(w, history({ id: "o1", role: "user", text: "q1", ts: 1 }));
+    // A held send the user then cancelled with /stop → a retracted marker
+    // (text preserved), followed by the published /stop itself.
+    deliver(w, { type: "typing" });
+    w.send("later question");
+    w.send("/stop");
+    const chip = w.getState().messages.find((m) => m.retracted === true)!;
+    expect(chip.text).toBe("later question");
+    // …then a later turn's replies land after it.
+    deliver(w, { type: "agent_message", id: "o2", text: "r1" });
+    deliver(w, { type: "agent_message", id: "o3", text: "r2" });
+    const before = w.getState().messages.map((m) => m.id);
+    expect(before.slice(-2)).toEqual(["o2", "o3"]);
+
+    // The keyframe covers only that later turn (anchor = o2).
+    deliver(
+      w,
+      keyframe(
+        { id: "o2", role: "agent", text: "r1", ts: 2 },
+        { id: "o3", role: "agent", text: "r2", ts: 3 },
+      ),
+    );
+
+    // Untouched: same ids, same order — the chip did NOT move to the tail.
+    expect(w.getState().messages.map((m) => m.id)).toEqual(before);
+    const after = w.getState().messages.find((m) => m.id === chip.id)!;
+    expect(after.retracted).toBe(true);
+    expect(after.text).toBe("later question");
+  });
+
+  it("applying the same keyframe twice is idempotent", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const w = makeWrapper();
+    seedCorruptLiveView(w);
+
+    deliver(w, keyframe(...KEYFRAME_ROWS));
+    const once = w.getState().messages;
+    deliver(w, keyframe(...KEYFRAME_ROWS));
+
+    expect(w.getState().messages).toEqual(once);
+    warn.mockRestore();
+  });
+
+  it("preserves a pending local user chip at the tail", () => {
+    const w = makeWrapper();
+    // These rows share no id with the live view → the full-replace warning fires;
+    // absorb it (the fallback itself has its own test above).
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    seedCorruptLiveView(w);
+    // A turn is in flight (typing), so the next send is HELD as a local-only
+    // pending chip — never on the wire, absent from the transcript a keyframe
+    // rebuilds from.
+    deliver(w, { type: "typing" });
+    w.send("unsent draft");
+    const pending = w
+      .getState()
+      .messages.find((m) => m.pending === true && m.role === "user");
+    expect(pending).toBeDefined();
+
+    deliver(w, keyframe(...KEYFRAME_ROWS));
+
+    const after = w.getState().messages;
+    // Agent rows rebuilt from the keyframe, the pending chip re-appended at the tail.
+    expect(after.map((m) => `${m.role}:${m.text}`)).toEqual([
+      "agent:A",
+      "agent:B",
+      "user:unsent draft",
+    ]);
+    const tail = after[after.length - 1];
+    expect(tail.pending).toBe(true);
+    expect(tail.id).toBe(pending!.id);
+
+    // The reset warning reports sizes, not loss — 4 rendered, 2 rows in, 1 local
+    // kept. Counts only — never text.
+    const logged = warn.mock.calls.map((c) => String(c[0]));
+    expect(
+      logged.some((line) =>
+        line.includes(
+          "replacing the whole timeline: 4 rendered, 2 row(s) received (2 usable), 1 local kept",
+        ),
+      ),
+    ).toBe(true);
+    expect(logged.join("\n")).not.toContain("unsent draft");
+    warn.mockRestore();
+  });
+
+  /**
+   * The COVERED-region counterpart of the uncovered-prefix chip test above, and
+   * the shape #173's own scenario produces: the user hits /stop mid-turn, and the
+   * keyframe emitted for that turn covers from its first row — so the chip sits
+   * INSIDE the replaced region. It is local-only text the transcript can never
+   * carry, so it survives, re-appended at the tail.
+   */
+  it("preserves a retracted chip that sits inside the covered region", () => {
+    const w = makeWrapper();
+    deliver(w, history({ id: "o1", role: "agent", text: "r0", ts: 1 }));
+    // A turn is running; the held send is then cancelled by /stop → a retracted
+    // marker keeping the user's text.
+    deliver(w, { type: "typing" });
+    w.send("later question");
+    w.send("/stop");
+    const chip = w.getState().messages.find((m) => m.retracted === true)!;
+    expect(chip.text).toBe("later question");
+    const stop = w.getState().messages.find((m) => m.text === "/stop")!;
+    // That turn's replies land AFTER the chip, so the keyframe below (anchored at
+    // o1, the oldest rendered row) covers the chip's position.
+    deliver(w, { type: "agent_message", id: "o2", text: "r1" });
+
+    deliver(
+      w,
+      keyframe(
+        { id: "o1", role: "agent", text: "r0", ts: 1 },
+        { id: "o2", role: "agent", text: "r1", ts: 2 },
+      ),
+    );
+
+    // Rebuilt rows first, then the preserved locals in their original order: the
+    // retracted chip, then the /stop that retracted it (a control-lane send with
+    // no evidence it ran, kept by the same rule).
+    const after = w.getState().messages;
+    expect(after.map((m) => m.id)).toEqual(["o1", "o2", chip.id, stop.id]);
+    const kept = after.find((m) => m.id === chip.id)!;
+    expect(kept.retracted).toBe(true);
+    expect(kept.text).toBe("later question");
+  });
+
+  /**
+   * The reducer REPLACES, so a duplicate id it renders is unrepairable: a later
+   * `history` dedups by id and can only ADD, leaving [A,B,A] → [A,B,C,A]. The
+   * `history` reducer's in-frame `seen` Set makes that impossible there; this
+   * reducer must hold the same line.
+   */
+  it("renders a repeated id once when a keyframe carries it twice", () => {
+    const w = makeWrapper();
+    deliver(
+      w,
+      keyframe(
+        { id: "A", role: "agent", text: "A", ts: 1 },
+        { id: "B", role: "agent", text: "B", ts: 2 },
+        { id: "A", role: "agent", text: "A", ts: 1 },
+      ),
+    );
+
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["A", "B"]);
+    expect(timeline(w)).toEqual(["agent:A", "agent:B"]);
+  });
+
+  /**
+   * The other half of "no id renders twice": a row whose id sits in the uncovered
+   * prefix.
+   *
+   * This fixture INDUCES the divergence directly, with an out-of-order `history`
+   * frame — the shortest way to put a keyframe row in front of the anchor. It is
+   * not a claim that a sender defect is required: the reachable-without-a-defect
+   * chain (a preserved bubble re-appended at the tail, adopted onto a canonical
+   * id by `history`, then a later keyframe anchoring there) is documented on
+   * `keptPrefix` in the reducer. What is asserted here is the reducer's response,
+   * which is identical either way.
+   *
+   * A duplicate ID is worse than a duplicate bubble: `upsertMessage` and
+   * `patchBubbleByReceiptKey` patch only the first match, and the next keyframe's
+   * anchor lookup latches the wrong occurrence.
+   */
+  it("does not render a keyframe row that is already in the uncovered prefix", () => {
+    const w = makeWrapper();
+    // Rendered order diverges from transcript order: core-X sits FIRST on screen
+    // while the keyframe below places it second.
+    deliver(
+      w,
+      history(
+        { id: "core-X", role: "user", text: "x", ts: 3 },
+        { id: "core-A", role: "agent", text: "a", ts: 1 },
+        { id: "core-B", role: "agent", text: "b", ts: 2 },
+      ),
+    );
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["core-X", "core-A", "core-B"]);
+
+    // Anchors at core-A (index 1) → core-X lands in keptPrefix AND in rebuilt.
+    deliver(
+      w,
+      keyframe(
+        { id: "core-A", role: "agent", text: "a", ts: 1 },
+        { id: "core-X", role: "user", text: "x", ts: 3 },
+        { id: "core-B", role: "agent", text: "b", ts: 2 },
+      ),
+    );
+
+    // The keyframe row is authoritative, so the prefix copy yields — core-X once.
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["core-A", "core-X", "core-B"]);
+  });
+
+  /**
+   * …but the prefix filter must never become a deletion path for local text. A
+   * frame carrying a local id (crafted, or a sender bug) must neither remove the
+   * unsent chip from the prefix — the one thing this reducer may never do — NOR
+   * render that id twice. Both are covered by dropping the ROW: the `u-<n>`
+   * namespace is the client's own, so such a row is never transcript material.
+   */
+  it("keeps a prefix chip exactly once when the keyframe carries its id", () => {
+    const w = makeWrapper();
+    deliver(w, history({ id: "o1", role: "agent", text: "r0", ts: 1 }));
+    // A held chip, then a later turn's reply after it.
+    deliver(w, { type: "typing" });
+    w.send("unsent secret");
+    const chip = w.getState().messages.find((m) => m.pending === true)!;
+    deliver(w, { type: "agent_message", id: "o2", text: "r1" });
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["o1", chip.id, "o2"]);
+
+    // The frame anchors at o2 (so the chip is in the PREFIX) and also carries the
+    // chip's own local id.
+    deliver(
+      w,
+      keyframe(
+        { id: "o2", role: "agent", text: "r1", ts: 2 },
+        { id: chip.id, role: "user", text: "unsent secret", ts: 3 },
+      ),
+    );
+
+    // The chip is still there, still local, still where the user left it — and
+    // rendered ONCE. The frame's row for that id was dropped, not merged.
+    const after = w.getState().messages;
+    expect(after.map((m) => m.id)).toEqual(["o1", chip.id, "o2"]);
+    expect(after.filter((m) => m.id === chip.id)).toHaveLength(1);
+    const kept = after.find((m) => m.id === chip.id && m.pending === true);
+    expect(kept).toBeDefined();
+    expect(kept!.text).toBe("unsent secret");
+  });
+
+  /**
+   * The BENIGN anchor miss: the keyframe window simply reaches further back than
+   * this device does, so `findIndex` misses and every rendered id is rebuilt —
+   * nothing is lost. The warning must not claim otherwise.
+   */
+  it("reports sizes, not loss, when a short-coverage anchor miss loses nothing", () => {
+    const w = makeWrapper();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    deliver(
+      w,
+      history(
+        { id: "core-19", role: "agent", text: "r19", ts: 19 },
+        { id: "core-20", role: "agent", text: "r20", ts: 20 },
+      ),
+    );
+
+    deliver(
+      w,
+      keyframe(
+        { id: "core-18", role: "agent", text: "r18", ts: 18 },
+        { id: "core-19", role: "agent", text: "r19", ts: 19 },
+        { id: "core-20", role: "agent", text: "r20", ts: 20 },
+      ),
+    );
+
+    // Anchor missed, yet nothing went missing — the rows superset the timeline.
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["core-18", "core-19", "core-20"]);
+    const logged = warn.mock.calls.map((c) => String(c[0]));
+    expect(
+      logged.some((line) =>
+        line.includes(
+          "replacing the whole timeline: 2 rendered, 3 row(s) received (3 usable), 0 local kept",
+        ),
+      ),
+    ).toBe(true);
+    // No claim of loss, and no message text.
+    expect(logged.join("\n")).not.toContain("dropping");
+    expect(logged.join("\n")).not.toContain("r19");
+    warn.mockRestore();
   });
 });

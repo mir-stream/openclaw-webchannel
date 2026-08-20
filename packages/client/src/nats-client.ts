@@ -167,10 +167,53 @@ export type InboundMessage = {
     // `history`). Applied as a REPLACE, but ONLY over the region these rows
     // cover: from the oldest row forward the client discards its rendered
     // agent/settled-user bubbles and rebuilds from these rows, as a fresh reload
-    // would. Strictly-older scrollback outside that region is RETAINED — the
-    // sender ships a bounded tail window (the history limit), so a blanket
-    // replace would collapse a paginated timeline down to that window. Corrects
-    // the tool-only-turn live-overwrite glitch ([A,A,B]).
+    // would. Corrects the tool-only-turn live-overwrite glitch ([A,A,B]).
+    //
+    // The region is found by locating the OLDEST row's id in the rendered
+    // timeline. The two exceptions to a plain replace both follow from that, and
+    // the sender obligation below follows from WHEN these rows are read:
+    //
+    //  - Strictly-older scrollback before that boundary is RETAINED — except for
+    //    a bubble whose id these rows also carry, which yields to the row so no
+    //    id is rendered twice. That precedence REVERSES for the reader's own
+    //    local-only chips: a row claiming one of those ids is dropped instead,
+    //    because that id namespace belongs to the reader and no transcript row
+    //    can legitimately hold one. Unsent text is never displaced by a row.
+    //    The sender ships a bounded tail window (the
+    //    history limit), so a blanket replace would collapse a paginated timeline
+    //    down to that window. This holds ONLY when the boundary is found: an id
+    //    that matches nothing on screen (long live session, or ids the reader
+    //    synthesized) leaves no boundary to splice at, and the covered region is
+    //    then the WHOLE timeline — equivalent to a reload EXCEPT that the
+    //    reader's own unsettled sends are still preserved per the next bullet.
+    //    Accepted, and logged by the reducer rather than silent.
+    //
+    //  - ORDERING OBLIGATION: for a given settlement, send `turn_settled` BEFORE
+    //    the `keyframe` it produced. These rows are read AT settlement, so they
+    //    already contain the settling turn's own user row; a reader that has not
+    //    yet seen the settle has no evidence that send ran, keeps its local
+    //    bubble, and renders the user's message twice. Reversed, this fires on
+    //    every settled turn, not just in anomalies.
+    //
+    //  - Of the reader's OWN sends, the replace discards a rendered user bubble
+    //    only when it knows that send ran — that is, a settle named it
+    //    (`turn_settled`). Everything else of its own is KEPT: local-only chips
+    //    (held or /stop-retracted, never published), sends still in flight,
+    //    control-lane sends that never settle, and failed sends. (A user bubble
+    //    the reader did not send — hydrated from `history`, or another device's
+    //    message — carries no local send record, so inside the covered region it
+    //    is simply rebuilt from these rows.) The sender reads the transcript at
+    //    settlement, so a turn dispatched after that read, a message the agent never admitted,
+    //    and an abort core consumed without an agent run are all absent from
+    //    these rows. The residual error is therefore always a DUPLICATE bubble,
+    //    never a deletion. Where the send's state is already terminal, that
+    //    duplicate persists for the life of the page — no later `history`
+    //    (additive, id-deduped) or `keyframe` (re-derives the same preserve)
+    //    removes it, only a RELOAD does. Where a settle is merely LATE (the
+    //    ordering obligation above), it promotes the bubble on arrival and the
+    //    next `keyframe` drops it. Either way the trade is the right one: a
+    //    duplicate is fixed by a reload or a later snapshot, while text that
+    //    never entered the transcript is unrecoverable once deleted.
     | "keyframe"
     // P0-3: slash-command discovery catalog (carries `commands`).
     | "commands"

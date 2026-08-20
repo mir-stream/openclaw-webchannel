@@ -1927,6 +1927,283 @@ describe("WebChannelNATSClient — P0-4 terminal settles the live-turn UI", () =
 });
 
 // ---------------------------------------------------------------------------
+// #173: the keyframe is an authoritative replace, and a send released MID-TURN
+// is transmitted before it lands. This needs the real socket (a `deliver()`-style
+// harness cannot publish or ack), because the bubble at risk is precisely the one
+// that went out on the wire: the release publishes it, the ack accepts it, and
+// only THEN does the keyframe arrive.
+// ---------------------------------------------------------------------------
+describe("#173 — a keyframe must not delete an already-transmitted send", () => {
+  it("keeps the released-and-acked bubble at the tail with its sendState", async () => {
+    const h = await connectWrapper();
+    // A hydrated transcript row, so the keyframe below has an anchor to find.
+    deliverOut(h.K, {
+      type: "history",
+      messages: [{ id: "core-1", role: "user", text: "first question", ts: 1 }],
+    });
+    // A turn is in flight → the send is HELD (local-only, never on the wire).
+    deliverOut(h.K, { type: "typing" });
+    await settle();
+    h.wrapper.send("my next question");
+    await settle();
+    const held = userBubble(h.wrapper, "my next question")!;
+    expect(held.pending).toBe(true);
+    expect(h.received).not.toContain(held.wireId); // nothing published yet
+
+    // The turn's replies land. The first final clears isTyping → the release gate
+    // publishes the held message, and the server acks it.
+    deliverOut(h.K, { type: "agent_message", id: "live-1", text: "A" });
+    deliverOut(h.K, { type: "agent_message", id: "live-2", text: "A" });
+    deliverOut(h.K, { type: "agent_message", id: "live-3", text: "B" });
+    await settle();
+    const released = userBubble(h.wrapper, "my next question")!;
+    expect(released.pending).toBe(false);
+    expect(released.sendState).toBe("accepted");
+    expect(h.received).toContain(released.wireId); // ON THE WIRE, to the agent
+
+    // Settlement of the turn that was already running, then the keyframe the
+    // plugin read at that settlement. The plugin dispatches turns serially, so a
+    // message released during a turn cannot appear in that turn's transcript read.
+    deliverOut(h.K, { type: "turn_settled", turnId: "prior-turn", outcome: "ok" });
+    deliverOut(h.K, {
+      type: "keyframe",
+      messages: [
+        { id: "core-1", role: "user", text: "first question", ts: 1 },
+        { id: "core-A", role: "agent", text: "A", ts: 2 },
+        { id: "core-B", role: "agent", text: "B", ts: 3 },
+      ],
+    });
+    await settle();
+
+    // The duplicate agent bubble is gone, and the transmitted question is STILL
+    // rendered — at the tail, where the answer it is about to receive will follow.
+    const after = h.wrapper.getState().messages;
+    expect(after.map((m) => `${m.role}:${m.text}`)).toEqual([
+      "user:first question",
+      "agent:A",
+      "agent:B",
+      "user:my next question",
+    ]);
+    const tail = after[after.length - 1];
+    expect(tail.id).toBe(released.id);
+    expect(tail.wireId).toBe(released.wireId);
+    expect(tail.sendState).toBe("accepted"); // still awaiting ITS turn_settled
+    h.wrapper.close();
+  });
+
+  // The UPPER bound of the preservation predicate. A send whose turn actually
+  // settled is transcript material like any other row: the keyframe owns it, and
+  // preserving it too would render it twice. Nothing else in the suite pins this
+  // edge — without it, widening the predicate to `completed` goes unnoticed.
+  it("does not re-append a send whose own turn settled — the keyframe row is the only copy", async () => {
+    const h = await connectWrapper();
+    // An older row, so the keyframe below anchors instead of full-replacing.
+    deliverOut(h.K, {
+      type: "history",
+      messages: [{ id: "core-0", role: "agent", text: "earlier", ts: 0 }],
+    });
+    await settle();
+    h.wrapper.send("first question");
+    await settle();
+    const sent = userBubble(h.wrapper, "first question")!;
+    expect(sent.sendState).toBe("accepted");
+
+    // ITS turn settles → the send is promoted (a real promotion, by wireId).
+    deliverOut(h.K, { type: "turn_settled", turnId: sent.wireId!, outcome: "ok" });
+    await settle();
+    expect(userBubble(h.wrapper, "first question")!.sendState).toBe("completed");
+
+    // The keyframe now carries that very message as a transcript row.
+    deliverOut(h.K, {
+      type: "keyframe",
+      messages: [
+        { id: "core-0", role: "agent", text: "earlier", ts: 0 },
+        { id: "core-1", role: "user", text: "first question", ts: 1 },
+        { id: "core-A", role: "agent", text: "A", ts: 2 },
+      ],
+    });
+    await settle();
+
+    const after = h.wrapper.getState().messages;
+    expect(after.map((m) => `${m.role}:${m.text}`)).toEqual([
+      "agent:earlier",
+      "user:first question",
+      "agent:A",
+    ]);
+    expect(after.filter((m) => m.text === "first question")).toHaveLength(1);
+    h.wrapper.close();
+  });
+
+  // Regression for the control-lane hole. A `/stop`-shaped send publishes on the
+  // control lane and never receives a `turn_settled`, so it sits at `accepted`
+  // forever. In its NORMAL case core's fast-abort consumes it and no agent run
+  // happens, so NOTHING is appended to the transcript (the fall-through to an
+  // ordinary turn is the other branch of that disjunction — see the `/stop` note
+  // in packages/plugin/src/inbound.ts). Keying preservation on "will an outcome
+  // arrive?" deleted this bubble permanently; the rule is "did it run?", and we
+  // have no evidence it did — so it is kept, and kept exactly once.
+  it("keeps a fast-abort-consumed control-lane send, exactly once", async () => {
+    const h = await connectWrapper();
+    // An older row, so the keyframe below anchors instead of full-replacing.
+    deliverOut(h.K, {
+      type: "history",
+      messages: [{ id: "core-0", role: "agent", text: "earlier", ts: 0 }],
+    });
+    // A turn is running; "stop" is abort-shaped, so it BYPASSES the hold and
+    // publishes immediately on the control lane.
+    deliverOut(h.K, { type: "typing" });
+    await settle();
+    h.wrapper.send("stop");
+    await settle();
+    const abort = userBubble(h.wrapper, "stop")!;
+    expect(h.received).toContain(abort.wireId!); // published
+    expect(abort.sendState).toBe("accepted"); // …and this is its terminal state
+
+    // A later ordinary turn runs and settles.
+    deliverOut(h.K, { type: "agent_message", id: "live-1", text: "A" });
+    deliverOut(h.K, { type: "turn_settled", turnId: "prior-turn", outcome: "ok" });
+    await settle();
+    expect(userBubble(h.wrapper, "stop")!.sendState).toBe("accepted"); // never promoted
+
+    // Core's fast-abort consumed it, so the transcript has NO row for it — the
+    // covering keyframe carries only the turn it aborted.
+    const rows = [
+      { id: "core-0", role: "agent", text: "earlier", ts: 0 },
+      { id: "core-A", role: "agent", text: "A", ts: 2 },
+    ];
+    deliverOut(h.K, { type: "keyframe", messages: rows });
+    await settle();
+    expect(h.wrapper.getState().messages.map((m) => `${m.role}:${m.text}`)).toEqual([
+      "agent:earlier",
+      "agent:A",
+      "user:stop",
+    ]);
+
+    // …and it does not accumulate: an unpromotable bubble is re-derived, not re-added.
+    deliverOut(h.K, { type: "keyframe", messages: rows });
+    await settle();
+    const after = h.wrapper.getState().messages;
+    expect(after.filter((m) => m.text === "stop")).toHaveLength(1);
+    expect(after.map((m) => m.id)).toEqual(["core-0", "core-A", abort.id]);
+    expect(after[after.length - 1].sendState).toBe("accepted");
+    h.wrapper.close();
+  });
+
+  // A FAILED send is normally absent from the transcript — an `inbound_rejected`
+  // under retained-work pressure never reached a turn at all — so the keyframe
+  // cannot account for it and dropping it would delete the user's typed text
+  // along with the retry affordance.
+  const rejectedSetup = async (): Promise<{
+    h: Setup;
+    rejected: ChatMessage;
+    rows: Record<string, unknown>[];
+  }> => {
+    const h = await connectWrapper();
+    // An older row, so the keyframe below anchors instead of full-replacing.
+    deliverOut(h.K, {
+      type: "history",
+      messages: [{ id: "core-0", role: "agent", text: "earlier", ts: 0 }],
+    });
+    await settle();
+    h.wrapper.send("over capacity");
+    await settle();
+    const sent = userBubble(h.wrapper, "over capacity")!;
+    expect(sent.sendState).toBe("accepted");
+
+    // Ingress rejects it: this send never became transcript material.
+    deliverOut(h.K, { type: "inbound_rejected", ids: [sent.wireId!], reason: "overloaded" });
+    await settle();
+    const rejected = userBubble(h.wrapper, "over capacity")!;
+    expect(rejected.sendState).toBe("failed");
+    expect(rejected.sendFailure?.reason).toBe("overloaded");
+
+    // The covering keyframe — anchored on the rendered row, and (correctly)
+    // carrying no row for the rejected text.
+    const rows = [
+      { id: "core-0", role: "agent", text: "earlier", ts: 0 },
+      { id: "core-1", role: "user", text: "a later message", ts: 1 },
+      { id: "core-A", role: "agent", text: "reply", ts: 2 },
+    ];
+    return { h, rejected, rows };
+  };
+
+  it("keeps a send the agent rejected at ingress — the transcript cannot carry it", async () => {
+    const { h, rejected, rows } = await rejectedSetup();
+    deliverOut(h.K, { type: "keyframe", messages: rows });
+    await settle();
+
+    const after = h.wrapper.getState().messages;
+    expect(after.map((m) => `${m.role}:${m.text}`)).toEqual([
+      "agent:earlier",
+      "user:a later message",
+      "agent:reply",
+      "user:over capacity",
+    ]);
+    const tail = after[after.length - 1];
+    expect(tail.id).toBe(rejected.id);
+    expect(tail.text).toBe("over capacity");
+    expect(tail.sendState).toBe("failed");
+    expect(tail.sendFailure?.reason).toBe("overloaded"); // retry affordance intact
+    h.wrapper.close();
+  });
+
+  // The UPPER bound of the (c) branch: `turn-failed` is the one failure reason
+  // produced BY a settle, so its turn provably ran and the keyframe owns the row.
+  // Without this, keeping every failure unconditionally would go unnoticed.
+  it("does not re-append a turn-failed send — its turn ran, so the keyframe owns it", async () => {
+    const h = await connectWrapper();
+    // An older row, so the keyframe below anchors instead of full-replacing.
+    deliverOut(h.K, {
+      type: "history",
+      messages: [{ id: "core-0", role: "agent", text: "earlier", ts: 0 }],
+    });
+    await settle();
+    h.wrapper.send("first question");
+    await settle();
+    const sent = userBubble(h.wrapper, "first question")!;
+    expect(sent.sendState).toBe("accepted");
+
+    // ITS turn was admitted, ran, and settled with an error.
+    deliverOut(h.K, { type: "turn_settled", turnId: sent.wireId!, outcome: "error" });
+    await settle();
+    const failed = userBubble(h.wrapper, "first question")!;
+    expect(failed.sendState).toBe("failed");
+    expect(failed.sendFailure?.reason).toBe("turn-failed");
+
+    // …so the keyframe DOES carry it as a canonical row.
+    deliverOut(h.K, {
+      type: "keyframe",
+      messages: [
+        { id: "core-0", role: "agent", text: "earlier", ts: 0 },
+        { id: "core-1", role: "user", text: "first question", ts: 1 },
+        { id: "core-A", role: "agent", text: "sorry, that failed", ts: 2 },
+      ],
+    });
+    await settle();
+
+    const after = h.wrapper.getState().messages;
+    expect(after.filter((m) => m.text === "first question")).toHaveLength(1);
+    expect(after.map((m) => m.id)).toEqual(["core-0", "core-1", "core-A"]);
+    h.wrapper.close();
+  });
+
+  // A preserved failure must not accumulate: re-applying the same keyframe
+  // re-derives the identical array.
+  it("keeps the rejected send exactly once across a repeated keyframe", async () => {
+    const { h, rejected, rows } = await rejectedSetup();
+    deliverOut(h.K, { type: "keyframe", messages: rows });
+    await settle();
+    deliverOut(h.K, { type: "keyframe", messages: rows });
+    await settle();
+
+    const after = h.wrapper.getState().messages;
+    expect(after.filter((m) => m.text === "over capacity")).toHaveLength(1);
+    expect(after.map((m) => m.id)).toEqual(["core-0", "core-1", "core-A", rejected.id]);
+    h.wrapper.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // T-sl: the additive turn_settled.outcome survives an envelope seal→open
 // round-trip (AAD is routing-only; the outcome rides inside the ciphertext).
 // ---------------------------------------------------------------------------
