@@ -46,6 +46,20 @@ jobs:
     # the exposure and the CI cost both disappear. Do not move this back.
     runs-on: ubuntu-latest
 
+    # Declared at JOB level, not repository level. The repository's default
+    # workflow-token permission is `read`, which grants contents/metadata/
+    # packages read but NOT `actions` — so the cache-health guard below (which
+    # lists this repository's cache entries over the REST API) would 403 without
+    # this block. Spelling both scopes out also NARROWS the token on what is now
+    # a public repository: an explicit block replaces the default set entirely,
+    # so this job carries read on exactly these two and nothing else.
+    # publish.yml is deliberately untouched — it carries the OIDC publish
+    # credentials and its own minimal permissions block, and no cache-hygiene
+    # check may be able to redden the release lane.
+    permissions:
+      contents: read
+      actions: read
+
     # Pin the Node.js version — must match the engines.node range declared
     # in each published package.json.
     env:
@@ -83,7 +97,10 @@ jobs:
       #    which is why every later step — the run AND step 7's collection —
       #    resolves the binary identically.
       # ──────────────────────────────────────────────────────────────────────
+      #    The `id` is what makes the action's `cache-hit`/`cache-key` outputs
+      #    reachable by the cache-health guard in step 4c.
       - name: Install nats-server (pinned, cached)
+        id: nats
         uses: ./.github/actions/install-nats-server
 
       # ──────────────────────────────────────────────────────────────────────
@@ -110,14 +127,152 @@ jobs:
       # dial seam.  playwright-core is bundled with the `openclaw` dependency;
       # we use its CLI to download and cache the managed Chromium binary.
       # ──────────────────────────────────────────────────────────────────────
+      # The key AND the path are defined ONCE, here, because both are read in
+      # more than one place (the cache step, the lookup-only probe below, and —
+      # for the key — the cache-health guard). A duplicated hashFiles()
+      # expression is a key that drifts the first time one copy is edited, and a
+      # guard checking a key nothing writes is worse than no guard.
+      #
+      # The path is exactly as load-bearing as the key: GitHub matches a cache
+      # by (KEY, VERSION, REF), and `version` hashes the raw `path:` STRING. A
+      # duplicated path therefore drifts into a different cache version — and
+      # unlike key drift, which the guard detects (`--probe-key` != `--key` is a
+      # hard error), path drift is invisible from the script and produces a
+      # PERMANENT false POISONED: it recurs on every re-run, so the remedy's own
+      # "re-run first" discriminator reports poison confirmed and an operator
+      # deletes a healthy 263 MB cache to unblock merges. The nats probe already
+      # avoids this by reading $NATS_SERVER_DIR on both sides.
+      #
+      # Both strings are byte-identical to the literals they replace, so the
+      # live entry keeps matching. `~` must stay literal — tilde expansion does
+      # not occur inside double quotes, and an expanded /home/runner path is a
+      # different string and so a different cache version. Safe at this position
+      # because the cache step already sits AFTER `npm ci`, so the hashed file
+      # exists.
+      - name: Define Playwright cache key and path
+        run: |
+          echo "PLAYWRIGHT_CACHE_KEY=playwright-chromium-${{ hashFiles('node_modules/openclaw/node_modules/playwright-core/package.json') }}" >> "$GITHUB_ENV"
+          echo "PLAYWRIGHT_CACHE_PATH=~/.cache/ms-playwright" >> "$GITHUB_ENV"
+
       - name: Cache Playwright browsers
         id: cache-playwright
         uses: actions/cache@v4
         with:
-          path: ~/.cache/ms-playwright
+          path: ${{ env.PLAYWRIGHT_CACHE_PATH }}
           # Key includes the playwright-core version so the cache invalidates
           # when playwright is upgraded in the openclaw package.
-          key: playwright-chromium-${{ hashFiles('node_modules/openclaw/node_modules/playwright-core/package.json') }}
+          key: ${{ env.PLAYWRIGHT_CACHE_KEY }}
+
+      # Lookup-only probe for the poisoned-cache guard in 4c. GitHub matches a
+      # cache by (KEY, VERSION, REF), and `version` is a private hash of the
+      # cached PATH plus the compression method — so "an entry exists under this
+      # key" (all the REST API can tell us) is NOT "an entry exists that this
+      # run could have restored". Edit `path:` above and every older entry keeps
+      # the key while becoming permanently unrestorable, which is healthy, and
+      # which a key-only check would report as poison and order deleted.
+      #
+      # We do not reconstruct that hash — we ASK THE ACTION. Same path, same
+      # key, so the same version, and `lookup-only: true` answers existence
+      # without downloading anything.
+      #
+      # >>> `path:` AND `key:` BELOW MUST RESOLVE FROM THE SAME $GITHUB_ENV
+      # >>> DEFINITIONS THE CACHE STEP ABOVE USES. <<< Both come from the
+      # "Define Playwright cache key and path" step, so there is ONE definition
+      # of each rather than two copies to hand-synchronise. Do not inline either
+      # one back here: a different path string is a different cache VERSION,
+      # which would silently turn this into the answer to a question nobody
+      # asked — and unlike a drifted key, a drifted path is undetectable from
+      # the guard script.
+      #
+      # Inert on the happy path: gated on the primary NOT reporting a hit, so a
+      # restored cache never pays for it.
+      #
+      # BOTH outputs are threaded to the guard, and the second is not redundant.
+      # `cache-hit` is "" on a genuine MISS as well as when the step is skipped
+      # — actions/cache sets it only to "true" on an exact match ("`cache-hit`
+      # is intentionally not set to `false` here", restoreImpl.ts, actions/cache
+      # issue 1466). So an empty `cache-hit` cannot tell a cold key from a probe
+      # that never ran. `cache-primary-key` can: restoreImpl records it BEFORE
+      # the miss return, so it is non-empty whenever the step ran, and empty
+      # only when it was skipped.
+      - name: Probe the Playwright cache at this run's version
+        id: probe-playwright
+        if: steps.cache-playwright.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.PLAYWRIGHT_CACHE_PATH }}
+          key: ${{ env.PLAYWRIGHT_CACHE_KEY }}
+          lookup-only: true
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 4c. Catch a POISONED cache entry — a defect that is otherwise invisible.
+      #
+      #     When an entry exists under a key but cannot be extracted, tar fails,
+      #     actions/cache SWALLOWS the failure and prints the exact same "Cache
+      #     not found for input keys" a cold key prints. The guarded install
+      #     step re-provisions from the network, the job stays green, and the
+      #     save at the end fails because the key is already taken — so the
+      #     broken entry holds that key FOREVER and re-burns the download every
+      #     run. The last instance survived four green runs at ~13s + 263 MB
+      #     apiece and was found only by reading logs by hand.
+      #
+      #     The fingerprint is "reported a MISS, but a lookup-only probe at the
+      #     SAME path and key — and therefore the same cache version — finds an
+      #     entry anyway". Both booleans are produced right here in the job;
+      #     they are what decides. The REST cache list is DIAGNOSTIC ONLY: it
+      #     turns a failure into an actionable message (which entries, on which
+      #     refs, at which versions, and their `id`, since deleting by `?key=`
+      #     would take out healthy siblings on other refs). Every REST failure
+      #     is a warning, never a verdict — a gate that reddens because
+      #     api.github.com hiccuped defends nothing.
+      #
+      #     Placed BEFORE "Install Playwright Chromium" on purpose: fail fast
+      #     rather than after paying the re-download the cache was meant to
+      #     prevent.
+      #
+      #     setup-node's internal npm cache is deliberately NOT covered. Its key
+      #     format is GitHub's private implementation detail, and reconstructing
+      #     it here would rot into a check of a key nothing writes.
+      # ──────────────────────────────────────────────────────────────────────
+      # The nats probe cannot sit next to the cache step it mirrors — that step
+      # lives inside .github/actions/install-nats-server. It is keyed on the
+      # action's exported `cache-key` and pathed on $NATS_SERVER_DIR — and the
+      # composite's own "Resolve install dir and cache key" step is the single
+      # definition of BOTH, writing the path to $GITHUB_ENV and the key to
+      # $GITHUB_OUTPUT before the cache step consumes them. Reading them back
+      # here therefore reproduces the same two strings, and so the same cache
+      # version.
+      #
+      # >>> `path:` AND `key:` BELOW MUST KEEP RESOLVING FROM THAT ONE STEP.
+      # >>> DO NOT INLINE EITHER. <<< A different path string is a different
+      # version, and this probe would then answer a question nobody asked. If
+      # the $GITHUB_ENV export is ever removed or renamed, this resolves to the
+      # empty string and the probe silently starts reporting on a different
+      # path — the two files have to be edited together.
+      - name: Probe the nats-server cache at this run's version
+        id: probe-nats
+        if: steps.nats.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.NATS_SERVER_DIR }}
+          key: ${{ steps.nats.outputs.cache-key }}
+          lookup-only: true
+
+      - name: Verify cache entries are healthy (poisoned-cache guard)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node scripts/check-cache-health.mjs \
+            --cache nats \
+            --key "${{ steps.nats.outputs.cache-key }}" \
+            --hit "${{ steps.nats.outputs.cache-hit }}" \
+            --probe "${{ steps.probe-nats.outputs.cache-hit }}" \
+            --probe-key "${{ steps.probe-nats.outputs.cache-primary-key }}" \
+            --cache playwright \
+            --key "${{ env.PLAYWRIGHT_CACHE_KEY }}" \
+            --hit "${{ steps.cache-playwright.outputs.cache-hit }}" \
+            --probe "${{ steps.probe-playwright.outputs.cache-hit }}" \
+            --probe-key "${{ steps.probe-playwright.outputs.cache-primary-key }}"
 
       - name: Install Playwright Chromium
         if: steps.cache-playwright.outputs.cache-hit != 'true'
