@@ -9,6 +9,25 @@ inputs:
     # server version silently changes what the real-server suites test against.
     default: "v2.14.0"
 
+# Exported so a caller can audit the cache the way `actions/cache@v4` itself
+# cannot: that action exposes ONLY `cache-hit` — there is no
+# `cache-primary-key` / `cache-matched-key` output on it, so the key cannot be
+# read back off the step and has to be handed out explicitly here.
+#
+# `cache-key` is the SAME expression the cache step below is keyed on, and
+# `inputs.version` above stays the one place the pinned version is written. The
+# two spellings of the key template must be edited together: a `cache-key` that
+# drifted from the key actually written would make the caller's poisoned-cache
+# guard check a key nothing ever saves — green, and meaningless, which is the
+# precise failure that guard exists to end.
+outputs:
+  cache-hit:
+    description: Whether the pinned nats-server binary was restored from cache.
+    value: ${{ steps.cache-nats.outputs.cache-hit }}
+  cache-key:
+    description: The cache key this action restores and saves under.
+    value: nats-server-${{ inputs.version }}-linux-amd64-toolcache
+
 # NO SUDO ANYWHERE IN THIS ACTION.
 #
 # Installing under $RUNNER_TOOL_CACHE and exporting it via $GITHUB_PATH needs no

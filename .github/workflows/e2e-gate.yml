@@ -46,6 +46,20 @@ jobs:
     # the exposure and the CI cost both disappear. Do not move this back.
     runs-on: ubuntu-latest
 
+    # Declared at JOB level, not repository level. The repository's default
+    # workflow-token permission is `read`, which grants contents/metadata/
+    # packages read but NOT `actions` — so the cache-health guard below (which
+    # lists this repository's cache entries over the REST API) would 403 without
+    # this block. Spelling both scopes out also NARROWS the token on what is now
+    # a public repository: an explicit block replaces the default set entirely,
+    # so this job carries read on exactly these two and nothing else.
+    # publish.yml is deliberately untouched — it carries the OIDC publish
+    # credentials and its own minimal permissions block, and no cache-hygiene
+    # check may be able to redden the release lane.
+    permissions:
+      contents: read
+      actions: read
+
     # Pin the Node.js version — must match the engines.node range declared
     # in each published package.json.
     env:
@@ -83,7 +97,10 @@ jobs:
       #    which is why every later step — the run AND step 7's collection —
       #    resolves the binary identically.
       # ──────────────────────────────────────────────────────────────────────
+      #    The `id` is what makes the action's `cache-hit`/`cache-key` outputs
+      #    reachable by the cache-health guard in step 4c.
       - name: Install nats-server (pinned, cached)
+        id: nats
         uses: ./.github/actions/install-nats-server
 
       # ──────────────────────────────────────────────────────────────────────
@@ -110,6 +127,17 @@ jobs:
       # dial seam.  playwright-core is bundled with the `openclaw` dependency;
       # we use its CLI to download and cache the managed Chromium binary.
       # ──────────────────────────────────────────────────────────────────────
+      # The key is defined ONCE, here, because it is now read in two places (the
+      # cache step and the cache-health guard). A duplicated hashFiles()
+      # expression is a key that drifts the first time one copy is edited — and
+      # a guard checking a key nothing writes is worse than no guard. Safe at
+      # this position because the cache step already sits AFTER `npm ci`, so the
+      # hashed file exists; the produced string is byte-identical to the inline
+      # expression it replaces, so the live 263 MB entry keeps matching.
+      - name: Define Playwright cache key
+        run: |
+          echo "PLAYWRIGHT_CACHE_KEY=playwright-chromium-${{ hashFiles('node_modules/openclaw/node_modules/playwright-core/package.json') }}" >> "$GITHUB_ENV"
+
       - name: Cache Playwright browsers
         id: cache-playwright
         uses: actions/cache@v4
@@ -117,7 +145,47 @@ jobs:
           path: ~/.cache/ms-playwright
           # Key includes the playwright-core version so the cache invalidates
           # when playwright is upgraded in the openclaw package.
-          key: playwright-chromium-${{ hashFiles('node_modules/openclaw/node_modules/playwright-core/package.json') }}
+          key: ${{ env.PLAYWRIGHT_CACHE_KEY }}
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 4c. Catch a POISONED cache entry — a defect that is otherwise invisible.
+      #
+      #     When an entry exists under a key but cannot be extracted, tar fails,
+      #     actions/cache SWALLOWS the failure and prints the exact same "Cache
+      #     not found for input keys" a cold key prints. The guarded install
+      #     step re-provisions from the network, the job stays green, and the
+      #     save at the end fails because the key is already taken — so the
+      #     broken entry holds that key FOREVER and re-burns the download every
+      #     run. The last instance survived four green runs at ~13s + 263 MB
+      #     apiece and was found only by reading logs by hand.
+      #
+      #     The fingerprint is "reported a MISS, but an entry under that exact
+      #     key already exists and is visible to this run" — the only signal
+      #     that separates poison from a genuinely cold key, and it lives in the
+      #     REST cache list, not in this job's log. The script is ref-aware (an
+      #     entry on a branch this run cannot restore from proves nothing) and
+      #     ignores entries created after this run started (a concurrent job may
+      #     legitimately create one mid-run).
+      #
+      #     Placed BEFORE "Install Playwright Chromium" on purpose: fail fast
+      #     rather than after paying the re-download the cache was meant to
+      #     prevent.
+      #
+      #     setup-node's internal npm cache is deliberately NOT covered. Its key
+      #     format is GitHub's private implementation detail, and reconstructing
+      #     it here would rot into a check of a key nothing writes.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Verify cache entries are healthy (poisoned-cache guard)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node scripts/check-cache-health.mjs \
+            --cache nats \
+            --key "${{ steps.nats.outputs.cache-key }}" \
+            --hit "${{ steps.nats.outputs.cache-hit }}" \
+            --cache playwright \
+            --key "${{ env.PLAYWRIGHT_CACHE_KEY }}" \
+            --hit "${{ steps.cache-playwright.outputs.cache-hit }}"
 
       - name: Install Playwright Chromium
         if: steps.cache-playwright.outputs.cache-hit != 'true'
