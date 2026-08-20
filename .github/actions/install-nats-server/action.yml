@@ -67,8 +67,10 @@ runs:
         # about a different path.
         echo "NATS_SERVER_DIR=$DIR" >> "$GITHUB_ENV"
         echo "$DIR" >> "$GITHUB_PATH"
-        # THE ONLY PLACE THE CACHE KEY TEMPLATE IS WRITTEN. The cache step below
-        # is keyed on this output and so is this action's exported `cache-key`,
+        # THE ONLY PLACE THE CACHE KEY TEMPLATE IS WRITTEN. BOTH cache steps
+        # below are keyed on this output and so is this action's exported
+        # `cache-key` — which is what makes the probe reproduce the primary's
+        # (key, version) pair rather than merely resemble it,
         # so the key the caller's poisoned-cache guard checks and the key this
         # action actually saves under cannot come apart. Bumped (-toolcache)
         # because the old key's entries were saved with an absolute

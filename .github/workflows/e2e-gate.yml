@@ -55,7 +55,13 @@ jobs:
     # so this job carries read on exactly these two and nothing else.
     # publish.yml is deliberately untouched — it carries the OIDC publish
     # credentials and its own minimal permissions block, and no cache-hygiene
-    # check may be able to redden the release lane.
+    # check may be able to redden the release lane. It DOES share the
+    # install-nats-server composite, and therefore now runs the lookup-only
+    # probe on a nats cache miss — but that cannot fail it: the guard script is
+    # invoked only here, and @actions/cache downgrades every non-ValidationError
+    # to a warning (the very swallowing this guard exists to detect), while the
+    # ValidationError paths are pre-cleared by the primary cache step in the
+    # same composite using identical path and key values.
     permissions:
       contents: read
       actions: read
@@ -218,8 +224,10 @@ jobs:
       #
       #     The fingerprint is "reported a MISS, but a lookup-only probe at the
       #     SAME path and key — and therefore the same cache version — finds an
-      #     entry anyway". Both booleans are produced right here in the job;
-      #     they are what decides. The REST cache list is DIAGNOSTIC ONLY: it
+      #     entry anyway". Both booleans are produced inside this job — the
+      #     playwright pair by the two steps just above, the nats pair inside
+      #     .github/actions/install-nats-server, where the probe sits adjacent
+      #     to the cache step it mirrors. They are what decides. The REST cache list is DIAGNOSTIC ONLY: it
       #     turns a failure into an actionable message (which entries, on which
       #     refs, at which versions, and their `id`, since deleting by `?key=`
       #     would take out healthy siblings on other refs). Every REST failure
