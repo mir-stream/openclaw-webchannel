@@ -166,6 +166,22 @@ type DeferredAngleMarkerTail = {
 
 type AssistantDraftLane = {
   generation: number;
+  /**
+   * #172: this lane's SOUND per-message identity — core's 1-based
+   * `assistantMessageIndex` for the assistant message this lane carries. Stamped
+   * by `handleAssistantMessageBoundary` from a boundary counter that ticks on
+   * EVERY `onAssistantMessageStart` (including the swallowed first), so message A
+   * = 1, B = 2, matching core. A lane the fail-safe `closeAndRotate` created
+   * WITHOUT a boundary callback is left undefined on purpose: it has no sound
+   * identity, so its block cannot be matched and degrades to independent
+   * delivery (recovery preserved).
+   *
+   * DELIBERATELY SEPARATE from the barrier/reservation system, which keys off
+   * `lane.generation` via the knowingly-off-by-one `assistantMessageIndexMatchesLane`
+   * (:1401). This field is used ONLY by `laneForAssistantMessageIndex` for the
+   * #172 block-suppression decision and never feeds ordering.
+   */
+  assistantMessageIndex?: number;
   /** Assigned only after a successful first wire frame for this lane. */
   id?: string;
   /** A provisional id is tentative for the duration of one send transaction. */
@@ -304,6 +320,14 @@ type ProgressDraftState = {
   emptyPredecessorTimer?: ReturnType<typeof setTimeout>;
   lastProgressSentAt: number;
   firstBoundarySeen: boolean;
+  /**
+   * #172: count of `onAssistantMessageStart` boundaries observed this turn,
+   * including the swallowed first one. Reproduces core's 1-based
+   * `assistantMessageIndex` (the Nth boundary ⇔ core index N) and is stamped
+   * onto the lane that boundary opens. Fail-safe rotations have no boundary and
+   * do not tick it, so their lanes stay unstamped.
+   */
+  assistantMessageBoundaryCount: number;
   lateReservationEpochOpen: boolean;
   nextTokenSequence: number;
   nextDeliverySequence: number;
@@ -622,6 +646,7 @@ export function createProgressDraftController(params: {
     lines: [],
     lastProgressSentAt: 0,
     firstBoundarySeen: false,
+    assistantMessageBoundaryCount: 0,
     lateReservationEpochOpen: true,
     nextTokenSequence: 0,
     nextDeliverySequence: 0,
@@ -952,6 +977,19 @@ export function createProgressDraftController(params: {
     state.lanes.filter(
       (lane) => lane.streamedVisibleAnswerText && lane.resolution === "materialized",
     );
+
+  // #172: the lane carrying core's assistant message `assistantMessageIndex`, by
+  // the sound per-message stamp (NOT the barrier system's generation mapping).
+  // Read-only. Undefined for an unstamped index (no boundary opened a lane for
+  // it — e.g. a fail-safe rotation) or an indexless block.
+  const laneForAssistantMessageIndex = (
+    assistantMessageIndex: number | undefined,
+  ): AssistantDraftLane | undefined => {
+    if (assistantMessageIndex === undefined) return undefined;
+    return state.lanes.find(
+      (lane) => lane.assistantMessageIndex === assistantMessageIndex,
+    );
+  };
 
   const laneOrderResolved = (lane: AssistantDraftLane): boolean => {
     if (!lane.closed) return false;
@@ -1873,11 +1911,22 @@ export function createProgressDraftController(params: {
           //    counter can at worst cause one spurious rotation, and an empty
           //    lane emits no bubble at all (§6.2-3, M6). A stray empty lane is
           //    not the same order of defect as deleted text.
+          // #172: tick the boundary counter on EVERY callback — the swallowed
+          // first one is a real `onAssistantMessageStart`, and core counts it —
+          // then stamp the lane this boundary opens with the resulting 1-based
+          // index. The first boundary opens the current (gen 0) lane = message A
+          // = index 1; every later boundary rotates a new lane and stamps that.
+          // This identity is separate from the barrier system (see the lane
+          // field docblock); it only drives #172 block suppression.
+          state.assistantMessageBoundaryCount += 1;
+          const boundaryIndex = state.assistantMessageBoundaryCount;
           if (!state.firstBoundarySeen) {
             state.firstBoundarySeen = true;
+            currentLane().assistantMessageIndex = boundaryIndex;
             return;
           }
           closeAndRotate();
+          currentLane().assistantMessageIndex = boundaryIndex;
         },
         undefined,
       );
@@ -1958,6 +2007,54 @@ export function createProgressDraftController(params: {
             kind: isNotice(input) ? "notice" : "block",
           });
           if (!input.text) return false;
+          // #172: a block carries NO content the partials did not already stream
+          // (core feeds the same visible text to `onPartialReply` and the block
+          // chunker). So when this block's own lane has streamed that content and
+          // will render it, delivering it again via `sendIndependent` duplicates
+          // the bubble (2 messages → 4 bubbles). Suppress the wire frame in that
+          // case — bookkeeping above (disposition + barriers) is untouched, so
+          // the ordering/release gate is unaffected.
+          //
+          // The match uses the sound per-message stamp (see the lane field and
+          // boundary-counter docblocks), NOT the barrier system's generation
+          // mapping.
+          //
+          // PREDICATE = `streamedVisibleAnswerText && !laneTerminalSuppressed`,
+          // i.e. the lane streamed visible answer text and is either MATERIALIZED
+          // or merely THROTTLE-PENDING (streamed but its progress frame is still
+          // held by the 600ms throttle), EXCLUDING only a lane whose send has
+          // actually FAILED (`laneTerminalSuppressed`). Do NOT tighten this back
+          // to `resolution === "materialized"`: blocks arrive MID-TURN during the
+          // throttle window, so message ≥2's lane is still `open` (its leading
+          // progress frame is throttled — only the FIRST lane emits leading-edge
+          // when `lastProgressSentAt === 0`) when its block lands. Requiring
+          // `materialized` there would fail to suppress and silently re-open #172
+          // for every non-first message (the common tool-using / multi-message
+          // case). A throttle-pending lane's text still reaches the wire via the
+          // throttle timer or the drain settle, so suppressing its block loses
+          // nothing.
+          //
+          // Every other shape falls through to independent delivery UNCHANGED:
+          // an indexless block, a stamp with no matching lane, a lane the
+          // fail-safe rotated (unstamped), or a lane whose frame FAILED to ship
+          // (`laneTerminalSuppressed`) — the last preserves failed-lane recovery
+          // (M13g). If that lane's deferred settle would also fail, the block's
+          // own `sendIndependent` shares the transport and fails too, so no
+          // recovery is forfeited by suppressing a merely-pending lane.
+          //
+          // Return `false` (the text-less/no-op contract, :~1975): no NEW visible
+          // bubble left this seam. It does NOT make the turn answer-less — the
+          // plugin's own `answerDelivered` is set for blocks independently at the
+          // deliver seam (inbound.ts), and core's streamed-answer tracking keys
+          // off the delivery call completing, not off this return.
+          const targetLane = laneForAssistantMessageIndex(input.assistantMessageIndex);
+          if (
+            targetLane &&
+            targetLane.streamedVisibleAnswerText &&
+            !laneTerminalSuppressed(targetLane)
+          ) {
+            return false;
+          }
           emitHeldLaneTextBeforeIndependentDelivery();
           return sendIndependent(input.text, input.assistantMessageIndex);
         },

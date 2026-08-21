@@ -1942,6 +1942,75 @@ describe("handleInboundMessage — #173 collapse-aware final routing", () => {
 
 
 /**
+ * #172 — a partial-streamed message's authorized block is REDUNDANT with the
+ * lane its partials already streamed (core feeds the same visible text to
+ * `onPartialReply` and the block chunker). Delivering the block independently
+ * double-renders the message (2 messages → 4 bubbles).
+ *
+ * This exercises the REAL inbound seam end to end: `onAssistantMessageStart`
+ * drives the controller's own boundary stamping, and each block's
+ * `assistantMessageIndex` flows through `deliveryAssistantMessageIndex(info)`
+ * exactly as production does. The indices are core's REAL 1-based ordinals for a
+ * tool-interleaved turn (A=1, tool-only T=2 consumed, B=3) — NOT hand-forced to
+ * match the stamp — so this test fails if the stamp and the seam index disagree
+ * (drift) OR if a message-≥2 lane's block is not suppressed (the throttle-window
+ * regression: only the FIRST lane materializes leading-edge, so a `materialized`
+ * predicate would leave B double-bubbled).
+ */
+describe("handleInboundMessage — #172 redundant block suppression", () => {
+  const ordinary = { type: "user_message" as const, text: "do the thing" };
+
+  it("[text A][tool-only T][text B] partial+block: A and B each render ONE bubble, no independent duplicate, B not lost", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      runImpl: async (turn) => {
+        // Message A: its boundary (core idx → 1), its partial, then core
+        // re-delivers A's already-streamed text as an authorized block carrying
+        // core's 1-based ordinal 1.
+        turn.replyOptions?.onAssistantMessageStart?.();
+        turn.replyOptions?.onPartialReply?.({ text: "A answer" });
+        await turn.delivery.deliver(
+          { text: "A answer" },
+          { kind: "block", assistantMessageIndex: 1 },
+        );
+        // Tool-only middle message T: fires its own boundary (core idx → 2) but
+        // streams no answer text and emits no answer block.
+        turn.replyOptions?.onAssistantMessageStart?.();
+        // Message B: boundary (core idx → 3), partial, then B's block carrying
+        // core's ordinal 3 — NOT 2. The plugin must independently arrive at the
+        // same stamp for B's lane by counting boundaries (including the tool-only
+        // one) for suppression to fire.
+        turn.replyOptions?.onAssistantMessageStart?.();
+        turn.replyOptions?.onPartialReply?.({ text: "B answer" });
+        await turn.delivery.deliver(
+          { text: "B answer" },
+          { kind: "block", assistantMessageIndex: 3 },
+        );
+      },
+    });
+    const { transport, finalizes, progress } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    const allFrames = [...progress, ...finalizes];
+    const laneAId = allFrames.find((f) => f.text === "A answer")!.id;
+    const laneBId = allFrames.find((f) => f.text === "B answer")!.id;
+    // A and B each render, on distinct lane ids.
+    expect(laneAId).toBeDefined();
+    expect(laneBId).toBeDefined();
+    expect(laneAId).not.toBe(laneBId);
+    // B is not lost.
+    expect(allFrames.some((f) => f.text === "B answer")).toBe(true);
+    // Exactly two bubble ids in the whole turn — the two lanes. A third id would
+    // be an independent (redundant) block bubble: the #172 regression. Both
+    // blocks were suppressed (A materialized leading-edge; B throttle-pending but
+    // streamed and not failed → still suppressed).
+    expect(new Set(allFrames.map((f) => f.id))).toEqual(new Set([laneAId, laneBId]));
+  });
+});
+
+
+/**
  * #87 — a provider-rejected turn must settle `error`, not `ok`.
  *
  * Core does NOT throw when the provider rejects: it absorbs the failure and
