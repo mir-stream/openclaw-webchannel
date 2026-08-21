@@ -157,6 +157,10 @@ export type InboundMessage = {
     // durable history. `argKeys` are argument KEY NAMES only — never values.
     | "tool_activity"
     | "turn_settled"
+    // #212 (Phase 3): the plugin's authoritative ordered set of the turn's agent
+    // ANSWER bubbles (carries `answers` + `remove`, keyed by `turnId`). Additive
+    // and safely ignorable by an old client.
+    | "turn_snapshot"
     | "approval_request"
     | "approval_resolved"
     // #15: authoritative pending-approval snapshot (carries `approvals`).
@@ -213,6 +217,18 @@ export type InboundMessage = {
   decision?: string;
   /** Transcript rows on a `history` (additive merge) frame. */
   messages?: Array<{ id: string; role: string; text: string; ts?: number }>;
+  /**
+   * #212: on a `turn_snapshot` frame, the plugin's authoritative ordered agent
+   * ANSWER bubbles for the turn (each `{id, text}`). The client re-declares this
+   * wire type (zero-dep package), so a new field here needs no plugin import.
+   */
+  answers?: Array<{ id: string; text: string }>;
+  /**
+   * #212: on a `turn_snapshot` frame, the bubble ids the plugin mis-routed answer
+   * content onto (overflow finals; recovery blocks now represented in `answers`).
+   * The client removes ONLY these and preserves every other turn agent bubble.
+   */
+  remove?: string[];
   /** #15: the still-pending approval set on an `approval_snapshot` frame. */
   approvals?: Array<{
     id: string;

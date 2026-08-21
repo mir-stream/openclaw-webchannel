@@ -516,6 +516,15 @@ export class NatsChannel implements WebChannelPeerChannel {
     return this.sendToPeer(peerId, { type: "turn_settled", turnId, outcome });
   }
 
+  sendTurnSnapshot(
+    peerId: string,
+    turnId: string,
+    answers: Array<{ id: string; text: string }>,
+    remove: string[],
+  ): boolean {
+    return this.sendToPeer(peerId, { type: "turn_snapshot", turnId, answers, remove });
+  }
+
   /**
    * P0-6: toggle the typing-indicator wire frame for this account's channel.
    * Called once at channel start (index-nats) with the account's resolved

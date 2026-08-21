@@ -222,6 +222,12 @@ function makeFakeTransport(options?: {
   settles: Array<"ok" | "error">;
   /** #99: the full settle frames, in emission order — turnId matters per member. */
   settleFrames: Array<{ turnId: string; outcome: "ok" | "error" }>;
+  /** #212: the turn_snapshot frames, in emission order. */
+  snapshotFrames: Array<{
+    turnId: string;
+    answers: Array<{ id: string; text: string }>;
+    remove: string[];
+  }>;
 } {
   const finalizes: Array<{
     id: string;
@@ -233,6 +239,11 @@ function makeFakeTransport(options?: {
   const typing: string[] = [];
   const settles: Array<"ok" | "error"> = [];
   const settleFrames: Array<{ turnId: string; outcome: "ok" | "error" }> = [];
+  const snapshotFrames: Array<{
+    turnId: string;
+    answers: Array<{ id: string; text: string }>;
+    remove: string[];
+  }> = [];
   const toolActivities: Array<{
     sessionKey: string;
     id: string;
@@ -285,6 +296,15 @@ function makeFakeTransport(options?: {
       }
       return !options?.failSettleFor?.includes(turnId);
     },
+    sendTurnSnapshot: (
+      _sessionKey: string,
+      turnId: string,
+      answers: Array<{ id: string; text: string }>,
+      remove: string[],
+    ) => {
+      snapshotFrames.push({ turnId, answers, remove });
+      return true;
+    },
     sendProgress: (_sessionKey: string, id: string, text: string) => {
       progress.push({ id, text });
       return true;
@@ -308,7 +328,7 @@ function makeFakeTransport(options?: {
     sendApprovalResolved: () => true,
     sendApprovalSnapshot: () => true,
   } as WebChannelPeerChannel;
-  return { transport, finalizes, texts, progress, toolActivities, typing, settles, settleFrames };
+  return { transport, finalizes, texts, progress, toolActivities, typing, settles, settleFrames, snapshotFrames };
 }
 
 const userMessage = { type: "user_message" as const, text: "/stop" };

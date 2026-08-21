@@ -76,6 +76,25 @@ export type OutboundWsMessage =
       argKeys?: string[];
     }
   | { type: "turn_settled"; turnId: string; outcome: "ok" | "error" }
+  /**
+   * #212 (Phase 3, targeted): the plugin's authoritative, ordered set of the
+   * turn's AGENT ANSWER bubbles, emitted at drain (after the buffered-final
+   * flush, before `turn_settled`). `answers` is the answer lanes in the plugin's
+   * generation order — `id` reuses a lane's materialized wire id or a freshly
+   * minted id for a lane that streamed but never reached the wire (failed-frame
+   * recovery); `text` is each lane's STREAMED answer text, immune to a
+   * mis-routed final top-up. `remove` names the bubble ids the plugin KNOWS it
+   * mis-routed answer content onto (overflow independents; recovery blocks whose
+   * lane is now in `answers`). The client replaces ONLY these — every other
+   * turn agent bubble (notices, errors, adopted history) is preserved. Additive
+   * and safely ignorable by an old client (no protocol bump).
+   */
+  | {
+      type: "turn_snapshot";
+      turnId: string;
+      answers: Array<{ id: string; text: string }>;
+      remove: string[];
+    }
   | ({ type: "approval_request" } & ApprovalRequestPayload)
   | { type: "approval_resolved"; id: string; decision: ApprovalDecision }
   | { type: "approval_snapshot"; approvals: ApprovalRequestPayload[]; resolved?: Array<{ id: string; decision: ApprovalDecision }> }
@@ -115,6 +134,12 @@ export interface WebChannelPeerChannel {
     },
   ): boolean;
   sendTurnSettled(peerId: string, turnId: string, outcome: "ok" | "error"): boolean;
+  sendTurnSnapshot(
+    peerId: string,
+    turnId: string,
+    answers: Array<{ id: string; text: string }>,
+    remove: string[],
+  ): boolean;
   sendTyping(peerId: string): boolean;
   sendHistory(peerId: string, messages: HistoryMessage[]): boolean;
   sendApprovalRequest(peerId: string, request: ApprovalRequestPayload): boolean;
@@ -131,6 +156,7 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendReasoning(_peerId: string, _id: string, _turnId: string, _text: string): boolean { return false; }
   sendToolActivity(_peerId: string, _activity: { id: string; turnId: string; name?: string; phase?: string; status?: string; summary?: string; argKeys?: string[] }): boolean { return false; }
   sendTurnSettled(_peerId: string, _turnId: string, _outcome: "ok" | "error"): boolean { return false; }
+  sendTurnSnapshot(_peerId: string, _turnId: string, _answers: Array<{ id: string; text: string }>, _remove: string[]): boolean { return false; }
   sendTyping(_peerId: string): boolean { return false; }
   sendHistory(_peerId: string, _messages: HistoryMessage[]): boolean { return false; }
   sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload): boolean { return false; }

@@ -1463,6 +1463,99 @@ export class WebChannelNATSClient {
    * upserts are coming; if `turnInFlight` drops as a result, the end-of-frame
    * `maybeRelease()` releases held messages.
    */
+  /**
+   * #212 (Phase 3, targeted): reconcile the live turn's AGENT ANSWER bubbles to
+   * the plugin's authoritative `turn_snapshot`. The plugin owns per-message
+   * identity; this is a PURE VIEW of its `answers` (ordered {id,text}) with a
+   * `remove` set naming the bubbles it mis-routed answer content onto.
+   *
+   * The contract is EXPLICIT, never a blanket "drop everything not listed":
+   *  - `answers` bubbles are upserted by id (existing bubble updated in place; an
+   *    id we do not hold yet is MINTED — a lane that streamed but whose wire
+   *    frames failed, e.g. the #215 mid-lane B recovery) and then reordered into
+   *    snapshot order among the slots answer bubbles already occupy;
+   *  - `remove` ids are dropped (an overflow final, or a recovery block now
+   *    represented by an `answers` lane);
+   *  - EVERYTHING else is untouched: user bubbles (receipts/held/sendState),
+   *    notices/errors, an adopted durable-history agent row that shares the turn,
+   *    and every non-answer agent bubble keeps its slot — only answer bubbles
+   *    reorder, and only among themselves.
+   * Case X is unaffected: its tool bubble is neither in `answers` (it never
+   * streamed) nor in `remove`, so it is preserved exactly as before.
+   */
+  private applyTurnSnapshot(msg: InboundMessage): void {
+    const turnId = msg.turnId;
+    if (typeof turnId !== "string" || turnId.length === 0) return;
+    const rawAnswers = (Array.isArray(msg.answers) ? msg.answers : []).filter(
+      (a): a is { id: string; text: string } =>
+        !!a &&
+        typeof a.id === "string" &&
+        a.id.length > 0 &&
+        typeof a.text === "string",
+    );
+    // Defense-in-depth: the plugin never repeats an id (lane ids and minted ids
+    // are unique), but a duplicate would break the slot-refill's
+    // `slots.length === answers.length` assumption. Keep the FIRST occurrence.
+    const answerSeen = new Set<string>();
+    const answers = rawAnswers.filter((a) =>
+      answerSeen.has(a.id) ? false : (answerSeen.add(a.id), true),
+    );
+    const removeSet = new Set(
+      (Array.isArray(msg.remove) ? msg.remove : []).filter(
+        (r): r is string => typeof r === "string" && r.length > 0,
+      ),
+    );
+    if (answers.length === 0 && removeSet.size === 0) return;
+
+    // 1. Drop the plugin-named superseded (mis-routed) answer bubbles.
+    let msgs = removeSet.size > 0
+      ? this.state.messages.filter((m) => !removeSet.has(m.id))
+      : this.state.messages.slice();
+
+    // 2. Desired answer objects, in authoritative order, reusing any existing
+    //    bubble's state (so a live bubble's non-render fields survive).
+    const existingById = new Map(msgs.map((m) => [m.id, m] as const));
+    const desiredById = new Map<string, ChatMessage>();
+    for (const a of answers) {
+      const prev = existingById.get(a.id);
+      desiredById.set(
+        a.id,
+        prev
+          ? { ...prev, role: "agent", text: a.text, working: false, turnId }
+          : { id: a.id, role: "agent", text: a.text, working: false, turnId },
+      );
+    }
+    const answerIds = new Set(answers.map((a) => a.id));
+
+    // 3. Give every MINTED (not-yet-present) answer a slot next to its
+    //    predecessor answer, so the reorder below is a pure permutation that
+    //    never moves a non-answer bubble.
+    for (let k = 0; k < answers.length; k++) {
+      if (existingById.has(answers[k].id)) continue;
+      let insertAt = msgs.length;
+      if (k > 0) {
+        const predIdx = msgs.findIndex((m) => m.id === answers[k - 1].id);
+        insertAt = predIdx === -1 ? msgs.length : predIdx + 1;
+      } else {
+        const firstAnswer = msgs.findIndex((m) => answerIds.has(m.id));
+        if (firstAnswer !== -1) insertAt = firstAnswer;
+      }
+      msgs.splice(insertAt, 0, desiredById.get(answers[k].id)!);
+    }
+
+    // 4. Refill the answer slots in authoritative order — answer bubbles reorder
+    //    among themselves; every non-answer bubble keeps its exact slot.
+    const slots: number[] = [];
+    msgs.forEach((m, i) => {
+      if (answerIds.has(m.id)) slots.push(i);
+    });
+    slots.forEach((pos, idx) => {
+      msgs[pos] = desiredById.get(answers[idx].id)!;
+    });
+
+    this.setState({ messages: msgs, isTyping: false });
+  }
+
   private finalizeDraftsForTurn(turnId?: string): void {
     if (!turnId) return;
     let changed = false;
@@ -2458,6 +2551,11 @@ export class WebChannelNATSClient {
         // draft whose turnId matches (in the normal flow the final agent_message
         // already did this, a no-op). Never swaps the id.
         this.finalizeDraftsForTurn(msg.turnId);
+        return;
+      }
+
+      case "turn_snapshot": {
+        this.applyTurnSnapshot(msg);
         return;
       }
 
