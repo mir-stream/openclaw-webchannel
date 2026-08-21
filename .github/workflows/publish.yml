@@ -1,27 +1,40 @@
 ################################################################################
 # publish.yml — Publish all release artifacts from ONE v* tag:
-#   1. @mir-stream/webchannel-client → GitHub Packages (private npm registry)
-#   2. @mir-stream/webchannel-saas   → GitHub Packages (private npm registry)
-#   3. openclaw-webchannel plugin    → public npm registry (registry.npmjs.org,
-#                                      OIDC trusted publishing — no NPM_TOKEN).
+#   1. @mir-stream/webchannel-client → public npm registry (registry.npmjs.org)
+#   2. @mir-stream/webchannel-saas   → public npm registry (registry.npmjs.org)
+#   3. openclaw-webchannel plugin    → public npm registry (registry.npmjs.org).
 #                                      This is the zero-auth remote-install path:
 #                                      `openclaw plugins install openclaw-webchannel@<v>`.
 #   4. openclaw-webchannel plugin    → ClawHub registry (code-plugin)
 #
+# ALL THREE npm artifacts go to the PUBLIC registry via OIDC trusted publishing
+# with `--provenance` — no NPM_TOKEN, no PAT, no long-lived credential anywhere.
+# The two scoped packages moved off GitHub Packages in 0.6.1: GH Packages
+# requires an authenticated `read:packages` PAT for EVERY consumer read, even of
+# a public package, and that auth requirement was the only thing forcing
+# downstreams to vendor these packages instead of installing them. The repo is
+# public and all three packages are MIT, so there is nothing left to gate.
+#
 # Trigger: push a tag like v0.1.0 (all three share ONE version), or run the npm
-# leg manually via workflow_dispatch. The npm packages use the built-in
-# GITHUB_TOKEN — no PAT/npm creds. The plugin leg (publish-plugin, gated on the
-# npm leg) publishes to ClawHub.
+# leg manually via workflow_dispatch. The plugin leg (publish-plugin, gated on
+# the npm leg) publishes to ClawHub.
+#
+# ONE-TIME BOOTSTRAP (per package name): npm attaches a Trusted Publisher to an
+# EXISTING package, so the very first publish of a brand-new name cannot come
+# from OIDC — an org owner publishes it manually once, then configures the
+# trusted publisher. Full procedure in docs/PUBLISHING.md.
 #
 # ClawHub auth is OIDC-first with a stored-token FALLBACK. The clawhub CLI's
 # resolvePackagePublishToken tries an OIDC mint first, then falls back to the
-# stored config token on mint failure. TODAY the fallback is the active path:
-# this repo is PRIVATE, and ClawHub can't register trusted publishing for a
-# private repo (its server-side GitHub lookup 404s), so we authenticate with a
-# `CLAWHUB_TOKEN` repo secret written to a runner-temp config file. `id-token:
-# write` stays wired so that the day the repo goes public and trusted publishing
-# is registered (`clawhub package trusted-publisher set`), OIDC takes over with
-# ZERO workflow change and the secret can be deleted. See docs/PUBLISHING.md.
+# stored config token on mint failure. The fallback is what this workflow is
+# still wired for — a `CLAWHUB_TOKEN` repo secret written to a runner-temp config
+# file — because trusted publishing could not be registered while the repo was
+# private (ClawHub's server-side GitHub lookup 404s on a private repo). That
+# blocker is gone now that the repo is public: register once with `clawhub
+# package trusted-publisher set` and OIDC takes over with ZERO workflow change
+# (`id-token: write` is already granted) and the secret can be deleted. The leg
+# is provisionally disabled regardless — see its own comment block and
+# docs/PUBLISHING.md.
 #
 # 3-way version lockstep is enforced hard: tag == plugin == client == saas, so
 # the plugin can never drift behind the npm packages again. The check runs in
@@ -29,8 +42,10 @@
 # mismatch aborts the release with nothing shipped and the tag unburned; the copy
 # in publish-plugin stays as defense-in-depth.
 #
-# Consumers need an .npmrc pointing @mir-stream at npm.pkg.github.com plus a
-# read:packages token — see docs/PUBLISHING.md.
+# Consumers need nothing: `npm install @mir-stream/webchannel-saas@<v>` works
+# with no .npmrc and no token, and `npm audit signatures` verifies the
+# provenance attestation back to the workflow run that built it. See
+# docs/PUBLISHING.md.
 ################################################################################
 
 name: Publish Packages
@@ -42,11 +57,16 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest  # 공개 저장소 전환(자체 호스팅 러너 폐지)
+    permissions:
+      contents: read
+      # OIDC trusted publishing: npm exchanges this id-token for a short-lived
+      # publish credential — no NPM_TOKEN secret and no GITHUB_TOKEN write scope.
+      # (`packages: write` is gone with the GitHub Packages leg it existed for.)
+      id-token: write
     steps:
       # ── 컷오버 조상 가드 ──
       # 구 커밋 재태그(전환 이전 세계의 파일·크레덴셜 전제)가 크레덴셜에 닿기 전에 차단한다.
@@ -68,11 +88,20 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # No `scope:` — setup-node writes a bare `registry=` line only when scope is
+      # absent; with a scope it writes `@scope:registry=` INSTEAD and leaves the
+      # default registry alone. We want the default pointed at npmjs.org (same as
+      # the plugin leg), which is what both the scoped `npm publish` and the
+      # `npm view` idempotency probe then resolve against.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://npm.pkg.github.com
-          scope: "@mir-stream"
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing (OIDC) needs npm >= 11.5.1; the npm bundled with
+      # setup-node's Node 22 is older, so upgrade before publishing.
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
 
       # Fail-fast copy of the lockstep check. It runs BEFORE any npm artifact is
       # built or published, so a version mismatch aborts the tag with nothing
@@ -135,9 +164,22 @@ jobs:
       # a partial npm publish (client shipped, saas flaked), and a full re-run of
       # a fully-shipped tag a green no-op. Each check uses the package.json's own
       # version (NOT the tag) so it's correct on workflow_dispatch too; lockstep
-      # guarantees package.json == tag on tag runs. `npm view` against GitHub
-      # Packages ALSO needs auth, so NODE_AUTH_TOKEN covers the whole step.
-      - name: Publish to GitHub Packages (idempotent)
+      # guarantees package.json == tag on tag runs. The `npm view` probe needs no
+      # auth at all now that the target is the public registry — which is also
+      # why a version bootstrapped by hand (see docs/PUBLISHING.md) makes the
+      # matching tag run a green no-op here.
+      #
+      # No NODE_AUTH_TOKEN: with a configured Trusted Publisher and npm >=
+      # 11.5.1, `npm publish` performs the OIDC exchange itself. `--access
+      # public` is redundant with each package's publishConfig.access but stated
+      # anyway, because scoped packages default to RESTRICTED and a silent
+      # private publish is the expensive failure here. `--provenance` needs the
+      # public repo (true since 2026-08-19), `id-token: write` (granted on this
+      # job), and a `repository` field in each manifest (both have one); if
+      # attestation generation fails, npm CANCELS the publish rather than
+      # shipping unattested, so a failure here ships nothing and the tag can be
+      # deleted and re-pushed.
+      - name: Publish to public npm (OIDC, idempotent)
         run: |
           set -euo pipefail
           for PKG in client saas; do
@@ -145,21 +187,21 @@ jobs:
             WANT="$(node -p "require('./packages/${PKG}/package.json').version")"
             GOT="$(npm view "${NAME}@${WANT}" version 2>/dev/null || true)"
             if [ "$GOT" = "$WANT" ]; then
-              echo "${NAME}@${WANT} already on GitHub Packages — skipping."
+              echo "${NAME}@${WANT} already on public npm — skipping."
             else
-              npm publish -w "packages/${PKG}"
+              npm publish -w "packages/${PKG}" --access public --provenance
             fi
           done
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ---------------------------------------------------------------------------
   # Plugin leg #1: publish the openclaw-webchannel code-plugin to the PUBLIC npm
   # registry (registry.npmjs.org) via OIDC Trusted Publishing — NO long-lived
   # NPM_TOKEN. This is the registry-independent, zero-auth install path
-  # (`openclaw plugins install openclaw-webchannel@<v>`): the plugin is unscoped
-  # so it can't live in GitHub Packages, and ClawHub publishing is currently
-  # blocked by a scanner false-positive on the package.
+  # (`openclaw plugins install openclaw-webchannel@<v>`), and the only npm one
+  # since ClawHub publishing is currently blocked by a scanner false-positive on
+  # the package. Since 0.6.1 the `publish` job it depends on ships the two scoped
+  # packages the same way; this job stays separate because the plugin has its own
+  # build, its own test suite, and its own trusted-publisher registration.
   #
   # PREREQUISITE (one-time, manual, on npmjs.com): a Trusted Publisher must be
   # configured for the `openclaw-webchannel` package —
@@ -174,7 +216,7 @@ jobs:
   # publisher — on the FIRST new version after setup. With OIDC + npm >= 11.5.1,
   # `npm publish` mints short-lived credentials from the id-token automatically.
   #
-  # Gated like the ClawHub leg: needs the GH-Packages leg, tag PUSH only.
+  # Gated like the ClawHub leg: needs the client/saas leg, tag PUSH only.
   # ---------------------------------------------------------------------------
   publish-plugin-npm:
     name: Publish plugin to npm (public, OIDC)
@@ -266,7 +308,7 @@ jobs:
         #
         # If this ever fails, the failure is contained: the npm leg cancels with
         # nothing published, so drop the flag, delete the tag, and re-push it.
-        # The GitHub Packages leg that ran before this one is idempotent and will
+        # The client/saas leg that ran before this one is idempotent and will
         # skip on the retry.
         run: npm publish -w packages/plugin --access public --provenance
 
@@ -305,9 +347,10 @@ jobs:
       contents: read
       # Kept wired for forward-compat: the clawhub CLI tries an OIDC mint
       # (audience "clawhub") FIRST and only falls back to the stored token on
-      # failure. It's inert today because trusted publishing can't be registered
-      # while this repo is private — once the repo is public and registered,
-      # OIDC takes over automatically with no workflow change (docs/PUBLISHING.md).
+      # failure. It's inert until trusted publishing is registered — which was
+      # impossible while this repo was private, and is merely not-yet-done now
+      # that it is public. Register it and OIDC takes over automatically with no
+      # workflow change (docs/PUBLISHING.md).
       id-token: write
     env:
       # Pin the ClawHub CLI so a registry-side CLI release can't silently change

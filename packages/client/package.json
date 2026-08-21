@@ -10,7 +10,7 @@
     "directory": "packages/client"
   },
   "publishConfig": {
-    "registry": "https://npm.pkg.github.com"
+    "access": "public"
   },
   "main": "./dist/index.js",
   "module": "./dist/index.js",

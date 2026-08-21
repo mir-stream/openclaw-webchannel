@@ -46,7 +46,6 @@ sees E2E-encrypted ciphertext.
 | Need | Why |
 |---|---|
 | **Node ≥ 22** | the packages target modern Node/WebCrypto (X25519/Ed25519). |
-| **A GitHub `read:packages` PAT** | *Only while the registry is private* (see Step 2). `@mir-stream/*` is on GitHub Packages; classic token, scope `read:packages`. Once public, no token is needed. |
 | **A Synadia / NGS account** | the managed relay. You need its **account identity** (`A…`), an **account signing-key seed** (`SA…`), and the **wss URL** (e.g. `wss://connect.ngs.global`). |
 | **openclaw** installed | your agent runtime. It needs a model provider configured (so the agent can actually reply). |
 
@@ -79,63 +78,20 @@ which is the whole point: you consume the library exactly as an outside develope
 > scaffold would remove this step — a possible follow-up.) The two **libraries** you
 > depend on are already published; only this example *app* still lives in the repo.
 
-## Step 2 — Install the published library from GitHub Packages
+## Step 2 — Install the published library
 
-> **Once the packages are public you can skip the token entirely** — a public
-> `@mir-stream/*` installs with just the registry line (no auth, no `.npmrc` token). The
-> steps below are only needed while the registry is private.
-
-**2a. Get a `read:packages` token.**
-
-- **Easiest, if you use the GitHub CLI** and are already logged in: skip token creation —
-  in step 2c just use `export NODE_AUTH_TOKEN=$(gh auth token)`.
-- **Otherwise**, on GitHub: **Settings → Developer settings → Personal access tokens →
-  Tokens (classic) → Generate new token (classic)**, tick the **`read:packages`** scope,
-  generate, and copy it (looks like `ghp_…`). **Use a *classic* token — GitHub Packages
-  npm rejects fine-grained tokens.**
-
-**2b. Create a file named `.npmrc` in the app folder** (`~/webchannel-app/.npmrc`). It
-points `@mir-stream` at GitHub Packages and reads the token from an env var, so **the
-secret never lives in the file**:
-
-```ini
-@mir-stream:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
-```
-
-You can create it in one line:
+Pin the two packages to the published version and install:
 
 ```bash
-cat > .npmrc <<'EOF'
-@mir-stream:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
-EOF
-```
-
-**2c. Export the token and install** (npm expands `${NODE_AUTH_TOKEN}` from `.npmrc`). Pin
-the two packages to the published version:
-
-```bash
-export NODE_AUTH_TOKEN=$(gh auth token)         # if you use the GitHub CLI (2a option 1)
-# export NODE_AUTH_TOKEN=ghp_your_token_here    # …or paste your classic token from 2a
-echo "${NODE_AUTH_TOKEN:0:4} len=${#NODE_AUTH_TOKEN}"   # sanity: should print  ghp_ len=40
-
-npm pkg set dependencies.@mir-stream/webchannel-saas=0.1.3
-npm pkg set dependencies.@mir-stream/webchannel-client=0.1.3
+npm pkg set dependencies.@mir-stream/webchannel-saas=0.6.1
+npm pkg set dependencies.@mir-stream/webchannel-client=0.6.1
 npm install
 ```
-
-> **401 Unauthorized?** The registry line worked but the token didn’t: `NODE_AUTH_TOKEN`
-> is empty (the `export` didn’t run in *this* shell), still the literal
-> `ghp_your_token_here` placeholder, or a fine-grained token (use a classic one). The
-> `echo` line above catches all three.
 
 Verify you actually downloaded the tarballs (not a local symlink):
 
 ```bash
 readlink node_modules/@mir-stream/webchannel-saas || echo "REAL dir (downloaded, not a symlink)"
-grep -m1 '"resolved".*npm.pkg.github.com' package-lock.json
-# → "resolved": "https://npm.pkg.github.com/download/@mir-stream/webchannel-saas/0.1.3/…"
 ```
 
 ## Step 3 — Point the relay at Synadia (NGS)
@@ -246,8 +202,6 @@ replies over the E2E-encrypted NGS relay.
   account=agent-dev` and that the wizard used the same tenant and account id.
 - **`401` when approving** → wrong/missing `x-admin-token`; use the token the server
   supplied through `ENROLLMENT_ADMIN_TOKEN`.
-- **`npm install` 401/403** → the PAT lacks `read:packages`, or `.npmrc` is missing the
-  `@mir-stream:registry` line.
 - **Agent connects but never replies** → openclaw has no model provider configured. The
   webchannel plugin is transport only; the reply comes from your openclaw agent/model.
 - **Browser register rejected with an opaque `unauthorized`** → the agent is verifying

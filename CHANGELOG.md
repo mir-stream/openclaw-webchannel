@@ -30,10 +30,25 @@ change** (`WEBCHANNEL_PROTOCOL_VERSION` stays `3`).
   that self-heals on reload. The sound fix is the authoritative snapshot still to
   come.
 
-Both are phases 1 and 2 of the delivery-render redesign tracked in **issue
-#212**, and they remove most of #174 as a consequence. All three packages move
-to `0.6.1` together under the 3-way version lockstep; the client bundle is
-code-identical to `0.6.0` and upgrading it is optional.
+- **`webchannel-client` and `webchannel-saas` now publish to the public npm
+  registry.** They were on GitHub Packages, which demands an authenticated
+  `read:packages` token for *every* consumer read — even of a public package —
+  so each downstream project, CI job, Docker build and deploy host needed a
+  credential just to `npm install`, and real consumers vendored the packages
+  through a pinned checkout instead. The repo has been public and all three
+  packages MIT since 0.6.0, so that gate protected nothing. Both now ship to
+  `registry.npmjs.org` by the same OIDC trusted-publishing path the plugin
+  already used — no long-lived token in CI — and carry a `--provenance`
+  attestation linking the tarball to the workflow run that built it. **Consumers
+  need no `.npmrc` and no token:** `npm install @mir-stream/webchannel-saas@0.6.1`
+  now just works. Package contents are unchanged; this is a distribution change
+  only. See `docs/PUBLISHING.md`, including the one-time manual bootstrap each
+  new package name needs before npm will accept an OIDC publish.
+
+Both delivery fixes are phases 1 and 2 of the delivery-render redesign tracked
+in **issue #212**, and they remove most of #174 as a consequence. All three
+packages move to `0.6.1` together under the 3-way version lockstep; the client
+bundle is code-identical to `0.6.0` and upgrading it is optional.
 
 Internally this cycle also replaced the CI cache-health guard with a
 version-aware probe run inside the install composite, deleting the raced
