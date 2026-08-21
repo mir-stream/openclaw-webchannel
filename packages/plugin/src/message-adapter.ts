@@ -175,13 +175,12 @@ type AssistantDraftLane = {
    * #173: did this lane ever receive non-empty VISIBLE answer text? Set true at
    * the `lane.answerText = cleaned` assignment, which is AFTER the reasoning
    * filter's early-return, so a reasoning-only partial never sets it. It is
-   * PERSISTENT: never cleared on close/rotate, because settlement counts how
-   * many distinct lanes streamed visible answer text over the whole turn (the
-   * [A,A,B] overwrite discriminator), and a lane the fail-safe rotated away must
-   * still be counted. This is the controller's authoritative version of the
-   * count inbound used to keep from raw `onPartialReply` callbacks — it tracks
-   * BOTH rotation paths (boundary and the `closeAndRotate` fail-safe) and never
-   * counts a reasoning partial the adapter filtered.
+   * PERSISTENT: never cleared on close/rotate, so a lane the fail-safe rotated
+   * away still counts. `finalize` uses it as the answer-lane routing predicate:
+   * an ordinary final is paired with a text-bearing lane in generation order,
+   * never a tool-only/reasoning-only lane (see the collapse-aware routing in
+   * `finalize`). It tracks BOTH rotation paths (boundary and the `closeAndRotate`
+   * fail-safe) and never counts a reasoning partial the adapter filtered.
    */
   streamedVisibleAnswerText: boolean;
   /**
@@ -274,6 +273,17 @@ type AuthorizedBlockDisposition = {
 type FinalReconciliationState = {
   ordinaryAnswerSettled: boolean;
   leadingTerminalErrorSeen: boolean;
+  /**
+   * #173: per-turn cursor counting how many ordinary (non-error, non-notice)
+   * answer-finals have already been routed to a lane this turn. The Nth such
+   * final settles the Nth target lane in generation order — see `finalize`. Core
+   * emits one ordinary final per text-bearing message when the last assistant
+   * message is tool-only (the #173 topology), and exactly ONE collapsed final
+   * (the last message's text) when the last message itself has text. The cursor
+   * lets order-based routing pair each final with the lane it belongs to instead
+   * of always overwriting `currentLane()`.
+   */
+  ordinaryAnswerFinalsRoutedToLanes: number;
 };
 
 type PendingProgressFrame =
@@ -544,14 +554,6 @@ export type ProgressDraftController = {
   }): Promise<boolean>;
   /** Record that a terminal error preceded any ordinary answer final. */
   noteLeadingTerminalError(): void;
-  /**
-   * #173: how many DISTINCT lanes streamed non-empty visible answer text this
-   * turn. Authoritative over inbound's old raw-callback count: it tracks both
-   * rotation paths (`handleAssistantMessageBoundary` and the `closeAndRotate`
-   * fail-safe) and excludes reasoning-only partials (the flag is set only at the
-   * post-filter `answerText = cleaned`). Settlement gates the keyframe on `>= 2`.
-   */
-  streamedVisibleAnswerLaneCount(): number;
   /** Retire tentative state and settle real text (or a lone tool preview). */
   drain(): Promise<void>;
   /**
@@ -615,6 +617,7 @@ export function createProgressDraftController(params: {
     finalReconciliation: {
       ordinaryAnswerSettled: false,
       leadingTerminalErrorSeen: false,
+      ordinaryAnswerFinalsRoutedToLanes: 0,
     },
     lines: [],
     lastProgressSentAt: 0,
@@ -628,6 +631,13 @@ export function createProgressDraftController(params: {
   };
   const queue: SerialQueueState = { running: false, tasks: [] };
   let ordinaryFinalSendInProgress = false;
+  // #173: ordinary finals that arrived while the current lane was TEXTLESS, held
+  // in arrival order until drain. At finalize time the collapse-with-nonstreaming-
+  // last shape (K==1 → the final is the last/current lane's own text) is
+  // indistinguishable from the tool-only-last shape (K>=2 → one final per
+  // text-bearing lane); only the drain-time COUNT tells them apart. See
+  // `flushBufferedOrdinaryFinals` and `finalize`.
+  const bufferedOrdinaryFinals: string[] = [];
 
   const warn = (message: string): void => {
     try {
@@ -928,6 +938,20 @@ export function createProgressDraftController(params: {
    */
   const laneTerminalSuppressed = (lane: AssistantDraftLane): boolean =>
     lane.resolution !== "materialized" && laneHasFailedCurrentRevision(lane);
+
+  // #173: the answer lanes an ordinary final may be routed to — lanes that
+  // streamed VISIBLE answer text AND actually reached the client
+  // (`resolution === "materialized"`). Requiring materialization excludes a lane
+  // that streamed but whose frame failed to ship (a transient disconnect): it
+  // rendered nothing, so it owns no bubble a final could top up, and a final that
+  // is really its own message's (arriving only in the final) must fall to the
+  // current-lane path instead — this is what keeps M13g's failed-lane-A shape
+  // settling B on its own preview id. Same predicate the removed keyframe count
+  // used, for the same reason.
+  const materializedAnswerLanes = (): AssistantDraftLane[] =>
+    state.lanes.filter(
+      (lane) => lane.streamedVisibleAnswerText && lane.resolution === "materialized",
+    );
 
   const laneOrderResolved = (lane: AssistantDraftLane): boolean => {
     if (!lane.closed) return false;
@@ -1552,7 +1576,12 @@ export function createProgressDraftController(params: {
       emitCurrentProgress: false,
       settleCurrent,
     });
-    if (settleCurrent) settlePreviewIfAlone();
+    if (settleCurrent) {
+      settlePreviewIfAlone();
+      // #173: the terminal settle is the point where the buffered-final count is
+      // finally known, so it is where the textless-currentLane finals resolve.
+      flushBufferedOrdinaryFinals();
+    }
   };
 
   const deliverTerminalIndependent = (text: string): boolean => {
@@ -1579,6 +1608,73 @@ export function createProgressDraftController(params: {
     const sent = sendIndependent(text);
     releaseReadyLanes({ emitCurrentProgress: false });
     return sent;
+  };
+
+  // #173: apply an ordinary final's authoritative text to a lane and settle it on
+  // that lane's OWN id. A lane other than the current one has already auto-settled
+  // with its last partial (`releaseReadyLanes` at its boundary); the final may
+  // carry a tail the partials never emitted, so top it up on the same id rather
+  // than dropping it (`settleLane` no-ops on an already-settled lane). Wrapped in
+  // the re-entrancy latch because the synchronous transport send can call back
+  // into `finalize`. Does NOT reset the deferred-angle-marker tail — callers do
+  // that first, before any `terminalDrain`, so the tail resolver sees it cleared.
+  const emitAuthoritativeFinalOnLane = (
+    target: AssistantDraftLane,
+    text: string,
+  ): boolean => {
+    target.answerText = text;
+    target.answerRevision += 1;
+    discardPendingProgress(
+      (frame) => frame.kind === "lane" && frame.generation === target.generation,
+    );
+    ordinaryFinalSendInProgress = true;
+    try {
+      return target.settleOutcome !== undefined
+        ? sendLaneFrame(target, "final", text)
+        : settleLane(target, text);
+    } finally {
+      ordinaryFinalSendInProgress = false;
+    }
+  };
+
+  // #173: resolve the finals that `finalize` buffered while the current lane was
+  // textless. Called from the terminal drain, where the count K is known.
+  const flushBufferedOrdinaryFinals = (): void => {
+    if (bufferedOrdinaryFinals.length === 0) return;
+    const finals = bufferedOrdinaryFinals.splice(0);
+    //   K == 1 → the single final is the last (current, textless) message's own
+    //            text: a collapse whose last message streamed no partial, or a
+    //            lone message with no partial. Settle the current lane on its id.
+    //            (Case X — a single streamed answer followed by a tool-only last
+    //            message — also lands here: the final tops up the tool-only
+    //            current lane, matching prior behaviour. The sound fix needs a
+    //            per-message final identity core does not expose; deferred to the
+    //            Phase 3 snapshot.)
+    //   K >= 2 → the tool-only-last (#173) shape: one final per text-bearing
+    //            message, in generation order. The textless current (tool-only)
+    //            lane receives none. Overflow → an independent bubble.
+    //
+    // KNOWN LIMITATION (K>=2), same #111 final-identity ceiling as Case X above:
+    // this positional pairing assumes every text-bearing lane materialized. If a
+    // MIDDLE lane's frame dropped on a transient wire failure (topology
+    // A,B,C[,tool]; B never ships), `materializedAnswerLanes()` correctly excludes
+    // B (per M13g), so pairing shifts — tB lands on C, tC overflows to an
+    // independent bubble. Finals are identity-less, so nothing at this layer can
+    // soundly recover which lane tB belongs to; any "safer" degradation only
+    // trades lane corruption for a stray bubble. Exotic (3+ text lanes + tool-only
+    // last + a mid-sequence drop) and self-heals on reload. The sound fix is the
+    // Phase 3 authoritative snapshot. Pinned by M173e; do NOT add mitigation here.
+    const targets = finals.length === 1 ? [currentLane()] : materializedAnswerLanes();
+    finals.forEach((text, index) => {
+      const target = targets[index];
+      if (!target) {
+        deliverTerminalIndependent(text);
+        return;
+      }
+      target.deferredAngleMarkerTail = undefined;
+      target.lastPartialSourceText = "";
+      emitAuthoritativeFinalOnLane(target, text);
+    });
   };
 
   return {
@@ -1951,31 +2047,60 @@ export function createProgressDraftController(params: {
             terminalDrain(false);
             return false;
           }
-          if (
-            state.finalReconciliation.leadingTerminalErrorSeen ||
-            state.finalReconciliation.ordinaryAnswerSettled ||
-            active.settleOutcome !== undefined
-          ) {
+          // A leading terminal error still forces every later ordinary final onto
+          // an independent bubble, whatever the lane topology.
+          if (state.finalReconciliation.leadingTerminalErrorSeen) {
             return deliverTerminalIndependent(text);
           }
+          // #173 — collapse-aware final routing. Core produces ordinary answer
+          // finals in one of two shapes (verified against the pinned bundle,
+          // payloads-1r4oLFNi.js:335/:424/:426):
+          //   - COLLAPSE: the last assistant message has visible text, so core
+          //     emits exactly ONE final = that last message's text. Earlier
+          //     messages only ever reached the user via live streaming.
+          //   - #173: the last assistant message is tool-only (no text), so the
+          //     collapse cannot fire and core emits one final PER text-bearing
+          //     message, IN ORDER. Tool-only messages still fire
+          //     `onAssistantMessageStart`, so at finalize time `currentLane()` is
+          //     the tool-only message's TEXTLESS lane — never a last answer lane.
+          //
+          // The routing target is unambiguous ONLY when the current lane bears
+          // text (collapse → the current lane) or there is no text-bearing lane
+          // at all (a lone message whose text arrived only in the final → the
+          // current lane). When the current lane is TEXTLESS *and* text-bearing
+          // lanes exist, the shape is undecidable at this instant: it is the
+          // collapse-with-nonstreaming-last shape (K==1 → the final is the
+          // current lane's own text) OR the tool-only-last #173 shape (K>=2 →
+          // one final per text-bearing lane). Only the drain-time COUNT tells
+          // them apart, so buffer and resolve in `flushBufferedOrdinaryFinals`.
+          const textBearingLanes = materializedAnswerLanes();
+          if (!active.streamedVisibleAnswerText && textBearingLanes.length > 0) {
+            state.finalReconciliation.ordinaryAnswerSettled = true;
+            bufferedOrdinaryFinals.push(text);
+            // Provisional: the real send happens at drain (a synchronous status is
+            // impossible here). Deliberately optimistic — inbound treats the final
+            // as delivered, and it will be unless the turn is `stop`ped before
+            // drain, in which case the streamed lane text still stands and a reload
+            // heals. Never leaves a dangling promise.
+            return true;
+          }
+          // Immediate path: the current lane is the sole, unambiguous target. The
+          // first final settles it; a second ordinary final in this shape has no
+          // lane left and falls back to an independent bubble (today's behaviour).
+          if (state.finalReconciliation.ordinaryAnswerFinalsRoutedToLanes >= 1) {
+            return deliverTerminalIndependent(text);
+          }
+          state.finalReconciliation.ordinaryAnswerFinalsRoutedToLanes += 1;
+          state.finalReconciliation.ordinaryAnswerSettled = true;
           // Unlike partial callbacks, the ordinary final is durable and
           // authoritative. It is the only event allowed to replace an exact
-          // quarantine with text that merely looks like a control marker.
+          // quarantine with text that merely looks like a control marker. Reset
+          // the tail BEFORE `terminalDrain`, whose resolver reads the current
+          // lane, so it sees the cleared tail.
           active.deferredAngleMarkerTail = undefined;
           active.lastPartialSourceText = "";
           terminalDrain(false);
-          state.finalReconciliation.ordinaryAnswerSettled = true;
-          active.answerText = text;
-          active.answerRevision += 1;
-          discardPendingProgress(
-            (frame) => frame.kind === "lane" && frame.generation === active.generation,
-          );
-          ordinaryFinalSendInProgress = true;
-          try {
-            return settleLane(active, text);
-          } finally {
-            ordinaryFinalSendInProgress = false;
-          }
+          return emitAuthoritativeFinalOnLane(active, text);
         },
         false,
       );
@@ -1986,20 +2111,6 @@ export function createProgressDraftController(params: {
         () => deliverTerminalIndependent(input.text),
         false,
       ),
-    streamedVisibleAnswerLaneCount: () =>
-      // #173: count only lanes that streamed VISIBLE answer text AND actually
-      // reached the client. `resolution === "materialized"` is set solely inside
-      // `sendLaneFrame`'s `if (sent)` branch, so it is true only once a lane
-      // frame successfully shipped. Requiring it closes the false positive where
-      // a lane streams but its progress publish fails on a transient
-      // disconnect: the client never rendered that lane's overwrite, so a
-      // destructive keyframe (which can delete a trailing status/trace bubble)
-      // must not fire. Both real-glitch paths (the boundary rotation and the
-      // `closeAndRotate` divergence fail-safe) leave both lanes materialized at
-      // settlement, so this does not weaken glitch detection.
-      state.lanes.filter(
-        (lane) => lane.streamedVisibleAnswerText && lane.resolution === "materialized",
-      ).length,
     noteLeadingTerminalError: () => {
       void enqueue(
         "leading terminal error",
@@ -2033,6 +2144,15 @@ export function createProgressDraftController(params: {
           clearProgressTimer();
           clearEmptyPredecessorTimer();
           state.pendingProgress = undefined;
+          // #173: a stop without a drain discards any buffered finals. This can
+          // lose content, not just a re-send: an ordinary final may carry a tail
+          // the last streamed partial never emitted (VERIFY-1 is still open), so a
+          // dropped buffered final can lose a final-only tail the streamed lane
+          // does NOT hold. Accepted by design — a reload heals it from durable
+          // history — and what must not happen is a dangling promise, which
+          // `finalize` already prevents by resolving each buffered final
+          // provisionally.
+          bufferedOrdinaryFinals.length = 0;
         },
         undefined,
       );
