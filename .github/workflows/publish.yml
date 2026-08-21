@@ -15,9 +15,10 @@
 # downstreams to vendor these packages instead of installing them. The repo is
 # public and all three packages are MIT, so there is nothing left to gate.
 #
-# Trigger: push a tag like v0.1.0 (all three share ONE version), or run the npm
-# leg manually via workflow_dispatch. The plugin leg (publish-plugin, gated on
-# the npm leg) publishes to ClawHub.
+# Trigger: push a tag like v0.1.0 (all three share ONE version). A
+# workflow_dispatch run builds and tests but publishes NOTHING unless it is
+# dispatched from a v* tag ref — see the tag-ref guard on the publish step. The
+# plugin leg (publish-plugin, gated on the npm leg) publishes to ClawHub.
 #
 # ONE-TIME BOOTSTRAP (per package name): npm attaches a Trusted Publisher to an
 # EXISTING package, so the very first publish of a brand-new name cannot come
@@ -98,33 +99,55 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      # Trusted publishing (OIDC) needs npm >= 11.5.1; the npm bundled with
-      # setup-node's Node 22 is older, so upgrade before publishing.
+      # Trusted publishing (OIDC) needs npm >= 11.5.1. Pin to the 11.x line
+      # rather than `npm@latest`: this step runs before `npm ci` and `npx
+      # vitest`, so whatever it installs governs the whole job's tooling, and
+      # this repo has already been bitten once by an npm major silently changing
+      # a contract (npm 12 reshaped `npm pack --json` and broke the ClawHub CLI —
+      # see CLAWHUB_NPM_PIN below). >= 11.5.1 is the actual stated requirement;
+      # take the newest 11.x that satisfies it and nothing beyond.
       - name: Upgrade npm for OIDC trusted publishing
-        run: npm install -g npm@latest
+        run: npm install -g "npm@^11.5.1"
 
       # Fail-fast copy of the lockstep check. It runs BEFORE any npm artifact is
       # built or published, so a version mismatch aborts the tag with nothing
       # shipped and the tag unburned — recover by deleting the tag, fixing the
       # versions, and re-pushing. The copy in publish-plugin stays as
       # defense-in-depth and is the one that exports VERSION for later steps.
-      # Step-level tag guard: workflow_dispatch runs skip it and publish whatever
-      # version is in package.json (unchanged behavior — no tag to check against).
+      #
+      # The check is in TWO halves because only one of them needs a tag:
+      #   - plugin == client == saas is comparable on ANY ref, so it always runs.
+      #     It used to be skipped wholesale on non-tag refs, which removed the
+      #     gate precisely on the path (workflow_dispatch from a branch) where
+      #     nothing else was checking the versions at all.
+      #   - == tag needs a tag, so that half runs only on a tag ref.
+      # A non-tag run is not a release: the publish step below refuses to ship
+      # from one, so a drifted branch fails here loudly rather than shipping.
       - name: Enforce 3-way version lockstep (tag == plugin == client == saas)
-        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
           PLUGIN_VERSION="$(node -p "require('./packages/plugin/package.json').version")"
           CLIENT_VERSION="$(node -p "require('./packages/client/package.json').version")"
           SAAS_VERSION="$(node -p "require('./packages/saas/package.json').version")"
-          echo "tag=${TAG_VERSION} plugin=${PLUGIN_VERSION} client=${CLIENT_VERSION} saas=${SAAS_VERSION}"
-          if [ "$PLUGIN_VERSION" != "$TAG_VERSION" ] \
-            || [ "$CLIENT_VERSION" != "$TAG_VERSION" ] \
-            || [ "$SAAS_VERSION" != "$TAG_VERSION" ]; then
-            echo "::error::Version lockstep violation — tag v${TAG_VERSION} must equal plugin/client/saas. Bump all three to match the tag before releasing."
+          echo "ref=${GITHUB_REF} plugin=${PLUGIN_VERSION} client=${CLIENT_VERSION} saas=${SAAS_VERSION}"
+          if [ "$CLIENT_VERSION" != "$PLUGIN_VERSION" ] \
+            || [ "$SAAS_VERSION" != "$PLUGIN_VERSION" ]; then
+            echo "::error::Version lockstep violation — plugin/client/saas must all match. Bump all three together."
             exit 1
           fi
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              TAG_VERSION="${GITHUB_REF_NAME#v}"
+              echo "tag=${TAG_VERSION}"
+              if [ "$PLUGIN_VERSION" != "$TAG_VERSION" ]; then
+                echo "::error::Version lockstep violation — tag v${TAG_VERSION} must equal plugin/client/saas. Bump all three to match the tag before releasing."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "non-tag ref — 3-way equality enforced, tag comparison skipped (this run cannot publish)."
+              ;;
+          esac
 
       # saas real-server suites HARD FAIL (not skip) in CI when the nats-server
       # binary is missing — the pinned version lives in the composite action.
@@ -164,10 +187,22 @@ jobs:
       # a partial npm publish (client shipped, saas flaked), and a full re-run of
       # a fully-shipped tag a green no-op. Each check uses the package.json's own
       # version (NOT the tag) so it's correct on workflow_dispatch too; lockstep
-      # guarantees package.json == tag on tag runs. The `npm view` probe needs no
-      # auth at all now that the target is the public registry — which is also
-      # why a version bootstrapped by hand (see docs/PUBLISHING.md) makes the
-      # matching tag run a green no-op here.
+      # guarantees package.json == tag on tag runs. Separately, the `npm view`
+      # probe needs no auth at all now that the target is the public registry.
+      #
+      # TAG-REF GUARD — the invariant is: NOTHING is published from a ref that is
+      # not a v* tag. Without it, a workflow_dispatch from a branch would publish
+      # whatever version that branch's package.json happens to carry. On GitHub
+      # Packages that was a deletable, token-gated mistake; on public npm it
+      # burns the version number permanently (unpublishable after 72h), ships an
+      # unreviewed branch build under a provenance attestation, and then makes
+      # the REAL tag a silent green no-op via the idempotency probe below. The
+      # guard is on this step rather than on the job so that a branch dispatch
+      # still checks out, installs, runs both lockstep gates, builds and tests —
+      # it just cannot ship. A dispatch from a TAG ref still publishes, which is
+      # the documented recovery lever when this leg flakes:
+      #   gh workflow run publish.yml --ref v0.6.1
+      # (the Actions UI ref picker lists branches only; the CLI reaches tags.)
       #
       # No NODE_AUTH_TOKEN: with a configured Trusted Publisher and npm >=
       # 11.5.1, `npm publish` performs the OIDC exchange itself. `--access
@@ -180,6 +215,7 @@ jobs:
       # shipping unattested, so a failure here ships nothing and the tag can be
       # deleted and re-pushed.
       - name: Publish to public npm (OIDC, idempotent)
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
           for PKG in client saas; do

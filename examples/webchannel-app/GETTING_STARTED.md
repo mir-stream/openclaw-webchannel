@@ -80,7 +80,8 @@ which is the whole point: you consume the library exactly as an outside develope
 
 ## Step 2 — Install the published library
 
-Pin the two packages to the published version and install:
+Pin the two packages to the published version and install — `0.6.1` is the first
+release to target the public npm registry:
 
 ```bash
 npm pkg set dependencies.@mir-stream/webchannel-saas=0.6.1
@@ -92,6 +93,8 @@ Verify you actually downloaded the tarballs (not a local symlink):
 
 ```bash
 readlink node_modules/@mir-stream/webchannel-saas || echo "REAL dir (downloaded, not a symlink)"
+grep -m1 '"resolved".*registry.npmjs.org' package-lock.json
+# → "resolved": "https://registry.npmjs.org/@mir-stream/webchannel-saas/-/webchannel-saas-0.6.1.tgz"
 ```
 
 ## Step 3 — Point the relay at Synadia (NGS)
