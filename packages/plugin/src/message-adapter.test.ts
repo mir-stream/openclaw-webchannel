@@ -382,6 +382,78 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(tcFrame.id).not.toBe(idC);
   });
 
+  // #172 — a block carries no content the partials did not already stream (core
+  // feeds the same visible text to `onPartialReply` and the block chunker). When
+  // a message's own lane has already rendered that content, re-delivering the
+  // block as an independent bubble double-renders it (2 messages → 4 bubbles).
+  // The controller stamps each lane with core's 1-based `assistantMessageIndex`
+  // from the boundary callbacks and suppresses a block whose stamped lane has
+  // materialized — while preserving independent delivery for every recovery
+  // shape (unmatched/unstamped/failed-lane/index-less).
+  it("M172a: a 2-message partial+block turn renders 2 lane bubbles, no independent block bubbles (redundant blocks suppressed)", async () => {
+    const h = makeDraftHarness();
+    // Message A: boundary #1 (swallowed) stamps the gen-0 lane index 1, the
+    // partial streams and materializes A's bubble.
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "A answer" });
+    await h.draft.flush();
+    const idA = h.frames.find((frame) => frame.text === "A answer")!.id;
+    // Core re-delivers A's already-streamed text as an authorized block carrying
+    // its 1-based index → redundant with the lane → suppressed (no wire frame).
+    await expect(
+      h.draft.deliverAuthorizedBlock({ text: "A answer", assistantMessageIndex: 1 }),
+    ).resolves.toBe(false);
+
+    // Message B: boundary #2 rotates to a fresh lane stamped index 2.
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "B answer" });
+    await h.draft.flush();
+    const idB = h.frames.find((frame) => frame.text === "B answer")!.id;
+    await expect(
+      h.draft.deliverAuthorizedBlock({ text: "B answer", assistantMessageIndex: 2 }),
+    ).resolves.toBe(false);
+
+    await h.draft.drain();
+
+    expect(idA).not.toBe(idB);
+    // Exactly two bubbles — the two lanes — and NO independent block bubble.
+    expect(successfulIds(h.frames)).toEqual([idA, idB]);
+    expect(bubbleOrder(h.frames)).toEqual(["A answer", "B answer"]);
+  });
+
+  it("M172b: a lane whose partial frame failed to ship is NOT materialized, so its block STILL delivers independently (recovery preserved)", async () => {
+    const h = makeDraftHarness({
+      decide: (attempt) =>
+        attempt.type === "progress" && attempt.text === "A answer" ? false : true,
+    });
+    h.draft.handleAssistantMessageBoundary(); // stamps the gen-0 lane index 1
+    h.draft.pushAnswerText({ text: "A answer" });
+    await h.draft.flush(); // progress send FAILS → lane streamed but not materialized
+    expect(h.frames.filter((frame) => frame.text === "A answer")).toEqual([]);
+
+    // The block is A's only chance to reach the client, so it must NOT be
+    // suppressed — it degrades to independent delivery.
+    await expect(
+      h.draft.deliverAuthorizedBlock({ text: "A answer", assistantMessageIndex: 1 }),
+    ).resolves.toBe(true);
+    expect(h.frames.some((frame) => frame.text === "A answer")).toBe(true);
+  });
+
+  it("M172c: a block whose index matches no stamped lane still delivers independently (degradation)", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary(); // stamps the gen-0 lane index 1
+    h.draft.pushAnswerText({ text: "A answer" });
+    await h.draft.flush();
+
+    // Index 2 was never stamped onto any lane (no second boundary opened it), so
+    // there is nothing to match — the block cannot be proven redundant and is
+    // delivered rather than dropped.
+    await expect(
+      h.draft.deliverAuthorizedBlock({ text: "late block", assistantMessageIndex: 2 }),
+    ).resolves.toBe(true);
+    expect(h.frames.some((frame) => frame.text === "late block")).toBe(true);
+  });
+
   it("M4: replace:true rewrites only the current lane", async () => {
     const warn = vi.fn();
     const h = makeDraftHarness({ logger: { warn } });
