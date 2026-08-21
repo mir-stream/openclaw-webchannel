@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.6.1
+
+A rendering-fidelity patch. Two long-standing delivery bugs are fixed on the
+plugin side; there is **no protocol break, no API change, and no client code
+change** (`WEBCHANNEL_PROTOCOL_VERSION` stays `3`).
+
+- **Every streamed message reached the browser twice (issue #172).** In
+  partial-streaming mode an assistant message was delivered once as its own
+  streamed bubble and again as an independent `agent_message` from the
+  authorized-block path — a two-message turn rendered as **four** bubbles.
+  Verified against the pinned core bundle, the authorized block is a redundant
+  re-render of the partial stream (core feeds the same visible text to both), so
+  the block's wire frame is now suppressed when its own assistant message
+  already streamed that text. The match is identity-first — each lane is stamped
+  with core's 1-based `assistantMessageIndex` — not positional, and independent
+  delivery is preserved unchanged as the recovery path for a message whose own
+  frame failed to ship.
+
+- **A second final overwrote the wrong bubble (issue #173).** An ordinary answer
+  final always overwrote the *current* message, so when the turn's last
+  assistant message is tool-only — the shape where core emits one final per
+  text-bearing message — a later final landed on top of a message it did not
+  belong to. Finals are now routed to the message they belong to and settle on
+  that message's own id. Notices, errors, and finals after a terminal error are
+  unchanged. One exotic shape remains imperfect (3+ text messages, tool-only
+  last, and a middle frame dropped mid-turn): finals are identity-less on the
+  wire, so the pairing is positional and can shift, surfacing one stray bubble
+  that self-heals on reload. The sound fix is the authoritative snapshot still to
+  come.
+
+Both are phases 1 and 2 of the delivery-render redesign tracked in **issue
+#212**, and they remove most of #174 as a consequence. All three packages move
+to `0.6.1` together under the 3-way version lockstep; the client bundle is
+code-identical to `0.6.0` and upgrading it is optional.
+
+Internally this cycle also replaced the CI cache-health guard with a
+version-aware probe run inside the install composite, deleting the raced
+fallback apparatus it had accumulated (#205, #210). No shipped code is affected.
+
 ## 0.6.0
 
 - **New: a structured tool-activity surface on the channel (issue #97).** Until

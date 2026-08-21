@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+## 0.6.1
+
+### Fixed
+
+- **Every streamed message reached the browser twice (#172).** In
+  partial-streaming mode an assistant message was delivered once as its own
+  streamed lane bubble (`onPartialReply`) and then again as an independent
+  `agent_message` from the authorized-block delivery, so a two-message turn
+  rendered as **four** bubbles. Verified against the pinned core bundle: the
+  authorized block is a redundant re-render of the partial stream — core feeds
+  the same visible text to `onPartialReply` and to the block chunker — so the
+  block carries no content the partials did not already stream. The block's wire
+  frame is now suppressed when its own assistant message already streamed
+  visible text and has not terminally failed. Disposition and barrier
+  bookkeeping are untouched, so the ordering/release gate is unaffected.
+  - The match is **identity-first**, not positional: each lane is stamped with
+    core's 1-based `assistantMessageIndex`, taken from a boundary counter that
+    ticks on every `onAssistantMessageStart` (including the swallowed first), and
+    verified in lockstep with core's block ordinal through tool-only middle
+    messages. It is deliberately separate from the barrier/reservation system and
+    never feeds ordering.
+  - Every other shape falls through to independent delivery **unchanged**: an
+    indexless block, a stamp with no matching lane, a lane the fail-safe rotated
+    (unstamped), or a lane whose own frame failed to ship. The last one is what
+    preserves failed-lane recovery.
+- **A second final overwrote the wrong bubble (#173).** An ordinary answer final
+  always overwrote the *current* lane, so when core emitted one final per
+  text-bearing message — the topology where the turn's last assistant message is
+  tool-only — the later final landed on top of a message it did not belong to.
+  Ordinary finals are now routed to the lane they belong to, in generation order
+  over the lanes that streamed visible text and actually reached the client, and
+  settle on that lane's **own id** rather than replacing another lane's text. The
+  single-final (collapsed) case still settles the current lane, and an overflow
+  final still falls back to an independent bubble. Notices, errors, and any final
+  after a leading terminal error take the independent/error route unchanged.
+  - **Known limitation.** Finals are identity-less on the wire, so this pairing
+    is positional over the materialized answer lanes. With 3+ text-bearing lanes
+    plus a tool-only last message, if a *middle* lane's frame drops on a
+    transient wire failure the pairing shifts and one final surfaces as a stray
+    independent bubble instead of topping up its own. It self-heals on reload,
+    and the sound fix needs the authoritative snapshot still to come in #212 —
+    this is pinned by a test; do not add mitigation at this layer.
+
+### Notes
+
+- **No protocol break and no API change.** `WEBCHANNEL_PROTOCOL_VERSION` stays
+  `3`, no frame type or field was added or removed, and no exported type moved.
+  Both fixes are entirely internal to how the plugin routes what it already
+  sends — the change is visible only as *correct* rendering: fewer duplicate
+  bubbles, and finals landing on their own message.
+- These are phases 1 and 2 of the delivery-render redesign tracked in **#212**;
+  they also remove most of #174 (independent-block ordering) as a consequence.
+  The remaining phase is the authoritative snapshot.
+- `@mir-stream/webchannel-client` `0.6.1` is a **code-identical** lockstep
+  release. No client upgrade is required to get these fixes — they are plugin
+  side only — but the 3-way version lockstep means all three artifacts move
+  together.
+
 ## 0.6.0
 
 ### Added

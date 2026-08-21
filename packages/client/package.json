@@ -1,6 +1,6 @@
 {
   "name": "@mir-stream/webchannel-client",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Framework-agnostic, zero-dependency browser client for WebChannel (headless connection + protocol + state).",
   "license": "MIT",
   "type": "module",

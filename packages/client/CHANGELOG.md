@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.6.1
+
+- **No client behaviour changed in this release.** `0.6.1` is a lockstep version
+  bump so that tag, plugin, client, and saas stay identical. The only source
+  change since `0.6.0` is one doc comment on `InboundMessage.messages`; the
+  public entry point and every exported type are untouched.
+- The `0.6.1` fixes (#172 duplicate bubbles, #173 finals overwriting the wrong
+  bubble) are **plugin side only** — they change which frames the agent sends,
+  not how the client reduces them. A `0.6.0` client already renders them
+  correctly; upgrading is optional and carries no behaviour change on its own.
+- Note for anyone who tracked the `develop` branch: the client-side keyframe
+  resync frame explored for #173 was **retired before release** and never
+  shipped. There is no `keyframe` inbound frame type in any published version,
+  and none is planned — the plugin is the source of truth for delivery, and the
+  remaining #212 phase keeps it there.
+
 ## 0.6.0
 
 ### Added

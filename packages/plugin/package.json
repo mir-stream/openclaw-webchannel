@@ -1,6 +1,6 @@
 {
   "name": "openclaw-webchannel",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Self-hosted web chat channel plugin for OpenClaw: E2E-encrypted browser chat over a NATS relay.",
   "license": "MIT",
   "type": "module",
