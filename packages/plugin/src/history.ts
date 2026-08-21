@@ -248,8 +248,8 @@ function normalizeAll(
  * The register-time snapshot is the case that first showed it: it reads inside
  * the register-request handler, whose ambient client is the plugin-auth client
  * with no `operator.read`, and history degraded to `[]` with `missing scope:
- * operator.read` and nothing else. `load_history` paging and the #173
- * settlement keyframe read from their own handlers and take the same route.
+ * operator.read` and nothing else. `load_history` paging reads from its own
+ * handler and takes the same route.
  *
  * HOW. openclaw's own `deleteSession` sidesteps this by forcing a synthetic
  * operator client, but `getSessionMessages` exposes no such option to plugins.

@@ -81,13 +81,6 @@ export type OutboundWsMessage =
   | { type: "approval_snapshot"; approvals: ApprovalRequestPayload[]; resolved?: Array<{ id: string; decision: ApprovalDecision }> }
   | { type: "typing" }
   | { type: "history"; messages: HistoryMessage[] }
-  // #173: an authoritative REPLACE frame carrying the same projection as
-  // `history`. Unlike `history` (an additive snapshot merged into live state),
-  // a keyframe re-establishes ground truth from the transcript — the client
-  // discards its rendered agent/settled-user bubbles and rebuilds from these
-  // rows, exactly as a fresh reload would. Emitted at settlement only when the
-  // plugin detects the tool-only-turn overwrite path corrupted the live view.
-  | { type: "keyframe"; messages: HistoryMessage[] }
   | { type: "commands"; commands: CommandCatalogEntry[] }
   | { type: "ack"; ids: string[] }
   | { type: "inbound_rejected"; ids: string[]; reason: "overloaded" };
@@ -124,11 +117,6 @@ export interface WebChannelPeerChannel {
   sendTurnSettled(peerId: string, turnId: string, outcome: "ok" | "error"): boolean;
   sendTyping(peerId: string): boolean;
   sendHistory(peerId: string, messages: HistoryMessage[]): boolean;
-  /**
-   * #173: authoritative-replace snapshot (same projection as `sendHistory`).
-   * The client applies it as a REPLACE, not an additive merge.
-   */
-  sendKeyframe(peerId: string, messages: HistoryMessage[]): boolean;
   sendApprovalRequest(peerId: string, request: ApprovalRequestPayload): boolean;
   sendApprovalResolved(peerId: string, id: string, decision: ApprovalDecision): boolean;
   sendApprovalSnapshot(peerId: string, approvals: ApprovalRequestPayload[], resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean;
@@ -145,7 +133,6 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendTurnSettled(_peerId: string, _turnId: string, _outcome: "ok" | "error"): boolean { return false; }
   sendTyping(_peerId: string): boolean { return false; }
   sendHistory(_peerId: string, _messages: HistoryMessage[]): boolean { return false; }
-  sendKeyframe(_peerId: string, _messages: HistoryMessage[]): boolean { return false; }
   sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload): boolean { return false; }
   sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision): boolean { return false; }
   sendApprovalSnapshot(_peerId: string, _approvals: ApprovalRequestPayload[], _resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean { return false; }

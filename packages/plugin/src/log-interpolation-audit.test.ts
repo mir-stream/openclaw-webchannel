@@ -141,10 +141,11 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
  * DELIBERATELY — that is the point.
  */
 const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: number }> = {
-  // #173 raised this from 7/14: the settlement keyframe adds a timed-out warn
-  // (4 interpolations) and an empty-projection warn (3). Both are the whole
-  // point of that change — a resync that skips must never do so in silence.
-  "inbound.ts": { statements: 9, interpolations: 21 },
+  // #173 (Phase 1) removed the settlement keyframe and its three warns (the
+  // timed-out read, the not-delivered send, and the empty-projection skip —
+  // 4+2+3 interpolations), restoring this to 6/12 now that the plugin emits the
+  // corrected [A][B] sequence directly and no resync read exists to narrate.
+  "inbound.ts": { statements: 6, interpolations: 12 },
   "ingress-dedupe.ts": { statements: 13, interpolations: 7 },
   "approvals.ts": { statements: 9, interpolations: 24 },
   "nats-account-runtime.ts": { statements: 23, interpolations: 45 },

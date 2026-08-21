@@ -213,6 +213,175 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(successfulIds(h.frames)).toHaveLength(3);
   });
 
+  // #173 — collapse-aware final routing. Which lane an ordinary final belongs to
+  // depends on the LAST assistant message, per the verified core contract
+  // (payloads-1r4oLFNi.js:335/:424/:426): a text-bearing last message COLLAPSES
+  // to exactly one final (the last message's text); a tool-only last message
+  // emits one final per text-bearing message, in order. Tool-only messages still
+  // fire `onAssistantMessageStart`, so in the tool-only shape `currentLane()` at
+  // finalize time is the TEXTLESS tool lane — the reason the old
+  // `finalize`→`currentLane()` produced [A,A,B].
+  //
+  // When the current lane is textless AND text-bearing lanes exist, the shape is
+  // undecidable until the turn ends: the collapse-with-nonstreaming-last shape
+  // (K==1 → the final is the current lane's own text, e.g. M15a/M15b) is
+  // byte-identical at finalize time to the tool-only-last #173 shape (K>=2 → one
+  // final per text-bearing lane). Only the drain-time COUNT separates them, so
+  // those finals are BUFFERED and resolved at drain.
+  it("M173a: tool-only last message — two finals settle each text lane's own bubble in order [A][B] at drain", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary(); // first boundary: no-op
+    h.draft.pushAnswerText({ text: "first ans" }); // lane A (gen 0)
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // rotate → lane B; lane A auto-settles
+    h.draft.pushAnswerText({ text: "second ans" }); // lane B (gen 1)
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // rotate → tool-only lane (gen 2); lane B auto-settles
+    // The tool-only last message streams NO visible answer text — its lane stays
+    // textless and is the current lane when the finals arrive.
+    const idA = h.frames.find((frame) => frame.text === "first ans")!.id;
+    const idB = h.frames.find((frame) => frame.text === "second ans")!.id;
+
+    // Textless current lane → both finals BUFFER (nothing sent yet), provisionally true.
+    await expect(h.draft.finalize("first answer")).resolves.toBe(true);
+    await expect(h.draft.finalize("second answer")).resolves.toBe(true);
+    const finalsBeforeDrain = h.frames.filter(
+      (frame) => frame.text === "first answer" || frame.text === "second answer",
+    );
+    expect(finalsBeforeDrain).toEqual([]);
+
+    // Drain knows K==2 → the #173 fallback: final#i → i-th text-bearing lane.
+    await h.draft.drain();
+
+    expect(idA).not.toBe(idB);
+    // Every final landed on a text lane's OWN id — no third (independent) bubble.
+    expect(successfulIds(h.frames)).toEqual([idA, idB]);
+    // The authoritative final tops up each lane's own bubble in order → [A][B].
+    const finalsById = (id: string) =>
+      h.frames.filter((frame) => frame.type === "final" && frame.id === id).map((f) => f.text);
+    expect(finalsById(idA)).toEqual(["first ans", "first answer"]);
+    expect(finalsById(idB)).toEqual(["second ans", "second answer"]);
+    expect(bubbleOrder(h.frames)).toEqual(["first answer", "second answer"]);
+  });
+
+  it("M173b: text-bearing last message (collapse) — the single final settles the current lane IMMEDIATELY; earlier lanes keep their streamed text", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary(); // first boundary: no-op
+    h.draft.pushAnswerText({ text: "first ans" }); // lane A (gen 0)
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // rotate → lane B; lane A auto-settles
+    h.draft.pushAnswerText({ text: "second ans" }); // lane B (gen 1) — the LAST message, and it has text
+    await h.draft.flush();
+    const idA = h.frames.find((frame) => frame.text === "first ans")!.id;
+    const idB = h.frames.find((frame) => frame.text === "second ans")!.id;
+
+    // Collapse: the current lane bears text, so the target is unambiguous and the
+    // final settles it IMMEDIATELY — no drain needed. It belongs to the current
+    // (text-bearing) lane, NOT the first lane.
+    await h.draft.finalize("second answer");
+
+    expect(successfulIds(h.frames)).toEqual([idA, idB]);
+    expect(bubbleOrder(h.frames)).toEqual(["first ans", "second answer"]);
+    // A stray second ordinary final in the collapse shape has no lane left to
+    // own it and falls back to an independent bubble (today's behaviour).
+    await h.draft.finalize("stray extra");
+    expect(bubbleOrder(h.frames)).toEqual(["first ans", "second answer", "stray extra"]);
+    expect(successfulIds(h.frames)).toHaveLength(3);
+  });
+
+  it("M173c: collapse whose last message streamed no partial — single buffered final settles the current lane at drain [A][B][C]", async () => {
+    // Real core shape (same as M15a/M15b): A and B stream; the LAST message C has
+    // text but streams no partial, so its lane is textless at finalize time. Core
+    // collapses to ONE final = C's text. K==1 at drain → the final is the current
+    // (textless) lane's own text → C gets its own bubble.
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "message A" });
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // → lane B; A auto-settles
+    h.draft.pushAnswerText({ text: "message B" });
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // → lane C (textless current); B auto-settles
+
+    await expect(h.draft.finalize("message C")).resolves.toBe(true); // buffered
+    expect(h.frames.some((frame) => frame.text === "message C")).toBe(false);
+
+    await h.draft.drain();
+
+    expect(bubbleOrder(h.frames)).toEqual(["message A", "message B", "message C"]);
+    expect(successfulIds(h.frames)).toHaveLength(3);
+  });
+
+  it("M173d: KNOWN LIMITATION (Case X) — a single streamed answer then a tool-only last message tops up the tool lane", async () => {
+    // [one text answer A, then a tool-only LAST message] collapses to K==1 with a
+    // textless current lane (the tool lane), so the lone final tops up that tool
+    // lane rather than lane A. This matches prior behaviour and is NOT a
+    // regression (the old keyframe never touched a one-text-lane turn either). The
+    // sound fix needs a per-message final identity core does not expose for
+    // finals; deferred to the Phase 3 snapshot. This test pins the CURRENT
+    // behaviour so a future change to it is deliberate.
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "the ans" }); // lane A (gen 0), the only text lane
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // → tool-only lane (gen 1, textless current); A auto-settles
+    const idA = h.frames.find((frame) => frame.text === "the ans")!.id;
+
+    await expect(h.draft.finalize("the answer")).resolves.toBe(true); // buffered
+    await h.draft.drain();
+
+    // K==1 → the final tops up the current (tool) lane, a SEPARATE bubble from A.
+    const idTool = h.frames.find((frame) => frame.text === "the answer")!.id;
+    expect(idTool).not.toBe(idA);
+    expect(bubbleOrder(h.frames)).toEqual(["the ans", "the answer"]);
+  });
+
+  it("M173e: KNOWN LIMITATION (K>=2 mid-lane materialization failure) — positional pairing shifts", async () => {
+    // Same #111 final-identity ceiling as Case X, at the K>=2 branch. Topology
+    // A,B,C (all text) + a tool-only LAST message; B's frames drop on a transient
+    // wire failure so B never materializes. Core emits finals [tA,tB,tC].
+    // `materializedAnswerLanes()` correctly excludes B (per M13g's rule), leaving
+    // [A,C], so positional pairing shifts: tA→A (right), tB→C (WRONG lane), tC→
+    // overflow→independent. Finals are identity-less, so no sound recovery exists
+    // at this layer; the Phase 3 authoritative snapshot is the real fix. This test
+    // PINS the current behaviour so a change to it is deliberate — do NOT add
+    // mitigation code to make it "pass differently."
+    const h = makeDraftHarness({
+      // Fail every frame carrying B's text (progress AND final) so lane B never
+      // materializes, modelling a mid-sequence transient publish failure.
+      decide: (attempt) => attempt.text !== "B",
+    });
+    h.draft.handleAssistantMessageBoundary(); // first boundary: no-op
+    h.draft.pushAnswerText({ text: "A" }); // lane A (gen 0)
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // → lane B; A auto-settles (materializes)
+    h.draft.pushAnswerText({ text: "B" }); // lane B (gen 1) — its frames all fail
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // → lane C; B auto-settle FAILS (not materialized)
+    h.draft.pushAnswerText({ text: "C" }); // lane C (gen 2)
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // → tool-only lane (gen 3, textless current); C auto-settles
+
+    const idA = h.frames.find((frame) => frame.text === "A")!.id;
+    const idC = h.frames.find((frame) => frame.text === "C")!.id;
+    // Lane B never shipped a single frame.
+    expect(h.frames.some((frame) => frame.text === "B")).toBe(false);
+
+    await expect(h.draft.finalize("tA")).resolves.toBe(true); // buffered
+    await expect(h.draft.finalize("tB")).resolves.toBe(true); // buffered
+    await expect(h.draft.finalize("tC")).resolves.toBe(true); // buffered
+    await h.draft.drain();
+
+    // tA → A (correct); tB → C (WRONG lane — the pinned limitation); tC → independent.
+    const lastFinalOn = (id: string) =>
+      h.frames.filter((frame) => frame.type === "final" && frame.id === id).at(-1)!.text;
+    expect(lastFinalOn(idA)).toBe("tA");
+    expect(lastFinalOn(idC)).toBe("tB");
+    const tcFrame = h.frames.find((frame) => frame.text === "tC")!;
+    expect(tcFrame.id).not.toBe(idA);
+    expect(tcFrame.id).not.toBe(idC);
+  });
+
   it("M4: replace:true rewrites only the current lane", async () => {
     const warn = vi.fn();
     const h = makeDraftHarness({ logger: { warn } });
