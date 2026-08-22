@@ -151,18 +151,17 @@ Two flags carry the weight here:
   restricted publish silently recreates the auth problem this whole move exists
   to delete. (Both manifests also carry `publishConfig.access: "public"`; the
   flag is belt-and-braces.)
-- **`--tag bootstrap`** — keeps the placeholder off `latest`. npm's publish
-  payload carries exactly one dist-tag, the requested one
-  (`libnpmpublish/lib/publish.js`: `root['dist-tags'][tag] = manifest.version`,
-  where `tag` defaults to `latest`), so `0.0.0-bootstrap.0` lands under
-  `bootstrap` and the package has **no `latest` at all** until the real release
-  publishes one. The prerelease suffix must remain: a bare `*` excludes
-  prereleases but would select a stable placeholder when `latest` is absent. A
-  bare `npm install @mir-stream/webchannel-client` therefore fails with `ETARGET`
-  during the bootstrap window, which is the intended behaviour: better a clear
-  error than serving a placeholder as the current version. (If npm's registry
-  ever did stamp `latest` onto a first publish regardless, the `0.6.1` release
-  publish moves it anyway.)
+- **`--tag bootstrap`** — adds the explicit `bootstrap` tag, but does **not** keep
+  a first publish off `latest`: measured on both client and saas, npm set both
+  `bootstrap` and `latest` to `0.0.0-bootstrap.0`. During the window before the
+  real release, a bare `npm install` of either package therefore resolves
+  `latest` and can serve the unattested placeholder; there is no `ETARGET`
+  protection. npm does not permit removing the `latest` dist-tag, so keep this
+  bootstrap window short and cut the release promptly — that publish moves
+  `latest` to the real version. Keep the prerelease suffix anyway: once a real
+  release exists, ordinary `*` range resolution excludes prereleases, so the
+  placeholder cannot be selected again by a version range even if `latest` were
+  ever unset or moved.
 
 **Do not `npm unpublish` the placeholder** before the real release ships.
 Unpublishing the only version of a package removes the package itself — taking
@@ -198,6 +197,16 @@ the release is `0.6.1`, the idempotency guard finds no match and **`0.6.1`
 publishes through OIDC with provenance**, exactly as the changelog and the
 section below claim. On a re-run, the guard skips it only after verifying that
 provenance and the published `gitHead` against the run's commit.
+
+After the release publishes, verify that `latest` moved for **both** packages:
+
+```sh
+curl -s https://registry.npmjs.org/-/package/@mir-stream%2fwebchannel-client/dist-tags
+curl -s https://registry.npmjs.org/-/package/@mir-stream%2fwebchannel-saas/dist-tags
+```
+
+Each response must report `latest` equal to the release version, not
+`0.0.0-bootstrap.0`.
 
 **Until the bootstrap lands, releases are blocked.** Every `v*` tag fails at the
 `publish` job, and both plugin legs `needs: publish`, so they are skipped — which
