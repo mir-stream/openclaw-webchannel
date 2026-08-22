@@ -466,8 +466,8 @@ jobs:
           echo "Then re-run the original tag-push run with 'gh run rerun <RUN_ID>'; the publish legs are idempotent."
           echo "A re-run of a superseded tag fails here by design because the three latest tags no longer point to that tag's version; re-run the current release's run instead, and never move latest backward."
           echo "If a version is published but its latest is still wrong, only an operator can repair it with interactive auth; CI's OIDC credential authorizes 'npm publish' and 'npm stage publish' but not 'npm dist-tag add'."
-          echo "For a scoped package, override the scope mapping: npm dist-tag add <name>@<version> latest --@mir-stream:registry=https://registry.npmjs.org/"
-          echo "A plain --registry option is ignored when an @scope:registry mapping exists."
+          echo "Use the exact name printed above: npm dist-tag add <name>@<version> latest --registry=https://registry.npmjs.org/"
+          echo "If that name is scoped (@scope/...), override the SCOPE instead, e.g. --@mir-stream:registry=https://registry.npmjs.org/ — a plain --registry is ignored when an @scope:registry mapping exists."
           echo "Never move latest backward to an older release."
           echo "See the 'Recovering a split latest' section of docs/PUBLISHING.md."
           exit 1

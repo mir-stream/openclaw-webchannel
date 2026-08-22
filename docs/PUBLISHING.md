@@ -120,19 +120,31 @@ provenance and `gitHead` are verified and skipped while a missing publish is
 retried. If the version is published but its `latest` tag is still wrong, an
 operator must repair that package with interactive npm authentication:
 
+Use the **exact package name the failing job printed** — it reads all three names
+from the manifests, so they change when the packages are renamed:
+
 ```sh
-npm dist-tag add @mir-stream/<package>@<version> latest \
-  --@mir-stream:registry=https://registry.npmjs.org/
-npm dist-tag add openclaw-webchannel@<version> latest \
+npm dist-tag add <name>@<version> latest \
   --registry=https://registry.npmjs.org/
 ```
 
-For the scoped `@mir-stream/*` packages, the first command must override the
-**scope mapping**. The legacy `.npmrc` line documented later in this guide maps
-`@mir-stream` to GitHub Packages, and a plain `--registry` option does not
-override an `@scope:registry` mapping. The unscoped `openclaw-webchannel` plugin
-is unaffected. Before changing any tag, confirm the intended version is newer;
-never move `latest` backward.
+That form is correct for every **unscoped** name, which today means
+`openclaw-webchannel` and, after the #226 rename, `openclaw-webchannel-client`
+and `openclaw-webchannel-saas`.
+
+**If the name is scoped** (`@scope/...`, i.e. the `@mir-stream/webchannel-*`
+packages up to and including 0.6.x), that command silently targets the wrong
+registry: the legacy `.npmrc` line documented later in this guide maps
+`@mir-stream` to GitHub Packages, and a plain `--registry` does **not** override
+an `@scope:registry` mapping. Override the scope instead:
+
+```sh
+npm dist-tag add @mir-stream/<package>@<version> latest \
+  --@mir-stream:registry=https://registry.npmjs.org/
+```
+
+Before changing any tag, confirm the intended version is newer; never move
+`latest` backward.
 
 CI cannot perform that fallback: its trusted-publishing OIDC credential
 authorizes `npm publish` and `npm stage publish`, but not `npm dist-tag add`.
