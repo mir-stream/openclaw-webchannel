@@ -442,6 +442,43 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(snap.remove).not.toContain(idC);
   });
 
+  it("M212a2 (P3-F1): clean K>=2 tool-only-last — the snapshot carries each lane's FULL authoritative final, not the truncated partial", async () => {
+    // The provably-sound K>=2 shape (M173a at the frame level): A and B both
+    // stream AND materialize, then a tool-only LAST message leaves the current
+    // lane textless. Core buffers finals [tA,tB] and drain pairs them one-to-one
+    // onto [A,B] — no overflow, every text lane streamed, so the routing is
+    // certain. Each final's tail therefore belongs to its lane and the snapshot
+    // MUST show the FULL final text ("first answer"/"second answer"), NOT the last
+    // streamed partial ("first ans"/"second ans"). Before P3-F1 the buffered path
+    // left `answerText` non-authoritative on THIS sound path too, so the snapshot
+    // collapsed each lane back to its partial (a truncated tail on reload).
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary(); // first boundary: no-op
+    h.draft.pushAnswerText({ text: "first ans" }); // lane A (gen 0), streams + materializes
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // → lane B; A auto-settles
+    h.draft.pushAnswerText({ text: "second ans" }); // lane B (gen 1), streams + materializes
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // → tool-only lane (gen 2), textless current
+    const idA = h.frames.find((frame) => frame.text === "first ans")!.id;
+    const idB = h.frames.find((frame) => frame.text === "second ans")!.id;
+
+    await h.draft.finalize("first answer"); // buffered (textless current lane)
+    await h.draft.finalize("second answer"); // buffered
+    await h.draft.drain();
+
+    expect(idA).not.toBe(idB);
+    expect(h.snapshots).toHaveLength(1);
+    const snap = h.snapshots[0];
+    // The full, correctly-routed final for each streamed lane — no truncation.
+    expect(snap.answers).toEqual([
+      { id: idA, text: "first answer" },
+      { id: idB, text: "second answer" },
+    ]);
+    // One-to-one pairing, no overflow bubble to supersede.
+    expect(snap.remove).toEqual([]);
+  });
+
   it("M212b: Case X (K==1) — snapshot is [A] streamed with an EMPTY remove; the tool bubble is untouched (M173d preserved)", async () => {
     // Byte-identical to M173c at the plugin layer, so the snapshot deliberately
     // does NOT touch the tool bubble: it is neither an answer lane (never
