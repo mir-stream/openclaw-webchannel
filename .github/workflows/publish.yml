@@ -57,15 +57,16 @@ on:
     tags: ["v*"]
   workflow_dispatch: {}
 
-# Every v* tag shares one group so different releases cannot interleave writes
-# to the same npm `latest` tags. Non-release refs remain keyed per ref, so an
-# ordinary dispatch does not queue behind a release. Cancellation stays off:
+# Every v* tag push shares one group so different releases cannot interleave
+# writes to the same npm `latest` tags. Every dispatch stays keyed per ref: it
+# publishes nothing, so it must never queue behind or evict a release.
+# Cancellation stays off:
 # cancelling a half-finished publish is strictly worse than queueing behind it.
 # GitHub retains only one pending run per group; if a third release arrives while
 # one is running and one is pending, GitHub cancels the pending run. That is loud
 # and recoverable with `gh run rerun <RUN_ID>`, but it is not silent serialization.
 concurrency:
-  group: ${{ github.workflow }}-${{ startsWith(github.ref, 'refs/tags/v') && 'npm-release' || github.ref }}
+  group: ${{ github.workflow }}-${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) && 'npm-release' || github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -84,7 +85,7 @@ jobs:
       # ── 컷오버 조상 가드 ──
       # 구 커밋 재태그(전환 이전 세계의 파일·크레덴셜 전제)가 크레덴셜에 닿기 전에 차단한다.
       # 체크아웃 불필요: API compare 한 방. GITHUB_REF_NAME(태그명) 비교라 annotated 태그 역참조 문제 없음.
-      # 후속 2잡은 needs: publish 라 이 가드 하나로 전부 차단된다.
+      # 후속 3잡은 needs: publish 라 이 가드 하나로 전부 차단된다.
       # 알려진 잔여 구간: 이 SHA 이후·호스티드 러너 전환 이전 커밋을 재태그하면 가드는 통과하지만
       # 워크플로가 그 시점 파일(`runs-on: deploy`)로 돌아 존재하지 않는 라벨에 영원히 큐잉된다.
       # 그 태그를 실제로 다시 팔 일이 생기면 SHA 를 전환 커밋으로 올려 실패를 시끄럽게 만들 것.
@@ -379,9 +380,9 @@ jobs:
   # ---------------------------------------------------------------------------
   # Final public-npm assertion: npm moves each package's `latest` independently,
   # so a partially successful release can leave unversioned installs split across
-  # versions even though every package version is immutable. Registry reads can
-  # lag briefly, so verify the complete set with bounded retries before declaring
-  # the release broken.
+  # versions even though every package version is immutable. Poll through npm's
+  # publish-time scan horizon, then accept either this release on all three tags or
+  # a later release on all three; unreadable or split results fail.
   # ---------------------------------------------------------------------------
   verify-dist-tags:
     name: Verify public npm latest tags
@@ -406,22 +407,33 @@ jobs:
           SAAS_NAME="$(node -p "require('./packages/saas/package.json').name")"
           PLUGIN_NAME="$(node -p "require('./packages/plugin/package.json').name")"
           NAMES=("$CLIENT_NAME" "$SAAS_NAME" "$PLUGIN_NAME")
-          MAX_ATTEMPTS=5
-          RETRY_SECONDS=15
+          # npm's publish-time malware scan can delay availability for 15 minutes
+          # or more, so a 60-second horizon can report a healthy release as split:
+          # https://github.blog/changelog/2026-07-28-npm-publish-time-malware-scanning-and-dual-use-metadata/
+          # The 39 inter-attempt sleeps provide about 19.5 minutes of polling.
+          MAX_ATTEMPTS=40
+          RETRY_SECONDS=30
 
           for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
             LATESTS=()
-            WRONG=()
+            READ_OKS=()
+            ALL_EXPECTED=1
             echo "Checking npm latest tags (attempt ${attempt}/${MAX_ATTEMPTS})..."
             for NAME in "${NAMES[@]}"; do
-              LATEST="$(npm view "${NAME}" dist-tags.latest 2>/dev/null || true)"
+              LATEST=""
+              if LATEST="$(npm view "${NAME}" dist-tags.latest 2>/dev/null)"; then
+                READ_OKS+=(1)
+              else
+                READ_OKS+=(0)
+                ALL_EXPECTED=0
+              fi
               LATESTS+=("$LATEST")
               if [ "$LATEST" != "$VERSION" ]; then
-                WRONG+=("$NAME")
+                ALL_EXPECTED=0
               fi
             done
 
-            if [ "${#WRONG[@]}" -eq 0 ]; then
+            if [ "$ALL_EXPECTED" -eq 1 ]; then
               for i in "${!NAMES[@]}"; do
                 echo "${NAMES[$i]} latest=${LATESTS[$i]} (confirmed)"
               done
@@ -434,12 +446,40 @@ jobs:
             fi
           done
 
+          # This is deliberately reachable only after the full horizon: while a
+          # genuine release is scan-pending, all three tags can still show the old
+          # version. Both publish legs succeeded and never publish with `--tag`, so
+          # each version they ship moves `latest`. Three readable, non-empty tags
+          # agreeing on another version therefore mean a later release owns
+          # `latest`; the invariant holds and moving it backward would be harmful.
+          CONSENSUS="${LATESTS[0]}"
+          ALL_AGREE=1
           for i in "${!NAMES[@]}"; do
-            if [ "${LATESTS[$i]}" != "$VERSION" ]; then
-              echo "::error::${NAMES[$i]} latest is '${LATESTS[$i]:-<absent>}' (expected '${VERSION}')."
+            if [ "${READ_OKS[$i]}" -ne 1 ] \
+              || [ -z "${LATESTS[$i]}" ] \
+              || [ "${LATESTS[$i]}" != "$CONSENSUS" ]; then
+              ALL_AGREE=0
             fi
           done
-          echo "Recovery: re-run the original tag-push run with 'gh run rerun <RUN_ID>'; the publish legs are idempotent. If a package is published but latest is still wrong, only an operator can run 'npm dist-tag add <name>@<version> latest' with interactive auth; CI's OIDC credential cannot do it."
+          if [ "$ALL_AGREE" -eq 1 ] && [ "$CONSENSUS" != "$VERSION" ]; then
+            echo "::warning::All three packages agree at latest='${CONSENSUS}'. This run's tag version '${VERSION}' is not the current release; this is what a re-run of a superseded tag looks like. Do not move latest backward."
+            exit 0
+          fi
+
+          for i in "${!NAMES[@]}"; do
+            if [ "${READ_OKS[$i]}" -ne 1 ]; then
+              echo "::error::${NAMES[$i]} registry query failed while reading dist-tags.latest (expected '${VERSION}')."
+            elif [ "${LATESTS[$i]}" != "$VERSION" ]; then
+              echo "::error::${NAMES[$i]} latest is '${LATESTS[$i]}' (expected '${VERSION}')."
+            fi
+          done
+          echo "npm's publish-time scan can delay availability by 15 minutes or more. Confirm the versions are actually installable before re-running; an immediate re-run can see a scan-pending version as absent and try to publish it again."
+          echo "Then re-run the original tag-push run with 'gh run rerun <RUN_ID>'; the publish legs are idempotent."
+          echo "If a version is published but its latest is still wrong, only an operator can repair it with interactive auth; CI's OIDC credential authorizes 'npm publish' and 'npm stage publish' but not 'npm dist-tag add'."
+          echo "For a scoped package, override the scope mapping: npm dist-tag add <name>@<version> latest --@mir-stream:registry=https://registry.npmjs.org/"
+          echo "A plain --registry option is ignored when an @scope:registry mapping exists."
+          echo "Never move latest backward to an older release."
+          echo "See the 'Recovering a split latest' section of docs/PUBLISHING.md."
           exit 1
 
   # ---------------------------------------------------------------------------

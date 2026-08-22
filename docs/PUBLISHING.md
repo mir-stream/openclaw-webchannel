@@ -64,8 +64,8 @@ The `Publish Packages` workflow (`.github/workflows/publish.yml`) runs four jobs
 - **`publish-plugin-npm`** — gated on `publish` succeeding; builds/tests the
   plugin and publishes it to public npm the same way. Tag *push* only.
 - **`verify-dist-tags`** — gated on both public-npm publish jobs succeeding;
-  confirms that all three packages' `latest` tags resolve to the release
-  version. Tag *push* only.
+  confirms that all three packages' `latest` tags agree (normally on the
+  release version). Tag *push* only.
 - **`publish-plugin`** — gated on `publish` succeeding; builds/tests the plugin
   and publishes it to ClawHub (see next section). Disabled by default via the
   `PUBLISH_CLAWHUB` repository variable, and additionally skipped on ALL manual
@@ -90,11 +90,21 @@ npm advances each package's `latest` dist-tag independently; there is no
 multi-package transaction. If a release stops partway through, some packages
 can therefore resolve at the new version while another still resolves at an
 older version (or at the bootstrap placeholder for a new package name). The
-read-only `verify-dist-tags` job retries through ordinary registry propagation
-lag, then makes the workflow red unless all three manifest-derived package names
-report the release version as `latest`.
+read-only `verify-dist-tags` job polls for roughly 20 minutes before declaring a
+split. That horizon covers npm's publish-time malware scan, which creates a
+delay between publishing and availability (typically about five minutes, but
+15 minutes or more at peak times or for some package content and sizes):
+https://github.blog/changelog/2026-07-28-npm-publish-time-malware-scanning-and-dual-use-metadata/.
+Do not re-run while a version is still scan-pending; an immediate re-run can see
+the version as absent and try to publish it again.
 
-First, re-run the original tag-push run:
+After that horizon, all three packages agreeing on the same readable, non-empty
+`latest` value is the invariant. A re-run of a superseded tag is therefore
+expected to end green with a warning when all three packages agree on the current
+release, rather than fail because they no longer point at the re-run's tag.
+**Never move `latest` backward** to an older release.
+
+Once the versions are actually installable, re-run the original tag-push run:
 
 ```sh
 gh run rerun <RUN_ID>
@@ -106,8 +116,18 @@ retried. If the version is published but its `latest` tag is still wrong, an
 operator must repair that package with interactive npm authentication:
 
 ```sh
-npm dist-tag add <name>@<version> latest
+npm dist-tag add @mir-stream/<package>@<version> latest \
+  --@mir-stream:registry=https://registry.npmjs.org/
+npm dist-tag add openclaw-webchannel@<version> latest \
+  --registry=https://registry.npmjs.org/
 ```
+
+For the scoped `@mir-stream/*` packages, the first command must override the
+**scope mapping**. The legacy `.npmrc` line documented later in this guide maps
+`@mir-stream` to GitHub Packages, and a plain `--registry` option does not
+override an `@scope:registry` mapping. The unscoped `openclaw-webchannel` plugin
+is unaffected. Before changing any tag, confirm the intended version is newer;
+never move `latest` backward.
 
 CI cannot perform that fallback: its trusted-publishing OIDC credential
 authorizes `npm publish` and `npm stage publish`, but not `npm dist-tag add`.
