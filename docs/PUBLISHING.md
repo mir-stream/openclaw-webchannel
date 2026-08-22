@@ -44,7 +44,7 @@ so the plugin can never fall behind the npm packages again.
    git push origin v0.1.0
    ```
 
-The `Publish Packages` workflow (`.github/workflows/publish.yml`) runs three jobs:
+The `Publish Packages` workflow (`.github/workflows/publish.yml`) runs four jobs:
 
 - **`publish`** — builds, tests, and publishes `webchannel-client` and
   `webchannel-saas` to public npm via **OIDC trusted publishing** with
@@ -64,11 +64,42 @@ The `Publish Packages` workflow (`.github/workflows/publish.yml`) runs three job
 
 - **`publish-plugin-npm`** — gated on `publish` succeeding; builds/tests the
   plugin and publishes it to public npm the same way. Tag *push* only.
+- **`verify-dist-tags`** — gated on both public-npm publish jobs succeeding;
+  confirms that all three packages' `latest` tags resolve to the release
+  version. Tag *push* only.
 - **`publish-plugin`** — gated on `publish` succeeding; builds/tests the plugin
   and publishes it to ClawHub (see next section). Disabled by default via the
   `PUBLISH_CLAWHUB` repository variable, and additionally skipped on ALL manual
   workflow_dispatch runs — including one started from a tag ref — because its
   publish surface deliberately remains tag-*push*-only.
+
+### Recovering a split `latest`
+
+npm advances each package's `latest` dist-tag independently; there is no
+multi-package transaction. If a release stops partway through, some packages
+can therefore resolve at the new version while another still resolves at an
+older version (or at the bootstrap placeholder for a new package name). The
+read-only `verify-dist-tags` job retries through ordinary registry propagation
+lag, then makes the workflow red unless all three manifest-derived package names
+report the release version as `latest`.
+
+First, re-run the original tag-push run:
+
+```sh
+gh run rerun <RUN_ID>
+```
+
+The publish legs are idempotent, so packages already present with the expected
+provenance and `gitHead` are verified and skipped while a missing publish is
+retried. If the version is published but its `latest` tag is still wrong, an
+operator must repair that package with interactive npm authentication:
+
+```sh
+npm dist-tag add <name>@<version> latest
+```
+
+CI cannot perform that fallback: its trusted-publishing OIDC credential
+authorizes `npm publish` and `npm stage publish`, but not `npm dist-tag add`.
 
 Note: **all three legs are idempotent.** Each package (client, saas, plugin) is
 skipped when that exact version is positively confirmed already on its registry

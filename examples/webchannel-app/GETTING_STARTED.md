@@ -97,9 +97,9 @@ npm install
 Verify you actually downloaded the tarballs (not a local symlink):
 
 ```bash
-readlink node_modules/@mir-stream/webchannel-saas || echo "REAL dir (downloaded, not a symlink)"
-grep -m1 '"resolved".*registry.npmjs.org' package-lock.json
-# → "resolved": "https://registry.npmjs.org/@mir-stream/webchannel-saas/-/webchannel-saas-0.6.1.tgz"
+node -e 'const l=require("./package-lock.json"); for (const p of ["@mir-stream/webchannel-saas","@mir-stream/webchannel-client"]) { const e=l.packages?.[`node_modules/${p}`]; if (!e?.resolved?.startsWith("https://registry.npmjs.org/")) { console.error(`${p}: expected a registry.npmjs.org tarball, found ${e?.resolved ?? "<missing>"}`); process.exitCode=1; } else console.log(`${p}: ${e.resolved}`); }'
+# → @mir-stream/webchannel-saas: https://registry.npmjs.org/@mir-stream/webchannel-saas/-/webchannel-saas-0.6.1.tgz
+# → @mir-stream/webchannel-client: https://registry.npmjs.org/@mir-stream/webchannel-client/-/webchannel-client-0.6.1.tgz
 ```
 
 ## Step 3 — Point the relay at Synadia (NGS)

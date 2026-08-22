@@ -56,6 +56,11 @@ on:
     tags: ["v*"]
   workflow_dispatch: {}
 
+# Cancelling a half-finished publish is strictly worse than queueing behind it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -366,6 +371,72 @@ jobs:
         # The client/saas leg that ran before this one is idempotent and will
         # skip on the retry.
         run: npm publish -w packages/plugin --access public --provenance
+
+  # ---------------------------------------------------------------------------
+  # Final public-npm assertion: npm moves each package's `latest` independently,
+  # so a partially successful release can leave unversioned installs split across
+  # versions even though every package version is immutable. Registry reads can
+  # lag briefly, so verify the complete set with bounded retries before declaring
+  # the release broken.
+  # ---------------------------------------------------------------------------
+  verify-dist-tags:
+    name: Verify public npm latest tags
+    needs: [publish, publish-plugin-npm]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Deliberately no `id-token: write`: this read-only assertion touches no credential.
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify all public npm latest tags
+        run: |
+          set -uo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          CLIENT_NAME="$(node -p "require('./packages/client/package.json').name")"
+          SAAS_NAME="$(node -p "require('./packages/saas/package.json').name")"
+          PLUGIN_NAME="$(node -p "require('./packages/plugin/package.json').name")"
+          NAMES=("$CLIENT_NAME" "$SAAS_NAME" "$PLUGIN_NAME")
+          MAX_ATTEMPTS=5
+          RETRY_SECONDS=15
+
+          for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
+            LATESTS=()
+            WRONG=()
+            echo "Checking npm latest tags (attempt ${attempt}/${MAX_ATTEMPTS})..."
+            for NAME in "${NAMES[@]}"; do
+              LATEST="$(npm view "${NAME}" dist-tags.latest 2>/dev/null || true)"
+              LATESTS+=("$LATEST")
+              if [ "$LATEST" != "$VERSION" ]; then
+                WRONG+=("$NAME")
+              fi
+            done
+
+            if [ "${#WRONG[@]}" -eq 0 ]; then
+              for i in "${!NAMES[@]}"; do
+                echo "${NAMES[$i]} latest=${LATESTS[$i]} (confirmed)"
+              done
+              exit 0
+            fi
+
+            if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+              echo "npm latest tags have not converged; retrying in ${RETRY_SECONDS}s."
+              sleep "$RETRY_SECONDS"
+            fi
+          done
+
+          for i in "${!NAMES[@]}"; do
+            if [ "${LATESTS[$i]}" != "$VERSION" ]; then
+              echo "::error::${NAMES[$i]} latest is '${LATESTS[$i]:-<absent>}' (expected '${VERSION}')."
+            fi
+          done
+          echo "Recovery: re-run the original tag-push run with 'gh run rerun <RUN_ID>'; the publish legs are idempotent. If a package is published but latest is still wrong, only an operator can run 'npm dist-tag add <name>@<version> latest' with interactive auth; CI's OIDC credential cannot do it."
+          exit 1
 
   # ---------------------------------------------------------------------------
   # Plugin leg #2: publish the openclaw-webchannel code-plugin to ClawHub.
