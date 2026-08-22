@@ -197,8 +197,11 @@ jobs:
       # the registry must also report provenance and a gitHead matching this run's
       # commit, or the step fails instead of accepting an immutable tarball of
       # unknown origin. This makes "Re-run failed jobs" safe after a partial npm
-      # publish (client shipped, saas flaked), and a full re-run of a fully-shipped
-      # tag a verified green no-op. Each check uses the package.json's own version
+      # publish (client shipped, saas flaked). On a full re-run, already-shipped
+      # publish legs are verified no-ops and skip green. End-to-end green also
+      # requires all three `latest` tags to equal the re-run tag's version, so a
+      # superseded tag ends red at `verify-dist-tags` by design; never move
+      # `latest` backward to fix it. Each check uses the package.json's own version
       # (NOT the tag); lockstep guarantees package.json == tag on the tag-push path.
       # The `npm view` probes need no auth now that the target is the public registry.
       #
@@ -381,18 +384,24 @@ jobs:
   # Final public-npm assertion: npm moves each package's `latest` independently,
   # so a partially successful release can leave unversioned installs split across
   # versions even though every package version is immutable. Poll through npm's
-  # publish-time scan horizon, then accept either this release on all three tags or
-  # a later release on all three; unreadable or split results fail.
+  # publish-time scan horizon, then succeed only when all three reads succeed and
+  # all three tags equal this release's version. Every other result fails closed.
   # ---------------------------------------------------------------------------
   verify-dist-tags:
     name: Verify public npm latest tags
     needs: [publish, publish-plugin-npm]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    # Deliberately no `id-token: write`: this read-only assertion touches no credential.
+    # Bound the ~19.5-minute polling budget plus registry latency, limiting how
+    # long this job can hold the npm-release concurrency group.
+    timeout-minutes: 30
+    # Deliberately no npm/OIDC publishing credential; the read-only GITHUB_TOKEN
+    # is limited to contents: read and is not persisted by checkout.
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -446,26 +455,6 @@ jobs:
             fi
           done
 
-          # This is deliberately reachable only after the full horizon: while a
-          # genuine release is scan-pending, all three tags can still show the old
-          # version. Both publish legs succeeded and never publish with `--tag`, so
-          # each version they ship moves `latest`. Three readable, non-empty tags
-          # agreeing on another version therefore mean a later release owns
-          # `latest`; the invariant holds and moving it backward would be harmful.
-          CONSENSUS="${LATESTS[0]}"
-          ALL_AGREE=1
-          for i in "${!NAMES[@]}"; do
-            if [ "${READ_OKS[$i]}" -ne 1 ] \
-              || [ -z "${LATESTS[$i]}" ] \
-              || [ "${LATESTS[$i]}" != "$CONSENSUS" ]; then
-              ALL_AGREE=0
-            fi
-          done
-          if [ "$ALL_AGREE" -eq 1 ] && [ "$CONSENSUS" != "$VERSION" ]; then
-            echo "::warning::All three packages agree at latest='${CONSENSUS}'. This run's tag version '${VERSION}' is not the current release; this is what a re-run of a superseded tag looks like. Do not move latest backward."
-            exit 0
-          fi
-
           for i in "${!NAMES[@]}"; do
             if [ "${READ_OKS[$i]}" -ne 1 ]; then
               echo "::error::${NAMES[$i]} registry query failed while reading dist-tags.latest (expected '${VERSION}')."
@@ -475,6 +464,7 @@ jobs:
           done
           echo "npm's publish-time scan can delay availability by 15 minutes or more. Confirm the versions are actually installable before re-running; an immediate re-run can see a scan-pending version as absent and try to publish it again."
           echo "Then re-run the original tag-push run with 'gh run rerun <RUN_ID>'; the publish legs are idempotent."
+          echo "A re-run of a superseded tag fails here by design because the three latest tags no longer point to that tag's version; re-run the current release's run instead, and never move latest backward."
           echo "If a version is published but its latest is still wrong, only an operator can repair it with interactive auth; CI's OIDC credential authorizes 'npm publish' and 'npm stage publish' but not 'npm dist-tag add'."
           echo "For a scoped package, override the scope mapping: npm dist-tag add <name>@<version> latest --@mir-stream:registry=https://registry.npmjs.org/"
           echo "A plain --registry option is ignored when an @scope:registry mapping exists."
