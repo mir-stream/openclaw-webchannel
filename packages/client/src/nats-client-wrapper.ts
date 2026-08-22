@@ -1494,8 +1494,14 @@ export class WebChannelNATSClient {
         typeof a.text === "string",
     );
     // Defense-in-depth: the plugin never repeats an id (lane ids and minted ids
-    // are unique), but a duplicate would break the slot-refill's
-    // `slots.length === answers.length` assumption. Keep the FIRST occurrence.
+    // are unique), but a duplicate would break the slot-refill's per-slot
+    // pairing. Keep the FIRST occurrence. NOTE: after alias resolution below the
+    // real invariant is `slots.length === (distinct resolvedIds)`; two answers
+    // could only collapse to one bubble if the plugin named a canonical/core
+    // transcript id in `answers`. That cannot happen today — the plugin
+    // answer-id namespace (`webchannel-*`/`a-*`) is disjoint from the core
+    // transcript id namespace history adoption renames INTO — so this dedup
+    // (wire-id only) plus that disjointness keeps the pairing 1:1.
     const answerSeen = new Set<string>();
     const answers = rawAnswers.filter((a) =>
       answerSeen.has(a.id) ? false : (answerSeen.add(a.id), true),
@@ -1515,32 +1521,57 @@ export class WebChannelNATSClient {
     // 2. Desired answer objects, in authoritative order, reusing any existing
     //    bubble's state (so a live bubble's non-render fields survive).
     const existingById = new Map(msgs.map((m) => [m.id, m] as const));
+    // Alias index: a bubble that history adoption renamed carries the LIVE id it
+    // was renamed from (`adoptedFromLiveId`). A `turn_snapshot` answer still
+    // names that live id, so an already-adopted bubble is invisible to the
+    // by-id lookup above and would MINT a permanent duplicate. Resolve the
+    // answer's live id to the adopted bubble via this alias too. Guard against
+    // shadowing a real live bubble that happens to hold the same id.
+    const existingByAlias = new Map<string, ChatMessage>();
+    for (const m of msgs) {
+      if (typeof m.adoptedFromLiveId === "string" && !existingById.has(m.adoptedFromLiveId)) {
+        existingByAlias.set(m.adoptedFromLiveId, m);
+      }
+    }
+    // The RESOLVED id — the id the matched bubble already carries in `msgs`
+    // (canonical for an adopted bubble, else the live id) — is the key every
+    // step below uses. Keying on it (not the wire answer id) keeps an
+    // alias-matched bubble on its own canonical slot instead of duplicating it.
+    const resolvedIds: string[] = [];
     const desiredById = new Map<string, ChatMessage>();
     for (const a of answers) {
-      const prev = existingById.get(a.id);
+      const prev = existingById.get(a.id) ?? existingByAlias.get(a.id);
+      const resolvedId = prev ? prev.id : a.id;
+      resolvedIds.push(resolvedId);
       desiredById.set(
-        a.id,
+        resolvedId,
         prev
           ? { ...prev, role: "agent", text: a.text, working: false, turnId }
           : { id: a.id, role: "agent", text: a.text, working: false, turnId },
       );
     }
-    const answerIds = new Set(answers.map((a) => a.id));
+    // Keyed on resolvedIds (not the wire answer ids): an alias-matched answer
+    // reorders on its canonical slot. Sound while resolvedIds stay distinct —
+    // see the namespace-disjointness note at the dedup above.
+    const answerIds = new Set(resolvedIds);
 
     // 3. Give every MINTED (not-yet-present) answer a slot next to its
     //    predecessor answer, so the reorder below is a pure permutation that
     //    never moves a non-answer bubble.
     for (let k = 0; k < answers.length; k++) {
-      if (existingById.has(answers[k].id)) continue;
+      // An already-present bubble — matched by wire id OR by adoption alias — has
+      // its resolved id in `existingById`, so it only needs reordering below, not
+      // a fresh slot. Only a genuinely absent answer mints.
+      if (existingById.has(resolvedIds[k])) continue;
       let insertAt = msgs.length;
       if (k > 0) {
-        const predIdx = msgs.findIndex((m) => m.id === answers[k - 1].id);
+        const predIdx = msgs.findIndex((m) => m.id === resolvedIds[k - 1]);
         insertAt = predIdx === -1 ? msgs.length : predIdx + 1;
       } else {
         const firstAnswer = msgs.findIndex((m) => answerIds.has(m.id));
         if (firstAnswer !== -1) insertAt = firstAnswer;
       }
-      msgs.splice(insertAt, 0, desiredById.get(answers[k].id)!);
+      msgs.splice(insertAt, 0, desiredById.get(resolvedIds[k])!);
     }
 
     // 4. Refill the answer slots in authoritative order — answer bubbles reorder
@@ -1550,7 +1581,7 @@ export class WebChannelNATSClient {
       if (answerIds.has(m.id)) slots.push(i);
     });
     slots.forEach((pos, idx) => {
-      msgs[pos] = desiredById.get(answers[idx].id)!;
+      msgs[pos] = desiredById.get(resolvedIds[idx])!;
     });
 
     this.setState({ messages: msgs, isTyping: false });
@@ -2164,11 +2195,23 @@ export class WebChannelNATSClient {
           // observed live block ordinal is deliberately discarded: history
           // cannot validate or persist this run/attempt-local metadata.
           const { assistantMessageIndex: _liveOrdinal, ...adoptedMessage } = next[idx];
+          // Record the live id we are renaming away from as an alias, so a later
+          // `turn_snapshot` (whose `answers` still name the LIVE id) resolves to
+          // THIS already-adopted bubble instead of minting a duplicate. Only for
+          // agent bubbles whose id actually changes: user echoes already survive
+          // id churn via `receiptKey`, and their live `u-<n>` ids are disjoint
+          // from the plugin answer-id namespace, so aliasing them buys nothing.
+          const priorLiveId = adoptedMessage.id;
+          const aliasField =
+            adoptedMessage.role === "agent" && priorLiveId !== m.id
+              ? { adoptedFromLiveId: priorLiveId }
+              : {};
           next[idx] = {
             ...adoptedMessage,
             id: m.id,
             text: m.text,
             ts: m.ts,
+            ...aliasField,
           };
           claimed.add(idx);
           localIndexById.set(m.id, idx);

@@ -1566,6 +1566,98 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
     deliver(w, { type: "turn_snapshot", turnId: "T", answers: [], remove: ["ghost"] });
     expect(w.getState().messages).toEqual(before);
   });
+
+  // --- S3: adoption BEFORE the snapshot (the 0.6.1 permanent-duplicate cross).
+  // Order: live render (working:false) → history adoption renames the live id to
+  // its canonical transcript id → `turn_snapshot` still names the LIVE id. Before
+  // the alias fix the snapshot's by-id lookup missed the adopted bubble and MINTED
+  // a second, permanent bubble ([canonical-A, webchannel-A]). Reachable on
+  // multi-device / reconnect (history is a detached read).
+  it("S3: a snapshot whose live answer id was already adopted updates in place, no duplicate", () => {
+    const w = makeWrapper();
+    w.send("hello"); // u-0
+    // Live agent bubble, settled (working:false) under its plugin live id.
+    liveBubble(w, "webchannel-A", "T", "…", "live A");
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["u-0", "webchannel-A"]);
+
+    // History adoption (tier-2 user echo, tier-3 positional agent) renames
+    // webchannel-A → canonical-A, discarding the live id but now recording it as
+    // an alias on the adopted bubble.
+    deliver(w, {
+      type: "history",
+      messages: [
+        { id: "core-u1", role: "user", text: "hello", ts: 1 },
+        { id: "canonical-A", role: "agent", text: "live A\n\n<stored metadata>", ts: 2 },
+      ],
+    });
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["core-u1", "canonical-A"]);
+
+    // The authoritative Phase-3 snapshot arrives naming the LIVE id.
+    deliver(w, {
+      type: "turn_snapshot",
+      turnId: "T",
+      answers: [{ id: "webchannel-A", text: "live A" }],
+      remove: [],
+    });
+
+    const after = w.getState().messages;
+    // Exactly ONE agent bubble — the adopted one, updated in place — never the
+    // [canonical-A, webchannel-A] duplicate.
+    expect(after.map((m) => m.id)).toEqual(["core-u1", "canonical-A"]);
+    expect(after.filter((m) => m.role === "agent")).toHaveLength(1);
+    // Snapshot text is authoritative; the bubble keeps its canonical id and turn.
+    expect(after.find((m) => m.id === "canonical-A")).toMatchObject({
+      role: "agent",
+      text: "live A",
+      working: false,
+      turnId: "T",
+    });
+    expect(after.some((m) => m.id === "webchannel-A")).toBe(false);
+
+    // Idempotent: a repeat snapshot for the same live id resolves via the alias
+    // again — still one bubble.
+    deliver(w, {
+      type: "turn_snapshot",
+      turnId: "T",
+      answers: [{ id: "webchannel-A", text: "live A" }],
+      remove: [],
+    });
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["core-u1", "canonical-A"]);
+    expect(w.getState().messages.filter((m) => m.role === "agent")).toHaveLength(1);
+  });
+
+  // --- S4: the REVERSE order (snapshot before adoption) must keep working: the
+  // snapshot upserts by the live id (no alias exists yet), then adoption renames
+  // that same bubble exactly once. Guards against a regression where alias
+  // resolution changed the not-yet-adopted path.
+  it("S4: reverse order — snapshot before adoption upserts by live id, then adoption renames once", () => {
+    const w = makeWrapper();
+    w.send("hello"); // u-0
+    liveBubble(w, "webchannel-A", "T", "…", "live A");
+
+    // Snapshot first, while the bubble still carries its live id (no alias yet).
+    deliver(w, {
+      type: "turn_snapshot",
+      turnId: "T",
+      answers: [{ id: "webchannel-A", text: "A final" }],
+      remove: [],
+    });
+    let msgs = w.getState().messages;
+    expect(msgs.map((m) => m.id)).toEqual(["u-0", "webchannel-A"]);
+    expect(msgs.find((m) => m.id === "webchannel-A")!.text).toBe("A final");
+
+    // Then history adoption renames the live id → canonical exactly once.
+    deliver(w, {
+      type: "history",
+      messages: [
+        { id: "core-u1", role: "user", text: "hello", ts: 1 },
+        { id: "canonical-A", role: "agent", text: "A final\n\n<stored metadata>", ts: 2 },
+      ],
+    });
+    msgs = w.getState().messages;
+    expect(msgs.map((m) => m.id)).toEqual(["core-u1", "canonical-A"]);
+    expect(msgs.filter((m) => m.role === "agent")).toHaveLength(1);
+  });
 });
 
 // ---------------------------------------------------------------------------

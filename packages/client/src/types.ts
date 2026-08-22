@@ -148,6 +148,18 @@ export type ChatMessage = {
    */
   turnId?: string;
   /**
+   * The LIVE (plugin-minted) id this agent bubble carried BEFORE history
+   * adoption renamed it to its canonical transcript id. History adoption
+   * (`adoptAt`) rewrites `id` in place and discards the live id, but a
+   * `turn_snapshot` still names that live id in its `answers`; without a
+   * back-reference the snapshot's live-id lookup would MISS the already-adopted
+   * bubble and MINT a permanent duplicate. `applyTurnSnapshot` resolves a
+   * snapshot answer id against BOTH `id` and this alias, updating the adopted
+   * bubble in place. Set only for adopted agent bubbles whose id actually
+   * changed; local-only, never on the wire, never in history. @internal
+   */
+  adoptedFromLiveId?: string;
+  /**
    * P1-9: true while this user message is HELD locally (a turn was in flight
    * at send time) and not yet published. Local-only — never on the wire,
    * never in history. Flips off (with wireId/turnId assigned) at release.
