@@ -230,9 +230,11 @@ replies over the E2E-encrypted NGS relay.
 
 ## What’s verified vs. the frontier
 
-- ✅ **Registry install + SaaS + browser flow** is verified: the app runs off the
-  downloaded `@mir-stream/*@0.1.3` tarballs up to the `connected → waiting-for-agent`
-  state, public-API-only.
+- ✅ **Registry install + SaaS + browser flow** is verified: the app ran off the
+  downloaded tarballs up to the `connected → waiting-for-agent` state,
+  public-API-only. That verification was performed at `0.1.3`, when these
+  packages were still published under the old scoped `@mir-stream/webchannel-*`
+  names.
 - 🧭 **The openclaw attach (Step 6) is the part you drive.** It uses the same enrollment
   mechanics (`/api/enroll` → admin approve → `gateway`) that the internal `demo/` proves,
   but your openclaw environment (account naming, model provider) is yours. If a step

@@ -1,21 +1,30 @@
 # Publishing & Consuming the WebChannel Packages
 
-As of **0.6.1**, two packages publish to the **public npm registry**
-(`registry.npmjs.org`), MIT-licensed, installable by anyone with no
-authentication at all:
+Two packages publish to the **public npm registry** (`registry.npmjs.org`),
+MIT-licensed, installable by anyone with no authentication at all:
 
 | Package | What it is |
 |---|---|
 | `openclaw-webchannel-saas` | Headless SaaS trust-chain core (device-flow enrollment, NATS creds/JWT minting) |
 | `openclaw-webchannel-client` | Framework-agnostic, zero-dependency browser client |
 
-They lived on **GitHub Packages** until 0.6.1. That registry requires an
-authenticated `read:packages` token for *every* consumer read — even of a public
-package — so every downstream project, CI job, Docker build and deploy host
-needed a credential just to `npm install`, which is why real consumers vendored
-these packages instead. The repo is public and the packages are MIT, so as of
-0.6.1 they publish to npmjs.org like the plugin already did: OIDC trusted
-publishing, no long-lived token, with provenance attestation.
+**Those unscoped names are not published yet.** They arrive with the next
+release, and each needs the
+[one-time bootstrap](#one-time-bootstrap-trusted-publishing-for-client--saas)
+below before CI can publish it. What is installable **today** is the previous,
+scoped pair — `@mir-stream/webchannel-saas` and `@mir-stream/webchannel-client`
+at `0.6.1`, on public npm, `latest`, with provenance. Those scoped names are
+unpublished once the unscoped ones ship, so consumers must move; see
+[Migrating an existing consumer](#migrating-an-existing-consumer).
+
+The scoped names lived on **GitHub Packages** until 0.6.1. That registry requires
+an authenticated `read:packages` token for *every* consumer read — even of a
+public package — so every downstream project, CI job, Docker build and deploy
+host needed a credential just to `npm install`, which is why real consumers
+vendored these packages instead. The repo is public and the packages are MIT, so
+as of 0.6.1 they publish to npmjs.org like the plugin already did: OIDC trusted
+publishing, no long-lived token, with provenance attestation. The rename changes
+the names only — that registry story is unaffected.
 
 A third artifact — the `openclaw-webchannel` **plugin** — is published to the
 public npm registry by the same `v*` tag. It has a ClawHub leg too, but that leg
@@ -185,31 +194,45 @@ CI could not replace it with the attested build the release promises. Bootstrap
 with a throwaway `0.0.0-bootstrap.0` instead, so the **real** release is the first
 thing CI publishes and it carries provenance.
 
-**Prerequisite.** Both names are **unscoped**, so npm org membership is
-irrelevant here — org permissions govern `@scope/` packages only. An unscoped
-name is owned **per package, first-come-first-served**: whoever publishes it
-first becomes its owner. Two things must therefore hold before step (a), and
-neither is self-diagnosing afterwards:
+**Prerequisite.** A brand-new **unscoped** name is claimed by whoever publishes
+it first, so `@mir-stream` org membership is not a precondition here — the
+bootstrap publish itself is what claims the name, and there is no separate grant
+step. Two things must hold before step (a), and neither is self-diagnosing
+afterwards:
 
-1. **You are logged in as the account that should own these names.** The
-   bootstrap publish is what claims ownership; there is no separate grant step.
+1. **You are logged in as the account that owns the existing plugin.** All three
+   packages must end up under one account: the operator repair path this guide
+   depends on (`npm dist-tag add`) can only be run by an owner, so bootstrapping
+   from a different account splits the three packages across two principals — and
+   you would discover it mid-release. `npm whoami` must equal the owner of
+   `openclaw-webchannel`:
 
    ```sh
    npm whoami --registry https://registry.npmjs.org
+   npm owner ls openclaw-webchannel --registry https://registry.npmjs.org  # → mir-stream
    ```
 
 2. **Both names are still unclaimed.** A `404` here is the required
    precondition, not an error:
 
    ```sh
-   npm view openclaw-webchannel-client   # must be E404
-   npm view openclaw-webchannel-saas     # must be E404
+   npm view openclaw-webchannel-client --registry https://registry.npmjs.org   # must be E404
+   npm view openclaw-webchannel-saas   --registry https://registry.npmjs.org   # must be E404
    ```
 
-   Both returned `E404` when last checked (2026-08-22). **If either ever stops
-   returning `404`, stop.** Someone else has taken the name, and no amount of
-   configuration recovers it — the bootstrap and every later release under that
-   name are blocked until a different name is chosen.
+   Both returned `E404` when last checked (2026-08-22). Pin the registry on these
+   reads: a stale `registry=` in `~/.npmrc` would 404 from the *wrong* registry
+   and hand you a false "unclaimed".
+
+   **If either stops returning `404`, check `npm owner ls <name>` before
+   concluding anything.** Step (a) publishes the two packages separately, so a
+   partial bootstrap is entirely normal — one can succeed and the other fail (the
+   two scoped packages were created 14 seconds apart, as two publishes). If your
+   account is listed, you already claimed that name on an earlier attempt: leave
+   it alone and skip to step (b). **Only if the owner is someone else must you
+   stop** — no amount of configuration recovers a name another account holds, and
+   the bootstrap plus every later release under it are blocked until a different
+   name is chosen.
 
 **(a) Publish a `0.0.0-bootstrap.0` placeholder for each package.** The point is
 only to make the *name* exist so npm will accept a trusted-publisher configuration
@@ -237,12 +260,12 @@ There is deliberately no build step: both manifests declare `"prepack": "npm run
 build"`, so `npm publish` rebuilds `dist/` itself. An explicit build line would
 be one more thing to forget, and forgetting it would ship a stale tarball.
 
-Two flags carry the weight here:
+One flag carries the weight here:
 
-- **`--access public`** — scoped packages default to **restricted**, and a
-  restricted publish silently recreates the auth problem this whole move exists
-  to delete. (Both manifests also carry `publishConfig.access: "public"`; the
-  flag is belt-and-braces.)
+- **`--access public`** — a no-op for these names, kept for clarity. Unscoped
+  packages are always public; the restricted default that this flag exists to
+  override applies to scoped names only. (Both manifests also carry
+  `publishConfig.access: "public"`, equally harmless.)
 - **`--tag bootstrap`** — adds the explicit `bootstrap` tag, but does **not** keep
   a first publish off `latest`: measured on both client and saas, npm set both
   `bootstrap` and `latest` to `0.0.0-bootstrap.0`. During the window before the
@@ -378,8 +401,14 @@ release can't silently change the publish contract mid-release. Bump the pin in
 
 ### Migrating an existing consumer
 
-Projects that consumed a pre-0.6.1 release may still force the entire
-`@mir-stream` scope through GitHub Packages.
+**Every existing consumer must do this**, whichever release you are on: the
+packages were renamed, and the old `@mir-stream/webchannel-*` names are
+unpublished once the unscoped names ship. This is a *name* change, so a plain
+`npm update` will not do it — nothing resolves the old name to the new one.
+
+Steps 1 and 2 apply only if you consumed a **pre-0.6.1** release and may still
+force the `@mir-stream` scope through GitHub Packages; if you are already on
+0.6.1 from public npm, start at step 3.
 
 1. **Remove the old registry configuration first.** Delete the scope line and
    any matching token line wherever they exist — project `.npmrc`, user-level
@@ -398,14 +427,31 @@ Projects that consumed a pre-0.6.1 release may still force the entire
 
    It must no longer print `https://npm.pkg.github.com`.
 
-3. **Upgrade explicitly and refresh the lockfile.** This replaces an old
-   dependency spec instead of letting Arborist preserve it:
+3. **Remove the old names and add the new ones.** Uninstalling is not optional:
+   `npm install` of the new names only *adds* them, leaving the old dependencies
+   in `package.json` and the lockfile — where they still resolve, so you would
+   ship two copies of the library and never notice.
 
    ```sh
+   npm uninstall @mir-stream/webchannel-saas @mir-stream/webchannel-client
    npm install --save-exact openclaw-webchannel-saas@0.6.1 openclaw-webchannel-client@0.6.1
    ```
 
-4. **Verify no GitHub Packages URL remains.**
+4. **Rewrite every import specifier in your source.** The package name changed,
+   so every `import`/`require` still naming the old package will now fail to
+   resolve. Find them first, then rewrite:
+
+   ```sh
+   grep -rn '@mir-stream/webchannel-' --include='*.ts' --include='*.tsx' \
+     --include='*.js' --include='*.mjs' .
+   ```
+
+   `@mir-stream/webchannel-saas` → `openclaw-webchannel-saas`, and
+   `@mir-stream/webchannel-client` → `openclaw-webchannel-client`. The exported
+   API is unchanged, so nothing but the specifier moves.
+
+5. **Verify the migration is complete.** This fails on either half — a leftover
+   GitHub Packages URL, or a residual old-name dependency:
 
    ```sh
    if [ ! -r package-lock.json ]; then
@@ -414,6 +460,10 @@ Projects that consumed a pre-0.6.1 release may still force the entire
    fi
    if grep -n 'npm\.pkg\.github\.com' package-lock.json; then
      echo "ERROR: package-lock.json still contains GitHub Packages URLs." >&2
+     exit 1
+   fi
+   if grep -n '@mir-stream/webchannel-' package-lock.json; then
+     echo "ERROR: package-lock.json still depends on the old package names." >&2
      exit 1
    fi
    ```

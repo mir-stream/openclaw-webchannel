@@ -106,7 +106,7 @@ long-lived branches:
 | Direct gateway transport removal | ✅ complete; browser traffic uses the NATS relay only. |
 | Demo/reference server hardening (review SEC1/2/5) | The reference/demo SaaS servers are deliberately demo-grade (in-memory stores, printed admin token); production-hardening rewrite is a pending decision. |
 | Pre-v2 credential documents | Legacy files without complete credential-binding identity are not reused. Stop the gateway, archive the exact file, complete any required SaaS active-key replacement, and explicitly re-enroll the account. |
-| Example app is not a scaffold | The registry half of this gap closes with 0.6.1 — the `openclaw-webchannel-*` libraries move to public npm and need no token, **pending the one-time trusted-publishing bootstrap** (`docs/PUBLISHING.md`), which no release has run yet. The example app is still not a standalone `npm create` scaffold. |
+| Example app is not a scaffold | The registry half of this gap closes with 0.6.1 — the `openclaw-webchannel-*` libraries move to public npm and need no token. That bootstrap has run and `0.6.1` shipped; the renamed packages need their own **one-time trusted-publishing bootstrap** before the next release (`docs/PUBLISHING.md`). The example app is still not a standalone `npm create` scaffold. |
 | Telegram-parity gaps | Depth cap, discovery, idempotency, markdown, turn control (`/stop`), etc. — analysis lives on branch `feature/webchannel-telegram-parity` (`docs/gaps/`), not merged. |
 | Follow-ups | Live-gateway admission migration (+`dmScope`), conversation-key rotation, agent-initiated-outbound demo scene. |
 

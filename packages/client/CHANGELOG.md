@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Changed
+
+- **BREAKING (package name): `@mir-stream/webchannel-client` is now
+  `openclaw-webchannel-client`.** The `@mir-stream` scope was only ever a GitHub
+  Packages requirement (scope must equal repo owner); these packages moved to
+  public npm in `0.6.1`, so the scope is a vestige of a registry they no longer
+  use. All three published packages now share the `openclaw-webchannel` prefix.
+  No API, behaviour, or protocol change — only the specifier you import.
+  **The old scoped name will be unpublished after this release**, so migration
+  is not optional: `npm uninstall @mir-stream/webchannel-client && npm install
+  openclaw-webchannel-client`, then rewrite your import specifiers. Full
+  procedure: [Migrating an existing consumer](../../docs/PUBLISHING.md#migrating-an-existing-consumer).
+
 ## 0.6.1
 
 - **No client behaviour changed in this release.** `0.6.1` is a lockstep version
@@ -63,7 +76,7 @@
 - **No protocol break.** `WEBCHANNEL_PROTOCOL_VERSION` stays `3`. Both additions
   are optional and additive in both directions: this client ignores their
   absence against an older agent, and an older client ignores them against a
-  `0.6.0` agent. Lockstep with `@mir-stream/webchannel-plugin` at `0.6.0` is
+  `0.6.0` agent. Lockstep with `openclaw-webchannel` at `0.6.0` is
   still the supported configuration and is required to see the new surface, but
   nothing in this release refuses a mismatched peer.
 
@@ -183,7 +196,7 @@
   replaced by `sendState?: "queued" | "sent" | "accepted" | "completed" | "failed"`
   and `sendFailure?: SendFailure`. Migration: `delivered === true` ↔
   `sendState === "accepted" || sendState === "completed"`. Lockstep with
-  `@mir-stream/webchannel-plugin` — upgrade both together.
+  `openclaw-webchannel` — upgrade both together.
 - `WebChannelErrorCause` adds the `"capacity"` member. This is wire-compatible,
   but downstream exhaustive switches over the union must add the new terminal,
   non-reauth case.

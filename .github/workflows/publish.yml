@@ -105,7 +105,7 @@ jobs:
       # No `scope:` — setup-node writes a bare `registry=` line only when scope is
       # absent; with a scope it writes `@scope:registry=` INSTEAD and leaves the
       # default registry alone. We want the default pointed at npmjs.org (same as
-      # the plugin leg), which is what both the scoped `npm publish` and the
+      # the plugin leg), which is what both the `npm publish` and the
       # `npm view` idempotency probe then resolve against.
       - uses: actions/setup-node@v4
         with:
@@ -219,9 +219,9 @@ jobs:
       #
       # No NODE_AUTH_TOKEN: with a configured Trusted Publisher and npm >=
       # 11.5.1, `npm publish` performs the OIDC exchange itself. `--access
-      # public` is redundant with each package's publishConfig.access but stated
-      # anyway, because scoped packages default to RESTRICTED and a silent
-      # private publish is the expensive failure here. `--provenance` needs the
+      # public` is redundant with each package's publishConfig.access and is a
+      # no-op besides: these names are unscoped, and unscoped packages are always
+      # public (the RESTRICTED default is scoped-only). `--provenance` needs the
       # public repo (true since 2026-08-19), `id-token: write` (granted on this
       # job), and a `repository` field in each manifest (both have one); if
       # attestation generation fails, npm CANCELS the publish rather than
@@ -256,7 +256,7 @@ jobs:
   # NPM_TOKEN. This is the registry-independent, zero-auth install path
   # (`openclaw plugins install openclaw-webchannel@<v>`), and the only npm one
   # since ClawHub publishing is currently blocked by a scanner false-positive on
-  # the package. Since 0.6.1 the `publish` job it depends on ships the two scoped
+  # the package. Since 0.6.1 the `publish` job it depends on ships the two
   # packages the same way; this job stays separate because the plugin has its own
   # build, its own test suite, and its own trusted-publisher registration.
   #

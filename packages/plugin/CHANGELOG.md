@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Changed
+
+- **The two companion libraries were renamed** —
+  `@mir-stream/webchannel-client` → `openclaw-webchannel-client` and
+  `@mir-stream/webchannel-saas` → `openclaw-webchannel-saas`. **This plugin's own
+  name is unchanged**; it has always been the unscoped `openclaw-webchannel`, and
+  all three now share that prefix. No API, behaviour, or protocol change.
+  **The old scoped names will be unpublished after this release**, so consumers
+  of the client or saas packages must migrate — see
+  [Migrating an existing consumer](../../docs/PUBLISHING.md#migrating-an-existing-consumer).
+
 ## 0.6.1
 
 ### Fixed
