@@ -250,15 +250,17 @@ jobs:
   # PREREQUISITE (one-time, manual, on npmjs.com): a Trusted Publisher must be
   # configured for the `openclaw-webchannel` package —
   #   Package → Settings → Trusted Publisher → Add:
-  #     Publisher = GitHub Actions
-  #     Repository = mir-stream/openclaw-webchannel
+  #     Organization or user = mir-stream
+  #     Repository           = openclaw-webchannel
   #     Workflow   = publish.yml
   #     Environment = (blank)
-  # Until that exists, the publish STEP is denied by npm. The idempotency guard
-  # means an already-published version (e.g. the initial local 0.1.8) is skipped,
-  # so this leg only actually publishes — and thus only needs the trusted
-  # publisher — on the FIRST new version after setup. With OIDC + npm >= 11.5.1,
-  # `npm publish` mints short-lived credentials from the id-token automatically.
+  #     Allowed actions = npm publish
+  # Until that exists, the publish STEP is denied by npm. A matching version is
+  # skipped only when its provenance and gitHead identify this exact run;
+  # otherwise the idempotency guard fails loudly. This leg only actually
+  # publishes — and thus only needs the trusted publisher — on the FIRST new
+  # version after setup. With OIDC + npm >= 11.5.1, `npm publish` mints
+  # short-lived credentials from the id-token automatically.
   #
   # Gated like the ClawHub leg: needs the client/saas leg, tag PUSH only.
   # ---------------------------------------------------------------------------
@@ -324,12 +326,21 @@ jobs:
         run: |
           set -uo pipefail
           # Key off stdout, not exit code (npm view semantics differ across
-          # majors). Skip ONLY on a positive version match; anything else
-          # (empty / E404 / garbage) falls through to publish, and a real
-          # duplicate still 409s loudly. Makes "Re-run failed jobs" safe.
+          # majors). An absent version (empty / E404 / garbage) falls through to
+          # publish. A version match is skipped ONLY after provenance and gitHead
+          # identify this exact run; otherwise fail instead of accepting an
+          # immutable tarball of unknown origin.
           GOT="$(npm view "openclaw-webchannel@${VERSION}" version 2>/dev/null || true)"
           if [ "$GOT" = "$VERSION" ]; then
-            echo "openclaw-webchannel@${VERSION} already on public npm — skipping."
+            PUBLISHED_GIT_HEAD="$(npm view "openclaw-webchannel@${VERSION}" gitHead 2>/dev/null || true)"
+            ATTESTATIONS="$(npm view "openclaw-webchannel@${VERSION}" dist.attestations 2>/dev/null || true)"
+            # GITHUB_SHA is the commit because releases deliberately use
+            # lightweight tags; an annotated tag can make it the tag-object SHA.
+            if [ -z "$ATTESTATIONS" ] || [ "$PUBLISHED_GIT_HEAD" != "$GITHUB_SHA" ]; then
+              echo "::error::Refusing to accept openclaw-webchannel@${VERSION}: dist.attestations found '${ATTESTATIONS:-<absent>}' (expected a non-empty provenance attestation); gitHead found '${PUBLISHED_GIT_HEAD:-<absent>}' (expected '${GITHUB_SHA}')."
+              exit 1
+            fi
+            echo "openclaw-webchannel@${VERSION} already on public npm with verified provenance and gitHead ${GITHUB_SHA} — skipping."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "openclaw-webchannel@${VERSION} not on public npm — will publish."

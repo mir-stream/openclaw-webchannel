@@ -73,14 +73,14 @@ The `Publish Packages` workflow (`.github/workflows/publish.yml`) runs three job
 Note: **all three legs are idempotent.** Each package (client, saas, plugin) is
 skipped when that exact version is positively confirmed already on its registry
 (the npm leg checks each package with `npm view`, the ClawHub leg with `package
-inspect`). For client and saas, a version match is accepted only when npm also
-reports a provenance attestation and a `gitHead` equal to the run's `GITHUB_SHA`;
-either mismatch fails the run loudly. Therefore **"Re-run failed jobs"** is safe
-anywhere in the workflow, including after a partial npm publish (e.g. client
-shipped but saas flaked), and a full re-run of an already-shipped tag is a
-verified green no-op end-to-end. An already-published version is **never
-republished** (it is skipped, not overwritten): to ship new content you must
-**bump the version and cut a new tag**.
+inspect`). For all three public-npm artifacts, a version match is accepted only
+when npm also reports a provenance attestation and a `gitHead` equal to the run's
+`GITHUB_SHA`; either mismatch fails the run loudly. Therefore **"Re-run failed
+jobs"** is safe anywhere in the workflow, including after a partial npm publish
+(e.g. client shipped but saas flaked), and a full re-run of an already-shipped
+tag is a verified green no-op end-to-end. An already-published version is
+**never republished** (it is skipped, not overwritten): to ship new content you
+must **bump the version and cut a new tag**.
 
 ## One-time bootstrap: trusted publishing for client + saas
 
@@ -94,16 +94,21 @@ for a name that does not exist yet; npm does not. See npm/cli#8544.)
 names *on npmjs.org* — their history is on GitHub Packages, a different registry
 — so all four steps below must be done for both packages.
 
-The plugin went through the same chicken-and-egg, but it is **unscoped**
-(`openclaw-webchannel`), so its bootstrap established nothing about the
-`@mir-stream` scope. These two are the first scoped publishes.
+The chicken-and-egg is per package **name**, not per scope, so the existing
+unscoped plugin registration does not configure either new scoped name. The
+`@mir-stream` scope and scoped OIDC trusted publishing with provenance for this
+org are already proven by `@mir-stream/openclaw-prompt-compat@0.3.0`, whose
+registry metadata includes a SLSA v1 provenance attestation and a `gitHead`.
+That package comes from a different repository, so it proves only that the
+registry/scope path works; it does not configure this repo's workflow for client
+or saas, and both names still require the bootstrap below.
 
 **Do not bootstrap at the release version.** Publishing `0.6.1` by hand would
 ship it **unattested**, and the workflow's idempotency guard would reject that
 unknown tarball and fail the real tag. The version would already be occupied, so
 CI could not replace it with the attested build the release promises. Bootstrap
-with a throwaway `0.0.0` instead, so the **real** release is the first thing CI
-publishes and it carries provenance.
+with a throwaway `0.0.0-bootstrap.0` instead, so the **real** release is the first
+thing CI publishes and it carries provenance.
 
 **Prerequisite.** The `@mir-stream` org exists on registry.npmjs.org. Before
 starting, confirm you are a member of it with publish rights — step (a) fails
@@ -114,10 +119,10 @@ npm whoami --registry https://registry.npmjs.org
 npm org ls mir-stream
 ```
 
-**(a) Publish a `0.0.0` placeholder for each package.** The point is only to make
-the *name* exist so npm will accept a trusted-publisher configuration on it. Work
-in a **throwaway clone** — the version edit below must never be committed or
-tagged, and the repo's own `package.json` files stay at `0.6.1`:
+**(a) Publish a `0.0.0-bootstrap.0` placeholder for each package.** The point is
+only to make the *name* exist so npm will accept a trusted-publisher configuration
+on it. Work in a **throwaway clone** — the version edit below must never be
+committed or tagged, and the repo's own `package.json` files stay at `0.6.1`:
 
 ```sh
 git clone https://github.com/mir-stream/openclaw-webchannel.git /tmp/wc-bootstrap
@@ -127,8 +132,8 @@ npm login   # if not already authenticated against registry.npmjs.org
 
 # Rewrite the two manifests IN THIS THROWAWAY CLONE ONLY.
 # --no-git-tag-version stops npm from committing or tagging the change.
-npm version 0.0.0 --no-git-tag-version -w packages/client
-npm version 0.0.0 --no-git-tag-version -w packages/saas
+npm version 0.0.0-bootstrap.0 --no-git-tag-version -w packages/client
+npm version 0.0.0-bootstrap.0 --no-git-tag-version -w packages/saas
 
 npm publish -w packages/client --access public --tag bootstrap --registry https://registry.npmjs.org
 npm publish -w packages/saas   --access public --tag bootstrap --registry https://registry.npmjs.org
@@ -149,44 +154,50 @@ Two flags carry the weight here:
 - **`--tag bootstrap`** — keeps the placeholder off `latest`. npm's publish
   payload carries exactly one dist-tag, the requested one
   (`libnpmpublish/lib/publish.js`: `root['dist-tags'][tag] = manifest.version`,
-  where `tag` defaults to `latest`), so `0.0.0` lands under `bootstrap` and the
-  package has **no `latest` at all** until the real release publishes one. A
+  where `tag` defaults to `latest`), so `0.0.0-bootstrap.0` lands under
+  `bootstrap` and the package has **no `latest` at all** until the real release
+  publishes one. The prerelease suffix must remain: a bare `*` excludes
+  prereleases but would select a stable placeholder when `latest` is absent. A
   bare `npm install @mir-stream/webchannel-client` therefore fails with `ETARGET`
   during the bootstrap window, which is the intended behaviour: better a clear
-  error than serving a `0.0.0` stub as the current version. (If npm's registry
+  error than serving a placeholder as the current version. (If npm's registry
   ever did stamp `latest` onto a first publish regardless, the `0.6.1` release
   publish moves it anyway.)
 
 **Do not `npm unpublish` the placeholder** before the real release ships.
 Unpublishing the only version of a package removes the package itself — taking
 the trusted-publisher configuration with it, and putting you back at square one.
-Leave `0.0.0@bootstrap` in place; it is harmless.
+Leave `0.0.0-bootstrap.0@bootstrap` in place; it is harmless.
 
 **(b) Attach the Trusted Publisher.** On npmjs.com, for **each** of
 `@mir-stream/webchannel-client` and `@mir-stream/webchannel-saas`:
 
 > Package → Settings → Trusted Publisher → Add:
-> - Publisher = **GitHub Actions**
-> - Repository = **`mir-stream/openclaw-webchannel`**
+> - Organization or user = **`mir-stream`**
+> - Repository = **`openclaw-webchannel`**
 > - Workflow = **`publish.yml`**
 > - Environment = *(blank)*
 > - Allowed actions = **npm publish**
 
 **(c) Disable token publishing.** After enabling the Trusted Publisher above,
-on npmjs.com, for **both** packages, configure **Settings → Publishing access →
-"Require two-factor authentication and disallow tokens"**. Trusted publishing
-coexists with token authentication by default; this closes the route by which a
-leaked or mistakenly used token could occupy a release version outside OIDC. The
-workflow guard can detect that conflict only after the version has been burned,
-so registry policy must prevent it.
+on npmjs.com, for **both** packages, open **Settings → Publishing access** and
+select **"Require two-factor authentication and disallow bypass 2fa tokens (recommended)"**.
+The same page confirms that all publishing access options are compatible with
+OIDC trusted publishers, and an already-configured trusted publisher keeps
+working regardless of which option is selected, so this step cannot break the
+OIDC release path. Trusted publishing coexists with token authentication by
+default; this closes the route by which a leaked or mistakenly used token could
+occupy a release version outside OIDC. The workflow guard can detect that
+conflict only after the version has been burned, so registry policy must prevent
+it.
 
 **(d) Cut the release normally.** From then on every tagged release publishes
 from CI with zero credentials — `npm publish` mints short-lived tokens from the
-workflow's id-token itself. Because the placeholder is `0.0.0` and the release is
-`0.6.1`, the idempotency guard finds no match and **`0.6.1` publishes through
-OIDC with provenance**, exactly as the changelog and the section below claim. On
-a re-run, the guard skips it only after verifying that provenance and the
-published `gitHead` against the run's commit.
+workflow's id-token itself. Because the placeholder is `0.0.0-bootstrap.0` and
+the release is `0.6.1`, the idempotency guard finds no match and **`0.6.1`
+publishes through OIDC with provenance**, exactly as the changelog and the
+section below claim. On a re-run, the guard skips it only after verifying that
+provenance and the published `gitHead` against the run's commit.
 
 **Until the bootstrap lands, releases are blocked.** Every `v*` tag fails at the
 `publish` job, and both plugin legs `needs: publish`, so they are skipped — which
@@ -267,19 +278,44 @@ release can't silently change the publish contract mid-release. Bump the pin in
 ### Migrating an existing consumer
 
 Projects that consumed a pre-0.6.1 release may still force the entire
-`@mir-stream` scope through GitHub Packages. Remove the scope line and any
-matching token line wherever they exist — project `.npmrc`, user-level
-`~/.npmrc`, and CI-generated npm configuration:
+`@mir-stream` scope through GitHub Packages.
 
-```ini
-@mir-stream:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=${TOKEN}
-```
+1. **Remove the old registry configuration first.** Delete the scope line and
+   any matching token line wherever they exist — project `.npmrc`, user-level
+   `~/.npmrc`, and CI-generated npm configuration:
 
-`npm config get @mir-stream:registry` is the quickest confirmation: it must no
-longer print `https://npm.pkg.github.com`. Then update to the public-registry
-release and refresh the lockfile so every matching `resolved` URL moves from
-`npm.pkg.github.com` to `registry.npmjs.org`.
+   ```ini
+   @mir-stream:registry=https://npm.pkg.github.com
+   //npm.pkg.github.com/:_authToken=${TOKEN}
+   ```
+
+2. **Confirm the scope override is gone.**
+
+   ```sh
+   npm config get @mir-stream:registry
+   ```
+
+   It must no longer print `https://npm.pkg.github.com`.
+
+3. **Upgrade explicitly and refresh the lockfile.** This replaces an old
+   dependency spec instead of letting Arborist preserve it:
+
+   ```sh
+   npm install --save-exact @mir-stream/webchannel-saas@0.6.1 @mir-stream/webchannel-client@0.6.1
+   ```
+
+4. **Verify no GitHub Packages URL remains.**
+
+   ```sh
+   if [ ! -r package-lock.json ]; then
+     echo "ERROR: package-lock.json is missing or unreadable." >&2
+     exit 1
+   fi
+   if grep -n 'npm\.pkg\.github\.com' package-lock.json; then
+     echo "ERROR: package-lock.json still contains GitHub Packages URLs." >&2
+     exit 1
+   fi
+   ```
 
 ### Installing
 
