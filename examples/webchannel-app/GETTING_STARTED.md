@@ -83,6 +83,11 @@ which is the whole point: you consume the library exactly as an outside develope
 Pin the two packages to the published version and install — `0.6.1` is the first
 release to target the public npm registry:
 
+> Upgrading an existing consumer? First follow the
+> [GitHub Packages migration](../../docs/PUBLISHING.md#migrating-an-existing-consumer)
+> so stale scope configuration and lockfile URLs do not keep routing installs to
+> the old registry.
+
 ```bash
 npm pkg set dependencies.@mir-stream/webchannel-saas=0.6.1
 npm pkg set dependencies.@mir-stream/webchannel-client=0.6.1
