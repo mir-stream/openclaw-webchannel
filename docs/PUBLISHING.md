@@ -49,11 +49,10 @@ The `Publish Packages` workflow (`.github/workflows/publish.yml`) runs four jobs
 - **`publish`** — builds, tests, and publishes `webchannel-client` and
   `webchannel-saas` to public npm via **OIDC trusted publishing** with
   `--provenance` (no `NPM_TOKEN`, no PAT — the job's `id-token: write` is the
-  whole credential story). Also runnable manually (workflow_dispatch) — but the
-  publish step is guarded on the ref, so **a dispatch from a branch builds and
-  tests without publishing anything**. Only a `v*` tag ref publishes. The
-  plugin jobs additionally require a tag *push*, so a fresh manual dispatch is
-  not a complete release recovery. Re-run the **original tag-push run** instead:
+  whole credential story). Also runnable manually (`workflow_dispatch`): a
+  dispatch from any ref builds, tests, and runs both lockstep gates, but never
+  publishes anything. Only a `v*` tag push publishes. A fresh manual dispatch is
+  therefore not release recovery. Re-run the **original tag-push run** instead:
 
   ```sh
   gh run rerun <RUN_ID>          # or: gh run list --workflow publish.yml
@@ -72,6 +71,18 @@ The `Publish Packages` workflow (`.github/workflows/publish.yml`) runs four jobs
   `PUBLISH_CLAWHUB` repository variable, and additionally skipped on ALL manual
   workflow_dispatch runs — including one started from a tag ref — because its
   publish surface deliberately remains tag-*push*-only.
+
+Note: **all three legs are idempotent.** Each package (client, saas, plugin) is
+skipped when that exact version is positively confirmed already on its registry
+(the npm leg checks each package with `npm view`, the ClawHub leg with `package
+inspect`). For all three public-npm artifacts, a version match is accepted only
+when npm also reports a provenance attestation and a `gitHead` equal to the run's
+`GITHUB_SHA`; either mismatch fails the run loudly. Therefore **"Re-run failed
+jobs"** is safe anywhere in the workflow, including after a partial npm publish
+(e.g. client shipped but saas flaked), and a full re-run of an already-shipped
+tag is a verified green no-op end-to-end. An already-published version is
+**never republished** (it is skipped, not overwritten): to ship new content you
+must **bump the version and cut a new tag**.
 
 ### Recovering a split `latest`
 
@@ -100,18 +111,6 @@ npm dist-tag add <name>@<version> latest
 
 CI cannot perform that fallback: its trusted-publishing OIDC credential
 authorizes `npm publish` and `npm stage publish`, but not `npm dist-tag add`.
-
-Note: **all three legs are idempotent.** Each package (client, saas, plugin) is
-skipped when that exact version is positively confirmed already on its registry
-(the npm leg checks each package with `npm view`, the ClawHub leg with `package
-inspect`). For all three public-npm artifacts, a version match is accepted only
-when npm also reports a provenance attestation and a `gitHead` equal to the run's
-`GITHUB_SHA`; either mismatch fails the run loudly. Therefore **"Re-run failed
-jobs"** is safe anywhere in the workflow, including after a partial npm publish
-(e.g. client shipped but saas flaked), and a full re-run of an already-shipped
-tag is a verified green no-op end-to-end. An already-published version is
-**never republished** (it is skipped, not overwritten): to ship new content you
-must **bump the version and cut a new tag**.
 
 ## One-time bootstrap: trusted publishing for client + saas
 

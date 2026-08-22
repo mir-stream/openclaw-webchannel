@@ -16,9 +16,10 @@
 # public and all three packages are MIT, so there is nothing left to gate.
 #
 # Trigger: push a tag like v0.1.0 (all three share ONE version). A
-# workflow_dispatch run builds and tests but publishes NOTHING unless it is
-# dispatched from a v* tag ref — see the tag-ref guard on the publish step. The
-# plugin leg (publish-plugin, gated on the npm leg) publishes to ClawHub.
+# workflow_dispatch run never publishes anything, from any ref; it builds,
+# tests, and runs both lockstep gates, which is what makes it useful. Only a v*
+# tag push publishes. The plugin leg (publish-plugin, gated on the npm leg)
+# publishes to ClawHub.
 #
 # ONE-TIME BOOTSTRAP (per package name): npm attaches a Trusted Publisher to an
 # EXISTING package, so the very first publish of a brand-new name cannot come
@@ -56,9 +57,15 @@ on:
     tags: ["v*"]
   workflow_dispatch: {}
 
-# Cancelling a half-finished publish is strictly worse than queueing behind it.
+# Every v* tag shares one group so different releases cannot interleave writes
+# to the same npm `latest` tags. Non-release refs remain keyed per ref, so an
+# ordinary dispatch does not queue behind a release. Cancellation stays off:
+# cancelling a half-finished publish is strictly worse than queueing behind it.
+# GitHub retains only one pending run per group; if a third release arrives while
+# one is running and one is pending, GitHub cancels the pending run. That is loud
+# and recoverable with `gh run rerun <RUN_ID>`, but it is not silent serialization.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ startsWith(github.ref, 'refs/tags/v') && 'npm-release' || github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -191,18 +198,15 @@ jobs:
       # unknown origin. This makes "Re-run failed jobs" safe after a partial npm
       # publish (client shipped, saas flaked), and a full re-run of a fully-shipped
       # tag a verified green no-op. Each check uses the package.json's own version
-      # (NOT the tag) so it's correct on workflow_dispatch too; lockstep guarantees
-      # package.json == tag on tag runs. The `npm view` probes need no auth now that
-      # the target is the public registry.
+      # (NOT the tag); lockstep guarantees package.json == tag on the tag-push path.
+      # The `npm view` probes need no auth now that the target is the public registry.
       #
-      # TAG-REF GUARD — the invariant is: NOTHING is published from a ref that is
-      # not a v* tag. Without it, a workflow_dispatch from a branch would publish
-      # whatever version that branch's package.json happens to carry. On GitHub
-      # Packages that was a deletable, token-gated mistake; on public npm it
-      # burns the version number permanently (unpublishable after 72h), ships an
-      # unreviewed branch build under a provenance attestation, and then makes
-      # the REAL tag a silent green no-op via the idempotency probe below. The
-      # guard is on this step rather than on the job so that a branch dispatch
+      # TAG-PUSH GUARD — the invariant is: ONLY a v* tag push publishes. A
+      # workflow_dispatch run never publishes anything, even from a v* tag ref.
+      # The ref check blocks branch builds from burning an immutable public-npm
+      # version; the event check prevents a tag-ref dispatch from running only
+      # this client/saas leg while the push-only plugin and verifier jobs skip.
+      # The guard is on this step rather than on the job so that every dispatch
       # still checks out, installs, runs both lockstep gates, builds and tests —
       # it just cannot ship. Recover a flaked release by re-running the ORIGINAL
       # tag-push run, which preserves its push event and tag ref for every job:
@@ -220,7 +224,7 @@ jobs:
       # shipping unattested, so a failure here ships nothing and the tag can be
       # deleted and re-pushed.
       - name: Publish to public npm (OIDC, idempotent)
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
           for PKG in client saas; do
@@ -442,11 +446,10 @@ jobs:
   # Plugin leg #2: publish the openclaw-webchannel code-plugin to ClawHub.
   #
   # Gated on `needs: publish` — if the npm publish failed the tag is a dud and
-  # the plugin must not ship on its own. The `if:` guard requires a tag PUSH:
-  # every workflow_dispatch run skips this job entirely (only ships the npm
-  # packages), INCLUDING a dispatch started from a tag ref — a plain
-  # `startsWith(github.ref, 'refs/tags/v')` would let such a dispatch through, so
-  # we also require `github.event_name == 'push'`.
+  # the plugin must not ship on its own. The `if:` guard requires a tag PUSH, so
+  # every workflow_dispatch run skips this job. The same event-and-ref invariant
+  # covers every public-npm publish surface: a dispatch from any ref publishes
+  # nothing.
   # ---------------------------------------------------------------------------
   publish-plugin:
     name: Publish plugin to ClawHub
