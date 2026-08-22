@@ -1468,6 +1468,104 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
       working: true,
     });
   });
+
+  // --- #212: turn_snapshot pure-view reconciliation. ----------------------
+  it("S1: the mid-lane snapshot fixes order/text, mints the failed lane, drops the overflow, and preserves EVERYTHING else", () => {
+    const w = makeWrapper();
+    // A user bubble with real send-state (must be untouched by the snapshot).
+    w.send("do the thing"); // u-0
+    expect(w.getState().messages.find((m) => m.id === "u-0")).toMatchObject({
+      id: "u-0",
+      role: "user",
+    });
+
+    // A durable-history agent row that happens to share the live turn (untouched
+    // — its id is neither in `answers` nor `remove`).
+    deliver(w, { type: "agent_message", id: "durable-1", turnId: "T", text: "older durable" });
+
+    // The live turn, as the pre-#212 client rendered it: lane A settled "tA"; a
+    // status notice mid-turn; lane C mis-topped to "tB"; the overflow final "tC"
+    // on its own independent bubble. Reasoning rides a separate surface.
+    liveBubble(w, "laneA", "T", "A", "tA");
+    deliver(w, { type: "reasoning", id: "r1", turnId: "T", text: "thinking…" });
+    deliver(w, { type: "agent_message", id: "notice1", turnId: "T", text: "Heads up: a notice." });
+    liveBubble(w, "laneC", "T", "C", "tB");
+    deliver(w, { type: "agent_message", id: "tcId", turnId: "T", text: "tC" });
+
+    const messagesBefore = w.getState().messages;
+    expect(messagesBefore.map((m) => m.id)).toEqual([
+      "u-0",
+      "durable-1",
+      "laneA",
+      "notice1",
+      "laneC",
+      "tcId",
+    ]);
+    // Capture the exact bubble objects to prove they are not even re-created.
+    const userBefore = messagesBefore.find((m) => m.id === "u-0")!;
+    const noticeBefore = messagesBefore.find((m) => m.id === "notice1")!;
+    const durableBefore = messagesBefore.find((m) => m.id === "durable-1")!;
+
+    // The plugin's authoritative snapshot: streamed [A][B][C]; lane B never
+    // materialized so it is MINTED; the overflow "tC" bubble is removed.
+    deliver(w, {
+      type: "turn_snapshot",
+      turnId: "T",
+      answers: [
+        { id: "laneA", text: "A" },
+        { id: "laneB", text: "B" },
+        { id: "laneC", text: "C" },
+      ],
+      remove: ["tcId"],
+    });
+
+    const after = w.getState().messages;
+    // Order: answers in authoritative order among themselves; every non-answer
+    // bubble keeps its slot; the overflow bubble is gone.
+    expect(after.map((m) => m.id)).toEqual([
+      "u-0",
+      "durable-1",
+      "laneA",
+      "laneB",
+      "notice1",
+      "laneC",
+    ]);
+    // Answer texts are the authoritative streamed content.
+    expect(after.find((m) => m.id === "laneA")!.text).toBe("A");
+    expect(after.find((m) => m.id === "laneB")!.text).toBe("B");
+    expect(after.find((m) => m.id === "laneC")!.text).toBe("C");
+    // The failed lane B was minted exactly once.
+    expect(after.filter((m) => m.text === "B")).toHaveLength(1);
+    expect(after.find((m) => m.id === "laneB")).toMatchObject({
+      role: "agent",
+      working: false,
+      turnId: "T",
+    });
+    // The overflow bubble is dropped.
+    expect(after.some((m) => m.id === "tcId")).toBe(false);
+
+    // Preserved halves — the SAME bubble objects, not re-created:
+    //  - the user bubble (receipts/send-state),
+    expect(after.find((m) => m.id === "u-0")).toBe(userBefore);
+    //  - the mid-turn notice bubble (text and its relative slot),
+    expect(after.find((m) => m.id === "notice1")).toBe(noticeBefore);
+    //  - the durable-history agent row that shares the turn,
+    expect(after.find((m) => m.id === "durable-1")).toBe(durableBefore);
+    //  - the reasoning surface (never in state.messages).
+    expect(w.getState().reasoning.map((r) => r.id)).toContain("r1");
+  });
+
+  it("S2: a snapshot for a foreign/absent turn with no matching ids is a no-op on the answer region", () => {
+    const w = makeWrapper();
+    liveBubble(w, "laneA", "T", "A", "final A");
+    const before = w.getState().messages.slice();
+    // An empty-answers, empty-remove snapshot changes nothing.
+    deliver(w, { type: "turn_snapshot", turnId: "T", answers: [], remove: [] });
+    expect(w.getState().messages).toEqual(before);
+    // A remove naming an id we do not hold changes nothing.
+    deliver(w, { type: "turn_snapshot", turnId: "T", answers: [], remove: ["ghost"] });
+    expect(w.getState().messages).toEqual(before);
+  });
 });
 
 // ---------------------------------------------------------------------------

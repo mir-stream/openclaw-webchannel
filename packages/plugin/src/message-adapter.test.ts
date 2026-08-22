@@ -81,6 +81,12 @@ function makeDraftHarness(options?: {
 }) {
   const attempts: DraftAttempt[] = [];
   const frames: DraftAttempt[] = [];
+  // #212: the turn_snapshot frames the controller emits at drain, in order.
+  const snapshots: Array<{
+    turnId: string;
+    answers: Array<{ id: string; text: string }>;
+    remove: string[];
+  }> = [];
   const deliver = (attempt: DraftAttempt): boolean => {
     const attemptIndex = attempts.length;
     attempts.push(attempt);
@@ -95,6 +101,15 @@ function makeDraftHarness(options?: {
       deliver({ type: "progress", id, text }),
     finalizeDraft: (_peer: string, id: string, text: string) =>
       deliver({ type: "final", id, text }),
+    sendTurnSnapshot: (
+      _peer: string,
+      turnId: string,
+      answers: Array<{ id: string; text: string }>,
+      remove: string[],
+    ) => {
+      snapshots.push({ turnId, answers, remove });
+      return true;
+    },
   } as unknown as WebChannelPeerChannel;
   const draft = createProgressDraftController({
     transport,
@@ -104,7 +119,7 @@ function makeDraftHarness(options?: {
     throttleMs: options?.throttleMs ?? 0,
     logger: options?.logger ?? { warn: () => {} },
   });
-  return { draft, attempts, frames };
+  return { draft, attempts, frames, snapshots };
 }
 
 const toolStart = (itemId = "tool-1") => ({
@@ -380,6 +395,253 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     const tcFrame = h.frames.find((frame) => frame.text === "tC")!;
     expect(tcFrame.id).not.toBe(idA);
     expect(tcFrame.id).not.toBe(idC);
+  });
+
+  // #212 (Phase 3, targeted) — the authoritative `turn_snapshot` emitted at drain.
+  // These ADD snapshot assertions on the #215 shapes; the existing frame-level
+  // assertions above (M173a-e) are deliberately left unchanged.
+  it("M212a: mid-lane K>=2 — snapshot carries streamed [A][B][C] and removes the overflow bubble", async () => {
+    // Same topology as M173e: A,B,C all stream; B's frames all fail (never
+    // materializes); tool-only last. Finals [tA,tB,tC] mis-route (tB→C, tC→
+    // independent). The snapshot must yield the CORRECT ordered STREAMED content
+    // regardless: [A][B][C], with the overflow bubble named in `remove`.
+    const h = makeDraftHarness({ decide: (attempt) => attempt.text !== "B" });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "A" });
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "B" }); // frames fail → not materialized, no lane id
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "C" });
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // tool-only last
+
+    const idA = h.frames.find((frame) => frame.text === "A")!.id;
+    const idC = h.frames.find((frame) => frame.text === "C")!.id;
+
+    await h.draft.finalize("tA");
+    await h.draft.finalize("tB");
+    await h.draft.finalize("tC");
+    await h.draft.drain();
+
+    const tcId = h.frames.find((frame) => frame.text === "tC")!.id;
+    expect(h.snapshots).toHaveLength(1);
+    const snap = h.snapshots[0];
+    expect(snap.turnId).toBe("turn-1");
+    // Streamed content, in generation order — immune to the mis-routed finals.
+    expect(snap.answers.map((a) => a.text)).toEqual(["A", "B", "C"]);
+    // A and C keep their materialized ids; B (never materialized) gets a minted id.
+    expect(snap.answers[0].id).toBe(idA);
+    expect(snap.answers[2].id).toBe(idC);
+    expect(snap.answers[1].id).not.toBe(idA);
+    expect(snap.answers[1].id).not.toBe(idC);
+    // The overflow independent bubble is named for removal; the answer ids are not.
+    expect(snap.remove).toEqual([tcId]);
+    expect(snap.remove).not.toContain(idA);
+    expect(snap.remove).not.toContain(idC);
+  });
+
+  it("M212b: Case X (K==1) — snapshot is [A] streamed with an EMPTY remove; the tool bubble is untouched (M173d preserved)", async () => {
+    // Byte-identical to M173c at the plugin layer, so the snapshot deliberately
+    // does NOT touch the tool bubble: it is neither an answer lane (never
+    // streamed) nor superseded. M173d's frame-level behaviour is unchanged.
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "the ans" });
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // tool-only last
+    const idA = h.frames.find((frame) => frame.text === "the ans")!.id;
+
+    await h.draft.finalize("the answer");
+    await h.draft.drain();
+
+    // Frame-level M173d still holds: two bubbles, the final on the tool lane.
+    expect(bubbleOrder(h.frames)).toEqual(["the ans", "the answer"]);
+
+    expect(h.snapshots).toHaveLength(1);
+    const snap = h.snapshots[0];
+    expect(snap.answers).toEqual([{ id: idA, text: "the ans" }]);
+    expect(snap.remove).toEqual([]);
+    // The mis-routed tool bubble is NOT named — the client preserves it.
+    const toolId = h.frames.find((frame) => frame.text === "the answer")!.id;
+    expect(snap.remove).not.toContain(toolId);
+    expect(snap.answers.map((a) => a.id)).not.toContain(toolId);
+  });
+
+  it("M212c: collapse with a non-streaming last message — snapshot is [A][B] with empty remove; message C is left intact", async () => {
+    // M173c shape: A,B stream; C has text but streams no partial → its final is
+    // routed to C's textless lane (a legitimate NEW bubble). The snapshot must NOT
+    // claim to remove or reorder C — C is neither in `answers` (it never streamed)
+    // nor in `remove`, so the client preserves it exactly.
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "message A" });
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "message B" });
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // lane C, textless current
+    const idA = h.frames.find((frame) => frame.text === "message A")!.id;
+    const idB = h.frames.find((frame) => frame.text === "message B")!.id;
+
+    await h.draft.finalize("message C");
+    await h.draft.drain();
+
+    // Frame-level M173c still holds.
+    expect(bubbleOrder(h.frames)).toEqual(["message A", "message B", "message C"]);
+    const idC = h.frames.find((frame) => frame.text === "message C")!.id;
+
+    expect(h.snapshots).toHaveLength(1);
+    const snap = h.snapshots[0];
+    expect(snap.answers).toEqual([
+      { id: idA, text: "message A" },
+      { id: idB, text: "message B" },
+    ]);
+    expect(snap.remove).toEqual([]);
+    // C's legitimate bubble is neither reordered nor removed.
+    expect(snap.answers.map((a) => a.id)).not.toContain(idC);
+    expect(snap.remove).not.toContain(idC);
+  });
+
+  it("M212d: a streamed collapse — the current lane's AUTHORITATIVE final text is kept (tail not truncated), empty remove", async () => {
+    // M173b shape: A and B stream, B is the last and text-bearing so its final
+    // settles it via the IMMEDIATE (correctly-routed) path. That final is
+    // authoritative for B, so the snapshot shows B's FINAL text ("second answer",
+    // NOT the streamed "second ans"). A received no final of its own, so it keeps
+    // its streamed text.
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "first ans" });
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "second ans" });
+    await h.draft.flush();
+    const idA = h.frames.find((frame) => frame.text === "first ans")!.id;
+    const idB = h.frames.find((frame) => frame.text === "second ans")!.id;
+
+    await h.draft.finalize("second answer");
+    await h.draft.drain();
+
+    expect(h.snapshots).toHaveLength(1);
+    const snap = h.snapshots[0];
+    expect(snap.answers).toEqual([
+      { id: idA, text: "first ans" }, // no final of its own → streamed text
+      { id: idB, text: "second answer" }, // correctly-routed final → authoritative
+    ]);
+    expect(snap.remove).toEqual([]);
+  });
+
+  it("M212d2: a lone collapse whose final adds a tail BEYOND the last partial — the snapshot keeps the FULL final text (tail-preservation guard)", async () => {
+    // The open VERIFY-1 edge: core's message_end reconciliation can make the final
+    // longer than the last streamed partial. On the common immediate path the
+    // final is correctly routed to its own lane, so the snapshot MUST show the
+    // full final text — dropping the tail would regress the common path and the
+    // north-star "final is not droppable".
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "Hello" }); // last partial is a strict prefix
+    await h.draft.flush();
+    const id = h.frames.find((frame) => frame.text === "Hello")!.id;
+
+    await h.draft.finalize("Hello, world — the full answer."); // final adds a tail
+    await h.draft.drain();
+
+    expect(h.snapshots).toHaveLength(1);
+    const snap = h.snapshots[0];
+    expect(snap.answers).toEqual([
+      { id, text: "Hello, world — the full answer." },
+    ]);
+    expect(snap.remove).toEqual([]);
+  });
+
+  it("M212e: an independent NOTICE final is never named in `remove` and never an answer", async () => {
+    // A notice (deliverIndependentFinal) is UNIQUE content, not answer content —
+    // it must be preserved by the client, so it is neither in `answers` nor in
+    // `remove`.
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "the answer" });
+    await h.draft.flush();
+    const idA = h.frames.find((frame) => frame.text === "the answer")!.id;
+
+    await h.draft.deliverIndependentFinal({ text: "Heads up: something happened.", isStatusNotice: true });
+    await h.draft.drain();
+
+    const noticeId = h.frames.find((frame) => frame.text === "Heads up: something happened.")!.id;
+    expect(h.snapshots).toHaveLength(1);
+    const snap = h.snapshots[0];
+    expect(snap.answers.map((a) => a.id)).toEqual([idA]);
+    expect(snap.remove).toEqual([]);
+    expect(snap.remove).not.toContain(noticeId);
+  });
+
+  it("M212f: a failed-lane recovery block is named in `remove` (its lane is now an answer)", async () => {
+    // M172b shape: A streams but its progress frame fails (not materialized); the
+    // authorized block recovers A's content independently. Under the snapshot, A's
+    // streamed text IS an answer (minted id), so the recovery block DUPLICATES it
+    // and is named in `remove`.
+    const h = makeDraftHarness({
+      decide: (attempt) =>
+        attempt.type === "progress" && attempt.text === "A answer" ? false : true,
+    });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "A answer" });
+    await h.draft.flush(); // progress fails → lane streamed but not materialized (no id)
+    await h.draft.deliverAuthorizedBlock({ text: "A answer", assistantMessageIndex: 1 });
+    await h.draft.drain();
+
+    const blockId = h.frames.find((frame) => frame.text === "A answer")!.id;
+    expect(h.snapshots).toHaveLength(1);
+    const snap = h.snapshots[0];
+    // A appears as an answer (minted id, streamed text); the recovery block is removed.
+    expect(snap.answers.map((a) => a.text)).toEqual(["A answer"]);
+    expect(snap.remove).toEqual([blockId]);
+  });
+
+  it("M212g: an overflow final whose message NEVER STREAMED is UNIQUE content — never named in `remove` (content-loss guard)", async () => {
+    // K>=2 tool-only-last turn where the last text message C streams NO partial
+    // (its content lives only in its final). A,B stream and materialize; C does
+    // not, so `materializedAnswerLanes()` = [A,B] and C's final tC OVERFLOWS to an
+    // independent bubble. C is NOT in `answers` (it never streamed), so tC is
+    // UNIQUE content — marking it in `remove` would make the client DELETE it (a
+    // regression vs the pre-#212 mis-ordered-but-visible bubble). The turn-level
+    // guard (streamed-lane-count 2 != finals-count 3) must leave `remove` empty.
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary(); // first boundary: no-op
+    h.draft.pushAnswerText({ text: "A" }); // lane A (gen 0), streams + materializes
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // → lane B; A auto-settles
+    h.draft.pushAnswerText({ text: "B" }); // lane B (gen 1), streams + materializes
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // → lane C (gen 2); B auto-settles
+    // Lane C streams NOTHING — a non-streaming text message.
+    h.draft.handleAssistantMessageBoundary(); // → tool-only lane (gen 3); C is textless
+
+    const idA = h.frames.find((frame) => frame.text === "A")!.id;
+    const idB = h.frames.find((frame) => frame.text === "B")!.id;
+
+    await h.draft.finalize("tA");
+    await h.draft.finalize("tB");
+    await h.draft.finalize("tC"); // C's final — its ONLY delivery of C's content
+    await h.draft.drain();
+
+    // tC overflows to an independent bubble (C never materialized as a lane).
+    const tcFrame = h.frames.find((frame) => frame.text === "tC")!;
+    expect(tcFrame.id).not.toBe(idA);
+    expect(tcFrame.id).not.toBe(idB);
+
+    expect(h.snapshots).toHaveLength(1);
+    const snap = h.snapshots[0];
+    // Only the streamed messages are answers; C is not (it never streamed).
+    expect(snap.answers).toEqual([
+      { id: idA, text: "A" },
+      { id: idB, text: "B" },
+    ]);
+    // CRITICAL: the unique overflow bubble is NOT named for removal — its content
+    // is not in `answers`, so the client must preserve it.
+    expect(snap.remove).toEqual([]);
+    expect(snap.remove).not.toContain(tcFrame.id);
   });
 
   // #172 — a block carries no content the partials did not already stream (core

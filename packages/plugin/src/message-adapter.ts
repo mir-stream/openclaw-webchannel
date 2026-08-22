@@ -188,6 +188,32 @@ type AssistantDraftLane = {
   tentativeProvisionalId?: string;
   answerText: string;
   /**
+   * #212 (Phase 3): the cleaned VISIBLE answer text this lane STREAMED, captured
+   * at `pushAnswerText` time (and on a deferred-tail restore) and NEVER
+   * overwritten by an authoritative final. `answerText` is topped up in place by
+   * `emitAuthoritativeFinalOnLane`/`flushBufferedOrdinaryFinals`, so it inherits
+   * the #215 mis-routing corruption (a final landing on the wrong lane). This
+   * field does not, so the `turn_snapshot` uses it as the corruption-immune
+   * fallback text source. The deliberate tradeoff is the open VERIFY-1 edge (a
+   * final-only tail that never streamed is missed) — but only on the buffered
+   * mis-routable path; the common immediate path prefers `answerText` (see
+   * `answerTextIsAuthoritative`).
+   */
+  streamedAnswerText: string;
+  /**
+   * #212 (Phase 3): is `answerText` a CORRECTLY-ROUTED authoritative final, safe
+   * to show verbatim in the snapshot? Set true ONLY when
+   * `emitAuthoritativeFinalOnLane` runs from `finalize`'s immediate path — the
+   * collapse / current-lane-has-text / lone-message cases, where the final
+   * provably belongs to THIS lane. Left false for the buffered positional path
+   * (`flushBufferedOrdinaryFinals`), which may mis-route a final onto the wrong
+   * lane (#215). The snapshot uses `answerText` when this is true (preserving the
+   * final's tail beyond the last partial — the VERIFY-1 edge, and the north-star
+   * "final is not droppable") and falls back to the corruption-immune
+   * `streamedAnswerText` otherwise.
+   */
+  answerTextIsAuthoritative: boolean;
+  /**
    * #173: did this lane ever receive non-empty VISIBLE answer text? Set true at
    * the `lane.answerText = cleaned` assignment, which is AFTER the reasoning
    * filter's early-return, so a reasoning-only partial never sets it. It is
@@ -611,6 +637,8 @@ export function createProgressDraftController(params: {
   const newLane = (generation: number): AssistantDraftLane => ({
     generation,
     answerText: "",
+    streamedAnswerText: "",
+    answerTextIsAuthoritative: false,
     streamedVisibleAnswerText: false,
     lastRawAnswerText: "",
     lastPartialSourceText: "",
@@ -663,6 +691,14 @@ export function createProgressDraftController(params: {
   // text-bearing lane); only the drain-time COUNT tells them apart. See
   // `flushBufferedOrdinaryFinals` and `finalize`.
   const bufferedOrdinaryFinals: string[] = [];
+  // #212: wire ids of independent bubbles the plugin KNOWS carry answer content
+  // already represented by a lane in the `turn_snapshot` (a mis-routed overflow
+  // final, or a recovery block whose streamed lane is in `answers`). The snapshot
+  // names them in `remove` so the client drops exactly these and preserves every
+  // other agent bubble (notices/errors). A missed id leaves a corruption bubble;
+  // a wrongly-added id would lose content — captured ONLY at the precise mint
+  // sites below, never from a notice/error path.
+  const supersededAnswerBubbleIds: string[] = [];
 
   const warn = (message: string): void => {
     try {
@@ -839,6 +875,11 @@ export function createProgressDraftController(params: {
   const sendIndependent = (
     text: string,
     assistantMessageIndex?: number,
+    // #212: when this independent bubble carries answer content a lane ALSO
+    // represents in the snapshot's `answers`, record its wire id so the snapshot
+    // can name it in `remove` (the client then drops this duplicate). Set ONLY at
+    // the overflow-final and streamed-lane recovery-block sites — never a notice.
+    options?: { supersedesAnswerLane?: boolean },
   ): boolean => {
     if (!text) {
       warn("independent delivery skipped empty text without a transport attempt");
@@ -866,6 +907,9 @@ export function createProgressDraftController(params: {
     }
     if (sent) {
       commitReservation(reservation);
+      if (options?.supersedesAnswerLane === true) {
+        supersededAnswerBubbleIds.push(reservation.id);
+      }
       return true;
     }
     rollbackReservation(reservation);
@@ -926,6 +970,9 @@ export function createProgressDraftController(params: {
     const restored = deferred.terminalFallbackText;
     if (restored === lane.answerText) return;
     lane.answerText = restored;
+    // #212: a restored incomplete-prose tail is genuine streamed content — keep
+    // the snapshot's streamed source in step with it.
+    lane.streamedAnswerText = restored;
     lane.answerRevision += 1;
     acceptRawBaseline(lane, restored, { replace: true });
     if (lane.resolution === "empty" || lane.resolution === "unresolved") {
@@ -1607,6 +1654,49 @@ export function createProgressDraftController(params: {
     return sent;
   };
 
+  // #212 (Phase 3, targeted): publish the plugin's AUTHORITATIVE ordered set of
+  // the turn's agent ANSWER bubbles so the client renders them verbatim (fixing
+  // #174 ordering and dissolving the #215 K>=2 mid-lane corruption). Called at the
+  // terminal drain AFTER `flushBufferedOrdinaryFinals` (so every lane's text and
+  // the superseded-id set are final) and BEFORE `turn_settled`.
+  //
+  //  - `answers` = the answer lanes (those that streamed visible text) in
+  //    generation order. `id` reuses the lane's own materialized wire id, or a
+  //    freshly minted id for a lane that streamed but never reached the wire
+  //    (failed-frame recovery — the client mints that bubble). `text` is the
+  //    lane's AUTHORITATIVE text when a correctly-routed final settled it
+  //    (`answerTextIsAuthoritative`, preserving the final's tail), else the
+  //    corruption-immune `streamedAnswerText`.
+  //  - `remove` = the ids of independent bubbles the plugin mis-routed answer
+  //    content onto (overflow finals; recovery blocks whose lane is in `answers`).
+  //    The client drops ONLY these and preserves every other agent bubble.
+  //
+  // Case X (K==1) is DELIBERATELY not addressed: it is byte-identical to the
+  // legitimate non-streaming-last collapse (M173c/M15a/M15b), so its tool bubble
+  // is neither an `answers` lane (it never streamed) nor in `remove` — it is
+  // preserved, unchanged, exactly as before.
+  const emitTurnSnapshot = (): void => {
+    const turnId = params.turnId;
+    // No correlation key ⇒ the client cannot scope the reconciliation to a turn.
+    if (turnId === undefined) return;
+    if (typeof transport.sendTurnSnapshot !== "function") return;
+    const answers = state.lanes
+      .filter((lane) => lane.streamedVisibleAnswerText)
+      .map((lane) => ({
+        id: lane.id ?? nextMessageId(),
+        text: lane.answerTextIsAuthoritative ? lane.answerText : lane.streamedAnswerText,
+      }));
+    const remove = [...new Set(supersededAnswerBubbleIds)];
+    if (answers.length === 0 && remove.length === 0) return;
+    try {
+      transport.sendTurnSnapshot(sessionKey, turnId, answers, remove);
+    } catch {
+      // A render-fidelity overlay: a failed emit degrades to the pre-#212
+      // arrival-order render — it never blocks the drain or `turn_settled`.
+      warn("turn_snapshot delivery threw; live-turn agent order falls back to arrival order");
+    }
+  };
+
   const terminalDrain = (settleCurrent: boolean): void => {
     resolveDeferredAngleMarkerTail(currentLane());
     retireTentativeState();
@@ -1619,10 +1709,19 @@ export function createProgressDraftController(params: {
       // #173: the terminal settle is the point where the buffered-final count is
       // finally known, so it is where the textless-currentLane finals resolve.
       flushBufferedOrdinaryFinals();
+      // #212: emit AFTER the flush (lane text + superseded ids now final).
+      emitTurnSnapshot();
     }
   };
 
-  const deliverTerminalIndependent = (text: string): boolean => {
+  const deliverTerminalIndependent = (
+    text: string,
+    // #212: forwarded to `sendIndependent` at the overflow-final site only, so an
+    // overflow bubble (whose content a snapshot lane already carries) is named in
+    // `remove`. Every other terminal-independent caller (leading error, stray
+    // extra, notices) leaves it unset — those bubbles are preserved.
+    options?: { supersedesAnswerLane?: boolean },
+  ): boolean => {
     // ONE STORY, in the order it happens:
     //
     // 1. Retire tentative state, which opens ordering barriers.
@@ -1643,7 +1742,7 @@ export function createProgressDraftController(params: {
     resolveDeferredAngleMarkerTail(currentLane(), { preserveExact: true });
     retireTentativeState();
     emitHeldLaneTextBeforeIndependentDelivery();
-    const sent = sendIndependent(text);
+    const sent = sendIndependent(text, undefined, options);
     releaseReadyLanes({ emitCurrentProgress: false });
     return sent;
   };
@@ -1659,8 +1758,15 @@ export function createProgressDraftController(params: {
   const emitAuthoritativeFinalOnLane = (
     target: AssistantDraftLane,
     text: string,
+    // #212: true ONLY from `finalize`'s immediate path, where this final is
+    // provably THIS lane's own (collapse / current-lane-has-text / lone message).
+    // The snapshot may then show `answerText` verbatim (the final's full tail).
+    // The buffered positional path leaves it false — it may mis-route (#215), so
+    // the snapshot falls back to the corruption-immune `streamedAnswerText`.
+    options?: { authoritative?: boolean },
   ): boolean => {
     target.answerText = text;
+    if (options?.authoritative === true) target.answerTextIsAuthoritative = true;
     target.answerRevision += 1;
     discardPendingProgress(
       (frame) => frame.kind === "lane" && frame.generation === target.generation,
@@ -1702,15 +1808,44 @@ export function createProgressDraftController(params: {
     // trades lane corruption for a stray bubble. Exotic (3+ text lanes + tool-only
     // last + a mid-sequence drop) and self-heals on reload. The sound fix is the
     // Phase 3 authoritative snapshot. Pinned by M173e; do NOT add mitigation here.
+    //
+    // #212 sub-case (non-streaming MIDDLE message): a text-bearing MIDDLE message
+    // that streams ZERO partials, in a K>=2 tool-only-last turn, is worse than a
+    // dropped frame. It has no `streamedAnswerText`, so it is absent from the
+    // snapshot's `answers` entirely; its mis-routed final overwrites a LATER
+    // lane's `answerText`, and the un-removed overflow duplicates that later lane —
+    // so the live view can read [A][C][C] with B absent (reload-heals). Same #111
+    // identity ceiling; not core-observed at the middle position today. Pinned
+    // conceptually alongside M212g, whose guard keeps the overflow VISIBLE (never
+    // named in `remove`) rather than deleting unique content.
     const targets = finals.length === 1 ? [currentLane()] : materializedAnswerLanes();
+    // #212: an overflow final is safe to name in the snapshot's `remove` ONLY when
+    // its content is provably in `answers`. `answers` carries every lane that
+    // STREAMED visible text; an overflow bubble duplicates one of those iff EVERY
+    // text-bearing message streamed — i.e. the count of streamed answer lanes
+    // equals the count of ordinary finals this flush routes. When it is smaller, at
+    // least one message streamed no partial (its content lives ONLY in its final),
+    // so an overflow bubble may carry UNIQUE content — never mark it, or the client
+    // would delete content absent from `answers` (a regression vs the pre-#212
+    // mis-ordered-but-visible bubble). This is a turn-level invariant, not a guess
+    // about which final overflowed.
+    const everyFinalHasStreamedLane =
+      state.lanes.filter((lane) => lane.streamedVisibleAnswerText).length === finals.length;
     finals.forEach((text, index) => {
       const target = targets[index];
       if (!target) {
-        deliverTerminalIndependent(text);
+        // #212: an overflow final in the #173 tool-only-last topology is one of
+        // the (already-streamed) text-bearing messages whose lane did not
+        // materialize — its content is in the snapshot's `answers`, so this
+        // independent bubble is a duplicate the snapshot names in `remove`. Only
+        // when `everyFinalHasStreamedLane` (see above) is this provable.
+        deliverTerminalIndependent(text, { supersedesAnswerLane: everyFinalHasStreamedLane });
         return;
       }
       target.deferredAngleMarkerTail = undefined;
       target.lastPartialSourceText = "";
+      // Buffered positional routing may mis-route (#215) — leave `answerText`
+      // non-authoritative so the snapshot uses the streamed text.
       emitAuthoritativeFinalOnLane(target, text);
     });
   };
@@ -1870,6 +2005,9 @@ export function createProgressDraftController(params: {
           lane.deferredAngleMarkerTail = deferredResult.deferred;
           if (!cleaned || cleaned.startsWith("Reasoning:\n")) return;
           lane.answerText = cleaned;
+          // #212: capture the streamed text on a field a later authoritative final
+          // never overwrites, so the `turn_snapshot` is immune to #215 mis-routing.
+          lane.streamedAnswerText = cleaned;
           // #173: this lane has now streamed visible answer text. Set AFTER the
           // reasoning-filter early-return above, so a `Reasoning:\n...` partial
           // never counts. Persistent: settlement counts lanes with this flag to
@@ -2056,7 +2194,15 @@ export function createProgressDraftController(params: {
             return false;
           }
           emitHeldLaneTextBeforeIndependentDelivery();
-          return sendIndependent(input.text, input.assistantMessageIndex);
+          // #212: reaching here with a streamed target lane means that lane's
+          // frame FAILED (`laneTerminalSuppressed`) — this block is recovering its
+          // content. That lane is in the snapshot's `answers` (by streamed text),
+          // so this independent recovery bubble duplicates it and is named in
+          // `remove`. An unstamped/tool-only-lane block carries UNIQUE content and
+          // is preserved (flag stays unset).
+          return sendIndependent(input.text, input.assistantMessageIndex, {
+            supersedesAnswerLane: targetLane?.streamedVisibleAnswerText === true,
+          });
         },
         false,
       ),
@@ -2197,7 +2343,9 @@ export function createProgressDraftController(params: {
           active.deferredAngleMarkerTail = undefined;
           active.lastPartialSourceText = "";
           terminalDrain(false);
-          return emitAuthoritativeFinalOnLane(active, text);
+          // #212: the immediate path routes the final to its OWN lane — the
+          // snapshot may show this authoritative text verbatim (final tail kept).
+          return emitAuthoritativeFinalOnLane(active, text, { authoritative: true });
         },
         false,
       );
