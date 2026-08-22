@@ -1,4 +1,4 @@
-# Changelog — @mir-stream/webchannel-client
+# Changelog — openclaw-webchannel-client
 
 ## Unreleased
 

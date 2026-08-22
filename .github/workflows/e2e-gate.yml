@@ -297,7 +297,7 @@ jobs:
       # ──────────────────────────────────────────────────────────────────────
       # 5b. Build the publishable packages (dist/) and run the examples'
       #     CONSUMER tests with their own node:test/TAP runner.
-      #     They import @mir-stream/* by package ENTRY (main/exports → dist/),
+      #     They import openclaw-webchannel-* by package ENTRY (main/exports → dist/),
       #     exactly like a downstream consumer — no dist ⇒ no resolve. They are
       #     deliberately EXCLUDED from the root vitest sweep (vitest.config.ts):
       #     vite's resolver doesn't produce the node error codes they assert.

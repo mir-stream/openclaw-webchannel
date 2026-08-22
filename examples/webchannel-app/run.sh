@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reference WebChannel app — boot the SaaS backend + a local nats-server, then
 # print how to attach an openclaw agent. Everything the app uses from the library
-# goes through the PUBLIC @mir-stream/webchannel-{saas,client} package names.
+# goes through the PUBLIC openclaw-webchannel-{saas,client} package names.
 #
 # Build MUST precede run: the package exports point at dist/ (gitignored), so a
 # stale/absent dist would resolve to nothing. We rebuild both packages first.
@@ -16,7 +16,7 @@ PORT="${PORT:-4000}"
 NATS_WS="${NATS_WS:-18790}"
 RELAY="${RELAY:-self-contained}"
 
-echo "[app] building @mir-stream/webchannel-saas + -client (dist is gitignored — always rebuild)…"
+echo "[app] building openclaw-webchannel-saas + -client (dist is gitignored — always rebuild)…"
 ( cd "$REPO" && npm run build -w packages/saas -w packages/client )
 
 echo ""

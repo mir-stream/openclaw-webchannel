@@ -1,7 +1,7 @@
 /**
  * Reference WebChannel browser client — PUBLIC API ONLY.
  *
- * Imports come solely from the published package `@mir-stream/webchannel-client`.
+ * Imports come solely from the published package `openclaw-webchannel-client`.
  * This is the full production connect flow:
  *
  *   login → generate device keys (X25519 ECDH + Ed25519 PoP) →
@@ -21,7 +21,7 @@ import {
   WebChannelNATSClient,
   generateDevicePopKeyPair,
   type WebChannelState,
-} from "@mir-stream/webchannel-client";
+} from "openclaw-webchannel-client";
 
 // ---------------------------------------------------------------------------
 // Pure classifier (exported for the headless smoke test).

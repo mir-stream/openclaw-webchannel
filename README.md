@@ -30,7 +30,7 @@ to the JWT-attested device key, so review finding **C2** — active-relay MITM �
 | E2E crypto (X25519 + HKDF + ChaCha20-Poly1305), envelope, NATS transport | ✅ done, component-tested |
 | Trust chain (`packages/saas`): `setupTrustChain`, device-flow enrollment, NATS user creds | ✅ done, tested on a real nats-server |
 | Browser dialing NATS in the production client (`WebChannelNatsClient`) | ✅ live (NKEY-auth + register-delivered conversation key, ciphertext-only) |
-| Packaging / publishing | ✅ **shipped** — plugin `openclaw-webchannel@0.1.0` on ClawHub (`clawhub:mir-stream/openclaw-webchannel`); `@mir-stream/webchannel-{saas,client}` on public npm (zero-auth install, provenance) via tag-triggered CI (`docs/PUBLISHING.md`) |
+| Packaging / publishing | ✅ **shipped** — plugin `openclaw-webchannel@0.1.0` on ClawHub (`clawhub:mir-stream/openclaw-webchannel`); `openclaw-webchannel-{saas,client}` on public npm (zero-auth install, provenance) via tag-triggered CI (`docs/PUBLISHING.md`) |
 
 Full detail, and reconciliation of the conflicting "AC 100% / complete" signals, is in
 [`docs/STATUS.md`](docs/STATUS.md).
@@ -116,4 +116,4 @@ excluded from that sweep and is guarded only by each example's own `npm test`.
 ## License
 
 [MIT](LICENSE) — all three published packages (`openclaw-webchannel`,
-`@mir-stream/webchannel-client`, `@mir-stream/webchannel-saas`).
+`openclaw-webchannel-client`, `openclaw-webchannel-saas`).

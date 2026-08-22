@@ -6,8 +6,8 @@ authentication at all:
 
 | Package | What it is |
 |---|---|
-| `@mir-stream/webchannel-saas` | Headless SaaS trust-chain core (device-flow enrollment, NATS creds/JWT minting) |
-| `@mir-stream/webchannel-client` | Framework-agnostic, zero-dependency browser client |
+| `openclaw-webchannel-saas` | Headless SaaS trust-chain core (device-flow enrollment, NATS creds/JWT minting) |
+| `openclaw-webchannel-client` | Framework-agnostic, zero-dependency browser client |
 
 They lived on **GitHub Packages** until 0.6.1. That registry requires an
 authenticated `read:packages` token for *every* consumer read — even of a public
@@ -26,9 +26,10 @@ repository variable is set to `"true"` — see
 ## Cutting a release
 
 One `v*` tag ships **all three** artifacts at a **single, identical version** —
-`webchannel-client`, `webchannel-saas` and the `openclaw-webchannel` plugin, all
-three to public npm (the plugin additionally to ClawHub *if* that leg is enabled,
-which by default it is not). This 3-way lockstep is enforced in CI (see below),
+`openclaw-webchannel-client`, `openclaw-webchannel-saas` and the
+`openclaw-webchannel` plugin, all three to public npm (the plugin additionally to
+ClawHub *if* that leg is enabled, which by default it is not). This 3-way
+lockstep is enforced in CI (see below),
 so the plugin can never fall behind the npm packages again.
 
 1. Bump `version` to the **same** value in all three:
@@ -46,8 +47,8 @@ so the plugin can never fall behind the npm packages again.
 
 The `Publish Packages` workflow (`.github/workflows/publish.yml`) runs four jobs:
 
-- **`publish`** — builds, tests, and publishes `webchannel-client` and
-  `webchannel-saas` to public npm via **OIDC trusted publishing** with
+- **`publish`** — builds, tests, and publishes `openclaw-webchannel-client` and
+  `openclaw-webchannel-saas` to public npm via **OIDC trusted publishing** with
   `--provenance` (no `NPM_TOKEN`, no PAT — the job's `id-token: write` is the
   whole credential story). Also runnable manually (`workflow_dispatch`): a
   dispatch from any ref builds, tests, and runs both lockstep gates, but never
@@ -128,20 +129,25 @@ npm dist-tag add <name>@<version> latest \
   --registry=https://registry.npmjs.org/
 ```
 
-That form is correct for every **unscoped** name, which today means
-`openclaw-webchannel` and, after the #226 rename, `openclaw-webchannel-client`
-and `openclaw-webchannel-saas`.
+That form is correct for every **unscoped** name, which is now **all three** of
+them — `openclaw-webchannel`, `openclaw-webchannel-client` and
+`openclaw-webchannel-saas`. Nothing this repo publishes is scoped any more, so
+the form above is the one to use.
 
-**If the name is scoped** (`@scope/...`, i.e. the `@mir-stream/webchannel-*`
-packages up to and including 0.6.x), that command silently targets the wrong
-registry: the legacy `.npmrc` line documented later in this guide maps
-`@mir-stream` to GitHub Packages, and a plain `--registry` does **not** override
-an `@scope:registry` mapping. Override the scope instead:
+**Legacy case — only if the name is scoped** (`@scope/...`, which for this repo
+means the scoped `@mir-stream/…` names client and saas carried up to and
+including 0.6.x, before the #226 rename): that command silently targets the
+wrong registry, because a plain `--registry` does **not** override an
+`@scope:registry` mapping — and the legacy `.npmrc` line documented later in
+this guide maps `@mir-stream` to GitHub Packages. Override the scope instead:
 
 ```sh
-npm dist-tag add @mir-stream/<package>@<version> latest \
-  --@mir-stream:registry=https://registry.npmjs.org/
+npm dist-tag add @scope/<package>@<version> latest \
+  --@scope:registry=https://registry.npmjs.org/
 ```
+
+That `@scope:registry`-beats-`--registry` precedence is live npm behavior worth
+remembering; it just no longer applies to any name here.
 
 Before changing any tag, confirm the intended version is newer; never move
 `latest` backward.
@@ -157,18 +163,20 @@ so a brand-new package name has a chicken-and-egg problem: OIDC cannot create
 it, and the workflow's publish step is denied by npm until the trusted publisher
 exists. (This is a known npm gap — PyPI lets you configure a trusted publisher
 for a name that does not exist yet; npm does not. See npm/cli#8544.)
-`@mir-stream/webchannel-client` and `@mir-stream/webchannel-saas` are brand-new
-names *on npmjs.org* — their history is on GitHub Packages, a different registry
-— so all four steps below must be done for both packages.
+`openclaw-webchannel-client` and `openclaw-webchannel-saas` are brand-new names
+*on npmjs.org* — nothing has ever been published under either — so all four
+steps below must be done for both packages.
 
-The chicken-and-egg is per package **name**, not per scope, so the existing
-unscoped plugin registration does not configure either new scoped name. The
-`@mir-stream` scope and scoped OIDC trusted publishing with provenance for this
-org are already proven by `@mir-stream/openclaw-prompt-compat@0.3.0`, whose
-registry metadata includes a SLSA v1 provenance attestation and a `gitHead`.
-That package comes from a different repository, so it proves only that the
-registry/scope path works; it does not configure this repo's workflow for client
-or saas, and both names still require the bootstrap below.
+The chicken-and-egg is per package **name**, so the existing
+`openclaw-webchannel` plugin registration configures neither of them, even
+though all three names now share that prefix: an unscoped prefix is not a
+namespace npm recognises. OIDC
+trusted publishing with provenance is already proven for this org by
+`@mir-stream/openclaw-prompt-compat@0.3.0`, whose registry metadata includes a
+SLSA v1 provenance attestation and a `gitHead`. That package comes from a
+different repository, so it proves only that the registry path works; it does
+not configure this repo's workflow for client or saas, and both names still
+require the bootstrap below.
 
 **Do not bootstrap at the release version.** Publishing `0.6.1` by hand would
 ship it **unattested**, and the workflow's idempotency guard would reject that
@@ -177,14 +185,31 @@ CI could not replace it with the attested build the release promises. Bootstrap
 with a throwaway `0.0.0-bootstrap.0` instead, so the **real** release is the first
 thing CI publishes and it carries provenance.
 
-**Prerequisite.** The `@mir-stream` org exists on registry.npmjs.org. Before
-starting, confirm you are a member of it with publish rights — step (a) fails
-with a `403` otherwise, and nothing about the rest is self-diagnosing:
+**Prerequisite.** Both names are **unscoped**, so npm org membership is
+irrelevant here — org permissions govern `@scope/` packages only. An unscoped
+name is owned **per package, first-come-first-served**: whoever publishes it
+first becomes its owner. Two things must therefore hold before step (a), and
+neither is self-diagnosing afterwards:
 
-```sh
-npm whoami --registry https://registry.npmjs.org
-npm org ls mir-stream
-```
+1. **You are logged in as the account that should own these names.** The
+   bootstrap publish is what claims ownership; there is no separate grant step.
+
+   ```sh
+   npm whoami --registry https://registry.npmjs.org
+   ```
+
+2. **Both names are still unclaimed.** A `404` here is the required
+   precondition, not an error:
+
+   ```sh
+   npm view openclaw-webchannel-client   # must be E404
+   npm view openclaw-webchannel-saas     # must be E404
+   ```
+
+   Both returned `E404` when last checked (2026-08-22). **If either ever stops
+   returning `404`, stop.** Someone else has taken the name, and no amount of
+   configuration recovers it — the bootstrap and every later release under that
+   name are blocked until a different name is chosen.
 
 **(a) Publish a `0.0.0-bootstrap.0` placeholder for each package.** The point is
 only to make the *name* exist so npm will accept a trusted-publisher configuration
@@ -236,7 +261,7 @@ the trusted-publisher configuration with it, and putting you back at square one.
 Leave `0.0.0-bootstrap.0@bootstrap` in place; it is harmless.
 
 **(b) Attach the Trusted Publisher.** On npmjs.com, for **each** of
-`@mir-stream/webchannel-client` and `@mir-stream/webchannel-saas`:
+`openclaw-webchannel-client` and `openclaw-webchannel-saas`:
 
 > Package → Settings → Trusted Publisher → Add:
 > - Organization or user = **`mir-stream`**
@@ -268,8 +293,8 @@ provenance and the published `gitHead` against the run's commit.
 After the release publishes, verify that `latest` moved for **both** packages:
 
 ```sh
-curl -s https://registry.npmjs.org/-/package/@mir-stream%2fwebchannel-client/dist-tags
-curl -s https://registry.npmjs.org/-/package/@mir-stream%2fwebchannel-saas/dist-tags
+curl -s https://registry.npmjs.org/-/package/openclaw-webchannel-client/dist-tags
+curl -s https://registry.npmjs.org/-/package/openclaw-webchannel-saas/dist-tags
 ```
 
 Each response must report `latest` equal to the release version, not
@@ -377,7 +402,7 @@ Projects that consumed a pre-0.6.1 release may still force the entire
    dependency spec instead of letting Arborist preserve it:
 
    ```sh
-   npm install --save-exact @mir-stream/webchannel-saas@0.6.1 @mir-stream/webchannel-client@0.6.1
+   npm install --save-exact openclaw-webchannel-saas@0.6.1 openclaw-webchannel-client@0.6.1
    ```
 
 4. **Verify no GitHub Packages URL remains.**
@@ -398,13 +423,13 @@ Projects that consumed a pre-0.6.1 release may still force the entire
 Install them. That is the whole procedure:
 
 ```sh
-npm install @mir-stream/webchannel-saas @mir-stream/webchannel-client
+npm install openclaw-webchannel-saas openclaw-webchannel-client
 ```
 
 **No `.npmrc`, no token, no registry configuration** — they are public packages
 on the default registry, so a plain `npm install` works in a laptop, a CI job, a
 Docker build, and a deploy host alike. Pin a version the usual way
-(`@mir-stream/webchannel-saas@0.6.1`) if you want reproducibility.
+(`openclaw-webchannel-saas@0.6.1`) if you want reproducibility.
 
 Releases published by CI carry an npm **provenance attestation** linking the
 tarball to the workflow run and source commit that built it. Verify it with:
@@ -425,6 +450,6 @@ To hand someone a build without any registry:
 
 ```sh
 npm pack -w packages/saas -w packages/client
-# → mir-stream-webchannel-saas-<v>.tgz, mir-stream-webchannel-client-<v>.tgz
-npm install ./mir-stream-webchannel-saas-<v>.tgz   # in the consuming project
+# → openclaw-webchannel-saas-<v>.tgz, openclaw-webchannel-client-<v>.tgz
+npm install ./openclaw-webchannel-saas-<v>.tgz   # in the consuming project
 ```

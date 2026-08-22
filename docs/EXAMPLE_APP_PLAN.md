@@ -1,6 +1,6 @@
 # 기획서 v2 — `examples/webchannel-app`: 공개 API만 쓰는 레퍼런스 데모
 
-> 목적: 제3자 개발자가 `@mir-stream/webchannel-{saas,client}`의 **공개(published) API만으로**
+> 목적: 제3자 개발자가 `openclaw-webchannel-{saas,client}`의 **공개(published) API만으로**
 > WebChannel 앱(SaaS 백엔드 + 브라우저 클라이언트)을 어떻게 만드는지 보여주는 실행 가능한 레퍼런스.
 > 기존 `demo/`(도청/카오스 레드팀 포함 쇼케이스)는 **그대로 유지**하고, 이건 **별도**로 추가한다.
 
@@ -90,7 +90,7 @@ export async function createBootstrapIssuer(opts: {
 examples/
   minimal-consumer/            # 기존 — 런타임 경계 테스트(exports 차단 assert). 유지·참조
   webchannel-app/              # ★신규
-    package.json               # deps: @mir-stream/webchannel-{saas,client}; devDeps: tsx, esbuild, typescript
+    package.json               # deps: openclaw-webchannel-{saas,client}; devDeps: tsx, esbuild, typescript
     README.md                  # 사용법 + openclaw 게이트웨이 꽂는 법(사용자 영역) + 무에이전트 종단 상태 설명
     tsconfig.json
     server/
@@ -106,7 +106,7 @@ examples/
 ```
 
 ## 4. SaaS 백엔드 (`server/`) — 전부 공개 API
-부팅(모두 `@mir-stream/webchannel-saas`):
+부팅(모두 `openclaw-webchannel-saas`):
 1. `loadOrCreateTrustChain(path, { operatorName, accountName })` → `natsConfig`(공개
    `NatsSelfContainedAccountConfig`: operatorJwt+resolverConfig+accountPublicKey), `private.natsAccountSeed`,
    `private.rsaPrivateKeyPem`, `kid`, `jwks` 확보.

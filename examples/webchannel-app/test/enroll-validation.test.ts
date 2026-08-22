@@ -3,7 +3,7 @@ import { Readable } from "node:stream";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DeviceFlowEnrollment } from "@mir-stream/webchannel-saas";
+import { DeviceFlowEnrollment } from "openclaw-webchannel-saas";
 import { createAccount } from "@nats-io/nkeys";
 import { exampleAssert as assert, exampleTest } from "../../../scripts/example-test-guard.mjs";
 

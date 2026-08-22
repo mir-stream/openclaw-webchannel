@@ -1,4 +1,4 @@
-# Changelog — @mir-stream/webchannel-plugin
+# Changelog — openclaw-webchannel
 
 ## Unreleased
 

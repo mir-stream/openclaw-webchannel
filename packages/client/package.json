@@ -1,5 +1,5 @@
 {
-  "name": "@mir-stream/webchannel-client",
+  "name": "openclaw-webchannel-client",
   "version": "0.6.1",
   "description": "Framework-agnostic, zero-dependency browser client for WebChannel (headless connection + protocol + state).",
   "license": "MIT",
