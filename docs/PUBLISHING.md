@@ -138,14 +138,11 @@ npm dist-tag add <name>@<version> latest \
   --registry=https://registry.npmjs.org/
 ```
 
-That form is correct for every **unscoped** name, which is now **all three** of
-them — `openclaw-webchannel`, `openclaw-webchannel-client` and
-`openclaw-webchannel-saas`. Nothing this repo publishes is scoped any more, so
-the form above is the one to use.
+That form is correct for every **unscoped** name — `openclaw-webchannel`, and
+`openclaw-webchannel-client` / `openclaw-webchannel-saas` once they are
+published.
 
-**Legacy case — only if the name is scoped** (`@scope/...`, which for this repo
-means the scoped `@mir-stream/…` names client and saas carried up to and
-including 0.6.x, before the #226 rename): that command silently targets the
+**If the name is scoped** (`@scope/...`), that command silently targets the
 wrong registry, because a plain `--registry` does **not** override an
 `@scope:registry` mapping — and the legacy `.npmrc` line documented later in
 this guide maps `@mir-stream` to GitHub Packages. Override the scope instead:
@@ -155,8 +152,17 @@ npm dist-tag add @scope/<package>@<version> latest \
   --@scope:registry=https://registry.npmjs.org/
 ```
 
+**This still applies to the scoped names today.**
+`@mir-stream/webchannel-{client,saas}@0.6.1` are live and `latest` on npm until
+the rename release unpublishes them, so they remain what this runbook repairs:
+
+```sh
+npm dist-tag add @mir-stream/webchannel-client@0.6.1 latest \
+  --@mir-stream:registry=https://registry.npmjs.org/
+```
+
 That `@scope:registry`-beats-`--registry` precedence is live npm behavior worth
-remembering; it just no longer applies to any name here.
+remembering, and it stops applying to this repo only once the old names are gone.
 
 Before changing any tag, confirm the intended version is newer; never move
 `latest` backward.
@@ -224,31 +230,55 @@ afterwards:
    reads: a stale `registry=` in `~/.npmrc` would 404 from the *wrong* registry
    and hand you a false "unclaimed".
 
-   **If either stops returning `404`, check `npm owner ls <name>` before
-   concluding anything.** Step (a) publishes the two packages separately, so a
-   partial bootstrap is entirely normal — one can succeed and the other fail (the
-   two scoped packages were created 14 seconds apart, as two publishes). If your
-   account is listed, you already claimed that name on an earlier attempt: leave
-   it alone and skip to step (b). **Only if the owner is someone else must you
-   stop** — no amount of configuration recovers a name another account holds, and
-   the bootstrap plus every later release under it are blocked until a different
-   name is chosen.
+   **If either stops returning `404`, check what is published before concluding
+   anything.** Step (a) publishes the two packages separately, so a partial
+   bootstrap is entirely normal — one can succeed and the other fail (the two
+   scoped packages were created 14 seconds apart, as two publishes). Triage on
+   the **versions**, which subsumes the ownership question:
+
+   ```sh
+   npm view openclaw-webchannel-client versions --json --registry https://registry.npmjs.org
+   ```
+
+   Exactly `["0.0.0-bootstrap.0"]` means you claimed that name on an earlier
+   attempt: leave it alone, skip to step (b) **for that name only**, and repeat
+   step (a) for whichever name still 404s.
+
+   **Anything else is a stop.** A different owner means no amount of
+   configuration recovers the name, and the bootstrap plus every later release
+   under it are blocked until a different name is chosen. Any *other* version
+   present — `0.6.1` above all — means a hand publish went out at a release
+   version: it is unattested, step (d) below depends on that version being
+   absent, and CI cannot replace it. See **Do not bootstrap at the release
+   version** above.
 
 **(a) Publish a `0.0.0-bootstrap.0` placeholder for each package.** The point is
 only to make the *name* exist so npm will accept a trusted-publisher configuration
 on it. Work in a **throwaway clone** — the version edit below must never be
-committed or tagged, and the repo's own `package.json` files stay at `0.6.1`:
+committed or tagged, and the repo's own `package.json` files stay at `0.6.1`.
+
+**Clone a ref that carries the #226 rename**, and do not run this step until the
+rename is merged to that ref. The manifests decide which names get claimed, and
+an unpinned clone takes the default branch — which still carries the old scoped
+names until the rename lands there. The assertion below makes that
+self-diagnosing; do not skip it.
 
 ```sh
-git clone https://github.com/mir-stream/openclaw-webchannel.git /tmp/wc-bootstrap
+# <ref> must be a branch or tag whose manifests already carry the new names.
+git clone --branch <ref> https://github.com/mir-stream/openclaw-webchannel.git /tmp/wc-bootstrap
 cd /tmp/wc-bootstrap
 npm ci
-npm login   # if not already authenticated against registry.npmjs.org
+npm login --registry https://registry.npmjs.org   # if not already authenticated
 
 # Rewrite the two manifests IN THIS THROWAWAY CLONE ONLY.
 # --no-git-tag-version stops npm from committing or tagging the change.
 npm version 0.0.0-bootstrap.0 --no-git-tag-version -w packages/client
 npm version 0.0.0-bootstrap.0 --no-git-tag-version -w packages/saas
+
+# ASSERT the clone carries the renamed manifests. If either prints an
+# @mir-stream/… name, STOP — the ref is wrong and you would claim nothing.
+node -p "require('./packages/client/package.json').name"   # → openclaw-webchannel-client
+node -p "require('./packages/saas/package.json').name"     # → openclaw-webchannel-saas
 
 npm publish -w packages/client --access public --tag bootstrap --registry https://registry.npmjs.org
 npm publish -w packages/saas   --access public --tag bootstrap --registry https://registry.npmjs.org
@@ -401,10 +431,25 @@ release can't silently change the publish contract mid-release. Bump the pin in
 
 ### Migrating an existing consumer
 
-**Every existing consumer must do this**, whichever release you are on: the
-packages were renamed, and the old `@mir-stream/webchannel-*` names are
-unpublished once the unscoped names ship. This is a *name* change, so a plain
-`npm update` will not do it — nothing resolves the old name to the new one.
+**Do this once the rename release is published — not before.** The unscoped
+names do not exist on npm yet (see the top of this guide); until that release
+ships, stay on the scoped names, which keep working. Confirm before you start:
+
+```sh
+npm view openclaw-webchannel-client version --registry https://registry.npmjs.org
+```
+
+Once it *is* published, **every existing consumer must migrate**, whichever
+release you are on: the packages were renamed, and the old
+`@mir-stream/webchannel-*` names are unpublished shortly after. This is a *name*
+change, so a plain `npm update` will not do it — nothing resolves the old name to
+the new one.
+
+(Operator note: npm's unconditional unpublish window is 72h from publish, and
+`0.6.1` was published 2026-08-22T01:38:56Z / 01:39:10Z — so it closes about
+**2026-08-25T01:39Z**. After that, unpublishing becomes conditional and the
+fallback is `npm deprecate`, which leaves the old names installable but warns on
+install.)
 
 Steps 1 and 2 apply only if you consumed a **pre-0.6.1** release and may still
 force the `@mir-stream` scope through GitHub Packages; if you are already on
@@ -427,14 +472,16 @@ force the `@mir-stream` scope through GitHub Packages; if you are already on
 
    It must no longer print `https://npm.pkg.github.com`.
 
-3. **Remove the old names and add the new ones.** Uninstalling is not optional:
-   `npm install` of the new names only *adds* them, leaving the old dependencies
-   in `package.json` and the lockfile — where they still resolve, so you would
-   ship two copies of the library and never notice.
+3. **Add the new names, then remove the old ones — in that order.** Install
+   first so a failed install leaves you on the working old packages rather than
+   with neither. Removing them afterwards is not optional: installing the new
+   names only *adds* them, and the old dependencies stay in `package.json` and
+   the lockfile — where they still resolve, so you would ship two copies of the
+   library and never notice.
 
    ```sh
-   npm uninstall @mir-stream/webchannel-saas @mir-stream/webchannel-client
    npm install --save-exact openclaw-webchannel-saas@0.6.1 openclaw-webchannel-client@0.6.1
+   npm uninstall @mir-stream/webchannel-saas @mir-stream/webchannel-client
    ```
 
 4. **Rewrite every import specifier in your source.** The package name changed,
@@ -442,16 +489,21 @@ force the `@mir-stream` scope through GitHub Packages; if you are already on
    resolve. Find them first, then rewrite:
 
    ```sh
-   grep -rn '@mir-stream/webchannel-' --include='*.ts' --include='*.tsx' \
-     --include='*.js' --include='*.mjs' .
+   grep -rn '@mir-stream/webchannel-' --exclude-dir=node_modules --exclude-dir=dist .
    ```
 
    `@mir-stream/webchannel-saas` → `openclaw-webchannel-saas`, and
    `@mir-stream/webchannel-client` → `openclaw-webchannel-client`. The exported
-   API is unchanged, so nothing but the specifier moves.
+   API is unchanged, so nothing but the specifier moves. Package names can also
+   appear outside source files — `tsconfig.json` `compilerOptions.paths`, bundler
+   aliases, and browser import maps — which is why the search above is not
+   restricted by file extension.
 
-5. **Verify the migration is complete.** This fails on either half — a leftover
-   GitHub Packages URL, or a residual old-name dependency:
+5. **Verify the migration is complete.** This fails on any of the three ways it
+   can be left half-done — a leftover GitHub Packages URL, a residual old-name
+   dependency, or a source file still importing the old name (step 4 skipped).
+   The lockfile checks are **npm-specific**; on yarn or pnpm keep the source
+   check and apply the equivalent inspection to your own lockfile.
 
    ```sh
    if [ ! -r package-lock.json ]; then
@@ -466,11 +518,16 @@ force the `@mir-stream` scope through GitHub Packages; if you are already on
      echo "ERROR: package-lock.json still depends on the old package names." >&2
      exit 1
    fi
+   if grep -rn '@mir-stream/webchannel-' --exclude-dir=node_modules --exclude-dir=dist .; then
+     echo "ERROR: source still imports the old package names (step 4)." >&2
+     exit 1
+   fi
    ```
 
 ### Installing
 
-Install them. That is the whole procedure:
+Install them. That is the whole procedure (once the rename release is published
+— until then these names 404; see the top of this guide):
 
 ```sh
 npm install openclaw-webchannel-saas openclaw-webchannel-client
