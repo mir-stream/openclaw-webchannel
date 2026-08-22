@@ -16,9 +16,10 @@
 # public and all three packages are MIT, so there is nothing left to gate.
 #
 # Trigger: push a tag like v0.1.0 (all three share ONE version). A
-# workflow_dispatch run builds and tests but publishes NOTHING unless it is
-# dispatched from a v* tag ref — see the tag-ref guard on the publish step. The
-# plugin leg (publish-plugin, gated on the npm leg) publishes to ClawHub.
+# workflow_dispatch run never publishes anything, from any ref; it builds,
+# tests, and runs both lockstep gates, which is what makes it useful. Only a v*
+# tag push publishes. The plugin leg (publish-plugin, gated on the npm leg)
+# publishes to ClawHub.
 #
 # ONE-TIME BOOTSTRAP (per package name): npm attaches a Trusted Publisher to an
 # EXISTING package, so the very first publish of a brand-new name cannot come
@@ -56,6 +57,18 @@ on:
     tags: ["v*"]
   workflow_dispatch: {}
 
+# Every v* tag push shares one group so different releases cannot interleave
+# writes to the same npm `latest` tags. Every dispatch stays keyed per ref: it
+# publishes nothing, so it must never queue behind or evict a release.
+# Cancellation stays off:
+# cancelling a half-finished publish is strictly worse than queueing behind it.
+# GitHub retains only one pending run per group; if a third release arrives while
+# one is running and one is pending, GitHub cancels the pending run. That is loud
+# and recoverable with `gh run rerun <RUN_ID>`, but it is not silent serialization.
+concurrency:
+  group: ${{ github.workflow }}-${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) && 'npm-release' || github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -72,7 +85,7 @@ jobs:
       # ── 컷오버 조상 가드 ──
       # 구 커밋 재태그(전환 이전 세계의 파일·크레덴셜 전제)가 크레덴셜에 닿기 전에 차단한다.
       # 체크아웃 불필요: API compare 한 방. GITHUB_REF_NAME(태그명) 비교라 annotated 태그 역참조 문제 없음.
-      # 후속 2잡은 needs: publish 라 이 가드 하나로 전부 차단된다.
+      # 후속 3잡은 needs: publish 라 이 가드 하나로 전부 차단된다.
       # 알려진 잔여 구간: 이 SHA 이후·호스티드 러너 전환 이전 커밋을 재태그하면 가드는 통과하지만
       # 워크플로가 그 시점 파일(`runs-on: deploy`)로 돌아 존재하지 않는 라벨에 영원히 큐잉된다.
       # 그 태그를 실제로 다시 팔 일이 생기면 SHA 를 전환 커밋으로 올려 실패를 시끄럽게 만들 것.
@@ -184,20 +197,20 @@ jobs:
       # the registry must also report provenance and a gitHead matching this run's
       # commit, or the step fails instead of accepting an immutable tarball of
       # unknown origin. This makes "Re-run failed jobs" safe after a partial npm
-      # publish (client shipped, saas flaked), and a full re-run of a fully-shipped
-      # tag a verified green no-op. Each check uses the package.json's own version
-      # (NOT the tag) so it's correct on workflow_dispatch too; lockstep guarantees
-      # package.json == tag on tag runs. The `npm view` probes need no auth now that
-      # the target is the public registry.
+      # publish (client shipped, saas flaked). On a full re-run, already-shipped
+      # publish legs are verified no-ops and skip green. End-to-end green also
+      # requires all three `latest` tags to equal the re-run tag's version, so a
+      # superseded tag ends red at `verify-dist-tags` by design; never move
+      # `latest` backward to fix it. Each check uses the package.json's own version
+      # (NOT the tag); lockstep guarantees package.json == tag on the tag-push path.
+      # The `npm view` probes need no auth now that the target is the public registry.
       #
-      # TAG-REF GUARD — the invariant is: NOTHING is published from a ref that is
-      # not a v* tag. Without it, a workflow_dispatch from a branch would publish
-      # whatever version that branch's package.json happens to carry. On GitHub
-      # Packages that was a deletable, token-gated mistake; on public npm it
-      # burns the version number permanently (unpublishable after 72h), ships an
-      # unreviewed branch build under a provenance attestation, and then makes
-      # the REAL tag a silent green no-op via the idempotency probe below. The
-      # guard is on this step rather than on the job so that a branch dispatch
+      # TAG-PUSH GUARD — the invariant is: ONLY a v* tag push publishes. A
+      # workflow_dispatch run never publishes anything, even from a v* tag ref.
+      # The ref check blocks branch builds from burning an immutable public-npm
+      # version; the event check prevents a tag-ref dispatch from running only
+      # this client/saas leg while the push-only plugin and verifier jobs skip.
+      # The guard is on this step rather than on the job so that every dispatch
       # still checks out, installs, runs both lockstep gates, builds and tests —
       # it just cannot ship. Recover a flaked release by re-running the ORIGINAL
       # tag-push run, which preserves its push event and tag ref for every job:
@@ -215,7 +228,7 @@ jobs:
       # shipping unattested, so a failure here ships nothing and the tag can be
       # deleted and re-pushed.
       - name: Publish to public npm (OIDC, idempotent)
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
           for PKG in client saas; do
@@ -368,14 +381,105 @@ jobs:
         run: npm publish -w packages/plugin --access public --provenance
 
   # ---------------------------------------------------------------------------
+  # Final public-npm assertion: npm moves each package's `latest` independently,
+  # so a partially successful release can leave unversioned installs split across
+  # versions even though every package version is immutable. Poll through npm's
+  # publish-time scan horizon, then succeed only when all three reads succeed and
+  # all three tags equal this release's version. Every other result fails closed.
+  # ---------------------------------------------------------------------------
+  verify-dist-tags:
+    name: Verify public npm latest tags
+    needs: [publish, publish-plugin-npm]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Bound the ~19.5-minute polling budget plus registry latency, limiting how
+    # long this job can hold the npm-release concurrency group.
+    timeout-minutes: 30
+    # Deliberately no npm/OIDC publishing credential; the read-only GITHUB_TOKEN
+    # is limited to contents: read and is not persisted by checkout.
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify all public npm latest tags
+        run: |
+          set -uo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          CLIENT_NAME="$(node -p "require('./packages/client/package.json').name")"
+          SAAS_NAME="$(node -p "require('./packages/saas/package.json').name")"
+          PLUGIN_NAME="$(node -p "require('./packages/plugin/package.json').name")"
+          NAMES=("$CLIENT_NAME" "$SAAS_NAME" "$PLUGIN_NAME")
+          # npm's publish-time malware scan can delay availability for 15 minutes
+          # or more, so a 60-second horizon can report a healthy release as split:
+          # https://github.blog/changelog/2026-07-28-npm-publish-time-malware-scanning-and-dual-use-metadata/
+          # The 39 inter-attempt sleeps provide about 19.5 minutes of polling.
+          MAX_ATTEMPTS=40
+          RETRY_SECONDS=30
+
+          for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
+            LATESTS=()
+            READ_OKS=()
+            ALL_EXPECTED=1
+            echo "Checking npm latest tags (attempt ${attempt}/${MAX_ATTEMPTS})..."
+            for NAME in "${NAMES[@]}"; do
+              LATEST=""
+              if LATEST="$(npm view "${NAME}" dist-tags.latest 2>/dev/null)"; then
+                READ_OKS+=(1)
+              else
+                READ_OKS+=(0)
+                ALL_EXPECTED=0
+              fi
+              LATESTS+=("$LATEST")
+              if [ "$LATEST" != "$VERSION" ]; then
+                ALL_EXPECTED=0
+              fi
+            done
+
+            if [ "$ALL_EXPECTED" -eq 1 ]; then
+              for i in "${!NAMES[@]}"; do
+                echo "${NAMES[$i]} latest=${LATESTS[$i]} (confirmed)"
+              done
+              exit 0
+            fi
+
+            if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+              echo "npm latest tags have not converged; retrying in ${RETRY_SECONDS}s."
+              sleep "$RETRY_SECONDS"
+            fi
+          done
+
+          for i in "${!NAMES[@]}"; do
+            if [ "${READ_OKS[$i]}" -ne 1 ]; then
+              echo "::error::${NAMES[$i]} registry query failed while reading dist-tags.latest (expected '${VERSION}')."
+            elif [ "${LATESTS[$i]}" != "$VERSION" ]; then
+              echo "::error::${NAMES[$i]} latest is '${LATESTS[$i]}' (expected '${VERSION}')."
+            fi
+          done
+          echo "npm's publish-time scan can delay availability by 15 minutes or more. Confirm the versions are actually installable before re-running; an immediate re-run can see a scan-pending version as absent and try to publish it again."
+          echo "Then re-run the original tag-push run with 'gh run rerun <RUN_ID>'; the publish legs are idempotent."
+          echo "A re-run of a superseded tag fails here by design because the three latest tags no longer point to that tag's version; re-run the current release's run instead, and never move latest backward."
+          echo "If a version is published but its latest is still wrong, only an operator can repair it with interactive auth; CI's OIDC credential authorizes 'npm publish' and 'npm stage publish' but not 'npm dist-tag add'."
+          echo "Use the exact name printed above: npm dist-tag add <name>@<version> latest --registry=https://registry.npmjs.org/"
+          echo "If that name is scoped (@scope/...), override the SCOPE instead, e.g. --@mir-stream:registry=https://registry.npmjs.org/ — a plain --registry is ignored when an @scope:registry mapping exists."
+          echo "Never move latest backward to an older release."
+          echo "See the 'Recovering a split latest' section of docs/PUBLISHING.md."
+          exit 1
+
+  # ---------------------------------------------------------------------------
   # Plugin leg #2: publish the openclaw-webchannel code-plugin to ClawHub.
   #
   # Gated on `needs: publish` — if the npm publish failed the tag is a dud and
-  # the plugin must not ship on its own. The `if:` guard requires a tag PUSH:
-  # every workflow_dispatch run skips this job entirely (only ships the npm
-  # packages), INCLUDING a dispatch started from a tag ref — a plain
-  # `startsWith(github.ref, 'refs/tags/v')` would let such a dispatch through, so
-  # we also require `github.event_name == 'push'`.
+  # the plugin must not ship on its own. The `if:` guard requires a tag PUSH, so
+  # every workflow_dispatch run skips this job. The same event-and-ref invariant
+  # covers every public-npm publish surface: a dispatch from any ref publishes
+  # nothing.
   # ---------------------------------------------------------------------------
   publish-plugin:
     name: Publish plugin to ClawHub

@@ -44,16 +44,15 @@ so the plugin can never fall behind the npm packages again.
    git push origin v0.1.0
    ```
 
-The `Publish Packages` workflow (`.github/workflows/publish.yml`) runs three jobs:
+The `Publish Packages` workflow (`.github/workflows/publish.yml`) runs four jobs:
 
 - **`publish`** — builds, tests, and publishes `webchannel-client` and
   `webchannel-saas` to public npm via **OIDC trusted publishing** with
   `--provenance` (no `NPM_TOKEN`, no PAT — the job's `id-token: write` is the
-  whole credential story). Also runnable manually (workflow_dispatch) — but the
-  publish step is guarded on the ref, so **a dispatch from a branch builds and
-  tests without publishing anything**. Only a `v*` tag ref publishes. The
-  plugin jobs additionally require a tag *push*, so a fresh manual dispatch is
-  not a complete release recovery. Re-run the **original tag-push run** instead:
+  whole credential story). Also runnable manually (`workflow_dispatch`): a
+  dispatch from any ref builds, tests, and runs both lockstep gates, but never
+  publishes anything. Only a `v*` tag push publishes. A fresh manual dispatch is
+  therefore not release recovery. Re-run the **original tag-push run** instead:
 
   ```sh
   gh run rerun <RUN_ID>          # or: gh run list --workflow publish.yml
@@ -64,6 +63,9 @@ The `Publish Packages` workflow (`.github/workflows/publish.yml`) runs three job
 
 - **`publish-plugin-npm`** — gated on `publish` succeeding; builds/tests the
   plugin and publishes it to public npm the same way. Tag *push* only.
+- **`verify-dist-tags`** — gated on both public-npm publish jobs succeeding;
+  confirms that all three packages' `latest` tags equal the release version.
+  Tag *push* only.
 - **`publish-plugin`** — gated on `publish` succeeding; builds/tests the plugin
   and publishes it to ClawHub (see next section). Disabled by default via the
   `PUBLISH_CLAWHUB` repository variable, and additionally skipped on ALL manual
@@ -77,10 +79,75 @@ inspect`). For all three public-npm artifacts, a version match is accepted only
 when npm also reports a provenance attestation and a `gitHead` equal to the run's
 `GITHUB_SHA`; either mismatch fails the run loudly. Therefore **"Re-run failed
 jobs"** is safe anywhere in the workflow, including after a partial npm publish
-(e.g. client shipped but saas flaked), and a full re-run of an already-shipped
-tag is a verified green no-op end-to-end. An already-published version is
-**never republished** (it is skipped, not overwritten): to ship new content you
-must **bump the version and cut a new tag**.
+(e.g. client shipped but saas flaked). On a full re-run of an already-shipped
+tag, the publish legs are verified no-ops and skip green. End-to-end green also
+requires all three public-npm `latest` tags to equal the re-run tag's version,
+so re-running a superseded tag ends red at `verify-dist-tags` by design; never
+move `latest` backward to make it pass. An already-published version is **never
+republished** (it is skipped, not overwritten): to ship new content you must
+**bump the version and cut a new tag**.
+
+### Recovering a split `latest`
+
+npm advances each package's `latest` dist-tag independently; there is no
+multi-package transaction. If a release stops partway through, some packages
+can therefore resolve at the new version while another still resolves at an
+older version (or at the bootstrap placeholder for a new package name). The
+read-only `verify-dist-tags` job has a roughly 19.5-minute sleep budget (39
+30-second inter-attempt sleeps) and a 30-minute hard job timeout that bounds the
+polling plus registry latency, including how long the job can hold the
+`npm-release` concurrency group. The polling horizon covers npm's publish-time
+malware scan, which creates a delay between publishing and availability
+(typically about five minutes, but 15 minutes or more at peak times or for some
+package content and sizes):
+https://github.blog/changelog/2026-07-28-npm-publish-time-malware-scanning-and-dual-use-metadata/.
+Do not re-run while a version is still scan-pending; an immediate re-run can see
+the version as absent and try to publish it again.
+
+The verifier succeeds only when all three registry reads succeed and all three
+`latest` tags equal the run's tag version. A re-run of a superseded tag therefore
+ends red by design because the tags no longer point at that version. **Never move
+`latest` backward** to make it pass; re-run the current release's run instead.
+
+Once the versions are actually installable, re-run the original tag-push run:
+
+```sh
+gh run rerun <RUN_ID>
+```
+
+The publish legs are idempotent, so packages already present with the expected
+provenance and `gitHead` are verified and skipped while a missing publish is
+retried. If the version is published but its `latest` tag is still wrong, an
+operator must repair that package with interactive npm authentication:
+
+Use the **exact package name the failing job printed** — it reads all three names
+from the manifests, so they change when the packages are renamed:
+
+```sh
+npm dist-tag add <name>@<version> latest \
+  --registry=https://registry.npmjs.org/
+```
+
+That form is correct for every **unscoped** name, which today means
+`openclaw-webchannel` and, after the #226 rename, `openclaw-webchannel-client`
+and `openclaw-webchannel-saas`.
+
+**If the name is scoped** (`@scope/...`, i.e. the `@mir-stream/webchannel-*`
+packages up to and including 0.6.x), that command silently targets the wrong
+registry: the legacy `.npmrc` line documented later in this guide maps
+`@mir-stream` to GitHub Packages, and a plain `--registry` does **not** override
+an `@scope:registry` mapping. Override the scope instead:
+
+```sh
+npm dist-tag add @mir-stream/<package>@<version> latest \
+  --@mir-stream:registry=https://registry.npmjs.org/
+```
+
+Before changing any tag, confirm the intended version is newer; never move
+`latest` backward.
+
+CI cannot perform that fallback: its trusted-publishing OIDC credential
+authorizes `npm publish` and `npm stage publish`, but not `npm dist-tag add`.
 
 ## One-time bootstrap: trusted publishing for client + saas
 

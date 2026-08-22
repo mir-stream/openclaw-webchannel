@@ -1590,10 +1590,10 @@ verification:
   `.github/workflows/publish.yml`; the tag-push workflow must pass that guard
   before any artifact is considered released.
 
-Do not use a manual `workflow_dispatch` as the issue #54 release: that path does
-not publish the plugin and therefore cannot prove the required three-artifact
-release. A partial publish retry remains governed by the idempotency/recovery
-procedure in `docs/PUBLISHING.md`.
+Do not use a manual `workflow_dispatch` as the issue #54 release: that path
+publishes nothing, from any ref, and therefore cannot prove the required
+three-artifact release. A partial publish retry remains governed by the
+idempotency/recovery procedure in `docs/PUBLISHING.md`.
 
 Run the targeted two-account isolation and derived-trust E2E harnesses in the
 environment used by CI. Add or extend one live two-process harness with A and B
