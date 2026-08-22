@@ -1831,6 +1831,18 @@ export function createProgressDraftController(params: {
     // about which final overflowed.
     const everyFinalHasStreamedLane =
       state.lanes.filter((lane) => lane.streamedVisibleAnswerText).length === finals.length;
+    // #212 (P3-F1): the buffered positional pairing is PROVABLY SOUND — every
+    // final lands on the lane that actually streamed its prefix — only when the
+    // finals map one-to-one onto the materialized targets (no overflow) AND every
+    // text-bearing message streamed (no dropped / non-streaming middle lane to
+    // shift the pairing, which is the exact #215/M173e mis-route hazard). When
+    // both hold, each final's authoritative full tail is safe to show verbatim in
+    // the snapshot; otherwise leave `answerText` non-authoritative so the snapshot
+    // falls back to the corruption-immune `streamedAnswerText`. The K==1 Case-X
+    // shape (M173d) is caught by the per-target `streamedVisibleAnswerText` test
+    // below: its lone target is the TEXTLESS current lane, which receives a final
+    // that belongs to an earlier streamed lane, so it must never be authoritative.
+    const pairingIsSound = targets.length === finals.length && everyFinalHasStreamedLane;
     finals.forEach((text, index) => {
       const target = targets[index];
       if (!target) {
@@ -1844,9 +1856,15 @@ export function createProgressDraftController(params: {
       }
       target.deferredAngleMarkerTail = undefined;
       target.lastPartialSourceText = "";
-      // Buffered positional routing may mis-route (#215) — leave `answerText`
-      // non-authoritative so the snapshot uses the streamed text.
-      emitAuthoritativeFinalOnLane(target, text);
+      // #212 (P3-F1): mark the final authoritative for the snapshot ONLY on the
+      // provably-sound pairing above, and only when THIS target actually streamed
+      // its own prefix. A mis-routable pairing (count mismatch) or a textless
+      // current lane (K==1 Case X) stays non-authoritative so the snapshot uses
+      // `streamedAnswerText`; the correctly-routed clean cases now preserve the
+      // final's full tail instead of collapsing back to the last partial.
+      emitAuthoritativeFinalOnLane(target, text, {
+        authoritative: pairingIsSound && target.streamedVisibleAnswerText,
+      });
     });
   };
 
