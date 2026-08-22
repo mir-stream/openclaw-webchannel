@@ -202,15 +202,17 @@ type AssistantDraftLane = {
   streamedAnswerText: string;
   /**
    * #212 (Phase 3): is `answerText` a CORRECTLY-ROUTED authoritative final, safe
-   * to show verbatim in the snapshot? Set true ONLY when
-   * `emitAuthoritativeFinalOnLane` runs from `finalize`'s immediate path — the
-   * collapse / current-lane-has-text / lone-message cases, where the final
-   * provably belongs to THIS lane. Left false for the buffered positional path
-   * (`flushBufferedOrdinaryFinals`), which may mis-route a final onto the wrong
-   * lane (#215). The snapshot uses `answerText` when this is true (preserving the
-   * final's tail beyond the last partial — the VERIFY-1 edge, and the north-star
-   * "final is not droppable") and falls back to the corruption-immune
-   * `streamedAnswerText` otherwise.
+   * to show verbatim in the snapshot? Set true when routing is proved: by
+   * `finalize`'s immediate collapse / current-lane-has-text / lone-message path,
+   * or by `flushBufferedOrdinaryFinals` when `pairingIsSound` (finals map
+   * one-to-one onto materialized targets and `everyFinalHasStreamedLane` proves
+   * every text-bearing message streamed) and THIS target's
+   * `streamedVisibleAnswerText` proves it streamed its own prefix. Left false
+   * when `pairingIsSound` is false (either count mismatch), or for the K==1
+   * Case-X textless current lane. The snapshot uses `answerText` when this is
+   * true (preserving the final's tail beyond the last partial — the VERIFY-1
+   * edge, and the north-star "final is not droppable") and falls back to the
+   * corruption-immune `streamedAnswerText` otherwise.
    */
   answerTextIsAuthoritative: boolean;
   /**
@@ -1758,11 +1760,13 @@ export function createProgressDraftController(params: {
   const emitAuthoritativeFinalOnLane = (
     target: AssistantDraftLane,
     text: string,
-    // #212: true ONLY from `finalize`'s immediate path, where this final is
-    // provably THIS lane's own (collapse / current-lane-has-text / lone message).
-    // The snapshot may then show `answerText` verbatim (the final's full tail).
-    // The buffered positional path leaves it false — it may mis-route (#215), so
-    // the snapshot falls back to the corruption-immune `streamedAnswerText`.
+    // #212: true only when this final is provably THIS lane's own: from
+    // `finalize`'s immediate collapse / current-lane-has-text / lone-message path,
+    // or from `flushBufferedOrdinaryFinals` when `pairingIsSound` (one-to-one
+    // materialized targets and `everyFinalHasStreamedLane`) and THIS target's
+    // `streamedVisibleAnswerText` is true. Otherwise — either count mismatch or
+    // the K==1 Case-X textless current lane — the snapshot falls back to the
+    // corruption-immune `streamedAnswerText`.
     options?: { authoritative?: boolean },
   ): boolean => {
     target.answerText = text;
