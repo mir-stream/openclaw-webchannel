@@ -48,10 +48,12 @@ this file, **this file is correct.**
   (`multiplex.ts`; 가-1/가-2). Exec/plugin approvals are **accountId-aware** (per-account
   claim/deliver/authz — S1 approvals half, `approvals.ts`).
 - **Published & consumable:** plugin `openclaw-webchannel@0.1.0` on **ClawHub**
-  (`clawhub:mir-stream/openclaw-webchannel`); libraries `@mir-stream/webchannel-{saas,client}`
-  target the **public npm registry** as of 0.6.1 — zero-auth install, OIDC trusted publishing
-  with provenance (tag-triggered `publish.yml`, lockstep versioning; the one-time bootstrap in
-  `docs/PUBLISHING.md` gates the first release). Public-API-only consumers exist and are CI-gated:
+  (`clawhub:mir-stream/openclaw-webchannel`); libraries target the **public npm registry**
+  as of 0.6.1 — zero-auth install, OIDC trusted publishing with provenance (tag-triggered
+  `publish.yml`, lockstep versioning). They shipped through `0.6.1` as
+  `@mir-stream/webchannel-{saas,client}`, which is what is installable today; they are renamed
+  to `openclaw-webchannel-{saas,client}` from the next release, and the one-time bootstrap in
+  `docs/PUBLISHING.md` gates that first release under the new names. Public-API-only consumers exist and are CI-gated:
   `examples/minimal-consumer` (boundary test) and `examples/webchannel-app` (full flow,
   Synadia/NGS external-relay mode, `GETTING_STARTED.md` attach-your-own-openclaw guide).
 - **The showcase demo is `demo/run.sh`** (SaaS+admin UI, nats relay, echo/real LLM, 2-agent
@@ -106,7 +108,7 @@ long-lived branches:
 | Direct gateway transport removal | ✅ complete; browser traffic uses the NATS relay only. |
 | Demo/reference server hardening (review SEC1/2/5) | The reference/demo SaaS servers are deliberately demo-grade (in-memory stores, printed admin token); production-hardening rewrite is a pending decision. |
 | Pre-v2 credential documents | Legacy files without complete credential-binding identity are not reused. Stop the gateway, archive the exact file, complete any required SaaS active-key replacement, and explicitly re-enroll the account. |
-| Example app is not a scaffold | The registry half of this gap closes with 0.6.1 — `@mir-stream/*` moves to public npm and needs no token, **pending the one-time trusted-publishing bootstrap** (`docs/PUBLISHING.md`), which no release has run yet. The example app is still not a standalone `npm create` scaffold. |
+| Example app is not a scaffold | The registry half of this gap closed with 0.6.1 — the libraries moved to public npm and need no token, shipping as `@mir-stream/webchannel-*`. That bootstrap has run and `0.6.1` shipped; the renamed `openclaw-webchannel-*` packages need their own **one-time trusted-publishing bootstrap** before the next release (`docs/PUBLISHING.md`). The example app is still not a standalone `npm create` scaffold. |
 | Telegram-parity gaps | Depth cap, discovery, idempotency, markdown, turn control (`/stop`), etc. — analysis lives on branch `feature/webchannel-telegram-parity` (`docs/gaps/`), not merged. |
 | Follow-ups | Live-gateway admission migration (+`dmScope`), conversation-key rotation, agent-initiated-outbound demo scene. |
 

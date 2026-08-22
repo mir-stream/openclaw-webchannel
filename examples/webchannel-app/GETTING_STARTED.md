@@ -1,7 +1,7 @@
 # Getting Started — run WebChannel on Synadia (NGS) and attach your own openclaw
 
 A follow-along guide: stand up the `webchannel-app` reference (SaaS backend + browser
-widget) using **only the published `@mir-stream/webchannel-{saas,client}` packages**,
+widget) using **only the published `openclaw-webchannel-{saas,client}` packages**,
 put the NATS relay on **Synadia Cloud / NGS**, then attach **your own openclaw agent**
 and chat end-to-end.
 
@@ -67,7 +67,7 @@ cd ~/webchannel-app
 ```
 
 **Why copy it out (and not just run it in place)?** Inside the monorepo,
-`examples/webchannel-app` is an npm **workspace member**, so `@mir-stream/webchannel-*`
+`examples/webchannel-app` is an npm **workspace member**, so `openclaw-webchannel-*`
 resolves through a symlink to the **local `packages/…` source** — i.e. you'd be running
 local code, not the published library. Copying it to a standalone folder detaches it from
 the workspace, so in Step 2 it installs the **published packages from the registry** —
@@ -80,8 +80,8 @@ which is the whole point: you consume the library exactly as an outside develope
 
 ## Step 2 — Install the published library
 
-Pin the two packages to the published version and install — `0.6.1` is the first
-release to target the public npm registry:
+Pin the two packages to a published version and install. Use the current published
+version — the commands below show `0.6.1`:
 
 > Upgrading an existing consumer? First follow the
 > [GitHub Packages migration](../../docs/PUBLISHING.md#migrating-an-existing-consumer)
@@ -89,17 +89,17 @@ release to target the public npm registry:
 > the old registry.
 
 ```bash
-npm pkg set dependencies.@mir-stream/webchannel-saas=0.6.1
-npm pkg set dependencies.@mir-stream/webchannel-client=0.6.1
+npm pkg set dependencies.openclaw-webchannel-saas=0.6.1
+npm pkg set dependencies.openclaw-webchannel-client=0.6.1
 npm install
 ```
 
 Verify you actually downloaded the tarballs (not a local symlink):
 
 ```bash
-node -e 'const l=require("./package-lock.json"); for (const p of ["@mir-stream/webchannel-saas","@mir-stream/webchannel-client"]) { const e=l.packages?.[`node_modules/${p}`]; if (!e?.resolved?.startsWith("https://registry.npmjs.org/")) { console.error(`${p}: expected a registry.npmjs.org tarball, found ${e?.resolved ?? "<missing>"}`); process.exitCode=1; } else console.log(`${p}: ${e.resolved}`); }'
-# → @mir-stream/webchannel-saas: https://registry.npmjs.org/@mir-stream/webchannel-saas/-/webchannel-saas-0.6.1.tgz
-# → @mir-stream/webchannel-client: https://registry.npmjs.org/@mir-stream/webchannel-client/-/webchannel-client-0.6.1.tgz
+node -e 'const l=require("./package-lock.json"); for (const p of ["openclaw-webchannel-saas","openclaw-webchannel-client"]) { const e=l.packages?.[`node_modules/${p}`]; if (!e?.resolved?.startsWith("https://registry.npmjs.org/")) { console.error(`${p}: expected a registry.npmjs.org tarball, found ${e?.resolved ?? "<missing>"}`); process.exitCode=1; } else console.log(`${p}: ${e.resolved}`); }'
+# → openclaw-webchannel-saas: https://registry.npmjs.org/openclaw-webchannel-saas/-/openclaw-webchannel-saas-0.6.1.tgz
+# → openclaw-webchannel-client: https://registry.npmjs.org/openclaw-webchannel-client/-/openclaw-webchannel-client-0.6.1.tgz
 ```
 
 ## Step 3 — Point the relay at Synadia (NGS)
@@ -230,9 +230,11 @@ replies over the E2E-encrypted NGS relay.
 
 ## What’s verified vs. the frontier
 
-- ✅ **Registry install + SaaS + browser flow** is verified: the app runs off the
-  downloaded `@mir-stream/*@0.1.3` tarballs up to the `connected → waiting-for-agent`
-  state, public-API-only.
+- ✅ **Registry install + SaaS + browser flow** is verified: the app ran off the
+  downloaded tarballs up to the `connected → waiting-for-agent` state,
+  public-API-only. That verification was performed at `0.1.3`, when these
+  packages were still published under the old scoped `@mir-stream/webchannel-*`
+  names.
 - 🧭 **The openclaw attach (Step 6) is the part you drive.** It uses the same enrollment
   mechanics (`/api/enroll` → admin approve → `gateway`) that the internal `demo/` proves,
   but your openclaw environment (account naming, model provider) is yours. If a step

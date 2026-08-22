@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
-import { EnrollmentValidationError } from "@mir-stream/webchannel-saas";
+import { EnrollmentValidationError } from "openclaw-webchannel-saas";
 import { createMinimalConsumerEnrollmentHandler } from "../src/operator.ts";
 import { exampleAssert as assert, exampleTest } from "../../../scripts/example-test-guard.mjs";
 

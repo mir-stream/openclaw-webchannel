@@ -1,9 +1,9 @@
 {
-  "name": "@mir-stream/webchannel-app-example",
+  "name": "openclaw-webchannel-app-example",
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Reference WebChannel app (SaaS backend + browser client) built with ONLY the public @mir-stream/webchannel-{saas,client} API.",
+  "description": "Reference WebChannel app (SaaS backend + browser client) built with ONLY the public openclaw-webchannel-{saas,client} API.",
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "node --import ../../scripts/example-test-guard.mjs --test --experimental-test-isolation=none test/no-internal-imports.test.mjs; boundary=$?; node --import tsx --import ../../scripts/example-test-guard.mjs --test --experimental-test-isolation=none test/enroll-validation.test.ts; behavior=$?; test $boundary -eq 0 -a $behavior -eq 0",
@@ -11,8 +11,8 @@
     "start": "tsx server/index.ts"
   },
   "dependencies": {
-    "@mir-stream/webchannel-saas": "*",
-    "@mir-stream/webchannel-client": "*"
+    "openclaw-webchannel-saas": "*",
+    "openclaw-webchannel-client": "*"
   },
   "devDependencies": {
     "esbuild": "^0.23.0",

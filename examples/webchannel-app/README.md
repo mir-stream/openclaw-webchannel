@@ -1,8 +1,8 @@
 # `webchannel-app` — public-API reference
 
 A runnable WebChannel app (SaaS backend + browser client) built with **only** the
-published public API of `@mir-stream/webchannel-saas` and
-`@mir-stream/webchannel-client`. Every library import is by package **name**;
+published public API of `openclaw-webchannel-saas` and
+`openclaw-webchannel-client`. Every library import is by package **name**;
 there are **zero** relative `../packages/` or deep-subpath imports (enforced by
 `test/no-internal-imports.test.mjs`). This is the *canonical reference* for the
 production trust flow — the red-team `demo/` reaches into internal source and is
@@ -19,7 +19,7 @@ The full browser connect flow, public-API-only:
 4. **`POST /nats-user`** → browser NATS credentials via `issueBrowserCredentials`.
 5. **`new WebChannelNATSClient({ natsCredentials, registration })`** → connect.
 
-Server side (`server/index.ts`, all `@mir-stream/webchannel-saas`):
+Server side (`server/index.ts`, all `openclaw-webchannel-saas`):
 `loadOrCreateTrustChain` → boot `nats-server` (`server/nats.ts`) →
 `createBootstrapIssuer` + `new DeviceFlowEnrollment(...)` → HTTP routes.
 

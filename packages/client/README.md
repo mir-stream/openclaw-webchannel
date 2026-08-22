@@ -11,7 +11,7 @@ framework.
 ## Usage
 
 ```ts
-import { WebChannelNATSClient } from "@mir-stream/webchannel-client";
+import { WebChannelNATSClient } from "openclaw-webchannel-client";
 
 const client = new WebChannelNATSClient({
   natsUrl: "wss://relay.example.com",
@@ -277,8 +277,8 @@ See [`../../docs/AUTH.md`](../../docs/AUTH.md) for the reasoning.
 
 The boolean `delivered` is gone. Migration: `delivered === true` ↔
 `sendState === "accepted" || sendState === "completed"`; render a failure from
-`sendState === "failed"` + `sendFailure`. `@mir-stream/webchannel-client` and
-`@mir-stream/webchannel-plugin` ship in lockstep — upgrade both together (the
+`sendState === "failed"` + `sendFailure`. `openclaw-webchannel-client` and
+`openclaw-webchannel` ship in lockstep — upgrade both together (the
 protocol v3 registration is mandatory in both directions).
 
 See [`../../docs/STATUS.md`](../../docs/STATUS.md) for current deployment status

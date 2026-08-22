@@ -1,6 +1,6 @@
 /**
  * Widget surface — imports ONLY the browser-widget public API from
- * `@mir-stream/webchannel-client` by package name. Instantiating the client
+ * `openclaw-webchannel-client` by package name. Instantiating the client
  * against a minimal options object (no live network) proves the widget surface
  * compiles cleanly through the package's exports -> dist .d.ts. Raw transport
  * (`nats-client`) stays unreachable.
@@ -10,7 +10,7 @@ import {
   WebChannelNATSClient,
   type WebChannelState,
   type ApprovalRequest,
-} from "@mir-stream/webchannel-client";
+} from "openclaw-webchannel-client";
 
 export async function createWidgetClient(): Promise<WebChannelNATSClient> {
   const pop = (await crypto.subtle.generateKey(

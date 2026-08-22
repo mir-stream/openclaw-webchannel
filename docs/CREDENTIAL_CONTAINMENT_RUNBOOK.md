@@ -306,7 +306,7 @@ re-derive the floor later:
 ```js
 import { readFileSync, writeFileSync } from "node:fs";
 import { decode } from "@nats-io/jwt";
-import { addRevocation } from "@mir-stream/webchannel-saas";
+import { addRevocation } from "openclaw-webchannel-saas";
 
 const currentAccountJwt = readFileSync("./current-account.jwt", "utf8").trim();
 const currentClaim = decode(currentAccountJwt);

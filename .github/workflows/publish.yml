@@ -1,8 +1,8 @@
 ################################################################################
 # publish.yml — Publish all release artifacts from ONE v* tag:
-#   1. @mir-stream/webchannel-client → public npm registry (registry.npmjs.org)
-#   2. @mir-stream/webchannel-saas   → public npm registry (registry.npmjs.org)
-#   3. openclaw-webchannel plugin    → public npm registry (registry.npmjs.org).
+#   1. openclaw-webchannel-client → public npm registry (registry.npmjs.org)
+#   2. openclaw-webchannel-saas   → public npm registry (registry.npmjs.org)
+#   3. openclaw-webchannel plugin → public npm registry (registry.npmjs.org).
 #                                      This is the zero-auth remote-install path:
 #                                      `openclaw plugins install openclaw-webchannel@<v>`.
 #   4. openclaw-webchannel plugin    → ClawHub registry (code-plugin)
@@ -44,7 +44,7 @@
 # mismatch aborts the release with nothing shipped and the tag unburned; the copy
 # in publish-plugin stays as defense-in-depth.
 #
-# Consumers need nothing: `npm install @mir-stream/webchannel-saas@<v>` works
+# Consumers need nothing: `npm install openclaw-webchannel-saas@<v>` works
 # with no .npmrc and no token, and `npm audit signatures` verifies the
 # provenance attestation back to the workflow run that built it. See
 # docs/PUBLISHING.md.
@@ -105,7 +105,7 @@ jobs:
       # No `scope:` — setup-node writes a bare `registry=` line only when scope is
       # absent; with a scope it writes `@scope:registry=` INSTEAD and leaves the
       # default registry alone. We want the default pointed at npmjs.org (same as
-      # the plugin leg), which is what both the scoped `npm publish` and the
+      # the plugin leg), which is what both the `npm publish` and the
       # `npm view` idempotency probe then resolve against.
       - uses: actions/setup-node@v4
         with:
@@ -219,9 +219,9 @@ jobs:
       #
       # No NODE_AUTH_TOKEN: with a configured Trusted Publisher and npm >=
       # 11.5.1, `npm publish` performs the OIDC exchange itself. `--access
-      # public` is redundant with each package's publishConfig.access but stated
-      # anyway, because scoped packages default to RESTRICTED and a silent
-      # private publish is the expensive failure here. `--provenance` needs the
+      # public` is redundant with each package's publishConfig.access and is a
+      # no-op besides: these names are unscoped, and unscoped packages are always
+      # public (the RESTRICTED default is scoped-only). `--provenance` needs the
       # public repo (true since 2026-08-19), `id-token: write` (granted on this
       # job), and a `repository` field in each manifest (both have one); if
       # attestation generation fails, npm CANCELS the publish rather than
@@ -256,7 +256,7 @@ jobs:
   # NPM_TOKEN. This is the registry-independent, zero-auth install path
   # (`openclaw plugins install openclaw-webchannel@<v>`), and the only npm one
   # since ClawHub publishing is currently blocked by a scanner false-positive on
-  # the package. Since 0.6.1 the `publish` job it depends on ships the two scoped
+  # the package. Since 0.6.1 the `publish` job it depends on ships the two
   # packages the same way; this job stays separate because the plugin has its own
   # build, its own test suite, and its own trusted-publisher registration.
   #
@@ -467,7 +467,7 @@ jobs:
           echo "A re-run of a superseded tag fails here by design because the three latest tags no longer point to that tag's version; re-run the current release's run instead, and never move latest backward."
           echo "If a version is published but its latest is still wrong, only an operator can repair it with interactive auth; CI's OIDC credential authorizes 'npm publish' and 'npm stage publish' but not 'npm dist-tag add'."
           echo "Use the exact name printed above: npm dist-tag add <name>@<version> latest --registry=https://registry.npmjs.org/"
-          echo "If that name is scoped (@scope/...), override the SCOPE instead, e.g. --@mir-stream:registry=https://registry.npmjs.org/ — a plain --registry is ignored when an @scope:registry mapping exists."
+          echo "Legacy case only: all three names are now UNSCOPED, so the line above is the one to use. If a name is ever scoped (@scope/...), override the SCOPE instead, e.g. --@scope:registry=https://registry.npmjs.org/ — a plain --registry is ignored when an @scope:registry mapping exists."
           echo "Never move latest backward to an older release."
           echo "See the 'Recovering a split latest' section of docs/PUBLISHING.md."
           exit 1
