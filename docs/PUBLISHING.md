@@ -52,30 +52,35 @@ The `Publish Packages` workflow (`.github/workflows/publish.yml`) runs three job
   whole credential story). Also runnable manually (workflow_dispatch) — but the
   publish step is guarded on the ref, so **a dispatch from a branch builds and
   tests without publishing anything**. Only a `v*` tag ref publishes. The
-  Actions-tab ref picker offers branches only, so the recovery lever for a flaked
-  npm leg is the CLI, which can target a tag:
+  plugin jobs additionally require a tag *push*, so a fresh manual dispatch is
+  not a complete release recovery. Re-run the **original tag-push run** instead:
 
   ```sh
-  gh workflow run publish.yml --ref v0.6.1
+  gh run rerun <RUN_ID>          # or: gh run list --workflow publish.yml
   ```
+
+  GitHub preserves that run's original `push` event and tag ref, so every job's
+  guard still matches.
 
 - **`publish-plugin-npm`** — gated on `publish` succeeding; builds/tests the
   plugin and publishes it to public npm the same way. Tag *push* only.
 - **`publish-plugin`** — gated on `publish` succeeding; builds/tests the plugin
   and publishes it to ClawHub (see next section). Disabled by default via the
   `PUBLISH_CLAWHUB` repository variable, and additionally skipped on ALL manual
-  workflow_dispatch runs — including one started from a tag ref — since it
-  requires a tag *push* (no tag to lockstep against otherwise).
+  workflow_dispatch runs — including one started from a tag ref — because its
+  publish surface deliberately remains tag-*push*-only.
 
 Note: **all three legs are idempotent.** Each package (client, saas, plugin) is
 skipped when that exact version is positively confirmed already on its registry
 (the npm leg checks each package with `npm view`, the ClawHub leg with `package
-inspect`) — so **"Re-run failed jobs"** is safe anywhere in the workflow,
-including after a partial npm publish (e.g. client shipped but saas flaked), and
-a full re-run of an already-shipped tag is a green no-op end-to-end. An
-already-published version is **never republished** (it is skipped, not
-overwritten): to ship new content you must **bump the version and cut a new
-tag**.
+inspect`). For client and saas, a version match is accepted only when npm also
+reports a provenance attestation and a `gitHead` equal to the run's `GITHUB_SHA`;
+either mismatch fails the run loudly. Therefore **"Re-run failed jobs"** is safe
+anywhere in the workflow, including after a partial npm publish (e.g. client
+shipped but saas flaked), and a full re-run of an already-shipped tag is a
+verified green no-op end-to-end. An already-published version is **never
+republished** (it is skipped, not overwritten): to ship new content you must
+**bump the version and cut a new tag**.
 
 ## One-time bootstrap: trusted publishing for client + saas
 
@@ -87,19 +92,18 @@ exists. (This is a known npm gap — PyPI lets you configure a trusted publisher
 for a name that does not exist yet; npm does not. See npm/cli#8544.)
 `@mir-stream/webchannel-client` and `@mir-stream/webchannel-saas` are brand-new
 names *on npmjs.org* — their history is on GitHub Packages, a different registry
-— so all three steps below must be done for both packages.
+— so all four steps below must be done for both packages.
 
 The plugin went through the same chicken-and-egg, but it is **unscoped**
 (`openclaw-webchannel`), so its bootstrap established nothing about the
 `@mir-stream` scope. These two are the first scoped publishes.
 
 **Do not bootstrap at the release version.** Publishing `0.6.1` by hand would
-ship it **unattested**, and the workflow's idempotency guard would then skip it
-on the real tag — so consumers would download a `0.6.1` with no provenance while
-the release notes and the section below tell them to verify one with `npm audit
-signatures`. An unattested tarball reads as tampering, not as an intended
-shortcut. Bootstrap with a throwaway `0.0.0` instead, so the **real** release is
-the first thing CI publishes and it carries provenance.
+ship it **unattested**, and the workflow's idempotency guard would reject that
+unknown tarball and fail the real tag. The version would already be occupied, so
+CI could not replace it with the attested build the release promises. Bootstrap
+with a throwaway `0.0.0` instead, so the **real** release is the first thing CI
+publishes and it carries provenance.
 
 **Prerequisite.** The `@mir-stream` org exists on registry.npmjs.org. Before
 starting, confirm you are a member of it with publish rights — step (a) fails
@@ -166,14 +170,23 @@ Leave `0.0.0@bootstrap` in place; it is harmless.
 > - Repository = **`mir-stream/openclaw-webchannel`**
 > - Workflow = **`publish.yml`**
 > - Environment = *(blank)*
+> - Allowed actions = **npm publish**
 
-**(c) Cut the release normally.** From then on every tagged release publishes
+**(c) Disable token publishing.** After enabling the Trusted Publisher above,
+on npmjs.com, for **both** packages, configure **Settings → Publishing access →
+"Require two-factor authentication and disallow tokens"**. Trusted publishing
+coexists with token authentication by default; this closes the route by which a
+leaked or mistakenly used token could occupy a release version outside OIDC. The
+workflow guard can detect that conflict only after the version has been burned,
+so registry policy must prevent it.
+
+**(d) Cut the release normally.** From then on every tagged release publishes
 from CI with zero credentials — `npm publish` mints short-lived tokens from the
 workflow's id-token itself. Because the placeholder is `0.0.0` and the release is
 `0.6.1`, the idempotency guard finds no match and **`0.6.1` publishes through
-OIDC with provenance**, exactly as the changelog and the section below claim. The
-guard's own behaviour is unchanged — it still skips any version already on the
-registry; that simply no longer describes the release.
+OIDC with provenance**, exactly as the changelog and the section below claim. On
+a re-run, the guard skips it only after verifying that provenance and the
+published `gitHead` against the run's commit.
 
 **Until the bootstrap lands, releases are blocked.** Every `v*` tag fails at the
 `publish` job, and both plugin legs `needs: publish`, so they are skipped — which
@@ -250,6 +263,25 @@ release can't silently change the publish contract mid-release. Bump the pin in
 `publish.yml` deliberately and re-verify the publish flow when you do.
 
 ## Consuming from another project
+
+### Migrating an existing consumer
+
+Projects that consumed a pre-0.6.1 release may still force the entire
+`@mir-stream` scope through GitHub Packages. Remove the scope line and any
+matching token line wherever they exist — project `.npmrc`, user-level
+`~/.npmrc`, and CI-generated npm configuration:
+
+```ini
+@mir-stream:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${TOKEN}
+```
+
+`npm config get @mir-stream:registry` is the quickest confirmation: it must no
+longer print `https://npm.pkg.github.com`. Then update to the public-registry
+release and refresh the lockfile so every matching `resolved` URL moves from
+`npm.pkg.github.com` to `registry.npmjs.org`.
+
+### Installing
 
 Install them. That is the whole procedure:
 

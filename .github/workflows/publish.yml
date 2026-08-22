@@ -176,19 +176,19 @@ jobs:
         env:
           CI: "true"
 
-      # Per-package idempotency guard, same philosophy as the ClawHub leg: skip
-      # ONLY on positive confirmation that the exact version is already on the
-      # registry; any doubt falls through to publish. Don't trust `npm view` exit
-      # codes — missing-version vs missing-package semantics differ across npm
-      # majors (some exit 0 with empty output on a missing version), so we key off
-      # stdout: skip only when it positively equals the wanted version. Anything
-      # else (empty, E404, garbage) publishes, and a real duplicate still 409s
-      # loudly (no worse than before). This makes "Re-run failed jobs" safe after
-      # a partial npm publish (client shipped, saas flaked), and a full re-run of
-      # a fully-shipped tag a green no-op. Each check uses the package.json's own
-      # version (NOT the tag) so it's correct on workflow_dispatch too; lockstep
-      # guarantees package.json == tag on tag runs. Separately, the `npm view`
-      # probe needs no auth at all now that the target is the public registry.
+      # Per-package idempotency guard. Preserve first-release behaviour by keying
+      # the existence probe off stdout: `npm view` exit semantics for a missing
+      # version/package differ across npm majors, so only an exact version match
+      # enters the skip path. Anything else (empty, E404, garbage) publishes, and
+      # a real duplicate still 409s loudly. A version match alone is NOT trusted:
+      # the registry must also report provenance and a gitHead matching this run's
+      # commit, or the step fails instead of accepting an immutable tarball of
+      # unknown origin. This makes "Re-run failed jobs" safe after a partial npm
+      # publish (client shipped, saas flaked), and a full re-run of a fully-shipped
+      # tag a verified green no-op. Each check uses the package.json's own version
+      # (NOT the tag) so it's correct on workflow_dispatch too; lockstep guarantees
+      # package.json == tag on tag runs. The `npm view` probes need no auth now that
+      # the target is the public registry.
       #
       # TAG-REF GUARD — the invariant is: NOTHING is published from a ref that is
       # not a v* tag. Without it, a workflow_dispatch from a branch would publish
@@ -199,10 +199,10 @@ jobs:
       # the REAL tag a silent green no-op via the idempotency probe below. The
       # guard is on this step rather than on the job so that a branch dispatch
       # still checks out, installs, runs both lockstep gates, builds and tests —
-      # it just cannot ship. A dispatch from a TAG ref still publishes, which is
-      # the documented recovery lever when this leg flakes:
-      #   gh workflow run publish.yml --ref v0.6.1
-      # (the Actions UI ref picker lists branches only; the CLI reaches tags.)
+      # it just cannot ship. Recover a flaked release by re-running the ORIGINAL
+      # tag-push run, which preserves its push event and tag ref for every job:
+      #   gh run rerun <RUN_ID>          # or: gh run list --workflow publish.yml
+      # The idempotency checks make already-shipped artifacts verified no-ops.
       #
       # No NODE_AUTH_TOKEN: with a configured Trusted Publisher and npm >=
       # 11.5.1, `npm publish` performs the OIDC exchange itself. `--access
@@ -223,7 +223,15 @@ jobs:
             WANT="$(node -p "require('./packages/${PKG}/package.json').version")"
             GOT="$(npm view "${NAME}@${WANT}" version 2>/dev/null || true)"
             if [ "$GOT" = "$WANT" ]; then
-              echo "${NAME}@${WANT} already on public npm — skipping."
+              PUBLISHED_GIT_HEAD="$(npm view "${NAME}@${WANT}" gitHead 2>/dev/null || true)"
+              ATTESTATIONS="$(npm view "${NAME}@${WANT}" dist.attestations 2>/dev/null || true)"
+              # GITHUB_SHA is the commit because releases deliberately use
+              # lightweight tags; an annotated tag can make it the tag-object SHA.
+              if [ -z "$ATTESTATIONS" ] || [ "$PUBLISHED_GIT_HEAD" != "$GITHUB_SHA" ]; then
+                echo "::error::Refusing to accept ${NAME}@${WANT}: dist.attestations found '${ATTESTATIONS:-<absent>}' (expected a non-empty provenance attestation); gitHead found '${PUBLISHED_GIT_HEAD:-<absent>}' (expected '${GITHUB_SHA}')."
+                exit 1
+              fi
+              echo "${NAME}@${WANT} already on public npm with verified provenance and gitHead ${GITHUB_SHA} — skipping."
             else
               npm publish -w "packages/${PKG}" --access public --provenance
             fi
