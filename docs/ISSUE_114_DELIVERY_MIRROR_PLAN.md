@@ -3,7 +3,7 @@
 - 이슈: [#114](https://github.com/mir-stream/openclaw-webchannel/issues/114) (keystone)
 - 엄브렐러: [#212](https://github.com/mir-stream/openclaw-webchannel/issues/212)
 - 관련: [#95](https://github.com/mir-stream/openclaw-webchannel/issues/95) (history 계약), [#104](https://github.com/mir-stream/openclaw-webchannel/issues/104) (client 중복), [#111](https://github.com/mir-stream/openclaw-webchannel/issues/111)·[#215](https://github.com/mir-stream/openclaw-webchannel/issues/215) (live final-routing ceiling), [#223](https://github.com/mir-stream/openclaw-webchannel/issues/223) (ordinal desync), [#227](https://github.com/mir-stream/openclaw-webchannel/issues/227)/[#228](https://github.com/mir-stream/openclaw-webchannel/issues/228) (client 재구성 케이스)
-- 상태: **v5 설계 (구현 전).** v1~v3 REJECT(폐기). **v4(§14)는 라운드-4에서 아키텍처는 CONFIRMED-sound(단일 egress choke point 확정)이나 spec 미완으로 claude NEEDS_CHANGES + codex REJECT.** **v5(§15) = v4의 뼈대 유지 + 라운드-4 통합 통찰: "저널=클라가 쓰는 정확한 순서 이벤트 스트림, history=클라 자신의 reducer 재생"**(서버가 순서/tombstone 규칙 발명 안 함). 리뷰 통과 전 코드 없음.
+- 상태: **v6 설계 = THE 설계 (구현 전).** v1~v3 REJECT(폐기), v4/v5(§14/§15)는 진화 뼈대. **v5는 §16.2의 9개 Telegram-정련 + §16.5/§16.6를 반영해 v6로 흡수됨 — v6가 최종.** v6가 v5를 4곳 뒤집음(서버-배정 id, persist-before-publish, 영구 delete, per-conversation seq). **v5 뼈대 통찰 유지: "저널=클라가 쓰는 정확한 순서 이벤트 스트림, history=클라 자신의 reducer 재생"**(서버가 순서/tombstone 규칙 발명 안 함). 회귀 방화벽=§0.2, 식별자 결정판=§16.5. 리뷰 통과 전 코드 없음.
 
 ---
 
@@ -48,12 +48,12 @@
 | **N2** | 클라 history를 위해 core transcript/`getSessionMessages`를 읽거나 core에 mirror-후-되읽기 | SSOT=플러그인이 **자기 store에서** history 서빙. v1(mirror-into-core+되읽기+dedup)은 claude·codex **둘 다 P0 REJECT** — mirror row와 LLM row는 **text/위치밖에** 공유 안 함(§2.2) | 압축 후 코드 다시 보면 `getSessionMessages`가 "원래 방식"처럼 읽힘 |
 | **N3** | "tool·reasoning·notice·approval은 ephemeral이라 durable 아님/gap 아님" | plugin=Telegram-**서버**는 service message를 보존한다. 판별 기준은 **MESSAGE vs INDICATOR**. 순수 표시기(isTyping, 마감 전 rolling draft)만 ephemeral. 현재 클라의 분리된 ephemeral 배열이 **고칠 위반**(§15.9) | 현재(타협된) 클라 구현을 스펙으로 착각 (→ N7) |
 | **N4** | "클라가 보는 durable id는 core-blocked, core가 줘야 함" | durable client-facing id는 **플러그인 소유**: 서버 messageId 배정 + 클라 random_id(§16.2-1). core 의존 0 | 하위목표를 "core의 id를 읽어 전달"로 잘못 정의 |
-| **N5** | final↔lane을 ordinal/count/`assistantMessageIndex`/위치로 매칭 | **현재-draft 마감** 모델. 못 붙는 final=**새 메시지**(deliverNormally). ordinal 매칭이 **#215/#223 자충수**(§16.1). count/위치로 identity 추론 = 0.6.1 post-mortem 근본원인 | 콜백 순서가 ordinal을 "무료 제공"하는 것처럼 보임 |
+| **N5** | ordinal/`assistantMessageIndex`/위치를 **정체성 키**로 써서 final↔lane 매칭 | **현재-draft 마감** 모델. ordinal 매칭이 **#215/#223 자충수**(§16.1). count/위치로 identity 추론 = 0.6.1 post-mortem 근본원인. **정밀판(§16.5): 내장 Telegram도 ordinal을 쓰긴 함 — 단 block-회전 힌트로만, 정체성 키로는 절대 안 씀.** ordinal 자체가 금지가 아니라 "정체성으로 쓰기"가 금지 | 콜백 순서가 ordinal을 "무료 제공"하는 것처럼 보임 |
 | **N6** | agent 답변을 publish 후에 커밋(commit-after) | **persist-before-publish**: egress 시점엔 텍스트가 이미 있어 유령 없음 = Telegram persist-then-deliver(§16.2-2, §15.8 뒤집음) | "보낸 걸 기록"이 순서상 자연스러워 보임 |
 | **N7** | "현재(shipped) 클라/플러그인 동작 = 스펙" | shipped 코드는 재설계가 없애는 문제의 **타협**을 품고 있다. 항상 물어라: **"이게 원칙인가, 타협된 코드가 우연히 그렇게 도는 것뿐인가?"** 같은 core의 레퍼런스(내장 채널)를 읽어라 | 압축 후 코드가 유일한 ground truth로 보임 (모든 회귀의 상위 원인) |
 | **N8** | "live와 history는 (의도적으로) 다를 수 있다" | 우리가 스트림 전체를 소유 → 차이는 전부 **버그**. live==history는 **절대**(공유 reducer로 양쪽 보장, §15.9) | 상태/tool 버블 렌더 차이를 "gap"으로 합리화 |
 | **N9** | partial-first/모드 의존 저널, legacy fallback·epoch 마커 유지 | SSOT는 모드 의존 불가. **파괴적 컷오버 승인**("아직 아무도 안 씀") → 저널이 첫날부터 유일 store, cutover/epoch/legacy 기계 **전부 삭제**(§15.6) | "안전한 전환기"가 신중해 보임 (실은 원칙 후퇴) |
-| **N10** | 못 붙는 final → degrade/skip, 안 그림 | Telegram 답은 **새 메시지**(deliverNormally), degrade 아님(§16.1). ("skip-degrade, never guess"는 옛 §0.1의 오판 잔재) | 옛 "core ceiling→degrade" 어법이 압축 후 되살아남 |
+| **N10** | 못 붙는 final → degrade/skip, 안 그림 | **현재-draft 우선 마감 → 안 되면 새 메시지(또는 애매하면 preview 유지)**, degrade 아님(§16.1, 정밀판 §16.5). ("skip-degrade, never guess"는 옛 §0.1의 오판 잔재) | 옛 "core ceiling→degrade" 어법이 압축 후 되살아남 |
 
 **메타 규칙(N1·N3·N5의 공통 근본):** 무언가를 **"core-limited / 구조적 / 불가능"** 이라 단정하기 전에 — **같은 core 위의 레퍼런스(내장 Telegram 채널, clone `/home/orca/workspace/openclaw` `src/channels/message/`·`src/auto-reply/reply/`)가 어떻게 하는지 먼저 읽는다.** 세 번(getSessionMessages, tool-durable, S1) 다 이걸 안 해서 나온 오판이다.
 
@@ -144,7 +144,7 @@ turn_snapshot은 **완전한 턴 기록이 아니라 교정 패치다.** 계약(
 3. **drain 후 authoritative 확정.** 최종 text/상태는 controller의 turn_snapshot에서 확정(state=committed). identity-less final에서 짜내지 않는다.
 4. **history는 journal에서만 서빙.** core transcript 안 읽음. 클라이언트는 우리 id를 받음 → text/위치 추측 원천 소멸.
 5. **live == durable == history, 같은 id.** lane.id = live 전송 id = journal answerId = history row id.
-6. **못 정하면 degrade, 추측 금지.** controller가 어떤 final의 lane을 확정 못하면(#215/#111 ceiling) journal에 그 불확정을 박제하지 않는다 — degrade(그 답변은 확정 기록 없이) 하되 절대 위치로 우겨넣지 않는다.
+6. **못 붙는 final = 새 메시지, degrade 아님 (2026-08-23 정정 — 옛 "degrade" 표현은 폐기).** 현재 draft(lane)에 붙는 final은 그 id를 in-place 마감; 현재 draft에 **안 붙는 final은 새 메시지로 배달**(내장 채널 `deliverNormally`; 애매한 edit 실패는 preview 유지). **위치/ordinal로 소급 귀속은 금지**(그게 #215/#223 자충수). ⚠️ 예전 "확정 못하면 degrade/skip"은 내장 채널 레퍼런스와 배치되는 오판이었다 → [[아닌 것 목록 §0.2]] N10, 결정판 §16.5.
 7. **legacy는 명시적 cutover 경계.** journal 도입 이전 대화는 journal에 없다. cutover 이전 구간은 별도 정책(best-effort 또는 표시 없음)으로 다루고, **journal era 안에서는 절대 core row와 섞지 않는다.**
 
 ---
@@ -714,7 +714,10 @@ egress에서 **클라가 view에 쓰는 이벤트만, 전송 순서(seq)대로**
 
 - **~~S1. Core가 메시지 형성을 소유 → final↔lane 영구 불확정.~~ 철회 (2026-08-23).** **오판이었다.** openclaw 내장 채널(Telegram 포함)도 **똑같은 core 위에서 똑같은 식별자-없는 `onAssistantMessageStart()`를 받는다** — core는 Telegram한테도 답변 id를 안 준다. 그런데 내장 채널은 멀쩡하다. 왜냐하면 **식별자를 core가 아니라 "배달 행위"에서 만들기 때문**이다(`[core] src/channels/message/live.ts`, `send.ts`): 채널이 보낼 때 플랫폼이 message_id를 돌려주고(`draft.id()`=previewId, receipt는 배달결과에서 생성), 스트리밍/최종은 **그 id를 in-place 편집**(`editFinal(previewId, edit)`), **"현재 draft 마감" 모델**이지 core ordinal 매칭이 아니다. 현재 draft에 못 붙는 final은 **그냥 새 메시지**(`kind!=="final"||!draft → deliverNormally`). → **우리 #215/#223는 core 한계가 아니라 우리가 `assistantMessageIndex`로 억지 매칭한 자충수.** v6가 "배달 시점 우리(=서버)가 id 배정 + 현재-draft 마감 + 못 붙는 final은 새 메시지"(=내장 채널 그대로)를 채택하면 풀린다. **core-limited 아님.** (§0.1 problem-1도 이 관점에서 재검토 필요 — degrade가 아니라 "새 메시지"가 Telegram 답.)
 - **S2. 중단된 생성의 정확한 이어붙이기 불가 — 강등(구조적 아님, AI 공통).** gateway 재시작 시 반쪽 답변을 같은 내용으로 못 잇는다(`[core] main-session-restart-recovery.ts`가 새 비결정 호출로 복구). **단 이건 우리가 Telegram보다 못한 게 아니다**: Telegram 일반 메시지는 완성 바이트 제출이라 무관하지만, **Telegram AI 봇은 정확히 같은 문제**를 겪고 **동일하게 처리**(live draft 만료 + 새 메시지). → 우리도 같은 방식이면 끝. 원칙 위반 아님, AI-스트리밍의 공통 현실.
-- **S3. 개인 gateway 가용성 경계 (유일한 진짜 영구 차이).** 권위 "서버"(플러그인)는 **유저 gateway가 켜져 있을 때만** 존재. Core NATS는 구독자 없으면 아무것도 저장 안 함(`[plugin] nats-channel.ts:333`, `[core] gateway-lock.ts`). → gateway 오프라인이면 접수·id배정·history 불가. 브라우저는 provisional 보관 후 재시도만. Telegram-cloud식 기기-독립 가용성은 **always-on 호스팅으로 제품을 바꿔야** 달성. 로컬 개인 gateway인 한 영구.
+- **S3. 개인 gateway 가용성 경계 (유일한 진짜 영구 차이) — 단, 아래처럼 좁혀야 정확함 (2026-08-23 codex 2인 정정).**
+  - **영구(구조적):** gateway **프로세스가 죽어 있는 동안**에는 권위 트랜잭션(접수 → messageId/conversation-seq 배정 → authoritative history 서빙)을 **실행할 수 없다.** 권위 트랜잭션은 플러그인 코드가 돌아야 일어나는데, 그 코드가 없다. JetStream/relay가 raw intent를 **보관**해줄 순 있어도 **부재중인 플러그인의 트랜잭션을 대신 실행할 순 없다.** 완전 해소=서버/SSOT를 always-on 컴포넌트로 승격=제품 모델이 바뀜. Telegram은 권위가 이미 always-on 클라우드라 자유롭다. (`[plugin] nats-channel.ts:288-335`, `[core] gateway-lock.ts:289`)
+  - **영구 아님(후속 fixable):** gateway 재시작을 **가로지르는 무손실 접수**는 구조적 한계가 **아니다.** JetStream/always-on relay spool + SDK의 payload-bearing durable queue(`ChannelIngressQueue`, `channel-outbound` durable-receive)로 raw intent를 보관하면 닫힌다. **내장 Telegram 플러그인 자신이 `extensions/telegram/src/telegram-ingress-spool.ts`로 이걸 한다.** → 후속 이슈 "agent-down ingress 보관(JetStream/relay spool)"로 분리.
+  - 즉 S3의 진짜 영구 알맹이는 "**프로세스 부재중 즉시 권위 처리 불가**"뿐. "메시지 유실"은 후속으로 닫을 수 있다.
 
 > **메타 교훈(또 반복한 회귀):** "core가 X를 안 줘서 못 한다"고 단정하기 전에 **같은 core 위의 레퍼런스(내장 Telegram 채널)가 어떻게 하는지 먼저 읽어라.** S1은 안 읽고 우겨서 나온 오판. 레퍼런스는 clone된 `/home/orca/workspace/openclaw`에 있다.
 
@@ -751,13 +754,13 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 | 모든 message/service 타입 durable vs tool/reasoning/notice/approval ephemeral | [#114] | `:131-132`, `channel-contract.ts:29`; §16.2-5 |
 | service message가 typed durable vs 이벤트 모델서 누락(approval 등) | [#114] | `channel-contract.ts:98-100`; §16.2-5 |
 | final↔답변 연결 vs 우리가 ordinal 억지매칭 desync | **[#114]** (S1 철회) | 내장 채널은 "현재 draft 마감 + 못 붙으면 새 메시지"; core 한계 아님(§16.1) |
-| 각 메시지 독립 vs user 메시지 coalesce(1턴) | [later] | `inbound-queue.ts:145`; "durable inbound queue" 후속 |
-| 위치/count ordinal 미사용 vs `assistantMessageIndex` 잔존 | [#114] | `channel-contract.ts:60-64` |
+| **원본 inbound 각각을 durable 보존** vs 우리는 journaling 없이 메모리서 `{id:last,text:joined}`로 병합 | **[#114]** (라벨 정정) | ⚠️ codex 정정: "Telegram은 coalesce 안 함"은 **틀림** — 내장 Telegram도 coalesce함(`[core] extensions/telegram/src/bot-handlers.runtime.ts:636`). 차이는 **병합 전 각 원본을 journal에 남기느냐**다. `inbound-queue.ts:145`. 턴-레벨 coalesce는 남겨도 됨 |
+| ordinal을 **durable id/final-attribution 키로 안 씀** vs 우리는 `assistantMessageIndex`로 final↔lane 매칭 | [#114] | ⚠️ codex 정정: "Telegram은 ordinal 아예 안 씀"은 **틀림** — 내장 Telegram은 ordinal을 **queued-block 회전/상관 힌트**로 씀(`[core] bot-message-dispatch.ts:1357-1441`), 단 **durable id나 final 정체성으론 절대 안 씀**. 우리 죄는 ordinal을 **정체성**으로 쓴 것. `channel-contract.ts:60-64` |
 | 안정 message_id 페이지 vs churn되는 id 커서(`before`) | [#114] | `history.ts:338`; §16.2-6 |
 | 한 답변=한 id(변경=edit) vs 재스트림=새 id 이중렌더 | [#114] | 현재-draft in-place 편집 모델 채택 시 해소(§16.1); core 한계 아님 |
 | 즉시 멀티디바이스 반영 vs B는 스냅샷까지 지연 | [#114] | `:2070`; §16.2-8 |
-| 정확한 재전송 vs 중단 생성 재생성(비결정적) | **[S2]** | `[core] restart-recovery.ts`; §16.1 |
-| 클라우드 권위(기기 독립) vs 개인 gateway(오프라인=불가) | **[S3]** | `nats-channel.ts:333`; §16.1 |
+| ~~정확한 재전송 vs 중단 생성 재생성(비결정적)~~ | ~~[S2]~~ **삭제** | codex 정정: Telegram AI도 동일(만료+새 메시지) → **구조적 차이 아님**. 이 행은 없는 차이를 광고함. §16.1 S2 |
+| 클라우드 권위(기기 독립) vs 개인 gateway(**프로세스 부재중** 권위 처리 불가) | **[S3, 좁힘]** | 무손실 접수는 후속 fixable; 프로세스 부재중 즉시 권위 처리만 영구. §16.1 |
 | 앱 업글이 history 안 지움 vs 파괴적 컷오버 | [later, 의도적] | §15.6; 운영상 수용 |
 | 불변 chat 정체성 vs conversation key에 mutable agentId 포함 | [#114] | `session-route.ts:198`; §16.2-7 |
 | accepted 전 durable vs ACK-후-handler crash gap; NORMAL 롤백 | [#114/later] | `ingress-dedupe.ts:471`; §16.2-9 |
@@ -768,4 +771,36 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 ### 16.4 결론
 
 - **원칙 부합 여부**: v5 방향(플러그인 소유 저널 + 공유 reducer)은 원칙에 맞고, §16.2의 9개 개정을 반영하면 **Telegram 업데이트 프로토콜 수준까지** 충실해진다(typed create/edit/delete + per-conversation seq gap-sync + 서버 id/random_id + persist-before-publish + durable content union).
-- **진짜 영구 한계는 S3(개인 gateway 오프라인=접수 불가) 하나뿐.** S1(core가 id 안 줌)은 **철회** — 같은 core 위의 내장 Telegram 채널이 "배달 시점 id 배정 + 현재-draft 마감"으로 멀쩡히 하는 걸 안 보고 우긴 오판이었다(§16.1). S2(중단 생성)는 AI 공통이라 강등(Telegram AI도 동일 처리). → **#114엔 core가 강제하는 천장이 없다.** 우리가 레퍼런스(내장 채널 `live.ts`)를 그대로 채택하면 identity는 우리가 완전히 소유한다.
+- **진짜 영구 한계는 S3의 알맹이("gateway 프로세스 부재중 즉시 권위 처리 불가") 하나뿐.** S1(core가 id 안 줌)은 **철회**, S2(중단 생성)는 AI 공통이라 **삭제**, S3은 "무손실 접수(후속 fixable) + 프로세스 부재중 권위 처리(영구)"로 **좁힘**. → **#114엔 core가 강제하는 identity 천장이 없다.** (4-모델 합의: §16.5)
+
+### 16.5 식별자(identifier) 최종 결론 — 4-모델 합의로 매듭 (2026-08-23)
+
+> claude-opus ×2 + codex(gpt-5.6-sol, max) ×2, 전원 소스 근거. codex 2인은 **실제 Telegram 확장**(`[core] extensions/telegram/src/*`)까지 읽음(generic barrel `src/channels/message/`보다 깊음). **이 절이 식별자 문제의 확정 답이다 — 다시 열지 말 것.**
+
+**Q. core가 채널에 답변별 안정 식별자를 주는가? → 아니다 (전원 CONFIRMED).**
+- `onAssistantMessageStart()` = 인자 0개(`[core] embedded-agent-subscribe.types.ts:70`). `onPartialReply` payload엔 id 필드 자체가 없음(`[core] get-reply-options.types.ts:58-61`). `BlockReplyContext.assistantMessageIndex`만 유일한 상관자인데 **source-stream ordinal**이지 durable id 아님(subscription마다 0에서 시작, reset마다 +1, 재시도=새 카운터; `[core] embedded-agent-subscribe.ts:169-207,401-450`). deliver-seam은 `{kind}`만 안정 계약(`ChannelDeliveryInfo`엔 assistantMessageIndex 없음; 지금 넘어오는 건 구현 누수). 내부 `deliveryId`/`streamItemId`는 채널에 안 넘김.
+
+**Q. 그럼 내장 Telegram은 어떻게 식별하나? → 배달 행위에서 자기가 만든다 (CONFIRMED).**
+- 첫 전송에서 Telegram `sendMessage`가 준 `sent.message_id`를 draft가 저장(`[core] extensions/telegram/src/draft-stream.ts:284-328`), 이후 스트리밍은 **그 id를 in-place edit**(`:329-377`). 최종도 같은 id로 마감. 못 마감하면 draft 비우고 **새 메시지로 sendPayload**(`lane-delivery-text-deliverer.ts:536-603`); 애매한 edit 실패는 **preview 유지**(중복 안 만듦). 멀티메시지는 경계/블록-ordinal 변화 시 lane을 **회전**(`forceNewMessage` → 다음 전송이 새 message_id)(`bot-message-dispatch.ts:1289-1303`).
+
+**Q. 우리가 따라할 수 있나? → 예, 완전히. 오히려 더 쉬움 (전원 CONFIRMED, 구조적 불가 0).**
+- Telegram은 **외부 플랫폼**이 send 응답으로 id를 주지만, **우리는 우리가 플랫폼이다** → lane 생성 시 **로컬에서 id를 민팅**(외부 왕복 없음; `message-adapter.ts:23-48,830-875` 이미 그렇게 함). SDK는 **구성 모델**을 그대로 export(`deliverFinalizableLivePreview` + `LivePreviewFinalizerDraft{flush,id,clear}` + `editFinal`/`deliverNormally`; `plugin-sdk/channel-outbound.d.ts`). 단 `message.live` facet엔 **완제품 draft 핸들은 없음**(capability map만) → draft는 **우리가 구성**(이미 함). 클라 wire는 이미 id-기반 upsert(progress/agent_message 같은 id).
+
+**세 가지 정밀 정정 (codex의 깊은 read가 드러냄 — 기존 문서 표현이 과했음):**
+1. **"Telegram은 ordinal 아예 안 쓴다"는 틀림.** 내장 Telegram은 `assistantMessageIndex`를 **queued-block 회전/상관 힌트**로 쓴다(`bot-message-dispatch.ts:1357-1441`). 다만 **durable id로도, final 정체성으로도 절대 안 쓴다.** ⇒ 정확한 규칙: **ordinal은 블록-회전 힌트로 OK, 정체성 키로는 금지**(우리 죄는 후자). [[아닌 것 목록 §0.2]] N5는 이 정밀판으로 읽어라.
+2. **"못 붙는 final = 새 메시지"는 fallback이지 첫 동작이 아님.** 첫 동작은 항상 **현재 draft 마감 시도**; 안 되면 새 메시지, **애매하면 preview 유지**. N10은 "현재-draft 우선 → 안 되면 새 메시지(또는 유지), 절대 degrade 아님"으로 읽어라.
+3. **"#215/#223 = 전부 ordinal 자충수"는 과함.** 두 개가 섞여 있다: (a) **ordinal-desync 자충수**(현재-draft 모델 채택으로 완전 해소) + (b) **identity-less final의 "이 final이 어느 이전 답변인가" 의미론적 귀속** — 이건 core가 Telegram에게도 안 주는 **공유 현실**이다. **그러나 현재-draft 모델은 이 질문을 아예 우회한다**(현재 draft를 마감하거나 새 메시지일 뿐, 과거로 소급 귀속 안 함) — Telegram과 **똑같이**. 즉 (b)는 "우리 vs Telegram 격차"가 **아니라** 스트리밍의 본질이고, 소급 귀속을 **시도할 때만** 문다. 우리가 물린 건 소급 ordinal 귀속을 시도했기 때문.
+
+**결론:** durable 식별자는 **우리가 100% 소유 가능**(구조적 불가 없음). 의미론적 소급-귀속은 Telegram도 못 하지만 현재-draft 모델이 우회하므로 실질 문제 아님. **불가능한 identity 차이 = 없음(빈 목록, 전원 일치).**
+
+### 16.6 이번 라운드가 새로 잡은 fixable 결함 (issue 재편 때 v6 슬라이스로)
+
+전부 [FIXABLE-IN-#114] 또는 후속(구조적 아님). 원칙 정정이 아니라 설계/스펙 보강이라 여기 모아둠:
+
+- **v6를 THE 설계로 승격.** 문서 상태줄(§상단)이 아직 "v5 spec-complete"인데 v6가 v5를 4곳(클라-민팅 id, commit-after, delete 부활, global seq)에서 뒤집음 → v5 준수하면서 북극성 위반 가능. (codex-disc #1)
+- **persist-before-publish로 §15.8 확정.** §15.8(commit-after)이 §0/N6·§16.2-2(persist-before)와 정면 모순. v6=persist-before가 이김. buffered-final이 transport 전에 `true` 반환 → 성공 보고됐는데 바이트 미전달 가능(`message-adapter.ts:2341-2350`). (codex-disc #4/#6)
+- **ingress 진짜 durability.** 지금 `accepted` 마커만 쓰고 본문은 in-process 큐에만 두고 ACK → crash 시 본문 영구 소실, replay는 마커 보고 재-ACK(`ingress-dedupe.ts:471-519`). SDK가 payload-bearing durable queue 제공. (codex-disc #5)
+- **프로토콜 버전 bump + capability negotiation.** v6가 correctness-critical id/seq/delete/sync 프레임 추가하는데 버전 협상 없음 → 옛 클라가 delete/sync를 조용히 무시하고 영구 발산(`protocol.ts`). (codex-disc #15)
+- **wire 런타임 검증.** "typed"가 TS 전용, 런타임은 `JSON.parse(...) as T` 무검증 → 악성/깨진 mutation·seq 프레임이 reducer 오염 가능(`nats-channel.ts:875-980`). v6에 런타임 디코딩/불변식. (codex-disc #17)
+- **원본 inbound 각각 journaling** (병합 전) — §16.3 행 정정과 동일. (codex-disc #16)
+- 후속(구조적 아님): agent-down ingress 보관(JetStream/relay spool; S3 무손실 부분), delivery/read-state 프로토콜, message mutation API, HA journal ownership.
