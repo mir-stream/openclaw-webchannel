@@ -8,8 +8,8 @@
   #215).** A `0.7.0` agent emits one new inbound frame at settlement —
   `turn_snapshot`, carrying `{ turnId, answers: Array<{ id, text }>, remove:
   string[] }`, delivered after the turn's last answer frame and immediately
-  before `turn_settled`. The client reconciles the live turn's agent **answer**
-  bubbles to it. Previously the transcript order was whatever order the frames
+  before `turn_settled`. The client reconciles the agent **answer** bubbles of
+  the turn the snapshot names to it, and clears the typing indicator. Previously the transcript order was whatever order the frames
   arrived in, which is why a later assistant message could sit above an earlier
   one (#174) and why a middle answer whose frames failed left a corrupted bubble
   plus a stray duplicate (#215).
