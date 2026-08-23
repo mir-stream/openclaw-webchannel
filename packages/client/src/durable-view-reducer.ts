@@ -19,6 +19,17 @@
  * with the REAL wire frames and compares against this reducer's output. A red
  * anchor always means the REDUCER is wrong; never adjust the expectation.
  *
+ * The anchors are not all equally wide, and the narrowing is a CARVE-OUT, not an
+ * oversight: `user`, `bubble` and `seal` compare the FULL projected view (text
+ * included), while `placement` compares only the SLOT SKELETON — id, role,
+ * turnId and ORDER. §15.9 excludes the rolling draft text from the durable view,
+ * so `applyPlacement` stores `text: ""` where the live client shows the draft.
+ * That text drop is the only place an anchor stops short of the live view, and
+ * it is itself pinned — the test file's "two DELIBERATE divergences"
+ * characterization block records it (alongside the `answerId: ""` divergence of
+ * BOUNDARY 1), so a change in either direction goes red instead of passing
+ * quietly.
+ *
  * SCOPE: the DURABLE subset of the client's `state.messages` only — `id`,
  * `role`, `text`, `turnId`, and ORDERING. Per §0.1 / the north star ("the
  * client owns its own send/UI state"), the client-local overlay is DELIBERATELY
@@ -33,12 +44,15 @@
  *
  * ⚠️ ARRAY IDENTITY IS NOT A GENERAL NO-OP SIGNAL. Some transitions hand the
  * input array straight back when nothing durable changed, and some always
- * allocate. Measured, exhaustively:
+ * allocate. Measured. The three SAME-array rows are EXHAUSTIVE — they are every
+ * path in this file that returns its input by reference. The two NEW-array rows
+ * are illustrative examples, not an enumeration: allocation is the default here,
+ * so any transition not listed among the first three allocates.
  *   - `placement`, repeat claim whose turnId resolves unchanged  → SAME array
  *   - `seal`, early return (no valid answers and no removes)     → SAME array
  *   - `seal`, empty/blank turnId early return                    → SAME array
- *   - `bubble` with identical text and turnId                    → NEW array
- *   - `seal` whose answers change nothing                        → NEW array
+ *   - `bubble` with identical text and turnId                    → NEW array (e.g.)
+ *   - `seal` whose answers change nothing                        → NEW array (e.g.)
  * The last two ALWAYS allocate (see `applyBubble` and `applySeal`'s tail); they
  * do not detect no-ops, and teaching them to would be a behavior change this
  * slice does not need. So do NOT build a `prev === next` memo, a
@@ -96,9 +110,15 @@ export type DurableView = readonly DurableMessage[];
  *                  (nats-client-wrapper.ts:804). Durable subset of the u- bubble.
  *  - `placement` — a `progress` frame for a lane (case "progress",
  *                  nats-client-wrapper.ts:2467). The FIRST one CLAIMS the lane's
- *                  slot (append at tail via `upsertMessage`); it carries no
- *                  durable text (the rolling "Working…" draft is non-durable), so
- *                  the durable text is authored later by a `bubble` or `seal`.
+ *                  slot (append at tail via `upsertMessage`). The frame ALWAYS
+ *                  carries text — `progress.text` is REQUIRED on the wire
+ *                  (channel-contract.ts:66) and the live client writes it
+ *                  (…:2472-2473) — but §15.9 CLASSIFIES that rolling "Working…"
+ *                  draft as an indicator rather than a message, so this event
+ *                  does not carry it and the durable text is authored later by a
+ *                  `bubble` or `seal`. That is a classification, not a wire fact;
+ *                  it is the deliberate divergence pinned by the test file's
+ *                  characterization block.
  *                  `turnId` is OPTIONAL because the wire says so
  *                  (channel-contract.ts:66; nats-channel.ts:469 omits it when
  *                  falsy) and the client stores it verbatim (…:2473). A required
@@ -138,6 +158,26 @@ export type DurableView = readonly DurableMessage[];
  * `a-<n>`-style client-local id to feed it. Do either and you get one of the two
  * bugs the module exists to prevent: the reducer's view silently lacks a bubble
  * the live view shows (history ≠ live, N8), or the viewer mints identity (N4).
+ *
+ * ⚠️ AND `""` IS THE OTHER WRONG ANSWER. `bubble.answerId` must be NON-EMPTY;
+ * `""` is NOT the encoding for "id-less". The trap is that the client's two id
+ * sites use DIFFERENT falsiness, so the natural mapper is the broken one:
+ *   - `progress` upserts on `id ?? ""` (nats-client-wrapper.ts:2471) — NULLISH,
+ *     so `""` SURVIVES as a real id. `placement` with `answerId: ""` is
+ *     therefore FAITHFUL;
+ *   - `agent_message` branches on `if (id)` (…:2569) — TRUTHY, so `""` falls
+ *     into the id-less mint branch at …:2593 and gets its own fresh `a-<n>`.
+ * The two sites genuinely differ. A slice-2 mapper writing
+ * `answerId: frame.id ?? ""` for the durable frame — the natural thing to write,
+ * because it mirrors the progress site verbatim — makes N id-less finals
+ * collapse into ONE durable row while live shows N bubbles: an N8 live≠history
+ * divergence landing in the mapper rather than here. Measured and pinned by the
+ * test file's characterization block. Until #238, an id-less `agent_message` has
+ * NO `bubble` event at all.
+ *
+ * `applySeal` already refuses an empty answer id (`a.id.length > 0`, and the
+ * same for the remove filter); `applyBubble` does not, which is why this is a
+ * CALLER precondition and not a guard.
  *
  * ── PRECONDITION: the journal contains no duplicate `user` rows ──
  *
@@ -292,6 +332,19 @@ function applyUser(
  * reducer still holds "FINAL ANSWER" — history ≠ live (N8). Do not silently
  * "harmonize" that if you meet it; it means a plugin guard regressed, and the
  * guard is the thing to fix.
+ *
+ * ⚠️ THE FORWARD CASE NEEDS NO REGRESSION AT ALL, so do not read the two guards
+ * above as covering it. A lane that receives `progress` and then NEVER a durable
+ * frame is reachable today: an aborted turn, a dropped connection, or the
+ * thrown-turn apology at `inbound.ts:1599`, which is id-LESS and therefore
+ * APPENDS a new bubble (BOUNDARY 1) while leaving the draft bubble in place. In
+ * every one of those the live view shows the lane's partial text where this
+ * reducer holds `""` — the same N8 shape, arrived at without any guard failing.
+ * That is the §15.9 classification working as designed at the reducer level;
+ * whether history should then render an empty bubble at all (drop it? show a
+ * placeholder? keep the slot?) is a slice-2 RENDER question, tracked separately.
+ * Do not resolve it here by teaching the reducer to keep draft text — that is
+ * the §15.9 reversal, and it would put the decision in the wrong layer.
  */
 function applyPlacement(
   view: DurableView,

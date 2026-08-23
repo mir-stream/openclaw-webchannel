@@ -390,6 +390,69 @@ describe("characterization: a duplicated `user` row violates the reducer's preco
 });
 
 // ---------------------------------------------------------------------------
+// CHARACTERIZATION — the two DELIBERATE divergences from the live client
+// ---------------------------------------------------------------------------
+//
+// The module's claim is byte-faithfulness, and the anchors below back it. These
+// two tests carve out the exceptions, so the carve-outs are OBSERVED rather than
+// merely asserted in prose. They RECORD; they do not endorse. A change in EITHER
+// direction — the reducer starting to mirror the client here, or the client
+// changing under it — must turn one of them red rather than pass silently.
+
+describe("characterization: the two DELIBERATE divergences from the live client", () => {
+  it("placement drops the draft text the live view shows (§15.9 indicator, not a message)", () => {
+    // `progress.text` is REQUIRED on the wire (channel-contract.ts:66) and the
+    // real client writes it into the bubble (nats-client-wrapper.ts:2472-2473).
+    // The reducer appends `text: ""` instead. That is the settled §15.9 decision
+    // — the rolling draft is a 표시기 (indicator), not a message — and it is the
+    // ONLY reason the `placement` anchors compare `slotSkeleton` rather than the
+    // whole view. Recorded here so the delta is a fact in the suite instead of a
+    // gap: do NOT "fix" the reducer to match, and do NOT widen the placement
+    // anchors to compare text — either move is a §15.9 reversal that belongs in
+    // the doc first.
+    const real = realDrive([], [progressFrame("A", "partial answer so far", TURN)]);
+    const reduced = reduceDurableView([{ kind: "placement", answerId: "A", turnId: TURN }]);
+
+    expect(real[0].text).toBe("partial answer so far");
+    expect(reduced[0].text).toBe("");
+    // …and the divergence is confined to `text`: everything placement DOES claim
+    // to mirror still matches exactly.
+    expect(slotSkeleton(reduced)).toEqual(slotSkeleton(real));
+  });
+
+  it('bubble with an EMPTY answerId is NOT "id-less" — the live client mints separate bubbles', () => {
+    // The client's two id sites use DIFFERENT falsiness, and this is the trap it
+    // sets for slice 2's mapper (see BOUNDARY 1 in durable-view-reducer.ts):
+    //   - `progress` upserts on `id ?? ""` (…:2471) — NULLISH, so "" survives as
+    //     a real id, which is why `placement` with `answerId: ""` is FAITHFUL;
+    //   - `agent_message` branches on `if (id)` (…:2569) — TRUTHY, so "" falls
+    //     into the id-less mint branch at …:2593 and gets a fresh `a-<n>`.
+    // So two id-less finals are TWO bubbles live, while a mapper that mirrors the
+    // progress site verbatim (`answerId: frame.id ?? ""`) collapses them into ONE
+    // durable row — an N8 live≠history divergence landing in the mapper. Hence
+    // `bubble.answerId` must be NON-EMPTY; "" is not the encoding for "id-less",
+    // and until #238 an id-less `agent_message` has NO `bubble` event at all.
+    const real = realDrive([], [
+      agentMessageFrame("", "one", TURN),
+      agentMessageFrame("", "two", TURN),
+    ]);
+    expect(real).toHaveLength(2);
+    expect(real.map((m) => m.text)).toEqual(["one", "two"]);
+    for (const m of real) expect(m.id).not.toBe("");
+    // Non-vacuity: they are distinct client-minted ids, not one bubble twice.
+    expect(new Set(real.map((m) => m.id)).size).toBe(2);
+
+    const reduced = reduceDurableView([
+      { kind: "bubble", answerId: "", text: "one", turnId: TURN },
+      { kind: "bubble", answerId: "", text: "two", turnId: TURN },
+    ]);
+    expect(reduced).toHaveLength(1);
+    expect(reduced[0].id).toBe("");
+    expect(reduced[0].text).toBe("two");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // EQUIVALENCE ANCHORS — every transition vs. the REAL client
 // ---------------------------------------------------------------------------
 //
@@ -397,13 +460,22 @@ describe("characterization: a duplicated `user` row violates the reducer's preco
 // does TODAY. A hand-written expectation cannot distinguish a faithful mirror
 // from a merely plausible one, so each of the four transitions is anchored by
 // driving the REAL `WebChannelNATSClient` with the REAL wire frames and
-// comparing `projectDurable(state.messages)` against the reducer's output for
-// the corresponding event stream:
+// comparing its projected `state.messages` against the reducer's output for the
+// corresponding event stream:
 //
 //   user      → the real public `send()` → `publish()` (nats-client-wrapper.ts:804)
 //   placement → a real `progress` frame  → `handleMessage` case (…:2467)
 //   bubble    → a real `agent_message`   → `handleMessage` case (…:2562)
 //   seal      → a real `turn_snapshot`   → `applyTurnSnapshot`  (…:1486-1557)
+//
+// WHAT IS COMPARED IS NOT UNIFORM, and the difference is a carve-out rather than
+// an oversight. `user`, `bubble` and `seal` compare the FULL projected view
+// (`projectDurable(state.messages)`, text included). `placement` compares only
+// the SLOT SKELETON — id / role / turnId / order — because §15.9 excludes the
+// rolling draft text from the durable view, so the reducer deliberately stores
+// `text: ""` where the live client shows the draft. That single delta is itself
+// pinned, by the characterization test above ("placement drops the draft text
+// the live view shows"), so it is observed and not merely narrated.
 //
 // The discipline that makes these worth anything is NON-CIRCULARITY: they call
 // real client code, never a second copy of the reducer. Nothing in this section
@@ -790,6 +862,28 @@ describe("equivalence anchor: reduceDurableView(seal) ≡ real turn_snapshot han
           { id: "A", text: "A" },
           { id: "B", text: "minted B" },
           { id: "C", text: "minted C" },
+        ],
+        remove: [],
+      },
+    },
+    // Covers `applySeal` step 3's `k === 0` sub-branch — the one that runs when
+    // answers[0] is ABSENT from the view while a LATER answer is PRESENT. Every
+    // other case above mints only at k > 0 (predecessor lookup) or has no
+    // surviving answer to anchor against, so WITHOUT this case the branch is
+    // DEAD to the suite: deleting its body leaves the whole file green while
+    // silently changing ORDERING — [Z, A, NOTICE] becomes [Z, NOTICE, A] — which
+    // is precisely the property this module exists to guarantee.
+    {
+      name: "minted answers[0] lands at the FIRST answer slot, not the tail",
+      prior: [
+        { kind: "bubble", answerId: "A", turnId: TURN, text: "A" },
+        { kind: "bubble", answerId: "NOTICE", turnId: TURN, text: "notice" },
+      ],
+      seal: {
+        turnId: TURN,
+        answers: [
+          { id: "Z", text: "minted Z" },
+          { id: "A", text: "A" },
         ],
         remove: [],
       },
