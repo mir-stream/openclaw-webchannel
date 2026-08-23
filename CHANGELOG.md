@@ -1,6 +1,64 @@
 # Changelog
 
-## Unreleased
+## 0.7.0
+
+Two unrelated changes ship together. **The two published libraries are renamed**
+— `@mir-stream/webchannel-client` and `@mir-stream/webchannel-saas` lose the
+scope, and the old names are unpublished after this release, so migration is
+required and is not automatic. Separately, **the agent becomes the authoritative
+source of the order of a turn's answers**, which closes the last two rendering
+defects of the delivery-render redesign (#212). The wire change is additive and
+`WEBCHANNEL_PROTOCOL_VERSION` stays `3`, so the protocol imposes no lockstep —
+but the fix has a half on each side of the wire, so seeing it needs the `0.7.0`
+plugin *and* the `0.7.0` client. All three packages move to `0.7.0` together
+under the 3-way version lockstep.
+
+### Added
+
+- **An authoritative end-of-turn snapshot of the turn's answer bubbles (#174,
+  #215).** Until now the transcript a browser rendered was whatever order the
+  wire happened to deliver, and the agent had no way to correct it afterwards.
+  At settlement the plugin now emits one extra frame —
+  `{ type: "turn_snapshot", turnId, answers: Array<{ id, text }>, remove: string[] }`
+  — at drain, after the buffered-final flush and immediately before
+  `turn_settled`. `answers` is the turn's agent answer bubbles in the plugin's
+  own generation order; `remove` names bubbles carrying answer content that
+  `answers` already represents. The client applies it as a **pure view**: drop
+  the `remove` ids, upsert each `answers` entry by id, and reorder answer
+  bubbles among the slots answer bubbles already occupy.
+
+  Two visible defects follow from it:
+  - **A later assistant message could render above an earlier one (#174).** The
+    snapshot states the order outright, so arrival order stops deciding it.
+  - **With two or more answers in a turn, a middle answer whose wire frames
+    failed left a corrupted bubble plus a stray, mis-routed extra bubble
+    (#215).** Each lane's snapshot text is captured *while it streams* and is
+    never overwritten by a later final landing on the wrong lane, so a
+    mis-routed final cannot corrupt it; where the routing is provably correct
+    the lane's full final text is used instead, so nothing a final added beyond
+    the last partial is lost. An `answers` entry with an id the browser has
+    never seen **recovers** a lane whose frames never arrived, and the
+    duplicate extra bubble is named in `remove`.
+
+  **It is additive and safely ignorable.** `WEBCHANNEL_PROTOCOL_VERSION` stays
+  `3`, no existing frame or field changed, and a `0.6.x` client that has never
+  heard of `turn_snapshot` ignores it and renders exactly as it does today. If
+  you hand-roll a client, the only requirement is that an unknown frame type
+  stays inert.
+
+  **Nothing is deleted speculatively.** `remove` carries only ids the plugin can
+  prove duplicate an `answers` entry — never a notice, an error, or a bubble
+  whose content is unique. If even one message in the turn streamed no partials,
+  that proof does not hold, so the plugin names nothing and leaves the bubble
+  visible-but-misplaced rather than risk telling the client to delete text that
+  exists nowhere else.
+
+  **Known limitation, deliberate and documented.** A message that streams no
+  partials at all has no streamed text, cannot appear in `answers`, and so
+  cannot be placed by the snapshot. That is the same final-identity ceiling as
+  #111 — core exposes no per-message identity on a final — not a defect in the
+  snapshot, and it is not observed at the middle position with the pinned core.
+  It heals on reload, when durable history supplies the true order.
 
 ### Changed
 
@@ -26,6 +84,18 @@
   follow the procedure rather than improvising it:
   [Migrating an existing consumer](docs/PUBLISHING.md#migrating-an-existing-consumer),
   which also covers rewriting your import specifiers.
+
+### Notes
+
+- The snapshot completes the delivery-render redesign tracked in **#212**; #172
+  and #173, its first two phases, shipped in `0.6.1`. The one shape #173 left
+  imperfect — three or more text messages, a tool-only last message, and a
+  middle frame dropped mid-turn — is exactly what the snapshot now corrects.
+- Internally this cycle also hardened the release pipeline (#220, #229): the
+  tag-dispatch path can no longer start a second release alongside a running
+  one, and a new `verify-dist-tags` job fails the release when npm's `latest`
+  ends up split across the three packages instead of letting it pass silently.
+  No shipped code is affected.
 
 ## 0.6.1
 

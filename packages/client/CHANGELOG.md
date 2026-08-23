@@ -1,6 +1,33 @@
 # Changelog — openclaw-webchannel-client
 
-## Unreleased
+## 0.7.0
+
+### Added
+
+- **The client now renders the agent's authoritative answer order (#174,
+  #215).** A `0.7.0` agent emits one new inbound frame at settlement —
+  `turn_snapshot`, carrying `{ turnId, answers: Array<{ id, text }>, remove:
+  string[] }`, delivered after the turn's last answer frame and immediately
+  before `turn_settled`. The client reconciles the live turn's agent **answer**
+  bubbles to it. Previously the transcript order was whatever order the frames
+  arrived in, which is why a later assistant message could sit above an earlier
+  one (#174) and why a middle answer whose frames failed left a corrupted bubble
+  plus a stray duplicate (#215).
+  - The reduction is explicit, never a blanket "drop anything not listed":
+    `remove` ids are dropped; each `answers` entry is upserted by id — an id the
+    client does not hold yet is **minted**, which is how an answer whose own
+    frames never arrived is recovered; and answer bubbles are then reordered
+    **among the slots answer bubbles already occupy**.
+  - **Everything else is preserved as the same object reference.** User bubbles
+    and their send state (receipts, held, `sendState`), notices and errors,
+    reasoning, tool activity, and an adopted durable-history agent row sharing
+    the turn all keep their identity and their slot. Only answer bubbles move,
+    and only past each other — so a `useSyncExternalStore` / memo consumer sees
+    no spurious change on the rows the snapshot did not touch.
+  - **No protocol break.** `WEBCHANNEL_PROTOCOL_VERSION` stays `3`; the frame is
+    additive in both directions. A `0.6.x` agent simply never sends it, and this
+    client behaves exactly as `0.6.1` did against one. Upgrading only the client
+    changes nothing on its own — the frame comes from the agent.
 
 ### Changed
 
@@ -15,6 +42,18 @@
   resolves an old name to a new one. Follow the pinned, ordered procedure in
   [Migrating an existing consumer](../../docs/PUBLISHING.md#migrating-an-existing-consumer);
   it also covers rewriting your import specifiers.
+- **`InboundMessage` gained the shape of the new frame.** `type` adds the
+  `"turn_snapshot"` member and two optional fields appear —
+  `answers?: Array<{ id: string; text: string }>` and `remove?: string[]` — both
+  meaningful only on a `turn_snapshot`. This is additive: existing
+  `InboundMessage` values stay valid. It is only a source break if you
+  exhaustively `switch` on `InboundMessage["type"]` with no `default`, in which
+  case TypeScript will now point at the missing case. The client re-declares the
+  wire type rather than importing it (this package stays dependency-free), so
+  the field docs live here too.
+- If you write your own frame handler rather than using
+  `WebChannelNATSClient`, **an unrecognized `turn_snapshot` must stay inert** —
+  do not treat it as a message-bearing frame.
 
 ## 0.6.1
 

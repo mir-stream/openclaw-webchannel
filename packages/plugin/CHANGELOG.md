@@ -1,9 +1,51 @@
 # Changelog — openclaw-webchannel
 
-## Unreleased
+## 0.7.0
+
+### Added
+
+- **The plugin is now the authoritative source of the live turn's answer order
+  (#174, #215).** It has always known which assistant message produced which
+  bubble; it had no way to say so, so the browser's transcript was decided by
+  whatever order the wire happened to deliver. At the terminal drain — after
+  `flushBufferedOrdinaryFinals`, before `turn_settled` — the channel now emits
+  one additional frame:
+  `{ type: "turn_snapshot", turnId, answers: Array<{ id, text }>, remove: string[] }`.
+  - `answers` is every lane that streamed visible answer text, **in generation
+    order**. `id` reuses the lane's materialized wire id, or a freshly minted id
+    for a lane that streamed but whose frames never reached the wire — that
+    minted entry is what *recovers* the #215 mid-lane, which previously rendered
+    as a corrupted bubble.
+  - `text` is the lane's new per-lane **`streamedAnswerText`**, captured at
+    stream time and never overwritten by a final topping the lane up. That is
+    what makes the snapshot immune to #215 final mis-routing: a final landing on
+    the wrong lane can no longer corrupt what the snapshot reports. Where the
+    routing is *provable* — the immediate collapse / current-lane-has-text /
+    lone-message paths, and the buffered path when the finals map one-to-one
+    onto materialized targets and every text-bearing message streamed
+    (`answerTextIsAuthoritative`) — the snapshot carries the lane's full
+    `answerText` instead, so a final's tail beyond the last partial is not
+    dropped.
+  - `remove` names only bubbles the plugin **can prove** duplicate an `answers`
+    entry: an overflow final's independent bubble, and a recovery block for a
+    lane already in `answers`. It is guarded by a turn-level invariant — the
+    count of streamed answer lanes must equal the count of ordinary finals being
+    routed — so when even one text-bearing message streamed nothing, the plugin
+    marks nothing and leaves the bubble visible-but-misplaced rather than tell
+    the client to delete content that exists nowhere else. A notice, an error,
+    or any stray independent bubble is **never** named.
+  - Emission is best-effort by design. A transport without `sendTurnSnapshot`
+    is skipped, a throw is caught and warned, and either way the drain and
+    `turn_settled` proceed — the turn degrades to the pre-#212 arrival-order
+    render rather than failing.
 
 ### Changed
 
+- **`WebChannelPeerChannel` gains a required `sendTurnSnapshot(peerId, turnId,
+  answers, remove)`.** `NatsChannel` and `NullPeerChannel` implement it. This is
+  an internal channel contract, not a published entry point — the plugin ships
+  no JS API — but an out-of-tree implementer of the interface must add the
+  method.
 - **The two companion libraries were renamed** —
   `@mir-stream/webchannel-client` → `openclaw-webchannel-client` and
   `@mir-stream/webchannel-saas` → `openclaw-webchannel-saas`. **This plugin's own
@@ -12,6 +54,27 @@
   **The old scoped names will be unpublished after this release**, so consumers
   of the client or saas packages must migrate — see
   [Migrating an existing consumer](../../docs/PUBLISHING.md#migrating-an-existing-consumer).
+
+### Notes
+
+- **No protocol break.** `WEBCHANNEL_PROTOCOL_VERSION` stays `3`. `turn_snapshot`
+  is purely additive and safely ignorable: no existing frame or field changed,
+  and a `0.6.x` client that has never heard of the type ignores it and renders
+  exactly as it does today. The order fix does need a `0.7.0` client to be seen,
+  but nothing here refuses a mismatched peer.
+- **Known limitation, deliberate.** A text-bearing message that streams **zero**
+  partials has no `streamedAnswerText`, so it cannot appear in `answers` and the
+  snapshot cannot place it — and in a `K>=2` tool-only-last turn its mis-routed
+  final can still leave the live view reading `[A][C][C]` with `B` absent. This
+  is the same #111 final-identity ceiling as the Case-X shape, not a defect in
+  the snapshot: finals are identity-less on the wire, and the pinned core does
+  not produce a non-streaming message at the middle position. It reload-heals.
+  The `remove` guard above exists precisely so this shape loses *ordering*, never
+  *content*. Pinned by tests; do not add mitigation at this layer.
+- This is the third and final phase of the delivery-render redesign tracked in
+  **#212** — #172 and #173 shipped in `0.6.1`, and the one shape #173 left
+  imperfect (3+ text-bearing lanes, a tool-only last message, a middle frame
+  dropped mid-turn) is what this snapshot corrects.
 
 ## 0.6.1
 

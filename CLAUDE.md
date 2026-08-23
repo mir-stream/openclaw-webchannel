@@ -44,3 +44,22 @@ Loaded on-demand — not preloaded.
 wonder, reflect, advocate, contrarian, judge
 **Support**: hacker, simplifier, researcher, architect
 <!-- ooo:END -->
+
+---
+
+# Delivery-render redesign — READ BEFORE TOUCHING message identity / history / streaming
+
+This repo's delivery-render / message-identity subsystem was redesigned after the
+approach flipped repeatedly at the spec level. To stop the oscillation:
+
+- **SSOT design doc:** `docs/ISSUE_114_DELIVERY_MIRROR_PLAN.md`. Read **§0** (the
+  principle), **§0.2** (the anti-regression NOT-list — the discarded paths and the
+  facts that kill them), **§15** (v6 design), **§16.5** (the settled identifier verdict).
+- **Live board:** GitHub issue **#236** (v6 umbrella) + its slices. It embeds the
+  NOT-list. Old design issues are CLOSED — do not reopen those approaches.
+- **The principle:** *our plugin = Telegram plugin + Telegram server; our client =
+  Telegram app.* The plugin owns identity (assigned at the delivery act) and its own
+  durable store; the client is a pure view. Never read core's transcript for the client.
+- **Before declaring anything "core-limited / structural / impossible / the spec,"**
+  check the NOT-list (§0.2) and read how core's built-in Telegram extension
+  (`extensions/telegram/src/` in the pinned core clone) does it on the same core.
