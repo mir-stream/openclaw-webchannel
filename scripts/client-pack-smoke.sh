@@ -64,6 +64,8 @@ dist/chacha20poly1305.d.ts
 dist/chacha20poly1305.js
 dist/command-filter.d.ts
 dist/command-filter.js
+dist/durable-view-reducer.d.ts
+dist/durable-view-reducer.js
 dist/e2e-crypto-browser.d.ts
 dist/e2e-crypto-browser.js
 dist/index.d.ts
