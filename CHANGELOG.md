@@ -7,10 +7,10 @@ Two unrelated changes ship together. **The two published libraries are renamed**
 scope, and the old names are unpublished after this release, so migration is
 required and is not automatic. Separately, **the agent becomes the authoritative
 source of the order of a turn's answers**, which closes #174 outright and
-dissolves the multi-answer half of #215. The delivery-render redesign (#212)
-keeps its single-answer Case X open on purpose, and #212 itself stays open for
-its durable-identity keystone; see the two known limitations below. The wire
-change is additive and `WEBCHANNEL_PROTOCOL_VERSION` stays `3`, so the protocol
+dissolves the multi-answer half of #215. It does not close the delivery-render
+work: the single-answer Case X is preserved on purpose, and two further
+limitations are documented below. The wire change is additive and
+`WEBCHANNEL_PROTOCOL_VERSION` stays `3`, so the protocol
 imposes no lockstep — but the fix has a half on each side of the wire, so seeing
 it needs the `0.7.0` plugin *and* the `0.7.0` client. All three packages move to
 `0.7.0` together under the 3-way version lockstep.
@@ -60,6 +60,14 @@ it needs the `0.7.0` plugin *and* the `0.7.0` client. All three packages move to
   visible-but-misplaced rather than risk telling the client to delete text that
   exists nowhere else.
 
+  One bounded exception, since "unique" is doing real work in that sentence: on
+  the mis-routable buffered path the snapshot carries each lane's *streamed*
+  text, so a removed overflow bubble's final-only tail — text a final added
+  beyond the last partial, the open VERIFY-1 edge — is dropped from the live
+  view. Ordering is what that shape was losing before; this trades a
+  correctly-ordered transcript for a possibly-truncated last line, and reload
+  restores it from durable history.
+
   **Known limitations, deliberate and documented.** Two, not one.
 
   *A message that streams no partials at all* has no streamed text, cannot
@@ -75,9 +83,9 @@ it needs the `0.7.0` plugin *and* the `0.7.0` client. All three packages move to
   is legal: a snapshot arriving **before** adoption is overwritten by it and the
   authoritative correction is lost for the session (**#227**), and one arriving
   **after** adoption misses the renamed bubble and mints a duplicate instead of
-  recovering a lane (**#228**, heals on reload). Both are open and are deferred
-  to the #114 delivery mirror on purpose: a fix inside the client would be more
-  of the id-guessing that #114 exists to retire. Reaching either needs a
+  recovering a lane (**#228**, heals on reload). Neither is fixed here, on
+  purpose: a fix inside the client would be more of the id-guessing that the
+  delivery-journal redesign exists to retire. Reaching either needs a
   durable-history read for the turn to interleave with the snapshot — a second
   device, a reconnect, and a cursor-less `loadHistory()` refresh around a live
   turn all produce that.
@@ -109,13 +117,13 @@ it needs the `0.7.0` plugin *and* the `0.7.0` client. All three packages move to
 
 ### Notes
 
-- The snapshot is the third plugin-side phase of the delivery-render redesign
-  tracked in **#212**; #172 and #173, its first two phases, shipped in `0.6.1`.
-  The one shape #173 left imperfect — three or more text messages, a tool-only
-  last message, and a middle frame dropped mid-turn — is exactly what the
-  snapshot now corrects. **#212 itself stays open.** Its durable-identity
-  keystone (#114) has not landed, and the client-side reconciliation workstream
-  still carries #104, #105, #227 and #228.
+- The snapshot follows #172 and #173, which shipped in `0.6.1`. The one shape
+  #173 left imperfect — three or more text messages, a tool-only last message,
+  and a middle frame dropped mid-turn — is exactly what the snapshot now
+  corrects. **This is not the end of the delivery-render work.** That design has
+  since been reboarded onto **#236**, which supersedes the older umbrella and
+  absorbs the limitations below; treat #236 as the live tracker and the issue
+  numbers in this entry as historical labels for the behaviours they describe.
 - Internally this cycle also hardened the release pipeline (#220, #229): the
   tag-dispatch path can no longer start a second release alongside a running
   one, and a new `verify-dist-tags` job fails the release when npm's `latest`

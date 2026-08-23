@@ -36,14 +36,13 @@
     is overwritten by it and the authoritative correction is lost for the
     session (**#227**), and one arriving **after** adoption misses the renamed
     bubble, so the "minted" path above adds a duplicate instead of recovering a
-    lane (**#228**, heals on reload). Both
-    are open and deferred to the #114 delivery mirror on purpose — resolving
-    them inside the client means matching on text or position, which is the
-    guessing #114 exists to retire, and which adversarial review found could
-    delete another device's answer outright. Reaching either needs a
-    durable-history read for the turn to interleave with the snapshot — a second
-    device, a reconnect, and a cursor-less `loadHistory()` refresh around a live
-    turn all produce that.
+    lane (**#228**, heals on reload). Neither is fixed here, on purpose —
+    resolving them inside the client means matching on text or position, which
+    is the guessing the delivery-journal redesign (**#236**) exists to retire,
+    and which adversarial review found could delete another device's answer
+    outright. Reaching either needs a durable-history read for the turn to
+    interleave with the snapshot — a second device, a reconnect, and a
+    cursor-less `loadHistory()` refresh around a live turn all produce that.
 
 ### Changed
 

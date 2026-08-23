@@ -31,13 +31,17 @@
   - `remove` names only bubbles the plugin **can prove** duplicate an `answers`
     entry: an overflow final's independent bubble, and a recovery block for a
     lane already in `answers`. The two carry **independent** proofs — the
-    overflow bubble is guarded by a turn-level invariant (every ordinary final
-    being routed must have a streamed answer lane), the recovery block by its
-    own lane having streamed visible text. Both predicates are the one `answers`
-    itself filters on, so a marked bubble is provably represented there. Where
-    the relevant proof fails the plugin
-    marks nothing and leaves the bubble visible-but-misplaced rather than tell
-    the client to delete content that exists nowhere else. A notice, an error,
+    overflow bubble is guarded by a turn-level invariant (a cardinality
+    condition — every ordinary final being routed must have a streamed answer
+    lane), the recovery block by its own lane having streamed visible text.
+    Both rest on `streamedVisibleAnswerText`, the predicate `answers` itself
+    filters on, so a marked bubble is provably represented there — as its
+    *streamed* text. The one gap that leaves: an overflow bubble named on the
+    mis-routable path can carry a final-only tail the last partial never
+    emitted (the open VERIFY-1 edge), which the live view then loses and a
+    reload restores. Where the relevant proof fails the plugin marks nothing
+    and leaves the bubble visible-but-misplaced rather than tell the client to
+    delete content that exists nowhere else. A notice, an error,
     or any stray independent bubble is **never** named.
   - Emission is best-effort by design. A transport without `sendTurnSnapshot`
     is skipped, a throw is caught and warned, and either way the drain and
@@ -82,15 +86,16 @@
   cursor-less `loadHistory()` refresh around a live turn can all put a
   `turn_snapshot` across its own turn's history frame, and the snapshot is
   then either overwritten by history adoption (**#227**) or mints a duplicate
-  bubble rather than recovering a lane (**#228**). Both are open, both are
-  client-side, and both are deferred to the #114 delivery mirror. Nothing in the
-  emission above changes to work around them.
-- This is the third plugin-side phase of the delivery-render redesign tracked in
-  **#212** — #172 and #173 shipped in `0.6.1`, and the one shape #173 left
-  imperfect (3+ text-bearing lanes, a tool-only last message, a middle frame
-  dropped mid-turn) is what this snapshot corrects. **It does not close #212**:
-  the durable-identity keystone (#114) has not landed, and the client-side
-  reconciliation workstream stays open (#104, #105, #227, #228).
+  bubble rather than recovering a lane (**#228**). Both are client-side and
+  neither is fixed here. Nothing in the emission above changes to work around
+  them.
+- This snapshot follows #172 and #173, which shipped in `0.6.1`, and corrects
+  the one shape #173 left imperfect (3+ text-bearing lanes, a tool-only last
+  message, a middle frame dropped mid-turn). **It is not the end of the
+  delivery-render work.** That design has since been reboarded onto **#236**,
+  which supersedes the older umbrella and absorbs the limitations above. Treat
+  #236 as the live tracker; the issue numbers here are historical labels for
+  the behaviours they describe.
 
 ## 0.6.1
 
