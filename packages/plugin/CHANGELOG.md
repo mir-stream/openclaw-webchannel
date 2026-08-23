@@ -15,7 +15,9 @@
     order**. `id` reuses the lane's materialized wire id, or a freshly minted id
     for a lane that streamed but whose frames never reached the wire — that
     minted entry is what *recovers* the #215 mid-lane, which previously rendered
-    as a corrupted bubble.
+    as a corrupted bubble. (Across a durable-history read the client turns that
+    same mint into a duplicate instead — see the client-side known limitation
+    below.)
   - `text` is the lane's new per-lane **`streamedAnswerText`**, captured at
     stream time and never overwritten by a final topping the lane up. That is
     what makes the snapshot immune to #215 final mis-routing: a final landing on
@@ -76,8 +78,9 @@
   *content*. Pinned by tests; do not add mitigation at this layer.
 - **Known limitation, client-side.** What the plugin states authoritatively is
   only as good as the client's reconciliation of it, and that reconciliation is
-  not yet ordered against durable history. On multi-device and on reconnect a
-  `turn_snapshot` can cross its own turn's history frame, and the snapshot is
+  not yet ordered against durable history. A second device, a reconnect, or a
+  cursor-less `loadHistory()` refresh around a live turn can all put a
+  `turn_snapshot` across its own turn's history frame, and the snapshot is
   then either overwritten by history adoption (**#227**) or mints a duplicate
   bubble rather than recovering a lane (**#228**). Both are open, both are
   client-side, and both are deferred to the #114 delivery mirror. Nothing in the
@@ -86,7 +89,7 @@
   **#212** — #172 and #173 shipped in `0.6.1`, and the one shape #173 left
   imperfect (3+ text-bearing lanes, a tool-only last message, a middle frame
   dropped mid-turn) is what this snapshot corrects. **It does not close #212**:
-  the durable-identity keystone (#114) has not started, and the client-side
+  the durable-identity keystone (#114) has not landed, and the client-side
   reconciliation workstream stays open (#104, #105, #227, #228).
 
 ## 0.6.1
