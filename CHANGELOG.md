@@ -8,12 +8,12 @@ scope, and the old names are unpublished after this release, so migration is
 required and is not automatic. Separately, **the agent becomes the authoritative
 source of the order of a turn's answers**, which closes #174 outright and
 dissolves the multi-answer half of #215. It does not close the delivery-render
-work: the single-answer Case X is preserved on purpose, and two further
+work: the single-answer Case X is preserved on purpose, and the remaining
 limitations are documented below. The wire change is additive and
-`WEBCHANNEL_PROTOCOL_VERSION` stays `3`, so the protocol
-imposes no lockstep — but the fix has a half on each side of the wire, so seeing
-it needs the `0.7.0` plugin *and* the `0.7.0` client. All three packages move to
-`0.7.0` together under the 3-way version lockstep.
+`WEBCHANNEL_PROTOCOL_VERSION` stays `3`, so the protocol imposes no lockstep —
+but the fix has a half on each side of the wire, so seeing it needs the `0.7.0`
+plugin *and* the `0.7.0` client. All three packages move to `0.7.0` together
+under the 3-way version lockstep.
 
 ### Added
 
@@ -68,7 +68,7 @@ it needs the `0.7.0` plugin *and* the `0.7.0` client. All three packages move to
   correctly-ordered transcript for a possibly-truncated last line, and reload
   restores it from durable history.
 
-  **Known limitations, deliberate and documented.** Two, not one.
+  **Known limitations, deliberate and documented.**
 
   *A message that streams no partials at all* has no streamed text, cannot
   appear in `answers`, and so cannot be placed by the snapshot. That is the same
@@ -122,7 +122,7 @@ it needs the `0.7.0` plugin *and* the `0.7.0` client. All three packages move to
   and a middle frame dropped mid-turn — is exactly what the snapshot now
   corrects. **This is not the end of the delivery-render work.** That design has
   since been reboarded onto **#236**, which supersedes the older umbrella and
-  absorbs the limitations below; treat #236 as the live tracker and the issue
+  absorbs the limitations above; treat #236 as the live tracker and the issue
   numbers in this entry as historical labels for the behaviours they describe.
 - Internally this cycle also hardened the release pipeline (#220, #229): the
   tag-dispatch path can no longer start a second release alongside a running
