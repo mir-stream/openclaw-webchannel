@@ -379,10 +379,22 @@ curl -s https://registry.npmjs.org/-/package/openclaw-webchannel-saas/dist-tags
 Each response must report `latest` equal to the release version, not
 `0.0.0-bootstrap.0`.
 
-**Until the bootstrap lands, releases are blocked.** Every `v*` tag fails at the
-`publish` job, and both plugin legs `needs: publish`, so they are skipped — which
-means even a **plugin-only hotfix cannot ship** until client and saas are
-squared away on the registry.
+**The bootstrap no longer blocks releases.** Steps (a) and (b) are done for both
+names, so a `v*` tag has everything it needs; the outstanding step (c) is registry
+policy and gates nothing in CI — as noted above, publishing access cannot break
+the OIDC release path. A **plugin-only hotfix needs no further npm web-UI work.**
+
+What is *not* proven yet is that step (b) was entered correctly. Nothing outside
+the npm web UI can read a trusted-publisher entry back, and a typo in one does not
+fail on save — it surfaces as a `404 on PUT` the first time the `publish` job runs.
+The next release is therefore what verifies (b); if it 404s, re-check both entries
+character by character before suspecting anything else.
+
+Keep the mechanism in mind, because it is what made (a) and (b) urgent: while
+either was missing, every `v*` tag failed at the `publish` job, and both plugin
+legs `needs: publish`, so they were skipped — meaning even a plugin-only hotfix
+could not ship until client and saas were squared away on the registry. That is
+the state to expect again if a future rename introduces another new name.
 
 ## Plugin publishing (ClawHub)
 
@@ -542,7 +554,7 @@ force the `@mir-stream` scope through GitHub Packages; if you are already on
    resolve. Find them first, then rewrite:
 
    ```sh
-   grep -rn '@mir-stream/webchannel-' --exclude-dir=node_modules --exclude-dir=dist .
+   grep -rn '@mir-stream/webchannel-' --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.git .
    ```
 
    `@mir-stream/webchannel-saas` → `openclaw-webchannel-saas`, and
@@ -574,7 +586,7 @@ force the `@mir-stream` scope through GitHub Packages; if you are already on
      echo "ERROR: package-lock.json still depends on the old package names." >&2
      exit 1
    fi
-   if grep -rn '@mir-stream/webchannel-' --exclude-dir=node_modules --exclude-dir=dist .; then
+   if grep -rn '@mir-stream/webchannel-' --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.git .; then
      echo "ERROR: source still imports the old package names (step 4)." >&2
      exit 1
    fi

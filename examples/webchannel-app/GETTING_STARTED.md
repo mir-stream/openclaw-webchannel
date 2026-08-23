@@ -76,7 +76,9 @@ which is the whole point: you consume the library exactly as an outside develope
 > **No repo access?** The example isn't published as a standalone starter package yet, so
 > today you need read access to the monorepo to get its source. (A `npm create`-style
 > scaffold would remove this step — a possible follow-up.) The two **libraries** you
-> depend on are already published; only this example *app* still lives in the repo.
+> depend on ship to public npm on their own release cadence; only this example *app*
+> still lives in the repo. (Under the new `openclaw-webchannel-*` names that release is
+> still pending — see Step 2.)
 
 ## Step 2 — Install the published library
 
@@ -92,10 +94,12 @@ If that prints `0.0.0-bootstrap.0`, the rename release has not shipped yet and t
 nothing usable to install under these names — see
 [`docs/PUBLISHING.md`](../../docs/PUBLISHING.md).
 
-> Upgrading an existing consumer? First follow the
-> [GitHub Packages migration](../../docs/PUBLISHING.md#migrating-an-existing-consumer)
-> so stale scope configuration and lockfile URLs do not keep routing installs to
-> the old registry.
+> Upgrading an existing consumer? The packages were **renamed**, so first follow the
+> [rename migration](../../docs/PUBLISHING.md#migrating-an-existing-consumer) — all five
+> steps, whichever release you are on. `npm update` cannot cross a name change, and the
+> order and pinning in step 3 are what keep a failed install from leaving you with
+> neither package. Its steps 1-2 (stale scope configuration and lockfile URLs still
+> routing installs to GitHub Packages) apply only if you consumed a pre-`0.6.1` release.
 
 ```bash
 npm pkg set dependencies.openclaw-webchannel-saas=<version>

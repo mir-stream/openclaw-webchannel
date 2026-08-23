@@ -11,9 +11,10 @@
   use. All three published packages now share the `openclaw-webchannel` prefix.
   No API, behaviour, or protocol change — only the specifier you import.
   **The old scoped name will be unpublished after this release**, so migration
-  is not optional: `npm uninstall @mir-stream/webchannel-client && npm install
-  openclaw-webchannel-client`, then rewrite your import specifiers. Full
-  procedure: [Migrating an existing consumer](../../docs/PUBLISHING.md#migrating-an-existing-consumer).
+  is not optional — and a plain `npm update` will not do it, because nothing
+  resolves an old name to a new one. Follow the pinned, ordered procedure in
+  [Migrating an existing consumer](../../docs/PUBLISHING.md#migrating-an-existing-consumer);
+  it also covers rewriting your import specifiers.
 
 ## 0.6.1
 

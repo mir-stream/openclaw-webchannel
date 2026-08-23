@@ -22,9 +22,10 @@
 
   **The old scoped names will be unpublished after this release.** Migration is
   therefore required, and a plain `npm update` will not do it — nothing resolves
-  an old name to a new one. Uninstall the old names, install the new ones, and
-  rewrite your import specifiers: see
-  [Migrating an existing consumer](docs/PUBLISHING.md#migrating-an-existing-consumer).
+  an old name to a new one. The order and the version pinning both matter, so
+  follow the procedure rather than improvising it:
+  [Migrating an existing consumer](docs/PUBLISHING.md#migrating-an-existing-consumer),
+  which also covers rewriting your import specifiers.
 
 ## 0.6.1
 
