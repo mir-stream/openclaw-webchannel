@@ -1,6 +1,6 @@
 {
   "name": "openclaw-webchannel-saas",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Headless SaaS trust chain core + reference harness for WebChannel NATS relay",
   "license": "MIT",
   "type": "module",
