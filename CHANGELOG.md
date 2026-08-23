@@ -59,12 +59,27 @@ under the 3-way version lockstep.
   visible-but-misplaced rather than risk telling the client to delete text that
   exists nowhere else.
 
-  **Known limitation, deliberate and documented.** A message that streams no
-  partials at all has no streamed text, cannot appear in `answers`, and so
-  cannot be placed by the snapshot. That is the same final-identity ceiling as
-  #111 — core exposes no per-message identity on a final — not a defect in the
-  snapshot, and it is not observed at the middle position with the pinned core.
-  It heals on reload, when durable history supplies the true order.
+  **Known limitations, deliberate and documented.** Two, not one.
+
+  *A message that streams no partials at all* has no streamed text, cannot
+  appear in `answers`, and so cannot be placed by the snapshot. That is the same
+  final-identity ceiling as #111 — core exposes no per-message identity on a
+  final — not a defect in the snapshot, and it is not observed at the middle
+  position with the pinned core. It heals on reload, when durable history
+  supplies the true order.
+
+  *A snapshot that crosses its own turn's durable-history frame* is not
+  reconciled correctly. The client matches on the bubble id it currently holds,
+  and history adoption renames those ids, so on multi-device and on reconnect —
+  where the history read is detached and either order is legal — a snapshot
+  arriving **before** adoption is overwritten by it and the authoritative
+  correction is lost for the session (**#227**), and one arriving **after**
+  adoption misses the renamed bubble and mints a duplicate instead of recovering
+  a lane (**#228**, heals on reload). Both are open and are deferred to the #114
+  delivery mirror on purpose: a fix inside the client would be more of the
+  id-guessing that #114 exists to retire. Reaching either needs a durable-history
+  read to interleave with the snapshot, which is what multi-device and reconnect
+  produce; an uninterrupted single session does not.
 
 ### Changed
 
@@ -93,10 +108,13 @@ under the 3-way version lockstep.
 
 ### Notes
 
-- The snapshot completes the delivery-render redesign tracked in **#212**; #172
-  and #173, its first two phases, shipped in `0.6.1`. The one shape #173 left
-  imperfect — three or more text messages, a tool-only last message, and a
-  middle frame dropped mid-turn — is exactly what the snapshot now corrects.
+- The snapshot is the third plugin-side phase of the delivery-render redesign
+  tracked in **#212**; #172 and #173, its first two phases, shipped in `0.6.1`.
+  The one shape #173 left imperfect — three or more text messages, a tool-only
+  last message, and a middle frame dropped mid-turn — is exactly what the
+  snapshot now corrects. **#212 itself stays open.** Its durable-identity
+  keystone (#114) has not started, and the client-side reconciliation workstream
+  still carries #104, #105, #227 and #228.
 - Internally this cycle also hardened the release pipeline (#220, #229): the
   tag-dispatch path can no longer start a second release alongside a running
   one, and a new `verify-dist-tags` job fails the release when npm's `latest`

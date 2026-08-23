@@ -74,10 +74,20 @@
   not produce a non-streaming message at the middle position. It reload-heals.
   The `remove` guard above exists precisely so this shape loses *ordering*, never
   *content*. Pinned by tests; do not add mitigation at this layer.
-- This is the third and final phase of the delivery-render redesign tracked in
+- **Known limitation, client-side.** What the plugin states authoritatively is
+  only as good as the client's reconciliation of it, and that reconciliation is
+  not yet ordered against durable history. On multi-device and on reconnect a
+  `turn_snapshot` can cross its own turn's history frame, and the snapshot is
+  then either overwritten by history adoption (**#227**) or mints a duplicate
+  bubble rather than recovering a lane (**#228**). Both are open, both are
+  client-side, and both are deferred to the #114 delivery mirror. Nothing in the
+  emission above changes to work around them.
+- This is the third plugin-side phase of the delivery-render redesign tracked in
   **#212** — #172 and #173 shipped in `0.6.1`, and the one shape #173 left
   imperfect (3+ text-bearing lanes, a tool-only last message, a middle frame
-  dropped mid-turn) is what this snapshot corrects.
+  dropped mid-turn) is what this snapshot corrects. **It does not close #212**:
+  the durable-identity keystone (#114) has not started, and the client-side
+  reconciliation workstream stays open (#104, #105, #227, #228).
 
 ## 0.6.1
 
