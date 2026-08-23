@@ -9,10 +9,11 @@
   `turn_snapshot`, carrying `{ turnId, answers: Array<{ id, text }>, remove:
   string[] }`, delivered after the turn's last answer frame and immediately
   before `turn_settled`. The client reconciles the agent **answer** bubbles of
-  the turn the snapshot names to it, and clears the typing indicator. Previously the transcript order was whatever order the frames
-  arrived in, which is why a later assistant message could sit above an earlier
-  one (#174) and why a middle answer whose frames failed left a corrupted bubble
-  plus a stray duplicate (#215).
+  the turn the snapshot names to it, and clears the typing indicator. Previously
+  the transcript order was whatever order the frames arrived in, which is why a
+  later assistant message could sit above an earlier one (#174) and why a middle
+  answer whose frames failed left a corrupted bubble plus a stray duplicate
+  (#215).
   - The reduction is explicit, never a blanket "drop anything not listed":
     `remove` ids are dropped; each `answers` entry is upserted by id — an id the
     client does not hold yet is **minted**, which is how an answer whose own
@@ -28,6 +29,20 @@
     additive in both directions. A `0.6.x` agent simply never sends it, and this
     client behaves exactly as `0.6.1` did against one. Upgrading only the client
     changes nothing on its own — the frame comes from the agent.
+  - **Known limitation: a snapshot that crosses durable history is not
+    reconciled correctly.** The upsert above matches on the bubble id the client
+    currently holds, and history adoption renames those ids. On multi-device and
+    on reconnect the history read is detached, so either order is legal: a
+    snapshot arriving **before** adoption is overwritten by it and the
+    authoritative correction is lost for the session (**#227**), and one arriving
+    **after** adoption misses the renamed bubble, so the "minted" path above adds
+    a duplicate instead of recovering a lane (**#228**, heals on reload). Both
+    are open and deferred to the #114 delivery mirror on purpose — resolving
+    them inside the client means matching on text or position, which is the
+    guessing #114 exists to retire, and which was measured to risk deleting
+    another device's answer. Reaching either needs a history read to interleave
+    with the snapshot — multi-device, or a reconnect; an uninterrupted session
+    does not.
 
 ### Changed
 
