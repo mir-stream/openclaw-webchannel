@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **BREAKING (package names): the `@mir-stream` scope is gone from both published
+  libraries.**
+
+  | Old | New |
+  |---|---|
+  | `@mir-stream/webchannel-client` | `openclaw-webchannel-client` |
+  | `@mir-stream/webchannel-saas` | `openclaw-webchannel-saas` |
+  | `openclaw-webchannel` (plugin) | *unchanged* |
+
+  The scope was never a design choice — GitHub Packages requires scope to equal
+  the repo owner. `0.6.1` moved these packages to public npm, where unscoped
+  names are first-come-first-served, so the scope became a vestige of a registry
+  they no longer use. All three artifacts now share the `openclaw-webchannel`
+  prefix. This is a rename only: no API, behaviour, or protocol change, and
+  `WEBCHANNEL_PROTOCOL_VERSION` is untouched.
+
+  **The old scoped names will be unpublished after this release.** Migration is
+  therefore required, and a plain `npm update` will not do it — nothing resolves
+  an old name to a new one. The order and the version pinning both matter, so
+  follow the procedure rather than improvising it:
+  [Migrating an existing consumer](docs/PUBLISHING.md#migrating-an-existing-consumer),
+  which also covers rewriting your import specifiers.
+
 ## 0.6.1
 
 A rendering-fidelity patch. Two long-standing delivery bugs are fixed on the

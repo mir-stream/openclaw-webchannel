@@ -1,5 +1,5 @@
 {
-  "name": "@mir-stream/webchannel-saas",
+  "name": "openclaw-webchannel-saas",
   "version": "0.6.1",
   "description": "Headless SaaS trust chain core + reference harness for WebChannel NATS relay",
   "license": "MIT",
