@@ -8,10 +8,14 @@ MIT-licensed, installable by anyone with no authentication at all:
 | `openclaw-webchannel-saas` | Headless SaaS trust-chain core (device-flow enrollment, NATS creds/JWT minting) |
 | `openclaw-webchannel-client` | Framework-agnostic, zero-dependency browser client |
 
-**Those unscoped names are not published yet.** They arrive with the next
-release, and each needs the
+**Both unscoped names exist on npm, but carry no real release yet.** Each holds
+only the hand-published, **unattested** `0.0.0-bootstrap.0` placeholder from
+step (a) of the
 [one-time bootstrap](#one-time-bootstrap-trusted-publishing-for-client--saas)
-below before CI can publish it. What is installable **today** is the previous,
+below — which npm also made their `latest`, so a bare `npm install` of either
+resolves the placeholder. The first real, provenance-carrying release under
+these names is still to come. What is installable as a **working library today**
+is the previous,
 scoped pair — `@mir-stream/webchannel-saas` and `@mir-stream/webchannel-client`
 at `0.6.1`, on public npm, `latest`, with provenance. Those scoped names are
 unpublished once the unscoped ones ship, so consumers must move; see
@@ -178,9 +182,21 @@ so a brand-new package name has a chicken-and-egg problem: OIDC cannot create
 it, and the workflow's publish step is denied by npm until the trusted publisher
 exists. (This is a known npm gap — PyPI lets you configure a trusted publisher
 for a name that does not exist yet; npm does not. See npm/cli#8544.)
-`openclaw-webchannel-client` and `openclaw-webchannel-saas` are brand-new names
-*on npmjs.org* — nothing has ever been published under either — so all four
-steps below must be done for both packages.
+`openclaw-webchannel-client` and `openclaw-webchannel-saas` were brand-new names
+*on npmjs.org*, which is why they need this at all. **Steps (a) and (b) have
+already been performed for both (2026-08-22)** — each now holds the
+`0.0.0-bootstrap.0` placeholder, and each has its Trusted Publisher attached.
+What remains before the release is **(c)**, the publishing-access lockdown, then
+**(d)**, the release itself. (a)–(c) are recorded below for re-execution and
+audit.
+
+**Only (a) is verifiable from outside the web UI.** The registry exposes
+versions, dist-tags and maintainers — it carries no trusted-publisher or
+publishing-access fields, and no npm CLI subcommand reads them either. So (b)
+and (c) cannot be re-checked from a script; the dates recorded here are the only
+audit trail, and confirming them means opening **Package → Settings** on
+npmjs.com for each name. A wrong trusted-publisher entry does not fail on save
+and surfaces only much later as a `404 on PUT` during the release.
 
 The chicken-and-egg is per package **name**, so the existing
 `openclaw-webchannel` plugin registration configures neither of them, even
@@ -193,9 +209,9 @@ different repository, so it proves only that the registry path works; it does
 not configure this repo's workflow for client or saas, and both names still
 require the bootstrap below.
 
-**Do not bootstrap at the release version.** Publishing `0.6.1` by hand would
-ship it **unattested**, and the workflow's idempotency guard would reject that
-unknown tarball and fail the real tag. The version would already be occupied, so
+**Do not bootstrap at the release version.** Publishing the release version by
+hand would ship it **unattested**, and the workflow's idempotency guard would
+reject that unknown tarball and fail the real tag. The version would already be occupied, so
 CI could not replace it with the attested build the release promises. Bootstrap
 with a throwaway `0.0.0-bootstrap.0` instead, so the **real** release is the first
 thing CI publishes and it carries provenance.
@@ -218,15 +234,18 @@ afterwards:
    npm owner ls openclaw-webchannel --registry https://registry.npmjs.org  # → mir-stream
    ```
 
-2. **Both names are still unclaimed.** A `404` here is the required
+2. **Neither name is claimed by anyone else.** A `404` is the clean
    precondition, not an error:
 
    ```sh
-   npm view openclaw-webchannel-client --registry https://registry.npmjs.org   # must be E404
-   npm view openclaw-webchannel-saas   --registry https://registry.npmjs.org   # must be E404
+   npm view openclaw-webchannel-client --registry https://registry.npmjs.org   # E404, or triage below
+   npm view openclaw-webchannel-saas   --registry https://registry.npmjs.org   # E404, or triage below
    ```
 
-   Both returned `E404` when last checked (2026-08-22). Pin the registry on these
+   Both now resolve rather than 404, because step (a) already ran for both on
+   2026-08-22: each carries exactly `["0.0.0-bootstrap.0"]`. That is the
+   *expected* post-step-(a) reading — it routes to the triage below, not to a
+   stop. Pin the registry on these
    reads: a stale `registry=` in `~/.npmrc` would 404 from the *wrong* registry
    and hand you a false "unclaimed".
 
@@ -247,8 +266,8 @@ afterwards:
    **Anything else is a stop.** A different owner means no amount of
    configuration recovers the name, and the bootstrap plus every later release
    under it are blocked until a different name is chosen. Any *other* version
-   present — `0.6.1` above all — means a hand publish went out at a release
-   version: it is unattested, step (d) below depends on that version being
+   present — the release version above all — means a hand publish went out at a
+   release version: it is unattested, step (d) below depends on that version being
    absent, and CI cannot replace it. See **Do not bootstrap at the release
    version** above.
 
@@ -338,10 +357,16 @@ it.
 **(d) Cut the release normally.** From then on every tagged release publishes
 from CI with zero credentials — `npm publish` mints short-lived tokens from the
 workflow's id-token itself. Because the placeholder is `0.0.0-bootstrap.0` and
-the release is `0.6.1`, the idempotency guard finds no match and **`0.6.1`
-publishes through OIDC with provenance**, exactly as the changelog and the
-section below claim. On a re-run, the guard skips it only after verifying that
-provenance and the published `gitHead` against the run's commit.
+the release is `<version>`, the idempotency guard finds no match and
+**`<version>` publishes through OIDC with provenance**, exactly as the changelog
+and the section below claim. On a re-run, the guard skips it only after verifying
+that provenance and the published `gitHead` against the run's commit.
+
+`<version>` must be **greater than `0.6.1`**: that version is already burned on
+the plugin (`openclaw-webchannel@0.6.1`, published with `gitHead 23bb278…`), the
+`v0.6.1` tag is pushed, and `publish.yml`'s plugin guard hard-fails a re-cut of
+that tag on the `gitHead` mismatch. Pick the actual number when the release is
+cut and read it back from the CHANGELOG / the release tag.
 
 After the release publishes, verify that `latest` moved for **both** packages:
 
@@ -432,11 +457,15 @@ release can't silently change the publish contract mid-release. Bump the pin in
 ### Migrating an existing consumer
 
 **Do this once the rename release is published — not before.** The unscoped
-names do not exist on npm yet (see the top of this guide); until that release
-ships, stay on the scoped names, which keep working. Confirm before you start:
+names already exist on npm, but so far only as the `0.0.0-bootstrap.0`
+placeholder (see the top of this guide) — so "the name resolves" is *not* the
+signal to migrate. Until the real release ships, stay on the scoped names, which
+keep working. Confirm before you start:
 
 ```sh
-npm view openclaw-webchannel-client version --registry https://registry.npmjs.org
+v=$(npm view openclaw-webchannel-client version --registry https://registry.npmjs.org) || exit 1
+case "$v" in 0.0.0-bootstrap.*) echo "STOP: only the bootstrap placeholder ($v) is published." >&2; exit 1;; esac
+echo "rename release published: $v"
 ```
 
 Once it *is* published, **every existing consumer must migrate**, whichever
@@ -480,9 +509,13 @@ force the `@mir-stream` scope through GitHub Packages; if you are already on
    library and never notice.
 
    ```sh
-   npm install --save-exact openclaw-webchannel-saas@0.6.1 openclaw-webchannel-client@0.6.1
+   npm install --save-exact openclaw-webchannel-saas@<version> openclaw-webchannel-client@<version>
    npm uninstall @mir-stream/webchannel-saas @mir-stream/webchannel-client
    ```
+
+   `<version>` is the rename release printed by the gate above — the same value
+   the CHANGELOG and the release tag carry. Do not pin `0.6.1` here: that
+   version exists only under the old scoped names, so it would `ETARGET`.
 
 4. **Rewrite every import specifier in your source.** The package name changed,
    so every `import`/`require` still naming the old package will now fail to
@@ -526,8 +559,10 @@ force the `@mir-stream` scope through GitHub Packages; if you are already on
 
 ### Installing
 
-Install them. That is the whole procedure (once the rename release is published
-— until then these names 404; see the top of this guide):
+Install them. That is the whole procedure — but wait for the rename release. A
+bare install **succeeds today** and silently gives you the unattested
+`0.0.0-bootstrap.0` placeholder, which npm also made `latest`; see the top of
+this guide:
 
 ```sh
 npm install openclaw-webchannel-saas openclaw-webchannel-client
@@ -536,7 +571,8 @@ npm install openclaw-webchannel-saas openclaw-webchannel-client
 **No `.npmrc`, no token, no registry configuration** — they are public packages
 on the default registry, so a plain `npm install` works in a laptop, a CI job, a
 Docker build, and a deploy host alike. Pin a version the usual way
-(`openclaw-webchannel-saas@0.6.1`) if you want reproducibility.
+(`openclaw-webchannel-saas@<version>`, taking `<version>` from the CHANGELOG or
+the release tag) if you want reproducibility.
 
 Releases published by CI carry an npm **provenance attestation** linking the
 tarball to the workflow run and source commit that built it. Verify it with:

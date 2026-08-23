@@ -80,8 +80,17 @@ which is the whole point: you consume the library exactly as an outside develope
 
 ## Step 2 — Install the published library
 
-Pin the two packages to a published version and install. Use the current published
-version — the commands below show `0.6.1`:
+Pin the two packages to a published version and install. Substitute `<version>` below
+with the current release under these names — read it from the repo `CHANGELOG.md` or the
+latest `v*` release tag, or ask npm directly:
+
+```bash
+npm view openclaw-webchannel-saas version --registry https://registry.npmjs.org
+```
+
+If that prints `0.0.0-bootstrap.0`, the rename release has not shipped yet and there is
+nothing usable to install under these names — see
+[`docs/PUBLISHING.md`](../../docs/PUBLISHING.md).
 
 > Upgrading an existing consumer? First follow the
 > [GitHub Packages migration](../../docs/PUBLISHING.md#migrating-an-existing-consumer)
@@ -89,8 +98,8 @@ version — the commands below show `0.6.1`:
 > the old registry.
 
 ```bash
-npm pkg set dependencies.openclaw-webchannel-saas=0.6.1
-npm pkg set dependencies.openclaw-webchannel-client=0.6.1
+npm pkg set dependencies.openclaw-webchannel-saas=<version>
+npm pkg set dependencies.openclaw-webchannel-client=<version>
 npm install
 ```
 
@@ -98,8 +107,8 @@ Verify you actually downloaded the tarballs (not a local symlink):
 
 ```bash
 node -e 'const l=require("./package-lock.json"); for (const p of ["openclaw-webchannel-saas","openclaw-webchannel-client"]) { const e=l.packages?.[`node_modules/${p}`]; if (!e?.resolved?.startsWith("https://registry.npmjs.org/")) { console.error(`${p}: expected a registry.npmjs.org tarball, found ${e?.resolved ?? "<missing>"}`); process.exitCode=1; } else console.log(`${p}: ${e.resolved}`); }'
-# → openclaw-webchannel-saas: https://registry.npmjs.org/openclaw-webchannel-saas/-/openclaw-webchannel-saas-0.6.1.tgz
-# → openclaw-webchannel-client: https://registry.npmjs.org/openclaw-webchannel-client/-/openclaw-webchannel-client-0.6.1.tgz
+# → openclaw-webchannel-saas: https://registry.npmjs.org/openclaw-webchannel-saas/-/openclaw-webchannel-saas-<version>.tgz
+# → openclaw-webchannel-client: https://registry.npmjs.org/openclaw-webchannel-client/-/openclaw-webchannel-client-<version>.tgz
 ```
 
 ## Step 3 — Point the relay at Synadia (NGS)
