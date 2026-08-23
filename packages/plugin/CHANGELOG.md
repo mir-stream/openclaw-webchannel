@@ -28,9 +28,12 @@
     dropped.
   - `remove` names only bubbles the plugin **can prove** duplicate an `answers`
     entry: an overflow final's independent bubble, and a recovery block for a
-    lane already in `answers`. It is guarded by a turn-level invariant — the
-    count of streamed answer lanes must equal the count of ordinary finals being
-    routed — so when even one text-bearing message streamed nothing, the plugin
+    lane already in `answers`. The two carry **independent** proofs — the
+    overflow bubble is guarded by a turn-level invariant (every ordinary final
+    being routed must have a streamed answer lane), the recovery block by its
+    own lane having streamed visible text. Both predicates are the one `answers`
+    itself filters on, so a marked bubble is provably represented there. Where
+    the relevant proof fails the plugin
     marks nothing and leaves the bubble visible-but-misplaced rather than tell
     the client to delete content that exists nowhere else. A notice, an error,
     or any stray independent bubble is **never** named.

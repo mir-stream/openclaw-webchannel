@@ -6,8 +6,10 @@ Two unrelated changes ship together. **The two published libraries are renamed**
 — `@mir-stream/webchannel-client` and `@mir-stream/webchannel-saas` lose the
 scope, and the old names are unpublished after this release, so migration is
 required and is not automatic. Separately, **the agent becomes the authoritative
-source of the order of a turn's answers**, which closes the last two rendering
-defects of the delivery-render redesign (#212). The wire change is additive and
+source of the order of a turn's answers**, which closes #174 outright and
+dissolves the multi-answer half of #215 — the delivery-render redesign (#212)
+keeps its single-answer Case X open on purpose, see the known limitation below.
+The wire change is additive and
 `WEBCHANNEL_PROTOCOL_VERSION` stays `3`, so the protocol imposes no lockstep —
 but the fix has a half on each side of the wire, so seeing it needs the `0.7.0`
 plugin *and* the `0.7.0` client. All three packages move to `0.7.0` together
@@ -24,8 +26,10 @@ under the 3-way version lockstep.
   `turn_settled`. `answers` is the turn's agent answer bubbles in the plugin's
   own generation order; `remove` names bubbles carrying answer content that
   `answers` already represents. The client applies it as a **pure view**: drop
-  the `remove` ids, upsert each `answers` entry by id, and reorder answer
-  bubbles among the slots answer bubbles already occupy.
+  the `remove` ids, upsert each `answers` entry by id, reorder answer bubbles
+  among the slots answer bubbles already occupy, and clear the typing indicator.
+  Every other row — your own messages and their send state, notices, reasoning,
+  tool activity, adopted history — is left untouched, as the same object.
 
   Two visible defects follow from it:
   - **A later assistant message could render above an earlier one (#174).** The
@@ -48,8 +52,10 @@ under the 3-way version lockstep.
 
   **Nothing is deleted speculatively.** `remove` carries only ids the plugin can
   prove duplicate an `answers` entry — never a notice, an error, or a bubble
-  whose content is unique. If even one message in the turn streamed no partials,
-  that proof does not hold, so the plugin names nothing and leaves the bubble
+  whose content is unique. The two cases carry their own separate proofs: an
+  overflow final's bubble is named only when every final in the turn has a
+  streamed lane, and a recovery block only when its own lane streamed text.
+  Where neither proof holds the plugin names nothing and leaves the bubble
   visible-but-misplaced rather than risk telling the client to delete text that
   exists nowhere else.
 
