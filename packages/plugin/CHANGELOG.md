@@ -41,8 +41,8 @@
     emitted (the open VERIFY-1 edge), which the live view then loses and a
     reload restores. Where the relevant proof fails the plugin marks nothing
     and leaves the bubble visible-but-misplaced rather than tell the client to
-    delete content that exists nowhere else. A notice, an error,
-    or any stray independent bubble is **never** named.
+    delete content that exists nowhere else. A notice, an error, or any stray
+    independent bubble is **never** named.
   - Emission is best-effort by design. A transport without `sendTurnSnapshot`
     is skipped, a throw is caught and warned, and either way the drain and
     `turn_settled` proceed — the turn degrades to the pre-#212 arrival-order
