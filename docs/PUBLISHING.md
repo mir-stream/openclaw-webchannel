@@ -143,8 +143,10 @@ npm dist-tag add <name>@<version> latest \
 ```
 
 That form is correct for every **unscoped** name — `openclaw-webchannel`, and
-`openclaw-webchannel-client` / `openclaw-webchannel-saas` once they are
-published.
+`openclaw-webchannel-client` / `openclaw-webchannel-saas` once they carry a real
+release. Today those two have a `latest`, but it points at the bootstrap
+placeholder — there is no release for it to have split away from, so there is
+nothing here to repair yet.
 
 **If the name is scoped** (`@scope/...`), that command silently targets the
 wrong registry, because a plain `--registry` does **not** override an
@@ -294,13 +296,12 @@ npm login --registry https://registry.npmjs.org   # if not already authenticated
 npm version 0.0.0-bootstrap.0 --no-git-tag-version -w packages/client
 npm version 0.0.0-bootstrap.0 --no-git-tag-version -w packages/saas
 
-# ASSERT the clone carries the renamed manifests. If either prints an
-# @mir-stream/… name, STOP — the ref is wrong and you would claim nothing.
-node -p "require('./packages/client/package.json').name"   # → openclaw-webchannel-client
-node -p "require('./packages/saas/package.json').name"     # → openclaw-webchannel-saas
-
-npm publish -w packages/client --access public --tag bootstrap --registry https://registry.npmjs.org
-npm publish -w packages/saas   --access public --tag bootstrap --registry https://registry.npmjs.org
+# ASSERT the clone carries the renamed manifests, then publish. The assert exits
+# non-zero on an @mir-stream/… name and the `&&` stops the publishes, so a wrong
+# ref cannot silently claim nothing. Do not split these lines apart.
+node -e 'for (const [w,n] of [["client","openclaw-webchannel-client"],["saas","openclaw-webchannel-saas"]]) { const a=require(`./packages/${w}/package.json`).name; if (a!==n) { console.error(`STOP: packages/${w} is named ${a}, expected ${n} — wrong ref.`); process.exit(1); } console.log(a); }' \
+  && npm publish -w packages/client --access public --tag bootstrap --registry https://registry.npmjs.org \
+  && npm publish -w packages/saas   --access public --tag bootstrap --registry https://registry.npmjs.org
 
 cd / && rm -rf /tmp/wc-bootstrap   # the clone has served its purpose
 ```
@@ -460,12 +461,17 @@ release can't silently change the publish contract mid-release. Bump the pin in
 names already exist on npm, but so far only as the `0.0.0-bootstrap.0`
 placeholder (see the top of this guide) — so "the name resolves" is *not* the
 signal to migrate. Until the real release ships, stay on the scoped names, which
-keep working. Confirm before you start:
+keep working. Confirm **both** names before you start — a release can stop
+partway with one name on the new version and the other still on the placeholder
+(see [Recovering a split `latest`](#recovering-a-split-latest)), which is exactly
+the state that makes step 3 `ETARGET`:
 
 ```sh
-v=$(npm view openclaw-webchannel-client version --registry https://registry.npmjs.org) || exit 1
-case "$v" in 0.0.0-bootstrap.*) echo "STOP: only the bootstrap placeholder ($v) is published." >&2; exit 1;; esac
-echo "rename release published: $v"
+for p in openclaw-webchannel-client openclaw-webchannel-saas; do
+  v=$(npm view "$p" version --registry https://registry.npmjs.org) || exit 1
+  case "$v" in 0.0.0-bootstrap.*) echo "STOP: $p is still the bootstrap placeholder ($v)." >&2; exit 1;; esac
+  echo "$p: $v"
+done
 ```
 
 Once it *is* published, **every existing consumer must migrate**, whichever
@@ -474,11 +480,20 @@ release you are on: the packages were renamed, and the old
 change, so a plain `npm update` will not do it — nothing resolves the old name to
 the new one.
 
-(Operator note: npm's unconditional unpublish window is 72h from publish, and
-`0.6.1` was published 2026-08-22T01:38:56Z / 01:39:10Z — so it closes about
-**2026-08-25T01:39Z**. After that, unpublishing becomes conditional and the
-fallback is `npm deprecate`, which leaves the old names installable but warns on
-install.)
+(Operator note: npm's unconditional unpublish window is 72h, but it runs off
+**two different clocks** and erasing the old names is governed by the earlier
+one. A *version-only* unpublish is gated 72h from that version's publish —
+`@mir-stream/webchannel-{client,saas}@0.6.1` went out 2026-08-22T03:17:03Z /
+03:17:10Z, so that clock runs to about 2026-08-25T03:17Z. Removing the **whole
+package** is gated 72h from the package's *first* publish, which for both scoped
+names is the `0.0.0-bootstrap.0` placeholder that created them —
+2026-08-22T01:38:56Z / 01:39:10Z, closing about **2026-08-25T01:39Z**. That
+whole-package clock is the binding one, 98 minutes earlier than the version-only
+one: unpublishing just `0.6.1` would leave `0.0.0-bootstrap.0` behind, so the
+scoped names would still exist and still surface in npm search — the exact thing
+the rename is meant to end. Do not re-derive this deadline from `0.6.1` alone.
+After the window, unpublishing becomes conditional and the fallback is
+`npm deprecate`, which leaves the old names installable but warns on install.)
 
 Steps 1 and 2 apply only if you consumed a **pre-0.6.1** release and may still
 force the `@mir-stream` scope through GitHub Packages; if you are already on
@@ -509,9 +524,14 @@ force the `@mir-stream` scope through GitHub Packages; if you are already on
    library and never notice.
 
    ```sh
-   npm install --save-exact openclaw-webchannel-saas@<version> openclaw-webchannel-client@<version>
-   npm uninstall @mir-stream/webchannel-saas @mir-stream/webchannel-client
+   npm install --save-exact openclaw-webchannel-saas@<version> openclaw-webchannel-client@<version> \
+     && npm uninstall @mir-stream/webchannel-saas @mir-stream/webchannel-client
    ```
+
+   The `&&` is what makes the ordering an actual guarantee. `npm install a@X
+   b@Y` aborts the whole ideal-tree build on a single `ETARGET`, so *neither*
+   new package lands; pasted as two plain lines, the `npm uninstall` would still
+   run and strip the working old packages, leaving you with neither.
 
    `<version>` is the rename release printed by the gate above — the same value
    the CHANGELOG and the release tag carry. Do not pin `0.6.1` here: that
@@ -532,9 +552,12 @@ force the `@mir-stream` scope through GitHub Packages; if you are already on
    aliases, and browser import maps — which is why the search above is not
    restricted by file extension.
 
-5. **Verify the migration is complete.** This fails on any of the three ways it
+5. **Verify the migration is complete.** This fails on any of the four ways it
    can be left half-done — a leftover GitHub Packages URL, a residual old-name
-   dependency, or a source file still importing the old name (step 4 skipped).
+   dependency, a source file still importing the old name (step 4 skipped), or
+   the new packages not actually installed. That last check is the one that
+   catches a step-3 `ETARGET`: every other check here is negative, so all of
+   them pass on a project with no WebChannel library installed at all.
    The lockfile checks are **npm-specific**; on yarn or pnpm keep the source
    check and apply the equivalent inspection to your own lockfile.
 
@@ -555,6 +578,7 @@ force the `@mir-stream` scope through GitHub Packages; if you are already on
      echo "ERROR: source still imports the old package names (step 4)." >&2
      exit 1
    fi
+   node -e 'const l=require("./package-lock.json"); for (const p of ["openclaw-webchannel-saas","openclaw-webchannel-client"]) { const e=l.packages?.[`node_modules/${p}`]; if (!e?.resolved?.startsWith("https://registry.npmjs.org/")) { console.error(`ERROR: ${p}: expected a registry.npmjs.org tarball, found ${e?.resolved ?? "<not installed — step 3 failed>"}`); process.exitCode=1; } else console.log(`${p}: ${e.resolved}`); }'
    ```
 
 ### Installing
