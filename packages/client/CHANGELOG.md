@@ -31,18 +31,19 @@
     changes nothing on its own — the frame comes from the agent.
   - **Known limitation: a snapshot that crosses durable history is not
     reconciled correctly.** The upsert above matches on the bubble id the client
-    currently holds, and history adoption renames those ids. On multi-device and
-    on reconnect the history read is detached, so either order is legal: a
-    snapshot arriving **before** adoption is overwritten by it and the
-    authoritative correction is lost for the session (**#227**), and one arriving
-    **after** adoption misses the renamed bubble, so the "minted" path above adds
-    a duplicate instead of recovering a lane (**#228**, heals on reload). Both
+    currently holds, and history adoption renames those ids. That read is
+    detached, so either order is legal: a snapshot arriving **before** adoption
+    is overwritten by it and the authoritative correction is lost for the
+    session (**#227**), and one arriving **after** adoption misses the renamed
+    bubble, so the "minted" path above adds a duplicate instead of recovering a
+    lane (**#228**, heals on reload). Both
     are open and deferred to the #114 delivery mirror on purpose — resolving
     them inside the client means matching on text or position, which is the
-    guessing #114 exists to retire, and which was measured to risk deleting
-    another device's answer. Reaching either needs a history read to interleave
-    with the snapshot — multi-device, or a reconnect; an uninterrupted session
-    does not.
+    guessing #114 exists to retire, and which adversarial review found could
+    delete another device's answer outright. Reaching either needs a
+    durable-history read for the turn to interleave with the snapshot — a second
+    device, a reconnect, and a cursor-less `loadHistory()` refresh around a live
+    turn all produce that.
 
 ### Changed
 

@@ -7,13 +7,13 @@ Two unrelated changes ship together. **The two published libraries are renamed**
 scope, and the old names are unpublished after this release, so migration is
 required and is not automatic. Separately, **the agent becomes the authoritative
 source of the order of a turn's answers**, which closes #174 outright and
-dissolves the multi-answer half of #215 — the delivery-render redesign (#212)
-keeps its single-answer Case X open on purpose, see the known limitation below.
-The wire change is additive and
-`WEBCHANNEL_PROTOCOL_VERSION` stays `3`, so the protocol imposes no lockstep —
-but the fix has a half on each side of the wire, so seeing it needs the `0.7.0`
-plugin *and* the `0.7.0` client. All three packages move to `0.7.0` together
-under the 3-way version lockstep.
+dissolves the multi-answer half of #215. The delivery-render redesign (#212)
+keeps its single-answer Case X open on purpose, and #212 itself stays open for
+its durable-identity keystone; see the two known limitations below. The wire
+change is additive and `WEBCHANNEL_PROTOCOL_VERSION` stays `3`, so the protocol
+imposes no lockstep — but the fix has a half on each side of the wire, so seeing
+it needs the `0.7.0` plugin *and* the `0.7.0` client. All three packages move to
+`0.7.0` together under the 3-way version lockstep.
 
 ### Added
 
@@ -41,8 +41,9 @@ under the 3-way version lockstep.
     mis-routed final cannot corrupt it; where the routing is provably correct
     the lane's full final text is used instead, so nothing a final added beyond
     the last partial is lost. An `answers` entry with an id the browser has
-    never seen **recovers** a lane whose frames never arrived, and the
-    duplicate extra bubble is named in `remove`.
+    never seen **recovers** a lane whose frames never arrived, and the duplicate
+    extra bubble is named in `remove` — except across a durable-history read,
+    where that same mint duplicates instead (second known limitation below).
 
   **It is additive and safely ignorable.** `WEBCHANNEL_PROTOCOL_VERSION` stays
   `3`, no existing frame or field changed, and a `0.6.x` client that has never
@@ -70,16 +71,16 @@ under the 3-way version lockstep.
 
   *A snapshot that crosses its own turn's durable-history frame* is not
   reconciled correctly. The client matches on the bubble id it currently holds,
-  and history adoption renames those ids, so on multi-device and on reconnect —
-  where the history read is detached and either order is legal — a snapshot
-  arriving **before** adoption is overwritten by it and the authoritative
-  correction is lost for the session (**#227**), and one arriving **after**
-  adoption misses the renamed bubble and mints a duplicate instead of recovering
-  a lane (**#228**, heals on reload). Both are open and are deferred to the #114
-  delivery mirror on purpose: a fix inside the client would be more of the
-  id-guessing that #114 exists to retire. Reaching either needs a durable-history
-  read to interleave with the snapshot, which is what multi-device and reconnect
-  produce; an uninterrupted single session does not.
+  and history adoption renames those ids. That read is detached, so either order
+  is legal: a snapshot arriving **before** adoption is overwritten by it and the
+  authoritative correction is lost for the session (**#227**), and one arriving
+  **after** adoption misses the renamed bubble and mints a duplicate instead of
+  recovering a lane (**#228**, heals on reload). Both are open and are deferred
+  to the #114 delivery mirror on purpose: a fix inside the client would be more
+  of the id-guessing that #114 exists to retire. Reaching either needs a
+  durable-history read for the turn to interleave with the snapshot — a second
+  device, a reconnect, and a cursor-less `loadHistory()` refresh around a live
+  turn all produce that.
 
 ### Changed
 
@@ -113,7 +114,7 @@ under the 3-way version lockstep.
   The one shape #173 left imperfect — three or more text messages, a tool-only
   last message, and a middle frame dropped mid-turn — is exactly what the
   snapshot now corrects. **#212 itself stays open.** Its durable-identity
-  keystone (#114) has not started, and the client-side reconciliation workstream
+  keystone (#114) has not landed, and the client-side reconciliation workstream
   still carries #104, #105, #227 and #228.
 - Internally this cycle also hardened the release pipeline (#220, #229): the
   tag-dispatch path can no longer start a second release alongside a running
