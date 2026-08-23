@@ -158,17 +158,9 @@ npm dist-tag add @scope/<package>@<version> latest \
   --@scope:registry=https://registry.npmjs.org/
 ```
 
-**This still applies to the scoped names today.**
-`@mir-stream/webchannel-{client,saas}@0.6.1` are live and `latest` on npm until
-the rename release unpublishes them, so they remain what this runbook repairs:
-
-```sh
-npm dist-tag add @mir-stream/webchannel-client@0.6.1 latest \
-  --@mir-stream:registry=https://registry.npmjs.org/
-```
-
-That `@scope:registry`-beats-`--registry` precedence is live npm behavior worth
-remembering, and it stops applying to this repo only once the old names are gone.
+No name this workflow publishes is scoped any more, so the scoped form above is
+kept only as the general rule — `publish.yml` prints the exact name to use, and
+it reads that name from the manifests.
 
 Before changing any tag, confirm the intended version is newer; never move
 `latest` backward.
@@ -310,7 +302,7 @@ There is deliberately no build step: both manifests declare `"prepack": "npm run
 build"`, so `npm publish` rebuilds `dist/` itself. An explicit build line would
 be one more thing to forget, and forgetting it would ship a stale tarball.
 
-One flag carries the weight here:
+Of the two flags, only one still carries weight:
 
 - **`--access public`** — a no-op for these names, kept for clarity. Unscoped
   packages are always public; the restricted default that this flag exists to
@@ -384,17 +376,10 @@ names, so a `v*` tag has everything it needs; the outstanding step (c) is regist
 policy and gates nothing in CI — as noted above, publishing access cannot break
 the OIDC release path. A **plugin-only hotfix needs no further npm web-UI work.**
 
-What is *not* proven yet is that step (b) was entered correctly. Nothing outside
-the npm web UI can read a trusted-publisher entry back, and a typo in one does not
-fail on save — it surfaces as a `404 on PUT` the first time the `publish` job runs.
-The next release is therefore what verifies (b); if it 404s, re-check both entries
-character by character before suspecting anything else.
-
-Keep the mechanism in mind, because it is what made (a) and (b) urgent: while
-either was missing, every `v*` tag failed at the `publish` job, and both plugin
-legs `needs: publish`, so they were skipped — meaning even a plugin-only hotfix
-could not ship until client and saas were squared away on the registry. That is
-the state to expect again if a future rename introduces another new name.
+What is not proven is that (b) was entered *correctly*: as noted above, no script
+can read a trusted-publisher entry back, so the next release is what verifies it.
+A `404 on PUT` at the `publish` job means re-check both entries character by
+character before suspecting anything else.
 
 ## Plugin publishing (ClawHub)
 
