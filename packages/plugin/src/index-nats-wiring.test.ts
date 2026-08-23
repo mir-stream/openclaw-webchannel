@@ -397,3 +397,71 @@ describe("nats-account-runtime.ts wiring contract — #99 inbound frame normaliz
     expect(RUNTIME_SOURCE).not.toMatch(/new InboundRetentionBudget\((?!\))/);
   });
 });
+
+describe("nats-account-runtime.ts wiring contract — #238 identity at the delivery act", () => {
+  /**
+   * The command-gate warning notice is the runtime's ONE durable-text egress
+   * site: a real `agent_message` bubble on the client. Since #238 the plugin —
+   * never the viewer — names every such bubble, so this `sendText` must pass a
+   * `nextMessageId()` as its third argument. An id-less send here hands the
+   * client an unnamed durable bubble and it falls back to minting `a-N` from a
+   * client-local counter (NOT-list N4/N5).
+   *
+   * Why a SOURCE guard: this call sits inside the message handler closed over
+   * by the module-private `buildNatsAccount`, which the same file already
+   * documents as "untestable routing" (see the #99 block above). The mint
+   * itself (`nextMessageId`) and the frame assembly (`NatsChannel.sendText`)
+   * are covered executably by message-adapter/nats-channel tests; this pins the
+   * wiring that joins them.
+   */
+  // Located by its semantic guard and SLICED, exactly like the #99 block above
+  // — not pinned as an exact multi-line literal. An exact literal is
+  // indentation- and line-break-sensitive: a semantically identical reformat
+  // (hoisting the text into a `const noticeText`, collapsing the call onto one
+  // line) turned the first version of this test red and dumped the whole
+  // ~1560-line file as an expected/received diff. A misleading red on a correct
+  // change is worse than no test.
+  //
+  // Slicing FIRST is load-bearing, not tidiness: the mint regex alone is
+  // satisfied by ANY `channel.sendText(peerId, …, nextMessageId())` in the file,
+  // so once a legitimate second egress site exists here, a notice that LOST its
+  // id would still go green on that other site's behalf. Bounding the search to
+  // this `if` block keeps the assertion about the notice.
+  const GATE_GUARD = "if (commandGate.delegated && !commandGate.isListed(peerId)) {";
+  const GATE_START = RUNTIME_SOURCE.indexOf(GATE_GUARD);
+  // Both bounds must FAIL CLOSED. A `-1` from either `indexOf` fed straight into
+  // `slice` is the vacuity this slicing exists to prevent, inverted: a missing
+  // `return;` would make the end bound `-1`, i.e. "the rest of the file minus one
+  // character", handing the mint regex back the whole-file scope it must not have.
+  const GATE_END = RUNTIME_SOURCE.indexOf("return;", GATE_START);
+  const NOTICE_BLOCK =
+    GATE_START < 0 || GATE_END < 0 ? "" : RUNTIME_SOURCE.slice(GATE_START, GATE_END);
+  // `[^;]` bounds the match to a SINGLE statement, so a later `nextMessageId()`
+  // can never be borrowed across the end of the notice send.
+  const MINTS_THIRD_ARG = /channel\.sendText\(\s*peerId,[^;]*?nextMessageId\(\)\s*,?\s*\)/;
+
+  it("mints the notice's id at the delivery act", () => {
+    // Guard first: a missing gate makes the slice empty, which would let the
+    // assertions below pass vacuously.
+    expect(GATE_START).toBeGreaterThan(-1);
+    expect(NOTICE_BLOCK).toContain("commands to an operator allowlist.");
+    expect(NOTICE_BLOCK).toMatch(MINTS_THIRD_ARG);
+  });
+
+  it("mints it through the ONE canonical minter, imported from the adapter", () => {
+    expect(RUNTIME_SOURCE).toContain('import { nextMessageId } from "./message-adapter.js";');
+    // The one-shape invariant. NOT a count of `nextMessageId()` calls: a second
+    // call is the SAME shape and is exactly what a legitimate future second
+    // egress site in this file would have to write. What must never appear is a
+    // SECOND id shape — an inline `webchannel-${…}` template minted here instead
+    // of through the adapter.
+    expect(RUNTIME_SOURCE).not.toMatch(/`webchannel-\$\{/);
+  });
+
+  it("keeps the notice best-effort: the boolean return stays ignored", () => {
+    // The notice is a hedge for a gate that is deliberately a conservative
+    // mirror; a failed send must not become a thrown or logged error here.
+    expect(RUNTIME_SOURCE).not.toContain("if (!channel.sendText(");
+    expect(RUNTIME_SOURCE).not.toMatch(/=\s*channel\.sendText\(/);
+  });
+});

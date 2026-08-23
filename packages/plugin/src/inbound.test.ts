@@ -205,7 +205,18 @@ function makeFakeTransport(options?: {
 }): {
   transport: WebChannelPeerChannel;
   finalizes: Array<{ id: string; text: string; assistantMessageIndex?: number }>;
-  texts: Array<{ text: string; assistantMessageIndex?: number }>;
+  /**
+   * The plain `agent_message` frames, in emission order. #238: `id`/`turnId`
+   * are recorded exactly the way `NatsChannel.sendText` puts them on the wire
+   * (present only when supplied), so a test can assert either presence or
+   * absence of the plugin-minted id.
+   */
+  texts: Array<{
+    text: string;
+    id?: string;
+    turnId?: string;
+    assistantMessageIndex?: number;
+  }>;
   progress: Array<{ id: string; text: string }>;
   /** #97: the structured tool-activity frames, in emission order. */
   toolActivities: Array<{
@@ -234,7 +245,12 @@ function makeFakeTransport(options?: {
     text: string;
     assistantMessageIndex?: number;
   }> = [];
-  const texts: Array<{ text: string; assistantMessageIndex?: number }> = [];
+  const texts: Array<{
+    text: string;
+    id?: string;
+    turnId?: string;
+    assistantMessageIndex?: number;
+  }> = [];
   const progress: Array<{ id: string; text: string }> = [];
   const typing: string[] = [];
   const settles: Array<"ok" | "error"> = [];
@@ -262,12 +278,16 @@ function makeFakeTransport(options?: {
     sendText: (
       _sessionKey: string,
       text: string,
-      _id?: string,
-      _turnId?: string,
+      id?: string,
+      turnId?: string,
       assistantMessageIndex?: number,
     ) => {
+      // Mirror `NatsChannel.sendText`'s payload assembly exactly: an absent or
+      // empty id/turnId never reaches the wire as a key.
       texts.push({
         text,
+        ...(id ? { id } : {}),
+        ...(turnId ? { turnId } : {}),
         ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
       });
       return true;
@@ -1682,6 +1702,11 @@ describe("handleInboundMessage — #111 live block ordinal", () => {
 
         const frames = streamingMode === "partial" ? finalizes : texts;
         expect(frames).toHaveLength(1);
+        // #238: the ordinal now rides ALONGSIDE a plugin-minted id on both
+        // paths — the draft finalize (already true before this slice) and the
+        // no-draft plain send (new). The ordinal itself is untouched: the
+        // assertions below are the pre-#238 ones, verbatim.
+        expect(frames[0]!.id).toEqual(expect.stringMatching(/\S/));
         if (testCase.expected === undefined) {
           expect(frames[0]).not.toHaveProperty("assistantMessageIndex");
         } else {
@@ -1732,6 +1757,109 @@ describe("handleInboundMessage — #111 live block ordinal", () => {
         expect(frames[0]).not.toHaveProperty("assistantMessageIndex");
       }
     }
+  });
+});
+
+/**
+ * #238 — the plugin mints message identity AT the delivery act.
+ *
+ * Governing principle: our plugin is the Telegram plugin AND the Telegram
+ * server, our client is the Telegram app. The platform names the message when
+ * it delivers it; the viewer never does. These two sites used to send id-less
+ * `agent_message` frames, which forced the client to invent `a-N` from a
+ * client-local counter — a viewer-minted durable id, NOT-list N4/N5.
+ */
+describe("handleInboundMessage — #238 identity at the delivery act", () => {
+  it("site 1: every no-draft reply carries a fresh plugin-minted id", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "first block" }, { kind: "block" });
+        await turn.delivery.deliver({ text: "second block" }, { kind: "block" });
+      },
+    });
+    const { transport, texts } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "answer twice",
+      id: "turn-two-sends",
+    });
+
+    // Behavior preservation: same two bubbles, same order, same text, same
+    // turnId as before the id was added.
+    expect(texts.map((frame) => frame.text)).toEqual([
+      "first block",
+      "second block",
+    ]);
+    expect(texts.map((frame) => frame.turnId)).toEqual([
+      "turn-two-sends",
+      "turn-two-sends",
+    ]);
+    // The only wire difference: each frame now carries a non-empty id...
+    for (const frame of texts) {
+      expect(typeof frame.id).toBe("string");
+      expect(frame.id).not.toBe("");
+    }
+    // ...and the no-draft path is one-new-bubble-per-send, so an id is NEVER
+    // reused across delivery acts (reuse would make the client top up the
+    // first bubble instead of appending a second).
+    expect(texts[0]!.id).not.toBe(texts[1]!.id);
+  });
+
+  it("site 1: an ordinal-bearing no-draft reply keeps the ordinal alongside the id", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver(
+          { text: "ordinal block" },
+          { kind: "block", assistantMessageIndex: 3 },
+        );
+      },
+    });
+    const { transport, texts } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "answer with an ordinal",
+      id: "turn-ordinal",
+    });
+
+    expect(texts).toHaveLength(1);
+    expect(texts[0]!.text).toBe("ordinal block");
+    expect(texts[0]!.turnId).toBe("turn-ordinal");
+    // #238 adds identity WITHOUT disturbing the ordinal — the two coexist on
+    // one frame. (Retiring the ordinal is a later slice, deliberately not
+    // this one.)
+    expect(texts[0]!.assistantMessageIndex).toBe(3);
+    expect(typeof texts[0]!.id).toBe("string");
+    expect(texts[0]!.id).not.toBe("");
+  });
+
+  it("site 2: the thrown-turn apology carries a plugin-minted id", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async () => {
+        throw new Error("provider exploded");
+      },
+    });
+    const { transport, texts } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "this turn throws",
+      id: "turn-apology",
+    });
+
+    // Behavior preservation: still exactly one apology bubble, same text, same
+    // turnId — only the id is new.
+    expect(texts).toHaveLength(1);
+    expect(texts[0]!.text).toBe(
+      "Sorry — something went wrong while answering. Please try again.",
+    );
+    expect(texts[0]!.turnId).toBe("turn-apology");
+    expect(typeof texts[0]!.id).toBe("string");
+    expect(texts[0]!.id).not.toBe("");
   });
 });
 

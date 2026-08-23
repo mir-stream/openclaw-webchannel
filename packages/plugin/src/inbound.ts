@@ -48,6 +48,7 @@ import {
   resolveStreamingMode,
   createProgressDraftController,
   createReasoningDraftController,
+  nextMessageId,
 } from "./message-adapter.js";
 import type {
   ProgressDraftController,
@@ -982,8 +983,10 @@ export async function handleInboundMessage(
   //    the answer text replaces the scaffold in the same draft.
   //  - "progress": tool-lines-only. Draft is created but `onPartialReply` is
   //    NOT wired — answer text never streams (the deliberate mode distinction).
-  //  - "block"/"off": NO draft. Falls through to the plain no-id `agent_message`
-  //    atomic append (see delivery.deliver below); `replyOptions` is omitted.
+  //  - "block"/"off": NO draft. Falls through to the plain `agent_message`
+  //    atomic append (see delivery.deliver below), which since #238 carries a
+  //    plugin-minted id like every other durable-text egress; `replyOptions` is
+  //    omitted.
   // 가-1 Cycle 2: read the PER-ACCOUNT resolved config (channel-level shared
   // base merged under this account's override), not the flat block, so each
   // account's streaming/dmSecurity/allowFrom apply to its own turns. For the
@@ -1544,13 +1547,34 @@ export async function handleInboundMessage(
                   if (sent) finalReplyDelivered = true;
                   return { visibleReplySent: sent };
                 }
+                // #238: the plugin owns identity and mints it AT the delivery
+                // act.
+                //
+                // ⚠️ This is the fall-through for a delivery NO DRAFT CLAIMED —
+                // NOT "the no-draft path". The two guards above claim only
+                // `draft && kind === "block"` and `draft && kind === "final"`,
+                // and `ReplyDispatchKind` is `"tool" | "block" | "final"`, so we
+                // arrive here either with no draft at all OR with a LIVE draft
+                // that does not handle this `kind`: under
+                // `streaming.mode: "progress"` a `kind: "tool"` delivery reaches
+                // this send with a non-null draft. Do not read this branch as
+                // "no draft can exist here" and conclude there is no lane state
+                // nearby — there may be one; this send simply is not part of it.
+                //
+                // Each such send is its own new bubble, so mint a fresh id per
+                // call and never reuse one across calls. Before this the frame
+                // went out id-less and the client invented `a-N` from a
+                // client-local counter, which is exactly the viewer-minted
+                // durable id the NOT-list forbids (N4/N5). Behavior is otherwise
+                // unchanged: same text, same order, same `turnId`, same ordinal.
+                const messageId = nextMessageId();
                 const sent =
                   assistantMessageIndex === undefined
-                    ? transport.sendText(wsKey, text, undefined, turnId)
+                    ? transport.sendText(wsKey, text, messageId, turnId)
                     : transport.sendText(
                         wsKey,
                         text,
-                        undefined,
+                        messageId,
                         turnId,
                         assistantMessageIndex,
                       );
@@ -1596,10 +1620,12 @@ export async function handleInboundMessage(
         );
       }
     } else if (!controlLane && !finalReplyDelivered) {
+      // #238: mint at the delivery act here too — the apology is a real durable
+      // bubble on the client, so the plugin (not the viewer) names it.
       const sent = transport.sendText(
         wsKey,
         "Sorry — something went wrong while answering. Please try again.",
-        undefined,
+        nextMessageId(),
         turnId,
       );
       if (!sent) {

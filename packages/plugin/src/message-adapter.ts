@@ -25,8 +25,27 @@ import type { WebChannelPeerChannel } from "./channel-contract.js";
  * the receipt's primary platform id (the editable handle core would use) AND the
  * WS frame id the widget keys its bubble on, so a progress draft and its final
  * answer share one id.
+ *
+ * #238: this is now THE mint point for every delivery act on this channel, not
+ * just this adapter's. The plugin owns message identity and assigns it at the
+ * moment it delivers — exactly like core's built-in Telegram extension keeps the
+ * `message_id` the platform hands back at first send. We ARE the platform here,
+ * so we mint locally.
+ *
+ * THE INVARIANT: one mint point, one id shape, and every durable-text egress
+ * site calls it — this adapter's `send.text`, inbound.ts's unclaimed-delivery
+ * reply and thrown-turn apology, channel.ts's core-initiated outbound seam, and
+ * nats-account-runtime.ts's command-gate notice. No other id shape may be
+ * introduced, and the client must never mint one for a durable bubble (NOT-list
+ * N4/N5).
+ *
+ * The receipt half is SEPARATE and narrower: only two of those five report an id
+ * to core at all (this adapter and channel.ts's outbound seam — the other three
+ * return neither a `messageId` nor a receipt). Where a site does report one, it
+ * reports this same id, so core's receipt and the client's bubble never end up
+ * as two names for one message.
  */
-function nextMessageId(): string {
+export function nextMessageId(): string {
   return `webchannel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
