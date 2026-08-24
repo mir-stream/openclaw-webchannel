@@ -54,7 +54,7 @@
 | **N8** | "live와 history는 (의도적으로) 다를 수 있다" | 우리가 스트림 전체를 소유 → 차이는 전부 **버그**. live==history는 **절대**(공유 reducer로 양쪽 보장, §15.9) | 상태/tool 버블 렌더 차이를 "gap"으로 합리화 |
 | **N9** | partial-first/모드 의존 저널, legacy fallback·epoch 마커 유지 | SSOT는 모드 의존 불가. **파괴적 컷오버 승인**("아직 아무도 안 씀") → 저널이 첫날부터 유일 store, cutover/epoch/legacy 기계 **전부 삭제**(§15.6) | "안전한 전환기"가 신중해 보임 (실은 원칙 후퇴) |
 | **N10** | 못 붙는 final → degrade/skip, 안 그림 | **현재-draft 우선 마감 → 안 되면 새 메시지(또는 애매하면 preview 유지)**, degrade 아님(§16.1, 정밀판 §16.5). ("skip-degrade, never guess"는 옛 §0.1의 오판 잔재) | 옛 "core ceiling→degrade" 어법이 압축 후 되살아남 |
-| **N10b** ⭐ | **"final은 정체성이 없다/식별 불가"** 를 한 덩어리로 말하기 | **세 가지가 뭉친 말이고, 셋 다 core 한계가 아니다(§16.5.3 표).** ① durable id → **우리가 민팅**(슬라이스 2에서 이미 완료) ② live 라우팅 → core가 포인터 대신 **순서 있는 배열**을 준다(`[core] dispatch-from-config.ts:3886,3941`), Telegram은 그 순서를 커서로 소비 ③ 소급 귀속 → Telegram도 못 하고 **필요도 없다**. ⇒ 정확히는 **"포인터가 없을 뿐 순서는 있다."** 우리 결함은 못 받은 정보가 아니라 **`materializedAnswerLanes()`로 스스로 버린 순서** | "id가 없다"는 관찰이 "대응을 알 수 없다"로 자동 확장됨 |
+| **N10b** ⭐ | **"final은 정체성이 없다/식별 불가"** 를 한 덩어리로 말하기 | **세 가지가 뭉친 말이고, 셋 다 core 한계가 아니다(§16.5.3 표).** ① durable id → **우리가 민팅**(슬라이스 2에서 이미 완료) ② live 라우팅 → core가 포인터 대신 **순서 있는 배열**을 준다(`[core] dispatch-from-config.ts:3886,3910`), Telegram은 그 순서를 커서로 소비 ③ 소급 귀속 → Telegram도 못 하고 **필요도 없다**. ⇒ 정확히는 **"포인터가 없을 뿐 순서는 있다."** 우리 결함은 못 받은 정보가 아니라 **`materializedAnswerLanes()`로 스스로 버린 순서** | "id가 없다"는 관찰이 "대응을 알 수 없다"로 자동 확장됨 |
 | **N11** ⭐ | Telegram의 사다리/렌더를 우리 코드에 **그대로 대입**. 특히 "final N개는 붙일 데가 없으니 새 말풍선 N개가 원칙이다" | **`lane`이 서로 다른 물건이다.** Telegram 레인 = 내용 종류 **2개**(`LaneName = "answer" \| "reasoning"`, `[core] lane-delivery-text-deliverer.ts:19`) → 열린 답변 말풍선이 **항상 1개**라 커서로 순차 소비하고 **매칭 질문 자체가 없다**. 우리 레인 = **메시지별 N개**. ⇒ Telegram은 이 shape에서 말풍선 **2개**를 그린다(4개 아님). **§16.5.1 전체를 읽어라.** 그리고 `forceNewMessage`는 레인 리셋이라는 **구현 한계**지 원칙이 아니다 — 우리는 서버라 id로 아무 말풍선이나 고친다(N7은 core의 shipped 코드에도 적용) | 문서와 코드가 **같은 단어**를 써서, 거짓 유비가 "스펙 직독"처럼 느껴짐. + **경로가 존재함**을 **동작이 발생함**으로 확인 착각 |
 
 **메타 규칙(N1·N3·N5의 공통 근본):** 무언가를 **"core-limited / 구조적 / 불가능"** 이라 단정하기 전에 — **같은 core 위의 레퍼런스(내장 Telegram 채널, clone `/home/orca/workspace/openclaw` `src/channels/message/`·`src/auto-reply/reply/`)가 어떻게 하는지 먼저 읽는다.** 세 번(getSessionMessages, tool-durable, S1) 다 이걸 안 해서 나온 오판이다.
@@ -62,6 +62,7 @@
 **메타 규칙 2 (N11이 추가한 것) — 레퍼런스를 읽을 때:**
 1. **레퍼런스의 어휘를 우리 어휘로 번역하고 나서 비교하라.** 같은 단어(`lane`, `draft`, `final`)가 같은 것을 가리킨다고 가정하지 마라. 먼저 **그 타입의 정의를 grep** 하라.
 2. **경로의 존재 ≠ 동작의 발생.** 함수가 있다는 것을 확인했으면, **그 시나리오가 실제로 그 함수에 도달하는지**를 따로 확인하라. 전자만 보고 후자를 진술하면 그것은 측정이 아니라 추측이다.
+   - ⚠️ **인용 줄번호는 CI가 안 잡는다.** `lint:citations`는 `dist/` 경로만 검사하므로 `[core] .../src/foo.ts:1234`의 **줄번호가 틀려도 통과한다.** 실제로 이 절의 첫 판(2026-08-24)이 finals 루프를 `:3941`로 적었는데 진짜는 `:3910`이었다(`:3941`은 dedupe `add`). **인용을 적을 때 그 줄을 실제로 출력해 보고 붙여라** — 틀린 줄번호는 다음 사람의 30초 재검증을 통째로 무력화한다.
 3. **레퍼런스의 결과를 목표로 삼지 마라.** 레퍼런스도 자기 플랫폼의 한계를 품고 있다(N7). 베낄 것은 **원칙**이지 **렌더**가 아니다.
 4. **서브에이전트 브리프에 crux를 단정해 심지 마라.** 심으면 에이전트는 그 프레임 안에서 최적화할 뿐 반증하지 못한다. crux는 **질문으로** 줘라.
 
@@ -822,7 +823,7 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 |---|---|---|
 | 1 | **배달 행위에서 id를 얻는다.** 첫 `sendMessage`가 준 `message_id`를 draft가 보관하고, 이후 스트리밍은 **그 id로 in-place edit** | `[core] draft-stream.ts:284-328`, `:329-377` |
 | 2 | **어시스턴트 메시지 경계에서 무조건 회전하지 않는다.** `answerLane.finalized`일 때만 `rotateLaneForNewMessage`. 아직 마감 전이면 **다음 메시지가 같은 말풍선에 이어서 스트리밍된다** | `[core] bot-message-dispatch.ts:2713-2725` |
-| 3 | **final은 core가 턴 끝에 N개를 몰아서 준다** (메시지별 실시간 배달이 아니다) | `[core] dispatch-from-config.ts:3941` — `for (const [replyIndex, reply] of replies.entries())` |
+| 3 | **final은 core가 턴 끝에 N개를 몰아서 준다** (메시지별 실시간 배달이 아니다) | `[core] dispatch-from-config.ts:3910` — `for (const [replyIndex, reply] of replies.entries())` |
 | 4 | 그 N개를 **커서가 순서대로 소비한다.** 첫 final이 현재 draft를 마감(`lane.finalized = true`), 그 다음부터는 `forceNewMessage()` → 새 message_id | `[core] lane-delivery-text-deliverer.ts:593-603`, `bot-message-dispatch.ts:1333-1356`, `draft-stream.ts:703` |
 
 **⇒ 결론: Telegram은 "이 final이 과거 어느 레인 것이냐"를 애초에 묻지 않는다. 물을 과거 레인이 없기 때문이다.** 열려 있는 것은 언제나 커서 하나뿐이고, 지나간 말풍선은 끝난 것이다. §16.5-2의 사다리("현재 draft 마감 → 새 메시지 → preview 유지")는 **이 단일 커서 위에서 도는 규칙**이다.
@@ -858,7 +859,7 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 | | 질문 | core가 주는가 | Telegram은 어떻게 하나 | **우리 결론** |
 |---|---|---|---|---|
 | **Q1** | **durable id** — 이 답변의 안정적 식별자 (history·클라 upsert용) | **안 준다** (`onAssistantMessageStart()` 인자 0개, partial payload에 id 필드 없음) | **자기가 만든다.** 플랫폼 `sendMessage`의 `message_id`를 배달 행위에서 받아 보관 | **우리가 민팅한다.** 우리가 플랫폼이므로 외부 왕복도 불필요. **이미 해결됨 — 슬라이스 2(#238a)가 모든 egress에 적용** |
-| **Q2** | **live 라우팅** — 이 final이 어느 말풍선을 갱신하나 | **명시적 포인터는 안 준다.** 단 **순서 있는 배열**로 준다 (`[core] dispatch-from-config.ts:3886,3941` — `replies.entries()`) | **순서를 상관관계로 쓴다.** 커서 하나가 앞으로만 소비: 첫 final이 현재 draft 마감, 이후 회전 | **똑같이 한다.** 순서가 곧 대응이다. **"식별 불가"가 아니라 "포인터 대신 순서"** |
+| **Q2** | **live 라우팅** — 이 final이 어느 말풍선을 갱신하나 | **명시적 포인터는 안 준다.** 단 **순서 있는 배열**로 준다 (`[core] dispatch-from-config.ts:3886,3910` — `replies.entries()`) | **순서를 상관관계로 쓴다.** 커서 하나가 앞으로만 소비: 첫 final이 현재 draft 마감, 이후 회전 | **똑같이 한다.** 순서가 곧 대응이다. **"식별 불가"가 아니라 "포인터 대신 순서"** |
 | **Q3** | **소급 귀속** — 이미 지나간 임의의 말풍선을 지목 | 안 준다 | **Telegram도 못 한다.** 커서 모델은 애초에 요구하지 않는다 | **하지 않는다.** 이것만이 진짜로 불가능한 것이고, **필요하지도 않다** |
 
 **⇒ 정확한 진술: "final은 durable id가 없고 명시적 포인터가 없다. 그러나 순서를 갖는다."** Q1은 우리가 만들어서 끝, Q2는 순서로 풀고, Q3은 애초에 안 한다. **셋 중 어느 것도 core 한계가 아니다.** ([[두 identity 문제 혼동 금지]] — 이 세 줄이 그 메모의 문서판이다.)
@@ -872,7 +873,7 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 
 **정직하게 남겨두는 미확인/잔여 위험 (추측으로 메우지 말 것):**
 - core는 채널에 넘기기 **전에** 일부 항목을 건너뛴다 — reasoning/commentary 미옵트인, `suppressDelivery`, 그리고 **동일 payload dedupe**(`sentFinalPayloadDedupeKeys`, `[core] dispatch-from-config.ts:3937-3941`). **순서는 보존되지만 개수는 줄 수 있다.** 특히 두 메시지의 텍스트가 완전히 같으면 뒤엣것이 dedupe로 사라진다.
-- `deliveryId: String(replyIndex)`가 core 내부에 존재하지만(`:3941`) 추적 결과 **idempotency 키에만 쓰이고 채널까지 오지 않는다.** SDK 표면에도 없다. (§16.5의 기존 진술과 일치 — 재확인함.)
+- `deliveryId: String(replyIndex)`가 core 내부에 존재하지만(`:3943`) 추적 결과 **idempotency 키에만 쓰이고 채널까지 오지 않는다.** SDK 표면에도 없다. (§16.5의 기존 진술과 일치 — 재확인함.)
 - **VERIFY-1은 여전히 미결**: "텍스트를 가진 어시스턴트 메시지 하나당 ordinary final 정확히 하나"가 실제 데이터에서 성립하는지 측정된 적이 없다. #173부터 열려 있다. **이 절은 그것을 가정하지 않는다** — 커서 모델은 개수가 어긋나도 앞으로만 가므로 오염이 아니라 "남는 final은 새 말풍선"으로 떨어진다.
 
 ### 16.6 이번 라운드가 새로 잡은 fixable 결함 (issue 재편 때 v6 슬라이스로)
