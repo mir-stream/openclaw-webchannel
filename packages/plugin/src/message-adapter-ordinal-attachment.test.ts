@@ -34,19 +34,17 @@ import { describe, it, expect } from "vitest";
  * generation comparison written INSIDE that seam, wherever its operands came
  * from — the seam being where a mapping has to land to affect attachment at all.
  *
- * Their reach is bounded, and the bound is measured rather than assumed — and
- * the two forms fare DIFFERENTLY, so do not read them as one hole.
+ * Between them those two shapes cover the re-basings anyone actually writes,
+ * including the one that motivated this file. They are text patterns, though,
+ * not a proof: a reintroduction that avoids BOTH shapes — the comparison placed
+ * outside the seam AND the ordinal reaching it under some other name — passes
+ * this file exactly as it passes the fixtures.
  *
- * A comparison routed through a local alias defeats the FIRST assertion:
- * writing `const idx = input.assistantMessageIndex;` and comparing
- * `lane.generation` to `idx - 1` puts the two names in different statements, so
- * `offenders` sees nothing. The second assertion still catches it, because the
- * comparison itself is written inside the seam (measured: that injection goes
- * red, and it passed all five assertions before the seam assertion existed).
- *
- * What defeats BOTH is a comparison hidden inside a helper DEFINED OUTSIDE the
- * seam and merely called from it. In that form the wrong fix passes this file
- * just as it passes the fixtures. That is the known, unclosed hole.
+ * Deliberately not enumerating which spellings land on which side of that line.
+ * Three review rounds each found the enumeration wrong in a new way, because it
+ * is a property of two regexes against an open set of spellings and cannot be
+ * stated once and stay true. The line above is what is stable, and it is the
+ * only claim this file makes about its own reach.
  *
  * So read what follows as a TRIPWIRE on the tempting spellings, not as a proof
  * that no ordinal→lane mapping exists. That is still worth having, because the
