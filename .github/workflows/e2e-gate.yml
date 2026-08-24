@@ -69,9 +69,12 @@ jobs:
     # Pin the Node.js version — the resolved runtime must SATISFY every
     # published package.json's engines.node range. Those ranges are no longer
     # identical: packages/plugin declares
-    # ">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0" (copied verbatim from the
-    # openclaw peer, because it needs the node:sqlite builtin), while client and
-    # saas still declare ">=22.0.0". The plugin's is the tightest, so it is the
+    # ">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0" — copied verbatim from the
+    # `openclaw` peer it already peer-depends on, so the range makes that peer's
+    # existing transitive floor explicit rather than inventing one. Do NOT read
+    # the numbers as a `node:sqlite` requirement: that builtin landed in 22.5.0,
+    # and none of these three floors is it. Meanwhile client and saas still
+    # declare ">=22.0.0". The plugin's is the tightest, so it is the
     # one this pin has to clear: "22" resolves to the latest 22.x, which is
     # >=22.22.3, so all three are satisfied. Bumping the plugin's floor above the
     # latest 22.x is what would break this — raise the pin then.

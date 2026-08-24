@@ -183,11 +183,31 @@ export interface DeliveryJournal {
   /**
    * Append one event and return its per-conversation `seq`.
    *
-   * `inserted: false` means an IDEMPOTENT no-op — the event was already in the
-   * log and `seq` is the FIRST one's. A duplicate NEVER throws; that is the
-   * point of it, since §15.8 mandates non-destructive retry of a failed append.
+   * `inserted: false` means an IDEMPOTENT no-op — a row was already in the log
+   * under this event's `(conversationId, kind, message id)`, and `seq` is THAT
+   * row's. A duplicate NEVER throws; that is the point of it, since §15.8
+   * mandates non-destructive retry of a failed append.
    *
-   * ⚠️ IT DOES THROW on a malformed `user` event, and only on those two things:
+   * ⚠️ THE PAYLOAD IS NOT COMPARED. `inserted: false` says a row exists under
+   * that id, NOT that it holds the same event — so a caller that reuses an id
+   * for genuinely different content gets the FIRST content kept and the second
+   * silently discarded, indistinguishable from an ordinary retry. That is
+   * exactly the shape of **#275**: the accept seam's own dedupe
+   * (`ingress-dedupe.ts`) is WINDOWED — 7-day TTL, bounded `stateMaxEntries` —
+   * while `journal_user_once` has no window, so a client id reused after
+   * eviction is new to the seam and a duplicate here. Whoever wires the seam
+   * (#240) owns reconciling the two lifetimes; do not read this flag as proof
+   * the stored event matches the one you passed.
+   *
+   * `conversationId` is UNVALIDATED and unbounded, unlike a `user` id — it is
+   * copied into every row plus each index entry, so that is only sound while it
+   * stays PLUGIN-DERIVED. Nothing in this package derives one yet; half 2
+   * invents it. If it ever comes from a client-supplied field, bound it at the
+   * seam the way `ingressDedupeKey` bounds `user_message.id`.
+   *
+   * ⚠️ IT DOES THROW on a malformed `user` event. Those are the only two
+   * VALIDATION refusals — a SQLite fault (a corrupt file, a failed lock) still
+   * propagates like any other:
    *  - `kind: "user"` whose `id` is empty or not a string. Distinct user
    *    messages under one id collapse onto a single row, and the loser comes
    *    back as `inserted: false` — indistinguishable from the ordinary retry
@@ -441,9 +461,13 @@ function openJournalConnection(
       },
     };
   } catch (error) {
-    // ⚠️ `maintenance.close()`, NOT just a rethrow. Step 4 installed a
-    // `setInterval` inside this handle, and it is the ONLY thing that clears
-    // it. Everything above — the pragma, the DDL, the meta insert, all four
+    // ⚠️ `maintenance.close()`, NOT just a rethrow. On the WAL path step 4
+    // installed a `setInterval` inside this handle, and it is the ONLY thing
+    // that clears it. (On a rollback-journal volume the SDK returns a no-timer
+    // stub instead — `configureSqliteWalMaintenance` in `openclaw`'s
+    // `src/infra/sqlite-wal.ts` — where this call is merely harmless, not
+    // required. Calling it unconditionally is right for both.)
+    // Everything above — the pragma, the DDL, the meta insert, all four
     // `prepare` calls — runs after that timer exists and can throw, and on
     // that path the caller never receives `maintenance`, so nothing else can
     // ever reach it. The timers are `unref()`'d and each firing throws into
@@ -699,7 +723,9 @@ function closeQuietly(db: SqliteDatabase): void {
  *
  * ⚠️ WE TAKE CORE'S SUFFIX LIST, NOT CORE'S FAILURE POLICY, and the divergence
  * is deliberate. Core runs the same four suffixes through `bestEffortChmodSync`
- * → `canIgnorePrivateChmodError` (`openclaw`'s `src/infra/private-mode.ts`),
+ * (`openclaw`'s `src/state/openclaw-state-db.ts`, which is also where the
+ * quoted sentence below lives) → `applyPrivateModeSync` →
+ * `canIgnorePrivateChmodError` (`openclaw`'s `src/infra/private-mode.ts`),
  * which TOLERATES `ENOTSUP`/`EOPNOTSUPP`/`EINVAL` outright and `EROFS`/`EPERM`
  * conditionally (only where the target is already restrictive, or the filesystem
  * demonstrably rejects chmod), because — in its own words — "crashing at open
@@ -759,10 +785,17 @@ function requireCount(value: number, parameter: string, min: number): number {
  * and answer ids are minted monotonically so one never spans two turns — but it
  * is a real edge the day either of those changes.
  *
- * The `default` is NOT an exhaustiveness hole — it is #253's retain rule. A
- * forward event kind read back from a newer build's journal is out of the union
- * at RUNTIME even though the switch is exhaustive at compile time; it stays
- * whole in `payload` and simply goes unindexed.
+ * The `default` is NOT an exhaustiveness hole — it is #253's retain rule on the
+ * WRITE path. A forward event kind is out of the union at RUNTIME even though
+ * the switch is exhaustive at compile time, so it stays whole in `payload` and
+ * simply goes unindexed rather than throwing.
+ *
+ * ⚠️ AND THE WRITE PATH IS THE ONLY WAY TO REACH IT. `read()` never calls this
+ * — it parses `payload` and takes `kind` straight off the parsed event — so
+ * "read back from a newer build's journal" is NOT this branch's trigger. What
+ * reaches it is an append of an unknown kind, which today means a cast at the
+ * call site (`delivery-journal.test.ts` pins exactly that, including the NULL
+ * `message_id` this returns).
  */
 function extractMessageId(event: JournalEvent): string | null {
   switch (event.kind) {
