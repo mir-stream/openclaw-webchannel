@@ -2897,7 +2897,6 @@ export class WebChannelNATSClient {
         const assistantMessageIndex = normalizeAssistantMessageIndex(
           msg.assistantMessageIndex,
         );
-        this.setState({ isTyping: false });
 
         if (id) {
           this.applyDurable(
@@ -2916,11 +2915,16 @@ export class WebChannelNATSClient {
                 ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
               },
             },
+            { isTyping: false },
           );
           // P1-9 §3.6.2: the final upsert also proves liveness — disarm.
           this.staleDraftWatch.delete(id);
           return;
         }
+
+        // Preserve the legacy id-less path's existing two public transitions:
+        // typing clears before the client-local bubble id is minted/applied.
+        this.setState({ isTyping: false });
 
         // LEGACY-PLUGIN PATH ONLY. Since #238 every durable egress site mints an
         // id at the delivery act, so a durable frame reaching here means an older

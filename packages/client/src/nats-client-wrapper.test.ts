@@ -1545,6 +1545,50 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
     ]);
   });
 
+  it("an id-bearing final is materialized before its notification can re-enter with /stop", () => {
+    const w = makeWrapper();
+    deliver(w, {
+      type: "progress",
+      id: "laneA",
+      turnId: "T",
+      text: "partial A",
+    });
+
+    let observedFinal: ReturnType<WebChannelNATSClient["getState"]>["messages"][number]
+      | undefined;
+    let observedTyping: boolean | undefined;
+    let reentered = false;
+    const unsubscribe = w.subscribe((state) => {
+      if (reentered) return;
+      reentered = true;
+      observedFinal = state.messages.find((message) => message.id === "laneA");
+      observedTyping = state.isTyping;
+      w.send("/stop");
+    });
+
+    deliver(w, {
+      type: "agent_message",
+      id: "laneA",
+      turnId: "T",
+      text: "final A",
+    });
+    unsubscribe();
+
+    expect(reentered).toBe(true);
+    expect(observedTyping).toBe(false);
+    expect(observedFinal).toMatchObject({
+      id: "laneA",
+      text: "final A",
+      working: false,
+    });
+    expect(observedFinal?.draftOnly).toBeUndefined();
+    expect(w.getState().messages.map((message) => message.id)).toEqual(["laneA", "u-0"]);
+    expect(w.getState().messages.filter((message) => message.id === "laneA"))
+      .toHaveLength(1);
+    expect(w.getState().messages.find((message) => message.id === "u-0")?.text)
+      .toBe("/stop");
+  });
+
   // --- #212: turn_snapshot pure-view reconciliation. ----------------------
   it("S1: the mid-lane snapshot fixes order/text, mints the failed lane, drops the overflow, and preserves EVERYTHING else", () => {
     const w = makeWrapper();
