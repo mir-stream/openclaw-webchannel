@@ -390,8 +390,10 @@ export class ApprovalOriginLeaseRegistry implements ApprovalOriginRegistry {
    * Capture the current clock as this epoch's barrier. Like `readClock()`, a
    * non-finite or backwards read leaves the epoch untrusted: accepting a
    * backwards baseline would un-fence requests stamped before the clock jump.
-   * A finite reading still becomes the new baseline so the next forward
-   * rotation can restore trust instead of remaining pinned to a stale future.
+   * A backwards baseline closes the epoch and moves the barrier, but
+   * deliberately does NOT lower the clock high-water mark. Trust returns only
+   * when a later rotation catches back up to that mark, because only then does
+   * its new barrier fence every preserved pre-jump request stamp.
    */
   private establishBarrier(): void {
     const value = this.now();
@@ -401,7 +403,7 @@ export class ApprovalOriginLeaseRegistry implements ApprovalOriginRegistry {
     }
     const previousLastObservedMs = this.lastObservedMs;
     this.barrierMs = value;
-    this.lastObservedMs = value;
+    this.lastObservedMs = Math.max(previousLastObservedMs, value);
     this.clockTrusted = value >= previousLastObservedMs;
   }
 

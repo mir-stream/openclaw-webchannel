@@ -401,23 +401,52 @@ describe("ApprovalOriginLeaseRegistry — epoch rotation", () => {
     });
   });
 
-  it("restores trust on the next forward rotation after a backwards baseline", () => {
+  it.each([
+    { kind: "higher", secondRotationMs: 1_011 },
+    { kind: "equal", secondRotationMs: 1_010 },
+  ])(
+    "does not restore trust on a second $kind rotation below the pre-jump high-water",
+    ({ secondRotationMs }) => {
+      const h = harness();
+      h.set(1_020);
+      expect(h.resolve("AcctA", 1_015)).toEqual({ kind: "no_match" });
+      h.set(1_010);
+      h.registry.rotateEpoch(); // backwards barrier closes this epoch
+
+      // Neither advancing below 1_020 nor repeating the backwards baseline can
+      // erase the pre-jump high-water and make its preserved stamp look new.
+      h.set(secondRotationMs);
+      h.registry.rotateEpoch();
+      h.set(1_012);
+      h.run("AcctA", "peerA");
+      h.set(1_016);
+      expect(h.resolve("AcctA", 1_015)).toEqual({
+        kind: "invalid_request_time",
+      });
+    },
+  );
+
+  it("restores trust only after a rotation catches up to the pre-jump high-water", () => {
     const h = harness();
     h.set(1_020);
     expect(h.resolve("AcctA", 1_015)).toEqual({ kind: "no_match" });
     h.set(1_010);
-    h.registry.rotateEpoch(); // backwards baseline closes this epoch
+    h.registry.rotateEpoch(); // backwards barrier closes this epoch
 
-    // The backwards finite reading becomes the recovery baseline, so a later
-    // forward rotation need not wait for the stale pre-jump value of 1_020.
-    h.set(1_011);
-    h.registry.rotateEpoch(); // barrier = 1_011; trust restored
-    h.set(1_012);
+    h.set(1_025);
+    h.registry.rotateEpoch(); // past high-water; barrier = 1_025, trust restored
+    h.set(1_030);
     h.run("AcctA", "peerA");
-    h.set(1_016);
-    expect(h.resolve("AcctA", 1_015)).toEqual({
+    h.set(1_040);
+    // An ordinary post-recovery request proves the registry is answering again.
+    expect(h.resolve("AcctA", 1_035)).toEqual({
       kind: "resolved",
       peerId: "peerA",
+    });
+    // Recovery is safe because its barrier now fences the preserved pre-jump
+    // stamp instead of merely declaring a low baseline trustworthy.
+    expect(h.resolve("AcctA", 1_015)).toEqual({
+      kind: "invalid_request_time",
     });
   });
 

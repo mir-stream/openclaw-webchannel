@@ -14,6 +14,10 @@
 > 넘긴 lease가 증명 불가로 박혀 **모든 승인이 `active_no_match`로 드롭**됐다.
 > 지금 barrier는 승인 스트림 자신의 수명(`startClawApprovalMonitor`)에 붙어 있고, `activate()`는 생성
 > epoch을 보지 않는다(시작 시각을 activate에서 읽으므로 항상 post-barrier다).
+>
+> - 시계 연속성도 함께 정정한다: backwards baseline은 epoch를 닫되 clock high-water를 낮추지 않고,
+>   이후 rotation이 그 high-water 이상에 도달해 pre-jump stamp를 새 barrier 아래로 가둘 때만 trust를 복구한다.
+>
 > 아래 본문의 rotate 위치·dormant handle 서술은 **그 정정 전 기준**으로 읽어라.
 
 ---

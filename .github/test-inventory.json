@@ -48,7 +48,7 @@
     "packages/plugin/src/approval-broadcast-integration.test.ts": 10,
     "packages/plugin/src/approval-e2e-crypto.test.ts": 32,
     "packages/plugin/src/approval-origin-delivery-integration.test.ts": 9,
-    "packages/plugin/src/approval-origin.test.ts": 49,
+    "packages/plugin/src/approval-origin.test.ts": 51,
     "packages/plugin/src/approvals.test.ts": 83,
     "packages/plugin/src/auth-admission.test.ts": 6,
     "packages/plugin/src/auth.test.ts": 22,
