@@ -257,11 +257,10 @@ type AssistantDraftLane = {
    * false on a count shortfall, or for the K==1 Case-X textless current lane. Note
    * the predicate is CARDINALITY-based, so a compensating desync (a deduped final
    * plus an unstreamed message) can still pass it — a pre-#238 hole, not closed
-   * here. The snapshot
-   * uses `answerText` when this is true (preserving the final's tail beyond the
-   * last partial — the VERIFY-1 edge, and the north-star "final is not
-   * droppable") and falls back to the corruption-immune `streamedAnswerText`
-   * otherwise.
+   * here (#262). The snapshot uses `answerText` when this is true (preserving the
+   * final's tail beyond the last partial — the VERIFY-1 edge, and the north-star
+   * "final is not droppable") and falls back to the corruption-immune
+   * `streamedAnswerText` otherwise.
    */
   answerTextIsAuthoritative: boolean;
   /**
@@ -743,12 +742,15 @@ export function createProgressDraftController(params: {
   // `flushBufferedOrdinaryFinals` and `finalize`.
   const bufferedOrdinaryFinals: string[] = [];
   // #212: wire ids of independent bubbles the plugin KNOWS carry answer content
-  // already represented by a lane in the `turn_snapshot` (a mis-routed overflow
-  // final, or a recovery block whose streamed lane is in `answers`). The snapshot
-  // names them in `remove` so the client drops exactly these and preserves every
-  // other agent bubble (notices/errors). A missed id leaves a corruption bubble;
-  // a wrongly-added id would lose content — captured ONLY at the precise mint
-  // sites below, never from a notice/error path.
+  // already represented by a lane in the `turn_snapshot`. Since #238 there is
+  // exactly ONE producer — the failed-lane recovery block (:2424), whose lane is
+  // in `answers` by its streamed text. (The overflow-final producer is gone: its
+  // flag's value was `streamed.length === finals.length`, unreachable at an
+  // overflow under the new candidate list.) The snapshot names these in `remove`
+  // so the client drops exactly them and preserves every other agent bubble
+  // (notices/errors). A missed id leaves a corruption bubble; a wrongly-added id
+  // would lose content — captured ONLY at that one mint site, never from a
+  // notice/error path.
   const supersededAnswerBubbleIds: string[] = [];
 
   const warn = (message: string): void => {
@@ -1118,7 +1120,7 @@ export function createProgressDraftController(params: {
   // #238 (v6 slice 5): the lanes the buffered-final cursor walks WHEN
   // order-correlation is exact — every lane that STREAMED visible answer text, in
   // generation order. This is deliberately the exact same set `emitTurnSnapshot`
-  // publishes as `answers` (:1775), so a lane the cursor can settle and a lane the
+  // publishes as `answers` (:1777), so a lane the cursor can settle and a lane the
   // snapshot can carry are the same lane.
   //
   // Materialization is NOT required, and that is the point. Core hands the channel
@@ -1812,10 +1814,10 @@ export function createProgressDraftController(params: {
   // here and is gone. That is a CARDINALITY argument and only that: do NOT
   // paraphrase it as "an overflow final's content never streamed", which is
   // measured false and is the premise that would justify deleting the bubble.
-  // EVERY bubble this function
-  // produces (leading error, stray extra, notice, overflow final) is preserved by
-  // the client. `sendIndependent` keeps the option for its one remaining user, the
-  // failed-lane recovery block (:2421), whose duplicate IS provable.
+  // EVERY bubble this function produces (leading error, stray extra, notice,
+  // overflow final) is preserved by the client. `sendIndependent` keeps the option
+  // for its one remaining user, the failed-lane recovery block (:2423), whose
+  // duplicate IS provable.
   const deliverTerminalIndependent = (text: string): boolean => {
     // ONE STORY, in the order it happens:
     //
@@ -2012,7 +2014,7 @@ export function createProgressDraftController(params: {
       // MEASURED: dropping this conjunct alone leaves the whole suite green — both
       // before and after the shortfall fix. That is not a coverage gap, it is
       // structural: `answerTextIsAuthoritative` has exactly ONE reader
-      // (`emitTurnSnapshot`, :1778) and that reader iterates `streamedAnswerLanes()`,
+      // (`emitTurnSnapshot`, :1780) and that reader iterates `streamedAnswerLanes()`,
       // filtering on the very predicate this conjunct tests, so a lane that would
       // be wrongly marked is never read. DO NOT take that as licence to delete it —
       // the coupling is incidental, the flag's contract is what is being stated, and
