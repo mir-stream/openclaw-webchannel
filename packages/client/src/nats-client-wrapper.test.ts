@@ -1664,6 +1664,40 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
     for (const m of after.slice(0, 2)) expect(Object.hasOwn(m, "turnId")).toBe(false);
   });
 
+  it("S1c: prototype-shaped snapshot ids remain ordinary overlay keys", () => {
+    const w = makeWrapper();
+    deliver(w, {
+      type: "history",
+      messages: [{ id: "working", role: "agent", text: "hydrated answer", ts: 1 }],
+    });
+    deliver(w, { type: "typing" });
+    expect(w.getState().isTyping).toBe(true);
+
+    expect(() => deliver(w, {
+      type: "turn_snapshot",
+      turnId: "T",
+      answers: [{ id: "__proto__", text: "sealed answer" }],
+      remove: [],
+    })).not.toThrow();
+
+    const state = w.getState();
+    expect(state.isTyping).toBe(false);
+    expect(state.messages.map((message) => message.id)).toEqual(["working", "__proto__"]);
+    expect(state.messages[0]).toMatchObject({
+      id: "working",
+      role: "agent",
+      text: "hydrated answer",
+      working: false,
+    });
+    expect(state.messages[1]).toMatchObject({
+      id: "__proto__",
+      role: "agent",
+      text: "sealed answer",
+      turnId: "T",
+      working: false,
+    });
+  });
+
   it("S2: a snapshot for a foreign/absent turn with no matching ids is a no-op on the answer region", () => {
     const w = makeWrapper();
     liveBubble(w, "laneA", "T", "A", "final A");

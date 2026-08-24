@@ -1574,7 +1574,8 @@ export class WebChannelNATSClient {
     );
     if (answers.length === 0 && remove.length === 0) return;
 
-    const local: DurableLocalOverlay = {};
+    // Answer ids are wire-controlled; `__proto__` must be an ordinary overlay key.
+    const local = Object.create(null) as DurableLocalOverlay;
     for (const a of answers) {
       // A sealed answer is authored durable text, so it is no longer a draft.
       local[a.id] = { working: false, draftOnly: undefined };
@@ -1943,9 +1944,10 @@ export class WebChannelNATSClient {
    *     its durable text is `""` by construction and the rendered text is the
    *     client-local draft, so taking the view's `""` would blank a live draft
    *     whenever an unrelated frame triggers an apply;
-   *  3. `local[id]` is applied LAST and wins. A key set to `undefined` DELETES
-   *     it (that is how `draftOnly` is cleared), rather than leaving an
-   *     `undefined`-valued key that would defeat the identity reuse below;
+   *  3. an OWN `local[id]` is applied LAST and wins. Prototype properties are
+   *     never overlays. A key set to `undefined` DELETES it (that is how
+   *     `draftOnly` is cleared), rather than leaving an `undefined`-valued key
+   *     that would defeat the identity reuse below;
    *  4. a spent draft (see `isSpentDraft`) is OMITTED;
    *  5. an id in `prev` but absent from the view is dropped — that is `seal`'s
    *     `remove` working as designed.
@@ -1975,7 +1977,9 @@ export class WebChannelNATSClient {
     const out: ChatMessage[] = [];
     for (const entry of view) {
       const base = prevById.get(entry.id);
-      const overlay = local?.[entry.id];
+      const overlay = local !== undefined && Object.hasOwn(local, entry.id)
+        ? local[entry.id]
+        : undefined;
       const overlaySetsText = overlay !== undefined && "text" in overlay;
       const overlaySetsDraftOnly = overlay !== undefined && "draftOnly" in overlay;
       const draftOnly = overlaySetsDraftOnly ? overlay.draftOnly : base?.draftOnly;
