@@ -215,7 +215,7 @@ type AssistantDraftLane = {
    * lane, and `outstandingRecordsAtIndex`/`retireOneRecordAtIndex` match on it to
    * retire a barrier), and every one of those is load-bearing. Do not read
    * "separate" as "the ordinal is unused over there" and delete a read on that
-   * basis; a review pass did exactly that to the arming branch and measured 20
+   * basis; a review pass did exactly that to the arming branch and measured 19
    * red on this tree, all of them the same shape — a lane held past the point it
    * should have released, so the next message never streams.
    *
@@ -2239,8 +2239,10 @@ export function createProgressDraftController(params: {
           // itself (see the lane field and boundary-counter docblocks). It is a
           // RENDERING decision about a lane that already exists — "has this lane
           // already shown this text" — and deliberately not an attachment
-          // decision: no ordinal picks which lane a record belongs to anywhere in
-          // this controller (plan §0.2 N5).
+          // decision: no ordinal picks the lane a record ATTACHES TO for ordering
+          // anywhere in this controller (plan §0.2 N5). Read narrowly: this very
+          // line maps an ordinal onto a lane, and is allowed precisely because it
+          // decides rendering rather than order.
           //
           // PREDICATE = `streamedVisibleAnswerText && !laneTerminalSuppressed`,
           // i.e. the lane streamed visible answer text and is either MATERIALIZED

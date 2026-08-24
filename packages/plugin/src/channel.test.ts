@@ -2344,9 +2344,11 @@ describe("webchannel inbound round-trip", () => {
    * The held lane is the THIRD message, and that is load-bearing rather than
    * incidental.
    *
-   * A block reservation picks its barrier lane from lane STATE — the earliest
-   * still-unresolved lane, else the lane being streamed now — so the reservation
-   * this fixture is about lands on the text-less second lane. A barrier holds
+   * A block reservation picks its barrier lane from lane STATE — a lane already
+   * armed for late reservations, else the earliest still-unresolved lane, else
+   * the lane being streamed now. No lane is armed here (nothing indexless
+   * precedes this), so the reservation this fixture is about lands on the
+   * text-less second lane via the last of those. A barrier holds
    * SUCCESSORS, never its own lane, so the ordering this asserts is only
    * observable if a later lane exists to be held. Drop the third boundary and
    * the reservation lands on "B draft"'s OWN lane instead of the text-less
