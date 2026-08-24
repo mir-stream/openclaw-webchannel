@@ -90,7 +90,7 @@ audience, JWKS source/material configuration 또는 `requirePoP` 정책을 바�
 7. **#93 lease도 tenant/scope를 모른다.** claim은 exact raw account, session key, peer만 보존한다
    (`approval-origin.ts:107-125`). #267 이후 `startClawApprovalMonitor`가 approval-stream/channel-account 시작 시
    호출하는 `rotateEpoch()`은 replay barrier를 세우지만, 계속 실행 중인 handler의 active claim은 의도적으로 유지한다
-   (`approval-origin.ts:350-365`; `inbound.ts:112-134`).
+   (`approvals.ts:1227-1261`; `approval-origin.ts:379-386`).
 8. **승인 delivery와 snapshot도 tenant/scope를 모른다.** live transport lookup은 account ID로만 현재
    runtime을 찾고(`nats-account-runtime.ts:323-326`), pending/resolved store와 조회는 normalized account와
    approval ID 또는 peer로만 key/filter한다(`approvals.ts:193-265`, `:399-422`). 등록 성공 시 현재 runtime은
