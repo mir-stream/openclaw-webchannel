@@ -592,6 +592,28 @@ export function getWebChannelExecApprovalApprovers(params: {
   });
 }
 
+/**
+ * The one approver entry that is not a peer id: `"*"` admits every peer that is
+ * already authenticated on THIS account.
+ *
+ * It is not a hole in the gate, because it is not the gate. A peer only reaches
+ * an approval decision by holding a live, verified transport session on this
+ * exact account, and the deployment's own enrolment/authorisation decides who
+ * can obtain one — rota, for instance, refuses to sign a browser's bootstrap
+ * unless the caller is the user this agent is ASSIGNED to. `approvers` then asks
+ * the same question a second time, in a place that cannot see the answer, which
+ * is why a deployment whose peer ids are already authorisation-bearing has
+ * nothing to put here. `"*"` lets it say so, instead of shipping a list it must
+ * keep in sync with the real one.
+ *
+ * `"*"` is never a valid peer id (peer ids are opaque verified strings a
+ * verifier hands out, and no verifier issues this one), so no real approver is
+ * shadowed by it. It stays account-scoped like every other entry: `"*"` on
+ * account A says nothing about account B. An empty/blank sender is still refused
+ * — "any authenticated peer" still requires a peer.
+ */
+export const WEBCHANNEL_ANY_APPROVER = "*";
+
 /** Whether `senderId` is one of the ACCOUNT's configured webchannel approvers. */
 export function isWebChannelExecApprovalApprover(params: {
   cfg: OpenClawConfig;
@@ -600,10 +622,12 @@ export function isWebChannelExecApprovalApprover(params: {
 }): boolean {
   const senderId = params.senderId?.trim();
   if (!senderId) return false;
-  return getWebChannelExecApprovalApprovers({
+  const approvers = getWebChannelExecApprovalApprovers({
     cfg: params.cfg,
     accountId: params.accountId,
-  }).includes(senderId);
+  });
+  if (approvers.includes(WEBCHANNEL_ANY_APPROVER)) return true;
+  return approvers.includes(senderId);
 }
 
 function hasConfiguredApprovers(cfg: OpenClawConfig, accountId?: string | null): boolean {
@@ -1114,7 +1138,7 @@ export function createClawApprovalCapability(
         accountId && accountId !== "default"
           ? `channels.webchannel.accounts.${accountId}`
           : "channels.webchannel";
-      return `WebChannel supports native exec approvals for this account. Configure \`${prefix}.execApprovals.approvers\` (peer ids from your verifier) and set \`${prefix}.execApprovals.enabled\` to \`true\` or \`"auto"\`. The global fallback is \`commands.ownerAllowFrom\`.`;
+      return `WebChannel supports native exec approvals for this account. Configure \`${prefix}.execApprovals.approvers\` (peer ids from your verifier, or \`["*"]\` for every peer already authenticated on this account) and set \`${prefix}.execApprovals.enabled\` to \`true\` or \`"auto"\`. The global fallback is \`commands.ownerAllowFrom\`.`;
     },
     // Core's approval bootstrap checks the outer adapter's `isConfigured`
     // (above, which requires approvers AND enabled) BEFORE the native handler
