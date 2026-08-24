@@ -54,8 +54,15 @@
 | **N8** | "live와 history는 (의도적으로) 다를 수 있다" | 우리가 스트림 전체를 소유 → 차이는 전부 **버그**. live==history는 **절대**(공유 reducer로 양쪽 보장, §15.9) | 상태/tool 버블 렌더 차이를 "gap"으로 합리화 |
 | **N9** | partial-first/모드 의존 저널, legacy fallback·epoch 마커 유지 | SSOT는 모드 의존 불가. **파괴적 컷오버 승인**("아직 아무도 안 씀") → 저널이 첫날부터 유일 store, cutover/epoch/legacy 기계 **전부 삭제**(§15.6) | "안전한 전환기"가 신중해 보임 (실은 원칙 후퇴) |
 | **N10** | 못 붙는 final → degrade/skip, 안 그림 | **현재-draft 우선 마감 → 안 되면 새 메시지(또는 애매하면 preview 유지)**, degrade 아님(§16.1, 정밀판 §16.5). ("skip-degrade, never guess"는 옛 §0.1의 오판 잔재) | 옛 "core ceiling→degrade" 어법이 압축 후 되살아남 |
+| **N11** ⭐ | Telegram의 사다리/렌더를 우리 코드에 **그대로 대입**. 특히 "final N개는 붙일 데가 없으니 새 말풍선 N개가 원칙이다" | **`lane`이 서로 다른 물건이다.** Telegram 레인 = 내용 종류 **2개**(`LaneName = "answer" \| "reasoning"`, `[core] lane-delivery-text-deliverer.ts:19`) → 열린 답변 말풍선이 **항상 1개**라 커서로 순차 소비하고 **매칭 질문 자체가 없다**. 우리 레인 = **메시지별 N개**. ⇒ Telegram은 이 shape에서 말풍선 **2개**를 그린다(4개 아님). **§16.5.1 전체를 읽어라.** 그리고 `forceNewMessage`는 레인 리셋이라는 **구현 한계**지 원칙이 아니다 — 우리는 서버라 id로 아무 말풍선이나 고친다(N7은 core의 shipped 코드에도 적용) | 문서와 코드가 **같은 단어**를 써서, 거짓 유비가 "스펙 직독"처럼 느껴짐. + **경로가 존재함**을 **동작이 발생함**으로 확인 착각 |
 
 **메타 규칙(N1·N3·N5의 공통 근본):** 무언가를 **"core-limited / 구조적 / 불가능"** 이라 단정하기 전에 — **같은 core 위의 레퍼런스(내장 Telegram 채널, clone `/home/orca/workspace/openclaw` `src/channels/message/`·`src/auto-reply/reply/`)가 어떻게 하는지 먼저 읽는다.** 세 번(getSessionMessages, tool-durable, S1) 다 이걸 안 해서 나온 오판이다.
+
+**메타 규칙 2 (N11이 추가한 것) — 레퍼런스를 읽을 때:**
+1. **레퍼런스의 어휘를 우리 어휘로 번역하고 나서 비교하라.** 같은 단어(`lane`, `draft`, `final`)가 같은 것을 가리킨다고 가정하지 마라. 먼저 **그 타입의 정의를 grep** 하라.
+2. **경로의 존재 ≠ 동작의 발생.** 함수가 있다는 것을 확인했으면, **그 시나리오가 실제로 그 함수에 도달하는지**를 따로 확인하라. 전자만 보고 후자를 진술하면 그것은 측정이 아니라 추측이다.
+3. **레퍼런스의 결과를 목표로 삼지 마라.** 레퍼런스도 자기 플랫폼의 한계를 품고 있다(N7). 베낄 것은 **원칙**이지 **렌더**가 아니다.
+4. **서브에이전트 브리프에 crux를 단정해 심지 마라.** 심으면 에이전트는 그 프레임 안에서 최적화할 뿐 반증하지 못한다. crux는 **질문으로** 줘라.
 
 ---
 
@@ -791,7 +798,57 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 2. **"못 붙는 final = 새 메시지"는 fallback이지 첫 동작이 아님.** 첫 동작은 항상 **현재 draft 마감 시도**; 안 되면 새 메시지, **애매하면 preview 유지**. N10은 "현재-draft 우선 → 안 되면 새 메시지(또는 유지), 절대 degrade 아님"으로 읽어라.
 3. **"#215/#223 = 전부 ordinal 자충수"는 과함.** 두 개가 섞여 있다: (a) **ordinal-desync 자충수**(현재-draft 모델 채택으로 완전 해소) + (b) **identity-less final의 "이 final이 어느 이전 답변인가" 의미론적 귀속** — 이건 core가 Telegram에게도 안 주는 **공유 현실**이다. **그러나 현재-draft 모델은 이 질문을 아예 우회한다**(현재 draft를 마감하거나 새 메시지일 뿐, 과거로 소급 귀속 안 함) — Telegram과 **똑같이**. 즉 (b)는 "우리 vs Telegram 격차"가 **아니라** 스트리밍의 본질이고, 소급 귀속을 **시도할 때만** 문다. 우리가 물린 건 소급 ordinal 귀속을 시도했기 때문.
 
+4. **⭐ "Telegram의 사다리를 우리 flush에 그대로 대입"은 틀림 — `lane`이라는 같은 단어가 서로 다른 것을 가리킨다.** 아래 §16.5.1이 이 정정의 본문이다. **§16.5를 인용해 우리 코드를 판단하기 전에 반드시 §16.5.1을 먼저 읽어라.** 이 한 줄이 없어서 2026-08-24에 정확히 같은 헛발질이 재발했다(§16.5.2).
+
 **결론:** durable 식별자는 **우리가 100% 소유 가능**(구조적 불가 없음). 의미론적 소급-귀속은 Telegram도 못 하지만 현재-draft 모델이 우회하므로 실질 문제 아님. **불가능한 identity 차이 = 없음(빈 목록, 전원 일치).**
+
+---
+
+### 16.5.1 ⭐ 내장 Telegram은 정체성을 **어떻게** 유지하는가 — 커서 하나 (2026-08-24 측정)
+
+> **이 절은 "final 정체성" 논의의 재발 방지 본체다.** 며칠을 같은 자리에서 맴돈 원인이 전부 여기 없던 사실 하나였다: **Telegram의 `lane`과 우리의 `lane`은 다른 물건이다.** 아래는 전부 pin된 clone(`/home/orca/workspace/openclaw`, `v2026.7.1-2`)에서 직접 읽은 것이다.
+
+**핵심 사실 — Telegram의 레인은 "내용 종류별 2개"지, "메시지별 N개"가 아니다.**
+
+```
+[core] extensions/telegram/src/lane-delivery-text-deliverer.ts:19
+  export type LaneName = "answer" | "reasoning";
+```
+
+그래서 Telegram이 정체성을 유지하는 방식은 **커서 하나**로 요약된다:
+
+| # | 동작 | 근거 |
+|---|---|---|
+| 1 | **배달 행위에서 id를 얻는다.** 첫 `sendMessage`가 준 `message_id`를 draft가 보관하고, 이후 스트리밍은 **그 id로 in-place edit** | `[core] draft-stream.ts:284-328`, `:329-377` |
+| 2 | **어시스턴트 메시지 경계에서 무조건 회전하지 않는다.** `answerLane.finalized`일 때만 `rotateLaneForNewMessage`. 아직 마감 전이면 **다음 메시지가 같은 말풍선에 이어서 스트리밍된다** | `[core] bot-message-dispatch.ts:2713-2725` |
+| 3 | **final은 core가 턴 끝에 N개를 몰아서 준다** (메시지별 실시간 배달이 아니다) | `[core] dispatch-from-config.ts:3941` — `for (const [replyIndex, reply] of replies.entries())` |
+| 4 | 그 N개를 **커서가 순서대로 소비한다.** 첫 final이 현재 draft를 마감(`lane.finalized = true`), 그 다음부터는 `forceNewMessage()` → 새 message_id | `[core] lane-delivery-text-deliverer.ts:593-603`, `bot-message-dispatch.ts:1333-1356`, `draft-stream.ts:703` |
+
+**⇒ 결론: Telegram은 "이 final이 과거 어느 레인 것이냐"를 애초에 묻지 않는다. 물을 과거 레인이 없기 때문이다.** 열려 있는 것은 언제나 커서 하나뿐이고, 지나간 말풍선은 끝난 것이다. §16.5-2의 사다리("현재 draft 마감 → 새 메시지 → preview 유지")는 **이 단일 커서 위에서 도는 규칙**이다.
+
+**비대칭 — 이게 crux다. 이 표를 지우지 마라.**
+
+| | 내장 Telegram | 우리 |
+|---|---|---|
+| `lane`의 의미 | **내용 종류** (`answer`/`reasoning`) — 총 2개 | **어시스턴트 메시지별** (`state.lanes`, `generation`, `currentLane()`, `materializedAnswerLanes()`) — 턴당 N개 |
+| 동시에 열린 답변 말풍선 | 항상 **1개** | **N개** |
+| 턴 끝의 상황 | final N개 + 커서 1개 → 순차 소비, 매칭 불필요 | final N개 + **열린 레인 N개** → "누구 것이냐"가 발생 |
+
+**따라서: "core가 final의 주인을 안 알려줘서 못 붙인다"는 프레이밍은 틀렸다. 그 질문은 core가 만든 게 아니라 우리의 메시지별 레인 설계가 만든 것이다.** 메시지별 말풍선은 우리가 의도한 UX이므로 설계 자체는 유지한다 — 다만 **그 대가로 생긴 질문을 "core 한계"로 부르지 마라.** (N1·N4·메타규칙과 같은 오류 유형이다.)
+
+**실무 규칙 두 줄:**
+- §16.5-2의 사다리를 우리 코드에 대입할 때는 **"현재 draft"가 이 호출 지점에 실제로 존재하는지 먼저 확인하라.** 예: `flushBufferedOrdinaryFinals`에서는 현재 레인이 **정의상 텍스트가 없어서** id도 draft도 없다(그래서 버퍼된 것이다) → 사다리의 1단이 없으므로 문자 그대로 대입하면 "무조건 새 메시지"로 붕괴한다.
+- Telegram의 **렌더 결과**를 목표로 삼지 마라. `forceNewMessage`는 레인 객체가 리셋되어 옛 말풍선에 손댈 수단이 없다는 **구현 한계**지, "소급 귀속은 틀렸다"는 판단이 아니다. **우리는 서버라서 id만 있으면 아무 말풍선이나 언제든 고칠 수 있다.** 한계를 베끼는 것은 N7(shipped 코드 ≠ 스펙)이며, N7은 **core의 shipped 코드에도 똑같이 적용된다.**
+
+### 16.5.2 이 절이 생긴 이유 — 2026-08-24 재발 기록
+
+슬라이스 5(`flushBufferedOrdinaryFinals`) 착수 시, §16.5-2의 사다리를 우리 flush에 직접 대입해 **"원칙대로 하면 말풍선 2개가 4개로 늘고 2개가 중복된다, 그게 Telegram 패리티다"**라는 결론을 내고 사용자에게 선택지로 제시했다. **전부 틀렸다.** 실제로는 위 표대로 Telegram은 말풍선 2개를 그린다. 재발 기전 3가지:
+
+1. **어휘 충돌.** 문서와 우리 코드가 `lane`이라는 같은 단어를 쓰는데 가리키는 대상이 다르다. 그래서 **거짓 유비가 "스펙을 직독한 것"처럼 느껴졌다.** ← 이 절이 막으려는 것.
+2. **기전 확인을 시나리오 확인으로 착각.** `forceNewMessage`가 존재한다는 것만 확인하고, **"그 시나리오가 실제로 발생하는가"는 확인하지 않은 채** 사실로 진술했다. (`[[stub-fixtures-must-be-recorded]]`·`[[prove-an-assertion-fires]]`의 새 변종: **경로의 존재 ≠ 동작의 발생.**)
+3. **서브에이전트 브리프에 결론을 심었다.** "the crux is that core's ladder runs within a caller-supplied lane"이라고 브리프에 써서 보냈다. 에이전트는 그 프레임 **안에서** 최적화했을 뿐 반증할 수 없었다. ⇒ **브리프에 crux를 단정하지 마라. 질문으로 줘라.**
+
+**30초 재검증:** `grep -n "export type LaneName" [core]/extensions/telegram/src/lane-delivery-text-deliverer.ts` — 답이 `"answer" | "reasoning"`이면 이 절은 유효하다.
 
 ### 16.6 이번 라운드가 새로 잡은 fixable 결함 (issue 재편 때 v6 슬라이스로)
 
