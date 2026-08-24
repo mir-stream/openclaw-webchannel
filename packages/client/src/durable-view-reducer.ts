@@ -19,6 +19,20 @@
  * with the REAL wire frames and compares against this reducer's output. A red
  * anchor always means the REDUCER is wrong; never adjust the expectation.
  *
+ * The anchors are not all equally wide, and the narrowing is a CARVE-OUT, not an
+ * oversight: `user`, `bubble` and `seal` compare the FULL projected view (text
+ * included), while `placement` compares only the SLOT SKELETON — id, role,
+ * turnId and ORDER. §15.9 excludes the rolling draft text from the durable view,
+ * so `applyPlacement` stores `text: ""` where the live client shows the draft.
+ * That text drop is the only place an anchor stops short of the live view, and
+ * it is itself pinned — the test file's "the deliberate divergence, and the
+ * precondition trap beside it" characterization block records it, so a change in
+ * either direction goes red instead of passing quietly. Its sibling test there
+ * pins the `answerId: ""` case, which is NOT a divergence of the same kind: that
+ * one is a CALLER-PRECONDITION VIOLATION (BOUNDARY 1 — `bubble.answerId` must be
+ * non-empty), recorded next to it because it is the trap a slice-2 mapper walks
+ * into, not because the reducer chose to differ.
+ *
  * SCOPE: the DURABLE subset of the client's `state.messages` only — `id`,
  * `role`, `text`, `turnId`, and ORDERING. Per §0.1 / the north star ("the
  * client owns its own send/UI state"), the client-local overlay is DELIBERATELY
@@ -33,12 +47,17 @@
  *
  * ⚠️ ARRAY IDENTITY IS NOT A GENERAL NO-OP SIGNAL. Some transitions hand the
  * input array straight back when nothing durable changed, and some always
- * allocate. Measured, exhaustively:
+ * allocate. Measured. The three SAME-array rows are EXHAUSTIVE — they are every
+ * path in this file that returns its input by reference. The two NEW-array rows
+ * are illustrative examples, not an enumeration: allocation is the default here,
+ * so any PATH not listed among the first three allocates. (Path, not
+ * transition: `placement` and `seal` each have paths on BOTH sides of the
+ * divide, even though only `seal` happens to have a row in each section below.)
  *   - `placement`, repeat claim whose turnId resolves unchanged  → SAME array
  *   - `seal`, early return (no valid answers and no removes)     → SAME array
  *   - `seal`, empty/blank turnId early return                    → SAME array
- *   - `bubble` with identical text and turnId                    → NEW array
- *   - `seal` whose answers change nothing                        → NEW array
+ *   - `bubble` with identical text and turnId                    → NEW array (e.g.)
+ *   - `seal` whose answers change nothing                        → NEW array (e.g.)
  * The last two ALWAYS allocate (see `applyBubble` and `applySeal`'s tail); they
  * do not detect no-ops, and teaching them to would be a behavior change this
  * slice does not need. So do NOT build a `prev === next` memo, a
@@ -47,6 +66,37 @@
  * "different ref ⇒ changed". `durable-view-reducer.test.ts` pins all five rows
  * above, the negative cases included, so the next reader measures instead of
  * assuming.
+ *
+ * ⚠️ AN UNKNOWN EVENT KIND IS NOT A NO-OP — AND `return view` IS NOT THE FIX.
+ * The `switch` in `applyDurableEvent` has NO `default`, so an out-of-union
+ * `kind` falls off the end and returns `undefined` while the signature declares
+ * `DurableView`; the NEXT event then throws — `Cannot read properties of
+ * undefined (reading 'findIndex')` for a `placement`/`bubble` — pointing at the
+ * WRONG event. That is unreachable today, and MEASURED rather than assumed:
+ * adding a fifth kind to `DurableEvent` fails tsc at this function's signature
+ * with `error TS2366: Function lacks ending return statement and return type
+ * does not include 'undefined'`, so the forgotten-case path BOUNDARY 2
+ * anticipates cannot ship. With zero runtime consumers and no journal yet, the
+ * ONE surviving path is RUNTIME VERSION SKEW — an older build replaying a
+ * journal a newer build wrote — which first needs #239 (the journal) and #241
+ * (a grown event set). Both obvious fixes are wrong, in the spirit of §0.2:
+ *   - `default: return view;`, mirroring `handleFrame`'s ignore-unknown
+ *     (nats-client-wrapper.ts:2061 — which has no `default:` either; it returns
+ *     `void`, so falling off the end IS its ignore) — REJECTED. That
+ *     faithfulness is about LIVE WIRE FRAMES, where ignoring a frame from a
+ *     newer server is right. A JOURNAL REPLAY is the opposite: the store is the
+ *     SSOT, so silently dropping rows it does not understand is the server
+ *     destroying its own truth — a quietly incomplete history with no signal to
+ *     anyone, the same N8 live≠history shape, arriving through this module.
+ *   - `default: throw` — REJECTED. That is the app dying instead of degrading.
+ * The real answer is RETAIN + RENDER AS UNSUPPORTED: keep the slot and show
+ * "this message is not supported by your version — please update", exactly as
+ * the Telegram app does (our plugin = the Telegram plugin + the Telegram
+ * server; our client = the Telegram app). A four-member CLOSED union cannot
+ * express that, so it is owned by #241 (typed event model) and #246 (protocol
+ * version + runtime wire validation), NOT by this slice. Do not add a `default`
+ * here to silence a reviewer: the absence is deliberate, and this is the reason.
+ * (doc `docs/ISSUE_114_DELIVERY_MIRROR_PLAN.md` §0.2 — the NOT-list.)
  *
  * DEPENDENCY CONTRACT: this file is STRICTLY dependency-free and Node-free — it
  * has no imports at all, not even `node:` built-ins. Two reasons: the client
@@ -88,7 +138,9 @@ export type DurableView = readonly DurableMessage[];
  * The ordered event stream the plugin would journal. Each event corresponds to a
  * real wire frame the client consumes today — the shapes below were read off
  * `packages/plugin/src/channel-contract.ts` (`OutboundWsMessage`) and the
- * wrapper's `handleMessage` cases, and every transition is anchored against the
+ * wrapper's `handleFrame` cases (…:2061 — `handleMessage` at …:2048 is the
+ * outer entry point, which brackets that switch with the live-turn latch
+ * observation and the release gate), and every transition is anchored against the
  * REAL client in `durable-view-reducer.test.ts`. What that covers is the four
  * kinds below; see the two BOUNDARY notes after the type for what it does not.
  *
@@ -96,9 +148,15 @@ export type DurableView = readonly DurableMessage[];
  *                  (nats-client-wrapper.ts:804). Durable subset of the u- bubble.
  *  - `placement` — a `progress` frame for a lane (case "progress",
  *                  nats-client-wrapper.ts:2467). The FIRST one CLAIMS the lane's
- *                  slot (append at tail via `upsertMessage`); it carries no
- *                  durable text (the rolling "Working…" draft is non-durable), so
- *                  the durable text is authored later by a `bubble` or `seal`.
+ *                  slot (append at tail via `upsertMessage`). The frame ALWAYS
+ *                  carries text — `progress.text` is REQUIRED on the wire
+ *                  (channel-contract.ts:66) and the live client writes it
+ *                  (…:2472-2473) — but §15.9 CLASSIFIES that rolling "Working…"
+ *                  draft as an indicator rather than a message, so this event
+ *                  does not carry it and the durable text is authored later by a
+ *                  `bubble` or `seal`. That is a classification, not a wire fact;
+ *                  it is the deliberate divergence pinned by the test file's
+ *                  characterization block.
  *                  `turnId` is OPTIONAL because the wire says so
  *                  (channel-contract.ts:66; nats-channel.ts:469 omits it when
  *                  falsy) and the client stores it verbatim (…:2473). A required
@@ -119,9 +177,21 @@ export type DurableView = readonly DurableMessage[];
  * ── BOUNDARY 1: the id-LESS `agent_message` branch is deliberately NOT modeled ──
  *
  * `bubble.answerId` is mandatory, but the wire today can deliver a durable agent
- * frame with NO id: `nats-channel.ts:458` writes `...(id ? { id } : {})`, and
- * three call sites pass none — `inbound.ts:1549`, `inbound.ts:1599` (the
- * thrown-turn apology) and `channel.ts:303`. The client branches on
+ * frame with NO id. `nats-channel.ts:456` is the ONLY producer of an
+ * `agent_message` frame, and its `sendText` writes `...(id ? { id } : {})`
+ * (…:458), so the id-less set is exactly the `sendText` callers that pass no
+ * `id`. Enumerated from an UNNARROWED repo-wide grep, there are FOUR:
+ *   - `inbound.ts:1549` / `:1550` — the two branches of one ternary (they
+ *     differ only in `assistantMessageIndex`), the ordinary visible reply;
+ *   - `inbound.ts:1599` — the thrown-turn apology;
+ *   - `channel.ts:303` — the generic outbound `sendText(ctx.to, ctx.text)`;
+ *   - `nats-account-runtime.ts:1173` — the /stop operator-allowlist notice.
+ * `message-adapter.ts:126` passes `nextMessageId()` and `nats-channel.ts:483`
+ * (`finalizeDraft`) requires an `id`, so those two are NOT id-less.
+ * ⚠️ COUNT THIS LIST AGAIN BEFORE RELYING ON IT — an earlier revision of this
+ * note said "three" and missed the /stop notice, which is precisely the kind of
+ * miss that would let slice 2 rewire while an id-less path survived.
+ * The client branches on
  * `nats-client-wrapper.ts:2569` `if (id) {…}`, and the else at …:2593-2599 mints
  * `id: \`a-${this.uid()}\`` from a CLIENT-LOCAL counter.
  *
@@ -131,13 +201,35 @@ export type DurableView = readonly DurableMessage[];
  * to kill (NOT-list N4/N5; doc §16.5: identity is assigned at the DELIVERY ACT,
  * by the plugin). The real resolution is that these frames stop being id-less
  * once the plugin assigns identity at delivery (board slice #238), which is why
- * those three call sites become id-bearing.
+ * ALL FOUR call sites above become id-bearing. #238 is not done while any one of
+ * them still omits the id: the survivor is invisible to this module's anchors
+ * (an id-less frame has none, by design), so nothing here would go red.
  *
  * ⚠️ ORDERING CONSTRAINT THIS IMPOSES — the client render must NOT be rewired
  * onto this reducer until #238 lands, and slice 2 must NEVER synthesize an
  * `a-<n>`-style client-local id to feed it. Do either and you get one of the two
  * bugs the module exists to prevent: the reducer's view silently lacks a bubble
  * the live view shows (history ≠ live, N8), or the viewer mints identity (N4).
+ *
+ * ⚠️ AND `""` IS THE OTHER WRONG ANSWER. `bubble.answerId` must be NON-EMPTY;
+ * `""` is NOT the encoding for "id-less". The trap is that the client's two id
+ * sites use DIFFERENT falsiness, so the natural mapper is the broken one:
+ *   - `progress` upserts on `id ?? ""` (nats-client-wrapper.ts:2471) — NULLISH,
+ *     so `""` SURVIVES as a real id. `placement` with `answerId: ""` is
+ *     therefore FAITHFUL;
+ *   - `agent_message` branches on `if (id)` (…:2569) — TRUTHY, so `""` falls
+ *     into the id-less mint branch at …:2593 and gets its own fresh `a-<n>`.
+ * The two sites genuinely differ. A slice-2 mapper writing
+ * `answerId: frame.id ?? ""` for the durable frame — the natural thing to write,
+ * because it mirrors the progress site verbatim — makes N id-less finals
+ * collapse into ONE durable row while live shows N bubbles: an N8 live≠history
+ * divergence landing in the mapper rather than here. Measured and pinned by the
+ * test file's characterization block. Until #238, an id-less `agent_message` has
+ * NO `bubble` event at all.
+ *
+ * `applySeal` already refuses an empty answer id (`a.id.length > 0`, and the
+ * same for the remove filter); `applyBubble` does not, which is why this is a
+ * CALLER precondition and not a guard.
  *
  * ── PRECONDITION: the journal contains no duplicate `user` rows ──
  *
@@ -150,7 +242,8 @@ export type DurableView = readonly DurableMessage[];
  *
  * That is a faithful port, not a defect to fix here: the live client throws
  * identically at nats-client-wrapper.ts:1552-1554. The only difference is
- * reachability — live, `u-${this.seq++}` is monotonic so the precondition cannot
+ * reachability — live, `u-${this.uid()}` (…:804-805, and `uid()` is
+ * `${this.seq++}` at …:1824-1825) is monotonic so the precondition cannot
  * be violated; a journal REPLAY can violate it. Do not "fix" it by making
  * `applyUser` an upsert or by de-duplicating inside `applySeal`: inventing a
  * reconciliation rule the client does not have is exactly the defect class this
@@ -218,9 +311,13 @@ export type DurableEvent =
  * literal `Array.prototype.reduce` over it. `durable-view-reducer.test.ts`
  * pins the agreement of the two entry points.
  *
- * PURE: `view` and `event` are never mutated; a fresh array is returned (or the
- * same reference when the event is a durable no-op, which is safe precisely
- * because nothing here mutates in place).
+ * PURE: `view` and `event` are never mutated. Usually a fresh array is
+ * returned; some transitions instead hand the input back, which is safe
+ * precisely because nothing here mutates in place. Do NOT read that as
+ * "a durable no-op returns the same reference" — it does not (a `bubble`
+ * repeating its text and turnId allocates, and the suite pins it). See the
+ * array-identity table in the file header: it is a partial property, never a
+ * no-op signal.
  */
 export function applyDurableEvent(
   view: DurableView,
@@ -292,6 +389,19 @@ function applyUser(
  * reducer still holds "FINAL ANSWER" — history ≠ live (N8). Do not silently
  * "harmonize" that if you meet it; it means a plugin guard regressed, and the
  * guard is the thing to fix.
+ *
+ * ⚠️ THE FORWARD CASE NEEDS NO REGRESSION AT ALL, so do not read the two guards
+ * above as covering it. A lane that receives `progress` and then NEVER a durable
+ * frame is reachable today: an aborted turn, a dropped connection, or the
+ * thrown-turn apology at `inbound.ts:1599`, which is id-LESS and therefore
+ * APPENDS a new bubble (BOUNDARY 1) while leaving the draft bubble in place. In
+ * every one of those the live view shows the lane's partial text where this
+ * reducer holds `""` — the same N8 shape, arrived at without any guard failing.
+ * That is the §15.9 classification working as designed at the reducer level;
+ * whether history should then render an empty bubble at all (drop it? show a
+ * placeholder? keep the slot?) is a slice-2 RENDER question, tracked separately.
+ * Do not resolve it here by teaching the reducer to keep draft text — that is
+ * the §15.9 reversal, and it would put the decision in the wrong layer.
  */
 function applyPlacement(
   view: DurableView,
@@ -317,7 +427,7 @@ function applyPlacement(
  * dominance): a `seal` remove drops the id, and a LATER `bubble` re-appends it.
  *
  * NOTE the asymmetry in `role`, which mirrors the client exactly: the UPDATE
- * branch (nats-client-wrapper.ts:2571-2578) spreads `prev` and writes only
+ * branch (nats-client-wrapper.ts:2572-2578) spreads `prev` and writes only
  * text/working/turnId — it never touches `role` — while only the APPEND fallback
  * (…:2579-2586) sets `role: "agent"`. Unreachable today (the u-/a-/lane id
  * namespaces do not collide), but this module's entire product is

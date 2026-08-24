@@ -265,8 +265,12 @@ describe("step / fold agreement: reduceDurableView === fold of applyDurableEvent
   // ARRAY IDENTITY — pins the header's table, negative rows included.
   // -------------------------------------------------------------------------
   //
-  // Array identity is a PARTIAL property: two transitions hand the input back on
-  // a durable no-op, two others always allocate. The negative rows matter as much
+  // Array identity is a PARTIAL property: `placement` and `seal` each have paths
+  // that hand the input back, while `user` and `bubble` ALWAYS allocate. The
+  // three SAME-array rows below are exhaustive — they are every `return view` in
+  // the module — and the two NEW-array rows are examples, not a partition (a
+  // `seal` appears on both sides, and `user` has no row at all because it can
+  // never return its input). The negative rows matter as much
   // as the positive ones — without them the header's narrowed claim is just
   // prose, and a slice-2 author could build a `prev === next` memo or a
   // `useSyncExternalStore` equality check on an invariant the code never held.
@@ -390,6 +394,80 @@ describe("characterization: a duplicated `user` row violates the reducer's preco
 });
 
 // ---------------------------------------------------------------------------
+// CHARACTERIZATION — the deliberate divergence, and the precondition trap
+// ---------------------------------------------------------------------------
+//
+// The module's claim is byte-faithfulness, and the anchors below back it. These
+// two tests record where the reducer's output is NOT the live view — but they
+// are two DIFFERENT categories, and conflating them invites the wrong fix:
+//
+//  - `placement` dropping the draft text is a DELIBERATE DESIGN DIVERGENCE. The
+//    §15.9 indicator classification chose it; the reducer is behaving correctly.
+//  - `bubble` with `answerId: ""` is NOT deliberate. It is a CALLER-PRECONDITION
+//    VIOLATION — BOUNDARY 1 requires `bubble.answerId` to be non-empty, and the
+//    module states that this is a CALLER precondition and not a guard (the same
+//    category as the duplicated-`user` block above). It is recorded here because
+//    it is the trap a slice-2 mapper walks into, not because the reducer chose
+//    to differ.
+//
+// Both RECORD; neither endorses. A change in EITHER direction — the reducer
+// starting to mirror the client here, or the client changing under it — must
+// turn one of them red rather than pass silently.
+
+describe("characterization: the deliberate divergence, and the precondition trap beside it", () => {
+  it("placement drops the draft text the live view shows (§15.9 indicator, not a message)", () => {
+    // `progress.text` is REQUIRED on the wire (channel-contract.ts:66) and the
+    // real client writes it into the bubble (nats-client-wrapper.ts:2472-2473).
+    // The reducer appends `text: ""` instead. That is the settled §15.9 decision
+    // — the rolling draft is a 표시기 (indicator), not a message — and it is the
+    // ONLY reason the `placement` anchors compare `slotSkeleton` rather than the
+    // whole view. Recorded here so the delta is a fact in the suite instead of a
+    // gap: do NOT "fix" the reducer to match, and do NOT widen the placement
+    // anchors to compare text — either move is a §15.9 reversal that belongs in
+    // the doc first.
+    const real = realDrive([], [progressFrame("A", "partial answer so far", TURN)]);
+    const reduced = reduceDurableView([{ kind: "placement", answerId: "A", turnId: TURN }]);
+
+    expect(real[0].text).toBe("partial answer so far");
+    expect(reduced[0].text).toBe("");
+    // …and the divergence is confined to `text`: everything placement DOES claim
+    // to mirror still matches exactly.
+    expect(slotSkeleton(reduced)).toEqual(slotSkeleton(real));
+  });
+
+  it('bubble with an EMPTY answerId is NOT "id-less" — the live client mints separate bubbles', () => {
+    // The client's two id sites use DIFFERENT falsiness, and this is the trap it
+    // sets for slice 2's mapper (see BOUNDARY 1 in durable-view-reducer.ts):
+    //   - `progress` upserts on `id ?? ""` (…:2471) — NULLISH, so "" survives as
+    //     a real id, which is why `placement` with `answerId: ""` is FAITHFUL;
+    //   - `agent_message` branches on `if (id)` (…:2569) — TRUTHY, so "" falls
+    //     into the id-less mint branch at …:2593 and gets a fresh `a-<n>`.
+    // So two id-less finals are TWO bubbles live, while a mapper that mirrors the
+    // progress site verbatim (`answerId: frame.id ?? ""`) collapses them into ONE
+    // durable row — an N8 live≠history divergence landing in the mapper. Hence
+    // `bubble.answerId` must be NON-EMPTY; "" is not the encoding for "id-less",
+    // and until #238 an id-less `agent_message` has NO `bubble` event at all.
+    const real = realDrive([], [
+      agentMessageFrame("", "one", TURN),
+      agentMessageFrame("", "two", TURN),
+    ]);
+    expect(real).toHaveLength(2);
+    expect(real.map((m) => m.text)).toEqual(["one", "two"]);
+    for (const m of real) expect(m.id).not.toBe("");
+    // Non-vacuity: they are distinct client-minted ids, not one bubble twice.
+    expect(new Set(real.map((m) => m.id)).size).toBe(2);
+
+    const reduced = reduceDurableView([
+      { kind: "bubble", answerId: "", text: "one", turnId: TURN },
+      { kind: "bubble", answerId: "", text: "two", turnId: TURN },
+    ]);
+    expect(reduced).toHaveLength(1);
+    expect(reduced[0].id).toBe("");
+    expect(reduced[0].text).toBe("two");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // EQUIVALENCE ANCHORS — every transition vs. the REAL client
 // ---------------------------------------------------------------------------
 //
@@ -397,13 +475,22 @@ describe("characterization: a duplicated `user` row violates the reducer's preco
 // does TODAY. A hand-written expectation cannot distinguish a faithful mirror
 // from a merely plausible one, so each of the four transitions is anchored by
 // driving the REAL `WebChannelNATSClient` with the REAL wire frames and
-// comparing `projectDurable(state.messages)` against the reducer's output for
-// the corresponding event stream:
+// comparing its projected `state.messages` against the reducer's output for the
+// corresponding event stream:
 //
 //   user      → the real public `send()` → `publish()` (nats-client-wrapper.ts:804)
-//   placement → a real `progress` frame  → `handleMessage` case (…:2467)
-//   bubble    → a real `agent_message`   → `handleMessage` case (…:2562)
+//   placement → a real `progress` frame  → `handleFrame` case (…:2467)
+//   bubble    → a real `agent_message`   → `handleFrame` case (…:2562)
 //   seal      → a real `turn_snapshot`   → `applyTurnSnapshot`  (…:1486-1557)
+//
+// WHAT IS COMPARED IS NOT UNIFORM, and the difference is a carve-out rather than
+// an oversight. `user`, `bubble` and `seal` compare the FULL projected view
+// (`projectDurable(state.messages)`, text included). `placement` compares only
+// the SLOT SKELETON — id / role / turnId / order — because §15.9 excludes the
+// rolling draft text from the durable view, so the reducer deliberately stores
+// `text: ""` where the live client shows the draft. That single delta is itself
+// pinned, by the characterization test above ("placement drops the draft text
+// the live view shows"), so it is observed and not merely narrated.
 //
 // The discipline that makes these worth anything is NON-CIRCULARITY: they call
 // real client code, never a second copy of the reducer. Nothing in this section
@@ -634,7 +721,7 @@ describe("equivalence anchor: bubble ≡ a real agent_message frame", () => {
   });
 
   it("an agent_message on a held id does NOT rewrite that bubble's role", () => {
-    // nats-client-wrapper.ts:2571-2578 — the UPDATE branch spreads `prev` and
+    // nats-client-wrapper.ts:2572-2578 — the UPDATE branch spreads `prev` and
     // sets text/working/turnId only; it never writes `role`. Only the APPEND
     // fallback (…:2579-2586) sets `role: "agent"`. Unreachable today (u-/a-/lane
     // id namespaces do not collide), but byte-faithfulness is this module's
@@ -790,6 +877,28 @@ describe("equivalence anchor: reduceDurableView(seal) ≡ real turn_snapshot han
           { id: "A", text: "A" },
           { id: "B", text: "minted B" },
           { id: "C", text: "minted C" },
+        ],
+        remove: [],
+      },
+    },
+    // Covers `applySeal` step 3's `k === 0` sub-branch — the one that runs when
+    // answers[0] is ABSENT from the view while a LATER answer is PRESENT. Every
+    // other case above mints only at k > 0 (predecessor lookup) or has no
+    // surviving answer to anchor against, so WITHOUT this case the branch is
+    // DEAD to the suite: deleting its body leaves the whole file green while
+    // silently changing ORDERING — [Z, A, NOTICE] becomes [Z, NOTICE, A] — which
+    // is precisely the property this module exists to guarantee.
+    {
+      name: "minted answers[0] lands at the FIRST answer slot, not the tail",
+      prior: [
+        { kind: "bubble", answerId: "A", turnId: TURN, text: "A" },
+        { kind: "bubble", answerId: "NOTICE", turnId: TURN, text: "notice" },
+      ],
+      seal: {
+        turnId: TURN,
+        answers: [
+          { id: "Z", text: "minted Z" },
+          { id: "A", text: "A" },
         ],
         remove: [],
       },

@@ -54,11 +54,21 @@ const TURN = "turn-1";
  * and `remove` (a mis-routed overflow bubble), then a post-seal resurrect.
  *
  * This is a VERBATIM copy of `MIXED_STREAM` in
- * `packages/client/src/durable-view-reducer.test.ts`, and the expected view
- * below is that file's expectation. The copy is deliberate: a fixture shared
- * through the module under test would let both sides drift together, whereas two
- * independently written expectations of the same stream is what makes this a
- * drift guard. If you change one, this file goes red until you change the other.
+ * `packages/client/src/durable-view-reducer.test.ts` — copied rather than shared,
+ * because a fixture imported through the module under test would let both sides
+ * drift together.
+ *
+ * The two expectations below are NOT both duplicated across the packages, and it
+ * is worth being precise about which is which:
+ *   - the ID-ORDER expectation is asserted on BOTH sides (there, in the
+ *     "step / fold agreement" block); it is the redundant one, so a rule change
+ *     that reorders this stream turns BOTH files red;
+ *   - the FULL-OBJECT expectation (role/text/turnId per row) exists ONLY here.
+ *     The client side never asserts it for this stream, so it is written
+ *     independently against the same input rather than copied from anywhere.
+ * Either way the drift guard holds: a fork of the reducer's rules on one side
+ * cannot satisfy both files at once. Do not "sync" these by importing them from
+ * the client test — the independence is the mechanism.
  */
 const STREAM: DurableEvent[] = [
   { kind: "user", id: "u-0", text: "do the thing", turnId: "w-0" },
