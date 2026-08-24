@@ -54,7 +54,28 @@ approach flipped repeatedly at the spec level. To stop the oscillation:
 
 - **SSOT design doc:** `docs/ISSUE_114_DELIVERY_MIRROR_PLAN.md`. Read **§0** (the
   principle), **§0.2** (the anti-regression NOT-list — the discarded paths and the
-  facts that kill them), **§15** (v6 design), **§16.5** (the settled identifier verdict).
+  facts that kill them), **§15** (v6 design), **§16.5** (the settled identifier verdict),
+  and **§16.5.1 — HOW the built-in Telegram channel keeps identity (one cursor).**
+- **⭐ If the question is about FINAL IDENTITY ("which answer does this final belong
+  to?"), read §16.5.1 and §16.5.3 FIRST — before §16.5, before the code.** That
+  question has burned days at a time, repeatedly. Two facts dissolve it:
+
+  1. **§16.5.1 — Telegram's `lane` is a CONTENT TYPE** (`"answer" | "reasoning"` —
+     exactly two), so only one answer bubble is ever open and turn-end finals are
+     consumed by a single advancing cursor. **Our** `lane` is per-assistant-message,
+     so we hold N open at once. Same word, different thing. The matching question is
+     created by OUR design, not by core.
+  2. **§16.5.3 — "finals have no identity" is three different claims wedged into
+     one, and none is a core limit.** Durable id: *we mint it* (already shipped).
+     Live routing: core gives no pointer but **does give an ordered array** — order
+     IS the correlation, which is exactly what Telegram's cursor uses. Retroactive
+     attribution: Telegram cannot do it either, and the cursor model never needs it.
+     **So it is not "unidentifiable" — there is no pointer, but there is order.** Our
+     actual bug is order we threw away ourselves (`materializedAnswerLanes()`), not
+     information core withheld.
+
+  Do not port Telegram's *render* either: its `forceNewMessage` is a lane-reset
+  limitation we do not share — we are the server and can edit any bubble by id.
 - **Live board:** GitHub issue **#236** (v6 umbrella) + its slices. It embeds the
   NOT-list. Old design issues are CLOSED — do not reopen those approaches.
 - **The principle:** *our plugin = Telegram plugin + Telegram server; our client =
