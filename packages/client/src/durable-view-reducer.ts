@@ -25,10 +25,13 @@
  * turnId and ORDER. §15.9 excludes the rolling draft text from the durable view,
  * so `applyPlacement` stores `text: ""` where the live client shows the draft.
  * That text drop is the only place an anchor stops short of the live view, and
- * it is itself pinned — the test file's "two DELIBERATE divergences"
- * characterization block records it (alongside the `answerId: ""` divergence of
- * BOUNDARY 1), so a change in either direction goes red instead of passing
- * quietly.
+ * it is itself pinned — the test file's "the deliberate divergence, and the
+ * precondition trap beside it" characterization block records it, so a change in
+ * either direction goes red instead of passing quietly. Its sibling test there
+ * pins the `answerId: ""` case, which is NOT a divergence of the same kind: that
+ * one is a CALLER-PRECONDITION VIOLATION (BOUNDARY 1 — `bubble.answerId` must be
+ * non-empty), recorded next to it because it is the trap a slice-2 mapper walks
+ * into, not because the reducer chose to differ.
  *
  * SCOPE: the DURABLE subset of the client's `state.messages` only — `id`,
  * `role`, `text`, `turnId`, and ORDERING. Per §0.1 / the north star ("the
@@ -61,6 +64,37 @@
  * "different ref ⇒ changed". `durable-view-reducer.test.ts` pins all five rows
  * above, the negative cases included, so the next reader measures instead of
  * assuming.
+ *
+ * ⚠️ AN UNKNOWN EVENT KIND IS NOT A NO-OP — AND `return view` IS NOT THE FIX.
+ * The `switch` in `applyDurableEvent` has NO `default`, so an out-of-union
+ * `kind` falls off the end and returns `undefined` while the signature declares
+ * `DurableView`; the NEXT event then throws — `Cannot read properties of
+ * undefined (reading 'findIndex')` for a `placement`/`bubble` — pointing at the
+ * WRONG event. That is unreachable today, and MEASURED rather than assumed:
+ * adding a fifth kind to `DurableEvent` fails tsc at this function's signature
+ * with `error TS2366: Function lacks ending return statement and return type
+ * does not include 'undefined'`, so the forgotten-case path BOUNDARY 2
+ * anticipates cannot ship. With zero runtime consumers and no journal yet, the
+ * ONE surviving path is RUNTIME VERSION SKEW — an older build replaying a
+ * journal a newer build wrote — which first needs #239 (the journal) and #241
+ * (a grown event set). Both obvious fixes are wrong, in the spirit of §0.2:
+ *   - `default: return view;`, mirroring `handleFrame`'s ignore-unknown
+ *     (nats-client-wrapper.ts:2061 — which has no `default:` either; it returns
+ *     `void`, so falling off the end IS its ignore) — REJECTED. That
+ *     faithfulness is about LIVE WIRE FRAMES, where ignoring a frame from a
+ *     newer server is right. A JOURNAL REPLAY is the opposite: the store is the
+ *     SSOT, so silently dropping rows it does not understand is the server
+ *     destroying its own truth — a quietly incomplete history with no signal to
+ *     anyone, the same N8 live≠history shape, arriving through this module.
+ *   - `default: throw` — REJECTED. That is the app dying instead of degrading.
+ * The real answer is RETAIN + RENDER AS UNSUPPORTED: keep the slot and show
+ * "this message is not supported by your version — please update", exactly as
+ * the Telegram app does (our plugin = the Telegram plugin + the Telegram
+ * server; our client = the Telegram app). A four-member CLOSED union cannot
+ * express that, so it is owned by #241 (typed event model) and #246 (protocol
+ * version + runtime wire validation), NOT by this slice. Do not add a `default`
+ * here to silence a reviewer: the absence is deliberate, and this is the reason.
+ * (doc `docs/ISSUE_114_DELIVERY_MIRROR_PLAN.md` §0.2 — the NOT-list.)
  *
  * DEPENDENCY CONTRACT: this file is STRICTLY dependency-free and Node-free — it
  * has no imports at all, not even `node:` built-ins. Two reasons: the client

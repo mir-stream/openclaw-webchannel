@@ -390,16 +390,27 @@ describe("characterization: a duplicated `user` row violates the reducer's preco
 });
 
 // ---------------------------------------------------------------------------
-// CHARACTERIZATION — the two DELIBERATE divergences from the live client
+// CHARACTERIZATION — the deliberate divergence, and the precondition trap
 // ---------------------------------------------------------------------------
 //
 // The module's claim is byte-faithfulness, and the anchors below back it. These
-// two tests carve out the exceptions, so the carve-outs are OBSERVED rather than
-// merely asserted in prose. They RECORD; they do not endorse. A change in EITHER
-// direction — the reducer starting to mirror the client here, or the client
-// changing under it — must turn one of them red rather than pass silently.
+// two tests record where the reducer's output is NOT the live view — but they
+// are two DIFFERENT categories, and conflating them invites the wrong fix:
+//
+//  - `placement` dropping the draft text is a DELIBERATE DESIGN DIVERGENCE. The
+//    §15.9 indicator classification chose it; the reducer is behaving correctly.
+//  - `bubble` with `answerId: ""` is NOT deliberate. It is a CALLER-PRECONDITION
+//    VIOLATION — BOUNDARY 1 requires `bubble.answerId` to be non-empty, and the
+//    module states that this is a CALLER precondition and not a guard (the same
+//    category as the duplicated-`user` block above). It is recorded here because
+//    it is the trap a slice-2 mapper walks into, not because the reducer chose
+//    to differ.
+//
+// Both RECORD; neither endorses. A change in EITHER direction — the reducer
+// starting to mirror the client here, or the client changing under it — must
+// turn one of them red rather than pass silently.
 
-describe("characterization: the two DELIBERATE divergences from the live client", () => {
+describe("characterization: the deliberate divergence, and the precondition trap beside it", () => {
   it("placement drops the draft text the live view shows (§15.9 indicator, not a message)", () => {
     // `progress.text` is REQUIRED on the wire (channel-contract.ts:66) and the
     // real client writes it into the bubble (nats-client-wrapper.ts:2472-2473).
