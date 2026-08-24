@@ -1642,8 +1642,8 @@ export async function handleInboundMessage(
     // the only thing keeping this run's claim in the registry, and a claim that
     // outlives its run poisons its tuple for every later origin on the same
     // key. Normal return, throw, provider error and abort all pass through
-    // here; the claim is removed by its own id, so a run retained across a
-    // teardown rotation releases only itself.
+    // here; the claim is removed by its own id, so a run retained when an
+    // approval-stream restart rotates the barrier releases only itself.
     originLease?.release();
     if (toolActivitySink) {
       for (const runId of agentRunIds) {

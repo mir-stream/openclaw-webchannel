@@ -243,7 +243,6 @@ export class ApprovalOriginLeaseRegistry implements ApprovalOriginRegistry {
    */
   private nextClaimId = 1;
 
-  private epoch = 0;
   private barrierMs = 0;
   private clockTrusted = false;
   private lastObservedMs = Number.NEGATIVE_INFINITY;
@@ -368,16 +367,16 @@ export class ApprovalOriginLeaseRegistry implements ApprovalOriginRegistry {
 
   /**
    * Start a new epoch (the approval request stream restarting — see
-   * `startClawApprovalMonitor`; #267): draw a fresh barrier, restore clock
-   * trust, and drop the previous epoch's poison.
+   * `startClawApprovalMonitor`; #267): draw a fresh barrier, re-evaluate clock
+   * trust against the preserved high-water mark, and drop the previous epoch's
+   * poison.
    *
-   * Active claims are deliberately RETAINED — a handler that survived teardown
-   * owns its lease until its own `release()`. Retained claims are then rescanned
-   * so any still-overlapping canonical key is re-poisoned immediately, before
-   * any resolve can observe the cleared set.
+   * Active claims are deliberately RETAINED — a handler still running across
+   * an approval-stream restart owns its lease until its own `release()`.
+   * Retained claims are then rescanned so any still-overlapping canonical key
+   * is re-poisoned immediately, before any resolve can observe the cleared set.
    */
   rotateEpoch(): void {
-    this.epoch += 1;
     this.poisonedKeys.clear();
     this.epochGloballyPoisoned = false;
     this.establishBarrier();

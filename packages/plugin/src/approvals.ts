@@ -893,8 +893,8 @@ type OriginUnresolvedReason =
   | "active_ambiguous"
   // Distinct from `active_ambiguous` on purpose: this one means the registry's
   // whole epoch failed closed, so EVERY fallback approval in the process is
-  // being dropped until the next teardown — a process-wide outage, not one
-  // confusable tuple.
+  // being dropped until the next approval-stream start rotates the epoch — a
+  // process-wide outage, not one confusable tuple.
   | "epoch_poisoned"
   // The process-global registry itself is unusable (an incompatible co-installed
   // build owns the versioned slot). Never folded into `sdk_error`, which would
@@ -1235,10 +1235,11 @@ export async function startClawApprovalMonitor(
   //
   // Rotation deliberately does NOT drop active claims: the queue lets a running
   // handler settle instead of aborting it (`inbound-queue.ts:393`), and that
-  // handler still owns its lease until its own `finally`. Because the start time
-  // is read at `onAgentRunStart` and not at lease creation, such a run records a
-  // post-barrier timestamp and can still serve requests it genuinely creates
-  // after this point — the contract the module header states.
+  // handler still owns its lease until its own `finally`. A run already active
+  // at rotation retains its original pre-barrier `activatedAtMs`, which still
+  // orders strictly before a request it genuinely creates after the barrier. A
+  // handle created before rotation but activated after it instead reads and
+  // records a post-barrier start time at `onAgentRunStart` — the #267 case.
   //
   // Rotating here also keeps clock-trust recovery reachable: an anomalous clock
   // read closes the epoch until the next rotation, and channel start is the only
