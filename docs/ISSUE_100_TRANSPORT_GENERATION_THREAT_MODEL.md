@@ -88,8 +88,9 @@ audience, JWKS source/material configuration 또는 `requirePoP` 정책을 바�
    `T1/account/P → T2/account/P`가 같은 core session/history namespace를 재사용할 수 있다. 이 더 넓은
    문제는 [#112](https://github.com/mir-stream/openclaw-webchannel/issues/112)가 소유한다.
 7. **#93 lease도 tenant/scope를 모른다.** claim은 exact raw account, session key, peer만 보존한다
-   (`approval-origin.ts:107-125`). host teardown의 `rotateEpoch()`은 replay barrier를 세우지만, 계속 실행 중인
-   handler의 active claim은 의도적으로 유지한다(`approval-origin.ts:350-365`; `inbound.ts:112-134`).
+   (`approval-origin.ts:107-125`). #267 이후 `startClawApprovalMonitor`가 approval-stream/channel-account 시작 시
+   호출하는 `rotateEpoch()`은 replay barrier를 세우지만, 계속 실행 중인 handler의 active claim은 의도적으로 유지한다
+   (`approvals.ts:1227-1261`; `approval-origin.ts:379-386`).
 8. **승인 delivery와 snapshot도 tenant/scope를 모른다.** live transport lookup은 account ID로만 현재
    runtime을 찾고(`nats-account-runtime.ts:323-326`), pending/resolved store와 조회는 normalized account와
    approval ID 또는 peer로만 key/filter한다(`approvals.ts:193-265`, `:399-422`). 등록 성공 시 현재 runtime은
@@ -116,7 +117,8 @@ tenant 없는 core session/history, tenant 없는 approval state는 구분해야
 2. 그 run의 #93 lease는 `(rawAccount=A, sessionKey, peer=P)`만 보존한다.
 3. operator가 같은 account A의 tenant만 T2로 바꾸어 host/account lifecycle을 reload한다. issuer,
    audience, JWKS configuration과 `requirePoP`은 그대로 둘 수 있다.
-4. teardown은 epoch를 rotate하지만 아직 실행 중인 G1 handler의 active claim은 유지한다.
+4. #267 이후 G2의 approval-stream/channel-account 시작에서 `startClawApprovalMonitor`가 epoch를 rotate하지만
+   아직 실행 중인 G1 handler의 active claim은 유지한다.
 5. G2가 `(tenant=T2, account=A)`로 게시되고, T2가 서명된 자격증명의 `sub=P`가 정상적으로 등록한다.
 6. retained G1 run이 approval을 만들면 fallback은 old lease에서 `P`를 얻고, account-only `transportFor(A)`는
    현재 G2 channel을 고른다. pending/resolved store도 tenant를 구별하지 않아 G2 register snapshot으로 같은

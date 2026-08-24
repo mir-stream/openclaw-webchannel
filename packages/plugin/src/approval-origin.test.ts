@@ -381,39 +381,142 @@ describe("ApprovalOriginLeaseRegistry — request time", () => {
 });
 
 describe("ApprovalOriginLeaseRegistry — epoch rotation", () => {
-  it("never resolves a handle that lay dormant across a rotation", () => {
+  it("fails closed when a rotation redraws the barrier behind the observed clock", () => {
     const h = harness();
-    h.set(1_010);
-    const dormant = h.lease("AcctA", "peerA");
     h.set(1_020);
-    h.registry.rotateEpoch();
-    h.set(1_030);
-    dormant.activate();
-    h.set(1_050);
-    // The run IS live and does hold a claim (it must stay visible to the
-    // overlap poison — see the dormant-overlap test below), but its start time
-    // proves nothing, so it can never be selected for any request time.
-    for (const requestCreatedAtMs of [1_021, 1_031, 1_040, 1_050]) {
-      expect(h.resolve("AcctA", requestCreatedAtMs)).toEqual({
-        kind: "no_match",
-      });
-    }
+    // The first delivery has no live claim, but advances the registry's clock
+    // observation before the wall clock steps backwards.
+    expect(h.resolve("AcctA", 1_015)).toEqual({ kind: "no_match" });
+
+    h.set(1_010);
+    h.registry.rotateEpoch(); // backwards barrier = 1_010; epoch is untrusted
+    const postJump = h.lease("AcctA", "peerA");
+    h.set(1_012);
+    postJump.activate();
+    h.set(1_016);
+    // The preserved 1_015 stamp now looks post-barrier and post-activation, but
+    // accepting it would hand a pre-jump approval to the new peer.
+    expect(h.resolve("AcctA", 1_015)).toEqual({
+      kind: "invalid_request_time",
+    });
   });
 
-  it("poisons the tuple when a dormant handle activates over a retained claim", () => {
+  it.each([
+    { kind: "higher", secondRotationMs: 1_011 },
+    { kind: "equal", secondRotationMs: 1_010 },
+  ])(
+    "does not restore trust on a second $kind rotation below the pre-jump high-water",
+    ({ secondRotationMs }) => {
+      const h = harness();
+      h.set(1_020);
+      expect(h.resolve("AcctA", 1_015)).toEqual({ kind: "no_match" });
+      h.set(1_010);
+      h.registry.rotateEpoch(); // backwards barrier closes this epoch
+
+      // Neither advancing below 1_020 nor repeating the backwards baseline can
+      // erase the pre-jump high-water and make its preserved stamp look new.
+      h.set(secondRotationMs);
+      h.registry.rotateEpoch();
+      h.set(1_012);
+      h.run("AcctA", "peerA");
+      h.set(1_016);
+      expect(h.resolve("AcctA", 1_015)).toEqual({
+        kind: "invalid_request_time",
+      });
+    },
+  );
+
+  it("restores trust only after a rotation catches up to the pre-jump high-water", () => {
+    const h = harness();
+    h.set(1_020);
+    expect(h.resolve("AcctA", 1_015)).toEqual({ kind: "no_match" });
+    h.set(1_010);
+    h.registry.rotateEpoch(); // backwards barrier closes this epoch
+
+    h.set(1_025);
+    h.registry.rotateEpoch(); // past high-water; barrier = 1_025, trust restored
+    h.set(1_030);
+    h.run("AcctA", "peerA");
+    h.set(1_040);
+    // An ordinary post-recovery request proves the registry is answering again.
+    expect(h.resolve("AcctA", 1_035)).toEqual({
+      kind: "resolved",
+      peerId: "peerA",
+    });
+    // Recovery is safe because its barrier now fences the preserved pre-jump
+    // stamp instead of merely declaring a low baseline trustworthy.
+    expect(h.resolve("AcctA", 1_015)).toEqual({
+      kind: "invalid_request_time",
+    });
+  });
+
+  it("resolves a handle created before a rotation and activated after it (#267)", () => {
     const h = harness();
     h.set(1_010);
-    h.run("AcctA", "peerA"); // survives teardown, keeps its lease
-    h.set(1_012);
-    const dormant = h.lease("AcctA", "peerB");
+    const spanning = h.lease("AcctA", "peerA");
     h.set(1_020);
     h.registry.rotateEpoch(); // barrier = 1_020
     h.set(1_030);
-    dormant.activate(); // live run, unprovable start time
+    spanning.activate(); // start time READ HERE — after the barrier
+    h.set(1_050);
+    // The start time is not inherited from the fenced-off epoch: it is read at
+    // activation, so it proves the run began at 1_030, after the barrier. A
+    // request the run genuinely created afterwards resolves, which is exactly
+    // what the module header promises a retained run may still do.
+    expect(h.resolve("AcctA", 1_031)).toEqual({
+      kind: "resolved",
+      peerId: "peerA",
+    });
+    expect(h.resolve("AcctA", 1_050)).toEqual({
+      kind: "resolved",
+      peerId: "peerA",
+    });
+  });
+
+  it("still refuses a request created before the spanning handle activated (#267)", () => {
+    const h = harness();
+    h.set(1_010);
+    const spanning = h.lease("AcctA", "peerA");
+    h.set(1_020);
+    h.registry.rotateEpoch(); // barrier = 1_020
+    h.set(1_030);
+    spanning.activate();
+    h.set(1_050);
+    // Strict ordering is untouched: post-barrier but pre-activation is still
+    // unprovable, and same-millisecond equality does not count as ordering.
+    expect(h.resolve("AcctA", 1_021)).toEqual({ kind: "no_match" });
+    expect(h.resolve("AcctA", 1_030)).toEqual({ kind: "no_match" });
+  });
+
+  it("still refuses a pre-barrier request replayed after a rotation", () => {
+    const h = harness();
+    h.set(1_010);
+    h.run("AcctA", "peerA");
+    h.set(1_020);
+    h.registry.rotateEpoch(); // barrier = 1_020
+    h.set(1_050);
+    // The replay guard is independent of claim activation and #267 does not
+    // touch it: a request stamped before the barrier can never be attributed.
+    expect(h.resolve("AcctA", 1_015)).toEqual({ kind: "invalid_request_time" });
+    expect(h.resolve("AcctA", 1_020)).toEqual({ kind: "invalid_request_time" });
+  });
+
+  it("poisons the tuple when a spanning handle activates over a retained claim", () => {
+    const h = harness();
+    h.set(1_010);
+    h.run("AcctA", "peerA"); // survives the restart, keeps its lease
+    h.set(1_012);
+    const spanning = h.lease("AcctA", "peerB");
+    h.set(1_020);
+    h.registry.rotateEpoch(); // barrier = 1_020
+    h.set(1_030);
+    spanning.activate();
 
     h.set(1_050);
     // Two exact origins are live on one tuple. A post-barrier request could
-    // have come from either, so it must not be handed to peerA.
+    // have come from either, so it must not be handed to peerA — and #267 must
+    // not weaken that: making the spanning claim PROVABLE makes this MORE
+    // clearly ambiguous, never resolvable.
     expect(h.resolve("AcctA", 1_040)).toEqual({ kind: "ambiguous" });
   });
 
@@ -602,19 +705,6 @@ describe("ApprovalOriginLeaseRegistry — clock anomalies", () => {
     // Service is restored: this is a real answer about the retained claim, not
     // a clock rejection.
     expect(h.resolve("AcctA", 1_055)).toEqual({
-      kind: "resolved",
-      peerId: "peerA",
-    });
-  });
-
-  it("accepts a backwards jump at rotation as a fresh baseline", () => {
-    const h = harness(5_000);
-    h.set(1_000);
-    h.registry.rotateEpoch(); // barrier = 1_000
-    h.set(1_010);
-    h.run("AcctA", "peerA");
-    h.set(1_030);
-    expect(h.resolve("AcctA", 1_020)).toEqual({
       kind: "resolved",
       peerId: "peerA",
     });
