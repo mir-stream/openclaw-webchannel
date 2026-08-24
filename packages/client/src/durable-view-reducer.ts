@@ -401,10 +401,10 @@ function applyUser(
  * this file enforces it, and nothing type-checks it — it holds only because the
  * plugin never emits such a frame. Two guards are why:
  *   - `attemptProgress` refuses a lane frame once the lane is done
- *     (message-adapter.ts:1332-1333, `lane.closed || lane.settled`);
+ *     (message-adapter.ts:1447-1455, `lane.closed || lane.settled`);
  *   - the provisional-preview path invalidates its scaffold writer before
- *     finalizing (message-adapter.ts:1643), so a late preview progress is
- *     dropped by the `scaffoldWriter !== "active"` check at …:1309-1313.
+ *     finalizing (message-adapter.ts:1727), so a late preview progress is
+ *     dropped by the `scaffoldWriter !== "active"` check at …:1427.
  *
  * If the plugin ever violates it, the live client and a journal replay DIVERGE:
  * `agent_message A "FINAL ANSWER"` followed by `progress A "Working…"` leaves the

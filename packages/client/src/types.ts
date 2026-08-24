@@ -155,9 +155,17 @@ export type ChatMessage = {
    *
    * §15.9 classifies the rolling "Working…" draft as a 표시기 (indicator), not a
    * message, so a `draftOnly` bubble contributes `text: ""` to the durable view
-   * (`nats-client-wrapper.ts`'s `durableProjection`). Set by the `progress`
-   * overlay; CLEARED by any `agent_message`/`turn_snapshot` that authors durable
-   * text for the same id.
+   * (`nats-client-wrapper.ts`'s `durableProjection`).
+   *
+   * CLAIMED, NEVER ADDED — the one invariant to keep. Only an absent bubble, or
+   * one that already carries the bit, may take it. Adding it to a bubble that
+   * already holds authored durable text would let a single stray `progress`
+   * frame turn a delivered answer into a DELETED one at turn end (M212g: a
+   * visible duplicate is recoverable where a deletion is not).
+   *
+   * Three writers CLEAR it: an `agent_message` or `turn_snapshot` that authors
+   * durable text for the same id, and `expireStaleDrafts`, which promotes the
+   * partial to durable rather than deleting it on a mid-turn guess.
    *
    * It outlives the `working` flip on purpose: that is what lets an unfinalized
    * lane's bubble be dropped at turn end instead of freezing its partial text

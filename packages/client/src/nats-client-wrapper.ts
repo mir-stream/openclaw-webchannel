@@ -1902,12 +1902,21 @@ export class WebChannelNATSClient {
 
   /**
    * Apply the #251 drop to a messages array the caller built WITHOUT the
-   * reducer. The four sites that flip `working: false` in place (terminal
-   * settle, `finalizeDraftsForTurn`, `finalizeLocalTurnState`,
-   * `expireStaleDrafts`) are exactly where an unfinalized lane stops being live,
-   * so they are where its bubble must vanish. Doing it here rather than routing
-   * those sites through `applyDurable` keeps them event-free: there is no
-   * "nothing happened" `DurableEvent`, and BOUNDARY 2 forbids inventing one.
+   * reducer. THREE sites call this — terminal settle, `finalizeDraftsForTurn`
+   * and `finalizeLocalTurnState`. Each is a real turn-end signal, which is what
+   * makes the drop safe: core deletes an unfinalized preview at TURN END
+   * (`[core] extensions/telegram/src/bot-message-dispatch.ts:2954-2975`).
+   *
+   * ⚠️ `expireStaleDrafts` also flips `working: false` and is deliberately NOT
+   * routed here — it PROMOTES instead (see its body). Do not "fix" that
+   * asymmetry: that valve is a consumer-side guess fired mid-turn on a possibly
+   * healthy turn, and deleting a partial the user is reading on a guess is the
+   * N10 violation this split exists to prevent. Wiring it in would look like a
+   * consistency cleanup and would silently restore content deletion.
+   *
+   * Doing the drop here rather than routing these sites through `applyDurable`
+   * keeps them event-free: there is no "nothing happened" `DurableEvent`, and
+   * BOUNDARY 2 forbids inventing one.
    */
   private dropSpentDrafts(messages: ChatMessage[]): ChatMessage[] {
     return messages.some((m) => this.isSpentDraft(m))
