@@ -374,6 +374,31 @@ describe("WebChannelNATSClient — W6 idempotent history hydration", () => {
     expect(wrapper.getState().messages).toHaveLength(1);
   });
 
+  it("mints an immediate user echo past a hydrated u-<n> id without sharing its receipt overlay", () => {
+    const wrapper = makeWrapper();
+    deliver(wrapper, {
+      type: "history",
+      messages: [{ id: "u-0", role: "user", text: "older history", ts: 1 }],
+    });
+
+    wrapper.send("new local send");
+
+    const [history, local] = wrapper.getState().messages;
+    expect(history).toEqual(expect.objectContaining({
+      id: "u-0", role: "user", text: "older history",
+    }));
+    expect(history).not.toHaveProperty("wireId");
+    expect(history).not.toHaveProperty("receiptKey");
+    expect(history).not.toHaveProperty("sendState");
+    expect(local).toEqual(expect.objectContaining({
+      id: "u-1",
+      role: "user",
+      text: "new local send",
+      sendState: "queued",
+    }));
+    expect(local.turnId).toBe(local.wireId);
+  });
+
   it("does not adopt across different texts, and repeated identical texts adopt one-to-one", () => {
     const wrapper = makeWrapper();
     wrapper.send("ping"); // u-0
@@ -447,6 +472,22 @@ describe("WebChannelNATSClient — W6 agent-bubble id adoption", () => {
     const messages = wrapper.getState().messages;
     expect(messages).toHaveLength(1);
     expect(messages[0].id).toBe("core-1");
+  });
+
+  it("mints a legacy id-less agent bubble past a hydrated a-<n> id", () => {
+    const wrapper = makeWrapper();
+    deliver(wrapper, {
+      type: "history",
+      messages: [{ id: "a-0", role: "agent", text: "older answer", ts: 1 }],
+    });
+
+    deliver(wrapper, { type: "agent_message", text: "legacy live answer" });
+
+    expect(wrapper.getState().messages.map(({ id, role, text }) => ({ id, role, text })))
+      .toEqual([
+        { id: "a-0", role: "agent", text: "older answer" },
+        { id: "a-1", role: "agent", text: "legacy live answer" },
+      ]);
   });
 
   it("never adopts onto a working progress draft (its live id must survive for upserts)", () => {
@@ -2624,6 +2665,27 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     expect(m.pending).toBe(true);
     expect(m.wireId).toBeUndefined();
     expect(heldTexts(w)).toEqual(["queued"]);
+  });
+
+  it("2b: a held staging bubble skips a hydrated u-<n> id before later materialization", () => {
+    const w = makeWrapper();
+    deliver(w, {
+      type: "history",
+      messages: [{ id: "u-0", role: "user", text: "history", ts: 1 }],
+    });
+    deliver(w, { type: "typing" });
+
+    w.send("held local");
+
+    expect(messages(w).map((m) => m.id)).toEqual(["u-0", "u-1"]);
+    expect(messages(w)[0]).not.toHaveProperty("receiptKey");
+    expect(messages(w)[1]).toMatchObject({
+      id: "u-1",
+      role: "user",
+      text: "held local",
+      pending: true,
+      sendState: "queued",
+    });
   });
 
   // 3. send during a working draft (isTyping already false) → held.

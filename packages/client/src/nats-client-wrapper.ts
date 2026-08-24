@@ -737,7 +737,7 @@ export class WebChannelNATSClient {
     // window would publish ahead of an earlier held message).
     if (this.shouldHold()) {
       const receiptKey = this.newReceiptKey();
-      const localId = `u-${this.uid()}`;
+      const localId = this.mintLocalBubbleId("u");
       const heldEntry = { localId, text: trimmed, receiptKey };
       this.held.push(heldEntry);
       if (this.deferredReplacementOpen()) {
@@ -844,10 +844,12 @@ export class WebChannelNATSClient {
     });
     // v6 §15.4: the echo's durable half (id/role/text/turnId + tail placement) is
     // the reducer's `user` transition; the receipt overlay is the client's.
-    const bubbleId = `u-${this.uid()}`;
-    const messages = this.nextDurableMessages(
-      { kind: "user", id: bubbleId, text: trimmed, turnId: wireId },
-      { [bubbleId]: { wireId, receiptKey, sendState: "queued" } },
+    const bubbleId = this.mintLocalBubbleId("u");
+    const messages = this.nextPublishedUserMessages(
+      bubbleId,
+      trimmed,
+      wireId,
+      { wireId, receiptKey, sendState: "queued" },
     );
     this.stageReceiptStateThenCommit(
       receiptKey,
@@ -1040,7 +1042,7 @@ export class WebChannelNATSClient {
     settlementEligible: boolean,
   ): SendReceipt {
     const receiptKey = this.newReceiptKey();
-    const localId = `u-${this.uid()}`;
+    const localId = this.mintLocalBubbleId("u");
     this.deferredReplacementOperations.push({
       kind: "user", localId, text: trimmed, receiptKey,
     });
@@ -1114,10 +1116,12 @@ export class WebChannelNATSClient {
       (message) => message.receiptKey === entry.receiptKey,
     );
     if (bubble) {
-      const messages = this.state.messages.map((message) =>
-        message.receiptKey === entry.receiptKey
-          ? { ...message, wireId, turnId: wireId }
-          : message,
+      const messages = this.nextPublishedUserMessages(
+        bubble.id,
+        entry.text,
+        wireId,
+        { wireId },
+        bubble,
       );
       this.stageReceiptStateThenCommit(
         entry.receiptKey,
@@ -1236,8 +1240,13 @@ export class WebChannelNATSClient {
         // A re-entrant listener may have already removed the bubble; the text is
         // still published (correct — release is a commit), so just skip the patch.
         if (bubble) {
-          const messages = this.state.messages.filter((m) => m.id !== localId);
-          messages.push({ ...bubble, pending: false, wireId, turnId: wireId });
+          const messages = this.nextPublishedUserMessages(
+            bubble.id,
+            text,
+            wireId,
+            { pending: false, wireId },
+            bubble,
+          );
           this.stageReceiptStateThenCommit(
             receiptKey,
             { messages },
@@ -2002,8 +2011,8 @@ export class WebChannelNATSClient {
 
   /**
    * Compute the next `state.messages` for ONE durable event, without committing
-   * it. `publish()` needs this form: its bubble has to ride inside the receipt
-   * staging patch rather than a bare `setState`.
+   * it. Receipt-bound user publication uses the specialized sibling below;
+   * inbound durable frames use this form through `applyDurable`.
    */
   private nextDurableMessages(
     event: DurableEvent,
@@ -2012,6 +2021,43 @@ export class WebChannelNATSClient {
     const before = this.durableProjection();
     const after = applyDurableEvent(before, event);
     return this.mergeDurable(this.state.messages, after, local);
+  }
+
+  /**
+   * Materialize one successfully published user echo through the shared reducer.
+   * A held/deferred bubble is only local staging until its wire id is reserved:
+   * remove that one row from the reducer input so `user` appends its FINAL
+   * durable identity/content/turnId at the tail, then merge against the full
+   * client view so the staging row's receipt/UI fields survive. `local` applies
+   * the path-specific publication changes (`pending:false` for held release,
+   * absent for deferred publication). A caller whose staging row disappeared
+   * deliberately skips this helper, so publication never resurrects a bubble.
+   */
+  private nextPublishedUserMessages(
+    bubbleId: string,
+    text: string,
+    wireId: string,
+    local: Partial<ChatMessage>,
+    stagedBubble?: ChatMessage,
+  ): ChatMessage[] {
+    let reducerInput = this.state.messages;
+    if (stagedBubble !== undefined) {
+      const stagedIndex = reducerInput.indexOf(stagedBubble);
+      if (stagedIndex !== -1) {
+        reducerInput = [
+          ...reducerInput.slice(0, stagedIndex),
+          ...reducerInput.slice(stagedIndex + 1),
+        ];
+      }
+    }
+    const before = projectDurableFromClient(reducerInput);
+    const after = applyDurableEvent(before, {
+      kind: "user",
+      id: bubbleId,
+      text,
+      turnId: wireId,
+    });
+    return this.mergeDurable(this.state.messages, after, { [bubbleId]: local });
   }
 
   /** Apply ONE durable event to `state.messages`, optionally folding in a
@@ -2060,6 +2106,15 @@ export class WebChannelNATSClient {
 
   private uid(): string {
     return `${this.seq++}`;
+  }
+
+  /** Mint a viewer-local bubble id without colliding with hydrated transcript ids. */
+  private mintLocalBubbleId(prefix: "u" | "a"): string {
+    let id: string;
+    do {
+      id = `${prefix}-${this.uid()}`;
+    } while (this.state.messages.some((message) => message.id === id));
+    return id;
   }
 
   private seq = 0;
@@ -2875,7 +2930,7 @@ export class WebChannelNATSClient {
         // it does the opposite of harm: routing it through the reducer is what
         // removes the N8 divergence the old `appendMessage` branch created, where
         // the live view held a bubble the reducer's view did not.
-        const mintedId = `a-${this.uid()}`;
+        const mintedId = this.mintLocalBubbleId("a");
         if (!this.warnedIdlessDurableFrame) {
           this.warnedIdlessDurableFrame = true;
           console.warn(

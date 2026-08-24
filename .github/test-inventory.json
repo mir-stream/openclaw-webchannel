@@ -34,7 +34,7 @@
     "packages/client/src/nats-client-wrapper-hydration.test.ts": 10,
     "packages/client/src/nats-client-wrapper-sendstate.test.ts": 58,
     "packages/client/src/nats-client-wrapper-turn-active.test.ts": 37,
-    "packages/client/src/nats-client-wrapper.test.ts": 100,
+    "packages/client/src/nats-client-wrapper.test.ts": 103,
     "packages/client/src/nats-p04-integration.test.ts": 2,
     "packages/client/src/pop-register.test.ts": 19,
     "packages/client/src/pop-signed-message-parity.test.ts": 10,

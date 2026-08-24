@@ -1392,6 +1392,15 @@ describe("WebChannelNATSClient — P0-4 teardown-then-notify (R3-1)", () => {
 
   it("stages /stop from a clear-hook reconnect so it never publishes on the old socket", async () => {
     const h = await connectWrapper();
+    // Reserve the id the deferred /stop would otherwise mint after old-held
+    // (`u-0`) and replacement-before-stop (`u-1`). The replacement staging path
+    // must skip this hydrated transcript row rather than seed a duplicate for
+    // its later reducer-backed materialization.
+    deliverOut(h.K, {
+      type: "history",
+      messages: [{ id: "u-2", role: "user", text: "historic u-2", ts: 1 }],
+    });
+    await settle();
     deliverOut(h.K, {
       type: "progress", id: "webchannel-d", text: "working", turnId: "T",
     });
@@ -1402,6 +1411,29 @@ describe("WebChannelNATSClient — P0-4 teardown-then-notify (R3-1)", () => {
     }).heldStallTimer;
     expect(oldTimer).not.toBeNull();
     const oldSocket = FakeNatsWS.instances.at(-1)!;
+
+    // A synchronous replacement-connect callout lands after /stop is staged but
+    // before its wire id is reserved. Final materialization must therefore put
+    // /stop after this durable frame, matching publication order rather than the
+    // staging row's earlier UI position.
+    const innerClient = (h.wrapper as unknown as {
+      client: { connect: () => void };
+    }).client;
+    const realInnerConnect = innerClient.connect.bind(innerClient);
+    let injectedDuringCommit = false;
+    const connectSpy = vi.spyOn(innerClient, "connect").mockImplementation(() => {
+      if (!injectedDuringCommit) {
+        injectedDuringCommit = true;
+        (h.wrapper as unknown as {
+          handleMessage: (message: Record<string, unknown> & { type: string }) => void;
+        }).handleMessage({
+          type: "agent_message",
+          id: "between-stage-and-publish",
+          text: "between staged and published",
+        });
+      }
+      realInnerConnect();
+    });
 
     const realClearTimeout = globalThis.clearTimeout;
     let hookRan = false;
@@ -1444,9 +1476,25 @@ describe("WebChannelNATSClient — P0-4 teardown-then-notify (R3-1)", () => {
       expect(publishedInputs(FakeNatsWS.instances[1], h.K)).toMatchObject([
         { type: "user_message", text: "/stop" },
       ]);
-      expect(h.received).toContain(userBubble(h.wrapper, "/stop")!.wireId!);
+      const stopBubble = userBubble(h.wrapper, "/stop")!;
+      expect(stopBubble.id).toBe("u-3");
+      expect(h.received).toContain(stopBubble.wireId!);
+      expect(stopBubble.turnId).toBe(stopBubble.wireId);
+      expect(stopBubble.pending).toBeUndefined();
+      expect(stopBubble.receiptKey).toBeDefined();
+      expect(injectedDuringCommit).toBe(true);
+      expect(h.wrapper.getState().messages.map((message) => message.id).indexOf(stopBubble.id))
+        .toBeGreaterThan(
+          h.wrapper.getState().messages.map((message) => message.id)
+            .indexOf("between-stage-and-publish"),
+        );
+      expect(h.wrapper.getState().messages.find((message) => message.id === "u-2"))
+        .toMatchObject({ text: "historic u-2", role: "user" });
+      expect(h.wrapper.getState().messages.find((message) => message.id === "u-2"))
+        .not.toHaveProperty("wireId");
     } finally {
       clearSpy.mockRestore();
+      connectSpy.mockRestore();
       h.wrapper.close();
     }
   });

@@ -162,8 +162,10 @@ export type DurableView = readonly DurableMessage[];
  * REAL client in `durable-view-reducer.test.ts`. What that covers is the four
  * kinds below; see the two BOUNDARY notes after the type for what it does not.
  *
- *  - `user`      — the local user echo installed by `publish()`
- *                  (nats-client-wrapper.ts:847). Durable subset of the u- bubble.
+ *  - `user`      — a local user echo materialized once publication reserves its
+ *                  wire id (`nextPublishedUserMessages` in the wrapper). This is
+ *                  the durable subset of the u- bubble; an earlier held/deferred
+ *                  row is client-local staging and is excluded from the input.
  *  - `placement` — a `progress` frame for a lane (case "progress",
  *                  nats-client-wrapper.ts:2701). The FIRST one CLAIMS the lane's
  *                  slot (append at tail). The frame ALWAYS carries text —
@@ -213,9 +215,9 @@ export type DurableView = readonly DurableMessage[];
  * id-less frame has none, by design).
  *
  * The client's id-less branch therefore survives only as a LEGACY-PLUGIN path
- * (nats-client-wrapper.ts:2834 `if (id) {…}`, else …:2869 mints
- * `id: \`a-${this.uid()}\`` from a CLIENT-LOCAL counter, behind a one-shot
- * `console.warn`). It is routed through this reducer as a `bubble`, and that is
+ * (`handleFrame`'s `if (id) {…}` branch, whose legacy `else` calls
+ * `mintLocalBubbleId("a")` behind a one-shot `console.warn`). It is routed
+ * through this reducer as a `bubble`, and that is
  * ADMISSIBLE for one reason only: the minted id never leaves the client. What
  * this boundary forbids is a viewer-minted id in the SHARED EVENT STREAM — the
  * journal, the SSOT — where it would write viewer-side identity into history
@@ -256,8 +258,9 @@ export type DurableView = readonly DurableMessage[];
  *
  * `placement` and `bubble` are upserts and `seal` is keyed by answer id, so
  * replaying any of them is harmless. `user` is the ONE non-idempotent
- * transition: it blind-appends, mirroring `publish()`, so two `user` events with
- * the same id yield two bubbles. Worse, a duplicated id then makes `applySeal`'s
+ * transition: it blind-appends, mirroring final user materialization, so two
+ * `user` events with the same id yield two bubbles. Worse, a duplicated id then
+ * makes `applySeal`'s
  * slot refill index `answers[idx]` past the end (`slots.length > answers.length`)
  * and THROW — a pure projection that crashes instead of returning a view.
  *
@@ -265,10 +268,10 @@ export type DurableView = readonly DurableMessage[];
  * identically from its own copy of this loop before the rewire, and now throws
  * THROUGH this function (so the test file's "the REAL client throws on the same
  * input" case no longer proves independence — see the anchor caveat in the
- * header). The only difference is reachability — live, `u-${this.uid()}`
- * (nats-client-wrapper.ts:847, and `uid()` is `${this.seq++}` at …:2052-2054) is
- * monotonic so the precondition cannot be violated; a journal REPLAY can violate
- * it. Do not "fix" it by making
+ * header). The only difference is reachability — the live client mints every
+ * local u-/a- id through `mintLocalBubbleId`, whose monotonic sequence skips ids
+ * already present in the transcript, so the precondition cannot be violated by
+ * local minting; a journal REPLAY can violate it. Do not "fix" it by making
  * `applyUser` an upsert or by de-duplicating inside `applySeal`: inventing a
  * reconciliation rule the client does not have is exactly the defect class this
  * slice forbids, and it would put the divergence somewhere much harder to see.
@@ -373,7 +376,7 @@ export function reduceDurableView(events: readonly DurableEvent[]): DurableView 
   return events.reduce<DurableView>((view, event) => applyDurableEvent(view, event), []);
 }
 
-/** User echo — `publish()` always APPENDS a fresh u- bubble at the tail. */
+/** Final user materialization always APPENDS a fresh u- bubble at the tail. */
 function applyUser(
   view: DurableView,
   event: { id: string; text: string; turnId?: string },
