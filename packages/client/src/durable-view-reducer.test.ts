@@ -265,8 +265,12 @@ describe("step / fold agreement: reduceDurableView === fold of applyDurableEvent
   // ARRAY IDENTITY — pins the header's table, negative rows included.
   // -------------------------------------------------------------------------
   //
-  // Array identity is a PARTIAL property: two transitions hand the input back on
-  // a durable no-op, two others always allocate. The negative rows matter as much
+  // Array identity is a PARTIAL property: `placement` and `seal` each have paths
+  // that hand the input back, while `user` and `bubble` ALWAYS allocate. The
+  // three SAME-array rows below are exhaustive — they are every `return view` in
+  // the module — and the two NEW-array rows are examples, not a partition (a
+  // `seal` appears on both sides, and `user` has no row at all because it can
+  // never return its input). The negative rows matter as much
   // as the positive ones — without them the header's narrowed claim is just
   // prose, and a slice-2 author could build a `prev === next` memo or a
   // `useSyncExternalStore` equality check on an invariant the code never held.
@@ -475,8 +479,8 @@ describe("characterization: the deliberate divergence, and the precondition trap
 // corresponding event stream:
 //
 //   user      → the real public `send()` → `publish()` (nats-client-wrapper.ts:804)
-//   placement → a real `progress` frame  → `handleMessage` case (…:2467)
-//   bubble    → a real `agent_message`   → `handleMessage` case (…:2562)
+//   placement → a real `progress` frame  → `handleFrame` case (…:2467)
+//   bubble    → a real `agent_message`   → `handleFrame` case (…:2562)
 //   seal      → a real `turn_snapshot`   → `applyTurnSnapshot`  (…:1486-1557)
 //
 // WHAT IS COMPARED IS NOT UNIFORM, and the difference is a carve-out rather than
@@ -717,7 +721,7 @@ describe("equivalence anchor: bubble ≡ a real agent_message frame", () => {
   });
 
   it("an agent_message on a held id does NOT rewrite that bubble's role", () => {
-    // nats-client-wrapper.ts:2571-2578 — the UPDATE branch spreads `prev` and
+    // nats-client-wrapper.ts:2572-2578 — the UPDATE branch spreads `prev` and
     // sets text/working/turnId only; it never writes `role`. Only the APPEND
     // fallback (…:2579-2586) sets `role: "agent"`. Unreachable today (u-/a-/lane
     // id namespaces do not collide), but byte-faithfulness is this module's

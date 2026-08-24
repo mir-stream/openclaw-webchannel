@@ -136,7 +136,8 @@ export type DurableView = readonly DurableMessage[];
  * The ordered event stream the plugin would journal. Each event corresponds to a
  * real wire frame the client consumes today — the shapes below were read off
  * `packages/plugin/src/channel-contract.ts` (`OutboundWsMessage`) and the
- * wrapper's `handleMessage` cases, and every transition is anchored against the
+ * wrapper's `handleFrame` cases (…:2061 — `handleMessage` at …:2048 only
+ * delegates to it), and every transition is anchored against the
  * REAL client in `durable-view-reducer.test.ts`. What that covers is the four
  * kinds below; see the two BOUNDARY notes after the type for what it does not.
  *
@@ -292,9 +293,13 @@ export type DurableEvent =
  * literal `Array.prototype.reduce` over it. `durable-view-reducer.test.ts`
  * pins the agreement of the two entry points.
  *
- * PURE: `view` and `event` are never mutated; a fresh array is returned (or the
- * same reference when the event is a durable no-op, which is safe precisely
- * because nothing here mutates in place).
+ * PURE: `view` and `event` are never mutated. Usually a fresh array is
+ * returned; some transitions instead hand the input back, which is safe
+ * precisely because nothing here mutates in place. Do NOT read that as
+ * "a durable no-op returns the same reference" — it does not (a `bubble`
+ * repeating its text and turnId allocates, and the suite pins it). See the
+ * array-identity table in the file header: it is a partial property, never a
+ * no-op signal.
  */
 export function applyDurableEvent(
   view: DurableView,
@@ -404,7 +409,7 @@ function applyPlacement(
  * dominance): a `seal` remove drops the id, and a LATER `bubble` re-appends it.
  *
  * NOTE the asymmetry in `role`, which mirrors the client exactly: the UPDATE
- * branch (nats-client-wrapper.ts:2571-2578) spreads `prev` and writes only
+ * branch (nats-client-wrapper.ts:2572-2578) spreads `prev` and writes only
  * text/working/turnId — it never touches `role` — while only the APPEND fallback
  * (…:2579-2586) sets `role: "agent"`. Unreachable today (the u-/a-/lane id
  * namespaces do not collide), but this module's entire product is
