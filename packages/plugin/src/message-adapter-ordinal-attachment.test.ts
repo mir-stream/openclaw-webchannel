@@ -34,13 +34,19 @@ import { describe, it, expect } from "vitest";
  * generation comparison written INSIDE that seam, wherever its operands came
  * from — the seam being where a mapping has to land to affect attachment at all.
  *
- * Their reach is bounded, and the bound is measured rather than assumed. A
- * comparison routed through a local alias defeats the first assertion — writing
- * `const idx = input.assistantMessageIndex;` and comparing `lane.generation` to
- * `idx - 1` puts the two names in different statements — and a comparison hidden
- * inside a helper DEFINED OUTSIDE the seam and merely called from it defeats the
- * second. Injected in either of those forms, the wrong fix passes this file just
- * as it passes the fixtures.
+ * Their reach is bounded, and the bound is measured rather than assumed — and
+ * the two forms fare DIFFERENTLY, so do not read them as one hole.
+ *
+ * A comparison routed through a local alias defeats the FIRST assertion:
+ * writing `const idx = input.assistantMessageIndex;` and comparing
+ * `lane.generation` to `idx - 1` puts the two names in different statements, so
+ * `offenders` sees nothing. The second assertion still catches it, because the
+ * comparison itself is written inside the seam (measured: that injection goes
+ * red, and it passed all five assertions before the seam assertion existed).
+ *
+ * What defeats BOTH is a comparison hidden inside a helper DEFINED OUTSIDE the
+ * seam and merely called from it. In that form the wrong fix passes this file
+ * just as it passes the fixtures. That is the known, unclosed hole.
  *
  * So read what follows as a TRIPWIRE on the tempting spellings, not as a proof
  * that no ordinal→lane mapping exists. That is still worth having, because the
@@ -60,6 +66,13 @@ import { describe, it, expect } from "vitest";
  * If one of these assertions fails, do not relax it to match new code. Either
  * the change is a regression, or the rule itself is being revisited — and that
  * is a design decision for the plan doc, not an edit here.
+ *
+ * ONE EXCEPTION, because the seam assertion is deliberately operand-agnostic and
+ * therefore also refuses a generation-to-generation comparison (say
+ * `barrierLane.generation === currentLane().generation`). That is pure lane
+ * state, exactly what this design endorses, and it is neither a regression nor a
+ * revision of the rule. Narrow the pattern to exclude that shape — do not widen
+ * it into permitting an ordinal operand.
  */
 
 const SOURCE = readFileSync(
