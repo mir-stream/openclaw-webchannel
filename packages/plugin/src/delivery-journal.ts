@@ -518,8 +518,11 @@ export function openDeliveryJournal(options: {
   //    argument INDIRECTLY through `atomicWritePrivateFile`'s
   //    `enforceDirectoryMode` — `conversation-key-store.ts`,
   //    `offline-conversation-key-rotation.ts` and `rotation-preflight.ts` all
-  //    pass `true` there. The one conditional in the package is
-  //    `enrollment-client.ts`, which passes `this.usesTupleCredentialPath`. So
+  //    pass `true` there. Two sites are not hard-coded: `enrollment-client.ts`
+  //    passes `this.usesTupleCredentialPath`, and
+  //    `legacy-storage-migration.ts`'s `publishCredential` takes
+  //    `enforceDirectoryMode` as a PARAMETER and forwards it (both of its own
+  //    call sites pass `true`). Neither is ever an unconditional `false`. So
   //    omitting it made the journal the only unconditional `false` while its
   //    comment claimed parity. It is also the exact argument `chmodDatabaseFiles`
   //    exists for one step below: inheritance never re-hardens what already
