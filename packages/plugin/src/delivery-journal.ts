@@ -392,8 +392,8 @@ function openJournalConnection(
     //    and never checked, so an older build opening a newer journal proceeds.
     //    Deliberate for this slice (the journal has no call sites and no on-disk
     //    installs to be older than), and it is the same runtime-version-skew
-    //    problem the reducer's BOUNDARY 2 defers to #241/#246. Whoever makes the
-    //    journal authoritative (#240) owns closing it.
+    //    problem the reducer's BOUNDARY 2 defers to #241/#246. Filed as **#271**;
+    //    whoever makes the journal authoritative (#240) owns closing it.
     db.exec(`
       CREATE TABLE IF NOT EXISTS journal_meta (
         key   TEXT PRIMARY KEY,
@@ -511,22 +511,23 @@ export function openDeliveryJournal(options: {
   //
   //    ⚠️ THE `true` IS LOAD-BEARING. `ensurePrivateDirectory` defaults it to
   //    false, which only sets 0700 on a directory it CREATES; a tuple directory
-  //    already sitting at 0755 stays 0755 (measured). Enumerated rather than
-  //    asserted this time: every OTHER direct caller in this package passes
-  //    `true` (`private-file.ts`'s `archiveFileNoReplace`, and three sites in
-  //    `legacy-storage-migration.ts`), and the secret stores reach the same
-  //    argument INDIRECTLY through `atomicWritePrivateFile`'s
-  //    `enforceDirectoryMode` — `conversation-key-store.ts`,
-  //    `offline-conversation-key-rotation.ts` and `rotation-preflight.ts` all
-  //    pass `true` there. Two sites are not hard-coded: `enrollment-client.ts`
-  //    passes `this.usesTupleCredentialPath`, and
-  //    `legacy-storage-migration.ts`'s `publishCredential` takes
-  //    `enforceDirectoryMode` as a PARAMETER and forwards it (both of its own
-  //    call sites pass `true`). Neither is ever an unconditional `false`. So
-  //    omitting it made the journal the only unconditional `false` while its
-  //    comment claimed parity. It is also the exact argument `chmodDatabaseFiles`
-  //    exists for one step below: inheritance never re-hardens what already
-  //    exists.
+  //    already sitting at 0755 stays 0755 (measured). This file holds message
+  //    plaintext, so inheriting a loose directory is not acceptable — and that
+  //    is the same reason `chmodDatabaseFiles` exists one step below.
+  //    Re-hardening what already exists is the whole point of both.
+  //
+  //    ⚠️ AND DO NOT RE-ADD A PACKAGE-WIDE CENSUS OF CALLERS HERE TO JUSTIFY IT.
+  //    An earlier version of this comment argued the `true` by enumerating every
+  //    other `enforceExistingMode` / `enforceDirectoryMode` caller in the package
+  //    and concluding the journal would otherwise be "the only unconditional
+  //    `false`". That census was written twice and was WRONG BOTH TIMES — most
+  //    recently it claimed `legacy-storage-migration.ts`'s `publishCredential`
+  //    never passes an unconditional `false`, while that file's own
+  //    `migrateExactCredentialSource` passes exactly that, hard-coded. The
+  //    argument above needs no census: it is local, it is about THIS file's
+  //    contents, and it cannot be invalidated by a caller elsewhere changing.
+  //    A justification that has to be re-verified across the package every time
+  //    someone touches an unrelated call site is a liability, not evidence.
   ensurePrivateDirectory(dirname(databasePath), true);
 
   // 2. Open. SQLite creates the main file here, at 0666 & ~umask.
