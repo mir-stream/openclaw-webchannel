@@ -121,7 +121,7 @@ turn_snapshot은 **완전한 턴 기록이 아니라 교정 패치다.** 계약(
 
 ### 3.3 [실측] off/block 모드엔 답변 id가 아예 없다 — 스코프 경계 — [우리코드]
 
-> ⛔ **이 절의 두 주장은 SUPERSEDED다 (#238 / PR #250 랜딩).** 이제 플러그인이 **모든 배달 행위(delivery act)에서 id를 민팅**하며 off/block의 plain send도 포함한다. 그래서 (a) 아래 `sendText(wsKey, text, undefined, turnId)`만 나가고 client가 `a-N`을 자체 발급한다는 **[실측]은 더 이상 성립하지 않고**, (b) "off/block의 durable id는 **분리된 후속**"이라는 스코프 판정도 종료됐다 — 그 후속이 #238이고 이미 랜딩했다. 식별자 최종 판정은 **§16.5**. 아래 본문은 **당시 측정 기록(역사)** 으로만 남긴다.
+> ⛔ **이 절의 두 주장은 SUPERSEDED다 — PR #250(#238)이 뒤집는다.** 거기서 플러그인은 **모든 배달 행위(delivery act)에서 id를 민팅**하며 off/block의 plain send도 포함한다. 그래서 (a) 아래 `sendText(wsKey, text, undefined, turnId)`만 나가고 client가 `a-N`을 자체 발급한다는 **[실측]은 더 이상 성립하지 않고**, (b) "off/block의 durable id는 **분리된 후속**"이라는 스코프 판정도 끝났다 — 그 후속이 바로 #238이다. 식별자 최종 판정은 **§16.5**. 아래 본문은 **당시 측정 기록(역사)** 으로만 남긴다.
 
 - `turn_snapshot`/draft는 `streaming.mode ∈ {partial, progress}`에서만 생긴다(`inbound.ts:1014-1017`). "block"/"off"는 draft 없음(`inbound.ts:985`) → snapshot 없음 → 답변 id 없음. `sendText(wsKey, text, undefined, turnId)`만 나가고 client가 `a-N` 자체 발급(`nats-client-wrapper.ts:2562`).
 - 플러그인 기본 streaming 모드는 "off"(`message-adapter.ts:146-149`). **단 [실측] 제품/데모는 partial로 돈다** — `run.sh:287`이 `"streaming":{"mode":"partial"}` 설정(`docs/gaps/P0_CORE_CHAT_GAPS.md:472-473`). ⚠️ operator가 `channels add`로 수동 등록하며 mode를 안 주면 "off" → journal-only history가 비어 **회귀**. off-mode history 연속성은 §6에서 처리(전환기엔 off/block에 `getSessionMessages` fallback 유지).
@@ -163,7 +163,7 @@ turn_snapshot은 **완전한 턴 기록이 아니라 교정 패치다.** 계약(
 - **plugin 특성화 테스트** + test-inventory 갱신.
 
 **OUT → 후속:**
-- off/block 모드 per-answer id 신설(controller/wire/client) — §3.3.
+- off/block 모드 per-answer id 신설(controller/wire/client) — §3.3. ⚠️ **절반 해소(PR #250 / #238)**: controller/wire 쪽(플러그인이 모든 배달 행위에서 id 민팅)은 거기서 처리됐고, **client 쪽은 아직 OUT**이다. 식별자 판정은 §16.5.
 - client text/위치 매칭 완전 제거(#104/#227/#228, `adoptedFromLiveId`, tier-2 exact-text) — journal 착지 후.
 - `getSessionMessages` 기반 history 제거 — cutover 후.
 
@@ -174,7 +174,7 @@ turn_snapshot은 **완전한 턴 기록이 아니라 교정 패치다.** 계약(
 두 리뷰가 노출한 것 + journal 특유의 것. 답 정하기 전 구현 없음.
 
 - ✅ [실측 완료] **snapshot ↔ journal 급전.** partial/progress는 drain에서 답변별 {id,text}를 낸다(§3.2) → journal은 그걸 적으면 됨. off/block은 안 냄(§3.3) → 후속. [codex F6 해소]
-- **id 민팅(off/block).** [후속으로 분리] 거긴 답변 id가 없다. 별도 작업(§3.3).
+- ✅ [해소] **id 민팅(off/block).** ~~[후속으로 분리] 거긴 답변 id가 없다. 별도 작업(§3.3).~~ → **PR #250(#238)이 이 항목을 구현한다**: 플러그인이 **모든 배달 행위(delivery act)에서 id를 민팅**하므로 off/block에도 답변 id가 있다. "거긴 답변 id가 없다"는 더 이상 성립하지 않는다. 남은 client 쪽은 §5 OUT 항목 참고. 식별자 판정은 §16.5.
 - **commit-before-publish의 크래시 갭.** commit 후 publish 전 크래시 시 pending 기록의 상태 정합성. 재시작 후 pending을 어떻게 확정/폐기?
 - **restart-stable id / idempotency.** answerId가 재시작·재시도에도 안정적이어야 중복 안 남(현재 id는 메모리 생성). idempotency 정체성 = answerId 자체로. [codex F/B]
 - **저장 매체·보존.** keyed store(maxEntries 바운드) vs json 파일(무한) vs SQLite 직접. history 1000 cap/pagination과의 정합. eviction이 오래된 history를 지우나?
@@ -786,7 +786,7 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 - 첫 전송에서 Telegram `sendMessage`가 준 `sent.message_id`를 draft가 저장(`[core] extensions/telegram/src/draft-stream.ts:284-328`), 이후 스트리밍은 **그 id를 in-place edit**(`:329-377`). 최종도 같은 id로 마감. 못 마감하면 draft 비우고 **새 메시지로 sendPayload**(`lane-delivery-text-deliverer.ts:536-603`); 애매한 edit 실패는 **preview 유지**(중복 안 만듦). 멀티메시지는 경계/블록-ordinal 변화 시 lane을 **회전**(`forceNewMessage` → 다음 전송이 새 message_id)(`bot-message-dispatch.ts:1289-1303`).
 
 **Q. 우리가 따라할 수 있나? → 예, 완전히. 오히려 더 쉬움 (전원 CONFIRMED, 구조적 불가 0).**
-- Telegram은 **외부 플랫폼**이 send 응답으로 id를 주지만, **우리는 우리가 플랫폼이다** → lane 생성 시 **로컬에서 id를 민팅**(외부 왕복 없음; `message-adapter.ts:23-48,830-875` 이미 그렇게 함). SDK는 **구성 모델**을 그대로 export(`deliverFinalizableLivePreview` + `LivePreviewFinalizerDraft{flush,id,clear}` + `editFinal`/`deliverNormally`; `plugin-sdk/channel-outbound.d.ts`). 단 `message.live` facet엔 **완제품 draft 핸들은 없음**(capability map만) → draft는 **우리가 구성**(이미 함). 클라 wire는 이미 id-기반 upsert(progress/agent_message 같은 id).
+- Telegram은 **외부 플랫폼**이 send 응답으로 id를 주지만, **우리는 우리가 플랫폼이다** → lane 생성 시 **로컬에서 id를 민팅**(외부 왕복 없음; `message-adapter.ts:23-63,862-907` 이미 그렇게 함). SDK는 **구성 모델**을 그대로 export(`deliverFinalizableLivePreview` + `LivePreviewFinalizerDraft{flush,id,clear}` + `editFinal`/`deliverNormally`; `plugin-sdk/channel-outbound.d.ts`). 단 `message.live` facet엔 **완제품 draft 핸들은 없음**(capability map만) → draft는 **우리가 구성**(이미 함). 클라 wire는 이미 id-기반 upsert(progress/agent_message 같은 id).
 
 **세 가지 정밀 정정 (codex의 깊은 read가 드러냄 — 기존 문서 표현이 과했음):**
 1. **"Telegram은 ordinal 아예 안 쓴다"는 틀림.** 내장 Telegram은 `assistantMessageIndex`를 **queued-block 회전/상관 힌트**로 쓴다(`bot-message-dispatch.ts:1357-1441`). 다만 **durable id로도, final 정체성으로도 절대 안 쓴다.** ⇒ 정확한 규칙: **ordinal은 블록-회전 힌트로 OK, 정체성 키로는 금지**(우리 죄는 후자). [[아닌 것 목록 §0.2]] N5는 이 정밀판으로 읽어라.

@@ -400,235 +400,52 @@ describe("nats-account-runtime.ts wiring contract — #99 inbound frame normaliz
 
 describe("nats-account-runtime.ts wiring contract — #238 identity at the delivery act", () => {
   /**
-   * The command-gate warning notice is the runtime's ONE durable-text egress
+   * The command-gate warning notice is this runtime's one durable-text egress
    * site: a real `agent_message` bubble on the client. Since #238 the plugin —
-   * never the viewer — names every such bubble, so this `sendText` must pass a
-   * `nextMessageId()` as its third argument. An id-less send here hands the
+   * never the viewer — names every such bubble, so this send must pass a
+   * `nextMessageId()` as `sendText`'s THIRD argument. An id-less send hands the
    * client an unnamed durable bubble and it falls back to minting `a-N` from a
    * client-local counter (NOT-list N4/N5).
    *
-   * Why a SOURCE guard: this call sits inside the message handler closed over
-   * by the module-private `buildNatsAccount`, which the same file already
-   * documents as "untestable routing" (see the #99 block above). The mint
-   * itself (`nextMessageId`) and the frame assembly (`NatsChannel.sendText`)
-   * are covered executably by message-adapter/nats-channel tests; this pins the
-   * wiring that joins them.
+   * Why a SOURCE guard: the call sits inside the message handler closed over by
+   * the module-private `buildNatsAccount`, which this file already documents as
+   * untestable routing (see the #99 block above). The mint (`nextMessageId`) and
+   * the frame assembly (`NatsChannel.sendText`) are covered executably by the
+   * message-adapter and nats-channel tests; this pins the wiring joining them.
    */
-  /**
-   * Drop line comments (`//` to EOL) and block comments from `src`, preserving
-   * everything else byte-for-byte (newlines included, so the code keeps shape).
-   * Returns `null` — never a partial result — if a literal or a block comment
-   * is left unterminated, so a caller that FAILS on `null` fails closed.
-   *
-   * Why comments are stripped at all: nats-account-runtime.ts is unusually
-   * comment-dense right here (~15 lines of rationale immediately above the
-   * send), and comments kept turning these assertions red on changes that were
-   * entirely correct — an apostrophe in `// don't reorder these` opened a
-   * phantom string literal, a comma in `// slots are peer, text, id` split a
-   * phantom argument, and a `return;` inside a comment truncated the slice
-   * before the send even began. That misleading-red class is the whole reason
-   * this block is written the way it is.
-   *
-   * The stripper is literal-aware in the one way that matters: a comment opener
-   * INSIDE a string literal is copied through, not treated as a comment start.
-   * It is deliberately NOT regex-literal-aware — a `/`-delimited regex could in
-   * principle hide a quote — because the failure mode is an unterminated
-   * literal, i.e. `null`, i.e. RED. It can never invent a pass.
-   */
-  function stripComments(src: string): string | null {
-    let out = "";
-    let i = 0;
-    while (i < src.length) {
-      const ch = src[i];
-      if (ch === '"' || ch === "'" || ch === "`") {
-        // Copy the literal through verbatim (honouring backslash escapes) so a
-        // `//` or `/*` inside the notice text can never start a comment.
-        const start = i;
-        i += 1;
-        while (i < src.length && src[i] !== ch) i += src[i] === "\\" ? 2 : 1;
-        if (i >= src.length) return null; // unterminated literal → fail closed
-        i += 1;
-        out += src.slice(start, i);
-        continue;
-      }
-      if (ch === "/" && src[i + 1] === "/") {
-        while (i < src.length && src[i] !== "\n") i += 1;
-        continue; // the newline itself falls through and is copied
-      }
-      if (ch === "/" && src[i + 1] === "*") {
-        const end = src.indexOf("*/", i + 2);
-        if (end < 0) return null; // unterminated block comment → fail closed
-        i = end + 2;
-        continue;
-      }
-      out += ch;
-      i += 1;
-    }
-    return out;
-  }
-
-  // Strip ONCE, on the WHOLE file, and do everything downstream in stripped
-  // space. The ORDER here is the load-bearing part, and getting it wrong was a
-  // real bug: when the slice bounds were computed on the raw source and only
-  // the resulting slice was stripped afterwards, the stripper could not protect
-  // the bound that produced its own input. A comment inside the gate block
-  // containing the token `return;` — `// Best-effort: no return; value to check
-  // here.` — moved the end bound in front of the send and red two of these
-  // three tests on a pure comment edit.
-  //
-  // Fail-closed is preserved: `null` (an unterminated literal or block comment)
-  // collapses to `""`, which makes GATE_START `-1` and fails every assertion
-  // below. Nothing here can pass vacuously.
-  const RUNTIME_CODE = stripComments(RUNTIME_SOURCE) ?? "";
-
-  // Located by its semantic guard and SLICED, exactly like the #99 block above
-  // — not pinned as an exact multi-line literal. An exact literal is
-  // indentation- and line-break-sensitive: a semantically identical reformat
-  // (hoisting the text into a `const noticeText`, collapsing the call onto one
-  // line) turned the first version of this test red and dumped the whole
-  // ~1560-line file as an expected/received diff. A misleading red on a correct
-  // change is worse than no test.
-  //
-  // Slicing is load-bearing, not tidiness: the shape assertions alone are
-  // satisfied by ANY `channel.sendText(peerId, …, nextMessageId())` in the
-  // file, so once a legitimate second egress site exists here, a notice that
-  // LOST its id would still go green on that other site's behalf. Bounding
-  // them to this `if` block keeps them about the notice.
-  const GATE_GUARD = "if (commandGate.delegated && !commandGate.isListed(peerId)) {";
-  const GATE_START = RUNTIME_CODE.indexOf(GATE_GUARD);
-  // Both bounds must FAIL CLOSED. A `-1` from either `indexOf` fed straight into
-  // `slice` is the vacuity this slicing exists to prevent, inverted: a missing
-  // `return;` would make the end bound `-1`, i.e. "the rest of the file minus one
-  // character", handing the shape assertions back the whole-file scope they must
-  // not have.
-  const GATE_END = RUNTIME_CODE.indexOf("return;", GATE_START);
-  const NOTICE_CODE =
-    GATE_START < 0 || GATE_END < 0 ? "" : RUNTIME_CODE.slice(GATE_START, GATE_END);
-
-  /**
-   * Parse the argument list of the FIRST `channel.sendText(` call in `src`,
-   * returning the top-level arguments trimmed — or `null` if the call is
-   * absent, unterminated, or unbalanced (callers must FAIL on `null`; a
-   * parse failure is never a pass).
-   *
-   * Why PARSED and not matched by regex: POSITION is the whole point.
-   * `NatsChannel.sendText(peerId, text, id?, turnId?, assistantMessageIndex?)`
-   * turns argument 3 — and only argument 3 — into `payload.id` on the wire. A
-   * regex that merely proves `nextMessageId()` appears somewhere in the list
-   * goes green on the exact regression this test is named for:
-   * `channel.sendText(peerId, text, undefined, nextMessageId())` ships the
-   * notice id-less (the mint wasted in the `turnId` slot) and the client falls
-   * back to viewer-minted `a-N` (NOT-list N4/N5).
-   *
-   * Why not pinned as an exact literal either: see the reformat lesson above.
-   * Parsing is line-break- and indentation-blind, so collapsing the call onto
-   * one line stays green; hoisting the text into a `const noticeText` above the
-   * `if` stays green too, but only because the TEXT assertion is made against
-   * the whole stripped file rather than this slice (see the test below).
-   *
-   * String literals are neutralised to `""` BEFORE splitting so that a comma,
-   * paren, or quote inside the notice text can never be mistaken for an
-   * argument separator. The current text has none; a future one may.
-   * Commas are split at depth 1 only, so `nextMessageId()`'s own parens — or
-   * any nested call/array/object — cannot split an argument in half.
-   *
-   * Expects COMMENT-FREE input (see `stripComments` above); it knows nothing
-   * about comments, which is why callers pass `NOTICE_CODE` — a slice of the
-   * already-stripped `RUNTIME_CODE`, never of the raw source.
-   */
-  function sendTextArgs(src: string): string[] | null {
-    const CALL = "channel.sendText(";
-    const at = src.indexOf(CALL);
-    if (at < 0) return null;
-    const args: string[] = [];
-    let current = "";
-    let depth = 1;
-    let i = at + CALL.length;
-    while (i < src.length) {
-      const ch = src[i];
-      if (ch === '"' || ch === "'" || ch === "`") {
-        // Skip the whole literal (honouring backslash escapes) and stand a
-        // neutral `""` in its place.
-        i += 1;
-        while (i < src.length && src[i] !== ch) i += src[i] === "\\" ? 2 : 1;
-        if (i >= src.length) return null; // unterminated literal → fail closed
-        i += 1;
-        current += '""';
-        continue;
-      }
-      if (ch === "(" || ch === "[" || ch === "{") depth += 1;
-      else if (ch === ")" || ch === "]" || ch === "}") {
-        depth -= 1;
-        if (depth === 0) {
-          args.push(current.trim());
-          // A trailing comma (the prettier multi-line form has one) leaves a
-          // final empty slot; it is punctuation, not an argument.
-          if (args.length > 1 && args[args.length - 1] === "") args.pop();
-          return args;
-        }
-      }
-      if (ch === "," && depth === 1) {
-        args.push(current.trim());
-        current = "";
-        i += 1;
-        continue;
-      }
-      current += ch;
-      i += 1;
-    }
-    return null; // unbalanced → fail closed
-  }
+  // Line comments are stripped naively and whitespace collapsed, so this guard
+  // is line-break- and indentation-blind. A naive strip is sound HERE because it
+  // can only ever delete real code — i.e. only ever turn a positive assertion
+  // RED. It is not sound in the other direction, which is why the negative guard
+  // below is explicitly best-effort.
+  const RUNTIME_FLAT = RUNTIME_SOURCE.replace(/\/\/[^\n]*/g, "").replace(/\s+/g, " ");
 
   it("mints the notice's id at the delivery act", () => {
-    // Guard first: a missing gate makes the slice empty, which would let the
-    // assertions below pass vacuously.
-    expect(GATE_START).toBeGreaterThan(-1);
-    // The notice TEXT is asserted file-wide (still comment-free, so prose that
-    // merely quotes the notice cannot stand in for one that is actually sent),
-    // while only the CALL SHAPE is pinned to the slice. That split is what
-    // makes hoisting real: `const noticeText = …` written ABOVE the `if` — the
-    // natural placement — moves the text out of the slice, and asserting it
-    // against the slice would red that entirely correct refactor.
-    expect(RUNTIME_CODE).toContain("commands to an operator allowlist.");
-    const args = sendTextArgs(NOTICE_CODE);
-    // Parse failure is a FAILURE, never a silent pass.
-    expect(args).not.toBeNull();
-    // Exactly three arguments, and the third — the id slot — is the mint.
-    // Both halves matter: the count rejects an `undefined` shoved into the id
-    // slot with the mint pushed down into `turnId`, and the value rejects any
-    // other id shape minted inline.
-    expect(args).toEqual(["peerId", expect.any(String), "nextMessageId()"]);
+    // ADJACENCY IS THE ASSERTION — the one non-obvious thing here.
+    // `sendText(peerId, text, id?, turnId?, …)` turns argument 3, and only
+    // argument 3, into `payload.id` on the wire. Requiring the mint to follow
+    // the text argument IMMEDIATELY is precisely "the mint is in slot 3": an
+    // `undefined` wedged into the id slot — or anything else between the two —
+    // breaks the adjacency and reds this.
+    //
+    // Hoisting the text or the mint into a `const` reds this too, and that is
+    // intended: per this file's header, a deliberate wiring change gets a
+    // deliberate one-line update here.
+    expect(RUNTIME_FLAT).toMatch(/"commands to an operator allowlist\.", nextMessageId\(\)/);
   });
 
   it("mints it through the ONE canonical minter, imported from the adapter", () => {
-    // Comment-free like the rest: a commented-out or merely quoted import line
-    // must not stand in for a real one.
-    expect(RUNTIME_CODE).toContain('import { nextMessageId } from "./message-adapter.js";');
-    // The one-shape invariant. NOT a count of `nextMessageId()` calls: a second
-    // call is the SAME shape and is exactly what a legitimate future second
-    // egress site in this file would have to write. What must never appear is a
-    // SECOND id shape — an inline `webchannel-${…}` template minted here instead
-    // of through the adapter.
-    // Comment-free: this PR's own rationale prose at channel.ts:304 contains a
-    // literal `webchannel-${Date.now()}`, and copying that explanation into
-    // this file must not red a guard about what the code MINTS.
-    expect(RUNTIME_CODE).not.toMatch(/`webchannel-\$\{/);
+    expect(RUNTIME_FLAT).toContain('import { nextMessageId } from "./message-adapter.js";');
+    // Best-effort defense-in-depth, NOT a sound guarantee: the naive strip is
+    // not regex-aware, so a regex literal containing an escaped `//` can hide a
+    // second id shape from it. Making this sound is not worth the machinery.
+    expect(RUNTIME_FLAT).not.toMatch(/`webchannel-\$\{/);
   });
 
   it("keeps the notice best-effort: the boolean return stays ignored", () => {
-    // The notice is a hedge for a gate that is deliberately a conservative
-    // mirror; a failed send must not become a thrown or logged error here.
-    //
-    // Scoped to the notice for the same reason the shape assertions are: this
-    // must be about the NOTICE. Whole-file, a legitimate future egress site
-    // elsewhere in this runtime that DOES check its boolean return — a
-    // perfectly correct change — would turn a test named "keeps the notice
-    // best-effort" red for reasons that have nothing to do with the notice.
-    // Comment-free for the same reason again: this block's rationale prose
-    // already discusses the ignored boolean return, and prose that NAMES a
-    // forbidden form must not be mistaken for the form itself.
-    expect(NOTICE_CODE).toContain("channel.sendText("); // fail closed, not vacuous
-    expect(NOTICE_CODE).not.toContain("if (!channel.sendText(");
-    expect(NOTICE_CODE).not.toMatch(/=\s*channel\.sendText\(/);
+    // The notice hedges a gate that is deliberately a conservative mirror, so a
+    // failed send must not become a thrown or logged error here.
+    expect(RUNTIME_FLAT).not.toContain("if (!channel.sendText(");
+    expect(RUNTIME_FLAT).not.toMatch(/=\s*channel\.sendText\(/);
   });
 });

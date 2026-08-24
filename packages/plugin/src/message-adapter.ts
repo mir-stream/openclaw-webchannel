@@ -33,23 +33,26 @@ import type { WebChannelPeerChannel } from "./channel-contract.js";
  * so we mint locally.
  *
  * THE INVARIANT: one mint point, one id shape, and every durable-text egress
- * site calls it. The six, in full:
- *   1. this adapter's `send.text`;
- *   2. inbound.ts's unclaimed-delivery reply;
- *   3. inbound.ts's thrown-turn apology;
- *   4. channel.ts's core-initiated outbound seam;
- *   5. nats-account-runtime.ts's command-gate notice;
- *   6. the progress-draft finalize path (nats-channel.ts's `finalizeDraft` ->
- *      `sendText`), whose ids are minted right here in this adapter.
- * Sites 1-5 are the ones #238 changed; site 6 already minted through this
- * function before that slice, and is listed because under
- * `streaming.mode: "partial"` — what the product actually runs — it is the
- * channel's PRIMARY durable-text egress, so an enumeration that omits it reads
- * as complete while being the least representative half of the truth. No other
- * id shape may be introduced, and the client must never mint one for a durable
- * bubble (NOT-list N4/N5).
+ * site calls it. All six, deliberately UNNUMBERED here — the tests own the
+ * "site N" numbering and it counts only the four sites #238 changed, so a
+ * second numbering in this docblock would make "site 4" mean two different
+ * files depending on which file you are reading:
+ *   - inbound.ts's unclaimed-delivery reply         -> tests' site 1
+ *   - inbound.ts's thrown-turn apology              -> tests' site 2
+ *   - channel.ts's core-initiated outbound seam     -> tests' site 3
+ *   - nats-account-runtime.ts's command-gate notice -> tests' site 4
+ *   - this adapter's own `send.text`                -> already minted at base
+ *   - the progress-draft finalize path (nats-channel.ts's `finalizeDraft` ->
+ *     `sendText`), minted right here                -> already minted at base
+ * So #238 changed the first four; the adapter's `send.text` and the draft path
+ * already minted through this function before the slice. The draft path is
+ * listed anyway because under `streaming.mode: "partial"` — what the product
+ * actually runs — it is the channel's PRIMARY durable-text egress, so an
+ * enumeration that omits it reads as complete while being the least
+ * representative half of the truth. No other id shape may be introduced, and
+ * the client must never mint one for a durable bubble (NOT-list N4/N5).
  *
- * The receipt half is SEPARATE and narrower: only two of those six report an id
+ * The receipt half is SEPARATE and narrower: only two of these six report an id
  * to core at all (this adapter's `send.text` and channel.ts's outbound seam —
  * the other four return neither a `messageId` nor a receipt). Where a site does
  * report one, it reports this same id, so core's receipt and the client's

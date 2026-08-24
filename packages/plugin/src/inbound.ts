@@ -1555,9 +1555,10 @@ export async function handleInboundMessage(
                 // `draft && kind === "block"` and `draft && kind === "final"`,
                 // and `ReplyDispatchKind` is `"tool" | "block" | "final"`, so we
                 // arrive here either with no draft at all OR with a LIVE draft
-                // that does not handle this `kind`: under
-                // `streaming.mode: "progress"` a `kind: "tool"` delivery reaches
-                // this send with a non-null draft. Do not read this branch as
+                // that does not handle this `kind` — a `kind: "tool"` delivery
+                // alongside a live draft is the shape the types permit (not a
+                // measured case; nothing here depends on how often core takes
+                // it). Do not read this branch as
                 // "no draft can exist here" and conclude there is no lane state
                 // nearby — there may be one; this send simply is not part of it.
                 //
