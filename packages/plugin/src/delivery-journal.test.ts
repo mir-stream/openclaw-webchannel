@@ -394,12 +394,26 @@ describe("payload retention (#253)", () => {
     expect(row.kind).toBe("messageDeleted");
   });
 
-  it("leaves an unknown kind UNINDEXED without failing the append", () => {
+  it("extracts turn_id for known AND unknown kinds, and leaves an unknown kind UNINDEXED", () => {
+    // ⚠️ THE `turn_id` ASSERTIONS ARE LOAD-BEARING AND WERE ADDED LATE. Before
+    // them, `extractTurnId` had NO coverage at all: replacing its whole body
+    // with `return null` kept every test in both new files green, because the
+    // only other place `turn_id` is read is this query and it expected `null`,
+    // while every round-trip assertion reads `turnId` out of the PAYLOAD and so
+    // cannot see the column. #240 filters per-turn queries on this column
+    // (`delivery-journal.ts`'s `extractTurnId` docblock), and would have
+    // inherited a silently all-NULL column with nothing going red.
+    //
+    // The unknown-kind row carries a turnId on purpose: it is what pins the
+    // "read STRUCTURALLY so a forward kind still yields one" half of that
+    // docblock, which a known-kind row alone cannot reach.
     const databasePath = newJournalPath();
     const journal = open(databasePath);
+    journal.append("conv", bubble("a-1", "one"));
     journal.append("conv", {
       kind: "messageDeleted",
-      messageId: "a-1",
+      messageId: "a-2",
+      turnId: TURN,
     } as unknown as JournalEvent);
 
     const sidecar = new DatabaseSync(databasePath);
@@ -408,7 +422,12 @@ describe("payload retention (#253)", () => {
         sidecar
           .prepare("SELECT kind, message_id, turn_id FROM journal_event")
           .all(),
-      ).toEqual([{ kind: "messageDeleted", message_id: null, turn_id: null }]);
+      ).toEqual([
+        { kind: "bubble", message_id: "a-1", turn_id: TURN },
+        // `message_id` NULL: the unknown kind goes unindexed rather than
+        // failing the append. `turn_id` still populated: extracted structurally.
+        { kind: "messageDeleted", message_id: null, turn_id: TURN },
+      ]);
     } finally {
       sidecar.close();
     }
@@ -494,16 +513,27 @@ describe("connection and on-disk facts", () => {
   });
 
   it("creates a 0700 directory, a 0600 database, and 0600 WAL sidecars", () => {
-    // The sidecar assertion is the one that actually catches a late chmod:
-    // SQLite copies the main file's mode onto `-wal`/`-shm` at creation, so a
-    // chmod that lands after they exist leaves plaintext at 0644 while the main
-    // file still looks right.
+    // This pins the END STATE — every file this journal creates ends at 0600.
     //
-    // PROVEN TO FIRE: moving `chmodSync` below the schema DDL in
-    // `delivery-journal.ts` turns this red with `expected 420 to be 384`.
-    // (Moving it merely below `configureSqliteConnectionPragmas` does NOT —
-    // measured, the sidecars are created by the first WRITE, not by
-    // `PRAGMA journal_mode = WAL`. That module's step-3 comment records it.)
+    // ⚠️ IT DOES NOT PIN THE CHMOD'S POSITION, and an earlier version of this
+    // comment claimed it did ("PROVEN TO FIRE: moving `chmodSync` below the
+    // schema DDL turns this red with `expected 420 to be 384`"). That was true
+    // when the sweep covered only the MAIN file. It stopped being true in this
+    // same PR, when the sweep grew to `SQLITE_DATABASE_FILE_SUFFIXES` — it now
+    // chmods `-wal`/`-shm` explicitly, so running it AFTER the DDL finds the
+    // sidecars already on disk and hardens them anyway. RE-MEASURED both
+    // orderings: the final modes are `main 0600, -wal 0600, -shm 0600` either
+    // way, so the claimed-red mutation is green. A rationale that outlived its
+    // code.
+    //
+    // What the early position actually buys is the absence of a WINDOW in which
+    // `-wal`/`-shm` exist at 0644 while another process could open them, and
+    // NOTHING pins that — a single-process end-state assertion structurally
+    // cannot. The position is still correct (it is the earliest correct point);
+    // it is simply unguarded, and this comment no longer says otherwise.
+    //
+    // The sweep ITSELF is pinned, by the sibling test above: reducing it to the
+    // main file leaves a pre-existing `-shm` at 0644 and turns that one red.
     const databasePath = newJournalPath();
     const journal = open(databasePath);
     journal.append("conv", bubble("a-1", "one"));

@@ -279,11 +279,23 @@ function openJournalConnection(
   //    ⚠️ MEASURED, and NOT where you would guess: the sidecars are NOT created
   //    by `PRAGMA journal_mode = WAL` (step 4). They appear at the FIRST WRITE,
   //    which here is step 6's DDL. So "before WAL is enabled" is sufficient but
-  //    is not the real boundary — "before the first write" is. Moving this call
-  //    to just after step 5 still passes; moving it after step 6 turns the
-  //    sidecars 0644 and `delivery-journal.test.ts` red (verified both ways).
-  //    Keep it here anyway: it is the earliest correct point, and it cannot be
-  //    invalidated by a later statement being added above the DDL.
+  //    is not the real boundary — "before the first write" is.
+  //
+  //    ⚠️ AND NO TEST PINS THIS POSITION. An earlier version of this comment
+  //    said moving the call after step 6 "turns the sidecars 0644 and
+  //    `delivery-journal.test.ts` red (verified both ways)". That held while the
+  //    sweep covered only the MAIN file; it stopped holding in this same commit,
+  //    once the sweep grew to cover `-wal`/`-shm` explicitly — run late, it
+  //    finds them already on disk and hardens them regardless. RE-MEASURED: both
+  //    orderings end at `main 0600, -wal 0600, -shm 0600`.
+  //
+  //    So what the early call buys is narrower than "the sidecars are 0600": it
+  //    is the absence of a WINDOW in which they exist at 0644 while another
+  //    process could open them. That window is real and it is unguarded — a
+  //    single-process end-state assertion cannot see it. Keep the call here: it
+  //    is still the earliest correct point and cannot be invalidated by a later
+  //    statement being added above the DDL. Just do not believe a test will
+  //    catch you moving it.
   //
   //    ⚠️ AND IT CHMODS THE SIDECARS TOO, NOT JUST THE MAIN FILE. Inheritance
   //    only covers sidecars SQLite CREATES; it never re-chmods one that already

@@ -169,6 +169,20 @@ export function journalEventForOutbound(
       // The text is deliberately NOT journaled: doc §15.9 classifies the rolling
       // "Working…" draft as an INDICATOR, not a message. The durable text is
       // authored later by a `bubble` or a `seal`.
+      //
+      // ⚠️ "LATER" IS NOT GUARANTEED, and #240's projector must not assume it.
+      // A lane that gets `progress` and then neither a `bubble` nor a
+      // `seal.answers` entry — an aborted turn, a connection dropped before the
+      // drain — leaves a placement whose text is never authored. Live renders
+      // NOTHING there (the client's `dropSpentDrafts` removes the spent draft at
+      // turn end), but `applyPlacement` appends an empty agent bubble and
+      // nothing in the journal removes it, because the `draftOnly` flag that
+      // drives the drop is client-local and deliberately never journaled. So a
+      // naive replay shows a phantom empty bubble live never showed — N8, by
+      // omission. Journaling the placement is still right (it is what carries
+      // the ORDER), and the repair is derivable from the journal alone: a
+      // placement whose answerId never reappears. That fold belongs to the
+      // slice that serves history — issues **#251** and **#264**.
       return {
         kind: "placement",
         answerId: frame.id,

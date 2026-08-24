@@ -120,6 +120,14 @@ describe("journalEventForOutbound maps the durable frames", () => {
     // reach into an event the journal is about to persist.
     expect((event as { answers: unknown }).answers).not.toBe(answers);
     expect((event as { remove: unknown }).remove).not.toBe(remove);
+    // ⚠️ THE ELEMENT CHECK, NOT JUST THE ARRAY CHECK. `answers: [...frame.answers]`
+    // is a shallow copy that still aliases every element object, and it passes
+    // the array-identity line above while completely falsifying the mapper's
+    // "self-contained value the caller cannot mutate" claim. `.map()` is what
+    // makes that claim true, and this is the line that requires it.
+    expect(
+      (event as { answers: Array<{ id: string }> }).answers[0],
+    ).not.toBe(answers[0]);
   });
 
   it("omits turnId entirely when the wire omitted it", () => {
