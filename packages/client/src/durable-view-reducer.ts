@@ -50,7 +50,8 @@
  * allocate. Measured. The three SAME-array rows are EXHAUSTIVE — they are every
  * path in this file that returns its input by reference. The two NEW-array rows
  * are illustrative examples, not an enumeration: allocation is the default here,
- * so any transition not listed among the first three allocates.
+ * so any PATH not listed among the first three allocates. (Path, not
+ * transition — `placement` and `seal` each appear on both sides.)
  *   - `placement`, repeat claim whose turnId resolves unchanged  → SAME array
  *   - `seal`, early return (no valid answers and no removes)     → SAME array
  *   - `seal`, empty/blank turnId early return                    → SAME array
@@ -175,9 +176,21 @@ export type DurableView = readonly DurableMessage[];
  * ── BOUNDARY 1: the id-LESS `agent_message` branch is deliberately NOT modeled ──
  *
  * `bubble.answerId` is mandatory, but the wire today can deliver a durable agent
- * frame with NO id: `nats-channel.ts:458` writes `...(id ? { id } : {})`, and
- * three call sites pass none — `inbound.ts:1549`, `inbound.ts:1599` (the
- * thrown-turn apology) and `channel.ts:303`. The client branches on
+ * frame with NO id. `nats-channel.ts:456` is the ONLY producer of an
+ * `agent_message` frame, and its `sendText` writes `...(id ? { id } : {})`
+ * (…:458), so the id-less set is exactly the `sendText` callers that pass no
+ * `id`. Enumerated from an UNNARROWED repo-wide grep, there are FOUR:
+ *   - `inbound.ts:1549` / `:1550` — the two branches of one ternary (they
+ *     differ only in `assistantMessageIndex`), the ordinary visible reply;
+ *   - `inbound.ts:1599` — the thrown-turn apology;
+ *   - `channel.ts:303` — the generic outbound `sendText(ctx.to, ctx.text)`;
+ *   - `nats-account-runtime.ts:1173` — the /stop operator-allowlist notice.
+ * `message-adapter.ts:126` passes `nextMessageId()` and `nats-channel.ts:483`
+ * (`finalizeDraft`) requires an `id`, so those two are NOT id-less.
+ * ⚠️ COUNT THIS LIST AGAIN BEFORE RELYING ON IT — an earlier revision of this
+ * note said "three" and missed the /stop notice, which is precisely the kind of
+ * miss that would let slice 2 rewire while an id-less path survived.
+ * The client branches on
  * `nats-client-wrapper.ts:2569` `if (id) {…}`, and the else at …:2593-2599 mints
  * `id: \`a-${this.uid()}\`` from a CLIENT-LOCAL counter.
  *
@@ -187,7 +200,9 @@ export type DurableView = readonly DurableMessage[];
  * to kill (NOT-list N4/N5; doc §16.5: identity is assigned at the DELIVERY ACT,
  * by the plugin). The real resolution is that these frames stop being id-less
  * once the plugin assigns identity at delivery (board slice #238), which is why
- * those three call sites become id-bearing.
+ * ALL FOUR call sites above become id-bearing. #238 is not done while any one of
+ * them still omits the id: the survivor is invisible to this module's anchors
+ * (an id-less frame has none, by design), so nothing here would go red.
  *
  * ⚠️ ORDERING CONSTRAINT THIS IMPOSES — the client render must NOT be rewired
  * onto this reducer until #238 lands, and slice 2 must NEVER synthesize an
