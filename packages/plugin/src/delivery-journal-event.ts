@@ -71,8 +71,11 @@ export type JournalEvent =
  * Same value and same reason as `ingress-dedupe.ts`'s
  * `MAX_INGRESS_DEDUPE_ID_LENGTH`, which is this plugin's established handling of
  * `user_message.id`.
+ *
+ * Exported because `delivery-journal.ts`'s `append` enforces the SAME bound at
+ * the mechanism — two doors, and they must not drift to two numbers.
  */
-const MAX_INBOUND_USER_ID_LENGTH = 128;
+export const MAX_INBOUND_USER_ID_LENGTH = 128;
 
 /**
  * Is this a usable durable message id — a NON-EMPTY STRING?

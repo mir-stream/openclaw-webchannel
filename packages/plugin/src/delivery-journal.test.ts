@@ -6,6 +6,7 @@
  * append the reducer's BOUNDARY 1 delegates here, and the on-disk facts that are
  * hard to notice when they regress (pragmas, file modes, WAL sidecar modes).
  */
+import { createHook } from "node:async_hooks";
 import {
   chmodSync,
   mkdirSync,
@@ -262,6 +263,33 @@ describe("idempotent append", () => {
     expect(journal.read("conv")).toEqual([]);
   });
 
+  it("REFUSES a `user` event whose id exceeds the 128-char bound", () => {
+    // The bound follows the empty-id refusal down to the mechanism: `append` is
+    // the second public door, and a hand-built event never passes the mapper.
+    const journal = open(newJournalPath());
+    expect(() =>
+      journal.append("conv", {
+        kind: "user",
+        id: "z".repeat(1_000_000),
+        text: "hi",
+      }),
+    ).toThrow(/exceeds 128 characters \(received 1000000\)/);
+    expect(journal.read("conv")).toEqual([]);
+    // Exactly at the bound is accepted.
+    expect(
+      journal.append("conv", { kind: "user", id: "z".repeat(128), text: "hi" })
+        .seq,
+    ).toBe(1);
+  });
+
+  it("does NOT length-bound a `bubble` — agent ids are ours (N10)", () => {
+    // The guard is gated on `kind === "user"`, so the agent-id counter-argument
+    // that kept the bound out of the shared predicate cannot apply here.
+    const journal = open(newJournalPath());
+    const longAgentId = "a".repeat(1_000);
+    expect(journal.append("conv", bubble(longAgentId, "delivered")).seq).toBe(1);
+  });
+
   it("still accepts a `placement` under the empty id — the kinds differ", () => {
     // Not an inconsistency to tidy: the client keys progress on `id ?? ""`, so
     // `""` is a real lane id there, while its user/agent paths branch on
@@ -493,30 +521,69 @@ describe("connection and on-disk facts", () => {
     expect(() => journal.close()).not.toThrow();
   });
 
-  it("surfaces the REAL error when open fails, and closes the handle", () => {
+  it("surfaces the REAL error when open fails, and leaks no checkpoint timer", async () => {
     // Poison the file with a foreign `journal_event`, so the schema step's index
     // creation fails on an already-open handle — the same shape as a corrupt
     // file, a non-ENOENT chmod failure, or the SDK helper refusing the
-    // filesystem.
+    // filesystem. Crucially it fails AFTER step 4, which is what makes the SDK's
+    // periodic-checkpoint `setInterval` already exist.
     const databasePath = newJournalPath();
     mkdirSync(dirname(databasePath), { recursive: true });
     const seed = new DatabaseSync(databasePath);
     seed.exec("CREATE TABLE journal_event (x INTEGER)");
     seed.close();
 
-    // The original error, not a `Cannot destructure` or a masked close failure.
-    for (let attempt = 0; attempt < 3; attempt++) {
-      expect(() => openDeliveryJournal({ databasePath })).toThrow(
-        /no such column: conversation_id/,
-      );
+    // `async_hooks` is a portable builtin, unlike the `/proc/self/fd` counting
+    // the descriptor half of this leak would need — so this is the half that can
+    // be pinned, and the two share one root cause and one fix.
+    //
+    // ⚠️ TWO THINGS MAKE THE NAIVE VERSION OF THIS TEST USELESS, both measured:
+    //  - a GLOBAL live-Timeout count is polluted by vitest's own timers (it
+    //    drifts 1→3→2→3 on its own), so only ids created INSIDE the call being
+    //    tested may be counted — hence `capturing`;
+    //  - `destroy` does NOT fire synchronously on `clearInterval`, so a
+    //    same-tick assertion sees a correctly-cleared timer as still live. One
+    //    `setImmediate` is enough to flush it: in a control with one cleared and
+    //    one deliberately-leaked interval, exactly the cleared one reported
+    //    `destroy` after the flush.
+    const created: number[] = [];
+    const destroyed = new Set<number>();
+    let capturing = false;
+    const hook = createHook({
+      init: (asyncId, type) => {
+        if (capturing && type === "Timeout") created.push(asyncId);
+      },
+      destroy: (asyncId) => destroyed.add(asyncId),
+    });
+    hook.enable();
+    try {
+      for (let attempt = 0; attempt < 5; attempt++) {
+        capturing = true;
+        // The original error, not a `Cannot destructure` or a masked close
+        // failure. Repeated because the leak is per-attempt: one iteration
+        // cannot tell "released" from "accumulating".
+        expect(() => openDeliveryJournal({ databasePath })).toThrow(
+          /no such column: conversation_id/,
+        );
+        capturing = false;
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      hook.disable();
     }
 
-    // ⚠️ THE FD RELEASE ITSELF IS NOT ASSERTED HERE — counting descriptors needs
-    // `/proc/self/fd`, and a Linux-only case in a portable suite is worse than
-    // this one. It WAS measured: with the `try`/`catch` around the connection
-    // setup removed, five failed opens leak 3,5,7,9,11 descriptors on this exact
-    // fixture (two per attempt); with it, 0,0,0,0,0. Half 2 retries an open per
-    // account and per reconnect, which is what makes the leak matter.
+    // Step 4 installs the SDK's periodic-checkpoint `setInterval` before the
+    // step that throws here, so a failed open creates one. It is `unref()`'d and
+    // each firing throws into the SDK's own swallow, which makes an accumulation
+    // completely silent — nothing but this can see it.
+    expect(created.length).toBe(5);
+    expect(created.filter((asyncId) => !destroyed.has(asyncId))).toEqual([]);
+
+    // ⚠️ THE DESCRIPTOR HALF IS STILL NOT ASSERTED — that needs `/proc/self/fd`,
+    // and a Linux-only case in a portable suite is worse than this note. It WAS
+    // measured on this same fixture: with `openDeliveryJournal`'s `try`/`catch`
+    // removed, five failed opens leak 3,5,7,9,11 descriptors (two per attempt);
+    // with it, 0,0,0,0,0.
   });
 });
 

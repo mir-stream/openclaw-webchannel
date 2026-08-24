@@ -34,7 +34,7 @@ export const CONVERSATION_KEY_GENERATIONS_FILE_NAME =
 export const DELIVERY_JOURNAL_FILE_NAME = "delivery-journal.sqlite";
 
 export type TupleStoragePathOptions = StorageScopeIdentity & {
-  /** Common v2 root for both tuple-scoped secret-bearing stores. */
+  /** Common v2 root for every tuple-scoped secret-bearing store. */
   storageRoot?: string;
   /** Home-directory seam used only when storageRoot is omitted. */
   home?: string;
@@ -70,7 +70,8 @@ export function legacyStorageRoot(home: string = homedir()): string {
 }
 
 /**
- * Build the one canonical tuple directory used by both v2 stores.
+ * Build the one canonical tuple directory used by all three v2 stores — the
+ * credential store, the conversation-key stores, and the v6 delivery journal.
  *
  * Scope validation happens before any path construction, and neither raw tenant
  * nor raw account id is interpolated into a v2 path.

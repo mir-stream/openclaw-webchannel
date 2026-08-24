@@ -66,8 +66,15 @@ jobs:
       contents: read
       actions: read
 
-    # Pin the Node.js version — must match the engines.node range declared
-    # in each published package.json.
+    # Pin the Node.js version — the resolved runtime must SATISFY every
+    # published package.json's engines.node range. Those ranges are no longer
+    # identical: packages/plugin declares
+    # ">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0" (copied verbatim from the
+    # openclaw peer, because it needs the node:sqlite builtin), while client and
+    # saas still declare ">=22.0.0". The plugin's is the tightest, so it is the
+    # one this pin has to clear: "22" resolves to the latest 22.x, which is
+    # >=22.22.3, so all three are satisfied. Bumping the plugin's floor above the
+    # latest 22.x is what would break this — raise the pin then.
     env:
       NODE_VERSION: "22"
       # Signal to real-server test suites that nats-server MUST be present.

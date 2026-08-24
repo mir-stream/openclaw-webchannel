@@ -51,13 +51,19 @@ import type {
   StatementSync as SqliteStatement,
 } from "node:sqlite";
 
-import type { JournalEvent } from "./delivery-journal-event.js";
+import {
+  MAX_INBOUND_USER_ID_LENGTH,
+  type JournalEvent,
+} from "./delivery-journal-event.js";
 import { ensurePrivateDirectory } from "./private-file.js";
 
 /** Main database plus every journal-mode sidecar that can hold database pages. */
 const SQLITE_DATABASE_FILE_SUFFIXES = ["", "-wal", "-shm", "-journal"] as const;
 
-/** Seeded into `journal_meta` on open. No migration gate exists yet — see `open`. */
+/**
+ * Seeded into `journal_meta` on open. No migration gate exists yet — the note is
+ * at step 6 in `openJournalConnection`.
+ */
 export const DELIVERY_JOURNAL_SCHEMA_VERSION = "1";
 
 /**
@@ -178,7 +184,22 @@ export interface DeliveryJournal {
    * Append one event and return its per-conversation `seq`.
    *
    * `inserted: false` means an IDEMPOTENT no-op — the event was already in the
-   * log and `seq` is the FIRST one's. Never throws on a duplicate.
+   * log and `seq` is the FIRST one's. A duplicate NEVER throws; that is the
+   * point of it, since §15.8 mandates non-destructive retry of a failed append.
+   *
+   * ⚠️ IT DOES THROW on a malformed `user` event, and only on those two things:
+   *  - `kind: "user"` whose `id` is empty or not a string. Distinct user
+   *    messages under one id collapse onto a single row, and the loser comes
+   *    back as `inserted: false` — indistinguishable from the ordinary retry
+   *    above — so its text is simply absent from the only SSOT user messages
+   *    have (doc §15.7);
+   *  - `kind: "user"` whose `id` exceeds `MAX_INBOUND_USER_ID_LENGTH` (128, the
+   *    bound `ingress-dedupe.ts` already applies to this client-supplied field).
+   *    An unbounded id is amplified three times per row.
+   *
+   * Both are USER-KIND-ONLY. A `placement` under `answerId: ""` is faithful and
+   * is accepted; agent ids are plugin-minted and are never length-checked,
+   * because refusing one would drop delivered text (N10).
    */
   append(
     conversationId: string,
@@ -274,150 +295,164 @@ function openJournalConnection(
     databaseLabel: "webchannel delivery journal",
   });
 
-  // 5. FULL. ⚠️ THIS EXEC ASSERTS INTENT; IT DOES NOT CHANGE BEHAVIOUR TODAY.
-  //    MEASURED: a fresh `node:sqlite` handle already reports `synchronous = 2`
-  //    (FULL) before any pragma, and step 4 leaves it at 2 — FULL is this
-  //    build's DEFAULT and NORMAL is the opt-out, so this line is currently a
-  //    no-op. It stays because `configureSqliteConnectionPragmas` ACCEPTS a
-  //    `synchronous: "NORMAL"` option (its type admits that one value and no
-  //    other): the day an SDK bump or a shared helper starts passing it, step 4
-  //    would silently downgrade this store, and this exec is what takes the
-  //    downgrade back. §16.2-9 is why the downgrade must not stand — WAL +
-  //    `NORMAL` can roll a COMMITTED transaction back on power loss, and a store
-  //    that calls itself durable does not get to do that. It has to be a raw
-  //    `exec` after step 4 for the same reason: `"FULL"` cannot be expressed
-  //    through that option type at all.
-  //
-  //    ⚠️ NOT UNIT-PINNED, and it cannot cheaply be: `synchronous` is
-  //    per-CONNECTION state, invisible from a second handle, and an assertion on
-  //    THIS connection would pass with this line deleted (it is the default).
-  //    An honest test would need a second process and a power-loss simulation.
-  //
-  //    The cost of NOT downgrading was MEASURED rather than assumed — 2000
-  //    bubble appends, one IMMEDIATE txn each, real on-disk filesystem (zfs),
-  //    identical code path, only the pragma varied: p50 1.38 ms FULL vs 0.068 ms
-  //    NORMAL, p99 3.0-5.6 ms vs 0.25 ms. So the ~20x is what we DECLINE TO
-  //    RECOVER by downgrading, not a cost we opted into, and 1.38 ms is well
-  //    inside what persist-before-publish can afford in front of an outbound
-  //    frame. (Doc §15.2 quotes p50 0.1 ms and states no mode; the 0.098 ms
-  //    figure is §14.8's, and that one DOES state its mode — `WAL +
-  //    synchronous=NORMAL + busy_timeout`. Both are NORMAL numbers, and §14.8's
-  //    p99 4.1 ms and 393 ms auto-checkpoint spike match the tail seen here.)
-  db.exec("PRAGMA synchronous = FULL");
+  try {
+    // 5. FULL. ⚠️ THIS EXEC ASSERTS INTENT; IT DOES NOT CHANGE BEHAVIOUR TODAY.
+    //    MEASURED: a fresh `node:sqlite` handle already reports `synchronous = 2`
+    //    (FULL) before any pragma, and step 4 leaves it at 2 — FULL is this
+    //    build's DEFAULT and NORMAL is the opt-out, so this line is currently a
+    //    no-op. It stays because `configureSqliteConnectionPragmas` ACCEPTS a
+    //    `synchronous: "NORMAL"` option (its type admits that one value and no
+    //    other): the day an SDK bump or a shared helper starts passing it, step 4
+    //    would silently downgrade this store, and this exec is what takes the
+    //    downgrade back. §16.2-9 is why the downgrade must not stand — WAL +
+    //    `NORMAL` can roll a COMMITTED transaction back on power loss, and a store
+    //    that calls itself durable does not get to do that. It has to be a raw
+    //    `exec` after step 4 for the same reason: `"FULL"` cannot be expressed
+    //    through that option type at all.
+    //
+    //    ⚠️ NOT UNIT-PINNED, and it cannot cheaply be: `synchronous` is
+    //    per-CONNECTION state, invisible from a second handle, and an assertion on
+    //    THIS connection would pass with this line deleted (it is the default).
+    //    An honest test would need a second process and a power-loss simulation.
+    //
+    //    The cost of NOT downgrading was MEASURED rather than assumed — 2000
+    //    bubble appends, one IMMEDIATE txn each, real on-disk filesystem (zfs),
+    //    identical code path, only the pragma varied: p50 1.38 ms FULL vs 0.068 ms
+    //    NORMAL, p99 3.0-5.6 ms vs 0.25 ms. So the ~20x is what we DECLINE TO
+    //    RECOVER by downgrading, not a cost we opted into, and 1.38 ms is well
+    //    inside what persist-before-publish can afford in front of an outbound
+    //    frame. (Doc §15.2 quotes p50 0.1 ms and states no mode; the 0.098 ms
+    //    figure is §14.8's, and that one DOES state its mode — `WAL +
+    //    synchronous=NORMAL + busy_timeout`. Both are NORMAL numbers, and §14.8's
+    //    p99 4.1 ms and 393 ms auto-checkpoint spike match the tail seen here.)
+    db.exec("PRAGMA synchronous = FULL");
 
-  // 6. Schema. `CREATE ... IF NOT EXISTS` so opening an existing journal is a
-  //    no-op.
-  //
-  //    ⚠️ A PLAIN ROWID TABLE, NOT `WITHOUT ROWID`, AND THE CHOICE IS MEASURED.
-  //    `WITHOUT ROWID` is the intuitive pick for a (conversation_id, seq)-keyed
-  //    append-only log: it clusters rows in exactly `read`'s scan order. It is
-  //    also the wrong pick here, because the whole ROW lives in an INDEX b-tree,
-  //    whose `maxLocal` is ~1008 B against a table b-tree's ~4084 B — so every
-  //    record between those sizes buys a whole extra 4 KB overflow page, and a
-  //    chat bubble sits squarely in that band.
-  //
-  //    A/B on this exact DDL, 20 000 rows, VACUUMed, only the clause varied,
-  //    real filesystem; `read()` = full-conversation scan, SQL then JSON.parse:
-  //
-  //      payload   WITHOUT ROWID              rowid table
-  //      200 B     6.84 MB   3.6/1.3 ms       7.20 MB   28.5/12.8 ms
-  //      1.2 KB    92.18 MB  256/30.2 ms      27.73 MB  75.5/12.4 ms
-  //      4 KB      92.18 MB  367/32.4 ms      92.55 MB  240/34.8 ms
-  //                          (single/interleaved read)
-  //
-  //    At the dominant ~1.2 KB size the rowid table is 3.3x SMALLER and 2-3x
-  //    FASTER to read — the clustering advantage is swamped by walking 3.3x more
-  //    pages. The counter-argument does survive at 200 B, where there is no
-  //    overflow: interleaved reads are ~10x faster clustered (1.3 ms vs 12.8 ms).
-  //    That band is real but it is not ours, and it loses the disk axis anyway.
-  //
-  //    This is IRREVERSIBLE in practice — see the missing version gate below —
-  //    so it is written down rather than left silent.
-  //
-  //    ⚠️ There is NO version-negotiation gate yet: `schema_version` is seeded
-  //    and never checked, so an older build opening a newer journal proceeds.
-  //    Deliberate for this slice (the journal has no call sites and no on-disk
-  //    installs to be older than), and it is the same runtime-version-skew
-  //    problem the reducer's BOUNDARY 2 defers to #241/#246. Whoever makes the
-  //    journal authoritative (#240) owns closing it.
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS journal_meta (
-      key   TEXT PRIMARY KEY,
-      value TEXT NOT NULL
+    // 6. Schema. `CREATE ... IF NOT EXISTS` so opening an existing journal is a
+    //    no-op.
+    //
+    //    ⚠️ A PLAIN ROWID TABLE, NOT `WITHOUT ROWID`, AND THE CHOICE IS MEASURED.
+    //    `WITHOUT ROWID` is the intuitive pick for a (conversation_id, seq)-keyed
+    //    append-only log: it clusters rows in exactly `read`'s scan order. It is
+    //    also the wrong pick here, because the whole ROW lives in an INDEX b-tree,
+    //    whose `maxLocal` is ~1008 B against a table b-tree's ~4084 B — so every
+    //    record between those sizes buys a whole extra 4 KB overflow page, and a
+    //    chat bubble sits squarely in that band.
+    //
+    //    A/B on this exact DDL, 20 000 rows, VACUUMed, only the clause varied,
+    //    real filesystem; `read()` = full-conversation scan, SQL then JSON.parse:
+    //
+    //      payload   WITHOUT ROWID              rowid table
+    //      200 B     6.84 MB   3.6/1.3 ms       7.20 MB   28.5/12.8 ms
+    //      1.2 KB    92.18 MB  256/30.2 ms      27.73 MB  75.5/12.4 ms
+    //      4 KB      92.18 MB  367/32.4 ms      92.55 MB  240/34.8 ms
+    //                          (single/interleaved read)
+    //
+    //    At the dominant ~1.2 KB size the rowid table is 3.3x SMALLER and 2-3x
+    //    FASTER to read — the clustering advantage is swamped by walking 3.3x more
+    //    pages. The counter-argument does survive at 200 B, where there is no
+    //    overflow: interleaved reads are ~10x faster clustered (1.3 ms vs 12.8 ms).
+    //    That band is real but it is not ours, and it loses the disk axis anyway.
+    //
+    //    This is IRREVERSIBLE in practice — see the missing version gate below —
+    //    so it is written down rather than left silent.
+    //
+    //    ⚠️ There is NO version-negotiation gate yet: `schema_version` is seeded
+    //    and never checked, so an older build opening a newer journal proceeds.
+    //    Deliberate for this slice (the journal has no call sites and no on-disk
+    //    installs to be older than), and it is the same runtime-version-skew
+    //    problem the reducer's BOUNDARY 2 defers to #241/#246. Whoever makes the
+    //    journal authoritative (#240) owns closing it.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS journal_meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS journal_event (
+        conversation_id TEXT    NOT NULL,
+        seq             INTEGER NOT NULL,
+        kind            TEXT    NOT NULL,
+        message_id      TEXT,
+        turn_id         TEXT,
+        payload         TEXT    NOT NULL,
+        created_ms      INTEGER NOT NULL,
+        PRIMARY KEY (conversation_id, seq)
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS journal_user_once
+        ON journal_event(conversation_id, message_id) WHERE kind = 'user';
+      CREATE UNIQUE INDEX IF NOT EXISTS journal_placement_once
+        ON journal_event(conversation_id, message_id) WHERE kind = 'placement';
+    `);
+    db.prepare(
+      "INSERT INTO journal_meta (key, value) VALUES ('schema_version', ?) " +
+        "ON CONFLICT DO NOTHING",
+    ).run(DELIVERY_JOURNAL_SCHEMA_VERSION);
+
+    // ── statements ──
+    //
+    // The seq allocation is per-CONVERSATION and runs INSIDE the append's
+    // transaction. A DB-global AUTOINCREMENT would be simpler and is wrong: it is
+    // exposed to the client as its gap-sync cursor, and the moment a SECOND
+    // conversation writes, the first one's cursor sees phantom gaps and asks for
+    // a difference that does not exist (doc §16.2-6).
+    const selectNextSeq = db.prepare(
+      "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM journal_event " +
+        "WHERE conversation_id = ?",
+    );
+    const insertEvent = db.prepare(
+      "INSERT INTO journal_event " +
+        "(conversation_id, seq, kind, message_id, turn_id, payload, created_ms) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+    );
+    // Two statements, one per deduped kind, with `kind` as a SQL LITERAL rather
+    // than a bound parameter. A bound `kind = ?` cannot be matched against the
+    // partial indexes' `WHERE kind = 'user'` / `'placement'` predicates — SQLite
+    // has to prove the predicate at prepare time — so the single-statement version
+    // scanned the whole conversation. EXPLAIN QUERY PLAN, re-confirmed against the
+    // rowid schema:
+    //   bound `kind = ?`  → SEARCH … USING INDEX sqlite_autoindex_journal_event_1
+    //                       (conversation_id=?)          ← whole-conversation scan
+    //   literal 'user'    → SEARCH … USING INDEX journal_user_once
+    //                       (conversation_id=? AND message_id=?)
+    //   literal 'placement' → … USING INDEX journal_placement_once (same shape)
+    const selectExistingSeqByKind = {
+      user: db.prepare(
+        "SELECT seq FROM journal_event " +
+          "WHERE conversation_id = ? AND kind = 'user' AND message_id = ?",
+      ),
+      placement: db.prepare(
+        "SELECT seq FROM journal_event " +
+          "WHERE conversation_id = ? AND kind = 'placement' AND message_id = ?",
+      ),
+    };
+    const selectRows = db.prepare(
+      "SELECT seq, payload, created_ms FROM journal_event " +
+        "WHERE conversation_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
     );
 
-    CREATE TABLE IF NOT EXISTS journal_event (
-      conversation_id TEXT    NOT NULL,
-      seq             INTEGER NOT NULL,
-      kind            TEXT    NOT NULL,
-      message_id      TEXT,
-      turn_id         TEXT,
-      payload         TEXT    NOT NULL,
-      created_ms      INTEGER NOT NULL,
-      PRIMARY KEY (conversation_id, seq)
-    );
-
-    CREATE UNIQUE INDEX IF NOT EXISTS journal_user_once
-      ON journal_event(conversation_id, message_id) WHERE kind = 'user';
-    CREATE UNIQUE INDEX IF NOT EXISTS journal_placement_once
-      ON journal_event(conversation_id, message_id) WHERE kind = 'placement';
-  `);
-  db.prepare(
-    "INSERT INTO journal_meta (key, value) VALUES ('schema_version', ?) " +
-      "ON CONFLICT DO NOTHING",
-  ).run(DELIVERY_JOURNAL_SCHEMA_VERSION);
-
-  // ── statements ──
-  //
-  // The seq allocation is per-CONVERSATION and runs INSIDE the append's
-  // transaction. A DB-global AUTOINCREMENT would be simpler and is wrong: it is
-  // exposed to the client as its gap-sync cursor, and the moment a SECOND
-  // conversation writes, the first one's cursor sees phantom gaps and asks for
-  // a difference that does not exist (doc §16.2-6).
-  const selectNextSeq = db.prepare(
-    "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM journal_event " +
-      "WHERE conversation_id = ?",
-  );
-  const insertEvent = db.prepare(
-    "INSERT INTO journal_event " +
-      "(conversation_id, seq, kind, message_id, turn_id, payload, created_ms) " +
-      "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-  );
-  // Two statements, one per deduped kind, with `kind` as a SQL LITERAL rather
-  // than a bound parameter. A bound `kind = ?` cannot be matched against the
-  // partial indexes' `WHERE kind = 'user'` / `'placement'` predicates — SQLite
-  // has to prove the predicate at prepare time — so the single-statement version
-  // scanned the whole conversation. EXPLAIN QUERY PLAN, re-confirmed against the
-  // rowid schema:
-  //   bound `kind = ?`  → SEARCH … USING INDEX sqlite_autoindex_journal_event_1
-  //                       (conversation_id=?)          ← whole-conversation scan
-  //   literal 'user'    → SEARCH … USING INDEX journal_user_once
-  //                       (conversation_id=? AND message_id=?)
-  //   literal 'placement' → … USING INDEX journal_placement_once (same shape)
-  const selectExistingSeqByKind = {
-    user: db.prepare(
-      "SELECT seq FROM journal_event " +
-        "WHERE conversation_id = ? AND kind = 'user' AND message_id = ?",
-    ),
-    placement: db.prepare(
-      "SELECT seq FROM journal_event " +
-        "WHERE conversation_id = ? AND kind = 'placement' AND message_id = ?",
-    ),
-  };
-  const selectRows = db.prepare(
-    "SELECT seq, payload, created_ms FROM journal_event " +
-      "WHERE conversation_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
-  );
-
-  return {
-    maintenance,
-    statements: {
-      selectNextSeq,
-      insertEvent,
-      selectExistingSeqByKind,
-      selectRows,
-    },
-  };
+    return {
+      maintenance,
+      statements: {
+        selectNextSeq,
+        insertEvent,
+        selectExistingSeqByKind,
+        selectRows,
+      },
+    };
+  } catch (error) {
+    // ⚠️ `maintenance.close()`, NOT just a rethrow. Step 4 installed a
+    // `setInterval` inside this handle, and it is the ONLY thing that clears
+    // it. Everything above — the pragma, the DDL, the meta insert, all four
+    // `prepare` calls — runs after that timer exists and can throw, and on
+    // that path the caller never receives `maintenance`, so nothing else can
+    // ever reach it. The timers are `unref()`'d and each firing throws into
+    // the SDK's own swallow, so the accumulation is silent and unbounded.
+    // MEASURED: five failed opens left five live `Timeout` handles; the
+    // suite pins the count (`delivery-journal.test.ts`).
+    maintenance.close();
+    throw error;
+  }
 }
 
 /**
@@ -440,12 +475,19 @@ export function openDeliveryJournal(options: {
   //
   //    ⚠️ THE `true` IS LOAD-BEARING. `ensurePrivateDirectory` defaults it to
   //    false, which only sets 0700 on a directory it CREATES; a tuple directory
-  //    already sitting at 0755 stays 0755 (measured). Every other caller in this
-  //    package passes `true` — `conversation-key-store.ts`,
-  //    `rotation-preflight.ts`, `offline-conversation-key-rotation.ts` — so
-  //    omitting it made the journal the sole exception while its comment claimed
-  //    parity. It is also the exact argument `chmodDatabaseFiles` exists for one
-  //    step below: inheritance never re-hardens something that already exists.
+  //    already sitting at 0755 stays 0755 (measured). Enumerated rather than
+  //    asserted this time: every OTHER direct caller in this package passes
+  //    `true` (`private-file.ts`'s `archiveFileNoReplace`, and three sites in
+  //    `legacy-storage-migration.ts`), and the secret stores reach the same
+  //    argument INDIRECTLY through `atomicWritePrivateFile`'s
+  //    `enforceDirectoryMode` — `conversation-key-store.ts`,
+  //    `offline-conversation-key-rotation.ts` and `rotation-preflight.ts` all
+  //    pass `true` there. The one conditional in the package is
+  //    `enrollment-client.ts`, which passes `this.usesTupleCredentialPath`. So
+  //    omitting it made the journal the only unconditional `false` while its
+  //    comment claimed parity. It is also the exact argument `chmodDatabaseFiles`
+  //    exists for one step below: inheritance never re-hardens what already
+  //    exists.
   ensurePrivateDirectory(dirname(databasePath), true);
 
   // 2. Open. SQLite creates the main file here, at 0666 & ~umask.
@@ -454,9 +496,16 @@ export function openDeliveryJournal(options: {
   // Steps 3-6 and the statement preparation all run against an OPEN handle, and
   // every one of them can throw — `chmodDatabaseFiles` rethrows a non-ENOENT
   // chmod failure, the SDK helper REFUSES an unsupported filesystem outright,
-  // and the DDL can fail on a corrupt file. Without this the handle and its fd
-  // leak on each failure, and half 2 retries an open per account and per
-  // reconnect, so they accumulate.
+  // and the DDL can fail on a corrupt file.
+  //
+  // A failed open leaks TWO things, and this `catch` owns only the first:
+  //   - the DATABASE HANDLE and its descriptors — released here. Measured at two
+  //     fds per failed open;
+  //   - the SDK's periodic-CHECKPOINT TIMER, once step 4 has run — released by
+  //     `openJournalConnection`'s own `catch`, because `maintenance` never
+  //     reaches this scope on the failing path. Measured at one live `Timeout`
+  //     per failed open.
+  // Half 2 retries an open per account and per reconnect, so both accumulate.
   let connection: ReturnType<typeof openJournalConnection>;
   try {
     connection = openJournalConnection(db, databasePath);
@@ -490,16 +539,34 @@ export function openDeliveryJournal(options: {
       // inconsistency to tidy up.
       // The `typeof` mirrors `isUsableMessageId` rather than testing `.length`
       // directly: a non-string that slipped past the type would otherwise throw
-      // an unnamed `TypeError` from inside a transaction instead of this.
-      if (
-        event.kind === "user" &&
-        !(typeof event.id === "string" && event.id.length > 0)
-      ) {
-        throw new Error(
-          "webchannel: delivery journal refuses a `user` event with an empty " +
-            "id — distinct user messages would collapse onto one row and the " +
-            "second would report as an ordinary duplicate (doc §15.7)",
-        );
+      // an unnamed `TypeError` where this raises a named one.
+      if (event.kind === "user") {
+        if (!(typeof event.id === "string" && event.id.length > 0)) {
+          throw new Error(
+            "webchannel: delivery journal refuses a `user` event with an " +
+              "empty id — distinct user messages would collapse onto one row " +
+              "and the second would report as an ordinary duplicate (doc §15.7)",
+          );
+        }
+        // The LENGTH bound follows the empty-id refusal down to the mechanism
+        // for the same reason: `append` is the second public door, and a
+        // hand-built `user` event that never went through
+        // `journalEventForInboundUser` reaches only this one. An unbounded
+        // client id is amplified three times per row (payload copy, indexed
+        // `message_id` copy, unique-index entry).
+        //
+        // USER-KIND-ONLY, exactly as the mapper's bound is: agent ids are
+        // plugin-minted, and refusing an over-long one would drop DELIVERED
+        // text (N10). Here that scoping is free — this branch is already gated
+        // on `kind === "user"`, so the agent-id counter-argument cannot apply.
+        if (event.id.length > MAX_INBOUND_USER_ID_LENGTH) {
+          throw new Error(
+            "webchannel: delivery journal refuses a `user` event whose id " +
+              `exceeds ${MAX_INBOUND_USER_ID_LENGTH} characters (received ` +
+              `${event.id.length}); see ingress-dedupe.ts's ingressDedupeKey ` +
+              "for the same bound and the storage-amplification reason",
+          );
+        }
       }
       // One IMMEDIATE transaction per event (doc §15.2: per-bubble immediate
       // txn, measured viable). Appends are SYNCHRONOUS and in egress order —
