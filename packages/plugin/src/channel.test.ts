@@ -2348,11 +2348,15 @@ describe("webchannel inbound round-trip", () => {
    * still-unresolved lane, else the lane being streamed now — so the reservation
    * this fixture is about lands on the text-less second lane. A barrier holds
    * SUCCESSORS, never its own lane, so the ordering this asserts is only
-   * observable if a later lane exists to be held. Without the third boundary the
-   * reservation guards nothing, and the fixture goes green even when a notice
-   * settlement wrongly retires it (measured while writing this: the shape with
-   * "B draft" on the barrier's own lane passes with `disposition.kind` replaced
-   * by a hardcoded `"block"`).
+   * observable if a later lane exists to be held. Drop the third boundary and
+   * the reservation lands on "B draft"'s OWN lane instead of the text-less
+   * second one; `predecessorsResolved` never inspects a lane's own barrier
+   * list, so nothing holds `progress:B draft` back and it goes out immediately.
+   * Measured on this branch: all three rows then FAIL against the expectation
+   * array below. The boundary is therefore not a hardening we could drop and
+   * stay green — it is what puts the barrier one lane EARLIER than the text it
+   * has to hold, and only in that arrangement can this fixture tell a
+   * reservation that survives a notice settlement from one that does not.
    *
    * The expected wire order is unchanged by that boundary: the second lane is
    * text-less and emits nothing.
