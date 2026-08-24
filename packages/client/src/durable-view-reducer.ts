@@ -51,7 +51,8 @@
  * path in this file that returns its input by reference. The two NEW-array rows
  * are illustrative examples, not an enumeration: allocation is the default here,
  * so any PATH not listed among the first three allocates. (Path, not
- * transition — `placement` and `seal` each appear on both sides.)
+ * transition: `placement` and `seal` each have paths on BOTH sides of the
+ * divide, even though only `seal` happens to have a row in each section below.)
  *   - `placement`, repeat claim whose turnId resolves unchanged  → SAME array
  *   - `seal`, early return (no valid answers and no removes)     → SAME array
  *   - `seal`, empty/blank turnId early return                    → SAME array
@@ -241,7 +242,8 @@ export type DurableView = readonly DurableMessage[];
  *
  * That is a faithful port, not a defect to fix here: the live client throws
  * identically at nats-client-wrapper.ts:1552-1554. The only difference is
- * reachability — live, `u-${this.seq++}` is monotonic so the precondition cannot
+ * reachability — live, `u-${this.uid()}` (…:804-805, and `uid()` is
+ * `${this.seq++}` at …:1824-1825) is monotonic so the precondition cannot
  * be violated; a journal REPLAY can violate it. Do not "fix" it by making
  * `applyUser` an upsert or by de-duplicating inside `applySeal`: inventing a
  * reconciliation rule the client does not have is exactly the defect class this
