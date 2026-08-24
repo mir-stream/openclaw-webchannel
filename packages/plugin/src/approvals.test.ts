@@ -598,6 +598,75 @@ describe("webchannel approver resolution", () => {
   });
 });
 
+describe('webchannel approver wildcard "*"', () => {
+  const wildcard = (accounts?: unknown) =>
+    ({
+      channels: {
+        webchannel: {
+          execApprovals: { enabled: true, approvers: ["*"] },
+          ...(accounts ? { accounts } : {}),
+        },
+      },
+    }) as any;
+
+  it("admits any peer already authenticated on the account", () => {
+    const cfg = wildcard();
+    for (const senderId of ["alice", "bob", "255f5a1e-4d5a-48d3-b983-782d3fa600da"]) {
+      expect(isWebChannelExecApprovalApprover({ cfg, senderId })).toBe(true);
+    }
+  });
+
+  it("still refuses an absent or blank sender — 'any peer' still needs a peer", () => {
+    const cfg = wildcard();
+    for (const senderId of [undefined, null, "", "   "]) {
+      expect(isWebChannelExecApprovalApprover({ cfg, senderId })).toBe(false);
+    }
+  });
+
+  it("stays account-scoped: '*' on one account says nothing about another", () => {
+    // A's list is the wildcard, B's names one peer. B must not inherit A's.
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            a: { execApprovals: { enabled: true, approvers: ["*"] } },
+            b: { execApprovals: { enabled: true, approvers: ["bob"] } },
+          },
+        },
+      },
+    } as any;
+    expect(isWebChannelExecApprovalApprover({ cfg, accountId: "a", senderId: "carol" })).toBe(true);
+    expect(isWebChannelExecApprovalApprover({ cfg, accountId: "b", senderId: "carol" })).toBe(false);
+    expect(isWebChannelExecApprovalApprover({ cfg, accountId: "b", senderId: "bob" })).toBe(true);
+  });
+
+  it("counts as a configured approver, so the native surface stays enabled", () => {
+    // `approverCount` gates the native approval client. A wildcard that read as
+    // "no approvers configured" would silently fall back to text delivery — the
+    // exact `no approval route` failure this replaces.
+    expect(getWebChannelExecApprovalApprovers({ cfg: wildcard() })).toEqual(["*"]);
+  });
+
+  it("works through the ownerAllowFrom fallback too", () => {
+    const cfg = {
+      commands: { ownerAllowFrom: ["*"] },
+      channels: { webchannel: { execApprovals: { enabled: true } } },
+    } as any;
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "alice" })).toBe(true);
+  });
+
+  it("does NOT admit anyone when the list merely CONTAINS a star-ish entry", () => {
+    // Exact match only: no globbing, no prefix matching. `"*"` is the whole
+    // entry or it is an ordinary (never-issued) peer id.
+    const cfg = {
+      channels: { webchannel: { execApprovals: { enabled: true, approvers: ["a*", "*b", "**"] } } },
+    } as any;
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "alice" })).toBe(false);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "ab" })).toBe(false);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "a*" })).toBe(true);
+  });
+});
+
 describe("webchannel exec approval authorization", () => {
   const cfgWithApprovers = {
     channels: {
