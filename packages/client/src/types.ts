@@ -148,6 +148,32 @@ export type ChatMessage = {
    */
   turnId?: string;
   /**
+   * v6 (#251): this bubble has received a `progress` draft but NO durable text
+   * yet. Client-local and never on the wire — it is the one bit that keeps the
+   * rolling draft distinguishable from authored content once the draft has been
+   * written into `text` for rendering.
+   *
+   * §15.9 classifies the rolling "Working…" draft as a 표시기 (indicator), not a
+   * message, so a `draftOnly` bubble contributes `text: ""` to the durable view
+   * (`nats-client-wrapper.ts`'s `durableProjection`).
+   *
+   * CLAIMED, NEVER ADDED — the one invariant to keep. Only an absent bubble, or
+   * one that already carries the bit, may take it. Adding it to a bubble that
+   * already holds authored durable text would let a single stray `progress`
+   * frame turn a delivered answer into a DELETED one at turn end (M212g: a
+   * visible duplicate is recoverable where a deletion is not).
+   *
+   * Three writers CLEAR it: an `agent_message` or `turn_snapshot` that authors
+   * durable text for the same id, and `expireStaleDrafts`, which promotes the
+   * partial to durable rather than deleting it on a mid-turn guess.
+   *
+   * It outlives the `working` flip on purpose: that is what lets an unfinalized
+   * lane's bubble be dropped at turn end instead of freezing its partial text
+   * forever, matching how core's built-in Telegram extension deletes an
+   * unfinalized preview (`[core] extensions/telegram/src/bot-message-dispatch.ts:2971-2975`).
+   */
+  draftOnly?: true;
+  /**
    * P1-9: true while this user message is HELD locally (a turn was in flight
    * at send time) and not yet published. Local-only — never on the wire,
    * never in history. Flips off (with wireId/turnId assigned) at release.

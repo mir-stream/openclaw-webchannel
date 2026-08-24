@@ -3,7 +3,7 @@ import { describe, it, expect } from "vitest";
 import {
   applyDurableEvent,
   reduceDurableView,
-  projectDurable,
+  projectDurableFromClient,
   type DurableEvent,
   type DurableRole,
   type DurableView,
@@ -19,10 +19,12 @@ import type { InboundMessage } from "./nats-client.js";
 //    of `applyDurableEvent` and not a second implementation of the transition
 //    table. The whole shared-reducer guarantee rests on there being ONE code
 //    path (the client folds incrementally, the server replays the log).
-//  - the EQUIVALENCE ANCHOR asserts the reducer's `seal` transition equals the
-//    client's REAL private `applyTurnSnapshot` for the same starting messages +
-//    snapshot. It instantiates the REAL `WebChannelNATSClient` on purpose: an
-//    anchor against a copy of the reducer would be circular and prove nothing.
+//  - the EQUIVALENCE ANCHOR drives the REAL `WebChannelNATSClient` with real
+//    wire frames and compares its projected `state.messages` against this
+//    reducer. Since the client was rewired onto the reducer that comparison is no
+//    longer between two independent implementations — read the caveat at the
+//    anchor section's own header before treating a green anchor as proof of a
+//    transition.
 
 const TURN = "turn-1";
 
@@ -340,9 +342,11 @@ describe("step / fold agreement: reduceDurableView === fold of applyDurableEvent
 //
 // These record what the reducer DOES on a journal that violates its stated
 // precondition (no duplicate `user` rows). They are NOT endorsements, and the
-// behavior is deliberately not "fixed" here: the live client does the same thing
-// at nats-client-wrapper.ts:1552-1554, and inventing a dedupe rule the client
-// lacks is exactly the defect class this slice forbids. Idempotent append is the
+// behavior is deliberately not "fixed" here: it is a faithful port of what the
+// client's own hand-rolled loop did before the rewire (the client now reaches
+// this same code, so the "REAL client throws too" case below no longer proves
+// independence), and inventing a dedupe rule the client lacks is exactly the
+// defect class this slice forbids. Idempotent append is the
 // JOURNAL's job (slice #239's persist-before-publish boundary).
 //
 // The hazard is real: §15.8 mandates non-destructive retry of a failed journal
@@ -415,38 +419,175 @@ describe("characterization: a duplicated `user` row violates the reducer's preco
 // turn one of them red rather than pass silently.
 
 describe("characterization: the deliberate divergence, and the precondition trap beside it", () => {
-  it("placement drops the draft text the live view shows (§15.9 indicator, not a message)", () => {
-    // `progress.text` is REQUIRED on the wire (channel-contract.ts:66) and the
-    // real client writes it into the bubble (nats-client-wrapper.ts:2472-2473).
-    // The reducer appends `text: ""` instead. That is the settled §15.9 decision
-    // — the rolling draft is a 표시기 (indicator), not a message — and it is the
-    // ONLY reason the `placement` anchors compare `slotSkeleton` rather than the
-    // whole view. Recorded here so the delta is a fact in the suite instead of a
-    // gap: do NOT "fix" the reducer to match, and do NOT widen the placement
-    // anchors to compare text — either move is a §15.9 reversal that belongs in
-    // the doc first.
-    const real = realDrive([], [progressFrame("A", "partial answer so far", TURN)]);
+  it("placement AGREES with the live view: the draft renders, the durable text is empty (§15.9)", () => {
+    // FLIPPED from pinning a divergence to pinning agreement (#251). Until the
+    // client was rewired onto the reducer this recorded a real delta: the live
+    // bubble held "partial answer so far" where the reducer held "". The verdict
+    // is that the reducer was right and LIVE was the defective side, so the
+    // client now keeps the two apart with `draftOnly` instead of conflating them.
+    //
+    // `progress.text` is still REQUIRED on the wire (channel-contract.ts:66) and
+    // the client still RENDERS it — what changed is that it no longer counts as
+    // durable content. Do NOT "fix" this by teaching the reducer to keep draft
+    // text: that is the §15.9 reversal, and it belongs in the doc first.
+    const frames = [progressFrame("A", "partial answer so far", TURN)];
+    const render = realRender([], frames);
+    const real = realDrive([], frames);
     const reduced = reduceDurableView([{ kind: "placement", answerId: "A", turnId: TURN }]);
 
-    expect(real[0].text).toBe("partial answer so far");
+    // The UI still shows the rolling draft…
+    expect(render[0].text).toBe("partial answer so far");
+    expect(render[0].working).toBe(true);
+    expect(render[0].draftOnly).toBe(true);
+    // …and the durable view — the client's and the reducer's alike — does not.
+    expect(real[0].text).toBe("");
     expect(reduced[0].text).toBe("");
-    // …and the divergence is confined to `text`: everything placement DOES claim
-    // to mirror still matches exactly.
-    expect(slotSkeleton(reduced)).toEqual(slotSkeleton(real));
+    expect(reduced).toEqual(real);
+  });
+
+  it("an unfinalized lane renders NO bubble once the turn ends (#251)", () => {
+    // The case the issue is actually about, end to end through the real client:
+    // A claims a slot and streams, the turn settles, and no durable frame ever
+    // named A. Core's built-in Telegram extension deletes exactly this preview at
+    // turn end (`[core] extensions/telegram/src/bot-message-dispatch.ts:2971-2975`
+    // → `stream.clear()` → `draft-stream.ts:653-668` → `:634 api.deleteMessage`),
+    // so the bubble goes rather than freezing at its last partial.
+    const live = realRender([], [progressFrame("A", "partial answer so far", TURN)]);
+    expect(live.map((m) => m.id)).toEqual(["A"]);
+
+    const settled = realRender([], [
+      progressFrame("A", "partial answer so far", TURN),
+      { type: "turn_settled", turnId: TURN } as unknown as InboundMessage,
+    ]);
+    expect(settled).toEqual([]);
+    // live == history: the reducer's view of the same stream is equally empty of
+    // durable text for A, so neither side shows a bubble the other lacks.
+    expect(
+      reduceDurableView([{ kind: "placement", answerId: "A", turnId: TURN }])[0].text,
+    ).toBe("");
+  });
+
+  it("a lane that DID receive durable text survives the same turn end", () => {
+    // Non-vacuity for the test above: the drop is keyed on "never authored
+    // durable text", not on "the turn ended".
+    const settled = realRender([], [
+      progressFrame("A", "partial…", TURN),
+      agentMessageFrame("A", "answer A (final)", TURN),
+      { type: "turn_settled", turnId: TURN } as unknown as InboundMessage,
+    ]);
+    expect(settled.map((m) => m.id)).toEqual(["A"]);
+    expect(settled[0].text).toBe("answer A (final)");
+    expect(settled[0].working).toBe(false);
+    expect(settled[0].draftOnly).toBeUndefined();
+  });
+
+  it("slot retention: B's text arriving first does not move A ahead of it", () => {
+    // The ordering guarantee `placement` exists to provide, driven through the
+    // real client: A claims slot 1 and B slot 2, then B's durable text lands
+    // BEFORE A's. A must keep slot 1 rather than being appended at the tail.
+    const view = realRender([], [
+      progressFrame("A", "A partial…", TURN),
+      progressFrame("B", "B partial…", TURN),
+      agentMessageFrame("B", "answer B", TURN),
+      agentMessageFrame("A", "answer A", TURN),
+    ]);
+    expect(view.map((m) => m.id)).toEqual(["A", "B"]);
+    expect(view.map((m) => m.text)).toEqual(["answer A", "answer B"]);
+  });
+
+  it("never-arrives: A is absent and B's position is unchanged", () => {
+    // A claims slot 1 and never receives durable text; B claims slot 2 and does.
+    // A vanishes at the turn end; B stays where it was.
+    const view = realRender([], [
+      progressFrame("A", "A partial…", TURN),
+      progressFrame("B", "B partial…", TURN),
+      agentMessageFrame("B", "answer B", TURN),
+      { type: "turn_settled", turnId: TURN } as unknown as InboundMessage,
+    ]);
+    expect(view.map((m) => m.id)).toEqual(["B"]);
+    expect(view[0].text).toBe("answer B");
+  });
+
+  it("late progress after a drop re-materialises the lane at the TAIL (#251)", () => {
+    // MEASURED consequence of the drop, recorded so it is visible in the suite
+    // rather than discovered later. This is the self-heal path at a TURN-END site
+    // — `turn_settled` here, and equally the terminal settle or an explicit
+    // `/stop` — where the lane is dropped and then proves it was alive after all
+    // by sending another `progress`. (The P1-9 staleness valve is NOT one of
+    // these: it is a mid-turn guess, so it promotes instead of dropping and its
+    // self-heal keeps the original slot. See `expireStaleDrafts`.)
+    //
+    // `applyPlacement` APPENDS on an id it does not hold, so the lane comes back
+    // at the tail: [A, B] becomes [B, A]. That is correct rather than a defect to
+    // design around — the preview was deleted, so the lane returning is a NEW
+    // delivery act, and a new message lands at the bottom, exactly as it would in
+    // Telegram. We are strictly better than the reference here because the id is
+    // REUSED: the later final still matches this bubble, so the self-heal
+    // produces no duplicate.
+    //
+    // Characterization: it records what happens, it does not claim the resulting
+    // order is ideal.
+    const w = newWrapper() as unknown as WrapperInternals;
+    w.handleMessage(progressFrame("A", "A partial…", TURN));
+    w.handleMessage(progressFrame("B", "B partial…", TURN));
+    w.handleMessage(agentMessageFrame("B", "answer B", TURN));
+    expect(w.state.messages.map((m) => m.id)).toEqual(["A", "B"]);
+
+    // A never received durable text → dropped at the turn end.
+    w.handleMessage({ type: "turn_settled", turnId: TURN } as unknown as InboundMessage);
+    expect(w.state.messages.map((m) => m.id)).toEqual(["B"]);
+
+    // …and A was alive after all. It returns — at the TAIL, not in slot 1.
+    w.handleMessage(progressFrame("A", "back alive…", TURN));
+    expect(w.state.messages.map((m) => m.id)).toEqual(["B", "A"]);
+    expect(w.state.messages[1]).toMatchObject({ text: "back alive…", working: true, draftOnly: true });
+
+    // The id was reused, so A's eventual final lands on THAT bubble — one A, not
+    // two. Slot order is the only thing the drop cost.
+    w.handleMessage(agentMessageFrame("A", "answer A", TURN));
+    expect(w.state.messages.map((m) => m.id)).toEqual(["B", "A"]);
+    expect(w.state.messages.map((m) => m.text)).toEqual(["answer B", "answer A"]);
+  });
+
+  it("a late seal re-materialises a dropped lane (characterised, not idealised)", () => {
+    // #215 failed-frame recovery arriving AFTER the drop. `applySeal` step 3
+    // mints an absent answer next to its PREDECESSOR answer, so A lands ahead of
+    // B — its original relative order — even though its bubble was gone. This
+    // records what `applySeal` actually produces; it is not an assertion that
+    // this is the ideal placement.
+    const view = realRender([], [
+      progressFrame("A", "A partial…", TURN),
+      progressFrame("B", "B partial…", TURN),
+      agentMessageFrame("B", "answer B", TURN),
+      { type: "turn_settled", turnId: TURN } as unknown as InboundMessage,
+      turnSnapshotFrame({
+        turnId: TURN,
+        answers: [
+          { id: "A", text: "answer A (recovered)" },
+          { id: "B", text: "answer B" },
+        ],
+        remove: [],
+      }),
+    ]);
+    expect(view.map((m) => m.id)).toEqual(["A", "B"]);
+    expect(view[0].text).toBe("answer A (recovered)");
+    expect(view[0].working).toBe(false);
+    expect(view[0].draftOnly).toBeUndefined();
   });
 
   it('bubble with an EMPTY answerId is NOT "id-less" — the live client mints separate bubbles', () => {
-    // The client's two id sites use DIFFERENT falsiness, and this is the trap it
-    // sets for slice 2's mapper (see BOUNDARY 1 in durable-view-reducer.ts):
-    //   - `progress` upserts on `id ?? ""` (…:2471) — NULLISH, so "" survives as
-    //     a real id, which is why `placement` with `answerId: ""` is FAITHFUL;
-    //   - `agent_message` branches on `if (id)` (…:2569) — TRUTHY, so "" falls
-    //     into the id-less mint branch at …:2593 and gets a fresh `a-<n>`.
+    // The client's two id sites use DIFFERENT falsiness, and this is the trap the
+    // frame→event mapper walks into (see BOUNDARY 1 in durable-view-reducer.ts):
+    //   - `progress` keys on `id ?? ""` (…:2707) — NULLISH, so "" survives as a
+    //     real id, which is why `placement` with `answerId: ""` is FAITHFUL;
+    //   - `agent_message` branches on `if (id)` (…:2834) — TRUTHY, so "" falls
+    //     into the mint branch at …:2869 and gets a fresh `a-<n>`.
     // So two id-less finals are TWO bubbles live, while a mapper that mirrors the
     // progress site verbatim (`answerId: frame.id ?? ""`) collapses them into ONE
     // durable row — an N8 live≠history divergence landing in the mapper. Hence
-    // `bubble.answerId` must be NON-EMPTY; "" is not the encoding for "id-less",
-    // and until #238 an id-less `agent_message` has NO `bubble` event at all.
+    // `bubble.answerId` must be NON-EMPTY; "" is not the encoding for "id-less".
+    // The live mapper preserves the difference verbatim, which is what keeps the
+    // two-bubble outcome below true.
     const real = realDrive([], [
       agentMessageFrame("", "one", TURN),
       agentMessageFrame("", "two", TURN),
@@ -471,31 +612,37 @@ describe("characterization: the deliberate divergence, and the precondition trap
 // EQUIVALENCE ANCHORS — every transition vs. the REAL client
 // ---------------------------------------------------------------------------
 //
-// This module's ONLY claim is that it is a faithful mirror of what the client
-// does TODAY. A hand-written expectation cannot distinguish a faithful mirror
-// from a merely plausible one, so each of the four transitions is anchored by
-// driving the REAL `WebChannelNATSClient` with the REAL wire frames and
-// comparing its projected `state.messages` against the reducer's output for the
-// corresponding event stream:
+// Each of the four transitions is anchored by driving the REAL
+// `WebChannelNATSClient` with the REAL wire frames and comparing its projected
+// `state.messages` against the reducer's output for the corresponding event
+// stream:
 //
-//   user      → the real public `send()` → `publish()` (nats-client-wrapper.ts:804)
-//   placement → a real `progress` frame  → `handleFrame` case (…:2467)
-//   bubble    → a real `agent_message`   → `handleFrame` case (…:2562)
-//   seal      → a real `turn_snapshot`   → `applyTurnSnapshot`  (…:1486-1557)
+//   user      → the real public `send()` → `publish()` (nats-client-wrapper.ts:847)
+//   placement → a real `progress` frame  → `handleFrame` case (…:2701)
+//   bubble    → a real `agent_message`   → `handleFrame` case (…:2827)
+//   seal      → a real `turn_snapshot`   → `applyTurnSnapshot`  (…:1546-1573)
 //
-// WHAT IS COMPARED IS NOT UNIFORM, and the difference is a carve-out rather than
-// an oversight. `user`, `bubble` and `seal` compare the FULL projected view
-// (`projectDurable(state.messages)`, text included). `placement` compares only
-// the SLOT SKELETON — id / role / turnId / order — because §15.9 excludes the
-// rolling draft text from the durable view, so the reducer deliberately stores
-// `text: ""` where the live client shows the draft. That single delta is itself
-// pinned, by the characterization test above ("placement drops the draft text
-// the live view shows"), so it is observed and not merely narrated.
+// ⚠️ READ WHAT THESE NOW PROVE, AND WHAT THEY NO LONGER DO. Until the client was
+// rewired onto the reducer they were genuinely NON-CIRCULAR: two independent
+// implementations of the same reconciliation, compared. The client's durable half
+// IS this reducer now, so a green anchor is no longer independent evidence about
+// a TRANSITION — the wrapper reaches the same code the left-hand side calls.
 //
-// The discipline that makes these worth anything is NON-CIRCULARITY: they call
-// real client code, never a second copy of the reducer. Nothing in this section
-// may ever be "fixed" by adjusting an expectation — a red anchor means the
-// reducer diverged from the client and the REDUCER is what changes.
+// They are kept, and still earn it, because what they cover moved rather than
+// vanished: the frame→event MAPPING (which falsifiable choices like `id ?? ""`
+// vs `if (id)` live in), the client-local overlay merge, the `draftOnly`
+// projection, and the dispatch edge — precisely where a rewiring bug lands. Do
+// not read them as the reducer's own proof, and do not delete them for being
+// "circular": that would drop the mapper's only end-to-end coverage.
+//
+// WHAT IS COMPARED IS NOW UNIFORM. `placement` used to compare only the SLOT
+// SKELETON (id / role / turnId / order) because §15.9 excludes the rolling draft
+// text from the durable view while the live client showed it. That carve-out
+// closed: the draft is behind the client-local `draftOnly` flag and the client's
+// own durable projection blanks it, so all four compare the full view.
+//
+// Nothing in this section may ever be "fixed" by adjusting an expectation — a red
+// anchor means the reducer and the client's mapping diverged.
 
 const registration = {
   devicePrivateKey: {} as CryptoKey,
@@ -539,22 +686,48 @@ function seed(w: WrapperInternals, starting: DurableView): void {
 }
 
 /**
+ * Project a real wrapper's `state.messages`. Uses the SHARED
+ * `projectDurableFromClient` — the same function the wrapper's own
+ * `durableProjection` calls — rather than a local copy of the §15.9 draft rule,
+ * so there is exactly one definition of what "durable" means for a live bubble.
+ *
+ * Reading `state.messages` through the RAW `projectDurable` instead would compare
+ * the reducer's durable view against the client's RENDER text and report a
+ * divergence the design says does not exist.
+ */
+function projectWrapper(messages: Array<Record<string, unknown>>): DurableView {
+  return projectDurableFromClient(
+    messages as unknown as Array<{
+      id: string;
+      role: DurableRole;
+      text: string;
+      turnId?: string;
+      draftOnly?: boolean;
+    }>,
+  );
+}
+
+/**
  * Drive the REAL private inbound handler (`handleMessage`,
- * nats-client-wrapper.ts:2048) with real wire frames over a starting view, and
+ * nats-client-wrapper.ts:2280) with real wire frames over a starting view, and
  * project the result. This is the same dispatch the socket feeds in production.
  */
 function realDrive(starting: DurableView, frames: InboundMessage[]): DurableView {
   const w = newWrapper() as unknown as WrapperInternals;
   seed(w, starting);
   for (const frame of frames) w.handleMessage(frame);
-  return projectDurable(
-    w.state.messages as unknown as Array<{
-      id: string;
-      role: DurableRole;
-      text: string;
-      turnId?: string;
-    }>,
-  );
+  return projectWrapper(w.state.messages);
+}
+
+/** The RENDER view — `state.messages` as the UI sees it, draft text included. */
+function realRender(
+  starting: DurableView,
+  frames: InboundMessage[],
+): Array<Record<string, unknown>> {
+  const w = newWrapper() as unknown as WrapperInternals;
+  seed(w, starting);
+  for (const frame of frames) w.handleMessage(frame);
+  return w.state.messages;
 }
 
 /** Build a `progress` wire frame (`channel-contract.ts:66` — `turnId` OPTIONAL). */
@@ -597,7 +770,7 @@ function slotSkeleton(view: DurableView): Array<{ id: string; role: DurableRole;
 describe("equivalence anchor: user ≡ the real publish() echo", () => {
   it("appends each user echo at the tail, interleaved with agent bubbles", () => {
     // Drive the REAL public `send()`, which routes through `publish()` and
-    // installs the u- bubble at nats-client-wrapper.ts:804. The bubble's ID and
+    // installs the u- bubble at nats-client-wrapper.ts:847. The bubble's ID and
     // turnId are minted by the client (a receipt/wireId concern the durable
     // stream does not model), so they are READ BACK from the real client and fed
     // into the reducer event. Everything `applyUser` actually claims — tail
@@ -609,14 +782,7 @@ describe("equivalence anchor: user ≡ the real publish() echo", () => {
     internals.handleMessage(agentMessageFrame("A", "answer A", TURN));
     w.send("second question");
 
-    const real = projectDurable(
-      internals.state.messages as unknown as Array<{
-        id: string;
-        role: DurableRole;
-        text: string;
-        turnId?: string;
-      }>,
-    );
+    const real = projectWrapper(internals.state.messages);
 
     // Identity fields taken from the real client, never invented here.
     const [u0, , u1] = real;
@@ -644,7 +810,7 @@ describe("equivalence anchor: placement ≡ a real progress frame", () => {
       { kind: "placement", answerId: "A", turnId: TURN },
       { kind: "placement", answerId: "B", turnId: TURN },
     ]);
-    expect(slotSkeleton(reduced)).toEqual(slotSkeleton(real));
+    expect(reduced).toEqual(real);
     expect(slotSkeleton(real)).toEqual([
       { id: "A", role: "agent", turnId: TURN },
       { id: "B", role: "agent", turnId: TURN },
@@ -652,8 +818,8 @@ describe("equivalence anchor: placement ≡ a real progress frame", () => {
   });
 
   it("a REPEAT progress on a held id keeps the slot and REFRESHES turnId", () => {
-    // nats-client-wrapper.ts:2472 applies `turnId: msg.turnId ?? prev.turnId` on
-    // EVERY progress, not just the first.
+    // The mapper applies `turnId: msg.turnId ?? prev.turnId` on EVERY progress,
+    // not just the first (`applyPlacement` owns the `??`).
     const real = realDrive([], [
       progressFrame("A", "Working…", "turn-old"),
       progressFrame("A", "Working… more", "turn-new"),
@@ -662,7 +828,7 @@ describe("equivalence anchor: placement ≡ a real progress frame", () => {
       { kind: "placement", answerId: "A", turnId: "turn-old" },
       { kind: "placement", answerId: "A", turnId: "turn-new" },
     ]);
-    expect(slotSkeleton(reduced)).toEqual(slotSkeleton(real));
+    expect(reduced).toEqual(real);
     expect(slotSkeleton(real)).toEqual([{ id: "A", role: "agent", turnId: "turn-new" }]);
   });
 
@@ -675,18 +841,18 @@ describe("equivalence anchor: placement ≡ a real progress frame", () => {
       { kind: "placement", answerId: "A", turnId: "turn-old" },
       { kind: "placement", answerId: "A" },
     ]);
-    expect(slotSkeleton(reduced)).toEqual(slotSkeleton(real));
+    expect(reduced).toEqual(real);
     expect(slotSkeleton(real)).toEqual([{ id: "A", role: "agent", turnId: "turn-old" }]);
   });
 
   it("a FIRST progress without turnId claims its slot with turnId undefined", () => {
     // `progress.turnId` is optional on the wire (channel-contract.ts:66;
-    // nats-channel.ts:469 omits it when falsy) and the client stores it verbatim
-    // (…:2473). The slot claim must survive — dropping it would lose the
+    // nats-channel.ts:469 omits it when falsy) and the client stores it verbatim.
+    // The slot claim must survive — dropping it would lose the
     // ordering the very first test in this file protects.
     const real = realDrive([], [progressFrame("A", "Working…")]);
     const reduced = reduceDurableView([{ kind: "placement", answerId: "A" }]);
-    expect(slotSkeleton(reduced)).toEqual(slotSkeleton(real));
+    expect(reduced).toEqual(real);
     expect(slotSkeleton(real)).toEqual([{ id: "A", role: "agent", turnId: undefined }]);
   });
 });
@@ -721,12 +887,13 @@ describe("equivalence anchor: bubble ≡ a real agent_message frame", () => {
   });
 
   it("an agent_message on a held id does NOT rewrite that bubble's role", () => {
-    // nats-client-wrapper.ts:2572-2578 — the UPDATE branch spreads `prev` and
-    // sets text/working/turnId only; it never writes `role`. Only the APPEND
-    // fallback (…:2579-2586) sets `role: "agent"`. Unreachable today (u-/a-/lane
-    // id namespaces do not collide), but byte-faithfulness is this module's
-    // entire product, and an id-namespace change must break HERE rather than
-    // silently reclassifying a user bubble in the durable history.
+    // `applyBubble`'s UPDATE branch spreads the held entry and sets text/turnId
+    // only; it never writes `role`. Only the APPEND fallback sets `role: "agent"`.
+    // (Pre-rewire this asymmetry lived in the wrapper's `upsertMessage` call, and
+    // it is preserved verbatim.) Unreachable today (u-/a-/lane id namespaces do
+    // not collide), but byte-faithfulness is this module's entire product, and an
+    // id-namespace change must break HERE rather than silently reclassifying a
+    // user bubble in the durable history.
     const starting: DurableView = [{ id: "u-0", role: "user", text: "mine", turnId: "w-0" }];
     const real = realDrive(starting, [agentMessageFrame("u-0", "overwritten", TURN)]);
     const reduced = applyDurableEvent(starting, {
@@ -765,10 +932,12 @@ describe("equivalence anchor: bubble ≡ a real agent_message frame", () => {
 //
 // Step 3 goes through `handleMessage` — the same real dispatch as the other
 // three anchors — rather than calling the private `applyTurnSnapshot`
-// (nats-client-wrapper.ts:1486-1557) directly. `case "turn_snapshot"` (…:2557)
-// is a bare delegation today, so nothing is lost; routing it this way also
-// covers the dispatch edge, so a frame that stops reaching the handler at all
-// fails here instead of passing against a hand-picked private method.
+// (nats-client-wrapper.ts:1546-1573) directly. That method is now the frame→event
+// mapper plus the per-answer `working:false` / `draftOnly`-clearing overlay, so
+// what these cases actually exercise is the MAPPING and the merge, not the
+// reconciliation (which is `applySeal`, the left-hand side). Routing it this way
+// also covers the dispatch edge, so a frame that stops reaching the handler at
+// all fails here instead of passing against a hand-picked private method.
 
 /** Build a `turn_snapshot` wire frame. */
 function turnSnapshotFrame(seal: {
