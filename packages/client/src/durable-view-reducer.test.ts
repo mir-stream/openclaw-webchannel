@@ -510,9 +510,12 @@ describe("characterization: the deliberate divergence, and the precondition trap
 
   it("late progress after a drop re-materialises the lane at the TAIL (#251)", () => {
     // MEASURED consequence of the drop, recorded so it is visible in the suite
-    // rather than discovered later. This is the P1-9 self-heal path: a lane is
-    // dropped (turn end / `/stop` / the staleness valve) and then proves it was
-    // alive after all by sending another `progress`.
+    // rather than discovered later. This is the self-heal path at a TURN-END site
+    // — `turn_settled` here, and equally the terminal settle or an explicit
+    // `/stop` — where the lane is dropped and then proves it was alive after all
+    // by sending another `progress`. (The P1-9 staleness valve is NOT one of
+    // these: it is a mid-turn guess, so it promotes instead of dropping and its
+    // self-heal keeps the original slot. See `expireStaleDrafts`.)
     //
     // `applyPlacement` APPENDS on an id it does not hold, so the lane comes back
     // at the tail: [A, B] becomes [B, A]. That is correct rather than a defect to
@@ -575,10 +578,10 @@ describe("characterization: the deliberate divergence, and the precondition trap
   it('bubble with an EMPTY answerId is NOT "id-less" — the live client mints separate bubbles', () => {
     // The client's two id sites use DIFFERENT falsiness, and this is the trap the
     // frame→event mapper walks into (see BOUNDARY 1 in durable-view-reducer.ts):
-    //   - `progress` keys on `id ?? ""` (…:2659) — NULLISH, so "" survives as a
+    //   - `progress` keys on `id ?? ""` (…:2707) — NULLISH, so "" survives as a
     //     real id, which is why `placement` with `answerId: ""` is FAITHFUL;
-    //   - `agent_message` branches on `if (id)` (…:2765) — TRUTHY, so "" falls
-    //     into the mint branch at …:2800 and gets a fresh `a-<n>`.
+    //   - `agent_message` branches on `if (id)` (…:2834) — TRUTHY, so "" falls
+    //     into the mint branch at …:2869 and gets a fresh `a-<n>`.
     // So two id-less finals are TWO bubbles live, while a mapper that mirrors the
     // progress site verbatim (`answerId: frame.id ?? ""`) collapses them into ONE
     // durable row — an N8 live≠history divergence landing in the mapper. Hence
@@ -614,10 +617,10 @@ describe("characterization: the deliberate divergence, and the precondition trap
 // `state.messages` against the reducer's output for the corresponding event
 // stream:
 //
-//   user      → the real public `send()` → `publish()` (nats-client-wrapper.ts:844)
-//   placement → a real `progress` frame  → `handleFrame` case (…:2653)
-//   bubble    → a real `agent_message`   → `handleFrame` case (…:2758)
-//   seal      → a real `turn_snapshot`   → `applyTurnSnapshot`  (…:1539-1567)
+//   user      → the real public `send()` → `publish()` (nats-client-wrapper.ts:847)
+//   placement → a real `progress` frame  → `handleFrame` case (…:2701)
+//   bubble    → a real `agent_message`   → `handleFrame` case (…:2827)
+//   seal      → a real `turn_snapshot`   → `applyTurnSnapshot`  (…:1546-1573)
 //
 // ⚠️ READ WHAT THESE NOW PROVE, AND WHAT THEY NO LONGER DO. Until the client was
 // rewired onto the reducer they were genuinely NON-CIRCULAR: two independent
@@ -706,7 +709,7 @@ function projectWrapper(messages: Array<Record<string, unknown>>): DurableView {
 
 /**
  * Drive the REAL private inbound handler (`handleMessage`,
- * nats-client-wrapper.ts:2232) with real wire frames over a starting view, and
+ * nats-client-wrapper.ts:2280) with real wire frames over a starting view, and
  * project the result. This is the same dispatch the socket feeds in production.
  */
 function realDrive(starting: DurableView, frames: InboundMessage[]): DurableView {
@@ -767,7 +770,7 @@ function slotSkeleton(view: DurableView): Array<{ id: string; role: DurableRole;
 describe("equivalence anchor: user ≡ the real publish() echo", () => {
   it("appends each user echo at the tail, interleaved with agent bubbles", () => {
     // Drive the REAL public `send()`, which routes through `publish()` and
-    // installs the u- bubble at nats-client-wrapper.ts:844. The bubble's ID and
+    // installs the u- bubble at nats-client-wrapper.ts:847. The bubble's ID and
     // turnId are minted by the client (a receipt/wireId concern the durable
     // stream does not model), so they are READ BACK from the real client and fed
     // into the reducer event. Everything `applyUser` actually claims — tail
@@ -929,7 +932,7 @@ describe("equivalence anchor: bubble ≡ a real agent_message frame", () => {
 //
 // Step 3 goes through `handleMessage` — the same real dispatch as the other
 // three anchors — rather than calling the private `applyTurnSnapshot`
-// (nats-client-wrapper.ts:1539-1567) directly. That method is now the frame→event
+// (nats-client-wrapper.ts:1546-1573) directly. That method is now the frame→event
 // mapper plus the per-answer `working:false` / `draftOnly`-clearing overlay, so
 // what these cases actually exercise is the MAPPING and the merge, not the
 // reconciliation (which is `applySeal`, the left-hand side). Routing it this way

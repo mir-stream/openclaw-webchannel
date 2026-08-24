@@ -984,10 +984,7 @@ describe("WebChannelNATSClient — #96 turnActive, valve and release edges", () 
     expect(w.getState().turnActive).toBe(true); // grace not expired yet
 
     vi.advanceTimersByTime(1_000);
-    // Setup probe only — this test is about `turnActive` below. #251: the draft
-    // never received durable text, so expiry drops the bubble rather than
-    // flipping it working:false in place.
-    expect(w.getState().messages.some((m) => m.id === "webchannel-d")).toBe(false);
+    expect(w.getState().messages.find((m) => m.id === "webchannel-d")?.working).toBe(false);
     expect(w.getState().turnActive).toBe(false); // no proof of life → no claim
     w.close();
   });

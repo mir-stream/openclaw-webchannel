@@ -271,8 +271,11 @@ export class WebChannelNATSClient {
   /**
    * P1-9 §3.6.2: post-reconnect staleness valve. `staleDraftWatch` holds the ids
    * of `working` drafts recorded when onSession fired; the timer flips any still
-   * in the set to `working: false` in place (never swapping the id) after the
-   * grace. Both are connection-scoped: cleared on every onState(false)/close()
+   * in the set to `working: false` in place after the grace, never swapping the
+   * id and never dropping the bubble — this valve GUESSES that a turn died, so it
+   * promotes the partial to durable rather than deleting it (see
+   * `expireStaleDrafts` for why this site differs from the three turn-end sites).
+   * Both are connection-scoped: cleared on every onState(false)/close()
    * and re-armed FRESH on every onSession, so the grace counts only connected
    * time. A draft-touching frame (progress/agent_message by id, reasoning by
    * turnId) disarms its entry — the turn is demonstrably alive.
@@ -1494,10 +1497,14 @@ export class WebChannelNATSClient {
   // ---------------------------------------------------------------------------
 
   /**
-   * §3.6.1: finalize any `working` draft whose turnId matches a settled turn
-   * (flip `working: false` in place — id/text untouched). Settled means no more
-   * upserts are coming; if `turnInFlight` drops as a result, the end-of-frame
-   * `maybeRelease()` releases held messages.
+   * §3.6.1: settle any `working` draft whose turnId matches a settled turn.
+   * Settled means no more upserts are coming; if `turnInFlight` drops as a
+   * result, the end-of-frame `maybeRelease()` releases held messages.
+   *
+   * "Settle" is TWO outcomes since #251, not the flip-in-place this used to
+   * promise: a draft that received durable text flips `working: false` with its
+   * id and text untouched, while one that never did is DROPPED. `turn_settled` is
+   * a genuine turn-end signal, so an unfinalized lane has nothing left to become.
    */
   /**
    * #212 (Phase 3, targeted): reconcile the live turn's AGENT ANSWER bubbles to
@@ -1586,16 +1593,29 @@ export class WebChannelNATSClient {
   }
 
   /**
-   * §3.4: finalize the local turn-in-flight state — flip EVERY live `working`
-   * draft to `working: false` in place (id/text untouched, staleness-watch entry
-   * dropped) AND clear the `isTyping` indicator. Both feed `turnInFlight()`, so
-   * clearing them is what actually unwedges the composer. Called only from the
-   * explicit-`/stop` branch of send(): "stop everything" must unwedge
-   * immediately, not wait for a `turn_settled`/final frame that may never arrive
-   * (agent died with the socket alive). Covers BOTH a working-draft hang and a
-   * pre-first-token typing-only hang (isTyping true, zero drafts). Same
-   * self-healing invariant as the staleness valve: if the turn is actually still
-   * alive, a later `typing`/`progress` frame re-sets the state it cleared.
+   * §3.4: settle the local turn-in-flight state — flip EVERY live `working` draft
+   * to `working: false` (staleness-watch entry dropped) AND clear the `isTyping`
+   * indicator. Both feed `turnInFlight()`, so clearing them is what actually
+   * unwedges the composer. Called only from the explicit-`/stop` branch of send():
+   * "stop everything" must unwedge immediately, not wait for a
+   * `turn_settled`/final frame that may never arrive (agent died with the socket
+   * alive). Covers BOTH a working-draft hang and a pre-first-token typing-only
+   * hang (isTyping true, zero drafts).
+   *
+   * #251: a draft that never received durable text is DROPPED rather than flipped
+   * in place — an explicit `/stop` is a genuine turn end, so an unfinalized lane
+   * has nothing to become. A draft that DID receive durable text keeps its id and
+   * text exactly as before.
+   *
+   * The self-healing invariant survives the drop, but ONLY FOR IDENTITY, not for
+   * position: if the turn was actually still alive, a later `typing`/`progress`
+   * re-sets the state this cleared and the lane comes back under the SAME id (one
+   * bubble, and its eventual final still matches it) — but `applyPlacement`
+   * appends, so it re-materialises at the TAIL rather than in its old slot. A
+   * `/stop` mid-turn can therefore leave the late answer BELOW the user's `/stop`
+   * bubble. That is Telegram-faithful: the preview was deleted, so the lane
+   * returning is a new delivery act. Pinned in `durable-view-reducer.test.ts`
+   * ("late progress after a drop re-materialises the lane at the TAIL (#251)").
    */
   private finalizeLocalTurnState(): void {
     let changed = false;
@@ -1664,29 +1684,43 @@ export class WebChannelNATSClient {
   /**
    * §3.6.2: grace expired. Any draft still in the watch set (no draft-touching
    * frame arrived across the grace) is presumed stale — flip `working: false` IN
-   * PLACE (id and text untouched, so a WRONG guess self-heals: a later progress
-   * upsert re-matches the id and re-flips it working, re-engaging the hold). Then
+   * PLACE and PROMOTE its partial text to durable (id, text and slot untouched,
+   * so a WRONG guess self-heals: a later progress upsert re-matches the id and
+   * re-flips it working, in its original slot, re-engaging the hold). Then
    * re-evaluate the release gate.
    */
   private expireStaleDrafts(): void {
     this.staleDraftTimer = null;
     if (this.staleDraftWatch.size === 0) return;
     let changed = false;
-    // #251: an expired draft is presumed dead, so a lane that never received
-    // durable text is dropped here too. NOTE this one fires MID-TURN, not at turn
-    // end — a user-visible change beyond the aborted-turn case #251 enumerates,
-    // and the intended Telegram parity (an unfinalized preview does not linger).
-    // The self-healing property is unchanged: a wrong guess is repaired by the
-    // next `progress`, which re-claims the slot at the tail.
-    const messages = this.dropSpentDrafts(
-      this.state.messages.map((m) => {
-        if (this.staleDraftWatch.has(m.id) && m.working) {
-          changed = true;
-          return { ...m, working: false };
-        }
-        return m;
-      }),
-    );
+    // #251 DOES NOT APPLY HERE, and the difference is the whole point: this is
+    // the ONE draft-settling site that is not a turn-end signal. The reference
+    // deletes an unfinalized preview inside a `finally` around the whole dispatch
+    // — `[core] extensions/telegram/src/bot-message-dispatch.ts:2954-2975`, i.e.
+    // the turn genuinely ENDED, abort path included. This valve is a
+    // CONSUMER-SIDE GUESS fired MID-TURN: armed at session re-establish, tripped
+    // by 30s of quiet on a turn that may be perfectly healthy. Deleting content on
+    // a guess is the wrong side of N10, so the other three sites (terminal settle,
+    // `turn_settled`, explicit `/stop` — all real turn-end signals) drop, and this
+    // one PROMOTES: `draftOnly` is cleared, the partial the user was already
+    // reading becomes durable, and the bubble stays in its slot.
+    //
+    // Clearing the bit is required, not cosmetic — merely SKIPPING the drop here
+    // would commit `working:false && draftOnly:true`, which `mergeDurable`'s rule
+    // 4 would then drop on the next unrelated frame anyway.
+    //
+    // Honest consequence: a dropped connection whose turn never settles leaves the
+    // frozen partial bubble on screen. That is the pre-#251 status quo at this
+    // site, not a regression — we only delete when we KNOW the turn ended.
+    const messages = this.state.messages.map((m) => {
+      if (this.staleDraftWatch.has(m.id) && m.working) {
+        changed = true;
+        const promoted: ChatMessage = { ...m, working: false };
+        delete promoted.draftOnly;
+        return promoted;
+      }
+      return m;
+    });
     // #96: the same verdict applies to the turn-open signal — the grace expired
     // with no proof of life, so stop claiming a turn is running.
     //
@@ -1912,6 +1946,13 @@ export class WebChannelNATSClient {
     view: DurableView,
     local?: DurableLocalOverlay,
   ): ChatMessage[] {
+    // `base` is looked up in the PRE-`remove` `prev`, so an id appearing in BOTH
+    // `seal.remove` and `seal.answers` would inherit the removed bubble's
+    // client-local fields rather than starting clean. Unreachable by construction
+    // rather than by a guard here: `emitTurnSnapshot` builds `answers` from lane
+    // ids and `remove` from `supersededAnswerBubbleIds`, which are disjoint sets.
+    // Recorded rather than branched on — an unreachable branch with no test is
+    // worse than a stated invariant.
     const prevById = new Map(prev.map((m) => [m.id, m] as const));
     const out: ChatMessage[] = [];
     for (const entry of view) {
@@ -1920,6 +1961,7 @@ export class WebChannelNATSClient {
       const overlaySetsText = overlay !== undefined && "text" in overlay;
       const overlaySetsDraftOnly = overlay !== undefined && "draftOnly" in overlay;
       const draftOnly = overlaySetsDraftOnly ? overlay.draftOnly : base?.draftOnly;
+      const turnId = entry.turnId ?? base?.turnId;
       const next: ChatMessage = {
         ...base,
         id: entry.id,
@@ -1929,8 +1971,14 @@ export class WebChannelNATSClient {
         text: draftOnly === true && !overlaySetsText && base !== undefined
           ? base.text
           : entry.text,
-        turnId: entry.turnId ?? base?.turnId,
       };
+      // Assigned rather than written in the literal so an ABSENT turnId does not
+      // become an own `turnId: undefined` key. A history-hydrated bubble is
+      // created without one (the fresh-insert at …:2469-2474 emits
+      // `{id, role, text, ts, working}`), and adding the key would fail
+      // `sameChatMessage`'s key-count check on the very first durable event —
+      // silently re-creating a bubble the `.toBe` guarantee says must be reused.
+      if (turnId !== undefined) next.turnId = turnId;
       if (overlay !== undefined) {
         for (const [key, value] of Object.entries(overlay)) {
           if (value === undefined) delete (next as Record<string, unknown>)[key];
@@ -2657,16 +2705,37 @@ export class WebChannelNATSClient {
         // `placement` mirrors that (BOUNDARY 1 — it is the `bubble` site below
         // that treats `""` as id-less, and the two genuinely differ).
         const answerId = id ?? "";
+        // `draftOnly` is only ever CLAIMED, never ADDED to a bubble that already
+        // exists without it. The bit is what makes a bubble droppable at turn end
+        // (`isSpentDraft`), so adding it to a bubble that already holds authored
+        // durable text would let a single stray `progress` frame turn a delivered
+        // answer into a DELETED one:
+        //
+        //   agent_message A "FINAL ANSWER"  → [A "FINAL ANSWER"]
+        //   progress      A "Working…"      → [A "Working…", draftOnly]
+        //   turn_settled                    → []            ← answer destroyed
+        //
+        // Such a frame should never arrive (see the UNGUARDED INVARIANT note on
+        // `applyPlacement`), but "should never" is not a reason to make the
+        // failure unrecoverable. This project's own ordering says so:
+        // `message-adapter.ts:1760-1761` — a visible duplicate is recoverable
+        // where a deletion is not (M212g). So a plugin-guard regression stays a
+        // wrong-text bug, repairable by the turn's `turn_snapshot`, exactly as it
+        // was before the reducer rewiring.
+        //
+        // A bubble that is ALREADY `draftOnly` keeps the bit (idempotent
+        // re-claim), and an absent one claims it — that is the normal path, and
+        // it is what keeps the rolling draft out of the durable projection
+        // (§15.9) while it still renders.
+        const heldBubble = this.state.messages.find((m) => m.id === answerId);
+        const claimsDraft = heldBubble === undefined || heldBubble.draftOnly === true;
         this.applyDurable(
           {
             kind: "placement",
             answerId,
             ...(msg.turnId === undefined ? {} : { turnId: msg.turnId }),
           },
-          // The rolling draft is the client's overlay, never durable (§15.9):
-          // `draftOnly` is what keeps it out of the durable projection while it
-          // still renders, and what makes the bubble droppable at turn end.
-          { [answerId]: { working: true, text, draftOnly: true } },
+          { [answerId]: { working: true, text, ...(claimsDraft ? { draftOnly: true } : {}) } },
         );
         this.setState({ isTyping: false });
         // P1-9 §3.6.2: a progress upsert on a watched draft proves the turn is

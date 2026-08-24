@@ -1471,6 +1471,37 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
       text: "Working… after claim",
       working: true,
     });
+    // …and the cost STOPS at wrong text. #251 made an unfinalized lane droppable
+    // at turn end, so a late progress that re-marked this bubble `draftOnly`
+    // would escalate the mutation above into DELETION of a delivered answer:
+    //
+    //   agent_message P "A authorized block" → progress P "Working…" → turn_settled → []
+    //
+    // The `progress` mapper therefore only ever CLAIMS `draftOnly`, never ADDS it
+    // to a bubble that already exists without it. Delivering the settle here is
+    // what makes that a regression net rather than a comment — the pre-existing
+    // version of this test stopped before `turn_settled` and could not see it.
+    deliver(lateScaffoldMutation, { type: "turn_settled", turnId: "T", outcome: "ok" });
+    expect(lateScaffoldMutation.getState().messages).toHaveLength(1);
+    expect(lateScaffoldMutation.getState().messages[0]).toMatchObject({
+      id: "webchannel-preview",
+      working: false,
+    });
+    expect(lateScaffoldMutation.getState().messages[0].draftOnly).toBeUndefined();
+
+    // And the bubble surviving is what leaves the damage REPAIRABLE: the turn's
+    // authoritative snapshot restores the authored text a deleted bubble could
+    // not have received (M212g — a visible duplicate/wrong text is recoverable
+    // where a deletion is not, `packages/plugin/src/message-adapter.ts:1760-1761`).
+    deliver(lateScaffoldMutation, {
+      type: "turn_snapshot",
+      turnId: "T",
+      answers: [{ id: "webchannel-preview", text: "A authorized block" }],
+      remove: [],
+    });
+    expect(lateScaffoldMutation.getState().messages.map((m) => m.text)).toEqual([
+      "A authorized block",
+    ]);
   });
 
   // --- #212: turn_snapshot pure-view reconciliation. ----------------------
@@ -1557,6 +1588,39 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
     expect(after.find((m) => m.id === "durable-1")).toBe(durableBefore);
     //  - the reasoning surface (never in state.messages).
     expect(w.getState().reasoning.map((r) => r.id)).toContain("r1");
+  });
+
+  it("S1b: a HISTORY-hydrated bubble (no turnId) is preserved by reference too", () => {
+    // The `.toBe` cases in S1 all carry a `turnId`, so they cannot see the
+    // key-SHAPE half of the guarantee. A history fresh-insert emits
+    // `{id, role, text, ts, working}` with NO `turnId` key at all, and
+    // `mergeDurable` writing `turnId: entry.turnId ?? base?.turnId` into the
+    // literal would give it an own `turnId: undefined` — a different key set,
+    // failing the identity check and silently re-creating the bubble on the very
+    // first durable frame of the next turn. Every hydrated row in the transcript
+    // would churn on every frame.
+    const w = makeWrapper();
+    deliver(w, {
+      type: "history",
+      messages: [
+        { id: "core-u1", role: "user", text: "hello", ts: 1 },
+        { id: "core-a1", role: "agent", text: "an older answer", ts: 2 },
+      ],
+    });
+    const hydrated = w.getState().messages;
+    expect(hydrated.map((m) => m.id)).toEqual(["core-u1", "core-a1"]);
+    // Non-vacuity: the premise is that these carry no `turnId` KEY.
+    for (const m of hydrated) expect(Object.hasOwn(m, "turnId")).toBe(false);
+
+    // A durable frame for a NEW turn re-projects and merges every bubble.
+    deliver(w, { type: "agent_message", id: "laneA", turnId: "T2", text: "new answer" });
+
+    const after = w.getState().messages;
+    expect(after.map((m) => m.id)).toEqual(["core-u1", "core-a1", "laneA"]);
+    expect(after[0]).toBe(hydrated[0]);
+    expect(after[1]).toBe(hydrated[1]);
+    // …and the key set is still what history produced — no `turnId` was added.
+    for (const m of after.slice(0, 2)) expect(Object.hasOwn(m, "turnId")).toBe(false);
   });
 
   it("S2: a snapshot for a foreign/absent turn with no matching ids is a no-op on the answer region", () => {
@@ -2893,7 +2957,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
 
   // 14. staleness valve (fake timers).
   describe("14: post-reconnect staleness valve", () => {
-    it("expires a wedged working draft after the grace and releases held", () => {
+    it("expires a wedged working draft after the grace, in place, and releases held", () => {
       vi.useFakeTimers();
       const w = makeWrapper();
       goOnline(w);
@@ -2903,11 +2967,18 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       fireSession(w);
 
       vi.advanceTimersByTime(30_000);
-      // #251: the draft never received durable text, so expiry DROPS it rather
-      // than freezing it at "partial…" (this used to assert flipped-in-place with
-      // id and text untouched). What this test is actually about is the release
-      // below: expiry must clear turnInFlight() so the held send goes out.
-      expect(messages(w).some((m) => m.id === "webchannel-d")).toBe(false);
+      const draft = messages(w).find((m) => m.id === "webchannel-d")!;
+      expect(draft.working).toBe(false); // flipped in place
+      expect(draft.id).toBe("webchannel-d"); // id untouched
+      expect(draft.text).toBe("partial…"); // text untouched
+      // #251 does NOT drop here, and that is deliberate: this valve is a
+      // consumer-side GUESS fired mid-turn, not a turn-end signal, so it PROMOTES
+      // the partial to durable instead of deleting content on a guess (N10). The
+      // three real turn-end sites — terminal settle, `turn_settled`, explicit
+      // `/stop` — do drop. Clearing the bit is what makes the bubble survive:
+      // leaving `working:false && draftOnly:true` committed would let
+      // `mergeDurable`'s rule 4 drop it on the next unrelated frame.
+      expect(draft.draftOnly).toBeUndefined();
       expect(pendingBubbles(w)).toHaveLength(0); // released
     });
 
@@ -2933,13 +3004,19 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
       fireSession(w);
       vi.advanceTimersByTime(30_000);
-      // #251: an unfinalized lane is dropped by expiry, not frozen.
-      expect(messages(w).some((m) => m.id === "webchannel-d")).toBe(false);
+      expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(false);
 
       deliver(w, { type: "progress", id: "webchannel-d", text: "back alive…", turnId: "T" });
       const drafts = messages(w).filter((m) => m.id === "webchannel-d");
-      expect(drafts).toHaveLength(1); // no duplicate — the id is REUSED
+      expect(drafts).toHaveLength(1); // no duplicate
       expect(drafts[0].working).toBe(true); // re-engaged
+      // The valve PROMOTES rather than drops (see the test above), so the bubble
+      // never left and the self-heal keeps its ORIGINAL SLOT — unlike the three
+      // turn-end sites, where a dropped lane re-materialises at the tail.
+      expect(messages(w)[0].id).toBe("webchannel-d");
+      // …and the re-claim does not re-mark an already-promoted bubble as a draft,
+      // which would make it droppable at the eventual turn end.
+      expect(drafts[0].draftOnly).toBeUndefined();
     });
 
     it("a mid-grace flap clears the timer and re-arms fresh on the next onSession (disconnected time never counts)", () => {
@@ -2960,15 +3037,13 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       vi.advanceTimersByTime(29_000);
       expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(true); // not yet
       vi.advanceTimersByTime(1_000);
-      // Expired — and #251 drops the unfinalized lane rather than freezing it, so
-      // "expired" now reads as the bubble being gone.
-      expect(messages(w).some((m) => m.id === "webchannel-d")).toBe(false); // now
+      expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(false); // now
     });
 
     // #94: after the per-message lane rotation a single turn leaves N working
     // drafts under N different ids, so the valve has to arm and expire them
     // individually rather than "the draft" of the turn.
-    it("#94: expires EVERY wedged lane of a multi-bubble turn (#251: each is dropped)", () => {
+    it("#94: expires EVERY wedged lane of a multi-bubble turn, each in place", () => {
       vi.useFakeTimers();
       const w = makeWrapper();
       goOnline(w);
@@ -2980,19 +3055,30 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       fireSession(w); // arm: the watch set takes ALL THREE ids
 
       vi.advanceTimersByTime(30_000);
+      const byId = (id: string) => messages(w).find((m) => m.id === id)!;
       // Arming iterates every `working` message, so one wedged turn arms N
       // entries and the single grace timer expires all of them together. Leaving
       // any one lane `working` would keep turnInFlight() true and the composer
       // wedged — the exact lockout this valve exists to prevent.
-      //
-      // #251: none of the three ever received durable text, so all three are
-      // DROPPED rather than frozen at their partials (this used to assert
-      // flipped-in-place with ids and texts untouched). The lockout property is
-      // unchanged and is what the release below still proves.
-      for (const id of ["webchannel-a", "webchannel-b", "webchannel-c"] as const) {
-        expect(messages(w).some((m) => m.id === id)).toBe(false);
+      for (const [id, text] of [
+        ["webchannel-a", "A partial…"],
+        ["webchannel-b", "B partial…"],
+        ["webchannel-c", "C partial…"],
+      ] as const) {
+        expect(byId(id).working).toBe(false); // flipped
+        expect(byId(id).id).toBe(id); // id untouched
+        expect(byId(id).text).toBe(text); // text untouched
+        // #251: this valve PROMOTES rather than drops — it is a mid-turn guess,
+        // not a turn-end signal. Every lane keeps its bubble AND its slot.
+        expect(byId(id).draftOnly).toBeUndefined();
       }
-      expect(messages(w).some((m) => m.working)).toBe(false); // nothing left wedged
+      // All three keep their slots, ahead of the user bubble the valve released.
+      expect(messages(w).map((m) => m.id)).toEqual([
+        "webchannel-a",
+        "webchannel-b",
+        "webchannel-c",
+        "u-0",
+      ]);
       expect(pendingBubbles(w)).toHaveLength(0); // released
     });
 
@@ -3034,18 +3120,23 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
 
         vi.advanceTimersByTime(30_000);
         const byId = (id: string) => messages(w).find((m) => m.id === id)!;
-        // #251: A and C never received durable text, so expiring them DROPS them
-        // (this used to assert working:false with "A partial…"/"C partial…"
-        // intact). The property under test is untouched — expiry reached exactly
-        // the two lanes that were not disarmed.
-        expect(messages(w).some((m) => m.id === "webchannel-a")).toBe(false); // expired
-        expect(messages(w).some((m) => m.id === "webchannel-c")).toBe(false); // expired
-        // B was disarmed inside the grace and survives either way: the
-        // `agent_message` variant gave it durable text, and the `progress`
-        // variant left it still live (`working: true`), which is not a spent
-        // draft.
+        expect(byId("webchannel-a").working).toBe(false); // expired
+        expect(byId("webchannel-c").working).toBe(false); // expired
         expect(byId("webchannel-b").working).toBe(expectedBWorking);
         expect(byId("webchannel-b").text).toBe(expectedBText);
+        // Expiry flips only working state; sibling ids/text remain intact.
+        expect(byId("webchannel-a").text).toBe("A partial…");
+        expect(byId("webchannel-c").text).toBe("C partial…");
+        // #251: expiry PROMOTES the expired partials to durable rather than
+        // dropping them (mid-turn guess, not a turn-end signal), so all three
+        // bubbles and their order survive.
+        expect(byId("webchannel-a").draftOnly).toBeUndefined();
+        expect(byId("webchannel-c").draftOnly).toBeUndefined();
+        expect(messages(w).map((m) => m.id)).toEqual([
+          "webchannel-a",
+          "webchannel-b",
+          "webchannel-c",
+        ]);
       },
     );
   });

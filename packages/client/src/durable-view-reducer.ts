@@ -14,7 +14,7 @@
  * NO runtime consumer, proven equivalent to the then-current client behavior
  * first; the client render was rewired onto it in the slice after #238, and is
  * now its FIRST runtime consumer — `nats-client-wrapper.ts`'s `applyDurable`
- * (…:1963) projects `state.messages`, applies one event here, and merges the
+ * (…:2011) projects `state.messages`, applies one event here, and merges the
  * result back. Each of the four transitions has its own EQUIVALENCE ANCHOR in
  * `durable-view-reducer.test.ts`, which drives the REAL `WebChannelNATSClient`
  * with the REAL wire frames and compares against this reducer's output.
@@ -95,7 +95,7 @@
  * newer build wrote — which first needs #239 (the journal) and #241 (a grown
  * event set). Both obvious fixes are wrong, in the spirit of §0.2:
  *   - `default: return view;`, mirroring `handleFrame`'s ignore-unknown
- *     (nats-client-wrapper.ts:2245 — which has no `default:` either; it returns
+ *     (nats-client-wrapper.ts:2293 — which has no `default:` either; it returns
  *     `void`, so falling off the end IS its ignore) — REJECTED. That
  *     faithfulness is about LIVE WIRE FRAMES, where ignoring a frame from a
  *     newer server is right. A JOURNAL REPLAY is the opposite: the store is the
@@ -122,7 +122,7 @@
  *
  * The `seal` transition WAS a line-for-line port of the wrapper's private
  * `applyTurnSnapshot`; that body has since been deleted and the wrapper's method
- * (nats-client-wrapper.ts:1539-1567) is now only the frame→event mapper that
+ * (nats-client-wrapper.ts:1546-1573) is now only the frame→event mapper that
  * calls it. There is one implementation of the reconciliation, and it is here.
  */
 
@@ -136,7 +136,7 @@ export type DurableRole = "user" | "agent";
  * in the input, and some transitions return the input array itself (see the
  * array-identity table in the file header; it is a partial, not a general,
  * property). The client consumer computes `merge(view, overlay)`
- * (`nats-client-wrapper.ts`'s `mergeDurable`, …:1910), and an in-place overlay
+ * (`nats-client-wrapper.ts`'s `mergeDurable`, …:1944), and an in-place overlay
  * write on a shared entry would retroactively mutate a view some other holder
  * already observed. The type makes that a compile error instead of a heisenbug.
  * It does NOT forbid the consumer handing an UNCHANGED bubble back by reference
@@ -156,16 +156,16 @@ export type DurableView = readonly DurableMessage[];
  * The ordered event stream the plugin would journal. Each event corresponds to a
  * real wire frame the client consumes today — the shapes below were read off
  * `packages/plugin/src/channel-contract.ts` (`OutboundWsMessage`) and the
- * wrapper's `handleFrame` cases (…:2245 — `handleMessage` at …:2232 is the
+ * wrapper's `handleFrame` cases (…:2293 — `handleMessage` at …:2280 is the
  * outer entry point, which brackets that switch with the live-turn latch
  * observation and the release gate), and every transition is anchored against the
  * REAL client in `durable-view-reducer.test.ts`. What that covers is the four
  * kinds below; see the two BOUNDARY notes after the type for what it does not.
  *
  *  - `user`      — the local user echo installed by `publish()`
- *                  (nats-client-wrapper.ts:844). Durable subset of the u- bubble.
+ *                  (nats-client-wrapper.ts:847). Durable subset of the u- bubble.
  *  - `placement` — a `progress` frame for a lane (case "progress",
- *                  nats-client-wrapper.ts:2653). The FIRST one CLAIMS the lane's
+ *                  nats-client-wrapper.ts:2701). The FIRST one CLAIMS the lane's
  *                  slot (append at tail). The frame ALWAYS carries text —
  *                  `progress.text` is REQUIRED on the wire
  *                  (channel-contract.ts:66) and the live client renders it —
@@ -174,7 +174,7 @@ export type DurableView = readonly DurableMessage[];
  *                  it and the durable text is authored later by a `bubble` or
  *                  `seal`. The consumer keeps the two apart with the client-local
  *                  `ChatMessage.draftOnly` flag: the draft renders out of `text`,
- *                  while the wrapper's `durableProjection` (…:1836) contributes
+ *                  while the wrapper's `durableProjection` (…:1870) contributes
  *                  `""` for that bubble. §15.9 is thus enforced at the projection,
  *                  not merely asserted here.
  *                  `turnId` is OPTIONAL because the wire says so
@@ -183,11 +183,11 @@ export type DurableView = readonly DurableMessage[];
  *                  force a consumer to drop such a frame — losing the slot claim,
  *                  i.e. the [A,B]-vs-[B,A] ordering — or to invent a value.
  *  - `bubble`    — a durable agent frame: `agent_message`/final/independent
- *                  (case "agent_message", nats-client-wrapper.ts:2758).
+ *                  (case "agent_message", nats-client-wrapper.ts:2827).
  *                  Upsert-by-id: update text in place if the id is held, else
  *                  append at tail.
  *  - `seal`      — the `turn_snapshot` frame (case "turn_snapshot",
- *                  nats-client-wrapper.ts:2753 → `applyTurnSnapshot`). Carries
+ *                  nats-client-wrapper.ts:2822 → `applyTurnSnapshot`). Carries
  *                  BOTH `answers` and `remove` in one frame, exactly like the
  *                  wire (there is no standalone `remove` wire frame — remove
  *                  exists ONLY inside turn_snapshot, so it is modeled as a `seal`
@@ -213,7 +213,7 @@ export type DurableView = readonly DurableMessage[];
  * id-less frame has none, by design).
  *
  * The client's id-less branch therefore survives only as a LEGACY-PLUGIN path
- * (nats-client-wrapper.ts:2765 `if (id) {…}`, else …:2800 mints
+ * (nats-client-wrapper.ts:2834 `if (id) {…}`, else …:2869 mints
  * `id: \`a-${this.uid()}\`` from a CLIENT-LOCAL counter, behind a one-shot
  * `console.warn`). It is routed through this reducer as a `bubble`, and that is
  * ADMISSIBLE for one reason only: the minted id never leaves the client. What
@@ -236,11 +236,11 @@ export type DurableView = readonly DurableMessage[];
  * ⚠️ AND `""` IS STILL THE WRONG ANSWER. `bubble.answerId` must be NON-EMPTY;
  * `""` is NOT the encoding for "id-less". The trap is that the client's two id
  * sites use DIFFERENT falsiness, so the natural mapper is the broken one:
- *   - `progress` keys on `id ?? ""` (nats-client-wrapper.ts:2659) — NULLISH, so
+ *   - `progress` keys on `id ?? ""` (nats-client-wrapper.ts:2707) — NULLISH, so
  *     `""` SURVIVES as a real id. `placement` with `answerId: ""` is therefore
  *     FAITHFUL;
- *   - `agent_message` branches on `if (id)` (…:2765) — TRUTHY, so `""` falls
- *     into the mint branch at …:2800 and gets its own fresh `a-<n>`.
+ *   - `agent_message` branches on `if (id)` (…:2834) — TRUTHY, so `""` falls
+ *     into the mint branch at …:2869 and gets its own fresh `a-<n>`.
  * The two sites genuinely differ, and the live mapper preserves the difference
  * verbatim. A mapper writing `answerId: frame.id ?? ""` for the DURABLE frame —
  * the natural thing to write, because it mirrors the progress site — would make
@@ -266,7 +266,7 @@ export type DurableView = readonly DurableMessage[];
  * THROUGH this function (so the test file's "the REAL client throws on the same
  * input" case no longer proves independence — see the anchor caveat in the
  * header). The only difference is reachability — live, `u-${this.uid()}`
- * (nats-client-wrapper.ts:844, and `uid()` is `${this.seq++}` at …:2004-2006) is
+ * (nats-client-wrapper.ts:847, and `uid()` is `${this.seq++}` at …:2052-2054) is
  * monotonic so the precondition cannot be violated; a journal REPLAY can violate
  * it. Do not "fix" it by making
  * `applyUser` an upsert or by de-duplicating inside `applySeal`: inventing a
@@ -295,7 +295,7 @@ export type DurableView = readonly DurableMessage[];
  *
  * `channel-contract.ts:102` declares `{ type: "history"; messages: … }`, and it
  * genuinely writes `state.messages` today — adoption plus ordered cursor
- * insertion, nats-client-wrapper.ts:2247-2444. It is nonetheless absent from
+ * insertion, nats-client-wrapper.ts:2295-2492. It is nonetheless absent from
  * `DurableEvent`, and that absence is a DECISION, not an oversight: doc §15.9
  * places history outside the reducer ("reducer 밖(의도적) … workstream C")
  * because the current frame is reconnect / late-join RECONSTRUCTION — the client
@@ -383,7 +383,7 @@ function applyUser(
 
 /**
  * `progress` frame — upsert by id (the shape the wrapper's now-deleted
- * `upsertMessage` had; the mapper is `case "progress"`, …:2653):
+ * `upsertMessage` had; the mapper is `case "progress"`, …:2701):
  *
  *  - an ABSENT id APPENDS a placeholder bubble at the tail — the slot claim, and
  *    the ORDERING mechanism: the lane's position is fixed by WHEN its first
@@ -406,12 +406,24 @@ function applyUser(
  *     finalizing (message-adapter.ts:1643), so a late preview progress is
  *     dropped by the `scaffoldWriter !== "active"` check at …:1309-1313.
  *
- * If the plugin ever violates it, the live client and this reducer DIVERGE, and
- * not subtly: the consumer re-marks the bubble `draftOnly` and renders the draft
- * text, so `agent_message A "FINAL ANSWER"` followed by `progress A "Working…"`
- * leaves the live view showing "Working…" while the durable projection falls back
- * to `""` — history ≠ live (N8). Do not silently "harmonize" that if you meet it;
- * it means a plugin guard regressed, and the guard is the thing to fix.
+ * If the plugin ever violates it, the live client and a journal replay DIVERGE:
+ * `agent_message A "FINAL ANSWER"` followed by `progress A "Working…"` leaves the
+ * live view showing "Working…" — the consumer applies the draft text
+ * unconditionally — while a replay of `[bubble A "FINAL ANSWER", placement A]`
+ * still holds "FINAL ANSWER", because `placement` carries no text and finds the
+ * id already present. History ≠ live (N8), in the WRONG-TEXT direction.
+ *
+ * ⚠️ IT STOPS THERE, AND THAT CAP IS DELIBERATE. The consumer refuses to ADD
+ * `draftOnly` to a bubble that already exists without it (nats-client-wrapper.ts's
+ * `case "progress"`, …:2701), so the mis-marked bubble is NOT droppable and
+ * survives the turn end for a later `turn_snapshot` to repair. Without that guard
+ * the same stray frame would delete a delivered answer outright — escalating a
+ * display bug into content loss, against this project's own ordering that a
+ * visible duplicate is recoverable where a deletion is not (M212g,
+ * `message-adapter.ts:1760-1761`).
+ *
+ * Do not silently "harmonize" the wrong text if you meet it; it means a plugin
+ * guard regressed, and the guard is the thing to fix.
  *
  * ⚠️ THE FORWARD CASE NEEDS NO REGRESSION AT ALL, so do not read the two guards
  * above as covering it. A lane that receives `progress` and then NEVER a durable
@@ -427,7 +439,7 @@ function applyUser(
  * via `draft-stream.ts:653-668` → `:634 api.deleteMessage`). So the reducer's
  * `""` is RIGHT and it was the LIVE side that was wrong: keeping the partial
  * draft forever was the bug, and the consumer's `draftOnly` drop
- * (nats-client-wrapper.ts's `isSpentDraft`, …:1865) fixes it. Both sides then
+ * (nats-client-wrapper.ts's `isSpentDraft`, …:1899) fixes it. Both sides then
  * agree on "no bubble" and live==history holds.
  *
  * Still do not resolve it here by teaching the reducer to keep draft text — that
@@ -483,7 +495,7 @@ function applyBubble(
 
 /**
  * `turn_snapshot` reconciliation — the ONE implementation. The wrapper's
- * `applyTurnSnapshot` (nats-client-wrapper.ts:1539-1567) is now only the
+ * `applyTurnSnapshot` (nats-client-wrapper.ts:1546-1573) is now only the
  * frame→event mapper that feeds this. The contract is EXPLICIT (never a blanket
  * drop):
  *  - `remove` ids are dropped;
