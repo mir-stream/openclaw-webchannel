@@ -360,15 +360,22 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
   it("M173e (#238): K>=2 mid-lane materialization failure — the cursor keeps step, every final lands on its OWN lane", async () => {
     // Topology A,B,C (all text) + a tool-only LAST message; B's frames drop on a
     // transient wire failure so B never materializes. Core emits finals [tA,tB,tC]
-    // as an ORDERED array (`[core] dispatch-from-config.ts:3886,3941`).
+    // as an ORDERED array (`[core] dispatch-from-config.ts:3886`, loop at `:3910`).
+    //
+    // This is the EXACT-CORRELATION case: three finals, three streamed lanes. So
+    // the candidate list widens to `streamedAnswerLanes()` and the forward-only
+    // cursor keeps step with core's array, each final settling the lane that
+    // actually streamed its prefix.
     //
     // This fixture used to pin the OPPOSITE: with `materializedAnswerLanes()` as
     // the candidate list, B fell out ([A,C]) and every later index skewed — tB
     // landed on C (corrupting a lane that had produced its own text) and tC
     // overflowed to a stray bubble. That was never a core limitation; it was
-    // order we discarded ourselves (plan §16.5.3). The candidate list is now
-    // `streamedAnswerLanes()`, so the forward-only cursor keeps step with core's
-    // array and each final settles the lane that actually streamed its prefix.
+    // order we discarded ourselves (plan §16.5.3).
+    //
+    // Contrast M238d, where the counts do NOT agree: there the widening is
+    // withheld, precisely because a mis-routed final landing on a streamed lane
+    // gets overwritten by the snapshot.
     //
     // B's bubble is BORN HERE, at drain: its earlier frames all failed, so it
     // owned no wire id and the final is its first successful send. That is why it
@@ -675,10 +682,15 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     // a skip). C is NOT in `answers` precisely BECAUSE it never streamed, so tC is
     // UNIQUE content and naming it in `remove` would make the client DELETE it.
     //
-    // Under cursor semantics that is not a guard we have to remember to apply: an
-    // overflow final is BY CONSTRUCTION one whose content never streamed, so it can
-    // never be in `answers`, so `remove` has nothing to say about it. The overflow
-    // site passes no `supersedesAnswerLane` at all (#238).
+    // Since #238 the overflow site passes no `supersedesAnswerLane` at all, and the
+    // reason is CARDINALITY: the flag's value was `streamedLanes.length ===
+    // finals.length`, which cannot hold when a final overflows. It is NOT that an
+    // overflow final's content never streamed — measured false, and the shape that
+    // shows it is one boundary away from this one: move C's silence to the MIDDLE
+    // (msg2 streams nothing, msg3 streams "C"), and it is tC — msg3's own final,
+    // from a message that did stream — that overflows, duplicating a lane that IS
+    // in `answers`. The flush cannot tell the two apart, so it preserves both: a
+    // visible duplicate is recoverable, a deletion is not.
     //
     // The count shortfall (2 candidates, 3 finals) also leaves A and B
     // non-authoritative — with an unstreamed message in the turn, order-correlation
@@ -720,6 +732,63 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     // is not in `answers`, so the client must preserve it.
     expect(snap.remove).toEqual([]);
     expect(snap.remove).not.toContain(tcFrame.id);
+  });
+
+  it("M238d: under a count shortfall the flush must NOT route onto a streamed lane — the snapshot would overwrite the final (data-loss guard)", async () => {
+    // The regression that #238's first cut introduced, pinned so it cannot return.
+    //
+    // Shape: msg1 streams "A" and materializes; msg2 is TEXT-BEARING but streams
+    // ZERO partials, so its answer exists only in its final tB; msg3 streams
+    // "Cstream" but every one of its frames fails; msg4 is tool-only. Core emits
+    // [tA,tB,tC], so finals=3 while streamed lanes = [msg1, msg3] = 2 — a shortfall.
+    //
+    // Widening the candidate list to the STREAMED lanes unconditionally routes tB
+    // onto msg3's lane. That is not merely a mis-render: every lane in the streamed
+    // set is one `emitTurnSnapshot` REPUBLISHES, and under a shortfall the landing
+    // is non-authoritative, so the snapshot overwrites that bubble with msg3's
+    // `streamedAnswerText` ("Cstream"). tB — msg2's only copy of its answer —
+    // is destroyed. The narrower list leaves tB as its own bubble, which the
+    // snapshot never touches.
+    //
+    // The gate that prevents this is `exactCorrelation`; the assertion below is on
+    // the OUTCOME (does tB's bubble survive the snapshot), not on the mechanism.
+    //
+    // This one shape stands in for a contract measured much more broadly during
+    // review: over all 64 stream/ship topologies of a 3-message + tool-only turn,
+    // every case where `exactCorrelation` is FALSE produced frames, `answers` and
+    // `remove` byte-identical to the pre-#238 commit, and every case that differed
+    // had it TRUE. A shortfall is not a place where we do something cleverer — it
+    // is a place where we do exactly what we did before.
+    const h = makeDraftHarness({ decide: (attempt) => attempt.text !== "Cstream" });
+    h.draft.handleAssistantMessageBoundary(); // first boundary: no-op
+    h.draft.pushAnswerText({ text: "A" }); // msg1 streams + materializes
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // → msg2's lane — streams NOTHING
+    h.draft.handleAssistantMessageBoundary(); // → msg3's lane
+    h.draft.pushAnswerText({ text: "Cstream" }); // every frame fails
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // → tool-only last
+
+    await h.draft.finalize("tA");
+    await h.draft.finalize("tB"); // msg2's ONLY delivery of its content
+    await h.draft.finalize("tC");
+    await h.draft.drain();
+
+    // tB reached the wire on some bubble.
+    const tbFrame = h.frames.find((frame) => frame.text === "tB");
+    expect(tbFrame).toBeDefined();
+
+    expect(h.snapshots).toHaveLength(1);
+    const snap = h.snapshots[0];
+    // THE GUARD: tB's bubble is not one the snapshot republishes, so its text
+    // survives the turn. Under the unconditional widening this id IS in `answers`
+    // and the client is told to render "Cstream" in its place.
+    expect(snap.answers.map((a) => a.id)).not.toContain(tbFrame!.id);
+    expect(snap.remove).not.toContain(tbFrame!.id);
+    // The two streamed lanes are published with their streamed text (the shortfall
+    // makes every landing non-authoritative), and nothing is deleted.
+    expect(snap.answers.map((a) => a.text)).toEqual(["A", "Cstream"]);
+    expect(snap.remove).toEqual([]);
   });
 
   // #172 — a block carries no content the partials did not already stream (core
