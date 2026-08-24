@@ -34,17 +34,17 @@ import { describe, it, expect } from "vitest";
  * generation comparison written INSIDE that seam, wherever its operands came
  * from — the seam being where a mapping has to land to affect attachment at all.
  *
- * Between them those two shapes cover the re-basings anyone actually writes,
- * including the one that motivated this file. They are text patterns, though,
- * not a proof: a reintroduction that avoids BOTH shapes — the comparison placed
- * outside the seam AND the ordinal reaching it under some other name — passes
- * this file exactly as it passes the fixtures.
+ * Those are TEXT PATTERNS, and the claim this file makes about its own reach is
+ * purely negative: a spelling that matches neither pattern passes, exactly as it
+ * passes the fixtures.
  *
- * Deliberately not enumerating which spellings land on which side of that line.
- * Three review rounds each found the enumeration wrong in a new way, because it
- * is a property of two regexes against an open set of spellings and cannot be
- * stated once and stay true. The line above is what is stable, and it is the
- * only claim this file makes about its own reach.
+ * Deliberately saying nothing about WHICH spellings fall outside them. Four
+ * review rounds tried to characterise that complement and all four were false by
+ * the next round — a different escaping spelling each time, none of them exotic.
+ * That is not four mistakes but one: the complement of two regexes over an open
+ * set of spellings cannot be written down and stay true. So it is not written
+ * down here, and a future round that finds yet another escaping spelling has
+ * confirmed this paragraph rather than contradicted it.
  *
  * So read what follows as a TRIPWIRE on the tempting spellings, not as a proof
  * that no ordinal→lane mapping exists. That is still worth having, because the
@@ -59,7 +59,9 @@ import { describe, it, expect } from "vitest";
  * record that settled (`outstandingRecordsAtIndex`, `retireOneRecordAtIndex`),
  * and `lane.assistantMessageIndex` is still the sound per-message stamp #172's
  * block suppression reads. Those are lifecycle and rendering. What is banned is
- * an ordinal choosing a LANE.
+ * an ordinal choosing the lane a record ATTACHES TO for ordering — not every
+ * association between an ordinal and a lane, which is what the sound per-message
+ * stamp one sentence up already is.
  *
  * If one of these assertions fails, do not relax it to match new code. Either
  * the change is a regression, or the rule itself is being revisited — and that
@@ -125,7 +127,8 @@ describe("message-adapter — barrier attachment never keys off an ordinal (#238
     // ONE attachment path. A second branch keyed on the ordinal's presence is
     // exactly what was removed; a `state.lanes[...]` lookup is the same move
     // written as an index.
-    expect(queuedBlock).not.toMatch(/state\.lanes\s*\[/);
+    // `.at(` alongside `[` — the same move, one character apart.
+    expect(queuedBlock).not.toMatch(/state\.lanes\s*(\[|\.at\()/);
     expect(queuedBlock).not.toMatch(
       /assistantMessageIndex !== undefined[\s\S]{0,400}?state\.lanes/,
     );
