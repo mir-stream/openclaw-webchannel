@@ -436,16 +436,87 @@ describe("nats-account-runtime.ts wiring contract — #238 identity at the deliv
   const GATE_END = RUNTIME_SOURCE.indexOf("return;", GATE_START);
   const NOTICE_BLOCK =
     GATE_START < 0 || GATE_END < 0 ? "" : RUNTIME_SOURCE.slice(GATE_START, GATE_END);
-  // `[^;]` bounds the match to a SINGLE statement, so a later `nextMessageId()`
-  // can never be borrowed across the end of the notice send.
-  const MINTS_THIRD_ARG = /channel\.sendText\(\s*peerId,[^;]*?nextMessageId\(\)\s*,?\s*\)/;
+  /**
+   * Parse the argument list of the FIRST `channel.sendText(` call in `src`,
+   * returning the top-level arguments trimmed — or `null` if the call is
+   * absent, unterminated, or unbalanced (callers must FAIL on `null`; a
+   * parse failure is never a pass).
+   *
+   * Why PARSED and not matched by regex: POSITION is the whole point.
+   * `NatsChannel.sendText(peerId, text, id?, turnId?, assistantMessageIndex?)`
+   * turns argument 3 — and only argument 3 — into `payload.id` on the wire. A
+   * regex that merely proves `nextMessageId()` appears somewhere in the list
+   * goes green on the exact regression this test is named for:
+   * `channel.sendText(peerId, text, undefined, nextMessageId())` ships the
+   * notice id-less (the mint wasted in the `turnId` slot) and the client falls
+   * back to viewer-minted `a-N` (NOT-list N4/N5).
+   *
+   * Why not pinned as an exact literal either: see the reformat lesson above.
+   * Parsing is line-break- and indentation-blind, so hoisting the text into a
+   * `const` or collapsing the call onto one line stays green.
+   *
+   * String literals are neutralised to `""` BEFORE splitting so that a comma,
+   * paren, or quote inside the notice text can never be mistaken for an
+   * argument separator. The current text has none; a future one may.
+   * Commas are split at depth 1 only, so `nextMessageId()`'s own parens — or
+   * any nested call/array/object — cannot split an argument in half.
+   */
+  function sendTextArgs(src: string): string[] | null {
+    const CALL = "channel.sendText(";
+    const at = src.indexOf(CALL);
+    if (at < 0) return null;
+    const args: string[] = [];
+    let current = "";
+    let depth = 1;
+    let i = at + CALL.length;
+    while (i < src.length) {
+      const ch = src[i];
+      if (ch === '"' || ch === "'" || ch === "`") {
+        // Skip the whole literal (honouring backslash escapes) and stand a
+        // neutral `""` in its place.
+        i += 1;
+        while (i < src.length && src[i] !== ch) i += src[i] === "\\" ? 2 : 1;
+        if (i >= src.length) return null; // unterminated literal → fail closed
+        i += 1;
+        current += '""';
+        continue;
+      }
+      if (ch === "(" || ch === "[" || ch === "{") depth += 1;
+      else if (ch === ")" || ch === "]" || ch === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          args.push(current.trim());
+          // A trailing comma (the prettier multi-line form has one) leaves a
+          // final empty slot; it is punctuation, not an argument.
+          if (args.length > 1 && args[args.length - 1] === "") args.pop();
+          return args;
+        }
+      }
+      if (ch === "," && depth === 1) {
+        args.push(current.trim());
+        current = "";
+        i += 1;
+        continue;
+      }
+      current += ch;
+      i += 1;
+    }
+    return null; // unbalanced → fail closed
+  }
 
   it("mints the notice's id at the delivery act", () => {
     // Guard first: a missing gate makes the slice empty, which would let the
     // assertions below pass vacuously.
     expect(GATE_START).toBeGreaterThan(-1);
     expect(NOTICE_BLOCK).toContain("commands to an operator allowlist.");
-    expect(NOTICE_BLOCK).toMatch(MINTS_THIRD_ARG);
+    const args = sendTextArgs(NOTICE_BLOCK);
+    // Parse failure is a FAILURE, never a silent pass.
+    expect(args).not.toBeNull();
+    // Exactly three arguments, and the third — the id slot — is the mint.
+    // Both halves matter: the count rejects an `undefined` shoved into the id
+    // slot with the mint pushed down into `turnId`, and the value rejects any
+    // other id shape minted inline.
+    expect(args).toEqual(["peerId", expect.any(String), "nextMessageId()"]);
   });
 
   it("mints it through the ONE canonical minter, imported from the adapter", () => {
@@ -461,7 +532,14 @@ describe("nats-account-runtime.ts wiring contract — #238 identity at the deliv
   it("keeps the notice best-effort: the boolean return stays ignored", () => {
     // The notice is a hedge for a gate that is deliberately a conservative
     // mirror; a failed send must not become a thrown or logged error here.
-    expect(RUNTIME_SOURCE).not.toContain("if (!channel.sendText(");
-    expect(RUNTIME_SOURCE).not.toMatch(/=\s*channel\.sendText\(/);
+    //
+    // Scoped to NOTICE_BLOCK for the same reason the mint guard is: the
+    // assertion must be about the NOTICE. Whole-file, a legitimate future
+    // egress site elsewhere in this runtime that DOES check its boolean return
+    // — a perfectly correct change — would turn a test named "keeps the notice
+    // best-effort" red for reasons that have nothing to do with the notice.
+    expect(NOTICE_BLOCK).toContain("channel.sendText("); // fail closed, not vacuous
+    expect(NOTICE_BLOCK).not.toContain("if (!channel.sendText(");
+    expect(NOTICE_BLOCK).not.toMatch(/=\s*channel\.sendText\(/);
   });
 });
