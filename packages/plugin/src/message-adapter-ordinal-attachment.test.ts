@@ -25,20 +25,29 @@ import { describe, it, expect } from "vitest";
  * shapes those fixtures build it happens to select the same lane the state rule
  * does.
  *
- * What catches it is this file, and specifically "no statement anywhere compares
- * an ordinal to a lane generation" below — that one fires on every injection
- * form tried, because a re-based mapping is still a comparison. ("The
- * queued-block seam picks its barrier lane from lane state only" also fires when
- * the injection is written as a branch at that seam, but it is shape-sensitive
- * and a differently-spelled reintroduction can slip past it; do not treat it as
- * the primary net.)
+ * What catches it is this file, via two assertions that bound the LIKELY
+ * spellings. "No statement anywhere compares an ordinal to a lane generation"
+ * fires on any form that names `assistantMessageIndex` and `generation` inside
+ * the same `;`-delimited statement — which is how the deleted predicate was
+ * written, and how the shortest re-basing of it would be written again. "The
+ * queued-block seam picks its barrier lane from lane state only" fires on a
+ * generation comparison written INSIDE that seam, wherever its operands came
+ * from — the seam being where a mapping has to land to affect attachment at all.
  *
- * So this file is not belt-and-braces over the fixtures; on the single most
- * likely regression it is the ONLY thing standing between us and "just fix the
- * off-by-one". The deleted `assistantMessageIndexMatchesLane` looked locally
- * reasonable and carried a correct-sounding comment for its whole life, and
- * re-basing it is the forbidden move dressed as a bugfix: it binds us to an
- * observed core version instead of a contract, and there is no sound
+ * Their reach is bounded, and the bound is measured rather than assumed. A
+ * comparison routed through a local alias defeats the first assertion — writing
+ * `const idx = input.assistantMessageIndex;` and comparing `lane.generation` to
+ * `idx - 1` puts the two names in different statements — and a comparison hidden
+ * inside a helper DEFINED OUTSIDE the seam and merely called from it defeats the
+ * second. Injected in either of those forms, the wrong fix passes this file just
+ * as it passes the fixtures.
+ *
+ * So read what follows as a TRIPWIRE on the tempting spellings, not as a proof
+ * that no ordinal→lane mapping exists. That is still worth having, because the
+ * alternative is no signal at all: the deleted `assistantMessageIndexMatchesLane`
+ * looked locally reasonable and carried a correct-sounding comment for its whole
+ * life, and re-basing it is the forbidden move dressed as a bugfix — it binds us
+ * to an observed core version instead of a contract, and there is no sound
  * ordinal→lane mapping to bind to in the first place.
  *
  * The ordinal itself is NOT banned. `reservation.assistantMessageIndex` and
@@ -109,6 +118,11 @@ describe("message-adapter — barrier attachment never keys off an ordinal (#238
     expect(queuedBlock).not.toMatch(
       /assistantMessageIndex !== undefined[\s\S]{0,400}?state\.lanes/,
     );
+
+    // An alias defeats the file-wide identifier test (`const idx = input.assistantMessageIndex`
+    // puts the two names in different statements), so ban the COMPARISON itself
+    // inside the seam, where a mapping must land to have any effect.
+    expect(queuedBlock).not.toMatch(/generation\s*===|===\s*[A-Za-z_$.]*generation/);
   });
 
   it("the lane a reservation attached to is recorded from that lane, not from an ordinal", () => {
