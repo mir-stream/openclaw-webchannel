@@ -20,15 +20,43 @@ import type { DurableEvent } from "../../client/src/durable-view-reducer.js";
 
 const TURN = "turn-1";
 
+/**
+ * Strict type IDENTITY, not mutual assignability.
+ *
+ * ⚠️ MUTUAL ASSIGNABILITY IS NOT ENOUGH AND THAT WAS MEASURED, not reasoned:
+ * `const a: DurableEvent = {} as JournalEvent` plus the reverse compiles CLEAN
+ * when one side gains an OPTIONAL field, because an optional field is satisfied
+ * by its absence in both directions. The field that will actually be added is
+ * `revision?: number` (#241, doc §16.2-4) — optional, precisely the case the
+ * weaker check is blind to.
+ *
+ * The `(<T>() => T extends X ? 1 : 2)` trick compares the two types as written
+ * rather than by assignability, so an optional field on ONE side is a `tsc`
+ * error. Proven to fire: adding `revision?: number` to `JournalEvent` produces
+ *   error TS2344: Type 'false' does not satisfy the constraint 'true'.
+ */
+type Equals<X, Y> =
+  (<T>() => T extends X ? 1 : 2) extends <T>() => T extends Y ? 1 : 2
+    ? true
+    : false;
+type AssertTrue<T extends true> = T;
+type _JournalEventMirrorsDurableEvent = AssertTrue<
+  Equals<JournalEvent, DurableEvent>
+>;
+
 describe("JournalEvent mirrors the client's DurableEvent", () => {
-  it("is MUTUALLY ASSIGNABLE with DurableEvent (compile-time mirror guard)", () => {
-    // This is the assertion that actually catches a divergence: adding,
-    // removing, renaming or re-typing a field on either side makes one of these
-    // two lines fail `tsc`. The runtime `expect` below only keeps vitest from
-    // reporting an empty test.
-    const journalIsDurable: DurableEvent = {} as JournalEvent;
-    const durableIsJournal: JournalEvent = {} as DurableEvent;
-    expect([journalIsDurable, durableIsJournal]).toHaveLength(2);
+  it("is TYPE-IDENTICAL to DurableEvent (compile-time mirror guard)", () => {
+    // The guard itself is the `_JournalEventMirrorsDurableEvent` alias above —
+    // it goes red in `tsc`, which is where a type divergence belongs. This case
+    // exists so the guard is discoverable from the test list, and so a reader
+    // who deletes the alias sees a named test disappear with it.
+    const mirrored: DurableEvent = {
+      kind: "bubble",
+      answerId: "a-0",
+      text: "answer",
+      turnId: TURN,
+    } satisfies JournalEvent;
+    expect(mirrored.kind).toBe("bubble");
   });
 
   it("enumerates the FIELD NAMES of each kind, so a divergence is greppable", () => {
@@ -263,5 +291,36 @@ describe("journalEventForInboundUser", () => {
     expect(
       Object.keys(journalEventForInboundUser({ id: "u-0", text: "hi" })),
     ).toEqual(["kind", "id", "text"]);
+  });
+
+  it("THROWS on an empty id rather than journaling one", () => {
+    // `user_message.id` is optional and client-supplied, and `""` is the
+    // established fallback shape for it here — so `id: message.id ?? ""` is the
+    // likely call. Two DIFFERENT user messages under `""` collide on the
+    // `journal_user_once` index; the second append returns `inserted: false`,
+    // which this store's contract tells the accept seam to read as an ordinary
+    // non-destructive retry (§15.8). The second message's text would be gone
+    // from the only SSOT user messages have (§15.7).
+    expect(() => journalEventForInboundUser({ id: "", text: "first" })).toThrow(
+      /requires a non-empty id/,
+    );
+    expect(() =>
+      journalEventForInboundUser({
+        id: undefined as unknown as string,
+        text: "first",
+      }),
+    ).toThrow(/requires a non-empty id/);
+  });
+
+  it("uses the SAME id-less notion as the durable-frame branch", () => {
+    // One predicate behind both, so they cannot drift on what `""` means.
+    expect(isIdlessDurableFrame({ type: "agent_message", text: "t", id: "" })).toBe(
+      true,
+    );
+    expect(() => journalEventForInboundUser({ id: "", text: "t" })).toThrow();
+    expect(
+      isIdlessDurableFrame({ type: "agent_message", text: "t", id: "u-0" }),
+    ).toBe(false);
+    expect(journalEventForInboundUser({ id: "u-0", text: "t" }).kind).toBe("user");
   });
 });

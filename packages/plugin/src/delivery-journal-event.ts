@@ -20,10 +20,14 @@
  * There is no shared package yet and creating one is NOT in this slice: #240 is
  * where the plugin actually RUNS the reducer, and it unifies the two. Until then
  * the mirror is held by two things, both in `delivery-journal-event.test.ts`:
- *  - a compile-time MUTUAL-ASSIGNABILITY assertion between `JournalEvent` and
+ *  - a compile-time STRICT TYPE-IDENTITY assertion between `JournalEvent` and
  *    the client's `DurableEvent` (imported by cross-package source path, the
  *    established pattern — see `durable-view-reducer-contract.test.ts`), which
- *    is what actually goes red on a divergence;
+ *    is what actually goes red on a divergence. It is deliberately an IDENTITY
+ *    check and not mutual assignability: mutual assignability is blind to an
+ *    OPTIONAL field added on one side only, and `revision?: number` is precisely
+ *    what #241 adds (doc §16.2-4). Measured — the assignability pair compiled
+ *    clean with `revision?` on one side;
  *  - a runtime enumeration of each kind's FIELD NAMES, so the divergence is also
  *    greppable by someone reading the failure rather than the types.
  *
@@ -52,11 +56,11 @@ export type JournalEvent =
     };
 
 /**
- * A durable agent frame's id, or `undefined` when the frame carries none.
+ * Is this a usable durable message id — present and non-empty?
  *
- * ONE definition of "id-less", used by both the mapper and
- * `isIdlessDurableFrame`, so the predicate can never disagree with the branch it
- * is supposed to describe.
+ * ONE definition of "id-less", shared by the `agent_message` branch of the
+ * mapper, by `isIdlessDurableFrame`, and by `journalEventForInboundUser`, so no
+ * two of them can disagree about what an id-less message is.
  *
  * `""` IS id-less HERE and is NOT id-less for `progress` — the two wire sites
  * genuinely differ and the reducer's BOUNDARY 1 pins why. The client's
@@ -68,7 +72,7 @@ export type JournalEvent =
  * ONE durable row while live shows N bubbles: an N8 live≠history divergence
  * landing right here.
  */
-function durableFrameId(id: string | undefined): id is string {
+function isUsableMessageId(id: string | undefined): id is string {
   return id !== undefined && id.length > 0;
 }
 
@@ -90,7 +94,7 @@ function durableFrameId(id: string | undefined): id is string {
  * journal agree by construction — doc §16.2-1, issue **#243**. Not built here.
  */
 export function isIdlessDurableFrame(frame: OutboundWsMessage): boolean {
-  return frame.type === "agent_message" && !durableFrameId(frame.id);
+  return frame.type === "agent_message" && !isUsableMessageId(frame.id);
 }
 
 /**
@@ -107,8 +111,8 @@ export function journalEventForOutbound(
   switch (frame.type) {
     case "agent_message":
       // The durable agent bubble. `""` and absent are both refused — see
-      // `durableFrameId` and `isIdlessDurableFrame`.
-      return durableFrameId(frame.id)
+      // `isUsableMessageId` and `isIdlessDurableFrame`.
+      return isUsableMessageId(frame.id)
         ? {
             kind: "bubble",
             answerId: frame.id,
@@ -200,12 +204,39 @@ export function journalEventForOutbound(
  * Exported alongside the outbound mapper so half 2 has nothing to invent at the
  * accept seam: doc §15.7 makes the plugin the ONLY SSOT for user messages, so
  * this event is the durable record of the accept, written before the ack.
+ *
+ * ⚠️ THROWS on an empty or absent id, and that is the whole point of it existing
+ * as a function rather than an object literal at the call site.
+ *
+ * `InboundWsMessage.user_message.id` is OPTIONAL and CLIENT-supplied, and `""`
+ * is the established fallback shape for that field elsewhere in this codebase —
+ * so `journalEventForInboundUser({ id: message.id ?? "", … })` is the likely
+ * thing half 2 writes, not a hypothetical. Reproduced: two genuinely DIFFERENT
+ * user messages both under `id: ""` collide on the `journal_user_once` partial
+ * index, the second append returns `inserted: false`, and that is exactly the
+ * value this interface tells half 2 to read as an ordinary non-destructive
+ * retry (§15.8). The second message's TEXT is then gone from the only SSOT
+ * there is for user messages (§15.7) — silent user-content loss, and history
+ * shows one bubble where live showed two (N8).
+ *
+ * It throws rather than returning `null` because this runs BEFORE accept: a
+ * loud failure in half 2's integration test is the outcome we want, whereas a
+ * `null` would invite the accept path to shrug and continue unjournaled.
+ * `isUsableMessageId` is the same predicate the durable-frame branch uses, so
+ * the two cannot drift on what "id-less" means.
  */
 export function journalEventForInboundUser(input: {
   id: string;
   text: string;
   turnId?: string;
 }): JournalEvent {
+  if (!isUsableMessageId(input.id)) {
+    throw new Error(
+      "webchannel: journalEventForInboundUser requires a non-empty id — a " +
+        "user message must be journaled under its own identity, and an empty " +
+        "id collapses distinct messages onto one row (doc §15.7)",
+    );
+  }
   return {
     kind: "user",
     id: input.id,

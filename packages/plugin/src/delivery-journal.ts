@@ -47,50 +47,115 @@ import { runSqliteImmediateTransactionSync } from "openclaw/plugin-sdk/sqlite-ru
 import type { JournalEvent } from "./delivery-journal-event.js";
 import { ensurePrivateDirectory } from "./private-file.js";
 
-/**
- * `node:sqlite`, fetched through `process.getBuiltinModule` instead of a static
- * `import { DatabaseSync } from "node:sqlite"`.
- *
- * ⚠️ THIS IS NOT STYLE — a static import makes every vitest suite that loads
- * this module FAIL TO COLLECT. `node:sqlite` is a PREFIX-ONLY builtin, so
- * `builtinModules` lists it as `"node:sqlite"`; vite-node's `normalizeModuleId`
- * strips the `node:` prefix and looks the result up in a set that has the
- * PREFIXED name, decides `sqlite` is not a builtin, and asks the vite server to
- * load a package by that name (`vite-node/dist/utils.mjs` hardcodes exactly one
- * exception, `prefixedBuiltins = new Set(["node:test"])`). The observed failure
- * is `Failed to load url sqlite (resolved id: sqlite)`. Neither
- * `server.deps.external` nor a `pre` resolve plugin fixes it: by the time either
- * runs the specifier is already the bare `sqlite`.
- *
- * `process.getBuiltinModule` is a documented, stable API for exactly this — a
- * builtin fetched without going through the module loader — available since
- * Node 22.3.0, comfortably under this package's `engines.node` floor, and fully
- * typed (`typeof import("node:sqlite")`), so `DatabaseSync` keeps its real type.
- * The alternative was a root `vitest.config.ts` shim, which would put a
- * workaround for one module in the whole repo's test config.
- *
- * REVISIT when vitest/vite-node is upgraded past this bug: the plain import is
- * the better code, and this comment is the reason it is not here.
- */
-const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
+/** Main database plus every journal-mode sidecar that can hold database pages. */
+const SQLITE_DATABASE_FILE_SUFFIXES = ["", "-wal", "-shm", "-journal"] as const;
 
 /** Seeded into `journal_meta` on open. No migration gate exists yet — see `open`. */
 export const DELIVERY_JOURNAL_SCHEMA_VERSION = "1";
 
+/**
+ * SQLite lock-wait before a busy error.
+ *
+ * ⚠️ DELIBERATELY 5 s, NOT core's 30 s (`OPENCLAW_SQLITE_BUSY_TIMEOUT_MS` in
+ * `openclaw`'s `src/state/openclaw-state-db.ts`). `busy_timeout` is a
+ * SYNCHRONOUS block: `DatabaseSync` parks the whole event loop for the wait, so
+ * the worst case here is the value chosen, not an async delay. Persist-before-
+ * publish puts this in front of every outbound frame, and a 30 s freeze of the
+ * gateway is a worse failure than a journal append that gives up and is retried
+ * non-destructively (§15.8) — the journal is a shadow store this slice, so a
+ * refused append costs nothing a retry cannot recover. Core's 30 s is right for
+ * core: its state DB is the authority and there is no frame waiting behind it.
+ * Revisit with #240, which makes this store authoritative.
+ */
 const BUSY_TIMEOUT_MS = 5_000;
+
+/** Memoized `node:sqlite`; see `loadNodeSqlite`. */
+let nodeSqlite: typeof import("node:sqlite") | undefined;
+
+/**
+ * Resolve `node:sqlite` through `process.getBuiltinModule` instead of a static
+ * `import { DatabaseSync } from "node:sqlite"`, LAZILY and memoized.
+ *
+ * ⚠️ THE INDIRECTION IS NOT STYLE — a static import makes every vitest suite
+ * that loads this module FAIL TO COLLECT. `node:sqlite` is a PREFIX-ONLY
+ * builtin, so `builtinModules` lists it as `"node:sqlite"`; vite-node's
+ * `normalizeModuleId` strips the `node:` prefix and looks the result up in a set
+ * that holds the PREFIXED name, concludes `sqlite` is not a builtin, and asks
+ * the vite server to load a package by that name (`vite-node/dist/utils.mjs`
+ * hardcodes exactly one exception, `prefixedBuiltins = new Set(["node:test"])`).
+ * The observed failure is `Failed to load url sqlite (resolved id: sqlite)`.
+ * Neither `server.deps.external` nor a `pre` resolve plugin fixes it: by the
+ * time either runs, the specifier is already the bare `sqlite`.
+ *
+ * ⚠️ AND THE LAZINESS IS NOT STYLE EITHER. Destructuring at module top level
+ * makes a Node built `--without-sqlite` fail with a bare `Cannot destructure
+ * property 'DatabaseSync' of undefined` at IMPORT time — and half 2 puts this
+ * module in the plugin's main import graph, so that would take the whole plugin
+ * down at load, with an error naming neither the journal nor SQLite. Resolving
+ * inside `openDeliveryJournal` confines the failure to the journal and lets it
+ * say what is actually wrong.
+ *
+ * `process.getBuiltinModule` is documented and stable for exactly this — a
+ * builtin fetched without going through the module loader — available since Node
+ * 22.3.0, comfortably under this package's `engines.node` floor, and fully typed
+ * (`typeof import("node:sqlite")`), so `DatabaseSync` keeps its real type.
+ *
+ * REVISIT when vitest/vite-node is upgraded past this bug: the plain import is
+ * the better code, and this comment is the reason it is not here.
+ */
+function loadNodeSqlite(): typeof import("node:sqlite") {
+  if (nodeSqlite === undefined) {
+    // Annotated as optional on purpose: the typed overload promises a module,
+    // but the runtime returns `undefined` for a builtin this binary lacks.
+    const resolved: typeof import("node:sqlite") | undefined =
+      process.getBuiltinModule("node:sqlite");
+    if (resolved === undefined) {
+      throw new Error(
+        "webchannel: the delivery journal requires the node:sqlite builtin, " +
+          "which this Node binary does not provide (a build configured " +
+          "--without-sqlite). Run the gateway on a standard Node matching this " +
+          "package's engines range.",
+      );
+    }
+    nodeSqlite = resolved;
+  }
+  return nodeSqlite;
+}
+
+/**
+ * An event kind this build does not know — #253's retain rule, in the type
+ * system. A newer build's journal can hold kinds only IT understands, and the
+ * store keeps them whole in `payload` rather than dropping them.
+ */
+export type UnknownJournalEvent = { kind: string } & Record<string, unknown>;
+
+/** What `read` can actually hand back: a known event, or a retained unknown one. */
+export type RetainedJournalEvent = JournalEvent | UnknownJournalEvent;
 
 /**
  * One journaled row.
  *
  * `event` is parsed from `payload`, which is the TRUTH — `kind`, `message_id`
- * and `turn_id` are extracted columns that exist only so the log can be indexed.
- * `kind` here is read back off the parsed event, never off the column, so a row
- * can never report a kind its own payload contradicts.
+ * and `turn_id` are extracted columns. `kind` here is read back off the parsed
+ * event, never off the column, so a row can never report a kind its own payload
+ * contradicts.
+ *
+ * ⚠️ `kind` IS `string` AND `event` IS `RetainedJournalEvent`, NOT `JournalEvent`
+ * — deliberately, and the friction that creates for consumers is the point. A
+ * row read out of a journal a NEWER build wrote can carry a kind outside the
+ * union (#253 retains it), so typing this field as `JournalEvent["kind"]` would
+ * be a knowing lie, and the lie has a specific victim: `applyDurableEvent`'s
+ * `switch` has no `default`, so an out-of-union kind falls off the end, returns
+ * `undefined`, and the NEXT event throws — pointing at the wrong event (the
+ * reducer's header documents this at length). #240 will lift the
+ * `read(...).map((row) => row.event as DurableEvent)` shape straight out of
+ * `delivery-journal.test.ts`, and this type is the only thing positioned to warn
+ * it that the cast is a claim, not a fact.
  */
 export type DeliveryJournalRow = {
   seq: number;
-  kind: JournalEvent["kind"];
-  event: JournalEvent;
+  kind: string;
+  event: RetainedJournalEvent;
   createdMs: number;
 };
 
@@ -105,20 +170,21 @@ export interface DeliveryJournal {
     conversationId: string,
     event: JournalEvent,
   ): { seq: number; inserted: boolean };
-  /** Rows for one conversation in `seq` order, i.e. in egress order. */
+  /**
+   * Rows for one conversation in `seq` order, i.e. in egress order.
+   *
+   * UNBOUNDED BY DEFAULT, on purpose: replaying the whole log is what the shared
+   * reducer does to produce history, so a silent default page size would produce
+   * a silently truncated history. #240 paginates from the materialized read
+   * model (doc §15.4), not from here.
+   *
+   * `afterSeq` must be a non-negative integer and `limit`, when given, a
+   * positive one; both throw rather than degrade.
+   */
   read(
     conversationId: string,
     options?: { afterSeq?: number; limit?: number },
   ): DeliveryJournalRow[];
-  /**
-   * Per-connection pragma values, as SQLite reports them.
-   *
-   * `synchronous` is per-CONNECTION state, so it is UNOBSERVABLE from a second
-   * handle on the same file — which is why this seam exists. `FULL` is the
-   * durability claim of §16.2-9, and a claim nothing can observe is a claim
-   * nothing can pin; `delivery-journal.test.ts` pins it through here.
-   */
-  connectionPragmas(): { journalMode: string; synchronous: number };
   /** Checkpoint, stop WAL maintenance, and close the handle. Idempotent. */
   close(): void;
 }
@@ -136,6 +202,7 @@ export function openDeliveryJournal(options: {
 }): DeliveryJournal {
   const databasePath = options.databasePath;
   const now = options.now ?? Date.now;
+  const { DatabaseSync } = loadNodeSqlite();
 
   // 1. Owner-only (0700) directory, the same handling the credential and
   //    conversation-key stores get.
@@ -157,7 +224,26 @@ export function openDeliveryJournal(options: {
   //    sidecars 0644 and `delivery-journal.test.ts` red (verified both ways).
   //    Keep it here anyway: it is the earliest correct point, and it cannot be
   //    invalidated by a later statement being added above the DDL.
-  chmodSync(databasePath, 0o600);
+  //
+  //    ⚠️ AND IT CHMODS THE SIDECARS TOO, NOT JUST THE MAIN FILE. Inheritance
+  //    only covers sidecars SQLite CREATES; it never re-chmods one that already
+  //    exists, so a journal whose sidecars were loosened — by a crash, a
+  //    restore, or a build predating this sweep — keeps them loose while the
+  //    main file looks correct. Core does the same sweep over the same four
+  //    names (`resolveSqliteDatabaseFilePaths` in `openclaw`'s
+  //    `src/infra/sqlite-files.ts`, applied by `ensureOpenClawStatePermissions`).
+  //    `-journal` is in the list because `configureSqliteConnectionPragmas`
+  //    silently falls back to `journal_mode = DELETE` on a network volume.
+  //
+  //    MEASURED, because the obvious version of this claim is wrong: SQLite
+  //    DELETES AND RECREATES a stale `-wal` on reopen, so that one comes back
+  //    0600 by inheritance anyway. The file that actually survives at 0644 is
+  //    the `-shm`, which SQLite leaves exactly as it finds it. It holds the WAL
+  //    INDEX rather than message plaintext, so the exposure is narrower than
+  //    "plaintext at 0644" — but it is real, it is what core's sweep covers, and
+  //    it is the assertion `delivery-journal.test.ts` uses to catch this
+  //    regressing (verified red when the sweep is cut back to the main file).
+  chmodDatabaseFiles(databasePath);
 
   // 4. busy-timeout / WAL / autocheckpoint, in the SDK's safe lock-retry order.
   //    Hand-rolling that ordering is how a store ends up wedged under a
@@ -169,21 +255,35 @@ export function openDeliveryJournal(options: {
     databaseLabel: "webchannel delivery journal",
   });
 
-  // 5. FULL — and it has to be a raw `exec` AFTER step 4, because the SDK's
-  //    option type admits `"NORMAL"` only, so this cannot be expressed through
-  //    it. (Step 4 does not clobber it: the helper touches `synchronous` only
-  //    when the caller passes the option, and we do not. The ordering is
-  //    "SDK baseline first, then tighten what the baseline cannot say".)
-  //    §16.2-9 is blunt about why NORMAL is not good enough: WAL + `NORMAL` can
-  //    roll a COMMITTED transaction back on power loss, and a store that calls
-  //    itself durable does not get to do that.
-  //    The cost was MEASURED, not assumed — 2000 bubble appends, one IMMEDIATE
-  //    txn each, real on-disk filesystem (zfs), same code path for both modes:
-  //    p50 0.068 ms NORMAL vs 1.38 ms FULL; p99 0.25 ms vs 3.0-5.6 ms. FULL is
-  //    ~20x NORMAL and still an order of magnitude inside the budget
-  //    persist-before-publish can afford in front of an outbound frame, so the
-  //    trade is paid. (Doc §15.2's 0.098 ms viability number was measured under
-  //    an unstated sync mode; it matches NORMAL here, not FULL.)
+  // 5. FULL. ⚠️ THIS EXEC ASSERTS INTENT; IT DOES NOT CHANGE BEHAVIOUR TODAY.
+  //    MEASURED: a fresh `node:sqlite` handle already reports `synchronous = 2`
+  //    (FULL) before any pragma, and step 4 leaves it at 2 — FULL is this
+  //    build's DEFAULT and NORMAL is the opt-out, so this line is currently a
+  //    no-op. It stays because `configureSqliteConnectionPragmas` ACCEPTS a
+  //    `synchronous: "NORMAL"` option (its type admits that one value and no
+  //    other): the day an SDK bump or a shared helper starts passing it, step 4
+  //    would silently downgrade this store, and this exec is what takes the
+  //    downgrade back. §16.2-9 is why the downgrade must not stand — WAL +
+  //    `NORMAL` can roll a COMMITTED transaction back on power loss, and a store
+  //    that calls itself durable does not get to do that. It has to be a raw
+  //    `exec` after step 4 for the same reason: `"FULL"` cannot be expressed
+  //    through that option type at all.
+  //
+  //    ⚠️ NOT UNIT-PINNED, and it cannot cheaply be: `synchronous` is
+  //    per-CONNECTION state, invisible from a second handle, and an assertion on
+  //    THIS connection would pass with this line deleted (it is the default).
+  //    An honest test would need a second process and a power-loss simulation.
+  //
+  //    The cost of NOT downgrading was MEASURED rather than assumed — 2000
+  //    bubble appends, one IMMEDIATE txn each, real on-disk filesystem (zfs),
+  //    identical code path, only the pragma varied: p50 1.38 ms FULL vs 0.068 ms
+  //    NORMAL, p99 3.0-5.6 ms vs 0.25 ms. So the ~20x is what we DECLINE TO
+  //    RECOVER by downgrading, not a cost we opted into, and 1.38 ms is well
+  //    inside what persist-before-publish can afford in front of an outbound
+  //    frame. (Doc §15.2 quotes p50 0.1 ms and states no mode; the 0.098 ms
+  //    figure is §14.8's, and that one DOES state its mode — `WAL +
+  //    synchronous=NORMAL + busy_timeout`. Both are NORMAL numbers, and §14.8's
+  //    p99 4.1 ms and 393 ms auto-checkpoint spike match the tail seen here.)
   db.exec("PRAGMA synchronous = FULL");
 
   // 6. Schema. `CREATE ... IF NOT EXISTS` so opening an existing journal is a
@@ -238,10 +338,22 @@ export function openDeliveryJournal(options: {
       "(conversation_id, seq, kind, message_id, turn_id, payload, created_ms) " +
       "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
   );
-  const selectExistingSeq = db.prepare(
-    "SELECT seq FROM journal_event " +
-      "WHERE conversation_id = ? AND kind = ? AND message_id = ?",
-  );
+  // Two statements, one per deduped kind, with `kind` as a SQL LITERAL rather
+  // than a bound parameter. A bound `kind = ?` cannot be matched against the
+  // partial indexes' `WHERE kind = 'user'` / `'placement'` predicates — SQLite
+  // has to prove the predicate at prepare time — so the single-statement version
+  // fell back to a PK range scan over the whole conversation. Confirmed with
+  // EXPLAIN QUERY PLAN both ways.
+  const selectExistingSeqByKind = {
+    user: db.prepare(
+      "SELECT seq FROM journal_event " +
+        "WHERE conversation_id = ? AND kind = 'user' AND message_id = ?",
+    ),
+    placement: db.prepare(
+      "SELECT seq FROM journal_event " +
+        "WHERE conversation_id = ? AND kind = 'placement' AND message_id = ?",
+    ),
+  };
   const selectRows = db.prepare(
     "SELECT seq, payload, created_ms FROM journal_event " +
       "WHERE conversation_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
@@ -280,14 +392,27 @@ export function openDeliveryJournal(options: {
         // shows it once (N8), and worse — `applyUser` blind-appends, so a
         // duplicated id makes a later `applySeal` index past the end and THROW
         // (the reducer's BOUNDARY 1 precondition).
-        const existing = selectExistingSeq.get(conversationId, kind, messageId) as
-          | { seq: number }
-          | undefined;
+        //
+        // ⚠️ GATED ON THE KINDS THAT ACTUALLY HAVE A UNIQUE INDEX. Only `user`
+        // and `placement` do. For a `bubble` the lookup is not unique — it would
+        // match SOME OTHER bubble carrying the same answer id (a legitimate
+        // edit) and report that row's seq as `inserted: false`, which is exactly
+        // the "a seq that names a different row" outcome the throw below exists
+        // to prevent. Unreachable today (a `bubble` cannot conflict: the only
+        // other constraint is the primary key, and `seq` was just allocated as
+        // MAX+1 inside this transaction), so this is the branch that must stay
+        // loud rather than clever.
+        const lookup =
+          kind === "user" || kind === "placement"
+            ? selectExistingSeqByKind[kind]
+            : undefined;
+        const existing =
+          lookup === undefined
+            ? undefined
+            : (lookup.get(conversationId, messageId) as
+                | { seq: number }
+                | undefined);
         if (existing === undefined) {
-          // Unreachable: the ONLY unique constraints besides the primary key
-          // are those two partial indexes, and the primary key cannot collide
-          // because `seq` was just allocated as MAX+1 inside this transaction.
-          // Throwing beats returning a seq that names a different row.
           throw new Error(
             "webchannel: delivery journal append conflicted on no known row " +
               `(kind ${kind})`,
@@ -298,9 +423,17 @@ export function openDeliveryJournal(options: {
     },
 
     read(conversationId, readOptions) {
-      const afterSeq = readOptions?.afterSeq ?? 0;
-      // SQLite reads a negative LIMIT as "no limit".
-      const limit = readOptions?.limit ?? -1;
+      // Validate before binding. An unchecked non-integer reaches SQLite and
+      // surfaces as a bare `datatype mismatch` naming nothing, and an unchecked
+      // NaN binds as NULL so `seq > NULL` is never true — a SILENTLY EMPTY
+      // history, which is the worse of the two by far.
+      const afterSeq = requireCount(readOptions?.afterSeq ?? 0, "afterSeq", 0);
+      // SQLite reads a negative LIMIT as "no limit"; that is the default here on
+      // purpose — see the interface docblock.
+      const limit =
+        readOptions?.limit === undefined
+          ? -1
+          : requireCount(readOptions.limit, "limit", 1);
       const rows = selectRows.all(conversationId, afterSeq, limit) as Array<{
         seq: number;
         payload: string;
@@ -310,8 +443,9 @@ export function openDeliveryJournal(options: {
         // `payload` is the truth, so the whole event round-trips VERBATIM —
         // including fields and even KINDS this build does not know about. #253:
         // retain, never silently drop. That is also why `kind` is taken from
-        // here and not from the column.
-        const event = JSON.parse(row.payload) as JournalEvent;
+        // here and not from the column, and why the parsed value is typed
+        // `RetainedJournalEvent` rather than `JournalEvent`.
+        const event = JSON.parse(row.payload) as RetainedJournalEvent;
         return {
           seq: Number(row.seq),
           kind: event.kind,
@@ -319,19 +453,6 @@ export function openDeliveryJournal(options: {
           createdMs: Number(row.created_ms),
         };
       });
-    },
-
-    connectionPragmas() {
-      const journalMode = db.prepare("PRAGMA journal_mode").get() as {
-        journal_mode: string;
-      };
-      const synchronous = db.prepare("PRAGMA synchronous").get() as {
-        synchronous: number;
-      };
-      return {
-        journalMode: journalMode.journal_mode,
-        synchronous: Number(synchronous.synchronous),
-      };
     },
 
     close() {
@@ -345,6 +466,30 @@ export function openDeliveryJournal(options: {
   };
 }
 
+/** Owner-only mode for the main database and every sidecar that exists. */
+function chmodDatabaseFiles(databasePath: string): void {
+  for (const suffix of SQLITE_DATABASE_FILE_SUFFIXES) {
+    try {
+      chmodSync(`${databasePath}${suffix}`, 0o600);
+    } catch (error) {
+      // A sidecar that does not exist is the normal case; anything else is a
+      // real hardening failure on a file holding plaintext, and stays loud.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+}
+
+/** A non-negative (or `min`-bounded) integer, or a throw naming the parameter. */
+function requireCount(value: number, parameter: string, min: number): number {
+  if (!Number.isInteger(value) || value < min) {
+    throw new Error(
+      `webchannel: delivery journal read ${parameter} must be an integer ` +
+        `>= ${min} (received ${String(value)})`,
+    );
+  }
+  return value;
+}
+
 /**
  * The indexed id for an event, or `null` when the kind has none.
  *
@@ -356,6 +501,14 @@ export function openDeliveryJournal(options: {
  * typed `messageEdited` with a monotonic revision, at which point the duplicate
  * question gets a real answer instead of an omission.) `seal` needs no dedupe
  * either: the fold is keyed by answer id, so replaying one is harmless.
+ *
+ * ⚠️ THE `placement` DEDUPE IS NOT QUITE LOSS-FREE, so do not read the asymmetry
+ * as "the deduped kinds carry nothing a repeat could update": a repeated
+ * `placement` whose `turnId` DIFFERS is discarded whole, while `applyPlacement`
+ * refreshes `turnId` on EVERY progress (`msg.turnId ?? prev.turnId`). Not
+ * reachable today — the emitters pass a turnId that is constant for the turn,
+ * and answer ids are minted monotonically so one never spans two turns — but it
+ * is a real edge the day either of those changes.
  *
  * The `default` is NOT an exhaustiveness hole — it is #253's retain rule. A
  * forward event kind read back from a newer build's journal is out of the union
@@ -376,7 +529,15 @@ function extractMessageId(event: JournalEvent): string | null {
   }
 }
 
-/** The indexed turn id. Read structurally so a forward kind still indexes it. */
+/**
+ * The extracted turn id. Read structurally so a forward kind still yields one.
+ *
+ * NOTHING INDEXES IT TODAY — there is no index on `turn_id`, and calling it
+ * "extracted for indexing" would overstate it. It is a column so #240's
+ * read-model queries (per-turn projection, seal reconciliation) can filter on it
+ * without parsing every `payload`; the index arrives with the query that needs
+ * it, not before.
+ */
 function extractTurnId(event: JournalEvent): string | null {
   const turnId = (event as { turnId?: unknown }).turnId;
   return typeof turnId === "string" ? turnId : null;

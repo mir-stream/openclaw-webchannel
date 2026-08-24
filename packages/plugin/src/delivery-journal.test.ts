@@ -7,6 +7,7 @@
  * hard to notice when they regress (pragmas, file modes, WAL sidecar modes).
  */
 import {
+  chmodSync,
   mkdtempSync,
   rmSync,
   statSync,
@@ -34,9 +35,11 @@ const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
 const TURN = "turn-1";
 
 const openJournals: DeliveryJournal[] = [];
+const sidecars: Array<{ close(): void }> = [];
 const tempRoots: string[] = [];
 
 afterEach(() => {
+  while (sidecars.length > 0) sidecars.pop()?.close();
   while (openJournals.length > 0) openJournals.pop()?.close();
   while (tempRoots.length > 0) {
     rmSync(tempRoots.pop() as string, { recursive: true, force: true });
@@ -140,6 +143,26 @@ describe("seq allocation", () => {
       journal.read("conv", { afterSeq: 3, limit: 1 }).map((r) => r.seq),
     ).toEqual([4]);
     expect(journal.read("other-conv")).toEqual([]);
+  });
+
+  it("refuses a non-integer or negative read window, naming the parameter", () => {
+    const journal = open(newJournalPath());
+    journal.append("conv", bubble("a-1", "one"));
+
+    // A raw `datatype mismatch` from SQLite names nothing.
+    expect(() => journal.read("conv", { limit: 1.5 })).toThrow(
+      /delivery journal read limit must be an integer >= 1 \(received 1\.5\)/,
+    );
+    // Worse than an ugly error: NaN binds as NULL, `seq > NULL` is never true,
+    // and the caller gets a SILENTLY EMPTY history.
+    expect(() => journal.read("conv", { afterSeq: Number.NaN })).toThrow(
+      /delivery journal read afterSeq must be an integer >= 0 \(received NaN\)/,
+    );
+    expect(() => journal.read("conv", { afterSeq: -1 })).toThrow(/afterSeq/);
+    expect(() => journal.read("conv", { limit: 0 })).toThrow(/limit/);
+
+    // The valid window still works, and the default stays unbounded.
+    expect(journal.read("conv")).toHaveLength(1);
   });
 
   it("stamps created_ms from the injected clock", () => {
@@ -341,16 +364,23 @@ describe("payload retention (#253)", () => {
 });
 
 describe("connection and on-disk facts", () => {
-  it("uses WAL, synchronous=FULL, and seeds schema_version", () => {
+  it("persists journal_mode=wal and seeds schema_version", () => {
+    // ⚠️ `synchronous` is NOT asserted, and the omission is deliberate rather
+    // than a gap. FULL is this build's DEFAULT (measured: a fresh handle reports
+    // 2 before any pragma), so an assertion on it would stay green with
+    // `delivery-journal.ts`'s `PRAGMA synchronous = FULL` deleted — a tautology
+    // dressed as a durability guarantee. It is also per-CONNECTION state, so it
+    // is unobservable from this sidecar handle at all. Both facts are recorded
+    // at that exec. What IS observable is asserted here: `journal_mode` is
+    // persistent in the file, and `schema_version` is a row.
     const databasePath = newJournalPath();
-    const journal = open(databasePath);
-    expect(journal.connectionPragmas()).toEqual({
-      journalMode: "wal",
-      synchronous: 2,
-    });
+    open(databasePath);
 
     const sidecar = new DatabaseSync(databasePath);
     try {
+      expect(sidecar.prepare("PRAGMA journal_mode").get()).toEqual({
+        journal_mode: "wal",
+      });
       expect(
         sidecar
           .prepare("SELECT value FROM journal_meta WHERE key = 'schema_version'")
@@ -359,6 +389,41 @@ describe("connection and on-disk facts", () => {
     } finally {
       sidecar.close();
     }
+  });
+
+  it("re-hardens sidecars an earlier build left world-readable", () => {
+    // Mode inheritance only covers sidecars SQLite CREATES; it never re-chmods
+    // one already on disk. So a journal whose sidecars were loosened — by a
+    // crash, a restore, or a build predating this sweep — keeps them loose.
+    //
+    // ⚠️ THE SETUP HAS TO KEEP THE SIDECARS ALIVE, and getting that wrong makes
+    // this test vacuous. MEASURED: a zero-byte `-wal` planted at 0644 is DELETED
+    // AND RECREATED by SQLite on reopen, so it comes back 0600 on its own and
+    // the test passes with the sweep removed. A sidecar only genuinely survives
+    // while another connection holds the database open — hence `holder`.
+    const databasePath = newJournalPath();
+    const first = open(databasePath);
+    first.append("conv", bubble("a-1", "one"));
+
+    const holder = new DatabaseSync(databasePath);
+    sidecars.push(holder);
+    holder.prepare("SELECT count(*) AS n FROM journal_event").get();
+    first.close();
+
+    for (const suffix of ["", "-wal", "-shm"]) {
+      chmodSync(`${databasePath}${suffix}`, 0o644);
+    }
+    expect(mode(`${databasePath}-shm`)).toBe(0o644);
+
+    open(databasePath);
+    expect(mode(databasePath)).toBe(0o600);
+    expect(mode(`${databasePath}-wal`)).toBe(0o600);
+    // ⚠️ `-shm` IS THE ASSERTION THAT ACTUALLY CATCHES THE MISSING SWEEP.
+    // MEASURED: with the sweep reduced to the main file, reopening this exact
+    // state yields `main 0600, -wal 0600, -shm 0644` — SQLite rewrites the
+    // `-wal` but leaves the `-shm` exactly as it found it. So the `-wal` line
+    // above is a regression guard, and this one is the live defect.
+    expect(mode(`${databasePath}-shm`)).toBe(0o600);
   });
 
   it("creates a 0700 directory, a 0600 database, and 0600 WAL sidecars", () => {
