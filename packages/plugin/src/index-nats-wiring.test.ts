@@ -413,20 +413,28 @@ describe("nats-account-runtime.ts wiring contract — #238 identity at the deliv
    * the frame assembly (`NatsChannel.sendText`) are covered executably by the
    * message-adapter and nats-channel tests; this pins the wiring joining them.
    */
-  // Line comments are stripped naively and whitespace collapsed, so this guard
-  // is line-break- and indentation-blind. A naive strip is sound HERE because it
-  // can only ever delete real code — i.e. only ever turn a positive assertion
-  // RED. It is not sound in the other direction, which is why the negative guard
-  // below is explicitly best-effort.
-  const RUNTIME_FLAT = RUNTIME_SOURCE.replace(/\/\/[^\n]*/g, "").replace(/\s+/g, " ");
+  // Comments are stripped naively — BOTH kinds — and whitespace collapsed, so
+  // this guard is line-break- and indentation-blind. Both kinds matter: strip
+  // only `//` and a `/* … */` comment quoting the notice send satisfies the
+  // positive assertion below all by itself, which is a false green (measured).
+  // A naive strip is sound in the positive direction because it can only ever
+  // delete real code — i.e. only ever turn a positive assertion RED. It is not
+  // sound in the other direction, which is why the negative guards are
+  // explicitly best-effort.
+  const RUNTIME_FLAT = RUNTIME_SOURCE.replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "")
+    .replace(/\s+/g, " ");
 
   it("mints the notice's id at the delivery act", () => {
     // ADJACENCY IS THE ASSERTION — the one non-obvious thing here.
     // `sendText(peerId, text, id?, turnId?, …)` turns argument 3, and only
     // argument 3, into `payload.id` on the wire. Requiring the mint to follow
-    // the text argument IMMEDIATELY is precisely "the mint is in slot 3": an
-    // `undefined` wedged into the id slot — or anything else between the two —
-    // breaks the adjacency and reds this.
+    // the text argument IMMEDIATELY is sufficient for every realistic edit to
+    // this call: an `undefined` wedged into the id slot — or anything else
+    // between the two — breaks the adjacency and reds this. It is NOT a formal
+    // equivalence; text and mint can be made adjacent somewhere other than an
+    // argument list (a destructured array literal, say). Those are deliberate
+    // rewrites, not drift, and this is a drift guard.
     //
     // Hoisting the text or the mint into a `const` reds this too, and that is
     // intended: per this file's header, a deliberate wiring change gets a

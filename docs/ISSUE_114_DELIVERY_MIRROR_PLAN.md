@@ -200,7 +200,7 @@ durable worktree에서. 스크래치패드 금지(`no-scratchpad-for-real-work`)
 ## 8. 범위 / 비범위
 
 **범위(이번):** partial/progress 모드 — journal store, drain-time commit 훅, journal 기반 history, client 순수-view 렌더 (§5 IN).
-**비범위(후속):** off/block 모드 per-answer id 신설; client text/위치 매칭 제거(#104/#227/#228); #215/#223 최종 종결; `getSessionMessages` 기반 history 제거(cutover 후); core 저장 형식 변경 없음.
+**비범위(후속):** off/block 모드 per-answer id 신설 — ⚠️ **절반 해소(PR #250 / #238)**: controller/wire 쪽은 거기서 처리됐고 **client 쪽만 남았다**(§5 OUT · §6 참고); client text/위치 매칭 제거(#104/#227/#228); #215/#223 최종 종결; `getSessionMessages` 기반 history 제거(cutover 후); core 저장 형식 변경 없음.
 
 ---
 
