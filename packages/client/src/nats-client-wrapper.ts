@@ -31,6 +31,12 @@ import {
   type WebChannelNatsClientOptions as DirectClientOptions,
   type InboundMessage,
 } from "./nats-client.js";
+import {
+  applyDurableEvent,
+  projectDurableFromClient,
+  type DurableEvent,
+  type DurableView,
+} from "./durable-view-reducer.js";
 
 /**
  * P0-4: the state a `SendReceipt` observes. A separate `receiptKey`-keyed record
@@ -121,6 +127,34 @@ export type WebChannelNATSClientOptions = Omit<WebChannelOptions, "bootstrapJwt"
 type InitializedWebChannelState = Omit<WebChannelState, "toolActivity"> & {
   toolActivity: ToolActivityItem[];
 };
+
+/**
+ * v6 §15.4: the per-id CLIENT-LOCAL overlay `mergeDurable` lays on top of the
+ * shared reducer's durable view. Keyed by bubble id because one event can touch
+ * many bubbles — a `turn_snapshot` finalizes every answer it names.
+ *
+ * An explicit `undefined` value DELETES the field (see `mergeDurable` rule 3);
+ * that is how `draftOnly` is cleared when a frame authors durable text.
+ */
+type DurableLocalOverlay = Record<string, Partial<ChatMessage>>;
+
+/**
+ * Shallow equality over a bubble's own enumerable fields, so `mergeDurable` can
+ * hand an UNCHANGED entry back by reference. `Object.is` rather than `===` only
+ * to keep `NaN` (a plausible `ts`/`assistantMessageIndex` corruption) from
+ * reporting a spurious change on every apply.
+ */
+function sameChatMessage(a: ChatMessage, b: ChatMessage): boolean {
+  const aKeys = Object.keys(a);
+  if (aKeys.length !== Object.keys(b).length) return false;
+  for (const key of aKeys) {
+    if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+    if (!Object.is((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key])) {
+      return false;
+    }
+  }
+  return true;
+}
 
 export class WebChannelNATSClient {
   private readonly natsOptions: DirectClientOptions;
@@ -453,15 +487,19 @@ export class WebChannelNATSClient {
       // Flip isTyping off and every `working` draft to `working:false` in place
       // (id/text untouched — the /stop idiom), atomically with the error status so
       // there is no intermediate flicker. Does NOT touch status/error semantics.
+      // #251: a lane that never received durable text has nothing to settle INTO,
+      // so it is dropped rather than frozen at its last partial.
       let draftsSettled = false;
-      const settledMessages = this.state.messages.map((m) => {
-        if (m.working) {
-          draftsSettled = true;
-          this.staleDraftWatch.delete(m.id);
-          return { ...m, working: false };
-        }
-        return m;
-      });
+      const settledMessages = this.dropSpentDrafts(
+        this.state.messages.map((m) => {
+          if (m.working) {
+            draftsSettled = true;
+            this.staleDraftWatch.delete(m.id);
+            return { ...m, working: false };
+          }
+          return m;
+        }),
+      );
       // #96: a retired instance can never see another `turn_settled`, so every
       // open turn ends here too — in the SAME atomic update as isTyping.
       const turnsCleared = this.clearOpenTurns();
@@ -801,18 +839,16 @@ export class WebChannelNATSClient {
       pendingTransitions: [],
       drainingTransitions: false,
     });
-    const bubble: ChatMessage = {
-      id: `u-${this.uid()}`,
-      role: "user",
-      text: trimmed,
-      wireId,
-      turnId: wireId,
-      receiptKey,
-      sendState: "queued",
-    };
+    // v6 §15.4: the echo's durable half (id/role/text/turnId + tail placement) is
+    // the reducer's `user` transition; the receipt overlay is the client's.
+    const bubbleId = `u-${this.uid()}`;
+    const messages = this.nextDurableMessages(
+      { kind: "user", id: bubbleId, text: trimmed, turnId: wireId },
+      { [bubbleId]: { wireId, receiptKey, sendState: "queued" } },
+    );
     this.stageReceiptStateThenCommit(
       receiptKey,
-      { messages: [...this.state.messages, bubble] },
+      { messages },
       () => { this.client.sendUserMessage(trimmed, wireId); },
     );
     return this.makeReceipt(receiptKey);
@@ -1482,6 +1518,23 @@ export class WebChannelNATSClient {
    *    reorder, and only among themselves.
    * Case X is unaffected: its tool bubble is neither in `answers` (it never
    * streamed) nor in `remove`, so it is preserved exactly as before.
+   *
+   * v6 §15.4: that whole reconciliation now lives in the shared reducer's `seal`
+   * transition (`durable-view-reducer.ts`'s `applySeal`, which was already a
+   * line-for-line port of the body this method used to hold). What survives here
+   * is the FRAME → EVENT mapper plus the client-local half:
+   *
+   *  - the two early returns are reproduced EXACTLY, including that neither sets
+   *    `isTyping: false`. A no-op snapshot must stay a no-op — emitting a state
+   *    patch and a listener notification for a frame that changes nothing is a
+   *    real regression, however small;
+   *  - the wire filters are applied HERE as well as inside `applySeal` (which
+   *    re-applies them idempotently) because the early-return decision and the
+   *    per-answer overlay both need the FILTERED set. An answer with a blank id
+   *    is dropped by the reducer, so it must not contribute an overlay either;
+   *  - `working: false` + clearing `draftOnly` on every answer is the overlay
+   *    that reproduces the old body's answer objects, for the reused and the
+   *    minted branch alike.
    */
   private applyTurnSnapshot(msg: InboundMessage): void {
     const turnId = msg.turnId;
@@ -1500,73 +1553,35 @@ export class WebChannelNATSClient {
     const answers = rawAnswers.filter((a) =>
       answerSeen.has(a.id) ? false : (answerSeen.add(a.id), true),
     );
-    const removeSet = new Set(
-      (Array.isArray(msg.remove) ? msg.remove : []).filter(
-        (r): r is string => typeof r === "string" && r.length > 0,
-      ),
+    const remove = (Array.isArray(msg.remove) ? msg.remove : []).filter(
+      (r): r is string => typeof r === "string" && r.length > 0,
     );
-    if (answers.length === 0 && removeSet.size === 0) return;
+    if (answers.length === 0 && remove.length === 0) return;
 
-    // 1. Drop the plugin-named superseded (mis-routed) answer bubbles.
-    let msgs = removeSet.size > 0
-      ? this.state.messages.filter((m) => !removeSet.has(m.id))
-      : this.state.messages.slice();
-
-    // 2. Desired answer objects, in authoritative order, reusing any existing
-    //    bubble's state (so a live bubble's non-render fields survive).
-    const existingById = new Map(msgs.map((m) => [m.id, m] as const));
-    const desiredById = new Map<string, ChatMessage>();
+    const local: DurableLocalOverlay = {};
     for (const a of answers) {
-      const prev = existingById.get(a.id);
-      desiredById.set(
-        a.id,
-        prev
-          ? { ...prev, role: "agent", text: a.text, working: false, turnId }
-          : { id: a.id, role: "agent", text: a.text, working: false, turnId },
-      );
+      // A sealed answer is authored durable text, so it is no longer a draft.
+      local[a.id] = { working: false, draftOnly: undefined };
     }
-    const answerIds = new Set(answers.map((a) => a.id));
-
-    // 3. Give every MINTED (not-yet-present) answer a slot next to its
-    //    predecessor answer, so the reorder below is a pure permutation that
-    //    never moves a non-answer bubble.
-    for (let k = 0; k < answers.length; k++) {
-      if (existingById.has(answers[k].id)) continue;
-      let insertAt = msgs.length;
-      if (k > 0) {
-        const predIdx = msgs.findIndex((m) => m.id === answers[k - 1].id);
-        insertAt = predIdx === -1 ? msgs.length : predIdx + 1;
-      } else {
-        const firstAnswer = msgs.findIndex((m) => answerIds.has(m.id));
-        if (firstAnswer !== -1) insertAt = firstAnswer;
-      }
-      msgs.splice(insertAt, 0, desiredById.get(answers[k].id)!);
-    }
-
-    // 4. Refill the answer slots in authoritative order — answer bubbles reorder
-    //    among themselves; every non-answer bubble keeps its exact slot.
-    const slots: number[] = [];
-    msgs.forEach((m, i) => {
-      if (answerIds.has(m.id)) slots.push(i);
-    });
-    slots.forEach((pos, idx) => {
-      msgs[pos] = desiredById.get(answers[idx].id)!;
-    });
-
-    this.setState({ messages: msgs, isTyping: false });
+    this.applyDurable({ kind: "seal", turnId, answers, remove }, local, { isTyping: false });
   }
 
   private finalizeDraftsForTurn(turnId?: string): void {
     if (!turnId) return;
     let changed = false;
-    const messages = this.state.messages.map((m) => {
-      if (m.working && m.turnId === turnId) {
-        changed = true;
-        this.staleDraftWatch.delete(m.id);
-        return { ...m, working: false };
-      }
-      return m;
-    });
+    // #251: the ordinary turn end. A lane whose draft never became durable text
+    // disappears here — the same thing Telegram's user sees when an unfinalized
+    // preview is cleared at turn end.
+    const messages = this.dropSpentDrafts(
+      this.state.messages.map((m) => {
+        if (m.working && m.turnId === turnId) {
+          changed = true;
+          this.staleDraftWatch.delete(m.id);
+          return { ...m, working: false };
+        }
+        return m;
+      }),
+    );
     if (changed) this.setState({ messages });
   }
 
@@ -1584,14 +1599,18 @@ export class WebChannelNATSClient {
    */
   private finalizeLocalTurnState(): void {
     let changed = false;
-    const messages = this.state.messages.map((m) => {
-      if (m.working) {
-        changed = true;
-        this.staleDraftWatch.delete(m.id);
-        return { ...m, working: false };
-      }
-      return m;
-    });
+    // #251: "stop everything" ends the turn, so an unfinalized lane's bubble goes
+    // with it rather than freezing at its last partial.
+    const messages = this.dropSpentDrafts(
+      this.state.messages.map((m) => {
+        if (m.working) {
+          changed = true;
+          this.staleDraftWatch.delete(m.id);
+          return { ...m, working: false };
+        }
+        return m;
+      }),
+    );
     const clearTyping = this.state.isTyping === true;
     // #96: "stop everything" includes the turn-open signal — otherwise a widget
     // would keep claiming the agent is working on a turn the user just killed
@@ -1653,13 +1672,21 @@ export class WebChannelNATSClient {
     this.staleDraftTimer = null;
     if (this.staleDraftWatch.size === 0) return;
     let changed = false;
-    const messages = this.state.messages.map((m) => {
-      if (this.staleDraftWatch.has(m.id) && m.working) {
-        changed = true;
-        return { ...m, working: false };
-      }
-      return m;
-    });
+    // #251: an expired draft is presumed dead, so a lane that never received
+    // durable text is dropped here too. NOTE this one fires MID-TURN, not at turn
+    // end — a user-visible change beyond the aborted-turn case #251 enumerates,
+    // and the intended Telegram parity (an unfinalized preview does not linger).
+    // The self-healing property is unchanged: a wrong guess is repaired by the
+    // next `progress`, which re-claims the slot at the tail.
+    const messages = this.dropSpentDrafts(
+      this.state.messages.map((m) => {
+        if (this.staleDraftWatch.has(m.id) && m.working) {
+          changed = true;
+          return { ...m, working: false };
+        }
+        return m;
+      }),
+    );
     // #96: the same verdict applies to the turn-open signal — the grace expired
     // with no proof of life, so stop claiming a turn is running.
     //
@@ -1772,6 +1799,175 @@ export class WebChannelNATSClient {
     this.setState({ messages: [...this.state.messages, message] });
   }
 
+  // ---------------------------------------------------------------------------
+  // v6 §15.4 (#237) — the durable half of `state.messages` is computed by the
+  // SHARED REDUCER, not by hand-rolled reconciliation here.
+  // ---------------------------------------------------------------------------
+  //
+  // The design's central bet is `history == the live view` BY CONSTRUCTION: one
+  // pure reducer (`durable-view-reducer.ts`) produces both this client's live
+  // view and — later, from the journal — the server's history projection. A
+  // reducer with no runtime consumer guarantees nothing, so THIS is its first
+  // consumer (NOT-list N8).
+  //
+  // Shape: `state.messages` stays the ONE array. There is deliberately no
+  // parallel durable event log and no retained `DurableView` field — we PROJECT
+  // `state.messages`, apply exactly one event, and merge the result back. That
+  // keeps bubbles the reducer never authored (adopted history rows, notices)
+  // inside the view, so they hold their slots through a `seal` exactly as
+  // `applySeal` promises, and it means the out-of-scope history three-tier
+  // adoption (which writes `state.messages` directly) automatically seeds the
+  // next projection without being routed through the reducer.
+  //
+  // Split of ownership, per §0.1 / the north star: the REDUCER owns id, role,
+  // durable text, turnId and ORDER; the CLIENT owns its own overlay (`working`,
+  // `ts`, `sendState`/`sendFailure`, `receiptKey`, `wireId`, `pending`,
+  // `retracted`, `assistantMessageIndex`, `draftOnly`), which is never journaled.
+
+  /**
+   * Project `state.messages` down to the durable view the reducer operates on.
+   *
+   * The §15.9 rule it applies (a `draftOnly` bubble contributes `text: ""`) lives
+   * in the reducer module, NOT here: it is the durability boundary itself, and
+   * the eventual server projection must inherit the same one. A second copy in
+   * the render path would be an N8 live≠history divergence with nothing to make
+   * it go red.
+   */
+  private durableProjection(): DurableView {
+    return projectDurableFromClient(this.state.messages);
+  }
+
+  /**
+   * #251: an agent bubble that claimed a slot via `progress` and never received
+   * durable text renders NOTHING once it stops working.
+   *
+   * Settled from the reference, not chosen: core's built-in Telegram extension
+   * DELETES an unfinalized preview at turn end —
+   * `[core] extensions/telegram/src/bot-message-dispatch.ts:2971-2975`
+   * (`lane.finalized ? stream.stop() : stream.clear()`), and `clear()` really
+   * deletes (`draft-stream.ts:653-668` → `:634 api.deleteMessage`). A preview
+   * becomes durable in exactly two cases — it finalized, or it is a completed
+   * overflow chunk (`draft-stream.ts:409`, `:479`, the only two `retain: true`
+   * sites). `draft-stream.ts:277` says it outright: "ephemeral preview to
+   * delete, NOT a durable content chunk to retain."
+   *
+   * The predicate keys on `draftOnly`, NOT on `text === ""`. Two reasons:
+   *  - `draftOnly` OUTLIVES the `working` flip, so the drop is actually
+   *    reachable at turn end. A text test is not: by then `text` holds the last
+   *    partial, so the bubble would freeze forever — today's bug;
+   *  - it cannot swallow a legitimately empty durable message. Every answer /
+   *    final path guards non-empty text (`message-adapter.ts:944`, `:1716`,
+   *    `:2521`; `inbound.ts:1446`), but the generic outbound seam
+   *    (`channel.ts:311`) forwards core's `ctx.text` unchecked, so empty durable
+   *    text is not structurally impossible. Keying on `draftOnly` makes that
+   *    moot instead of relying on the guarantee.
+   */
+  private isSpentDraft(m: ChatMessage): boolean {
+    return m.role === "agent" && m.working !== true && m.draftOnly === true;
+  }
+
+  /**
+   * Apply the #251 drop to a messages array the caller built WITHOUT the
+   * reducer. The four sites that flip `working: false` in place (terminal
+   * settle, `finalizeDraftsForTurn`, `finalizeLocalTurnState`,
+   * `expireStaleDrafts`) are exactly where an unfinalized lane stops being live,
+   * so they are where its bubble must vanish. Doing it here rather than routing
+   * those sites through `applyDurable` keeps them event-free: there is no
+   * "nothing happened" `DurableEvent`, and BOUNDARY 2 forbids inventing one.
+   */
+  private dropSpentDrafts(messages: ChatMessage[]): ChatMessage[] {
+    return messages.some((m) => this.isSpentDraft(m))
+      ? messages.filter((m) => !this.isSpentDraft(m))
+      : messages;
+  }
+
+  /**
+   * Merge a reducer-produced `DurableView` back onto `state.messages`.
+   *
+   *  1. every client-local field is carried from the `prev` bubble with the same
+   *     id (the whole overlay — `ts`, `working`, `sendState`, `receiptKey`, …);
+   *  2. `id`, `role`, `text` and `turnId` come from the view (`turnId` falls back
+   *     to `prev`'s), EXCEPT that a still-`draftOnly` entry keeps `prev.text` —
+   *     its durable text is `""` by construction and the rendered text is the
+   *     client-local draft, so taking the view's `""` would blank a live draft
+   *     whenever an unrelated frame triggers an apply;
+   *  3. `local[id]` is applied LAST and wins. A key set to `undefined` DELETES
+   *     it (that is how `draftOnly` is cleared), rather than leaving an
+   *     `undefined`-valued key that would defeat the identity reuse below;
+   *  4. a spent draft (see `isSpentDraft`) is OMITTED;
+   *  5. an id in `prev` but absent from the view is dropped — that is `seal`'s
+   *     `remove` working as designed.
+   *
+   * Entries whose emitted fields are unchanged are returned BY REFERENCE. That
+   * is required, not an optimization: `nats-client-wrapper.test.ts` asserts
+   * `.toBe` identity for untouched user/notice/history bubbles across a
+   * `turn_snapshot`. It is also the reducer's own structural-sharing discipline
+   * — `DurableMessage` being `readonly` forbids writing THROUGH a shared entry,
+   * not handing an unchanged one back. Note this is entry identity only: do NOT
+   * build an ARRAY-identity no-op signal on top (the reducer's header is
+   * explicit that array identity is a partial property).
+   */
+  private mergeDurable(
+    prev: ChatMessage[],
+    view: DurableView,
+    local?: DurableLocalOverlay,
+  ): ChatMessage[] {
+    const prevById = new Map(prev.map((m) => [m.id, m] as const));
+    const out: ChatMessage[] = [];
+    for (const entry of view) {
+      const base = prevById.get(entry.id);
+      const overlay = local?.[entry.id];
+      const overlaySetsText = overlay !== undefined && "text" in overlay;
+      const overlaySetsDraftOnly = overlay !== undefined && "draftOnly" in overlay;
+      const draftOnly = overlaySetsDraftOnly ? overlay.draftOnly : base?.draftOnly;
+      const next: ChatMessage = {
+        ...base,
+        id: entry.id,
+        role: entry.role,
+        // Rule 2's carve-out: while the bubble holds only a draft, `text` is the
+        // client's, not the view's.
+        text: draftOnly === true && !overlaySetsText && base !== undefined
+          ? base.text
+          : entry.text,
+        turnId: entry.turnId ?? base?.turnId,
+      };
+      if (overlay !== undefined) {
+        for (const [key, value] of Object.entries(overlay)) {
+          if (value === undefined) delete (next as Record<string, unknown>)[key];
+          else (next as Record<string, unknown>)[key] = value;
+        }
+      }
+      if (this.isSpentDraft(next)) continue;
+      out.push(base !== undefined && sameChatMessage(base, next) ? base : next);
+    }
+    return out;
+  }
+
+  /**
+   * Compute the next `state.messages` for ONE durable event, without committing
+   * it. `publish()` needs this form: its bubble has to ride inside the receipt
+   * staging patch rather than a bare `setState`.
+   */
+  private nextDurableMessages(
+    event: DurableEvent,
+    local?: DurableLocalOverlay,
+  ): ChatMessage[] {
+    const before = this.durableProjection();
+    const after = applyDurableEvent(before, event);
+    return this.mergeDurable(this.state.messages, after, local);
+  }
+
+  /** Apply ONE durable event to `state.messages`, optionally folding in a
+   *  sibling state patch the same frame owes (e.g. `turn_snapshot`'s
+   *  `isTyping: false`) so it lands in a single notification. */
+  private applyDurable(
+    event: DurableEvent,
+    local?: DurableLocalOverlay,
+    extra?: Partial<InitializedWebChannelState>,
+  ): void {
+    this.setState({ messages: this.nextDurableMessages(event, local), ...extra });
+  }
+
   private upsertReasoning(item: ReasoningItem): void {
     const current = this.state.reasoning;
     const idx = current.findIndex((entry) => entry.id === item.id);
@@ -1796,22 +1992,6 @@ export class WebChannelNATSClient {
     this.setState({ toolActivity: next.slice(-100) });
   }
 
-  private upsertMessage(
-    id: string,
-    update: (prev: ChatMessage) => ChatMessage,
-    fallback: ChatMessage,
-  ): void {
-    const messages = this.state.messages;
-    const idx = messages.findIndex((m) => m.id === id);
-    if (idx === -1) {
-      this.setState({ messages: [...messages, fallback] });
-      return;
-    }
-    const next = messages.slice();
-    next[idx] = update(next[idx]);
-    this.setState({ messages: next });
-  }
-
   private patchApproval(
     id: string,
     update: (prev: ApprovalRequest) => ApprovalRequest,
@@ -1826,6 +2006,10 @@ export class WebChannelNATSClient {
   }
 
   private seq = 0;
+
+  /** One-shot latch: the id-less durable `agent_message` warning is per client
+   *  instance, not per frame — a legacy plugin emits one per reply. */
+  private warnedIdlessDurableFrame = false;
 
   // ---------------------------------------------------------------------------
   // P0-4 — receipt records + send-state projection (D5)
@@ -2074,10 +2258,12 @@ export class WebChannelNATSClient {
         // state under LOCAL id namespaces while the snapshot carries the core
         // transcript's canonical ids, so plain id-dedup would duplicate them:
         //   - user sends → synthetic local echo ids (`u-<n>`);
-        //   - agent replies → the plugin's live-frame ids (`webchannel-…`
-        //     from nextMessageId(), or `a-<n>` when a frame had no id) — the
-        //     core transcript NEVER stores that platform id, so history ids
-        //     can never match live ids for agent messages either.
+        //   - agent replies → the plugin's live-frame ids (`webchannel-…` from
+        //     nextMessageId(); since #238 EVERY durable egress site mints one at
+        //     the delivery act, so the client-local `a-<n>` fallback survives only
+        //     for an id-less frame from a legacy plugin build) — the core
+        //     transcript NEVER stores that platform id, so history ids can never
+        //     match live ids for agent messages either.
         // Matching happens in three tiers, in snapshot order:
         //   1. id — a message whose canonical id we already hold (a prior
         //      snapshot placed or adopted it) is a no-op;
@@ -2467,15 +2653,25 @@ export class WebChannelNATSClient {
       case "progress": {
         const { id } = msg;
         const text = msg.text ?? "";
-        this.upsertMessage(
-          id ?? "",
-          (prev) => ({ ...prev, text, working: true, turnId: msg.turnId ?? prev.turnId }),
-          { id: id ?? "", role: "agent", text, working: true, turnId: msg.turnId },
+        // NULLISH, not truthy: `""` survives as a real id here, and the reducer's
+        // `placement` mirrors that (BOUNDARY 1 — it is the `bubble` site below
+        // that treats `""` as id-less, and the two genuinely differ).
+        const answerId = id ?? "";
+        this.applyDurable(
+          {
+            kind: "placement",
+            answerId,
+            ...(msg.turnId === undefined ? {} : { turnId: msg.turnId }),
+          },
+          // The rolling draft is the client's overlay, never durable (§15.9):
+          // `draftOnly` is what keeps it out of the durable projection while it
+          // still renders, and what makes the bubble droppable at turn end.
+          { [answerId]: { working: true, text, draftOnly: true } },
         );
         this.setState({ isTyping: false });
         // P1-9 §3.6.2: a progress upsert on a watched draft proves the turn is
         // still alive — disarm its staleness entry.
-        this.staleDraftWatch.delete(id ?? "");
+        this.staleDraftWatch.delete(answerId);
         return;
       }
 
@@ -2567,22 +2763,21 @@ export class WebChannelNATSClient {
         this.setState({ isTyping: false });
 
         if (id) {
-          this.upsertMessage(
-            id,
-            (prev) => ({
-              ...prev,
-              text: text ?? "",
-              working: false,
-              turnId: msg.turnId ?? prev.turnId,
-              ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
-            }),
+          this.applyDurable(
             {
-              id,
-              role: "agent",
+              kind: "bubble",
+              answerId: id,
               text: text ?? "",
-              working: false,
-              turnId: msg.turnId,
-              ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
+              ...(msg.turnId === undefined ? {} : { turnId: msg.turnId }),
+            },
+            {
+              [id]: {
+                working: false,
+                // Durable text has been authored, so the bubble is no longer a
+                // draft — this is what makes it survive the turn end.
+                draftOnly: undefined,
+                ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
+              },
             },
           );
           // P1-9 §3.6.2: the final upsert also proves liveness — disarm.
@@ -2590,13 +2785,38 @@ export class WebChannelNATSClient {
           return;
         }
 
-        this.appendMessage({
-          id: `a-${this.uid()}`,
-          role: "agent",
-          text: text ?? "",
-          turnId: msg.turnId,
-          ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
-        });
+        // LEGACY-PLUGIN PATH ONLY. Since #238 every durable egress site mints an
+        // id at the delivery act, so a durable frame reaching here means an older
+        // plugin build. The text is never dropped (NOT-list N10): it still gets a
+        // bubble, via a client-local `a-<n>`.
+        //
+        // Minting that id and feeding it to the reducer is admissible precisely
+        // because it NEVER LEAVES THE CLIENT. What BOUNDARY 1 forbids (N4/N5) is
+        // a viewer-minted id entering the SHARED EVENT STREAM, where it would
+        // write viewer-side identity into the SSOT. Kept inside this local view
+        // it does the opposite of harm: routing it through the reducer is what
+        // removes the N8 divergence the old `appendMessage` branch created, where
+        // the live view held a bubble the reducer's view did not.
+        const mintedId = `a-${this.uid()}`;
+        if (!this.warnedIdlessDurableFrame) {
+          this.warnedIdlessDurableFrame = true;
+          console.warn(
+            "[nats-wrapper] durable agent_message arrived without an id; " +
+              "rendering it under a client-local id. This is a legacy-plugin " +
+              "path — since #238 the plugin mints the id at the delivery act.",
+          );
+        }
+        this.applyDurable(
+          {
+            kind: "bubble",
+            answerId: mintedId,
+            text: text ?? "",
+            ...(msg.turnId === undefined ? {} : { turnId: msg.turnId }),
+          },
+          assistantMessageIndex !== undefined
+            ? { [mintedId]: { assistantMessageIndex } }
+            : undefined,
+        );
         return;
       }
     }

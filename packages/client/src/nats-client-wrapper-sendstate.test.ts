@@ -1910,7 +1910,7 @@ describe("WebChannelNATSClient — P0-4 terminal settles the live-turn UI", () =
     expect(h.wrapper.getState().isTyping).toBe(false);
   });
 
-  it("terminal while a working draft is live flips it working:false in place", async () => {
+  it("terminal while an unfinalized draft is live settles it — #251: by dropping it", async () => {
     const h = await connectWrapper();
     deliverOut(h.K, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
     await settle();
@@ -1920,9 +1920,15 @@ describe("WebChannelNATSClient — P0-4 terminal settles the live-turn UI", () =
     await settle();
 
     expect(h.wrapper.getState().status).toBe("error");
-    const draft = h.wrapper.getState().messages.find((m) => m.id === "webchannel-d")!;
-    expect(draft.working).toBe(false); // settled in place
-    expect(draft.text).toBe("partial…"); // text untouched
+    // A retired instance can never receive the lane's final, so there is nothing
+    // for this draft to settle INTO. This used to assert settled-in-place with
+    // the text untouched — i.e. "partial…" left on screen forever behind an error
+    // banner. #251 drops it instead, as core's built-in Telegram extension does
+    // with an unfinalized preview
+    // (`[core] extensions/telegram/src/bot-message-dispatch.ts:2971-2975`).
+    expect(h.wrapper.getState().messages.some((m) => m.id === "webchannel-d")).toBe(false);
+    // The point of the terminal sweep survives: nothing is left claiming to work.
+    expect(h.wrapper.getState().messages.some((m) => m.working)).toBe(false);
   });
 });
 

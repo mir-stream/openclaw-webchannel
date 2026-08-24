@@ -1137,7 +1137,7 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
   });
 
   // --- C5(a): one turn_settled must settle EVERY lane of its turn. --------
-  it("C5a: a single turn_settled finalizes every working draft sharing its turnId, in place", () => {
+  it("C5a: a single turn_settled settles every lane sharing its turnId — #251: dropping the unfinalized ones", () => {
     const w = makeWrapper();
     // Three lanes of turn T left streaming (their final frames never arrived),
     // plus one lane of an unrelated turn U.
@@ -1155,21 +1155,19 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
     deliver(w, { type: "turn_settled", turnId: "T" });
 
     const messages = w.getState().messages;
-    expect(messages.map((m) => m.working)).toEqual([false, false, false, true]);
-    // Finalization is IN PLACE: ids and texts must survive untouched, so a late
-    // frame on any lane still re-matches its bubble instead of duplicating it.
-    expect(messages.map((m) => m.id)).toEqual([
-      "webchannel-a",
-      "webchannel-b",
-      "webchannel-c",
-      "webchannel-z",
-    ]);
-    expect(messages.map((m) => m.text)).toEqual([
-      "A partial…",
-      "B partial…",
-      "C partial…",
-      "Z partial…",
-    ]);
+    // #251: all three lanes of T claimed a slot and never received durable text,
+    // so settling them DROPS them. This used to assert finalize-in-place — three
+    // bubbles left showing "A/B/C partial…" forever, which is the freeze the
+    // issue is about. Z belongs to turn U, is untouched, and stays working: that
+    // is what proves the settle is still scoped BY turnId and not a blanket sweep.
+    expect(messages.map((m) => m.id)).toEqual(["webchannel-z"]);
+    expect(messages.map((m) => m.working)).toEqual([true]);
+    expect(messages[0].text).toBe("Z partial…");
+    // The lockout property the test exists for: no lane of T is left `working`,
+    // so turnInFlight() no longer holds on T's account.
+    expect(
+      w.getState().messages.some((m) => m.turnId === "T" && m.working),
+    ).toBe(false);
   });
 
   // --- C6: the first tool scaffold is a provisional preview, not a lane. --
@@ -1410,8 +1408,16 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
     const blockOnlyFresh = makeWrapper();
 
     // The same invalid fresh-first shape in a block-only turn leaves P with no
-    // payload that can replace it. turn_settled therefore exposes the exact
-    // two-bubble [ghost P, F] cost that successful P-claiming prevents.
+    // payload that can replace it.
+    //
+    // #251: the two-bubble [ghost P, F] cost this comment used to describe is
+    // GONE, not deferred. P claimed a slot, streamed "Working…", and never
+    // received durable text, so turn_settled DROPS it — exactly as core's
+    // built-in Telegram extension deletes an unfinalized preview at turn end
+    // (`[core] extensions/telegram/src/bot-message-dispatch.ts:2971-2975`). The
+    // ledger entry that survives is the ORDERING one above (fresh-first still
+    // produces [B(P), F] when P is claimed); the ghost bubble is no longer part
+    // of the cost of getting it wrong.
     deliver(blockOnlyFresh, {
       type: "progress",
       id: "webchannel-preview",
@@ -1427,14 +1433,12 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
     deliver(blockOnlyFresh, { type: "turn_settled", turnId: "T", outcome: "ok" });
 
     expect(blockOnlyFresh.getState().messages.map((m) => m.id)).toEqual([
-      "webchannel-preview",
       "webchannel-fallback-a",
     ]);
     expect(blockOnlyFresh.getState().messages.map((m) => m.text)).toEqual([
-      "Working…",
       "A authorized block",
     ]);
-    expect(blockOnlyFresh.getState().messages.map((m) => m.working)).toEqual([false, false]);
+    expect(blockOnlyFresh.getState().messages.map((m) => m.working)).toEqual([false]);
 
     const lateScaffoldMutation = makeWrapper();
 
@@ -2889,7 +2893,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
 
   // 14. staleness valve (fake timers).
   describe("14: post-reconnect staleness valve", () => {
-    it("expires a wedged working draft after the grace, in place, and releases held", () => {
+    it("expires a wedged working draft after the grace and releases held", () => {
       vi.useFakeTimers();
       const w = makeWrapper();
       goOnline(w);
@@ -2899,10 +2903,11 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       fireSession(w);
 
       vi.advanceTimersByTime(30_000);
-      const draft = messages(w).find((m) => m.id === "webchannel-d")!;
-      expect(draft.working).toBe(false); // flipped in place
-      expect(draft.id).toBe("webchannel-d"); // id untouched
-      expect(draft.text).toBe("partial…"); // text untouched
+      // #251: the draft never received durable text, so expiry DROPS it rather
+      // than freezing it at "partial…" (this used to assert flipped-in-place with
+      // id and text untouched). What this test is actually about is the release
+      // below: expiry must clear turnInFlight() so the held send goes out.
+      expect(messages(w).some((m) => m.id === "webchannel-d")).toBe(false);
       expect(pendingBubbles(w)).toHaveLength(0); // released
     });
 
@@ -2928,11 +2933,12 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
       fireSession(w);
       vi.advanceTimersByTime(30_000);
-      expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(false);
+      // #251: an unfinalized lane is dropped by expiry, not frozen.
+      expect(messages(w).some((m) => m.id === "webchannel-d")).toBe(false);
 
       deliver(w, { type: "progress", id: "webchannel-d", text: "back alive…", turnId: "T" });
       const drafts = messages(w).filter((m) => m.id === "webchannel-d");
-      expect(drafts).toHaveLength(1); // no duplicate
+      expect(drafts).toHaveLength(1); // no duplicate — the id is REUSED
       expect(drafts[0].working).toBe(true); // re-engaged
     });
 
@@ -2954,13 +2960,15 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       vi.advanceTimersByTime(29_000);
       expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(true); // not yet
       vi.advanceTimersByTime(1_000);
-      expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(false); // now
+      // Expired — and #251 drops the unfinalized lane rather than freezing it, so
+      // "expired" now reads as the bubble being gone.
+      expect(messages(w).some((m) => m.id === "webchannel-d")).toBe(false); // now
     });
 
     // #94: after the per-message lane rotation a single turn leaves N working
     // drafts under N different ids, so the valve has to arm and expire them
     // individually rather than "the draft" of the turn.
-    it("#94: expires EVERY wedged lane of a multi-bubble turn, each in place", () => {
+    it("#94: expires EVERY wedged lane of a multi-bubble turn (#251: each is dropped)", () => {
       vi.useFakeTimers();
       const w = makeWrapper();
       goOnline(w);
@@ -2972,20 +2980,19 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       fireSession(w); // arm: the watch set takes ALL THREE ids
 
       vi.advanceTimersByTime(30_000);
-      const byId = (id: string) => messages(w).find((m) => m.id === id)!;
       // Arming iterates every `working` message, so one wedged turn arms N
       // entries and the single grace timer expires all of them together. Leaving
       // any one lane `working` would keep turnInFlight() true and the composer
       // wedged — the exact lockout this valve exists to prevent.
-      for (const [id, text] of [
-        ["webchannel-a", "A partial…"],
-        ["webchannel-b", "B partial…"],
-        ["webchannel-c", "C partial…"],
-      ] as const) {
-        expect(byId(id).working).toBe(false); // flipped
-        expect(byId(id).id).toBe(id); // id untouched
-        expect(byId(id).text).toBe(text); // text untouched
+      //
+      // #251: none of the three ever received durable text, so all three are
+      // DROPPED rather than frozen at their partials (this used to assert
+      // flipped-in-place with ids and texts untouched). The lockout property is
+      // unchanged and is what the release below still proves.
+      for (const id of ["webchannel-a", "webchannel-b", "webchannel-c"] as const) {
+        expect(messages(w).some((m) => m.id === id)).toBe(false);
       }
+      expect(messages(w).some((m) => m.working)).toBe(false); // nothing left wedged
       expect(pendingBubbles(w)).toHaveLength(0); // released
     });
 
@@ -3027,25 +3034,36 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
 
         vi.advanceTimersByTime(30_000);
         const byId = (id: string) => messages(w).find((m) => m.id === id)!;
-        expect(byId("webchannel-a").working).toBe(false); // expired
-        expect(byId("webchannel-c").working).toBe(false); // expired
+        // #251: A and C never received durable text, so expiring them DROPS them
+        // (this used to assert working:false with "A partial…"/"C partial…"
+        // intact). The property under test is untouched — expiry reached exactly
+        // the two lanes that were not disarmed.
+        expect(messages(w).some((m) => m.id === "webchannel-a")).toBe(false); // expired
+        expect(messages(w).some((m) => m.id === "webchannel-c")).toBe(false); // expired
+        // B was disarmed inside the grace and survives either way: the
+        // `agent_message` variant gave it durable text, and the `progress`
+        // variant left it still live (`working: true`), which is not a spent
+        // draft.
         expect(byId("webchannel-b").working).toBe(expectedBWorking);
         expect(byId("webchannel-b").text).toBe(expectedBText);
-        // Expiry flips only working state; sibling ids/text remain intact.
-        expect(byId("webchannel-a").text).toBe("A partial…");
-        expect(byId("webchannel-c").text).toBe("C partial…");
       },
     );
   });
 
-  // 15. turn_settled with matching turnId finalizes a lingering draft.
-  it("15: turn_settled finalizes a lingering working draft whose turnId matches", () => {
+  // 15. turn_settled with matching turnId settles a lingering draft — and #251
+  // makes "settle" mean DROP for a lane that never received durable text.
+  it("15: turn_settled drops a lingering working draft whose turnId matches (#251)", () => {
     const w = makeWrapper();
     deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
     expect(messages(w)[0].working).toBe(true);
     deliver(w, { type: "turn_settled", turnId: "T" });
-    expect(messages(w)[0].working).toBe(false); // finalized in place
-    expect(messages(w)[0].id).toBe("webchannel-d");
+    // Was: finalized in place, still showing "partial…" forever. Core's built-in
+    // Telegram extension deletes an unfinalized preview at turn end
+    // (`[core] extensions/telegram/src/bot-message-dispatch.ts:2971-2975`), and so
+    // do we now.
+    expect(messages(w)).toHaveLength(0);
+    // The composer still unwedges — that is what the settle is for.
+    expect(w.getState().isTyping).toBe(false);
   });
 
   // 16. approval_request with no working draft → releases.
@@ -3109,9 +3127,10 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     expect(pendingBubbles(w)).toHaveLength(0);
   });
 
-  // 18. Fix B1: explicit /stop finalizes a live working draft in place, unwedging
-  //     the composer even with no disconnect (socket-alive agent death).
-  it("18: explicit /stop finalizes a live working draft in place and unlocks the composer", () => {
+  // 18. Fix B1: explicit /stop settles a live working draft, unwedging the
+  //     composer even with no disconnect (socket-alive agent death). #251: for a
+  //     lane that never received durable text, settling means DROPPING it.
+  it("18: explicit /stop drops a live unfinalized draft (#251) and unlocks the composer", () => {
     const w = makeWrapper();
     goOnline(w);
     const spy = vi.spyOn(inner(w), "sendUserMessage");
@@ -3120,13 +3139,14 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
     expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(true);
 
-    // Explicit /stop: published immediately AND finalizes the draft in place.
+    // Explicit /stop: published immediately AND settles the draft. This used to
+    // assert flipped-in-place with id and text untouched; the lane never became
+    // durable, so it is dropped instead — "stop everything" ends the turn, and
+    // core's built-in Telegram extension deletes an unfinalized preview at turn
+    // end (`[core] extensions/telegram/src/bot-message-dispatch.ts:2971-2975`).
     w.send("/stop");
     expect(spy).toHaveBeenCalledWith("/stop", expect.any(String));
-    const draft = messages(w).find((m) => m.id === "webchannel-d")!;
-    expect(draft.working).toBe(false); // flipped in place
-    expect(draft.id).toBe("webchannel-d"); // id untouched
-    expect(draft.text).toBe("partial…"); // text untouched
+    expect(messages(w).some((m) => m.id === "webchannel-d")).toBe(false);
 
     // The wedge is unlocked: a subsequent send publishes IMMEDIATELY (not held).
     spy.mockClear();
@@ -3136,19 +3156,26 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     expect(held(w)).toHaveLength(0);
   });
 
-  // 18b. Fix B1 self-heal: a post-/stop progress on the same draft id re-flips it
-  //      working (the turn was actually alive), with no duplicate bubble.
-  it("18b: a post-/stop progress re-flips the same draft working (self-heal, no duplicate)", () => {
+  // 18b. Fix B1 self-heal: a post-/stop progress on the same draft id brings the
+  //      lane back (the turn was actually alive), with no duplicate bubble.
+  it("18b: a post-/stop progress re-materialises the same draft (self-heal, no duplicate)", () => {
     const w = makeWrapper();
     goOnline(w);
     deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
     w.send("/stop");
-    expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(false);
+    // #251: dropped, not frozen at "partial…".
+    expect(messages(w).some((m) => m.id === "webchannel-d")).toBe(false);
 
     deliver(w, { type: "progress", id: "webchannel-d", text: "back alive…", turnId: "T" });
     const drafts = messages(w).filter((m) => m.id === "webchannel-d");
+    // The self-heal is intact: the id is REUSED, so the lane comes back as ONE
+    // bubble that a later final still matches. What the drop costs is the slot —
+    // it re-materialises at the tail. Pinned in
+    // `durable-view-reducer.test.ts` ("late progress after a drop re-materialises
+    // the lane at the TAIL (#251)").
     expect(drafts).toHaveLength(1); // no duplicate bubble
     expect(drafts[0].working).toBe(true); // re-engaged
+    expect(drafts[0].text).toBe("back alive…");
   });
 
   // 18c. Fix B1 scope: an NL abort word ("abort") must NOT finalize a working draft.
