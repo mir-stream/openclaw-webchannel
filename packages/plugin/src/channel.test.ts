@@ -2340,6 +2340,23 @@ describe("webchannel inbound round-trip", () => {
     },
   );
 
+  /**
+   * The held lane is the THIRD message, and that is load-bearing rather than
+   * incidental.
+   *
+   * A block reservation picks its barrier lane from lane STATE — the earliest
+   * still-unresolved lane, else the lane being streamed now — so the reservation
+   * this fixture is about lands on the text-less second lane. A barrier holds
+   * SUCCESSORS, never its own lane, so the ordering this asserts is only
+   * observable if a later lane exists to be held. Without the third boundary the
+   * reservation guards nothing, and the fixture goes green even when a notice
+   * settlement wrongly retires it (measured while writing this: the shape with
+   * "B draft" on the barrier's own lane passes with `disposition.kind` replaced
+   * by a hardcoded `"block"`).
+   *
+   * The expected wire order is unchanged by that boundary: the second lane is
+   * text-less and emits nothing.
+   */
   it.each([
     "isStatusNotice",
     "isFallbackNotice",
@@ -2387,6 +2404,9 @@ describe("webchannel inbound round-trip", () => {
                 assistantMessageIndex: 0,
               },
             },
+            // Closes the text-less lane the reservation attached to, so the
+            // barrier has a successor to hold (see the docblock).
+            { boundary: true },
             { partial: { text: "B draft" } },
             { deliverBlock: actualNotice },
             {

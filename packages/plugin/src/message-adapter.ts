@@ -208,10 +208,24 @@ type AssistantDraftLane = {
    * identity, so its block cannot be matched and degrades to independent
    * delivery (recovery preserved).
    *
-   * DELIBERATELY SEPARATE from the barrier/reservation system, which keys off
-   * `lane.generation` via the knowingly-off-by-one `assistantMessageIndexMatchesLane`
-   * (:1401). This field is used ONLY by `laneForAssistantMessageIndex` for the
-   * #172 block-suppression decision and never feeds ordering.
+   * DELIBERATELY SEPARATE from the barrier/reservation system, which picks its
+   * lanes from lane STATE: no ordinal chooses a LANE there. That is the whole of
+   * the claim — the reservation system still READS the ordinal in three live
+   * places (it stores it on the reservation, it arms an indexless reservation's
+   * lane, and `outstandingRecordsAtIndex`/`retireOneRecordAtIndex` match on it to
+   * retire a barrier), and every one of those is load-bearing. Do not read
+   * "separate" as "the ordinal is unused over there" and delete a read on that
+   * basis; a review pass did exactly that to the arming branch and measured 19
+   * red, all of them "the next lane never streams".
+   *
+   * This field is used ONLY by `laneForAssistantMessageIndex` for the #172
+   * block-suppression decision and never feeds ordering.
+   *
+   * That separation is the whole point, so keep it: this stamp answers "which
+   * assistant message does this lane carry", which is a rendering question about
+   * a lane that already exists. It must never be inverted into "which lane does
+   * this record belong to" — an ordinal deciding a record's lane is the
+   * forbidden move (plan §0.2 N5), whatever the base arithmetic.
    */
   assistantMessageIndex?: number;
   /** Assigned only after a successful first wire frame for this lane. */
@@ -1060,9 +1074,10 @@ export function createProgressDraftController(params: {
     );
 
   // #172: the lane carrying core's assistant message `assistantMessageIndex`, by
-  // the sound per-message stamp (NOT the barrier system's generation mapping).
-  // Read-only. Undefined for an unstamped index (no boundary opened a lane for
-  // it — e.g. a fail-safe rotation) or an indexless block.
+  // the sound per-message stamp this controller wrote itself. Read-only, and
+  // used ONLY for the #172 block-suppression decision — it never picks the lane
+  // a record attaches to. Undefined for an unstamped index (no boundary opened a
+  // lane for it — e.g. a fail-safe rotation) or an indexless block.
   const laneForAssistantMessageIndex = (
     assistantMessageIndex: number | undefined,
   ): AssistantDraftLane | undefined => {
@@ -1111,12 +1126,21 @@ export function createProgressDraftController(params: {
   ): AssistantDraftLane[] | undefined => {
     // A block queued ANYWHERE in this turn and not yet retired means we cannot
     // know a text-less predecessor is genuinely empty — its body may still be in
-    // flight. Deliberately turn-wide and lane-agnostic: which lane a reservation
-    // attached to (or whether it attached at all) is decided by
-    // `assistantMessageIndexMatchesLane`, whose index base is known-unsound on
-    // the pinned core, so the release must not depend on that answer. With a
-    // block outstanding we fall back to the documented turn-bounded delay, which
-    // `retireReservation` and terminal drain both clear.
+    // flight, and "text-less" is exactly what a lane whose only content is an
+    // undelivered block looks like. Releasing on that evidence would let the
+    // successor stream ahead of a block still on its way, which is a permanent
+    // bubble inversion, not a delay.
+    //
+    // Deliberately turn-wide and lane-agnostic, and it stays that way now that
+    // reservations attach by lane state rather than by an ordinal comparison.
+    // Attachment answers "which lane is held", which is a strictly narrower
+    // question than "is any block still owed in this turn" — a reservation whose
+    // own lane is the current one holds no successor at all, and this gate is
+    // what still covers that. It never depended on the attachment answer and
+    // must not start depending on it.
+    //
+    // With a block outstanding we fall back to the documented turn-bounded
+    // delay, which `retireReservation` and terminal drain both clear.
     if (state.blockReservations.some((reservation) => reservation.state === "pending")) {
       return undefined;
     }
@@ -1488,54 +1512,6 @@ export function createProgressDraftController(params: {
     }
   };
 
-  const assistantMessageIndexMatchesLane = (
-    assistantMessageIndex: number,
-    lane: AssistantDraftLane,
-  ): boolean => {
-    // KNOWN-UNSOUND ON THE PINNED CORE, and tolerated deliberately.
-    //
-    // Core stamps the queued-block context from the same payload metadata the
-    // delivery seam reads, and that stream is 1-BASED (measured on a real
-    // gateway: message A = 1, B = 2). Lane generations are 0-based, so this
-    // predicate is wrong on EVERY indexed turn, not in some edge case:
-    //   - it matches A's reservation (index 1) against lane generation 1 = B, so
-    //     the barrier lands on the SUCCESSOR, which never blocks that lane's own
-    //     progress (`predecessorsResolved` looks only at predecessors); and
-    //   - more commonly, when the block is queued while its own lane is still
-    //     current, generation 1 does not exist yet, `state.lanes.find` returns
-    //     undefined and NO barrier is created at all until the next rotation.
-    //
-    // An earlier version of this comment called the consequence a turn-bounded
-    // delay. That stopped being true when the empty-predecessor release timer
-    // landed: a mis-attached (or unattached) reservation leaves the real
-    // predecessor text-less with an empty barrier list, i.e. releasable, and the
-    // successor then streams ahead of a block that is still in flight —
-    // inverting the two bubbles rather than delaying one.
-    //
-    // What makes tolerating it safe is `releasableEmptyPredecessors`, which
-    // refuses to release while ANY reservation in the turn is still pending,
-    // whatever lane it did or did not attach to. Correcting the mapping itself
-    // needs a real index→lane identity and belongs to #111; guessing an offset
-    // here would bind us to an observed core version instead of a contract.
-    return assistantMessageIndex === lane.generation;
-  };
-
-  const attachIndexedReservations = (lane: AssistantDraftLane): void => {
-    if (!state.lateReservationEpochOpen) return;
-    for (const reservation of state.blockReservations) {
-      if (
-        reservation.state !== "pending" ||
-        reservation.barrierGeneration !== undefined ||
-        reservation.assistantMessageIndex === undefined ||
-        !assistantMessageIndexMatchesLane(reservation.assistantMessageIndex, lane)
-      ) {
-        continue;
-      }
-      reservation.barrierGeneration = lane.generation;
-      lane.tentativeBarrierReservationIds.push(reservation.token);
-    }
-  };
-
   const closeAndRotate = (): void => {
     const lane = currentLane();
     resolveDeferredAngleMarkerTail(lane);
@@ -1552,7 +1528,12 @@ export function createProgressDraftController(params: {
     }
     const next = newLane(lane.generation + 1);
     state.lanes.push(next);
-    attachIndexedReservations(next);
+    // No late attachment pass here on purpose. Every block reservation picks its
+    // barrier lane from LANE STATE at queue time (`noteBlockReplyQueued`), so
+    // there is no such thing as a reservation still waiting for the lane that
+    // will "match" it. The rotation-time rescan that used to live here existed
+    // only to retry an ordinal→generation comparison; see the reservation
+    // docblock for why that comparison is gone.
     releaseReadyLanes({ emitCurrentProgress: false });
   };
 
@@ -1621,6 +1602,16 @@ export function createProgressDraftController(params: {
    * retiring one record per settlement drains them all whatever order they
    * arrive in, and the block reservation — the only record that is an ordering
    * barrier — is released last at its index.
+   *
+   * CALLER DEPENDENCY, so a change here does not silently break it:
+   * `noteBlockReplyQueued`'s arming branch is a capability test on THIS
+   * function. It arms a lane exactly when a reservation is un-retirable before
+   * drain, and "un-retirable" means precisely what this function refuses — the
+   * `undefined` bail below, and the strict-equality index match in
+   * `outstandingRecordsAtIndex`. Widen either one so that indexless records can
+   * be matched, and that arming predicate becomes wrong: it would keep arming
+   * lanes that are now retirable, over-holding them. (Safe direction — it stalls,
+   * it never inverts — but it is still a stall, so go update the branch.)
    */
   const retireOneRecordAtIndex = (
     assistantMessageIndex: number | undefined,
@@ -2144,28 +2135,64 @@ export function createProgressDraftController(params: {
           state.blockReservations.push(reservation);
           if (reservation.state === "retired") return;
 
-          let barrierLane: AssistantDraftLane | undefined;
-          if (input.assistantMessageIndex !== undefined) {
-            barrierLane = state.lanes.find(
-              (lane) => assistantMessageIndexMatchesLane(input.assistantMessageIndex!, lane),
+          // ONE attachment path for every reservation, indexed or not, keyed on
+          // LANE STATE alone.
+          //
+          // There used to be a second path that picked the barrier lane by
+          // comparing `input.assistantMessageIndex` to `lane.generation`. It is
+          // deleted, and not because the comparison had the wrong base: there is
+          // no sound ordinal→lane mapping to correct it to. The ordinal is a
+          // source-stream counter core resets per subscription, and using it as
+          // the key that decides WHICH lane a record belongs to is the
+          // self-inflicted #215/#223 defect (plan §0.2 N5, §16.5 precision note
+          // 1). Core's own Telegram extension draws the same line: it reads the
+          // ordinal as a block-ROTATION hint and never as an identity key.
+          //
+          // Lane state answers the question the ordinal was being asked for, and
+          // answers it soundly: the earliest lane that is still unresolved is the
+          // one a block can still be owed to, and if none is, the block belongs
+          // to the message being streamed right now.
+          const unresolvedCandidates = state.lanes.filter(
+            (lane) => lane.resolution === "unresolved",
+          );
+          if (unresolvedCandidates.length > 1) {
+            warn(
+              `ambiguous block reservation has ${unresolvedCandidates.length} ` +
+                "unresolved predecessors; retaining the earliest ordering barrier",
             );
-          } else {
-            const unresolvedCandidates = state.lanes.filter(
-              (lane) => lane.resolution === "unresolved",
-            );
-            if (unresolvedCandidates.length > 1) {
-              warn(
-                `ambiguous indexless block reservation has ${unresolvedCandidates.length} ` +
-                  "unresolved predecessors; retaining the earliest ordering barrier",
-              );
-            }
-            barrierLane =
-              state.lanes.find((lane) => lane.acceptsLateIndexlessReservations) ??
-              unresolvedCandidates[0] ??
-              currentLane();
+          }
+          const barrierLane =
+            state.lanes.find((lane) => lane.acceptsLateIndexlessReservations) ??
+            unresolvedCandidates[0] ??
+            currentLane();
+          // Arming is about RETIRABILITY, not about which lane was chosen above —
+          // the choice is already made, and the same way for both kinds.
+          //
+          // A settlement carries an `assistantMessageIndex`, and
+          // `retireOneRecordAtIndex` uses it to retire the one pending record
+          // that settled. An INDEXLESS reservation can never be matched that way,
+          // so nothing short of terminal drain can prove it is done, and its lane
+          // stays armed. An indexed one is individually retirable, so arming it
+          // would only stall its lane's successor until drain (measured: the
+          // whole M6b/M6h/M6u/I11/I18 family goes red, all as "B never streams").
+          // This is lifecycle bookkeeping, the same category as
+          // `outstandingRecordsAtIndex`; it is not an ordinal deciding a lane.
+          //
+          // ARMING HAS TWO EFFECTS, and the second one reaches further than the
+          // flag's name suggests. It keeps this lane from pre-resolving to
+          // `"empty"` when its barrier list empties — that is the local one. It
+          // also makes the `find(acceptsLateIndexlessReservations)` lookup above
+          // return this lane FIRST, and that lookup is now on the single unified
+          // path, so the armed lane captures the next reservation of EITHER kind,
+          // not just the next indexless one. Consequence worth stating plainly:
+          // whether reservation N carried an ordinal transitively selects the
+          // barrier lane for reservation N+1. That is still lane state deciding —
+          // the flag is lane state — but it is the one place where an ordinal's
+          // presence has a downstream effect on a lane choice, so a change to the
+          // condition below is not local to this statement.
+          if (input.assistantMessageIndex === undefined) {
             barrierLane.acceptsLateIndexlessReservations = true;
           }
-          if (!barrierLane) return;
           reservation.barrierGeneration = barrierLane.generation;
           barrierLane.tentativeBarrierReservationIds.push(reservation.token);
         },
@@ -2207,9 +2234,12 @@ export function createProgressDraftController(params: {
           // case — bookkeeping above (disposition + barriers) is untouched, so
           // the ordering/release gate is unaffected.
           //
-          // The match uses the sound per-message stamp (see the lane field and
-          // boundary-counter docblocks), NOT the barrier system's generation
-          // mapping.
+          // The match uses the sound per-message stamp this controller wrote
+          // itself (see the lane field and boundary-counter docblocks). It is a
+          // RENDERING decision about a lane that already exists — "has this lane
+          // already shown this text" — and deliberately not an attachment
+          // decision: no ordinal picks which lane a record belongs to anywhere in
+          // this controller (plan §0.2 N5).
           //
           // PREDICATE = `streamedVisibleAnswerText && !laneTerminalSuppressed`,
           // i.e. the lane streamed visible answer text and is either MATERIALIZED
@@ -2273,10 +2303,24 @@ export function createProgressDraftController(params: {
           if (kind === "error") {
             // Retires nothing on purpose: an adapter error says a delivery
             // failed, not WHICH record it belonged to, and this seam has no
-            // payload to classify. Terminal drain clears whatever is left. Note
-            // the cost is now turn-wide rather than per-lane — a reservation
-            // surviving here keeps the empty-predecessor release gate closed for
-            // the rest of the turn — which is the price of not guessing.
+            // payload to classify. Terminal drain clears whatever is left.
+            //
+            // PRICE THE COST HONESTLY, because it grew. A reservation surviving
+            // here still keeps the turn-wide empty-predecessor release gate
+            // closed, and it now ALSO hard-holds the lane it attached to: since
+            // #238 every reservation attaches to a real lane, so the barrier
+            // token sits on that lane's list, `laneOrderResolved` refuses it, and
+            // `predecessorsResolved` blocks every successor. No timer clears
+            // that — `releasableEmptyPredecessors` bails on the same pending
+            // reservation — so the successor streams NOTHING and arrives only as
+            // its terminal frame at drain.
+            //
+            // Measured: lane A streams "A text", A's block is queued at core's
+            // real ordinal 1, this error fires, then B streams "B text". Before
+            // #238 the wire carried B's progress frame pre-drain; now it does
+            // not. That is the intended conservative direction — an ordering
+            // barrier we cannot prove is discharged is held, not guessed away —
+            // but it is a stalled lane, not merely a disarmed timer.
             warn("delivery adapter reported an error; ambiguous reservations await terminal drain");
           } else if (kind === "settled") {
             // `onDeliverySettled` carries no payload — core hands this seam only
