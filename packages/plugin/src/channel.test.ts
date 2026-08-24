@@ -348,21 +348,35 @@ describe("webchannel plugin", () => {
     const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
     const plugin = createWebChannelPlugin(transport) as any;
 
-    const result = await plugin.outbound.sendText({ to: "web-anon", text: "core says hi" });
+    // TWO sends, because the id must be FRESH PER DELIVERY ACT and one send
+    // cannot show that. The client keys durable bubbles by id
+    // (`upsertMessage(id, …)`, nats-client-wrapper.ts), so a cached or reused
+    // id would collapse every core-initiated message into ONE bubble,
+    // overwritten in place instead of appended.
+    const first = await plugin.outbound.sendText({ to: "web-anon", text: "core says hi" });
+    const second = await plugin.outbound.sendText({ to: "web-anon", text: "core says hi again" });
 
-    // Behavior preservation: one send, same peer, same text.
-    expect(sendTextSpy).toHaveBeenCalledTimes(1);
+    // Behavior preservation: one send per call, same peer, same texts.
+    expect(sendTextSpy).toHaveBeenCalledTimes(2);
     expect(sendTextSpy.mock.calls[0]![0]).toBe("web-anon");
     expect(sendTextSpy.mock.calls[0]![1]).toBe("core says hi");
+    expect(sendTextSpy.mock.calls[1]![1]).toBe("core says hi again");
 
     // The whole point of this site: core's receipt id and the client's bubble
     // id must be ONE id. Before #238 the frame went out id-less while core got
     // a separately fabricated `webchannel-${Date.now()}` — two names for one
     // message. Guard against a vacuous `undefined === undefined` pass first.
     const frameId = sendTextSpy.mock.calls[0]![2];
-    expect(typeof frameId).toBe("string");
-    expect(frameId).not.toBe("");
-    expect(result.messageId).toBe(frameId);
+    const secondFrameId = sendTextSpy.mock.calls[1]![2];
+    for (const id of [frameId, secondFrameId]) {
+      expect(typeof id).toBe("string");
+      expect(id).not.toBe("");
+    }
+    expect(first.messageId).toBe(frameId);
+    expect(second.messageId).toBe(secondFrameId);
+    // ...and each act gets its OWN name. A hard-coded constant satisfies every
+    // per-call assertion above while making all of them one bubble forever.
+    expect(secondFrameId).not.toBe(frameId);
   });
 
   it("#238 site 3: the id is minted before the send, and a failed send still throws", async () => {

@@ -1845,21 +1845,43 @@ describe("handleInboundMessage — #238 identity at the delivery act", () => {
     });
     const { transport, texts } = makeFakeTransport();
 
+    // TWO thrown turns, because the id must be FRESH PER DELIVERY ACT and one
+    // send cannot show that. The client keys durable bubbles by id
+    // (`upsertMessage(id, …)`, nats-client-wrapper.ts), so a cached or reused
+    // id would silently collapse every apology across every turn and peer into
+    // ONE bubble, overwritten in place instead of appended.
     await handleInboundMessage(api, transport, "peer-1", {
       type: "user_message",
       text: "this turn throws",
       id: "turn-apology",
     });
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "this turn throws too",
+      id: "turn-apology-2",
+    });
 
-    // Behavior preservation: still exactly one apology bubble, same text, same
-    // turnId — only the id is new.
-    expect(texts).toHaveLength(1);
-    expect(texts[0]!.text).toBe(
-      "Sorry — something went wrong while answering. Please try again.",
-    );
-    expect(texts[0]!.turnId).toBe("turn-apology");
-    expect(typeof texts[0]!.id).toBe("string");
-    expect(texts[0]!.id).not.toBe("");
+    // Behavior preservation: still exactly one apology bubble per thrown turn,
+    // same text, each under its own turnId — only the id is new.
+    expect(texts).toHaveLength(2);
+    for (const frame of texts) {
+      expect(frame.text).toBe(
+        "Sorry — something went wrong while answering. Please try again.",
+      );
+      expect(typeof frame.id).toBe("string");
+      expect(frame.id).not.toBe("");
+    }
+    expect(texts.map((frame) => frame.turnId)).toEqual([
+      "turn-apology",
+      "turn-apology-2",
+    ]);
+    // Fresh per act, and DISTINCT FROM THE TURN ID. Both halves are load-
+    // bearing: reusing the turnId as the message id passes any "non-empty
+    // string" check while giving one turn's apology the same name as its turn,
+    // and a hard-coded constant passes every per-frame check while making all
+    // apologies one bubble forever.
+    expect(texts[0]!.id).not.toBe(texts[1]!.id);
+    for (const frame of texts) expect(frame.id).not.toBe(frame.turnId);
   });
 });
 

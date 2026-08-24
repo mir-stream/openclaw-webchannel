@@ -121,6 +121,8 @@ turn_snapshot은 **완전한 턴 기록이 아니라 교정 패치다.** 계약(
 
 ### 3.3 [실측] off/block 모드엔 답변 id가 아예 없다 — 스코프 경계 — [우리코드]
 
+> ⛔ **이 절의 두 주장은 SUPERSEDED다 (#238 / PR #250 랜딩).** 이제 플러그인이 **모든 배달 행위(delivery act)에서 id를 민팅**하며 off/block의 plain send도 포함한다. 그래서 (a) 아래 `sendText(wsKey, text, undefined, turnId)`만 나가고 client가 `a-N`을 자체 발급한다는 **[실측]은 더 이상 성립하지 않고**, (b) "off/block의 durable id는 **분리된 후속**"이라는 스코프 판정도 종료됐다 — 그 후속이 #238이고 이미 랜딩했다. 식별자 최종 판정은 **§16.5**. 아래 본문은 **당시 측정 기록(역사)** 으로만 남긴다.
+
 - `turn_snapshot`/draft는 `streaming.mode ∈ {partial, progress}`에서만 생긴다(`inbound.ts:1014-1017`). "block"/"off"는 draft 없음(`inbound.ts:985`) → snapshot 없음 → 답변 id 없음. `sendText(wsKey, text, undefined, turnId)`만 나가고 client가 `a-N` 자체 발급(`nats-client-wrapper.ts:2562`).
 - 플러그인 기본 streaming 모드는 "off"(`message-adapter.ts:146-149`). **단 [실측] 제품/데모는 partial로 돈다** — `run.sh:287`이 `"streaming":{"mode":"partial"}` 설정(`docs/gaps/P0_CORE_CHAT_GAPS.md:472-473`). ⚠️ operator가 `channels add`로 수동 등록하며 mode를 안 주면 "off" → journal-only history가 비어 **회귀**. off-mode history 연속성은 §6에서 처리(전환기엔 off/block에 `getSessionMessages` fallback 유지).
 - **그러나 #212 identity 버그(#173/#172/#104 …)는 전부 partial 모드에서 발생**한다 — lane/다중답변이 거기만 존재(`docs/gaps/P1_RICH_UX_GAPS.md`). off/block은 답변당 plain send라 그 오배송·재구성 버그가 안 생긴다.
