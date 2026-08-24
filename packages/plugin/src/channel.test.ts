@@ -31,6 +31,15 @@ import {
 import type { ReasoningOptOutStoreAccess } from "./reasoning-opt-out.js";
 
 /**
+ * #238: every durable-text egress site now mints its own id AT the delivery act,
+ * so the `id` argument of `sendText` is a non-empty plugin-minted string on
+ * paths that used to pass `undefined` and let the client invent an `a-N`.
+ * Matched by non-emptiness on purpose — the id SHAPE is `nextMessageId`'s
+ * business (message-adapter.ts), not each call site's.
+ */
+const MINTED_ID = expect.stringMatching(/\S/);
+
+/**
  * Unit-level adapter: production callers must supply the immutable tenant from
  * the startup serving plan. Every fake runtime in this file is bound to the
  * same explicit fixture tenant, so keep the individual call sites focused on
@@ -329,6 +338,62 @@ describe("webchannel plugin", () => {
     );
     // D1 caveat: this adapter does not opt into core's error-swallowing path.
     expect(plugin.outbound.bestEffort).not.toBe(true);
+  });
+
+  it("#238 site 3: the core-initiated outbound puts the SAME id on the wire that it reports to core", async () => {
+    const transport = new FakePeerChannel();
+    // `sendText(peerId, text, id, ...)` is what assembles the `agent_message`
+    // frame (nats-channel.ts spreads arg 3 in as `payload.id`), so arg 3 IS the
+    // frame's id.
+    const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    const plugin = createWebChannelPlugin(transport) as any;
+
+    // TWO sends, because the id must be FRESH PER DELIVERY ACT and one send
+    // cannot show that. The client keys durable bubbles by id
+    // (`upsertMessage(id, …)`, nats-client-wrapper.ts), so a cached or reused
+    // id would collapse every core-initiated message into ONE bubble,
+    // overwritten in place instead of appended.
+    const first = await plugin.outbound.sendText({ to: "web-anon", text: "core says hi" });
+    const second = await plugin.outbound.sendText({ to: "web-anon", text: "core says hi again" });
+
+    // Behavior preservation: one send per call, same peer, same texts.
+    expect(sendTextSpy).toHaveBeenCalledTimes(2);
+    expect(sendTextSpy.mock.calls[0]![0]).toBe("web-anon");
+    expect(sendTextSpy.mock.calls[0]![1]).toBe("core says hi");
+    expect(sendTextSpy.mock.calls[1]![1]).toBe("core says hi again");
+
+    // The whole point of this site: core's receipt id and the client's bubble
+    // id must be ONE id. Before #238 the frame went out id-less while core got
+    // a separately fabricated `webchannel-${Date.now()}` — two names for one
+    // message. Guard against a vacuous `undefined === undefined` pass first.
+    const frameId = sendTextSpy.mock.calls[0]![2];
+    const secondFrameId = sendTextSpy.mock.calls[1]![2];
+    for (const id of [frameId, secondFrameId]) {
+      expect(typeof id).toBe("string");
+      expect(id).not.toBe("");
+    }
+    expect(first.messageId).toBe(frameId);
+    expect(second.messageId).toBe(secondFrameId);
+    // ...and each act gets its OWN name. A hard-coded constant satisfies every
+    // per-call assertion above while making all of them one bubble forever.
+    expect(secondFrameId).not.toBe(frameId);
+  });
+
+  it("#238 site 3: the id is minted before the send, and a failed send still throws", async () => {
+    const transport = new FakePeerChannel();
+    // FakePeerChannel does not override sendText, and NullPeerChannel.sendText
+    // returns false unconditionally — so this send fails without any mocking.
+    const sendTextSpy = vi.spyOn(transport, "sendText");
+    const plugin = createWebChannelPlugin(transport) as any;
+
+    await expect(
+      plugin.outbound.sendText({ to: "missing", text: "core says hi" }),
+    ).rejects.toThrow("targeted send returned false for peer missing");
+
+    // Minting must not be conditional on success, and a failure must not be
+    // swallowed: the send was attempted WITH an id, and it still threw.
+    expect(sendTextSpy).toHaveBeenCalledTimes(1);
+    expect(sendTextSpy.mock.calls[0]![2]).toEqual(MINTED_ID);
   });
 
   it("exposes doctor preview warnings and status probing from the common factory", async () => {
@@ -727,10 +792,12 @@ describe("webchannel inbound round-trip", () => {
 
     expect(inboundRun).not.toHaveBeenCalled();
     expect(error).toHaveBeenCalledTimes(1);
+    // #238 site 2: the thrown-turn apology is a real durable bubble, so it now
+    // carries a plugin-minted id. Text and `turnId` are unchanged.
     expect(sendSpy).toHaveBeenCalledWith(
       "alice",
       "Sorry — something went wrong while answering. Please try again.",
-      undefined,
+      MINTED_ID,
       "acked-route-fault",
     );
     expect(settledSpy).toHaveBeenCalledTimes(1);
@@ -771,8 +838,9 @@ describe("webchannel inbound round-trip", () => {
     // The recorded reply `to` lines up with the socket-map key we deliver to.
     expect(captured.recordedTo).toBe("web-anon");
     // The reply was delivered back through THIS channel to the peer's socket.
-    // No-progress config => plain no-id agent_message (legacy append path).
-    expect(sendSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
+    // No-progress config => the plain append path, which since #238 carries a
+    // plugin-minted id (the client no longer invents `a-N` for it).
+    expect(sendSpy).toHaveBeenCalledWith("web-anon", "hi back", MINTED_ID, expect.any(String));
   });
 
   it("threads accountId into resolveAgentRoute (binding.account routing — Cycle 2)", async () => {
@@ -2132,7 +2200,12 @@ describe("webchannel inbound round-trip", () => {
         "block two",
         "plain final",
       ]);
-      expect(sendTextSpy.mock.calls.every((call) => call[2] === undefined)).toBe(true);
+      // #238 site 1: every no-draft send is its own new bubble, so each carries
+      // a FRESH plugin-minted id — non-empty and never reused across calls.
+      // (Before #238 all three went out id-less and the client minted `a-N`.)
+      const mintedIds = sendTextSpy.mock.calls.map((call) => call[2]);
+      for (const id of mintedIds) expect(id).toEqual(MINTED_ID);
+      expect(new Set(mintedIds).size).toBe(mintedIds.length);
       expect(progressSpy).not.toHaveBeenCalled();
       expect(finalizeSpy).not.toHaveBeenCalled();
     },
@@ -2577,7 +2650,7 @@ describe("webchannel inbound round-trip", () => {
     expect(progressSpy.mock.calls[0][2].split("\n")[0]).toMatch(/…$/);
   });
 
-  it("streaming.mode=block takes the plain no-id agent_message path (no draft — regression)", async () => {
+  it("streaming.mode=block takes the plain agent_message path (no draft — regression)", async () => {
     const transport = new FakePeerChannel();
     const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
@@ -2613,7 +2686,7 @@ describe("webchannel inbound round-trip", () => {
     expect(seenReplyOptions).toEqual({ onAgentRunStart: expect.any(Function) });
     expect(progressSpy).not.toHaveBeenCalled();
     expect(finalizeSpy).not.toHaveBeenCalled();
-    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
+    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", MINTED_ID, expect.any(String));
   });
 
   it("streaming.mode=block with capabilities.reasoning wires ONLY the reasoning callbacks (no tool/answer draft)", async () => {
@@ -2654,7 +2727,7 @@ describe("webchannel inbound round-trip", () => {
     });
     expect(progressSpy).not.toHaveBeenCalled();
     expect(finalizeSpy).not.toHaveBeenCalled();
-    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
+    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", MINTED_ID, expect.any(String));
   });
 
   it.each(["off", "block", "progress", "partial"] as const)(
@@ -3647,7 +3720,7 @@ describe("webchannel inbound round-trip", () => {
     expect(typingSpy).toHaveBeenCalledWith("web-anon");
     // The agent's reply (via sendText) was delivered — proves the typing
     // call is BEFORE agent dispatch, not after.
-    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
+    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", MINTED_ID, expect.any(String));
     // Strict order: typing < sendText.
     const typingOrder = typingSpy.mock.invocationCallOrder[0];
     const sendTextOrder = sendTextSpy.mock.invocationCallOrder[0];

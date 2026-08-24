@@ -397,3 +397,63 @@ describe("nats-account-runtime.ts wiring contract — #99 inbound frame normaliz
     expect(RUNTIME_SOURCE).not.toMatch(/new InboundRetentionBudget\((?!\))/);
   });
 });
+
+describe("nats-account-runtime.ts wiring contract — #238 identity at the delivery act", () => {
+  /**
+   * The command-gate warning notice is this runtime's one durable-text egress
+   * site: a real `agent_message` bubble on the client. Since #238 the plugin —
+   * never the viewer — names every such bubble, so this send must pass a
+   * `nextMessageId()` as `sendText`'s THIRD argument. An id-less send hands the
+   * client an unnamed durable bubble and it falls back to minting `a-N` from a
+   * client-local counter (NOT-list N4/N5).
+   *
+   * Why a SOURCE guard: the call sits inside the message handler closed over by
+   * the module-private `buildNatsAccount`, which this file already documents as
+   * untestable routing (see the #99 block above). The mint (`nextMessageId`) and
+   * the frame assembly (`NatsChannel.sendText`) are covered executably by the
+   * message-adapter and nats-channel tests; this pins the wiring joining them.
+   */
+  // Comments are stripped naively — BOTH kinds — and whitespace collapsed, so
+  // this guard is line-break- and indentation-blind. Both kinds matter: strip
+  // only `//` and a `/* … */` comment quoting the notice send satisfies the
+  // positive assertion below all by itself, which is a false green (measured).
+  // A naive strip is sound in the positive direction because it can only ever
+  // delete real code — i.e. only ever turn a positive assertion RED. It is not
+  // sound in the other direction, which is why the negative guards are
+  // explicitly best-effort.
+  const RUNTIME_FLAT = RUNTIME_SOURCE.replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "")
+    .replace(/\s+/g, " ");
+
+  it("mints the notice's id at the delivery act", () => {
+    // ADJACENCY IS THE ASSERTION — the one non-obvious thing here.
+    // `sendText(peerId, text, id?, turnId?, …)` turns argument 3, and only
+    // argument 3, into `payload.id` on the wire. Requiring the mint to follow
+    // the text argument IMMEDIATELY is sufficient for every realistic edit to
+    // this call: an `undefined` wedged into the id slot — or anything else
+    // between the two — breaks the adjacency and reds this. It is NOT a formal
+    // equivalence; text and mint can be made adjacent somewhere other than an
+    // argument list (a destructured array literal, say). Those are deliberate
+    // rewrites, not drift, and this is a drift guard.
+    //
+    // Hoisting the text or the mint into a `const` reds this too, and that is
+    // intended: per this file's header, a deliberate wiring change gets a
+    // deliberate one-line update here.
+    expect(RUNTIME_FLAT).toMatch(/"commands to an operator allowlist\.", nextMessageId\(\)/);
+  });
+
+  it("mints it through the ONE canonical minter, imported from the adapter", () => {
+    expect(RUNTIME_FLAT).toContain('import { nextMessageId } from "./message-adapter.js";');
+    // Best-effort defense-in-depth, NOT a sound guarantee: the naive strip is
+    // not regex-aware, so a regex literal containing an escaped `//` can hide a
+    // second id shape from it. Making this sound is not worth the machinery.
+    expect(RUNTIME_FLAT).not.toMatch(/`webchannel-\$\{/);
+  });
+
+  it("keeps the notice best-effort: the boolean return stays ignored", () => {
+    // The notice hedges a gate that is deliberately a conservative mirror, so a
+    // failed send must not become a thrown or logged error here.
+    expect(RUNTIME_FLAT).not.toContain("if (!channel.sendText(");
+    expect(RUNTIME_FLAT).not.toMatch(/=\s*channel\.sendText\(/);
+  });
+});

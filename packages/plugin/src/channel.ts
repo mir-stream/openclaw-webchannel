@@ -7,7 +7,7 @@ import type { ChannelDoctorAdapter, ChannelStatusAdapter } from "openclaw/plugin
 
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
-import { createClawMessageAdapter } from "./message-adapter.js";
+import { createClawMessageAdapter, nextMessageId } from "./message-adapter.js";
 import {
   createClawApprovalCapability,
   startClawApprovalMonitor,
@@ -300,12 +300,20 @@ export function createWebChannelPlugin(
           if (!ctx.to) {
             throw new Error("[webchannel] outbound send failed: ctx.to is absent");
           }
-          if (!transport.sendText(ctx.to, ctx.text)) {
+          // #238: ONE id, minted before the send, put on the wire AND reported
+          // back to core. This seam used to fabricate `webchannel-${Date.now()}`
+          // for core's receipt while sending the frame id-less, so core's
+          // receipt id and the client's bubble id were two different names for
+          // the same message (and the fabricated one was millisecond-collision
+          // prone). Mint order matters: the id must exist before the send, and a
+          // failed send still throws exactly as before.
+          const id = nextMessageId();
+          if (!transport.sendText(ctx.to, ctx.text, id)) {
             throw new Error(
               `[webchannel] outbound send failed: targeted send returned false for peer ${ctx.to}`,
             );
           }
-          return { messageId: `webchannel-${Date.now()}` };
+          return { messageId: id };
         },
       },
       // No media in Phase 0. `deliveryMode` is required on the outbound base

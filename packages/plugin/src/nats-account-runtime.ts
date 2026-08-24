@@ -21,6 +21,7 @@ import { createCapacityDiagnostics } from "./capacity-diagnostics.js";
 import { resolveEncryptionPolicy } from "./encryption-policy.js";
 import type { WebchannelEncryptionConfig } from "./encryption-policy.js";
 import { createWebChannelPlugin } from "./channel.js";
+import { nextMessageId } from "./message-adapter.js";
 import {
   handleInboundMessage,
   startAgentLifecycleSubscription,
@@ -1169,11 +1170,15 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           // false positive is only an extra hedged message, never a missed one.
           // Best-effort send (ignore the boolean return), matching the rest of
           // the outbound surface.
+          // #238: this notice is a real durable bubble, so the plugin mints its
+          // id at the delivery act rather than letting the viewer name it. Still
+          // best-effort — the boolean return stays deliberately ignored.
           if (commandGate.delegated && !commandGate.isListed(peerId)) {
             channel.sendText(
               peerId,
               "Stop may not be permitted for this user: this agent restricts " +
                 "commands to an operator allowlist.",
+              nextMessageId(),
             );
           }
           return;
