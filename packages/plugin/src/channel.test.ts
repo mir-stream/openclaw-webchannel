@@ -367,7 +367,8 @@ describe("webchannel plugin", () => {
 
   it("#238 site 3: the id is minted before the send, and a failed send still throws", async () => {
     const transport = new FakePeerChannel();
-    // NullPeerChannel.sendText returns false for an unmapped peer.
+    // FakePeerChannel does not override sendText, and NullPeerChannel.sendText
+    // returns false unconditionally — so this send fails without any mocking.
     const sendTextSpy = vi.spyOn(transport, "sendText");
     const plugin = createWebChannelPlugin(transport) as any;
 

@@ -436,6 +436,69 @@ describe("nats-account-runtime.ts wiring contract — #238 identity at the deliv
   const GATE_END = RUNTIME_SOURCE.indexOf("return;", GATE_START);
   const NOTICE_BLOCK =
     GATE_START < 0 || GATE_END < 0 ? "" : RUNTIME_SOURCE.slice(GATE_START, GATE_END);
+
+  /**
+   * Drop line comments (`//` to EOL) and block comments from `src`, preserving
+   * everything else byte-for-byte (newlines included, so the code keeps shape).
+   * Returns `null` — never a partial result — if a literal or a block comment
+   * is left unterminated, so a caller that FAILS on `null` fails closed.
+   *
+   * Why strip up front instead of teaching the argument scanner about comments:
+   * this call site is unusually comment-dense (nats-account-runtime.ts has ~15
+   * lines of rationale immediately above the send), and a comment placed INSIDE
+   * the argument list used to false-red the mint guard — an apostrophe in
+   * `// don't reorder these` opened a phantom string literal, and a comma in
+   * `// slots are peer, text, id` split a phantom argument. That is exactly the
+   * misleading-red-on-a-correct-change class this whole block exists to avoid,
+   * and one dedicated pass kills it for every assertion at once instead of
+   * adding two more branches to the scanner below.
+   *
+   * The stripper is literal-aware in the one way that matters: a comment opener
+   * INSIDE a string literal is copied through, not treated as a comment start.
+   * It is deliberately NOT regex-literal-aware — a `/`-delimited regex could in
+   * principle hide a quote — because no regex literal can appear here: the
+   * slice is bounded to one `if` block whose entire body is the notice send.
+   * Should one ever appear, the failure mode is an unterminated literal, i.e.
+   * `null`, i.e. RED.
+   */
+  function stripComments(src: string): string | null {
+    let out = "";
+    let i = 0;
+    while (i < src.length) {
+      const ch = src[i];
+      if (ch === '"' || ch === "'" || ch === "`") {
+        // Copy the literal through verbatim (honouring backslash escapes) so a
+        // `//` or `/*` inside the notice text can never start a comment.
+        const start = i;
+        i += 1;
+        while (i < src.length && src[i] !== ch) i += src[i] === "\\" ? 2 : 1;
+        if (i >= src.length) return null; // unterminated literal → fail closed
+        i += 1;
+        out += src.slice(start, i);
+        continue;
+      }
+      if (ch === "/" && src[i + 1] === "/") {
+        while (i < src.length && src[i] !== "\n") i += 1;
+        continue; // the newline itself falls through and is copied
+      }
+      if (ch === "/" && src[i + 1] === "*") {
+        const end = src.indexOf("*/", i + 2);
+        if (end < 0) return null; // unterminated block comment → fail closed
+        i = end + 2;
+        continue;
+      }
+      out += ch;
+      i += 1;
+    }
+    return out;
+  }
+
+  // Every assertion below reads the comment-free code, never the raw slice:
+  // what these tests are about is what the runtime DOES, and prose about the
+  // send must not be able to turn them red or green. `null` (an unterminated
+  // literal or block comment) collapses to `""`, which fails every assertion.
+  const NOTICE_CODE = NOTICE_BLOCK === "" ? "" : (stripComments(NOTICE_BLOCK) ?? "");
+
   /**
    * Parse the argument list of the FIRST `channel.sendText(` call in `src`,
    * returning the top-level arguments trimmed — or `null` if the call is
@@ -460,6 +523,10 @@ describe("nats-account-runtime.ts wiring contract — #238 identity at the deliv
    * argument separator. The current text has none; a future one may.
    * Commas are split at depth 1 only, so `nextMessageId()`'s own parens — or
    * any nested call/array/object — cannot split an argument in half.
+   *
+   * Expects COMMENT-FREE input (see `stripComments` above); it knows nothing
+   * about comments, which is why callers pass `NOTICE_CODE`, never the raw
+   * slice.
    */
   function sendTextArgs(src: string): string[] | null {
     const CALL = "channel.sendText(";
@@ -508,8 +575,10 @@ describe("nats-account-runtime.ts wiring contract — #238 identity at the deliv
     // Guard first: a missing gate makes the slice empty, which would let the
     // assertions below pass vacuously.
     expect(GATE_START).toBeGreaterThan(-1);
-    expect(NOTICE_BLOCK).toContain("commands to an operator allowlist.");
-    const args = sendTextArgs(NOTICE_BLOCK);
+    // The text is asserted on the comment-free code too: a notice quoted in a
+    // comment must not stand in for a notice that is actually sent.
+    expect(NOTICE_CODE).toContain("commands to an operator allowlist.");
+    const args = sendTextArgs(NOTICE_CODE);
     // Parse failure is a FAILURE, never a silent pass.
     expect(args).not.toBeNull();
     // Exactly three arguments, and the third — the id slot — is the mint.
@@ -533,13 +602,16 @@ describe("nats-account-runtime.ts wiring contract — #238 identity at the deliv
     // The notice is a hedge for a gate that is deliberately a conservative
     // mirror; a failed send must not become a thrown or logged error here.
     //
-    // Scoped to NOTICE_BLOCK for the same reason the mint guard is: the
-    // assertion must be about the NOTICE. Whole-file, a legitimate future
-    // egress site elsewhere in this runtime that DOES check its boolean return
-    // — a perfectly correct change — would turn a test named "keeps the notice
+    // Scoped to the notice for the same reason the mint guard is: the assertion
+    // must be about the NOTICE. Whole-file, a legitimate future egress site
+    // elsewhere in this runtime that DOES check its boolean return — a
+    // perfectly correct change — would turn a test named "keeps the notice
     // best-effort" red for reasons that have nothing to do with the notice.
-    expect(NOTICE_BLOCK).toContain("channel.sendText("); // fail closed, not vacuous
-    expect(NOTICE_BLOCK).not.toContain("if (!channel.sendText(");
-    expect(NOTICE_BLOCK).not.toMatch(/=\s*channel\.sendText\(/);
+    // Comment-free for the same reason again: this block's rationale prose
+    // already discusses the ignored boolean return, and prose that NAMES a
+    // forbidden form must not be mistaken for the form itself.
+    expect(NOTICE_CODE).toContain("channel.sendText("); // fail closed, not vacuous
+    expect(NOTICE_CODE).not.toContain("if (!channel.sendText(");
+    expect(NOTICE_CODE).not.toMatch(/=\s*channel\.sendText\(/);
   });
 });
