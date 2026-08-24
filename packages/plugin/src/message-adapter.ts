@@ -931,10 +931,14 @@ export function createProgressDraftController(params: {
     // can name it in `remove` (the client then drops this duplicate). Set at ONE
     // site — the failed-lane recovery block, whose lane is in `answers` by its
     // streamed text. Never a notice, and (since #238) never an overflow final: the
-    // flag's old value there was `streamedLanes.length === finals.length`, which is
-    // mutually exclusive with overflow, so it had no reachable true case. NOT
-    // because an overflow bubble's content never streamed — measured false, it
-    // often has (see the flush's overflow branch).
+    // flag's old value there was `streamedLanes.length === finals.length`, which
+    // UNDER THE NEW CANDIDATE LIST is mutually exclusive with overflow, so it had
+    // no reachable true case. Scope that to the new list — under the OLD one
+    // (`materializedAnswerLanes()`) the two were perfectly compatible: 3 streamed,
+    // 2 materialized, 3 finals made the flag true WITH an overflow, which is the
+    // `remove: [tcId]` base's M212a asserted. And NOT because an overflow bubble's
+    // content never streamed — measured false, it often has (see the flush's
+    // overflow branch).
     options?: { supersedesAnswerLane?: boolean },
   ): boolean => {
     if (!text) {
@@ -1114,7 +1118,7 @@ export function createProgressDraftController(params: {
   // #238 (v6 slice 5): the lanes the buffered-final cursor walks WHEN
   // order-correlation is exact — every lane that STREAMED visible answer text, in
   // generation order. This is deliberately the exact same set `emitTurnSnapshot`
-  // publishes as `answers` (:1770), so a lane the cursor can settle and a lane the
+  // publishes as `answers` (:1775), so a lane the cursor can settle and a lane the
   // snapshot can carry are the same lane.
   //
   // Materialization is NOT required, and that is the point. Core hands the channel
@@ -1802,12 +1806,16 @@ export function createProgressDraftController(params: {
   };
 
   // #238: this used to forward a `supersedesAnswerLane` option for the
-  // overflow-final site. Under cursor semantics an overflow final's content never
-  // streamed, so it is never in the snapshot's `answers` and never removable — the
-  // option had no reachable true case here and is gone. EVERY bubble this function
+  // overflow-final site. The flag's old value there was `streamed.length ===
+  // finals.length`, which under the new candidate list cannot hold at an overflow
+  // (see the flush's overflow branch) — so the option had no reachable true case
+  // here and is gone. That is a CARDINALITY argument and only that: do NOT
+  // paraphrase it as "an overflow final's content never streamed", which is
+  // measured false and is the premise that would justify deleting the bubble.
+  // EVERY bubble this function
   // produces (leading error, stray extra, notice, overflow final) is preserved by
   // the client. `sendIndependent` keeps the option for its one remaining user, the
-  // failed-lane recovery block (:2403), whose duplicate IS provable.
+  // failed-lane recovery block (:2421), whose duplicate IS provable.
   const deliverTerminalIndependent = (text: string): boolean => {
     // ONE STORY, in the order it happens:
     //
@@ -2004,7 +2012,7 @@ export function createProgressDraftController(params: {
       // MEASURED: dropping this conjunct alone leaves the whole suite green — both
       // before and after the shortfall fix. That is not a coverage gap, it is
       // structural: `answerTextIsAuthoritative` has exactly ONE reader
-      // (`emitTurnSnapshot`, :1773) and that reader iterates `streamedAnswerLanes()`,
+      // (`emitTurnSnapshot`, :1778) and that reader iterates `streamedAnswerLanes()`,
       // filtering on the very predicate this conjunct tests, so a lane that would
       // be wrongly marked is never read. DO NOT take that as licence to delete it —
       // the coupling is incidental, the flag's contract is what is being stated, and

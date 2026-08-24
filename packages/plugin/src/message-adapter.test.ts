@@ -437,7 +437,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     // the stray in `remove`. Both halves of that are now obsolete. The cursor
     // routes every final correctly, so:
     //   - the snapshot carries each lane's FULL final text (tA/tB/tC), not the
-    //     truncated last partial — `cursorConsumesEveryCandidate` holds (3 finals,
+    //     truncated last partial — `exactCorrelation` holds (3 finals,
     //     3 streamed candidates), so each final is authoritative for its own lane;
     //   - there is no overflow bubble, so `remove` is empty. That matters beyond
     //     tidiness: the old `remove` entry pointed at tC, whose text existed
@@ -684,7 +684,9 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     //
     // Since #238 the overflow site passes no `supersedesAnswerLane` at all, and the
     // reason is CARDINALITY: the flag's value was `streamedLanes.length ===
-    // finals.length`, which cannot hold when a final overflows. It is NOT that an
+    // finals.length`, which cannot hold when a final overflows the NEW candidate
+    // list. (Under the old one it could, and did — 3 streamed / 2 materialized / 3
+    // finals is base's M212a, flag true with an overflow.) It is NOT that an
     // overflow final's content never streamed — measured false, and the shape that
     // shows it is one boundary away from this one: move C's silence to the MIDDLE
     // (msg2 streams nothing, msg3 streams "C"), and it is tC — msg3's own final,
