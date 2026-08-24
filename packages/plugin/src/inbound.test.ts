@@ -3375,7 +3375,7 @@ describe("handleInboundMessage — approval-origin lease", () => {
     await ordinaryTurn;
   });
 
-  it("rotates the epoch on teardown, refusing requests stamped before it", async () => {
+  it("refuses requests stamped before an approval-stream restart's barrier", async () => {
     const started = deferred();
     const finish = deferred();
     const made = makeFakeApi({
@@ -3397,7 +3397,11 @@ describe("handleInboundMessage — approval-origin lease", () => {
       peerId: "peer-1",
     });
 
-    stopAgentLifecycleSubscription(); // draws a new barrier at 1_030
+    // #267: the barrier is drawn by the approval stream restarting, which in
+    // production is `startClawApprovalMonitor`. Called directly here so this
+    // test stays about the lease WINDOW; where the call lives is pinned
+    // separately in approvals.test.ts.
+    registry.rotateEpoch(); // draws a new barrier at 1_030
     // The same request the registry answered a moment ago is now unattributable:
     // it predates the barrier, so a gateway replay of it cannot be delivered.
     expect(resolveOrigin(made.api, 1_020)).toEqual({ kind: "invalid_request_time" });
@@ -3406,8 +3410,15 @@ describe("handleInboundMessage — approval-origin lease", () => {
     await turnPromise;
   });
 
-  it("never resolves a handle left dormant across the rotation", async () => {
+  it("resolves a handle whose run starts AFTER a rotation, from its real start time (#267)", async () => {
+    // This inverts what #93 originally asserted. The handle's start time is read
+    // at `onAgentRunStart`, not at lease creation, so a run that begins after the
+    // barrier records a post-barrier time and is provable like any other. Gating
+    // on the CREATION epoch instead threw that proof away, and since the barrier
+    // was drawn on ordinary plugin re-registration it happened on every turn:
+    // every approval was dropped as `active_no_match`.
     let afterLateStart: unknown;
+    let beforeLateStart: unknown;
     const started = deferred();
     const finish = deferred();
     const made = makeFakeApi({
@@ -3419,7 +3430,11 @@ describe("handleInboundMessage — approval-origin lease", () => {
         nowMs = 1_040;
         turn.replyOptions?.onAgentRunStart?.("run-1");
         nowMs = 1_060;
+        // Created after the barrier AND after the run started: deliverable.
         afterLateStart = resolveOrigin(made.api, 1_050);
+        // Created after the barrier but BEFORE the run started: still refused —
+        // strict ordering is untouched by #267.
+        beforeLateStart = resolveOrigin(made.api, 1_035);
       },
     });
     const { transport } = makeFakeTransport();
@@ -3427,14 +3442,50 @@ describe("handleInboundMessage — approval-origin lease", () => {
     const turnPromise = handleInboundMessage(made.api, transport, "peer-1", ordinary);
     await started.promise;
     nowMs = 1_030;
-    stopAgentLifecycleSubscription(); // barrier 1_030, epoch rotated
+    registry.rotateEpoch(); // barrier 1_030, epoch rotated
 
     finish.resolve();
     await turnPromise;
 
-    expect(afterLateStart).toEqual({ kind: "no_match" });
+    expect(afterLateStart).toEqual({ kind: "resolved", peerId: "peer-1" });
+    expect(beforeLateStart).toEqual({ kind: "no_match" });
+    // The outer `finally` still releases it, so nothing survives the turn.
     nowMs = 1_080;
     expect(resolveOrigin(made.api, 1_070)).toEqual({ kind: "no_match" });
+  });
+
+  it("draws NO barrier when the agent-lifecycle subscription is torn down (#267)", async () => {
+    // The regression guard for the outage: `registerFull` wires both ends of
+    // this seam and the host re-registers plugins several times per turn, so a
+    // barrier here fences off the in-flight turn's own lease.
+    const started = deferred();
+    const finish = deferred();
+    const made = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        nowMs = 1_010;
+        turn.replyOptions?.onAgentRunStart?.("run-1");
+        started.resolve();
+        await finish.promise;
+      },
+    });
+    const { transport } = makeFakeTransport();
+
+    const turnPromise = handleInboundMessage(made.api, transport, "peer-1", ordinary);
+    await started.promise;
+    nowMs = 1_030;
+    stopAgentLifecycleSubscription();
+
+    nowMs = 1_060;
+    // No barrier was drawn, so a request older than the teardown is still
+    // answerable — the teardown is not a replay boundary.
+    expect(resolveOrigin(made.api, 1_020)).toEqual({
+      kind: "resolved",
+      peerId: "peer-1",
+    });
+
+    finish.resolve();
+    await turnPromise;
   });
 
   it("keeps a run active across the rotation, post-barrier only, released by its own finally", async () => {
@@ -3454,7 +3505,7 @@ describe("handleInboundMessage — approval-origin lease", () => {
     const turnPromise = handleInboundMessage(made.api, transport, "peer-1", ordinary);
     await started.promise;
     nowMs = 1_030;
-    stopAgentLifecycleSubscription(); // barrier 1_030; the claim is NOT cleared
+    registry.rotateEpoch(); // barrier 1_030; the claim is NOT cleared
 
     nowMs = 1_060;
     // A replayed pre-barrier request stays refused …

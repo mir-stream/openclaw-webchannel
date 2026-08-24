@@ -1227,6 +1227,38 @@ export function shouldSuppressClawNativeExecApprovalPrompt(params: {
 export async function startClawApprovalMonitor(
   ctx: ChannelGatewayContext,
 ): Promise<void> {
+  // #267: THIS is the approval stream's lifetime boundary, so this is where the
+  // approval-origin replay barrier belongs. Registering the context below is
+  // what flips core's native approval handler on; a request the gateway replays
+  // from before this moment cannot be attributed to a run started after it, so
+  // it is refused rather than matched against whatever is running now.
+  //
+  // Rotation deliberately does NOT drop active claims: the queue lets a running
+  // handler settle instead of aborting it (`inbound-queue.ts:393`), and that
+  // handler still owns its lease until its own `finally`. Because the start time
+  // is read at `onAgentRunStart` and not at lease creation, such a run records a
+  // post-barrier timestamp and can still serve requests it genuinely creates
+  // after this point — the contract the module header states.
+  //
+  // Rotating here also keeps clock-trust recovery reachable: an anomalous clock
+  // read closes the epoch until the next rotation, and channel start is the only
+  // event left that draws one.
+  //
+  // Swallowed on failure: the getter throws when the versioned global slot holds
+  // an incompatible registry, and that must not take the channel down. It is not
+  // silent overall — the same getter throws loudly at
+  // `startAgentLifecycleSubscription` and on every turn, which is where it is
+  // actionable.
+  //
+  // ⚠️ Known gap, tracked separately: this monitor is per ACCOUNT while the
+  // registry's barrier is process-global, so one account's channel start fences
+  // another account's in-flight request. Same shape as #113. Correct fix is an
+  // account-scoped barrier; it is not in this change.
+  try {
+    getApprovalOriginRegistry().rotateEpoch();
+  } catch {
+    /* channel start continues */
+  }
   const registry = ctx.channelRuntime?.runtimeContexts;
   const registration = registry?.register({
     channelId: WEBCHANNEL_ID,

@@ -817,25 +817,27 @@ function releaseAgentLifecycleSubscription(options: {
     agentRunToolActivitySinks.clear();
   }
   if (options.rearmDiagnostics) reasoningEmptyLaneWarned.clear();
-  // #93: host teardown draws a new approval-origin barrier. Any request the
-  // gateway replays from BEFORE this point can no longer be attributed to a
-  // live run, so it is refused rather than matched against whatever is running
-  // after the reload. Rotation deliberately does NOT drop active claims: the
-  // queue lets a running handler settle instead of aborting it
-  // (`inbound-queue.ts:393`), and that handler still owns its lease until its
-  // own `finally` — it can still legitimately emit approvals for requests it
-  // creates after the new barrier.
+  // #267: this function does NOT rotate the approval-origin epoch, and must not
+  // start doing so again.
   //
-  // Swallowed on failure: the getter throws when the versioned global slot holds
-  // an incompatible registry, and a teardown that cannot rotate must not take
-  // the rest of the host's cleanup down with it. That condition is never silent
-  // overall — the same getter throws loudly at `startAgentLifecycleSubscription`
-  // and on every turn, which is where it is actionable.
-  try {
-    getApprovalOriginRegistry().rotateEpoch();
-  } catch {
-    /* teardown continues */
-  }
+  // #93 drew the barrier here on the reading that releasing this subscription is
+  // a host teardown. It is not one. `registerFull` wires BOTH ends of this
+  // function — it calls `startAgentLifecycleSubscription` (whose replace-don't-
+  // stack path lands here) and registers a runtime lifecycle whose `cleanup`
+  // calls `stopAgentLifecycleSubscription` (which also lands here) — and the
+  // host re-registers plugins per load profile, several times inside a single
+  // turn. Measured on a live gateway: four rotations between `createLease()` and
+  // `onAgentRunStart`, from both entry points, on every turn. The lease was then
+  // recorded unprovable and EVERY approval was dropped as `active_no_match`.
+  //
+  // The listener this function owns carries turn verdicts and tool activity. It
+  // does not own the approval request stream, so replacing it cannot replay an
+  // approval request and no barrier is owed here. The barrier lives with the
+  // `approval.native` runtime context instead — see `startClawApprovalMonitor`.
+  //
+  // This is the same shape as #113's `rearmDiagnostics`: shared teardown state
+  // that a mere (re)start must not touch. That flag exists two lines above for
+  // exactly this reason.
 }
 
 /**

@@ -48,12 +48,21 @@
  *     evidence. Overflowing its cap escalates to poisoning the epoch globally.
  *
  * ── Epochs ──────────────────────────────────────────────────────────────────
- * A host teardown/reload rotates the epoch, which captures a new `barrierMs`.
- * Rotation does NOT drop active claims: the queue does not abort a running
- * handler, so a pre-reload run keeps its lease until its own `release()`. That
- * retained run can still serve requests it genuinely creates AFTER the new
- * barrier, while any pre-barrier request replayed by the gateway is rejected as
- * `invalid_request_time`.
+ * A restart of the approval request stream rotates the epoch, which captures a
+ * new `barrierMs`. Rotation does NOT drop active claims: the queue does not
+ * abort a running handler, so a run that predates the restart keeps its lease
+ * until its own `release()`. That retained run can still serve requests it
+ * genuinely creates AFTER the new barrier, while any pre-barrier request
+ * replayed by the gateway is rejected as `invalid_request_time`.
+ *
+ * #267: "restart of the approval request stream" is a narrower event than it
+ * once was, and the narrowing is the point. The rotation used to hang off the
+ * agent-event lifecycle listener, which the host replaces on ORDINARY plugin
+ * re-registration — several times per turn under load profiles. That listener
+ * carries turn verdicts and tool activity; it does not own the approval stream,
+ * so the barrier fenced nothing and killed everything. The barrier now belongs
+ * to the `approval.native` runtime context, whose registration IS the approval
+ * handler's lifetime.
  *
  * Pure and in-memory by construction: no I/O, an injectable clock, and no
  * dependency on the current config route or on alias enumeration.
@@ -148,13 +157,16 @@ export const DEFAULT_MAX_POISONED_KEYS = 1024;
 
 /**
  * The `activatedAtMs` of a PRESENCE claim — a live run that must never be
- * selected as an origin. Three situations produce one, and they are all the same
- * concept rather than three special cases:
+ * selected as an origin. Two situations produce one, and they are the same
+ * concept rather than two special cases:
  *
  *   1. the caller declared `evidence: "presence"` (the control lane),
- *   2. the clock read was anomalous, so no start time can be trusted,
- *   3. the handle lay dormant across an epoch rotation, so its start time
- *      belongs to a teardown that has already been fenced off.
+ *   2. the clock read was anomalous, so no start time can be trusted.
+ *
+ * A third case used to live here — "the handle lay dormant across an epoch
+ * rotation" — and it was wrong (#267). The start time is read at `activate()`,
+ * never at `createLease()`, so a handle that spans a rotation records a time
+ * AFTER the new barrier. Nothing about it belongs to the fenced-off epoch.
  *
  * `Infinity` implements "unselectable" exactly: `resolve` filters on
  * `activatedAtMs < requestCreatedAtMs`, and `Infinity < x` is false for every
@@ -254,15 +266,14 @@ export class ApprovalOriginLeaseRegistry implements ApprovalOriginRegistry {
 
   /**
    * Build an immutable handle for a turn WITHOUT touching registry state. The
-   * exact claim, its unique id and the creation epoch are captured in the
-   * closure; only `activate()` publishes anything.
+   * exact claim and its unique id are captured in the closure; only
+   * `activate()` publishes anything, and only `activate()` reads a clock.
    */
   createLease(input: ApprovalOriginLeaseInput): ApprovalOriginLease {
     const { rawAccountId, sessionKey, peerId } = input;
     const evidence: ApprovalOriginEvidence = input.evidence ?? "origin";
     const canonicalKey = composeCanonicalKey(rawAccountId, sessionKey);
     const claimId = this.nextClaimId++;
-    const createdEpoch = this.epoch;
     let activated = false;
     let released = false;
 
@@ -271,12 +282,20 @@ export class ApprovalOriginLeaseRegistry implements ApprovalOriginRegistry {
         // A released handle's turn is over; it must never claim. Everything
         // else that reaches here is a LIVE run and gets a claim.
         if (activated || released) return;
-        // Three ways to end up with a presence claim, one rule: the run is
+        // Two ways to end up with a presence claim, one rule: the run is
         // recorded, but with no usable start time. Either the caller asked for
-        // presence, or the handle lay dormant across a rotation (its start time
-        // belongs to a teardown already fenced off), or the clock read was
-        // anomalous — which additionally closes the epoch inside `readClock()`.
-        const provable = evidence === "origin" && createdEpoch === this.epoch;
+        // presence, or the clock read was anomalous — which additionally closes
+        // the epoch inside `readClock()`.
+        //
+        // #267: the handle's CREATION epoch is deliberately not consulted. The
+        // start time is read HERE, at `onAgentRunStart`, so a handle created
+        // before a rotation and activated after it records a post-barrier
+        // timestamp — exactly the proof the module header promises a retained
+        // run may still offer. Gating on the creation epoch discarded that
+        // proof and made every rotation inside the create→activate window fail
+        // the whole turn closed; with the barrier drawn on ordinary plugin
+        // re-registration, that was every turn.
+        const provable = evidence === "origin";
         const readMs = provable ? this.readClock() : null;
         activated = true;
         this.insertClaim(
@@ -347,8 +366,9 @@ export class ApprovalOriginLeaseRegistry implements ApprovalOriginRegistry {
   }
 
   /**
-   * Start a new epoch (host teardown/reload): draw a fresh barrier, restore
-   * clock trust, and drop the previous epoch's poison.
+   * Start a new epoch (the approval request stream restarting — see
+   * `startClawApprovalMonitor`; #267): draw a fresh barrier, restore clock
+   * trust, and drop the previous epoch's poison.
    *
    * Active claims are deliberately RETAINED — a handler that survived teardown
    * owns its lease until its own `release()`. Retained claims are then rescanned

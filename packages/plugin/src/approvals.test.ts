@@ -17,6 +17,10 @@ vi.mock("openclaw/plugin-sdk/approval-handler-runtime", async (importOriginal) =
   return { ...actual, resolveApprovalOverGateway };
 });
 
+import {
+  startAgentLifecycleSubscription,
+  stopAgentLifecycleSubscription,
+} from "./inbound.js";
 import { NullPeerChannel } from "./channel-contract.js";
 class FakePeerChannel extends NullPeerChannel {
   setFirstLivenessHandler(_handler: any) {}
@@ -1934,5 +1938,81 @@ describe("approval error messages are single log records (#123)", () => {
       'webchannel: approval "exec-1" is unknown or already resolved ' +
         "(no live delivery binding) — refusing to resolve",
     );
+  });
+});
+
+describe("approval-origin barrier placement (#267)", () => {
+  // The FIX is a move, not a deletion, so the guard has to be a move too: one
+  // assertion that the agent-lifecycle seam no longer draws a barrier, and one
+  // that the approval stream's own lifetime does. Testing only the registry
+  // would let someone re-add `rotateEpoch()` to the teardown and stay green,
+  // which is exactly how the outage was introduced.
+  const slots = globalThis as unknown as Record<symbol, unknown>;
+  let saved: unknown;
+  let rotate: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    saved = slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY];
+    rotate = vi.fn();
+    slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY] = {
+      contractVersion: 1,
+      createLease: () => ({ activate() {}, release() {} }),
+      resolve: () => ({ kind: "no_match" }),
+      rotateEpoch: rotate,
+    };
+  });
+
+  afterEach(() => {
+    if (saved === undefined) delete slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY];
+    else slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY] = saved;
+  });
+
+  it("does NOT rotate when the agent-lifecycle subscription starts or stops", () => {
+    // `registerFull` wires BOTH of these, and the host re-registers plugins per
+    // load profile — several times inside one turn. Rotating here fenced off the
+    // in-flight turn's own lease and dropped every approval.
+    const api: any = {
+      registrationMode: "full",
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      runtime: { events: { onAgentEvent: () => () => {} } },
+    };
+    startAgentLifecycleSubscription(api);
+    startAgentLifecycleSubscription(api); // replace-don't-stack path
+    stopAgentLifecycleSubscription(); // the runtime-lifecycle cleanup path
+    expect(rotate).not.toHaveBeenCalled();
+  });
+
+  it("rotates exactly once when the approval stream starts", async () => {
+    const abort = new AbortController();
+    const ctx: any = {
+      cfg: cfgEnabled,
+      accountId: "default",
+      abortSignal: abort.signal,
+      channelRuntime: { runtimeContexts: { register: () => ({ dispose() {} }) } },
+    };
+    const monitorPromise = startClawApprovalMonitor(ctx);
+    expect(rotate).toHaveBeenCalledTimes(1);
+    abort.abort();
+    await monitorPromise;
+    // Teardown does not draw a second barrier; only a start does.
+    expect(rotate).toHaveBeenCalledTimes(1);
+  });
+
+  it("survives an incompatible planted registry rather than failing channel start", async () => {
+    // The getter throws on a hostile global. A channel must still come up: the
+    // same getter throws loudly on every turn, which is where it is actionable.
+    slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY] = "not-a-registry";
+    const abort = new AbortController();
+    const register = vi.fn(() => ({ dispose() {} }));
+    const ctx: any = {
+      cfg: cfgEnabled,
+      accountId: "default",
+      abortSignal: abort.signal,
+      channelRuntime: { runtimeContexts: { register } },
+    };
+    const monitorPromise = startClawApprovalMonitor(ctx);
+    expect(register).toHaveBeenCalledTimes(1);
+    abort.abort();
+    await monitorPromise;
   });
 });

@@ -3073,10 +3073,10 @@ describe("webchannel inbound round-trip", () => {
   // unrelated turns qualify to latch it — so without a reset these assertions
   // would pass or fail on test ORDER.
   //
-  // `stopAgentLifecycleSubscription` is the production re-arm seam and clears it,
-  // but it also rotates the #93 approval-origin epoch. That is a far wider reset
-  // than this needs, so it is confined to this block rather than run before all
-  // ~120 tests in the file; every test outside keeps its own #93 preconditions.
+  // `stopAgentLifecycleSubscription` is the production re-arm seam and clears it.
+  // It is still confined to this block rather than run before all ~120 tests in
+  // the file, because it also clears run-scoped state. It no longer rotates the
+  // #93 approval-origin epoch — see the #267 guard below.
   describe("reasoning lane diagnostics (#113)", () => {
     beforeEach(() => {
       stopAgentLifecycleSubscription();
