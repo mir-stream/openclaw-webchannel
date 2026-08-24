@@ -8,6 +8,7 @@
  */
 import {
   chmodSync,
+  mkdirSync,
   mkdtempSync,
   rmSync,
   statSync,
@@ -247,6 +248,29 @@ describe("idempotent append", () => {
     expect(journal.read("conv")).toHaveLength(1);
   });
 
+  it("REFUSES a `user` event with an empty id at `append` itself", () => {
+    // The mapper's throw guards one door; `append` is public and is the other,
+    // and half 2 replaying a `user` event it did not build through
+    // `journalEventForInboundUser` arrives here. Without this, two DIFFERENT
+    // messages collapse: the second returns `{ seq: 1, inserted: false }` — the
+    // "ordinary retry" value — and its text is gone from the only SSOT user
+    // messages have (§15.7).
+    const journal = open(newJournalPath());
+    expect(() =>
+      journal.append("conv", { kind: "user", id: "", text: "first" }),
+    ).toThrow(/refuses a `user` event with an empty id/);
+    expect(journal.read("conv")).toEqual([]);
+  });
+
+  it("still accepts a `placement` under the empty id — the kinds differ", () => {
+    // Not an inconsistency to tidy: the client keys progress on `id ?? ""`, so
+    // `""` is a real lane id there, while its user/agent paths branch on
+    // truthiness. Refusing it would drop a real slot claim (reducer BOUNDARY 1).
+    const journal = open(newJournalPath());
+    expect(journal.append("conv", { kind: "placement", answerId: "" }).seq).toBe(1);
+    expect(journal.read("conv")).toHaveLength(1);
+  });
+
   it("does NOT dedupe `bubble` — a second bubble for one id is an EDIT", () => {
     // Last-write-wins by answer id: the client's `applyBubble` upserts in place,
     // so discarding the second write would discard the edit. #241 turns this
@@ -391,6 +415,21 @@ describe("connection and on-disk facts", () => {
     }
   });
 
+  it("re-hardens a tuple directory that already existed at 0755", () => {
+    // `ensurePrivateDirectory`'s default only sets 0700 on a directory it
+    // CREATES, so without `enforceExistingMode = true` a pre-existing 0755
+    // directory stays 0755 — and every other caller in this package already
+    // passes `true`. The other mode test only ever sees a freshly created
+    // directory, so it cannot catch this.
+    const databasePath = newJournalPath();
+    mkdirSync(dirname(databasePath), { recursive: true, mode: 0o755 });
+    chmodSync(dirname(databasePath), 0o755);
+    expect(mode(dirname(databasePath))).toBe(0o755);
+
+    open(databasePath);
+    expect(mode(dirname(databasePath))).toBe(0o700);
+  });
+
   it("re-hardens sidecars an earlier build left world-readable", () => {
     // Mode inheritance only covers sidecars SQLite CREATES; it never re-chmods
     // one already on disk. So a journal whose sidecars were loosened — by a
@@ -452,6 +491,32 @@ describe("connection and on-disk facts", () => {
     journal.append("conv", bubble("a-1", "one"));
     journal.close();
     expect(() => journal.close()).not.toThrow();
+  });
+
+  it("surfaces the REAL error when open fails, and closes the handle", () => {
+    // Poison the file with a foreign `journal_event`, so the schema step's index
+    // creation fails on an already-open handle — the same shape as a corrupt
+    // file, a non-ENOENT chmod failure, or the SDK helper refusing the
+    // filesystem.
+    const databasePath = newJournalPath();
+    mkdirSync(dirname(databasePath), { recursive: true });
+    const seed = new DatabaseSync(databasePath);
+    seed.exec("CREATE TABLE journal_event (x INTEGER)");
+    seed.close();
+
+    // The original error, not a `Cannot destructure` or a masked close failure.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      expect(() => openDeliveryJournal({ databasePath })).toThrow(
+        /no such column: conversation_id/,
+      );
+    }
+
+    // ⚠️ THE FD RELEASE ITSELF IS NOT ASSERTED HERE — counting descriptors needs
+    // `/proc/self/fd`, and a Linux-only case in a portable suite is worse than
+    // this one. It WAS measured: with the `try`/`catch` around the connection
+    // setup removed, five failed opens leak 3,5,7,9,11 descriptors on this exact
+    // fixture (two per attempt); with it, 0,0,0,0,0. Half 2 retries an open per
+    // account and per reconnect, which is what makes the leak matter.
   });
 });
 

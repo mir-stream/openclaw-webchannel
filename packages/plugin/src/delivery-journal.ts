@@ -44,6 +44,13 @@ import { dirname } from "node:path";
 import { configureSqliteConnectionPragmas } from "openclaw/plugin-sdk/plugin-state-runtime";
 import { runSqliteImmediateTransactionSync } from "openclaw/plugin-sdk/sqlite-runtime";
 
+// Type-only, so it is erased before vite-node ever sees a `node:sqlite`
+// specifier — see `loadNodeSqlite` for why a VALUE import would break collection.
+import type {
+  DatabaseSync as SqliteDatabase,
+  StatementSync as SqliteStatement,
+} from "node:sqlite";
+
 import type { JournalEvent } from "./delivery-journal-event.js";
 import { ensurePrivateDirectory } from "./private-file.js";
 
@@ -96,9 +103,16 @@ let nodeSqlite: typeof import("node:sqlite") | undefined;
  * say what is actually wrong.
  *
  * `process.getBuiltinModule` is documented and stable for exactly this — a
- * builtin fetched without going through the module loader — available since Node
- * 22.3.0, comfortably under this package's `engines.node` floor, and fully typed
+ * builtin fetched without going through the module loader — and fully typed
  * (`typeof import("node:sqlite")`), so `DatabaseSync` keeps its real type.
+ *
+ * The binding requirement is `node:sqlite` ITSELF, which is what forces a modern
+ * Node here; `process.getBuiltinModule` (Node 22.3.0) is strictly older than
+ * that and never the constraint. Do NOT justify either against this package's
+ * `engines.node` — that range is copied verbatim from the `openclaw` PEER's own
+ * declaration, so citing it as evidence for a floor this file needs is circular
+ * (the same commit introduced both). The peer is the source of the range; this
+ * module is a consumer of it.
  *
  * REVISIT when vitest/vite-node is upgraded past this bug: the plain import is
  * the better code, and this comment is the reason it is not here.
@@ -178,6 +192,12 @@ export interface DeliveryJournal {
    * a silently truncated history. #240 paginates from the materialized read
    * model (doc §15.4), not from here.
    *
+   * ⚠️ THE DEFAULT IS ALSO A MEMORY DECISION, and #240 owns it: an unbounded
+   * read materializes AND `JSON.parse`s the entire conversation log into memory
+   * SYNCHRONOUSLY, blocking the event loop for the duration. Measured at 20 000
+   * rows of ~1.2 KB that is ~75 ms and ~25 MB of live objects. Fine for a store
+   * with no call sites; not fine once history is served from it per reconnect.
+   *
    * `afterSeq` must be a non-negative integer and `limit`, when given, a
    * positive one; both throw rather than degrade.
    */
@@ -189,28 +209,27 @@ export interface DeliveryJournal {
   close(): void;
 }
 
+/** The prepared statements one journal connection owns. */
+type JournalStatements = {
+  selectNextSeq: SqliteStatement;
+  insertEvent: SqliteStatement;
+  selectExistingSeqByKind: { user: SqliteStatement; placement: SqliteStatement };
+  selectRows: SqliteStatement;
+};
+
 /**
- * Open (creating if absent) the delivery journal at an EXPLICIT path.
+ * Steps 3-6 of the open sequence, plus the statements, on an ALREADY-OPEN handle.
  *
- * Connection setup order is load-bearing — see the inline notes, especially the
- * chmod, which must happen before the first WRITE creates the WAL sidecars.
+ * Split out so `openDeliveryJournal` can wrap the whole thing in one `try` and
+ * close the handle if any of it throws — see the call site.
  */
-export function openDeliveryJournal(options: {
-  databasePath: string;
-  /** Injectable clock. Tests pin `created_ms`; production passes nothing. */
-  now?: () => number;
-}): DeliveryJournal {
-  const databasePath = options.databasePath;
-  const now = options.now ?? Date.now;
-  const { DatabaseSync } = loadNodeSqlite();
-
-  // 1. Owner-only (0700) directory, the same handling the credential and
-  //    conversation-key stores get.
-  ensurePrivateDirectory(dirname(databasePath));
-
-  // 2. Open. SQLite creates the main file here, at 0666 & ~umask.
-  const db = new DatabaseSync(databasePath);
-
+function openJournalConnection(
+  db: SqliteDatabase,
+  databasePath: string,
+): {
+  maintenance: ReturnType<typeof configureSqliteConnectionPragmas>;
+  statements: JournalStatements;
+} {
   // 3. chmod 0600 before anything can create the WAL sidecars. SQLite copies
   //    the MAIN database file's mode onto `-wal`/`-shm` when it creates them, so
   //    a late chmod leaves world-readable sidecars holding message plaintext —
@@ -289,6 +308,32 @@ export function openDeliveryJournal(options: {
   // 6. Schema. `CREATE ... IF NOT EXISTS` so opening an existing journal is a
   //    no-op.
   //
+  //    ⚠️ A PLAIN ROWID TABLE, NOT `WITHOUT ROWID`, AND THE CHOICE IS MEASURED.
+  //    `WITHOUT ROWID` is the intuitive pick for a (conversation_id, seq)-keyed
+  //    append-only log: it clusters rows in exactly `read`'s scan order. It is
+  //    also the wrong pick here, because the whole ROW lives in an INDEX b-tree,
+  //    whose `maxLocal` is ~1008 B against a table b-tree's ~4084 B — so every
+  //    record between those sizes buys a whole extra 4 KB overflow page, and a
+  //    chat bubble sits squarely in that band.
+  //
+  //    A/B on this exact DDL, 20 000 rows, VACUUMed, only the clause varied,
+  //    real filesystem; `read()` = full-conversation scan, SQL then JSON.parse:
+  //
+  //      payload   WITHOUT ROWID              rowid table
+  //      200 B     6.84 MB   3.6/1.3 ms       7.20 MB   28.5/12.8 ms
+  //      1.2 KB    92.18 MB  256/30.2 ms      27.73 MB  75.5/12.4 ms
+  //      4 KB      92.18 MB  367/32.4 ms      92.55 MB  240/34.8 ms
+  //                          (single/interleaved read)
+  //
+  //    At the dominant ~1.2 KB size the rowid table is 3.3x SMALLER and 2-3x
+  //    FASTER to read — the clustering advantage is swamped by walking 3.3x more
+  //    pages. The counter-argument does survive at 200 B, where there is no
+  //    overflow: interleaved reads are ~10x faster clustered (1.3 ms vs 12.8 ms).
+  //    That band is real but it is not ours, and it loses the disk axis anyway.
+  //
+  //    This is IRREVERSIBLE in practice — see the missing version gate below —
+  //    so it is written down rather than left silent.
+  //
   //    ⚠️ There is NO version-negotiation gate yet: `schema_version` is seeded
   //    and never checked, so an older build opening a newer journal proceeds.
   //    Deliberate for this slice (the journal has no call sites and no on-disk
@@ -310,7 +355,7 @@ export function openDeliveryJournal(options: {
       payload         TEXT    NOT NULL,
       created_ms      INTEGER NOT NULL,
       PRIMARY KEY (conversation_id, seq)
-    ) WITHOUT ROWID;
+    );
 
     CREATE UNIQUE INDEX IF NOT EXISTS journal_user_once
       ON journal_event(conversation_id, message_id) WHERE kind = 'user';
@@ -342,8 +387,13 @@ export function openDeliveryJournal(options: {
   // than a bound parameter. A bound `kind = ?` cannot be matched against the
   // partial indexes' `WHERE kind = 'user'` / `'placement'` predicates — SQLite
   // has to prove the predicate at prepare time — so the single-statement version
-  // fell back to a PK range scan over the whole conversation. Confirmed with
-  // EXPLAIN QUERY PLAN both ways.
+  // scanned the whole conversation. EXPLAIN QUERY PLAN, re-confirmed against the
+  // rowid schema:
+  //   bound `kind = ?`  → SEARCH … USING INDEX sqlite_autoindex_journal_event_1
+  //                       (conversation_id=?)          ← whole-conversation scan
+  //   literal 'user'    → SEARCH … USING INDEX journal_user_once
+  //                       (conversation_id=? AND message_id=?)
+  //   literal 'placement' → … USING INDEX journal_placement_once (same shape)
   const selectExistingSeqByKind = {
     user: db.prepare(
       "SELECT seq FROM journal_event " +
@@ -359,10 +409,98 @@ export function openDeliveryJournal(options: {
       "WHERE conversation_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
   );
 
+  return {
+    maintenance,
+    statements: {
+      selectNextSeq,
+      insertEvent,
+      selectExistingSeqByKind,
+      selectRows,
+    },
+  };
+}
+
+/**
+ * Open (creating if absent) the delivery journal at an EXPLICIT path.
+ *
+ * Connection setup order is load-bearing — see the inline notes, especially the
+ * chmod, which must happen before the first WRITE creates the WAL sidecars.
+ */
+export function openDeliveryJournal(options: {
+  databasePath: string;
+  /** Injectable clock. Tests pin `created_ms`; production passes nothing. */
+  now?: () => number;
+}): DeliveryJournal {
+  const databasePath = options.databasePath;
+  const now = options.now ?? Date.now;
+  const { DatabaseSync } = loadNodeSqlite();
+
+  // 1. Owner-only (0700) directory, the same handling the credential and
+  //    conversation-key stores get — including `enforceExistingMode = true`.
+  //
+  //    ⚠️ THE `true` IS LOAD-BEARING. `ensurePrivateDirectory` defaults it to
+  //    false, which only sets 0700 on a directory it CREATES; a tuple directory
+  //    already sitting at 0755 stays 0755 (measured). Every other caller in this
+  //    package passes `true` — `conversation-key-store.ts`,
+  //    `rotation-preflight.ts`, `offline-conversation-key-rotation.ts` — so
+  //    omitting it made the journal the sole exception while its comment claimed
+  //    parity. It is also the exact argument `chmodDatabaseFiles` exists for one
+  //    step below: inheritance never re-hardens something that already exists.
+  ensurePrivateDirectory(dirname(databasePath), true);
+
+  // 2. Open. SQLite creates the main file here, at 0666 & ~umask.
+  const db = new DatabaseSync(databasePath);
+
+  // Steps 3-6 and the statement preparation all run against an OPEN handle, and
+  // every one of them can throw — `chmodDatabaseFiles` rethrows a non-ENOENT
+  // chmod failure, the SDK helper REFUSES an unsupported filesystem outright,
+  // and the DDL can fail on a corrupt file. Without this the handle and its fd
+  // leak on each failure, and half 2 retries an open per account and per
+  // reconnect, so they accumulate.
+  let connection: ReturnType<typeof openJournalConnection>;
+  try {
+    connection = openJournalConnection(db, databasePath);
+  } catch (error) {
+    closeQuietly(db);
+    throw error;
+  }
+  const { maintenance, statements } = connection;
+  const { selectNextSeq, insertEvent, selectExistingSeqByKind, selectRows } =
+    statements;
+
   let closed = false;
 
   return {
     append(conversationId, event) {
+      // ⚠️ THE EMPTY-`user`-ID REFUSAL LIVES HERE, AT THE MECHANISM, not only in
+      // `journalEventForInboundUser`. That mapper guards one door; `append` is
+      // public and is the other, and half 2 replaying or re-journaling a `user`
+      // event it did not build through the mapper reaches this one. The failure
+      // is silent and lossy: two DIFFERENT user messages under `""` collide on
+      // `journal_user_once`, so the second returns `{ inserted: false }` — the
+      // value this contract defines as an ordinary non-destructive retry — and
+      // its text is simply absent from the only SSOT user messages have (§15.7).
+      //
+      // ⚠️ KIND-SPECIFIC ON PURPOSE. `placement` under `""` is FAITHFUL and is
+      // pinned by its own test: the client keys progress on `id ?? ""`, so `""`
+      // survives there as a real lane id, and refusing it would drop a real slot
+      // claim. The client's `agent_message`/user path branches on truthiness
+      // instead, so for those `""` is not an id at all. The two kinds differ
+      // because the two WIRE SITES differ (reducer BOUNDARY 1) — this is not an
+      // inconsistency to tidy up.
+      // The `typeof` mirrors `isUsableMessageId` rather than testing `.length`
+      // directly: a non-string that slipped past the type would otherwise throw
+      // an unnamed `TypeError` from inside a transaction instead of this.
+      if (
+        event.kind === "user" &&
+        !(typeof event.id === "string" && event.id.length > 0)
+      ) {
+        throw new Error(
+          "webchannel: delivery journal refuses a `user` event with an empty " +
+            "id — distinct user messages would collapse onto one row and the " +
+            "second would report as an ordinary duplicate (doc §15.7)",
+        );
+      }
       // One IMMEDIATE transaction per event (doc §15.2: per-bubble immediate
       // txn, measured viable). Appends are SYNCHRONOUS and in egress order —
       // never batch or defer them, because batching reorders (§15.8).
@@ -459,14 +597,58 @@ export function openDeliveryJournal(options: {
       if (closed) return;
       closed = true;
       // `maintenance.close()` clears the periodic-checkpoint interval the SDK
-      // installed. Skipping it leaks a timer per opened journal.
+      // installed. Skipping it leaks a timer per opened journal. It swallows its
+      // own checkpoint errors, so it cannot throw past here.
       maintenance.close();
-      db.close();
+      // `closeQuietly`, not `db.close()`: the handle may ALREADY be closed —
+      // the SDK's transaction helper closes it itself when a ROLLBACK fails,
+      // without telling this module. A bare `db.close()` would then throw out of
+      // a method documented as idempotent.
+      closeQuietly(db);
     },
   };
 }
 
-/** Owner-only mode for the main database and every sidecar that exists. */
+/**
+ * Close a handle without letting the close itself mask the real error.
+ *
+ * Used on the failed-open path, and by `close()` — the SDK's transaction helper
+ * closes `db` ITSELF when a ROLLBACK fails (`openclaw`'s
+ * `src/infra/sqlite-transaction.ts`), which leaves this module's `closed` flag
+ * `false` over an already-closed handle. A later `close()` would then throw out
+ * of a method whose contract says it is idempotent.
+ */
+function closeQuietly(db: SqliteDatabase): void {
+  try {
+    db.close();
+  } catch {
+    // Already closed, or closing failed — either way there is nothing left to
+    // do with this handle and nothing useful to report.
+  }
+}
+
+/**
+ * Owner-only mode for the main database and every sidecar that exists.
+ *
+ * ⚠️ WE TAKE CORE'S SUFFIX LIST, NOT CORE'S FAILURE POLICY, and the divergence
+ * is deliberate. Core runs the same four suffixes through `bestEffortChmodSync`
+ * → `canIgnorePrivateChmodError` (`openclaw`'s `src/infra/private-mode.ts`),
+ * which TOLERATES `ENOTSUP`/`EOPNOTSUPP`/`EINVAL` outright and `EROFS`/`EPERM`
+ * conditionally (only where the target is already restrictive, or the filesystem
+ * demonstrably rejects chmod), because — in its own words — "crashing at open
+ * would take the gateway down on Azure Files/NFS/Docker volumes (#91919)."
+ *
+ * This throws on all of those instead, for two reasons: `private-file.ts` in
+ * this package uses a bare `chmodSync` throughout, so fail-closed is the house
+ * convention here and a lone best-effort store would be the inconsistency; and
+ * the journal has NO CALL SITES yet, so nothing can be taken down by it.
+ *
+ * ⚠️ #240 MUST REVISIT THIS. That slice puts the journal in the plugin's load
+ * path, at which point core's reason starts applying to us verbatim: a gateway
+ * that refuses to start on a Docker volume because a `-shm` chmod returned
+ * ENOTSUP is a worse outcome than a loose `-shm`. Do not treat the strictness as
+ * settled just because it survived this slice.
+ */
 function chmodDatabaseFiles(databasePath: string): void {
   for (const suffix of SQLITE_DATABASE_FILE_SUFFIXES) {
     try {

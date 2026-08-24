@@ -19,17 +19,26 @@
  *
  * There is no shared package yet and creating one is NOT in this slice: #240 is
  * where the plugin actually RUNS the reducer, and it unifies the two. Until then
- * the mirror is held by two things, both in `delivery-journal-event.test.ts`:
- *  - a compile-time STRICT TYPE-IDENTITY assertion between `JournalEvent` and
- *    the client's `DurableEvent` (imported by cross-package source path, the
- *    established pattern — see `durable-view-reducer-contract.test.ts`), which
- *    is what actually goes red on a divergence. It is deliberately an IDENTITY
- *    check and not mutual assignability: mutual assignability is blind to an
- *    OPTIONAL field added on one side only, and `revision?: number` is precisely
- *    what #241 adds (doc §16.2-4). Measured — the assignability pair compiled
- *    clean with `revision?` on one side;
- *  - a runtime enumeration of each kind's FIELD NAMES, so the divergence is also
- *    greppable by someone reading the failure rather than the types.
+ * the mirror is held by exactly ONE guard, in `delivery-journal-event.test.ts`:
+ * a compile-time STRICT TYPE-IDENTITY assertion between `JournalEvent` and the
+ * client's `DurableEvent` (imported by cross-package source path, the
+ * established pattern — see `durable-view-reducer-contract.test.ts`). It is
+ * deliberately an IDENTITY check and not mutual assignability: mutual
+ * assignability is blind to an OPTIONAL field added on one side only, and
+ * `revision?: number` is precisely what #241 adds (doc §16.2-4). Measured — the
+ * assignability pair compiled clean with `revision?` on one side.
+ *
+ * ⚠️ ONE guard, not two. There WAS a second, runtime `Object.keys` enumeration
+ * of each kind's field names, advertised here as making a divergence greppable.
+ * It was deleted because it could not do that: `DurableEvent` is never read at
+ * runtime and its type annotation is erased, so a field added to one side left
+ * it green while the identity alias went red, a field added to BOTH left it
+ * green while quietly falsifying its own "optional fields included" claim, and a
+ * RENAME surfaced as a type error at its object literal — the exact failure mode
+ * it claimed to spare the reader. `vitest run` does not typecheck, so under the
+ * command that ran it, it asserted nothing the types did not already decide. A
+ * decorative guard beside a real one is worse than the real one alone, because
+ * this header was citing it as coverage.
  *
  * ⚠️ AND DO NOT READ "it isn't in `JournalEvent`" AS "it is non-durable by
  * design" — that is NOT-list N3/N7, and BOUNDARY 2 of the reducer says the event
@@ -56,11 +65,40 @@ export type JournalEvent =
     };
 
 /**
- * Is this a usable durable message id — present and non-empty?
+ * Upper bound on a CLIENT-supplied user-message id. See
+ * `journalEventForInboundUser`; deliberately NOT part of `isUsableMessageId`.
+ *
+ * Same value and same reason as `ingress-dedupe.ts`'s
+ * `MAX_INGRESS_DEDUPE_ID_LENGTH`, which is this plugin's established handling of
+ * `user_message.id`.
+ */
+const MAX_INBOUND_USER_ID_LENGTH = 128;
+
+/**
+ * Is this a usable durable message id — a NON-EMPTY STRING?
  *
  * ONE definition of "id-less", shared by the `agent_message` branch of the
  * mapper, by `isIdlessDurableFrame`, and by `journalEventForInboundUser`, so no
  * two of them can disagree about what an id-less message is.
+ *
+ * ⚠️ `typeof`, NOT just `!== undefined`. The wire does not validate this field —
+ * `InboundWsMessage` types it `id?: string`, and a JSON client sends `null` for
+ * "absent" — so a non-string genuinely arrives here. A truthiness- or
+ * `undefined`-only check lets `null` reach `.length` and throw a bare
+ * `TypeError: Cannot read properties of null (reading 'length')`, which defeats
+ * the entire reason `journalEventForInboundUser` is a function rather than an
+ * object literal: a NAMED failure. `["a"]` and `{ length: 3 }` likewise used to
+ * pass and then fail much later, at SQLite bind time.
+ *
+ * ⚠️ THE ≤128 LENGTH BOUND IS NOT HERE, AND THAT ASYMMETRY IS DELIBERATE. It
+ * belongs to the inbound seam only, because the two seams face different
+ * threats: a user id is client-supplied and hostile input, while an agent id is
+ * PLUGIN-MINTED (`message-adapter.ts`'s `nextMessageId()`, `webchannel-<ms>-<6
+ * chars>` — 31 chars, verified in-tree). Applying the bound to agent ids would
+ * classify an over-long minted id as id-less, and an id-less durable frame is
+ * dropped from the journal — silently discarding DELIVERED text, which is N10.
+ * Refusing to store is the safe answer for input we did not create; it is the
+ * unsafe answer for output we already sent.
  *
  * `""` IS id-less HERE and is NOT id-less for `progress` — the two wire sites
  * genuinely differ and the reducer's BOUNDARY 1 pins why. The client's
@@ -72,8 +110,8 @@ export type JournalEvent =
  * ONE durable row while live shows N bubbles: an N8 live≠history divergence
  * landing right here.
  */
-function isUsableMessageId(id: string | undefined): id is string {
-  return id !== undefined && id.length > 0;
+function isUsableMessageId(id: unknown): id is string {
+  return typeof id === "string" && id.length > 0;
 }
 
 /**
@@ -205,25 +243,39 @@ export function journalEventForOutbound(
  * accept seam: doc §15.7 makes the plugin the ONLY SSOT for user messages, so
  * this event is the durable record of the accept, written before the ack.
  *
- * ⚠️ THROWS on an empty or absent id, and that is the whole point of it existing
- * as a function rather than an object literal at the call site.
+ * ⚠️ THROWS on an id that is absent, empty, not a string, or longer than
+ * `MAX_INBOUND_USER_ID_LENGTH`. That is the whole point of it existing as a
+ * function rather than an object literal at the call site.
  *
- * `InboundWsMessage.user_message.id` is OPTIONAL and CLIENT-supplied, and `""`
- * is the established fallback shape for that field elsewhere in this codebase —
- * so `journalEventForInboundUser({ id: message.id ?? "", … })` is the likely
- * thing half 2 writes, not a hypothetical. Reproduced: two genuinely DIFFERENT
- * user messages both under `id: ""` collide on the `journal_user_once` partial
- * index, the second append returns `inserted: false`, and that is exactly the
- * value this interface tells half 2 to read as an ordinary non-destructive
- * retry (§15.8). The second message's TEXT is then gone from the only SSOT
- * there is for user messages (§15.7) — silent user-content loss, and history
- * shows one bubble where live showed two (N8).
+ * `InboundWsMessage.user_message.id` is OPTIONAL and CLIENT-supplied, and the
+ * wire validates NOTHING about it. This plugin's established handling of that
+ * exact field is `ingress-dedupe.ts`'s `ingressDedupeKey`: string, non-empty,
+ * ≤128 chars, and anything else is treated as id-less rather than persisted.
+ * Its docblock gives the reason — a hostile peer can send a non-string or a
+ * ~1 MB string, and a recorded id is persisted, so bounding it bounds the
+ * storage-amplification surface. This function adopts that whole rule, not part
+ * of it: an unbounded id here is amplified THREE times per row (the `payload`
+ * copy, the indexed `message_id` copy, and the `journal_user_once` entry), so
+ * fifty 1 MB ids are ~150 MB of journal.
+ *
+ * Each refusal is a real reproduced failure, not a hypothetical:
+ *  - `""` — two genuinely DIFFERENT user messages both under `""` collide on
+ *    `journal_user_once`, the second append returns `inserted: false`, and that
+ *    is exactly the value this store's contract tells the accept seam to read as
+ *    an ordinary non-destructive retry (§15.8). The second message's TEXT is
+ *    then gone from the only SSOT user messages have (§15.7) — silent
+ *    user-content loss, and history shows one bubble where live showed two (N8);
+ *  - `null` — what a JSON client sends for "absent"; it used to reach `.length`
+ *    and throw an unnamed `TypeError`;
+ *  - `["a"]` / `{ length: 3 }` — used to pass and fail later at SQLite bind time;
+ *  - a 1 MB id — see the amplification above.
  *
  * It throws rather than returning `null` because this runs BEFORE accept: a
  * loud failure in half 2's integration test is the outcome we want, whereas a
  * `null` would invite the accept path to shrug and continue unjournaled.
  * `isUsableMessageId` is the same predicate the durable-frame branch uses, so
- * the two cannot drift on what "id-less" means.
+ * the two cannot drift on what "id-less" means; the LENGTH bound is added only
+ * here, and that docblock explains why it must not be shared.
  */
 export function journalEventForInboundUser(input: {
   id: string;
@@ -232,9 +284,18 @@ export function journalEventForInboundUser(input: {
 }): JournalEvent {
   if (!isUsableMessageId(input.id)) {
     throw new Error(
-      "webchannel: journalEventForInboundUser requires a non-empty id — a " +
-        "user message must be journaled under its own identity, and an empty " +
-        "id collapses distinct messages onto one row (doc §15.7)",
+      "webchannel: journalEventForInboundUser requires a non-empty string id " +
+        "— a user message must be journaled under its own identity, and an " +
+        "empty or non-string id collapses distinct messages onto one row " +
+        `(doc §15.7); received ${typeof input.id}`,
+    );
+  }
+  if (input.id.length > MAX_INBOUND_USER_ID_LENGTH) {
+    throw new Error(
+      "webchannel: journalEventForInboundUser requires an id of at most " +
+        `${MAX_INBOUND_USER_ID_LENGTH} characters (received ${input.id.length}); ` +
+        "an unbounded client id is amplified three times per journaled row " +
+        "(see ingress-dedupe.ts's ingressDedupeKey, the same bound and reason)",
     );
   }
   return {

@@ -59,38 +59,15 @@ describe("JournalEvent mirrors the client's DurableEvent", () => {
     expect(mirrored.kind).toBe("bubble");
   });
 
-  it("enumerates the FIELD NAMES of each kind, so a divergence is greppable", () => {
-    // Every kind, fully populated (optional fields included). If this list stops
-    // matching `durable-view-reducer.ts`'s `DurableEvent`, the compile-time
-    // assertion above goes red first — this one exists so the failure NAMES the
-    // field instead of printing a type error.
-    const fullyPopulated: JournalEvent[] = [
-      { kind: "user", id: "u-0", text: "hello", turnId: TURN },
-      { kind: "placement", answerId: "a-0", turnId: TURN },
-      { kind: "bubble", answerId: "a-0", text: "answer", turnId: TURN },
-      {
-        kind: "seal",
-        turnId: TURN,
-        answers: [{ id: "a-0", text: "answer" }],
-        remove: ["a-1"],
-      },
-    ];
-    const fieldsByKind = Object.fromEntries(
-      fullyPopulated.map((event) => [event.kind, Object.keys(event).sort()]),
-    );
-    expect(fieldsByKind).toEqual({
-      user: ["id", "kind", "text", "turnId"],
-      placement: ["answerId", "kind", "turnId"],
-      bubble: ["answerId", "kind", "text", "turnId"],
-      seal: ["answers", "kind", "remove", "turnId"],
-    });
-    expect(Object.keys(fieldsByKind).sort()).toEqual([
-      "bubble",
-      "placement",
-      "seal",
-      "user",
-    ]);
-  });
+  // ⚠️ THERE WAS A SECOND CASE HERE — an `Object.keys` enumeration of each
+  // kind's field names — and it was DELETED rather than repaired. It could not
+  // detect what it claimed to: `DurableEvent` is never read at runtime and its
+  // annotation is erased, so a field added to one side left it green (the alias
+  // above caught it), a field added to BOTH left it green while falsifying its
+  // own "optional fields included" comment, and a RENAME failed as a type error
+  // at its object literal — the exact failure mode it existed to spare the
+  // reader. `vitest run` never typechecks, so under the command that ran it, it
+  // asserted nothing the types had not already decided. Do not reinstate it.
 });
 
 describe("journalEventForOutbound maps the durable frames", () => {
@@ -251,14 +228,23 @@ describe("journalEventForOutbound returns null for every non-durable frame", () 
     expect(journalEventForOutbound(frame)).toBeNull();
   });
 
-  it("covers every OutboundWsMessage variant exactly once", () => {
+  it("keeps the null-table's frame types matching a hand-listed union", () => {
+    // ⚠️ WHAT THIS DOES AND DOES NOT DO. It compares two HAND-MAINTAINED lists —
+    // the `nonDurable` table's frame types plus the three durable ones, against
+    // the literal list below. It does NOT read `OutboundWsMessage`, so it cannot
+    // notice a new wire variant on its own, and despite the old name it does not
+    // check "exactly once" either (both sides are sorted arrays; a duplicate on
+    // one side simply has to appear on the other).
+    //
+    // The real exhaustiveness guarantee is the mapper's `default: const _never:
+    // never = frame`, which makes a new variant a COMPILE error. This case earns
+    // its place only as the reminder that lands next to that compile error: when
+    // tsc points at the mapper, this list is the other place to update.
     const durableTypes = ["agent_message", "progress", "turn_snapshot"];
     const covered = [
       ...durableTypes,
       ...nonDurable.map(([, frame]) => frame.type),
     ].sort();
-    // Mirrors the union in `channel-contract.ts`. A new wire variant makes the
-    // mapper fail to compile; this keeps the TEST table from silently lagging.
     expect(covered).toEqual(
       [
         "ack",
@@ -293,23 +279,63 @@ describe("journalEventForInboundUser", () => {
     ).toEqual(["kind", "id", "text"]);
   });
 
+  it("THROWS on a non-string id with a NAMED error, not a TypeError", () => {
+    // `user_message.id` is `id?: string` on the wire and the wire validates
+    // nothing; a JSON client sends `null` for "absent". These used to reach
+    // `.length` (bare `TypeError: Cannot read properties of null`) or pass the
+    // guard entirely and fail later at SQLite bind time — either way defeating
+    // the reason this is a function: a NAMED failure.
+    for (const id of [null, 7, ["a"], { length: 3 }, undefined]) {
+      expect(() =>
+        journalEventForInboundUser({ id: id as unknown as string, text: "hi" }),
+      ).toThrow(/requires a non-empty string id/);
+    }
+  });
+
+  it("THROWS on an id longer than the 128-char ingress bound", () => {
+    // Same bound and same reason as `ingress-dedupe.ts`'s `ingressDedupeKey`,
+    // this plugin's established handling of exactly this field. An unbounded
+    // client id is amplified three times per row (payload copy, indexed
+    // `message_id` copy, unique-index entry), so fifty 1 MB ids are ~150 MB.
+    expect(() =>
+      journalEventForInboundUser({ id: "z".repeat(129), text: "hi" }),
+    ).toThrow(/at most 128 characters \(received 129\)/);
+    expect(() =>
+      journalEventForInboundUser({ id: "z".repeat(1_000_000), text: "hi" }),
+    ).toThrow(/at most 128 characters/);
+    // Exactly at the bound is fine.
+    expect(
+      journalEventForInboundUser({ id: "z".repeat(128), text: "hi" }).kind,
+    ).toBe("user");
+  });
+
+  it("does NOT bound the length of a plugin-minted agent id", () => {
+    // The asymmetry is deliberate: agent ids are ours, and treating an over-long
+    // one as id-less would drop DELIVERED text from the journal (N10). Only the
+    // client-supplied inbound id is bounded.
+    const longAgentId = "a".repeat(1_000);
+    expect(
+      journalEventForOutbound({
+        type: "agent_message",
+        text: "final",
+        id: longAgentId,
+      }),
+    ).toEqual({ kind: "bubble", answerId: longAgentId, text: "final" });
+    expect(
+      isIdlessDurableFrame({ type: "agent_message", text: "t", id: longAgentId }),
+    ).toBe(false);
+  });
+
   it("THROWS on an empty id rather than journaling one", () => {
-    // `user_message.id` is optional and client-supplied, and `""` is the
-    // established fallback shape for it here — so `id: message.id ?? ""` is the
-    // likely call. Two DIFFERENT user messages under `""` collide on the
+    // `user_message.id` is optional, client-supplied and unvalidated on the
+    // wire. Two DIFFERENT user messages under `""` collide on the
     // `journal_user_once` index; the second append returns `inserted: false`,
     // which this store's contract tells the accept seam to read as an ordinary
     // non-destructive retry (§15.8). The second message's text would be gone
     // from the only SSOT user messages have (§15.7).
     expect(() => journalEventForInboundUser({ id: "", text: "first" })).toThrow(
-      /requires a non-empty id/,
+      /requires a non-empty string id/,
     );
-    expect(() =>
-      journalEventForInboundUser({
-        id: undefined as unknown as string,
-        text: "first",
-      }),
-    ).toThrow(/requires a non-empty id/);
   });
 
   it("uses the SAME id-less notion as the durable-frame branch", () => {
