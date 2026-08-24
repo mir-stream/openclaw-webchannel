@@ -327,14 +327,20 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(successfulIds(h.frames)).toHaveLength(3);
   });
 
-  it("M173d: KNOWN LIMITATION (Case X) — a single streamed answer then a tool-only last message tops up the tool lane", async () => {
+  it("M173d (Case X): a single streamed answer then a tool-only last message tops up the tool lane", async () => {
     // [one text answer A, then a tool-only LAST message] collapses to K==1 with a
     // textless current lane (the tool lane), so the lone final tops up that tool
     // lane rather than lane A. This matches prior behaviour and is NOT a
-    // regression (the old keyframe never touched a one-text-lane turn either). The
-    // sound fix needs a per-message final identity core does not expose for
-    // finals; deferred to the Phase 3 snapshot. This test pins the CURRENT
-    // behaviour so a future change to it is deliberate.
+    // regression (the old keyframe never touched a one-text-lane turn either).
+    //
+    // It is left alone ON PURPOSE, and not because anything upstream forbids a
+    // fix: at this seam the shape is byte-identical to the legitimate
+    // non-streaming-last collapse (M173c/M15a/M15b), so there is nothing to
+    // distinguish "the final belongs to A" from "the final is the last message's
+    // own text" without guessing. The flush's cursor does not guess — it settles
+    // the current draft (plan §16.5.3 Q3: no retroactive attribution, and none
+    // needed) — and the snapshot leaves this bubble untouched rather than
+    // deleting it (M212b). This test pins the behaviour so a change is deliberate.
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
     h.draft.pushAnswerText({ text: "the ans" }); // lane A (gen 0), the only text lane
@@ -351,16 +357,23 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(bubbleOrder(h.frames)).toEqual(["the ans", "the answer"]);
   });
 
-  it("M173e: KNOWN LIMITATION (K>=2 mid-lane materialization failure) — positional pairing shifts", async () => {
-    // Same #111 final-identity ceiling as Case X, at the K>=2 branch. Topology
-    // A,B,C (all text) + a tool-only LAST message; B's frames drop on a transient
-    // wire failure so B never materializes. Core emits finals [tA,tB,tC].
-    // `materializedAnswerLanes()` correctly excludes B (per M13g's rule), leaving
-    // [A,C], so positional pairing shifts: tA→A (right), tB→C (WRONG lane), tC→
-    // overflow→independent. Finals are identity-less, so no sound recovery exists
-    // at this layer; the Phase 3 authoritative snapshot is the real fix. This test
-    // PINS the current behaviour so a change to it is deliberate — do NOT add
-    // mitigation code to make it "pass differently."
+  it("M173e (#238): K>=2 mid-lane materialization failure — the cursor keeps step, every final lands on its OWN lane", async () => {
+    // Topology A,B,C (all text) + a tool-only LAST message; B's frames drop on a
+    // transient wire failure so B never materializes. Core emits finals [tA,tB,tC]
+    // as an ORDERED array (`[core] dispatch-from-config.ts:3886,3941`).
+    //
+    // This fixture used to pin the OPPOSITE: with `materializedAnswerLanes()` as
+    // the candidate list, B fell out ([A,C]) and every later index skewed — tB
+    // landed on C (corrupting a lane that had produced its own text) and tC
+    // overflowed to a stray bubble. That was never a core limitation; it was
+    // order we discarded ourselves (plan §16.5.3). The candidate list is now
+    // `streamedAnswerLanes()`, so the forward-only cursor keeps step with core's
+    // array and each final settles the lane that actually streamed its prefix.
+    //
+    // B's bubble is BORN HERE, at drain: its earlier frames all failed, so it
+    // owned no wire id and the final is its first successful send. That is why it
+    // arrives LAST on the wire — and why the ordered `turn_snapshot` below, not
+    // arrival order, is what the client renders (M212a).
     const h = makeDraftHarness({
       // Fail every frame carrying B's text (progress AND final) so lane B never
       // materializes, modelling a mid-sequence transient publish failure.
@@ -387,24 +400,42 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     await expect(h.draft.finalize("tC")).resolves.toBe(true); // buffered
     await h.draft.drain();
 
-    // tA → A (correct); tB → C (WRONG lane — the pinned limitation); tC → independent.
+    // tA → A and tC → C, each on its OWN id. No lane is overwritten with another
+    // message's text, and there is no overflow at all.
     const lastFinalOn = (id: string) =>
       h.frames.filter((frame) => frame.type === "final" && frame.id === id).at(-1)!.text;
     expect(lastFinalOn(idA)).toBe("tA");
-    expect(lastFinalOn(idC)).toBe("tB");
-    const tcFrame = h.frames.find((frame) => frame.text === "tC")!;
-    expect(tcFrame.id).not.toBe(idA);
-    expect(tcFrame.id).not.toBe(idC);
+    expect(lastFinalOn(idC)).toBe("tC");
+    // tB reaches the wire on a THIRD id — lane B's own, minted by this first
+    // successful send. Under the old candidate list B's content never shipped as a
+    // frame at all; here it does.
+    const tbFrame = h.frames.find((frame) => frame.text === "tB")!;
+    expect(tbFrame.id).not.toBe(idA);
+    expect(tbFrame.id).not.toBe(idC);
+    // Arrival order is [tA][tC][tB] because B had no slot to claim until now. The
+    // snapshot is what fixes the render (M212a); pinned here so the asymmetry
+    // between wire order and snapshot order stays a deliberate, visible fact.
+    expect(bubbleOrder(h.frames)).toEqual(["tA", "tC", "tB"]);
   });
 
   // #212 (Phase 3, targeted) — the authoritative `turn_snapshot` emitted at drain.
   // These ADD snapshot assertions on the #215 shapes; the existing frame-level
   // assertions above (M173a-e) are deliberately left unchanged.
-  it("M212a: mid-lane K>=2 — snapshot carries streamed [A][B][C] and removes the overflow bubble", async () => {
+  it("M212a (#238): mid-lane K>=2 — the snapshot carries each lane's AUTHORITATIVE final in order, and removes nothing", async () => {
     // Same topology as M173e: A,B,C all stream; B's frames all fail (never
-    // materializes); tool-only last. Finals [tA,tB,tC] mis-route (tB→C, tC→
-    // independent). The snapshot must yield the CORRECT ordered STREAMED content
-    // regardless: [A][B][C], with the overflow bubble named in `remove`.
+    // materializes); tool-only last. Finals [tA,tB,tC].
+    //
+    // Before #238 the finals mis-routed (tB→C, tC→a stray bubble) and this
+    // fixture's job was DAMAGE CONTROL: republish the streamed [A][B][C] and name
+    // the stray in `remove`. Both halves of that are now obsolete. The cursor
+    // routes every final correctly, so:
+    //   - the snapshot carries each lane's FULL final text (tA/tB/tC), not the
+    //     truncated last partial — `cursorConsumesEveryCandidate` holds (3 finals,
+    //     3 streamed candidates), so each final is authoritative for its own lane;
+    //   - there is no overflow bubble, so `remove` is empty. That matters beyond
+    //     tidiness: the old `remove` entry pointed at tC, whose text existed
+    //     NOWHERE in `answers` (they carried the streamed prefixes), so the client
+    //     was being told to delete unique content.
     const h = makeDraftHarness({ decide: (attempt) => attempt.text !== "B" });
     h.draft.handleAssistantMessageBoundary();
     h.draft.pushAnswerText({ text: "A" });
@@ -425,21 +456,21 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     await h.draft.finalize("tC");
     await h.draft.drain();
 
-    const tcId = h.frames.find((frame) => frame.text === "tC")!.id;
     expect(h.snapshots).toHaveLength(1);
     const snap = h.snapshots[0];
     expect(snap.turnId).toBe("turn-1");
-    // Streamed content, in generation order — immune to the mis-routed finals.
-    expect(snap.answers.map((a) => a.text)).toEqual(["A", "B", "C"]);
-    // A and C keep their materialized ids; B (never materialized) gets a minted id.
+    // Authoritative final text per lane, in GENERATION order — which is also the
+    // repair for M173e's [tA][tC][tB] arrival order.
+    expect(snap.answers.map((a) => a.text)).toEqual(["tA", "tB", "tC"]);
+    // A and C keep their materialized ids; B's id is the one its drain-time final
+    // minted, and it is a real wire id the client already has a bubble for.
     expect(snap.answers[0].id).toBe(idA);
     expect(snap.answers[2].id).toBe(idC);
-    expect(snap.answers[1].id).not.toBe(idA);
-    expect(snap.answers[1].id).not.toBe(idC);
-    // The overflow independent bubble is named for removal; the answer ids are not.
-    expect(snap.remove).toEqual([tcId]);
-    expect(snap.remove).not.toContain(idA);
-    expect(snap.remove).not.toContain(idC);
+    const tbId = h.frames.find((frame) => frame.text === "tB")!.id;
+    expect(snap.answers[1].id).toBe(tbId);
+    // Nothing to remove: every final found its own lane, so no bubble duplicates
+    // another and no unique content is deleted.
+    expect(snap.remove).toEqual([]);
   });
 
   it("M212a2 (P3-F1): clean K>=2 tool-only-last — the snapshot carries each lane's FULL authoritative final, not the truncated partial", async () => {
@@ -638,12 +669,22 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
 
   it("M212g: an overflow final whose message NEVER STREAMED is UNIQUE content — never named in `remove` (content-loss guard)", async () => {
     // K>=2 tool-only-last turn where the last text message C streams NO partial
-    // (its content lives only in its final). A,B stream and materialize; C does
-    // not, so `materializedAnswerLanes()` = [A,B] and C's final tC OVERFLOWS to an
-    // independent bubble. C is NOT in `answers` (it never streamed), so tC is
-    // UNIQUE content — marking it in `remove` would make the client DELETE it (a
-    // regression vs the pre-#212 mis-ordered-but-visible bubble). The turn-level
-    // guard (streamed-lane-count 2 != finals-count 3) must leave `remove` empty.
+    // (its content lives only in its final). A,B stream; C does not, so the flush's
+    // candidate list `streamedAnswerLanes()` = [A,B] and C's final tC runs PAST the
+    // end of it — an independent bubble, per plan §0.2 N10 (never a degrade, never
+    // a skip). C is NOT in `answers` precisely BECAUSE it never streamed, so tC is
+    // UNIQUE content and naming it in `remove` would make the client DELETE it.
+    //
+    // Under cursor semantics that is not a guard we have to remember to apply: an
+    // overflow final is BY CONSTRUCTION one whose content never streamed, so it can
+    // never be in `answers`, so `remove` has nothing to say about it. The overflow
+    // site passes no `supersedesAnswerLane` at all (#238).
+    //
+    // The count shortfall (2 candidates, 3 finals) also leaves A and B
+    // non-authoritative — with an unstreamed message in the turn, order-correlation
+    // is only exact up to the first one, so the snapshot keeps the streamed text.
+    // Here C is LAST so the routing happened to be right anyway; the guard does not
+    // rely on knowing that.
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary(); // first boundary: no-op
     h.draft.pushAnswerText({ text: "A" }); // lane A (gen 0), streams + materializes
