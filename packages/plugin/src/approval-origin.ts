@@ -35,7 +35,8 @@
  *     provable.
  *   - Time comparisons are STRICT. Same-millisecond equality cannot prove
  *     ordering, so it is excluded; an anomalous clock (non-finite, or moving
- *     backwards inside an epoch) closes the whole epoch.
+ *     backwards — inside an epoch OR as a rotation's new baseline) closes the
+ *     whole epoch.
  *   - EVERY live agent run that can emit an approval is represented by exactly
  *     one claim on its canonical tuple, from `onAgentRunStart` until the outer
  *     `finally` — including runs that must never be ANSWERED with, such as a
@@ -386,10 +387,11 @@ export class ApprovalOriginLeaseRegistry implements ApprovalOriginRegistry {
   }
 
   /**
-   * Capture the current clock as this epoch's barrier. A non-finite read leaves
-   * the epoch untrusted (every resolve fails closed) until a later rotation
-   * establishes a fresh finite barrier. A backwards jump IS accepted here: a
-   * rotation is exactly where a new time baseline may legitimately be drawn.
+   * Capture the current clock as this epoch's barrier. Like `readClock()`, a
+   * non-finite or backwards read leaves the epoch untrusted: accepting a
+   * backwards baseline would un-fence requests stamped before the clock jump.
+   * A finite reading still becomes the new baseline so the next forward
+   * rotation can restore trust instead of remaining pinned to a stale future.
    */
   private establishBarrier(): void {
     const value = this.now();
@@ -397,9 +399,10 @@ export class ApprovalOriginLeaseRegistry implements ApprovalOriginRegistry {
       this.clockTrusted = false;
       return;
     }
+    const previousLastObservedMs = this.lastObservedMs;
     this.barrierMs = value;
     this.lastObservedMs = value;
-    this.clockTrusted = true;
+    this.clockTrusted = value >= previousLastObservedMs;
   }
 
   /**

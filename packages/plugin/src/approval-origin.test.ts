@@ -381,6 +381,46 @@ describe("ApprovalOriginLeaseRegistry — request time", () => {
 });
 
 describe("ApprovalOriginLeaseRegistry — epoch rotation", () => {
+  it("fails closed when a rotation redraws the barrier behind the observed clock", () => {
+    const h = harness();
+    h.set(1_020);
+    // The first delivery has no live claim, but advances the registry's clock
+    // observation before the wall clock steps backwards.
+    expect(h.resolve("AcctA", 1_015)).toEqual({ kind: "no_match" });
+
+    h.set(1_010);
+    h.registry.rotateEpoch(); // backwards barrier = 1_010; epoch is untrusted
+    const postJump = h.lease("AcctA", "peerA");
+    h.set(1_012);
+    postJump.activate();
+    h.set(1_016);
+    // The preserved 1_015 stamp now looks post-barrier and post-activation, but
+    // accepting it would hand a pre-jump approval to the new peer.
+    expect(h.resolve("AcctA", 1_015)).toEqual({
+      kind: "invalid_request_time",
+    });
+  });
+
+  it("restores trust on the next forward rotation after a backwards baseline", () => {
+    const h = harness();
+    h.set(1_020);
+    expect(h.resolve("AcctA", 1_015)).toEqual({ kind: "no_match" });
+    h.set(1_010);
+    h.registry.rotateEpoch(); // backwards baseline closes this epoch
+
+    // The backwards finite reading becomes the recovery baseline, so a later
+    // forward rotation need not wait for the stale pre-jump value of 1_020.
+    h.set(1_011);
+    h.registry.rotateEpoch(); // barrier = 1_011; trust restored
+    h.set(1_012);
+    h.run("AcctA", "peerA");
+    h.set(1_016);
+    expect(h.resolve("AcctA", 1_015)).toEqual({
+      kind: "resolved",
+      peerId: "peerA",
+    });
+  });
+
   it("resolves a handle created before a rotation and activated after it (#267)", () => {
     const h = harness();
     h.set(1_010);
@@ -636,19 +676,6 @@ describe("ApprovalOriginLeaseRegistry — clock anomalies", () => {
     // Service is restored: this is a real answer about the retained claim, not
     // a clock rejection.
     expect(h.resolve("AcctA", 1_055)).toEqual({
-      kind: "resolved",
-      peerId: "peerA",
-    });
-  });
-
-  it("accepts a backwards jump at rotation as a fresh baseline", () => {
-    const h = harness(5_000);
-    h.set(1_000);
-    h.registry.rotateEpoch(); // barrier = 1_000
-    h.set(1_010);
-    h.run("AcctA", "peerA");
-    h.set(1_030);
-    expect(h.resolve("AcctA", 1_020)).toEqual({
       kind: "resolved",
       peerId: "peerA",
     });
