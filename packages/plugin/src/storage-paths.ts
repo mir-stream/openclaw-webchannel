@@ -19,6 +19,19 @@ export const CREDENTIAL_FILE_NAME = "credentials.json";
 export const CONVERSATION_KEY_FILE_NAME = "conversation-keys.json";
 export const CONVERSATION_KEY_GENERATIONS_FILE_NAME =
   "conversation-key-generations.json";
+/**
+ * v6 delivery journal (issue #239) — the plugin-owned durable event log.
+ *
+ * It lives in the SAME tuple directory as the two secret stores rather than in
+ * core's shared state dir (which doc §15.2 named). The journal holds message
+ * PLAINTEXT, so it belongs behind the same tenant/account isolation as the
+ * conversation keys that protect that plaintext in transit: this directory has a
+ * validated namespace derivation (`storage-identity.ts`) and owner-only handling
+ * (`private-file.ts:ensurePrivateDirectory`), and core's state dir would give the
+ * journal LESS separation than the keys. Full reasoning in
+ * `delivery-journal.ts`'s docblock.
+ */
+export const DELIVERY_JOURNAL_FILE_NAME = "delivery-journal.sqlite";
 
 export type TupleStoragePathOptions = StorageScopeIdentity & {
   /** Common v2 root for both tuple-scoped secret-bearing stores. */
@@ -35,6 +48,7 @@ export type TupleStoragePaths = Readonly<{
   credentialPath: string;
   conversationKeyPath: string;
   conversationKeyGenerationsPath: string;
+  deliveryJournalPath: string;
 }>;
 
 export type CredentialPathOptions = TupleStoragePathOptions & {
@@ -84,6 +98,7 @@ export function tupleStoragePaths(
       directory,
       CONVERSATION_KEY_GENERATIONS_FILE_NAME,
     ),
+    deliveryJournalPath: join(directory, DELIVERY_JOURNAL_FILE_NAME),
   });
 }
 

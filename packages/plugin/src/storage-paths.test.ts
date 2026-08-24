@@ -30,6 +30,13 @@ describe("tuple storage paths", () => {
     expect(paths.conversationKeyGenerationsPath).toBe(
       join(paths.directory, "conversation-key-generations.json"),
     );
+    // v6 #239: the delivery journal holds message PLAINTEXT, so it sits behind
+    // the same tuple isolation as the keys that protect it — not in core's
+    // shared state dir (doc §15.2's `resolveStateDir()`), which would give the
+    // plaintext less separation than its own keys.
+    expect(paths.deliveryJournalPath).toBe(
+      join(paths.directory, "delivery-journal.sqlite"),
+    );
   });
 
   it("separates exact case-sensitive tuples without exposing raw tenant in paths", () => {
