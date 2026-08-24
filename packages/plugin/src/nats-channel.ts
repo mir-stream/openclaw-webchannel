@@ -29,6 +29,17 @@ import type { CommandCatalogEntry } from "./commands-catalog.js";
 import { createIngressResultChunkWriter } from "./ingress-result-chunks.js";
 import type { IngressResultFrame } from "./ingress-result-chunks.js";
 import { logSafe } from "./log-safe.js";
+/**
+ * v6 delivery journal (#239). TYPE-ONLY on purpose — the store resolves
+ * `node:sqlite` lazily and this import is erased, so `nats-channel.ts` keeps
+ * pulling in no database runtime. The two mapper functions below are ordinary
+ * value imports; `delivery-journal-event.ts` is pure and has no runtime deps.
+ */
+import type { DeliveryJournal } from "./delivery-journal.js";
+import {
+  isIdlessDurableFrame,
+  journalEventForOutbound,
+} from "./delivery-journal-event.js";
 
 /** Preserve caught-error detail without changing primitive thrown-value rendering. */
 function formatCaughtDiagnostic(value: unknown): unknown {
@@ -130,6 +141,30 @@ export type NatsChannelLimits = {
   maxSeenMessageIdsPerPeer?: number;
 };
 
+/**
+ * v6 durable-store wiring for `NatsChannel` (#239 half 2).
+ *
+ * ⚠️ ITS OWN PARAMETER, NOT A FIELD OF `NatsChannelLimits`. `NatsChannelLimits`
+ * is memory ceilings; a durable store is not a ceiling, and folding it in there
+ * would make "tune the bounds" and "attach the SSOT" the same argument.
+ *
+ * ⚠️ CONSTRUCTOR-ONLY, DELIBERATELY — there is no `setDeliveryJournal`. The
+ * journal is persist-BEFORE-publish (see `sendToPeer`), so a channel that
+ * acquires one mid-life has already published frames that were never journaled,
+ * and a channel that swaps one has split its conversation across two files. Both
+ * are silent `live ≠ history` divergences (N8). Ownership is decided once, by
+ * whoever constructs the channel.
+ *
+ * OPTIONAL because the plaintext/test construction has no tuple directory to
+ * open a journal in; `nats-account-runtime.ts` is the production owner and
+ * always supplies one (pinned by a source guard in `index-nats-wiring.test.ts`,
+ * precisely because "optional" must not quietly become "absent in production").
+ */
+export type NatsChannelDurability = {
+  /** v6 delivery journal (#239). Absent = no journaling (tests, legacy plaintext mode). */
+  deliveryJournal?: DeliveryJournal;
+};
+
 /** S2 defaults — high enough that normal operation never evicts. */
 const DEFAULT_MAX_PEERS = 10_000;
 const DEFAULT_MAX_APPROVAL_RESOLUTIONS = 10_000;
@@ -141,6 +176,97 @@ const DEFAULT_MAX_APPROVAL_RESOLUTIONS = 10_000;
 const DEFAULT_REPLAY_WINDOW_MS = 10 * 60 * 1_000;
 const DEFAULT_MAX_SEEN_MESSAGE_IDS_PER_PEER = 2_000;
 const RESULT_LIMIT_WARNING_INTERVAL_MS = 60_000;
+/**
+ * Rate-limit window for the two delivery-journal warnings, matching
+ * `RESULT_LIMIT_WARNING_INTERVAL_MS` and `ingress-outcome.ts`'s limiter. Both
+ * categories fire once per frame when they fire at all, so an unthrottled log
+ * would be one line per outbound message.
+ */
+const DELIVERY_JOURNAL_WARNING_INTERVAL_MS = 60_000;
+
+/**
+ * The FIXED set of delivery-journal warning categories.
+ *
+ * Fixed on purpose, exactly like `ingress-outcome.ts`'s
+ * `OUTCOME_FAILURE_CATEGORIES`: the limiter's keyspace is a closed union, so no
+ * peer-controlled value (an id, a turn id, an error message) can ever become a
+ * map key and grow the warning state, and the emitted line is a fixed template
+ * plus a `logSafe`-quoted peerId plus — for a failure only — the value-free
+ * status `journalFailureDiagnostic` extracts. Never message text.
+ */
+type DeliveryJournalWarning =
+  /**
+   * The journal write path threw (either mapper call, or `append`). The send
+   * proceeds unchanged and the frame goes on to be published — see
+   * `journalOutbound`.
+   */
+  | "append-failed"
+  /** A durable frame carrying no usable id reached egress. Post-#238 a regression. */
+  | "idless-durable-frame";
+
+/**
+ * The value-free part of a journal-write failure, for the warning line.
+ *
+ * ⚠️ `error.message` IS DELIBERATELY EXCLUDED, AND THE EARLIER "it can carry the
+ * bound SQL parameters" JUSTIFICATION WAS WRONG — MEASURED, not assumed. Seven
+ * failure shapes were driven against a real `openDeliveryJournal`/`node:sqlite`,
+ * every one journaling a distinctive marker string as the bubble text:
+ *
+ *   append after close()       message "database is not open"          code ERR_INVALID_STATE (no errcode)
+ *   table dropped underneath   message "no such table: journal_event"  code ERR_SQLITE_ERROR errcode 1    errstr "SQL logic error"
+ *   sidecar holds BEGIN EXCL.  message "database is locked"            code ERR_SQLITE_ERROR errcode 5    errstr "database is locked"
+ *   raw UNIQUE/PK conflict     message "UNIQUE constraint failed: t.a" code ERR_SQLITE_ERROR errcode 1555 errstr "constraint failed"
+ *   NOT NULL violation         message "NOT NULL constraint failed: t.a"                     errcode 1299
+ *   CHECK violation            message "CHECK constraint failed: n < 5"                      errcode 275
+ *   read-only file / corrupted main file — DID NOT THROW at all (WAL: the write
+ *   lands in the already-open `-wal` sidecar)
+ *
+ * The marker never appeared in `message`, in any own property, or in the stack.
+ * So the message is not a plaintext leak. It is still excluded because it is
+ * FREE-FORM text with no contract — the CHECK case shows it echoing schema
+ * source verbatim — whereas `code`/`errcode`/`errstr` are enumerated constants.
+ * Those three are also what actually answers the operator's question, which was
+ * the other half of the objection to swallowing everything. Among the shapes
+ * ACTUALLY MEASURED above, `ERR_INVALID_STATE` (the handle was closed under us),
+ * `ERR_SQLITE_ERROR`+errcode 1 (the schema is gone) and `ERR_SQLITE_ERROR`+errcode
+ * 5 (another writer holds the lock) are three different incidents with three
+ * different fixes, and the status is the only field that separates them.
+ *
+ * ⚠️ THE PROPERTY READS ARE GUARDED. This runs inside `journalOutbound`'s catch,
+ * so a thrown object with a throwing getter (or a Proxy trap) would escape that
+ * catch and then `sendToPeer` — the exact "permanently lost message" outcome the
+ * wide `try` exists to prevent. "Nothing in the tree throws from a getter today"
+ * is the same argument that was rejected for the mapper, so it is rejected here.
+ */
+function journalFailureDiagnostic(error: unknown): string {
+  if (typeof error !== "object" || error === null) {
+    // Not an Error at all (a thrown string could BE message text) — report only
+    // that fact.
+    return `code=${logSafe(`<thrown-${typeof error}>`)}`;
+  }
+  let code: unknown;
+  let errcode: unknown;
+  let errstr: unknown;
+  try {
+    ({ code, errcode, errstr } = error as {
+      code?: unknown;
+      errcode?: unknown;
+      errstr?: unknown;
+    });
+  } catch {
+    // A throwing getter or a Proxy trap. The diagnostic is best-effort; the
+    // isolation is not.
+    return `code=${logSafe("<unreadable>")}`;
+  }
+  const parts = [
+    `code=${typeof code === "string" ? logSafe(code) : logSafe("<none>")}`,
+  ];
+  // Absent on the SDK's own state errors (ERR_INVALID_STATE), present on
+  // everything that reached SQLite.
+  if (typeof errcode === "number") parts.push(`errcode=${errcode}`);
+  if (typeof errstr === "string") parts.push(`errstr=${logSafe(errstr)}`);
+  return parts.join(" ");
+}
 
 /**
  * NATS-based message channel for WebChannel.
@@ -233,6 +359,28 @@ export class NatsChannel implements WebChannelPeerChannel {
   /** Bounded, content-free configuration-warning state for result max_payload. */
   private lastResultLimitWarningAt = Number.NEGATIVE_INFINITY;
   private suppressedResultLimitWarnings = 0;
+
+  // ---- v6 delivery journal (#239 half 2) -----------------------------------
+
+  /**
+   * The plugin-owned durable event log, or `null` when this channel does not
+   * journal (see `NatsChannelDurability`). Written on the egress path only;
+   * NOTHING in this class reads it back — the journal is a SHADOW store until
+   * #240 makes history a projection of it, so no send result depends on it.
+   */
+  private readonly deliveryJournal: DeliveryJournal | null;
+  /**
+   * Bounded, content-free warning state, one entry per FIXED category. Same
+   * shape as `lastResultLimitWarningAt`/`suppressedResultLimitWarnings` above,
+   * just keyed — see `warnDeliveryJournal`.
+   */
+  private readonly deliveryJournalWarnings: Record<
+    DeliveryJournalWarning,
+    { lastAt: number; suppressed: number }
+  > = {
+    "append-failed": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
+    "idless-durable-frame": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
+  };
   /**
    * Register-hop admission over NATS (replaces the deleted HTTP register routes).
    * Fired for a plaintext JSON request on `…{peerId}.register`; the handler runs
@@ -252,6 +400,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     tenant: string,
     crypto?: NatsChannelCryptoOptions,
     limits?: NatsChannelLimits,
+    durability?: NatsChannelDurability,
   ) {
     this.transport = transport;
     this.accountId = accountId;
@@ -277,6 +426,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     this.replayWindowMs = limits?.replayWindowMs ?? DEFAULT_REPLAY_WINDOW_MS;
     this.maxSeenMessageIdsPerPeer =
       limits?.maxSeenMessageIdsPerPeer ?? DEFAULT_MAX_SEEN_MESSAGE_IDS_PER_PEER;
+    this.deliveryJournal = durability?.deliveryJournal ?? null;
 
     // Retain the exact listener identity so account teardown can detach it.
     this.transportMessageListener = (msg: NatsMessage) => {
@@ -758,6 +908,15 @@ export class NatsChannel implements WebChannelPeerChannel {
     return `webchannel.${this.tenant}.${this.accountId}.${peerId}.out`;
   }
 
+  /**
+   * THE single outbound egress point. Every public sender funnels through it —
+   * `sendText`/`finalizeDraft`, `sendProgress`, `sendReasoning`,
+   * `sendToolActivity`, `sendTurnSettled`, `sendTurnSnapshot`, typing, history,
+   * commands, the approval frames, and (via `sendIngressResult`) the ack and
+   * inbound_rejected chunks. That is why the v6 journal hook lives HERE and
+   * nowhere else: one hook covers the whole surface, including the direct-ACK
+   * paths doc §15.7 worried about.
+   */
   private sendToPeer(peerId: string, payload: OutboundWsMessage): boolean {
     if (this.disposed || !this.transport.connected) {
       console.warn("[nats-channel] Transport not connected, cannot send");
@@ -766,20 +925,65 @@ export class NatsChannel implements WebChannelPeerChannel {
 
     const subject = this.outboundSubject(peerId);
 
+    // Fail-closed: refuse to publish until registration established a
+    // session key. We NEVER fall back to plaintext on the relay.
+    //
+    // Lifted out of the `try` below ONLY so the journal hook can sit between the
+    // REFUSALS and the WIRE WRITE. The check itself is unchanged and still runs
+    // before anything is journaled or published; `sealEnvelope` deliberately
+    // stays inside the `try`, so a throw while sealing still returns `false`.
+    let sessionKey: Uint8Array | undefined;
+    if (this.encryptionRequired) {
+      sessionKey = this.peerSessionKeys.get(peerId);
+      if (!sessionKey) {
+        console.warn(
+          `[nats-channel] Refusing to send to ${logSafe(peerId)}: no session key yet (fail-closed, no plaintext)`,
+        );
+        return false;
+      }
+    }
+
+    // ---- v6 PERSIST-BEFORE-PUBLISH (#239, NOT-list N6, doc §16.2-2) --------
+    //
+    // The durable record is committed BEFORE THE WIRE WRITE. That is the whole
+    // claim, and it is deliberately narrow: it is NOT "before we decide whether
+    // to write". It reverses the older §15.8 commit-after decision, because at
+    // the egress moment the text is already known — Telegram's
+    // persist-then-deliver, and our plugin is the Telegram server.
+    //
+    // ⚠️ IT SITS BELOW THE THREE REFUSALS (disposed, transport down, no session
+    // key) AND MUST STAY THERE. Journaling a REFUSED send was tried and is
+    // actively harmful, because of what the caller does with the `false`:
+    // `message-adapter.ts`'s `reserveProvisional` hands out a FRESH
+    // `nextMessageId()` on every attempt once the provisional preview is
+    // unavailable, `lane.id ??= reservation.id` only runs on success, and
+    // `rollbackReservation` is a no-op for a fresh id — so a peer mid-
+    // registration or a transport blip during a streaming answer does not
+    // produce one recoverable row, it produces `placement{X₁}`, `placement{X₂}`,
+    // `placement{X₃}`… one per revision, each under an id that never existed
+    // live and will never be used again. `journal_placement_once` cannot collapse
+    // them (different `message_id` each time), and at #240 replay every one
+    // becomes a phantom empty bubble: N8 in the GAINING direction, at an
+    // unbounded rate, manufactured entirely by us. A refusal also loses nothing
+    // by not being journaled — the text is already gone from the client's view
+    // (a `false` return makes `message-adapter.ts` record a delivery failure,
+    // and a thrown send moves the message to `failed`, never re-sent), so a row
+    // for it would only make history show what live never showed.
+    //
+    // The window §16.2-2 actually describes is the one that REMAINS: `sealEnvelope`
+    // or `transport.publish` throwing after this line. There the record is
+    // committed and the frame does not reach the peer, and that is the SAFE
+    // direction on purpose — history has it and the reconnect catches up, rather
+    // than the client holding a message the store lacks.
+    this.journalOutbound(peerId, payload);
+
     try {
-      if (this.encryptionRequired) {
-        // Fail-closed: refuse to publish until registration established a
-        // session key. We NEVER fall back to plaintext on the relay.
-        const key = this.peerSessionKeys.get(peerId);
-        if (!key) {
-          console.warn(
-            `[nats-channel] Refusing to send to ${logSafe(peerId)}: no session key yet (fail-closed, no plaintext)`,
-          );
-          return false;
-        }
+      if (sessionKey) {
+        // `sessionKey`, not `this.encryptionRequired` — equivalent, because an
+        // encrypted channel without a key has already returned above.
         const wire = sealEnvelope(
           { accountId: this.accountId, tenant: this.tenant, sub: peerId },
-          key,
+          sessionKey,
           payload,
         );
         this.transport.publish(subject, wire);
@@ -845,6 +1049,154 @@ export class NatsChannel implements WebChannelPeerChannel {
       "[nats-channel] ingress result frame cannot fit effective NATS max_payload; " +
         `increase the server limit (suppressed=${suppressed})`,
     );
+  }
+
+  /**
+   * Commit one outbound frame to the delivery journal. Called by `sendToPeer`
+   * BEFORE publishing; see the block comment there for the ordering rationale.
+   *
+   * ⚠️ THIS FUNCTION CANNOT CHANGE A SEND RESULT, AND THAT IS THE WHOLE POINT.
+   * It returns `void` so there is no value for `sendToPeer` to branch on, and
+   * every failure of the JOURNAL WRITE PATH — both mapper calls as well as
+   * `append` — is swallowed into a rate-limited warning. Emitting that warning
+   * is itself a bare `console` call, on exactly the same footing as the
+   * `console.warn` this method's caller makes on each refusal and the
+   * `console.error` in its publish catch: a host that installed a faulting
+   * `console` escapes `sendToPeer` with or without this hook, so there is no
+   * fourth `try` here pretending otherwise. §15.8
+   * names the forbidden outcome exactly: turning a journal failure into
+   * `sendToPeer` → `false` would roll back the caller's reservation and make it
+   * retry the same content under a DIFFERENT id — the store meant to preserve
+   * identity would be the thing destroying it. The journal is a shadow store
+   * until #240; nothing reads it, so nothing may depend on it.
+   *
+   * ⚠️ SYNCHRONOUS, IN EGRESS ORDER. No batching, no queue, no promise. §15.8's
+   * last bullet: a deferred append reorders the stream, and the stream's ORDER
+   * *is* the identity model (doc §16.5.3 — there is no pointer from a final back
+   * to its answer, there is only order).
+   */
+  private journalOutbound(peerId: string, payload: OutboundWsMessage): void {
+    const journal = this.deliveryJournal;
+    if (!journal) return;
+
+    // ⚠️ THE `try` COVERS THE WHOLE JOURNAL WRITE PATH — BOTH MAPPER CALLS AS
+    // WELL AS `append` — AND THE SCOPE IS THE POINT. The isolation above must be
+    // enforced by this MECHANISM, not by the type checker happening to know that
+    // today's two mapper functions do not throw: `sendToPeer`'s callers are
+    // written for a boolean, and a throw escaping here is strictly WORSE than
+    // the `false` return §15.8 forbids. `message-adapter.ts`'s delivery comment
+    // spells the consequence out — a thrown send moves the message to `failed`
+    // and it is never re-sent, i.e. permanently lost, where a `false` at least
+    // retries. Nothing in the tree can throw through here today; the `try` is
+    // what keeps that true after the mapper grows (#242 widens the event set).
+    try {
+      // Checked BEFORE the mapper, which cannot distinguish "not durable" from
+      // "durable but unusable": both come back as `null`.
+      //
+      // Post-#238 every durable frame carries a plugin-minted id, from
+      // `message-adapter.ts`'s `nextMessageId()` at the delivery act. The call
+      // sites are deliberately NOT listed here — there are a dozen across
+      // `message-adapter.ts`, `inbound.ts`, `channel.ts` and
+      // `nats-account-runtime.ts`, and a partial census is worse than none: it
+      // invites the next reader to "correct" it. The reducer's BOUNDARY 1
+      // enumerates the ones that USED to be id-less, which is the list that
+      // matters. So this branch is a REGRESSION DETECTOR, not a case we handle — hence
+      // `error`, not `warn`, and `delivery-journal-event.ts`'s
+      // `isIdlessDurableFrame` docblock says so explicitly ("Half 2 logs it at
+      // `error`"). We do not mint an id here and store the text anyway: by this
+      // point the frame is on its way to the client, which mints its OWN local
+      // id for an id-less bubble, so a row under a different id is exactly the
+      // `live ≠ history` divergence (N8) the store exists to kill. The real
+      // repair is a server-assigned id before egress — doc §16.2-1, issue #243.
+      if (isIdlessDurableFrame(payload)) {
+        this.warnDeliveryJournal("idless-durable-frame", peerId);
+        return;
+      }
+
+      // `null` = this frame is not (or not yet) a durable message. The mapper
+      // owns that verdict and documents every case; do not second-guess it here.
+      const event = journalEventForOutbound(payload);
+      if (!event) return;
+
+      // D1 — THE CONVERSATION ID IS THE `peerId`. The journal FILE is already
+      // scoped to (tenant, accountId) by its path (`storage-paths.ts`'s
+      // `deliveryJournalPath`), so the peerId completes the triple. It is the
+      // authenticated JWT `sub` claim: immutable, plugin-owned, and with no
+      // dependence on core's mutable route or agentId. Doc §16.2-7 — which is
+      // also why this seam needs no route knowledge and therefore none of
+      // §15.5's per-turn route-scoped callback (the "P-J probe" is dissolved,
+      // not deferred).
+      journal.append(peerId, event);
+    } catch (error) {
+      // `append-failed` covers the whole write path, mapper throw included: from
+      // the caller's side both are "this frame got no durable row".
+      this.warnDeliveryJournal(
+        "append-failed",
+        peerId,
+        journalFailureDiagnostic(error),
+      );
+    }
+  }
+
+  /**
+   * Rate-limited journal diagnostic. Fixed category set, 60 s per category, with
+   * the suppressed count carried into the next line — the shape
+   * `warnResultLimitTooSmall` above and `ingress-outcome.ts`'s
+   * `createRateLimitedOutcomeFailureWarning` already use.
+   *
+   * ⚠️ TWO SINKS, ONE THROTTLE, AND THE SPLIT IS DELIBERATE:
+   *  - `append-failed` → `console.warn`. The journal is a SHADOW store in this
+   *    slice: nothing reads it, no send result changes, so a failed write is a
+   *    degradation of something not yet load-bearing. #240 is where it becomes
+   *    fatal, and that slice owns raising it.
+   *  - `idless-durable-frame` → `console.error`. Post-#238 this cannot happen
+   *    without a regression, and when it does it means DELIVERED text is missing
+   *    from the store — a defect, not a hiccup. `delivery-journal-event.ts`'s
+   *    `isIdlessDurableFrame` docblock already states this level ("Half 2 logs
+   *    it at `error`"); the two files must not disagree.
+   *
+   * Both stay THROTTLED at the same interval. The failure mode either category
+   * announces is sustained (one line per outbound frame), so an unthrottled
+   * `error` would bury the log; the `suppressed=N` count is what makes the
+   * difference between one hiccup and a live regression visible.
+   *
+   * ⚠️ NO MESSAGE TEXT, EVER. The line has exactly THREE variable parts and no
+   * others: the fixed `category`; the `peerId`, quoted and escaped through
+   * `logSafe` like every other peer-derived value in this class (#123
+   * log-record integrity); and `diagnostic` — the one part derived from an
+   * arbitrary caught value, which is why it never comes from the caller
+   * directly but only from `journalFailureDiagnostic`, whose docblock records
+   * the measurement showing its three fields are value-free. (`suppressed` is
+   * this class's own counter.)
+   */
+  private warnDeliveryJournal(
+    category: DeliveryJournalWarning,
+    peerId: string,
+    diagnostic?: string,
+  ): void {
+    const entry = this.deliveryJournalWarnings[category];
+    const now = Date.now();
+    if (now - entry.lastAt < DELIVERY_JOURNAL_WARNING_INTERVAL_MS) {
+      entry.suppressed++;
+      return;
+    }
+    const suppressed = entry.suppressed;
+    entry.lastAt = now;
+    entry.suppressed = 0;
+    // ⚠️ "the send result is unchanged" — NOT "delivery is unaffected", and NOT
+    // "this frame never reached the peer". The hook runs BELOW all three
+    // refusals, so on every path that reaches either warning the frame goes on
+    // to be published: the operator's remediation is "delivered, no durable
+    // row", not "undelivered". The single exception is the wire write throwing
+    // after the commit, and that path logs its own `Failed to send to peer`
+    // line. What the journal genuinely cannot change is the boolean
+    // `sendToPeer` returns.
+    const line =
+      `[nats-channel] delivery journal ${category} for peer ${logSafe(peerId)}; ` +
+      `this frame has no durable row, the send result is unchanged` +
+      `${diagnostic === undefined ? "" : ` ${diagnostic}`} (suppressed=${suppressed})`;
+    if (category === "idless-durable-frame") console.error(line);
+    else console.warn(line);
   }
 
   private handleNatsMessage(msg: NatsMessage): void {
