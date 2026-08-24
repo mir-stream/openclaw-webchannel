@@ -136,8 +136,9 @@ export type DurableView = readonly DurableMessage[];
  * The ordered event stream the plugin would journal. Each event corresponds to a
  * real wire frame the client consumes today — the shapes below were read off
  * `packages/plugin/src/channel-contract.ts` (`OutboundWsMessage`) and the
- * wrapper's `handleFrame` cases (…:2061 — `handleMessage` at …:2048 only
- * delegates to it), and every transition is anchored against the
+ * wrapper's `handleFrame` cases (…:2061 — `handleMessage` at …:2048 is the
+ * outer entry point, which brackets that switch with the live-turn latch
+ * observation and the release gate), and every transition is anchored against the
  * REAL client in `durable-view-reducer.test.ts`. What that covers is the four
  * kinds below; see the two BOUNDARY notes after the type for what it does not.
  *
