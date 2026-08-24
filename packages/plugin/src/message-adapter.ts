@@ -215,8 +215,9 @@ type AssistantDraftLane = {
    * lane, and `outstandingRecordsAtIndex`/`retireOneRecordAtIndex` match on it to
    * retire a barrier), and every one of those is load-bearing. Do not read
    * "separate" as "the ordinal is unused over there" and delete a read on that
-   * basis; a review pass did exactly that to the arming branch and measured 19
-   * red, all of them "the next lane never streams".
+   * basis; a review pass did exactly that to the arming branch and measured 20
+   * red on this tree, all of them the same shape — a lane held past the point it
+   * should have released, so the next message never streams.
    *
    * This field is used ONLY by `laneForAssistantMessageIndex` for the #172
    * block-suppression decision and never feeds ordering.
