@@ -787,21 +787,31 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     }
   });
 
-  it("M5: multiple unresolved indexless candidates retain the earliest barrier and diagnose ambiguity", async () => {
-    const warn = vi.fn();
-    const h = makeDraftHarness({ logger: { warn } });
-    h.draft.handleAssistantMessageBoundary();
-    h.draft.handleAssistantMessageBoundary();
-    h.draft.handleAssistantMessageBoundary();
-    h.draft.pushAnswerText({ text: "C" });
-    h.draft.noteBlockReplyQueued({});
+  // Parametrised over the ordinal on purpose: the diagnostic and the chosen
+  // barrier are properties of LANE STATE, so carrying core's ordinal must not
+  // change either one. Before #238 the indexed row took a different code path
+  // and never warned at all.
+  it.each([
+    ["an indexless reservation", {}],
+    ["an indexed reservation", { assistantMessageIndex: 1 }],
+  ])(
+    "M5: multiple unresolved candidates retain the earliest barrier and diagnose ambiguity for %s",
+    async (_name, queued) => {
+      const warn = vi.fn();
+      const h = makeDraftHarness({ logger: { warn } });
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushAnswerText({ text: "C" });
+      h.draft.noteBlockReplyQueued(queued);
 
-    expect(h.frames).toEqual([]);
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn.mock.calls[0]![0]).toContain("ambiguous indexless block reservation");
-    await h.draft.drain();
-    expect(h.frames.map((frame) => frame.text)).toEqual(["C"]);
-  });
+      expect(h.frames).toEqual([]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]![0]).toContain("ambiguous block reservation has 2 ");
+      await h.draft.drain();
+      expect(h.frames.map((frame) => frame.text)).toEqual(["C"]);
+    },
+  );
 
   it("M6: a callback-only lane produces no bubble after skip, cancel, or drain", async () => {
     for (const lifecycle of ["skip", "cancel", "drain"] as const) {
@@ -1347,22 +1357,33 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
   });
 
   /**
-   * #94 — the index base and the release timer meet.
+   * #94/#238 — the release timer, and the ordinal that used to decide the
+   * barrier lane.
    *
-   * Core's queued-block context is 1-BASED on the pinned core (message A = 1),
-   * while lane generations are 0-based, so `assistantMessageIndexMatchesLane`
-   * mis-attaches A's reservation to B — or, when A's block is queued while A is
-   * still the current lane, attaches it nowhere at all because generation 1 does
-   * not exist yet. Either way lane A is left text-less with an EMPTY barrier
-   * list, which is exactly the shape the release timer treats as "tool-only,
-   * nothing is coming". It then releases A and B streams ahead of A's block.
+   * HISTORY, because this fixture only makes sense with it. A queued block used
+   * to pick its barrier lane by comparing core's `assistantMessageIndex` to
+   * `lane.generation`. Core's ordinal is 1-BASED (message A = 1) and generations
+   * are 0-based, so on the shape below — A's block queued while A is still the
+   * current lane — generation 1 did not exist yet and NO barrier was created.
+   * Lane A was then text-less with an empty barrier list, which is exactly what
+   * the release timer treats as "tool-only, nothing is coming": it released A and
+   * B streamed ahead of A's block. Measured then, as bubble first-appearance
+   * order (which decides screen position — a terminal frame lands in the bubble
+   * its first frame created): ["B text", "A block"].
    *
-   * Measured before the fix, as bubble first-appearance order (which is what
-   * decides screen position — a terminal frame lands in the bubble its first
-   * frame created):  ["B text", "A block"].
+   * What kept that survivable was the turn-wide gate in
+   * `releasableEmptyPredecessors`, which refuses to release while ANY reservation
+   * in the turn is pending, whatever lane it did or did not attach to. That is
+   * still the property this fixture pins, and it is why the assertion is written
+   * against the release rather than against a lane's barrier list.
    *
-   * These fixtures are deliberately 1-BASED. A 0-based fixture cannot see this
-   * defect at all, and 0 is a value the pinned core never emits.
+   * The ordinal comparison is now deleted (#238): reservations attach by lane
+   * state, so this block attaches to A — its own, correct lane — at queue time.
+   * The barrier that used to be absent now exists, and the fixture holds for the
+   * stronger reason as well as the original one.
+   *
+   * The 1-BASED index is still deliberate. It is what the pinned core emits, and
+   * a fixture written with 0 would have been blind to the old defect entirely.
    */
   it("M6t: a pending block reservation blocks the release, whatever lane it attached to", async () => {
     vi.useFakeTimers();
@@ -1389,6 +1410,157 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  /**
+   * #238 — THE INVARIANT: the ordinal is inert for barrier attachment.
+   *
+   * A block reservation picks its barrier lane from lane state alone. Core's
+   * `assistantMessageIndex` may ride along (it is still how a settlement finds
+   * the record it retires), but it must never decide WHICH lane the record
+   * belongs to — plan §0.2 N5, §16.5 precision note 1: core's own Telegram
+   * extension reads the ordinal as a block-rotation hint and never as an
+   * identity key.
+   *
+   * So the same lane state must produce the same barrier for every ordinal, and
+   * for no ordinal at all. Every row below queues A's block while A is still the
+   * current lane, and A's lane is the correct answer in all of them.
+   *
+   * The rows are chosen to be maximally hostile to the deleted mapping
+   * (`assistantMessageIndex === lane.generation`), which answered each one
+   * differently: 0 hit A by luck, 1 — the value the pinned core actually emits
+   * for message A — hit nothing at queue time and then B on the next rotation,
+   * and 7 hit nothing, ever.
+   *
+   * WHAT THIS DOES NOT DO: discriminate. It is green on the pre-#238 tree too,
+   * because the turn-wide gate in `releasableEmptyPredecessors` withholds B on
+   * that tree for a different reason — a pending reservation anywhere in the
+   * turn — and this fixture cannot see which reason applied. Read it as a
+   * CHARACTERIZATION of the unified path, kept because the slice's headline
+   * invariant deserves to be stated executably and in one place. The teeth are
+   * in M238b, which observes the barrier LANE through the retirement seam and
+   * does go red on the old tree. Against a merely RE-BASED mapping
+   * (`generation === assistantMessageIndex - 1`) not even M238b bites — measured,
+   * all eight M238 rows stay green — and the only net is the source guard in
+   * `message-adapter-ordinal-attachment.test.ts`.
+   */
+  it.each([
+    ["no ordinal at all", undefined],
+    ["a 0-based ordinal the pinned core never emits", 0],
+    ["core's real 1-based ordinal for message A", 1],
+    ["an ordinal no lane will ever have", 7],
+  ])(
+    "M238a: a queued block attaches by lane state, not by %s",
+    async (_name, assistantMessageIndex) => {
+      const queued =
+        assistantMessageIndex === undefined ? {} : { assistantMessageIndex };
+      const h = makeDraftHarness();
+      h.draft.handleAssistantMessageBoundary(); // lane 0 = A, text-less
+      h.draft.noteBlockReplyQueued(queued); // A's block, queued while A is current
+      h.draft.handleAssistantMessageBoundary(); // lane 1 = B
+      h.draft.pushAnswerText({ text: "B text" });
+
+      // The barrier is on A, so B is held and A's block reaches the wire first.
+      await h.draft.deliverAuthorizedBlock({ text: "A block" });
+      expect(h.frames.map((frame) => frame.text)).toEqual(["A block"]);
+
+      await h.draft.drain();
+      expect(bubbleOrder(h.frames)).toEqual(["A block", "B text"]);
+    },
+  );
+
+  /**
+   * #238 — the same invariant read through the RETIREMENT seam, which is where
+   * the barrier lane is observable without waiting for drain.
+   *
+   * Retiring the reservation resolves the lane it attached to; if that lane is
+   * text-less it flips to `"empty"` and its successor is released on the spot.
+   * So "which lane did this attach to" becomes "which lane got released", and
+   * that is visible immediately, with no timer and no drain.
+   *
+   * Indexed rows only, because retirement itself is index-keyed: a settlement
+   * carries an `assistantMessageIndex` and `retireOneRecordAtIndex` uses it to
+   * find the record that settled. That is lifecycle bookkeeping and is NOT what
+   * this slice removed — an indexless reservation genuinely cannot be retired
+   * before drain (M6c pins that). What must not vary is the barrier LANE, and
+   * these rows vary the ordinal across every value the deleted mapping treated
+   * differently.
+   */
+  it.each([[0], [1], [7]])(
+    "M238b: retiring a block released ITS OWN lane, whatever ordinal it carried (%i)",
+    async (assistantMessageIndex) => {
+      const h = makeDraftHarness();
+      h.draft.handleAssistantMessageBoundary(); // lane 0 = A, text-less
+      h.draft.noteBlockReplyQueued({ assistantMessageIndex });
+      h.draft.handleAssistantMessageBoundary(); // lane 1 = B
+      h.draft.pushAnswerText({ text: "B text" });
+      await h.draft.deliverAuthorizedBlock({ text: "A block" });
+      expect(h.frames.map((frame) => frame.text)).toEqual(["A block"]);
+
+      h.draft.noteDeliveryLifecycle("settled", {
+        deliveryKind: "block",
+        assistantMessageIndex,
+      });
+      // A is now demonstrably empty, so B streams at once — no release timer,
+      // no drain. Under the deleted mapping this held for `0` only.
+      expect(h.frames.map((frame) => frame.text)).toEqual(["A block", "B text"]);
+    },
+  );
+
+  /**
+   * #238 — an ordering INVERSION the deleted mapping allowed, and the reason the
+   * ordinal has to be inert rather than merely re-based.
+   *
+   * A emits two blocks. The first settles; the second is still in flight when B
+   * starts streaming. The ordinal stamps are deliberately DIFFERENT (0 and 1),
+   * which is the point: the ordinal is an input this controller does not control
+   * — core resets that counter per subscription and bumps it on retry (plan
+   * §16.5) — so no value of it may open a hole in the barrier. Under the deleted
+   * mapping this pair did:
+   *
+   *   - the `0` reservation matched lane generation 0 and attached to A;
+   *   - retiring it emptied A's barrier list, and A is text-less, so A flipped to
+   *     `"empty"` — resolved — while A's SECOND block was still outstanding;
+   *   - the `1` reservation had matched nothing at queue time and was picked up
+   *     by the rotation pass onto lane 1 = B, where a barrier holds no one (a
+   *     barrier holds SUCCESSORS, and B is its own lane);
+   *   - so `predecessorsResolved(B)` was true and B streamed.
+   *
+   * Measured on the pre-#238 tree as bubble order: ["A block 1", "B text",
+   * "A block 2"] — message B's bubble permanently above message A's own block.
+   * The turn-wide gate in `releasableEmptyPredecessors` does not cover it,
+   * because that gate only withholds the empty-predecessor RELEASE TIMER and
+   * nothing here goes through the timer.
+   *
+   * Attaching by lane state closes it: both reservations land on A, so retiring
+   * the first leaves A still held by the second.
+   *
+   * HONESTY NOTE about what this does NOT show: with core's real 1-based stamps
+   * both of A's blocks carry the same ordinal (`1`), the deleted mapping put both
+   * on B, and A stayed unresolved — so B was held there too. No stream-ahead
+   * shape was found using only ordinals the pinned core actually emits; on those,
+   * the deletion's gain is the earlier, correct release pinned by M238b rather
+   * than a fixed inversion.
+   */
+  it("M238c: no ordinal value can leave a still-pending block's lane unheld", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary(); // lane 0 = A, text-less
+    h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 }); // A's first block
+    h.draft.noteBlockReplyQueued({ assistantMessageIndex: 1 }); // A's second block
+    await h.draft.deliverAuthorizedBlock({ text: "A block 1" });
+    h.draft.noteDeliveryLifecycle("settled", {
+      deliveryKind: "block",
+      assistantMessageIndex: 0,
+    });
+
+    h.draft.handleAssistantMessageBoundary(); // lane 1 = B
+    h.draft.pushAnswerText({ text: "B text" });
+    // B is still held: A carries the second block's barrier.
+    expect(h.frames.map((frame) => frame.text)).toEqual(["A block 1"]);
+
+    await h.draft.deliverAuthorizedBlock({ text: "A block 2" });
+    await h.draft.drain();
+    expect(bubbleOrder(h.frames)).toEqual(["A block 1", "A block 2", "B text"]);
   });
 
   it("M6u: a retired reservation stops blocking the release", async () => {
@@ -1661,9 +1833,13 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     // the loop settles lane 1 first, putting assistant message 1 above message 0.
     //
     // The two shapes are distinguished only by WHOSE block just arrived, which is
-    // the delivery identity this seam does not have (#111). Scoping the loop by
-    // `barrierGeneration` instead would rest the ordering on the 1-based index
-    // matcher that is already documented as unsound, so it is not a way out.
+    // the delivery identity this seam does not have. Scoping the loop by
+    // `barrierGeneration` was rejected when that generation came from the
+    // ordinal→generation comparison, because it rested the ordering on a mapping
+    // documented as unsound. That comparison is gone (#238; barriers attach by
+    // lane state now), so the old reason no longer applies — but the alternative
+    // has NOT been re-measured against this pair, so it is not adopted here and
+    // this fixture keeps pinning the shipped whole-function stand-down.
     vi.useFakeTimers();
     try {
       const h = makeDraftHarness({ throttleMs: 600 });
