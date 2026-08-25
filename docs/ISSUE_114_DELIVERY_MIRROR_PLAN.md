@@ -650,6 +650,10 @@ egress에서 **클라가 view에 쓰는 이벤트만, 전송 순서(seq)대로**
   - `remove` 후 늦은 same-id `bubble` = **부활**(order-sensitive, tombstone 지배 아님; codex5). answers ∩ remove = answers win.
 - **durable-view ⊥ client-local state**: reducer는 durable view(answers/notices/순서/텍스트)만. sendState/working/held 등 클라 로컬 UI 상태는 reducer 밖(북극성: 클라가 자기 send state 소유).
 - **journal_message(materialized) 완전 명세**(codex9): stable rank(슬롯 순서), tombstone 표현, revision, projector checkpoint(seq high-water), cursor 정의. pagination은 이 테이블에서(projected message 순서). log-prefix 삭제 시 checkpoint를 새 truth로 원자 승격(경계 명시).
+  - ⚠️ **#240 half 1(2026-08-25)은 이 테이블 **없이** projection을 냈다 — 의도적 편차이고, 실측이 그 편차를 더 비싸게 만들었다.** `packages/plugin/src/journal-history.ts`가 대화 전체를 공유 reducer로 **매번 재생**하고 두 page selector는 그 결과를 자른다. 정확성은 맞다(순서를 정할 자격은 reducer뿐). 비용은 **독립 2회 실측**: 20 000 이벤트/10 000 메시지에서 raw read 61–70 ms, **reducer fold 1 323–1 392 ms**, 전체 projection 1 450–1 510 ms, 이벤트 2배당 3.6–4.6배. 표의 정본은 `journal-history.ts` 헤더(구현자 측정, 3회 중 최선)이고, 여기 범위는 Advisor의 독립 재실행을 합친 것 — 두 실행은 같은 박스·다른 warmup이라 절대값이 ~10% 다르고 성장 지수도 구간마다 다르지만, **결론(quadratic, fold 지배)은 동일**하다. 지수 하나를 인용하지 말고 범위로 인용할 것.
+    - **비싼 건 SQL이 아니라 fold이고, fold는 대화 길이에 대해 QUADRATIC이다.** `applyPlacement`/`applyBubble`이 `view.findIndex`로 upsert하고 모든 transition이 view 전체 배열을 새로 만든다. live에선 무해(짧은 view에 이벤트 하나씩)하고, **플러그인 쪽에 빠른 사설 fold를 두는 건 두 번째 구현 = N8이라 금지.** chunk 크기는 무관(128/512/4096이 1.5% 이내)이라 메모리 경계는 공짜.
+    - 결론: **reconnect 스냅샷 1회는 오늘 길이에선 괜찮고, page-scroll마다 전체 재생은 못 쓴다.** 진짜 답이 이 bullet의 materialized table(체크포인트에서 증분 투영)이며, 어려운 부분은 DDL이 아니라 **"체크포인트 투영 ≡ 0부터 재생"의 증명**이다(`seal`이 슬롯을 재정렬하고 create-or-update하며 `remove` 후 `bubble`이 부활하므로). → **#286.**
+  - ⚠️ **projection이 live와 갈라지는 알려진 지점 하나 — 이 절의 "발명 금지"가 아니라 §15.9의 live==history 쪽 문제다.** `progress`만 받고 `bubble`도 `seal.answers`도 못 받은 lane(중단된 턴, drain 전 연결 끊김)은 저널에 placement만 남는다. `applyPlacement`는 `text: ""` agent 버블을 append하고 reducer는 그걸 지우지 않는데, **live는 아무것도 안 그린다** — 클라가 `isSpentDraft`로 거르고(`nats-client-wrapper.ts:2010`) 그 판단을 구동하는 `draftOnly`는 **client-local이라 저널되지 않기** 때문. 그래서 순진한 재생은 live가 보여준 적 없는 빈 버블을 낸다(N8, 누락 방향). 규칙 자체가 이벤트만으론 표현이 안 되고 turn-close 이벤트가 필요할 수 있어(#241/BOUNDARY 2) → **#251·#264** 소관. #240 half 1은 이걸 고치지 않고 `journal-history.ts` 헤더에 명시해 두었다.
 
 ### 15.5 seam — route key + user-id 생애 (findings codex6/claude4, codex8)
 
@@ -664,6 +668,8 @@ egress에서 **클라가 view에 쓰는 이벤트만, 전송 순서(seq)대로**
 - 기존(배포 이전) 대화는 **버려진다**(파괴적). 클라 history 3-tier 텍스트/위치 adoption도 함께 제거 가능(더 이상 legacy core row 없음).
 - write 실패: 저널이 유일 저장소이므로 **실패 = 접수 실패**로 다룬다(§15.7의 hard 요건과 동일 규율); 조용한 빈-세션 위장 금지.
 - **이점**: §0("core transcript 안 읽음")이 전환기 예외 없이 **문자 그대로 즉시 성립.** 설계가 크게 단순해짐.
+- 🚧 **구현 상태(2026-08-25): 아직 안 됐다. #240 half 1은 엔진만 냈고 아무 데도 안 붙였다.** `journal-history.ts`가 저널을 history view로 접을 수 있게 됐을 뿐, 살아있는 history 경로는 여전히 core transcript를 읽는다(`history.ts`의 `getSessionMessages`, `runDetachedHistoryRead`). 즉 **N2는 아직 살아 있고**, 위 문단들은 목표지 현재 상태가 아니다. half 2가 두 호출부를 바꾸고 `getSessionMessages`·`AsyncResource` operator-scope 우회·`history-sanitize.ts`·클라 3-tier adoption을 **삭제**해야 이 절이 참이 된다. 그때까지 이 절을 "이미 그렇다"로 인용하지 말 것.
+  - 부수 결론 하나: `history-sanitize.ts`는 **core transcript reader가 raw 모델 출력을 받기 때문에만** 존재한다. 저널은 클라에 실제로 publish된 텍스트를 그대로 갖고 있으므로 **projection 경로에서 재-sanitize하면 그 자체가 N8이다.** half 2에서 모듈째 삭제 대상이고, 그 전까지 `journal-history.ts` 헤더가 ⚠️로 막아 둔다.
 
 ### 15.7 user-message durability = 플러그인이 유일 SSOT (사용자 정정 2026-08-23)
 
