@@ -32,9 +32,8 @@ because the thing it names does not exist. The correction:
 
 - **K seals no history at rest.** The history authority is OpenClaw core's
   session transcript: plaintext JSONL at owner-only permissions, written by
-  core, not by this plugin (the plugin's own transcript at rest is
-  `delivery-journal.sqlite` below, which K does not seal either).
-  `NatsChannel.sendHistory` seals the frame with the
+  core, not by this plugin (whose own at-rest store is `delivery-journal.sqlite`
+  below). `NatsChannel.sendHistory` seals the frame with the
   **current** K at delivery time. Replacing K therefore costs no re-encryption —
   the next read-and-deliver cycle simply reseals under the new key
   (`ISSUE_72_CONTAINMENT_PLAN.md` §1.4, RETAIN + RESEAL).
@@ -43,8 +42,9 @@ because the thing it names does not exist. The correction:
   - `credentials.json` — NATS user seed and agent identity key. Owner-only.
   - `conversation-keys.json` — the per-peer K store.
   - `conversation-key-generations.json` — the audit-only generation sidecar.
-  - `delivery-journal.sqlite`, plus its `-wal` and `-shm` sidecars — the v6
-    delivery journal, opened at account start unconditionally, with no config to
+  - `delivery-journal.sqlite`, plus its `-wal`, `-shm` and `-journal` sidecars
+    (the last only on volumes where WAL is unavailable) — the v6 delivery
+    journal, opened at account start unconditionally, with no config to
     disable it. It holds message **plaintext**, not ciphertext: `agent_message`
     text, `progress` placements, and the `turn_snapshot` rows written at turn
     end, all recorded on the egress path. Owner-only (0600) inside the 0700
@@ -56,8 +56,8 @@ because the thing it names does not exist. The correction:
     `sendToPeer` journals the payload *before* `sealEnvelope` runs, so K covers
     the wire and nothing else here. Two consequences. Count this file in the
     §0.1 exposure assessment: whoever could read `conversation-keys.json` could
-    read this too, so the exposed set includes everything the agent sent, not
-    only what K could decrypt. And deleting it is available to you as **data
+    read this too, so the exposed set is what the list above names, not only
+    what K could decrypt. And deleting it is available to you as **data
     minimization** — it removes plaintext standing on disk from here on. That
     is not containment and it does not undo past exposure (§0.1), so it is your
     call to make, not a step this procedure requires.
@@ -66,8 +66,6 @@ because the thing it names does not exist. The correction:
   That is the complete list. Nothing on it is a ciphertext store to invalidate:
   the one file holding conversation content, `delivery-journal.sqlite`, holds it
   in the clear, so the only lever over it is deletion, not invalidation.
-  (`packages/plugin/src/history-store.ts` exists but has no production caller,
-  so it writes nothing; the delivery journal does have one.)
 - **Rotating K does not disconnect anyone and does not revoke anything.** It is
   one of two independent controls. Section 2 tells you which ones you need.
 
@@ -80,7 +78,7 @@ exception that rule anticipates.** During a confirmed containment you may move
 `credentials.json` aside when the current agent credential was revoked (step
 ④-bis, per `AUTH.md`), you replace K in `conversation-keys.json` only when K
 is in scope (step ④), and you **may** delete `delivery-journal.sqlite` together
-with its `-wal`/`-shm` sidecars if you choose to clear the conversation
+with its `-wal`/`-shm`/`-journal` sidecars if you choose to clear the conversation
 plaintext they hold (§0.2 — optional, and not containment) — unlike the other
 two, that one is an outright delete, not a move-aside or an in-place
 replacement. All are done with the gateway stopped; the first two use the

@@ -985,10 +985,9 @@ export class NatsChannel implements WebChannelPeerChannel {
     // last-write-wins by id, so history has it and the reconnect catches up,
     // rather than the client holding a message the store lacks.
     //
-    // ⚠️ NOT for a lane whose FIRST wire attempt fails: `lane.id` is never
-    // assigned, so every retry re-mints and the rows accumulate under ids that
-    // never existed live. #278 carries the chain; its fix needs a size decision
-    // this slice does not own.
+    // ⚠️ NOT universally — a lane that never sends successfully accumulates
+    // rows under ids that never existed live. #278 owns that case and the
+    // conditions it needs.
     this.journalOutbound(peerId, payload);
 
     try {
