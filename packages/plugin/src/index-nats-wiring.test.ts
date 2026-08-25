@@ -193,6 +193,32 @@ describe("nats-account-runtime.ts wiring contract — v6 delivery journal (#239)
     expect(CHANNEL_SOURCE).not.toMatch(/setDeliveryJournal\s*\(/);
   });
 
+  it("passes the SAME handle to the inbound accept seam", () => {
+    // #239 half 3. `IngressOnFlushDeps.deliveryJournal` is optional for the same
+    // compile-only reason as the channel's, and it is MORE dangerous absent:
+    // doc §15.7 makes the journal write part of ACCEPTING a user message, so an
+    // unwired seam silently reverts user messages to best-effort durability —
+    // which no test outside this file can see while the store has no readers.
+    //
+    // CONTAINMENT, not an ordinal or a bare-name match: `deliveryJournal` occurs
+    // several times in this file (the declaration, the open, the channel
+    // injection, two closes), so slice the real `createIngressOnFlush({ ... })`
+    // call and require the key inside it. Verified to go red when the line is
+    // deleted.
+    const callStart = RUNTIME_SOURCE.indexOf(
+      "const onIngressFlush = createIngressOnFlush<DebounceItem>({",
+    );
+    expect(callStart).toBeGreaterThan(-1);
+    const callEnd = RUNTIME_SOURCE.indexOf("\n      });", callStart);
+    expect(callEnd).toBeGreaterThan(callStart);
+    const call = RUNTIME_SOURCE.slice(callStart, callEnd);
+
+    // Shorthand only: the handle must be the one opened above, not a second
+    // `openDeliveryJournal(...)` giving this seam its own connection.
+    expect(call).toMatch(/^\s*deliveryJournal,$/m);
+    expect(call).not.toContain("openDeliveryJournal(");
+  });
+
   /** The `try` whose `catch` converts an account-start throw into a failed start. */
   const START_TRY = "try {\n        const keyStore = new ConversationKeyStore({";
   /** The exact failed-start close, tail included — see the anchoring note below. */
