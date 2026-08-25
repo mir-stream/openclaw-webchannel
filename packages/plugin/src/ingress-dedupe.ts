@@ -44,8 +44,37 @@
  * up to stateMaxEntries). So we treat a non-string or over-length id as ID-LESS
  * (pass through un-deduped, never recorded) rather than persisting it — bounding
  * the storage-amplification surface to conforming clients.
+ *
+ * ⚠️ DERIVED FROM `MAX_INBOUND_USER_ID_LENGTH`, NOT REPEATED AS `128`, AND THAT
+ * IS LOAD-BEARING SINCE #239 HALF 3. The exported constant's own docblock already
+ * asks for this ("two doors, and they must not drift to two numbers"), but before
+ * this slice the two doors never met. Now they are in series: an id that passes
+ * `ingressDedupeKey` goes on to `journalEventForInboundUser`, which THROWS above
+ * its own bound. If this number were ever raised alone, an id of length 129 would
+ * be admitted here and then throw inside the accept seam's footer — reported as a
+ * store failure with a misleading `code="<none>"`, the whole batch refused, the
+ * client replaying the same id into the same refusal forever until `MAX_UNACKED`
+ * evicts it as a `failed` bubble. A peer-controlled permanent wedge of its own
+ * conversation, from a one-line edit. Deriving it makes THAT hole
+ * unrepresentable.
+ *
+ * ⚠️ IT DOES NOT MAKE THE CLASS UNREPRESENTABLE, AND THE NEXT PERSON TO RAISE
+ * THE NUMBER NEEDS THE LIST. Three more `128`s are hardcoded INDEPENDENTLY and
+ * are deliberately NOT derived here, because they are different concerns
+ * (wire-frame sizing, debouncer validation) and coupling them is a bigger change
+ * than this slice should make:
+ *   - `ingress-result-chunks.ts`'s `MAX_INGRESS_RESULT_ID_LENGTH`
+ *   - `bounded-inbound-debouncer.ts`'s `validId`
+ *   - `nats-account-runtime.ts`'s overflow-resolver id guard
+ * The first is the sharp one: raise `MAX_INBOUND_USER_ID_LENGTH` to 256 and both
+ * derived doors move together, so it LOOKS safe — but a 200-char id is then
+ * admitted, journaled, recorded `accepted` and dispatched, and
+ * `createIngressResultChunkWriter.add` refuses it, so no ack is ever emitted. The
+ * client replays forever and every replay takes the `existing.status === "found"`
+ * path straight back into the same refusal: the same permanent wedge, one door
+ * further along.
  */
-const MAX_INGRESS_DEDUPE_ID_LENGTH = 128;
+const MAX_INGRESS_DEDUPE_ID_LENGTH = MAX_INBOUND_USER_ID_LENGTH;
 export const MAX_CANCELLED_INBOUND_FALLBACK_TOMBSTONES = 256;
 export const MAX_CANCELLED_INBOUND_FALLBACK_BYTES = 256 * 1024;
 
@@ -112,10 +141,21 @@ export type IngressDedupeCheck = (
   options?: { namespace?: string },
 ) => Promise<boolean>;
 
-/** Minimum item shape: a routable peer and a message that may carry a dedupe id. */
+/**
+ * Minimum item shape: a routable peer and a message that may carry a dedupe id.
+ *
+ * `text` is here for the v6 delivery journal (#239 half 3): §15.7 makes the
+ * plugin the ONLY SSOT for user messages, so the accept seam has to persist the
+ * message's CONTENT, not just its id. Both fields are OPTIONAL because this
+ * constraint is deliberately the minimum an item must satisfy — production
+ * instantiates it with `WebchannelUserMessage`, whose `text` is a required
+ * `string` — and because the wire is decoded with a cast
+ * (`JSON.parse(...) as InboundWsMessage` in `nats-channel.ts`), so a peer that
+ * omits `text` really does reach this type with it absent.
+ */
 export type IngressDedupeItem = {
   peerId: string;
-  message: { id?: string };
+  message: { id?: string; text?: string };
 };
 
 /**
@@ -221,6 +261,20 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
   effectiveOutboundLimit?: () => number;
   /** Cancel-record failures that must be suppressed before ordinary admission. */
   cancelledFallback?: CancelledInboundFallbackTombstones;
+  /**
+   * v6 delivery journal (#239 half 3) — the plugin's own durable store.
+   *
+   * ⚠️ OPTIONAL IN THE TYPE ONLY. THIS IS NOT A DEGRADE MODE. Doc §15.7 makes a
+   * durable journal write a HARD REQUIREMENT of accepting a user message, so an
+   * account serving without one is serving without the SSOT its history comes
+   * from. It is optional purely so the dozens of existing four-key test
+   * constructions in `ingress-dedupe.test.ts` keep compiling.
+   * `nats-account-runtime.ts` is the production owner and ALWAYS supplies one —
+   * pinned by a source guard in `index-nats-wiring.test.ts`, exactly because
+   * "optional" must not quietly become "absent in production" (the same guard
+   * `NatsChannelDurability` gets on the egress side).
+   */
+  deliveryJournal?: DeliveryJournal;
   /** Routine duplicate-drop sink (info). */
   logInfo?: (message: string) => void;
   /** Fail-open fault sink (warn). */
@@ -228,6 +282,73 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
   /** Account-runtime lifecycle fence, combined with each retained entry fence. */
   isActive?: () => boolean;
 };
+
+/**
+ * The FIXED set of delivery-journal warning categories at this seam.
+ *
+ * Fixed for the same reason as `ingress-outcome.ts`'s
+ * `OUTCOME_FAILURE_CATEGORIES` and `nats-channel.ts`'s `DeliveryJournalWarning`:
+ * the limiter's keyspace is a closed union, so no peer-controlled value can
+ * become a map key and grow the warning state.
+ */
+type JournalWarning =
+  /**
+   * The journal refused the batch. §15.7's asymmetry with the egress seam lives
+   * here: this one IS an accept failure — the batch rolls back and no fresh
+   * admission is acked. (Two paths are deliberately NOT unwound; the catch that
+   * emits this names both.)
+   */
+  | "append-failed"
+  /**
+   * An item was ADMITTED (it runs a turn and the client shows its bubble) but
+   * could not be journaled, so history will not have it. A live≠history gap we
+   * are choosing to leave visible rather than absorb — see the call sites.
+   */
+  | "unjournalable-user";
+
+/** Match `ingress-outcome.ts`'s limiter and `nats-channel.ts`'s journal warnings. */
+const JOURNAL_WARNING_INTERVAL_MS = 60_000;
+
+/**
+ * Rate-limited, per-category journal warning, carrying the suppressed count into
+ * the next line — the shape `createRateLimitedOutcomeFailureWarning` already
+ * uses in this file's imports.
+ *
+ * Throttled because both categories are PEER-DRIVEN at full ingress rate: an
+ * `unjournalable-user` line fires once per malformed frame, and a failing store
+ * fails for every batch. One line per inbound message would bury the log the
+ * `#123` discipline exists to keep readable.
+ *
+ * One limiter per `createIngressOnFlush`, i.e. per ACCOUNT — so a broken account
+ * cannot silence a healthy one, but WITHIN an account the window is shared across
+ * every peer. State that plainly, because per-message attribution is the whole
+ * point of the `peer=` field: one peer spamming malformed frames suppresses
+ * another peer's gap line for the rest of the interval, and the line that does
+ * survive names only ONE peer while `suppressed=N` counts all of them. Sharpening
+ * this to per-peer would make the keyspace peer-controlled, which is exactly what
+ * the fixed category union above exists to prevent; the account-wide window is
+ * the deliberate trade.
+ */
+function createRateLimitedJournalWarning(
+  warn: ((message: string) => void) | undefined,
+): (category: JournalWarning, body: string) => void {
+  const state: Record<JournalWarning, { lastAt: number; suppressed: number }> = {
+    "append-failed": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
+    "unjournalable-user": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
+  };
+  return (category, body) => {
+    const entry = state[category];
+    const at = Date.now();
+    if (at - entry.lastAt < JOURNAL_WARNING_INTERVAL_MS) {
+      entry.suppressed++;
+      return;
+    }
+    const suppressed = entry.suppressed;
+    entry.lastAt = at;
+    entry.suppressed = 0;
+    warn?.(`${body} suppressed=${suppressed}`);
+  };
+}
 
 /**
  * Build the debouncer's `onFlush` handler — the REAL one index-nats.ts wires,
@@ -247,6 +368,10 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
  *  - lookup the durable accepted/overloaded outcome before admission;
  *  - offer fresh work against the dispatcher lease and record exactly one chosen
  *    outcome before committing the lease;
+ *  - commit each FRESH admission's `user` event to the v6 delivery journal —
+ *    doc §15.7 makes that write part of ACCEPTING the message, so a failure here
+ *    rolls the batch back and no fresh admission is acked (the footer block
+ *    states precisely what unwinds and the two paths that do not);
  *  - emit ACK only for accepted ids and `inbound_rejected` only for overloaded
  *    ids. These result classes are disjoint and are published after persistence.
  *
@@ -272,6 +397,16 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
  * entirely in setMessageHandler, so aborts never reach this path and are never
  * deduped — a duplicate abort is a harmless cosmetic double-bubble, and the abort
  * must not wait on SQLite. The control-lane branch acks its own frame separately.
+ * Which means the v6 journal hook below does NOT cover it, and that is a real
+ * live≠history gap rather than a decision that aborts are not messages: the
+ * client's `send()` routes abort-shaped text through the very same `publish()` as
+ * ordinary text, which applies a durable `user` event to its own view, so a
+ * `/stop` — and every word in the wider NL abort vocabulary, which is ordinary
+ * text like "wait" — DOES render a user bubble live. Issue **#281** owns it. It
+ * is out of scope here because the control lane has different semantics: the
+ * abort must not wait on SQLite (above), and that branch has no rollback path to
+ * express "not accepted" with. Doc §15.7's last bullet asked the question; #281
+ * carries the answer.
  *
  * In that legacy branch, per-id recording happens inside
  * `filterFreshInboundItems` before coalesce/dispatch. Production does not use
@@ -284,6 +419,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
   const isActive = deps.isActive ?? (() => true);
   const sinks: IngressDedupeLogSinks = { info: logInfo, warn: logWarn };
   const warnOutcomeFailure = createRateLimitedOutcomeFailureWarning((message) => logWarn?.(message));
+  const warnJournal = createRateLimitedJournalWarning(logWarn);
   return async (items) => {
     if (!isActive()) return;
     if (deps.outcomeStore && deps.beginBatch) {
@@ -321,6 +457,40 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
       const commitOffers: Array<() => void> = [];
       const pendingWrites: OutcomeWriteReceipt[] = [];
       const deferredReleases: Array<() => void> = [];
+      /**
+       * #239 half 3 — the FRESH admissions this batch owes the journal, in
+       * ARRIVAL ORDER, collected as they are decided and written in the footer.
+       *
+       * ⚠️ ONE ENTRY PER ITEM, NOT ONE PER TURN. P1-8b coalesces the batch into a
+       * single turn message carrying the LAST frame's id, but the client drew N
+       * user bubbles, so N `user` rows is what makes history equal live (N8). The
+       * coalesced message is a dispatch concern and never reaches this array.
+       */
+      const journalPending: Array<{ id: string; text: unknown }> = [];
+      /**
+       * The chosen results, held until the footer. **NOTHING may be `add`ed to
+       * either chunk writer inside the item loop.**
+       *
+       * ⚠️ `add()` IS NOT A BUFFER. `createIngressResultChunkWriter.add` flushes
+       * EAGERLY — at `maxIds` (`ingress-result-chunks.ts`, the `ids.length >=
+       * maxIds` branch) and again when the next id would exceed the effective
+       * wire limit — and `flush()` calls `publish`, which is `deps.sendAck` →
+       * `channel.sendAck` → the wire. So an in-loop `add` could publish an ack
+       * for the batch's first 64 ids BEFORE the journal ran, and a journal
+       * failure would then roll those messages back while the client had already
+       * drained their ledger entries and would never replay them: permanent,
+       * silent loss of accepted user text — exactly what doc §15.7 exists to
+       * prevent. (Unreachable today only by arithmetic — `maxIds` is 64 and
+       * `DEFAULT_BUSY_TURN_LIMITS.maxMessagesPerSession` is 32 — which is not a
+       * property this file should depend on.)
+       *
+       * The chunking semantics are unchanged: the same ids are `add`ed in the
+       * same order, so the same frames are produced — only later. Memory: two
+       * arrays of ≤128-char ids, alongside `retained`, which already holds every
+       * item's whole message for the life of the batch.
+       */
+      const ackIds: string[] = [];
+      const rejectedIds: string[] = [];
       let finalized = false;
       let fifoBlocked = false;
 
@@ -331,6 +501,31 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         await rollbackWrites();
         for (const rollback of rollbackOffers) rollback();
         for (const release of deferredReleases) release();
+      };
+
+      /**
+       * An item that was ADMITTED but cannot be journaled. Both reasons are
+       * malformed-frame shapes the conforming client never produces; each leaves
+       * live text that history will not have (N8), so it is reported rather than
+       * absorbed. Silent when this seam has no journal at all — then nothing is
+       * journaled and there is no gap specific to this item.
+       */
+      const journalGap = (reason: "no-usable-id" | "non-string-text") => {
+        if (!deps.deliveryJournal) return;
+        // The action is PER REASON. #243 (server-assigned user ids) is the fix
+        // for `no-usable-id` and does not address `non-string-text` at all —
+        // that one needs wire-level validation of `text`, which
+        // `normalizeInboundUserMessage` explicitly declines to do — so pointing
+        // both at #243 would send an operator to an issue that can never close
+        // their line.
+        const action = reason === "no-usable-id"
+          ? "action=live-only-history-gap-issue-243"
+          : "action=live-only-history-gap-malformed-frame-no-owning-issue";
+        warnJournal(
+          "unjournalable-user",
+          "webchannel: inbound user message admitted but NOT journaled " +
+            `peer=${logSafe(peerId)} reason=${reason} ${action}`,
+        );
       };
 
       try {
@@ -355,8 +550,40 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           const key = ingressDedupeKey(item);
           if (!key) {
             const offer = lease.offer(item.message, reservation);
-            if (offer.status === "accepted") offer.commit();
-            else release();
+            if (offer.status === "accepted") {
+              offer.commit();
+              // KNOWN GAP, DELIBERATELY LEFT VISIBLE (#239 half 3). An item with
+              // no dedupe key is still ADMITTED here: it runs a turn and the
+              // client shows its bubble. It is not journaled, because
+              // `journalEventForInboundUser` THROWS on an id that is absent,
+              // empty, non-string or over-length — a durable row would either be
+              // impossible to key or would collapse distinct messages onto one
+              // (its docblock has the reproduced failures). So this is live text
+              // history will not have: an N8 gap we are CHOOSING to leave, which
+              // is why it is a warn and not silence.
+              //
+              // ⚠️ DO NOT "FIX" IT BY MINTING A SERVER-SIDE ID HERE. Server-
+              // assigned user ids reconciled against a client `random_id` are
+              // doc §16.2-1, issue **#243**; minting one at this seam would pin
+              // a shape that design has not chosen yet, under an id the client
+              // has never heard of.
+              //
+              // Only a NON-CONFORMING client reaches this: `nats-client.ts`
+              // mints an id for every `user_message` it publishes, and the
+              // ledger it replays from is keyed by that id.
+              //
+              // ⚠️ "IT RUNS" IS CHECKED, NOT ASSUMED — the gap claim is only
+              // honest if the item really does produce a live bubble. Two facts,
+              // both in `inbound-queue.ts`: `finish()` promotes every `committed`
+              // entry to `attached` and drains it (so a REFUSED batch still runs
+              // this one — pinned by a test), and `commit()`'s own
+              // disposed/finished rollback branch cannot fire from here, because
+              // `offer()` reads those SAME two flags one statement earlier and
+              // would have returned `{status:"disposed"}` into the `else`. The
+              // two calls are adjacent and synchronous with no callout between
+              // them; put an `await` there and this stops being true.
+              journalGap("no-usable-id");
+            } else release();
             continue;
           }
           const id = item.message.id as string;
@@ -424,8 +651,13 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           }
           if (existing.status === "found") {
             release();
-            if (existing.outcome === "accepted") ack.add(id);
-            else rejected.add(id);
+            // Deferred to the footer like every other result — see `ackIds`.
+            // A REPLAY's ack is therefore also withheld when a fresh sibling's
+            // journal write fails. Deliberate, and harmless: the batch retries
+            // whole, and this id's durable outcome is already `accepted`, so the
+            // replay simply lands here again and acks then.
+            if (existing.outcome === "accepted") ackIds.push(id);
+            else rejectedIds.push(id);
             continue;
           }
 
@@ -452,7 +684,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             if (result?.status === "recorded" && result.durability === "durable") {
               pendingWrites.push(result.write);
               deferredReleases.push(release);
-              rejected.add(id);
+              rejectedIds.push(id);
             } else {
               if (result?.status === "recorded") await result.write.rollback();
               release();
@@ -485,7 +717,25 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           } else if (recorded?.status === "recorded") {
             pendingWrites.push(recorded.write);
             commitOffers.push(offer.commit);
-            ack.add(id);
+            ackIds.push(id);
+            // ---- v6 #239 half 3: THE ONE FRESH ADMISSION OF NEW USER TEXT ----
+            //
+            // Collected HERE and written in the footer, not written here. This
+            // point is still inside the item loop, and the `invalidated` check
+            // below can still roll the ENTIRE batch back — a `/stop` or a peer
+            // retirement that lands while a later item is awaiting its lookup.
+            // A `user` row for a message that then never runs is a phantom user
+            // bubble in history that live never showed: N8 in the GAINING
+            // direction, the same class of error NOT-list N6b records (the
+            // egress seam's own two-round mistake).
+            //
+            // The `existing.status === "found"` branch above is deliberately NOT
+            // collected: it re-acks a message whose `user` row was written when
+            // it was first admitted, so re-journaling would be a no-op on
+            // `journal_user_once` and would only add a second call site.
+            if (deps.deliveryJournal) {
+              journalPending.push({ id, text: item.message.text });
+            }
           } else {
             rollbackOnce();
             fifoBlocked = true;
@@ -513,9 +763,231 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           finalized = true;
           return;
         }
+        // ---- v6 #239 half 3 — THE JOURNAL WRITE *IS* THE ACCEPT (doc §15.7) --
+        //
+        // The plugin is the ONLY SSOT for user messages, so a durable journal
+        // write is a HARD REQUIREMENT of accepting one, not best-effort: a user
+        // message that is not in the journal WAS NOT ACCEPTED. It runs BEFORE
+        // `pendingWrites` commit because §15.7's ordering is journal-first →
+        // then confirm; the dedupe/outcome store is explicitly an optimization
+        // layer whose authority the journal supersedes.
+        //
+        // ⚠️ THE ASYMMETRY WITH THE EGRESS SEAM IS DELIBERATE AND IS THE WHOLE
+        // POINT OF THIS BLOCK. At egress (§15.8, `nats-channel.ts`'s
+        // `journalOutbound`) a journal failure must NEVER change the send
+        // result — log, never throw, never return `false` — because by then the
+        // text has already left for the client and refusing would lose delivered
+        // text (N10). HERE nothing has been confirmed to anyone yet: no ack is
+        // on the wire, no turn has run, and the journal is the authority that
+        // decides whether the message exists at all. So here a journal failure
+        // IS an accept failure.
+        //
+        // Position: AFTER the `invalidated` early return (see the collection
+        // site — journaling a batch that is about to roll back is N8 in the
+        // gaining direction) and BEFORE ANY RESULT REACHES THE WIRE. The item
+        // loop deliberately publishes nothing at all — see `ackIds` for why
+        // `chunkWriter.add()` inside the loop was NOT good enough.
+        if (deps.deliveryJournal && journalPending.length > 0) {
+          // The text is validated HERE rather than at the collection site so a
+          // batch that never survives to this point cannot report a gap for a
+          // message that never ran. A non-string `text` reaches us only from a
+          // non-conforming client — `normalizeInboundUserMessage` copies
+          // `raw.text` unvalidated off a frame decoded with a cast. `append`
+          // would TAKE it (only `user` IDS are validated there), but the shared
+          // reducer types `user.text` as a `string`, so a row holding one is a
+          // durable row no reader can render. Same verdict as an unusable id:
+          // admit, do not journal, say so.
+          const journalable: Array<{ id: string; text: string }> = [];
+          for (const pending of journalPending) {
+            if (typeof pending.text === "string") {
+              journalable.push({ id: pending.id, text: pending.text });
+            } else journalGap("non-string-text");
+          }
+          try {
+            for (const pending of journalable) {
+              // `conversationId` is the peerId — doc §16.2-7, identical to the
+              // egress seam. The journal FILE is already scoped to
+              // (tenant, accountId) by its path, and the peerId is the
+              // authenticated JWT `sub`, so the triple is complete without
+              // reading core's mutable route or agentId.
+              //
+              // `turnId` IS THIS MESSAGE'S OWN WIRE ID, and that is the client
+              // mirror, not an invention. Live, `nats-client-wrapper.ts`'s
+              // `nextPublishedUserMessages` applies
+              // `{kind:"user", id: bubbleId, text, turnId: wireId}` — the wire id
+              // reserved for THAT publish — and all three of its callers
+              // (`publish`, and the two held-message release paths) pass their
+              // own freshly reserved id, never a shared batch anchor.
+              // `applyUser` writes it straight onto the durable message. So
+              // omitting it would put `turnId: undefined` in history where live
+              // has a value, on EVERY user message — a live≠history field
+              // divergence (N8), in rows §15.6's destructive cutover makes the
+              // only store, with no schema gate (#271) to migrate later.
+              //
+              // The plugin agrees independently: `inbound.ts` derives the turn's
+              // own id as `message.id ?? "webchannel-turn-<ms>-<rand>"`, i.e. the
+              // user message's wire id IS the turn id. (For a P1-8b-coalesced
+              // batch the plugin's turn takes the LAST frame's id while the
+              // client stamps each bubble with its own — so per-message is the
+              // faithful choice, and it is also what the client does.)
+              //
+              // ⚠️ THIS IS NOT THE `id` QUESTION. We journal `id` = the WIRE id
+              // while live holds a local `u-<n>` from `mintLocalBubbleId`; that
+              // divergence is doc §16.2-1 / issue **#243** and is deliberately
+              // NOT touched here. `turnId` is a separate field whose two sides
+              // already agree on a value we hold.
+              //
+              // Synchronous and in arrival order, because `seq` order is the
+              // stream's order and the stream's order IS the identity model
+              // (doc §16.5.3). No batching, no deferral.
+              deps.deliveryJournal.append(
+                peerId,
+                journalEventForInboundUser({
+                  id: pending.id,
+                  text: pending.text,
+                  turnId: pending.id,
+                }),
+              );
+            }
+          } catch (error) {
+            // ACCEPT FAILURE, expressed with the mechanism this function already
+            // has: leave `finalized` false and return, so the `finally` below
+            // runs `rollbackBatch()`. That is the same shape the unresolved
+            // outcome-store classification uses above (`existing.status ===
+            // "unknown"` → `fifoBlocked`, no result published, retry later);
+            // §15.7 makes the journal the higher authority, so it gets at least
+            // the same discipline.
+            //
+            // ⚠️ WHAT ACTUALLY UNWINDS — AND THE TWO THINGS THAT DO NOT. An
+            // unqualified "everything rolls back" is how N6b happened: an
+            // absolute in this file becomes the next reader's premise. So, both
+            // MEASURED with probes now kept as tests in
+            // `ingress-dedupe-delivery-journal.test.ts`:
+            //
+            // Unwound — every fresh admission this seam is the SSOT for: no
+            // `ack` and no `inbound_rejected` frame (both writers are untouched
+            // until the footer below), every outcome write in `pendingWrites`
+            // rolled back, every offer in `rollbackOffers` rolled back, every
+            // reservation in `deferredReleases` released.
+            //
+            // NOT unwound, and correct:
+            //  1. THE CANCELLED-INBOUND FALLBACK's result. That branch commits
+            //     its outcome write and calls `deps.sendAck` DIRECTLY inside the
+            //     item loop, bypassing the chunk writers — so its ack is already
+            //     on the wire before the journal is consulted, and nothing here
+            //     undoes it. The item is text `/stop` already KILLED: it has no
+            //     durable row to lose, and that ack is what stops the client
+            //     replaying a dead message forever.
+            //  2. AN ID-LESS ITEM's dispatch. That branch calls `offer.commit()`
+            //     inline and never pushes onto `rollbackOffers`, so `finish()`
+            //     promotes it to `attached` and drains it — the item runs even
+            //     though the batch was refused. Only a non-conforming client
+            //     produces one, and refusing to run text already accepted for
+            //     dispatch would lose it outright. `journalGap` reports exactly
+            //     this as the live≠history gap it is.
+            //
+            // Neither exception loses fresh conforming-client text, which is the
+            // property §15.7 actually demands.
+            //
+            // ⚠️ ONE LINE FOR BOTH THROW SOURCES (the mapper and `append`), ON
+            // PURPOSE. A mapper refusal and a store fault would call for
+            // opposite operator responses, so merging them would normally be
+            // wrong — but after the `MAX_INGRESS_DEDUPE_ID_LENGTH` collapse
+            // above, `journalEventForInboundUser` CANNOT refuse anything that
+            // reaches here: its id came through `ingressDedupeKey`'s identical
+            // predicate at the identical bound, and its text was just narrowed
+            // to `string`. So today this line has exactly one real source, and a
+            // `code="<none>"` diagnostic on it means a construction bug, not a
+            // sick database. The `try` still spans the mapper because #242
+            // widens the event set and may add refusals — and THAT is when the
+            // categories must split.
+            //
+            // ⚠️ CAUGHT, NOT PROPAGATED. Measured: a rejected `onFlush` is
+            // swallowed with NO log by the debouncer's worker
+            // (`bounded-inbound-debouncer.ts`'s `pump`: `catch { /* One failed
+            // flush must not poison later same-key batches. */ }`), so letting
+            // it escape would roll the batch back silently and cost the operator
+            // the only line that explains why messages stopped being accepted.
+            //
+            // ⚠️ A PARTIAL BATCH PRODUCES NO DUPLICATE ROW — and that is ALL
+            // this claim covers. It is a fact about the CALLER, not about this
+            // function: `nats-client.ts` replays an unacked `user_message` under
+            // the SAME id (`flushQueue()` re-queues `entry.message` from the
+            // ledger keyed by that id, and `retryDueUnacked()` re-publishes the
+            // same entry in-session), so a row committed before the throw comes
+            // back as an ordinary `inserted: false` no-op on `journal_user_once`.
+            // (The exact opposite of the egress caller, which re-mints
+            // `nextMessageId()` per attempt; N6b is what that costs.)
+            //
+            // ⚠️ IT DOES NOT COVER ORDER, AND ORDER DOES BREAK. Thirty lines up
+            // this block says `seq` order IS the identity model, so the residual
+            // has to be named rather than argued away: a refused batch holding
+            // `A` starts no turn, the client does not gate a new send on a
+            // pending unacked entry, so the user's next message `B` is accepted
+            // and journaled first, and `A` lands after it when its backoff
+            // fires — live `A, B`, replay `B, A`. That is issue **#282**, whose
+            // body carries the measurements; the fix belongs to #240, which is
+            // where the journal acquires a reader.
+            //
+            // ⚠️ AND IT DOES NOT COVER THE ORPHAN ROW EITHER — issue **#283**.
+            // `append` is one IMMEDIATE transaction PER EVENT
+            // (`delivery-journal.ts`), so a throw at append *k* leaves rows
+            // `1..k-1` COMMITTED while every one of those messages' turns is
+            // rolled back here. The retry normally repairs it: the client
+            // replays the same ids, the committed rows come back
+            // `inserted: false`, and the messages run. But the ledger is
+            // memory-only, so if the client loses it before its backoff fires (a
+            // page reload), row `1` stays in the journal with no turn and no live
+            // bubble — a phantom user bubble in history that live never showed,
+            // N8 in the GAINING direction, arriving through a different door than
+            // the one the collection site above guards.
+            //
+            // Reachability, stated honestly rather than hidden or inflated: it
+            // needs a MULTI-ITEM batch (the debounce default is 0 ms, so batches
+            // are usually size 1 — multi-item ones come from busy-time
+            // coalescing), AND a store that fails BETWEEN appends rather than on
+            // the first (a closed, corrupt or read-only handle fails uniformly on
+            // append 1 and leaves no partial state; a lock taken mid-batch is the
+            // realistic case), AND the client losing the ledger before the retry.
+            //
+            // NOT fixed here on purpose. The fix is an atomic multi-append, and
+            // `delivery-journal.ts`'s append docblock currently states the
+            // opposite as a rule ("never batch or defer them, because batching
+            // reorders"). That rule's REASON does not apply to a synchronous,
+            // in-order multi-append — but amending a merged sibling slice's
+            // stated contract from a slice that is not about the store is the
+            // wrong place for that argument, and #240 owns the reader that makes
+            // the row visible at all. #283 carries both options.
+            //
+            // The retry is BOUNDED, not infinite, and the honest claim is worth
+            // stating: the ledger is capped at `MAX_UNACKED = 100` in memory and
+            // evicts the oldest with "they will not be replayed on reconnect",
+            // surfacing as a `failed` bubble; a page reload loses it entirely.
+            // Doc §16.2-9 already records the memory-cap outbox as a known gap.
+            warnJournal(
+              "append-failed",
+              "webchannel: delivery journal append failed at the inbound accept " +
+                `peer=${logSafe(peerId)} messagesInBatch=${journalable.length} ` +
+                `action=reject-accept-client-retries ${journalFailureDiagnostic(error)}`,
+            );
+            return;
+          }
+        }
         for (const write of pendingWrites) write.commit();
         for (const commit of commitOffers) commit();
+        // THE ONLY PLACE EITHER WRITER IS TOUCHED. `add` can publish (see
+        // `ackIds`), so both the adds and the finishes live here, below the
+        // journal and below every persistence commit — this is what the
+        // docblock's "published after persistence" means.
+        //
+        // Same ids, same order, so the same chunk boundaries as before; the only
+        // observable change is that all `ack` frames now precede all
+        // `inbound_rejected` frames instead of interleaving by item. The two
+        // classes are disjoint id sets and the client handles them
+        // independently, and the footer already finished them in this order.
+        for (const id of ackIds) ack.add(id);
         ack.finish();
+        for (const id of rejectedIds) rejected.add(id);
         rejected.finish();
         for (const release of deferredReleases) release();
         finalized = true;
@@ -679,3 +1151,13 @@ import { createIngressResultChunkWriter } from "./ingress-result-chunks.js";
 import type { IngressResultFrame } from "./ingress-result-chunks.js";
 // #123: peer ids and message ids reach these log lines straight off the wire.
 import { logSafe } from "./log-safe.js";
+/**
+ * v6 delivery journal (#239 half 3). TYPE-ONLY for the store — this module never
+ * opens one — and a value import for the pure mapper/diagnostic beside it.
+ */
+import type { DeliveryJournal } from "./delivery-journal.js";
+import {
+  MAX_INBOUND_USER_ID_LENGTH,
+  journalEventForInboundUser,
+  journalFailureDiagnostic,
+} from "./delivery-journal-event.js";

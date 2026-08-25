@@ -1006,6 +1006,11 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         beginBatch: (peerId) => inboundDispatcher!.beginBatch(peerId),
         sendAck: (peerId, ids) => channel.sendAck(peerId, ids),
         sendInboundRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids),
+        // v6 (#239 half 3): the SAME handle the channel got for the egress seam,
+        // opened above from this account's (tenant, accountId) tuple. Doc §15.7
+        // makes this write part of accepting a user message, so a missing handle
+        // here is not a degrade mode — `index-nats-wiring.test.ts` pins the line.
+        deliveryJournal,
         cancelledFallback: cancelledInboundFallback,
         logInfo: (message) => api.logger?.info?.(message),
         logWarn: (message) => api.logger?.warn?.(message),
