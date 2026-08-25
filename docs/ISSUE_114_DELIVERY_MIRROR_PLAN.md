@@ -50,6 +50,7 @@
 | **N4** | "클라가 보는 durable id는 core-blocked, core가 줘야 함" | durable client-facing id는 **플러그인 소유**: 서버 messageId 배정 + 클라 random_id(§16.2-1). core 의존 0 | 하위목표를 "core의 id를 읽어 전달"로 잘못 정의 |
 | **N5** | ordinal/`assistantMessageIndex`/위치를 **정체성 키**로 써서 final↔lane 매칭 | **현재-draft 마감** 모델. ordinal 매칭이 **#215/#223 자충수**(§16.1). count/위치로 identity 추론 = 0.6.1 post-mortem 근본원인. **정밀판(§16.5): 내장 Telegram도 ordinal을 쓰긴 함 — 단 block-회전 힌트로만, 정체성 키로는 절대 안 씀.** ordinal 자체가 금지가 아니라 "정체성으로 쓰기"가 금지 | 콜백 순서가 ordinal을 "무료 제공"하는 것처럼 보임 |
 | **N6** | agent 답변을 publish 후에 커밋(commit-after) | **persist-before-publish**: egress 시점엔 텍스트가 이미 있어 유령 없음 = Telegram persist-then-deliver(§16.2-2, §15.8 뒤집음) | "보낸 걸 기록"이 순서상 자연스러워 보임 |
+| **N6b** ⭐ | persist-before-publish를 "**보내기로 결정하기 전에도** 기록"으로 읽어, 거절된 send(transport down, fail-closed 세션키 없음)까지 저널링 | **"wire write 전"이지 "거절 전"이 아니다.** §16.2-2의 유령 논증은 **commit-vs-push 순서**(둘 사이의 크래시)에 관한 것이고, 시도조차 안 한 프레임은 다루지 않는다. 반증은 store가 아니라 **호출자**에 있다: 실패하면 `reserveProvisional`이 매 시도마다 **새 `nextMessageId()`**를 발급하고 `lane.id ??=`는 성공에만 실행되며 `rollbackReservation`은 fresh id에 no-op, `lastProgressSentAt`도 성공에만 갱신돼 throttle이 실패 구간 내내 무력하다 ⇒ 등록 중 peer/transport blip이 **revision마다** `placement{X₁},{X₂},{X₃}…`를 낳고, id가 매번 달라 `journal_placement_once`가 못 접으며 #240 replay에서 전부 유령 빈 말풍선 = **N8을 gaining 방향으로, 무한정, 우리가 만들어서.** 거절을 안 적어도 잃는 건 없다(`false`는 이미 호출자가 delivery failure로 기록). 코드: `nats-channel.ts` `sendToPeer` — 훅은 세 거절 **아래**, wire write **바로 위** | "안전한 방향으로 실패하라"가 **컴포넌트만 보고** 판정 가능한 것처럼 느껴짐. 실제로는 **실패 후 호출자가 무엇을 하는가**에 대한 주장이고, 그건 남의 코드다 (2026-08-25 실제 발생: Advisor가 이 배치를 지시 → 리뷰 2라운드가 뒤집음) |
 | **N7** | "현재(shipped) 클라/플러그인 동작 = 스펙" | shipped 코드는 재설계가 없애는 문제의 **타협**을 품고 있다. 항상 물어라: **"이게 원칙인가, 타협된 코드가 우연히 그렇게 도는 것뿐인가?"** 같은 core의 레퍼런스(내장 채널)를 읽어라 | 압축 후 코드가 유일한 ground truth로 보임 (모든 회귀의 상위 원인) |
 | **N8** | "live와 history는 (의도적으로) 다를 수 있다" | 우리가 스트림 전체를 소유 → 차이는 전부 **버그**. live==history는 **절대**(공유 reducer로 양쪽 보장, §15.9) | 상태/tool 버블 렌더 차이를 "gap"으로 합리화 |
 | **N9** | partial-first/모드 의존 저널, legacy fallback·epoch 마커 유지 | SSOT는 모드 의존 불가. **파괴적 컷오버 승인**("아직 아무도 안 씀") → 저널이 첫날부터 유일 store, cutover/epoch/legacy 기계 **전부 삭제**(§15.6) | "안전한 전환기"가 신중해 보임 (실은 원칙 후퇴) |
@@ -632,7 +633,7 @@ egress에서 **클라가 view에 쓰는 이벤트만, 전송 순서(seq)대로**
 |---|---|---|---|
 | `user` | user 메시지 수신(pre-ACK) | msgId(client-민팅), text | publish echo 항상 append(`nats-client-wrapper.ts:804`) |
 | `placement` | lane 첫 progress(슬롯 클레임) | answerId, turnId, seq(=순서) | 첫 progress가 tail에 슬롯 점유(`:2467`), 텍스트 없음 |
-| `bubble` | durable 프레임(agent_message/final/independent) egress 성공 | answerId, turnId, text | upsert-by-id(`:2562`), 없으면 append |
+| `bubble` | durable 프레임(agent_message/final/independent) — **wire write 직전**(v6). ⚠️ 이 칸의 옛 표현 "egress 성공"은 v5 commit-after 잔재이며 **N6·N6b 양쪽으로 틀렸다** | answerId, turnId, text | upsert-by-id(`:2562`), 없으면 append |
 | `seal` | drain turn_snapshot | turnId, answers[]:{id,text}, **remove[]** | `applyTurnSnapshot`(`:2557,1486-1557`) |
 
 - **순서**: `seq` autoincrement = 전송 순서. placement가 슬롯 순서를 박제(codex1 해소).
@@ -651,7 +652,7 @@ egress에서 **클라가 view에 쓰는 이벤트만, 전송 순서(seq)대로**
 
 ### 15.5 seam — route key + user-id 생애 (findings codex6/claude4, codex8)
 
-- **route key(server)**: journal write는 **route 해석(`inbound.ts:1046`) 후 route-scoped 키를 클로저로 잡은 per-turn 콜백**. `NatsChannel`은 route를 모르므로(codex6) 콜백을 turn-handler가 주입. **P-J: agents-bind 등 config 변경이 route 키를 바꿔 대화 orphan 되는가**(기존 history도 동일 제약) — stable conversation 키 존재 확인.
+- **route key(server)**: ~~journal write는 **route 해석(`inbound.ts:1046`) 후 route-scoped 키를 클로저로 잡은 per-turn 콜백**. `NatsChannel`은 route를 모르므로(codex6) 콜백을 turn-handler가 주입. **P-J: agents-bind 등 config 변경이 route 키를 바꿔 대화 orphan 되는가**~~ — **이 절 전체 SUPERSEDED (§16.2-7, 구현 완료 2026-08-25).** `conversationId = peerId`(인증된 JWT `sub`). 저널 파일이 이미 `(tenant, accountId)`로 경로 스코프되므로 peerId가 triple을 완성하고, **core의 mutable route/agentId를 아예 안 읽는다** ⇒ per-turn route-scoped 콜백 **불필요**, P-J는 **해소(dissolved)이지 연기 아님**. 코드: `nats-channel.ts` `journalOutbound`.
 - **user-id(client)**: client가 `user_message.id`를 민팅해 local==wire==history 동일. **held/deferred/retracted/cancel 생애 규칙 명시**(codex8): 초기 렌더에 id 예약, 취소/철회 시 해제 API 추가, coalescing turn anchor와의 관계. 파괴적 컷오버(§15.6)로 legacy가 없으므로 text-match(tier-2/3, `nats-client-wrapper.ts:2081-2113`)는 **이 통일과 함께 즉시 제거** 가능.
 
 ### 15.6 파괴적 컷오버 — 저널이 첫날부터 유일 저장소 (사용자 결정 2026-08-23)
@@ -694,7 +695,7 @@ egress에서 **클라가 view에 쓰는 이벤트만, 전송 순서(seq)대로**
     - **구현 형태(스파이크가 확정):** `render = merge(reduceDurableView(eventLog), clientLocalOverlay)` — 핸들러는 local overlay(working/receipts/sendState/isTyping) 부수효과 유지, **durable `messages` 재조정만 reducer에 위임.** DurableMessage = `{id,role,text,turnId}` (client-local 제외, §0.1).
     - 스파이크 범위 외(구현 시): 실제 클라를 reducer 호출로 refactor; reducer 모듈을 client·plugin 공유 위치로 이동(의존성 없어 기계적); `placement`는 텍스트 미보유(never-final draft 저널링은 비범위).
     - reducer 밖(의도적): `history` 3-tier 텍스트/위치 adoption(`:2063-2258`) = reconnect/late-join 추측 → 서버 스냅샷으로 대체될 workstream C. #114가 스트림 저널링으로 이를 가능케 함.
-  - **P-J(route 키 안정성/orphan)**, **P-H(off/block id client 영향)** — 구현 단계에서.
+  - ✅ **P-J(route 키 안정성/orphan) DISSOLVED** — 프로브가 아니라 설계로 해소됨(§16.2-7): plugin-소유 불변 conversation id = `(tenant, accountId)` 경로 스코프 + `peerId`. route를 안 읽으니 orphan될 route 키가 없다. #239 half 2에서 구현·검증(2026-08-25). **P-H(off/block id client 영향)** — 구현 단계에서.
 
 ### 15.10 v5 결정 로그
 
@@ -738,6 +739,8 @@ v5보다 Telegram에 더 충실하고, **live==history를 유지하면서** 원�
 
 1. **서버-배정 messageId + 클라 random_id** (codex3/claude4). 플러그인이 user·agent **양쪽 durable id를 배정**(저널 seq와 함께 트랜잭션 배정, 배달 전), 클라는 멱등용 `random_id`만 보내고 낙관 버블을 **random_id로** 화해(text 아님). → v5 §15.5/§15.7의 "클라가 durable user id 민팅"을 대체. #1(text/position 추측)·#3(3중 id)도 함께 해소.
 2. **persist-before-publish** (codex5/claude9). id/seq 배정 + 이벤트 커밋을 **wire push 전에**(user·agent 공통). egress 시점엔 텍스트가 이미 있으니 유령 없음 = Telegram persist-then-deliver. → v5 §15.8의 commit-after 결정 **뒤집음**(안전 방향: history엔 있고 재접속이 따라잡음).
+   - ⚠️ **정밀화(2026-08-25, 구현이 강제) — "wire write 전"이지 "보낼지 결정하기 전"이 아니다. NOT-list N6b를 먼저 읽어라.** 이 조항이 말하는 유령은 push와 commit **사이**의 크래시이지, 우리가 **거절한** 프레임이 아니다. 훅은 세 거절(disposed / transport down / fail-closed 세션키 없음) **아래**, wire write 바로 **위**에 둔다. 거절까지 저널링하면 호출자의 id 재민팅 때문에 revision마다 유령 placement가 쌓인다(N6b에 전체 사슬).
+   - 남는 창 = `sealEnvelope`/`transport.publish`가 커밋 **후** throw하는 경우. 그게 이 조항이 실제로 말하는 창이고, 거기서는 안전 방향(history엔 있음)이 맞다.
 3. **영구 typed delete + revision/seq 지배** (codex9/claude5). order-sensitive 부활 폐기 → `messageDeleted`(sequenced) + revision 지배. 복원은 새 id 또는 명시적 restore. **클라·공유 reducer 양쪽** 변경(둘 다 바꾸니 live==history 유지, codex 라운드-4 "dominance 발명 금지"와 안 충돌).
 4. **typed 이벤트 + edited 마커** (codex10/claude6). untyped LWW 대신 `messageCreated`/`messageEdited`/`messageDeleted` + monotonic revision; stale revision 거부; "edited" 표시. → §15.3 4-kind 모델을 typed union으로 확장.
 5. **durable content = tagged union**(not {role,text}) (codex12/claude11-12, 사용자 tool-durable 지시). user·answer·notice·**tool·approval**·(content로 남길 reasoning) = stable id + 구조화 내용 + seq. 순수 표시기만 ephemeral. → DurableMessage 타입 확장.
