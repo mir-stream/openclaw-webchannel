@@ -32,9 +32,23 @@
  * `packages/client/src/durable-view-reducer.test.ts`. Duplicating it here would
  * be the very fork this guard is meant to prevent.
  *
- * As of slice 1 no plugin runtime code consumes the reducer yet; this test is
- * the only plugin-side consumer, and that is intentional. It proves consumption
- * is POSSIBLE before slice 2+ makes it load-bearing.
+ * ⚠️ THIS IS NO LONGER THE ONLY PLUGIN-SIDE CONSUMER, and the sentence that said
+ * so has been corrected rather than left standing. It read: "as of slice 1 no
+ * plugin runtime code consumes the reducer yet; this test is the only
+ * plugin-side consumer … it proves consumption is POSSIBLE before slice 2+
+ * makes it load-bearing." #240 made it load-bearing: `journal-history.ts` is
+ * PRODUCTION plugin source that imports `applyDurableEvent` and folds journal
+ * rows through it, and `delivery-journal-event.ts`'s `JournalEvent` is now a
+ * plain alias of `DurableEvent` from the same module. (It is not yet reached
+ * from the plugin's entry graph — #240 half 1 ships the projection with no
+ * caller — so `esbuild --bundle` does not yet inline the reducer into
+ * `dist/index-nats.js`. That is a wiring fact about half 2, not a fact about
+ * whether the import resolves; bundling `journal-history.ts` directly with the
+ * build's own flags inlines it.)
+ *
+ * The guard below keeps its job either way: it is the executable proof that a
+ * cross-package SOURCE import of the client's reducer resolves and folds from
+ * inside this package.
  */
 import { describe, it, expect } from "vitest";
 

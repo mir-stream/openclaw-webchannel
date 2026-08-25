@@ -1,11 +1,18 @@
 /**
- * v6 #239 — the frame→event mapper, and the mirror guard that keeps
- * `JournalEvent` structurally identical to the client's `DurableEvent`.
+ * v6 #239 — the frame→event mapper.
  *
- * The mirror matters more than any single mapping: the v6 bet is that ONE pure
- * reducer computes both the live view and history, so two event shapes that
- * drift are two reducers (N8). Until #240 unifies them into a shared module,
- * this file is the guard.
+ * ⚠️ THIS FILE USED TO CARRY THE MIRROR GUARD TOO, AND IT IS GONE BECAUSE THE
+ * THING IT GUARDED NO LONGER EXISTS. `JournalEvent` was a second declaration
+ * structurally identical to the client's `DurableEvent`, held together by a
+ * compile-time STRICT TYPE-IDENTITY assertion here. #240 turned the plugin into
+ * a RUNTIME consumer of the client's reducer (`journal-history.ts`), so
+ * `delivery-journal-event.ts` now ALIASES `DurableEvent` outright — one type,
+ * one reducer, `history == live` by construction (N8) with nothing left to
+ * drift. Against an alias the assertion reads `Equals<T, T>`: it cannot fail,
+ * and a guard that cannot fail is worse than no guard, because a file header can
+ * cite it as coverage. Deleted for exactly the reason the `Object.keys` guard
+ * before it was deleted — that argument is written out at length in
+ * `delivery-journal-event.ts`'s header. Do not reinstate either one.
  */
 import { describe, expect, it } from "vitest";
 
@@ -14,61 +21,9 @@ import {
   isIdlessDurableFrame,
   journalEventForInboundUser,
   journalEventForOutbound,
-  type JournalEvent,
 } from "./delivery-journal-event.js";
-import type { DurableEvent } from "../../client/src/durable-view-reducer.js";
 
 const TURN = "turn-1";
-
-/**
- * Strict type IDENTITY, not mutual assignability.
- *
- * ⚠️ MUTUAL ASSIGNABILITY IS NOT ENOUGH AND THAT WAS MEASURED, not reasoned:
- * `const a: DurableEvent = {} as JournalEvent` plus the reverse compiles CLEAN
- * when one side gains an OPTIONAL field, because an optional field is satisfied
- * by its absence in both directions. The field that will actually be added is
- * `revision?: number` (#241, doc §16.2-4) — optional, precisely the case the
- * weaker check is blind to.
- *
- * The `(<T>() => T extends X ? 1 : 2)` trick compares the two types as written
- * rather than by assignability, so an optional field on ONE side is a `tsc`
- * error. Proven to fire: adding `revision?: number` to `JournalEvent` produces
- *   error TS2344: Type 'false' does not satisfy the constraint 'true'.
- */
-type Equals<X, Y> =
-  (<T>() => T extends X ? 1 : 2) extends <T>() => T extends Y ? 1 : 2
-    ? true
-    : false;
-type AssertTrue<T extends true> = T;
-type _JournalEventMirrorsDurableEvent = AssertTrue<
-  Equals<JournalEvent, DurableEvent>
->;
-
-describe("JournalEvent mirrors the client's DurableEvent", () => {
-  it("is TYPE-IDENTICAL to DurableEvent (compile-time mirror guard)", () => {
-    // The guard itself is the `_JournalEventMirrorsDurableEvent` alias above —
-    // it goes red in `tsc`, which is where a type divergence belongs. This case
-    // exists so the guard is discoverable from the test list, and so a reader
-    // who deletes the alias sees a named test disappear with it.
-    const mirrored: DurableEvent = {
-      kind: "bubble",
-      answerId: "a-0",
-      text: "answer",
-      turnId: TURN,
-    } satisfies JournalEvent;
-    expect(mirrored.kind).toBe("bubble");
-  });
-
-  // ⚠️ THERE WAS A SECOND CASE HERE — an `Object.keys` enumeration of each
-  // kind's field names — and it was DELETED rather than repaired. It could not
-  // detect what it claimed to: `DurableEvent` is never read at runtime and its
-  // annotation is erased, so a field added to one side left it green (the alias
-  // above caught it), a field added to BOTH left it green while falsifying its
-  // own "optional fields included" comment, and a RENAME failed as a type error
-  // at its object literal — the exact failure mode it existed to spare the
-  // reader. `vitest run` never typechecks, so under the command that ran it, it
-  // asserted nothing the types had not already decided. Do not reinstate it.
-});
 
 describe("journalEventForOutbound maps the durable frames", () => {
   it("maps an id-bearing agent_message to a bubble", () => {

@@ -19,36 +19,43 @@
  * as a value — `nats-channel.ts` takes `DeliveryJournal` type-only on purpose so
  * it pulls in no database runtime, so `delivery-journal.ts` could not be it.
  *
- * ⚠️ `JournalEvent` IS A MIRROR OF `DurableEvent`, NOT A SEPARATE MODEL.
- * `packages/client/src/durable-view-reducer.ts` is the AUTHORITY; the two must
- * stay structurally identical, because the whole v6 bet is that ONE pure reducer
- * computes BOTH the live view and history (`history == live` BY CONSTRUCTION,
- * doc §15.4). Two shapes that drift are two reducers, and a server-side
- * projection free to invent its own ordering/supersession rule is exactly the
- * regression this redesign exists to kill (N8).
+ * ⚠️ `JournalEvent` IS THE CLIENT'S `DurableEvent` — ONE TYPE, NOT A MIRROR.
+ * It is a plain alias of the export from
+ * `packages/client/src/durable-view-reducer.ts`, imported by cross-package
+ * SOURCE path. The whole v6 bet is that ONE pure reducer computes BOTH the live
+ * view and history (`history == live` BY CONSTRUCTION, doc §15.4), and two event
+ * shapes free to drift are two reducers — a server-side projection that can
+ * invent its own ordering/supersession rule is exactly the regression this
+ * redesign exists to kill (N8). An alias makes the drift unrepresentable instead
+ * of merely detected.
  *
- * There is no shared package yet and creating one is NOT in this slice: #240 is
- * where the plugin actually RUNS the reducer, and it unifies the two. Until then
- * the mirror is held by exactly ONE guard, in `delivery-journal-event.test.ts`:
- * a compile-time STRICT TYPE-IDENTITY assertion between `JournalEvent` and the
- * client's `DurableEvent` (imported by cross-package source path, the
- * established pattern — see `durable-view-reducer-contract.test.ts`). It is
- * deliberately an IDENTITY check and not mutual assignability: mutual
- * assignability is blind to an OPTIONAL field added on one side only, and
- * `revision?: number` is precisely what #241 adds (doc §16.2-4). Measured — the
- * assignability pair compiled clean with `revision?` on one side.
+ * ⚠️ AND THE ALIAS IS WHAT MADE THE OLD GUARD OBSOLETE, NOT A REVIEWER'S
+ * PREFERENCE. Until #240 the two were separate declarations held together by a
+ * compile-time STRICT TYPE-IDENTITY assertion in `delivery-journal-event.test.ts`
+ * (identity rather than mutual assignability, because assignability is blind to
+ * an OPTIONAL field added on one side only — `revision?: number`, #241,
+ * doc §16.2-4 — and that was measured, not reasoned). #240 makes the reducer a
+ * dependency of the plugin's PRODUCTION source rather than of its tests only:
+ * `journal-history.ts` imports `applyDurableEvent` and folds journal rows
+ * through it. (Half 1 gives it no caller, so it is not yet reached at run time
+ * — that is half 2's wiring, and it does not change which package the type
+ * belongs to.) The cross-package import is therefore no longer a test-only
+ * affordance and the second declaration had no reason to exist. With
+ * one type the assertion degenerates to `Equals<T, T>` — a guard that CANNOT
+ * fail — so it was deleted rather than kept. That is the same judgement already
+ * recorded below about the `Object.keys` guard, and for the same reason: a guard
+ * that cannot fail is worse than no guard, because a header like this one can
+ * cite it as coverage.
  *
- * ⚠️ ONE guard, not two. There WAS a second, runtime `Object.keys` enumeration
- * of each kind's field names, advertised here as making a divergence greppable.
- * It was deleted because it could not do that: `DurableEvent` is never read at
- * runtime and its type annotation is erased, so a field added to one side left
- * it green while the identity alias went red, a field added to BOTH left it
- * green while quietly falsifying its own "optional fields included" claim, and a
- * RENAME surfaced as a type error at its object literal — the exact failure mode
- * it claimed to spare the reader. `vitest run` does not typecheck, so under the
- * command that ran it, it asserted nothing the types did not already decide. A
- * decorative guard beside a real one is worse than the real one alone, because
- * this header was citing it as coverage.
+ * ⚠️ THE `Object.keys` GUARD IS ALSO GONE, AND WAS GONE FIRST. It was a runtime
+ * enumeration of each kind's field names, advertised as making a divergence
+ * greppable. It could not do that: `DurableEvent` is never read at runtime and
+ * its type annotation is erased, so a field added to one side left it green
+ * while the identity alias went red, a field added to BOTH left it green while
+ * quietly falsifying its own "optional fields included" claim, and a RENAME
+ * surfaced as a type error at its object literal — the exact failure mode it
+ * claimed to spare the reader. `vitest run` does not typecheck, so under the
+ * command that ran it, it asserted nothing the types did not already decide.
  *
  * ⚠️ AND DO NOT READ "it isn't in `JournalEvent`" AS "it is non-durable by
  * design" — that is NOT-list N3/N7, and BOUNDARY 2 of the reducer says the event
@@ -63,22 +70,18 @@ import type { OutboundWsMessage } from "./channel-contract.js";
 // need — NO DATABASE/IO RUNTIME DEPENDENCY, which is why `nats-channel.ts` can
 // take `DeliveryJournal` type-only and still call in here for values.
 import { logSafe } from "./log-safe.js";
+// TYPE-ONLY, and the target has no imports AT ALL (its DEPENDENCY CONTRACT
+// forbids them, `node:` builtins included), so this line adds no runtime
+// dependency in either sense — it is erased under `verbatimModuleSyntax`, and
+// even a value import of that module would pull in nothing.
+import type { DurableEvent } from "../../client/src/durable-view-reducer.js";
 
 /**
- * The ordered event stream the plugin journals. Structural mirror of
- * `DurableEvent` in `packages/client/src/durable-view-reducer.ts` — see the
- * file header before changing a single field name.
+ * The ordered event stream the plugin journals: THE SAME TYPE the client's
+ * reducer consumes, not a copy of it. See the file header for why this is an
+ * alias rather than a second declaration guarded by an assertion.
  */
-export type JournalEvent =
-  | { kind: "user"; id: string; text: string; turnId?: string }
-  | { kind: "placement"; answerId: string; turnId?: string }
-  | { kind: "bubble"; answerId: string; text: string; turnId?: string }
-  | {
-      kind: "seal";
-      turnId: string;
-      answers: Array<{ id: string; text: string }>;
-      remove?: string[];
-    };
+export type JournalEvent = DurableEvent;
 
 /**
  * Upper bound on a CLIENT-supplied user-message id. See

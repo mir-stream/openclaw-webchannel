@@ -10,10 +10,16 @@
  * implementations agreeing (doc §15.4).
  *
  * `openDeliveryJournal` takes an explicit path and does not resolve config, read
- * the environment, or know about accounts. #239 half 2 landed the wiring — the
- * account-start open in `nats-account-runtime.ts` and the egress seam — and with
- * it persist-before-publish (commit the event BEFORE publishing its frame — N6,
- * doc §16.2-2, reversing v5 §15.8's commit-after).
+ * the environment, or know about accounts. #239 halves 2 and 3 landed the wiring
+ * — the account-start open in `nats-account-runtime.ts`, the egress seam in
+ * `nats-channel.ts`, and the inbound-accept seam in `ingress-dedupe.ts` — and
+ * with it persist-before-publish (commit the event BEFORE publishing its frame —
+ * N6, doc §16.2-2, reversing v5 §15.8's commit-after).
+ *
+ * What has NOT happened yet is a READER. #240 half 1 adds `journal-history.ts`,
+ * the projection, wired to nothing; half 2 is the cutover that makes this store
+ * the only history source. Several notes below still turn on "nothing reads it",
+ * which is a different and still-live premise from "nothing writes it".
  *
  * ── WHERE IT LIVES, AND WHY NOT WHERE THE DOC SAID ──
  *
@@ -75,10 +81,16 @@ export const DELIVERY_JOURNAL_SCHEMA_VERSION = "1";
  * the worst case here is the value chosen, not an async delay. Persist-before-
  * publish puts this in front of every outbound frame, and a 30 s freeze of the
  * gateway is a worse failure than a journal append that gives up and is retried
- * non-destructively (§15.8) — the journal is a shadow store this slice, so a
- * refused append costs nothing a retry cannot recover. Core's 30 s is right for
- * core: its state DB is the authority and there is no frame waiting behind it.
- * Revisit with #240, which makes this store authoritative.
+ * non-destructively (§15.8) — the journal is still a SHADOW store, so a refused
+ * append costs nothing a retry cannot recover. Core's 30 s is right for core: its
+ * state DB is the authority and there is no frame waiting behind it.
+ *
+ * ⚠️ "SHADOW" NOW MEANS "NOTHING READS IT", NOT "NOTHING WRITES IT" — #239 halves
+ * 2 and 3 wired both write seams, so this timeout IS in front of every outbound
+ * frame and every accepted user message today. What still makes a refused append
+ * cheap is that no reader depends on completeness yet. #240 **half 2** is where
+ * that stops being true and this value must be re-argued; half 1 (the projection,
+ * wired to nothing) does not change it.
  */
 const BUSY_TIMEOUT_MS = 5_000;
 
@@ -167,10 +179,19 @@ export type RetainedJournalEvent = JournalEvent | UnknownJournalEvent;
  * be a knowing lie, and the lie has a specific victim: `applyDurableEvent`'s
  * `switch` has no `default`, so an out-of-union kind falls off the end, returns
  * `undefined`, and the NEXT event throws — pointing at the wrong event (the
- * reducer's header documents this at length). #240 will lift the
+ * reducer's header documents this at length).
+ *
+ * ✅ AND THAT WARNING LANDED — the prediction here was that #240 would "lift the
  * `read(...).map((row) => row.event as DurableEvent)` shape straight out of
- * `delivery-journal.test.ts`, and this type is the only thing positioned to warn
- * it that the cast is a claim, not a fact.
+ * `delivery-journal.test.ts`". It did not: `journal-history.ts` wrote
+ * `isKnownJournalEvent`, a `Record<JournalEvent["kind"], true>`-derived filter
+ * that counts out-of-union rows into `unsupportedEvents` and keeps them away
+ * from `applyDurableEvent` entirely. Recorded as an outcome rather than deleted,
+ * because the POINT of the paragraph is unchanged and is now load-bearing for a
+ * real consumer: `kind` is `string` and `event` is `RetainedJournalEvent` ON
+ * PURPOSE, and that friction is what made the cast visibly a claim instead of a
+ * fact. Do not "tidy" either field to `JournalEvent`; the next consumer needs the
+ * same push.
  */
 export type DeliveryJournalRow = {
   seq: number;
@@ -230,15 +251,24 @@ export interface DeliveryJournal {
    *
    * UNBOUNDED BY DEFAULT, on purpose: replaying the whole log is what the shared
    * reducer does to produce history, so a silent default page size would produce
-   * a silently truncated history. #240 paginates from the materialized read
-   * model (doc §15.4), not from here.
+   * a silently truncated history.
    *
-   * ⚠️ THE DEFAULT IS ALSO A MEMORY DECISION, and #240 owns it: an unbounded
-   * read materializes AND `JSON.parse`s the entire conversation log into memory
-   * SYNCHRONOUSLY, blocking the event loop for the duration. Measured at 20 000
-   * rows of ~1.2 KB that is ~75 ms and ~25 MB of live objects. Fine while
-   * `read()` has no production caller; not fine once history is served from it
-   * per reconnect.
+   * ⚠️ THIS METHOD *IS* THE PAGINATION PATH, not a stopgap ahead of one. #240
+   * half 1's `journal-history.ts` serves a page by a FULL CHUNKED REPLAY off
+   * exactly this call — `read(conversationId, { afterSeq, limit })` in a loop —
+   * because the reducer is the only thing allowed to decide order, and a
+   * materialized table not yet proven equivalent to a replay would be a second
+   * opinion about it (N8). Doc §15.4's read model is still the right
+   * destination; it is deferred, not adopted, and **#286** tracks it with the
+   * replay's measured cost.
+   *
+   * ⚠️ THE DEFAULT IS ALSO A MEMORY DECISION, and #240 answered it by NEVER
+   * CALLING IT unbounded: an unbounded read materializes AND `JSON.parse`s the
+   * entire conversation log into memory SYNCHRONOUSLY, blocking the event loop
+   * for the duration. Measured at 20 000 rows of ~1.2 KB that is ~75 ms and
+   * ~25 MB of live objects. The projection chunks instead, so the unbounded
+   * default survives for callers that genuinely want the whole log (tests, and
+   * the store's own round-trip assertions) rather than as the history path.
    *
    * `afterSeq` must be a non-negative integer and `limit`, when given, a
    * positive one; both throw rather than degrade.
@@ -394,7 +424,13 @@ function openJournalConnection(
     //    Deliberate for this slice, and it is the same runtime-version-skew
     //    problem the reducer's BOUNDARY 2 defers to #241/#246. Filed as
     //    **#271**, which owns the residual risk; whoever makes the journal
-    //    authoritative (#240) owns closing it.
+    //    authoritative (#240 **half 2**) owns closing it.
+    //
+    //    ⚠️ ONE THING, AND ONLY ONE, MAKES THE GAP TOLERABLE: there are still no
+    //    deployed installs whose build could be older than a journal on disk.
+    //    That is not a property of this slice and it expires the day this ships
+    //    to a real deployment — so do not read the survival of the gap through
+    //    another slice as evidence that it is cheap.
     db.exec(`
       CREATE TABLE IF NOT EXISTS journal_meta (
         key   TEXT PRIMARY KEY,
@@ -760,6 +796,11 @@ function closeQuietly(db: SqliteDatabase): void {
  * the same seam but keeps only the residue no chmod policy covers: the SSHFS
  * hard refusal, and two comments in this file that contradict each other about
  * network filesystems.)
+ *
+ * #240 half 1 does not touch it either — it ships `journal-history.ts` wired to
+ * nothing, so it changes neither the load path nor the policy. Half 2's cutover
+ * is the last slice that can decide this before the store is the only copy of
+ * the truth.
  */
 function chmodDatabaseFiles(databasePath: string): void {
   for (const suffix of SQLITE_DATABASE_FILE_SUFFIXES) {
