@@ -158,8 +158,9 @@ describe("index-nats.ts wiring contract — account-bound auth and startup", () 
 
 describe("nats-account-runtime.ts wiring contract — v6 delivery journal (#239)", () => {
   /**
-   * `NatsChannelDurability.deliveryJournal` is OPTIONAL so the hundreds of
-   * four-argument test constructions keep compiling. That optionality is exactly
+   * `NatsChannelDurability.deliveryJournal` is OPTIONAL for the reason its own
+   * docblock gives: the plaintext/test construction has no tuple directory to
+   * open a journal in. That optionality is exactly
    * what could turn into an UNJOURNALED PRODUCTION without a single test going
    * red — the journal is a shadow store until #240, so nothing reads it and
    * nothing else would notice. These assertions are the only thing standing

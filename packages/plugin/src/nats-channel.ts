@@ -985,9 +985,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     // last-write-wins by id, so history has it and the reconnect catches up,
     // rather than the client holding a message the store lacks.
     //
-    // ⚠️ NOT universally — a lane that never sends successfully accumulates
-    // rows under ids that never existed live. #278 owns that case and the
-    // conditions it needs.
+    // ⚠️ NOT universally — see #278 for the case and its conditions.
     this.journalOutbound(peerId, payload);
 
     try {

@@ -9,11 +9,11 @@
  * history — so `history == live` holds BY CONSTRUCTION rather than by two
  * implementations agreeing (doc §15.4).
  *
- * THIS HALF SHIPS THE STORE WITH NO CALL SITES. `openDeliveryJournal` takes an
- * explicit path and does not resolve config, read the environment, or know about
- * accounts; half 2 owns the wiring, and with it persist-before-publish (commit
- * the event BEFORE publishing its frame — N6, doc §16.2-2, reversing v5 §15.8's
- * commit-after).
+ * `openDeliveryJournal` takes an explicit path and does not resolve config, read
+ * the environment, or know about accounts. #239 half 2 landed the wiring — the
+ * account-start open in `nats-account-runtime.ts` and the egress seam — and with
+ * it persist-before-publish (commit the event BEFORE publishing its frame — N6,
+ * doc §16.2-2, reversing v5 §15.8's commit-after).
  *
  * ── WHERE IT LIVES, AND WHY NOT WHERE THE DOC SAID ──
  *
@@ -236,8 +236,9 @@ export interface DeliveryJournal {
    * ⚠️ THE DEFAULT IS ALSO A MEMORY DECISION, and #240 owns it: an unbounded
    * read materializes AND `JSON.parse`s the entire conversation log into memory
    * SYNCHRONOUSLY, blocking the event loop for the duration. Measured at 20 000
-   * rows of ~1.2 KB that is ~75 ms and ~25 MB of live objects. Fine for a store
-   * with no call sites; not fine once history is served from it per reconnect.
+   * rows of ~1.2 KB that is ~75 ms and ~25 MB of live objects. Fine while
+   * `read()` has no production caller; not fine once history is served from it
+   * per reconnect.
    *
    * `afterSeq` must be a non-negative integer and `limit`, when given, a
    * positive one; both throw rather than degrade.
@@ -390,10 +391,10 @@ function openJournalConnection(
     //
     //    ⚠️ There is NO version-negotiation gate yet: `schema_version` is seeded
     //    and never checked, so an older build opening a newer journal proceeds.
-    //    Deliberate for this slice (the journal has no call sites and no on-disk
-    //    installs to be older than), and it is the same runtime-version-skew
-    //    problem the reducer's BOUNDARY 2 defers to #241/#246. Filed as **#271**;
-    //    whoever makes the journal authoritative (#240) owns closing it.
+    //    Deliberate for this slice, and it is the same runtime-version-skew
+    //    problem the reducer's BOUNDARY 2 defers to #241/#246. Filed as
+    //    **#271**, which owns the residual risk; whoever makes the journal
+    //    authoritative (#240) owns closing it.
     db.exec(`
       CREATE TABLE IF NOT EXISTS journal_meta (
         key   TEXT PRIMARY KEY,
