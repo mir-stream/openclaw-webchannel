@@ -96,7 +96,37 @@ const ENFORCED = [
  */
 const KNOWN_RAW: Record<string, readonly string[]> = {
   "inbound.ts": [],
-  "ingress-dedupe.ts": [],
+
+  /**
+   * #239 half 3's two delivery-journal warnings. The ONE peer-controlled value
+   * on either line — `peerId` — IS wrapped, which is why it is not here. These
+   * four are non-peer, so they fall outside #123's scope for the same reason
+   * `nats-account-runtime.ts`'s startup values do:
+   *  - `reason` and the `action` derived from it are members of a CLOSED
+   *    two-value union (`"no-usable-id" | "non-string-text"`), not data. If that
+   *    union is ever widened to carry anything from a frame, these two
+   *    exemptions stop being sound and must become `logSafe` calls;
+   *  - `journalable.length` is a count;
+   *  - `journalFailureDiagnostic(error)` is a COMPOSITE that already escapes each
+   *    field it renders (`code=`/`errcode=`/`errstr=`, `logSafe` per value, and
+   *    it excludes `error.message` entirely). Wrapping it again would quote the
+   *    whole record and destroy the logfmt structure it exists to produce.
+   *
+   * ⚠️ THE ALTERNATIVE WAS TO HIDE THEM, AND THAT IS WHY THIS LIST GREW INSTEAD.
+   * `nats-channel.ts` builds its sibling journal warning into a local `const
+   * line` and calls `console.warn(line)`. The scanner derives `prefixText` from
+   * the STATIC text of the call's arguments, so a bare identifier yields `""`,
+   * no prefix matches, and the whole statement is skipped — not exempted,
+   * INVISIBLE. Assembling the template one statement earlier would have made
+   * these four disappear with no entry here at all. An exemption a reader can
+   * see and falsify beats a statement the audit never looks at.
+   */
+  "ingress-dedupe.ts": [
+    `ingress-dedupe.ts  ::  reason  @  "unjournalable-user""webchannel: inbound user message admitted but NOT journaled "peer= reason=`,
+    `ingress-dedupe.ts  ::  action  @  "unjournalable-user""webchannel: inbound user message admitted but NOT journaled "peer= reason=`,
+    `ingress-dedupe.ts  ::  journalable.length  @  "append-failed""webchannel: delivery journal append failed at the inbound accept "peer= messagesInBatch= action=reject-accept-client-retries`,
+    `ingress-dedupe.ts  ::  journalFailureDiagnostic(error)  @  "append-failed""webchannel: delivery journal append failed at the inbound accept "peer= messagesInBatch= action=reject-accept-client-retries`,
+  ],
 
   "approvals.ts": [],
 
@@ -146,7 +176,12 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // 4+2+3 interpolations), restoring this to 6/12 now that the plugin emits the
   // corrected [A][B] sequence directly and no resync read exists to narrate.
   "inbound.ts": { statements: 6, interpolations: 12 },
-  "ingress-dedupe.ts": { statements: 13, interpolations: 7 },
+  // #239 half 3 adds the two delivery-journal warnings (13→15) and their six
+  // interpolations (7→13): `peerId` twice, plus `reason`/`action` on the gap
+  // line and `journalable.length`/`journalFailureDiagnostic(error)` on the
+  // failure line. Only `peerId` is peer-controlled and only `peerId` is wrapped;
+  // the other four are in KNOWN_RAW above with the property each one rests on.
+  "ingress-dedupe.ts": { statements: 15, interpolations: 13 },
   "approvals.ts": { statements: 9, interpolations: 24 },
   "nats-account-runtime.ts": { statements: 23, interpolations: 45 },
   "auth.ts": { statements: 16, interpolations: 5 },
