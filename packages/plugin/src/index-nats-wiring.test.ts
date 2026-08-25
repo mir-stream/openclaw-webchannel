@@ -172,10 +172,12 @@ describe("nats-account-runtime.ts wiring contract — v6 delivery journal (#239)
     // Same (tenant, accountId, storageRoot) triple as the ConversationKeyStore
     // two lines up — a second, differently-derived path would put the journal in
     // a directory nothing else protects.
+    // One regex, not two: a free-floating `.deliveryJournalPath,` match would
+    // stay green while the call above read `.credentialPath`. `[^;]*?` spans the
+    // optional-storageRoot spread without escaping the statement.
     expect(RUNTIME_SOURCE).toMatch(
-      /deliveryJournal = openDeliveryJournal\(\{\s*databasePath: tupleStoragePaths\(\{\s*tenant,\s*accountId,/,
+      /deliveryJournal = openDeliveryJournal\(\{\s*databasePath: tupleStoragePaths\(\{\s*tenant,\s*accountId,[^;]*?\}\)\.deliveryJournalPath,/,
     );
-    expect(RUNTIME_SOURCE).toMatch(/\}\)\.deliveryJournalPath,/);
     // The channel must actually RECEIVE it. `undefined` is the defaulted
     // NatsChannelLimits in the 5th position.
     expect(RUNTIME_SOURCE).toMatch(

@@ -759,15 +759,6 @@ function closeQuietly(db: SqliteDatabase): void {
  * the same seam but keeps only the residue no chmod policy covers: the SSHFS
  * hard refusal, and two comments in this file that contradict each other about
  * network filesystems.)
- *
- * What keeps that from being a NEW availability regression, measured so it is
- * not re-derived: `ConversationKeyStore.getOrCreate` → `persist` →
- * `atomicWritePrivateFile(..., { enforceDirectoryMode: true })` →
- * `ensurePrivateDirectory(dir, true)` → `chmodSync(dir, 0o700)` already runs in
- * the SAME tuple directory on every new peer registration, so a chmod-hostile
- * filesystem could never register a peer even before this slice. The change
- * moves the failure from first-register to account-start; it does not create a
- * class of deployment that was previously alive.
  */
 function chmodDatabaseFiles(databasePath: string): void {
   for (const suffix of SQLITE_DATABASE_FILE_SUFFIXES) {

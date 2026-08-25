@@ -981,24 +981,14 @@ export class NatsChannel implements WebChannelPeerChannel {
     // The window §16.2-2 actually describes is the one that REMAINS: `sealEnvelope`
     // or `transport.publish` throwing after this line, so the record is committed
     // and the frame does not reach the peer. For a `bubble` that is the SAFE
-    // direction on purpose — the id is stable and the row upserts by id, so
-    // history has it and the reconnect catches up, rather than the client holding
-    // a message the store lacks.
+    // direction on purpose — the id is stable and the projection is
+    // last-write-wins by id, so history has it and the reconnect catches up,
+    // rather than the client holding a message the store lacks.
     //
-    // ⚠️ IT IS NOT SAFE FOR `placement`. That is the SAME re-minting above,
-    // reached through the WIRE WRITE instead of a refusal: `message-adapter.ts`'s
-    // `sendLaneFrame` reserves `lane.id` when set and otherwise
-    // `reserveProvisional`, which hands out a fresh `nextMessageId()` while the
-    // provisional preview is unavailable, and `lane.id ??= reservation.id` runs
-    // only on success — so a repeated failure re-mints per attempt and
-    // `journal_placement_once`, keyed on `message_id`, cannot collapse them. The
-    // sustained trigger is `transport.publish`'s size gate against the relay's
-    // advertised `max_payload`: a `progress` frame carries the CUMULATIVE answer
-    // text, so once it crosses the limit it stays across it for the rest of the
-    // answer, while `state.lastProgressSentAt` advances only on success and
-    // leaves the throttle inert. One re-minted `placement` row per chunk — N6b in
-    // the GAINING direction. Tracked as #278 with the full chain; its fix is out
-    // of this PR's scope by decision, not by oversight.
+    // ⚠️ NOT for a lane whose FIRST wire attempt fails: `lane.id` is never
+    // assigned, so every retry re-mints and the rows accumulate under ids that
+    // never existed live. #278 carries the chain; its fix needs a size decision
+    // this slice does not own.
     this.journalOutbound(peerId, payload);
 
     try {

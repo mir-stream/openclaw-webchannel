@@ -56,11 +56,11 @@ because the thing it names does not exist. The correction:
     `sendToPeer` journals the payload *before* `sealEnvelope` runs, so K covers
     the wire and nothing else here. Two consequences. Count this file in the
     §0.1 exposure assessment: whoever could read `conversation-keys.json` could
-    read this too, so the exposed set is the full transcript, not only what K
-    could decrypt. And deleting it is available to you as **data minimization** —
-    it removes plaintext standing on disk from here on. That is not containment
-    and it does not undo past exposure (§0.1), so it is your call to make, not a
-    step this procedure requires.
+    read this too, so the exposed set includes everything the agent sent, not
+    only what K could decrypt. And deleting it is available to you as **data
+    minimization** — it removes plaintext standing on disk from here on. That
+    is not containment and it does not undo past exposure (§0.1), so it is your
+    call to make, not a step this procedure requires.
   - legacy migration artifacts under `$HOME/.openclaw-webchannel/`.
 
   That is the complete list. Nothing on it is a ciphertext store to invalidate:
