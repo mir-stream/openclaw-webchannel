@@ -909,13 +909,16 @@ export class NatsChannel implements WebChannelPeerChannel {
   }
 
   /**
-   * THE single outbound egress point. Every public sender funnels through it —
-   * `sendText`/`finalizeDraft`, `sendProgress`, `sendReasoning`,
-   * `sendToolActivity`, `sendTurnSettled`, `sendTurnSnapshot`, typing, history,
-   * commands, the approval frames, and (via `sendIngressResult`) the ack and
-   * inbound_rejected chunks. That is why the v6 journal hook lives HERE and
-   * nowhere else: one hook covers the whole surface, including the direct-ACK
-   * paths doc §15.7 worried about.
+   * THE single egress point for every `OutboundWsMessage`. Every public sender
+   * funnels through it — `sendText`/`finalizeDraft`, `sendProgress`,
+   * `sendReasoning`, `sendToolActivity`, `sendTurnSettled`, `sendTurnSnapshot`,
+   * typing, history, commands, the approval frames, and (via
+   * `sendIngressResult`) the ack and inbound_rejected chunks. That is why the v6
+   * journal hook lives HERE and nowhere else: one hook covers the whole surface,
+   * including the direct-ACK paths doc §15.7 worried about. (The class's one
+   * other `this.transport.publish` — `handleRegister`'s request-reply on the
+   * requester's `reginbox` subject — is a raw handshake string rather than an
+   * `OutboundWsMessage`, and carries nothing durable.)
    */
   private sendToPeer(peerId: string, payload: OutboundWsMessage): boolean {
     if (this.disposed || !this.transport.connected) {
@@ -929,9 +932,14 @@ export class NatsChannel implements WebChannelPeerChannel {
     // session key. We NEVER fall back to plaintext on the relay.
     //
     // Lifted out of the `try` below ONLY so the journal hook can sit between the
-    // REFUSALS and the WIRE WRITE. The check itself is unchanged and still runs
-    // before anything is journaled or published; `sealEnvelope` deliberately
-    // stays inside the `try`, so a throw while sealing still returns `false`.
+    // REFUSALS and the WIRE WRITE. The predicate and its position are unchanged
+    // and still run before anything is journaled or published; `sealEnvelope`
+    // deliberately stays inside the `try`, so a throw while sealing still
+    // returns `false`. What the lift DID change is exception containment on this
+    // one path: the `console.warn` below used to sit inside the `try`, so a
+    // faulting host `console` became `return false`, and now it escapes
+    // `sendToPeer` — which matches the disposed/transport-down refusal above,
+    // where that has always been true.
     let sessionKey: Uint8Array | undefined;
     if (this.encryptionRequired) {
       sessionKey = this.peerSessionKeys.get(peerId);
@@ -971,10 +979,26 @@ export class NatsChannel implements WebChannelPeerChannel {
     // for it would only make history show what live never showed.
     //
     // The window §16.2-2 actually describes is the one that REMAINS: `sealEnvelope`
-    // or `transport.publish` throwing after this line. There the record is
-    // committed and the frame does not reach the peer, and that is the SAFE
-    // direction on purpose — history has it and the reconnect catches up, rather
-    // than the client holding a message the store lacks.
+    // or `transport.publish` throwing after this line, so the record is committed
+    // and the frame does not reach the peer. For a `bubble` that is the SAFE
+    // direction on purpose — the id is stable and the row upserts by id, so
+    // history has it and the reconnect catches up, rather than the client holding
+    // a message the store lacks.
+    //
+    // ⚠️ IT IS NOT SAFE FOR `placement`. That is the SAME re-minting above,
+    // reached through the WIRE WRITE instead of a refusal: `message-adapter.ts`'s
+    // `sendLaneFrame` reserves `lane.id` when set and otherwise
+    // `reserveProvisional`, which hands out a fresh `nextMessageId()` while the
+    // provisional preview is unavailable, and `lane.id ??= reservation.id` runs
+    // only on success — so a repeated failure re-mints per attempt and
+    // `journal_placement_once`, keyed on `message_id`, cannot collapse them. The
+    // sustained trigger is `transport.publish`'s size gate against the relay's
+    // advertised `max_payload`: a `progress` frame carries the CUMULATIVE answer
+    // text, so once it crosses the limit it stays across it for the rest of the
+    // answer, while `state.lastProgressSentAt` advances only on success and
+    // leaves the throttle inert. One re-minted `placement` row per chunk — N6b in
+    // the GAINING direction. Tracked as #278 with the full chain; its fix is out
+    // of this PR's scope by decision, not by oversight.
     this.journalOutbound(peerId, payload);
 
     try {

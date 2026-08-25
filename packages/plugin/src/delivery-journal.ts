@@ -747,16 +747,27 @@ function closeQuietly(db: SqliteDatabase): void {
  * demonstrably rejects chmod), because — in its own words — "crashing at open
  * would take the gateway down on Azure Files/NFS/Docker volumes (#91919)."
  *
- * This throws on all of those instead, for two reasons: `private-file.ts` in
- * this package uses a bare `chmodSync` throughout, so fail-closed is the house
- * convention here and a lone best-effort store would be the inconsistency; and
- * the journal has NO CALL SITES yet, so nothing can be taken down by it.
+ * This throws on all of those instead, because `private-file.ts` in this package
+ * uses a bare `chmodSync` throughout: fail-closed is the house convention here,
+ * and a lone best-effort store would be the inconsistency.
  *
- * ⚠️ #240 MUST REVISIT THIS. That slice puts the journal in the plugin's load
- * path, at which point core's reason starts applying to us verbatim: a gateway
- * that refuses to start on a Docker volume because a `-shm` chmod returned
- * ENOTSUP is a worse outcome than a loose `-shm`. Do not treat the strictness as
- * settled just because it survived this slice.
+ * ⚠️ #287 MUST REVISIT THIS. The journal IS in the plugin's load path as of #239
+ * half 2 (opened at account start), at which point core's reason starts applying
+ * to us verbatim: a gateway that refuses to start on a Docker volume because a
+ * `-shm` chmod returned ENOTSUP is a worse outcome than a loose `-shm`. Do not
+ * treat the strictness as settled just because it survived this slice. (#280 is
+ * the same seam but keeps only the residue no chmod policy covers: the SSHFS
+ * hard refusal, and two comments in this file that contradict each other about
+ * network filesystems.)
+ *
+ * What keeps that from being a NEW availability regression, measured so it is
+ * not re-derived: `ConversationKeyStore.getOrCreate` → `persist` →
+ * `atomicWritePrivateFile(..., { enforceDirectoryMode: true })` →
+ * `ensurePrivateDirectory(dir, true)` → `chmodSync(dir, 0o700)` already runs in
+ * the SAME tuple directory on every new peer registration, so a chmod-hostile
+ * filesystem could never register a peer even before this slice. The change
+ * moves the failure from first-register to account-start; it does not create a
+ * class of deployment that was previously alive.
  */
 function chmodDatabaseFiles(databasePath: string): void {
   for (const suffix of SQLITE_DATABASE_FILE_SUFFIXES) {
