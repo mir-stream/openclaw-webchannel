@@ -272,7 +272,7 @@ export function journalEventForOutbound(
 /**
  * The inbound user message's journal event.
  *
- * Exported alongside the outbound mapper so half 2 has nothing to invent at the
+ * Exported alongside the outbound mapper so half 3 has nothing to invent at the
  * accept seam: doc §15.7 makes the plugin the ONLY SSOT for user messages, so
  * this event is the durable record of the accept, written before the ack.
  *
@@ -304,7 +304,8 @@ export function journalEventForOutbound(
  *  - a 1 MB id — see the amplification above.
  *
  * It throws rather than returning `null` because this runs BEFORE accept: a
- * loud failure in half 2's integration test is the outcome we want, whereas a
+ * loud failure in half 3's accept-seam tests
+ * (`ingress-dedupe-delivery-journal.test.ts`) is the outcome we want, whereas a
  * `null` would invite the accept path to shrug and continue unjournaled.
  * `isUsableMessageId` is the same predicate the durable-frame branch uses, so
  * the two cannot drift on what "id-less" means; the LENGTH bound is added only

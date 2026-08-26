@@ -58,21 +58,22 @@
  * conversation, from a one-line edit. Deriving it makes THAT hole
  * unrepresentable.
  *
- * ⚠️ IT DOES NOT MAKE THE CLASS UNREPRESENTABLE, AND THE NEXT PERSON TO RAISE
- * THE NUMBER NEEDS THE LIST. Three more `128`s are hardcoded INDEPENDENTLY and
- * are deliberately NOT derived here, because they are different concerns
- * (wire-frame sizing, debouncer validation) and coupling them is a bigger change
- * than this slice should make:
- *   - `ingress-result-chunks.ts`'s `MAX_INGRESS_RESULT_ID_LENGTH`
- *   - `bounded-inbound-debouncer.ts`'s `validId`
- *   - `nats-account-runtime.ts`'s overflow-resolver id guard
- * The first is the sharp one: raise `MAX_INBOUND_USER_ID_LENGTH` to 256 and both
- * derived doors move together, so it LOOKS safe — but a 200-char id is then
- * admitted, journaled, recorded `accepted` and dispatched, and
- * `createIngressResultChunkWriter.add` refuses it, so no ack is ever emitted. The
- * client replays forever and every replay takes the `existing.status === "found"`
- * path straight back into the same refusal: the same permanent wedge, one door
- * further along.
+ * ⚠️ IT DOES NOT MAKE THE CLASS UNREPRESENTABLE. Several more `128`s bound this
+ * same `user_message.id` at later doors, each hardcoded INDEPENDENTLY and
+ * deliberately NOT derived here, because they are different concerns (wire-frame
+ * sizing, debouncer validation, coalesce membership, overflow resolution) and
+ * coupling them is a bigger change than this slice should make. ANYONE RAISING
+ * `MAX_INBOUND_USER_ID_LENGTH` MUST SWEEP THE PACKAGE FOR THEM — an enumeration
+ * kept here would only rot into a list that reads complete and is not.
+ *
+ * `ingress-result-chunks.ts`'s `MAX_INGRESS_RESULT_ID_LENGTH` is the sharp one,
+ * and is worth reproducing because it shows what the sweep is FOR: raise
+ * `MAX_INBOUND_USER_ID_LENGTH` to 256 and both derived doors move together, so it
+ * LOOKS safe — but a 200-char id is then admitted, journaled, recorded `accepted`
+ * and dispatched, and `createIngressResultChunkWriter.add` refuses it, so no ack
+ * is ever emitted. The client replays forever and every replay takes the
+ * `existing.status === "found"` path straight back into the same refusal: the
+ * same permanent wedge, one door further along.
  */
 const MAX_INGRESS_DEDUPE_ID_LENGTH = MAX_INBOUND_USER_ID_LENGTH;
 export const MAX_CANCELLED_INBOUND_FALLBACK_TOMBSTONES = 256;
@@ -267,8 +268,8 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
    * ⚠️ OPTIONAL IN THE TYPE ONLY. THIS IS NOT A DEGRADE MODE. Doc §15.7 makes a
    * durable journal write a HARD REQUIREMENT of accepting a user message, so an
    * account serving without one is serving without the SSOT its history comes
-   * from. It is optional purely so the dozens of existing four-key test
-   * constructions in `ingress-dedupe.test.ts` keep compiling.
+   * from. It is optional purely so the existing test constructions in
+   * `ingress-dedupe.test.ts` keep compiling.
    * `nats-account-runtime.ts` is the production owner and ALWAYS supplies one —
    * pinned by a source guard in `index-nats-wiring.test.ts`, exactly because
    * "optional" must not quietly become "absent in production" (the same guard
@@ -480,9 +481,15 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
        * failure would then roll those messages back while the client had already
        * drained their ledger entries and would never replay them: permanent,
        * silent loss of accepted user text — exactly what doc §15.7 exists to
-       * prevent. (Unreachable today only by arithmetic — `maxIds` is 64 and
-       * `DEFAULT_BUSY_TURN_LIMITS.maxMessagesPerSession` is 32 — which is not a
-       * property this file should depend on.)
+       * prevent. (Unreachable today only by one accident per trigger, both in
+       * OTHER files: the id-count trigger is held off because `maxIds` is 64 and
+       * `DEFAULT_BUSY_TURN_LIMITS.maxMessagesPerSession` is 32, and the byte
+       * trigger because `MAX_INGRESS_RESULT_WIRE_BYTES` is 64 KB AND
+       * `nats-account-runtime.ts` never supplies the `effectiveOutboundLimit`
+       * that would shrink it — a wiring gap, which is weaker than arithmetic and
+       * one line from closing. This slice's own tests pass an
+       * `effectiveOutboundLimit` precisely to fire that second trigger. Neither
+       * is a property this file should depend on.)
        *
        * The chunking semantics are unchanged: the same ids are `add`ed in the
        * same order, so the same frames are produced — only later. Memory: two
@@ -576,7 +583,9 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               // honest if the item really does produce a live bubble. Two facts,
               // both in `inbound-queue.ts`: `finish()` promotes every `committed`
               // entry to `attached` and drains it (so a REFUSED batch still runs
-              // this one — pinned by a test), and `commit()`'s own
+              // this one; a test pins the precondition — this item's offer is
+              // committed and never rolled back — not the promotion itself),
+              // and `commit()`'s own
               // disposed/finished rollback branch cannot fire from here, because
               // `offer()` reads those SAME two flags one statement earlier and
               // would have returned `{status:"disposed"}` into the `else`. The
@@ -730,9 +739,9 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // egress seam's own two-round mistake).
             //
             // The `existing.status === "found"` branch above is deliberately NOT
-            // collected: it re-acks a message whose `user` row was written when
-            // it was first admitted, so re-journaling would be a no-op on
-            // `journal_user_once` and would only add a second call site.
+            // collected: it is not a fresh admission of new text, so this seam is
+            // not its journal author — and re-appending would in any case be a
+            // no-op on `journal_user_once` and would only add a second call site.
             if (deps.deliveryJournal) {
               journalPending.push({ id, text: item.message.text });
             }
@@ -777,16 +786,19 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         // `journalOutbound`) a journal failure must NEVER change the send
         // result — log, never throw, never return `false` — because by then the
         // text has already left for the client and refusing would lose delivered
-        // text (N10). HERE nothing has been confirmed to anyone yet: no ack is
-        // on the wire, no turn has run, and the journal is the authority that
-        // decides whether the message exists at all. So here a journal failure
-        // IS an accept failure.
+        // text (N10). HERE nothing this seam is the SSOT for has been confirmed
+        // to anyone yet: no chunk-writer result is on the wire, no turn has run,
+        // and the journal is the authority that decides whether the message
+        // exists at all. So here a journal failure IS an accept failure.
         //
         // Position: AFTER the `invalidated` early return (see the collection
         // site — journaling a batch that is about to roll back is N8 in the
-        // gaining direction) and BEFORE ANY RESULT REACHES THE WIRE. The item
-        // loop deliberately publishes nothing at all — see `ackIds` for why
-        // `chunkWriter.add()` inside the loop was NOT good enough.
+        // gaining direction) and BEFORE ANY CHUNK-WRITER RESULT REACHES THE
+        // WIRE. The item loop deliberately publishes nothing through either
+        // writer — see `ackIds` for why `chunkWriter.add()` inside the loop was
+        // NOT good enough. The one exception is the cancelled-inbound fallback
+        // branch's direct `sendAck`, which does reach the wire before this
+        // point; exception 1 in the catch block below argues why that is right.
         if (deps.deliveryJournal && journalPending.length > 0) {
           // The text is validated HERE rather than at the collection site so a
           // batch that never survives to this point cannot report a gap for a
@@ -796,7 +808,9 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           // would TAKE it (only `user` IDS are validated there), but the shared
           // reducer types `user.text` as a `string`, so a row holding one is a
           // durable row no reader can render. Same verdict as an unusable id:
-          // admit, do not journal, say so.
+          // admit, do not journal, say so. And the gap is sharper than a plain
+          // omission — the turn still runs and the egress seam journals its
+          // answer, so history gains an agent answer with NO preceding user row.
           const journalable: Array<{ id: string; text: string }> = [];
           for (const pending of journalPending) {
             if (typeof pending.text === "string") {
@@ -967,7 +981,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             warnJournal(
               "append-failed",
               "webchannel: delivery journal append failed at the inbound accept " +
-                `peer=${logSafe(peerId)} messagesInBatch=${journalable.length} ` +
+                `peer=${logSafe(peerId)} journaled=${journalable.length} ` +
                 `action=reject-accept-client-retries ${journalFailureDiagnostic(error)}`,
             );
             return;

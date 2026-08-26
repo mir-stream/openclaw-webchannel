@@ -548,7 +548,7 @@ describe("#239 — a journal failure is an ACCEPT failure (doc §15.7)", () => {
     const warn = warns(seam.calls)[0]!.message;
     expect(warn).toContain("delivery journal append failed at the inbound accept");
     expect(warn).toContain(`peer="${PEER}"`);
-    expect(warn).toContain("messagesInBatch=2");
+    expect(warn).toContain("journaled=2");
     expect(warn).toContain("action=reject-accept-client-retries");
     // The value-free status the shared `journalFailureDiagnostic` extracts —
     // never the free-form message, never message text.
@@ -596,7 +596,7 @@ describe("#239 — a journal failure is an ACCEPT failure (doc §15.7)", () => {
     // `deferredReleases` loop — the accepted item's rides on its offer rollback.
     // Deleting that loop leaves this at `{ messages: 1, bytes: 1 }`.
     expect(budget.usage()).toEqual({ messages: 0, bytes: 0 });
-    expect(warns(seam.calls)[0]!.message).toContain("messagesInBatch=1");
+    expect(warns(seam.calls)[0]!.message).toContain("journaled=1");
   });
 
   it("does NOT unwind the cancelled-inbound fallback's ack — the one result that outruns the journal", async () => {
@@ -669,7 +669,7 @@ describe("#239 — a journal failure is an ACCEPT failure (doc §15.7)", () => {
       expect.objectContaining({ call: "ack" }),
     );
     expect(kinds(seam.calls).filter((kind) => kind === "offer-rollback")).toHaveLength(2);
-    expect(warns(seam.calls)[0]!.message).toContain("messagesInBatch=2");
+    expect(warns(seam.calls)[0]!.message).toContain("journaled=2");
   });
 });
 

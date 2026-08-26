@@ -124,8 +124,8 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
   "ingress-dedupe.ts": [
     `ingress-dedupe.ts  ::  reason  @  "unjournalable-user""webchannel: inbound user message admitted but NOT journaled "peer= reason=`,
     `ingress-dedupe.ts  ::  action  @  "unjournalable-user""webchannel: inbound user message admitted but NOT journaled "peer= reason=`,
-    `ingress-dedupe.ts  ::  journalable.length  @  "append-failed""webchannel: delivery journal append failed at the inbound accept "peer= messagesInBatch= action=reject-accept-client-retries`,
-    `ingress-dedupe.ts  ::  journalFailureDiagnostic(error)  @  "append-failed""webchannel: delivery journal append failed at the inbound accept "peer= messagesInBatch= action=reject-accept-client-retries`,
+    `ingress-dedupe.ts  ::  journalable.length  @  "append-failed""webchannel: delivery journal append failed at the inbound accept "peer= journaled= action=reject-accept-client-retries`,
+    `ingress-dedupe.ts  ::  journalFailureDiagnostic(error)  @  "append-failed""webchannel: delivery journal append failed at the inbound accept "peer= journaled= action=reject-accept-client-retries`,
   ],
 
   "approvals.ts": [],
