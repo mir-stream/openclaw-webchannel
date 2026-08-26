@@ -149,8 +149,9 @@
  *     in their own unit; a single percentage across the table is false at three
  *     of these four sizes whichever one you pick.
  *  2. THE SQL IS NOT THE COST. The raw unbounded read is linear and small
- *     (~61 ms at 20 000, matching the ~75 ms in `DeliveryJournal.read`'s
- *     docblock); the projection is 24x that.
+ *     (~61 ms at 20 000 — the same ORDER as the ~75 ms in
+ *     `DeliveryJournal.read`'s docblock, not a match for it; the two runs differ
+ *     by 19%); the projection is 24x that.
  *  3. ⚠️ THE COST IS THE SHARED REDUCER'S FOLD, AND IT IS QUADRATIC IN
  *     CONVERSATION LENGTH. `fold only` is `reduceDurableView` over rows already
  *     parsed, so the gap up to `project@512` is this module's own overhead — the
@@ -289,9 +290,15 @@ const KNOWN_EVENT_KINDS: Record<JournalEvent["kind"], true> = {
  * `turnId` as given. The property that a journaled `user.text` really is a
  * `string` is established at the ACCEPT seam instead, where `ingress-dedupe.ts`
  * filters the batch on `typeof pending.text === "string"` before appending and
- * reports the rest as a journal gap (ingress-dedupe.ts:791-805). So "the write
- * path already checked" is true, but it is true at a different door than this
- * one.
+ * reports the rest as a journal gap. So "the write path already checked" is
+ * true, but it is true at a different door than this one.
+ *
+ * (That last one is cited by its CONDITION rather than a line range on purpose.
+ * It is the only anchor in this file pointing into a seam that a different,
+ * still-open slice is actively rewriting — the range moved twice during this
+ * PR's own review — and nothing in the repo checks in-repo `file.ts:NNN`
+ * anchors (**#288**). A grep-stable predicate survives that churn; a number does
+ * not, and a number that has gone stale reads as authority.)
  */
 function isKnownJournalEvent(
   event: RetainedJournalEvent,
