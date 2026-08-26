@@ -24,6 +24,11 @@ const RUNTIME_SOURCE = readFileSync(
   "utf8",
 );
 const ENTRY_SOURCE = readFileSync(fileURLToPath(new URL("../index-nats.ts", import.meta.url)), "utf8");
+/** The channel itself — read only by the #239 durability contract below. */
+const CHANNEL_SOURCE = readFileSync(
+  fileURLToPath(new URL("./nats-channel.ts", import.meta.url)),
+  "utf8",
+);
 
 describe("index-nats.ts entry boundary", () => {
   it("is a thin re-export with no lifecycle ownership", () => {
@@ -147,6 +152,128 @@ describe("index-nats.ts wiring contract — account-bound auth and startup", () 
     expect(publication).toBeGreaterThan(readiness);
     expect(RUNTIME_SOURCE).toMatch(
       /isVersionTooNew\(err\)[\s\S]{0,300}?kind: "permanent"[\s\S]{0,300}?code: `\$\{err\.document\}-version-too-new`[\s\S]{0,300}?operatorMessage: err\.message/,
+    );
+  });
+});
+
+describe("nats-account-runtime.ts wiring contract — v6 delivery journal (#239)", () => {
+  /**
+   * `NatsChannelDurability.deliveryJournal` is OPTIONAL for the reason its own
+   * docblock gives: the plaintext/test construction has no tuple directory to
+   * open a journal in. That optionality is exactly
+   * what could turn into an UNJOURNALED PRODUCTION without a single test going
+   * red — the journal is a shadow store until #240, so nothing reads it and
+   * nothing else would notice. These assertions are the only thing standing
+   * between "optional" and "absent where it matters".
+   *
+   * Same house rule as the guards above: they pin WIRING SHAPE, not behavior. If
+   * a line legitimately changes, update the assertion DELIBERATELY.
+   */
+  it("opens the journal from the same tuple as the key store and injects it into the channel", () => {
+    // Same (tenant, accountId, storageRoot) triple as the ConversationKeyStore
+    // two lines up — a second, differently-derived path would put the journal in
+    // a directory nothing else protects.
+    // One regex, not two: a free-floating `.deliveryJournalPath,` match would
+    // stay green while the call above read `.credentialPath`. `[^;]*?` spans the
+    // optional-storageRoot spread without escaping the statement.
+    expect(RUNTIME_SOURCE).toMatch(
+      /deliveryJournal = openDeliveryJournal\(\{\s*databasePath: tupleStoragePaths\(\{\s*tenant,\s*accountId,[^;]*?\}\)\.deliveryJournalPath,/,
+    );
+    // The channel must actually RECEIVE it. `undefined` is the defaulted
+    // NatsChannelLimits in the 5th position.
+    expect(RUNTIME_SOURCE).toMatch(
+      /\}, undefined, \{ deliveryJournal \}\);/,
+    );
+    // Constructor-only: a late/mutable attachment would mean frames published
+    // before it landed were never journaled. Asserted against the CHANNEL, which
+    // is the only file such a setter could live in — the earlier version of this
+    // line searched the runtime, where the symbol could never have appeared.
+    // Method-shaped match (`setDeliveryJournal(`), because the bare name also
+    // appears in `NatsChannelDurability`'s docblock stating the prohibition.
+    expect(CHANNEL_SOURCE).not.toMatch(/setDeliveryJournal\s*\(/);
+  });
+
+  /** The `try` whose `catch` converts an account-start throw into a failed start. */
+  const START_TRY = "try {\n        const keyStore = new ConversationKeyStore({";
+  /** The exact failed-start close, tail included — see the anchoring note below. */
+  const FAILED_START_CLOSE =
+    "try { deliveryJournal?.close(); } catch { /* the failed start owns no further cleanup */ }";
+
+  it("opens the journal INSIDE the try whose catch converts a throw into a failed start", () => {
+    // D3 — no degrade-to-unjournaled path.
+    //
+    // ⚠️ ORDINAL CHECKS ARE NOT ENOUGH, which is what the first version of this
+    // test got wrong: `open > probe` and `channel > open` both stay green if the
+    // open is HOISTED OUT into a bare statement between two separate `try`
+    // blocks. That breaks D3 concretely — a failed open would then throw past the
+    // attempt classifier, skipping the catch's `transport.closeGracefully()` and
+    // `attemptAbort.dispose()` and leaking a transport per retry. So assert
+    // CONTAINMENT: slice the real block and require the statements inside it.
+    const tryStart = RUNTIME_SOURCE.lastIndexOf(START_TRY);
+    expect(tryStart).toBeGreaterThan(-1);
+    const catchStart = RUNTIME_SOURCE.indexOf("} catch (err) {", tryStart);
+    expect(catchStart).toBeGreaterThan(tryStart);
+    const block = RUNTIME_SOURCE.slice(tryStart, catchStart);
+
+    expect(block).toContain("keyStore.assertNoFutureDocuments()");
+    expect(block).toContain("deliveryJournal = openDeliveryJournal({");
+    expect(block).toContain(
+      "channel = new NatsChannel(transport, accountId, tenant, {",
+    );
+    // No nested try/catch inside the slice, so the `} catch (err) {` we sliced to
+    // is genuinely the handler covering the open.
+    expect(block).not.toMatch(/\}\s*catch\b/);
+    // Order WITHIN the block still matters.
+    expect(
+      block.indexOf("deliveryJournal = openDeliveryJournal({"),
+    ).toBeGreaterThan(block.indexOf("keyStore.assertNoFutureDocuments()"));
+    expect(
+      block.indexOf("channel = new NatsChannel(transport, accountId, tenant, {"),
+    ).toBeGreaterThan(block.indexOf("deliveryJournal = openDeliveryJournal({"));
+  });
+
+  it("closes the journal on the FAILED-START path, ahead of the transport teardown", () => {
+    // `new NatsChannel(...)` is fail-closed and can throw AFTER the open, and the
+    // startup loop RETRIES — so without this close every attempt leaks two
+    // descriptors and a live WAL-checkpoint timer. PR #270 spent a whole commit
+    // (`5f2b4d9`) pinning the identical leak on the store's side of the seam.
+    //
+    // ⚠️ ANCHORED ON THE TAIL, NOT THE PREFIX. `try { deliveryJournal?.close(); }`
+    // on its own is a PREFIX OF BOTH close sites, so an earlier version of this
+    // assertion stayed green with the failed-start close deleted — the dispose-
+    // chain close kept satisfying it.
+    expect(RUNTIME_SOURCE).toContain(FAILED_START_CLOSE);
+    const catchStart = RUNTIME_SOURCE.indexOf(
+      "} catch (err) {",
+      RUNTIME_SOURCE.lastIndexOf(START_TRY),
+    );
+    const failedStartClose = RUNTIME_SOURCE.indexOf(
+      FAILED_START_CLOSE,
+      catchStart,
+    );
+    const transportClose = RUNTIME_SOURCE.indexOf(
+      "await transport.closeGracefully()",
+      catchStart,
+    );
+    expect(failedStartClose).toBeGreaterThan(catchStart);
+    expect(transportClose).toBeGreaterThan(failedStartClose);
+  });
+
+  it("closes the journal AFTER the channel in the dispose chain", () => {
+    // Ordering is load-bearing: the channel journals on its egress path, so
+    // closing the handle first leaves a window where a send writes to a closed
+    // database.
+    const channelDispose = RUNTIME_SOURCE.lastIndexOf(
+      'errors.push({ phase: "channel", error })',
+    );
+    const journalClose = RUNTIME_SOURCE.lastIndexOf(
+      'errors.push({ phase: "delivery-journal", error })',
+    );
+    expect(channelDispose).toBeGreaterThan(-1);
+    expect(journalClose).toBeGreaterThan(channelDispose);
+    // Tail-anchored for the same reason as the failed-start close above.
+    expect(RUNTIME_SOURCE).toContain(
+      'try { deliveryJournal?.close(); } catch (error) { errors.push({ phase: "delivery-journal", error }); }',
     );
   });
 });

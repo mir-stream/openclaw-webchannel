@@ -17,6 +17,9 @@ import { NatsChannel } from "./nats-channel.js";
 import type { RegisterChannelSurface } from "./nats-channel.js";
 import type { InboundWsMessage, NatsChannelCryptoOptions } from "./nats-channel.js";
 import { ConversationKeyStore } from "./conversation-key-store.js";
+import { openDeliveryJournal } from "./delivery-journal.js";
+import type { DeliveryJournal } from "./delivery-journal.js";
+import { tupleStoragePaths } from "./storage-paths.js";
 import { createCapacityDiagnostics } from "./capacity-diagnostics.js";
 import { resolveEncryptionPolicy } from "./encryption-policy.js";
 import type { WebchannelEncryptionConfig } from "./encryption-policy.js";
@@ -812,6 +815,9 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // Subject namespace is webchannel.{tenant}.{accountId}.{peerId} — the
       // accountId is the wire identity (one namespace per account).
       let channel: NatsChannel;
+      // v6 delivery journal (#239). Declared out here so the failure path below
+      // and `dispose()` further down can both reach the handle.
+      let deliveryJournal: DeliveryJournal | undefined;
       try {
         const keyStore = new ConversationKeyStore({
           tenant,
@@ -826,12 +832,45 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         // This probe is version-only and non-mutating; ordinary corruption
         // keeps the key store's existing lazy quarantine/audit policy.
         keyStore.assertNoFutureDocuments();
+        // v6 (#239): open the plugin's OWN durable store, from the SAME
+        // (tenant, accountId) tuple as the key store above —
+        // `deliveryJournalPath` is a field of that one path record, and
+        // `storage-paths.ts` records why the journal belongs beside the secrets
+        // rather than in core's shared state dir (it holds message PLAINTEXT).
+        //
+        // ⚠️ A FAILED OPEN FAILS THE ACCOUNT START — there is deliberately NO
+        // degrade-to-unjournaled path, which is why this sits inside the same
+        // `try` whose `catch` already converts `assertNoFutureDocuments()`'s
+        // throw into a failed start. The journal is a shadow store today
+        // (nothing reads it until #240), so a degrade path would look harmless;
+        // it is the "green pipeline that ships nothing" failure mode — serving
+        // normally while silently keeping no history — and #240's cutover makes
+        // the journal mandatory anyway, so it would be written only to be
+        // deleted.
+        deliveryJournal = openDeliveryJournal({
+          databasePath: tupleStoragePaths({
+            tenant,
+            accountId,
+            ...(plan.storageRoot !== undefined
+              ? { storageRoot: plan.storageRoot }
+              : {}),
+          }).deliveryJournalPath,
+        });
+        // The 5th argument is `NatsChannelLimits` and stays defaulted here; the
+        // 6th is the v6 durability wiring. Constructor-only by design — see
+        // `NatsChannelDurability`.
         channel = new NatsChannel(transport, accountId, tenant, {
           ...cryptoOptions,
           keyStore,
           identityKeyPair: attemptIdentityKey,
-        });
+        }, undefined, { deliveryJournal });
       } catch (err) {
+        // The journal can be open by the time `new NatsChannel(...)` throws (it
+        // is fail-closed on a missing attested identity key). A failed start is
+        // RETRIED by the startup loop, and `delivery-journal.ts`'s open docblock
+        // measured what each leaked handle costs — two descriptors plus a live
+        // WAL-checkpoint `Timeout` — so this must not accumulate per attempt.
+        try { deliveryJournal?.close(); } catch { /* the failed start owns no further cleanup */ }
         try { detachTransportListeners?.(); } catch { /* close still owns cleanup */ }
         const closeReport = await transport.closeGracefully();
         attemptAbort.dispose();
@@ -891,6 +930,12 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           sessionTokens.clear();
           try { detachTransportListeners?.(); } catch (error) { errors.push({ phase: "transport-listeners", error }); }
           try { channel.dispose(); } catch (error) { errors.push({ phase: "channel", error }); }
+          // ⚠️ AFTER `channel.dispose()`, NOT BEFORE. The channel journals on its
+          // egress path (persist-before-publish), so closing the handle first
+          // would leave a window where a send writes to a closed database. A
+          // disposed channel refuses to send at all, so nothing can reach the
+          // journal past this line. `close()` is idempotent.
+          try { deliveryJournal?.close(); } catch (error) { errors.push({ phase: "delivery-journal", error }); }
           const transportReport = await transport.closeGracefully();
           return { errors, transport: transportReport };
         })();
