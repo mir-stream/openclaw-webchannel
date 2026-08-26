@@ -589,18 +589,30 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               // mints an id for every `user_message` it publishes, and the
               // ledger it replays from is keyed by that id.
               //
-              // ⚠️ "IT RUNS" IS CHECKED, NOT ASSUMED — the gap claim is only
-              // honest if the item really does produce a live bubble. Two facts,
-              // both in `inbound-queue.ts`: `finish()` promotes every `committed`
-              // entry to `attached` and drains it (so a REFUSED batch still runs
-              // this one; a test pins the precondition — this item's offer is
-              // committed and never rolled back — not the promotion itself),
-              // and `commit()`'s own
-              // disposed/finished rollback branch cannot fire from here, because
-              // `offer()` reads those SAME two flags one statement earlier and
-              // would have returned `{status:"disposed"}` into the `else`. The
-              // two calls are adjacent and synchronous with no callout between
-              // them; put an `await` there and this stops being true.
+              // ⚠️ REPORTED FROM THE ITEM LOOP, UNLIKE THE `non-string-text`
+              // GAP, AND THE ASYMMETRY IS THE POINT. That one is a fresh
+              // admission sitting in `rollbackOffers`, so a refused batch rolls
+              // it back and it never runs — reporting it there would be a gap
+              // line for a message that never existed, which is why it is
+              // deferred to the footer. THIS one commits its offer inline and
+              // never enters `rollbackOffers`, so `finish()` promotes it to
+              // `attached` and drains it: a refused batch still runs it (that is
+              // exception 2 in the catch below), and the gap is real precisely
+              // when the batch fails. Deferring this one would LOSE a true line.
+              //
+              // ⚠️ "IT RUNS" IS CHECKED, NOT ASSUMED, AND IT IS NOT ABSOLUTE.
+              // `commit()`'s own disposed/finished rollback branch cannot fire
+              // from here, because `offer()` reads those SAME two flags one
+              // statement earlier and would have returned `{status:"disposed"}`
+              // into the `else`; the two calls are adjacent and synchronous with
+              // no callout between them, so put an `await` there and that stops
+              // being true. But a `/stop` racing this batch DOES falsify it from
+              // outside: `clearPending` walks `state.openLeases` and rolls back
+              // every entry not already `rolled-back` — this `committed` one
+              // included — so the line can be emitted for an item that is then
+              // cancelled and never runs. Narrow (a non-conforming client plus a
+              // racing `/stop`) and log-only, but it is a spurious gap report,
+              // and it is the same mid-flight cancellation #292 measures.
               journalGap("no-usable-id");
             } else release();
             continue;
@@ -750,8 +762,11 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             //
             // The `existing.status === "found"` branch above is deliberately NOT
             // collected: it is not a fresh admission of new text, so this seam is
-            // not its journal author — and re-appending would in any case be a
-            // no-op on `journal_user_once` and would only add a second call site.
+            // not its journal author, and collecting it would only add a second
+            // call site. (It would NOT merely be a `journal_user_once` no-op —
+            // that holds only where a row already exists, and #292 is precisely
+            // the case where one does not. Do not read this as "a hook here
+            // would be inert"; #292 may well want one.)
             if (deps.deliveryJournal) {
               journalPending.push({ id, text: item.message.text });
             }
@@ -811,10 +826,13 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         // point; exception 1 in the catch block below argues why that is right.
         if (deps.deliveryJournal && journalPending.length > 0) {
           // The text is validated HERE rather than at the collection site, and
-          // the gap lines are emitted only AFTER the append loop has committed,
-          // so neither return path that abandons the batch — the `invalidated`
-          // one above nor the append failure below — can report a gap for a
-          // message that never ran. A non-string `text` reaches us only from a
+          // these `non-string-text` lines are emitted only AFTER the append loop
+          // has committed, so neither return path that abandons the batch — the
+          // `invalidated` one above nor the append failure below — reports a
+          // TEXT gap for a message that never ran. (The `no-usable-id` line
+          // still fires from the item loop, and correctly so: that item runs
+          // even when the batch is refused. Its call site carries the
+          // asymmetry.) A non-string `text` reaches us only from a
           // non-conforming client — `normalizeInboundUserMessage` copies
           // `raw.text` unvalidated off a frame decoded with a cast. `append`
           // would TAKE it (only `user` IDS are validated there), but the shared

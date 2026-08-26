@@ -677,8 +677,10 @@ describe("#239 — a journal failure is an ACCEPT failure (doc §15.7)", () => {
     // will not"), on the OTHER return that abandons a batch: that test pins the
     // rollback-on-invalidation path, this one pins the append-failure path. A
     // refused batch never ran, so its malformed item has no live bubble for
-    // history to be missing — which is why the gap lines are emitted only after
-    // the append loop has committed, not while `journalable` is being built.
+    // history to be missing — which is why the `non-string-text` lines are
+    // emitted only after the append loop has committed, not while `journalable`
+    // is being built. (`no-usable-id` still reports from the item loop, because
+    // that item runs even when the batch is refused.)
     const seam = makeSeam();
     seam.journal.throwOnAppendNumber = 1;
     const malformed = item(undefined, "u-2");
@@ -691,8 +693,9 @@ describe("#239 — a journal failure is an ACCEPT failure (doc §15.7)", () => {
       warns(seam.calls).filter((entry) =>
         entry.message.includes("admitted but NOT journaled")),
     ).toHaveLength(0);
-    // …and the batch really did reach the append-failure return — `journalable=1`
-    // is only reachable with the malformed item filtered out of a 2-item batch.
+    // …and the batch really did reach the append-failure return. `journalable=1`
+    // shows the malformed item was filtered out of this 2-item batch; the
+    // sibling at the `non-string-text` test is what pins WHICH item was filtered.
     const refusals = warns(seam.calls).filter((entry) =>
       entry.message.includes("delivery journal append failed at the inbound accept"));
     expect(refusals).toHaveLength(1);
