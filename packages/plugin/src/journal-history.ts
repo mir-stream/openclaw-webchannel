@@ -3,10 +3,10 @@
  * (issue #240, doc §15.4).
  *
  * The plugin is the Telegram *server*: it owns the durable store and the client
- * is a pure view of it (doc §0). Today history is still read back out of core's
- * agent transcript, which is precisely what §0 forbids (NOT-list N2). This
- * module is the replacement's engine — one conversation's journal, folded into
- * the message list the `history` frame carries.
+ * is a pure view of it (doc §0). History used to be read back out of core's
+ * agent transcript, which is precisely what §0 forbids (NOT-list N2); #240
+ * half 2 deleted that path, and this module replaced it — one conversation's
+ * journal, folded into the message list the `history` frame carries.
  *
  * ⚠️ IT REPLAYS THE SHARED REDUCER. IT DOES NOT RE-IMPLEMENT IT. Every ordering,
  * supersession, tombstone and resurrect rule comes from
@@ -23,8 +23,8 @@
  * ── ⚠️ ONE KNOWN live≠history GAP, AND THIS MODULE IS WHERE IT BECOMES VISIBLE ──
  *
  * "`history == live` by construction" is the bet, not a proof, and there is a
- * standing exception that half 2's author will meet the moment a real
- * conversation is replayed. READ THIS BEFORE CONCLUDING THE PROJECTION IS WRONG.
+ * standing exception that shows up the moment a real conversation is replayed.
+ * READ THIS BEFORE CONCLUDING THE PROJECTION IS WRONG.
  *
  * A lane that receives a `progress` and then NEITHER a `bubble` NOR a
  * `seal.answers` entry — an aborted turn, or a connection dropped before the
@@ -56,31 +56,40 @@
  * created; this block exists so the reader who hits the phantom bubble in a
  * replay finds it here too.
  *
- * ⚠️ WIRED TO NOTHING. Same shape as #239 half 1: the capability lands pure and
- * fully tested, with no caller. The live history path still reads the core
- * transcript through `history.ts`; the destructive cutover (§15.6 — deleting
- * `getSessionMessages`, the `AsyncResource` operator-scope detour,
- * `history-sanitize.ts`, and the client's 3-tier adoption) is #240's second half.
+ * ⚠️ THIS IS NOW THE ONLY HISTORY READ PATH. #240 half 2 wired both call sites
+ * (the register-time snapshot and the `load_history` pager) to
+ * `serveHistoryRequest` below and DELETED the core transcript reader with them:
+ * the `runtime.subagent` session-message read, the `AsyncResource`
+ * operator-scope detour, the transcript normalizer and `history-sanitize.ts`
+ * are gone from this package. `history.ts` survives as the wire type + config +
+ * request-plan module and nothing else. Both call sites live in
+ * `history-serve.ts`, which owns the deferral, the per-peer in-flight bound and
+ * the failure policy; `nats-account-runtime.ts` only wires it. (The client's
+ * 3-tier adoption block is RETAINED, but no longer "untouched": the cutover
+ * made two of its paths lose delivered text, so #240 half 2 also fixes those
+ * two — a tier-1 match now claims its local bubble, and empty-text agent rows
+ * are dropped on arrival. Wholesale removal is tracked at doc §5's non-scope
+ * list, #104/#227/#228; §15.6 itself says the block is removable together with
+ * this cutover, so "separate work" was never the doc's position.)
  *
- * ⚠️ NEVER SANITIZE HERE. Do not call `sanitizeHistoryText` or anything like it.
- * The journal stores the EXACT text that was published to the client, so
- * re-sanitizing on the way out would make history differ from live by
+ * ⚠️ NEVER SANITIZE HERE. Do not reintroduce `sanitizeHistoryText` or anything
+ * like it. The journal stores the EXACT text that was published to the client,
+ * so re-sanitizing on the way out would make history differ from live by
  * construction — N8, introduced by the one module whose job is to prevent it.
- * `history-sanitize.ts` exists only because the CORE-transcript reader gets raw
- * model output that the live path never showed verbatim; it dies with the
- * cutover in half 2. Its presence in this package is not a precedent for this
- * path.
+ * The deleted sanitizer existed ONLY because the core-transcript reader received
+ * raw model output that the live path never showed verbatim; that input no
+ * longer reaches this package, so the module had no subject left.
  *
  * ⚠️ AND NEVER SORT. The reducer's slot-claim order IS the order — a `placement`
  * fixes a lane's position, and a `seal` may legitimately permute answer slots
  * afterwards, so the `ts` values below can be NON-MONOTONE with respect to the
  * emitted array. That is correct, not a bug: sorting by `ts` would override the
- * reducer and reintroduce N8. Measured, because `history.ts`'s own `HistoryMessage`
- * docblock (history.ts:13) claims the widget "can sort by recency" and that claim
- * is stale: there is no `.sort(`/`.toSorted(` in any non-test file under
- * `packages/client/src`, and none in the widget tree at `demo/web/src/` either —
- * where `presentation.ts` and `app.ts` actually render the list. `ts` is
- * hydration metadata, not an ordering key.
+ * reducer and reintroduce N8. Measured, because `HistoryMessage`'s docblock used
+ * to claim the widget "can sort by recency" and that claim was stale: there is no
+ * `.sort(`/`.toSorted(` in any non-test file under `packages/client/src`, and
+ * none in the widget tree at `demo/web/src/` either — where `presentation.ts` and
+ * `app.ts` actually render the list. `ts` is hydration metadata, not an ordering
+ * key. The docblock was corrected in half 2; this is the measurement behind it.
  *
  * ── MEMORY IS BOUNDED BY CONSTRUCTION ──
  *
@@ -180,23 +189,47 @@
  *
  * So: fine per RECONNECT at today's conversation lengths, already ~1.4 s at
  * 20 000 events, and not viable per page-scroll. That is #286's job.
+ *
+ * ⚠️ AND HALF 2 SHIPPED THE CUTOVER ANYWAY, WITH MITIGATIONS THAT ARE NOT A FIX.
+ * `history-serve.ts` does two things, and they are worth stating separately
+ * because an earlier version of this paragraph ran them together and got the
+ * second one wrong:
+ *  - DEFERRAL. Both call sites schedule the fold, so it never runs on the turn
+ *    that requested it — the register reply publishes before the snapshot is
+ *    projected. This changes WHO ELSE GETS TO RUN, not the CPU spent.
+ *  - A PER-PEER IN-FLIGHT LATCH. For ONE peer a burst of `load_history` frames
+ *    does NOT become "one turn per page": the first is scheduled and the rest
+ *    are DROPPED. Interleaving one fold per turn is what happens across
+ *    DIFFERENT peers.
+ * Neither is a bound on depth or on rate. A 20 000-event conversation still
+ * costs ~1.4 s of blocked loop PER PAGE, and pages are unbounded — a depth bound
+ * was built and reverted because total length is checkable before a fold and
+ * cursor depth is not, so a length gate destroys reach instead of limiting it
+ * (`history-serve.ts`'s header has the full argument). Do not read the deferral
+ * or the latch as the cost being handled; #286 is the fix.
  */
 import {
   applyDurableEvent,
   type DurableView,
 } from "../../client/src/durable-view-reducer.js";
-// Type-only, all three. This module must stay pure and IO-free: importing
+// Type-only, all four. This module must stay pure and IO-free: importing
 // `delivery-journal.ts` for a VALUE would drag `node:sqlite` (and the SDK's
-// sqlite runtime) into anything that touches history projection, and importing
-// `history.ts` for a value would drag in `node:async_hooks` and the core
-// transcript reader this slice exists to retire. The reader arrives as a
-// PARAMETER instead.
+// sqlite runtime) into anything that touches history projection. The reader
+// arrives as a PARAMETER instead.
+//
+// `history.ts` is type-only for a WEAKER reason than it used to be — half 2
+// emptied that file of everything but the wire type, the config resolver and
+// `planHistoryFetch`, so a value import would no longer drag in
+// `node:async_hooks` or a transcript reader. Keep it type-only anyway: the
+// dependency runs the other way round in `serveHistoryRequest`'s design (the
+// PLAN is data handed in, not a function this module calls), and a value edge
+// here is the first step back toward the two modules knowing about each other.
 import type {
   DeliveryJournal,
   RetainedJournalEvent,
 } from "./delivery-journal.js";
 import type { JournalEvent } from "./delivery-journal-event.js";
-import type { HistoryMessage } from "./history.js";
+import type { HistoryFetchPlan, HistoryMessage } from "./history.js";
 
 /**
  * The journal read seam, taken verbatim off the store's own interface so the two
@@ -258,14 +291,14 @@ const KNOWN_EVENT_KINDS: Record<JournalEvent["kind"], true> = {
  *    PASSES. The `typeof` gate is what stops that one; `Object.hasOwn` alone
  *    cannot, because the coercion happens inside it. And do NOT delete the gate
  *    as redundant with `RetainedJournalEvent`'s `kind: string`: that annotation
- *    describes an unvalidated `JSON.parse` cast (delivery-journal.ts:730), so it
+ *    describes an unvalidated `JSON.parse` cast (delivery-journal.ts:739), so it
  *    is a claim about the row, not a check on it — which is exactly the friction
  *    that field's own docblock says it exists to create.
  *
  * ⚠️ BE PRECISE ABOUT WHICH DOOR THAT SECOND ONE COMES THROUGH — it is NOT our
  * own `append`. MEASURED on `node:sqlite`: `append` binds `event.kind` and
  * `JSON.stringify(event)` as parameters of ONE `insertEvent.run(...)`
- * (delivery-journal.ts:657-665), and binding an ARRAY or an OBJECT throws before
+ * (delivery-journal.ts:666-674), and binding an ARRAY or an OBJECT throws before
  * any row is written, so `{"kind":["user"]}` cannot be stored by this build at
  * all. A NUMBER kind does bind and round-trip — and `Object.hasOwn(K, 7)` is
  * already `false`, so `hasOwn` alone handles that one. Through the plugin's own
@@ -286,7 +319,7 @@ const KNOWN_EVENT_KINDS: Record<JournalEvent["kind"], true> = {
  * write path, and validating field-by-field here would be a second schema free to
  * disagree with the reducer's. Note the store is a NARROWER backstop than it
  * looks — `append` validates the `user` id only (non-empty string, within
- * `MAX_INBOUND_USER_ID_LENGTH`; delivery-journal.ts:620-647) and takes `text` and
+ * `MAX_INBOUND_USER_ID_LENGTH`; delivery-journal.ts:629-655) and takes `text` and
  * `turnId` as given. The property that a journaled `user.text` really is a
  * `string` is established at the ACCEPT seam instead, where `ingress-dedupe.ts`
  * filters the batch on `typeof pending.text === "string"` before appending and
@@ -332,23 +365,21 @@ export type JournalHistoryProjection = {
  * `read` is injected rather than imported so this module stays pure and
  * database-free; pass `journal.read` bound to the open store.
  *
- * ── READ FAILURE: THIS MODULE DOES NOT CATCH, AND HALF 2 MUST NOT COPY `recent` ──
+ * ── READ FAILURE: THIS MODULE DOES NOT CATCH, AND NEITHER DOES `serveHistoryRequest` ──
  *
- * A store failure PROPAGATES from here. The reason is narrow and still stands:
- * one log path per failure rather than two, so the wrapper that owns the policy
- * also owns the log line — structurally the same split as `history.ts`'s
- * `readFromStore`, which likewise does not catch.
+ * A store failure PROPAGATES from here, through `serveHistoryRequest`, to the
+ * two call sites in `history-serve.ts`. The reason is narrow: one log
+ * path per failure rather than two, so the site that owns the policy also owns
+ * the log line.
  *
- * ⚠️ BUT DO NOT FOLLOW THAT PRECEDENT INTO THE WRAPPER, WHICH IS WHERE IT
- * MATTERS AND WHERE IT IS WRONG. `readFromStore`'s public wrapper is `recent`
- * (history.ts:299-314), and its catch RETURNS `[]` — a failed read is rendered
- * as "no history". That is sound ONLY because of something that is about to stop
- * being true: today history is read from CORE's transcript, which is a SECOND
- * copy of the truth, so a failed read degrades a convenience view while the real
- * conversation is untouched. Under §15.6 the journal becomes the ONLY store
- * (destructive cutover, core-read 0), and at that point catch-and-return-`[]`
- * turns a broken read into a conversation that LOOKS EMPTY to its owner —
- * unrecoverable in a way a crash is not, because nobody is told anything.
+ * ⚠️ AND THE POLICY IS "NO FRAME", NEVER "AN EMPTY FRAME". The deleted
+ * core-transcript wrapper caught and returned `[]` — a failed read rendered as
+ * "no history" — which was sound only because core's transcript was a SECOND
+ * copy of the truth, so a failed read degraded a convenience view while the real
+ * conversation sat untouched. Under §15.6 the journal is the ONLY store, and
+ * catch-and-return-`[]` now turns a broken read into a conversation that LOOKS
+ * EMPTY to its owner: unrecoverable in a way a crash is not, because nobody is
+ * told anything. Do not reintroduce that wrapper.
  *
  * The design forbids it in as many words: doc §15.6's write-failure line ends
  * "조용한 빈-세션 위장 금지" — no silent empty-session impersonation. It is
@@ -358,11 +389,9 @@ export type JournalHistoryProjection = {
  * This is also the SAME argument the `chunkRows` validation below is made from,
  * and the two must not contradict each other: that throw exists precisely
  * because an empty projection is indistinguishable from an empty conversation.
- * A wrapper that then swallows a read failure into `[]` would hand back the
- * exact value the throw refuses to produce. So half 2's wrapper must surface the
- * failure to the client — an error frame, or no `history` frame at all — never a
- * successful-looking empty one. Half 1 has no wrapper, so this is a pointer, not
- * a defect here.
+ * A caller that then swallowed a read failure into `[]` would hand back the exact
+ * value the throw refuses to produce. What the two live call sites do instead is
+ * log at `error` and send NO `history` frame at all.
  *
  * ── CHUNKED FOLD ──
  *
@@ -413,7 +442,8 @@ export type JournalHistoryProjection = {
  *
  * The REAL answer is retain-and-render-as-unsupported — keep the slot and show
  * "not supported by your version", the way the Telegram app does — which needs a
- * non-closed union and is #241/#246, not this slice.
+ * non-closed union and is **#241/#253**, not this slice. (#246 is the protocol
+ * version bump, a different issue; an earlier revision cited it here.)
  *
  * ── WHERE `ts` COMES FROM ──
  *
@@ -450,17 +480,17 @@ export function projectJournalHistory(
   const chunkRows = options?.chunkRows ?? HISTORY_REPLAY_CHUNK_ROWS;
   // ⚠️ VALIDATED, AND THE THROW IS THE POINT. Against the REAL store a
   // non-positive or non-integer value is already loud — `read` runs it through
-  // `requireCount` (delivery-journal.ts:715-718). Against an INJECTED reader it
+  // `requireCount` (delivery-journal.ts:721/727). Against an INJECTED reader it
   // is not: `chunkRows: 0` makes every chunk come back empty, the loop exits on
   // its first iteration, and the caller gets an empty projection
   // INDISTINGUISHABLE FROM AN EMPTY CONVERSATION. The store ranks that outcome
   // the same way — but ⚠️ NEITHER of the two places it says so is about THIS
   // trigger, so neither is being inherited here:
-  //   - `read`'s IMPLEMENTATION comment (delivery-journal.ts:708-711) is where
+  //   - `read`'s IMPLEMENTATION comment (delivery-journal.ts:717-720) is where
   //     the phrase "a SILENTLY EMPTY history, which is the worse of the two by
   //     far" lives, and it is about a `NaN` `afterSeq` binding as NULL so
   //     `seq > NULL` is never true — nothing to do with page size;
-  //   - the INTERFACE docblock (delivery-journal.ts:254) is the page-size one,
+  //   - the INTERFACE docblock (delivery-journal.ts:263) is the page-size one,
   //     and it refuses a silent default because that yields "a silently
   //     TRUNCATED history" — the milder cousin of this failure, not this one.
   // The argument stands on its own either way: a history that lies about being
@@ -595,6 +625,20 @@ function recordFirstSeen(
         if (answer && typeof answer === "object") note(answer.id);
       }
       return;
+    default: {
+      // ⚠️ COMPILE-TIME EXHAUSTIVENESS, same device and same reason as
+      // `KNOWN_EVENT_KINDS` above. Without it a `switch` over a closed union
+      // SILENTLY NO-OPS on a new member: #241 adds a fifth kind, the author is
+      // forced to update `KNOWN_EVENT_KINDS` (tsc fails there), the new kind
+      // therefore reaches the fold — but nothing records a first appearance for
+      // any id it introduces, so every message it creates quietly takes the
+      // `lastCreatedMs` fallback. `ts` is hydration metadata and nothing orders
+      // on it, so that is invisible in every test asserting ids and text. This
+      // makes the second place that must change fail loudly like the first.
+      const unhandled: never = event;
+      void unhandled;
+      return;
+    }
   }
 }
 
@@ -602,16 +646,17 @@ function recordFirstSeen(
  * The most recent `limit` messages — the tail fetch, the no-cursor case of
  * `planHistoryFetch`.
  *
- * ⚠️ THE `limit` GUARD IS `history.ts:pageBefore`'s (`limit <= 0` → `[]`,
- * history.ts:431), NOT `planHistoryFetch`'s (non-positive / non-finite /
- * non-number → the configured fallback, history.ts:337). Both exist in this
- * package and matching the wrong one, or splitting the difference, would make
- * this a THIRD convention. `pageBefore`'s is the right one because this function
- * sits where `pageBefore` sits — downstream of the plan, with no fallback value
- * to sanitize toward. The consequence is inherited too: `NaN <= 0` is false, so a
- * `NaN` limit falls through to `slice` and yields everything. That is
- * `planHistoryFetch`'s job to prevent, in the new path exactly as in the old one,
- * and the test file pins the behaviour so it is visible rather than assumed.
+ * ⚠️ THE `limit` GUARD IS THE DOWNSTREAM ONE (`limit <= 0` → `[]`), NOT
+ * `planHistoryFetch`'s (non-positive / non-finite / non-number → the configured
+ * fallback, `history.ts`). Both conventions exist in this package and matching
+ * the wrong one, or splitting the difference, would make this a THIRD. This is
+ * the right one because these selectors sit DOWNSTREAM of the plan, with no
+ * fallback value to sanitize toward — it is the same guard the deleted
+ * `history.ts:pageBefore` carried, in the same position. The consequence is
+ * inherited too: `NaN <= 0` is false, so a `NaN` limit falls through to `slice`
+ * and yields everything. That is `planHistoryFetch`'s job to prevent, in the new
+ * path exactly as in the old one, and the test file pins the behaviour so it is
+ * visible rather than assumed.
  */
 export function recentHistoryPage(
   messages: readonly HistoryMessage[],
@@ -625,16 +670,16 @@ export function recentHistoryPage(
  * Up to `limit` messages OLDER than `beforeId` — never including the cursor.
  *
  * ⚠️ A CURSOR THAT IS NOT IN THE PROJECTION RETURNS `[]`, AND THAT IS THE
- * CONTRACT, not a degradation. It preserves `history.ts:pageBefore`'s existing
- * behaviour and its stated reason (history.ts:411-414): returning newest-N
- * instead would only feed the client duplicates it already dedupes — a SILENT
- * stop — whereas an empty page is the honest "no more history" signal the client
- * wrapper treats as a no-op.
+ * CONTRACT, not a degradation. It preserves the deleted `history.ts:pageBefore`'s
+ * behaviour and its stated reason: returning newest-N instead would only feed the
+ * client duplicates it already dedupes — a SILENT stop — whereas an empty page is
+ * the honest "no more history" signal the client wrapper treats as a no-op.
  *
- * What changes with the journal is only that the miss becomes rare: `pageBefore`
- * has a hard `MAX_FETCH_WINDOW` wall at 1000 messages because the SDK seam it
- * reads has no cursor, and this projection has no wall at all. Same guard on
- * `limit` as `recentHistoryPage` — see that docblock.
+ * What changed with the journal is that the miss became rare, and the wall went
+ * away entirely. The old reader had a hard 1000-message `MAX_FETCH_WINDOW`
+ * because the SDK seam it read has no cursor and clamps its `limit` upstream;
+ * this projection replays the whole log, so there is no window and no wall. Same
+ * guard on `limit` as `recentHistoryPage` — see that docblock.
  */
 export function historyPageBefore(
   messages: readonly HistoryMessage[],
@@ -645,4 +690,90 @@ export function historyPageBefore(
   const idx = messages.findIndex((message) => message.id === beforeId);
   if (idx === -1) return [];
   return messages.slice(Math.max(0, idx - limit), idx);
+}
+
+/** What `serveHistoryRequest` hands back: one page, plus whole-projection health. */
+export type ServedHistory = {
+  /** The selected page — a slice, not the whole projection. */
+  messages: HistoryMessage[];
+  /**
+   * ⚠️ COUNTED OVER THE WHOLE PROJECTION, NOT THE PAGE. Both are properties of
+   * the replay that produced the page, so a page of 10 can carry a non-zero
+   * count sourced from a row nowhere near it. That is the useful reading: they
+   * say "this projection is not authoritative", never "this page is short by N".
+   */
+  unsupportedEvents: number;
+  tsFallbacks: number;
+};
+
+/**
+ * Project, then select — the whole history read, for both live call sites.
+ *
+ * The register-time snapshot and the `load_history` pager differ ONLY in which
+ * plan they carry, so composing the three steps here is what keeps them from
+ * drifting into two slightly different reads of the same store. Both go through
+ * this function; neither is allowed to reach `projectJournalHistory` directly.
+ *
+ * ⚠️ `conversationId` IS THE `peerId`, and that is the entire scoping story for
+ * a history read. Both write seams key the journal by peerId
+ * (`nats-channel.ts`'s egress `journal.append(peerId, …)` and `ingress-dedupe.ts`
+ * at the accept), and the FILE itself is already scoped to one
+ * `(tenant, accountId)` tuple by `tupleStoragePaths(...).deliveryJournalPath`.
+ * So there is no session key, no route resolution and no core lookup left in
+ * this path — see `session-route-tenant-isolation.test.ts`, which asserts the
+ * isolation property against THIS mechanism rather than the deleted one.
+ *
+ * ⚠️ IT DOES NOT CATCH. A store failure propagates to the caller, whose policy
+ * is `logger.error` + NO `history` frame — never a successful-looking empty one.
+ * The file header's READ FAILURE block has the argument; do not wrap this in a
+ * `try` that returns `[]`.
+ *
+ * ⚠️ IT RETURNS THE PROJECTION'S DIAGNOSTIC COUNTERS, AND THE CALLER MUST NOT
+ * DROP THEM. An earlier revision returned only `messages`, arguing the counters
+ * were "provably 0 for every event this build can write" and that logging them
+ * needed a rate limiter nobody had yet. Both halves were wrong the same way: the
+ * counters exist FOR builds that are not this build, and the missing rate
+ * limiter now exists in `history-serve.ts`.
+ *
+ * The case that killed it is a ROLLBACK. Ship #241 (which widens the event
+ * union), write some rows, roll back one release: every new row is an unknown
+ * kind, `isKnownJournalEvent` drops all of them, the projection is `[]`, and
+ * `sendSnapshot`'s `length > 0` gate suppresses the frame. The peer opens what
+ * looks like a brand-new empty conversation and NOTHING is logged anywhere —
+ * the same "조용한 빈-세션 위장" the READ FAILURE block above spends 25 lines
+ * forbidding, reached through the SUCCESSFUL-read door instead of the failed
+ * one. A `[]` that is honest and a `[]` that means "this build cannot read your
+ * history" are indistinguishable without these counts.
+ *
+ * So `history-serve.ts` logs on `unsupportedEvents > 0`, throttled, at `error`
+ * — the level follows this file's own words about the count ("this projection
+ * is not authoritative"), which is a defect, not a hiccup. **#253**
+ * (retain + render unsupported, never silently drop) is still the real answer;
+ * this is the signal that the day arrived. (An earlier revision cited #246 for
+ * it — verified wrong: #246 is "protocol version bump + runtime wire
+ * validation".)
+ *
+ * COST: this is a FULL REPLAY per call, quadratic in conversation length
+ * (~1.45–1.51 s at 20 000 events across #286's two runs; the table in this
+ * file's header is one run and tops out at 1449.6 ms). It is
+ * SYNCHRONOUS. `history-serve.ts` defers both call sites for that reason, and
+ * bounds them to one in flight per peer per kind — see its header.
+ */
+export function serveHistoryRequest(
+  read: JournalReader,
+  conversationId: string,
+  plan: HistoryFetchPlan,
+): ServedHistory {
+  const { messages, unsupportedEvents, tsFallbacks } = projectJournalHistory(
+    read,
+    conversationId,
+  );
+  return {
+    messages:
+      plan.kind === "page"
+        ? historyPageBefore(messages, plan.beforeId, plan.limit)
+        : recentHistoryPage(messages, plan.limit),
+    unsupportedEvents,
+    tsFallbacks,
+  };
 }

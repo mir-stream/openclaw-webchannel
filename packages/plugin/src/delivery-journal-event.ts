@@ -200,8 +200,16 @@ export function journalEventForOutbound(
       // naive replay shows a phantom empty bubble live never showed — N8, by
       // omission. Journaling the placement is still right (it is what carries
       // the ORDER), and the repair is derivable from the journal alone: a
-      // placement whose answerId never reappears. That fold belongs to the
-      // slice that serves history — issues **#251** and **#264**.
+      // placement whose answerId never reappears.
+      //
+      // ⚠️ THAT SLICE HAS SHIPPED AND DID NOT DO IT. This comment used to say
+      // the fold "belongs to the slice that serves history"; #240 half 2 IS
+      // that slice, and it wired the projection up without the repair — so the
+      // phantom bubble is reachable in a real history read today, not a
+      // prediction. Ownership stays with **#251** (what should render for such
+      // a lane) and **#264** (deriving it from events alone). Do not write the
+      // fold into the projection: a supersession rule invented server-side is
+      // N8, which is the whole thing this store exists to prevent.
       return {
         kind: "placement",
         answerId: frame.id,

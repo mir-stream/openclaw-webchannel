@@ -6,11 +6,13 @@
  * Problem
  * ───────
  * A device that joins an existing conversation after some messages have already
- * been exchanged has missed live broadcasts. The production history authority
- * is OpenClaw core's session transcript (plaintext, core-owned); the plugin
- * reads and normalizes those messages, then `NatsChannel.sendHistory` seals a
- * history frame with the current K and publishes it on the peer's `.out`
- * subject. See `history.ts` and `docs/ISSUE_72_CONTAINMENT_PLAN.md` §1.4.
+ * been exchanged has missed live broadcasts. Since #240 the production history
+ * authority is the plugin's OWN delivery journal (doc §0 — the plugin is the
+ * SSOT; it is no longer core's session transcript): `journal-history.ts`
+ * projects that peer's journal rows by replaying the client's reducer, then
+ * `NatsChannel.sendHistory` seals the resulting frame with the current K and
+ * publishes it on the peer's `.out` subject. See `journal-history.ts` and
+ * `docs/ISSUE_72_CONTAINMENT_PLAN.md` §1.4.
  *
  * But ciphertext alone is not enough: the device also needs the conversation key
  * used to encrypt those envelopes.  That key is delivered out-of-band, wrapped

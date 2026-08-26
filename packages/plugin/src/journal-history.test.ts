@@ -1,5 +1,6 @@
 /**
- * v6 #240 half 1 — the journal → history projection.
+ * v6 #240 — the journal → history projection, and the seam the live read path
+ * calls it through.
  *
  * WHAT THESE PIN, AND WHAT THEY DELIBERATELY DO NOT. The module's whole product
  * is that it does NOT re-implement the reducer, so re-asserting the reducer's
@@ -19,7 +20,11 @@
  *     never egressed a bubble and the post-`remove` resurrect that must keep its
  *     ORIGINAL moment, plus the fallback and the anchor that feeds it;
  *   - unknown kinds: counted, excluded, and harmless to the surrounding fold;
- *   - paging: every edge of the two pure selectors.
+ *   - paging: every edge of the two pure selectors;
+ *   - `serveHistoryRequest`: plan dispatch, and that a store failure
+ *     PROPAGATES rather than degrading to an empty page — half 2 made this the
+ *     only history read path, so `[]` on failure would impersonate an empty
+ *     conversation to its owner.
  * Plus two tests against a REAL `openDeliveryJournal`, because nothing else
  * proves the projection and the store compose.
  *
@@ -57,6 +62,7 @@ import {
   historyPageBefore,
   projectJournalHistory,
   recentHistoryPage,
+  serveHistoryRequest,
   type JournalReader,
 } from "./journal-history.js";
 import { reduceDurableView } from "../../client/src/durable-view-reducer.js";
@@ -265,10 +271,10 @@ describe("projectJournalHistory — chunking", () => {
 
   it("REFUSES a chunkRows that is not an integer >= 1, with a named throw", () => {
     // Against the real store `read` already refuses these (`requireCount`,
-    // delivery-journal.ts:715-718). Against an INJECTED reader `chunkRows: 0`
+    // delivery-journal.ts:721/727). Against an INJECTED reader `chunkRows: 0`
     // would return an empty projection indistinguishable from an empty
     // conversation — the shape `read`'s own implementation comment
-    // (delivery-journal.ts:708-711) calls "the worse of the two by far", though
+    // (delivery-journal.ts:717-720) calls "the worse of the two by far", though
     // it reaches it from a different trigger (a `NaN` `afterSeq` binding as
     // NULL, not a zero page size).
     const { read, calls } = fakeReader(rowsFor(MIXED_STREAM));
@@ -753,7 +759,7 @@ describe("recentHistoryPage", () => {
     // `slice(-1)` silently returns the tail instead of the whole page.
     //
     // That window is production-dominant, not exotic: the default `limit` and
-    // `pageSize` are both 50 (`DEFAULT_HISTORY_CONFIG`, history.ts:30-33), so
+    // `pageSize` are both 50 (`DEFAULT_HISTORY_CONFIG`, history.ts:56-59), so
     // every conversation between 26 and 49 messages long sits in it.
     expect(recentHistoryPage(page, 4)).toEqual(page);
     expect(recentHistoryPage(page, 5)).toEqual(page);
@@ -768,8 +774,8 @@ describe("recentHistoryPage", () => {
 
   it("CHARACTERIZATION: a NaN limit falls through and returns everything", () => {
     // `NaN <= 0` is false, so it reaches `slice`. This is inherited from
-    // `history.ts:pageBefore` (history.ts:431) on purpose rather than fixed with
-    // a third convention: `planHistoryFetch` (history.ts:337) is what sanitizes
+    // the DELETED `history.ts:pageBefore` on purpose rather than fixed with
+    // a third convention: `planHistoryFetch` (history.ts:104) is what sanitizes
     // limit in BOTH the old path and the new one. Recorded, not endorsed.
     expect(recentHistoryPage(page, Number.NaN)).toEqual(page);
   });
@@ -838,7 +844,7 @@ describe("historyPageBefore", () => {
     // cursor-miss contract exists to prevent, reintroduced one line below it.
     //
     // Production-dominant window, same as the twin: the default `pageSize` is 50
-    // (`DEFAULT_HISTORY_CONFIG`, history.ts:30-33), so any cursor at projection
+    // (`DEFAULT_HISTORY_CONFIG`, history.ts:56-59), so any cursor at projection
     // positions 1..49 sits in it — position 0 excluded, per the `0 <` above.
     expect(historyPageBefore(page, "m2", 3).map((m) => m.id)).toEqual(["m1"]);
     expect(historyPageBefore(page, "m3", 3).map((m) => m.id)).toEqual([
@@ -851,7 +857,7 @@ describe("historyPageBefore", () => {
 
   it("returns [] for a cursor that is not in the projection", () => {
     // The honest "no more history" signal, and `history.ts:pageBefore`'s
-    // existing contract (history.ts:411-414): newest-N would only feed the
+    // contract, preserved verbatim from the deleted reader: newest-N would only feed the
     // client duplicates it dedupes — a SILENT stop.
     expect(historyPageBefore(page, "nope", 10)).toEqual([]);
   });
@@ -867,7 +873,7 @@ describe("historyPageBefore", () => {
     // same inherited hole must be pinned on BOTH or the claim is untested on one
     // of them. `NaN <= 0` is false, so it reaches `slice`, where
     // `Math.max(0, idx - NaN)` is NaN and `slice(NaN, idx)` starts at 0.
-    // `planHistoryFetch` (history.ts:337) is what prevents this upstream, in the
+    // `planHistoryFetch` (history.ts:104) is what prevents this upstream, in the
     // new path exactly as in the old. Recorded, not endorsed.
     expect(historyPageBefore(page, "m3", Number.NaN).map((m) => m.id)).toEqual([
       "m1",
@@ -907,6 +913,74 @@ describe("historyPageBefore", () => {
       cursor = older[0].id;
     }
     expect(seen).toEqual(["m1", "m2", "m3"]);
+  });
+});
+
+describe("serveHistoryRequest — the composition seam both call sites use", () => {
+  /**
+   * The two live call sites (`history-serve.ts`'s `sendSnapshot` and
+   * `servePage`) differ ONLY in the plan
+   * they carry, so what is worth pinning here is the dispatch and the failure
+   * policy — not the selectors, which have their own describes above.
+   */
+  const IDS = ["u-0", "B", "A", "NOTICE", "C", "X"];
+
+  it("routes a `recent` plan to the tail of the full projection", () => {
+    const { read } = fakeReader(rowsFor(MIXED_STREAM));
+    expect(
+      serveHistoryRequest(read, CONV, { kind: "recent", limit: 2 }).messages.map(
+        (m) => m.id,
+      ),
+    ).toEqual(IDS.slice(-2));
+  });
+
+  it("routes a `page` plan to the messages older than the cursor", () => {
+    const { read } = fakeReader(rowsFor(MIXED_STREAM));
+    expect(
+      serveHistoryRequest(read, CONV, {
+        kind: "page",
+        beforeId: "NOTICE",
+        limit: 2,
+      }).messages.map((m) => m.id),
+    ).toEqual(["B", "A"]);
+  });
+
+  it("serves a page off the REDUCER's order, not the journal's write order", () => {
+    // The distinction the seam exists to preserve: `B` was placed after `A` and
+    // the seal permuted them, so "older than NOTICE" is [B, A] rather than
+    // [A, B]. A page selector applied to raw rows would answer differently.
+    const { read } = fakeReader(rowsFor(MIXED_STREAM));
+    expect(
+      serveHistoryRequest(read, CONV, { kind: "recent", limit: 100 }).messages.map(
+        (m) => m.id,
+      ),
+    ).toEqual(IDS);
+  });
+
+  it("forwards the conversationId — a different id gets that id's rows", () => {
+    const { read, calls } = fakeReader(rowsFor(MIXED_STREAM));
+    expect(
+      serveHistoryRequest(read, "someone-else", { kind: "recent", limit: 5 }),
+    ).toEqual({ messages: [], unsupportedEvents: 0, tsFallbacks: 0 });
+    expect(calls).toHaveLength(1);
+  });
+
+  it("PROPAGATES a store failure — it must never come back as an empty page", () => {
+    // ⚠️ THE LOAD-BEARING TEST OF THIS SEAM. With the journal as the only store,
+    // catching and returning `[]` would render a broken read as an empty
+    // conversation to its owner (doc §15.6, and the READ FAILURE block in
+    // `journal-history.ts`). The two call sites log at `error` and send no
+    // frame; that policy is only reachable if the throw gets to them.
+    const boom = new Error("SQLITE_CORRUPT: database disk image is malformed");
+    const read: JournalReader = () => {
+      throw boom;
+    };
+    expect(() => serveHistoryRequest(read, CONV, { kind: "recent", limit: 5 })).toThrow(
+      boom,
+    );
+    expect(() =>
+      serveHistoryRequest(read, CONV, { kind: "page", beforeId: "A", limit: 5 }),
+    ).toThrow(boom);
   });
 });
 

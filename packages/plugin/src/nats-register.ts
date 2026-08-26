@@ -126,8 +126,18 @@ export type RegisterHandlerDeps = {
   unregisterPeer: (peerId: string) => void;
   /**
    * Fire the STATELESS initial history snapshot for a just-registered peer
-   * (route resolution + detached self-read + `sendHistory`). Injected because it
-   * needs the gateway `api`; kept out of this pure handler.
+   * (a projection of that peer's rows in the plugin's delivery journal, then
+   * `sendHistory`). Injected because it needs the account's journal handle and
+   * channel; kept out of this pure handler.
+   *
+   * ⚠️ MUST RETURN WITHOUT DOING THE WORK. It is called BELOW, before this
+   * handler publishes its `reply(...)`, and since #240 the projection is a
+   * SYNCHRONOUS full replay of the conversation — ~1.45–1.51 s at 20 000 journal
+   * events (#286's two runs). `history-serve.ts`'s `sendSnapshot` — the production
+   * implementation, wired in by `nats-account-runtime.ts` — defers the fold
+   * for exactly that reason, so the register reply is not held behind a long
+   * conversation's history. An implementation that folds inline re-introduces
+   * that stall.
    */
   sendHistorySnapshot: (peerId: string) => void;
   /**
@@ -469,13 +479,28 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
 
   // Register (idempotent) + wrap K + snapshot. These do real I/O — registerPeer
   // loads/creates the peer's stable K (ConversationKeyStore.persist → fs writes
-  // that can EACCES/ENOSPC), wrap does crypto, snapshot reads history — so any
+  // that can EACCES/ENOSPC) and wrap does crypto — so any
   // throw here MUST produce a guarded reply (REGISTER_CAPACITY_EXCEEDED for the
   // typed capacity boundary, otherwise REGISTER_FAILED), not escape. The call
   // site wires this as `void handleRegisterRequest(...)`; an unguarded throw
   // would leave the browser with NO reply (→ client retries then terminal
   // disconnect) AND raise an unhandledRejection. This mirrors the deleted HTTP
   // route's whole-body try/catch.
+  //
+  // ⚠️ "snapshot reads history" USED TO BE IN THAT LIST AND NO LONGER BELONGS.
+  // Since #240 half 2 `sendHistorySnapshot` DEFERS the read (see its docblock
+  // above), so no store I/O happens on this turn and a read failure is logged
+  // where it happens instead of surfacing here.
+  //
+  // ⚠️ THAT IS NOT THE SAME AS "IT CANNOT THROW", AND THE STRONGER CLAIM WAS
+  // WRONG. `sendSnapshot` still runs its in-flight check and, on a drop, emits
+  // a `logger.warn` SYNCHRONOUSLY on this turn — so a host with a faulting
+  // logger could throw into this `try` and turn a diagnostic into
+  // REGISTER_FAILED. `history-serve.ts` wraps that emission in its own
+  // `try`/`catch` (restoring a guard the deleted `history.ts` had) so the
+  // failure mode is closed at the source; this `try` is the second line of
+  // defence, not the reason it is safe. The guard here remains REQUIRED for
+  // `registerPeer` and `wrapConversationKeyForDevice` regardless.
   try {
     // Register (idempotent) + wrap K to THIS request's attested device key.
     deps.registerPeer(peerId);

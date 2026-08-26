@@ -2361,7 +2361,58 @@ export class WebChannelNATSClient {
   private handleFrame(msg: InboundMessage): void {
     switch (msg.type) {
       case "history": {
-        const incoming = Array.isArray(msg.messages) ? msg.messages : [];
+        const rawIncoming = Array.isArray(msg.messages) ? msg.messages : [];
+        /**
+         * ⚠️ DROP EMPTY-TEXT AGENT ROWS BEFORE ANYTHING ELSE LOOKS AT THEM.
+         *
+         * A lane that got a `progress` and then neither a `bubble` nor a
+         * `seal.answers` entry — an aborted turn, or a connection dropped before
+         * the drain — leaves a PLACEMENT whose text is never authored. The
+         * server's replay emits it as `{role:"agent", text:""}` because
+         * `applyPlacement` appends one and nothing in the journal removes it
+         * (`journal-history.ts`'s header documents this as N8-by-omission), and
+         * the server CANNOT drop it: the rule that hides it live keys on
+         * `draftOnly`, a client-local flag §15.9 deliberately never journals.
+         *
+         * MEASURED DAMAGE WITHOUT THIS FILTER, and it is not cosmetic: such a
+         * row matches no local text, so tier 2 misses and TIER 3 fires — it
+         * probes `anchor + 1`, finds the next real agent bubble, and `adoptAt`
+         * overwrites it with `{id: P, text: ""}`. A delivered answer's text is
+         * destroyed (N10), and the row that actually carried it is then skipped
+         * as a tier-1 hit. Live renders nothing there; history rendered nothing
+         * AND ate the next answer.
+         *
+         * ⚠️ THIS IS NOT A NEW RULE — IT IS THE ONE THIS CLIENT ALREADY APPLIES
+         * LIVE, moved to the only other door the same lane can arrive through.
+         * `isSpentDraft`/`dropSpentDrafts` delete a spent draft at turn end
+         * (#251, settled against core's built-in Telegram extension, which
+         * deletes an unfinalized preview rather than keeping it). A `history`
+         * frame is always after turn end, and an empty agent bubble renders
+         * nothing either way, so this converges history to live instead of
+         * inventing a third behaviour. Keeping it client-local is also where
+         * **#264** says the derivation belongs — a server-side "placement whose
+         * answerId never reappears" fold would be a supersession rule invented
+         * in the projection, which is the N8 the store exists to prevent.
+         *
+         * ⚠️ RESIDUAL, STATED BECAUSE `isSpentDraft`'s OWN DOCBLOCK NAMES IT:
+         * this keys on `text === ""`, which `isSpentDraft` deliberately does NOT,
+         * so it also drops a LEGITIMATELY empty durable message. Those are not
+         * structurally impossible — every answer/final path guards non-empty
+         * text, but the generic outbound seam (`channel.ts:311`) forwards core's
+         * `ctx.text` unchecked. The consequence is invisible: an empty bubble
+         * renders nothing whether it is dropped or kept. We cannot do better
+         * here, because `draftOnly` is exactly the discriminator the wire does
+         * not carry.
+         */
+        const incoming = rawIncoming.filter(
+          (m) =>
+            !(
+              m &&
+              typeof m === "object" &&
+              (m as { role?: unknown }).role === "agent" &&
+              (m as { text?: unknown }).text === ""
+            ),
+        );
         if (incoming.length === 0) return;
 
         const existing = this.state.messages;
@@ -2371,25 +2422,73 @@ export class WebChannelNATSClient {
         // triggered by ANY device's register — this device's reconnect or a
         // second device joining — arrives at every device mid-session on the
         // shared `.out`. Messages already rendered LIVE on this device sit in
-        // state under LOCAL id namespaces while the snapshot carries the core
-        // transcript's canonical ids, so plain id-dedup would duplicate them:
-        //   - user sends → synthetic local echo ids (`u-<n>`);
-        //   - agent replies → the plugin's live-frame ids (`webchannel-…` from
-        //     nextMessageId(); since #238 EVERY durable egress site mints one at
-        //     the delivery act, so the client-local `a-<n>` fallback survives only
-        //     for an id-less frame from a legacy plugin build) — the core
-        //     transcript NEVER stores that platform id, so history ids can never
-        //     match live ids for agent messages either.
+        // state under LOCAL id namespaces, so plain id-dedup could duplicate
+        // them.
+        //
+        // ⚠️ WHERE THE SNAPSHOT'S IDS COME FROM CHANGED IN #240 HALF 2, AND THIS
+        // BLOCK'S ORIGINAL PREMISE IS NOW FALSE. It used to read "the snapshot
+        // carries the core transcript's canonical ids" and, for agent messages,
+        // "the core transcript NEVER stores that platform id, so history ids can
+        // never match live ids". The plugin no longer reads core's transcript at
+        // all: history is projected from its OWN delivery journal, whose ids ARE
+        // the ids minted at the delivery act — the same `webchannel-…` values the
+        // live frames carried. So:
+        //   - AGENT replies → snapshot id == the live id. TIER 1 MATCHES. The
+        //     "can never match" sentence was the justification for tier 3, and it
+        //     no longer holds;
+        //   - USER sends → the local echo id is `u-<n>` while the journal stores
+        //     the inbound WIRE id, so tier 1 misses and TIER 2 (text+role) adopts
+        //     — exactly as it did against core ids. Unchanged.
+        //   - ⚠️ RESIDUAL, unfixed here and true PRE-cutover too: an id-less
+        //     frame from a legacy plugin build gets a client-local `a-<n>` bubble
+        //     and NO journal row at all, so no snapshot row can ever tier-1 claim
+        //     it and it stays adoptable by any same-text row indefinitely.
+        //
+        // ⚠️ TIER 3 IS **NOT** DEAD, AND AN EARLIER REVISION OF THIS COMMENT SAID
+        // IT WAS. That claim was wrong twice over and it is what let two
+        // data-loss defects through review, so it is corrected rather than
+        // softened:
+        //  - the unauthored-placement row (`{agent, ""}`) matches no local text,
+        //    so it reached tier 3 and OVERWROTE the next real answer. It is now
+        //    filtered out on arrival, above — that filter is the only reason
+        //    tier 3 is unreachable for that shape;
+        //  - agent bubbles do move to tier 1, but a tier-1 match did not CLAIM
+        //    its local bubble, so a later same-text row tier-2 adopted onto it
+        //    and destroyed a delivered answer. Fixed below.
+        // Both are pinned, each against a `core-`-id control, in
+        // `nats-client-wrapper-hydration.test.ts`.
+        //
+        // ⚠️ AND "REMOVING THIS BLOCK IS SEPARATE WORK" WAS ALSO WRONG. Doc
+        // §15.6 says the opposite — with no legacy core rows the 3-tier
+        // text/position adoption 「도 함께 제거 가능」, removable TOGETHER with
+        // the cutover — and the follow-up item lives in §5's non-scope list
+        // ("client text/위치 매칭 제거", #104/#227/#228), not in a "§15.6
+        // follow-up list", which does not exist. What is true is narrower: the
+        // block is RETAINED because its defect history is long (#16, P1-9 §6.3)
+        // and a destructive server cutover is a bad commit to bury a client
+        // rewrite in — but part of it stopped being optional the moment the
+        // journal began supplying these ids, and that part is fixed in this
+        // diff.
+        //
         // Matching happens in three tiers, in snapshot order:
         //   1. id — a message whose canonical id we already hold (a prior
-        //      snapshot placed or adopted it) is a no-op;
+        //      snapshot placed or adopted it) is a no-op. Post-#240 this is also
+        //      where every AGENT bubble matches;
         //   2. exact text+role — adopt the server id onto the first
         //      text-matching local bubble (covers user echoes always; covers
-        //      agent replies only when live text == stored text);
-        //   3. POSITIONAL (agent only) — openclaw's live reply text is NOT
-        //      byte-equal to the stored transcript text (core strips metadata
-        //      sections from live replies but stores the raw model output), so
-        //      tier 2 can miss agent bubbles entirely. Structure saves us: an
+        //      agent replies only when live text == stored text — post-#240 they
+        //      are byte-equal by construction, but tier 1 has already claimed
+        //      them);
+        //   3. POSITIONAL (agent only) — ⚠️ STILL REACHABLE; see above. Its
+        //      ORIGINAL premise is gone (openclaw's live reply text was not
+        //      byte-equal to the stored transcript text, because core stripped
+        //      metadata from live replies while storing raw model output; the
+        //      journal stores exactly what was published, and tier 1 now claims
+        //      agent bubbles by id first). What still reaches here is any row
+        //      whose text matches no local bubble — and the empty-text placement
+        //      row, the one shape that did so routinely, is filtered on arrival
+        //      BECAUSE it reached this tier and ate the next answer. Do not
+        //      treat this branch as dead code. Structure saves us: an
         //      agent reply in the snapshot immediately FOLLOWS the message it
         //      answered, and that predecessor matched some local index i via
         //      tier 1/2 — so if the local message at i+1 is a live-id agent
@@ -2491,7 +2590,30 @@ export class WebChannelNATSClient {
             // later fresh messages insert after it. An id we can't locate
             // locally (should not happen — `seen` is seeded from `next`) leaves
             // the cursor untouched.
-            if (li !== undefined) cursor = li + 1;
+            if (li !== undefined) {
+              cursor = li + 1;
+              // ⚠️ CLAIM IT. A bubble already identified BY ID must not stay a
+              // later row's tier-2 adoption target.
+              //
+              // MEASURED DATA LOSS WITHOUT THIS LINE: live holds
+              // `webchannel-1 "ok"`; a snapshot carries `webchannel-1 "ok"` then
+              // `webchannel-2 "ok"`. Row 1 matches here at tier 1 but never
+              // claims index 0, so index 0 is still in `adoptable` under
+              // `agent ok` — row 2 then tier-2 adopts ONTO IT and overwrites it.
+              // Two delivered answers render as one bubble (N10).
+              //
+              // ⚠️ AND THIS ONLY BECAME REACHABLE AT #240 HALF 2. Pre-cutover
+              // history ids were core's `core-…`, which `isLocalLiveId` rejects,
+              // so a tier-1-matched bubble was never in the pool to begin with.
+              // The journal serves the delivery-act id — the SAME `webchannel-…`
+              // the live frame carried — so now it is. The paired `core-`-id
+              // control in the hydration tests pins exactly that difference.
+              //
+              // `claimed` alone is sufficient: tier 2 shifts claimed indices off
+              // the front of each pool before using one, so this entry is purged
+              // when it is reached. No pool surgery, no loop restructuring.
+              claimed.add(li);
+            }
             continue;
           }
 
