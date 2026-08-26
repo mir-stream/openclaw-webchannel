@@ -23,11 +23,12 @@
  * Plus two tests against a REAL `openDeliveryJournal`, because nothing else
  * proves the projection and the store compose.
  *
- * TWO CHARACTERIZATION CASES record known-wrong-ish behaviour rather than
- * endorsing it — a `NaN` limit reaching `slice` (inherited from
+ * THREE CHARACTERIZATION CASES record known-wrong-ish behaviour rather than
+ * endorsing it — a `NaN` limit reaching `slice`, pinned on BOTH selectors because
+ * the shared docblock claims they guard alike (inherited from
  * `history.ts:pageBefore` deliberately, see that selector's docblock), and an id
  * dated by a `seal` the REDUCER rejected (`recordFirstSeen`'s docblock has the
- * full argument for documenting instead of fixing). Both are labelled
+ * full argument for documenting instead of fixing). All three are labelled
  * CHARACTERIZATION in their names so nobody reads them as specifications.
  *
  * ⚠️ TWO OF THESE ARE MUTATION-PROVED AND MUST STAY THAT WAY. The ts-anchor test
@@ -263,10 +264,12 @@ describe("projectJournalHistory — chunking", () => {
 
   it("REFUSES a chunkRows that is not an integer >= 1, with a named throw", () => {
     // Against the real store `read` already refuses these (`requireCount`,
-    // delivery-journal.ts:720-723). Against an INJECTED reader `chunkRows: 0`
+    // delivery-journal.ts:715-718). Against an INJECTED reader `chunkRows: 0`
     // would return an empty projection indistinguishable from an empty
-    // conversation — the silently-empty-history failure `DeliveryJournal.read`'s
-    // docblock calls the worse of its two evils.
+    // conversation — the shape `read`'s own implementation comment
+    // (delivery-journal.ts:708-711) calls "the worse of the two by far", though
+    // it reaches it from a different trigger (a `NaN` `afterSeq` binding as
+    // NULL, not a zero page size).
     const { read, calls } = fakeReader(rowsFor(MIXED_STREAM));
     for (const chunkRows of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(() =>
@@ -390,9 +393,9 @@ describe("projectJournalHistory — an unknown kind is counted, not folded", () 
     // resurrect, the most order-sensitive seam in the stream. `rowsFor`
     // renumbers `seq` and `createdMs` across the whole list, so the spliced row
     // lands at seq 9 with the surrounding rows shifted; nothing further is
-    // needed. (An earlier revision reassigned `withUnknown[8]` here, which was a
-    // no-op — it rebuilt the identical row — and read as if renumbering were
-    // required.)
+    // needed — in particular do not reassign `withUnknown[8]` to "fix" the seq,
+    // which only rebuilds the identical row while reading as if renumbering
+    // were required.
     const withUnknown = rowsFor([
       ...MIXED_STREAM.slice(0, 8),
       { kind: "sticker", id: "s-1", pack: "cats" },
@@ -431,8 +434,10 @@ describe("projectJournalHistory — an unknown kind is counted, not folded", () 
   it("advances the ts-fallback anchor across an UNSUPPORTED row too", () => {
     // The fold sets `lastCreatedMs` for EVERY row it reads, unsupported ones
     // included, and that decision had zero coverage — moving the assignment
-    // below the `isKnownJournalEvent` guard left all 34 tests green. This is the
-    // test that pins it.
+    // below the `isKnownJournalEvent` guard left EVERY OTHER test in this file
+    // green. This is the test that pins it. (Never restate that as a total —
+    // a count goes stale the next time anyone adds a case, and then reads as a
+    // measurement of a suite that no longer exists.)
     //
     // The bubble's id is a NUMBER, so `recordFirstSeen` refuses to key the map on
     // it and the message falls to the fallback; the unsupported row that FOLLOWS
@@ -478,6 +483,41 @@ describe("projectJournalHistory — an unknown kind is counted, not folded", () 
     expect(projection.unsupportedEvents).toBe(2);
     expect(projection.messages).toEqual([
       { id: "u-0", role: "user", text: "hi", ts: T0 + 2 * T_STEP },
+    ]);
+  });
+
+  it("does not treat a NON-STRING kind that stringifies to a known one as known", () => {
+    // The other half of the same hole, and `Object.hasOwn` alone cannot close
+    // it: it runs `ToPropertyKey` on its second argument, so `["user"]` becomes
+    // the key `"user"` and answers TRUE. `{"kind":["user"]}` is legal JSON, so
+    // it round-trips through `payload` — `RetainedJournalEvent`'s `kind: string`
+    // is an unvalidated `JSON.parse` cast, not a check.
+    //
+    // If it passed, `applyDurableEvent`'s `switch` would compare with `===`,
+    // match no case, fall off the end and return `undefined` — and the NEXT
+    // event would throw while naming the wrong one. So the assertion that
+    // matters is not just the count: it is that the user row AFTER it still
+    // folds, which is what the `undefined` view would have destroyed.
+    const rows: DeliveryJournalRow[] = [
+      ...rowsFor([{ kind: "user", id: "u-0", text: "before" }]),
+      {
+        seq: 2,
+        kind: "user",
+        event: { kind: ["user"] } as unknown as DeliveryJournalRow["event"],
+        createdMs: T0 + T_STEP,
+      },
+      ...rowsFor([{ kind: "user", id: "u-1", text: "after" }]).map((row) => ({
+        ...row,
+        seq: 3,
+        createdMs: T0 + 2 * T_STEP,
+      })),
+    ];
+    const projection = projectJournalHistory(fakeReader(rows).read, CONV);
+    expect(projection.unsupportedEvents).toBe(1);
+    expect(projection.tsFallbacks).toBe(0);
+    expect(projection.messages).toEqual([
+      { id: "u-0", role: "user", text: "before", ts: T0 },
+      { id: "u-1", role: "user", text: "after", ts: T0 + 2 * T_STEP },
     ]);
   });
 });
@@ -647,6 +687,37 @@ describe("projectJournalHistory — where ts comes from", () => {
       { id: "u-0", role: "user", text: "hi", ts: T0 },
     ]);
   });
+
+  it("survives a seal whose answers array holds NON-OBJECT ELEMENTS", () => {
+    // The array-level guard above is not the whole story: `recordFirstSeen`
+    // walks the elements, and `answers: [null]` reaches `note(answer.id)` —
+    // which throws `Cannot read properties of null` on the way to a history
+    // read, i.e. this module crashing where `applySeal` merely filters (its
+    // element predicate starts `!!a &&`, durable-view-reducer.ts:546-549). The
+    // per-element `answer && typeof answer === "object"` check is what keeps the
+    // projection no stricter than the rules it replays, and this is the case
+    // that pins it. A string element is covered too: `typeof "C" === "object"`
+    // is false, so it is skipped rather than dated under `undefined`.
+    const { read } = fakeReader(
+      rowsFor([
+        { kind: "user", id: "u-0", text: "hi" },
+        {
+          kind: "seal",
+          turnId: TURN,
+          answers: [null, "C", 7, undefined, { id: "D", text: "d" }],
+        },
+      ]),
+    );
+    const projection = projectJournalHistory(read, CONV);
+    expect(projection.unsupportedEvents).toBe(0);
+    expect(projection.tsFallbacks).toBe(0);
+    // Only the well-formed answer survives the REDUCER's own filter, and it is
+    // dated from the seal row — the elements the reducer dropped left no trace.
+    expect(projection.messages).toEqual([
+      { id: "u-0", role: "user", text: "hi", ts: T0 },
+      { id: "D", role: "agent", text: "d", ts: T0 + T_STEP },
+    ]);
+  });
 });
 
 describe("recentHistoryPage", () => {
@@ -662,6 +733,24 @@ describe("recentHistoryPage", () => {
 
   it("returns everything when limit exceeds the available messages", () => {
     expect(recentHistoryPage(page, 99)).toEqual(page);
+  });
+
+  it("clamps a limit JUST past the end — the only window where Math.max matters", () => {
+    // ⚠️ THE CASE ABOVE DOES NOT COVER THE CLAMP, WHICH IS WHY THIS ONE EXISTS.
+    // `slice` re-clamps a sufficiently negative start to 0 all by itself, so at
+    // limit 99 (start -96) dropping the `Math.max(0, …)` changes NOTHING. The
+    // divergence window is exactly `length < limit < 2 * length`, where the
+    // negative start lands INSIDE the array and `slice` reads it as an
+    // offset-from-the-end instead: at 3 messages and limit 4, the unclamped
+    // `slice(-1)` silently returns the tail instead of the whole page.
+    //
+    // That window is production-dominant, not exotic: the default `limit` and
+    // `pageSize` are both 50 (`DEFAULT_HISTORY_CONFIG`, history.ts:30-33), so
+    // every conversation between 26 and 49 messages long sits in it.
+    expect(recentHistoryPage(page, 4)).toEqual(page);
+    expect(recentHistoryPage(page, 5)).toEqual(page);
+    // And the boundary itself: limit === length is the last non-clamping value.
+    expect(recentHistoryPage(page, 3)).toEqual(page);
   });
 
   it("returns [] for a non-positive limit — history.ts:pageBefore's guard", () => {
@@ -714,6 +803,35 @@ describe("historyPageBefore", () => {
       "m1",
       "m2",
     ]);
+  });
+
+  it("clamps a limit JUST past the cursor — unclamped is a SILENT STOP", () => {
+    // ⚠️ THE CASE ABOVE DOES NOT COVER THE CLAMP. At limit 100 the unclamped
+    // start is -98, which `slice` re-clamps to 0 on its own, so dropping the
+    // `Math.max(0, …)` changes nothing there. The divergence window is
+    // `idx < limit < length + idx`: `slice` maps the negative start `idx-limit`
+    // to `max(length + idx - limit, 0)`, so it stays INSIDE the array — and is
+    // read as an offset from the END — for exactly that range, where it can
+    // exceed `idx` and invert the range. At the cursor "m2" (idx 1, length 4)
+    // with limit 3, `slice(-2, 1)` starts at index 2 and ends at 1 — EMPTY.
+    //
+    // ⚠️ AND EMPTY IS NOT A VISIBLE FAILURE HERE, WHICH IS WHY THIS MATTERS MORE
+    // THAN THE TWIN ABOVE. `[]` is this function's honest "no more history"
+    // signal, which the client wrapper treats as a no-op — so the unclamped
+    // version does not look broken, it looks like the top of the conversation.
+    // That is exactly the SILENT STOP this selector's docblock says the
+    // cursor-miss contract exists to prevent, reintroduced one line below it.
+    //
+    // Production-dominant window, same as the twin: the default `pageSize` is 50
+    // (`DEFAULT_HISTORY_CONFIG`, history.ts:30-33), so any cursor in the oldest
+    // 49 messages of a page request sits in it.
+    expect(historyPageBefore(page, "m2", 3).map((m) => m.id)).toEqual(["m1"]);
+    expect(historyPageBefore(page, "m3", 3).map((m) => m.id)).toEqual([
+      "m1",
+      "m2",
+    ]);
+    // The boundary: limit === idx is the last non-clamping value.
+    expect(historyPageBefore(page, "m2", 1).map((m) => m.id)).toEqual(["m1"]);
   });
 
   it("returns [] for a cursor that is not in the projection", () => {

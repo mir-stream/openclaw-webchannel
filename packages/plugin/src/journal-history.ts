@@ -76,9 +76,11 @@
  * afterwards, so the `ts` values below can be NON-MONOTONE with respect to the
  * emitted array. That is correct, not a bug: sorting by `ts` would override the
  * reducer and reintroduce N8. Measured, because `history.ts`'s own `HistoryMessage`
- * docblock claims the widget "can sort by recency" and that claim is stale: there
- * is no `.sort(` in any non-test file under `packages/client/src`, and there is no
- * `web/` tree in this repo at all. `ts` is hydration metadata, not an ordering key.
+ * docblock (history.ts:13) claims the widget "can sort by recency" and that claim
+ * is stale: there is no `.sort(`/`.toSorted(` in any non-test file under
+ * `packages/client/src`, and none in the widget tree at `demo/web/src/` either —
+ * where `presentation.ts` and `app.ts` actually render the list. `ts` is
+ * hydration metadata, not an ordering key.
  *
  * ── MEMORY IS BOUNDED BY CONSTRUCTION ──
  *
@@ -95,9 +97,18 @@
  * "the view and one chunk" is not the whole list.
  *
  * ⚠️ THAT BOUNDS THE LIVE SET, NOT THE ALLOCATION CHURN, and the distinction was
- * measured. Every reducer transition returns a NEW array covering the whole view
- * (structural sharing at the ENTRY level, not the array level), so a 20 000-event
- * replay allocates and discards ~20 000 arrays of up to 10 000 pointers: heap
+ * measured. Allocation is the reducer's DEFAULT: a transition that changes the
+ * durable view returns a NEW array covering the whole view (structural sharing at
+ * the ENTRY level, not the array level), so a 20 000-event replay allocates and
+ * discards up to ~20 000 arrays of up to 10 000 pointers. UP TO, not exactly —
+ * three paths hand the input array straight back instead: a repeat `placement`
+ * claim whose turnId resolves unchanged (durable-view-reducer.ts:493-494), a
+ * `seal` with no valid answers and no removes (:561), and a `seal` whose `turnId`
+ * is blank or not a string (:544). That list is EXHAUSTIVE, and the reducer's own
+ * header (durable-view-reducer.ts:61-81) is where it is maintained — read it
+ * there rather than re-deriving it here. `MIXED_STREAM` in the test file
+ * exercises the first, via its repeat placement claim. So ~20 000 is an UPPER
+ * BOUND on the arrays, not a count of them. The measurement is unaffected: heap
  * BEFORE a forced GC came out HIGHER for the chunked replay (+85.5 MB) than for
  * the unbounded read (+48.0 MB), while retained heap after one came out lower
  * (+11.8 MB vs +22.0 MB). Neither number is a defect — one is garbage, one is the
@@ -126,18 +137,34 @@
  *
  * Three things fall out of that table, and only the first was expected:
  *
- *  1. CHUNK SIZE COSTS ESSENTIALLY NOTHING. 128 vs 4096 is under 1.5% at every
- *     size, so the memory bound is bought for free — see
- *     `HISTORY_REPLAY_CHUNK_ROWS`.
+ *  1. CHUNK SIZE IS NOT A TIME/MEMORY TRADE — and that has to be stated in the
+ *     unit that is true at each end, because the RATIO is not flat. 128 vs 4096
+ *     is +1.3% at 20 000 events (1449.6 vs 1430.9) and +2.0% at 10 000; the
+ *     spread WIDENS as a fraction on short conversations (+4.6% at 5 000, +15.3%
+ *     at 1 000), because there the fold is small enough that the extra reads
+ *     stop disappearing into it. But at 1 000 events that 15.3% is 0.9 ms of
+ *     wall clock (6.8 vs 5.9). So: ~1% where the projection is expensive, under
+ *     a millisecond where it is not, and no size where the memory bound buys
+ *     back time worth having — see `HISTORY_REPLAY_CHUNK_ROWS`. Quote BOTH ends
+ *     in their own unit; a single percentage across the table is false at three
+ *     of these four sizes whichever one you pick.
  *  2. THE SQL IS NOT THE COST. The raw unbounded read is linear and small
  *     (~61 ms at 20 000, matching the ~75 ms in `DeliveryJournal.read`'s
  *     docblock); the projection is 24x that.
  *  3. ⚠️ THE COST IS THE SHARED REDUCER'S FOLD, AND IT IS QUADRATIC IN
  *     CONVERSATION LENGTH. `fold only` is `reduceDurableView` over rows already
- *     parsed, i.e. this module's own overhead above it is ~9%. It grows ~4x per
- *     2x of events because `applyPlacement`/`applyBubble` upsert by
- *     `view.findIndex` and each transition allocates a fresh array of the whole
- *     view. That is inherent to the reducer, is fine LIVE (one event at a time
+ *     parsed, so the gap up to `project@512` is this module's own overhead — the
+ *     reads, the `JSON.parse`, the `firstSeenMs` bookkeeping and the final
+ *     `view.map`. That overhead is 9.5% at 20 000 events (1449.1 vs 1323.3),
+ *     and it is a much larger fraction of a much smaller number lower down the
+ *     table: 16% at 10 000, 24% at 5 000, 88% at 1 000 — where the entire
+ *     projection is 6.2 ms and the constant costs simply have nothing to hide
+ *     behind. Read it as "the fold dominates once the conversation is long
+ *     enough for the projection to matter", never as a fixed ~9% surcharge.
+ *     The fold itself grows ~4x per 2x of events because
+ *     `applyPlacement`/`applyBubble` upsert by `view.findIndex` and each
+ *     view-changing transition allocates a fresh array of the whole view. That
+ *     is inherent to the reducer, is fine LIVE (one event at a time
  *     against a short view), and must NOT be "optimized" here — a faster private
  *     fold in the plugin is a second implementation, which is N8. The fix is the
  *     materialized read model of §15.4 (**#286**), which replays incrementally
@@ -187,10 +214,13 @@ export type JournalReader = DeliveryJournal["read"];
  * back toward the unbounded read and makes the bound stop meaning anything.
  *
  * ⚠️ THE VALUE IS NOT A TIME/MEMORY TRADE — THAT WAS MEASURED, AND THERE IS NO
- * TRADE TO MAKE. 128, 512 and 4096 land within 1.5% of each other at every size
- * tested (see the table in the file header), because the replay's cost is the
- * reducer's fold, not the reads. So pick the value on memory alone and do not
- * "tune" it for speed; there is nothing there.
+ * TRADE TO MAKE. Across 128, 512 and 4096 the whole spread is 1.3% at 20 000
+ * events and 2.0% at 10 000; it widens to 15.3% at 1 000 events, which is 0.9 ms
+ * of wall clock (see the table in the file header). Both ends say the same thing,
+ * because the replay's cost is the reducer's fold and not the reads: ~1% where
+ * the projection is expensive, under a millisecond where it is cheap. So pick the
+ * value on memory alone and do not "tune" it for speed; there is nothing there to
+ * win.
  *
  * The projected VIEW is not bounded by this and cannot be — it is the answer.
  */
@@ -215,23 +245,47 @@ const KNOWN_EVENT_KINDS: Record<JournalEvent["kind"], true> = {
 /**
  * Can this row's event reach `applyDurableEvent` at all?
  *
- * ⚠️ `Object.hasOwn`, NOT `kind in KNOWN_EVENT_KINDS` and not a truthiness read.
- * `kind` comes off a `JSON.parse`d payload, so it is attacker-shaped only in the
- * sense that a future build writes it — but `"constructor"`, `"toString"` and
- * `"__proto__"` all answer truthy through the prototype chain, and an inherited
- * hit here would send an out-of-union event straight into the reducer, which is
- * the one outcome this predicate exists to prevent.
+ * ⚠️ `typeof === "string"` AND `Object.hasOwn` — not `kind in KNOWN_EVENT_KINDS`,
+ * not a truthiness read, and not `Object.hasOwn` on its own. `kind` comes off a
+ * `JSON.parse`d payload, so it is attacker-shaped only in the sense that a future
+ * build writes it, but there are two ways a non-kind answers yes:
+ *  - INHERITED NAMES. `"constructor"`, `"toString"` and `"__proto__"` all answer
+ *    truthy through the prototype chain, which `Object.hasOwn` refuses.
+ *  - NON-STRINGS THAT STRINGIFY. `Object.hasOwn` runs `ToPropertyKey` on its
+ *    second argument, so `{"kind": ["user"]}` — legal JSON, and therefore
+ *    reachable off a stored payload — becomes the key `"user"` and PASSES. The
+ *    `typeof` gate is what stops that one; `Object.hasOwn` alone cannot, because
+ *    the coercion happens inside it. And do NOT delete the gate as redundant
+ *    with `RetainedJournalEvent`'s `kind: string`: that annotation describes an
+ *    unvalidated `JSON.parse` cast (delivery-journal.ts:730), so it is a claim
+ *    about the row, not a check on it — which is exactly the friction that
+ *    field's own docblock says it exists to create.
+ * Both land in the same place if they get through: `applyDurableEvent`'s `switch`
+ * compares with `===`, matches no case, falls off the end and returns `undefined`
+ * while the signature declares `DurableView` — so the NEXT event throws while
+ * naming the WRONG event. That is the one outcome this predicate exists to
+ * prevent, and it is why the guard is on the VALUE, not just on the lookup.
  *
- * It checks the KIND and nothing else. A row whose kind is `"user"` but whose
- * payload lacks `id` still passes, and that is deliberate: the journal is our
- * own write path, the store already refuses a malformed `user` at `append`, and
- * validating field-by-field here would be a second schema free to disagree with
- * the reducer's.
+ * Beyond the kind it checks nothing. A row whose kind is `"user"` but whose
+ * payload lacks `id` still passes, and that is deliberate: the journal is our own
+ * write path, and validating field-by-field here would be a second schema free to
+ * disagree with the reducer's. Note the store is a NARROWER backstop than it
+ * looks — `append` validates the `user` id only (non-empty string, within
+ * `MAX_INBOUND_USER_ID_LENGTH`; delivery-journal.ts:620-647) and takes `text` and
+ * `turnId` as given. The property that a journaled `user.text` really is a
+ * `string` is established at the ACCEPT seam instead, where `ingress-dedupe.ts`
+ * filters the batch on `typeof pending.text === "string"` before appending and
+ * reports the rest as a journal gap (ingress-dedupe.ts:791-805). So "the write
+ * path already checked" is true, but it is true at a different door than this
+ * one.
  */
 function isKnownJournalEvent(
   event: RetainedJournalEvent,
 ): event is JournalEvent {
-  return Object.hasOwn(KNOWN_EVENT_KINDS, event.kind);
+  return (
+    typeof event.kind === "string" &&
+    Object.hasOwn(KNOWN_EVENT_KINDS, event.kind)
+  );
 }
 
 /** What one conversation's journal projects to. */
@@ -375,15 +429,24 @@ export function projectJournalHistory(
   const chunkRows = options?.chunkRows ?? HISTORY_REPLAY_CHUNK_ROWS;
   // ⚠️ VALIDATED, AND THE THROW IS THE POINT. Against the REAL store a
   // non-positive or non-integer value is already loud — `read` runs it through
-  // `requireCount` (delivery-journal.ts:720-723). Against an INJECTED reader it
+  // `requireCount` (delivery-journal.ts:715-718). Against an INJECTED reader it
   // is not: `chunkRows: 0` makes every chunk come back empty, the loop exits on
   // its first iteration, and the caller gets an empty projection
-  // INDISTINGUISHABLE FROM AN EMPTY CONVERSATION. `DeliveryJournal.read`'s own
-  // docblock names that exact shape as the worse of its two failure modes ("a
-  // SILENTLY EMPTY history"), and a history that lies about being empty is
-  // unrecoverable in a way a crash is not. Same rule and same wording shape as
-  // the store's `requireCount`, so the two doors cannot disagree about what a
-  // legal page size is.
+  // INDISTINGUISHABLE FROM AN EMPTY CONVERSATION. The store ranks that outcome
+  // the same way — but ⚠️ NEITHER of the two places it says so is about THIS
+  // trigger, so neither is being inherited here:
+  //   - `read`'s IMPLEMENTATION comment (delivery-journal.ts:708-711) is where
+  //     the phrase "a SILENTLY EMPTY history, which is the worse of the two by
+  //     far" lives, and it is about a `NaN` `afterSeq` binding as NULL so
+  //     `seq > NULL` is never true — nothing to do with page size;
+  //   - the INTERFACE docblock (delivery-journal.ts:254) is the page-size one,
+  //     and it refuses a silent default because that yields "a silently
+  //     TRUNCATED history" — the milder cousin of this failure, not this one.
+  // The argument stands on its own either way: a history that lies about being
+  // empty is unrecoverable in a way a crash is not, because nobody is told
+  // anything. Same rule and same
+  // wording shape as the store's `requireCount`, so the two doors cannot
+  // disagree about what a legal page size is.
   if (!Number.isInteger(chunkRows) || chunkRows < 1) {
     throw new Error(
       "webchannel: projectJournalHistory chunkRows must be an integer >= 1 " +
