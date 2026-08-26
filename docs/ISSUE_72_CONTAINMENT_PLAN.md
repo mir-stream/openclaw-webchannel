@@ -107,21 +107,49 @@ reference/demo의 admin·chaos 기본 경로도 role이 browser라면 예외 없
 
 ### 1.4 production history authority
 
+> ⚠️ **2026-08-26, #240 half 2 — 이 절의 결론이 바뀌었다.** production history
+> authority 는 더 이상 **core session transcript 가 아니다.** 아래 "SUPERSEDED"
+> 블록은 그 시점까지의 사실 기록으로 남긴다. 정책(RETAIN + RESEAL)과 그 결과는
+> 그대로지만, **무엇을 retain 하는가**가 바뀌었으므로 containment 범위도 바뀐다.
+
+**현재 (#240 이후).** production register/load-history 는
+`packages/plugin/src/history-serve.ts` 의 두 read site(`sendSnapshot`,
+`servePage`)가 `journal-history.ts` 의 `serveHistoryRequest` 를 호출한다
+(`nats-account-runtime.ts` 는 배선만 한다). 이것은 **플러그인이
+직접 소유한 delivery journal**(`delivery-journal.sqlite`, tuple storage
+디렉터리 안, message PLAINTEXT)을 client 의 reducer 로 replay 해서 history 를
+만든다. core transcript 는 read 하지 않는다 — `getSessionMessages` 는
+`packages/**` 어디에도 남아 있지 않다 (N2, doc §0.2).
+
+containment 관점에서 바뀐 것:
+
+- **plaintext 소재지가 하나 늘었다** — 이제 이 플러그인도 message plaintext 를
+  디스크에 쓴다. purge/inventory 대상 파일 목록은 #239 half 2 가 이미 갱신했다
+  — `docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md` 의 파일 목록(0600 + owner-only
+  디렉터리, `-wal`/`-shm`/`-journal` sidecar 포함)이 이 절의 실제 범위다.
+- **core transcript 는 여전히 존재한다** (core 가 쓴다). 다만 이 플러그인의
+  history 경로가 그것을 읽지 않을 뿐이다. core 쪽 purge 는 core 의 문제로 남는다.
+
+정책은 여전히 **RETAIN + RESEAL** 이다.
+
+- rotation 뒤 journal 은 유지한다.
+- 다음 history read 는 projection 을 K_new 로 reseal 한다 (`sendHistory` 가
+  delivery time 의 현재 K 로 봉인하므로 re-encryption 비용이 없다).
+- 새 snapshot 은 K_new 로 열리고 K_old 로는 열리지 않아야 한다.
+- gateway restart 는 journal 을 purge 하지 않으며 history loss 를 만들지 않는다.
+- 이것은 과거에 노출된 평문/ciphertext 의 retroactive secrecy 를 제공하지 않는다.
+
+<details>
+<summary>SUPERSEDED (#240 이전 기록)</summary>
+
 `HistoryStore`(#153 에서 삭제됨)는 production snapshot authority가 아니었다. production register/load-history는
 `packages/plugin/src/nats-account-runtime.ts`에서 `history.ts`의 `getSessionMessages`를 호출해
-OpenClaw core session transcript를 읽고 현재 K로 snapshot을 다시 봉인한다.
-
-정책은 **RETAIN + RESEAL**이다.
-
-- rotation 뒤 core transcript는 유지한다.
-- 다음 history read는 transcript를 K_new로 reseal한다.
-- 새 snapshot은 K_new로 열리고 K_old로는 열리지 않아야 한다.
-- gateway restart는 core transcript를 purge하지 않으며 history loss를 만들지 않는다.
-- 이것은 과거에 노출된 평문/ciphertext의 retroactive secrecy를 제공하지 않는다.
+OpenClaw core session transcript를 읽고 현재 K로 snapshot을 다시 봉인했다.
 
 test-only/dead `HistoryStore` 정리는 이 이슈의 범위 밖이었다 — #153 이 별도로 처리해
-`history-store.ts` 를 삭제했다. 이 절의 결론(production authority 는 core session
-transcript 다)은 그대로다.
+`history-store.ts` 를 삭제했다.
+
+</details>
 
 ## 2. Track C — 지금 실행 가능한 봉쇄 런북
 
