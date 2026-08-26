@@ -31,7 +31,8 @@
  * full argument for documenting instead of fixing). All three are labelled
  * CHARACTERIZATION in their names so nobody reads them as specifications.
  *
- * ⚠️ TWO OF THESE ARE MUTATION-PROVED AND MUST STAY THAT WAY. The ts-anchor test
+ * ⚠️ TWO TESTS ELSEWHERE IN THIS FILE — neither of them one of those three — ARE
+ * MUTATION-PROVED AND MUST STAY THAT WAY. The ts-anchor test
  * goes red only if `lastCreatedMs` stops advancing across unsupported rows, and
  * the non-advancing test THROWS on a call bound rather than relying on a timeout
  * — because deleting the loop guard produces a synchronous `for(;;)` that blocks
@@ -489,9 +490,16 @@ describe("projectJournalHistory — an unknown kind is counted, not folded", () 
   it("does not treat a NON-STRING kind that stringifies to a known one as known", () => {
     // The other half of the same hole, and `Object.hasOwn` alone cannot close
     // it: it runs `ToPropertyKey` on its second argument, so `["user"]` becomes
-    // the key `"user"` and answers TRUE. `{"kind":["user"]}` is legal JSON, so
-    // it round-trips through `payload` — `RetainedJournalEvent`'s `kind: string`
-    // is an unvalidated `JSON.parse` cast, not a check.
+    // the key `"user"` and answers TRUE. `RetainedJournalEvent`'s `kind: string`
+    // does not stop it either — that annotation is an unvalidated `JSON.parse`
+    // cast, not a check.
+    //
+    // ⚠️ AND THE READER IS THE DOOR, NOT `append`. Measured: `append` binds
+    // `event.kind` and the payload in one `insertEvent.run`, and `node:sqlite`
+    // REFUSES an array/object bind before writing a row, so our own writer
+    // cannot store this shape. It arrives through an injected `JournalReader` —
+    // this module's public seam, which is what this test is — or a foreign
+    // writer. That is the guard's real justification; see `isKnownJournalEvent`.
     //
     // If it passed, `applyDurableEvent`'s `switch` would compare with `===`,
     // match no case, fall off the end and return `undefined` — and the NEXT
@@ -809,11 +817,18 @@ describe("historyPageBefore", () => {
     // ⚠️ THE CASE ABOVE DOES NOT COVER THE CLAMP. At limit 100 the unclamped
     // start is -98, which `slice` re-clamps to 0 on its own, so dropping the
     // `Math.max(0, …)` changes nothing there. The divergence window is
-    // `idx < limit < length + idx`: `slice` maps the negative start `idx-limit`
-    // to `max(length + idx - limit, 0)`, so it stays INSIDE the array — and is
-    // read as an offset from the END — for exactly that range, where it can
-    // exceed `idx` and invert the range. At the cursor "m2" (idx 1, length 4)
-    // with limit 3, `slice(-2, 1)` starts at index 2 and ends at 1 — EMPTY.
+    // `0 < idx < limit < length + idx`: `slice` maps the negative start
+    // `idx-limit` to `max(length + idx - limit, 0)`, so it stays INSIDE the
+    // array — and is read as an offset from the END — for exactly that range,
+    // where it can exceed `idx` and invert the range. At the cursor "m2"
+    // (idx 1, length 4) with limit 3, `slice(-2, 1)` starts at index 2 and ends
+    // at 1 — EMPTY.
+    //
+    // The leading `0 <` is not decoration: at `idx === 0` BOTH forms are `[]`
+    // for every limit (clamped is `slice(0,0)`; unclamped has start >= end), so
+    // the cursor-at-the-very-start case never diverges. Verified by exhaustive
+    // scan over length 1..8 x idx x limit 1..20 — this predicate matches the
+    // divergence set exactly, and dropping the `0 <` mismatches 28 cases.
     //
     // ⚠️ AND EMPTY IS NOT A VISIBLE FAILURE HERE, WHICH IS WHY THIS MATTERS MORE
     // THAN THE TWIN ABOVE. `[]` is this function's honest "no more history"
@@ -823,8 +838,8 @@ describe("historyPageBefore", () => {
     // cursor-miss contract exists to prevent, reintroduced one line below it.
     //
     // Production-dominant window, same as the twin: the default `pageSize` is 50
-    // (`DEFAULT_HISTORY_CONFIG`, history.ts:30-33), so any cursor in the oldest
-    // 49 messages of a page request sits in it.
+    // (`DEFAULT_HISTORY_CONFIG`, history.ts:30-33), so any cursor at projection
+    // positions 1..49 sits in it — position 0 excluded, per the `0 <` above.
     expect(historyPageBefore(page, "m2", 3).map((m) => m.id)).toEqual(["m1"]);
     expect(historyPageBefore(page, "m3", 3).map((m) => m.id)).toEqual([
       "m1",

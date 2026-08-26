@@ -161,7 +161,8 @@
  *     projection is 6.2 ms and the constant costs simply have nothing to hide
  *     behind. Read it as "the fold dominates once the conversation is long
  *     enough for the projection to matter", never as a fixed ~9% surcharge.
- *     The fold itself grows ~4x per 2x of events because
+ *     The fold itself grows ~4–5x per 2x of events (62.0 → 269.6 is 4.35x,
+ *     269.6 → 1 323.3 is 4.91x — quote the range, not one exponent) because
  *     `applyPlacement`/`applyBubble` upsert by `view.findIndex` and each
  *     view-changing transition allocates a fresh array of the whole view. That
  *     is inherent to the reducer, is fine LIVE (one event at a time
@@ -252,14 +253,27 @@ const KNOWN_EVENT_KINDS: Record<JournalEvent["kind"], true> = {
  *  - INHERITED NAMES. `"constructor"`, `"toString"` and `"__proto__"` all answer
  *    truthy through the prototype chain, which `Object.hasOwn` refuses.
  *  - NON-STRINGS THAT STRINGIFY. `Object.hasOwn` runs `ToPropertyKey` on its
- *    second argument, so `{"kind": ["user"]}` — legal JSON, and therefore
- *    reachable off a stored payload — becomes the key `"user"` and PASSES. The
- *    `typeof` gate is what stops that one; `Object.hasOwn` alone cannot, because
- *    the coercion happens inside it. And do NOT delete the gate as redundant
- *    with `RetainedJournalEvent`'s `kind: string`: that annotation describes an
- *    unvalidated `JSON.parse` cast (delivery-journal.ts:730), so it is a claim
- *    about the row, not a check on it — which is exactly the friction that
- *    field's own docblock says it exists to create.
+ *    second argument, so `{"kind": ["user"]}` becomes the key `"user"` and
+ *    PASSES. The `typeof` gate is what stops that one; `Object.hasOwn` alone
+ *    cannot, because the coercion happens inside it. And do NOT delete the gate
+ *    as redundant with `RetainedJournalEvent`'s `kind: string`: that annotation
+ *    describes an unvalidated `JSON.parse` cast (delivery-journal.ts:730), so it
+ *    is a claim about the row, not a check on it — which is exactly the friction
+ *    that field's own docblock says it exists to create.
+ *
+ * ⚠️ BE PRECISE ABOUT WHICH DOOR THAT SECOND ONE COMES THROUGH — it is NOT our
+ * own `append`. MEASURED on `node:sqlite`: `append` binds `event.kind` and
+ * `JSON.stringify(event)` as parameters of ONE `insertEvent.run(...)`
+ * (delivery-journal.ts:657-665), and binding an ARRAY or an OBJECT throws before
+ * any row is written, so `{"kind":["user"]}` cannot be stored by this build at
+ * all. A NUMBER kind does bind and round-trip — and `Object.hasOwn(K, 7)` is
+ * already `false`, so `hasOwn` alone handles that one. Through the plugin's own
+ * write path the `typeof` gate is therefore a no-op, and the reachable callers
+ * are the ones that did not go through `append`: a hand-edited or foreign-written
+ * database, and — today, in this process — any INJECTED `JournalReader`, which is
+ * this function's public seam and is exactly what the test uses. Cheap, correct,
+ * and defending the seam we actually expose; not a claim that our own writer can
+ * produce it.
  * Both land in the same place if they get through: `applyDurableEvent`'s `switch`
  * compares with `===`, matches no case, falls off the end and returns `undefined`
  * while the signature declares `DurableView` — so the NEXT event throws while
