@@ -606,13 +606,17 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               // statement earlier and would have returned `{status:"disposed"}`
               // into the `else`; the two calls are adjacent and synchronous with
               // no callout between them, so put an `await` there and that stops
-              // being true. But a `/stop` racing this batch DOES falsify it from
-              // outside: `clearPending` walks `state.openLeases` and rolls back
-              // every entry not already `rolled-back` — this `committed` one
-              // included — so the line can be emitted for an item that is then
-              // cancelled and never runs. Narrow (a non-conforming client plus a
-              // racing `/stop`) and log-only, but it is a spurious gap report,
-              // and it is the same mid-flight cancellation #292 measures.
+              // being true. A cancellation racing this batch DOES falsify it
+              // from outside: `clearPending` walks `state.openLeases` and rolls
+              // back every entry not already `rolled-back` — this `committed`
+              // one included — so the line can be emitted for an item that is
+              // then cancelled and never runs. Name the MECHANISM, not one
+              // caller: `/stop`, peer retirement (unregister and peer-cap
+              // eviction both reach it) and teardown all land the same rollback,
+              // which is why the invalidated check below says "`/stop` or peer
+              // retirement" rather than naming one. Needs a non-conforming
+              // client and is log-only, but it is a spurious gap report, and it
+              // is the same mid-flight cancellation #292 measures.
               journalGap("no-usable-id");
             } else release();
             continue;
@@ -926,7 +930,9 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             //  2. AN ID-LESS ITEM's dispatch. That branch calls `offer.commit()`
             //     inline and never pushes onto `rollbackOffers`, so `finish()`
             //     promotes it to `attached` and drains it — the item runs even
-            //     though the batch was refused. Only a non-conforming client
+            //     though the batch was refused. (True of THIS unwinding; the
+            //     call site above names the one thing that falsifies it from
+            //     outside.) Only a non-conforming client
             //     produces one, and refusing to run text already accepted for
             //     dispatch would lose it outright. `journalGap` reports exactly
             //     this as the live≠history gap it is.

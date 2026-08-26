@@ -694,8 +694,8 @@ describe("#239 — a journal failure is an ACCEPT failure (doc §15.7)", () => {
         entry.message.includes("admitted but NOT journaled")),
     ).toHaveLength(0);
     // …and the batch really did reach the append-failure return. `journalable=1`
-    // shows the malformed item was filtered out of this 2-item batch; the
-    // sibling at the `non-string-text` test is what pins WHICH item was filtered.
+    // shows the malformed item was filtered out of this 2-item batch; "admits an
+    // item whose text is not a string" is what pins WHICH item was filtered.
     const refusals = warns(seam.calls).filter((entry) =>
       entry.message.includes("delivery journal append failed at the inbound accept"));
     expect(refusals).toHaveLength(1);
