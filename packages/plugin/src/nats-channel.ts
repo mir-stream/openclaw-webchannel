@@ -32,8 +32,9 @@ import { logSafe } from "./log-safe.js";
 /**
  * v6 delivery journal (#239). TYPE-ONLY on purpose — the store resolves
  * `node:sqlite` lazily and this import is erased, so `nats-channel.ts` keeps
- * pulling in no database runtime. The two mapper functions below are ordinary
- * value imports; `delivery-journal-event.ts` is pure and has no runtime deps.
+ * pulling in no database runtime. The symbols below are ordinary value imports
+ * because `delivery-journal-event.ts` carries no database/IO runtime dependency
+ * of its own — the property stated at that file's `log-safe.js` import.
  */
 import type { DeliveryJournal } from "./delivery-journal.js";
 import {

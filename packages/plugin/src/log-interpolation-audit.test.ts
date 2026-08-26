@@ -107,9 +107,11 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
    *    union is ever widened to carry anything from a frame, these two
    *    exemptions stop being sound and must become `logSafe` calls;
    *  - `journalable.length` is a count;
-   *  - `journalFailureDiagnostic(error)` is a COMPOSITE that already escapes each
-   *    field it renders (`code=`/`errcode=`/`errstr=`, `logSafe` per value, and
-   *    it excludes `error.message` entirely). Wrapping it again would quote the
+   *  - `journalFailureDiagnostic(error)` is a COMPOSITE that already renders each
+   *    field safely — `logSafe` on the two string fields (`code=`, `errstr=`) and
+   *    a `typeof errcode === "number"` guard on `errcode=`, which is interpolated
+   *    raw and is safe because of that guard, not because of `logSafe`; and it
+   *    excludes `error.message` entirely. Wrapping it again would quote the
    *    whole record and destroy the logfmt structure it exists to produce.
    *
    * ⚠️ THE ALTERNATIVE WAS TO HIDE THEM, AND THAT IS WHY THIS LIST GREW INSTEAD.
@@ -122,10 +124,10 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
    * see and falsify beats a statement the audit never looks at.
    */
   "ingress-dedupe.ts": [
-    `ingress-dedupe.ts  ::  reason  @  "unjournalable-user""webchannel: inbound user message admitted but NOT journaled "peer= reason=`,
-    `ingress-dedupe.ts  ::  action  @  "unjournalable-user""webchannel: inbound user message admitted but NOT journaled "peer= reason=`,
-    `ingress-dedupe.ts  ::  journalable.length  @  "append-failed""webchannel: delivery journal append failed at the inbound accept "peer= journaled= action=reject-accept-client-retries`,
-    `ingress-dedupe.ts  ::  journalFailureDiagnostic(error)  @  "append-failed""webchannel: delivery journal append failed at the inbound accept "peer= journaled= action=reject-accept-client-retries`,
+    `ingress-dedupe.ts  ::  reason  @  "unjournalable-user-id""unjournalable-user-text""webchannel: inbound user message admitted but NOT journaled "peer= reason=`,
+    `ingress-dedupe.ts  ::  action  @  "unjournalable-user-id""unjournalable-user-text""webchannel: inbound user message admitted but NOT journaled "peer= reason=`,
+    `ingress-dedupe.ts  ::  journalable.length  @  "append-failed""webchannel: delivery journal append failed at the inbound accept "peer= journalable= action=reject-accept-client-retries`,
+    `ingress-dedupe.ts  ::  journalFailureDiagnostic(error)  @  "append-failed""webchannel: delivery journal append failed at the inbound accept "peer= journalable= action=reject-accept-client-retries`,
   ],
 
   "approvals.ts": [],

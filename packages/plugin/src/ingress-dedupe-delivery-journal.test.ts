@@ -548,7 +548,7 @@ describe("#239 — a journal failure is an ACCEPT failure (doc §15.7)", () => {
     const warn = warns(seam.calls)[0]!.message;
     expect(warn).toContain("delivery journal append failed at the inbound accept");
     expect(warn).toContain(`peer="${PEER}"`);
-    expect(warn).toContain("journaled=2");
+    expect(warn).toContain("journalable=2");
     expect(warn).toContain("action=reject-accept-client-retries");
     // The value-free status the shared `journalFailureDiagnostic` extracts —
     // never the free-form message, never message text.
@@ -596,7 +596,7 @@ describe("#239 — a journal failure is an ACCEPT failure (doc §15.7)", () => {
     // `deferredReleases` loop — the accepted item's rides on its offer rollback.
     // Deleting that loop leaves this at `{ messages: 1, bytes: 1 }`.
     expect(budget.usage()).toEqual({ messages: 0, bytes: 0 });
-    expect(warns(seam.calls)[0]!.message).toContain("journaled=1");
+    expect(warns(seam.calls)[0]!.message).toContain("journalable=1");
   });
 
   it("does NOT unwind the cancelled-inbound fallback's ack — the one result that outruns the journal", async () => {
@@ -669,7 +669,35 @@ describe("#239 — a journal failure is an ACCEPT failure (doc §15.7)", () => {
       expect.objectContaining({ call: "ack" }),
     );
     expect(kinds(seam.calls).filter((kind) => kind === "offer-rollback")).toHaveLength(2);
-    expect(warns(seam.calls)[0]!.message).toContain("journaled=2");
+    expect(warns(seam.calls)[0]!.message).toContain("journalable=2");
+  });
+
+  it("does not report a non-string-text gap for a batch the APPEND then refuses", async () => {
+    // Same claim as the `invalidated` sibling above ("live shows this, history
+    // will not"), on the OTHER return that abandons a batch: that test pins the
+    // rollback-on-invalidation path, this one pins the append-failure path. A
+    // refused batch never ran, so its malformed item has no live bubble for
+    // history to be missing — which is why the gap lines are emitted only after
+    // the append loop has committed, not while `journalable` is being built.
+    const seam = makeSeam();
+    seam.journal.throwOnAppendNumber = 1;
+    const malformed = item(undefined, "u-2");
+    (malformed.message as { text?: unknown }).text = 42;
+
+    await seam.onFlush([item("first", "u-1"), malformed]);
+
+    // Positive on both halves: the gap line is ABSENT…
+    expect(
+      warns(seam.calls).filter((entry) =>
+        entry.message.includes("admitted but NOT journaled")),
+    ).toHaveLength(0);
+    // …and the batch really did reach the append-failure return — `journalable=1`
+    // is only reachable with the malformed item filtered out of a 2-item batch.
+    const refusals = warns(seam.calls).filter((entry) =>
+      entry.message.includes("delivery journal append failed at the inbound accept"));
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]!.message).toContain("journalable=1");
+    expect(seam.calls).not.toContainEqual(expect.objectContaining({ call: "ack" }));
   });
 });
 

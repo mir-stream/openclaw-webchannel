@@ -304,8 +304,14 @@ type JournalWarning =
    * An item was ADMITTED (it runs a turn and the client shows its bubble) but
    * could not be journaled, so history will not have it. A live≠history gap we
    * are choosing to leave visible rather than absorb — see the call sites.
+   *
+   * ONE MEMBER PER REASON, not one for both: the two carry different `action=`
+   * values, and only `no-usable-id` has an owning issue (#243). A shared window
+   * would let the id-less line suppress the malformed-`text` one within the same
+   * batch — hiding precisely the reason nothing else is tracking.
    */
-  | "unjournalable-user";
+  | "unjournalable-user-id"
+  | "unjournalable-user-text";
 
 /** Match `ingress-outcome.ts`'s limiter and `nats-channel.ts`'s journal warnings. */
 const JOURNAL_WARNING_INTERVAL_MS = 60_000;
@@ -315,10 +321,10 @@ const JOURNAL_WARNING_INTERVAL_MS = 60_000;
  * the next line — the shape `createRateLimitedOutcomeFailureWarning` already
  * uses in this file's imports.
  *
- * Throttled because both categories are PEER-DRIVEN at full ingress rate: an
- * `unjournalable-user` line fires once per malformed frame, and a failing store
- * fails for every batch. One line per inbound message would bury the log the
- * `#123` discipline exists to keep readable.
+ * Throttled because every category is PEER-DRIVEN at full ingress rate: each
+ * `unjournalable-user-*` line fires once per malformed frame, and a failing
+ * store fails for every batch. One line per inbound message would bury the log
+ * the `#123` discipline exists to keep readable.
  *
  * One limiter per `createIngressOnFlush`, i.e. per ACCOUNT — so a broken account
  * cannot silence a healthy one, but WITHIN an account the window is shared across
@@ -335,7 +341,8 @@ function createRateLimitedJournalWarning(
 ): (category: JournalWarning, body: string) => void {
   const state: Record<JournalWarning, { lastAt: number; suppressed: number }> = {
     "append-failed": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
-    "unjournalable-user": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
+    "unjournalable-user-id": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
+    "unjournalable-user-text": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
   };
   return (category, body) => {
     const entry = state[category];
@@ -524,12 +531,15 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         // that one needs wire-level validation of `text`, which
         // `normalizeInboundUserMessage` explicitly declines to do — so pointing
         // both at #243 would send an operator to an issue that can never close
-        // their line.
-        const action = reason === "no-usable-id"
+        // their line. The throttle CATEGORY is per reason for the same reason:
+        // one shared 60 s window lets whichever reason fires first hide the
+        // other, and the one with no owning issue must not be the hidden one.
+        const idLess = reason === "no-usable-id";
+        const action = idLess
           ? "action=live-only-history-gap-issue-243"
           : "action=live-only-history-gap-malformed-frame-no-owning-issue";
         warnJournal(
-          "unjournalable-user",
+          idLess ? "unjournalable-user-id" : "unjournalable-user-text",
           "webchannel: inbound user message admitted but NOT journaled " +
             `peer=${logSafe(peerId)} reason=${reason} ${action}`,
         );
@@ -800,8 +810,10 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         // branch's direct `sendAck`, which does reach the wire before this
         // point; exception 1 in the catch block below argues why that is right.
         if (deps.deliveryJournal && journalPending.length > 0) {
-          // The text is validated HERE rather than at the collection site so a
-          // batch that never survives to this point cannot report a gap for a
+          // The text is validated HERE rather than at the collection site, and
+          // the gap lines are emitted only AFTER the append loop has committed,
+          // so neither return path that abandons the batch — the `invalidated`
+          // one above nor the append failure below — can report a gap for a
           // message that never ran. A non-string `text` reaches us only from a
           // non-conforming client — `normalizeInboundUserMessage` copies
           // `raw.text` unvalidated off a frame decoded with a cast. `append`
@@ -812,10 +824,11 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           // omission — the turn still runs and the egress seam journals its
           // answer, so history gains an agent answer with NO preceding user row.
           const journalable: Array<{ id: string; text: string }> = [];
+          const unjournalableText: Array<"non-string-text"> = [];
           for (const pending of journalPending) {
             if (typeof pending.text === "string") {
               journalable.push({ id: pending.id, text: pending.text });
-            } else journalGap("non-string-text");
+            } else unjournalableText.push("non-string-text");
           }
           try {
             for (const pending of journalable) {
@@ -981,11 +994,12 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             warnJournal(
               "append-failed",
               "webchannel: delivery journal append failed at the inbound accept " +
-                `peer=${logSafe(peerId)} journaled=${journalable.length} ` +
+                `peer=${logSafe(peerId)} journalable=${journalable.length} ` +
                 `action=reject-accept-client-retries ${journalFailureDiagnostic(error)}`,
             );
             return;
           }
+          for (const reason of unjournalableText) journalGap(reason);
         }
         for (const write of pendingWrites) write.commit();
         for (const commit of commitOffers) commit();
@@ -1006,8 +1020,12 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         for (const release of deferredReleases) release();
         finalized = true;
       } finally {
-        if (!finalized) await rollbackBatch();
-        lease.finish();
+        // Nested: a rejected rollback must not strand the lease in `openLeases`.
+        try {
+          if (!finalized) await rollbackBatch();
+        } finally {
+          lease.finish();
+        }
       }
       return;
     }
