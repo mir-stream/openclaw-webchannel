@@ -92,7 +92,22 @@
  * argument rather than a shrug: bounding pages while the snapshot stays
  * unbounded is THEATRE. The register hop is unrated (#298), and it drives the
  * snapshot — an unbounded fold on a path that has no bound BY DESIGN, since a
- * truncated snapshot is a wrong chat rather than a slow one. The process is
+ * truncated snapshot is a wrong chat rather than a slow one.
+ *
+ * ⚠️ "TRUNCATED" THERE MEANS REPLAY DEPTH, NOT THE SERVED WINDOW — read as the
+ * latter the sentence is simply false, because `sendSnapshot` below asks for
+ * `{kind:"recent", limit: config.limit}` and `DEFAULT_HISTORY_CONFIG.limit` is
+ * 50, so every snapshot IS windowed to the newest 50 messages. What must not be
+ * truncated is the FOLD: `serveHistoryRequest` projects the WHOLE journal and
+ * `recentHistoryPage`/`historyPageBefore` slice that result. Truncating the
+ * INPUT instead is not available — the projection is a fold from the start of
+ * the stream with no way to resume partway (materializing one is exactly #286),
+ * so a shortened replay yields a different conversation rather than a shorter
+ * one. Windowing the OUTPUT is cheap and correct. `MAX_WIRE_HISTORY_LIMIT`
+ * (`history.ts`) likewise bounds only the output of a peer-requested page — it
+ * is not a fold bound and does not touch the argument below.
+ *
+ * The process is
  * therefore already exposed to unbounded serial folds; the page path adds
  * nothing qualitatively new to that exposure, only more of it. A page bound
  * would buy a real product regression for no change in the worst case.

@@ -20,6 +20,7 @@ import {
   planHistoryFetch,
   resolveHistoryConfig,
   DEFAULT_HISTORY_CONFIG,
+  MAX_WIRE_HISTORY_LIMIT,
 } from "./history.js";
 
 describe("history — resolveHistoryConfig (AC6)", () => {
@@ -98,5 +99,45 @@ describe("history — planHistoryFetch (load_history wire → fetch mapping)", (
 
   it("floors a fractional wire limit (integer-only contract)", () => {
     expect(planHistoryFetch({ before: "m-1", limit: 25.9 }, 50).limit).toBe(25);
+  });
+
+  /**
+   * The peer-supplied `limit` is clamped; the operator-supplied fallback is not.
+   * Base had this cap twice over (the deleted reader's `MAX_FETCH_WINDOW` and
+   * core's own `Math.min` inside `getSessionMessages`), and the cutover deleted
+   * both — so `{limit: 1e9}` selected, stringified and sealed a whole
+   * conversation in one frame. See `planHistoryFetch`'s docblock for why the
+   * asymmetry is deliberate.
+   */
+  it("clamps an oversized wire limit to MAX_WIRE_HISTORY_LIMIT, on both plans", () => {
+    expect(planHistoryFetch({ limit: 1e9 }, 50)).toEqual({
+      kind: "recent",
+      limit: MAX_WIRE_HISTORY_LIMIT,
+    });
+    expect(planHistoryFetch({ before: "m-1", limit: 1e9 }, 50)).toEqual({
+      kind: "page",
+      beforeId: "m-1",
+      limit: MAX_WIRE_HISTORY_LIMIT,
+    });
+    // Exactly at the cap is not "oversized".
+    expect(planHistoryFetch({ limit: MAX_WIRE_HISTORY_LIMIT }, 50).limit).toBe(
+      MAX_WIRE_HISTORY_LIMIT,
+    );
+  });
+
+  it("passes a wire limit below the cap through unchanged", () => {
+    expect(planHistoryFetch({ limit: MAX_WIRE_HISTORY_LIMIT - 1 }, 50).limit).toBe(
+      MAX_WIRE_HISTORY_LIMIT - 1,
+    );
+  });
+
+  it("leaves the OPERATOR fallback unclamped when the wire limit is absent or invalid", () => {
+    // Trusted input: an operator raising `history.pageSize` past the wire cap is
+    // a deliberate configuration choice, not an attack, and must not be silently
+    // overridden.
+    const huge = MAX_WIRE_HISTORY_LIMIT * 10;
+    expect(planHistoryFetch({}, huge).limit).toBe(huge);
+    expect(planHistoryFetch({ limit: NaN }, huge).limit).toBe(huge);
+    expect(planHistoryFetch({ before: "m-1", limit: -5 }, huge).limit).toBe(huge);
   });
 });

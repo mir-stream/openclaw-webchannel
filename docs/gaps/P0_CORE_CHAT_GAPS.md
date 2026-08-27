@@ -75,7 +75,7 @@ The **server/agent side (NATS path)** lives in the package-root composition entr
 | Capability | Emit (`nats-channel.ts`) | Wired in `index-nats.ts` (root) |
 |---|---|---|
 | register hop | — | `setRegisterRequestHandler()` `:322` (channel) → wired `:638` (**NATS request/reply — the old HTTP `registerHttpRoute` is gone**) |
-| history snapshot on register | `sendHistory()` (`nats-channel.ts:643`) | **from the register success path** (stateless): `history-serve.ts` `sendSnapshot` → `serveHistoryRequest` (journal replay) → `sendHistory`, **deferred one turn** so the register reply publishes first. ⚠️ Updated by #240 half 2 — was `historyRecent`→`sendHistory` as a detached core-transcript read; both that symbol and the `AsyncResource` detour are deleted. |
+| history snapshot on register | `sendHistory()` (`nats-channel.ts:644`) | **from the register success path** (stateless): `history-serve.ts` `sendSnapshot` → `serveHistoryRequest` (journal replay) → `sendHistory`, **deferred one turn** so the register reply publishes first. ⚠️ Updated by #240 half 2 — was `historyRecent`→`sendHistory` as a detached core-transcript read; both that symbol and the `AsyncResource` detour are deleted. |
 | approval snapshot on register | `sendApprovalSnapshot()` `:473` | **from the same register path**, **synchronous** (not detached): `listPendingApprovalsForPeer`/`listResolvedApprovalsForPeer` → `sendApprovalSnapshot` (`:668-673`) |
 | history pagination | — | `setLoadHistoryHandler` → `history-serve.ts` `servePage` → `planHistoryFetch` → `serveHistoryRequest` (journal replay) → `sendHistory`, deferred, and bounded to one in-flight page per peer. ⚠️ Updated by #240 half 2 — `historyPageBefore`/`historyRecent` (the core-transcript pager) are deleted. |
 | command discovery | `sendCommands()` `:527-530` | `setLoadCommandsHandler` `:658` wired `:917-925` → `createCommandCatalogProvider(api.config)()` (memoized, config-filtered) |
@@ -208,14 +208,22 @@ snapshot is lost.
 > ids, the "upstream-constrained, file a feature request for a `before`/`offset`
 > cursor" analysis. None of that code exists any more. The plugin now serves
 > history from its OWN delivery journal (`journal-history.ts`, replaying the
-> client's reducer), a page comes off the full projection, and there is no
-> fetch window and therefore **no cap at any size** — the residual "conversations
-> >1000 messages hard-wall" is not ours and needs nothing from upstream.
+> client's reducer), and a page comes off the full projection. **Distinguish the
+> two quantities the old wording ran together (it said "no cap at any size"):**
+> REACH is now uncapped — `historyPageBefore` pages arbitrarily far back, so the
+> "conversations >1000 messages hard-wall" really is gone and needs nothing from
+> upstream. A single PAGE is still capped at 1000 for a peer-supplied `limit`
+> (`MAX_WIRE_HISTORY_LIMIT` in `history.ts`), which is what base effectively did
+> too — via `MAX_FETCH_WINDOW` and again inside core's `getSessionMessages`. The
+> cutover dropped that clamp; #240 half 2 restores it, at zero cost to reach.
 >
 > What is genuinely still open here is the CLIENT half: the scroll-UX polish
-> (item 1 of the sketch) and the client's three-tier adoption merge, which #240
-> deliberately did not touch. The new cost ceiling is different in kind and is
-> tracked separately: a page is a full synchronous replay, quadratic in
+> (item 1 of the sketch) and the client's three-tier adoption merge — which is
+> RETAINED but **not** untouched, and an earlier revision of this line saying
+> #240 "deliberately did not touch" it was wrong: the cutover made three of its
+> paths lose delivered text and this slice fixes all three (doc §15.6 has the
+> list; wholesale removal is **#302**). The new cost ceiling is different in kind
+> and is tracked separately: a page is a full synchronous replay, quadratic in
 > conversation length (**#286** — the materialized read model).
 >
 > Kept below as the record of what was built and why, not as current state. Do

@@ -91,6 +91,22 @@ export type HistoryFetchPlan =
   | { kind: "recent"; limit: number };
 
 /**
+ * Upper bound on a PEER-SUPPLIED `limit`, in messages per `history` frame.
+ *
+ * ⚠️ THIS RESTORES A CLAMP THE CUTOVER DROPPED, it is not a new policy. The
+ * deleted reader had `MAX_FETCH_WINDOW = 1000`, and upstream core clamped again
+ * inside `getSessionMessages` (`Math.min` against
+ * `PLUGIN_SUBAGENT_SESSION_MESSAGES_MAX_LIMIT = 1_000`). So on base EVERY
+ * history read was capped at 1000 messages per frame no matter what the peer
+ * asked for. Without it, `{type:"load_history", limit: 1e9}` from any
+ * authenticated peer selects the entire conversation, then `JSON.stringify`s and
+ * AEAD-seals all of it on the shared event loop — `sendHistory`/`sendToPeer`
+ * apply no size guard of their own (`effectiveOutboundLimit` is consulted only
+ * by `sendIngressResult`'s chunking).
+ */
+export const MAX_WIRE_HISTORY_LIMIT = 1000;
+
+/**
  * Turn an inbound `load_history` request into a fetch plan.
  *
  * `limit` is validated here because the NATS dispatch forwards `message.limit`
@@ -100,6 +116,20 @@ export type HistoryFetchPlan =
  * non-finite / non-number falls back to `fallbackLimit` (the configured page
  * size). A present `before` selects pagination; its absence selects the tail
  * fetch.
+ *
+ * ⚠️ THE CLAMP IS ASYMMETRIC ON PURPOSE — DO NOT "FIX" THE INCONSISTENCY.
+ * `MAX_WIRE_HISTORY_LIMIT` bounds `request.limit`, which is peer-controlled
+ * input. `fallbackLimit` is `config.limit` / `config.pageSize` — operator
+ * configuration, i.e. trusted — and an operator who raises it is making a
+ * deliberate choice about their own gateway, not mounting an attack. Clamping it
+ * too would silently override a documented config key.
+ *
+ * ⚠️ AND THIS IS NOT THE DEPTH/LENGTH GATE THAT WAS BUILT AND REVERTED EARLIER
+ * IN THIS SLICE. That one refused to serve past a total-conversation size, which
+ * destroys REACH — a 1200-message conversation would have been unreadable at any
+ * depth. A per-PAGE cap costs zero reach: `historyPageBefore` still pages
+ * arbitrarily far back, 1000 messages at a time, which is strictly more reach
+ * than base had (base capped the page identically AND capped it twice).
  */
 export function planHistoryFetch(
   request: { before?: string; limit?: number },
@@ -109,7 +139,7 @@ export function planHistoryFetch(
     typeof request.limit === "number" &&
     Number.isFinite(request.limit) &&
     request.limit > 0
-      ? Math.floor(request.limit)
+      ? Math.min(Math.floor(request.limit), MAX_WIRE_HISTORY_LIMIT)
       : fallbackLimit;
   return request.before
     ? { kind: "page", beforeId: request.before, limit }

@@ -14,8 +14,30 @@ set -euo pipefail
 
 # The predicate under test, character-for-character as `pack-load-smoke.sh` runs
 # it. Kept as a copy on purpose: sourcing that script would run the whole smoke
-# test. The duplication is one line, and the test below fails loudly if the two
-# ever disagree about a real leak.
+# test (a full pack + install).
+#
+# ⚠️ A COPY IS ONLY A TEST OF THE ORIGINAL IF THE COPY IS PINNED, and an earlier
+# revision of this comment claimed the checks below "fail loudly if the two ever
+# disagree" — they cannot, because nothing here reads the production script.
+# Widening `pack-load-smoke.sh`'s filter (say to `grep -cvE '^//'`, which drops
+# EVERY comment line and disarms the scan) would leave every check below green.
+# So the pin is explicit: assert the production file still contains this exact
+# pipeline, and fail if it does not.
+PREDICATE=$'grep -F \'/src/\' "$PKG/$f" | grep -cvE \'^// [^[:space:]]+$\''
+SMOKE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pack-load-smoke.sh"
+if [ ! -f "$SMOKE" ]; then
+  echo "FAIL — cannot pin the predicate: $SMOKE not found" >&2
+  exit 1
+fi
+if ! grep -qF -- "$PREDICATE" "$SMOKE"; then
+  echo "FAIL — pack-load-smoke.sh no longer contains the predicate this self-test copies." >&2
+  echo "       expected to find, verbatim:" >&2
+  echo "         $PREDICATE" >&2
+  echo "       Either the scan changed (update the copy below AND re-derive these" >&2
+  echo "       checks against it) or it was disarmed. Do not just edit this file." >&2
+  exit 1
+fi
+
 residual_count() {
   grep -F '/src/' "$1" | grep -cvE '^// [^[:space:]]+$' || true
 }

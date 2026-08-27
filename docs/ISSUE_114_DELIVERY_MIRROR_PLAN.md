@@ -175,7 +175,7 @@ turn_snapshot은 **완전한 턴 기록이 아니라 교정 패치다.** 계약(
 
 **OUT → 후속:**
 - off/block 모드 per-answer id 신설(controller/wire/client) — §3.3. ⚠️ **절반 해소(PR #250 / #238)**: controller/wire 쪽(플러그인이 모든 배달 행위에서 id 민팅)은 거기서 처리됐고, **client 쪽은 아직 OUT**이다. 식별자 판정은 §16.5.
-- client text/위치 매칭 완전 제거(#104/#227/#228, `adoptedFromLiveId`, tier-2 exact-text) — journal 착지 후.
+- client text/위치 매칭 완전 제거(**#302**, `adoptedFromLiveId`, tier-2 exact-text) — journal 착지 후. (원래 #104/#227/#228을 적었으나 셋 다 v6 보드 재편 때 CLOSED다 — 실제 소유 이슈는 #302.)
 - `getSessionMessages` 기반 history 제거 — cutover 후. ✅ **완료 (#240 half 2, 2026-08-26)**: reader·`AsyncResource` operator-scope 우회·transcript normalizer·`history-sanitize.ts` 모두 삭제, `grep -rn "getSessionMessages" packages/` 무출력.
 
 ---
@@ -211,7 +211,7 @@ durable worktree에서. 스크래치패드 금지(`no-scratchpad-for-real-work`)
 ## 8. 범위 / 비범위
 
 **범위(이번):** partial/progress 모드 — journal store, drain-time commit 훅, journal 기반 history, client 순수-view 렌더 (§5 IN).
-**비범위(후속):** off/block 모드 per-answer id 신설 — ⚠️ **절반 해소(PR #250 / #238)**: controller/wire 쪽은 거기서 처리됐고 **client 쪽만 남았다**(§5 OUT · §6 참고); client text/위치 매칭 제거(#104/#227/#228); #215/#223 최종 종결; `getSessionMessages` 기반 history 제거(cutover 후); core 저장 형식 변경 없음.
+**비범위(후속):** off/block 모드 per-answer id 신설 — ⚠️ **절반 해소(PR #250 / #238)**: controller/wire 쪽은 거기서 처리됐고 **client 쪽만 남았다**(§5 OUT · §6 참고); client text/위치 매칭 제거(**#302**; 과거 표기 #104/#227/#228은 CLOSED); #215/#223 최종 종결; `getSessionMessages` 기반 history 제거(cutover 후); core 저장 형식 변경 없음.
 
 ---
 
@@ -623,7 +623,7 @@ CREATE INDEX IF NOT EXISTS ix_event_turn ON journal_event(session, turn_id);
 ### 15.2 저장·feed (v4에서 확정, 유지)
 
 - 우리 소유 SQLite(`node:sqlite` DatabaseSync + 계약 `runSqliteImmediateTransactionSync`, `resolveStateDir`). core-agent DB 미사용(확정).
-- feed = `nats-channel.ts`의 **단일 egress**(`nats-channel.ts`의 `sendToPeer`/`sendText`/`finalizeDraft`) — 모든 durable 프레임이 통과함 CONFIRMED(양쪽 리뷰). progress는 별도 타입(`sendProgress`). ⚠️ **줄번호로 걸지 말 것** — 이 세 앵커는 #240 half 2 이전부터 이미 밀려 있었고(리뷰가 계산한 +6도 틀렸다; `sendProgress`는 561), 심볼명이 유일하게 안 썩는 참조다.
+- feed = `nats-channel.ts`의 **단일 egress**(`nats-channel.ts`의 `sendToPeer`/`sendText`/`finalizeDraft`) — 모든 durable 프레임이 통과함 CONFIRMED(양쪽 리뷰). progress는 별도 타입(`sendProgress`). ⚠️ **줄번호로 걸지 말 것** — 이 세 앵커는 #240 half 2 이전부터 이미 밀려 있었고(리뷰가 계산한 +6도 틀렸다), 심볼명이 유일하게 안 썩는 참조다. — 이 문장이 원래 `sendProgress`의 "정확한" 줄번호를 적었다가 그것마저 한 줄 틀렸다. 논지가 곧 반례였으므로 숫자를 고치지 않고 **지웠다**.
 - 버블당 IMMEDIATE txn(p50 0.1ms 실측); WAL checkpoint는 hot-path 밖.
 
 ### 15.3 이벤트 모델 — 완전 순서 스트림 (findings codex1·4·6)
@@ -671,7 +671,12 @@ egress에서 **클라가 view에 쓰는 이벤트만, 전송 순서(seq)대로**
 - **이점**: §0("core transcript 안 읽음")이 전환기 예외 없이 **문자 그대로 즉시 성립.** 설계가 크게 단순해짐.
 - ✅ **구현 상태(2026-08-26): 서버 쪽 컷오버 완료 (#240 half 2).** core transcript reader가 **패키지에서 사라졌다** — `getSessionMessages` 호출, `AsyncResource` operator-scope 우회, transcript normalizer, `history-sanitize.ts` 모두 삭제(`grep -rn "getSessionMessages" packages/` 무출력). **N2는 이 시점부터 서버 쪽에서 문자 그대로 성립한다.**
   - **세는 대신 이름으로 적는다 — 그리고 셋 다 바뀌었다.** half 1이 남긴 경고("두 호출부"가 아니라 핸들러 2개에 호출 3개)는 옳았고, 실제로 교체된 건 그 셋이다: (1) connect/reconnect 스냅샷의 `historyRecent`, (2) load-history 핸들러의 `historyPageBefore`, (3) 같은 핸들러의 `historyRecent`. 지금은 셋 다 `history-serve.ts`의 `createHistoryServer`(`sendSnapshot`/`servePage`) 뒤로 들어갔고, `nats-account-runtime.ts`에는 배선만 남았다. **두 body가 `buildNatsAccount` 안의 클로저였다는 게 실제로 사고를 냈다**: tenant-isolation 스위트가 그걸 *베껴서* 커버하고 있었고, production 인자를 `peerId`→`accountId`로 바꿔도(= 한 (tenant, accountId) 아래 모든 peer가 서로의 대화를 읽음) 21개 테스트가 전부 green이었다. 지금은 실제 코드를 돌리고 그 mutation이 17개 red다.
-  - ⚠️ **클라 3-tier adoption은 "제거"되지 않았지만 "손 안 댐"도 아니다 — 컷오버가 거기에 데이터 손실 결함 2개를 만들었고 고쳤다.** 둘 다 실측했고, `core-` id 대조군이 컷오버가 원인임을 증명한다: (1) tier 1이 **claim을 안 해서** — history id가 `core-…`일 땐 `isLocalLiveId`가 걸러 무해했지만 이제 저널 id가 곧 live `webchannel-…` id라 뒤 행이 같은 텍스트로 tier 2 입양을 해버린다(같은 답 두 개 → 한 개). (2) placement-only lane의 `{role:"agent", text:""}`가 `seen`에도 없고 텍스트도 안 맞아 **tier 3이 발동**, `anchor+1`의 진짜 답변 버블을 `{id:P, text:""}`로 덮어썼다(N10, 전달된 텍스트 파괴). 고침은 tier-1 index claim + 도착 즉시 빈 agent 행 드롭(= `dropSpentDrafts`가 live에서 이미 적용하는 그 규칙을, 같은 lane이 들어오는 유일한 다른 문에 적용). ⇒ **tier 3은 이제 진짜로 도달 불가**이고, 나머지 text/위치 매칭 제거는 여전히 **§5·§8의 후속(#104/#227/#228)**이다(§12.9 아님 — 그 절은 SUPERSEDED §12 안이다).
+  - ⚠️ **클라 3-tier adoption은 "제거"되지 않았지만 "손 안 댐"도 아니다 — 컷오버가 거기에 데이터 손실 결함 3개를 만들었고 고쳤다.** 셋 다 실측했다(각각 제거하면 red가 되는 테스트가 `nats-client-wrapper-hydration.test.ts`에 있다). 공통 원인은 하나다: **저널 id가 곧 live `webchannel-…` id라, 스냅샷 행 id와 로컬 버블 id가 이제 같은 이름공간에 산다.** 다만 컷오버 이전에 각각을 막고 있던 것은 서로 다르므로, 항목마다 적는다.
+    1. **tier 1이 index를 claim하지 않았다** → tier-1로 이미 식별된 버블이 tier-2 풀에 남아, 같은 텍스트의 뒤 행이 그 위에 입양(같은 답 두 개 → 한 개). *이전 차단막*: history id가 `core-…`면 `isLocalLiveId`가 걸러 애초에 tier-2 풀에 안 들어갔다.
+    2. **placement-only lane의 `{role:"agent", text:""}`** 가 `seen`에도 없고 텍스트도 안 맞아 **tier 3이 발동**, `anchor+1`의 진짜 답변 버블을 `{id:P, text:""}`로 덮어썼다(N10, 전달된 텍스트 파괴). → 도착 즉시 빈 agent 행 드롭(= `dropSpentDrafts`가 live에서 이미 적용하는 그 규칙을, 같은 lane이 들어오는 유일한 다른 문에 적용). *이전 차단막*: `isLocalLiveId`가 아니다(그건 incoming id가 아니라 **로컬** 후보를 본다) — core transcript에 저자 없는 placement 행이라는 것 자체가 없었다.
+    3. **`adoptAt`이 밀려난 id를 은퇴시키지 않았다** — 입양이 `next[idx]`의 id를 갈아치우면서 옛 id를 `seen`/`localIndexById`에 그대로 뒀다. 스냅샷은 바로 그 id를 **자기 뒤 행으로도** 들고 오므로, 그 행이 이미 자기 것이 아닌 index에 tier-1 "매치"해서 조용히 버려졌다(tier 2·tier 3 경로 양쪽에서 각각 답변 하나 소실). → 입양 시 `seen.delete`/`localIndexById.delete`. *이전 차단막*: `seen`은 로컬 id만 담는데 스냅샷 agent id는 전부 `core-…`라 `seen.has(...)`가 늘 false였다.
+  - 남은 text/위치 매칭 제거는 여전히 **§5·§8의 후속**이고, 그 소유 이슈는 **#302**다(§12.9 아님 — 그 절은 SUPERSEDED §12 안이다). 원래 여기 적혀 있던 #104/#227/#228은 v6 보드 재편 때 전부 CLOSED다.
+    - ⚠️ **tier 3의 도달 가능성 판정은 이 문서에서 뺀다.** 세 개정판에 걸쳐 세 번 다르게(그리고 매번 틀리게) 적혔다 — 마지막은 "이제 진짜로 도달 불가"였는데 위 (3)의 tier-3 트레이스가 바로 그 반례다. 코드 쪽 주석(`nats-client-wrapper.ts`의 `case "history"`)이 조건과 함께 진실을 갖고 있고, 제거는 #302 소관이다.
   - 부수 결론 하나: `history-sanitize.ts`는 **core transcript reader가 raw 모델 출력을 받기 때문에만** 존재했다. 저널은 클라에 실제로 publish된 텍스트를 그대로 갖고 있으므로 **projection 경로에서 재-sanitize하면 그 자체가 N8이다.** half 2에서 모듈째 삭제했고, `journal-history.ts` 헤더가 ⚠️로 재도입을 막는다.
   - ⚠️ **컷오버가 "빈 세션 위장 금지"를 read 쪽으로 끌고 왔고, 거기서 끝난다.** 저널 read가 실패하면 두 호출부 모두 `logger.error` + **`history` 프레임 미발행**이다(`[]`를 보내면 깨진 read가 "history 없음"으로 렌더링되고, 그게 이 절이 write 쪽에서 금지한 바로 그것). **하지만 클라는 그 둘을 구분할 수 없다** — 프레임을 못 받은 peer가 보는 화면은 새 대화와 동일하다. wire 신호가 없어서 정직한 정책이 wire에서 끊긴다 → **#296.**
   - ⚠️ **배포 이전 대화가 조용히 사라진다는 것**(이 절 위쪽의 "기존 대화는 버려진다")은 승인된 결정이지만, **운영자가 볼 곳에 아직 안 적혀 있다.** 릴리스 노트와 backfill 여부 기록 → **#297.** (v1 설계 때 걱정하던 "off 모드면 저널이 빈다"는 v6엔 해당 없음: 저널은 streaming이 아니라 egress seam이 채우고 `journalEventForOutbound`가 `agent_message` → `bubble`을 매핑한다.)

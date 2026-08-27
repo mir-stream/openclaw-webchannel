@@ -66,11 +66,13 @@
  * `history-serve.ts`, which owns the deferral, the per-peer in-flight bound and
  * the failure policy; `nats-account-runtime.ts` only wires it. (The client's
  * 3-tier adoption block is RETAINED, but no longer "untouched": the cutover
- * made two of its paths lose delivered text, so #240 half 2 also fixes those
- * two — a tier-1 match now claims its local bubble, and empty-text agent rows
- * are dropped on arrival. Wholesale removal is tracked at doc §5's non-scope
- * list, #104/#227/#228; §15.6 itself says the block is removable together with
- * this cutover, so "separate work" was never the doc's position.)
+ * made three of its paths lose delivered text, so #240 half 2 also fixes those
+ * three — a tier-1 match now claims its local bubble, empty-text agent rows are
+ * dropped on arrival, and an adoption now retires the id it displaced.
+ * Wholesale removal is tracked at doc §5's non-scope list and owned by **#302**
+ * (the #104/#227/#228 that list originally cited are all CLOSED); §15.6 itself
+ * says the block is removable together with this cutover, so "separate work"
+ * was never the doc's position.)
  *
  * ⚠️ NEVER SANITIZE HERE. Do not reintroduce `sanitizeHistoryText` or anything
  * like it. The journal stores the EXACT text that was published to the client,

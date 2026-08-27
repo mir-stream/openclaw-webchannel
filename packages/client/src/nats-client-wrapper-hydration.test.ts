@@ -216,7 +216,8 @@ describe("#95 WP B — live timeline converges to the row sequence", () => {
    * while other rows can still reach it. Keep it while the tier exists.
    *
    * Removing the tier is tracked at doc §5's non-scope list ("client text/위치
-   * 매칭 제거", #104/#227/#228) — not a "§15.6 follow-up list", which does not
+   * 매칭 제거") and owned by **#302** — the #104/#227/#228 that list originally
+   * cited are all CLOSED. It is not a "§15.6 follow-up list", which does not
    * exist; §15.6 in fact says the adoption block is removable TOGETHER with the
    * cutover.
    */
@@ -301,14 +302,29 @@ describe("#95 WP B — live timeline converges to the row sequence", () => {
 
 
 /**
- * #240 half 2 — TWO DATA-LOSS DEFECTS THE CUTOVER MADE REACHABLE.
+ * #240 half 2 — THREE DATA-LOSS DEFECTS THE CUTOVER MADE REACHABLE.
  *
  * ⚠️ THESE ARE REGRESSIONS OF THE SERVER CHANGE, SURFACING IN CLIENT CODE THAT
- * WAS NOT EDITED. Both were mis-scoped as "the client still works" during
+ * WAS NOT EDITED. They were mis-scoped as "the client still works" during
  * review, on the reasoning that agent bubbles simply move from tier 3 to tier 1.
  * They do — and the id change that makes them do it is exactly what breaks these
- * two paths. Each test below is PAIRED with a `core-`-id control reproducing the
- * pre-cutover input, so the diff between them IS the regression.
+ * paths: the snapshot's ids now live in the SAME namespace as local bubble ids.
+ *
+ * ⚠️ NOT EVERY TEST HERE IS PAIRED WITH A `core-`-ID CONTROL, and an earlier
+ * revision of this docblock claimed they all were. A control needs a
+ * DIFFERENTIAL — the same fixture converging under `core-` ids and losing a
+ * message under journal ids — and that depends on WHICH pre-cutover fact was
+ * blocking the defect:
+ *   - tier-1 claim: blocked by `isLocalLiveId` rejecting the snapshot id, so the
+ *     namespace swap IS the differential. Control present, directly below.
+ *   - empty-agent filter: NO control is constructible. The filter keys on text
+ *     and is id-agnostic, so a `core-P` empty row is dropped identically; what
+ *     blocked it pre-cutover was that core's transcript never held an unauthored
+ *     placement row at all, which no fixture can assert. Do not build one.
+ *   - displaced-identity retirement: blocked by `seen` holding only local ids
+ *     while snapshot agent ids were all `core-…`. A control IS constructible
+ *     here; what these tests measure instead is the mutation (remove the two
+ *     `delete`s in `adoptAt` and both go red), which is the stronger evidence.
  */
 describe("#240 half 2 — journal ids make a tier-1 match a live adoption target", () => {
   it("keeps two identical agent answers as two bubbles", () => {
@@ -347,6 +363,62 @@ describe("#240 half 2 — journal ids make a tier-1 match a live adoption target
     );
 
     expect(timeline(w)).toEqual(["agent:ok", "agent:ok"]);
+  });
+
+  /**
+   * THE MIRROR DEFECT: an adoption DISPLACES an id, and the displaced id stayed
+   * in `seen`/`localIndexById`. Post-cutover the snapshot carries that very id
+   * as a later row, so the row tier-1 "matched" a bubble it no longer occupied
+   * and was silently discarded. Both directions below lose a delivered answer
+   * without the two `delete`s in `adoptAt`.
+   */
+  it("keeps a row whose id was displaced by a tier-3 adoption", () => {
+    // Live holds the SECOND answer only (the first frame was missed). Row 2
+    // tier-3 adopts onto that bubble, displacing `webchannel-2`; row 3 then
+    // carries `webchannel-2` itself.
+    const rows: Row[] = [
+      { id: "wire-8f3a1c", role: "user", text: "which agents are configured?", ts: 1 },
+      { id: "webchannel-1", role: "agent", text: "Let me check that.", ts: 2 },
+      { id: "webchannel-2", role: "agent", text: "You have three: alpha, beta, gamma.", ts: 3 },
+    ];
+
+    const w = makeWrapper();
+    w.send("which agents are configured?");
+    deliver(w, {
+      type: "agent_message",
+      id: "webchannel-2",
+      text: "You have three: alpha, beta, gamma.",
+    });
+    deliver(w, history(...rows));
+
+    const cold = makeWrapper();
+    deliver(cold, history(...rows));
+
+    expect(timeline(w)).toEqual(timeline(cold));
+    expect(w.getState().messages.map((m) => m.id)).toEqual([
+      "wire-8f3a1c",
+      "webchannel-1",
+      "webchannel-2",
+    ]);
+  });
+
+  it("keeps a row whose id was displaced by a tier-2 adoption", () => {
+    // Live holds the LATER of two identical answers. Row 1 tier-2 adopts onto
+    // it (text matches), displacing `webchannel-2` — which row 2 then carries.
+    const w = makeWrapper();
+    deliver(w, { type: "agent_message", id: "webchannel-2", text: "ok" });
+    deliver(
+      w,
+      history(
+        { id: "webchannel-1", role: "agent", text: "ok", ts: 1 },
+        { id: "webchannel-2", role: "agent", text: "ok", ts: 2 },
+      ),
+    );
+
+    expect(w.getState().messages.map((m) => `${m.id}|${m.role}|${m.text}`)).toEqual([
+      "webchannel-1|agent|ok",
+      "webchannel-2|agent|ok",
+    ]);
   });
 
   it("still dedups a repeated snapshot of one bubble (no over-claiming)", () => {
@@ -391,10 +463,16 @@ describe("#240 half 2 — a phantom empty agent row must never reach tier 3", ()
     ]);
   });
 
-  it("CONTROL: the same phantom under a core id also could not adopt", () => {
-    // Pre-cutover the phantom row simply did not exist (core's transcript never
-    // held an unauthored placement) AND a `core-` id fails `isLocalLiveId`. This
-    // pins that the filter, not the id namespace, is what protects us now.
+  it("a real answer under a pre-cutover core id still adopts normally", () => {
+    // The pre-cutover input shape, for contrast: core's transcript never held an
+    // unauthored placement, so there is no empty row here at all.
+    //
+    // ⚠️ THIS IS NOT A CONTROL FOR THE FILTER, and an earlier revision billed it
+    // as one ("pins that the filter, not the id namespace, is what protects us")
+    // — false, since the fixture contains no empty row to filter. No such
+    // control is constructible: the filter is id-agnostic, so a `core-`-id empty
+    // row is dropped exactly like a `webchannel-` one and there is no
+    // differential to assert. Do not try to build one.
     const w = makeWrapper();
     w.send("hi");
     deliver(w, { type: "agent_message", id: "webchannel-2", text: "real answer" });

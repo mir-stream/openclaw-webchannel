@@ -1996,8 +1996,9 @@ export class WebChannelNATSClient {
       };
       // Assigned rather than written in the literal so an ABSENT turnId does not
       // become an own `turnId: undefined` key. A history-hydrated bubble is
-      // created without one (the fresh-insert at …:2469-2474 emits
-      // `{id, role, text, ts, working}`), and adding the key would fail
+      // created without one (`case "history"`'s fresh-insert — the
+      // `inserts.set(cursor, atCursor)` push for a row that matched no tier —
+      // emits exactly `{id, role, text, ts, working}`), and adding the key fails
       // `sameChatMessage`'s key-count check on the very first durable event —
       // silently re-creating a bubble the `.toBe` guarantee says must be reused.
       if (turnId !== undefined) next.turnId = turnId;
@@ -2386,10 +2387,21 @@ export class WebChannelNATSClient {
          * LIVE, moved to the only other door the same lane can arrive through.
          * `isSpentDraft`/`dropSpentDrafts` delete a spent draft at turn end
          * (#251, settled against core's built-in Telegram extension, which
-         * deletes an unfinalized preview rather than keeping it). A `history`
-         * frame is always after turn end, and an empty agent bubble renders
-         * nothing either way, so this converges history to live instead of
-         * inventing a third behaviour. Keeping it client-local is also where
+         * deletes an unfinalized preview rather than keeping it). An empty agent
+         * bubble renders nothing either way, so this converges history to live
+         * instead of inventing a third behaviour.
+         *
+         * ⚠️ A `history` FRAME IS NOT "ALWAYS AFTER TURN END" — an earlier
+         * revision of this paragraph said so, and the Phase-6 note below
+         * contradicts it: a snapshot arrives at every device MID-SESSION. The
+         * justification does not need that claim. A lane still in flight
+         * projects `{agent, ""}` and is filtered — same outcome as the live
+         * draft it mirrors, which also renders nothing. A lane that already
+         * published a bubble carries its text, so it tier-1 matches its own
+         * `working:true` draft by id and is left alone (tier 1 is a no-op; a
+         * working draft is never an adoption target either).
+         *
+         * Keeping it client-local is also where
          * **#264** says the derivation belongs — a server-side "placement whose
          * answerId never reappears" fold would be a supersession rule invented
          * in the projection, which is the N8 the store exists to prevent.
@@ -2455,15 +2467,24 @@ export class WebChannelNATSClient {
         //  - agent bubbles do move to tier 1, but a tier-1 match did not CLAIM
         //    its local bubble, so a later same-text row tier-2 adopted onto it
         //    and destroyed a delivered answer. Fixed below.
-        // Both are pinned, each against a `core-`-id control, in
-        // `nats-client-wrapper-hydration.test.ts`.
+        //  - and a THIRD, found only after the two above were fixed: an adoption
+        //    DISPLACES an id, and `adoptAt` left it in `seen`/`localIndexById`,
+        //    so the snapshot's own later row for that id tier-1 "matched" a
+        //    bubble it no longer occupied and was dropped. Reached through tier 3
+        //    AND through tier 2. Fixed in `adoptAt`.
+        // All three are pinned in `nats-client-wrapper-hydration.test.ts`. Not
+        // all three carry a `core-`-id control, and that file's header says per
+        // defect why — one of the pre-cutover blockers admits no differential at
+        // all.
         //
         // ⚠️ AND "REMOVING THIS BLOCK IS SEPARATE WORK" WAS ALSO WRONG. Doc
         // §15.6 says the opposite — with no legacy core rows the 3-tier
         // text/position adoption 「도 함께 제거 가능」, removable TOGETHER with
         // the cutover — and the follow-up item lives in §5's non-scope list
-        // ("client text/위치 매칭 제거", #104/#227/#228), not in a "§15.6
-        // follow-up list", which does not exist. What is true is narrower: the
+        // ("client text/위치 매칭 제거", owned by **#302** — the #104/#227/#228
+        // that list originally cited were all CLOSED at the v6 board rebuild),
+        // not in a "§15.6 follow-up list", which does not exist. What is true is
+        // narrower: the
         // block is RETAINED because its defect history is long (#16, P1-9 §6.3)
         // and a destructive server cutover is a bad commit to bury a client
         // rewrite in — but part of it stopped being optional the moment the
@@ -2560,6 +2581,14 @@ export class WebChannelNATSClient {
         let cursor = 0;
 
         const adoptAt = (idx: number, m: { id: string; text: string; ts?: number }): void => {
+          // INVARIANT: `seen` and `localIndexById` describe `next` EXACTLY.
+          // `adoptAt` is the only thing that mutates `next` inside the loop, so
+          // it is the only place that can break them — the displaced identity
+          // is no longer anywhere in `next`. Post-#240-half-2 a stale entry is
+          // reachable rather than academic, because the snapshot carries the
+          // very id being displaced as its own later row; that row would then
+          // tier-1 "match" a bubble it no longer occupies and be dropped (N10).
+          const displacedId = next[idx].id;
           // Keep the canonical stored text on adoption, so this device
           // converges to exactly what a reloading device would render. The
           // observed live block ordinal is deliberately discarded: history
@@ -2571,6 +2600,10 @@ export class WebChannelNATSClient {
             text: m.text,
             ts: m.ts,
           };
+          // `displacedId !== m.id` always here (equality is a tier-1 hit, which
+          // never reaches an adoption), so this cannot erase what we just set.
+          seen.delete(displacedId);
+          localIndexById.delete(displacedId);
           claimed.add(idx);
           localIndexById.set(m.id, idx);
           adopted = true;
