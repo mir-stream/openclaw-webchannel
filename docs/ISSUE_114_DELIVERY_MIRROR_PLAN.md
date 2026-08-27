@@ -175,7 +175,7 @@ turn_snapshot은 **완전한 턴 기록이 아니라 교정 패치다.** 계약(
 
 **OUT → 후속:**
 - off/block 모드 per-answer id 신설(controller/wire/client) — §3.3. ⚠️ **절반 해소(PR #250 / #238)**: controller/wire 쪽(플러그인이 모든 배달 행위에서 id 민팅)은 거기서 처리됐고, **client 쪽은 아직 OUT**이다. 식별자 판정은 §16.5.
-- client text/위치 매칭 완전 제거(**#302**, `adoptedFromLiveId`, tier-2 exact-text) — journal 착지 후. (원래 #104/#227/#228을 적었으나 셋 다 v6 보드 재편 때 CLOSED다 — 실제 소유 이슈는 #302.)
+- client **AGENT 행** text/위치 매칭 제거(**#302**) — journal 착지 후. agent 행은 tier 2 풀·tier 3 probe에서 빠지고 tier 1을 놓치면 fresh-insert 한다. ⚠️ **"완전 제거"가 아니다**: #302는 **user 행의 tier 2를 유지**한다(`reserveWireId`가 wire id를 랜덤 토큰으로 민팅하는데 로컬 에코는 `u-<n>`이라 user 행은 정상적으로 tier 1을 놓친다). 이 줄이 원래 적던 `adoptedFromLiveId`는 **이 트리에도 `origin/develop`에도 없는 심볼**이라 지웠고, #104/#227/#228은 v6 보드 재편 때 전부 CLOSED다.
 - `getSessionMessages` 기반 history 제거 — cutover 후. ✅ **완료 (#240 half 2, 2026-08-26)**: reader·`AsyncResource` operator-scope 우회·transcript normalizer·`history-sanitize.ts` 모두 삭제, `grep -rn "getSessionMessages" packages/` 무출력.
 
 ---
@@ -211,7 +211,7 @@ durable worktree에서. 스크래치패드 금지(`no-scratchpad-for-real-work`)
 ## 8. 범위 / 비범위
 
 **범위(이번):** partial/progress 모드 — journal store, drain-time commit 훅, journal 기반 history, client 순수-view 렌더 (§5 IN).
-**비범위(후속):** off/block 모드 per-answer id 신설 — ⚠️ **절반 해소(PR #250 / #238)**: controller/wire 쪽은 거기서 처리됐고 **client 쪽만 남았다**(§5 OUT · §6 참고); client text/위치 매칭 제거(**#302**; 과거 표기 #104/#227/#228은 CLOSED); #215/#223 최종 종결; `getSessionMessages` 기반 history 제거(cutover 후); core 저장 형식 변경 없음.
+**비범위(후속):** off/block 모드 per-answer id 신설 — ⚠️ **절반 해소(PR #250 / #238)**: controller/wire 쪽은 거기서 처리됐고 **client 쪽만 남았다**(§5 OUT · §6 참고); client **agent 행** text/위치 매칭 제거(**#302** — user 행 tier 2는 유지, §5 참조; 과거 표기 #104/#227/#228은 CLOSED); #215/#223 최종 종결; `getSessionMessages` 기반 history 제거(cutover 후); core 저장 형식 변경 없음.
 
 ---
 

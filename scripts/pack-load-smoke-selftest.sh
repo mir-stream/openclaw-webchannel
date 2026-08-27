@@ -12,9 +12,15 @@
 # Run: bash scripts/pack-load-smoke-selftest.sh
 set -euo pipefail
 
-# The predicate under test, character-for-character as `pack-load-smoke.sh` runs
-# it. Kept as a copy on purpose: sourcing that script would run the whole smoke
-# test (a full pack + install).
+# The predicate under test. Kept as a copy on purpose: sourcing that script would
+# run the whole smoke test (a full pack + install).
+#
+# ⚠️ The copy is NOT "character-for-character as pack-load-smoke.sh runs it", as
+# an earlier revision of this comment said: production reads `"$PKG/$f"` where
+# `residual_count` reads `"$1"`. What IS character-identical is the FILTER, which
+# is the part under test. `$PREDICATE` below is production's line as production
+# writes it, so the pin asserts that line verbatim; the copy then differs from it
+# only in the argument.
 #
 # ⚠️ A COPY IS ONLY A TEST OF THE ORIGINAL IF THE COPY IS PINNED, and an earlier
 # revision of this comment claimed the checks below "fail loudly if the two ever

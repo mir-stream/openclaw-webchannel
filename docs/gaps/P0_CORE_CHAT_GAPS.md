@@ -214,8 +214,12 @@ snapshot is lost.
 > "conversations >1000 messages hard-wall" really is gone and needs nothing from
 > upstream. A single PAGE is still capped at 1000 for a peer-supplied `limit`
 > (`MAX_WIRE_HISTORY_LIMIT` in `history.ts`), which is what base effectively did
-> too — via `MAX_FETCH_WINDOW` and again inside core's `getSessionMessages`. The
-> cutover dropped that clamp; #240 half 2 restores it, at zero cost to reach.
+> too — though **not** "via `MAX_FETCH_WINDOW` and again inside core's
+> `getSessionMessages`", as an earlier revision of this line said. That is true
+> only of the `page` path: base's `recent()` forwarded the peer's `limit`
+> unclamped and was capped ONCE, by core. `{load_history, limit: 1e9}` carries no
+> cursor, so it is a `recent`. The cutover dropped that clamp with core itself;
+> #240 half 2 restores it, at zero cost to reach.
 >
 > What is genuinely still open here is the CLIENT half: the scroll-UX polish
 > (item 1 of the sketch) and the client's three-tier adoption merge — which is

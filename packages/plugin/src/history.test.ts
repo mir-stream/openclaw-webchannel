@@ -103,11 +103,16 @@ describe("history — planHistoryFetch (load_history wire → fetch mapping)", (
 
   /**
    * The peer-supplied `limit` is clamped; the operator-supplied fallback is not.
-   * Base had this cap twice over (the deleted reader's `MAX_FETCH_WINDOW` and
-   * core's own `Math.min` inside `getSessionMessages`), and the cutover deleted
-   * both — so `{limit: 1e9}` selected, stringified and sealed a whole
-   * conversation in one frame. See `planHistoryFetch`'s docblock for why the
-   * asymmetry is deliberate.
+   *
+   * Base capped both plans at 1000, by DIFFERENT means — the `recent` assertion
+   * first below is the one that matters, and an earlier revision of this comment
+   * got its mechanism wrong by saying base capped it "twice over". Base's
+   * `recent()` forwarded `limit` unclamped and was capped only by core inside
+   * `getSessionMessages`; `MAX_FETCH_WINDOW` lived in `pageBefore` alone. The
+   * cutover removed core from the path entirely, so `{limit: 1e9}` — which
+   * carries no cursor and is therefore a `recent` — selected, stringified and
+   * sealed a whole conversation in one frame. See `MAX_WIRE_HISTORY_LIMIT` and
+   * `planHistoryFetch`'s docblocks.
    */
   it("clamps an oversized wire limit to MAX_WIRE_HISTORY_LIMIT, on both plans", () => {
     expect(planHistoryFetch({ limit: 1e9 }, 50)).toEqual({

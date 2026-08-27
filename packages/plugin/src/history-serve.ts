@@ -96,8 +96,11 @@
  *
  * ⚠️ "TRUNCATED" THERE MEANS REPLAY DEPTH, NOT THE SERVED WINDOW — read as the
  * latter the sentence is simply false, because `sendSnapshot` below asks for
- * `{kind:"recent", limit: config.limit}` and `DEFAULT_HISTORY_CONFIG.limit` is
- * 50, so every snapshot IS windowed to the newest 50 messages. What must not be
+ * `{kind:"recent", limit: config.limit}` — which at the DEFAULT config
+ * (`DEFAULT_HISTORY_CONFIG.limit` is 50) windows every snapshot to the newest
+ * 50 messages. That number is `channels.webchannel.history.limit` and an
+ * operator can set it to anything; what is unconditional is that the snapshot is
+ * windowed at all, not the width. What must not be
  * truncated is the FOLD: `serveHistoryRequest` projects the WHOLE journal and
  * `recentHistoryPage`/`historyPageBefore` slice that result. Truncating the
  * INPUT instead is not available — the projection is a fold from the start of

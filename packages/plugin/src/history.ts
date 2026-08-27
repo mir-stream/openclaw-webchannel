@@ -93,16 +93,31 @@ export type HistoryFetchPlan =
 /**
  * Upper bound on a PEER-SUPPLIED `limit`, in messages per `history` frame.
  *
- * ⚠️ THIS RESTORES A CLAMP THE CUTOVER DROPPED, it is not a new policy. The
- * deleted reader had `MAX_FETCH_WINDOW = 1000`, and upstream core clamped again
- * inside `getSessionMessages` (`Math.min` against
- * `PLUGIN_SUBAGENT_SESSION_MESSAGES_MAX_LIMIT = 1_000`). So on base EVERY
- * history read was capped at 1000 messages per frame no matter what the peer
- * asked for. Without it, `{type:"load_history", limit: 1e9}` from any
- * authenticated peer selects the entire conversation, then `JSON.stringify`s and
- * AEAD-seals all of it on the shared event loop — `sendHistory`/`sendToPeer`
- * apply no size guard of their own (`effectiveOutboundLimit` is consulted only
- * by `sendIngressResult`'s chunking).
+ * ⚠️ THIS RESTORES A CLAMP THE CUTOVER DROPPED, it is not a new policy. On base
+ * every history read was capped at 1000 per frame — but ⚠️ NOT, as an earlier
+ * revision of this docblock said, "twice over" on both paths. Stated per path,
+ * because the difference matters for the request this bounds:
+ *   - `recent` (no cursor): base's `recent()` forwarded `limit` to
+ *     `getSessionMessages` UNCLAMPED. `MAX_FETCH_WINDOW = 1000` was referenced
+ *     only inside `pageBefore`. So this path was capped ONCE, upstream, by core's
+ *     `Math.min` against `PLUGIN_SUBAGENT_SESSION_MESSAGES_MAX_LIMIT = 1_000`;
+ *   - `page` (cursor supplied): base clamped locally first
+ *     (`Math.min(limit * 2, MAX_FETCH_WINDOW)`) and core clamped again.
+ * `{type:"load_history", limit: 1e9}` carries NO cursor, so the exact request in
+ * the threat model took the once-capped path. The conclusion is unchanged — base
+ * capped it, the cutover did not — only the mechanism.
+ *
+ * Without this clamp that request selects the entire conversation, then
+ * `JSON.stringify`s and AEAD-seals all of it on the shared event loop.
+ * `sendHistory`/`sendToPeer` apply no size guard of their OWN — ⚠️ which is not
+ * the same as "nothing checks the size", as an earlier revision implied by
+ * claiming `effectiveOutboundLimit` is consulted only by `sendIngressResult`'s
+ * chunking. `nats-transport.ts`'s `publish` checks it too and THROWS a
+ * `RangeError` above it, on the very path every `sendHistory` takes
+ * (`history-serve.ts` catches that throw as "publish failed"). So an oversized
+ * frame is a failed send rather than a chunked one — the frame never arrives,
+ * and the CPU was already spent building and sealing it. The clamp is about that
+ * cost, and about not making a failed publish the only backstop.
  */
 export const MAX_WIRE_HISTORY_LIMIT = 1000;
 

@@ -152,12 +152,16 @@ correctness fix:
 1. **P0-2 depth cap** — ✅ FIXED (#24), then **SUPERSEDED by #240 half 2**. The #24 fix was a
    two-phase fetch in `history.ts:pageBefore` that widened to the 1000-message upstream ceiling
    (`MAX_FETCH_WINDOW`) and returned an **empty page** on a genuine cursor miss. That whole pager is
-   deleted: history now comes off the plugin's own delivery journal (`journal-history.ts`), a page
-   is a slice of the full projection, and **there is no fetch window and no ceiling** — the
+   deleted: history now comes off the plugin's own delivery journal (`journal-history.ts`) and a
+   page is a slice of the full projection. **Separate the two quantities** (an earlier revision of
+   this line said "no fetch window and no ceiling", which stopped being true when the page clamp
+   came back): REACH is uncapped — `historyPageBefore` pages arbitrarily far back, so the
    "conversations >1000 turns stay upstream-blocked" residual is gone and needs nothing from
-   upstream. What survives from #24 is the empty-page cursor-miss contract and `planHistoryFetch`
-   (still the wire-`limit` validator). The new ceiling is COST, not depth: a page is a full
-   synchronous replay, quadratic in conversation length — **#286**.
+   upstream. A single PAGE is capped at 1000 when the peer supplies the `limit`
+   (`MAX_WIRE_HISTORY_LIMIT`, `history.ts`); the operator-configured limit is not clamped. What
+   survives from #24 is the empty-page cursor-miss contract and `planHistoryFetch` (still the
+   wire-`limit` validator, and now the clamp site). The new ceiling is COST, not depth: a page is a
+   full synchronous replay, quadratic in conversation length — **#286**.
 2. **P0-6 typing gate** — ✅ FIXED (#26). `NatsChannel` now has a `typingEnabled` field (`:249`) +
    `setTypingEnabled()` (`:502-504`); `sendTyping` (`:509-513`) is gated; wired at
    `index-nats.ts:590` from `resolveTypingEnabled(account)` (`account-config.ts:271-276`). So

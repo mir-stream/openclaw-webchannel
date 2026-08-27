@@ -34,11 +34,12 @@
  *     (durable-view-reducer.ts:487-490) and nothing in the reducer or the journal
  *     ever removes it, so `projectJournalHistory` emits a PHANTOM EMPTY AGENT
  *     BUBBLE;
- *   - LIVE: the client renders nothing there. `mergeDurable` skips the entry
- *     (nats-client-wrapper.ts:2010) via `isSpentDraft`
- *     (nats-client-wrapper.ts:1909), which keys on the CLIENT-LOCAL `draftOnly`
- *     flag — deliberately never journaled, because §15.9 classifies the rolling
- *     draft as an indicator rather than a message.
+ *   - LIVE: the client renders nothing there. `mergeDurable` skips the entry —
+ *     its `if (this.isSpentDraft(next)) continue` guard, just before the `out.push`
+ *     (`nats-client-wrapper.ts`; cited by symbol because the line number here
+ *     rotted within one commit) — and `isSpentDraft` keys on the CLIENT-LOCAL
+ *     `draftOnly` flag, deliberately never journaled, because §15.9 classifies
+ *     the rolling draft as an indicator rather than a message.
  * So the rule that hides it is expressed in a field the server does not have.
  * That is N8 by OMISSION, and it is the reason this file cannot claim the
  * equality unconditionally.
@@ -69,7 +70,9 @@
  * made three of its paths lose delivered text, so #240 half 2 also fixes those
  * three — a tier-1 match now claims its local bubble, empty-text agent rows are
  * dropped on arrival, and an adoption now retires the id it displaced.
- * Wholesale removal is tracked at doc §5's non-scope list and owned by **#302**
+ * Removing the AGENT-row guessing is tracked at doc §5's non-scope list and
+ * owned by **#302** — not "wholesale" removal, since #302 deliberately KEEPS
+ * tier 2 for user rows, whose wire id and local echo id legitimately differ
  * (the #104/#227/#228 that list originally cited are all CLOSED); §15.6 itself
  * says the block is removable together with this cutover, so "separate work"
  * was never the doc's position.)
