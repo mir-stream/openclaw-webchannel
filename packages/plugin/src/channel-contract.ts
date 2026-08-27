@@ -64,7 +64,74 @@ export type OutboundWsMessage =
       assistantMessageIndex?: number;
     }
   | { type: "progress"; id: string; text: string; turnId?: string }
-  | { type: "reasoning"; id: string; turnId: string; text: string }
+  | {
+      type: "reasoning";
+      id: string;
+      turnId: string;
+      text: string;
+      /**
+       * #242 half 1 (doc §15.9/§16.2-5): THIS frame closes the reasoning burst.
+       * Its `text` is the burst's DURABLE text, and it is the ONLY `reasoning`
+       * frame the delivery journal can record
+       * (`delivery-journal-event.ts`'s `case "reasoning"`). Absent or `false`
+       * means a LIVE CUMULATIVE DRAFT update — not durable, exactly as
+       * `progress` is not durable.
+       *
+       * ⚠️ "CAN RECORD", NOT "DOES". Whether ANY reasoning row is written is a
+       * separate, per-account decision — `capabilities.reasoningDurable`,
+       * default OFF. This flag is the WIRE's answer to "which frame carries the
+       * burst's content"; it is not a promise that the content is stored. The
+       * frame is emitted either way, which is the point: the storage gate lives
+       * at the journal, never on the lane.
+       *
+       * ⚠️ THE FLAG EXISTS BECAUSE THE LIVE STREAM IS UNTHROTTLED.
+       * `message-adapter.ts`'s `createReasoningDraftController` sends one frame
+       * per cumulative token update, each carrying the whole text so far, so
+       * journaling every `reasoning` frame would write O(n²) bytes per burst.
+       * With the flag a burst costs exactly one row.
+       *
+       * ADDITIVE AND OPTIONAL: an older client ignores the extra key and takes
+       * the frame down its ordinary `reasoning` path. That path is NOT inert,
+       * and calling it a "render no-op" understates it — for the frame this
+       * slice ADDS to the wire (`closeLiveBurst`'s: the burst's own id, carrying
+       * the text the peer already holds) what actually happens is:
+       *  - `upsertReasoning` replaces the entry under the SAME id with the SAME
+       *    text, so the rendered reasoning list is unchanged in content;
+       *  - `disarmStaleDraftsByTurn(turnId)` runs, which only DELETES ids from
+       *    the client's stale-draft watch set — it touches no message;
+       *  - `setState` fires, so subscribers see one extra notification.
+       * The disarm is the only behavioural effect, and it is safe here because
+       * of WHEN this frame is sent: every burst close happens inside the turn,
+       * and `inbound.ts` emits this turn's `turn_settled` afterwards (its
+       * `reasoning?.stop()` runs in the `finally`, before the settlement block),
+       * so any draft this frame disarms is still finalized by the turn's own
+       * terminal frame.
+       *
+       * ⚠️ THAT `turn_settled` IS GATED, AND THE GATE IS WHY THE ARGUMENT HOLDS
+       * RATHER THAN A HOLE IN IT — check it before "fixing" this. `inbound.ts`
+       * settles under `if (settlementEligible)`, which is `!controlLane` and is
+       * cleared when admission is denied. On BOTH of those paths NO REASONING
+       * CONTROLLER IS EVER BUILT, so there is nothing to close and this frame
+       * cannot be sent: `reasoningEnabled` is `!controlLane && …`, so a control
+       * lane never constructs one and `reasoning?.stop()` no-ops; and the
+       * admission-denied path returns well before the construction site. The two
+       * conditions cannot co-occur — an existing controller implies a dispatched
+       * turn implies an eligible settlement.
+       *
+       * ⚠️ THE THREE BULLETS ARE NOT UNIVERSAL OVER FRAMES CARRYING THIS FLAG.
+       * `pushDurableBlock`'s independent-block branch also sets it, on a FRESHLY
+       * MINTED id carrying text the client has not seen — so there
+       * `upsertReasoning` takes its APPEND path and the `.slice(-100)` cap can
+       * evict the oldest entry. That is not a compatibility concern, because
+       * that branch sent a byte-identical frame (minus this key) before the flag
+       * existed; it is a warning against reading "same id, same text" as a
+       * property of `final` rather than of the burst-closing frame.
+       *
+       * The cost is one extra copy of the burst's text on the wire per burst,
+       * and it is accepted.
+       */
+      final?: boolean;
+    }
   | {
       type: "tool_activity";
       turnId: string;
@@ -120,7 +187,17 @@ export interface WebChannelPeerChannel {
     turnId?: string,
     assistantMessageIndex?: number,
   ): boolean;
-  sendReasoning(peerId: string, id: string, turnId: string, text: string): boolean;
+  /**
+   * `final` marks the frame that CLOSES this burst — the only one the journal
+   * records (#242 half 1). See the `reasoning` member of `OutboundWsMessage`.
+   */
+  sendReasoning(
+    peerId: string,
+    id: string,
+    turnId: string,
+    text: string,
+    final?: boolean,
+  ): boolean;
   sendToolActivity(
     peerId: string,
     activity: {
@@ -153,7 +230,7 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendText(_peerId: string, _text: string, _id?: string, _turnId?: string, _assistantMessageIndex?: number): boolean { return false; }
   sendProgress(_peerId: string, _id: string, _text: string, _turnId?: string): boolean { return false; }
   finalizeDraft(_peerId: string, _id: string, _text: string, _turnId?: string, _assistantMessageIndex?: number): boolean { return false; }
-  sendReasoning(_peerId: string, _id: string, _turnId: string, _text: string): boolean { return false; }
+  sendReasoning(_peerId: string, _id: string, _turnId: string, _text: string, _final?: boolean): boolean { return false; }
   sendToolActivity(_peerId: string, _activity: { id: string; turnId: string; name?: string; phase?: string; status?: string; summary?: string; argKeys?: string[] }): boolean { return false; }
   sendTurnSettled(_peerId: string, _turnId: string, _outcome: "ok" | "error"): boolean { return false; }
   sendTurnSnapshot(_peerId: string, _turnId: string, _answers: Array<{ id: string; text: string }>, _remove: string[]): boolean { return false; }

@@ -47,12 +47,75 @@ because the thing it names does not exist. The correction:
   - `delivery-journal.sqlite`, plus its `-wal`, `-shm` and `-journal` sidecars
     (the last only on volumes where WAL is unavailable) — the v6 delivery
     journal, opened at account start unconditionally, with no config to
-    disable it. It holds message **plaintext**, not ciphertext: `agent_message`
-    text, `progress` placements, and the `turn_snapshot` rows written at turn
-    end, all recorded on the egress path. Owner-only (0600) inside the 0700
-    tuple directory, and nothing ages out of it — this slice ships no retention
-    (that is #240, tracked with the operator-facing half in #290) — so it
-    accumulates for the life of the account.
+    disable it. It holds message **plaintext**, not ciphertext, written by
+    **two** seams:
+      - on the **EGRESS** path (`nats-channel.ts`'s `sendToPeer`): `agent_message`
+        text, `progress` placements, and the `turn_snapshot` rows written at
+        turn end — plus, **only for an account that has opted in**, the model's
+        REASONING text (#242 half 1; see the note below);
+      - on the **INGRESS** path (`ingress-dedupe.ts` → `journalEventForInboundUser`):
+        `kind:"user"` rows carrying **the message the user typed, verbatim**.
+        ⚠️ THIS ONE WAS MISSING FROM THIS LIST UNTIL 2026-08-27 AND IS THE ONE AN
+        OPERATOR IS LEAST LIKELY TO GUESS. An earlier revision said the journal's
+        contents were "all recorded on the egress path", which reads as "this
+        file holds what the agent said" — but doc §15.7 makes this plugin the
+        ONLY store for user messages, so every prompt your users sent is here in
+        the clear. `journal-history.ts` names both appenders; the runbook simply
+        did not.
+    Owner-only (0600) inside the 0700
+    tuple directory, and nothing ages out of it — no slice has shipped
+    retention (the pruning path is #299, the operator-facing procedure is
+    #290) — so it accumulates for the life of the account. This used to say
+    "that is #240"; #240 is history-from-the-journal plus the destructive
+    cutover, and neither of its two halves touches retention, so an operator
+    following that pointer would land on the wrong issue.
+
+    ⚠️ **REASONING IS OFF BY DEFAULT, AND IT IS AN OPT-IN — BUT READ THE CONTENT
+    WARNING BEFORE YOU TURN IT ON.** Nothing writes a reasoning row unless the
+    account sets `capabilities.reasoningDurable: true`. An earlier revision of
+    this runbook said rows are written unless an operator turns them off; that
+    is what stopped being true when #242 half 1 shipped the separate,
+    default-OFF switch, and the lever is now an opt-IN rather than an opt-out.
+    ⚠️ ONLY THAT HALF CHANGED. The same revision also said the rows accumulate
+    with **no user-visible benefit**, and that is STILL TRUE — see the paragraph
+    below, which says so in as many words. The default flipped; the value of
+    opting in did not.
+
+    ⚠️ **IT IS STILL A NEW CLASS OF CONTENT AT REST**, and that is the part an
+    operator needs when they DO turn it on. Be precise about what is new,
+    because an earlier revision was not: it said the other rows are "text the
+    user was shown", contrasting reasoning as the only thing quoting *user
+    data* — which is false, since the `kind:"user"` rows above already hold
+    every prompt verbatim. What is actually distinctive is that a reasoning row
+    is content **nobody ever chose to send**: the user's rows are what they
+    typed and the agent's rows are what it published, but reasoning is the
+    model's *private deliberation*, drafted on the assumption that it is
+    working notes. It routinely restates **tool output and file contents** that
+    appear in neither side of the conversation — a third source of material,
+    landing on disk from a surface that was never addressed to anyone. One row
+    per burst, stored verbatim — e.g.
+    `{"kind":"reasoning","id":"R1","turnId":"T","text":"…"}`.
+    The plugin's own `resolveReasoningEnabled` says the same thing about the
+    content ("reasoning can restate file contents, credentials, or the user's
+    own prompt to the least trusted surface this plugin serves") — that
+    judgement applies to bytes at rest, not only to a wire frame.
+
+    ⚠️ **DO NOT CONFUSE THE TWO KEYS.** `capabilities.reasoning` (default **ON**)
+    controls the ephemeral LIVE lane the widget renders; it writes nothing to
+    disk. `capabilities.reasoningDurable` (default **OFF**) is what puts the
+    content in this file. #113's default-ON was a decision to render a volatile
+    live lane, and it does not inherit to a decision to permanently record
+    plaintext to disk — which is exactly why they are two keys.
+
+    Before opting in, note what the opt-in currently buys: nothing ages out of
+    the journal (#299 is unshipped), and #242 **half 1 leaves the content
+    unreadable by any client** — the `history` wire frame cannot carry a
+    role-less message, so the projection drops it. Until half 2/3 lands you are
+    accumulating plaintext that no user can see. If you have already opted in
+    and want to stop, set `capabilities.reasoningDurable` back to `false` (any
+    present value other than boolean `true` also fails closed — see
+    `resolveReasoningDurable`); the data-minimization note below applies to the
+    rows already written.
 
     **K does not seal this file, and rotating K does not touch it.**
     `sendToPeer` journals the payload *before* `sealEnvelope` runs, so K covers
@@ -75,7 +138,14 @@ because the thing it names does not exist. The correction:
     shadow store.
   - legacy migration artifacts under `$HOME/.openclaw-webchannel/`.
 
-  That is the complete list. Nothing on it is a ciphertext store to invalidate:
+  That is the complete list of FILES, and — since the correction above — of the
+  content classes inside the journal too. ⚠️ TREAT THAT SECOND CLAIM AS THE
+  FRAGILE ONE. This list has now been wrong twice in the same direction: once
+  when the journal itself was added, and once when it named only the egress
+  seam and silently omitted every message users typed. An operator running the
+  §0.1 exposure assessment reads this sentence and stops, so a slice that
+  teaches either seam to write a new kind must edit THIS list in the same
+  change. Nothing on it is a ciphertext store to invalidate:
   the one file holding conversation content, `delivery-journal.sqlite`, holds it
   in the clear, so the only lever over it is deletion, not invalidation.
 - **Rotating K does not disconnect anyone and does not revoke anything.** It is

@@ -40,6 +40,7 @@ import type { DeliveryJournal } from "./delivery-journal.js";
 import {
   isIdlessDurableFrame,
   journalEventForOutbound,
+  type JournalPolicy,
   journalFailureDiagnostic,
 } from "./delivery-journal-event.js";
 
@@ -165,6 +166,18 @@ export type NatsChannelLimits = {
 export type NatsChannelDurability = {
   /** v6 delivery journal (#239). Absent = no journaling (tests, legacy plaintext mode). */
   deliveryJournal?: DeliveryJournal;
+  /**
+   * #242 half 1: does this account journal REASONING content
+   * (`capabilities.reasoningDurable`)? Absent = NO, which is the shipped
+   * default — see `account-config.ts`'s `resolveReasoningDurable` for why this
+   * is a separate switch from the default-ON live lane.
+   *
+   * Resolved ONCE at account start and carried here, alongside the journal it
+   * governs, rather than read from config per frame: `sendToPeer` is on the hot
+   * egress path, and a policy that can change under a live channel is the same
+   * split-conversation hazard the journal itself is constructor-only to avoid.
+   */
+  reasoningDurable?: boolean;
 };
 
 /** S2 defaults — high enough that normal operation never evicts. */
@@ -314,6 +327,22 @@ export class NatsChannel implements WebChannelPeerChannel {
    */
   private readonly deliveryJournal: DeliveryJournal | null;
   /**
+   * #242 half 1: the per-account journaling policy, resolved once at account
+   * start, in the shape the mapper takes.
+   *
+   * ⚠️ THAT IS NOT "the mapper can gain a field without this class gaining one",
+   * which an earlier revision claimed — `NatsChannelDurability` carries a FLAT
+   * `reasoningDurable?: boolean` and the constructor rebuilds the object key by
+   * key, so a second policy field is an edit here either way. Holding the mapper's
+   * own type buys one real thing and it is smaller: the value handed to
+   * `journalEventForOutbound` is constructed once, not per frame.
+   *
+   * `readonly`, like the journal beside it, and for the same reason: a policy
+   * that flipped mid-life would split one conversation into a journaled half and
+   * an unjournaled half, with nothing recording where the seam is.
+   */
+  private readonly journalPolicy: JournalPolicy;
+  /**
    * Bounded, content-free warning state, one entry per FIXED category. Same
    * shape as `lastResultLimitWarningAt`/`suppressedResultLimitWarnings` above,
    * just keyed — see `warnDeliveryJournal`.
@@ -371,6 +400,10 @@ export class NatsChannel implements WebChannelPeerChannel {
     this.maxSeenMessageIdsPerPeer =
       limits?.maxSeenMessageIdsPerPeer ?? DEFAULT_MAX_SEEN_MESSAGE_IDS_PER_PEER;
     this.deliveryJournal = durability?.deliveryJournal ?? null;
+    // `=== true`, not `?? false`: a non-boolean reaching here (a hand-built
+    // durability object in a test, a future caller) must fail CLOSED, matching
+    // `resolveReasoningDurable`'s own rule for a present malformed value.
+    this.journalPolicy = { reasoningDurable: durability?.reasoningDurable === true };
 
     // Retain the exact listener identity so account teardown can detach it.
     this.transportMessageListener = (msg: NatsMessage) => {
@@ -577,8 +610,26 @@ export class NatsChannel implements WebChannelPeerChannel {
     return this.sendText(peerId, text, id, turnId, assistantMessageIndex);
   }
 
-  sendReasoning(peerId: string, id: string, turnId: string, text: string): boolean {
-    return this.sendToPeer(peerId, { type: "reasoning", id, turnId, text });
+  /**
+   * #242 half 1: `final` marks the burst-closing frame — the ONE `reasoning`
+   * frame `journalOutbound` turns into a durable row. The key is omitted when
+   * the flag is absent/false so a live draft frame is byte-identical to what it
+   * was before the flag existed.
+   */
+  sendReasoning(
+    peerId: string,
+    id: string,
+    turnId: string,
+    text: string,
+    final?: boolean,
+  ): boolean {
+    return this.sendToPeer(peerId, {
+      type: "reasoning",
+      id,
+      turnId,
+      text,
+      ...(final === true ? { final: true } : {}),
+    });
   }
 
   sendToolActivity(
@@ -916,11 +967,24 @@ export class NatsChannel implements WebChannelPeerChannel {
     // live and will never be used again. `journal_placement_once` cannot collapse
     // them (different `message_id` each time), and at #240 replay every one
     // becomes a phantom empty bubble: N8 in the GAINING direction, at an
-    // unbounded rate, manufactured entirely by us. A refusal also loses nothing
-    // by not being journaled — the text is already gone from the client's view
-    // (a `false` return makes `message-adapter.ts` record a delivery failure,
-    // and a thrown send moves the message to `failed`, never re-sent), so a row
-    // for it would only make history show what live never showed.
+    // unbounded rate, manufactured entirely by us.
+    //
+    // ⚠️ EVERYTHING ABOVE IS SCOPED TO THE PLACEMENT PATH, AND IT IS THE ONLY
+    // ARGUMENT THIS DOCBLOCK MAKES. It used to close with a general one — "a
+    // refusal loses nothing by not being journaled; the text is already gone
+    // from the client's view, so a row would only make history show what live
+    // never showed". #242 half 1 falsified that by giving the funnel a second
+    // durable kind: a refused reasoning CLOSE frame carries `lastDeliveredText`,
+    // text the transport ACCEPTED and the peer is still rendering, and the
+    // delivery-failure bookkeeping the parenthetical relied on is bubble/
+    // placement state that reasoning frames have none of.
+    //
+    // The refused-send question is therefore NOT settled by this docblock, and
+    // the position of the hook is not the same thing as a reason it must stay.
+    // The GENERAL reason lives in exactly one place — `message-adapter.ts`'s
+    // `lastDeliveredText` declaration, which carries the mechanism and both
+    // retracted rationales. **#304** is the open residual. Do not restate it
+    // here; four restatements of it have already shipped wrong.
     //
     // The window §16.2-2 actually describes is the one that REMAINS: `sealEnvelope`
     // or `transport.publish` throwing after this line, so the record is committed
@@ -1077,7 +1141,7 @@ export class NatsChannel implements WebChannelPeerChannel {
 
       // `null` = this frame is not (or not yet) a durable message. The mapper
       // owns that verdict and documents every case; do not second-guess it here.
-      const event = journalEventForOutbound(payload);
+      const event = journalEventForOutbound(payload, this.journalPolicy);
       if (!event) return;
 
       // D1 — THE CONVERSATION ID IS THE `peerId`. The journal FILE is already

@@ -504,6 +504,132 @@ export function resolveReasoningEnabled(accountConfig: WebchannelAccountConfig):
   return (capabilities as { reasoning?: unknown }).reasoning === true;
 }
 
+/**
+ * Resolve whether reasoning content is DURABLE — journaled to disk — for an
+ * account (#242 half 1). Reads `capabilities.reasoningDurable`.
+ *
+ * DEFAULT **OFF**. An absent key, an absent container, and every malformed
+ * shape all resolve `false`; only a plain object carrying literal boolean `true`
+ * as an OWN property opens it.
+ *
+ * ⚠️ THIS IS A SECOND SWITCH ON PURPOSE, AND MERGING IT BACK INTO
+ * `capabilities.reasoning` IS THE MISTAKE THIS DOCBLOCK EXISTS TO PREVENT.
+ * **#113's default-ON was a decision to render a volatile live lane, and it does
+ * not inherit to a decision to permanently record plaintext to disk.** Those are
+ * two different questions with two different blast radii:
+ *  - the LANE is ephemeral. It is drawn, the turn ends, the client's own
+ *    `state.reasoning` is capped and eventually dropped, and nothing survives a
+ *    reload. Defaulting it ON costs a UI section;
+ *  - the JOURNAL is permanent plaintext on disk. `resolveReasoningEnabled` one
+ *    function up already treats this content as sensitive for the SAME reason,
+ *    in its own words: reasoning "can restate file contents, credentials, or the
+ *    user's own prompt to the least trusted surface this plugin serves". Add
+ *    TOOL OUTPUT to that list for the durable case — it is the material most
+ *    likely to appear in deliberation and in neither side of the conversation —
+ *    and note there is no retention path yet (**#299** is unshipped), so nothing
+ *    ages out.
+ *
+ * ⚠️ AND THE BENEFIT SIDE IS CURRENTLY ZERO, WHICH IS WHAT DECIDES IT. #242
+ * half 1 is server-side only: `journal-history.ts` drops reasoning when it
+ * builds the `history` frame, because `HistoryMessage.role` cannot express a
+ * role-less message. So until half 2/3 lands there is NO client that can read
+ * these rows back. A window with a real cost and zero benefit has no trade-off
+ * to weigh, so it takes the cheapest reversible direction: off, with an
+ * operator opt-IN. Revisit the default when half 2/3 makes the content
+ * readable — that is when this argument expires, not before.
+ *
+ * ⚠️ SEPARATE SWITCH, BUT NOT AN INDEPENDENT ONE — THE DEPENDENCY RUNS ONE WAY
+ * AND IT IS SILENT. This resolver's `true` is NECESSARY BUT NOT SUFFICIENT.
+ * `inbound.ts` builds `createReasoningDraftController` only when
+ * `resolveReasoningEnabled` (plus `!controlLane` and no session `/reasoning
+ * off`) says the LANE is open, and the journal hook sits on the outbound frame
+ * funnel — so with the lane closed there are no `reasoning` frames to map, and
+ * `capabilities.reasoningDurable: true` writes ZERO ROWS with no warning. The
+ * opted-in-lane-received-nothing diagnostic does not fire either; it only
+ * watches lanes that OPENED.
+ *
+ * So "record the deliberation but do not stream it to browser peers" is NOT a
+ * configuration these two keys can express, and the asymmetry is inherent
+ * rather than incidental: durability is recorded AT THE DELIVERY ACT, which is
+ * the whole principle (doc §0, and NOT-list N6b/N6c forbids a second journal
+ * hook inside the controller to route around it). Changing it is a design
+ * question, not a flag.
+ *
+ * The two keys ARE independent in the direction that matters for the decision
+ * below — lane ON + durable OFF is the default and is fully supported — and
+ * they are independent at THIS function's boundary, which is all
+ * `manifest-schema.test.ts`'s hydration case asserts. Do not read that test as
+ * saying the runtime honours every combination.
+ *
+ * ── WHY THIS IS SHORTER THAN `resolveReasoningEnabled`, AND WHAT MUST STAY ──
+ *
+ * That function's longer ladder — the separate `capabilities === undefined`
+ * arm, the "only an omitted container gets the default" comment — exists because
+ * its default is ON: there, mistaking a malformed container for an absent one
+ * would ERASE AN INHERITED OPT-OUT and leak the lane back on. Here the default
+ * is OFF, so every one of those paths already lands on `false` and writing them
+ * out separately would be branch structure with no behaviour behind it.
+ *
+ * ⚠️ TWO OF ITS GUARDS MUST SURVIVE, BUT THEY DO NOT DO WHAT AN EARLIER REVISION
+ * OF THIS DOCBLOCK CLAIMED. That revision said the PROTOTYPE CHECK is what stops
+ * "a poisoned `Object.prototype` (or a class instance whose prototype declares
+ * it)" from supplying `reasoningDurable: true` through the chain. It is not —
+ * the OWN-property test below already blocks both, and would block them with the
+ * prototype check deleted. MEASURED against that exact counterfactual:
+ *
+ *   capabilities                                    shipped | no prototype check
+ *   Object.create({reasoningDurable:true})           false  | false
+ *   class instance, PROTOTYPE declares it            false  | false
+ *   plain {} under a poisoned Object.prototype       false  | false
+ *   class instance with an OWN reasoningDurable=true false  | TRUE
+ *
+ * So the prototype check contributes EXACTLY ONE behaviour, and it is the last
+ * row: it refuses an explicit, OWN-property opt-in carried on an object whose
+ * prototype is not plain. Nothing about inheritance.
+ *
+ *  - the PROTOTYPE CHECK, kept for the reason that is actually true: this is a
+ *    CONFIG boundary, and config is JSON. A `Date`, a class instance, a `Map` —
+ *    anything with a non-plain prototype — cannot have come from a parsed
+ *    config file, so whatever produced it did something this resolver has no
+ *    model of. Refusing the whole container is the right posture for a switch
+ *    that turns on plaintext-at-rest; "it carries the key, so honour it" is not.
+ *    It is a shape check, not an inheritance defence.
+ *  - `Object.prototype.hasOwnProperty.call`, which IS the inheritance defence and
+ *    is doing that work alone. A bare `capabilities.reasoningDurable` read walks
+ *    the prototype chain, so this is what stops a poisoned `Object.prototype`
+ *    from opting every account in. It is `.call`ed off `Object.prototype` rather
+ *    than invoked as a method because `capabilities` may be a null-prototype
+ *    record, which has no `hasOwnProperty` of its own.
+ *
+ * `account-config.test.ts`'s prototype-chain case already attributed these
+ * correctly — its case (b) says the poisoned-`Object.prototype` shape "is
+ * carried entirely by the OWN-property test". The two files now agree; when they
+ * disagreed, the test was right.
+ *
+ * A null prototype is ACCEPTED (`Object.create(null)` is the safest plain record
+ * there is, and it is what a hardened config loader produces); what is refused
+ * is a prototype that is neither `Object.prototype` nor absent.
+ */
+export function resolveReasoningDurable(accountConfig: WebchannelAccountConfig): boolean {
+  const capabilities = accountConfig?.capabilities;
+  // `typeof null === "object"`, so null is excluded explicitly; `undefined`
+  // falls out of the `typeof` test and needs no arm of its own under a
+  // default-OFF gate.
+  if (
+    capabilities === null ||
+    typeof capabilities !== "object" ||
+    Array.isArray(capabilities)
+  ) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(capabilities);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  if (!Object.prototype.hasOwnProperty.call(capabilities, "reasoningDurable")) {
+    return false;
+  }
+  return (capabilities as { reasoningDurable?: unknown }).reasoningDurable === true;
+}
+
 /** Read an account's merged `nats` config block (for credential-source resolution). */
 export function resolveAccountNatsConfig(
   cfg: unknown,

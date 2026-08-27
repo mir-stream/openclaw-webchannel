@@ -14,10 +14,23 @@
  * NO runtime consumer, proven equivalent to the then-current client behavior
  * first; the client render was rewired onto it in the slice after #238, and is
  * now its FIRST runtime consumer — `nats-client-wrapper.ts`'s `applyDurable`
- * (…:2011) projects `state.messages`, applies one event here, and merges the
- * result back. Each of the four transitions has its own EQUIVALENCE ANCHOR in
+ * projects `state.messages`, applies one event here, and merges the
+ * result back. Four of the five transitions have their own EQUIVALENCE ANCHOR in
  * `durable-view-reducer.test.ts`, which drives the REAL `WebChannelNATSClient`
  * with the REAL wire frames and compares against this reducer's output.
+ *
+ * ⚠️ `reasoning` HAS NO ANCHOR, AND CANNOT HAVE ONE YET. #242 half 1 makes
+ * reasoning durable on the SERVER side only: the plugin journals one row per
+ * burst (for an account that opted in — `capabilities.reasoningDurable`,
+ * default OFF), this reducer folds it, and `journal-history.ts` replays it.
+ * The CLIENT
+ * still renders reasoning out of its own `state.reasoning` array
+ * (`upsertReasoning`) and routes no `reasoning` frame through this file, so
+ * there is no second implementation to compare against — an "anchor" would only
+ * drive the wrapper's unrelated array. `applyReasoning` is instead a documented
+ * port of that method, and the ONE deliberate difference (the live `.slice(-100)`
+ * cap) is recorded at the transition. Half 2 moves the client onto this reducer;
+ * that is when the anchor becomes possible and when the divergence closes.
  *
  * ⚠️ THE ANCHORS' EVIDENTIAL VALUE CHANGED WHEN THE CLIENT BECAME THE CONSUMER.
  * While the client had its own hand-rolled reconciliation they were genuinely
@@ -61,22 +74,26 @@
  * ⚠️ ARRAY IDENTITY IS NOT A GENERAL NO-OP SIGNAL. Some transitions hand the
  * input array straight back when nothing durable changed, and some always
  * allocate. Measured. The three SAME-array rows are EXHAUSTIVE — they are every
- * path in this file that returns its input by reference. The two NEW-array rows
+ * path in this file that returns its input by reference. The three NEW-array rows
  * are illustrative examples, not an enumeration: allocation is the default here,
  * so any PATH not listed among the first three allocates. (Path, not
  * transition: `placement` and `seal` each have paths on BOTH sides of the
- * divide, even though only `seal` happens to have a row in each section below.)
+ * divide, even though only `seal` happens to have a row in each section below.
+ * `reasoning` has NO path in the first section — see its row.)
  *   - `placement`, repeat claim whose turnId resolves unchanged  → SAME array
  *   - `seal`, early return (no valid answers and no removes)     → SAME array
  *   - `seal`, empty/blank turnId early return                    → SAME array
  *   - `bubble` with identical text and turnId                    → NEW array (e.g.)
  *   - `seal` whose answers change nothing                        → NEW array (e.g.)
- * The last two ALWAYS allocate (see `applyBubble` and `applySeal`'s tail); they
+ *   - `reasoning` REPEATING its id, turnId and text              → NEW array (e.g.)
+ * The last three ALWAYS allocate (see `applyBubble`, `applySeal`'s tail, and
+ * `applyReasoning` — BOTH of the latter's paths allocate, so it contributes no
+ * row to the exhaustive section above); they
  * do not detect no-ops, and teaching them to would be a behavior change this
  * slice does not need. So do NOT build a `prev === next` memo, a
  * `useSyncExternalStore` equality check, or any render skip on array identity —
  * it is sound only as "same ref ⇒ definitely unchanged", never as
- * "different ref ⇒ changed". `durable-view-reducer.test.ts` pins all five rows
+ * "different ref ⇒ changed". `durable-view-reducer.test.ts` pins all six rows
  * above, the negative cases included, so the next reader measures instead of
  * assuming.
  *
@@ -85,12 +102,15 @@
  * `kind` falls off the end and returns `undefined` while the signature declares
  * `DurableView`; the NEXT event then throws — `Cannot read properties of
  * undefined (reading 'findIndex')` for a `placement`/`bubble` — pointing at the
- * WRONG event. That is unreachable today, and MEASURED rather than assumed:
- * adding a fifth kind to `DurableEvent` fails tsc at this function's signature
- * with `error TS2366: Function lacks ending return statement and return type
- * does not include 'undefined'`, so the forgotten-case path BOUNDARY 2
- * anticipates cannot ship. The client consumer only ever constructs events from
- * the four wire frames it already handles, so the ONE surviving path is RUNTIME
+ * WRONG event. That is unreachable today, and the claim is no longer a
+ * measurement someone once took — #242 half 1 RAN the experiment by actually
+ * adding a kind, and it behaved as written: `reasoning` failed tsc at this
+ * function's signature with `error TS2366: Function lacks ending return
+ * statement and return type does not include 'undefined'` until its `case` was
+ * added, so the forgotten-case path BOUNDARY 2 anticipates cannot ship. The
+ * client consumer still only ever constructs events from the four wire frames it
+ * already handles (`reasoning` is journaled and folded SERVER-side in half 1;
+ * the client does not route it here), so the ONE surviving path is RUNTIME
  * VERSION SKEW — an older build replaying a journal a newer build wrote.
  *
  * ⚠️ THAT PATH IS NO LONGER HYPOTHETICAL, AND SOMETHING NOW STANDS IN FRONT OF
@@ -102,14 +122,22 @@
  * genuinely reaches that consumer's hands. What keeps it out of THIS function is
  * `isKnownJournalEvent` there: a `Record<DurableEvent["kind"], true>`-derived
  * filter that counts such rows into `unsupportedEvents` and never folds them.
- * The remaining precondition is only #241 (a kind outside the four).
+ *
+ * ⚠️ AND THE LAST PRECONDITION IS NOW MET — BY THIS SLICE, NOT BY #241. This used
+ * to end "the remaining precondition is only #241 (a kind outside the four)".
+ * #242 half 1 added `reasoning`, so a journal written by a build that has it and
+ * replayed by a build that does not is a REAL five-versus-four skew, not a
+ * prediction about a slice nobody has started. `isKnownJournalEvent` is
+ * therefore load-bearing for an event kind that exists TODAY. What #241 still
+ * owns is the answer (retain + render as unsupported); what it no longer owns is
+ * the arrival of the first skewable kind.
  *
  * So the next journal consumer must not re-derive this hazard from scratch: the
  * `default`-less switch is still deliberate HERE, and the guard belongs at the
  * consumer, exactly as `journal-history.ts` does it. Both obvious fixes are still
  * wrong, in the spirit of §0.2:
  *   - `default: return view;`, mirroring `handleFrame`'s ignore-unknown
- *     (nats-client-wrapper.ts:2293 — which has no `default:` either; it returns
+ *     (the wrapper's `handleFrame` — which has no `default:` either; it returns
  *     `void`, so falling off the end IS its ignore) — REJECTED. That
  *     faithfulness is about LIVE WIRE FRAMES, where ignoring a frame from a
  *     newer server is right. A JOURNAL REPLAY is the opposite: the store is the
@@ -120,8 +148,9 @@
  * The real answer is RETAIN + RENDER AS UNSUPPORTED: keep the slot and show
  * "this message is not supported by your version — please update", exactly as
  * the Telegram app does (our plugin = the Telegram plugin + the Telegram
- * server; our client = the Telegram app). A four-member CLOSED union cannot
- * express that, so it is owned by #241 (typed event model) and #246 (protocol
+ * server; our client = the Telegram app). A CLOSED union cannot
+ * express that — five members no more than four — so it is owned by #241 (typed
+ * event model) and #246 (protocol
  * version + runtime wire validation), NOT by this slice. Do not add a `default`
  * here to silence a reviewer: the absence is deliberate, and this is the reason.
  * (doc `docs/ISSUE_114_DELIVERY_MIRROR_PLAN.md` §0.2 — the NOT-list.)
@@ -143,59 +172,139 @@
  * `journal-history.ts` with the plugin build's own flags
  * (`esbuild --bundle --platform=node --format=esm --packages=external`) INLINES
  * this module and leaves no unresolved import, because `--packages=external`
- * externalises bare specifiers only and this is a relative path. #240 half 1
- * gives that module no caller, so the reducer is not in `dist/index-nats.js`
- * YET — half 2's wiring puts it there. A `node:` import added here would then
- * break the plugin's BUNDLE, not merely its test suite.
+ * externalises bare specifiers only and this is a relative path.
+ *
+ * ⚠️ AND IT IS IN THE SHIPPED BUNDLE NOW — THIS SENTENCE USED TO SAY "YET". It
+ * read "#240 half 1 gives that module no caller, so the reducer is not in
+ * `dist/index-nats.js` YET — half 2's wiring puts it there." Half 2 landed, and
+ * the wiring is real: `index-nats.ts` → `nats-account-runtime.ts` →
+ * `history-serve.ts` → `journal-history.ts` → this module, all production
+ * source. MEASURED after `npm run build -w packages/plugin`:
+ * `grep -c "applyReasoning\|projectJournalHistory" dist/index-nats.js` → 5.
+ * So a `node:` import added here does not "then" break the plugin's bundle at
+ * some future wiring step — it breaks the SHIPPED artifact today, not merely
+ * the test suite.
  *
  * The `seal` transition WAS a line-for-line port of the wrapper's private
  * `applyTurnSnapshot`; that body has since been deleted and the wrapper's method
- * (nats-client-wrapper.ts:1546-1573) is now only the frame→event mapper that
+ * of that name is now only the frame→event mapper that
  * calls it. There is one implementation of the reconciliation, and it is here.
  */
 
 export type DurableRole = "user" | "agent";
 
 /**
- * The durable subset of one `ChatMessage`. Client-local fields are excluded.
+ * The durable subset of one delivered message. Client-local fields are excluded.
+ *
+ * ⚠️ A DISCRIMINATED UNION ON `kind`, NOT ONE RECORD — #242, doc §16.2-5. §15.9's
+ * durable set is not one shape: an answer/user bubble has an author (`role`), a
+ * reasoning block does not. Widening the single record with an optional `role`
+ * was the alternative and is the worse one: every consumer would then have to
+ * decide what an absent `role` means at the point it renders, which is exactly
+ * the "infer identity from a missing field" habit the v6 redesign exists to
+ * remove. A tag makes the two cases impossible to confuse and makes a consumer
+ * that forgot one a COMPILE error.
+ *
+ * ⚠️ THE REASONING VARIANT HAS NO `role`, AND THAT IS NOT AN OVERSIGHT TO FIX.
+ * The wire frame carries none (`channel-contract.ts`'s `reasoning` member is
+ * `{ id, turnId, text }` plus #242's `final` flag), so any value here would be
+ * INVENTED — a fabricated claim inside the SSOT, which is the N8 shape. How a
+ * reasoning message renders is half 2's decision, made where the render is.
+ *
+ * `turnId` is REQUIRED on the reasoning variant and optional on the text one,
+ * again following the wire: the `reasoning` frame types `turnId: string`, and
+ * the client's `case "reasoning"` DROPS a frame that lacks it, so a reasoning
+ * message without a turnId is not a state either side can be in.
  *
  * `readonly` is load-bearing, not decoration: every transition below returns a
  * STRUCTURALLY SHARED view — unchanged entries are the SAME object references as
  * in the input, and some transitions return the input array itself (see the
  * array-identity table in the file header; it is a partial, not a general,
  * property). The client consumer computes `merge(view, overlay)`
- * (`nats-client-wrapper.ts`'s `mergeDurable`, …:1944), and an in-place overlay
+ * (`nats-client-wrapper.ts`'s `mergeDurable`), and an in-place overlay
  * write on a shared entry would retroactively mutate a view some other holder
  * already observed. The type makes that a compile error instead of a heisenbug.
  * It does NOT forbid the consumer handing an UNCHANGED bubble back by reference
  * — that is structural sharing, the same discipline this file follows, and the
  * wrapper's suite pins it with `.toBe`.
  */
-export interface DurableMessage {
-  readonly id: string;
-  readonly role: DurableRole;
-  readonly text: string;
-  readonly turnId?: string;
-}
+export type DurableMessage =
+  | {
+      readonly kind: "text";
+      readonly id: string;
+      readonly role: DurableRole;
+      readonly text: string;
+      readonly turnId?: string;
+    }
+  | {
+      readonly kind: "reasoning";
+      readonly id: string;
+      readonly turnId: string;
+      readonly text: string;
+    };
+
+/** The `text` variant, named so the transitions that only handle it can say so. */
+export type DurableTextMessage = Extract<DurableMessage, { kind: "text" }>;
 
 export type DurableView = readonly DurableMessage[];
+
+/**
+ * The index of the TEXT entry holding `id`, or -1.
+ *
+ * ⚠️ THE `kind` TEST IS WHAT KEEPS A `seal`/`bubble`/`placement` OFF A REASONING
+ * BLOCK. `user`, `placement`, `bubble` and `seal` all address ANSWER/USER
+ * bubbles by id; `reasoning` addresses reasoning blocks by id, and these guards
+ * are what keep the two id spaces from meeting IN THE VIEW.
+ *
+ * ⚠️ "IN THE VIEW" IS THE WHOLE SCOPE OF THAT CLAIM. The two spaces DO meet one
+ * layer out, in `journal-history.ts`'s `firstSeenMs`, which is keyed by id
+ * across every kind and is first-write-wins — so a reasoning burst id colliding
+ * with a later user id would hand the earlier `ts` to the bubble. That is
+ * bounded, not broken, and `recordFirstSeen`'s docblock is where the bound is
+ * argued (`ts` is hydration metadata; nothing orders on it). Cited here so the
+ * enumeration below is not read as covering the whole system.
+ *
+ * ⚠️ DO NOT ARGUE THIS FROM ID SHAPES — THAT ARGUMENT WAS TRIED AND IS FALSE.
+ * An earlier revision said a collision is unarrangeable because reasoning ids
+ * come from `nextMessageId()`. Both halves fail: AGENT ANSWER ids come from the
+ * SAME `nextMessageId()` (`delivery-journal-event.ts`'s `isUsableMessageId`
+ * docblock says so), so the shapes are identical rather than disjoint; and USER
+ * ids are CLIENT-SUPPLIED, validated only as a non-empty string within
+ * `MAX_INBOUND_USER_ID_LENGTH`, so a peer can send `webchannel-…` verbatim. The
+ * conclusion survives, but only because it never depended on the ids.
+ *
+ * The guards are the whole argument, and they hold whatever an id looks like: a
+ * `seal.remove` naming a reasoning id does not delete it, a `bubble` sharing an
+ * id does not overwrite it, and `applySeal`'s permutation leaves the reasoning
+ * block in its exact slot. Without them a collision would let an answer frame
+ * overwrite, or a `seal.remove` DELETE, a delivered reasoning block (N10,
+ * content loss); with them the worst case is a duplicated id in the view, which
+ * is visible and recoverable. This project's own ordering says a visible
+ * duplicate beats a deletion (`message-adapter.ts`'s M212g note). The reducer
+ * test file drives both collisions and pins the outcome.
+ */
+function findTextIndex(view: DurableView, id: string): number {
+  return view.findIndex((m) => m.kind === "text" && m.id === id);
+}
 
 /**
  * The ordered event stream the plugin would journal. Each event corresponds to a
  * real wire frame the client consumes today — the shapes below were read off
  * `packages/plugin/src/channel-contract.ts` (`OutboundWsMessage`) and the
- * wrapper's `handleFrame` cases (…:2293 — `handleMessage` at …:2280 is the
+ * wrapper's `handleFrame` cases (`handleMessage` is the
  * outer entry point, which brackets that switch with the live-turn latch
- * observation and the release gate), and every transition is anchored against the
- * REAL client in `durable-view-reducer.test.ts`. What that covers is the four
- * kinds below; see the two BOUNDARY notes after the type for what it does not.
+ * observation and the release gate), and every transition EXCEPT `reasoning` is
+ * anchored against the REAL client in `durable-view-reducer.test.ts` (the
+ * exception, and why it cannot be anchored in half 1, is in the file header).
+ * What that covers is four of the five kinds below; see the two BOUNDARY notes
+ * after the type for what it does not.
  *
  *  - `user`      — a local user echo materialized once publication reserves its
  *                  wire id (`nextPublishedUserMessages` in the wrapper). This is
  *                  the durable subset of the u- bubble; an earlier held/deferred
  *                  row is client-local staging and is excluded from the input.
- *  - `placement` — a `progress` frame for a lane (case "progress",
- *                  nats-client-wrapper.ts:2701). The FIRST one CLAIMS the lane's
+ *  - `placement` — a `progress` frame for a lane (the wrapper's
+ *                  `case "progress"`). The FIRST one CLAIMS the lane's
  *                  slot (append at tail). The frame ALWAYS carries text —
  *                  `progress.text` is REQUIRED on the wire
  *                  (channel-contract.ts:66) and the live client renders it —
@@ -204,39 +313,65 @@ export type DurableView = readonly DurableMessage[];
  *                  it and the durable text is authored later by a `bubble` or
  *                  `seal`. The consumer keeps the two apart with the client-local
  *                  `ChatMessage.draftOnly` flag: the draft renders out of `text`,
- *                  while the wrapper's `durableProjection` (…:1870) contributes
+ *                  while the wrapper's `durableProjection` contributes
  *                  `""` for that bubble. §15.9 is thus enforced at the projection,
  *                  not merely asserted here.
  *                  `turnId` is OPTIONAL because the wire says so
- *                  (channel-contract.ts:66; nats-channel.ts:469 omits it when
- *                  falsy) and the client stores it verbatim. A required one would
+ *                  (channel-contract.ts:66; `NatsChannel.sendProgress` omits it
+ *                  when falsy) and the client stores it verbatim. A required one would
  *                  force a consumer to drop such a frame — losing the slot claim,
  *                  i.e. the [A,B]-vs-[B,A] ordering — or to invent a value.
  *  - `bubble`    — a durable agent frame: `agent_message`/final/independent
- *                  (case "agent_message", nats-client-wrapper.ts:2827).
+ *                  (the wrapper's `case "agent_message"`).
  *                  Upsert-by-id: update text in place if the id is held, else
  *                  append at tail.
- *  - `seal`      — the `turn_snapshot` frame (case "turn_snapshot",
- *                  nats-client-wrapper.ts:2822 → `applyTurnSnapshot`). Carries
+ *  - `seal`      — the `turn_snapshot` frame (the wrapper's
+ *                  `case "turn_snapshot"` → `applyTurnSnapshot`). Carries
  *                  BOTH `answers` and `remove` in one frame, exactly like the
  *                  wire (there is no standalone `remove` wire frame — remove
  *                  exists ONLY inside turn_snapshot, so it is modeled as a `seal`
  *                  field, not a separate event).
+ *  - `reasoning` — ONE COMPLETED reasoning burst (#242 half 1, doc §15.9). It
+ *                  mirrors the `reasoning` wire frame minus the `final` flag:
+ *                  by the time an event exists, `final` is what MADE it an
+ *                  event. Upsert-by-id, exactly like `bubble`.
+ *
+ *                  ⚠️ AN EVENT OF THIS KIND ONLY EXISTS FOR AN ACCOUNT THAT
+ *                  OPTED IN (`capabilities.reasoningDurable`, default OFF), so
+ *                  a journal with NO reasoning rows is the ordinary case, not
+ *                  evidence of a lost write. The gate is at the journaling
+ *                  seam, so the live lane is unaffected either way — do not
+ *                  infer anything about what the user SAW from what this
+ *                  stream contains.
+ *
+ *                  ⚠️ IT IS NOT ONE FRAME PER EVENT, AND THAT IS THE WHOLE
+ *                  DESIGN. `message-adapter.ts`'s `createReasoningDraftController`
+ *                  sends a `reasoning` frame for every cumulative update that
+ *                  changes the text — an exact repeat is its only no-op, and
+ *                  there is no throttle — each carrying the full text so far. One
+ *                  event per frame would be O(n²) bytes per burst and would
+ *                  multiply journal rows by orders of magnitude into an already
+ *                  quadratic replay (#286). So the controller emits ONE extra
+ *                  frame at burst close carrying `final: true`, and
+ *                  `journalEventForOutbound` records only that one — the same
+ *                  draft-versus-durable line §15.9 already draws between
+ *                  `progress` and `agent_message`, which reasoning simply had no
+ *                  equivalent of.
  *
  * ── BOUNDARY 1: a viewer-minted id must never enter the SHARED event stream ──
  *
  * `bubble.answerId` is mandatory, but the wire can deliver a durable agent frame
- * with NO id. `nats-channel.ts:456` is the ONLY producer of an `agent_message`
- * frame, and its `sendText` writes `...(id ? { id } : {})` (…:458), so the
+ * with NO id. `NatsChannel.sendText` is the ONLY producer of an `agent_message`
+ * frame, and it writes `...(id ? { id } : {})`, so the
  * id-less set is exactly the `sendText` callers that pass no `id`.
  *
  * ✅ THAT SET IS NOW EMPTY. #238 landed: all FOUR call sites this note used to
  * enumerate mint at the delivery act — `inbound.ts:1571-1581` (the ordinary
  * visible reply, both branches of the one ternary), `inbound.ts:1626-1631` (the
  * thrown-turn apology), `channel.ts:311` (the generic outbound), and
- * `nats-account-runtime.ts:1177-1182` (the /stop operator-allowlist notice).
- * `message-adapter.ts:158` passes `nextMessageId()` and `nats-channel.ts:483`
- * (`finalizeDraft`) requires an `id`, as they always did. The enumeration is kept
+ * `nats-account-runtime.ts`'s /stop operator-allowlist notice.
+ * `message-adapter.ts`'s `message.send.text` handler passes `nextMessageId()` and
+ * `NatsChannel.finalizeDraft` requires an `id`, as they always did. The enumeration is kept
  * in the past tense rather than deleted because "the count is four, not three"
  * was itself hard-won: an earlier revision said three and missed the /stop
  * notice, and a survivor would have been INVISIBLE to this module's anchors (an
@@ -266,11 +401,11 @@ export type DurableView = readonly DurableMessage[];
  * ⚠️ AND `""` IS STILL THE WRONG ANSWER. `bubble.answerId` must be NON-EMPTY;
  * `""` is NOT the encoding for "id-less". The trap is that the client's two id
  * sites use DIFFERENT falsiness, so the natural mapper is the broken one:
- *   - `progress` keys on `id ?? ""` (nats-client-wrapper.ts:2707) — NULLISH, so
+ *   - `progress` keys on `id ?? ""` (the wrapper's `case "progress"`) — NULLISH, so
  *     `""` SURVIVES as a real id. `placement` with `answerId: ""` is therefore
  *     FAITHFUL;
- *   - `agent_message` branches on `if (id)` (…:2834) — TRUTHY, so `""` falls
- *     into the mint branch at …:2869 and gets its own fresh `a-<n>`.
+ *   - `agent_message` branches on `if (id)` — TRUTHY, so `""` falls
+ *     into that case's `mintLocalBubbleId("a")` branch and gets a fresh `a-<n>`.
  * The two sites genuinely differ, and the live mapper preserves the difference
  * verbatim. A mapper writing `answerId: frame.id ?? ""` for the DURABLE frame —
  * the natural thing to write, because it mirrors the progress site — would make
@@ -314,19 +449,23 @@ export type DurableView = readonly DurableMessage[];
  * tests in `durable-view-reducer.test.ts` (they record what happens; they do not
  * endorse it).
  *
- * ── BOUNDARY 2: four kinds is TODAY'S wire, not the settled model ──
+ * ── BOUNDARY 2: five kinds is TODAY'S wire, not the settled model ──
  *
  * Doc §15.9 requires tool and reasoning messages to become DURABLE messages —
  * only pure indicators (the rolling progress draft, the typing flag) stay
- * ephemeral. So this event set will GROW. Do not read the four kinds as final
- * spec, and do not treat "it isn't in DurableEvent" as evidence that something
- * is non-durable by design (NOT-list N3/N7).
+ * ephemeral. So this event set will GROW; it already did once, and the rest of
+ * the growth is scheduled. #242 half 1 added `reasoning`; TOOL ACTIVITY and the
+ * APPROVAL frames are still `null` in `journalEventForOutbound`, marked "#242
+ * half 2" there, and are absent here for that reason and no other. Do not read
+ * the five kinds as final spec, and do not treat "it isn't in DurableEvent" as
+ * evidence that something is non-durable by design (NOT-list N3/N7).
  *
  * ── BOUNDARY 3: the `history` frame is durable but deliberately OUT OF SCOPE ──
  *
- * `channel-contract.ts:102` declares `{ type: "history"; messages: … }`, and it
+ * `channel-contract.ts`'s `OutboundWsMessage` declares
+ * `{ type: "history"; messages: … }`, and it
  * genuinely writes `state.messages` today — adoption plus ordered cursor
- * insertion, nats-client-wrapper.ts:2295-2492. It is nonetheless absent from
+ * insertion, in the wrapper's `case "history"`. It is nonetheless absent from
  * `DurableEvent`, and that absence is a DECISION, not an oversight: doc §15.9
  * places history outside the reducer ("reducer 밖(의도적) … workstream C")
  * because the current frame is reconnect / late-join RECONSTRUCTION — the client
@@ -347,7 +486,8 @@ export type DurableEvent =
       turnId: string;
       answers: Array<{ id: string; text: string }>;
       remove?: string[];
-    };
+    }
+  | { kind: "reasoning"; id: string; turnId: string; text: string };
 
 /**
  * STEP: apply exactly ONE journaled event to a durable view.
@@ -387,6 +527,8 @@ export function applyDurableEvent(
       return applyBubble(view, event);
     case "seal":
       return applySeal(view, event);
+    case "reasoning":
+      return applyReasoning(view, event);
   }
 }
 
@@ -409,12 +551,15 @@ function applyUser(
   view: DurableView,
   event: { id: string; text: string; turnId?: string },
 ): DurableView {
-  return [...view, { id: event.id, role: "user", text: event.text, turnId: event.turnId }];
+  return [
+    ...view,
+    { kind: "text", id: event.id, role: "user", text: event.text, turnId: event.turnId },
+  ];
 }
 
 /**
  * `progress` frame — upsert by id (the shape the wrapper's now-deleted
- * `upsertMessage` had; the mapper is `case "progress"`, …:2701):
+ * `upsertMessage` had; the mapper is the wrapper's `case "progress"`):
  *
  *  - an ABSENT id APPENDS a placeholder bubble at the tail — the slot claim, and
  *    the ORDERING mechanism: the lane's position is fixed by WHEN its first
@@ -433,9 +578,9 @@ function applyUser(
  * plugin never emits such a frame. Two guards are why:
  *   - `attemptProgress` refuses a lane frame once the lane is done
  *     (message-adapter.ts:1447-1455, `lane.closed || lane.settled`);
- *   - the provisional-preview path invalidates its scaffold writer before
- *     finalizing (message-adapter.ts:1727), so a late preview progress is
- *     dropped by the `scaffoldWriter !== "active"` check at …:1427.
+ *   - the provisional-preview path sets `scaffoldWriter = "invalidated"` before
+ *     finalizing, so a late preview progress is dropped by `attemptProgress`'s
+ *     `preview.scaffoldWriter !== "active"` check.
  *
  * If the plugin ever violates it, the live client and a journal replay DIVERGE:
  * `agent_message A "FINAL ANSWER"` followed by `progress A "Working…"` leaves the
@@ -446,7 +591,7 @@ function applyUser(
  *
  * ⚠️ IT STOPS THERE, AND THAT CAP IS DELIBERATE. The consumer refuses to ADD
  * `draftOnly` to a bubble that already exists without it (nats-client-wrapper.ts's
- * `case "progress"`, …:2701), so the mis-marked bubble is NOT droppable and
+ * `case "progress"`), so the mis-marked bubble is NOT droppable and
  * survives the turn end for a later `turn_snapshot` to repair. Without that guard
  * the same stray frame would delete a delivered answer outright — escalating a
  * display bug into content loss, against this project's own ordering that a
@@ -470,7 +615,7 @@ function applyUser(
  * via `draft-stream.ts:653-668` → `:634 api.deleteMessage`). So the reducer's
  * `""` is RIGHT and it was the LIVE side that was wrong: keeping the partial
  * draft forever was the bug, and the consumer's `draftOnly` drop
- * (nats-client-wrapper.ts's `isSpentDraft`, …:1909) fixes it. Both sides then
+ * (nats-client-wrapper.ts's `isSpentDraft`) fixes it. Both sides then
  * agree on "no bubble" and live==history holds.
  *
  * Still do not resolve it here by teaching the reducer to keep draft text — that
@@ -484,11 +629,19 @@ function applyPlacement(
   view: DurableView,
   event: { answerId: string; turnId?: string },
 ): DurableView {
-  const idx = view.findIndex((m) => m.id === event.answerId);
-  if (idx === -1) {
-    return [...view, { id: event.answerId, role: "agent", text: "", turnId: event.turnId }];
+  const idx = findTextIndex(view, event.answerId);
+  const prev = idx === -1 ? undefined : view[idx];
+  // `prev.kind !== "text"` CANNOT fire — `findTextIndex`'s predicate already
+  // decided it, and TS simply cannot carry a `findIndex` callback's narrowing to
+  // the element. It shares this branch rather than standing as its own assertion
+  // because both disjuncts say the same thing to this transition: no text entry
+  // holds this id, so the placement CLAIMS a fresh slot.
+  if (prev === undefined || prev.kind !== "text") {
+    return [
+      ...view,
+      { kind: "text", id: event.answerId, role: "agent", text: "", turnId: event.turnId },
+    ];
   }
-  const prev = view[idx];
   const turnId = event.turnId ?? prev.turnId;
   // Durable no-op (the draft churn is not durable) — return the SAME reference.
   if (turnId === prev.turnId) return view;
@@ -515,21 +668,104 @@ function applyBubble(
   view: DurableView,
   event: { answerId: string; text: string; turnId?: string },
 ): DurableView {
-  const idx = view.findIndex((m) => m.id === event.answerId);
-  if (idx === -1) {
-    return [...view, { id: event.answerId, role: "agent", text: event.text, turnId: event.turnId }];
+  const idx = findTextIndex(view, event.answerId);
+  const prev = idx === -1 ? undefined : view[idx];
+  // Same shape and same reason as `applyPlacement`'s: the second disjunct is
+  // unreachable and is how TS is told what `findTextIndex` already guaranteed.
+  if (prev === undefined || prev.kind !== "text") {
+    return [
+      ...view,
+      { kind: "text", id: event.answerId, role: "agent", text: event.text, turnId: event.turnId },
+    ];
   }
   const next = view.slice();
-  next[idx] = { ...next[idx], text: event.text, turnId: event.turnId ?? next[idx].turnId };
+  next[idx] = { ...prev, text: event.text, turnId: event.turnId ?? prev.turnId };
+  return next;
+}
+
+/**
+ * ONE COMPLETED reasoning burst — upsert by id: replace in place if the id is
+ * held (keeping its slot), else APPEND at the tail. The append is the SLOT
+ * CLAIM, and it is the entire point of routing reasoning through the reducer at
+ * all: a reasoning block gets a POSITION in the transcript rather than living in
+ * a side list with none.
+ *
+ * ⚠️ THE POSITION IS WHERE THE EVENT WAS APPENDED, WHICH IS NOT ALWAYS WHERE THE
+ * BURST WAS DELIVERED. An earlier revision said "where it was DELIVERED" flatly;
+ * that is true for a burst closed by `onReasoningEnd` (the controller's
+ * `endBurst`, which runs mid-turn) and FALSE for one still open at turn end.
+ * `inbound.ts` drains the answer draft — which emits the `turn_snapshot`, i.e.
+ * the `seal` row — and only then calls `reasoning?.stop()` from its `finally`,
+ * so a burst that streamed BEFORE the answer but never got a reasoning-end
+ * boundary is journaled AFTER the seal and replays at the TAIL, past the turn's
+ * answers.
+ *
+ * Not observable in #242 half 1 (`journal-history.ts` drops reasoning before the
+ * wire), and not fixable here — the repair is the ORDER of two calls in
+ * `inbound.ts`'s turn teardown, which is half 2's to make. Recorded so the next
+ * reader meets it as a known divergence rather than as a reducer bug.
+ *
+ * A PORT of the client's live `upsertReasoning` (`nats-client-wrapper.ts`),
+ * which does the same find-by-id / append-or-replace over `state.reasoning`.
+ * The replacement is WHOLESALE (a new object from the event's three fields),
+ * not a merge onto the previous entry, because that is what the live method
+ * does — `current.map((entry, i) => (i === idx ? item : entry))`.
+ *
+ * ⚠️ ONE DELIBERATE DIFFERENCE: THE LIVE `.slice(-100)` CAP IS NOT HERE. The
+ * client keeps the most recent 100 reasoning items and discards the rest; the
+ * durable view keeps all of them. Three reasons, and none of them is an
+ * oversight:
+ *  - a per-kind cap inside the DURABLE projection silently drops content that
+ *    was delivered (N10). A memory bound on a live UI surface and a bound on the
+ *    system of record are not the same decision;
+ *  - this view is already unbounded for text bubbles, so a cap on one kind only
+ *    would be a second, inconsistent bounding opinion about the same array;
+ *  - retention/pruning of the journal is #299's job, at the store, where it can
+ *    be one policy over everything rather than a number hidden in a transition.
+ *
+ * ⚠️ SO HALF 1 KNOWINGLY LEAVES A live≠history DIVERGENCE OPEN, AND IT IS
+ * BOUNDED. Past 100 reasoning blocks in one conversation the client's live list
+ * has dropped the oldest and a replay still has them. It is not reachable
+ * through this file today — the client does not feed `reasoning` here at all in
+ * half 1, it renders `state.reasoning` directly — so nothing in the client can
+ * observe the disagreement yet. Half 2 moves the client onto this reducer, which
+ * is what closes it — either by REMOVING the client cap, or by bounding BOTH
+ * sides at the store, where #299 already owns retention as one policy over
+ * everything. What it must not do is add a second, view-local cap here: that is
+ * the one option that drops delivered text (N10) while leaving the two sides
+ * still free to disagree. Do not "fix" this by capping.
+ *
+ * BOTH PATHS ALLOCATE. Like `applyBubble`, this does not detect a no-op: a
+ * `reasoning` event repeating its id, turnId and text still returns a new array.
+ * That is faithful to the live method (which always allocates) and keeps the
+ * header's SAME-array list exhaustive at three rows.
+ */
+function applyReasoning(
+  view: DurableView,
+  event: { id: string; turnId: string; text: string },
+): DurableView {
+  const entry: DurableMessage = {
+    kind: "reasoning",
+    id: event.id,
+    turnId: event.turnId,
+    text: event.text,
+  };
+  // Reasoning blocks are addressed among THEMSELVES — see `findTextIndex`'s
+  // docblock for why the two id spaces do not cross-match.
+  const idx = view.findIndex((m) => m.kind === "reasoning" && m.id === event.id);
+  if (idx === -1) return [...view, entry];
+  const next = view.slice();
+  next[idx] = entry;
   return next;
 }
 
 /**
  * `turn_snapshot` reconciliation — the ONE implementation. The wrapper's
- * `applyTurnSnapshot` (nats-client-wrapper.ts:1546-1573) is now only the
+ * `applyTurnSnapshot` is now only the
  * frame→event mapper that feeds this. The contract is EXPLICIT (never a blanket
  * drop):
- *  - `remove` ids are dropped;
+ *  - `remove` ids are dropped (ANSWER BUBBLES only — a seal never touches a
+ *    reasoning block; see step 1's note);
  *  - `answers` are upserted by id (existing bubble reused, absent id MINTED —
  *    #215 failed-frame recovery) then reordered into snapshot order among the
  *    slots answer bubbles already occupy — every non-answer bubble keeps its
@@ -564,12 +800,22 @@ function applySeal(
   //    Both branches produce a fresh MUTABLE working copy (`filter`/`slice` off a
   //    readonly array widen to `DurableMessage[]`), so steps 3-4 below may splice
   //    and assign freely without ever touching the caller's `view`.
+  //
+  //    ⚠️ EVERY id TEST IN THIS FUNCTION IS GUARDED BY `kind === "text"`. A
+  //    `turn_snapshot` reconciles the turn's ANSWER BUBBLES; it says nothing
+  //    about reasoning blocks, so neither `remove` nor `answers` may reach one.
+  //    Unreachable in practice (the id spaces do not collide — see
+  //    `findTextIndex`), and decided in the direction that cannot DELETE
+  //    delivered content if it ever were.
   const msgs: DurableMessage[] =
-    removeSet.size > 0 ? view.filter((m) => !removeSet.has(m.id)) : view.slice();
+    removeSet.size > 0
+      ? view.filter((m) => !(m.kind === "text" && removeSet.has(m.id)))
+      : view.slice();
 
   // 2. Desired answer objects, in authoritative order, reusing any existing
   //    bubble (so a live bubble's fields survive).
-  const existingById = new Map(msgs.map((m) => [m.id, m] as const));
+  const existingById = new Map<string, DurableTextMessage>();
+  for (const m of msgs) if (m.kind === "text") existingById.set(m.id, m);
   const desiredById = new Map<string, DurableMessage>();
   for (const a of answers) {
     const prev = existingById.get(a.id);
@@ -577,10 +823,12 @@ function applySeal(
       a.id,
       prev
         ? { ...prev, role: "agent", text: a.text, turnId }
-        : { id: a.id, role: "agent", text: a.text, turnId },
+        : { kind: "text", id: a.id, role: "agent", text: a.text, turnId },
     );
   }
   const answerIds = new Set(answers.map((a) => a.id));
+  const isAnswerSlot = (m: DurableMessage): boolean =>
+    m.kind === "text" && answerIds.has(m.id);
 
   // 3. Give every MINTED (not-yet-present) answer a slot next to its predecessor
   //    answer, so the reorder below is a pure permutation.
@@ -588,10 +836,10 @@ function applySeal(
     if (existingById.has(answers[k].id)) continue;
     let insertAt = msgs.length;
     if (k > 0) {
-      const predIdx = msgs.findIndex((m) => m.id === answers[k - 1].id);
+      const predIdx = findTextIndex(msgs, answers[k - 1].id);
       insertAt = predIdx === -1 ? msgs.length : predIdx + 1;
     } else {
-      const firstAnswer = msgs.findIndex((m) => answerIds.has(m.id));
+      const firstAnswer = msgs.findIndex(isAnswerSlot);
       if (firstAnswer !== -1) insertAt = firstAnswer;
     }
     msgs.splice(insertAt, 0, desiredById.get(answers[k].id)!);
@@ -601,7 +849,7 @@ function applySeal(
   //    among themselves; every non-answer bubble keeps its exact slot.
   const slots: number[] = [];
   msgs.forEach((m, i) => {
-    if (answerIds.has(m.id)) slots.push(i);
+    if (isAnswerSlot(m)) slots.push(i);
   });
   slots.forEach((pos, idx) => {
     msgs[pos] = desiredById.get(answers[idx].id)!;
@@ -618,11 +866,24 @@ function applySeal(
  * LIVE `state.messages` reads a rolling draft's partial text back as durable
  * content. Use `projectDurableFromClient` below for anything holding a live
  * client bubble; this one is for views that are already durable.
+ *
+ * ⚠️ IT PRODUCES ONLY `kind: "text"` ENTRIES, AND THAT IS RIGHT FOR HALF 1. Its
+ * input is the client's `state.messages` — the CHAT BUBBLE list, which holds no
+ * reasoning blocks: the client keeps those in a separate `state.reasoning` array
+ * and renders them from there (#242 half 2 is what changes that). So there is
+ * nothing here to tag as reasoning, and tagging by guesswork would be the
+ * fabrication `DurableMessage`'s docblock refuses.
  */
 export function projectDurable(
   messages: Array<{ id: string; role: DurableRole; text: string; turnId?: string }>,
 ): DurableView {
-  return messages.map((m) => ({ id: m.id, role: m.role, text: m.text, turnId: m.turnId }));
+  return messages.map((m) => ({
+    kind: "text",
+    id: m.id,
+    role: m.role,
+    text: m.text,
+    turnId: m.turnId,
+  }));
 }
 
 /**

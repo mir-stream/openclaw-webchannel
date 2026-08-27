@@ -5,7 +5,9 @@ import {
   reduceDurableView,
   projectDurableFromClient,
   type DurableEvent,
+  type DurableMessage,
   type DurableRole,
+  type DurableTextMessage,
   type DurableView,
 } from "./durable-view-reducer.js";
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
@@ -28,6 +30,22 @@ import type { InboundMessage } from "./nats-client.js";
 
 const TURN = "turn-1";
 
+/**
+ * Narrow a view entry to the `text` variant so an anchor can read `role`.
+ *
+ * THROWS rather than filtering. Every entry the anchors below produce is a text
+ * message: the client routes no `reasoning` event through the reducer in #242
+ * half 1 (it renders `state.reasoning` directly), so a reasoning entry appearing
+ * in a wrapper-driven view would mean the anchor is no longer comparing what it
+ * says it compares. A silent skip would hide that; a throw names it.
+ */
+function asText(message: DurableMessage): DurableTextMessage {
+  if (message.kind !== "text") {
+    throw new Error(`expected a text durable message, received kind=${message.kind}`);
+  }
+  return message;
+}
+
 describe("reduceDurableView — durable view extraction (v6 slice 1)", () => {
   it("slot-claim ordering: a held answer keeps the slot it claimed via first progress (P0 #1)", () => {
     // A claims its slot (first progress / placement) BEFORE the independent
@@ -43,8 +61,8 @@ describe("reduceDurableView — durable view extraction (v6 slice 1)", () => {
     const view = reduceDurableView(events);
     expect(view.map((m) => m.id)).toEqual(["A", "B"]);
     expect(view).toEqual<DurableView>([
-      { id: "A", role: "agent", text: "answer A (final)", turnId: TURN },
-      { id: "B", role: "agent", text: "independent notice", turnId: TURN },
+      { kind: "text", id: "A", role: "agent", text: "answer A (final)", turnId: TURN },
+      { kind: "text", id: "B", role: "agent", text: "independent notice", turnId: TURN },
     ]);
   });
 
@@ -169,8 +187,8 @@ describe("reduceDurableView — durable view extraction (v6 slice 1)", () => {
     ];
     const view = reduceDurableView(events);
     expect(view).toEqual<DurableView>([
-      { id: "u-0", role: "user", text: "hello", turnId: "w-0" },
-      { id: "A", role: "agent", text: "hi back", turnId: TURN },
+      { kind: "text", id: "u-0", role: "user", text: "hello", turnId: "w-0" },
+      { kind: "text", id: "A", role: "agent", text: "hi back", turnId: TURN },
     ]);
   });
 });
@@ -250,10 +268,10 @@ describe("step / fold agreement: reduceDurableView === fold of applyDurableEvent
     // there while corrupting an incremental caller's retained view.
     for (const event of MIXED_STREAM) {
       const view: DurableView = [
-        { id: "u-0", role: "user", text: "do the thing", turnId: "w-0" },
-        { id: "A", role: "agent", text: "A final", turnId: TURN },
-        { id: "NOTICE", role: "agent", text: "a notice", turnId: TURN },
-        { id: "X", role: "agent", text: "mis-routed overflow", turnId: TURN },
+        { kind: "text", id: "u-0", role: "user", text: "do the thing", turnId: "w-0" },
+        { kind: "text", id: "A", role: "agent", text: "A final", turnId: TURN },
+        { kind: "text", id: "NOTICE", role: "agent", text: "a notice", turnId: TURN },
+        { kind: "text", id: "X", role: "agent", text: "mis-routed overflow", turnId: TURN },
       ];
       const viewSnapshot = JSON.stringify(view);
       const eventSnapshot = JSON.stringify(event);
@@ -268,9 +286,10 @@ describe("step / fold agreement: reduceDurableView === fold of applyDurableEvent
   // -------------------------------------------------------------------------
   //
   // Array identity is a PARTIAL property: `placement` and `seal` each have paths
-  // that hand the input back, while `user` and `bubble` ALWAYS allocate. The
+  // that hand the input back, while `user`, `bubble` and `reasoning` ALWAYS
+  // allocate. The
   // three SAME-array rows below are exhaustive — they are every `return view` in
-  // the module — and the two NEW-array rows are examples, not a partition (a
+  // the module — and the three NEW-array rows are examples, not a partition (a
   // `seal` appears on both sides, and `user` has no row at all because it can
   // never return its input). The negative rows matter as much
   // as the positive ones — without them the header's narrowed claim is just
@@ -334,6 +353,153 @@ describe("step / fold agreement: reduceDurableView === fold of applyDurableEvent
     expect(next).not.toBe(view);
     expect(next).toEqual(view);
   });
+
+  it("NEW array: a reasoning event repeating id, turnId and text still allocates", () => {
+    // `applyReasoning` has NO same-array path — both branches allocate, like the
+    // live `upsertReasoning` it ports. That is what keeps the three SAME-array
+    // rows above exhaustive after #242 half 1 added a fifth transition.
+    const view = reduceDurableView([
+      { kind: "reasoning", id: "r-1", turnId: TURN, text: "thought" },
+    ]);
+    const next = applyDurableEvent(view, {
+      kind: "reasoning",
+      id: "r-1",
+      turnId: TURN,
+      text: "thought",
+    });
+    expect(next).not.toBe(view);
+    expect(next).toEqual(view);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REASONING — #242 half 1
+// ---------------------------------------------------------------------------
+//
+// ⚠️ NO EQUIVALENCE ANCHOR IS POSSIBLE FOR THIS TRANSITION YET, and that is a
+// fact about the slice rather than a gap in the suite. Half 1 makes reasoning
+// durable SERVER-side only: the plugin journals one row per burst and
+// `journal-history.ts` replays it. The client still renders reasoning out of its
+// own `state.reasoning` array and routes no `reasoning` frame through the
+// reducer, so driving the real wrapper with a `reasoning` frame would exercise
+// `upsertReasoning`, not this file. These cases therefore assert the PORT and
+// the ONE deliberate difference from it; half 2 is when an anchor becomes
+// meaningful.
+describe("applyReasoning — one completed burst per event", () => {
+  it("APPENDS an unseen id at the tail, claiming the slot where the EVENT was appended", () => {
+    // The whole reason reasoning goes through the reducer: the block gets a
+    // POSITION among the bubbles instead of living in a side list with none.
+    //
+    // ⚠️ "WHERE THE EVENT WAS APPENDED", NOT "WHERE IT WAS DELIVERED" — this
+    // title used to say the latter, contradicting `applyReasoning`'s own
+    // docblock, which retracts that wording in as many words. The two coincide
+    // for a burst closed by `onReasoningEnd` and DIVERGE for one still open at
+    // turn end: `inbound.ts` drains the answer draft (emitting the `seal`)
+    // before calling `reasoning?.stop()`, so such a burst is appended after the
+    // turn's answers and replays at the tail. This fixture appends in order, so
+    // it exercises the coinciding case only.
+    const view = reduceDurableView([
+      { kind: "bubble", answerId: "A", text: "A", turnId: TURN },
+      { kind: "reasoning", id: "r-1", turnId: TURN, text: "thinking" },
+      { kind: "bubble", answerId: "B", text: "B", turnId: TURN },
+    ]);
+    expect(view.map((m) => m.id)).toEqual(["A", "r-1", "B"]);
+    expect(view[1]).toEqual({ kind: "reasoning", id: "r-1", turnId: TURN, text: "thinking" });
+  });
+
+  it("has NO role, because the wire carries none", () => {
+    const view = reduceDurableView([
+      { kind: "reasoning", id: "r-1", turnId: TURN, text: "thinking" },
+    ]);
+    expect(view[0]).not.toHaveProperty("role");
+  });
+
+  it("UPSERTS by id, keeping the slot", () => {
+    const view = reduceDurableView([
+      { kind: "reasoning", id: "r-1", turnId: TURN, text: "first" },
+      { kind: "bubble", answerId: "A", text: "A", turnId: TURN },
+      { kind: "reasoning", id: "r-1", turnId: "turn-2", text: "revised" },
+    ]);
+    expect(view.map((m) => m.id)).toEqual(["r-1", "A"]);
+    expect(view[0]).toEqual({ kind: "reasoning", id: "r-1", turnId: "turn-2", text: "revised" });
+  });
+
+  it("keeps distinct bursts as distinct blocks, in delivery order", () => {
+    const view = reduceDurableView([
+      { kind: "reasoning", id: "r-1", turnId: TURN, text: "one" },
+      { kind: "reasoning", id: "r-2", turnId: TURN, text: "two" },
+      { kind: "reasoning", id: "r-3", turnId: TURN, text: "three" },
+    ]);
+    expect(view.map((m) => m.text)).toEqual(["one", "two", "three"]);
+  });
+
+  it("does NOT apply the live 100-item cap — a durable view never drops delivered content", () => {
+    // The client caps `state.reasoning` at `.slice(-100)`. That is a memory
+    // bound on a live UI surface; applying it to the system of record would
+    // silently discard delivered content (N10). Retention is #299's job.
+    // ⚠️ THIS IS A KNOWN live≠history DIVERGENCE FOR THE DURATION OF HALF 1, and
+    // half 2 closes it by REMOVING the cap, never by adding one here.
+    const events: DurableEvent[] = Array.from({ length: 150 }, (_, i) => ({
+      kind: "reasoning" as const,
+      id: `r-${i}`,
+      turnId: TURN,
+      text: `thought ${i}`,
+    }));
+    const view = reduceDurableView(events);
+    expect(view).toHaveLength(150);
+    expect(view[0]).toEqual({ kind: "reasoning", id: "r-0", turnId: TURN, text: "thought 0" });
+  });
+
+  it("is PURE: it mutates neither the input view nor the event", () => {
+    const view: DurableView = [
+      { kind: "text", id: "A", role: "agent", text: "A", turnId: TURN },
+      { kind: "reasoning", id: "r-1", turnId: TURN, text: "first" },
+    ];
+    const event: DurableEvent = { kind: "reasoning", id: "r-1", turnId: TURN, text: "second" };
+    const viewSnapshot = JSON.stringify(view);
+    const eventSnapshot = JSON.stringify(event);
+    const next = applyDurableEvent(view, event);
+    expect(JSON.stringify(view)).toBe(viewSnapshot);
+    expect(JSON.stringify(event)).toBe(eventSnapshot);
+    // Structural sharing: the untouched entry is the SAME reference.
+    expect(next[0]).toBe(view[0]);
+    expect(next[1]).not.toBe(view[1]);
+  });
+
+  it("does not cross-match the answer id space: a seal cannot remove or overwrite a block", () => {
+    // ⚠️ NOT "unreachable because the ids differ" — they do NOT differ. Agent
+    // answer ids come from the same `nextMessageId()` as reasoning ids, and user
+    // ids are client-supplied and only length-checked, so a peer can send a
+    // `webchannel-…`-shaped id verbatim. What makes a collision HARMLESS is the
+    // `kind` guard, and that is what this drives: the collision is constructed
+    // here and the outcome is pinned. See `findTextIndex`'s docblock.
+    const view = reduceDurableView([
+      { kind: "reasoning", id: "shared", turnId: TURN, text: "a thought" },
+      {
+        kind: "seal",
+        turnId: TURN,
+        answers: [{ id: "shared", text: "an answer" }],
+        remove: ["shared"],
+      },
+    ]);
+    // The reasoning block survives the remove AND is not reclassified; the seal's
+    // answer is minted as its own text entry.
+    expect(view).toEqual([
+      { kind: "reasoning", id: "shared", turnId: TURN, text: "a thought" },
+      { kind: "text", id: "shared", role: "agent", text: "an answer", turnId: TURN },
+    ]);
+  });
+
+  it("a bubble does not overwrite a reasoning block that happens to share its id", () => {
+    const view = reduceDurableView([
+      { kind: "reasoning", id: "shared", turnId: TURN, text: "a thought" },
+      { kind: "bubble", answerId: "shared", text: "an answer", turnId: TURN },
+    ]);
+    expect(view).toEqual([
+      { kind: "reasoning", id: "shared", turnId: TURN, text: "a thought" },
+      { kind: "text", id: "shared", role: "agent", text: "an answer", turnId: TURN },
+    ]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -386,8 +552,8 @@ describe("characterization: a duplicated `user` row violates the reducer's preco
     // module introduced. Drive the real client with the same duplicated view
     // plus the same snapshot frame.
     const duplicatedView: DurableView = [
-      { id: "u-0", role: "user", text: "same message", turnId: "w-0" },
-      { id: "u-0", role: "user", text: "same message", turnId: "w-0" },
+      { kind: "text", id: "u-0", role: "user", text: "same message", turnId: "w-0" },
+      { kind: "text", id: "u-0", role: "user", text: "same message", turnId: "w-0" },
     ];
     expect(() =>
       realDrive(duplicatedView, [
@@ -578,10 +744,12 @@ describe("characterization: the deliberate divergence, and the precondition trap
   it('bubble with an EMPTY answerId is NOT "id-less" — the live client mints separate bubbles', () => {
     // The client's two id sites use DIFFERENT falsiness, and this is the trap the
     // frame→event mapper walks into (see BOUNDARY 1 in durable-view-reducer.ts):
-    //   - `progress` keys on `id ?? ""` (…:2707) — NULLISH, so "" survives as a
+    //   - `progress` keys on `id ?? ""` (the wrapper's `case "progress"`) —
+    //     NULLISH, so "" survives as a
     //     real id, which is why `placement` with `answerId: ""` is FAITHFUL;
-    //   - `agent_message` branches on `if (id)` (…:2834) — TRUTHY, so "" falls
-    //     into the mint branch at …:2869 and gets a fresh `a-<n>`.
+    //   - `agent_message` branches on `if (id)` (the wrapper's
+    //     `case "agent_message"`) — TRUTHY, so "" falls into that case's
+    //     `mintLocalBubbleId("a")` branch and gets a fresh `a-<n>`.
     // So two id-less finals are TWO bubbles live, while a mapper that mirrors the
     // progress site verbatim (`answerId: frame.id ?? ""`) collapses them into ONE
     // durable row — an N8 live≠history divergence landing in the mapper. Hence
@@ -618,9 +786,9 @@ describe("characterization: the deliberate divergence, and the precondition trap
 // stream:
 //
 //   user      → the real public `send()` → `publish()` (nats-client-wrapper.ts:847)
-//   placement → a real `progress` frame  → `handleFrame` case (…:2701)
-//   bubble    → a real `agent_message`   → `handleFrame` case (…:2827)
-//   seal      → a real `turn_snapshot`   → `applyTurnSnapshot`  (…:1546-1573)
+//   placement → a real `progress` frame  → `handleFrame`'s `case "progress"`
+//   bubble    → a real `agent_message`   → `handleFrame`'s `case "agent_message"`
+//   seal      → a real `turn_snapshot`   → `applyTurnSnapshot`
 //
 // ⚠️ READ WHAT THESE NOW PROVE, AND WHAT THEY NO LONGER DO. Until the client was
 // rewired onto the reducer they were genuinely NON-CIRCULAR: two independent
@@ -675,7 +843,7 @@ type WrapperInternals = {
 function seed(w: WrapperInternals, starting: DurableView): void {
   w.state = {
     ...w.state,
-    messages: starting.map((m) => ({
+    messages: starting.map((m) => asText(m)).map((m) => ({
       id: m.id,
       role: m.role,
       text: m.text,
@@ -708,8 +876,8 @@ function projectWrapper(messages: Array<Record<string, unknown>>): DurableView {
 }
 
 /**
- * Drive the REAL private inbound handler (`handleMessage`,
- * nats-client-wrapper.ts:2280) with real wire frames over a starting view, and
+ * Drive the REAL private inbound handler (`nats-client-wrapper.ts`'s
+ * `handleMessage`) with real wire frames over a starting view, and
  * project the result. This is the same dispatch the socket feeds in production.
  */
 function realDrive(starting: DurableView, frames: InboundMessage[]): DurableView {
@@ -764,7 +932,7 @@ function agentMessageFrame(id: string, text: string, turnId?: string): InboundMe
  * `seal` anchors below compare the whole view, text included.
  */
 function slotSkeleton(view: DurableView): Array<{ id: string; role: DurableRole; turnId?: string }> {
-  return view.map((m) => ({ id: m.id, role: m.role, turnId: m.turnId }));
+  return view.map(asText).map((m) => ({ id: m.id, role: m.role, turnId: m.turnId }));
 }
 
 describe("equivalence anchor: user ≡ the real publish() echo", () => {
@@ -786,8 +954,8 @@ describe("equivalence anchor: user ≡ the real publish() echo", () => {
 
     // Identity fields taken from the real client, never invented here.
     const [u0, , u1] = real;
-    expect(u0.role).toBe("user");
-    expect(u1.role).toBe("user");
+    expect(asText(u0).role).toBe("user");
+    expect(asText(u1).role).toBe("user");
 
     const events: DurableEvent[] = [
       { kind: "user", id: u0.id, text: "first question", turnId: u0.turnId },
@@ -796,7 +964,7 @@ describe("equivalence anchor: user ≡ the real publish() echo", () => {
     ];
     expect(reduceDurableView(events)).toEqual(real);
     // Non-vacuity: the interleaving is what the anchor is about.
-    expect(real.map((m) => m.role)).toEqual(["user", "agent", "user"]);
+    expect(real.map((m) => asText(m).role)).toEqual(["user", "agent", "user"]);
   });
 });
 
@@ -847,7 +1015,8 @@ describe("equivalence anchor: placement ≡ a real progress frame", () => {
 
   it("a FIRST progress without turnId claims its slot with turnId undefined", () => {
     // `progress.turnId` is optional on the wire (channel-contract.ts:66;
-    // nats-channel.ts:469 omits it when falsy) and the client stores it verbatim.
+    // `NatsChannel.sendProgress` omits it when falsy) and the client stores it
+    // verbatim.
     // The slot claim must survive — dropping it would lose the
     // ordering the very first test in this file protects.
     const real = realDrive([], [progressFrame("A", "Working…")]);
@@ -894,7 +1063,7 @@ describe("equivalence anchor: bubble ≡ a real agent_message frame", () => {
     // not collide), but byte-faithfulness is this module's entire product, and an
     // id-namespace change must break HERE rather than silently reclassifying a
     // user bubble in the durable history.
-    const starting: DurableView = [{ id: "u-0", role: "user", text: "mine", turnId: "w-0" }];
+    const starting: DurableView = [{ kind: "text", id: "u-0", role: "user", text: "mine", turnId: "w-0" }];
     const real = realDrive(starting, [agentMessageFrame("u-0", "overwritten", TURN)]);
     const reduced = applyDurableEvent(starting, {
       kind: "bubble",
@@ -903,7 +1072,7 @@ describe("equivalence anchor: bubble ≡ a real agent_message frame", () => {
       turnId: TURN,
     });
     expect(reduced).toEqual(real);
-    expect(real[0].role).toBe("user");
+    expect(asText(real[0]).role).toBe("user");
   });
 
   it("an agent_message without turnId keeps the held bubble's previous turnId", () => {
@@ -932,7 +1101,8 @@ describe("equivalence anchor: bubble ≡ a real agent_message frame", () => {
 //
 // Step 3 goes through `handleMessage` — the same real dispatch as the other
 // three anchors — rather than calling the private `applyTurnSnapshot`
-// (nats-client-wrapper.ts:1546-1573) directly. That method is now the frame→event
+// (`nats-client-wrapper.ts`'s `applyTurnSnapshot`) directly. That method is now
+// the frame→event
 // mapper plus the per-answer `working:false` / `draftOnly`-clearing overlay, so
 // what these cases actually exercise is the MAPPING and the merge, not the
 // reconciliation (which is `applySeal`, the left-hand side). Routing it this way

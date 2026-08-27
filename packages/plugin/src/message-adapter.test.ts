@@ -3551,14 +3551,79 @@ describe("ProgressDraftController — provisional preview transactions", () => {
   });
 });
 
+/**
+ * Script one `sendReasoning` result, or FAIL LOUDLY when the script runs out.
+ *
+ * ⚠️ THIS THROWS INSTEAD OF DEFAULTING TO `true`, AND THAT IS A CORRECTION OF A
+ * REAL DEFECT IN THIS FILE. The fixtures used to read
+ * `sendResults[sendIndex++] ?? true`, so a script covering only the `push` calls
+ * silently handed the BURST-CLOSE frame a success the scenario never granted it:
+ * `setup([true, false])` reads as "the transport went down and stayed down", but
+ * the close frame — a third send — defaulted to delivered. Every MIXED-REFUSAL
+ * test was therefore quietly testing a RECOVERED transport, which is why the
+ * still-down residual (#304) shipped unnoticed through two rounds of review.
+ *
+ * ⚠️ "MIXED-refusal", NOT "every refused-transport test" — an earlier revision
+ * of this comment overstated it. The ALL-refused case is unaffected, and
+ * `setup([false, true])` ("emits the CLI durable replay when its matching live
+ * send was rejected") is the proof: its refused `push` leaves
+ * `lastDeliveredText` empty, so `closeLiveBurst` attempts NO close frame, the
+ * scenario makes exactly two sends, and the script covers both. Only a burst
+ * with at least one DELIVERED push attempts a close frame, so only a mixed
+ * refusal could consume the phantom default.
+ *
+ * So: an EMPTY script means "every send succeeds" (the ordinary case, and most
+ * callers), but a NON-EMPTY one must account for every send the scenario makes,
+ * close frames included. A stub must never supply a recovery the named scenario
+ * does not have.
+ */
+function nextSendResult(sendResults: readonly boolean[], index: number): boolean {
+  if (sendResults.length === 0) return true;
+  if (index >= sendResults.length) {
+    throw new Error(
+      `reasoning send script exhausted: send #${index + 1} has no scripted result ` +
+        `(script length ${sendResults.length}). A scripted test must state the fate of ` +
+        `EVERY send, including the burst-close frame — see nextSendResult.`,
+    );
+  }
+  return sendResults[index];
+}
+
+/**
+ * One recorded `sendReasoning` call. `final` is #242 half 1's burst-close flag —
+ * the ONLY reasoning frame the delivery journal records.
+ */
+type ReasoningFrame = { id: string; turnId: string; text: string; final?: boolean };
+
+/**
+ * The LIVE cumulative draft frames — everything the controller sent that is NOT
+ * a burst close. The pre-#242 suite asserted over the whole frame list, and
+ * these two splits are what keep each of those assertions about exactly what it
+ * was about before: the live stream's text, ids and stale-prefix stripping on
+ * one side, the durable burst frames on the other.
+ */
+const liveFrames = (frames: ReasoningFrame[]): ReasoningFrame[] =>
+  frames.filter((frame) => frame.final !== true);
+const liveTexts = (frames: ReasoningFrame[]): string[] =>
+  liveFrames(frames).map((frame) => frame.text);
+/** The burst-close frames — one per closed non-empty burst, and nothing else. */
+const finalFrames = (frames: ReasoningFrame[]): ReasoningFrame[] =>
+  frames.filter((frame) => frame.final === true);
+
 describe("ReasoningDraftController", () => {
   function setup(sendResults: boolean[] = []) {
-    const frames: Array<{ id: string; turnId: string; text: string }> = [];
+    const frames: ReasoningFrame[] = [];
     let sendIndex = 0;
     const transport = {
-      sendReasoning: (_peer: string, id: string, turnId: string, text: string) => {
-        const sent = sendResults[sendIndex++] ?? true;
-        if (sent) frames.push({ id, turnId, text });
+      sendReasoning: (
+        _peer: string,
+        id: string,
+        turnId: string,
+        text: string,
+        final?: boolean,
+      ) => {
+        const sent = nextSendResult(sendResults, sendIndex++);
+        if (sent) frames.push({ id, turnId, text, ...(final === true ? { final: true } : {}) });
         return sent;
       },
     } as unknown as WebChannelPeerChannel;
@@ -3610,6 +3675,10 @@ describe("ReasoningDraftController", () => {
 
     expect(frames.map((frame) => frame.text)).toEqual(["Plan", "Plan", "Plan carefully"]);
     expect(new Set(frames.map((frame) => frame.id)).size).toBe(3);
+    // #242: each block is COMPLETE when sent, so each carries `final` on its own
+    // single frame — three blocks, three durable frames, no live drafts at all.
+    expect(finalFrames(frames)).toHaveLength(3);
+    expect(liveFrames(frames)).toHaveLength(0);
   });
 
   it("suppresses the CLI final replay only while its equal live burst is open", () => {
@@ -3618,13 +3687,20 @@ describe("ReasoningDraftController", () => {
     // Pinned CLI shape: no onReasoningEnd; the final live snapshot is prepended
     // to the result as an equal durable isReasoning payload.
     controller.pushDurableBlock({ text: "Plan" });
-    expect(frames.map((frame) => frame.text)).toEqual(["Plan"]);
+    expect(liveTexts(frames)).toEqual(["Plan"]);
+    // #242: the replay CLOSED the live burst, so the burst's ONE durable frame
+    // is emitted here — under the LIVE burst's id, not a fresh one — and the
+    // durable block itself is still suppressed (two frames would be two rows).
+    expect(finalFrames(frames)).toEqual([
+      { id: liveFrames(frames)[0].id, turnId: "turn-1", text: "Plan", final: true },
+    ]);
 
     // Once the live burst was closed, an equal independent durable block is not
     // a proven replay and must retain its own wire id.
     controller.pushDurableBlock({ text: "Plan" });
-    expect(frames.map((frame) => frame.text)).toEqual(["Plan", "Plan"]);
-    expect(frames[0]?.id).not.toBe(frames[1]?.id);
+    expect(liveTexts(frames)).toEqual(["Plan"]);
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["Plan", "Plan"]);
+    expect(finalFrames(frames)[1].id).not.toBe(finalFrames(frames)[0].id);
   });
 
   it("emits the CLI durable replay when its matching live send was rejected", () => {
@@ -3633,6 +3709,12 @@ describe("ReasoningDraftController", () => {
     controller.pushDurableBlock({ text: "Plan" });
 
     expect(frames.map((frame) => frame.text)).toEqual(["Plan"]);
+    // #242 / #304, the ALL-REFUSED case: nothing of the live burst reached the
+    // client, so `lastDeliveredText` is empty and `closeLiveBurst` emits no
+    // close frame. The durable block is the only delivery, so it is also the
+    // only durable record. ONE row.
+    expect(finalFrames(frames)).toHaveLength(1);
+    expect(finalFrames(frames)[0].text).toBe("Plan");
   });
 
   it("closes live reasoning before emitting a non-equal durable block in full", () => {
@@ -3640,8 +3722,13 @@ describe("ReasoningDraftController", () => {
     controller.push({ text: "Plan" });
     controller.pushDurableBlock({ text: "Plan carefully" });
 
-    expect(frames.map((frame) => frame.text)).toEqual(["Plan", "Plan carefully"]);
-    expect(frames[0]?.id).not.toBe(frames[1]?.id);
+    expect(liveTexts(frames)).toEqual(["Plan"]);
+    // Two bursts closed ⇒ two durable frames: the live burst's own close (under
+    // its live id) and the independent block (under the rotated one).
+    const finals = finalFrames(frames);
+    expect(finals.map((frame) => frame.text)).toEqual(["Plan", "Plan carefully"]);
+    expect(finals[0].id).toBe(liveFrames(frames)[0].id);
+    expect(finals[1].id).not.toBe(finals[0].id);
   });
 
   it("rotates ids at a reasoning-end boundary and ignores late updates after stop", () => {
@@ -3651,17 +3738,236 @@ describe("ReasoningDraftController", () => {
     controller.push({ text: "second" });
     controller.stop();
     controller.push({ text: "late" });
-    expect(frames).toHaveLength(2);
-    expect(frames[0].id).not.toBe(frames[1].id);
+    const lives = liveFrames(frames);
+    expect(lives.map((frame) => frame.text)).toEqual(["first", "second"]);
+    expect(lives[0].id).not.toBe(lives[1].id);
+    // #242: BOTH bursts closed — the first by `endBurst`, the second by
+    // `stop()` — so each contributes exactly one durable frame, under its own
+    // burst id. Before this slice the second burst had no close at all and its
+    // content was durably lost on an aborted turn.
+    const finals = finalFrames(frames);
+    expect(finals.map((frame) => frame.text)).toEqual(["first", "second"]);
+    expect(finals.map((frame) => frame.id)).toEqual([lives[0].id, lives[1].id]);
+  });
+});
+
+/**
+ * #242 half 1 — ONE DURABLE FRAME PER BURST, AND EXACTLY ONE.
+ *
+ * The live reasoning stream is unthrottled and every frame carries the full text
+ * so far, so "journal the reasoning frame" would be O(n²) bytes per burst. The
+ * controller instead emits one extra frame per burst close carrying
+ * `final: true`, and `journalEventForOutbound` records only those. These cases
+ * cover all four places a burst closes, plus the paths that must emit NOTHING.
+ */
+describe("ReasoningDraftController — #242 durable burst frames", () => {
+  function setup(sendResults: boolean[] = []) {
+    const frames: ReasoningFrame[] = [];
+    let sendIndex = 0;
+    const transport = {
+      sendReasoning: (
+        _peer: string,
+        id: string,
+        turnId: string,
+        text: string,
+        final?: boolean,
+      ) => {
+        const sent = nextSendResult(sendResults, sendIndex++);
+        if (sent) frames.push({ id, turnId, text, ...(final === true ? { final: true } : {}) });
+        return sent;
+      },
+    } as unknown as WebChannelPeerChannel;
+    const controller = createReasoningDraftController({
+      transport,
+      sessionKey: "peer-1",
+      turnId: "turn-1",
+    });
+    return { controller, frames };
+  }
+
+  it("marks no live draft frame, however long the burst streams", () => {
+    const { controller, frames } = setup();
+    for (const text of ["a", "ab", "abc", "abcd", "abcde"]) controller.push({ text });
+    // Five cumulative updates, five wire frames, ZERO durable rows: the whole
+    // point of the flag. Journaling these would store the burst five times over.
+    expect(frames).toHaveLength(5);
+    expect(finalFrames(frames)).toHaveLength(0);
+  });
+
+  it("endBurst closes with ONE final frame carrying the burst's displayed text", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "a" });
+    controller.push({ text: "ab" });
+    controller.push({ text: "abc" });
+    controller.endBurst();
+    const finals = finalFrames(frames);
+    expect(finals).toEqual([
+      { id: liveFrames(frames)[0].id, turnId: "turn-1", text: "abc", final: true },
+    ]);
+  });
+
+  it("stop() flushes an OPEN burst — an aborted turn keeps what the user watched", () => {
+    // `inbound.ts` calls `reasoning?.stop()` on the turn's way out, so this is
+    // the /stop and dropped-connection path. Before #242 half 1 `stop()` only
+    // latched a flag and the burst was durably lost.
+    const { controller, frames } = setup();
+    controller.push({ text: "thinking hard" });
+    controller.stop();
+    expect(finalFrames(frames)).toEqual([
+      { id: liveFrames(frames)[0].id, turnId: "turn-1", text: "thinking hard", final: true },
+    ]);
+  });
+
+  it("stop() emits nothing when the burst was already closed, and repeats emit nothing", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "done" });
+    controller.endBurst();
+    expect(finalFrames(frames)).toHaveLength(1);
+    controller.stop();
+    controller.stop();
+    expect(finalFrames(frames)).toHaveLength(1);
+  });
+
+  it("an empty burst emits nothing on either close path", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "" });
+    controller.endBurst();
+    controller.stop();
+    expect(frames).toEqual([]);
+  });
+
+  it("emits exactly one final per burst across a three-burst turn", () => {
+    // endBurst, endBurst, stop — three closes, three durable rows, and the ids
+    // are all distinct so a replay yields three separate reasoning blocks.
+    const { controller, frames } = setup();
+    controller.push({ text: "one" });
+    controller.endBurst();
+    controller.push({ text: "two" });
+    controller.endBurst();
+    controller.push({ text: "three" });
+    controller.stop();
+    const finals = finalFrames(frames);
+    expect(finals.map((frame) => frame.text)).toEqual(["one", "two", "three"]);
+    expect(new Set(finals.map((frame) => frame.id)).size).toBe(3);
+  });
+
+  it("MIXED refusal, transport RECOVERED by close: the close frame carries what the client has", () => {
+    // ⚠️ THE THIRD SCRIPT ENTRY IS THE POINT, AND ITS ABSENCE IS WHY #304'S
+    // RESIDUAL SHIPPED. `push "a"` lands, `push "ab"` is refused, and the
+    // CLOSE FRAME is a third send whose fate the scenario must state. Here it
+    // succeeds — the transport came back — which is exactly the case
+    // `lastDeliveredText` fixed: one frame carrying "a", an upsert-by-id no-op
+    // for the client, and the journal records what was actually seen. A
+    // "did the LAST send land?" gate emitted ZERO here.
+    const { controller, frames } = setup([true, false, true]);
+    controller.push({ text: "a" });
+    controller.push({ text: "ab" });
+    controller.endBurst();
+
+    const finals = finalFrames(frames);
+    expect(finals).toHaveLength(1);
+    expect(finals[0].text).toBe("a");
+    expect(finals[0].id).toBe(liveFrames(frames)[0].id);
+  });
+
+  it("CHARACTERIZATION — transport STILL refusing at close: the burst gets no frame at all (#304)", () => {
+    // ⚠️ RECORDS, DOES NOT ENDORSE. The refusal that silenced `push "ab"` is
+    // usually still in effect one call later, so the close frame is refused too.
+    // The controller ATTEMPTS it — that is all it can do — and the frame never
+    // reaches the transport, so no journal row exists for a burst whose first
+    // update the peer is still rendering.
+    //
+    // The seam cannot repair this: `sendToPeer`'s refusal checks sit ABOVE
+    // `journalOutbound`, so a declined frame never reaches the mapper. WHY that
+    // is not simply fixed is stated ONCE, at `message-adapter.ts`'s
+    // `lastDeliveredText` declaration, and deliberately not restated here — two
+    // earlier restatements of it shipped false. #304 owns the residual.
+    const { controller, frames } = setup([true, false, false]);
+    controller.push({ text: "a" });
+    controller.push({ text: "ab" });
+    controller.endBurst();
+
+    // The peer received "a" and is still rendering it…
+    expect(liveFrames(frames).map((frame) => frame.text)).toEqual(["a"]);
+    // …and nothing durable was recorded for the burst.
+    expect(finalFrames(frames)).toEqual([]);
+  });
+
+  it("MIXED refusal on the stop() path, RECOVERED — an aborted turn keeps the delivered prefix", () => {
+    const { controller, frames } = setup([true, false, true]);
+    controller.push({ text: "a" });
+    controller.push({ text: "ab" });
+    controller.stop();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["a"]);
+  });
+
+  it("CHARACTERIZATION — stop() with the transport still down loses the burst too (#304)", () => {
+    // Same residual on the turn-teardown path, which is the more likely one: a
+    // dropped connection is what ends the turn AND refuses the close frame.
+    const { controller, frames } = setup([true, false, false]);
+    controller.push({ text: "a" });
+    controller.push({ text: "ab" });
+    controller.stop();
+    expect(liveFrames(frames).map((frame) => frame.text)).toEqual(["a"]);
+    expect(finalFrames(frames)).toEqual([]);
+  });
+
+  it("MIXED refusal then a durable block: two blocks live, two rows, matching exactly", () => {
+    // The live view here is NOT "one block" and NOT "two identical blocks" —
+    // the client holds {"Plan"} from the accepted push and {"Plan carefully"}
+    // from the durable block. Two rows is therefore the MATCHING record rather
+    // than a duplicate, which is why the close frame belongs on this path.
+    // FOUR sends: two pushes, the burst-close frame, then the durable block.
+    const { controller, frames } = setup([true, false, true, true]);
+    controller.push({ text: "Plan" });
+    controller.push({ text: "Plan carefully" });
+    controller.pushDurableBlock({ text: "Plan carefully" });
+
+    const finals = finalFrames(frames);
+    expect(finals.map((frame) => frame.text)).toEqual(["Plan", "Plan carefully"]);
+    expect(finals[0].id).toBe(liveFrames(frames)[0].id);
+    expect(finals[1].id).not.toBe(finals[0].id);
+  });
+
+  it("ALL-REFUSED: no close frame, and the id still rotates for the next burst", () => {
+    // THREE sends: the refused push, the second burst's push, and that burst's
+    // close frame. Burst 1 attempts no close frame at all (`lastDeliveredText`
+    // is empty), which is why only three appear.
+    const { controller, frames } = setup([false, true, true]);
+    controller.push({ text: "a" });
+    controller.endBurst();
+    expect(frames).toEqual([]);
+    // The rotation is unconditional, so a later delivered burst is its own
+    // block rather than an upsert onto the one nobody received.
+    controller.push({ text: "b" });
+    controller.endBurst();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["b"]);
+  });
+
+  it("journals the DISPLAYED text, not btw's raw cumulative payload", () => {
+    // burst 2's raw payload still carries burst 1's text (btw never resets its
+    // accumulator). The durable frame must hold what the client was shown.
+    const { controller, frames } = setup();
+    controller.push({ text: "AAA" });
+    controller.endBurst();
+    controller.push({ text: "AAABBB" });
+    controller.endBurst();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "BBB"]);
   });
 });
 
 describe("ReasoningDraftController — btw stale-burst defense", () => {
   function setup() {
-    const frames: Array<{ id: string; turnId: string; text: string }> = [];
+    const frames: ReasoningFrame[] = [];
     const transport = {
-      sendReasoning: (_peer: string, id: string, turnId: string, text: string) => {
-        frames.push({ id, turnId, text });
+      sendReasoning: (
+        _peer: string,
+        id: string,
+        turnId: string,
+        text: string,
+        final?: boolean,
+      ) => {
+        frames.push({ id, turnId, text, ...(final === true ? { final: true } : {}) });
         return true;
       },
     } as unknown as WebChannelPeerChannel;
@@ -3681,10 +3987,13 @@ describe("ReasoningDraftController — btw stale-burst defense", () => {
     controller.endBurst();
     controller.push({ text: "AAABBB" });
     controller.push({ text: "AAABBBCCC" });
-    expect(frames.map((f) => f.text)).toEqual(["AAA", "BBB", "BBBCCC"]);
+    const lives = liveFrames(frames);
+    expect(lives.map((f) => f.text)).toEqual(["AAA", "BBB", "BBBCCC"]);
     // burst 1 has its own id; burst 2's two frames share the rotated id.
-    expect(frames[1].id).not.toBe(frames[0].id);
-    expect(frames[2].id).toBe(frames[1].id);
+    expect(lives[1].id).not.toBe(lives[0].id);
+    expect(lives[2].id).toBe(lives[1].id);
+    // #242: only burst 1 has closed, so there is exactly one durable frame.
+    expect(finalFrames(frames).map((f) => f.text)).toEqual(["AAA"]);
   });
 
   it("ignores a stale re-send of the exact prior-burst text after endBurst", () => {
@@ -3692,7 +4001,8 @@ describe("ReasoningDraftController — btw stale-burst defense", () => {
     controller.push({ text: "AAA" });
     controller.endBurst();
     controller.push({ text: "AAA" });
-    expect(frames.map((f) => f.text)).toEqual(["AAA"]);
+    expect(liveTexts(frames)).toEqual(["AAA"]);
+    expect(finalFrames(frames).map((f) => f.text)).toEqual(["AAA"]);
   });
 
   it("trims inter-burst whitespace left in the stripped remainder", () => {
@@ -3700,7 +4010,8 @@ describe("ReasoningDraftController — btw stale-burst defense", () => {
     controller.push({ text: "AAA" });
     controller.endBurst();
     controller.push({ text: "AAA\n\nBBB" });
-    expect(frames.map((f) => f.text)).toEqual(["AAA", "BBB"]);
+    expect(liveTexts(frames)).toEqual(["AAA", "BBB"]);
+    expect(finalFrames(frames).map((f) => f.text)).toEqual(["AAA"]);
   });
 
   it("recognizes an open burst's exact raw snapshot after display-prefix stripping", () => {
@@ -3710,12 +4021,20 @@ describe("ReasoningDraftController — btw stale-burst defense", () => {
     controller.push({ text: "AAABBB" }); // displayed as BBB; raw snapshot is AAABBB
 
     controller.pushDurableBlock({ text: "AAABBB" });
-    expect(frames.map((frame) => frame.text)).toEqual(["AAA", "BBB"]);
+    expect(liveTexts(frames)).toEqual(["AAA", "BBB"]);
+    // #242: both bursts have now closed (endBurst, then the replay), each with
+    // one durable frame carrying its DISPLAYED text — never the raw payload.
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "BBB"]);
 
     // The replay closed the live burst; equality no longer suppresses an
     // independent durable block.
     controller.pushDurableBlock({ text: "AAABBB" });
-    expect(frames.map((frame) => frame.text)).toEqual(["AAA", "BBB", "AAABBB"]);
+    expect(liveTexts(frames)).toEqual(["AAA", "BBB"]);
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual([
+      "AAA",
+      "BBB",
+      "AAABBB",
+    ]);
   });
 
   it("falls through to a plain replace when a later burst does not carry the stale prefix", () => {
@@ -3723,8 +4042,10 @@ describe("ReasoningDraftController — btw stale-burst defense", () => {
     controller.push({ text: "AAA" });
     controller.endBurst();
     controller.push({ text: "XYZ" });
-    expect(frames.map((f) => f.text)).toEqual(["AAA", "XYZ"]);
-    expect(frames[1].id).not.toBe(frames[0].id);
+    const lives = liveFrames(frames);
+    expect(lives.map((f) => f.text)).toEqual(["AAA", "XYZ"]);
+    expect(lives[1].id).not.toBe(lives[0].id);
+    expect(finalFrames(frames).map((f) => f.text)).toEqual(["AAA"]);
   });
 
   it("accumulates the stale prefix across three bursts (burst 3 prefix = burst1+burst2)", () => {
@@ -3734,9 +4055,12 @@ describe("ReasoningDraftController — btw stale-burst defense", () => {
     controller.push({ text: "AAABBB" });
     controller.endBurst();
     controller.push({ text: "AAABBBCCC" });
-    expect(frames.map((f) => f.text)).toEqual(["AAA", "BBB", "CCC"]);
+    const lives = liveFrames(frames);
+    expect(lives.map((f) => f.text)).toEqual(["AAA", "BBB", "CCC"]);
     // Each burst renders under its own rotated id.
-    expect(new Set(frames.map((f) => f.id)).size).toBe(3);
+    expect(new Set(lives.map((f) => f.id)).size).toBe(3);
+    // Bursts 1 and 2 closed; burst 3 is still open.
+    expect(finalFrames(frames).map((f) => f.text)).toEqual(["AAA", "BBB"]);
   });
 
   it("handles three bursts with whitespace BETWEEN them in btw's raw accumulator", () => {
@@ -3748,8 +4072,10 @@ describe("ReasoningDraftController — btw stale-burst defense", () => {
     controller.push({ text: "AAA\nBBB" });
     controller.endBurst();
     controller.push({ text: "AAA\nBBB\nCCC" });
-    expect(frames.map((f) => f.text)).toEqual(["AAA", "BBB", "CCC"]);
-    expect(new Set(frames.map((f) => f.id)).size).toBe(3);
+    const lives = liveFrames(frames);
+    expect(lives.map((f) => f.text)).toEqual(["AAA", "BBB", "CCC"]);
+    expect(new Set(lives.map((f) => f.id)).size).toBe(3);
+    expect(finalFrames(frames).map((f) => f.text)).toEqual(["AAA", "BBB"]);
   });
 
   it("preserves the stale prefix through an all-stale burst (endBurst early-return)", () => {
@@ -3761,7 +4087,11 @@ describe("ReasoningDraftController — btw stale-burst defense", () => {
     controller.push({ text: "AAA" }); // stale re-send only — strips to empty
     controller.endBurst();
     controller.push({ text: "AAA\nCCC" });
-    expect(frames.map((f) => f.text)).toEqual(["AAA", "CCC"]);
-    expect(new Set(frames.map((f) => f.id)).size).toBe(2);
+    const lives = liveFrames(frames);
+    expect(lives.map((f) => f.text)).toEqual(["AAA", "CCC"]);
+    expect(new Set(lives.map((f) => f.id)).size).toBe(2);
+    // The all-stale middle burst is EMPTY, and an empty burst emits no durable
+    // frame — the second endBurst produced nothing.
+    expect(finalFrames(frames).map((f) => f.text)).toEqual(["AAA"]);
   });
 });

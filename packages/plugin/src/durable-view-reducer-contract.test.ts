@@ -39,16 +39,31 @@
  * makes it load-bearing." #240 made it load-bearing: `journal-history.ts` is
  * PRODUCTION plugin source that imports `applyDurableEvent` and folds journal
  * rows through it, and `delivery-journal-event.ts`'s `JournalEvent` is now a
- * plain alias of `DurableEvent` from the same module. (It is not yet reached
- * from the plugin's entry graph — #240 half 1 ships the projection with no
- * caller — so `esbuild --bundle` does not yet inline the reducer into
- * `dist/index-nats.js`. That is a wiring fact about half 2, not a fact about
- * whether the import resolves; bundling `journal-history.ts` directly with the
- * build's own flags inlines it.)
+ * plain alias of `DurableEvent` from the same module.
  *
- * The guard below keeps its job either way: it is the executable proof that a
- * cross-package SOURCE import of the client's reducer resolves and folds from
- * inside this package.
+ * ⚠️ AND IT IS NOW IN THE SHIPPED BUNDLE, WHICH RAISES THE STAKES OF THE GUARD
+ * BELOW. This paragraph used to end with a parenthetical claiming the reducer is
+ * "not yet reached from the plugin's entry graph — #240 half 1 ships the
+ * projection with no caller — so `esbuild --bundle` does not yet inline the
+ * reducer into `dist/index-nats.js`". That was true when it was written and
+ * went false when #240 HALF 2 wired the read path. MEASURED on this branch,
+ * `npm run build -w packages/plugin` then grepping the output:
+ *
+ *   grep -c "applyReasoning\|projectJournalHistory" dist/index-nats.js   → 5
+ *   applyReasoning 2 · applyDurableEvent 2 · projectJournalHistory 3
+ *
+ * The entry chain is all production source: `index-nats.ts` →
+ * `nats-account-runtime.ts` → `history-serve.ts` → `journal-history.ts` →
+ * `../../client/src/durable-view-reducer.js` (a VALUE import of
+ * `applyDurableEvent`). #242 half 1 then added `applyReasoning` to that same
+ * inlined module, which is why this correction belongs to a reasoning slice.
+ *
+ * So read the guard below at its real blast radius. If the reducer ever gains a
+ * dependency this package cannot resolve — a `node:` builtin is the standing
+ * hazard, forbidden by that module's DEPENDENCY CONTRACT — the failure is NOT
+ * "a test goes red". It is `dist/index-nats.js` failing to build or failing at
+ * load, i.e. the shipped plugin. The guard is the cheap early warning for a
+ * break whose real cost lands on the artifact.
  */
 import { describe, it, expect } from "vitest";
 
@@ -115,12 +130,12 @@ describe("shared durable-view reducer — the plugin consumes the client module"
     // REAL private `applyTurnSnapshot`.
     expect(view.map((m) => m.id)).toEqual(["u-0", "B", "A", "NOTICE", "C", "X"]);
     expect(view).toEqual<DurableView>([
-      { id: "u-0", role: "user", text: "do the thing", turnId: "w-0" },
-      { id: "B", role: "agent", text: "B (sealed)", turnId: TURN },
-      { id: "A", role: "agent", text: "A (sealed)", turnId: TURN },
-      { id: "NOTICE", role: "agent", text: "a notice", turnId: TURN },
-      { id: "C", role: "agent", text: "C (minted)", turnId: TURN },
-      { id: "X", role: "agent", text: "X, resurrected", turnId: TURN },
+      { kind: "text", id: "u-0", role: "user", text: "do the thing", turnId: "w-0" },
+      { kind: "text", id: "B", role: "agent", text: "B (sealed)", turnId: TURN },
+      { kind: "text", id: "A", role: "agent", text: "A (sealed)", turnId: TURN },
+      { kind: "text", id: "NOTICE", role: "agent", text: "a notice", turnId: TURN },
+      { kind: "text", id: "C", role: "agent", text: "C (minted)", turnId: TURN },
+      { kind: "text", id: "X", role: "agent", text: "X, resurrected", turnId: TURN },
     ]);
   });
 

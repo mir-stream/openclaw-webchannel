@@ -2774,13 +2774,32 @@ describe("webchannel inbound round-trip", () => {
         text: "hello",
       });
 
-      expect(reasoningSpy).toHaveBeenCalledTimes(1);
-      expect(reasoningSpy).toHaveBeenCalledWith(
+      // #242 half 1: TWO frames per burst through the REAL inbound path — the
+      // live cumulative draft, then the burst's single `final: true` close,
+      // which is the ONE frame the delivery journal records. Same id and same
+      // text, so for the client the second is an upsert-by-id with identical
+      // content, so the rendered reasoning list does not change (the frame is
+      // not otherwise inert — see the `final` member's docblock in
+      // `channel-contract.ts` for what its handler does do). The extra copy on
+      // the wire is the accepted cost of the burst-versus-token distinction.
+      expect(reasoningSpy).toHaveBeenCalledTimes(2);
+      expect(reasoningSpy).toHaveBeenNthCalledWith(
+        1,
         "web-anon",
         expect.any(String),
         "turn-42",
         "safe",
       );
+      expect(reasoningSpy).toHaveBeenNthCalledWith(
+        2,
+        "web-anon",
+        expect.any(String),
+        "turn-42",
+        "safe",
+        true,
+      );
+      const [liveCall, finalCall] = reasoningSpy.mock.calls;
+      expect(finalCall?.[1]).toBe(liveCall?.[1]);
       // turn_settled is a lifecycle frame emitted for every ordinary turn.
       expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42", "ok");
     },
@@ -2821,9 +2840,15 @@ describe("webchannel inbound round-trip", () => {
     });
 
     expect(seenReplyOptions?.reasoningPayloadsEnabled).toBe(true);
+    // Still TWO frames, and #242 half 1 is why that number did not move: these
+    // are `pushDurableBlock` blocks, ALREADY COMPLETE when sent, so each carries
+    // `final: true` on its own single frame rather than getting a second closing
+    // one. No live burst is ever open on this path (`push` is never called), so
+    // nothing else closes.
     expect(reasoningSpy).toHaveBeenCalledTimes(2);
     const reasoningCalls = reasoningSpy.mock.calls;
     expect(reasoningCalls.map((call) => call[3])).toEqual(["Plan", "Plan carefully"]);
+    expect(reasoningCalls.map((call) => call[4])).toEqual([true, true]);
     expect(reasoningCalls[0]?.[1]).not.toBe(reasoningCalls[1]?.[1]);
     expect(reasoningCalls.every((call) => call[2] === "turn-durable-reasoning")).toBe(true);
     // The three reasoning deliveries are consumed (`false`); the ordinary final
@@ -2861,13 +2886,28 @@ describe("webchannel inbound round-trip", () => {
       text: "hello",
     });
 
-    expect(reasoningSpy).toHaveBeenCalledTimes(1);
-    expect(reasoningSpy).toHaveBeenCalledWith(
+    // #242 half 1: the live draft, then the burst close the replay triggered —
+    // same id, same text, `final: true`. The durable replay ITSELF is still
+    // suppressed, which is what this test is about: the second call is the
+    // burst's ONE journal-bound frame under the LIVE id, not the replay leaking
+    // through under a fresh one.
+    expect(reasoningSpy).toHaveBeenCalledTimes(2);
+    expect(reasoningSpy).toHaveBeenNthCalledWith(
+      1,
       "web-anon",
       expect.any(String),
       "turn-cli-reasoning-replay",
       "Plan",
     );
+    expect(reasoningSpy).toHaveBeenNthCalledWith(
+      2,
+      "web-anon",
+      expect.any(String),
+      "turn-cli-reasoning-replay",
+      "Plan",
+      true,
+    );
+    expect(reasoningSpy.mock.calls[1]?.[1]).toBe(reasoningSpy.mock.calls[0]?.[1]);
     expect(deliveryResults).toEqual([false, true]);
     expect(sendTextSpy.mock.calls.map((call) => String(call[1]))).toEqual(["hi back"]);
   });

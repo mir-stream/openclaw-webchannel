@@ -20,10 +20,23 @@
  *    and never re-sends it. Both the mapper and `append` are covered.
  *  - REFUSAL vs FAILED WRITE, which is the distinction the hook's position
  *    encodes. A send we DECLINE to attempt (transport down, no session key yet)
- *    is journaled NOT AT ALL — the caller re-mints an id per attempt, so
- *    recording refusals manufactures rows under ids that never existed live. A
- *    wire write that THROWS after the commit is journaled, and that is the
- *    window §16.2-2 is actually about.
+ *    is journaled NOT AT ALL, because all three refusal checks sit ABOVE
+ *    `journalOutbound`. A wire write that THROWS after the commit IS journaled,
+ *    and that is the window §16.2-2 is actually about.
+ *    ⚠️ WHY the refusal side is not simply fixed — and why #304's residual is
+ *    deferred rather than patched — is the GENERAL rule, and it is stated ONCE,
+ *    at `message-adapter.ts`'s `lastDeliveredText` declaration. This docblock
+ *    used to restate it and no longer does: the version it carried was an
+ *    id-re-minting argument that reads as general but describes only
+ *    `reserveProvisional`'s PLACEMENT path, and this file now also owns the #242
+ *    reasoning characterization tests, where it is false.
+ *    ⚠️ TWO PLACEMENT-SCOPED STATEMENTS DO REMAIN IN THIS FILE, and they are
+ *    TRUE where they sit — the `placement{X₁},{X₂},{X₃}` argument on the
+ *    disconnected-refusal test, and "the client never saw this text either" on
+ *    the fail-closed one. Both are about a refused `sendText`, where the peer
+ *    genuinely received nothing. DO NOT GENERALISE EITHER to the reasoning close
+ *    frame, which carries `lastDeliveredText` — text the peer IS rendering. Four
+ *    wrong generalisations of this rule have shipped; that is the failure mode.
  *  - One test against a REAL journal, because the two halves of #239 shipped
  *    separately and nothing else proves they compose.
  */
@@ -42,6 +55,7 @@ import {
   type DeliveryJournalRow,
 } from "./delivery-journal.js";
 import type { JournalEvent } from "./delivery-journal-event.js";
+import { createReasoningDraftController } from "./message-adapter.js";
 import { NatsChannel } from "./nats-channel.js";
 import type { NatsTransport } from "./nats-transport.js";
 
@@ -68,6 +82,17 @@ class RecordingTransport extends EventEmitter {
   connected = true;
   /** Large enough that the ingress-result chunker never splits or refuses. */
   effectiveOutboundLimit = 1_000_000;
+  /**
+   * Every published frame, PARSED and whole.
+   *
+   * ⚠️ SEPARATE FROM `calls` ON PURPOSE. `Call`'s publish variant records only
+   * `{call, subject, type}`, and ~20 `toEqual` assertions in this file are
+   * written against that exact shape — widening it would churn every one of
+   * them to restate a key they do not care about. This sink is additive, so a
+   * test that needs to look INSIDE a frame can, and every existing assertion is
+   * untouched.
+   */
+  readonly frames: Array<Record<string, unknown>> = [];
   private sid = 0;
   constructor(private readonly calls: Call[]) {
     super();
@@ -79,7 +104,9 @@ class RecordingTransport extends EventEmitter {
     /* no-op */
   }
   publish(subject: string, payload: string): void {
-    const type = (JSON.parse(payload) as { type?: string }).type ?? "<unknown>";
+    const frame = JSON.parse(payload) as Record<string, unknown>;
+    this.frames.push(frame);
+    const type = (frame as { type?: string }).type ?? "<unknown>";
     this.calls.push({ call: "publish", subject, type });
   }
 }
@@ -107,7 +134,14 @@ class FakeJournal implements DeliveryJournal {
   }
 }
 
-function makeChannel(): {
+/**
+ * `reasoningDurable` mirrors production's default: OMITTED means OFF, exactly as
+ * `resolveReasoningDurable` resolves an account that never set the key. A test
+ * that wants reasoning rows must say so, which is the point — the opt-in is the
+ * shipped behaviour and a test that got them for free would be testing a
+ * configuration nobody runs by default.
+ */
+function makeChannel(options?: { reasoningDurable?: boolean }): {
   calls: Call[];
   transport: RecordingTransport;
   journal: FakeJournal;
@@ -122,7 +156,12 @@ function makeChannel(): {
     TENANT,
     undefined,
     undefined,
-    { deliveryJournal: journal },
+    {
+      deliveryJournal: journal,
+      ...(options?.reasoningDurable === undefined
+        ? {}
+        : { reasoningDurable: options.reasoningDurable }),
+    },
   );
   return { calls, transport, journal, channel };
 }
@@ -610,5 +649,276 @@ describe("#239 — egress seam against a real journal", () => {
     expect(rows.map((row) => row.seq)).toEqual([1, 2, 3, 4]);
     // A different peer is a different conversation in the same file.
     expect(journal.read("peer-other")).toEqual([]);
+  });
+});
+
+/**
+ * #242 half 1 — ONE ROW PER REASONING BURST, THROUGH THE REAL CHANNEL.
+ *
+ * ⚠️ THIS IS THE TEST THAT WOULD HAVE CAUGHT THE O(n²) DESIGN. The unit tests on
+ * either side of this seam can both pass while the composition is quadratic: the
+ * controller's suite counts frames, the mapper's suite maps ONE frame at a time,
+ * and neither can see that `createReasoningDraftController` calls
+ * `sendReasoning` on EVERY cumulative token update — unthrottled, each frame
+ * carrying the whole text so far. Driving the REAL controller into the REAL
+ * channel is what turns "how many rows does a burst cost" into an observable.
+ */
+/**
+ * #242 half 1 — THE DEFAULT: the live lane runs, the journal stays empty.
+ *
+ * ⚠️ THIS IS THE TEST THAT PROVES THE GATE IS AT THE JOURNAL AND NOT ON THE
+ * LANE. Two switches, two decisions: `capabilities.reasoning` keeps its #113
+ * default-ON because it is about rendering a volatile live stream, and
+ * `capabilities.reasoningDurable` defaults OFF because it is about permanently
+ * recording plaintext to disk. Gating by closing the lane would have satisfied
+ * "no rows" while silently regressing #113, and nothing else in the suite would
+ * have noticed — so the assertion is deliberately BOTH halves: every live frame
+ * still on the wire, INCLUDING the `final: true` close frame, and zero rows.
+ */
+describe("#242 — reasoningDurable OFF (default): lane intact, journal empty", () => {
+  it("publishes the whole burst, close frame included, and journals nothing", () => {
+    const { calls, transport, channel } = makeChannel();
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+
+    controller.push({ text: "Let" });
+    controller.push({ text: "Let me" });
+    controller.push({ text: "Let me think" });
+    controller.endBurst();
+
+    // The LANE is untouched: three live drafts plus the burst close.
+    expect(calls.filter((entry) => entry.call === "publish")).toEqual([
+      { call: "publish", subject: OUT, type: "reasoning" },
+      { call: "publish", subject: OUT, type: "reasoning" },
+      { call: "publish", subject: OUT, type: "reasoning" },
+      { call: "publish", subject: OUT, type: "reasoning" },
+    ]);
+    // ⚠️ AND THE FOURTH ONE REALLY IS THE `final` FRAME — read off the PUBLISHED
+    // PAYLOAD, not inferred from the count. Without this the docblock above
+    // claims a `final: true` the assertion cannot see: `Call`'s publish variant
+    // carries only `type`, so gating the LANE down to three frames and gating
+    // the FLAG off both stay green on the count alone.
+    //
+    // The three drafts assert `undefined`, not `false`, which pins the other
+    // half of `nats-channel.ts`'s `sendReasoning` contract: the key is OMITTED
+    // rather than emitted false, so a live draft frame is byte-identical to what
+    // it was before this slice existed.
+    expect(transport.frames.map((frame) => frame.final)).toEqual([
+      undefined,
+      undefined,
+      undefined,
+      true,
+    ]);
+    // And the JOURNAL is empty.
+    expect(appends(calls)).toEqual([]);
+  });
+
+  it("still journals every OTHER durable frame of the same turn", () => {
+    // Non-vacuity, and the exact failure a lane-side gate would NOT produce:
+    // the flag must silence reasoning ONLY. A turn whose answers stopped being
+    // journaled would be catastrophic and must not hide behind "no rows".
+    const { calls, channel } = makeChannel();
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+
+    controller.push({ text: "thinking" });
+    controller.endBurst();
+    channel.sendProgress(PEER, "a-1", "Working…", "turn-1");
+    channel.sendText(PEER, "the answer", "a-1", "turn-1");
+
+    expect(
+      appends(calls).map((entry) => (entry.call === "append" ? entry.event : undefined)),
+    ).toEqual([
+      { kind: "placement", answerId: "a-1", turnId: "turn-1" },
+      { kind: "bubble", answerId: "a-1", text: "the answer", turnId: "turn-1" },
+    ]);
+  });
+
+  it("a non-boolean reasoningDurable fails CLOSED at the channel boundary", () => {
+    // `resolveReasoningDurable` already refuses a present malformed value, but
+    // the channel takes a plain object and a future caller could hand it one
+    // that never went through the resolver. `=== true` is what makes that safe.
+    const { calls, channel } = makeChannel({
+      reasoningDurable: "true" as unknown as boolean,
+    });
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+    controller.push({ text: "thinking" });
+    controller.endBurst();
+    expect(appends(calls)).toEqual([]);
+  });
+});
+
+describe("#242 — with reasoningDurable ON, a live stream costs ONE row per burst", () => {
+  it("writes one row per burst, not one per cumulative update", () => {
+    const { calls, channel } = makeChannel({ reasoningDurable: true });
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+
+    // A realistic burst: ten cumulative updates, each the full text so far.
+    let text = "";
+    for (const token of ["Le", "t m", "e t", "hi", "nk ", "abo", "ut ", "th", "is", "."]) {
+      text += token;
+      controller.push({ text });
+    }
+    controller.endBurst();
+
+    // ELEVEN wire frames — ten live drafts plus the close — and exactly ONE row.
+    expect(calls.filter((entry) => entry.call === "publish")).toHaveLength(11);
+    expect(appends(calls)).toHaveLength(1);
+    const [row] = appends(calls);
+    expect(row).toEqual({
+      call: "append",
+      conversationId: PEER,
+      event: {
+        kind: "reasoning",
+        id: expect.any(String),
+        turnId: "turn-1",
+        text: "Let me think about this.",
+      },
+    });
+  });
+
+  it("gives each burst of a turn its own row, and an aborted turn still gets one", () => {
+    const { calls, channel } = makeChannel({ reasoningDurable: true });
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+
+    controller.push({ text: "first thought" });
+    controller.endBurst();
+    controller.push({ text: "second thought" });
+    // The turn is aborted here — `inbound.ts` calls `stop()` on the way out.
+    controller.stop();
+
+    expect(
+      appends(calls).map((entry) => (entry.call === "append" ? entry.event : undefined)),
+    ).toEqual([
+      { kind: "reasoning", id: expect.any(String), turnId: "turn-1", text: "first thought" },
+      { kind: "reasoning", id: expect.any(String), turnId: "turn-1", text: "second thought" },
+    ]);
+    // Distinct ids: two bursts must replay as two blocks, not one overwriting
+    // the other through the reducer's upsert.
+    const ids = appends(calls).map((entry) =>
+      entry.call === "append" ? (entry.event as { id: string }).id : "",
+    );
+    expect(new Set(ids).size).toBe(2);
+  });
+
+  it("a blip the transport RECOVERED from still gets its row, carrying the delivered text", () => {
+    // ⚠️ #304 END TO END, THROUGH THE REAL CHANNEL — and note WHICH half of it.
+    // The transport comes back UP before `endBurst()`, so the close frame is
+    // published and journaled. This is precisely the case `lastDeliveredText`
+    // fixed; a "did the LAST send land" gate wrote no row here.
+    //
+    // ⚠️ THE `connected = true` LINE IS LOAD-BEARING, NOT SETUP TIDINESS. It is
+    // the ONLY arrangement in which a row appears at all, and an earlier
+    // revision of this test carried it while claiming the general "a burst
+    // interrupted by a blip still gets its row" — which is false. The sibling
+    // below is that general case, and it records the opposite outcome.
+    const { calls, transport, channel } = makeChannel({ reasoningDurable: true });
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    controller.push({ text: "Let me" });
+    transport.connected = false;
+    controller.push({ text: "Let me think" });
+    transport.connected = true; // ⭐ recovered BEFORE the close
+    controller.endBurst();
+    warn.mockRestore();
+
+    expect(
+      appends(calls).map((entry) => (entry.call === "append" ? entry.event : undefined)),
+    ).toEqual([
+      { kind: "reasoning", id: expect.any(String), turnId: "turn-1", text: "Let me" },
+    ]);
+  });
+
+  it("CHARACTERIZATION — a transport STILL down at close loses the burst entirely (#304)", () => {
+    // ⚠️ RECORDS THE RESIDUAL, DOES NOT ENDORSE IT. Identical to the test above
+    // except the transport never recovers, which is the ORDINARY shape of a
+    // reconnect or a fail-closed no-session-key window: the condition that
+    // refused the last `push` is still in effect when the burst closes, so
+    // `sendToPeer` refuses the close frame too — above `journalOutbound`, by
+    // design — and the peer keeps rendering text that has no durable record.
+    //
+    // Two publishes reached the wire and ZERO rows were written. Not fixable at
+    // this seam; WHY is stated ONCE, at `message-adapter.ts`'s
+    // `lastDeliveredText` declaration, and deliberately not restated here — two
+    // earlier restatements of it shipped false. #304 owns the residual.
+    const { calls, transport, channel } = makeChannel({ reasoningDurable: true });
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    controller.push({ text: "Let me" });
+    controller.push({ text: "Let me think" });
+    transport.connected = false; // and it stays down
+    controller.push({ text: "Let me think about this" });
+    controller.endBurst();
+    warn.mockRestore();
+
+    // The peer received two frames and is still rendering "Let me think"…
+    expect(calls.filter((entry) => entry.call === "publish")).toHaveLength(2);
+    // …and the journal holds nothing for the burst.
+    expect(appends(calls)).toEqual([]);
+  });
+
+  it("CHARACTERIZATION — the same residual on the stop() teardown path (#304)", () => {
+    // The likelier trigger in production: the dropped connection is what ends
+    // the turn, so `inbound.ts`'s `reasoning?.stop()` runs while the transport
+    // is still refusing.
+    const { calls, transport, channel } = makeChannel({ reasoningDurable: true });
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    controller.push({ text: "Let me" });
+    transport.connected = false;
+    controller.push({ text: "Let me think" });
+    controller.stop();
+    warn.mockRestore();
+
+    expect(calls.filter((entry) => entry.call === "publish")).toHaveLength(1);
+    expect(appends(calls)).toEqual([]);
+  });
+
+  it("an open burst with no delivered snapshot writes nothing", () => {
+    // The transport refuses every send (no session key on an encrypted channel
+    // is the real shape; here the transport is simply disconnected), so the
+    // journal — which sits BELOW `sendToPeer`'s refusals — sees nothing at all.
+    const { calls, transport, channel } = makeChannel({ reasoningDurable: true });
+    transport.connected = false;
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    controller.push({ text: "never delivered" });
+    controller.endBurst();
+    warn.mockRestore();
+    expect(appends(calls)).toEqual([]);
   });
 });

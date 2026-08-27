@@ -169,7 +169,7 @@ it; the widget renders it.
   `journal-history.ts` (`serveHistoryRequest` → `projectJournalHistory`), config via
   `resolveHistoryConfig` in `history.ts`.
 - Wire frame: `{ type:"history"; messages:[{id,role,text,ts}] }`.
-- **Reducer hydrates it (#16 ordered merge):** `nats-client-wrapper.ts:2363` `case "history"` — no
+- **Reducer hydrates it (#16 ordered merge):** `nats-client-wrapper.ts`'s `case "history"` — no
   longer a blanket "dedup + prepend oldest-first". Since #240 half 2 it does TWO-tier matching (id →
   exact text+role adoption of server ids onto local live-id bubbles, **USER rows only**; the
   positional tier for reformatted agent replies is DELETED, along with its anchor, because the
@@ -305,7 +305,7 @@ enough for any realistic session (confirmed acceptable by user 2026-07-03). Only
 exceeding 1000 turns would still hit a hard wall, and *that* residual case needs the upstream cursor
 above.
 
-**Reference implementation (our reducer).** `nats-client-wrapper.ts:2363` already does the #16 ordered
+**Reference implementation (our reducer).** `nats-client-wrapper.ts`'s `case "history"` already does the #16 ordered
 merge (two-tier match + insertion-cursor placement, with blanket oldest-first prepend for a
 zero-overlap page); the "Load older" response reuses it.
 

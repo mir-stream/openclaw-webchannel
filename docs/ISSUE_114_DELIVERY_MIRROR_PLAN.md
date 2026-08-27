@@ -120,10 +120,10 @@ v1은 `appendAssistantMirrorMessageByIdentity`로 core transcript에 미러 row�
 - `answers = state.lanes.filter(streamedVisibleAnswerText).map(lane => ({ id: lane.id ?? nextMessageId(), text: answerTextIsAuthoritative ? answerText : streamedAnswerText }))` — **답변 lane마다 {id, 최종 text}**.
 - `id`는 lane이 live로 쓴 그 wire id(없으면 새 id) → **live id == snapshot id.**
 - `remove[]`는 플러그인이 오배송을 아는 bubble id.
-- wire 계약: `turn_snapshot { turnId, answers:[{id,text}], remove[] }` (`channel-contract.ts:92-97`). 클라이언트는 이미 이걸 적용한다.
+- wire 계약: `turn_snapshot { turnId, answers:[{id,text}], remove[] }` (`channel-contract.ts`의 `OutboundWsMessage` `turn_snapshot` 멤버). 클라이언트는 이미 이걸 적용한다.
 
 ⚠️ **[라운드-2에서 이 전제가 REFUTED됨 — "snapshot을 적으면 됨"은 틀렸다]**
-turn_snapshot은 **완전한 턴 기록이 아니라 교정 패치다.** 계약(`channel-contract.ts:79-90`)이 명시: 클라이언트는 `answers`/`remove`에 든 것만 교체하고 **나머지 모든 버블(notice, error, final-only 답변, adopted history)은 보존**한다. 그래서:
+turn_snapshot은 **완전한 턴 기록이 아니라 교정 패치다.** 계약(같은 멤버의 docblock)이 명시: 클라이언트는 `answers`/`remove`에 든 것만 교체하고 **나머지 모든 버블(notice, error, final-only 답변, adopted history)은 보존**한다. 그래서:
 - **final-only 답변(예: A,B는 스트리밍, C는 final-only)은 `answers`에서 빠진다** — shipped 테스트가 C 누락·overflow 누락을 고정(`message-adapter.test.ts:472-505, 602-644`). snapshot만 저장하면 리로드 때 C가 **삭제**된다.
 - **progress 모드는 `onPartialReply`가 없어**(`inbound.ts:979-985`) `streamedVisibleAnswerText`가 안 켜져 `answers`가 **빈다**. → snapshot이 답변 text를 주는 건 **partial 모드뿐.**
 - snapshot text도 `answerTextIsAuthoritative`일 때만 최종; 아니면 streamed fallback(최종 tail 누락 가능).
@@ -134,7 +134,7 @@ turn_snapshot은 **완전한 턴 기록이 아니라 교정 패치다.** 계약(
 
 > ⛔ **이 절의 두 주장은 SUPERSEDED다 — PR #250(#238)이 뒤집는다.** 거기서 플러그인은 **모든 배달 행위(delivery act)에서 id를 민팅**하며 off/block의 plain send도 포함한다. 그래서 (a) 아래 `sendText(wsKey, text, undefined, turnId)`만 나가고 client가 `a-N`을 자체 발급한다는 **[실측]은 더 이상 성립하지 않고**, (b) "off/block의 durable id는 **분리된 후속**"이라는 스코프 판정도 끝났다 — 그 후속이 바로 #238이다. 식별자 최종 판정은 **§16.5**. 아래 본문은 **당시 측정 기록(역사)** 으로만 남긴다.
 
-- `turn_snapshot`/draft는 `streaming.mode ∈ {partial, progress}`에서만 생긴다(`inbound.ts:1014-1017`). "block"/"off"는 draft 없음(`inbound.ts:985`) → snapshot 없음 → 답변 id 없음. `sendText(wsKey, text, undefined, turnId)`만 나가고 client가 `a-N` 자체 발급(`nats-client-wrapper.ts:2562`).
+- `turn_snapshot`/draft는 `streaming.mode ∈ {partial, progress}`에서만 생긴다(`inbound.ts:1014-1017`). "block"/"off"는 draft 없음(`inbound.ts:985`) → snapshot 없음 → 답변 id 없음. `sendText(wsKey, text, undefined, turnId)`만 나가고 client가 `a-N` 자체 발급(`nats-client-wrapper.ts`).
 - 플러그인 기본 streaming 모드는 "off"(`message-adapter.ts:146-149`). **단 [실측] 제품/데모는 partial로 돈다** — `demo/run.sh:286`이 `"streaming":{"mode":"partial"}` 설정(`docs/gaps/P0_CORE_CHAT_GAPS.md:499`). ~~⚠️ operator가 `channels add`로 수동 등록하며 mode를 안 주면 "off" → journal-only history가 비어 **회귀**. off-mode history 연속성은 §6에서 처리(전환기엔 off/block에 `getSessionMessages` fallback 유지).~~ → **이 걱정은 틀렸다(2026-08-26, #240 half 2에서 확인).** 저널을 채우는 건 streaming이 아니라 **egress seam**이다: `journalEventForOutbound`가 `agent_message` → `bubble`을 매핑하고, off 모드 턴도 `agent_message`를 낸다. 즉 off 모드 history는 정상 저널된다. 전환기 fallback도 **없다** — §15.6 파괴적 컷오버가 core-read를 0으로 만들었고, 모드별 fallback을 남기는 건 N2 복귀다.
 - **그러나 #212 identity 버그(#173/#172/#104 …)는 전부 partial 모드에서 발생**한다 — lane/다중답변이 거기만 존재(`docs/gaps/P1_RICH_UX_GAPS.md`). off/block은 답변당 plain send라 그 오배송·재구성 버그가 안 생긴다.
 
@@ -192,7 +192,7 @@ turn_snapshot은 **완전한 턴 기록이 아니라 교정 패치다.** 계약(
 - **순서.** 지연/재시도 interleave 시 durable live-order 키가 필요(timestamp/seq는 append 순서일 뿐). 플러그인 monotonic sequence가 그 키. [codex F9/E]
 - ~~**legacy cutover + off-mode 연속성.** 경계를 무엇으로(시각/sequence/플래그)? 이전 구간 UX? **off/block로 설정된 operator는 journal이 비어 history가 회귀** — 전환기엔 그 모드에 `getSessionMessages` fallback을 남긴다(단 partial journal era와 절대 섞지 않음; v1의 merge 부활 금지). 이 fallback이 core-transcript-read를 다시 들이는지 리뷰 확인 필요.~~ → **DISSOLVED (§15.6, 구현 완료 2026-08-26).** 경계도 fallback도 없다: 사용자 결정으로 **파괴적 컷오버**를 골랐으므로 legacy 구간이 존재하지 않는다. off-mode 전제도 틀렸었다(§3.3 참조 — 저널은 streaming이 아니라 egress seam이 채운다). 남은 진짜 항목은 하나뿐이고 코드 문제가 아니다: **배포 이전 대화가 조용히 사라진다는 걸 운영자에게 알리는 릴리스 노트** → #297.
 - **성능.** 답변당 journal write 비용, write lock 경합. (v1의 O(n) idempotency scan 문제는 journal에선 사라지지만 자체 비용 확인.) [codex F10]
-- **멀티디바이스/재시도 replica.** 서버는 공유 subject로 한 번만 publish(`nats-channel.ts:757`)하고 2번째 기기 등록이 재-write를 안 만든다 → 진짜 위험은 replica/retry identity. [codex H 정정]
+- **멀티디바이스/재시도 replica.** 서버는 공유 subject로 한 번만 publish(`nats-channel.ts`의 `sendToPeer` — 단일 egress choke point)하고 2번째 기기 등록이 재-write를 안 만든다 → 진짜 위험은 replica/retry identity. [codex H 정정]
 - **degrade 정의.** #215 ceiling으로 lane 미확정 시 journal 동작(§4-6)의 정확한 규칙.
 
 ---
@@ -369,7 +369,7 @@ partial 스트리밍 프레임(`onPartialReply` 다발)은 **journal에 매 프�
 
 - controller는 pre-route `wsKey`(`inbound.ts:1018`)로 생성되지만 history는 tenant/account/agent-scoped route 키(`inbound.ts:1037`, `nats-account-runtime.ts:393`)를 쓴다. journal이 wsKey로 쓰고 route키로 읽으면 miss/크로스테넌트 충돌.
 - **결정:** journal의 `session` 컬럼은 **항상 route-scoped 키**. 첫 agent 배달은 route 해석(~1037) 이후에 일어나므로 그 시점에 route키를 캡처해 outbox에 바인딩. `laneOpen` 호출을 route 해석 이후로 보장.
-- **단일 writer 가정:** `seq` monotonic·pagination은 "sessionKey당 단일 writer"에 의존. nats publish가 공유 subject로 1회(`nats-channel.ts:757`, §6 codex-H)라 서버 단일 소유가 유력하나, **수평 확장 시 같은 session을 여러 프로세스가 쓰는지 프로브 P-C로 실측.** 다중 writer면 seq를 DB autoincrement(단일 파일 직렬화)로 유지하되 파일 공유 여부 확인.
+- **단일 writer 가정:** `seq` monotonic·pagination은 "sessionKey당 단일 writer"에 의존. nats publish가 공유 subject로 1회(`nats-channel.ts`의 `sendToPeer`, §6 codex-H)라 서버 단일 소유가 유력하나, **수평 확장 시 같은 session을 여러 프로세스가 쓰는지 프로브 P-C로 실측.** 다중 writer면 seq를 DB autoincrement(단일 파일 직렬화)로 유지하되 파일 공유 여부 확인.
 
 ### 12.9 history routing + cutover marker (결정 A·C)
 
@@ -654,12 +654,12 @@ egress에서 **클라가 view에 쓰는 이벤트만, 전송 순서(seq)대로**
     - **비싼 건 SQL이 아니라 fold이고, fold는 대화 길이에 대해 QUADRATIC이다.** `applyPlacement`/`applyBubble`이 `view.findIndex`로 upsert하고 **view를 바꾸는** transition마다 view 전체 배열을 새로 만든다(할당이 기본값이고, 입력 배열을 그대로 돌려주는 same-array 경로는 `durable-view-reducer.ts` 헤더가 열거한 3개뿐이다 — 그래서 배열 수는 이벤트 수의 상한이지 실측 개수가 아니다). live에선 무해(짧은 view에 이벤트 하나씩)하고, **플러그인 쪽에 빠른 사설 fold를 두는 건 두 번째 구현 = N8이라 금지.** chunk 크기는 시간/메모리 트레이드가 아니다: 128/512/4096 스프레드가 20 000 이벤트에서 1.3%, 10 000에서 2.0%이고, 짧은 대화일수록 **비율은 벌어져** 5 000에서 4.6%, 1 000에서 15.3%가 되지만 — 그 15.3%는 절대값 **0.9 ms**다(fold가 작아 read가 더 이상 묻히지 않을 뿐). 비싼 쪽에서 ~1%, 싼 쪽에서 1 ms 미만이므로 어느 크기에서도 메모리 경계와 맞바꿀 시간이 없다. (퍼센트는 모두 정본 표 = `journal-history.ts` 헤더 기준.) ⚠️ **퍼센트 하나로 뭉뚱그리지 말 것** — 어느 값을 고르든 4개 중 3개 크기에서 정본 표 자신에게 반증당한다. 양 끝을 각각의 단위(긴 쪽은 %, 짧은 쪽은 ms)로 인용할 것.
     - 결론: **reconnect 스냅샷 1회는 오늘 길이에선 괜찮고, page-scroll마다 전체 재생은 못 쓴다.** 진짜 답이 이 bullet의 materialized table(체크포인트에서 증분 투영)이며, 어려운 부분은 DDL이 아니라 **"체크포인트 투영 ≡ 0부터 재생"의 증명**이다(`seal`이 슬롯을 재정렬하고 create-or-update하며 `remove` 후 `bubble`이 부활하므로). → **#286.**
     - ⚠️ **그리고 half 2는 #286 scope note의 두 탈출구 중 어느 것도 만족하지 않고 나갔다(2026-08-26).** 그 note는 "스냅샷 경로만" 또는 "페이징 깊이 제한"이면 blocker가 아니라고 했는데, half 2는 **두 경로 다 무제한**이다. 깊이 제한을 한 번 시도했다가 **되돌렸다**: fold 전에 싸게 잴 수 있는 건 *대화 길이*지 *커서 깊이*가 아니고(커서 위치를 알려면 fold가 필요하다), 길이 게이트는 삭제한 `MAX_FETCH_WINDOW`보다 **더 나쁜 제품**이다 — 옛 벽은 "최신 1000개는 항상 도달 가능"인 깊이 벽이었는데, 길이 게이트는 임계를 넘는 대화의 페이징을 **통째로** 거절한다(1200개 대화 → 1150개가 어느 깊이에서도 소실). 그럼에도 무제한으로 낸 근거는 하나다: **스냅샷이 무제한인 채로 페이지만 묶는 건 연극이다.** register hop에 rate limit이 없어(#298) 프로세스는 이미 무제한 *직렬* fold에 노출돼 있고, 페이지 경로가 새로 추가하는 성질은 없다. half 2가 실제로 넣은 건 per-peer in-flight 래치 두 개(스냅샷/페이지 분리, busy면 drop)로, 이건 scope note가 말하지 않은 **세 번째** 실패(프레임 버스트가 fold를 쌓는 것; 20 000 이벤트 대화에 50프레임 ≈ 72초 블로킹 → 1건)에 대한 **동시성** 제한이지 깊이 제한도 rate 제한도 아니다. ⇒ **#286은 이제 가정이 아니라 배포된 상태를 서술하는 blocker이고, 레버는 #286(재생을 싸게)과 #298(트리거를 제한) 둘 다이며 서로를 대체하지 않는다.**
-  - ⚠️ **projection이 live와 갈라지는 알려진 지점 하나 — 이 절의 "발명 금지"가 아니라 §15.9의 live==history 쪽 문제다.** `progress`만 받고 `bubble`도 `seal.answers`도 못 받은 lane(중단된 턴, drain 전 연결 끊김)은 저널에 placement만 남는다. `applyPlacement`는 `text: ""` agent 버블을 append하고 reducer는 그걸 지우지 않는데, **live는 아무것도 안 그린다** — 클라가 `isSpentDraft`로 거르고(`nats-client-wrapper.ts:2010`) 그 판단을 구동하는 `draftOnly`는 **client-local이라 저널되지 않기** 때문. 그래서 순진한 재생은 live가 보여준 적 없는 빈 버블을 낸다(N8, 누락 방향). 규칙 자체가 이벤트만으론 표현이 안 되고 turn-close 이벤트가 필요할 수 있어(#241/BOUNDARY 2) → **#251·#264** 소관. #240 half 1은 이걸 고치지 않고 `journal-history.ts` 헤더에 명시해 두었다.
+  - ⚠️ **projection이 live와 갈라지는 알려진 지점 하나 — 이 절의 "발명 금지"가 아니라 §15.9의 live==history 쪽 문제다.** `progress`만 받고 `bubble`도 `seal.answers`도 못 받은 lane(중단된 턴, drain 전 연결 끊김)은 저널에 placement만 남는다. `applyPlacement`는 `text: ""` agent 버블을 append하고 reducer는 그걸 지우지 않는데, **live는 아무것도 안 그린다** — 클라가 `mergeDurable` 안에서 `isSpentDraft`로 거르고 그 판단을 구동하는 `draftOnly`는 **client-local이라 저널되지 않기** 때문. 그래서 순진한 재생은 live가 보여준 적 없는 빈 버블을 낸다(N8, 누락 방향). 규칙 자체가 이벤트만으론 표현이 안 되고 turn-close 이벤트가 필요할 수 있어(#241/BOUNDARY 2) → **#251·#264** 소관. #240 half 1은 이걸 고치지 않고 `journal-history.ts` 헤더에 명시해 두었다.
 
 ### 15.5 seam — route key + user-id 생애 (findings codex6/claude4, codex8)
 
 - **route key(server)**: ~~journal write는 **route 해석(`inbound.ts:1046`) 후 route-scoped 키를 클로저로 잡은 per-turn 콜백**. `NatsChannel`은 route를 모르므로(codex6) 콜백을 turn-handler가 주입. **P-J: agents-bind 등 config 변경이 route 키를 바꿔 대화 orphan 되는가**~~ — **이 절 전체 SUPERSEDED (§16.2-7, 구현 완료 2026-08-25).** `conversationId = peerId`(인증된 JWT `sub`). 저널 파일이 이미 `(tenant, accountId)`로 경로 스코프되므로 peerId가 triple을 완성하고, **core의 mutable route/agentId를 아예 안 읽는다** ⇒ per-turn route-scoped 콜백 **불필요**, P-J는 **해소(dissolved)이지 연기 아님**. 코드: `nats-channel.ts` `journalOutbound`.
-- **user-id(client)**: client가 `user_message.id`를 민팅해 local==wire==history 동일. **held/deferred/retracted/cancel 생애 규칙 명시**(codex8): 초기 렌더에 id 예약, 취소/철회 시 해제 API 추가, coalescing turn anchor와의 관계. 파괴적 컷오버(§15.6)로 legacy가 없으므로 text-match(tier-2/3, `nats-client-wrapper.ts:2081-2113`)는 **이 통일과 함께 즉시 제거** 가능.
+- **user-id(client)**: client가 `user_message.id`를 민팅해 local==wire==history 동일. **held/deferred/retracted/cancel 생애 규칙 명시**(codex8): 초기 렌더에 id 예약, 취소/철회 시 해제 API 추가, coalescing turn anchor와의 관계. 파괴적 컷오버(§15.6)로 legacy가 없으므로 text-match(`nats-client-wrapper.ts`의 `case "history"` adoption)는 **이 통일과 함께 즉시 제거** 가능. ⚠️ 이 문장은 3-tier 시절에 쓰였다 — 지금은 **2-tier**(id → user 행 한정 text+role)이고, 위치 티어는 #240 half 2가 삭제했다(§15.6 아래 같은 주석, #302가 잔여 소유). 남은 것은 텍스트 티어 하나뿐이다.
 
 ### 15.6 파괴적 컷오버 — 저널이 첫날부터 유일 저장소 (사용자 결정 2026-08-23)
 
@@ -710,6 +710,25 @@ egress에서 **클라가 view에 쓰는 이벤트만, 전송 순서(seq)대로**
   - **durable(저널·history):** user, agent 답변, notice/상태 버블, **tool 메시지**, reasoning(트랜스크립트에 남길 content면). Telegram이 tool/service 메시지를 보존하듯 우리 플러그인(=Telegram 서버)도 보존한다. → placement/bubble 이벤트로 저널(stable id 부여 필요).
   - **ephemeral(저널 안 함, 순수 표시기):** `isTyping` 스피너, finalize 전 "Working…" 롤링 초안 텍스트, sendState UI 장식. live에도 "메시지"가 아니고 history에도 없음 = 불일치 없음.
   - ⚠️ **현재 클라의 `state.reasoning`·`state.toolActivity` 별개 ephemeral 배열**(`nats-client-wrapper.ts:131-132`)은 **북극성 위반 한계지 스펙이 아니다.** tool을 live-only로만 두는 지금 상태가 바로 live≠history 결함 — #114가 이를 durable로 만들어 해소한다. (per-type 결정은 "durable 메시지냐 순수 표시기냐"로 명시적으로 내린다; 절대 "live엔 있는데 history엔 없는" 상태를 남기지 않는다.)
+  - 🟡 **reasoning: #242 half 1에서 서버 쪽만 착지 (2026-08-27). 남은 갭을 아래에 명시한다 — 닫혔다고 읽지 말 것.**
+    - **착지한 것:** ① wire `reasoning` 프레임에 **`final?: boolean`** 추가(`channel-contract.ts`); ② `createReasoningDraftController`가 burst가 닫히는 **네 지점**(`endBurst`, `pushDurableBlock`의 두 갈래, **`stop()`**)에서 `final: true` 프레임을 낸다. ⚠️ 불변식은 **호출당 하나가 아니라 burst당 하나**다: `endBurst`/`stop()`/`pushDurableBlock` replay-suppression 갈래는 **1개 또는 0개**(0은 그 burst가 client에 한 글자도 닿지 않았을 때뿐), `pushDurableBlock`의 independent-block 갈래는 **최대 2개** — live burst 마감 + 블록 자신이며 이건 burst가 **둘**이기 때문이다. 그리고 `final` 프레임이 싣는 건 `currentText`가 아니라 **실제 배달에 성공한 마지막 텍스트**(`lastDeliveredText`)다 — 전송 하나가 거절된 burst를 통째로 잃던 구멍이 #304; ③ `journalEventForOutbound`가 **그 프레임만** 저널링 → **burst당 1행**; ④ 공유 reducer에 `kind:"reasoning"` 이벤트 + `applyReasoning`(id upsert, 없으면 tail append — **이벤트가 저널에 append된 자리**를 잡는 슬롯 클레임. "배달된 자리"가 아니다: 아래 ⚠️ 순서 항목); ⑤ `DurableMessage`가 **tagged union**이 됨(`text` | `reasoning`, §16.2-5의 첫 조각); ⑥ `journal-history.ts`가 reasoning 행을 접어 view에 넣는다.
+    - 🔒 **journaling은 `capabilities.reasoningDurable`(기본 **OFF**)로 별도 게이트 — 사용자 결정 2026-08-27.** live lane과 on-disk 기록은 **서로 다른 결정**이고 스위치를 공유하면 안 된다.
+      - **`capabilities.reasoning`은 #113의 기본 ON을 그대로 유지한다.** 그 결정은 *휘발성 live lane을 렌더할지*에 대한 것이었고 이번 슬라이스는 거기 아무것도 손대지 않는다.
+      - **저장은 자기 키를 갖고 기본값은 OFF**다: `capabilities.reasoningDurable`, resolver는 `account-config.ts`의 `resolveReasoningDurable`(plain object + OWN property + literal `true`, 그 외 전부 `false`).
+      - **게이트 위치는 저널링 seam** — `delivery-journal-event.ts`의 `case "reasoning"`, `final` 검사보다 **앞**. ⚠️ **lane을 닫는 방식으로 구현하면 안 된다**: 그건 #113의 렌더를 회귀시켜 저장 속성을 사는 것이다. 게이트가 여기 있으므로 durability OFF에서도 `final: true` 종료 프레임을 포함한 **모든 live 프레임은 그대로 나간다**.
+      - **한 문장으로 남길 근거(이걸 지우면 다음 사람이 두 결정을 다시 합친다):** *"#113's default-ON was a decision to render a volatile live lane, and it does not inherit to a decision to permanently record plaintext to disk."*
+      - **왜 OFF인가:** reasoning은 tool 출력·파일 내용·사용자 프롬프트를 일상적으로 인용하는 **새로운 content class**인데, half 1엔 **그걸 읽을 수 있는 클라이언트가 없고**(projection이 wire 변환 지점에서 drop), **#299 미구현이라 지울 방법도 없다.** 이득이 0인 구간엔 저울질할 trade-off가 없으므로 **되돌리기 싼 방향**을 택한다.
+      - **기본값 재검토는 half 2/3에서** — 그 시점에 content가 client-readable이 되면서 "이득 0" 논거가 만료된다. 추적 이슈는 **#306**("Revisit `capabilities.reasoningDurable`'s default once half 2/3 makes reasoning client-readable"). ⚠️ **#299가 아니다** — #299는 retention/pruning이고 `reasoningDurable`을 언급하지 않는다. #299는 *관련*(지울 방법이 없다는 게 OFF의 근거 절반) 이지 이 결정의 소유자가 아니다.
+    - ⚠️ **`final` 플래그는 편의가 아니라 필수다.** 컨트롤러는 **누적 토큰 갱신마다** `sendReasoning`을 부르고(throttle 없음) 매 프레임이 **지금까지의 전체 텍스트**를 싣는다. 프레임 단위로 저널링하면 burst당 **O(n²) 바이트** + 행 수 폭증이고, 그게 이미 quadratic한 replay(#286)로 그대로 들어간다. §15.9가 `progress`(표시기) vs `agent_message`(durable content)에 이미 그은 선을, reasoning에는 `progress` 상당물이 없어서 못 긋고 있던 것뿐 — `final`이 같은 층에서 같은 선을 복원한다.
+      - 기각한 대안 두 가지(재론 금지): **(a) `ON CONFLICT … DO UPDATE`** 업서트 — burst당 1행은 되지만 payload가 **mutable**해져 append-only 성질과 "seq = 이 내용이 authored된 시점"이라는 의미가 깨진다(기존 `journal_user_once`/`journal_placement_once`는 `DO NOTHING` = 멱등이지 revision이 아니다). **(b) 컨트롤러 안에 두 번째 저널 훅** — NOT-list **N6b/N6c**: 훅을 *이름*으로 배치하다 이 보드에서 이미 두 번 결함을 냈다. `sendToPeer` 하나가 전 표면을 덮는 게 설계다.
+    - ⚠️ **`stop()`으로 닫힌 burst는 그 턴의 `seal` **뒤에** append된다 — 알려진 순서 divergence.** `inbound.ts`의 turn 종료 경로는 `await draft?.drain()`(→ `emitTurnSnapshot` → `seal` 행)을 먼저 하고, `reasoning?.stop()`은 그 뒤 `finally`에서 부른다. 그래서 **답변보다 먼저** 흘러간 reasoning burst라도 turn 종료 시점까지 열려 있었으면 그 이벤트는 `seal` 다음 seq를 받고, replay는 그 블록을 턴의 답변들 **뒤(꼬리)** 에 놓는다. `onReasoningEnd`로 닫히는(=`endBurst`) burst는 턴 진행 중에 append되므로 영향 없다 — `stop()` 경로만의 문제다.
+      - **half 1에서는 관측 불가능**: projection이 `HistoryMessage` 변환 지점에서 reasoning을 drop하므로 wire에 나가지 않는다.
+      - **half 2가 그대로 물려받는다**: 클라가 reducer를 타는 순간 live(답변 앞에 그려짐)와 history(답변 뒤에 그려짐)가 **순서로** 갈라진다 → N8.
+      - **이 슬라이스에서 고치지 않는다.** `stop()` 호출 위치를 옮기는 건 turn 종료 순서를 바꾸는 일이라 이 슬라이스 범위 밖이고 위험하다. half 2 소관.
+    - ⚠️ **의도적으로 안 한 것 (half 2 소관):** ① **클라 렌더는 안 옮겼다** — 클라는 여전히 `state.reasoning`을 직접 그리고 `reasoning` 프레임을 reducer로 보내지 않는다; ② **wire `history` 프레임은 reasoning을 못 싣는다** — `HistoryMessage`(projection이 쓰는 건 `history.ts`의 선언 — `channel-contract.ts`의 wire 타입 재수출이 아니라 `ts: number`가 필수인 별도 선언)는 `{id, role, text, ts}`이고 `role`은 `"user"|"agent"`인데 reasoning 메시지는 **role이 없다**(wire가 안 주고, 지어내면 SSOT에 날조를 넣는 것). 그래서 `projectJournalHistory`는 view→`HistoryMessage` 변환 지점에서 reasoning을 **명시적으로 drop**한다(그 줄에 주석).
+    - ⚠️ **따라서 half 1은 live≠history를 알면서 두 군데 남긴다:** ① **리로드하면 reasoning이 사라진다**(live엔 있었고 history엔 없다) — 위 ②의 직접 결과; ② **`applyReasoning`에는 클라의 `.slice(-100)` 캡이 없다** — durable projection이 배달된 content를 조용히 버리는 건 N10이고, 보존/pruning은 **#299** 소관이다. 한 대화에서 reasoning burst가 100개를 넘으면 클라 live 목록은 오래된 걸 버렸는데 replay는 갖고 있다. 지금은 클라가 reducer를 안 타므로 **관측 불가능**하다.
+    - **half 2가 닫는 방식(순서가 요점):** frame 확장 + 클라 렌더 이전을 **한 단계로** 한다. 프레임만 먼저 넓히면 아무 클라도 안 읽는 필드를 배포하는 것이고, 캡은 **여기 추가하는 게 아니라 클라에서 제거**해서 맞춘다.
+    - **tool_activity·approval_\*은 여전히 non-durable**이며 `delivery-journal-event.ts`에서 "#242 half 2"로 표시돼 있다.
 - **fallback 이중 렌더는 갭이 아니다**: 스트림 재생이라 live·history에 **동일하게** 나타난다(둘 다 이중, 불일치 없음). 이중 렌더 제거는 problem-1(#215/#223)의 별도 라우팅 개선 — 고치면 스트림이 바뀌어 **양쪽 동시 개선.**
 - **범위:** 전-모드 event-stream 저널 + 공유 reducer read model, egress feed, **파괴적 컷오버(§15.6)**, client user-id 통일(§15.5), **tool/상태 버블 durable화(stable id + 이벤트 모델)**, projection≡live-reducer(공유 모듈). 구현 단계화: partial 답변 먼저 → off/block egress-id → tool/status durable. **설계상 tool durable은 확정(비범위 아님).**
 - **비범위(별도 이슈, live==history는 항상 유지):** fallback 이중 렌더 라우팅(problem-1, #215/#223); HA queue group(P-C: core도 외부상태 요구).
@@ -768,6 +787,9 @@ v5보다 Telegram에 더 충실하고, **live==history를 유지하면서** 원�
 3. **영구 typed delete + revision/seq 지배** (codex9/claude5). order-sensitive 부활 폐기 → `messageDeleted`(sequenced) + revision 지배. 복원은 새 id 또는 명시적 restore. **클라·공유 reducer 양쪽** 변경(둘 다 바꾸니 live==history 유지, codex 라운드-4 "dominance 발명 금지"와 안 충돌).
 4. **typed 이벤트 + edited 마커** (codex10/claude6). untyped LWW 대신 `messageCreated`/`messageEdited`/`messageDeleted` + monotonic revision; stale revision 거부; "edited" 표시. → §15.3 4-kind 모델을 typed union으로 확장.
 5. **durable content = tagged union**(not {role,text}) (codex12/claude11-12, 사용자 tool-durable 지시). user·answer·notice·**tool·approval**·(content로 남길 reasoning) = stable id + 구조화 내용 + seq. 순수 표시기만 ephemeral. → DurableMessage 타입 확장.
+   - 🟡 **부분 착지 (#242 half 1, 2026-08-27) — tagged union 자체는 생겼고, 멤버는 아직 둘이다.** `DurableMessage`가 `{kind:"text", id, role, text, turnId?} | {kind:"reasoning", id, turnId, text}` 로 바뀌었고 `DurableEvent`에 `kind:"reasoning"`이 추가됐다. **reasoning 변종에 `role`이 없는 건 누락이 아니라 결정**이다 — wire `reasoning` 프레임이 role을 안 싣고, 지어내면 SSOT 안의 날조(N8)다. 어떻게 렌더할지는 렌더가 있는 곳(half 2)에서 정한다. `turnId`는 반대로 **필수**다(wire가 `string`이고, 클라의 `case "reasoning"`이 turnId 없는 프레임을 버린다).
+   - 🔒 **그리고 reasoning의 durable화는 기본값이 OFF다** — `capabilities.reasoningDurable`(별도 키, 별도 결정). tagged union이 reasoning을 *표현할 수 있게* 된 것과 그 계정이 실제로 *디스크에 남기는* 것은 다른 문제다. §15.9의 reasoning 항목에 근거 전체가 있다: **#113's default-ON was a decision to render a volatile live lane, and it does not inherit to a decision to permanently record plaintext to disk.** 미래 슬라이스가 "reasoning은 durable이니 당연히 저널된다"로 넘어가지 않도록, 이 구분은 여기(SSOT)에 남긴다.
+   - ⚠️ **여기서 "확장했다"고 읽지 말 것:** `tool_activity`·`approval_request`·`approval_resolved`·`approval_snapshot`은 여전히 저널링되지 않으며 **#242 half 2** 소관이다. reasoning도 **서버 쪽만** 끝났다 — wire `history` 프레임(`HistoryMessage.role` = `"user"|"agent"`, 두 선언 모두)이 role 없는 메시지를 표현할 수 없어서 projection이 그 지점에서 **명시적으로 drop**한다. 남은 갭 전체는 §15.9의 reasoning 항목에 적어 뒀다.
 6. **per-conversation 연속 seq + `getDifference(afterSeq)` gap-sync** (codex4/claude7). Telegram pts/qts. ⚠️ **codex 날카로운 지적: DB-global AUTOINCREMENT를 그대로 노출하면 다른 대화 때문에 phantom gap 생김** → **대화별 연속 seq** 필요. 클라가 last-applied seq 보존, gap 감지, 차이만 fetch. 스냅샷을 authoritative high-water로 감쌈.
 7. **불변 plugin-소유 conversation id** (codex14, P-J 해소). authenticated account/peer로만 keying, mutable core route/agentId 배제. agents-bind가 대화를 orphan 안 시킴. → §15.5 P-J를 설계로 해결.
 8. **커밋된 user 이벤트를 전 기기 broadcast** (codex7/claude18). 서버가 확정 user 메시지(server id·seq)를 계정의 모든 기기로. 멀티디바이스 수렴. origin은 random_id로 화해.
@@ -780,7 +802,7 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 | Telegram vs 우리 | 라벨 | 근거 |
 |---|---|---|
 | 서버가 history store 소유 vs 우리는 core transcript 투영 | [#114] | ✅ **해소됨 (#240 half 2, 2026-08-26)** — core transcript reader 삭제, 앵커가 가리키던 `history.ts`의 `getSessionMessages` 호출 자체가 없어졌다(§15.6) |
-| 서버-배정 id vs 클라가 text/position로 추측 adopt | [#114] | `nats-client-wrapper.ts:2081-2113`; §16.2-1 |
+| 서버-배정 id vs 클라가 text/position로 추측 adopt | [#114] | `nats-client-wrapper.ts`의 `case "history"` **2-tier** adoption (id → user 행 한정 text+role). **position 티어는 #240 half 2가 삭제** — 이 행의 "position"은 이제 과거형이고, 잔여는 #302; §16.2-1 |
 | 한 계정 전 기기 동일 id vs 같은 메시지 3중 id | [#114] | `:2593,805,808`; §16.2-1 |
 | 서버 messageId + 클라 random_id vs 클라가 durable id 민팅 | [#114] | §15.5; `message-adapter.ts:23`; §16.2-1 |
 | 영구 delete vs remove-후-부활 | [#114] | `:1503,2569`; §16.2-3 |
@@ -789,8 +811,8 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 | 서버 seq 순서 vs stream-replay 순서(슬롯클레임+부활) | [#114] | §15.0; §16.2-3/6 |
 | persist-before-deliver vs commit-after-publish(agent) | [#114] | §15.8; §16.2-2 |
 | 전송 확인(sent/delivered/read)+persist vs 로컬 WS enqueue만 | [#114 부분/later] | `nats-transport.ts:759`; §16.2-2/9 |
-| 모든 message/service 타입 durable vs tool/reasoning/notice/approval ephemeral | [#114] | `:131-132`, `channel-contract.ts:29`; §16.2-5 |
-| service message가 typed durable vs 이벤트 모델서 누락(approval 등) | [#114] | `channel-contract.ts:98-100`; §16.2-5 |
+| 모든 message/service 타입 durable vs tool/reasoning/notice/approval ephemeral | [#114] | 🟡 **부분 (#242 half 1, 2026-08-27)** — reasoning만, 그것도 **서버 쪽만**(저널 burst당 1행 + reducer fold). 클라 렌더·`history` 프레임은 그대로 → 리로드하면 여전히 안 보인다. tool/approval은 미착수. 남은 갭 전체는 §15.9 reasoning 항목 |
+| service message가 typed durable vs 이벤트 모델서 누락(approval 등) | [#114] | `channel-contract.ts`의 `approval_*` 멤버들; §16.2-5 |
 | final↔답변 연결 vs 우리가 ordinal 억지매칭 desync | **[#114]** (S1 철회) | 내장 채널은 "현재 draft 마감 + 못 붙으면 새 메시지"; core 한계 아님(§16.1) |
 | **원본 inbound 각각을 durable 보존** vs 우리는 journaling 없이 메모리서 `{id:last,text:joined}`로 병합 | **[#114]** (라벨 정정) | ⚠️ codex 정정: "Telegram은 coalesce 안 함"은 **틀림** — 내장 Telegram도 coalesce함(`[core] extensions/telegram/src/bot-handlers.runtime.ts:636`). 차이는 **병합 전 각 원본을 journal에 남기느냐**다. `inbound-queue.ts:145`. 턴-레벨 coalesce는 남겨도 됨 |
 | ordinal을 **durable id/final-attribution 키로 안 씀** vs 우리는 `assistantMessageIndex`로 final↔lane 매칭 | [#114] | ⚠️ codex 정정: "Telegram은 ordinal 아예 안 씀"은 **틀림** — 내장 Telegram은 ordinal을 **queued-block 회전/상관 힌트**로 씀(`[core] bot-message-dispatch.ts:1357-1441`), 단 **durable id나 final 정체성으론 절대 안 씀**. 우리 죄는 ordinal을 **정체성**으로 쓴 것. `channel-contract.ts:60-64` |
@@ -913,6 +935,6 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 - **persist-before-publish로 §15.8 확정.** §15.8(commit-after)이 §0/N6·§16.2-2(persist-before)와 정면 모순. v6=persist-before가 이김. buffered-final이 transport 전에 `true` 반환 → 성공 보고됐는데 바이트 미전달 가능(`message-adapter.ts:2341-2350`). (codex-disc #4/#6)
 - **ingress 진짜 durability.** 지금 `accepted` 마커만 쓰고 본문은 in-process 큐에만 두고 ACK → crash 시 본문 영구 소실, replay는 마커 보고 재-ACK(`ingress-dedupe.ts:471-519`). SDK가 payload-bearing durable queue 제공. (codex-disc #5)
 - **프로토콜 버전 bump + capability negotiation.** v6가 correctness-critical id/seq/delete/sync 프레임 추가하는데 버전 협상 없음 → 옛 클라가 delete/sync를 조용히 무시하고 영구 발산(`protocol.ts`). (codex-disc #15)
-- **wire 런타임 검증.** "typed"가 TS 전용, 런타임은 `JSON.parse(...) as T` 무검증 → 악성/깨진 mutation·seq 프레임이 reducer 오염 가능(`nats-channel.ts:875-980`). v6에 런타임 디코딩/불변식. (codex-disc #17)
+- **wire 런타임 검증.** "typed"가 TS 전용, 런타임은 `JSON.parse(...) as T` 무검증 → 악성/깨진 mutation·seq 프레임이 reducer 오염 가능(`nats-channel.ts`). v6에 런타임 디코딩/불변식. (codex-disc #17)
 - **원본 inbound 각각 journaling** (병합 전) — §16.3 행 정정과 동일. (codex-disc #16)
 - 후속(구조적 아님): agent-down ingress 보관(JetStream/relay spool; S3 무손실 부분), delivery/read-state 프로토콜, message mutation API, HA journal ownership.
