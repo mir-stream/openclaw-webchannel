@@ -193,8 +193,16 @@ export function orderConversationPresentation(
  *
  * The property that makes a reasoning id safe was verified against the REAL
  * pager rather than assumed: a reasoning id is PLUGIN-minted, appears in the
- * projection, and `historyPageBefore` resolves by `findIndex` over the emitted
- * list without ever reading `kind`.
+ * projection WHEN THE ACCOUNT OPTED INTO `capabilities.reasoningDurable`, and
+ * `historyPageBefore` resolves by `findIndex` over the emitted list without ever
+ * reading `kind`.
+ *
+ * ⚠️ THAT QUALIFIER IS NOT A HEDGE — the opt-in DEFAULTS OFF, so in the default
+ * configuration a live reasoning id is in NO projection at all. Stating it
+ * unconditionally would have made this paragraph read as the safety argument for
+ * every deployment when it is the argument for one of them. The default case is
+ * covered by the paragraph below instead, and by the same rule: an unresolvable
+ * cursor is the empty page, which is honest, whereas the skip was a stall.
  *
  * ⚠️ AND THE WORRY THAT MOTIVATED THE SKIP WAS NOT NEW TO REASONING — that is
  * why it does not justify one. A published local user echo keeps its `u-<n>` id

@@ -148,12 +148,6 @@ type InitializedWebChannelState = Omit<WebChannelState, "toolActivity"> & {
 type DurableLocalOverlay = Record<string, Partial<ChatBubble>>;
 
 /**
- * Shallow equality over a bubble's own enumerable fields, so `mergeDurable` can
- * hand an UNCHANGED entry back by reference. `Object.is` rather than `===` only
- * to keep `NaN` (a plausible `ts`/`assistantMessageIndex` corruption) from
- * reporting a spurious change on every apply.
- */
-/**
  * What a state mutation may carry.
  *
  * ⚠️ `reasoning` IS EXCLUDED AT THE TYPE LEVEL (#242 half 2), and that exclusion
@@ -213,6 +207,19 @@ function nextStateFrom(
   return next;
 }
 
+/**
+ * Shallow equality over a transcript entry's own enumerable fields, so
+ * `mergeDurable` can hand an UNCHANGED entry back by reference. `Object.is`
+ * rather than `===` only to keep `NaN` (a plausible `ts`/`assistantMessageIndex`
+ * corruption) from reporting a spurious change on every apply.
+ *
+ * ⚠️ "ENTRY", NOT "BUBBLE" — this said `bubble` while it only ever saw bubbles,
+ * and #242 half 2 gave it a second caller (`mergeDurable`'s reasoning branch,
+ * `sameChatMessage(prevEntry, nextReasoning)`). The key-count check is what makes
+ * that work for BOTH kinds, which is why `ChatBubble.kind` and a reasoning
+ * entry's `ts` are absent as OWN KEYS rather than present-and-`undefined`; both
+ * of those declarations cite this function for the reason.
+ */
 function sameChatMessage(a: ChatMessage, b: ChatMessage): boolean {
   const aKeys = Object.keys(a);
   if (aKeys.length !== Object.keys(b).length) return false;
@@ -3167,8 +3174,10 @@ export class WebChannelNATSClient {
         // WHOLE transcript instead of walking a ≤100-entry side array. It is the
         // same per-frame O(messages) the other durable frames already pay, and
         // taking a cheaper private path would be the second implementation
-        // again — so the cost is accepted here and tracked as its own issue, not
-        // worked around.
+        // again — so the cost is accepted here and tracked as **#310**, not
+        // worked around. (Named rather than left as "its own issue": every other
+        // deferral in this slice cites a number, and an uncited one is a claim
+        // the next reader cannot check.)
         this.applyDurable({
           kind: "reasoning",
           id: msg.id,

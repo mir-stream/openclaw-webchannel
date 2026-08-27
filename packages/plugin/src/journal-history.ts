@@ -794,6 +794,30 @@ function recordFirstSeen(
  * only reachable for an account that opted into `capabilities.reasoningDurable`
  * (default OFF). Do not "fix" it by making the count kind-aware: that is a
  * second opinion about what a message is, held only by the pager.
+ *
+ * ⚠️ AND THAT IS THE MILD HALF. STATE THE OTHER ONE HERE, BECAUSE THIS IS THE
+ * SITE AN OPERATOR READS — **#311**. Fewer bubbles per page is a tuning
+ * annoyance; the same fact has a second consequence that is not. `limit`,
+ * `pageSize` and `MAX_WIRE_HISTORY_LIMIT` bound a page by ROW COUNT, and NOTHING
+ * bounds it by BYTES — a reasoning row is routinely an order of magnitude larger
+ * than a bubble, so the same row count is now a much larger frame. At the default
+ * `limit: 50`, a mean row of ~21 KB reaches a stock nats-server's 1 MiB
+ * `max_payload`.
+ *
+ * An oversized frame is NOT truncated. `nats-transport.ts`'s `publish` throws a
+ * `RangeError` and `history-serve.ts` catches it as "publish failed", so the peer
+ * receives NO HISTORY AT ALL — not "no reasoning" — on every reconnect, with no
+ * chunking and no retry. `history.ts`'s `MAX_WIRE_HISTORY_LIMIT` docblock already
+ * said an oversized frame "never arrives"; what half 2 changed is how easily a
+ * page reaches that size.
+ *
+ * ⚠️ AND IT DOES NOT UNDO. The `reasoningDurable` gate is at the JOURNALING seam
+ * only — `serveHistoryRequest` and `projectJournalHistory` take no config and
+ * never consult it — so flipping the key back OFF stops new rows and keeps
+ * serving every row already written. Recovery is #299 retention (unshipped) or
+ * journal surgery. The real fix is a byte-aware page budget (#311, with #286 /
+ * #298); it is deliberately NOT attempted here, because narrowing a page is a
+ * pager policy decision and this function's contract is "the most recent N".
  */
 export function recentHistoryPage(
   messages: readonly ProjectedHistoryMessage[],
