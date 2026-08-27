@@ -32,6 +32,7 @@ import {
   composerButtonMode,
   activityHint,
   oldestHistoryCursor,
+  HISTORY_PAGE_SIZE,
 } from "./presentation.js";
 
 const STATUS_LABEL: Record<WebChannelState["status"], string> = {
@@ -533,7 +534,8 @@ export async function createWidget(
     // participates in is driven end to end by `history-paging.test.ts`.
     client?.loadHistory({
       before: oldestHistoryCursor(client.getState().messages),
-      limit: 20,
+      // Shared with `history-paging.test.ts`; see `HISTORY_PAGE_SIZE`.
+      limit: HISTORY_PAGE_SIZE,
     });
   };
   shortBtn.onclick = () => { connectLaneGuarded(SHORT_TTL_SECONDS); };

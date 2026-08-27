@@ -13,13 +13,21 @@ export { ANON_PEER_ID };
  * DERIVED from this one, so the relationship is checked by tsc instead of
  * asserted in prose. Do not restate this shape anywhere else.
  *
- * ⚠️ ONE EXCEPTION EXISTS, AND NAMING IT IS CHEAPER THAN AN ABSOLUTE THAT IS
- * ALREADY FALSE. `packages/client/src/nats-client.ts` re-declares the row
- * LOOSELY — one flat record with optional `kind`/`role`/`turnId`, not this union
- * — because that package is zero-dependency and may not import the plugin. It is
- * labelled as such at its declaration, it discriminates at RUNTIME (where values
- * off the wire have to be validated anyway), and it is not a second copy of this
- * SHAPE. Every other restatement is still forbidden.
+ * ⚠️ "DO NOT RESTATE" IS A DIRECTIVE, NOT A CENSUS — and the difference is not
+ * pedantry, it is the fifth time in one review that counting the other sites
+ * produced a false claim. A previous revision said "ONE EXCEPTION EXISTS" and
+ * named `nats-client.ts`; that was itself wrong, because
+ * `reasoning-turn.test-harness.ts` declares a second structural copy of both
+ * arms. Restatements that DO exist, and why each is tolerated:
+ *  - `packages/client/src/nats-client.ts` — one flat record with optional
+ *    `kind`/`role`/`turnId`, not this union, because that package is
+ *    zero-dependency and may not import the plugin. It discriminates at RUNTIME,
+ *    where wire values must be validated anyway.
+ *  - `packages/client/src/reasoning-turn.test-harness.ts` — both arms minus
+ *    `ts`, as the shared FIXTURE two packages assert against. Same dependency
+ *    reason; it is plain data with no imports.
+ * Neither is load-bearing for the wire SHAPE, which is this file's. The rule for
+ * anyone reading: add no more, and if you must, say why here.
  */
 
 /**

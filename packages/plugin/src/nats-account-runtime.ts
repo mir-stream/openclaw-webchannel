@@ -953,8 +953,12 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // start that gets this far and then fails has already logged, and the
       // retry loop logs again on every attempt. That is acceptable for a
       // config-time diagnostic — the condition it reports is genuinely still
-      // true on each retry — but do not cite this line as a once-per-process
+      // true on each retry — but do not cite this line as a once-per-account
       // guarantee the way `inbound.ts`'s `reasoningEmptyLaneWarned` latch is.
+      // (And that latch is once per account per PLUGIN LOAD, not per process:
+      // its own docblock says `stopAgentLifecycleSubscription` clears it, so a
+      // reload re-arms it deliberately, and `MAX_WARNED_ACCOUNTS` eviction can
+      // cost a repeat too. This line said "per-process", which overstated it.)
       if (reasoningDurable && !resolveReasoningEnabled(account)) {
         log("warn",
           `webchannel: capabilities.reasoningDurable is ON but capabilities.reasoning is OFF for ` +

@@ -811,7 +811,7 @@ describe("history hydration — reasoning rows (#242 half 2)", () => {
   });
 
   it("still drops a repeat of the same id WITHIN one page — both kinds", () => {
-    // The other half of the kind conjunct, pinned so a future edit cannot buy
+    // The other half of the kind-KEYED tier 1, pinned so a future edit cannot buy
     // the cross-kind fix by re-admitting within-page repeats. A fresh insert
     // adds to `seen` WITHOUT adding to `localIndexByKey`, so "seen but not
     // locally held" means "a repeat of an id earlier in THIS page" — still a

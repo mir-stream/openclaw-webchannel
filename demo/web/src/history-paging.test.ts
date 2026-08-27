@@ -30,7 +30,7 @@ import type { ProjectedHistoryMessage } from "../../../packages/plugin/src/histo
 import { WebChannelNATSClient } from "../../../packages/client/src/index.js";
 import type { ChatMessage } from "../../../packages/client/src/types.js";
 
-import { oldestHistoryCursor } from "./presentation.js";
+import { oldestHistoryCursor, HISTORY_PAGE_SIZE } from "./presentation.js";
 
 const TURN = "t1";
 
@@ -55,8 +55,15 @@ function deliver(client: WebChannelNATSClient, frame: AnyFrame): void {
   (client as unknown as { handleMessage: (m: AnyFrame) => void }).handleMessage(frame);
 }
 
-/** The widget's own page size (`widget.ts`'s `historyBtn.onclick`). */
-const WIDGET_LIMIT = 20;
+/**
+ * The widget's own page size — IMPORTED, not copied.
+ *
+ * It was `const WIDGET_LIMIT = 20;` here while `widget.ts` had `limit: 20`
+ * inline, so the two could drift and this file would stay green while measuring
+ * a boundary the widget no longer used — which is exactly what the boundary test
+ * below promises cannot happen.
+ */
+const WIDGET_LIMIT = HISTORY_PAGE_SIZE;
 
 /**
  * One "load older" click: pick the cursor the way the widget does, serve the
@@ -132,11 +139,22 @@ describe('"load older" reaches the start of the conversation', () => {
     expect(ids(client)).toEqual(projection.map((m) => m.id));
   });
 
-  it("the run length that stalls is exactly `limit`, so the boundary is pinned", () => {
+  it("the run length that stalls is exactly `limit` — the cliff, with its control", () => {
     // A run of `limit - 1` leaves one bubble inside the first page, so even a
     // reasoning-skipping cursor advances. The defect only appears at `limit`.
-    // Both directions are asserted so a future page-size change cannot silently
-    // move the cliff without moving this test.
+    //
+    // ⚠️ THE TWO LEGS ARE NOT SYMMETRIC, AND THE TITLE USED TO IMPLY THEY WERE.
+    // Only the `WIDGET_LIMIT` leg carries regression value: it is the one that
+    // goes red under a reasoning-skipping picker. The `WIDGET_LIMIT - 1` leg
+    // passes under the BUGGY picker too — that is precisely what makes it a
+    // CONTROL rather than a second assertion. It is what locates the cliff at
+    // `limit` instead of somewhere below it; without it, a failure at
+    // `WIDGET_LIMIT` would not tell you the boundary.
+    //
+    // This also said "a future page-size change cannot silently move the cliff
+    // without moving this test", which was false while `WIDGET_LIMIT` was a
+    // literal copied from the widget. It is now IMPORTED (see its declaration),
+    // so the sentence holds: change the page size and both legs follow.
     for (const runLength of [WIDGET_LIMIT - 1, WIDGET_LIMIT]) {
       const projection = projectionWithReasoningRun(runLength);
       const client = newClient();

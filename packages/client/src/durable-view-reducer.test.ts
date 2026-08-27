@@ -1481,7 +1481,12 @@ describe("live == history for reasoning: a reload reproduces what was watched", 
    * `progress`), and round 1 asserted a DICHOTOMY — "safe if closed by
    * `endBurst`, broken if closed at turn end" — that this stream refutes: the
    * burst below closes via `endBurst`, mid-turn, and still diverges. The real
-   * invariant is stated once, in `journal-history.ts`'s conversion loop.
+   * invariant is stated canonically in `journal-history.ts`'s conversion loop —
+   * cite that, do not copy it. (This read "stated ONCE", which was the fifth
+   * form of a census that has been wrong in every one of them. The invariant is
+   * in fact restated verbatim in several files; that is the drift the canonical
+   * block asks future writers to stop adding to, and it is not something a
+   * comment can truthfully claim to have already achieved.)
    *
    * The plugin half drives the same fixture through the REAL mapper and the REAL
    * projection, so both directions are pinned in both packages.
