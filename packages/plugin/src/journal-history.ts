@@ -615,15 +615,45 @@ export function projectJournalHistory(
     // sourced identically for both, and `recordFirstSeen` already dated
     // reasoning ids in half 1 precisely so this step would inherit it unchanged.
     //
-    // ⚠️ GAP 2b — ORDERING. A reasoning block's POSITION here is where its
-    // JOURNAL ROW fell, which is the moment the burst CLOSED. The client's live
-    // position is where the burst's FIRST frame arrived, because `applyReasoning`
-    // appends on the first upsert and keeps the slot afterwards. Those agree for
-    // every burst closed by `endBurst` — the ordinary case, where the reasoning
-    // ends before the answer streams — and DISAGREE for a burst still open at
-    // turn end: `inbound.ts` closes it from its `finally`, after the answer's
-    // `progress`/`agent_message` rows are already journaled, so the replay puts
-    // it after the turn's answers while live put it before them.
+    // ── ⚠️ GAP 2b — ORDERING. THIS IS THE CANONICAL STATEMENT; THE OTHER THREE
+    //    SITES POINT HERE RATHER THAN RESTATING IT ──
+    //
+    // A reasoning block's POSITION here is where its JOURNAL ROW fell, which is
+    // the moment the burst CLOSED — the journal records the ONE `final: true`
+    // frame and nothing else of the burst. The client's live position is where
+    // the burst's FIRST DELIVERED frame arrived, because `applyReasoning` appends
+    // on the first upsert and keeps the slot afterwards.
+    //
+    // THE INVARIANT, stated as the condition it actually is:
+    //
+    //   live and replay agree for a burst IFF no `placement` or `bubble` row is
+    //   journaled BETWEEN that burst's first delivered frame and its closing
+    //   frame.
+    //
+    // ⚠️ DO NOT WRITE THE DICHOTOMY THIS BLOCK USED TO CARRY. It said the two
+    // "agree for every burst closed by `endBurst` … and DISAGREE for a burst
+    // still open at turn end", which is a false universal in BOTH directions and
+    // was refuted at the frame level:
+    //
+    //   reasoning r1 "th" | progress A | reasoning r1 "thinking" final | agent_message A
+    //   LIVE   [r1, A]        (r1 appended at the first frame, before A's slot)
+    //   REPLAY [A, r1]        (A's placement row precedes the burst's one row)
+    //
+    // That burst closes via `endBurst`, MID-TURN, which the old text called the
+    // safe case. `endBurst` establishes nothing about interleaving; the closing
+    // MECHANISM is not the variable, the interleaving is. The dichotomy also
+    // omitted BOTH `pushDurableBlock` branches — burst-closing points just like
+    // `endBurst` and `stop()` — and `pushDurableBlock` is called from inside the
+    // `delivery.deliver` seam (`inbound.ts`, the `payload.isReasoning === true`
+    // interception), i.e. the very seam that journals answer bubbles.
+    //
+    // ⚠️ NOT A CLAIM THAT PINNED CORE REACHES THAT ORDER TODAY. Core emits a
+    // reasoning end at `thinking_end` / `</think>`, both of which precede visible
+    // answer text on the pinned runners, so the counterexample above is a
+    // property of OUR event model rather than an observed production bug. It is
+    // written down because a refutable condition must not be presented as an
+    // exact characterization — the next reader will build on whichever one is
+    // here.
     //
     // ⚠️ AND THE FIX THE REDUCER'S `applyReasoning` DOCBLOCK NAMED FOR HALF 2 —
     // "the ORDER of those two calls in `inbound.ts`'s turn teardown" — DOES NOT
@@ -808,8 +838,28 @@ export function recentHistoryPage(
  *
  * The second bullet is a CLIENT-side cursor-choice concern, not a server one:
  * whatever the widget hands us, "not in the projection ⇒ no more history" is the
- * honest answer, and it is why `demo/web/src/widget.ts`'s oldest-cursor pick
- * excludes rows whose id may be local-only.
+ * honest answer.
+ *
+ * ⚠️ AND THE OBVIOUS CLIENT-SIDE PRECAUTION IS A DEADLOCK — DO NOT SUGGEST IT.
+ * An earlier revision of this paragraph ended "…which is why the oldest-cursor
+ * pick excludes rows whose id may be local-only", pointing approvingly at a pick
+ * that skipped reasoning rows. That pick was the DEFECT: once the `limit` rows
+ * before the oldest held BUBBLE are all reasoning, the cursor stops advancing,
+ * every page re-serves rows the client holds, and older history becomes
+ * permanently unreachable. Measured at `limit: 20` over `[u0, r1…r30, A]`; the
+ * cliff is exactly at run length `limit`. `demo/web/src/history-paging.test.ts`
+ * drives this function, the widget's picker and the client's merge together and
+ * pins it. A cursor may be ANY projected message id, reasoning included.
+ *
+ * ⚠️ AN OLDER CLIENT STALLS THE SAME WAY, AND THE REPAIR IS NOT HERE. It DROPS
+ * role-less rows (see `channel-contract.ts`), so its transcript can never hold a
+ * reasoning id to cite and its cursor sticks on the same bubble. The tempting
+ * server-side fix — "every page must contain at least one role-bearing row" — is
+ * a supersession rule invented in the projection, which is N8 and is the exact
+ * defect class this module exists to prevent. It is a consequence of opting into
+ * `capabilities.reasoningDurable` while a peer runs a stale client, and the real
+ * fix is **#246** (protocol version + runtime wire validation), which lets the
+ * server know a peer cannot read the row before it serves one.
  */
 export function historyPageBefore(
   messages: readonly ProjectedHistoryMessage[],

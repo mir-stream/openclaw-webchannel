@@ -1212,84 +1212,118 @@ describe("against a REAL openDeliveryJournal", () => {
 // ---------------------------------------------------------------------------
 //
 // The client half — "the live view and a replayed `history` frame agree, in
-// content and in position" — is pinned in
+// content and in position" — is in
 // `packages/client/src/durable-view-reducer.test.ts`'s
 // "live == history for reasoning" block, which drives the REAL wrapper with the
 // REAL wire frames and then hands a FRESH wrapper a `history` frame.
 //
-// ⚠️ THAT TEST BUILDS ITS `history` ROWS BY HAND, because the client package is
-// zero-dependency and may not import this one. So on its own it proves the
-// client is self-consistent for rows OF THAT SHAPE — not that the plugin serves
-// them. This case closes exactly that gap, from the other side, over the SAME
-// turn: it drives the REAL `journalEventForOutbound` with the REAL outbound
-// frames the turn emits, writes the events it returns as journal rows, projects
-// them, and asserts the served rows are byte-for-byte the ones the client test
-// consumes. If either side is edited alone, one of the two goes red.
-describe("live == history for reasoning: what the plugin actually serves (#242 half 2)", () => {
-  /** Exactly the outbound frames the client-side twin drives, in order. */
-  const TURN_FRAMES: OutboundWsMessage[] = [
-    { type: "reasoning", id: "r1", turnId: TURN, text: "Let" },
-    { type: "reasoning", id: "r1", turnId: TURN, text: "Let me" },
-    { type: "reasoning", id: "r1", turnId: TURN, text: "Let me think" },
-    { type: "reasoning", id: "r1", turnId: TURN, text: "Let me think", final: true },
-    { type: "progress", id: "A", text: "Working…", turnId: TURN },
-    { type: "agent_message", id: "A", text: "first answer", turnId: TURN },
-    { type: "reasoning", id: "r2", turnId: TURN, text: "and also", final: true },
-    { type: "agent_message", id: "B", text: "second answer", turnId: TURN },
-  ];
+// ⚠️ THE TWO HALVES SHARE ONE FIXTURE, AND ROUND 1'S CLAIM THAT THEY DID WAS
+// FALSE. This block used to say "asserts the served rows are byte-for-byte the
+// ones the client test consumes … if either side is edited alone, one of the two
+// goes red" — while both files carried INDEPENDENT hand-written literals with no
+// shared constant, no import edge, and different `ts` values. Reordering the
+// client's copy, or adding a `role` to one of its reasoning rows, left this file
+// green. Both now import `reasoning-turn.test-harness.ts` from the CLIENT
+// package, which this file's module already depends on (`journal-history.ts` →
+// `durable-view-reducer.ts`), so the edge and its direction are unchanged.
+//
+// WHAT EACH HALF PROVES, stated separately because they are different claims:
+//   - THIS half: the real `journalEventForOutbound` + the real projection EMIT
+//     exactly `ORDINARY_TURN_ROWS`, with the `ts` sourcing this module owns;
+//   - the CLIENT half: replaying those rows renders what the live stream did.
+// Neither proves the other, and neither can be edited alone any more.
+import {
+  INTERLEAVED_TURN_FRAMES,
+  INTERLEAVED_TURN_REPLAY_IDS,
+  ORDINARY_TURN_FRAMES,
+  ORDINARY_TURN_ROWS,
+  type ReasoningTurnFrame,
+} from "../../client/src/reasoning-turn.test-harness.js";
 
-  function journalRowsFor(frames: readonly OutboundWsMessage[]): DeliveryJournalRow[] {
+describe("live == history for reasoning: what the plugin actually serves (#242 half 2)", () => {
+  const asOutbound = (frame: ReasoningTurnFrame): OutboundWsMessage =>
+    frame as unknown as OutboundWsMessage;
+
+  function journalRowsFor(
+    frames: readonly ReasoningTurnFrame[],
+    reasoningDurable = true,
+  ): DeliveryJournalRow[] {
     const events: JournalEvent[] = [];
     for (const frame of frames) {
-      const event = journalEventForOutbound(frame, { reasoningDurable: true });
+      const event = journalEventForOutbound(asOutbound(frame), { reasoningDurable });
       if (event !== null) events.push(event);
     }
     return rowsFor(events);
   }
 
+  /** A served row with `ts` stripped — the shape the shared fixture pins. */
+  const withoutTs = (row: ProjectedHistoryMessage): unknown => {
+    const { ts: _ts, ...rest } = row;
+    return rest;
+  };
+
   it("ONE row per burst — the unthrottled cumulative stream does not reach the store", () => {
     // Stated first: without the `final` gate this turn would write three rows
     // for `r1` alone, each holding the whole text so far.
-    const rows = journalRowsFor(TURN_FRAMES);
-    expect(rows.map((r) => r.kind)).toEqual([
+    expect(journalRowsFor(ORDINARY_TURN_FRAMES).map((r) => r.kind)).toEqual([
       "reasoning",
       "placement",
       "bubble",
       "reasoning",
       "bubble",
     ]);
+    // Non-vacuity: the fixture really does stream the burst more than once.
+    expect(
+      ORDINARY_TURN_FRAMES.filter((f) => f.type === "reasoning" && f.final !== true),
+    ).not.toHaveLength(0);
   });
 
   it("serves EXACTLY the rows the client-side live==history twin replays", () => {
-    const { read } = fakeReader(journalRowsFor(TURN_FRAMES));
+    const { read } = fakeReader(journalRowsFor(ORDINARY_TURN_FRAMES));
     const messages = projectJournalHistory(read, CONV).messages;
 
-    // ⚠️ `toEqual` on the whole array: no `role` on a reasoning row, no `kind`
-    // on a text row, and the ORDER is the reducer's — which for this turn is the
-    // order the peer watched.
-    expect(messages).toEqual([
-      { kind: "reasoning", id: "r1", turnId: TURN, text: "Let me think", ts: T0 + 0 * T_STEP },
-      { id: "A", role: "agent", text: "first answer", ts: T0 + 1 * T_STEP },
-      { kind: "reasoning", id: "r2", turnId: TURN, text: "and also", ts: T0 + 3 * T_STEP },
-      { id: "B", role: "agent", text: "second answer", ts: T0 + 4 * T_STEP },
-    ]);
+    // ⚠️ THE SHARED FIXTURE IS THE EXPECTATION. `toEqual` on the whole array
+    // after stripping `ts`: no `role` on a reasoning row, no `kind` on a text
+    // row, and the ORDER is the reducer's.
+    expect(messages.map(withoutTs)).toEqual(ORDINARY_TURN_ROWS.map((row) => ({ ...row })));
     // The position claim, stated on its own so a reordering regression names
     // itself rather than hiding inside the equality above.
     expect(messages.map((m) => m.id)).toEqual(["r1", "A", "r2", "B"]);
-    // `A`'s `ts` is its PLACEMENT's row (seq 2, index 1), not its bubble's —
-    // first appearance, as `recordFirstSeen` promises, unchanged by half 2.
+
+    // `ts` is THIS module's concern and is asserted here rather than in the
+    // shared fixture — first appearance, so `A` is dated by its PLACEMENT row
+    // (index 1), not by its bubble.
+    expect(messages.map((m) => m.ts)).toEqual([
+      T0 + 0 * T_STEP,
+      T0 + 1 * T_STEP,
+      T0 + 3 * T_STEP,
+      T0 + 4 * T_STEP,
+    ]);
   });
 
   it("serves NOTHING for the same turn when the account did not opt in", () => {
     // Non-vacuity for the whole block, and the shipped default: with
     // `reasoningDurable` off the identical frames produce a bubble-only history,
     // and the peer's reload legitimately shows no reasoning.
-    const events: JournalEvent[] = [];
-    for (const frame of TURN_FRAMES) {
-      const event = journalEventForOutbound(frame, { reasoningDurable: false });
-      if (event !== null) events.push(event);
-    }
-    const { read } = fakeReader(rowsFor(events));
+    const { read } = fakeReader(journalRowsFor(ORDINARY_TURN_FRAMES, false));
     expect(projectJournalHistory(read, CONV).messages.map((m) => m.id)).toEqual(["A", "B"]);
+  });
+
+  /**
+   * ⚠️ CHARACTERIZATION — GAP 2b, FROM THE SERVER SIDE.
+   *
+   * The shared fixture's ordinary turn closes every burst before the next
+   * answer's `progress`, so it cannot reach the ordering divergence. This drives
+   * the fixture that can, through the REAL mapper and the REAL projection, and
+   * pins the order the SERVER produces; the client half pins the order the LIVE
+   * client produces for the same frames. The two expectations differ ON PURPOSE
+   * — that difference IS the gap, and it is now measured in both packages
+   * instead of asserted in a comment.
+   */
+  it("CHARACTERIZATION: an answer slot claimed mid-burst replays out of live order", () => {
+    const { read } = fakeReader(journalRowsFor(INTERLEAVED_TURN_FRAMES));
+    expect(projectJournalHistory(read, CONV).messages.map((m) => m.id)).toEqual([
+      ...INTERLEAVED_TURN_REPLAY_IDS,
+    ]);
   });
 });

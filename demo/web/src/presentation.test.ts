@@ -100,10 +100,16 @@ describe("activityHint (#96 — the transcript-tail activity line)", () => {
   });
 
   it("still shows the gap hint when the turn already produced reasoning", () => {
-    // The Fix-1 regression: `state.reasoning` is a rolling buffer with no
-    // liveness notion, so gating the WHOLE hint on it would suppress "still
-    // working…" for the rest of any turn that ever emitted one reasoning frame
-    // — i.e. never render it on a default (reasoning-on) deployment.
+    // The Fix-1 regression: `state.reasoning` carries no liveness notion, so
+    // gating the WHOLE hint on it would suppress "still working…" for the rest
+    // of any turn that ever emitted one reasoning block — i.e. never render it
+    // on a default (reasoning-on) deployment.
+    //
+    // ⚠️ This said "is a rolling buffer". `presentation.ts` dropped that phrase
+    // in #242 half 2 and this test did not: `state.reasoning` is now DERIVED
+    // from `state.messages` and UNCAPPED, and it also holds blocks replayed from
+    // history. The argument is unaffected — it never depended on the buffer, and
+    // an unbounded, history-bearing list makes it STRONGER.
     expect(activityHint({ ...gap, reasoning, approvals: [] })).toBe("still working…");
   });
 

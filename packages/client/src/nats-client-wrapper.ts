@@ -184,11 +184,25 @@ function deriveReasoning(messages: readonly ChatMessage[]): ReasoningItem[] {
 /**
  * Apply one patch and recompute every DERIVED field.
  *
- * The derivation is conditional on `messages` being in the patch, which keeps
- * `state.reasoning`'s ARRAY IDENTITY stable across the many patches that do not
- * touch the transcript — `WebChannelState`'s docblock promises a listener can
- * detect updates by identity, and recomputing unconditionally would report a
- * change on every `typing` frame.
+ * The derivation is conditional on `messages` being in the patch, so
+ * `state.reasoning` keeps its ARRAY IDENTITY across patches that do not touch
+ * the transcript — `typing`, `commands`, `approvals`, connection status.
+ *
+ * ⚠️ BE HONEST ABOUT WHAT THAT DOES AND DOES NOT BUY. An earlier revision said
+ * the alternative "would report a change on every `typing` frame", which is true
+ * and also the least of it. MEASURED: `state.reasoning` gets a FRESH array on
+ * EVERY patch that touches `messages`, contents identical or not — two
+ * consecutive `progress` frames each produce a new one. `progress` is far more
+ * frequent during a turn than `typing` is, so a listener that keys off
+ * `state.reasoning`'s identity still sees churn; what this condition removes is
+ * the churn OUTSIDE a turn, not inside one.
+ *
+ * That is consistent with the rest of the object rather than a compromise —
+ * `WebChannelState`'s docblock promises a new object per change, "the arrays
+ * too", and `messages` itself is rebuilt by `mergeDurable` on every durable
+ * frame. A content-equality memo here would be a fourth opinion about when a
+ * view changed; the reducer's own header already refuses that reasoning for
+ * array identity.
  */
 function nextStateFrom(
   prev: InitializedWebChannelState,
@@ -2193,15 +2207,30 @@ export class WebChannelNATSClient {
   private applyDurable(
     event: DurableEvent,
     local?: DurableLocalOverlay,
-    extra?: Partial<InitializedWebChannelState>,
+    // ⚠️ `StatePatch`, NOT `Partial<InitializedWebChannelState>` — this was the
+    // ONE door left unnarrowed in #242 half 2, and a spread hole is still a
+    // hole: `setState({ messages, ...extra })` does not error on a `reasoning`
+    // key arriving through the spread, so `StatePatch`'s claim that assigning
+    // `reasoning` is "a compile error, not a convention" was true of every
+    // caller except this one. Closed rather than weakened, because a guarantee
+    // with a documented exception is the shape nobody checks.
+    extra?: StatePatch,
   ): void {
     this.setState({ messages: this.nextDurableMessages(event, local), ...extra });
   }
 
   // #97: upsert a tool-activity item by turn-scoped `(turnId, id)`. A later
   // sparse lifecycle frame refines the same call without erasing name/argKeys
-  // learned at start. Bounded like `reasoning`; ephemeral, NOT cleared on
-  // turn_settled (a live-not-durable surface).
+  // learned at start. Ephemeral, NOT cleared on turn_settled (a live-not-durable
+  // surface), and bounded at 100 by the `.slice(-100)` below.
+  //
+  // ⚠️ "BOUNDED LIKE `reasoning`" IS NO LONGER TRUE — #242 half 2 DELETED that
+  // bound. Reasoning is a DURABLE message now: it lives in `state.messages`, is
+  // uncapped there to match the durable view, and `state.reasoning` is derived
+  // from it. Tool activity is still a live-only side array with no durable twin
+  // to disagree with, so its cap costs nothing and stays. When half 3 makes tool
+  // activity durable this cap has to go the same way, for the same reason — a
+  // live cap over an uncapped durable view IS a live≠history divergence.
   private upsertToolActivity(item: ToolActivityItem): void {
     const current = this.state.toolActivity;
     const idx = current.findIndex(
@@ -2545,10 +2574,22 @@ export class WebChannelNATSClient {
          * NOT THE TEXT TEST (#242 half 2 — checked, because "empty text" would
          * be the tempting thing to blame). A reasoning row carries NO `role`, so
          * the first conjunct is already false and the row is kept whatever its
-         * text says. There is also no empty reasoning row to keep: the plugin's
-         * `closeLiveBurst` only emits the burst's durable frame when
-         * `lastDeliveredText.length > 0`, so a burst that reached nobody is
-         * never journaled in the first place.
+         * text says.
+         *
+         * ⚠️ THAT IS WHY AN EMPTY REASONING ROW IS REFUSED IN THE REASONING
+         * BRANCH INSTEAD, and it is a different rule with a different reason.
+         * Live, `case "reasoning"` drops a frame whose `text` is empty
+         * (`msg.text.length === 0`). Without a matching admission rule here the
+         * same content would be DROPPED live and KEPT from history — an empty
+         * `<details>` the live path would never draw, which is an N8 divergence
+         * this door introduced. It is not enough that the plugin's
+         * `closeLiveBurst` only emits a burst frame when
+         * `lastDeliveredText.length > 0`: that makes such a row unreachable FROM
+         * OUR PLUGIN, not absent, and this reducer's standing policy is that a
+         * history row is validated on its own rather than on trust in the
+         * server. (Contrast the empty USER row below, which is deliberately
+         * KEPT: nothing drops an empty user bubble live either, so keeping it is
+         * what agrees.)
          */
         const incoming = rawIncoming.filter(
           (m) =>
@@ -2761,6 +2802,11 @@ export class WebChannelNATSClient {
            */
           if (m.kind === "reasoning") {
             if (typeof m.turnId !== "string" || m.turnId.length === 0) continue;
+            // ⚠️ THE SAME ADMISSION RULE `case "reasoning"` APPLIES LIVE. Its
+            // guard is `msg.text.length === 0`, and a history row must meet it
+            // too or the identical content renders from one door and not the
+            // other — see the empty-row note at the top of this case.
+            if (m.text.length === 0) continue;
             if (seen.has(m.id)) {
               const li = localIndexById.get(m.id);
               if (li !== undefined) {

@@ -2240,6 +2240,28 @@ describe("WebChannelNATSClient — reasoning lane", () => {
     expect(wrapper.getState().reasoning).toBe(before);
   });
 
+  it("but it DOES churn on every frame that touches the transcript — measured, not implied", () => {
+    // ⚠️ THE HONEST OTHER HALF, pinned because `nextStateFrom`'s docblock used
+    // to state only the `typing` case and that reads as a stronger guarantee
+    // than it is. A `progress` frame patches `messages`, so `reasoning` is
+    // rebuilt — identical contents, new array — and `progress` is far more
+    // frequent during a turn than `typing` is. Consistent with the rest of the
+    // object (`WebChannelState` promises a new object per change, "the arrays
+    // too"), but a subscriber must not read this array's identity as "the
+    // reasoning changed".
+    const wrapper = makeWrapper();
+    deliver(wrapper, { type: "reasoning", id: "r1", turnId: "t1", text: "thought" });
+    const before = wrapper.getState().reasoning;
+    deliver(wrapper, { type: "progress", id: "A", turnId: "t1", text: "Working…" });
+    const after = wrapper.getState().reasoning;
+    expect(after).not.toBe(before);
+    expect(after).toEqual(before);
+    // Two consecutive `progress` frames churn it again, with nothing to show.
+    deliver(wrapper, { type: "progress", id: "A", turnId: "t1", text: "Working… more" });
+    expect(wrapper.getState().reasoning).not.toBe(after);
+    expect(wrapper.getState().reasoning).toEqual(before);
+  });
+
   it("a reasoning block sits between the answers it was delivered between", () => {
     // Position comes from the stream, not from `turnId` grouping — the property
     // the demo's deleted interleave used to supply and now must not.

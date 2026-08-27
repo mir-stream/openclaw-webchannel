@@ -654,12 +654,31 @@ describe("history hydration — reasoning rows (#242 half 2)", () => {
     expect(w.getState().messages.map((m) => m.id)).toEqual(["r1"]);
   });
 
-  it("the empty-agent-row filter cannot eat a reasoning row — it tests `role`", () => {
-    // The filter's first conjunct is `role === "agent"`, which a role-less row
-    // fails, so the text test is never reached. Driven with EMPTY text so the
-    // second conjunct is true and only the first can be doing the work.
+  it("an EMPTY reasoning row is refused, exactly as the live frame is", () => {
+    // ⚠️ THIS CASE ASSERTED THE OPPOSITE IN ROUND 1 — it pinned the row as KEPT,
+    // on the true-but-insufficient ground that the empty-AGENT-row filter tests
+    // `role` and so cannot reach a role-less row. It cannot; that is why the
+    // rule had to be added to the reasoning branch instead. Measured: live,
+    // `{type:"reasoning", text:""}` yields `messages: []` (the
+    // `msg.text.length === 0` guard); before this fix the same content arriving
+    // as a history row RENDERED — an empty `<details>` the live path never
+    // draws. Agreement is the property, not which door is stricter.
+    const live = makeWrapper();
+    deliver(live, { type: "reasoning", id: "r1", turnId: "t1", text: "" });
+    expect(live.getState().messages).toEqual([]);
+
+    const replayed = makeWrapper();
+    deliver(replayed, history(reasoningRow("r1", "t1", "", 1)));
+    expect(replayed.getState().messages).toEqual([]);
+    expect(replayed.getState().reasoning).toEqual([]);
+  });
+
+  it("keeps a NON-empty reasoning row past the empty-agent-row filter", () => {
+    // Non-vacuity for the case above: the admission rule must be the TEXT rule
+    // in the reasoning branch, not the agent filter widening to eat every
+    // role-less row.
     const w = makeWrapper();
-    deliver(w, history(reasoningRow("r1", "t1", "", 1)));
+    deliver(w, history(reasoningRow("r1", "t1", "kept", 1)));
     expect(w.getState().messages.map((m) => m.id)).toEqual(["r1"]);
   });
 

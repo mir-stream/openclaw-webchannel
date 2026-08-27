@@ -79,9 +79,18 @@ export type HistoryTextMessage = {
  *
  *   That guard is not new in this slice, and it is not a claim about ONE build:
  *   `git show <tag>:packages/client/src/nats-client-wrapper.ts | grep -c` finds
- *   it in EVERY released tag — v0.4.0, v0.5.0, v0.6.0, v0.6.1 and v0.7.0, one
- *   occurrence each. There is no published client that predates it, so there is
- *   no version of this package that mis-renders the new row.
+ *   it exactly ONCE in EVERY ONE of the 15 released tags — v0.1.0 through
+ *   v0.1.8, v0.2.0, v0.4.0, v0.5.0, v0.6.0, v0.6.1, v0.7.0. There is no
+ *   published client that predates it, so there is no version of this package
+ *   that mis-renders the new row.
+ *
+ *   ⚠️ TWO COUNTING TRAPS, BOTH HIT WHILE ESTABLISHING THIS. The first draft
+ *   listed FIVE tags and read as exhaustive — a partial list in exhaustive
+ *   clothing, and weaker than the truth. The correction offered in review was
+ *   "all 17 tags", which is also wrong: `git tag` returns 17, but two of them
+ *   (`archive/issue-53-pre-rebase-checkpoint`, `issue-94-pr2-superseded`) are
+ *   working checkpoints, not releases. 15 is the number of things a peer can
+ *   actually be running. Re-derive it with `git tag --list 'v*'`, not `git tag`.
  *
  * `turnId` is REQUIRED, following the live frame (`turnId: string`) and
  * `DurableMessage`'s reasoning variant. `ts` is the same hydration metadata the
@@ -170,11 +179,21 @@ export type OutboundWsMessage =
        * journaling every `reasoning` frame would write O(n²) bytes per burst.
        * With the flag a burst costs exactly one row.
        *
-       * ADDITIVE AND OPTIONAL: an older client ignores the extra key and takes
-       * the frame down its ordinary `reasoning` path. That path is NOT inert,
-       * and calling it a "render no-op" understates it — for the frame this
-       * slice ADDS to the wire (`closeLiveBurst`'s: the burst's own id, carrying
-       * the text the peer already holds) what actually happens is:
+       * ADDITIVE AND OPTIONAL: a client that does not know this key takes the
+       * frame down its ordinary `reasoning` path. That path is NOT inert, and
+       * calling it a "render no-op" understates it — for the frame #242 half 1
+       * ADDED to the wire (`closeLiveBurst`'s: the burst's own id, carrying the
+       * text the peer already holds) what actually happens is:
+       *
+       * ⚠️ THE THREE BULLETS BELOW DESCRIBE THE **half-1-AND-EARLIER CLIENT**,
+       * NOT THE CURRENT ONE — read them as the compatibility argument they are.
+       * #242 half 2 deleted `upsertReasoning` and routed `case "reasoning"`
+       * through `applyDurable`, so on a CURRENT client this frame is an upsert
+       * by id into `state.messages` (same id, same text ⇒ same content, a new
+       * array), the same disarm, and the same one extra notification. The
+       * conclusion is identical on both — which is the point of keeping the old
+       * reading: it is what an OLDER peer does, and older peers are exactly who
+       * this "additive and optional" claim is about.
        *  - `upsertReasoning` replaces the entry under the SAME id with the SAME
        *    text, so the rendered reasoning list is unchanged in content;
        *  - `disarmStaleDraftsByTurn(turnId)` runs, which only DELETES ids from
@@ -198,11 +217,14 @@ export type OutboundWsMessage =
        * conditions cannot co-occur — an existing controller implies a dispatched
        * turn implies an eligible settlement.
        *
-       * ⚠️ THE THREE BULLETS ARE NOT UNIVERSAL OVER FRAMES CARRYING THIS FLAG.
+       * ⚠️ AND THE THREE BULLETS ARE NOT UNIVERSAL OVER FRAMES CARRYING THIS
+       * FLAG, on any client version.
        * `pushDurableBlock`'s independent-block branch also sets it, on a FRESHLY
        * MINTED id carrying text the client has not seen — so there
-       * `upsertReasoning` takes its APPEND path and the `.slice(-100)` cap can
-       * evict the oldest entry. That is not a compatibility concern, because
+       * an older client's `upsertReasoning` takes its APPEND path and its
+       * `.slice(-100)` cap can evict the oldest entry (a CURRENT client appends
+       * into `state.messages`, which #242 half 2 left uncapped — same append,
+       * no eviction). That is not a compatibility concern, because
        * that branch sent a byte-identical frame (minus this key) before the flag
        * existed; it is a warning against reading "same id, same text" as a
        * property of `final` rather than of the burst-closing frame.

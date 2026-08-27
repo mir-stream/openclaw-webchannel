@@ -701,15 +701,20 @@ function applyBubble(
  * a side list with none.
  *
  * ⚠️ THE POSITION IS WHERE THE EVENT WAS APPENDED, WHICH IS NOT ALWAYS WHERE THE
- * BURST WAS DELIVERED. An earlier revision said "where it was DELIVERED" flatly;
- * that is true for a burst closed by `onReasoningEnd` (the controller's
- * `endBurst`, which runs mid-turn) and FALSE for one still open at turn end.
- * `inbound.ts` drains the answer draft — which emits the `turn_snapshot`, i.e.
- * the `seal` row — and only then calls `reasoning?.stop()` from its `finally`,
- * so a burst that streamed BEFORE the answer but never got a reasoning-end
- * boundary is journaled AFTER the seal and replays at the TAIL, past the turn's
- * answers. LIVE it sits before them, because this transition appends on the
- * burst's FIRST frame and the slot never moves afterwards.
+ * BURST WAS DELIVERED. Live, this transition appends on the burst's FIRST
+ * delivered frame and the slot never moves afterwards; in a REPLAY the burst has
+ * exactly one row, written when it CLOSED. So:
+ *
+ *   live and replay agree for a burst IFF no `placement` or `bubble` row is
+ *   journaled BETWEEN that burst's first delivered frame and its closing frame.
+ *
+ * ⚠️ DO NOT RE-DERIVE THAT AS "safe if closed by `endBurst`, broken if closed at
+ * turn end". Two revisions of this docblock said exactly that and it is a false
+ * universal in both directions — `endBurst` establishes nothing about
+ * interleaving, and both `pushDurableBlock` branches are burst-closing points it
+ * omits. `journal-history.ts`'s conversion loop (GAP 2b) is the CANONICAL
+ * statement and carries the frame-level counterexample; this line points there
+ * on purpose rather than keeping a fourth copy that can drift.
  *
  * ⚠️ AND THE FIX THIS BLOCK USED TO PROMISE — "the ORDER of two calls in
  * `inbound.ts`'s turn teardown, which is half 2's to make" — DOES NOT WORK.
@@ -749,6 +754,23 @@ function applyBubble(
  * Do not "fix" the now-unbounded live list by capping — not here, and not in the
  * wrapper's derivation either; that would re-open the divergence in the exact
  * shape half 2 closed.
+ *
+ * ⚠️ AND STATE THE TRADE HONESTLY, BECAUSE THE JUSTIFICATION ABOVE IS CONDITIONAL
+ * AND THE COST IS NOT. Removing the cap closes a live≠history divergence ONLY
+ * where a durable view exists to disagree with — and `capabilities.reasoningDurable`
+ * DEFAULTS OFF, so on a default deployment nothing is journaled, there is no
+ * replay to differ from, and the removal closes nothing at all. What it does
+ * unconditionally is make `state.messages` accumulate every reasoning burst of
+ * the session, where a 100-item cap previously bounded them — and every durable
+ * frame pays an O(messages) projection and merge over that array, so the cost is
+ * super-linear in session length, not merely a memory number.
+ *
+ * That is accepted rather than hidden, for one reason: a cap that exists only
+ * when durability is OFF is TWO behaviours for one view, selected by a server-
+ * side setting the client cannot see — the same divergence class, reintroduced
+ * from the other side and harder to observe. A client-side retention policy that
+ * applies uniformly is the real answer, it is the twin of #299 (which owns the
+ * server side), and it is not this slice's.
  *
  * BOTH PATHS ALLOCATE. Like `applyBubble`, this does not detect a no-op: a
  * `reasoning` event repeating its id, turnId and text still returns a new array.

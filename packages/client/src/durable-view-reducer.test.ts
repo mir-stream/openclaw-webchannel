@@ -355,9 +355,12 @@ describe("step / fold agreement: reduceDurableView === fold of applyDurableEvent
   });
 
   it("NEW array: a reasoning event repeating id, turnId and text still allocates", () => {
-    // `applyReasoning` has NO same-array path — both branches allocate, like the
-    // live `upsertReasoning` it ports. That is what keeps the three SAME-array
-    // rows above exhaustive after #242 half 1 added a fifth transition.
+    // `applyReasoning` has NO same-array path — both branches allocate. That is
+    // what keeps the three SAME-array rows above exhaustive now that a fifth
+    // transition exists. (This said "like the live `upsertReasoning` it ports";
+    // #242 half 2 DELETED that method — `applyReasoning` ports nothing now, it
+    // IS the client's reasoning transition, and the always-allocate behaviour is
+    // simply what the client does.)
     const view = reduceDurableView([
       { kind: "reasoning", id: "r-1", turnId: TURN, text: "thought" },
     ]);
@@ -432,12 +435,19 @@ describe("applyReasoning — one completed burst per event", () => {
     expect(view.map((m) => m.text)).toEqual(["one", "two", "three"]);
   });
 
-  it("does NOT apply the live 100-item cap — a durable view never drops delivered content", () => {
-    // The client caps `state.reasoning` at `.slice(-100)`. That is a memory
-    // bound on a live UI surface; applying it to the system of record would
-    // silently discard delivered content (N10). Retention is #299's job.
-    // ⚠️ THIS IS A KNOWN live≠history DIVERGENCE FOR THE DURATION OF HALF 1, and
-    // half 2 closes it by REMOVING the cap, never by adding one here.
+  it("applies NO 100-item cap — a durable view never drops delivered content", () => {
+    // A per-kind cap inside the system of record would silently discard
+    // delivered content (N10). Retention is #299's job, at the store, where it
+    // can be one policy over everything.
+    // ⚠️ THE DIVERGENCE THIS CASE ONCE GUARDED IS CLOSED, AND THE TITLE CHANGED
+    // WITH IT. It read "does NOT apply the LIVE 100-item cap" and its body
+    // called that a "KNOWN live≠history DIVERGENCE FOR THE DURATION OF HALF 1,
+    // and half 2 closes it by REMOVING the cap" — present tense, in this file,
+    // whose header now records that half 2 (this slice) did exactly that. There
+    // is no live cap left to differ from: `upsertReasoning` and its
+    // `.slice(-100)` are deleted and `state.reasoning` is derived from an
+    // uncapped `state.messages`. What survives is the rule for THIS module —
+    // never cap here — which is why the case stays.
     const events: DurableEvent[] = Array.from({ length: 150 }, (_, i) => ({
       kind: "reasoning" as const,
       id: `r-${i}`,
@@ -1349,63 +1359,71 @@ describe("equivalence anchor: reasoning ≡ a real reasoning frame", () => {
 //             delivered to a FRESH client with empty state, which is exactly what
 //             a reload does.
 //
-// The `history` rows are built here from the journal's OWN rule — one row per
-// burst, from the `final: true` frame — rather than by calling the plugin, since
-// this file may not import it (the client package is zero-dependency). The
-// plugin side of the same property is pinned in
-// `packages/plugin/src/journal-history.test.ts`; the seam between them is the
-// wire shape, which `packages/plugin/src/channel-contract.ts` owns.
+// ⚠️ THE ROWS ARE NOT HAND-WRITTEN HERE, AND THAT IS THE POINT OF THE HARNESS.
+// Round 1 had this file and `packages/plugin/src/journal-history.test.ts`
+// carrying INDEPENDENT literals for the same turn, with a comment claiming
+// "if either side is edited alone, one of the two goes red" — which was false:
+// nothing connected them, and their `ts` values already differed. Both now
+// import `reasoning-turn.test-harness.ts`, so there is ONE definition of the
+// turn and ONE definition of the rows it must serve. The plugin half proves the
+// projection EMITS those rows; this half proves the client RENDERS them the same
+// as live. Neither can be edited alone.
+import {
+  INTERLEAVED_TURN_FRAMES,
+  INTERLEAVED_TURN_LIVE_IDS,
+  INTERLEAVED_TURN_REPLAY_IDS,
+  ORDINARY_TURN_FRAMES,
+  ORDINARY_TURN_ROWS,
+  REASONING_TURN,
+  type ReasoningTurnFrame,
+  type ReasoningTurnRow,
+} from "./reasoning-turn.test-harness.js";
+
+/** A fixture frame, as the wrapper's inbound dispatcher receives it. */
+function inbound(frame: ReasoningTurnFrame): InboundMessage {
+  return frame as unknown as InboundMessage;
+}
+
+/** A fixture row, as a `history` frame carries it — `ts` added by position. */
+function servedRow(row: ReasoningTurnRow, index: number): unknown {
+  return { ...row, ts: index + 1 };
+}
+
 describe("live == history for reasoning: a reload reproduces what was watched", () => {
-  function reasoningFrame(id: string, turnId: string, text: string, final?: boolean): InboundMessage {
-    return {
-      type: "reasoning",
-      id,
-      turnId,
-      text,
-      ...(final === undefined ? {} : { final }),
-    } as unknown as InboundMessage;
+  /**
+   * The DURABLE fields of a transcript. `ts`/`working` are the client-local
+   * overlay §0.1 puts on the app's side of the split, and a live bubble
+   * legitimately has no `ts`, so they are excluded from the comparison.
+   */
+  function durable(list: Array<Record<string, unknown>>): unknown[] {
+    return list.map((m) =>
+      m.kind === "reasoning"
+        ? { kind: "reasoning", id: m.id, turnId: m.turnId, text: m.text }
+        : { id: m.id, role: m.role, text: m.text },
+    );
   }
 
   it("same content, same position — across a turn with two bursts and two answers", () => {
     // ── LIVE ──
     const w = newWrapper() as unknown as WrapperInternals;
-    // A burst streams token by token, then closes.
-    w.handleMessage(reasoningFrame("r1", TURN, "Let"));
-    w.handleMessage(reasoningFrame("r1", TURN, "Let me"));
-    w.handleMessage(reasoningFrame("r1", TURN, "Let me think"));
-    w.handleMessage(reasoningFrame("r1", TURN, "Let me think", true));
-    // The answer streams and finalizes.
-    w.handleMessage(progressFrame("A", "Working…", TURN));
-    w.handleMessage(agentMessageFrame("A", "first answer", TURN));
-    // A SECOND burst, after the first answer.
-    w.handleMessage(reasoningFrame("r2", TURN, "and also", true));
-    w.handleMessage(agentMessageFrame("B", "second answer", TURN));
-
+    for (const frame of ORDINARY_TURN_FRAMES) w.handleMessage(inbound(frame));
     const live = w.state.messages;
     expect(live.map((m) => m.id)).toEqual(["r1", "A", "r2", "B"]);
 
-    // ── REPLAY ── the rows the plugin's projection emits for that same journal,
-    // in the reducer's order, `ts` attached. Reasoning rows carry NO `role`.
-    const served = [
-      { kind: "reasoning", id: "r1", turnId: TURN, text: "Let me think", ts: 1 },
-      { id: "A", role: "agent", text: "first answer", ts: 2 },
-      { kind: "reasoning", id: "r2", turnId: TURN, text: "and also", ts: 3 },
-      { id: "B", role: "agent", text: "second answer", ts: 4 },
-    ];
+    // ── REPLAY ── the rows the plugin's projection emits for that same journal.
+    // Reasoning rows carry NO `role`; `toEqual` on the durable projection below
+    // would fail if one appeared.
     const fresh = newWrapper() as unknown as WrapperInternals;
-    fresh.handleMessage({ type: "history", messages: served } as unknown as InboundMessage);
-    const replayed = fresh.state.messages;
+    fresh.handleMessage({
+      type: "history",
+      messages: ORDINARY_TURN_ROWS.map(servedRow),
+    } as unknown as InboundMessage);
 
-    // ⭐ SAME CONTENT, SAME POSITION. Compared on the DURABLE fields only —
-    // `ts`/`working` are the client-local overlay §0.1 puts on the app's side of
-    // the split, and a live bubble legitimately has no `ts`.
-    const durable = (list: Array<Record<string, unknown>>) =>
-      list.map((m) =>
-        m.kind === "reasoning"
-          ? { kind: "reasoning", id: m.id, turnId: m.turnId, text: m.text }
-          : { id: m.id, role: m.role, text: m.text },
-      );
-    expect(durable(replayed)).toEqual(durable(live));
+    // ⭐ SAME CONTENT, SAME POSITION.
+    expect(durable(fresh.state.messages)).toEqual(durable(live));
+    // Non-vacuity: the shared fixture really does describe this turn, so a
+    // fixture edit cannot make the equality above pass by emptying both sides.
+    expect(durable(live)).toEqual(ORDINARY_TURN_ROWS.map((row) => ({ ...row })));
 
     // And the derived public surface agrees too, since that is what a widget
     // reads: same bursts, same order, same text.
@@ -1413,8 +1431,8 @@ describe("live == history for reasoning: a reload reproduces what was watched", 
       (x.state as unknown as { reasoning: unknown[] }).reasoning;
     expect(reasoningOf(fresh)).toEqual(reasoningOf(w));
     expect(reasoningOf(fresh)).toEqual([
-      { id: "r1", turnId: TURN, text: "Let me think" },
-      { id: "r2", turnId: TURN, text: "and also" },
+      { id: "r1", turnId: REASONING_TURN, text: "Let me think" },
+      { id: "r2", turnId: REASONING_TURN, text: "and also" },
     ]);
   });
 
@@ -1424,19 +1442,45 @@ describe("live == history for reasoning: a reload reproduces what was watched", 
     // device already rendered. Reasoning ids are plugin-minted and identical
     // live and in history, so they match at tier 1.
     const w = newWrapper() as unknown as WrapperInternals;
-    w.handleMessage(reasoningFrame("r1", TURN, "thinking", true));
-    w.handleMessage(agentMessageFrame("A", "answer", TURN));
+    for (const frame of ORDINARY_TURN_FRAMES) w.handleMessage(inbound(frame));
     const before = w.state.messages.map((m) => m.id);
 
     w.handleMessage({
       type: "history",
-      messages: [
-        { kind: "reasoning", id: "r1", turnId: TURN, text: "thinking", ts: 1 },
-        { id: "A", role: "agent", text: "answer", ts: 2 },
-      ],
+      messages: ORDINARY_TURN_ROWS.map(servedRow),
     } as unknown as InboundMessage);
 
     expect(w.state.messages.map((m) => m.id)).toEqual(before);
-    expect(w.state.messages.map((m) => m.id)).toEqual(["r1", "A"]);
+    expect(w.state.messages.map((m) => m.id)).toEqual(["r1", "A", "r2", "B"]);
+  });
+
+  /**
+   * ⚠️ CHARACTERIZATION — GAP 2b, THE ONE STREAM WHERE THEY DO NOT AGREE.
+   *
+   * Recorded, not endorsed. It is here because the pair's shared fixture above
+   * cannot reach it (every burst there closes before the next answer's
+   * `progress`), and round 1 asserted a DICHOTOMY — "safe if closed by
+   * `endBurst`, broken if closed at turn end" — that this stream refutes: the
+   * burst below closes via `endBurst`, mid-turn, and still diverges. The real
+   * invariant is stated once, in `journal-history.ts`'s conversion loop.
+   *
+   * The plugin half drives the same fixture through the REAL mapper and the REAL
+   * projection, so both directions are pinned in both packages.
+   */
+  it("CHARACTERIZATION: an answer slot claimed mid-burst puts live and replay out of order", () => {
+    const w = newWrapper() as unknown as WrapperInternals;
+    for (const frame of INTERLEAVED_TURN_FRAMES) w.handleMessage(inbound(frame));
+    expect(w.state.messages.map((m) => m.id)).toEqual([...INTERLEAVED_TURN_LIVE_IDS]);
+
+    // The replay order, computed by the same reducer the server projection runs.
+    const replayed = reduceDurableView([
+      { kind: "placement", answerId: "A", turnId: REASONING_TURN },
+      { kind: "reasoning", id: "r1", turnId: REASONING_TURN, text: "thinking" },
+      { kind: "bubble", answerId: "A", turnId: REASONING_TURN, text: "because" },
+    ]);
+    expect(replayed.map((m) => m.id)).toEqual([...INTERLEAVED_TURN_REPLAY_IDS]);
+
+    // The point of the case, said out loud so nobody "fixes" the expectations:
+    expect(INTERLEAVED_TURN_LIVE_IDS).not.toEqual(INTERLEAVED_TURN_REPLAY_IDS);
   });
 });

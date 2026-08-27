@@ -166,6 +166,52 @@ export function orderConversationPresentation(
 }
 
 /**
+ * The `before` cursor for a "load older" request: the id of the OLDEST entry
+ * this device holds that the server could plausibly resolve, or `undefined` to
+ * ask for the tail.
+ *
+ * Extracted from `widget.ts`'s `historyBtn.onclick` so the paging LOOP is
+ * testable end to end — see `history-paging.test.ts`, which drives this picker
+ * against the plugin's real `historyPageBefore` and the client's real
+ * `case "history"` merge. It was inline, and the defect it hid was invisible to
+ * every unit test in the repo.
+ *
+ * P1-9: a local-only id (held `pending` / `retracted`) must never be sent as a
+ * `before` cursor — those were never on the wire and are never in the journal.
+ * A `working` draft is skipped for the same reason.
+ *
+ * ⚠️ A REASONING ROW IS A LEGITIMATE CURSOR, AND SKIPPING IT DEADLOCKS THE
+ * BUTTON. #242 half 2 first added `m.kind === undefined` to this predicate,
+ * reasoning that a live reasoning id might not be in the journal. That is a
+ * DEFECT, and the test file above reproduces it: once the `limit` rows
+ * immediately preceding the oldest held bubble are all reasoning, the oldest
+ * cursorable entry never changes, every click re-serves a page the client
+ * already holds, every row tier-1 matches — and the rest of the conversation
+ * becomes permanently unreachable. Measured at the widget's own `limit: 20`
+ * against `[u0, r1…r30, A]`: five clicks, cursor `A` every time, `u0` never
+ * reached. The cliff is exactly at run length `limit`.
+ *
+ * The property that makes a reasoning id safe was verified against the REAL
+ * pager rather than assumed: a reasoning id is PLUGIN-minted, appears in the
+ * projection, and `historyPageBefore` resolves by `findIndex` over the emitted
+ * list without ever reading `kind`.
+ *
+ * ⚠️ AND THE WORRY THAT MOTIVATED THE SKIP WAS NOT NEW TO REASONING — that is
+ * why it does not justify one. A published local user echo keeps its `u-<n>` id
+ * until a snapshot adopts it, while the accept seam journals the inbound WIRE
+ * id, so this predicate has ALWAYS been able to return an id the journal does
+ * not hold. The answer then and now is `historyPageBefore`'s stated contract:
+ * an unresolvable cursor is the empty page, which the client treats as "no more
+ * history". A stall is strictly worse than that, because it is indistinguishable
+ * from it while hiding content that does exist.
+ */
+export function oldestHistoryCursor(
+  messages: readonly ChatMessage[],
+): string | undefined {
+  return messages.find((m) => !m.working && !m.pending && !m.retracted)?.id;
+}
+
+/**
  * #97: compose the single-line label for a tool-activity chip. Pure so the
  * ordering/formatting is unit-testable and never touches the DOM. Shape:
  *   `🔧 {name} — {status ?? phase}` then ` ({argKeys})` then ` · {summary}`.
