@@ -939,6 +939,17 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           // flush either resumes after dispose and takes the `invalidated` early
           // return, or is already past it and cannot interleave. Inserting an
           // `await` on either side of that span breaks this argument.
+          //
+          // ⚠️ THIS ENUMERATES WRITERS, AND SINCE #240 THERE IS ALSO A DEFERRED
+          // READER. `history-serve.ts` schedules its fold with `setImmediate`,
+          // so a snapshot or page scheduled just before teardown can run after
+          // `close()` and read a closed handle. That is contained rather than
+          // argued away: the read sits inside `runDeferred`'s `try`, so it
+          // logs "journal read failed" and sends no frame. The residual is a
+          // spurious `error`-level line during an ordinary shutdown, not a
+          // crash and not a lost message — the peer is going away with the
+          // account. Do not "fix" it by moving `close()` earlier; that trades a
+          // log line for the write window this ordering exists to prevent.
           // `close()` is idempotent.
           try { deliveryJournal?.close(); } catch (error) { errors.push({ phase: "delivery-journal", error }); }
           const transportReport = await transport.closeGracefully();

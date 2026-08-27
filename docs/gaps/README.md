@@ -56,7 +56,7 @@ which glues together the split modules:
 | protocol version (#33) | `src/protocol.ts` (`WEBCHANNEL_PROTOCOL_VERSION`, `readPluginVersion`) |
 | inbound turn / streaming / typing | `src/inbound.ts` (streaming-mode resolve `:124-136`, control-lane branch, `sendTyping` `:160`, `commandBody` `:200`) |
 | debounce / coalesce (P1-8b) | `src/inbound-queue.ts` (`coalesceUserMessages`, `startCoalesceTurn`, `clearPending`/`pendingBuffered`) + core `createInboundDebouncer` |
-| history store | `src/history.ts` (`resolveHistoryConfig` `:37`, `recent` `:182`, `planHistoryFetch` `:218-231`, `pageBefore` `:277-318`) |
+| history store | `src/journal-history.ts` (the projection) + `src/history-serve.ts` (the two read sites). `src/history.ts` is now only the wire type, `resolveHistoryConfig` and `planHistoryFetch` — ⚠️ #240 half 2 DELETED `recent`/`pageBefore` and the core-transcript reader with them. Symbols, not line numbers: the anchors this row carried had rotted before the deletion and nothing lints them (#288). |
 | multi-account multiplex | `src/multiplex.ts` (`planAccounts`) |
 | legacy WS transport (retained) | `src/transport.ts` (`typingEnabled`/`historyEnabled` gates) |
 

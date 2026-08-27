@@ -217,8 +217,10 @@ identical ciphertext, cross-user isolation).
 > **Status update (#153):** the at-rest store (`history-store.ts`) listed here was
 > IMPLEMENTED AND THEN REMOVED. It never acquired a production caller and its
 > backing was a plain in-memory `Map`, so it was never durable; the production
-> history authority is OpenClaw core's session transcript, read through
-> `history.ts` (`pageBefore` cursor pagination). Late-join hydration is served by
+> history authority WAS OpenClaw core's session transcript, read through
+> `history.ts` (`pageBefore` cursor pagination) — ⚠️ **until #240 half 2 deleted
+> that reader and `pageBefore` with it.** It is now the plugin's own delivery
+> journal, projected through the client's reducer (N2). Late-join hydration is served by
 > `sendHistory` + `late-join-decryptor.ts`. The design below is retained as the
 > record of the decision, not as a description of the current tree.
 
@@ -422,8 +424,10 @@ recorded here so the next person re-derives neither the design nor the decision.
 
 An in-memory ciphertext store with `loadHistory` cursor pagination (Sub-AC 2a).
 Backed by a plain `Map`, so it was never durable, and it had no production
-caller: `history.ts` reads OpenClaw core's session transcript (on disk, 0600)
-and paginates with `pageBefore`, while late-joining devices are served by
+caller: `history.ts` READ OpenClaw core's session transcript (on disk, 0600)
+and paginated with `pageBefore` — ⚠️ **both deleted by #240 half 2**; history is
+now projected from the plugin's own delivery journal, and NOT-list N2 forbids
+reading core's transcript for the client at all. Late-joining devices are served by
 `NatsChannel.sendHistory` + `late-join-decryptor.ts`. Nothing was lost.
 
 ### 13.2 `typing-indicator.ts` — a feature we chose not to build

@@ -93,7 +93,7 @@ export const DELIVERY_JOURNAL_SCHEMA_VERSION = "1";
  *  - A REFUSED APPEND now costs a real row. At egress the send proceeds anyway
  *    (`nats-channel.ts`'s `journalOutbound` warns and returns), so the peer saw
  *    that bubble live and will not see it on reconnect; at the inbound accept
- *    the batch is rejected and the CLIENT retries, which is recoverable.
+ *    the batch is rejected and the CLIENT may retry — ⚠️ weaker than it sounds, and `ingress-dedupe.ts` retracts the strong form two seams over: the ledger is capped at `MAX_UNACKED = 100` and lost on reload, and a retry recovers neither #282's ordering nor #283's orphan row.
  *  - A 30 s BUSY WAIT still freezes the whole gateway synchronously, for every
  *    peer, because `DatabaseSync` parks the event loop.
  * 5 s stays: the freeze is unbounded in blast radius and the loss is one frame

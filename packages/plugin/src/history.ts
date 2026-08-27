@@ -98,7 +98,11 @@ export type HistoryFetchPlan =
  * revision of this docblock said, "twice over" on both paths. Stated per path,
  * because the difference matters for the request this bounds:
  *   - `recent` (no cursor): base's `recent()` forwarded `limit` to
- *     `getSessionMessages` UNCLAMPED. `MAX_FETCH_WINDOW = 1000` was referenced
+ *     core's session-message read UNCLAMPED (⚠️ the symbol is deliberately NOT
+ *     spelled here — #240's acceptance check is a repo-wide grep for it that must
+ *     match NOTHING under `packages/`, and a docblock naming it is exactly the hit
+ *     that makes the check lie about itself; `session-route-tenant-isolation.test.ts`
+ *     splits the token for the same reason). `MAX_FETCH_WINDOW = 1000` was referenced
  *     only inside `pageBefore`. So this path was capped ONCE, upstream, by core's
  *     `Math.min` against `PLUGIN_SUBAGENT_SESSION_MESSAGES_MAX_LIMIT = 1_000`;
  *   - `page` (cursor supplied): base clamped locally first

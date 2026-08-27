@@ -108,7 +108,8 @@ describe("history — planHistoryFetch (load_history wire → fetch mapping)", (
    * first below is the one that matters, and an earlier revision of this comment
    * got its mechanism wrong by saying base capped it "twice over". Base's
    * `recent()` forwarded `limit` unclamped and was capped only by core inside
-   * `getSessionMessages`; `MAX_FETCH_WINDOW` lived in `pageBefore` alone. The
+   * core's session-message read (symbol deliberately unspelled — see the note in
+   * `history.ts`); `MAX_FETCH_WINDOW` lived in `pageBefore` alone. The
    * cutover removed core from the path entirely, so `{limit: 1e9}` — which
    * carries no cursor and is therefore a `recent` — selected, stringified and
    * sealed a whole conversation in one frame. See `MAX_WIRE_HISTORY_LIMIT` and
