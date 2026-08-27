@@ -12,6 +12,14 @@ export { ANON_PEER_ID };
  * projection-side "`ts` is always present" as `ProjectedHistoryMessage`, a type
  * DERIVED from this one, so the relationship is checked by tsc instead of
  * asserted in prose. Do not restate this shape anywhere else.
+ *
+ * ⚠️ ONE EXCEPTION EXISTS, AND NAMING IT IS CHEAPER THAN AN ABSOLUTE THAT IS
+ * ALREADY FALSE. `packages/client/src/nats-client.ts` re-declares the row
+ * LOOSELY — one flat record with optional `kind`/`role`/`turnId`, not this union
+ * — because that package is zero-dependency and may not import the plugin. It is
+ * labelled as such at its declaration, it discriminates at RUNTIME (where values
+ * off the wire have to be validated anyway), and it is not a second copy of this
+ * SHAPE. Every other restatement is still forbidden.
  */
 
 /**

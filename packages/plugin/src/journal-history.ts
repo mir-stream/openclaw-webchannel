@@ -621,15 +621,19 @@ export function projectJournalHistory(
     // sourced identically for both, and `recordFirstSeen` already dated
     // reasoning ids in half 1 precisely so this step would inherit it unchanged.
     //
-    // ── ⚠️ GAP 2b — ORDERING. THIS IS THE CANONICAL STATEMENT; EVERY OTHER
-    //    SITE POINTS HERE RATHER THAN RESTATING IT ──
+    // ── ⚠️ GAP 2b — ORDERING. THIS IS THE CANONICAL STATEMENT: CITE IT, DO NOT
+    //    COPY IT ──
     //
-    // ⚠️ NO COUNT. This said "THE OTHER THREE SITES" and a sibling said "rather
-    // than keeping a FOURTH copy" — two numbers that already disagreed, while
-    // `git grep -n 'GAP 2b'` finds the term in ten files. A census in prose is
-    // born stale: it is wrong the moment anyone cites this from a new place, and
-    // nothing makes it fail. The property that matters is "here, not there",
-    // which needs no number.
+    // ⚠️ AND NOTHING IS CLAIMED HERE ABOUT THE OTHER SITES — deliberately, after
+    // four tries. This line has carried, in order: "THE OTHER THREE SITES POINT
+    // HERE" (a count, contradicted by a sibling's "a FOURTH copy"), then "EVERY
+    // OTHER SITE POINTS HERE RATHER THAN RESTATING IT" (a universal, falsified
+    // by `durable-view-reducer.test.ts`, which was restating the retracted
+    // dichotomy at that very moment). Every version was wrong in a new way,
+    // because it asserted something about a set nobody maintains and nothing
+    // checks. A directive to future writers is enforceable; a census of past
+    // ones is born stale. So this says what to DO and claims nothing about what
+    // is already out there.
     //
     // A reasoning block's POSITION here is where its JOURNAL ROW fell, which is
     // the moment the burst CLOSED — the journal records the ONE `final: true`

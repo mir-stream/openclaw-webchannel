@@ -744,7 +744,7 @@ describe("history hydration — reasoning rows (#242 half 2)", () => {
   /**
    * ⚠️ TIER 1 REQUIRES THE KINDS TO AGREE, and these two cases are why.
    *
-   * `seen`/`localIndexById` are built from ALL of `state.messages`, which since
+   * `seen`/`localIndexByKey` are built from ALL of `state.messages`, which since
    * half 2 mixes both kinds. The two id spaces are NOT provably disjoint —
    * `durable-view-reducer.ts`'s `findTextIndex` docblock retracts the id-shape
    * argument outright: agent ids come from the same `nextMessageId()` as
@@ -813,7 +813,7 @@ describe("history hydration — reasoning rows (#242 half 2)", () => {
   it("still drops a repeat of the same id WITHIN one page — both kinds", () => {
     // The other half of the kind conjunct, pinned so a future edit cannot buy
     // the cross-kind fix by re-admitting within-page repeats. A fresh insert
-    // adds to `seen` WITHOUT adding to `localIndexById`, so "seen but not
+    // adds to `seen` WITHOUT adding to `localIndexByKey`, so "seen but not
     // locally held" means "a repeat of an id earlier in THIS page" — still a
     // match, and still a drop.
     const text = makeWrapper();

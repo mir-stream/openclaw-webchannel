@@ -404,12 +404,21 @@ describe("applyReasoning — one completed burst per event", () => {
     //
     // ⚠️ "WHERE THE EVENT WAS APPENDED", NOT "WHERE IT WAS DELIVERED" — this
     // title used to say the latter, contradicting `applyReasoning`'s own
-    // docblock, which retracts that wording in as many words. The two coincide
-    // for a burst closed by `onReasoningEnd` and DIVERGE for one still open at
-    // turn end: `inbound.ts` drains the answer draft (emitting the `seal`)
-    // before calling `reasoning?.stop()`, so such a burst is appended after the
-    // turn's answers and replays at the tail. This fixture appends in order, so
-    // it exercises the coinciding case only.
+    // docblock, which retracts that wording in as many words.
+    //
+    // ⚠️ AND THE EXPLANATION THAT FOLLOWED IS CUT, BECAUSE IT WAS THE RETRACTED
+    // FALSE UNIVERSAL. It read "the two coincide for a burst closed by
+    // `onReasoningEnd` and DIVERGE for one still open at turn end" — and
+    // `onReasoningEnd` IS `endBurst` (`inbound.ts`: `onReasoningEnd: () =>
+    // reasoning!.endBurst()`), so that is word for word the dichotomy
+    // `applyReasoning`'s docblock forbids re-deriving. The shared fixture's
+    // counterexample closes MID-TURN via `endBurst` and still diverges.
+    //
+    // The real condition: live and replay agree for a burst IFF no
+    // `placement`/`bubble` row is journaled between its first delivered frame
+    // and its closing frame. `journal-history.ts`'s conversion loop (GAP 2b) is
+    // where that is stated; this fixture interleaves nothing, so it exercises
+    // the agreeing case only.
     const view = reduceDurableView([
       { kind: "bubble", answerId: "A", text: "A", turnId: TURN },
       { kind: "reasoning", id: "r-1", turnId: TURN, text: "thinking" },

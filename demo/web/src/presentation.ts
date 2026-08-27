@@ -116,11 +116,24 @@ export type ConversationPresentationItem =
  * to take a separate `reasoning` array and place each burst after its user
  * anchor by `turnId`, grouped per turn — a SECOND opinion about ordering, held
  * by the renderer. Reasoning is a durable message now: it sits in
- * `state.messages` at the position the stream put it, and the reducer owns that
- * position on both the live and the replayed side. Re-deriving it from `turnId`
- * would put a third answer next to those two, and it would be WRONG in exactly
- * the cases the id ordering gets right (two bursts around one answer, a burst
- * whose turn has no user anchor in view).
+ * `state.messages` at the position the stream put it, and this function READS
+ * that position rather than re-deriving one. Re-deriving it from `turnId` would
+ * put a third answer next to the other two, and it would be WRONG in exactly the
+ * cases the id ordering gets right (two bursts around one answer, a burst whose
+ * turn has no user anchor in view).
+ *
+ * ⚠️ THIS SAID "the reducer owns that position on both the live and the replayed
+ * side", WHICH CLAIMS TOO MUCH. The reducer owns the position it assigns;
+ * `case "history"`'s cursor MERGE is not the reducer, and it can move rows
+ * around a live block. Traced: hold `[u1, r1]` with the turn's answer not yet
+ * received, then receive a snapshot `[u1, A1]` — with `reasoningDurable` OFF
+ * (the default) that snapshot carries no reasoning row, so `u1` tier-1 matches
+ * and walks the cursor past itself, `A1` fresh-inserts after it, and the render
+ * is `[u1, A1, r1]` where base drew `[u1, r1, A1]`. Cosmetic only — nothing
+ * lost, duplicated or unstable — and a direct consequence of deleting the
+ * renderer's `turnId` re-anchor, which is the decision this docblock defends. It
+ * is NOT GAP 2b (that is journal position vs live); it is merge-cursor
+ * displacement, recorded here because no other site covers it.
  *
  * ⚠️ TOOL ACTIVITY IS STILL INTERLEAVED, and that is not an inconsistency: it is
  * still EPHEMERAL (`#242 half 3` is what makes it durable), so it lives in its
