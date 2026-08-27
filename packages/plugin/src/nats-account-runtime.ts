@@ -902,9 +902,14 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // ── #242 half 2: THE CONFIG-TIME HALF OF THE REASONING DIAGNOSTIC ──
       //
       // `capabilities.reasoningDurable: true` yields ZERO journal rows whenever
-      // the lane never opens, and there are TWO independent reasons it may not.
-      // This warning covers exactly ONE of them, and the split is why it exists
-      // rather than duplicating what already ships:
+      // the lane never opens or opens empty, and there are THREE independent
+      // reasons for that — see the note below, which enumerates all three. Two
+      // of them are warned about, in two different places, and this warning is
+      // one of that pair; the split is why it exists rather than duplicating
+      // what already ships. (This line said "TWO independent reasons", which the
+      // note below has always contradicted with "⚠️ THERE IS A THIRD WAY". One
+      // of the two counts had to go, and the enumeration is the one that is
+      // checkable.)
       //
       //   THIS LINE          — `capabilities.reasoning` is OFF (channel config).
       //                        Knowable AT CONFIG TIME, before a single turn
@@ -924,7 +929,8 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // ⚠️ THERE IS A THIRD WAY THE LANE STAYS SHUT AND NEITHER WARNING COVERS
       // IT — stated so the pair is not read as exhaustive. `inbound.ts` builds
       // `reasoningEnabled` as `!controlLane && resolveReasoningEnabled(…) &&
-      // !hasExplicitSessionReasoningOptOut(…)`, and that last disjunct is a
+      // !hasExplicitSessionReasoningOptOut(…)`, and that last CONJUNCT (it read
+      // "disjunct"; the chain is `&&`) is a
       // PEER's own persisted `/reasoning off`. Both warnings are silent for it,
       // deliberately: it is a per-session user choice, not an operator
       // misconfiguration, and there is nothing for the operator to fix. This
@@ -940,8 +946,15 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // not inherit to RECORDING plaintext at rest — `resolveReasoningDurable`'s
       // docblock carries the argument).
       //
-      // Once per SUCCESSFUL account start: a start that fails returns above
-      // this point, and the retry loop re-runs the whole attempt.
+      // ⚠️ CADENCE: ONCE PER ATTEMPT THAT REACHES CHANNEL CREATION — not "once
+      // per SUCCESSFUL account start", which is what this said and is false.
+      // Failure returns exist BELOW this line as well as above it (the SUB/flush
+      // barrier and the outer catch both `return { kind: "failed" … }`), so a
+      // start that gets this far and then fails has already logged, and the
+      // retry loop logs again on every attempt. That is acceptable for a
+      // config-time diagnostic — the condition it reports is genuinely still
+      // true on each retry — but do not cite this line as a once-per-process
+      // guarantee the way `inbound.ts`'s `reasoningEmptyLaneWarned` latch is.
       if (reasoningDurable && !resolveReasoningEnabled(account)) {
         log("warn",
           `webchannel: capabilities.reasoningDurable is ON but capabilities.reasoning is OFF for ` +

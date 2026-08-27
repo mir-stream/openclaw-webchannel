@@ -148,10 +148,12 @@ received no payload logs one warning per account per process — suppressed on a
 delivered no answer, so it only fires where zero frames is genuinely surprising. It names the likely
 cause without asserting it: core's `canShowReasoning` (the agent's thinking level `!== "off"`) is an
 independent precondition the channel cannot observe or override, and some models emit no reasoning. Dedicated `reasoning` and `turn_settled` frames
-exist in both transports. **This gap is CLOSED as of #242 half 2** (2026-08-27) — the four sentences that
-stood here described half 1 and every one of them is now false, so they are replaced rather than amended:
-the demo no longer keeps a bounded side array, no longer groups by `turnId` at render time, the client
-state IS persisted for an opted-in account, and the projection no longer drops reasoning.
+exist in both transports. **This gap is CLOSED as of #242 half 2** (2026-08-27). What stood here described
+half 1; the parts that went stale are replaced below, and the parts that are still true are kept. Three
+things changed: the client's bounded reasoning state is gone (the `.slice(-100)` lived in the CLIENT
+WRAPPER's `upsertReasoning`, not in the demo — the demo only read `state.reasoning`), the demo no longer
+groups by `turnId` at render time, and the projection no longer drops reasoning, so that state now IS
+persisted for an opted-in account.
 
 The plugin journals one row per reasoning BURST — the burst's delivered display text, as plaintext — but
 only for an account that sets `capabilities.reasoningDurable: true`, which **defaults OFF** and is a

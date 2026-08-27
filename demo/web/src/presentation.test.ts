@@ -205,11 +205,22 @@ describe("orderConversationPresentation", () => {
   });
 
   it("does NOT re-anchor a block by turnId — the stream order wins", () => {
-    // The case the deleted `turnId` grouping would have got WRONG: a burst
-    // journaled AFTER its turn's answer (a burst closed by the turn teardown —
-    // `journal-history.ts`'s GAP 2b) belongs where the stream put it. The old
-    // implementation would have hoisted it back above `a1`, inventing an order
-    // neither the live client nor a replay produces.
+    // The case the deleted `turnId` grouping would have got WRONG: a block that
+    // arrives AFTER its turn's answer belongs where the stream put it, and the
+    // old implementation would have hoisted it back above `a1` by `turnId`.
+    //
+    // ⚠️ TWO THINGS THIS COMMENT USED TO CLAIM ARE CUT, BOTH FALSE. It attributed
+    // the late arrival to "a burst closed by the turn teardown", which is the
+    // dichotomy `journal-history.ts`'s conversion loop retracts — the closing
+    // mechanism is not the variable, the interleaving is. And it called the
+    // hoisted order "an order neither the live client nor a replay produces",
+    // which is backwards for the GAP 2b case it was naming: there the hoisted
+    // order IS the live one (`INTERLEAVED_TURN_LIVE_IDS` is `["r1", "A"]`).
+    //
+    // What this test actually pins is narrower and does not need either claim:
+    // this function reads POSITION off the array and never re-derives it from
+    // `turnId`. Which of live and replay is "right" when they disagree is GAP
+    // 2b's question, not the renderer's.
     const ordered = orderConversationPresentation([
       { id: "u1", role: "user", text: "one", turnId: "t1" },
       { id: "a1", role: "agent", text: "answer one", turnId: "t1" },

@@ -714,7 +714,10 @@ function applyBubble(
  * interleaving, and both `pushDurableBlock` branches are burst-closing points it
  * omits. `journal-history.ts`'s conversion loop (GAP 2b) is the CANONICAL
  * statement and carries the frame-level counterexample; this line points there
- * on purpose rather than keeping a fourth copy that can drift.
+ * on purpose rather than keeping another copy that can drift. (It said "a FOURTH
+ * copy" while `journal-history.ts` said "the other THREE sites" — two counts
+ * that already disagreed, over a term that appears in ten files. Neither number
+ * was load-bearing; both are gone.)
  *
  * ⚠️ AND THE FIX THIS BLOCK USED TO PROMISE — "the ORDER of two calls in
  * `inbound.ts`'s turn teardown, which is half 2's to make" — DOES NOT WORK.

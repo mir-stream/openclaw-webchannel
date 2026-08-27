@@ -833,4 +833,41 @@ describe("history hydration — reasoning rows (#242 half 2)", () => {
     );
     expect(reasoning.getState().messages.map((m) => `${m.id}|${m.text}`)).toEqual(["d2|one"]);
   });
+
+  it("each member of a same-id pair keeps its own overlay past an unrelated frame", () => {
+    // ⚠️ `mergeDurable`'s `prevById` WAS THE SIBLING OF THE `case "history"`
+    // INDEX — kind-blind and last-wins over the same mixed array. The cross-kind
+    // fresh insert above DELIBERATELY produces a same-id pair, so `get(id)`
+    // returned whichever member sat later in the array and the kind guard turned
+    // that into `base === undefined` for the EARLIER one — dropping the WHOLE
+    // overlay, not one field. `ts` is the visible symptom; the same loss takes
+    // `receiptKey` (so `patchBubbleByReceiptKey` can never find the bubble
+    // again), `wireId` (`promoteAnchor`) and `pending` (`retract()` returns
+    // false for a bubble still held). Any durable frame re-merges the whole
+    // view, so ONE unrelated message is the whole trigger.
+    const bubbleLast = makeWrapper();
+    deliver(bubbleLast, { type: "reasoning", id: "dup", turnId: "t1", text: "thinking" });
+    deliver(bubbleLast, history({ id: "dup", role: "user", text: "the question", ts: 5 }));
+    const bubbleBefore = bubbleLast.getState().messages.find((m) => m.kind === undefined);
+    expect(bubbleBefore?.ts).toBe(5);
+    deliver(bubbleLast, { type: "agent_message", id: "other", turnId: "t2", text: "unrelated" });
+    expect(bubbleLast.getState().messages.find((m) => m.kind === undefined)?.ts).toBe(5);
+
+    // The mirror image: the REASONING entry is the earlier member, and `ts` is
+    // the one client-local field it can hold.
+    const reasoningFirst = makeWrapper();
+    deliver(reasoningFirst, { type: "agent_message", id: "dup", turnId: "t1", text: "answer" });
+    deliver(reasoningFirst, history(reasoningRow("dup", "t1", "thinking", 7)));
+    const reasoningBefore = reasoningFirst
+      .getState()
+      .messages.find((m) => m.kind === "reasoning");
+    expect(reasoningBefore?.ts).toBe(7);
+    deliver(reasoningFirst, {
+      type: "agent_message",
+      id: "other",
+      turnId: "t2",
+      text: "unrelated",
+    });
+    expect(reasoningFirst.getState().messages.find((m) => m.kind === "reasoning")?.ts).toBe(7);
+  });
 });

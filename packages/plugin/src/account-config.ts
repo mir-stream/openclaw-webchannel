@@ -517,9 +517,17 @@ export function resolveReasoningEnabled(accountConfig: WebchannelAccountConfig):
  * **#113's default-ON was a decision to render a volatile live lane, and it does
  * not inherit to a decision to permanently record plaintext to disk.** Those are
  * two different questions with two different blast radii:
- *  - the LANE is ephemeral. It is drawn, the turn ends, the client's own
- *    `state.reasoning` is capped and eventually dropped, and nothing survives a
- *    reload. Defaulting it ON costs a UI section;
+ *  - the LANE is ephemeral: it is drawn, and with durability OFF nothing of it
+ *    survives a reload. Defaulting it ON costs a UI section.
+ *    ⚠️ THIS BULLET USED TO SAY "the client's own `state.reasoning` is capped
+ *    and eventually dropped, and nothing survives a reload", and #242 half 2
+ *    falsified BOTH clauses — four lines above the paragraph that was rewritten
+ *    for exactly this reason. The `.slice(-100)` cap is GONE (`upsertReasoning`
+ *    was deleted; `state.reasoning` is derived from `state.messages` and
+ *    uncapped), and for an OPTED-IN account a reload does replay it. The
+ *    ephemerality that survives is conditional on the opt-in being off, which is
+ *    the distinction this whole docblock is drawing — so the sentence had to
+ *    name it rather than assert the old absolute;
  *  - the JOURNAL is permanent plaintext on disk. `resolveReasoningEnabled` one
  *    function up already treats this content as sensitive for the SAME reason,
  *    in its own words: reasoning "can restate file contents, credentials, or the

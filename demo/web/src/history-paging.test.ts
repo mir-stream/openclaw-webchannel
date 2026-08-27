@@ -105,9 +105,13 @@ describe('"load older" reaches the start of the conversation', () => {
     // are all reasoning: every click re-serves the same page, every row tier-1
     // matches, nothing moves, and `u0` is unreachable. Measured before the fix:
     //
-    //   click 1: cursor=A page=[r11..r30]  rows 20 -> 21
+    //   click 1: cursor=A page=[r11..r30]  rows 1 -> 21
     //   click 2: cursor=A page=[r11..r30]  rows 21 -> 21
     //   click 3..5: identical.  u0 ever reached? false
+    //
+    // (The first line read "rows 20 -> 21". The device holds exactly ONE row
+    // before the first click — the `agent_message` below — so 1 -> 21 is the
+    // only arithmetic this fixture supports: 1 held + 20 served.)
     const projection = projectionWithReasoningRun(30);
     const client = newClient();
     // The device has watched the live turn's last answer and nothing else.

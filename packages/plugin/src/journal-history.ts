@@ -67,8 +67,14 @@
  *    controller is N6b/N6c, so #304 needs a design round, not a patch. The full
  *    mechanism and its case table live at `lastDeliveredText`'s declaration in
  *    `message-adapter.ts`; do not restate them, and do not "fix" this here.
- *  - GAP 2b — A BURST CLOSED BY THE TURN TEARDOWN REPLAYS AFTER THE TURN'S
- *    ANSWERS. See the ORDERING note on the conversion loop below.
+ *  - GAP 2b — LIVE AND REPLAY CAN DISAGREE ON A BURST'S POSITION. They agree
+ *    IFF no `placement`/`bubble` row is journaled BETWEEN that burst's first
+ *    delivered frame and its closing frame. ⚠️ DO NOT re-attribute this to "a
+ *    burst closed by the turn teardown" — this bullet said exactly that and it
+ *    is the false dichotomy the conversion loop below retracts at length, with
+ *    a frame-level counterexample whose burst closes MID-TURN via `endBurst`.
+ *    The interleaving is the variable; the closing mechanism is not. See that
+ *    note for the statement.
  *
  * Both are content/order divergences on top of a shared reducer, not second
  * transition tables, so neither changes the rule this module lives by.
@@ -615,8 +621,15 @@ export function projectJournalHistory(
     // sourced identically for both, and `recordFirstSeen` already dated
     // reasoning ids in half 1 precisely so this step would inherit it unchanged.
     //
-    // ── ⚠️ GAP 2b — ORDERING. THIS IS THE CANONICAL STATEMENT; THE OTHER THREE
-    //    SITES POINT HERE RATHER THAN RESTATING IT ──
+    // ── ⚠️ GAP 2b — ORDERING. THIS IS THE CANONICAL STATEMENT; EVERY OTHER
+    //    SITE POINTS HERE RATHER THAN RESTATING IT ──
+    //
+    // ⚠️ NO COUNT. This said "THE OTHER THREE SITES" and a sibling said "rather
+    // than keeping a FOURTH copy" — two numbers that already disagreed, while
+    // `git grep -n 'GAP 2b'` finds the term in ten files. A census in prose is
+    // born stale: it is wrong the moment anyone cites this from a new place, and
+    // nothing makes it fail. The property that matters is "here, not there",
+    // which needs no number.
     //
     // A reasoning block's POSITION here is where its JOURNAL ROW fell, which is
     // the moment the burst CLOSED — the journal records the ONE `final: true`

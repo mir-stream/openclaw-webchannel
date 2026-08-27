@@ -2032,7 +2032,12 @@ export class WebChannelNATSClient {
    * Merge a reducer-produced `DurableView` back onto `state.messages`.
    *
    *  1. every client-local field is carried from the `prev` bubble with the same
-   *     id (the whole overlay — `ts`, `working`, `sendState`, `receiptKey`, …);
+   *     id (the whole overlay — `ts`, `working`, `sendState`, `receiptKey`, …).
+   *     ⚠️ THE CARRY IS KEYED BY (KIND, id), NOT BY id: `state.messages` can
+   *     hold a same-id pair of different kinds (`case "history"`'s cross-kind
+   *     fresh insert), and each member keeps its OWN overlay. This sentence was
+   *     false while `prev` was indexed by id alone — see the two kind-scoped
+   *     maps below for what went wrong and how;
    *  2. `id`, `role`, `text` and `turnId` come from the view (`turnId` falls back
    *     to `prev`'s), EXCEPT that a still-`draftOnly` entry keeps `prev.text` —
    *     its durable text is `""` by construction and the rendered text is the
@@ -2072,22 +2077,30 @@ export class WebChannelNATSClient {
     // ids and `remove` from `supersededAnswerBubbleIds`, which are disjoint sets.
     // Recorded rather than branched on — an unreachable branch with no test is
     // worse than a stated invariant.
-    const prevById = new Map(prev.map((m) => [m.id, m] as const));
-    // ⚠️ KIND-GUARDED, MIRRORING THE REDUCER'S `findTextIndex`. The two id spaces
+    // ⚠️ TWO KIND-SCOPED INDEXES, NEVER ONE KEYED BY ID. The two id spaces
     // (answer/user bubbles and reasoning blocks) are not provably disjoint — the
-    // reducer's own docblock retracts the id-shape argument that used to claim
-    // they were — so a lookup must only carry client-local fields ACROSS a
-    // matching kind. Without this a colliding id would let a bubble's overlay be
-    // spread under a reasoning entry (or vice versa), which is how a fabricated
-    // `role` would get into the view by the back door.
-    const prevBubble = (id: string): ChatBubble | undefined => {
-      const held = prevById.get(id);
-      return held !== undefined && held.kind === undefined ? held : undefined;
-    };
-    const prevReasoning = (id: string): ChatReasoningMessage | undefined => {
-      const held = prevById.get(id);
-      return held !== undefined && held.kind === "reasoning" ? held : undefined;
-    };
+    // reducer's `findTextIndex` docblock retracts the id-shape argument that used
+    // to claim they were — and `case "history"` now DELIBERATELY produces a
+    // same-id pair of different kinds when a snapshot row collides with a local
+    // entry of the other kind.
+    //
+    // ⚠️ A SINGLE `Map<string, ChatMessage>` WITH A KIND GUARD ON THE LOOKUP WAS
+    // TRIED AND WAS WRONG, in exactly the way `case "history"`'s id-keyed index
+    // was wrong: a Map is LAST-WINS, so `get(id)` on such a pair returned
+    // whichever member sat later in the array and the guard turned that into
+    // `undefined` for the EARLIER one — dropping its WHOLE overlay (rule 1), not
+    // one field. Measured: a hydrated bubble lost its `ts` on the next unrelated
+    // durable frame; the same loss takes `receiptKey` (after which
+    // `patchBubbleByReceiptKey` can never find that bubble), `wireId` (breaking
+    // `promoteAnchor`) and `pending` (making `retract()` return false for a
+    // bubble still in `this.held[]`). Scoping the INDEX makes each member find
+    // its own `prev`, and the guards disappear because the key does the work.
+    const prevBubbleById = new Map<string, ChatBubble>();
+    const prevReasoningById = new Map<string, ChatReasoningMessage>();
+    for (const m of prev) {
+      if (m.kind === "reasoning") prevReasoningById.set(m.id, m);
+      else prevBubbleById.set(m.id, m);
+    }
     const out: ChatMessage[] = [];
     for (const entry of view) {
       // ⚠️ #242 half 2: A REASONING ENTRY IS CARRIED, NOT SKIPPED. Half 1 had a
@@ -2105,8 +2118,16 @@ export class WebChannelNATSClient {
       // reload hydrates the block with a `ts`; the very next durable frame
       // re-projects and re-merges the whole view, and building a fresh
       // `{kind,id,turnId,text}` would silently drop it.
+      //
+      // ⚠️ THAT REASONING WAS RIGHT AND THE CODE STILL LOST THE `ts` — measured,
+      // and worth recording because the paragraph above reads as a guarantee.
+      // The inheritance only ever held for the LAST-WINS member of a same-id
+      // pair: `prev` was indexed by id alone, so a reasoning entry sharing an id
+      // with a bubble later in the array looked up as `undefined` and this
+      // branch built exactly the fresh `{kind,id,turnId,text}` it says it
+      // avoids. Keying the index by kind is what made the paragraph true.
       if (entry.kind === "reasoning") {
-        const prevEntry = prevReasoning(entry.id);
+        const prevEntry = prevReasoningById.get(entry.id);
         const nextReasoning: ChatReasoningMessage = {
           kind: "reasoning",
           id: entry.id,
@@ -2124,7 +2145,7 @@ export class WebChannelNATSClient {
         );
         continue;
       }
-      const base = prevBubble(entry.id);
+      const base = prevBubbleById.get(entry.id);
       const overlay = local !== undefined && Object.hasOwn(local, entry.id)
         ? local[entry.id]
         : undefined;
