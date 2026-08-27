@@ -217,8 +217,14 @@ function nextStateFrom(
  * and #242 half 2 gave it a second caller (`mergeDurable`'s reasoning branch,
  * `sameChatMessage(prevEntry, nextReasoning)`). The key-count check is what makes
  * that work for BOTH kinds, which is why `ChatBubble.kind` and a reasoning
- * entry's `ts` are absent as OWN KEYS rather than present-and-`undefined`; both
- * of those declarations cite this function for the reason.
+ * entry's `ts` are absent as OWN KEYS rather than present-and-`undefined`.
+ *
+ * ⚠️ ONLY ONE OF THOSE TWO CITES THIS FUNCTION, so do not go looking for a pair.
+ * `ChatBubble.kind`'s declaration in `types.ts` carries the reason; the reasoning
+ * `ts` is explained at its ASSIGNMENT site (`mergeDurable`'s reasoning branch),
+ * not at its declaration. An earlier revision of this block claimed both
+ * declarations did — corrected rather than deleted, because "both declarations
+ * say so" is exactly the kind of census a reader trusts without checking.
  */
 function sameChatMessage(a: ChatMessage, b: ChatMessage): boolean {
   const aKeys = Object.keys(a);
@@ -2784,7 +2790,7 @@ export class WebChannelNATSClient {
           if (typeof m.text !== "string") continue;
           /**
            * ⚠️ #242 half 2: A REASONING ROW TAKES TIER 1 OR A FRESH INSERT, AND
-           * NOTHING ELSE. Three properties make that safe, and all three were
+           * NOTHING ELSE. Four properties make that safe, and all four were
            * checked rather than assumed:
            *
            *  1. TIER 1 IS THE NORMAL OUTCOME. A reasoning id is minted by the
@@ -2802,6 +2808,22 @@ export class WebChannelNATSClient {
            *     that misses tier 1 — which is the right answer for the same
            *     reason: with plugin-minted ids, a miss means this device has no
            *     local counterpart at all.
+           *  4. TIER 1 REQUIRES THE KINDS TO AGREE — the fourth outcome, which
+           *     the first revision of this list did not enumerate and which was
+           *     the defect. `seen`/`localIndexById` are built from ALL of
+           *     `state.messages`, which now mixes both kinds, and the two id
+           *     spaces are NOT provably disjoint: `durable-view-reducer.ts`'s
+           *     `findTextIndex` docblock retracts the id-shape argument (agent
+           *     answer ids come from the same `nextMessageId()`, and USER ids
+           *     are client-supplied, validated only as a non-empty string
+           *     within `MAX_INBOUND_USER_ID_LENGTH`, so a peer can send
+           *     `webchannel-…` verbatim). A kind-blind tier 1 therefore counted
+           *     a collision with an entry of the OTHER kind as a match and
+           *     DROPPED the row — never inserted, never rendered, though it
+           *     renders fine on a fresh load (N10, live≠history content loss).
+           *     The `kindAgrees` conjunct below sends a disagreement to the
+           *     fresh insert, which is already the right answer for "this
+           *     device has no local counterpart" (property 3).
            *
            * `turnId` is REQUIRED on this variant (the wire types it `string`),
            * so a row without one is dropped rather than inserted with a
@@ -2814,8 +2836,14 @@ export class WebChannelNATSClient {
             // too or the identical content renders from one door and not the
             // other — see the empty-row note at the top of this case.
             if (m.text.length === 0) continue;
-            if (seen.has(m.id)) {
-              const li = localIndexById.get(m.id);
+            const li = localIndexById.get(m.id);
+            // ⚠️ THE KINDS MUST AGREE (property 4 above). `li === undefined`
+            // with the id in `seen` is NOT a cross-kind collision — a fresh
+            // insert adds to `seen` without adding to `localIndexById`, so that
+            // state means "a repeat of an id earlier in THIS page", which is a
+            // real match and still a drop.
+            const kindAgrees = li === undefined || next[li].kind === "reasoning";
+            if (seen.has(m.id) && kindAgrees) {
               if (li !== undefined) {
                 cursor = li + 1;
                 claimed.add(li);
@@ -2835,12 +2863,28 @@ export class WebChannelNATSClient {
             continue;
           }
           if (m.role !== "user" && m.role !== "agent") continue;
-          if (seen.has(m.id)) {
-            const li = localIndexById.get(m.id);
+          const li = localIndexById.get(m.id);
+          // ⚠️ THE KINDS MUST AGREE — the same conjunct the reasoning branch
+          // above carries, and for the same reason (see property 4 in its
+          // docblock): an id resolving to a REASONING entry is not a match for a
+          // text row, and counting it as one dropped the row entirely. As there,
+          // `li === undefined` with the id in `seen` is a repeat within THIS
+          // page, which stays a match and stays a drop.
+          const kindAgrees = li === undefined || next[li].kind === undefined;
+          if (seen.has(m.id) && kindAgrees) {
             // Tier-1 match: walk the cursor past this already-held message so
-            // later fresh messages insert after it. An id we can't locate
-            // locally (should not happen — `seen` is seeded from `next`) leaves
-            // the cursor untouched.
+            // later fresh messages insert after it. An id we cannot locate
+            // locally leaves the cursor untouched.
+            //
+            // ⚠️ THAT CASE IS REACHABLE, AND THE PARENTHETICAL THAT USED TO SIT
+            // HERE DENIED IT — it read "should not happen — `seen` is seeded
+            // from `next`". `seen` is ALSO added to by the fresh-insert paths
+            // below, which do not touch `localIndexById`, so `seen.has(id)` with
+            // no local index is the ordinary within-page repeat. It was already
+            // wrong before #242 half 2; it is cut now because the `kindAgrees`
+            // conjunct three lines above depends on exactly that state meaning
+            // what it means, and two adjacent comments disagreeing about it is
+            // worse than either alone.
             if (li !== undefined) {
               cursor = li + 1;
               // ⚠️ CLAIM IT. A bubble already identified BY ID must not stay a
@@ -3136,7 +3180,16 @@ export class WebChannelNATSClient {
         // re-claim), and an absent one claims it — that is the normal path, and
         // it is what keeps the rolling draft out of the durable projection
         // (§15.9) while it still renders.
-        const heldBubble = this.state.messages.find((m) => m.id === answerId);
+        // ⚠️ `m.kind === undefined` IS PART OF THE PREDICATE, exactly as in
+        // `patchBubbleByReceiptKey` — the two id spaces are not provably
+        // disjoint (`durable-view-reducer.ts`'s `findTextIndex` docblock), and a
+        // reasoning entry found here reads as a bubble with `draftOnly`
+        // undefined, so `claimsDraft` goes false, the overlay omits `draftOnly`,
+        // and the rolling draft never becomes droppable at turn end — it freezes
+        // as durable text.
+        const heldBubble = this.state.messages.find(
+          (m) => m.kind === undefined && m.id === answerId,
+        );
         const claimsDraft = heldBubble === undefined || heldBubble.draftOnly === true;
         this.applyDurable(
           {

@@ -740,4 +740,68 @@ describe("history hydration — reasoning rows (#242 half 2)", () => {
     );
     expect(w.getState().messages.map((m) => m.id)).toEqual(["u-old", "r-old", "a-new"]);
   });
+
+  /**
+   * ⚠️ TIER 1 REQUIRES THE KINDS TO AGREE, and these two cases are why.
+   *
+   * `seen`/`localIndexById` are built from ALL of `state.messages`, which since
+   * half 2 mixes both kinds. The two id spaces are NOT provably disjoint —
+   * `durable-view-reducer.ts`'s `findTextIndex` docblock retracts the id-shape
+   * argument outright: agent ids come from the same `nextMessageId()` as
+   * reasoning ids, and USER ids are client-supplied and validated only as a
+   * non-empty string within `MAX_INBOUND_USER_ID_LENGTH`, so a peer can send
+   * `webchannel-…` verbatim. So a snapshot row CAN collide with a locally-held
+   * entry of the other kind, and a kind-blind tier 1 silently DROPS it — never
+   * inserted, never rendered — while the same row renders fine on a fresh load.
+   * That is a live≠history content loss (N10).
+   */
+  it("a TEXT row colliding with a held REASONING id is inserted, not dropped", () => {
+    const w = makeWrapper();
+    deliver(w, { type: "reasoning", id: "dup", turnId: "t1", text: "thinking" });
+    deliver(w, history({ id: "dup", role: "agent", text: "the answer", ts: 5 }));
+
+    // The reasoning block survives untouched, and the text row RENDERS.
+    expect(w.getState().messages.map((m) => `${m.kind ?? "text"}|${m.id}|${m.text}`)).toEqual([
+      "text|dup|the answer",
+      "reasoning|dup|thinking",
+    ]);
+    expect(w.getState().reasoning.map((r) => r.id)).toEqual(["dup"]);
+  });
+
+  it("a REASONING row colliding with a held BUBBLE id is inserted, not dropped", () => {
+    const w = makeWrapper();
+    deliver(w, { type: "agent_message", id: "dup", turnId: "t1", text: "the answer" });
+    deliver(w, history(reasoningRow("dup", "t1", "thinking", 5)));
+
+    // The bubble survives untouched, and the reasoning row RENDERS.
+    expect(w.getState().messages.map((m) => `${m.kind ?? "text"}|${m.id}|${m.text}`)).toEqual([
+      "reasoning|dup|thinking",
+      "text|dup|the answer",
+    ]);
+    expect(w.getState().reasoning.map((r) => r.id)).toEqual(["dup"]);
+  });
+
+  it("still drops a repeat of the same id WITHIN one page — both kinds", () => {
+    // The other half of the kind conjunct, pinned so a future edit cannot buy
+    // the cross-kind fix by re-admitting within-page repeats. A fresh insert
+    // adds to `seen` WITHOUT adding to `localIndexById`, so "seen but not
+    // locally held" means "a repeat of an id earlier in THIS page" — still a
+    // match, and still a drop.
+    const text = makeWrapper();
+    deliver(
+      text,
+      history(
+        { id: "d1", role: "agent", text: "one", ts: 1 },
+        { id: "d1", role: "agent", text: "two", ts: 2 },
+      ),
+    );
+    expect(text.getState().messages.map((m) => `${m.id}|${m.text}`)).toEqual(["d1|one"]);
+
+    const reasoning = makeWrapper();
+    deliver(
+      reasoning,
+      history(reasoningRow("d2", "t1", "one", 1), reasoningRow("d2", "t1", "two", 2)),
+    );
+    expect(reasoning.getState().messages.map((m) => `${m.id}|${m.text}`)).toEqual(["d2|one"]);
+  });
 });

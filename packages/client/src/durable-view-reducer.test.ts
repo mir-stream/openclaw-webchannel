@@ -33,11 +33,21 @@ const TURN = "turn-1";
 /**
  * Narrow a view entry to the `text` variant so an anchor can read `role`.
  *
- * THROWS rather than filtering. Every entry the anchors below produce is a text
- * message: the client routes no `reasoning` event through the reducer in #242
- * half 1 (it renders `state.reasoning` directly), so a reasoning entry appearing
- * in a wrapper-driven view would mean the anchor is no longer comparing what it
- * says it compares. A silent skip would hide that; a throw names it.
+ * THROWS rather than filtering — but ⚠️ NOT FOR THE REASON THIS BLOCK USED TO
+ * GIVE, AND THE OLD REASON NOW POINTS AT THE WRONG THING. It said "every entry
+ * the anchors below produce is a text message: the client routes no `reasoning`
+ * event through the reducer in #242 half 1", so a reasoning entry in a
+ * wrapper-driven view "would mean the anchor is no longer comparing what it says
+ * it compares." Half 2 deleted that premise — `case "reasoning"` routes through
+ * `applyDurable` now — and the fifth anchor in this very file drives a real
+ * `reasoning` frame and EXPECTS a reasoning entry in the wrapper-driven view. So
+ * the old sentence named the expected outcome as the failure signal, and it
+ * contradicted the retracted section header a few lines below it.
+ *
+ * The surviving reason is narrower and is about the CALLER: this helper exists so
+ * an anchor can read `role`, which only the `text` variant has. A reasoning entry
+ * reaching it therefore means the WRONG anchor called it — not that the reducer
+ * or the client is broken. A silent skip would hide that; a throw names it.
  */
 function asText(message: DurableMessage): DurableTextMessage {
   if (message.kind !== "text") {

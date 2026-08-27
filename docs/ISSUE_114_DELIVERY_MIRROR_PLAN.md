@@ -820,7 +820,7 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 | 서버 seq 순서 vs stream-replay 순서(슬롯클레임+부활) | [#114] | §15.0; §16.2-3/6 |
 | persist-before-deliver vs commit-after-publish(agent) | [#114] | §15.8; §16.2-2 |
 | 전송 확인(sent/delivered/read)+persist vs 로컬 WS enqueue만 | [#114 부분/later] | `nats-transport.ts:759`; §16.2-2/9 |
-| 모든 message/service 타입 durable vs tool/reasoning/notice/approval ephemeral | [#114] | 🟡 **부분 (#242 half 1, 2026-08-27)** — reasoning만, 그것도 **서버 쪽만**(저널 burst당 1행 + reducer fold). 클라 렌더·`history` 프레임은 그대로 → 리로드하면 여전히 안 보인다. tool/approval은 미착수. 남은 갭 전체는 §15.9 reasoning 항목 |
+| 모든 message/service 타입 durable vs tool/reasoning/notice/approval ephemeral | [#114] | 🟡 **부분 (#242 half 1 → half 2, 2026-08-27)** — reasoning만. ⚠️ **"서버 쪽만"은 옛말이다**: half 2가 `history` wire row를 tagged union으로 넓히고 projection의 drop을 없애고 클라 렌더를 공유 reducer로 옮겼다 → **리로드하면 보인다**(단 `capabilities.reasoningDurable` 옵트인 계정 한정, 기본 OFF). 남은 갭은 두 개뿐 — **#304**(닫는 시점 transport 거절 시 행 없음)와 **순서(GAP 2b)**. tool/approval은 여전히 미착수(#242 half 3). 전체 서술은 §15.9 reasoning 항목 |
 | service message가 typed durable vs 이벤트 모델서 누락(approval 등) | [#114] | `channel-contract.ts`의 `approval_*` 멤버들; §16.2-5 |
 | final↔답변 연결 vs 우리가 ordinal 억지매칭 desync | **[#114]** (S1 철회) | 내장 채널은 "현재 draft 마감 + 못 붙으면 새 메시지"; core 한계 아님(§16.1) |
 | **원본 inbound 각각을 durable 보존** vs 우리는 journaling 없이 메모리서 `{id:last,text:joined}`로 병합 | **[#114]** (라벨 정정) | ⚠️ codex 정정: "Telegram은 coalesce 안 함"은 **틀림** — 내장 Telegram도 coalesce함(`[core] extensions/telegram/src/bot-handlers.runtime.ts:636`). 차이는 **병합 전 각 원본을 journal에 남기느냐**다. `inbound-queue.ts:145`. 턴-레벨 coalesce는 남겨도 됨 |
