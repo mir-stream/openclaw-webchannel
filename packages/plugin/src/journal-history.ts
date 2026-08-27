@@ -703,7 +703,7 @@ function recordFirstSeen(
     default: {
       // ⚠️ COMPILE-TIME EXHAUSTIVENESS, same device and same reason as
       // `KNOWN_EVENT_KINDS` above. Without it a `switch` over a closed union
-      // SILENTLY NO-OPS on a new member: #241 adds a fifth kind, the author is
+      // SILENTLY NO-OPS on a new member: a new kind arrives, the author is
       // forced to update `KNOWN_EVENT_KINDS` (tsc fails there), the new kind
       // therefore reaches the fold — but nothing records a first appearance for
       // any id it introduces, so every message it creates quietly takes the

@@ -92,8 +92,9 @@ export type OutboundWsMessage =
        *
        * ADDITIVE AND OPTIONAL: an older client ignores the extra key and takes
        * the frame down its ordinary `reasoning` path. That path is NOT inert,
-       * and calling it a "render no-op" understates it — what actually happens
-       * is:
+       * and calling it a "render no-op" understates it — for the frame this
+       * slice ADDS to the wire (`closeLiveBurst`'s: the burst's own id, carrying
+       * the text the peer already holds) what actually happens is:
        *  - `upsertReasoning` replaces the entry under the SAME id with the SAME
        *    text, so the rendered reasoning list is unchanged in content;
        *  - `disarmStaleDraftsByTurn(turnId)` runs, which only DELETES ids from
@@ -105,6 +106,15 @@ export type OutboundWsMessage =
        * `reasoning?.stop()` runs in the `finally`, before the settlement block),
        * so any draft this frame disarms is still finalized by the turn's own
        * terminal frame.
+       *
+       * ⚠️ THE THREE BULLETS ARE NOT UNIVERSAL OVER FRAMES CARRYING THIS FLAG.
+       * `pushDurableBlock`'s independent-block branch also sets it, on a FRESHLY
+       * MINTED id carrying text the client has not seen — so there
+       * `upsertReasoning` takes its APPEND path and the `.slice(-100)` cap can
+       * evict the oldest entry. That is not a compatibility concern, because
+       * that branch sent a byte-identical frame (minus this key) before the flag
+       * existed; it is a warning against reading "same id, same text" as a
+       * property of `final` rather than of the burst-closing frame.
        *
        * The cost is one extra copy of the burst's text on the wire per burst,
        * and it is accepted.

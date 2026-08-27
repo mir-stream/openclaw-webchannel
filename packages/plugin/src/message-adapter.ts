@@ -2694,7 +2694,7 @@ export type ReasoningDraftController = {
  *
  * So "exactly one per close call" is false and "at most one per burst, and zero
  * only when the burst reached nobody" is the property. See `closeLiveBurst` for
- * the O(n²) argument the flag replaces and for the four-case table behind the
+ * the O(n²) argument the flag replaces and for the five-case table behind the
  * `lastDeliveredText` gate.
  *
  * VERIFIED INTERNAL BEHAVIOR (OpenClaw 2026.7.1-2): every emitter sends either
@@ -2790,11 +2790,24 @@ export function createReasoningDraftController(params: {
   // identical. The recovered control writes 1 row carrying "Let me".
   //
   // ⚠️ AND THE SEAM CANNOT FIX THE RESIDUAL — do not try here. Journaling a
-  // refused send is ruled out at `sendToPeer`'s persist-before-publish block:
-  // the caller re-mints an id per attempt, so recording refusals manufactures a
-  // phantom row per revision under ids that never existed live (N8, gaining, at
-  // an unbounded rate). A second journal hook inside this controller is NOT-list
-  // N6b/N6c. The residual is #304 and needs a design round, not a patch.
+  // refused send is ruled out at `sendToPeer`'s persist-before-publish block,
+  // and the rule is the FUNNEL'S OWN, holding for every frame type it carries: a
+  // refusal means the peer never received the frame, so recording it would put
+  // content in history that live never showed — N8, in the gaining direction.
+  //
+  // ⚠️ DO NOT RESTATE THAT AS AN ARGUMENT ABOUT IDS. An earlier revision of this
+  // comment gave the reason as "the caller re-mints an id per attempt, so
+  // recording refusals manufactures a phantom row per revision under ids that
+  // never existed live". That is `reserveProvisional`'s behaviour on the
+  // PLACEMENT path, borrowed; it is not this controller's. `push` reuses ONE id
+  // for the whole burst and rotates only at close, so refusals here would repeat
+  // a single id rather than mint new ones — an upsert, not an unbounded phantom
+  // fan-out. The conclusion is unchanged and does not depend on the correction;
+  // only the mechanism was wrong, and a reader who checked it here would have
+  // concluded the deferral was unfounded.
+  //
+  // A second journal hook inside this controller is NOT-list N6b/N6c. The
+  // residual is #304 and needs a design round, not a patch.
   let lastDeliveredText = "";
   let stopped = false;
 
