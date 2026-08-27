@@ -3671,11 +3671,10 @@ describe("ReasoningDraftController", () => {
     controller.pushDurableBlock({ text: "Plan" });
 
     expect(frames.map((frame) => frame.text)).toEqual(["Plan"]);
-    // #242: the rejected live burst emits NO close frame — see the
-    // `liveSnapshotDelivered` gate in `closeLiveBurst`. The durable block is the
-    // delivery path here, so it is also the durable record; a close frame too
-    // would put the same burst on the wire twice and render two identical
-    // reasoning blocks where the client renders one.
+    // #242 / #304, the ALL-REFUSED case: nothing of the live burst reached the
+    // client, so `lastDeliveredText` is empty and `closeLiveBurst` emits no
+    // close frame. The durable block is the only delivery, so it is also the
+    // only durable record. ONE row.
     expect(finalFrames(frames)).toHaveLength(1);
     expect(finalFrames(frames)[0].text).toBe("Plan");
   });
@@ -3812,6 +3811,61 @@ describe("ReasoningDraftController — #242 durable burst frames", () => {
     const finals = finalFrames(frames);
     expect(finals.map((frame) => frame.text)).toEqual(["one", "two", "three"]);
     expect(new Set(finals.map((frame) => frame.id)).size).toBe(3);
+  });
+
+  it("MIXED refusal: the close frame carries what the client ACTUALLY HAS", () => {
+    // ⚠️ #304, AND THE CASE A "did the LAST send land?" GATE LOSES ENTIRELY.
+    // `push "a"` lands, `push "ab"` is REFUSED, the burst closes. Under that
+    // gate this emits ZERO durable frames — a burst the user watched with no
+    // journal row at all, on an ordinary trigger (a NATS reconnect, the
+    // fail-closed no-session-key window). Tracking the last DELIVERED text
+    // instead emits one frame carrying "a": still an upsert-by-id no-op for the
+    // client, and the journal records exactly what was seen.
+    const { controller, frames } = setup([true, false]);
+    controller.push({ text: "a" });
+    controller.push({ text: "ab" });
+    controller.endBurst();
+
+    const finals = finalFrames(frames);
+    expect(finals).toHaveLength(1);
+    expect(finals[0].text).toBe("a");
+    expect(finals[0].id).toBe(liveFrames(frames)[0].id);
+  });
+
+  it("MIXED refusal on the stop() path too — an aborted turn keeps the delivered prefix", () => {
+    const { controller, frames } = setup([true, false]);
+    controller.push({ text: "a" });
+    controller.push({ text: "ab" });
+    controller.stop();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["a"]);
+  });
+
+  it("MIXED refusal then a durable block: two blocks live, two rows, matching exactly", () => {
+    // The live view here is NOT "one block" and NOT "two identical blocks" —
+    // the client holds {"Plan"} from the accepted push and {"Plan carefully"}
+    // from the durable block. Two rows is therefore the MATCHING record rather
+    // than a duplicate, which is why the close frame belongs on this path.
+    const { controller, frames } = setup([true, false]);
+    controller.push({ text: "Plan" });
+    controller.push({ text: "Plan carefully" });
+    controller.pushDurableBlock({ text: "Plan carefully" });
+
+    const finals = finalFrames(frames);
+    expect(finals.map((frame) => frame.text)).toEqual(["Plan", "Plan carefully"]);
+    expect(finals[0].id).toBe(liveFrames(frames)[0].id);
+    expect(finals[1].id).not.toBe(finals[0].id);
+  });
+
+  it("ALL-REFUSED: no close frame, and the id still rotates for the next burst", () => {
+    const { controller, frames } = setup([false]);
+    controller.push({ text: "a" });
+    controller.endBurst();
+    expect(frames).toEqual([]);
+    // The rotation is unconditional, so a later delivered burst is its own
+    // block rather than an upsert onto the one nobody received.
+    controller.push({ text: "b" });
+    controller.endBurst();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["b"]);
   });
 
   it("journals the DISPLAYED text, not btw's raw cumulative payload", () => {

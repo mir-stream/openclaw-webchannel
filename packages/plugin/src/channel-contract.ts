@@ -83,11 +83,24 @@ export type OutboundWsMessage =
        * journaling every `reasoning` frame would write O(n²) bytes per burst.
        * With the flag a burst costs exactly one row.
        *
-       * ADDITIVE AND OPTIONAL: an older client ignores the extra key and renders
-       * the frame exactly as it renders any other — the final frame repeats the
-       * closing frame's id and text, so it is an upsert-by-id with identical
-       * content, i.e. a render no-op. The cost is one extra copy of the burst's
-       * text on the wire per burst, and it is accepted.
+       * ADDITIVE AND OPTIONAL: an older client ignores the extra key and takes
+       * the frame down its ordinary `reasoning` path. That path is NOT inert,
+       * and calling it a "render no-op" understates it — what actually happens
+       * is:
+       *  - `upsertReasoning` replaces the entry under the SAME id with the SAME
+       *    text, so the rendered reasoning list is unchanged in content;
+       *  - `disarmStaleDraftsByTurn(turnId)` runs, which only DELETES ids from
+       *    the client's stale-draft watch set — it touches no message;
+       *  - `setState` fires, so subscribers see one extra notification.
+       * The disarm is the only behavioural effect, and it is safe here because
+       * of WHEN this frame is sent: every burst close happens inside the turn,
+       * and `inbound.ts` emits this turn's `turn_settled` afterwards (its
+       * `reasoning?.stop()` runs in the `finally`, before the settlement block),
+       * so any draft this frame disarms is still finalized by the turn's own
+       * terminal frame.
+       *
+       * The cost is one extra copy of the burst's text on the wire per burst,
+       * and it is accepted.
        */
       final?: boolean;
     }

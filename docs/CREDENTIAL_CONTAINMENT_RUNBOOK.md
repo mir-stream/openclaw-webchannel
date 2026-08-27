@@ -48,11 +48,37 @@ because the thing it names does not exist. The correction:
     (the last only on volumes where WAL is unavailable) — the v6 delivery
     journal, opened at account start unconditionally, with no config to
     disable it. It holds message **plaintext**, not ciphertext: `agent_message`
-    text, `progress` placements, and the `turn_snapshot` rows written at turn
-    end, all recorded on the egress path. Owner-only (0600) inside the 0700
-    tuple directory, and nothing ages out of it — this slice ships no retention
-    (that is #240, tracked with the operator-facing half in #290) — so it
-    accumulates for the life of the account.
+    text, `progress` placements, the `turn_snapshot` rows written at turn end,
+    and — since #242 half 1 — **the model's REASONING text**, all recorded on
+    the egress path. Owner-only (0600) inside the 0700
+    tuple directory, and nothing ages out of it — no slice has shipped
+    retention (the pruning path is #299, the operator-facing procedure is
+    #290) — so it accumulates for the life of the account. This used to say
+    "that is #240"; #240 is history-from-the-journal plus the destructive
+    cutover, and neither of its two halves touches retention, so an operator
+    following that pointer would land on the wrong issue.
+
+    ⚠️ **REASONING IS A NEW CLASS OF CONTENT ON DISK, NOT MORE OF THE SAME.**
+    The other rows are text the user was shown as the answer; a reasoning row
+    is the model's *private deliberation*, which routinely quotes tool output,
+    file contents and user data that never appear in any answer. One row per
+    burst, stored verbatim — e.g.
+    `{"kind":"reasoning","id":"R1","turnId":"T","text":"…"}`. The plugin's own
+    `resolveReasoningEnabled` says the same thing about the content
+    ("reasoning can restate file contents, credentials, or the user's own prompt
+    to the least trusted surface this plugin serves") — that judgement now
+    applies to bytes at rest, not only to a wire frame.
+
+    Three facts make this worth stating rather than folding into the sentence
+    above: `capabilities.reasoning` defaults **ON**, so rows are written unless
+    an operator turned it off; nothing ages out (#299 is unshipped); and #242
+    **half 1 makes the content unreadable by any client** — the `history` wire
+    frame cannot carry a role-less message, so the projection drops it. Until
+    half 2 lands, this accumulates on disk with **no user-visible benefit at
+    all**. If that trade is not one you want to carry, set
+    `capabilities.reasoning` to `false` (any present value other than boolean
+    `true` also fails closed — see `resolveReasoningEnabled`) to stop new rows;
+    the data-minimization note below applies to the ones already written.
 
     **K does not seal this file, and rotating K does not touch it.**
     `sendToPeer` journals the payload *before* `sealEnvelope` runs, so K covers

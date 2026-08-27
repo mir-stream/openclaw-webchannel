@@ -741,7 +741,7 @@ describe("projectJournalHistory — where ts comes from", () => {
   it("CHARACTERIZATION: an id is dated by a seal the REDUCER rejected", () => {
     // A known, accepted divergence, recorded rather than fixed —
     // `recordFirstSeen`'s docblock has the full argument. `applySeal` refuses the
-    // whole event when `turnId` is blank (durable-view-reducer.ts:544), so this
+    // whole event at its blank-turnId guard, so this
     // seal contributes NOTHING to the view; `recordFirstSeen` records `C`
     // anyway. The later genuine bubble for C therefore materializes with a `ts`
     // sourced from an event that never entered the view.
@@ -788,7 +788,7 @@ describe("projectJournalHistory — where ts comes from", () => {
     // walks the elements, and `answers: [null]` reaches `note(answer.id)` —
     // which throws `Cannot read properties of null` on the way to a history
     // read, i.e. this module crashing where `applySeal` merely filters (its
-    // element predicate starts `!!a &&`, durable-view-reducer.ts:546-549). The
+    // element predicate in `applySeal`'s `rawAnswers` filter starts `!!a &&`). The
     // per-element `answer && typeof answer === "object"` check is what keeps the
     // projection no stricter than the rules it replays, and this is the case
     // that pins it. A string element is covered too: `typeof "C" === "object"`

@@ -2778,8 +2778,10 @@ describe("webchannel inbound round-trip", () => {
       // live cumulative draft, then the burst's single `final: true` close,
       // which is the ONE frame the delivery journal records. Same id and same
       // text, so for the client the second is an upsert-by-id with identical
-      // content (a render no-op); the extra copy on the wire is the accepted
-      // cost of the burst-versus-token distinction.
+      // content, so the rendered reasoning list does not change (the frame is
+      // not otherwise inert — see the `final` member's docblock in
+      // `channel-contract.ts` for what its handler does do). The extra copy on
+      // the wire is the accepted cost of the burst-versus-token distinction.
       expect(reasoningSpy).toHaveBeenCalledTimes(2);
       expect(reasoningSpy).toHaveBeenNthCalledWith(
         1,

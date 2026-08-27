@@ -44,16 +44,17 @@
  * `seal.answers` entry — an aborted turn, or a connection dropped before the
  * drain — leaves a `placement` whose text is never authored. The two sides then
  * disagree:
- *   - REPLAY (here): `applyPlacement` appends `{role:"agent", text:""}`
- *     (durable-view-reducer.ts:487-490) and nothing in the reducer or the journal
- *     ever removes it, so `projectJournalHistory` emits a PHANTOM EMPTY AGENT
- *     BUBBLE;
+ *   - REPLAY (here): `applyPlacement`'s APPEND BRANCH (the one taken when no
+ *     text entry holds the id) adds `{kind:"text", role:"agent", text:""}` and
+ *     nothing in the reducer or the journal ever removes it, so
+ *     `projectJournalHistory` emits a PHANTOM EMPTY AGENT BUBBLE;
  *   - LIVE: the client renders nothing there. `mergeDurable` skips the entry —
- *     its `if (this.isSpentDraft(next)) continue` guard, just before the `out.push`
- *     (`nats-client-wrapper.ts`; cited by symbol because the line number here
- *     rotted within one commit) — and `isSpentDraft` keys on the CLIENT-LOCAL
- *     `draftOnly` flag, deliberately never journaled, because §15.9 classifies
- *     the rolling draft as an indicator rather than a message.
+ *     its `if (this.isSpentDraft(next)) continue;` guard, just before the
+ *     `out.push` (`nats-client-wrapper.ts`; both of these are cited by SYMBOL
+ *     because the line numbers here rotted within one commit) — and
+ *     `isSpentDraft` keys on the CLIENT-LOCAL `draftOnly` flag, deliberately
+ *     never journaled, because §15.9 classifies the rolling draft as an
+ *     indicator rather than a message.
  * So the rule that hides it is expressed in a field the server does not have.
  * That is N8 by OMISSION, and it is the reason this file cannot claim the
  * equality unconditionally.
@@ -136,11 +137,11 @@
  * durable view returns a NEW array covering the whole view (structural sharing at
  * the ENTRY level, not the array level), so a 20 000-event replay allocates and
  * discards up to ~20 000 arrays of up to 10 000 pointers. UP TO, not exactly —
- * three paths hand the input array straight back instead: a repeat `placement`
- * claim whose turnId resolves unchanged (durable-view-reducer.ts:493-494), a
- * `seal` with no valid answers and no removes (:561), and a `seal` whose `turnId`
- * is blank or not a string (:544). That list is EXHAUSTIVE, and the reducer's own
- * header (durable-view-reducer.ts:61-81) is where it is maintained — read it
+ * three paths hand the input array straight back instead: `applyPlacement`'s
+ * `turnId === prev.turnId` no-op on a repeat claim, `applySeal`'s
+ * no-valid-answers-and-no-removes early return, and `applySeal`'s blank-turnId
+ * guard. That list is EXHAUSTIVE, and the ARRAY IDENTITY table in
+ * `durable-view-reducer.ts`'s own header is where it is maintained — read it
  * there rather than re-deriving it here. `MIXED_STREAM` in the test file
  * exercises the first, via its repeat placement claim. So ~20 000 is an UPPER
  * BOUND on the arrays, not a count of them. The measurement is unaffected: heap
@@ -640,9 +641,9 @@ export function projectJournalHistory(
  *
  * ⚠️ THIS DATES IDS FROM EVENTS THE REDUCER MAY THEN REJECT, AND THAT IS A KNOWN,
  * ACCEPTED DIVERGENCE — not an oversight. `applySeal` refuses a seal outright
- * when `turnId` is blank or not a string (durable-view-reducer.ts:544) and drops
- * individual answers whose `id` is `""` or whose `text` is not a string
- * (durable-view-reducer.ts:546-549). This function records every
+ * at its blank-turnId guard when `turnId` is blank or not a string, and drops
+ * individual answers whose `id` is `""` or whose `text` is not a string at its
+ * `rawAnswers` filter. This function records every
  * `answers[].id` regardless. `journalEventForOutbound` copies `frame.turnId`
  * verbatim, so `seal{turnId:"", answers:[{id:"C",…}]}` really does round-trip
  * through the store: it contributes NOTHING to the view, yet it dates C. A later

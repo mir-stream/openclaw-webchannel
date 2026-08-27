@@ -2673,15 +2673,26 @@ export type ReasoningDraftController = {
  * never deduplicated. If the live transport rejected its latest snapshot, the
  * durable block remains the fallback and is emitted normally.
  *
- * #242 half 1 — ONE DURABLE FRAME PER BURST. Every burst close emits a single
- * extra frame carrying `final: true` whose `text` is the burst's displayed text;
- * that flag is what makes the delivery journal record the burst, and it records
- * NOTHING else this controller sends. A burst closes in four places — `endBurst`,
- * both branches of `pushDurableBlock`, and `stop()` — and each produces exactly
- * one. A `pushDurableBlock` block is already complete when it is sent, so it
- * carries the flag on its own single frame instead of getting a second one. See
- * `closeLiveBurst` for the O(n²) argument this replaces and for why the emission
- * is gated on `liveSnapshotDelivered`.
+ * #242 half 1 — ONE DURABLE FRAME PER BURST. A frame carrying `final: true` is
+ * what makes the delivery journal record a burst, and the journal records
+ * NOTHING else this controller sends. The invariant is per BURST, not per call:
+ *
+ *   `endBurst`                    — closes the live burst: ONE frame, or ZERO
+ *                                   when nothing of it was delivered.
+ *   `stop()`                      — same, on the turn's way out.
+ *   `pushDurableBlock`, branch A  — the CLI replay: closes the live burst (one
+ *     (replay suppression)          or zero) and suppresses the block itself,
+ *                                   because the block IS that burst.
+ *   `pushDurableBlock`, branch B  — an independent block: closes the live burst
+ *     (independent block)           (one or zero) AND emits the block, which is
+ *                                   already complete and so carries the flag on
+ *                                   its own single frame. Up to TWO frames —
+ *                                   two BURSTS, not one burst twice.
+ *
+ * So "exactly one per close call" is false and "at most one per burst, and zero
+ * only when the burst reached nobody" is the property. See `closeLiveBurst` for
+ * the O(n²) argument the flag replaces and for the four-case table behind the
+ * `lastDeliveredText` gate.
  *
  * VERIFIED INTERNAL BEHAVIOR (OpenClaw 2026.7.1-2): every emitter sends either
  * a snapshot or the cumulative FULL text so far — NEVER a bare delta:
@@ -2736,7 +2747,27 @@ export function createReasoningDraftController(params: {
   // reached the transport. A rejected live send leaves the durable result as the
   // only delivery path, so it must not be discarded merely because its text
   // matches the controller's in-memory snapshot.
+  //
+  // ⚠️ THIS FLAG IS ABOUT THE *LAST* SEND, AND THAT IS THE ONLY QUESTION IT MAY
+  // BE ASKED. It is deliberately NOT the gate on the burst's durable frame — see
+  // `lastDeliveredText` and #304 for the hole that produced.
   let liveSnapshotDelivered = false;
+  // ⚠️ THE BURST TEXT THE CLIENT ACTUALLY HAS (#242 half 1, #304). Assigned ONLY
+  // when `sendReasoning` returned true, so it lags `currentText` whenever a send
+  // is refused, and cleared with `currentText` at close.
+  //
+  // This exists because the obvious gate — "did the LAST send land?" — answers
+  // the wrong question and loses whole bursts. MEASURED: with `push "a"`
+  // delivered, `push "ab"` REFUSED, and then `endBurst()`, a last-send gate emits
+  // ZERO durable frames, so a burst the user watched has no journal row at all.
+  // One transient refusal with no successful push after it — a NATS reconnect,
+  // the fail-closed "no session key yet" window — is enough, which is exactly the
+  // N8-losing hole this slice exists to close.
+  //
+  // The two questions that actually matter are different: (a) did ANY of this
+  // burst reach the client, and (b) what text does the client hold. One variable
+  // answers both, and the durable frame carries it rather than `currentText`.
+  let lastDeliveredText = "";
   let stopped = false;
 
   const closeLiveBurst = (): void => {
@@ -2755,32 +2786,43 @@ export function createReasoningDraftController(params: {
     // reasoning simply had no `progress` equivalent, so every one of its frames
     // looked durable.
     //
-    // It repeats the LAST LIVE FRAME's id and text, so for the client it is an
-    // upsert-by-id with identical content — a render no-op. The one real cost is
-    // one extra copy of the burst's text on the wire per burst; accepted.
+    // ⚠️ IT CARRIES `lastDeliveredText`, NOT `currentText`, AND IS GATED ON THE
+    // SAME VARIABLE. The rule is one sentence — **history records what was
+    // DELIVERED** — which is N10 stated positively, and it dissolves a trade-off
+    // an earlier revision tried to pick a side of (#304, fixed by this slice, not
+    // an open limitation). The four cases, all validated:
     //
-    // The text is `currentText` (what the client was shown), never `lastRawText`
-    // (btw's raw cumulative payload, which still carries earlier bursts). History
-    // must record what live displayed.
+    //   ordinary  every push landed        → final carries the full text.
+    //                                        ONE row.
+    //   mixed     early pushes landed,     → final carries what the client
+    //             a later one refused        ACTUALLY HAS, so it is still an
+    //                                        upsert-by-id no-op for the client,
+    //                                        and the journal records what the
+    //                                        user saw. A durable block, if one
+    //                                        follows, arrives under its own id
+    //                                        as a SECOND block — two blocks
+    //                                        live, two rows, matching exactly.
+    //   all-refused                        → `lastDeliveredText` is empty, no
+    //                                        final at all; the durable block is
+    //                                        the only delivery. ONE row.
+    //   empty burst                        → the early return above. Nothing.
     //
-    // ⚠️ GATED ON `liveSnapshotDelivered`, THE SAME FLAG AND THE SAME MEANING AS
-    // THE REPLAY SUPPRESSION BELOW: "did this burst's content actually reach the
-    // transport". If the last live send was refused, `pushDurableBlock`'s
-    // suppression does not fire and the durable block RE-DELIVERS the identical
-    // text under a fresh id — so emitting a final here too would put the same
-    // burst on the wire twice, and the client would render two identical
-    // reasoning blocks where it renders one today. That is a live regression, not
-    // only a duplicate row. The cost of the gate is the narrower case where the
-    // earlier sends of a burst succeeded and only the last one threw during
-    // publish: that burst gets no durable row. Refusals lose nothing either way —
-    // `sendToPeer` journals only BELOW its three refusals, so a refused final
-    // would never have been recorded.
-    if (liveSnapshotDelivered) {
+    // So this is NOT "did the last send land". That question loses the whole
+    // MIXED case — measured, and the reason `lastDeliveredText` exists.
+    //
+    // The id is the live burst's own, so for the client the frame is an upsert
+    // by id over text it already holds. The one real cost is one extra copy of
+    // the burst's text on the wire per burst; accepted.
+    //
+    // The text is a DISPLAY text (post-strip), never `lastRawText` (btw's raw
+    // cumulative payload, which still carries earlier bursts). History must
+    // record what live displayed.
+    if (lastDeliveredText.length > 0) {
       params.transport.sendReasoning(
         params.sessionKey,
         id,
         params.turnId,
-        currentText,
+        lastDeliveredText,
         true,
       );
     }
@@ -2791,6 +2833,7 @@ export function createReasoningDraftController(params: {
     stalePrefix = lastRawText;
     id = nextMessageId();
     currentText = "";
+    lastDeliveredText = "";
     liveSnapshotDelivered = false;
   };
 
@@ -2821,6 +2864,11 @@ export function createReasoningDraftController(params: {
       params.turnId,
       currentText,
     );
+    // Only a send the transport ACCEPTED changes what the client holds, so this
+    // lags `currentText` across a refusal instead of tracking it. That lag is
+    // the whole mechanism — see `lastDeliveredText`'s declaration and
+    // `closeLiveBurst`'s case table.
+    if (liveSnapshotDelivered) lastDeliveredText = currentText;
   };
 
   return {
@@ -2840,9 +2888,11 @@ export function createReasoningDraftController(params: {
       // #242 half 1: `closeLiveBurst` emits the burst's ONE `final` frame here,
       // and this branch must NOT also send the durable block — that is what
       // "suppress the replay" means, and sending both would be two durable rows
-      // for one burst. The branch already requires `liveSnapshotDelivered`, which
-      // is exactly the gate `closeLiveBurst` applies, so the final really is
-      // emitted on this path rather than silently skipped.
+      // for one burst. This branch requires `liveSnapshotDelivered`, and that
+      // condition is only reachable when the last `push` was accepted, so
+      // `lastDeliveredText === currentText` here: the final really is emitted on
+      // this path, and it carries the burst's full text rather than a truncated
+      // prefix.
       if (
         liveSnapshotDelivered &&
         currentText.length > 0 &&
@@ -2884,6 +2934,17 @@ export function createReasoningDraftController(params: {
       // Idempotent: `closeLiveBurst` early-returns on an empty burst, and it
       // clears `currentText`, so a second `stop()` — or a `stop()` after
       // `endBurst` — emits nothing.
+      //
+      // ⚠️ THIS FRAME IS JOURNALED AFTER THE TURN'S `seal`, AND THAT IS A KNOWN
+      // ORDERING DIVERGENCE. `inbound.ts` awaits `draft?.drain()` — which emits
+      // the `turn_snapshot` — and calls `reasoning?.stop()` afterwards, from its
+      // `finally`. So a burst that streamed BEFORE the answer but never received
+      // a reasoning-end boundary gets a later `seq` than the seal and replays at
+      // the tail, past the turn's answers. Bursts closed by `endBurst` are
+      // unaffected (they close mid-turn). Unobservable in half 1 because the
+      // projection drops reasoning before the wire; half 2 inherits it as a
+      // live≠history ORDERING divergence and owns the fix, which is the order of
+      // those two calls in the turn teardown — NOT a change to make here.
       closeLiveBurst();
       stopped = true;
     },

@@ -686,6 +686,34 @@ describe("#242 — a live reasoning stream costs ONE journal row per burst", () 
     expect(new Set(ids).size).toBe(2);
   });
 
+  it("a burst interrupted by a transport blip still gets its row, carrying the delivered text", () => {
+    // ⚠️ #304 END TO END, THROUGH THE REAL CHANNEL. A NATS reconnect mid-burst
+    // is the ordinary trigger: `sendToPeer` refuses while the transport is down,
+    // and the burst closes after it comes back. The row must exist and must
+    // hold what the peer actually received — a gate on "did the LAST send land"
+    // wrote NO row here at all, which is the N8-losing hole this slice exists
+    // to close.
+    const { calls, transport, channel } = makeChannel();
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    controller.push({ text: "Let me" });
+    transport.connected = false;
+    controller.push({ text: "Let me think" });
+    transport.connected = true;
+    controller.endBurst();
+    warn.mockRestore();
+
+    expect(
+      appends(calls).map((entry) => (entry.call === "append" ? entry.event : undefined)),
+    ).toEqual([
+      { kind: "reasoning", id: expect.any(String), turnId: "turn-1", text: "Let me" },
+    ]);
+  });
+
   it("an open burst with no delivered snapshot writes nothing", () => {
     // The transport refuses every send (no session key on an encrypted channel
     // is the real shape; here the transport is simply disconnected), so the

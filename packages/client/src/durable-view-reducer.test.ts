@@ -458,9 +458,12 @@ describe("applyReasoning — one completed burst per event", () => {
   });
 
   it("does not cross-match the answer id space: a seal cannot remove or overwrite a block", () => {
-    // Unreachable in practice — both id spaces come from `nextMessageId()` — but
-    // the unreachable case is DECIDED, in the direction that cannot delete
-    // delivered content. See `findTextIndex`'s docblock.
+    // ⚠️ NOT "unreachable because the ids differ" — they do NOT differ. Agent
+    // answer ids come from the same `nextMessageId()` as reasoning ids, and user
+    // ids are client-supplied and only length-checked, so a peer can send a
+    // `webchannel-…`-shaped id verbatim. What makes a collision HARMLESS is the
+    // `kind` guard, and that is what this drives: the collision is constructed
+    // here and the outcome is pinned. See `findTextIndex`'s docblock.
     const view = reduceDurableView([
       { kind: "reasoning", id: "shared", turnId: TURN, text: "a thought" },
       {
@@ -732,10 +735,12 @@ describe("characterization: the deliberate divergence, and the precondition trap
   it('bubble with an EMPTY answerId is NOT "id-less" — the live client mints separate bubbles', () => {
     // The client's two id sites use DIFFERENT falsiness, and this is the trap the
     // frame→event mapper walks into (see BOUNDARY 1 in durable-view-reducer.ts):
-    //   - `progress` keys on `id ?? ""` (…:2707) — NULLISH, so "" survives as a
+    //   - `progress` keys on `id ?? ""` (the wrapper's `case "progress"`) —
+    //     NULLISH, so "" survives as a
     //     real id, which is why `placement` with `answerId: ""` is FAITHFUL;
-    //   - `agent_message` branches on `if (id)` (…:2834) — TRUTHY, so "" falls
-    //     into the mint branch at …:2869 and gets a fresh `a-<n>`.
+    //   - `agent_message` branches on `if (id)` (the wrapper's
+    //     `case "agent_message"`) — TRUTHY, so "" falls into that case's
+    //     `mintLocalBubbleId("a")` branch and gets a fresh `a-<n>`.
     // So two id-less finals are TWO bubbles live, while a mapper that mirrors the
     // progress site verbatim (`answerId: frame.id ?? ""`) collapses them into ONE
     // durable row — an N8 live≠history divergence landing in the mapper. Hence
@@ -772,9 +777,9 @@ describe("characterization: the deliberate divergence, and the precondition trap
 // stream:
 //
 //   user      → the real public `send()` → `publish()` (nats-client-wrapper.ts:847)
-//   placement → a real `progress` frame  → `handleFrame` case (…:2701)
-//   bubble    → a real `agent_message`   → `handleFrame` case (…:2827)
-//   seal      → a real `turn_snapshot`   → `applyTurnSnapshot`  (…:1546-1573)
+//   placement → a real `progress` frame  → `handleFrame`'s `case "progress"`
+//   bubble    → a real `agent_message`   → `handleFrame`'s `case "agent_message"`
+//   seal      → a real `turn_snapshot`   → `applyTurnSnapshot`
 //
 // ⚠️ READ WHAT THESE NOW PROVE, AND WHAT THEY NO LONGER DO. Until the client was
 // rewired onto the reducer they were genuinely NON-CIRCULAR: two independent
@@ -862,8 +867,8 @@ function projectWrapper(messages: Array<Record<string, unknown>>): DurableView {
 }
 
 /**
- * Drive the REAL private inbound handler (`handleMessage`,
- * nats-client-wrapper.ts:2280) with real wire frames over a starting view, and
+ * Drive the REAL private inbound handler (`nats-client-wrapper.ts`'s
+ * `handleMessage`) with real wire frames over a starting view, and
  * project the result. This is the same dispatch the socket feeds in production.
  */
 function realDrive(starting: DurableView, frames: InboundMessage[]): DurableView {
@@ -1001,7 +1006,8 @@ describe("equivalence anchor: placement ≡ a real progress frame", () => {
 
   it("a FIRST progress without turnId claims its slot with turnId undefined", () => {
     // `progress.turnId` is optional on the wire (channel-contract.ts:66;
-    // nats-channel.ts:469 omits it when falsy) and the client stores it verbatim.
+    // `NatsChannel.sendProgress` omits it when falsy) and the client stores it
+    // verbatim.
     // The slot claim must survive — dropping it would lose the
     // ordering the very first test in this file protects.
     const real = realDrive([], [progressFrame("A", "Working…")]);
@@ -1086,7 +1092,8 @@ describe("equivalence anchor: bubble ≡ a real agent_message frame", () => {
 //
 // Step 3 goes through `handleMessage` — the same real dispatch as the other
 // three anchors — rather than calling the private `applyTurnSnapshot`
-// (nats-client-wrapper.ts:1546-1573) directly. That method is now the frame→event
+// (`nats-client-wrapper.ts`'s `applyTurnSnapshot`) directly. That method is now
+// the frame→event
 // mapper plus the per-answer `working:false` / `draftOnly`-clearing overlay, so
 // what these cases actually exercise is the MAPPING and the merge, not the
 // reconciliation (which is `applySeal`, the left-hand side). Routing it this way

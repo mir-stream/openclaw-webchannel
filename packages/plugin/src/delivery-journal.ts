@@ -840,7 +840,7 @@ function requireCount(value: number, parameter: string, min: number): number {
  *
  * `bubble` is DELIBERATELY NOT DEDUPED even though it has a message id, and the
  * asymmetry with `user`/`placement` is the point rather than an oversight: the
- * 4-kind model is last-write-wins by answer id, so a SECOND bubble for one id is
+ * event model is last-write-wins by answer id, so a SECOND bubble for one id is
  * a legitimate EDIT of that bubble — the client's `applyBubble` upserts it in
  * place. Deduping it would silently discard the edit. (#241 turns that into a
  * typed `messageEdited` with a monotonic revision, at which point the duplicate
@@ -855,17 +855,30 @@ function requireCount(value: number, parameter: string, min: number): number {
  * and answer ids are minted monotonically so one never spans two turns — but it
  * is a real edge the day either of those changes.
  *
- * The `default` is NOT an exhaustiveness hole — it is #253's retain rule on the
- * WRITE path. A forward event kind is out of the union at RUNTIME even though
- * the switch is exhaustive at compile time, so it stays whole in `payload` and
- * simply goes unindexed rather than throwing.
+ * The `default` is #253's retain rule on the WRITE path: a forward event kind is
+ * out of the union at RUNTIME, so it stays whole in `payload` and simply goes
+ * unindexed rather than throwing.
  *
- * ⚠️ AND THE WRITE PATH IS THE ONLY WAY TO REACH IT. `read()` never calls this
- * — it parses `payload` and takes `kind` straight off the parsed event — so
- * "read back from a newer build's journal" is NOT this branch's trigger. What
- * reaches it is an append of an unknown kind, which today means a cast at the
- * call site (`delivery-journal.test.ts` pins exactly that, including the NULL
- * `message_id` this returns).
+ * ⚠️ BUT IT IS AN EXHAUSTIVENESS HOLE, AND #242 FELL IN IT. This docblock used
+ * to say the `default` "is NOT an exhaustiveness hole … the switch is exhaustive
+ * at compile time" and that "THE WRITE PATH IS THE ONLY WAY TO REACH IT … which
+ * today means a cast at the call site". Both were falsified by the very next
+ * kind added: `reasoning` is IN the union, reaches this switch through ORDINARY
+ * production egress, and — because a `default` swallows what a `never` gate
+ * would have caught — was written with `message_id = NULL` with nothing going
+ * red. Measured against a real `openDeliveryJournal`: `seq 3 kind reasoning
+ * message_id null`.
+ *
+ * ⚠️ SO DO NOT GENERALISE THIS FILE'S EXHAUSTIVENESS STORY FROM THE OTHER TWO
+ * SWITCHES. `journal-history.ts`'s `KNOWN_EVENT_KINDS` and `recordFirstSeen`
+ * both fail tsc on a new kind (verified: TS2741 and TS2322-to-`never`), and
+ * their docblocks say so. This one cannot, because the `default` it needs for
+ * #253's retain rule is the same `default` that hides a forgotten member. The
+ * two requirements genuinely conflict; the only thing standing here is that a
+ * new `case` must be added by hand, so ADD ONE when you grow `JournalEvent`.
+ * (Splitting it — an exhaustive switch over the union plus a runtime kind test
+ * in front — would restore the gate, but that is #241's typed-event work, not a
+ * change to make while landing a kind.)
  */
 function extractMessageId(event: JournalEvent): string | null {
   switch (event.kind) {
@@ -874,6 +887,21 @@ function extractMessageId(event: JournalEvent): string | null {
     case "placement":
     case "bubble":
       return event.answerId;
+    case "reasoning":
+      // #242 half 1. The id is the BURST's id (the live burst's wire id, reused
+      // by its `final` frame), so the column names the same message the client
+      // upserted — the whole reason this column exists.
+      //
+      // ⚠️ INDEXING IT CANNOT COLLIDE WITH THE TWO DEDUPE INDEXES, CHECKED
+      // RATHER THAN ASSUMED: `journal_user_once` and `journal_placement_once`
+      // are both PARTIAL — `ON journal_event(conversation_id, message_id) WHERE
+      // kind = 'user'` and `… WHERE kind = 'placement'` respectively — so a
+      // `reasoning` row is outside both index predicates and can never conflict
+      // with a user or placement row that happens to share an id. Reasoning is
+      // therefore un-deduped, like `bubble`, which is right for the same reason:
+      // a second `final` for one burst id is an EDIT the reducer upserts in
+      // place, and dropping it would discard the edit.
+      return event.id;
     case "seal":
       return null;
     default:

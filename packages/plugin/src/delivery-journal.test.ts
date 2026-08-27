@@ -432,6 +432,65 @@ describe("payload retention (#253)", () => {
       sidecar.close();
     }
   });
+
+  it("indexes a reasoning row's message_id as the BURST id, never NULL (#242 half 1)", () => {
+    // ⚠️ THIS IS A REGRESSION GUARD FOR A REAL DEFECT, NOT COVERAGE FOR ITS OWN
+    // SAKE. `extractMessageId` needs its `default` (#253's retain rule for a
+    // forward kind), and that same `default` swallows a member of `JournalEvent`
+    // whose `case` someone forgot — no `never` gate can fire behind it. #242
+    // half 1 walked straight into that: `reasoning` rows shipped with
+    // `message_id = NULL` and nothing anywhere went red. The two sibling
+    // switches in `journal-history.ts` DO fail tsc on a new kind; this one
+    // structurally cannot, so the check has to be a test.
+    const databasePath = newJournalPath();
+    const journal = open(databasePath);
+    journal.append("conv", {
+      kind: "reasoning",
+      id: "r-1",
+      turnId: TURN,
+      text: "the whole thought",
+    });
+
+    const sidecar = new DatabaseSync(databasePath);
+    try {
+      expect(
+        sidecar
+          .prepare("SELECT kind, message_id, turn_id FROM journal_event")
+          .all(),
+      ).toEqual([{ kind: "reasoning", message_id: "r-1", turn_id: TURN }]);
+    } finally {
+      sidecar.close();
+    }
+  });
+
+  it("does not dedupe reasoning, and cannot collide with the two kind-scoped indexes", () => {
+    // `journal_user_once` and `journal_placement_once` are PARTIAL —
+    // `WHERE kind = 'user'` and `WHERE kind = 'placement'` — so a reasoning row
+    // is outside both index predicates however its id is shaped. Asserted rather
+    // than read off the schema, because indexing `message_id` for a new kind is
+    // exactly where a partial index stops being partial by accident.
+    //
+    // Un-deduped is also the RIGHT rule, for `bubble`'s reason: a second `final`
+    // frame under one burst id is an EDIT the reducer upserts in place, and
+    // dropping it would discard the edit.
+    const journal = open(newJournalPath());
+    expect(journal.append("conv", { kind: "user", id: "X", text: "hi" }).inserted).toBe(true);
+    expect(
+      journal.append("conv", { kind: "placement", answerId: "X", turnId: TURN }).inserted,
+    ).toBe(true);
+    expect(
+      journal.append("conv", { kind: "reasoning", id: "X", turnId: TURN, text: "one" }).inserted,
+    ).toBe(true);
+    expect(
+      journal.append("conv", { kind: "reasoning", id: "X", turnId: TURN, text: "two" }).inserted,
+    ).toBe(true);
+    expect(journal.read("conv").map((row) => row.event)).toEqual([
+      { kind: "user", id: "X", text: "hi" },
+      { kind: "placement", answerId: "X", turnId: TURN },
+      { kind: "reasoning", id: "X", turnId: TURN, text: "one" },
+      { kind: "reasoning", id: "X", turnId: TURN, text: "two" },
+    ]);
+  });
 });
 
 describe("connection and on-disk facts", () => {
