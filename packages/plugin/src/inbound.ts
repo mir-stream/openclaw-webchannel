@@ -1716,9 +1716,10 @@ export async function handleInboundMessage(
     // ⚠️ THE REASON GIVEN HERE FOR NOT RELAXING THE GUARD WAS FALSE, AND IS CUT:
     // it read "do not relax this guard to cover the other case — per-turn is the
     // wrong cadence for a config mistake". This warning is NOT per-turn —
-    // `reasoningEmptyLaneWarned` makes it one per ACCOUNT per PLUGIN LOAD (its
-    // declaration says `stopAgentLifecycleSubscription` clears it, so a reload
-    // re-arms it on purpose), and the shipped log text says so. Relaxing
+    // `reasoningEmptyLaneWarned` makes it ONE PER ACCOUNT PER PROCESS, the
+    // scope this file uses everywhere (a real teardown re-arms it on purpose —
+    // see the latch's declaration and `releaseAgentLifecycleSubscription`).
+    // Relaxing
     // the guard would not produce per-turn output, so that was an argument
     // against something the code does not do. The real reason to keep the cases
     // apart is the one above: they have different causes and different fixes,

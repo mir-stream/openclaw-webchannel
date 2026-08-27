@@ -179,6 +179,20 @@ export function orderConversationPresentation(
 }
 
 /**
+ * The widget's "load older" page size — ONE definition, imported by both the
+ * widget and `history-paging.test.ts`.
+ *
+ * ⚠️ IT LIVES HERE BECAUSE THE TEST'S CLAIM DEPENDS ON IT. That test says a
+ * future page-size change "cannot silently move the cliff without moving this
+ * test", and while the widget had `limit: 20` inline and the test had its own
+ * `WIDGET_LIMIT = 20`, that was false — the two literals could drift and the
+ * test would stay green while measuring a boundary the widget no longer uses.
+ * Exporting the constant is what makes the sentence true, which is cheaper than
+ * deleting it.
+ */
+export const HISTORY_PAGE_SIZE = 20;
+
+/**
  * The `before` cursor for a "load older" request: the id of the OLDEST entry
  * this device holds that the server could plausibly resolve, or `undefined` to
  * ask for the tail.
@@ -226,20 +240,6 @@ export function orderConversationPresentation(
  * history". A stall is strictly worse than that, because it is indistinguishable
  * from it while hiding content that does exist.
  */
-/**
- * The widget's "load older" page size — ONE definition, imported by both the
- * widget and `history-paging.test.ts`.
- *
- * ⚠️ IT LIVES HERE BECAUSE THE TEST'S CLAIM DEPENDS ON IT. That test says a
- * future page-size change "cannot silently move the cliff without moving this
- * test", and while the widget had `limit: 20` inline and the test had its own
- * `WIDGET_LIMIT = 20`, that was false — the two literals could drift and the
- * test would stay green while measuring a boundary the widget no longer uses.
- * Exporting the constant is what makes the sentence true, which is cheaper than
- * deleting it.
- */
-export const HISTORY_PAGE_SIZE = 20;
-
 export function oldestHistoryCursor(
   messages: readonly ChatMessage[],
 ): string | undefined {

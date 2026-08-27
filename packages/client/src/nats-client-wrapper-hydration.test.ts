@@ -845,13 +845,13 @@ describe("history hydration — reasoning rows (#242 half 2)", () => {
     // again), `wireId` (`promoteAnchor`) and `pending` (`retract()` returns
     // false for a bubble still held). Any durable frame re-merges the whole
     // view, so ONE unrelated message is the whole trigger.
-    const bubbleLast = makeWrapper();
-    deliver(bubbleLast, { type: "reasoning", id: "dup", turnId: "t1", text: "thinking" });
-    deliver(bubbleLast, history({ id: "dup", role: "user", text: "the question", ts: 5 }));
-    const bubbleBefore = bubbleLast.getState().messages.find((m) => m.kind === undefined);
+    const bubbleFirst = makeWrapper();
+    deliver(bubbleFirst, { type: "reasoning", id: "dup", turnId: "t1", text: "thinking" });
+    deliver(bubbleFirst, history({ id: "dup", role: "user", text: "the question", ts: 5 }));
+    const bubbleBefore = bubbleFirst.getState().messages.find((m) => m.kind === undefined);
     expect(bubbleBefore?.ts).toBe(5);
-    deliver(bubbleLast, { type: "agent_message", id: "other", turnId: "t2", text: "unrelated" });
-    expect(bubbleLast.getState().messages.find((m) => m.kind === undefined)?.ts).toBe(5);
+    deliver(bubbleFirst, { type: "agent_message", id: "other", turnId: "t2", text: "unrelated" });
+    expect(bubbleFirst.getState().messages.find((m) => m.kind === undefined)?.ts).toBe(5);
 
     // The mirror image: the REASONING entry is the earlier member, and `ts` is
     // the one client-local field it can hold.
