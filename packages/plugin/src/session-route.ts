@@ -6,10 +6,21 @@
  * direct peer onto the SAME agent session (`agent:<id>:main`). For a single-user
  * channel that is fine, but webchannel's register-hop mode serves MANY users
  * (one peerId per authenticated user uuid) on one account. Under `"main"` all of
- * them share one transcript, so the register-time history snapshot and
- * `load_history` re-seal OTHER USERS' messages to each requester's own
- * conversation key — a cross-user transcript leak that per-peer E2E encryption
- * cannot prevent, because the leak happens BEFORE sealing, at session scoping.
+ * them WRITE INTO ONE AGENT SESSION: every peer's turn is appended to the same
+ * transcript, so the agent answers each user with the accumulated context of all
+ * the others — one user's prompts, files and answers leak into another user's
+ * replies. Per-peer E2E encryption cannot prevent that, because the mixing
+ * happens BEFORE any sealing, at session scoping.
+ *
+ * ⚠️ THE JUSTIFICATION MOVED IN #240 HALF 2, AND THE RULE IS NOT VESTIGIAL.
+ * Until that slice this paragraph named a READ leak: the register-time history
+ * snapshot and `load_history` read that shared core transcript and re-sealed
+ * OTHER USERS' messages to each requester's key. Those read paths are GONE —
+ * history is projected from the plugin's own delivery journal, which is keyed
+ * per peer independently of the session key (`journal-history.ts`). What
+ * survives is the WRITE side above, and it is the stronger of the two: a shared
+ * agent session mixes contexts at generation time, which no amount of
+ * per-recipient sealing downstream can undo.
  *
  * Rather than depend on the operator setting a safe global `session.dmScope`,
  * webchannel FORCES its own inbound session scope — exactly as the two blessed
@@ -28,12 +39,17 @@
  * collide. `per-account-channel-peer` keys on `channel:accountId:direct:peerId`,
  * isolating both by account AND by peer.
  *
- * ── The crux: ONE key everywhere ────────────────────────────────────────────
- * Webchannel derives a session key at several sites — the inbound turn dispatch
- * (WRITE), the register-time history snapshot (READ), and the `load_history`
- * pagination handler (READ). If any one of them derived a DIFFERENT key, history
- * would silently break (empty) or leak. Every one of those sites MUST route
- * through this ONE helper so the key is byte-identical.
+ * ── The crux: ONE key, and since #240 half 2 exactly ONE site ───────────────
+ * Webchannel derives a session key at ONE site: the inbound turn dispatch
+ * (WRITE, `inbound.ts`'s `resolveWebchannelSessionRoute` call). It used to
+ * derive one at three — the two history READ sites (the register-time snapshot
+ * and the `load_history` pager) derived the same key to read core's transcript,
+ * and a divergence between any two of the three silently broke history (empty)
+ * or leaked it. #240 half 2 deleted both READ sites with the transcript reader,
+ * so the "must agree" hazard is gone by construction rather than by discipline.
+ * The rule stands for anything ADDED later: a second derivation site must route
+ * through this ONE helper. `session-route-tenant-isolation.test.ts` pins the
+ * negative for the two modules the read path now lives in.
  *
  * The helper keeps the binding-based AGENT routing from `resolveAgentRoute`
  * (a `binding.account` may pick a specific agentId) and ONLY overrides the
@@ -55,10 +71,13 @@
  * tenant component the key was therefore NOT unique per authorization scope:
  * serve `(T1, A, P)`, hot-reload the same local account as `(T2, A)` keeping the
  * agent binding and verifier, register with a valid T2 JWT for the same peer
- * string `P`, and the T2 browser resolves T1's session key — reading T1's
- * transcript through the register-time snapshot or `load_history`. Register
- * admission cannot catch this: it verifies the JWT tenant against the
- * CONFIGURED tenant, which after the reload is legitimately T2.
+ * string `P`, and the T2 browser resolves T1's session key — dispatching its
+ * turns INTO T1's agent session, so T1's accumulated context answers T2 (and
+ * T2's turns are appended to it). Register admission cannot catch this: it
+ * verifies the JWT tenant against the CONFIGURED tenant, which after the reload
+ * is legitimately T2. (Before #240 half 2 the same mis-resolution ALSO handed
+ * T2 a direct read of T1's transcript through the register-time snapshot or
+ * `load_history`; those read paths are deleted, the write-side leak is not.)
  *
  * So the tenant is appended as its own `:tenant:<token>` component, where the
  * token is the full lowercase SHA-256 digest of the verbatim tenant.
@@ -110,30 +129,38 @@
  * the NATS subject namespace and register-admission verifier already capture
  * that planned tenant, while OpenClaw may temporarily mutate `process.env` for
  * skill overrides and config objects may be replaced on reload. Re-resolving on
- * each turn/history read could therefore produce a key in a different tenant
- * while the runtime still authenticates under the original one. The per-account
- * runtime closes over `plan.tenant` and supplies that same immutable value at
- * the inbound WRITE, register-snapshot READ, and `load_history` READ sites.
+ * each turn could therefore produce a key in a different tenant while the
+ * runtime still authenticates under the original one. The per-account runtime
+ * closes over `plan.tenant` and supplies that same immutable value at the
+ * inbound WRITE site — which, since #240 half 2, is the only site.
  *
  * CONTINUITY (breaking, decided — do not "restore" this): the component is
  * appended UNCONDITIONALLY, so every pre-existing session key changes, including
  * those of single-tenant deployments that never configured a tenant and land on
- * `DEFAULT_WEBCHANNEL_TENANT`. At upgrade a live session loses its history
- * binding: the register-time snapshot and `load_history` come back empty. No
- * credential or conversation key changes, because those are keyed by
- * `(tenant, accountId)` + peerId and never by the session key. Core's
- * `sessions.json` contains metadata/key-to-file mappings; transcript messages
- * are in the referenced per-agent `sessions/*.jsonl` files. Preserving old
- * history therefore requires stopping/quiescing the gateway and copying the
- * complete relevant per-agent sessions directory/storage (both `sessions.json`
- * and its referenced JSONLs), not copying `sessions.json` alone.
+ * `DEFAULT_WEBCHANNEL_TENANT`. At upgrade a live session loses its AGENT
+ * CONTEXT: the next turn starts a fresh core session, so the agent no longer
+ * remembers the conversation so far. No credential or conversation key changes,
+ * because those are keyed by `(tenant, accountId)` + peerId and never by the
+ * session key.
+ *
+ * ⚠️ THE HISTORY CONSEQUENCE WAS DELETED AT #240 HALF 2, NOT SOFTENED — an
+ * earlier revision of this paragraph said the register-time snapshot and
+ * `load_history` "come back empty" and prescribed quiescing the gateway and
+ * copying core's per-agent `sessions.json` + its referenced `sessions/*.jsonl`.
+ * Both halves are now wrong. Webchannel history is served from the plugin's own
+ * delivery journal, keyed by `(tenant, accountId)` + peerId exactly like the
+ * conversation keys — so a session-key change does NOT empty what the user
+ * sees, and copying core's session files preserves nothing for webchannel. The
+ * CONTINUITY DECISION IS UNCHANGED (append unconditionally; do not "restore"
+ * the old key); only what it costs has shrunk to the agent's own memory of the
+ * conversation.
  *
  * Eliding the component when the tenant is `DEFAULT_WEBCHANNEL_TENANT` would
  * spare exactly those deployments, and it was rejected: a deployment that HAS
  * configured a tenant — i.e. the entire population this bug can affect — breaks
  * either way, so the asterisk buys nothing security-relevant while making a
  * confidentiality boundary conditional on a magic literal. A uniform derivation
- * is worth more than a one-time empty transcript.
+ * is worth more than a one-time loss of agent context.
  */
 
 import { createHash } from "node:crypto";
@@ -203,8 +230,10 @@ function withTenantScope(baseSessionKey: string, tenant: string): string {
  * `lastRoutePolicy`) overridden — binding-based agent selection, `agentId`,
  * `channel`, `accountId`, and `mainSessionKey` are preserved verbatim.
  *
- * ALL webchannel session-key sites (inbound dispatch, history snapshot,
- * load_history) call THIS so the key is identical everywhere.
+ * EVERY webchannel session-key site calls THIS, so the key is identical
+ * everywhere. Since #240 half 2 there is exactly one in production — the inbound
+ * turn dispatch in `inbound.ts` — because the two history READ sites were
+ * deleted with the core-transcript reader. Any new site must come through here.
  */
 export function resolveWebchannelSessionRoute(
   api: OpenClawPluginApi,

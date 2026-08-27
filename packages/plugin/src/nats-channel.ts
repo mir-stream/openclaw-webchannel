@@ -303,8 +303,14 @@ export class NatsChannel implements WebChannelPeerChannel {
   /**
    * The plugin-owned durable event log, or `null` when this channel does not
    * journal (see `NatsChannelDurability`). Written on the egress path only;
-   * NOTHING in this class reads it back — the journal is a SHADOW store until
-   * #240 makes history a projection of it, so no send result depends on it.
+   * NOTHING IN THIS CLASS reads it back, so no send result depends on it.
+   *
+   * ⚠️ THAT IS A STATEMENT ABOUT THIS CLASS, NOT ABOUT THE PLUGIN — it stopped
+   * being both in #240. The journal is no longer a shadow store: it is the ONLY
+   * history store, projected by `journal-history.ts` and served from the two
+   * read sites in `history-serve.ts`. What survives here is the narrower
+   * property that matters to this file: the egress path writes and never reads,
+   * so journaling cannot change what a `send` returns.
    */
   private readonly deliveryJournal: DeliveryJournal | null;
   /**
@@ -1016,8 +1022,15 @@ export class NatsChannel implements WebChannelPeerChannel {
    * names the forbidden outcome exactly: turning a journal failure into
    * `sendToPeer` → `false` would roll back the caller's reservation and make it
    * retry the same content under a DIFFERENT id — the store meant to preserve
-   * identity would be the thing destroying it. The journal is a shadow store
-   * until #240; nothing reads it, so nothing may depend on it.
+   * identity would be the thing destroying it.
+   *
+   * ⚠️ AND THAT REASON IS THE ONE THAT SURVIVED #240. This paragraph used to end
+   * "the journal is a shadow store until #240; nothing reads it, so nothing may
+   * depend on it" — which is now false, since the journal is the only history
+   * store. It does not change the ruling: §15.8's argument is about the CALLER's
+   * id-reminting retry, not about whether anyone reads the store, so swallowing
+   * the failure is still strictly better than a `false` return here. What the
+   * cutover does change is the COST of the swallow (see `warnDeliveryJournal`).
    *
    * ⚠️ SYNCHRONOUS, IN EGRESS ORDER. No batching, no queue, no promise. §15.8's
    * last bullet: a deferred append reorders the stream, and the stream's ORDER
@@ -1094,10 +1107,18 @@ export class NatsChannel implements WebChannelPeerChannel {
    * `createRateLimitedOutcomeFailureWarning` already use.
    *
    * ⚠️ TWO SINKS, ONE THROTTLE, AND THE SPLIT IS DELIBERATE:
-   *  - `append-failed` → `console.warn`. The journal is a SHADOW store in this
-   *    slice: nothing reads it, no send result changes, so a failed write is a
-   *    degradation of something not yet load-bearing. #240 is where it becomes
-   *    fatal, and that slice owns raising it.
+   *  - `append-failed` → `console.warn`. ⚠️ THE ARGUMENT THAT PICKED `warn` HAS
+   *    EXPIRED AND THE SINK HAS NOT MOVED. It read "the journal is a SHADOW
+   *    store: nothing reads it, so a failed write degrades something not yet
+   *    load-bearing", and #240 half 2 ended that: the journal is now the ONLY
+   *    history store. A failed append here does NOT stop the publish (the send
+   *    proceeds and returns `true`), so what it costs today is a frame the peer
+   *    SAW live and will not see on reconnect — live ≠ history, the exact
+   *    divergence this store exists to kill. That is `error`-shaped, and
+   *    arguably fail-closed-shaped. Half 2 deliberately did not change either:
+   *    raising the sink and, much more so, refusing the publish are behaviour
+   *    changes outside a read-path cutover. Recorded here as OWED work, not as a
+   *    justified level — do not read this bullet as an endorsement of `warn`.
    *  - `idless-durable-frame` → `console.error`. Post-#238 this cannot happen
    *    without a regression, and when it does it means DELIVERED text is missing
    *    from the store — a defect, not a hiccup. `delivery-journal-event.ts`'s
@@ -1362,11 +1383,18 @@ export class NatsChannel implements WebChannelPeerChannel {
 
 /**
  * The exact `NatsChannel` method surface the register-hop wiring reaches to feed
- * `RegisterHandlerDeps` (see index-nats.ts). The register deps are function-
- * injected, and index-nats.ts sits OUTSIDE this package's `tsc` include set, so
- * without this contract nothing would force these methods to keep existing on
- * `NatsChannel`. Derived via `Pick`, so dropping any listed method from the
- * class turns THIS type into a compile error in a type-checked file.
+ * `RegisterHandlerDeps`. The register deps are FUNCTION-INJECTED —
+ * `nats-account-runtime.ts` passes closures like `(pid) =>
+ * registerChannel.registerPeer(pid)` — and a closure body is only checked
+ * against the method it calls, so dropping a method from `NatsChannel` would
+ * surface as an error at that one call site and nowhere else. This `Pick`
+ * makes the whole surface a single named contract instead.
+ *
+ * ⚠️ AN EARLIER VERSION JUSTIFIED THIS BY CLAIMING `index-nats.ts` "sits
+ * OUTSIDE this package's `tsc` include set". VERIFIED FALSE:
+ * `packages/plugin/tsconfig.json` lists `index-nats.ts` in `include`
+ * explicitly (that file records #32 as the fix). The type earns its keep for
+ * the reason above, which does not depend on anything being unchecked.
  */
 export type RegisterChannelSurface = Pick<
   NatsChannel,

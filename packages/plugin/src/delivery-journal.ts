@@ -2,8 +2,8 @@
  * v6 delivery-render — THE PLUGIN-OWNED DELIVERY JOURNAL (issue #239, doc §15.2).
  *
  * Our plugin is the Telegram plugin AND the Telegram server; our client is the
- * Telegram app (doc §0). Today the plugin owns no store at all and history is
- * read back out of core's agent transcript, which is precisely what §0 forbids
+ * Telegram app (doc §0). The plugin used to own no store at all, and history was
+ * read back out of core's agent transcript — precisely what §0 forbids
  * (NOT-list N2). This is that store: an append-only, per-conversation ordered
  * log of `JournalEvent`s, which #240 replays through the SHARED reducer to serve
  * history — so `history == live` holds BY CONSTRUCTION rather than by two
@@ -16,10 +16,12 @@
  * with it persist-before-publish (commit the event BEFORE publishing its frame —
  * N6, doc §16.2-2, reversing v5 §15.8's commit-after).
  *
- * What has NOT happened yet is a READER. #240 half 1 adds `journal-history.ts`,
- * the projection, wired to nothing; half 2 is the cutover that makes this store
- * the only history source. Several notes below still turn on "nothing reads it",
- * which is a different and still-live premise from "nothing writes it".
+ * ⚠️ AND THE READER LANDED. #240 half 1 added `journal-history.ts` (the
+ * projection); half 2 wired it to both live read sites and DELETED the core
+ * transcript path, so this store is now the ONLY history source there is. Notes
+ * below that still turn on "nothing reads it" are therefore stale wherever they
+ * survive — each one that mattered has been re-argued in place; treat any that
+ * has not as a defect, not as a premise.
  *
  * ── WHERE IT LIVES, AND WHY NOT WHERE THE DOC SAID ──
  *
@@ -80,17 +82,24 @@ export const DELIVERY_JOURNAL_SCHEMA_VERSION = "1";
  * SYNCHRONOUS block: `DatabaseSync` parks the whole event loop for the wait, so
  * the worst case here is the value chosen, not an async delay. Persist-before-
  * publish puts this in front of every outbound frame, and a 30 s freeze of the
- * gateway is a worse failure than a journal append that gives up and is retried
- * non-destructively (§15.8) — the journal is still a SHADOW store, so a refused
- * append costs nothing a retry cannot recover. Core's 30 s is right for core: its
- * state DB is the authority and there is no frame waiting behind it.
+ * gateway is a worse failure than a journal append that gives up (§15.8). Core's
+ * 30 s is right for core: its state DB is the authority and there is no frame
+ * waiting behind it.
  *
- * ⚠️ "SHADOW" NOW MEANS "NOTHING READS IT", NOT "NOTHING WRITES IT" — #239 halves
- * 2 and 3 wired both write seams, so this timeout IS in front of every outbound
- * frame and every accepted user message today. What still makes a refused append
- * cheap is that no reader depends on completeness yet. #240 **half 2** is where
- * that stops being true and this value must be re-argued; half 1 (the projection,
- * wired to nothing) does not change it.
+ * ⚠️ RE-ARGUED AT #240 HALF 2, WHICH IS WHERE THE OLD JUSTIFICATION DIED. It
+ * used to end "the journal is still a SHADOW store, so a refused append costs
+ * nothing a retry cannot recover", and the cutover made the journal the only
+ * history store. So price the two sides honestly:
+ *  - A REFUSED APPEND now costs a real row. At egress the send proceeds anyway
+ *    (`nats-channel.ts`'s `journalOutbound` warns and returns), so the peer saw
+ *    that bubble live and will not see it on reconnect; at the inbound accept
+ *    the batch is rejected and the CLIENT may retry — ⚠️ weaker than it sounds, and `ingress-dedupe.ts` retracts the strong form two seams over: the ledger is capped at `MAX_UNACKED = 100` and lost on reload, and a retry recovers neither #282's ordering nor #283's orphan row.
+ *  - A 30 s BUSY WAIT still freezes the whole gateway synchronously, for every
+ *    peer, because `DatabaseSync` parks the event loop.
+ * 5 s stays: the freeze is unbounded in blast radius and the loss is one frame
+ * with a loud, throttled diagnostic. But it is now a TRADE, not a free choice,
+ * and the honest fix for the losing side is fail-closed egress (refuse the
+ * publish when the append fails), not a longer wait here.
  */
 const BUSY_TIMEOUT_MS = 5_000;
 
@@ -797,10 +806,11 @@ function closeQuietly(db: SqliteDatabase): void {
  * hard refusal, and two comments in this file that contradict each other about
  * network filesystems.)
  *
- * #240 half 1 does not touch it either — it ships `journal-history.ts` wired to
- * nothing, so it changes neither the load path nor the policy. Half 2's cutover
- * is the last slice that can decide this before the store is the only copy of
- * the truth.
+ * #240 does not touch it either. Half 1 shipped `journal-history.ts` wired to
+ * nothing; half 2 wired it up, and a READ path changes neither the load path nor
+ * the chmod policy — it is `open` that runs this, once, at account start. The
+ * store is now the only copy of the truth, so the decision this comment was
+ * holding open is no longer "before the cutover": it is #287's, on its own.
  */
 function chmodDatabaseFiles(databasePath: string): void {
   for (const suffix of SQLITE_DATABASE_FILE_SUFFIXES) {

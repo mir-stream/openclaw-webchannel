@@ -73,15 +73,9 @@ import {
 } from "./account-auth.js";
 import { PopChallengeStore } from "./pop-challenge.js";
 import { handleRegisterRequest } from "./nats-register.js";
-import {
-  recent as historyRecent,
-  pageBefore as historyPageBefore,
-  resolveHistoryConfig,
-  planHistoryFetch,
-  runDetachedHistoryRead,
-} from "./history.js";
+import { resolveHistoryConfig } from "./history.js";
+import { createHistoryServer, type HistoryServer } from "./history-serve.js";
 import { createCommandCatalogProvider } from "./commands-catalog.js";
-import { resolveWebchannelSessionRoute } from "./session-route.js";
 import { WEBCHANNEL_ID, type WebChannelPeerChannel } from "./channel-contract.js";
 import {
   NatsConnectionClosedError,
@@ -377,46 +371,6 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
     // answered by `handleRegisterRequest` (packages/plugin/src/nats-register.ts).
     // The account-specific I/O — JWT verify + the history snapshot — is injected
     // here; every identity check the HTTP route performed is preserved verbatim.
-
-    // Fire the STATELESS initial history snapshot for a just-registered peer:
-    // resolve the agent route, self-read the recent transcript detached (so
-    // `sessions.get` authorizes against a synthetic operator client — see
-    // historyReadScope), and seal it to the peer over `.out`. K is already
-    // established at register time and the client subscribes `.out` BEFORE it
-    // registers, so nothing is lost.
-    const sendHistorySnapshot = (
-      accountId: string,
-      servingTenant: string,
-      channel: NatsChannel,
-      historyConfig: ReturnType<typeof resolveHistoryConfig>,
-      peerId: string,
-    ): void => {
-      try {
-        // Same forced per-account-channel-peer key as the inbound WRITE site —
-        // so the snapshot reads THIS user's session, never the shared "main" one.
-        const route = resolveWebchannelSessionRoute(
-          api,
-          accountId,
-          peerId,
-          servingTenant,
-        );
-        void runDetachedHistoryRead(() =>
-          historyRecent(api, route.sessionKey, historyConfig.limit, api.logger),
-        )
-          .then((messages) => {
-            if (messages.length > 0) channel.sendHistory(peerId, messages);
-          })
-          .catch((err) => {
-            api.logger.error?.(
-              `webchannel: history snapshot failed for ${logSafe(peerId)}: ${logSafe(err)}`,
-            );
-          });
-      } catch (err) {
-        api.logger.error?.(
-          `webchannel: history snapshot resolution failed for ${logSafe(peerId)}: ${logSafe(err)}`,
-        );
-      }
-    };
 
     // -----------------------------------------------------------------------
     // Steps 0–7 (per account): build ONE serving runtime per configured account
@@ -804,20 +758,51 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       }
 
       // Phase 6 review finding 1 (RESOLVED, not warned): a multi-user
-      // (register-hop) account no longer risks the SHARED-transcript leak on the
-      // history snapshot / load_history paths — webchannel FORCES its own
-      // per-account-channel-peer session scope regardless of the operator's
-      // global session.dmScope (see src/session-route.ts). The old startup
-      // dmScope="main" warning is therefore gone; the readiness line below
-      // reports the ENFORCED scope instead.
+      // (register-hop) account does not risk a SHARED-transcript leak on the
+      // WRITE path — webchannel FORCES its own per-account-channel-peer session
+      // scope regardless of the operator's global session.dmScope (see
+      // src/session-route.ts and `inbound.ts`). The old startup dmScope="main"
+      // warning is therefore gone; the readiness line below reports the ENFORCED
+      // scope instead.
+      //
+      // ⚠️ THE READ SIDE OF THAT FINDING IS NOW ANSWERED BY A DIFFERENT
+      // MECHANISM, so do not cite the session scope for it. Since #240 the
+      // history snapshot and `load_history` do not read core at all: they replay
+      // the plugin's delivery journal, which is scoped by its FILE PATH to one
+      // (tenant, accountId) and then by `conversationId === peerId` inside it.
+      // `session-route-tenant-isolation.test.ts` asserts the property against
+      // that mechanism.
 
       // ---- Step 2 (per account): create the encrypted NATS channel ---------
       // Subject namespace is webchannel.{tenant}.{accountId}.{peerId} — the
       // accountId is the wire identity (one namespace per account).
       let channel: NatsChannel;
-      // v6 delivery journal (#239). Declared out here so the failure path below
-      // and `dispose()` further down can both reach the handle.
+      // Resolved BEFORE the try so the history server can be constructed
+      // alongside the journal it reads; it is pure config and cannot throw.
+      const historyConfig = resolveHistoryConfig(
+        account as { capabilities?: { typing?: "on" | "off" } } | undefined,
+      );
+      // `| undefined` because the failure path below and `dispose()` further
+      // down both run on paths where the open never happened.
       let deliveryJournal: DeliveryJournal | undefined;
+      // #240 half 2's history read path. Built INSIDE the try, from the `const`
+      // the open returns, so "a failed journal open fails the account start" is
+      // carried by `HistoryServerDeps.journal` being non-optional — an ordinary
+      // parameter type the compiler actually checks.
+      //
+      // ⚠️ THIS BINDING ITSELF IS NOT COMPILER-GUARDED, and an earlier revision
+      // of this comment claimed the equivalent and was wrong. Every read of it
+      // is inside a closure, and TypeScript suppresses definite-assignment
+      // analysis there — MEASURED: a `let x: T` never assigned on ANY path
+      // typechecks clean when its only reads are in closures.
+      //
+      // ⚠️ EXACTLY ONE THING CATCHES AN UNWIRED SERVER: the source-shape
+      // assertion in `index-nats-wiring.test.ts`. MEASURED — delete the
+      // `createHistoryServer({…})` block below and that file goes red while
+      // `history-serve.test.ts` stays GREEN, because the latter constructs its
+      // own server and structurally never reads this file. Do not delete that
+      // assertion believing the unit tests cover it; nothing else does.
+      let historyServer: HistoryServer;
       try {
         const keyStore = new ConversationKeyStore({
           tenant,
@@ -841,13 +826,13 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         // ⚠️ A FAILED OPEN FAILS THE ACCOUNT START — there is deliberately NO
         // degrade-to-unjournaled path, which is why this sits inside the same
         // `try` whose `catch` already converts `assertNoFutureDocuments()`'s
-        // throw into a failed start. The journal is a shadow store today
-        // (nothing reads it until #240), so a degrade path would look harmless;
-        // it is the "green pipeline that ships nothing" failure mode — serving
-        // normally while silently keeping no history — and #240's cutover makes
-        // the journal mandatory anyway, so it would be written only to be
-        // deleted.
-        deliveryJournal = openDeliveryJournal({
+        // throw into a failed start. Since #240 the journal is the ONLY history
+        // store, so a degrade path would serve normally while silently keeping
+        // and showing no history — the "green pipeline that ships nothing"
+        // failure mode. (It was already refused when the journal was still a
+        // shadow store, on the grounds that the cutover would make it mandatory.
+        // The cutover has landed; the rule now rests on the store itself.)
+        const journal = openDeliveryJournal({
           databasePath: tupleStoragePaths({
             tenant,
             accountId,
@@ -856,6 +841,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
               : {}),
           }).deliveryJournalPath,
         });
+        deliveryJournal = journal;
         // The 5th argument is `NatsChannelLimits` and stays defaulted here; the
         // 6th is the v6 durability wiring. Constructor-only by design — see
         // `NatsChannelDurability`.
@@ -864,6 +850,17 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           keyStore,
           identityKeyPair: attemptIdentityKey,
         }, undefined, { deliveryJournal });
+        // #240 half 2 — the read path, built here so it receives the SAME open
+        // handle as the channel's write path, as a `const` in direct flow. All
+        // history policy (deferral, the per-peer in-flight bound, the
+        // no-frame-on-failure rule) lives in `history-serve.ts`; what is left
+        // below is wiring.
+        historyServer = createHistoryServer({
+          journal,
+          channel,
+          config: historyConfig,
+          logger: api.logger,
+        });
       } catch (err) {
         // The journal can be open by the time `new NatsChannel(...)` throws (it
         // is fail-closed on a missing attested identity key). A failed start is
@@ -942,6 +939,17 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           // flush either resumes after dispose and takes the `invalidated` early
           // return, or is already past it and cannot interleave. Inserting an
           // `await` on either side of that span breaks this argument.
+          //
+          // ⚠️ THIS ENUMERATES WRITERS, AND SINCE #240 THERE IS ALSO A DEFERRED
+          // READER. `history-serve.ts` schedules its fold with `setImmediate`,
+          // so a snapshot or page scheduled just before teardown can run after
+          // `close()` and read a closed handle. That is contained rather than
+          // argued away: the read sits inside `runDeferred`'s `try`, so it
+          // logs "journal read failed" and sends no frame. The residual is a
+          // spurious `error`-level line during an ordinary shutdown, not a
+          // crash and not a lost message — the peer is going away with the
+          // account. Do not "fix" it by moving `close()` earlier; that trades a
+          // log line for the write window this ordering exists to prevent.
           // `close()` is idempotent.
           try { deliveryJournal?.close(); } catch (error) { errors.push({ phase: "delivery-journal", error }); }
           const transportReport = await transport.closeGracefully();
@@ -1274,31 +1282,17 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       });
 
       // ---- Step 5 (per account): history load handler ----------------------
-      const historyConfig = resolveHistoryConfig(
-        account as { capabilities?: { typing?: "on" | "off" } } | undefined,
-      );
+      // Pure wiring. Everything that used to be inline here — the plan, the
+      // deferral, the per-peer in-flight bound, the failure policy — moved into
+      // `history-serve.ts`, where it can be tested against a real journal. The
+      // outer try/catch that used to wrap this went with it: it guarded
+      // `planHistoryFetch` (which cannot throw for any wire input — it is
+      // `typeof`/`Number.isFinite`/`Math.floor` over a literal the dispatcher
+      // always constructs) and `setImmediate`, so its `error` line was
+      // unreachable while still counting toward the #123 audit's coverage floor
+      // as if it were live. `servePage` is internally guarded end to end.
       channel.setLoadHistoryHandler((peerId, request) => {
-        try {
-          // Same forced key as the WRITE + snapshot sites — pagination reads
-          // THIS user's session, so older pages never leak another user's turns.
-          const route = resolveWebchannelSessionRoute(api, accountId, peerId, tenant);
-          // `planHistoryFetch` validates the wire `limit` (the NATS dispatch
-          // forwards it unvalidated) and picks paginate-vs-tail from `before`.
-          const plan = planHistoryFetch(request, historyConfig.pageSize);
-          void runDetachedHistoryRead(() =>
-            plan.kind === "page"
-              ? historyPageBefore(api, route.sessionKey, plan.beforeId, plan.limit, api.logger)
-              : historyRecent(api, route.sessionKey, plan.limit, api.logger),
-          )
-            .then((messages) => {
-              channel.sendHistory(peerId, messages);
-            })
-            .catch((err) => {
-              api.logger.error?.(`webchannel: history page failed for ${logSafe(peerId)}: ${logSafe(err)}`);
-            });
-        } catch (err) {
-          api.logger.error?.(`webchannel: history resolution failed for ${logSafe(peerId)}: ${logSafe(err)}`);
-        }
+        historyServer.servePage(peerId, request);
       });
 
       // ---- Step 5b (per account): command-catalog load handler (P0-3) ------
@@ -1376,12 +1370,12 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             wrapConversationKeyForDevice: (pid, key, clientNonce) =>
               registerChannel.wrapConversationKeyForDevice(pid, key, clientNonce),
             unregisterPeer: (pid) => registerChannel.unregisterPeer(pid),
-            sendHistorySnapshot: (pid) =>
-              sendHistorySnapshot(accountId, tenant, channel, historyConfig, pid),
+            sendHistorySnapshot: (pid) => historyServer.sendSnapshot(pid),
             // #15/#19: authoritative pending-approval snapshot PLUS recently-
             // resolved outcomes. BOTH store reads and the publish MUST be
-            // synchronous — one event-loop turn, NO await/.then() between them (do
-            // NOT imitate sendHistorySnapshot's detached-read shape above). The
+            // synchronous — one event-loop turn, NO await/.then()/`setImmediate`
+            // between them (do NOT imitate `sendSnapshot`'s deferred shape;
+            // history can afford a later turn, this cannot). The
             // §3.4 race analysis holds precisely BECAUSE finalize deletes the
             // pending entry AND records the resolved outcome before publishing
             // `approval_resolved`, and this is list→list→publish atomically — so a

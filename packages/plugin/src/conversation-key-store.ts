@@ -19,16 +19,20 @@
  * K-at-rest encryption is deferred (a co-located master key adds no real
  * protection).
  *
- * K seals NO history at rest. The production history authority is OpenClaw
- * core's session transcript — plaintext JSONL at owner-only perms, written by
- * core, never by this plugin. `history.ts` reads and normalizes it through
- * `getSessionMessages`; `NatsChannel.sendHistory` seals the resulting frame
- * with the CURRENT K at delivery time, so replacing K costs no
- * re-encryption: the next read-and-deliver cycle reseals
- * (`docs/ISSUE_72_CONTAINMENT_PLAN.md` §1.4, RETAIN + RESEAL). There is no
- * agent-side ciphertext store at all: the in-memory one an earlier revision of
- * this comment pointed at was never reachable from production and was deleted
- * in #153.
+ * K seals NO history at rest. ⚠️ THE HISTORY AUTHORITY MOVED IN #240 and the
+ * containment consequences moved with it: it is no longer core's session
+ * transcript but the plugin's OWN delivery journal — message plaintext in a
+ * SQLite file this plugin writes, beside the secrets in the tuple storage
+ * directory (`storage-paths.ts` records why it belongs there, and
+ * the file inventory is in `docs/CREDENTIAL_CONTAINMENT_RUNBOOK.md` §0.2,
+ * which §1.4 of the containment plan delegates to).
+ * `journal-history.ts` projects that journal into a history frame, and
+ * `NatsChannel.sendHistory` seals the frame with the CURRENT K at delivery
+ * time, so replacing K still costs no re-encryption: the next read-and-deliver
+ * cycle reseals (§1.4, RETAIN + RESEAL). What has NOT changed is that there is
+ * no agent-side CIPHERTEXT store — the journal holds plaintext, and the
+ * in-memory ciphertext store an earlier revision of this comment pointed at was
+ * never reachable from production and was deleted in #153.
  *
  * File shape: `{ "version": 2, "storageIdentity": { ... }, "keys": { ... } }`.
  * Writes are atomic (tmp + rename), file mode 0600, directory mode 0700.

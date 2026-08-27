@@ -977,8 +977,11 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // pending unacked entry, so the user's next message `B` is accepted
             // and journaled first, and `A` lands after it when its backoff
             // fires — live `A, B`, replay `B, A`. That is issue **#282**, whose
-            // body carries the measurements; the fix belongs to #240, which is
-            // where the journal acquires a reader.
+            // body carries the measurements. ⚠️ #240 HAS LANDED AND DID NOT FIX
+            // IT: half 2 made the journal the only history store, so the reorder
+            // is now OBSERVABLE by any client that reconnects rather than
+            // hypothetical. #282 still owns it, and it got more urgent, not
+            // less — do not read the reader's arrival as its resolution.
             //
             // ⚠️ AND IT DOES NOT COVER THE ORPHAN ROW EITHER — issue **#283**.
             // `append` is one IMMEDIATE transaction PER EVENT
@@ -1007,8 +1010,11 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // reorders"). That rule's REASON does not apply to a synchronous,
             // in-order multi-append — but amending a merged sibling slice's
             // stated contract from a slice that is not about the store is the
-            // wrong place for that argument, and #240 owns the reader that makes
-            // the row visible at all. #283 carries both options.
+            // wrong place for that argument. ⚠️ AND THE READER HAS SINCE ARRIVED
+            // — #240 half 2 — so "the row is not visible yet" is no longer part
+            // of why this is deferred: an orphan row IS a phantom bubble in a
+            // real history read today. #283 carries both options and is the only
+            // thing still holding the fix.
             //
             // The retry is BOUNDED, not infinite, and the honest claim is worth
             // stating: the ledger is capped at `MAX_UNACKED = 100` in memory and

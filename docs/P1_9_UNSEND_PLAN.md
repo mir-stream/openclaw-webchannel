@@ -1,5 +1,16 @@
 # P1-9 — Pending-message retraction ("unsend") — Implementation Plan (v4)
 
+> ⚠️ **#240 half 2 DELETED the tier-3 positional probe.** Every reference below to
+> "tier-3", the `anchor + 1` candidate probe, or the probe skipping a held chip
+> describes a mechanism that no longer exists: the client's `case "history"` now
+> matches an agent row by id or fresh-inserts it. **The §6.3 PROPERTY SURVIVES and
+> is still enforced** — a held (`pending`) or `/stop`-retracted chip is never an
+> adoption target, now because the tier-2 pool excludes it and there is no probe
+> at all. Do not rebuild the probe to "restore" §6.3; it is what the property
+> needed protecting *from*. Text matching remains for USER rows only (#302,
+> blocked on #243).
+
+
 > Gap: `docs/gaps/P1_RICH_UX_GAPS.md` §P1-9. Status there: 🟢 web advantage (no
 > Telegram equivalent), recommended **Option A — client-side hold**. This plan
 > implements Option A. **Zero wire change, zero server change.**

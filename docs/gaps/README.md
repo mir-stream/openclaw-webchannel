@@ -56,7 +56,7 @@ which glues together the split modules:
 | protocol version (#33) | `src/protocol.ts` (`WEBCHANNEL_PROTOCOL_VERSION`, `readPluginVersion`) |
 | inbound turn / streaming / typing | `src/inbound.ts` (streaming-mode resolve `:124-136`, control-lane branch, `sendTyping` `:160`, `commandBody` `:200`) |
 | debounce / coalesce (P1-8b) | `src/inbound-queue.ts` (`coalesceUserMessages`, `startCoalesceTurn`, `clearPending`/`pendingBuffered`) + core `createInboundDebouncer` |
-| history store | `src/history.ts` (`resolveHistoryConfig` `:37`, `recent` `:182`, `planHistoryFetch` `:218-231`, `pageBefore` `:277-318`) |
+| history store | `src/journal-history.ts` (the projection) + `src/history-serve.ts` (the two read sites). `src/history.ts` is now only the wire type, `resolveHistoryConfig` and `planHistoryFetch` — ⚠️ #240 half 2 DELETED `recent`/`pageBefore` and the core-transcript reader with them. Symbols, not line numbers: the anchors this row carried had rotted before the deletion and nothing lints them (#288). |
 | multi-account multiplex | `src/multiplex.ts` (`planAccounts`) |
 | legacy WS transport (retained) | `src/transport.ts` (`typingEnabled`/`historyEnabled` gates) |
 
@@ -68,8 +68,8 @@ every inbound frame; the widget renders each.
 
 | Gap | Status now | Where |
 |---|---|---|
-| **P0-1** history restore | ✅ **built** (client reduce + **ordered merge** + render; server snapshot from the register route, stateless). #16 three-tier matching + anchor-cursor; #15/#19 approval snapshot on the same hop. | reducer `case "history"` `nats-client-wrapper.ts:209`; server snapshot in the register route |
-| **P0-2** history pagination | ✅ **built** (#24): two-phase `pageBefore` to the 1000-msg ceiling + `planHistoryFetch` call-site fix; >1000-turn residual stays upstream-blocked | `pageBefore` `history.ts:277-318`; `planHistoryFetch` `:218-231` |
+| **P0-1** history restore | ✅ **built** (client reduce + **ordered merge** + render; server snapshot from the register route, stateless). #16 matching + insertion cursor — TWO tiers since #240 half 2 (id, then text+role for USER rows only; the positional tier and anchor are deleted); #15/#19 approval snapshot on the same hop. | reducer `case "history"`; server snapshot in the register route |
+| **P0-2** history pagination | ✅ **built** (#24), then **SUPERSEDED by #240 half 2** — see item 1 below: the core-transcript pager is deleted, history pages off the plugin's journal, and the >1000-turn residual is gone | `pageBefore` DELETED; `planHistoryFetch` survives in `history.ts` |
 | **P0-3** slash-command discovery | ✅ **built** (#30): server catalog (`load_commands`→`commands`) + client typeahead. **Residual: argument menus** | `commands-catalog.ts`; `sendCommands` `nats-channel.ts:527-530`; widget `cmdMenu` `:78`, `renderMenu` `:238` |
 | **P0-4** approval cards | ✅ **built** (card render + `decide`); **rehydration built** (#15/#19 `approval_snapshot` Legs A/B/C) | `renderApproval` `widget.ts:81`; reducer `:381/:421/:435`; `decide` `:145` |
 | **P0-5** streaming drafts | 🟡 **enablement built; correctness open** — demo sets `streaming.mode:"partial"` (`run.sh:287`), but #94 must preserve multiple assistant-message lanes through finalize | reducer `case "progress"` `:557`; server gate `inbound.ts:124-136`; #94 |
@@ -138,7 +138,8 @@ narrowed to agent-down durability — see below).
    it does not offer `streaming.mode` (enroll-only).
 
 3. **Slash commands both execute AND are discoverable.** Execution always worked — text commands are
-   on by default and WebChannel is not a native-command surface (`channel.ts:115` declares no
+   on by default and WebChannel is not a native-command surface (an ABSENCE in `channel.ts`'s
+   capabilities block — the line anchor once cited here points at unrelated code; it declares no
    `nativeCommands`), so `/help` typed in the browser runs (core `commands-text-routing.ts:40-48`).
    **Discovery is now built too** (#30): a `load_commands`→`commands` catalog (config-filtered, from
    `native-command-registry`) feeds a widget typeahead. The only P0-3 residual is **argument menus**.
@@ -148,11 +149,19 @@ narrowed to agent-down durability — see below).
 The original enablement gaps landed. Streaming is enabled, with #94 still open as a live-path
 correctness fix:
 
-1. **P0-2 depth cap** — ✅ FIXED (#24). `pageBefore` (`history.ts:277-318`) is now a two-phase fetch
-   that widens to the 1000-message upstream ceiling (`MAX_FETCH_WINDOW`) when the small window can't
-   yield a full page, and returns an **empty page** (not the old newest-N `slice`) on a genuine
-   cursor miss. The live-path call-site bug (whole request object passed as `beforeId`) is fixed via
-   `planHistoryFetch` (`:218-231`). Residual: conversations >1000 turns stay upstream-blocked.
+1. **P0-2 depth cap** — ✅ FIXED (#24), then **SUPERSEDED by #240 half 2**. The #24 fix was a
+   two-phase fetch in `history.ts:pageBefore` that widened to the 1000-message upstream ceiling
+   (`MAX_FETCH_WINDOW`) and returned an **empty page** on a genuine cursor miss. That whole pager is
+   deleted: history now comes off the plugin's own delivery journal (`journal-history.ts`) and a
+   page is a slice of the full projection. **Separate the two quantities** (an earlier revision of
+   this line said "no fetch window and no ceiling", which stopped being true when the page clamp
+   came back): REACH is uncapped — `historyPageBefore` pages arbitrarily far back, so the
+   "conversations >1000 turns stay upstream-blocked" residual is gone and needs nothing from
+   upstream. A single PAGE is capped at 1000 when the peer supplies the `limit`
+   (`MAX_WIRE_HISTORY_LIMIT`, `history.ts`); the operator-configured limit is not clamped. What
+   survives from #24 is the empty-page cursor-miss contract and `planHistoryFetch` (still the
+   wire-`limit` validator, and now the clamp site). The new ceiling is COST, not depth: a page is a
+   full synchronous replay, quadratic in conversation length — **#286**.
 2. **P0-6 typing gate** — ✅ FIXED (#26). `NatsChannel` now has a `typingEnabled` field (`:249`) +
    `setTypingEnabled()` (`:502-504`); `sendTyping` (`:509-513`) is gated; wired at
    `index-nats.ts:590` from `resolveTypingEnabled(account)` (`account-config.ts:271-276`). So

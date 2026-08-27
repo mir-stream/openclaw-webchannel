@@ -113,7 +113,7 @@ export type ChatMessage = {
    * `user_message` this bubble echoes (user role only). Set at send/release time
    * so an `ack` frame's `accepted` transition can find the bubble. Absent on
    * server-hydrated bubbles, on agent messages, and on a still-`queued` P1-9
-   * hold (assigned only at release); not used by the history three-tier adoption.
+   * hold (assigned only at release); not used by the history adoption tiers.
    */
   wireId?: string;
   /**

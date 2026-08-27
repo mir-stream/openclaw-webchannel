@@ -135,7 +135,7 @@ turn_snapshot은 **완전한 턴 기록이 아니라 교정 패치다.** 계약(
 > ⛔ **이 절의 두 주장은 SUPERSEDED다 — PR #250(#238)이 뒤집는다.** 거기서 플러그인은 **모든 배달 행위(delivery act)에서 id를 민팅**하며 off/block의 plain send도 포함한다. 그래서 (a) 아래 `sendText(wsKey, text, undefined, turnId)`만 나가고 client가 `a-N`을 자체 발급한다는 **[실측]은 더 이상 성립하지 않고**, (b) "off/block의 durable id는 **분리된 후속**"이라는 스코프 판정도 끝났다 — 그 후속이 바로 #238이다. 식별자 최종 판정은 **§16.5**. 아래 본문은 **당시 측정 기록(역사)** 으로만 남긴다.
 
 - `turn_snapshot`/draft는 `streaming.mode ∈ {partial, progress}`에서만 생긴다(`inbound.ts:1014-1017`). "block"/"off"는 draft 없음(`inbound.ts:985`) → snapshot 없음 → 답변 id 없음. `sendText(wsKey, text, undefined, turnId)`만 나가고 client가 `a-N` 자체 발급(`nats-client-wrapper.ts:2562`).
-- 플러그인 기본 streaming 모드는 "off"(`message-adapter.ts:146-149`). **단 [실측] 제품/데모는 partial로 돈다** — `run.sh:287`이 `"streaming":{"mode":"partial"}` 설정(`docs/gaps/P0_CORE_CHAT_GAPS.md:472-473`). ⚠️ operator가 `channels add`로 수동 등록하며 mode를 안 주면 "off" → journal-only history가 비어 **회귀**. off-mode history 연속성은 §6에서 처리(전환기엔 off/block에 `getSessionMessages` fallback 유지).
+- 플러그인 기본 streaming 모드는 "off"(`message-adapter.ts:146-149`). **단 [실측] 제품/데모는 partial로 돈다** — `demo/run.sh:286`이 `"streaming":{"mode":"partial"}` 설정(`docs/gaps/P0_CORE_CHAT_GAPS.md:499`). ~~⚠️ operator가 `channels add`로 수동 등록하며 mode를 안 주면 "off" → journal-only history가 비어 **회귀**. off-mode history 연속성은 §6에서 처리(전환기엔 off/block에 `getSessionMessages` fallback 유지).~~ → **이 걱정은 틀렸다(2026-08-26, #240 half 2에서 확인).** 저널을 채우는 건 streaming이 아니라 **egress seam**이다: `journalEventForOutbound`가 `agent_message` → `bubble`을 매핑하고, off 모드 턴도 `agent_message`를 낸다. 즉 off 모드 history는 정상 저널된다. 전환기 fallback도 **없다** — §15.6 파괴적 컷오버가 core-read를 0으로 만들었고, 모드별 fallback을 남기는 건 N2 복귀다.
 - **그러나 #212 identity 버그(#173/#172/#104 …)는 전부 partial 모드에서 발생**한다 — lane/다중답변이 거기만 존재(`docs/gaps/P1_RICH_UX_GAPS.md`). off/block은 답변당 plain send라 그 오배송·재구성 버그가 안 생긴다.
 
 → **#114는 partial/progress를 먼저 SSOT화한다**(버그가 사는 곳, 재료가 이미 있음). off/block의 durable id는 **분리된 후속**(id 민팅 신설 필요; 더 큼; 급하지 않음).
@@ -169,14 +169,14 @@ turn_snapshot은 **완전한 턴 기록이 아니라 교정 패치다.** 계약(
 **IN (partial/progress):**
 - **journal store (신규 모듈)** [우리코드 + 계약 store §3.1]: `{sessionKey, answerId, sequence, role, text, ts}` commit/update/read; 저장 매체·보존·write lock.
 - **controller 훅 `message-adapter.ts`** [우리코드]: `emitTurnSnapshot`(drain) 시점에 같은 answers를 journal에도 durable commit. (지금은 wire로만 방출 — 저장 경로 추가.) user 메시지는 inbound 수신 시 journal 기록.
-- **history `history.ts`** [우리코드]: agent/user 버블을 `getSessionMessages`(core transcript) 대신 journal에서 서빙. pagination cursor = journal sequence.
+- **history** [우리코드]: agent/user 버블을 core transcript 대신 journal에서 서빙. ✅ **구현 완료 (#240, 2026-08-26)** — 단 파일 배치는 이 줄과 다르다: 투영은 `journal-history.ts`, 두 read 호출부는 `history-serve.ts`, `history.ts`에는 wire 타입·config·`planHistoryFetch`만 남았다. pagination cursor는 journal sequence가 아니라 **projected message id**다(§15.4 read model이 아직 없어 page selector가 전체 투영을 자른다 → #286).
 - **client `nats-client-wrapper.ts`** [우리코드]: history를 journal 기반으로 렌더(순수 view). partial의 live/snapshot id는 이미 서버 id라 live 경로 변경은 최소.
 - **plugin 특성화 테스트** + test-inventory 갱신.
 
 **OUT → 후속:**
 - off/block 모드 per-answer id 신설(controller/wire/client) — §3.3. ⚠️ **절반 해소(PR #250 / #238)**: controller/wire 쪽(플러그인이 모든 배달 행위에서 id 민팅)은 거기서 처리됐고, **client 쪽은 아직 OUT**이다. 식별자 판정은 §16.5.
-- client text/위치 매칭 완전 제거(#104/#227/#228, `adoptedFromLiveId`, tier-2 exact-text) — journal 착지 후.
-- `getSessionMessages` 기반 history 제거 — cutover 후.
+- client text/위치 매칭 제거 — ✅ **agent 행은 완료 (#240 half 2, `a9e1837`)**: tier 3(위치 프로브)은 통째로 삭제, tier 2는 agent 행에 대해 닫힘, `anchor` 제거. 저널이 delivery-act id를 서빙하므로 agent 행은 id로 맞거나 대응 로컬 버블이 없다. ⚠️ **남은 것은 user 행의 tier 2뿐이고 그 소유자가 #302다(열려 있음)** — 로컬 에코는 `u-<n>`인데 accept seam은 인바운드 **wire id**를 저널링하므로 user는 id가 일치하지 않는다. 선행 조건은 **#243**. 이 줄이 원래 적던 `adoptedFromLiveId`는 이 트리에도 `origin/develop`에도 없는 심볼이라 지웠고, #104/#227/#228은 v6 보드 재편 때 전부 CLOSED다.
+- `getSessionMessages` 기반 history 제거 — cutover 후. ✅ **완료 (#240 half 2, 2026-08-26)**: reader·`AsyncResource` operator-scope 우회·transcript normalizer·`history-sanitize.ts` 모두 삭제, `grep -rn "getSessionMessages" packages/` 무출력.
 
 ---
 
@@ -190,7 +190,7 @@ turn_snapshot은 **완전한 턴 기록이 아니라 교정 패치다.** 계약(
 - **restart-stable id / idempotency.** answerId가 재시작·재시도에도 안정적이어야 중복 안 남(현재 id는 메모리 생성). idempotency 정체성 = answerId 자체로. [codex F/B]
 - **저장 매체·보존.** keyed store(maxEntries 바운드) vs json 파일(무한) vs SQLite 직접. history 1000 cap/pagination과의 정합. eviction이 오래된 history를 지우나?
 - **순서.** 지연/재시도 interleave 시 durable live-order 키가 필요(timestamp/seq는 append 순서일 뿐). 플러그인 monotonic sequence가 그 키. [codex F9/E]
-- **legacy cutover + off-mode 연속성.** 경계를 무엇으로(시각/sequence/플래그)? 이전 구간 UX? **off/block로 설정된 operator는 journal이 비어 history가 회귀** — 전환기엔 그 모드에 `getSessionMessages` fallback을 남긴다(단 partial journal era와 절대 섞지 않음; v1의 merge 부활 금지). 이 fallback이 core-transcript-read를 다시 들이는지 리뷰 확인 필요.
+- ~~**legacy cutover + off-mode 연속성.** 경계를 무엇으로(시각/sequence/플래그)? 이전 구간 UX? **off/block로 설정된 operator는 journal이 비어 history가 회귀** — 전환기엔 그 모드에 `getSessionMessages` fallback을 남긴다(단 partial journal era와 절대 섞지 않음; v1의 merge 부활 금지). 이 fallback이 core-transcript-read를 다시 들이는지 리뷰 확인 필요.~~ → **DISSOLVED (§15.6, 구현 완료 2026-08-26).** 경계도 fallback도 없다: 사용자 결정으로 **파괴적 컷오버**를 골랐으므로 legacy 구간이 존재하지 않는다. off-mode 전제도 틀렸었다(§3.3 참조 — 저널은 streaming이 아니라 egress seam이 채운다). 남은 진짜 항목은 하나뿐이고 코드 문제가 아니다: **배포 이전 대화가 조용히 사라진다는 걸 운영자에게 알리는 릴리스 노트** → #297.
 - **성능.** 답변당 journal write 비용, write lock 경합. (v1의 O(n) idempotency scan 문제는 journal에선 사라지지만 자체 비용 확인.) [codex F10]
 - **멀티디바이스/재시도 replica.** 서버는 공유 subject로 한 번만 publish(`nats-channel.ts:757`)하고 2번째 기기 등록이 재-write를 안 만든다 → 진짜 위험은 replica/retry identity. [codex H 정정]
 - **degrade 정의.** #215 ceiling으로 lane 미확정 시 journal 동작(§4-6)의 정확한 규칙.
@@ -211,7 +211,7 @@ durable worktree에서. 스크래치패드 금지(`no-scratchpad-for-real-work`)
 ## 8. 범위 / 비범위
 
 **범위(이번):** partial/progress 모드 — journal store, drain-time commit 훅, journal 기반 history, client 순수-view 렌더 (§5 IN).
-**비범위(후속):** off/block 모드 per-answer id 신설 — ⚠️ **절반 해소(PR #250 / #238)**: controller/wire 쪽은 거기서 처리됐고 **client 쪽만 남았다**(§5 OUT · §6 참고); client text/위치 매칭 제거(#104/#227/#228); #215/#223 최종 종결; `getSessionMessages` 기반 history 제거(cutover 후); core 저장 형식 변경 없음.
+**비범위(후속):** off/block 모드 per-answer id 신설 — ⚠️ **절반 해소(PR #250 / #238)**: controller/wire 쪽은 거기서 처리됐고 **client 쪽만 남았다**(§5 OUT · §6 참고); client text/위치 매칭 제거 — **agent 행은 #240 half 2에서 완료**, 비범위로 남은 것은 **user 행의 tier 2뿐이고 #302가 소유**한다(**#243** 선행; 과거 표기 #104/#227/#228은 CLOSED); #215/#223 최종 종결; `getSessionMessages` 기반 history 제거(cutover 후); core 저장 형식 변경 없음.
 
 ---
 
@@ -433,7 +433,7 @@ partial 스트리밍 프레임(`onPartialReply` 다발)은 **journal에 매 프�
 
 ### 13.1 실측 확정 사실
 
-- **[우리코드] `lane.id`는 write-once, 위치-파생 아님.** `lane.id ??= reservation.id`(`message-adapter.ts:860`), 첫 wire 프레임 성공 후 고정. progress/final/snapshot answers 모두 동일 값(`nats-channel.ts:469,455-461`; snapshot `message-adapter.ts:1688`). → **내 §12.3 "결정적 파생 id"는 불필요. lane.id 자체가 안정 identity.**
+- **[우리코드] `lane.id`는 write-once, 위치-파생 아님.** `lane.id ??= reservation.id`(`message-adapter.ts:860`), 첫 wire 프레임 성공 후 고정. progress/final/snapshot answers 모두 동일 값(`nats-channel.ts`의 `sendProgress`/`sendText`; snapshot `message-adapter.ts:1688`). → **내 §12.3 "결정적 파생 id"는 불필요. lane.id 자체가 안정 identity.**
 - **[우리코드] 재시작은 재전송하지 않는다.** 트랜스포트는 **core NATS pub/sub(JetStream 아님)** — `packages/plugin/src` 어디에도 ack/ackWait/nak/consumer 없음. ACK는 admission 영수증(handler 전 durable 기록, `ingress-dedupe.ts:254,516-518`), outcome store는 durable(`plugin-sdk/persistent-dedupe`). 재시작 replay는 outcome lookup으로 re-ACK만, **재dispatch 안 함**(`ingress-dedupe.ts:425-429`). → **mid-turn crash = 턴 유실, 재시도 없음.** findings ①②(restart-stable 파생 id)가 실측으로 **소멸** — 파생을 버리고 lane.id 사용.
 - **[우리코드] 저널 훅은 inbound이 아니라 message-adapter 안에 있어야 한다.** inbound deliver는 boolean만 받는다(`deliverDraftFinalPayload → {sent}`, `inbound.ts:566,1538`; fallback `sendText(...,undefined,...)` `inbound.ts:1549`). lane.id는 `sendLaneFrame` 안에서만 안다(Q3). → **feed point = `sendLaneFrame` 성공 seam + `sendIndependent` seam** (v3의 "inbound send site" 정정).
 
@@ -623,7 +623,7 @@ CREATE INDEX IF NOT EXISTS ix_event_turn ON journal_event(session, turn_id);
 ### 15.2 저장·feed (v4에서 확정, 유지)
 
 - 우리 소유 SQLite(`node:sqlite` DatabaseSync + 계약 `runSqliteImmediateTransactionSync`, `resolveStateDir`). core-agent DB 미사용(확정).
-- feed = `nats-channel.ts`의 **단일 egress**(`sendToPeer`/`sendText`/`finalizeDraft`, `nats-channel.ts:761`) — 모든 durable 프레임이 통과함 CONFIRMED(양쪽 리뷰). progress는 별도 타입(`nats-channel.ts:469`).
+- feed = `nats-channel.ts`의 **단일 egress**(`nats-channel.ts`의 `sendToPeer`/`sendText`/`finalizeDraft`) — 모든 durable 프레임이 통과함 CONFIRMED(양쪽 리뷰). progress는 별도 타입(`sendProgress`). ⚠️ **줄번호로 걸지 말 것** — 이 세 앵커는 #240 half 2 이전부터 이미 밀려 있었고(리뷰가 계산한 +6도 틀렸다), 심볼명이 유일하게 안 썩는 참조다. — 이 문장이 원래 `sendProgress`의 "정확한" 줄번호를 적었다가 그것마저 한 줄 틀렸다. 논지가 곧 반례였으므로 숫자를 고치지 않고 **지웠다**.
 - 버블당 IMMEDIATE txn(p50 0.1ms 실측); WAL checkpoint는 hot-path 밖.
 
 ### 15.3 이벤트 모델 — 완전 순서 스트림 (findings codex1·4·6)
@@ -653,6 +653,7 @@ egress에서 **클라가 view에 쓰는 이벤트만, 전송 순서(seq)대로**
   - ⚠️ **#240 half 1(2026-08-25)은 이 테이블 **없이** projection을 냈다 — 의도적 편차이고, 실측이 그 편차를 더 비싸게 만들었다.** `packages/plugin/src/journal-history.ts`가 대화 전체를 공유 reducer로 **매번 재생**하고 두 page selector는 그 결과를 자른다. 정확성은 맞다(순서를 정할 자격은 reducer뿐). 비용은 **독립 2회 실측**: 20 000 이벤트/10 000 메시지에서 raw read 61–70 ms, **reducer fold 1 323–1 392 ms**, 전체 projection 1 450–1 510 ms, 이벤트 2배당 **3.6–4.91배**(정본 표의 fold 더블링이 4.35배·4.91배이고, 범위는 그 최댓값을 반드시 **포함**해야 한다 — 반올림해서 "4.9배"로 적으면 4.91을 다시 범위 밖에 두게 되므로 상한은 정본 값 그대로 적는다. 이전 판의 "3.6–4.6배"는 자기가 정본이라 선언한 표의 값을 아예 범위 밖에 두고 있었다). 표의 정본은 `journal-history.ts` 헤더(구현자 측정, 3회 중 최선)이고, 여기 범위는 Advisor의 독립 재실행을 합친 것 — 두 실행은 같은 박스·다른 warmup이라 절대값이 ~10% 다르고 성장 지수도 구간마다 다르지만, **결론(quadratic, fold 지배)은 동일**하다. 지수 하나를 인용하지 말고 범위로 인용할 것.
     - **비싼 건 SQL이 아니라 fold이고, fold는 대화 길이에 대해 QUADRATIC이다.** `applyPlacement`/`applyBubble`이 `view.findIndex`로 upsert하고 **view를 바꾸는** transition마다 view 전체 배열을 새로 만든다(할당이 기본값이고, 입력 배열을 그대로 돌려주는 same-array 경로는 `durable-view-reducer.ts` 헤더가 열거한 3개뿐이다 — 그래서 배열 수는 이벤트 수의 상한이지 실측 개수가 아니다). live에선 무해(짧은 view에 이벤트 하나씩)하고, **플러그인 쪽에 빠른 사설 fold를 두는 건 두 번째 구현 = N8이라 금지.** chunk 크기는 시간/메모리 트레이드가 아니다: 128/512/4096 스프레드가 20 000 이벤트에서 1.3%, 10 000에서 2.0%이고, 짧은 대화일수록 **비율은 벌어져** 5 000에서 4.6%, 1 000에서 15.3%가 되지만 — 그 15.3%는 절대값 **0.9 ms**다(fold가 작아 read가 더 이상 묻히지 않을 뿐). 비싼 쪽에서 ~1%, 싼 쪽에서 1 ms 미만이므로 어느 크기에서도 메모리 경계와 맞바꿀 시간이 없다. (퍼센트는 모두 정본 표 = `journal-history.ts` 헤더 기준.) ⚠️ **퍼센트 하나로 뭉뚱그리지 말 것** — 어느 값을 고르든 4개 중 3개 크기에서 정본 표 자신에게 반증당한다. 양 끝을 각각의 단위(긴 쪽은 %, 짧은 쪽은 ms)로 인용할 것.
     - 결론: **reconnect 스냅샷 1회는 오늘 길이에선 괜찮고, page-scroll마다 전체 재생은 못 쓴다.** 진짜 답이 이 bullet의 materialized table(체크포인트에서 증분 투영)이며, 어려운 부분은 DDL이 아니라 **"체크포인트 투영 ≡ 0부터 재생"의 증명**이다(`seal`이 슬롯을 재정렬하고 create-or-update하며 `remove` 후 `bubble`이 부활하므로). → **#286.**
+    - ⚠️ **그리고 half 2는 #286 scope note의 두 탈출구 중 어느 것도 만족하지 않고 나갔다(2026-08-26).** 그 note는 "스냅샷 경로만" 또는 "페이징 깊이 제한"이면 blocker가 아니라고 했는데, half 2는 **두 경로 다 무제한**이다. 깊이 제한을 한 번 시도했다가 **되돌렸다**: fold 전에 싸게 잴 수 있는 건 *대화 길이*지 *커서 깊이*가 아니고(커서 위치를 알려면 fold가 필요하다), 길이 게이트는 삭제한 `MAX_FETCH_WINDOW`보다 **더 나쁜 제품**이다 — 옛 벽은 "최신 1000개는 항상 도달 가능"인 깊이 벽이었는데, 길이 게이트는 임계를 넘는 대화의 페이징을 **통째로** 거절한다(1200개 대화 → 1150개가 어느 깊이에서도 소실). 그럼에도 무제한으로 낸 근거는 하나다: **스냅샷이 무제한인 채로 페이지만 묶는 건 연극이다.** register hop에 rate limit이 없어(#298) 프로세스는 이미 무제한 *직렬* fold에 노출돼 있고, 페이지 경로가 새로 추가하는 성질은 없다. half 2가 실제로 넣은 건 per-peer in-flight 래치 두 개(스냅샷/페이지 분리, busy면 drop)로, 이건 scope note가 말하지 않은 **세 번째** 실패(프레임 버스트가 fold를 쌓는 것; 20 000 이벤트 대화에 50프레임 ≈ 72초 블로킹 → 1건)에 대한 **동시성** 제한이지 깊이 제한도 rate 제한도 아니다. ⇒ **#286은 이제 가정이 아니라 배포된 상태를 서술하는 blocker이고, 레버는 #286(재생을 싸게)과 #298(트리거를 제한) 둘 다이며 서로를 대체하지 않는다.**
   - ⚠️ **projection이 live와 갈라지는 알려진 지점 하나 — 이 절의 "발명 금지"가 아니라 §15.9의 live==history 쪽 문제다.** `progress`만 받고 `bubble`도 `seal.answers`도 못 받은 lane(중단된 턴, drain 전 연결 끊김)은 저널에 placement만 남는다. `applyPlacement`는 `text: ""` agent 버블을 append하고 reducer는 그걸 지우지 않는데, **live는 아무것도 안 그린다** — 클라가 `isSpentDraft`로 거르고(`nats-client-wrapper.ts:2010`) 그 판단을 구동하는 `draftOnly`는 **client-local이라 저널되지 않기** 때문. 그래서 순진한 재생은 live가 보여준 적 없는 빈 버블을 낸다(N8, 누락 방향). 규칙 자체가 이벤트만으론 표현이 안 되고 turn-close 이벤트가 필요할 수 있어(#241/BOUNDARY 2) → **#251·#264** 소관. #240 half 1은 이걸 고치지 않고 `journal-history.ts` 헤더에 명시해 두었다.
 
 ### 15.5 seam — route key + user-id 생애 (findings codex6/claude4, codex8)
@@ -668,9 +669,16 @@ egress에서 **클라가 view에 쓰는 이벤트만, 전송 순서(seq)대로**
 - 기존(배포 이전) 대화는 **버려진다**(파괴적). 클라 history 3-tier 텍스트/위치 adoption도 함께 제거 가능(더 이상 legacy core row 없음).
 - write 실패: 저널이 유일 저장소이므로 **실패 = 접수 실패**로 다룬다(§15.7의 hard 요건과 동일 규율); 조용한 빈-세션 위장 금지.
 - **이점**: §0("core transcript 안 읽음")이 전환기 예외 없이 **문자 그대로 즉시 성립.** 설계가 크게 단순해짐.
-- 🚧 **구현 상태(2026-08-25): 아직 안 됐다. #240 half 1은 엔진만 냈고 아무 데도 안 붙였다.** `journal-history.ts`가 저널을 history view로 접을 수 있게 됐을 뿐, 살아있는 history 경로는 여전히 core transcript를 읽는다(`history.ts`의 `getSessionMessages`, `runDetachedHistoryRead`). 즉 **N2는 아직 살아 있고**, 위 문단들은 목표지 현재 상태가 아니다. half 2가 아래 호출부를 전부 바꾸고 `getSessionMessages`·`AsyncResource` operator-scope 우회·`history-sanitize.ts`·클라 3-tier adoption을 **삭제**해야 이 절이 참이 된다. 그때까지 이 절을 "이미 그렇다"로 인용하지 말 것.
-  - ⚠️ **세는 대신 이름을 적는다 — "두 호출부"가 아니라 핸들러 2개에 호출 3개다.** `nats-account-runtime.ts`의 (1) connect/reconnect 스냅샷 `historyRecent`, (2) load-history 핸들러의 `historyPageBefore`, (3) 같은 핸들러의 `historyRecent`. 개수로 적으면 페이징 핸들러만 보고 **스냅샷을 빠뜨리기** 쉬운데, 그 스냅샷이야말로 v6가 존재하는 이유인 재접속 경로다. (실수해도 조용히 나가지는 않는다 — 같은 문장이 지시하는 `getSessionMessages` 삭제가 스냅샷 호출부를 tsc에서 깨뜨린다.) 덤으로 `nats-account-runtime.ts`는 이미 `pageBefore`를 `historyPageBefore`라는 이름으로 import하고 있으므로, half 2가 `journal-history.ts`의 동명 export를 들여올 때 **이름 충돌**을 먼저 정리해야 한다.
-  - 부수 결론 하나: `history-sanitize.ts`는 **core transcript reader가 raw 모델 출력을 받기 때문에만** 존재한다. 저널은 클라에 실제로 publish된 텍스트를 그대로 갖고 있으므로 **projection 경로에서 재-sanitize하면 그 자체가 N8이다.** half 2에서 모듈째 삭제 대상이고, 그 전까지 `journal-history.ts` 헤더가 ⚠️로 막아 둔다.
+- ✅ **구현 상태(2026-08-26): 서버 쪽 컷오버 완료 (#240 half 2).** core transcript reader가 **패키지에서 사라졌다** — `getSessionMessages` 호출, `AsyncResource` operator-scope 우회, transcript normalizer, `history-sanitize.ts` 모두 삭제(`grep -rn "getSessionMessages" packages/` 무출력). **N2는 이 시점부터 서버 쪽에서 문자 그대로 성립한다.**
+  - **세는 대신 이름으로 적는다 — 그리고 셋 다 바뀌었다.** half 1이 남긴 경고("두 호출부"가 아니라 핸들러 2개에 호출 3개)는 옳았고, 실제로 교체된 건 그 셋이다: (1) connect/reconnect 스냅샷의 `historyRecent`, (2) load-history 핸들러의 `historyPageBefore`, (3) 같은 핸들러의 `historyRecent`. 지금은 셋 다 `history-serve.ts`의 `createHistoryServer`(`sendSnapshot`/`servePage`) 뒤로 들어갔고, `nats-account-runtime.ts`에는 배선만 남았다. **두 body가 `buildNatsAccount` 안의 클로저였다는 게 실제로 사고를 냈다**: tenant-isolation 스위트가 그걸 *베껴서* 커버하고 있었고, production 인자를 `peerId`→`accountId`로 바꿔도(= 한 (tenant, accountId) 아래 모든 peer가 서로의 대화를 읽음) 21개 테스트가 전부 green이었다. 지금은 실제 코드를 돌리고 그 mutation이 17개 red다.
+  - ⚠️ **클라 adoption 티어는 agent 경로에서 삭제됐다 — 규칙을 더 얹은 게 아니라 그 규칙군을 지웠다.** 컷오버가 이 블록에 만든 데이터 손실 결함이 **네 라운드 연속으로 네 개** 나왔고, 매번 새 규칙으로 고쳤는데 그 규칙이 다음 인스턴스를 못 덮었다: (1) tier 1이 index를 claim 안 함, (2) placement-only lane의 `{agent,""}`가 위치 프로브를 발화, (3) `adoptAt`이 밀려난 id를 `seen`/`localIndexById`에서 안 지움, (4) `isLocalLiveId`가 `webchannel-` 접두사만 보는 탓에 **history가 hydrate한 버블**을 live로 오인(프레임 간 페이징에서 최신 답변 파괴). 네 개 전부 agent 경로다.
+    - **근거**: 저널이 delivery-act id를 서빙하므로, 클라가 live로 렌더한 agent 버블은 스냅샷 행과 **같은 id**를 갖는다 ⇒ tier 1에서 맞는다. 따라서 tier 1을 못 맞춘 agent 행은 대응하는 로컬 버블이 **없고**, 그걸 텍스트/위치로 입양하는 건 반드시 **다른 메시지를 덮어쓴다**. 그래서 tier 3(위치 프로브)은 통째로 삭제, tier 2는 agent 행에 대해 닫았다. `anchor`도 함께 사라졌다(tier 3이 유일한 소비자였고 tsc가 잡아냈다).
+    - ⚠️ **user 경로의 tier 2는 남는다 — 이건 누락이 아니라 측정 결과다.** 클라는 user 버블을 로컬 `u-<n>`(`mintLocalBubbleId`)로 렌더하고 accept seam은 인바운드 **wire id**를 저널링한다(`ingress-dedupe.ts`의 `journalEventForInboundUser({id: pending.id})`). 즉 user는 id가 일치하지 않아 tier 1을 못 맞추고, 여기서 tier 2를 지우면 스냅샷마다 user 행이 전부 fresh-insert 되어 **이 기기가 보낸 모든 메시지가 중복**된다.
+    - ⚠️ **정직한 비용**: 텍스트 매칭은 N5가 금지하는 바로 그 추론이고, **user 경로에 그대로 남아 있다.** 제거의 선행 조건은 **#243**(user 메시지에 공유 id)이고, 잔여의 소유자는 **#302**로 **열어둔다**(§12.9 아님 — 그 절은 SUPERSEDED §12 안이다). 원래 적혀 있던 #104/#227/#228은 v6 보드 재편 때 전부 CLOSED다.
+    - **양방향 가드**가 `nats-client-wrapper-hydration.test.ts`에 있다: agent 경로에서 tier 2/3가 사라졌다는 것(동일 텍스트·다른 id 미입양, 위치 미입양, 프레임 간 페이징 4버블)과, user echo가 재연결 스냅샷에서 **중복되지 않는다**는 것 둘 다. 삭제 전 코드에 대고 돌리면 agent 가드 3개가 red다.
+  - 부수 결론 하나: `history-sanitize.ts`는 **core transcript reader가 raw 모델 출력을 받기 때문에만** 존재했다. 저널은 클라에 실제로 publish된 텍스트를 그대로 갖고 있으므로 **projection 경로에서 재-sanitize하면 그 자체가 N8이다.** half 2에서 모듈째 삭제했고, `journal-history.ts` 헤더가 ⚠️로 재도입을 막는다.
+  - ⚠️ **컷오버가 "빈 세션 위장 금지"를 read 쪽으로 끌고 왔고, 거기서 끝난다.** 저널 read가 실패하면 두 호출부 모두 `logger.error` + **`history` 프레임 미발행**이다(`[]`를 보내면 깨진 read가 "history 없음"으로 렌더링되고, 그게 이 절이 write 쪽에서 금지한 바로 그것). **하지만 클라는 그 둘을 구분할 수 없다** — 프레임을 못 받은 peer가 보는 화면은 새 대화와 동일하다. wire 신호가 없어서 정직한 정책이 wire에서 끊긴다 → **#296.**
+  - ⚠️ **배포 이전 대화가 조용히 사라진다는 것**(이 절 위쪽의 "기존 대화는 버려진다")은 승인된 결정이지만, **운영자가 볼 곳에 아직 안 적혀 있다.** 릴리스 노트와 backfill 여부 기록 → **#297.** (v1 설계 때 걱정하던 "off 모드면 저널이 빈다"는 v6엔 해당 없음: 저널은 streaming이 아니라 egress seam이 채우고 `journalEventForOutbound`가 `agent_message` → `bubble`을 매핑한다.)
 
 ### 15.7 user-message durability = 플러그인이 유일 SSOT (사용자 정정 2026-08-23)
 
@@ -709,7 +717,7 @@ egress에서 **클라가 view에 쓰는 이벤트만, 전송 순서(seq)대로**
   - ✅ **P-I CONFIRMED (스파이크, 검증 완료)** — 클라 live 재조정이 순수 공유 reducer `reduceDurableView(events)→DurableView`로 **깨끗이 추출됨.** worktree `spike/114-shared-reducer` commit `ad81bac`: `packages/client/src/durable-view-reducer.ts` + 14 vitest(8 시나리오 + 6 **등가 앵커** = 실제 private `applyTurnSnapshot`을 인스턴스화해 호출·비교, 순환 아님). Advisor가 직접 14/14 통과·소스 확인. 라운드-4 P0(슬롯 클레임 순서 [A,B]≠[B,A], 늦은 remove-후-부활, seal create-or-update #215 회복, final-only C, notice 슬롯 보존) 전부 green. **중심 베팅(history==live by construction) 성립.**
     - **구현 형태(스파이크가 확정):** `render = merge(reduceDurableView(eventLog), clientLocalOverlay)` — 핸들러는 local overlay(working/receipts/sendState/isTyping) 부수효과 유지, **durable `messages` 재조정만 reducer에 위임.** DurableMessage = `{id,role,text,turnId}` (client-local 제외, §0.1).
     - 스파이크 범위 외(구현 시): 실제 클라를 reducer 호출로 refactor; reducer 모듈을 client·plugin 공유 위치로 이동(의존성 없어 기계적); `placement`는 텍스트 미보유(never-final draft 저널링은 비범위).
-    - reducer 밖(의도적): `history` 3-tier 텍스트/위치 adoption(`:2063-2258`) = reconnect/late-join 추측 → 서버 스냅샷으로 대체될 workstream C. #114가 스트림 저널링으로 이를 가능케 함.
+    - reducer 밖(의도적): `history` 텍스트/위치 adoption = reconnect/late-join 추측 → 서버 스냅샷으로 대체될 workstream C. #114가 스트림 저널링으로 이를 가능케 함. ⚠️ **당시 3-tier였고 지금은 2-tier다** — #240 half 2가 위치 티어를 삭제하고 텍스트 티어를 user 행으로 좁혔다(#302가 잔여 소유). 줄번호는 썩어서 지웠다.
   - ✅ **P-J(route 키 안정성/orphan) DISSOLVED** — 프로브가 아니라 설계로 해소됨(§16.2-7): plugin-소유 불변 conversation id = `(tenant, accountId)` 경로 스코프 + `peerId`. route를 안 읽으니 orphan될 route 키가 없다. #239 half 2에서 구현·검증(2026-08-25). **P-H(off/block id client 영향)** — 구현 단계에서.
 
 ### 15.10 v5 결정 로그
@@ -771,7 +779,7 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 
 | Telegram vs 우리 | 라벨 | 근거 |
 |---|---|---|
-| 서버가 history store 소유 vs 우리는 core transcript 투영 | [#114] | `history.ts:268` getSessionMessages; §15.6 파괴적 컷오버가 해소 |
+| 서버가 history store 소유 vs 우리는 core transcript 투영 | [#114] | ✅ **해소됨 (#240 half 2, 2026-08-26)** — core transcript reader 삭제, 앵커가 가리키던 `history.ts`의 `getSessionMessages` 호출 자체가 없어졌다(§15.6) |
 | 서버-배정 id vs 클라가 text/position로 추측 adopt | [#114] | `nats-client-wrapper.ts:2081-2113`; §16.2-1 |
 | 한 계정 전 기기 동일 id vs 같은 메시지 3중 id | [#114] | `:2593,805,808`; §16.2-1 |
 | 서버 messageId + 클라 random_id vs 클라가 durable id 민팅 | [#114] | §15.5; `message-adapter.ts:23`; §16.2-1 |
@@ -786,7 +794,7 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 | final↔답변 연결 vs 우리가 ordinal 억지매칭 desync | **[#114]** (S1 철회) | 내장 채널은 "현재 draft 마감 + 못 붙으면 새 메시지"; core 한계 아님(§16.1) |
 | **원본 inbound 각각을 durable 보존** vs 우리는 journaling 없이 메모리서 `{id:last,text:joined}`로 병합 | **[#114]** (라벨 정정) | ⚠️ codex 정정: "Telegram은 coalesce 안 함"은 **틀림** — 내장 Telegram도 coalesce함(`[core] extensions/telegram/src/bot-handlers.runtime.ts:636`). 차이는 **병합 전 각 원본을 journal에 남기느냐**다. `inbound-queue.ts:145`. 턴-레벨 coalesce는 남겨도 됨 |
 | ordinal을 **durable id/final-attribution 키로 안 씀** vs 우리는 `assistantMessageIndex`로 final↔lane 매칭 | [#114] | ⚠️ codex 정정: "Telegram은 ordinal 아예 안 씀"은 **틀림** — 내장 Telegram은 ordinal을 **queued-block 회전/상관 힌트**로 씀(`[core] bot-message-dispatch.ts:1357-1441`), 단 **durable id나 final 정체성으론 절대 안 씀**. 우리 죄는 ordinal을 **정체성**으로 쓴 것. `channel-contract.ts:60-64` |
-| 안정 message_id 페이지 vs churn되는 id 커서(`before`) | [#114] | `history.ts:338`; §16.2-6 |
+| 안정 message_id 페이지 vs churn되는 id 커서(`before`) | [#114] | `planHistoryFetch`(`history.ts`) + `historyPageBefore`(`journal-history.ts`); §16.2-6. 커서는 이제 projected message id다 |
 | 한 답변=한 id(변경=edit) vs 재스트림=새 id 이중렌더 | [#114] | 현재-draft in-place 편집 모델 채택 시 해소(§16.1); core 한계 아님 |
 | 즉시 멀티디바이스 반영 vs B는 스냅샷까지 지연 | [#114] | `:2070`; §16.2-8 |
 | ~~정확한 재전송 vs 중단 생성 재생성(비결정적)~~ | ~~[S2]~~ **삭제** | codex 정정: Telegram AI도 동일(만료+새 메시지) → **구조적 차이 아님**. 이 행은 없는 차이를 광고함. §16.1 S2 |

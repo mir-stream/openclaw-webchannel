@@ -30,12 +30,14 @@ Earlier guidance (CHANGELOG, #54) told operators to "invalidate the old
 encrypted peer state". An operator following that instruction has nowhere to go,
 because the thing it names does not exist. The correction:
 
-- **K seals no history at rest.** The history authority is OpenClaw core's
-  session transcript: plaintext JSONL at owner-only permissions, written by
-  core, not by this plugin (whose own at-rest store is `delivery-journal.sqlite`
-  below). `NatsChannel.sendHistory` seals the frame with the
-  **current** K at delivery time. Replacing K therefore costs no re-encryption —
-  the next read-and-deliver cycle simply reseals under the new key
+- **K seals no history at rest.** Since #240 the history authority is **this
+  plugin's own `delivery-journal.sqlite`** (described below) — a chat reload is
+  served by replaying that file, not by reading core's session transcript. Core
+  still writes its own transcript, and it is still plaintext JSONL at owner-only
+  permissions, but this plugin no longer reads it for history.
+  `NatsChannel.sendHistory` seals the frame with the **current** K at delivery
+  time. Replacing K therefore costs no re-encryption — the next
+  read-and-deliver cycle simply reseals under the new key
   (`ISSUE_72_CONTAINMENT_PLAN.md` §1.4, RETAIN + RESEAL).
 - **What this plugin writes**, per exact `(tenant, accountId)` tuple, under
   `$HOME/.openclaw-webchannel-v2/<v2_namespace>/`:
@@ -61,6 +63,16 @@ because the thing it names does not exist. The correction:
     minimization** — it removes plaintext standing on disk from here on. That
     is not containment and it does not undo past exposure (§0.1), so it is your
     call to make, not a step this procedure requires.
+
+    ⚠️ **AND SINCE #240 THAT DELETION IS DESTRUCTIVE TO YOUR USERS, NOT JUST TO
+    THE DISK.** This file is now the ONLY history store — a chat reload replays
+    it, and nothing else is consulted. Deleting it does not merely stop
+    retaining plaintext going forward; every affected peer's conversation
+    reloads **empty**, with no recovery and no signal to them that anything was
+    removed. Core's own transcript survives, but this plugin does not read it,
+    so it is not a fallback. Price that against the minimization benefit before
+    pulling the lever; it was a much cheaper action while the journal was a
+    shadow store.
   - legacy migration artifacts under `$HOME/.openclaw-webchannel/`.
 
   That is the complete list. Nothing on it is a ciphertext store to invalidate:
@@ -79,7 +91,8 @@ exception that rule anticipates.** During a confirmed containment you may move
 ④-bis, per `AUTH.md`), you replace K in `conversation-keys.json` only when K
 is in scope (step ④), and you **may** delete `delivery-journal.sqlite` together
 with its `-wal`/`-shm`/`-journal` sidecars if you choose to clear the conversation
-plaintext they hold (§0.2 — optional, and not containment) — unlike the other
+plaintext they hold (§0.2 — optional, not containment, and since #240 it also
+**erases every affected peer's chat history irrecoverably**) — unlike the other
 two, that one is an outright delete, not a move-aside or an in-place
 replacement. All are done with the gateway stopped; the first two use the
 documented paths below. Outside an incident, the README rule stands:

@@ -162,9 +162,11 @@ describe("nats-account-runtime.ts wiring contract — v6 delivery journal (#239)
    * docblock gives: the plaintext/test construction has no tuple directory to
    * open a journal in. That optionality is exactly
    * what could turn into an UNJOURNALED PRODUCTION without a single test going
-   * red — the journal is a shadow store until #240, so nothing reads it and
-   * nothing else would notice. These assertions are the only thing standing
-   * between "optional" and "absent where it matters".
+   * red. (The original reason was "the journal is a shadow store until #240, so
+   * nothing reads it and nothing else would notice" — #240 half 2 ended that,
+   * and the guard got MORE load-bearing, not less: an unwired journal is now an
+   * account that serves empty history forever.) These assertions are the only
+   * thing standing between "optional" and "absent where it matters".
    *
    * Same house rule as the guards above: they pin WIRING SHAPE, not behavior. If
    * a line legitimately changes, update the assertion DELIBERATELY.
@@ -176,9 +178,32 @@ describe("nats-account-runtime.ts wiring contract — v6 delivery journal (#239)
     // One regex, not two: a free-floating `.deliveryJournalPath,` match would
     // stay green while the call above read `.credentialPath`. `[^;]*?` spans the
     // optional-storageRoot spread without escaping the statement.
+    //
+    // ⚠️ THE ASSIGNMENT TARGET IS A `const journal`, NOT `deliveryJournal`,
+    // SINCE #240 HALF 2. Two bindings for one handle: `deliveryJournal` stays
+    // `| undefined` because the failed-start close and the dispose chain both
+    // run where the open never happened, while the `const` is what
+    // `createHistoryServer` receives.
+    //
+    // (The `\b` is belt-and-braces, NOT what separates the two names — an
+    // earlier comment claimed it was. `deliveryJournal` contains no lowercase
+    // `journal`, so case alone already distinguishes them. The regex is right;
+    // that justification for it was not.)
+    //
+    // ⚠️ AN EARLIER REVISION CLAIMED THE `const` MADE "a failed open fails the
+    // account start" A COMPILE-TIME FACT VIA DEFINITE-ASSIGNMENT ANALYSIS. That
+    // was FALSE and was mutation-proven so: a `let x: T` never assigned on any
+    // path typechecks clean when its only reads are inside closures, which is
+    // every read here. What actually carries the property is
+    // `HistoryServerDeps.journal` being NON-OPTIONAL plus the server being
+    // constructed in direct flow beside the open — asserted below.
+    //
+    // The alias is asserted right after, because dropping it is what would
+    // silently disarm both closes.
     expect(RUNTIME_SOURCE).toMatch(
-      /deliveryJournal = openDeliveryJournal\(\{\s*databasePath: tupleStoragePaths\(\{\s*tenant,\s*accountId,[^;]*?\}\)\.deliveryJournalPath,/,
+      /\bjournal = openDeliveryJournal\(\{\s*databasePath: tupleStoragePaths\(\{\s*tenant,\s*accountId,[^;]*?\}\)\.deliveryJournalPath,/,
     );
+    expect(RUNTIME_SOURCE).toContain("deliveryJournal = journal;");
     // The channel must actually RECEIVE it. `undefined` is the defaulted
     // NatsChannelLimits in the 5th position.
     expect(RUNTIME_SOURCE).toMatch(
@@ -241,21 +266,51 @@ describe("nats-account-runtime.ts wiring contract — v6 delivery journal (#239)
     expect(catchStart).toBeGreaterThan(tryStart);
     const block = RUNTIME_SOURCE.slice(tryStart, catchStart);
 
+    const OPEN = "\n        const journal = openDeliveryJournal({";
     expect(block).toContain("keyStore.assertNoFutureDocuments()");
-    expect(block).toContain("deliveryJournal = openDeliveryJournal({");
+    expect(block).toContain(OPEN);
+    // The `| undefined` alias the two close paths use must be assigned INSIDE
+    // the try as well, immediately after the open — hoisting it out, or setting
+    // it only after `new NatsChannel(...)`, re-opens the leak the failed-start
+    // close exists to prevent (the channel constructor is fail-closed and throws
+    // after the journal is already open).
+    expect(block).toContain("deliveryJournal = journal;");
     expect(block).toContain(
       "channel = new NatsChannel(transport, accountId, tenant, {",
     );
+    // ⚠️ AND THE HISTORY SERVER IS BUILT HERE TOO, FROM THE SAME `const`. That
+    // placement is what carries "a failed journal open fails the account start"
+    // — `HistoryServerDeps.journal` is non-optional, so the server cannot be
+    // constructed without a real handle, and it is constructed in DIRECT FLOW
+    // where the open just succeeded.
+    //
+    // ⚠️ THIS ASSERTION IS THE ONLY THING THAT CATCHES AN UNWIRED SERVER, and
+    // tsc is not a second one: an earlier revision claimed definite-assignment
+    // analysis proved the handle set, which is FALSE — a `let x: T` never
+    // assigned on any path typechecks clean when its only reads are inside
+    // closures, which is every read there. MEASURED: delete the
+    // `createHistoryServer({…})` block and only THIS file goes red;
+    // `history-serve.test.ts` builds its own server and never reads
+    // `nats-account-runtime.ts` at all, so it stays green.
+    expect(block).toContain("historyServer = createHistoryServer({");
+    expect(block).toMatch(/historyServer = createHistoryServer\(\{\s*journal,/);
     // No nested try/catch inside the slice, so the `} catch (err) {` we sliced to
     // is genuinely the handler covering the open.
     expect(block).not.toMatch(/\}\s*catch\b/);
     // Order WITHIN the block still matters.
-    expect(
-      block.indexOf("deliveryJournal = openDeliveryJournal({"),
-    ).toBeGreaterThan(block.indexOf("keyStore.assertNoFutureDocuments()"));
+    expect(block.indexOf(OPEN)).toBeGreaterThan(
+      block.indexOf("keyStore.assertNoFutureDocuments()"),
+    );
+    expect(block.indexOf("deliveryJournal = journal;")).toBeGreaterThan(
+      block.indexOf(OPEN),
+    );
     expect(
       block.indexOf("channel = new NatsChannel(transport, accountId, tenant, {"),
-    ).toBeGreaterThan(block.indexOf("deliveryJournal = openDeliveryJournal({"));
+    ).toBeGreaterThan(block.indexOf("deliveryJournal = journal;"));
+    // The server needs the channel it publishes on, so it must come last.
+    expect(block.indexOf("historyServer = createHistoryServer({")).toBeGreaterThan(
+      block.indexOf("channel = new NatsChannel(transport, accountId, tenant, {"),
+    );
   });
 
   it("closes the journal on the FAILED-START path, ahead of the transport teardown", () => {

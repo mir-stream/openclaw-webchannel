@@ -53,7 +53,7 @@ The **wrapper reduces every inbound frame** (`nats-client-wrapper.ts`):
 
 | Frame | Reducer case | Effect |
 |---|---|---|
-| `history` | `:209` | **#16 ordered merge**: three-tier matching (id → exact text+role adoption of server ids onto live-id bubbles → positional adoption for reformatted agent replies) + **anchor-cursor** insertion (fresh unmatched messages land at `matchedIndex+1`, so a mid-session snapshot's unseen suffix inserts chronologically). Blanket oldest-first prepend only for zero-overlap pages / initial hydration into empty state. |
+| `history` | `case "history"` | **#16 ordered merge**: TWO-tier matching since #240 half 2 (id → exact text+role adoption, **USER rows only**; the positional tier and its anchor were deleted — an agent row matches by id or fresh-inserts) + **insertion-cursor** placement (fresh unmatched messages land at `matchedIndex+1`, so a mid-session snapshot's unseen suffix inserts chronologically). Blanket oldest-first prepend only for zero-overlap pages / initial hydration into empty state. |
 | `typing` | `:376` | `isTyping:true` |
 | `approval_request` | `:381` | upsert into `approvals[]` (**upsert-preserve** `:400-417`: a re-delivered request can't clobber a local resolution), clear `isTyping` |
 | `approval_resolved` | `:421` | mark card resolved |
@@ -75,9 +75,9 @@ The **server/agent side (NATS path)** lives in the package-root composition entr
 | Capability | Emit (`nats-channel.ts`) | Wired in `index-nats.ts` (root) |
 |---|---|---|
 | register hop | — | `setRegisterRequestHandler()` `:322` (channel) → wired `:638` (**NATS request/reply — the old HTTP `registerHttpRoute` is gone**) |
-| history snapshot on register | `sendHistory()` `:398` | **from the register success path** (stateless): `historyRecent`→`sendHistory`, detached read |
+| history snapshot on register | `sendHistory()` (`nats-channel.ts:644`) | **from the register success path** (stateless): `history-serve.ts` `sendSnapshot` → `serveHistoryRequest` (journal replay) → `sendHistory`, **deferred one turn** so the register reply publishes first. ⚠️ Updated by #240 half 2 — was `historyRecent`→`sendHistory` as a detached core-transcript read; both that symbol and the `AsyncResource` detour are deleted. |
 | approval snapshot on register | `sendApprovalSnapshot()` `:473` | **from the same register path**, **synchronous** (not detached): `listPendingApprovalsForPeer`/`listResolvedApprovalsForPeer` → `sendApprovalSnapshot` (`:668-673`) |
-| history pagination | — | `setLoadHistoryHandler` `:505`/wired `:548` → `planHistoryFetch` → `historyPageBefore`/`historyRecent` → `sendHistory` |
+| history pagination | — | `setLoadHistoryHandler` → `history-serve.ts` `servePage` → `planHistoryFetch` → `serveHistoryRequest` (journal replay) → `sendHistory`, deferred, and bounded to one in-flight page per peer. ⚠️ Updated by #240 half 2 — `historyPageBefore`/`historyRecent` (the core-transcript pager) are deleted. |
 | command discovery | `sendCommands()` `:527-530` | `setLoadCommandsHandler` `:658` wired `:917-925` → `createCommandCatalogProvider(api.config)()` (memoized, config-filtered) |
 | typing | `sendTyping()` `:509-513` (**now gated** — see P0-6) | gate set `index-nats.ts:590` `channel.setTypingEnabled(resolveTypingEnabled(account))` |
 | streaming draft | `sendProgress()` `:375` / `finalizeDraft()` `:383` | `inbound.ts:124-136` (gated on `streaming.mode` — `partial` = answer text, `progress` = tool lines) |
@@ -118,7 +118,7 @@ boolean `delivered`), `approvals`, `status`, `connected`, `error?`, `isTyping?`,
 | `history.enabled` | **`true`** (`:174-178`) | **`true`** (`:234`) | ✅ P0-1 works E2E |
 | `execApprovals` + `capabilities.inlineButtons` | first-class (`:137/:163`) | **enabled + approvers** (`:235`) | ✅ P0-4 works E2E |
 | `capabilities.typing` | **`"on"`** (`:167-170`) | unset → default on | ✅ P0-6 — gate now wired on NATS (`typing:"off"` honored) |
-| `streaming.mode` | option only (enum `off\|partial\|block\|progress`, `:110`), **no default** | **`"partial"`** (`run.sh:287`) | 🟡 P0-5 — enablement built; multi-message finalize correctness #94 open |
+| `streaming.mode` | option only (enum `off\|partial\|block\|progress`, `:110`), **no default** | **`"partial"`** (`run.sh:286`) | 🟡 P0-5 — enablement built; multi-message finalize correctness #94 open |
 | `messages.inbound.byChannel.webchannel` (core key) | core default `0` (inert) | **`300`** (`run.sh:268`) | ✅ P1-8b pre-run debounce active |
 
 ### Reuse note — openclaw `plugin-sdk` runtimes (VERIFIED available)
@@ -153,21 +153,28 @@ it; the widget renders it.
 - Server sends the snapshot **from the register success path** (Phase 6 stateless-register change — it
   used to fire on first liveness / register-complete, that wiring is now gone; the register hop is
   now NATS request/reply via `setRegisterRequestHandler`, no HTTP). Every register (first join,
-  reload, reconnect) gets the bounded snapshot: `historyRecent(api, route.sessionKey,
-  historyConfig.limit, …)` → `channel.sendHistory(peerId, messages)`, run as a **detached** read
-  (`runDetachedHistoryRead`) so it authorizes against a synthetic operator client. **Since #15/#19,
-  the same register path also sends an `approval_snapshot`** (`sendApprovalSnapshot`,
-  `index-nats.ts:668-673`) — deliberately **synchronous**, not detached (race analysis comment at
-  `index-nats.ts:655-667`), so a pending approval card is rehydrated on the same hop as history (see
-  P0-4). The client's message-id-idempotent, order-preserving hydration absorbs duplicate snapshots
-  across reconnects.
-- `historyRecent` reads the openclaw session store: `src/history.ts` (`recent` `:182`, config via
-  `resolveHistoryConfig` `:37`).
+  reload, reconnect) gets the bounded snapshot: **as of #240 half 2**,
+  `serveHistoryRequest(journal.read, peerId, { kind:"recent", limit })` →
+  `channel.sendHistory(peerId, messages)`, deferred one turn with `setImmediate` so the register
+  reply is not held behind a synchronous replay. (It used to be
+  `historyRecent(api, route.sessionKey, …)` run inside `runDetachedHistoryRead` so it would
+  authorize against a synthetic operator client; both the core read and the detour are deleted —
+  the journal needs no authorization because it is ours.) **Since #15/#19,
+  the same register path also sends an `approval_snapshot`** (`sendApprovalSnapshot`) —
+  deliberately **synchronous**, and it must stay that way (race analysis comment beside the wiring
+  in `nats-account-runtime.ts`), so a pending approval card is rehydrated on the same hop as
+  history (see P0-4). The client's message-id-idempotent, order-preserving hydration absorbs
+  duplicate snapshots across reconnects.
+- The snapshot reads the PLUGIN's own delivery journal, not core's session store:
+  `journal-history.ts` (`serveHistoryRequest` → `projectJournalHistory`), config via
+  `resolveHistoryConfig` in `history.ts`.
 - Wire frame: `{ type:"history"; messages:[{id,role,text,ts}] }`.
-- **Reducer hydrates it (#16 ordered merge):** `nats-client-wrapper.ts:209` `case "history"` — no
-  longer a blanket "dedup + prepend oldest-first". It does three-tier matching (id → exact text+role
-  adoption of server ids onto local live-id bubbles → positional adoption for reformatted agent
-  replies) and **anchor-cursor** insertion so an overlapping mid-session snapshot's unseen suffix
+- **Reducer hydrates it (#16 ordered merge):** `nats-client-wrapper.ts:2363` `case "history"` — no
+  longer a blanket "dedup + prepend oldest-first". Since #240 half 2 it does TWO-tier matching (id →
+  exact text+role adoption of server ids onto local live-id bubbles, **USER rows only**; the
+  positional tier for reformatted agent replies is DELETED, along with its anchor, because the
+  journal serves the delivery-act id so an agent row matches by id or has no local counterpart)
+  and **insertion-cursor** placement so an overlapping mid-session snapshot's unseen suffix
   lands chronologically after the matched prefix. Blanket prepend survives only for zero-overlap
   pages and initial hydration into empty state (design comment `:216-259`).
 - **Widget renders it:** `demo/web/src/widget.ts:146-158` maps `state.messages` → bubbles.
@@ -196,10 +203,47 @@ snapshot is lost.
 
 ## P0-2 — History pagination (scroll-up "load more") — ✅ BUILT (1000-msg ceiling)
 
+> ⚠️ **SUPERSEDED 2026-08-26 by #240 half 2 — the 1000-message wall is gone, and
+> so is everything below that reasons from it.** The entire SERVER half of this
+> section describes a pager built on `openclaw`'s tail-fetch transcript seam:
+> the two-phase fetch, `MAX_FETCH_WINDOW = 1000`, the window-relative synthetic
+> ids, the "upstream-constrained, file a feature request for a `before`/`offset`
+> cursor" analysis. None of that code exists any more. The plugin now serves
+> history from its OWN delivery journal (`journal-history.ts`, replaying the
+> client's reducer), and a page comes off the full projection. **Distinguish the
+> two quantities the old wording ran together (it said "no cap at any size"):**
+> REACH is now uncapped — `historyPageBefore` pages arbitrarily far back, so the
+> "conversations >1000 messages hard-wall" really is gone and needs nothing from
+> upstream. A single PAGE is still capped at 1000 for a peer-supplied `limit`
+> (`MAX_WIRE_HISTORY_LIMIT` in `history.ts`), which is what base effectively did
+> too — though **not** "via `MAX_FETCH_WINDOW` and again inside core's
+> `getSessionMessages`", as an earlier revision of this line said. That is true
+> only of the `page` path: base's `recent()` forwarded the peer's `limit`
+> unclamped and was capped ONCE, by core. `{load_history, limit: 1e9}` carries no
+> cursor, so it is a `recent`. The cutover dropped that clamp with core itself;
+> #240 half 2 restores it, at zero cost to reach.
+>
+> What is genuinely still open here is the CLIENT half: the scroll-UX polish
+> (item 1 of the sketch) and the user side of the adoption merge. The AGENT side
+> is **deleted** as of #240 half 2 — the positional tier is gone and the
+> text tier is closed to agent rows, because the journal serves the delivery-act
+> id, so an agent row either matches by id or has no local counterpart to match.
+> Four data-loss defects were found there across four review rounds before the
+> tiers were removed rather than patched again (doc §15.6 has the list). Text
+> matching survives for USER rows only, where the local `u-<n>` echo and the
+> journaled wire id legitimately differ; removing that is **#302**, blocked on
+> **#243**. The new cost ceiling is different in kind
+> and is tracked separately: a page is a full synchronous replay, quadratic in
+> conversation length (**#286** — the materialized read model).
+>
+> Kept below as the record of what was built and why, not as current state. Do
+> not cite it for "how does history pagination work" or for anything about
+> upstream limits.
+
 **Symptom (original).** Older-than-snapshot turns can't be reached past ~2 pages.
 
 **Classification.** ✅ Closed 2026-07-10 (#24, branch `feat/p0-2`). Two defects fixed:
-1. **`pageBefore` depth cap + left-edge truncation** (`history.ts:277-318`): now a two-phase fetch —
+1. **`pageBefore` depth cap + left-edge truncation** (`history.ts`, DELETED by #240 half 2): a two-phase fetch —
    phase 1 reads `Math.min(limit*2, MAX_FETCH_WINDOW)` (`:287`); the older-slice is returned only when
    it cannot be left-truncated by the window edge (`idx >= limit || (found && phase1Limit >=
    MAX_FETCH_WINDOW)`, `:293`); otherwise (miss OR hit at `idx < limit`) phase 2 widens to the
@@ -210,7 +254,7 @@ snapshot is lost.
 2. **Live NATS call-site bug** (`index-nats.ts` load-history handler): it passed the whole
    `{before, limit}` request object as `beforeId`, so live-path pagination ALWAYS returned `[]`
    (masked from tsc — `index-nats.ts` is outside the plugin tsconfig `include`). Now routed
-   through `planHistoryFetch(request, pageSize)` (`history.ts:218-231`): validates the wire `limit`
+   through `planHistoryFetch(request, pageSize)` (`history.ts`; the function survives, the line anchor did not): validates the wire `limit`
    (finite, >0, floored, else pageSize) and branches `before` → `pageBefore` / absent → `recent`,
    matching the legacy `index.ts` handler.
 
@@ -261,8 +305,8 @@ enough for any realistic session (confirmed acceptable by user 2026-07-03). Only
 exceeding 1000 turns would still hit a hard wall, and *that* residual case needs the upstream cursor
 above.
 
-**Reference implementation (our reducer).** `nats-client-wrapper.ts:209` already does the #16 ordered
-merge (three-tier match + anchor-cursor insertion, with blanket oldest-first prepend for a
+**Reference implementation (our reducer).** `nats-client-wrapper.ts:2363` already does the #16 ordered
+merge (two-tier match + insertion-cursor placement, with blanket oldest-first prepend for a
 zero-overlap page); the "Load older" response reuses it.
 
 **Telegram reference.** `message-cache.ts` builds bounded history windows on demand; Telegram has no
@@ -292,7 +336,8 @@ rendered yet.
 
 **Execution (unchanged, still true).** `/help` typed in the browser is routed to core's text-command
 handler and returns output as an `agent_message`; webchannel declares no `capabilities.nativeCommands`
-(`channel.ts:115`) so text slash-commands stay active (core `commands-text-routing.ts:40-48`,
+(an ABSENCE in `channel.ts`'s capabilities block — no line anchors it, and the
+one that used to be cited here points at unrelated code) so text slash-commands stay active (core `commands-text-routing.ts:40-48`,
 `cfg.commands?.text !== false`). No change was needed here.
 
 **Where it stands today — discovery built.**
@@ -469,7 +514,7 @@ until a history reload restores them.
   be a plugin-side lane change, not a new client protocol.
 - **Widget:** working bubbles render italic/dimmed (`widget.ts:215` `m.working` → `opacity:.7;
   font-style:italic`).
-- ✅ **Demo sets `streaming.mode:"partial"`.** The account block (`run.sh:287`) now carries
+- ✅ **Demo sets `streaming.mode:"partial"`.** The account block (`run.sh:286`) now carries
   `"streaming": { "mode": "partial" }` alongside `history`/`execApprovals`/`auth`/`dmSecurity`, so
   `draftEnabled` + `answerStreamingEnabled` are both true and the answer streams into the working
   bubble.

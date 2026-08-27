@@ -1044,10 +1044,19 @@ export async function handleInboundMessage(
   // routing is preserved (`agents bind --agent X --bind webchannel:<account>`
   // still routes THIS account's inbound to agent X), but the session key NEVER
   // inherits the operator's global `session.dmScope="main"` — every user's uuid
-  // gets its OWN agent session, so the cross-user transcript leak on the history
-  // snapshot / load_history read paths cannot happen. This is the WRITE site: the
-  // turn is dispatched under this key, and the history READ sites resolve the
-  // SAME key via the SAME helper, so paging/snapshot stay consistent.
+  // gets its OWN agent session, so one user's turns are never appended to
+  // another's transcript and the agent never answers with a context it built
+  // from someone else's conversation.
+  //
+  // ⚠️ THIS IS THE ONLY SITE. An earlier revision of this comment justified the
+  // forced scope by a cross-user leak on "the history snapshot / load_history
+  // read paths", and closed by saying "the history READ sites resolve the SAME
+  // key via the SAME helper". Both are false since #240 half 2: those read paths
+  // are deleted, history is projected from the plugin's own delivery journal
+  // (keyed by peerId, not by the session key), and this call is the last
+  // remaining `resolveWebchannelSessionRoute` in production. The forced scope is
+  // NOT vestigial — the write-side reason above is the stronger one, and it is
+  // now the whole reason. See `session-route.ts`'s module docblock.
   const route = resolveWebchannelSessionRoute(api, accountId, wsKey, servingTenant);
 
   // #93: build this turn's approval-origin lease handle. Creating it claims

@@ -21,7 +21,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { NatsChannel } from "./nats-channel.js";
 import { ConversationKeyStore } from "./conversation-key-store.js";
 import { generateKeyPair } from "./e2e-crypto.js";
-import { recent } from "./history.js";
+import { serveHistoryRequest, type JournalReader } from "./journal-history.js";
 import { unwrapConversationKey } from "./late-join-decryptor.js";
 import { sealEnvelope, openEnvelope } from "./e2e-session.js";
 
@@ -346,7 +346,14 @@ describe("NatsChannel keyStore mode (register admission)", () => {
     })).toThrow();
   });
 
-  it("reads retained core history after rotation and reseals it only under K_new", async () => {
+  it("reads retained JOURNAL history after rotation and reseals it only under K_new", () => {
+    // ⚠️ #240 half 2 changed WHERE the retained history comes from, not what
+    // this test is about. The subject is still the reseal: history recovered
+    // after a key rotation must go out under K_new and be undecryptable to the
+    // pre-rotation device. The source used to be core's transcript through
+    // `history.recent`; it is now the plugin's own delivery journal replayed by
+    // `serveHistoryRequest`, so the reader is an in-memory `JournalReader`
+    // rather than a core-transcript `subagent` stub.
     const broker = new FakeBroker();
     const { channel, store } = makeKeyStoreChannel(broker);
     channel.registerPeer(PEER);
@@ -356,30 +363,29 @@ describe("NatsChannel keyStore mode (register admission)", () => {
 
     const oldDevice = makeDevice(broker, () => oldKey);
     const newDevice = makeDevice(broker, () => rotated.key);
-    const calls: Array<{ sessionKey: string; limit?: number }> = [];
-    const api = {
-      runtime: {
-        subagent: {
-          getSessionMessages: async (params: { sessionKey: string; limit?: number }) => {
-            calls.push(params);
-            return {
-              messages: [{
-                role: "assistant",
-                content: [{ type: "text", text: "retained transcript" }],
-                timestamp: 1_700_000_000_000,
-                __openclaw: { id: "history-1" },
-              }],
-            };
-          },
+    // The journal is keyed by peerId, so the read scope IS the peer — assert
+    // the projection was asked for this peer and nobody else.
+    const asked: string[] = [];
+    const read: JournalReader = (conversationId, options) => {
+      asked.push(conversationId);
+      if (conversationId !== PEER || (options?.afterSeq ?? 0) > 0) return [];
+      return [{
+        seq: 1,
+        kind: "bubble",
+        event: {
+          kind: "bubble",
+          answerId: "history-1",
+          turnId: "turn-1",
+          text: "retained transcript",
         },
-      },
-    } as unknown as Parameters<typeof recent>[0];
+        createdMs: 1_700_000_000_000,
+      }];
+    };
 
-    const messages = await recent(api, "webchannel:agent-1:user-42", 10);
-    expect(calls).toEqual([{
-      sessionKey: "webchannel:agent-1:user-42",
-      limit: 10,
-    }]);
+    const { messages } = serveHistoryRequest(read, PEER, { kind: "recent", limit: 10 });
+    // ONE read: the chunk came back shorter than the chunk size, so the replay
+    // loop is done and must not ask again.
+    expect(asked).toEqual([PEER]);
     expect(channel.sendHistory(PEER, messages)).toBe(true);
     expect(newDevice.decrypted).toEqual([{
       type: "history",

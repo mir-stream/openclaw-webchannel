@@ -336,6 +336,16 @@ jobs:
       #     future change misplaces into devDependencies (builds green,
       #     breaks remote install) — which no other CI step would detect.
       # ──────────────────────────────────────────────────────────────────────
+      # Runs BEFORE the smoke test, not after: it pins the residual-`/src/` scan
+      # inside that script, and a scan that has been disarmed produces a GREEN
+      # smoke test. Order is the only thing that makes this report first.
+      # ⚠️ The 5d banner above describes the SMOKE step below, not this one.
+      # This step guards that step's residual-`/src/` scan and therefore has to
+      # run first — a disarmed scan produces a green smoke test, so only
+      # ordering makes the self-test report the disarming.
+      - name: Pack-load smoke self-test (the residual-/src/ scan still fires)
+        run: bash scripts/pack-load-smoke-selftest.sh
+
       - name: Plugin pack-and-load smoke (F3 remote-install guard)
         run: bash scripts/pack-load-smoke.sh
 
