@@ -65,17 +65,24 @@
  * are gone from this package. `history.ts` survives as the wire type + config +
  * request-plan module and nothing else. Both call sites live in
  * `history-serve.ts`, which owns the deferral, the per-peer in-flight bound and
- * the failure policy; `nats-account-runtime.ts` only wires it. (The client's
- * 3-tier adoption block is RETAINED, but no longer "untouched": the cutover
- * made three of its paths lose delivered text, so #240 half 2 also fixes those
- * three — a tier-1 match now claims its local bubble, empty-text agent rows are
- * dropped on arrival, and an adoption now retires the id it displaced.
- * Removing the AGENT-row guessing is tracked at doc §5's non-scope list and
- * owned by **#302** — not "wholesale" removal, since #302 deliberately KEEPS
- * tier 2 for user rows, whose wire id and local echo id legitimately differ
- * (the #104/#227/#228 that list originally cited are all CLOSED); §15.6 itself
- * says the block is removable together with this cutover, so "separate work"
- * was never the doc's position.)
+ * the failure policy; `nats-account-runtime.ts` only wires it.
+ *
+ * ⚠️ THE CLIENT'S AGENT-SIDE ADOPTION TIERS ARE GONE, and that is a consequence
+ * of this module rather than a separate cleanup. Because the journal serves the
+ * delivery-act id, an agent bubble the client rendered live carries the id the
+ * snapshot carries — so it matches by ID, and an agent row that does NOT match
+ * by id has no local counterpart at all. Four data-loss defects were found in
+ * that block across four review rounds before the tiers were deleted rather
+ * than patched a fifth time. `case "history"` in `nats-client-wrapper.ts` now
+ * matches an agent row by id or fresh-inserts it; it never guesses.
+ *
+ * ⚠️ USER ROWS STILL TEXT-MATCH, AND THE RESIDUAL IS REAL. The client renders a
+ * user echo under a local `u-<n>` while the accept seam journals the inbound
+ * WIRE id, so user ids do NOT agree and tier 2 is how the echo is recovered.
+ * That is the ordinal/text inference N5 forbids, still running on one path.
+ * **#302** owns removing it and stays OPEN, blocked on **#243** giving a user
+ * message one shared id. (The #104/#227/#228 doc §5 originally cited for this
+ * are all CLOSED.)
  *
  * ⚠️ NEVER SANITIZE HERE. Do not reintroduce `sanitizeHistoryText` or anything
  * like it. The journal stores the EXACT text that was published to the client,

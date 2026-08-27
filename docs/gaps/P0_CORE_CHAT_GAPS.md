@@ -222,11 +222,15 @@ snapshot is lost.
 > #240 half 2 restores it, at zero cost to reach.
 >
 > What is genuinely still open here is the CLIENT half: the scroll-UX polish
-> (item 1 of the sketch) and the client's three-tier adoption merge — which is
-> RETAINED but **not** untouched, and an earlier revision of this line saying
-> #240 "deliberately did not touch" it was wrong: the cutover made three of its
-> paths lose delivered text and this slice fixes all three (doc §15.6 has the
-> list; wholesale removal is **#302**). The new cost ceiling is different in kind
+> (item 1 of the sketch) and the user side of the adoption merge. The AGENT side
+> is **deleted** as of #240 half 2 — the positional tier is gone and the
+> text tier is closed to agent rows, because the journal serves the delivery-act
+> id, so an agent row either matches by id or has no local counterpart to match.
+> Four data-loss defects were found there across four review rounds before the
+> tiers were removed rather than patched again (doc §15.6 has the list). Text
+> matching survives for USER rows only, where the local `u-<n>` echo and the
+> journaled wire id legitimately differ; removing that is **#302**, blocked on
+> **#243**. The new cost ceiling is different in kind
 > and is tracked separately: a page is a full synchronous replay, quadratic in
 > conversation length (**#286** — the materialized read model).
 >

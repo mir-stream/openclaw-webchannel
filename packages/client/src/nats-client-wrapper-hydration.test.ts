@@ -76,6 +76,23 @@ const TWO_STEP_ROWS: Row[] = [
   { id: "core-3", role: "agent", text: "You have three: alpha, beta, gamma.", ts: 3 },
 ];
 
+/**
+ * The same conversation as the JOURNAL actually serves it, which is what every
+ * MID-SESSION test below must use.
+ *
+ * The ids are the difference and it is the whole point: an agent row carries the
+ * DELIVERY-ACT id (`webchannel-…`) — byte-identical to the id the live frame
+ * carried — and a user row carries the inbound WIRE id, which is a random token
+ * and never the client's local `u-<n>` echo id. `TWO_STEP_ROWS`' `core-…` ids
+ * cannot arise from the journal at all; they are kept only where the test is
+ * genuinely id-agnostic (the cold-reload block, which hydrates into empty state).
+ */
+const JOURNAL_TWO_STEP_ROWS: Row[] = [
+  { id: "wire-8f3a1c", role: "user", text: "which agents are configured?", ts: 1 },
+  { id: "webchannel-1", role: "agent", text: "Let me check that.", ts: 2 },
+  { id: "webchannel-2", role: "agent", text: "You have three: alpha, beta, gamma.", ts: 3 },
+];
+
 describe("#95 WP B — cold reload is a faithful reconstruction of the row sequence", () => {
   /**
    * THE CONTRACT. Hydration into empty state — what a reloading tab does — must
@@ -177,8 +194,17 @@ describe("#95 WP B — cold reload is a faithful reconstruction of the row seque
 
 describe("#95 WP B — live timeline converges to the row sequence", () => {
   /**
-   * The simple case: live text equals stored text. Tier 2 adopts, and the
-   * reloaded and live timelines agree exactly.
+   * The ordinary post-cutover case: every agent row TIER-1 matches (same
+   * delivery-act id), the user row tier-2 adopts, and the live and reloaded
+   * timelines agree exactly.
+   *
+   * ⚠️ RE-BASED ONTO JOURNAL IDS. This used to deliver `TWO_STEP_ROWS`
+   * (`core-…`) into a live session and pass because tier 2/3 GUESSED the agent
+   * correspondence. Those tiers are deleted, and a `core-` agent id is a shape
+   * the journal cannot emit, so the old fixture now asserts nothing about
+   * production — it would just measure how many duplicates an impossible frame
+   * produces. The convergence property it is named for is real and is what is
+   * asserted here, against the ids the server actually sends.
    */
   it("a live session and a cold reload of the same transcript agree", () => {
     const live = makeWrapper();
@@ -189,82 +215,96 @@ describe("#95 WP B — live timeline converges to the row sequence", () => {
       id: "webchannel-2",
       text: "You have three: alpha, beta, gamma.",
     });
-    deliver(live, history(...TWO_STEP_ROWS));
+    deliver(live, history(...JOURNAL_TWO_STEP_ROWS));
 
     const cold = makeWrapper();
-    deliver(cold, history(...TWO_STEP_ROWS));
+    deliver(cold, history(...JOURNAL_TWO_STEP_ROWS));
 
     expect(timeline(live)).toEqual(timeline(cold));
+    expect(live.getState().messages).toHaveLength(3);
+    expect(live.getState().messages.map((m) => m.id)).toEqual([
+      "wire-8f3a1c",
+      "webchannel-1",
+      "webchannel-2",
+    ]);
   });
 
   /**
-   * TIER 3, the fragile path. When the live and stored text differ, tier 2
-   * misses and the POSITIONAL anchor must carry the adoption.
-   */
-  /**
-   * ⚠️ AN EARLIER REVISION OF THIS NOTE CALLED TIER 3 "DEAD IN PRODUCTION SINCE
-   * #240 HALF 2". THAT WAS WRONG, and the two `#240 half 2` describes at the
-   * bottom of this file are the proof: an unauthored-placement row
-   * (`{agent, ""}`) reached tier 3 and OVERWROTE the next real answer. It is
-   * unreachable for that shape now only because the wrapper FILTERS those rows
-   * on arrival — a fix, not a property of the cutover.
+   * TIER-3 REMOVAL GUARD — the positional probe must not come back.
    *
-   * What IS true: this fixture's specific shape — a snapshot id differing from
-   * the live id AND stored text differing from live text — cannot arise from the
-   * journal, which stores the delivery-act id and the exact published text. So
-   * this test characterizes a branch that production no longer drives THIS WAY,
-   * while other rows can still reach it. Keep it while the tier exists.
+   * ⚠️ THIS TEST WAS `tier 3 adopts positionally when live text differs from
+   * stored text` AND IT ASSERTED THE OPPOSITE. It is inverted rather than
+   * deleted because the SHAPE is still the one that matters: an agent row that
+   * matches no local text, arriving right after a row that DID match, is exactly
+   * what the old probe would have grabbed. The probe adopted the next agent
+   * bubble on the theory that a reply follows the message it answers — which is
+   * a guess, and post-cutover a provably wrong one: if this device had rendered
+   * that answer, the row would carry its id and tier 1 would have matched.
+   * Missing tier 1 means there is no local counterpart, so the row must
+   * FRESH-INSERT and the local bubble must survive untouched.
    *
-   * Removing the tier is tracked at doc §5's non-scope list ("client text/위치
-   * 매칭 제거") and owned by **#302** — the #104/#227/#228 that list originally
-   * cited are all CLOSED. It is not a "§15.6 follow-up list", which does not
-   * exist; §15.6 in fact says the adoption block is removable TOGETHER with the
-   * cutover.
+   * The old fixture's premise is doubly dead: it needed live text ≠ stored text,
+   * which the journal cannot produce (it stores exactly what was published).
    */
-  it("tier 3 adopts positionally when live text differs from stored text", () => {
+  it("does not positionally adopt an agent row that matches no local text", () => {
     const w = makeWrapper();
     w.send("which agents are configured?");
+    // An answer THIS device rendered live.
     deliver(w, {
       type: "agent_message",
       id: "webchannel-1",
-      text: "LIVE reformatted answer",
-      assistantMessageIndex: 1,
+      text: "the answer this device rendered",
     });
 
+    // A snapshot whose user row matches (so the old probe would have had an
+    // anchor) followed by an agent row this device never rendered — a turn from
+    // another device, or one that landed while this tab was away.
     deliver(
       w,
       history(
-        { id: "core-1", role: "user", text: "which agents are configured?", ts: 1 },
-        { id: "core-2", role: "agent", text: "STORED raw answer", ts: 2 },
+        { id: "wire-8f3a1c", role: "user", text: "which agents are configured?", ts: 1 },
+        { id: "webchannel-7", role: "agent", text: "an answer this device never saw", ts: 2 },
       ),
     );
 
-    // One user bubble and one agent bubble — no duplicate — and the incoming
-    // stored text won.
-    expect(timeline(w)).toEqual(["user:which agents are configured?", "agent:STORED raw answer"]);
-    expect(w.getState().messages.map((m) => m.id)).toEqual(["core-1", "core-2"]);
-    expect(w.getState().messages[1]).not.toHaveProperty("assistantMessageIndex");
+    // Three bubbles: the adopted user echo, the inserted row, and the local
+    // answer INTACT. Under tier 3 this was two — `webchannel-1`'s text was
+    // overwritten with the incoming row's and a delivered answer was destroyed.
+    expect(w.getState().messages.map((m) => `${m.id}|${m.role}|${m.text}`)).toEqual([
+      "wire-8f3a1c|user|which agents are configured?",
+      "webchannel-7|agent|an answer this device never saw",
+      "webchannel-1|agent|the answer this device rendered",
+    ]);
   });
 
   /**
-   * TIER 3 WHERE THIS FIXTURE'S ROWS OUTNUMBER ITS SEEDED LIVE BUBBLES.
+   * WHERE THE SNAPSHOT'S ROWS OUTNUMBER THE SEEDED LIVE BUBBLES: this device
+   * rendered only the SECOND answer (the first frame was missed), and the
+   * snapshot carries both.
    *
-   * The seeded state contains ONE agent bubble while the snapshot carries TWO
-   * agent rows. This does not claim how a particular live/core execution reached
-   * either shape. It characterizes what the reducer does: convergence to the
-   * projection rewrites the live bubble's text to the first row and appends the
-   * second.
+   * Post-cutover the reducer no longer has to guess which is which: row 2's id
+   * is unknown here so it fresh-inserts, row 3's id IS the local bubble's so
+   * tier 1 matches it in place, and the cursor puts the insert ahead of it. The
+   * post-condition is the one this test is named for and it holds exactly — the
+   * final timeline equals the cold-reload timeline, nothing duplicated, nothing
+   * lost.
    *
-   * What matters for the contract is the post-condition, and it does hold: the
-   * final timeline equals the cold-reload timeline exactly — same boundaries,
-   * same order, nothing duplicated, nothing lost.
+   * ⚠️ RE-BASED ONTO JOURNAL IDS, AND IT MATTERS FOR THIS ONE SPECIFICALLY.
+   * Under `TWO_STEP_ROWS`' `core-` ids this was the minimal reproducer for the
+   * "displaced identity" defect (an adoption left the displaced id in `seen`, so
+   * the snapshot's own later row for it was dropped) — and it did NOT catch that
+   * defect, because pre-cutover ids never collided with local ones. It also
+   * absorbs the separate `keeps a row whose id was displaced by a tier-3
+   * adoption` case added while that defect was being fixed: same fixture, same
+   * property, and with agent adoption gone there is no longer a distinct
+   * mechanism to pin.
    */
   it("converges when incoming rows outnumber seeded live bubbles", () => {
     const w = makeWrapper();
     w.send("which agents are configured?");
     deliver(w, {
       type: "agent_message",
-      id: "webchannel-1",
+      id: "webchannel-2",
       text: "You have three: alpha, beta, gamma.",
     });
     expect(timeline(w)).toEqual([
@@ -272,19 +312,30 @@ describe("#95 WP B — live timeline converges to the row sequence", () => {
       "agent:You have three: alpha, beta, gamma.",
     ]);
 
-    deliver(w, history(...TWO_STEP_ROWS));
+    deliver(w, history(...JOURNAL_TWO_STEP_ROWS));
 
     const cold = makeWrapper();
-    deliver(cold, history(...TWO_STEP_ROWS));
+    deliver(cold, history(...JOURNAL_TWO_STEP_ROWS));
 
     expect(timeline(w)).toEqual(timeline(cold));
-    expect(w.getState().messages.map((m) => m.id)).toEqual(["core-1", "core-2", "core-3"]);
+    expect(w.getState().messages).toHaveLength(3);
+    expect(w.getState().messages.map((m) => m.id)).toEqual([
+      "wire-8f3a1c",
+      "webchannel-1",
+      "webchannel-2",
+    ]);
   });
 
   /**
-   * A `working:true` progress draft is never an adoption target — its live id
-   * must survive for the upcoming progress/final upserts. The snapshot row must
-   * therefore insert rather than steal the draft's identity.
+   * A `working:true` progress draft keeps its live id, so the upcoming
+   * progress/final upserts still land on it.
+   *
+   * ⚠️ THE MECHANISM CHANGED — this is now an OUTCOME guard. The draft used to
+   * be protected by an explicit `!m.working` clause in the adoption predicate;
+   * that predicate is user-only now, and `working` is an agent-bubble state, so
+   * a draft is out of reach because AGENT rows cannot adopt at all. The assertion
+   * is kept because the user-visible property is what matters and a future
+   * change could reintroduce the hazard by a different route.
    */
   it("never adopts onto a working progress draft", () => {
     const w = makeWrapper();
@@ -293,7 +344,7 @@ describe("#95 WP B — live timeline converges to the row sequence", () => {
     const draftBefore = w.getState().messages.find((m) => m.working === true);
     expect(draftBefore?.id).toBe("draft-1");
 
-    deliver(w, history({ id: "core-9", role: "agent", text: "Working…", ts: 9 }));
+    deliver(w, history({ id: "webchannel-9", role: "agent", text: "Working…", ts: 9 }));
 
     const draftAfter = w.getState().messages.find((m) => m.working === true);
     expect(draftAfter?.id).toBe("draft-1");
@@ -302,36 +353,35 @@ describe("#95 WP B — live timeline converges to the row sequence", () => {
 
 
 /**
- * #240 half 2 — THREE DATA-LOSS DEFECTS THE CUTOVER MADE REACHABLE.
+ * #240 half 2 — THE AGENT PATH NO LONGER ADOPTS. Tier 2 rejects agent rows and
+ * tier 3 is deleted.
  *
- * ⚠️ THESE ARE REGRESSIONS OF THE SERVER CHANGE, SURFACING IN CLIENT CODE THAT
- * WAS NOT EDITED. They were mis-scoped as "the client still works" during
- * review, on the reasoning that agent bubbles simply move from tier 3 to tier 1.
- * They do — and the id change that makes them do it is exactly what breaks these
- * paths: the snapshot's ids now live in the SAME namespace as local bubble ids.
+ * FOUR data-loss defects were found here in four consecutive review rounds of
+ * one PR, each patched by adding a rule and each rule failing to cover the next
+ * instance: (1) tier 1 matched without claiming its index; (2) an unauthored
+ * `{agent, ""}` placement row reached tier 3 and overwrote the next real answer;
+ * (3) `adoptAt` did not retire the id it displaced; (4) a history-HYDRATED agent
+ * bubble was itself adoptable, so an older page destroyed the newest answer.
  *
- * ⚠️ NOT EVERY TEST HERE IS PAIRED WITH A `core-`-ID CONTROL, and an earlier
- * revision of this docblock claimed they all were. A control needs a
- * DIFFERENTIAL — the same fixture converging under `core-` ids and losing a
- * message under journal ids — and that depends on WHICH pre-cutover fact was
- * blocking the defect:
- *   - tier-1 claim: blocked by `isLocalLiveId` rejecting the snapshot id, so the
- *     namespace swap IS the differential. Control present, directly below.
- *   - empty-agent filter: NO control is constructible. The filter keys on text
- *     and is id-agnostic, so a `core-P` empty row is dropped identically; what
- *     blocked it pre-cutover was that core's transcript never held an unauthored
- *     placement row at all, which no fixture can assert. Do not build one.
- *   - displaced-identity retirement: blocked by `seen` holding only local ids
- *     while snapshot agent ids were all `core-…`. A control IS constructible
- *     here; what these tests measure instead is the mutation (remove the two
- *     `delete`s in `adoptAt` and both go red), which is the stronger evidence.
+ * The tiers existed to GUESS a correspondence the cutover made unnecessary: the
+ * journal serves the delivery-act id and the live bubble carries that same id,
+ * so an agent row that misses tier 1 has NO local counterpart and every adoption
+ * of one overwrote a different message. The tests below pin the deletion in both
+ * directions the guessing used to go — by text (old tier 2) and by position
+ * (old tier 3) — plus the cross-frame case that produced defect (4).
+ *
+ * ⚠️ THE `core-`-ID CONTROLS THAT USED TO LIVE HERE ARE DELETED, not moved. They
+ * existed to show "the cutover is what changed the outcome" by running the same
+ * fixture under both id namespaces. With agent adoption gone, NEITHER namespace
+ * adopts, so a control has no differential left to demonstrate — and a `core-`
+ * agent id is a shape the journal cannot emit in the first place.
  */
-describe("#240 half 2 — journal ids make a tier-1 match a live adoption target", () => {
+describe("#240 half 2 — the agent path no longer adopts (tiers 2 and 3 deleted)", () => {
   it("keeps two identical agent answers as two bubbles", () => {
-    // The live bubble and snapshot row 1 share the delivery-act id, so row 1 is
-    // a tier-1 match. Row 2 carries the SAME TEXT under a different id. Without
-    // the tier-1 claim, row 2 adopts onto the already-matched bubble and one
-    // delivered answer disappears.
+    // Row 1 shares the delivery-act id with the live bubble → tier 1, in place.
+    // Row 2 carries the SAME TEXT under a different id → no local counterpart,
+    // so it fresh-inserts after it. Under tier 2 it adopted onto the bubble row
+    // 1 had just identified and one delivered answer disappeared (defect 1).
     const w = makeWrapper();
     deliver(w, { type: "agent_message", id: "webchannel-1", text: "ok" });
     deliver(
@@ -348,72 +398,24 @@ describe("#240 half 2 — journal ids make a tier-1 match a live adoption target
     ]);
   });
 
-  it("CONTROL: the same shape with pre-cutover core ids was already correct", () => {
-    // `core-…` fails `isLocalLiveId`, so a tier-1-matched bubble never entered
-    // the tier-2 pool and the defect could not occur. This is what "the cutover
-    // is what changed the outcome" means, stated as a test rather than a claim.
-    const w = makeWrapper();
-    deliver(w, { type: "agent_message", id: "webchannel-1", text: "ok" });
-    deliver(
-      w,
-      history(
-        { id: "core-1", role: "agent", text: "ok", ts: 1 },
-        { id: "core-2", role: "agent", text: "ok", ts: 2 },
-      ),
-    );
-
-    expect(timeline(w)).toEqual(["agent:ok", "agent:ok"]);
-  });
-
-  /**
-   * THE MIRROR DEFECT: an adoption DISPLACES an id, and the displaced id stayed
-   * in `seen`/`localIndexById`. Post-cutover the snapshot carries that very id
-   * as a later row, so the row tier-1 "matched" a bubble it no longer occupied
-   * and was silently discarded. Both directions below lose a delivered answer
-   * without the two `delete`s in `adoptAt`.
-   */
-  it("keeps a row whose id was displaced by a tier-3 adoption", () => {
-    // Live holds the SECOND answer only (the first frame was missed). Row 2
-    // tier-3 adopts onto that bubble, displacing `webchannel-2`; row 3 then
-    // carries `webchannel-2` itself.
-    const rows: Row[] = [
-      { id: "wire-8f3a1c", role: "user", text: "which agents are configured?", ts: 1 },
-      { id: "webchannel-1", role: "agent", text: "Let me check that.", ts: 2 },
-      { id: "webchannel-2", role: "agent", text: "You have three: alpha, beta, gamma.", ts: 3 },
-    ];
-
-    const w = makeWrapper();
-    w.send("which agents are configured?");
-    deliver(w, {
-      type: "agent_message",
-      id: "webchannel-2",
-      text: "You have three: alpha, beta, gamma.",
-    });
-    deliver(w, history(...rows));
-
-    const cold = makeWrapper();
-    deliver(cold, history(...rows));
-
-    expect(timeline(w)).toEqual(timeline(cold));
-    expect(w.getState().messages.map((m) => m.id)).toEqual([
-      "wire-8f3a1c",
-      "webchannel-1",
-      "webchannel-2",
-    ]);
-  });
-
-  it("keeps a row whose id was displaced by a tier-2 adoption", () => {
-    // Live holds the LATER of two identical answers. Row 1 tier-2 adopts onto
-    // it (text matches), displacing `webchannel-2` — which row 2 then carries.
+  it("does not adopt an agent row onto a same-text local bubble with a different id", () => {
+    // TIER-2 REMOVAL GUARD, deliberately MINIMAL: one local answer, one snapshot
+    // row, identical text, different ids. Text equality is not identity — these
+    // are two distinct utterances, and a row that matches no id has no local
+    // counterpart, so it must insert rather than rename the local bubble.
+    //
+    // Kept to a single row on purpose. The obvious richer fixture (this device
+    // holds the LATER of two identical answers, the snapshot carries both) is
+    // ALREADY green on the pre-deletion code — the second row tier-1 matches and
+    // the first one's adoption is invisible in the final array — so it would
+    // have looked like a guard while discriminating nothing.
+    //
+    // (Repurposed from `keeps a row whose id was displaced by a tier-2
+    // adoption`. That name described the defect-3 hazard, which needed an
+    // adoption to displace an AGENT id — impossible now.)
     const w = makeWrapper();
     deliver(w, { type: "agent_message", id: "webchannel-2", text: "ok" });
-    deliver(
-      w,
-      history(
-        { id: "webchannel-1", role: "agent", text: "ok", ts: 1 },
-        { id: "webchannel-2", role: "agent", text: "ok", ts: 2 },
-      ),
-    );
+    deliver(w, history({ id: "webchannel-1", role: "agent", text: "ok", ts: 1 }));
 
     expect(w.getState().messages.map((m) => `${m.id}|${m.role}|${m.text}`)).toEqual([
       "webchannel-1|agent|ok",
@@ -421,9 +423,58 @@ describe("#240 half 2 — journal ids make a tier-1 match a live adoption target
     ]);
   });
 
+  /**
+   * DEFECT (4), THE CROSS-FRAME CASE — the one no earlier test covered, and the
+   * reason this became a deletion instead of a fifth rule.
+   *
+   * Frame 1 is the register snapshot; the bubbles it HYDRATES carry
+   * `webchannel-` ids, exactly like live ones. The user then pages older
+   * (`loadHistory({before, limit})`, as `demo/web/src/widget.ts` does) and frame
+   * 2 is a strictly-older page whose answer happens to read the same — "OK" is
+   * the obvious collision, but any repeated phrasing does it.
+   *
+   * The old predicate was named `isLocalLiveId` and tested
+   * `id.startsWith("webchannel-")`, so it could not tell a hydrated bubble from
+   * a live one. The older page's row therefore adopted onto the NEWEST answer
+   * and destroyed it. Correct behaviour is four bubbles: two turns, both intact,
+   * the older pair prepended.
+   */
+  it("an older page does not adopt onto bubbles a previous snapshot hydrated", () => {
+    const w = makeWrapper();
+    deliver(
+      w,
+      history(
+        { id: "wire-new", role: "user", text: "again?", ts: 10 },
+        { id: "webchannel-new", role: "agent", text: "OK", ts: 11 },
+      ),
+    );
+    expect(w.getState().messages).toHaveLength(2);
+
+    // What the widget's "load older" button does: the oldest non-local id as the
+    // cursor. The request itself is staged (no socket here); the page arrives as
+    // the frame below.
+    const oldest = w.getState().messages.find((m) => !m.working && !m.pending && !m.retracted);
+    w.loadHistory({ before: oldest?.id, limit: 20 });
+
+    deliver(
+      w,
+      history(
+        { id: "wire-old", role: "user", text: "ready?", ts: 1 },
+        { id: "webchannel-old", role: "agent", text: "OK", ts: 2 },
+      ),
+    );
+
+    expect(w.getState().messages.map((m) => `${m.id}|${m.role}|${m.text}`)).toEqual([
+      "wire-old|user|ready?",
+      "webchannel-old|agent|OK",
+      "wire-new|user|again?",
+      "webchannel-new|agent|OK",
+    ]);
+  });
+
   it("still dedups a repeated snapshot of one bubble (no over-claiming)", () => {
-    // The claim must not break ordinary idempotence: re-delivering the same
-    // frame twice is still a no-op.
+    // The tier-1 claim must not break ordinary idempotence: re-delivering the
+    // same frame twice is still a no-op.
     const w = makeWrapper();
     deliver(w, { type: "agent_message", id: "webchannel-1", text: "ok" });
     const frame = history({ id: "webchannel-1", role: "agent", text: "ok", ts: 1 });
@@ -436,57 +487,96 @@ describe("#240 half 2 — journal ids make a tier-1 match a live adoption target
   });
 });
 
-describe("#240 half 2 — a phantom empty agent row must never reach tier 3", () => {
-  it("does not let an unauthored placement overwrite the next real answer", () => {
-    // `webchannel-P` is a lane that got a `progress` and never any durable text
-    // (aborted turn / dropped connection). Live drops it via `dropSpentDrafts`;
-    // the journal cannot, because that rule keys on the client-local `draftOnly`
-    // flag. Un-filtered it matches no text, falls to tier 3, and overwrites the
-    // real answer that follows it.
+/**
+ * #240 half 2 — THE USER PATH STILL ADOPTS, AND MUST.
+ *
+ * Tier 2 is retained for user rows only. This is an N5 text inference the north
+ * star forbids, kept because the ids do not agree yet: the client renders its
+ * echo under `mintLocalBubbleId("u")` → `u-<n>` and carries the wire id only as
+ * the durable event's `turnId`, while the plugin journals the WIRE id. So a user
+ * row legitimately misses tier 1, and deleting tier 2 for users would
+ * fresh-insert every user row of every snapshot — duplicating every message this
+ * device has sent.
+ *
+ * The residual is owned by **#302**, which stays OPEN, and is unblocked only by
+ * **#243**. These tests are what makes the retention safe to ship in the
+ * meantime; they must keep passing until #243 changes the id story.
+ */
+describe("#240 half 2 — the user path still converges (tier 2 retained, #302/#243)", () => {
+  it("adopts the wire id onto the local echo — one bubble, not two", () => {
     const w = makeWrapper();
-    w.send("hi");
-    deliver(w, { type: "agent_message", id: "webchannel-2", text: "real answer" });
-    const userId = w.getState().messages[0].id;
+    w.send("hello there");
+    const localId = w.getState().messages[0].id;
+    expect(localId.startsWith("u-")).toBe(true);
+
+    // A reconnect snapshot carries that message under the id the journal holds:
+    // the inbound WIRE id, which is a random token and never the `u-<n>` echo.
+    deliver(w, history({ id: "wire-3f9c22", role: "user", text: "hello there", ts: 1 }));
+
+    expect(w.getState().messages).toHaveLength(1);
+    expect(w.getState().messages[0].id).toBe("wire-3f9c22");
+    expect(w.getState().messages[0].text).toBe("hello there");
+  });
+
+  it("adopts two identical user messages onto two distinct echoes", () => {
+    // Where a broken pool duplicates: same text twice. Each snapshot row must
+    // take its own local echo, in order — not both land on the first.
+    const w = makeWrapper();
+    w.send("ping");
+    w.send("ping");
+    expect(w.getState().messages).toHaveLength(2);
 
     deliver(
       w,
       history(
-        { id: userId, role: "user", text: "hi", ts: 1 },
+        { id: "wire-aaa111", role: "user", text: "ping", ts: 1 },
+        { id: "wire-bbb222", role: "user", text: "ping", ts: 2 },
+      ),
+    );
+
+    expect(w.getState().messages).toHaveLength(2);
+    expect(w.getState().messages.map((m) => `${m.id}|${m.text}`)).toEqual([
+      "wire-aaa111|ping",
+      "wire-bbb222|ping",
+    ]);
+  });
+});
+
+/**
+ * #240 half 2 — AN UNAUTHORED PLACEMENT ROW IS DROPPED ON ARRIVAL.
+ *
+ * ⚠️ RENAMED FROM "…must never reach tier 3", WHICH IS NO LONGER THE REASON.
+ * The filter was originally defended as the only thing keeping tier 3
+ * unreachable for this shape; tier 3 is deleted, so an unfiltered phantom row
+ * would now merely fresh-insert a blank bubble. The filter stays for the reason
+ * that always mattered and is simpler: LIVE renders nothing for a lane that
+ * never authored durable text (`dropSpentDrafts`), so history must not render a
+ * phantom empty bubble either, or the two diverge — N8, from the one path whose
+ * contract is that they agree.
+ */
+describe("#240 half 2 — an unauthored placement row is dropped on arrival", () => {
+  it("drops the placement row and leaves the real answer that follows it intact", () => {
+    // `webchannel-P` is a lane that got a `progress` and never any durable text
+    // (aborted turn / dropped connection). Live drops it via `dropSpentDrafts`;
+    // the journal cannot, because that rule keys on the client-local `draftOnly`
+    // flag, which §15.9 deliberately never journals.
+    const w = makeWrapper();
+    w.send("hi");
+    deliver(w, { type: "agent_message", id: "webchannel-2", text: "real answer" });
+
+    deliver(
+      w,
+      history(
+        { id: "wire-77aa10", role: "user", text: "hi", ts: 1 },
         { id: "webchannel-P", role: "agent", text: "", ts: 2 },
         { id: "webchannel-2", role: "agent", text: "real answer", ts: 3 },
       ),
     );
 
     expect(w.getState().messages.map((m) => `${m.id}|${m.role}|${m.text}`)).toEqual([
-      `${userId}|user|hi`,
+      "wire-77aa10|user|hi",
       "webchannel-2|agent|real answer",
     ]);
-  });
-
-  it("a real answer under a pre-cutover core id still adopts normally", () => {
-    // The pre-cutover input shape, for contrast: core's transcript never held an
-    // unauthored placement, so there is no empty row here at all.
-    //
-    // ⚠️ THIS IS NOT A CONTROL FOR THE FILTER, and an earlier revision billed it
-    // as one ("pins that the filter, not the id namespace, is what protects us")
-    // — false, since the fixture contains no empty row to filter. No such
-    // control is constructible: the filter is id-agnostic, so a `core-`-id empty
-    // row is dropped exactly like a `webchannel-` one and there is no
-    // differential to assert. Do not try to build one.
-    const w = makeWrapper();
-    w.send("hi");
-    deliver(w, { type: "agent_message", id: "webchannel-2", text: "real answer" });
-    const userId = w.getState().messages[0].id;
-
-    deliver(
-      w,
-      history(
-        { id: userId, role: "user", text: "hi", ts: 1 },
-        { id: "core-2", role: "agent", text: "real answer", ts: 2 },
-      ),
-    );
-
-    expect(timeline(w)).toEqual(["user:hi", "agent:real answer"]);
   });
 
   it("drops a phantom row on COLD hydration too, rather than rendering a blank", () => {

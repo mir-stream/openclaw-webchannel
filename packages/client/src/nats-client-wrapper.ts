@@ -2375,13 +2375,15 @@ export class WebChannelNATSClient {
          * the server CANNOT drop it: the rule that hides it live keys on
          * `draftOnly`, a client-local flag §15.9 deliberately never journals.
          *
-         * MEASURED DAMAGE WITHOUT THIS FILTER, and it is not cosmetic: such a
-         * row matches no local text, so tier 2 misses and TIER 3 fires — it
-         * probes `anchor + 1`, finds the next real agent bubble, and `adoptAt`
-         * overwrites it with `{id: P, text: ""}`. A delivered answer's text is
-         * destroyed (N10), and the row that actually carried it is then skipped
-         * as a tier-1 hit. Live renders nothing there; history rendered nothing
-         * AND ate the next answer.
+         * ⚠️ WHY IT STILL EXISTS NOW THAT AGENT ROWS CANNOT ADOPT. It was added
+         * because the row DESTROYED a delivered answer: matching no local text it
+         * fell through to the positional probe, which took the next real agent
+         * bubble and overwrote it with `{id: P, text: ""}` (N10). That probe is
+         * deleted, so the row can no longer damage anything — it would simply
+         * fresh-insert. The filter is retained for the ORIGINAL, smaller reason,
+         * which the damage had overshadowed: live renders nothing for such a
+         * lane, so a history that renders an empty bubble diverges from live for
+         * no benefit (N8). Deriving the row away server-side is #251/#264.
          *
          * ⚠️ THIS IS NOT A NEW RULE — IT IS THE ONE THIS CLIENT ALREADY APPLIES
          * LIVE, moved to the only other door the same lane can arrive through.
@@ -2437,85 +2439,43 @@ export class WebChannelNATSClient {
         // state under LOCAL id namespaces, so plain id-dedup could duplicate
         // them.
         //
-        // ⚠️ WHERE THE SNAPSHOT'S IDS COME FROM CHANGED IN #240 HALF 2, AND THIS
-        // BLOCK'S ORIGINAL PREMISE IS NOW FALSE. It used to read "the snapshot
-        // carries the core transcript's canonical ids" and, for agent messages,
-        // "the core transcript NEVER stores that platform id, so history ids can
-        // never match live ids". The plugin no longer reads core's transcript at
-        // all: history is projected from its OWN delivery journal, whose ids ARE
-        // the ids minted at the delivery act — the same `webchannel-…` values the
-        // live frames carried. So:
-        //   - AGENT replies → snapshot id == the live id. TIER 1 MATCHES. The
-        //     "can never match" sentence was the justification for tier 3, and it
-        //     no longer holds;
-        //   - USER sends → the local echo id is `u-<n>` while the journal stores
-        //     the inbound WIRE id, so tier 1 misses and TIER 2 (text+role) adopts
-        //     — exactly as it did against core ids. Unchanged.
-        //   - ⚠️ RESIDUAL, unfixed here and true PRE-cutover too: an id-less
-        //     frame from a legacy plugin build gets a client-local `a-<n>` bubble
-        //     and NO journal row at all, so no snapshot row can ever tier-1 claim
-        //     it and it stays adoptable by any same-text row indefinitely.
+        // ⚠️ #240 HALF 2 CHANGED WHERE THE SNAPSHOT'S IDS COME FROM, AND THE
+        // AGENT-SIDE GUESSING TIERS WERE DELETED BECAUSE OF IT. History is no
+        // longer core's transcript; it is a projection of the plugin's own
+        // delivery journal, whose ids ARE the ids minted at the delivery act —
+        // the same `webchannel-…` values the live frames carried. So:
+        //   - AGENT rows: if this device rendered the answer, its bubble carries
+        //     that id and TIER 1 matches. Therefore an agent row that MISSES tier
+        //     1 has no local counterpart, and any text- or position-based
+        //     adoption of one is guaranteed to overwrite a different message.
+        //     Tiers 2 and 3 are closed to agent rows for that reason.
+        //   - USER rows: the local echo is `u-<n>` (`mintLocalBubbleId`) while
+        //     the journal stores the inbound WIRE id, so a user row legitimately
+        //     misses tier 1 and TIER 2 is how it is recovered. Removing tier 2
+        //     here would fresh-insert every user row on every snapshot and
+        //     duplicate everything this device sent. **#302** owns removing it,
+        //     and is blocked on **#243** giving a user message one shared id.
         //
-        // ⚠️ TIER 3 IS **NOT** DEAD, AND AN EARLIER REVISION OF THIS COMMENT SAID
-        // IT WAS. That claim was wrong twice over and it is what let two
-        // data-loss defects through review, so it is corrected rather than
-        // softened:
-        //  - the unauthored-placement row (`{agent, ""}`) matches no local text,
-        //    so it reached tier 3 and OVERWROTE the next real answer. It is now
-        //    filtered out on arrival, above — that filter is the only reason
-        //    tier 3 is unreachable for that shape;
-        //  - agent bubbles do move to tier 1, but a tier-1 match did not CLAIM
-        //    its local bubble, so a later same-text row tier-2 adopted onto it
-        //    and destroyed a delivered answer. Fixed below.
-        //  - and a THIRD, found only after the two above were fixed: an adoption
-        //    DISPLACES an id, and `adoptAt` left it in `seen`/`localIndexById`,
-        //    so the snapshot's own later row for that id tier-1 "matched" a
-        //    bubble it no longer occupied and was dropped. Reached through tier 3
-        //    AND through tier 2. Fixed in `adoptAt`.
-        // All three are pinned in `nats-client-wrapper-hydration.test.ts`. Not
-        // all three carry a `core-`-id control, and that file's header says per
-        // defect why — one of the pre-cutover blockers admits no differential at
-        // all.
+        // ⚠️ THE HONEST COST, STATED WHERE IT IS PAID: text matching is the
+        // ordinal/text inference NOT-list N5 forbids, and it still runs on the
+        // user path. That is not an oversight — it is unremovable until #243.
         //
-        // ⚠️ AND "REMOVING THIS BLOCK IS SEPARATE WORK" WAS ALSO WRONG. Doc
-        // §15.6 says the opposite — with no legacy core rows the 3-tier
-        // text/position adoption 「도 함께 제거 가능」, removable TOGETHER with
-        // the cutover — and the follow-up item lives in §5's non-scope list
-        // ("client text/위치 매칭 제거", owned by **#302** — the #104/#227/#228
-        // that list originally cited were all CLOSED at the v6 board rebuild),
-        // not in a "§15.6 follow-up list", which does not exist. What is true is
-        // narrower: the
-        // block is RETAINED because its defect history is long (#16, P1-9 §6.3)
-        // and a destructive server cutover is a bad commit to bury a client
-        // rewrite in — but part of it stopped being optional the moment the
-        // journal began supplying these ids, and that part is fixed in this
-        // diff.
+        // ⚠️ WHY DELETION RATHER THAN MORE RULES. Four data-loss defects were
+        // found in this block across four consecutive review rounds, each fixed
+        // by adding a rule, and each new rule failed to cover the next instance:
+        // a tier-1 match that did not claim its bubble; the unauthored placement
+        // row firing the positional probe; `adoptAt` not retiring the id it
+        // displaced; and a hydrated bubble being treated as live because the old
+        // `isLocalLiveId` was a bare `webchannel-` prefix test. All four were on
+        // the agent path. Do not reintroduce a tier here to "restore coverage" —
+        // the coverage it restores is the coverage that lost the messages.
         //
-        // Matching happens in three tiers, in snapshot order:
-        //   1. id — a message whose canonical id we already hold (a prior
-        //      snapshot placed or adopted it) is a no-op. Post-#240 this is also
-        //      where every AGENT bubble matches;
-        //   2. exact text+role — adopt the server id onto the first
-        //      text-matching local bubble (covers user echoes always; covers
-        //      agent replies only when live text == stored text — post-#240 they
-        //      are byte-equal by construction, but tier 1 has already claimed
-        //      them);
-        //   3. POSITIONAL (agent only) — ⚠️ STILL REACHABLE; see above. Its
-        //      ORIGINAL premise is gone (openclaw's live reply text was not
-        //      byte-equal to the stored transcript text, because core stripped
-        //      metadata from live replies while storing raw model output; the
-        //      journal stores exactly what was published, and tier 1 now claims
-        //      agent bubbles by id first). What still reaches here is any row
-        //      whose text matches no local bubble — and the empty-text placement
-        //      row, the one shape that did so routinely, is filtered on arrival
-        //      BECAUSE it reached this tier and ate the next answer. Do not
-        //      treat this branch as dead code. Structure saves us: an
-        //      agent reply in the snapshot immediately FOLLOWS the message it
-        //      answered, and that predecessor matched some local index i via
-        //      tier 1/2 — so if the local message at i+1 is a live-id agent
-        //      bubble, it IS this reply's live rendering; adopt onto it (and
-        //      keep the canonical stored text). Chains across multi-frame
-        //      replies because each adoption advances the anchor.
+        // Matching happens in two tiers, in snapshot order:
+        //   1. id — a message whose canonical id we already hold is a no-op.
+        //      This is where every AGENT row either matches or falls through to
+        //      a fresh insert;
+        //   2. exact text+role — USER ROWS ONLY. Adopt the server id onto the
+        //      first text-matching local echo.
         // PLACEMENT of the unmatched (fresh) messages is ORDERED, not a blanket
         // prepend (#16). We carry an insertion CURSOR = the index into `next`
         // before which the next fresh message lands; every match/adoption walks
@@ -2533,16 +2493,26 @@ export class WebChannelNATSClient {
         // device's server id onto this device's bubble — the ids swap between
         // the two bubbles, but the bubble COUNT stays exactly right and every
         // later snapshot still dedups, so nothing duplicates or disappears.
-        // P1-9 §6.3: a held (pending) or /stop-retracted user bubble is
-        // LOCAL-ONLY (never on the wire, never in the transcript). It must NEVER
-        // be an adoption target — a snapshot row with identical text (the same
-        // text sent from another device) would otherwise steal its server id onto
-        // our UNSENT bubble, and the later release would run/duplicate it. Exclude
-        // both from the tier-2 text-match pool.
-        const isLocalLiveId = (m: ChatMessage): boolean =>
-          m.role === "user"
-            ? m.id.startsWith("u-") && m.pending !== true && m.retracted !== true
-            : !m.working && (m.id.startsWith("a-") || m.id.startsWith("webchannel-"));
+        // ⚠️ USER ROWS ONLY — the agent branch of this predicate was DELETED, and
+        // its NAME is why. It used to be `isLocalLiveId`, and it read
+        // `!m.working && (id.startsWith("a-") || id.startsWith("webchannel-"))`.
+        // Post-cutover a history-HYDRATED agent bubble also carries
+        // `webchannel-`, so the prefix stopped discriminating "rendered live on
+        // this device" from "handed to us by the server" — and an older page
+        // then adopted onto a bubble a previous snapshot had hydrated, destroying
+        // the newer answer. The predicate is now named for what it actually
+        // tests.
+        //
+        // P1-9 §6.3, still load-bearing: a held (pending) or /stop-retracted user
+        // bubble is LOCAL-ONLY (never on the wire, never in the journal). It must
+        // NEVER be an adoption target — a snapshot row with identical text (the
+        // same text sent from another device) would otherwise steal its server id
+        // onto our UNSENT bubble, and the later release would run/duplicate it.
+        const isAdoptableUserEcho = (m: ChatMessage): boolean =>
+          m.role === "user" &&
+          m.id.startsWith("u-") &&
+          m.pending !== true &&
+          m.retracted !== true;
         const adoptKey = (role: string, text: string): string => `${role} ${text}`;
 
         const next = existing.slice();
@@ -2551,7 +2521,7 @@ export class WebChannelNATSClient {
         const claimed = new Set<number>();
         const adoptable = new Map<string, number[]>();
         next.forEach((m, i) => {
-          if ((m.role === "user" || m.role === "agent") && isLocalLiveId(m)) {
+          if (isAdoptableUserEcho(m)) {
             const key = adoptKey(m.role, m.text);
             const idxs = adoptable.get(key) ?? [];
             idxs.push(i);
@@ -2570,8 +2540,6 @@ export class WebChannelNATSClient {
          * cursor keep their snapshot order (appended to the same array).
          */
         const inserts = new Map<number, ChatMessage[]>();
-        /** Local index the PREVIOUS snapshot message resolved to (tier-3 anchor). */
-        let anchor: number | null = null;
         /**
          * Index into `next` before which the NEXT fresh message is inserted.
          * Advances to `matchedIndex + 1` past every matched (tier 1) or adopted
@@ -2581,13 +2549,19 @@ export class WebChannelNATSClient {
         let cursor = 0;
 
         const adoptAt = (idx: number, m: { id: string; text: string; ts?: number }): void => {
-          // INVARIANT: `seen` and `localIndexById` describe `next` EXACTLY.
+          // INVARIANT: `seen` and `localIndexById` describe `next` exactly.
           // `adoptAt` is the only thing that mutates `next` inside the loop, so
-          // it is the only place that can break them — the displaced identity
-          // is no longer anywhere in `next`. Post-#240-half-2 a stale entry is
-          // reachable rather than academic, because the snapshot carries the
-          // very id being displaced as its own later row; that row would then
-          // tier-1 "match" a bubble it no longer occupies and be dropped (N10).
+          // it is the only place that can break them.
+          //
+          // ⚠️ THE REACHABLE TRIGGER IS GONE and the earlier version of this
+          // comment claiming "MEASURED DATA LOSS WITHOUT THIS LINE" no longer
+          // describes this tree. It was true while AGENT rows could adopt: the
+          // snapshot carried the very id being displaced as its own later row,
+          // which then tier-1 "matched" a bubble it no longer occupied and was
+          // dropped. Only user echoes adopt now, and the sole id a user adoption
+          // can displace is a local `u-<n>` that no snapshot row ever carries.
+          // Kept anyway: two lines that keep the bookkeeping unconditionally true
+          // beat a live premise about what ids can appear.
           const displacedId = next[idx].id;
           // Keep the canonical stored text on adoption, so this device
           // converges to exactly what a reloading device would render. The
@@ -2607,7 +2581,6 @@ export class WebChannelNATSClient {
           claimed.add(idx);
           localIndexById.set(m.id, idx);
           adopted = true;
-          anchor = idx;
           cursor = idx + 1;
         };
 
@@ -2618,7 +2591,6 @@ export class WebChannelNATSClient {
           if (typeof m.text !== "string") continue;
           if (seen.has(m.id)) {
             const li = localIndexById.get(m.id);
-            anchor = li ?? null;
             // Tier-1 match: walk the cursor past this already-held message so
             // later fresh messages insert after it. An id we can't locate
             // locally (should not happen — `seen` is seeded from `next`) leaves
@@ -2626,21 +2598,12 @@ export class WebChannelNATSClient {
             if (li !== undefined) {
               cursor = li + 1;
               // ⚠️ CLAIM IT. A bubble already identified BY ID must not stay a
-              // later row's tier-2 adoption target.
-              //
-              // MEASURED DATA LOSS WITHOUT THIS LINE: live holds
-              // `webchannel-1 "ok"`; a snapshot carries `webchannel-1 "ok"` then
-              // `webchannel-2 "ok"`. Row 1 matches here at tier 1 but never
-              // claims index 0, so index 0 is still in `adoptable` under
-              // `agent ok` — row 2 then tier-2 adopts ONTO IT and overwrites it.
-              // Two delivered answers render as one bubble (N10).
-              //
-              // ⚠️ AND THIS ONLY BECAME REACHABLE AT #240 HALF 2. Pre-cutover
-              // history ids were core's `core-…`, which `isLocalLiveId` rejects,
-              // so a tier-1-matched bubble was never in the pool to begin with.
-              // The journal serves the delivery-act id — the SAME `webchannel-…`
-              // the live frame carried — so now it is. The paired `core-`-id
-              // control in the hydration tests pins exactly that difference.
+              // later row's tier-2 adoption target. Like the retirement in
+              // `adoptAt`, this is now bookkeeping rather than a live fix — the
+              // pool holds only unadopted `u-<n>` echoes, which cannot be
+              // tier-1 matched (the journal never serves that id). The measured
+              // loss it was added for was on the AGENT path, which no longer
+              // adopts at all.
               //
               // `claimed` alone is sufficient: tier 2 shifts claimed indices off
               // the front of each pool before using one, so this entry is purged
@@ -2651,39 +2614,17 @@ export class WebChannelNATSClient {
           }
 
           seen.add(m.id);
-          // Tier 2: exact text+role.
-          const idxs = adoptable.get(adoptKey(m.role, m.text));
-          while (idxs && idxs.length > 0 && claimed.has(idxs[0])) idxs.shift();
-          if (idxs && idxs.length > 0) {
-            adoptAt(idxs.shift()!, m);
-            continue;
-          }
-          // Tier 3: positional (agent replies whose live text was reformatted).
-          if (m.role === "agent" && anchor !== null) {
-            // P1-9 §6.3: a held (pending) or retracted user chip is local-only
-            // and sits BETWEEN the anchor and the agent reply it delayed
-            // (`[u2, h3(pending), A]`). The probe was hard-coded to `anchor + 1`,
-            // which would land on the chip (role user) and miss `A` → the
-            // snapshot row fresh-inserts → duplicate agent bubble. Skip past
-            // pending/retracted bubbles (they can never correspond to a snapshot
-            // row) and probe the first NON-local candidate after the anchor.
-            // CURSOR MECHANICS ARE UNTOUCHED — fresh rows still insert at the
-            // plain `cursor` (before a held chip is chronologically correct;
-            // anything the snapshot carries predates the unpublished chip).
-            let cand = anchor + 1;
-            while (
-              cand < next.length &&
-              (next[cand].pending === true || next[cand].retracted === true)
-            ) {
-              cand++;
-            }
-            if (
-              cand < next.length &&
-              !claimed.has(cand) &&
-              next[cand].role === "agent" &&
-              isLocalLiveId(next[cand])
-            ) {
-              adoptAt(cand, m);
+          // Tier 2: exact text+role — ⚠️ USER ROWS ONLY, and the role test is
+          // EXPLICIT rather than left to the pool being empty for agent keys.
+          // Implicit-by-empty-pool is exactly the kind of coupling that produced
+          // the four defects this deletion closes: it reads as "agent rows may
+          // adopt, there just happens to be nothing to adopt onto", which is one
+          // pool-seeding edit away from being wrong again.
+          if (m.role === "user") {
+            const idxs = adoptable.get(adoptKey(m.role, m.text));
+            while (idxs && idxs.length > 0 && claimed.has(idxs[0])) idxs.shift();
+            if (idxs && idxs.length > 0) {
+              adoptAt(idxs.shift()!, m);
               continue;
             }
           }
@@ -2696,7 +2637,6 @@ export class WebChannelNATSClient {
             working: false,
           });
           inserts.set(cursor, atCursor);
-          anchor = null;
         }
 
         if (inserts.size === 0 && !adopted) return;
