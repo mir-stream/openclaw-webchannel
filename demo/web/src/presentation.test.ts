@@ -169,50 +169,87 @@ describe("activityHint (#96 — the transcript-tail activity line)", () => {
 });
 
 describe("orderConversationPresentation", () => {
-  it("keeps two turns' reasoning between each user and answer", () => {
-    const ordered = orderConversationPresentation(
-      [
-        { id: "u1", role: "user", text: "one", turnId: "t1" },
-        { id: "a1", role: "agent", text: "answer one", turnId: "t1" },
-        { id: "u2", role: "user", text: "two", turnId: "t2" },
-        { id: "a2", role: "agent", text: "answer two", turnId: "t2" },
-      ],
-      [
-        { id: "r1", turnId: "t1", text: "reason one" },
-        { id: "r2", turnId: "t2", text: "reason two" },
-      ],
-    );
+  /**
+   * ⚠️ #242 half 2 CHANGED WHAT THIS FUNCTION IS FOR, and these cases were
+   * rewritten rather than adapted. The old suite fed a SEPARATE reasoning array
+   * and asserted that each burst was placed after its user anchor by `turnId` —
+   * including a "multi-device orphan" case that placed a burst whose turn had no
+   * local anchor at the live tail. All of that was the renderer holding a second
+   * opinion about ordering. Reasoning is a durable message now: its position is
+   * the array's, so the property to pin is that this function PRESERVES it.
+   */
+  it("emits reasoning exactly where the transcript holds it", () => {
+    const ordered = orderConversationPresentation([
+      { id: "u1", role: "user", text: "one", turnId: "t1" },
+      { kind: "reasoning", id: "r1", turnId: "t1", text: "reason one" },
+      { id: "a1", role: "agent", text: "answer one", turnId: "t1" },
+      { id: "u2", role: "user", text: "two", turnId: "t2" },
+      { kind: "reasoning", id: "r2", turnId: "t2", text: "reason two" },
+      { id: "a2", role: "agent", text: "answer two", turnId: "t2" },
+    ]);
     expect(ordered.map((item) => item.value.id)).toEqual(["u1", "r1", "a1", "u2", "r2", "a2"]);
-  });
-
-  it("places a multi-device orphan before its correlated answer, or at the live tail", () => {
-    expect(orderConversationPresentation(
-      [{ id: "a", role: "agent", text: "answer", turnId: "remote" }],
-      [{ id: "r", turnId: "remote", text: "reason" }],
-    ).map((item) => item.value.id)).toEqual(["r", "a"]);
-
-    expect(orderConversationPresentation(
-      [{ id: "old", role: "agent", text: "old" }],
-      [{ id: "r", turnId: "live", text: "reason" }],
-    ).map((item) => item.value.id)).toEqual(["old", "r"]);
-  });
-
-  it("#97 places tool activity after reasoning, before its turn's answer", () => {
-    const ordered = orderConversationPresentation(
-      [
-        { id: "u1", role: "user", text: "one", turnId: "t1" },
-        { id: "a1", role: "agent", text: "answer one", turnId: "t1" },
-      ],
-      [{ id: "r1", turnId: "t1", text: "reason one" }],
-      [{ id: "tc1", turnId: "t1", name: "bash" }],
-    );
     expect(ordered.map((item) => item.kind)).toEqual([
       "message",
       "reasoning",
-      "tool_activity",
+      "message",
+      "message",
+      "reasoning",
       "message",
     ]);
-    expect(ordered.map((item) => item.value.id)).toEqual(["u1", "r1", "tc1", "a1"]);
+  });
+
+  it("does NOT re-anchor a block by turnId — the stream order wins", () => {
+    // The case the deleted `turnId` grouping would have got WRONG: a burst
+    // journaled AFTER its turn's answer (a burst closed by the turn teardown —
+    // `journal-history.ts`'s GAP 2b) belongs where the stream put it. The old
+    // implementation would have hoisted it back above `a1`, inventing an order
+    // neither the live client nor a replay produces.
+    const ordered = orderConversationPresentation([
+      { id: "u1", role: "user", text: "one", turnId: "t1" },
+      { id: "a1", role: "agent", text: "answer one", turnId: "t1" },
+      { kind: "reasoning", id: "r1", turnId: "t1", text: "reason one" },
+    ]);
+    expect(ordered.map((item) => item.value.id)).toEqual(["u1", "a1", "r1"]);
+  });
+
+  it("keeps two bursts of one turn distinct and in order", () => {
+    const ordered = orderConversationPresentation([
+      { kind: "reasoning", id: "r1", turnId: "t1", text: "first" },
+      { kind: "reasoning", id: "r2", turnId: "t1", text: "second" },
+      { id: "a1", role: "agent", text: "answer", turnId: "t1" },
+    ]);
+    expect(ordered.map((item) => item.value.id)).toEqual(["r1", "r2", "a1"]);
+  });
+
+  it("#97 still interleaves tool activity by turnId — it is still ephemeral", () => {
+    const ordered = orderConversationPresentation(
+      [
+        { id: "u1", role: "user", text: "one", turnId: "t1" },
+        { kind: "reasoning", id: "r1", turnId: "t1", text: "reason one" },
+        { id: "a1", role: "agent", text: "answer one", turnId: "t1" },
+      ],
+      [{ id: "tc1", turnId: "t1", name: "bash" }],
+    );
+    // The tool chip anchors to the USER row (its turn's anchor), which now puts
+    // it before the reasoning block rather than after it. That is the honest
+    // consequence of the two lanes no longer being ordered by the same rule —
+    // one has a position, the other has only a turn.
+    expect(ordered.map((item) => item.kind)).toEqual([
+      "message",
+      "tool_activity",
+      "reasoning",
+      "message",
+    ]);
+    expect(ordered.map((item) => item.value.id)).toEqual(["u1", "tc1", "r1", "a1"]);
+  });
+
+  it("#97 places an orphan tool chip at the tail when its turn has no anchor", () => {
+    expect(
+      orderConversationPresentation(
+        [{ id: "old", role: "agent", text: "old" }],
+        [{ id: "tc1", turnId: "live", name: "bash" }],
+      ).map((item) => item.value.id),
+    ).toEqual(["old", "tc1"]);
   });
 });
 

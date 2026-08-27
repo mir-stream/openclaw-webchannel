@@ -47,19 +47,31 @@
  * That is N8 by OMISSION, and it is the reason this file cannot claim the
  * equality unconditionally.
  *
- * GAP 2 — REASONING IS DURABLE BUT UNSENDABLE (#242 half 1). For an account
- * that opted in via `capabilities.reasoningDurable` (default OFF — see
- * `account-config.ts`'s `resolveReasoningDurable`), the journal
- * records one row per reasoning burst and the fold places it in the view, but
- * the `history` wire frame carries `HistoryMessage`, whose `role` is
- * `"user" | "agent"` and which therefore cannot express a role-less reasoning
- * message. So the conversion loop in `projectJournalHistory` DROPS reasoning
- * entries on the way out, and a reload shows no reasoning where live showed it.
- * That is deliberate and scoped: half 1 is the SERVER side only. Half 2 widens
- * the frame and moves the client's render onto the reducer together, so the two
- * sides start agreeing in one step rather than passing through a state where the
- * wire carries a field no client reads. The drop is commented at the exact line
- * that performs it.
+ * GAP 2 — REASONING (#242). ⚠️ THE DROP THIS BLOCK USED TO DESCRIBE IS GONE.
+ * Half 1 made reasoning durable server-side and then dropped it from the emitted
+ * list, because the wire row's `role` was `"user" | "agent"` and a reasoning
+ * message has none. Half 2 widened `channel-contract.ts`'s row into a TAGGED
+ * UNION and the conversion loop below now emits the reasoning variant. What is
+ * left of this gap is two SMALLER, named residuals — neither of them a shape
+ * limit, and neither fixable in this module:
+ *
+ *  - GAP 2a — A BURST WHOSE TRANSPORT IS STILL REFUSING AT CLOSE GETS NO ROW
+ *    (**#304**). The burst's one durable frame is the `final: true` close frame,
+ *    and `sendToPeer`'s disposed / transport-down / no-session-key refusals all
+ *    sit ABOVE `journalOutbound` — so if the transport is down when the burst
+ *    closes (a NATS reconnect, or the fail-closed no-session-key window), the
+ *    frame is refused and nothing is journaled, WHILE THE PEER KEEPS RENDERING
+ *    the prefix it already received. Half 1 could describe that as an invisible
+ *    gap; half 2 makes it visible, as "reasoning I watched vanished on reload".
+ *    The seam cannot journal a refused send (N6b) and a second hook inside the
+ *    controller is N6b/N6c, so #304 needs a design round, not a patch. The full
+ *    mechanism and its case table live at `lastDeliveredText`'s declaration in
+ *    `message-adapter.ts`; do not restate them, and do not "fix" this here.
+ *  - GAP 2b — A BURST CLOSED BY THE TURN TEARDOWN REPLAYS AFTER THE TURN'S
+ *    ANSWERS. See the ORDERING note on the conversion loop below.
+ *
+ * Both are content/order divergences on top of a shared reducer, not second
+ * transition tables, so neither changes the rule this module lives by.
  *
  *
  * ⚠️ IT IS NOT THIS SLICE'S TO FIX, AND THE OBVIOUS FIX IS FORBIDDEN HERE. The
@@ -259,7 +271,7 @@ import type {
   RetainedJournalEvent,
 } from "./delivery-journal.js";
 import type { JournalEvent } from "./delivery-journal-event.js";
-import type { HistoryFetchPlan, HistoryMessage } from "./history.js";
+import type { HistoryFetchPlan, ProjectedHistoryMessage } from "./history.js";
 
 /**
  * The journal read seam, taken verbatim off the store's own interface so the two
@@ -379,7 +391,7 @@ function isKnownJournalEvent(
 /** What one conversation's journal projects to. */
 export type JournalHistoryProjection = {
   /** The durable view, in the REDUCER's order, with `ts` attached. */
-  messages: HistoryMessage[];
+  messages: ProjectedHistoryMessage[];
   /**
    * Rows dropped because this build does not know their kind. NOT a silent
    * drop — see `projectJournalHistory`'s note on why the count is the whole
@@ -504,10 +516,13 @@ export type JournalHistoryProjection = {
  * new kind which introduces an id cannot ship `ts: undefined` or `NaN` onto the
  * wire while nobody notices. The counter is how the caller finds out it happened.
  *
- * ⚠️ IT IS ALSO COUNTED OVER THE EMITTED LIST, NOT THE VIEW. Reasoning messages
- * are dropped before this step (see the conversion loop), so they can neither
- * raise nor mask this counter — which is right, because the counter is about
- * what `ts` reaches the WIRE.
+ * ⚠️ IT IS COUNTED OVER THE EMITTED LIST, WHICH IS NOW THE WHOLE VIEW. Half 1
+ * dropped reasoning before this step, so this note used to say reasoning could
+ * "neither raise nor mask this counter". Half 2 emits reasoning, and the emitted
+ * list and the view have the same members again — so a reasoning message with no
+ * recorded first appearance DOES raise the counter. The counter's meaning is
+ * unchanged (it is about what `ts` reaches the WIRE); what changed is that the
+ * two lists no longer differ, so there is no gap left for it to miss.
  */
 export function projectJournalHistory(
   read: JournalReader,
@@ -586,49 +601,56 @@ export function projectJournalHistory(
   }
 
   let tsFallbacks = 0;
-  const messages: HistoryMessage[] = [];
+  const messages: ProjectedHistoryMessage[] = [];
   for (const message of view) {
-    // ⚠️ #242 half 1: REASONING IS IN THE DURABLE VIEW AND CANNOT GO ON THE
-    // WIRE YET. This is a shape limit, not a judgement about the content — read
-    // the two facts in this order:
-    //  - the view ABOVE HOLDS IT. The journal has one row per reasoning burst
-    //    and `applyDurableEvent` folded it into `view` at the position it was
-    //    delivered. Nothing is missing from the projection;
-    //  - `HistoryMessage` — the one this module imports, `history.ts`'s, which
-    //    is its OWN declaration requiring `ts: number` rather than a re-export
-    //    of the wire-shaped `channel-contract.ts` type — is
-    //    `{ id, role, text, ts }`. `role` is `"user" | "agent"` and a reasoning
-    //    message HAS NO ROLE: the wire frame carries none, and the reducer's
-    //    `DurableMessage` refuses to invent one. There is no value to put there,
-    //    so there is no frame to send. (Both declarations have the same `role`,
-    //    so widening is a two-file change, which is half 2's problem.)
-    // Half 2 widens the frame and moves the client's render onto the reducer IN
-    // ONE STEP, which is what makes `live == history` close atomically for
-    // reasoning; widening the frame here alone would ship a field no client
-    // reads. Do NOT "fix" this by giving reasoning `role: "agent"` — that is a
-    // fabricated claim in the SSOT (N8), and it would render reasoning as an
-    // answer bubble on every existing client.
+    // ⚠️ #242 half 2: REASONING IS EMITTED. Half 1 had a `continue` here, because
+    // `HistoryMessage` was `{id, role, text, ts}` and a role-less reasoning
+    // message had no `role` to fill. `channel-contract.ts`'s row is now a TAGGED
+    // UNION mirroring `DurableMessage`, so the reasoning variant travels as
+    // itself — with no `role`, which is also what makes an older client drop it
+    // rather than render it as an answer bubble (the argument, and the
+    // measurement behind it, are in that file, not here).
     //
-    // The two page selectors are unaffected BY CONSTRUCTION: they operate on
-    // this list, and their cursor is an id taken FROM it, so a reasoning id can
-    // never become a cursor the client cannot resolve. `ts` is still recorded
-    // for these ids (see `recordFirstSeen`), which is what half 2 inherits.
-    if (message.kind !== "text") continue;
+    // The two branches below differ ONLY in which fields they copy. `ts` is
+    // sourced identically for both, and `recordFirstSeen` already dated
+    // reasoning ids in half 1 precisely so this step would inherit it unchanged.
+    //
+    // ⚠️ GAP 2b — ORDERING. A reasoning block's POSITION here is where its
+    // JOURNAL ROW fell, which is the moment the burst CLOSED. The client's live
+    // position is where the burst's FIRST frame arrived, because `applyReasoning`
+    // appends on the first upsert and keeps the slot afterwards. Those agree for
+    // every burst closed by `endBurst` — the ordinary case, where the reasoning
+    // ends before the answer streams — and DISAGREE for a burst still open at
+    // turn end: `inbound.ts` closes it from its `finally`, after the answer's
+    // `progress`/`agent_message` rows are already journaled, so the replay puts
+    // it after the turn's answers while live put it before them.
+    //
+    // ⚠️ AND THE FIX THE REDUCER'S `applyReasoning` DOCBLOCK NAMED FOR HALF 2 —
+    // "the ORDER of those two calls in `inbound.ts`'s turn teardown" — DOES NOT
+    // WORK, which is why half 2 does not make it. Moving `reasoning?.stop()`
+    // above `await draft?.drain()` moves the row before the `seal`, but NOT
+    // before the `placement`/`bubble` rows the lane already wrote while it was
+    // streaming; the block still lands after the turn's answers, and
+    // `applySeal` leaves non-answer slots exactly where they are. The claim was
+    // about the seal alone and reads as if it covered the answers. Corrected
+    // here rather than silently dropped, because a later reader would otherwise
+    // "restore" it.
     const seen = firstSeenMs.get(message.id);
+    let ts: number;
     if (seen !== undefined) {
-      messages.push({ id: message.id, role: message.role, text: message.text, ts: seen });
-      continue;
+      ts = seen;
+    } else {
+      tsFallbacks += 1;
+      // `lastCreatedMs` is defined whenever the view is non-empty (a message can
+      // only exist because a row produced it), so the `0` is unreachable and is
+      // here to keep the type honest rather than as a policy.
+      ts = lastCreatedMs ?? 0;
     }
-    tsFallbacks += 1;
-    // `lastCreatedMs` is defined whenever the view is non-empty (a message can
-    // only exist because a row produced it), so the `0` is unreachable and is
-    // here to keep the type honest rather than as a policy.
-    messages.push({
-      id: message.id,
-      role: message.role,
-      text: message.text,
-      ts: lastCreatedMs ?? 0,
-    });
+    messages.push(
+      message.kind === "reasoning"
+        ? { kind: "reasoning", id: message.id, turnId: message.turnId, text: message.text, ts }
+        : { id: message.id, role: message.role, text: message.text, ts },
+    );
   }
 
   return { messages, unsupportedEvents, tsFallbacks };
@@ -687,11 +709,11 @@ function recordFirstSeen(
       note(event.answerId);
       return;
     case "reasoning":
-      // Recorded even though half 1 DROPS reasoning from the emitted
-      // `HistoryMessage` list (see `projectJournalHistory`'s conversion): the
-      // drop is a wire-shape limitation, not a decision that the message has no
-      // moment. Half 2 puts it on the wire and takes the `ts` from here
-      // unchanged.
+      // Half 1 recorded this while the conversion loop still dropped reasoning,
+      // on the grounds that the drop was a wire-shape limitation and not a
+      // decision that the message had no moment. Half 2 puts it on the wire and
+      // reads the `ts` from here UNCHANGED — the prediction held, and this line
+      // did not have to move.
       note(event.id);
       return;
     case "seal":
@@ -732,11 +754,21 @@ function recordFirstSeen(
  * and yields everything. That is `planHistoryFetch`'s job to prevent, in the new
  * path exactly as in the old one, and the test file pins the behaviour so it is
  * visible rather than assumed.
+ *
+ * ⚠️ `limit` COUNTS ROWS, AND SINCE #242 half 2 A REASONING BLOCK IS A ROW. So a
+ * conversation with durable reasoning gets FEWER CHAT BUBBLES per page at the
+ * same `limit`. That is the selector working as specified — the page is "the
+ * most recent N messages", and half 2's whole point is that a reasoning block IS
+ * one — but it is a behaviour change for an operator who tuned
+ * `history.limit`/`history.pageSize` against a bubble-only projection, and it is
+ * only reachable for an account that opted into `capabilities.reasoningDurable`
+ * (default OFF). Do not "fix" it by making the count kind-aware: that is a
+ * second opinion about what a message is, held only by the pager.
  */
 export function recentHistoryPage(
-  messages: readonly HistoryMessage[],
+  messages: readonly ProjectedHistoryMessage[],
   limit: number,
-): HistoryMessage[] {
+): ProjectedHistoryMessage[] {
   if (limit <= 0) return [];
   return messages.slice(Math.max(0, messages.length - limit));
 }
@@ -755,12 +787,35 @@ export function recentHistoryPage(
  * because the SDK seam it read has no cursor and clamps its `limit` upstream;
  * this projection replays the whole log, so there is no window and no wall. Same
  * guard on `limit` as `recentHistoryPage` — see that docblock.
+ *
+ * ── ⚠️ THE CURSOR GUARANTEE #242 half 1 RELIED ON IS GONE. READ THIS. ──
+ *
+ * Half 1's conversion loop carried the sentence "a reasoning id can never become
+ * a cursor the client cannot resolve", true because reasoning never reached the
+ * emitted list. It does now, so a reasoning id CAN arrive as `beforeId`. What
+ * replaces the guarantee is not a narrower one — it is the fact that this
+ * function never depended on the row's KIND in the first place:
+ *
+ *  - RESOLUTION is `findIndex` by `id` over the SAME list the client was served,
+ *    and the emitted list is the whole view. So any id from any page resolves,
+ *    reasoning included, and the slice ending at it is a well-formed page.
+ *  - The MISS case is unchanged and is the one below: an id NOT in the
+ *    projection returns `[]`. Reasoning adds no NEW class of miss — the client
+ *    has always been able to hold ids the journal does not serve. A local user
+ *    echo is one (`mintLocalBubbleId`'s `u-<n>`, while the accept seam journals
+ *    the inbound WIRE id), and a live reasoning block on an account that did NOT
+ *    opt into `capabilities.reasoningDurable` is now another.
+ *
+ * The second bullet is a CLIENT-side cursor-choice concern, not a server one:
+ * whatever the widget hands us, "not in the projection ⇒ no more history" is the
+ * honest answer, and it is why `demo/web/src/widget.ts`'s oldest-cursor pick
+ * excludes rows whose id may be local-only.
  */
 export function historyPageBefore(
-  messages: readonly HistoryMessage[],
+  messages: readonly ProjectedHistoryMessage[],
   beforeId: string,
   limit: number,
-): HistoryMessage[] {
+): ProjectedHistoryMessage[] {
   if (!beforeId || limit <= 0) return [];
   const idx = messages.findIndex((message) => message.id === beforeId);
   if (idx === -1) return [];
@@ -770,7 +825,7 @@ export function historyPageBefore(
 /** What `serveHistoryRequest` hands back: one page, plus whole-projection health. */
 export type ServedHistory = {
   /** The selected page — a slice, not the whole projection. */
-  messages: HistoryMessage[];
+  messages: ProjectedHistoryMessage[];
   /**
    * ⚠️ COUNTED OVER THE WHOLE PROJECTION, NOT THE PAGE. Both are properties of
    * the replay that produced the page, so a page of 10 can carry a non-zero

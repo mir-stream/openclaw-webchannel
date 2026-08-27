@@ -1703,6 +1703,18 @@ export async function handleInboundMessage(
     // reasoning payload, so the widget showed an empty Reasoning section — the
     // silent failure this issue exists to end.
     //
+    // ⚠️ IT WATCHES ONLY LANES THAT OPENED, AND #242 half 2 ADDED ITS
+    // COUNTERPART FOR THE LANES THAT DID NOT. The `reasoning &&` guard below
+    // means this says nothing when `capabilities.reasoning` is off — which is
+    // exactly when `capabilities.reasoningDurable: true` records zero rows.
+    // `nats-account-runtime.ts` now warns ONCE PER ACCOUNT START for that
+    // combination, at config time, where it is fixable by flipping one key. The
+    // two do not overlap: that one is about a lane that never opens, this one is
+    // about a lane that opened and stayed empty (whose most likely cause is
+    // core's `thinkingLevel === "off"`, which no channel config can force). Do
+    // not merge them, and do not relax this guard to cover the other case —
+    // per-turn is the wrong cadence for a config mistake.
+    //
     // Placed AFTER the verdict resolution on purpose. It fires on a turn that
     // ANSWERED SUCCESSFULLY and was not positively known to be aborted — that is
     // the case where zero reasoning frames is actually surprising. Three ways a

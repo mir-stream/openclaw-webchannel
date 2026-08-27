@@ -679,3 +679,47 @@ describe("nats-account-runtime.ts wiring contract — #238 identity at the deliv
     expect(RUNTIME_FLAT).not.toMatch(/=\s*channel\.sendText\(/);
   });
 });
+
+describe("nats-account-runtime.ts wiring contract — the reasoning opt-in diagnostic (#242 half 2)", () => {
+  /**
+   * ⚠️ WHY THIS IS A SOURCE GUARD AND NOT A BEHAVIOURAL TEST — stated so the
+   * next reader does not "upgrade" it and find out the hard way. The warning
+   * lives inside `startAccount`'s per-account body, past a live NATS dial and a
+   * real `openDeliveryJournal`; reaching it in a unit test means standing up the
+   * whole account lifecycle. What the warning DECIDES is pure and is covered
+   * where it belongs: `account-config.test.ts` pins that `resolveReasoningDurable`
+   * and `resolveReasoningEnabled` disagree exactly on the combination below, and
+   * `log-interpolation-audit.test.ts` pins that the line exists, is
+   * `webchannel:`-prefixed, and interpolates nothing raw (its
+   * `nats-account-runtime.ts` floor moved 19→20 / 37→38 for this statement).
+   * What is left for this file is the WIRING: that the emission is gated on the
+   * two resolvers and not on something else.
+   */
+  it("gates the warning on `reasoningDurable && !resolveReasoningEnabled(account)`", () => {
+    expect(RUNTIME_SOURCE).toMatch(
+      /if \(reasoningDurable && !resolveReasoningEnabled\(account\)\) \{/,
+    );
+    // The SAME `account` binding the durability resolver reads — not a fresh
+    // `resolveWebchannelAccountConfig(...)`, which could disagree with what
+    // `inbound.ts` will read for the lane.
+    expect(RUNTIME_SOURCE).not.toMatch(
+      /resolveReasoningEnabled\(\s*resolveWebchannelAccountConfig\(/,
+    );
+  });
+
+  it("stays a DIAGNOSTIC — `reasoningDurable` never implies the lane", () => {
+    // The one edit this guard exists to stop. `capabilities.reasoning: false` is
+    // an explicit privacy opt-OUT for a live surface; letting a storage key
+    // silently reverse it defeats the reason the two keys were split (#113's
+    // default-ON is about RENDERING a volatile lane, not about RECORDING
+    // plaintext at rest). So the durable switch may never appear in the LANE's
+    // resolution — and that resolution lives in `inbound.ts`, which must not
+    // read the durable key at all.
+    const INBOUND_SOURCE = readFileSync(
+      fileURLToPath(new URL("./inbound.ts", import.meta.url)),
+      "utf8",
+    );
+    expect(INBOUND_SOURCE).not.toMatch(/resolveReasoningDurable/);
+    expect(INBOUND_SOURCE).not.toMatch(/reasoningDurable\s*\|\|/);
+  });
+});

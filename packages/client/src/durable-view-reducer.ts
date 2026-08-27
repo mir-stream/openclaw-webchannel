@@ -19,18 +19,19 @@
  * `durable-view-reducer.test.ts`, which drives the REAL `WebChannelNATSClient`
  * with the REAL wire frames and compares against this reducer's output.
  *
- * ⚠️ `reasoning` HAS NO ANCHOR, AND CANNOT HAVE ONE YET. #242 half 1 makes
- * reasoning durable on the SERVER side only: the plugin journals one row per
- * burst (for an account that opted in — `capabilities.reasoningDurable`,
- * default OFF), this reducer folds it, and `journal-history.ts` replays it.
- * The CLIENT
- * still renders reasoning out of its own `state.reasoning` array
- * (`upsertReasoning`) and routes no `reasoning` frame through this file, so
- * there is no second implementation to compare against — an "anchor" would only
- * drive the wrapper's unrelated array. `applyReasoning` is instead a documented
- * port of that method, and the ONE deliberate difference (the live `.slice(-100)`
- * cap) is recorded at the transition. Half 2 moves the client onto this reducer;
- * that is when the anchor becomes possible and when the divergence closes.
+ * ✅ `reasoning` NOW HAS AN ANCHOR — #242 half 2 CLOSED THE GAP THIS PARAGRAPH
+ * USED TO DESCRIBE. Half 1 made reasoning durable on the SERVER side only: the
+ * plugin journaled one row per burst (for an account that opted in —
+ * `capabilities.reasoningDurable`, default OFF), this reducer folded it, and
+ * `journal-history.ts` replayed it — while the CLIENT still rendered reasoning
+ * out of its own `state.reasoning` array and routed no `reasoning` frame here.
+ * There was no second implementation to compare against, and `applyReasoning`
+ * was a documented PORT of `upsertReasoning` with one deliberate difference (the
+ * live `.slice(-100)` cap). Half 2 deleted `upsertReasoning`, routed
+ * `case "reasoning"` through `applyDurable`, made `state.reasoning` a DERIVED
+ * view of the reasoning entries in `state.messages`, and dropped the cap — so
+ * the port is now the implementation, the divergence is closed, and the fifth
+ * anchor exists in `durable-view-reducer.test.ts` alongside the other four.
  *
  * ⚠️ THE ANCHORS' EVIDENTIAL VALUE CHANGED WHEN THE CLIENT BECAME THE CONSUMER.
  * While the client had its own hand-rolled reconciliation they were genuinely
@@ -108,10 +109,10 @@
  * function's signature with `error TS2366: Function lacks ending return
  * statement and return type does not include 'undefined'` until its `case` was
  * added, so the forgotten-case path BOUNDARY 2 anticipates cannot ship. The
- * client consumer still only ever constructs events from the four wire frames it
- * already handles (`reasoning` is journaled and folded SERVER-side in half 1;
- * the client does not route it here), so the ONE surviving path is RUNTIME
- * VERSION SKEW — an older build replaying a journal a newer build wrote.
+ * client consumer constructs events only from wire frames it already handles —
+ * FIVE of them since #242 half 2 routed `case "reasoning"` here (half 1 folded
+ * reasoning SERVER-side only) — so the ONE surviving path is RUNTIME VERSION
+ * SKEW: an older build replaying a journal a newer build wrote.
  *
  * ⚠️ THAT PATH IS NO LONGER HYPOTHETICAL, AND SOMETHING NOW STANDS IN FRONT OF
  * IT. This used to say the skew case "first needs #239 (the journal) and #241 (a
@@ -208,8 +209,15 @@ export type DurableRole = "user" | "agent";
  * ⚠️ THE REASONING VARIANT HAS NO `role`, AND THAT IS NOT AN OVERSIGHT TO FIX.
  * The wire frame carries none (`channel-contract.ts`'s `reasoning` member is
  * `{ id, turnId, text }` plus #242's `final` flag), so any value here would be
- * INVENTED — a fabricated claim inside the SSOT, which is the N8 shape. How a
- * reasoning message renders is half 2's decision, made where the render is.
+ * INVENTED — a fabricated claim inside the SSOT, which is the N8 shape.
+ *
+ * ✅ HALF 2 MADE THE SAME CHOICE AT BOTH OF THE OTHER TWO LAYERS, and the
+ * absence turned out to be load-bearing rather than merely honest:
+ * `channel-contract.ts`'s `HistoryMessage` and the client's `ChatMessage` are
+ * both tagged unions whose reasoning variant carries no `role` either — and it
+ * is precisely a missing `role` that makes every RELEASED client drop the new
+ * history row instead of rendering it as an answer bubble. That measurement is
+ * in `channel-contract.ts`; do not re-derive it here.
  *
  * `turnId` is REQUIRED on the reasoning variant and optional on the text one,
  * again following the wire: the `reasoning` frame types `turnId: string`, and
@@ -293,11 +301,11 @@ function findTextIndex(view: DurableView, id: string): number {
  * `packages/plugin/src/channel-contract.ts` (`OutboundWsMessage`) and the
  * wrapper's `handleFrame` cases (`handleMessage` is the
  * outer entry point, which brackets that switch with the live-turn latch
- * observation and the release gate), and every transition EXCEPT `reasoning` is
- * anchored against the REAL client in `durable-view-reducer.test.ts` (the
- * exception, and why it cannot be anchored in half 1, is in the file header).
- * What that covers is four of the five kinds below; see the two BOUNDARY notes
- * after the type for what it does not.
+ * observation and the release gate), and EVERY transition — all five kinds
+ * below, `reasoning` included since #242 half 2 gave the client a `reasoning`
+ * consumer to anchor against — is anchored against the REAL client in
+ * `durable-view-reducer.test.ts`. See the two BOUNDARY notes after the type for
+ * what that does NOT cover.
  *
  *  - `user`      — a local user echo materialized once publication reserves its
  *                  wire id (`nextPublishedUserMessages` in the wrapper). This is
@@ -454,9 +462,11 @@ function findTextIndex(view: DurableView, id: string): number {
  * Doc §15.9 requires tool and reasoning messages to become DURABLE messages —
  * only pure indicators (the rolling progress draft, the typing flag) stay
  * ephemeral. So this event set will GROW; it already did once, and the rest of
- * the growth is scheduled. #242 half 1 added `reasoning`; TOOL ACTIVITY and the
- * APPROVAL frames are still `null` in `journalEventForOutbound`, marked "#242
- * half 2" there, and are absent here for that reason and no other. Do not read
+ * the growth is scheduled. #242 half 1 added `reasoning` and half 2 gave it a
+ * CLIENT consumer; TOOL ACTIVITY and the APPROVAL frames are still `null` in
+ * `journalEventForOutbound`, marked "#242 half 3" there (this line said "half 2"
+ * until half 2 shipped without them — a forward reference made before the slice
+ * was split three ways), and are absent here for that reason and no other. Do not read
  * the five kinds as final spec, and do not treat "it isn't in DurableEvent" as
  * evidence that something is non-durable by design (NOT-list N3/N7).
  *
@@ -698,23 +708,37 @@ function applyBubble(
  * the `seal` row — and only then calls `reasoning?.stop()` from its `finally`,
  * so a burst that streamed BEFORE the answer but never got a reasoning-end
  * boundary is journaled AFTER the seal and replays at the TAIL, past the turn's
- * answers.
+ * answers. LIVE it sits before them, because this transition appends on the
+ * burst's FIRST frame and the slot never moves afterwards.
  *
- * Not observable in #242 half 1 (`journal-history.ts` drops reasoning before the
- * wire), and not fixable here — the repair is the ORDER of two calls in
- * `inbound.ts`'s turn teardown, which is half 2's to make. Recorded so the next
- * reader meets it as a known divergence rather than as a reducer bug.
+ * ⚠️ AND THE FIX THIS BLOCK USED TO PROMISE — "the ORDER of two calls in
+ * `inbound.ts`'s turn teardown, which is half 2's to make" — DOES NOT WORK.
+ * Half 2 checked it and did not make the change: hoisting `reasoning?.stop()`
+ * above `await draft?.drain()` moves the row before the `seal`, but the lane's
+ * `placement`/`bubble` rows were journaled while it was STREAMING, long before
+ * either call, so the block still replays after the turn's answers — and
+ * `applySeal` deliberately leaves every non-answer slot where it is. The old
+ * sentence was true about the seal and read as if it covered the answers.
+ * `journal-history.ts`'s conversion loop (GAP 2b) now owns the statement of this
+ * divergence; it is recorded there because that is where a reader meets it.
  *
- * A PORT of the client's live `upsertReasoning` (`nats-client-wrapper.ts`),
- * which does the same find-by-id / append-or-replace over `state.reasoning`.
- * The replacement is WHOLESALE (a new object from the event's three fields),
- * not a merge onto the previous entry, because that is what the live method
- * does — `current.map((entry, i) => (i === idx ? item : entry))`.
+ * ✅ FORMERLY A PORT, NOW THE IMPLEMENTATION. Through #242 half 1 this was a
+ * documented port of the client's live `upsertReasoning`, which did the same
+ * find-by-id / append-or-replace over a separate `state.reasoning` array. Half 2
+ * DELETED that method: `case "reasoning"` builds a `DurableEvent` and routes it
+ * through `applyDurable` like every other durable frame, and `state.reasoning`
+ * is a derived view of the reasoning entries in `state.messages`. The wholesale
+ * replacement below (a new object from the event's three fields rather than a
+ * merge onto the previous entry) is retained from that port and is now simply
+ * what the client does.
  *
- * ⚠️ ONE DELIBERATE DIFFERENCE: THE LIVE `.slice(-100)` CAP IS NOT HERE. The
- * client keeps the most recent 100 reasoning items and discards the rest; the
- * durable view keeps all of them. Three reasons, and none of them is an
- * oversight:
+ * ✅ THE `.slice(-100)` CAP IS GONE FROM THE CLIENT, so the ONE deliberate
+ * difference this block used to record no longer exists. It said: the live list
+ * kept the most recent 100 reasoning items while the durable view kept all of
+ * them, leaving a bounded live≠history divergence for half 2 to close "either by
+ * REMOVING the client cap, or by bounding BOTH sides at the store". Half 2 took
+ * the first option. The three reasons a cap must not be added HERE are unchanged
+ * and still binding:
  *  - a per-kind cap inside the DURABLE projection silently drops content that
  *    was delivered (N10). A memory bound on a live UI surface and a bound on the
  *    system of record are not the same decision;
@@ -722,18 +746,9 @@ function applyBubble(
  *    would be a second, inconsistent bounding opinion about the same array;
  *  - retention/pruning of the journal is #299's job, at the store, where it can
  *    be one policy over everything rather than a number hidden in a transition.
- *
- * ⚠️ SO HALF 1 KNOWINGLY LEAVES A live≠history DIVERGENCE OPEN, AND IT IS
- * BOUNDED. Past 100 reasoning blocks in one conversation the client's live list
- * has dropped the oldest and a replay still has them. It is not reachable
- * through this file today — the client does not feed `reasoning` here at all in
- * half 1, it renders `state.reasoning` directly — so nothing in the client can
- * observe the disagreement yet. Half 2 moves the client onto this reducer, which
- * is what closes it — either by REMOVING the client cap, or by bounding BOTH
- * sides at the store, where #299 already owns retention as one policy over
- * everything. What it must not do is add a second, view-local cap here: that is
- * the one option that drops delivered text (N10) while leaving the two sides
- * still free to disagree. Do not "fix" this by capping.
+ * Do not "fix" the now-unbounded live list by capping — not here, and not in the
+ * wrapper's derivation either; that would re-open the divergence in the exact
+ * shape half 2 closed.
  *
  * BOTH PATHS ALLOCATE. Like `applyBubble`, this does not detect a no-op: a
  * `reasoning` event repeating its id, turnId and text still returns a new array.
@@ -859,6 +874,21 @@ function applySeal(
 }
 
 /**
+ * The structural shape of ONE client transcript entry, as this module sees it.
+ *
+ * ⚠️ STRUCTURAL, NOT `ChatMessage`. This file is strictly dependency-free (see
+ * the DEPENDENCY CONTRACT in the header) and the plugin imports it by
+ * cross-package source path, so it may not name the client's type. It MIRRORS
+ * `packages/client/src/types.ts`'s `ChatMessage` union, and the mirror is
+ * checked at the only call site that matters: `nats-client-wrapper.ts` passes a
+ * real `ChatMessage[]` into `projectDurableFromClient`, so a divergence in the
+ * durable fields is a compile error there.
+ */
+type ClientTranscriptEntry =
+  | { kind?: undefined; id: string; role: DurableRole; text: string; turnId?: string; draftOnly?: boolean }
+  | { kind: "reasoning"; id: string; turnId: string; text: string };
+
+/**
  * Project a full `ChatMessage[]` (the client's live `state.messages`) down to
  * the durable view. Keeps only the durable fields.
  *
@@ -867,23 +897,29 @@ function applySeal(
  * content. Use `projectDurableFromClient` below for anything holding a live
  * client bubble; this one is for views that are already durable.
  *
- * ⚠️ IT PRODUCES ONLY `kind: "text"` ENTRIES, AND THAT IS RIGHT FOR HALF 1. Its
- * input is the client's `state.messages` — the CHAT BUBBLE list, which holds no
- * reasoning blocks: the client keeps those in a separate `state.reasoning` array
- * and renders them from there (#242 half 2 is what changes that). So there is
- * nothing here to tag as reasoning, and tagging by guesswork would be the
- * fabrication `DurableMessage`'s docblock refuses.
+ * ⚠️ IT IS KIND-PRESERVING, AND IT MUST BE. This used to produce only
+ * `kind: "text"` entries, correctly, because in half 1 the client kept reasoning
+ * in a separate `state.reasoning` array and `state.messages` held no reasoning
+ * blocks. Half 2 moved reasoning INTO `state.messages`, and this function is one
+ * half of a ROUND TRIP: the wrapper computes
+ * `mergeDurable(projectDurableFromClient(state.messages) + one event)` on every
+ * durable frame, so a projection that flattened reasoning back to `kind: "text"`
+ * — or dropped it — would delete every reasoning block from the view on the next
+ * unrelated frame. The tag is carried, never inferred; there is still no
+ * guesswork here.
  */
-export function projectDurable(
-  messages: Array<{ id: string; role: DurableRole; text: string; turnId?: string }>,
-): DurableView {
-  return messages.map((m) => ({
-    kind: "text",
-    id: m.id,
-    role: m.role,
-    text: m.text,
-    turnId: m.turnId,
-  }));
+export function projectDurable(messages: ClientTranscriptEntry[]): DurableView {
+  return messages.map((m) =>
+    m.kind === "reasoning"
+      ? { kind: "reasoning", id: m.id, turnId: m.turnId, text: m.text }
+      : {
+          kind: "text",
+          id: m.id,
+          role: m.role,
+          text: m.text,
+          turnId: m.turnId,
+        },
+  );
 }
 
 /**
@@ -907,17 +943,19 @@ export function projectDurable(
  * The parameter is STRUCTURAL, not `ChatMessage`: this file is strictly
  * dependency-free (see the DEPENDENCY CONTRACT in the header) and the plugin
  * imports it by cross-package source path.
+ *
+ * ⚠️ THE `draftOnly` RULE IS BUBBLE-ONLY, AND THE NARROWING SAYS SO RATHER THAN
+ * ASSUMING IT. §15.9's indicator/message line is drawn between a lane's rolling
+ * `progress` draft and its authored text; a reasoning block has no draft state
+ * on the client at all (the wire streams cumulative FULL text and
+ * `applyReasoning` upserts it), so there is nothing here to blank.
  */
 export function projectDurableFromClient(
-  messages: Array<{
-    id: string;
-    role: DurableRole;
-    text: string;
-    turnId?: string;
-    draftOnly?: boolean;
-  }>,
+  messages: ClientTranscriptEntry[],
 ): DurableView {
   return projectDurable(
-    messages.map((m) => (m.draftOnly === true ? { ...m, text: "" } : m)),
+    messages.map((m) =>
+      m.kind === "reasoning" ? m : m.draftOnly === true ? { ...m, text: "" } : m,
+    ),
   );
 }

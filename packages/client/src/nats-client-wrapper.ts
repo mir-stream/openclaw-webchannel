@@ -18,7 +18,9 @@ import type {
   Listener,
   ApprovalDecision,
   ApprovalOption,
+  ChatBubble,
   ChatMessage,
+  ChatReasoningMessage,
   ReasoningItem,
   ToolActivityItem,
   ApprovalRequest,
@@ -63,7 +65,7 @@ type ReceiptRecord = {
   pendingTransitions: Array<{
     state: NonNullable<ChatMessage["sendState"]>;
     failure?: SendFailure;
-    extraBubblePatch?: Partial<ChatMessage>;
+    extraBubblePatch?: Partial<ChatBubble>;
   }>;
   drainingTransitions: boolean;
 };
@@ -135,8 +137,15 @@ type InitializedWebChannelState = Omit<WebChannelState, "toolActivity"> & {
  *
  * An explicit `undefined` value DELETES the field (see `mergeDurable` rule 3);
  * that is how `draftOnly` is cleared when a frame authors durable text.
+ *
+ * ⚠️ `Partial<ChatBubble>`, NOT `Partial<ChatMessage>` (#242 half 2). Every field
+ * an overlay can carry — `working`, `draftOnly`, `sendState`, `receiptKey`,
+ * `pending`, `wireId` — is bubble-only, and a reasoning entry has none of them
+ * (see `ChatReasoningMessage`). Typing it to the bubble arm makes an overlay
+ * aimed at a reasoning id a COMPILE error at the call site rather than a silent
+ * no-op inside `mergeDurable`, which is where it would otherwise be discovered.
  */
-type DurableLocalOverlay = Record<string, Partial<ChatMessage>>;
+type DurableLocalOverlay = Record<string, Partial<ChatBubble>>;
 
 /**
  * Shallow equality over a bubble's own enumerable fields, so `mergeDurable` can
@@ -144,6 +153,52 @@ type DurableLocalOverlay = Record<string, Partial<ChatMessage>>;
  * to keep `NaN` (a plausible `ts`/`assistantMessageIndex` corruption) from
  * reporting a spurious change on every apply.
  */
+/**
+ * What a state mutation may carry.
+ *
+ * ⚠️ `reasoning` IS EXCLUDED AT THE TYPE LEVEL (#242 half 2), and that exclusion
+ * IS the "one source of truth" guarantee. The field is DERIVED from
+ * `state.messages` by `nextStateFrom` below; a patch that could also set it
+ * would let the two disagree, which is the whole defect class this slice closes.
+ * Writing `setState({ reasoning: … })` is now a compile error, not a convention.
+ */
+type StatePatch = Omit<Partial<InitializedWebChannelState>, "reasoning">;
+
+/**
+ * The reasoning bursts inside a transcript, in transcript order — what
+ * `state.reasoning` exposes.
+ *
+ * ⚠️ NO CAP. `upsertReasoning`'s `.slice(-100)` is deliberately not reproduced
+ * here: the durable view is uncapped, so a live cap would be exactly the
+ * live≠history divergence #242 half 2 exists to close (the argument is at the
+ * reducer's `applyReasoning`; retention is #299's, at the store). Do not add one.
+ */
+function deriveReasoning(messages: readonly ChatMessage[]): ReasoningItem[] {
+  const out: ReasoningItem[] = [];
+  for (const m of messages) {
+    if (m.kind === "reasoning") out.push({ id: m.id, turnId: m.turnId, text: m.text });
+  }
+  return out;
+}
+
+/**
+ * Apply one patch and recompute every DERIVED field.
+ *
+ * The derivation is conditional on `messages` being in the patch, which keeps
+ * `state.reasoning`'s ARRAY IDENTITY stable across the many patches that do not
+ * touch the transcript — `WebChannelState`'s docblock promises a listener can
+ * detect updates by identity, and recomputing unconditionally would report a
+ * change on every `typing` frame.
+ */
+function nextStateFrom(
+  prev: InitializedWebChannelState,
+  patch: StatePatch,
+): InitializedWebChannelState {
+  const next = { ...prev, ...patch };
+  if (patch.messages !== undefined) next.reasoning = deriveReasoning(patch.messages);
+  return next;
+}
+
 function sameChatMessage(a: ChatMessage, b: ChatMessage): boolean {
   const aKeys = Object.keys(a);
   if (aKeys.length !== Object.keys(b).length) return false;
@@ -1806,8 +1861,8 @@ export class WebChannelNATSClient {
    * Public state listeners are isolated so an embedder render bug cannot abort a
    * send, a staged-bubble exposure, or a held drain midway through its FIFO commit.
    */
-  private setState(patch: Partial<InitializedWebChannelState>): void {
-    this.state = { ...this.state, ...patch };
+  private setState(patch: StatePatch): void {
+    this.state = nextStateFrom(this.state, patch);
     this.notifyStateListeners();
   }
 
@@ -1834,11 +1889,14 @@ export class WebChannelNATSClient {
    */
   private stageReceiptStateThenCommit(
     receiptKey: string,
-    patch: Partial<InitializedWebChannelState>,
+    patch: StatePatch,
     commit: () => void,
   ): void {
     const notificationSeq = this.stateNotificationSeq;
-    this.state = { ...this.state, ...patch };
+    // Routed through the SAME derivation as `setState` — this is the other door
+    // into `this.state`, and a direct spread here would leave `reasoning` stale
+    // for any staged patch that touches `messages`.
+    this.state = nextStateFrom(this.state, patch);
     this.stagedReceiptExposures.add(receiptKey);
     try {
       commit();
@@ -1961,6 +2019,11 @@ export class WebChannelNATSClient {
    *  5. an id in `prev` but absent from the view is dropped — that is `seal`'s
    *     `remove` working as designed.
    *
+   * ⚠️ RULES 1-4 ARE ABOUT BUBBLES. A `kind: "reasoning"` entry takes the short
+   * branch at the top of the loop: it has no overlay to lay on (rule 1/3), no
+   * `draftOnly` carve-out (rule 2) and no spent-draft state (rule 4). Rule 5 and
+   * the reference-reuse guarantee below apply to it unchanged. #242 half 2.
+   *
    * Entries whose emitted fields are unchanged are returned BY REFERENCE. That
    * is required, not an optimization: `nats-client-wrapper.test.ts` asserts
    * `.toBe` identity for untouched user/notice/history bubbles across a
@@ -1983,22 +2046,58 @@ export class WebChannelNATSClient {
     // Recorded rather than branched on — an unreachable branch with no test is
     // worse than a stated invariant.
     const prevById = new Map(prev.map((m) => [m.id, m] as const));
+    // ⚠️ KIND-GUARDED, MIRRORING THE REDUCER'S `findTextIndex`. The two id spaces
+    // (answer/user bubbles and reasoning blocks) are not provably disjoint — the
+    // reducer's own docblock retracts the id-shape argument that used to claim
+    // they were — so a lookup must only carry client-local fields ACROSS a
+    // matching kind. Without this a colliding id would let a bubble's overlay be
+    // spread under a reasoning entry (or vice versa), which is how a fabricated
+    // `role` would get into the view by the back door.
+    const prevBubble = (id: string): ChatBubble | undefined => {
+      const held = prevById.get(id);
+      return held !== undefined && held.kind === undefined ? held : undefined;
+    };
+    const prevReasoning = (id: string): ChatReasoningMessage | undefined => {
+      const held = prevById.get(id);
+      return held !== undefined && held.kind === "reasoning" ? held : undefined;
+    };
     const out: ChatMessage[] = [];
     for (const entry of view) {
-      // ⚠️ #242 half 1: `state.messages` IS THE CHAT-BUBBLE LIST, and a reasoning
-      // block is not a chat bubble here. The client still renders reasoning from
-      // its own `state.reasoning` array (`upsertReasoning`) and constructs no
-      // `reasoning` DurableEvent, so this branch is UNREACHABLE from the client
-      // today — the reducer's reasoning variant exists for the PLUGIN's journal
-      // replay (`journal-history.ts`), the only production code that folds one.
+      // ⚠️ #242 half 2: A REASONING ENTRY IS CARRIED, NOT SKIPPED. Half 1 had a
+      // `continue` here because `state.messages` was the chat-BUBBLE list and
+      // the client rendered reasoning from a separate `state.reasoning` array.
+      // Half 2 made `ChatMessage` a tagged union and moved reasoning into this
+      // array, so the entry maps across as itself.
       //
-      // It is a `continue` rather than a cast because the alternative is to make
-      // up a `role` for a message the wire gives none, which `DurableMessage`'s
-      // docblock refuses. Half 2 is what decides how a reasoning message renders
-      // and routes it here; until then, silently carrying one into
-      // `state.messages` would render it as an agent bubble.
-      if (entry.kind !== "text") continue;
-      const base = prevById.get(entry.id);
+      // It carries NO overlay and NO `role` — see `ChatReasoningMessage` for why
+      // neither can apply. The one client-local field it can hold is `ts`
+      // (hydration metadata off a `history` row), and it is inherited from the
+      // previous entry exactly the way rule 1 inherits the bubble overlay.
+      //
+      // ⚠️ THE `ts` INHERITANCE IS WHY THIS BRANCH CANNOT BE A BARE `push`. A
+      // reload hydrates the block with a `ts`; the very next durable frame
+      // re-projects and re-merges the whole view, and building a fresh
+      // `{kind,id,turnId,text}` would silently drop it.
+      if (entry.kind === "reasoning") {
+        const prevEntry = prevReasoning(entry.id);
+        const nextReasoning: ChatReasoningMessage = {
+          kind: "reasoning",
+          id: entry.id,
+          turnId: entry.turnId,
+          text: entry.text,
+        };
+        // Assigned rather than written in the literal for the same reason the
+        // bubble branch assigns `turnId`: an own `ts: undefined` key would fail
+        // `sameChatMessage`'s key-count check and defeat the identity reuse.
+        if (prevEntry?.ts !== undefined) nextReasoning.ts = prevEntry.ts;
+        out.push(
+          prevEntry !== undefined && sameChatMessage(prevEntry, nextReasoning)
+            ? prevEntry
+            : nextReasoning,
+        );
+        continue;
+      }
+      const base = prevBubble(entry.id);
       const overlay = local !== undefined && Object.hasOwn(local, entry.id)
         ? local[entry.id]
         : undefined;
@@ -2006,7 +2105,7 @@ export class WebChannelNATSClient {
       const overlaySetsDraftOnly = overlay !== undefined && "draftOnly" in overlay;
       const draftOnly = overlaySetsDraftOnly ? overlay.draftOnly : base?.draftOnly;
       const turnId = entry.turnId ?? base?.turnId;
-      const next: ChatMessage = {
+      const next: ChatBubble = {
         ...base,
         id: entry.id,
         role: entry.role,
@@ -2018,9 +2117,10 @@ export class WebChannelNATSClient {
       };
       // Assigned rather than written in the literal so an ABSENT turnId does not
       // become an own `turnId: undefined` key. A history-hydrated bubble is
-      // created without one (`case "history"`'s fresh-insert — the
-      // `inserts.set(cursor, atCursor)` push for a row that matched no tier —
-      // emits exactly `{id, role, text, ts, working}`), and adding the key fails
+      // created without one (`case "history"`'s fresh-insert for a TEXT row that
+      // matched no tier — the `inserts` push in the `m.role` branch, not the
+      // reasoning one above it — emits exactly `{id, role, text, ts, working}`),
+      // and adding the key fails
       // `sameChatMessage`'s key-count check on the very first durable event —
       // silently re-creating a bubble the `.toBe` guarantee says must be reused.
       if (turnId !== undefined) next.turnId = turnId;
@@ -2064,7 +2164,7 @@ export class WebChannelNATSClient {
     bubbleId: string,
     text: string,
     wireId: string,
-    local: Partial<ChatMessage>,
+    local: Partial<ChatBubble>,
     stagedBubble?: ChatMessage,
   ): ChatMessage[] {
     let reducerInput = this.state.messages;
@@ -2096,15 +2196,6 @@ export class WebChannelNATSClient {
     extra?: Partial<InitializedWebChannelState>,
   ): void {
     this.setState({ messages: this.nextDurableMessages(event, local), ...extra });
-  }
-
-  private upsertReasoning(item: ReasoningItem): void {
-    const current = this.state.reasoning;
-    const idx = current.findIndex((entry) => entry.id === item.id);
-    const next = idx === -1
-      ? [...current, item]
-      : current.map((entry, i) => (i === idx ? item : entry));
-    this.setState({ reasoning: next.slice(-100) });
   }
 
   // #97: upsert a tool-activity item by turn-scoped `(turnId, id)`. A later
@@ -2235,7 +2326,7 @@ export class WebChannelNATSClient {
     receiptKey: string,
     state: NonNullable<ChatMessage["sendState"]>,
     failure?: SendFailure,
-    extraBubblePatch?: Partial<ChatMessage>,
+    extraBubblePatch?: Partial<ChatBubble>,
   ): void {
     const rec = this.receipts.get(receiptKey);
     if (!rec) return;
@@ -2337,16 +2428,26 @@ export class WebChannelNATSClient {
    */
   private patchBubbleByReceiptKey(
     receiptKey: string,
-    patch: Partial<ChatMessage>,
-    extraState?: Partial<InitializedWebChannelState>,
+    patch: Partial<ChatBubble>,
+    extraState?: StatePatch,
   ): void {
-    const idx = this.state.messages.findIndex((m) => m.receiptKey === receiptKey);
+    // ⚠️ `m.kind === undefined` IS PART OF THE PREDICATE, not decoration.
+    // `receiptKey` is a bubble-only field — a reasoning block is never SENT by
+    // this client, so it has no receipt — which makes a match a bubble by
+    // construction. The conjunct is here anyway because "cannot happen" is not a
+    // reason to spread a bubble patch over an entry of another kind. The cast
+    // below records what this predicate already decided; TS cannot carry a
+    // `findIndex` callback's narrowing to the element (the same limitation the
+    // reducer's `applyPlacement` documents).
+    const idx = this.state.messages.findIndex(
+      (m) => m.kind === undefined && m.receiptKey === receiptKey,
+    );
     if (idx === -1) {
       if (extraState) this.setState(extraState);
       return;
     }
     const messages = this.state.messages.slice();
-    messages[idx] = { ...messages[idx], ...patch };
+    messages[idx] = { ...(messages[idx] as ChatBubble), ...patch };
     this.setState({ messages, ...(extraState ?? {}) });
   }
 
@@ -2439,6 +2540,15 @@ export class WebChannelNATSClient {
          * renders nothing whether it is dropped or kept. We cannot do better
          * here, because `draftOnly` is exactly the discriminator the wire does
          * not carry.
+         *
+         * ⚠️ IT CANNOT EAT A REASONING ROW, AND THE REASON IS THE `role` TEST,
+         * NOT THE TEXT TEST (#242 half 2 — checked, because "empty text" would
+         * be the tempting thing to blame). A reasoning row carries NO `role`, so
+         * the first conjunct is already false and the row is kept whatever its
+         * text says. There is also no empty reasoning row to keep: the plugin's
+         * `closeLiveBurst` only emits the burst's durable frame when
+         * `lastDeliveredText.length > 0`, so a burst that reached nobody is
+         * never journaled in the first place.
          */
         const incoming = rawIncoming.filter(
           (m) =>
@@ -2498,6 +2608,13 @@ export class WebChannelNATSClient {
         //      a fresh insert;
         //   2. exact text+role — USER ROWS ONLY. Adopt the server id onto the
         //      first text-matching local echo.
+        // ⚠️ A REASONING ROW USES TIER 1 AND THE FRESH INSERT, AND NOTHING ELSE
+        // (#242 half 2). It is handled in its own branch below, ahead of the
+        // `role` validation, for a reason worth stating here too: reasoning ids
+        // are PLUGIN-minted and identical live and in the snapshot, so tier 1 is
+        // the normal outcome — and tier 2 is closed to it twice over (the
+        // incoming row's `if (m.role === "user")` and the pool's
+        // `isAdoptableUserEcho`).
         // PLACEMENT of the unmatched (fresh) messages is ORDERED, not a blanket
         // prepend (#16). We carry an insertion CURSOR = the index into `next`
         // before which the next fresh message lands; every match/adoption walks
@@ -2530,7 +2647,14 @@ export class WebChannelNATSClient {
         // NEVER be an adoption target — a snapshot row with identical text (the
         // same text sent from another device) would otherwise steal its server id
         // onto our UNSENT bubble, and the later release would run/duplicate it.
-        const isAdoptableUserEcho = (m: ChatMessage): boolean =>
+        // ⚠️ A TYPE PREDICATE, not a `boolean` — #242 half 2. `m.role === "user"`
+        // already excludes a reasoning entry at RUNTIME (it has no role), and
+        // the predicate makes tsc carry that fact to the `adoptKey(m.role, …)`
+        // below instead of leaving `role` possibly-undefined there. It is also
+        // the second of the two independent guards that keep tier 2 off a
+        // reasoning row; the other is the `if (m.role === "user")` on the
+        // incoming row.
+        const isAdoptableUserEcho = (m: ChatMessage): m is ChatBubble =>
           m.role === "user" &&
           m.id.startsWith("u-") &&
           m.pending !== true &&
@@ -2609,8 +2733,55 @@ export class WebChannelNATSClient {
         for (const m of incoming) {
           if (!m || typeof m !== "object") continue;
           if (typeof m.id !== "string" || m.id.length === 0) continue;
-          if (m.role !== "user" && m.role !== "agent") continue;
           if (typeof m.text !== "string") continue;
+          /**
+           * ⚠️ #242 half 2: A REASONING ROW TAKES TIER 1 OR A FRESH INSERT, AND
+           * NOTHING ELSE. Three properties make that safe, and all three were
+           * checked rather than assumed:
+           *
+           *  1. TIER 1 IS THE NORMAL OUTCOME. A reasoning id is minted by the
+           *     PLUGIN (`nextMessageId()` inside the reasoning controller) and
+           *     travels on the live `reasoning` frame; `journalEventForOutbound`
+           *     copies that same `frame.id` into the journal row. So the id this
+           *     device rendered live IS the id the snapshot carries, and
+           *     `seen.has(m.id)` matches it — no adoption, no duplicate.
+           *  2. TIER 2 CANNOT REACH IT, TWICE OVER. The adoption branch is
+           *     gated `if (m.role === "user")`, which a role-less row fails; and
+           *     the pool itself is seeded only from `isAdoptableUserEcho`, which
+           *     tests `m.role === "user"`. So no reasoning row can adopt, and no
+           *     reasoning bubble can BE adopted onto.
+           *  3. A MISS FRESH-INSERTS AT THE CURSOR, exactly like an agent row
+           *     that misses tier 1 — which is the right answer for the same
+           *     reason: with plugin-minted ids, a miss means this device has no
+           *     local counterpart at all.
+           *
+           * `turnId` is REQUIRED on this variant (the wire types it `string`),
+           * so a row without one is dropped rather than inserted with a
+           * fabricated correlation.
+           */
+          if (m.kind === "reasoning") {
+            if (typeof m.turnId !== "string" || m.turnId.length === 0) continue;
+            if (seen.has(m.id)) {
+              const li = localIndexById.get(m.id);
+              if (li !== undefined) {
+                cursor = li + 1;
+                claimed.add(li);
+              }
+              continue;
+            }
+            seen.add(m.id);
+            const atCursorReasoning = inserts.get(cursor) ?? [];
+            atCursorReasoning.push({
+              kind: "reasoning",
+              id: m.id,
+              turnId: m.turnId,
+              text: m.text,
+              ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
+            });
+            inserts.set(cursor, atCursorReasoning);
+            continue;
+          }
+          if (m.role !== "user" && m.role !== "agent") continue;
           if (seen.has(m.id)) {
             const li = localIndexById.get(m.id);
             // Tier-1 match: walk the cursor past this already-held message so
@@ -2931,7 +3102,33 @@ export class WebChannelNATSClient {
 
       case "reasoning": {
         if (!msg.id || !msg.turnId || typeof msg.text !== "string" || msg.text.length === 0) return;
-        this.upsertReasoning({ id: msg.id, turnId: msg.turnId, text: msg.text });
+        // ⚠️ #242 half 2: THROUGH THE SHARED REDUCER, like every other durable
+        // frame. Half 1 called a private `upsertReasoning` over a side array;
+        // that method is deleted, and with it the second implementation the v6
+        // bet cannot afford (N8). The event is byte-identical to the one
+        // `journalEventForOutbound` records for this burst's `final` frame, so a
+        // replay folds the same transition this line does.
+        //
+        // ⚠️ EVERY FRAME, NOT JUST `final`. `msg.final` is deliberately not read
+        // here: the lane streams cumulative FULL text and `applyReasoning` is an
+        // upsert by id, so applying each frame renders the burst live and
+        // converges on exactly the text the `final` frame carries — which is the
+        // text that gets journaled. Gating on `final` would leave the live lane
+        // blank until the burst closed.
+        //
+        // ⚠️ WHAT THIS COSTS. A reasoning frame arrives per cumulative token
+        // update with no throttle, and each one now projects and re-merges the
+        // WHOLE transcript instead of walking a ≤100-entry side array. It is the
+        // same per-frame O(messages) the other durable frames already pay, and
+        // taking a cheaper private path would be the second implementation
+        // again — so the cost is accepted here and tracked as its own issue, not
+        // worked around.
+        this.applyDurable({
+          kind: "reasoning",
+          id: msg.id,
+          turnId: msg.turnId,
+          text: msg.text,
+        });
         // P1-9 §3.6.2: reasoning correlates by turnId — disarm any watched draft
         // for this turn (the turn is demonstrably still producing frames).
         this.disarmStaleDraftsByTurn(msg.turnId);

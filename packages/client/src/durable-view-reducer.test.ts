@@ -376,15 +376,14 @@ describe("step / fold agreement: reduceDurableView === fold of applyDurableEvent
 // REASONING — #242 half 1
 // ---------------------------------------------------------------------------
 //
-// ⚠️ NO EQUIVALENCE ANCHOR IS POSSIBLE FOR THIS TRANSITION YET, and that is a
-// fact about the slice rather than a gap in the suite. Half 1 makes reasoning
-// durable SERVER-side only: the plugin journals one row per burst and
-// `journal-history.ts` replays it. The client still renders reasoning out of its
-// own `state.reasoning` array and routes no `reasoning` frame through the
-// reducer, so driving the real wrapper with a `reasoning` frame would exercise
-// `upsertReasoning`, not this file. These cases therefore assert the PORT and
-// the ONE deliberate difference from it; half 2 is when an anchor becomes
-// meaningful.
+// ✅ AN EQUIVALENCE ANCHOR IS POSSIBLE NOW — see the anchor section below. This
+// block used to say one was impossible, correctly: half 1 made reasoning durable
+// SERVER-side only, the client rendered it from its own `state.reasoning` array,
+// and driving the real wrapper with a `reasoning` frame would have exercised
+// `upsertReasoning` rather than this file. #242 half 2 deleted that method and
+// routed `case "reasoning"` through `applyDurable`, so the fifth anchor is real.
+// These cases still assert the transition on its own; the anchor covers the
+// frame→event mapping.
 describe("applyReasoning — one completed burst per event", () => {
   it("APPENDS an unseen id at the tail, claiming the slot where the EVENT was appended", () => {
     // The whole reason reasoning goes through the reducer: the block gets a
@@ -780,7 +779,7 @@ describe("characterization: the deliberate divergence, and the precondition trap
 // EQUIVALENCE ANCHORS — every transition vs. the REAL client
 // ---------------------------------------------------------------------------
 //
-// Each of the four transitions is anchored by driving the REAL
+// Each transition is anchored by driving the REAL
 // `WebChannelNATSClient` with the REAL wire frames and comparing its projected
 // `state.messages` against the reducer's output for the corresponding event
 // stream:
@@ -789,6 +788,11 @@ describe("characterization: the deliberate divergence, and the precondition trap
 //   placement → a real `progress` frame  → `handleFrame`'s `case "progress"`
 //   bubble    → a real `agent_message`   → `handleFrame`'s `case "agent_message"`
 //   seal      → a real `turn_snapshot`   → `applyTurnSnapshot`
+//   reasoning → a real `reasoning` frame → `handleFrame`'s `case "reasoning"`
+//
+// ⚠️ FIVE, NOT FOUR, SINCE #242 half 2. The header above this section used to
+// say "each of the four", and `reasoning` was explicitly excluded because the
+// client had no consumer to drive. It has one now.
 //
 // ⚠️ READ WHAT THESE NOW PROVE, AND WHAT THEY NO LONGER DO. Until the client was
 // rewired onto the reducer they were genuinely NON-CIRCULAR: two independent
@@ -843,13 +847,16 @@ type WrapperInternals = {
 function seed(w: WrapperInternals, starting: DurableView): void {
   w.state = {
     ...w.state,
-    messages: starting.map((m) => asText(m)).map((m) => ({
-      id: m.id,
-      role: m.role,
-      text: m.text,
-      turnId: m.turnId,
-      working: false,
-    })),
+    // ⚠️ KIND-PRESERVING since #242 half 2. This used to force every entry
+    // through `asText`; a reasoning entry in the starting view would now be
+    // seeded as a role-less TEXT bubble, and the round trip through
+    // `projectDurableFromClient` would report a divergence the client does not
+    // have.
+    messages: starting.map((m) =>
+      m.kind === "reasoning"
+        ? { kind: "reasoning", id: m.id, turnId: m.turnId, text: m.text }
+        : { id: m.id, role: m.role, text: m.text, turnId: m.turnId, working: false },
+    ),
   };
 }
 
@@ -865,13 +872,7 @@ function seed(w: WrapperInternals, starting: DurableView): void {
  */
 function projectWrapper(messages: Array<Record<string, unknown>>): DurableView {
   return projectDurableFromClient(
-    messages as unknown as Array<{
-      id: string;
-      role: DurableRole;
-      text: string;
-      turnId?: string;
-      draftOnly?: boolean;
-    }>,
+    messages as unknown as Parameters<typeof projectDurableFromClient>[0],
   );
 }
 
@@ -1255,4 +1256,187 @@ describe("equivalence anchor: reduceDurableView(seal) ≡ real turn_snapshot han
       expect(reducerResult).toEqual(realResult);
     });
   }
+});
+
+describe("equivalence anchor: reasoning ≡ a real reasoning frame", () => {
+  /** Build a `reasoning` wire frame (`channel-contract.ts` — `turnId` REQUIRED). */
+  function reasoningFrame(
+    id: string,
+    turnId: string,
+    text: string,
+    final?: boolean,
+  ): InboundMessage {
+    return {
+      type: "reasoning",
+      id,
+      turnId,
+      text,
+      ...(final === undefined ? {} : { final }),
+    } as unknown as InboundMessage;
+  }
+
+  it("appends an unseen burst at the tail, among the turn's bubbles", () => {
+    const prior: DurableEvent[] = [
+      { kind: "bubble", answerId: "A", turnId: TURN, text: "first" },
+    ];
+    const starting = reduceDurableView(prior);
+    const event: DurableEvent = { kind: "reasoning", id: "r1", turnId: TURN, text: "hmm" };
+
+    expect(realDrive(starting, [reasoningFrame("r1", TURN, "hmm")])).toEqual(
+      reduceDurableView([...prior, event]),
+    );
+  });
+
+  it("upserts by id across a whole cumulative burst — N frames, ONE entry", () => {
+    // The live lane sends a frame per cumulative token update, each carrying the
+    // full text so far, and closes with one more carrying `final: true`. The
+    // JOURNAL records only that last one. This is the anchor that makes the two
+    // agree: folding all N frames converges on exactly the single `final` event.
+    const frames = [
+      reasoningFrame("r1", TURN, "Let"),
+      reasoningFrame("r1", TURN, "Let me"),
+      reasoningFrame("r1", TURN, "Let me think"),
+      reasoningFrame("r1", TURN, "Let me think", true),
+    ];
+    const journaled: DurableEvent[] = [
+      { kind: "reasoning", id: "r1", turnId: TURN, text: "Let me think" },
+    ];
+    expect(realDrive([], frames)).toEqual(reduceDurableView(journaled));
+  });
+
+  it("a second burst claims its own slot after the answer it followed", () => {
+    const prior: DurableEvent[] = [
+      { kind: "reasoning", id: "r1", turnId: TURN, text: "first thought" },
+      { kind: "bubble", answerId: "A", turnId: TURN, text: "an answer" },
+    ];
+    const starting = reduceDurableView(prior);
+    const event: DurableEvent = { kind: "reasoning", id: "r2", turnId: TURN, text: "second" };
+    expect(realDrive(starting, [reasoningFrame("r2", TURN, "second")])).toEqual(
+      reduceDurableView([...prior, event]),
+    );
+  });
+
+  it("the MAPPER drops a frame the reducer could not represent, and the anchor sees it", () => {
+    // `case "reasoning"`'s guard, stated as an equivalence rather than as a unit
+    // test of the guard: a frame with no `turnId` (or empty text) produces NO
+    // event, because `DurableMessage`'s reasoning variant requires a `turnId`
+    // and the client refuses to invent one.
+    const starting = reduceDurableView([
+      { kind: "bubble", answerId: "A", turnId: TURN, text: "a" },
+    ]);
+    for (const bad of [
+      { type: "reasoning", id: "r1", text: "orphan" },
+      { type: "reasoning", id: "r1", turnId: "", text: "orphan" },
+      { type: "reasoning", id: "r1", turnId: TURN, text: "" },
+      { type: "reasoning", turnId: TURN, text: "no id" },
+    ]) {
+      expect(realDrive(starting, [bad as unknown as InboundMessage])).toEqual(starting);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ⭐ THE v6 BET, END TO END, FOR REASONING (#242 half 2)
+// ---------------------------------------------------------------------------
+//
+// "A reasoning block the user watched live is still there after a reload, in the
+// position it was delivered." That sentence is the slice, and this is the case
+// that decides it. It is deliberately NOT a reducer-vs-reducer comparison:
+//
+//   LIVE    — the REAL `WebChannelNATSClient`, driven by the REAL wire frames a
+//             turn emits, INCLUDING the untorn cumulative reasoning stream.
+//   REPLAY  — the REAL `history` frame the plugin would serve for the same turn,
+//             delivered to a FRESH client with empty state, which is exactly what
+//             a reload does.
+//
+// The `history` rows are built here from the journal's OWN rule — one row per
+// burst, from the `final: true` frame — rather than by calling the plugin, since
+// this file may not import it (the client package is zero-dependency). The
+// plugin side of the same property is pinned in
+// `packages/plugin/src/journal-history.test.ts`; the seam between them is the
+// wire shape, which `packages/plugin/src/channel-contract.ts` owns.
+describe("live == history for reasoning: a reload reproduces what was watched", () => {
+  function reasoningFrame(id: string, turnId: string, text: string, final?: boolean): InboundMessage {
+    return {
+      type: "reasoning",
+      id,
+      turnId,
+      text,
+      ...(final === undefined ? {} : { final }),
+    } as unknown as InboundMessage;
+  }
+
+  it("same content, same position — across a turn with two bursts and two answers", () => {
+    // ── LIVE ──
+    const w = newWrapper() as unknown as WrapperInternals;
+    // A burst streams token by token, then closes.
+    w.handleMessage(reasoningFrame("r1", TURN, "Let"));
+    w.handleMessage(reasoningFrame("r1", TURN, "Let me"));
+    w.handleMessage(reasoningFrame("r1", TURN, "Let me think"));
+    w.handleMessage(reasoningFrame("r1", TURN, "Let me think", true));
+    // The answer streams and finalizes.
+    w.handleMessage(progressFrame("A", "Working…", TURN));
+    w.handleMessage(agentMessageFrame("A", "first answer", TURN));
+    // A SECOND burst, after the first answer.
+    w.handleMessage(reasoningFrame("r2", TURN, "and also", true));
+    w.handleMessage(agentMessageFrame("B", "second answer", TURN));
+
+    const live = w.state.messages;
+    expect(live.map((m) => m.id)).toEqual(["r1", "A", "r2", "B"]);
+
+    // ── REPLAY ── the rows the plugin's projection emits for that same journal,
+    // in the reducer's order, `ts` attached. Reasoning rows carry NO `role`.
+    const served = [
+      { kind: "reasoning", id: "r1", turnId: TURN, text: "Let me think", ts: 1 },
+      { id: "A", role: "agent", text: "first answer", ts: 2 },
+      { kind: "reasoning", id: "r2", turnId: TURN, text: "and also", ts: 3 },
+      { id: "B", role: "agent", text: "second answer", ts: 4 },
+    ];
+    const fresh = newWrapper() as unknown as WrapperInternals;
+    fresh.handleMessage({ type: "history", messages: served } as unknown as InboundMessage);
+    const replayed = fresh.state.messages;
+
+    // ⭐ SAME CONTENT, SAME POSITION. Compared on the DURABLE fields only —
+    // `ts`/`working` are the client-local overlay §0.1 puts on the app's side of
+    // the split, and a live bubble legitimately has no `ts`.
+    const durable = (list: Array<Record<string, unknown>>) =>
+      list.map((m) =>
+        m.kind === "reasoning"
+          ? { kind: "reasoning", id: m.id, turnId: m.turnId, text: m.text }
+          : { id: m.id, role: m.role, text: m.text },
+      );
+    expect(durable(replayed)).toEqual(durable(live));
+
+    // And the derived public surface agrees too, since that is what a widget
+    // reads: same bursts, same order, same text.
+    const reasoningOf = (x: WrapperInternals) =>
+      (x.state as unknown as { reasoning: unknown[] }).reasoning;
+    expect(reasoningOf(fresh)).toEqual(reasoningOf(w));
+    expect(reasoningOf(fresh)).toEqual([
+      { id: "r1", turnId: TURN, text: "Let me think" },
+      { id: "r2", turnId: TURN, text: "and also" },
+    ]);
+  });
+
+  it("a MID-SESSION snapshot re-serving the same turn is a no-op — tier 1 matches by id", () => {
+    // The other half of "still there": a snapshot arrives at every device
+    // mid-session (Phase 6), so the reload path must not DUPLICATE a block this
+    // device already rendered. Reasoning ids are plugin-minted and identical
+    // live and in history, so they match at tier 1.
+    const w = newWrapper() as unknown as WrapperInternals;
+    w.handleMessage(reasoningFrame("r1", TURN, "thinking", true));
+    w.handleMessage(agentMessageFrame("A", "answer", TURN));
+    const before = w.state.messages.map((m) => m.id);
+
+    w.handleMessage({
+      type: "history",
+      messages: [
+        { kind: "reasoning", id: "r1", turnId: TURN, text: "thinking", ts: 1 },
+        { id: "A", role: "agent", text: "answer", ts: 2 },
+      ],
+    } as unknown as InboundMessage);
+
+    expect(w.state.messages.map((m) => m.id)).toEqual(before);
+    expect(w.state.messages.map((m) => m.id)).toEqual(["r1", "A"]);
+  });
 });

@@ -1,5 +1,6 @@
 import type {
   ApprovalRequest,
+  ChatBubble,
   ChatMessage,
   ReasoningItem,
   ToolActivityItem,
@@ -49,9 +50,18 @@ export function composerButtonMode(
  * `isTyping` ("an answer is being composed right now") keeps its base behavior
  * exactly: the reasoning gate belongs to the "agent is typing…" line ALONE,
  * because a live reasoning lane is that same signal in richer form. It must NOT
- * gate the gap hint: `state.reasoning` is a rolling buffer with no liveness
- * notion, so one reasoning frame anywhere in the turn would otherwise suppress
- * the gap hint for the rest of it — exactly the case #96 is about.
+ * gate the gap hint: `state.reasoning` carries no liveness notion, so one
+ * reasoning block anywhere in the turn would otherwise suppress the gap hint for
+ * the rest of it — exactly the case #96 is about.
+ *
+ * ⚠️ THAT ARGUMENT GOT STRONGER, NOT WEAKER, IN #242 half 2 — check it before
+ * "simplifying" this. `state.reasoning` used to be a capped rolling buffer; it
+ * is now DERIVED from `state.messages` and UNCAPPED, so it also holds blocks
+ * REPLAYED FROM HISTORY. The turn-scoped match is what keeps that harmless: it
+ * compares against `latestUser.turnId`, and a history-hydrated user row is
+ * fresh-inserted WITHOUT a `turnId` (`case "history"` emits exactly
+ * `{id, role, text, ts, working}`), so a reload cannot make an old block speak
+ * for a new turn. Dropping the turn scope would.
  *
  * In the gap (`turnActive` true, nothing typing) the line softens to "still
  * working…", except when something louder already speaks for the turn: a live
@@ -85,28 +95,43 @@ export function activityHint(state: {
   return "still working…";
 }
 
+/**
+ * One drawable row.
+ *
+ * ⚠️ `message` CARRIES A `ChatBubble`, NOT A `ChatMessage` — that narrowing is
+ * where the widget's compile-time safety against drawing a reasoning block as an
+ * agent bubble lives (#242 half 2; `ChatMessage`'s docblock explains why the
+ * union itself is readable without narrowing). A widget cannot reach `m.role`
+ * or `m.text` here without first switching on this `kind`.
+ */
 export type ConversationPresentationItem =
-  | { kind: "message"; value: ChatMessage }
+  | { kind: "message"; value: ChatBubble }
   | { kind: "reasoning"; value: ReasoningItem }
   | { kind: "tool_activity"; value: ToolActivityItem };
 
 /**
- * Place ephemeral reasoning and tool activity (#97) after their user anchor and
- * before their turn answer. Both lanes correlate by `turnId`; tool activity is
- * emitted right after any reasoning for the same turn so it reads as
- * subordinate, live turn detail.
+ * Order the transcript for rendering.
+ *
+ * ⚠️ REASONING IS NO LONGER INTERLEAVED HERE (#242 half 2). This function used
+ * to take a separate `reasoning` array and place each burst after its user
+ * anchor by `turnId`, grouped per turn — a SECOND opinion about ordering, held
+ * by the renderer. Reasoning is a durable message now: it sits in
+ * `state.messages` at the position the stream put it, and the reducer owns that
+ * position on both the live and the replayed side. Re-deriving it from `turnId`
+ * would put a third answer next to those two, and it would be WRONG in exactly
+ * the cases the id ordering gets right (two bursts around one answer, a burst
+ * whose turn has no user anchor in view).
+ *
+ * ⚠️ TOOL ACTIVITY IS STILL INTERLEAVED, and that is not an inconsistency: it is
+ * still EPHEMERAL (`#242 half 3` is what makes it durable), so it lives in its
+ * own array with no position of its own and `turnId` is the only anchor there
+ * is. When half 3 lands, this function should lose the second lane the same way
+ * it just lost the first.
  */
 export function orderConversationPresentation(
   messages: readonly ChatMessage[],
-  reasoning: readonly ReasoningItem[],
   toolActivity: readonly ToolActivityItem[] = [],
 ): ConversationPresentationItem[] {
-  const reasoningByTurn = new Map<string, ReasoningItem[]>();
-  for (const item of reasoning) {
-    const items = reasoningByTurn.get(item.turnId) ?? [];
-    items.push(item);
-    reasoningByTurn.set(item.turnId, items);
-  }
   const toolByTurn = new Map<string, ToolActivityItem[]>();
   for (const item of toolActivity) {
     const items = toolByTurn.get(item.turnId) ?? [];
@@ -117,24 +142,25 @@ export function orderConversationPresentation(
   const result: ConversationPresentationItem[] = [];
   const emitTurnLanes = (turnId: string): void => {
     if (emitted.has(turnId)) return;
-    const reasoningItems = reasoningByTurn.get(turnId);
     const toolItems = toolByTurn.get(turnId);
-    if (!reasoningItems && !toolItems) return;
+    if (!toolItems) return;
     emitted.add(turnId);
-    if (reasoningItems) {
-      result.push(...reasoningItems.map((value) => ({ kind: "reasoning" as const, value })));
-    }
-    if (toolItems) {
-      result.push(...toolItems.map((value) => ({ kind: "tool_activity" as const, value })));
-    }
+    result.push(...toolItems.map((value) => ({ kind: "tool_activity" as const, value })));
   };
 
   for (const message of messages) {
+    if (message.kind === "reasoning") {
+      // In place, from the array — no turn lookup and no grouping.
+      result.push({
+        kind: "reasoning",
+        value: { id: message.id, turnId: message.turnId, text: message.text },
+      });
+      continue;
+    }
     if (message.role === "agent" && message.turnId) emitTurnLanes(message.turnId);
     result.push({ kind: "message", value: message });
     if (message.role === "user" && message.turnId) emitTurnLanes(message.turnId);
   }
-  for (const turnId of reasoningByTurn.keys()) emitTurnLanes(turnId);
   for (const turnId of toolByTurn.keys()) emitTurnLanes(turnId);
   return result;
 }

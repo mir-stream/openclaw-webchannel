@@ -4,7 +4,24 @@ import type { CommandCatalogEntry } from "./commands-catalog.js";
 export const WEBCHANNEL_ID = "webchannel";
 export { ANON_PEER_ID };
 /**
- * A normalized transcript row on the hydration wire.
+ * ⚠️ THIS FILE IS THE ONLY DECLARATION OF THE HISTORY WIRE ROW (#305).
+ *
+ * There used to be two — this one and `history.ts`'s — and they had already
+ * drifted on `ts` (optional here, required there). #242 half 2 collapsed them:
+ * `history.ts` now RE-EXPORTS `HistoryMessage` from here and expresses its
+ * projection-side "`ts` is always present" as `ProjectedHistoryMessage`, a type
+ * DERIVED from this one, so the relationship is checked by tsc instead of
+ * asserted in prose. Do not restate this shape anywhere else.
+ */
+
+/**
+ * A chat bubble on the hydration wire — the row shape that has always been
+ * here.
+ *
+ * ⚠️ `kind` IS ABSENT ON THIS VARIANT, ON THE WIRE AS WELL AS IN THE TYPE, and
+ * that is the whole backward-compatibility story (see `HistoryMessage`). A text
+ * row serialized by this build is byte-identical to one serialized before #242
+ * half 2.
  *
  * #95: hydration reproduces the role, sanitized text, order, row identity, and
  * optional timestamp present in this projection. It does not reproduce every
@@ -21,17 +38,80 @@ export { ANON_PEER_ID };
  *    retry or fallback. Textless or sanitized-away attempts produce no row, so
  *    the projection cannot expose a retry-safe terminal failure signal.
  *  - `working`, `wireId`, `sendState` — live-only client state.
- *  - reasoning previews, typing, and tool progress — ephemeral by design
- *    (`docs/P1_REASONING_LANE_PLAN.md`), matching what Telegram does.
+ *  - typing and tool progress — ephemeral by design, matching what Telegram
+ *    does. ⚠️ REASONING IS NO LONGER ON THAT LIST: #242 made it durable
+ *    (server side in half 1, readable in half 2), and it travels as the sibling
+ *    variant below. `docs/P1_REASONING_LANE_PLAN.md`'s "ephemeral by design"
+ *    line is superseded for reasoning and still holds for the other two.
  *
  * Full rationale: `docs/ISSUE_95_HISTORY_CONTRACT_PLAN.md`.
  */
-export type HistoryMessage = {
+export type HistoryTextMessage = {
+  /**
+   * Never present. The discriminant lives here as `undefined` so tsc treats the
+   * two variants as a discriminated union rather than as two overlapping
+   * records — and so that WRITING a `kind` onto a text row is a compile error.
+   */
+  kind?: undefined;
   id: string;
   role: "user" | "agent";
   text: string;
   ts?: number;
 };
+
+/**
+ * ONE COMPLETED REASONING BURST on the hydration wire (#242 half 2).
+ *
+ * ⚠️ IT HAS NO `role`, AND THAT IS NOT AN OVERSIGHT TO FIX. The live `reasoning`
+ * frame carries none and `DurableMessage` (the reducer's SSOT shape, which this
+ * mirrors) refuses to invent one — a fabricated author inside the system of
+ * record is the N8 shape. The absence is also what makes the widening SAFE FOR
+ * OLDER CLIENTS, which is the reason the union is shaped this way rather than
+ * as an optional `role`:
+ *
+ *   MEASURED against the shipped client's `case "history"`
+ *   (`packages/client/src/nats-client-wrapper.ts`): its per-row validation runs
+ *   `if (m.role !== "user" && m.role !== "agent") continue;` BEFORE any tier
+ *   matching or insertion. A row with no `role` therefore takes that `continue`
+ *   and is DROPPED — never adopted, never inserted, never rendered as an agent
+ *   bubble. So an older client shows a reload without the reasoning blocks,
+ *   exactly as it does today, and a newer one shows them.
+ *
+ *   That guard is not new in this slice, and it is not a claim about ONE build:
+ *   `git show <tag>:packages/client/src/nats-client-wrapper.ts | grep -c` finds
+ *   it in EVERY released tag — v0.4.0, v0.5.0, v0.6.0, v0.6.1 and v0.7.0, one
+ *   occurrence each. There is no published client that predates it, so there is
+ *   no version of this package that mis-renders the new row.
+ *
+ * `turnId` is REQUIRED, following the live frame (`turnId: string`) and
+ * `DurableMessage`'s reasoning variant. `ts` is the same hydration metadata the
+ * text variant carries — see `history.ts`'s note; it is NOT an ordering key.
+ */
+export type HistoryReasoningMessage = {
+  kind: "reasoning";
+  id: string;
+  turnId: string;
+  text: string;
+  ts?: number;
+};
+
+/**
+ * One row on the hydration wire: a chat bubble, or a completed reasoning burst.
+ *
+ * ⚠️ A TAGGED UNION, MIRRORING `DurableMessage` — NOT A WIDENED RECORD. The
+ * reducer already solved this shape and its docblock carries the argument: an
+ * optional `role` would force every consumer to decide what an absent one means
+ * at the point it renders, which is the "infer identity from a missing field"
+ * habit v6 exists to remove. Two variants make a consumer that forgot one a
+ * COMPILE error.
+ *
+ * ⚠️ THE TAG IS PRESENT ONLY ON THE REASONING VARIANT, DELIBERATELY. Emitting
+ * `kind: "text"` on every bubble would change the serialized form of every row
+ * that exists today for no gain; leaving it absent keeps the widening strictly
+ * ADDITIVE — an older PLUGIN's rows still parse (no tag ⇒ bubble), and an older
+ * CLIENT drops the new rows on the `role` guard quoted above.
+ */
+export type HistoryMessage = HistoryTextMessage | HistoryReasoningMessage;
 
 export type ApprovalDecision = "allow-once" | "allow-always" | "deny";
 export type ApprovalOption = { decision: ApprovalDecision; label: string; style: string };

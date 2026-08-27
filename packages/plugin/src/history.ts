@@ -21,11 +21,22 @@
  * paths — the wire type the `history` frame carries, the operator config block,
  * and the pure wire→plan mapping. Do not grow a reader back into this file.
  */
+import type { HistoryMessage as WireHistoryMessage } from "./channel-contract.js";
 
 /**
  * History messages that travel on the wire and live in client state.
  *
- * Mirrored on the client side as `ChatMessage` in `packages/client/src/types.ts`.
+ * ⚠️ RE-EXPORTED, NOT RE-DECLARED (#305). This file used to carry its OWN
+ * `HistoryMessage` — `{id, role, text, ts}` with `ts` REQUIRED — beside
+ * `channel-contract.ts`'s `{id, role, text, ts?}`. Two independent declarations
+ * of one wire type, already drifted on `ts`, which made every widening a
+ * two-file change and every reader's "which one is this?" a real question. The
+ * wire shape belongs to `channel-contract.ts`; the only thing this module adds
+ * is the PROJECTION's stronger `ts` guarantee, expressed below as a DERIVED
+ * type so tsc checks the relationship instead of a comment asserting it.
+ *
+ * Mirrored on the client side as `ChatMessage` in `packages/client/src/types.ts`
+ * — which #242 half 2 made a tagged union for the same reason this one is.
  *
  * `ts` is HYDRATION METADATA — a server-recorded millisecond timestamp so a
  * rehydrated bubble can show when it was said. ⚠️ IT IS NOT AN ORDERING KEY, and
@@ -40,12 +51,32 @@
  * widget) keep `ts` absent; the widget assigns one on receive, but the field is
  * wire-shaped.
  */
-export type HistoryMessage = {
-  id: string;
-  role: "user" | "agent";
-  text: string;
-  ts: number;
-};
+export type {
+  HistoryMessage,
+  HistoryReasoningMessage,
+  HistoryTextMessage,
+} from "./channel-contract.js";
+
+/**
+ * What `journal-history.ts` PRODUCES: a wire row whose `ts` is always present.
+ *
+ * ⚠️ DERIVED FROM THE WIRE TYPE, NEVER RESTATED. `Required<Pick<…, "ts">>` is
+ * what makes this a CHECKED relationship: rename or drop `ts` on the wire and
+ * this line fails to compile, instead of silently becoming a second, drifting
+ * declaration — which is exactly what #305 was.
+ *
+ * The intersection distributes over the union, so `kind === "reasoning"` still
+ * narrows a `ProjectedHistoryMessage` the same way it narrows the wire type.
+ *
+ * WHY THE PROJECTION IS STRONGER THAN THE WIRE. `projectJournalHistory` sources
+ * a `ts` for every row it emits (the `created_ms` of the row whose event first
+ * names that id, or the documented fallback), so the value is never absent on
+ * the way out. The WIRE stays optional because it also describes rows this
+ * package does not produce — an older plugin's, and the shape a client is
+ * allowed to receive.
+ */
+export type ProjectedHistoryMessage = WireHistoryMessage &
+  Required<Pick<WireHistoryMessage, "ts">>;
 
 /** Resolved `channels.webchannel.history` config block. */
 export type HistoryConfig = {

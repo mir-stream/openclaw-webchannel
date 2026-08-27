@@ -215,8 +215,29 @@ export type InboundMessage = {
   options?: Array<{ decision: string; label: string; style: string }>;
   expiresAtMs?: number;
   decision?: string;
-  /** Transcript rows on a `history` (additive merge) frame. */
-  messages?: Array<{ id: string; role: string; text: string; ts?: number }>;
+  /**
+   * Transcript rows on a `history` (additive merge) frame.
+   *
+   * ⚠️ RE-DECLARED LOOSELY ON PURPOSE — this package is zero-dependency and does
+   * not import the plugin's `HistoryMessage`. It mirrors that TAGGED UNION
+   * (#242 half 2) flattened into one optional-field record, so the wrapper's
+   * `case "history"` does the discrimination at runtime, where it has to anyway:
+   * these values come off the wire and nothing has validated them.
+   *  - `kind` absent  → a chat bubble; `role` is `"user" | "agent"`;
+   *  - `kind: "reasoning"` → a completed reasoning burst; NO `role`, and
+   *    `turnId` is required.
+   * `role` is optional here because the reasoning variant carries none — the
+   * wrapper's existing `m.role !== "user" && m.role !== "agent"` guard is what
+   * keeps an unrecognised shape out of the transcript.
+   */
+  messages?: Array<{
+    id: string;
+    kind?: string;
+    role?: string;
+    text: string;
+    ts?: number;
+    turnId?: string;
+  }>;
   /**
    * #212: on a `turn_snapshot` frame, the plugin's authoritative ordered agent
    * ANSWER bubbles for the turn (each `{id, text}`). The client re-declares this

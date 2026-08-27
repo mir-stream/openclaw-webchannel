@@ -249,7 +249,15 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // same edit: a floor that drops while the lines merely relocate to an
   // unwatched file is the audit going blind, which is the failure this per-file
   // floor exists to make visible.
-  "nats-account-runtime.ts": { statements: 19, interpolations: 37 },
+  //
+  // #242 half 2 adds ONE statement (19→20) and ONE interpolation (37→38): the
+  // config-time reasoning diagnostic, which fires when
+  // `capabilities.reasoningDurable` is on while `capabilities.reasoning` is off.
+  // Its single interpolation is `logSafe(accountId)`, so it is WRAPPED and adds
+  // NO entry to `KNOWN_RAW` above — which is the whole point of checking both
+  // numbers rather than just the floor: a raw value would have shown up there
+  // instead, and the baseline is exact-multiset.
+  "nats-account-runtime.ts": { statements: 20, interpolations: 38 },
   "auth.ts": { statements: 16, interpolations: 5 },
   "nats-channel.ts": { statements: 22, interpolations: 33 },
   // ⚠️ ZERO, AND THE ENTRY STAYS — BUT IT GUARANTEES LESS THAN IT LOOKS LIKE.

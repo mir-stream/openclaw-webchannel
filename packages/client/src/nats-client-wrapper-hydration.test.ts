@@ -611,3 +611,114 @@ describe("#240 half 2 — an unauthored placement row is dropped on arrival", ()
     ]);
   });
 });
+
+/**
+ * #242 half 2 — a `history` frame can now carry REASONING ROWS.
+ *
+ * `case "history"` predates reasoning entirely, so every rule in it was written
+ * about a row with a `role`. These cases pin what each of those rules does when
+ * it meets a row that has none, which is the shape the plugin now serves.
+ */
+describe("history hydration — reasoning rows (#242 half 2)", () => {
+  const reasoningRow = (id: string, turnId: string, text: string, ts?: number): Row =>
+    ({ kind: "reasoning", id, turnId, text, ...(ts === undefined ? {} : { ts }) }) as unknown as Row;
+
+  it("hydrates a cold reload into one entry per row, in row order", () => {
+    const w = makeWrapper();
+    deliver(
+      w,
+      history(
+        { id: "u1", role: "user", text: "why?", ts: 1 },
+        reasoningRow("r1", "t1", "let me think", 2),
+        { id: "a1", role: "agent", text: "because", ts: 3 },
+      ),
+    );
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["u1", "r1", "a1"]);
+    expect(w.getState().messages[1]).toEqual({
+      kind: "reasoning",
+      id: "r1",
+      turnId: "t1",
+      text: "let me think",
+      ts: 2,
+    });
+    // The public derived surface follows.
+    expect(w.getState().reasoning).toEqual([
+      { id: "r1", turnId: "t1", text: "let me think" },
+    ]);
+  });
+
+  it("tier 1 matches a block this device rendered live — no duplicate", () => {
+    const w = makeWrapper();
+    deliver(w, { type: "reasoning", id: "r1", turnId: "t1", text: "thinking" });
+    deliver(w, history(reasoningRow("r1", "t1", "thinking", 5)));
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["r1"]);
+  });
+
+  it("the empty-agent-row filter cannot eat a reasoning row — it tests `role`", () => {
+    // The filter's first conjunct is `role === "agent"`, which a role-less row
+    // fails, so the text test is never reached. Driven with EMPTY text so the
+    // second conjunct is true and only the first can be doing the work.
+    const w = makeWrapper();
+    deliver(w, history(reasoningRow("r1", "t1", "", 1)));
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["r1"]);
+  });
+
+  it("drops a reasoning row with no usable turnId rather than inventing one", () => {
+    const w = makeWrapper();
+    deliver(
+      w,
+      history(
+        { kind: "reasoning", id: "r1", text: "orphan", ts: 1 } as unknown as Row,
+        { kind: "reasoning", id: "r2", turnId: "", text: "orphan", ts: 2 } as unknown as Row,
+        { id: "a1", role: "agent", text: "kept", ts: 3 },
+      ),
+    );
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["a1"]);
+  });
+
+  it("tier 2 can never adopt onto, or from, a reasoning row", () => {
+    // The user echo and the reasoning block carry IDENTICAL text, so a
+    // text-only match would swap them. Two independent guards stop it: the
+    // incoming row's `if (m.role === "user")`, and the adoptable pool's
+    // `isAdoptableUserEcho`.
+    const w = makeWrapper();
+    w.send("same text");
+    deliver(w, { type: "reasoning", id: "r-live", turnId: "t1", text: "same text" });
+    deliver(
+      w,
+      history(
+        { id: "wire-u1", role: "user", text: "same text", ts: 1 },
+        reasoningRow("r-hist", "t1", "same text", 2),
+      ),
+    );
+    const ids = w.getState().messages.map((m) => m.id);
+    // The user echo adopted the WIRE id (tier 2, as designed) ...
+    expect(ids).toContain("wire-u1");
+    expect(ids).not.toContain("u-0");
+    // ... the live reasoning block kept its own id, untouched ...
+    expect(ids).toContain("r-live");
+    // ... and the snapshot's reasoning row fresh-inserted rather than adopting.
+    expect(ids).toContain("r-hist");
+    // Nothing was destroyed: two reasoning entries, one user echo. ⚠️ THE ORDER
+    // IS `r-hist` FIRST, and that is the ordered-insertion cursor (#16) working
+    // as designed, not a reasoning quirk: the adopted user echo walks the cursor
+    // to its own index + 1, so the next fresh row lands immediately after it —
+    // ahead of `r-live`, which is a purely local block this snapshot does not
+    // carry. Any snapshot that DID carry it would tier-1 match instead.
+    expect(ids).toEqual(["wire-u1", "r-hist", "r-live"]);
+    expect(w.getState().reasoning.map((r) => r.id)).toEqual(["r-hist", "r-live"]);
+  });
+
+  it("an older PAGE prepends its reasoning rows in order, before the live tail", () => {
+    const w = makeWrapper();
+    deliver(w, { type: "agent_message", id: "a-new", turnId: "t2", text: "recent" });
+    deliver(
+      w,
+      history(
+        { id: "u-old", role: "user", text: "older", ts: 1 },
+        reasoningRow("r-old", "t1", "older thought", 2),
+      ),
+    );
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["u-old", "r-old", "a-new"]);
+  });
+});

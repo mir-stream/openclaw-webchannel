@@ -290,9 +290,11 @@ export async function createWidget(
     const nextMdCache = new Map<string, HTMLElement>();
     const openReasoningIds = captureOpenReasoningIds(list);
     const bubbles: HTMLElement[] = [];
+    // #242 half 2: `state.reasoning` is no longer passed — reasoning lives in
+    // `state.messages` at its own position now, and re-supplying the derived
+    // array would ask this function to place the same blocks twice.
     for (const presentation of orderConversationPresentation(
       state.messages,
-      state.reasoning,
       state.toolActivity ?? [],
     )) {
       if (presentation.kind === "reasoning") {
@@ -528,8 +530,17 @@ export async function createWidget(
   historyBtn.onclick = () => {
     // P1-9: a local-only id (held pending / retracted) must never be sent as a
     // `before` cursor — exclude them from the oldest-cursor pick.
+    //
+    // ⚠️ #242 half 2 ADDS A REASONING ROW TO THAT EXCLUSION, and it is the same
+    // rule, not a new one: a reasoning block is only in the journal for an
+    // account that opted into `capabilities.reasoningDurable` (default OFF), so
+    // on a default deployment a LIVE reasoning id is another id the server has
+    // never heard of. Sending one as `before` makes `historyPageBefore` answer
+    // `[]` — the honest "no more history" contract — and the button would look
+    // broken. Reasoning blocks that came FROM history are safely skippable too:
+    // the next row is a cursor for the same page.
     const oldest = client?.getState().messages.find(
-      (m) => !m.working && !m.pending && !m.retracted,
+      (m) => m.kind === undefined && !m.working && !m.pending && !m.retracted,
     );
     client?.loadHistory({ before: oldest?.id, limit: 20 });
   };

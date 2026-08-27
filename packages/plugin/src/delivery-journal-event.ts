@@ -341,21 +341,27 @@ export function journalEventForOutbound(
             text: frame.text,
           }
         : null;
+    // ⚠️ THE FOUR `null`s BELOW SAID "#242 half 2" AND NOW SAY "half 3". That
+    // was not a typo when it was written — it was a forward reference made
+    // before #242 was split three ways. Half 2 shipped (it widened the wire row
+    // and moved the client's reasoning render onto the reducer) and deliberately
+    // did NOT touch these; half 3 owns them. Corrected rather than left, because
+    // a stale "the next slice does it" reads as a commitment nobody made.
     case "tool_activity":
-      // NOT YET durable — #242 half 2. Same as `reasoning` was: Telegram
+      // NOT YET durable — #242 half 3. Same as `reasoning` was: Telegram
       // preserves service messages and so must we; the event model has to grow
       // first. Half 1 grew it for reasoning only.
       return null;
     case "approval_request":
-      // NOT YET durable — #242 half 2. An approval is a MESSAGE by §15.9's
+      // NOT YET durable — #242 half 3. An approval is a MESSAGE by §15.9's
       // message-vs-indicator test, not an indicator.
       return null;
     case "approval_resolved":
-      // NOT YET durable — #242 half 2. It is the state change of the message
+      // NOT YET durable — #242 half 3. It is the state change of the message
       // above.
       return null;
     case "approval_snapshot":
-      // NOT YET durable — #242 half 2. Also a REPLAY of approvals the store
+      // NOT YET durable — #242 half 3. Also a REPLAY of approvals the store
       // already owns once that half lands; see the `history` case for why
       // replays are not journaled.
       return null;
