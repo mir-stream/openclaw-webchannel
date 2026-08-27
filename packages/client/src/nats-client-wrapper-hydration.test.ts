@@ -781,6 +781,35 @@ describe("history hydration — reasoning rows (#242 half 2)", () => {
     expect(w.getState().reasoning.map((r) => r.id)).toEqual(["dup"]);
   });
 
+  it("is IDEMPOTENT across repeated pages carrying the same collision", () => {
+    // ⚠️ THE CASE THE FIRST FIX GOT WRONG, PINNED SO IT CANNOT COME BACK. That
+    // fix kept the id-keyed index and added a `kindAgrees` conjunct. Page 1
+    // fresh-inserted correctly, but the index is KIND-BLIND and LAST-WINS, so
+    // once the pair existed `get("dup")` returned the REASONING entry's index,
+    // `kindAgrees` was false forever, and the text row inserted AGAIN on every
+    // page — unbounded duplicate growth on every reconnect, worse than the drop
+    // it replaced. Keying the index by (kind, id) is what makes page 2 a plain
+    // tier-1 match. A snapshot arrives on every register, so "the same page
+    // twice" is the ordinary case, not an exotic one.
+    const w = makeWrapper();
+    deliver(w, { type: "reasoning", id: "dup", turnId: "t1", text: "thinking" });
+    const page = (): void => {
+      deliver(w, history({ id: "dup", role: "agent", text: "the answer", ts: 5 }));
+    };
+    page();
+    const afterFirst = w.getState().messages.map((m) => `${m.kind ?? "text"}|${m.id}|${m.text}`);
+    expect(afterFirst).toEqual(["text|dup|the answer", "reasoning|dup|thinking"]);
+
+    page();
+    expect(w.getState().messages.map((m) => `${m.kind ?? "text"}|${m.id}|${m.text}`)).toEqual(
+      afterFirst,
+    );
+    page();
+    expect(w.getState().messages.map((m) => `${m.kind ?? "text"}|${m.id}|${m.text}`)).toEqual(
+      afterFirst,
+    );
+  });
+
   it("still drops a repeat of the same id WITHIN one page — both kinds", () => {
     // The other half of the kind conjunct, pinned so a future edit cannot buy
     // the cross-kind fix by re-admitting within-page repeats. A fresh insert

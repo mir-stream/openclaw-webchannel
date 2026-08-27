@@ -2616,7 +2616,24 @@ export class WebChannelNATSClient {
         if (incoming.length === 0) return;
 
         const existing = this.state.messages;
-        const seen = new Set(existing.map((m) => m.id));
+        /**
+         * The tier-1 key: (KIND, id), never the id alone.
+         *
+         * ⚠️ `state.messages` MIXES BOTH KINDS SINCE #242 half 2, and the two id
+         * spaces are NOT provably disjoint — `durable-view-reducer.ts`'s
+         * `findTextIndex` docblock retracts the id-shape argument outright
+         * (agent answer ids come from the same `nextMessageId()` as reasoning
+         * ids, and USER ids are client-supplied, validated only as a non-empty
+         * string within `MAX_INBOUND_USER_ID_LENGTH`, so a peer can send
+         * `webchannel-…` verbatim). Indexing a mixed array by id alone is
+         * therefore the whole defect class; keying it is the fix, and it is one
+         * property rather than a rule each site has to remember.
+         *
+         * NUL separates, so no id can spell another kind's key.
+         */
+        const kindKey = (kind: string | undefined, id: string): string =>
+          `${kind === "reasoning" ? "r" : "t"}\0${id}`;
+        const seen = new Set(existing.map((m) => kindKey(m.kind, m.id)));
 
         // Phase 6 (stateless register, shared conversation key): a snapshot
         // triggered by ANY device's register — this device's reconnect or a
@@ -2716,8 +2733,10 @@ export class WebChannelNATSClient {
         const adoptKey = (role: string, text: string): string => `${role} ${text}`;
 
         const next = existing.slice();
-        const localIndexById = new Map<string, number>();
-        next.forEach((m, i) => localIndexById.set(m.id, i));
+        // Last-wins on a duplicate key, exactly as before — the change is the
+        // KEY, not the policy, so the non-collision case is unaffected.
+        const localIndexByKey = new Map<string, number>();
+        next.forEach((m, i) => localIndexByKey.set(kindKey(m.kind, m.id), i));
         const claimed = new Set<number>();
         const adoptable = new Map<string, number[]>();
         next.forEach((m, i) => {
@@ -2735,7 +2754,7 @@ export class WebChannelNATSClient {
          * value in effect when each was seen — the index into `next` BEFORE
          * which they must land. We cannot splice into `next` mid-loop (that
          * invalidates every cached local index in
-         * `localIndexById`/`claimed`/`adoptable`), so the placement is deferred
+         * `localIndexByKey`/`claimed`/`adoptable`), so the placement is deferred
          * to a single rebuild after the loop. Multiple fresh messages sharing a
          * cursor keep their snapshot order (appended to the same array).
          */
@@ -2749,9 +2768,17 @@ export class WebChannelNATSClient {
         let cursor = 0;
 
         const adoptAt = (idx: number, m: { id: string; text: string; ts?: number }): void => {
-          // INVARIANT: `seen` and `localIndexById` describe `next` exactly.
+          // INVARIANT: `seen` and `localIndexByKey` describe `next` exactly.
           // `adoptAt` is the only thing that mutates `next` inside the loop, so
           // it is the only place that can break them.
+          //
+          // ⚠️ EVERY KEY BELOW IS A BUBBLE KEY, AND THAT IS CHECKED, NOT
+          // ASSUMED. This closure has ONE call site — the tier-2 branch, gated
+          // `if (m.role === "user")` — so the incoming row is a user bubble; and
+          // `idx` comes only from the `adoptable` pool, seeded solely from
+          // `isAdoptableUserEcho`, a type predicate that narrows to
+          // `ChatBubble`. So the displaced entry is a bubble too, and a
+          // reasoning key can never be the right one here.
           //
           // ⚠️ THE REACHABLE TRIGGER IS GONE and the earlier version of this
           // comment claiming "MEASURED DATA LOSS WITHOUT THIS LINE" no longer
@@ -2776,10 +2803,10 @@ export class WebChannelNATSClient {
           };
           // `displacedId !== m.id` always here (equality is a tier-1 hit, which
           // never reaches an adoption), so this cannot erase what we just set.
-          seen.delete(displacedId);
-          localIndexById.delete(displacedId);
+          seen.delete(kindKey(undefined, displacedId));
+          localIndexByKey.delete(kindKey(undefined, displacedId));
           claimed.add(idx);
-          localIndexById.set(m.id, idx);
+          localIndexByKey.set(kindKey(undefined, m.id), idx);
           adopted = true;
           cursor = idx + 1;
         };
@@ -2798,7 +2825,8 @@ export class WebChannelNATSClient {
            *     travels on the live `reasoning` frame; `journalEventForOutbound`
            *     copies that same `frame.id` into the journal row. So the id this
            *     device rendered live IS the id the snapshot carries, and
-           *     `seen.has(m.id)` matches it — no adoption, no duplicate.
+           *     `seen.has(kindKey("reasoning", m.id))` matches it — no
+           *     adoption, no duplicate.
            *  2. TIER 2 CANNOT REACH IT, TWICE OVER. The adoption branch is
            *     gated `if (m.role === "user")`, which a role-less row fails; and
            *     the pool itself is seeded only from `isAdoptableUserEcho`, which
@@ -2808,22 +2836,31 @@ export class WebChannelNATSClient {
            *     that misses tier 1 — which is the right answer for the same
            *     reason: with plugin-minted ids, a miss means this device has no
            *     local counterpart at all.
-           *  4. TIER 1 REQUIRES THE KINDS TO AGREE — the fourth outcome, which
-           *     the first revision of this list did not enumerate and which was
-           *     the defect. `seen`/`localIndexById` are built from ALL of
-           *     `state.messages`, which now mixes both kinds, and the two id
-           *     spaces are NOT provably disjoint: `durable-view-reducer.ts`'s
-           *     `findTextIndex` docblock retracts the id-shape argument (agent
-           *     answer ids come from the same `nextMessageId()`, and USER ids
-           *     are client-supplied, validated only as a non-empty string
-           *     within `MAX_INBOUND_USER_ID_LENGTH`, so a peer can send
-           *     `webchannel-…` verbatim). A kind-blind tier 1 therefore counted
-           *     a collision with an entry of the OTHER kind as a match and
-           *     DROPPED the row — never inserted, never rendered, though it
-           *     renders fine on a fresh load (N10, live≠history content loss).
-           *     The `kindAgrees` conjunct below sends a disagreement to the
-           *     fresh insert, which is already the right answer for "this
-           *     device has no local counterpart" (property 3).
+           *  4. TIER 1 CAN ONLY MATCH AN ENTRY OF THE ROW'S OWN KIND, because
+           *     `seen`/`localIndexByKey` are keyed by (KIND, id) rather than by
+           *     id — see `kindKey` at the top of this case for why the two id
+           *     spaces cannot be assumed disjoint. This was the fourth outcome
+           *     the first revision of this list did not enumerate, and it was
+           *     the defect: a kind-blind tier 1 counted a collision with an
+           *     entry of the OTHER kind as a match and DROPPED the row — never
+           *     inserted, never rendered, though it renders fine on a fresh
+           *     load (N10, live≠history content loss). A miss now falls to the
+           *     fresh insert, which is already the right answer for "this device
+           *     has no local counterpart" (property 3).
+           *
+           *     ⚠️ KEYING THE INDEX IS THE FIX; A CONJUNCT ON TOP OF AN ID-KEYED
+           *     INDEX WAS TRIED FIRST AND WAS WRONG. That version left the map
+           *     keyed by id and guarded tier 1 with `kindAgrees`. Page 1
+           *     fresh-inserted correctly — and then, because the map is
+           *     LAST-WINS, `get(id)` on the resulting same-id pair resolved to
+           *     the OTHER kind's entry forever, `kindAgrees` never became true
+           *     again, and the row inserted AGAIN on every subsequent page.
+           *     Measured: three identical pages yielded three text entries
+           *     beside the one reasoning entry. A snapshot lands on every
+           *     register, so unbounded duplicate growth per reconnect is worse
+           *     than the drop it replaced. Keyed, page 2 is an ordinary tier-1
+           *     match and the whole thing is idempotent — which is why the
+           *     conjunct is gone rather than repaired.
            *
            * `turnId` is REQUIRED on this variant (the wire types it `string`),
            * so a row without one is dropped rather than inserted with a
@@ -2836,21 +2873,17 @@ export class WebChannelNATSClient {
             // too or the identical content renders from one door and not the
             // other — see the empty-row note at the top of this case.
             if (m.text.length === 0) continue;
-            const li = localIndexById.get(m.id);
-            // ⚠️ THE KINDS MUST AGREE (property 4 above). `li === undefined`
-            // with the id in `seen` is NOT a cross-kind collision — a fresh
-            // insert adds to `seen` without adding to `localIndexById`, so that
-            // state means "a repeat of an id earlier in THIS page", which is a
-            // real match and still a drop.
-            const kindAgrees = li === undefined || next[li].kind === "reasoning";
-            if (seen.has(m.id) && kindAgrees) {
+            // Keyed, so this can only ever meet a REASONING entry (property 4).
+            const key = kindKey("reasoning", m.id);
+            if (seen.has(key)) {
+              const li = localIndexByKey.get(key);
               if (li !== undefined) {
                 cursor = li + 1;
                 claimed.add(li);
               }
               continue;
             }
-            seen.add(m.id);
+            seen.add(key);
             const atCursorReasoning = inserts.get(cursor) ?? [];
             atCursorReasoning.push({
               kind: "reasoning",
@@ -2863,28 +2896,23 @@ export class WebChannelNATSClient {
             continue;
           }
           if (m.role !== "user" && m.role !== "agent") continue;
-          const li = localIndexById.get(m.id);
-          // ⚠️ THE KINDS MUST AGREE — the same conjunct the reasoning branch
-          // above carries, and for the same reason (see property 4 in its
-          // docblock): an id resolving to a REASONING entry is not a match for a
-          // text row, and counting it as one dropped the row entirely. As there,
-          // `li === undefined` with the id in `seen` is a repeat within THIS
-          // page, which stays a match and stays a drop.
-          const kindAgrees = li === undefined || next[li].kind === undefined;
-          if (seen.has(m.id) && kindAgrees) {
+          // Keyed, so this can only ever meet a BUBBLE — see property 4 in the
+          // reasoning branch's docblock above for the whole argument.
+          const key = kindKey(undefined, m.id);
+          if (seen.has(key)) {
+            const li = localIndexByKey.get(key);
             // Tier-1 match: walk the cursor past this already-held message so
-            // later fresh messages insert after it. An id we cannot locate
+            // later fresh messages insert after it. A key we cannot locate
             // locally leaves the cursor untouched.
             //
             // ⚠️ THAT CASE IS REACHABLE, AND THE PARENTHETICAL THAT USED TO SIT
             // HERE DENIED IT — it read "should not happen — `seen` is seeded
             // from `next`". `seen` is ALSO added to by the fresh-insert paths
-            // below, which do not touch `localIndexById`, so `seen.has(id)` with
-            // no local index is the ordinary within-page repeat. It was already
-            // wrong before #242 half 2; it is cut now because the `kindAgrees`
-            // conjunct three lines above depends on exactly that state meaning
-            // what it means, and two adjacent comments disagreeing about it is
-            // worse than either alone.
+            // below, which do not touch `localIndexByKey`, so a key in `seen`
+            // with no local index is the ordinary within-page repeat: still a
+            // match, still a drop. It was already wrong before #242 half 2, and
+            // it is cut now because keying the index makes that state the ONLY
+            // way the two can disagree.
             if (li !== undefined) {
               cursor = li + 1;
               // ⚠️ CLAIM IT. A bubble already identified BY ID must not stay a
@@ -2903,7 +2931,7 @@ export class WebChannelNATSClient {
             continue;
           }
 
-          seen.add(m.id);
+          seen.add(key);
           // Tier 2: exact text+role — ⚠️ USER ROWS ONLY, and the role test is
           // EXPLICIT rather than left to the pool being empty for agent keys.
           // Implicit-by-empty-pool is exactly the kind of coupling that produced
