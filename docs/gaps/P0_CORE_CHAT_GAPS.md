@@ -53,7 +53,7 @@ The **wrapper reduces every inbound frame** (`nats-client-wrapper.ts`):
 
 | Frame | Reducer case | Effect |
 |---|---|---|
-| `history` | `:209` | **#16 ordered merge**: three-tier matching (id → exact text+role adoption of server ids onto live-id bubbles → positional adoption for reformatted agent replies) + **anchor-cursor** insertion (fresh unmatched messages land at `matchedIndex+1`, so a mid-session snapshot's unseen suffix inserts chronologically). Blanket oldest-first prepend only for zero-overlap pages / initial hydration into empty state. |
+| `history` | `case "history"` | **#16 ordered merge**: TWO-tier matching since #240 half 2 (id → exact text+role adoption, **USER rows only**; the positional tier and its anchor were deleted — an agent row matches by id or fresh-inserts) + **insertion-cursor** placement (fresh unmatched messages land at `matchedIndex+1`, so a mid-session snapshot's unseen suffix inserts chronologically). Blanket oldest-first prepend only for zero-overlap pages / initial hydration into empty state. |
 | `typing` | `:376` | `isTyping:true` |
 | `approval_request` | `:381` | upsert into `approvals[]` (**upsert-preserve** `:400-417`: a re-delivered request can't clobber a local resolution), clear `isTyping` |
 | `approval_resolved` | `:421` | mark card resolved |
@@ -170,9 +170,11 @@ it; the widget renders it.
   `resolveHistoryConfig` in `history.ts`.
 - Wire frame: `{ type:"history"; messages:[{id,role,text,ts}] }`.
 - **Reducer hydrates it (#16 ordered merge):** `nats-client-wrapper.ts:2363` `case "history"` — no
-  longer a blanket "dedup + prepend oldest-first". It does three-tier matching (id → exact text+role
-  adoption of server ids onto local live-id bubbles → positional adoption for reformatted agent
-  replies) and **anchor-cursor** insertion so an overlapping mid-session snapshot's unseen suffix
+  longer a blanket "dedup + prepend oldest-first". Since #240 half 2 it does TWO-tier matching (id →
+  exact text+role adoption of server ids onto local live-id bubbles, **USER rows only**; the
+  positional tier for reformatted agent replies is DELETED, along with its anchor, because the
+  journal serves the delivery-act id so an agent row matches by id or has no local counterpart)
+  and **insertion-cursor** placement so an overlapping mid-session snapshot's unseen suffix
   lands chronologically after the matched prefix. Blanket prepend survives only for zero-overlap
   pages and initial hydration into empty state (design comment `:216-259`).
 - **Widget renders it:** `demo/web/src/widget.ts:146-158` maps `state.messages` → bubbles.
@@ -304,7 +306,7 @@ exceeding 1000 turns would still hit a hard wall, and *that* residual case needs
 above.
 
 **Reference implementation (our reducer).** `nats-client-wrapper.ts:2363` already does the #16 ordered
-merge (three-tier match + anchor-cursor insertion, with blanket oldest-first prepend for a
+merge (two-tier match + insertion-cursor placement, with blanket oldest-first prepend for a
 zero-overlap page); the "Load older" response reuses it.
 
 **Telegram reference.** `message-cache.ts` builds bounded history windows on demand; Telegram has no

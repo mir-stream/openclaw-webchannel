@@ -68,7 +68,7 @@ every inbound frame; the widget renders each.
 
 | Gap | Status now | Where |
 |---|---|---|
-| **P0-1** history restore | ✅ **built** (client reduce + **ordered merge** + render; server snapshot from the register route, stateless). #16 three-tier matching + anchor-cursor; #15/#19 approval snapshot on the same hop. | reducer `case "history"` `nats-client-wrapper.ts:209`; server snapshot in the register route |
+| **P0-1** history restore | ✅ **built** (client reduce + **ordered merge** + render; server snapshot from the register route, stateless). #16 matching + insertion cursor — TWO tiers since #240 half 2 (id, then text+role for USER rows only; the positional tier and anchor are deleted); #15/#19 approval snapshot on the same hop. | reducer `case "history"`; server snapshot in the register route |
 | **P0-2** history pagination | ✅ **built** (#24), then **SUPERSEDED by #240 half 2** — see item 1 below: the core-transcript pager is deleted, history pages off the plugin's journal, and the >1000-turn residual is gone | `pageBefore` DELETED; `planHistoryFetch` survives in `history.ts` |
 | **P0-3** slash-command discovery | ✅ **built** (#30): server catalog (`load_commands`→`commands`) + client typeahead. **Residual: argument menus** | `commands-catalog.ts`; `sendCommands` `nats-channel.ts:527-530`; widget `cmdMenu` `:78`, `renderMenu` `:238` |
 | **P0-4** approval cards | ✅ **built** (card render + `decide`); **rehydration built** (#15/#19 `approval_snapshot` Legs A/B/C) | `renderApproval` `widget.ts:81`; reducer `:381/:421/:435`; `decide` `:145` |

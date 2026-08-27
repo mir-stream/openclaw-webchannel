@@ -1166,11 +1166,20 @@ export class WebChannelNATSClient {
    * Each released bubble is published, patched `{pending:false, wireId, turnId}`,
    * AND MOVED TO THE TAIL of `state.messages` (display position = publish
    * position). Moving to the tail is load-bearing, not cosmetic: the history
-   * merge assumes local order mirrors transcript order (the tier-3 probe + the
-   * insertion cursor). An in-place release would order a held chip ABOVE the
-   * reply it delayed while the server transcript orders it after — the next
-   * snapshot would mis-adopt or duplicate. Moving to the tail makes a released
-   * bubble an ordinary send in an ordinary position.
+   * merge assumes local order mirrors the ORDER THE JOURNAL REPLAYS. An
+   * in-place release would order a held chip ABOVE the reply it delayed while
+   * the journal orders it after — a later user row could then adopt at a lower
+   * index and drag the insertion cursor backwards, misplacing the rows after it.
+   * Moving to the tail makes a released bubble an ordinary send in an ordinary
+   * position.
+   *
+   * ⚠️ THE REASON NARROWED AT #240 HALF 2 AND STILL HOLDS. It used to cite the
+   * tier-3 positional probe (deleted) and "the server transcript" (never read
+   * any more — N2). What carries it now is the insertion cursor alone, on the
+   * USER path, which is the one tier that still adopts. Also worth keeping from
+   * the deleted tier: a fresh row inserting at the plain `cursor`, AHEAD of a
+   * held chip, is chronologically right — anything a snapshot carries predates
+   * an unpublished chip.
    *
    * Re-entrancy: drain `held[]` LIVE — `shift()` one entry per iteration rather
    * than snapshot-and-clear before the loop. Each staged bubble is exposed to
@@ -1859,9 +1868,9 @@ export class WebChannelNATSClient {
   // `state.messages`, apply exactly one event, and merge the result back. That
   // keeps bubbles the reducer never authored (adopted history rows, notices)
   // inside the view, so they hold their slots through a `seal` exactly as
-  // `applySeal` promises, and it means the out-of-scope history three-tier
-  // adoption (which writes `state.messages` directly) automatically seeds the
-  // next projection without being routed through the reducer.
+  // `applySeal` promises, and it means the history merge's adoption of a
+  // snapshot row (which writes `state.messages` directly) automatically seeds
+  // the next projection without being routed through the reducer.
   //
   // Split of ownership, per §0.1 / the north star: the REDUCER owns id, role,
   // durable text, turnId and ORDER; the CLIENT owns its own overlay (`working`,

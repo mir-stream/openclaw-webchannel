@@ -175,7 +175,7 @@ turn_snapshot은 **완전한 턴 기록이 아니라 교정 패치다.** 계약(
 
 **OUT → 후속:**
 - off/block 모드 per-answer id 신설(controller/wire/client) — §3.3. ⚠️ **절반 해소(PR #250 / #238)**: controller/wire 쪽(플러그인이 모든 배달 행위에서 id 민팅)은 거기서 처리됐고, **client 쪽은 아직 OUT**이다. 식별자 판정은 §16.5.
-- client **AGENT 행** text/위치 매칭 제거(**#302**) — journal 착지 후. agent 행은 tier 2 풀·tier 3 probe에서 빠지고 tier 1을 놓치면 fresh-insert 한다. ⚠️ **"완전 제거"가 아니다**: #302는 **user 행의 tier 2를 유지**한다(`reserveWireId`가 wire id를 랜덤 토큰으로 민팅하는데 로컬 에코는 `u-<n>`이라 user 행은 정상적으로 tier 1을 놓친다). 이 줄이 원래 적던 `adoptedFromLiveId`는 **이 트리에도 `origin/develop`에도 없는 심볼**이라 지웠고, #104/#227/#228은 v6 보드 재편 때 전부 CLOSED다.
+- client text/위치 매칭 제거 — ✅ **agent 행은 완료 (#240 half 2, `a9e1837`)**: tier 3(위치 프로브)은 통째로 삭제, tier 2는 agent 행에 대해 닫힘, `anchor` 제거. 저널이 delivery-act id를 서빙하므로 agent 행은 id로 맞거나 대응 로컬 버블이 없다. ⚠️ **남은 것은 user 행의 tier 2뿐이고 그 소유자가 #302다(열려 있음)** — 로컬 에코는 `u-<n>`인데 accept seam은 인바운드 **wire id**를 저널링하므로 user는 id가 일치하지 않는다. 선행 조건은 **#243**. 이 줄이 원래 적던 `adoptedFromLiveId`는 이 트리에도 `origin/develop`에도 없는 심볼이라 지웠고, #104/#227/#228은 v6 보드 재편 때 전부 CLOSED다.
 - `getSessionMessages` 기반 history 제거 — cutover 후. ✅ **완료 (#240 half 2, 2026-08-26)**: reader·`AsyncResource` operator-scope 우회·transcript normalizer·`history-sanitize.ts` 모두 삭제, `grep -rn "getSessionMessages" packages/` 무출력.
 
 ---
@@ -211,7 +211,7 @@ durable worktree에서. 스크래치패드 금지(`no-scratchpad-for-real-work`)
 ## 8. 범위 / 비범위
 
 **범위(이번):** partial/progress 모드 — journal store, drain-time commit 훅, journal 기반 history, client 순수-view 렌더 (§5 IN).
-**비범위(후속):** off/block 모드 per-answer id 신설 — ⚠️ **절반 해소(PR #250 / #238)**: controller/wire 쪽은 거기서 처리됐고 **client 쪽만 남았다**(§5 OUT · §6 참고); client **agent 행** text/위치 매칭 제거(**#302** — user 행 tier 2는 유지, §5 참조; 과거 표기 #104/#227/#228은 CLOSED); #215/#223 최종 종결; `getSessionMessages` 기반 history 제거(cutover 후); core 저장 형식 변경 없음.
+**비범위(후속):** off/block 모드 per-answer id 신설 — ⚠️ **절반 해소(PR #250 / #238)**: controller/wire 쪽은 거기서 처리됐고 **client 쪽만 남았다**(§5 OUT · §6 참고); client text/위치 매칭 제거 — **agent 행은 #240 half 2에서 완료**, 비범위로 남은 것은 **user 행의 tier 2뿐이고 #302가 소유**한다(**#243** 선행; 과거 표기 #104/#227/#228은 CLOSED); #215/#223 최종 종결; `getSessionMessages` 기반 history 제거(cutover 후); core 저장 형식 변경 없음.
 
 ---
 
@@ -717,7 +717,7 @@ egress에서 **클라가 view에 쓰는 이벤트만, 전송 순서(seq)대로**
   - ✅ **P-I CONFIRMED (스파이크, 검증 완료)** — 클라 live 재조정이 순수 공유 reducer `reduceDurableView(events)→DurableView`로 **깨끗이 추출됨.** worktree `spike/114-shared-reducer` commit `ad81bac`: `packages/client/src/durable-view-reducer.ts` + 14 vitest(8 시나리오 + 6 **등가 앵커** = 실제 private `applyTurnSnapshot`을 인스턴스화해 호출·비교, 순환 아님). Advisor가 직접 14/14 통과·소스 확인. 라운드-4 P0(슬롯 클레임 순서 [A,B]≠[B,A], 늦은 remove-후-부활, seal create-or-update #215 회복, final-only C, notice 슬롯 보존) 전부 green. **중심 베팅(history==live by construction) 성립.**
     - **구현 형태(스파이크가 확정):** `render = merge(reduceDurableView(eventLog), clientLocalOverlay)` — 핸들러는 local overlay(working/receipts/sendState/isTyping) 부수효과 유지, **durable `messages` 재조정만 reducer에 위임.** DurableMessage = `{id,role,text,turnId}` (client-local 제외, §0.1).
     - 스파이크 범위 외(구현 시): 실제 클라를 reducer 호출로 refactor; reducer 모듈을 client·plugin 공유 위치로 이동(의존성 없어 기계적); `placement`는 텍스트 미보유(never-final draft 저널링은 비범위).
-    - reducer 밖(의도적): `history` 3-tier 텍스트/위치 adoption(`:2063-2258`) = reconnect/late-join 추측 → 서버 스냅샷으로 대체될 workstream C. #114가 스트림 저널링으로 이를 가능케 함.
+    - reducer 밖(의도적): `history` 텍스트/위치 adoption = reconnect/late-join 추측 → 서버 스냅샷으로 대체될 workstream C. #114가 스트림 저널링으로 이를 가능케 함. ⚠️ **당시 3-tier였고 지금은 2-tier다** — #240 half 2가 위치 티어를 삭제하고 텍스트 티어를 user 행으로 좁혔다(#302가 잔여 소유). 줄번호는 썩어서 지웠다.
   - ✅ **P-J(route 키 안정성/orphan) DISSOLVED** — 프로브가 아니라 설계로 해소됨(§16.2-7): plugin-소유 불변 conversation id = `(tenant, accountId)` 경로 스코프 + `peerId`. route를 안 읽으니 orphan될 route 키가 없다. #239 half 2에서 구현·검증(2026-08-25). **P-H(off/block id client 영향)** — 구현 단계에서.
 
 ### 15.10 v5 결정 로그

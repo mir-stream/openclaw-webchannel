@@ -1,5 +1,16 @@
 # Phase 6 — Multi-Device E2E — Design Plan
 
+> ⚠️ **#240 half 2 (`a9e1837`) DELETED the agent side of the three-tier adoption
+> this document presents as the shipped fix.** The positional probe and its
+> anchor are gone, and the text tier is closed to agent rows: history is
+> projected from the plugin's own delivery journal, which serves the
+> delivery-act id, so an agent row matches by ID or has no local counterpart to
+> match. Text matching survives for USER rows only, because a user echo's local
+> `u-<n>` and the journaled wire id legitimately differ — **#302** owns removing
+> that, blocked on **#243**. The multi-device CONCLUSIONS below still hold; the
+> mechanism described for reaching them does not.
+
+
 > **Issue #54 update:** Each runtime verifier is fixed to its account id and
 > `auth.jwt.audience` is removed. A signed multi-value `aud` remains supported as
 > an authorization set: each concrete connection selects one authorized target
