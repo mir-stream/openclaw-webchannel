@@ -2759,17 +2759,41 @@ export function createReasoningDraftController(params: {
   // when `sendReasoning` returned true, so it lags `currentText` whenever a send
   // is refused, and cleared with `currentText` at close.
   //
-  // This exists because the obvious gate — "did the LAST send land?" — answers
-  // the wrong question and loses whole bursts. MEASURED: with `push "a"`
-  // delivered, `push "ab"` REFUSED, and then `endBurst()`, a last-send gate emits
-  // ZERO durable frames, so a burst the user watched has no journal row at all.
-  // One transient refusal with no successful push after it — a NATS reconnect,
-  // the fail-closed "no session key yet" window — is enough, which is exactly the
-  // N8-losing hole this slice exists to close.
+  // It replaces an obvious-but-wrong gate — "did the LAST send land?" — which
+  // discards a burst the user demonstrably watched: with `push "a"` delivered,
+  // `push "ab"` refused, and then `endBurst()`, that gate emits ZERO durable
+  // frames even though the peer is still rendering "a". Tracking the last
+  // DELIVERED text answers the two questions that actually matter — did ANY of
+  // this burst reach the client, and what text does it hold — with one variable.
   //
-  // The two questions that actually matter are different: (a) did ANY of this
-  // burst reach the client, and (b) what text does the client hold. One variable
-  // answers both, and the durable frame carries it rather than `currentText`.
+  // ⚠️ WHAT THIS FIXES IS NARROWER THAN AN EARLIER REVISION OF THIS COMMENT
+  // CLAIMED, AND THE DIFFERENCE IS A REAL RESIDUAL HOLE. That revision named the
+  // triggers as "a NATS reconnect, the fail-closed 'no session key yet' window"
+  // and presented this variable as closing them. It does not: those same two
+  // conditions refuse the CLOSE FRAME as well. `sendToPeer` returns `false` at
+  // its disposed/transport-down check and at its missing-session-key check, and
+  // BOTH sit ABOVE `journalOutbound` — deliberately, so a refused send is never
+  // journaled. So the fix is conditional on RECOVERY:
+  //
+  //   transport recovered by close time → the close frame is published and
+  //                                       journaled, carrying the delivered
+  //                                       prefix. THIS is what changed.
+  //   transport STILL refusing at close → the close frame is refused too, and
+  //                                       the burst gets NO row at all, while
+  //                                       the peer keeps rendering the text it
+  //                                       already received. STILL OPEN.
+  //
+  // MEASURED against the real `NatsChannel` with `reasoningDurable: true`: push
+  // "Let me" (published), push "Let me think" (published), transport down, push
+  // "…about this" (refused), `endBurst()` → 2 publishes, 0 rows. `stop()` is
+  // identical. The recovered control writes 1 row carrying "Let me".
+  //
+  // ⚠️ AND THE SEAM CANNOT FIX THE RESIDUAL — do not try here. Journaling a
+  // refused send is ruled out at `sendToPeer`'s persist-before-publish block:
+  // the caller re-mints an id per attempt, so recording refusals manufactures a
+  // phantom row per revision under ids that never existed live (N8, gaining, at
+  // an unbounded rate). A second journal hook inside this controller is NOT-list
+  // N6b/N6c. The residual is #304 and needs a design round, not a patch.
   let lastDeliveredText = "";
   let stopped = false;
 
@@ -2790,28 +2814,36 @@ export function createReasoningDraftController(params: {
     // looked durable.
     //
     // ⚠️ IT CARRIES `lastDeliveredText`, NOT `currentText`, AND IS GATED ON THE
-    // SAME VARIABLE. The rule is one sentence — **history records what was
-    // DELIVERED** — which is N10 stated positively, and it dissolves a trade-off
-    // an earlier revision tried to pick a side of (#304, fixed by this slice, not
-    // an open limitation). The four cases, all validated:
+    // SAME VARIABLE — "history records what was DELIVERED", N10 stated
+    // positively. That NARROWS #304; it does not close it (#304 is OPEN, and its
+    // body has a section headed "Why it is filed rather than fixed in #242
+    // half 1"). The cases, and the row count each actually produces:
     //
-    //   ordinary  every push landed        → final carries the full text.
-    //                                        ONE row.
-    //   mixed     early pushes landed,     → final carries what the client
-    //             a later one refused        ACTUALLY HAS, so it is still an
-    //                                        upsert-by-id no-op for the client,
-    //                                        and the journal records what the
-    //                                        user saw. A durable block, if one
-    //                                        follows, arrives under its own id
-    //                                        as a SECOND block — two blocks
-    //                                        live, two rows, matching exactly.
-    //   all-refused                        → `lastDeliveredText` is empty, no
-    //                                        final at all; the durable block is
-    //                                        the only delivery. ONE row.
-    //   empty burst                        → the early return above. Nothing.
+    //   ordinary   every push landed        → close frame carries the full text.
+    //                                         ONE row.
+    //   mixed,     early pushes landed, a   → close frame carries what the client
+    //   RECOVERED  later one refused, the     ACTUALLY HAS. Published and
+    //              transport is back up      journaled: ONE row, and it is an
+    //              at close time             upsert-by-id no-op for the client.
+    //                                        ⭐ THIS is the case this variable
+    //                                        fixed; before it, ZERO rows.
+    //   mixed,     the transport is STILL   → the close frame is REFUSED too
+    //   STILL      refusing when the burst    (`sendToPeer` returns false above
+    //   DOWN       closes                     `journalOutbound`), so NO row at
+    //                                         all — while the peer keeps
+    //                                         rendering the text it did receive.
+    //                                         ⚠️ STILL OPEN. #304.
+    //   all-refused                         → `lastDeliveredText` is empty, so no
+    //                                         close frame is even attempted; a
+    //                                         durable block, if one follows, is
+    //                                         the only delivery and the only row.
+    //   empty burst                         → the early return above. Nothing.
     //
-    // So this is NOT "did the last send land". That question loses the whole
-    // MIXED case — measured, and the reason `lastDeliveredText` exists.
+    // A `pushDurableBlock` that follows any of these arrives under its OWN id as
+    // a second block, so two blocks live is two rows — matching, not duplicated.
+    //
+    // Characterization tests pin every row above INCLUDING the still-open one;
+    // they record the behaviour, they do not endorse it.
     //
     // The id is the live burst's own, so for the client the frame is an upsert
     // by id over text it already holds. The one real cost is one extra copy of

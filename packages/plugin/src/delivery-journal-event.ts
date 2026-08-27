@@ -301,16 +301,25 @@ export function journalEventForOutbound(
       // draft, and for the same reason: the durable content is authored once, at
       // close.
       //
-      // ⚠️ THE ADMISSION RULE IS THE CLIENT'S, FIELD FOR FIELD, AND THAT IS THE
-      // POINT. The live handler is
+      // ⚠️ THE ADMISSION RULE TRACKS THE CLIENT'S, AND IS VERY SLIGHTLY STRICTER.
+      // The live handler is
       // `if (!msg.id || !msg.turnId || typeof msg.text !== "string" || msg.text.length === 0) return;`
       // (`nats-client-wrapper.ts`'s `case "reasoning"`), i.e. non-empty id,
-      // non-empty turnId, non-empty string text — `isUsableMessageId` is exactly
-      // that predicate with the type check the wire does not perform. Journaling
-      // a frame the client REFUSES would put a message in history that live
-      // never rendered (N8, in the gaining direction); refusing one the client
-      // accepts would lose delivered content (N10). Neither margin is available,
-      // so the two rules must be the same rule.
+      // non-empty turnId, non-empty string text. The reason to track it is that
+      // both margins are expensive: journaling a frame the client REFUSES puts a
+      // message in history that live never rendered (N8, gaining), and refusing
+      // one the client ACCEPTS loses delivered content (N10).
+      //
+      // The one difference, stated rather than glossed: the client's `!msg.id`
+      // is a TRUTHINESS test, so it would accept a truthy NON-STRING id (`7`,
+      // `["a"]`), while `isUsableMessageId` requires `typeof === "string"`. That
+      // is deliberate — the wire performs no runtime validation, and a
+      // non-string id fails much later at SQLite bind time — and it is
+      // unreachable in practice, since the only producer of these frames is
+      // `message-adapter.ts`'s controller passing a minted string. So "the same
+      // rule" is true for every value either side can actually see; it is not
+      // true field-for-field, and an earlier revision of this comment said it
+      // was.
       //
       // `turnId` is required here where `bubble`/`placement` treat it as
       // optional, because the wire genuinely differs: `reasoning.turnId` is

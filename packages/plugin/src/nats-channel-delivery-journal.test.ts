@@ -777,13 +777,17 @@ describe("#242 — with reasoningDurable ON, a live stream costs ONE row per bur
     expect(new Set(ids).size).toBe(2);
   });
 
-  it("a burst interrupted by a transport blip still gets its row, carrying the delivered text", () => {
-    // ⚠️ #304 END TO END, THROUGH THE REAL CHANNEL. A NATS reconnect mid-burst
-    // is the ordinary trigger: `sendToPeer` refuses while the transport is down,
-    // and the burst closes after it comes back. The row must exist and must
-    // hold what the peer actually received — a gate on "did the LAST send land"
-    // wrote NO row here at all, which is the N8-losing hole this slice exists
-    // to close.
+  it("a blip the transport RECOVERED from still gets its row, carrying the delivered text", () => {
+    // ⚠️ #304 END TO END, THROUGH THE REAL CHANNEL — and note WHICH half of it.
+    // The transport comes back UP before `endBurst()`, so the close frame is
+    // published and journaled. This is precisely the case `lastDeliveredText`
+    // fixed; a "did the LAST send land" gate wrote no row here.
+    //
+    // ⚠️ THE `connected = true` LINE IS LOAD-BEARING, NOT SETUP TIDINESS. It is
+    // the ONLY arrangement in which a row appears at all, and an earlier
+    // revision of this test carried it while claiming the general "a burst
+    // interrupted by a blip still gets its row" — which is false. The sibling
+    // below is that general case, and it records the opposite outcome.
     const { calls, transport, channel } = makeChannel({ reasoningDurable: true });
     const controller = createReasoningDraftController({
       transport: channel,
@@ -794,7 +798,7 @@ describe("#242 — with reasoningDurable ON, a live stream costs ONE row per bur
     controller.push({ text: "Let me" });
     transport.connected = false;
     controller.push({ text: "Let me think" });
-    transport.connected = true;
+    transport.connected = true; // ⭐ recovered BEFORE the close
     controller.endBurst();
     warn.mockRestore();
 
@@ -803,6 +807,58 @@ describe("#242 — with reasoningDurable ON, a live stream costs ONE row per bur
     ).toEqual([
       { kind: "reasoning", id: expect.any(String), turnId: "turn-1", text: "Let me" },
     ]);
+  });
+
+  it("CHARACTERIZATION — a transport STILL down at close loses the burst entirely (#304)", () => {
+    // ⚠️ RECORDS THE RESIDUAL, DOES NOT ENDORSE IT. Identical to the test above
+    // except the transport never recovers, which is the ORDINARY shape of a
+    // reconnect or a fail-closed no-session-key window: the condition that
+    // refused the last `push` is still in effect when the burst closes, so
+    // `sendToPeer` refuses the close frame too — above `journalOutbound`, by
+    // design — and the peer keeps rendering text that has no durable record.
+    //
+    // Two publishes reached the wire and ZERO rows were written. Not fixable at
+    // this seam: journaling refused sends manufactures phantom rows under
+    // re-minted ids, and a second hook is NOT-list N6b/N6c. #304.
+    const { calls, transport, channel } = makeChannel({ reasoningDurable: true });
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    controller.push({ text: "Let me" });
+    controller.push({ text: "Let me think" });
+    transport.connected = false; // and it stays down
+    controller.push({ text: "Let me think about this" });
+    controller.endBurst();
+    warn.mockRestore();
+
+    // The peer received two frames and is still rendering "Let me think"…
+    expect(calls.filter((entry) => entry.call === "publish")).toHaveLength(2);
+    // …and the journal holds nothing for the burst.
+    expect(appends(calls)).toEqual([]);
+  });
+
+  it("CHARACTERIZATION — the same residual on the stop() teardown path (#304)", () => {
+    // The likelier trigger in production: the dropped connection is what ends
+    // the turn, so `inbound.ts`'s `reasoning?.stop()` runs while the transport
+    // is still refusing.
+    const { calls, transport, channel } = makeChannel({ reasoningDurable: true });
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    controller.push({ text: "Let me" });
+    transport.connected = false;
+    controller.push({ text: "Let me think" });
+    controller.stop();
+    warn.mockRestore();
+
+    expect(calls.filter((entry) => entry.call === "publish")).toHaveLength(1);
+    expect(appends(calls)).toEqual([]);
   });
 
   it("an open burst with no delivered snapshot writes nothing", () => {

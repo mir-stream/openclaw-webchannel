@@ -397,11 +397,13 @@ describe("account-config: resolveReasoningDurable (#242 half 1)", () => {
   });
 
   it("refuses a value reachable only through the PROTOTYPE CHAIN", () => {
-    // ⚠️ THE TWO GUARDS THAT SURVIVED THE DEFAULT FLIP, AND THE REASON THEY DID.
-    // Most of `resolveReasoningEnabled`'s ladder collapses under a default-OFF
-    // gate because every malformed path already lands on `false`. These two do
-    // not: without them, a prototype nobody wrote into this account's config
-    // could turn ON plaintext-at-rest.
+    // ⚠️ THIS IS THE OWN-PROPERTY TEST'S WORK, NOT THE PROTOTYPE CHECK'S, AND THE
+    // TWO ARE EASY TO MISATTRIBUTE — an earlier revision of
+    // `resolveReasoningDurable`'s docblock credited the prototype check with
+    // exactly this and was wrong. Measured against the counterfactual: with the
+    // prototype check DELETED, every case below still resolves `false`. What the
+    // prototype check actually contributes is the separate case at the end of
+    // this file's next test — an OWN-property opt-in on a non-plain object.
     //
     // (a) a CLASS instance whose prototype declares the key.
     class Capabilities {}
@@ -422,6 +424,24 @@ describe("account-config: resolveReasoningDurable (#242 half 1)", () => {
       delete proto.reasoningDurable;
     }
     expect(({} as { reasoningDurable?: boolean }).reasoningDurable).toBeUndefined();
+  });
+
+  it("refuses an OWN-property opt-in on a NON-PLAIN object — the prototype check's only job", () => {
+    // ⚠️ THE ONE BEHAVIOUR THE PROTOTYPE CHECK CONTRIBUTES, ISOLATED. Deleting
+    // that check flips THIS case to `true` and leaves every other case in this
+    // file unchanged — which is how its real job was identified.
+    //
+    // The reason to keep it is a shape argument, not an inheritance one: config
+    // is JSON, so a class instance cannot have come from a parsed config file,
+    // and a switch that turns on plaintext-at-rest should refuse a container it
+    // has no model of rather than honour a key it happens to carry.
+    class Capabilities {
+      reasoningDurable = true;
+    }
+    expect(resolveReasoningDurable({ capabilities: new Capabilities() })).toBe(false);
+    // Same shape, same verdict, via other non-plain prototypes.
+    expect(resolveReasoningDurable({ capabilities: Object.assign(new Date(0), { reasoningDurable: true }) })).toBe(false);
+    expect(resolveReasoningDurable({ capabilities: Object.assign(new Map(), { reasoningDurable: true }) })).toBe(false);
   });
 
   it("accepts a null-prototype record carrying the key as an OWN property", () => {

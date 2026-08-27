@@ -544,21 +544,45 @@ export function resolveReasoningEnabled(accountConfig: WebchannelAccountConfig):
  * is OFF, so every one of those paths already lands on `false` and writing them
  * out separately would be branch structure with no behaviour behind it.
  *
- * ⚠️ TWO OF ITS GUARDS ARE NOT REDUNDANT AND MUST SURVIVE. Do not "restore
- * symmetry" by deleting them, and do not simplify them into a property read:
- *  - the PROTOTYPE CHECK. Without it, a poisoned `Object.prototype` (or a class
- *    instance whose prototype declares it) could supply `reasoningDurable: true`
- *    through the chain and turn on plaintext-at-rest for an account whose own
- *    config never mentions it;
- *  - `Object.prototype.hasOwnProperty.call`, for exactly the same reason. A bare
- *    `capabilities.reasoningDurable` read walks the prototype chain, so the
- *    OWN-property test is what makes the check above mean anything. It is
- *    `.call`ed off `Object.prototype` rather than invoked as a method because
- *    `capabilities` may be a null-prototype record, which has no
- *    `hasOwnProperty` of its own.
+ * ⚠️ TWO OF ITS GUARDS MUST SURVIVE, BUT THEY DO NOT DO WHAT AN EARLIER REVISION
+ * OF THIS DOCBLOCK CLAIMED. That revision said the PROTOTYPE CHECK is what stops
+ * "a poisoned `Object.prototype` (or a class instance whose prototype declares
+ * it)" from supplying `reasoningDurable: true` through the chain. It is not —
+ * the OWN-property test below already blocks both, and would block them with the
+ * prototype check deleted. MEASURED against that exact counterfactual:
+ *
+ *   capabilities                                    shipped | no prototype check
+ *   Object.create({reasoningDurable:true})           false  | false
+ *   class instance, PROTOTYPE declares it            false  | false
+ *   plain {} under a poisoned Object.prototype       false  | false
+ *   class instance with an OWN reasoningDurable=true false  | TRUE
+ *
+ * So the prototype check contributes EXACTLY ONE behaviour, and it is the last
+ * row: it refuses an explicit, OWN-property opt-in carried on an object whose
+ * prototype is not plain. Nothing about inheritance.
+ *
+ *  - the PROTOTYPE CHECK, kept for the reason that is actually true: this is a
+ *    CONFIG boundary, and config is JSON. A `Date`, a class instance, a `Map` —
+ *    anything with a non-plain prototype — cannot have come from a parsed
+ *    config file, so whatever produced it did something this resolver has no
+ *    model of. Refusing the whole container is the right posture for a switch
+ *    that turns on plaintext-at-rest; "it carries the key, so honour it" is not.
+ *    It is a shape check, not an inheritance defence.
+ *  - `Object.prototype.hasOwnProperty.call`, which IS the inheritance defence and
+ *    is doing that work alone. A bare `capabilities.reasoningDurable` read walks
+ *    the prototype chain, so this is what stops a poisoned `Object.prototype`
+ *    from opting every account in. It is `.call`ed off `Object.prototype` rather
+ *    than invoked as a method because `capabilities` may be a null-prototype
+ *    record, which has no `hasOwnProperty` of its own.
+ *
+ * `account-config.test.ts`'s prototype-chain case already attributed these
+ * correctly — its case (b) says the poisoned-`Object.prototype` shape "is
+ * carried entirely by the OWN-property test". The two files now agree; when they
+ * disagreed, the test was right.
+ *
  * A null prototype is ACCEPTED (`Object.create(null)` is the safest plain record
  * there is, and it is what a hardened config loader produces); what is refused
- * is a prototype that could carry keys.
+ * is a prototype that is neither `Object.prototype` nor absent.
  */
 export function resolveReasoningDurable(accountConfig: WebchannelAccountConfig): boolean {
   const capabilities = accountConfig?.capabilities;

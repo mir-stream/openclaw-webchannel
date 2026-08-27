@@ -26,20 +26,6 @@
  * standing exceptions that show up the moment a real conversation is replayed.
  * READ THIS BEFORE CONCLUDING THE PROJECTION IS WRONG.
  *
- * GAP 2 — REASONING IS DURABLE BUT UNSENDABLE (#242 half 1). For an account
- * that opted in via `capabilities.reasoningDurable` (default OFF — see
- * `account-config.ts`'s `resolveReasoningDurable`), the journal
- * records one row per reasoning burst and the fold places it in the view, but
- * the `history` wire frame carries `HistoryMessage`, whose `role` is
- * `"user" | "agent"` and which therefore cannot express a role-less reasoning
- * message. So the conversion loop in `projectJournalHistory` DROPS reasoning
- * entries on the way out, and a reload shows no reasoning where live showed it.
- * That is deliberate and scoped: half 1 is the SERVER side only. Half 2 widens
- * the frame and moves the client's render onto the reducer together, so the two
- * sides start agreeing in one step rather than passing through a state where the
- * wire carries a field no client reads. The drop is commented at the exact line
- * that performs it.
- *
  * GAP 1 — the phantom empty bubble:
  *
  * A lane that receives a `progress` and then NEITHER a `bubble` NOR a
@@ -60,6 +46,21 @@
  * So the rule that hides it is expressed in a field the server does not have.
  * That is N8 by OMISSION, and it is the reason this file cannot claim the
  * equality unconditionally.
+ *
+ * GAP 2 — REASONING IS DURABLE BUT UNSENDABLE (#242 half 1). For an account
+ * that opted in via `capabilities.reasoningDurable` (default OFF — see
+ * `account-config.ts`'s `resolveReasoningDurable`), the journal
+ * records one row per reasoning burst and the fold places it in the view, but
+ * the `history` wire frame carries `HistoryMessage`, whose `role` is
+ * `"user" | "agent"` and which therefore cannot express a role-less reasoning
+ * message. So the conversion loop in `projectJournalHistory` DROPS reasoning
+ * entries on the way out, and a reload shows no reasoning where live showed it.
+ * That is deliberate and scoped: half 1 is the SERVER side only. Half 2 widens
+ * the frame and moves the client's render onto the reducer together, so the two
+ * sides start agreeing in one step rather than passing through a state where the
+ * wire carries a field no client reads. The drop is commented at the exact line
+ * that performs it.
+ *
  *
  * ⚠️ IT IS NOT THIS SLICE'S TO FIX, AND THE OBVIOUS FIX IS FORBIDDEN HERE. The
  * repair is derivable from the log alone — "a placement whose answerId never

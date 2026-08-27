@@ -861,13 +861,19 @@ function requireCount(value: number, parameter: string, min: number): number {
  *
  * ⚠️ BUT IT IS AN EXHAUSTIVENESS HOLE, AND #242 FELL IN IT. This docblock used
  * to say the `default` "is NOT an exhaustiveness hole … the switch is exhaustive
- * at compile time" and that "THE WRITE PATH IS THE ONLY WAY TO REACH IT … which
- * today means a cast at the call site". Both were falsified by the very next
- * kind added: `reasoning` is IN the union, reaches this switch through ORDINARY
- * production egress, and — because a `default` swallows what a `never` gate
- * would have caught — was written with `message_id = NULL` with nothing going
- * red. Measured against a real `openDeliveryJournal`: `seq 3 kind reasoning
- * message_id null`.
+ * at compile time". That is what the very next kind falsified: `reasoning` is IN
+ * the union, reaches this switch through ORDINARY production egress, and —
+ * because a `default` swallows what a `never` gate would have caught — was
+ * written with `message_id = NULL` with nothing going red. Measured against a
+ * real `openDeliveryJournal`: `seq 3 kind reasoning message_id null`.
+ *
+ * ⚠️ BE PRECISE ABOUT WHAT SURVIVED THAT CORRECTION. "THE WRITE PATH IS THE ONLY
+ * WAY TO REACH IT" is STILL TRUE and still worth knowing — `read()` does not
+ * call this function at all (it parses `payload` and takes `kind` off the parsed
+ * event), so "read back from a newer build's journal" is not this branch's
+ * trigger. What #242 falsified is only the clause that followed it, "which today
+ * means a cast at the call site": an in-union kind with no `case` reaches the
+ * `default` through an ordinary typed append, no cast required.
  *
  * ⚠️ SO DO NOT GENERALISE THIS FILE'S EXHAUSTIVENESS STORY FROM THE OTHER TWO
  * SWITCHES. `journal-history.ts`'s `KNOWN_EVENT_KINDS` and `recordFirstSeen`

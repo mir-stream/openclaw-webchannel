@@ -3552,6 +3552,36 @@ describe("ProgressDraftController — provisional preview transactions", () => {
 });
 
 /**
+ * Script one `sendReasoning` result, or FAIL LOUDLY when the script runs out.
+ *
+ * ⚠️ THIS THROWS INSTEAD OF DEFAULTING TO `true`, AND THAT IS A CORRECTION OF A
+ * REAL DEFECT IN THIS FILE. The fixtures used to read
+ * `sendResults[sendIndex++] ?? true`, so a script covering only the `push` calls
+ * silently handed the BURST-CLOSE frame a success the scenario never granted it:
+ * `setup([true, false])` reads as "the transport went down and stayed down", but
+ * the close frame — a third send — defaulted to delivered. Every "refused
+ * transport" test was therefore quietly testing a RECOVERED transport, which is
+ * why the still-down residual (#304) shipped unnoticed through two rounds of
+ * review.
+ *
+ * So: an EMPTY script means "every send succeeds" (the ordinary case, and most
+ * callers), but a NON-EMPTY one must account for every send the scenario makes,
+ * close frames included. A stub must never supply a recovery the named scenario
+ * does not have.
+ */
+function nextSendResult(sendResults: readonly boolean[], index: number): boolean {
+  if (sendResults.length === 0) return true;
+  if (index >= sendResults.length) {
+    throw new Error(
+      `reasoning send script exhausted: send #${index + 1} has no scripted result ` +
+        `(script length ${sendResults.length}). A scripted test must state the fate of ` +
+        `EVERY send, including the burst-close frame — see nextSendResult.`,
+    );
+  }
+  return sendResults[index];
+}
+
+/**
  * One recorded `sendReasoning` call. `final` is #242 half 1's burst-close flag —
  * the ONLY reasoning frame the delivery journal records.
  */
@@ -3584,7 +3614,7 @@ describe("ReasoningDraftController", () => {
         text: string,
         final?: boolean,
       ) => {
-        const sent = sendResults[sendIndex++] ?? true;
+        const sent = nextSendResult(sendResults, sendIndex++);
         if (sent) frames.push({ id, turnId, text, ...(final === true ? { final: true } : {}) });
         return sent;
       },
@@ -3734,7 +3764,7 @@ describe("ReasoningDraftController — #242 durable burst frames", () => {
         text: string,
         final?: boolean,
       ) => {
-        const sent = sendResults[sendIndex++] ?? true;
+        const sent = nextSendResult(sendResults, sendIndex++);
         if (sent) frames.push({ id, turnId, text, ...(final === true ? { final: true } : {}) });
         return sent;
       },
@@ -3813,15 +3843,15 @@ describe("ReasoningDraftController — #242 durable burst frames", () => {
     expect(new Set(finals.map((frame) => frame.id)).size).toBe(3);
   });
 
-  it("MIXED refusal: the close frame carries what the client ACTUALLY HAS", () => {
-    // ⚠️ #304, AND THE CASE A "did the LAST send land?" GATE LOSES ENTIRELY.
-    // `push "a"` lands, `push "ab"` is REFUSED, the burst closes. Under that
-    // gate this emits ZERO durable frames — a burst the user watched with no
-    // journal row at all, on an ordinary trigger (a NATS reconnect, the
-    // fail-closed no-session-key window). Tracking the last DELIVERED text
-    // instead emits one frame carrying "a": still an upsert-by-id no-op for the
-    // client, and the journal records exactly what was seen.
-    const { controller, frames } = setup([true, false]);
+  it("MIXED refusal, transport RECOVERED by close: the close frame carries what the client has", () => {
+    // ⚠️ THE THIRD SCRIPT ENTRY IS THE POINT, AND ITS ABSENCE IS WHY #304'S
+    // RESIDUAL SHIPPED. `push "a"` lands, `push "ab"` is refused, and the
+    // CLOSE FRAME is a third send whose fate the scenario must state. Here it
+    // succeeds — the transport came back — which is exactly the case
+    // `lastDeliveredText` fixed: one frame carrying "a", an upsert-by-id no-op
+    // for the client, and the journal records what was actually seen. A
+    // "did the LAST send land?" gate emitted ZERO here.
+    const { controller, frames } = setup([true, false, true]);
     controller.push({ text: "a" });
     controller.push({ text: "ab" });
     controller.endBurst();
@@ -3832,12 +3862,45 @@ describe("ReasoningDraftController — #242 durable burst frames", () => {
     expect(finals[0].id).toBe(liveFrames(frames)[0].id);
   });
 
-  it("MIXED refusal on the stop() path too — an aborted turn keeps the delivered prefix", () => {
-    const { controller, frames } = setup([true, false]);
+  it("CHARACTERIZATION — transport STILL refusing at close: the burst gets no frame at all (#304)", () => {
+    // ⚠️ RECORDS, DOES NOT ENDORSE. The refusal that silenced `push "ab"` is
+    // usually still in effect one call later, so the close frame is refused too.
+    // The controller ATTEMPTS it — that is all it can do — and the frame never
+    // reaches the transport, so no journal row exists for a burst whose first
+    // update the peer is still rendering.
+    //
+    // The seam cannot repair this: `sendToPeer` refuses ABOVE `journalOutbound`
+    // on purpose (journaling refused sends manufactures phantom rows under
+    // re-minted ids), and a second hook inside this controller is NOT-list
+    // N6b/N6c. #304 owns it.
+    const { controller, frames } = setup([true, false, false]);
+    controller.push({ text: "a" });
+    controller.push({ text: "ab" });
+    controller.endBurst();
+
+    // The peer received "a" and is still rendering it…
+    expect(liveFrames(frames).map((frame) => frame.text)).toEqual(["a"]);
+    // …and nothing durable was recorded for the burst.
+    expect(finalFrames(frames)).toEqual([]);
+  });
+
+  it("MIXED refusal on the stop() path, RECOVERED — an aborted turn keeps the delivered prefix", () => {
+    const { controller, frames } = setup([true, false, true]);
     controller.push({ text: "a" });
     controller.push({ text: "ab" });
     controller.stop();
     expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["a"]);
+  });
+
+  it("CHARACTERIZATION — stop() with the transport still down loses the burst too (#304)", () => {
+    // Same residual on the turn-teardown path, which is the more likely one: a
+    // dropped connection is what ends the turn AND refuses the close frame.
+    const { controller, frames } = setup([true, false, false]);
+    controller.push({ text: "a" });
+    controller.push({ text: "ab" });
+    controller.stop();
+    expect(liveFrames(frames).map((frame) => frame.text)).toEqual(["a"]);
+    expect(finalFrames(frames)).toEqual([]);
   });
 
   it("MIXED refusal then a durable block: two blocks live, two rows, matching exactly", () => {
@@ -3845,7 +3908,8 @@ describe("ReasoningDraftController — #242 durable burst frames", () => {
     // the client holds {"Plan"} from the accepted push and {"Plan carefully"}
     // from the durable block. Two rows is therefore the MATCHING record rather
     // than a duplicate, which is why the close frame belongs on this path.
-    const { controller, frames } = setup([true, false]);
+    // FOUR sends: two pushes, the burst-close frame, then the durable block.
+    const { controller, frames } = setup([true, false, true, true]);
     controller.push({ text: "Plan" });
     controller.push({ text: "Plan carefully" });
     controller.pushDurableBlock({ text: "Plan carefully" });
@@ -3857,7 +3921,10 @@ describe("ReasoningDraftController — #242 durable burst frames", () => {
   });
 
   it("ALL-REFUSED: no close frame, and the id still rotates for the next burst", () => {
-    const { controller, frames } = setup([false]);
+    // THREE sends: the refused push, the second burst's push, and that burst's
+    // close frame. Burst 1 attempts no close frame at all (`lastDeliveredText`
+    // is empty), which is why only three appear.
+    const { controller, frames } = setup([false, true, true]);
     controller.push({ text: "a" });
     controller.endBurst();
     expect(frames).toEqual([]);
