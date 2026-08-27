@@ -48,9 +48,10 @@ because the thing it names does not exist. The correction:
     (the last only on volumes where WAL is unavailable) — the v6 delivery
     journal, opened at account start unconditionally, with no config to
     disable it. It holds message **plaintext**, not ciphertext: `agent_message`
-    text, `progress` placements, the `turn_snapshot` rows written at turn end,
-    and — since #242 half 1 — **the model's REASONING text**, all recorded on
-    the egress path. Owner-only (0600) inside the 0700
+    text, `progress` placements, and the `turn_snapshot` rows written at turn
+    end, all recorded on the egress path — plus, **only for an account that has
+    opted in**, the model's REASONING text (#242 half 1; see the note below).
+    Owner-only (0600) inside the 0700
     tuple directory, and nothing ages out of it — no slice has shipped
     retention (the pruning path is #299, the operator-facing procedure is
     #290) — so it accumulates for the life of the account. This used to say
@@ -58,27 +59,41 @@ because the thing it names does not exist. The correction:
     cutover, and neither of its two halves touches retention, so an operator
     following that pointer would land on the wrong issue.
 
-    ⚠️ **REASONING IS A NEW CLASS OF CONTENT ON DISK, NOT MORE OF THE SAME.**
-    The other rows are text the user was shown as the answer; a reasoning row
-    is the model's *private deliberation*, which routinely quotes tool output,
-    file contents and user data that never appear in any answer. One row per
-    burst, stored verbatim — e.g.
-    `{"kind":"reasoning","id":"R1","turnId":"T","text":"…"}`. The plugin's own
-    `resolveReasoningEnabled` says the same thing about the content
-    ("reasoning can restate file contents, credentials, or the user's own prompt
-    to the least trusted surface this plugin serves") — that judgement now
-    applies to bytes at rest, not only to a wire frame.
+    ⚠️ **REASONING IS OFF BY DEFAULT, AND IT IS AN OPT-IN — BUT READ THE CONTENT
+    WARNING BEFORE YOU TURN IT ON.** Nothing writes a reasoning row unless the
+    account sets `capabilities.reasoningDurable: true`. An earlier revision of
+    this runbook said the opposite — that rows are written unless an operator
+    turns them off, and that they accumulate with no user-visible benefit — and
+    both halves stopped being true when #242 half 1 shipped the separate,
+    default-OFF switch. The lever is now an opt-IN, not an opt-out.
 
-    Three facts make this worth stating rather than folding into the sentence
-    above: `capabilities.reasoning` defaults **ON**, so rows are written unless
-    an operator turned it off; nothing ages out (#299 is unshipped); and #242
-    **half 1 makes the content unreadable by any client** — the `history` wire
-    frame cannot carry a role-less message, so the projection drops it. Until
-    half 2 lands, this accumulates on disk with **no user-visible benefit at
-    all**. If that trade is not one you want to carry, set
-    `capabilities.reasoning` to `false` (any present value other than boolean
-    `true` also fails closed — see `resolveReasoningEnabled`) to stop new rows;
-    the data-minimization note below applies to the ones already written.
+    ⚠️ **IT IS STILL A NEW CLASS OF CONTENT AT REST, NOT MORE OF THE SAME**, and
+    that is the part an operator needs when they DO turn it on. The other rows
+    are text the user was shown as the answer; a reasoning row is the model's
+    *private deliberation*, which routinely quotes tool output, file contents
+    and user data that never appear in any answer. One row per burst, stored
+    verbatim — e.g. `{"kind":"reasoning","id":"R1","turnId":"T","text":"…"}`.
+    The plugin's own `resolveReasoningEnabled` says the same thing about the
+    content ("reasoning can restate file contents, credentials, or the user's
+    own prompt to the least trusted surface this plugin serves") — that
+    judgement applies to bytes at rest, not only to a wire frame.
+
+    ⚠️ **DO NOT CONFUSE THE TWO KEYS.** `capabilities.reasoning` (default **ON**)
+    controls the ephemeral LIVE lane the widget renders; it writes nothing to
+    disk. `capabilities.reasoningDurable` (default **OFF**) is what puts the
+    content in this file. #113's default-ON was a decision to render a volatile
+    live lane, and it does not inherit to a decision to permanently record
+    plaintext to disk — which is exactly why they are two keys.
+
+    Before opting in, note what the opt-in currently buys: nothing ages out of
+    the journal (#299 is unshipped), and #242 **half 1 leaves the content
+    unreadable by any client** — the `history` wire frame cannot carry a
+    role-less message, so the projection drops it. Until half 2/3 lands you are
+    accumulating plaintext that no user can see. If you have already opted in
+    and want to stop, set `capabilities.reasoningDurable` back to `false` (any
+    present value other than boolean `true` also fails closed — see
+    `resolveReasoningDurable`); the data-minimization note below applies to the
+    rows already written.
 
     **K does not seal this file, and rotating K does not touch it.**
     `sendToPeer` journals the payload *before* `sealEnvelope` runs, so K covers

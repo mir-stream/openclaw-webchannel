@@ -504,6 +504,82 @@ export function resolveReasoningEnabled(accountConfig: WebchannelAccountConfig):
   return (capabilities as { reasoning?: unknown }).reasoning === true;
 }
 
+/**
+ * Resolve whether reasoning content is DURABLE — journaled to disk — for an
+ * account (#242 half 1). Reads `capabilities.reasoningDurable`.
+ *
+ * DEFAULT **OFF**. An absent key, an absent container, and every malformed
+ * shape all resolve `false`; only a plain object carrying literal boolean `true`
+ * as an OWN property opens it.
+ *
+ * ⚠️ THIS IS A SECOND SWITCH ON PURPOSE, AND MERGING IT BACK INTO
+ * `capabilities.reasoning` IS THE MISTAKE THIS DOCBLOCK EXISTS TO PREVENT.
+ * **#113's default-ON was a decision to render a volatile live lane, and it does
+ * not inherit to a decision to permanently record plaintext to disk.** Those are
+ * two different questions with two different blast radii:
+ *  - the LANE is ephemeral. It is drawn, the turn ends, the client's own
+ *    `state.reasoning` is capped and eventually dropped, and nothing survives a
+ *    reload. Defaulting it ON costs a UI section;
+ *  - the JOURNAL is permanent plaintext on disk. Reasoning routinely restates
+ *    tool output, file contents and the user's own prompt — this file already
+ *    says so, one function up, as the reason a PRESENT malformed value fails
+ *    closed — and there is no retention path yet (**#299** is unshipped), so
+ *    nothing ages out.
+ *
+ * ⚠️ AND THE BENEFIT SIDE IS CURRENTLY ZERO, WHICH IS WHAT DECIDES IT. #242
+ * half 1 is server-side only: `journal-history.ts` drops reasoning when it
+ * builds the `history` frame, because `HistoryMessage.role` cannot express a
+ * role-less message. So until half 2/3 lands there is NO client that can read
+ * these rows back. A window with a real cost and zero benefit has no trade-off
+ * to weigh, so it takes the cheapest reversible direction: off, with an
+ * operator opt-IN. Revisit the default when half 2/3 makes the content
+ * readable — that is when this argument expires, not before.
+ *
+ * ── WHY THIS IS SHORTER THAN `resolveReasoningEnabled`, AND WHAT MUST STAY ──
+ *
+ * That function's longer ladder — the separate `capabilities === undefined`
+ * arm, the "only an omitted container gets the default" comment — exists because
+ * its default is ON: there, mistaking a malformed container for an absent one
+ * would ERASE AN INHERITED OPT-OUT and leak the lane back on. Here the default
+ * is OFF, so every one of those paths already lands on `false` and writing them
+ * out separately would be branch structure with no behaviour behind it.
+ *
+ * ⚠️ TWO OF ITS GUARDS ARE NOT REDUNDANT AND MUST SURVIVE. Do not "restore
+ * symmetry" by deleting them, and do not simplify them into a property read:
+ *  - the PROTOTYPE CHECK. Without it, a poisoned `Object.prototype` (or a class
+ *    instance whose prototype declares it) could supply `reasoningDurable: true`
+ *    through the chain and turn on plaintext-at-rest for an account whose own
+ *    config never mentions it;
+ *  - `Object.prototype.hasOwnProperty.call`, for exactly the same reason. A bare
+ *    `capabilities.reasoningDurable` read walks the prototype chain, so the
+ *    OWN-property test is what makes the check above mean anything. It is
+ *    `.call`ed off `Object.prototype` rather than invoked as a method because
+ *    `capabilities` may be a null-prototype record, which has no
+ *    `hasOwnProperty` of its own.
+ * A null prototype is ACCEPTED (`Object.create(null)` is the safest plain record
+ * there is, and it is what a hardened config loader produces); what is refused
+ * is a prototype that could carry keys.
+ */
+export function resolveReasoningDurable(accountConfig: WebchannelAccountConfig): boolean {
+  const capabilities = accountConfig?.capabilities;
+  // `typeof null === "object"`, so null is excluded explicitly; `undefined`
+  // falls out of the `typeof` test and needs no arm of its own under a
+  // default-OFF gate.
+  if (
+    capabilities === null ||
+    typeof capabilities !== "object" ||
+    Array.isArray(capabilities)
+  ) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(capabilities);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  if (!Object.prototype.hasOwnProperty.call(capabilities, "reasoningDurable")) {
+    return false;
+  }
+  return (capabilities as { reasoningDurable?: unknown }).reasoningDurable === true;
+}
+
 /** Read an account's merged `nats` config block (for credential-source resolution). */
 export function resolveAccountNatsConfig(
   cfg: unknown,

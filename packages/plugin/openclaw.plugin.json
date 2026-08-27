@@ -172,6 +172,10 @@
               "reasoning": {
                 "type": "boolean",
                 "description": "Whether the agent's reasoning/thinking stream is delivered to browser peers. Defaults to true when the key is OMITTED; set it to boolean false to turn the lane off. A persisted explicit session /reasoning off also vetoes delivery. Deliberately carries NO schema default: core hydrates defaults into the stored config, so declaring one here would write the key into every deployment and the omitted-means-on default could never be reached. Note the \"on\"/\"off\" strings that capabilities.typing accepts are rejected by this channel-level schema; deliberately unvalidated named-account leaves fail closed at runtime. Enabling it is necessary but NOT sufficient: the agent's own thinking level must also be something other than \"off\", which channel config cannot force."
+              },
+              "reasoningDurable": {
+                "type": "boolean",
+                "description": "Whether the agent's reasoning/thinking content is PERSISTED to this plugin's delivery journal on disk, as message plaintext. Defaults to FALSE when the key is OMITTED; set it to boolean true to opt in. Deliberately SEPARATE from capabilities.reasoning, which governs the ephemeral live lane and defaults to true: #113's default-ON was a decision to render a volatile live lane, and it does not inherit to a decision to permanently record plaintext to disk. Reasoning routinely restates tool output, file contents and the user's own prompt; nothing ages out of the journal yet (#299); and #242 half 1 has no client that can read these rows back, so opting in currently buys storage with no user-visible benefit. Carries NO schema default for the same reason capabilities.reasoning does not: core hydrates defaults into the stored config, so declaring one would write the key into every deployment. Deliberately unvalidated named-account leaves fail closed at runtime."
               }
             }
           },
@@ -316,6 +320,10 @@
         "capabilities.reasoning": {
           "label": "Reasoning stream",
           "help": "Whether the agent's reasoning/thinking stream is delivered to browser peers. Default true when omitted; set boolean false to turn the lane off. A persisted explicit session /reasoning off also vetoes delivery. This key is a boolean: malformed channel-level values are rejected, while deliberately unvalidated named-account values fail closed at runtime. Note this alone is not enough: the agent's thinking level must also be other than \"off\", or the lane stays empty."
+        },
+        "capabilities.reasoningDurable": {
+          "label": "Persist reasoning to disk",
+          "help": "Whether the agent's reasoning/thinking content is written to this plugin's delivery journal on disk as plaintext. Default false when omitted; set boolean true to opt in. This is NOT capabilities.reasoning \u2014 that key controls the live lane and defaults to true. Rendering a volatile live lane and permanently recording plaintext are separate decisions. Nothing ages out of the journal yet, and no client can read these rows back until #242 half 2, so leave it off unless you specifically want the record."
         },
         "history.enabled": {
           "label": "History pagination",

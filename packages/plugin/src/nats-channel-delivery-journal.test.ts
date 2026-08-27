@@ -108,7 +108,14 @@ class FakeJournal implements DeliveryJournal {
   }
 }
 
-function makeChannel(): {
+/**
+ * `reasoningDurable` mirrors production's default: OMITTED means OFF, exactly as
+ * `resolveReasoningDurable` resolves an account that never set the key. A test
+ * that wants reasoning rows must say so, which is the point — the opt-in is the
+ * shipped behaviour and a test that got them for free would be testing a
+ * configuration nobody runs by default.
+ */
+function makeChannel(options?: { reasoningDurable?: boolean }): {
   calls: Call[];
   transport: RecordingTransport;
   journal: FakeJournal;
@@ -123,7 +130,12 @@ function makeChannel(): {
     TENANT,
     undefined,
     undefined,
-    { deliveryJournal: journal },
+    {
+      deliveryJournal: journal,
+      ...(options?.reasoningDurable === undefined
+        ? {}
+        : { reasoningDurable: options.reasoningDurable }),
+    },
   );
   return { calls, transport, journal, channel };
 }
@@ -625,9 +637,88 @@ describe("#239 — egress seam against a real journal", () => {
  * carrying the whole text so far. Driving the REAL controller into the REAL
  * channel is what turns "how many rows does a burst cost" into an observable.
  */
-describe("#242 — a live reasoning stream costs ONE journal row per burst", () => {
-  it("writes one row per burst, not one per cumulative update", () => {
+/**
+ * #242 half 1 — THE DEFAULT: the live lane runs, the journal stays empty.
+ *
+ * ⚠️ THIS IS THE TEST THAT PROVES THE GATE IS AT THE JOURNAL AND NOT ON THE
+ * LANE. Two switches, two decisions: `capabilities.reasoning` keeps its #113
+ * default-ON because it is about rendering a volatile live stream, and
+ * `capabilities.reasoningDurable` defaults OFF because it is about permanently
+ * recording plaintext to disk. Gating by closing the lane would have satisfied
+ * "no rows" while silently regressing #113, and nothing else in the suite would
+ * have noticed — so the assertion is deliberately BOTH halves: every live frame
+ * still on the wire, INCLUDING the `final: true` close frame, and zero rows.
+ */
+describe("#242 — reasoningDurable OFF (default): lane intact, journal empty", () => {
+  it("publishes the whole burst, close frame included, and journals nothing", () => {
     const { calls, channel } = makeChannel();
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+
+    controller.push({ text: "Let" });
+    controller.push({ text: "Let me" });
+    controller.push({ text: "Let me think" });
+    controller.endBurst();
+
+    // The LANE is untouched: three live drafts plus the burst close.
+    expect(calls.filter((entry) => entry.call === "publish")).toEqual([
+      { call: "publish", subject: OUT, type: "reasoning" },
+      { call: "publish", subject: OUT, type: "reasoning" },
+      { call: "publish", subject: OUT, type: "reasoning" },
+      { call: "publish", subject: OUT, type: "reasoning" },
+    ]);
+    // And the JOURNAL is empty.
+    expect(appends(calls)).toEqual([]);
+  });
+
+  it("still journals every OTHER durable frame of the same turn", () => {
+    // Non-vacuity, and the exact failure a lane-side gate would NOT produce:
+    // the flag must silence reasoning ONLY. A turn whose answers stopped being
+    // journaled would be catastrophic and must not hide behind "no rows".
+    const { calls, channel } = makeChannel();
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+
+    controller.push({ text: "thinking" });
+    controller.endBurst();
+    channel.sendProgress(PEER, "a-1", "Working…", "turn-1");
+    channel.sendText(PEER, "the answer", "a-1", "turn-1");
+
+    expect(
+      appends(calls).map((entry) => (entry.call === "append" ? entry.event : undefined)),
+    ).toEqual([
+      { kind: "placement", answerId: "a-1", turnId: "turn-1" },
+      { kind: "bubble", answerId: "a-1", text: "the answer", turnId: "turn-1" },
+    ]);
+  });
+
+  it("a non-boolean reasoningDurable fails CLOSED at the channel boundary", () => {
+    // `resolveReasoningDurable` already refuses a present malformed value, but
+    // the channel takes a plain object and a future caller could hand it one
+    // that never went through the resolver. `=== true` is what makes that safe.
+    const { calls, channel } = makeChannel({
+      reasoningDurable: "true" as unknown as boolean,
+    });
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+    controller.push({ text: "thinking" });
+    controller.endBurst();
+    expect(appends(calls)).toEqual([]);
+  });
+});
+
+describe("#242 — with reasoningDurable ON, a live stream costs ONE row per burst", () => {
+  it("writes one row per burst, not one per cumulative update", () => {
+    const { calls, channel } = makeChannel({ reasoningDurable: true });
     const controller = createReasoningDraftController({
       transport: channel,
       sessionKey: PEER,
@@ -659,7 +750,7 @@ describe("#242 — a live reasoning stream costs ONE journal row per burst", () 
   });
 
   it("gives each burst of a turn its own row, and an aborted turn still gets one", () => {
-    const { calls, channel } = makeChannel();
+    const { calls, channel } = makeChannel({ reasoningDurable: true });
     const controller = createReasoningDraftController({
       transport: channel,
       sessionKey: PEER,
@@ -693,7 +784,7 @@ describe("#242 — a live reasoning stream costs ONE journal row per burst", () 
     // hold what the peer actually received — a gate on "did the LAST send land"
     // wrote NO row here at all, which is the N8-losing hole this slice exists
     // to close.
-    const { calls, transport, channel } = makeChannel();
+    const { calls, transport, channel } = makeChannel({ reasoningDurable: true });
     const controller = createReasoningDraftController({
       transport: channel,
       sessionKey: PEER,
@@ -718,7 +809,7 @@ describe("#242 — a live reasoning stream costs ONE journal row per burst", () 
     // The transport refuses every send (no session key on an encrypted channel
     // is the real shape; here the transport is simply disconnected), so the
     // journal — which sits BELOW `sendToPeer`'s refusals — sees nothing at all.
-    const { calls, transport, channel } = makeChannel();
+    const { calls, transport, channel } = makeChannel({ reasoningDurable: true });
     transport.connected = false;
     const controller = createReasoningDraftController({
       transport: channel,

@@ -61,8 +61,12 @@
  * design" — that is NOT-list N3/N7, and BOUNDARY 2 of the reducer says the event
  * set WILL grow (doc §15.9 requires tool and reasoning messages to become
  * durable MESSAGES; only pure indicators stay ephemeral). It already grew once:
- * #242 half 1 made `reasoning` durable, one row per BURST rather than per frame
- * — see that case for why the distinction is load-bearing rather than cosmetic.
+ * #242 half 1 made `reasoning` durable — one row per BURST rather than per
+ * frame, and only when the account OPTS IN via `capabilities.reasoningDurable`
+ * (default OFF, a separate switch from the default-ON live lane; see that case
+ * and `resolveReasoningDurable`) — so its `null` now has TWO reasons and they
+ * mean different things: "this account does not store reasoning" and "this frame
+ * is a live draft, not the burst's content".
  * TOOL ACTIVITY and the APPROVAL frames are still `null` and are marked "#242
  * half 2". Every `null` below carries its reason, and the ones owned by #242 say
  * "not yet" rather than "no".
@@ -162,15 +166,42 @@ export function isIdlessDurableFrame(frame: OutboundWsMessage): boolean {
 }
 
 /**
+ * Per-account policy this mapper needs. Resolved ONCE at account start and
+ * carried on the channel — never read from config per frame.
+ */
+export type JournalPolicy = {
+  /**
+   * #242 half 1: is reasoning content DURABLE for this account
+   * (`capabilities.reasoningDurable`, `account-config.ts`)? DEFAULT OFF.
+   *
+   * Separate from `capabilities.reasoning`, which governs the LIVE LANE and
+   * keeps its #113 default-ON. `resolveReasoningDurable`'s docblock carries the
+   * full argument; the one line to remember is that #113's default-ON was a
+   * decision to render a volatile live lane, and it does not inherit to a
+   * decision to permanently record plaintext to disk.
+   */
+  reasoningDurable?: boolean;
+};
+
+/**
  * Map one outbound frame to the event the journal must persist, or `null` when
  * the frame is not (or not yet) a durable message.
  *
  * The `switch` is EXHAUSTIVE by construction: the `default` assigns `frame` to
  * `never`, so a new `OutboundWsMessage` variant is a COMPILE ERROR here rather
  * than a silently unjournaled message.
+ *
+ * ⚠️ `policy` IS OPTIONAL AND ITS OMISSION IS THE SAFE DIRECTION, NOT AN
+ * OVERSIGHT. A caller that forgets it journals LESS, never more: every field is
+ * a per-account permission to store something, so absent reads as "not
+ * permitted". Making it required would have been compiler-checked but would
+ * force every existing call site to restate a default it does not care about,
+ * and the wiring is proven where it actually matters — a channel-level test
+ * drives the REAL `NatsChannel` with the flag on and off and counts rows.
  */
 export function journalEventForOutbound(
   frame: OutboundWsMessage,
+  policy?: JournalPolicy,
 ): JournalEvent | null {
   switch (frame.type) {
     case "agent_message":
@@ -233,6 +264,27 @@ export function journalEventForOutbound(
         remove: [...frame.remove],
       };
     case "reasoning":
+      // ⚠️ OUTER GATE FIRST: IS REASONING DURABLE FOR THIS ACCOUNT AT ALL?
+      // `capabilities.reasoningDurable` (`account-config.ts`'s
+      // `resolveReasoningDurable`) DEFAULTS OFF, so this returns `null` for
+      // every reasoning frame unless an operator opted in.
+      //
+      // ⚠️ THE GATE IS HERE, AT THE JOURNALING SEAM, AND NOT ON THE LANE — that
+      // placement is the decision, not an implementation detail. Closing the
+      // lane instead would regress #113 (the live reasoning stream the client
+      // renders) to buy a storage property, i.e. pay for it in a completely
+      // different currency. With the gate here the lane is untouched: every live
+      // `reasoning` frame still goes out, INCLUDING the `final: true` close
+      // frame, and only the row is withheld. The channel-level tests assert
+      // exactly that pairing.
+      //
+      // ⚠️ AND IT IS CHECKED BEFORE THE `final` TEST BELOW, DELIBERATELY. The
+      // account permission is the OUTER question ("may we store reasoning?");
+      // `final` is the inner one ("is this the frame worth storing?"). Reading
+      // them in the other order works today and would still be correct, but it
+      // reads as though `final` were the gate and the permission a refinement of
+      // it, which is backwards and is how the two get merged again later.
+      if (policy?.reasoningDurable !== true) return null;
       // DURABLE, but ONLY the frame that CLOSES a burst (#242 half 1, §15.9).
       //
       // ⚠️ `final` IS NOT A NICETY — WITHOUT IT THIS CASE IS O(n²) BYTES PER

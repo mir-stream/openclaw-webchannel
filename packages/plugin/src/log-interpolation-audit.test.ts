@@ -36,8 +36,8 @@ import { decodeStrictLogfmt } from "./test-fixtures/strict-logfmt.js";
  * without this guard saying anything:
  *
  *   1. VARIABLE-FIRST RECORDS. `const m = `…`; logger.error(m)` needs dataflow.
- *      This is not hypothetical: `nats-account-runtime.ts:322-324` builds
- *      `event=webchannel.invalid_account_id` exactly this way, and this guard
+ *      This is not hypothetical: `nats-account-runtime.ts` builds its
+ *      `event=webchannel.invalid_account_id` line exactly this way, and this guard
  *      does not see it. (Its two interpolations — `formatAccountIdForLog(...)`
  *      and `JSON.stringify(invalid.reason)` — are both non-peer, so
  *      it is baseline-class debt, not a live hole — but it is invisible here.)

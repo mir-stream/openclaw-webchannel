@@ -72,10 +72,17 @@ export type OutboundWsMessage =
       /**
        * #242 half 1 (doc §15.9/§16.2-5): THIS frame closes the reasoning burst.
        * Its `text` is the burst's DURABLE text, and it is the ONLY `reasoning`
-       * frame the delivery journal records
+       * frame the delivery journal can record
        * (`delivery-journal-event.ts`'s `case "reasoning"`). Absent or `false`
        * means a LIVE CUMULATIVE DRAFT update — not durable, exactly as
        * `progress` is not durable.
+       *
+       * ⚠️ "CAN RECORD", NOT "DOES". Whether ANY reasoning row is written is a
+       * separate, per-account decision — `capabilities.reasoningDurable`,
+       * default OFF. This flag is the WIRE's answer to "which frame carries the
+       * burst's content"; it is not a promise that the content is stored. The
+       * frame is emitted either way, which is the point: the storage gate lives
+       * at the journal, never on the lane.
        *
        * ⚠️ THE FLAG EXISTS BECAUSE THE LIVE STREAM IS UNTHROTTLED.
        * `message-adapter.ts`'s `createReasoningDraftController` sends one frame

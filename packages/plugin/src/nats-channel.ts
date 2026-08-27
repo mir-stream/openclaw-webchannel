@@ -40,6 +40,7 @@ import type { DeliveryJournal } from "./delivery-journal.js";
 import {
   isIdlessDurableFrame,
   journalEventForOutbound,
+  type JournalPolicy,
   journalFailureDiagnostic,
 } from "./delivery-journal-event.js";
 
@@ -165,6 +166,18 @@ export type NatsChannelLimits = {
 export type NatsChannelDurability = {
   /** v6 delivery journal (#239). Absent = no journaling (tests, legacy plaintext mode). */
   deliveryJournal?: DeliveryJournal;
+  /**
+   * #242 half 1: does this account journal REASONING content
+   * (`capabilities.reasoningDurable`)? Absent = NO, which is the shipped
+   * default — see `account-config.ts`'s `resolveReasoningDurable` for why this
+   * is a separate switch from the default-ON live lane.
+   *
+   * Resolved ONCE at account start and carried here, alongside the journal it
+   * governs, rather than read from config per frame: `sendToPeer` is on the hot
+   * egress path, and a policy that can change under a live channel is the same
+   * split-conversation hazard the journal itself is constructor-only to avoid.
+   */
+  reasoningDurable?: boolean;
 };
 
 /** S2 defaults — high enough that normal operation never evicts. */
@@ -314,6 +327,16 @@ export class NatsChannel implements WebChannelPeerChannel {
    */
   private readonly deliveryJournal: DeliveryJournal | null;
   /**
+   * #242 half 1: the per-account journaling policy, resolved once at account
+   * start. Held as a whole `JournalPolicy` rather than as loose booleans so the
+   * mapper can gain a field without this class gaining one.
+   *
+   * `readonly`, like the journal beside it, and for the same reason: a policy
+   * that flipped mid-life would split one conversation into a journaled half and
+   * an unjournaled half, with nothing recording where the seam is.
+   */
+  private readonly journalPolicy: JournalPolicy;
+  /**
    * Bounded, content-free warning state, one entry per FIXED category. Same
    * shape as `lastResultLimitWarningAt`/`suppressedResultLimitWarnings` above,
    * just keyed — see `warnDeliveryJournal`.
@@ -371,6 +394,10 @@ export class NatsChannel implements WebChannelPeerChannel {
     this.maxSeenMessageIdsPerPeer =
       limits?.maxSeenMessageIdsPerPeer ?? DEFAULT_MAX_SEEN_MESSAGE_IDS_PER_PEER;
     this.deliveryJournal = durability?.deliveryJournal ?? null;
+    // `=== true`, not `?? false`: a non-boolean reaching here (a hand-built
+    // durability object in a test, a future caller) must fail CLOSED, matching
+    // `resolveReasoningDurable`'s own rule for a present malformed value.
+    this.journalPolicy = { reasoningDurable: durability?.reasoningDurable === true };
 
     // Retain the exact listener identity so account teardown can detach it.
     this.transportMessageListener = (msg: NatsMessage) => {
@@ -1095,7 +1122,7 @@ export class NatsChannel implements WebChannelPeerChannel {
 
       // `null` = this frame is not (or not yet) a durable message. The mapper
       // owns that verdict and documents every case; do not second-guess it here.
-      const event = journalEventForOutbound(payload);
+      const event = journalEventForOutbound(payload, this.journalPolicy);
       if (!event) return;
 
       // D1 — THE CONVERSATION ID IS THE `peerId`. The journal FILE is already

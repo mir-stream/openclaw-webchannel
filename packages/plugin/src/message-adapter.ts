@@ -2674,8 +2674,11 @@ export type ReasoningDraftController = {
  * durable block remains the fallback and is emitted normally.
  *
  * #242 half 1 — ONE DURABLE FRAME PER BURST. A frame carrying `final: true` is
- * what makes the delivery journal record a burst, and the journal records
- * NOTHING else this controller sends. The invariant is per BURST, not per call:
+ * what LETS the delivery journal record a burst, and the journal records
+ * NOTHING else this controller sends. (Whether it records anything at all is the
+ * account's `capabilities.reasoningDurable`, default OFF — gated at the
+ * journaling seam, never here, so this controller's wire output is identical
+ * either way.) The invariant is per BURST, not per call:
  *
  *   `endBurst`                    — closes the live burst: ONE frame, or ZERO
  *                                   when nothing of it was delivered.

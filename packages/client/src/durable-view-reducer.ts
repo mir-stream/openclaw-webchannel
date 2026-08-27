@@ -21,7 +21,9 @@
  *
  * ⚠️ `reasoning` HAS NO ANCHOR, AND CANNOT HAVE ONE YET. #242 half 1 makes
  * reasoning durable on the SERVER side only: the plugin journals one row per
- * burst, this reducer folds it, and `journal-history.ts` replays it. The CLIENT
+ * burst (for an account that opted in — `capabilities.reasoningDurable`,
+ * default OFF), this reducer folds it, and `journal-history.ts` replays it.
+ * The CLIENT
  * still renders reasoning out of its own `state.reasoning` array
  * (`upsertReasoning`) and routes no `reasoning` frame through this file, so
  * there is no second implementation to compare against — an "anchor" would only
@@ -318,6 +320,14 @@ function findTextIndex(view: DurableView, id: string): number {
  *                  by the time an event exists, `final` is what MADE it an
  *                  event. Upsert-by-id, exactly like `bubble`.
  *
+ *                  ⚠️ AN EVENT OF THIS KIND ONLY EXISTS FOR AN ACCOUNT THAT
+ *                  OPTED IN (`capabilities.reasoningDurable`, default OFF), so
+ *                  a journal with NO reasoning rows is the ordinary case, not
+ *                  evidence of a lost write. The gate is at the journaling
+ *                  seam, so the live lane is unaffected either way — do not
+ *                  infer anything about what the user SAW from what this
+ *                  stream contains.
+ *
  *                  ⚠️ IT IS NOT ONE FRAME PER EVENT, AND THAT IS THE WHOLE
  *                  DESIGN. `message-adapter.ts`'s `createReasoningDraftController`
  *                  sends a `reasoning` frame for every cumulative update that
@@ -343,7 +353,7 @@ function findTextIndex(view: DurableView, id: string): number {
  * enumerate mint at the delivery act — `inbound.ts:1571-1581` (the ordinary
  * visible reply, both branches of the one ternary), `inbound.ts:1626-1631` (the
  * thrown-turn apology), `channel.ts:311` (the generic outbound), and
- * `nats-account-runtime.ts:1177-1182` (the /stop operator-allowlist notice).
+ * `nats-account-runtime.ts`'s /stop operator-allowlist notice.
  * `message-adapter.ts`'s `message.send.text` handler passes `nextMessageId()` and
  * `NatsChannel.finalizeDraft` requires an `id`, as they always did. The enumeration is kept
  * in the past tense rather than deleted because "the count is four, not three"

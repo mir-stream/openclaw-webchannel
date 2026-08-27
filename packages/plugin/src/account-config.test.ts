@@ -22,6 +22,7 @@ import {
   resolveAccountNatsConfig,
   resolveTypingEnabled,
   resolveReasoningEnabled,
+  resolveReasoningDurable,
   readAccountsMap,
   readWebchannelSection,
   accountCredentialPath,
@@ -348,6 +349,124 @@ describe("account-config: resolveReasoningEnabled (#113)", () => {
     expect(resolveTypingEnabled({ capabilities: { reasoning: false } })).toBe(true);
     expect(resolveReasoningEnabled({ capabilities: { reasoning: "on" } })).toBe(false);
     expect(resolveTypingEnabled({ capabilities: { typing: "on" } })).toBe(true);
+  });
+});
+
+describe("account-config: resolveReasoningDurable (#242 half 1)", () => {
+  it("defaults OFF when the key is absent — container missing, empty, or unrelated", () => {
+    // ⚠️ THE OPPOSITE DEFAULT TO `resolveReasoningEnabled` NEXT DOOR, ON
+    // PURPOSE. #113's default-ON was a decision to render a volatile live lane,
+    // and it does not inherit to a decision to permanently record plaintext to
+    // disk. The lane is drawn and forgotten; the journal is plaintext that
+    // nothing ages out (#299 unshipped) and that no client can read back until
+    // #242 half 2 — cost with no benefit, so it takes the reversible direction.
+    expect(resolveReasoningDurable({})).toBe(false);
+    expect(resolveReasoningDurable({ capabilities: {} })).toBe(false);
+    expect(resolveReasoningDurable({ capabilities: { typing: "on" } })).toBe(false);
+    // The neighbouring key does NOT open it — the whole point of the split.
+    expect(resolveReasoningDurable({ capabilities: { reasoning: true } })).toBe(false);
+  });
+
+  it("ON only for explicit boolean true", () => {
+    expect(resolveReasoningDurable({ capabilities: { reasoningDurable: true } })).toBe(true);
+  });
+
+  it("OFF for explicit false", () => {
+    expect(resolveReasoningDurable({ capabilities: { reasoningDurable: false } })).toBe(false);
+  });
+
+  it("OFF for every PRESENT non-boolean-true value, the string 'true' included", () => {
+    // Same fail-closed rule as `resolveReasoningEnabled`, and it matters MORE
+    // here: a truthiness read would let the string "true" — or "on", copied from
+    // `capabilities.typing` — silently start writing plaintext to disk.
+    for (const value of ["true", "on", "off", "false", 1, 0, {}, [], null, undefined]) {
+      expect(
+        resolveReasoningDurable({ capabilities: { reasoningDurable: value } }),
+        `reasoningDurable: ${JSON.stringify(value)} must resolve OFF`,
+      ).toBe(false);
+    }
+  });
+
+  it("fails closed for every malformed capabilities container", () => {
+    for (const capabilities of [null, "off", [], 0, 1, false, true, new Date(0)]) {
+      expect(
+        resolveReasoningDurable({ capabilities }),
+        `capabilities: ${String(capabilities)} must resolve OFF`,
+      ).toBe(false);
+    }
+  });
+
+  it("refuses a value reachable only through the PROTOTYPE CHAIN", () => {
+    // ⚠️ THE TWO GUARDS THAT SURVIVED THE DEFAULT FLIP, AND THE REASON THEY DID.
+    // Most of `resolveReasoningEnabled`'s ladder collapses under a default-OFF
+    // gate because every malformed path already lands on `false`. These two do
+    // not: without them, a prototype nobody wrote into this account's config
+    // could turn ON plaintext-at-rest.
+    //
+    // (a) a CLASS instance whose prototype declares the key.
+    class Capabilities {}
+    (Capabilities.prototype as { reasoningDurable?: boolean }).reasoningDurable = true;
+    expect(resolveReasoningDurable({ capabilities: new Capabilities() })).toBe(false);
+
+    // (b) a plain object INHERITING it from a poisoned Object.prototype. The
+    //     prototype check passes here (it IS Object.prototype), so this case is
+    //     carried entirely by the OWN-property test.
+    const proto = Object.prototype as { reasoningDurable?: boolean };
+    try {
+      proto.reasoningDurable = true;
+      expect(resolveReasoningDurable({ capabilities: {} })).toBe(false);
+      // Non-vacuity: the poison really is reachable by a bare property read,
+      // so the assertion above is about the guard and not about an empty object.
+      expect(({} as { reasoningDurable?: boolean }).reasoningDurable).toBe(true);
+    } finally {
+      delete proto.reasoningDurable;
+    }
+    expect(({} as { reasoningDurable?: boolean }).reasoningDurable).toBeUndefined();
+  });
+
+  it("accepts a null-prototype record carrying the key as an OWN property", () => {
+    // `Object.create(null)` is the safest plain record there is and is what a
+    // hardened config loader produces, so a null prototype is ACCEPTED. What the
+    // check refuses is a prototype that could carry keys.
+    const record = Object.assign(Object.create(null), { reasoningDurable: true });
+    expect(resolveReasoningDurable({ capabilities: record })).toBe(true);
+    expect(resolveReasoningDurable({ capabilities: Object.create(null) })).toBe(false);
+  });
+
+  it("carries a channel-level opt-in down to an account that omits capabilities", () => {
+    // The ON direction is the meaningful one here (mirror image of the reasoning
+    // suite): with the default OFF, only a `true` that survives the merge can
+    // distinguish "the merge carried my value" from "the default agreed".
+    const cfg = {
+      channels: {
+        webchannel: {
+          capabilities: { reasoningDurable: true },
+          accounts: { acctA: { tenant: "t" } },
+        },
+      },
+    };
+    expect(resolveReasoningDurable(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(true);
+  });
+
+  it("lets one account opt out of a channel-level opt-in", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          capabilities: { reasoningDurable: true },
+          accounts: { acctA: { capabilities: { reasoningDurable: false } } },
+        },
+      },
+    };
+    expect(resolveReasoningDurable(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(false);
+  });
+
+  it("is independent of capabilities.reasoning in BOTH directions", () => {
+    // The split, stated as a property: neither key moves the other off its own
+    // default. A future refactor that folds them back into one switch fails here.
+    expect(resolveReasoningEnabled({ capabilities: { reasoningDurable: true } })).toBe(true);
+    expect(resolveReasoningDurable({ capabilities: { reasoning: true } })).toBe(false);
+    expect(resolveReasoningEnabled({ capabilities: { reasoning: false, reasoningDurable: true } })).toBe(false);
+    expect(resolveReasoningDurable({ capabilities: { reasoning: false, reasoningDurable: true } })).toBe(true);
   });
 });
 

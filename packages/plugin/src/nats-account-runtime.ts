@@ -96,6 +96,7 @@ import {
 import { planWebchannelAccount } from "./multiplex.js";
 import {
   loadPersistedCredentialDocument,
+  resolveReasoningDurable,
   resolveTypingEnabled,
 } from "./account-config.js";
 import {
@@ -782,6 +783,17 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       const historyConfig = resolveHistoryConfig(
         account as { capabilities?: { typing?: "on" | "off" } } | undefined,
       );
+      // #242 half 1: does THIS account journal reasoning content? Resolved here,
+      // beside the other pure-config reads and from the same `account` binding
+      // `setTypingEnabled` uses below, so the policy is decided ONCE per account
+      // start rather than per outbound frame.
+      //
+      // ⚠️ DEFAULT OFF, AND IT IS NOT `capabilities.reasoning`. That key governs
+      // the LIVE LANE and keeps its #113 default-ON; this one governs plaintext
+      // on disk. `resolveReasoningDurable`'s docblock carries the argument —
+      // #113's default-ON was a decision to render a volatile live lane, and it
+      // does not inherit to a decision to permanently record plaintext to disk.
+      const reasoningDurable = resolveReasoningDurable(account);
       // `| undefined` because the failure path below and `dispose()` further
       // down both run on paths where the open never happened.
       let deliveryJournal: DeliveryJournal | undefined;
@@ -849,7 +861,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           ...cryptoOptions,
           keyStore,
           identityKeyPair: attemptIdentityKey,
-        }, undefined, { deliveryJournal });
+        }, undefined, { deliveryJournal, reasoningDurable });
         // #240 half 2 — the read path, built here so it receives the SAME open
         // handle as the channel's write path, as a `const` in direct flow. All
         // history policy (deferral, the per-peer in-flight bound, the

@@ -26,7 +26,9 @@
  * standing exceptions that show up the moment a real conversation is replayed.
  * READ THIS BEFORE CONCLUDING THE PROJECTION IS WRONG.
  *
- * GAP 2 — REASONING IS DURABLE BUT UNSENDABLE (#242 half 1). The journal now
+ * GAP 2 — REASONING IS DURABLE BUT UNSENDABLE (#242 half 1). For an account
+ * that opted in via `capabilities.reasoningDurable` (default OFF — see
+ * `account-config.ts`'s `resolveReasoningDurable`), the journal
  * records one row per reasoning burst and the fold places it in the view, but
  * the `history` wire frame carries `HistoryMessage`, whose `role` is
  * `"user" | "agent"` and which therefore cannot express a role-less reasoning

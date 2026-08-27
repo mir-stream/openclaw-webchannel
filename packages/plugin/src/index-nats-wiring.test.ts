@@ -206,8 +206,22 @@ describe("nats-account-runtime.ts wiring contract — v6 delivery journal (#239)
     expect(RUNTIME_SOURCE).toContain("deliveryJournal = journal;");
     // The channel must actually RECEIVE it. `undefined` is the defaulted
     // NatsChannelLimits in the 5th position.
+    //
+    // ⚠️ THE DURABILITY OBJECT NOW CARRIES A SECOND FIELD (#242 half 1), and it
+    // is asserted here rather than in a guard of its own because the failure it
+    // prevents is the same one: a value resolved and then never handed over.
+    // `reasoningDurable` is resolved from account config a few lines up; if the
+    // wiring dropped it the channel would default it OFF, every reasoning row
+    // would silently stop being written for accounts that opted IN, and no
+    // behavioural test would notice — the channel-level tests construct their
+    // own durability object and never traverse this line.
     expect(RUNTIME_SOURCE).toMatch(
-      /\}, undefined, \{ deliveryJournal \}\);/,
+      /\}, undefined, \{ deliveryJournal, reasoningDurable \}\);/,
+    );
+    // And it must be the RESOLVER's answer, not a literal or a re-read of
+    // `capabilities.reasoning` — the two switches are deliberately separate.
+    expect(RUNTIME_SOURCE).toMatch(
+      /const reasoningDurable = resolveReasoningDurable\(account\);/,
     );
     // Constructor-only: a late/mutable attachment would mean frames published
     // before it landed were never journaled. Asserted against the CHANNEL, which

@@ -164,7 +164,16 @@ describe("an id-less agent_message is not persisted, and IS observable", () => {
  * that the admission rule is the LIVE CLIENT'S rule — anything else is a
  * live≠history divergence created right here.
  */
-describe("journalEventForOutbound — reasoning (#242 half 1)", () => {
+/**
+ * #242 half 1 — THE OUTER GATE: does this account journal reasoning at all?
+ *
+ * `capabilities.reasoningDurable` defaults OFF, so these cases are about the
+ * permission rather than about the frame. They are kept in their own describe,
+ * ahead of the content rules below, because the two answer different questions
+ * and merging them is exactly how the live lane and the on-disk record got
+ * conflated in the first place.
+ */
+describe("journalEventForOutbound — the reasoningDurable gate (#242 half 1)", () => {
   const closing: OutboundWsMessage = {
     type: "reasoning",
     id: "r-1",
@@ -173,8 +182,59 @@ describe("journalEventForOutbound — reasoning (#242 half 1)", () => {
     final: true,
   };
 
+  it("journals NOTHING when the policy is absent — the shipped default", () => {
+    // A caller that forgets the policy journals LESS, never more.
+    expect(journalEventForOutbound(closing)).toBeNull();
+    expect(journalEventForOutbound(closing, {})).toBeNull();
+  });
+
+  it("journals NOTHING when reasoningDurable is false or malformed", () => {
+    expect(journalEventForOutbound(closing, { reasoningDurable: false })).toBeNull();
+    for (const value of ["true", 1, {}, null, undefined]) {
+      expect(
+        journalEventForOutbound(closing, {
+          reasoningDurable: value as unknown as boolean,
+        }),
+        `reasoningDurable: ${JSON.stringify(value)} must not open the journal`,
+      ).toBeNull();
+    }
+  });
+
+  it("does not gate any OTHER durable kind — the flag is reasoning-only", () => {
+    // Non-vacuity for the whole describe: if the gate were placed wrong (say, in
+    // `journalOutbound` instead of this case) it would silence bubbles too, and
+    // every reasoning assertion above would still pass.
+    const bubble = journalEventForOutbound({
+      type: "agent_message",
+      id: "a-1",
+      text: "hi",
+      turnId: TURN,
+    });
+    expect(bubble).toEqual({ kind: "bubble", answerId: "a-1", text: "hi", turnId: TURN });
+    expect(
+      journalEventForOutbound({ type: "progress", id: "a-1", text: "…", turnId: TURN }),
+    ).toEqual({ kind: "placement", answerId: "a-1", turnId: TURN });
+  });
+});
+
+describe("journalEventForOutbound — reasoning content rules (#242 half 1)", () => {
+  const closing: OutboundWsMessage = {
+    type: "reasoning",
+    id: "r-1",
+    turnId: TURN,
+    text: "the whole thought",
+    final: true,
+  };
+  /**
+   * ⚠️ EVERY CASE BELOW OPTS IN EXPLICITLY, AND THAT IS LOAD-BEARING. These
+   * assert the CONTENT rules — `final`, id, turnId, text. Without the opt-in the
+   * refusals would all pass for the wrong reason (the outer gate), and the file
+   * would claim to check the `final` distinction while checking nothing.
+   */
+  const DURABLE = { reasoningDurable: true } as const;
+
   it("maps the burst-closing frame to a reasoning event", () => {
-    expect(journalEventForOutbound(closing)).toEqual({
+    expect(journalEventForOutbound(closing, DURABLE)).toEqual({
       kind: "reasoning",
       id: "r-1",
       turnId: TURN,
@@ -183,7 +243,7 @@ describe("journalEventForOutbound — reasoning (#242 half 1)", () => {
   });
 
   it("does not carry `final` into the event — being final is WHY there is one", () => {
-    expect(Object.keys(journalEventForOutbound(closing) as object)).toEqual([
+    expect(Object.keys(journalEventForOutbound(closing, DURABLE) as object)).toEqual([
       "kind",
       "id",
       "turnId",
@@ -194,19 +254,19 @@ describe("journalEventForOutbound — reasoning (#242 half 1)", () => {
   it("refuses a live cumulative draft, whether the flag is absent or false", () => {
     // The O(n²) case: one row per token, each holding the whole burst.
     const { final: _final, ...draft } = closing;
-    expect(journalEventForOutbound(draft as OutboundWsMessage)).toBeNull();
-    expect(journalEventForOutbound({ ...closing, final: false })).toBeNull();
+    expect(journalEventForOutbound(draft as OutboundWsMessage, DURABLE)).toBeNull();
+    expect(journalEventForOutbound({ ...closing, final: false }, DURABLE)).toBeNull();
   });
 
   it("refuses a closing frame with no usable id", () => {
-    expect(journalEventForOutbound({ ...closing, id: "" })).toBeNull();
+    expect(journalEventForOutbound({ ...closing, id: "" }, DURABLE)).toBeNull();
     // The wire validates nothing at runtime; a JSON client sends `null` for
     // "absent", and a missing key arrives as `undefined`.
     expect(
-      journalEventForOutbound({ ...closing, id: undefined as unknown as string }),
+      journalEventForOutbound({ ...closing, id: undefined as unknown as string }, DURABLE),
     ).toBeNull();
     expect(
-      journalEventForOutbound({ ...closing, id: null as unknown as string }),
+      journalEventForOutbound({ ...closing, id: null as unknown as string }, DURABLE),
     ).toBeNull();
   });
 
@@ -215,9 +275,9 @@ describe("journalEventForOutbound — reasoning (#242 half 1)", () => {
     // `reasoning.turnId` as `string`, the reducer's reasoning variant requires
     // it, and the live client DROPS a reasoning frame that lacks one — so a row
     // without it would be history showing what live never rendered.
-    expect(journalEventForOutbound({ ...closing, turnId: "" })).toBeNull();
+    expect(journalEventForOutbound({ ...closing, turnId: "" }, DURABLE)).toBeNull();
     expect(
-      journalEventForOutbound({ ...closing, turnId: undefined as unknown as string }),
+      journalEventForOutbound({ ...closing, turnId: undefined as unknown as string }, DURABLE),
     ).toBeNull();
   });
 
@@ -225,9 +285,9 @@ describe("journalEventForOutbound — reasoning (#242 half 1)", () => {
     // `nats-client-wrapper.ts`'s `case "reasoning"` returns early on
     // `typeof msg.text !== "string" || msg.text.length === 0`. Journaling what
     // the client refuses to render is N8 in the gaining direction.
-    expect(journalEventForOutbound({ ...closing, text: "" })).toBeNull();
+    expect(journalEventForOutbound({ ...closing, text: "" }, DURABLE)).toBeNull();
     expect(
-      journalEventForOutbound({ ...closing, text: undefined as unknown as string }),
+      journalEventForOutbound({ ...closing, text: undefined as unknown as string }, DURABLE),
     ).toBeNull();
   });
 });
@@ -268,7 +328,13 @@ describe("journalEventForOutbound returns null for every non-durable frame", () 
   ];
 
   it.each(nonDurable)("%s", (_label, frame) => {
-    expect(journalEventForOutbound(frame)).toBeNull();
+    // ⚠️ RUN WITH reasoningDurable ON, DELIBERATELY. The table's reasoning row
+    // is a live draft, and under the shipped default-OFF it would come back
+    // `null` for the WRONG reason — the account gate rather than the missing
+    // `final` flag — leaving the row asserting nothing about drafts. Opting in
+    // makes each row say what it claims: even for an account that DOES store
+    // reasoning, none of these frames is a durable message.
+    expect(journalEventForOutbound(frame, { reasoningDurable: true })).toBeNull();
   });
 
   it("keeps the null-table's frame types matching a hand-listed union", () => {
