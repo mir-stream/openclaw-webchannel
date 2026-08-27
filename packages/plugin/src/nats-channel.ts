@@ -328,8 +328,14 @@ export class NatsChannel implements WebChannelPeerChannel {
   private readonly deliveryJournal: DeliveryJournal | null;
   /**
    * #242 half 1: the per-account journaling policy, resolved once at account
-   * start. Held as a whole `JournalPolicy` rather than as loose booleans so the
-   * mapper can gain a field without this class gaining one.
+   * start, in the shape the mapper takes.
+   *
+   * ⚠️ THAT IS NOT "the mapper can gain a field without this class gaining one",
+   * which an earlier revision claimed — `NatsChannelDurability` carries a FLAT
+   * `reasoningDurable?: boolean` and the constructor rebuilds the object key by
+   * key, so a second policy field is an edit here either way. Holding the mapper's
+   * own type buys one real thing and it is smaller: the value handed to
+   * `journalEventForOutbound` is constructed once, not per frame.
    *
    * `readonly`, like the journal beside it, and for the same reason: a policy
    * that flipped mid-life would split one conversation into a journaled half and

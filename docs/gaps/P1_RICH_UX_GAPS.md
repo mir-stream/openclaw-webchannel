@@ -149,7 +149,13 @@ delivered no answer, so it only fires where zero frames is genuinely surprising.
 cause without asserting it: core's `canShowReasoning` (the agent's thinking level `!== "off"`) is an
 independent precondition the channel cannot observe or override, and some models emit no reasoning. Dedicated `reasoning` and `turn_settled` frames
 exist in both transports. Both clients keep bounded ephemeral reasoning state; the demo groups it by
-`turnId` between the matching user message and answer. It is not persisted.
+`turnId` between the matching user message and answer, and that client state is not persisted. **Server-side it now can be** (#242 half 1): the plugin journals one row per reasoning BURST — the burst's delivered
+display text, as plaintext — but only for an account that sets `capabilities.reasoningDurable: true`, which
+**defaults OFF** and is a separate key from the default-ON `capabilities.reasoning`. It is necessary but not
+sufficient: durability records the same lane the live stream carries, so with the lane off no frames are produced and
+no rows are written. Half 1 is server-side only — the projection drops reasoning at the `history` frame because
+`HistoryMessage.role` cannot express a role-less message — so a reload still shows none, and half 2 is what makes the
+rows readable.
 
 **Telegram reference.**
 - `reasoning-lane-coordinator.ts:68` `splitTelegramReasoningText()` — splits `{reasoningText,

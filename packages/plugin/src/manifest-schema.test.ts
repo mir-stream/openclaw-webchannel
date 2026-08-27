@@ -244,7 +244,18 @@ describe("shipped WebChannel manifest schema", () => {
       ).toBe(true);
     });
 
-    it("keeps the two reasoning keys independent through hydration", () => {
+    // ⚠️ RESOLVER-LEVEL INDEPENDENCE ONLY — NOT A CLAIM THAT THIS PAIR WORKS.
+    // The pair below is deliberately the awkward one, because hydration is where
+    // the two keys would bleed into each other if the schema declared a default
+    // or the resolvers shared a read. They do not, and that is what this asserts.
+    //
+    // At RUNTIME the same pair is dead: `inbound.ts` builds the reasoning
+    // controller only when the LANE is on, and the journal hook is on the
+    // outbound frame funnel, so `reasoning: false` means no frames, which means
+    // zero rows however this resolver answers. "Record but do not show" is not
+    // expressible — see `resolveReasoningDurable`'s docblock for why that is
+    // inherent to journaling at the delivery act rather than a gap to close.
+    it("keeps the two reasoning keys independent AT THE RESOLVER through hydration", () => {
       const hydrated = hydrate({
         enabled: true,
         capabilities: { reasoning: false, reasoningDurable: true },

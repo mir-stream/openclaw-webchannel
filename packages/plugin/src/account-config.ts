@@ -538,6 +538,29 @@ export function resolveReasoningEnabled(accountConfig: WebchannelAccountConfig):
  * operator opt-IN. Revisit the default when half 2/3 makes the content
  * readable — that is when this argument expires, not before.
  *
+ * ⚠️ SEPARATE SWITCH, BUT NOT AN INDEPENDENT ONE — THE DEPENDENCY RUNS ONE WAY
+ * AND IT IS SILENT. This resolver's `true` is NECESSARY BUT NOT SUFFICIENT.
+ * `inbound.ts` builds `createReasoningDraftController` only when
+ * `resolveReasoningEnabled` (plus `!controlLane` and no session `/reasoning
+ * off`) says the LANE is open, and the journal hook sits on the outbound frame
+ * funnel — so with the lane closed there are no `reasoning` frames to map, and
+ * `capabilities.reasoningDurable: true` writes ZERO ROWS with no warning. The
+ * opted-in-lane-received-nothing diagnostic does not fire either; it only
+ * watches lanes that OPENED.
+ *
+ * So "record the deliberation but do not stream it to browser peers" is NOT a
+ * configuration these two keys can express, and the asymmetry is inherent
+ * rather than incidental: durability is recorded AT THE DELIVERY ACT, which is
+ * the whole principle (doc §0, and NOT-list N6b/N6c forbids a second journal
+ * hook inside the controller to route around it). Changing it is a design
+ * question, not a flag.
+ *
+ * The two keys ARE independent in the direction that matters for the decision
+ * below — lane ON + durable OFF is the default and is fully supported — and
+ * they are independent at THIS function's boundary, which is all
+ * `manifest-schema.test.ts`'s hydration case asserts. Do not read that test as
+ * saying the runtime honours every combination.
+ *
  * ── WHY THIS IS SHORTER THAN `resolveReasoningEnabled`, AND WHAT MUST STAY ──
  *
  * That function's longer ladder — the separate `capabilities === undefined`

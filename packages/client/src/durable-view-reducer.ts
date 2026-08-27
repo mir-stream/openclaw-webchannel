@@ -254,7 +254,15 @@ export type DurableView = readonly DurableMessage[];
  * ⚠️ THE `kind` TEST IS WHAT KEEPS A `seal`/`bubble`/`placement` OFF A REASONING
  * BLOCK. `user`, `placement`, `bubble` and `seal` all address ANSWER/USER
  * bubbles by id; `reasoning` addresses reasoning blocks by id, and these guards
- * are what keep the two id spaces from ever meeting.
+ * are what keep the two id spaces from meeting IN THE VIEW.
+ *
+ * ⚠️ "IN THE VIEW" IS THE WHOLE SCOPE OF THAT CLAIM. The two spaces DO meet one
+ * layer out, in `journal-history.ts`'s `firstSeenMs`, which is keyed by id
+ * across every kind and is first-write-wins — so a reasoning burst id colliding
+ * with a later user id would hand the earlier `ts` to the bubble. That is
+ * bounded, not broken, and `recordFirstSeen`'s docblock is where the bound is
+ * argued (`ts` is hydration metadata; nothing orders on it). Cited here so the
+ * enumeration below is not read as covering the whole system.
  *
  * ⚠️ DO NOT ARGUE THIS FROM ID SHAPES — THAT ARGUMENT WAS TRIED AND IS FALSE.
  * An earlier revision said a collision is unarrangeable because reasoning ids
@@ -721,8 +729,11 @@ function applyBubble(
  * through this file today — the client does not feed `reasoning` here at all in
  * half 1, it renders `state.reasoning` directly — so nothing in the client can
  * observe the disagreement yet. Half 2 moves the client onto this reducer, which
- * is what closes it, and it must close it by REMOVING the cap rather than by
- * adding one here. Do not "fix" this by capping.
+ * is what closes it — either by REMOVING the client cap, or by bounding BOTH
+ * sides at the store, where #299 already owns retention as one policy over
+ * everything. What it must not do is add a second, view-local cap here: that is
+ * the one option that drops delivered text (N10) while leaving the two sides
+ * still free to disagree. Do not "fix" this by capping.
  *
  * BOTH PATHS ALLOCATE. Like `applyBubble`, this does not detect a no-op: a
  * `reasoning` event repeating its id, turnId and text still returns a new array.
