@@ -110,11 +110,13 @@ export type OutboundWsMessage =
        * ⚠️ THAT `turn_settled` IS GATED, AND THE GATE IS WHY THE ARGUMENT HOLDS
        * RATHER THAN A HOLE IN IT — check it before "fixing" this. `inbound.ts`
        * settles under `if (settlementEligible)`, which is `!controlLane` and is
-       * cleared when admission is denied. Both of those are turns where NO AGENT
-       * RUN WAS DISPATCHED, so no reasoning ever streamed, so `closeLiveBurst`
-       * early-returns on an empty burst and THIS FRAME IS NEVER SENT. The two
-       * conditions cannot co-occur: a burst that exists to be closed implies a
-       * dispatched turn implies an eligible settlement.
+       * cleared when admission is denied. On BOTH of those paths NO REASONING
+       * CONTROLLER IS EVER BUILT, so there is nothing to close and this frame
+       * cannot be sent: `reasoningEnabled` is `!controlLane && …`, so a control
+       * lane never constructs one and `reasoning?.stop()` no-ops; and the
+       * admission-denied path returns well before the construction site. The two
+       * conditions cannot co-occur — an existing controller implies a dispatched
+       * turn implies an eligible settlement.
        *
        * ⚠️ THE THREE BULLETS ARE NOT UNIVERSAL OVER FRAMES CARRYING THIS FLAG.
        * `pushDurableBlock`'s independent-block branch also sets it, on a FRESHLY

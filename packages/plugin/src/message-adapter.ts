@@ -2789,25 +2789,35 @@ export function createReasoningDraftController(params: {
   // "…about this" (refused), `endBurst()` → 2 publishes, 0 rows. `stop()` is
   // identical. The recovered control writes 1 row carrying "Let me".
   //
-  // ⚠️ AND THE SEAM CANNOT FIX THE RESIDUAL — do not try here. Journaling a
-  // refused send is ruled out at `sendToPeer`'s persist-before-publish block,
-  // and the rule is the FUNNEL'S OWN, holding for every frame type it carries: a
-  // refusal means the peer never received the frame, so recording it would put
-  // content in history that live never showed — N8, in the gaining direction.
+  // ⚠️ AND THE SEAM CANNOT FIX THE RESIDUAL — do not try here. THIS IS THE ONE
+  // PLACE THAT STATES WHY; every other site points here rather than restating
+  // it, deliberately (see the warning at the end of this block).
   //
-  // ⚠️ DO NOT RESTATE THAT AS AN ARGUMENT ABOUT IDS. An earlier revision of this
-  // comment gave the reason as "the caller re-mints an id per attempt, so
-  // recording refusals manufactures a phantom row per revision under ids that
-  // never existed live". That is `reserveProvisional`'s behaviour on the
-  // PLACEMENT path, borrowed; it is not this controller's. `push` reuses ONE id
-  // for the whole burst and rotates only at close, so refusals here would repeat
-  // a single id rather than mint new ones — an upsert, not an unbounded phantom
-  // fan-out. The conclusion is unchanged and does not depend on the correction;
-  // only the mechanism was wrong, and a reader who checked it here would have
-  // concluded the deferral was unfounded.
+  // The mechanism, and nothing beyond it: `sendToPeer`'s three refusal checks —
+  // disposed, transport down, no session key — all sit ABOVE `journalOutbound`,
+  // so a frame the funnel DECLINES is never offered to the mapper at all. That
+  // is the funnel's shape. It is one generic hook over every frame type, and
+  // from a single refused frame it cannot tell one carrying text an earlier
+  // ACCEPTED frame already delivered (this burst's close frame, which carries
+  // `lastDeliveredText`) from one carrying text the peer never saw. Journaling
+  // refusals wholesale records the second kind — N8, gaining. Journaling only
+  // the first kind requires a distinction the funnel cannot make. Either way it
+  // is a new seam or a second hook, which is NOT-list N6b/N6c, which is why
+  // **#304 needs a design round and not a patch**.
   //
-  // A second journal hook inside this controller is NOT-list N6b/N6c. The
-  // residual is #304 and needs a design round, not a patch.
+  // ⚠️ DO NOT WRITE A THIRD JUSTIFICATION HERE. Two have already shipped and
+  // both were false, which is the actual lesson of this comment:
+  //  - "the caller re-mints an id per attempt, so refusals manufacture phantom
+  //    rows under ids that never existed live" — that is `reserveProvisional`'s
+  //    PLACEMENT path. `push` reuses ONE id for the whole burst and rotates only
+  //    at close, so refusals here would repeat one id: an upsert, not a fan-out;
+  //  - "a refusal means the peer never received the frame, so recording it would
+  //    put content in history that live never showed" — false for precisely the
+  //    frame this defers. The close frame's payload IS `lastDeliveredText`, text
+  //    the transport accepted and the peer is rendering.
+  // Both were reached by reasoning about what the CONTENT means. The mechanism
+  // above is about where the checks SIT, which is checkable. If you find
+  // yourself explaining this a third way, the explanation is the problem.
   let lastDeliveredText = "";
   let stopped = false;
 

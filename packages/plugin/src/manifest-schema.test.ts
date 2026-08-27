@@ -158,8 +158,10 @@ describe("shipped WebChannel manifest schema", () => {
   it("accepts capabilities.reasoningDurable as a boolean, at channel level and per account", () => {
     expect(runtime.safeParse({ capabilities: { reasoningDurable: true } }).success).toBe(true);
     expect(runtime.safeParse({ capabilities: { reasoningDurable: false } }).success).toBe(true);
-    // Coexists with BOTH siblings — the two reasoning keys are independent
-    // switches and an operator will set them together.
+    // Coexists with BOTH siblings — SCHEMA coexistence, which is all this
+    // asserts. The two keys are separate switches, not independent ones: at
+    // runtime durability is dominated by the lane. See the hydration case below
+    // and `resolveReasoningDurable`'s docblock.
     expect(
       runtime.safeParse({
         capabilities: { typing: "on", reasoning: true, reasoningDurable: true },

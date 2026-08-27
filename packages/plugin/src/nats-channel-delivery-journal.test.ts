@@ -20,10 +20,15 @@
  *    and never re-sends it. Both the mapper and `append` are covered.
  *  - REFUSAL vs FAILED WRITE, which is the distinction the hook's position
  *    encodes. A send we DECLINE to attempt (transport down, no session key yet)
- *    is journaled NOT AT ALL — the caller re-mints an id per attempt, so
- *    recording refusals manufactures rows under ids that never existed live. A
- *    wire write that THROWS after the commit is journaled, and that is the
- *    window §16.2-2 is actually about.
+ *    is journaled NOT AT ALL, because all three refusal checks sit ABOVE
+ *    `journalOutbound`. A wire write that THROWS after the commit IS journaled,
+ *    and that is the window §16.2-2 is actually about.
+ *    ⚠️ WHY the refusal side is not simply fixed is stated ONCE, at
+ *    `message-adapter.ts`'s `lastDeliveredText` declaration. It is not restated
+ *    here — this docblock used to carry an id-re-minting rationale that reads as
+ *    general but describes only `reserveProvisional`'s placement path, and this
+ *    file now also owns the #242 reasoning characterization tests, where it is
+ *    false. Two restatements of that rule have shipped wrong; there is one copy.
  *  - One test against a REAL journal, because the two halves of #239 shipped
  *    separately and nothing else proves they compose.
  */
@@ -847,12 +852,9 @@ describe("#242 — with reasoningDurable ON, a live stream costs ONE row per bur
     // design — and the peer keeps rendering text that has no durable record.
     //
     // Two publishes reached the wire and ZERO rows were written. Not fixable at
-    // this seam: a refusal means the peer never received the frame, so recording
-    // it would put content in history that live never showed (N8, gaining) —
-    // the funnel's own rule, NOT an argument about re-minted ids, which is
-    // `reserveProvisional`'s placement-path mechanism and is retracted at
-    // `message-adapter.ts`'s `lastDeliveredText` declaration. A second hook is
-    // NOT-list N6b/N6c. #304.
+    // this seam; WHY is stated ONCE, at `message-adapter.ts`'s
+    // `lastDeliveredText` declaration, and deliberately not restated here — two
+    // earlier restatements of it shipped false. #304 owns the residual.
     const { calls, transport, channel } = makeChannel({ reasoningDurable: true });
     const controller = createReasoningDraftController({
       transport: channel,
