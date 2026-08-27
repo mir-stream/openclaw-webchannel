@@ -659,7 +659,7 @@ egress에서 **클라가 view에 쓰는 이벤트만, 전송 순서(seq)대로**
 ### 15.5 seam — route key + user-id 생애 (findings codex6/claude4, codex8)
 
 - **route key(server)**: ~~journal write는 **route 해석(`inbound.ts:1046`) 후 route-scoped 키를 클로저로 잡은 per-turn 콜백**. `NatsChannel`은 route를 모르므로(codex6) 콜백을 turn-handler가 주입. **P-J: agents-bind 등 config 변경이 route 키를 바꿔 대화 orphan 되는가**~~ — **이 절 전체 SUPERSEDED (§16.2-7, 구현 완료 2026-08-25).** `conversationId = peerId`(인증된 JWT `sub`). 저널 파일이 이미 `(tenant, accountId)`로 경로 스코프되므로 peerId가 triple을 완성하고, **core의 mutable route/agentId를 아예 안 읽는다** ⇒ per-turn route-scoped 콜백 **불필요**, P-J는 **해소(dissolved)이지 연기 아님**. 코드: `nats-channel.ts` `journalOutbound`.
-- **user-id(client)**: client가 `user_message.id`를 민팅해 local==wire==history 동일. **held/deferred/retracted/cancel 생애 규칙 명시**(codex8): 초기 렌더에 id 예약, 취소/철회 시 해제 API 추가, coalescing turn anchor와의 관계. 파괴적 컷오버(§15.6)로 legacy가 없으므로 text-match(tier-2/3, `nats-client-wrapper.ts`의 `case "history"` 3-tier adoption)는 **이 통일과 함께 즉시 제거** 가능.
+- **user-id(client)**: client가 `user_message.id`를 민팅해 local==wire==history 동일. **held/deferred/retracted/cancel 생애 규칙 명시**(codex8): 초기 렌더에 id 예약, 취소/철회 시 해제 API 추가, coalescing turn anchor와의 관계. 파괴적 컷오버(§15.6)로 legacy가 없으므로 text-match(`nats-client-wrapper.ts`의 `case "history"` adoption)는 **이 통일과 함께 즉시 제거** 가능. ⚠️ 이 문장은 3-tier 시절에 쓰였다 — 지금은 **2-tier**(id → user 행 한정 text+role)이고, 위치 티어는 #240 half 2가 삭제했다(§15.6 아래 같은 주석, #302가 잔여 소유). 남은 것은 텍스트 티어 하나뿐이다.
 
 ### 15.6 파괴적 컷오버 — 저널이 첫날부터 유일 저장소 (사용자 결정 2026-08-23)
 
@@ -802,7 +802,7 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 | Telegram vs 우리 | 라벨 | 근거 |
 |---|---|---|
 | 서버가 history store 소유 vs 우리는 core transcript 투영 | [#114] | ✅ **해소됨 (#240 half 2, 2026-08-26)** — core transcript reader 삭제, 앵커가 가리키던 `history.ts`의 `getSessionMessages` 호출 자체가 없어졌다(§15.6) |
-| 서버-배정 id vs 클라가 text/position로 추측 adopt | [#114] | `nats-client-wrapper.ts`의 `case "history"` 3-tier adoption; §16.2-1 |
+| 서버-배정 id vs 클라가 text/position로 추측 adopt | [#114] | `nats-client-wrapper.ts`의 `case "history"` **2-tier** adoption (id → user 행 한정 text+role). **position 티어는 #240 half 2가 삭제** — 이 행의 "position"은 이제 과거형이고, 잔여는 #302; §16.2-1 |
 | 한 계정 전 기기 동일 id vs 같은 메시지 3중 id | [#114] | `:2593,805,808`; §16.2-1 |
 | 서버 messageId + 클라 random_id vs 클라가 durable id 민팅 | [#114] | §15.5; `message-adapter.ts:23`; §16.2-1 |
 | 영구 delete vs remove-후-부활 | [#114] | `:1503,2569`; §16.2-3 |

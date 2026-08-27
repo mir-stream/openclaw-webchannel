@@ -2786,12 +2786,18 @@ export function createReasoningDraftController(params: {
   //
   // MEASURED against the real `NatsChannel` with `reasoningDurable: true`: push
   // "Let me" (published), push "Let me think" (published), transport down, push
-  // "…about this" (refused), `endBurst()` → 2 publishes, 0 rows. `stop()` is
-  // identical. The recovered control writes 1 row carrying "Let me".
+  // "…about this" (refused), `endBurst()` → 2 publishes, 0 rows. The `stop()`
+  // teardown path has the same ZERO-ROW residual (its own characterization runs
+  // a two-push script → 1 publish, 0 rows; the publish counts differ because the
+  // scripts do, the row count is the point). The recovered control writes 1 row
+  // carrying "Let me".
   //
   // ⚠️ AND THE SEAM CANNOT FIX THE RESIDUAL — do not try here. THIS IS THE ONE
-  // PLACE THAT STATES WHY; every other site points here rather than restating
-  // it, deliberately (see the warning at the end of this block).
+  // PLACE THAT STATES THE GENERAL RULE; every other site points here rather than
+  // restating it, deliberately (see the warning at the end of this block). Two
+  // PLACEMENT-SCOPED statements remain in
+  // `nats-channel-delivery-journal.test.ts`, true of a refused `sendText` where
+  // the peer received nothing, and marked there as not generalisable to here.
   //
   // The mechanism, and nothing beyond it: `sendToPeer`'s three refusal checks —
   // disposed, transport down, no session key — all sit ABOVE `journalOutbound`,

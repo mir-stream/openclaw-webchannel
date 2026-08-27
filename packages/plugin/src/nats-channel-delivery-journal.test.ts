@@ -23,12 +23,20 @@
  *    is journaled NOT AT ALL, because all three refusal checks sit ABOVE
  *    `journalOutbound`. A wire write that THROWS after the commit IS journaled,
  *    and that is the window §16.2-2 is actually about.
- *    ⚠️ WHY the refusal side is not simply fixed is stated ONCE, at
- *    `message-adapter.ts`'s `lastDeliveredText` declaration. It is not restated
- *    here — this docblock used to carry an id-re-minting rationale that reads as
- *    general but describes only `reserveProvisional`'s placement path, and this
- *    file now also owns the #242 reasoning characterization tests, where it is
- *    false. Two restatements of that rule have shipped wrong; there is one copy.
+ *    ⚠️ WHY the refusal side is not simply fixed — and why #304's residual is
+ *    deferred rather than patched — is the GENERAL rule, and it is stated ONCE,
+ *    at `message-adapter.ts`'s `lastDeliveredText` declaration. This docblock
+ *    used to restate it and no longer does: the version it carried was an
+ *    id-re-minting argument that reads as general but describes only
+ *    `reserveProvisional`'s PLACEMENT path, and this file now also owns the #242
+ *    reasoning characterization tests, where it is false.
+ *    ⚠️ TWO PLACEMENT-SCOPED STATEMENTS DO REMAIN IN THIS FILE, and they are
+ *    TRUE where they sit — the `placement{X₁},{X₂},{X₃}` argument on the
+ *    disconnected-refusal test, and "the client never saw this text either" on
+ *    the fail-closed one. Both are about a refused `sendText`, where the peer
+ *    genuinely received nothing. DO NOT GENERALISE EITHER to the reasoning close
+ *    frame, which carries `lastDeliveredText` — text the peer IS rendering. Four
+ *    wrong generalisations of this rule have shipped; that is the failure mode.
  *  - One test against a REAL journal, because the two halves of #239 shipped
  *    separately and nothing else proves they compose.
  */

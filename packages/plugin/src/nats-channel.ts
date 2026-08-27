@@ -981,10 +981,10 @@ export class NatsChannel implements WebChannelPeerChannel {
     //
     // The refused-send question is therefore NOT settled by this docblock, and
     // the position of the hook is not the same thing as a reason it must stay.
-    // The reason lives in exactly one place — `message-adapter.ts`'s
+    // The GENERAL reason lives in exactly one place — `message-adapter.ts`'s
     // `lastDeliveredText` declaration, which carries the mechanism and both
     // retracted rationales. **#304** is the open residual. Do not restate it
-    // here; three restatements of it have already shipped wrong.
+    // here; four restatements of it have already shipped wrong.
     //
     // The window §16.2-2 actually describes is the one that REMAINS: `sealEnvelope`
     // or `transport.publish` throwing after this line, so the record is committed
