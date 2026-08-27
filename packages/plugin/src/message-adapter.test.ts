@@ -3878,9 +3878,13 @@ describe("ReasoningDraftController — #242 durable burst frames", () => {
     // update the peer is still rendering.
     //
     // The seam cannot repair this: `sendToPeer` refuses ABOVE `journalOutbound`
-    // on purpose (journaling refused sends manufactures phantom rows under
-    // re-minted ids), and a second hook inside this controller is NOT-list
-    // N6b/N6c. #304 owns it.
+    // on purpose, because a refusal means the peer never received the frame and
+    // recording it would put content in history that live never showed (N8, in
+    // the gaining direction). That is the funnel's own rule, holding for every
+    // frame type it carries — NOT an argument about re-minted ids, which is
+    // `reserveProvisional`'s placement-path mechanism and is retracted at
+    // `message-adapter.ts`'s `lastDeliveredText` declaration. A second hook
+    // inside this controller is NOT-list N6b/N6c. #304 owns it.
     const { controller, frames } = setup([true, false, false]);
     controller.push({ text: "a" });
     controller.push({ text: "ab" });

@@ -107,6 +107,15 @@ export type OutboundWsMessage =
        * so any draft this frame disarms is still finalized by the turn's own
        * terminal frame.
        *
+       * ⚠️ THAT `turn_settled` IS GATED, AND THE GATE IS WHY THE ARGUMENT HOLDS
+       * RATHER THAN A HOLE IN IT — check it before "fixing" this. `inbound.ts`
+       * settles under `if (settlementEligible)`, which is `!controlLane` and is
+       * cleared when admission is denied. Both of those are turns where NO AGENT
+       * RUN WAS DISPATCHED, so no reasoning ever streamed, so `closeLiveBurst`
+       * early-returns on an empty burst and THIS FRAME IS NEVER SENT. The two
+       * conditions cannot co-occur: a burst that exists to be closed implies a
+       * dispatched turn implies an eligible settlement.
+       *
        * ⚠️ THE THREE BULLETS ARE NOT UNIVERSAL OVER FRAMES CARRYING THIS FLAG.
        * `pushDurableBlock`'s independent-block branch also sets it, on a FRESHLY
        * MINTED id carrying text the client has not seen — so there

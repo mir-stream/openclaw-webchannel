@@ -69,6 +69,17 @@ class RecordingTransport extends EventEmitter {
   connected = true;
   /** Large enough that the ingress-result chunker never splits or refuses. */
   effectiveOutboundLimit = 1_000_000;
+  /**
+   * Every published frame, PARSED and whole.
+   *
+   * ⚠️ SEPARATE FROM `calls` ON PURPOSE. `Call`'s publish variant records only
+   * `{call, subject, type}`, and ~20 `toEqual` assertions in this file are
+   * written against that exact shape — widening it would churn every one of
+   * them to restate a key they do not care about. This sink is additive, so a
+   * test that needs to look INSIDE a frame can, and every existing assertion is
+   * untouched.
+   */
+  readonly frames: Array<Record<string, unknown>> = [];
   private sid = 0;
   constructor(private readonly calls: Call[]) {
     super();
@@ -80,7 +91,9 @@ class RecordingTransport extends EventEmitter {
     /* no-op */
   }
   publish(subject: string, payload: string): void {
-    const type = (JSON.parse(payload) as { type?: string }).type ?? "<unknown>";
+    const frame = JSON.parse(payload) as Record<string, unknown>;
+    this.frames.push(frame);
+    const type = (frame as { type?: string }).type ?? "<unknown>";
     this.calls.push({ call: "publish", subject, type });
   }
 }
@@ -651,7 +664,7 @@ describe("#239 — egress seam against a real journal", () => {
  */
 describe("#242 — reasoningDurable OFF (default): lane intact, journal empty", () => {
   it("publishes the whole burst, close frame included, and journals nothing", () => {
-    const { calls, channel } = makeChannel();
+    const { calls, transport, channel } = makeChannel();
     const controller = createReasoningDraftController({
       transport: channel,
       sessionKey: PEER,
@@ -669,6 +682,22 @@ describe("#242 — reasoningDurable OFF (default): lane intact, journal empty", 
       { call: "publish", subject: OUT, type: "reasoning" },
       { call: "publish", subject: OUT, type: "reasoning" },
       { call: "publish", subject: OUT, type: "reasoning" },
+    ]);
+    // ⚠️ AND THE FOURTH ONE REALLY IS THE `final` FRAME — read off the PUBLISHED
+    // PAYLOAD, not inferred from the count. Without this the docblock above
+    // claims a `final: true` the assertion cannot see: `Call`'s publish variant
+    // carries only `type`, so gating the LANE down to three frames and gating
+    // the FLAG off both stay green on the count alone.
+    //
+    // The three drafts assert `undefined`, not `false`, which pins the other
+    // half of `nats-channel.ts`'s `sendReasoning` contract: the key is OMITTED
+    // rather than emitted false, so a live draft frame is byte-identical to what
+    // it was before this slice existed.
+    expect(transport.frames.map((frame) => frame.final)).toEqual([
+      undefined,
+      undefined,
+      undefined,
+      true,
     ]);
     // And the JOURNAL is empty.
     expect(appends(calls)).toEqual([]);
@@ -818,8 +847,12 @@ describe("#242 — with reasoningDurable ON, a live stream costs ONE row per bur
     // design — and the peer keeps rendering text that has no durable record.
     //
     // Two publishes reached the wire and ZERO rows were written. Not fixable at
-    // this seam: journaling refused sends manufactures phantom rows under
-    // re-minted ids, and a second hook is NOT-list N6b/N6c. #304.
+    // this seam: a refusal means the peer never received the frame, so recording
+    // it would put content in history that live never showed (N8, gaining) —
+    // the funnel's own rule, NOT an argument about re-minted ids, which is
+    // `reserveProvisional`'s placement-path mechanism and is retracted at
+    // `message-adapter.ts`'s `lastDeliveredText` declaration. A second hook is
+    // NOT-list N6b/N6c. #304.
     const { calls, transport, channel } = makeChannel({ reasoningDurable: true });
     const controller = createReasoningDraftController({
       transport: channel,
