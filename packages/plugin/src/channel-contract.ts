@@ -64,7 +64,33 @@ export type OutboundWsMessage =
       assistantMessageIndex?: number;
     }
   | { type: "progress"; id: string; text: string; turnId?: string }
-  | { type: "reasoning"; id: string; turnId: string; text: string }
+  | {
+      type: "reasoning";
+      id: string;
+      turnId: string;
+      text: string;
+      /**
+       * #242 half 1 (doc §15.9/§16.2-5): THIS frame closes the reasoning burst.
+       * Its `text` is the burst's DURABLE text, and it is the ONLY `reasoning`
+       * frame the delivery journal records
+       * (`delivery-journal-event.ts`'s `case "reasoning"`). Absent or `false`
+       * means a LIVE CUMULATIVE DRAFT update — not durable, exactly as
+       * `progress` is not durable.
+       *
+       * ⚠️ THE FLAG EXISTS BECAUSE THE LIVE STREAM IS UNTHROTTLED.
+       * `message-adapter.ts`'s `createReasoningDraftController` sends one frame
+       * per cumulative token update, each carrying the whole text so far, so
+       * journaling every `reasoning` frame would write O(n²) bytes per burst.
+       * With the flag a burst costs exactly one row.
+       *
+       * ADDITIVE AND OPTIONAL: an older client ignores the extra key and renders
+       * the frame exactly as it renders any other — the final frame repeats the
+       * closing frame's id and text, so it is an upsert-by-id with identical
+       * content, i.e. a render no-op. The cost is one extra copy of the burst's
+       * text on the wire per burst, and it is accepted.
+       */
+      final?: boolean;
+    }
   | {
       type: "tool_activity";
       turnId: string;
@@ -120,7 +146,17 @@ export interface WebChannelPeerChannel {
     turnId?: string,
     assistantMessageIndex?: number,
   ): boolean;
-  sendReasoning(peerId: string, id: string, turnId: string, text: string): boolean;
+  /**
+   * `final` marks the frame that CLOSES this burst — the only one the journal
+   * records (#242 half 1). See the `reasoning` member of `OutboundWsMessage`.
+   */
+  sendReasoning(
+    peerId: string,
+    id: string,
+    turnId: string,
+    text: string,
+    final?: boolean,
+  ): boolean;
   sendToolActivity(
     peerId: string,
     activity: {
@@ -153,7 +189,7 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendText(_peerId: string, _text: string, _id?: string, _turnId?: string, _assistantMessageIndex?: number): boolean { return false; }
   sendProgress(_peerId: string, _id: string, _text: string, _turnId?: string): boolean { return false; }
   finalizeDraft(_peerId: string, _id: string, _text: string, _turnId?: string, _assistantMessageIndex?: number): boolean { return false; }
-  sendReasoning(_peerId: string, _id: string, _turnId: string, _text: string): boolean { return false; }
+  sendReasoning(_peerId: string, _id: string, _turnId: string, _text: string, _final?: boolean): boolean { return false; }
   sendToolActivity(_peerId: string, _activity: { id: string; turnId: string; name?: string; phase?: string; status?: string; summary?: string; argKeys?: string[] }): boolean { return false; }
   sendTurnSettled(_peerId: string, _turnId: string, _outcome: "ok" | "error"): boolean { return false; }
   sendTurnSnapshot(_peerId: string, _turnId: string, _answers: Array<{ id: string; text: string }>, _remove: string[]): boolean { return false; }

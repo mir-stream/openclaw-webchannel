@@ -115,12 +115,12 @@ describe("shared durable-view reducer — the plugin consumes the client module"
     // REAL private `applyTurnSnapshot`.
     expect(view.map((m) => m.id)).toEqual(["u-0", "B", "A", "NOTICE", "C", "X"]);
     expect(view).toEqual<DurableView>([
-      { id: "u-0", role: "user", text: "do the thing", turnId: "w-0" },
-      { id: "B", role: "agent", text: "B (sealed)", turnId: TURN },
-      { id: "A", role: "agent", text: "A (sealed)", turnId: TURN },
-      { id: "NOTICE", role: "agent", text: "a notice", turnId: TURN },
-      { id: "C", role: "agent", text: "C (minted)", turnId: TURN },
-      { id: "X", role: "agent", text: "X, resurrected", turnId: TURN },
+      { kind: "text", id: "u-0", role: "user", text: "do the thing", turnId: "w-0" },
+      { kind: "text", id: "B", role: "agent", text: "B (sealed)", turnId: TURN },
+      { kind: "text", id: "A", role: "agent", text: "A (sealed)", turnId: TURN },
+      { kind: "text", id: "NOTICE", role: "agent", text: "a notice", turnId: TURN },
+      { kind: "text", id: "C", role: "agent", text: "C (minted)", turnId: TURN },
+      { kind: "text", id: "X", role: "agent", text: "X, resurrected", turnId: TURN },
     ]);
   });
 

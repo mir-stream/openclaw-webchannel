@@ -1985,6 +1985,19 @@ export class WebChannelNATSClient {
     const prevById = new Map(prev.map((m) => [m.id, m] as const));
     const out: ChatMessage[] = [];
     for (const entry of view) {
+      // ⚠️ #242 half 1: `state.messages` IS THE CHAT-BUBBLE LIST, and a reasoning
+      // block is not a chat bubble here. The client still renders reasoning from
+      // its own `state.reasoning` array (`upsertReasoning`) and constructs no
+      // `reasoning` DurableEvent, so this branch is UNREACHABLE from the client
+      // today — the reducer's reasoning variant exists for the PLUGIN's journal
+      // replay (`journal-history.ts`), the only production code that folds one.
+      //
+      // It is a `continue` rather than a cast because the alternative is to make
+      // up a `role` for a message the wire gives none, which `DurableMessage`'s
+      // docblock refuses. Half 2 is what decides how a reasoning message renders
+      // and routes it here; until then, silently carrying one into
+      // `state.messages` would render it as an agent bubble.
+      if (entry.kind !== "text") continue;
       const base = prevById.get(entry.id);
       const overlay = local !== undefined && Object.hasOwn(local, entry.id)
         ? local[entry.id]

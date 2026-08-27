@@ -155,6 +155,83 @@ describe("an id-less agent_message is not persisted, and IS observable", () => {
   });
 });
 
+/**
+ * #242 half 1 — reasoning is durable, ONE ROW PER BURST.
+ *
+ * The controller sends a `reasoning` frame on every cumulative token update,
+ * each carrying the whole text so far, so the flag is what stands between this
+ * mapper and O(n²) bytes per burst. These cases pin both sides of it, and pin
+ * that the admission rule is the LIVE CLIENT'S rule — anything else is a
+ * live≠history divergence created right here.
+ */
+describe("journalEventForOutbound — reasoning (#242 half 1)", () => {
+  const closing: OutboundWsMessage = {
+    type: "reasoning",
+    id: "r-1",
+    turnId: TURN,
+    text: "the whole thought",
+    final: true,
+  };
+
+  it("maps the burst-closing frame to a reasoning event", () => {
+    expect(journalEventForOutbound(closing)).toEqual({
+      kind: "reasoning",
+      id: "r-1",
+      turnId: TURN,
+      text: "the whole thought",
+    });
+  });
+
+  it("does not carry `final` into the event — being final is WHY there is one", () => {
+    expect(Object.keys(journalEventForOutbound(closing) as object)).toEqual([
+      "kind",
+      "id",
+      "turnId",
+      "text",
+    ]);
+  });
+
+  it("refuses a live cumulative draft, whether the flag is absent or false", () => {
+    // The O(n²) case: one row per token, each holding the whole burst.
+    const { final: _final, ...draft } = closing;
+    expect(journalEventForOutbound(draft as OutboundWsMessage)).toBeNull();
+    expect(journalEventForOutbound({ ...closing, final: false })).toBeNull();
+  });
+
+  it("refuses a closing frame with no usable id", () => {
+    expect(journalEventForOutbound({ ...closing, id: "" })).toBeNull();
+    // The wire validates nothing at runtime; a JSON client sends `null` for
+    // "absent", and a missing key arrives as `undefined`.
+    expect(
+      journalEventForOutbound({ ...closing, id: undefined as unknown as string }),
+    ).toBeNull();
+    expect(
+      journalEventForOutbound({ ...closing, id: null as unknown as string }),
+    ).toBeNull();
+  });
+
+  it("refuses a closing frame with no usable turnId", () => {
+    // Not optional here, unlike on bubble/placement: the wire types
+    // `reasoning.turnId` as `string`, the reducer's reasoning variant requires
+    // it, and the live client DROPS a reasoning frame that lacks one — so a row
+    // without it would be history showing what live never rendered.
+    expect(journalEventForOutbound({ ...closing, turnId: "" })).toBeNull();
+    expect(
+      journalEventForOutbound({ ...closing, turnId: undefined as unknown as string }),
+    ).toBeNull();
+  });
+
+  it("refuses empty or non-string text, exactly as the live client does", () => {
+    // `nats-client-wrapper.ts`'s `case "reasoning"` returns early on
+    // `typeof msg.text !== "string" || msg.text.length === 0`. Journaling what
+    // the client refuses to render is N8 in the gaining direction.
+    expect(journalEventForOutbound({ ...closing, text: "" })).toBeNull();
+    expect(
+      journalEventForOutbound({ ...closing, text: undefined as unknown as string }),
+    ).toBeNull();
+  });
+});
+
 describe("journalEventForOutbound returns null for every non-durable frame", () => {
   // ONE case per `OutboundWsMessage` variant, so the list is visibly exhaustive
   // against `channel-contract.ts`. A new variant is already a COMPILE error in
@@ -164,10 +241,13 @@ describe("journalEventForOutbound returns null for every non-durable frame", () 
   // ⚠️ `null` here is never evidence that a frame is non-durable BY DESIGN
   // (NOT-list N3/N7). The `#242` rows are "not yet".
   const nonDurable: Array<[string, OutboundWsMessage]> = [
-    ["reasoning (#242: durable later)", { type: "reasoning", id: "r-1", turnId: TURN, text: "thinking" }],
-    ["tool_activity (#242: durable later)", { type: "tool_activity", id: "t-1", turnId: TURN, name: "bash" }],
+    // A LIVE CUMULATIVE DRAFT — no `final`. #242 half 1 made reasoning durable,
+    // but only the burst-closing frame; see the dedicated describe below for the
+    // durable side and for why the split exists.
+    ["reasoning without final (a live draft)", { type: "reasoning", id: "r-1", turnId: TURN, text: "thinking" }],
+    ["tool_activity (#242 half 2: durable later)", { type: "tool_activity", id: "t-1", turnId: TURN, name: "bash" }],
     [
-      "approval_request (#242: durable later)",
+      "approval_request (#242 half 2: durable later)",
       {
         type: "approval_request",
         id: "ap-1",
@@ -177,8 +257,8 @@ describe("journalEventForOutbound returns null for every non-durable frame", () 
         options: [{ decision: "allow-once", label: "Allow", style: "primary" }],
       },
     ],
-    ["approval_resolved (#242: durable later)", { type: "approval_resolved", id: "ap-1", decision: "deny" }],
-    ["approval_snapshot (#242: durable later)", { type: "approval_snapshot", approvals: [] }],
+    ["approval_resolved (#242 half 2: durable later)", { type: "approval_resolved", id: "ap-1", decision: "deny" }],
+    ["approval_snapshot (#242 half 2: durable later)", { type: "approval_snapshot", approvals: [] }],
     ["turn_settled (control frame)", { type: "turn_settled", turnId: TURN, outcome: "ok" }],
     ["typing (pure indicator)", { type: "typing" }],
     ["history (server→client replay)", { type: "history", messages: [] }],
@@ -203,6 +283,10 @@ describe("journalEventForOutbound returns null for every non-durable frame", () 
     // never = frame`, which makes a new variant a COMPILE error. This case earns
     // its place only as the reminder that lands next to that compile error: when
     // tsc points at the mapper, this list is the other place to update.
+    // `reasoning` is deliberately NOT here. It is durable ONLY with
+    // `final: true` (#242 half 1), and the `nonDurable` table above carries its
+    // draft shape — so it appears exactly once in `covered`, which is what this
+    // comparison needs. Its durable side is covered by its own describe.
     const durableTypes = ["agent_message", "progress", "turn_snapshot"];
     const covered = [
       ...durableTypes,

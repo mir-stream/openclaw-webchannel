@@ -42,6 +42,7 @@ import {
   type DeliveryJournalRow,
 } from "./delivery-journal.js";
 import type { JournalEvent } from "./delivery-journal-event.js";
+import { createReasoningDraftController } from "./message-adapter.js";
 import { NatsChannel } from "./nats-channel.js";
 import type { NatsTransport } from "./nats-transport.js";
 
@@ -610,5 +611,96 @@ describe("#239 — egress seam against a real journal", () => {
     expect(rows.map((row) => row.seq)).toEqual([1, 2, 3, 4]);
     // A different peer is a different conversation in the same file.
     expect(journal.read("peer-other")).toEqual([]);
+  });
+});
+
+/**
+ * #242 half 1 — ONE ROW PER REASONING BURST, THROUGH THE REAL CHANNEL.
+ *
+ * ⚠️ THIS IS THE TEST THAT WOULD HAVE CAUGHT THE O(n²) DESIGN. The unit tests on
+ * either side of this seam can both pass while the composition is quadratic: the
+ * controller's suite counts frames, the mapper's suite maps ONE frame at a time,
+ * and neither can see that `createReasoningDraftController` calls
+ * `sendReasoning` on EVERY cumulative token update — unthrottled, each frame
+ * carrying the whole text so far. Driving the REAL controller into the REAL
+ * channel is what turns "how many rows does a burst cost" into an observable.
+ */
+describe("#242 — a live reasoning stream costs ONE journal row per burst", () => {
+  it("writes one row per burst, not one per cumulative update", () => {
+    const { calls, channel } = makeChannel();
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+
+    // A realistic burst: ten cumulative updates, each the full text so far.
+    let text = "";
+    for (const token of ["Le", "t m", "e t", "hi", "nk ", "abo", "ut ", "th", "is", "."]) {
+      text += token;
+      controller.push({ text });
+    }
+    controller.endBurst();
+
+    // ELEVEN wire frames — ten live drafts plus the close — and exactly ONE row.
+    expect(calls.filter((entry) => entry.call === "publish")).toHaveLength(11);
+    expect(appends(calls)).toHaveLength(1);
+    const [row] = appends(calls);
+    expect(row).toEqual({
+      call: "append",
+      conversationId: PEER,
+      event: {
+        kind: "reasoning",
+        id: expect.any(String),
+        turnId: "turn-1",
+        text: "Let me think about this.",
+      },
+    });
+  });
+
+  it("gives each burst of a turn its own row, and an aborted turn still gets one", () => {
+    const { calls, channel } = makeChannel();
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+
+    controller.push({ text: "first thought" });
+    controller.endBurst();
+    controller.push({ text: "second thought" });
+    // The turn is aborted here — `inbound.ts` calls `stop()` on the way out.
+    controller.stop();
+
+    expect(
+      appends(calls).map((entry) => (entry.call === "append" ? entry.event : undefined)),
+    ).toEqual([
+      { kind: "reasoning", id: expect.any(String), turnId: "turn-1", text: "first thought" },
+      { kind: "reasoning", id: expect.any(String), turnId: "turn-1", text: "second thought" },
+    ]);
+    // Distinct ids: two bursts must replay as two blocks, not one overwriting
+    // the other through the reducer's upsert.
+    const ids = appends(calls).map((entry) =>
+      entry.call === "append" ? (entry.event as { id: string }).id : "",
+    );
+    expect(new Set(ids).size).toBe(2);
+  });
+
+  it("an open burst with no delivered snapshot writes nothing", () => {
+    // The transport refuses every send (no session key on an encrypted channel
+    // is the real shape; here the transport is simply disconnected), so the
+    // journal — which sits BELOW `sendToPeer`'s refusals — sees nothing at all.
+    const { calls, transport, channel } = makeChannel();
+    transport.connected = false;
+    const controller = createReasoningDraftController({
+      transport: channel,
+      sessionKey: PEER,
+      turnId: "turn-1",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    controller.push({ text: "never delivered" });
+    controller.endBurst();
+    warn.mockRestore();
+    expect(appends(calls)).toEqual([]);
   });
 });

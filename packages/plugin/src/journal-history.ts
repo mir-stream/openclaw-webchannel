@@ -20,11 +20,25 @@
  * transition table. That list is what this module OWNS; it is not a list of
  * every way the two views can differ, and the next block is the counter-example.
  *
- * ── ⚠️ ONE KNOWN live≠history GAP, AND THIS MODULE IS WHERE IT BECOMES VISIBLE ──
+ * ── ⚠️ KNOWN live≠history GAPS, AND THIS MODULE IS WHERE THEY BECOME VISIBLE ──
  *
- * "`history == live` by construction" is the bet, not a proof, and there is a
- * standing exception that shows up the moment a real conversation is replayed.
+ * "`history == live` by construction" is the bet, not a proof, and there are two
+ * standing exceptions that show up the moment a real conversation is replayed.
  * READ THIS BEFORE CONCLUDING THE PROJECTION IS WRONG.
+ *
+ * GAP 2 — REASONING IS DURABLE BUT UNSENDABLE (#242 half 1). The journal now
+ * records one row per reasoning burst and the fold places it in the view, but
+ * the `history` wire frame carries `HistoryMessage`, whose `role` is
+ * `"user" | "agent"` and which therefore cannot express a role-less reasoning
+ * message. So the conversion loop in `projectJournalHistory` DROPS reasoning
+ * entries on the way out, and a reload shows no reasoning where live showed it.
+ * That is deliberate and scoped: half 1 is the SERVER side only. Half 2 widens
+ * the frame and moves the client's render onto the reducer together, so the two
+ * sides start agreeing in one step rather than passing through a state where the
+ * wire carries a field no client reads. The drop is commented at the exact line
+ * that performs it.
+ *
+ * GAP 1 — the phantom empty bubble:
  *
  * A lane that receives a `progress` and then NEITHER a `bubble` NOR a
  * `seal.answers` entry — an aborted turn, or a connection dropped before the
@@ -274,19 +288,23 @@ export type JournalReader = DeliveryJournal["read"];
 export const HISTORY_REPLAY_CHUNK_ROWS = 512;
 
 /**
- * The four kinds THIS BUILD can fold, derived from the event union rather than
+ * The kinds THIS BUILD can fold, derived from the event union rather than
  * written out as a string array.
  *
- * `Record<JournalEvent["kind"], true>` is what makes a fifth kind impossible to
- * forget: #241 grows the event model, and the day it does, tsc fails HERE with a
- * missing property instead of letting the new kind be silently counted as
- * unsupported forever.
+ * `Record<JournalEvent["kind"], true>` is what makes a new kind impossible to
+ * forget: the day the event model grows, tsc fails HERE with a missing property
+ * instead of letting the new kind be silently counted as unsupported forever.
+ *
+ * ⚠️ THAT IS NOT A PREDICTION ANY MORE — IT FIRED. #242 half 1 added
+ * `reasoning`, and this object is one of the places tsc pointed at. The device
+ * works; keep it derived, and never "simplify" it to a string literal array.
  */
 const KNOWN_EVENT_KINDS: Record<JournalEvent["kind"], true> = {
   user: true,
   placement: true,
   bubble: true,
   seal: true,
+  reasoning: true,
 };
 
 /**
@@ -462,8 +480,8 @@ export type JournalHistoryProjection = {
  * `DurableMessage` has no timestamp (it is client-local overlay by §0.1) and
  * `HistoryMessage` requires `ts: number`, so this module sources it: the
  * `created_ms` of the row whose event FIRST NAMES that id — `user.id`,
- * `placement.answerId`, `bubble.answerId`, and every `seal.answers[].id` — never
- * overwritten afterwards.
+ * `placement.answerId`, `bubble.answerId`, `reasoning.id`, and every
+ * `seal.answers[].id` — never overwritten afterwards.
  *
  * First-appearance rather than last-write, for two reasons. An EDIT does not
  * change a message's timestamp (Telegram behaves the same way), so a `bubble`
@@ -478,9 +496,14 @@ export type JournalHistoryProjection = {
  * FALLBACK: a message in the final view with no recorded first appearance takes
  * the last processed row's `createdMs` and increments `tsFallbacks`. That path
  * is UNREACHABLE on today's event set — every `DurableMessage` id is introduced
- * by one of the four events above, all of which record — and it exists so that a
- * fifth kind which introduces an id cannot ship `ts: undefined` or `NaN` onto the
+ * by one of the five events above, all of which record — and it exists so that a
+ * new kind which introduces an id cannot ship `ts: undefined` or `NaN` onto the
  * wire while nobody notices. The counter is how the caller finds out it happened.
+ *
+ * ⚠️ IT IS ALSO COUNTED OVER THE EMITTED LIST, NOT THE VIEW. Reasoning messages
+ * are dropped before this step (see the conversion loop), so they can neither
+ * raise nor mask this counter — which is right, because the counter is about
+ * what `ts` reaches the WIRE.
  */
 export function projectJournalHistory(
   read: JournalReader,
@@ -559,22 +582,50 @@ export function projectJournalHistory(
   }
 
   let tsFallbacks = 0;
-  const messages: HistoryMessage[] = view.map((message) => {
+  const messages: HistoryMessage[] = [];
+  for (const message of view) {
+    // ⚠️ #242 half 1: REASONING IS IN THE DURABLE VIEW AND CANNOT GO ON THE
+    // WIRE YET. This is a shape limit, not a judgement about the content — read
+    // the two facts in this order:
+    //  - the view ABOVE HOLDS IT. The journal has one row per reasoning burst
+    //    and `applyDurableEvent` folded it into `view` at the position it was
+    //    delivered. Nothing is missing from the projection;
+    //  - `HistoryMessage` — the one this module imports, `history.ts`'s, which
+    //    is its OWN declaration requiring `ts: number` rather than a re-export
+    //    of the wire-shaped `channel-contract.ts` type — is
+    //    `{ id, role, text, ts }`. `role` is `"user" | "agent"` and a reasoning
+    //    message HAS NO ROLE: the wire frame carries none, and the reducer's
+    //    `DurableMessage` refuses to invent one. There is no value to put there,
+    //    so there is no frame to send. (Both declarations have the same `role`,
+    //    so widening is a two-file change, which is half 2's problem.)
+    // Half 2 widens the frame and moves the client's render onto the reducer IN
+    // ONE STEP, which is what makes `live == history` close atomically for
+    // reasoning; widening the frame here alone would ship a field no client
+    // reads. Do NOT "fix" this by giving reasoning `role: "agent"` — that is a
+    // fabricated claim in the SSOT (N8), and it would render reasoning as an
+    // answer bubble on every existing client.
+    //
+    // The two page selectors are unaffected BY CONSTRUCTION: they operate on
+    // this list, and their cursor is an id taken FROM it, so a reasoning id can
+    // never become a cursor the client cannot resolve. `ts` is still recorded
+    // for these ids (see `recordFirstSeen`), which is what half 2 inherits.
+    if (message.kind !== "text") continue;
     const seen = firstSeenMs.get(message.id);
     if (seen !== undefined) {
-      return { id: message.id, role: message.role, text: message.text, ts: seen };
+      messages.push({ id: message.id, role: message.role, text: message.text, ts: seen });
+      continue;
     }
     tsFallbacks += 1;
     // `lastCreatedMs` is defined whenever the view is non-empty (a message can
     // only exist because a row produced it), so the `0` is unreachable and is
     // here to keep the type honest rather than as a policy.
-    return {
+    messages.push({
       id: message.id,
       role: message.role,
       text: message.text,
       ts: lastCreatedMs ?? 0,
-    };
-  });
+    });
+  }
 
   return { messages, unsupportedEvents, tsFallbacks };
 }
@@ -630,6 +681,14 @@ function recordFirstSeen(
     case "placement":
     case "bubble":
       note(event.answerId);
+      return;
+    case "reasoning":
+      // Recorded even though half 1 DROPS reasoning from the emitted
+      // `HistoryMessage` list (see `projectJournalHistory`'s conversion): the
+      // drop is a wire-shape limitation, not a decision that the message has no
+      // moment. Half 2 puts it on the wire and takes the `ts` from here
+      // unchanged.
+      note(event.id);
       return;
     case "seal":
       if (!Array.isArray(event.answers)) return;

@@ -65,7 +65,10 @@ import {
   serveHistoryRequest,
   type JournalReader,
 } from "./journal-history.js";
-import { reduceDurableView } from "../../client/src/durable-view-reducer.js";
+import {
+  reduceDurableView,
+  type DurableTextMessage,
+} from "../../client/src/durable-view-reducer.js";
 
 const TURN = "turn-1";
 const CONV = "conv-0";
@@ -231,16 +234,94 @@ describe("projectJournalHistory — the fold", () => {
     expect(ts).not.toEqual([...ts].sort((a, b) => a - b));
   });
 
-  it("carries the reducer's full durable view, text included", () => {
+  it("carries the reducer's full durable view of TEXT messages, text included", () => {
+    // The `kind === "text"` filter is a NO-OP on `MIXED_STREAM` — it holds no
+    // `reasoning` event — and is written out so the equality states what it
+    // actually compares after #242 half 1: the emitted list is the reducer's
+    // view MINUS reasoning, which the wire cannot carry yet. The reasoning drop
+    // itself is asserted in its own describe below, against a stream that has
+    // one.
     const { read } = fakeReader(rowsFor(MIXED_STREAM));
     const projected = projectJournalHistory(read, CONV).messages;
     expect(projected.map(({ id, role, text }) => ({ id, role, text }))).toEqual(
-      reduceDurableView(MIXED_STREAM).map(({ id, role, text }) => ({
-        id,
-        role,
-        text,
-      })),
+      reduceDurableView(MIXED_STREAM)
+        .filter((m): m is DurableTextMessage => m.kind === "text")
+        .map(({ id, role, text }) => ({ id, role, text })),
     );
+  });
+});
+
+/**
+ * #242 half 1 — the journal HOLDS reasoning; the `history` frame cannot carry it.
+ *
+ * The projection folds `reasoning` rows into the durable view at the position
+ * they were delivered, and then DROPS them when it converts that view into
+ * `HistoryMessage`s, because `HistoryMessage.role` is `"user" | "agent"` and a
+ * reasoning message has no role to put there. Half 2 widens the frame and moves
+ * the client render together. These cases pin both halves of that sentence, so a
+ * later slice cannot quietly satisfy one by breaking the other.
+ */
+describe("projectJournalHistory — reasoning is folded but not emitted (#242 half 1)", () => {
+  const WITH_REASONING: JournalEvent[] = [
+    { kind: "user", id: "u-0", text: "why?", turnId: TURN },
+    { kind: "reasoning", id: "r-1", turnId: TURN, text: "let me think" },
+    { kind: "bubble", answerId: "A", turnId: TURN, text: "because" },
+    { kind: "reasoning", id: "r-2", turnId: TURN, text: "and also" },
+    { kind: "bubble", answerId: "B", turnId: TURN, text: "and therefore" },
+  ];
+
+  it("the REDUCER's view holds every reasoning block, in delivery order", () => {
+    // Stated first and separately: the drop below is a wire-shape limit, not a
+    // gap in the store. If this goes red the journal really is losing content.
+    expect(reduceDurableView(WITH_REASONING).map((m) => m.id)).toEqual([
+      "u-0",
+      "r-1",
+      "A",
+      "r-2",
+      "B",
+    ]);
+  });
+
+  it("the emitted HistoryMessage list holds NONE of them, and nothing else moves", () => {
+    const { read } = fakeReader(rowsFor(WITH_REASONING));
+    const projection = projectJournalHistory(read, CONV);
+    expect(projection.messages).toEqual([
+      { id: "u-0", role: "user", text: "why?", ts: T0 + 0 * T_STEP },
+      { id: "A", role: "agent", text: "because", ts: T0 + 2 * T_STEP },
+      { id: "B", role: "agent", text: "and therefore", ts: T0 + 4 * T_STEP },
+    ]);
+    // A reasoning row is KNOWN, not unsupported — it was folded. Confusing the
+    // two would make the drop look like a version-skew failure to an operator.
+    expect(projection.unsupportedEvents).toBe(0);
+    // The drop happens before the `ts` step, so it can neither raise nor mask
+    // this counter.
+    expect(projection.tsFallbacks).toBe(0);
+  });
+
+  it("no reasoning id can become a page cursor the client cannot resolve", () => {
+    // The cursor is an id taken FROM the emitted list, so this is true by
+    // construction — asserted anyway because it is the property a half-2 author
+    // must preserve when the ids start reaching the wire.
+    const { read } = fakeReader(rowsFor(WITH_REASONING));
+    const messages = projectJournalHistory(read, CONV).messages;
+    expect(messages.map((m) => m.id)).not.toContain("r-1");
+    expect(messages.map((m) => m.id)).not.toContain("r-2");
+    // Paging by a real cursor is unaffected by the reasoning blocks between the
+    // rows: everything strictly older than B is [u-0, A].
+    expect(historyPageBefore(messages, "B", 10).map((m) => m.id)).toEqual(["u-0", "A"]);
+    // And an unresolvable cursor is still the empty page, not newest-N.
+    expect(historyPageBefore(messages, "r-1", 10)).toEqual([]);
+  });
+
+  it("counts reasoning-only conversations as empty on the wire, not as unsupported", () => {
+    const { read } = fakeReader(
+      rowsFor([{ kind: "reasoning", id: "r-1", turnId: TURN, text: "alone" } satisfies JournalEvent]),
+    );
+    expect(projectJournalHistory(read, CONV)).toEqual({
+      messages: [],
+      unsupportedEvents: 0,
+      tsFallbacks: 0,
+    });
   });
 });
 

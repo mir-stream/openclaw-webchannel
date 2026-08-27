@@ -60,8 +60,12 @@
  * ⚠️ AND DO NOT READ "it isn't in `JournalEvent`" AS "it is non-durable by
  * design" — that is NOT-list N3/N7, and BOUNDARY 2 of the reducer says the event
  * set WILL grow (doc §15.9 requires tool and reasoning messages to become
- * durable MESSAGES; only pure indicators stay ephemeral). Every `null` below
- * carries its reason, and the ones owned by #242 say "not yet" rather than "no".
+ * durable MESSAGES; only pure indicators stay ephemeral). It already grew once:
+ * #242 half 1 made `reasoning` durable, one row per BURST rather than per frame
+ * — see that case for why the distinction is load-bearing rather than cosmetic.
+ * TOOL ACTIVITY and the APPROVAL frames are still `null` and are marked "#242
+ * half 2". Every `null` below carries its reason, and the ones owned by #242 say
+ * "not yet" rather than "no".
  */
 import type { OutboundWsMessage } from "./channel-contract.js";
 // #123: the diagnostic below is interpolated into a log line, so every value it
@@ -229,25 +233,70 @@ export function journalEventForOutbound(
         remove: [...frame.remove],
       };
     case "reasoning":
-      // NOT YET durable — #242. §15.9 requires reasoning content that belongs in
-      // the transcript to become a durable message; the 4-kind model cannot
-      // express it, so it is absent, not exempt (N3/N7).
-      return null;
+      // DURABLE, but ONLY the frame that CLOSES a burst (#242 half 1, §15.9).
+      //
+      // ⚠️ `final` IS NOT A NICETY — WITHOUT IT THIS CASE IS O(n²) BYTES PER
+      // BURST. `message-adapter.ts`'s `createReasoningDraftController` calls
+      // `sendReasoning` on EVERY cumulative token update, unthrottled, and each
+      // frame carries the whole text so far. Journaling those would write one
+      // row per token, each holding the full burst, and would multiply row count
+      // by orders of magnitude into an already quadratic replay (#286). The
+      // controller therefore emits ONE extra frame per burst carrying
+      // `final: true`, and only that one is recorded here.
+      //
+      // A frame WITHOUT the flag is a live cumulative draft and is deliberately
+      // not durable — the same classification §15.9 gives the rolling `progress`
+      // draft, and for the same reason: the durable content is authored once, at
+      // close.
+      //
+      // ⚠️ THE ADMISSION RULE IS THE CLIENT'S, FIELD FOR FIELD, AND THAT IS THE
+      // POINT. The live handler is
+      // `if (!msg.id || !msg.turnId || typeof msg.text !== "string" || msg.text.length === 0) return;`
+      // (`nats-client-wrapper.ts`'s `case "reasoning"`), i.e. non-empty id,
+      // non-empty turnId, non-empty string text — `isUsableMessageId` is exactly
+      // that predicate with the type check the wire does not perform. Journaling
+      // a frame the client REFUSES would put a message in history that live
+      // never rendered (N8, in the gaining direction); refusing one the client
+      // accepts would lose delivered content (N10). Neither margin is available,
+      // so the two rules must be the same rule.
+      //
+      // `turnId` is required here where `bubble`/`placement` treat it as
+      // optional, because the wire genuinely differs: `reasoning.turnId` is
+      // `string`, `progress.turnId` is `string | undefined`.
+      //
+      // The text check is written out rather than routed through
+      // `isUsableMessageId`: that predicate is the ONE definition of "id-less"
+      // and its docblock is entirely about identity, so borrowing it for a body
+      // field would make a later change to either one silently change the other.
+      return frame.final === true &&
+        isUsableMessageId(frame.id) &&
+        isUsableMessageId(frame.turnId) &&
+        typeof frame.text === "string" &&
+        frame.text.length > 0
+        ? {
+            kind: "reasoning",
+            id: frame.id,
+            turnId: frame.turnId,
+            text: frame.text,
+          }
+        : null;
     case "tool_activity":
-      // NOT YET durable — #242. Same as `reasoning`: Telegram preserves service
-      // messages and so must we; the event model has to grow first.
+      // NOT YET durable — #242 half 2. Same as `reasoning` was: Telegram
+      // preserves service messages and so must we; the event model has to grow
+      // first. Half 1 grew it for reasoning only.
       return null;
     case "approval_request":
-      // NOT YET durable — #242. An approval is a MESSAGE by §15.9's
+      // NOT YET durable — #242 half 2. An approval is a MESSAGE by §15.9's
       // message-vs-indicator test, not an indicator.
       return null;
     case "approval_resolved":
-      // NOT YET durable — #242. It is the state change of the message above.
+      // NOT YET durable — #242 half 2. It is the state change of the message
+      // above.
       return null;
     case "approval_snapshot":
-      // NOT YET durable — #242. Also a REPLAY of approvals the store already
-      // owns once #242 lands; see the `history` case for why replays are not
-      // journaled.
+      // NOT YET durable — #242 half 2. Also a REPLAY of approvals the store
+      // already owns once that half lands; see the `history` case for why
+      // replays are not journaled.
       return null;
     case "turn_settled":
       // Control frame. It carries no content and the client renders no bubble

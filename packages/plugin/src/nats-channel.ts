@@ -577,8 +577,26 @@ export class NatsChannel implements WebChannelPeerChannel {
     return this.sendText(peerId, text, id, turnId, assistantMessageIndex);
   }
 
-  sendReasoning(peerId: string, id: string, turnId: string, text: string): boolean {
-    return this.sendToPeer(peerId, { type: "reasoning", id, turnId, text });
+  /**
+   * #242 half 1: `final` marks the burst-closing frame — the ONE `reasoning`
+   * frame `journalOutbound` turns into a durable row. The key is omitted when
+   * the flag is absent/false so a live draft frame is byte-identical to what it
+   * was before the flag existed.
+   */
+  sendReasoning(
+    peerId: string,
+    id: string,
+    turnId: string,
+    text: string,
+    final?: boolean,
+  ): boolean {
+    return this.sendToPeer(peerId, {
+      type: "reasoning",
+      id,
+      turnId,
+      text,
+      ...(final === true ? { final: true } : {}),
+    });
   }
 
   sendToolActivity(
