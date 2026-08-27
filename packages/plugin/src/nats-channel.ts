@@ -967,11 +967,24 @@ export class NatsChannel implements WebChannelPeerChannel {
     // live and will never be used again. `journal_placement_once` cannot collapse
     // them (different `message_id` each time), and at #240 replay every one
     // becomes a phantom empty bubble: N8 in the GAINING direction, at an
-    // unbounded rate, manufactured entirely by us. A refusal also loses nothing
-    // by not being journaled — the text is already gone from the client's view
-    // (a `false` return makes `message-adapter.ts` record a delivery failure,
-    // and a thrown send moves the message to `failed`, never re-sent), so a row
-    // for it would only make history show what live never showed.
+    // unbounded rate, manufactured entirely by us.
+    //
+    // ⚠️ EVERYTHING ABOVE IS SCOPED TO THE PLACEMENT PATH, AND IT IS THE ONLY
+    // ARGUMENT THIS DOCBLOCK MAKES. It used to close with a general one — "a
+    // refusal loses nothing by not being journaled; the text is already gone
+    // from the client's view, so a row would only make history show what live
+    // never showed". #242 half 1 falsified that by giving the funnel a second
+    // durable kind: a refused reasoning CLOSE frame carries `lastDeliveredText`,
+    // text the transport ACCEPTED and the peer is still rendering, and the
+    // delivery-failure bookkeeping the parenthetical relied on is bubble/
+    // placement state that reasoning frames have none of.
+    //
+    // The refused-send question is therefore NOT settled by this docblock, and
+    // the position of the hook is not the same thing as a reason it must stay.
+    // The reason lives in exactly one place — `message-adapter.ts`'s
+    // `lastDeliveredText` declaration, which carries the mechanism and both
+    // retracted rationales. **#304** is the open residual. Do not restate it
+    // here; three restatements of it have already shipped wrong.
     //
     // The window §16.2-2 actually describes is the one that REMAINS: `sealEnvelope`
     // or `transport.publish` throwing after this line, so the record is committed
