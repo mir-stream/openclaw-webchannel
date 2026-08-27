@@ -520,11 +520,14 @@ export function resolveReasoningEnabled(accountConfig: WebchannelAccountConfig):
  *  - the LANE is ephemeral. It is drawn, the turn ends, the client's own
  *    `state.reasoning` is capped and eventually dropped, and nothing survives a
  *    reload. Defaulting it ON costs a UI section;
- *  - the JOURNAL is permanent plaintext on disk. Reasoning routinely restates
- *    tool output, file contents and the user's own prompt — this file already
- *    says so, one function up, as the reason a PRESENT malformed value fails
- *    closed — and there is no retention path yet (**#299** is unshipped), so
- *    nothing ages out.
+ *  - the JOURNAL is permanent plaintext on disk. `resolveReasoningEnabled` one
+ *    function up already treats this content as sensitive for the SAME reason,
+ *    in its own words: reasoning "can restate file contents, credentials, or the
+ *    user's own prompt to the least trusted surface this plugin serves". Add
+ *    TOOL OUTPUT to that list for the durable case — it is the material most
+ *    likely to appear in deliberation and in neither side of the conversation —
+ *    and note there is no retention path yet (**#299** is unshipped), so nothing
+ *    ages out.
  *
  * ⚠️ AND THE BENEFIT SIDE IS CURRENTLY ZERO, WHICH IS WHAT DECIDES IT. #242
  * half 1 is server-side only: `journal-history.ts` drops reasoning when it

@@ -172,10 +172,18 @@
  * `journal-history.ts` with the plugin build's own flags
  * (`esbuild --bundle --platform=node --format=esm --packages=external`) INLINES
  * this module and leaves no unresolved import, because `--packages=external`
- * externalises bare specifiers only and this is a relative path. #240 half 1
- * gives that module no caller, so the reducer is not in `dist/index-nats.js`
- * YET — half 2's wiring puts it there. A `node:` import added here would then
- * break the plugin's BUNDLE, not merely its test suite.
+ * externalises bare specifiers only and this is a relative path.
+ *
+ * ⚠️ AND IT IS IN THE SHIPPED BUNDLE NOW — THIS SENTENCE USED TO SAY "YET". It
+ * read "#240 half 1 gives that module no caller, so the reducer is not in
+ * `dist/index-nats.js` YET — half 2's wiring puts it there." Half 2 landed, and
+ * the wiring is real: `index-nats.ts` → `nats-account-runtime.ts` →
+ * `history-serve.ts` → `journal-history.ts` → this module, all production
+ * source. MEASURED after `npm run build -w packages/plugin`:
+ * `grep -c "applyReasoning\|projectJournalHistory" dist/index-nats.js` → 5.
+ * So a `node:` import added here does not "then" break the plugin's bundle at
+ * some future wiring step — it breaks the SHIPPED artifact today, not merely
+ * the test suite.
  *
  * The `seal` transition WAS a line-for-line port of the wrapper's private
  * `applyTurnSnapshot`; that body has since been deleted and the wrapper's method

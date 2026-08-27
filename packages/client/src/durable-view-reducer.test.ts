@@ -386,9 +386,18 @@ describe("step / fold agreement: reduceDurableView === fold of applyDurableEvent
 // the ONE deliberate difference from it; half 2 is when an anchor becomes
 // meaningful.
 describe("applyReasoning — one completed burst per event", () => {
-  it("APPENDS an unseen id at the tail, claiming the slot where it was delivered", () => {
-    // The whole reason reasoning goes through the reducer: the block lands
-    // BETWEEN the bubbles that surrounded it, not in a side list with no order.
+  it("APPENDS an unseen id at the tail, claiming the slot where the EVENT was appended", () => {
+    // The whole reason reasoning goes through the reducer: the block gets a
+    // POSITION among the bubbles instead of living in a side list with none.
+    //
+    // ⚠️ "WHERE THE EVENT WAS APPENDED", NOT "WHERE IT WAS DELIVERED" — this
+    // title used to say the latter, contradicting `applyReasoning`'s own
+    // docblock, which retracts that wording in as many words. The two coincide
+    // for a burst closed by `onReasoningEnd` and DIVERGE for one still open at
+    // turn end: `inbound.ts` drains the answer draft (emitting the `seal`)
+    // before calling `reasoning?.stop()`, so such a burst is appended after the
+    // turn's answers and replays at the tail. This fixture appends in order, so
+    // it exercises the coinciding case only.
     const view = reduceDurableView([
       { kind: "bubble", answerId: "A", text: "A", turnId: TURN },
       { kind: "reasoning", id: "r-1", turnId: TURN, text: "thinking" },

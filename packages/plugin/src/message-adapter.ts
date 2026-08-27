@@ -2753,7 +2753,8 @@ export function createReasoningDraftController(params: {
   //
   // ⚠️ THIS FLAG IS ABOUT THE *LAST* SEND, AND THAT IS THE ONLY QUESTION IT MAY
   // BE ASKED. It is deliberately NOT the gate on the burst's durable frame — see
-  // `lastDeliveredText` and #304 for the hole that produced.
+  // `lastDeliveredText` below for the hole that produced and for what is left of
+  // it (#304 tracks the remainder; the argument is here, not there).
   let liveSnapshotDelivered = false;
   // ⚠️ THE BURST TEXT THE CLIENT ACTUALLY HAS (#242 half 1, #304). Assigned ONLY
   // when `sendReasoning` returned true, so it lags `currentText` whenever a send
@@ -2815,9 +2816,24 @@ export function createReasoningDraftController(params: {
     //
     // ⚠️ IT CARRIES `lastDeliveredText`, NOT `currentText`, AND IS GATED ON THE
     // SAME VARIABLE — "history records what was DELIVERED", N10 stated
-    // positively. That NARROWS #304; it does not close it (#304 is OPEN, and its
-    // body has a section headed "Why it is filed rather than fixed in #242
-    // half 1"). The cases, and the row count each actually produces:
+    // positively. That NARROWS the loss; it does not end it. What remains is
+    // deferred for one reason, and it is stated HERE rather than by pointer: the
+    // seam cannot journal a refused send (N6b — see the declaration of
+    // `lastDeliveredText` above for the full chain), and a second journal hook
+    // inside this controller is N6b/N6c. **#304 tracks the remainder.**
+    //
+    // ⚠️ CITE #304 AS THE TRACKER, NEVER AS THE EXPLANATION. Its original filing
+    // is about the gap this file has since CLOSED — its candidate fix reads
+    // "track `anySnapshotDelivered` alongside `liveSnapshotDelivered` … captured
+    // at send time rather than read off `currentText`", which is
+    // `lastDeliveredText` as shipped right here. A reader sent to that body to
+    // learn why the residual is deferred finds an argument for deferring
+    // something already done, and the obvious next move is to close the issue —
+    // taking the tracker away from a burst the peer watched and no row records.
+    // The reasons live in this file; the issue exists to keep the remainder
+    // visible.
+    //
+    // The cases, and the row count each actually produces:
     //
     //   ordinary   every push landed        → close frame carries the full text.
     //                                         ONE row.

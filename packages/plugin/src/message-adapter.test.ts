@@ -3559,10 +3559,18 @@ describe("ProgressDraftController — provisional preview transactions", () => {
  * `sendResults[sendIndex++] ?? true`, so a script covering only the `push` calls
  * silently handed the BURST-CLOSE frame a success the scenario never granted it:
  * `setup([true, false])` reads as "the transport went down and stayed down", but
- * the close frame — a third send — defaulted to delivered. Every "refused
- * transport" test was therefore quietly testing a RECOVERED transport, which is
- * why the still-down residual (#304) shipped unnoticed through two rounds of
- * review.
+ * the close frame — a third send — defaulted to delivered. Every MIXED-REFUSAL
+ * test was therefore quietly testing a RECOVERED transport, which is why the
+ * still-down residual (#304) shipped unnoticed through two rounds of review.
+ *
+ * ⚠️ "MIXED-refusal", NOT "every refused-transport test" — an earlier revision
+ * of this comment overstated it. The ALL-refused case is unaffected, and
+ * `setup([false, true])` ("emits the CLI durable replay when its matching live
+ * send was rejected") is the proof: its refused `push` leaves
+ * `lastDeliveredText` empty, so `closeLiveBurst` attempts NO close frame, the
+ * scenario makes exactly two sends, and the script covers both. Only a burst
+ * with at least one DELIVERED push attempts a close frame, so only a mixed
+ * refusal could consume the phantom default.
  *
  * So: an EMPTY script means "every send succeeds" (the ordinary case, and most
  * callers), but a NON-EMPTY one must account for every send the scenario makes,

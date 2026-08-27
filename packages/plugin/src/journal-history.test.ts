@@ -270,9 +270,16 @@ describe("projectJournalHistory — reasoning is folded but not emitted (#242 ha
     { kind: "bubble", answerId: "B", turnId: TURN, text: "and therefore" },
   ];
 
-  it("the REDUCER's view holds every reasoning block, in delivery order", () => {
+  it("the REDUCER's view holds every reasoning block, in JOURNAL order", () => {
     // Stated first and separately: the drop below is a wire-shape limit, not a
     // gap in the store. If this goes red the journal really is losing content.
+    //
+    // ⚠️ "JOURNAL order", not "delivery order" — the fold reproduces the order
+    // rows were APPENDED, which `applyReasoning`'s docblock is explicit is not
+    // always the order bursts were delivered (a burst closed by `stop()` is
+    // appended after its turn's `seal`). This fixture appends in delivery
+    // order, so the two agree here; the title should not claim more than the
+    // reducer does.
     expect(reduceDurableView(WITH_REASONING).map((m) => m.id)).toEqual([
       "u-0",
       "r-1",
