@@ -90,10 +90,24 @@
  * with `error TS2366: Function lacks ending return statement and return type
  * does not include 'undefined'`, so the forgotten-case path BOUNDARY 2
  * anticipates cannot ship. The client consumer only ever constructs events from
- * the four wire frames it already handles, so with no journal yet the ONE
- * surviving path is RUNTIME VERSION SKEW — an older build replaying a journal a
- * newer build wrote — which first needs #239 (the journal) and #241 (a grown
- * event set). Both obvious fixes are wrong, in the spirit of §0.2:
+ * the four wire frames it already handles, so the ONE surviving path is RUNTIME
+ * VERSION SKEW — an older build replaying a journal a newer build wrote.
+ *
+ * ⚠️ THAT PATH IS NO LONGER HYPOTHETICAL, AND SOMETHING NOW STANDS IN FRONT OF
+ * IT. This used to say the skew case "first needs #239 (the journal) and #241 (a
+ * grown event set)". #239 LANDED, and #240 added the consumer that reads those
+ * rows back: `packages/plugin/src/journal-history.ts` replays a journal through
+ * `applyDurableEvent`, and `delivery-journal.ts` RETAINS rows whose kind this
+ * build does not know (#253) rather than dropping them — so an out-of-union kind
+ * genuinely reaches that consumer's hands. What keeps it out of THIS function is
+ * `isKnownJournalEvent` there: a `Record<DurableEvent["kind"], true>`-derived
+ * filter that counts such rows into `unsupportedEvents` and never folds them.
+ * The remaining precondition is only #241 (a kind outside the four).
+ *
+ * So the next journal consumer must not re-derive this hazard from scratch: the
+ * `default`-less switch is still deliberate HERE, and the guard belongs at the
+ * consumer, exactly as `journal-history.ts` does it. Both obvious fixes are still
+ * wrong, in the spirit of §0.2:
  *   - `default: return view;`, mirroring `handleFrame`'s ignore-unknown
  *     (nats-client-wrapper.ts:2293 — which has no `default:` either; it returns
  *     `void`, so falling off the end IS its ignore) — REJECTED. That
@@ -116,9 +130,23 @@
  * has no imports at all, not even `node:` built-ins. Two reasons: the client
  * package publishes as a zero-dependency browser-targeted bundle (its tsconfig
  * lib set is `ES2022`/`DOM` with no `@types/node`), and the plugin consumes this
- * same file by cross-package SOURCE import (see
- * `packages/plugin/src/durable-view-reducer-contract.test.ts`), which only
- * bundles cleanly while the file drags in nothing. Keep it that way.
+ * same file by cross-package SOURCE import, which only bundles cleanly while the
+ * file drags in nothing. Keep it that way.
+ *
+ * ⚠️ "KEEP IT THAT WAY" IS NOW LOAD-BEARING FOR A SHIPPED ARTIFACT, NOT JUST FOR
+ * A TEST. This used to cite `durable-view-reducer-contract.test.ts` as the
+ * plugin-side importer, and a broken contract would only have turned a test red.
+ * PRODUCTION plugin source imports it now: `packages/plugin/src/journal-history.ts`
+ * (value import — it calls `applyDurableEvent`) and
+ * `packages/plugin/src/delivery-journal-event.ts` (type-only — `JournalEvent` is
+ * a plain alias of `DurableEvent`, so the two are ONE type). Measured: bundling
+ * `journal-history.ts` with the plugin build's own flags
+ * (`esbuild --bundle --platform=node --format=esm --packages=external`) INLINES
+ * this module and leaves no unresolved import, because `--packages=external`
+ * externalises bare specifiers only and this is a relative path. #240 half 1
+ * gives that module no caller, so the reducer is not in `dist/index-nats.js`
+ * YET — half 2's wiring puts it there. A `node:` import added here would then
+ * break the plugin's BUNDLE, not merely its test suite.
  *
  * The `seal` transition WAS a line-for-line port of the wrapper's private
  * `applyTurnSnapshot`; that body has since been deleted and the wrapper's method
@@ -442,7 +470,7 @@ function applyUser(
  * via `draft-stream.ts:653-668` → `:634 api.deleteMessage`). So the reducer's
  * `""` is RIGHT and it was the LIVE side that was wrong: keeping the partial
  * draft forever was the bug, and the consumer's `draftOnly` drop
- * (nats-client-wrapper.ts's `isSpentDraft`, …:1899) fixes it. Both sides then
+ * (nats-client-wrapper.ts's `isSpentDraft`, …:1909) fixes it. Both sides then
  * agree on "no bubble" and live==history holds.
  *
  * Still do not resolve it here by teaching the reducer to keep draft text — that
