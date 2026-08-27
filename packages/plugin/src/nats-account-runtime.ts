@@ -934,7 +934,15 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           // egress path (persist-before-publish), so closing the handle first
           // would leave a window where a send writes to a closed database. A
           // disposed channel refuses to send at all, so nothing can reach the
-          // journal past this line. `close()` is idempotent.
+          // journal past this line. The ingress accept seam (wired below) writes
+          // WITHOUT going through the channel, so it needs its own reason: this
+          // function sets `runtimeActive = false` with no `await` before
+          // `close()`, and `createIngressOnFlush`'s span from its `isActive()`
+          // check to its last `append` is entirely synchronous — so an in-flight
+          // flush either resumes after dispose and takes the `invalidated` early
+          // return, or is already past it and cannot interleave. Inserting an
+          // `await` on either side of that span breaks this argument.
+          // `close()` is idempotent.
           try { deliveryJournal?.close(); } catch (error) { errors.push({ phase: "delivery-journal", error }); }
           const transportReport = await transport.closeGracefully();
           return { errors, transport: transportReport };
@@ -1006,6 +1014,11 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         beginBatch: (peerId) => inboundDispatcher!.beginBatch(peerId),
         sendAck: (peerId, ids) => channel.sendAck(peerId, ids),
         sendInboundRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids),
+        // v6 (#239 half 3): the SAME handle the channel got for the egress seam,
+        // opened above from this account's (tenant, accountId) tuple. Doc §15.7
+        // makes this write part of accepting a user message, so a missing handle
+        // here is not a degrade mode — `index-nats-wiring.test.ts` pins the line.
+        deliveryJournal,
         cancelledFallback: cancelledInboundFallback,
         logInfo: (message) => api.logger?.info?.(message),
         logWarn: (message) => api.logger?.warn?.(message),

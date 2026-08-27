@@ -32,13 +32,15 @@ import { logSafe } from "./log-safe.js";
 /**
  * v6 delivery journal (#239). TYPE-ONLY on purpose — the store resolves
  * `node:sqlite` lazily and this import is erased, so `nats-channel.ts` keeps
- * pulling in no database runtime. The two mapper functions below are ordinary
- * value imports; `delivery-journal-event.ts` is pure and has no runtime deps.
+ * pulling in no database runtime. The symbols below are ordinary value imports
+ * because `delivery-journal-event.ts` carries no database/IO runtime dependency
+ * of its own — the property stated at that file's `log-safe.js` import.
  */
 import type { DeliveryJournal } from "./delivery-journal.js";
 import {
   isIdlessDurableFrame,
   journalEventForOutbound,
+  journalFailureDiagnostic,
 } from "./delivery-journal-event.js";
 
 /** Preserve caught-error detail without changing primitive thrown-value rendering. */
@@ -203,70 +205,6 @@ type DeliveryJournalWarning =
   | "append-failed"
   /** A durable frame carrying no usable id reached egress. Post-#238 a regression. */
   | "idless-durable-frame";
-
-/**
- * The value-free part of a journal-write failure, for the warning line.
- *
- * ⚠️ `error.message` IS DELIBERATELY EXCLUDED, AND THE EARLIER "it can carry the
- * bound SQL parameters" JUSTIFICATION WAS WRONG — MEASURED, not assumed. Seven
- * failure shapes were driven against a real `openDeliveryJournal`/`node:sqlite`,
- * every one journaling a distinctive marker string as the bubble text:
- *
- *   append after close()       message "database is not open"          code ERR_INVALID_STATE (no errcode)
- *   table dropped underneath   message "no such table: journal_event"  code ERR_SQLITE_ERROR errcode 1    errstr "SQL logic error"
- *   sidecar holds BEGIN EXCL.  message "database is locked"            code ERR_SQLITE_ERROR errcode 5    errstr "database is locked"
- *   raw UNIQUE/PK conflict     message "UNIQUE constraint failed: t.a" code ERR_SQLITE_ERROR errcode 1555 errstr "constraint failed"
- *   NOT NULL violation         message "NOT NULL constraint failed: t.a"                     errcode 1299
- *   CHECK violation            message "CHECK constraint failed: n < 5"                      errcode 275
- *   read-only file / corrupted main file — DID NOT THROW at all (WAL: the write
- *   lands in the already-open `-wal` sidecar)
- *
- * The marker never appeared in `message`, in any own property, or in the stack.
- * So the message is not a plaintext leak. It is still excluded because it is
- * FREE-FORM text with no contract — the CHECK case shows it echoing schema
- * source verbatim — whereas `code`/`errcode`/`errstr` are enumerated constants.
- * Those three are also what actually answers the operator's question, which was
- * the other half of the objection to swallowing everything. Among the shapes
- * ACTUALLY MEASURED above, `ERR_INVALID_STATE` (the handle was closed under us),
- * `ERR_SQLITE_ERROR`+errcode 1 (the schema is gone) and `ERR_SQLITE_ERROR`+errcode
- * 5 (another writer holds the lock) are three different incidents with three
- * different fixes, and the status is the only field that separates them.
- *
- * ⚠️ THE PROPERTY READS ARE GUARDED. This runs inside `journalOutbound`'s catch,
- * so a thrown object with a throwing getter (or a Proxy trap) would escape that
- * catch and then `sendToPeer` — the exact "permanently lost message" outcome the
- * wide `try` exists to prevent. "Nothing in the tree throws from a getter today"
- * is the same argument that was rejected for the mapper, so it is rejected here.
- */
-function journalFailureDiagnostic(error: unknown): string {
-  if (typeof error !== "object" || error === null) {
-    // Not an Error at all (a thrown string could BE message text) — report only
-    // that fact.
-    return `code=${logSafe(`<thrown-${typeof error}>`)}`;
-  }
-  let code: unknown;
-  let errcode: unknown;
-  let errstr: unknown;
-  try {
-    ({ code, errcode, errstr } = error as {
-      code?: unknown;
-      errcode?: unknown;
-      errstr?: unknown;
-    });
-  } catch {
-    // A throwing getter or a Proxy trap. The diagnostic is best-effort; the
-    // isolation is not.
-    return `code=${logSafe("<unreadable>")}`;
-  }
-  const parts = [
-    `code=${typeof code === "string" ? logSafe(code) : logSafe("<none>")}`,
-  ];
-  // Absent on the SDK's own state errors (ERR_INVALID_STATE), present on
-  // everything that reached SQLite.
-  if (typeof errcode === "number") parts.push(`errcode=${errcode}`);
-  if (typeof errstr === "string") parts.push(`errstr=${logSafe(errstr)}`);
-  return parts.join(" ");
-}
 
 /**
  * NATS-based message channel for WebChannel.

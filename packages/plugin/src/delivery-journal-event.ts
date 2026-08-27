@@ -4,10 +4,20 @@
  * The plugin is the Telegram *server*: it owns a durable store and the client is
  * a pure view of it (doc §0). This module is the PURE half of that store — it
  * decides which outbound frames are durable MESSAGES and what event each one
- * becomes. `delivery-journal.ts` persists what this returns; #239's second half
- * wires both into the egress and inbound-accept seams so that every durable
- * event is committed BEFORE its frame is published (persist-before-publish,
- * NOT-list N6, doc §16.2-2, which reverses v5 §15.8's commit-after).
+ * becomes, and it renders the store's failure diagnostic for a log line.
+ * `delivery-journal.ts` persists what this returns; #239's second and third
+ * halves wire both into the egress and inbound-accept seams so that every
+ * durable event is committed BEFORE its frame is published
+ * (persist-before-publish, NOT-list N6, doc §16.2-2, which reverses v5 §15.8's
+ * commit-after).
+ *
+ * ⚠️ `journalFailureDiagnostic` LIVES HERE BECAUSE BOTH SEAMS NEED IT AND IT
+ * MUST BE ONE DOOR. It shipped in `nats-channel.ts` when egress was the only
+ * caller; the accept seam (half 3) needs the same value-free status, and the
+ * measurement in its docblock is the kind of thing that must not exist in two
+ * copies free to drift. This module is the only home both seams already import
+ * as a value — `nats-channel.ts` takes `DeliveryJournal` type-only on purpose so
+ * it pulls in no database runtime, so `delivery-journal.ts` could not be it.
  *
  * ⚠️ `JournalEvent` IS A MIRROR OF `DurableEvent`, NOT A SEPARATE MODEL.
  * `packages/client/src/durable-view-reducer.ts` is the AUTHORITY; the two must
@@ -47,6 +57,12 @@
  * carries its reason, and the ones owned by #242 say "not yet" rather than "no".
  */
 import type { OutboundWsMessage } from "./channel-contract.js";
+// #123: the diagnostic below is interpolated into a log line, so every value it
+// renders is quoted and escaped. `log-safe.ts` is a regex and `JSON.stringify`
+// and nothing else, so this module keeps the property its importers actually
+// need — NO DATABASE/IO RUNTIME DEPENDENCY, which is why `nats-channel.ts` can
+// take `DeliveryJournal` type-only and still call in here for values.
+import { logSafe } from "./log-safe.js";
 
 /**
  * The ordered event stream the plugin journals. Structural mirror of
@@ -256,7 +272,7 @@ export function journalEventForOutbound(
 /**
  * The inbound user message's journal event.
  *
- * Exported alongside the outbound mapper so half 2 has nothing to invent at the
+ * Exported alongside the outbound mapper so half 3 has nothing to invent at the
  * accept seam: doc §15.7 makes the plugin the ONLY SSOT for user messages, so
  * this event is the durable record of the accept, written before the ack.
  *
@@ -288,7 +304,8 @@ export function journalEventForOutbound(
  *  - a 1 MB id — see the amplification above.
  *
  * It throws rather than returning `null` because this runs BEFORE accept: a
- * loud failure in half 2's integration test is the outcome we want, whereas a
+ * loud failure in half 3's accept-seam tests
+ * (`ingress-dedupe-delivery-journal.test.ts`) is the outcome we want, whereas a
  * `null` would invite the accept path to shrug and continue unjournaled.
  * `isUsableMessageId` is the same predicate the durable-frame branch uses, so
  * the two cannot drift on what "id-less" means; the LENGTH bound is added only
@@ -331,4 +348,71 @@ export function journalEventForInboundUser(input: {
  */
 function optionalTurnId(turnId: string | undefined): { turnId?: string } {
   return turnId === undefined ? {} : { turnId };
+}
+
+/**
+ * The value-free part of a journal-write failure, for the warning line.
+ *
+ * ⚠️ `error.message` IS DELIBERATELY EXCLUDED, AND THE EARLIER "it can carry the
+ * bound SQL parameters" JUSTIFICATION WAS WRONG — MEASURED, not assumed. Seven
+ * failure shapes were driven against a real `openDeliveryJournal`/`node:sqlite`,
+ * every one journaling a distinctive marker string as the bubble text:
+ *
+ *   append after close()       message "database is not open"          code ERR_INVALID_STATE (no errcode)
+ *   table dropped underneath   message "no such table: journal_event"  code ERR_SQLITE_ERROR errcode 1    errstr "SQL logic error"
+ *   sidecar holds BEGIN EXCL.  message "database is locked"            code ERR_SQLITE_ERROR errcode 5    errstr "database is locked"
+ *   raw UNIQUE/PK conflict     message "UNIQUE constraint failed: t.a" code ERR_SQLITE_ERROR errcode 1555 errstr "constraint failed"
+ *   NOT NULL violation         message "NOT NULL constraint failed: t.a"                     errcode 1299
+ *   CHECK violation            message "CHECK constraint failed: n < 5"                      errcode 275
+ *   read-only file / corrupted main file — DID NOT THROW at all (WAL: the write
+ *   lands in the already-open `-wal` sidecar)
+ *
+ * The marker never appeared in `message`, in any own property, or in the stack.
+ * So the message is not a plaintext leak. It is still excluded because it is
+ * FREE-FORM text with no contract — the CHECK case shows it echoing schema
+ * source verbatim — whereas `code`/`errcode`/`errstr` are enumerated constants.
+ * Those three are also what actually answers the operator's question, which was
+ * the other half of the objection to swallowing everything. Among the shapes
+ * ACTUALLY MEASURED above, `ERR_INVALID_STATE` (the handle was closed under us),
+ * `ERR_SQLITE_ERROR`+errcode 1 (the schema is gone) and `ERR_SQLITE_ERROR`+errcode
+ * 5 (another writer holds the lock) are three different incidents with three
+ * different fixes, and the status is the only field that separates them.
+ *
+ * ⚠️ THE PROPERTY READS ARE GUARDED, and both callers depend on that. Each runs
+ * this inside the `catch` that isolates the journal from its seam — a thrown
+ * object with a throwing getter (or a Proxy trap) would escape that catch and
+ * then the seam itself: at egress that is `sendToPeer` throwing, which
+ * `message-adapter.ts` turns into a permanently lost message; at the accept seam
+ * it is `onFlush` rejecting, which the bounded debouncer's `pump` swallows with
+ * no log at all. "Nothing in the tree throws from a getter today" is the same
+ * argument that was rejected for the mapper, so it is rejected here.
+ */
+export function journalFailureDiagnostic(error: unknown): string {
+  if (typeof error !== "object" || error === null) {
+    // Not an Error at all (a thrown string could BE message text) — report only
+    // that fact.
+    return `code=${logSafe(`<thrown-${typeof error}>`)}`;
+  }
+  let code: unknown;
+  let errcode: unknown;
+  let errstr: unknown;
+  try {
+    ({ code, errcode, errstr } = error as {
+      code?: unknown;
+      errcode?: unknown;
+      errstr?: unknown;
+    });
+  } catch {
+    // A throwing getter or a Proxy trap. The diagnostic is best-effort; the
+    // isolation is not.
+    return `code=${logSafe("<unreadable>")}`;
+  }
+  const parts = [
+    `code=${typeof code === "string" ? logSafe(code) : logSafe("<none>")}`,
+  ];
+  // Absent on the SDK's own state errors (ERR_INVALID_STATE), present on
+  // everything that reached SQLite.
+  if (typeof errcode === "number") parts.push(`errcode=${errcode}`);
+  if (typeof errstr === "string") parts.push(`errstr=${logSafe(errstr)}`);
+  return parts.join(" ");
 }
