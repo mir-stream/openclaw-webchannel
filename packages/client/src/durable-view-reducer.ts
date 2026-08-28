@@ -15,7 +15,7 @@
  * first; the client render was rewired onto it in the slice after #238, and is
  * now its FIRST runtime consumer — `nats-client-wrapper.ts`'s `applyDurable`
  * projects `state.messages`, applies one event here, and merges the
- * result back. Four of the five transitions have their own EQUIVALENCE ANCHOR in
+ * result back. Each transition has its own EQUIVALENCE ANCHOR in
  * `durable-view-reducer.test.ts`, which drives the REAL `WebChannelNATSClient`
  * with the REAL wire frames and compares against this reducer's output.
  *
@@ -30,8 +30,10 @@
  * live `.slice(-100)` cap). Half 2 deleted `upsertReasoning`, routed
  * `case "reasoning"` through `applyDurable`, made `state.reasoning` a DERIVED
  * view of the reasoning entries in `state.messages`, and dropped the cap — so
- * the port is now the implementation, the divergence is closed, and the fifth
- * anchor exists in `durable-view-reducer.test.ts` alongside the other four.
+ * the port is now the implementation, the divergence is closed, and its anchor
+ * exists in `durable-view-reducer.test.ts` alongside the rest. #242 half 4 did
+ * the same for the two approval transitions, which is why the sentence above
+ * no longer carves any transition out.
  *
  * ⚠️ THE ANCHORS' EVIDENTIAL VALUE CHANGED WHEN THE CLIENT BECAME THE CONSUMER.
  * While the client had its own hand-rolled reconciliation they were genuinely
@@ -74,27 +76,30 @@
  *
  * ⚠️ ARRAY IDENTITY IS NOT A GENERAL NO-OP SIGNAL. Some transitions hand the
  * input array straight back when nothing durable changed, and some always
- * allocate. Measured. The three SAME-array rows are EXHAUSTIVE — they are every
- * path in this file that returns its input by reference. The three NEW-array rows
- * are illustrative examples, not an enumeration: allocation is the default here,
- * so any PATH not listed among the first three allocates. (Path, not
- * transition: `placement` and `seal` each have paths on BOTH sides of the
+ * allocate. Measured. The FOUR SAME-array rows are EXHAUSTIVE — they are every
+ * path in this file that returns its input by reference. The NEW-array rows
+ * below them are illustrative examples, not an enumeration: allocation is the
+ * default here, so any PATH not listed among the first four allocates. (Path,
+ * not transition: `placement` and `seal` each have paths on BOTH sides of the
  * divide, even though only `seal` happens to have a row in each section below.
  * `reasoning` has NO path in the first section — see its row.)
  *   - `placement`, repeat claim whose turnId resolves unchanged  → SAME array
  *   - `seal`, early return (no valid answers and no removes)     → SAME array
  *   - `seal`, empty/blank turnId early return                    → SAME array
+ *   - `approvalResolution` naming an id no approval holds        → SAME array
  *   - `bubble` with identical text and turnId                    → NEW array (e.g.)
  *   - `seal` whose answers change nothing                        → NEW array (e.g.)
  *   - `reasoning` REPEATING its id, turnId and text              → NEW array (e.g.)
- * The last three ALWAYS allocate (see `applyBubble`, `applySeal`'s tail, and
- * `applyReasoning` — BOTH of the latter's paths allocate, so it contributes no
- * row to the exhaustive section above); they
+ *   - `approval` REPEATING an identical request payload          → NEW array (e.g.)
+ * The four illustrative rows ALWAYS allocate (see `applyBubble`, `applySeal`'s
+ * tail, `applyReasoning` and `applyApproval` — BOTH paths of each of the latter
+ * two allocate, so neither contributes a row to the exhaustive section above);
+ * they
  * do not detect no-ops, and teaching them to would be a behavior change this
  * slice does not need. So do NOT build a `prev === next` memo, a
  * `useSyncExternalStore` equality check, or any render skip on array identity —
  * it is sound only as "same ref ⇒ definitely unchanged", never as
- * "different ref ⇒ changed". `durable-view-reducer.test.ts` pins all six rows
+ * "different ref ⇒ changed". `durable-view-reducer.test.ts` pins all eight rows
  * above, the negative cases included, so the next reader measures instead of
  * assuming.
  *
@@ -110,9 +115,13 @@
  * statement and return type does not include 'undefined'` until its `case` was
  * added, so the forgotten-case path BOUNDARY 2 anticipates cannot ship. The
  * client consumer constructs events only from wire frames it already handles —
- * FIVE of them since #242 half 2 routed `case "reasoning"` here (half 1 folded
- * reasoning SERVER-side only) — so the ONE surviving path is RUNTIME VERSION
- * SKEW: an older build replaying a journal a newer build wrote.
+ * since #242 half 4 that is EVERY kind in the union, with no arm left that only
+ * the plugin produces — so the ONE surviving path is RUNTIME VERSION SKEW: an
+ * older build replaying a journal a newer build wrote. (Stated as a property
+ * rather than a count on purpose: this sentence said "FIVE of them" and stayed
+ * at five through half 3, which added a sixth. A number here is born
+ * stale-able; "every kind" is re-checkable by grepping the wrapper's
+ * `applyDurable`/`nextDurableMessages` call sites.)
  *
  * ⚠️ THAT PATH IS NO LONGER HYPOTHETICAL, AND SOMETHING NOW STANDS IN FRONT OF
  * IT. This used to say the skew case "first needs #239 (the journal) and #241 (a
@@ -193,6 +202,33 @@
  */
 
 export type DurableRole = "user" | "agent";
+
+/**
+ * The decision a native HITL approval can carry (#242 half 4).
+ *
+ * ⚠️ DECLARED HERE RATHER THAN IMPORTED, and that is the DEPENDENCY CONTRACT in
+ * the header doing its job, not duplication for its own sake: this file has no
+ * imports at all, so it may name neither `types.ts`'s `ApprovalDecision` nor the
+ * plugin's. All three are the same three string literals, so every value is
+ * assignable across them and tsc checks the agreement at each boundary the two
+ * meet (the wrapper's handlers, the plugin's mapper).
+ *
+ * ⚠️ `"unknown"` IS DELIBERATELY NOT A MEMBER. The client has a resolution
+ * SENTINEL of that name (#15 — "decided or expired while this device wasn't
+ * looking"), and it is a LIVE-ONLY reconciliation outcome produced by
+ * `approval_snapshot`'s Leg B, never a decision anybody made. Nothing can
+ * journal it: the only producer of a resolution event is the
+ * `approval_resolved` wire frame, whose `decision` is a real verdict. Admitting
+ * it here would let a replay serve a resolution that never happened.
+ */
+export type DurableApprovalDecision = "allow-once" | "allow-always" | "deny";
+
+/** One offered approval button, exactly as the request frame carries it. */
+export type DurableApprovalOption = {
+  readonly decision: DurableApprovalDecision;
+  readonly label: string;
+  readonly style: string;
+};
 
 /**
  * The durable subset of one delivered message. Client-local fields are excluded.
@@ -290,6 +326,62 @@ export type DurableMessage =
       readonly status?: string;
       readonly summary?: string;
       readonly argKeys?: readonly string[];
+    }
+  /**
+   * ONE NATIVE HITL APPROVAL CARD, WITH ITS STATE (#242 half 4, doc §15.9).
+   *
+   * ⚠️ THIS IS THE FOLD OF **TWO** EVENTS, AND THAT IS THE WHOLE SLICE. An
+   * approval is the first durable message whose content changes by a USER
+   * ACTION rather than by a delivery revision, which is why it was deferred out
+   * of half 3 as "#241 revision territory". It is not: the request and the
+   * resolution are journaled as TWO APPEND-ONLY EVENTS (`approval`,
+   * `approvalResolution`) and folded into this one message, exactly the shape
+   * `seal` already has against `bubble`. No row is ever edited, so there is no
+   * mutation model to invent and #241 is not a prerequisite.
+   *
+   * ⚠️ THE DURABLE STATE IS `pending | resolved(decision)` — THERE IS NO
+   * `expired`, AND THERE MUST NOT BE. `expiresAtMs` is journaled because the
+   * request frame carries it (`channel-contract.ts`'s
+   * `ApprovalRequestPayload`), but "is it expired" is a comparison against the
+   * WALL CLOCK and this module's PURITY CONTRACT forbids a clock. Expiredness is
+   * therefore computed at RENDER, from `expiresAtMs`, by whoever draws the card.
+   * Do not add an `expired` event and do not read a clock here: an expiry that
+   * was folded at replay time would make the same journal project differently on
+   * two reads, which is the one property `history == live` cannot survive.
+   *
+   * Note core resolves an EXPIRED approval as a real `deny` on the wire
+   * (`approvals.ts`'s `buildExpiredResult` returns
+   * `{kind:"update", payload:{decision:"deny"}}`), so an approval that timed out
+   * server-side arrives here as an ordinary resolution and needs none of the
+   * above. The clock question is only about a card whose deadline passed with no
+   * frame at all.
+   *
+   * ⚠️ NO `role`, for the reason the reasoning and tool arms give: the wire
+   * carries no author and this type refuses to invent one.
+   *
+   * ⚠️ THE PAYLOAD'S OWN `kind` FIELD IS CARRIED AS `approvalKind`. The wire
+   * calls it `kind` (`"exec" | "plugin"`), which is the same name this union
+   * uses as its DISCRIMINANT. Renaming it here is not cosmetic — carrying it
+   * verbatim would make the two meanings collide on one key and the union
+   * undiscriminable. The rename is repeated identically at the wire history row
+   * and the client entry so all three agree.
+   */
+  | {
+      readonly kind: "approval";
+      readonly id: string;
+      readonly approvalKind: "exec" | "plugin";
+      readonly title: string;
+      readonly description?: string;
+      readonly prompt: string;
+      readonly options: readonly DurableApprovalOption[];
+      readonly expiresAtMs?: number;
+      /**
+       * The SERVER-CONFIRMED decision, folded from an `approvalResolution`
+       * event. Absent means the card is still pending AS THIS STREAM RECORDS IT
+       * — which is NOT the same as "still actionable"; see the client entry's
+       * `actionable` for why a replayed pending card must never be clickable.
+       */
+      readonly resolvedDecision?: DurableApprovalDecision;
     };
 
 /** The `text` variant, named so the transitions that only handle it can say so. */
@@ -342,11 +434,11 @@ function findTextIndex(view: DurableView, id: string): number {
  * `packages/plugin/src/channel-contract.ts` (`OutboundWsMessage`) and the
  * wrapper's `handleFrame` cases (`handleMessage` is the
  * outer entry point, which brackets that switch with the live-turn latch
- * observation and the release gate), and EVERY transition — all five kinds
- * below, `reasoning` included since #242 half 2 gave the client a `reasoning`
- * consumer to anchor against — is anchored against the REAL client in
- * `durable-view-reducer.test.ts`. See the two BOUNDARY notes after the type for
- * what that does NOT cover.
+ * observation and the release gate), and EVERY transition below — with no arm
+ * excepted, `reasoning` since #242 half 2 gave the client a `reasoning` consumer
+ * to anchor against and the two approval arms since half 4 — is anchored against
+ * the REAL client in `durable-view-reducer.test.ts`. See the two BOUNDARY notes
+ * after the type for what that does NOT cover.
  *
  *  - `user`      — a local user echo materialized once publication reserves its
  *                  wire id (`nextPublishedUserMessages` in the wrapper). This is
@@ -498,29 +590,36 @@ function findTextIndex(view: DurableView, id: string): number {
  * tests in `durable-view-reducer.test.ts` (they record what happens; they do not
  * endorse it).
  *
- * ── BOUNDARY 2: six kinds is TODAY'S wire, not the settled model ──
+ * ── BOUNDARY 2: today's wire is not, by itself, the settled model ──
  *
- * Doc §15.9 requires tool and reasoning messages to become DURABLE messages —
- * only pure indicators (the rolling progress draft, the typing flag) stay
- * ephemeral. So this event set will GROW; it has now done so twice, and the rest
- * of the growth is scheduled. #242 half 1 added `reasoning` and half 2 gave it a
- * CLIENT consumer; half 3 added `tool` and moved the client's live tool surface
- * onto this reducer, which is what §15.9's tool clause asked for and completes
- * it.
+ * Doc §15.9 requires every MESSAGE to become durable and leaves only pure
+ * INDICATORS ephemeral (the rolling progress draft, the typing flag). So this
+ * event set GREW, once per #242 slice: half 1 added `reasoning` and half 2 gave
+ * it a CLIENT consumer; half 3 added `tool` and moved the client's live tool
+ * surface onto this reducer; half 4 added `approval` + `approvalResolution` and
+ * did the same for the approval surface.
  *
- * The APPROVAL frames are still `null` in `journalEventForOutbound` and absent
- * here. That is **#242 half 4**, not half 3, and the reason is not effort: an
- * approval is BIDIRECTIONAL — the client sends `approval_decision` back through
- * the inbound path, and resolution changes a durable message's content by a USER
- * ACTION rather than by a delivery revision. It is the first message in this
- * system that does that, which is **#241**'s typed edit/revision territory;
- * modelling it before #241 means inventing the mutation model twice.
- * `approval_snapshot` is a different thing again and is `null` PERMANENTLY — see
- * its case in the mapper.
+ * ✅ THAT COMPLETES §15.9'S LIST, AND THE PARAGRAPH THAT USED TO SIT HERE IS
+ * RETRACTED RATHER THAN DELETED, BECAUSE ITS ARGUMENT WAS WRONG AND WILL BE
+ * RE-DERIVED OTHERWISE. It read: the approval frames stay out because an
+ * approval is BIDIRECTIONAL, so resolution changes a durable message's content
+ * by a USER ACTION rather than a delivery revision, which is **#241**'s typed
+ * edit/revision territory. The premise is true and the conclusion does not
+ * follow. Nothing is edited: the request and the resolution are TWO APPEND-ONLY
+ * EVENTS folded into one message, the same relationship `seal` already has to
+ * `bubble`. #241 was never a prerequisite.
  *
- * Do not read the six kinds as final spec, and do not treat "it isn't in
- * DurableEvent" as evidence that something is non-durable by design
- * (NOT-list N3/N7).
+ * `notice` needed no event of its own and never did — a notice, a route apology
+ * and the `/stop` notice all go out through `NatsChannel.sendText` carrying a
+ * minted id, so the mapper's `agent_message` branch has journaled them as
+ * `bubble`s since #239. `approval_snapshot` is `null` PERMANENTLY (see its case
+ * in the mapper): it is a replay of state this store already holds, not a
+ * message.
+ *
+ * The list being complete is NOT a licence to read this union as closed. Do not
+ * treat "it isn't in `DurableEvent`" as evidence that something is non-durable
+ * by design (NOT-list N3/N7) — that inference was wrong for tool, for reasoning
+ * and for approvals in turn.
  *
  * ── BOUNDARY 3: the `history` frame is durable but deliberately OUT OF SCOPE ──
  *
@@ -606,7 +705,44 @@ export type DurableEvent =
       status?: string;
       summary?: string;
       argKeys?: readonly string[];
-    };
+    }
+  /**
+   * ONE `approval_request` WIRE FRAME (#242 half 4) — the card's CONTENT.
+   *
+   * Upsert-by-id, exactly like `bubble`, with one addition `applyApproval`
+   * carries: a re-delivered request NEVER clobbers a resolution already folded
+   * onto the card. That is the durable twin of the client's #15 upsert-preserve,
+   * and it is needed for the same reason — the register path can re-deliver a
+   * prompt after it was decided.
+   */
+  | {
+      kind: "approval";
+      id: string;
+      approvalKind: "exec" | "plugin";
+      title: string;
+      description?: string;
+      prompt: string;
+      options: readonly DurableApprovalOption[];
+      expiresAtMs?: number;
+    }
+  /**
+   * ONE `approval_resolved` WIRE FRAME (#242 half 4) — the card's STATE CHANGE.
+   *
+   * ⚠️ A SECOND APPEND-ONLY EVENT, NOT AN EDIT OF THE FIRST, AND THAT IS THE
+   * DESIGN. The alternative — one `approval` row rewritten in place when the
+   * user decides — is a REVISION, needs #241's typed mutation model, and breaks
+   * the store's append-only property (§15.9's rejected alternative (a) for
+   * reasoning makes the same argument for the same reason: a mutable payload
+   * destroys "seq = the moment this content was authored"). Two events folded by
+   * one transition is the shape `seal` already uses against `bubble`, so nothing
+   * new had to be invented and #241 is not a prerequisite for this slice.
+   *
+   * ⚠️ IT CARRIES NO CONTENT OF ITS OWN. A resolution naming an id no approval
+   * in the view holds is a NO-OP that returns the view by reference — see
+   * `applyApprovalResolution` for why appending a contentless card instead would
+   * be inventing a message.
+   */
+  | { kind: "approvalResolution"; id: string; decision: DurableApprovalDecision };
 
 /**
  * STEP: apply exactly ONE journaled event to a durable view.
@@ -650,6 +786,10 @@ export function applyDurableEvent(
       return applyReasoning(view, event);
     case "tool":
       return applyTool(view, event);
+    case "approval":
+      return applyApproval(view, event);
+    case "approvalResolution":
+      return applyApprovalResolution(view, event);
   }
 }
 
@@ -978,6 +1118,132 @@ function applyTool(
 }
 
 /**
+ * The index of the APPROVAL entry holding `id`, or -1.
+ *
+ * ⚠️ THE `kind` TEST IS WHAT KEEPS THE APPROVAL ID SPACE SEPARATE, exactly as
+ * `findTextIndex` does for bubbles and `applyReasoning`/`applyTool` do for
+ * theirs. An approval id is core's `approvalId` (`approvals.ts`'s
+ * `buildApprovalRequestPayload` copies `view.approvalId` verbatim), so it is
+ * minted by a DIFFERENT producer from every other id in this view — which is
+ * exactly why the disjointness must not be assumed. See `findTextIndex`'s
+ * docblock: the id-shape argument was tried for the other kinds and retracted,
+ * and the guards are the whole argument for all of them.
+ *
+ * Keyed by `id` ALONE, not by a pair. Unlike `tool`, whose producer id is unique
+ * only within a run, an approval id is the gateway's own approval identifier and
+ * is what the client sends back on `approval_decision`; keying it by anything
+ * else would make the durable card unaddressable by the id the reverse leg uses.
+ */
+function findApprovalIndex(view: DurableView, id: string): number {
+  return view.findIndex((m) => m.kind === "approval" && m.id === id);
+}
+
+/**
+ * `approval_request` — upsert by id: replace the payload in place if the id is
+ * held (keeping its slot), else APPEND at the tail. The append is the SLOT
+ * CLAIM, and it is why an approval belongs in the transcript at all: the card
+ * gets a POSITION between the messages it interrupted, rather than living in a
+ * side list beside them.
+ *
+ * ⚠️ A RE-DELIVERED REQUEST MUST NOT RESURRECT A DECIDED CARD. `resolvedDecision`
+ * is carried over from the entry being replaced, and the reason is not
+ * hypothetical: the client has had this exact rule since #15 (its
+ * `case "approval_request"` calls it "upsert-preserve", because a stateless
+ * register re-delivers a prompt and a fresh entry built from the frame would
+ * CLOBBER the resolution and re-enable the buttons). The durable fold needs the
+ * same rule or a replay disagrees with what live showed — N8 — in the worst
+ * possible direction, since the disagreement is about whether an action is still
+ * offered.
+ *
+ * ⚠️ CARRIED FROM `prev`, NOT MERGED FROM THE EVENT. The event has no
+ * `resolvedDecision` field at all (see `DurableEvent`'s approval arm), so there
+ * is nothing on it to lose; writing it as a spread would invite someone to add
+ * the field to the event later and reintroduce the clobber through the back
+ * door.
+ *
+ * BOTH PATHS ALLOCATE, like `applyBubble` and `applyReasoning`: a repeated
+ * identical request still returns a new array. That keeps the header's
+ * SAME-array list exhaustive without this transition contributing a row.
+ */
+function applyApproval(
+  view: DurableView,
+  event: {
+    id: string;
+    approvalKind: "exec" | "plugin";
+    title: string;
+    description?: string;
+    prompt: string;
+    options: readonly DurableApprovalOption[];
+    expiresAtMs?: number;
+  },
+): DurableView {
+  const idx = findApprovalIndex(view, event.id);
+  const prev = idx === -1 ? undefined : view[idx];
+  const carriedDecision =
+    prev !== undefined && prev.kind === "approval" && prev.resolvedDecision !== undefined
+      ? { resolvedDecision: prev.resolvedDecision }
+      : {};
+  const entry: DurableMessage = {
+    kind: "approval",
+    id: event.id,
+    approvalKind: event.approvalKind,
+    title: event.title,
+    // Each optional field is an ABSENT KEY when the frame omitted it, never an
+    // explicit `undefined` — the same rule the tool arm follows, and for the
+    // same reason: `JSON.stringify` drops an `undefined` value, so an
+    // always-present key makes the in-memory event and the one read back out of
+    // the journal structurally different objects.
+    ...(event.description !== undefined ? { description: event.description } : {}),
+    prompt: event.prompt,
+    options: event.options,
+    ...(event.expiresAtMs !== undefined ? { expiresAtMs: event.expiresAtMs } : {}),
+    ...carriedDecision,
+  };
+  if (idx === -1) return [...view, entry];
+  const next = view.slice();
+  next[idx] = entry;
+  return next;
+}
+
+/**
+ * `approval_resolved` — record the decision on the card it names.
+ *
+ * ⚠️ AN UNMATCHED RESOLUTION IS A NO-OP, AND IT RETURNS THE INPUT ARRAY BY
+ * REFERENCE (a fourth row for the header's exhaustive SAME-array list). The
+ * alternative — appending a card built from the resolution alone — would be
+ * INVENTING a message: the resolution frame carries an id and a decision and no
+ * content at all, so the "card" would have no title, no prompt and no options.
+ * That is the server-side invention N8 forbids.
+ *
+ * ⚠️ AND IT IS UNREACHABLE IN A FULL REPLAY, WHICH IS WHY THE NO-OP IS SAFE
+ * RATHER THAN LOSSY. The resolution is only ever published for an approval this
+ * plugin already delivered — `approvals.ts`'s `updateEntry` fires off the entry
+ * that `deliverPending` returned — and both frames go out through the SAME
+ * `sendToPeer` funnel, so the request row precedes the resolution row in the
+ * one ordered stream. `projectJournalHistory` folds the WHOLE journal before it
+ * pages (see `historyTail`/`pageBefore`, which slice the projected MESSAGES),
+ * so a page boundary cannot separate them either. The reachable case is a
+ * client applying a live `approval_resolved` for a card it never received —
+ * which is exactly today's behaviour (`patchApproval` maps over the array and
+ * matches nothing).
+ */
+function applyApprovalResolution(
+  view: DurableView,
+  event: { id: string; decision: DurableApprovalDecision },
+): DurableView {
+  const idx = findApprovalIndex(view, event.id);
+  if (idx === -1) return view;
+  const prev = view[idx];
+  // `prev.kind !== "approval"` CANNOT fire — `findApprovalIndex`'s predicate
+  // already decided it, and TS cannot carry a `findIndex` callback's narrowing
+  // to the element. Same shape and same reason as `applyPlacement`'s.
+  if (prev.kind !== "approval") return view;
+  const next = view.slice();
+  next[idx] = { ...prev, resolvedDecision: event.decision };
+  return next;
+}
+
+/**
  * `turn_snapshot` reconciliation — the ONE implementation. The wrapper's
  * `applyTurnSnapshot` is now only the
  * frame→event mapper that feeds this. The contract is EXPLICIT (never a blanket
@@ -1099,6 +1365,17 @@ type ClientTranscriptEntry =
       status?: string;
       summary?: string;
       argKeys?: readonly string[];
+    }
+  | {
+      kind: "approval";
+      id: string;
+      approvalKind: "exec" | "plugin";
+      title: string;
+      description?: string;
+      prompt: string;
+      options: readonly DurableApprovalOption[];
+      expiresAtMs?: number;
+      resolvedDecision?: DurableApprovalDecision;
     };
 
 /**
@@ -1143,6 +1420,36 @@ export function projectDurable(messages: ClientTranscriptEntry[]): DurableView {
         ...(m.status !== undefined ? { status: m.status } : {}),
         ...(m.summary !== undefined ? { summary: m.summary } : {}),
         ...(m.argKeys !== undefined ? { argKeys: m.argKeys } : {}),
+      };
+    }
+    // ⚠️ #242 half 4: THE APPROVAL'S `resolvedDecision` IS CARRIED, AND IT IS THE
+    // ONE FIELD THAT MAKES THIS A ROUND TRIP RATHER THAN A COPY. The wrapper
+    // recomputes `mergeDurable(projectDurableFromClient(state.messages) + one
+    // event)` on every durable frame, so a projection that dropped the decision
+    // would UN-RESOLVE every decided card on the next unrelated frame — the
+    // exact resurrect-the-buttons failure `applyApproval`'s upsert-preserve
+    // exists to prevent, arriving through the back door.
+    //
+    // ⚠️ AND `decide()`'s OPTIMISTIC DECISION RIDES THIS SAME FIELD, ON PURPOSE.
+    // The client writes its local guess into the entry's `resolvedDecision`, so
+    // this projection reads it back as durable — which is correct HERE, because
+    // this view is local and is never journaled (the plugin builds its own
+    // events from wire frames at `journalEventForOutbound`). What separates the
+    // guess from the server's answer is `resolutionConfirmed`, which is
+    // client-local and deliberately not projected.
+    if (m.kind === "approval") {
+      return {
+        kind: "approval",
+        id: m.id,
+        approvalKind: m.approvalKind,
+        title: m.title,
+        ...(m.description !== undefined ? { description: m.description } : {}),
+        prompt: m.prompt,
+        options: m.options,
+        ...(m.expiresAtMs !== undefined ? { expiresAtMs: m.expiresAtMs } : {}),
+        ...(m.resolvedDecision !== undefined
+          ? { resolvedDecision: m.resolvedDecision }
+          : {}),
       };
     }
     return {
@@ -1195,7 +1502,10 @@ export function projectDurableFromClient(
       // made this a COMPILE ERROR rather than a silent one: `m.draftOnly` does
       // not exist on the tool arm, so the narrowing had to be made explicit here
       // instead of leaning on "everything that is not reasoning is a bubble".
-      if (m.kind === "reasoning" || m.kind === "tool") return m;
+      // Half 4's approval arm joins them for the same reason: an approval card
+      // is authored once and never streams a draft, so it has no `draftOnly`
+      // field and nothing here to blank.
+      if (m.kind === "reasoning" || m.kind === "tool" || m.kind === "approval") return m;
       return m.draftOnly === true ? { ...m, text: "" } : m;
     }),
   );

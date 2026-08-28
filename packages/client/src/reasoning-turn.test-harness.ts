@@ -245,3 +245,124 @@ export const TOOL_TURN_ROWS: readonly (ToolTurnRow | { id: string; role: "user" 
   },
   { id: "A", role: "agent", text: "the answer" },
 ];
+
+/**
+ * ── FIXTURE D: THE APPROVAL TURN (#242 half 4) ──
+ *
+ * ⚠️ THIS FIXTURE PINS THE PROPERTY THE SLICE IS FOR: an approval REQUESTED and
+ * RESOLVED live, then REPLAYED from the journal, produces the same view — same
+ * content, same state, same position. Like the three above it is imported by
+ * BOTH packages (`durable-view-reducer.test.ts` drives the real wrapper,
+ * `journal-history.test.ts` drives the real `journalEventForOutbound` and the
+ * real projection), so editing it turns tests red on both sides instead of
+ * letting two hand-written literals drift.
+ *
+ * ⚠️ THE APPROVAL IS **TWO** FRAMES FOLDED INTO **ONE** ROW, and that is the one
+ * design decision in this slice. The request and the resolution are journaled as
+ * two APPEND-ONLY events; nothing is edited, so the mutation model #241 owns was
+ * never needed. The expected row below carries fields from both frames — the
+ * payload from the request, `resolvedDecision` from the resolution — which is
+ * what makes a one-event design (or a lost fold) fail rather than pass quietly.
+ *
+ * ⚠️ THE REQUEST STRADDLES THE ANSWER'S `progress` ON PURPOSE. The prompt
+ * arrives BEFORE the lane claims its slot and is resolved AFTER, so the fixture
+ * also pins that a card holds the position of its REQUEST rather than drifting
+ * to where it was decided — the same claim `TOOL_TURN_FRAMES` makes for a call,
+ * and the one a fold keyed off the resolution would get wrong.
+ *
+ * ⚠️ IT SAYS NOTHING ABOUT INTERACTIVITY, AND THAT IS DELIBERATE. Whether a
+ * replayed card may be clicked is CLIENT-LOCAL state (`actionable`) that is
+ * never journaled and never on the history wire, so it cannot belong to a
+ * fixture both packages assert against. The client suite owns that property.
+ */
+export const APPROVAL_TURN = "turn-3";
+
+/** One outbound approval wire frame, in the shape both sides speak. */
+export type ApprovalTurnFrame =
+  | {
+      type: "approval_request";
+      id: string;
+      kind: "exec" | "plugin";
+      title: string;
+      description?: string;
+      prompt: string;
+      options: ReadonlyArray<{ decision: string; label: string; style: string }>;
+      expiresAtMs?: number;
+    }
+  | { type: "approval_resolved"; id: string; decision: string };
+
+/**
+ * A durable approval row a replay must serve, WITHOUT `ts` — same reason
+ * `ReasoningTurnRow` omits it: `ts` is a projection concern the plugin sources
+ * from journal row timestamps, and the plugin test asserts it separately.
+ *
+ * Note `approvalKind`, not `kind`: the payload's own kind is renamed at every
+ * layer because `kind` is the row union's discriminant.
+ */
+export type ApprovalTurnRow = {
+  kind: "approval";
+  id: string;
+  approvalKind: "exec" | "plugin";
+  title: string;
+  description?: string;
+  prompt: string;
+  options: ReadonlyArray<{ decision: string; label: string; style: string }>;
+  expiresAtMs?: number;
+  resolvedDecision?: string;
+};
+
+/**
+ * A turn with ONE approval prompt spanning two frames and ONE answer, with the
+ * answer's lane claiming its slot BETWEEN them.
+ */
+export const APPROVAL_TURN_FRAMES: readonly (ApprovalTurnFrame | ReasoningTurnFrame)[] = [
+  {
+    type: "approval_request",
+    id: "ap-1",
+    kind: "exec",
+    title: "Run a command",
+    description: "The agent wants to run a shell command.",
+    prompt: "Run a command: rm -rf /tmp/scratch",
+    options: [
+      { decision: "allow-once", label: "Allow once", style: "success" },
+      { decision: "deny", label: "Deny", style: "danger" },
+    ],
+    expiresAtMs: 1_900_000_000_000,
+  },
+  { type: "progress", id: "A", turnId: APPROVAL_TURN, text: "Working…" },
+  { type: "approval_resolved", id: "ap-1", decision: "allow-once" },
+  { type: "agent_message", id: "A", turnId: APPROVAL_TURN, text: "the answer" },
+];
+
+/**
+ * What BOTH a live render and a replay of `APPROVAL_TURN_FRAMES` must produce.
+ *
+ * ⚠️ THE CARD COMES FIRST, BEFORE THE ANSWER — the position claim. The request
+ * preceded `progress A`, so the fold appends it ahead of A's slot on BOTH sides.
+ * A design that placed the card where it was RESOLVED would put it after.
+ *
+ * ⚠️ AND IT CARRIES `resolvedDecision` — the state claim. Live showed the card
+ * decided; history must not hide that (N8/N10). A projection that served only
+ * the request row would produce a card reading "pending" for a command the user
+ * approved, which is the worst direction this slice could fail in.
+ */
+export const APPROVAL_TURN_ROWS: readonly (
+  | ApprovalTurnRow
+  | { id: string; role: "user" | "agent"; text: string }
+)[] = [
+  {
+    kind: "approval",
+    id: "ap-1",
+    approvalKind: "exec",
+    title: "Run a command",
+    description: "The agent wants to run a shell command.",
+    prompt: "Run a command: rm -rf /tmp/scratch",
+    options: [
+      { decision: "allow-once", label: "Allow once", style: "success" },
+      { decision: "deny", label: "Deny", style: "danger" },
+    ],
+    expiresAtMs: 1_900_000_000_000,
+    resolvedDecision: "allow-once",
+  },
+  { id: "A", role: "agent", text: "the answer" },
+];

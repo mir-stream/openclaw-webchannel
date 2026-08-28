@@ -18,6 +18,7 @@ import type {
   Listener,
   ApprovalDecision,
   ApprovalOption,
+  ChatApprovalMessage,
   ChatBubble,
   ChatMessage,
   ChatReasoningMessage,
@@ -151,14 +152,18 @@ type DurableLocalOverlay = Record<string, Partial<ChatBubble>>;
 /**
  * What a state mutation may carry.
  *
- * ⚠️ `reasoning` (#242 half 2) AND `toolActivity` (half 3) ARE EXCLUDED AT THE
- * TYPE LEVEL, and that exclusion IS the "one source of truth" guarantee. Both
- * fields are DERIVED from `state.messages` by `nextStateFrom` below; a patch that
- * could also set one would let the two disagree, which is the whole defect class
- * these slices close. Writing `setState({ reasoning: … })` or
- * `setState({ toolActivity: … })` is a compile error, not a convention.
+ * ⚠️ `reasoning` (#242 half 2), `toolActivity` (half 3) AND `approvals` (half 4)
+ * ARE EXCLUDED AT THE TYPE LEVEL, and that exclusion IS the "one source of truth"
+ * guarantee. All three are DERIVED from `state.messages` by `nextStateFrom`
+ * below; a patch that could also set one would let the two disagree, which is the
+ * whole defect class these slices close. Writing `setState({ reasoning: … })`,
+ * `setState({ toolActivity: … })` or `setState({ approvals: … })` is a compile
+ * error, not a convention.
  */
-type StatePatch = Omit<Partial<InitializedWebChannelState>, "reasoning" | "toolActivity">;
+type StatePatch = Omit<
+  Partial<InitializedWebChannelState>,
+  "reasoning" | "toolActivity" | "approvals"
+>;
 
 /**
  * The reasoning bursts inside a transcript, in transcript order — what
@@ -212,6 +217,143 @@ function deriveToolActivity(messages: readonly ChatMessage[]): ToolActivityItem[
 }
 
 /**
+ * The approval cards inside a transcript, in transcript order — what
+ * `state.approvals` exposes (#242 half 4).
+ *
+ * ⚠️ `actionable` IS RECOMPUTED HERE, NOT COPIED, AND THAT IS THE ONE PLACE THE
+ * TWO CONDITIONS MEET. A card is offered to the embedder as actionable only when
+ * BOTH hold:
+ *   1. this device was told it is still open — `entry.actionable === true`, set
+ *      ONLY by a live `approval_request` or by an `approval_snapshot` that lists
+ *      the id as pending, and therefore ABSENT on anything replayed from
+ *      `history`; and
+ *   2. it is not resolved — no server decision, no optimistic local decision,
+ *      no `resolvedElsewhere` sentinel.
+ *
+ * Deriving (2) rather than clearing the bit at each resolution site is
+ * deliberate: there are four sites that can resolve a card (the live
+ * `approval_resolved` frame, `decide()`, and two snapshot legs), and a rule that
+ * each of them must remember to also clear a flag is a rule one of them will
+ * eventually forget. One expression cannot be forgotten. `isActionableApproval`
+ * is that expression, and `decide()` enforces the same one.
+ *
+ * ⚠️ THE `"unknown"` SENTINEL IS RE-COMPOSED HERE TOO. It is not a decision, so
+ * it is not stored in `resolvedDecision` (see `ChatApprovalMessage`); the entry
+ * carries `resolvedElsewhere` and this is where the public shape #15 defined
+ * gets its value back. Only when there is no real decision — a confirmed real
+ * outcome, from a snapshot's `resolved` list, must not be downgraded to the
+ * sentinel.
+ *
+ * ⚠️ NO CAP, the same position `deriveReasoning`/`deriveToolActivity` take, and
+ * for the same reasons: a live cap over an uncapped durable view is exactly the
+ * live≠history divergence this slice closes, and retention belongs at the store
+ * (**#299**, client-side twin **#310**).
+ */
+/**
+ * May this device offer decision buttons for this approval entry? ONE
+ * definition, shared by `deriveApprovals` (what the embedder sees) and by
+ * `decide()` (what the API will actually send) — so the button the UI draws and
+ * the call the UI makes can never disagree about the same card.
+ *
+ * BOTH conjuncts are load-bearing and they answer different questions:
+ * `actionable` is "is this card still OPEN as far as the live session knows"
+ * (absent on anything replayed from `history`), and the resolution tests are "has
+ * it already been answered" (by the server, by this device optimistically, or by
+ * another device per `approval_snapshot`'s Leg B).
+ */
+/**
+ * Is this UNVALIDATED wire value one of the three real approval decisions?
+ *
+ * ⚠️ IT DELIBERATELY REJECTS `"unknown"`. That is the client's own resolution
+ * SENTINEL (#15 — "answered while this device wasn't looking"), produced only by
+ * `approval_snapshot`'s Leg B and stored as `resolvedElsewhere`, never as a
+ * decision. Nothing on the server can journal it, so a `history` row carrying
+ * one is either a forged frame or a future meaning this build does not have;
+ * either way, admitting it would render a resolution that never happened.
+ */
+function isApprovalDecision(value: unknown): value is ApprovalDecision {
+  return value === "allow-once" || value === "allow-always" || value === "deny";
+}
+
+function isActionableApproval(entry: ChatApprovalMessage): boolean {
+  return (
+    entry.actionable === true &&
+    entry.resolvedDecision === undefined &&
+    entry.resolvedElsewhere !== true
+  );
+}
+
+/**
+ * Mark ONE approval entry actionable — the only door through which a card
+ * becomes clickable (#242 half 4).
+ *
+ * Two callers, both of which are an authority for "this card is open RIGHT NOW":
+ * the live `approval_request` frame, and `approval_snapshot`'s still-pending
+ * listing. `case "history"` deliberately does NOT call it, which is what makes a
+ * replayed card inert.
+ *
+ * Returns the input array by reference when the bit is already set, so a
+ * re-delivered request does not churn `state.messages`.
+ */
+function markApprovalActionable(messages: ChatMessage[], id: string): ChatMessage[] {
+  let changed = false;
+  const next = messages.map((m) => {
+    if (m.kind !== "approval" || m.id !== id || m.actionable === true) return m;
+    changed = true;
+    return { ...m, actionable: true };
+  });
+  return changed ? next : messages;
+}
+
+/**
+ * Mark ONE approval entry's resolution SERVER-CONFIRMED — the client-local half
+ * of an `approval_resolved` frame (the decision itself is durable and is folded
+ * by the reducer).
+ *
+ * Confirmed means the snapshot reconciler treats the card as authoritative: it
+ * never re-sends the decision as lost (Leg C) and never downgrades it to the
+ * `"unknown"` sentinel (Leg B). Returns the input array by reference when the
+ * bit is already set.
+ */
+function markApprovalConfirmed(messages: ChatMessage[], id: string): ChatMessage[] {
+  let changed = false;
+  const next = messages.map((m) => {
+    if (m.kind !== "approval" || m.id !== id || m.resolutionConfirmed === true) return m;
+    changed = true;
+    return { ...m, resolutionConfirmed: true };
+  });
+  return changed ? next : messages;
+}
+
+function deriveApprovals(messages: readonly ChatMessage[]): ApprovalRequest[] {
+  const out: ApprovalRequest[] = [];
+  for (const m of messages) {
+    if (m.kind !== "approval") continue;
+    const resolvedDecision: ApprovalDecision | "unknown" | undefined =
+      m.resolvedDecision ?? (m.resolvedElsewhere === true ? "unknown" : undefined);
+    out.push({
+      id: m.id,
+      kind: m.approvalKind,
+      title: m.title,
+      ...(m.description !== undefined ? { description: m.description } : {}),
+      prompt: m.prompt,
+      // A fresh array: `ApprovalRequest.options` is a MUTABLE `ApprovalOption[]`
+      // in the public type while the entry holds a `readonly` one, and handing
+      // the entry's own array out would let an embedder mutate a transcript
+      // entry the reducer shares by reference.
+      options: m.options.map((o) => ({ ...o })),
+      ...(m.expiresAtMs !== undefined ? { expiresAtMs: m.expiresAtMs } : {}),
+      ...(resolvedDecision !== undefined ? { resolvedDecision } : {}),
+      ...(m.resolutionConfirmed !== undefined
+        ? { resolutionConfirmed: m.resolutionConfirmed }
+        : {}),
+      actionable: isActionableApproval(m),
+    });
+  }
+  return out;
+}
+
+/**
  * Apply one patch and recompute every DERIVED field.
  *
  * The derivation is conditional on `messages` being in the patch, so
@@ -242,6 +384,7 @@ function nextStateFrom(
   if (patch.messages !== undefined) {
     next.reasoning = deriveReasoning(patch.messages);
     next.toolActivity = deriveToolActivity(patch.messages);
+    next.approvals = deriveApprovals(patch.messages);
   }
   return next;
 }
@@ -250,8 +393,11 @@ function nextStateFrom(
  * THE KIND-SCOPED IDENTITY OF ONE TRANSCRIPT ENTRY — one definition, every
  * index, BOTH the local entry and the wire row (#242 half 3).
  *
- * ⚠️ THIS EXISTS BECAUSE THE COPY-PASTE ENDS HERE. `state.messages` holds three
- * kinds now and will hold four (#242 half 4's approvals). Half 2 shipped THREE
+ * ⚠️ THIS EXISTS BECAUSE THE COPY-PASTE ENDS HERE. `state.messages` holds FOUR
+ * kinds since #242 half 4 added approvals — and the device did its job on the
+ * way in: adding the arm below turned every call site red until it was handled,
+ * which is exactly what the two-way inline key it replaced could not do. Half 2
+ * shipped THREE
  * separate defects of one shape — an id-keyed index over a mixed array — and its
  * conclusion is the rule this function enforces mechanically rather than by
  * memory: NEVER KEY A MIXED TRANSCRIPT BY ID ALONE. The two id spaces are not
@@ -291,7 +437,8 @@ function nextStateFrom(
 type KeyedTranscriptEntry =
   | { kind?: undefined; id: string }
   | { kind: "reasoning"; id: string }
-  | { kind: "tool"; id: string; turnId: string };
+  | { kind: "tool"; id: string; turnId: string }
+  | { kind: "approval"; id: string };
 
 function transcriptEntryKey(entry: KeyedTranscriptEntry): string {
   switch (entry.kind) {
@@ -301,6 +448,12 @@ function transcriptEntryKey(entry: KeyedTranscriptEntry): string {
       return `r\0${entry.id}`;
     case "tool":
       return `x\0${toolEntryKey(entry.turnId, entry.id)}`;
+    // #242 half 4. Keyed by `id` alone, like the first two and unlike `tool`:
+    // an approval id is the gateway's own `approvalId` (the value the client
+    // sends back on `approval_decision`), so it is the whole identity and there
+    // is no second field to compose.
+    case "approval":
+      return `p\0${entry.id}`;
     default: {
       const unhandled: never = entry;
       void unhandled;
@@ -317,8 +470,8 @@ function transcriptEntryKey(entry: KeyedTranscriptEntry): string {
  * TYPE (#242 half 3).
  *
  * ⚠️ ONE INDEX, NOT ONE MAP PER KIND BOLTED ON AS KINDS ARRIVE. `mergeDurable`
- * used to build `prevBubbleById` and `prevReasoningById` side by side; tool would
- * have made three and half 4's approvals four, with every call site needing to
+ * used to build `prevBubbleById` and `prevReasoningById` side by side; tool made
+ * three and half 4's approvals four, with every call site needing to
  * remember which map to reach into. The record below is built by ONE exhaustive
  * switch, so adding a kind is two compile errors — a missing field on
  * `TranscriptIndex` and an unhandled arm here — instead of a map somebody forgot
@@ -335,6 +488,7 @@ type TranscriptIndex = {
   bubble: Map<string, ChatBubble>;
   reasoning: Map<string, ChatReasoningMessage>;
   tool: Map<string, ChatToolMessage>;
+  approval: Map<string, ChatApprovalMessage>;
 };
 
 function indexTranscriptByKind(messages: readonly ChatMessage[]): TranscriptIndex {
@@ -342,6 +496,7 @@ function indexTranscriptByKind(messages: readonly ChatMessage[]): TranscriptInde
     bubble: new Map(),
     reasoning: new Map(),
     tool: new Map(),
+    approval: new Map(),
   };
   for (const m of messages) {
     switch (m.kind) {
@@ -353,6 +508,9 @@ function indexTranscriptByKind(messages: readonly ChatMessage[]): TranscriptInde
         break;
       case "tool":
         index.tool.set(toolEntryKey(m.turnId, m.id), m);
+        break;
+      case "approval":
+        index.approval.set(m.id, m);
         break;
       default: {
         const unhandled: never = m;
@@ -2016,19 +2174,72 @@ export class WebChannelNATSClient {
     this.maybeRelease();
   }
 
-  /** Send approval decision */
+  /**
+   * Send approval decision.
+   *
+   * ⚠️ #242 half 4: A CARD THIS DEVICE HOLDS AND KNOWS IS NOT ACTIONABLE IS
+   * REFUSED HERE, NOT ONLY GREYED OUT IN A RENDERER. Approvals became durable
+   * messages in this slice, so a REPLAYED card sits in the transcript looking
+   * exactly like a live one — unresolved as far as the durable stream records,
+   * while it may have expired or been decided elsewhere since. Sending a
+   * decision for it means answering a question nobody is waiting for. The
+   * renderer is the wrong and only place to enforce that: an embedder writes its
+   * own renderer, and the shipped demo used to key its buttons purely off
+   * `resolvedDecision !== undefined` — which a replayed pending card satisfies.
+   * `isActionableApproval` is the same predicate `state.approvals` reports, so
+   * the button and the call agree by construction.
+   *
+   * ⚠️ AN UNKNOWN ID IS STILL SENT, AND THAT ASYMMETRY IS DELIBERATE. This
+   * refuses only what it can PROVE stale. A card this client never held carries
+   * no evidence either way — an embedder answering out of band is the documented
+   * behaviour and the wrapper has no basis to override it — so the operation
+   * goes out exactly as before. (It is also unreachable from a UI: nothing
+   * renders a card that is not in `state.approvals`.)
+   *
+   * ⚠️ THE `setState` IS UNCONDITIONAL ON PURPOSE. It fires even when the
+   * optimistic mark changes nothing, because that has always been true here
+   * (`patchApproval` mapped and committed regardless) and the replacement-FIFO
+   * ordering depends on it: a state listener may synchronously raise another
+   * outbound operation, and it must land BEHIND the decision reserved above.
+   */
   decide(id: string, decision: ApprovalDecision): void {
+    const held = this.state.messages.find(
+      (m): m is ChatApprovalMessage => m.kind === "approval" && m.id === id,
+    );
+    if (held !== undefined && !isActionableApproval(held)) return;
     const operation = { kind: "approval-decision", id, decision } as const;
     // In a replacement transaction, reserve the decision's FIFO position before
     // optimistic UI fanout. A state listener may synchronously emit another
     // outbound operation; it belongs behind this already-invoked decision.
     const deferred = this.deferReplacementOperation(operation);
-    this.patchApproval(id, (a) =>
-      a.resolvedDecision === undefined
-        ? { ...a, resolvedDecision: decision }
-        : a,
-    );
+    this.setState({ messages: this.optimisticApprovalDecision(id, decision) });
     if (!deferred) this.deferOrRunReplacementOperation(operation);
+  }
+
+  /**
+   * Record `decide()`'s OPTIMISTIC decision on the card, leaving
+   * `resolutionConfirmed` falsy so `approval_snapshot`'s Leg C can detect a lost
+   * decision frame and re-send it (#15).
+   *
+   * It rides `resolvedDecision`, the same field the server's answer folds into,
+   * because that is what makes the card stop offering buttons immediately — and
+   * because `projectDurable` carries the field, the guess survives the next
+   * unrelated durable frame instead of being re-projected away. Nothing local
+   * is ever journaled; the plugin builds its own events from wire frames.
+   *
+   * Returns the input array by reference when no card matched.
+   */
+  private optimisticApprovalDecision(
+    id: string,
+    decision: ApprovalDecision,
+  ): ChatMessage[] {
+    let changed = false;
+    const next = this.state.messages.map((m) => {
+      if (m.kind !== "approval" || m.id !== id) return m;
+      changed = true;
+      return { ...m, resolvedDecision: decision };
+    });
+    return changed ? next : this.state.messages;
   }
 
   /**
@@ -2230,10 +2441,18 @@ export class WebChannelNATSClient {
    *  5. an id in `prev` but absent from the view is dropped — that is `seal`'s
    *     `remove` working as designed.
    *
-   * ⚠️ RULES 1-4 ARE ABOUT BUBBLES. A `kind: "reasoning"` entry takes the short
-   * branch at the top of the loop: it has no overlay to lay on (rule 1/3), no
-   * `draftOnly` carve-out (rule 2) and no spent-draft state (rule 4). Rule 5 and
-   * the reference-reuse guarantee below apply to it unchanged. #242 half 2.
+   * ⚠️ RULES 1-4 ARE ABOUT BUBBLES. A `kind: "reasoning"` or `kind: "tool"`
+   * entry takes a short branch at the top of the loop: it has no `local[id]`
+   * overlay to lay on (rule 1/3), no `draftOnly` carve-out (rule 2) and no
+   * spent-draft state (rule 4). Rule 5 and the reference-reuse guarantee below
+   * apply to it unchanged. #242 half 2 / half 3.
+   *
+   * ⚠️ AN APPROVAL ENTRY IS THE ONE TAGGED ARM THAT PARTIALLY BREAKS THAT — read
+   * its branch before assuming "tagged ⇒ no client state". It takes no
+   * `local[id]` overlay either, but it DOES carry client-local fields
+   * (`actionable`, `resolutionConfirmed`, `resolvedElsewhere`) that must be
+   * inherited from `prev` exactly the way rule 1 inherits a bubble's overlay.
+   * #242 half 4.
    *
    * Entries whose emitted fields are unchanged are returned BY REFERENCE. That
    * is required, not an optimization: `nats-client-wrapper.test.ts` asserts
@@ -2337,6 +2556,55 @@ export class WebChannelNATSClient {
           prevTool !== undefined && sameChatMessage(prevTool, nextTool)
             ? prevTool
             : nextTool,
+        );
+        continue;
+      }
+      // ⚠️ #242 half 4: AN APPROVAL ENTRY CARRIES A CLIENT-LOCAL OVERLAY THAT
+      // THE OTHER TWO TAGGED ARMS DO NOT, AND LOSING IT IS THE SAFETY BUG. Three
+      // fields are inherited from `prev` rather than rebuilt: `actionable` (may
+      // this device offer buttons — absent means NO, and rebuilding without it
+      // would silently disarm a live card on the next unrelated frame),
+      // `resolutionConfirmed` and `resolvedElsewhere` (the #15 pair that tells a
+      // server answer from `decide()`'s optimistic one), plus the hydration `ts`
+      // the other arms also inherit.
+      //
+      // ⚠️ THE INHERITANCE RUNS ONE WAY ONLY. `resolvedDecision` comes from the
+      // VIEW, never from `prev`: it is durable state, the reducer owns it, and
+      // `applyApproval`'s upsert-preserve is what keeps a re-delivered request
+      // from clearing it. Taking it from `prev` here would be a second copy of
+      // that rule, in a different module, free to drift.
+      if (entry.kind === "approval") {
+        const prevApproval = prevByKind.approval.get(entry.id);
+        const nextApproval: ChatApprovalMessage = {
+          kind: "approval",
+          id: entry.id,
+          approvalKind: entry.approvalKind,
+          title: entry.title,
+          ...(entry.description !== undefined ? { description: entry.description } : {}),
+          prompt: entry.prompt,
+          options: entry.options,
+          ...(entry.expiresAtMs !== undefined ? { expiresAtMs: entry.expiresAtMs } : {}),
+          ...(entry.resolvedDecision !== undefined
+            ? { resolvedDecision: entry.resolvedDecision }
+            : {}),
+        };
+        // Assigned rather than written in the literal, exactly as the two
+        // branches below do: an own `…: undefined` key would fail
+        // `sameChatMessage`'s key-count check and defeat the identity reuse.
+        if (prevApproval?.actionable !== undefined) {
+          nextApproval.actionable = prevApproval.actionable;
+        }
+        if (prevApproval?.resolutionConfirmed !== undefined) {
+          nextApproval.resolutionConfirmed = prevApproval.resolutionConfirmed;
+        }
+        if (prevApproval?.resolvedElsewhere !== undefined) {
+          nextApproval.resolvedElsewhere = prevApproval.resolvedElsewhere;
+        }
+        if (prevApproval?.ts !== undefined) nextApproval.ts = prevApproval.ts;
+        out.push(
+          prevApproval !== undefined && sameChatMessage(prevApproval, nextApproval)
+            ? prevApproval
+            : nextApproval,
         );
         continue;
       }
@@ -2477,14 +2745,15 @@ export class WebChannelNATSClient {
   // `WebChannelState.toolActivity` for the honest version of what that does and
   // does not close.
 
-  private patchApproval(
-    id: string,
-    update: (prev: ApprovalRequest) => ApprovalRequest,
-  ): void {
-    this.setState({
-      approvals: this.state.approvals.map((a) => (a.id === id ? update(a) : a)),
-    });
-  }
+  // ⚠️ `patchApproval` IS GONE (#242 half 4). It mapped over `state.approvals`
+  // as an independently maintained side array — a second opinion about which
+  // approvals a conversation contains and, since that array had no transcript
+  // position at all, about where they sit. An approval is a DURABLE MESSAGE now:
+  // `case "approval_request"`/`case "approval_resolved"` route through
+  // `applyDurable`, `durable-view-reducer.ts` performs the ONE fold, and
+  // `state.approvals` is derived from `state.messages` by `deriveApprovals`.
+  // `StatePatch` excludes `approvals` so a `setState({approvals})` regression is
+  // a compile error rather than a divergence.
 
   private uid(): string {
     return `${this.seq++}`;
@@ -3119,6 +3388,84 @@ export class WebChannelNATSClient {
             inserts.set(cursor, atCursorTool);
             continue;
           }
+          /**
+           * ⚠️ #242 half 4: AN APPROVAL ROW TAKES TIER 1 OR A FRESH INSERT, and
+           * it MUST sit above the `text` guard for the same reason the tool
+           * branch does — an approval row carries no `text` at all (its content
+           * is the title/prompt/options surface), so below the guard every one
+           * of them would be dropped while live rendered them (N10, and an N8
+           * live≠history gap).
+           *
+           * The four properties in the reasoning branch's docblock carry over
+           * unchanged: tier 1 is the normal outcome (an approval id is the
+           * gateway's `approvalId`, identical live and in the projection); tier
+           * 2 cannot reach it (gated `if (m.role === "user")`, and the pool is
+           * seeded only from `isAdoptableUserEcho`); a miss fresh-inserts at the
+           * cursor; and tier 1 can only match an entry of this row's own kind,
+           * because `transcriptEntryKey` keys by (kind, id).
+           *
+           * ⚠️ AND THE ROW IS INSERTED WITHOUT `actionable` — THAT IS THE POINT
+           * OF THE WHOLE SLICE, NOT AN OMISSION. A card rebuilt here is a
+           * REPLAY: the durable stream may record it as still pending while it
+           * has since expired or been decided on another device, and a click
+           * would send a decision nobody is waiting for. It renders inert until
+           * a register-time `approval_snapshot` lists it as pending again, which
+           * is the one authority for "still open". Do not "restore" the bit here
+           * to make a reloaded card usable; the snapshot already does that, on
+           * every register, and it does it from the server's own pending set.
+           *
+           * `resolvedDecision` IS adopted from the row, because live showed the
+           * decided card with its outcome and history must not hide it (N8/N10).
+           * It is validated against the three real decisions rather than trusted:
+           * these values come off the wire unvalidated, and the client's
+           * `"unknown"` sentinel must never enter through this door — it is a
+           * local reconciliation outcome, and a server that sent one would be
+           * asserting a resolution that never happened.
+           */
+          if (m.kind === "approval") {
+            const key = transcriptEntryKey({ kind: "approval", id: m.id });
+            if (seen.has(key)) {
+              const li = localIndexByKey.get(key);
+              if (li !== undefined) {
+                cursor = li + 1;
+                claimed.add(li);
+              }
+              continue;
+            }
+            seen.add(key);
+            const atCursorApproval = inserts.get(cursor) ?? [];
+            atCursorApproval.push({
+              kind: "approval",
+              id: m.id,
+              approvalKind: m.approvalKind === "plugin" ? "plugin" : "exec",
+              title: typeof m.title === "string" ? m.title : "",
+              ...(typeof m.description === "string" ? { description: m.description } : {}),
+              prompt: typeof m.prompt === "string" ? m.prompt : "",
+              options: Array.isArray(m.options)
+                ? (m.options as ApprovalOption[])
+                : [],
+              ...(typeof m.expiresAtMs === "number" ? { expiresAtMs: m.expiresAtMs } : {}),
+              // ⚠️ A SERVED DECISION IS SERVER-CONFIRMED BY CONSTRUCTION, and
+              // saying so here is not decoration — it is what stops a replayed
+              // card RE-SENDING a decision. The only producer of an
+              // `approvalResolution` row is an `approval_resolved` frame the
+              // plugin itself published, so a decision that came out of the
+              // journal is by definition the server's own answer, never
+              // `decide()`'s optimistic guess. Leaving the flag off would make
+              // the next `approval_snapshot` that still lists the card as
+              // pending (stale by milliseconds, or a server that never erased
+              // it) take Leg C and re-send a decision this device never made.
+              // It is also the one field that made the live and replayed cards
+              // differ — measured, not predicted: the both-sides test went red
+              // on exactly this key.
+              ...(isApprovalDecision(m.resolvedDecision)
+                ? { resolvedDecision: m.resolvedDecision, resolutionConfirmed: true }
+                : {}),
+              ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
+            });
+            inserts.set(cursor, atCursorApproval);
+            continue;
+          }
           if (typeof m.text !== "string") continue;
           /**
            * ⚠️ #242 half 2: A REASONING ROW TAKES TIER 1 OR A FRESH INSERT, AND
@@ -3310,56 +3657,62 @@ export class WebChannelNATSClient {
       }
 
       case "approval_request": {
-        const req: ApprovalRequest = {
-          id: msg.id ?? "",
-          kind: msg.kind ?? "exec",
+        // ⚠️ #242 half 4: AN id-LESS FRAME IS NOW REFUSED, AND THAT IS A
+        // DELIBERATE (SMALL) BEHAVIOUR CHANGE. This used to build a card under
+        // `id: msg.id ?? ""`. `journalEventForOutbound` refuses an empty id
+        // (`isUsableMessageId`, the one definition of "id-less" the whole store
+        // shares), so keeping the old default would render a card live that
+        // history can never hold — N8 in the GAINING direction, manufactured at
+        // this line. It costs nothing real: an approval id is the gateway's
+        // `approvalId` and is what `approval_decision` sends back, so a card
+        // under `""` was undecidable anyway.
+        const id = msg.id ?? "";
+        if (id.length === 0) return;
+        const merged = this.nextDurableMessages({
+          kind: "approval",
+          id,
+          approvalKind: msg.kind ?? "exec",
           title: msg.title ?? "",
-          description: msg.description,
+          ...(msg.description !== undefined ? { description: msg.description } : {}),
           prompt: msg.prompt ?? "",
           options: (msg.options ?? []) as ApprovalOption[],
-          expiresAtMs: msg.expiresAtMs,
-        };
-
-        const approvals = this.state.approvals;
-        const idx = approvals.findIndex((a) => a.id === req.id);
-
-        if (idx === -1) {
-          this.setState({
-            approvals: [...approvals, req],
-            isTyping: false,
-          });
-        } else {
-          // Upsert-preserve (#15): a re-delivered `approval_request` (stateless
-          // register, retry) rebuilds a FRESH entry from the frame, which would
-          // otherwise CLOBBER a locally-set resolution and resurrect actionable
-          // buttons for an already-decided card. Carry the existing resolution
-          // (and its server-confirmed flag) over the refreshed payload.
-          const prev = approvals[idx];
-          const next = approvals.slice();
-          next[idx] =
-            prev.resolvedDecision !== undefined
-              ? {
-                  ...req,
-                  resolvedDecision: prev.resolvedDecision,
-                  resolutionConfirmed: prev.resolutionConfirmed,
-                }
-              : req;
-          this.setState({ approvals: next, isTyping: false });
-        }
+          ...(msg.expiresAtMs !== undefined ? { expiresAtMs: msg.expiresAtMs } : {}),
+        });
+        // Upsert-preserve (#15) is NOT repeated here — `applyApproval` owns it,
+        // so a re-delivered `approval_request` (stateless register, retry)
+        // cannot clobber a resolution and resurrect the buttons. The rule lives
+        // in the shared reducer precisely so a REPLAY obeys it too.
+        //
+        // The LIVE frame is one of the two authorities for "this card is open
+        // right now", so it is also the one that (re-)arms interactivity.
+        this.setState({
+          messages: markApprovalActionable(merged, id),
+          isTyping: false,
+        });
         return;
       }
 
       case "approval_resolved": {
         const id = msg.id ?? "";
         const decision = msg.decision as ApprovalDecision | undefined;
-        // Server-confirmed resolution: set the decision AND mark it confirmed, so
-        // the snapshot reconciler treats it as authoritative (never re-sends it
-        // as a lost decision, never overwrites it with "unknown"). (#15)
-        this.patchApproval(id, (a) => ({
-          ...a,
-          resolvedDecision: decision,
-          resolutionConfirmed: true,
-        }));
+        // ⚠️ A DECISION-LESS FRAME IS REFUSED, where this used to write
+        // `resolvedDecision: undefined` alongside `resolutionConfirmed: true` —
+        // i.e. mark a card confirmed-resolved with no outcome, which no renderer
+        // can express. The wire types `decision` as an `ApprovalDecision`, so
+        // only a malformed peer produces one, and the journal mapper refuses the
+        // same shape.
+        if (id.length === 0 || decision === undefined) return;
+        // Server-confirmed resolution: the DECISION is durable state and the
+        // reducer folds it (`applyApprovalResolution`); `resolutionConfirmed` is
+        // client-local and marks it authoritative, so the snapshot reconciler
+        // never re-sends it as a lost decision (Leg C) and never downgrades it to
+        // the "unknown" sentinel (Leg B). (#15)
+        const merged = this.nextDurableMessages({
+          kind: "approvalResolution",
+          id,
+          decision,
+        });
+        this.setState({ messages: markApprovalConfirmed(merged, id) });
         return;
       }
 
@@ -3378,18 +3731,53 @@ export class WebChannelNATSClient {
         //     card the snapshot STILL lists as pending → the decision frame was
         //     lost; re-send it and keep the card resolved (every future register
         //     retries until the server confirms, so it converges hands-free).
+        //
+        // ⚠️ #242 half 4 GAVE THIS FRAME A FOURTH JOB, AND IT IS THE ONE THE
+        // SLICE EXISTS FOR: THIS IS THE ONLY THING THAT MAKES A CARD CLICKABLE
+        // AGAIN. Approvals are durable messages now, so a reconnect ALSO replays
+        // them out of `history` — and a replayed card is built without
+        // `actionable`, deliberately, because between the disconnect and now it
+        // may have expired or been decided on another device. The snapshot is
+        // exactly the authority for "what is still open", and it is emitted on
+        // EVERY successful register, unconditionally, in the same success block
+        // as the history snapshot (`nats-register.ts`'s
+        // `deps.sendApprovalSnapshot(peerId)`), so nothing has to be invented
+        // to carry that role.
+        //
+        // ⚠️ THE ARRIVAL ORDER OF `history` AND THIS FRAME IS NOT FIXED, AND
+        // BOTH ORDERS ARE HANDLED HERE. The register path calls
+        // `sendHistorySnapshot` first, but #240 half 2 made that read DEFERRED,
+        // so the approval snapshot can win the race. If the snapshot lands
+        // FIRST, Leg A inserts the card actionable and the later history row
+        // tier-1 matches it (`case "history"` walks its cursor past a match and
+        // touches nothing). If `history` lands FIRST, the card is already in the
+        // transcript and INERT — which is why the still-pending branch below
+        // RE-ARMS an existing entry instead of assuming "present ⇒ already
+        // actionable". That assumption is what the pre-half-4 code made, and it
+        // was correct only while cards could not arrive from history at all.
+        //
+        // ⚠️ THE RECONCILIATION RUNS OVER `state.messages`, NOT OVER A SIDE
+        // ARRAY. `state.approvals` is derived (`deriveApprovals`), so a card's
+        // transcript POSITION is preserved by every leg below: each patched
+        // entry is rebuilt in place, and only Leg A appends.
         const incoming = Array.isArray(msg.approvals) ? msg.approvals : [];
-        const snapshotById = new Map<string, ApprovalRequest>();
+        const snapshotById = new Map<string, ChatApprovalMessage>();
         for (const p of incoming) {
           if (!p || typeof p.id !== "string" || p.id.length === 0) continue;
           snapshotById.set(p.id, {
+            kind: "approval",
             id: p.id,
-            kind: p.kind ?? "exec",
+            approvalKind: p.kind ?? "exec",
             title: p.title ?? "",
-            description: p.description,
+            ...(p.description !== undefined ? { description: p.description } : {}),
             prompt: p.prompt ?? "",
             options: (p.options ?? []) as ApprovalOption[],
-            expiresAtMs: p.expiresAtMs,
+            ...(p.expiresAtMs !== undefined ? { expiresAtMs: p.expiresAtMs } : {}),
+            // Leg A's inserts are actionable BY CONSTRUCTION — the snapshot is
+            // the authority that says so. This is the second (and last) door
+            // through which the bit is ever set; the other is the live
+            // `approval_request` frame.
+            actionable: true,
           });
         }
         // #19: the recently-RESOLVED outcomes riding alongside the pending set.
@@ -3402,9 +3790,8 @@ export class WebChannelNATSClient {
           resolvedById.set(r.id, r.decision as ApprovalDecision);
         }
 
-        const existing = this.state.approvals;
         const seen = new Set<string>();
-        const next: ApprovalRequest[] = [];
+        const next: ChatMessage[] = [];
         let changed = false;
         // Tracks whether a NEW actionable (pending) card was rehydrated (Leg A),
         // so we clear the typing indicator in parity with the live
@@ -3412,62 +3799,90 @@ export class WebChannelNATSClient {
         // BLOCKED on the user, not still working.
         let rehydratedActionable = false;
 
-        for (const a of existing) {
-          seen.add(a.id);
+        for (const m of this.state.messages) {
+          // Every other transcript kind passes straight through: this frame
+          // reconciles approval state and says nothing about bubbles, reasoning
+          // blocks or tool calls.
+          if (m.kind !== "approval") {
+            next.push(m);
+            continue;
+          }
+          seen.add(m.id);
           // Defense in depth: an id in BOTH the pending `approvals` and the
           // `resolved` lists is impossible server-side (finalize deletes the
           // pending entry and records the resolved outcome in ONE synchronous
           // step before publishing), but if it ever happens the TERMINAL outcome
           // must win — never keep/make the card actionable. So a resolved-listed
           // id is routed to the resolved-upgrade branches below, ignoring `snap`.
-          const snap = resolvedById.has(a.id) ? undefined : snapshotById.get(a.id);
+          const snap = resolvedById.has(m.id) ? undefined : snapshotById.get(m.id);
+          // "Answered" in ANY of the three ways a card can be: the server told
+          // us, we guessed optimistically in `decide()`, or a previous Leg B
+          // recorded that somebody else answered it.
+          const answered =
+            m.resolvedDecision !== undefined || m.resolvedElsewhere === true;
           if (snap) {
-            if (a.resolvedDecision === undefined) {
-              // Present + unresolved: already actionable with the full payload
-              // (an approval is immutable once minted), so keep the existing
-              // entry — a duplicate snapshot stays a no-op.
-              next.push(a);
-            } else if (!a.resolutionConfirmed && a.resolvedDecision !== "unknown") {
+            if (!answered) {
+              // Present + unresolved: actionable with the full payload (an
+              // approval is immutable once minted), so the payload is NOT
+              // rebuilt from the snapshot — a duplicate snapshot must stay a
+              // no-op. The one thing that may need changing is the bit: a card
+              // hydrated from `history` is inert until this frame arms it.
+              if (m.actionable !== true) {
+                next.push({ ...m, actionable: true });
+                changed = true;
+              } else {
+                next.push(m);
+              }
+            } else if (m.resolutionConfirmed !== true && m.resolvedDecision !== undefined) {
               // Leg C: re-send the lost decision, keep the card resolved. Stays
               // unconfirmed so the next register retries until the server echoes
-              // an authoritative `approval_resolved`.
+              // an authoritative `approval_resolved`. A `resolvedElsewhere` card
+              // has no decision to re-send and is excluded by the second
+              // conjunct — the same carve-out the old `!== "unknown"` test made.
               this.deferOrRunReplacementOperation({
-                kind: "approval-decision", id: a.id, decision: a.resolvedDecision,
+                kind: "approval-decision", id: m.id, decision: m.resolvedDecision,
               });
-              next.push(a);
+              next.push(m);
             } else {
               // Server-confirmed resolution wins over a stale-by-ms snapshot.
-              next.push(a);
+              next.push(m);
             }
-          } else if (a.resolvedDecision === undefined) {
+          } else if (!answered) {
             // Leg B: decided/expired while we weren't looking — no longer
             // actionable, server-confirmed (authoritative). #19: show the ACTUAL
-            // outcome if the snapshot carried it, else the "unknown" sentinel.
-            const outcome = resolvedById.get(a.id);
-            next.push({
-              ...a,
-              resolvedDecision: outcome ?? "unknown",
-              resolutionConfirmed: true,
-            });
+            // outcome if the snapshot carried it, else the "unknown" sentinel,
+            // which rides `resolvedElsewhere` because it is a reconciliation
+            // outcome and not a decision anyone made.
+            const outcome = resolvedById.get(m.id);
+            next.push(
+              outcome !== undefined
+                ? { ...m, resolvedDecision: outcome, resolutionConfirmed: true }
+                : { ...m, resolvedElsewhere: true, resolutionConfirmed: true },
+            );
             changed = true;
-          } else if (!a.resolutionConfirmed) {
+          } else if (m.resolutionConfirmed !== true) {
             // Optimistic decision the server no longer has pending — our decision
             // (or another device's) won. #19: if the snapshot's resolved outcome
             // DIFFERS from our optimistic guess, the SERVER decision wins;
             // otherwise just confirm what we already showed.
-            const outcome = resolvedById.get(a.id);
+            const outcome = resolvedById.get(m.id);
             next.push(
-              outcome !== undefined && outcome !== a.resolvedDecision
-                ? { ...a, resolvedDecision: outcome, resolutionConfirmed: true }
-                : { ...a, resolutionConfirmed: true },
+              outcome !== undefined && outcome !== m.resolvedDecision
+                ? { ...m, resolvedDecision: outcome, resolutionConfirmed: true }
+                : { ...m, resolutionConfirmed: true },
             );
             changed = true;
           } else {
-            next.push(a);
+            next.push(m);
           }
         }
 
         // Leg A: snapshot ids with no local entry → rehydrate as pending cards.
+        //
+        // Appended at the TAIL, which is where a still-open prompt belongs and is
+        // also what `applyApproval` would do for a first-seen id. A later
+        // `history` page carrying the same card tier-1 matches it by
+        // (kind, id) and does not duplicate it.
         for (const [id, snap] of snapshotById) {
           if (seen.has(id)) continue;
           // Defense in depth (see the loop above): an id present in BOTH lists is
@@ -3480,7 +3895,7 @@ export class WebChannelNATSClient {
 
         if (changed) {
           this.setState({
-            approvals: next,
+            messages: next,
             ...(rehydratedActionable ? { isTyping: false } : {}),
           });
         }
