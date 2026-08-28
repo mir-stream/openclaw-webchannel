@@ -942,6 +942,17 @@ function applyReasoning(
  * ⚠️ `event` MUST NOT CARRY `undefined` VALUES — see the event type. A
  * present-and-`undefined` `name` would spread over a learned one and blank it.
  * The two producers both build with `...(x !== undefined ? {x} : {})`.
+ *
+ * ⚠️ THE MERGE KEY `(turnId, id)` INHERITS `turnId`'s PEER-CONTROLLED PROVENANCE.
+ * `turnId` is the inbound `message.id` off the wire (`inbound.ts` fallback only
+ * mints one when absent), validated as shape only. A peer that reuses one
+ * `message.id` outside the accept seam's windowed dedupe (#275) produces two
+ * genuinely distinct tool calls sharing a `(turnId, id)`, and this upsert then
+ * MERGES them into one row (last-write-wins across the spread) — silent content
+ * loss confined to that peer's own conversation. This is a KNOWN, ACCEPTED
+ * limitation tracked in #323; the real fix is server-minted turn ids (#243).
+ * Do not treat this pair as globally unique — it is unique in the projection
+ * only, because the projection achieved uniqueness by destroying a distinction.
  */
 function applyTool(
   view: DurableView,
