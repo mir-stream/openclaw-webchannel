@@ -238,19 +238,26 @@ describe("orderConversationPresentation", () => {
     expect(ordered.map((item) => item.value.id)).toEqual(["r1", "r2", "a1"]);
   });
 
-  it("#97 still interleaves tool activity by turnId — it is still ephemeral", () => {
-    const ordered = orderConversationPresentation(
-      [
-        { id: "u1", role: "user", text: "one", turnId: "t1" },
-        { kind: "reasoning", id: "r1", turnId: "t1", text: "reason one" },
-        { id: "a1", role: "agent", text: "answer one", turnId: "t1" },
-      ],
-      [{ id: "tc1", turnId: "t1", name: "bash" }],
-    );
-    // The tool chip anchors to the USER row (its turn's anchor), which now puts
-    // it before the reasoning block rather than after it. That is the honest
-    // consequence of the two lanes no longer being ordered by the same rule —
-    // one has a position, the other has only a turn.
+  /**
+   * ⚠️ #242 half 3 DELETED THE TOOL LANE TOO, and the two cases that used to sit
+   * here went with it rather than being adapted. They pinned the interleaving
+   * itself: one asserted a tool chip anchoring to its turn's USER row (landing
+   * before the reasoning block), the other placed an "orphan" chip whose turn had
+   * no local anchor at the tail. Both described the renderer holding a second
+   * opinion about ordering, and both are unrepresentable now — the function takes
+   * no side array, so there is no orphan case to have.
+   *
+   * What replaces them is the same property already pinned for reasoning: tool
+   * activity is a durable message, so its position is the ARRAY's and this
+   * function preserves it.
+   */
+  it("emits tool activity exactly where the transcript holds it", () => {
+    const ordered = orderConversationPresentation([
+      { id: "u1", role: "user", text: "one", turnId: "t1" },
+      { kind: "tool", id: "tc1", turnId: "t1", name: "bash", status: "completed" },
+      { kind: "reasoning", id: "r1", turnId: "t1", text: "reason one" },
+      { id: "a1", role: "agent", text: "answer one", turnId: "t1" },
+    ]);
     expect(ordered.map((item) => item.kind)).toEqual([
       "message",
       "tool_activity",
@@ -260,13 +267,49 @@ describe("orderConversationPresentation", () => {
     expect(ordered.map((item) => item.value.id)).toEqual(["u1", "tc1", "r1", "a1"]);
   });
 
-  it("#97 places an orphan tool chip at the tail when its turn has no anchor", () => {
-    expect(
-      orderConversationPresentation(
-        [{ id: "old", role: "agent", text: "old" }],
-        [{ id: "tc1", turnId: "live", name: "bash" }],
-      ).map((item) => item.value.id),
-    ).toEqual(["old", "tc1"]);
+  it("does NOT re-anchor a tool call by turnId either — the stream order wins", () => {
+    // The exact case the deleted `toolByTurn` grouping got WRONG: a call whose
+    // frames straddle the answer belongs where the stream put it. The old
+    // implementation hoisted every chip of a turn to that turn's first anchor,
+    // so this input rendered as [u1, tc1, a1].
+    const ordered = orderConversationPresentation([
+      { id: "u1", role: "user", text: "one", turnId: "t1" },
+      { id: "a1", role: "agent", text: "answer one", turnId: "t1" },
+      { kind: "tool", id: "tc1", turnId: "t1", name: "bash" },
+    ]);
+    expect(ordered.map((item) => item.value.id)).toEqual(["u1", "a1", "tc1"]);
+  });
+
+  it("carries the merged tool surface through to the chip, dropping nothing", () => {
+    // The renderer is a pure view: every durable field the fold produced has to
+    // reach `formatToolActivityLine`, or history renders a poorer chip than live
+    // did for the same call.
+    const ordered = orderConversationPresentation([
+      {
+        kind: "tool",
+        id: "tc1",
+        turnId: "t1",
+        name: "read_file",
+        phase: "end",
+        status: "completed",
+        summary: "2 modified",
+        argKeys: ["path", "limit"],
+      },
+    ]);
+    expect(ordered).toEqual([
+      {
+        kind: "tool_activity",
+        value: {
+          id: "tc1",
+          turnId: "t1",
+          name: "read_file",
+          phase: "end",
+          status: "completed",
+          summary: "2 modified",
+          argKeys: ["path", "limit"],
+        },
+      },
+    ]);
   });
 });
 

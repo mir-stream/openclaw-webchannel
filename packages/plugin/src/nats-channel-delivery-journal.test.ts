@@ -237,9 +237,10 @@ describe("#239 — egress persist-before-publish", () => {
     // Indicators.
     expect(channel.sendTyping(PEER)).toBe(true);
     expect(channel.sendReasoning(PEER, "r-1", "turn-1", "thinking")).toBe(true);
-    expect(
-      channel.sendToolActivity(PEER, { id: "t-1", turnId: "turn-1", name: "Read" }),
-    ).toBe(true);
+    // ⚠️ `sendToolActivity` IS NO LONGER DRIVEN HERE — #242 half 3 made it
+    // durable, so it belongs to the case below, not to this one. It was moved
+    // rather than deleted: a frame silently dropped from a "journals nothing"
+    // list is indistinguishable from one that stopped being sent.
     // Turn control and server→client replay.
     expect(channel.sendTurnSettled(PEER, "turn-1", "ok")).toBe(true);
     expect(
@@ -253,12 +254,70 @@ describe("#239 — egress persist-before-publish", () => {
       "inbound_rejected",
       "typing",
       "reasoning",
-      "tool_activity",
       "turn_settled",
       "history",
       "commands",
     ]);
     expect(appends(calls)).toEqual([]);
+  });
+
+  it("#242 half 3 — journals EVERY tool_activity frame, persist-before-publish", () => {
+    const { calls, channel } = makeChannel();
+
+    // The measured lifecycle triple for ONE call. The closing frame carries
+    // `status` but neither `name` nor `argKeys`, which is why all three are
+    // stored rather than one "final".
+    expect(
+      channel.sendToolActivity(PEER, {
+        id: "call-1",
+        turnId: "turn-1",
+        name: "read_file",
+        phase: "start",
+        argKeys: ["path", "limit"],
+      }),
+    ).toBe(true);
+    expect(
+      channel.sendToolActivity(PEER, { id: "call-1", turnId: "turn-1", phase: "update" }),
+    ).toBe(true);
+    expect(
+      channel.sendToolActivity(PEER, {
+        id: "call-1",
+        turnId: "turn-1",
+        phase: "end",
+        status: "completed",
+      }),
+    ).toBe(true);
+
+    // ORDER IS THE POINT: each append precedes its own publish (NOT-list N6,
+    // doc §16.2-2), and there are three of each rather than one.
+    expect(
+      calls.map((entry) =>
+        entry.call === "append"
+          ? `append:${(entry.event as { phase?: string }).phase}`
+          : `publish:${entry.type}`,
+      ),
+    ).toEqual([
+      "append:start",
+      "publish:tool_activity",
+      "append:update",
+      "publish:tool_activity",
+      "append:end",
+      "publish:tool_activity",
+    ]);
+    expect(
+      appends(calls).map((entry) => (entry.call === "append" ? entry.event : undefined)),
+    ).toEqual([
+      {
+        kind: "tool",
+        id: "call-1",
+        turnId: "turn-1",
+        name: "read_file",
+        phase: "start",
+        argKeys: ["path", "limit"],
+      },
+      { kind: "tool", id: "call-1", turnId: "turn-1", phase: "update" },
+      { kind: "tool", id: "call-1", turnId: "turn-1", phase: "end", status: "completed" },
+    ]);
   });
 
   it("publishes and returns true when append throws, warning once and suppressing the repeat", () => {

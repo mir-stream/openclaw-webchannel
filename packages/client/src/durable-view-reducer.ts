@@ -249,6 +249,47 @@ export type DurableMessage =
       readonly id: string;
       readonly turnId: string;
       readonly text: string;
+    }
+  /**
+   * ONE TOOL CALL, MERGED (#242 half 3, doc §15.9).
+   *
+   * ⚠️ THIS IS THE MERGE RESULT, WHILE THE `tool` EVENT IS A DELTA — the only
+   * place in this union where the message shape and its event shape differ in
+   * meaning rather than only in field names, so it is stated here rather than
+   * left to `applyTool`.
+   *
+   * MEASURED, not assumed (the producer is `inbound.ts`'s
+   * `createAgentToolActivitySink`; the sequence below was recorded by driving it
+   * with a `start`/`update`/`end` event triple on the `tool` stream):
+   *
+   *   {turnId, id, name:"read_file", phase:"start", argKeys:["path","limit"]}
+   *   {turnId, id, phase:"update"}
+   *   {turnId, id, phase:"end", status:"completed"}
+   *
+   * The CLOSING frame carries neither `name` nor `argKeys` — `argKeys` is
+   * emitted only on a NON-terminal frame and `status` only on a terminal one.
+   * So the `final`-flag device that makes `reasoning` one row per burst CANNOT
+   * be reused here: journaling only the closing frame would durably record a
+   * nameless, argKey-less tool call while live rendered "read_file(path,
+   * limit)". That is N8 live≠history, and it is why the durable ROW is the fold
+   * of every frame rather than any one of them.
+   *
+   * ⚠️ NO `role`, for the same reason `reasoning` has none: the wire carries no
+   * author and this type refuses to invent one.
+   *
+   * `argKeys` is `readonly string[]` and holds ARGUMENT KEY NAMES ONLY — never
+   * arg values. That boundary is enforced at the producer (`Object.keys(args)`)
+   * and again where the wire is read; it must survive to disk unchanged.
+   */
+  | {
+      readonly kind: "tool";
+      readonly id: string;
+      readonly turnId: string;
+      readonly name?: string;
+      readonly phase?: string;
+      readonly status?: string;
+      readonly summary?: string;
+      readonly argKeys?: readonly string[];
     };
 
 /** The `text` variant, named so the transitions that only handle it can say so. */
@@ -457,18 +498,29 @@ function findTextIndex(view: DurableView, id: string): number {
  * tests in `durable-view-reducer.test.ts` (they record what happens; they do not
  * endorse it).
  *
- * ── BOUNDARY 2: five kinds is TODAY'S wire, not the settled model ──
+ * ── BOUNDARY 2: six kinds is TODAY'S wire, not the settled model ──
  *
  * Doc §15.9 requires tool and reasoning messages to become DURABLE messages —
  * only pure indicators (the rolling progress draft, the typing flag) stay
- * ephemeral. So this event set will GROW; it already did once, and the rest of
- * the growth is scheduled. #242 half 1 added `reasoning` and half 2 gave it a
- * CLIENT consumer; TOOL ACTIVITY and the APPROVAL frames are still `null` in
- * `journalEventForOutbound`, marked "#242 half 3" there (this line said "half 2"
- * until half 2 shipped without them — a forward reference made before the slice
- * was split three ways), and are absent here for that reason and no other. Do not read
- * the five kinds as final spec, and do not treat "it isn't in DurableEvent" as
- * evidence that something is non-durable by design (NOT-list N3/N7).
+ * ephemeral. So this event set will GROW; it has now done so twice, and the rest
+ * of the growth is scheduled. #242 half 1 added `reasoning` and half 2 gave it a
+ * CLIENT consumer; half 3 added `tool` and moved the client's live tool surface
+ * onto this reducer, which is what §15.9's tool clause asked for and completes
+ * it.
+ *
+ * The APPROVAL frames are still `null` in `journalEventForOutbound` and absent
+ * here. That is **#242 half 4**, not half 3, and the reason is not effort: an
+ * approval is BIDIRECTIONAL — the client sends `approval_decision` back through
+ * the inbound path, and resolution changes a durable message's content by a USER
+ * ACTION rather than by a delivery revision. It is the first message in this
+ * system that does that, which is **#241**'s typed edit/revision territory;
+ * modelling it before #241 means inventing the mutation model twice.
+ * `approval_snapshot` is a different thing again and is `null` PERMANENTLY — see
+ * its case in the mapper.
+ *
+ * Do not read the six kinds as final spec, and do not treat "it isn't in
+ * DurableEvent" as evidence that something is non-durable by design
+ * (NOT-list N3/N7).
  *
  * ── BOUNDARY 3: the `history` frame is durable but deliberately OUT OF SCOPE ──
  *
@@ -497,7 +549,52 @@ export type DurableEvent =
       answers: Array<{ id: string; text: string }>;
       remove?: string[];
     }
-  | { kind: "reasoning"; id: string; turnId: string; text: string };
+  | { kind: "reasoning"; id: string; turnId: string; text: string }
+  /**
+   * ONE `tool_activity` WIRE FRAME, VERBATIM — a DELTA, not a snapshot
+   * (#242 half 3).
+   *
+   * ⚠️ EVERY FRAME IS JOURNALED, AND THE FOLD DOES THE MERGING. That is the one
+   * design decision in this slice, and it is the OPPOSITE of `reasoning`'s. See
+   * `DurableMessage`'s tool arm for the MEASURED frame sequence that forces it:
+   * the closing frame carries neither `name` nor `argKeys`, so there is no
+   * single self-contained frame a `final`-style flag could pick.
+   *
+   * ⚠️ WHY THE DELTA AND NOT A SERVER-MERGED SNAPSHOT. Merging at the journaling
+   * seam would put a per-`(turnId,id)` accumulator in the plugin and make the
+   * stored row a PROJECTION the seam computed — a second implementation of a
+   * merge the live client also performs, free to drift from it. That is exactly
+   * what N8 and this file's one-reducer bet forbid, and it is why `JournalEvent`
+   * is an ALIAS of this type rather than a mirror. Journaling the frame keeps the
+   * seam stateless and leaves `applyTool` the ONLY merge in the system, so
+   * `history == live` holds by construction rather than by two pieces of code
+   * agreeing.
+   *
+   * ⚠️ THE COST IS ROW COUNT, AND IT IS REAL. One tool call writes one row PER
+   * FRAME (three in the measured triple) instead of one, and a chatty tool
+   * emitting many `update` frames writes one row each. Each row is small and
+   * bounded — a tool name, a phase from a five-member set, a status, key names,
+   * and a count-grammar summary — so this is O(frames) rows of O(1) bytes, NOT
+   * the O(n²) BYTES that `final` exists to prevent for reasoning (there every
+   * frame carried the whole cumulative text). It still feeds the quadratic
+   * replay fold tracked by **#286**, and it adds another content class to the
+   * ROW-bounded (not byte-bounded) history page tracked by **#311**.
+   *
+   * Fields other than `id`/`turnId` are OPTIONAL and must be ABSENT KEYS when
+   * the frame omitted them, never `undefined` values — `applyTool` merges by
+   * spread, so a present-and-`undefined` key would ERASE a field learned at
+   * `start`.
+   */
+  | {
+      kind: "tool";
+      id: string;
+      turnId: string;
+      name?: string;
+      phase?: string;
+      status?: string;
+      summary?: string;
+      argKeys?: readonly string[];
+    };
 
 /**
  * STEP: apply exactly ONE journaled event to a durable view.
@@ -539,6 +636,8 @@ export function applyDurableEvent(
       return applySeal(view, event);
     case "reasoning":
       return applyReasoning(view, event);
+    case "tool":
+      return applyTool(view, event);
   }
 }
 
@@ -800,6 +899,61 @@ function applyReasoning(
 }
 
 /**
+ * MERGE one tool-activity frame onto the call it refines (#242 half 3).
+ *
+ * ⚠️ THE KEY IS THE COMPOSITE `(turnId, id)`, NOT `id` ALONE. `inbound.ts`'s
+ * `correlatedId` derives the id from core's `itemId`/`toolCallId`/`name` within
+ * ONE RUN, so it is unique per turn but carries no cross-turn guarantee; the
+ * live client has always keyed this surface the same way
+ * (`nats-client-wrapper.ts`'s `upsertToolActivity` matches on
+ * `entry.turnId === item.turnId && entry.id === item.id`), and history must key
+ * it identically or the two disagree the first time a run reuses an id.
+ *
+ * ⚠️ AND THE `kind` TEST KEEPS TOOL IDS OUT OF THE OTHER TWO ID SPACES, exactly
+ * as `findTextIndex` and `applyReasoning` do for theirs. A tool id colliding
+ * with a bubble or a reasoning id therefore costs a duplicated id in the view —
+ * visible and recoverable — rather than one message overwriting the other
+ * (N10). See `findTextIndex`'s docblock for why the spaces cannot be ASSUMED
+ * disjoint; the argument there does not depend on id shapes and neither does
+ * this one.
+ *
+ * ⚠️ THE SPREAD IS THE WHOLE TRANSITION, AND IT IS DIRECTIONAL. `{...prev,
+ * ...event}` lets a later frame REFINE the call — adding `status` at the end —
+ * while keeping the `name` and `argKeys` only the `start` frame carried. Written
+ * the other way round a `start` frame arriving late would erase the outcome. The
+ * `kind` key is re-stated after the spread because `event.kind` is `"tool"`
+ * either way but `event` also carries no `ts`-style client fields; restating it
+ * keeps the result a well-formed `DurableMessage` rather than relying on the
+ * event's own tag surviving the spread.
+ *
+ * ⚠️ `event` MUST NOT CARRY `undefined` VALUES — see the event type. A
+ * present-and-`undefined` `name` would spread over a learned one and blank it.
+ * The two producers both build with `...(x !== undefined ? {x} : {})`.
+ */
+function applyTool(
+  view: DurableView,
+  event: {
+    id: string;
+    turnId: string;
+    name?: string;
+    phase?: string;
+    status?: string;
+    summary?: string;
+    argKeys?: readonly string[];
+  },
+): DurableView {
+  const idx = view.findIndex(
+    (m) => m.kind === "tool" && m.id === event.id && m.turnId === event.turnId,
+  );
+  if (idx === -1) {
+    return [...view, { ...event, kind: "tool" }];
+  }
+  const next = view.slice();
+  next[idx] = { ...next[idx], ...event, kind: "tool" };
+  return next;
+}
+
+/**
  * `turn_snapshot` reconciliation — the ONE implementation. The wrapper's
  * `applyTurnSnapshot` is now only the
  * frame→event mapper that feeds this. The contract is EXPLICIT (never a blanket
@@ -911,7 +1065,17 @@ function applySeal(
  */
 type ClientTranscriptEntry =
   | { kind?: undefined; id: string; role: DurableRole; text: string; turnId?: string; draftOnly?: boolean }
-  | { kind: "reasoning"; id: string; turnId: string; text: string };
+  | { kind: "reasoning"; id: string; turnId: string; text: string }
+  | {
+      kind: "tool";
+      id: string;
+      turnId: string;
+      name?: string;
+      phase?: string;
+      status?: string;
+      summary?: string;
+      argKeys?: readonly string[];
+    };
 
 /**
  * Project a full `ChatMessage[]` (the client's live `state.messages`) down to
@@ -934,17 +1098,37 @@ type ClientTranscriptEntry =
  * guesswork here.
  */
 export function projectDurable(messages: ClientTranscriptEntry[]): DurableView {
-  return messages.map((m) =>
-    m.kind === "reasoning"
-      ? { kind: "reasoning", id: m.id, turnId: m.turnId, text: m.text }
-      : {
-          kind: "text",
-          id: m.id,
-          role: m.role,
-          text: m.text,
-          turnId: m.turnId,
-        },
-  );
+  return messages.map((m) => {
+    if (m.kind === "reasoning") {
+      return { kind: "reasoning", id: m.id, turnId: m.turnId, text: m.text };
+    }
+    // ⚠️ #242 half 3: TOOL IS CARRIED FIELD BY FIELD, and each optional field is
+    // omitted rather than written as `undefined`. This is the ROUND TRIP the
+    // docblock above warns about — the wrapper recomputes
+    // `mergeDurable(projectDurableFromClient(state.messages) + one event)` on
+    // every durable frame, so a spread that introduced own `name: undefined`
+    // keys here would feed them back through `applyTool`'s spread and BLANK the
+    // very fields the `start` frame carried, on the next unrelated frame.
+    if (m.kind === "tool") {
+      return {
+        kind: "tool",
+        id: m.id,
+        turnId: m.turnId,
+        ...(m.name !== undefined ? { name: m.name } : {}),
+        ...(m.phase !== undefined ? { phase: m.phase } : {}),
+        ...(m.status !== undefined ? { status: m.status } : {}),
+        ...(m.summary !== undefined ? { summary: m.summary } : {}),
+        ...(m.argKeys !== undefined ? { argKeys: m.argKeys } : {}),
+      };
+    }
+    return {
+      kind: "text",
+      id: m.id,
+      role: m.role,
+      text: m.text,
+      turnId: m.turnId,
+    };
+  });
 }
 
 /**
@@ -979,8 +1163,16 @@ export function projectDurableFromClient(
   messages: ClientTranscriptEntry[],
 ): DurableView {
   return projectDurable(
-    messages.map((m) =>
-      m.kind === "reasoning" ? m : m.draftOnly === true ? { ...m, text: "" } : m,
-    ),
+    messages.map((m) => {
+      // ⚠️ THE DRAFT CARVE-OUT IS BUBBLE-ONLY, AND THE `kind` TESTS ARE WHAT SAY
+      // SO. `draftOnly` lives on the bubble arm alone — a reasoning block streams
+      // cumulative full text through an upsert and a tool call is a lifecycle
+      // fold, so neither has a rolling draft to suppress. Adding `tool` in half 3
+      // made this a COMPILE ERROR rather than a silent one: `m.draftOnly` does
+      // not exist on the tool arm, so the narrowing had to be made explicit here
+      // instead of leaning on "everything that is not reasoning is a bubble".
+      if (m.kind === "reasoning" || m.kind === "tool") return m;
+      return m.draftOnly === true ? { ...m, text: "" } : m;
+    }),
   );
 }
