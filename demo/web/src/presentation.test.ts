@@ -5,6 +5,7 @@ import {
   composerInFlight,
   formatToolActivityLine,
   orderConversationPresentation,
+  type ConversationPresentationItem,
 } from "./presentation.js";
 
 describe("composerInFlight (#96 — Stop affordance survives between bubbles)", () => {
@@ -117,29 +118,37 @@ describe("activityHint (#96 — the transcript-tail activity line)", () => {
     expect(activityHint({ ...gap, reasoning: [], approvals: [] })).toBe("still working…");
   });
 
-  it("is silent while an unresolved approval card is actionable", () => {
+  it("is silent while an ACTIONABLE approval card is on screen", () => {
     // The turn is blocked on the USER, not working — the card takes priority.
-    expect(
-      activityHint({ ...gap, reasoning, approvals: [{ resolvedDecision: undefined }] }),
-    ).toBeNull();
+    expect(activityHint({ ...gap, reasoning, approvals: [{ actionable: true }] })).toBeNull();
   });
 
   it("resumes the gap hint once every approval is resolved", () => {
-    expect(
-      activityHint({ ...gap, reasoning, approvals: [{ resolvedDecision: "allow-once" }] }),
-    ).toBe("still working…");
+    expect(activityHint({ ...gap, reasoning, approvals: [{ actionable: false }] })).toBe(
+      "still working…",
+    );
   });
 
-  it("is silent when only SOME of the approvals are resolved", () => {
-    // Any one unresolved card is actionable, so "every resolved" is the wrong
-    // question — a resolved card ahead of it must not unmute the hint.
+  it("is silent when only SOME of the approvals are actionable", () => {
+    // Any one actionable card blocks, so "every resolved" is the wrong question
+    // — a resolved card ahead of it must not unmute the hint.
     expect(
       activityHint({
         ...gap,
         reasoning,
-        approvals: [{ resolvedDecision: "deny" }, { resolvedDecision: undefined }],
+        approvals: [{ actionable: false }, { actionable: true }],
       }),
     ).toBeNull();
+  });
+
+  it("#242 half 4: a card REPLAYED from history does not mute the hint forever", () => {
+    // The regression the `actionable` switch exists to prevent. A history-
+    // replayed card is unresolved as far as the durable stream records, but it
+    // is inert — under the old `resolvedDecision === undefined` test it would
+    // suppress "still working…" on every later turn, for the rest of the session.
+    expect(
+      activityHint({ ...gap, reasoning, approvals: [{ actionable: false }] }),
+    ).toBe("still working…");
   });
 
   it("is silent while a working draft renders its own in-progress bubble", () => {
@@ -174,6 +183,19 @@ describe("activityHint (#96 — the transcript-tail activity line)", () => {
   });
 });
 
+/**
+ * The id of whatever a presentation item points at.
+ *
+ * ⚠️ #242 half 4 MADE `item.value.id` UNTYPEABLE, and that is the union working.
+ * The approval arm carries an `id` and NO `value` — deliberately, because a
+ * renderer must not re-fold a card's state (see `ConversationPresentationItem`)
+ * — so a bare `.value.id` no longer compiles for every arm. Narrowing here keeps
+ * every ordering assertion below reading exactly as it did.
+ */
+function presentationId(item: ConversationPresentationItem): string {
+  return item.kind === "approval" ? item.id : item.value.id;
+}
+
 describe("orderConversationPresentation", () => {
   /**
    * ⚠️ #242 half 2 CHANGED WHAT THIS FUNCTION IS FOR, and these cases were
@@ -193,7 +215,7 @@ describe("orderConversationPresentation", () => {
       { kind: "reasoning", id: "r2", turnId: "t2", text: "reason two" },
       { id: "a2", role: "agent", text: "answer two", turnId: "t2" },
     ]);
-    expect(ordered.map((item) => item.value.id)).toEqual(["u1", "r1", "a1", "u2", "r2", "a2"]);
+    expect(ordered.map(presentationId)).toEqual(["u1", "r1", "a1", "u2", "r2", "a2"]);
     expect(ordered.map((item) => item.kind)).toEqual([
       "message",
       "reasoning",
@@ -226,7 +248,7 @@ describe("orderConversationPresentation", () => {
       { id: "a1", role: "agent", text: "answer one", turnId: "t1" },
       { kind: "reasoning", id: "r1", turnId: "t1", text: "reason one" },
     ]);
-    expect(ordered.map((item) => item.value.id)).toEqual(["u1", "a1", "r1"]);
+    expect(ordered.map(presentationId)).toEqual(["u1", "a1", "r1"]);
   });
 
   it("keeps two bursts of one turn distinct and in order", () => {
@@ -235,7 +257,7 @@ describe("orderConversationPresentation", () => {
       { kind: "reasoning", id: "r2", turnId: "t1", text: "second" },
       { id: "a1", role: "agent", text: "answer", turnId: "t1" },
     ]);
-    expect(ordered.map((item) => item.value.id)).toEqual(["r1", "r2", "a1"]);
+    expect(ordered.map(presentationId)).toEqual(["r1", "r2", "a1"]);
   });
 
   /**
@@ -264,7 +286,50 @@ describe("orderConversationPresentation", () => {
       "reasoning",
       "message",
     ]);
-    expect(ordered.map((item) => item.value.id)).toEqual(["u1", "tc1", "r1", "a1"]);
+    expect(ordered.map(presentationId)).toEqual(["u1", "tc1", "r1", "a1"]);
+  });
+
+  it("emits an approval card exactly where the prompt interrupted (#242 half 4)", () => {
+    // The LAST lane the widget held — and the one that was not even ordered.
+    // `state.approvals` was drawn into a box BELOW the whole transcript, so a
+    // prompt that interrupted the second of four messages rendered under the
+    // fourth. It sits in `state.messages` now and this function reads that.
+    const ordered = orderConversationPresentation([
+      { id: "u1", role: "user", text: "one", turnId: "t1" },
+      {
+        kind: "approval",
+        id: "ap1",
+        approvalKind: "exec",
+        title: "Run",
+        prompt: "Run: ls",
+        options: [],
+      },
+      { id: "a1", role: "agent", text: "answer one", turnId: "t1" },
+    ]);
+    expect(ordered.map((item) => item.kind)).toEqual(["message", "approval", "message"]);
+    expect(ordered.map(presentationId)).toEqual(["u1", "ap1", "a1"]);
+  });
+
+  it("an approval item carries only an ID — the render state is the library's", () => {
+    // ⚠️ NOT AN OMISSION. `resolvedDecision` folds a durable decision, an
+    // optimistic one and the "unknown" sentinel, and `actionable` decides whether
+    // buttons are drawn at all. `state.approvals` (`deriveApprovals`) is that
+    // computation; recomputing it in a renderer would be a second opinion about
+    // whether a stale card is clickable — the worst possible thing to hold two
+    // opinions about.
+    const [item] = orderConversationPresentation([
+      {
+        kind: "approval",
+        id: "ap1",
+        approvalKind: "exec",
+        title: "Run",
+        prompt: "Run: ls",
+        options: [],
+        resolvedDecision: "deny",
+        actionable: true,
+      },
+    ]);
+    expect(item).toEqual({ kind: "approval", id: "ap1" });
   });
 
   it("does NOT re-anchor a tool call by turnId either — the stream order wins", () => {
@@ -277,7 +342,7 @@ describe("orderConversationPresentation", () => {
       { id: "a1", role: "agent", text: "answer one", turnId: "t1" },
       { kind: "tool", id: "tc1", turnId: "t1", name: "bash" },
     ]);
-    expect(ordered.map((item) => item.value.id)).toEqual(["u1", "a1", "tc1"]);
+    expect(ordered.map(presentationId)).toEqual(["u1", "a1", "tc1"]);
   });
 
   it("carries the merged tool surface through to the chip, dropping nothing", () => {

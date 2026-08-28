@@ -234,19 +234,33 @@ export type InboundMessage = {
    *    `turnId` is required.
    *  - `kind: "tool"` → a MERGED tool call (#242 half 3); NO `role`, NO `text`,
    *    `turnId` required, and the tool surface below.
-   * `role` is optional here because neither tagged variant carries one — the
-   * wrapper's existing `m.role !== "user" && m.role !== "agent"` guard is what
-   * keeps an unrecognised shape out of the transcript.
+   *  - `kind: "approval"` → a native HITL approval CARD with its state
+   *    (#242 half 4); NO `role`, NO `text`, NO `turnId`, and the approval
+   *    surface below (`approvalKind`/`title`/`prompt`/`options`/…).
+   * `role` is optional here because none of the tagged variants carries one —
+   * the wrapper's existing `m.role !== "user" && m.role !== "agent"` guard is
+   * what keeps an unrecognised shape out of the transcript.
    *
    * ⚠️ `text` IS OPTIONAL HERE, AND IT WAS REQUIRED UNTIL #242 half 3. A tool row
    * genuinely has none — its content is the name/phase/status/argKeys surface —
-   * so a required `text` would have made the tool variant unrepresentable. The
-   * wrapper's `typeof m.text !== "string"` guard still runs for the two variants
-   * that DO carry text; the tool branch is deliberately placed AHEAD of it.
+   * so a required `text` would have made the tool variant unrepresentable, and
+   * the approval variant has none either. The wrapper's
+   * `typeof m.text !== "string"` guard still runs for the two variants that DO
+   * carry text; the tool and approval branches are deliberately placed AHEAD of
+   * it.
    *
    * ⚠️ `argKeys` IS KEY NAMES ONLY, NEVER ARG VALUES — and nothing has validated
    * that here. The wrapper re-filters it to strings on the way in; this
    * declaration is the unvalidated wire shape, not a promise about it.
+   *
+   * ⚠️ THE APPROVAL FIELDS ARE NAMED `approvalKind`/`resolvedDecision`, NOT
+   * `kind`/`decision`. The frame-level `kind` and `decision` above belong to the
+   * live `approval_request`/`approval_resolved` FRAMES; on a history ROW the
+   * card's own kind is renamed because `kind` is the row union's discriminant.
+   * The rename happens at all three layers — do not "harmonise" it back here.
+   * `resolvedDecision` is typed loosely and is VALIDATED by the wrapper against
+   * the three real decisions; the `"unknown"` sentinel is client-local and must
+   * never be admitted from the wire.
    */
   messages?: Array<{
     id: string;
@@ -260,6 +274,13 @@ export type InboundMessage = {
     status?: string;
     summary?: string;
     argKeys?: unknown;
+    approvalKind?: string;
+    title?: string;
+    description?: string;
+    prompt?: string;
+    options?: unknown;
+    expiresAtMs?: number;
+    resolvedDecision?: unknown;
   }>;
   /**
    * #212: on a `turn_snapshot` frame, the plugin's authoritative ordered agent

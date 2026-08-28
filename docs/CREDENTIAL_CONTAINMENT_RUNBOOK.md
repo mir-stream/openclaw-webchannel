@@ -51,8 +51,9 @@ because the thing it names does not exist. The correction:
     **two** seams:
       - on the **EGRESS** path (`nats-channel.ts`'s `sendToPeer`): `agent_message`
         text, `progress` placements, and the `turn_snapshot` rows written at
-        turn end — plus, **only for an account that has opted in**, the model's
-        REASONING text (#242 half 1; see the note below);
+        turn end; **`tool_activity` rows** and **approval rows** (both #242, both
+        with **no opt-in** — see the two notes below); plus, **only for an
+        account that has opted in**, the model's REASONING text (#242 half 1);
       - on the **INGRESS** path (`ingress-dedupe.ts` → `journalEventForInboundUser`):
         `kind:"user"` rows carrying **the message the user typed, verbatim**.
         ⚠️ THIS ONE WAS MISSING FROM THIS LIST UNTIL 2026-08-27 AND IS THE ONE AN
@@ -108,14 +109,70 @@ because the thing it names does not exist. The correction:
     plaintext to disk — which is exactly why they are two keys.
 
     Before opting in, note what the opt-in currently buys: nothing ages out of
-    the journal (#299 is unshipped), and #242 **half 1 leaves the content
-    unreadable by any client** — the `history` wire frame cannot carry a
-    role-less message, so the projection drops it. Until half 2/3 lands you are
-    accumulating plaintext that no user can see. If you have already opted in
+    the journal (#299 is unshipped). ⚠️ **THE OTHER HALF OF THIS PARAGRAPH HAS
+    EXPIRED AND IS CORRECTED RATHER THAN DELETED**, because "you are accumulating
+    plaintext that no user can see" was a real argument for staying opted out and
+    someone will otherwise re-derive it. It read: #242 half 1 leaves the content
+    unreadable by any client, since the `history` wire frame cannot carry a
+    role-less message and the projection drops it. **Half 2 shipped**: the wire
+    row became a tagged union, the projection stops dropping, and the client
+    renders reasoning from the transcript — so opting in now genuinely restores
+    the lane on reload. The privacy cost is unchanged; the "buys you nothing"
+    half is gone, and the default is still OFF (revisit tracked by #306). If you
+    have already opted in
     and want to stop, set `capabilities.reasoningDurable` back to `false` (any
     present value other than boolean `true` also fails closed — see
     `resolveReasoningDurable`); the data-minimization note below applies to the
     rows already written.
+
+    ⚠️ **TOOL ACTIVITY IS ON DISK, WITH NO OPT-IN — AND IT IS THE CHEAP ONE.**
+    #242 half 3 made the structured tool lane durable: one row per `tool_activity`
+    frame, carrying the tool's **name**, its **phase/status**, a count-only
+    `summary`, and `argKeys`. ⚠️ **`argKeys` IS ARGUMENT KEY *NAMES* ONLY — NEVER
+    ARGUMENT VALUES**, and that is the whole reason this class needed no separate
+    switch: the boundary is enforced at the producer (`Object.keys(args)`) and
+    again where the wire is read, so no argument value reaches this file through
+    a tool row. What you can learn from these rows is **which tools ran, in what
+    order, on what named parameters, and whether they succeeded** — real
+    operational metadata, but not content. Judge it accordingly; it is not in the
+    same class as the two paragraphs around it.
+
+    ⚠️ **APPROVAL ROWS ARE THE SHARPEST ITEM IN THIS INVENTORY. READ THIS BEFORE
+    YOU DECIDE WHETHER TO KEEP THE FILE.** #242 half 4 made native HITL approval
+    cards durable, with **no opt-in**, so they are written **at the default
+    configuration**. An approval is stored as **two** rows — the request
+    (`approval_request`) and, separately, its outcome (`approval_resolved`) —
+    and the request row carries the card's `title`, `description`, `options` and
+    `prompt`.
+
+    **`prompt` is the part that matters: for an exec approval it is the command
+    line the agent asked to run, INCLUDING ITS ARGUMENT VALUES.** Concretely,
+    `approvals.ts` composes it as *title*, then the command preview — so a row
+    can read
+    `{"kind":"approval","id":"ap-1","prompt":"Run a command: psql \"postgres://svc:hunter2@db/prod\" -c …"}`.
+    Contrast the tool rows one paragraph up, which deliberately hold key **names**
+    only: **the approval row is where argument values land on disk**, and it does
+    so without anyone opting in. If your agents approve commands that carry
+    secrets in their arguments — connection strings, tokens, `--password` flags —
+    those strings are in this file, in the clear, and they are in the §0.1
+    exposure set.
+
+    **Why that was accepted, so you can weigh it rather than just discover it.**
+    An approval card is a message the user was **shown and clicked**: it cannot
+    be withheld from the browser, because nobody can approve a command they
+    cannot see. So there is no *disclosure* decision left at this seam — only a
+    *retention* one. And the alternative was worse in the other direction: with
+    the card dropped, a reloaded conversation would show the agent having run a
+    command with **nothing recording that anyone authorised it**, erasing the
+    audit trail of the user's own consent. That trade is defensible; it is not a
+    reason to be unaware of it.
+
+    **What it costs you.** Nothing ages out (#299 is unshipped), so approval rows
+    — argument values included — accumulate **for the life of the account**.
+    There is no switch to turn this off; the only lever is the deletion described
+    below, and since #240 that deletion also erases every peer's chat history.
+    If that is unacceptable for your deployment, the thing to raise is #299
+    (retention), not a config change, because there is no config for it.
 
     **K does not seal this file, and rotating K does not touch it.**
     `sendToPeer` journals the payload *before* `sealEnvelope` runs, so K covers
@@ -138,14 +195,32 @@ because the thing it names does not exist. The correction:
     shadow store.
   - legacy migration artifacts under `$HOME/.openclaw-webchannel/`.
 
-  That is the complete list of FILES, and — since the correction above — of the
+  That is the complete list of FILES, and — since the corrections above — of the
   content classes inside the journal too. ⚠️ TREAT THAT SECOND CLAIM AS THE
-  FRAGILE ONE. This list has now been wrong twice in the same direction: once
-  when the journal itself was added, and once when it named only the egress
-  seam and silently omitted every message users typed. An operator running the
-  §0.1 exposure assessment reads this sentence and stops, so a slice that
-  teaches either seam to write a new kind must edit THIS list in the same
-  change. Nothing on it is a ciphertext store to invalidate:
+  FRAGILE ONE. This list has now been wrong **four** times in the same
+  direction, and the last two are the damning ones:
+   1. when the journal itself was added and the file was simply absent;
+   2. when it named only the EGRESS seam and silently omitted every message
+      users typed (#242 half 2 fixed it);
+   3. **#242 half 3** made `tool_activity` durable and did not touch this list.
+      That one SHIPPED wrong: the omission stood from half 3 until half 4;
+   4. **#242 half 4** made approval rows durable — the first class to put command
+      ARGUMENT VALUES on disk, with no opt-in — and its implementation did not
+      touch this list either. Caught in review before the commit, which is why
+      both #3 and #4 are repaired by the same change rather than left as two more
+      entries. Do not read "caught" as "so the rule works": it was caught by a
+      person who happened to check, not by anything in the repo.
+  ⚠️ **BOTH OF THE LAST TWO VIOLATED A RULE WRITTEN IN THIS PARAGRAPH.** The
+  sentence "a slice that teaches either seam to write a new kind must edit THIS
+  list in the same change" was already here when they shipped, so the wording was
+  never what was missing. That is why the rule now has a TEST behind it —
+  `packages/plugin/src/containment-runbook-inventory.test.ts` derives the durable
+  kinds from `journal-history.ts`'s `KNOWN_EVENT_KINDS` and fails when one of
+  them is not named in this section. If you are adding a durable kind, that test
+  is what will tell you to come back here; do not "fix" it by loosening its
+  token map. An operator running the §0.1 exposure assessment reads this
+  paragraph and stops, so the cost of it being stale is theirs, not ours.
+  Nothing on this list is a ciphertext store to invalidate:
   the one file holding conversation content, `delivery-journal.sqlite`, holds it
   in the clear, so the only lever over it is deletion, not invalidation.
 - **Rotating K does not disconnect anyone and does not revoke anything.** It is

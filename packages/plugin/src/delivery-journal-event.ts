@@ -70,11 +70,24 @@
  *
  * It has since grown again: #242 half 3 made TOOL ACTIVITY durable — one row per
  * FRAME rather than per call, and with NO account opt-in, both of which are the
- * opposite of the reasoning answer and are argued at that case. The APPROVAL
- * request/resolution frames remain `null` and are now marked "#242 **half 4**",
- * because an approval is the first BIDIRECTIONAL durable message here and needs
- * #241's revision model first. `approval_snapshot` is `null` PERMANENTLY — it is
- * a replay, not a message.
+ * opposite of the reasoning answer and are argued at that case.
+ *
+ * And again, for the last time on §15.9's list: #242 half 4 made APPROVALS
+ * durable — `approval_request` and `approval_resolved` become TWO append-only
+ * events that the shared reducer folds into ONE card, with no account opt-in
+ * (argued from the approval's own content at its case, since the tool argument
+ * does not transfer — an approval carries real free text). `approval_snapshot`
+ * stays `null` PERMANENTLY: it is a replay, not a message.
+ *
+ * ⚠️ THE HEADER USED TO SAY APPROVALS NEEDED **#241**'s REVISION MODEL FIRST.
+ * That was wrong and the retraction is at the `approval_request` case, where the
+ * next reader meets it. Nothing is revised: two events, one fold.
+ *
+ * ⚠️ AND `notice` NEVER NEEDED A CASE OF ITS OWN, so do not go looking for the
+ * one §15.9 names. Notices, route apologies and the `/stop` operator-allowlist
+ * notice all go out through `NatsChannel.sendText` carrying an id minted at the
+ * delivery act (#238), so the `agent_message` branch below has journaled them as
+ * `bubble`s since #239.
  *
  * Every `null` below carries its reason, and the ones that are merely deferred
  * say "not yet" rather than "no".
@@ -418,37 +431,130 @@ export function journalEventForOutbound(
               : {}),
           }
         : null;
-    // ⚠️ THE THREE `null`s BELOW SAID "#242 half 3" AND NOW SAY "half 4". Half 3
-    // shipped `tool_activity` above and deliberately did NOT touch these. This
-    // comment has now been corrected twice (it said "half 2" until half 2
-    // shipped without them), so the reason is recorded rather than the label
-    // alone: a stale "the next slice does it" reads as a commitment nobody made.
     case "approval_request":
-      // NOT YET durable — #242 **half 4**. An approval is a MESSAGE by §15.9's
-      // message-vs-indicator test, not an indicator.
+      // DURABLE since #242 half 4 (§15.9) — the approval CARD's content.
       //
-      // ⚠️ IT IS NOT SIMPLY "MORE OF HALF 3", AND THAT IS WHY IT IS SPLIT OFF.
-      // Every durable message before it is one-directional: the plugin delivers
-      // content and later REVISES it. An approval is BIDIRECTIONAL — the client
-      // sends `approval_decision` back through the inbound path, and the
-      // resolution below changes this message's content by a USER ACTION rather
-      // than by a delivery revision. That is the first such message in this
-      // system and it is **#241**'s typed edit/revision territory; modelling it
-      // before #241 lands means inventing the mutation model twice, and the two
-      // inventions would then have to be reconciled.
-      return null;
+      // ⚠️ THE "IT NEEDS #241 FIRST" ARGUMENT THAT STOOD HERE FOR THREE SLICES
+      // IS RETRACTED, AND IS RECORDED RATHER THAN DELETED BECAUSE IT IS THE
+      // OBVIOUS THING TO RE-DERIVE. It read: every durable message before this
+      // one is one-directional, the plugin delivers content and later REVISES
+      // it; an approval is BIDIRECTIONAL, so the resolution changes this
+      // message's content by a USER ACTION rather than by a delivery revision,
+      // which is **#241**'s typed edit/revision territory. The premise is
+      // correct — this really is the first message a user action changes — and
+      // the conclusion does not follow, because nothing here is revised. The
+      // request and the resolution are TWO APPEND-ONLY EVENTS and
+      // `durable-view-reducer.ts` folds them into ONE message, which is exactly
+      // the relationship `seal` already has to `bubble`. #241 was never a
+      // prerequisite.
+      //
+      // ⚠️ NO `policy` GATE, UNLIKE `reasoning`, AND THE TOOL ARGUMENT DOES NOT
+      // TRANSFER — this one is argued from the approval's own content, because
+      // an approval genuinely carries free text where a tool row carries none.
+      // MEASURED at the producer (`approvals.ts`'s `buildApprovalRequestPayload`):
+      // `title` and `description` come straight off the SDK's
+      // `PendingApprovalView`, and `prompt` is composed as
+      // `` `${view.title}: ${view.commandPreview || view.commandText}` `` for an
+      // exec approval and `` `${view.title}: ${view.toolName || view.pluginId}` ``
+      // for a plugin one. So the free text this row adds is THE COMMAND THE
+      // AGENT ASKED TO RUN, plus the SDK's own title/description for it.
+      //
+      // Three reasons that is not the class `reasoningDurable` exists to gate:
+      //  - §15.9 names the class precisely, and it is a different one: reasoning
+      //    "routinely quotes tool output, file contents and user prompts" — it is
+      //    content the transcript does not otherwise hold. An approval card holds
+      //    the command, and the journal ALREADY stores, with no opt-in, the user
+      //    prompt that asked for it (`user`) and the agent's prose about it
+      //    (`bubble`/`seal`);
+      //  - the card is a MESSAGE THE USER WAS SHOWN AND ACTED ON. It cannot be
+      //    withheld from the client — you cannot approve what you cannot see — so
+      //    unlike a chain of thought there is no disclosure decision left to make
+      //    at this seam, only a retention one;
+      //  - and the tie-breaker runs the OTHER WAY here. The reasoning gate chose
+      //    the cheap-to-reverse direction because absence cost only an
+      //    explanation. An approval's absence costs the record of a USER'S
+      //    CONSENT: a reloaded transcript would show the agent running a command
+      //    with nothing saying anyone authorised it. Not storing is the expensive
+      //    direction, not the cheap one.
+      //
+      // ⚠️ STATE THE COST HONESTLY, BECAUSE IT IS REAL AND IT IS NEW. An exec
+      // approval row puts a command line WITH ITS ARGUMENT VALUES on disk, where
+      // half 3's `tool` row deliberately carries argument KEY NAMES only. This
+      // slice therefore widens what reaches disk relative to half 3, and #299
+      // (retention/pruning at the store) is still unimplemented. That is
+      // accepted, not overlooked, and it is the argument above that pays for it —
+      // not silence.
+      //
+      // ⚠️ THE `kind` FIELD IS RENAMED TO `approvalKind` ON THE WAY IN. The wire
+      // payload calls it `kind` (`"exec" | "plugin"`) and `JournalEvent`'s own
+      // discriminant is also `kind`; a verbatim copy would collide the two
+      // meanings on one key and make the event union undiscriminable. Spreading
+      // `...request` here would do exactly that silently, which is why every
+      // field is written out.
+      //
+      // The admission rule is `isUsableMessageId` on the id alone — the same
+      // predicate every other durable branch uses — because everything else on
+      // the payload is either enumerated (`kind`, `options[].decision`) or
+      // free text the client renders as-is with no non-empty requirement (the
+      // live `case "approval_request"` defaults each of them, `title: msg.title ?? ""`).
+      // Refusing a blank title here would drop a card live rendered (N10).
+      return isUsableMessageId(frame.id)
+        ? {
+            kind: "approval",
+            id: frame.id,
+            approvalKind: frame.kind,
+            title: frame.title,
+            ...(frame.description !== undefined
+              ? { description: frame.description }
+              : {}),
+            prompt: frame.prompt,
+            // COPIED, not aliased, so the event is a self-contained value the
+            // caller cannot mutate out from under the journal — the same rule
+            // the `seal` branch above applies to `answers`/`remove`.
+            options: frame.options.map((option) => ({
+              decision: option.decision,
+              label: option.label,
+              style: option.style,
+            })),
+            ...(frame.expiresAtMs !== undefined
+              ? { expiresAtMs: frame.expiresAtMs }
+              : {}),
+          }
+        : null;
     case "approval_resolved":
-      // NOT YET durable — #242 half 4. It is the state change of the message
-      // above, and it is the half that actually needs #241's revision model.
-      return null;
+      // DURABLE since #242 half 4 — the card's STATE CHANGE, as its own
+      // append-only row. `applyApprovalResolution` folds it onto the `approval`
+      // row that precedes it in this same stream.
+      //
+      // ⚠️ EXPIRY IS NOT A SEPARATE EVENT AND MUST NEVER BECOME ONE. A card that
+      // times out server-side arrives here as an ordinary resolution —
+      // `approvals.ts`'s `buildExpiredResult` returns
+      // `{kind:"update", payload:{decision:"deny"}}`, which reaches
+      // `updateEntry` and publishes a real `approval_resolved{decision:"deny"}`.
+      // What is left over is a card whose `expiresAtMs` passed with no frame at
+      // all, and THAT is a wall-clock comparison the reducer's PURITY CONTRACT
+      // forbids: an expiry folded at replay time would make one journal project
+      // differently on two reads. Expiredness is derived at RENDER, from the
+      // `expiresAtMs` this row already carries.
+      return isUsableMessageId(frame.id)
+        ? { kind: "approvalResolution", id: frame.id, decision: frame.decision }
+        : null;
     case "approval_snapshot":
-      // NEVER durable — and this one is NOT deferred work, unlike the two above.
+      // NEVER durable — and this one is NOT deferred work, unlike the two above
+      // ever were.
       //
       // It is a server→client REPLAY of approval state the store already holds,
       // exactly like the `history` case below: journaling it would write the
-      // store's own output back into the store, duplicating rows that the
-      // `approval_request`/`approval_resolved` events will already carry once
-      // half 4 lands. Do not schedule it.
+      // store's own output back into the store, duplicating rows the
+      // `approval`/`approvalResolution` events already carry now that half 4 has
+      // landed. Do not schedule it.
+      //
+      // ⚠️ IT IS ALSO WHAT MAKES A REPLAYED CARD SAFE, so do not read "not
+      // durable" as "not load-bearing". `nats-register.ts` sends this frame on
+      // EVERY successful register, unconditionally; the client renders a card
+      // that came from `history` non-interactive and lets ONLY this frame arm
+      // one again. It is the authority for "what is still open", which is
+      // precisely why it must not also be a stored message.
       return null;
     case "turn_settled":
       // Control frame. It carries no content and the client renders no bubble

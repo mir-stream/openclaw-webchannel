@@ -37,6 +37,13 @@ function renderInto(list: HTMLElement, messages: readonly ChatMessage[]): void {
       bubbles.push(buildReasoningDetails(item, renderMarkdown(item.text), openIds.has(item.id)));
     } else if (presentation.kind === "tool_activity") {
       bubbles.push(buildToolActivityChip(presentation.value));
+    } else if (presentation.kind === "approval") {
+      // #242 half 4. This harness only pins ORDER and DOM identity, so the card
+      // is a marker node: resolving it against `state.approvals` (what the real
+      // widget does) would drag the whole client state in for nothing.
+      const div = document.createElement("div");
+      div.dataset.approvalId = presentation.id;
+      bubbles.push(div);
     } else {
       const div = document.createElement("div");
       div.textContent = presentation.value.text;

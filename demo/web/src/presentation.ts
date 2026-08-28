@@ -65,17 +65,27 @@ export function composerButtonMode(
  *
  * In the gap (`turnActive` true, nothing typing) the line softens to "still
  * working…", except when something louder already speaks for the turn: a live
- * `working` draft renders its own in-progress bubble, and an unresolved approval
+ * `working` draft renders its own in-progress bubble, and an ACTIONABLE approval
  * card takes priority over the gap hint (the turn is blocked on the USER, not
  * working). The approval check is scoped to the gap hint alone — the typing line
  * keeps its base behavior, where an approval frame clears `isTyping` anyway.
+ *
+ * ⚠️ THE APPROVAL TEST IS `actionable`, AND IT WAS `resolvedDecision === undefined`
+ * UNTIL #242 half 4 MADE THAT ANSWER WRONG. Approvals are durable messages now,
+ * so `state.approvals` also holds cards REPLAYED from history — a card the user
+ * saw days ago, still recorded as unresolved because nobody ever answered it.
+ * Under the old test one such card would suppress "still working…" for the rest
+ * of the session, on every turn, forever after a reload. `actionable` asks the
+ * question this line actually means: is the agent blocked on the user RIGHT NOW.
+ * A live unresolved card answers yes exactly as before, so the behaviour this
+ * hint was built for is unchanged.
  */
 export function activityHint(state: {
   isTyping?: boolean;
   turnActive?: boolean;
   messages: readonly ChatMessage[];
   reasoning: readonly ReasoningItem[];
-  approvals: readonly Pick<ApprovalRequest, "resolvedDecision">[];
+  approvals: readonly Pick<ApprovalRequest, "actionable">[];
 }): string | null {
   if (state.isTyping === true) {
     // P1-9: skip pending/retracted user bubbles — they have no turnId, and
@@ -91,7 +101,7 @@ export function activityHint(state: {
   }
   if (state.turnActive !== true) return null;
   if (state.messages.some((m) => m.working)) return null;
-  if (state.approvals.some((a) => a.resolvedDecision === undefined)) return null;
+  if (state.approvals.some((a) => a.actionable === true)) return null;
   return "still working…";
 }
 
@@ -107,7 +117,25 @@ export function activityHint(state: {
 export type ConversationPresentationItem =
   | { kind: "message"; value: ChatBubble }
   | { kind: "reasoning"; value: ReasoningItem }
-  | { kind: "tool_activity"; value: ToolActivityItem };
+  | { kind: "tool_activity"; value: ToolActivityItem }
+  /**
+   * An approval CARD's position in the transcript (#242 half 4).
+   *
+   * ⚠️ IT CARRIES AN `id`, NOT A VALUE, AND THAT ASYMMETRY IS THE POINT. The
+   * other three items carry a value because this module can build it from the
+   * transcript entry alone. An approval's RENDER STATE cannot be built here
+   * without recomputing what the library already computes — `resolvedDecision`
+   * folds a durable decision, an optimistic one and the `"unknown"` sentinel,
+   * and `actionable` is the safety bit that decides whether buttons are drawn at
+   * all. `state.approvals` is that computation (`deriveApprovals`), so the
+   * renderer looks the card up there and this item supplies only what the
+   * library cannot: WHERE it goes.
+   *
+   * A second copy of that fold, in a renderer, is exactly the "renderer holds a
+   * second opinion" shape the two halves before this one deleted — and here it
+   * would be a second opinion about whether a stale card is clickable.
+   */
+  | { kind: "approval"; id: string };
 
 /**
  * Order the transcript for rendering.
@@ -154,7 +182,17 @@ export type ConversationPresentationItem =
  * traces is the common case there. Tool durability has no such opt-in, so a
  * tool row is normally PRESENT in the snapshot and tier-1 matches — the
  * displacement is reachable for tool only in the narrower window where the
- * snapshot predates the call.
+ * snapshot predates the call. Approval rows behave like tool rows on both
+ * counts: no opt-in, so normally present and tier-1 matched.
+ *
+ * ⚠️ AND THE APPROVAL LANE IS GONE TOO (#242 half 4) — the LAST of the three,
+ * and the one that was not even a lane. Reasoning and tool at least had a
+ * `turnId` the widget re-anchored on; approvals were drawn from
+ * `state.approvals` into a BOX BELOW THE WHOLE TRANSCRIPT
+ * (`widget.ts`'s `approvalsBox`), so a card had no position at all — a prompt
+ * that interrupted the third of ten messages rendered under the tenth. An
+ * approval is a durable message now, it sits where the stream put it, and this
+ * function reads that position like every other kind.
  */
 export function orderConversationPresentation(
   messages: readonly ChatMessage[],
@@ -182,6 +220,10 @@ export function orderConversationPresentation(
           ...(message.argKeys !== undefined ? { argKeys: message.argKeys } : {}),
         },
       });
+      continue;
+    }
+    if (message.kind === "approval") {
+      result.push({ kind: "approval", id: message.id });
       continue;
     }
     result.push({ kind: "message", value: message });

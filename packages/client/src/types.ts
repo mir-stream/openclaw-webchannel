@@ -308,16 +308,93 @@ type BubbleOnlyFieldsAbsentOnTool = {
 export type ChatToolMessage = ChatToolCore & BubbleOnlyFieldsAbsentOnTool;
 
 /**
- * One entry in `state.messages` — a chat bubble, a reasoning block, or a tool
- * call.
+ * ONE NATIVE HITL APPROVAL CARD in the transcript (#242 half 4, doc §15.9).
+ *
+ * ⚠️ THIS IS THE FIRST DURABLE MESSAGE THE USER INTERACTS WITH, and the fields
+ * below split three ways rather than two. Read the split before changing any of
+ * them:
+ *  - DURABLE CONTENT (`id`, `approvalKind`, `title`, `description`, `prompt`,
+ *    `options`, `expiresAtMs`) — the request payload, journaled verbatim;
+ *  - DURABLE STATE (`resolvedDecision`) — folded from the `approvalResolution`
+ *    event, and the one field a replay can set;
+ *  - CLIENT-LOCAL (`actionable`, `resolutionConfirmed`, `resolvedElsewhere`,
+ *    `ts`) — never journaled, never on the history wire.
+ *
+ * ⚠️ `actionable` IS THE SAFETY BIT OF THIS ENTIRE SLICE, AND ITS DEFAULT IS THE
+ * WHOLE POINT: ABSENT MEANS NOT CLICKABLE. An approval replayed from `history`
+ * is built without it, so a card the user saw three days ago can never offer
+ * buttons again. Only a LIVE `approval_request`, or an `approval_snapshot` that
+ * still lists the id as pending, may set it — and the snapshot is exactly the
+ * authority for "what is still open", emitted on EVERY successful register
+ * (`nats-register.ts`'s `deps.sendApprovalSnapshot(peerId)`, in the same success
+ * block as the history snapshot and unconditionally).
+ *
+ * Writing it the other way round — a `stale` bit set by the history path —
+ * would be one forgotten branch away from a clickable replay, and the branch
+ * that forgets is always the new one. Fail-closed costs nothing here: the
+ * snapshot re-arms every card that is genuinely still open, on every reconnect.
+ *
+ * ⚠️ `resolvedDecision` CARRIES BOTH THE SERVER'S ANSWER AND `decide()`'s
+ * OPTIMISTIC GUESS, and `resolutionConfirmed` is what tells them apart — the
+ * same #15 arrangement `ApprovalRequest` has always had, moved onto the
+ * transcript entry. `"unknown"` is NOT a member here: it is a reconciliation
+ * OUTCOME, not a decision, so it rides its own `resolvedElsewhere` bit and is
+ * re-composed for the public `ApprovalRequest`. Keeping the sentinel out of the
+ * decision field is what lets the durable arm of `DurableMessage` refuse it.
+ *
+ * ⚠️ NO `role`, exactly as on `ChatReasoningMessage` and `ChatToolMessage` — the
+ * wire carries no author and no layer invents one. That absence is also what
+ * makes the new history row safe for every released client (see
+ * `channel-contract.ts`'s approval variant for the measured argument).
+ *
+ * ⚠️ THE PAYLOAD'S OWN `kind` IS CARRIED AS `approvalKind`, because `kind` is
+ * this union's DISCRIMINANT. Same rename, same reason, at all three layers.
+ */
+type ChatApprovalCore = {
+  kind: "approval";
+  id: string;
+  approvalKind: "exec" | "plugin";
+  title: string;
+  description?: string;
+  prompt: string;
+  options: readonly ApprovalOption[];
+  expiresAtMs?: number;
+  /** DURABLE state, or `decide()`'s optimistic guess — see `resolutionConfirmed`. */
+  resolvedDecision?: ApprovalDecision;
+  /** CLIENT-LOCAL: a server frame (or a snapshot) confirmed the resolution. */
+  resolutionConfirmed?: boolean;
+  /** CLIENT-LOCAL: resolved while this device was away, outcome unknown (#15). */
+  resolvedElsewhere?: boolean;
+  /** CLIENT-LOCAL: this device may offer decision buttons for this card. */
+  actionable?: boolean;
+  /** Hydration metadata, exactly as on a bubble. Absent on a live card. */
+  ts?: number;
+};
+
+/**
+ * Every `ChatBubble` field an approval entry cannot have, pinned to `undefined`
+ * — the same device as `BubbleOnlyFieldsAbsent`, derived rather than listed for
+ * the same reason. See that type for the full trade this shape makes.
+ */
+type BubbleOnlyFieldsAbsentOnApproval = {
+  [K in Exclude<keyof ChatBubble, keyof ChatApprovalCore>]?: undefined;
+};
+
+export type ChatApprovalMessage = ChatApprovalCore & BubbleOnlyFieldsAbsentOnApproval;
+
+/**
+ * One entry in `state.messages` — a chat bubble, a reasoning block, a tool call,
+ * or an approval card.
  *
  * ⚠️ A TAGGED UNION, MIRRORING THE REDUCER'S `DurableMessage` AND THE WIRE'S
- * `HistoryMessage`. #242 half 2 moved reasoning INTO this array and half 3 did
- * the same for tool activity, because such a block's POSITION is the
- * transcript's, and the transcript's order is the array's. The alternative —
- * keeping a side list and re-interleaving it by `turnId` at render time — is a
- * SECOND opinion about ordering held by the renderer, which is what the widget
- * used to do and what those two halves deleted, one lane each.
+ * `HistoryMessage`. #242 half 2 moved reasoning INTO this array, half 3 did the
+ * same for tool activity and half 4 for approvals, because such a block's
+ * POSITION is the transcript's, and the transcript's order is the array's. The
+ * alternative — keeping a side list and re-interleaving it by `turnId` at render
+ * time — is a SECOND opinion about ordering held by the renderer, which is what
+ * the widget used to do and what those three halves deleted, one lane each. (The
+ * approval lane was not even ordered by `turnId`: the demo drew `state.approvals`
+ * in a BOX BELOW the transcript, so a card had no position at all.)
  *
  * ⚠️ NARROW ON `kind`, NEVER ON A MISSING FIELD. `m.kind === "reasoning"` is the
  * test. Reading `m.role`/`m.working` off an unnarrowed entry does compile (see
@@ -325,7 +402,11 @@ export type ChatToolMessage = ChatToolCore & BubbleOnlyFieldsAbsentOnTool;
  * but "no role, therefore reasoning" is the inference v6 exists to remove — a
  * future variant would break it silently, where a `kind` test would not.
  */
-export type ChatMessage = ChatBubble | ChatReasoningMessage | ChatToolMessage;
+export type ChatMessage =
+  | ChatBubble
+  | ChatReasoningMessage
+  | ChatToolMessage
+  | ChatApprovalMessage;
 
 /**
  * One live/durable reasoning burst, as `state.reasoning` exposes it.
@@ -416,8 +497,28 @@ export type ApprovalOption = {
  * `approval_resolved` frame, or a snapshot marking the card resolved) from
  * `decide()`'s OPTIMISTIC local set. It stays falsy for an optimistic decision
  * so the snapshot reconciler can detect a lost decision frame (Leg C) and
- * re-send it. It is internal-ish plumbing; the demo widget still keys its UI
- * purely off `resolvedDecision !== undefined`.
+ * re-send it. It is internal-ish plumbing.
+ *
+ * ⚠️ `state.approvals` IS DERIVED FROM `state.messages` SINCE #242 half 4 — an
+ * approval is a durable transcript message now, not a side array. The ITEM shape
+ * below is unchanged except for one ADDED field, so an existing embedder needs
+ * no edit to keep working; it needs one to stay CORRECT. See `actionable`.
+ *
+ * ⚠️ `actionable` IS NOT COSMETIC, AND `resolvedDecision !== undefined` IS NO
+ * LONGER A SUFFICIENT UI KEY. Before half 4 an approval card existed only while
+ * the live session knew about it, so "unresolved" and "clickable" were the same
+ * state. Now a card can be REPLAYED FROM HISTORY: still unresolved as far as the
+ * durable stream records, but possibly expired or decided on another device
+ * since, and a click on it would send a decision nobody is waiting for. A
+ * history-replayed card therefore reports `actionable !== true` while
+ * `resolvedDecision` stays `undefined`, and only the live `approval_request`
+ * frame or a register-time `approval_snapshot` that still lists the id as
+ * pending makes it true again.
+ *
+ * `decide()` enforces the same rule at the API, so an embedder that renders
+ * buttons off `resolvedDecision` alone shows a dead button rather than sending a
+ * stale decision. That is a degradation, not a hole — but render off
+ * `actionable`.
  */
 export type ApprovalRequest = {
   id: string;
@@ -429,6 +530,11 @@ export type ApprovalRequest = {
   expiresAtMs?: number;
   resolvedDecision?: ApprovalDecision | "unknown";
   resolutionConfirmed?: boolean;
+  /**
+   * May this device offer decision buttons for this card? See the ⚠️ above —
+   * ABSENT/false is the safe default and is what a history replay produces.
+   */
+  actionable?: boolean;
 };
 
 /**
@@ -570,6 +676,27 @@ export type WebChannelState = {
    * compatible; current wrapper snapshots always initialize this to an array.
    */
   toolActivity?: ToolActivityItem[];
+  /**
+   * The approval cards in this transcript, in TRANSCRIPT ORDER.
+   *
+   * ⚠️ DERIVED FROM `state.messages` SINCE #242 half 4 — no longer an
+   * independently maintained array, and no longer position-less. An approval is
+   * a durable message: it is journaled (`approval` + `approvalResolution`
+   * events), replayed on reload, and it sits between the messages it
+   * interrupted. The public shape is unchanged apart from the added
+   * `actionable`, so reading this field still works; see `ApprovalRequest` for
+   * why rendering off `resolvedDecision` alone no longer does.
+   *
+   * ⚠️ NO CAP AND NO PRUNE, the same honest position `reasoning`/`toolActivity`
+   * take: this grows with the conversation, retention belongs at the store
+   * (**#299**), and the client-retention twin is **#310**.
+   *
+   * ⚠️ KNOWN LIMITATION — **#311**, and an approval is the WORST row for it. A
+   * history page is bounded by ROW COUNT, never by bytes, and an approval row
+   * carries `title`, `prompt`, `description` and an `options[]` array, so it is
+   * LARGER than a tool row. Unlike reasoning it has no opt-in, so — exactly like
+   * tool — it appears at the DEFAULT configuration. #311 is not fixed here.
+   */
   approvals: ApprovalRequest[];
   status: ConnectionStatus;
   /** Convenience mirror of `status === "connected"`. */

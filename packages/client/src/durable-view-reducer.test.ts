@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 import {
   applyDurableEvent,
@@ -354,7 +354,7 @@ describe("step / fold agreement: reduceDurableView === fold of applyDurableEvent
       turnId: "turn-new",
     });
     expect(changed).not.toBe(view);
-    expect(view[0].turnId).toBe(TURN);
+    expect(asText(view[0]).turnId).toBe(TURN);
   });
 
   it("SAME array: a seal with neither valid answers nor removes", () => {
@@ -938,6 +938,27 @@ function seed(w: WrapperInternals, starting: DurableView): void {
           ...(m.argKeys !== undefined ? { argKeys: m.argKeys } : {}),
         };
       }
+      // #242 half 4, same rule as the tool arm above: field by field, each
+      // absent optional OMITTED rather than written as `undefined`, so the round
+      // trip back through `projectDurableFromClient` reproduces this entry
+      // exactly. Client-local fields (`actionable`, `resolutionConfirmed`,
+      // `resolvedElsewhere`) are deliberately NOT seeded — they are not part of
+      // the durable view a seed is built from.
+      if (m.kind === "approval") {
+        return {
+          kind: "approval",
+          id: m.id,
+          approvalKind: m.approvalKind,
+          title: m.title,
+          ...(m.description !== undefined ? { description: m.description } : {}),
+          prompt: m.prompt,
+          options: m.options,
+          ...(m.expiresAtMs !== undefined ? { expiresAtMs: m.expiresAtMs } : {}),
+          ...(m.resolvedDecision !== undefined
+            ? { resolvedDecision: m.resolvedDecision }
+            : {}),
+        };
+      }
       return { id: m.id, role: m.role, text: m.text, turnId: m.turnId, working: false };
     }),
   };
@@ -1042,9 +1063,9 @@ describe("equivalence anchor: user ≡ the real publish() echo", () => {
     expect(asText(u1).role).toBe("user");
 
     const events: DurableEvent[] = [
-      { kind: "user", id: u0.id, text: "first question", turnId: u0.turnId },
+      { kind: "user", id: u0.id, text: "first question", turnId: asText(u0).turnId },
       { kind: "bubble", answerId: "A", text: "answer A", turnId: TURN },
-      { kind: "user", id: u1.id, text: "second question", turnId: u1.turnId },
+      { kind: "user", id: u1.id, text: "second question", turnId: asText(u1).turnId },
     ];
     expect(reduceDurableView(events)).toEqual(real);
     // Non-vacuity: the interleaving is what the anchor is about.
@@ -1170,7 +1191,7 @@ describe("equivalence anchor: bubble ≡ a real agent_message frame", () => {
       text: "A final",
     });
     expect(reduced).toEqual(real);
-    expect(real[0].turnId).toBe(TURN);
+    expect(asText(real[0]).turnId).toBe(TURN);
   });
 });
 
@@ -1451,6 +1472,8 @@ import {
   TOOL_TURN,
   TOOL_TURN_FRAMES,
   TOOL_TURN_ROWS,
+  APPROVAL_TURN_FRAMES,
+  APPROVAL_TURN_ROWS,
   type ReasoningTurnFrame,
   type ReasoningTurnRow,
 } from "./reasoning-turn.test-harness.js";
@@ -1725,5 +1748,295 @@ describe("live == history for tool activity: a reload reproduces what was watche
       { kind: "tool", id: "call-1", turnId: "turn-a", name: "bash" },
       { kind: "tool", id: "call-1", turnId: "turn-b", name: "grep" },
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #242 half 4 — live == history for APPROVALS, and the one thing that must NOT
+// survive the round trip: interactivity.
+// ---------------------------------------------------------------------------
+//
+// The both-sides property is pinned by the SHARED fixture
+// (`reasoning-turn.test-harness.ts`, FIXTURE D), so this half and
+// `packages/plugin/src/journal-history.test.ts` cannot be edited apart: this one
+// proves the CLIENT renders the replayed rows the same as live, that one proves
+// the PROJECTION emits them.
+//
+// ⚠️ THE INTERACTIVITY CASES ARE DELIBERATELY *NOT* IN THE SHARED FIXTURE.
+// `actionable` is client-local, never journaled and never on the history wire —
+// a fixture both packages assert against could not carry it without asserting a
+// field one of them does not have.
+describe("live == history for approvals: a reload reproduces the card and its verdict", () => {
+  /** The DURABLE fields of a transcript — `ts`/`working`/`actionable` are local. */
+  function durable(list: Array<Record<string, unknown>>): unknown[] {
+    return list.map((m) => {
+      if (m.kind === "approval") {
+        return {
+          kind: "approval",
+          id: m.id,
+          approvalKind: m.approvalKind,
+          title: m.title,
+          ...(m.description !== undefined ? { description: m.description } : {}),
+          prompt: m.prompt,
+          options: m.options,
+          ...(m.expiresAtMs !== undefined ? { expiresAtMs: m.expiresAtMs } : {}),
+          ...(m.resolvedDecision !== undefined
+            ? { resolvedDecision: m.resolvedDecision }
+            : {}),
+        };
+      }
+      return { id: m.id, role: m.role, text: m.text };
+    });
+  }
+
+  function driveLive(): WrapperInternals {
+    const w = newWrapper() as unknown as WrapperInternals;
+    for (const frame of APPROVAL_TURN_FRAMES) {
+      w.handleMessage(frame as unknown as InboundMessage);
+    }
+    return w;
+  }
+
+  function driveReplay(): WrapperInternals {
+    const fresh = newWrapper() as unknown as WrapperInternals;
+    fresh.handleMessage({
+      type: "history",
+      messages: APPROVAL_TURN_ROWS.map((row, i) => ({ ...row, ts: i + 1 })),
+    } as unknown as InboundMessage);
+    return fresh;
+  }
+
+  const approvalsOf = (x: WrapperInternals) =>
+    (x.state as unknown as { approvals: Array<Record<string, unknown>> }).approvals;
+
+  it("same content, same state, same position — two frames fold into one card", () => {
+    const live = driveLive();
+    // POSITION: the card holds the slot of its REQUEST, ahead of the answer,
+    // even though it was RESOLVED after the answer's lane claimed its own.
+    expect(live.state.messages.map((m) => m.id)).toEqual(["ap-1", "A"]);
+
+    const fresh = driveReplay();
+
+    // ⭐ SAME CONTENT, SAME STATE, SAME POSITION.
+    expect(durable(fresh.state.messages)).toEqual(durable(live.state.messages));
+    // Non-vacuity: the shared fixture really does describe this turn, so a
+    // fixture edit cannot make the equality above pass by emptying both sides.
+    expect(durable(live.state.messages)).toEqual(
+      APPROVAL_TURN_ROWS.map((row) => ({ ...row })),
+    );
+  });
+
+  it("the FOLD is what makes them agree — the verdict survives onto the request row", () => {
+    // The regression guard for the design decision. The resolution frame carries
+    // no content and the request frame carries no verdict; a one-event journal
+    // would durably record a card reading "pending" for a command the user
+    // approved.
+    const live = driveLive();
+    expect(live.state.messages[0]).toMatchObject({
+      kind: "approval",
+      id: "ap-1",
+      title: "Run a command",
+      resolvedDecision: "allow-once",
+    });
+  });
+
+  it("state.approvals is DERIVED from the transcript, live and replayed alike", () => {
+    const live = driveLive();
+    const fresh = driveReplay();
+    // Everything except the one field that MUST differ.
+    const withoutActionable = (list: Array<Record<string, unknown>>) =>
+      list.map(({ actionable: _drop, ...rest }) => rest);
+    expect(withoutActionable(approvalsOf(fresh))).toEqual(
+      withoutActionable(approvalsOf(live)),
+    );
+    expect(withoutActionable(approvalsOf(live))).toEqual([
+      {
+        id: "ap-1",
+        kind: "exec",
+        title: "Run a command",
+        description: "The agent wants to run a shell command.",
+        prompt: "Run a command: rm -rf /tmp/scratch",
+        options: [
+          { decision: "allow-once", label: "Allow once", style: "success" },
+          { decision: "deny", label: "Deny", style: "danger" },
+        ],
+        expiresAtMs: 1_900_000_000_000,
+        resolvedDecision: "allow-once",
+        resolutionConfirmed: true,
+      },
+    ]);
+  });
+
+  it("a mid-session snapshot re-serving the same card is a no-op — tier 1 matches", () => {
+    // Keyed by (kind, id), so the row meets its own entry and does not
+    // duplicate. A history snapshot lands on every register, so a
+    // non-idempotent tier 1 grows the transcript once per reconnect.
+    const w = driveLive();
+    const before = durable(w.state.messages);
+    for (let i = 0; i < 3; i++) {
+      w.handleMessage({
+        type: "history",
+        messages: APPROVAL_TURN_ROWS.map((row, j) => ({ ...row, ts: j + 1 })),
+      } as unknown as InboundMessage);
+    }
+    expect(durable(w.state.messages)).toEqual(before);
+  });
+
+  it("an approval id colliding with a BUBBLE id does not overwrite either one", () => {
+    // The kind-scoped index, end to end: same id, different kinds, both render.
+    const w = newWrapper() as unknown as WrapperInternals;
+    w.handleMessage({
+      type: "approval_request",
+      id: "X",
+      kind: "exec",
+      title: "T",
+      prompt: "P",
+      options: [],
+    } as unknown as InboundMessage);
+    w.handleMessage({
+      type: "agent_message",
+      id: "X",
+      turnId: "t",
+      text: "an answer",
+    } as unknown as InboundMessage);
+    expect(durable(w.state.messages)).toEqual([
+      { kind: "approval", id: "X", approvalKind: "exec", title: "T", prompt: "P", options: [] },
+      { id: "X", role: "agent", text: "an answer" },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #242 half 4 — THE HAZARD THIS SLICE EXISTS TO GET RIGHT.
+// ---------------------------------------------------------------------------
+//
+// An approval is the first durable message the user INTERACTS with. Re-rendering
+// a resolved one as clickable is bad; re-rendering a PENDING-AT-DISCONNECT one as
+// clickable is worse — on reconnect it may have expired or been decided out of
+// band, and a click sends a decision nobody is waiting for.
+//
+// The rule: a card that came from `history` is NON-INTERACTIVE, always. Only the
+// live `approval_snapshot` can make one interactive again.
+describe("#242 half 4: a REPLAYED approval is never clickable", () => {
+  const approvalsOf = (x: WrapperInternals) =>
+    (x.state as unknown as { approvals: Array<Record<string, unknown>> }).approvals;
+
+  /** A still-PENDING card as a history row — the dangerous shape. */
+  const pendingRow = {
+    kind: "approval",
+    id: "ap-9",
+    approvalKind: "exec",
+    title: "Run a command",
+    prompt: "Run a command: rm -rf /tmp/scratch",
+    options: [{ decision: "allow-once", label: "Allow once", style: "success" }],
+    ts: 1,
+  };
+
+  function replayPending(): WrapperInternals {
+    const w = newWrapper() as unknown as WrapperInternals;
+    w.handleMessage({
+      type: "history",
+      messages: [pendingRow],
+    } as unknown as InboundMessage);
+    return w;
+  }
+
+  it("⭐ a pending card replayed from history is UNRESOLVED and NOT actionable", () => {
+    const w = replayPending();
+    const [card] = approvalsOf(w);
+    // The trap: it looks exactly like a live pending card on the old UI key.
+    expect(card.resolvedDecision).toBeUndefined();
+    // The guard: it is not offered as actionable.
+    expect(card.actionable).toBe(false);
+  });
+
+  it("⭐ decide() REFUSES a replayed card — nothing reaches the wire", () => {
+    const w = replayPending();
+    const client = (w as unknown as {
+      client: { sendApprovalDecision: (id: string, d: string) => void };
+    }).client;
+    const spy = vi.spyOn(client, "sendApprovalDecision");
+    (w as unknown as { decide: (id: string, d: string) => void }).decide(
+      "ap-9",
+      "allow-once",
+    );
+    expect(spy).not.toHaveBeenCalled();
+    // And no optimistic resolution was recorded either — the card is untouched.
+    expect(approvalsOf(w)[0].resolvedDecision).toBeUndefined();
+  });
+
+  it("a LIVE approval_request IS actionable, so the guard is not vacuous", () => {
+    const w = newWrapper() as unknown as WrapperInternals;
+    w.handleMessage({
+      type: "approval_request",
+      id: "ap-9",
+      kind: "exec",
+      title: "Run a command",
+      prompt: "Run a command: rm -rf /tmp/scratch",
+      options: [{ decision: "allow-once", label: "Allow once", style: "success" }],
+    } as unknown as InboundMessage);
+    expect(approvalsOf(w)[0].actionable).toBe(true);
+  });
+
+  it("⭐ an approval_snapshot listing the card as pending RE-ARMS it (history-first order)", () => {
+    // The register path sends `history` and `approval_snapshot` on every
+    // register, and #240 half 2 made the history read DEFERRED, so either can
+    // land first. History-first is the order that leaves an inert card behind,
+    // and the snapshot is the ONLY authority allowed to fix that.
+    const w = replayPending();
+    expect(approvalsOf(w)[0].actionable).toBe(false);
+    w.handleMessage({
+      type: "approval_snapshot",
+      approvals: [
+        {
+          id: "ap-9",
+          kind: "exec",
+          title: "Run a command",
+          prompt: "Run a command: rm -rf /tmp/scratch",
+          options: [{ decision: "allow-once", label: "Allow once", style: "success" }],
+        },
+      ],
+    } as unknown as InboundMessage);
+    expect(approvalsOf(w)[0].actionable).toBe(true);
+    // Re-armed IN PLACE: one card, still at its transcript position.
+    expect(w.state.messages.map((m) => m.id)).toEqual(["ap-9"]);
+  });
+
+  it("an approval_snapshot that does NOT list the card retires it instead (Leg B)", () => {
+    const w = replayPending();
+    w.handleMessage({
+      type: "approval_snapshot",
+      approvals: [],
+    } as unknown as InboundMessage);
+    const [card] = approvalsOf(w);
+    expect(card.resolvedDecision).toBe("unknown");
+    expect(card.actionable).toBe(false);
+  });
+
+  it("a RESOLVED card replayed from history reports its verdict and is not actionable", () => {
+    // N8/N10: live showed the decision, so history must not hide it — but the
+    // buttons stay off.
+    const w = newWrapper() as unknown as WrapperInternals;
+    w.handleMessage({
+      type: "history",
+      messages: [{ ...pendingRow, resolvedDecision: "deny" }],
+    } as unknown as InboundMessage);
+    const [card] = approvalsOf(w);
+    expect(card.resolvedDecision).toBe("deny");
+    expect(card.actionable).toBe(false);
+  });
+
+  it("a history row carrying the client-local 'unknown' sentinel is REFUSED as a decision", () => {
+    // `"unknown"` is a local reconciliation outcome, not a decision anyone made;
+    // the server cannot journal one, so admitting it from the wire would render
+    // a resolution that never happened. The card stays pending — and inert.
+    const w = newWrapper() as unknown as WrapperInternals;
+    w.handleMessage({
+      type: "history",
+      messages: [{ ...pendingRow, resolvedDecision: "unknown" }],
+    } as unknown as InboundMessage);
+    const [card] = approvalsOf(w);
+    expect(card.resolvedDecision).toBeUndefined();
+    expect(card.actionable).toBe(false);
   });
 });

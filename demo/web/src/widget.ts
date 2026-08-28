@@ -78,7 +78,6 @@ export async function createWidget(
     style: "font-size:11px;color:var(--muted);margin-bottom:8px",
   }, ["↔ multi-device: open another tab as the same user — it syncs (each tab is its own device key)"]);
   const list = el("div", { style: "display:flex;flex-direction:column;gap:8px;min-height:120px" });
-  const approvalsBox = el("div", { style: "display:flex;flex-direction:column;gap:8px" });
   const errBox = el("div", {
     class: "hidden",
     style:
@@ -96,7 +95,7 @@ export async function createWidget(
       "border:1px solid var(--border);border-radius:6px;background:#161b22;max-height:180px;overflow:auto",
   });
   const composer = el("div", { style: "display:flex;gap:8px;margin-top:10px" }, [input, sendBtn]);
-  bodyEl.append(topBar, mdHint, errBox, list, approvalsBox, cmdMenu, composer);
+  bodyEl.append(topBar, mdHint, errBox, list, cmdMenu, composer);
 
   let client: WebChannelNATSClient | null = null;
   // P0-3 typeahead state. `commandsRequestedAt` makes catalog discovery LAZY
@@ -148,13 +147,27 @@ export async function createWidget(
   };
 
   // ── Render ───────────────────────────────────────────────────────────────
+  /**
+   * ⚠️ #242 half 4: THE BUTTONS KEY OFF `actionable`, NOT OFF
+   * `resolvedDecision !== undefined`. Approvals are durable messages now, so a
+   * card can be REPLAYED from history: unresolved as far as the durable stream
+   * records, and yet not something to click, because between the disconnect and
+   * this render it may have expired or been decided on another device. A click
+   * would send a decision nobody is waiting for.
+   *
+   * `state.approvals` reports `actionable` as "the live session says this card
+   * is still open AND nothing has answered it", so the old test is subsumed
+   * rather than dropped — a resolved card is never actionable. `decide()`
+   * enforces the same predicate, so a stale click is refused even if a renderer
+   * gets this wrong; that is the belt, this is the braces.
+   */
   function renderApproval(a: ApprovalRequest): HTMLElement {
     const resolved = a.resolvedDecision !== undefined;
     const buttons = a.options.map((opt) => {
       const bt = el("button", {}, [opt.label]) as HTMLButtonElement;
       if (opt.style === "danger") bt.style.borderColor = "var(--bad)";
       if (opt.style === "success" || opt.style === "primary") bt.className = "primary";
-      bt.disabled = resolved;
+      bt.disabled = a.actionable !== true;
       bt.onclick = () => client?.decide(a.id, opt.decision);
       return bt;
     });
@@ -300,11 +313,19 @@ export async function createWidget(
     const nextMdCache = new Map<string, HTMLElement>();
     const openReasoningIds = captureOpenReasoningIds(list);
     const bubbles: HTMLElement[] = [];
-    // #242 half 2 stopped passing `state.reasoning`, and half 3 stopped passing
-    // `state.toolActivity` for the same reason: BOTH lanes live in
-    // `state.messages` at their own positions now, and both side arrays are
-    // DERIVED from it, so re-supplying either would ask this function to place
-    // the same blocks twice. The parameter is gone, not merely unused.
+    // #242 half 2 stopped passing `state.reasoning`, half 3 stopped passing
+    // `state.toolActivity` and half 4 removed the `approvalsBox` entirely, all
+    // for the same reason: every one of those lanes lives in `state.messages` at
+    // its own position now, and every side array is DERIVED from it, so
+    // re-supplying one would ask this function to place the same blocks twice.
+    // The parameters are gone, not merely unused.
+    //
+    // ⚠️ `state.approvals` IS STILL READ — as a LOOKUP, not as a lane. The
+    // presentation item carries only the card's id (see
+    // `ConversationPresentationItem`), because the card's render state
+    // (`resolvedDecision`, `actionable`) is a fold the library already performs
+    // and a renderer must not perform twice.
+    const approvalById = new Map(state.approvals.map((a) => [a.id, a]));
     for (const presentation of orderConversationPresentation(state.messages)) {
       if (presentation.kind === "reasoning") {
         const item = presentation.value;
@@ -322,6 +343,15 @@ export async function createWidget(
       // exactly as it does live.
       if (presentation.kind === "tool_activity") {
         bubbles.push(buildToolActivityChip(presentation.value));
+        continue;
+      }
+      // #242 half 4: the approval card renders IN PLACE, where the prompt
+      // interrupted the conversation, instead of in a box below everything. A
+      // card whose id is not in `state.approvals` cannot happen (both are
+      // derived from the same array) and is skipped rather than guessed at.
+      if (presentation.kind === "approval") {
+        const approval = approvalById.get(presentation.id);
+        if (approval) bubbles.push(renderApproval(approval));
         continue;
       }
       const m = presentation.value;
@@ -374,7 +404,6 @@ export async function createWidget(
     }
     list.replaceChildren(...bubbles);
     mdCache = nextMdCache;
-    approvalsBox.replaceChildren(...state.approvals.map(renderApproval));
     // Keep the typeahead in sync when the catalog frame lands mid-typing.
     renderMenu();
   }
