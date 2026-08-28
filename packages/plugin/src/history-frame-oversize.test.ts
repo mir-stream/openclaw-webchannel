@@ -1,45 +1,40 @@
 /**
- * #311 — THE `history` FRAME IS BOUNDED BY ROW COUNT AND NEVER BY BYTES.
+ * #311 — A `history` FRAME TOO BIG FOR THE WIRE, END TO END.
  *
- * ⚠️ THIS FILE PINS A DEFECT, NOT A CONTRACT. Every assertion below describes
- * what the code does TODAY. When #311's fix lands (a byte-aware page budget, or
- * chunking) these tests MUST be consciously rewritten — that is the point of
- * having them. Each one names the defect it is pinning at its assertion.
+ * This file drives the REAL `createHistoryServer` (`history-serve.ts`) over a
+ * REAL `openDeliveryJournal` fed through the REAL egress seam
+ * (`NatsChannel.sendReasoning` / `sendText` → `sendToPeer` → `journalOutbound`),
+ * against a transport that reproduces `nats-transport.ts`'s ONE size check
+ * verbatim. `history-frame-budget.test.ts` is the pure unit file for the
+ * algorithm; this one is the proof that it is actually wired to the sealed
+ * sizes the wire uses.
  *
- * WHY IT EXISTS: #311's body said "Not measured — the threshold above is
- * arithmetic from the configured limits, not an observed failure." These tests
- * are the measurement. They drive the REAL `createHistoryServer`
- * (`history-serve.ts`) over a REAL `openDeliveryJournal` fed through the REAL
- * egress seam (`NatsChannel.sendReasoning` / `sendText` →
- * `sendToPeer` → `journalOutbound`), against a transport that reproduces
- * `nats-transport.ts`'s ONE size check verbatim.
+ * ── WHAT WAS MEASURED (this is what closed #311's "Not measured") ──
  *
- * ── THE MECHANISM, AS MEASURED HERE ──
+ * `history.limit` / `pageSize` / `MAX_WIRE_HISTORY_LIMIT` bound a page by ROW
+ * COUNT and nothing bounded it by BYTES. On an encrypted channel, a 50-row
+ * snapshot seals past a stock nats-server's 1 MiB at 15 651 bytes of text per
+ * row; a peer-requested 1000-row page at 734 bytes per row; one row alone at
+ * 786 160 bytes. The MEASUREMENT tests below still assert exactly those
+ * thresholds, because they are the evidence and they must not be softened.
  *
- *  1. `history-serve.ts`'s `sendSnapshot` asks for `{kind:"recent", limit:
- *     config.limit}` (default 50) and calls `channel.sendHistory(...)`;
- *     `servePage` does the same with the peer's clamped `limit`
- *     (`MAX_WIRE_HISTORY_LIMIT` = 1000).
- *  2. `NatsChannel.sendHistory` builds `{type:"history", messages}` and hands it
- *     to `sendToPeer`, which journals, seals, and publishes.
- *  3. `NatsTransport.publish` throws a `RangeError` when the sealed buffer is
- *     longer than `effectiveOutboundLimit` (stock nats-server: 1 MiB).
- *  4. `sendToPeer`'s own `catch` SWALLOWS that `RangeError`: one
- *     `console.error`, and `false` is returned.
- *  5. `history-serve.ts` ignores that `false`. So its "publish failed" branch
- *     never runs — that branch only catches a THROW out of `sendHistory`, and
- *     nothing throws.
+ * ── WHAT USED TO HAPPEN THERE, AND WHAT HAPPENS NOW ──
  *
- * Net: the peer receives NO `history` frame at all — not a truncated one — and
- * `history-serve.ts`, the module that owns the read, says NOTHING. `sendSnapshot`
- * is the register-hop snapshot, so this repeats on every reconnect: the chat is
- * EMPTY, not merely "missing reasoning".
+ * BEFORE: `NatsTransport.publish` threw a `RangeError`; `sendToPeer` caught it,
+ * logged one line and returned `false`; both call sites in `history-serve.ts`
+ * discarded that `false`. The peer received NO frame — not a short one — on
+ * every reconnect, and the module that owns the read said nothing.
  *
- * ⚠️ A CORRECTION TO PROSE THAT SHIPPED. `journal-history.ts`'s
- * `recentHistoryPage` docblock says the `RangeError` is one "`history-serve.ts`
- * catches as 'publish failed'". It is NOT — step 4 above eats it first, and the
- * `logger.error` assertion in "the silence" test below is the proof. Same for
- * `history.ts`'s `MAX_WIRE_HISTORY_LIMIT` docblock, which says the same thing.
+ * NOW: `history-frame-budget.ts` fits the page to the peer's sealed limit before
+ * it is published. The frame IS published, carrying the NEWEST rows that fit;
+ * the older ones are reported at `warn` and are reachable through the pager. A
+ * row that cannot fit on its own is skipped at `error` so paging can pass it —
+ * sound because such a row's LIVE send hit the same limit, so it was never
+ * delivered (the journal is written before the publish). And a send that is
+ * refused anyway is now reported instead of dropped.
+ *
+ * ⚠️ THE ONE THING THAT MUST NOT REGRESS: "short" must never become "absent".
+ * Each test below states which of the two it is holding.
  */
 
 import { EventEmitter } from "node:events";
@@ -205,6 +200,10 @@ function harness(opts: {
         sendHistoryResults.push(ok);
         return ok;
       },
+      // Straight through to the real channel: the budget must run against the
+      // SEALED sizes and the transport's own advertised limit, not a stand-in.
+      outboundWireSize: (peerId, payload) => channel.outboundWireSize(peerId, payload),
+      effectiveOutboundLimit: () => channel.effectiveOutboundLimit(),
     },
     config: opts.config ?? DEFAULT_HISTORY_CONFIG,
     logger: {
@@ -294,43 +293,69 @@ function crossingTextBytes(h: Harness, page: HistoryMessage[], hi: number): numb
   return hi;
 }
 
-describe("#311 — an oversized history frame is a BLACKOUT, not a truncation", () => {
-  it("publishes NOTHING to the peer when the snapshot exceeds max_payload", () => {
+describe("#311 — an oversized history frame is SHORTENED, never lost", () => {
+  /** The ids of the rows the peer's frame actually carries. */
+  const servedIds = (h: Harness, call = 0): string[] =>
+    h.servedFrames[call].map((m) => m.id);
+
+  it("publishes the NEWEST rows that fit when the snapshot exceeds max_payload", () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(console, "log").mockImplementation(() => {});
     const h = harness({ reasoningDurable: true });
     seedReasoningBursts(h, 6, 4 * 1024);
 
     // Seeding ran at `SEEDING_LIMIT`; the bound below is armed only for the
-    // READ, and it is one that a single live frame still fits under (asserted at
-    // the end) but six rows aggregated into one history frame do not.
+    // READ, and it is one that a single live frame still fits under but six
+    // rows aggregated into one history frame do not.
     armAt(h, 32 * 1024);
     h.server.sendSnapshot(PEER);
     h.flush();
 
-    // ⚠️ THE DEFECT, PINNED. Not a short frame — NO frame. The peer's chat is
-    // empty on this reconnect and on every one after it.
-    expect(outboundFrames(h)).toEqual([]);
-    // The read itself was fine and produced all six rows; only the wire refused.
-    expect(h.servedFrames).toHaveLength(1);
-    expect(h.servedFrames[0]).toHaveLength(6);
-    // `sendHistory` reported the failure the only way it can — and
-    // `history-serve.ts` drops this value on the floor at both call sites.
-    expect(h.sendHistoryResults).toEqual([false]);
-    // The `RangeError` died here: `sendToPeer`'s catch, one console line.
-    expect(error).toHaveBeenCalledTimes(1);
-    expect(String(error.mock.calls[0]?.[0])).toContain("Failed to send to peer");
+    // ⚠️ SHORT, NOT ABSENT — the property this whole issue is about. Exactly one
+    // frame reached the peer, and it fits.
+    const frames = outboundFrames(h);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].bytes).toBeLessThanOrEqual(32 * 1024);
+    expect(h.sendHistoryResults).toEqual([true]);
+    // Nothing was refused, so the channel's egress diagnostic never fired.
+    expect(error).not.toHaveBeenCalled();
 
-    // ⚠️ AND THE CHANNEL IS NOT SIMPLY DOWN. Under the SAME bound a live frame
-    // of the same content still reaches the peer, so this is specifically the
-    // AGGREGATED history frame that cannot be delivered — live keeps working
-    // while the reconnect view stays empty, which is why nobody notices.
-    expect(h.channel.sendReasoning(PEER, "r-live", "turn-live", "x".repeat(4 * 1024), true))
-      .toBe(true);
-    expect(outboundFrames(h)).toHaveLength(1);
+    // The NEWEST rows, in order, as a contiguous suffix of the conversation.
+    expect(servedIds(h)).toEqual(["r-1", "r-2", "r-3", "r-4", "r-5"]);
+
+    // ⚠️ AND IT IS MAXIMAL, not merely "some suffix". Adding the one row the
+    // budget left out puts the frame over the bound — checked with the
+    // channel's own sealed measurement, so this pins "as many of the newest as
+    // fit" rather than "an arbitrary number of them".
+    const oneMore = [{ ...h.servedFrames[0][0], id: "r-0" }, ...h.servedFrames[0]];
+    expect(sealedHistoryBytes(h, oneMore)).toBeGreaterThan(32 * 1024);
   });
 
-  it("CONTROL: the same journal and the same rows publish once the bound fits", () => {
+  it("says the page was shortened, at warn, and does not call it data loss", () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const h = harness({ reasoningDurable: true });
+    seedReasoningBursts(h, 6, 4 * 1024);
+
+    armAt(h, 32 * 1024);
+    h.server.sendSnapshot(PEER);
+    h.flush();
+
+    // ⚠️ THE SILENCE IS GONE. Before #311 this whole read logged NOTHING while
+    // the peer got NOTHING; `history-serve.ts` never saw `sendHistory`'s
+    // `false`. Now the module that owns the read reports what it did.
+    expect(h.warns).toHaveLength(1);
+    expect(h.warns[0]).toContain("history snapshot");
+    expect(h.warns[0]).toContain("was shortened");
+    expect(h.warns[0]).toContain("1 older row(s) left out");
+    expect(h.warns[0]).toContain("reachable with load_history");
+    expect(h.warns[0]).toContain(PEER);
+    // ⚠️ `warn`, NOT `error`, and nothing was undeliverable: the trimmed row is
+    // one `load_history` away. An operator reading this as deletion would go
+    // hunting for a corruption that is not there.
+    expect(h.errors).toEqual([]);
+  });
+
+  it("CONTROL: the same journal and the same rows arrive WHOLE once the bound fits", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     const h = harness({ reasoningDurable: true });
     seedReasoningBursts(h, 6, 4 * 1024);
@@ -339,16 +364,17 @@ describe("#311 — an oversized history frame is a BLACKOUT, not a truncation", 
     h.server.sendSnapshot(PEER);
     h.flush();
 
-    // Identical store, identical projection, identical row count — the ONLY
-    // difference from the test above is the byte bound. That is what makes the
-    // blackout a byte problem rather than a read problem.
+    // Identical store, identical projection — the ONLY difference from the two
+    // tests above is the byte bound. So the shortening is a byte decision, not
+    // a read one, and a page that fits is never touched.
     expect(outboundFrames(h)).toHaveLength(1);
     expect(h.sendHistoryResults).toEqual([true]);
-    expect(h.servedFrames[0]).toHaveLength(6);
+    expect(servedIds(h)).toEqual(["r-0", "r-1", "r-2", "r-3", "r-4", "r-5"]);
+    expect(h.warns).toEqual([]);
+    expect(h.errors).toEqual([]);
   });
 
-  it("the page path blacks out identically — it is not snapshot-only", () => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
+  it("the PAGE path is shortened the same way — this is not snapshot-only", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     const h = harness({ reasoningDurable: true });
     seedReasoningBursts(h, 6, 4 * 1024);
@@ -357,14 +383,18 @@ describe("#311 — an oversized history frame is a BLACKOUT, not a truncation", 
     h.server.servePage(PEER, {});
     h.flush();
 
-    expect(outboundFrames(h)).toEqual([]);
-    expect(h.sendHistoryResults).toEqual([false]);
+    expect(outboundFrames(h)).toHaveLength(1);
+    expect(h.sendHistoryResults).toEqual([true]);
+    expect(servedIds(h)).toEqual(["r-1", "r-2", "r-3", "r-4", "r-5"]);
+    expect(h.warns[0]).toContain("history page");
   });
-});
 
-describe("#311 — `history-serve.ts` never learns that the frame was lost", () => {
-  it("logs NOTHING: not 'publish failed', not anything", () => {
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+  it("PAGING REACHES THE TRIMMED ROWS — the cost of shortening is zero reach", () => {
+    // ⚠️ THE JUSTIFICATION FOR TRIMMING, EXERCISED RATHER THAN ASSERTED. Rows
+    // dropped from the OLD end are exactly what the next `load_history`
+    // returns, because this module's other entry point IS the pager. If that
+    // were not true, shortening would be data loss and chunking would have been
+    // the only honest fix.
     vi.spyOn(console, "log").mockImplementation(() => {});
     const h = harness({ reasoningDurable: true });
     seedReasoningBursts(h, 6, 4 * 1024);
@@ -372,30 +402,38 @@ describe("#311 — `history-serve.ts` never learns that the frame was lost", () 
     armAt(h, 32 * 1024);
     h.server.sendSnapshot(PEER);
     h.flush();
+    expect(servedIds(h)).toEqual(["r-1", "r-2", "r-3", "r-4", "r-5"]);
 
-    // ⚠️ THIS EMPTINESS IS THE FINDING (#311). `history-serve.ts`'s
-    // "publish failed" branch guards `emit(messages)` and only fires on a THROW
-    // out of `sendHistory` — but `NatsChannel.sendToPeer` catches the
-    // transport's `RangeError` itself and returns `false`, and both
-    // `sendSnapshot` and `servePage` ignore the return value. So the module
-    // that owns the read believes it succeeded.
-    //
-    // WHEN #311 IS FIXED THIS ASSERTION MUST CHANGE, and that is deliberate:
-    // whatever the fix is (a byte budget that shrinks the page, or chunking),
-    // a frame that still cannot be delivered has to become visible here.
-    expect(h.errors).toEqual([]);
-    expect(h.warns).toEqual([]);
-    // The projection was reported HEALTHY on the way past — nothing was
-    // unfoldable, so `reportProjectionHealth` had nothing to say either.
-    expect(h.servedFrames[0]).toHaveLength(6);
-    // The only trace anywhere is one `console.error` inside the channel. It is
-    // the GENERIC egress diagnostic — it does not carry `history-serve.ts`'s
-    // label, so nothing in the logs says a history read was lost.
+    // The client asks for what came before the oldest row it was given.
+    h.server.servePage(PEER, { before: servedIds(h)[0] });
+    h.flush();
+    expect(servedIds(h, 1)).toEqual(["r-0"]);
+  });
+
+  it("reports a send the channel REFUSES, instead of discarding the boolean", () => {
+    // The budget declines to act when even an EMPTY frame exceeds the limit —
+    // no subset of rows can help, and answering `[]` would impersonate an empty
+    // conversation to its owner. The page is handed on, the channel refuses it,
+    // and THAT is what must not be silent: before #311 this exact `false` was
+    // dropped at both call sites.
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const h = harness({ reasoningDurable: true });
+    seedReasoningBursts(h, 6, 4 * 1024);
+
+    armAt(h, 10);
+    h.server.sendSnapshot(PEER);
+    h.flush();
+
+    expect(outboundFrames(h)).toEqual([]);
+    expect(h.sendHistoryResults).toEqual([false]);
+    expect(h.errors).toHaveLength(1);
+    expect(h.errors[0]).toContain("history snapshot publish failed");
+    expect(h.errors[0]).toContain("refused a 6-row frame");
+    expect(h.errors[0]).toContain(PEER);
+    // The channel logged its own generic line too; the point is that the module
+    // owning the read no longer depends on someone reading that one.
     expect(error).toHaveBeenCalledTimes(1);
-    const line = String(error.mock.calls[0]?.[0]);
-    expect(line).toContain("[nats-channel] Failed to send to peer");
-    expect(line).not.toContain("history snapshot publish failed");
-    expect(line).not.toContain("history snapshot journal read failed");
   });
 });
 
@@ -446,8 +484,8 @@ describe("#311 — THE MEASUREMENT: where a page crosses a stock 1 MiB max_paylo
     expect(belowCrossing).toBeLessThanOrEqual(STOCK_MAX_PAYLOAD);
   });
 
-  it("END TO END: a 50-row snapshot at the crossing size really is a blackout", () => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
+  it("END TO END: a 50-row snapshot past the crossing arrives SHORT, not empty", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(console, "log").mockImplementation(() => {});
     // 16 KiB per burst — just past the crossing measured above, and a plausible
     // amount of reasoning for one turn.
@@ -458,9 +496,20 @@ describe("#311 — THE MEASUREMENT: where a page crosses a stock 1 MiB max_paylo
     h.server.sendSnapshot(PEER);
     h.flush();
 
-    expect(h.servedFrames[0]).toHaveLength(50);
-    expect(outboundFrames(h)).toEqual([]);
-    expect(h.sendHistoryResults).toEqual([false]);
+    // Before #311 this published nothing at all. Now it publishes one frame
+    // under the bound, carrying the newest rows.
+    const frames = outboundFrames(h);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].bytes).toBeLessThanOrEqual(STOCK_MAX_PAYLOAD);
+    expect(h.sendHistoryResults).toEqual([true]);
+    expect(error).not.toHaveBeenCalled();
+
+    const served = h.servedFrames[0];
+    expect(served.length).toBeGreaterThan(40);
+    expect(served.length).toBeLessThan(DEFAULT_HISTORY_CONFIG.limit);
+    // Newest-first-kept: the last row of the conversation is always present.
+    expect(served[served.length - 1].id).toBe("r-49");
+    expect(h.warns[0]).toContain("was shortened");
     expect(h.errors).toEqual([]);
   });
 
@@ -472,9 +521,9 @@ describe("#311 — THE MEASUREMENT: where a page crosses a stock 1 MiB max_paylo
    * 1000-row page with no operator configuration at all. At 1000 rows the
    * per-row budget is ~1 KiB, which MEASURES to 734 bytes of body text (sealing
    * to 1 049 453; 1 048 120 at 733) — an utterly ordinary agent answer, about a
-   * paragraph. So the blackout is reachable on plain chat bubbles with
+   * paragraph. So the overflow is reachable on plain chat bubbles with
    * `capabilities.reasoningDurable` OFF, which is its shipped default: the
-   * exposed set is every account, not only the ones that opted in.
+   * exposed set was every account, not only the ones that opted in.
    */
   it("1000 ORDINARY BUBBLES at MAX_WIRE_HISTORY_LIMIT cross 1 MiB at ~734 bytes each", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
@@ -496,8 +545,8 @@ describe("#311 — THE MEASUREMENT: where a page crosses a stock 1 MiB max_paylo
     expect(crossing).toBeLessThan(771);
   });
 
-  it("END TO END: a 1000-bubble page of 800-byte answers is a blackout", () => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
+  it("END TO END: a 1000-bubble page of 800-byte answers arrives SHORT, not empty", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(console, "log").mockImplementation(() => {});
     const h = harness();
     seedBubbles(h, MAX_WIRE_HISTORY_LIMIT, 800);
@@ -506,14 +555,21 @@ describe("#311 — THE MEASUREMENT: where a page crosses a stock 1 MiB max_paylo
     h.server.servePage(PEER, { limit: MAX_WIRE_HISTORY_LIMIT });
     h.flush();
 
-    expect(h.servedFrames[0]).toHaveLength(MAX_WIRE_HISTORY_LIMIT);
-    expect(outboundFrames(h)).toEqual([]);
-    expect(h.sendHistoryResults).toEqual([false]);
-    expect(h.errors).toEqual([]);
+    const frames = outboundFrames(h);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].bytes).toBeLessThanOrEqual(STOCK_MAX_PAYLOAD);
+    expect(h.sendHistoryResults).toEqual([true]);
+    expect(error).not.toHaveBeenCalled();
+
+    const served = h.servedFrames[0];
+    expect(served.length).toBeLessThan(MAX_WIRE_HISTORY_LIMIT);
+    expect(served[served.length - 1].id).toBe("m-999");
+    expect(h.warns[0]).toContain("history page");
+    expect(h.warns[0]).toContain("was shortened");
   });
 });
 
-describe("#311 — ONE row can be oversized on its own, and it is a permanent poison", () => {
+describe("#311 — a row too big to send is SKIPPED, and the page spans across it", () => {
   /**
    * MEASURED: one reasoning row on its own seals past a stock 1 MiB at 786 160
    * bytes of text (768 KiB) — 1 048 577 sealed at that length, exactly 1 048 576
@@ -522,36 +578,88 @@ describe("#311 — ONE row can be oversized on its own, and it is a permanent po
    * Nothing caps the LENGTH of a durable body. `sendToPeer` journals BEFORE it
    * publishes (#239, the persist-before-publish seam), so a body larger than
    * `max_payload` is committed to the store and only THEN fails to reach the
-   * peer live. From that moment every history read whose window includes that
-   * row blacks out — and no row count, however small, can page around it. A
-   * byte budget that shrinks the page therefore cannot fix this case on its
-   * own; a `limit` of 1 still exceeds the bound.
+   * peer live.
+   *
+   * ⚠️ WHICH IS EXACTLY WHY SKIPPING IT IS NOT AN N8 DIVERGENCE. The row is in the store
+   * BECAUSE its own live send hit the same `RangeError` at the same limit — the
+   * peer never saw it. Leaving it out of history PRESERVES `history == live`;
+   * it is a shrinking page that would break it. And a byte budget alone cannot
+   * help here: a page of ONE row is still over the bound, so without the skip
+   * the row is a permanent wall the pager can never get behind.
    */
-  it("journals an over-max_payload reasoning burst, then blacks out every read of it", () => {
+  it("skips the undeliverable row, serves the rest, and names it at error", () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(console, "log").mockImplementation(() => {});
-    const h = harness({ reasoningDurable: true, config: { limit: 1, pageSize: 1 } });
+    const h = harness({ reasoningDurable: true });
 
+    // Rows on BOTH sides of the poison one, so this is the mid-page case rather
+    // than a truncation that happens to look right.
+    seedReasoningBursts(h, 2, 1024);
     h.transport.effectiveOutboundLimit = STOCK_MAX_PAYLOAD;
-    // One burst whose text alone exceeds a stock max_payload.
-    expect(h.channel.sendReasoning(PEER, "r-big", "turn-big", "x".repeat(STOCK_MAX_PAYLOAD + 1), true))
-      .toBe(false);
-    // The LIVE frame never reached the peer...
-    expect(outboundFrames(h)).toEqual([]);
-    // ...and the row was written anyway, because the journal hook sits above the
-    // publish. This is the persist-before-publish window, working as designed.
-    expect(h.journal.read(PEER)).toHaveLength(1);
+    const huge = "x".repeat(STOCK_MAX_PAYLOAD + 1);
+    expect(h.channel.sendReasoning(PEER, "r-big", "turn-big", huge, true)).toBe(false);
+    h.transport.effectiveOutboundLimit = SEEDING_LIMIT;
+    for (let i = 0; i < 2; i++) {
+      expect(h.channel.sendReasoning(PEER, `late-${i}`, `turn-late-${i}`, "y".repeat(1024), true))
+        .toBe(true);
+    }
+
+    // The live send of the big row was refused, and the row was written anyway:
+    // the journal hook sits above the publish.
+    expect(h.journal.read(PEER)).toHaveLength(5);
 
     error.mockClear();
-    h.transport.published.length = 0;
+    armAt(h, STOCK_MAX_PAYLOAD);
     h.server.sendSnapshot(PEER);
     h.flush();
 
-    // A one-row page. Still oversized, still silent.
-    expect(h.servedFrames[0]).toHaveLength(1);
+    // ⚠️ THE PAGE SPANS ACROSS IT: rows older AND newer than the undeliverable
+    // one arrive in one frame, in order. Without the skip the budget stops at
+    // `r-big` and every page ends there forever.
+    expect(outboundFrames(h)).toHaveLength(1);
+    expect(h.sendHistoryResults).toEqual([true]);
+    expect(h.servedFrames[0].map((m) => m.id)).toEqual(["r-0", "r-1", "late-0", "late-1"]);
+
+    // Operator-actionable, at error, naming the row and its measured size.
+    expect(h.errors).toHaveLength(1);
+    expect(h.errors[0]).toContain("history snapshot skipped 1 undeliverable row(s)");
+    expect(h.errors[0]).toContain("r-big");
+    expect(h.errors[0]).toContain("#311");
+    expect(h.errors[0]).toContain(PEER);
+    // Not a trim: nothing was left out for budget reasons here.
+    expect(h.warns).toEqual([]);
+  });
+
+  it("a conversation of NOTHING BUT undeliverable rows sends no snapshot, loudly", () => {
+    // The frame would be empty, and an empty SNAPSHOT is suppressed exactly as
+    // it always was — an empty chat is what the peer sees either way. What must
+    // not happen is that it is silent: the `error` above is the only place this
+    // fact exists, because the wire has no "history unavailable" signal (#296).
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const h = harness({ reasoningDurable: true });
+
+    h.transport.effectiveOutboundLimit = STOCK_MAX_PAYLOAD;
+    for (let i = 0; i < 2; i++) {
+      expect(h.channel.sendReasoning(
+        PEER,
+        `r-big-${i}`,
+        `turn-big-${i}`,
+        "x".repeat(STOCK_MAX_PAYLOAD + 1),
+        true,
+      )).toBe(false);
+    }
+
+    error.mockClear();
+    armAt(h, STOCK_MAX_PAYLOAD);
+    h.server.sendSnapshot(PEER);
+    h.flush();
+
     expect(outboundFrames(h)).toEqual([]);
-    expect(h.sendHistoryResults).toEqual([false]);
-    expect(h.errors).toEqual([]);
-    expect(error).toHaveBeenCalledTimes(1);
+    expect(h.sendHistoryResults).toEqual([]);
+    expect(h.errors).toHaveLength(1);
+    expect(h.errors[0]).toContain("skipped 2 undeliverable row(s)");
+    expect(h.errors[0]).toContain("r-big-0");
+    expect(h.errors[0]).toContain("r-big-1");
   });
 });

@@ -4,8 +4,9 @@
  * Both things a peer can ask for — the register-time snapshot and a
  * `load_history` page — are the same three steps: pick a plan, replay this
  * peer's journal through the shared reducer (`journal-history.ts`), publish the
- * result. This module owns those two bodies so that `nats-account-runtime.ts`
- * is left holding wiring and no policy.
+ * result — byte-fitted to the peer's wire since #311 (`history-frame-budget.ts`,
+ * applied in `publishFitted` below). This module owns those two bodies so that
+ * `nats-account-runtime.ts` is left holding wiring and no policy.
  *
  * ⚠️ IT LIVES HERE BECAUSE IT COULD NOT BE TESTED WHERE IT LIVED BEFORE, AND
  * THAT WAS NOT A STYLE PROBLEM. Both bodies were closures inside
@@ -159,6 +160,7 @@
  * second implementation of the reducer, which is N8.
  */
 import type { DeliveryJournal } from "./delivery-journal.js";
+import { fitHistoryFrame, type SkippedHistoryRow } from "./history-frame-budget.js";
 import type { HistoryConfig, HistoryMessage } from "./history.js";
 import { planHistoryFetch } from "./history.js";
 import { serveHistoryRequest, type ServedHistory } from "./journal-history.js";
@@ -169,8 +171,16 @@ import type { NatsChannel } from "./nats-channel.js";
  * The exact channel surface this module reaches. `Pick` over the real class, the
  * same device `RegisterChannelSurface` uses, so removing `sendHistory` from
  * `NatsChannel` is a compile error at this contract rather than a runtime break.
+ *
+ * #311 widened it by the two MEASUREMENT members — the sealed size of a frame
+ * for this peer, and the peer's effective `max_payload`. Both were already
+ * public methods on the class; nothing new is exposed. They are what
+ * `history-frame-budget.ts` needs and deliberately does not import for itself.
  */
-export type HistoryChannelSurface = Pick<NatsChannel, "sendHistory">;
+export type HistoryChannelSurface = Pick<
+  NatsChannel,
+  "sendHistory" | "outboundWireSize" | "effectiveOutboundLimit"
+>;
 
 /** Minimal logger shape — matches OpenClaw's optional-method logger. */
 export type HistoryServerLogger = {
@@ -233,16 +243,45 @@ type DiagnosticReason =
   | "read-failed"
   | "publish-failed"
   | "unsupported-events"
-  | "ts-fallbacks";
+  | "ts-fallbacks"
+  | "oversize-skipped"
+  | "budget-trimmed";
 
 const SERVE_KINDS: readonly ServeKind[] = ["snapshot", "page"];
+/**
+ * ⚠️ EVERY MEMBER OF `DiagnosticReason` MUST APPEAR HERE. This array is what
+ * seeds the `diagnostics` map, and `admit` reads that map with a non-null
+ * assertion precisely because a miss is impossible — see its docblock. Adding a
+ * reason to the union and not to this list turns the first diagnostic of that
+ * kind into a `TypeError` inside a scheduled callback.
+ */
 const DIAGNOSTIC_REASONS: readonly DiagnosticReason[] = [
   "dropped",
   "read-failed",
   "publish-failed",
   "unsupported-events",
   "ts-fallbacks",
+  "oversize-skipped",
+  "budget-trimmed",
 ];
+
+/**
+ * How many skipped row ids one `oversize-skipped` line names before it counts
+ * the rest. The line is throttled to one per minute, but a page can nominate up
+ * to `MAX_WIRE_HISTORY_LIMIT` rows at once and an unbounded log line is its own
+ * incident.
+ */
+const MAX_SKIPPED_IDS_LOGGED = 5;
+
+/** `id (N B), id (N B) +K more` — one bounded string, built off the log call. */
+function summarizeSkippedRows(skipped: readonly SkippedHistoryRow[]): string {
+  const named = skipped
+    .slice(0, MAX_SKIPPED_IDS_LOGGED)
+    .map((row) => `${row.id} (${row.bytes} B)`)
+    .join(", ");
+  const rest = skipped.length - MAX_SKIPPED_IDS_LOGGED;
+  return rest > 0 ? `${named} +${rest} more` : named;
+}
 
 /**
  * Same 60 s window the two sibling throttles in this package use
@@ -393,6 +432,107 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
   };
 
   /**
+   * ⚠️ THE ONE PLACE A `history` FRAME REACHES THE WIRE (#311).
+   *
+   * Both emit callbacks go through here so that the byte budget, the two
+   * diagnostics it produces, and the publish-failure report cannot drift apart
+   * between the snapshot path and the page path — which is exactly how the
+   * `false` return below came to be dropped at TWO call sites rather than one.
+   *
+   * WHAT CHANGED, AND WHY IT IS SAFE TO SHORTEN A PAGE. Before this, an
+   * oversized frame was not truncated — `nats-transport.ts`'s `publish` threw a
+   * `RangeError`, `nats-channel.ts`'s `sendToPeer` caught it and returned
+   * `false`, and both call sites here ignored that value. The peer received NO
+   * frame, on every reconnect, silently. Shortening from the OLD end costs zero
+   * reach because this module's other entry point IS the pager: the dropped
+   * rows are exactly what the next `load_history` returns.
+   *
+   * ⚠️ AND THE `false` IS NO LONGER DISCARDED. A refused frame is reported under
+   * the SAME `publish-failed` reason as a thrown one, deliberately: it is one
+   * operator-visible event ("this peer did not get its history"), and giving it
+   * a second vocabulary would mean an operator has to know both to grep for it.
+   */
+  const publishFitted = (
+    kind: ServeKind,
+    peerId: string,
+    messages: HistoryMessage[],
+    options: { sendEmpty: boolean },
+  ): void => {
+    const limit = channel.effectiveOutboundLimit();
+    const fitted = fitHistoryFrame(messages, {
+      limit,
+      // The SEALED length — what `publish` compares against the limit. On an
+      // encrypted channel with no session key yet this returns `undefined`, and
+      // `fitHistoryFrame` treats that as "do not budget" rather than falling
+      // back to a plaintext estimate, because the send is about to be refused
+      // fail-closed for the same missing key.
+      measure: (rows) => channel.outboundWireSize(peerId, { type: "history", messages: rows }),
+    });
+
+    if (fitted.skipped.length > 0) {
+      const suppressed = admit(kind, "oversize-skipped");
+      if (suppressed !== undefined) {
+        // `error`, and it is the right level: content exists in this peer's
+        // store that can NEVER be delivered to it at this `max_payload`. It is
+        // also the one line that tells an operator WHICH rows, so raising the
+        // server's `max_payload` (or #299 retention) has a target.
+        const detail = summarizeSkippedRows(fitted.skipped);
+        try {
+          logger?.error?.(
+            `webchannel: history ${kind} skipped ${fitted.skipped.length} ` +
+              `undeliverable row(s) for ${logSafe(peerId)}; each one alone ` +
+              `exceeds this peer's effective max_payload of ${limit} bytes and ` +
+              `can never be sent, live or replayed (#311): ${logSafe(detail)} ` +
+              `(suppressed=${suppressed})`,
+          );
+        } catch { /* a faulting logger must not escape this callback */ }
+      }
+    }
+
+    if (fitted.trimmed > 0) {
+      const suppressed = admit(kind, "budget-trimmed");
+      if (suppressed !== undefined) {
+        // ⚠️ `warn`, AND THE WORDING MATTERS AS MUCH AS THE LEVEL. This is NOT
+        // data loss and must not read as it: the rows left out are the OLDEST
+        // in the window and the pager reaches every one of them. An operator
+        // who reads this as "history is being deleted" will go looking for a
+        // corruption that is not there.
+        try {
+          logger?.warn?.(
+            `webchannel: history ${kind} for ${logSafe(peerId)} was shortened ` +
+              `to fit the peer's effective max_payload of ${limit} bytes: ` +
+              `${fitted.trimmed} older row(s) left out of this page and still ` +
+              `reachable with load_history (suppressed=${suppressed})`,
+          );
+        } catch { /* a faulting logger must not escape this callback */ }
+      }
+    }
+
+    // An empty SNAPSHOT is nothing to hydrate and is suppressed, exactly as it
+    // was before the budget existed. An empty PAGE is still an answer.
+    //
+    // ⚠️ HONEST RESIDUAL: a page whose every row was skipped as undeliverable
+    // arrives as an empty page, which a client reads as end-of-history rather
+    // than as "this window cannot be shown". There is no wire signal for the
+    // latter — **#296** owns adding one — so the `error` above is where that
+    // fact lives today.
+    if (fitted.rows.length === 0 && !options.sendEmpty) return;
+
+    if (!channel.sendHistory(peerId, fitted.rows)) {
+      const suppressed = admit(kind, "publish-failed");
+      if (suppressed !== undefined) {
+        try {
+          logger?.error?.(
+            `webchannel: history ${kind} publish failed for ${logSafe(peerId)}: ` +
+              `the channel refused a ${fitted.rows.length}-row frame; see the ` +
+              `channel log for the cause (suppressed=${suppressed})`,
+          );
+        } catch { /* a faulting logger must not escape this callback */ }
+      }
+    }
+  };
+
+  /**
    * The one deferred body both entry points share.
    *
    * `produce` returns `undefined` to mean "answer nothing at all" — the read
@@ -440,6 +580,15 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
       // failed", pointing an operator at a database that was fine. Two try
       // blocks, two labels, and neither may escape: nothing is left on the stack
       // to catch a throw here, so an escape is an `uncaughtException`.
+      //
+      // ⚠️ SINCE #311 THE `emit` SIDE ALSO RUNS THE BYTE BUDGET, so "publish
+      // failed" now labels a throw out of `publishFitted` as well — which means
+      // a throw out of `channel.outboundWireSize` (i.e. `sealEnvelope`) as much
+      // as one out of `sendHistory`. The label is still accurate: both are the
+      // send half of this callback, both mean the peer got no frame, and
+      // neither is a journal fault. What the label does NOT cover is a REFUSED
+      // send, which never throws — that is reported inside `publishFitted`
+      // under the same `publish-failed` reason.
       let messages: HistoryMessage[] | undefined;
       try {
         messages = produce();
@@ -501,7 +650,9 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
           // hydrate. Safe to suppress ONLY because `reportProjectionHealth`
           // above has already spoken if the emptiness was manufactured by rows
           // this build could not read.
-          if (messages.length > 0) channel.sendHistory(peerId, messages);
+          if (messages.length > 0) {
+            publishFitted("snapshot", peerId, messages, { sendEmpty: false });
+          }
         },
       );
     },
@@ -542,7 +693,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
           // changes nothing, which is the honest outcome. For a third-party
           // client that does track a request, an empty page is the end-of-history
           // answer. Sending nothing would be worse for both.
-          channel.sendHistory(peerId, messages);
+          publishFitted("page", peerId, messages, { sendEmpty: true });
         },
       );
     },

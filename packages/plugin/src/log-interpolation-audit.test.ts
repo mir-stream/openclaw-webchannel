@@ -170,19 +170,34 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
   "history.ts": [],
 
   /**
-   * #240 half 2's five history-server diagnostics. TWO peer-derived values
-   * appear across them — `peerId` and `err` — and BOTH are `logSafe`-wrapped,
-   * which is why neither is listed here. (An earlier version of this sentence
-   * said `peerId` was the only one; `err` is on the read- and publish-failure
-   * lines.)
+   * #240 half 2's five history-server diagnostics, plus #311's three. THREE
+   * peer-derived values appear across them — `peerId`, `err` and the skipped-row
+   * summary — and ALL THREE are `logSafe`-wrapped, which is why none is listed
+   * here. (An earlier version of this sentence said `peerId` was the only one;
+   * `err` is on the read- and publish-failure lines, and #311's `detail` carries
+   * journal row ids.)
    * The rest are non-peer, on the same footing as `ingress-dedupe.ts`'s entries:
    *  - `kind` is a member of a CLOSED two-value union (`"snapshot" | "page"`),
    *    not data. If it is ever widened to carry anything from a frame, these
    *    exemptions stop being sound and must become `logSafe` calls;
-   *  - `suppressed`, `served.unsupportedEvents` and `served.tsFallbacks` are
-   *    counts.
+   *  - `suppressed`, `served.unsupportedEvents`, `served.tsFallbacks`,
+   *    `fitted.skipped.length`, `fitted.trimmed` and `fitted.rows.length` are
+   *    counts;
+   *  - `limit` is `NatsChannel.effectiveOutboundLimit()`, i.e. the NATS server's
+   *    advertised `max_payload`. Operator/server configuration, never peer data.
    */
   "history-serve.ts": [
+    "history-serve.ts  ::  fitted.rows.length  @  webchannel: history publish failed for : the channel refused a -row frame; see the channel log for the cause (suppressed=)",
+    "history-serve.ts  ::  fitted.skipped.length  @  webchannel: history skipped undeliverable row(s) for ; each one alone exceeds this peer's effective max_payload of bytes and can never be sent, live or replayed (#311): (suppressed=)",
+    "history-serve.ts  ::  fitted.trimmed  @  webchannel: history for was shortened to fit the peer's effective max_payload of bytes: older row(s) left out of this page and still reachable with load_history (suppressed=)",
+    "history-serve.ts  ::  kind  @  webchannel: history for was shortened to fit the peer's effective max_payload of bytes: older row(s) left out of this page and still reachable with load_history (suppressed=)",
+    "history-serve.ts  ::  kind  @  webchannel: history publish failed for : the channel refused a -row frame; see the channel log for the cause (suppressed=)",
+    "history-serve.ts  ::  kind  @  webchannel: history skipped undeliverable row(s) for ; each one alone exceeds this peer's effective max_payload of bytes and can never be sent, live or replayed (#311): (suppressed=)",
+    "history-serve.ts  ::  limit  @  webchannel: history for was shortened to fit the peer's effective max_payload of bytes: older row(s) left out of this page and still reachable with load_history (suppressed=)",
+    "history-serve.ts  ::  limit  @  webchannel: history skipped undeliverable row(s) for ; each one alone exceeds this peer's effective max_payload of bytes and can never be sent, live or replayed (#311): (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: history for was shortened to fit the peer's effective max_payload of bytes: older row(s) left out of this page and still reachable with load_history (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: history publish failed for : the channel refused a -row frame; see the channel log for the cause (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: history skipped undeliverable row(s) for ; each one alone exceeds this peer's effective max_payload of bytes and can never be sent, live or replayed (#311): (suppressed=)",
     "history-serve.ts  ::  kind  @  webchannel: history projection is NOT authoritative for ; skipped journal event(s) this build cannot fold — history may be missing messages (suppressed=)",
     "history-serve.ts  ::  served.unsupportedEvents  @  webchannel: history projection is NOT authoritative for ; skipped journal event(s) this build cannot fold — history may be missing messages (suppressed=)",
     "history-serve.ts  ::  suppressed  @  webchannel: history projection is NOT authoritative for ; skipped journal event(s) this build cannot fold — history may be missing messages (suppressed=)",
@@ -313,7 +328,14 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // × {kind, peerId, kind, suppressed} and {kind, peerId, err} = 7). The
   // failure was the only signal, and it is why the throttle now returns a count
   // instead of taking a message.
-  "history-serve.ts": { statements: 5, interpolations: 20 },
+  // #311 adds the three byte-budget diagnostics (5→8 statements) and their
+  // fifteen interpolations (20→35): the skipped-row report and the shortened
+  // report carry {kind, peerId, count, limit, detail-or-nothing, suppressed},
+  // and the refused-send report carries {kind, peerId, rows, suppressed}. Of
+  // those, `peerId` and the skipped-row `detail` are the peer-derived ones and
+  // both are `logSafe`-wrapped; the rest are in KNOWN_RAW above with the
+  // property each rests on.
+  "history-serve.ts": { statements: 8, interpolations: 35 },
   "nats-register.ts": { statements: 18, interpolations: 20 },
 };
 

@@ -926,9 +926,16 @@ function recordFirstSeen(
  * annoyance; the same fact has a second consequence that is not. `limit`,
  * `pageSize` and `MAX_WIRE_HISTORY_LIMIT` bound a page by ROW COUNT, and NOTHING
  * bounds it by BYTES — a reasoning row is routinely an order of magnitude larger
- * than a bubble, so the same row count is now a much larger frame. At the default
- * `limit: 50`, a mean row of ~21 KB reaches a stock nats-server's 1 MiB
+ * than a bubble, so the same row count is now a much larger frame. MEASURED
+ * (`history-frame-oversize.test.ts`), at the default `limit: 50` on an encrypted
+ * channel: 15 651 bytes of text per row reaches a stock nats-server's 1 MiB
  * `max_payload`.
+ *
+ * ⚠️ THAT NUMBER USED TO READ "~21 KB" AND THE DIFFERENCE IS NOT A CORRECTION OF
+ * ARITHMETIC — do not "fix" it back. ~21 KB is what the PLAINTEXT JSON gives.
+ * `publish` measures the SEALED buffer, and `e2e-envelope.ts` base64url-encodes
+ * the ciphertext into a JSON envelope, so the wire is ~4/3 of the JSON and the
+ * real bar is a quarter lower.
  *
  * ⚠️ TOOL ROWS BELONG TO #311 TOO, BUT DO NOT INFLATE THEM INTO THE SAME
  * HAZARD. A tool row is a name, a phase, a status, a count-grammar summary and a
@@ -957,19 +964,28 @@ function recordFirstSeen(
  * about today's tools, not an enforced property (**#321**).
  *
  * An oversized frame is NOT truncated. `nats-transport.ts`'s `publish` throws a
- * `RangeError` and `history-serve.ts` catches it as "publish failed", so the peer
- * receives NO HISTORY AT ALL — not "no reasoning" — on every reconnect, with no
- * chunking and no retry. `history.ts`'s `MAX_WIRE_HISTORY_LIMIT` docblock already
- * said an oversized frame "never arrives"; what half 2 changed is how easily a
- * page reaches that size.
+ * `RangeError`, and — ⚠️ CONTRARY TO WHAT THIS DOCBLOCK USED TO SAY —
+ * `history-serve.ts` does NOT catch it: `nats-channel.ts`'s `sendToPeer` catches
+ * it first, logs one line and returns `false`. Before #311 both read paths
+ * discarded that `false`, so the peer received NO HISTORY AT ALL — not "no
+ * reasoning" — on every reconnect, with nothing logged by the module that owns
+ * the read. SINCE #311 the page is byte-fitted before it is published
+ * (`history-frame-budget.ts`): it is shortened from the OLD end, which costs no
+ * reach because the pager returns exactly those rows, and a refused send is
+ * reported. `history.ts`'s `MAX_WIRE_HISTORY_LIMIT` docblock carried the same
+ * mistake and is corrected too; what half 2 changed is how easily a page reaches
+ * that size.
  *
  * ⚠️ AND IT DOES NOT UNDO. The `reasoningDurable` gate is at the JOURNALING seam
  * only — `serveHistoryRequest` and `projectJournalHistory` take no config and
  * never consult it — so flipping the key back OFF stops new rows and keeps
  * serving every row already written. Recovery is #299 retention (unshipped) or
- * journal surgery. The real fix is a byte-aware page budget (#311, with #286 /
- * #298); it is deliberately NOT attempted here, because narrowing a page is a
- * pager policy decision and this function's contract is "the most recent N".
+ * journal surgery. #311's budget makes those rows non-fatal — a row that cannot
+ * fit the wire alone is SKIPPED so the pager can pass it — but it does not
+ * delete them. The budget is deliberately NOT applied here: narrowing a page is
+ * a pager policy decision, it needs the peer's sealed size and outbound limit
+ * (which this pure projection has no access to), and this function's contract is
+ * "the most recent N".
  */
 export function recentHistoryPage(
   messages: readonly ProjectedHistoryMessage[],
