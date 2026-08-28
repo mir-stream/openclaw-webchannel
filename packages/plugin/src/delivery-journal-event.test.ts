@@ -305,9 +305,20 @@ describe("journalEventForOutbound returns null for every non-durable frame", () 
     // but only the burst-closing frame; see the dedicated describe below for the
     // durable side and for why the split exists.
     ["reasoning without final (a live draft)", { type: "reasoning", id: "r-1", turnId: TURN, text: "thinking" }],
-    ["tool_activity (#242 half 2: durable later)", { type: "tool_activity", id: "t-1", turnId: TURN, name: "bash" }],
+    // ⚠️ `tool_activity` IS NO LONGER IN THIS LIST — #242 half 3 made it durable.
+    // Its cases live in the dedicated describe below. What remains here are the
+    // two ID-LESS forms, which are refused for the same reason an id-less
+    // `agent_message` is: a row under no identity cannot be reconciled.
+    // ⚠️ `tool_activity` IS DURABLE SINCE #242 half 3, so what stands here is its
+    // ID-LESS form only — refused for the same reason an id-less `agent_message`
+    // is, since a row under no identity cannot be reconciled. Exactly ONE entry,
+    // like `reasoning`'s draft shape above and for the same mechanical reason:
+    // `covered` below compares sorted arrays against a list naming each type
+    // once, so a second entry would break that count. The turnId-less form and
+    // the durable cases live in the dedicated describe further down.
+    ["tool_activity with no id (durable otherwise)", { type: "tool_activity", id: "", turnId: TURN, name: "bash" }],
     [
-      "approval_request (#242 half 2: durable later)",
+      "approval_request (#242 half 4: durable later)",
       {
         type: "approval_request",
         id: "ap-1",
@@ -317,8 +328,8 @@ describe("journalEventForOutbound returns null for every non-durable frame", () 
         options: [{ decision: "allow-once", label: "Allow", style: "primary" }],
       },
     ],
-    ["approval_resolved (#242 half 2: durable later)", { type: "approval_resolved", id: "ap-1", decision: "deny" }],
-    ["approval_snapshot (#242 half 2: durable later)", { type: "approval_snapshot", approvals: [] }],
+    ["approval_resolved (#242 half 4: durable later)", { type: "approval_resolved", id: "ap-1", decision: "deny" }],
+    ["approval_snapshot (a REPLAY — never durable, not deferred)", { type: "approval_snapshot", approvals: [] }],
     ["turn_settled (control frame)", { type: "turn_settled", turnId: TURN, outcome: "ok" }],
     ["typing (pure indicator)", { type: "typing" }],
     ["history (server→client replay)", { type: "history", messages: [] }],
@@ -376,6 +387,117 @@ describe("journalEventForOutbound returns null for every non-durable frame", () 
         "typing",
       ].sort(),
     );
+  });
+});
+
+describe("#242 half 3 — tool_activity is durable, EVERY frame, no policy gate", () => {
+  /**
+   * ⚠️ THE MEASURED FRAME TRIPLE. Recorded by driving `inbound.ts`'s
+   * `createAgentToolActivitySink` with a `start`/`update`/`end` event sequence on
+   * the `tool` stream; it is not invented. The property it pins is that the
+   * CLOSING frame carries `status` but NEITHER `name` NOR `argKeys`, which is
+   * what rules out a `final`-style flag: journaling only that frame would store a
+   * nameless, argKey-less call.
+   */
+  const START: OutboundWsMessage = {
+    type: "tool_activity",
+    id: "call-1",
+    turnId: TURN,
+    name: "read_file",
+    phase: "start",
+    argKeys: ["path", "limit"],
+  };
+  const UPDATE: OutboundWsMessage = {
+    type: "tool_activity",
+    id: "call-1",
+    turnId: TURN,
+    phase: "update",
+  };
+  const END: OutboundWsMessage = {
+    type: "tool_activity",
+    id: "call-1",
+    turnId: TURN,
+    phase: "end",
+    status: "completed",
+  };
+
+  it("journals the frame VERBATIM as a delta — every one of the three", () => {
+    expect(journalEventForOutbound(START)).toEqual({
+      kind: "tool",
+      id: "call-1",
+      turnId: TURN,
+      name: "read_file",
+      phase: "start",
+      argKeys: ["path", "limit"],
+    });
+    expect(journalEventForOutbound(UPDATE)).toEqual({
+      kind: "tool",
+      id: "call-1",
+      turnId: TURN,
+      phase: "update",
+    });
+    expect(journalEventForOutbound(END)).toEqual({
+      kind: "tool",
+      id: "call-1",
+      turnId: TURN,
+      phase: "end",
+      status: "completed",
+    });
+  });
+
+  it("the CLOSING frame alone is a PARTIAL — this is why there is no `final` flag", () => {
+    // The regression guard for the whole design decision. If someone reworks
+    // this case to journal only the terminal frame, THIS is what the journal
+    // would hold for the call — and the live client rendered `read_file` with
+    // its arg key names.
+    const closing = journalEventForOutbound(END);
+    expect(closing).not.toBeNull();
+    expect(Object.hasOwn(closing!, "name")).toBe(false);
+    expect(Object.hasOwn(closing!, "argKeys")).toBe(false);
+    // And the opening frame is the only one that carries them.
+    expect(journalEventForOutbound(START)).toMatchObject({
+      name: "read_file",
+      argKeys: ["path", "limit"],
+    });
+  });
+
+  it("omits an absent field as an ABSENT KEY, never an explicit undefined", () => {
+    // Load-bearing: `applyTool` merges by spread, so a present-and-`undefined`
+    // `name` on the closing frame would ERASE the one `start` carried.
+    expect(Object.keys(journalEventForOutbound(UPDATE)!).sort()).toEqual(
+      ["id", "kind", "phase", "turnId"].sort(),
+    );
+  });
+
+  it("is journaled with NO policy — tool durability has no account opt-in", () => {
+    // Unlike reasoning, whose row is withheld unless `reasoningDurable` is on.
+    // Both calls must produce the row.
+    expect(journalEventForOutbound(START, {})).toEqual(journalEventForOutbound(START));
+    expect(
+      journalEventForOutbound(START, { reasoningDurable: false }),
+    ).toEqual(journalEventForOutbound(START));
+  });
+
+  it("filters argKeys to strings — the wire is untrusted and this reaches disk", () => {
+    expect(
+      journalEventForOutbound({
+        type: "tool_activity",
+        id: "call-1",
+        turnId: TURN,
+        argKeys: ["ok", 7, null, { a: 1 }, "fine"] as unknown as string[],
+      }),
+    ).toEqual({ kind: "tool", id: "call-1", turnId: TURN, argKeys: ["ok", "fine"] });
+  });
+
+  it("REFUSES a frame with no usable id or turnId — a row needs an identity", () => {
+    // The admission rule tracks the client's `case "tool_activity"` exactly, so
+    // nothing is journaled that the live client refuses.
+    expect(
+      journalEventForOutbound({ type: "tool_activity", id: "", turnId: TURN }),
+    ).toBeNull();
+    expect(
+      journalEventForOutbound({ type: "tool_activity", id: "call-1", turnId: "" }),
+    ).toBeNull();
   });
 });
 

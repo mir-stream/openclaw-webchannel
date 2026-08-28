@@ -112,3 +112,108 @@ export const INTERLEAVED_TURN_LIVE_IDS: readonly string[] = ["r1", "A"];
 
 /** What a REPLAY of the same turn serves. ⚠️ Deliberately different. */
 export const INTERLEAVED_TURN_REPLAY_IDS: readonly string[] = ["A", "r1"];
+
+/**
+ * ── FIXTURE C: THE TOOL TURN (#242 half 3) ──
+ *
+ * ⚠️ THIS FIXTURE EXISTS TO PIN THE ONE PROPERTY THE SLICE IS FOR: a tool call
+ * delivered LIVE and the same call REPLAYED from the journal produce the same
+ * view — same content, same position. Like the two above it is imported by BOTH
+ * packages (`durable-view-reducer.test.ts` drives the real wrapper,
+ * `journal-history.test.ts` drives the real `journalEventForOutbound` and the
+ * real projection), so editing it turns tests red on both sides instead of
+ * letting two hand-written literals drift.
+ *
+ * ⚠️ THE FRAME SEQUENCE IS RECORDED FROM THE REAL PRODUCER, NOT INVENTED. It was
+ * measured by driving `inbound.ts`'s `createAgentToolActivitySink` with a
+ * `start`/`update`/`end` event triple on the `tool` stream. The property that
+ * makes this fixture worth having is visible in it: the CLOSING frame carries
+ * `status` but NEITHER `name` NOR `argKeys`, so any scheme that journals one
+ * "final" frame stores a partial. Every frame is journaled and `applyTool`
+ * folds them, which is why the expected row below carries fields drawn from
+ * THREE different frames.
+ */
+export const TOOL_TURN = "turn-2";
+
+/** One outbound `tool_activity` wire frame, in the shape both sides speak. */
+export type ToolTurnFrame = {
+  type: "tool_activity";
+  id: string;
+  turnId: string;
+  name?: string;
+  phase?: string;
+  status?: string;
+  argKeys?: readonly string[];
+};
+
+/**
+ * A durable tool row a replay must serve, WITHOUT `ts` — same reason
+ * `ReasoningTurnRow` omits it: `ts` is a projection concern the plugin sources
+ * from journal row timestamps, and the plugin test asserts it separately.
+ */
+export type ToolTurnRow = {
+  kind: "tool";
+  id: string;
+  turnId: string;
+  name?: string;
+  phase?: string;
+  status?: string;
+  argKeys?: readonly string[];
+};
+
+/**
+ * A turn with ONE user message, ONE tool call spanning three frames, and ONE
+ * answer. The tool frames straddle the answer's `progress` on purpose: the call
+ * STARTS before the lane claims its slot and ENDS after, so the fixture also
+ * pins that a tool call holds the position of its FIRST frame rather than
+ * drifting to where it completed.
+ */
+export const TOOL_TURN_FRAMES: readonly (ToolTurnFrame | ReasoningTurnFrame)[] = [
+  {
+    type: "tool_activity",
+    id: "call-1",
+    turnId: TOOL_TURN,
+    name: "read_file",
+    phase: "start",
+    argKeys: ["path", "limit"],
+  },
+  { type: "tool_activity", id: "call-1", turnId: TOOL_TURN, phase: "update" },
+  { type: "progress", id: "A", turnId: TOOL_TURN, text: "Working…" },
+  {
+    type: "tool_activity",
+    id: "call-1",
+    turnId: TOOL_TURN,
+    phase: "end",
+    status: "completed",
+  },
+  { type: "agent_message", id: "A", turnId: TOOL_TURN, text: "the answer" },
+];
+
+/**
+ * What BOTH a live render and a replay of `TOOL_TURN_FRAMES` must produce.
+ *
+ * ⚠️ THE TOOL ROW IS THE MERGE OF ALL THREE FRAMES: `name`/`argKeys` from
+ * `start`, `status` from `end`, and `phase` from `end` because it is the last
+ * frame to carry one. A `final`-frame-only design would produce
+ * `{id, turnId, phase:"end", status:"completed"}` here — no `name`, no
+ * `argKeys` — which is precisely the live≠history divergence this slice exists
+ * to prevent, and asserting the merged shape is what makes that regression
+ * fail rather than pass quietly.
+ *
+ * ⚠️ AND THE TOOL ROW COMES FIRST, BEFORE THE ANSWER. That is the position
+ * claim: the call's first frame preceded `progress A`, so the fold appends it
+ * ahead of A's slot on BOTH sides. A design that keyed position off the
+ * COMPLETING frame would put it after the answer.
+ */
+export const TOOL_TURN_ROWS: readonly (ToolTurnRow | { id: string; role: "user" | "agent"; text: string })[] = [
+  {
+    kind: "tool",
+    id: "call-1",
+    turnId: TOOL_TURN,
+    name: "read_file",
+    phase: "end",
+    status: "completed",
+    argKeys: ["path", "limit"],
+  },
+  { id: "A", role: "agent", text: "the answer" },
+];

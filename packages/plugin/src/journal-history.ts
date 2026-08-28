@@ -327,6 +327,7 @@ const KNOWN_EVENT_KINDS: Record<JournalEvent["kind"], true> = {
   bubble: true,
   seal: true,
   reasoning: true,
+  tool: true,
 };
 
 /**
@@ -696,7 +697,24 @@ export function projectJournalHistory(
     messages.push(
       message.kind === "reasoning"
         ? { kind: "reasoning", id: message.id, turnId: message.turnId, text: message.text, ts }
-        : { id: message.id, role: message.role, text: message.text, ts },
+        : message.kind === "tool"
+          // #242 half 3. The view entry is ALREADY the fold of every frame —
+          // `applyTool` merged them on the way in — so this is a field copy, not
+          // an accumulation. Optional fields are omitted rather than written as
+          // `undefined` so the served row matches the live frame's own shape and
+          // `JSON.stringify` drops nothing silently.
+          ? {
+              kind: "tool",
+              id: message.id,
+              turnId: message.turnId,
+              ...(message.name !== undefined ? { name: message.name } : {}),
+              ...(message.phase !== undefined ? { phase: message.phase } : {}),
+              ...(message.status !== undefined ? { status: message.status } : {}),
+              ...(message.summary !== undefined ? { summary: message.summary } : {}),
+              ...(message.argKeys !== undefined ? { argKeys: message.argKeys } : {}),
+              ts,
+            }
+          : { id: message.id, role: message.role, text: message.text, ts },
     );
   }
 
@@ -761,6 +779,34 @@ function recordFirstSeen(
       // decision that the message had no moment. Half 2 puts it on the wire and
       // reads the `ts` from here UNCHANGED — the prediction held, and this line
       // did not have to move.
+      note(event.id);
+      return;
+    case "tool":
+      // #242 half 3. FIRST-WRITE-WINS gives the call the moment its `start`
+      // frame landed, not its last refinement, which is the right answer: a tool
+      // call's moment is when it began.
+      //
+      // ⚠️ NOTE THE ID ALONE, NOT THE `(turnId, id)` PAIR THE VIEW KEYS ON, and
+      // that asymmetry is deliberate rather than an oversight. `firstSeenMs` is
+      // keyed by id across EVERY kind and is first-write-wins — the docblock
+      // above already records that as a known, bounded imprecision, with the
+      // bound being that `ts` is HYDRATION METADATA and nothing orders on it.
+      // Keying this one case by a pair would make the map's key space
+      // inconsistent to buy a property nothing reads.
+      //
+      // ⚠️ THE EXACT CONDITION UNDER WHICH THIS BECOMES WRONG, so the next
+      // reader can CHECK it rather than re-derive it: IF TWO TOOL CALLS IN
+      // DIFFERENT TURNS EVER SHARE AN `id`, the second call inherits the FIRST
+      // call's `ts`. The view keeps them apart — `applyTool` keys on
+      // `(turnId, id)`, so they are two distinct messages — but they collide in
+      // THIS map, and first-write-wins hands the older timestamp to the newer
+      // call. Reachable in principle: `inbound.ts`'s `correlatedId` derives the
+      // id from core's `itemId`/`toolCallId`/`name` within ONE RUN, so it is
+      // unique per turn and carries no cross-turn guarantee. Harmless while `ts`
+      // stays hydration metadata (nothing in production orders on it — see the
+      // NEVER SORT block in the file header); if `ts` ever becomes load-bearing,
+      // this is the second line to revisit after that docblock, and the repair
+      // is to key the map by the same pair the view uses.
       note(event.id);
       return;
     case "seal":

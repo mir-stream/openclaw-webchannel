@@ -135,46 +135,57 @@ export type ConversationPresentationItem =
  * is NOT GAP 2b (that is journal position vs live); it is merge-cursor
  * displacement, recorded here because no other site covers it.
  *
- * ⚠️ TOOL ACTIVITY IS STILL INTERLEAVED, and that is not an inconsistency: it is
- * still EPHEMERAL (`#242 half 3` is what makes it durable), so it lives in its
- * own array with no position of its own and `turnId` is the only anchor there
- * is. When half 3 lands, this function should lose the second lane the same way
- * it just lost the first.
+ * ⚠️ TOOL ACTIVITY IS NO LONGER INTERLEAVED EITHER (#242 half 3), and this
+ * function now has NO second lane at all. The paragraph that used to sit here
+ * said tool was "still EPHEMERAL … `turnId` is the only anchor there is" and
+ * promised that half 3 "should lose the second lane the same way it just lost
+ * the first". That is exactly what happened: tool activity is a durable message
+ * now, it sits in `state.messages` at the position the stream put it, and the
+ * `toolActivity` parameter — along with the `toolByTurn` grouping, the `emitted`
+ * set and the trailing orphan-turn drain — is gone rather than left inert.
+ *
+ * The two callers' argument lists shrink accordingly; that is the point. A
+ * renderer that can still be HANDED a side array is a renderer that can still
+ * hold a second opinion about ordering.
+ *
+ * ⚠️ THE CURSOR-DISPLACEMENT NOTE ABOVE APPLIES TO TOOL ROWS TOO, with one
+ * difference worth stating: it was written for reasoning, whose snapshot rows
+ * are absent by DEFAULT (`reasoningDurable` is off), so the displacement it
+ * traces is the common case there. Tool durability has no such opt-in, so a
+ * tool row is normally PRESENT in the snapshot and tier-1 matches — the
+ * displacement is reachable for tool only in the narrower window where the
+ * snapshot predates the call.
  */
 export function orderConversationPresentation(
   messages: readonly ChatMessage[],
-  toolActivity: readonly ToolActivityItem[] = [],
 ): ConversationPresentationItem[] {
-  const toolByTurn = new Map<string, ToolActivityItem[]>();
-  for (const item of toolActivity) {
-    const items = toolByTurn.get(item.turnId) ?? [];
-    items.push(item);
-    toolByTurn.set(item.turnId, items);
-  }
-  const emitted = new Set<string>();
   const result: ConversationPresentationItem[] = [];
-  const emitTurnLanes = (turnId: string): void => {
-    if (emitted.has(turnId)) return;
-    const toolItems = toolByTurn.get(turnId);
-    if (!toolItems) return;
-    emitted.add(turnId);
-    result.push(...toolItems.map((value) => ({ kind: "tool_activity" as const, value })));
-  };
-
   for (const message of messages) {
+    // Each kind in place, from the array — no turn lookup and no grouping.
     if (message.kind === "reasoning") {
-      // In place, from the array — no turn lookup and no grouping.
       result.push({
         kind: "reasoning",
         value: { id: message.id, turnId: message.turnId, text: message.text },
       });
       continue;
     }
-    if (message.role === "agent" && message.turnId) emitTurnLanes(message.turnId);
+    if (message.kind === "tool") {
+      result.push({
+        kind: "tool_activity",
+        value: {
+          id: message.id,
+          turnId: message.turnId,
+          ...(message.name !== undefined ? { name: message.name } : {}),
+          ...(message.phase !== undefined ? { phase: message.phase } : {}),
+          ...(message.status !== undefined ? { status: message.status } : {}),
+          ...(message.summary !== undefined ? { summary: message.summary } : {}),
+          ...(message.argKeys !== undefined ? { argKeys: message.argKeys } : {}),
+        },
+      });
+      continue;
+    }
     result.push({ kind: "message", value: message });
-    if (message.role === "user" && message.turnId) emitTurnLanes(message.turnId);
   }
-  for (const turnId of toolByTurn.keys()) emitTurnLanes(turnId);
   return result;
 }
 

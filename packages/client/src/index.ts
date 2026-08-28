@@ -37,6 +37,7 @@ export type {
   // every call site.
   ChatBubble,
   ChatReasoningMessage,
+  ChatToolMessage,
   ReasoningItem,
   ToolActivityItem,
   ApprovalDecision,

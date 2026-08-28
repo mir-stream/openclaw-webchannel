@@ -56,6 +56,38 @@ function asText(message: DurableMessage): DurableTextMessage {
   return message;
 }
 
+/**
+ * The `reasoning` sibling of `asText`, for the reasoning cases that read `text`
+ * off a whole view.
+ *
+ * ⚠️ IT EXISTS BECAUSE "NOT `reasoning` ⇒ HAS `text`" STOPPED BEING TRUE. #242
+ * half 3 added the `tool` variant, which carries NO `text` at all, so a bare
+ * `view.map((m) => m.text)` no longer type-checks and — more to the point — no
+ * longer expresses what the reasoning cases mean. They assert that a fixture of
+ * N reasoning bursts stays N reasoning blocks in order; a `tool` entry appearing
+ * there would mean the reducer routed something it was never handed. Throwing
+ * names that, where a filter would quietly shorten the list instead.
+ */
+function asReasoning(message: DurableMessage): Extract<DurableMessage, { kind: "reasoning" }> {
+  if (message.kind !== "reasoning") {
+    throw new Error(`expected a reasoning durable message, received kind=${message.kind}`);
+  }
+  return message;
+}
+
+/**
+ * `view.find` by id, narrowed to the `text` variant.
+ *
+ * `undefined` is PASSED THROUGH rather than thrown on, so a caller's
+ * `expect(findText(view, "X")?.text).toBe(…)` still fails exactly the way it did
+ * before when the entry is simply ABSENT — that is the property those cases are
+ * about. Only a PRESENT entry of the wrong kind throws, via `asText`.
+ */
+function findText(view: DurableView, id: string): DurableTextMessage | undefined {
+  const found = view.find((m) => m.id === id);
+  return found === undefined ? undefined : asText(found);
+}
+
 describe("reduceDurableView — durable view extraction (v6 slice 1)", () => {
   it("slot-claim ordering: a held answer keeps the slot it claimed via first progress (P0 #1)", () => {
     // A claims its slot (first progress / placement) BEFORE the independent
@@ -88,7 +120,7 @@ describe("reduceDurableView — durable view extraction (v6 slice 1)", () => {
     ];
     const view = reduceDurableView(events);
     expect(view.map((m) => m.id)).toEqual(["A", "X"]);
-    expect(view.find((m) => m.id === "X")?.text).toBe("X, resurrected");
+    expect(findText(view, "X")?.text).toBe("X, resurrected");
   });
 
   it("remove ∩ answers within one seal: answers WIN (X present)", () => {
@@ -109,7 +141,7 @@ describe("reduceDurableView — durable view extraction (v6 slice 1)", () => {
     ];
     const view = reduceDurableView(events);
     expect(view.map((m) => m.id)).toEqual(["A", "X"]);
-    expect(view.find((m) => m.id === "X")?.text).toBe("X (answer wins)");
+    expect(findText(view, "X")?.text).toBe("X (answer wins)");
   });
 
   it("seal create-or-update: a lane that never egressed a bubble is MINTED (#215 recovery)", () => {
@@ -130,7 +162,7 @@ describe("reduceDurableView — durable view extraction (v6 slice 1)", () => {
     ];
     const view = reduceDurableView(events);
     expect(view.map((m) => m.id)).toEqual(["A", "B"]);
-    expect(view.find((m) => m.id === "B")?.text).toBe("answer B (minted from snapshot)");
+    expect(findText(view, "B")?.text).toBe("answer B (minted from snapshot)");
   });
 
   it("final-only C (K>=2): a non-answer independent bubble is preserved in position", () => {
@@ -155,7 +187,7 @@ describe("reduceDurableView — durable view extraction (v6 slice 1)", () => {
     ];
     const view = reduceDurableView(events);
     expect(view.map((m) => m.id)).toEqual(["A", "B", "C"]);
-    expect(view.find((m) => m.id === "C")?.text).toBe("C (independent final)");
+    expect(findText(view, "C")?.text).toBe("C (independent final)");
   });
 
   it("notice slot preservation: answers reorder among themselves; a notice keeps its exact slot", () => {
@@ -451,7 +483,7 @@ describe("applyReasoning — one completed burst per event", () => {
       { kind: "reasoning", id: "r-2", turnId: TURN, text: "two" },
       { kind: "reasoning", id: "r-3", turnId: TURN, text: "three" },
     ]);
-    expect(view.map((m) => m.text)).toEqual(["one", "two", "three"]);
+    expect(view.map((m) => asReasoning(m).text)).toEqual(["one", "two", "three"]);
   });
 
   it("applies NO 100-item cap — a durable view never drops delivered content", () => {
@@ -634,8 +666,8 @@ describe("characterization: the deliberate divergence, and the precondition trap
     expect(render[0].working).toBe(true);
     expect(render[0].draftOnly).toBe(true);
     // …and the durable view — the client's and the reducer's alike — does not.
-    expect(real[0].text).toBe("");
-    expect(reduced[0].text).toBe("");
+    expect(asText(real[0]).text).toBe("");
+    expect(asText(reduced[0]).text).toBe("");
     expect(reduced).toEqual(real);
   });
 
@@ -657,7 +689,7 @@ describe("characterization: the deliberate divergence, and the precondition trap
     // live == history: the reducer's view of the same stream is equally empty of
     // durable text for A, so neither side shows a bubble the other lacks.
     expect(
-      reduceDurableView([{ kind: "placement", answerId: "A", turnId: TURN }])[0].text,
+      asText(reduceDurableView([{ kind: "placement", answerId: "A", turnId: TURN }])[0]).text,
     ).toBe("");
   });
 
@@ -789,7 +821,7 @@ describe("characterization: the deliberate divergence, and the precondition trap
       agentMessageFrame("", "two", TURN),
     ]);
     expect(real).toHaveLength(2);
-    expect(real.map((m) => m.text)).toEqual(["one", "two"]);
+    expect(real.map((m) => asText(m).text)).toEqual(["one", "two"]);
     for (const m of real) expect(m.id).not.toBe("");
     // Non-vacuity: they are distinct client-minted ids, not one bubble twice.
     expect(new Set(real.map((m) => m.id)).size).toBe(2);
@@ -800,7 +832,7 @@ describe("characterization: the deliberate divergence, and the precondition trap
     ]);
     expect(reduced).toHaveLength(1);
     expect(reduced[0].id).toBe("");
-    expect(reduced[0].text).toBe("two");
+    expect(asText(reduced[0]).text).toBe("two");
   });
 });
 
@@ -881,11 +913,33 @@ function seed(w: WrapperInternals, starting: DurableView): void {
     // seeded as a role-less TEXT bubble, and the round trip through
     // `projectDurableFromClient` would report a divergence the client does not
     // have.
-    messages: starting.map((m) =>
-      m.kind === "reasoning"
-        ? { kind: "reasoning", id: m.id, turnId: m.turnId, text: m.text }
-        : { id: m.id, role: m.role, text: m.text, turnId: m.turnId, working: false },
-    ),
+    //
+    // ⚠️ THREE BRANCHES SINCE #242 half 3, AND THE `tool` ONE IS NOT A SPREAD.
+    // It mirrors `projectDurable`'s tool arm field by field, omitting each
+    // absent optional rather than writing it as `undefined` — the same round
+    // trip that docblock warns about runs through here, and an own
+    // `name: undefined` key would feed back through `applyTool`'s spread and
+    // blank the very fields the `start` frame carried. No fixture in this file
+    // seeds a tool entry today; the branch exists so that adding one seeds a
+    // TOOL row instead of falling into the bubble arm and inventing a `role`.
+    messages: starting.map((m) => {
+      if (m.kind === "reasoning") {
+        return { kind: "reasoning", id: m.id, turnId: m.turnId, text: m.text };
+      }
+      if (m.kind === "tool") {
+        return {
+          kind: "tool",
+          id: m.id,
+          turnId: m.turnId,
+          ...(m.name !== undefined ? { name: m.name } : {}),
+          ...(m.phase !== undefined ? { phase: m.phase } : {}),
+          ...(m.status !== undefined ? { status: m.status } : {}),
+          ...(m.summary !== undefined ? { summary: m.summary } : {}),
+          ...(m.argKeys !== undefined ? { argKeys: m.argKeys } : {}),
+        };
+      }
+      return { id: m.id, role: m.role, text: m.text, turnId: m.turnId, working: false };
+    }),
   };
 }
 
@@ -1394,6 +1448,9 @@ import {
   ORDINARY_TURN_FRAMES,
   ORDINARY_TURN_ROWS,
   REASONING_TURN,
+  TOOL_TURN,
+  TOOL_TURN_FRAMES,
+  TOOL_TURN_ROWS,
   type ReasoningTurnFrame,
   type ReasoningTurnRow,
 } from "./reasoning-turn.test-harness.js";
@@ -1506,5 +1563,167 @@ describe("live == history for reasoning: a reload reproduces what was watched", 
 
     // The point of the case, said out loud so nobody "fixes" the expectations:
     expect(INTERLEAVED_TURN_LIVE_IDS).not.toEqual(INTERLEAVED_TURN_REPLAY_IDS);
+  });
+});
+
+/**
+ * ⭐ #242 half 3 — THE CENTRAL PROPERTY, CLIENT HALF.
+ *
+ * A tool call delivered LIVE and the same call REPLAYED from the journal must
+ * produce the same view: same content, same position. This half drives the REAL
+ * wrapper; `packages/plugin/src/journal-history.test.ts` drives the real
+ * `journalEventForOutbound` and the real projection over the SAME fixture, so
+ * the two cannot be edited apart.
+ */
+describe("live == history for tool activity: a reload reproduces what was watched", () => {
+  /** The DURABLE fields of a transcript — `ts`/`working` are client-local. */
+  function durable(list: Array<Record<string, unknown>>): unknown[] {
+    return list.map((m) => {
+      if (m.kind === "tool") {
+        return {
+          kind: "tool",
+          id: m.id,
+          turnId: m.turnId,
+          ...(m.name !== undefined ? { name: m.name } : {}),
+          ...(m.phase !== undefined ? { phase: m.phase } : {}),
+          ...(m.status !== undefined ? { status: m.status } : {}),
+          ...(m.summary !== undefined ? { summary: m.summary } : {}),
+          ...(m.argKeys !== undefined ? { argKeys: m.argKeys } : {}),
+        };
+      }
+      if (m.kind === "reasoning") {
+        return { kind: "reasoning", id: m.id, turnId: m.turnId, text: m.text };
+      }
+      return { id: m.id, role: m.role, text: m.text };
+    });
+  }
+
+  it("same content, same position — three sparse frames fold into one call", () => {
+    // ── LIVE ──
+    const w = newWrapper() as unknown as WrapperInternals;
+    for (const frame of TOOL_TURN_FRAMES) {
+      w.handleMessage(frame as unknown as InboundMessage);
+    }
+    const live = w.state.messages;
+    // POSITION: the call holds the slot of its FIRST frame, ahead of the answer.
+    expect(live.map((m) => m.id)).toEqual(["call-1", "A"]);
+
+    // ── REPLAY ── the rows the plugin's projection emits for that same journal.
+    const fresh = newWrapper() as unknown as WrapperInternals;
+    fresh.handleMessage({
+      type: "history",
+      messages: TOOL_TURN_ROWS.map((row, i) => ({ ...row, ts: i + 1 })),
+    } as unknown as InboundMessage);
+
+    // ⭐ SAME CONTENT, SAME POSITION.
+    expect(durable(fresh.state.messages)).toEqual(durable(live));
+    // Non-vacuity: the shared fixture really does describe this turn, so a
+    // fixture edit cannot make the equality above pass by emptying both sides.
+    expect(durable(live)).toEqual(TOOL_TURN_ROWS.map((row) => ({ ...row })));
+  });
+
+  it("the MERGE is what makes them agree — name/argKeys survive the closing frame", () => {
+    // The regression guard for the design decision. The closing frame carries
+    // neither `name` nor `argKeys`; a `final`-frame-only journal would lose both.
+    const w = newWrapper() as unknown as WrapperInternals;
+    for (const frame of TOOL_TURN_FRAMES) {
+      w.handleMessage(frame as unknown as InboundMessage);
+    }
+    expect(w.state.messages[0]).toMatchObject({
+      kind: "tool",
+      id: "call-1",
+      turnId: TOOL_TURN,
+      name: "read_file",
+      argKeys: ["path", "limit"],
+      status: "completed",
+      phase: "end",
+    });
+  });
+
+  it("state.toolActivity is DERIVED from the transcript, live and replayed alike", () => {
+    const toolOf = (x: WrapperInternals) =>
+      (x.state as unknown as { toolActivity: unknown[] }).toolActivity;
+
+    const w = newWrapper() as unknown as WrapperInternals;
+    for (const frame of TOOL_TURN_FRAMES) {
+      w.handleMessage(frame as unknown as InboundMessage);
+    }
+    const fresh = newWrapper() as unknown as WrapperInternals;
+    fresh.handleMessage({
+      type: "history",
+      messages: TOOL_TURN_ROWS.map((row, i) => ({ ...row, ts: i + 1 })),
+    } as unknown as InboundMessage);
+
+    expect(toolOf(fresh)).toEqual(toolOf(w));
+    expect(toolOf(w)).toEqual([
+      {
+        id: "call-1",
+        turnId: TOOL_TURN,
+        name: "read_file",
+        phase: "end",
+        status: "completed",
+        argKeys: ["path", "limit"],
+      },
+    ]);
+  });
+
+  it("a MID-SESSION snapshot re-serving the same call is a no-op — tier 1 matches", () => {
+    // Keyed by (kind, turnId, id), so the row meets its own entry and does not
+    // duplicate. A snapshot lands on every register, so a non-idempotent tier 1
+    // grows the transcript once per reconnect.
+    const w = newWrapper() as unknown as WrapperInternals;
+    for (const frame of TOOL_TURN_FRAMES) {
+      w.handleMessage(frame as unknown as InboundMessage);
+    }
+    const before = durable(w.state.messages);
+    for (let i = 0; i < 3; i++) {
+      w.handleMessage({
+        type: "history",
+        messages: TOOL_TURN_ROWS.map((row, j) => ({ ...row, ts: j + 1 })),
+      } as unknown as InboundMessage);
+    }
+    expect(durable(w.state.messages)).toEqual(before);
+  });
+
+  it("a tool id colliding with a BUBBLE id does not overwrite either one", () => {
+    // The kind-scoped index, end to end: same id, different kinds, both render.
+    const w = newWrapper() as unknown as WrapperInternals;
+    w.handleMessage({
+      type: "tool_activity",
+      id: "X",
+      turnId: TOOL_TURN,
+      name: "bash",
+    } as unknown as InboundMessage);
+    w.handleMessage({
+      type: "agent_message",
+      id: "X",
+      turnId: TOOL_TURN,
+      text: "an answer",
+    } as unknown as InboundMessage);
+    expect(durable(w.state.messages)).toEqual([
+      { kind: "tool", id: "X", turnId: TOOL_TURN, name: "bash" },
+      { id: "X", role: "agent", text: "an answer" },
+    ]);
+  });
+
+  it("the SAME id in two different TURNS is two calls, not one", () => {
+    // `(turnId, id)`, never `id` alone — the producer's id is unique per RUN.
+    const w = newWrapper() as unknown as WrapperInternals;
+    w.handleMessage({
+      type: "tool_activity",
+      id: "call-1",
+      turnId: "turn-a",
+      name: "bash",
+    } as unknown as InboundMessage);
+    w.handleMessage({
+      type: "tool_activity",
+      id: "call-1",
+      turnId: "turn-b",
+      name: "grep",
+    } as unknown as InboundMessage);
+    expect(durable(w.state.messages)).toEqual([
+      { kind: "tool", id: "call-1", turnId: "turn-a", name: "bash" },
+      { kind: "tool", id: "call-1", turnId: "turn-b", name: "grep" },
+    ]);
   });
 });
