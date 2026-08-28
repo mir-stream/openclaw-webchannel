@@ -550,16 +550,31 @@ export type WebChannelState = {
    *
    * ⚠️ NO SEPARATE OPT-IN, UNLIKE REASONING — a deliberate asymmetry, not an
    * omission. `capabilities.reasoningDurable` guards the model's chain-of-thought
-   * PLAINTEXT, and that noun is what carries the argument. A tool row's fields
-   * are not plaintext: `phase` comes from a five-member set, `status` from the
-   * producer's enumerated verdicts, `argKeys` is `Object.keys(args)` (key NAMES
-   * only, never values), and `summary` is count-only — `inbound.ts`'s
+   * PLAINTEXT, and that noun is what carries the argument. The two fields that
+   * could carry content do not: `argKeys` is `Object.keys(args)` (key NAMES only,
+   * never values) and `summary` is count-only — `inbound.ts`'s
    * `readSafePatchSummary` either derives it from array LENGTHS or matches it
-   * against an anchored count grammar, so no free text can pass. Storing that is
-   * not the new disclosure class a separate switch exists to gate. The live lane
-   * gates it instead, and does so for free: the producer is only constructed when
-   * streaming mode is `progress`/`partial`, so a `block`/`off` account emits no
-   * `tool_activity` frames at all and therefore journals no rows.
+   * against an anchored count grammar, so no free text can pass. Both are
+   * enforced at the PRODUCER. Storing that is not the new disclosure class a
+   * separate switch exists to gate. The live lane gates it instead, and does so
+   * for free: the producer is only constructed when streaming mode is
+   * `progress`/`partial`, so a `block`/`off` account emits no `tool_activity`
+   * frames at all and therefore journals no rows.
+   *
+   * ⚠️ THIS ARGUMENT USED TO LEAN ON TWO MORE CLAUSES, AND BOTH WERE FALSE —
+   * MEASURED, so do not restore them as reassurance in the published `.d.ts`.
+   * They read "`phase` comes from a five-member set, `status` from the producer's
+   * enumerated verdicts":
+   *   - `status` IS A PASS-THROUGH. `inbound.ts`'s `explicitTerminalToolStatus`
+   *     returns `readEventString(data, "status")` verbatim for ANY non-empty
+   *     string, mapping only `"error"` → `"failed"`;
+   *   - `phase` is checked against `TOOL_EVENT_PHASES` on the `tool` and `item`
+   *     streams ONLY. The `command_output`/`patch` branch forwards it UNCHECKED.
+   * Neither weakens the no-opt-in decision — both are verdict labels, not content
+   * — but the decision now rests on `argKeys` and `summary` alone rather than on
+   * an enumeration nothing enforces. SIZE is a separate, open caveat: nothing
+   * caps `argKeys`'s key count or key length anywhere on the path (**#321**), so
+   * "a tool row is small" is an observation about today's tools, not a property.
    *
    * ⚠️ KNOWN LIMITATION — **#304**, inherited unchanged. The plugin's send path
    * refuses a frame outright while the transport is down, ABOVE the journaling

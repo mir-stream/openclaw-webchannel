@@ -916,10 +916,11 @@ function applyReasoning(
  * ⚠️ THE KEY IS THE COMPOSITE `(turnId, id)`, NOT `id` ALONE. `inbound.ts`'s
  * `correlatedId` derives the id from core's `itemId`/`toolCallId`/`name` within
  * ONE RUN, so it is unique per turn but carries no cross-turn guarantee; the
- * live client has always keyed this surface the same way
- * (`nats-client-wrapper.ts`'s `upsertToolActivity` matches on
- * `entry.turnId === item.turnId && entry.id === item.id`), and history must key
- * it identically or the two disagree the first time a run reuses an id.
+ * live client has always keyed this surface the same way (the
+ * `upsertToolActivity` this slice DELETED from `nats-client-wrapper.ts` matched
+ * on `entry.turnId === item.turnId && entry.id === item.id`), and this fold —
+ * now the only one — must key it identically or live and history disagree the
+ * first time a run reuses an id.
  *
  * ⚠️ AND THE `kind` TEST KEEPS TOOL IDS OUT OF THE OTHER TWO ID SPACES, exactly
  * as `findTextIndex` and `applyReasoning` do for theirs. A tool id colliding

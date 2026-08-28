@@ -138,6 +138,18 @@ export const MAX_INBOUND_USER_ID_LENGTH = 128;
  * Refusing to store is the safe answer for input we did not create; it is the
  * unsafe answer for output we already sent.
  *
+ * ⚠️ AND SINCE #242 half 3 THERE IS AN EXCEPTION TO "PLUGIN-MINTED" — NAMED HERE
+ * SO THE PARAGRAPH ABOVE IS NOT READ AS COVERING EVERY CALLER. The
+ * `tool_activity` branch calls this predicate on a TOOL id, and that id is NOT
+ * ours: `inbound.ts`'s `createCall` prefers the upstream `toolCallId`/`itemId`
+ * straight off the agent event stream, so any non-empty string of any length can
+ * arrive here. The reasoning above still decides the ANSWER — the frame has
+ * already been delivered to the client under that id, so refusing to store it is
+ * the N8/N10 divergence, not a defence — but the premise it rests on is
+ * narrower than it reads. The unbounded SIZE that follows is **#321**; the fix
+ * belongs at the producer or the wire, not in this predicate. DO NOT ADD A BOUND
+ * HERE.
+ *
  * `""` IS id-less HERE and is NOT id-less for `progress` — the two wire sites
  * genuinely differ and the reducer's BOUNDARY 1 pins why. The client's
  * `agent_message` handler branches on `if (id)` (TRUTHY), so `""` falls into its

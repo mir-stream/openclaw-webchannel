@@ -1119,6 +1119,18 @@ export class NatsChannel implements WebChannelPeerChannel {
       // Checked BEFORE the mapper, which cannot distinguish "not durable" from
       // "durable but unusable": both come back as `null`.
       //
+      // ⚠️ AND THIS DETECTOR COVERS ONLY ONE OF THE TWO UNUSABLE CLASSES — say so
+      // rather than let the sentence above read as a general guarantee.
+      // `isIdlessDurableFrame` tests `agent_message` alone. Since #242 half 3
+      // there is a second class: a `tool_activity` frame whose `id` or `turnId`
+      // is not a usable string also maps to `null`, and it goes unlogged here.
+      // That is BENIGN and deliberately not widened — the client's
+      // `case "tool_activity"` refuses exactly the same frame, so nothing
+      // rendered live is missing from history (no N8), and unlike an id-less
+      // `agent_message` there is no delivered TEXT being discarded (no N10).
+      // Post-#238 the `agent_message` case is a REGRESSION detector; the tool
+      // case would be an ordinary refusal, which is why it is not one.
+      //
       // Post-#238 every durable frame carries a plugin-minted id, from
       // `message-adapter.ts`'s `nextMessageId()` at the delivery act. The call
       // sites are deliberately NOT listed here — there are a dozen across

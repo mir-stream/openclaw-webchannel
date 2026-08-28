@@ -213,10 +213,18 @@ async function mountBrowserUi(): Promise<void> {
           // display; do not present it as the call's arguments.
           div.className = "msg tool";
           const label = m.name ?? "tool";
-          const state = m.status ?? m.phase;
+          // ⚠️ NOT `state` — that name SHADOWS the outer `state: WebChannelState`
+          // whose `.messages` this very `.map` is walking. It was correct only
+          // because nothing in the arm reads the outer one, and the gate would
+          // not have caught it becoming wrong: CI typechecks the three published
+          // packages only and lints nothing at all (**#318**), so this workspace's
+          // own `typecheck` script runs only when someone runs it locally. This
+          // file is the worked example of consuming the API — the habits it
+          // demonstrates are its product, so it does not get to lean on that.
+          const phaseLabel = m.status ?? m.phase;
           const args = m.argKeys && m.argKeys.length > 0 ? ` (${m.argKeys.join(", ")})` : "";
           div.textContent =
-            `🔧 ${label}${state !== undefined ? ` — ${state}` : ""}${args}` +
+            `🔧 ${label}${phaseLabel !== undefined ? ` — ${phaseLabel}` : ""}${args}` +
             (m.summary !== undefined ? ` · ${m.summary}` : "");
           return div;
         }

@@ -8,8 +8,10 @@ import type { ChatMessage } from "./types.js";
  * The texts of the USER bubbles, in transcript order.
  *
  * ⚠️ IT NARROWS ON `kind` FIRST, AND THAT IS THE POINT. `ChatMessage` is a
- * tagged union whose `reasoning` and `tool` variants carry neither `role` nor
- * `text`, so `messages.filter((m) => m.role === "user")` — what these two call
+ * tagged union whose `reasoning` and `tool` variants carry no `role` (only the
+ * `tool` variant also lacks `text` — `ChatReasoningCore` has `text: string`; it
+ * is the missing `role` that matters here), so
+ * `messages.filter((m) => m.role === "user")` — what these two call
  * sites used to inline — could not narrow anything: `Array.filter` keeps the
  * element type unless its predicate is a type guard, so the following `.map`
  * still saw the whole union. Selecting the bubble arm by its absent tag makes

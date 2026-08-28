@@ -134,9 +134,17 @@ export type HistoryReasoningMessage = {
  * and the same MEASURED backward-compatibility argument applies UNCHANGED: the
  * shipped client's `case "history"` runs
  * `if (m.role !== "user" && m.role !== "agent") continue;` before any tier
- * matching, and that guard is present exactly once in every one of the 15
- * released tags (`git tag --list 'v*'`), so an older client DROPS this row and a
- * newer one renders it. The widening stays strictly additive.
+ * matching, and that guard is present exactly once **in
+ * `packages/client/src/nats-client-wrapper.ts`** in every one of the 15 released
+ * tags (`git tag --list 'v*'`), so an older client DROPS this row and a newer one
+ * renders it. The widening stays strictly additive.
+ *
+ * ⚠️ THE FILE SCOPE IS NOT DECORATION — the reasoning variant's docblock above
+ * carries it and warns about exactly this trap, and this sentence had dropped it.
+ * Unscoped the claim is FALSE: in v0.1.0–v0.2.0 the same guard also appears once
+ * in `packages/client/src/client.ts`, so a repo-wide `grep -c` finds it twice in
+ * ten of the fifteen tags. The conclusion is unchanged (the wrapper is the
+ * `case "history"` path, and every tag has the guard there); only the census is.
  *
  * ⚠️ THIS ROW IS THE FOLD OF MANY JOURNAL ROWS, NOT ONE OF THEM. The journal
  * stores one event per `tool_activity` FRAME (a delta — see `DurableEvent`'s

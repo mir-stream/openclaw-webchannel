@@ -236,9 +236,11 @@ describe('"load older" reaches the start of the conversation', () => {
 
   it("an AMBIGUOUS tool cursor never silently skips the rows between the two matches", () => {
     // ⚠️ THE REGRESSION TEST FOR THE THIRD CURSOR OUTCOME (#242 half 3). Tool ids
-    // are TURN-LOCAL — `createAgentToolActivitySink` is built per inbound turn, so
-    // the correlation's sequence restarts and mints `tool-activity-1` again — while
-    // the paging cursor carries an ID ALONE. Resolving it with a bare `findIndex`
+    // are TURN-LOCAL on BOTH paths — `createAgentToolActivitySink` is built per
+    // inbound turn, so the generated sequence restarts and can mint
+    // `tool-activity-1` again in a turn that took the id-less path, and an
+    // upstream `toolCallId`/`itemId` is documented run-local too — while the
+    // paging cursor carries an ID ALONE. Resolving it with a bare `findIndex`
     // picks the OLDER match and serves the slice ending THERE, so everything
     // between the two matches is skipped and the client renders one continuous
     // conversation with no gap marker. Measured before the guard:
@@ -276,16 +278,40 @@ describe('"load older" reaches the start of the conversation', () => {
     // deadlock the cases above pin).
     const first = clickLoadOlder(client, projection);
     expect(first.cursor).toBe(REPEATED_TOOL_ID);
-    for (let click = 0; click < 4; click++) clickLoadOlder(client, projection);
+    const later = [first];
+    for (let click = 0; click < 4; click++) later.push(clickLoadOlder(client, projection));
 
-    // The property: whatever the client ends up holding is a CONTIGUOUS span of
-    // the projection. `["u0", tool, "A"]` — the first row plus the last two, with
-    // `m1`/`m2` missing and nothing marking the hole — is the corruption.
+    // ── TWO ASSERTIONS, MEASURING DIFFERENT THINGS ──
+    //
+    // (a) THE PROPERTY. Whatever the client ends up holding is a CONTIGUOUS span
+    //     of the projection. `["u0", tool, "A"]` — the first row plus the last
+    //     two, with `m1`/`m2` missing and nothing marking the hole — is the
+    //     corruption, and it is exactly what a bare `findIndex` produced.
     const span = projectionSpan(projection, client);
     // Every held row is a projection row (an unlocatable one would make the
     // contiguity check vacuous rather than false).
     expect(span.every((i) => i >= 0)).toBe(true);
     expect(span).toEqual(span.map((_, k) => span[0] + k));
+
+    // (b) ⚠️ AND (a) ON ITS OWN IS VACUOUS — WHICH IS WHY THE REST OF THIS BLOCK
+    //     EXISTS. Serving NOTHING AT ALL satisfies contiguity too, so (a) cannot
+    //     tell "the guard works" from "paging is dead". What follows is a
+    //     CHARACTERIZATION: it RECORDS today's behaviour, it does not endorse it.
+    //     MEASURED — the cursor never moves off the ambiguous id, every click
+    //     answers `[]`, and the client is left holding exactly the two rows it
+    //     watched live. So `u0`, `m1` and `m2` are UNREACHABLE, not merely
+    //     un-skipped: the rows BEFORE an ambiguous cursor cannot be paged to at
+    //     all. That is the price of the honest stop, and the repair is a
+    //     composite `(turnId, id)` cursor — **#320**, not this test.
+    //
+    //     ⚠️ THIS IS MEANT TO GO RED WHEN #320 LANDS, and that is the point of
+    //     writing it as an EXACT transcript rather than a `toContain`. A fix that
+    //     restores reach makes this list grow; the test must then be UPDATED to
+    //     the new reach, never relaxed. A change in reach — gained or lost — must
+    //     not be able to pass silently.
+    expect(later.map((r) => r.cursor)).toEqual(new Array(5).fill(REPEATED_TOOL_ID));
+    expect(later.map((r) => r.page)).toEqual([[], [], [], [], []]);
+    expect(ids(client)).toEqual([REPEATED_TOOL_ID, "A"]);
   });
 
   it("`historyPageBefore` resolves an ambiguous cursor to no page at all", () => {

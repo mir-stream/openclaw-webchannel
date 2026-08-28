@@ -299,16 +299,15 @@ describe("journalEventForOutbound returns null for every non-durable frame", () 
   // reviewable.
   //
   // ⚠️ `null` here is never evidence that a frame is non-durable BY DESIGN
-  // (NOT-list N3/N7). The `#242` rows are "not yet".
+  // (NOT-list N3/N7). Most of the `#242` rows are "not yet" — but read each row's
+  // own label, because they no longer agree: `approval_request` and
+  // `approval_resolved` are deferred to half 4, while `approval_snapshot` is a
+  // REPLAY and is PERMANENTLY non-durable, which this slice settled.
   const nonDurable: Array<[string, OutboundWsMessage]> = [
     // A LIVE CUMULATIVE DRAFT — no `final`. #242 half 1 made reasoning durable,
     // but only the burst-closing frame; see the dedicated describe below for the
     // durable side and for why the split exists.
     ["reasoning without final (a live draft)", { type: "reasoning", id: "r-1", turnId: TURN, text: "thinking" }],
-    // ⚠️ `tool_activity` IS NO LONGER IN THIS LIST — #242 half 3 made it durable.
-    // Its cases live in the dedicated describe below. What remains here are the
-    // two ID-LESS forms, which are refused for the same reason an id-less
-    // `agent_message` is: a row under no identity cannot be reconciled.
     // ⚠️ `tool_activity` IS DURABLE SINCE #242 half 3, so what stands here is its
     // ID-LESS form only — refused for the same reason an id-less `agent_message`
     // is, since a row under no identity cannot be reconciled. Exactly ONE entry,

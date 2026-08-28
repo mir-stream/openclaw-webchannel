@@ -220,6 +220,25 @@
  *   10 000     5 000                30.8      269.6        316.7  312.7  310.4
  *   20 000    10 000                60.9    1 323.3      1 449.6 1449.1 1430.9
  *
+ * ⚠️ THOSE NUMBERS ARE NOW A FLOOR, NOT AN ESTIMATE, AND THE FIXTURE IS WHY.
+ * It is 8 events per turn (user / 3 placements / 3 bubbles / seal) and contains
+ * NO TOOL EVENTS AT ALL — it could not, because tool activity journaled nothing
+ * when this was measured. Half 3 changed that: every `tool_activity` FRAME is a
+ * row, so on an account with streaming on, ONE tool call adds at least three
+ * events to the turn (`start` / `update` / `end`) and a chatty tool adds one more
+ * per `update`. A turn with a handful of tool calls is therefore several times
+ * the fixture's event count, against a fold that is quadratic in it. No new
+ * numbers are offered here — measure them if you need them — but do not quote the
+ * table as the cost for a streaming-mode account. It UNDERSTATES it, by a factor
+ * this fixture cannot say.
+ *
+ * ⚠️ AND THE FIRST PLACE THAT LANDS IS THE REGISTER-TIME SNAPSHOT, not paging.
+ * `history-serve.ts` folds the whole journal on EVERY register, and the rate of
+ * that hop is unbounded for an authenticated peer — already filed as **#298**,
+ * which owns bounding the trigger. #298 and #286 stay independent levers (one
+ * makes the fold cheaper, one bounds how often it runs); what half 3 changes is
+ * only how much each register costs.
+ *
  * Three things fall out of that table, and only the first was expected:
  *
  *  1. CHUNK SIZE IS NOT A TIME/MEMORY TRADE — and that has to be stated in the
@@ -249,7 +268,10 @@
  *     enough for the projection to matter", never as a fixed ~9% surcharge.
  *     The fold itself grows ~4–5x per 2x of events (62.0 → 269.6 is 4.35x,
  *     269.6 → 1 323.3 is 4.91x — quote the range, not one exponent) because
- *     `applyPlacement`/`applyBubble` upsert by `view.findIndex` and each
+ *     ALL FOUR upserting applies scan by `view.findIndex` —
+ *     `applyPlacement`/`applyBubble`, plus `applyReasoning` (half 2) and
+ *     `applyTool` (half 3), which is the highest-frequency of the four since it
+ *     folds one row per FRAME rather than per message — and each
  *     view-changing transition allocates a fresh array of the whole view. That
  *     is inherent to the reducer, is fine LIVE (one event at a time
  *     against a short view), and must NOT be "optimized" here — a faster private
@@ -912,10 +934,17 @@ function recordFirstSeen(
  * HAZARD. A tool row is a name, a phase, a status, a count-grammar summary and a
  * list of argument key names — small in practice, nothing like a reasoning
  * transcript — so what it consumes is the ROW budget, not the byte budget. The
- * qualifier "in practice" is doing real work: `argKeys` is the one field with NO
- * producer-side bound on count or length (see `delivery-journal-event.ts`'s
- * `case "tool_activity"`), so smallness is an observation about today's tools,
- * not an enforced property.
+ * qualifier "in practice" is doing real work: NOTHING on the path bounds the
+ * SIZE of a tool row's fields, and it is not one field but most of them —
+ * `argKeys` (no cap on key count or key length), `id` and `name` (both
+ * `readEventString` pass-throughs off the agent event stream), `status` (a
+ * verbatim pass-through — `explicitTerminalToolStatus` maps only
+ * `"error"` → `"failed"`), and `phase` on the `command_output`/`patch` branch,
+ * which forwards it unchecked. The one field that IS bounded is `summary`:
+ * `readSafePatchSummary` admits only ≤96 chars matching an anchored count
+ * grammar. See `delivery-journal-event.ts`'s `case "tool_activity"`, which says
+ * the same thing — the two must not drift. So smallness is an observation about
+ * today's tools, not an enforced property (**#321**).
  *
  * An oversized frame is NOT truncated. `nats-transport.ts`'s `publish` throws a
  * `RangeError` and `history-serve.ts` catches it as "publish failed", so the peer
@@ -983,13 +1012,22 @@ export function recentHistoryPage(
  *
  * WHY AMBIGUITY IS POSSIBLE AT ALL. Every other row carries a PLUGIN-minted id
  * (`nextMessageId()`'s `webchannel-<ms>-<rand>`), which is globally unique, and
- * until #242 half 3 the whole projection was such rows. A TOOL row is not:
- * `createAgentToolActivitySink` is constructed PER INBOUND TURN, so the
- * correlation's generated sequence restarts and mints `tool-activity-1` in every
- * turn — and an upstream provider id is documented run-local too (`inbound.ts`
- * calls it a "Run-local namespace"). That is why a tool call is addressed by the
- * PAIR `(turnId, id)` everywhere the view keys on it. A CURSOR CARRIES ONLY AN
- * ID, so one cursor can name two rows.
+ * until #242 half 3 the whole projection was such rows. A TOOL row is not, and
+ * BOTH of its id paths are turn-local:
+ *
+ *  - GENERATED. `createAgentToolActivitySink` is constructed PER INBOUND TURN, so
+ *    the correlation's generated sequence restarts at 1. ⚠️ This does NOT mean
+ *    `tool-activity-1` appears in every turn — `createCall` PREFERS an upstream
+ *    `toolCallId`/`itemId` when the event carries one, so a generated id appears
+ *    only in a turn that took the id-less path (which the pinned emitters
+ *    normally do not). The earlier wording said "in every turn" and over-claimed.
+ *  - UPSTREAM. The preferred id is no better, and this leg does not depend on the
+ *    generated one: `inbound.ts` documents the provider ids as a "Run-local
+ *    namespace: providers may reuse the same ids after fallback".
+ *
+ * So ambiguity is reachable either way. That is why a tool call is addressed by
+ * the PAIR `(turnId, id)` everywhere the view keys on it. A CURSOR CARRIES ONLY
+ * AN ID, so one cursor can name two rows.
  *
  * ⚠️ AND THE GUARD IS NOT TOOL-SPECIFIC. It fires on ANY duplicated id in the
  * projection — a peer-echoed user id (**#293**: inbound user ids are

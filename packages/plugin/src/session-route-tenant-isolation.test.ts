@@ -230,8 +230,10 @@ function serveVia(
  * compare against `T1_TRANSCRIPT`.
  *
  * ⚠️ IT NARROWS ON `kind` AND THROWS, RATHER THAN FILTERING. `HistoryMessage`'s
- * `reasoning` and `tool` variants carry no `text` (#242), so `m.text` over the
- * bare union stopped type-checking — but the fix is not to drop the untagged
+ * `tool` variant carries no `text` (#242 half 3), so `m.text` over the bare union
+ * stopped type-checking. (The `reasoning` variant is NOT the reason: it HAS
+ * `text: string` — see `channel-contract.ts`'s `HistoryReasoningMessage`. What
+ * both tagged variants lack is `role`.) But the fix is not to drop the untagged
  * rows. These are ISOLATION controls: their job is to prove the harness CAN
  * leak, so the negative assertions beside them are load-bearing. A filter would
  * make a tagged row vanish from the comparison and could shrink a leaked
