@@ -55,6 +55,7 @@ export type {
   HistoryMessage,
   HistoryReasoningMessage,
   HistoryTextMessage,
+  HistoryToolMessage,
 } from "./channel-contract.js";
 
 /**
@@ -116,9 +117,13 @@ export function resolveHistoryConfig(channelConfig: unknown): HistoryConfig {
  * from the live channel wiring:
  *  - `page`   — a cursor was supplied; fetch older-than-`beforeId`.
  *  - `recent` — no cursor; tail-fetch the most recent `limit`.
+ *
+ * `beforeTurnId` is the OPTIONAL second half of the page cursor (#320). Present,
+ * the anchor row must match BOTH fields; absent, `beforeId` alone selects it —
+ * which is what an older peer sends and what it therefore still gets.
  */
 export type HistoryFetchPlan =
-  | { kind: "page"; beforeId: string; limit: number }
+  | { kind: "page"; beforeId: string; beforeTurnId?: string; limit: number }
   | { kind: "recent"; limit: number };
 
 /**
@@ -174,6 +179,12 @@ export const MAX_WIRE_HISTORY_LIMIT = 1000;
  * deliberate choice about their own gateway, not mounting an attack. Clamping it
  * too would silently override a documented config key.
  *
+ * `beforeTurnId` IS NOT VALIDATED HERE, and that asymmetry with `limit` is not
+ * an oversight. `limit` needs validation because a non-finite one slips past the
+ * page selectors' own `limit <= 0` check; `beforeTurnId` is only ever COMPARED,
+ * exactly like `before` — a value naming no row is the empty page, which is the
+ * same honest miss an unknown `before` already gets.
+ *
  * ⚠️ AND THIS IS NOT THE DEPTH/LENGTH GATE THAT WAS BUILT AND REVERTED EARLIER
  * IN THIS SLICE. That one refused to serve past a total-conversation size, which
  * destroys REACH — a 1200-message conversation would have been unreadable at any
@@ -182,7 +193,7 @@ export const MAX_WIRE_HISTORY_LIMIT = 1000;
  * than base had (base capped the page identically AND capped it twice).
  */
 export function planHistoryFetch(
-  request: { before?: string; limit?: number },
+  request: { before?: string; beforeTurnId?: string; limit?: number },
   fallbackLimit: number,
 ): HistoryFetchPlan {
   const limit =
@@ -191,7 +202,10 @@ export function planHistoryFetch(
     request.limit > 0
       ? Math.min(Math.floor(request.limit), MAX_WIRE_HISTORY_LIMIT)
       : fallbackLimit;
+  // `beforeTurnId` rides along on the `page` arm only — it is meaningless
+  // without an anchor id, so a request carrying it with no `before` still
+  // tail-fetches.
   return request.before
-    ? { kind: "page", beforeId: request.before, limit }
+    ? { kind: "page", beforeId: request.before, beforeTurnId: request.beforeTurnId, limit }
     : { kind: "recent", limit };
 }

@@ -1236,7 +1236,11 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
       text: "B final",
       working: false,
     });
-    expect(messages.some((m) => m.text.includes("Working"))).toBe(false);
+    // ⚠️ `kind !== "tool"` IS THE NARROWING, NOT A FILTER ON WHAT COUNTS. The
+    // `tool` arm of `ChatMessage` carries no `text` at all (#242 half 3), so it
+    // cannot hold a stale "Working…" draft; every arm that CAN — the bubble and
+    // the reasoning block — is still searched, which is the whole claim here.
+    expect(messages.some((m) => m.kind !== "tool" && m.text.includes("Working"))).toBe(false);
   });
 
   // --- C7: history adoption makes the old live ids stale. -----------------
@@ -2431,18 +2435,34 @@ describe("WebChannelNATSClient — #97 tool activity lane", () => {
     expect(toolActivityOf(wrapper)).toHaveLength(0);
   });
 
-  it("bounds the list to the last 100 entries", () => {
+  /**
+   * ⚠️ THIS CASE USED TO ASSERT THE OPPOSITE — "bounds the list to the last 100
+   * entries", expecting `tc5` at the head after 105 frames. #242 half 3 DELETED
+   * the `.slice(-100)` cap along with `upsertToolActivity` itself, so the
+   * assertion is INVERTED rather than adjusted: a live cap over an uncapped
+   * durable view is itself a live≠history divergence, which is the defect class
+   * the slice closes.
+   *
+   * ⚠️ AND THE HONEST VERSION OF WHAT THAT BUYS, because "no cap" reads as a
+   * pure win and is not one. It is #310's twin: where the journal is wired there
+   * IS a durable view and the cap would have disagreed with it, so removing it
+   * closes a real gap; where no journal is wired there is no durable view to
+   * disagree with, so the removal closes nothing there while the array grows
+   * unbounded. Retention belongs at the STORE (#299). Do not re-add a cap here.
+   */
+  it("BEHAVIOUR CHANGE (#242 half 3): the 100-entry cap is GONE — 105 frames keep all 105, oldest included", () => {
     const wrapper = makeWrapper();
     for (let i = 0; i < 105; i++) {
       deliver(wrapper, { type: "tool_activity", id: `tc${i}`, turnId: `t${i}`, name: "n" });
     }
     const list = toolActivityOf(wrapper);
-    expect(list).toHaveLength(100);
-    expect(list[0].id).toBe("tc5");
+    expect(list).toHaveLength(105);
+    // The OLDEST entry survives — that is the whole difference from the cap.
+    expect(list[0].id).toBe("tc0");
     expect(list.at(-1)?.id).toBe("tc104");
   });
 
-  it("does NOT clear toolActivity on turn_settled (ephemeral, live-not-durable)", () => {
+  it("does NOT clear toolActivity on turn_settled", () => {
     const wrapper = makeWrapper();
     deliver(wrapper, { type: "tool_activity", id: "tc1", turnId: "t1", name: "bash" });
     deliver(wrapper, { type: "turn_settled", turnId: "t1" });
@@ -3553,5 +3573,52 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     expect(spy).toHaveBeenCalledWith("next", expect.any(String));
     expect(pendingBubbles(w)).toHaveLength(0);
     expect(held(w)).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #320 — the composite history cursor must survive the CLIENT transport chain.
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — #320 loadHistory carries `beforeTurnId` to the wire", () => {
+  it("puts `beforeTurnId` on the enqueued load_history frame", () => {
+    // ⚠️ WHAT THIS PINS. `beforeTurnId` is threaded by hand through three client
+    // hops — the wrapper's public `loadHistory` (which stages it on the deferred
+    // `load-history` entry), `commitDeferredReplacementOperation` (which passes
+    // it as the THIRD positional argument to the inner client), and the inner
+    // `loadHistory` (which puts it on the outbound frame). Every one of the
+    // three is a one-line deletion that TYPECHECKS, because the field is
+    // optional at each seam, and before this test each deletion left the whole
+    // client suite green while the tool cursor silently reverted to id-only.
+    //
+    // Constructing the wrapper opens no socket, and with no session key the
+    // inner client's drain is a no-op, so the frame simply stays on
+    // `outboundQueue` — which is the earliest place the assembled frame exists.
+    const wrapper = new WebChannelNATSClient({
+      natsUrl: "wss://nats.example.com",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "acct-1",
+      tenant: "tenant-1",
+      peerId: "peer-1",
+      registration,
+    });
+
+    wrapper.loadHistory({
+      before: "tool-activity-1",
+      beforeTurnId: "turn-b",
+      limit: 10,
+    });
+
+    const queue = (wrapper["client"] as unknown as {
+      outboundQueue: Array<Record<string, unknown>>;
+    }).outboundQueue;
+    const frame = queue.find((m) => m.type === "load_history");
+    expect(frame).toBeDefined();
+    // Read the FIELD, never a whole-object `toEqual`: `toEqual` treats an absent
+    // key and a present-but-`undefined` key as equal, so an object-shaped
+    // expectation passes just as happily with the forwarding deleted.
+    expect(frame!.beforeTurnId).toBe("turn-b");
+    // Positive controls — the two halves that already travelled still do.
+    expect(frame!.before).toBe("tool-activity-1");
+    expect(frame!.limit).toBe(10);
   });
 });

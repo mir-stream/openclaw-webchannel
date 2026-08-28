@@ -22,9 +22,9 @@
  *
  * ── ⚠️ KNOWN live≠history GAPS, AND THIS MODULE IS WHERE THEY BECOME VISIBLE ──
  *
- * "`history == live` by construction" is the bet, not a proof, and there are two
- * standing exceptions that show up the moment a real conversation is replayed.
- * READ THIS BEFORE CONCLUDING THE PROJECTION IS WRONG.
+ * "`history == live` by construction" is the bet, not a proof, and there are
+ * three standing exceptions that show up the moment a real conversation is
+ * replayed. READ THIS BEFORE CONCLUDING THE PROJECTION IS WRONG.
  *
  * GAP 1 — the phantom empty bubble:
  *
@@ -78,6 +78,34 @@
  *
  * Both are content/order divergences on top of a shared reducer, not second
  * transition tables, so neither changes the rule this module lives by.
+ *
+ * GAP 3 — TOOL (#242 half 3). A LOST DELTA YIELDS A ROW THAT IS WRONG, NOT A
+ * ROW THAT IS ABSENT, and that is the whole difference from GAP 2a above. For
+ * reasoning the durable frame is one per burst, so a refused close means NO ROW;
+ * for tool the design is one row per FRAME, merged by `applyTool` at replay, so
+ * losing any single frame leaves a MERGED PARTIAL that renders confidently:
+ *
+ *  - LOSE THE `start` FRAME and history folds `{phase:"end",
+ *    status:"completed"}` — the widget renders `🔧 tool — completed`, nameless
+ *    and argKey-less, where live rendered `read_file(path, limit)`. ⚠️ THAT IS
+ *    VERBATIM THE OUTCOME `delivery-journal-event.ts`'s `case "tool_activity"`
+ *    CITES AS ITS REASON FOR REJECTING A `final`-FLAG DESIGN. So the design
+ *    refuses a DETERMINISTIC partial and currently accepts a NONDETERMINISTIC
+ *    one; that is a real asymmetry, and it is recorded rather than resolved.
+ *  - LOSE THE TERMINAL FRAME and the row is stuck mid-flight (`phase:"update"`,
+ *    no `status`) FOREVER — every future reload renders a call that never
+ *    finishes, because nothing later can close it.
+ *
+ * Two reachable causes, neither hypothetical: (a) the append throwing, which
+ * `nats-channel.ts`'s `journalOutbound` catches and reports as `append-failed`
+ * while the PUBLISH proceeds — so the peer sees the frame and the journal does
+ * not; and (b) #304's refusal window, since `journalOutbound` sits below
+ * `sendToPeer`'s three refusal checks exactly as GAP 2a describes.
+ *
+ * ⚠️ RECORDED, NOT REPAIRED — and do not "fix" it here. Reconstructing a missing
+ * `start` from the frames that did land, or closing a stuck call at replay, is a
+ * supersession rule invented server-side (N8), which is what the header above
+ * forbids this module. The repair belongs with #304's design round.
  *
  *
  * ⚠️ IT IS NOT THIS SLICE'S TO FIX, AND THE OBVIOUS FIX IS FORBIDDEN HERE. The
@@ -192,6 +220,25 @@
  *   10 000     5 000                30.8      269.6        316.7  312.7  310.4
  *   20 000    10 000                60.9    1 323.3      1 449.6 1449.1 1430.9
  *
+ * ⚠️ THOSE NUMBERS ARE NOW A FLOOR, NOT AN ESTIMATE, AND THE FIXTURE IS WHY.
+ * It is 8 events per turn (user / 3 placements / 3 bubbles / seal) and contains
+ * NO TOOL EVENTS AT ALL — it could not, because tool activity journaled nothing
+ * when this was measured. Half 3 changed that: every `tool_activity` FRAME is a
+ * row, so on an account with streaming on, ONE tool call adds at least three
+ * events to the turn (`start` / `update` / `end`) and a chatty tool adds one more
+ * per `update`. A turn with a handful of tool calls is therefore several times
+ * the fixture's event count, against a fold that is quadratic in it. No new
+ * numbers are offered here — measure them if you need them — but do not quote the
+ * table as the cost for a streaming-mode account. It UNDERSTATES it, by a factor
+ * this fixture cannot say.
+ *
+ * ⚠️ AND THE FIRST PLACE THAT LANDS IS THE REGISTER-TIME SNAPSHOT, not paging.
+ * `history-serve.ts` folds the whole journal on EVERY register, and the rate of
+ * that hop is unbounded for an authenticated peer — already filed as **#298**,
+ * which owns bounding the trigger. #298 and #286 stay independent levers (one
+ * makes the fold cheaper, one bounds how often it runs); what half 3 changes is
+ * only how much each register costs.
+ *
  * Three things fall out of that table, and only the first was expected:
  *
  *  1. CHUNK SIZE IS NOT A TIME/MEMORY TRADE — and that has to be stated in the
@@ -221,7 +268,10 @@
  *     enough for the projection to matter", never as a fixed ~9% surcharge.
  *     The fold itself grows ~4–5x per 2x of events (62.0 → 269.6 is 4.35x,
  *     269.6 → 1 323.3 is 4.91x — quote the range, not one exponent) because
- *     `applyPlacement`/`applyBubble` upsert by `view.findIndex` and each
+ *     ALL FOUR upserting applies scan by `view.findIndex` —
+ *     `applyPlacement`/`applyBubble`, plus `applyReasoning` (half 2) and
+ *     `applyTool` (half 3), which is the highest-frequency of the four since it
+ *     folds one row per FRAME rather than per message — and each
  *     view-changing transition allocates a fresh array of the whole view. That
  *     is inherent to the reducer, is fine LIVE (one event at a time
  *     against a short view), and must NOT be "optimized" here — a faster private
@@ -327,6 +377,7 @@ const KNOWN_EVENT_KINDS: Record<JournalEvent["kind"], true> = {
   bubble: true,
   seal: true,
   reasoning: true,
+  tool: true,
 };
 
 /**
@@ -696,7 +747,24 @@ export function projectJournalHistory(
     messages.push(
       message.kind === "reasoning"
         ? { kind: "reasoning", id: message.id, turnId: message.turnId, text: message.text, ts }
-        : { id: message.id, role: message.role, text: message.text, ts },
+        : message.kind === "tool"
+          // #242 half 3. The view entry is ALREADY the fold of every frame —
+          // `applyTool` merged them on the way in — so this is a field copy, not
+          // an accumulation. Optional fields are omitted rather than written as
+          // `undefined` so the served row matches the live frame's own shape and
+          // `JSON.stringify` drops nothing silently.
+          ? {
+              kind: "tool",
+              id: message.id,
+              turnId: message.turnId,
+              ...(message.name !== undefined ? { name: message.name } : {}),
+              ...(message.phase !== undefined ? { phase: message.phase } : {}),
+              ...(message.status !== undefined ? { status: message.status } : {}),
+              ...(message.summary !== undefined ? { summary: message.summary } : {}),
+              ...(message.argKeys !== undefined ? { argKeys: message.argKeys } : {}),
+              ts,
+            }
+          : { id: message.id, role: message.role, text: message.text, ts },
     );
   }
 
@@ -763,6 +831,34 @@ function recordFirstSeen(
       // did not have to move.
       note(event.id);
       return;
+    case "tool":
+      // #242 half 3. FIRST-WRITE-WINS gives the call the moment its `start`
+      // frame landed, not its last refinement, which is the right answer: a tool
+      // call's moment is when it began.
+      //
+      // ⚠️ NOTE THE ID ALONE, NOT THE `(turnId, id)` PAIR THE VIEW KEYS ON, and
+      // that asymmetry is deliberate rather than an oversight. `firstSeenMs` is
+      // keyed by id across EVERY kind and is first-write-wins — the docblock
+      // above already records that as a known, bounded imprecision, with the
+      // bound being that `ts` is HYDRATION METADATA and nothing orders on it.
+      // Keying this one case by a pair would make the map's key space
+      // inconsistent to buy a property nothing reads.
+      //
+      // ⚠️ THE EXACT CONDITION UNDER WHICH THIS BECOMES WRONG, so the next
+      // reader can CHECK it rather than re-derive it: IF TWO TOOL CALLS IN
+      // DIFFERENT TURNS EVER SHARE AN `id`, the second call inherits the FIRST
+      // call's `ts`. The view keeps them apart — `applyTool` keys on
+      // `(turnId, id)`, so they are two distinct messages — but they collide in
+      // THIS map, and first-write-wins hands the older timestamp to the newer
+      // call. Reachable in principle: `inbound.ts`'s `correlatedId` derives the
+      // id from core's `itemId`/`toolCallId`/`name` within ONE RUN, so it is
+      // unique per turn and carries no cross-turn guarantee. Harmless while `ts`
+      // stays hydration metadata (nothing in production orders on it — see the
+      // NEVER SORT block in the file header); if `ts` ever becomes load-bearing,
+      // this is the second line to revisit after that docblock, and the repair
+      // is to key the map by the same pair the view uses.
+      note(event.id);
+      return;
     case "seal":
       if (!Array.isArray(event.answers)) return;
       for (const answer of event.answers) {
@@ -802,15 +898,28 @@ function recordFirstSeen(
  * path exactly as in the old one, and the test file pins the behaviour so it is
  * visible rather than assumed.
  *
- * ⚠️ `limit` COUNTS ROWS, AND SINCE #242 half 2 A REASONING BLOCK IS A ROW. So a
- * conversation with durable reasoning gets FEWER CHAT BUBBLES per page at the
- * same `limit`. That is the selector working as specified — the page is "the
- * most recent N messages", and half 2's whole point is that a reasoning block IS
- * one — but it is a behaviour change for an operator who tuned
- * `history.limit`/`history.pageSize` against a bubble-only projection, and it is
- * only reachable for an account that opted into `capabilities.reasoningDurable`
- * (default OFF). Do not "fix" it by making the count kind-aware: that is a
- * second opinion about what a message is, held only by the pager.
+ * ⚠️ `limit` COUNTS ROWS, AND SINCE #242 half 2 A REASONING BLOCK IS A ROW —
+ * SINCE half 3, SO IS A TOOL CALL. So a conversation with durable reasoning or
+ * tool activity gets FEWER CHAT BUBBLES per page at the same `limit`. That is
+ * the selector working as specified — the page is "the most recent N messages",
+ * and each half's whole point is that such a block IS one — but it is a
+ * behaviour change for an operator who tuned `history.limit`/`history.pageSize`
+ * against a bubble-only projection. Do not "fix" it by making the count
+ * kind-aware: that is a second opinion about what a message is, held only by the
+ * pager.
+ *
+ * ⚠️ AND THE TWO ROW CLASSES HAVE DIFFERENT REACH, WHICH THIS DOCBLOCK USED TO
+ * GET WRONG. It said the change was "only reachable for an account that opted
+ * into `capabilities.reasoningDurable` (default OFF)", true of reasoning and
+ * FALSE of tool: tool durability has NO separate opt-in. What gates it is the
+ * live lane itself — the producer is constructed only in `progress`/`partial`
+ * streaming modes, and the plugin's own default is `streaming.mode: "off"`
+ * (`message-adapter.ts`'s `resolveChannelPreviewStreamMode(config, "off")`),
+ * which emits no `tool_activity` frame and journals no row. So the honest
+ * statement is: ANY ACCOUNT WITH STREAMING ENABLED, WITH NO SEPARATE DURABILITY
+ * OPT-IN — not "every account", and not "the default configuration". A tool call
+ * writes one row PER FRAME, so a chatty turn adds rows faster than it adds
+ * bubbles.
  *
  * ⚠️ AND THAT IS THE MILD HALF. STATE THE OTHER ONE HERE, BECAUSE THIS IS THE
  * SITE AN OPERATOR READS — **#311**. Fewer bubbles per page is a tuning
@@ -820,6 +929,32 @@ function recordFirstSeen(
  * than a bubble, so the same row count is now a much larger frame. At the default
  * `limit: 50`, a mean row of ~21 KB reaches a stock nats-server's 1 MiB
  * `max_payload`.
+ *
+ * ⚠️ TOOL ROWS BELONG TO #311 TOO, BUT DO NOT INFLATE THEM INTO THE SAME
+ * HAZARD. A tool row is a name, a phase, a status, a count-grammar summary and a
+ * list of argument key names — small in practice, nothing like a reasoning
+ * transcript — so what it consumes is the ROW budget, not the byte budget. The
+ * qualifier "in practice" is doing real work: NOTHING on the path bounds the
+ * SIZE of a tool row's fields, and it is not one field but most of them —
+ * `argKeys` (no cap on key count or key length), `id` and `name` (both
+ * `readEventString` pass-throughs off the agent event stream), `status` (a
+ * verbatim pass-through — `explicitTerminalToolStatus` maps only
+ * `"error"` → `"failed"`), and `phase` on the `command_output`/`patch` branch,
+ * which gates on `isTerminalToolActivity` — a predicate that can pass on
+ * `status` alone — and then forwards `phase` unchecked. The one field that IS
+ * bounded is `summary`: `readSafePatchSummary` either derives it from array
+ * LENGTHS or admits only ≤96 chars matching an anchored count grammar. See
+ * `delivery-journal-event.ts`'s `case "tool_activity"` and `types.ts`'s
+ * `WebChannelState.toolActivity`, which say the same thing — the three must not
+ * drift. ⚠️ THE POINTER USED TO NAME `ChatToolMessage`, WHICH DOES NOT CARRY THIS
+ * CLAIM AT ALL: its docblock covers the fold, the absent `role` and the
+ * `(turnId, id)` identity, and of this argument only "`argKeys` holds argument
+ * KEY NAMES ONLY". A pointer to a passage that does not make the claim is worse
+ * than no pointer — it invites the next maintainer to conclude the note is
+ * stale, or to paste a FOURTH copy onto `ChatToolCore`. This sentence had
+ * dropped the array-LENGTHS disjunct both siblings carried, and the terminal
+ * gate that `delivery-journal-event.ts` carried. So smallness is an observation
+ * about today's tools, not an enforced property (**#321**).
  *
  * An oversized frame is NOT truncated. `nats-transport.ts`'s `publish` throws a
  * `RangeError` and `history-serve.ts` catches it as "publish failed", so the peer
@@ -865,21 +1000,103 @@ export function recentHistoryPage(
  * a cursor the client cannot resolve", true because reasoning never reached the
  * emitted list. It does now, so a reasoning id CAN arrive as `beforeId`. What
  * replaces the guarantee is not a narrower one — it is the fact that this
- * function never depended on the row's KIND in the first place:
+ * function's POLICY never branched on the row's KIND, and still does not:
  *
- *  - RESOLUTION is `findIndex` by `id` over the SAME list the client was served,
- *    and the emitted list is the whole view. So any id from any page resolves,
- *    reasoning included, and the slice ending at it is a well-formed page.
- *  - The MISS case is unchanged and is the one below: an id NOT in the
- *    projection returns `[]`. Reasoning adds no NEW class of miss — the client
- *    has always been able to hold ids the journal does not serve. A local user
- *    echo is one (`mintLocalBubbleId`'s `u-<n>`, while the accept seam journals
- *    the inbound WIRE id), and a live reasoning block on an account that did NOT
- *    opt into `capabilities.reasoningDurable` is now another.
+ *  - RESOLUTION is `findIndex` over the SAME list the client was served, matching
+ *    on `id` (plus `turnId` when the cursor carries one), and the emitted list is
+ *    the whole view. So any id from any page resolves, reasoning included.
+ *    ⚠️ `rowTurnId` DOES read `kind`, and that is not a policy branch — it is how
+ *    the discriminated union spells "does this variant have a `turnId` field".
+ *    No kind is preferred, skipped, or served differently.
+ *    ⚠️ THIS BULLET ONCE ENDED "…and the slice ending at it is a well-formed
+ *    page", which #242 half 3 made FALSE for an id-only cursor over a duplicated
+ *    id — see the outcomes below.
+ *  - The MISS case is unchanged and is the one below: an identity NOT in the
+ *    projection returns `[]` — an unknown id, and equally a pair whose `turnId`
+ *    matches no row bearing that id. Reasoning adds no NEW class of miss — the
+ *    client has always been able to hold ids the journal does not serve. A local
+ *    user echo is one (`mintLocalBubbleId`'s `u-<n>`, while the accept seam
+ *    journals the inbound WIRE id), and a live reasoning block on an account that
+ *    did NOT opt into `capabilities.reasoningDurable` is now another.
  *
  * The second bullet is a CLIENT-side cursor-choice concern, not a server one:
  * whatever the widget hands us, "not in the projection ⇒ no more history" is the
  * honest answer.
+ *
+ * ── ⚠️ FOUR OUTCOMES: RESOLVE / RESOLVE-BY-PAIR / MISS / AMBIGUOUS ──
+ *
+ * WHY AMBIGUITY IS POSSIBLE AT ALL. Every other row carries a PLUGIN-minted id
+ * (`nextMessageId()`'s `webchannel-<ms>-<rand>`), which is globally unique, and
+ * until #242 half 3 the whole projection was such rows. A TOOL row is not, and
+ * BOTH of its id paths are turn-local:
+ *
+ *  - GENERATED. `createAgentToolActivitySink` is constructed PER INBOUND TURN, so
+ *    the correlation's generated sequence restarts at 1. ⚠️ TWO WORDINGS HAVE
+ *    BEEN WRONG HERE, IN OPPOSITE DIRECTIONS, so quote the rule instead of
+ *    summarising it. `createCall` reads
+ *    `preferred && !usedPublicIds.has(preferred) ? preferred : nextGeneratedId()`
+ *    — the upstream `toolCallId`/`itemId` is preferred CONDITIONALLY, only while
+ *    it is still unused. So `tool-activity-N` is minted on the id-less path AND
+ *    whenever an upstream id repeats, which `inbound.ts` documents as an
+ *    ordinary outcome rather than an edge: "an id re-used after completion is a
+ *    new invocation and receives a generated public id so the earlier call
+ *    remains visible". It does not appear in every turn (the first wording), and
+ *    it is not confined to turns that took the id-less path (the second) — an
+ *    id-BEARING turn mints one as soon as a tool is invoked twice under the same
+ *    upstream id, which is exactly the collision the guard below exists for.
+ *  - UPSTREAM. The preferred id is no better, and this leg does not depend on the
+ *    generated one: `inbound.ts` documents the provider ids as a "Run-local
+ *    namespace: providers may reuse the same ids after fallback".
+ *
+ * So ambiguity is reachable either way. That is why a tool call is addressed by
+ * the PAIR `(turnId, id)` everywhere the view keys on it.
+ *
+ * ── RESOLVE-BY-PAIR: `beforeTurnId` (#320, IMPLEMENTED HERE) ──
+ *
+ * A cursor may now carry the other half of that identity, and when it does the
+ * match predicate is the PAIR rather than the id — which is how the tool cursor
+ * above resolves instead of being refused. `applyTool`
+ * (`durable-view-reducer.ts`) upserts on exactly `(kind === "tool", id, turnId)`,
+ * so at most ONE tool row per pair can exist in the view and therefore in this
+ * projection; that uniqueness is what makes the pair resolvable, and it is the
+ * only property this repair rests on.
+ *
+ * ⚠️ THE AMBIGUITY GUARD BELOW IS NOT REPLACED BY THIS — IT IS THE BACKSTOP.
+ * `beforeTurnId` is OPTIONAL (an older peer sends none), and even with one the
+ * pair is not a projection-wide unique key: a reasoning row and a tool row could
+ * in principle share both fields. The guard is applied to the SAME predicate the
+ * match uses, so it fires on whatever that predicate cannot separate.
+ *
+ * ⚠️ AND THE GUARD IS NOT TOOL-SPECIFIC. It fires wherever the cursor predicate
+ * matches twice — for an id-only cursor that is ANY duplicated id in the
+ * projection, and a peer-echoed user id (**#293**: inbound user ids are
+ * client-supplied, and the only checks on them are non-empty and
+ * `MAX_INBOUND_USER_ID_LENGTH` — `ingress-dedupe.ts`'s `ingressDedupeKey`,
+ * `journalEventForInboundUser`, and the store's `user` branch, the same bound at
+ * all three doors; nothing constrains the CONTENT) reaches it the same way. A
+ * plugin-minted id is well under 128 chars, so the bound rules nothing out here.
+ * It is a property of the cursor, not of the kind. The pair narrows the
+ * predicate; it does not make the guard a tool concern.
+ *
+ * AMBIGUOUS DEGRADES TO THE EMPTY PAGE, DELIBERATELY — the same answer a miss
+ * gets. `findIndex` would silently resolve to the OLDER match and serve the
+ * slice ending there, which SKIPS every row between the two matches: measured on
+ * `[u0, tool₁@t1, m1, m2, tool₁@t2, A]` at `limit: 20`, click 1 served `[u0]`,
+ * every later click served `[]`, and `m1`/`m2` became permanently unreachable
+ * while the client rendered one continuous conversation with no gap marker. A
+ * silently mis-anchored page is a dropped RANGE (N10) and is strictly worse than
+ * an honest stop, so the ambiguity is refused rather than guessed.
+ *
+ * THE REAL REPAIR IS THE COMPOSITE CURSOR ABOVE — `(turnId, id)` on the wire,
+ * the same identity the view already keys on — and **#320 is implemented here**,
+ * so a peer that sends the pair pages past a duplicated id instead of stopping.
+ * The refusal remains the answer for a cursor that stays ambiguous. Three
+ * repairs that look adjacent are still NOT the fix and must not be substituted:
+ * skipping tool rows in the widget's cursor pick reinstates half 2's paging
+ * DEADLOCK (`presentation.ts`, and a 20-tool-call turn is ordinary); making the
+ * generated ids unique fixes only the generated half and leaves provider id
+ * reuse; and `findLastIndex` trades this hole for a STALL once the client has
+ * paged past the newer duplicate.
  *
  * ⚠️ AND THE OBVIOUS CLIENT-SIDE PRECAUTION IS A DEADLOCK — DO NOT SUGGEST IT.
  * An earlier revision of this paragraph ended "…which is why the oldest-cursor
@@ -906,11 +1123,41 @@ export function historyPageBefore(
   messages: readonly ProjectedHistoryMessage[],
   beforeId: string,
   limit: number,
+  beforeTurnId?: string,
 ): ProjectedHistoryMessage[] {
   if (!beforeId || limit <= 0) return [];
-  const idx = messages.findIndex((message) => message.id === beforeId);
+  // The cursor's identity. `beforeTurnId` absent ⇒ id alone, which is exactly
+  // what an older peer sends and exactly what it used to get.
+  const isCursor = (message: ProjectedHistoryMessage): boolean =>
+    message.id === beforeId &&
+    (beforeTurnId === undefined || rowTurnId(message) === beforeTurnId);
+  const idx = messages.findIndex(isCursor);
   if (idx === -1) return [];
+  // AMBIGUOUS ⇒ unresolvable — over the SAME predicate the match used, so it is
+  // the backstop for whatever that predicate cannot separate. See above.
+  if (messages.some((message, i) => i > idx && isCursor(message))) return [];
   return messages.slice(Math.max(0, idx - limit), idx);
+}
+
+/**
+ * A projected row's `turnId`, or `undefined` for the text variant — which is the
+ * one that HAS NO SUCH FIELD (`channel-contract.ts`: the tag is absent only on
+ * text, and the union is discriminated on it). So a bubble id can never be
+ * matched by a pair cursor, which is correct: the wire shape is the whole
+ * reason, and nothing mints a pair cursor for one.
+ *
+ * ⚠️ DO NOT RE-ADD "AND BUBBLE IDS ARE GLOBALLY UNIQUE" AS A SECOND REASON — it
+ * was here, and it is FALSE for the user half. `ingress-dedupe.ts` journals the
+ * peer-supplied wire id VERBATIM, and inbound user ids are client-supplied,
+ * checked only for non-emptiness and `MAX_INBOUND_USER_ID_LENGTH` (**#293**, and
+ * `historyPageBefore`'s guard note above names the same three doors). Neither
+ * check constrains the content, and a plugin-minted id fits well inside 128
+ * chars, so a peer can echo one. Agent bubble ids are `nextMessageId()`-minted;
+ * user ones are not, so a uniqueness premise layered on top of the wire-shape
+ * reason would be a claim this projection cannot make.
+ */
+function rowTurnId(message: ProjectedHistoryMessage): string | undefined {
+  return message.kind === undefined ? undefined : message.turnId;
 }
 
 /** What `serveHistoryRequest` hands back: one page, plus whole-projection health. */
@@ -992,7 +1239,7 @@ export function serveHistoryRequest(
   return {
     messages:
       plan.kind === "page"
-        ? historyPageBefore(messages, plan.beforeId, plan.limit)
+        ? historyPageBefore(messages, plan.beforeId, plan.limit, plan.beforeTurnId)
         : recentHistoryPage(messages, plan.limit),
     unsupportedEvents,
     tsFallbacks,

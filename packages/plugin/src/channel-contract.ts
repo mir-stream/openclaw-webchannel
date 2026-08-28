@@ -54,11 +54,18 @@ export { ANON_PEER_ID };
  *    retry or fallback. Textless or sanitized-away attempts produce no row, so
  *    the projection cannot expose a retry-safe terminal failure signal.
  *  - `working`, `wireId`, `sendState` — live-only client state.
- *  - typing and tool progress — ephemeral by design, matching what Telegram
- *    does. ⚠️ REASONING IS NO LONGER ON THAT LIST: #242 made it durable
- *    (server side in half 1, readable in half 2), and it travels as the sibling
- *    variant below. `docs/P1_REASONING_LANE_PLAN.md`'s "ephemeral by design"
- *    line is superseded for reasoning and still holds for the other two.
+ *  - the TYPING flag and the rolling PROGRESS DRAFT — ephemeral by design,
+ *    matching what Telegram does.
+ *    ⚠️ NEITHER REASONING NOR TOOL ACTIVITY IS ON THAT LIST ANY MORE. #242 made
+ *    reasoning durable (server side in half 1, readable in half 2) and tool
+ *    activity durable in half 3; both travel as sibling variants below.
+ *    `docs/P1_REASONING_LANE_PLAN.md`'s "ephemeral by design" line is superseded
+ *    for both and still holds for the two named above.
+ *    ⚠️ AND "tool progress" WAS AN AMBIGUOUS NAME FOR TWO DIFFERENT THINGS,
+ *    which is why this line is rewritten rather than shortened: the rolling
+ *    `progress` DRAFT (an indicator, still ephemeral) and the structured
+ *    `tool_activity` LANE (a message, now durable). §15.9's message-vs-indicator
+ *    test separates them; the old wording let one word cover both.
  *
  * Full rationale: `docs/ISSUE_95_HISTORY_CONTRACT_PLAN.md`.
  */
@@ -121,7 +128,62 @@ export type HistoryReasoningMessage = {
 };
 
 /**
- * One row on the hydration wire: a chat bubble, or a completed reasoning burst.
+ * ONE TOOL CALL on the hydration wire, MERGED (#242 half 3).
+ *
+ * ⚠️ IT HAS NO `role`, for the reason the reasoning variant above gives in full,
+ * and the same MEASURED backward-compatibility argument applies UNCHANGED: the
+ * shipped client's `case "history"` runs
+ * `if (m.role !== "user" && m.role !== "agent") continue;` before any tier
+ * matching, and that guard is present exactly once **in
+ * `packages/client/src/nats-client-wrapper.ts`** in every one of the 15 released
+ * tags (`git tag --list 'v*'`), so an older client DROPS this row and a newer one
+ * renders it. The widening stays strictly additive.
+ *
+ * ⚠️ THE FILE SCOPE IS NOT DECORATION — the reasoning variant's docblock above
+ * carries it and warns about exactly this trap, and this sentence had dropped it.
+ * Unscoped the claim is FALSE: in v0.1.0–v0.2.0 the same guard also appears once
+ * in `packages/client/src/client.ts`, so a repo-wide `grep -c` finds it twice in
+ * ten of the fifteen tags. The conclusion is unchanged (the wrapper is the
+ * `case "history"` path, and every tag has the guard there); only the census is.
+ *
+ * ⚠️ THIS ROW IS THE FOLD OF MANY JOURNAL ROWS, NOT ONE OF THEM. The journal
+ * stores one event per `tool_activity` FRAME (a delta — see `DurableEvent`'s
+ * tool arm for the measured frame shape that forces it), and
+ * `journal-history.ts` replays them through the shared `applyTool` before
+ * serving. So the wire carries the merged call and the client needs no
+ * accumulation of its own.
+ *
+ * ⚠️ `turnId` IS PART OF THE IDENTITY, NOT DECORATION — the producer's tool id
+ * is unique within a RUN, so a consumer must key on the PAIR. It is REQUIRED
+ * here, following the live frame (`turnId: string`) and `DurableMessage`'s tool
+ * variant.
+ *
+ * ⚠️ `argKeys` CARRIES ARGUMENT KEY NAMES ONLY — NEVER VALUES. That trust
+ * boundary is established at the producer (`Object.keys(args)`), re-filtered
+ * where the wire is read, and it must survive to disk and back out unchanged.
+ * `summary` is likewise count-only (`inbound.ts`'s `readSafePatchSummary`).
+ * Neither field is free text, which is why tool durability needs no separate
+ * storage opt-in the way reasoning does.
+ *
+ * ⚠️ **#311** APPLIES HERE AND IS NOT FIXED BY THIS SLICE: a history page is
+ * bounded by ROW COUNT, not by bytes, and this variant adds another content
+ * class to the same frame. A reader meeting a large page meets it here.
+ */
+export type HistoryToolMessage = {
+  kind: "tool";
+  id: string;
+  turnId: string;
+  name?: string;
+  phase?: string;
+  status?: string;
+  summary?: string;
+  argKeys?: readonly string[];
+  ts?: number;
+};
+
+/**
+ * One row on the hydration wire: a chat bubble, a completed reasoning burst, or
+ * a merged tool call.
  *
  * ⚠️ A TAGGED UNION, MIRRORING `DurableMessage` — NOT A WIDENED RECORD. The
  * reducer already solved this shape and its docblock carries the argument: an
@@ -130,13 +192,16 @@ export type HistoryReasoningMessage = {
  * habit v6 exists to remove. Two variants make a consumer that forgot one a
  * COMPILE error.
  *
- * ⚠️ THE TAG IS PRESENT ONLY ON THE REASONING VARIANT, DELIBERATELY. Emitting
+ * ⚠️ THE TAG IS ABSENT ONLY ON THE TEXT VARIANT, DELIBERATELY. Emitting
  * `kind: "text"` on every bubble would change the serialized form of every row
- * that exists today for no gain; leaving it absent keeps the widening strictly
+ * that exists today for no gain; leaving it absent keeps each widening strictly
  * ADDITIVE — an older PLUGIN's rows still parse (no tag ⇒ bubble), and an older
- * CLIENT drops the new rows on the `role` guard quoted above.
+ * CLIENT drops the tagged rows on the `role` guard quoted above.
  */
-export type HistoryMessage = HistoryTextMessage | HistoryReasoningMessage;
+export type HistoryMessage =
+  | HistoryTextMessage
+  | HistoryReasoningMessage
+  | HistoryToolMessage;
 
 export type ApprovalDecision = "allow-once" | "allow-always" | "deny";
 export type ApprovalOption = { decision: ApprovalDecision; label: string; style: string };
@@ -153,7 +218,29 @@ export type ApprovalRequestPayload = {
 export type InboundWsMessage =
   | { type: "user_message"; text: string; id?: string }
   | { type: "approval_decision"; id: string; decision: ApprovalDecision }
-  | { type: "load_history"; before?: string; limit?: number }
+  /**
+   * Page older history.
+   *
+   * `beforeTurnId` COMPLETES THE CURSOR, and it is strictly ADDITIVE (#320).
+   * `before` alone names a row by id, which is sufficient only while no id can
+   * name two projected rows. A TOOL id can: it is turn-local on both of its
+   * paths, and a tool row is addressed by the PAIR `(turnId, id)` everywhere the
+   * view keys on it (`durable-view-reducer.ts`'s `applyTool` upserts on exactly
+   * that pair), so an id-only cursor can name two rows and `historyPageBefore`
+   * then refuses it as ambiguous. Sending the pair resolves it.
+   *
+   * OMITTING IT IS SUPPORTED AND UNCHANGED — an older peer that sends only
+   * `before` gets exactly the id-only behaviour, ambiguity guard included
+   * (`demo/web/src/history-paging.test.ts` measures that rather than asserting
+   * it). Newer peers set it for a TOOL cursor only, for two different reasons: a
+   * BUBBLE row has no `turnId` on this wire to pair with at all
+   * (`HistoryTextMessage` above), while a REASONING cursor stays id-only by a
+   * deliberate choice that carries a stated residual —
+   * `demo/web/src/presentation.ts`'s `oldestHistoryCursor` argues it. Do not
+   * summarise either as "these ids are globally unique": user bubble ids are
+   * peer-supplied (#293) and that claim is false of them.
+   */
+  | { type: "load_history"; before?: string; beforeTurnId?: string; limit?: number }
   | { type: "load_commands" };
 
 export type OutboundWsMessage =

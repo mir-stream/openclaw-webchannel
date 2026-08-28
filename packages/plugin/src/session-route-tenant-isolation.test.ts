@@ -225,6 +225,30 @@ function serveVia(
   return sent.length === 0 ? [] : sent[sent.length - 1]!;
 }
 
+/**
+ * The `text` of every row a read returned, in order — what the CONTROL cases
+ * compare against `T1_TRANSCRIPT`.
+ *
+ * ⚠️ IT NARROWS ON `kind` AND THROWS, RATHER THAN FILTERING. `HistoryMessage`'s
+ * `tool` variant carries no `text` (#242 half 3), so `m.text` over the bare union
+ * stopped type-checking. (The `reasoning` variant is NOT the reason: it HAS
+ * `text: string` — see `channel-contract.ts`'s `HistoryReasoningMessage`. What
+ * both tagged variants lack is `role`.) But the fix is not to drop the untagged
+ * rows. These are ISOLATION controls: their job is to prove the harness CAN
+ * leak, so the negative assertions beside them are load-bearing. A filter would
+ * make a tagged row vanish from the comparison and could shrink a leaked
+ * transcript back down to the expected list. The fixtures here write only text
+ * bubbles, so anything else means the harness changed, and it should say so.
+ */
+function transcriptTexts(messages: readonly HistoryMessage[]): string[] {
+  return messages.map((m) => {
+    if (m.kind !== undefined) {
+      throw new Error(`expected a text history row, received kind=${m.kind} (id=${m.id})`);
+    }
+    return m.text;
+  });
+}
+
 /** The production register-time snapshot. */
 function readSnapshot(
   journal: DeliveryJournal,
@@ -496,7 +520,7 @@ describe("#112 — tenant scoping of the delivery journal (READ path, #240)", ()
     // Proves the harness can leak, so the assertion above is load-bearing.
     const journal = seedT1Then(T1);
     const { snapshot } = await registerAndSnapshot(journal, T1);
-    expect(snapshot.map((m) => m.text)).toEqual(T1_TRANSCRIPT);
+    expect(transcriptTexts(snapshot)).toEqual(T1_TRANSCRIPT);
   });
 
   it("ADMITS the T2 register — the tenant boundary cannot rest on admission", async () => {
@@ -528,7 +552,7 @@ describe("#112 — tenant scoping of the delivery journal (READ path, #240)", ()
     // broken for mixed-case tenants.
     const journal = seedThenReload("Acme", "Acme");
     const { snapshot } = await registerAndSnapshot(journal, "Acme");
-    expect(snapshot.map((m) => m.text)).toEqual(T1_TRANSCRIPT);
+    expect(transcriptTexts(snapshot)).toEqual(T1_TRANSCRIPT);
   });
 
   it("denies a T2 peer T1's load_history tail fetch", () => {
@@ -542,8 +566,8 @@ describe("#112 — tenant scoping of the delivery journal (READ path, #240)", ()
 
   it("CONTROL: the same load_history reads under T1 do return T1's messages", () => {
     const journal = seedT1Then(T1);
-    expect(readLoadHistory(journal, PEER, {}).map((m) => m.text)).toEqual(T1_TRANSCRIPT);
-    expect(readLoadHistory(journal, PEER, { before: "m3" }).map((m) => m.text)).toEqual(
+    expect(transcriptTexts(readLoadHistory(journal, PEER, {}))).toEqual(T1_TRANSCRIPT);
+    expect(transcriptTexts(readLoadHistory(journal, PEER, { before: "m3" }))).toEqual(
       T1_TRANSCRIPT.slice(0, 2),
     );
   });
@@ -685,12 +709,12 @@ describe("#112 — startup-tenant binding survives an env mutation", () => {
         journalPath(servingTenant, "default"),
       );
 
-      expect(readSnapshot(journal, PEER).map((m) => m.text)).toEqual(T1_TRANSCRIPT);
-      expect(readLoadHistory(journal, PEER, {}).map((m) => m.text)).toEqual(
+      expect(transcriptTexts(readSnapshot(journal, PEER))).toEqual(T1_TRANSCRIPT);
+      expect(transcriptTexts(readLoadHistory(journal, PEER, {}))).toEqual(
         T1_TRANSCRIPT,
       );
       expect(
-        readLoadHistory(journal, PEER, { before: "m3" }).map((m) => m.text),
+        transcriptTexts(readLoadHistory(journal, PEER, { before: "m3" })),
       ).toEqual(T1_TRANSCRIPT.slice(0, 2));
     } finally {
       vi.unstubAllEnvs();

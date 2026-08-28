@@ -20,7 +20,7 @@
  * hides the (useless) re-auth button.
  */
 import { WebChannelNATSClient, filterCommandCatalog } from "../../../packages/client/src/index.js";
-import type { WebChannelState, ApprovalRequest, ChatMessage } from "../../../packages/client/src/types.js";
+import type { WebChannelState, ApprovalRequest, ChatBubble } from "../../../packages/client/src/types.js";
 import { api, b64url, el, type DemoConfig } from "./config.js";
 import { renderMarkdown } from "./markdown.js";
 import { terminalErrorCopy } from "./error-copy.js";
@@ -188,7 +188,15 @@ export async function createWidget(
   // P1-9: a HELD (pending) user message — a dimmed chip with the "queued" hint
   // and a ✕ to retract it BEFORE it publishes (the local twin of the server-side
   // coalesce buffer; retracting means the agent never sees the text).
-  function renderPendingBubble(m: ChatMessage): HTMLElement {
+  // ⚠️ `ChatBubble`, NOT `ChatMessage` — both of these render a USER bubble
+  // (a held or retracted send) and read `m.text`, which only the bubble arm of
+  // the union has. The parameter said `ChatMessage` while the union had a
+  // `text` on every arm; #242 half 3's tool arm has none, so the wider type
+  // stopped compiling. Narrowed at the DECLARATION rather than guarded inside:
+  // the sole call site already holds a `ChatBubble` (`orderConversationPresentation`
+  // hands back `{kind:"message", value: ChatBubble}`), so a guard would be
+  // unreachable code standing in for a type that was simply too loose.
+  function renderPendingBubble(m: ChatBubble): HTMLElement {
     const dismiss = el("button", {
       title: "retract",
       style: "background:transparent;border:none;color:inherit;cursor:pointer;font-size:12px;padding:0 2px",
@@ -213,7 +221,7 @@ export async function createWidget(
   // instead of destroying it (client-held text exists nowhere else). Struck and
   // dimmed, with a one-tap RESTORE (into the composer, appended so it never
   // clobbers a draft the user is mid-typing) and a ✕ to dismiss it for good.
-  function renderRetractedBubble(m: ChatMessage): HTMLElement {
+  function renderRetractedBubble(m: ChatBubble): HTMLElement {
     const restore = el("button", {
       style: "background:transparent;border:none;color:var(--accent);cursor:pointer;font-size:11px;padding:0",
     }, ["restore"]) as HTMLButtonElement;
@@ -292,13 +300,12 @@ export async function createWidget(
     const nextMdCache = new Map<string, HTMLElement>();
     const openReasoningIds = captureOpenReasoningIds(list);
     const bubbles: HTMLElement[] = [];
-    // #242 half 2: `state.reasoning` is no longer passed — reasoning lives in
-    // `state.messages` at its own position now, and re-supplying the derived
-    // array would ask this function to place the same blocks twice.
-    for (const presentation of orderConversationPresentation(
-      state.messages,
-      state.toolActivity ?? [],
-    )) {
+    // #242 half 2 stopped passing `state.reasoning`, and half 3 stopped passing
+    // `state.toolActivity` for the same reason: BOTH lanes live in
+    // `state.messages` at their own positions now, and both side arrays are
+    // DERIVED from it, so re-supplying either would ask this function to place
+    // the same blocks twice. The parameter is gone, not merely unused.
+    for (const presentation of orderConversationPresentation(state.messages)) {
       if (presentation.kind === "reasoning") {
         const item = presentation.value;
         const key = `reasoning:${item.id}\n${item.text}`;
@@ -309,7 +316,10 @@ export async function createWidget(
         );
         continue;
       }
-      // #97: minimal, muted tool-activity chip (structured lane, not history).
+      // #97: minimal, muted tool-activity chip. ⚠️ It USED to say "structured
+      // lane, not history" — false since #242 half 3 made tool activity a
+      // durable message; this chip now renders from the transcript on a reload
+      // exactly as it does live.
       if (presentation.kind === "tool_activity") {
         bubbles.push(buildToolActivityChip(presentation.value));
         continue;
@@ -531,9 +541,13 @@ export async function createWidget(
   // ── Wiring ────────────────────────────────────────────────────────────────
   historyBtn.onclick = () => {
     // The pick is `presentation.ts`'s `oldestHistoryCursor`; the paging LOOP it
-    // participates in is driven end to end by `history-paging.test.ts`.
+    // participates in is driven end to end by `history-paging.test.ts`. It
+    // returns an IDENTITY — `turnId` is set for a tool cursor only, and both
+    // halves go on the wire (#320).
+    const cursor = client ? oldestHistoryCursor(client.getState().messages) : undefined;
     client?.loadHistory({
-      before: oldestHistoryCursor(client.getState().messages),
+      before: cursor?.id,
+      beforeTurnId: cursor?.turnId,
       // Shared with `history-paging.test.ts`; see `HISTORY_PAGE_SIZE`.
       limit: HISTORY_PAGE_SIZE,
     });

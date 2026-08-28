@@ -214,8 +214,16 @@ export type HistoryServer = {
    * every long conversation.
    */
   sendSnapshot(peerId: string): void;
-  /** Serve one `load_history` request. Same deferral, different reason — below. */
-  servePage(peerId: string, request: { before?: string; limit?: number }): void;
+  /**
+   * Serve one `load_history` request. Same deferral, different reason — below.
+   *
+   * `beforeTurnId` completes the cursor for a tool row and is optional on the
+   * wire; see `channel-contract.ts`'s `load_history` member.
+   */
+  servePage(
+    peerId: string,
+    request: { before?: string; beforeTurnId?: string; limit?: number },
+  ): void;
 };
 
 /** What a diagnostic is about. Closed set; one throttle entry per (kind, reason). */
@@ -498,11 +506,14 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
       );
     },
 
-    servePage(peerId: string, request: { before?: string; limit?: number }): void {
+    servePage(
+      peerId: string,
+      request: { before?: string; beforeTurnId?: string; limit?: number },
+    ): void {
       // PURE, so it stays on the dispatch turn: `planHistoryFetch` validates the
       // wire `limit` (the NATS dispatch forwards `message.limit` unvalidated)
-      // and picks paginate-vs-tail from `before`. It cannot throw and it does
-      // not touch the store.
+      // and picks paginate-vs-tail from `before`, carrying `beforeTurnId` into
+      // the page plan. It cannot throw and it does not touch the store.
       const plan = planHistoryFetch(request, config.pageSize);
       // ⚠️ DEFERRED FOR A DIFFERENT REASON THAN THE SNAPSHOT — name which one.
       // Nothing is racing this handler (a `load_history` answer is an ordinary

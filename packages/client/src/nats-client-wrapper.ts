@@ -21,6 +21,7 @@ import type {
   ChatBubble,
   ChatMessage,
   ChatReasoningMessage,
+  ChatToolMessage,
   ReasoningItem,
   ToolActivityItem,
   ApprovalRequest,
@@ -88,7 +89,7 @@ type DeferredReplacementOperation =
       receiptKey: string;
     }
   | { kind: "approval-decision"; id: string; decision: ApprovalDecision }
-  | { kind: "load-history"; before?: string; limit?: number }
+  | { kind: "load-history"; before?: string; beforeTurnId?: string; limit?: number }
   | { kind: "load-commands" };
 
 function normalizeAssistantMessageIndex(value: unknown): number | undefined {
@@ -150,13 +151,14 @@ type DurableLocalOverlay = Record<string, Partial<ChatBubble>>;
 /**
  * What a state mutation may carry.
  *
- * ⚠️ `reasoning` IS EXCLUDED AT THE TYPE LEVEL (#242 half 2), and that exclusion
- * IS the "one source of truth" guarantee. The field is DERIVED from
- * `state.messages` by `nextStateFrom` below; a patch that could also set it
- * would let the two disagree, which is the whole defect class this slice closes.
- * Writing `setState({ reasoning: … })` is now a compile error, not a convention.
+ * ⚠️ `reasoning` (#242 half 2) AND `toolActivity` (half 3) ARE EXCLUDED AT THE
+ * TYPE LEVEL, and that exclusion IS the "one source of truth" guarantee. Both
+ * fields are DERIVED from `state.messages` by `nextStateFrom` below; a patch that
+ * could also set one would let the two disagree, which is the whole defect class
+ * these slices close. Writing `setState({ reasoning: … })` or
+ * `setState({ toolActivity: … })` is a compile error, not a convention.
  */
-type StatePatch = Omit<Partial<InitializedWebChannelState>, "reasoning">;
+type StatePatch = Omit<Partial<InitializedWebChannelState>, "reasoning" | "toolActivity">;
 
 /**
  * The reasoning bursts inside a transcript, in transcript order — what
@@ -171,6 +173,40 @@ function deriveReasoning(messages: readonly ChatMessage[]): ReasoningItem[] {
   const out: ReasoningItem[] = [];
   for (const m of messages) {
     if (m.kind === "reasoning") out.push({ id: m.id, turnId: m.turnId, text: m.text });
+  }
+  return out;
+}
+
+/**
+ * The tool calls inside a transcript, in transcript order — what
+ * `state.toolActivity` exposes (#242 half 3).
+ *
+ * ⚠️ NO CAP. `upsertToolActivity`'s `.slice(-100)` is deliberately not reproduced
+ * here, for the reason `deriveReasoning` gives and with the same honest
+ * conditional attached: a live cap over an uncapped durable view IS the
+ * live≠history divergence this slice closes, and where no journal is wired there
+ * is no durable view to disagree with, so the removal closes nothing there while
+ * the array grows unbounded (#310's twin). Retention is #299's, at the store.
+ * Do not add one.
+ *
+ * ⚠️ EACH OPTIONAL FIELD IS OMITTED, NOT WRITTEN AS `undefined`. `setState`
+ * hands these items straight to embedders and `sameChatMessage`-style key-count
+ * comparisons exist elsewhere in this file; an own `name: undefined` key would
+ * make an item that reads identically compare as different.
+ */
+function deriveToolActivity(messages: readonly ChatMessage[]): ToolActivityItem[] {
+  const out: ToolActivityItem[] = [];
+  for (const m of messages) {
+    if (m.kind !== "tool") continue;
+    out.push({
+      id: m.id,
+      turnId: m.turnId,
+      ...(m.name !== undefined ? { name: m.name } : {}),
+      ...(m.phase !== undefined ? { phase: m.phase } : {}),
+      ...(m.status !== undefined ? { status: m.status } : {}),
+      ...(m.summary !== undefined ? { summary: m.summary } : {}),
+      ...(m.argKeys !== undefined ? { argKeys: m.argKeys } : {}),
+    });
   }
   return out;
 }
@@ -203,8 +239,140 @@ function nextStateFrom(
   patch: StatePatch,
 ): InitializedWebChannelState {
   const next = { ...prev, ...patch };
-  if (patch.messages !== undefined) next.reasoning = deriveReasoning(patch.messages);
+  if (patch.messages !== undefined) {
+    next.reasoning = deriveReasoning(patch.messages);
+    next.toolActivity = deriveToolActivity(patch.messages);
+  }
   return next;
+}
+
+/**
+ * THE KIND-SCOPED IDENTITY OF ONE TRANSCRIPT ENTRY — one definition, every
+ * index, BOTH the local entry and the wire row (#242 half 3).
+ *
+ * ⚠️ THIS EXISTS BECAUSE THE COPY-PASTE ENDS HERE. `state.messages` holds three
+ * kinds now and will hold four (#242 half 4's approvals). Half 2 shipped THREE
+ * separate defects of one shape — an id-keyed index over a mixed array — and its
+ * conclusion is the rule this function enforces mechanically rather than by
+ * memory: NEVER KEY A MIXED TRANSCRIPT BY ID ALONE. The two id spaces are not
+ * provably disjoint (`durable-view-reducer.ts`'s `findTextIndex` docblock
+ * retracts the id-shape argument outright), and `case "history"` deliberately
+ * produces same-id pairs of different kinds.
+ *
+ * ⚠️ AND A FORGOTTEN KIND IS A COMPILE ERROR, WHICH IS THE ACTUAL POINT. The
+ * inline key this replaced was
+ * `` `${kind === "reasoning" ? "r" : "t"}\0${id}` `` — a two-way test with an
+ * `else` fallback, so adding a third kind would have SILENTLY mapped every tool
+ * entry into the BUBBLE key space and reintroduced the exact collision half 2
+ * spent three rounds removing. The `never` default below makes that fail to
+ * compile, the same device `KNOWN_EVENT_KINDS` uses in `journal-history.ts`.
+ *
+ * ⚠️ THE PARAMETER IS THE STRUCTURAL MINIMUM, NOT `ChatMessage`, AND THAT IS
+ * WHAT LETS ONE FUNCTION SERVE BOTH SIDES. `case "history"` keys UNVALIDATED
+ * WIRE ROWS and `mergeDurable` keys VALIDATED LOCAL ENTRIES; those are different
+ * types carrying the same identity. An earlier revision of this slice wrote TWO
+ * functions with identical bodies — two things that must agree and nothing to
+ * make them go red together, which is the defect class this whole module is
+ * organised against. Widening the parameter instead costs nothing: every
+ * `ChatMessage` arm is assignable to the matching arm below, so a FOURTH
+ * `ChatMessage` kind stops compiling at each call site rather than being keyed
+ * wrongly.
+ *
+ * ⚠️ TOOL IS KEYED BY THE PAIR `(turnId, id)`, the other two by `id`. That is
+ * not stylistic — the producer's tool id is unique within a RUN, and both the
+ * live upsert and `applyTool` address a call by both fields. A key function per
+ * kind is exactly what lets one index serve all three.
+ *
+ * NUL separates, so no id can spell another kind's key. The residual ambiguity
+ * is a NUL *inside* an id or turnId; that is the pre-existing convention here
+ * and its blast radius is two tool calls sharing a key, which is a visible
+ * duplicate rather than a loss.
+ */
+type KeyedTranscriptEntry =
+  | { kind?: undefined; id: string }
+  | { kind: "reasoning"; id: string }
+  | { kind: "tool"; id: string; turnId: string };
+
+function transcriptEntryKey(entry: KeyedTranscriptEntry): string {
+  switch (entry.kind) {
+    case undefined:
+      return `t\0${entry.id}`;
+    case "reasoning":
+      return `r\0${entry.id}`;
+    case "tool":
+      return `x\0${toolEntryKey(entry.turnId, entry.id)}`;
+    default: {
+      const unhandled: never = entry;
+      void unhandled;
+      // Unreachable: every arm is handled above, and a new one fails to compile
+      // at the assignment. Returning a key that can collide with nothing keeps
+      // this total for a value forged past the type system.
+      return `?\0${String((entry as { id?: unknown }).id)}`;
+    }
+  }
+}
+
+/**
+ * Index a transcript by KIND, each kind under its own key space and its own
+ * TYPE (#242 half 3).
+ *
+ * ⚠️ ONE INDEX, NOT ONE MAP PER KIND BOLTED ON AS KINDS ARRIVE. `mergeDurable`
+ * used to build `prevBubbleById` and `prevReasoningById` side by side; tool would
+ * have made three and half 4's approvals four, with every call site needing to
+ * remember which map to reach into. The record below is built by ONE exhaustive
+ * switch, so adding a kind is two compile errors — a missing field on
+ * `TranscriptIndex` and an unhandled arm here — instead of a map somebody forgot
+ * to populate.
+ *
+ * ⚠️ THE MAPS STAY SEPARATELY TYPED RATHER THAN COLLAPSING TO
+ * `Map<string, ChatMessage>` KEYED BY `transcriptEntryKey`. That would work and
+ * would need a narrowing read at every lookup to recover the arm — a guard on
+ * the read, which is the shape half 2 proved dangerous. Typed buckets give each
+ * caller the exact arm with no guard at all, which is the property the
+ * "the key does the work" conclusion was actually about.
+ */
+type TranscriptIndex = {
+  bubble: Map<string, ChatBubble>;
+  reasoning: Map<string, ChatReasoningMessage>;
+  tool: Map<string, ChatToolMessage>;
+};
+
+function indexTranscriptByKind(messages: readonly ChatMessage[]): TranscriptIndex {
+  const index: TranscriptIndex = {
+    bubble: new Map(),
+    reasoning: new Map(),
+    tool: new Map(),
+  };
+  for (const m of messages) {
+    switch (m.kind) {
+      case undefined:
+        index.bubble.set(m.id, m);
+        break;
+      case "reasoning":
+        index.reasoning.set(m.id, m);
+        break;
+      case "tool":
+        index.tool.set(toolEntryKey(m.turnId, m.id), m);
+        break;
+      default: {
+        const unhandled: never = m;
+        void unhandled;
+        break;
+      }
+    }
+  }
+  return index;
+}
+
+/**
+ * The composite key a tool call is addressed by, in ONE place.
+ *
+ * Both `transcriptEntryKey` and `indexTranscriptByKind` compose it, so the
+ * "(turnId, id), never id alone" rule has a single definition rather than two
+ * sites that must remember it.
+ */
+function toolEntryKey(turnId: string, id: string): string {
+  return `${turnId}\0${id}`;
 }
 
 /**
@@ -1180,7 +1348,7 @@ export class WebChannelNATSClient {
       return;
     }
     if (entry.kind === "load-history") {
-      this.client.loadHistory(entry.before, entry.limit);
+      this.client.loadHistory(entry.before, entry.limit, entry.beforeTurnId);
       return;
     }
     if (entry.kind === "load-commands") {
@@ -1863,10 +2031,21 @@ export class WebChannelNATSClient {
     if (!deferred) this.deferOrRunReplacementOperation(operation);
   }
 
-  /** Request history page */
-  loadHistory(request?: { before?: string; limit?: number }): void {
+  /**
+   * Request history page.
+   *
+   * `beforeTurnId` completes the cursor when `before` names a TOOL row, which is
+   * identified by the pair `(turnId, id)` — an id-only cursor over a repeated
+   * tool id is ambiguous and the server refuses it (#320). Optional and additive:
+   * omitting it is the id-only cursor. `demo/web/src/presentation.ts`'s
+   * `oldestHistoryCursor` is the reference picker.
+   */
+  loadHistory(request?: { before?: string; beforeTurnId?: string; limit?: number }): void {
     this.deferOrRunReplacementOperation({
-      kind: "load-history", before: request?.before, limit: request?.limit,
+      kind: "load-history",
+      before: request?.before,
+      beforeTurnId: request?.beforeTurnId,
+      limit: request?.limit,
     });
   }
 
@@ -2077,12 +2256,12 @@ export class WebChannelNATSClient {
     // ids and `remove` from `supersededAnswerBubbleIds`, which are disjoint sets.
     // Recorded rather than branched on — an unreachable branch with no test is
     // worse than a stated invariant.
-    // ⚠️ TWO KIND-SCOPED INDEXES, NEVER ONE KEYED BY ID. The two id spaces
-    // (answer/user bubbles and reasoning blocks) are not provably disjoint — the
-    // reducer's `findTextIndex` docblock retracts the id-shape argument that used
-    // to claim they were — and `case "history"` now DELIBERATELY produces a
-    // same-id pair of different kinds when a snapshot row collides with a local
-    // entry of the other kind.
+    // ⚠️ KIND-SCOPED INDEXES, NEVER ONE KEYED BY ID. The id spaces (answer/user
+    // bubbles, reasoning blocks, and — since #242 half 3 — tool calls) are not
+    // provably disjoint — the reducer's `findTextIndex` docblock retracts the
+    // id-shape argument that used to claim they were — and `case "history"` now
+    // DELIBERATELY produces a same-id pair of different kinds when a snapshot row
+    // collides with a local entry of the other kind.
     //
     // ⚠️ A SINGLE `Map<string, ChatMessage>` WITH A KIND GUARD ON THE LOOKUP WAS
     // TRIED AND WAS WRONG, in exactly the way `case "history"`'s id-keyed index
@@ -2095,12 +2274,13 @@ export class WebChannelNATSClient {
     // `promoteAnchor`) and `pending` (making `retract()` return false for a
     // bubble still in `this.held[]`). Scoping the INDEX makes each member find
     // its own `prev`, and the guards disappear because the key does the work.
-    const prevBubbleById = new Map<string, ChatBubble>();
-    const prevReasoningById = new Map<string, ChatReasoningMessage>();
-    for (const m of prev) {
-      if (m.kind === "reasoning") prevReasoningById.set(m.id, m);
-      else prevBubbleById.set(m.id, m);
-    }
+    //
+    // ⚠️ THE THREE MAPS ARE NO LONGER BUILT HERE. Half 3 moved the construction
+    // into `indexTranscriptByKind`, whose exhaustive switch makes a FORGOTTEN
+    // KIND a compile error — the copy-paste that would have made this loop's
+    // `if/else` silently file tool entries under the bubble key space. See that
+    // function for why the buckets stay separately typed.
+    const prevByKind = indexTranscriptByKind(prev);
     const out: ChatMessage[] = [];
     for (const entry of view) {
       // ⚠️ #242 half 2: A REASONING ENTRY IS CARRIED, NOT SKIPPED. Half 1 had a
@@ -2126,8 +2306,42 @@ export class WebChannelNATSClient {
       // with a bubble later in the array looked up as `undefined` and this
       // branch built exactly the fresh `{kind,id,turnId,text}` it says it
       // avoids. Keying the index by kind is what made the paragraph true.
+      // ⚠️ #242 half 3: A TOOL ENTRY IS CARRIED THE SAME WAY, and for the same
+      // reasons the reasoning branch above spells out — it holds no overlay and
+      // no `role`, and its one client-local field is the hydration `ts`, which
+      // must be inherited or a reload's timestamp is dropped by the next
+      // unrelated durable frame.
+      //
+      // ⚠️ THE LOOKUP KEY IS `(turnId, id)`, NOT `id`. `indexTranscriptByKind`
+      // files tool entries under `toolEntryKey`, so reading them back by id alone
+      // would miss every one of them — and a miss here is not a no-op, it is the
+      // `ts` loss described above plus a needlessly fresh object defeating the
+      // `.toBe` identity reuse.
+      if (entry.kind === "tool") {
+        const prevTool = prevByKind.tool.get(toolEntryKey(entry.turnId, entry.id));
+        const nextTool: ChatToolMessage = {
+          kind: "tool",
+          id: entry.id,
+          turnId: entry.turnId,
+          ...(entry.name !== undefined ? { name: entry.name } : {}),
+          ...(entry.phase !== undefined ? { phase: entry.phase } : {}),
+          ...(entry.status !== undefined ? { status: entry.status } : {}),
+          ...(entry.summary !== undefined ? { summary: entry.summary } : {}),
+          ...(entry.argKeys !== undefined ? { argKeys: entry.argKeys } : {}),
+        };
+        // Assigned rather than written in the literal, exactly as the two
+        // branches around it do: an own `ts: undefined` key would fail
+        // `sameChatMessage`'s key-count check and defeat the identity reuse.
+        if (prevTool?.ts !== undefined) nextTool.ts = prevTool.ts;
+        out.push(
+          prevTool !== undefined && sameChatMessage(prevTool, nextTool)
+            ? prevTool
+            : nextTool,
+        );
+        continue;
+      }
       if (entry.kind === "reasoning") {
-        const prevEntry = prevReasoningById.get(entry.id);
+        const prevEntry = prevByKind.reasoning.get(entry.id);
         const nextReasoning: ChatReasoningMessage = {
           kind: "reasoning",
           id: entry.id,
@@ -2145,7 +2359,7 @@ export class WebChannelNATSClient {
         );
         continue;
       }
-      const base = prevBubbleById.get(entry.id);
+      const base = prevByKind.bubble.get(entry.id);
       const overlay = local !== undefined && Object.hasOwn(local, entry.id)
         ? local[entry.id]
         : undefined;
@@ -2253,28 +2467,15 @@ export class WebChannelNATSClient {
     this.setState({ messages: this.nextDurableMessages(event, local), ...extra });
   }
 
-  // #97: upsert a tool-activity item by turn-scoped `(turnId, id)`. A later
-  // sparse lifecycle frame refines the same call without erasing name/argKeys
-  // learned at start. Ephemeral, NOT cleared on turn_settled (a live-not-durable
-  // surface), and bounded at 100 by the `.slice(-100)` below.
-  //
-  // ⚠️ "BOUNDED LIKE `reasoning`" IS NO LONGER TRUE — #242 half 2 DELETED that
-  // bound. Reasoning is a DURABLE message now: it lives in `state.messages`, is
-  // uncapped there to match the durable view, and `state.reasoning` is derived
-  // from it. Tool activity is still a live-only side array with no durable twin
-  // to disagree with, so its cap costs nothing and stays. When half 3 makes tool
-  // activity durable this cap has to go the same way, for the same reason — a
-  // live cap over an uncapped durable view IS a live≠history divergence.
-  private upsertToolActivity(item: ToolActivityItem): void {
-    const current = this.state.toolActivity;
-    const idx = current.findIndex(
-      (entry) => entry.turnId === item.turnId && entry.id === item.id,
-    );
-    const next = idx === -1
-      ? [...current, item]
-      : current.map((entry, i) => (i === idx ? { ...entry, ...item } : entry));
-    this.setState({ toolActivity: next.slice(-100) });
-  }
+  // ⚠️ `upsertToolActivity` IS GONE (#242 half 3). It maintained
+  // `state.toolActivity` as an independent, `.slice(-100)`-capped side array —
+  // a second opinion about which tool calls a conversation contains and where
+  // they sit. Tool activity is a DURABLE MESSAGE now: `case "tool_activity"`
+  // routes each frame through `applyDurable`, `durable-view-reducer.ts`'s
+  // `applyTool` performs the ONE merge, and `state.toolActivity` is derived from
+  // `state.messages` by `deriveToolActivity`. The cap went with it — see
+  // `WebChannelState.toolActivity` for the honest version of what that does and
+  // does not close.
 
   private patchApproval(
     id: string,
@@ -2638,23 +2839,31 @@ export class WebChannelNATSClient {
 
         const existing = this.state.messages;
         /**
-         * The tier-1 key: (KIND, id), never the id alone.
+         * The tier-1 key: (KIND, identity), never the id alone.
          *
-         * ⚠️ `state.messages` MIXES BOTH KINDS SINCE #242 half 2, and the two id
-         * spaces are NOT provably disjoint — `durable-view-reducer.ts`'s
-         * `findTextIndex` docblock retracts the id-shape argument outright
-         * (agent answer ids come from the same `nextMessageId()` as reasoning
-         * ids, and USER ids are client-supplied, validated only as a non-empty
-         * string within `MAX_INBOUND_USER_ID_LENGTH`, so a peer can send
-         * `webchannel-…` verbatim). Indexing a mixed array by id alone is
-         * therefore the whole defect class; keying it is the fix, and it is one
-         * property rather than a rule each site has to remember.
+         * ⚠️ `state.messages` MIXES KINDS SINCE #242 half 2 (three of them since
+         * half 3), and the id spaces are NOT provably disjoint —
+         * `durable-view-reducer.ts`'s `findTextIndex` docblock retracts the
+         * id-shape argument outright (agent answer ids come from the same
+         * `nextMessageId()` as reasoning ids, and USER ids are client-supplied,
+         * validated only as a non-empty string within
+         * `MAX_INBOUND_USER_ID_LENGTH`, so a peer can send `webchannel-…`
+         * verbatim). Indexing a mixed array by id alone is therefore the whole
+         * defect class; keying it is the fix, and it is one property rather than
+         * a rule each site has to remember.
          *
-         * NUL separates, so no id can spell another kind's key.
+         * ⚠️ THE LOCAL LAMBDA IS GONE — IT WAS THE NEXT INSTANCE OF THE DEFECT,
+         * NOT A HELPER. It read
+         * `` `${kind === "reasoning" ? "r" : "t"}\0${id}` ``: a two-way test with
+         * an `else`, so half 3's tool entries would have keyed as BUBBLES and
+         * collided silently. `transcriptEntryKey` switches on a closed union
+         * with a `never` default, so a fourth kind (half 4's approvals) fails to
+         * compile instead. It also carries tool's composite `(turnId, id)` key,
+         * which a `(kind, id)` lambda could not express — and it is the SAME
+         * function `mergeDurable` keys local entries with, so the wire side and
+         * the local side cannot drift.
          */
-        const kindKey = (kind: string | undefined, id: string): string =>
-          `${kind === "reasoning" ? "r" : "t"}\0${id}`;
-        const seen = new Set(existing.map((m) => kindKey(m.kind, m.id)));
+        const seen = new Set(existing.map((m) => transcriptEntryKey(m)));
 
         // Phase 6 (stateless register, shared conversation key): a snapshot
         // triggered by ANY device's register — this device's reconnect or a
@@ -2757,7 +2966,7 @@ export class WebChannelNATSClient {
         // Last-wins on a duplicate key, exactly as before — the change is the
         // KEY, not the policy, so the non-collision case is unaffected.
         const localIndexByKey = new Map<string, number>();
-        next.forEach((m, i) => localIndexByKey.set(kindKey(m.kind, m.id), i));
+        next.forEach((m, i) => localIndexByKey.set(transcriptEntryKey(m), i));
         const claimed = new Set<number>();
         const adoptable = new Map<string, number[]>();
         next.forEach((m, i) => {
@@ -2788,7 +2997,7 @@ export class WebChannelNATSClient {
          */
         let cursor = 0;
 
-        const adoptAt = (idx: number, m: { id: string; text: string; ts?: number }): void => {
+        const adoptAt = (idx: number, m: { id: string; text: string; ts?: number }): boolean => {
           // INVARIANT: `seen` and `localIndexByKey` describe `next` exactly.
           // `adoptAt` is the only thing that mutates `next` inside the loop, so
           // it is the only place that can break them.
@@ -2810,12 +3019,24 @@ export class WebChannelNATSClient {
           // can displace is a local `u-<n>` that no snapshot row ever carries.
           // Kept anyway: two lines that keep the bookkeeping unconditionally true
           // beat a live premise about what ids can appear.
-          const displacedId = next[idx].id;
+          // ⚠️ NARROWED, NOT CAST (#242 half 3). The argument above proves the
+          // target is a bubble, and until half 3 the SPREAD below happened to
+          // type-check anyway; with a third arm it stopped, because
+          // `ChatToolMessage` pins `text` to `undefined` and this writes a
+          // string. Rather than cast the proof back in, the refusal is made
+          // explicit and REPORTED: the caller falls through to the fresh-insert
+          // path, so an invariant violation costs a duplicate row rather than a
+          // dropped one or a malformed entry. `adopted`/`claimed`/`cursor` are
+          // all left untouched on that path, which is what keeps `seen` and
+          // `localIndexByKey` describing `next` exactly.
+          const target = next[idx];
+          if (target.kind !== undefined) return false;
+          const displacedId = target.id;
           // Keep the canonical stored text on adoption, so this device
           // converges to exactly what a reloading device would render. The
           // observed live block ordinal is deliberately discarded: history
           // cannot validate or persist this run/attempt-local metadata.
-          const { assistantMessageIndex: _liveOrdinal, ...adoptedMessage } = next[idx];
+          const { assistantMessageIndex: _liveOrdinal, ...adoptedMessage } = target;
           next[idx] = {
             ...adoptedMessage,
             id: m.id,
@@ -2824,17 +3045,80 @@ export class WebChannelNATSClient {
           };
           // `displacedId !== m.id` always here (equality is a tier-1 hit, which
           // never reaches an adoption), so this cannot erase what we just set.
-          seen.delete(kindKey(undefined, displacedId));
-          localIndexByKey.delete(kindKey(undefined, displacedId));
+          seen.delete(transcriptEntryKey({ id: displacedId }));
+          localIndexByKey.delete(transcriptEntryKey({ id: displacedId }));
           claimed.add(idx);
-          localIndexByKey.set(kindKey(undefined, m.id), idx);
+          localIndexByKey.set(transcriptEntryKey({ id: m.id }), idx);
           adopted = true;
           cursor = idx + 1;
+          return true;
         };
 
         for (const m of incoming) {
           if (!m || typeof m !== "object") continue;
           if (typeof m.id !== "string" || m.id.length === 0) continue;
+          // ⚠️ THE TOOL BRANCH RUNS BEFORE THE `text` GUARD, AND MUST. A tool row
+          // is the ONE history variant with no `text` at all — its content is the
+          // name/phase/status/argKeys surface — so leaving it below the guard
+          // would drop EVERY tool row on the way in while live rendered them
+          // (N10, and an N8 live≠history gap). Found by the compiler only
+          // indirectly; verified by the round-trip test.
+          /**
+           * ⚠️ #242 half 3: A TOOL ROW TAKES TIER 1 OR A FRESH INSERT, exactly
+           * like a reasoning row, and all four properties in the docblock above
+           * carry over unchanged — with one addition that is NOT cosmetic:
+           *
+           *  5. THE KEY IS `(kind, turnId, id)`. `transcriptEntryKey` composes
+           *     the tool arm from BOTH identity fields, so tier 1 here asks the same
+           *     question `applyTool` and `indexTranscriptByKind` ask. Keying a
+           *     tool row by id alone would tier-1 match two different calls that
+           *     happen to share a producer id across turns and DROP the second —
+           *     N10 content loss, and the same shape as the defect property 4
+           *     records, one field further out.
+           *
+           * ⚠️ THE ROW IS A MERGED CALL, NOT A FRAME, so it is inserted whole.
+           * The journal stores one row per frame and the PLUGIN's projection
+           * folds them through the same `applyTool` before serving; by the time a
+           * row reaches this client it is already the merge result. That is why
+           * there is no accumulation to do here and no partial to reconcile.
+           *
+           * `turnId` is REQUIRED on this variant (the wire types it `string`), so
+           * a row without one is dropped rather than inserted with a fabricated
+           * correlation — the same rule the reasoning branch applies. There is
+           * deliberately NO non-empty test on the other fields: unlike reasoning's
+           * `text`, every one of them is optional on the wire and an empty
+           * `status` is a real state a live frame can produce, so refusing one
+           * here would drop a row live rendered.
+           */
+          if (m.kind === "tool") {
+            if (typeof m.turnId !== "string" || m.turnId.length === 0) continue;
+            const key = transcriptEntryKey({ kind: "tool", id: m.id, turnId: m.turnId });
+            if (seen.has(key)) {
+              const li = localIndexByKey.get(key);
+              if (li !== undefined) {
+                cursor = li + 1;
+                claimed.add(li);
+              }
+              continue;
+            }
+            seen.add(key);
+            const atCursorTool = inserts.get(cursor) ?? [];
+            atCursorTool.push({
+              kind: "tool",
+              id: m.id,
+              turnId: m.turnId,
+              ...(typeof m.name === "string" ? { name: m.name } : {}),
+              ...(typeof m.phase === "string" ? { phase: m.phase } : {}),
+              ...(typeof m.status === "string" ? { status: m.status } : {}),
+              ...(typeof m.summary === "string" ? { summary: m.summary } : {}),
+              ...(Array.isArray(m.argKeys)
+                ? { argKeys: m.argKeys.filter((k): k is string => typeof k === "string") }
+                : {}),
+              ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
+            });
+            inserts.set(cursor, atCursorTool);
+            continue;
+          }
           if (typeof m.text !== "string") continue;
           /**
            * ⚠️ #242 half 2: A REASONING ROW TAKES TIER 1 OR A FRESH INSERT, AND
@@ -2846,7 +3130,7 @@ export class WebChannelNATSClient {
            *     travels on the live `reasoning` frame; `journalEventForOutbound`
            *     copies that same `frame.id` into the journal row. So the id this
            *     device rendered live IS the id the snapshot carries, and
-           *     `seen.has(kindKey("reasoning", m.id))` matches it — no
+           *     `seen.has(transcriptEntryKey(m))` matches it — no
            *     adoption, no duplicate.
            *  2. TIER 2 CANNOT REACH IT, TWICE OVER. The adoption branch is
            *     gated `if (m.role === "user")`, which a role-less row fails; and
@@ -2859,8 +3143,8 @@ export class WebChannelNATSClient {
            *     local counterpart at all.
            *  4. TIER 1 CAN ONLY MATCH AN ENTRY OF THE ROW'S OWN KIND, because
            *     `seen`/`localIndexByKey` are keyed by (KIND, id) rather than by
-           *     id — see `kindKey` at the top of this case for why the two id
-           *     spaces cannot be assumed disjoint. This was the fourth outcome
+           *     id — see `transcriptEntryKey` for why the id spaces cannot be
+           *     assumed disjoint. This was the fourth outcome
            *     the first revision of this list did not enumerate, and it was
            *     the defect: a kind-blind tier 1 counted a collision with an
            *     entry of the OTHER kind as a match and DROPPED the row — never
@@ -2895,7 +3179,7 @@ export class WebChannelNATSClient {
             // other — see the empty-row note at the top of this case.
             if (m.text.length === 0) continue;
             // Keyed, so this can only ever meet a REASONING entry (property 4).
-            const key = kindKey("reasoning", m.id);
+            const key = transcriptEntryKey({ kind: "reasoning", id: m.id });
             if (seen.has(key)) {
               const li = localIndexByKey.get(key);
               if (li !== undefined) {
@@ -2919,7 +3203,7 @@ export class WebChannelNATSClient {
           if (m.role !== "user" && m.role !== "agent") continue;
           // Keyed, so this can only ever meet a BUBBLE — see property 4 in the
           // reasoning branch's docblock above for the whole argument.
-          const key = kindKey(undefined, m.id);
+          const key = transcriptEntryKey({ id: m.id });
           if (seen.has(key)) {
             const li = localIndexByKey.get(key);
             // Tier-1 match: walk the cursor past this already-held message so
@@ -2962,8 +3246,11 @@ export class WebChannelNATSClient {
           if (m.role === "user") {
             const idxs = adoptable.get(adoptKey(m.role, m.text));
             while (idxs && idxs.length > 0 && claimed.has(idxs[0])) idxs.shift();
-            if (idxs && idxs.length > 0) {
-              adoptAt(idxs.shift()!, m);
+            if (
+              idxs &&
+              idxs.length > 0 &&
+              adoptAt(idxs.shift()!, { id: m.id, text: m.text, ts: m.ts })
+            ) {
               continue;
             }
           }
@@ -3298,7 +3585,15 @@ export class WebChannelNATSClient {
         // in `argKeys` are carried — no arg values ever reach state.
         if (typeof msg.id !== "string" || msg.id.length === 0) return;
         if (typeof msg.turnId !== "string" || msg.turnId.length === 0) return;
-        this.upsertToolActivity({
+        // ⚠️ #242 half 3: THROUGH THE SHARED REDUCER, NOT A SIDE ARRAY. The
+        // event is the FRAME, verbatim — a delta. `applyTool` folds it onto the
+        // call it refines, which is why the terminal frame's missing `name` and
+        // `argKeys` do not blank the ones `start` carried. The admission rule
+        // (non-empty string id AND turnId) is the one `journalEventForOutbound`
+        // tracks, so nothing is journaled that this refuses and nothing is
+        // refused that gets journaled.
+        this.applyDurable({
+          kind: "tool",
           id: msg.id,
           turnId: msg.turnId,
           ...(typeof msg.name === "string" ? { name: msg.name } : {}),
@@ -3307,6 +3602,8 @@ export class WebChannelNATSClient {
           ...(typeof msg.summary === "string" ? { summary: msg.summary } : {}),
           // Trust boundary: the wire is untrusted; keep only string key names
           // (the "argKeys are key names only" contract) and drop anything else.
+          // It survives to disk unchanged — the plugin's mapper applies the SAME
+          // filter, so a hostile value cannot enter the journal by either door.
           ...(Array.isArray(msg.argKeys)
             ? { argKeys: msg.argKeys.filter((k): k is string => typeof k === "string") }
             : {}),

@@ -67,9 +67,17 @@
  * and `resolveReasoningDurable`) — so its `null` now has TWO reasons and they
  * mean different things: "this account does not store reasoning" and "this frame
  * is a live draft, not the burst's content".
- * TOOL ACTIVITY and the APPROVAL frames are still `null` and are marked "#242
- * half 2". Every `null` below carries its reason, and the ones owned by #242 say
- * "not yet" rather than "no".
+ *
+ * It has since grown again: #242 half 3 made TOOL ACTIVITY durable — one row per
+ * FRAME rather than per call, and with NO account opt-in, both of which are the
+ * opposite of the reasoning answer and are argued at that case. The APPROVAL
+ * request/resolution frames remain `null` and are now marked "#242 **half 4**",
+ * because an approval is the first BIDIRECTIONAL durable message here and needs
+ * #241's revision model first. `approval_snapshot` is `null` PERMANENTLY — it is
+ * a replay, not a message.
+ *
+ * Every `null` below carries its reason, and the ones that are merely deferred
+ * say "not yet" rather than "no".
  */
 import type { OutboundWsMessage } from "./channel-contract.js";
 // #123: the diagnostic below is interpolated into a log line, so every value it
@@ -129,6 +137,18 @@ export const MAX_INBOUND_USER_ID_LENGTH = 128;
  * dropped from the journal — silently discarding DELIVERED text, which is N10.
  * Refusing to store is the safe answer for input we did not create; it is the
  * unsafe answer for output we already sent.
+ *
+ * ⚠️ AND SINCE #242 half 3 THERE IS AN EXCEPTION TO "PLUGIN-MINTED" — NAMED HERE
+ * SO THE PARAGRAPH ABOVE IS NOT READ AS COVERING EVERY CALLER. The
+ * `tool_activity` branch calls this predicate on a TOOL id, and that id is NOT
+ * ours: `inbound.ts`'s `createCall` prefers the upstream `toolCallId`/`itemId`
+ * straight off the agent event stream, so any non-empty string of any length can
+ * arrive here. The reasoning above still decides the ANSWER — the frame has
+ * already been delivered to the client under that id, so refusing to store it is
+ * the N8/N10 divergence, not a defence — but the premise it rests on is
+ * narrower than it reads. The unbounded SIZE that follows is **#321**; the fix
+ * belongs at the producer or the wire, not in this predicate. DO NOT ADD A BOUND
+ * HERE.
  *
  * `""` IS id-less HERE and is NOT id-less for `progress` — the two wire sites
  * genuinely differ and the reducer's BOUNDARY 1 pins why. The client's
@@ -341,29 +361,128 @@ export function journalEventForOutbound(
             text: frame.text,
           }
         : null;
-    // ⚠️ THE FOUR `null`s BELOW SAID "#242 half 2" AND NOW SAY "half 3". That
-    // was not a typo when it was written — it was a forward reference made
-    // before #242 was split three ways. Half 2 shipped (it widened the wire row
-    // and moved the client's reasoning render onto the reducer) and deliberately
-    // did NOT touch these; half 3 owns them. Corrected rather than left, because
-    // a stale "the next slice does it" reads as a commitment nobody made.
     case "tool_activity":
-      // NOT YET durable — #242 half 3. Same as `reasoning` was: Telegram
-      // preserves service messages and so must we; the event model has to grow
-      // first. Half 1 grew it for reasoning only.
-      return null;
+      // DURABLE since #242 half 3 (§15.9) — and EVERY frame is journaled, not
+      // just a closing one.
+      //
+      // ⚠️ THAT IS THE OPPOSITE OF `reasoning` ABOVE, AND IT IS FORCED BY THE
+      // FRAME SHAPE — MEASURED on `inbound.ts`'s `createAgentToolActivitySink`,
+      // not assumed from the neighbouring case. One tool call on the `tool`
+      // stream emits:
+      //
+      //   {turnId, id, name:"read_file", phase:"start", argKeys:["path","limit"]}
+      //   {turnId, id, phase:"update"}
+      //   {turnId, id, phase:"end", status:"completed"}
+      //
+      // The frames are SPARSE DELTAS that refine one call: `argKeys` is emitted
+      // only on a NON-terminal frame and `status` only on a terminal one, so the
+      // CLOSING frame carries neither `name` nor `argKeys`. A `final`-style flag
+      // would therefore journal a PARTIAL — history would show a nameless,
+      // argKey-less call where live showed `read_file(path, limit)`, which is
+      // N8 live≠history.
+      //
+      // ⚠️ AND THE MERGE IS NOT DONE HERE. The alternative to a closing frame is
+      // storing the merged record, which would need a per-`(turnId,id)`
+      // accumulator at this seam and would make the stored row a projection the
+      // PLUGIN computed — a second implementation of a merge the live client
+      // also performs, free to drift. That is precisely what this module's
+      // header refuses (the `JournalEvent` alias exists so ONE reducer computes
+      // both views), so the frame is stored verbatim and
+      // `durable-view-reducer.ts`'s `applyTool` stays the only merge in the
+      // system. Cost: one row per frame rather than per call. Each row is SMALL
+      // IN PRACTICE — not bounded: nothing here, at `sendToolActivity`, or at
+      // the producer caps `argKeys`'s key COUNT or key LENGTH, so "bounded size"
+      // would be an assumption dressed as a property (**#321**). Still
+      // far from reasoning's O(n²) BYTES, where every frame carried the whole
+      // cumulative text; and it feeds #286's quadratic replay and #311's
+      // row-bounded pages either way. ⚠️ DO NOT ADD A CAP HERE — that is a
+      // producer/wire decision, not this mapper's.
+      //
+      // ⚠️ NO `policy` GATE, UNLIKE `reasoning` — deliberate, and argued rather
+      // than inherited. `reasoningDurable` guards the model's chain-of-thought
+      // PLAINTEXT; a tool row has none. The two fields that carry that argument
+      // are ENFORCED at the producer, and were re-verified against it:
+      //   - `argKeys` is `Object.keys(args)` (`inbound.ts`) — key NAMES only,
+      //     never values. This is the load-bearing privacy clause;
+      //   - `summary` is count-only: `readSafePatchSummary` either derives it
+      //     from array LENGTHS or requires ≤96 chars matching an anchored count
+      //     grammar, and its only callers are the `patch` paths.
+      //
+      // ⚠️ AND TWO CLAIMS THAT USED TO SIT HERE ARE FALSE — MEASURED, so do not
+      // restore them as reassurance. This comment asserted "`phase` comes from a
+      // five-member set, `status` from enumerated verdicts":
+      //   - `status` IS A PASS-THROUGH. `explicitTerminalToolStatus` returns
+      //     `readEventString(data, "status")` verbatim for ANY non-empty string,
+      //     mapping only `"error"` → `"failed"`;
+      //   - `phase` is checked against `TOOL_EVENT_PHASES` on the `tool` and
+      //     `item` streams ONLY. The `command_output`/`patch` branch gates on
+      //     `isTerminalToolActivity` — which can pass on `status` alone — and
+      //     then forwards `phase` UNCHECKED.
+      // Neither weakens the privacy argument (both are verdict labels, not
+      // content), which is why the gate stays absent; but the argument now rests
+      // on the two fields above rather than on an enumeration nothing enforces.
+      //
+      // The live lane already gates storage for free: the producer is
+      // constructed only in `progress`/`partial` streaming modes, so a
+      // `block`/`off` account emits no such frame and journals no row.
+      //
+      // The admission rule tracks the client's `case "tool_activity"` exactly —
+      // non-empty string `id` and `turnId`, and `argKeys` filtered to strings —
+      // so nothing is journaled that the client refuses (N8, gaining) and
+      // nothing the client accepts is dropped (N10).
+      return isUsableMessageId(frame.id) && isUsableMessageId(frame.turnId)
+        ? {
+            kind: "tool",
+            id: frame.id,
+            turnId: frame.turnId,
+            // Each optional field is an ABSENT KEY when the frame omitted it,
+            // never an explicit `undefined`: `applyTool` merges by spread, so a
+            // present-and-`undefined` `name` would ERASE the one the `start`
+            // frame carried.
+            ...(typeof frame.name === "string" ? { name: frame.name } : {}),
+            ...(typeof frame.phase === "string" ? { phase: frame.phase } : {}),
+            ...(typeof frame.status === "string" ? { status: frame.status } : {}),
+            ...(typeof frame.summary === "string" ? { summary: frame.summary } : {}),
+            ...(Array.isArray(frame.argKeys)
+              ? {
+                  argKeys: frame.argKeys.filter(
+                    (k): k is string => typeof k === "string",
+                  ),
+                }
+              : {}),
+          }
+        : null;
+    // ⚠️ THE THREE `null`s BELOW SAID "#242 half 3" AND NOW SAY "half 4". Half 3
+    // shipped `tool_activity` above and deliberately did NOT touch these. This
+    // comment has now been corrected twice (it said "half 2" until half 2
+    // shipped without them), so the reason is recorded rather than the label
+    // alone: a stale "the next slice does it" reads as a commitment nobody made.
     case "approval_request":
-      // NOT YET durable — #242 half 3. An approval is a MESSAGE by §15.9's
+      // NOT YET durable — #242 **half 4**. An approval is a MESSAGE by §15.9's
       // message-vs-indicator test, not an indicator.
+      //
+      // ⚠️ IT IS NOT SIMPLY "MORE OF HALF 3", AND THAT IS WHY IT IS SPLIT OFF.
+      // Every durable message before it is one-directional: the plugin delivers
+      // content and later REVISES it. An approval is BIDIRECTIONAL — the client
+      // sends `approval_decision` back through the inbound path, and the
+      // resolution below changes this message's content by a USER ACTION rather
+      // than by a delivery revision. That is the first such message in this
+      // system and it is **#241**'s typed edit/revision territory; modelling it
+      // before #241 lands means inventing the mutation model twice, and the two
+      // inventions would then have to be reconciled.
       return null;
     case "approval_resolved":
-      // NOT YET durable — #242 half 3. It is the state change of the message
-      // above.
+      // NOT YET durable — #242 half 4. It is the state change of the message
+      // above, and it is the half that actually needs #241's revision model.
       return null;
     case "approval_snapshot":
-      // NOT YET durable — #242 half 3. Also a REPLAY of approvals the store
-      // already owns once that half lands; see the `history` case for why
-      // replays are not journaled.
+      // NEVER durable — and this one is NOT deferred work, unlike the two above.
+      //
+      // It is a server→client REPLAY of approval state the store already holds,
+      // exactly like the `history` case below: journaling it would write the
+      // store's own output back into the store, duplicating rows that the
+      // `approval_request`/`approval_resolved` events will already carry once
+      // half 4 lands. Do not schedule it.
       return null;
     case "turn_settled":
       // Control frame. It carries no content and the client renders no bubble

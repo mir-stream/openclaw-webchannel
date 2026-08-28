@@ -71,6 +71,7 @@ import {
 } from "./journal-history.js";
 import {
   reduceDurableView,
+  type DurableMessage,
 } from "../../client/src/durable-view-reducer.js";
 
 const TURN = "turn-1";
@@ -246,21 +247,70 @@ describe("projectJournalHistory — the fold", () => {
     // its own describe below.
     const { read } = fakeReader(rowsFor(MIXED_STREAM));
     const projected = projectJournalHistory(read, CONV).messages;
-    expect(
-      projected.map((m) =>
-        m.kind === "reasoning"
-          ? { id: m.id, turnId: m.turnId, text: m.text }
-          : { id: m.id, role: m.role, text: m.text },
-      ),
-    ).toEqual(
-      reduceDurableView(MIXED_STREAM).map((m) =>
-        m.kind === "reasoning"
-          ? { id: m.id, turnId: m.turnId, text: m.text }
-          : { id: m.id, role: m.role, text: m.text },
-      ),
+    expect(projected.map(comparableRow)).toEqual(
+      reduceDurableView(MIXED_STREAM).map(comparableRow),
     );
   });
 });
+
+/**
+ * The shape the wire row and the reducer entry are compared in — ONE function,
+ * applied to BOTH sides, so the comparison can never be made to pass by mapping
+ * the two halves differently.
+ *
+ * ⚠️ IT BRANCHES ON `kind` FOR ALL THREE ARMS, INCLUDING THE ONE NO FIXTURE
+ * PRODUCES. Until #242 half 3 this was a two-way ternary inlined twice, and it
+ * only type-checked because "not `reasoning` ⇒ has `role` and `text`" was
+ * exhaustive. The `tool` arm carries NEITHER, so that inference is gone — and
+ * inferring content from an absent tag is the habit v6 exists to remove, so the
+ * arm is written out rather than folded into the bubble branch where it would
+ * read `undefined` into `role`/`text` on both sides and compare equal for the
+ * wrong reason. `MIXED_STREAM` holds no `tool` event today; the branch is what
+ * makes adding one a real comparison instead of a silent pair of blanks.
+ *
+ * It drops `ts` on purpose (the wire has it, the reducer does not) and is
+ * otherwise the FULL durable content of each arm — the equality stays the
+ * strong, unfiltered one that #242 half 2 made it.
+ */
+/**
+ * Find a projected row by id and narrow it to the TEXT variant.
+ *
+ * ⚠️ `undefined` IS PASSED THROUGH, DELIBERATELY. The callers assert with
+ * `?.ts` / `?.text`, so an ABSENT id must keep failing exactly as it did — that
+ * is the property those cases are about. Only a row that is PRESENT under a
+ * `reasoning`/`tool` tag throws, because neither of those carries `text` and a
+ * silent skip would turn "the projection tagged this row wrong" into a passing
+ * `undefined === undefined`.
+ */
+function findTextRow(
+  messages: readonly ProjectedHistoryMessage[],
+  id: string,
+): (ProjectedHistoryMessage & { kind?: undefined }) | undefined {
+  const found = messages.find((m) => m.id === id);
+  if (found === undefined) return undefined;
+  if (found.kind !== undefined) {
+    throw new Error(`expected a text history row for id=${id}, received kind=${found.kind}`);
+  }
+  return found;
+}
+
+function comparableRow(m: ProjectedHistoryMessage | DurableMessage) {
+  if (m.kind === "reasoning") {
+    return { id: m.id, turnId: m.turnId, text: m.text };
+  }
+  if (m.kind === "tool") {
+    return {
+      id: m.id,
+      turnId: m.turnId,
+      name: m.name,
+      phase: m.phase,
+      status: m.status,
+      summary: m.summary,
+      argKeys: m.argKeys,
+    };
+  }
+  return { id: m.id, role: m.role, text: m.text };
+}
 
 /**
  * #242 half 2 — the journal holds reasoning AND the `history` frame carries it.
@@ -470,7 +520,7 @@ describe("projectJournalHistory — chunking", () => {
       CONV,
     );
     expect(
-      reFold.messages.filter((m) => m.kind !== "reasoning" && m.role === "user").map((m) => m.id),
+      reFold.messages.filter((m) => m.kind === undefined && m.role === "user").map((m) => m.id),
     ).toEqual(["u-0", "u-1"]);
   });
 
@@ -704,9 +754,7 @@ describe("projectJournalHistory — where ts comes from", () => {
     // X is bubbled at index 6, removed by the seal at 7, and re-bubbled at 8.
     // First-appearance means the moment the user first saw it, which is 6.
     const { read } = fakeReader(rowsFor(MIXED_STREAM));
-    const resurrected = projectJournalHistory(read, CONV).messages.find(
-      (m) => m.id === "X",
-    );
+    const resurrected = findTextRow(projectJournalHistory(read, CONV).messages, "X");
     expect(resurrected?.ts).toBe(T0 + 6 * T_STEP);
     expect(resurrected?.text).toBe("X, resurrected");
   });
@@ -1237,7 +1285,10 @@ import {
   INTERLEAVED_TURN_REPLAY_IDS,
   ORDINARY_TURN_FRAMES,
   ORDINARY_TURN_ROWS,
+  TOOL_TURN_FRAMES,
+  TOOL_TURN_ROWS,
   type ReasoningTurnFrame,
+  type ToolTurnFrame,
 } from "../../client/src/reasoning-turn.test-harness.js";
 
 describe("live == history for reasoning: what the plugin actually serves (#242 half 2)", () => {
@@ -1325,5 +1376,77 @@ describe("live == history for reasoning: what the plugin actually serves (#242 h
     expect(projectJournalHistory(read, CONV).messages.map((m) => m.id)).toEqual([
       ...INTERLEAVED_TURN_REPLAY_IDS,
     ]);
+  });
+});
+
+/**
+ * ⭐ #242 half 3 — THE CENTRAL PROPERTY, PLUGIN HALF.
+ *
+ * The client twin (`packages/client/src/durable-view-reducer.test.ts`) drives
+ * the REAL wrapper over `TOOL_TURN_FRAMES` and asserts the live view. THIS half
+ * drives the real `journalEventForOutbound` and the real projection over the
+ * SAME fixture and asserts that what the plugin SERVES is exactly what that
+ * twin replays. Neither can be edited alone.
+ */
+describe("live == history for tool activity: what the plugin serves (#242 half 3)", () => {
+  const asOutbound = (frame: ToolTurnFrame | ReasoningTurnFrame): OutboundWsMessage =>
+    frame as unknown as OutboundWsMessage;
+
+  function toolJournalRows(): DeliveryJournalRow[] {
+    const events: JournalEvent[] = [];
+    for (const frame of TOOL_TURN_FRAMES) {
+      // NO policy: tool durability has no account opt-in, unlike reasoning.
+      const event = journalEventForOutbound(asOutbound(frame));
+      if (event !== null) events.push(event);
+    }
+    return rowsFor(events);
+  }
+
+  const stripTs = (row: ProjectedHistoryMessage): unknown => {
+    const { ts: _ts, ...rest } = row;
+    return rest;
+  };
+
+  it("writes ONE ROW PER FRAME — the opposite of reasoning's one-per-burst", () => {
+    // The decision, made checkable. Three tool frames become three `tool` rows,
+    // because no single frame is self-contained (the closing one carries neither
+    // `name` nor `argKeys`).
+    expect(toolJournalRows().map((r) => r.kind)).toEqual([
+      "tool",
+      "tool",
+      "placement",
+      "tool",
+      "bubble",
+    ]);
+  });
+
+  it("serves EXACTLY the rows the client-side live==history twin replays", () => {
+    const { read } = fakeReader(toolJournalRows());
+    const messages = projectJournalHistory(read, CONV).messages;
+
+    // ⚠️ THE SHARED FIXTURE IS THE EXPECTATION. The three delta rows have been
+    // folded by `applyTool` into ONE served row carrying fields from all three.
+    expect(messages.map(stripTs)).toEqual(TOOL_TURN_ROWS.map((row) => ({ ...row })));
+    // The position claim, stated on its own so a reordering regression names
+    // itself rather than hiding inside the equality above.
+    expect(messages.map((m) => m.id)).toEqual(["call-1", "A"]);
+  });
+
+  it("dates the call by its FIRST frame — a tool call's moment is when it began", () => {
+    // `ts` is THIS module's concern and is asserted here rather than in the
+    // shared fixture. `recordFirstSeen` is first-write-wins, so `call-1` is
+    // dated by row 1 (its `start`), not by the `end` frame at row 4.
+    const rows = toolJournalRows();
+    const { read } = fakeReader(rows);
+    const messages = projectJournalHistory(read, CONV).messages;
+    expect(messages.find((m) => m.id === "call-1")?.ts).toBe(rows[0].createdMs);
+  });
+
+  it("recognises the `tool` kind — it is not counted as an unsupported row", () => {
+    // `KNOWN_EVENT_KINDS` is the gate; a build that forgot to add `tool` there
+    // would drop every row and report it here rather than serving a partial
+    // transcript silently.
+    const { read } = fakeReader(toolJournalRows());
+    expect(projectJournalHistory(read, CONV).unsupportedEvents).toBe(0);
   });
 });

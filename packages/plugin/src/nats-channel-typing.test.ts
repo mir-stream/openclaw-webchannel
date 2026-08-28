@@ -115,6 +115,48 @@ describe("#153 — live inbound typing/history boundary", () => {
   });
 });
 
+describe("#320 — the composite history cursor crosses the inbound dispatch", () => {
+  it("forwards `beforeTurnId` to the load-history handler", () => {
+    const transport = new RecordingTransport();
+    const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant");
+    const onLoadHistory = vi.fn();
+    channel.setLoadHistoryHandler(onLoadHistory);
+
+    transport.emit("message", {
+      subject: "webchannel.tenant.acct.peer-0.in",
+      payload: Buffer.from(
+        JSON.stringify({
+          type: "load_history",
+          before: "tool-activity-1",
+          beforeTurnId: "turn-b",
+          limit: 10,
+        }),
+      ),
+    });
+
+    // ⚠️ THE FIELD IS ASSERTED DIRECTLY, NOT VIA A WHOLE-OBJECT
+    // `toHaveBeenCalledWith`, AND THAT IS THE WHOLE POINT OF THIS TEST.
+    // `toHaveBeenCalledWith` compares with `toEqual` semantics, which treat an
+    // ABSENT key and a present-but-`undefined` key as equal — so the sibling
+    // expectation above (`{before, limit}`) passes identically whether or not
+    // `nats-channel.ts` puts `beforeTurnId` on the request it builds, and an
+    // expectation naming all three fields would too. The field is OPTIONAL on
+    // the wire type, so deleting the forwarding line also typechecks; without a
+    // direct read the composite cursor degrades to id-only in silence and the
+    // tool-cursor paging repair (#320) is undone at the very first hop.
+    const [peerId, request] = onLoadHistory.mock.calls[0] as [
+      string,
+      { before?: string; beforeTurnId?: string; limit?: number },
+    ];
+    expect(peerId).toBe("peer-0");
+    expect(request.beforeTurnId).toBe("turn-b");
+    // Positive controls: the two halves that already travelled still do, so a
+    // failure above names the new field rather than a broken dispatch.
+    expect(request.before).toBe("tool-activity-1");
+    expect(request.limit).toBe(10);
+  });
+});
+
 describe("approval decision reverse path", () => {
   it("dispatches a decoded decision with peer/id/decision and rejects malformed input", () => {
     const transport = new RecordingTransport();

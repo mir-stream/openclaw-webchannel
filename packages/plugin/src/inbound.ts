@@ -919,6 +919,12 @@ export async function handleInboundMessage(
   // (2) we stamp CommandAuthorized on the turn context (see the buildContext
   // call) so core's fast-abort accepts it.
   const controlLane = options?.controlLane === true;
+  // ⚠️ The non-fallback branch (`message.id`) is UNTRUSTED peer input used as an
+  // identity: since #242 half 3, `(turnId, id)` keys durable tool rows in the
+  // client reducer's `applyTool`, so a reused `message.id` (outside #275's
+  // windowed dedupe) silently merges two distinct tool calls. Known/accepted —
+  // #323; real fix is server-minted turn ids (#243). The fallback below only
+  // covers a message that carries no id at all.
   const turnId =
     message.id ??
     `webchannel-turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;

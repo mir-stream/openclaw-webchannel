@@ -910,6 +910,30 @@ function extractMessageId(event: JournalEvent): string | null {
       return event.id;
     case "seal":
       return null;
+    case "tool":
+      // #242 half 3 — DELIBERATELY id-less HERE, and spelled out because this is
+      // the one place in that slice where a new kind is absorbed by a fallback
+      // instead of failing to compile. The same diff adds a
+      // `Record<JournalEvent["kind"], true>` exhaustiveness table and `never`
+      // defaults elsewhere precisely so a new kind cannot slip through; a `tool`
+      // row reaching `default` below would have been silent, so it gets its own
+      // arm and this note.
+      //
+      // WHY NULL IS RIGHT, not merely tolerable. `message_id` exists to name the
+      // message a row revises, for the two dedupe indexes and #240's read model.
+      // A tool call is not addressed by `id` alone — its identity is the PAIR
+      // `(turnId, id)` (see `durable-view-reducer.ts`'s `applyTool`), so a bare
+      // `id` in this column would be a WRONG name, not a partial one: two turns
+      // reusing `tool-activity-1` would file under one `message_id`. Nothing
+      // reads the column for tool, and both unique indexes are PARTIAL
+      // (`WHERE kind = 'user'` / `WHERE kind = 'placement'`), so a NULL here
+      // collides with nothing.
+      //
+      // ⚠️ DO NOT "FIX" THIS BY RETURNING `event.id`. It would change the bytes
+      // of every stored tool row for no reader, and it would enshrine the
+      // id-alone identity that **#320** exists to replace. When tool rows need a
+      // column to key on, it is the composite — a schema change, not this switch.
+      return null;
     default:
       return null;
   }

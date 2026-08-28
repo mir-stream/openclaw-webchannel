@@ -304,7 +304,10 @@ export class NatsChannel implements WebChannelPeerChannel {
   // Message handlers
   private onMessage?: (peerId: string, message: InboundWsMessage) => void;
   private onApprovalDecision?: (peerId: string, id: string, decision: ApprovalDecision) => void;
-  private onLoadHistory?: (peerId: string, request: { before?: string; limit?: number }) => void;
+  private onLoadHistory?: (
+    peerId: string,
+    request: { before?: string; beforeTurnId?: string; limit?: number },
+  ) => void;
   private onLoadCommands?: (peerId: string) => void;
   private onPeerUnregister?: (peerId: string) => void;
   /** Bounded, content-free configuration-warning state for result max_payload. */
@@ -832,7 +835,10 @@ export class NatsChannel implements WebChannelPeerChannel {
    * Set history load handler.
    */
   setLoadHistoryHandler(
-    handler: (peerId: string, request: { before?: string; limit?: number }) => void
+    handler: (
+      peerId: string,
+      request: { before?: string; beforeTurnId?: string; limit?: number },
+    ) => void
   ): void {
     this.onLoadHistory = handler;
   }
@@ -1118,6 +1124,18 @@ export class NatsChannel implements WebChannelPeerChannel {
     try {
       // Checked BEFORE the mapper, which cannot distinguish "not durable" from
       // "durable but unusable": both come back as `null`.
+      //
+      // ⚠️ AND THIS DETECTOR COVERS ONLY ONE OF THE TWO UNUSABLE CLASSES — say so
+      // rather than let the sentence above read as a general guarantee.
+      // `isIdlessDurableFrame` tests `agent_message` alone. Since #242 half 3
+      // there is a second class: a `tool_activity` frame whose `id` or `turnId`
+      // is not a usable string also maps to `null`, and it goes unlogged here.
+      // That is BENIGN and deliberately not widened — the client's
+      // `case "tool_activity"` refuses exactly the same frame, so nothing
+      // rendered live is missing from history (no N8), and unlike an id-less
+      // `agent_message` there is no delivered TEXT being discarded (no N10).
+      // Post-#238 the `agent_message` case is a REGRESSION detector; the tool
+      // case would be an ordinary refusal, which is why it is not one.
       //
       // Post-#238 every durable frame carries a plugin-minted id, from
       // `message-adapter.ts`'s `nextMessageId()` at the delivery act. The call
@@ -1430,7 +1448,14 @@ export class NatsChannel implements WebChannelPeerChannel {
         break;
 
       case "load_history":
-        this.onLoadHistory?.(peerId, { before: message.before, limit: message.limit });
+        // Forwarded UNVALIDATED, as `before`/`limit` always were —
+        // `planHistoryFetch` is the one validator on this path and
+        // `historyPageBefore` treats a non-matching pair as an honest miss.
+        this.onLoadHistory?.(peerId, {
+          before: message.before,
+          beforeTurnId: message.beforeTurnId,
+          limit: message.limit,
+        });
         break;
 
       case "load_commands":

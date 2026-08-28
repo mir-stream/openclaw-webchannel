@@ -152,9 +152,15 @@ export type InboundMessage = {
     | "agent_message"
     | "progress"
     | "reasoning"
-    // #97: structured, live, turn-scoped tool-call activity. Carries
-    // name/phase/status/summary/argKeys. Ephemeral (like `reasoning`), not
-    // durable history. `argKeys` are argument KEY NAMES only — never values.
+    // #97: structured, turn-scoped tool-call activity. Carries
+    // name/phase/status/summary/argKeys, and the frames are SPARSE DELTAS —
+    // several refine ONE call, keyed by `(turnId, id)`.
+    // ⚠️ "Ephemeral (like `reasoning`), not durable history" WAS WRITTEN HERE
+    // AND IS NOW FALSE ON BOTH COUNTS: #242 half 1/2 made reasoning durable and
+    // half 3 did the same for this frame (doc §15.9; NOT-list N3 names the old
+    // claim as the forbidden one). Every frame is journaled and the reducer's
+    // `applyTool` folds them into one durable message.
+    // `argKeys` are argument KEY NAMES only — never values.
     | "tool_activity"
     | "turn_settled"
     // #212 (Phase 3): the plugin's authoritative ordered set of the turn's agent
@@ -226,17 +232,34 @@ export type InboundMessage = {
    *  - `kind` absent  → a chat bubble; `role` is `"user" | "agent"`;
    *  - `kind: "reasoning"` → a completed reasoning burst; NO `role`, and
    *    `turnId` is required.
-   * `role` is optional here because the reasoning variant carries none — the
+   *  - `kind: "tool"` → a MERGED tool call (#242 half 3); NO `role`, NO `text`,
+   *    `turnId` required, and the tool surface below.
+   * `role` is optional here because neither tagged variant carries one — the
    * wrapper's existing `m.role !== "user" && m.role !== "agent"` guard is what
    * keeps an unrecognised shape out of the transcript.
+   *
+   * ⚠️ `text` IS OPTIONAL HERE, AND IT WAS REQUIRED UNTIL #242 half 3. A tool row
+   * genuinely has none — its content is the name/phase/status/argKeys surface —
+   * so a required `text` would have made the tool variant unrepresentable. The
+   * wrapper's `typeof m.text !== "string"` guard still runs for the two variants
+   * that DO carry text; the tool branch is deliberately placed AHEAD of it.
+   *
+   * ⚠️ `argKeys` IS KEY NAMES ONLY, NEVER ARG VALUES — and nothing has validated
+   * that here. The wrapper re-filters it to strings on the way in; this
+   * declaration is the unvalidated wire shape, not a promise about it.
    */
   messages?: Array<{
     id: string;
     kind?: string;
     role?: string;
-    text: string;
+    text?: string;
     ts?: number;
     turnId?: string;
+    name?: string;
+    phase?: string;
+    status?: string;
+    summary?: string;
+    argKeys?: unknown;
   }>;
   /**
    * #212: on a `turn_snapshot` frame, the plugin's authoritative ordered agent
@@ -278,7 +301,10 @@ export type OutboundMessage =
   // typed optional to mirror the wire union (older clients omit it).
   | { type: "user_message"; text: string; id?: string }
   | { type: "approval_decision"; id: string; decision: string }
-  | { type: "load_history"; before?: string; limit?: number }
+  // #320: `beforeTurnId` completes the page cursor for a TOOL row, which is
+  // addressed by the pair `(turnId, id)`. Additive — omitting it is the id-only
+  // cursor every older peer sends.
+  | { type: "load_history"; before?: string; beforeTurnId?: string; limit?: number }
   // P0-3: request the slash-command discovery catalog.
   | { type: "load_commands" };
 
@@ -1499,9 +1525,16 @@ export class WebChannelNatsClient {
     this.enqueue({ type: "approval_decision", id, decision });
   }
 
-  /** Request history page (buffered until the handshake completes). */
-  loadHistory(before?: string, limit?: number): void {
-    this.enqueue({ type: "load_history", before, limit });
+  /**
+   * Request history page (buffered until the handshake completes).
+   *
+   * `beforeTurnId` is LAST rather than beside `before` on purpose: the two-arg
+   * form is this class's shipped public signature, and appending keeps every
+   * existing call site compiling and behaving identically. Pass it only for a
+   * tool cursor — see `channel-contract.ts`'s `load_history` member.
+   */
+  loadHistory(before?: string, limit?: number, beforeTurnId?: string): void {
+    this.enqueue({ type: "load_history", before, beforeTurnId, limit });
   }
 
   /** Request the slash-command catalog (buffered until the handshake completes). */

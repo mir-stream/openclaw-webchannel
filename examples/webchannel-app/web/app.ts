@@ -181,8 +181,56 @@ async function mountBrowserUi(): Promise<void> {
       bannerEl.textContent = `⚠ ${state.error ?? "connection error"}`;
     }
     chatEl.replaceChildren(
+      // ⚠️ NARROW ON `kind` — DO NOT MAP OVER `state.messages` AND READ
+      // `role`/`text` DIRECTLY. `ChatMessage` is a TAGGED UNION: a chat bubble
+      // (no `kind`), a reasoning block (`kind: "reasoning"`), or a tool call
+      // (`kind: "tool"`). Only the bubble arm has `role`, and only the bubble and
+      // reasoning arms have `text` — a tool call's content is its
+      // name/phase/status/argKeys surface.
+      //
+      // This example previously did map straight over the array, and that is
+      // precisely what broke when the union grew a third arm: `m.text` became
+      // `string | undefined` and `m.role` `undefined`. The narrowing below is
+      // the pattern a real client should copy, and the reason it is spelled out
+      // here rather than collapsed into a one-liner — this file is the worked
+      // example of consuming the API, so the habit it demonstrates matters more
+      // than its length.
       ...state.messages.map((m) => {
         const div = document.createElement("div");
+
+        if (m.kind === "reasoning") {
+          // A completed reasoning burst. It has NO `role` — the wire carries no
+          // author and the client refuses to invent one — so it is rendered as
+          // its own kind rather than as an agent bubble.
+          div.className = "msg reasoning";
+          div.textContent = m.text;
+          return div;
+        }
+
+        if (m.kind === "tool") {
+          // One tool call, merged from its lifecycle frames. `argKeys` carries
+          // argument KEY NAMES ONLY — never argument values — so it is safe to
+          // display; do not present it as the call's arguments.
+          div.className = "msg tool";
+          const label = m.name ?? "tool";
+          // ⚠️ NOT `state` — that name SHADOWS the outer `state: WebChannelState`
+          // whose `.messages` this very `.map` is walking. It was correct only
+          // because nothing in the arm reads the outer one, and the gate would
+          // not have caught it becoming wrong: CI typechecks the three published
+          // packages only and lints nothing at all (**#318**), so this workspace's
+          // own `typecheck` script runs only when someone runs it locally. This
+          // file is the worked example of consuming the API — the habits it
+          // demonstrates are its product, so it does not get to lean on that.
+          const phaseLabel = m.status ?? m.phase;
+          const args = m.argKeys && m.argKeys.length > 0 ? ` (${m.argKeys.join(", ")})` : "";
+          div.textContent =
+            `🔧 ${label}${phaseLabel !== undefined ? ` — ${phaseLabel}` : ""}${args}` +
+            (m.summary !== undefined ? ` · ${m.summary}` : "");
+          return div;
+        }
+
+        // The chat bubble arm. `m` is narrowed to `ChatBubble` here, so `role`
+        // and `text` are both present.
         div.className = `msg ${m.role}`;
         div.textContent = m.text;
         // P0-4: minimal send-status affordance on the user's own bubbles. The

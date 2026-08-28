@@ -273,6 +273,83 @@ describe("createHistoryServer — plan dispatch and empty results", () => {
   });
 });
 
+describe("createHistoryServer — the COMPOSITE cursor, end to end (#320)", () => {
+  const TOOL_ID = "tool-activity-1";
+  const TURN_A = "turn-a";
+  const TURN_B = "turn-b";
+
+  /**
+   * ⚠️ WHAT THIS COVERS, AND WHERE IT STARTS. `beforeTurnId` crosses five hops on
+   * this side — `nats-channel.ts` → `servePage` → `planHistoryFetch` →
+   * `serveHistoryRequest` → `historyPageBefore` — and every existing test
+   * touched only the last one, directly, with a positional argument.
+   *
+   * This body enters at `servePage`, so it pins hops 2 THROUGH 5, through the
+   * real `createHistoryServer` against a real journal. It does NOT reach hop 1:
+   * `nats-channel.ts`'s inbound `load_history` dispatch is pinned separately, by
+   * `nats-channel-typing.test.ts`'s `#320` case. (An earlier revision of this
+   * paragraph listed the five hops and then claimed "this pins the rest", which
+   * read as covering all four of the ones `history.test.ts` does not — it never
+   * touched the transport hop.) `history.test.ts` pins the plan hop on its own.
+   * Between the three files every plugin-side hop goes red when it stops
+   * forwarding the field, instead of degrading the tool cursor back to id-only
+   * in production.
+   *
+   * ONE tool id in TWO turns, with rows only that span contains between them:
+   * `m1`/`m2` exist nowhere else, so a page anchored at the OLDER match is
+   * exactly what loses them.
+   */
+  function repeatedToolThread(journal: DeliveryJournal): void {
+    const toolRow = (turnId: string): JournalEvent => ({
+      kind: "tool",
+      id: TOOL_ID,
+      turnId,
+      name: "read_file",
+      phase: "end",
+      status: "completed",
+      argKeys: ["path"],
+    });
+    journal.append(PEER, { kind: "user", id: "u0", text: "why?", turnId: "w-u0" });
+    journal.append(PEER, toolRow(TURN_A));
+    journal.append(PEER, { kind: "bubble", answerId: "m1", text: "first", turnId: TURN_A });
+    journal.append(PEER, { kind: "bubble", answerId: "m2", text: "second", turnId: TURN_A });
+    journal.append(PEER, toolRow(TURN_B));
+    journal.append(PEER, { kind: "bubble", answerId: "A", text: "because", turnId: TURN_B });
+  }
+
+  it("anchors the page at the NAMED turn's row, where an id-only cursor gets nothing", () => {
+    const journal = openJournal();
+    repeatedToolThread(journal);
+    const { server, sent, scheduler } = harness(journal);
+
+    // Flushed between requests: back-to-back pages for one peer are dropped by
+    // the in-flight latch, so a sequential client is what this has to model.
+    server.servePage(PEER, { before: TOOL_ID, beforeTurnId: TURN_B });
+    scheduler.flush();
+    expect(sent[0].messages.map((m) => m.id)).toEqual(["u0", TOOL_ID, "m1", "m2"]);
+
+    // ⚠️ THE CONTROL THAT MAKES THE LINE ABOVE A MEASUREMENT OF THE PLUMBING
+    // RATHER THAN OF THE FIXTURE. The same request WITHOUT the second half is
+    // the older peer's id-only cursor: the id names two rows, the ambiguity
+    // guard refuses it, and the answer is the empty page. So if any hop drops
+    // `beforeTurnId`, the first assertion collapses onto this one.
+    server.servePage(PEER, { before: TOOL_ID });
+    scheduler.flush();
+    expect(sent[1].messages).toEqual([]);
+
+    // And the OTHER turn is a DIFFERENT anchor — the field is COMPARED end to
+    // end, not merely carried as far as the selector.
+    server.servePage(PEER, { before: TOOL_ID, beforeTurnId: TURN_A });
+    scheduler.flush();
+    expect(sent[2].messages.map((m) => m.id)).toEqual(["u0"]);
+
+    // A pair naming no row is the ordinary honest miss, like an unknown id.
+    server.servePage(PEER, { before: TOOL_ID, beforeTurnId: "turn-absent" });
+    scheduler.flush();
+    expect(sent[3].messages).toEqual([]);
+  });
+});
+
 describe("createHistoryServer — read failure sends NO frame", () => {
   /**
    * The production failure named in the code: the account is disposed (journal

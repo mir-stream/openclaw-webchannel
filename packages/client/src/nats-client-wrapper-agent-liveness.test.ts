@@ -2,6 +2,26 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
 import type { InboundMessage } from "./nats-client.js";
+import type { ChatMessage } from "./types.js";
+
+/**
+ * The texts of the USER bubbles, in transcript order.
+ *
+ * ⚠️ IT NARROWS ON `kind` FIRST, AND THAT IS THE POINT. `ChatMessage` is a
+ * tagged union whose `reasoning` and `tool` variants carry no `role` (only the
+ * `tool` variant also lacks `text` — `ChatReasoningCore` has `text: string`; it
+ * is the missing `role` that matters here), so
+ * `messages.filter((m) => m.role === "user")` — what these two call
+ * sites used to inline — could not narrow anything: `Array.filter` keeps the
+ * element type unless its predicate is a type guard, so the following `.map`
+ * still saw the whole union. Selecting the bubble arm by its absent tag makes
+ * the intent ("the user's own bubbles") explicit and the result a real
+ * `string[]`, without changing which messages are selected: a row with no
+ * `role` never satisfied `role === "user"` at runtime either.
+ */
+function userTexts(messages: readonly ChatMessage[]): string[] {
+  return messages.flatMap((m) => (m.kind === undefined && m.role === "user" ? [m.text] : []));
+}
 
 const registration = {
   devicePrivateKey: {} as CryptoKey,
@@ -124,7 +144,7 @@ describe("WebChannelNATSClient — #81 held-work recovery", () => {
     frame(wrapper, { type: "typing" });
     const snapshots: Array<{ texts: string[]; timer: unknown; generation: number }> = [];
     wrapper.subscribe((state) => snapshots.push({
-      texts: state.messages.filter((message) => message.role === "user").map((message) => message.text),
+      texts: userTexts(state.messages),
       timer: inside(wrapper).heldStallTimer,
       generation: inside(wrapper).heldStallTimerGeneration,
     }));
@@ -138,9 +158,7 @@ describe("WebChannelNATSClient — #81 held-work recovery", () => {
       if (reenter) {
         reenter = false;
         nestedReceipt = wrapper.send("B");
-        hookTexts = wrapper.getState().messages
-          .filter((message) => message.role === "user")
-          .map((message) => message.text);
+        hookTexts = userTexts(wrapper.getState().messages);
         expect(snapshots).toEqual([]);
       }
       return timer;
@@ -160,9 +178,7 @@ describe("WebChannelNATSClient — #81 held-work recovery", () => {
     frame(wrapper, { type: "turn_settled", turnId: "turn" });
     expect(publish.mock.calls.map(([text]) => text)).toEqual(["A", "B"]);
     expect(inside(wrapper).held).toHaveLength(0);
-    expect(wrapper.getState().messages
-      .filter((message) => message.role === "user")
-      .map((message) => message.text)).toEqual(["A", "B"]);
+    expect(userTexts(wrapper.getState().messages)).toEqual(["A", "B"]);
   });
 
   it.each(["typing", "progress", "reasoning"] as const)(

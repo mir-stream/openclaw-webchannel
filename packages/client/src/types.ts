@@ -262,14 +262,62 @@ type BubbleOnlyFieldsAbsent = {
 export type ChatReasoningMessage = ChatReasoningCore & BubbleOnlyFieldsAbsent;
 
 /**
- * One entry in `state.messages` — a chat bubble, or a reasoning block.
+ * ONE TOOL CALL in the transcript, MERGED from its lifecycle frames
+ * (#242 half 3, doc §15.9).
+ *
+ * ⚠️ THE ENTRY IS THE FOLD OF SEVERAL FRAMES, NOT A COPY OF ONE. Measured on
+ * `inbound.ts`'s producer, a single call emits `start` (carrying `name` and
+ * `argKeys`), zero or more `update`s, and a terminal frame carrying `status` but
+ * NEITHER `name` NOR `argKeys`. `durable-view-reducer.ts`'s `applyTool` merges
+ * them by `(turnId, id)`; this type is what that merge produces.
+ *
+ * ⚠️ NO `role`, exactly as on `ChatReasoningMessage` — the wire carries no
+ * author and neither `DurableMessage` nor this type invents one.
+ *
+ * ⚠️ `turnId` IS PART OF THE IDENTITY HERE, NOT DECORATION. Bubbles and
+ * reasoning blocks are addressed by `id`; a tool call is addressed by the PAIR,
+ * because the producer's id is unique within a run rather than globally. Every
+ * index over `state.messages` therefore has to key tool entries on both fields —
+ * `nats-client-wrapper.ts`'s `transcriptEntryKey` is the one place that is
+ * written down.
+ *
+ * `argKeys` holds argument KEY NAMES ONLY, never arg values.
+ */
+type ChatToolCore = {
+  kind: "tool";
+  id: string;
+  turnId: string;
+  name?: string;
+  phase?: string;
+  status?: string;
+  summary?: string;
+  argKeys?: readonly string[];
+  /** Hydration metadata, exactly as on a bubble. Absent on a live call. */
+  ts?: number;
+};
+
+/**
+ * Every `ChatBubble` field a tool entry cannot have, pinned to `undefined` —
+ * the same device as `BubbleOnlyFieldsAbsent`, derived rather than listed for
+ * the same reason. See that type for the full trade this shape makes.
+ */
+type BubbleOnlyFieldsAbsentOnTool = {
+  [K in Exclude<keyof ChatBubble, keyof ChatToolCore>]?: undefined;
+};
+
+export type ChatToolMessage = ChatToolCore & BubbleOnlyFieldsAbsentOnTool;
+
+/**
+ * One entry in `state.messages` — a chat bubble, a reasoning block, or a tool
+ * call.
  *
  * ⚠️ A TAGGED UNION, MIRRORING THE REDUCER'S `DurableMessage` AND THE WIRE'S
- * `HistoryMessage`. #242 half 2 moved reasoning INTO this array, because a
- * reasoning block's POSITION is the transcript's, and the transcript's order is
- * the array's. The alternative — keeping a side list and re-interleaving it by
- * `turnId` at render time — is a SECOND opinion about ordering held by the
- * renderer, which is what the widget used to do and what half 2 deleted.
+ * `HistoryMessage`. #242 half 2 moved reasoning INTO this array and half 3 did
+ * the same for tool activity, because such a block's POSITION is the
+ * transcript's, and the transcript's order is the array's. The alternative —
+ * keeping a side list and re-interleaving it by `turnId` at render time — is a
+ * SECOND opinion about ordering held by the renderer, which is what the widget
+ * used to do and what those two halves deleted, one lane each.
  *
  * ⚠️ NARROW ON `kind`, NEVER ON A MISSING FIELD. `m.kind === "reasoning"` is the
  * test. Reading `m.role`/`m.working` off an unnarrowed entry does compile (see
@@ -277,7 +325,7 @@ export type ChatReasoningMessage = ChatReasoningCore & BubbleOnlyFieldsAbsent;
  * but "no role, therefore reasoning" is the inference v6 exists to remove — a
  * future variant would break it silently, where a `kind` test would not.
  */
-export type ChatMessage = ChatBubble | ChatReasoningMessage;
+export type ChatMessage = ChatBubble | ChatReasoningMessage | ChatToolMessage;
 
 /**
  * One live/durable reasoning burst, as `state.reasoning` exposes it.
@@ -293,12 +341,23 @@ export type ReasoningItem = {
 };
 
 /**
- * #97: one live, turn-scoped tool-call activity item. Structured per-tool
- * surface (name/phase/status/summary/argKeys) delivered on its own
- * `tool_activity` wire frame — independent of the progress-draft text path, so
- * short tool calls that never flush a draft are still visible. Like
- * `ReasoningItem`, it is ephemeral and NOT durable history. `argKeys` carries
- * ONLY the argument KEY NAMES — never arg values.
+ * #97: one turn-scoped tool-call activity item, as `state.toolActivity` exposes
+ * it. Structured per-tool surface (name/phase/status/summary/argKeys) delivered
+ * on its own `tool_activity` wire frame — independent of the progress-draft text
+ * path, so short tool calls that never flush a draft are still visible.
+ * `argKeys` carries ONLY the argument KEY NAMES — never arg values.
+ *
+ * ⚠️ "EPHEMERAL AND NOT DURABLE HISTORY" WAS TRUE AND IS NO LONGER — #242 half 3
+ * made tool activity a DURABLE MESSAGE (doc §15.9; NOT-list N3 names the old
+ * claim as the forbidden one). Like `ReasoningItem` since half 2, this type is
+ * now a DERIVED VIEW of the `tool` entries in `state.messages`, not an
+ * independently maintained array, and it is no longer capped. See
+ * `WebChannelState.toolActivity`.
+ *
+ * The ITEM shape is unchanged, so an embedder READING `state.toolActivity` needs
+ * no edit — but one field did widen: `argKeys` is now `readonly string[]`, so an
+ * embedder that ASSIGNS `item.argKeys` to a `string[]` no longer compiles (copy
+ * it, or widen the annotation).
  */
 export type ToolActivityItem = {
   id: string;
@@ -307,7 +366,7 @@ export type ToolActivityItem = {
   phase?: string;
   status?: string;
   summary?: string;
-  argKeys?: string[];
+  argKeys?: readonly string[];
 };
 
 /** Native HITL approval decision; mirrors the plugin/SDK union. */
@@ -468,7 +527,64 @@ export type WebChannelState = {
    */
   reasoning: ReasoningItem[];
   /**
-   * Ephemeral, non-history tool-call activity, bounded by the clients (#97).
+   * The conversation's tool calls, in transcript order (#97, durable since
+   * #242 half 3).
+   *
+   * ⚠️ DERIVED FROM `state.messages`, NOT INDEPENDENTLY MAINTAINED. It is a
+   * projection of that array's `tool` entries, recomputed whenever `messages`
+   * changes — there is no second list and no second opinion about which calls a
+   * conversation contains, or where they sit. The wrapper's `setState` refuses a
+   * `toolActivity` patch at the type level (`StatePatch`), exactly as it refuses
+   * a `reasoning` one.
+   *
+   * ⚠️ THE `.slice(-100)` CAP IS GONE, AND THE HONEST VERSION OF WHY MATTERS.
+   * The old `upsertToolActivity` kept the newest 100 items. A live cap over an
+   * UNCAPPED durable view is itself a live≠history divergence, which is the
+   * defect class this slice closes — so removing it is right. But the same
+   * conditional half 1 recorded for reasoning in **#310** applies verbatim here:
+   * tool durability has no opt-in of its own (see the note below), so the durable
+   * view exists whenever the journal does, and where it does NOT — a build with
+   * no journal wired — there is no durable view to disagree with, so the removal
+   * closes nothing there while the array grows unbounded. Retention belongs at
+   * the STORE (#299), not here. Do not re-add a cap.
+   *
+   * ⚠️ NO SEPARATE OPT-IN, UNLIKE REASONING — a deliberate asymmetry, not an
+   * omission. `capabilities.reasoningDurable` guards the model's chain-of-thought
+   * PLAINTEXT, and that noun is what carries the argument. The two fields that
+   * could carry content do not: `argKeys` is `Object.keys(args)` (key NAMES only,
+   * never values) and `summary` is count-only — `inbound.ts`'s
+   * `readSafePatchSummary` either derives it from array LENGTHS or matches it
+   * against an anchored count grammar, so no free text can pass. Both are
+   * enforced at the PRODUCER. Storing that is not the new disclosure class a
+   * separate switch exists to gate. The live lane gates it instead, and does so
+   * for free: the producer is only constructed when streaming mode is
+   * `progress`/`partial`, so a `block`/`off` account emits no `tool_activity`
+   * frames at all and therefore journals no rows.
+   *
+   * ⚠️ THIS ARGUMENT USED TO LEAN ON TWO MORE CLAUSES, AND BOTH WERE FALSE —
+   * MEASURED, so do not restore them as reassurance in the published `.d.ts`.
+   * They read "`phase` comes from a five-member set, `status` from the producer's
+   * enumerated verdicts":
+   *   - `status` IS A PASS-THROUGH. `inbound.ts`'s `explicitTerminalToolStatus`
+   *     returns `readEventString(data, "status")` verbatim for ANY non-empty
+   *     string, mapping only `"error"` → `"failed"`;
+   *   - `phase` is checked against `TOOL_EVENT_PHASES` on the `tool` and `item`
+   *     streams ONLY. The `command_output`/`patch` branch gates on
+   *     `isTerminalToolActivity` — which can pass on `status` alone — and then
+   *     forwards `phase` UNCHECKED.
+   * Neither weakens the no-opt-in decision — both are verdict labels, not content
+   * — but the decision now rests on `argKeys` and `summary` alone rather than on
+   * an enumeration nothing enforces. SIZE is a separate, open caveat: nothing
+   * caps `argKeys`'s key count or key length anywhere on the path (**#321**), so
+   * "a tool row is small" is an observation about today's tools, not a property.
+   *
+   * ⚠️ KNOWN LIMITATION — **#304**, inherited unchanged. The plugin's send path
+   * refuses a frame outright while the transport is down, ABOVE the journaling
+   * hook, so a refused frame is never offered to it. Tool rides that same seam:
+   * frames dropped during a refusing window leave the fold with a partial call —
+   * a `start` with no terminal `status`, or a terminal with no `name`. Deferred,
+   * not overlooked; do not work around it in a renderer.
+   *
    * Optional so existing `WebChannelState` object literals remain source
    * compatible; current wrapper snapshots always initialize this to an array.
    */

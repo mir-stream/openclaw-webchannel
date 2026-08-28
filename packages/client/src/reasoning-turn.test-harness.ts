@@ -112,3 +112,136 @@ export const INTERLEAVED_TURN_LIVE_IDS: readonly string[] = ["r1", "A"];
 
 /** What a REPLAY of the same turn serves. ⚠️ Deliberately different. */
 export const INTERLEAVED_TURN_REPLAY_IDS: readonly string[] = ["A", "r1"];
+
+/**
+ * ── FIXTURE C: THE TOOL TURN (#242 half 3) ──
+ *
+ * ⚠️ THIS FIXTURE EXISTS TO PIN THE ONE PROPERTY THE SLICE IS FOR: a tool call
+ * delivered LIVE and the same call REPLAYED from the journal produce the same
+ * view — same content, same position. Like the two above it is imported by BOTH
+ * packages (`durable-view-reducer.test.ts` drives the real wrapper,
+ * `journal-history.test.ts` drives the real `journalEventForOutbound` and the
+ * real projection), so editing it turns tests red on both sides instead of
+ * letting two hand-written literals drift.
+ *
+ * ⚠️ THE FRAME SEQUENCE IS RECORDED FROM THE REAL PRODUCER, NOT INVENTED. It was
+ * measured by driving `inbound.ts`'s `createAgentToolActivitySink` with a
+ * `start`/`update` pair on the `tool` stream and a TERMINAL event on the `patch`
+ * stream for the same correlated call. Both streams feed one public id, which is
+ * why one fixture can carry both `argKeys` and `summary`: `inbound.ts` emits
+ * `argKeys` on the `tool` stream and ONLY when the frame is non-terminal, and
+ * emits `summary` only for a patch (`readSafePatchSummary`'s count grammar) —
+ * the `tool` stream never produces one. That is also why the call is named
+ * `apply_patch`: a `read_file` closing with a patch summary would be invented.
+ *
+ * The property that makes this fixture worth having is visible in it: the
+ * CLOSING frame carries `status` and `summary` but NEITHER `name` NOR `argKeys`,
+ * so any scheme that journals one "final" frame stores a partial. Every frame is
+ * journaled and `applyTool` folds them, which is why the expected row below
+ * carries fields drawn from THREE different frames.
+ */
+export const TOOL_TURN = "turn-2";
+
+/** One outbound `tool_activity` wire frame, in the shape both sides speak. */
+export type ToolTurnFrame = {
+  type: "tool_activity";
+  id: string;
+  turnId: string;
+  name?: string;
+  phase?: string;
+  status?: string;
+  summary?: string;
+  argKeys?: readonly string[];
+};
+
+/**
+ * A durable tool row a replay must serve, WITHOUT `ts` — same reason
+ * `ReasoningTurnRow` omits it: `ts` is a projection concern the plugin sources
+ * from journal row timestamps, and the plugin test asserts it separately.
+ */
+export type ToolTurnRow = {
+  kind: "tool";
+  id: string;
+  turnId: string;
+  name?: string;
+  phase?: string;
+  status?: string;
+  summary?: string;
+  argKeys?: readonly string[];
+};
+
+/**
+ * A turn with ONE tool call spanning three frames and ONE answer — and NO user
+ * message (this sentence claimed one, and neither `TOOL_TURN_FRAMES` nor
+ * `TOOL_TURN_ROWS` has ever contained it). The tool frames straddle the
+ * answer's `progress` on purpose: the call
+ * STARTS before the lane claims its slot and ENDS after, so the fixture also
+ * pins that a tool call holds the position of its FIRST frame rather than
+ * drifting to where it completed.
+ */
+export const TOOL_TURN_FRAMES: readonly (ToolTurnFrame | ReasoningTurnFrame)[] = [
+  {
+    type: "tool_activity",
+    id: "call-1",
+    turnId: TOOL_TURN,
+    name: "apply_patch",
+    phase: "start",
+    argKeys: ["path", "patch"],
+  },
+  { type: "tool_activity", id: "call-1", turnId: TOOL_TURN, phase: "update" },
+  { type: "progress", id: "A", turnId: TOOL_TURN, text: "Working…" },
+  {
+    type: "tool_activity",
+    id: "call-1",
+    turnId: TOOL_TURN,
+    phase: "end",
+    status: "completed",
+    summary: "2 added, 1 modified",
+  },
+  { type: "agent_message", id: "A", turnId: TOOL_TURN, text: "the answer" },
+];
+
+/**
+ * What BOTH a live render and a replay of `TOOL_TURN_FRAMES` must produce.
+ *
+ * ⚠️ THE TOOL ROW IS THE MERGE OF ALL THREE FRAMES: `name`/`argKeys` from
+ * `start`, `status`/`summary` from `end`, and `phase` from `end` because it is
+ * the last frame to carry one. A `final`-frame-only design would produce
+ * `{id, turnId, phase:"end", status:"completed", summary:"…"}` here — no `name`,
+ * no `argKeys` — which is precisely the live≠history divergence this slice
+ * exists to prevent, and asserting the merged shape is what makes that
+ * regression fail rather than pass quietly.
+ *
+ * ⚠️ THE `summary` IS HERE TO PIN THE PLUGIN'S THREE FORWARDING SITES, and it is
+ * the only field in this fixture that exists for that reason rather than for the
+ * merge/position claims. `summary` crosses `delivery-journal-event.ts`'s
+ * `case "tool_activity"` (frame → journal event) and `journal-history.ts`'s
+ * conversion loop (view entry → served row); before it was added, deleting
+ * either spread left `delivery-journal-event.test.ts`, `journal-history.test.ts`
+ * and `nats-channel-delivery-journal.test.ts` all green, because no plugin
+ * fixture carried one. It is not a spare field: `delivery-journal-event.ts`
+ * names `summary` as one of the two clauses the no-separate-opt-in decision now
+ * rests on, so losing it between disk and wire is a silent live≠history (N8).
+ * The third site,
+ * `nats-channel.ts`'s `sendToolActivity` payload, is NOT reachable from this
+ * fixture — nothing drives that method from here — and is pinned by its own
+ * literal in `nats-channel-delivery-journal.test.ts`.
+ *
+ * ⚠️ AND THE TOOL ROW COMES FIRST, BEFORE THE ANSWER. That is the position
+ * claim: the call's first frame preceded `progress A`, so the fold appends it
+ * ahead of A's slot on BOTH sides. A design that keyed position off the
+ * COMPLETING frame would put it after the answer.
+ */
+export const TOOL_TURN_ROWS: readonly (ToolTurnRow | { id: string; role: "user" | "agent"; text: string })[] = [
+  {
+    kind: "tool",
+    id: "call-1",
+    turnId: TOOL_TURN,
+    name: "apply_patch",
+    phase: "end",
+    status: "completed",
+    summary: "2 added, 1 modified",
+    argKeys: ["path", "patch"],
+  },
+  { id: "A", role: "agent", text: "the answer" },
+];
