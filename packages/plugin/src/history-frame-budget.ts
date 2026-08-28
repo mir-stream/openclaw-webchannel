@@ -41,6 +41,23 @@
  * disappearing from history — so `history-serve.ts` passes
  * `effectiveOutboundLimit()` and nothing else.
  *
+ * ⚠️ THE EQUIVALENCE IS EXACT IN THE LIMIT BUT ONLY APPROXIMATE IN THE FRAME
+ * SHAPE, and the gap is one-directional. What the budget measures is the row
+ * inside a `{type:"history",messages:[row]}` envelope; what the live send sealed
+ * was the bare `{type:"reasoning",…}` / `{type:"agent_message",…}` frame
+ * (`nats-channel.ts`'s `sendReasoning`/`sendText`). The history wrapper is the
+ * LARGER of the two — the `messages` array plus the projection's `kind`/`ts`/
+ * `role`, net of the live `final` flag, is ~50 sealed bytes more — so a row
+ * whose LIVE frame sealed into the narrow band `(limit − ~50, limit]` was seen
+ * live yet its single-row history frame seals just OVER the limit and is
+ * skipped: N8 in the LOSING direction, for a row in a ~40-byte-of-text window at
+ * exactly this peer's `max_payload`. It is left unfixed on purpose. The window
+ * is a razor edge, the row is still in the journal (a peer with a larger
+ * `max_payload` gets it, and #299/#325 own the write seam), and it is STRICTLY
+ * BETTER THAN BASE, which dropped the whole frame — this peer and that razor-edge
+ * band both lost everything before #311. Closing it exactly would mean sizing
+ * each row in its live frame shape, which the read path does not have.
+ *
  * ⚠️ AND SKIPPING IS WHAT KEEPS THE PAGER ABLE TO PASS IT. Without the skip the
  * budget simply stops at such a row, every page ends there, and "load older"
  * can never get behind it — the blackout becomes a permanent wall at one row
