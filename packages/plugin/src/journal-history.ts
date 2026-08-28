@@ -945,10 +945,16 @@ function recordFirstSeen(
  * bounded is `summary`: `readSafePatchSummary` either derives it from array
  * LENGTHS or admits only ≤96 chars matching an anchored count grammar. See
  * `delivery-journal-event.ts`'s `case "tool_activity"` and `types.ts`'s
- * `ChatToolMessage`, which say the same thing — the three must not drift, and
- * this sentence HAD drifted from both (it dropped the terminal gate and the
- * array-LENGTHS disjunct). So smallness is an observation about today's tools,
- * not an enforced property (**#321**).
+ * `WebChannelState.toolActivity`, which say the same thing — the three must not
+ * drift. ⚠️ THE POINTER USED TO NAME `ChatToolMessage`, WHICH DOES NOT CARRY THIS
+ * CLAIM AT ALL: its docblock covers the fold, the absent `role` and the
+ * `(turnId, id)` identity, and of this argument only "`argKeys` holds argument
+ * KEY NAMES ONLY". A pointer to a passage that does not make the claim is worse
+ * than no pointer — it invites the next maintainer to conclude the note is
+ * stale, or to paste a FOURTH copy onto `ChatToolCore`. This sentence had
+ * dropped the array-LENGTHS disjunct both siblings carried, and the terminal
+ * gate that `delivery-journal-event.ts` carried. So smallness is an observation
+ * about today's tools, not an enforced property (**#321**).
  *
  * An oversized frame is NOT truncated. `nats-transport.ts`'s `publish` throws a
  * `RangeError` and `history-serve.ts` catches it as "publish failed", so the peer

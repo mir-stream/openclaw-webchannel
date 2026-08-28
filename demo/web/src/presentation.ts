@@ -224,8 +224,10 @@ export const HISTORY_PAGE_SIZE = 20;
  * ⚠️ THIS USED TO END "NARROWER CURSOR, SAME REACH", AND THE REACH IS NOT QUITE
  * THE SAME — the residual is stated rather than softened. Inbound user ids are
  * client-supplied and checked only for non-emptiness and a 128-char bound
- * (**#293**; `ingress-dedupe.ts`'s `MAX_INGRESS_DEDUPE_ID_LENGTH` and the two
- * plugin-side doors derived from `MAX_INBOUND_USER_ID_LENGTH`), and
+ * (**#293**; three plugin-side doors, all resolving to the same constant —
+ * `delivery-journal-event.ts` and `delivery-journal.ts` use
+ * `MAX_INBOUND_USER_ID_LENGTH` directly, and `ingress-dedupe.ts`'s
+ * `MAX_INGRESS_DEDUPE_ID_LENGTH` is assigned FROM it, not a peer of it), and
  * `ingress-dedupe.ts` journals that wire id VERBATIM. Neither check constrains
  * the CONTENT and a plugin-minted id is far shorter than the bound, so a peer
  * can send a `user_message` whose id equals a plugin-minted reasoning id. That
