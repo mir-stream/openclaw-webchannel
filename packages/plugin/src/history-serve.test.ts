@@ -279,14 +279,21 @@ describe("createHistoryServer — the COMPOSITE cursor, end to end (#320)", () =
   const TURN_B = "turn-b";
 
   /**
-   * ⚠️ WHAT THIS COVERS THAT NOTHING ELSE DID. `beforeTurnId` crosses five hops
-   * on this side — `nats-channel.ts` → `servePage` → `planHistoryFetch` →
+   * ⚠️ WHAT THIS COVERS, AND WHERE IT STARTS. `beforeTurnId` crosses five hops on
+   * this side — `nats-channel.ts` → `servePage` → `planHistoryFetch` →
    * `serveHistoryRequest` → `historyPageBefore` — and every existing test
    * touched only the last one, directly, with a positional argument.
-   * `history.test.ts` pins the plan hop; this pins the rest, through the real
-   * `createHistoryServer` against a real journal, so a hop that silently stops
-   * forwarding the field goes red here instead of degrading the tool cursor back
-   * to id-only in production.
+   *
+   * This body enters at `servePage`, so it pins hops 2 THROUGH 5, through the
+   * real `createHistoryServer` against a real journal. It does NOT reach hop 1:
+   * `nats-channel.ts`'s inbound `load_history` dispatch is pinned separately, by
+   * `nats-channel-typing.test.ts`'s `#320` case. (An earlier revision of this
+   * paragraph listed the five hops and then claimed "this pins the rest", which
+   * read as covering all four of the ones `history.test.ts` does not — it never
+   * touched the transport hop.) `history.test.ts` pins the plan hop on its own.
+   * Between the three files every plugin-side hop goes red when it stops
+   * forwarding the field, instead of degrading the tool cursor back to id-only
+   * in production.
    *
    * ONE tool id in TWO turns, with rows only that span contains between them:
    * `m1`/`m2` exist nowhere else, so a page anchored at the OLDER match is

@@ -940,11 +940,15 @@ function recordFirstSeen(
  * `readEventString` pass-throughs off the agent event stream), `status` (a
  * verbatim pass-through — `explicitTerminalToolStatus` maps only
  * `"error"` → `"failed"`), and `phase` on the `command_output`/`patch` branch,
- * which forwards it unchecked. The one field that IS bounded is `summary`:
- * `readSafePatchSummary` admits only ≤96 chars matching an anchored count
- * grammar. See `delivery-journal-event.ts`'s `case "tool_activity"`, which says
- * the same thing — the two must not drift. So smallness is an observation about
- * today's tools, not an enforced property (**#321**).
+ * which gates on `isTerminalToolActivity` — a predicate that can pass on
+ * `status` alone — and then forwards `phase` unchecked. The one field that IS
+ * bounded is `summary`: `readSafePatchSummary` either derives it from array
+ * LENGTHS or admits only ≤96 chars matching an anchored count grammar. See
+ * `delivery-journal-event.ts`'s `case "tool_activity"` and `types.ts`'s
+ * `ChatToolMessage`, which say the same thing — the three must not drift, and
+ * this sentence HAD drifted from both (it dropped the terminal gate and the
+ * array-LENGTHS disjunct). So smallness is an observation about today's tools,
+ * not an enforced property (**#321**).
  *
  * An oversized frame is NOT truncated. `nats-transport.ts`'s `publish` throws a
  * `RangeError` and `history-serve.ts` catches it as "publish failed", so the peer
@@ -1021,11 +1025,19 @@ export function recentHistoryPage(
  * BOTH of its id paths are turn-local:
  *
  *  - GENERATED. `createAgentToolActivitySink` is constructed PER INBOUND TURN, so
- *    the correlation's generated sequence restarts at 1. ⚠️ This does NOT mean
- *    `tool-activity-1` appears in every turn — `createCall` PREFERS an upstream
- *    `toolCallId`/`itemId` when the event carries one, so a generated id appears
- *    only in a turn that took the id-less path (which the pinned emitters
- *    normally do not). The earlier wording said "in every turn" and over-claimed.
+ *    the correlation's generated sequence restarts at 1. ⚠️ TWO WORDINGS HAVE
+ *    BEEN WRONG HERE, IN OPPOSITE DIRECTIONS, so quote the rule instead of
+ *    summarising it. `createCall` reads
+ *    `preferred && !usedPublicIds.has(preferred) ? preferred : nextGeneratedId()`
+ *    — the upstream `toolCallId`/`itemId` is preferred CONDITIONALLY, only while
+ *    it is still unused. So `tool-activity-N` is minted on the id-less path AND
+ *    whenever an upstream id repeats, which `inbound.ts` documents as an
+ *    ordinary outcome rather than an edge: "an id re-used after completion is a
+ *    new invocation and receives a generated public id so the earlier call
+ *    remains visible". It does not appear in every turn (the first wording), and
+ *    it is not confined to turns that took the id-less path (the second) — an
+ *    id-BEARING turn mints one as soon as a tool is invoked twice under the same
+ *    upstream id, which is exactly the collision the guard below exists for.
  *  - UPSTREAM. The preferred id is no better, and this leg does not depend on the
  *    generated one: `inbound.ts` documents the provider ids as a "Run-local
  *    namespace: providers may reuse the same ids after fallback".
@@ -1052,8 +1064,12 @@ export function recentHistoryPage(
  * ⚠️ AND THE GUARD IS NOT TOOL-SPECIFIC. It fires wherever the cursor predicate
  * matches twice — for an id-only cursor that is ANY duplicated id in the
  * projection, and a peer-echoed user id (**#293**: inbound user ids are
- * client-supplied and validated only as non-empty strings) reaches it the same
- * way. It is a property of the cursor, not of the kind. The pair narrows the
+ * client-supplied, and the only checks on them are non-empty and
+ * `MAX_INBOUND_USER_ID_LENGTH` — `ingress-dedupe.ts`'s `ingressDedupeKey`,
+ * `journalEventForInboundUser`, and the store's `user` branch, the same bound at
+ * all three doors; nothing constrains the CONTENT) reaches it the same way. A
+ * plugin-minted id is well under 128 chars, so the bound rules nothing out here.
+ * It is a property of the cursor, not of the kind. The pair narrows the
  * predicate; it does not make the guard a tool concern.
  *
  * AMBIGUOUS DEGRADES TO THE EMPTY PAGE, DELIBERATELY — the same answer a miss
@@ -1126,11 +1142,13 @@ export function historyPageBefore(
  *
  * ⚠️ DO NOT RE-ADD "AND BUBBLE IDS ARE GLOBALLY UNIQUE" AS A SECOND REASON — it
  * was here, and it is FALSE for the user half. `ingress-dedupe.ts` journals the
- * peer-supplied wire id VERBATIM, and inbound user ids are client-supplied and
- * validated only as non-empty strings (**#293**, as the guard note above already
- * says). Agent bubble ids are `nextMessageId()`-minted; user ones are not, so a
- * uniqueness premise layered on top of the wire-shape reason would be a claim
- * this projection cannot make.
+ * peer-supplied wire id VERBATIM, and inbound user ids are client-supplied,
+ * checked only for non-emptiness and `MAX_INBOUND_USER_ID_LENGTH` (**#293**, and
+ * `historyPageBefore`'s guard note above names the same three doors). Neither
+ * check constrains the content, and a plugin-minted id fits well inside 128
+ * chars, so a peer can echo one. Agent bubble ids are `nextMessageId()`-minted;
+ * user ones are not, so a uniqueness premise layered on top of the wire-shape
+ * reason would be a claim this projection cannot make.
  */
 function rowTurnId(message: ProjectedHistoryMessage): string | undefined {
   return message.kind === undefined ? undefined : message.turnId;

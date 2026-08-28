@@ -93,10 +93,24 @@ function cursorKey(cursor: Cursor): string {
  * this test never reaches.
  *
  * The widget's own wiring is UNCOVERED — there is no `widget.ts` test in this
- * package. What IS covered is the whole plugin side of the same cursor:
- * `packages/plugin/src/history.test.ts` pins the plan hop and
- * `history-serve.test.ts` drives `servePage` → `historyPageBefore` against a
- * real journal, so only the widget→`loadHistory` hop rests on review.
+ * package. Nor does anything here exercise the CLIENT TRANSPORT: `clickLoadOlder`
+ * calls `historyPageBefore` directly and never `client.loadHistory`, so the
+ * wrapper→inner-client→wire hops are not on this path either.
+ *
+ * Where those hops ARE pinned, so this file need not pretend to cover them:
+ *  - plugin transport dispatch — `packages/plugin/src/nats-channel-typing.test.ts`
+ *    (`#320` case, asserting the forwarded field directly);
+ *  - plugin plan hop — `packages/plugin/src/history.test.ts`;
+ *  - `servePage` → `historyPageBefore` against a real journal —
+ *    `packages/plugin/src/history-serve.test.ts`;
+ *  - client transport chain — `packages/client/src/nats-client-wrapper.test.ts`
+ *    (`#320` case, asserting the enqueued `load_history` frame).
+ *
+ * What rests on review is exactly ONE site: `demo/web/src/widget.ts`'s
+ * `loadHistory({…})` call. An earlier revision said "the whole plugin side" was
+ * covered and "only the widget→`loadHistory` hop rests on review"; the first was
+ * short by the transport dispatch and the second silently excused the client
+ * chain as well.
  */
 function clickLoadOlder(
   client: WebChannelNATSClient,

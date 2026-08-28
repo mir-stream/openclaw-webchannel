@@ -569,7 +569,9 @@ export type WebChannelState = {
    *     returns `readEventString(data, "status")` verbatim for ANY non-empty
    *     string, mapping only `"error"` → `"failed"`;
    *   - `phase` is checked against `TOOL_EVENT_PHASES` on the `tool` and `item`
-   *     streams ONLY. The `command_output`/`patch` branch forwards it UNCHECKED.
+   *     streams ONLY. The `command_output`/`patch` branch gates on
+   *     `isTerminalToolActivity` — which can pass on `status` alone — and then
+   *     forwards `phase` UNCHECKED.
    * Neither weakens the no-opt-in decision — both are verdict labels, not content
    * — but the decision now rests on `argKeys` and `summary` alone rather than on
    * an enumeration nothing enforces. SIZE is a separate, open caveat: nothing

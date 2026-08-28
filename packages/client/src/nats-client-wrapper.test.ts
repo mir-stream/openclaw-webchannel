@@ -3575,3 +3575,50 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     expect(held(w)).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// #320 — the composite history cursor must survive the CLIENT transport chain.
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — #320 loadHistory carries `beforeTurnId` to the wire", () => {
+  it("puts `beforeTurnId` on the enqueued load_history frame", () => {
+    // ⚠️ WHAT THIS PINS. `beforeTurnId` is threaded by hand through three client
+    // hops — the wrapper's public `loadHistory` (which stages it on the deferred
+    // `load-history` entry), `commitDeferredReplacementOperation` (which passes
+    // it as the THIRD positional argument to the inner client), and the inner
+    // `loadHistory` (which puts it on the outbound frame). Every one of the
+    // three is a one-line deletion that TYPECHECKS, because the field is
+    // optional at each seam, and before this test each deletion left the whole
+    // client suite green while the tool cursor silently reverted to id-only.
+    //
+    // Constructing the wrapper opens no socket, and with no session key the
+    // inner client's drain is a no-op, so the frame simply stays on
+    // `outboundQueue` — which is the earliest place the assembled frame exists.
+    const wrapper = new WebChannelNATSClient({
+      natsUrl: "wss://nats.example.com",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "acct-1",
+      tenant: "tenant-1",
+      peerId: "peer-1",
+      registration,
+    });
+
+    wrapper.loadHistory({
+      before: "tool-activity-1",
+      beforeTurnId: "turn-b",
+      limit: 10,
+    });
+
+    const queue = (wrapper["client"] as unknown as {
+      outboundQueue: Array<Record<string, unknown>>;
+    }).outboundQueue;
+    const frame = queue.find((m) => m.type === "load_history");
+    expect(frame).toBeDefined();
+    // Read the FIELD, never a whole-object `toEqual`: `toEqual` treats an absent
+    // key and a present-but-`undefined` key as equal, so an object-shaped
+    // expectation passes just as happily with the forwarding deleted.
+    expect(frame!.beforeTurnId).toBe("turn-b");
+    // Positive controls — the two halves that already travelled still do.
+    expect(frame!.before).toBe("tool-activity-1");
+    expect(frame!.limit).toBe(10);
+  });
+});

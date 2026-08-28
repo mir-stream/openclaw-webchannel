@@ -470,11 +470,26 @@ describe("#242 half 3 — tool_activity is durable, EVERY frame, no policy gate"
 
   it("is journaled with NO policy — tool durability has no account opt-in", () => {
     // Unlike reasoning, whose row is withheld unless `reasoningDurable` is on.
-    // Both calls must produce the row.
-    expect(journalEventForOutbound(START, {})).toEqual(journalEventForOutbound(START));
-    expect(
-      journalEventForOutbound(START, { reasoningDurable: false }),
-    ).toEqual(journalEventForOutbound(START));
+    //
+    // ⚠️ EACH CALL IS COMPARED AGAINST A LITERAL, NEVER AGAINST ANOTHER CALL OF
+    // THE SAME FUNCTION. This case used to read
+    // `expect(journalEventForOutbound(START, {})).toEqual(journalEventForOutbound(START))`,
+    // which asserts nothing: both sides move together, so introducing an
+    // opt-OUT (`if (policy?.toolDurable === false) return null;`) would turn
+    // both into `null` and leave the case green — the exact regression its name
+    // promises to catch. The literal is what makes a withheld row fail.
+    const row = {
+      kind: "tool",
+      id: "call-1",
+      turnId: TURN,
+      name: "read_file",
+      phase: "start",
+      argKeys: ["path", "limit"],
+    };
+    expect(journalEventForOutbound(START)).toEqual(row);
+    expect(journalEventForOutbound(START, {})).toEqual(row);
+    expect(journalEventForOutbound(START, { reasoningDurable: false })).toEqual(row);
+    expect(journalEventForOutbound(START, { reasoningDurable: true })).toEqual(row);
   });
 
   it("filters argKeys to strings — the wire is untrusted and this reaches disk", () => {

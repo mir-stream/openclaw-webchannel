@@ -1633,9 +1633,10 @@ describe("live == history for tool activity: a reload reproduces what was watche
       kind: "tool",
       id: "call-1",
       turnId: TOOL_TURN,
-      name: "read_file",
-      argKeys: ["path", "limit"],
+      name: "apply_patch",
+      argKeys: ["path", "patch"],
       status: "completed",
+      summary: "2 added, 1 modified",
       phase: "end",
     });
   });
@@ -1659,10 +1660,11 @@ describe("live == history for tool activity: a reload reproduces what was watche
       {
         id: "call-1",
         turnId: TOOL_TURN,
-        name: "read_file",
+        name: "apply_patch",
         phase: "end",
         status: "completed",
-        argKeys: ["path", "limit"],
+        summary: "2 added, 1 modified",
+        argKeys: ["path", "patch"],
       },
     ]);
   });
@@ -1683,6 +1685,40 @@ describe("live == history for tool activity: a reload reproduces what was watche
       } as unknown as InboundMessage);
     }
     expect(durable(w.state.messages)).toEqual(before);
+  });
+
+  it("a hydrated tool row's `ts` survives the NEXT unrelated durable frame", () => {
+    // ⚠️ `ts` IS INVISIBLE TO EVERY OTHER CASE IN THIS DESCRIBE — `durable()`
+    // strips it by construction, so nothing above can see it come or go. The
+    // inheritance line in `nats-client-wrapper.ts`'s tool branch is what keeps
+    // it: EVERY durable frame re-projects and re-merges the whole view, and that
+    // branch builds a fresh `{kind,id,turnId,…}` carrying no `ts` unless the
+    // previous entry's is copied onto it. Delete the line and a reload's
+    // timestamp stays on screen only until the next frame of any kind arrives.
+    const w = newWrapper() as unknown as WrapperInternals;
+    w.handleMessage({
+      type: "history",
+      messages: TOOL_TURN_ROWS.map((row, i) => ({ ...row, ts: 1000 + i })),
+    } as unknown as InboundMessage);
+    expect(w.state.messages.find((m) => m.id === "call-1")).toMatchObject({
+      kind: "tool",
+      ts: 1000,
+    });
+
+    // UNRELATED on purpose — a different id AND a different kind. The merge is
+    // whole-view, not per-entry, so nothing about the tool call need change for
+    // its `ts` to be dropped.
+    w.handleMessage({
+      type: "agent_message",
+      id: "Z",
+      turnId: TOOL_TURN,
+      text: "later",
+    } as unknown as InboundMessage);
+
+    expect(w.state.messages.find((m) => m.id === "call-1")).toMatchObject({
+      kind: "tool",
+      ts: 1000,
+    });
   });
 
   it("a tool id colliding with a BUBBLE id does not overwrite either one", () => {

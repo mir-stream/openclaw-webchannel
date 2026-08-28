@@ -265,15 +265,24 @@ describe("#239 — egress persist-before-publish", () => {
     const { calls, channel } = makeChannel();
 
     // The measured lifecycle triple for ONE call. The closing frame carries
-    // `status` but neither `name` nor `argKeys`, which is why all three are
-    // stored rather than one "final".
+    // `status` and `summary` but neither `name` nor `argKeys`, which is why all
+    // three are stored rather than one "final".
+    //
+    // ⚠️ `summary` IS HERE BECAUSE THIS IS THE ONLY TEST THAT REACHES ITS
+    // FORWARDING SITE. `sendToolActivity` rebuilds the payload field by field,
+    // and the shared `TOOL_TURN_FRAMES` fixture cannot pin that spread — nothing
+    // drives this method from the fixture — so before this call carried one,
+    // deleting `summary` from the payload literal left every plugin suite green
+    // while the field silently stopped reaching both the journal and the wire.
+    // The value is the producer's count grammar (`readSafePatchSummary`), which
+    // is why the call is named `apply_patch`.
     expect(
       channel.sendToolActivity(PEER, {
         id: "call-1",
         turnId: "turn-1",
-        name: "read_file",
+        name: "apply_patch",
         phase: "start",
-        argKeys: ["path", "limit"],
+        argKeys: ["path", "patch"],
       }),
     ).toBe(true);
     expect(
@@ -285,6 +294,7 @@ describe("#239 — egress persist-before-publish", () => {
         turnId: "turn-1",
         phase: "end",
         status: "completed",
+        summary: "2 added, 1 modified",
       }),
     ).toBe(true);
 
@@ -311,12 +321,19 @@ describe("#239 — egress persist-before-publish", () => {
         kind: "tool",
         id: "call-1",
         turnId: "turn-1",
-        name: "read_file",
+        name: "apply_patch",
         phase: "start",
-        argKeys: ["path", "limit"],
+        argKeys: ["path", "patch"],
       },
       { kind: "tool", id: "call-1", turnId: "turn-1", phase: "update" },
-      { kind: "tool", id: "call-1", turnId: "turn-1", phase: "end", status: "completed" },
+      {
+        kind: "tool",
+        id: "call-1",
+        turnId: "turn-1",
+        phase: "end",
+        status: "completed",
+        summary: "2 added, 1 modified",
+      },
     ]);
   });
 
