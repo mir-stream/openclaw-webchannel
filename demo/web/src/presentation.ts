@@ -217,9 +217,26 @@ export const HISTORY_PAGE_SIZE = 20;
  *
  * ⚠️ `turnId` IS POPULATED FOR `kind === "tool"` ONLY, AND THAT IS DELIBERATE.
  * A reasoning row also carries a `turnId`, but its id is `nextMessageId()`-minted
- * (`message-adapter.ts`) and therefore globally unique, so pairing it buys no
- * disambiguation while adding a second field that must agree with the projection
- * for the cursor to resolve at all. Narrower cursor, same reach.
+ * (`message-adapter.ts`), so nothing WE mint can collide with it and pairing buys
+ * no disambiguation in ordinary operation — while adding a second field that must
+ * agree with the projection for the cursor to resolve at all.
+ *
+ * ⚠️ THIS USED TO END "NARROWER CURSOR, SAME REACH", AND THE REACH IS NOT QUITE
+ * THE SAME — the residual is stated rather than softened. Inbound user ids are
+ * client-supplied and validated only as non-empty strings (**#293**), and
+ * `ingress-dedupe.ts` journals that wire id VERBATIM, so a peer can send a
+ * `user_message` whose id equals a plugin-minted reasoning id. That id is then
+ * duplicated in the projection, and an id-only reasoning cursor is refused as
+ * ambiguous where a paired one would have separated the two (`rowTurnId` is
+ * `undefined` for the text row).
+ *
+ * The widening is KNOWN AND DELIBERATELY NOT TAKEN, on the difference between
+ * the two collisions: a tool collision arises from ORDINARY OPERATION — tool ids
+ * are turn-local on both of their paths, so one ordinary conversation produces
+ * it — whereas a reasoning collision requires a peer to echo back an id we
+ * minted, which is self-inflicted and is tracked as #293. Reasoning stays
+ * id-only; the cost is that one self-inflicted case stops paging honestly
+ * instead of resolving.
  *
  * ⚠️ AND NO KIND IS SKIPPED — the pick still returns the oldest entry whatever it
  * is. Skipping a kind is the deadlock documented at length below; carrying an

@@ -84,8 +84,19 @@ function cursorKey(cursor: Cursor): string {
  * One "load older" click: pick the cursor the way the widget does, serve the
  * page the way the plugin does, merge it the way the client does.
  *
- * Both halves of the cursor travel, exactly as `widget.ts` sends them — an
- * id-only call here would test a wire the widget no longer speaks.
+ * Both halves of the cursor travel. This MIRRORS the widget's call shape; it
+ * does not verify it — nothing here calls `widget.ts`, so deleting
+ * `beforeTurnId:` from its `loadHistory({…})` leaves this file green. The
+ * compiler does not catch it either: the field is OPTIONAL on `loadHistory`'s
+ * parameter, so omitting it typechecks. An earlier revision claimed the halves
+ * travel "exactly as `widget.ts` sends them", which asserted fidelity to a file
+ * this test never reaches.
+ *
+ * The widget's own wiring is UNCOVERED — there is no `widget.ts` test in this
+ * package. What IS covered is the whole plugin side of the same cursor:
+ * `packages/plugin/src/history.test.ts` pins the plan hop and
+ * `history-serve.test.ts` drives `servePage` → `historyPageBefore` against a
+ * real journal, so only the widget→`loadHistory` hop rests on review.
  */
 function clickLoadOlder(
   client: WebChannelNATSClient,
@@ -337,7 +348,12 @@ describe('"load older" reaches the start of the conversation', () => {
     expect(span).toEqual(span.map((_, k) => span[0] + k));
   });
 
-  it("an OLDER PEER — `before` alone, no `beforeTurnId` — gets exactly today's behaviour", () => {
+  it("an OLDER PEER's id-only cursor is unchanged, and ONLY the pair resolves the repeat", () => {
+    // ⚠️ THE NAME COVERS BOTH HALVES ON PURPOSE. It used to name the older-peer
+    // leg alone, which is two of the seven assertions here; the rest measure the
+    // NEW composite behaviour. A name narrower than its body is how a suite stops
+    // being greppable.
+    //
     // ⚠️ THE WIRE-ADDITIVITY CLAIM, MEASURED RATHER THAN ASSERTED. `beforeTurnId`
     // is optional on the wire, so a peer that predates #320 sends the id-only
     // cursor — which is the 3-argument call below. It must resolve exactly as it
@@ -416,19 +432,33 @@ describe('"load older" reaches the start of the conversation', () => {
       ]),
     ).toEqual({ id: REPEATED_TOOL_ID, turnId: TURN_B });
 
-    // ⚠️ A REASONING ROW CARRIES A `turnId` TOO AND STILL MUST NOT PAIR IT. Its id
-    // is `nextMessageId()`-minted and globally unique, so pairing disambiguates
-    // nothing while adding a second field the projection must agree with for the
-    // cursor to resolve at all. `toEqual` would pass on a stray `turnId`
+    // ⚠️ A REASONING ROW CARRIES A `turnId` TOO AND STILL MUST NOT PAIR IT. Its
+    // id is `nextMessageId()`-minted, so pairing disambiguates nothing in
+    // ordinary operation while adding a second field the projection must agree
+    // with for the cursor to resolve at all (`presentation.ts` states the one
+    // residual that leaves). `toEqual` would pass on a stray `turnId`
     // (undefined-valued keys are ignored), so this is checked as a property.
     const reasoning = oldestHistoryCursor([
       { kind: "reasoning", id: "r1", turnId: TURN, text: "thinking" },
       { id: "A", role: "agent", text: "answer" },
     ]);
     expect(reasoning?.turnId).toBeUndefined();
-    // A plain bubble has no `turnId` field at all in `ChatMessage`'s text arm.
+
+    // ⚠️ A BUBBLE IS NOT PAIRED EITHER, AND THE REASON IS THE **WIRE** TYPE, NOT
+    // THE CLIENT ONE. This line used to say "a plain bubble has no `turnId`
+    // field at all in `ChatMessage`'s text arm", which is false — `ChatBubble`
+    // declares `turnId?: string` (`packages/client/src/types.ts`) and live
+    // `agent_message`/`progress` frames populate it. The field that does not
+    // exist is on the HYDRATION wire: `HistoryTextMessage`
+    // (`packages/plugin/src/channel-contract.ts`) has no `turnId`, so no
+    // projected bubble row could ever match a pair cursor. The picker's refusal
+    // is what keeps the cursor resolvable, so it is asserted against a bubble
+    // that HAS a `turnId` — the fixture below used to omit it, which is why the
+    // assertion passed without measuring the picker at all.
     expect(
-      oldestHistoryCursor([{ id: "A", role: "agent", text: "answer" }])?.turnId,
+      oldestHistoryCursor([
+        { id: "A", role: "agent", text: "answer", turnId: TURN },
+      ])?.turnId,
     ).toBeUndefined();
   });
 });

@@ -222,18 +222,23 @@ export type InboundWsMessage =
    * Page older history.
    *
    * `beforeTurnId` COMPLETES THE CURSOR, and it is strictly ADDITIVE (#320).
-   * `before` alone names a row by id, which was sufficient while every projected
-   * row carried a globally unique plugin-minted id. A TOOL row does not — it is
-   * addressed by the PAIR `(turnId, id)` everywhere the view keys on it
-   * (`durable-view-reducer.ts`'s `applyTool` upserts on exactly that pair), so
-   * an id-only cursor can name two rows and `historyPageBefore` then refuses it
-   * as ambiguous. Sending the pair resolves it.
+   * `before` alone names a row by id, which is sufficient only while no id can
+   * name two projected rows. A TOOL id can: it is turn-local on both of its
+   * paths, and a tool row is addressed by the PAIR `(turnId, id)` everywhere the
+   * view keys on it (`durable-view-reducer.ts`'s `applyTool` upserts on exactly
+   * that pair), so an id-only cursor can name two rows and `historyPageBefore`
+   * then refuses it as ambiguous. Sending the pair resolves it.
    *
    * OMITTING IT IS SUPPORTED AND UNCHANGED — an older peer that sends only
    * `before` gets exactly the id-only behaviour, ambiguity guard included
    * (`demo/web/src/history-paging.test.ts` measures that rather than asserting
-   * it). Newer peers set it only for a tool cursor; a reasoning or bubble id is
-   * `nextMessageId()`-minted and globally unique, so pairing adds nothing there.
+   * it). Newer peers set it for a TOOL cursor only, for two different reasons: a
+   * BUBBLE row has no `turnId` on this wire to pair with at all
+   * (`HistoryTextMessage` above), while a REASONING cursor stays id-only by a
+   * deliberate choice that carries a stated residual —
+   * `demo/web/src/presentation.ts`'s `oldestHistoryCursor` argues it. Do not
+   * summarise either as "these ids are globally unique": user bubble ids are
+   * peer-supplied (#293) and that claim is false of them.
    */
   | { type: "load_history"; before?: string; beforeTurnId?: string; limit?: number }
   | { type: "load_commands" };

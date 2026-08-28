@@ -69,9 +69,33 @@ describe("history — planHistoryFetch (load_history wire → fetch mapping)", (
   // store-backed test can. Regression guard for the bug where the whole request
   // object was passed as `beforeId`.
   it("maps a `before` cursor to a page fetch carrying the STRING id", () => {
+    // ⚠️ THIS CASE CANNOT SEE `beforeTurnId` BEING DROPPED, and that is why the
+    // next one exists. `toEqual` ignores undefined-valued keys, so this
+    // assertion passes unchanged if `planHistoryFetch` stops forwarding the
+    // field entirely — the silent revert to an id-only cursor (#320).
     expect(planHistoryFetch({ before: "m-9", limit: 25 }, 50)).toEqual({
       kind: "page",
       beforeId: "m-9",
+      limit: 25,
+    });
+  });
+
+  it("carries `beforeTurnId` into the page plan — the composite cursor's first hop (#320)", () => {
+    // ⚠️ ASSERTED AS A FIELD, NOT VIA `toEqual` ON THE WHOLE PLAN. That matcher
+    // ignores undefined-valued keys, so an object comparison is blind to the
+    // exact regression this pins: the second half of the cursor being dropped
+    // here, which reinstates the ambiguity refusal on a repeated tool id and
+    // makes older history permanently unreachable — invisibly.
+    const plan = planHistoryFetch({ before: "m-9", beforeTurnId: "t-2", limit: 25 }, 50);
+    expect(plan.kind).toBe("page");
+    // Narrowed inline so the field read typechecks; `kind` is asserted above, so
+    // a `recent` plan fails there rather than silently reading `undefined` here.
+    expect(plan.kind === "page" ? plan.beforeTurnId : undefined).toBe("t-2");
+
+    // Meaningless without an anchor: carrying it with no `before` is still a
+    // tail fetch, and the `recent` arm has no such field to carry it on.
+    expect(planHistoryFetch({ beforeTurnId: "t-2", limit: 25 }, 50)).toEqual({
+      kind: "recent",
       limit: 25,
     });
   });

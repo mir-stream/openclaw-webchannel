@@ -1121,8 +1121,16 @@ export function historyPageBefore(
  * A projected row's `turnId`, or `undefined` for the text variant — which is the
  * one that HAS NO SUCH FIELD (`channel-contract.ts`: the tag is absent only on
  * text, and the union is discriminated on it). So a bubble id can never be
- * matched by a pair cursor, which is correct: bubble ids are `nextMessageId()`-
- * minted and globally unique, and nothing mints a pair cursor for one.
+ * matched by a pair cursor, which is correct: the wire shape is the whole
+ * reason, and nothing mints a pair cursor for one.
+ *
+ * ⚠️ DO NOT RE-ADD "AND BUBBLE IDS ARE GLOBALLY UNIQUE" AS A SECOND REASON — it
+ * was here, and it is FALSE for the user half. `ingress-dedupe.ts` journals the
+ * peer-supplied wire id VERBATIM, and inbound user ids are client-supplied and
+ * validated only as non-empty strings (**#293**, as the guard note above already
+ * says). Agent bubble ids are `nextMessageId()`-minted; user ones are not, so a
+ * uniqueness premise layered on top of the wire-shape reason would be a claim
+ * this projection cannot make.
  */
 function rowTurnId(message: ProjectedHistoryMessage): string | undefined {
   return message.kind === undefined ? undefined : message.turnId;

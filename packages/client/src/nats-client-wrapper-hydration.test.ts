@@ -429,7 +429,8 @@ describe("#240 half 2 — the agent path no longer adopts (tiers 2 and 3 deleted
    *
    * Frame 1 is the register snapshot; the bubbles it HYDRATES carry
    * `webchannel-` ids, exactly like live ones. The user then pages older
-   * (`loadHistory({before, limit})`, as `demo/web/src/widget.ts` does) and frame
+   * (`loadHistory({before, beforeTurnId, limit})`, as `demo/web/src/widget.ts`
+   * does — the second half of the cursor is set for a tool row only, #320) and frame
    * 2 is a strictly-older page whose answer happens to read the same — "OK" is
    * the obvious collision, but any repeated phrasing does it.
    *
