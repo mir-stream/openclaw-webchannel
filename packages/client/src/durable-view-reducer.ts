@@ -572,13 +572,25 @@ export type DurableEvent =
    *
    * ⚠️ THE COST IS ROW COUNT, AND IT IS REAL. One tool call writes one row PER
    * FRAME (three in the measured triple) instead of one, and a chatty tool
-   * emitting many `update` frames writes one row each. Each row is small and
-   * bounded — a tool name, a phase from a five-member set, a status, key names,
-   * and a count-grammar summary — so this is O(frames) rows of O(1) bytes, NOT
-   * the O(n²) BYTES that `final` exists to prevent for reasoning (there every
-   * frame carried the whole cumulative text). It still feeds the quadratic
-   * replay fold tracked by **#286**, and it adds another content class to the
-   * ROW-bounded (not byte-bounded) history page tracked by **#311**.
+   * emitting many `update` frames writes one row each. Each row is SMALL IN
+   * PRACTICE — a tool name, a phase, a status, key names, and a count-grammar
+   * summary — which is far from the O(n²) BYTES that `final` exists to prevent
+   * for reasoning (there every frame carried the whole cumulative text).
+   *
+   * ⚠️ "SMALL IN PRACTICE", NOT "O(1) BYTES" — THIS PARAGRAPH USED TO CLAIM THE
+   * LATTER AND IT WAS AN ASSUMPTION, NOT AN ENFORCED PROPERTY. Checked against
+   * the producer: NOTHING caps `argKeys`'s key COUNT or key LENGTH — not
+   * `inbound.ts`'s `Object.keys(args)`, not `sendToolActivity`, not the journal
+   * mapper. A tool invoked with many or long argument names writes proportionally
+   * larger rows (**#321**). Two neighbouring claims were wrong for the
+   * same reason and are gone with it: `phase` is validated on the `tool`/`item`
+   * streams only, and `status` is a producer PASS-THROUGH. What IS enforced —
+   * and what carries the no-separate-opt-in decision — is that `argKeys` holds
+   * argument KEY NAMES ONLY, never values.
+   *
+   * It still feeds the quadratic replay fold tracked by **#286**, and it adds
+   * another content class to the ROW-bounded (not byte-bounded) history page
+   * tracked by **#311**.
    *
    * Fields other than `id`/`turnId` are OPTIONAL and must be ABSENT KEYS when
    * the frame omitted them, never `undefined` values — `applyTool` merges by

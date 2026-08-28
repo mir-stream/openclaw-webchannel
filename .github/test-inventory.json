@@ -4,7 +4,7 @@
     "demo/enroll-validation.test.ts": 2,
     "demo/saas-server-auth.test.ts": 1,
     "demo/web/src/error-copy.test.ts": 7,
-    "demo/web/src/history-paging.test.ts": 4,
+    "demo/web/src/history-paging.test.ts": 6,
     "demo/web/src/markdown.dom.test.ts": 10,
     "demo/web/src/markdown.test.ts": 26,
     "demo/web/src/presentation.dom.test.ts": 6,

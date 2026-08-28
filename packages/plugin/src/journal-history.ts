@@ -22,9 +22,9 @@
  *
  * ── ⚠️ KNOWN live≠history GAPS, AND THIS MODULE IS WHERE THEY BECOME VISIBLE ──
  *
- * "`history == live` by construction" is the bet, not a proof, and there are two
- * standing exceptions that show up the moment a real conversation is replayed.
- * READ THIS BEFORE CONCLUDING THE PROJECTION IS WRONG.
+ * "`history == live` by construction" is the bet, not a proof, and there are
+ * three standing exceptions that show up the moment a real conversation is
+ * replayed. READ THIS BEFORE CONCLUDING THE PROJECTION IS WRONG.
  *
  * GAP 1 — the phantom empty bubble:
  *
@@ -78,6 +78,34 @@
  *
  * Both are content/order divergences on top of a shared reducer, not second
  * transition tables, so neither changes the rule this module lives by.
+ *
+ * GAP 3 — TOOL (#242 half 3). A LOST DELTA YIELDS A ROW THAT IS WRONG, NOT A
+ * ROW THAT IS ABSENT, and that is the whole difference from GAP 2a above. For
+ * reasoning the durable frame is one per burst, so a refused close means NO ROW;
+ * for tool the design is one row per FRAME, merged by `applyTool` at replay, so
+ * losing any single frame leaves a MERGED PARTIAL that renders confidently:
+ *
+ *  - LOSE THE `start` FRAME and history folds `{phase:"end",
+ *    status:"completed"}` — the widget renders `🔧 tool — completed`, nameless
+ *    and argKey-less, where live rendered `read_file(path, limit)`. ⚠️ THAT IS
+ *    VERBATIM THE OUTCOME `delivery-journal-event.ts`'s `case "tool_activity"`
+ *    CITES AS ITS REASON FOR REJECTING A `final`-FLAG DESIGN. So the design
+ *    refuses a DETERMINISTIC partial and currently accepts a NONDETERMINISTIC
+ *    one; that is a real asymmetry, and it is recorded rather than resolved.
+ *  - LOSE THE TERMINAL FRAME and the row is stuck mid-flight (`phase:"update"`,
+ *    no `status`) FOREVER — every future reload renders a call that never
+ *    finishes, because nothing later can close it.
+ *
+ * Two reachable causes, neither hypothetical: (a) the append throwing, which
+ * `nats-channel.ts`'s `journalOutbound` catches and reports as `append-failed`
+ * while the PUBLISH proceeds — so the peer sees the frame and the journal does
+ * not; and (b) #304's refusal window, since `journalOutbound` sits below
+ * `sendToPeer`'s three refusal checks exactly as GAP 2a describes.
+ *
+ * ⚠️ RECORDED, NOT REPAIRED — and do not "fix" it here. Reconstructing a missing
+ * `start` from the frames that did land, or closing a stuck call at replay, is a
+ * supersession rule invented server-side (N8), which is what the header above
+ * forbids this module. The repair belongs with #304's design round.
  *
  *
  * ⚠️ IT IS NOT THIS SLICE'S TO FIX, AND THE OBVIOUS FIX IS FORBIDDEN HERE. The
@@ -848,15 +876,28 @@ function recordFirstSeen(
  * path exactly as in the old one, and the test file pins the behaviour so it is
  * visible rather than assumed.
  *
- * ⚠️ `limit` COUNTS ROWS, AND SINCE #242 half 2 A REASONING BLOCK IS A ROW. So a
- * conversation with durable reasoning gets FEWER CHAT BUBBLES per page at the
- * same `limit`. That is the selector working as specified — the page is "the
- * most recent N messages", and half 2's whole point is that a reasoning block IS
- * one — but it is a behaviour change for an operator who tuned
- * `history.limit`/`history.pageSize` against a bubble-only projection, and it is
- * only reachable for an account that opted into `capabilities.reasoningDurable`
- * (default OFF). Do not "fix" it by making the count kind-aware: that is a
- * second opinion about what a message is, held only by the pager.
+ * ⚠️ `limit` COUNTS ROWS, AND SINCE #242 half 2 A REASONING BLOCK IS A ROW —
+ * SINCE half 3, SO IS A TOOL CALL. So a conversation with durable reasoning or
+ * tool activity gets FEWER CHAT BUBBLES per page at the same `limit`. That is
+ * the selector working as specified — the page is "the most recent N messages",
+ * and each half's whole point is that such a block IS one — but it is a
+ * behaviour change for an operator who tuned `history.limit`/`history.pageSize`
+ * against a bubble-only projection. Do not "fix" it by making the count
+ * kind-aware: that is a second opinion about what a message is, held only by the
+ * pager.
+ *
+ * ⚠️ AND THE TWO ROW CLASSES HAVE DIFFERENT REACH, WHICH THIS DOCBLOCK USED TO
+ * GET WRONG. It said the change was "only reachable for an account that opted
+ * into `capabilities.reasoningDurable` (default OFF)", true of reasoning and
+ * FALSE of tool: tool durability has NO separate opt-in. What gates it is the
+ * live lane itself — the producer is constructed only in `progress`/`partial`
+ * streaming modes, and the plugin's own default is `streaming.mode: "off"`
+ * (`message-adapter.ts`'s `resolveChannelPreviewStreamMode(config, "off")`),
+ * which emits no `tool_activity` frame and journals no row. So the honest
+ * statement is: ANY ACCOUNT WITH STREAMING ENABLED, WITH NO SEPARATE DURABILITY
+ * OPT-IN — not "every account", and not "the default configuration". A tool call
+ * writes one row PER FRAME, so a chatty turn adds rows faster than it adds
+ * bubbles.
  *
  * ⚠️ AND THAT IS THE MILD HALF. STATE THE OTHER ONE HERE, BECAUSE THIS IS THE
  * SITE AN OPERATOR READS — **#311**. Fewer bubbles per page is a tuning
@@ -866,6 +907,15 @@ function recordFirstSeen(
  * than a bubble, so the same row count is now a much larger frame. At the default
  * `limit: 50`, a mean row of ~21 KB reaches a stock nats-server's 1 MiB
  * `max_payload`.
+ *
+ * ⚠️ TOOL ROWS BELONG TO #311 TOO, BUT DO NOT INFLATE THEM INTO THE SAME
+ * HAZARD. A tool row is a name, a phase, a status, a count-grammar summary and a
+ * list of argument key names — small in practice, nothing like a reasoning
+ * transcript — so what it consumes is the ROW budget, not the byte budget. The
+ * qualifier "in practice" is doing real work: `argKeys` is the one field with NO
+ * producer-side bound on count or length (see `delivery-journal-event.ts`'s
+ * `case "tool_activity"`), so smallness is an observation about today's tools,
+ * not an enforced property.
  *
  * An oversized frame is NOT truncated. `nats-transport.ts`'s `publish` throws a
  * `RangeError` and `history-serve.ts` catches it as "publish failed", so the peer
@@ -915,7 +965,9 @@ export function recentHistoryPage(
  *
  *  - RESOLUTION is `findIndex` by `id` over the SAME list the client was served,
  *    and the emitted list is the whole view. So any id from any page resolves,
- *    reasoning included, and the slice ending at it is a well-formed page.
+ *    reasoning included. ⚠️ THIS BULLET ONCE ENDED "…and the slice ending at it
+ *    is a well-formed page", which #242 half 3 made FALSE — see the third
+ *    outcome below.
  *  - The MISS case is unchanged and is the one below: an id NOT in the
  *    projection returns `[]`. Reasoning adds no NEW class of miss — the client
  *    has always been able to hold ids the journal does not serve. A local user
@@ -926,6 +978,41 @@ export function recentHistoryPage(
  * The second bullet is a CLIENT-side cursor-choice concern, not a server one:
  * whatever the widget hands us, "not in the projection ⇒ no more history" is the
  * honest answer.
+ *
+ * ── ⚠️ THERE ARE NOW THREE OUTCOMES, NOT TWO: RESOLVE / MISS / AMBIGUOUS ──
+ *
+ * WHY AMBIGUITY IS POSSIBLE AT ALL. Every other row carries a PLUGIN-minted id
+ * (`nextMessageId()`'s `webchannel-<ms>-<rand>`), which is globally unique, and
+ * until #242 half 3 the whole projection was such rows. A TOOL row is not:
+ * `createAgentToolActivitySink` is constructed PER INBOUND TURN, so the
+ * correlation's generated sequence restarts and mints `tool-activity-1` in every
+ * turn — and an upstream provider id is documented run-local too (`inbound.ts`
+ * calls it a "Run-local namespace"). That is why a tool call is addressed by the
+ * PAIR `(turnId, id)` everywhere the view keys on it. A CURSOR CARRIES ONLY AN
+ * ID, so one cursor can name two rows.
+ *
+ * ⚠️ AND THE GUARD IS NOT TOOL-SPECIFIC. It fires on ANY duplicated id in the
+ * projection — a peer-echoed user id (**#293**: inbound user ids are
+ * client-supplied and validated only as non-empty strings) reaches it the same
+ * way. It is a property of the cursor, not of the kind.
+ *
+ * AMBIGUOUS DEGRADES TO THE EMPTY PAGE, DELIBERATELY — the same answer a miss
+ * gets. `findIndex` would silently resolve to the OLDER match and serve the
+ * slice ending there, which SKIPS every row between the two matches: measured on
+ * `[u0, tool₁@t1, m1, m2, tool₁@t2, A]` at `limit: 20`, click 1 served `[u0]`,
+ * every later click served `[]`, and `m1`/`m2` became permanently unreachable
+ * while the client rendered one continuous conversation with no gap marker. A
+ * silently mis-anchored page is a dropped RANGE (N10) and is strictly worse than
+ * an honest stop, so the ambiguity is refused rather than guessed.
+ *
+ * THE REAL REPAIR IS A COMPOSITE CURSOR — `(turnId, id)` on the wire, the same
+ * identity the view already keys on — and it is **#320**, not this
+ * function. Three repairs that look adjacent are NOT the fix and must not be
+ * substituted: skipping tool rows in the widget's cursor pick reinstates half
+ * 2's paging DEADLOCK (`presentation.ts`, and a 20-tool-call turn is ordinary);
+ * making the generated ids unique fixes only the generated half and leaves
+ * provider id reuse; and `findLastIndex` trades this hole for a STALL once the
+ * client has paged past the newer duplicate.
  *
  * ⚠️ AND THE OBVIOUS CLIENT-SIDE PRECAUTION IS A DEADLOCK — DO NOT SUGGEST IT.
  * An earlier revision of this paragraph ended "…which is why the oldest-cursor
@@ -956,6 +1043,8 @@ export function historyPageBefore(
   if (!beforeId || limit <= 0) return [];
   const idx = messages.findIndex((message) => message.id === beforeId);
   if (idx === -1) return [];
+  // AMBIGUOUS ⇒ unresolvable. See the third-outcome block above.
+  if (messages.some((message, i) => i > idx && message.id === beforeId)) return [];
   return messages.slice(Math.max(0, idx - limit), idx);
 }
 

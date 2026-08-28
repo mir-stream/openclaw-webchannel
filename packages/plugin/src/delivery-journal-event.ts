@@ -377,20 +377,42 @@ export function journalEventForOutbound(
       // header refuses (the `JournalEvent` alias exists so ONE reducer computes
       // both views), so the frame is stored verbatim and
       // `durable-view-reducer.ts`'s `applyTool` stays the only merge in the
-      // system. Cost: one row per frame rather than per call — bounded rows of
-      // bounded size, unlike reasoning's O(n²) bytes; it still feeds #286's
-      // quadratic replay and #311's row-bounded pages.
+      // system. Cost: one row per frame rather than per call. Each row is SMALL
+      // IN PRACTICE — not bounded: nothing here, at `sendToolActivity`, or at
+      // the producer caps `argKeys`'s key COUNT or key LENGTH, so "bounded size"
+      // would be an assumption dressed as a property (**#321**). Still
+      // far from reasoning's O(n²) BYTES, where every frame carried the whole
+      // cumulative text; and it feeds #286's quadratic replay and #311's
+      // row-bounded pages either way. ⚠️ DO NOT ADD A CAP HERE — that is a
+      // producer/wire decision, not this mapper's.
       //
       // ⚠️ NO `policy` GATE, UNLIKE `reasoning` — deliberate, and argued rather
       // than inherited. `reasoningDurable` guards the model's chain-of-thought
-      // PLAINTEXT; a tool row has none. `phase` comes from a five-member set,
-      // `status` from enumerated verdicts, `argKeys` is `Object.keys(args)` —
-      // key NAMES only, never values — and `summary` is count-only, since
-      // `readSafePatchSummary` either derives it from array LENGTHS or matches
-      // an anchored count grammar. The live lane already gates storage for free:
-      // the producer is constructed only in `progress`/`partial` streaming
-      // modes, so a `block`/`off` account emits no such frame and journals no
-      // row.
+      // PLAINTEXT; a tool row has none. The two fields that carry that argument
+      // are ENFORCED at the producer, and were re-verified against it:
+      //   - `argKeys` is `Object.keys(args)` (`inbound.ts`) — key NAMES only,
+      //     never values. This is the load-bearing privacy clause;
+      //   - `summary` is count-only: `readSafePatchSummary` either derives it
+      //     from array LENGTHS or requires ≤96 chars matching an anchored count
+      //     grammar, and its only callers are the `patch` paths.
+      //
+      // ⚠️ AND TWO CLAIMS THAT USED TO SIT HERE ARE FALSE — MEASURED, so do not
+      // restore them as reassurance. This comment asserted "`phase` comes from a
+      // five-member set, `status` from enumerated verdicts":
+      //   - `status` IS A PASS-THROUGH. `explicitTerminalToolStatus` returns
+      //     `readEventString(data, "status")` verbatim for ANY non-empty string,
+      //     mapping only `"error"` → `"failed"`;
+      //   - `phase` is checked against `TOOL_EVENT_PHASES` on the `tool` and
+      //     `item` streams ONLY. The `command_output`/`patch` branch gates on
+      //     `isTerminalToolActivity` — which can pass on `status` alone — and
+      //     then forwards `phase` UNCHECKED.
+      // Neither weakens the privacy argument (both are verdict labels, not
+      // content), which is why the gate stays absent; but the argument now rests
+      // on the two fields above rather than on an enumeration nothing enforces.
+      //
+      // The live lane already gates storage for free: the producer is
+      // constructed only in `progress`/`partial` streaming modes, so a
+      // `block`/`off` account emits no such frame and journals no row.
       //
       // The admission rule tracks the client's `case "tool_activity"` exactly —
       // non-empty string `id` and `turnId`, and `argKeys` filtered to strings —

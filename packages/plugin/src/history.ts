@@ -55,6 +55,7 @@ export type {
   HistoryMessage,
   HistoryReasoningMessage,
   HistoryTextMessage,
+  HistoryToolMessage,
 } from "./channel-contract.js";
 
 /**

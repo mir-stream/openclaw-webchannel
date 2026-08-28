@@ -162,8 +162,10 @@ export type ToolTurnRow = {
 };
 
 /**
- * A turn with ONE user message, ONE tool call spanning three frames, and ONE
- * answer. The tool frames straddle the answer's `progress` on purpose: the call
+ * A turn with ONE tool call spanning three frames and ONE answer — and NO user
+ * message (this sentence claimed one, and neither `TOOL_TURN_FRAMES` nor
+ * `TOOL_TURN_ROWS` has ever contained it). The tool frames straddle the
+ * answer's `progress` on purpose: the call
  * STARTS before the lane claims its slot and ENDS after, so the fixture also
  * pins that a tool call holds the position of its FIRST frame rather than
  * drifting to where it completed.

@@ -354,8 +354,10 @@ export type ReasoningItem = {
  * independently maintained array, and it is no longer capped. See
  * `WebChannelState.toolActivity`.
  *
- * The ITEM shape is unchanged, so an embedder reading `state.toolActivity` needs
- * no edit.
+ * The ITEM shape is unchanged, so an embedder READING `state.toolActivity` needs
+ * no edit — but one field did widen: `argKeys` is now `readonly string[]`, so an
+ * embedder that ASSIGNS `item.argKeys` to a `string[]` no longer compiles (copy
+ * it, or widen the annotation).
  */
 export type ToolActivityItem = {
   id: string;
