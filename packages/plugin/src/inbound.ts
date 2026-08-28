@@ -1703,6 +1703,28 @@ export async function handleInboundMessage(
     // reasoning payload, so the widget showed an empty Reasoning section — the
     // silent failure this issue exists to end.
     //
+    // ⚠️ IT WATCHES ONLY LANES THAT OPENED, AND #242 half 2 ADDED ITS
+    // COUNTERPART FOR THE LANES THAT DID NOT. The `reasoning &&` guard below
+    // means this says nothing when `capabilities.reasoning` is off — which is
+    // exactly when `capabilities.reasoningDurable: true` records zero rows.
+    // `nats-account-runtime.ts` now warns for that combination at config time,
+    // where it is fixable by flipping one key. The two do not overlap: that one
+    // is about a lane that never opens, this one is about a lane that opened and
+    // stayed empty (whose most likely cause is core's `thinkingLevel === "off"`,
+    // which no channel config can force). Do not merge them.
+    //
+    // ⚠️ THE REASON GIVEN HERE FOR NOT RELAXING THE GUARD WAS FALSE, AND IS CUT:
+    // it read "do not relax this guard to cover the other case — per-turn is the
+    // wrong cadence for a config mistake". This warning is NOT per-turn —
+    // `reasoningEmptyLaneWarned` makes it ONE PER ACCOUNT PER PROCESS, the
+    // scope this file uses everywhere (a real teardown re-arms it on purpose —
+    // see the latch's declaration and `releaseAgentLifecycleSubscription`).
+    // Relaxing
+    // the guard would not produce per-turn output, so that was an argument
+    // against something the code does not do. The real reason to keep the cases
+    // apart is the one above: they have different causes and different fixes,
+    // and only one of them is knowable before a turn runs.
+    //
     // Placed AFTER the verdict resolution on purpose. It fires on a turn that
     // ANSWERED SUCCESSFULLY and was not positively known to be aborted — that is
     // the case where zero reasoning frames is actually surprising. Three ways a

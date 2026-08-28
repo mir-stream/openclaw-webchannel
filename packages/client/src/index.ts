@@ -31,6 +31,12 @@ export { filterCommandCatalog } from "./command-filter.js";
 export type {
   ChatRole,
   ChatMessage,
+  // #242 half 2: `ChatMessage` is a tagged union now, so an embedder that wants
+  // to name ONE arm — a `renderBubble(m: ChatBubble)` helper, say — needs the
+  // members too. Exporting only the union would force `Extract<…>` gymnastics at
+  // every call site.
+  ChatBubble,
+  ChatReasoningMessage,
   ReasoningItem,
   ToolActivityItem,
   ApprovalDecision,

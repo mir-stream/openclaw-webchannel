@@ -15,21 +15,23 @@ import {
   buildToolActivityChip,
 } from "./presentation.js";
 import { renderMarkdown } from "./markdown.js";
-import type { ChatMessage, ReasoningItem } from "../../../packages/client/src/types.js";
+import type { ChatMessage } from "../../../packages/client/src/types.js";
 
 /**
  * Mirror the widget's reasoning render loop against `list`: snapshot which lanes
  * the user has expanded, rebuild every presentation item's `<details>`, then swap
  * the children in one `replaceChildren()`. Returns nothing — asserts read `list`.
+ *
+ * ⚠️ ONE ARRAY SINCE #242 half 2, exactly like the widget. This helper used to
+ * take `(messages, reasoning)` and hand both to
+ * `orderConversationPresentation`; reasoning is a transcript member now, so a
+ * reasoning row is written into `messages` at the position it was delivered and
+ * there is no second array to pass.
  */
-function renderInto(
-  list: HTMLElement,
-  messages: readonly ChatMessage[],
-  reasoning: readonly ReasoningItem[],
-): void {
+function renderInto(list: HTMLElement, messages: readonly ChatMessage[]): void {
   const openIds = captureOpenReasoningIds(list);
   const bubbles: HTMLElement[] = [];
-  for (const presentation of orderConversationPresentation(messages, reasoning)) {
+  for (const presentation of orderConversationPresentation(messages)) {
     if (presentation.kind === "reasoning") {
       const item = presentation.value;
       bubbles.push(buildReasoningDetails(item, renderMarkdown(item.text), openIds.has(item.id)));
@@ -51,14 +53,20 @@ const user = (id: string, turnId: string, text = "hi"): ChatMessage => ({
   turnId,
 });
 
+const reasoning = (id: string, turnId: string, text: string): ChatMessage => ({
+  kind: "reasoning",
+  id,
+  turnId,
+  text,
+});
+
 describe("reasoning lane DOM", () => {
   it("renders a reasoning item as a collapsed <details data-reasoning-id> with sanitized markdown body", () => {
     const list = document.createElement("div");
-    renderInto(
-      list,
-      [user("u1", "t1")],
-      [{ id: "r1", turnId: "t1", text: "the **plan** is [ok](https://example.com)" }],
-    );
+    renderInto(list, [
+      user("u1", "t1"),
+      reasoning("r1", "t1", "the **plan** is [ok](https://example.com)"),
+    ]);
 
     const details = list.querySelector<HTMLDetailsElement>("details[data-reasoning-id]");
     expect(details).not.toBeNull();
@@ -76,7 +84,7 @@ describe("reasoning lane DOM", () => {
 
   it("preserves a user-opened lane across a rerender with updated text", () => {
     const list = document.createElement("div");
-    renderInto(list, [user("u1", "t1")], [{ id: "r1", turnId: "t1", text: "step one" }]);
+    renderInto(list, [user("u1", "t1"), reasoning("r1", "t1", "step one")]);
 
     // User expands the lane.
     const details = list.querySelector<HTMLDetailsElement>("details[data-reasoning-id]")!;
@@ -84,7 +92,7 @@ describe("reasoning lane DOM", () => {
     details.open = true;
 
     // A streaming update rerenders the transcript (new text, same id).
-    renderInto(list, [user("u1", "t1")], [{ id: "r1", turnId: "t1", text: "step one, step two" }]);
+    renderInto(list, [user("u1", "t1"), reasoning("r1", "t1", "step one, step two")]);
 
     const rebuilt = list.querySelector<HTMLDetailsElement>("details[data-reasoning-id]")!;
     // It is a freshly-built node (rebuild happened) but stays expanded...
@@ -96,7 +104,7 @@ describe("reasoning lane DOM", () => {
 
   it("renders no details element when there is no reasoning", () => {
     const list = document.createElement("div");
-    renderInto(list, [user("u1", "t1")], []);
+    renderInto(list, [user("u1", "t1")]);
     expect(list.querySelector("details[data-reasoning-id]")).toBeNull();
   });
 
@@ -132,17 +140,14 @@ describe("reasoning lane DOM", () => {
 
   it("yields inert DOM for hostile markdown/HTML in reasoning text (no script/onerror)", () => {
     const list = document.createElement("div");
-    renderInto(
-      list,
-      [user("u1", "t1")],
-      [
-        {
-          id: "r1",
-          turnId: "t1",
-          text: "<script>alert(1)</script><img src=x onerror=alert(1)> [x](javascript:alert(1))",
-        },
-      ],
-    );
+    renderInto(list, [
+      user("u1", "t1"),
+      reasoning(
+        "r1",
+        "t1",
+        "<script>alert(1)</script><img src=x onerror=alert(1)> [x](javascript:alert(1))",
+      ),
+    ]);
 
     const details = list.querySelector<HTMLDetailsElement>("details[data-reasoning-id]")!;
     // No live script or image element — content is only ever text nodes.

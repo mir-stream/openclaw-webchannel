@@ -358,9 +358,16 @@ past reasoning. Existing items remain visible through an ordinary reconnect in
 the same wrapper instance, but a fresh client starts with `reasoning: []`.
 
 Reasoning items have no `working`/`done` state, so a lost end frame or reconnect
-cannot leave a false live indicator. Retain at most the newest 100 reasoning bursts
+cannot leave a false live indicator. ~~Retain at most the newest 100 reasoning bursts
 and preferentially discard items whose `turnId` no longer has a local user or
-answer anchor. This is an ephemeral UI bound, not history retention.
+answer anchor. This is an ephemeral UI bound, not history retention.~~
+
+⚠️ **SUPERSEDED by #242 half 2 (2026-08-27).** The 100-item cap is **deleted**. A live
+cap over an uncapped durable view is itself a live≠history divergence, and dropping
+delivered text is NOT-list N10 — the argument is at `durable-view-reducer.ts`'s
+`applyReasoning`. Reasoning is a durable message now: it lives in `state.messages`,
+`state.reasoning` is derived from it, and retention is **#299**'s (server side) with
+**#310** as its client-side twin. Do not restore a number here.
 
 ### 3.6 Demo rendering
 
@@ -462,8 +469,13 @@ silently enable tool progress or answer partials.
   state. A lost activity settlement is cleared at reconnect or the next settling
   content frame.
 - **Markdown/XSS:** reuse `renderMarkdown`; never use `innerHTML`.
-- **History/reload:** reasoning is intentionally ephemeral and absent after a
-  fresh load.
+- **History/reload:** ⚠️ **SUPERSEDED by #242 (2026-08-27).** This read "reasoning is
+  intentionally ephemeral and absent after a fresh load", which is now true only for an
+  account that has NOT opted in. Half 1 made reasoning durable server-side and half 2
+  made it readable, so with `capabilities.reasoningDurable: true` (default **OFF**) a
+  reasoning block survives a reload at its delivered position. With the opt-in off the
+  original sentence still holds. Two residuals: **#304** and the GAP 2b ordering
+  divergence.
 
 ## 6. Non-goals
 

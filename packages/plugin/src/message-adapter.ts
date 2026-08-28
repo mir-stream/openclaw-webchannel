@@ -3020,11 +3020,30 @@ export function createReasoningDraftController(params: {
       // the `turn_snapshot` — and calls `reasoning?.stop()` afterwards, from its
       // `finally`. So a burst that streamed BEFORE the answer but never received
       // a reasoning-end boundary gets a later `seq` than the seal and replays at
-      // the tail, past the turn's answers. Bursts closed by `endBurst` are
-      // unaffected (they close mid-turn). Unobservable in half 1 because the
-      // projection drops reasoning before the wire; half 2 inherits it as a
-      // live≠history ORDERING divergence and owns the fix, which is the order of
-      // those two calls in the turn teardown — NOT a change to make here.
+      // the tail, past the turn's answers. Unobservable in half 1 because the
+      // projection dropped reasoning before the wire; half 2 emits it, and the
+      // divergence became live.
+      //
+      // ⚠️ THIS `stop()` PATH IS AN INSTANCE, NOT THE CONDITION. An earlier
+      // revision added "Bursts closed by `endBurst` are unaffected (they close
+      // mid-turn)" — a false universal. The real invariant is that live and
+      // replay agree for a burst IFF no `placement`/`bubble` row is journaled
+      // between its first delivered frame and its closing frame; `endBurst`
+      // guarantees nothing of the sort, and `pushDurableBlock` closes bursts
+      // from inside the `delivery.deliver` seam itself. The canonical statement
+      // and its frame-level counterexample live in `journal-history.ts`'s
+      // conversion loop (GAP 2b) — do not restate the condition here.
+      //
+      // ⚠️ THE FIX THIS COMMENT USED TO NAME DOES NOT WORK, AND HALF 2 DID NOT
+      // MAKE IT. It read "half 2 … owns the fix, which is the order of those two
+      // calls in the turn teardown". Hoisting `reasoning?.stop()` above
+      // `await draft?.drain()` moves the row before the SEAL — but the lane's
+      // `placement`/`bubble` rows were journaled while it was streaming, long
+      // before either call, so the block still lands after the turn's answers,
+      // and `applySeal` deliberately leaves every non-answer slot where it is.
+      // The old sentence was true about the seal and read as if it covered the
+      // answers. `journal-history.ts`'s conversion loop (GAP 2b) is where the
+      // divergence is now stated; still NOT a change to make here.
       closeLiveBurst();
       stopped = true;
     },

@@ -97,6 +97,7 @@ import { planWebchannelAccount } from "./multiplex.js";
 import {
   loadPersistedCredentialDocument,
   resolveReasoningDurable,
+  resolveReasoningEnabled,
   resolveTypingEnabled,
 } from "./account-config.js";
 import {
@@ -897,6 +898,76 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       log("info",
         `[webchannel] account "${accountId}" ✓ encrypted NATS channel (tenant=${tenant}, accountId=${accountId})`,
       );
+
+      // ── #242 half 2: THE CONFIG-TIME HALF OF THE REASONING DIAGNOSTIC ──
+      //
+      // `capabilities.reasoningDurable: true` yields ZERO journal rows whenever
+      // the lane never opens or opens empty, and there are THREE independent
+      // reasons for that — see the note below, which enumerates all three. Two
+      // of them are warned about, in two different places, and this warning is
+      // one of that pair; the split is why it exists rather than duplicating
+      // what already ships. (This line said "TWO independent reasons", which the
+      // note below has always contradicted with "⚠️ THERE IS A THIRD WAY". One
+      // of the two counts had to go, and the enumeration is the one that is
+      // checkable.)
+      //
+      //   THIS LINE          — `capabilities.reasoning` is OFF (channel config).
+      //                        Knowable AT CONFIG TIME, before a single turn
+      //                        runs, and FIXABLE by the operator: flip one key.
+      //   `inbound.ts`'s     — the lane OPENED and core delivered nothing all
+      //   `finally` warning    turn. That covers the other reason — core's
+      //                        `canShowReasoning` (`thinkingLevel === "off"`),
+      //                        which no channel config can force — and it can
+      //                        only be observed at RUNTIME, per turn.
+      //
+      // They are complementary, not redundant: the runtime one explicitly
+      // "only watches lanes that OPENED", so with `capabilities.reasoning` off
+      // it never fires at all. Without this line that combination is silent in
+      // both places, and half 2 is what makes the silence visible to a user —
+      // "I turned on durable reasoning and my history is empty."
+      //
+      // ⚠️ THERE IS A THIRD WAY THE LANE STAYS SHUT AND NEITHER WARNING COVERS
+      // IT — stated so the pair is not read as exhaustive. `inbound.ts` builds
+      // `reasoningEnabled` as `!controlLane && resolveReasoningEnabled(…) &&
+      // !hasExplicitSessionReasoningOptOut(…)`, and that last CONJUNCT (it read
+      // "disjunct"; the chain is `&&`) is a
+      // PEER's own persisted `/reasoning off`. Both warnings are silent for it,
+      // deliberately: it is a per-session user choice, not an operator
+      // misconfiguration, and there is nothing for the operator to fix. This
+      // line reads the SAME value `inbound.ts` does —
+      // `resolveWebchannelAccountConfig(api.config, accountId)`, which is what
+      // `plan.account` already is — so the two cannot disagree about the key.
+      //
+      // ⚠️ AND IT IS A DIAGNOSTIC, NEVER AN OVERRIDE. Do not make
+      // `reasoningDurable: true` imply the lane. `capabilities.reasoning: false`
+      // is an explicit privacy opt-OUT for a live surface, and letting a
+      // storage key silently reverse it defeats the reason the two keys were
+      // split (#113's default-ON is about RENDERING a volatile lane; it does
+      // not inherit to RECORDING plaintext at rest — `resolveReasoningDurable`'s
+      // docblock carries the argument).
+      //
+      // ⚠️ CADENCE: ONCE PER ATTEMPT THAT REACHES CHANNEL CREATION — not "once
+      // per SUCCESSFUL account start", which is what this said and is false.
+      // Failure returns exist BELOW this line as well as above it (the SUB/flush
+      // barrier and the outer catch both `return { kind: "failed" … }`), so a
+      // start that gets this far and then fails has already logged, and the
+      // retry loop logs again on every attempt. That is acceptable for a
+      // config-time diagnostic — the condition it reports is genuinely still
+      // true on each retry — but do not cite this line as a once-per-account
+      // guarantee the way `inbound.ts`'s `reasoningEmptyLaneWarned` latch is.
+      // That latch is once per account per process, re-armed only by a real
+      // teardown; this line has no latch at all.
+      if (reasoningDurable && !resolveReasoningEnabled(account)) {
+        log("warn",
+          `webchannel: capabilities.reasoningDurable is ON but capabilities.reasoning is OFF for ` +
+            `account=${logSafe(accountId)} — the reasoning lane never opens, so no reasoning frame ` +
+            `is ever produced and the delivery journal will record ZERO reasoning rows. History ` +
+            `will show none. To record reasoning, set channels.webchannel.capabilities.reasoning=true ` +
+            `(it defaults to true; something has switched it off). To stop recording, set ` +
+            `capabilities.reasoningDurable=false. Note the reverse combination — lane on, durable ` +
+            `off — is the shipped default and is fully supported.`,
+        );
+      }
 
       // #99: the dispatcher's message type is the wire frame PLUS the internal
       // member-id list `coalesceUserMessages` stamps on a merged turn. Widened

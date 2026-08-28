@@ -4,7 +4,40 @@ import type { CommandCatalogEntry } from "./commands-catalog.js";
 export const WEBCHANNEL_ID = "webchannel";
 export { ANON_PEER_ID };
 /**
- * A normalized transcript row on the hydration wire.
+ * ⚠️ THIS FILE IS THE ONLY DECLARATION OF THE HISTORY WIRE ROW (#305).
+ *
+ * There used to be two — this one and `history.ts`'s — and they had already
+ * drifted on `ts` (optional here, required there). #242 half 2 collapsed them:
+ * `history.ts` now RE-EXPORTS `HistoryMessage` from here and expresses its
+ * projection-side "`ts` is always present" as `ProjectedHistoryMessage`, a type
+ * DERIVED from this one, so the relationship is checked by tsc instead of
+ * asserted in prose. Do not restate this shape anywhere else.
+ *
+ * ⚠️ "DO NOT RESTATE" IS A DIRECTIVE, NOT A CENSUS — and the difference is not
+ * pedantry, it is the fifth time in one review that counting the other sites
+ * produced a false claim. A previous revision said "ONE EXCEPTION EXISTS" and
+ * named `nats-client.ts`; that was itself wrong, because
+ * `reasoning-turn.test-harness.ts` declares a second structural copy of both
+ * arms. Restatements that DO exist, and why each is tolerated:
+ *  - `packages/client/src/nats-client.ts` — one flat record with optional
+ *    `kind`/`role`/`turnId`, not this union, because that package is
+ *    zero-dependency and may not import the plugin. It discriminates at RUNTIME,
+ *    where wire values must be validated anyway.
+ *  - `packages/client/src/reasoning-turn.test-harness.ts` — both arms minus
+ *    `ts`, as the shared FIXTURE two packages assert against. Same dependency
+ *    reason; it is plain data with no imports.
+ * Neither is load-bearing for the wire SHAPE, which is this file's. The rule for
+ * anyone reading: add no more, and if you must, say why here.
+ */
+
+/**
+ * A chat bubble on the hydration wire — the row shape that has always been
+ * here.
+ *
+ * ⚠️ `kind` IS ABSENT ON THIS VARIANT, ON THE WIRE AS WELL AS IN THE TYPE, and
+ * that is the whole backward-compatibility story (see `HistoryMessage`). A text
+ * row serialized by this build is byte-identical to one serialized before #242
+ * half 2.
  *
  * #95: hydration reproduces the role, sanitized text, order, row identity, and
  * optional timestamp present in this projection. It does not reproduce every
@@ -21,17 +54,89 @@ export { ANON_PEER_ID };
  *    retry or fallback. Textless or sanitized-away attempts produce no row, so
  *    the projection cannot expose a retry-safe terminal failure signal.
  *  - `working`, `wireId`, `sendState` — live-only client state.
- *  - reasoning previews, typing, and tool progress — ephemeral by design
- *    (`docs/P1_REASONING_LANE_PLAN.md`), matching what Telegram does.
+ *  - typing and tool progress — ephemeral by design, matching what Telegram
+ *    does. ⚠️ REASONING IS NO LONGER ON THAT LIST: #242 made it durable
+ *    (server side in half 1, readable in half 2), and it travels as the sibling
+ *    variant below. `docs/P1_REASONING_LANE_PLAN.md`'s "ephemeral by design"
+ *    line is superseded for reasoning and still holds for the other two.
  *
  * Full rationale: `docs/ISSUE_95_HISTORY_CONTRACT_PLAN.md`.
  */
-export type HistoryMessage = {
+export type HistoryTextMessage = {
+  /**
+   * Never present. The discriminant lives here as `undefined` so tsc treats the
+   * two variants as a discriminated union rather than as two overlapping
+   * records — and so that WRITING a `kind` onto a text row is a compile error.
+   */
+  kind?: undefined;
   id: string;
   role: "user" | "agent";
   text: string;
   ts?: number;
 };
+
+/**
+ * ONE COMPLETED REASONING BURST on the hydration wire (#242 half 2).
+ *
+ * ⚠️ IT HAS NO `role`, AND THAT IS NOT AN OVERSIGHT TO FIX. The live `reasoning`
+ * frame carries none and `DurableMessage` (the reducer's SSOT shape, which this
+ * mirrors) refuses to invent one — a fabricated author inside the system of
+ * record is the N8 shape. The absence is also what makes the widening SAFE FOR
+ * OLDER CLIENTS, which is the reason the union is shaped this way rather than
+ * as an optional `role`:
+ *
+ *   MEASURED against the shipped client's `case "history"`
+ *   (`packages/client/src/nats-client-wrapper.ts`): its per-row validation runs
+ *   `if (m.role !== "user" && m.role !== "agent") continue;` BEFORE any tier
+ *   matching or insertion. A row with no `role` therefore takes that `continue`
+ *   and is DROPPED — never adopted, never inserted, never rendered as an agent
+ *   bubble. So an older client shows a reload without the reasoning blocks,
+ *   exactly as it does today, and a newer one shows them.
+ *
+ *   That guard is not new in this slice, and it is not a claim about ONE build:
+ *   `git show <tag>:packages/client/src/nats-client-wrapper.ts | grep -c` finds
+ *   it exactly ONCE in EVERY ONE of the 15 released tags — v0.1.0 through
+ *   v0.1.8, v0.2.0, v0.4.0, v0.5.0, v0.6.0, v0.6.1, v0.7.0. There is no
+ *   published client that predates it, so there is no version of this package
+ *   that mis-renders the new row.
+ *
+ *   ⚠️ TWO COUNTING TRAPS, BOTH HIT WHILE ESTABLISHING THIS. The first draft
+ *   listed FIVE tags and read as exhaustive — a partial list in exhaustive
+ *   clothing, and weaker than the truth. The correction offered in review was
+ *   "all 17 tags", which is also wrong: `git tag` returns 17, but two of them
+ *   (`archive/issue-53-pre-rebase-checkpoint`, `issue-94-pr2-superseded`) are
+ *   working checkpoints, not releases. 15 is the number of things a peer can
+ *   actually be running. Re-derive it with `git tag --list 'v*'`, not `git tag`.
+ *
+ * `turnId` is REQUIRED, following the live frame (`turnId: string`) and
+ * `DurableMessage`'s reasoning variant. `ts` is the same hydration metadata the
+ * text variant carries — see `history.ts`'s note; it is NOT an ordering key.
+ */
+export type HistoryReasoningMessage = {
+  kind: "reasoning";
+  id: string;
+  turnId: string;
+  text: string;
+  ts?: number;
+};
+
+/**
+ * One row on the hydration wire: a chat bubble, or a completed reasoning burst.
+ *
+ * ⚠️ A TAGGED UNION, MIRRORING `DurableMessage` — NOT A WIDENED RECORD. The
+ * reducer already solved this shape and its docblock carries the argument: an
+ * optional `role` would force every consumer to decide what an absent one means
+ * at the point it renders, which is the "infer identity from a missing field"
+ * habit v6 exists to remove. Two variants make a consumer that forgot one a
+ * COMPILE error.
+ *
+ * ⚠️ THE TAG IS PRESENT ONLY ON THE REASONING VARIANT, DELIBERATELY. Emitting
+ * `kind: "text"` on every bubble would change the serialized form of every row
+ * that exists today for no gain; leaving it absent keeps the widening strictly
+ * ADDITIVE — an older PLUGIN's rows still parse (no tag ⇒ bubble), and an older
+ * CLIENT drops the new rows on the `role` guard quoted above.
+ */
+export type HistoryMessage = HistoryTextMessage | HistoryReasoningMessage;
 
 export type ApprovalDecision = "allow-once" | "allow-always" | "deny";
 export type ApprovalOption = { decision: ApprovalDecision; label: string; style: string };
@@ -90,11 +195,21 @@ export type OutboundWsMessage =
        * journaling every `reasoning` frame would write O(n²) bytes per burst.
        * With the flag a burst costs exactly one row.
        *
-       * ADDITIVE AND OPTIONAL: an older client ignores the extra key and takes
-       * the frame down its ordinary `reasoning` path. That path is NOT inert,
-       * and calling it a "render no-op" understates it — for the frame this
-       * slice ADDS to the wire (`closeLiveBurst`'s: the burst's own id, carrying
-       * the text the peer already holds) what actually happens is:
+       * ADDITIVE AND OPTIONAL: a client that does not know this key takes the
+       * frame down its ordinary `reasoning` path. That path is NOT inert, and
+       * calling it a "render no-op" understates it — for the frame #242 half 1
+       * ADDED to the wire (`closeLiveBurst`'s: the burst's own id, carrying the
+       * text the peer already holds) what actually happens is:
+       *
+       * ⚠️ THE THREE BULLETS BELOW DESCRIBE THE **half-1-AND-EARLIER CLIENT**,
+       * NOT THE CURRENT ONE — read them as the compatibility argument they are.
+       * #242 half 2 deleted `upsertReasoning` and routed `case "reasoning"`
+       * through `applyDurable`, so on a CURRENT client this frame is an upsert
+       * by id into `state.messages` (same id, same text ⇒ same content, a new
+       * array), the same disarm, and the same one extra notification. The
+       * conclusion is identical on both — which is the point of keeping the old
+       * reading: it is what an OLDER peer does, and older peers are exactly who
+       * this "additive and optional" claim is about.
        *  - `upsertReasoning` replaces the entry under the SAME id with the SAME
        *    text, so the rendered reasoning list is unchanged in content;
        *  - `disarmStaleDraftsByTurn(turnId)` runs, which only DELETES ids from
@@ -118,11 +233,14 @@ export type OutboundWsMessage =
        * conditions cannot co-occur — an existing controller implies a dispatched
        * turn implies an eligible settlement.
        *
-       * ⚠️ THE THREE BULLETS ARE NOT UNIVERSAL OVER FRAMES CARRYING THIS FLAG.
+       * ⚠️ AND THE THREE BULLETS ARE NOT UNIVERSAL OVER FRAMES CARRYING THIS
+       * FLAG, on any client version.
        * `pushDurableBlock`'s independent-block branch also sets it, on a FRESHLY
        * MINTED id carrying text the client has not seen — so there
-       * `upsertReasoning` takes its APPEND path and the `.slice(-100)` cap can
-       * evict the oldest entry. That is not a compatibility concern, because
+       * an older client's `upsertReasoning` takes its APPEND path and its
+       * `.slice(-100)` cap can evict the oldest entry (a CURRENT client appends
+       * into `state.messages`, which #242 half 2 left uncapped — same append,
+       * no eviction). That is not a compatibility concern, because
        * that branch sent a byte-identical frame (minus this key) before the flag
        * existed; it is a warning against reading "same id, same text" as a
        * property of `final` rather than of the burst-closing frame.

@@ -31,6 +31,8 @@ import {
   buildToolActivityChip,
   composerButtonMode,
   activityHint,
+  oldestHistoryCursor,
+  HISTORY_PAGE_SIZE,
 } from "./presentation.js";
 
 const STATUS_LABEL: Record<WebChannelState["status"], string> = {
@@ -290,9 +292,11 @@ export async function createWidget(
     const nextMdCache = new Map<string, HTMLElement>();
     const openReasoningIds = captureOpenReasoningIds(list);
     const bubbles: HTMLElement[] = [];
+    // #242 half 2: `state.reasoning` is no longer passed — reasoning lives in
+    // `state.messages` at its own position now, and re-supplying the derived
+    // array would ask this function to place the same blocks twice.
     for (const presentation of orderConversationPresentation(
       state.messages,
-      state.reasoning,
       state.toolActivity ?? [],
     )) {
       if (presentation.kind === "reasoning") {
@@ -526,12 +530,13 @@ export async function createWidget(
 
   // ── Wiring ────────────────────────────────────────────────────────────────
   historyBtn.onclick = () => {
-    // P1-9: a local-only id (held pending / retracted) must never be sent as a
-    // `before` cursor — exclude them from the oldest-cursor pick.
-    const oldest = client?.getState().messages.find(
-      (m) => !m.working && !m.pending && !m.retracted,
-    );
-    client?.loadHistory({ before: oldest?.id, limit: 20 });
+    // The pick is `presentation.ts`'s `oldestHistoryCursor`; the paging LOOP it
+    // participates in is driven end to end by `history-paging.test.ts`.
+    client?.loadHistory({
+      before: oldestHistoryCursor(client.getState().messages),
+      // Shared with `history-paging.test.ts`; see `HISTORY_PAGE_SIZE`.
+      limit: HISTORY_PAGE_SIZE,
+    });
   };
   shortBtn.onclick = () => { connectLaneGuarded(SHORT_TTL_SECONDS); };
   const submit = () => {

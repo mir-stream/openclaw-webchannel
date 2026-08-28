@@ -480,6 +480,26 @@ describe("account-config: resolveReasoningDurable (#242 half 1)", () => {
     expect(resolveReasoningDurable(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(false);
   });
 
+  it("#242 half 2: the diagnostic's trigger is exactly `durable && !enabled`", () => {
+    // The predicate `nats-account-runtime.ts` warns on, pinned as a pure
+    // function of config so the wiring guard in `index-nats-wiring.test.ts` only
+    // has to check WHERE it is read, never WHAT it decides. It fires on the one
+    // combination that records zero rows for an operator who asked for rows —
+    // and stays silent on the shipped default (lane on, durable off), which is
+    // fully supported and must never warn.
+    const triggers = (capabilities: unknown): boolean =>
+      resolveReasoningDurable({ capabilities } as Parameters<typeof resolveReasoningDurable>[0]) &&
+      !resolveReasoningEnabled({ capabilities } as Parameters<typeof resolveReasoningEnabled>[0]);
+
+    expect(triggers({ reasoning: false, reasoningDurable: true })).toBe(true);
+    expect(triggers({ reasoning: "off", reasoningDurable: true })).toBe(true);
+    // Silent everywhere else, including both defaults.
+    expect(triggers({ reasoning: true, reasoningDurable: true })).toBe(false);
+    expect(triggers({})).toBe(false);
+    expect(triggers({ reasoning: false })).toBe(false);
+    expect(triggers(undefined)).toBe(false);
+  });
+
   it("is independent of capabilities.reasoning in BOTH directions", () => {
     // The split, stated as a property: neither key moves the other off its own
     // default. A future refactor that folds them back into one switch fails here.

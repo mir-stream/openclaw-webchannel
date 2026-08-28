@@ -611,3 +611,263 @@ describe("#240 half 2 — an unauthored placement row is dropped on arrival", ()
     ]);
   });
 });
+
+/**
+ * #242 half 2 — a `history` frame can now carry REASONING ROWS.
+ *
+ * `case "history"` predates reasoning entirely, so every rule in it was written
+ * about a row with a `role`. These cases pin what each of those rules does when
+ * it meets a row that has none, which is the shape the plugin now serves.
+ */
+describe("history hydration — reasoning rows (#242 half 2)", () => {
+  const reasoningRow = (id: string, turnId: string, text: string, ts?: number): Row =>
+    ({ kind: "reasoning", id, turnId, text, ...(ts === undefined ? {} : { ts }) }) as unknown as Row;
+
+  it("hydrates a cold reload into one entry per row, in row order", () => {
+    const w = makeWrapper();
+    deliver(
+      w,
+      history(
+        { id: "u1", role: "user", text: "why?", ts: 1 },
+        reasoningRow("r1", "t1", "let me think", 2),
+        { id: "a1", role: "agent", text: "because", ts: 3 },
+      ),
+    );
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["u1", "r1", "a1"]);
+    expect(w.getState().messages[1]).toEqual({
+      kind: "reasoning",
+      id: "r1",
+      turnId: "t1",
+      text: "let me think",
+      ts: 2,
+    });
+    // The public derived surface follows.
+    expect(w.getState().reasoning).toEqual([
+      { id: "r1", turnId: "t1", text: "let me think" },
+    ]);
+  });
+
+  it("tier 1 matches a block this device rendered live — no duplicate", () => {
+    const w = makeWrapper();
+    deliver(w, { type: "reasoning", id: "r1", turnId: "t1", text: "thinking" });
+    deliver(w, history(reasoningRow("r1", "t1", "thinking", 5)));
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["r1"]);
+  });
+
+  it("an EMPTY reasoning row is refused, exactly as the live frame is", () => {
+    // ⚠️ THIS CASE ASSERTED THE OPPOSITE IN ROUND 1 — it pinned the row as KEPT,
+    // on the true-but-insufficient ground that the empty-AGENT-row filter tests
+    // `role` and so cannot reach a role-less row. It cannot; that is why the
+    // rule had to be added to the reasoning branch instead. Measured: live,
+    // `{type:"reasoning", text:""}` yields `messages: []` (the
+    // `msg.text.length === 0` guard); before this fix the same content arriving
+    // as a history row RENDERED — an empty `<details>` the live path never
+    // draws. Agreement is the property, not which door is stricter.
+    const live = makeWrapper();
+    deliver(live, { type: "reasoning", id: "r1", turnId: "t1", text: "" });
+    expect(live.getState().messages).toEqual([]);
+
+    const replayed = makeWrapper();
+    deliver(replayed, history(reasoningRow("r1", "t1", "", 1)));
+    expect(replayed.getState().messages).toEqual([]);
+    expect(replayed.getState().reasoning).toEqual([]);
+  });
+
+  it("keeps a NON-empty reasoning row past the empty-agent-row filter", () => {
+    // Non-vacuity for the case above: the admission rule must be the TEXT rule
+    // in the reasoning branch, not the agent filter widening to eat every
+    // role-less row.
+    const w = makeWrapper();
+    deliver(w, history(reasoningRow("r1", "t1", "kept", 1)));
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["r1"]);
+  });
+
+  it("drops a reasoning row with no usable turnId rather than inventing one", () => {
+    const w = makeWrapper();
+    deliver(
+      w,
+      history(
+        { kind: "reasoning", id: "r1", text: "orphan", ts: 1 } as unknown as Row,
+        { kind: "reasoning", id: "r2", turnId: "", text: "orphan", ts: 2 } as unknown as Row,
+        { id: "a1", role: "agent", text: "kept", ts: 3 },
+      ),
+    );
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["a1"]);
+  });
+
+  it("tier 2 can never adopt onto, or from, a reasoning row", () => {
+    // The user echo and the reasoning block carry IDENTICAL text, so a
+    // text-only match would swap them. Two independent guards stop it: the
+    // incoming row's `if (m.role === "user")`, and the adoptable pool's
+    // `isAdoptableUserEcho`.
+    const w = makeWrapper();
+    w.send("same text");
+    deliver(w, { type: "reasoning", id: "r-live", turnId: "t1", text: "same text" });
+    deliver(
+      w,
+      history(
+        { id: "wire-u1", role: "user", text: "same text", ts: 1 },
+        reasoningRow("r-hist", "t1", "same text", 2),
+      ),
+    );
+    const ids = w.getState().messages.map((m) => m.id);
+    // The user echo adopted the WIRE id (tier 2, as designed) ...
+    expect(ids).toContain("wire-u1");
+    expect(ids).not.toContain("u-0");
+    // ... the live reasoning block kept its own id, untouched ...
+    expect(ids).toContain("r-live");
+    // ... and the snapshot's reasoning row fresh-inserted rather than adopting.
+    expect(ids).toContain("r-hist");
+    // Nothing was destroyed: two reasoning entries, one user echo. ⚠️ THE ORDER
+    // IS `r-hist` FIRST, and that is the ordered-insertion cursor (#16) working
+    // as designed, not a reasoning quirk: the adopted user echo walks the cursor
+    // to its own index + 1, so the next fresh row lands immediately after it —
+    // ahead of `r-live`, which is a purely local block this snapshot does not
+    // carry. Any snapshot that DID carry it would tier-1 match instead.
+    expect(ids).toEqual(["wire-u1", "r-hist", "r-live"]);
+    expect(w.getState().reasoning.map((r) => r.id)).toEqual(["r-hist", "r-live"]);
+  });
+
+  it("an older PAGE prepends its reasoning rows in order, before the live tail", () => {
+    const w = makeWrapper();
+    deliver(w, { type: "agent_message", id: "a-new", turnId: "t2", text: "recent" });
+    deliver(
+      w,
+      history(
+        { id: "u-old", role: "user", text: "older", ts: 1 },
+        reasoningRow("r-old", "t1", "older thought", 2),
+      ),
+    );
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["u-old", "r-old", "a-new"]);
+  });
+
+  /**
+   * ⚠️ TIER 1 REQUIRES THE KINDS TO AGREE, and these two cases are why.
+   *
+   * `seen`/`localIndexByKey` are built from ALL of `state.messages`, which since
+   * half 2 mixes both kinds. The two id spaces are NOT provably disjoint —
+   * `durable-view-reducer.ts`'s `findTextIndex` docblock retracts the id-shape
+   * argument outright: agent ids come from the same `nextMessageId()` as
+   * reasoning ids, and USER ids are client-supplied and validated only as a
+   * non-empty string within `MAX_INBOUND_USER_ID_LENGTH`, so a peer can send
+   * `webchannel-…` verbatim. So a snapshot row CAN collide with a locally-held
+   * entry of the other kind, and a kind-blind tier 1 silently DROPS it — never
+   * inserted, never rendered — while the same row renders fine on a fresh load.
+   * That is a live≠history content loss (N10).
+   */
+  it("a TEXT row colliding with a held REASONING id is inserted, not dropped", () => {
+    const w = makeWrapper();
+    deliver(w, { type: "reasoning", id: "dup", turnId: "t1", text: "thinking" });
+    deliver(w, history({ id: "dup", role: "agent", text: "the answer", ts: 5 }));
+
+    // The reasoning block survives untouched, and the text row RENDERS.
+    expect(w.getState().messages.map((m) => `${m.kind ?? "text"}|${m.id}|${m.text}`)).toEqual([
+      "text|dup|the answer",
+      "reasoning|dup|thinking",
+    ]);
+    expect(w.getState().reasoning.map((r) => r.id)).toEqual(["dup"]);
+  });
+
+  it("a REASONING row colliding with a held BUBBLE id is inserted, not dropped", () => {
+    const w = makeWrapper();
+    deliver(w, { type: "agent_message", id: "dup", turnId: "t1", text: "the answer" });
+    deliver(w, history(reasoningRow("dup", "t1", "thinking", 5)));
+
+    // The bubble survives untouched, and the reasoning row RENDERS.
+    expect(w.getState().messages.map((m) => `${m.kind ?? "text"}|${m.id}|${m.text}`)).toEqual([
+      "reasoning|dup|thinking",
+      "text|dup|the answer",
+    ]);
+    expect(w.getState().reasoning.map((r) => r.id)).toEqual(["dup"]);
+  });
+
+  it("is IDEMPOTENT across repeated pages carrying the same collision", () => {
+    // ⚠️ THE CASE THE FIRST FIX GOT WRONG, PINNED SO IT CANNOT COME BACK. That
+    // fix kept the id-keyed index and added a `kindAgrees` conjunct. Page 1
+    // fresh-inserted correctly, but the index is KIND-BLIND and LAST-WINS, so
+    // once the pair existed `get("dup")` returned the REASONING entry's index,
+    // `kindAgrees` was false forever, and the text row inserted AGAIN on every
+    // page — unbounded duplicate growth on every reconnect, worse than the drop
+    // it replaced. Keying the index by (kind, id) is what makes page 2 a plain
+    // tier-1 match. A snapshot arrives on every register, so "the same page
+    // twice" is the ordinary case, not an exotic one.
+    const w = makeWrapper();
+    deliver(w, { type: "reasoning", id: "dup", turnId: "t1", text: "thinking" });
+    const page = (): void => {
+      deliver(w, history({ id: "dup", role: "agent", text: "the answer", ts: 5 }));
+    };
+    page();
+    const afterFirst = w.getState().messages.map((m) => `${m.kind ?? "text"}|${m.id}|${m.text}`);
+    expect(afterFirst).toEqual(["text|dup|the answer", "reasoning|dup|thinking"]);
+
+    page();
+    expect(w.getState().messages.map((m) => `${m.kind ?? "text"}|${m.id}|${m.text}`)).toEqual(
+      afterFirst,
+    );
+    page();
+    expect(w.getState().messages.map((m) => `${m.kind ?? "text"}|${m.id}|${m.text}`)).toEqual(
+      afterFirst,
+    );
+  });
+
+  it("still drops a repeat of the same id WITHIN one page — both kinds", () => {
+    // The other half of the kind-KEYED tier 1, pinned so a future edit cannot buy
+    // the cross-kind fix by re-admitting within-page repeats. A fresh insert
+    // adds to `seen` WITHOUT adding to `localIndexByKey`, so "seen but not
+    // locally held" means "a repeat of an id earlier in THIS page" — still a
+    // match, and still a drop.
+    const text = makeWrapper();
+    deliver(
+      text,
+      history(
+        { id: "d1", role: "agent", text: "one", ts: 1 },
+        { id: "d1", role: "agent", text: "two", ts: 2 },
+      ),
+    );
+    expect(text.getState().messages.map((m) => `${m.id}|${m.text}`)).toEqual(["d1|one"]);
+
+    const reasoning = makeWrapper();
+    deliver(
+      reasoning,
+      history(reasoningRow("d2", "t1", "one", 1), reasoningRow("d2", "t1", "two", 2)),
+    );
+    expect(reasoning.getState().messages.map((m) => `${m.id}|${m.text}`)).toEqual(["d2|one"]);
+  });
+
+  it("each member of a same-id pair keeps its own overlay past an unrelated frame", () => {
+    // ⚠️ `mergeDurable`'s `prevById` WAS THE SIBLING OF THE `case "history"`
+    // INDEX — kind-blind and last-wins over the same mixed array. The cross-kind
+    // fresh insert above DELIBERATELY produces a same-id pair, so `get(id)`
+    // returned whichever member sat later in the array and the kind guard turned
+    // that into `base === undefined` for the EARLIER one — dropping the WHOLE
+    // overlay, not one field. `ts` is the visible symptom; the same loss takes
+    // `receiptKey` (so `patchBubbleByReceiptKey` can never find the bubble
+    // again), `wireId` (`promoteAnchor`) and `pending` (`retract()` returns
+    // false for a bubble still held). Any durable frame re-merges the whole
+    // view, so ONE unrelated message is the whole trigger.
+    const bubbleFirst = makeWrapper();
+    deliver(bubbleFirst, { type: "reasoning", id: "dup", turnId: "t1", text: "thinking" });
+    deliver(bubbleFirst, history({ id: "dup", role: "user", text: "the question", ts: 5 }));
+    const bubbleBefore = bubbleFirst.getState().messages.find((m) => m.kind === undefined);
+    expect(bubbleBefore?.ts).toBe(5);
+    deliver(bubbleFirst, { type: "agent_message", id: "other", turnId: "t2", text: "unrelated" });
+    expect(bubbleFirst.getState().messages.find((m) => m.kind === undefined)?.ts).toBe(5);
+
+    // The mirror image: the REASONING entry is the earlier member, and `ts` is
+    // the one client-local field it can hold.
+    const reasoningFirst = makeWrapper();
+    deliver(reasoningFirst, { type: "agent_message", id: "dup", turnId: "t1", text: "answer" });
+    deliver(reasoningFirst, history(reasoningRow("dup", "t1", "thinking", 7)));
+    const reasoningBefore = reasoningFirst
+      .getState()
+      .messages.find((m) => m.kind === "reasoning");
+    expect(reasoningBefore?.ts).toBe(7);
+    deliver(reasoningFirst, {
+      type: "agent_message",
+      id: "other",
+      turnId: "t2",
+      text: "unrelated",
+    });
+    expect(reasoningFirst.getState().messages.find((m) => m.kind === "reasoning")?.ts).toBe(7);
+  });
+});

@@ -55,8 +55,12 @@ import {
   type DeliveryJournal,
   type DeliveryJournalRow,
 } from "./delivery-journal.js";
-import type { JournalEvent } from "./delivery-journal-event.js";
-import type { HistoryMessage } from "./history.js";
+import {
+  journalEventForOutbound,
+  type JournalEvent,
+} from "./delivery-journal-event.js";
+import type { OutboundWsMessage } from "./channel-contract.js";
+import type { ProjectedHistoryMessage } from "./history.js";
 import {
   HISTORY_REPLAY_CHUNK_ROWS,
   historyPageBefore,
@@ -67,7 +71,6 @@ import {
 } from "./journal-history.js";
 import {
   reduceDurableView,
-  type DurableTextMessage,
 } from "../../client/src/durable-view-reducer.js";
 
 const TURN = "turn-1";
@@ -234,34 +237,43 @@ describe("projectJournalHistory — the fold", () => {
     expect(ts).not.toEqual([...ts].sort((a, b) => a - b));
   });
 
-  it("carries the reducer's full durable view of TEXT messages, text included", () => {
-    // The `kind === "text"` filter is a NO-OP on `MIXED_STREAM` — it holds no
-    // `reasoning` event — and is written out so the equality states what it
-    // actually compares after #242 half 1: the emitted list is the reducer's
-    // view MINUS reasoning, which the wire cannot carry yet. The reasoning drop
-    // itself is asserted in its own describe below, against a stream that has
-    // one.
+  it("carries the reducer's full durable view, text included", () => {
+    // ⚠️ NO KIND FILTER SINCE #242 half 2. Half 1 filtered the reducer's view to
+    // `kind === "text"` here, because the emitted list was the view MINUS
+    // reasoning. The emitted list is the WHOLE view now, so the equality is the
+    // stronger, unfiltered one — and it stays a no-op distinction on
+    // `MIXED_STREAM`, which holds no `reasoning` event; the reasoning case has
+    // its own describe below.
     const { read } = fakeReader(rowsFor(MIXED_STREAM));
     const projected = projectJournalHistory(read, CONV).messages;
-    expect(projected.map(({ id, role, text }) => ({ id, role, text }))).toEqual(
-      reduceDurableView(MIXED_STREAM)
-        .filter((m): m is DurableTextMessage => m.kind === "text")
-        .map(({ id, role, text }) => ({ id, role, text })),
+    expect(
+      projected.map((m) =>
+        m.kind === "reasoning"
+          ? { id: m.id, turnId: m.turnId, text: m.text }
+          : { id: m.id, role: m.role, text: m.text },
+      ),
+    ).toEqual(
+      reduceDurableView(MIXED_STREAM).map((m) =>
+        m.kind === "reasoning"
+          ? { id: m.id, turnId: m.turnId, text: m.text }
+          : { id: m.id, role: m.role, text: m.text },
+      ),
     );
   });
 });
 
 /**
- * #242 half 1 — the journal HOLDS reasoning; the `history` frame cannot carry it.
+ * #242 half 2 — the journal holds reasoning AND the `history` frame carries it.
  *
- * The projection folds `reasoning` rows into the durable view at the position
- * they were delivered, and then DROPS them when it converts that view into
- * `HistoryMessage`s, because `HistoryMessage.role` is `"user" | "agent"` and a
- * reasoning message has no role to put there. Half 2 widens the frame and moves
- * the client render together. These cases pin both halves of that sentence, so a
- * later slice cannot quietly satisfy one by breaking the other.
+ * Half 1's version of this block asserted the OPPOSITE of the second half: the
+ * projection folded `reasoning` rows into the durable view and then DROPPED them
+ * on the way to the wire, because the row type's `role` was `"user" | "agent"`
+ * and a reasoning message has none. Half 2 made the wire row a tagged union, so
+ * the drop is gone and these cases pin what replaced it — the emitted list is
+ * now the WHOLE view, reasoning in its journal position, with the reasoning
+ * variant's own shape.
  */
-describe("projectJournalHistory — reasoning is folded but not emitted (#242 half 1)", () => {
+describe("projectJournalHistory — reasoning reaches the wire (#242 half 2)", () => {
   const WITH_REASONING: JournalEvent[] = [
     { kind: "user", id: "u-0", text: "why?", turnId: TURN },
     { kind: "reasoning", id: "r-1", turnId: TURN, text: "let me think" },
@@ -271,8 +283,9 @@ describe("projectJournalHistory — reasoning is folded but not emitted (#242 ha
   ];
 
   it("the REDUCER's view holds every reasoning block, in JOURNAL order", () => {
-    // Stated first and separately: the drop below is a wire-shape limit, not a
-    // gap in the store. If this goes red the journal really is losing content.
+    // Stated first and separately from the emitted list, so a regression can be
+    // attributed: this one is about the STORE and the fold. If it goes red the
+    // journal really is losing content, whatever the wire does.
     //
     // ⚠️ "JOURNAL order", not "delivery order" — the fold reproduces the order
     // rows were APPENDED, which `applyReasoning`'s docblock is explicit is not
@@ -289,43 +302,81 @@ describe("projectJournalHistory — reasoning is folded but not emitted (#242 ha
     ]);
   });
 
-  it("the emitted HistoryMessage list holds NONE of them, and nothing else moves", () => {
+  it("the emitted list holds EVERY block, in the view's order and with NO role", () => {
     const { read } = fakeReader(rowsFor(WITH_REASONING));
     const projection = projectJournalHistory(read, CONV);
     expect(projection.messages).toEqual([
       { id: "u-0", role: "user", text: "why?", ts: T0 + 0 * T_STEP },
+      // ⚠️ NO `role` KEY AT ALL, and `toEqual` is what enforces that: an extra
+      // own property on the actual value fails it. This is the exact property
+      // every RELEASED client's `case "history"` relies on to DROP the row
+      // rather than draw it as an answer bubble, so it is asserted here and not
+      // merely described in `channel-contract.ts`.
+      { kind: "reasoning", id: "r-1", turnId: TURN, text: "let me think", ts: T0 + 1 * T_STEP },
       { id: "A", role: "agent", text: "because", ts: T0 + 2 * T_STEP },
+      { kind: "reasoning", id: "r-2", turnId: TURN, text: "and also", ts: T0 + 3 * T_STEP },
       { id: "B", role: "agent", text: "and therefore", ts: T0 + 4 * T_STEP },
     ]);
-    // A reasoning row is KNOWN, not unsupported — it was folded. Confusing the
-    // two would make the drop look like a version-skew failure to an operator.
+    // Symmetrically: a TEXT row still carries no `kind` key, so the widening is
+    // byte-additive for every row that existed before this slice.
+    for (const m of projection.messages.filter((row) => row.id === "A")) {
+      expect(Object.hasOwn(m, "kind")).toBe(false);
+    }
+    // A reasoning row is KNOWN, not unsupported — it was folded.
     expect(projection.unsupportedEvents).toBe(0);
-    // The drop happens before the `ts` step, so it can neither raise nor mask
-    // this counter.
+    // `recordFirstSeen` dated the reasoning ids in half 1 and half 2 reads them
+    // unchanged, so emitting them adds no fallbacks.
     expect(projection.tsFallbacks).toBe(0);
   });
 
-  it("no reasoning id can become a page cursor the client cannot resolve", () => {
-    // The cursor is an id taken FROM the emitted list, so this is true by
-    // construction — asserted anyway because it is the property a half-2 author
-    // must preserve when the ids start reaching the wire.
+  it("a reasoning id IS a resolvable page cursor now that it reaches the wire", () => {
+    // Half 1 asserted the opposite ("no reasoning id can become a cursor"),
+    // which was true only because the ids never left the projection. The
+    // replacement property is the one `historyPageBefore` actually rests on:
+    // resolution is `findIndex` by id over the SAME list the client was served,
+    // and that list is now the whole view.
     const { read } = fakeReader(rowsFor(WITH_REASONING));
     const messages = projectJournalHistory(read, CONV).messages;
-    expect(messages.map((m) => m.id)).not.toContain("r-1");
-    expect(messages.map((m) => m.id)).not.toContain("r-2");
-    // Paging by a real cursor is unaffected by the reasoning blocks between the
-    // rows: everything strictly older than B is [u-0, A].
-    expect(historyPageBefore(messages, "B", 10).map((m) => m.id)).toEqual(["u-0", "A"]);
-    // And an unresolvable cursor is still the empty page, not newest-N.
-    expect(historyPageBefore(messages, "r-1", 10)).toEqual([]);
+    expect(messages.map((m) => m.id)).toEqual(["u-0", "r-1", "A", "r-2", "B"]);
+    // Everything strictly older than B — reasoning blocks included, because
+    // they are messages now.
+    expect(historyPageBefore(messages, "B", 10).map((m) => m.id)).toEqual([
+      "u-0",
+      "r-1",
+      "A",
+      "r-2",
+    ]);
+    // A reasoning cursor resolves like any other.
+    expect(historyPageBefore(messages, "r-2", 10).map((m) => m.id)).toEqual([
+      "u-0",
+      "r-1",
+      "A",
+    ]);
+    // And an id the projection does not hold is still the empty page, not
+    // newest-N — the unchanged contract, and the only outcome a live-only
+    // reasoning id (an account with `reasoningDurable` off) can produce.
+    expect(historyPageBefore(messages, "never-journaled", 10)).toEqual([]);
   });
 
-  it("counts reasoning-only conversations as empty on the wire, not as unsupported", () => {
+  it("`limit` counts reasoning rows, so a page holds fewer bubbles", () => {
+    // Stated as a test because it is a real behaviour change for an operator
+    // who tuned `history.pageSize` against a bubble-only projection.
+    const { read } = fakeReader(rowsFor(WITH_REASONING));
+    const messages = projectJournalHistory(read, CONV).messages;
+    expect(recentHistoryPage(messages, 3).map((m) => m.id)).toEqual(["A", "r-2", "B"]);
+  });
+
+  it("a reasoning-only conversation is a NON-empty wire frame now", () => {
     const { read } = fakeReader(
       rowsFor([{ kind: "reasoning", id: "r-1", turnId: TURN, text: "alone" } satisfies JournalEvent]),
     );
+    // Half 1 asserted `messages: []` here. That mattered: `sendSnapshot` gates
+    // the frame on `length > 0`, so under half 1 such a conversation looked
+    // brand new to its owner. It no longer does.
     expect(projectJournalHistory(read, CONV)).toEqual({
-      messages: [],
+      messages: [
+        { kind: "reasoning", id: "r-1", turnId: TURN, text: "alone", ts: T0 },
+      ],
       unsupportedEvents: 0,
       tsFallbacks: 0,
     });
@@ -418,9 +469,9 @@ describe("projectJournalHistory — chunking", () => {
       fakeReader(rowsFor(RE_FOLD_SENSITIVE_STREAM)).read,
       CONV,
     );
-    expect(reFold.messages.filter((m) => m.role === "user").map((m) => m.id)).toEqual(
-      ["u-0", "u-1"],
-    );
+    expect(
+      reFold.messages.filter((m) => m.kind !== "reasoning" && m.role === "user").map((m) => m.id),
+    ).toEqual(["u-0", "u-1"]);
   });
 
   it("TERMINATES against a reader that never advances, instead of spinning", () => {
@@ -823,7 +874,7 @@ describe("projectJournalHistory — where ts comes from", () => {
 });
 
 describe("recentHistoryPage", () => {
-  const page: HistoryMessage[] = [
+  const page: ProjectedHistoryMessage[] = [
     { id: "m1", role: "user", text: "1", ts: 1 },
     { id: "m2", role: "agent", text: "2", ts: 2 },
     { id: "m3", role: "user", text: "3", ts: 3 },
@@ -874,7 +925,7 @@ describe("recentHistoryPage", () => {
 });
 
 describe("historyPageBefore", () => {
-  const page: HistoryMessage[] = [
+  const page: ProjectedHistoryMessage[] = [
     { id: "m1", role: "user", text: "1", ts: 1 },
     { id: "m2", role: "agent", text: "2", ts: 2 },
     { id: "m3", role: "user", text: "3", ts: 3 },
@@ -979,7 +1030,7 @@ describe("historyPageBefore", () => {
     // fixture that was never passed in, so NO implementation could fail it. The
     // identity claim is only real when the reference under test is the reference
     // that went in; the twin at `recentHistoryPage` does it that way.
-    const input: HistoryMessage[] = [
+    const input: ProjectedHistoryMessage[] = [
       ...page,
       { id: "m5", role: "user", text: "5", ts: 5 },
     ];
@@ -1153,5 +1204,126 @@ describe("against a REAL openDeliveryJournal", () => {
     expect(
       historyPageBefore(chunked.messages, "u-57", 2).map((m) => m.id),
     ).toEqual(["u-55", "u-56"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ⭐ THE PLUGIN HALF OF THE v6 BET FOR REASONING (#242 half 2)
+// ---------------------------------------------------------------------------
+//
+// The client half — "the live view and a replayed `history` frame agree, in
+// content and in position" — is in
+// `packages/client/src/durable-view-reducer.test.ts`'s
+// "live == history for reasoning" block, which drives the REAL wrapper with the
+// REAL wire frames and then hands a FRESH wrapper a `history` frame.
+//
+// ⚠️ THE TWO HALVES SHARE ONE FIXTURE, AND ROUND 1'S CLAIM THAT THEY DID WAS
+// FALSE. This block used to say "asserts the served rows are byte-for-byte the
+// ones the client test consumes … if either side is edited alone, one of the two
+// goes red" — while both files carried INDEPENDENT hand-written literals with no
+// shared constant, no import edge, and different `ts` values. Reordering the
+// client's copy, or adding a `role` to one of its reasoning rows, left this file
+// green. Both now import `reasoning-turn.test-harness.ts` from the CLIENT
+// package, which this file's module already depends on (`journal-history.ts` →
+// `durable-view-reducer.ts`), so the edge and its direction are unchanged.
+//
+// WHAT EACH HALF PROVES, stated separately because they are different claims:
+//   - THIS half: the real `journalEventForOutbound` + the real projection EMIT
+//     exactly `ORDINARY_TURN_ROWS`, with the `ts` sourcing this module owns;
+//   - the CLIENT half: replaying those rows renders what the live stream did.
+// Neither proves the other, and neither can be edited alone any more.
+import {
+  INTERLEAVED_TURN_FRAMES,
+  INTERLEAVED_TURN_REPLAY_IDS,
+  ORDINARY_TURN_FRAMES,
+  ORDINARY_TURN_ROWS,
+  type ReasoningTurnFrame,
+} from "../../client/src/reasoning-turn.test-harness.js";
+
+describe("live == history for reasoning: what the plugin actually serves (#242 half 2)", () => {
+  const asOutbound = (frame: ReasoningTurnFrame): OutboundWsMessage =>
+    frame as unknown as OutboundWsMessage;
+
+  function journalRowsFor(
+    frames: readonly ReasoningTurnFrame[],
+    reasoningDurable = true,
+  ): DeliveryJournalRow[] {
+    const events: JournalEvent[] = [];
+    for (const frame of frames) {
+      const event = journalEventForOutbound(asOutbound(frame), { reasoningDurable });
+      if (event !== null) events.push(event);
+    }
+    return rowsFor(events);
+  }
+
+  /** A served row with `ts` stripped — the shape the shared fixture pins. */
+  const withoutTs = (row: ProjectedHistoryMessage): unknown => {
+    const { ts: _ts, ...rest } = row;
+    return rest;
+  };
+
+  it("ONE row per burst — the unthrottled cumulative stream does not reach the store", () => {
+    // Stated first: without the `final` gate this turn would write three rows
+    // for `r1` alone, each holding the whole text so far.
+    expect(journalRowsFor(ORDINARY_TURN_FRAMES).map((r) => r.kind)).toEqual([
+      "reasoning",
+      "placement",
+      "bubble",
+      "reasoning",
+      "bubble",
+    ]);
+    // Non-vacuity: the fixture really does stream the burst more than once.
+    expect(
+      ORDINARY_TURN_FRAMES.filter((f) => f.type === "reasoning" && f.final !== true),
+    ).not.toHaveLength(0);
+  });
+
+  it("serves EXACTLY the rows the client-side live==history twin replays", () => {
+    const { read } = fakeReader(journalRowsFor(ORDINARY_TURN_FRAMES));
+    const messages = projectJournalHistory(read, CONV).messages;
+
+    // ⚠️ THE SHARED FIXTURE IS THE EXPECTATION. `toEqual` on the whole array
+    // after stripping `ts`: no `role` on a reasoning row, no `kind` on a text
+    // row, and the ORDER is the reducer's.
+    expect(messages.map(withoutTs)).toEqual(ORDINARY_TURN_ROWS.map((row) => ({ ...row })));
+    // The position claim, stated on its own so a reordering regression names
+    // itself rather than hiding inside the equality above.
+    expect(messages.map((m) => m.id)).toEqual(["r1", "A", "r2", "B"]);
+
+    // `ts` is THIS module's concern and is asserted here rather than in the
+    // shared fixture — first appearance, so `A` is dated by its PLACEMENT row
+    // (index 1), not by its bubble.
+    expect(messages.map((m) => m.ts)).toEqual([
+      T0 + 0 * T_STEP,
+      T0 + 1 * T_STEP,
+      T0 + 3 * T_STEP,
+      T0 + 4 * T_STEP,
+    ]);
+  });
+
+  it("serves NOTHING for the same turn when the account did not opt in", () => {
+    // Non-vacuity for the whole block, and the shipped default: with
+    // `reasoningDurable` off the identical frames produce a bubble-only history,
+    // and the peer's reload legitimately shows no reasoning.
+    const { read } = fakeReader(journalRowsFor(ORDINARY_TURN_FRAMES, false));
+    expect(projectJournalHistory(read, CONV).messages.map((m) => m.id)).toEqual(["A", "B"]);
+  });
+
+  /**
+   * ⚠️ CHARACTERIZATION — GAP 2b, FROM THE SERVER SIDE.
+   *
+   * The shared fixture's ordinary turn closes every burst before the next
+   * answer's `progress`, so it cannot reach the ordering divergence. This drives
+   * the fixture that can, through the REAL mapper and the REAL projection, and
+   * pins the order the SERVER produces; the client half pins the order the LIVE
+   * client produces for the same frames. The two expectations differ ON PURPOSE
+   * — that difference IS the gap, and it is now measured in both packages
+   * instead of asserted in a comment.
+   */
+  it("CHARACTERIZATION: an answer slot claimed mid-burst replays out of live order", () => {
+    const { read } = fakeReader(journalRowsFor(INTERLEAVED_TURN_FRAMES));
+    expect(projectJournalHistory(read, CONV).messages.map((m) => m.id)).toEqual([
+      ...INTERLEAVED_TURN_REPLAY_IDS,
+    ]);
   });
 });

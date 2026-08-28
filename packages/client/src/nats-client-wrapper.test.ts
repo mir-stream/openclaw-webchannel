@@ -1599,7 +1599,10 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
 
     // The live turn, as the pre-#212 client rendered it: lane A settled "tA"; a
     // status notice mid-turn; lane C mis-topped to "tB"; the overflow final "tC"
-    // on its own independent bubble. Reasoning rides a separate surface.
+    // on its own independent bubble. ⚠️ The reasoning block is IN the transcript
+    // since #242 half 2 — it used to ride a separate surface, and this case now
+    // doubles as the proof that a `seal` steps over it (the reducer's
+    // `applySeal` guards every id test with `kind === "text"`).
     liveBubble(w, "laneA", "T", "A", "tA");
     deliver(w, { type: "reasoning", id: "r1", turnId: "T", text: "thinking…" });
     deliver(w, { type: "agent_message", id: "notice1", turnId: "T", text: "Heads up: a notice." });
@@ -1611,6 +1614,7 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
       "u-0",
       "durable-1",
       "laneA",
+      "r1",
       "notice1",
       "laneC",
       "tcId",
@@ -1619,6 +1623,7 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
     const userBefore = messagesBefore.find((m) => m.id === "u-0")!;
     const noticeBefore = messagesBefore.find((m) => m.id === "notice1")!;
     const durableBefore = messagesBefore.find((m) => m.id === "durable-1")!;
+    const reasoningBefore = messagesBefore.find((m) => m.id === "r1")!;
 
     // The plugin's authoritative snapshot: streamed [A][B][C]; lane B never
     // materialized so it is MINTED; the overflow "tC" bubble is removed.
@@ -1635,12 +1640,14 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
 
     const after = w.getState().messages;
     // Order: answers in authoritative order among themselves; every non-answer
-    // bubble keeps its slot; the overflow bubble is gone.
+    // bubble keeps its slot — the reasoning block INCLUDED; the overflow bubble
+    // is gone.
     expect(after.map((m) => m.id)).toEqual([
       "u-0",
       "durable-1",
       "laneA",
       "laneB",
+      "r1",
       "notice1",
       "laneC",
     ]);
@@ -1665,8 +1672,20 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
     expect(after.find((m) => m.id === "notice1")).toBe(noticeBefore);
     //  - the durable-history agent row that shares the turn,
     expect(after.find((m) => m.id === "durable-1")).toBe(durableBefore);
-    //  - the reasoning surface (never in state.messages).
-    expect(w.getState().reasoning.map((r) => r.id)).toContain("r1");
+    //  - and the reasoning block, BY REFERENCE, with no `role` invented for it.
+    //    A `seal` reconciles the turn's ANSWER bubbles and must say nothing
+    //    about a reasoning block that shares the turn (#242 half 2).
+    expect(after.find((m) => m.id === "r1")).toBe(reasoningBefore);
+    expect(after.find((m) => m.id === "r1")).toEqual({
+      kind: "reasoning",
+      id: "r1",
+      turnId: "T",
+      text: "thinking…",
+    });
+    //  - `state.reasoning` is the DERIVED view of exactly that entry.
+    expect(w.getState().reasoning).toEqual([
+      { id: "r1", turnId: "T", text: "thinking…" },
+    ]);
   });
 
   it("S1b: a HISTORY-hydrated bubble (no turnId) is preserved by reference too", () => {
@@ -2173,16 +2192,84 @@ describe("WebChannelNATSClient — reasoning lane", () => {
     (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(frame);
   }
 
-  it("keeps reasoning separate, correlated, replaceable, and bounded", () => {
+  it("is correlated, replaceable, and UNBOUNDED — the .slice(-100) cap is gone", () => {
+    // ⚠️ THIS CASE ASSERTED THE OPPOSITE UNTIL #242 half 2. It read
+    // `toHaveLength(100)` / `reasoning[0].id === "r5"`, pinning `upsertReasoning`'s
+    // `.slice(-100)`. That cap is deleted: the durable view is uncapped, so a
+    // live cap was itself a live≠history divergence (past 100 blocks the live
+    // list had dropped the oldest and a replay still had them). Retention is
+    // #299's, at the store, as one policy over everything.
     const wrapper = makeWrapper();
     for (let i = 0; i < 105; i++) {
       deliver(wrapper, { type: "reasoning", id: `r${i}`, turnId: `t${i}`, text: `text${i}` });
     }
-    expect(wrapper.getState().reasoning).toHaveLength(100);
-    expect(wrapper.getState().reasoning[0].id).toBe("r5");
+    expect(wrapper.getState().reasoning).toHaveLength(105);
+    expect(wrapper.getState().reasoning[0].id).toBe("r0");
+    // Upsert by id, not append.
     deliver(wrapper, { type: "reasoning", id: "r104", turnId: "t104", text: "updated" });
+    expect(wrapper.getState().reasoning).toHaveLength(105);
     expect(wrapper.getState().reasoning.at(-1)?.text).toBe("updated");
-    expect(wrapper.getState().messages).toEqual([]);
+  });
+
+  it("puts each burst IN the transcript, and derives state.reasoning from it", () => {
+    // The other half of the same change: `state.messages` used to stay `[]`
+    // through every reasoning frame, because the client kept a side array.
+    const wrapper = makeWrapper();
+    deliver(wrapper, { type: "reasoning", id: "r1", turnId: "t1", text: "half" });
+    deliver(wrapper, { type: "reasoning", id: "r1", turnId: "t1", text: "half done" });
+
+    // ⚠️ `toEqual` on the whole entry, so an invented `role` (or any other
+    // bubble field) fails: the entry has exactly four own keys.
+    expect(wrapper.getState().messages).toEqual([
+      { kind: "reasoning", id: "r1", turnId: "t1", text: "half done" },
+    ]);
+    // DERIVED, not maintained — same content, `ReasoningItem` shape.
+    expect(wrapper.getState().reasoning).toEqual([
+      { id: "r1", turnId: "t1", text: "half done" },
+    ]);
+  });
+
+  it("state.reasoning keeps its ARRAY IDENTITY across a frame that is not a transcript change", () => {
+    // The derivation is conditional on `messages` being in the patch. Without
+    // that, every `typing` frame would hand listeners a fresh `reasoning` array
+    // and defeat the identity-based change detection `WebChannelState` promises.
+    const wrapper = makeWrapper();
+    deliver(wrapper, { type: "reasoning", id: "r1", turnId: "t1", text: "thought" });
+    const before = wrapper.getState().reasoning;
+    deliver(wrapper, { type: "typing" });
+    expect(wrapper.getState().reasoning).toBe(before);
+  });
+
+  it("but it DOES churn on every frame that touches the transcript — measured, not implied", () => {
+    // ⚠️ THE HONEST OTHER HALF, pinned because `nextStateFrom`'s docblock used
+    // to state only the `typing` case and that reads as a stronger guarantee
+    // than it is. A `progress` frame patches `messages`, so `reasoning` is
+    // rebuilt — identical contents, new array — and `progress` is far more
+    // frequent during a turn than `typing` is. Consistent with the rest of the
+    // object (`WebChannelState` promises a new object per change, "the arrays
+    // too"), but a subscriber must not read this array's identity as "the
+    // reasoning changed".
+    const wrapper = makeWrapper();
+    deliver(wrapper, { type: "reasoning", id: "r1", turnId: "t1", text: "thought" });
+    const before = wrapper.getState().reasoning;
+    deliver(wrapper, { type: "progress", id: "A", turnId: "t1", text: "Working…" });
+    const after = wrapper.getState().reasoning;
+    expect(after).not.toBe(before);
+    expect(after).toEqual(before);
+    // Two consecutive `progress` frames churn it again, with nothing to show.
+    deliver(wrapper, { type: "progress", id: "A", turnId: "t1", text: "Working… more" });
+    expect(wrapper.getState().reasoning).not.toBe(after);
+    expect(wrapper.getState().reasoning).toEqual(before);
+  });
+
+  it("a reasoning block sits between the answers it was delivered between", () => {
+    // Position comes from the stream, not from `turnId` grouping — the property
+    // the demo's deleted interleave used to supply and now must not.
+    const wrapper = makeWrapper();
+    deliver(wrapper, { type: "agent_message", id: "A", turnId: "t1", text: "first" });
+    deliver(wrapper, { type: "reasoning", id: "r1", turnId: "t1", text: "hmm" });
+    deliver(wrapper, { type: "agent_message", id: "B", turnId: "t1", text: "second" });
+    expect(wrapper.getState().messages.map((m) => m.id)).toEqual(["A", "r1", "B"]);
   });
 
   it("does not clear typing on reasoning but turn_settled does", () => {

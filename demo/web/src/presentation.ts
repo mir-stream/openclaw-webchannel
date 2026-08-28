@@ -1,5 +1,6 @@
 import type {
   ApprovalRequest,
+  ChatBubble,
   ChatMessage,
   ReasoningItem,
   ToolActivityItem,
@@ -49,9 +50,18 @@ export function composerButtonMode(
  * `isTyping` ("an answer is being composed right now") keeps its base behavior
  * exactly: the reasoning gate belongs to the "agent is typing…" line ALONE,
  * because a live reasoning lane is that same signal in richer form. It must NOT
- * gate the gap hint: `state.reasoning` is a rolling buffer with no liveness
- * notion, so one reasoning frame anywhere in the turn would otherwise suppress
- * the gap hint for the rest of it — exactly the case #96 is about.
+ * gate the gap hint: `state.reasoning` carries no liveness notion, so one
+ * reasoning block anywhere in the turn would otherwise suppress the gap hint for
+ * the rest of it — exactly the case #96 is about.
+ *
+ * ⚠️ THAT ARGUMENT GOT STRONGER, NOT WEAKER, IN #242 half 2 — check it before
+ * "simplifying" this. `state.reasoning` used to be a capped rolling buffer; it
+ * is now DERIVED from `state.messages` and UNCAPPED, so it also holds blocks
+ * REPLAYED FROM HISTORY. The turn-scoped match is what keeps that harmless: it
+ * compares against `latestUser.turnId`, and a history-hydrated user row is
+ * fresh-inserted WITHOUT a `turnId` (`case "history"` emits exactly
+ * `{id, role, text, ts, working}`), so a reload cannot make an old block speak
+ * for a new turn. Dropping the turn scope would.
  *
  * In the gap (`turnActive` true, nothing typing) the line softens to "still
  * working…", except when something louder already speaks for the turn: a live
@@ -85,28 +95,56 @@ export function activityHint(state: {
   return "still working…";
 }
 
+/**
+ * One drawable row.
+ *
+ * ⚠️ `message` CARRIES A `ChatBubble`, NOT A `ChatMessage` — that narrowing is
+ * where the widget's compile-time safety against drawing a reasoning block as an
+ * agent bubble lives (#242 half 2; `ChatMessage`'s docblock explains why the
+ * union itself is readable without narrowing). A widget cannot reach `m.role`
+ * or `m.text` here without first switching on this `kind`.
+ */
 export type ConversationPresentationItem =
-  | { kind: "message"; value: ChatMessage }
+  | { kind: "message"; value: ChatBubble }
   | { kind: "reasoning"; value: ReasoningItem }
   | { kind: "tool_activity"; value: ToolActivityItem };
 
 /**
- * Place ephemeral reasoning and tool activity (#97) after their user anchor and
- * before their turn answer. Both lanes correlate by `turnId`; tool activity is
- * emitted right after any reasoning for the same turn so it reads as
- * subordinate, live turn detail.
+ * Order the transcript for rendering.
+ *
+ * ⚠️ REASONING IS NO LONGER INTERLEAVED HERE (#242 half 2). This function used
+ * to take a separate `reasoning` array and place each burst after its user
+ * anchor by `turnId`, grouped per turn — a SECOND opinion about ordering, held
+ * by the renderer. Reasoning is a durable message now: it sits in
+ * `state.messages` at the position the stream put it, and this function READS
+ * that position rather than re-deriving one. Re-deriving it from `turnId` would
+ * put a third answer next to the other two, and it would be WRONG in exactly the
+ * cases the id ordering gets right (two bursts around one answer, a burst whose
+ * turn has no user anchor in view).
+ *
+ * ⚠️ THIS SAID "the reducer owns that position on both the live and the replayed
+ * side", WHICH CLAIMS TOO MUCH. The reducer owns the position it assigns;
+ * `case "history"`'s cursor MERGE is not the reducer, and it can move rows
+ * around a live block. Traced: hold `[u1, r1]` with the turn's answer not yet
+ * received, then receive a snapshot `[u1, A1]` — with `reasoningDurable` OFF
+ * (the default) that snapshot carries no reasoning row, so `u1` tier-1 matches
+ * and walks the cursor past itself, `A1` fresh-inserts after it, and the render
+ * is `[u1, A1, r1]` where base drew `[u1, r1, A1]`. Cosmetic only — nothing
+ * lost, duplicated or unstable — and a direct consequence of deleting the
+ * renderer's `turnId` re-anchor, which is the decision this docblock defends. It
+ * is NOT GAP 2b (that is journal position vs live); it is merge-cursor
+ * displacement, recorded here because no other site covers it.
+ *
+ * ⚠️ TOOL ACTIVITY IS STILL INTERLEAVED, and that is not an inconsistency: it is
+ * still EPHEMERAL (`#242 half 3` is what makes it durable), so it lives in its
+ * own array with no position of its own and `turnId` is the only anchor there
+ * is. When half 3 lands, this function should lose the second lane the same way
+ * it just lost the first.
  */
 export function orderConversationPresentation(
   messages: readonly ChatMessage[],
-  reasoning: readonly ReasoningItem[],
   toolActivity: readonly ToolActivityItem[] = [],
 ): ConversationPresentationItem[] {
-  const reasoningByTurn = new Map<string, ReasoningItem[]>();
-  for (const item of reasoning) {
-    const items = reasoningByTurn.get(item.turnId) ?? [];
-    items.push(item);
-    reasoningByTurn.set(item.turnId, items);
-  }
   const toolByTurn = new Map<string, ToolActivityItem[]>();
   for (const item of toolActivity) {
     const items = toolByTurn.get(item.turnId) ?? [];
@@ -117,26 +155,95 @@ export function orderConversationPresentation(
   const result: ConversationPresentationItem[] = [];
   const emitTurnLanes = (turnId: string): void => {
     if (emitted.has(turnId)) return;
-    const reasoningItems = reasoningByTurn.get(turnId);
     const toolItems = toolByTurn.get(turnId);
-    if (!reasoningItems && !toolItems) return;
+    if (!toolItems) return;
     emitted.add(turnId);
-    if (reasoningItems) {
-      result.push(...reasoningItems.map((value) => ({ kind: "reasoning" as const, value })));
-    }
-    if (toolItems) {
-      result.push(...toolItems.map((value) => ({ kind: "tool_activity" as const, value })));
-    }
+    result.push(...toolItems.map((value) => ({ kind: "tool_activity" as const, value })));
   };
 
   for (const message of messages) {
+    if (message.kind === "reasoning") {
+      // In place, from the array — no turn lookup and no grouping.
+      result.push({
+        kind: "reasoning",
+        value: { id: message.id, turnId: message.turnId, text: message.text },
+      });
+      continue;
+    }
     if (message.role === "agent" && message.turnId) emitTurnLanes(message.turnId);
     result.push({ kind: "message", value: message });
     if (message.role === "user" && message.turnId) emitTurnLanes(message.turnId);
   }
-  for (const turnId of reasoningByTurn.keys()) emitTurnLanes(turnId);
   for (const turnId of toolByTurn.keys()) emitTurnLanes(turnId);
   return result;
+}
+
+/**
+ * The widget's "load older" page size — ONE definition, imported by both the
+ * widget and `history-paging.test.ts`.
+ *
+ * ⚠️ IT LIVES HERE BECAUSE THE TEST'S CLAIM DEPENDS ON IT. That test says a
+ * future page-size change "cannot silently move the cliff without moving this
+ * test", and while the widget had `limit: 20` inline and the test had its own
+ * `WIDGET_LIMIT = 20`, that was false — the two literals could drift and the
+ * test would stay green while measuring a boundary the widget no longer uses.
+ * Exporting the constant is what makes the sentence true, which is cheaper than
+ * deleting it.
+ */
+export const HISTORY_PAGE_SIZE = 20;
+
+/**
+ * The `before` cursor for a "load older" request: the id of the OLDEST entry
+ * this device holds that the server could plausibly resolve, or `undefined` to
+ * ask for the tail.
+ *
+ * Extracted from `widget.ts`'s `historyBtn.onclick` so the paging LOOP is
+ * testable end to end — see `history-paging.test.ts`, which drives this picker
+ * against the plugin's real `historyPageBefore` and the client's real
+ * `case "history"` merge. It was inline, and the defect it hid was invisible to
+ * every unit test in the repo.
+ *
+ * P1-9: a local-only id (held `pending` / `retracted`) must never be sent as a
+ * `before` cursor — those were never on the wire and are never in the journal.
+ * A `working` draft is skipped for the same reason.
+ *
+ * ⚠️ A REASONING ROW IS A LEGITIMATE CURSOR, AND SKIPPING IT DEADLOCKS THE
+ * BUTTON. #242 half 2 first added `m.kind === undefined` to this predicate,
+ * reasoning that a live reasoning id might not be in the journal. That is a
+ * DEFECT, and the test file above reproduces it: once the `limit` rows
+ * immediately preceding the oldest held bubble are all reasoning, the oldest
+ * cursorable entry never changes, every click re-serves a page the client
+ * already holds, every row tier-1 matches — and the rest of the conversation
+ * becomes permanently unreachable. Measured at the widget's own `limit: 20`
+ * against `[u0, r1…r30, A]`: five clicks, cursor `A` every time, `u0` never
+ * reached. The cliff is exactly at run length `limit`.
+ *
+ * The property that makes a reasoning id safe was verified against the REAL
+ * pager rather than assumed: a reasoning id is PLUGIN-minted, appears in the
+ * projection WHEN THE ACCOUNT OPTED INTO `capabilities.reasoningDurable`, and
+ * `historyPageBefore` resolves by `findIndex` over the emitted list without ever
+ * reading `kind`.
+ *
+ * ⚠️ THAT QUALIFIER IS NOT A HEDGE — the opt-in DEFAULTS OFF, so in the default
+ * configuration a live reasoning id is in NO projection at all. Stating it
+ * unconditionally would have made this paragraph read as the safety argument for
+ * every deployment when it is the argument for one of them. The default case is
+ * covered by the paragraph below instead, and by the same rule: an unresolvable
+ * cursor is the empty page, which is honest, whereas the skip was a stall.
+ *
+ * ⚠️ AND THE WORRY THAT MOTIVATED THE SKIP WAS NOT NEW TO REASONING — that is
+ * why it does not justify one. A published local user echo keeps its `u-<n>` id
+ * until a snapshot adopts it, while the accept seam journals the inbound WIRE
+ * id, so this predicate has ALWAYS been able to return an id the journal does
+ * not hold. The answer then and now is `historyPageBefore`'s stated contract:
+ * an unresolvable cursor is the empty page, which the client treats as "no more
+ * history". A stall is strictly worse than that, because it is indistinguishable
+ * from it while hiding content that does exist.
+ */
+export function oldestHistoryCursor(
+  messages: readonly ChatMessage[],
+): string | undefined {
+  return messages.find((m) => !m.working && !m.pending && !m.retracted)?.id;
 }
 
 /**

@@ -91,12 +91,28 @@ export type SendReceipt = {
  * rolling "Working…" bubble); it flips to false when the same id is finalized
  * into the agent's answer.
  *
- * `ts` is hydration metadata: server-recorded millisecond timestamp carried
- * over from the core session transcript. The server uses it to sort the
- * initial snapshot in recency order. Local sends (a user typing in the
- * widget) keep `ts` absent — the server stamps it on receive.
+ * `ts` is hydration metadata: a server-recorded millisecond timestamp. Local
+ * sends (a user typing in the widget) keep `ts` absent — the server stamps it on
+ * receive. ⚠️ IT IS NOT AN ORDERING KEY: order is the array's, which comes from
+ * the shared reducer. (An earlier version of this docblock said "the server uses
+ * it to sort the initial snapshot in recency order"; that was stale — nothing in
+ * this package or the widget tree sorts on it, and `journal-history.ts`'s NEVER
+ * SORT block carries the measurement.)
  */
-export type ChatMessage = {
+export type ChatBubble = {
+  /**
+   * Never present on a bubble — the discriminant of the `ChatMessage` union,
+   * declared as `undefined` here so that (a) tsc narrows the union on it and
+   * (b) writing a `kind` onto a bubble is a compile error.
+   *
+   * ⚠️ IT MUST STAY ABSENT AS AN OWN KEY AT RUNTIME, not merely `undefined`.
+   * `nats-client-wrapper.ts`'s `sameChatMessage` compares `Object.keys` COUNTS
+   * to decide whether an unchanged bubble can be handed back by reference, and
+   * the wrapper's suite asserts that reference identity with `.toBe`. A
+   * `kind: undefined` key on every bubble would break the count on the first
+   * durable event.
+   */
+  kind?: undefined;
   id: string;
   role: ChatRole;
   text: string;
@@ -186,6 +202,90 @@ export type ChatMessage = {
   retracted?: boolean;
 };
 
+/**
+ * ONE COMPLETED REASONING BURST, as a member of the transcript (#242 half 2).
+ *
+ * ⚠️ NO `role`, AND NO CLIENT-LOCAL SEND STATE. Both absences are deliberate and
+ * they have different reasons:
+ *  - `role` is absent because the wire carries none and `DurableMessage` refuses
+ *    to invent one. Overloading `role` — "reasoning is an agent bubble with a
+ *    flag" — was the alternative and is the shape v6 exists to remove: it makes
+ *    every renderer decide what a special role means at the point it draws.
+ *  - `working`/`draftOnly`/`pending`/`sendState`/`wireId`/`receiptKey` are
+ *    absent because none of them can apply. A reasoning block is never sent BY
+ *    this client, so it has no receipt; and the lane streams cumulative FULL
+ *    text through an upsert rather than a rolling draft, so it has no
+ *    draft/finalize state either.
+ *
+ * `turnId` is REQUIRED, following both the live `reasoning` frame and the wire
+ * history row.
+ */
+type ChatReasoningCore = {
+  kind: "reasoning";
+  id: string;
+  turnId: string;
+  text: string;
+  /** Hydration metadata, exactly as on a bubble. Absent on a live burst. */
+  ts?: number;
+};
+
+/**
+ * Every `ChatBubble` field a reasoning entry cannot have, pinned to `undefined`.
+ *
+ * ⚠️ DERIVED FROM `ChatBubble`, NEVER LISTED. Add a field to the bubble and it
+ * lands here automatically as "provably absent on a reasoning entry"; a hand-
+ * written list would silently stop covering it.
+ *
+ * WHAT THIS BUYS, AND WHAT IT COSTS — both are real, so the trade is stated
+ * rather than implied:
+ *  + WRITING one of these onto a reasoning entry stays a COMPILE ERROR. That is
+ *    the property that matters most here: `{kind:"reasoning", role:"agent"}` —
+ *    the fabricated author `DurableMessage` refuses — cannot be constructed.
+ *  + READING one off an unnarrowed `ChatMessage` compiles, and yields
+ *    `undefined`, which is the TRUE answer: a reasoning entry is never
+ *    `working`, never `pending`, has no receipt and no author. The wrapper's
+ *    two dozen transcript predicates (`m.working`, `m.role === "user"`,
+ *    `isSpentDraft`, …) therefore keep their exact behaviour, and comparing any
+ *    of them against a literal still NARROWS to `ChatBubble`.
+ *  − A RENDERER that forgets `kind` entirely does not fail to compile; it draws
+ *    a reasoning block as an agent bubble (`role === "user"` is false). That is
+ *    the one guarantee a fields-absent union gives up against a strict one.
+ *    It is bought back where it is actually needed — at the render boundary —
+ *    by `demo/web/src/presentation.ts`'s `ConversationPresentationItem`, whose
+ *    `message` member carries a `ChatBubble`, so a widget MUST switch on the
+ *    presentation kind before it can draw anything.
+ */
+type BubbleOnlyFieldsAbsent = {
+  [K in Exclude<keyof ChatBubble, keyof ChatReasoningCore>]?: undefined;
+};
+
+export type ChatReasoningMessage = ChatReasoningCore & BubbleOnlyFieldsAbsent;
+
+/**
+ * One entry in `state.messages` — a chat bubble, or a reasoning block.
+ *
+ * ⚠️ A TAGGED UNION, MIRRORING THE REDUCER'S `DurableMessage` AND THE WIRE'S
+ * `HistoryMessage`. #242 half 2 moved reasoning INTO this array, because a
+ * reasoning block's POSITION is the transcript's, and the transcript's order is
+ * the array's. The alternative — keeping a side list and re-interleaving it by
+ * `turnId` at render time — is a SECOND opinion about ordering held by the
+ * renderer, which is what the widget used to do and what half 2 deleted.
+ *
+ * ⚠️ NARROW ON `kind`, NEVER ON A MISSING FIELD. `m.kind === "reasoning"` is the
+ * test. Reading `m.role`/`m.working` off an unnarrowed entry does compile (see
+ * `BubbleOnlyFieldsAbsent` for exactly what that does and does not guarantee),
+ * but "no role, therefore reasoning" is the inference v6 exists to remove — a
+ * future variant would break it silently, where a `kind` test would not.
+ */
+export type ChatMessage = ChatBubble | ChatReasoningMessage;
+
+/**
+ * One live/durable reasoning burst, as `state.reasoning` exposes it.
+ *
+ * ⚠️ `state.reasoning` IS DERIVED FROM `state.messages` SINCE #242 half 2 — it is
+ * no longer independently maintained, and it is no longer capped. See
+ * `WebChannelState.reasoning`.
+ */
 export type ReasoningItem = {
   id: string;
   turnId: string;
@@ -332,7 +432,40 @@ export type WebChannelErrorCause =
  */
 export type WebChannelState = {
   messages: ChatMessage[];
-  /** Ephemeral, non-history reasoning previews, bounded by the clients. */
+  /**
+   * The conversation's reasoning bursts, in transcript order.
+   *
+   * ⚠️ DERIVED, NOT MAINTAINED (#242 half 2). This is `state.messages`'s
+   * reasoning entries, recomputed whenever `messages` changes — there is no
+   * second store and nothing writes it directly, so it cannot drift from the
+   * transcript. The wrapper's `setState` refuses a `reasoning` patch at the type
+   * level for that reason.
+   *
+   * ⚠️ AND IT IS NO LONGER "EPHEMERAL, BOUNDED BY THE CLIENTS", which is what
+   * this comment used to say. Both halves changed:
+   *  - the `.slice(-100)` cap is GONE. A live cap over an uncapped durable view
+   *    is itself a live≠history divergence (the reducer's `applyReasoning`
+   *    carries the argument); retention is #299's, at the store;
+   *  - the content is DURABLE for an account that opted into
+   *    `capabilities.reasoningDurable` (default OFF), and a reload replays it.
+   *    With the opt-in off it is still live-only — the lane renders, nothing is
+   *    journaled, and a reload shows none of it.
+   *
+   * ⚠️ KNOWN LIMITATION, EVEN WITH THE OPT-IN ON — **#304**. A burst is journaled
+   * by the ONE frame that closes it, and the plugin's send path refuses a frame
+   * outright while the transport is down (a NATS reconnect, or its fail-closed
+   * no-session-key window) — above the journaling hook, so a refused frame is
+   * never offered to it. If the transport is still refusing when the burst
+   * closes, that burst gets NO row while this client is still rendering the text
+   * it already received. The user-visible shape is "reasoning I watched vanished
+   * on reload". It is deferred, not overlooked: the seam cannot journal a
+   * refused send, and a second hook inside the reasoning controller is exactly
+   * what the v6 NOT-list forbids, so #304 needs a design round rather than a
+   * patch. Do not work around it in a renderer.
+   *
+   * The ITEM shape is unchanged, so an embedder reading `state.reasoning` needs
+   * no edit.
+   */
   reasoning: ReasoningItem[];
   /**
    * Ephemeral, non-history tool-call activity, bounded by the clients (#97).

@@ -39,6 +39,43 @@ Public state types include `ChatMessage`, `ApprovalRequest`, `ReasoningItem`,
 `WebChannelState`, `WebChannelErrorCause`, `WebChannelOptions`, and the P0-4
 send-result types `SendState`, `SendFailure`, and `SendReceipt`.
 
+### BREAKING: `ChatMessage` is a tagged union, and reasoning is in the transcript
+
+`state.messages` now carries reasoning blocks alongside chat bubbles, because a
+reasoning block has a POSITION in the conversation and the transcript array is
+what holds positions. `ChatMessage` is therefore
+`ChatBubble | ChatReasoningMessage`, discriminated on `kind`:
+
+```ts
+if (m.kind === "reasoning") {
+  // { kind, id, turnId, text, ts? } — no `role`, no send/draft state.
+} else {
+  // ChatBubble — exactly the old ChatMessage, with no `kind` key.
+}
+```
+
+Migration, in practice:
+
+- a renderer that walks `state.messages` **must** handle `kind === "reasoning"`,
+  or it will draw a reasoning block as an agent bubble (a reasoning entry has no
+  `role`, so `role === "user"` is false);
+- reads that ask "is this bubble in state X" — `m.role === "user"`, `m.working`,
+  `m.pending` — keep compiling and keep their exact behaviour. Those fields are
+  declared absent on the reasoning arm, so they answer `undefined`, and comparing
+  one against a literal narrows to `ChatBubble`;
+- **never** construct a reasoning entry with a `role`. The wire carries none and
+  inventing one puts a fabricated author in the system of record; the type makes
+  it a compile error.
+
+`state.reasoning` keeps its `ReasoningItem[]` shape, so code that only reads it
+needs no edit — but it is now **derived** from `state.messages` rather than
+separately maintained, and the previous 100-item cap is **gone** (the durable
+view is uncapped; a live cap made a reload disagree with what was watched).
+
+Whether reasoning survives a reload is an agent-side opt-in
+(`channels.webchannel.capabilities.reasoningDurable`, default **off**). With it
+off the lane still renders live and a reload shows none of it.
+
 ### Terminal connection causes
 
 `WebChannelState.errorCause` distinguishes failures that need re-authentication

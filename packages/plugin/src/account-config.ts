@@ -517,9 +517,17 @@ export function resolveReasoningEnabled(accountConfig: WebchannelAccountConfig):
  * **#113's default-ON was a decision to render a volatile live lane, and it does
  * not inherit to a decision to permanently record plaintext to disk.** Those are
  * two different questions with two different blast radii:
- *  - the LANE is ephemeral. It is drawn, the turn ends, the client's own
- *    `state.reasoning` is capped and eventually dropped, and nothing survives a
- *    reload. Defaulting it ON costs a UI section;
+ *  - the LANE is ephemeral: it is drawn, and with durability OFF nothing of it
+ *    survives a reload. Defaulting it ON costs a UI section.
+ *    ⚠️ THIS BULLET USED TO SAY "the client's own `state.reasoning` is capped
+ *    and eventually dropped, and nothing survives a reload", and #242 half 2
+ *    falsified BOTH clauses — four lines above the paragraph that was rewritten
+ *    for exactly this reason. The `.slice(-100)` cap is GONE (`upsertReasoning`
+ *    was deleted; `state.reasoning` is derived from `state.messages` and
+ *    uncapped), and for an OPTED-IN account a reload does replay it. The
+ *    ephemerality that survives is conditional on the opt-in being off, which is
+ *    the distinction this whole docblock is drawing — so the sentence had to
+ *    name it rather than assert the old absolute;
  *  - the JOURNAL is permanent plaintext on disk. `resolveReasoningEnabled` one
  *    function up already treats this content as sensitive for the SAME reason,
  *    in its own words: reasoning "can restate file contents, credentials, or the
@@ -529,14 +537,22 @@ export function resolveReasoningEnabled(accountConfig: WebchannelAccountConfig):
  *    and note there is no retention path yet (**#299** is unshipped), so nothing
  *    ages out.
  *
- * ⚠️ AND THE BENEFIT SIDE IS CURRENTLY ZERO, WHICH IS WHAT DECIDES IT. #242
- * half 1 is server-side only: `journal-history.ts` drops reasoning when it
- * builds the `history` frame, because `HistoryMessage.role` cannot express a
- * role-less message. So until half 2/3 lands there is NO client that can read
- * these rows back. A window with a real cost and zero benefit has no trade-off
- * to weigh, so it takes the cheapest reversible direction: off, with an
- * operator opt-IN. Revisit the default when half 2/3 makes the content
- * readable — that is when this argument expires, not before.
+ * ⚠️ THE "BENEFIT SIDE IS CURRENTLY ZERO" ARGUMENT HAS EXPIRED — AND THE
+ * DEFAULT STILL DOES NOT MOVE IN THIS SLICE. Half 1 justified the opt-in partly
+ * on the ground that nothing could read the rows back: the projection dropped
+ * reasoning because the wire row's `role` could not express a role-less message,
+ * so the window had a real cost and no benefit at all. #242 half 2 widened the
+ * wire row into a tagged union, emitted reasoning, and moved the client render
+ * onto the shared reducer — so the rows ARE readable now and that half of the
+ * argument is gone.
+ *
+ * What is left is the half that decided it anyway, and it is untouched: the
+ * JOURNAL is permanent plaintext on disk, holding content the user never chose
+ * to publish, with no retention path (**#299** is unshipped). Turning that on by
+ * default is not a rendering decision, so it is not #113's to inherit. Changing
+ * the default is a deliberate privacy call — **#306** owns it, and it is OPEN —
+ * not a consequence of half 2 shipping. Do not read "the reason is stale" as
+ * "the default is wrong".
  *
  * ⚠️ SEPARATE SWITCH, BUT NOT AN INDEPENDENT ONE — THE DEPENDENCY RUNS ONE WAY
  * AND IT IS SILENT. This resolver's `true` is NECESSARY BUT NOT SUFFICIENT.
@@ -544,9 +560,16 @@ export function resolveReasoningEnabled(accountConfig: WebchannelAccountConfig):
  * `resolveReasoningEnabled` (plus `!controlLane` and no session `/reasoning
  * off`) says the LANE is open, and the journal hook sits on the outbound frame
  * funnel — so with the lane closed there are no `reasoning` frames to map, and
- * `capabilities.reasoningDurable: true` writes ZERO ROWS with no warning. The
+ * `capabilities.reasoningDurable: true` writes ZERO ROWS.
+ *
+ * ✅ IT IS NO LONGER SILENT. This used to end "with no warning… the
  * opted-in-lane-received-nothing diagnostic does not fire either; it only
- * watches lanes that OPENED.
+ * watches lanes that OPENED." That second sentence is still true, and #242
+ * half 2 added the counterpart it exposes: `nats-account-runtime.ts` warns once
+ * per account start when `reasoningDurable` is on and `resolveReasoningEnabled`
+ * is off, naming both keys and which one to change. A peer's own persisted
+ * `/reasoning off` is still silent, deliberately — that one is a user choice,
+ * not an operator mistake.
  *
  * So "record the deliberation but do not stream it to browser peers" is NOT a
  * configuration these two keys can express, and the asymmetry is inherent
