@@ -84,3 +84,29 @@ approach flipped repeatedly at the spec level. To stop the oscillation:
 - **Before declaring anything "core-limited / structural / impossible / the spec,"**
   check the NOT-list (§0.2) and read how core's built-in Telegram extension
   (`extensions/telegram/src/` in the pinned core clone) does it on the same core.
+
+---
+
+# Test evidence comes from CI — do not run the full suite locally
+
+`npm test` is a **full sweep** — for its current scale read
+`.github/test-inventory.json`, which the gate checks exactly and which therefore
+cannot go stale. The size is not what makes it dangerous, though;
+`vitest.config.ts` is: `pool: 'forks'` with isolation and no `maxForks` cap, so it
+forks one process per core and holds them for the whole run. Several worktrees are
+usually in flight here, and the dev box has no swap — parallel sweeps have
+OOM-killed it. So:
+
+- **Push, and read `e2e-gate.yml`'s result for that SHA.** That is the verification
+  evidence: bound to the pushed commit, not to an edited working tree, and it
+  survives the session. Push first and read the diff while it runs.
+- **Locally, run only what the pipeline cannot see, and only narrowly** — named
+  files (`npx vitest run packages/plugin/src/foo.test.ts`), an uncommitted-state
+  probe, or one failure you are reproducing. `npm run typecheck`, `test:inventory`,
+  and `lint:citations` are cheap and stay fine.
+- **Never write a full local sweep into a subagent's completion criteria.** Name
+  the specific test files instead. This is the rule that actually gets violated:
+  one sweep is survivable, four concurrent ones are not.
+- A stacked PR gets no gate run (`pull_request` matches the BASE) — mirror the
+  commit to a `feature/**` branch and read that run. Don't substitute a local
+  sweep for the missing CI run.
