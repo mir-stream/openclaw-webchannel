@@ -42,15 +42,63 @@ async function all(ledger: BrowserCredentialLedger, natsAccountPublicKey: string
   }
 }
 
+/**
+ * `exp - iat` is one of exactly TWO values — never a range, and never wrong by
+ * more than a second. Issuance reads two different clocks:
+ *
+ *   - `exp` = OUR clock read + `ttlSeconds`, in `mintNatsUserCreds`
+ *     (`nats-user-creds.ts`, the `opts.ttlSeconds` line);
+ *   - `iat` = the JWT LIBRARY's own clock read, taken strictly later — inside
+ *     `@nats-io/jwt`'s `encode()`.
+ *
+ * The GUARANTEED invariant is the one-sided one: because the library reads
+ * second, `iat >= ourClock`, therefore `exp - iat <= ttlSeconds`. The gap
+ * between the two reads is a few function calls, so it crosses at most one
+ * second boundary — hence exactly two admitted values. A long enough stall
+ * would cost more than one second; #312 carries the measured series.
+ *
+ * No formula for the skew is stated here on purpose. Two successive review
+ * rounds produced two different wrong ones — `can only ever cost one`, then
+ * `ceil(gap_ms / 1000)` — the second written to correct the first. The
+ * derivation is what keeps being wrong; the two facts the assertion actually
+ * rests on are the direction and one-boundary-in-practice.
+ *
+ * WHY THIS IS ACCEPTABLE rather than a bug to chase: the error has a DIRECTION,
+ * and it is the safe one. The credential expires at most as late as configured
+ * and typically a second EARLY, never late — it can never outlive the TTL it
+ * was configured with. A credential that dies a second sooner than asked is a
+ * non-event; one that outlived its TTL would be a security finding. That
+ * asymmetry is the whole argument for tolerating it.
+ *
+ * Deliberately NOT a tolerance (`>= ttl - 5` and friends): a divergence beyond
+ * the one-boundary case means something else is wrong and must still go red.
+ *
+ * DEBUGGING A `ttl - 2` RED: that is not a product change and there is no
+ * phantom regression to chase. It means more than a wall-clock second elapsed
+ * between the two clock reads — an environment stall (a contended runner, a GC
+ * pause) — because the direction of the skew is still the safe one.
+ *
+ * The exact fix — one clock read feeding both — is blocked by the library:
+ * `encodeUser` accepts no explicit `iat` (@nats-io/jwt v0.0.10-5). See
+ * #312 (the @nats-io/jwt `iat` limitation) — if that ever
+ * changes, pass one captured clock read to both and tighten these back to an
+ * exact `toBe`. The version matters: this is a claim about v0.0.10-5 and it
+ * rots the moment the dependency moves.
+ */
+const expectTtlWithinOneSecond = (expSec: number, iatSec: number, ttlSeconds: number): void => {
+  expect([ttlSeconds - 1, ttlSeconds]).toContain(expSec - iatSec);
+};
+
 describe("issueBrowserCredentials × BrowserCredentialLedger", () => {
   it("records exactly one secret-free record per issuance, with the JWT's own sub/iat/exp", async () => {
     const built = await chain();
     const ledger = ledgerOf();
+    const ttlSeconds = 3600;
     const creds = await issueBrowserCredentials({
       accountSeed: built.private.natsAccountSeed,
       tenant: "tenant-x",
       peerId: "peer-1",
-      ttlSeconds: 3600,
+      ttlSeconds,
       ledger,
       accountContext: "session-abc",
     });
@@ -62,9 +110,16 @@ describe("issueBrowserCredentials × BrowserCredentialLedger", () => {
     const payload = JSON.parse(Buffer.from(creds.userJwt.split(".")[1] as string, "base64url").toString());
     expect(record?.userPubkey).toBe(creds.userPubkey);
     expect(record?.userPubkey).toBe(payload.sub);
+    // These two CANNOT flake, and that is worth stating so the next reader of a
+    // red does not suspect all three. `issueBrowserCredentials` builds the row
+    // by copying `issuedAtSec: claim.iat` / `expiresAtSec: claim.exp` straight
+    // out of `decodeMintedUserClaim`'s decode of the real JWT, so the ledger has
+    // no independent clock and cannot disagree with the credential.
     expect(record?.issuedAtSec).toBe(payload.iat);
     expect(record?.expiresAtSec).toBe(payload.exp);
-    expect(record?.expiresAtSec).toBe(payload.iat + 3600);
+    // Only THIS line is exposed to the two-clock skew — it is the one place the
+    // record is checked against a value derived from the OTHER clock read.
+    expectTtlWithinOneSecond(record?.expiresAtSec as number, payload.iat, ttlSeconds);
     expect(record?.tenant).toBe("tenant-x");
     expect(record?.peerId).toBe("peer-1");
     expect(record?.accountContext).toBe("session-abc");
@@ -107,11 +162,12 @@ describe("issueBrowserCredentials × BrowserCredentialLedger", () => {
     const payload = JSON.parse(Buffer.from(creds.userJwt.split(".")[1] as string, "base64url").toString());
     const record = await ledger.get(creds.userPubkey);
     expect(creds.permissions.pub).toEqual(["webchannel.tenant-original.*.peer-original.>"]);
-    // `exp` is computed immediately before the async encoder stamps `iat`, so
-    // a saturated test worker can cross a wall-clock second between the two.
-    // The original one-hour TTL remains unmistakable from the mutated 0.5s.
-    expect(payload.exp - payload.iat).toBeGreaterThan(3_500);
-    expect(payload.exp - payload.iat).toBeLessThanOrEqual(3_600);
+    // Same two-clock skew as above, and pinned the same way. This was a loose
+    // tolerance (`> 3500`); it is tightened to the two values the skew can
+    // actually produce, because a loose form sitting next to the exact one is
+    // what the next person copies. The original one-hour TTL stays unmistakable
+    // from the mutated 0.5s either way.
+    expectTtlWithinOneSecond(payload.exp, payload.iat, 3_600);
     expect(record).toMatchObject({
       tenant: "tenant-original",
       peerId: "peer-original",
