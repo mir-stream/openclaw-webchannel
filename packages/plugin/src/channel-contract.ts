@@ -218,7 +218,24 @@ export type ApprovalRequestPayload = {
 export type InboundWsMessage =
   | { type: "user_message"; text: string; id?: string }
   | { type: "approval_decision"; id: string; decision: ApprovalDecision }
-  | { type: "load_history"; before?: string; limit?: number }
+  /**
+   * Page older history.
+   *
+   * `beforeTurnId` COMPLETES THE CURSOR, and it is strictly ADDITIVE (#320).
+   * `before` alone names a row by id, which was sufficient while every projected
+   * row carried a globally unique plugin-minted id. A TOOL row does not — it is
+   * addressed by the PAIR `(turnId, id)` everywhere the view keys on it
+   * (`durable-view-reducer.ts`'s `applyTool` upserts on exactly that pair), so
+   * an id-only cursor can name two rows and `historyPageBefore` then refuses it
+   * as ambiguous. Sending the pair resolves it.
+   *
+   * OMITTING IT IS SUPPORTED AND UNCHANGED — an older peer that sends only
+   * `before` gets exactly the id-only behaviour, ambiguity guard included
+   * (`demo/web/src/history-paging.test.ts` measures that rather than asserting
+   * it). Newer peers set it only for a tool cursor; a reasoning or bubble id is
+   * `nextMessageId()`-minted and globally unique, so pairing adds nothing there.
+   */
+  | { type: "load_history"; before?: string; beforeTurnId?: string; limit?: number }
   | { type: "load_commands" };
 
 export type OutboundWsMessage =

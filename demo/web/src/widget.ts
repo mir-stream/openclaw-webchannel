@@ -541,9 +541,13 @@ export async function createWidget(
   // ── Wiring ────────────────────────────────────────────────────────────────
   historyBtn.onclick = () => {
     // The pick is `presentation.ts`'s `oldestHistoryCursor`; the paging LOOP it
-    // participates in is driven end to end by `history-paging.test.ts`.
+    // participates in is driven end to end by `history-paging.test.ts`. It
+    // returns an IDENTITY — `turnId` is set for a tool cursor only, and both
+    // halves go on the wire (#320).
+    const cursor = client ? oldestHistoryCursor(client.getState().messages) : undefined;
     client?.loadHistory({
-      before: oldestHistoryCursor(client.getState().messages),
+      before: cursor?.id,
+      beforeTurnId: cursor?.turnId,
       // Shared with `history-paging.test.ts`; see `HISTORY_PAGE_SIZE`.
       limit: HISTORY_PAGE_SIZE,
     });

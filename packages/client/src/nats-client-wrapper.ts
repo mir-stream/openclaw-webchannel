@@ -89,7 +89,7 @@ type DeferredReplacementOperation =
       receiptKey: string;
     }
   | { kind: "approval-decision"; id: string; decision: ApprovalDecision }
-  | { kind: "load-history"; before?: string; limit?: number }
+  | { kind: "load-history"; before?: string; beforeTurnId?: string; limit?: number }
   | { kind: "load-commands" };
 
 function normalizeAssistantMessageIndex(value: unknown): number | undefined {
@@ -1348,7 +1348,7 @@ export class WebChannelNATSClient {
       return;
     }
     if (entry.kind === "load-history") {
-      this.client.loadHistory(entry.before, entry.limit);
+      this.client.loadHistory(entry.before, entry.limit, entry.beforeTurnId);
       return;
     }
     if (entry.kind === "load-commands") {
@@ -2031,10 +2031,21 @@ export class WebChannelNATSClient {
     if (!deferred) this.deferOrRunReplacementOperation(operation);
   }
 
-  /** Request history page */
-  loadHistory(request?: { before?: string; limit?: number }): void {
+  /**
+   * Request history page.
+   *
+   * `beforeTurnId` completes the cursor when `before` names a TOOL row, which is
+   * identified by the pair `(turnId, id)` — an id-only cursor over a repeated
+   * tool id is ambiguous and the server refuses it (#320). Optional and additive:
+   * omitting it is the id-only cursor. `demo/web/src/presentation.ts`'s
+   * `oldestHistoryCursor` is the reference picker.
+   */
+  loadHistory(request?: { before?: string; beforeTurnId?: string; limit?: number }): void {
     this.deferOrRunReplacementOperation({
-      kind: "load-history", before: request?.before, limit: request?.limit,
+      kind: "load-history",
+      before: request?.before,
+      beforeTurnId: request?.beforeTurnId,
+      limit: request?.limit,
     });
   }
 

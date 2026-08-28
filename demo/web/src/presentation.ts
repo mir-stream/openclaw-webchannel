@@ -204,9 +204,26 @@ export function orderConversationPresentation(
 export const HISTORY_PAGE_SIZE = 20;
 
 /**
- * The `before` cursor for a "load older" request: the id of the OLDEST entry
- * this device holds that the server could plausibly resolve, or `undefined` to
- * ask for the tail.
+ * The `before` cursor for a "load older" request: the IDENTITY of the OLDEST
+ * entry this device holds that the server could plausibly resolve, or
+ * `undefined` to ask for the tail.
+ *
+ * ⚠️ IT RETURNS AN IDENTITY, NOT A BARE ID (#320). A tool row is addressed by the
+ * PAIR `(turnId, id)` everywhere the view keys on it — `applyTool` upserts on
+ * exactly that pair — and a tool id is turn-local on both of its paths, so an
+ * id-only cursor over one can name two rows and `historyPageBefore` refuses it as
+ * ambiguous. That refusal is honest but it STOPS paging, which is the regression
+ * #320 repairs: `turnId` travels with the id and the pair resolves.
+ *
+ * ⚠️ `turnId` IS POPULATED FOR `kind === "tool"` ONLY, AND THAT IS DELIBERATE.
+ * A reasoning row also carries a `turnId`, but its id is `nextMessageId()`-minted
+ * (`message-adapter.ts`) and therefore globally unique, so pairing it buys no
+ * disambiguation while adding a second field that must agree with the projection
+ * for the cursor to resolve at all. Narrower cursor, same reach.
+ *
+ * ⚠️ AND NO KIND IS SKIPPED — the pick still returns the oldest entry whatever it
+ * is. Skipping a kind is the deadlock documented at length below; carrying an
+ * extra field is not skipping.
  *
  * Extracted from `widget.ts`'s `historyBtn.onclick` so the paging LOOP is
  * testable end to end — see `history-paging.test.ts`, which drives this picker
@@ -232,8 +249,10 @@ export const HISTORY_PAGE_SIZE = 20;
  * The property that makes a reasoning id safe was verified against the REAL
  * pager rather than assumed: a reasoning id is PLUGIN-minted, appears in the
  * projection WHEN THE ACCOUNT OPTED INTO `capabilities.reasoningDurable`, and
- * `historyPageBefore` resolves by `findIndex` over the emitted list without ever
- * reading `kind`.
+ * `historyPageBefore` resolves by `findIndex` over the emitted list with no
+ * policy branch on `kind` — every variant is served by the same rule. (Since
+ * #320 it reads `kind` to find a row's `turnId`; that is a field lookup on a
+ * discriminated union, not a preference between kinds.)
  *
  * ⚠️ THAT QUALIFIER IS NOT A HEDGE — the opt-in DEFAULTS OFF, so in the default
  * configuration a live reasoning id is in NO projection at all. Stating it
@@ -253,8 +272,12 @@ export const HISTORY_PAGE_SIZE = 20;
  */
 export function oldestHistoryCursor(
   messages: readonly ChatMessage[],
-): string | undefined {
-  return messages.find((m) => !m.working && !m.pending && !m.retracted)?.id;
+): { id: string; turnId?: string } | undefined {
+  const oldest = messages.find((m) => !m.working && !m.pending && !m.retracted);
+  if (!oldest) return undefined;
+  return oldest.kind === "tool"
+    ? { id: oldest.id, turnId: oldest.turnId }
+    : { id: oldest.id };
 }
 
 /**

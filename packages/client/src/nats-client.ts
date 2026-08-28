@@ -301,7 +301,10 @@ export type OutboundMessage =
   // typed optional to mirror the wire union (older clients omit it).
   | { type: "user_message"; text: string; id?: string }
   | { type: "approval_decision"; id: string; decision: string }
-  | { type: "load_history"; before?: string; limit?: number }
+  // #320: `beforeTurnId` completes the page cursor for a TOOL row, which is
+  // addressed by the pair `(turnId, id)`. Additive — omitting it is the id-only
+  // cursor every older peer sends.
+  | { type: "load_history"; before?: string; beforeTurnId?: string; limit?: number }
   // P0-3: request the slash-command discovery catalog.
   | { type: "load_commands" };
 
@@ -1522,9 +1525,16 @@ export class WebChannelNatsClient {
     this.enqueue({ type: "approval_decision", id, decision });
   }
 
-  /** Request history page (buffered until the handshake completes). */
-  loadHistory(before?: string, limit?: number): void {
-    this.enqueue({ type: "load_history", before, limit });
+  /**
+   * Request history page (buffered until the handshake completes).
+   *
+   * `beforeTurnId` is LAST rather than beside `before` on purpose: the two-arg
+   * form is this class's shipped public signature, and appending keeps every
+   * existing call site compiling and behaving identically. Pass it only for a
+   * tool cursor — see `channel-contract.ts`'s `load_history` member.
+   */
+  loadHistory(before?: string, limit?: number, beforeTurnId?: string): void {
+    this.enqueue({ type: "load_history", before, beforeTurnId, limit });
   }
 
   /** Request the slash-command catalog (buffered until the handshake completes). */

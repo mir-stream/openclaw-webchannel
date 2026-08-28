@@ -304,7 +304,10 @@ export class NatsChannel implements WebChannelPeerChannel {
   // Message handlers
   private onMessage?: (peerId: string, message: InboundWsMessage) => void;
   private onApprovalDecision?: (peerId: string, id: string, decision: ApprovalDecision) => void;
-  private onLoadHistory?: (peerId: string, request: { before?: string; limit?: number }) => void;
+  private onLoadHistory?: (
+    peerId: string,
+    request: { before?: string; beforeTurnId?: string; limit?: number },
+  ) => void;
   private onLoadCommands?: (peerId: string) => void;
   private onPeerUnregister?: (peerId: string) => void;
   /** Bounded, content-free configuration-warning state for result max_payload. */
@@ -832,7 +835,10 @@ export class NatsChannel implements WebChannelPeerChannel {
    * Set history load handler.
    */
   setLoadHistoryHandler(
-    handler: (peerId: string, request: { before?: string; limit?: number }) => void
+    handler: (
+      peerId: string,
+      request: { before?: string; beforeTurnId?: string; limit?: number },
+    ) => void
   ): void {
     this.onLoadHistory = handler;
   }
@@ -1442,7 +1448,14 @@ export class NatsChannel implements WebChannelPeerChannel {
         break;
 
       case "load_history":
-        this.onLoadHistory?.(peerId, { before: message.before, limit: message.limit });
+        // Forwarded UNVALIDATED, as `before`/`limit` always were —
+        // `planHistoryFetch` is the one validator on this path and
+        // `historyPageBefore` treats a non-matching pair as an honest miss.
+        this.onLoadHistory?.(peerId, {
+          before: message.before,
+          beforeTurnId: message.beforeTurnId,
+          limit: message.limit,
+        });
         break;
 
       case "load_commands":

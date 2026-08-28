@@ -65,19 +65,37 @@ function deliver(client: WebChannelNATSClient, frame: AnyFrame): void {
  */
 const WIDGET_LIMIT = HISTORY_PAGE_SIZE;
 
+/** The cursor identity the picker returns — `turnId` set for a tool row only. */
+type Cursor = { id: string; turnId?: string } | undefined;
+
+/**
+ * A cursor as a comparable VALUE.
+ *
+ * ⚠️ IT EXISTS SO THE "THE CURSOR MOVED" CHECKS STAY NON-VACUOUS. #320 turned
+ * the picker's return into an object, and `new Set([...objects]).size` counts
+ * IDENTITIES — every click would look like a new cursor and a total stall would
+ * pass. Comparing the flattened pair is what actually measures movement.
+ */
+function cursorKey(cursor: Cursor): string {
+  return cursor === undefined ? "<none>" : `${cursor.turnId ?? "-"}/${cursor.id}`;
+}
+
 /**
  * One "load older" click: pick the cursor the way the widget does, serve the
  * page the way the plugin does, merge it the way the client does.
+ *
+ * Both halves of the cursor travel, exactly as `widget.ts` sends them — an
+ * id-only call here would test a wire the widget no longer speaks.
  */
 function clickLoadOlder(
   client: WebChannelNATSClient,
   projection: readonly ProjectedHistoryMessage[],
-): { cursor: string | undefined; page: string[] } {
+): { cursor: Cursor; page: string[] } {
   const cursor = oldestHistoryCursor(client.getState().messages);
   const page =
     cursor === undefined
       ? []
-      : historyPageBefore(projection, cursor, WIDGET_LIMIT);
+      : historyPageBefore(projection, cursor.id, WIDGET_LIMIT, cursor.turnId);
   deliver(client, { type: "history", messages: page });
   return { cursor, page: page.map((m) => m.id) };
 }
@@ -179,9 +197,9 @@ describe('"load older" reaches the start of the conversation', () => {
     // The device has watched the live turn's last answer and nothing else.
     deliver(client, { type: "agent_message", id: "A", turnId: TURN, text: "because" });
 
-    const cursors: Array<string | undefined> = [];
+    const cursors: string[] = [];
     for (let click = 0; click < 5; click++) {
-      cursors.push(clickLoadOlder(client, projection).cursor);
+      cursors.push(cursorKey(clickLoadOlder(client, projection).cursor));
       if (ids(client).includes("u0")) break;
     }
 
@@ -223,8 +241,10 @@ describe('"load older" reaches the start of the conversation', () => {
 
   it("a reasoning id IS a resolvable cursor — the property the fix rests on", () => {
     // Verified against the REAL pager rather than assumed: `historyPageBefore`
-    // resolves by `findIndex` over the emitted list and never reads `kind`, so a
-    // plugin-minted reasoning id pages exactly like a bubble id.
+    // resolves by `findIndex` over the emitted list with no policy branch on
+    // `kind`, so a plugin-minted reasoning id pages exactly like a bubble id —
+    // and it does so from an ID ALONE, which is why the picker sends no `turnId`
+    // for one (#320).
     const projection = projectionWithReasoningRun(3);
     expect(historyPageBefore(projection, "r2", 10).map((m) => m.id)).toEqual(["u0", "r1"]);
     // The honest miss is unchanged, and it is not new to reasoning: a published
@@ -234,24 +254,28 @@ describe('"load older" reaches the start of the conversation', () => {
     expect(historyPageBefore(projection, "u-0", 10)).toEqual([]);
   });
 
-  it("an AMBIGUOUS tool cursor never silently skips the rows between the two matches", () => {
-    // ⚠️ THE REGRESSION TEST FOR THE THIRD CURSOR OUTCOME (#242 half 3). Tool ids
-    // are TURN-LOCAL on BOTH paths — `createAgentToolActivitySink` is built per
-    // inbound turn, so the generated sequence restarts and can mint
-    // `tool-activity-1` again in a turn that took the id-less path, and an
-    // upstream `toolCallId`/`itemId` is documented run-local too — while the
-    // paging cursor carries an ID ALONE. Resolving it with a bare `findIndex`
-    // picks the OLDER match and serves the slice ending THERE, so everything
-    // between the two matches is skipped and the client renders one continuous
-    // conversation with no gap marker. Measured before the guard:
+  it("a REPEATED tool id is paged past, not stopped at — the composite cursor (#320)", () => {
+    // ⚠️ THE REGRESSION TEST FOR THE TOOL CURSOR. Tool ids are TURN-LOCAL on BOTH
+    // paths — `createAgentToolActivitySink` is built per inbound turn, so the
+    // generated sequence restarts and can mint `tool-activity-1` again in a turn
+    // that took the id-less path, and an upstream `toolCallId`/`itemId` is
+    // documented run-local too. So one ID can name two rows, and the two wrong
+    // answers to that are both measured facts of this fixture:
     //
-    //   click 1: cursor="tool-activity-1"  page=["u0"]   <- resolved to the OLDER match
-    //   click 2..5: cursor="u0"            page=[]
-    //   final client transcript: ["u0","tool-activity-1","A"]   (m1, m2 unreachable)
+    //   bare `findIndex` (no guard):  click 1 served ["u0"] anchored at the OLDER
+    //     match, m1/m2 skipped with no gap marker — a dropped RANGE (N10).
+    //   id-only cursor + guard (#242 half 3): every click answered [], the cursor
+    //     never left "tool-activity-1", and u0/m1/m2 were UNREACHABLE. Honest,
+    //     but a paging stop — the base regression this test now pins closed.
     //
-    // A dropped RANGE that looks contiguous is worse than an honest stop (N10),
-    // so `historyPageBefore` refuses an ambiguous cursor exactly as it refuses one
-    // that is not in the projection at all.
+    // The cursor carries the PAIR `(turnId, id)` — the identity `applyTool`
+    // already keys on — so the anchor resolves to the row the client actually
+    // holds and paging continues.
+    //
+    // ⚠️ REACHABILITY IS THE PROPERTY, NOT CONTIGUITY. An earlier revision of this
+    // test asserted only that the held span was contiguous, which SERVING NOTHING
+    // satisfies — that is exactly how it stayed green across the stall. The
+    // assertions below are about which rows ARRIVED.
     const projection = projectionWithRepeatedToolId();
     const client = newClient();
     // The device watched the SECOND turn live: the tool call, then the answer.
@@ -272,55 +296,58 @@ describe('"load older" reaches the start of the conversation', () => {
     });
     deliver(client, { type: "agent_message", id: "A", turnId: TURN_B, text: "because" });
 
-    // Non-vacuity: the widget really does hand us the AMBIGUOUS id. If the picker
-    // ever stops choosing it this test would pass while measuring nothing — and
-    // making it stop is itself forbidden (skipping tool rows reinstates the
-    // deadlock the cases above pin).
+    // Non-vacuity: the widget really does hand us the REPEATED id, paired with
+    // the turn the device actually watched. If the picker ever stopped choosing
+    // it this test would pass while measuring nothing — and making it stop is
+    // itself forbidden (skipping tool rows reinstates the deadlock the cases
+    // above pin).
     const first = clickLoadOlder(client, projection);
-    expect(first.cursor).toBe(REPEATED_TOOL_ID);
-    const later = [first];
-    for (let click = 0; click < 4; click++) later.push(clickLoadOlder(client, projection));
+    expect(first.cursor).toEqual({ id: REPEATED_TOOL_ID, turnId: TURN_B });
 
-    // ── TWO ASSERTIONS, MEASURING DIFFERENT THINGS ──
-    //
-    // (a) THE PROPERTY. Whatever the client ends up holding is a CONTIGUOUS span
-    //     of the projection. `["u0", tool, "A"]` — the first row plus the last
-    //     two, with `m1`/`m2` missing and nothing marking the hole — is the
-    //     corruption, and it is exactly what a bare `findIndex` produced.
+    // ── (a) REACHABILITY — the page ARRIVED, and it is the right one. ──
+    // Anchored at the SECOND turn's row, so the four older rows come back. A
+    // page of `[]` (the stall) or of `["u0"]` (the older-match mis-anchor) both
+    // fail here, which is what distinguishes this from the contiguity check.
+    expect(first.page).toEqual(["u0", REPEATED_TOOL_ID, "m1", "m2"]);
+
+    const clicks = [first];
+    for (let click = 0; click < 4 && !ids(client).includes("u0"); click++) {
+      clicks.push(clickLoadOlder(client, projection));
+    }
+    // The start of the conversation is reached, and `m1`/`m2` — which exist
+    // nowhere but that span — are held. Whole projection, in order, once each.
+    expect(ids(client)).toContain("u0");
+    expect(ids(client)).toEqual(projection.map((m) => m.id));
+
+    // One click was enough — recorded, because a fix that needed five would be a
+    // different behaviour wearing the same green.
+    expect(clicks).toHaveLength(1);
+    // The cursor MOVED off the repeated id (compared by value — see `cursorKey`).
+    const afterwards = clickLoadOlder(client, projection);
+    expect(cursorKey(afterwards.cursor)).not.toBe(cursorKey(first.cursor));
+    // And the top of the conversation is an honest stop, not a loop.
+    expect(afterwards.page).toEqual([]);
+
+    // ── (b) CONTIGUITY — retained, as the weaker companion property. It cannot
+    //     substitute for (a): serving nothing satisfies it too.
     const span = projectionSpan(projection, client);
     // Every held row is a projection row (an unlocatable one would make the
     // contiguity check vacuous rather than false).
     expect(span.every((i) => i >= 0)).toBe(true);
     expect(span).toEqual(span.map((_, k) => span[0] + k));
-
-    // (b) ⚠️ AND (a) ON ITS OWN IS VACUOUS — WHICH IS WHY THE REST OF THIS BLOCK
-    //     EXISTS. Serving NOTHING AT ALL satisfies contiguity too, so (a) cannot
-    //     tell "the guard works" from "paging is dead". What follows is a
-    //     CHARACTERIZATION: it RECORDS today's behaviour, it does not endorse it.
-    //     MEASURED — the cursor never moves off the ambiguous id, every click
-    //     answers `[]`, and the client is left holding exactly the two rows it
-    //     watched live. So `u0`, `m1` and `m2` are UNREACHABLE, not merely
-    //     un-skipped: the rows BEFORE an ambiguous cursor cannot be paged to at
-    //     all. That is the price of the honest stop, and the repair is a
-    //     composite `(turnId, id)` cursor — **#320**, not this test.
-    //
-    //     ⚠️ THIS IS MEANT TO GO RED WHEN #320 LANDS, and that is the point of
-    //     writing it as an EXACT transcript rather than a `toContain`. A fix that
-    //     restores reach makes this list grow; the test must then be UPDATED to
-    //     the new reach, never relaxed. A change in reach — gained or lost — must
-    //     not be able to pass silently.
-    expect(later.map((r) => r.cursor)).toEqual(new Array(5).fill(REPEATED_TOOL_ID));
-    expect(later.map((r) => r.page)).toEqual([[], [], [], [], []]);
-    expect(ids(client)).toEqual([REPEATED_TOOL_ID, "A"]);
   });
 
-  it("`historyPageBefore` resolves an ambiguous cursor to no page at all", () => {
-    // The unit-level statement of the same rule, against the real pager: a
-    // duplicated id is UNRESOLVABLE, which is the empty page a miss already gets.
-    // The guard is not tool-specific — it fires on any repeated id — but tool is
-    // the kind that makes repetition ordinary.
+  it("an OLDER PEER — `before` alone, no `beforeTurnId` — gets exactly today's behaviour", () => {
+    // ⚠️ THE WIRE-ADDITIVITY CLAIM, MEASURED RATHER THAN ASSERTED. `beforeTurnId`
+    // is optional on the wire, so a peer that predates #320 sends the id-only
+    // cursor — which is the 3-argument call below. It must resolve exactly as it
+    // did before this slice: the ambiguity guard fires and the page is empty.
+    // (Honest, and still a stop — that is precisely why the CLIENT was taught to
+    // send the pair rather than the server taught to guess.)
     const projection = projectionWithRepeatedToolId();
     expect(historyPageBefore(projection, REPEATED_TOOL_ID, 20)).toEqual([]);
+    // An explicitly-undefined 4th argument is the same request, not a third case.
+    expect(historyPageBefore(projection, REPEATED_TOOL_ID, 20, undefined)).toEqual([]);
     // Control: a unique id in the SAME projection still pages normally, so the
     // guard is not simply refusing everything.
     expect(historyPageBefore(projection, "m2", 20).map((m) => m.id)).toEqual([
@@ -328,6 +355,23 @@ describe('"load older" reaches the start of the conversation', () => {
       REPEATED_TOOL_ID,
       "m1",
     ]);
+
+    // And the composite is what changes the answer — both turns resolve, each to
+    // its own anchor. This is the pair of cases the id-only cursor cannot express.
+    expect(historyPageBefore(projection, REPEATED_TOOL_ID, 20, TURN).map((m) => m.id)).toEqual([
+      "u0",
+    ]);
+    expect(historyPageBefore(projection, REPEATED_TOOL_ID, 20, TURN_B).map((m) => m.id)).toEqual([
+      "u0",
+      REPEATED_TOOL_ID,
+      "m1",
+      "m2",
+    ]);
+    // A pair naming no row is the ordinary honest miss, like an unknown id.
+    expect(historyPageBefore(projection, REPEATED_TOOL_ID, 20, "t-absent")).toEqual([]);
+    // A `turnId` against a row that HAS none (the text variant carries no such
+    // field) is a miss too, not an accidental match on `undefined`.
+    expect(historyPageBefore(projection, "m2", 20, TURN_B)).toEqual([]);
   });
 
   it("still refuses a held or retracted bubble as the cursor (P1-9)", () => {
@@ -338,20 +382,53 @@ describe('"load older" reaches the start of the conversation', () => {
       { id: "u-2", role: "user", text: "not sent", retracted: true },
       { id: "A", role: "agent", text: "answer" },
     ];
-    expect(oldestHistoryCursor(held)).toBe("A");
+    expect(oldestHistoryCursor(held)).toEqual({ id: "A" });
     // A live progress draft is skipped for the same reason.
     expect(
       oldestHistoryCursor([
         { id: "B", role: "agent", text: "Working…", working: true, draftOnly: true },
         { id: "A", role: "agent", text: "answer" },
       ]),
-    ).toBe("A");
+    ).toEqual({ id: "A" });
     // A reasoning row is NOT skipped — see the stall cases above.
     expect(
       oldestHistoryCursor([
         { kind: "reasoning", id: "r1", turnId: TURN, text: "thinking" },
         { id: "A", role: "agent", text: "answer" },
       ]),
-    ).toBe("r1");
+    ).toEqual({ id: "r1" });
+  });
+
+  it("`turnId` rides the cursor for a TOOL row and for nothing else (#320)", () => {
+    // The picker returns an IDENTITY. A tool row is addressed by the pair, so
+    // both halves travel.
+    expect(
+      oldestHistoryCursor([
+        {
+          kind: "tool",
+          id: REPEATED_TOOL_ID,
+          turnId: TURN_B,
+          name: "read_file",
+          phase: "end",
+          status: "completed",
+        },
+        { id: "A", role: "agent", text: "answer" },
+      ]),
+    ).toEqual({ id: REPEATED_TOOL_ID, turnId: TURN_B });
+
+    // ⚠️ A REASONING ROW CARRIES A `turnId` TOO AND STILL MUST NOT PAIR IT. Its id
+    // is `nextMessageId()`-minted and globally unique, so pairing disambiguates
+    // nothing while adding a second field the projection must agree with for the
+    // cursor to resolve at all. `toEqual` would pass on a stray `turnId`
+    // (undefined-valued keys are ignored), so this is checked as a property.
+    const reasoning = oldestHistoryCursor([
+      { kind: "reasoning", id: "r1", turnId: TURN, text: "thinking" },
+      { id: "A", role: "agent", text: "answer" },
+    ]);
+    expect(reasoning?.turnId).toBeUndefined();
+    // A plain bubble has no `turnId` field at all in `ChatMessage`'s text arm.
+    expect(
+      oldestHistoryCursor([{ id: "A", role: "agent", text: "answer" }])?.turnId,
+    ).toBeUndefined();
   });
 });

@@ -990,25 +990,30 @@ export function recentHistoryPage(
  * a cursor the client cannot resolve", true because reasoning never reached the
  * emitted list. It does now, so a reasoning id CAN arrive as `beforeId`. What
  * replaces the guarantee is not a narrower one — it is the fact that this
- * function never depended on the row's KIND in the first place:
+ * function's POLICY never branched on the row's KIND, and still does not:
  *
- *  - RESOLUTION is `findIndex` by `id` over the SAME list the client was served,
- *    and the emitted list is the whole view. So any id from any page resolves,
- *    reasoning included. ⚠️ THIS BULLET ONCE ENDED "…and the slice ending at it
- *    is a well-formed page", which #242 half 3 made FALSE — see the third
- *    outcome below.
- *  - The MISS case is unchanged and is the one below: an id NOT in the
- *    projection returns `[]`. Reasoning adds no NEW class of miss — the client
- *    has always been able to hold ids the journal does not serve. A local user
- *    echo is one (`mintLocalBubbleId`'s `u-<n>`, while the accept seam journals
- *    the inbound WIRE id), and a live reasoning block on an account that did NOT
- *    opt into `capabilities.reasoningDurable` is now another.
+ *  - RESOLUTION is `findIndex` over the SAME list the client was served, matching
+ *    on `id` (plus `turnId` when the cursor carries one), and the emitted list is
+ *    the whole view. So any id from any page resolves, reasoning included.
+ *    ⚠️ `rowTurnId` DOES read `kind`, and that is not a policy branch — it is how
+ *    the discriminated union spells "does this variant have a `turnId` field".
+ *    No kind is preferred, skipped, or served differently.
+ *    ⚠️ THIS BULLET ONCE ENDED "…and the slice ending at it is a well-formed
+ *    page", which #242 half 3 made FALSE for an id-only cursor over a duplicated
+ *    id — see the outcomes below.
+ *  - The MISS case is unchanged and is the one below: an identity NOT in the
+ *    projection returns `[]` — an unknown id, and equally a pair whose `turnId`
+ *    matches no row bearing that id. Reasoning adds no NEW class of miss — the
+ *    client has always been able to hold ids the journal does not serve. A local
+ *    user echo is one (`mintLocalBubbleId`'s `u-<n>`, while the accept seam
+ *    journals the inbound WIRE id), and a live reasoning block on an account that
+ *    did NOT opt into `capabilities.reasoningDurable` is now another.
  *
  * The second bullet is a CLIENT-side cursor-choice concern, not a server one:
  * whatever the widget hands us, "not in the projection ⇒ no more history" is the
  * honest answer.
  *
- * ── ⚠️ THERE ARE NOW THREE OUTCOMES, NOT TWO: RESOLVE / MISS / AMBIGUOUS ──
+ * ── ⚠️ FOUR OUTCOMES: RESOLVE / RESOLVE-BY-PAIR / MISS / AMBIGUOUS ──
  *
  * WHY AMBIGUITY IS POSSIBLE AT ALL. Every other row carries a PLUGIN-minted id
  * (`nextMessageId()`'s `webchannel-<ms>-<rand>`), which is globally unique, and
@@ -1026,13 +1031,30 @@ export function recentHistoryPage(
  *    namespace: providers may reuse the same ids after fallback".
  *
  * So ambiguity is reachable either way. That is why a tool call is addressed by
- * the PAIR `(turnId, id)` everywhere the view keys on it. A CURSOR CARRIES ONLY
- * AN ID, so one cursor can name two rows.
+ * the PAIR `(turnId, id)` everywhere the view keys on it.
  *
- * ⚠️ AND THE GUARD IS NOT TOOL-SPECIFIC. It fires on ANY duplicated id in the
- * projection — a peer-echoed user id (**#293**: inbound user ids are
+ * ── RESOLVE-BY-PAIR: `beforeTurnId` (#320, IMPLEMENTED HERE) ──
+ *
+ * A cursor may now carry the other half of that identity, and when it does the
+ * match predicate is the PAIR rather than the id — which is how the tool cursor
+ * above resolves instead of being refused. `applyTool`
+ * (`durable-view-reducer.ts`) upserts on exactly `(kind === "tool", id, turnId)`,
+ * so at most ONE tool row per pair can exist in the view and therefore in this
+ * projection; that uniqueness is what makes the pair resolvable, and it is the
+ * only property this repair rests on.
+ *
+ * ⚠️ THE AMBIGUITY GUARD BELOW IS NOT REPLACED BY THIS — IT IS THE BACKSTOP.
+ * `beforeTurnId` is OPTIONAL (an older peer sends none), and even with one the
+ * pair is not a projection-wide unique key: a reasoning row and a tool row could
+ * in principle share both fields. The guard is applied to the SAME predicate the
+ * match uses, so it fires on whatever that predicate cannot separate.
+ *
+ * ⚠️ AND THE GUARD IS NOT TOOL-SPECIFIC. It fires wherever the cursor predicate
+ * matches twice — for an id-only cursor that is ANY duplicated id in the
+ * projection, and a peer-echoed user id (**#293**: inbound user ids are
  * client-supplied and validated only as non-empty strings) reaches it the same
- * way. It is a property of the cursor, not of the kind.
+ * way. It is a property of the cursor, not of the kind. The pair narrows the
+ * predicate; it does not make the guard a tool concern.
  *
  * AMBIGUOUS DEGRADES TO THE EMPTY PAGE, DELIBERATELY — the same answer a miss
  * gets. `findIndex` would silently resolve to the OLDER match and serve the
@@ -1043,14 +1065,16 @@ export function recentHistoryPage(
  * silently mis-anchored page is a dropped RANGE (N10) and is strictly worse than
  * an honest stop, so the ambiguity is refused rather than guessed.
  *
- * THE REAL REPAIR IS A COMPOSITE CURSOR — `(turnId, id)` on the wire, the same
- * identity the view already keys on — and it is **#320**, not this
- * function. Three repairs that look adjacent are NOT the fix and must not be
- * substituted: skipping tool rows in the widget's cursor pick reinstates half
- * 2's paging DEADLOCK (`presentation.ts`, and a 20-tool-call turn is ordinary);
- * making the generated ids unique fixes only the generated half and leaves
- * provider id reuse; and `findLastIndex` trades this hole for a STALL once the
- * client has paged past the newer duplicate.
+ * THE REAL REPAIR IS THE COMPOSITE CURSOR ABOVE — `(turnId, id)` on the wire,
+ * the same identity the view already keys on — and **#320 is implemented here**,
+ * so a peer that sends the pair pages past a duplicated id instead of stopping.
+ * The refusal remains the answer for a cursor that stays ambiguous. Three
+ * repairs that look adjacent are still NOT the fix and must not be substituted:
+ * skipping tool rows in the widget's cursor pick reinstates half 2's paging
+ * DEADLOCK (`presentation.ts`, and a 20-tool-call turn is ordinary); making the
+ * generated ids unique fixes only the generated half and leaves provider id
+ * reuse; and `findLastIndex` trades this hole for a STALL once the client has
+ * paged past the newer duplicate.
  *
  * ⚠️ AND THE OBVIOUS CLIENT-SIDE PRECAUTION IS A DEADLOCK — DO NOT SUGGEST IT.
  * An earlier revision of this paragraph ended "…which is why the oldest-cursor
@@ -1077,13 +1101,31 @@ export function historyPageBefore(
   messages: readonly ProjectedHistoryMessage[],
   beforeId: string,
   limit: number,
+  beforeTurnId?: string,
 ): ProjectedHistoryMessage[] {
   if (!beforeId || limit <= 0) return [];
-  const idx = messages.findIndex((message) => message.id === beforeId);
+  // The cursor's identity. `beforeTurnId` absent ⇒ id alone, which is exactly
+  // what an older peer sends and exactly what it used to get.
+  const isCursor = (message: ProjectedHistoryMessage): boolean =>
+    message.id === beforeId &&
+    (beforeTurnId === undefined || rowTurnId(message) === beforeTurnId);
+  const idx = messages.findIndex(isCursor);
   if (idx === -1) return [];
-  // AMBIGUOUS ⇒ unresolvable. See the third-outcome block above.
-  if (messages.some((message, i) => i > idx && message.id === beforeId)) return [];
+  // AMBIGUOUS ⇒ unresolvable — over the SAME predicate the match used, so it is
+  // the backstop for whatever that predicate cannot separate. See above.
+  if (messages.some((message, i) => i > idx && isCursor(message))) return [];
   return messages.slice(Math.max(0, idx - limit), idx);
+}
+
+/**
+ * A projected row's `turnId`, or `undefined` for the text variant — which is the
+ * one that HAS NO SUCH FIELD (`channel-contract.ts`: the tag is absent only on
+ * text, and the union is discriminated on it). So a bubble id can never be
+ * matched by a pair cursor, which is correct: bubble ids are `nextMessageId()`-
+ * minted and globally unique, and nothing mints a pair cursor for one.
+ */
+function rowTurnId(message: ProjectedHistoryMessage): string | undefined {
+  return message.kind === undefined ? undefined : message.turnId;
 }
 
 /** What `serveHistoryRequest` hands back: one page, plus whole-projection health. */
@@ -1165,7 +1207,7 @@ export function serveHistoryRequest(
   return {
     messages:
       plan.kind === "page"
-        ? historyPageBefore(messages, plan.beforeId, plan.limit)
+        ? historyPageBefore(messages, plan.beforeId, plan.limit, plan.beforeTurnId)
         : recentHistoryPage(messages, plan.limit),
     unsupportedEvents,
     tsFallbacks,
