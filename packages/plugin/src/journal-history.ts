@@ -1252,11 +1252,12 @@ export function historyPageBefore(
 }
 
 /**
- * A projected row's `turnId`, or `undefined` for the text variant — which is the
- * one that HAS NO SUCH FIELD (`channel-contract.ts`: the tag is absent only on
- * text, and the union is discriminated on it). So a bubble id can never be
- * matched by a pair cursor, which is correct: the wire shape is the whole
- * reason, and nothing mints a pair cursor for one.
+ * A projected row's `turnId`, or `undefined` for the variants that HAVE NO SUCH
+ * FIELD (`channel-contract.ts`: the field is absent on text AND on #242 half 4's
+ * approval rows — reasoning and tool are the two that carry it, and the union is
+ * discriminated on `kind`). So a bubble or approval id can never be matched by a
+ * pair cursor, which is correct: the wire shape is the whole reason, and nothing
+ * mints a pair cursor for one.
  *
  * ⚠️ DO NOT RE-ADD "AND BUBBLE IDS ARE GLOBALLY UNIQUE" AS A SECOND REASON — it
  * was here, and it is FALSE for the user half. `ingress-dedupe.ts` journals the
@@ -1269,7 +1270,12 @@ export function historyPageBefore(
  * reason would be a claim this projection cannot make.
  */
 function rowTurnId(message: ProjectedHistoryMessage): string | undefined {
-  return message.kind === undefined ? undefined : message.turnId;
+  // Only the variants that CARRY a `turnId` field can seat a pair cursor:
+  // reasoning and tool. Text bubbles (`kind === undefined`) never had one, and
+  // #242 half 4's approval rows deliberately do not either — an approval is
+  // identified by its plugin-minted request `id` alone, like a bubble, so it
+  // pages by the id-only cursor. Anything without the field returns undefined.
+  return message.kind === "reasoning" || message.kind === "tool" ? message.turnId : undefined;
 }
 
 /** What `serveHistoryRequest` hands back: one page, plus whole-projection health. */
