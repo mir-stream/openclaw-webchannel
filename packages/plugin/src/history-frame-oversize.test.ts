@@ -269,9 +269,20 @@ function sealedHistoryBytes(h: Harness, messages: HistoryMessage[]): number {
   return size;
 }
 
-/** Same row, shorter body. Written per-variant so the union stays discriminated. */
+/**
+ * Same row, shorter body. Written per-variant so the union stays discriminated:
+ * a tool row carries no `text` body to shorten, so it is returned unchanged (no
+ * fixture here builds one); the text and reasoning variants get the new body.
+ */
 function withText(message: HistoryMessage, text: string): HistoryMessage {
-  return message.kind === "reasoning" ? { ...message, text } : { ...message, text };
+  if (message.kind === "tool") return message;
+  if (message.kind === "reasoning") return { ...message, text };
+  return { ...message, text };
+}
+
+/** The row's text body, or "" for a tool row (which has none). */
+function bodyText(message: HistoryMessage): string {
+  return message.kind === "tool" ? "" : message.text;
 }
 
 /**
@@ -281,7 +292,7 @@ function withText(message: HistoryMessage, text: string): HistoryMessage {
  */
 function crossingTextBytes(h: Harness, page: HistoryMessage[], hi: number): number {
   const sealedAt = (s: number): number =>
-    sealedHistoryBytes(h, page.map((m) => withText(m, m.text.slice(0, s))));
+    sealedHistoryBytes(h, page.map((m) => withText(m, bodyText(m).slice(0, s))));
   expect(sealedAt(0)).toBeLessThanOrEqual(STOCK_MAX_PAYLOAD);
   expect(sealedAt(hi)).toBeGreaterThan(STOCK_MAX_PAYLOAD);
   let lo = 0;
@@ -475,10 +486,10 @@ describe("#311 — THE MEASUREMENT: where a page crosses a stock 1 MiB max_paylo
 
     // The two numbers the issue wanted: what the page seals to at the crossing,
     // and one byte of text per row below it.
-    const atCrossing = sealedHistoryBytes(h, page.map((m) => withText(m, m.text.slice(0, crossing))));
+    const atCrossing = sealedHistoryBytes(h, page.map((m) => withText(m, bodyText(m).slice(0, crossing))));
     const belowCrossing = sealedHistoryBytes(
       h,
-      page.map((m) => withText(m, m.text.slice(0, crossing - 1))),
+      page.map((m) => withText(m, bodyText(m).slice(0, crossing - 1))),
     );
     expect(atCrossing).toBeGreaterThan(STOCK_MAX_PAYLOAD);
     expect(belowCrossing).toBeLessThanOrEqual(STOCK_MAX_PAYLOAD);

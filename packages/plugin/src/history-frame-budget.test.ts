@@ -39,7 +39,7 @@ function linearMeasure(
     // changing afterwards, and every assertion about call shapes then lies.
     calls.push([...candidate]);
     return candidate.reduce(
-      (total, message) => total + perRow + (overrides[message.id] ?? message.text.length),
+      (total, message) => total + perRow + (overrides[message.id] ?? bodyLen(message)),
       frame,
     );
   }) as HistoryFrameMeasure & { calls: HistoryMessage[][] };
@@ -48,6 +48,12 @@ function linearMeasure(
 }
 
 const ids = (fitted: { rows: HistoryMessage[] }): string[] => fitted.rows.map((m) => m.id);
+
+/**
+ * The row's body length in bytes of text. A tool row carries no `text` body, so
+ * it contributes 0 — honest here because no fixture in this file builds one.
+ */
+const bodyLen = (m: HistoryMessage): number => (m.kind === "tool" ? 0 : m.text.length);
 
 describe("fitHistoryFrame — the fast path", () => {
   it("returns the page unchanged, at a cost of exactly ONE measurement", () => {
@@ -323,8 +329,8 @@ describe("fitHistoryFrame — the price of having no estimator", () => {
     let bytesMeasured = 0;
     const measure = (candidate: HistoryMessage[]): number => {
       calls++;
-      bytesMeasured += candidate.reduce((total, m) => total + m.text.length, 0);
-      return candidate.reduce((total, m) => total + 10 + m.text.length, 40);
+      bytesMeasured += candidate.reduce((total, m) => total + bodyLen(m), 0);
+      return candidate.reduce((total, m) => total + 10 + bodyLen(m), 40);
     };
 
     const fitted = fitHistoryFrame(page, { measure, limit: 1024 * 1024 });
