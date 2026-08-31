@@ -76,13 +76,24 @@
  *
  * ⚠️ ARRAY IDENTITY IS NOT A GENERAL NO-OP SIGNAL. Some transitions hand the
  * input array straight back when nothing durable changed, and some always
- * allocate. Measured. The FOUR SAME-array rows are EXHAUSTIVE — they are every
- * path in this file that returns its input by reference. The NEW-array rows
- * below them are illustrative examples, not an enumeration: allocation is the
- * default here, so any PATH not listed among the first four allocates. (Path,
- * not transition: `placement` and `seal` each have paths on BOTH sides of the
- * divide, even though only `seal` happens to have a row in each section below.
- * `reasoning` has NO path in the first section — see its row.)
+ * allocate. Measured. The FOUR SAME-array rows are EXHAUSTIVE FOR ANY STREAM
+ * THAT PREDATES #241 — they are every path a `user`/`placement`/`bubble`/`seal`/
+ * `reasoning`/`tool`/`approval`/`approvalResolution` stream can take that returns
+ * its input by reference. The NEW-array rows below them are illustrative
+ * examples, not an enumeration: allocation is the default here, so any PATH not
+ * listed among the first four allocates. (Path, not transition: `placement` and
+ * `seal` each have paths on BOTH sides of the divide, even though only `seal`
+ * happens to have a row in each section below. `reasoning` has NO path in the
+ * first section — see its row.)
+ *
+ * ⚠️ #241 half 1 ADDS MORE by-reference returns, and they are DORMANT rather than
+ * a fifth exhaustive count. Every one is gated on a TOMBSTONE or a mutation
+ * event that no producer emits yet: `applyMessageEdited`'s absent-id/stale/
+ * tombstone no-ops, `applyMessageDeleted`'s absent-id/stale no-ops, and the
+ * tombstone no-resurrect guards added to `applyPlacement`/`applyBubble`. None can
+ * fire without a `messageDeleted`/`messageEdited` event, so on any existing
+ * stream the FOUR above remain exhaustive — which is exactly why this slice is
+ * additive and every legacy anchor stays byte-identical.
  *   - `placement`, repeat claim whose turnId resolves unchanged  → SAME array
  *   - `seal`, early return (no valid answers and no removes)     → SAME array
  *   - `seal`, empty/blank turnId early return                    → SAME array
@@ -279,6 +290,35 @@ export type DurableMessage =
       readonly role: DurableRole;
       readonly text: string;
       readonly turnId?: string;
+      /**
+       * MONOTONIC per-message revision (#241 half 1, doc §16.2-4). ABSENT ⇒ treat
+       * as 0 (the base creation): every entry the four legacy transitions
+       * (`user`/`placement`/`bubble`/`seal`) produce omits it, so those streams
+       * stay byte-identical and their anchors stay green. Only a `messageEdited`
+       * or `messageDeleted` event writes it, and only when it DOMINATES — strictly
+       * greater than the entry's current revision — which is what makes a stale
+       * revision a no-op (§16.2-4 "stale revision 거부") rather than a clobber.
+       */
+      readonly revision?: number;
+      /**
+       * The "edited" marker (#241 half 1, doc §16.2-4). Set ONLY by a dominant
+       * `messageEdited`; absent everywhere else. It is dormant in half 1 — no
+       * producer emits `messageEdited` yet, so no live entry ever carries it — and
+       * half 2 renders it. A consumer must read `=== true`, never truthiness, so
+       * the absent case reads as "not edited".
+       */
+      readonly edited?: boolean;
+      /**
+       * The TOMBSTONE marker for a permanent typed delete (#241 half 1, doc
+       * §16.2-3). A `messageDeleted` replaces the entry IN PLACE with a tombstone
+       * (`text: ""`, `deleted: true`) that stays in the array at its slot — the
+       * fold RETAINS it so a later same-id event can see it and refuse to
+       * resurrect it (order-sensitive revive is gone; restore is a new id or an
+       * explicit restore per §16.2-3). Dormant in half 1: with no `messageDeleted`
+       * producer, no tombstone can exist, which is what makes every no-resurrect
+       * guard below provably unreachable for an existing stream. Read `=== true`.
+       */
+      readonly deleted?: boolean;
     }
   | {
       readonly kind: "reasoning";
@@ -742,7 +782,43 @@ export type DurableEvent =
    * `applyApprovalResolution` for why appending a contentless card instead would
    * be inventing a message.
    */
-  | { kind: "approvalResolution"; id: string; decision: DurableApprovalDecision };
+  | { kind: "approvalResolution"; id: string; decision: DurableApprovalDecision }
+  /**
+   * REVISION-DOMINANT TEXT EDIT of an existing text message (#241 half 1, doc
+   * §15.3, §16.2-4). This is the typed replacement for the old untyped
+   * last-write-wins overwrite: an edit no longer wins because it arrived later,
+   * it wins because its `revision` DOMINATES (`> (msg.revision ?? 0)`). A stale
+   * or equal revision is rejected. See `applyMessageEdited`.
+   *
+   * ⚠️ NOT A CREATE. There is deliberately no `messageCreated` event — creation
+   * stays via the existing `user`/`bubble` append paths (§15.3's 4-kind model,
+   * EXTENDED not replaced), so `messageEdited` naming an id no text message holds
+   * is a NO-OP, never a create-or-update. A create-or-update here would resurrect
+   * a tombstoned id and defeat the permanent typed delete this slice introduces.
+   *
+   * ⚠️ DORMANT IN HALF 1. No producer constructs this event yet: the egress
+   * mapper (`journalEventForOutbound`) switches over WIRE FRAME types, and no
+   * frame maps to it. The model and its transitions exist and are unit-tested;
+   * the producer/consumer cutover (egress emitting typed edits, the client
+   * rendering the "edited" marker) is half 2. So every existing event stream
+   * projects byte-identically, which is the whole point of the split.
+   */
+  | { kind: "messageEdited"; id: string; text: string; revision: number; turnId?: string }
+  /**
+   * PERMANENT TYPED DELETE of an existing text message (#241 half 1, doc §15.3,
+   * §16.2-3). This replaces the order-sensitive `seal.remove`-then-late-`bubble`
+   * REVIVE with a revision-dominant tombstone that NEVER resurrects: a later
+   * same-id `bubble`/`placement`/`seal.answers` is refused, and restore is a new
+   * id or an explicit restore (§16.2-3), not an accidental re-append. See
+   * `applyMessageDeleted` for the tombstone, and the no-resurrect guards in
+   * `applyBubble`/`applyPlacement`/`applySeal`.
+   *
+   * Like `messageEdited`, a delete naming an absent id is a NO-OP (seq ordering
+   * guarantees the create preceded), and this event is DORMANT in half 1 — no
+   * producer emits it, so no tombstone can exist and the guards are unreachable
+   * for every existing stream.
+   */
+  | { kind: "messageDeleted"; id: string; revision: number; turnId?: string };
 
 /**
  * STEP: apply exactly ONE journaled event to a durable view.
@@ -790,6 +866,10 @@ export function applyDurableEvent(
       return applyApproval(view, event);
     case "approvalResolution":
       return applyApprovalResolution(view, event);
+    case "messageEdited":
+      return applyMessageEdited(view, event);
+    case "messageDeleted":
+      return applyMessageDeleted(view, event);
   }
 }
 
@@ -892,6 +972,13 @@ function applyPlacement(
 ): DurableView {
   const idx = findTextIndex(view, event.answerId);
   const prev = idx === -1 ? undefined : view[idx];
+  // ⚠️ NO-RESURRECT (#241 half 1, doc §16.2-3). A placement claiming a slot for a
+  // TOMBSTONED id must not revive it — the delete is permanent, so this is a
+  // no-op returning the input by reference. UNREACHABLE without a `messageDeleted`
+  // event: no tombstone can exist otherwise, so this branch cannot fire for any
+  // existing stream and `placement`'s behavior stays byte-identical. It is stated
+  // as `deleted === true` (not truthiness) so only an actual tombstone trips it.
+  if (prev !== undefined && prev.kind === "text" && prev.deleted === true) return view;
   // `prev.kind !== "text"` CANNOT fire — `findTextIndex`'s predicate already
   // decided it, and TS simply cannot carry a `findIndex` callback's narrowing to
   // the element. It shares this branch rather than standing as its own assertion
@@ -931,6 +1018,13 @@ function applyBubble(
 ): DurableView {
   const idx = findTextIndex(view, event.answerId);
   const prev = idx === -1 ? undefined : view[idx];
+  // ⚠️ NO-RESURRECT (#241 half 1, doc §16.2-3). This is the transition the old
+  // order-sensitive revive lived on: a `seal.remove` dropped an id and a LATER
+  // `bubble` re-appended it. A tombstone replaces that — a `bubble` whose id
+  // resolves to a tombstone must neither overwrite the tombstone (update branch)
+  // nor append a duplicate (append branch), so it is a no-op here, BEFORE either.
+  // UNREACHABLE without a `messageDeleted`, so existing streams are byte-identical.
+  if (prev !== undefined && prev.kind === "text" && prev.deleted === true) return view;
   // Same shape and same reason as `applyPlacement`'s: the second disjunct is
   // unreachable and is how TS is told what `findTextIndex` already guaranteed.
   if (prev === undefined || prev.kind !== "text") {
@@ -1244,6 +1338,94 @@ function applyApprovalResolution(
 }
 
 /**
+ * REVISION-DOMINANT TEXT EDIT (#241 half 1, doc §16.2-4). The typed replacement
+ * for untyped last-write-wins: an edit applies because its `revision` DOMINATES,
+ * not because it arrived later.
+ *
+ *  - ABSENT id → NO-OP (return the input by reference). Documented rather than a
+ *    create-or-update on purpose: seq ordering guarantees the create precedes the
+ *    edit, so an id that is not here is one that was DELETED — a create-or-update
+ *    would resurrect a tombstone and defeat the permanent typed delete. §15.3
+ *    keeps creation on the `user`/`bubble` paths; there is no `messageCreated`.
+ *  - TOMBSTONED entry (`deleted: true`) → NO-OP. A deleted message is not
+ *    editable; restore is a new id or an explicit restore (§16.2-3).
+ *  - STALE/EQUAL revision (`event.revision <= (prev.revision ?? 0)`) → NO-OP
+ *    (§16.2-4 "stale revision 거부").
+ *  - DOMINANT revision → replace the entry IN PLACE (slot preserved), taking the
+ *    new text, carrying `turnId` forward when the event omits it, stamping the
+ *    new `revision`, and setting the "edited" marker.
+ *
+ * ⚠️ EVERY EARLY RETURN IS UNREACHABLE FOR A STREAM WITH NO `messageEdited`
+ * EVENT — this transition simply never runs. It is additive and dormant in half
+ * 1; the producer/consumer cutover is half 2.
+ */
+function applyMessageEdited(
+  view: DurableView,
+  event: { id: string; text: string; revision: number; turnId?: string },
+): DurableView {
+  const idx = findTextIndex(view, event.id);
+  if (idx === -1) return view;
+  const prev = view[idx];
+  // `prev.kind !== "text"` CANNOT fire — `findTextIndex` already decided it. Same
+  // shape and reason as `applyApprovalResolution`'s narrowing return.
+  if (prev.kind !== "text") return view;
+  if (prev.deleted === true) return view;
+  if (!(event.revision > (prev.revision ?? 0))) return view;
+  const next = view.slice();
+  next[idx] = {
+    ...prev,
+    text: event.text,
+    turnId: event.turnId ?? prev.turnId,
+    revision: event.revision,
+    edited: true,
+  };
+  return next;
+}
+
+/**
+ * PERMANENT TYPED DELETE with NO RESURRECT (#241 half 1, doc §16.2-3). Replaces
+ * the order-sensitive `remove`-then-revive with a revision-dominant tombstone.
+ *
+ *  - ABSENT id → NO-OP (double-delete of an already-gone id, or a delete before
+ *    its create — seq ordering rules the latter out). Returns the input by
+ *    reference.
+ *  - STALE/EQUAL revision → NO-OP (§16.2-4's rejection rule, applied to delete
+ *    too). A second delete at the same-or-lower revision is therefore a clean
+ *    by-reference no-op — the message stays deleted either way.
+ *  - DOMINANT revision → replace the entry IN PLACE with a TOMBSTONE
+ *    (`text: ""`, `deleted: true`, the new `revision`). The tombstone is KEPT in
+ *    the array at its slot — NOT filtered out — because retention is what makes
+ *    no-resurrect work at the fold level: a later same-id `bubble`/`placement`/
+ *    `seal.answers` finds the tombstone (via `findTextIndex`) and refuses to
+ *    overwrite or re-append it. Restore is a new id or an explicit restore.
+ *
+ * ⚠️ DORMANT IN HALF 1 — no producer emits `messageDeleted`, so no tombstone is
+ * ever created and the no-resurrect guards in the other transitions never fire.
+ */
+function applyMessageDeleted(
+  view: DurableView,
+  event: { id: string; revision: number; turnId?: string },
+): DurableView {
+  const idx = findTextIndex(view, event.id);
+  if (idx === -1) return view;
+  const prev = view[idx];
+  // `prev.kind !== "text"` CANNOT fire — `findTextIndex` already decided it.
+  if (prev.kind !== "text") return view;
+  if (!(event.revision > (prev.revision ?? 0))) return view;
+  const next = view.slice();
+  next[idx] = {
+    kind: "text",
+    id: prev.id,
+    role: prev.role,
+    text: "",
+    turnId: prev.turnId,
+    revision: event.revision,
+    deleted: true,
+  };
+  return next;
+}
+
+/**
  * `turn_snapshot` reconciliation — the ONE implementation. The wrapper's
  * `applyTurnSnapshot` is now only the
  * frame→event mapper that feeds this. The contract is EXPLICIT (never a blanket
@@ -1270,9 +1452,23 @@ function applySeal(
   // Defense-in-depth: keep the FIRST occurrence of a duplicated answer id, so
   // the slot-refill's `slots.length === answers.length` assumption holds.
   const answerSeen = new Set<string>();
-  const answers = rawAnswers.filter((a) =>
+  const dedupedAnswers = rawAnswers.filter((a) =>
     answerSeen.has(a.id) ? false : (answerSeen.add(a.id), true),
   );
+  // ⚠️ NO-RESURRECT (#241 half 1, doc §16.2-3). An `answers` entry naming a
+  // TOMBSTONED id must not revive it — `seal.answers`'s create-or-update (#215
+  // failed-frame recovery) is exactly the revive path the permanent delete
+  // replaces, and letting a tombstone through step 2 below would build a
+  // `{ ...tombstone, text }` half-state that is `deleted: true` yet non-empty.
+  // Skip those ids so the tombstone stays put as a non-answer slot. The set is
+  // EMPTY without a `messageDeleted` event, so `answers === dedupedAnswers`
+  // logically for every existing stream and the reordering below is unchanged.
+  const tombstonedIds = new Set<string>();
+  for (const m of view) if (m.kind === "text" && m.deleted === true) tombstonedIds.add(m.id);
+  const answers =
+    tombstonedIds.size === 0
+      ? dedupedAnswers
+      : dedupedAnswers.filter((a) => !tombstonedIds.has(a.id));
   const removeSet = new Set(
     (Array.isArray(event.remove) ? event.remove : []).filter(
       (r): r is string => typeof r === "string" && r.length > 0,

@@ -380,9 +380,15 @@ describe("payload retention (#253)", () => {
   it("round-trips an unknown KIND verbatim rather than dropping the row", () => {
     // The store never silently drops what it does not understand — that is the
     // server destroying its own truth (reducer BOUNDARY 2's reasoning).
+    //
+    // ⚠️ THE STAND-IN KIND MUST BE OUTSIDE THE UNION, and this one changed: it
+    // was `messageDeleted`, which #241 half 1 promoted to a REAL member — so it
+    // stopped being an "unknown kind" and started hitting `extractMessageId`'s
+    // typed arm. `unknownFutureKind` is a kind only a NEWER build could write;
+    // if a later slice ever adds it, pick another out-of-union name here.
     const journal = open(newJournalPath());
     const forward = {
-      kind: "messageDeleted",
+      kind: "unknownFutureKind",
       messageId: "a-1",
       revision: 3,
     } as unknown as JournalEvent;
@@ -391,7 +397,7 @@ describe("payload retention (#253)", () => {
     expect(row.event).toEqual(forward);
     // `kind` is read off the PAYLOAD, so a row can never report a kind its own
     // payload contradicts.
-    expect(row.kind).toBe("messageDeleted");
+    expect(row.kind).toBe("unknownFutureKind");
   });
 
   it("extracts turn_id for known AND unknown kinds, and leaves an unknown kind UNINDEXED", () => {
@@ -410,8 +416,11 @@ describe("payload retention (#253)", () => {
     const databasePath = newJournalPath();
     const journal = open(databasePath);
     journal.append("conv", bubble("a-1", "one"));
+    // `unknownFutureKind` — a kind only a newer build could write. Was
+    // `messageDeleted` until #241 half 1 made that a real, INDEXED member; the
+    // stand-in must stay outside the union to exercise the retain-unindexed path.
     journal.append("conv", {
-      kind: "messageDeleted",
+      kind: "unknownFutureKind",
       messageId: "a-2",
       turnId: TURN,
     } as unknown as JournalEvent);
@@ -426,7 +435,7 @@ describe("payload retention (#253)", () => {
         { kind: "bubble", message_id: "a-1", turn_id: TURN },
         // `message_id` NULL: the unknown kind goes unindexed rather than
         // failing the append. `turn_id` still populated: extracted structurally.
-        { kind: "messageDeleted", message_id: null, turn_id: TURN },
+        { kind: "unknownFutureKind", message_id: null, turn_id: TURN },
       ]);
     } finally {
       sidecar.close();

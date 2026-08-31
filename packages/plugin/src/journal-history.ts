@@ -394,6 +394,14 @@ export const KNOWN_EVENT_KINDS: Record<JournalEvent["kind"], true> = {
   tool: true,
   approval: true,
   approvalResolution: true,
+  // #241 half 1 (typed event model). Dormant: no producer emits these yet
+  // (`journalEventForOutbound` maps no wire frame to them), so no such row is
+  // ever written. Enumerated here anyway because the union grew and this
+  // `Record<JournalEvent["kind"], true>` fails tsc otherwise — the device doing
+  // its job — and because a build that DOES read one back (version skew) must
+  // fold it rather than count it unsupported.
+  messageEdited: true,
+  messageDeleted: true,
 };
 
 /**
@@ -960,6 +968,18 @@ function recordFirstSeen(
       for (const answer of event.answers) {
         if (answer && typeof answer === "object") note(answer.id);
       }
+      return;
+    case "messageEdited":
+    case "messageDeleted":
+      // #241 half 1 (typed event model). `note` is first-write-wins, so noting
+      // the target id here is harmless: the message's `firstSeenMs` was already
+      // set by the `user`/`bubble` create that seq-ordering guarantees preceded
+      // this mutation, and `note` leaves that earlier `ts` untouched. Dormant in
+      // half 1 (no producer), so this only matters if a version-skew replay reads
+      // one back. It must still be an explicit case — the `default` below is a
+      // `never` exhaustiveness gate, so a missing member fails tsc rather than
+      // silently no-op'ing the first-seen bookkeeping.
+      note(event.id);
       return;
     default: {
       // ⚠️ COMPILE-TIME EXHAUSTIVENESS, same device and same reason as
