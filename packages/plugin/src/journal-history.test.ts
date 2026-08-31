@@ -309,6 +309,21 @@ function comparableRow(m: ProjectedHistoryMessage | DurableMessage) {
       argKeys: m.argKeys,
     };
   }
+  // #242 half 4. `approvalKind`/`options` are compared too: the rename and the
+  // button list are exactly what a layer could drop silently, and this helper
+  // is what makes the both-sides equality unfiltered.
+  if (m.kind === "approval") {
+    return {
+      id: m.id,
+      approvalKind: m.approvalKind,
+      title: m.title,
+      description: m.description,
+      prompt: m.prompt,
+      options: m.options,
+      expiresAtMs: m.expiresAtMs,
+      resolvedDecision: m.resolvedDecision,
+    };
+  }
   return { id: m.id, role: m.role, text: m.text };
 }
 
@@ -1287,6 +1302,9 @@ import {
   ORDINARY_TURN_ROWS,
   TOOL_TURN_FRAMES,
   TOOL_TURN_ROWS,
+  APPROVAL_TURN_FRAMES,
+  APPROVAL_TURN_ROWS,
+  type ApprovalTurnFrame,
   type ReasoningTurnFrame,
   type ToolTurnFrame,
 } from "../../client/src/reasoning-turn.test-harness.js";
@@ -1448,5 +1466,135 @@ describe("live == history for tool activity: what the plugin serves (#242 half 3
     // transcript silently.
     const { read } = fakeReader(toolJournalRows());
     expect(projectJournalHistory(read, CONV).unsupportedEvents).toBe(0);
+  });
+});
+
+/**
+ * ⭐ #242 half 4 — THE CENTRAL PROPERTY, PLUGIN HALF.
+ *
+ * The client twin (`packages/client/src/durable-view-reducer.test.ts`) drives
+ * the REAL wrapper over `APPROVAL_TURN_FRAMES` and asserts the live view. THIS
+ * half drives the real `journalEventForOutbound` and the real projection over
+ * the SAME fixture and asserts that what the plugin SERVES is exactly what that
+ * twin replays. Neither can be edited alone.
+ */
+describe("live == history for approvals: what the plugin serves (#242 half 4)", () => {
+  const asOutbound = (frame: ApprovalTurnFrame | ReasoningTurnFrame): OutboundWsMessage =>
+    frame as unknown as OutboundWsMessage;
+
+  function approvalJournalRows(): DeliveryJournalRow[] {
+    const events: JournalEvent[] = [];
+    for (const frame of APPROVAL_TURN_FRAMES) {
+      // NO policy: approval durability has no account opt-in, like tool and
+      // unlike reasoning. The argument is at the mapper's `approval_request`
+      // case and is made from the payload's own content.
+      const event = journalEventForOutbound(asOutbound(frame));
+      if (event !== null) events.push(event);
+    }
+    return rowsFor(events);
+  }
+
+  const stripTs = (row: ProjectedHistoryMessage): unknown => {
+    const { ts: _ts, ...rest } = row;
+    return rest;
+  };
+
+  it("writes TWO APPEND-ONLY ROWS for one card — never an edit of the first", () => {
+    // The design decision, made checkable. The request and the resolution are
+    // two rows; nothing rewrites a stored payload, so #241's revision model is
+    // not a prerequisite.
+    expect(approvalJournalRows().map((r) => r.kind)).toEqual([
+      "approval",
+      "placement",
+      "approvalResolution",
+      "bubble",
+    ]);
+  });
+
+  it("serves EXACTLY the rows the client-side live==history twin replays", () => {
+    const { read } = fakeReader(approvalJournalRows());
+    const messages = projectJournalHistory(read, CONV).messages;
+
+    // ⚠️ THE SHARED FIXTURE IS THE EXPECTATION. The two rows have been folded
+    // into ONE served card carrying the request's payload AND the resolution's
+    // verdict.
+    expect(messages.map(stripTs)).toEqual(APPROVAL_TURN_ROWS.map((row) => ({ ...row })));
+    // The position claim, stated on its own so a reordering regression names
+    // itself rather than hiding inside the equality above.
+    expect(messages.map((m) => m.id)).toEqual(["ap-1", "A"]);
+  });
+
+  it("dates the card by its REQUEST — a prompt's moment is when it was shown", () => {
+    // `ts` is THIS module's concern and is asserted here rather than in the
+    // shared fixture. `recordFirstSeen` is first-write-wins and
+    // `approvalResolution` notes nothing at all, so `ap-1` is dated by row 1.
+    const rows = approvalJournalRows();
+    const { read } = fakeReader(rows);
+    const messages = projectJournalHistory(read, CONV).messages;
+    expect(messages.find((m) => m.id === "ap-1")?.ts).toBe(rows[0].createdMs);
+  });
+
+  it("recognises both approval kinds — neither is counted as an unsupported row", () => {
+    // `KNOWN_EVENT_KINDS` is the gate; a build that forgot either arm would drop
+    // those rows and report it here rather than serving a partial transcript
+    // silently. Half 4 is the first slice to add TWO kinds at once.
+    const { read } = fakeReader(approvalJournalRows());
+    expect(projectJournalHistory(read, CONV).unsupportedEvents).toBe(0);
+  });
+
+  it("a resolution naming a card the journal does not hold changes nothing", () => {
+    // `applyApprovalResolution` no-ops rather than appending a contentless card
+    // built from an id and a verdict — that would be the server INVENTING a
+    // message (N8). Unreachable in a full replay (both frames ride the one
+    // `sendToPeer` funnel, so the request row always precedes), and pinned here
+    // because the alternative is the tempting one.
+    const orphan = journalEventForOutbound({
+      type: "approval_resolved",
+      id: "never-requested",
+      decision: "deny",
+    } as unknown as OutboundWsMessage);
+    expect(orphan).not.toBeNull();
+    const { read } = fakeReader(rowsFor([orphan!]));
+    expect(projectJournalHistory(read, CONV).messages).toEqual([]);
+  });
+
+  it("an id-less approval frame is refused rather than stored under an empty id", () => {
+    // The same `isUsableMessageId` rule every other durable branch uses. The
+    // client refuses the identical shape, so nothing renders live that history
+    // cannot hold.
+    expect(
+      journalEventForOutbound({
+        type: "approval_request",
+        id: "",
+        kind: "exec",
+        title: "T",
+        prompt: "P",
+        options: [],
+      } as unknown as OutboundWsMessage),
+    ).toBeNull();
+    expect(
+      journalEventForOutbound({
+        type: "approval_resolved",
+        id: "",
+        decision: "deny",
+      } as unknown as OutboundWsMessage),
+    ).toBeNull();
+  });
+
+  it("the stored event COPIES `options` — the caller cannot mutate the journal", () => {
+    const frame = {
+      type: "approval_request",
+      id: "ap-x",
+      kind: "exec" as const,
+      title: "T",
+      prompt: "P",
+      options: [{ decision: "deny" as const, label: "No", style: "danger" }],
+    };
+    const event = journalEventForOutbound(frame as unknown as OutboundWsMessage);
+    frame.options[0].label = "MUTATED";
+    expect(event).toMatchObject({
+      kind: "approval",
+      options: [{ decision: "deny", label: "No", style: "danger" }],
+    });
   });
 });

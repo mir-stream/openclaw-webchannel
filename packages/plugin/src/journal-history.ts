@@ -308,6 +308,7 @@
  */
 import {
   applyDurableEvent,
+  type DurableMessage,
   type DurableView,
 } from "../../client/src/durable-view-reducer.js";
 // Type-only, all four. This module must stay pure and IO-free: importing
@@ -367,17 +368,32 @@ export const HISTORY_REPLAY_CHUNK_ROWS = 512;
  * forget: the day the event model grows, tsc fails HERE with a missing property
  * instead of letting the new kind be silently counted as unsupported forever.
  *
- * ⚠️ THAT IS NOT A PREDICTION ANY MORE — IT FIRED. #242 half 1 added
- * `reasoning`, and this object is one of the places tsc pointed at. The device
- * works; keep it derived, and never "simplify" it to a string literal array.
+ * ⚠️ THAT IS NOT A PREDICTION ANY MORE — IT FIRED, AND IT HAS KEPT FIRING. #242
+ * half 1 added `reasoning`, half 3 added `tool`, half 4 added `approval` and
+ * `approvalResolution`, and this object is one of the places tsc pointed at
+ * every time (half 4's message names both missing properties in one error). The
+ * device works; keep it derived, and never "simplify" it to a string literal
+ * array.
+ *
+ * ⚠️ EXPORTED FOR ONE REASON, AND IT IS NOT A CONSUMER: it is the only
+ * MACHINE-READABLE enumeration of the durable kinds this build writes, so
+ * `containment-runbook-inventory.test.ts` can ask "is every one of these named
+ * in the containment runbook's §0.2 disk inventory?". That inventory is the
+ * single authority for what this plugin writes to disk, and a prose rule telling
+ * slices to update it was violated by the next TWO slices after it was written
+ * (#242 half 3 and half 4) — so the rule now has a test, and the test needs this
+ * object. Nothing in `packages/` imports it; do not add a production consumer
+ * without saying why here.
  */
-const KNOWN_EVENT_KINDS: Record<JournalEvent["kind"], true> = {
+export const KNOWN_EVENT_KINDS: Record<JournalEvent["kind"], true> = {
   user: true,
   placement: true,
   bubble: true,
   seal: true,
   reasoning: true,
   tool: true,
+  approval: true,
+  approvalResolution: true,
 };
 
 /**
@@ -744,31 +760,93 @@ export function projectJournalHistory(
       // here to keep the type honest rather than as a policy.
       ts = lastCreatedMs ?? 0;
     }
-    messages.push(
-      message.kind === "reasoning"
-        ? { kind: "reasoning", id: message.id, turnId: message.turnId, text: message.text, ts }
-        : message.kind === "tool"
-          // #242 half 3. The view entry is ALREADY the fold of every frame —
-          // `applyTool` merged them on the way in — so this is a field copy, not
-          // an accumulation. Optional fields are omitted rather than written as
-          // `undefined` so the served row matches the live frame's own shape and
-          // `JSON.stringify` drops nothing silently.
-          ? {
-              kind: "tool",
-              id: message.id,
-              turnId: message.turnId,
-              ...(message.name !== undefined ? { name: message.name } : {}),
-              ...(message.phase !== undefined ? { phase: message.phase } : {}),
-              ...(message.status !== undefined ? { status: message.status } : {}),
-              ...(message.summary !== undefined ? { summary: message.summary } : {}),
-              ...(message.argKeys !== undefined ? { argKeys: message.argKeys } : {}),
-              ts,
-            }
-          : { id: message.id, role: message.role, text: message.text, ts },
-    );
+    messages.push(historyRowFor(message, ts));
   }
 
   return { messages, unsupportedEvents, tsFallbacks };
+}
+
+/**
+ * Turn ONE folded view entry into the row the hydration wire carries.
+ *
+ * ⚠️ A `switch` WITH A `never` DEFAULT, NOT THE NESTED TERNARY THIS REPLACED —
+ * and the change is the same lesson `transcriptEntryKey` records on the client
+ * side (#242 half 3). The ternary chain was
+ * `kind === "reasoning" ? … : kind === "tool" ? … : <text row>`: a two-way test
+ * with an `else` that means "text". A fourth kind lands in that `else`, and it
+ * only failed to compile here by luck — because `DurableMessage`'s approval arm
+ * happens to carry neither `role` nor `text`, so the text row's field reads went
+ * red. A future kind that DID carry both would have been silently served as a
+ * chat bubble. The `never` below does not depend on which fields the new arm
+ * has.
+ *
+ * `ts` is passed in rather than looked up: the caller owns the
+ * first-seen/fallback decision and counts `tsFallbacks`, and moving that in here
+ * would put the counter behind a second door.
+ */
+function historyRowFor(
+  message: DurableMessage,
+  ts: number,
+): ProjectedHistoryMessage {
+  switch (message.kind) {
+    case "reasoning":
+      return { kind: "reasoning", id: message.id, turnId: message.turnId, text: message.text, ts };
+    case "tool":
+      // #242 half 3. The view entry is ALREADY the fold of every frame —
+      // `applyTool` merged them on the way in — so this is a field copy, not
+      // an accumulation. Optional fields are omitted rather than written as
+      // `undefined` so the served row matches the live frame's own shape and
+      // `JSON.stringify` drops nothing silently.
+      return {
+        kind: "tool",
+        id: message.id,
+        turnId: message.turnId,
+        ...(message.name !== undefined ? { name: message.name } : {}),
+        ...(message.phase !== undefined ? { phase: message.phase } : {}),
+        ...(message.status !== undefined ? { status: message.status } : {}),
+        ...(message.summary !== undefined ? { summary: message.summary } : {}),
+        ...(message.argKeys !== undefined ? { argKeys: message.argKeys } : {}),
+        ts,
+      };
+    case "approval":
+      // #242 half 4. Like the tool row this is the fold of MORE THAN ONE journal
+      // event — the `approval` request plus any `approvalResolution` —
+      // already merged by the shared reducer, so it is a field copy.
+      //
+      // ⚠️ `resolvedDecision` IS SERVED, AND SERVING IT IS NOT AN INVITATION TO
+      // ACT. Live showed the resolved card with its outcome, so history must not
+      // hide it (N8/N10). What the wire does NOT carry is any actionability
+      // signal, deliberately: the client renders every history-sourced card
+      // non-interactive and only the live `approval_snapshot` re-arms one.
+      return {
+        kind: "approval",
+        id: message.id,
+        approvalKind: message.approvalKind,
+        title: message.title,
+        ...(message.description !== undefined ? { description: message.description } : {}),
+        prompt: message.prompt,
+        options: message.options,
+        ...(message.expiresAtMs !== undefined ? { expiresAtMs: message.expiresAtMs } : {}),
+        ...(message.resolvedDecision !== undefined
+          ? { resolvedDecision: message.resolvedDecision }
+          : {}),
+        ts,
+      };
+    case "text":
+      return { id: message.id, role: message.role, text: message.text, ts };
+    default: {
+      const unhandled: never = message;
+      void unhandled;
+      // Unreachable: every arm is handled above and a new one fails to compile
+      // at the assignment. `throw` rather than a fabricated row, because there is
+      // no honest row to invent for a kind this build cannot name — and the
+      // caller has already filtered unknown EVENT kinds (`isKnownJournalEvent`),
+      // so reaching here means the VIEW type grew without this switch.
+      throw new Error(
+        "webchannel: projectJournalHistory met a durable message kind it cannot serve",
+      );
+    }
+  }
 }
 
 /**
@@ -858,6 +936,24 @@ function recordFirstSeen(
       // this is the second line to revisit after that docblock, and the repair
       // is to key the map by the same pair the view uses.
       note(event.id);
+      return;
+    case "approval":
+      // #242 half 4. The card's moment is when the PROMPT WAS SHOWN, not when it
+      // was decided — first-write-wins gives exactly that, because the request
+      // row always precedes its resolution in this stream (both frames leave
+      // through the one `sendToPeer` funnel).
+      note(event.id);
+      return;
+    case "approvalResolution":
+      // ⚠️ DELIBERATELY NOTES NOTHING, AND THAT IS NOT THE OVERSIGHT THE
+      // `default` BELOW EXISTS TO CATCH. This event INTRODUCES NO MESSAGE —
+      // `applyApprovalResolution` folds it onto an existing card and appends
+      // nothing, returning the view by reference when the id matches none. So
+      // there is no id here whose first appearance needs dating; the card was
+      // already dated by its `approval` row above. Noting it anyway would be
+      // harmless today (first-write-wins would ignore it) and wrong the moment a
+      // resolution arrives for a card whose request row this build could not
+      // read — it would date a message the view does not contain.
       return;
     case "seal":
       if (!Array.isArray(event.answers)) return;
@@ -1156,11 +1252,12 @@ export function historyPageBefore(
 }
 
 /**
- * A projected row's `turnId`, or `undefined` for the text variant — which is the
- * one that HAS NO SUCH FIELD (`channel-contract.ts`: the tag is absent only on
- * text, and the union is discriminated on it). So a bubble id can never be
- * matched by a pair cursor, which is correct: the wire shape is the whole
- * reason, and nothing mints a pair cursor for one.
+ * A projected row's `turnId`, or `undefined` for the variants that HAVE NO SUCH
+ * FIELD (`channel-contract.ts`: the field is absent on text AND on #242 half 4's
+ * approval rows — reasoning and tool are the two that carry it, and the union is
+ * discriminated on `kind`). So a bubble or approval id can never be matched by a
+ * pair cursor, which is correct: the wire shape is the whole reason, and nothing
+ * mints a pair cursor for one.
  *
  * ⚠️ DO NOT RE-ADD "AND BUBBLE IDS ARE GLOBALLY UNIQUE" AS A SECOND REASON — it
  * was here, and it is FALSE for the user half. `ingress-dedupe.ts` journals the
@@ -1173,7 +1270,12 @@ export function historyPageBefore(
  * reason would be a claim this projection cannot make.
  */
 function rowTurnId(message: ProjectedHistoryMessage): string | undefined {
-  return message.kind === undefined ? undefined : message.turnId;
+  // Only the variants that CARRY a `turnId` field can seat a pair cursor:
+  // reasoning and tool. Text bubbles (`kind === undefined`) never had one, and
+  // #242 half 4's approval rows deliberately do not either — an approval is
+  // identified by its plugin-minted request `id` alone, like a bubble, so it
+  // pages by the id-only cursor. Anything without the field returns undefined.
+  return message.kind === "reasoning" || message.kind === "tool" ? message.turnId : undefined;
 }
 
 /** What `serveHistoryRequest` hands back: one page, plus whole-projection health. */

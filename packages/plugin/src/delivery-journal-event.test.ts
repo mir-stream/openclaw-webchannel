@@ -299,10 +299,10 @@ describe("journalEventForOutbound returns null for every non-durable frame", () 
   // reviewable.
   //
   // ⚠️ `null` here is never evidence that a frame is non-durable BY DESIGN
-  // (NOT-list N3/N7). Most of the `#242` rows are "not yet" — but read each row's
-  // own label, because they no longer agree: `approval_request` and
-  // `approval_resolved` are deferred to half 4, while `approval_snapshot` is a
-  // REPLAY and is PERMANENTLY non-durable, which this slice settled.
+  // (NOT-list N3/N7). What is left in this table after #242 half 4 is: ID-LESS
+  // forms of frames that ARE durable, genuine indicators/control frames, and
+  // `approval_snapshot`, which is a replay. No row here is a deferred slice any
+  // more — §15.9's durable list is complete.
   const nonDurable: Array<[string, OutboundWsMessage]> = [
     // A LIVE CUMULATIVE DRAFT — no `final`. #242 half 1 made reasoning durable,
     // but only the burst-closing frame; see the dedicated describe below for the
@@ -316,18 +316,26 @@ describe("journalEventForOutbound returns null for every non-durable frame", () 
     // once, so a second entry would break that count. The turnId-less form and
     // the durable cases live in the dedicated describe further down.
     ["tool_activity with no id (durable otherwise)", { type: "tool_activity", id: "", turnId: TURN, name: "bash" }],
+    // ⚠️ THE TWO APPROVAL FRAMES ARE DURABLE SINCE #242 half 4, so what stands
+    // here is their ID-LESS form only — same treatment, and same one-entry-per-
+    // type constraint, as `tool_activity` above. Their durable cases live in the
+    // dedicated describe further down.
     [
-      "approval_request (#242 half 4: durable later)",
+      "approval_request with no id (durable otherwise)",
       {
         type: "approval_request",
-        id: "ap-1",
+        id: "",
         kind: "exec",
         title: "run",
         prompt: "ok?",
         options: [{ decision: "allow-once", label: "Allow", style: "primary" }],
       },
     ],
-    ["approval_resolved (#242 half 4: durable later)", { type: "approval_resolved", id: "ap-1", decision: "deny" }],
+    ["approval_resolved with no id (durable otherwise)", { type: "approval_resolved", id: "", decision: "deny" }],
+    // ⚠️ `approval_snapshot` STAYS, AND IT IS THE ONE ROW HERE THAT IS NOT
+    // "not yet". It is a server→client REPLAY of state this store already holds
+    // — journaling it would write the store's own output back into the store,
+    // duplicating the `approval`/`approvalResolution` rows. Not scheduled, ever.
     ["approval_snapshot (a REPLAY — never durable, not deferred)", { type: "approval_snapshot", approvals: [] }],
     ["turn_settled (control frame)", { type: "turn_settled", turnId: TURN, outcome: "ok" }],
     ["typing (pure indicator)", { type: "typing" }],
@@ -597,5 +605,83 @@ describe("journalEventForInboundUser", () => {
       isIdlessDurableFrame({ type: "agent_message", text: "t", id: "u-0" }),
     ).toBe(false);
     expect(journalEventForInboundUser({ id: "u-0", text: "t" }).kind).toBe("user");
+  });
+});
+
+describe("#242 half 4 — the approval frames are durable, TWO events, no policy gate", () => {
+  const request = {
+    type: "approval_request",
+    id: "ap-1",
+    kind: "exec",
+    title: "Run a command",
+    description: "The agent wants to run a shell command.",
+    prompt: "Run a command: rm -rf /tmp/scratch",
+    options: [
+      { decision: "allow-once", label: "Allow once", style: "success" },
+      { decision: "deny", label: "Deny", style: "danger" },
+    ],
+    expiresAtMs: 1_900_000_000_000,
+  } as unknown as OutboundWsMessage;
+
+  it("maps `approval_request` to an `approval` event, renaming the payload's own kind", () => {
+    // ⚠️ `approvalKind`, NOT `kind`. The payload calls it `kind` and so does the
+    // event union's DISCRIMINANT; carrying it verbatim (or spreading
+    // `...request`) would collide the two meanings on one key and make the union
+    // undiscriminable. Pinned because a spread is the natural thing to write.
+    expect(journalEventForOutbound(request)).toEqual({
+      kind: "approval",
+      id: "ap-1",
+      approvalKind: "exec",
+      title: "Run a command",
+      description: "The agent wants to run a shell command.",
+      prompt: "Run a command: rm -rf /tmp/scratch",
+      options: [
+        { decision: "allow-once", label: "Allow once", style: "success" },
+        { decision: "deny", label: "Deny", style: "danger" },
+      ],
+      expiresAtMs: 1_900_000_000_000,
+    });
+  });
+
+  it("maps `approval_resolved` to a SEPARATE append-only event, never an edit", () => {
+    expect(
+      journalEventForOutbound({
+        type: "approval_resolved",
+        id: "ap-1",
+        decision: "allow-once",
+      } as unknown as OutboundWsMessage),
+    ).toEqual({ kind: "approvalResolution", id: "ap-1", decision: "allow-once" });
+  });
+
+  it("has NO account opt-in — `reasoningDurable: false` still journals both", () => {
+    // The decision, made checkable: unlike reasoning and like tool, approval
+    // durability is not gated on `capabilities.reasoningDurable`. The argument
+    // is at the mapper's `approval_request` case and is made from the payload's
+    // own content — a card is a message the user was SHOWN and ACTED ON, and its
+    // absence would erase the record of their consent.
+    expect(journalEventForOutbound(request, { reasoningDurable: false })).not.toBeNull();
+    expect(
+      journalEventForOutbound(
+        { type: "approval_resolved", id: "ap-1", decision: "deny" } as unknown as OutboundWsMessage,
+        { reasoningDurable: false },
+      ),
+    ).not.toBeNull();
+  });
+
+  it("omits an absent optional rather than writing an explicit `undefined`", () => {
+    // `JSON.stringify` drops an `undefined` value, so an always-present key makes
+    // the in-memory event and the one read back out of the journal structurally
+    // different objects. Same rule as the tool arm.
+    const event = journalEventForOutbound({
+      type: "approval_request",
+      id: "ap-2",
+      kind: "plugin",
+      title: "T",
+      prompt: "P",
+      options: [],
+    } as unknown as OutboundWsMessage);
+    expect(Object.keys(event ?? {}).sort()).toEqual(
+      ["approvalKind", "id", "kind", "options", "prompt", "title"].sort(),
+    );
   });
 });

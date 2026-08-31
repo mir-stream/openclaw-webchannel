@@ -56,9 +56,10 @@ export { ANON_PEER_ID };
  *  - `working`, `wireId`, `sendState` — live-only client state.
  *  - the TYPING flag and the rolling PROGRESS DRAFT — ephemeral by design,
  *    matching what Telegram does.
- *    ⚠️ NEITHER REASONING NOR TOOL ACTIVITY IS ON THAT LIST ANY MORE. #242 made
- *    reasoning durable (server side in half 1, readable in half 2) and tool
- *    activity durable in half 3; both travel as sibling variants below.
+ *    ⚠️ NEITHER REASONING NOR TOOL ACTIVITY NOR APPROVALS ARE ON THAT LIST ANY
+ *    MORE. #242 made reasoning durable (server side in half 1, readable in
+ *    half 2), tool activity durable in half 3 and approval cards durable in
+ *    half 4; all three travel as sibling variants below.
  *    `docs/P1_REASONING_LANE_PLAN.md`'s "ephemeral by design" line is superseded
  *    for both and still holds for the two named above.
  *    ⚠️ AND "tool progress" WAS AN AMBIGUOUS NAME FOR TWO DIFFERENT THINGS,
@@ -182,8 +183,62 @@ export type HistoryToolMessage = {
 };
 
 /**
- * One row on the hydration wire: a chat bubble, a completed reasoning burst, or
- * a merged tool call.
+ * ONE NATIVE HITL APPROVAL CARD on the hydration wire (#242 half 4).
+ *
+ * ⚠️ IT HAS NO `role`, for the reason the reasoning variant above gives in full,
+ * and the same MEASURED backward-compatibility argument applies UNCHANGED: the
+ * shipped client's `case "history"` runs
+ * `if (m.role !== "user" && m.role !== "agent") continue;` before any tier
+ * matching, and that guard is present exactly once in the `nats-client-wrapper.ts`
+ * of every one of the 15 released tags (`git tag --list 'v*'`), so an older
+ * client DROPS this row and a newer one renders it. The widening stays strictly
+ * additive. (An older client drops it TWICE over, in fact: it also has no
+ * `text`, and every released `case "history"` guards `typeof m.text !== "string"`
+ * ahead of the role test. The `role` argument is the one that is measured across
+ * the tag set, so it is the one quoted.)
+ *
+ * ⚠️ THIS ROW IS THE FOLD OF **TWO** JOURNAL EVENTS — the `approval` request and
+ * a later `approvalResolution` — merged by the shared reducer before serving,
+ * exactly as the tool row is the fold of many `tool` deltas. The wire carries the
+ * card WITH its state, so the client needs no second frame to make it complete.
+ *
+ * ⚠️ THE PAYLOAD'S OWN `kind` RIDES AS `approvalKind`. `ApprovalRequestPayload`
+ * calls it `kind` (`"exec" | "plugin"`), which is this union's DISCRIMINANT;
+ * carrying it verbatim would collide two meanings on one key. The rename is the
+ * same at all three layers (`DurableMessage`, this row, `ChatApprovalMessage`).
+ *
+ * ⚠️ `resolvedDecision` NEVER CARRIES THE `"unknown"` SENTINEL. That value is a
+ * CLIENT-side reconciliation outcome (#15 — "decided while this device wasn't
+ * looking"), produced only by `approval_snapshot`'s Leg B; nothing on the server
+ * can journal it, so nothing on this wire can serve it.
+ *
+ * ⚠️ AND THIS ROW IS NOT AN INVITATION TO ACT. A replayed approval is rendered
+ * NON-INTERACTIVE by the client whatever its `resolvedDecision` says — the live
+ * `approval_snapshot` is the only authority for "still open". See
+ * `ChatApprovalMessage`'s `actionable`.
+ *
+ * ⚠️ **#311** APPLIES HERE HARDEST, AND IS NOT FIXED BY THIS SLICE: a history
+ * page is bounded by ROW COUNT, not by bytes, and this variant carries `title`,
+ * `prompt`, `description` AND an `options[]` array — so an approval row is
+ * LARGER than a tool row. Like tool and unlike reasoning it has no storage
+ * opt-in, so it appears at the DEFAULT configuration.
+ */
+export type HistoryApprovalMessage = {
+  kind: "approval";
+  id: string;
+  approvalKind: "exec" | "plugin";
+  title: string;
+  description?: string;
+  prompt: string;
+  options: readonly ApprovalOption[];
+  expiresAtMs?: number;
+  resolvedDecision?: ApprovalDecision;
+  ts?: number;
+};
+
+/**
+ * One row on the hydration wire: a chat bubble, a completed reasoning burst, a
+ * merged tool call, or an approval card.
  *
  * ⚠️ A TAGGED UNION, MIRRORING `DurableMessage` — NOT A WIDENED RECORD. The
  * reducer already solved this shape and its docblock carries the argument: an
@@ -201,7 +256,8 @@ export type HistoryToolMessage = {
 export type HistoryMessage =
   | HistoryTextMessage
   | HistoryReasoningMessage
-  | HistoryToolMessage;
+  | HistoryToolMessage
+  | HistoryApprovalMessage;
 
 export type ApprovalDecision = "allow-once" | "allow-always" | "deny";
 export type ApprovalOption = { decision: ApprovalDecision; label: string; style: string };

@@ -1236,11 +1236,15 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
       text: "B final",
       working: false,
     });
-    // ⚠️ `kind !== "tool"` IS THE NARROWING, NOT A FILTER ON WHAT COUNTS. The
-    // `tool` arm of `ChatMessage` carries no `text` at all (#242 half 3), so it
-    // cannot hold a stale "Working…" draft; every arm that CAN — the bubble and
-    // the reasoning block — is still searched, which is the whole claim here.
-    expect(messages.some((m) => m.kind !== "tool" && m.text.includes("Working"))).toBe(false);
+    // ⚠️ THE `typeof` TEST IS THE NARROWING, NOT A FILTER ON WHAT COUNTS. Two
+    // arms of `ChatMessage` carry no `text` at all — `tool` (#242 half 3) and
+    // `approval` (half 4) — so neither can hold a stale "Working…" draft; every
+    // arm that CAN, the bubble and the reasoning block, is still searched, which
+    // is the whole claim here. Written as a `typeof` rather than a growing list
+    // of excluded kinds, because that list went stale on the very next slice.
+    expect(
+      messages.some((m) => typeof m.text === "string" && m.text.includes("Working")),
+    ).toBe(false);
   });
 
   // --- C7: history adoption makes the old live ids stale. -----------------

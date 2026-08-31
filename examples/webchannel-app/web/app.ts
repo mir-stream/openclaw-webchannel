@@ -183,18 +183,20 @@ async function mountBrowserUi(): Promise<void> {
     chatEl.replaceChildren(
       // ⚠️ NARROW ON `kind` — DO NOT MAP OVER `state.messages` AND READ
       // `role`/`text` DIRECTLY. `ChatMessage` is a TAGGED UNION: a chat bubble
-      // (no `kind`), a reasoning block (`kind: "reasoning"`), or a tool call
-      // (`kind: "tool"`). Only the bubble arm has `role`, and only the bubble and
-      // reasoning arms have `text` — a tool call's content is its
-      // name/phase/status/argKeys surface.
+      // (no `kind`), a reasoning block (`kind: "reasoning"`), a tool call
+      // (`kind: "tool"`) or an approval card (`kind: "approval"`). Only the
+      // bubble arm has `role`, and only the bubble and reasoning arms have
+      // `text` — a tool call's content is its name/phase/status/argKeys surface,
+      // and an approval's is its title/prompt/options.
       //
       // This example previously did map straight over the array, and that is
       // precisely what broke when the union grew a third arm: `m.text` became
-      // `string | undefined` and `m.role` `undefined`. The narrowing below is
-      // the pattern a real client should copy, and the reason it is spelled out
-      // here rather than collapsed into a one-liner — this file is the worked
-      // example of consuming the API, so the habit it demonstrates matters more
-      // than its length.
+      // `string | undefined` and `m.role` `undefined`. It broke again, in the
+      // same place, when half 4 added the fourth — which is the argument for the
+      // narrowing, not against it. The pattern below is the one a real client
+      // should copy, and the reason it is spelled out here rather than collapsed
+      // into a one-liner — this file is the worked example of consuming the API,
+      // so the habit it demonstrates matters more than its length.
       ...state.messages.map((m) => {
         const div = document.createElement("div");
 
@@ -226,6 +228,27 @@ async function mountBrowserUi(): Promise<void> {
           div.textContent =
             `🔧 ${label}${phaseLabel !== undefined ? ` — ${phaseLabel}` : ""}${args}` +
             (m.summary !== undefined ? ` · ${m.summary}` : "");
+          return div;
+        }
+
+        if (m.kind === "approval") {
+          // A native HITL approval card. It has NO `role` and NO `text`, and it
+          // is a DURABLE message — a reload replays it, so this arm draws both
+          // the live card and the historical record of one.
+          //
+          // ⚠️ THIS EXAMPLE IS READ-ONLY AND DRAWS NO BUTTONS, which is the safe
+          // default rather than a shortcut. A real client that offers decision
+          // buttons must gate them on `state.approvals`' `actionable`, NEVER on
+          // `resolvedDecision === undefined`: a card replayed from history is
+          // unresolved as far as the stored stream records, and may still have
+          // expired or been decided elsewhere. `decide()` refuses such a card
+          // too, so the worst case is a dead button rather than a stale
+          // decision — but do not rely on that.
+          div.className = "msg approval";
+          div.textContent =
+            `🔐 ${m.title}` +
+            (m.prompt ? ` — ${m.prompt}` : "") +
+            (m.resolvedDecision !== undefined ? ` · ${m.resolvedDecision}` : " · pending");
           return div;
         }
 
