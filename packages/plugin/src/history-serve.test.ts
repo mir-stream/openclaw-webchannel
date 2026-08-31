@@ -79,7 +79,16 @@ function thread(prefix: string): JournalEvent[] {
   ];
 }
 
-/** Records every `sendHistory` call; returns `true` like the real channel. */
+/**
+ * Records every `sendHistory` call; returns `true` like the real channel.
+ *
+ * #311 widened the surface with the two measurement members. They are answered
+ * in PLAINTEXT against a limit nothing in this file approaches, so every page
+ * takes the budget's fast path and arrives whole — which is what keeps the
+ * assertions below about scoping, deferral and diagnostics rather than bytes.
+ * The byte behaviour has its own two files (`history-frame-budget.test.ts`,
+ * `history-frame-oversize.test.ts`).
+ */
 function recordingChannel(): {
   channel: HistoryChannelSurface;
   sent: Array<{ peerId: string; messages: HistoryMessage[] }>;
@@ -92,6 +101,9 @@ function recordingChannel(): {
         sent.push({ peerId, messages });
         return true;
       },
+      outboundWireSize: (_peerId, payload) =>
+        Buffer.byteLength(JSON.stringify(payload), "utf8"),
+      effectiveOutboundLimit: () => 8 * 1024 * 1024,
     },
   };
 }
@@ -675,6 +687,9 @@ describe("createHistoryServer — a publish failure is not blamed on the journal
         sendHistory() {
           throw new Error("transport closed");
         },
+        outboundWireSize: (_peerId, payload) =>
+          Buffer.byteLength(JSON.stringify(payload), "utf8"),
+        effectiveOutboundLimit: () => 8 * 1024 * 1024,
       },
       config: DEFAULT_HISTORY_CONFIG,
       logger: { error: (m) => void errors.push(m) },

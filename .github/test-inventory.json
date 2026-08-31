@@ -79,6 +79,8 @@
     "packages/plugin/src/enrolled-nats-connection.test.ts": 12,
     "packages/plugin/src/enrollment-client.test.ts": 34,
     "packages/plugin/src/entry-exports.test.ts": 7,
+    "packages/plugin/src/history-frame-budget.test.ts": 16,
+    "packages/plugin/src/history-frame-oversize.test.ts": 12,
     "packages/plugin/src/history-serve.test.ts": 24,
     "packages/plugin/src/history.test.ts": 12,
     "packages/plugin/src/inbound-debounce.test.ts": 6,

@@ -153,11 +153,17 @@ export type HistoryFetchPlan =
  * the same as "nothing checks the size", as an earlier revision implied by
  * claiming `effectiveOutboundLimit` is consulted only by `sendIngressResult`'s
  * chunking. `nats-transport.ts`'s `publish` checks it too and THROWS a
- * `RangeError` above it, on the very path every `sendHistory` takes
- * (`history-serve.ts` catches that throw as "publish failed"). So an oversized
- * frame is a failed send rather than a chunked one — the frame never arrives,
- * and the CPU was already spent building and sealing it. The clamp is about that
- * cost, and about not making a failed publish the only backstop.
+ * `RangeError` above it, on the very path every `sendHistory` takes.
+ *
+ * ⚠️ THAT THROW IS NOT CAUGHT BY `history-serve.ts`, as this docblock used to
+ * claim — `nats-channel.ts`'s `sendToPeer` catches it first and returns `false`.
+ * SINCE #311 the size is no longer left to that throw at all:
+ * `history-frame-budget.ts` fits the page to the peer's sealed limit before it
+ * is published, so an oversized page is SHORTENED from the old end (the pager
+ * still reaches the rest) rather than lost whole. This clamp is still worth
+ * having and its reason is unchanged: it bounds the CPU spent projecting and
+ * sealing a page before any budget can look at it, and it keeps a peer from
+ * naming an arbitrary row count in the first place.
  */
 export const MAX_WIRE_HISTORY_LIMIT = 1000;
 

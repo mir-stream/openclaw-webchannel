@@ -213,6 +213,12 @@ function serveVia(
         sent.push(messages);
         return true;
       },
+      // #311's byte budget. Plaintext sizing against a limit no test here can
+      // reach, so every page takes the fast path and the assertions below are
+      // about SCOPE, exactly as before.
+      outboundWireSize: (_peerId, payload) =>
+        Buffer.byteLength(JSON.stringify(payload), "utf8"),
+      effectiveOutboundLimit: () => 8 * 1024 * 1024,
     },
     config,
     logger: { error: () => {}, warn: () => {} },
