@@ -50,10 +50,12 @@ function linearMeasure(
 const ids = (fitted: { rows: HistoryMessage[] }): string[] => fitted.rows.map((m) => m.id);
 
 /**
- * The row's body length in bytes of text. A tool row carries no `text` body, so
- * it contributes 0 — honest here because no fixture in this file builds one.
+ * The row's body length in bytes of text. Only the text and reasoning variants
+ * carry a `text` body; a tool or approval row has none, so it contributes 0 —
+ * honest here because no fixture in this file builds one of those.
  */
-const bodyLen = (m: HistoryMessage): number => (m.kind === "tool" ? 0 : m.text.length);
+const bodyLen = (m: HistoryMessage): number =>
+  m.kind === undefined || m.kind === "reasoning" ? m.text.length : 0;
 
 describe("fitHistoryFrame — the fast path", () => {
   it("returns the page unchanged, at a cost of exactly ONE measurement", () => {

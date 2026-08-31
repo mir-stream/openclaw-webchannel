@@ -271,18 +271,18 @@ function sealedHistoryBytes(h: Harness, messages: HistoryMessage[]): number {
 
 /**
  * Same row, shorter body. Written per-variant so the union stays discriminated:
- * a tool row carries no `text` body to shorten, so it is returned unchanged (no
- * fixture here builds one); the text and reasoning variants get the new body.
+ * only the text and reasoning variants carry a `text` body to shorten; a tool or
+ * approval row has none and is returned unchanged (no fixture here builds one).
  */
 function withText(message: HistoryMessage, text: string): HistoryMessage {
-  if (message.kind === "tool") return message;
   if (message.kind === "reasoning") return { ...message, text };
-  return { ...message, text };
+  if (message.kind === undefined) return { ...message, text };
+  return message;
 }
 
-/** The row's text body, or "" for a tool row (which has none). */
+/** The row's text body, or "" for a tool or approval row (which have none). */
 function bodyText(message: HistoryMessage): string {
-  return message.kind === "tool" ? "" : message.text;
+  return message.kind === undefined || message.kind === "reasoning" ? message.text : "";
 }
 
 /**
