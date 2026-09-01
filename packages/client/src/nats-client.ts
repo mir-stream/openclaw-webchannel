@@ -182,6 +182,11 @@ export type InboundMessage = {
     // replay ledger; unknown ids are a silent no-op.
     | "ack"
     | "inbound_rejected"
+    // #245 Part B: the immediate multi-device broadcast of a just-committed inbound
+    // USER message (carries `id`/`text`/`turnId`/`seq`/`random_id`). Seq-bearing on
+    // the client — it flows through the wrapper's gap-detection/cursor path. The
+    // origin reconciles by `random_id`; a non-origin device appends it.
+    | "user_committed"
     // #244 half B: the gap-recovery catch-up response (carries `events`). The
     // wrapper folds each raw event through its reducer and advances its seq cursor.
     | "difference";
@@ -343,6 +348,14 @@ export type InboundMessage = {
   seq?: number;
   /** #244 half A — see `seq`. */
   highWaterSeq?: number;
+  /**
+   * #245 Part B: on a `user_committed` frame, the client-minted idempotency
+   * `random_id` of the send this echoes — the origin device's reconciliation key
+   * (re-key the optimistic bubble onto the server `id`), a no-op on a non-origin
+   * device. Optional (an older client's send omits it). Re-declared loosely, like
+   * every other field here (zero-dep package; runtime discrimination).
+   */
+  random_id?: string;
   /**
    * #244 half B: the RAW journal events on a `difference` frame — each `event` is
    * an untyped wire object the wrapper folds through its reducer, paired with the

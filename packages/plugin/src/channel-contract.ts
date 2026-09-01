@@ -538,6 +538,37 @@ export type OutboundWsMessage =
     }
   | { type: "inbound_rejected"; ids: string[]; reason: "overloaded" }
   /**
+   * #245 Part B (doc §16.2-8, the Telegram multi-device model): the immediate
+   * BROADCAST of a just-committed inbound USER message to ALL of the account's
+   * devices, so a user's own send appears on their OTHER devices NOW rather than
+   * only when the agent next responds.
+   *
+   * ⚠️ IT IS A DELIVERY OF AN ALREADY-JOURNALED EVENT, NOT A NEW DURABLE ROW.
+   * `appendInboundUser` has already committed the `user` event (that is where its
+   * `id`/`seq`/`random_id` come from); this frame merely ships it live. So, like
+   * `difference` and `history`, it is EXCLUDED from `journalEventForOutbound`/
+   * `isSeqBearingFrame` — re-journaling it would write the store's own output back
+   * in. Its `seq` is set at CONSTRUCTION from `appendInboundUser`'s return
+   * (`nats-channel.ts`'s `sendUserCommitted`), NOT stamped by `sendToPeer`'s
+   * seq-bearing path (which only touches frames `isSeqBearingFrame` accepts).
+   *
+   * ⚠️ `seq` IS REQUIRED HERE, unlike the `seq?` on the durable frames. The user
+   * opener's seq is known at commit and is the whole point of the frame for a
+   * NON-ORIGIN device: it advances that device's cursor so the turn's first agent
+   * frame at `seq+1` reads as contiguous rather than a phantom gap (doc §16.2-6).
+   *
+   * ⚠️ `random_id` IS THE ORIGIN's RECONCILIATION KEY. The origin device adopts
+   * its optimistic bubble onto this `id` by matching `random_id` (the same
+   * correlation `ack.committed`/#337 use) and then folds a no-op — ONE bubble. A
+   * non-origin device has no linkage for this `random_id`, so the adopt is a
+   * no-op and it APPENDS the user event. Absent for an older (non-`random_id`)
+   * client's send. ADDITIVE — an older client that does not know this type drops
+   * it (not in its seq-bearing set / frame switch), and the gap-sync fallback
+   * still converges the user event when the next agent frame opens a gap; the
+   * broadcast is at-most-once and purely an IMMEDIACY optimization over that path.
+   */
+  | { type: "user_committed"; id: string; text: string; turnId?: string; seq: number; random_id?: string }
+  /**
    * #244 half B (doc §16.2-6): the answer to `get_difference` — the RAW journal
    * events with `seq > afterSeq`, each paired with its `seq`, in ascending `seq`
    * order. The client folds each `event` through the SAME reducer it folds live
@@ -625,6 +656,17 @@ export interface WebChannelPeerChannel {
     peerId: string,
     events: Array<{ seq: number; event: DurableEvent }>,
   ): boolean;
+  /**
+   * #245 Part B: broadcast a just-committed inbound user message to the account's
+   * devices. Optional so an older channel impl is not forced to implement it — see
+   * the `user_committed` member of `OutboundWsMessage`. `seq`/`id`/`random_id`
+   * come from `appendInboundUser`'s return; the frame is NOT journaled here (the
+   * event already is).
+   */
+  sendUserCommitted?(
+    peerId: string,
+    message: { id: string; text: string; turnId?: string; seq: number; random_id?: string },
+  ): boolean;
   sendApprovalRequest(peerId: string, request: ApprovalRequestPayload): boolean;
   sendApprovalResolved(peerId: string, id: string, decision: ApprovalDecision): boolean;
   sendApprovalSnapshot(peerId: string, approvals: ApprovalRequestPayload[], resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean;
@@ -647,6 +689,7 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendTyping(_peerId: string): boolean { return false; }
   sendHistory(_peerId: string, _messages: HistoryMessage[], _highWaterSeq?: number): boolean { return false; }
   sendDifference(_peerId: string, _events: Array<{ seq: number; event: DurableEvent }>): boolean { return false; }
+  sendUserCommitted(_peerId: string, _message: { id: string; text: string; turnId?: string; seq: number; random_id?: string }): boolean { return false; }
   sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload): boolean { return false; }
   sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision): boolean { return false; }
   sendApprovalSnapshot(_peerId: string, _approvals: ApprovalRequestPayload[], _resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean { return false; }

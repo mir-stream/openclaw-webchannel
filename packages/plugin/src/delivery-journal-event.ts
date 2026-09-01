@@ -658,6 +658,16 @@ export function journalEventForOutbound(
       // output back in, exactly like `history` above. NOT seq-bearing either —
       // `isSeqBearingFrame` rejects it, and the drift test pins the two agreeing.
       return null;
+    case "user_committed":
+      // #245 Part B — the immediate multi-device BROADCAST of a user message the
+      // store ALREADY committed (`appendInboundUser` minted its id/seq before this
+      // frame was built). Journaling it would write the store's own output back in,
+      // duplicating the `user` row `appendInboundUser` wrote — exactly the
+      // `difference`/`history` shape above. NOT seq-bearing either: its `seq` is
+      // set at construction from `appendInboundUser`'s return, not stamped by
+      // `sendToPeer`, so `isSeqBearingFrame` rejects it and the drift test pins
+      // the two agreeing.
+      return null;
     case "commands":
       // Catalog data, not a transcript message.
       return null;

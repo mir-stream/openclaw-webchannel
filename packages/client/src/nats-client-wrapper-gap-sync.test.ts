@@ -551,3 +551,160 @@ describe("#337 — a difference user event adopts an un-adopted optimistic bubbl
     expect(userIds(w)).toEqual(["webchannel-user-2"]);
   });
 });
+
+describe("#245 Part B — the multi-device user_committed broadcast", () => {
+  // The immediate mirror: a user's own send is broadcast on the shared `.out`
+  // subject so their OTHER devices render it NOW. It is seq-bearing on the client
+  // (drives the cursor); the origin reconciles by random_id, a non-origin device
+  // appends. The gap-sync path (#244 hB / #337) stays the correctness fallback.
+  const userCommitted = (seq: number): InboundMessage => ({
+    type: "user_committed",
+    id: "webchannel-user-2",
+    text: "hello",
+    turnId: "t1",
+    seq,
+    random_id: "rand-1",
+  });
+
+  it("NON-ORIGIN: appends the user bubble and advances the cursor (no gap, no request)", () => {
+    // This device did NOT send the message — no optimistic bubble, no random_id
+    // linkage. The broadcast at seq2 is contiguous with the seeded cursor (1), so
+    // it folds live: applyUser appends (the adopt is a no-op — no linkage).
+    const { w, getDifference } = spied();
+    w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+    w.handleMessage(userCommitted(2));
+
+    expect(userIds(w)).toEqual(["webchannel-user-2"]);
+    const users = project(w).filter((m) => (m as { role?: string }).role === "user");
+    expect((users[0] as { text: string }).text).toBe("hello");
+    // The cursor advanced to the user opener's seq — so the turn's first agent
+    // frame at seq3 is CONTIGUOUS, not a phantom gap.
+    expect(w.lastAppliedSeq).toBe(2);
+    w.handleMessage({ type: "agent_message", id: "a3", text: "answer 3", turnId: "t1", seq: 3 });
+    expect(getDifference).not.toHaveBeenCalled();
+    expect(w.lastAppliedSeq).toBe(3);
+    // One user bubble + one agent bubble, in seq order.
+    expect(project(w).map((m) => (m as { text: string }).text)).toEqual(["hello", "answer 3"]);
+  });
+
+  it("ORIGIN, broadcast BEFORE ack: adopts the optimistic bubble; the later ack skips — ONE bubble", () => {
+    const { w } = spied();
+    w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+    seedOptimisticUser(w, { localId: "u-0", receiptKey: "r-0", randomId: "rand-1", text: "hello", wireId: "t1" });
+    expect(userIds(w)).toEqual(["u-0"]);
+
+    // The broadcast arrives first: adopt-by-random_id re-keys u-0 → server id and
+    // drains the linkage; applyUser then no-ops on the now-held id.
+    w.handleMessage(userCommitted(2));
+    expect(userIds(w)).toEqual(["webchannel-user-2"]);
+    expect(w.randomIdToReceiptKey.has("rand-1")).toBe(false);
+    expect(w.lastAppliedSeq).toBe(2);
+
+    // The ack (origin's authoritative receipt) lands after: the linkage is drained,
+    // so adoptCommittedIds skips; advanceCursor(2) is a no-op. Still ONE bubble.
+    w.handleMessage({
+      type: "ack",
+      ids: ["u-0"],
+      committed: [{ random_id: "rand-1", messageId: "webchannel-user-2", seq: 2 }],
+    });
+    expect(userIds(w)).toEqual(["webchannel-user-2"]);
+    expect(w.lastAppliedSeq).toBe(2);
+  });
+
+  it("ORIGIN, ack BEFORE broadcast: ack adopts; the broadcast no-ops — ONE bubble", () => {
+    const { w } = spied();
+    w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+    seedOptimisticUser(w, { localId: "u-0", receiptKey: "r-0", randomId: "rand-1", text: "hello", wireId: "t1" });
+
+    // The ack lands first: adopts u-0 → server id and drains the linkage.
+    w.handleMessage({
+      type: "ack",
+      ids: ["u-0"],
+      committed: [{ random_id: "rand-1", messageId: "webchannel-user-2", seq: 2 }],
+    });
+    expect(userIds(w)).toEqual(["webchannel-user-2"]);
+    expect(w.lastAppliedSeq).toBe(2);
+
+    // The broadcast follows: adopt resolves rand-1 → undefined (drained) → no re-key,
+    // and applyUser no-ops on the already-held server id. Still ONE bubble.
+    w.handleMessage(userCommitted(2));
+    expect(userIds(w)).toEqual(["webchannel-user-2"]);
+    expect(w.lastAppliedSeq).toBe(2);
+  });
+
+  it("MISSED broadcast: the gap-sync fallback still converges (non-origin)", () => {
+    // The at-most-once broadcast is DROPPED, so this non-origin device never sees
+    // the user_committed. The turn's first agent frame (seq3) then opens a gap →
+    // get_difference(1) → the difference carries the user event (#337 appends it
+    // for a device with no linkage). Convergence is preserved by the fallback.
+    const { w, getDifference } = spied();
+    w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+    // NO userCommitted(2) delivered — the broadcast was missed.
+    w.handleMessage({ type: "agent_message", id: "a3", text: "answer 3", turnId: "t1", seq: 3 });
+    expect(getDifference).toHaveBeenCalledWith(1);
+    w.handleMessage({
+      type: "difference",
+      events: [
+        { seq: 2, event: { kind: "user", id: "webchannel-user-2", text: "hello", turnId: "t1", randomId: "rand-1" } },
+        { seq: 3, event: { kind: "bubble", answerId: "a3", text: "answer 3", turnId: "t1" } },
+      ],
+    });
+
+    expect(userIds(w)).toEqual(["webchannel-user-2"]);
+    expect(project(w).map((m) => (m as { text: string }).text)).toEqual(["hello", "answer 3"]);
+    expect(w.lastAppliedSeq).toBe(3);
+    expect(w.differenceInFlight).toBe(false);
+  });
+
+  it("broadcast THEN a later difference re-delivering the same event → still ONE bubble", () => {
+    // Non-origin sees the broadcast (appends webchannel-user-2, cursor→2). Later a
+    // gap re-fetches a range that re-carries the same user event; applyUser is
+    // id-idempotent, so the second fold is a no-op — no duplicate.
+    const { w, getDifference } = spied();
+    w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+    w.handleMessage(userCommitted(2));
+    expect(userIds(w)).toEqual(["webchannel-user-2"]);
+    expect(w.lastAppliedSeq).toBe(2);
+
+    // A later agent frame at seq5 opens a gap (seqs 3,4 dropped) → get_difference(2),
+    // and the server's difference re-carries seq2's user event alongside the missed
+    // range.
+    w.handleMessage({ type: "agent_message", id: "a5", text: "answer 5", turnId: "t1", seq: 5 });
+    expect(getDifference).toHaveBeenCalledWith(2);
+    w.handleMessage({
+      type: "difference",
+      events: [
+        { seq: 2, event: { kind: "user", id: "webchannel-user-2", text: "hello", turnId: "t1", randomId: "rand-1" } },
+        { seq: 3, event: { kind: "bubble", answerId: "a3", text: "answer 3", turnId: "t1" } },
+        { seq: 4, event: { kind: "bubble", answerId: "a4", text: "answer 4", turnId: "t1" } },
+        { seq: 5, event: { kind: "bubble", answerId: "a5", text: "answer 5", turnId: "t1" } },
+      ],
+    });
+
+    // The re-delivered user event did NOT duplicate — one user bubble, held id.
+    expect(userIds(w)).toEqual(["webchannel-user-2"]);
+    expect(project(w).map((m) => (m as { text: string }).text)).toEqual([
+      "hello", "answer 3", "answer 4", "answer 5",
+    ]);
+    expect(w.lastAppliedSeq).toBe(5);
+  });
+
+  it("an OLDER client with no user_committed handling is unaffected (frame ignored, gap-sync converges)", () => {
+    // Simulate an older wrapper: user_committed is not in ITS seq-bearing set and
+    // not in ITS frame switch, so it neither advances the cursor nor folds. Here we
+    // just never deliver it (the older client would drop it) and confirm the stream
+    // still converges through the gap path — the additive-frame back-compat claim.
+    const { w, getDifference } = spied();
+    w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+    w.handleMessage({ type: "agent_message", id: "a3", text: "answer 3", turnId: "t1", seq: 3 });
+    expect(getDifference).toHaveBeenCalledWith(1);
+    w.handleMessage({
+      type: "difference",
+      events: [
+        { seq: 2, event: { kind: "user", id: "webchannel-user-2", text: "hello", turnId: "t1", randomId: "rand-1" } },
+        { seq: 3, event: { kind: "bubble", answerId: "a3", text: "answer 3", turnId: "t1" } },
+      ],
+    });
+    expect(project(w).map((m) => (m as { text: string }).text)).toEqual(["hello", "answer 3"]);
+  });
+});

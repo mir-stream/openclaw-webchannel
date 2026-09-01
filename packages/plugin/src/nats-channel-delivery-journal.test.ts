@@ -273,6 +273,31 @@ describe("#239 — egress persist-before-publish", () => {
     expect(appends(calls)).toEqual([]);
   });
 
+  it("#245 Part B — sendUserCommitted publishes to the shared subject, journals nothing, and preserves the construction seq", () => {
+    const { calls, transport, channel } = makeChannel();
+
+    expect(
+      channel.sendUserCommitted(PEER, {
+        id: "webchannel-user-7",
+        text: "hi",
+        turnId: "u-7",
+        seq: 7,
+        random_id: "r-7",
+      }),
+    ).toBe(true);
+
+    // Reached the shared `.out` subject as a `user_committed` frame…
+    expect(calls).toEqual([{ call: "publish", subject: OUT, type: "user_committed" }]);
+    // …produced NO journal row (the `user` event was already committed upstream)…
+    expect(appends(calls)).toEqual([]);
+    // …and the published frame carries the seq set at CONSTRUCTION, verbatim —
+    // `sendToPeer` does not stamp it (it only stamps seq-bearing/durable frames,
+    // and this one is neither).
+    expect(transport.frames).toEqual([
+      { type: "user_committed", id: "webchannel-user-7", text: "hi", turnId: "u-7", seq: 7, random_id: "r-7" },
+    ]);
+  });
+
   it("#242 half 3 — journals EVERY tool_activity frame, persist-before-publish", () => {
     const { calls, channel } = makeChannel();
 

@@ -305,6 +305,19 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
     ids: string[],
     committed?: Array<{ random_id: string; messageId: string; seq: number }>,
   ) => boolean;
+  /**
+   * #245 Part B: broadcast a just-committed inbound user message to the account's
+   * devices (the Telegram multi-device model — a user's own send appears on their
+   * other devices immediately). Called ONCE per genuinely NEW admission
+   * (`appendInboundUser`'s `inserted === true`), never on a dedup retry. OPTIONAL
+   * and back-compatible — the gap-sync catch-up (#244 hB / #337) remains the
+   * correctness fallback if the at-most-once broadcast is missed, so an
+   * account/test wired without this simply converges non-origin devices lazily.
+   */
+  sendUserCommitted?: (
+    peerId: string,
+    message: { id: string; text: string; turnId?: string; seq: number; random_id?: string },
+  ) => boolean;
   sendInboundRejected?: (peerId: string, ids: string[]) => boolean;
   outcomeStore?: IngressOutcomeStore;
   beginBatch?: (peerId: string) => DispatcherBatchLease<T["message"]>;
@@ -988,7 +1001,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               // Synchronous and in arrival order, because `seq` order is the
               // stream's order and the stream's order IS the identity model
               // (doc §16.5.3). No batching, no deferral.
-              const { messageId, seq } = deps.deliveryJournal.appendInboundUser(peerId, {
+              const { messageId, seq, inserted } = deps.deliveryJournal.appendInboundUser(peerId, {
                 text: pending.text,
                 turnId: pending.wireId,
                 ...(pending.randomId !== undefined ? { randomId: pending.randomId } : {}),
@@ -1002,6 +1015,38 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               // and without it the turn's first agent frame reads as a phantom gap.
               if (pending.randomId !== undefined) {
                 committedBatch.push({ random_id: pending.randomId, messageId, seq });
+              }
+              // #245 Part B: broadcast the committed user event to the account's
+              // OTHER devices so a user's own send appears there immediately (the
+              // Telegram model), rather than lazily on the next agent frame's
+              // gap-sync catch-up. ONE publish to the shared `.out` subject — it IS
+              // the fan-out (no per-device registry; doc §16.2-8).
+              //
+              // ⚠️ ONLY ON A GENUINELY NEW ADMISSION (`inserted === true`). A dedup
+              // retry re-appends idempotently (`inserted === false`) and must NOT
+              // re-broadcast: it would be redundant (the event already went out on
+              // the first admission) — harmless if it did (the client's adopt/
+              // `applyUser` are idempotent), but this keeps the wire quiet.
+              //
+              // ⚠️ NOT the origin's authoritative receipt — that stays the
+              // `ack.committed` echo above, unchanged. This is the mirror to the
+              // OTHER devices; the origin reconciles it against its optimistic
+              // bubble by `random_id` (a no-op once the ack drained the linkage),
+              // so it too sees exactly one bubble.
+              //
+              // The gap-sync path (#244 hB / #337) REMAINS the correctness
+              // fallback: NATS is at-most-once, so a missed broadcast is caught
+              // when the next agent frame opens a seq gap and `get_difference`
+              // re-delivers this user event (#337 appends it for a non-origin
+              // device). This broadcast only makes the common case immediate.
+              if (inserted) {
+                deps.sendUserCommitted?.(peerId, {
+                  id: messageId,
+                  text: pending.text,
+                  turnId: pending.wireId,
+                  seq,
+                  ...(pending.randomId !== undefined ? { random_id: pending.randomId } : {}),
+                });
               }
             }
           } catch (error) {
