@@ -652,6 +652,12 @@ export function journalEventForOutbound(
       // Server→client REPLAY. Journaling it would journal the store's own
       // output back into the store.
       return null;
+    case "difference":
+      // #244 half B — server→client REPLAY of events the store already holds
+      // (`get_difference` catch-up). Journaling it would write the store's own
+      // output back in, exactly like `history` above. NOT seq-bearing either —
+      // `isSeqBearingFrame` rejects it, and the drift test pins the two agreeing.
+      return null;
     case "commands":
       // Catalog data, not a transcript message.
       return null;

@@ -166,6 +166,9 @@ import { planHistoryFetch } from "./history.js";
 import { serveHistoryRequest, type ServedHistory } from "./journal-history.js";
 import { logSafe } from "./log-safe.js";
 import type { NatsChannel } from "./nats-channel.js";
+// #244 half B: a `difference` carries RAW journal events, typed by the client
+// reducer's `DurableEvent` (`JournalEvent`'s alias). TYPE-ONLY, erased.
+import type { DurableEvent } from "../../client/src/durable-view-reducer.js";
 
 /**
  * The exact channel surface this module reaches. `Pick` over the real class, the
@@ -179,8 +182,21 @@ import type { NatsChannel } from "./nats-channel.js";
  */
 export type HistoryChannelSurface = Pick<
   NatsChannel,
-  "sendHistory" | "outboundWireSize" | "effectiveOutboundLimit"
+  "sendHistory" | "sendDifference" | "outboundWireSize" | "effectiveOutboundLimit"
 >;
+
+/**
+ * #244 half B — the ceiling on how many RAW events one `difference` response
+ * carries. It bounds the READ (`delivery-journal.read`'s `limit`); the real bound
+ * on the wire is the BYTE budget applied in `fitDifference` below. A gap is
+ * normally a handful of dropped frames, so this rarely binds — and when it does,
+ * the client advances to the max seq it received and re-requests for the rest, so
+ * a capped response costs a round-trip, never data (doc §16.2-6).
+ */
+export const MAX_DIFFERENCE_EVENTS = 500;
+
+/** One raw catch-up entry: a journal row's `seq` and its event, folded client-side. */
+export type DifferenceEntry = { seq: number; event: DurableEvent };
 
 /** Minimal logger shape — matches OpenClaw's optional-method logger. */
 export type HistoryServerLogger = {
@@ -234,6 +250,23 @@ export type HistoryServer = {
     peerId: string,
     request: { before?: string; beforeTurnId?: string; limit?: number },
   ): void;
+  /**
+   * #244 half B — answer a `get_difference(afterSeq)`: read this peer's journal
+   * for `seq > afterSeq`, byte-fit the RAW events, and `sendDifference`.
+   *
+   * ⚠️ RAW EVENTS, NO REDUCER. Unlike `sendSnapshot`/`servePage` this does NOT
+   * call `serveHistoryRequest`/`projectJournalHistory` — the #286 quadratic
+   * replay — because the client already holds the folded view and folds the
+   * difference onto it. This is the whole reason half B is #286-free.
+   *
+   * ⚠️ NOT DEFERRED. The read is a single bounded, indexed `read(afterSeq, limit)`
+   * — O(limit) rows, no fold — so unlike the two projection paths it stays on the
+   * dispatch turn (the same choice `servePage`'s docblock defends the OTHER way
+   * for the fold). It is wrapped in a try/catch: a read fault logs and sends
+   * nothing (the client's request simply goes unanswered and its buffered frames
+   * eventually drive a retry), never an empty frame that would falsely advance.
+   */
+  serveDifference(peerId: string, afterSeq: number): void;
 };
 
 /** What a diagnostic is about. Closed set; one throttle entry per (kind, reason). */
@@ -633,7 +666,92 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
     });
   };
 
+  /**
+   * #244 half B — trim a difference to the peer's wire, keeping the OLDEST
+   * contiguous prefix (lowest seqs).
+   *
+   * ⚠️ THE OPPOSITE END FROM `fitHistoryFrame`, ON PURPOSE. A history page keeps
+   * the NEWEST rows because the pager reaches the older ones. A difference must
+   * keep the OLDEST because the client advances its cursor to the max seq it
+   * receives and re-requests from there: dropping the tail is re-requestable,
+   * dropping the head would strand a permanent hole below the new cursor. Order is
+   * never permuted.
+   *
+   * Each event was already delivered LIVE as its own frame that fit this wire, so
+   * a single event always fits and the kept prefix is non-empty whenever the input
+   * is — which is what guarantees the client makes FORWARD PROGRESS rather than
+   * stalling on a `difference` the channel would refuse.
+   */
+  const fitDifference = (peerId: string, entries: DifferenceEntry[]): DifferenceEntry[] => {
+    if (entries.length === 0) return entries;
+    const limit = channel.effectiveOutboundLimit();
+    // An unusable limit means "no bound known" — send as-is and let the channel
+    // decide, the same idiom `fitHistoryFrame` uses.
+    if (!Number.isSafeInteger(limit) || limit < 0) return entries;
+    const sizeOf = (rows: DifferenceEntry[]): number | undefined =>
+      channel.outboundWireSize(peerId, { type: "difference", events: rows });
+    const whole = sizeOf(entries);
+    // No session key yet: the send is about to fail-closed for the same reason, so
+    // there is nothing to budget. Hand it on unchanged.
+    if (whole === undefined) return entries;
+    if (whole <= limit) return entries;
+    // Oversize: keep the largest fitting PREFIX. Bounded by row count and only
+    // paid by a response that would otherwise be refused whole.
+    let hi = entries.length;
+    while (hi > 1) {
+      const prefix = entries.slice(0, hi - 1);
+      const size = sizeOf(prefix);
+      hi -= 1;
+      if (size !== undefined && size <= limit) return prefix;
+    }
+    // One event and it still does not fit (the #311 undeliverable case, and it was
+    // deliverable live so this is near-impossible). Hand it on; the channel refuses
+    // it loudly rather than this function impersonating "no events to send".
+    return entries.slice(0, 1);
+  };
+
+  const publishDifference = (peerId: string, entries: DifferenceEntry[]): void => {
+    const fitted = fitDifference(peerId, entries);
+    if (!channel.sendDifference?.(peerId, fitted)) {
+      try {
+        logger?.error?.(
+          `webchannel: difference publish failed for ${logSafe(peerId)}: the ` +
+            `channel refused a ${fitted.length}-event frame; see the channel log`,
+        );
+      } catch { /* a faulting logger must not escape the dispatch turn */ }
+    }
+  };
+
   return {
+    serveDifference(peerId: string, afterSeq: number): void {
+      let entries: DifferenceEntry[];
+      try {
+        // RAW read: `read` already filters `seq > afterSeq` and orders by seq
+        // ascending. NO reducer, NO projection — the whole point (doc §16.2-6):
+        // the client folds these onto the view it already holds.
+        const rows = journal.read(peerId, { afterSeq, limit: MAX_DIFFERENCE_EVENTS });
+        // The row's event is `RetainedJournalEvent` — a newer build's row may carry
+        // a kind this build does not know (#253). It is shipped VERBATIM: the
+        // CLIENT skips an unknown kind while still advancing its cursor past it (as
+        // `projectJournalHistory` does with `unsupportedEvents`), so filtering here
+        // would strand the cursor below an unknown tail and re-request forever.
+        entries = rows.map((row) => ({ seq: row.seq, event: row.event as DurableEvent }));
+      } catch (err) {
+        try {
+          logger?.error?.(
+            `webchannel: difference read failed for ${logSafe(peerId)} ` +
+              `(afterSeq=${afterSeq}): ${logSafe(err)}`,
+          );
+        } catch { /* a faulting logger must not escape the dispatch turn */ }
+        return;
+      }
+      // An EMPTY difference (afterSeq already current) is still ANSWERED — the
+      // client's `case "difference"` no-ops the fold and drains its buffer, which
+      // is how a spurious/raced detection unwinds. Sending nothing would leave a
+      // client that DID buffer stuck in-flight.
+      publishDifference(peerId, entries);
+    },
+
     sendSnapshot(peerId: string): void {
       // #244 half A: the conversation's high-water `seq` at snapshot time,
       // captured in `produce` (inside the read guard) and stamped onto the

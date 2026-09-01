@@ -99,6 +99,59 @@ function normalizeAssistantMessageIndex(value: unknown): number | undefined {
     ? value
     : undefined;
 }
+
+/**
+ * #244 half B — the inbound frame types that carry a per-conversation `seq`, i.e.
+ * the DURABLE frames the plugin stamps `seq` on (`isSeqBearingFrame` in
+ * `delivery-journal-event.ts` is the server-side twin, and its drift test pins the
+ * set). These are the frames gap detection watches and the ones buffered while a
+ * `get_difference` is in flight. A frame of one of these types WITHOUT a `seq`
+ * (an id-less `agent_message`, a live reasoning DRAFT) is still handled normally —
+ * it just carries no cursor, so it neither advances nor gaps.
+ */
+const SEQ_BEARING_INBOUND_TYPES: ReadonlySet<string> = new Set([
+  "agent_message",
+  "progress",
+  "turn_snapshot",
+  "reasoning",
+  "tool_activity",
+  "approval_request",
+  "approval_resolved",
+]);
+
+function isSeqBearingInbound(msg: { type?: unknown }): boolean {
+  return typeof msg.type === "string" && SEQ_BEARING_INBOUND_TYPES.has(msg.type);
+}
+
+/**
+ * #244 half B — the `DurableEvent` kinds this build's reducer knows. A
+ * `difference` from a NEWER plugin may carry a kind outside this set (#253's
+ * retained-unknown rows); the client SKIPS folding it but still advances its
+ * cursor past its seq — exactly as the server's `projectJournalHistory` counts an
+ * `unsupportedEvents` row rather than stalling on it. Kept in step with
+ * `applyDurableEvent`'s switch (`durable-view-reducer.ts`).
+ */
+const KNOWN_DURABLE_EVENT_KINDS: ReadonlySet<string> = new Set([
+  "user",
+  "placement",
+  "bubble",
+  "seal",
+  "reasoning",
+  "tool",
+  "approval",
+  "approvalResolution",
+  "messageEdited",
+  "messageDeleted",
+]);
+
+function isFoldableDurableEvent(event: unknown): event is DurableEvent {
+  return (
+    !!event &&
+    typeof event === "object" &&
+    typeof (event as { kind?: unknown }).kind === "string" &&
+    KNOWN_DURABLE_EVENT_KINDS.has((event as { kind: string }).kind)
+  );
+}
 // P1-9: the client-side mirror of core's abort predicate (§3.3). Intentionally
 // NOT re-exported from the public barrel; imported directly here and by the
 // plugin-side contract test.
@@ -2812,6 +2865,25 @@ export class WebChannelNATSClient {
    *  instance, not per frame — a legacy plugin emits one per reply. */
   private warnedIdlessDurableFrame = false;
 
+  // ---- #244 half B — per-conversation seq tracking + gap recovery -----------
+  //
+  // ONE conversation per client here (`peerId` is fixed at construction and the
+  // `.out` stream is single-conversation), so a single cursor suffices — no
+  // per-conversation map. `0` is the empty-journal baseline (`delivery-journal`'s
+  // `maxSeq` returns 0 for no rows), and it is SEEDED from the reconnect snapshot's
+  // `highWaterSeq` (`case "history"`). A durable frame at `lastAppliedSeq + 1` is
+  // contiguous; one beyond it is a gap.
+  private lastAppliedSeq = 0;
+  /**
+   * True while a `get_difference` round-trip is outstanding. Durable frames that
+   * arrive in this window are BUFFERED (`gapBuffer`) rather than folded — folding
+   * one the difference will also carry would double-apply a non-idempotent event
+   * (`seal` reorders; `user`/`messageEdited` are not idempotent).
+   */
+  private differenceInFlight = false;
+  /** Durable frames held during a catch-up, drained in arrival order once it lands. */
+  private gapBuffer: InboundMessage[] = [];
+
   // ---------------------------------------------------------------------------
   // P0-4 — receipt records + send-state projection (D5)
   // ---------------------------------------------------------------------------
@@ -3128,6 +3200,79 @@ export class WebChannelNATSClient {
   // ---------------------------------------------------------------------------
 
   private handleMessage(msg: InboundMessage): void {
+    // #244 half B: the catch-up response is orchestration (fold N events, then
+    // drain the buffer), not a single state transition, so it is handled ahead of
+    // the ordinary dispatch and outside the seq-bearing path below.
+    if (msg.type === "difference") {
+      this.applyDifference(msg);
+      return;
+    }
+
+    // #244 half B: DURABLE (seq-bearing) frames drive gap detection and are
+    // buffered while a `get_difference` is in flight. Every other frame passes
+    // straight through — a `difference` is the only inbound frame that itself
+    // advances the cursor without being folded live.
+    if (isSeqBearingInbound(msg)) {
+      if (this.differenceInFlight) {
+        // Held, not folded — see `gapBuffer`. Drained (or discarded as covered)
+        // when the difference lands.
+        this.gapBuffer.push(msg);
+        return;
+      }
+      const seq = typeof msg.seq === "number" ? msg.seq : undefined;
+      if (seq !== undefined && seq > this.lastAppliedSeq + 1) {
+        // GAP: frames (lastApplied, seq) were dropped — NATS is at-most-once, so a
+        // hole in the contiguous seq stream is a real drop. Hold this frame,
+        // request everything after the cursor, and buffer the rest until it lands.
+        // Exactly ONE `get_difference` per gap: `differenceInFlight` gates re-entry.
+        this.differenceInFlight = true;
+        this.gapBuffer.push(msg);
+        this.client.getDifference(this.lastAppliedSeq);
+        return;
+      }
+      this.applyFrame(msg);
+      // High-water advance: a deduped retry or a `messageEdited`-style revision may
+      // REUSE or repeat a seq, so the cursor only ever moves forward and a
+      // `seq <= lastApplied` is never read as a gap.
+      if (seq !== undefined && seq > this.lastAppliedSeq) this.lastAppliedSeq = seq;
+      return;
+    }
+
+    this.applyFrame(msg);
+
+    // Two NON-seq-bearing frames still carry a seq BASELINE the cursor tracks.
+    if (msg.type === "history") {
+      // The reconnect snapshot's authoritative high-water — the baseline half B
+      // resumes gap detection from (doc §16.2-6). `case "history"` has already
+      // hydrated; seed the cursor to it, never backward. (A `load_history` PAGE
+      // omits `highWaterSeq`, so this only fires for the register-time snapshot.)
+      if (typeof msg.highWaterSeq === "number" && msg.highWaterSeq > this.lastAppliedSeq) {
+        this.lastAppliedSeq = msg.highWaterSeq;
+      }
+    } else if (msg.type === "ack") {
+      // The inbound USER opener consumes a seq but rides no durable frame — half A
+      // echoes that seq here. Advance the high-water so the turn's first agent
+      // frame at userSeq+1 reads as contiguous instead of a phantom gap. ADVANCE
+      // ONLY, never gap-detect on the ack: `adoptCommittedIds` has already re-keyed
+      // the local user bubble to `webchannel-user-<seq>`, so a later `difference`
+      // that carries the same `user` event folds as a no-op by id — but only
+      // because we do not withhold the adopt. A pre-user gap from another device is
+      // therefore left to reconnect recovery (half C) rather than risk duplicating
+      // the optimistic bubble; see the report.
+      for (const entry of msg.committed ?? []) {
+        if (typeof entry?.seq === "number" && entry.seq > this.lastAppliedSeq) {
+          this.lastAppliedSeq = entry.seq;
+        }
+      }
+    }
+  }
+
+  /**
+   * The ordinary per-frame dispatch: observe held-turn activity against the
+   * pre-frame latch, fold the frame, then re-evaluate the release gate. Split out
+   * of `handleMessage` so the #244 gap-sync path can gate/buffer around it.
+   */
+  private applyFrame(msg: InboundMessage): void {
     // Observe authenticated turn activity against the pre-frame live-turn latch.
     // Reducers may settle that latch or invoke public listeners, so this must be
     // the first operation for every decrypted frame.
@@ -3138,6 +3283,112 @@ export class WebChannelNATSClient {
     // release gate after the reducer settles (a no-op when nothing is held or a
     // turn is still in flight).
     this.maybeRelease();
+  }
+
+  /**
+   * #244 half B — fold a `difference` catch-up onto the view, advance the cursor,
+   * then drain the frames buffered while the request was in flight.
+   *
+   * The events are folded through the SAME `applyDurable` reducer path live frames
+   * fold through — RAW journal events, no client-local overlays, so the result
+   * converges on the durable (history) truth for the caught-up range. The cursor
+   * advances PAST every seq in the response — including one whose kind this build
+   * cannot fold (a newer plugin) — so an unknown tail is never re-requested forever
+   * (the server's `projectJournalHistory` treats such a row the same way, as an
+   * `unsupportedEvents` skip).
+   */
+  private applyDifference(msg: InboundMessage): void {
+    const raw = Array.isArray(msg.events) ? msg.events : [];
+    const events = raw
+      .filter(
+        (e): e is { seq: number; event: unknown } =>
+          !!e && typeof e === "object" && typeof (e as { seq?: unknown }).seq === "number",
+      )
+      // The server sends ascending `seq`; sort defensively so the fold order is a
+      // property of this method, not of the wire.
+      .sort((a, b) => a.seq - b.seq);
+
+    let maxSeq = this.lastAppliedSeq;
+    for (const { seq, event } of events) {
+      // Already covered (a raced/duplicate response overlapping what we hold): skip
+      // the fold, but still let it advance the cursor.
+      if (seq > this.lastAppliedSeq && isFoldableDurableEvent(event)) {
+        this.foldDifferenceEvent(event);
+      }
+      if (seq > maxSeq) maxSeq = seq;
+    }
+    this.lastAppliedSeq = maxSeq;
+    this.differenceInFlight = false;
+    this.drainGapBuffer();
+    // A difference can settle a held-turn condition (it is durable turn content),
+    // and the fold above bypassed the per-frame gate; re-evaluate it once here.
+    this.maybeRelease();
+  }
+
+  /**
+   * #244 half B — fold ONE raw catch-up event, applying the SAME client-local
+   * overlay the corresponding LIVE handler applies.
+   *
+   * ⚠️ THE OVERLAY IS LOAD-BEARING, NOT DECORATION — this is the subtlety half B
+   * turns on. `working`/`draftOnly` are client-local flags the wire never carries
+   * (a journal `placement` has no text; a `bubble`/`seal` authors durable text and
+   * RETIRES the draft). A BARE `applyDurable(bubble)` folded onto a live draft
+   * bubble keeps that bubble `draftOnly:true` — and `projectDurableFromClient`
+   * blanks a `draftOnly` bubble to `""`, so the caught-up text would VANISH from
+   * the durable view. Re-supplying the exact overlays `case "agent_message"` /
+   * `case "progress"` / `applyTurnSnapshot` supply is what makes a gap heal to a
+   * view byte-identical to the no-gap fold (live == history). Every other event
+   * kind (`user`/`reasoning`/`tool`/`approval`/…) carries no such flag, so it folds
+   * with no overlay exactly as its live handler does — an approval, like a
+   * history-replayed one, is inert until an `approval_snapshot` arms it.
+   */
+  private foldDifferenceEvent(event: DurableEvent): void {
+    switch (event.kind) {
+      case "bubble":
+        // Mirror `case "agent_message"`: durable text authored ⇒ no longer a draft.
+        this.applyDurable(event, {
+          [event.answerId]: { working: false, draftOnly: undefined },
+        });
+        return;
+      case "placement":
+        // Mirror `case "progress"`: the slot claim is a working draft. The draft
+        // TEXT is not journaled, so it stays empty until a `bubble`/`seal` authors
+        // it (the same lane the live progress carried, minus the volatile text).
+        this.applyDurable(event, {
+          [event.answerId]: { working: true, draftOnly: true },
+        });
+        return;
+      case "seal": {
+        // Mirror `applyTurnSnapshot`: each sealed answer is authored durable text.
+        const local = Object.create(null) as DurableLocalOverlay;
+        for (const a of event.answers) {
+          local[a.id] = { working: false, draftOnly: undefined };
+        }
+        this.applyDurable(event, local);
+        return;
+      }
+      default:
+        this.applyDurable(event);
+    }
+  }
+
+  /**
+   * #244 half B — replay the frames buffered during a catch-up, in arrival order.
+   *
+   * A buffered frame the difference already covered (`seq <= lastApplied`) is
+   * DISCARDED — re-folding it would double-apply a non-idempotent event. Anything
+   * still beyond the cursor is re-dispatched through `handleMessage`, so a buffered
+   * frame that reveals a FURTHER gap re-enters gap-sync cleanly, re-buffering the
+   * remainder onto the (freshly emptied) buffer.
+   */
+  private drainGapBuffer(): void {
+    const buffered = this.gapBuffer;
+    this.gapBuffer = [];
+    for (const m of buffered) {
+      const seq = typeof m.seq === "number" ? m.seq : undefined;
+      if (seq !== undefined && seq <= this.lastAppliedSeq) continue;
+      this.handleMessage(m);
+    }
   }
 
   private handleFrame(msg: InboundMessage): void {

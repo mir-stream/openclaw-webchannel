@@ -344,6 +344,10 @@ describe("journalEventForOutbound returns null for every non-durable frame", () 
     ["commands (catalog, not a message)", { type: "commands", commands: [] }],
     ["ack (transport control)", { type: "ack", ids: ["u-0"] }],
     ["inbound_rejected (transport control)", { type: "inbound_rejected", ids: ["u-0"], reason: "overloaded" }],
+    // #244 half B: a `difference` is a server→client REPLAY of events the store
+    // already holds — journaling it would write the store's own output back in,
+    // exactly like `history`. NOT seq-bearing either (the drift describe pins that).
+    ["difference (a REPLAY — never durable)", { type: "difference", events: [] }],
   ];
 
   it.each(nonDurable)("%s", (_label, frame) => {
@@ -385,6 +389,7 @@ describe("journalEventForOutbound returns null for every non-durable frame", () 
         "approval_resolved",
         "approval_snapshot",
         "commands",
+        "difference",
         "history",
         "inbound_rejected",
         "progress",
@@ -730,6 +735,8 @@ describe("#244 half A — isSeqBearingFrame tracks the mapper's non-null set", (
     commands: { type: "commands", commands: [] },
     ack: { type: "ack", ids: [] },
     inbound_rejected: { type: "inbound_rejected", ids: [], reason: "overloaded" },
+    // #244 half B — a REPLAY frame; mapper returns null, predicate must reject.
+    difference: { type: "difference", events: [] },
   };
 
   it("accepts a frame IFF the mapper journals it, over every wire type", () => {

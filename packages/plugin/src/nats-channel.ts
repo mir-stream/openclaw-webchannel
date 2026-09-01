@@ -41,9 +41,15 @@ import {
   isIdlessDurableFrame,
   isSeqBearingFrame,
   journalEventForOutbound,
+  type JournalEvent,
   type JournalPolicy,
   journalFailureDiagnostic,
 } from "./delivery-journal-event.js";
+// #244 half B: `sendDifference` carries RAW journal events, typed by the client
+// reducer's `DurableEvent` (the same type `JournalEvent` aliases). TYPE-ONLY and
+// erased, so it adds no runtime dependency — the same property the `DeliveryJournal`
+// import above states.
+import type { DurableEvent } from "../../client/src/durable-view-reducer.js";
 
 /** Preserve caught-error detail without changing primitive thrown-value rendering. */
 function formatCaughtDiagnostic(value: unknown): unknown {
@@ -309,6 +315,8 @@ export class NatsChannel implements WebChannelPeerChannel {
     peerId: string,
     request: { before?: string; beforeTurnId?: string; limit?: number },
   ) => void;
+  // #244 half B: `get_difference` catch-up handler.
+  private onGetDifference?: (peerId: string, afterSeq: number) => void;
   private onLoadCommands?: (peerId: string) => void;
   private onPeerUnregister?: (peerId: string) => void;
   /** Bounded, content-free configuration-warning state for result max_payload. */
@@ -559,6 +567,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     this.onMessage = undefined;
     this.onApprovalDecision = undefined;
     this.onLoadHistory = undefined;
+    this.onGetDifference = undefined;
     this.onLoadCommands = undefined;
     this.onPeerUnregister = undefined;
     this.onRegisterRequest = undefined;
@@ -711,6 +720,25 @@ export class NatsChannel implements WebChannelPeerChannel {
   }
 
   /**
+   * #244 half B: answer a `get_difference` with RAW journal events
+   * (`seq > afterSeq`), in ascending `seq` order, for the client to fold onto the
+   * view it already holds. Rides the same sealed `.out` path as every other frame.
+   *
+   * ⚠️ NOT journaled and NOT seq-bearing — a `difference` is a server→client
+   * REPLAY (`journalEventForOutbound` returns null, `isSeqBearingFrame` rejects
+   * it), so `sendToPeer` stamps no `seq` on the FRAME; the per-event `seq` inside
+   * `events` is the cursor. This is the #286-free path: the server ships raw rows
+   * and does NOT run the reducer/projection (contrast `sendHistory`).
+   */
+  sendDifference(
+    peerId: string,
+    events: Array<{ seq: number; event: DurableEvent }>,
+  ): boolean {
+    const payload: OutboundWsMessage = { type: "difference", events };
+    return this.sendToPeer(peerId, payload);
+  }
+
+  /**
    * Send the slash-command catalog to peer (P0-3 discovery). Rides the same
    * sealed `.out` path as every other outbound frame.
    */
@@ -855,6 +883,15 @@ export class NatsChannel implements WebChannelPeerChannel {
     ) => void
   ): void {
     this.onLoadHistory = handler;
+  }
+
+  /**
+   * #244 half B: set the `get_difference` catch-up handler. Fires on a
+   * `get_difference` request; the handler reads the journal for `seq > afterSeq`
+   * and calls `sendDifference`.
+   */
+  setGetDifferenceHandler(handler: (peerId: string, afterSeq: number) => void): void {
+    this.onGetDifference = handler;
   }
 
   /**
@@ -1515,6 +1552,23 @@ export class NatsChannel implements WebChannelPeerChannel {
           beforeTurnId: message.beforeTurnId,
           limit: message.limit,
         });
+        break;
+
+      case "get_difference":
+        // #244 half B. VALIDATED here, unlike `load_history` (whose validator is
+        // `planHistoryFetch` downstream): the serve path passes `afterSeq`
+        // straight to `delivery-journal.read`, which requires a non-negative
+        // integer, and the wire is peer-controlled and validates nothing. A
+        // malformed request is dropped rather than reflected as a fault.
+        if (
+          typeof message.afterSeq !== "number" ||
+          !Number.isInteger(message.afterSeq) ||
+          message.afterSeq < 0
+        ) {
+          console.warn(`[nats-channel] Invalid get_difference from ${logSafe(peerId)}`);
+          break;
+        }
+        this.onGetDifference?.(peerId, message.afterSeq);
         break;
 
       case "load_commands":

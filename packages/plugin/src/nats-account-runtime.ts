@@ -1379,6 +1379,16 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         historyServer.servePage(peerId, request);
       });
 
+      // ---- #244 half B (per account): get_difference catch-up handler --------
+      // Serves RAW events (`seq > afterSeq`) for the client to fold onto the view
+      // it already holds — NO reducer/projection, so it does not touch the #286
+      // quadratic replay. `afterSeq` is already validated at the dispatch boundary
+      // (`nats-channel.ts`'s `get_difference` case); `serveDifference` is guarded
+      // end to end.
+      channel.setGetDifferenceHandler((peerId, afterSeq) => {
+        historyServer.serveDifference(peerId, afterSeq);
+      });
+
       // ---- Step 5b (per account): command-catalog load handler (P0-3) ------
       // Slash-command DISCOVERY. The catalog is a PURE function of the agent's
       // resolved config, which is fixed for the process's lifetime, so we build

@@ -204,6 +204,8 @@ function harness(opts: {
       // SEALED sizes and the transport's own advertised limit, not a stand-in.
       outboundWireSize: (peerId, payload) => channel.outboundWireSize(peerId, payload),
       effectiveOutboundLimit: () => channel.effectiveOutboundLimit(),
+      // #244 half B: not exercised here — delegate to the real channel.
+      sendDifference: (peerId, events) => channel.sendDifference(peerId, events),
     },
     config: opts.config ?? DEFAULT_HISTORY_CONFIG,
     logger: {

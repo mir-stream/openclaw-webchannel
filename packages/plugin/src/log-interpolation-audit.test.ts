@@ -187,6 +187,13 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
    *    advertised `max_payload`. Operator/server configuration, never peer data.
    */
   "history-serve.ts": [
+    // #244 half B — the difference (get_difference catch-up) failure lines. Their
+    // peer id and error are `logSafe`-wrapped (covered, not here); what remains raw
+    // is `afterSeq` (a client-supplied value VALIDATED to a non-negative integer at
+    // the dispatch boundary, so a number, on the same footing as the counts below)
+    // and `fitted.length` (a count).
+    "history-serve.ts  ::  afterSeq  @  webchannel: difference read failed for (afterSeq=):",
+    "history-serve.ts  ::  fitted.length  @  webchannel: difference publish failed for : the channel refused a -event frame; see the channel log",
     "history-serve.ts  ::  fitted.rows.length  @  webchannel: history publish failed for : the channel refused a -row frame; see the channel log for the cause (suppressed=)",
     "history-serve.ts  ::  fitted.skipped.length  @  webchannel: history skipped undeliverable row(s) for ; each one alone exceeds this peer's effective max_payload of bytes and can never be sent, live or replayed (#311): (suppressed=)",
     "history-serve.ts  ::  fitted.trimmed  @  webchannel: history for was shortened to fit the peer's effective max_payload of bytes: older row(s) left out of this page and still reachable with load_history (suppressed=)",
@@ -274,7 +281,9 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // instead, and the baseline is exact-multiset.
   "nats-account-runtime.ts": { statements: 20, interpolations: 38 },
   "auth.ts": { statements: 16, interpolations: 5 },
-  "nats-channel.ts": { statements: 22, interpolations: 33 },
+  // #244 half B added the `Invalid get_difference` guard warn (one statement,
+  // one `logSafe(peerId)` interpolation): 22→23 statements, 33→34 interpolations.
+  "nats-channel.ts": { statements: 23, interpolations: 34 },
   // ⚠️ ZERO, AND THE ENTRY STAYS — BUT IT GUARANTEES LESS THAN IT LOOKS LIKE.
   // #240 half 2 deleted the whole core-transcript reader out of `history.ts`
   // (the shape-drift warn, the two cursor-miss warns and the two best-effort
@@ -335,7 +344,12 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // those, `peerId` and the skipped-row `detail` are the peer-derived ones and
   // both are `logSafe`-wrapped; the rest are in KNOWN_RAW above with the
   // property each rests on.
-  "history-serve.ts": { statements: 8, interpolations: 35 },
+  // #244 half B adds the two `serveDifference` failure lines (8→10 statements):
+  // the read failure {peerId, afterSeq, err} and the publish failure
+  // {peerId, fitted.length} = 5 more interpolations (35→40). `peerId` and `err`
+  // are `logSafe`-wrapped; `afterSeq` (validated integer) and `fitted.length`
+  // (count) are in KNOWN_RAW above.
+  "history-serve.ts": { statements: 10, interpolations: 40 },
   "nats-register.ts": { statements: 18, interpolations: 20 },
 };
 
