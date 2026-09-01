@@ -691,7 +691,19 @@ function findTextIndex(view: DurableView, id: string): number {
  * workstream."
  */
 export type DurableEvent =
-  | { kind: "user"; id: string; text: string; turnId?: string }
+  /**
+   * ⚠️ `randomId` (#337) is CARRIED, NOT REDUCED. It is the client-minted
+   * `random_id` of the send this user final echoes, present only when the row was
+   * journaled with one (`appendInboundUser` writes it into the payload). The
+   * reducer NEVER reads it — `applyUser` folds by `id` alone, so `history == live`
+   * is unaffected by its presence or absence. It exists for ONE consumer: the
+   * wrapper's `get_difference` fold, which re-keys an un-adopted optimistic user
+   * bubble onto this event's server `id` by matching `randomId` (the same
+   * correlation the ack's `adoptCommittedIds` uses) BEFORE folding, so a
+   * re-delivered user event no-ops instead of appending a second bubble. Absent on
+   * an older row / an older client's send ⇒ the fold falls back to append (safe).
+   */
+  | { kind: "user"; id: string; text: string; turnId?: string; randomId?: string }
   | { kind: "placement"; answerId: string; turnId?: string }
   | { kind: "bubble"; answerId: string; text: string; turnId?: string }
   | {

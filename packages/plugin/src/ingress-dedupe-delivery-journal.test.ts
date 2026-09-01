@@ -891,10 +891,11 @@ describe("#243 half 2a — the server assigns the durable user id and echoes it"
 
       await onFlush([item("hello", "u-1", "r-1")]);
 
-      // Durable id is the server mint; `turnId` is the wire id; neither is the
-      // client `random_id`.
+      // Durable id is the server mint; `turnId` is the wire id; #337 also carries
+      // the client `random_id` in the payload (a distinct field) for the client's
+      // difference-fold adopt-by-random_id.
       expect(journal.read(PEER).map((row) => row.event)).toEqual([
-        { kind: "user", id: "webchannel-user-1", text: "hello", turnId: "u-1" },
+        { kind: "user", id: "webchannel-user-1", text: "hello", turnId: "u-1", randomId: "r-1" },
       ]);
       // The ack carries the random_id → server messageId mapping.
       expect(ackOf(calls)).toEqual({
@@ -938,7 +939,7 @@ describe("#243 half 2a — the server assigns the durable user id and echoes it"
       });
       // Still exactly one row — the SAME id, no duplicate.
       expect(journal.read(PEER).map((row) => row.event)).toEqual([
-        { kind: "user", id: "webchannel-user-1", text: "hello", turnId: "u-1" },
+        { kind: "user", id: "webchannel-user-1", text: "hello", turnId: "u-1", randomId: "r-1" },
       ]);
     } finally {
       journal.close();
@@ -966,8 +967,8 @@ describe("#243 half 2a — the server assigns the durable user id and echoes it"
       await round2.onFlush([item("first", "u-1", "r-1"), item("second", "u-2", "r-2")]);
 
       expect(journal.read(PEER).map((row) => row.event)).toEqual([
-        { kind: "user", id: "webchannel-user-1", text: "first", turnId: "u-1" },
-        { kind: "user", id: "webchannel-user-2", text: "second", turnId: "u-2" },
+        { kind: "user", id: "webchannel-user-1", text: "first", turnId: "u-1", randomId: "r-1" },
+        { kind: "user", id: "webchannel-user-2", text: "second", turnId: "u-2", randomId: "r-2" },
       ]);
       // The ack re-echoes BOTH, `r-1` under its already-minted id.
       expect(ackOf(round2.calls).committed).toEqual(
