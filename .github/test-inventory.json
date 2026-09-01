@@ -114,7 +114,7 @@
     "packages/plugin/src/nats-channel-admission-boundary.test.ts": 4,
     "packages/plugin/src/nats-channel-commands.test.ts": 4,
     "packages/plugin/src/nats-channel-crypto.test.ts": 10,
-    "packages/plugin/src/nats-channel-delivery-journal.test.ts": 30,
+    "packages/plugin/src/nats-channel-delivery-journal.test.ts": 33,
     "packages/plugin/src/nats-channel-keystore.test.ts": 13,
     "packages/plugin/src/nats-channel-p1-3-reconnect.test.ts": 1,
     "packages/plugin/src/nats-channel-register.test.ts": 13,

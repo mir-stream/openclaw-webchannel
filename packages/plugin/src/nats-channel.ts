@@ -1017,17 +1017,29 @@ export class NatsChannel implements WebChannelPeerChannel {
 
     // #244 half A: stamp the per-conversation `seq` the journal allocated onto
     // the durable frame BEFORE sealing/publishing (persist-before-publish means
-    // the seq is known here). Scoped to the three frames the contract carries it
-    // on — `agent_message`, `progress`, `turn_snapshot`; the reducer folds these
-    // and half B tracks their `seq`. `reasoning`/`tool_activity` are journaled
-    // too but the contract deliberately does NOT expose `seq` on them (they are
-    // the live lanes, not folded by the seq cursor). A frame that was not
-    // journaled (`seq === undefined`) ships unchanged, without a `seq`.
+    // the seq is known here).
+    //
+    // ⚠️ EVERY DURABLE FRAME, NOT A SUBSET — contiguity is the point. `seq` is
+    // defined IFF the frame was appended, and a frame is appended IFF it is one
+    // of the SEVEN durable types `journalEventForOutbound` maps
+    // (`agent_message`, `progress`, `turn_snapshot`, `reasoning`,
+    // `tool_activity`, `approval_request`, `approval_resolved`) — all of which
+    // now carry `seq?`. Stamping only some would leave the client's stream with
+    // holes where the others silently consumed a seq, which half B reads as a
+    // phantom gap. The `payload.type` test is what NARROWS the union so
+    // `{ ...payload, seq }` is type-honest (no cast); at runtime it is implied by
+    // `seq !== undefined`, but tsc cannot see that invariant. A frame that was
+    // not journaled (`seq === undefined` — non-durable, id-less, or a caught
+    // failure) ships unchanged, without a `seq`.
     const outbound: OutboundWsMessage =
       seq !== undefined &&
       (payload.type === "agent_message" ||
         payload.type === "progress" ||
-        payload.type === "turn_snapshot")
+        payload.type === "turn_snapshot" ||
+        payload.type === "reasoning" ||
+        payload.type === "tool_activity" ||
+        payload.type === "approval_request" ||
+        payload.type === "approval_resolved")
         ? { ...payload, seq }
         : payload;
 

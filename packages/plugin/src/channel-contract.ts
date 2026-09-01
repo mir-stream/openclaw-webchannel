@@ -323,9 +323,23 @@ export type OutboundWsMessage =
        * (`delivery-journal.ts` `append` → `{seq}`), stamped by `sendToPeer` after
        * the persist-before-publish commit. Monotone within a conversation; a
        * future client (half B) tracks the last-applied `seq` and detects gaps.
+       *
+       * ⚠️ IT RIDES EVERY DURABLE FRAME, NOT JUST THIS ONE, AND CONTIGUITY IS THE
+       * REASON. Each frame `journalEventForOutbound` maps to a journal event
+       * occupies a per-conversation `seq`: the SEVEN durable types are
+       * `agent_message`, `progress`, `turn_snapshot`, `reasoning` (only the
+       * journaled `final` frame, and only when `reasoningDurable` is on),
+       * `tool_activity`, `approval_request`, `approval_resolved`. If `seq` rode
+       * only some of them the client's stream would have holes where the others
+       * consumed a seq unseen — and half B would read those as phantom gaps and
+       * fire a spurious `getDifference`. So the field is declared on all seven and
+       * `sendToPeer` stamps it on whichever frame was actually journaled.
+       *
        * ADDITIVE AND OPTIONAL: older clients ignore it, and a frame whose journal
-       * append was refused or failed ships WITHOUT it (the client tolerates the
-       * absence). Half A only EXPOSES the field — nothing consumes it yet.
+       * append was refused or failed — or a non-durable frame (a live reasoning
+       * DRAFT, an id-less `agent_message`) — ships WITHOUT it (the client
+       * tolerates the absence). Half A only EXPOSES the field — nothing consumes
+       * it yet.
        */
       seq?: number;
     }
@@ -410,6 +424,14 @@ export type OutboundWsMessage =
        * and it is accepted.
        */
       final?: boolean;
+      /**
+       * #244 half A — see `agent_message`. Present ONLY on the burst-closing
+       * (`final`) frame that the journal actually recorded, and ONLY when
+       * `capabilities.reasoningDurable` is on: a live cumulative DRAFT is not
+       * journaled, so it carries no `seq` (it is not part of the durable stream
+       * the client's cursor counts).
+       */
+      seq?: number;
     }
   | {
       type: "tool_activity";
@@ -420,6 +442,8 @@ export type OutboundWsMessage =
       status?: string;
       summary?: string;
       argKeys?: string[];
+      /** #244 half A — see `agent_message`. Every `tool_activity` delta is durable. */
+      seq?: number;
     }
   | { type: "turn_settled"; turnId: string; outcome: "ok" | "error" }
   /**
@@ -443,8 +467,8 @@ export type OutboundWsMessage =
       /** #244 half A — see `agent_message`. */
       seq?: number;
     }
-  | ({ type: "approval_request" } & ApprovalRequestPayload)
-  | { type: "approval_resolved"; id: string; decision: ApprovalDecision }
+  | ({ type: "approval_request"; /** #244 half A — see `agent_message`. */ seq?: number } & ApprovalRequestPayload)
+  | { type: "approval_resolved"; id: string; decision: ApprovalDecision; /** #244 half A — see `agent_message`. */ seq?: number }
   | { type: "approval_snapshot"; approvals: ApprovalRequestPayload[]; resolved?: Array<{ id: string; decision: ApprovalDecision }> }
   | { type: "typing" }
   | {
