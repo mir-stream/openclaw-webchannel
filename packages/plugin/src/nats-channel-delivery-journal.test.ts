@@ -131,7 +131,7 @@ class FakeJournal implements DeliveryJournal {
   appendInboundUser(): { seq: number; inserted: boolean; messageId: string } {
     throw new Error("appendInboundUser is not exercised by the egress seam");
   }
-  lookupUserMessageIdByRandomId(): string | undefined {
+  lookupUserMessageIdByRandomId(): { messageId: string; seq: number } | undefined {
     return undefined;
   }
   read(): DeliveryJournalRow[] {
@@ -920,10 +920,16 @@ describe("#244 half A — seq on the durable wire frames", () => {
     expect(wireSeqs).toEqual([1, 2, 3, 4]);
   });
 
-  it("CONTIGUITY — a mixed durable stream (user + reasoning + tool + agent + snapshot) has no seq holes", () => {
-    // ⚠️ THE TEST THE THREE-FRAMES-ONLY VERSION FAILED. `reasoning` and `tool`
-    // consume a seq each; if they did not ride the wire, the client would see the
-    // agent bubble jump past them and half B would fire a spurious getDifference.
+  it("CONTIGUITY — client-observable seqs (ack echo + durable wire frames) form a gapless 1..N run", () => {
+    // ⚠️ RECONCILED FROM CLIENT-OBSERVABLE DATA ONLY, WHICH IS THE WHOLE POINT.
+    // The user opener consumes seq 1 but rides NO durable frame — its seq reaches
+    // the client only on the `ack.committed` echo (FIX 1). reasoning + tool each
+    // consume a seq too. This assertion reads the ack seq off the published FRAME
+    // and the durable seqs off the wire; it reads neither the journal nor the
+    // `appendInboundUser` return. So it goes RED if the user seq is dropped from
+    // the ack (FIX 1 reverted) OR any durable frame stops carrying its seq — the
+    // earlier `[user.seq, ...]` form passed on a value the client never sees and
+    // masked exactly that hole.
     const root = mkdtempSync(join(tmpdir(), "webchannel-egress-contig-"));
     tempRoots.push(root);
     const journal = openDeliveryJournal({
@@ -940,15 +946,19 @@ describe("#244 half A — seq on the durable wire frames", () => {
       { deliveryJournal: journal, reasoningDurable: true },
     );
 
-    // The user turn-opener is journaled at the ACCEPT seam, not egress — mirror it
-    // so the stream is a whole turn. It occupies seq 1 and never rides the wire
-    // (the client authored it).
+    // Accept seam: the user opener is journaled (seq 1) and the runtime echoes
+    // that seq on the ack — mirror BOTH steps exactly as `ingress-dedupe.ts` does
+    // (it reads the seq off `appendInboundUser`'s return and puts it in
+    // `committed`). The seq is passed IN here; the assertion reads it back OUT of
+    // the published frame, never from this return value.
     const user = journal.appendInboundUser(PEER, {
       text: "why?",
       turnId: "w-1",
       randomId: "rnd-1",
     });
-    expect(user.seq).toBe(1);
+    channel.sendAck(PEER, ["w-1"], [
+      { random_id: "rnd-1", messageId: user.messageId, seq: user.seq },
+    ]);
 
     // Every egress frame of the turn is durable and rides the wire with its seq.
     channel.sendReasoning(PEER, "r-1", "turn-1", "let me look", true);
@@ -961,16 +971,20 @@ describe("#244 half A — seq on the durable wire frames", () => {
       [],
     );
 
-    // The wire carries every egress frame's seq, consecutive with NO holes.
-    const wireSeqs = transport.frames.map((f) => f.seq);
-    expect(wireSeqs).toEqual([2, 3, 4, 5]);
+    // Reconcile from CLIENT-OBSERVABLE data only: seqs on the ack echo PLUS seqs
+    // on the durable wire frames.
+    const ackFrame = transport.frames.find((f) => f.type === "ack");
+    const ackSeqs = ((ackFrame?.committed ?? []) as Array<{ seq: number }>).map(
+      (c) => c.seq,
+    );
+    const wireSeqs = transport.frames
+      .filter((f) => f.type !== "ack")
+      .map((f) => f.seq as number | undefined);
+    const observed = [...ackSeqs, ...wireSeqs].sort((a, b) => Number(a) - Number(b));
 
-    // And the FULL journal — the user row plus every egress row — is a gapless
-    // 1..N run: nothing consumed a seq without either being the client's own
-    // opener (seq 1) or riding the wire, so half B sees no phantom gap.
-    const rowSeqs = journal.read(PEER).map((row) => row.seq);
-    expect(rowSeqs).toEqual([1, 2, 3, 4, 5]);
-    expect([user.seq, ...wireSeqs]).toEqual(rowSeqs);
+    // A gapless 1..N run with no undefined holes: everything the client receives
+    // accounts for every seq the conversation allocated, so half B sees no gap.
+    expect(observed).toEqual([1, 2, 3, 4, 5]);
   });
 });
 

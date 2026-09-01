@@ -199,6 +199,56 @@ export function isIdlessDurableFrame(frame: OutboundWsMessage): boolean {
 }
 
 /**
+ * The outbound frame types that CARRY a per-conversation `seq` on the wire (#244
+ * half A) — exactly the durable frames `journalEventForOutbound` maps to a
+ * non-null event, each of which occupies a seq and declares `seq?` in
+ * `channel-contract.ts`. `sendToPeer` stamps `seq` on a frame iff this predicate
+ * accepts it (and the journal actually allocated one).
+ *
+ * ⚠️ THIS SET AND `journalEventForOutbound`'s NON-NULL SET MUST STAY IDENTICAL,
+ * AND THE LINK IS ENFORCED BY TEST, NOT BY THE COMPILER. A durable type added to
+ * the mapper but not here would allocate a seq that never rides the wire — the
+ * exact phantom gap #244 exists to prevent, and nothing here would catch it.
+ * `delivery-journal-event.test.ts`'s drift guard drives one canonical frame of
+ * EVERY `OutboundWsMessage` type (an exhaustive `Record`, so a NEW variant is a
+ * compile error there) through both this predicate and the mapper and asserts
+ * they agree. Keep the two lists in step.
+ *
+ * ⚠️ THE INBOUND USER OPENER ALSO CONSUMES A SEQ (`appendInboundUser`) BUT IS NOT
+ * AN OUTBOUND FRAME — its seq rides the `ack.committed` echo, not a durable frame
+ * (doc §16.2-6). So "every seq the client sees" is this set's frames PLUS that
+ * echo, which is what makes the client's stream contiguous.
+ */
+export type SeqBearingFrame = Extract<
+  OutboundWsMessage,
+  {
+    type:
+      | "agent_message"
+      | "progress"
+      | "turn_snapshot"
+      | "reasoning"
+      | "tool_activity"
+      | "approval_request"
+      | "approval_resolved";
+  }
+>;
+
+export function isSeqBearingFrame(frame: OutboundWsMessage): frame is SeqBearingFrame {
+  switch (frame.type) {
+    case "agent_message":
+    case "progress":
+    case "turn_snapshot":
+    case "reasoning":
+    case "tool_activity":
+    case "approval_request":
+    case "approval_resolved":
+      return true;
+    default:
+      return false;
+  }
+}
+
+/**
  * Per-account policy this mapper needs. Resolved ONCE at account start and
  * carried on the channel — never read from config per frame.
  */

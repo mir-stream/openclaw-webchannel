@@ -19,6 +19,7 @@ import { describe, expect, it } from "vitest";
 import type { OutboundWsMessage } from "./channel-contract.js";
 import {
   isIdlessDurableFrame,
+  isSeqBearingFrame,
   journalEventForInboundUser,
   journalEventForOutbound,
 } from "./delivery-journal-event.js";
@@ -682,6 +683,78 @@ describe("#242 half 4 — the approval frames are durable, TWO events, no policy
     } as unknown as OutboundWsMessage);
     expect(Object.keys(event ?? {}).sort()).toEqual(
       ["approvalKind", "id", "kind", "options", "prompt", "title"].sort(),
+    );
+  });
+});
+
+/**
+ * #244 half A — DRIFT GUARD: `isSeqBearingFrame` must accept EXACTLY the frame
+ * types `journalEventForOutbound` maps to a non-null event.
+ *
+ * ⚠️ THIS IS THE COMPILE-TIME-ANCHORED LINK the inline `sendToPeer` disjunction
+ * lacked. `isSeqBearingFrame` decides which frames get a `seq` stamped, and
+ * `journalEventForOutbound` decides which frames consume one — if those sets ever
+ * diverge, a durable frame allocates a seq that never rides the wire (or a
+ * non-durable one claims a seq it never got), which is the exact phantom gap #244
+ * exists to prevent, and nothing else would catch it.
+ *
+ * `SAMPLES` is a `Record<OutboundWsMessage["type"], …>`, so adding a NEW frame
+ * variant to the wire union is a COMPILE ERROR here until a canonical sample is
+ * supplied — which forces this guard to weigh in on every future type. Each
+ * durable sample is its maximally-journaled variant (reasoning `final: true`,
+ * usable ids), driven with `reasoningDurable: true`, so "predicate accepts it"
+ * and "mapper journals it" line up type-for-type.
+ */
+describe("#244 half A — isSeqBearingFrame tracks the mapper's non-null set", () => {
+  const SAMPLES: Record<OutboundWsMessage["type"], OutboundWsMessage> = {
+    // DURABLE — mapper returns non-null, predicate must accept.
+    agent_message: { type: "agent_message", text: "a", id: "a-1", turnId: TURN },
+    progress: { type: "progress", id: "a-1", text: "working", turnId: TURN },
+    turn_snapshot: { type: "turn_snapshot", turnId: TURN, answers: [], remove: [] },
+    reasoning: { type: "reasoning", id: "r-1", turnId: TURN, text: "t", final: true },
+    tool_activity: { type: "tool_activity", id: "t-1", turnId: TURN, name: "grep" },
+    approval_request: {
+      type: "approval_request",
+      id: "ap-1",
+      kind: "exec",
+      title: "T",
+      prompt: "P",
+      options: [],
+    },
+    approval_resolved: { type: "approval_resolved", id: "ap-1", decision: "allow-once" },
+    // NON-DURABLE — mapper returns null, predicate must reject.
+    turn_settled: { type: "turn_settled", turnId: TURN, outcome: "ok" },
+    approval_snapshot: { type: "approval_snapshot", approvals: [] },
+    typing: { type: "typing" },
+    history: { type: "history", messages: [] },
+    commands: { type: "commands", commands: [] },
+    ack: { type: "ack", ids: [] },
+    inbound_rejected: { type: "inbound_rejected", ids: [], reason: "overloaded" },
+  };
+
+  it("accepts a frame IFF the mapper journals it, over every wire type", () => {
+    for (const frame of Object.values(SAMPLES)) {
+      const journaled =
+        journalEventForOutbound(frame, { reasoningDurable: true }) !== null;
+      expect(isSeqBearingFrame(frame)).toBe(journaled);
+    }
+  });
+
+  it("the seq-bearing set is exactly the seven durable outbound frame types", () => {
+    const seqBearing = Object.values(SAMPLES)
+      .filter((frame) => isSeqBearingFrame(frame))
+      .map((frame) => frame.type)
+      .sort();
+    expect(seqBearing).toEqual(
+      [
+        "agent_message",
+        "approval_request",
+        "approval_resolved",
+        "progress",
+        "reasoning",
+        "tool_activity",
+        "turn_snapshot",
+      ].sort(),
     );
   });
 });

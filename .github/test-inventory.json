@@ -69,7 +69,7 @@
     "packages/plugin/src/conversation-key-store.test.ts": 30,
     "packages/plugin/src/credential-document.test.ts": 46,
     "packages/plugin/src/crypto-nats-channel-integration.test.ts": 10,
-    "packages/plugin/src/delivery-journal-event.test.ts": 47,
+    "packages/plugin/src/delivery-journal-event.test.ts": 49,
     "packages/plugin/src/delivery-journal.test.ts": 36,
     "packages/plugin/src/dm-allowlist.test.ts": 5,
     "packages/plugin/src/doctor.test.ts": 48,

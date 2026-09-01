@@ -751,17 +751,20 @@ describe("#243 half 2a — appendInboundUser (server-assigned id) + idempotency"
     expect(journal.read("conv").map((row) => row.seq)).toEqual([1]);
   });
 
-  it("lookupUserMessageIdByRandomId recovers the minted id, and is undefined for the unknown", () => {
+  it("lookupUserMessageIdByRandomId recovers the minted id AND its seq, and is undefined for the unknown", () => {
     const journal = open(newJournalPath());
-    const { messageId } = journal.appendInboundUser("conv", { text: "hi", turnId: "wire-1", randomId: "r-1" });
+    const { messageId, seq } = journal.appendInboundUser("conv", { text: "hi", turnId: "wire-1", randomId: "r-1" });
 
-    expect(journal.lookupUserMessageIdByRandomId("conv", "r-1")).toBe(messageId);
+    // #244 half A: the lookup returns the first admission's {messageId, seq} so a
+    // deduped retry can re-echo BOTH unchanged.
+    expect(journal.lookupUserMessageIdByRandomId("conv", "r-1")).toEqual({ messageId, seq });
+    expect(journal.lookupUserMessageIdByRandomId("conv", "r-1")).toEqual({ messageId: "webchannel-user-1", seq: 1 });
     expect(journal.lookupUserMessageIdByRandomId("conv", "nope")).toBeUndefined();
     // Scoped per conversation — the same random_id in another conversation misses.
     expect(journal.lookupUserMessageIdByRandomId("other", "r-1")).toBeUndefined();
     // An older-client row keyed on its wire id is not addressable by a random_id.
     journal.appendInboundUser("conv", { text: "old", turnId: "wire-2" });
-    expect(journal.lookupUserMessageIdByRandomId("conv", "wire-2")).toBe("webchannel-user-2");
+    expect(journal.lookupUserMessageIdByRandomId("conv", "wire-2")).toEqual({ messageId: "webchannel-user-2", seq: 2 });
   });
 
   it("forward-migrates a journal whose journal_event predates the idempotency_key column", () => {
@@ -792,6 +795,6 @@ describe("#243 half 2a — appendInboundUser (server-assigned id) + idempotency"
     expect(
       journal.appendInboundUser("conv", { text: "hi", turnId: "wire-1", randomId: "r-1" }),
     ).toEqual({ seq: 1, inserted: false, messageId: "webchannel-user-1" });
-    expect(journal.lookupUserMessageIdByRandomId("conv", "r-1")).toBe("webchannel-user-1");
+    expect(journal.lookupUserMessageIdByRandomId("conv", "r-1")).toEqual({ messageId: "webchannel-user-1", seq: 1 });
   });
 });

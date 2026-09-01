@@ -3074,7 +3074,9 @@ export class WebChannelNATSClient {
    * for the tier-2/3 text fallback (deliberately kept; removing it is half 3).
    */
   private adoptCommittedIds(
-    committed: Array<{ random_id: string; messageId: string }> | undefined,
+    // #244 half A adds an optional `seq` to each entry (the user message's wire
+    // seq). Adoption ignores it — this method re-keys by `messageId` only.
+    committed: Array<{ random_id: string; messageId: string; seq?: number }> | undefined,
   ): void {
     if (!Array.isArray(committed) || committed.length === 0) return;
     // receiptKey → server messageId, for the entries we can resolve this frame.

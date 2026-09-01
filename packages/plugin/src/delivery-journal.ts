@@ -302,11 +302,18 @@ export interface DeliveryJournal {
    * this conversation, or `undefined` if none. This is the deduped-retry echo's
    * lookup: when the ingress dedupe catches a retry before it re-appends, this
    * recovers the id the FIRST admission assigned so the ack echoes it unchanged.
+   *
+   * #244 half A — it now also returns that first admission's `seq`. The user
+   * turn-opener consumes a per-conversation seq (`appendInboundUser`) but never
+   * rides a durable wire frame; the ack echo is its only carrier to the client,
+   * and a DEDUPED RETRY must echo the SAME first-admission seq (never a new one),
+   * exactly as it echoes the same `messageId`. Both come off the one row this
+   * SELECT already reads.
    */
   lookupUserMessageIdByRandomId(
     conversationId: string,
     randomId: string,
-  ): string | undefined;
+  ): { messageId: string; seq: number } | undefined;
   /**
    * Rows for one conversation in `seq` order, i.e. in egress order.
    *
@@ -981,7 +988,11 @@ export function openDeliveryJournal(options: {
       const row = selectUserByIdempotencyKey.get(conversationId, randomId) as
         | { seq: number; message_id: string }
         | undefined;
-      return row?.message_id ?? undefined;
+      // #244 half A: return the seq alongside the id — both are the FIRST
+      // admission's, so a deduped retry echoes them unchanged.
+      return row === undefined
+        ? undefined
+        : { messageId: row.message_id, seq: Number(row.seq) };
     },
 
     read(conversationId, readOptions) {

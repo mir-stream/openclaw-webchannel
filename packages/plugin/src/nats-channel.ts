@@ -39,6 +39,7 @@ import { logSafe } from "./log-safe.js";
 import type { DeliveryJournal } from "./delivery-journal.js";
 import {
   isIdlessDurableFrame,
+  isSeqBearingFrame,
   journalEventForOutbound,
   type JournalPolicy,
   journalFailureDiagnostic,
@@ -728,7 +729,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   sendAck(
     peerId: string,
     ids: string[],
-    committed?: Array<{ random_id: string; messageId: string }>,
+    committed?: Array<{ random_id: string; messageId: string; seq: number }>,
   ): boolean {
     return this.sendIngressResult(peerId, "ack", ids, committed);
   }
@@ -1020,26 +1021,23 @@ export class NatsChannel implements WebChannelPeerChannel {
     // the seq is known here).
     //
     // ⚠️ EVERY DURABLE FRAME, NOT A SUBSET — contiguity is the point. `seq` is
-    // defined IFF the frame was appended, and a frame is appended IFF it is one
-    // of the SEVEN durable types `journalEventForOutbound` maps
-    // (`agent_message`, `progress`, `turn_snapshot`, `reasoning`,
-    // `tool_activity`, `approval_request`, `approval_resolved`) — all of which
-    // now carry `seq?`. Stamping only some would leave the client's stream with
-    // holes where the others silently consumed a seq, which half B reads as a
-    // phantom gap. The `payload.type` test is what NARROWS the union so
-    // `{ ...payload, seq }` is type-honest (no cast); at runtime it is implied by
-    // `seq !== undefined`, but tsc cannot see that invariant. A frame that was
-    // not journaled (`seq === undefined` — non-durable, id-less, or a caught
-    // failure) ships unchanged, without a `seq`.
+    // defined IFF the frame was appended, and a frame is appended IFF it is one of
+    // the durable types `journalEventForOutbound` maps. `isSeqBearingFrame` is the
+    // single expression of that set (co-located with the mapper, with a drift test
+    // pinning the two identical); it also NARROWS the union so `{ ...payload, seq }`
+    // is type-honest (no cast). At runtime the predicate is implied by
+    // `seq !== undefined`, but tsc cannot see that invariant. Stamping only some
+    // durable frames would leave the client's stream with holes where the others
+    // silently consumed a seq — a phantom gap for half B. A frame that was not
+    // journaled (`seq === undefined` — non-durable, id-less, or a caught failure)
+    // ships unchanged, without a `seq`.
+    //
+    // ⚠️ THE INBOUND USER OPENER is the one other seq-consumer, and it is NOT here
+    // because it is not an outbound frame: its seq rides the `ack.committed` echo
+    // (`ingress-dedupe.ts`), not a durable frame. Frames-here + that echo = every
+    // seq the client sees, which is what keeps its stream gapless.
     const outbound: OutboundWsMessage =
-      seq !== undefined &&
-      (payload.type === "agent_message" ||
-        payload.type === "progress" ||
-        payload.type === "turn_snapshot" ||
-        payload.type === "reasoning" ||
-        payload.type === "tool_activity" ||
-        payload.type === "approval_request" ||
-        payload.type === "approval_resolved")
+      seq !== undefined && isSeqBearingFrame(payload)
         ? { ...payload, seq }
         : payload;
 
@@ -1078,7 +1076,8 @@ export class NatsChannel implements WebChannelPeerChannel {
     candidates: readonly unknown[],
     // #243 half 2a: the server-assigned-id echo for an `ack`, attached to the
     // first published frame by the chunk writer and measured on the wire with it.
-    committed?: Array<{ random_id: string; messageId: string }>,
+    // #244 half A: each entry also carries the user message's per-conversation seq.
+    committed?: Array<{ random_id: string; messageId: string; seq: number }>,
   ): boolean {
     if (candidates.length === 0) return true;
     const advertisedLimit = this.transport.effectiveOutboundLimit;

@@ -326,14 +326,24 @@ export type OutboundWsMessage =
        *
        * ⚠️ IT RIDES EVERY DURABLE FRAME, NOT JUST THIS ONE, AND CONTIGUITY IS THE
        * REASON. Each frame `journalEventForOutbound` maps to a journal event
-       * occupies a per-conversation `seq`: the SEVEN durable types are
+       * occupies a per-conversation `seq`: the SEVEN durable outbound types are
        * `agent_message`, `progress`, `turn_snapshot`, `reasoning` (only the
        * journaled `final` frame, and only when `reasoningDurable` is on),
-       * `tool_activity`, `approval_request`, `approval_resolved`. If `seq` rode
-       * only some of them the client's stream would have holes where the others
+       * `tool_activity`, `approval_request`, `approval_resolved`
+       * (`isSeqBearingFrame` is their single source of truth). If `seq` rode only
+       * some of them the client's stream would have holes where the others
        * consumed a seq unseen — and half B would read those as phantom gaps and
        * fire a spurious `getDifference`. So the field is declared on all seven and
        * `sendToPeer` stamps it on whichever frame was actually journaled.
+       *
+       * ⚠️ ONE SEQ-CONSUMER IS NOT AN OUTBOUND FRAME: the INBOUND USER opener.
+       * `appendInboundUser` allocates from the SAME per-conversation counter, so a
+       * user message holds seq N and the turn's first agent frame holds N+1 — but
+       * the user opener never rides a durable frame (the client authored it). Its
+       * seq therefore rides the `ack.committed` echo instead (see the `ack` member
+       * and `CommittedUserMessage`). So "every seq the client sees" is the seven
+       * frames here PLUS that echo; together they are gapless. Without the echo
+       * carrying it, the first agent frame of every turn would look like a gap.
        *
        * ADDITIVE AND OPTIONAL: older clients ignore it, and a frame whose journal
        * append was refused or failed — or a non-durable frame (a live reasoning
@@ -498,8 +508,16 @@ export type OutboundWsMessage =
        * that only reads `ids` is unaffected, and the CURRENT client IGNORES it
        * (adoption is half 2b; `drainAcked` still keys on `ids`). It rides `ack`
        * because that frame already reports per-id acceptance; see `IngressResultFrame`.
+       *
+       * #244 half A: each entry now also carries the user message's per-conversation
+       * `seq`. The inbound user turn-opener consumes a seq (`appendInboundUser`,
+       * from the SAME counter as egress) but NEVER rides a durable wire frame, so
+       * without this the client would see the turn's first agent frame at seq N
+       * while holding last-applied N-2 — a phantom gap on every turn (doc §16.2-6).
+       * This ack echo is the user seq's only carrier. A deduped retry echoes the
+       * SAME first-admission seq. Still ignored by the current client in half A.
        */
-      committed?: Array<{ random_id: string; messageId: string }>;
+      committed?: Array<{ random_id: string; messageId: string; seq: number }>;
     }
   | { type: "inbound_rejected"; ids: string[]; reason: "overloaded" };
 
@@ -562,7 +580,7 @@ export interface WebChannelPeerChannel {
   sendAck?(
     peerId: string,
     ids: string[],
-    committed?: Array<{ random_id: string; messageId: string }>,
+    committed?: Array<{ random_id: string; messageId: string; seq: number }>,
   ): boolean;
   sendInboundRejected?(peerId: string, ids: string[]): boolean;
 }
@@ -580,6 +598,6 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload): boolean { return false; }
   sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision): boolean { return false; }
   sendApprovalSnapshot(_peerId: string, _approvals: ApprovalRequestPayload[], _resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean { return false; }
-  sendAck(_peerId: string, ids: string[], _committed?: Array<{ random_id: string; messageId: string }>): boolean { return ids.length === 0; }
+  sendAck(_peerId: string, ids: string[], _committed?: Array<{ random_id: string; messageId: string; seq: number }>): boolean { return ids.length === 0; }
   sendInboundRejected(_peerId: string, ids: string[]): boolean { return ids.length === 0; }
 }

@@ -193,8 +193,12 @@ export type InboundMessage = {
    * the server id) is half 2b; the field is declared now only so the wire
    * TYPECHECKS. Re-declared loosely, like every other field here (zero-dep
    * package; runtime discrimination).
+   *
+   * #244 half A: each entry also carries the user message's per-conversation
+   * `seq` (its only wire carrier — the user opener rides no durable frame). Still
+   * IGNORED in half A; declared optional here so the loose wire shape typechecks.
    */
-  committed?: Array<{ random_id: string; messageId: string }>;
+  committed?: Array<{ random_id: string; messageId: string; seq?: number }>;
   reason?: "overloaded";
   text?: string;
   turnId?: string;
