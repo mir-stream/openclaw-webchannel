@@ -152,6 +152,10 @@ class FakeJournal implements DeliveryJournal {
   read(): DeliveryJournalRow[] {
     return [];
   }
+  // #244 half A: the high-water is the last seq this fake allocated.
+  maxSeq(): number {
+    return this.appended;
+  }
   close(): void {
     /* no-op */
   }
@@ -204,6 +208,9 @@ class FlakyJournal implements DeliveryJournal {
   }
   read(conversationId: string): DeliveryJournalRow[] {
     return this.inner.read(conversationId);
+  }
+  maxSeq(conversationId: string): number {
+    return this.inner.maxSeq(conversationId);
   }
   close(): void {
     this.inner.close();

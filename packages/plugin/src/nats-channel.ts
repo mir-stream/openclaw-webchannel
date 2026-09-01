@@ -695,8 +695,17 @@ export class NatsChannel implements WebChannelPeerChannel {
   /**
    * Send history snapshot to peer.
    */
-  sendHistory(peerId: string, messages: HistoryMessage[]): boolean {
-    const payload: OutboundWsMessage = { type: "history", messages };
+  sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number): boolean {
+    // #244 half A: `highWaterSeq` is the conversation's authoritative MAX(seq),
+    // attached to the register-time SNAPSHOT only (`history-serve.ts` passes it
+    // there and omits it for the pager). Additive/optional — a `history` frame is
+    // not journaled (`journalEventForOutbound` returns null for it), so it carries
+    // no per-frame `seq`; the high-water is a distinct baseline field.
+    const payload: OutboundWsMessage = {
+      type: "history",
+      messages,
+      ...(highWaterSeq !== undefined ? { highWaterSeq } : {}),
+    };
     return this.sendToPeer(peerId, payload);
   }
 
@@ -1004,7 +1013,23 @@ export class NatsChannel implements WebChannelPeerChannel {
     // rather than the client holding a message the store lacks.
     //
     // ⚠️ NOT universally — see #278 for the case and its conditions.
-    this.journalOutbound(peerId, payload);
+    const seq = this.journalOutbound(peerId, payload);
+
+    // #244 half A: stamp the per-conversation `seq` the journal allocated onto
+    // the durable frame BEFORE sealing/publishing (persist-before-publish means
+    // the seq is known here). Scoped to the three frames the contract carries it
+    // on — `agent_message`, `progress`, `turn_snapshot`; the reducer folds these
+    // and half B tracks their `seq`. `reasoning`/`tool_activity` are journaled
+    // too but the contract deliberately does NOT expose `seq` on them (they are
+    // the live lanes, not folded by the seq cursor). A frame that was not
+    // journaled (`seq === undefined`) ships unchanged, without a `seq`.
+    const outbound: OutboundWsMessage =
+      seq !== undefined &&
+      (payload.type === "agent_message" ||
+        payload.type === "progress" ||
+        payload.type === "turn_snapshot")
+        ? { ...payload, seq }
+        : payload;
 
     try {
       if (sessionKey) {
@@ -1013,13 +1038,13 @@ export class NatsChannel implements WebChannelPeerChannel {
         const wire = sealEnvelope(
           { accountId: this.accountId, tenant: this.tenant, sub: peerId },
           sessionKey,
-          payload,
+          outbound,
         );
         this.transport.publish(subject, wire);
         return true;
       }
 
-      this.transport.publish(subject, JSON.stringify(payload));
+      this.transport.publish(subject, JSON.stringify(outbound));
       return true;
     } catch (err) {
       console.error(
@@ -1089,9 +1114,15 @@ export class NatsChannel implements WebChannelPeerChannel {
    * BEFORE publishing; see the block comment there for the ordering rationale.
    *
    * ⚠️ THIS FUNCTION CANNOT CHANGE A SEND RESULT, AND THAT IS THE WHOLE POINT.
-   * It returns `void` so there is no value for `sendToPeer` to branch on, and
-   * every failure of the JOURNAL WRITE PATH — both mapper calls as well as
-   * `append` — is swallowed into a rate-limited warning. Emitting that warning
+   * #244 half A gave it a return value — the appended per-conversation `seq`, or
+   * `undefined` when nothing durable was written (an id-less/non-durable frame or
+   * a CAUGHT failure) — but that value is METADATA the caller stamps onto the
+   * outbound frame, NEVER a boolean `sendToPeer` branches on. The send result is
+   * still computed entirely from the wire write below the hook; a journal fault
+   * yields `undefined` (the frame ships WITHOUT a `seq`), it never becomes a
+   * `false`/thrown send. Every failure of the JOURNAL WRITE PATH — both mapper
+   * calls as well as `append` — is swallowed into a rate-limited warning and
+   * returns `undefined`. Emitting that warning
    * is itself a bare `console` call, on exactly the same footing as the
    * `console.warn` this method's caller makes on each refusal and the
    * `console.error` in its publish catch: a host that installed a faulting
@@ -1115,9 +1146,9 @@ export class NatsChannel implements WebChannelPeerChannel {
    * *is* the identity model (doc §16.5.3 — there is no pointer from a final back
    * to its answer, there is only order).
    */
-  private journalOutbound(peerId: string, payload: OutboundWsMessage): void {
+  private journalOutbound(peerId: string, payload: OutboundWsMessage): number | undefined {
     const journal = this.deliveryJournal;
-    if (!journal) return;
+    if (!journal) return undefined;
 
     // ⚠️ THE `try` COVERS THE WHOLE JOURNAL WRITE PATH — BOTH MAPPER CALLS AS
     // WELL AS `append` — AND THE SCOPE IS THE POINT. The isolation above must be
@@ -1162,13 +1193,13 @@ export class NatsChannel implements WebChannelPeerChannel {
       // repair is a server-assigned id before egress — doc §16.2-1, issue #243.
       if (isIdlessDurableFrame(payload)) {
         this.warnDeliveryJournal("idless-durable-frame", peerId);
-        return;
+        return undefined;
       }
 
       // `null` = this frame is not (or not yet) a durable message. The mapper
       // owns that verdict and documents every case; do not second-guess it here.
       const event = journalEventForOutbound(payload, this.journalPolicy);
-      if (!event) return;
+      if (!event) return undefined;
 
       // D1 — THE CONVERSATION ID IS THE `peerId`. The journal FILE is already
       // scoped to (tenant, accountId) by its path (`storage-paths.ts`'s
@@ -1178,7 +1209,13 @@ export class NatsChannel implements WebChannelPeerChannel {
       // also why this seam needs no route knowledge and therefore none of
       // §15.5's per-turn route-scoped callback (the "P-J probe" is dissolved,
       // not deferred).
-      journal.append(peerId, event);
+      //
+      // #244 half A: return the per-conversation `seq` `append` allocated so
+      // `sendToPeer` can stamp it onto the durable outbound frame. `inserted` is
+      // deliberately ignored — an idempotent no-op still names the row's own
+      // `seq`, which is the correct value to publish (a retry re-ships the frame
+      // the FIRST admission was assigned).
+      return journal.append(peerId, event).seq;
     } catch (error) {
       // `append-failed` covers the whole write path, mapper throw included: from
       // the caller's side both are "this frame got no durable row".
@@ -1187,7 +1224,10 @@ export class NatsChannel implements WebChannelPeerChannel {
         peerId,
         journalFailureDiagnostic(error),
       );
+      // A caught failure yields NO seq — the frame ships without one (§15.8: the
+      // failure must never change the send result). Falls through to `undefined`.
     }
+    return undefined;
   }
 
   /**

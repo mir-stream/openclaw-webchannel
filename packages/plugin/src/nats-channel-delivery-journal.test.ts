@@ -137,6 +137,10 @@ class FakeJournal implements DeliveryJournal {
   read(): DeliveryJournalRow[] {
     return [];
   }
+  // #244 half A: the high-water is the last seq this fake allocated.
+  maxSeq(): number {
+    return this.seq;
+  }
   close(): void {
     /* no-op */
   }
@@ -733,6 +737,137 @@ describe("#239 — egress seam against a real journal", () => {
     expect(rows.map((row) => row.seq)).toEqual([1, 2, 3, 4]);
     // A different peer is a different conversation in the same file.
     expect(journal.read("peer-other")).toEqual([]);
+  });
+});
+
+/**
+ * #244 half A — the per-conversation `seq` on the DURABLE outbound wire frames.
+ *
+ * The journal already allocated a contiguous per-conversation `seq` at egress
+ * (#239); half A stops discarding it. `sendToPeer` stamps the `seq` `append`
+ * returned onto the three durable frames the reducer folds — `agent_message`,
+ * `progress`, `turn_snapshot` — so a future client (half B) can track a
+ * last-applied seq and detect gaps (doc §16.2-6, Telegram pts/qts).
+ *
+ * ⚠️ THE ASSERTIONS READ `transport.frames`, the whole parsed frame — the `seq`
+ * lives INSIDE the payload, which `Call`'s publish variant deliberately does not
+ * carry (see `RecordingTransport`).
+ */
+describe("#244 half A — seq on the durable wire frames", () => {
+  const tempRoots: string[] = [];
+  const openJournals: DeliveryJournal[] = [];
+
+  afterEach(() => {
+    while (openJournals.length > 0) openJournals.pop()?.close();
+    while (tempRoots.length > 0) {
+      rmSync(tempRoots.pop() as string, { recursive: true, force: true });
+    }
+  });
+
+  it("stamps the append-allocated seq on agent_message/progress/turn_snapshot, monotone within the conversation", () => {
+    const { channel, transport } = makeChannel();
+
+    expect(channel.sendProgress(PEER, "a-1", "Working…", "turn-1")).toBe(true);
+    expect(channel.sendText(PEER, "first", "a-1", "turn-1")).toBe(true);
+    expect(channel.sendText(PEER, "second", "a-2", "turn-1")).toBe(true);
+    expect(
+      channel.sendTurnSnapshot(PEER, "turn-1", [{ id: "a-1", text: "first" }], []),
+    ).toBe(true);
+
+    // The FakeJournal allocates 1,2,3,4 in append order; each durable frame
+    // carries its own row's seq, contiguous and ascending.
+    expect(transport.frames.map((f) => [f.type, f.seq])).toEqual([
+      ["progress", 1],
+      ["agent_message", 2],
+      ["agent_message", 3],
+      ["turn_snapshot", 4],
+    ]);
+  });
+
+  it("stamps NO seq on ephemeral frames — typing, reasoning, tool_activity, ack, turn_settled, history, commands", () => {
+    const { channel, transport } = makeChannel();
+
+    expect(channel.sendTyping(PEER)).toBe(true);
+    expect(channel.sendReasoning(PEER, "r-1", "turn-1", "thinking")).toBe(true);
+    expect(
+      channel.sendToolActivity(PEER, { id: "t-1", turnId: "turn-1", name: "grep" }),
+    ).toBe(true);
+    expect(channel.sendAck(PEER, ["u-1"])).toBe(true);
+    expect(channel.sendTurnSettled(PEER, "turn-1", "ok")).toBe(true);
+    expect(
+      channel.sendHistory(PEER, [{ id: "h-1", role: "agent", text: "old" }]),
+    ).toBe(true);
+    expect(channel.sendCommands(PEER, [])).toBe(true);
+
+    // `reasoning` and `tool_activity` ARE journaled (they get a seq internally),
+    // but the contract does not expose `seq` on them — the seq cursor is for the
+    // three folded frames only. Not one published frame carries a `seq`.
+    for (const frame of transport.frames) {
+      expect(frame.seq).toBeUndefined();
+    }
+  });
+
+  it("ships a durable frame WITHOUT a seq when the journal append fails — §15.8 send result unchanged", () => {
+    const { channel, transport, journal } = makeChannel();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    journal.throwOnAppend = true;
+
+    // A caught journal failure must not change the send result, and it leaves the
+    // frame with no seq to stamp — the client tolerates the absence.
+    expect(channel.sendText(PEER, "hello", "a-1", "turn-1")).toBe(true);
+
+    expect(transport.frames).toHaveLength(1);
+    expect(transport.frames[0].type).toBe("agent_message");
+    expect(transport.frames[0].seq).toBeUndefined();
+    warn.mockRestore();
+  });
+
+  it("an id-less durable frame ships without a seq (never journaled)", () => {
+    const { channel, transport } = makeChannel();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // No usable id ⇒ `isIdlessDurableFrame` short-circuits before `append`, so
+    // there is no seq — the frame still reaches the wire.
+    expect(channel.sendText(PEER, "unattributed")).toBe(true);
+
+    expect(transport.frames).toHaveLength(1);
+    expect(transport.frames[0].seq).toBeUndefined();
+    error.mockRestore();
+  });
+
+  it("through the REAL store, each durable frame's wire seq equals its journal row's seq", () => {
+    const root = mkdtempSync(join(tmpdir(), "webchannel-egress-seq-"));
+    tempRoots.push(root);
+    const journal = openDeliveryJournal({
+      databasePath: join(root, "tuple", "delivery-journal.sqlite"),
+    });
+    openJournals.push(journal);
+    const transport = new RecordingTransport([]);
+    const channel = new NatsChannel(
+      transport as unknown as NatsTransport,
+      ACCOUNT,
+      TENANT,
+      undefined,
+      undefined,
+      { deliveryJournal: journal },
+    );
+
+    channel.sendProgress(PEER, "a-1", "Working…", "turn-1");
+    channel.sendText(PEER, "first answer", "a-1", "turn-1");
+    channel.sendText(PEER, "second answer", "a-2", "turn-1");
+    channel.sendTurnSnapshot(
+      PEER,
+      "turn-1",
+      [{ id: "a-1", text: "first answer" }, { id: "a-2", text: "second answer" }],
+      [],
+    );
+
+    const rowSeqs = journal.read(PEER).map((row) => row.seq);
+    const wireSeqs = transport.frames.map((f) => f.seq);
+    // The wire seq the client sees IS the durable row's seq — same value, same
+    // order — so the client's cursor and the store agree by construction.
+    expect(wireSeqs).toEqual(rowSeqs);
+    expect(wireSeqs).toEqual([1, 2, 3, 4]);
   });
 });
 

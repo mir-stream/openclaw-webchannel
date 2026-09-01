@@ -338,6 +338,21 @@ export interface DeliveryJournal {
     conversationId: string,
     options?: { afterSeq?: number; limit?: number },
   ): DeliveryJournalRow[];
+  /**
+   * #244 half A (doc §16.2-6) — the conversation's current high-water `seq`, i.e.
+   * `MAX(seq)`, or `0` for a conversation with no rows yet (the same COALESCE
+   * base `selectNextSeq` uses, so "nothing written" reads as `0` rather than
+   * `undefined`).
+   *
+   * ⚠️ THIS IS A CHEAP INDEX READ, NOT A FOLD — and that distinction is the point.
+   * It is a single `SELECT MAX(seq)` over the (conversation_id, seq) primary key,
+   * NOT a replay of the log. It does NOT project, cache, or memoize the reducer's
+   * output, so it is not the §15.4 materialized read model `history-serve.ts`'s
+   * header forbids reintroducing (that ban is about AVOIDING the replay; this
+   * read stands alongside one). The snapshot path calls it to stamp the
+   * `history` frame's `highWaterSeq` baseline without re-folding to learn the max.
+   */
+  maxSeq(conversationId: string): number;
   /** Checkpoint, stop WAL maintenance, and close the handle. Idempotent. */
   close(): void;
 }
@@ -345,6 +360,8 @@ export interface DeliveryJournal {
 /** The prepared statements one journal connection owns. */
 type JournalStatements = {
   selectNextSeq: SqliteStatement;
+  /** #244 half A — the conversation's high-water `MAX(seq)` for the snapshot. */
+  selectMaxSeq: SqliteStatement;
   insertEvent: SqliteStatement;
   selectExistingSeqByKind: { user: SqliteStatement; placement: SqliteStatement };
   selectRows: SqliteStatement;
@@ -611,6 +628,15 @@ function openJournalConnection(
       "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM journal_event " +
         "WHERE conversation_id = ?",
     );
+    // #244 half A — the conversation's high-water `seq`. Same `MAX(seq)` over the
+    // same (conversation_id, seq) primary key as `selectNextSeq`, without the
+    // `+ 1`: this reports the LAST allocated seq (the snapshot baseline), where
+    // that one reports the NEXT to allocate. `COALESCE(…, 0)` makes an empty
+    // conversation read `0`.
+    const selectMaxSeq = db.prepare(
+      "SELECT COALESCE(MAX(seq), 0) AS max FROM journal_event " +
+        "WHERE conversation_id = ?",
+    );
     // `idempotency_key` is the trailing bind: NULL for `append` (every kind but a
     // fresh inbound user), and the stable key for `appendInboundUser`.
     const insertEvent = db.prepare(
@@ -657,6 +683,7 @@ function openJournalConnection(
       maintenance,
       statements: {
         selectNextSeq,
+        selectMaxSeq,
         insertEvent,
         selectExistingSeqByKind,
         selectRows,
@@ -747,6 +774,7 @@ export function openDeliveryJournal(options: {
   const { maintenance, statements } = connection;
   const {
     selectNextSeq,
+    selectMaxSeq,
     insertEvent,
     selectExistingSeqByKind,
     selectRows,
@@ -987,6 +1015,13 @@ export function openDeliveryJournal(options: {
           createdMs: Number(row.created_ms),
         };
       });
+    },
+
+    maxSeq(conversationId) {
+      // A single index read over the (conversation_id, seq) primary key — see the
+      // interface docblock: this is NOT a fold and does not memoize the reducer.
+      const row = selectMaxSeq.get(conversationId) as { max: number } | undefined;
+      return Number(row?.max ?? 0);
     },
 
     close() {

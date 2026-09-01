@@ -90,6 +90,24 @@ describe("seq allocation", () => {
     expect(journal.read("conv-b").map((row) => row.seq)).toEqual([1, 2, 3]);
   });
 
+  it("#244 half A — maxSeq is the conversation's high-water, 0 before any write", () => {
+    const journal = open(newJournalPath());
+    // An untouched conversation reads 0, not undefined — the COALESCE base.
+    expect(journal.maxSeq("conv-a")).toBe(0);
+    expect(journal.append("conv-a", bubble("a-1", "one")).seq).toBe(1);
+    expect(journal.append("conv-a", bubble("a-2", "two")).seq).toBe(2);
+    expect(journal.maxSeq("conv-a")).toBe(2);
+    // Per-conversation, like the seq itself: another conversation's writes never
+    // move this one's high-water (the §16.2-6 phantom-gap property).
+    journal.append("conv-b", bubble("b-1", "other"));
+    expect(journal.maxSeq("conv-a")).toBe(2);
+    expect(journal.maxSeq("conv-b")).toBe(1);
+    // maxSeq == the last seq append returned, and == the max read-back row seq.
+    expect(journal.maxSeq("conv-a")).toBe(
+      Math.max(...journal.read("conv-a").map((row) => row.seq)),
+    );
+  });
+
   it("reads back in append order, which is egress order", () => {
     const journal = open(newJournalPath());
     const stream: JournalEvent[] = [

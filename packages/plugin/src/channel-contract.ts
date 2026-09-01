@@ -317,8 +317,19 @@ export type OutboundWsMessage =
        * It can repeat after model fallback and is not a durable hydration key.
        */
       assistantMessageIndex?: number;
+      /**
+       * #244 half A (doc §16.2-6, Telegram pts/qts): the per-conversation
+       * contiguous `seq` this frame's DURABLE row was allocated at egress
+       * (`delivery-journal.ts` `append` → `{seq}`), stamped by `sendToPeer` after
+       * the persist-before-publish commit. Monotone within a conversation; a
+       * future client (half B) tracks the last-applied `seq` and detects gaps.
+       * ADDITIVE AND OPTIONAL: older clients ignore it, and a frame whose journal
+       * append was refused or failed ships WITHOUT it (the client tolerates the
+       * absence). Half A only EXPOSES the field — nothing consumes it yet.
+       */
+      seq?: number;
     }
-  | { type: "progress"; id: string; text: string; turnId?: string }
+  | { type: "progress"; id: string; text: string; turnId?: string; /** #244 half A — see `agent_message`. */ seq?: number }
   | {
       type: "reasoning";
       id: string;
@@ -429,12 +440,29 @@ export type OutboundWsMessage =
       turnId: string;
       answers: Array<{ id: string; text: string }>;
       remove: string[];
+      /** #244 half A — see `agent_message`. */
+      seq?: number;
     }
   | ({ type: "approval_request" } & ApprovalRequestPayload)
   | { type: "approval_resolved"; id: string; decision: ApprovalDecision }
   | { type: "approval_snapshot"; approvals: ApprovalRequestPayload[]; resolved?: Array<{ id: string; decision: ApprovalDecision }> }
   | { type: "typing" }
-  | { type: "history"; messages: HistoryMessage[] }
+  | {
+      type: "history";
+      messages: HistoryMessage[];
+      /**
+       * #244 half A (doc §16.2-6): the conversation's authoritative high-water
+       * `seq` at snapshot time — the journal's current `MAX(seq)` for this
+       * conversation. It is the baseline a reconnecting client (half B) resumes
+       * gap detection from: every durable live frame after the snapshot carries a
+       * `seq` and the client can tell a contiguous stream from a gap against this
+       * number. Populated only on the register-time SNAPSHOT (`history-serve.ts`'s
+       * `sendSnapshot`); a `load_history` PAGE serves OLDER rows and carries no
+       * high-water. ADDITIVE AND OPTIONAL — older clients ignore it, and half A
+       * only exposes it (no client consumes it yet).
+       */
+      highWaterSeq?: number;
+    }
   | { type: "commands"; commands: CommandCatalogEntry[] }
   | {
       type: "ack";
@@ -498,7 +526,12 @@ export interface WebChannelPeerChannel {
     remove: string[],
   ): boolean;
   sendTyping(peerId: string): boolean;
-  sendHistory(peerId: string, messages: HistoryMessage[]): boolean;
+  /**
+   * #244 half A: `highWaterSeq` is the conversation's authoritative `MAX(seq)`,
+   * attached to the register-time SNAPSHOT frame only (the pager omits it).
+   * Additive and optional — see the `history` member of `OutboundWsMessage`.
+   */
+  sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number): boolean;
   sendApprovalRequest(peerId: string, request: ApprovalRequestPayload): boolean;
   sendApprovalResolved(peerId: string, id: string, decision: ApprovalDecision): boolean;
   sendApprovalSnapshot(peerId: string, approvals: ApprovalRequestPayload[], resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean;
@@ -519,7 +552,7 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendTurnSettled(_peerId: string, _turnId: string, _outcome: "ok" | "error"): boolean { return false; }
   sendTurnSnapshot(_peerId: string, _turnId: string, _answers: Array<{ id: string; text: string }>, _remove: string[]): boolean { return false; }
   sendTyping(_peerId: string): boolean { return false; }
-  sendHistory(_peerId: string, _messages: HistoryMessage[]): boolean { return false; }
+  sendHistory(_peerId: string, _messages: HistoryMessage[], _highWaterSeq?: number): boolean { return false; }
   sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload): boolean { return false; }
   sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision): boolean { return false; }
   sendApprovalSnapshot(_peerId: string, _approvals: ApprovalRequestPayload[], _resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean { return false; }
