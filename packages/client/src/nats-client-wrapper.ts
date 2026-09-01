@@ -629,8 +629,11 @@ export class WebChannelNATSClient {
    * survives the very re-key it enables. An entry is consumed when its echo is
    * adopted; a send that never draws a `committed` echo (control-lane text; the
    * plugin's fast-path/overflow/cancelled ack gaps — a documented follow-up)
-   * leaves one bounded residue entry per send and its bubble stays `u-<n>`,
-   * where the tier-2/3 text fallback still reconciles it on reconnect.
+   * leaves one residue entry per un-echoed send — bounded per send, but NOT
+   * cleared until half 3 closes those echo gaps, so it grows with un-echoed
+   * sends over a session (tiny string entries; a stale one can only no-op). Its
+   * bubble stays `u-<n>`, where the tier-2/3 text fallback still reconciles it on
+   * reconnect.
    */
   private readonly randomIdToReceiptKey = new Map<string, string>();
   /** P0-4: forward rank for the receipt-level monotonic guard (incl. `completed`). */
@@ -3049,15 +3052,19 @@ export class WebChannelNATSClient {
    * text/position (tier 2/3) — live == history under one shared id, which is
    * what #302 is blocked on.
    *
-   * ⚠️ RE-KEYING A DURABLE ID ON THE CLIENT IS THE DANGEROUS ACT `mergeDurable`'s
-   * header warns about. This is safe for exactly the reasons `ChatBubble.id`'s
-   * docblock states and `case "history"`'s `adoptAt` relies on: the receipt
-   * record and its `wireId` alias are keyed by `receiptKey`/`wireId`, NOT by the
-   * bubble id, and the spread preserves `receiptKey` (this method even MATCHES on
-   * it) — so `patchBubbleByReceiptKey`, `promoteAnchor`, and the send-state path
-   * all keep working; and the durable projection re-derives the bubble under its
-   * new id every frame, so the overlay carries across `mergeDurable` by
-   * `(kind,id)`. We change ONLY `id`; `text`/`ts`/`sendState`/`pending` are the
+   * ⚠️ RE-KEYING A DURABLE ID ON THE CLIENT is the same in-place `id` rewrite
+   * `case "history"`'s `adoptAt` already performs on a user bubble; it is safe
+   * for exactly the reason `ChatBubble.receiptKey`'s docblock (`types.ts`) states
+   * — "history adoption rewrites `id` in place but keeps this key, so the receipt
+   * survives id churn." The receipt record and its `wireId` alias are keyed by
+   * `receiptKey`/`wireId`, NOT by the bubble id, and the spread preserves
+   * `receiptKey` (this method even MATCHES on it) — so `patchBubbleByReceiptKey`,
+   * `promoteAnchor`, and the send-state path all keep working; and the durable
+   * projection re-derives the bubble under its new id every frame, so the overlay
+   * carries across `mergeDurable` by `(kind,id)` (which is the loss `mergeDurable`'s
+   * own header warns about — averted here because the re-key lands in
+   * `state.messages` before the next projection reads it). We change ONLY `id`;
+   * `text`/`ts`/`sendState`/`pending` are the
    * bubble's own and stay — the same fields `adoptAt` keeps (it discards only
    * `assistantMessageIndex`, which a user bubble never carries).
    *
