@@ -541,9 +541,10 @@ export type JournalHistoryProjection = {
  * acceptable way for this function to be wrong, so a fake or a future reader
  * that violates the ordering contract gets a truncated history instead of a hung
  * gateway. Checking BEFORE the fold rather than after is what keeps the guard
- * from corrupting the view on its way out: rows are ordered, so a chunk that did
- * not advance is entirely rows already folded, and folding them twice duplicates
- * every `user` bubble in it (`applyUser` blind-appends).
+ * from hanging: rows are ordered, so a chunk that did not advance is entirely
+ * rows already folded, and re-folding forever is the infinite loop. (Re-folding
+ * is view-safe since #244 half B — every reducer arm, `applyUser` included, is
+ * id-idempotent — so this guards the HANG, not view corruption.)
  *
  * ── AN UNKNOWN KIND IS COUNTED, NEVER FOLDED ──
  *
@@ -660,10 +661,10 @@ export function projectJournalHistory(
     const lastSeq = rows[rows.length - 1].seq;
     // ⚠️ THE ADVANCEMENT CHECK RUNS BEFORE THE FOLD, NOT AFTER IT. Rows come
     // back `seq`-ordered, so a chunk whose LAST seq did not pass `afterSeq` is
-    // entirely rows we have already folded — folding it again would duplicate a
-    // `user` bubble (`applyUser` blind-appends) on the way out of the loop, i.e.
-    // the guard against a hang would itself corrupt the view it terminated.
-    // Refuse the chunk, then stop. Defensive: see the docblock — the real
+    // entirely rows we have already folded — re-folding them forever is the hang
+    // this guards. (Re-folding no longer corrupts the view: since #244 half B
+    // every reducer arm, `applyUser` included, is id-idempotent.) Refuse the
+    // chunk, then stop. Defensive: see the docblock — the real
     // `selectRows` filters `seq > afterSeq`, so this cannot fire against the
     // store.
     if (!(lastSeq > afterSeq)) break;
