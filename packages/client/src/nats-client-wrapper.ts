@@ -3291,14 +3291,25 @@ export class WebChannelNATSClient {
       // The inbound USER opener consumes a seq but rides no durable frame — half A
       // echoes that seq here. Advance the high-water so the turn's first agent
       // frame at userSeq+1 reads as contiguous instead of a phantom gap. ADVANCE
-      // ONLY, never gap-detect on the ack: a later `difference` that carries the
-      // same `user` event folds as a NO-OP BY ID because `applyUser` is
-      // id-idempotent (`durable-view-reducer.ts`) — an already-held id is not
-      // re-appended. (`adoptCommittedIds` also re-keys the local optimistic bubble
-      // to `webchannel-user-<seq>` so it converges on that same id, but the
-      // no-duplicate guarantee rests on the reducer's idempotency, not on adoption
-      // having run.) A pre-user gap from another device is left to reconnect
-      // recovery (half C) rather than gap-detected here; see the report.
+      // ONLY, never gap-detect on the ack. Two DISTINCT no-duplicate paths, do not
+      // conflate them: (1) HAPPY PATH — this ack ran `adoptCommittedIds` above,
+      // re-keying the local optimistic bubble to `webchannel-user-<seq>`; a later
+      // `difference` re-carrying that `user` event then folds as a no-op only
+      // BECAUSE the id is already held. (2) `applyUser` is additionally
+      // id-idempotent (`durable-view-reducer.ts`), which covers a RE-DELIVERED
+      // difference (a retry double-reply) — the second fold of an already-placed
+      // `webchannel-user-<seq>` is a no-op.
+      //
+      // ⚠️ These cover adoption-ran and re-delivery. They do NOT cover a LOST ack:
+      // if this ack never arrives, adoption never runs, the optimistic bubble keeps
+      // its LOCAL id, and the FIRST `difference` requested for the turn's agent-frame
+      // gap re-delivers the `user` event under `webchannel-user-<seq>` — a DISTINCT
+      // id — so `applyUser` appends a second (duplicate) user bubble in-session
+      // (N8 class). Idempotency cannot see it: there is no shared id to dedupe on
+      // without the ack. Tracked as #337 (adopt the difference-delivered user event
+      // by `random_id`, reusing #243's spine — never by text); recovered on
+      // reconnect until then. A pre-user gap from another device is likewise left to
+      // reconnect recovery (half C) rather than gap-detected here.
       //
       // ⚠️ HIGH-1: `advanceCursor` DEFERS this while a `get_difference` is in
       // flight. `applyFrame` above already ran (the id-adoption is live and
