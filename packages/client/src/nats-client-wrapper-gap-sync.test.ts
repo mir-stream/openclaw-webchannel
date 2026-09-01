@@ -345,3 +345,60 @@ describe("#244 half B — MED-3: a fold placement never blanks an authored answe
     expect(project(w).map((m) => (m as { text: string }).text)).toEqual(["final A", "final D"]);
   });
 });
+
+describe("#244 half B — a re-delivered/stale difference never corrupts the view", () => {
+  it("the proven repro: a retry double-reply does NOT duplicate the user bubble", () => {
+    vi.useFakeTimers();
+    try {
+      const { w, getDifference } = spied();
+      w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+      // A durable frame at seq3 opens a gap → get_difference(1).
+      w.handleMessage({ type: "agent_message", id: "a3", text: "answer 3", turnId: "t1", seq: 3 });
+      expect(getDifference).toHaveBeenCalledTimes(1);
+      // The 5s timeout re-issues the SAME request (same afterSeq).
+      vi.advanceTimersByTime(5_000);
+      expect(getDifference).toHaveBeenCalledTimes(2);
+      expect(getDifference).toHaveBeenLastCalledWith(1);
+
+      // Both the original and the retry answer with the SAME events (the user
+      // opener at seq2 rode no live frame; the difference carries it).
+      const reply: InboundMessage = {
+        type: "difference",
+        events: [
+          { seq: 2, event: { kind: "user", id: "webchannel-user-2", text: "hello", turnId: "t1" } },
+          { seq: 3, event: { kind: "bubble", answerId: "a3", text: "answer 3", turnId: "t1" } },
+        ],
+      };
+      // First reply heals.
+      w.handleMessage(reply);
+      expect(w.differenceInFlight).toBe(false);
+      // Retry reply lands AFTER the heal — must be dropped, not re-folded.
+      w.handleMessage(reply);
+
+      const users = project(w).filter((m) => (m as { role?: string }).role === "user");
+      expect(users).toHaveLength(1);
+      expect((users[0] as { text: string }).text).toBe("hello");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("drops a difference that lands with no request in flight — no state change", () => {
+    // Isolates the in-flight guard: with no outstanding request, a (stale) reply
+    // must not fold anything or advance the cursor.
+    const { w, getDifference } = spied();
+    w.handleMessage({ type: "history", messages: [], highWaterSeq: 5 });
+    const before = project(w);
+    const cursorBefore = w.lastAppliedSeq;
+    w.handleMessage({
+      type: "difference",
+      events: [
+        { seq: 6, event: { kind: "user", id: "webchannel-user-6", text: "ghost", turnId: "t1" } },
+      ],
+    });
+    expect(project(w)).toEqual(before);
+    expect(w.lastAppliedSeq).toBe(cursorBefore);
+    expect(w.differenceInFlight).toBe(false);
+    expect(getDifference).not.toHaveBeenCalled();
+  });
+});

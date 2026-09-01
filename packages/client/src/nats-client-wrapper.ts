@@ -3291,12 +3291,14 @@ export class WebChannelNATSClient {
       // The inbound USER opener consumes a seq but rides no durable frame — half A
       // echoes that seq here. Advance the high-water so the turn's first agent
       // frame at userSeq+1 reads as contiguous instead of a phantom gap. ADVANCE
-      // ONLY, never gap-detect on the ack: `adoptCommittedIds` has already re-keyed
-      // the local user bubble to `webchannel-user-<seq>`, so a later `difference`
-      // that carries the same `user` event folds as a no-op by id — but only
-      // because we do not withhold the adopt. A pre-user gap from another device is
-      // therefore left to reconnect recovery (half C) rather than risk duplicating
-      // the optimistic bubble; see the report.
+      // ONLY, never gap-detect on the ack: a later `difference` that carries the
+      // same `user` event folds as a NO-OP BY ID because `applyUser` is
+      // id-idempotent (`durable-view-reducer.ts`) — an already-held id is not
+      // re-appended. (`adoptCommittedIds` also re-keys the local optimistic bubble
+      // to `webchannel-user-<seq>` so it converges on that same id, but the
+      // no-duplicate guarantee rests on the reducer's idempotency, not on adoption
+      // having run.) A pre-user gap from another device is left to reconnect
+      // recovery (half C) rather than gap-detected here; see the report.
       //
       // ⚠️ HIGH-1: `advanceCursor` DEFERS this while a `get_difference` is in
       // flight. `applyFrame` above already ran (the id-adoption is live and
@@ -3445,8 +3447,22 @@ export class WebChannelNATSClient {
    * data loss). Those advances were deferred into `pendingDeferredSeq` and are
    * folded back into the cursor here, so the final cursor reflects both the
    * difference and anything that arrived during it.
+   *
+   * ⚠️ A difference is ONLY meaningful while a request is OUTSTANDING. If one lands
+   * with no request in flight it is DROPPED here, before the timer or the fold are
+   * touched. This kills two duplicate-fold paths: (a) the retry double-reply — the
+   * original and a re-issued request both answer, the first heals
+   * (`differenceInFlight=false`) and the second must not re-fold (`floor` is still
+   * `pendingAfterSeq`, so it would re-append every `seq > floor` — and `applyUser`
+   * being idempotent (Fix 1) covers the user bubble, but dropping the whole stale
+   * reply is the cheaper, exact guard for ALL kinds); (b) a reply landing after
+   * teardown/give-up. Dropping loses nothing — durable frames are journaled, and
+   * the frozen-cursor + next-frame re-detect path re-requests what is still missing.
    */
   private applyDifference(msg: InboundMessage): void {
+    // No request outstanding ⇒ this reply is stale/duplicate. Drop it WITHOUT
+    // cancelling any timer (there is none to cancel that belongs to it) or draining.
+    if (!this.differenceInFlight) return;
     // The reply landed — stop the liveness timer before folding.
     this.cancelDifferenceTimer();
     const floor = this.pendingAfterSeq;
