@@ -688,3 +688,92 @@ describe("connection and on-disk facts", () => {
 function mode(path: string): number {
   return statSync(path).mode & 0o777;
 }
+
+describe("#243 half 2a — appendInboundUser (server-assigned id) + idempotency", () => {
+  it("mints webchannel-user-<seq>, journals under it, keeps turnId as the wire id", () => {
+    const journal = open(newJournalPath());
+    const first = journal.appendInboundUser("conv", { text: "hi", turnId: "wire-1", randomId: "r-1" });
+    const second = journal.appendInboundUser("conv", { text: "yo", turnId: "wire-2", randomId: "r-2" });
+
+    expect(first).toEqual({ seq: 1, inserted: true, messageId: "webchannel-user-1" });
+    expect(second).toEqual({ seq: 2, inserted: true, messageId: "webchannel-user-2" });
+    // The durable row's id is the server mint; turnId is the wire id; the client
+    // random_id is NOT in the reducer-visible event (it lives only in the column).
+    expect(journal.read("conv").map((row) => row.event)).toEqual([
+      { kind: "user", id: "webchannel-user-1", text: "hi", turnId: "wire-1" },
+      { kind: "user", id: "webchannel-user-2", text: "yo", turnId: "wire-2" },
+    ]);
+  });
+
+  it("never mints an id that could collide with an agent (nextMessageId) id", () => {
+    // Agent ids are `webchannel-<digits>-<6 chars>`; a server user id is
+    // `webchannel-user-<seq>`. The `user-` infix is the collision guard.
+    const journal = open(newJournalPath());
+    const { messageId } = journal.appendInboundUser("conv", { text: "hi", turnId: "w", randomId: "r" });
+    expect(messageId).toMatch(/^webchannel-user-\d+$/);
+    // The agent-id shape has DIGITS right after `webchannel-`; this never does.
+    expect(messageId).not.toMatch(/^webchannel-\d/);
+  });
+
+  it("is idempotent on the random_id — a replay returns the first id and writes no second row", () => {
+    const journal = open(newJournalPath());
+    const first = journal.appendInboundUser("conv", { text: "hi", turnId: "wire-1", randomId: "r-1" });
+    const replay = journal.appendInboundUser("conv", { text: "hi", turnId: "wire-1", randomId: "r-1" });
+
+    expect(replay).toEqual({ seq: 1, inserted: false, messageId: first.messageId });
+    expect(journal.read("conv").map((row) => row.seq)).toEqual([1]);
+  });
+
+  it("is idempotent on the wire id when the client sent no random_id", () => {
+    const journal = open(newJournalPath());
+    const first = journal.appendInboundUser("conv", { text: "hi", turnId: "wire-1" });
+    const replay = journal.appendInboundUser("conv", { text: "hi", turnId: "wire-1" });
+
+    expect(replay).toEqual({ seq: 1, inserted: false, messageId: first.messageId });
+    expect(journal.read("conv").map((row) => row.seq)).toEqual([1]);
+  });
+
+  it("lookupUserMessageIdByRandomId recovers the minted id, and is undefined for the unknown", () => {
+    const journal = open(newJournalPath());
+    const { messageId } = journal.appendInboundUser("conv", { text: "hi", turnId: "wire-1", randomId: "r-1" });
+
+    expect(journal.lookupUserMessageIdByRandomId("conv", "r-1")).toBe(messageId);
+    expect(journal.lookupUserMessageIdByRandomId("conv", "nope")).toBeUndefined();
+    // Scoped per conversation — the same random_id in another conversation misses.
+    expect(journal.lookupUserMessageIdByRandomId("other", "r-1")).toBeUndefined();
+    // An older-client row keyed on its wire id is not addressable by a random_id.
+    journal.appendInboundUser("conv", { text: "old", turnId: "wire-2" });
+    expect(journal.lookupUserMessageIdByRandomId("conv", "wire-2")).toBe("webchannel-user-2");
+  });
+
+  it("forward-migrates a journal whose journal_event predates the idempotency_key column", () => {
+    // Simulate an on-disk journal written by a build before this slice: the
+    // journal_event table exists WITHOUT idempotency_key. Opening it must ALTER
+    // the column in and then function normally, not throw.
+    const path = newJournalPath();
+    mkdirSync(dirname(path), { recursive: true });
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE journal_event (
+        conversation_id TEXT    NOT NULL,
+        seq             INTEGER NOT NULL,
+        kind            TEXT    NOT NULL,
+        message_id      TEXT,
+        turn_id         TEXT,
+        payload         TEXT    NOT NULL,
+        created_ms      INTEGER NOT NULL,
+        PRIMARY KEY (conversation_id, seq)
+      );
+    `);
+    legacy.close();
+
+    const journal = open(path);
+    const first = journal.appendInboundUser("conv", { text: "hi", turnId: "wire-1", randomId: "r-1" });
+    expect(first.messageId).toBe("webchannel-user-1");
+    // Idempotency (which needs the migrated column and its index) still holds.
+    expect(
+      journal.appendInboundUser("conv", { text: "hi", turnId: "wire-1", randomId: "r-1" }),
+    ).toEqual({ seq: 1, inserted: false, messageId: "webchannel-user-1" });
+    expect(journal.lookupUserMessageIdByRandomId("conv", "r-1")).toBe("webchannel-user-1");
+  });
+});

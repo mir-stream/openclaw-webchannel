@@ -256,6 +256,51 @@ export interface DeliveryJournal {
     event: JournalEvent,
   ): { seq: number; inserted: boolean };
   /**
+   * #243 half 2a (doc §16.2-1) — journal a FRESH inbound user message under a
+   * SERVER-MINTED durable id, and RETURN that id so the accept seam can echo it.
+   *
+   * The id is minted INSIDE the same transaction that allocates `seq`
+   * (`webchannel-user-<seq>`), which is the whole reason this is a distinct entry
+   * point rather than `append(journalEventForInboundUser(...))`: §16.2-1 requires
+   * the durable id be assigned transactionally WITH the seq, and the loose
+   * `nextMessageId()` mint used at egress is not tied to this store's txn. So the
+   * caller supplies only the CONTENT (`text`, the wire `turnId`, and the client
+   * `random_id`); the identity is this store's to assign.
+   *
+   * `turnId` STAYS the client's wire id (the client still holds it and stamps it
+   * on its live user bubble); only the message `id` moves to the server. See the
+   * accept seam's mirror argument.
+   *
+   * IDEMPOTENT on the stable key `randomId ?? turnId` (turnId = the wire id the
+   * client reuses on every replay) — mirroring `ingressDedupeKey`. A replay of a
+   * message already journaled returns the FIRST row's `seq` and minted
+   * `messageId` with `inserted: false`, and writes NO second row. This is the
+   * journal-level net that replaces the old `journal_user_once`-on-wire-id
+   * collapse, which stopped working once the durable id became server-minted (a
+   * replay would otherwise mint a DIFFERENT id and duplicate the row). It matters
+   * because persist-before-publish can commit a row and then have its batch
+   * refused, after which the client replays.
+   *
+   * `randomId` is also what `lookupUserMessageIdByRandomId` recovers a minted id
+   * by for the deduped-retry echo. Pass `undefined` for an older client that sent
+   * no usable `random_id`: it is still journaled (keyed by its wire id) and still
+   * idempotent, but carries no `random_id` echo.
+   */
+  appendInboundUser(
+    conversationId: string,
+    input: { text: string; turnId?: string; randomId?: string },
+  ): { seq: number; inserted: boolean; messageId: string };
+  /**
+   * #243 half 2a — the server user messageId previously minted for `randomId` in
+   * this conversation, or `undefined` if none. This is the deduped-retry echo's
+   * lookup: when the ingress dedupe catches a retry before it re-appends, this
+   * recovers the id the FIRST admission assigned so the ack echoes it unchanged.
+   */
+  lookupUserMessageIdByRandomId(
+    conversationId: string,
+    randomId: string,
+  ): string | undefined;
+  /**
    * Rows for one conversation in `seq` order, i.e. in egress order.
    *
    * UNBOUNDED BY DEFAULT, on purpose: replaying the whole log is what the shared
@@ -296,7 +341,32 @@ type JournalStatements = {
   insertEvent: SqliteStatement;
   selectExistingSeqByKind: { user: SqliteStatement; placement: SqliteStatement };
   selectRows: SqliteStatement;
+  /** #243 half 2a: idempotency check-first, and the deduped-retry echo lookup. */
+  selectUserByIdempotencyKey: SqliteStatement;
 };
+
+/**
+ * #243 half 2a — mint a user message's DURABLE id from its per-conversation
+ * `seq`, INSIDE the append transaction that allocated it (doc §16.2-1).
+ *
+ * ⚠️ THE `user-` INFIX IS WHAT KEEPS THIS COLLISION-FREE WITH AGENT IDS, and it
+ * is load-bearing, not decoration. Agent ids are `nextMessageId()`'s
+ * `webchannel-<ms>-<6 chars>` (`message-adapter.ts`), where the segment after
+ * `webchannel-` is DIGITS (`Date.now()`); this one is `webchannel-user-<seq>`,
+ * where that segment begins with `user`. The two namespaces cannot overlap, so a
+ * server user id can never be mistaken for — or collide with — an agent bubble id
+ * in the shared `message_id` column.
+ *
+ * ⚠️ UNIQUENESS COMES FROM `seq`, WHICH IS THE POINT. `seq` is `MAX(seq)+1` per
+ * conversation, allocated in this same transaction and never reused (append-only,
+ * no deletes), so `webchannel-user-<seq>` is unique within the conversation — the
+ * exact scope `journal_user_once` keys on — BY CONSTRUCTION. Deriving the id FROM
+ * `seq` is the most direct expression of "assigned transactionally with the seq":
+ * there is no second source of truth to keep in step.
+ */
+function mintServerUserMessageId(seq: number): string {
+  return `webchannel-user-${seq}`;
+}
 
 /**
  * Steps 3-6 of the open sequence, plus the statements, on an ALREADY-OPEN handle.
@@ -454,6 +524,16 @@ function openJournalConnection(
         turn_id         TEXT,
         payload         TEXT    NOT NULL,
         created_ms      INTEGER NOT NULL,
+        -- #243 half 2a: the STABLE idempotency key a fresh user row was admitted
+        -- under — the client random_id when it sent one, else its wire id — which
+        -- mirrors ingress-dedupe.ts's ingressDedupeKey keyBody exactly. It gives
+        -- a user row an idempotent identity that survives the durable id moving
+        -- from client-minted to server-minted: appendInboundUser is idempotent on
+        -- it (a replay of the same message returns the first row, never a second),
+        -- and it is the column lookupUserMessageIdByRandomId queries to recover a
+        -- minted id for the retry echo. NULL for every other kind. Added LAST so
+        -- its position matches the ALTER path below on an existing journal.
+        idempotency_key TEXT,
         PRIMARY KEY (conversation_id, seq)
       );
 
@@ -461,6 +541,42 @@ function openJournalConnection(
         ON journal_event(conversation_id, message_id) WHERE kind = 'user';
       CREATE UNIQUE INDEX IF NOT EXISTS journal_placement_once
         ON journal_event(conversation_id, message_id) WHERE kind = 'placement';
+    `);
+
+    // #243 half 2a — FORWARD-MIGRATE an existing journal that predates the
+    // `idempotency_key` column. `CREATE TABLE IF NOT EXISTS` above is a no-op on a
+    // table that already exists, so it never adds the column; a bare unconditional
+    // `ALTER TABLE … ADD COLUMN` would throw "duplicate column name" on a journal
+    // this build already migrated. Gate on `table_info` so the migration is
+    // idempotent both ways. Cheap (one PRAGMA at open), and needed because #271's
+    // version gate does not exist yet — this is the same "schema is malleable
+    // before there is a deployed install" window the DDL comment above relies on.
+    const journalColumns = db
+      .prepare("PRAGMA table_info(journal_event)")
+      .all() as Array<{ name: string }>;
+    if (!journalColumns.some((column) => column.name === "idempotency_key")) {
+      db.exec("ALTER TABLE journal_event ADD COLUMN idempotency_key TEXT");
+    }
+
+    // The idempotency index MUST be created AFTER the ALTER — on a migrated
+    // journal the column does not exist until the statement above runs, so
+    // referencing it inside the CREATE TABLE block would fail there. Partial
+    // (`WHERE kind = 'user' AND idempotency_key IS NOT NULL`) so it covers only
+    // user rows and never the NULLs every other kind carries.
+    //
+    // UNIQUE, and it is the journal-level idempotency net that #243 half 2a needs.
+    // Before this slice the durable id WAS the client wire id, so `journal_user_once`
+    // (on `message_id`) made a replay collapse onto its first row. Now the id is
+    // SERVER-minted per `seq`, so a replay would mint a DIFFERENT id and slip past
+    // that index — the exact duplicate-row failure the mapping exists to prevent.
+    // This index restores the guarantee on the STABLE key instead. `appendInboundUser`
+    // checks it first inside the txn, so an ordinary replay never reaches the
+    // insert; the UNIQUE clause is the belt to that check's braces (both live on
+    // the same-peer-serialized flush path, so they cannot race).
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS journal_user_idempotency_once
+        ON journal_event(conversation_id, idempotency_key)
+        WHERE kind = 'user' AND idempotency_key IS NOT NULL;
     `);
     db.prepare(
       "INSERT INTO journal_meta (key, value) VALUES ('schema_version', ?) " +
@@ -478,10 +594,12 @@ function openJournalConnection(
       "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM journal_event " +
         "WHERE conversation_id = ?",
     );
+    // `idempotency_key` is the trailing bind: NULL for `append` (every kind but a
+    // fresh inbound user), and the stable key for `appendInboundUser`.
     const insertEvent = db.prepare(
       "INSERT INTO journal_event " +
-        "(conversation_id, seq, kind, message_id, turn_id, payload, created_ms) " +
-        "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        "(conversation_id, seq, kind, message_id, turn_id, payload, created_ms, idempotency_key) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
     );
     // Two statements, one per deduped kind, with `kind` as a SQL LITERAL rather
     // than a bound parameter. A bound `kind = ?` cannot be matched against the
@@ -508,6 +626,15 @@ function openJournalConnection(
       "SELECT seq, payload, created_ms FROM journal_event " +
         "WHERE conversation_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
     );
+    // #243 half 2a — served by the partial `journal_user_idempotency_once` index.
+    // `kind = 'user'` is a SQL LITERAL for the same reason `selectExistingSeqByKind`
+    // uses one: the partial index's predicate is provable at prepare time only
+    // against a literal. Two shapes, one index: `appendInboundUser`'s check-first
+    // needs the `seq` and minted `message_id`; the retry echo needs only the id.
+    const selectUserByIdempotencyKey = db.prepare(
+      "SELECT seq, message_id FROM journal_event " +
+        "WHERE conversation_id = ? AND kind = 'user' AND idempotency_key = ?",
+    );
 
     return {
       maintenance,
@@ -516,6 +643,7 @@ function openJournalConnection(
         insertEvent,
         selectExistingSeqByKind,
         selectRows,
+        selectUserByIdempotencyKey,
       },
     };
   } catch (error) {
@@ -600,8 +728,13 @@ export function openDeliveryJournal(options: {
     throw error;
   }
   const { maintenance, statements } = connection;
-  const { selectNextSeq, insertEvent, selectExistingSeqByKind, selectRows } =
-    statements;
+  const {
+    selectNextSeq,
+    insertEvent,
+    selectExistingSeqByKind,
+    selectRows,
+    selectUserByIdempotencyKey,
+  } = statements;
 
   let closed = false;
 
@@ -671,6 +804,9 @@ export function openDeliveryJournal(options: {
           extractTurnId(event),
           JSON.stringify(event),
           now(),
+          // `idempotency_key` is owned by `appendInboundUser`; every `append` kind
+          // (including the egress seam's) carries none.
+          null,
         );
         if (Number(result.changes) > 0) return { seq, inserted: true };
 
@@ -711,6 +847,84 @@ export function openDeliveryJournal(options: {
         }
         return { seq: Number(existing.seq), inserted: false };
       });
+    },
+
+    appendInboundUser(conversationId, input) {
+      // The STABLE idempotency key mirrors ingress-dedupe.ts's `ingressDedupeKey`
+      // keyBody: the client `random_id` when it sent one, else its wire id (which
+      // the client reuses verbatim on every replay). It is what makes this method
+      // idempotent even though the durable id is now server-minted rather than the
+      // wire id the old `journal_user_once` net keyed on.
+      const idempotencyKey = input.randomId ?? input.turnId;
+      // The id is SERVER-MINTED, so this path does NOT run the client-supplied-id
+      // validation `append` and `journalEventForInboundUser` apply — that guard
+      // exists to bound HOSTILE input, and this id is our own mint
+      // (`webchannel-user-<seq>`), short and always well-formed. #243 half 2a item
+      // 4: the check shifts from "bound hostile input" to "trust our own mint",
+      // exactly as agent ids are already unchecked. `turnId` is still the client's
+      // wire id and is only ever handled structurally.
+      return runSqliteImmediateTransactionSync(db, () => {
+        // CHECK-FIRST, inside the txn: a replay of a message we already journaled
+        // (same key) returns the FIRST row's id, never a second row. This is the
+        // idempotency net #243 half 2a needs — persist-before-publish means a
+        // batch can commit a row and then be refused, and the client replays it;
+        // this returns the committed row instead of duplicating it. Same-peer
+        // serialization plus this immediate txn make the check-then-insert atomic.
+        if (idempotencyKey !== undefined) {
+          const existing = selectUserByIdempotencyKey.get(
+            conversationId,
+            idempotencyKey,
+          ) as { seq: number; message_id: string } | undefined;
+          if (existing !== undefined) {
+            return {
+              seq: Number(existing.seq),
+              inserted: false,
+              messageId: existing.message_id,
+            };
+          }
+        }
+        const seq = Number(
+          (selectNextSeq.get(conversationId) as { next: number }).next,
+        );
+        const messageId = mintServerUserMessageId(seq);
+        const event: JournalEvent = {
+          kind: "user",
+          id: messageId,
+          text: input.text,
+          ...(input.turnId === undefined ? {} : { turnId: input.turnId }),
+        };
+        const result = insertEvent.run(
+          conversationId,
+          seq,
+          "user",
+          messageId,
+          input.turnId ?? null,
+          JSON.stringify(event),
+          now(),
+          idempotencyKey ?? null,
+        );
+        // With the check above passed, a fresh `seq` yields a fresh `message_id`
+        // and a fresh `idempotency_key`, so neither unique index can conflict. A
+        // zero-change insert here is therefore a construction bug — fail loudly
+        // rather than return a seq that names some other row.
+        if (Number(result.changes) === 0) {
+          throw new Error(
+            "webchannel: appendInboundUser insert conflicted after an idempotency " +
+              `miss (key ${String(idempotencyKey)}, id ${messageId}) — construction bug`,
+          );
+        }
+        return { seq, inserted: true, messageId };
+      });
+    },
+
+    lookupUserMessageIdByRandomId(conversationId, randomId) {
+      // Queried with the client `random_id`, which is the `idempotency_key` value
+      // for any row a conforming client admitted (an older client's key is its
+      // wire id, and it has no random_id to look up with, so it never reaches here).
+      const row = selectUserByIdempotencyKey.get(conversationId, randomId) as
+        | { seq: number; message_id: string }
+        | undefined;
+      return row?.message_id ?? undefined;
     },
 
     read(conversationId, readOptions) {

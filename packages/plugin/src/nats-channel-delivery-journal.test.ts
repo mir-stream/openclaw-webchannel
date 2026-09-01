@@ -126,6 +126,14 @@ class FakeJournal implements DeliveryJournal {
     this.calls.push({ call: "append", conversationId, event });
     return { seq: ++this.seq, inserted: true };
   }
+  // #243 half 2a: this is the EGRESS-seam test, which never accepts inbound user
+  // messages, so these two are unreached stubs kept only to satisfy the interface.
+  appendInboundUser(): { seq: number; inserted: boolean; messageId: string } {
+    throw new Error("appendInboundUser is not exercised by the egress seam");
+  }
+  lookupUserMessageIdByRandomId(): string | undefined {
+    return undefined;
+  }
   read(): DeliveryJournalRow[] {
     return [];
   }

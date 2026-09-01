@@ -1103,7 +1103,8 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         accountId,
         outcomeStore: processIngressOutcomes,
         beginBatch: (peerId) => inboundDispatcher!.beginBatch(peerId),
-        sendAck: (peerId, ids) => channel.sendAck(peerId, ids),
+        // #243 half 2a: forward the server-assigned-id echo so it rides the ack.
+        sendAck: (peerId, ids, committed) => channel.sendAck(peerId, ids, committed),
         sendInboundRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids),
         // v6 (#239 half 3): the SAME handle the channel got for the egress seam,
         // opened above from this account's (tenant, accountId) tuple. Doc §15.7

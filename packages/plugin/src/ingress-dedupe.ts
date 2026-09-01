@@ -283,7 +283,16 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
    * When present, called once per flush with the unique ids across ALL items
    * (see the ack rationale in the factory doc).
    */
-  sendAck?: (peerId: string, ids: string[]) => boolean;
+  /**
+   * #243 half 2a: `committed` carries the server-assigned `random_id → messageId`
+   * echo. Optional and back-compatible — every non-echo caller (cancelled
+   * fallback, legacy branch) passes two args exactly as before.
+   */
+  sendAck?: (
+    peerId: string,
+    ids: string[],
+    committed?: Array<{ random_id: string; messageId: string }>,
+  ) => boolean;
   sendInboundRejected?: (peerId: string, ids: string[]) => boolean;
   outcomeStore?: IngressOutcomeStore;
   beginBatch?: (peerId: string) => DispatcherBatchLease<T["message"]>;
@@ -476,13 +485,10 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
       const lease = deps.beginBatch(peerId);
       const measure = (frame: IngressResultFrame) => deps.measureResultWireBytes?.(peerId, frame)
         ?? Buffer.byteLength(JSON.stringify(frame), "utf8");
-      const ack = createIngressResultChunkWriter({
-        type: "ack",
-        publish: (frame) => deps.sendAck?.(peerId, frame.ids) ?? false,
-        measureWireBytes: measure,
-        effectiveOutboundLimit: deps.effectiveOutboundLimit?.(),
-        onTooSmall: () => logWarn?.("webchannel: result frame cannot fit effective NATS max_payload"),
-      });
+      // #243 half 2a: the `ack` writer is created in the FOOTER, not here, because
+      // its `committed` echo is only known once the fresh admissions have been
+      // journaled (their minted ids) and the deduped retries have been looked up.
+      // See `committedBatch` and the footer.
       const rejected = createIngressResultChunkWriter({
         type: "inbound_rejected",
         publish: (frame) => deps.sendInboundRejected?.(peerId, frame.ids) ?? false,
@@ -503,7 +509,16 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
        * user bubbles, so N `user` rows is what makes history equal live (N8). The
        * coalesced message is a dispatch concern and never reaches this array.
        */
-      const journalPending: Array<{ id: string; text: unknown }> = [];
+      const journalPending: Array<{ wireId: string; randomId: string | undefined; text: unknown }> = [];
+      /**
+       * #243 half 2a — the batch's `random_id → messageId` echo, in the order the
+       * ids are collected. A FRESH admission contributes its newly minted id
+       * (footer append loop); a DEDUPED RETRY contributes the id its first
+       * admission minted, recovered via `lookupUserMessageIdByRandomId`. Rides
+       * the first `ack` frame (see the footer). Empty for older clients that sent
+       * no usable `random_id` — those are still acked, just not echoed.
+       */
+      const committedBatch: Array<{ random_id: string; messageId: string }> = [];
       /**
        * The chosen results, held until the footer. **NOTHING may be `add`ed to
        * either chunk writer inside the item loop.**
@@ -651,6 +666,11 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             continue;
           }
           const id = item.message.id as string;
+          // #243 half 2a: the usable client `random_id` this item was keyed on
+          // (the same predicate `ingressDedupeKey` uses for the key BODY). It is
+          // what a fresh admission is journaled under and what a retry echoes by.
+          // Absent for an older client that sent none — then there is no echo.
+          const randomId = usableId(item.message.random_id) ? item.message.random_id : undefined;
 
           // A cancellation tombstone is authoritative and must run before an
           // ordinary outcome lookup or dispatcher admission. It represents text
@@ -720,8 +740,27 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // journal write fails. Deliberate, and harmless: the batch retries
             // whole, and this id's durable outcome is already `accepted`, so the
             // replay simply lands here again and acks then.
-            if (existing.outcome === "accepted") ackIds.push(id);
-            else rejectedIds.push(id);
+            if (existing.outcome === "accepted") {
+              ackIds.push(id);
+              // #243 half 2a — THE DEDUPED-RETRY ECHO. The retry is caught here,
+              // BEFORE any re-append, so it must not mint a fresh id or write a
+              // second row (a new id would slip past `journal_user_once`, whose
+              // key is the OLD id, and duplicate the durable message). Instead
+              // recover the id the FIRST admission minted, from the row's
+              // `random_id`, and echo the SAME value. Absent lookup ⇒ no echo but
+              // still acked: an older client with no `random_id`, or the #275
+              // window skew where the outcome marker outlived the row's presence
+              // in this store — neither of which the client consumes in 2a anyway.
+              if (randomId !== undefined && deps.deliveryJournal) {
+                const messageId = deps.deliveryJournal.lookupUserMessageIdByRandomId(
+                  peerId,
+                  randomId,
+                );
+                if (messageId !== undefined) {
+                  committedBatch.push({ random_id: randomId, messageId });
+                }
+              }
+            } else rejectedIds.push(id);
             continue;
           }
 
@@ -801,7 +840,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // the case where one does not. Do not read this as "a hook here
             // would be inert"; #292 may well want one.)
             if (deps.deliveryJournal) {
-              journalPending.push({ id, text: item.message.text });
+              journalPending.push({ wireId: id, randomId, text: item.message.text });
             }
           } else {
             rollbackOnce();
@@ -874,11 +913,11 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           // admit, do not journal, say so. And the gap is sharper than a plain
           // omission — the turn still runs and the egress seam journals its
           // answer, so history gains an agent answer with NO preceding user row.
-          const journalable: Array<{ id: string; text: string }> = [];
+          const journalable: Array<{ wireId: string; randomId: string | undefined; text: string }> = [];
           const unjournalableText: Array<"non-string-text"> = [];
           for (const pending of journalPending) {
             if (typeof pending.text === "string") {
-              journalable.push({ id: pending.id, text: pending.text });
+              journalable.push({ wireId: pending.wireId, randomId: pending.randomId, text: pending.text });
             } else unjournalableText.push("non-string-text");
           }
           try {
@@ -909,23 +948,31 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               // client stamps each bubble with its own — so per-message is the
               // faithful choice, and it is also what the client does.)
               //
-              // ⚠️ THIS IS NOT THE `id` QUESTION. We journal `id` = the WIRE id
-              // while live holds a local `u-<n>` from `mintLocalBubbleId`; that
-              // divergence is doc §16.2-1 / issue **#243** and is deliberately
-              // NOT touched here. `turnId` is a separate field whose two sides
-              // already agree on a value we hold.
+              // ⚠️ THIS IS THE `id` QUESTION, AND #243 half 2a IS WHERE IT MOVES.
+              // The durable `id` is no longer the client WIRE id — the SERVER
+              // mints it inside `appendInboundUser`'s transaction, tied to the
+              // `seq` (doc §16.2-1). `turnId` is a SEPARATE field and STAYS the
+              // wire id: the client still holds it (`nextPublishedUserMessages`
+              // stamps it on the live bubble) and it is the value both sides
+              // already agree on, so it is the faithful mirror. The minted id is
+              // captured for the ack echo below; in 2a the client keeps
+              // reconciling by text/position and ignores that echo (adoption is
+              // half 2b).
               //
               // Synchronous and in arrival order, because `seq` order is the
               // stream's order and the stream's order IS the identity model
               // (doc §16.5.3). No batching, no deferral.
-              deps.deliveryJournal.append(
-                peerId,
-                journalEventForInboundUser({
-                  id: pending.id,
-                  text: pending.text,
-                  turnId: pending.id,
-                }),
-              );
+              const { messageId } = deps.deliveryJournal.appendInboundUser(peerId, {
+                text: pending.text,
+                turnId: pending.wireId,
+                ...(pending.randomId !== undefined ? { randomId: pending.randomId } : {}),
+              });
+              // The echo is keyed by `random_id`, so it exists only for a
+              // conforming client. An older client is still journaled (under a
+              // server id) and acked; it simply carries no `committed` entry.
+              if (pending.randomId !== undefined) {
+                committedBatch.push({ random_id: pending.randomId, messageId });
+              }
             }
           } catch (error) {
             // ACCEPT FAILURE, expressed with the mechanism this function already
@@ -969,21 +1016,16 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // Neither exception loses fresh conforming-client text, which is the
             // property §15.7 actually demands.
             //
-            // ⚠️ ONE LINE FOR BOTH THROW SOURCES (the mapper and `append`), ON
-            // PURPOSE. A mapper refusal and a store fault would call for
-            // opposite operator responses, so merging them would normally be
-            // wrong — but after the `MAX_INGRESS_DEDUPE_ID_LENGTH` collapse
-            // above, `journalEventForInboundUser` CANNOT refuse anything that
-            // reaches here: its id (the wire `id`, `pending.id`) came through
-            // `ingressDedupeKey`'s identical predicate at the identical bound —
-            // and that is still true after #243 half 1, which added a `random_id`
-            // key BODY but left the wire-id GATE (`usableId(id)`) as the sole
-            // admission to this else-branch, precisely so this invariant holds —
-            // and its text was just narrowed to `string`. So today this line has
-            // exactly one real source, and a
-            // `code="<none>"` diagnostic on it means a construction bug, not a
-            // sick database. The `try` still spans the mapper because #242
-            // widens the event set and may add refusals — and THAT is when the
+            // ⚠️ ONE REAL THROW SOURCE HERE, ON PURPOSE. As of #243 half 2a the
+            // append goes through `appendInboundUser`, which no longer runs the
+            // client-supplied-id VALIDATION the old `journalEventForInboundUser`
+            // mapper did (the id is now SERVER-minted from `seq`, always
+            // well-formed — item 4's "trust our own mint"). So the only way this
+            // catch fires is a genuine STORE FAULT (`append`/`appendInboundUser`
+            // hitting SQLite), and a `code="<none>"` diagnostic on it means a
+            // construction bug, not a sick database. The `try` still spans the
+            // whole append loop because #242 widens the durable event set and a
+            // future kind may add a mapper-style refusal — and THAT is when the
             // categories must split.
             //
             // ⚠️ CAUGHT, NOT PROPAGATED. Measured: a rejected `onFlush` is
@@ -1076,6 +1118,29 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         // `inbound_rejected` frames instead of interleaving by item. The two
         // classes are disjoint id sets and the client handles them
         // independently, and the footer already finished them in this order.
+        //
+        // #243 half 2a: the `ack` writer is BUILT HERE, not at the top of the
+        // batch, because `committedBatch` is only complete now — after the fresh
+        // admissions minted their ids (append loop) and the deduped retries
+        // recovered theirs (item loop). The writer attaches the whole echo to its
+        // FIRST published frame and measures it on the wire; `publish` forwards
+        // `frame.committed` to `deps.sendAck`, whose channel-side writer re-carries
+        // it on ITS first frame (`sendIngressResult`).
+        const ack = createIngressResultChunkWriter({
+          type: "ack",
+          // Pass the third arg ONLY when there is an echo to carry, so an ack
+          // with no `committed` calls `sendAck` with its original two-arg shape.
+          publish: (frame) => {
+            const committed = frame.type === "ack" ? frame.committed : undefined;
+            return (committed && committed.length > 0
+              ? deps.sendAck?.(peerId, frame.ids, committed)
+              : deps.sendAck?.(peerId, frame.ids)) ?? false;
+          },
+          measureWireBytes: measure,
+          effectiveOutboundLimit: deps.effectiveOutboundLimit?.(),
+          ...(committedBatch.length > 0 ? { committed: committedBatch } : {}),
+          onTooSmall: () => logWarn?.("webchannel: result frame cannot fit effective NATS max_payload"),
+        });
         for (const id of ackIds) ack.add(id);
         ack.finish();
         for (const id of rejectedIds) rejected.add(id);
@@ -1248,11 +1313,13 @@ import type { IngressResultFrame } from "./ingress-result-chunks.js";
 import { logSafe } from "./log-safe.js";
 /**
  * v6 delivery journal (#239 half 3). TYPE-ONLY for the store — this module never
- * opens one — and a value import for the pure mapper/diagnostic beside it.
+ * opens one — and a value import for the id-length bound and failure diagnostic
+ * beside it. (#243 half 2a: the accept seam no longer calls
+ * `journalEventForInboundUser` — the server mints the id inside
+ * `appendInboundUser` — so that mapper is no longer imported here.)
  */
 import type { DeliveryJournal } from "./delivery-journal.js";
 import {
   MAX_INBOUND_USER_ID_LENGTH,
-  journalEventForInboundUser,
   journalFailureDiagnostic,
 } from "./delivery-journal-event.js";
