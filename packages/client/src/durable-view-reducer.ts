@@ -322,9 +322,13 @@ export type DurableMessage =
        * explicit restore per §16.2-3). ⚠️ SINCE HALF 2 the tombstone also has a
        * SECOND producer: `applySeal`'s `remove` writes exactly this shape in place
        * (a `messageDeleted` is the future third one, still dormant). So a tombstone
-       * DOES exist on a live stream now, which is why the no-resurrect guards below
-       * are reachable rather than dormant. Both consumers STRIP `deleted === true`
-       * at render/serve, so a tombstone never renders. Read `=== true`.
+       * DOES exist on a live stream now — but the no-resurrect GUARDS below still
+       * fire only in a constructed whole-log fold, because egress emits no later
+       * same-id event after a `seal.remove` (id non-reuse + terminal-drain
+       * snapshot); the server's full replay is the side they protect (#329 tracks
+       * making the client's no-resurrect structural). Both consumers STRIP
+       * `deleted === true` at render/serve, so a tombstone never renders. Read
+       * `=== true`.
        */
       readonly deleted?: boolean;
     }
@@ -982,10 +986,13 @@ function applyPlacement(
   const prev = idx === -1 ? undefined : view[idx];
   // ⚠️ NO-RESURRECT (#241, doc §16.2-3). A placement claiming a slot for a
   // TOMBSTONED id must not revive it — the delete is permanent, so this is a
-  // no-op returning the input by reference. REACHABLE since half 2: a
-  // `seal.remove` now tombstones in place, so a later `progress` for that id
-  // hits this branch (as well as any future `messageDeleted`). It is stated as
-  // `deleted === true` (not truthiness) so only an actual tombstone trips it.
+  // no-op returning the input by reference. Half 2's `applySeal` produces the
+  // tombstone this guards against, but the guard itself FIRES only in a
+  // constructed whole-log fold — never in production nor on the incremental
+  // client, because egress emits no `progress`/`bubble` for a `seal.remove`d id
+  // after its snapshot (see the file header at the array-identity table: id
+  // non-reuse + terminal-drain snapshot). It is stated as `deleted === true`
+  // (not truthiness) so only an actual tombstone trips it.
   if (prev !== undefined && prev.kind === "text" && prev.deleted === true) return view;
   // `prev.kind !== "text"` CANNOT fire — `findTextIndex`'s predicate already
   // decided it, and TS simply cannot carry a `findIndex` callback's narrowing to
@@ -1035,8 +1042,12 @@ function applyBubble(
   // `bubble` re-appended it. A tombstone replaces that — a `bubble` whose id
   // resolves to a tombstone must neither overwrite the tombstone (update branch)
   // nor append a duplicate (append branch), so it is a no-op here, BEFORE either.
-  // REACHABLE since half 2, which routes `seal.remove` through a tombstone: this
-  // is what makes `[bubble X, seal(remove X), bubble X]` leave X tombstoned.
+  // This is what makes `[bubble X, seal(remove X), bubble X]` leave X tombstoned
+  // — but that sequence is reachable only in a constructed whole-log fold: in
+  // production and on the incremental client, egress emits no `bubble` for a
+  // `seal.remove`d id after its snapshot, so this guard never fires there (the
+  // server's full replay is the side the tombstone actually protects). #329
+  // tracks making the client's no-resurrect structural rather than egress-reliant.
   if (prev !== undefined && prev.kind === "text" && prev.deleted === true) return view;
   // Same shape and same reason as `applyPlacement`'s: the second disjunct is
   // unreachable and is how TS is told what `findTextIndex` already guaranteed.
