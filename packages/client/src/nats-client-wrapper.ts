@@ -2439,7 +2439,11 @@ export class WebChannelNATSClient {
    *     that would defeat the identity reuse below;
    *  4. a spent draft (see `isSpentDraft`) is OMITTED;
    *  5. an id in `prev` but absent from the view is dropped — that is `seal`'s
-   *     `remove` working as designed.
+   *     `remove` working as designed. ⚠️ SINCE #241 half 2 a `seal.remove` no longer makes the
+ *     id ABSENT — it leaves a tombstone (`kind: "text", deleted: true`) in the
+ *     view at its slot — so the drop now happens via the tombstone strip at the
+ *     TOP of the loop rather than by absence. Either way a removed id is not
+ *     rendered.
    *
    * ⚠️ RULES 1-4 ARE ABOUT BUBBLES. A `kind: "reasoning"` or `kind: "tool"`
    * entry takes a short branch at the top of the loop: it has no `local[id]`
@@ -2502,6 +2506,15 @@ export class WebChannelNATSClient {
     const prevByKind = indexTranscriptByKind(prev);
     const out: ChatMessage[] = [];
     for (const entry of view) {
+      // ⚠️ #241 half 2: STRIP TOMBSTONES. A permanent typed delete — today only a
+      // `seal.remove` — leaves a `{ kind: "text", deleted: true, text: "" }`
+      // entry in the durable view at its slot so a later same-id event cannot
+      // resurrect it (the reducer's no-resurrect guards). It must never become a
+      // rendered `ChatMessage`: dropping it here makes a removed id invisible,
+      // exactly as the old `filter`-based `seal` did (rule 5). This is the CLIENT
+      // half of the strip; `journal-history.ts` drops the same entries when it
+      // serves history, and both fold the SAME reducer — so live == history.
+      if (entry.kind === "text" && entry.deleted === true) continue;
       // ⚠️ #242 half 2: A REASONING ENTRY IS CARRIED, NOT SKIPPED. Half 1 had a
       // `continue` here because `state.messages` was the chat-BUBBLE list and
       // the client rendered reasoning from a separate `state.reasoning` array.
