@@ -263,8 +263,17 @@ export type HistoryServer = {
    * — O(limit) rows, no fold — so unlike the two projection paths it stays on the
    * dispatch turn (the same choice `servePage`'s docblock defends the OTHER way
    * for the fold). It is wrapped in a try/catch: a read fault logs and sends
-   * nothing (the client's request simply goes unanswered and its buffered frames
-   * eventually drive a retry), never an empty frame that would falsely advance.
+   * NOTHING — never an empty frame, which would falsely advance the client's
+   * cursor past the range it is missing.
+   *
+   * ⚠️ SENDING NOTHING ON A FAULT IS SAFE ONLY BECAUSE THE CLIENT SELF-HEALS. The
+   * request went unanswered; there is no server- or client-side path here that
+   * "eventually retries" on its own. The client arms a TIMEOUT on its in-flight
+   * `get_difference` (`nats-client-wrapper.ts`) and re-issues it when no
+   * `difference` arrives — that timer, not any buffered-frame mechanism, is what
+   * recovers a dropped request/reply or a read fault. An EMPTY-SUCCESSFUL read is
+   * a different thing and IS still answered (an empty `difference`), so an
+   * already-current `afterSeq` unwinds cleanly rather than waiting on the timeout.
    */
   serveDifference(peerId: string, afterSeq: number): void;
 };
@@ -737,6 +746,11 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
         // would strand the cursor below an unknown tail and re-request forever.
         entries = rows.map((row) => ({ seq: row.seq, event: row.event as DurableEvent }));
       } catch (err) {
+        // READ FAULT: log and send NOTHING. This does NOT unwind the client — an
+        // unanswered request is recovered by the client's in-flight TIMEOUT
+        // (`nats-client-wrapper.ts`), which re-issues and then re-detects. Sending
+        // an empty frame here would be worse than silence: it would falsely advance
+        // the client PAST the range it is still missing.
         try {
           logger?.error?.(
             `webchannel: difference read failed for ${logSafe(peerId)} ` +
@@ -745,10 +759,11 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
         } catch { /* a faulting logger must not escape the dispatch turn */ }
         return;
       }
-      // An EMPTY difference (afterSeq already current) is still ANSWERED — the
-      // client's `case "difference"` no-ops the fold and drains its buffer, which
-      // is how a spurious/raced detection unwinds. Sending nothing would leave a
-      // client that DID buffer stuck in-flight.
+      // EMPTY-SUCCESSFUL read (afterSeq already current) — a DIFFERENT case from the
+      // fault above, and it IS answered: an empty `difference`. The client's
+      // `case "difference"` no-ops the fold and drains its buffer, unwinding a
+      // spurious/raced detection without waiting on its timeout. Sending nothing
+      // here would leave a client that DID buffer stuck until that timeout fires.
       publishDifference(peerId, entries);
     },
 
