@@ -34,7 +34,7 @@
     "packages/client/src/nats-client-wrapped-settle-until.test.ts": 4,
     "packages/client/src/nats-client-wrapper-agent-liveness.test.ts": 19,
     "packages/client/src/nats-client-wrapper-hydration.test.ts": 32,
-    "packages/client/src/nats-client-wrapper-sendstate.test.ts": 58,
+    "packages/client/src/nats-client-wrapper-sendstate.test.ts": 64,
     "packages/client/src/nats-client-wrapper-turn-active.test.ts": 38,
     "packages/client/src/nats-client-wrapper.test.ts": 111,
     "packages/client/src/nats-p04-integration.test.ts": 2,

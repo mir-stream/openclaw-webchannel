@@ -2830,7 +2830,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     const w = makeWrapper();
     const spy = vi.spyOn(inner(w), "sendUserMessage");
     w.send("hello");
-    expect(spy).toHaveBeenCalledWith("hello", expect.any(String));
+    expect(spy).toHaveBeenCalledWith("hello", expect.any(String), expect.any(String));
     const m = messages(w)[0];
     expect(m.pending).toBeUndefined();
     expect(m.wireId).toBeTruthy();
@@ -2916,7 +2916,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     w.send("queued");
     expect(spy).not.toHaveBeenCalled();
     deliver(w, { type: "turn_settled", turnId: "T" });
-    expect(spy).toHaveBeenCalledWith("queued", expect.any(String));
+    expect(spy).toHaveBeenCalledWith("queued", expect.any(String), expect.any(String));
     expect(pendingBubbles(w)).toHaveLength(0);
   });
 
@@ -2953,7 +2953,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     const heldId = messages(w)[0].id;
 
     w.send(" /STOP "); // case/whitespace variant — trimmed before publish
-    expect(spy).toHaveBeenCalledWith("/STOP", expect.any(String));
+    expect(spy).toHaveBeenCalledWith("/STOP", expect.any(String), expect.any(String));
     const marker = messages(w).find((m) => m.id === heldId)!;
     expect(marker.retracted).toBe(true);
     expect(marker.pending).toBe(false);
@@ -2974,7 +2974,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       spy.mockClear();
 
       w.send(word);
-      expect(spy).toHaveBeenCalledWith(word, expect.any(String)); // bypassed → published
+      expect(spy).toHaveBeenCalledWith(word, expect.any(String), expect.any(String)); // bypassed → published
       // The held message is UNTOUCHED (not retracted, still pending).
       const stillHeld = messages(w).find((m) => m.text === "keep me")!;
       expect(stillHeld.pending).toBe(true);
@@ -2994,7 +2994,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     expect(heldTexts(w)).toEqual(["wait"]);
 
     deliver(w, { type: "turn_settled", turnId: "T" });
-    expect(spy).toHaveBeenCalledWith("wait", expect.any(String));
+    expect(spy).toHaveBeenCalledWith("wait", expect.any(String), expect.any(String));
     expect(held(w)).toHaveLength(0);
   });
 
@@ -3050,7 +3050,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     releaseRegister();
     await establishKey(w);
     expect(w.getState()).toMatchObject({ status: "connected", connected: true });
-    expect(spy).toHaveBeenCalledWith("M", expect.any(String));
+    expect(spy).toHaveBeenCalledWith("M", expect.any(String), expect.any(String));
     w.close();
   });
 
@@ -3449,7 +3449,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       prompt: "cmd",
       options: [{ decision: "allow-once", label: "Allow", style: "success" }],
     });
-    expect(spy).toHaveBeenCalledWith("queued", expect.any(String));
+    expect(spy).toHaveBeenCalledWith("queued", expect.any(String), expect.any(String));
     expect(pendingBubbles(w)).toHaveLength(0);
   });
 
@@ -3512,13 +3512,13 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     // core's built-in Telegram extension deletes an unfinalized preview at turn
     // end (`[core] extensions/telegram/src/bot-message-dispatch.ts:2971-2975`).
     w.send("/stop");
-    expect(spy).toHaveBeenCalledWith("/stop", expect.any(String));
+    expect(spy).toHaveBeenCalledWith("/stop", expect.any(String), expect.any(String));
     expect(messages(w).some((m) => m.id === "webchannel-d")).toBe(false);
 
     // The wedge is unlocked: a subsequent send publishes IMMEDIATELY (not held).
     spy.mockClear();
     w.send("next");
-    expect(spy).toHaveBeenCalledWith("next", expect.any(String));
+    expect(spy).toHaveBeenCalledWith("next", expect.any(String), expect.any(String));
     expect(pendingBubbles(w)).toHaveLength(0);
     expect(held(w)).toHaveLength(0);
   });
@@ -3553,7 +3553,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
 
     w.send("abort"); // NL abort → bypasses the hold, published, but NO finalize
-    expect(spy).toHaveBeenCalledWith("abort", expect.any(String));
+    expect(spy).toHaveBeenCalledWith("abort", expect.any(String), expect.any(String));
     expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(true);
   });
 
@@ -3568,22 +3568,25 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     expect(w.getState().isTyping).toBe(true);
 
     w.send("/stop");
-    expect(spy).toHaveBeenCalledWith("/stop", expect.any(String));
+    expect(spy).toHaveBeenCalledWith("/stop", expect.any(String), expect.any(String));
     expect(w.getState().isTyping).toBe(false); // typing indicator cleared
 
     // Composer unlocked: a subsequent send publishes immediately (not held).
     spy.mockClear();
     w.send("next");
-    expect(spy).toHaveBeenCalledWith("next", expect.any(String));
+    expect(spy).toHaveBeenCalledWith("next", expect.any(String), expect.any(String));
     expect(pendingBubbles(w)).toHaveLength(0);
     expect(held(w)).toHaveLength(0);
   });
 
-  // #243 half 1: `random_id` is minted inside the inner client's `sendUserMessage`,
-  // so EVERY send path (idle publish AND held release) puts one on the assembled
-  // wire frame. With no session key the inner drain is a no-op, so the frame stays
-  // on `outboundQueue` — the earliest place it exists (same technique as the #320
-  // cursor test). Read the FIELD off that frame, distinct from the wire `id`.
+  // #243 half 1: every send path (idle publish AND held release) puts a
+  // `random_id` on the assembled wire frame. As of half 2b the WRAPPER mints it
+  // (`mintRandomId`) and passes it as the third `sendUserMessage` argument so it
+  // owns the `random_id ↔ bubble` linkage; `sendUserMessage`'s own default only
+  // covers direct callers/tests. With no session key the inner drain is a no-op,
+  // so the frame stays on `outboundQueue` — the earliest place it exists (same
+  // technique as the #320 cursor test). Read the FIELD off that frame, distinct
+  // from the wire `id`.
   const outboundOf = (w: Wrapper) =>
     (inner(w) as unknown as { outboundQueue: Array<Record<string, unknown>> }).outboundQueue;
 

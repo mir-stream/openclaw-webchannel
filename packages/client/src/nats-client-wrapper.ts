@@ -32,6 +32,7 @@ import type {
 } from "./types.js";
 import {
   WebChannelNatsClient,
+  randomInboxToken,
   type WebChannelNatsClientOptions as DirectClientOptions,
   type InboundMessage,
 } from "./nats-client.js";
@@ -614,6 +615,24 @@ export class WebChannelNATSClient {
    */
   private readonly receipts = new Map<string, ReceiptRecord>();
   private readonly wireIdToReceiptKey = new Map<string, string>();
+  /**
+   * #243 half 2b: the idempotency `random_id → receiptKey` linkage for the
+   * bubbles this client sent. The wrapper mints the `random_id` (see
+   * `mintRandomId`) so it — not the low-level `sendUserMessage` — owns the
+   * `random_id ↔ bubble` correlation. On an `ack` carrying `committed`
+   * (`{random_id, messageId}[]`), `adoptCommittedIds` looks up the receiptKey
+   * here, finds the optimistic `u-<n>` bubble carrying that receiptKey, and
+   * re-keys its durable id to the SERVER `messageId` — so the client's `user`
+   * id becomes the id the delivery journal already holds, and a later
+   * history/full-replay tier-1 matches by id instead of by text (`case
+   * "history"` tier 2). Keyed by receiptKey (not the mutating bubble id) so it
+   * survives the very re-key it enables. An entry is consumed when its echo is
+   * adopted; a send that never draws a `committed` echo (control-lane text; the
+   * plugin's fast-path/overflow/cancelled ack gaps — a documented follow-up)
+   * leaves one bounded residue entry per send and its bubble stays `u-<n>`,
+   * where the tier-2/3 text fallback still reconciles it on reconnect.
+   */
+  private readonly randomIdToReceiptKey = new Map<string, string>();
   /** P0-4: forward rank for the receipt-level monotonic guard (incl. `completed`). */
   private static readonly RECEIPT_RANK: Record<"queued" | "sent" | "accepted" | "completed", number> = {
     queued: 0,
@@ -1259,10 +1278,11 @@ export class WebChannelNATSClient {
       wireId,
       { wireId, receiptKey, sendState: "queued" },
     );
+    const randomId = this.mintRandomId(receiptKey);
     this.stageReceiptStateThenCommit(
       receiptKey,
       { messages },
-      () => { this.client.sendUserMessage(trimmed, wireId); },
+      () => { this.client.sendUserMessage(trimmed, wireId, randomId); },
     );
     return this.makeReceipt(receiptKey);
   }
@@ -1523,6 +1543,7 @@ export class WebChannelNATSClient {
     const bubble = this.state.messages.find(
       (message) => message.receiptKey === entry.receiptKey,
     );
+    const randomId = this.mintRandomId(entry.receiptKey);
     if (bubble) {
       const messages = this.nextPublishedUserMessages(
         bubble.id,
@@ -1534,10 +1555,10 @@ export class WebChannelNATSClient {
       this.stageReceiptStateThenCommit(
         entry.receiptKey,
         { messages },
-        () => { this.client.sendUserMessage(entry.text, wireId); },
+        () => { this.client.sendUserMessage(entry.text, wireId, randomId); },
       );
     } else {
-      this.client.sendUserMessage(entry.text, wireId);
+      this.client.sendUserMessage(entry.text, wireId, randomId);
     }
   }
 
@@ -1654,6 +1675,7 @@ export class WebChannelNATSClient {
         const receipt = this.receipts.get(receiptKey);
         if (receipt) receipt.wireId = wireId;
         const bubble = this.state.messages.find((m) => m.id === localId);
+        const randomId = this.mintRandomId(receiptKey);
         // A re-entrant listener may have already removed the bubble; the text is
         // still published (correct — release is a commit), so just skip the patch.
         if (bubble) {
@@ -1667,14 +1689,14 @@ export class WebChannelNATSClient {
           this.stageReceiptStateThenCommit(
             receiptKey,
             { messages },
-            () => { this.client.sendUserMessage(text, wireId); },
+            () => { this.client.sendUserMessage(text, wireId, randomId); },
           );
         } else {
           // No bubble remains to stage. The authoritative `sent`/`accepted`
           // receipt callback still opens and exposes the turn only after the
           // low-level publish succeeds; `heldReleaseCommitDepth` keeps a listener
           // reached by that fanout from jumping this entry's FIFO position.
-          this.client.sendUserMessage(text, wireId);
+          this.client.sendUserMessage(text, wireId, randomId);
         }
       }
     } finally {
@@ -2797,6 +2819,22 @@ export class WebChannelNATSClient {
     return `r-${this.receiptSeq++}`;
   }
 
+  /**
+   * #243 half 2b: mint the `user_message` idempotency `random_id` for one send
+   * and remember `random_id → receiptKey` so a later `ack` echo can adopt the
+   * server id onto this exact bubble (`adoptCommittedIds`). Minting it HERE — not
+   * in the low-level `sendUserMessage` default — is what gives the wrapper the
+   * `random_id ↔ bubble` correlation. Called once per logical send; the token is
+   * stamped on the outbound frame the low-level ledgers, so every reconnect
+   * REPLAY re-publishes the same `random_id` (half 1's idempotency) without the
+   * wrapper re-minting.
+   */
+  private mintRandomId(receiptKey: string): string {
+    const randomId = randomInboxToken();
+    this.randomIdToReceiptKey.set(randomId, receiptKey);
+    return randomId;
+  }
+
   /** A thin observable view over the receiptKey-keyed record (no state duplication). */
   private makeReceipt(receiptKey: string): SendReceipt {
     return {
@@ -2995,6 +3033,71 @@ export class WebChannelNATSClient {
     const messages = this.state.messages.slice();
     messages[idx] = { ...(messages[idx] as ChatBubble), ...patch };
     this.setState({ messages, ...(extraState ?? {}) });
+  }
+
+  /**
+   * #243 half 2b: adopt the server-assigned durable ids echoed on an `ack`.
+   *
+   * `committed` is `{random_id, messageId}[]` (#243 half 2a): the plugin minted
+   * ONE durable `messageId` per inbound user message and echoes it against the
+   * client's idempotency `random_id`. For each entry we resolve `random_id →
+   * receiptKey` (the linkage `mintRandomId` recorded), find the optimistic
+   * `u-<n>` bubble carrying that receiptKey, and RE-KEY its durable id to the
+   * server `messageId`. After this the client's `user` id equals the id the
+   * delivery journal holds, so a later `history`/full-replay of the same
+   * conversation TIER-1 matches by id (`case "history"`) instead of adopting by
+   * text/position (tier 2/3) — live == history under one shared id, which is
+   * what #302 is blocked on.
+   *
+   * ⚠️ RE-KEYING A DURABLE ID ON THE CLIENT IS THE DANGEROUS ACT `mergeDurable`'s
+   * header warns about. This is safe for exactly the reasons `ChatBubble.id`'s
+   * docblock states and `case "history"`'s `adoptAt` relies on: the receipt
+   * record and its `wireId` alias are keyed by `receiptKey`/`wireId`, NOT by the
+   * bubble id, and the spread preserves `receiptKey` (this method even MATCHES on
+   * it) — so `patchBubbleByReceiptKey`, `promoteAnchor`, and the send-state path
+   * all keep working; and the durable projection re-derives the bubble under its
+   * new id every frame, so the overlay carries across `mergeDurable` by
+   * `(kind,id)`. We change ONLY `id`; `text`/`ts`/`sendState`/`pending` are the
+   * bubble's own and stay — the same fields `adoptAt` keeps (it discards only
+   * `assistantMessageIndex`, which a user bubble never carries).
+   *
+   * A `random_id` with no linkage (never sent from this client), or one whose
+   * bubble was retracted, is a silent no-op — and a send whose ack carries NO
+   * `committed` at all simply never reaches here, leaving its bubble at `u-<n>`
+   * for the tier-2/3 text fallback (deliberately kept; removing it is half 3).
+   */
+  private adoptCommittedIds(
+    committed: Array<{ random_id: string; messageId: string }> | undefined,
+  ): void {
+    if (!Array.isArray(committed) || committed.length === 0) return;
+    // receiptKey → server messageId, for the entries we can resolve this frame.
+    const adopt = new Map<string, string>();
+    for (const entry of committed) {
+      if (!entry || typeof entry !== "object") continue;
+      const { random_id: randomId, messageId } = entry;
+      if (typeof randomId !== "string" || randomId.length === 0) continue;
+      if (typeof messageId !== "string" || messageId.length === 0) continue;
+      const receiptKey = this.randomIdToReceiptKey.get(randomId);
+      // Consume the linkage: the echo is terminal for this `random_id` (its
+      // ledger entry drained on this same `ack`, so no replay reuses it).
+      this.randomIdToReceiptKey.delete(randomId);
+      if (receiptKey === undefined) continue;
+      adopt.set(receiptKey, messageId);
+    }
+    if (adopt.size === 0) return;
+
+    let changed = false;
+    const messages = this.state.messages.map((m): ChatMessage => {
+      // Only a sent USER echo adopts. `role === "user"` narrows to `ChatBubble`
+      // (the other union members have no `role`), and `receiptKey` links it to
+      // its send.
+      if (m.role !== "user" || m.receiptKey === undefined) return m;
+      const serverId = adopt.get(m.receiptKey);
+      if (serverId === undefined || serverId === m.id) return m;
+      changed = true;
+      return { ...m, id: serverId };
+    });
+    if (changed) this.setState({ messages });
   }
 
   /**
@@ -3657,9 +3760,17 @@ export class WebChannelNATSClient {
         // P0-4: acceptance is now driven authoritatively by the low-level
         // tracker — the same `ack` frame already advanced each matching wireId to
         // `accepted` via `onSendState` (which patched the bubble's sendState).
-        // Nothing to do at the reducer level; `handleMessage` runs the release
-        // gate (`maybeRelease`) AFTER this reducer returns, so the ack still
-        // participates in re-evaluating held-message release.
+        // `handleMessage` runs the release gate (`maybeRelease`) AFTER this
+        // reducer returns, so the ack still participates in re-evaluating
+        // held-message release.
+        //
+        // #243 half 2b: an `ack` MAY also carry `committed` — the server's
+        // durable id per `random_id`. Adopt each onto its optimistic bubble so
+        // client and server converge on one id (`adoptCommittedIds`). It runs
+        // after `onSendState` has already flipped the bubble to `accepted`; the
+        // re-key preserves that overlay. An ack without `committed` is a no-op
+        // here (the tier-2/3 history fallback reconciles that bubble).
+        this.adoptCommittedIds(msg.committed);
         return;
       }
 
