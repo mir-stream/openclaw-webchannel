@@ -47,16 +47,23 @@
  *
  * ⚠️ DERIVED FROM `MAX_INBOUND_USER_ID_LENGTH`, NOT REPEATED AS `128`, AND THAT
  * IS LOAD-BEARING SINCE #239 HALF 3. The exported constant's own docblock already
- * asks for this ("two doors, and they must not drift to two numbers"), but before
- * this slice the two doors never met. Now they are in series: an id that passes
- * `ingressDedupeKey` goes on to `journalEventForInboundUser`, which THROWS above
- * its own bound. If this number were ever raised alone, an id of length 129 would
- * be admitted here and then throw inside the accept seam's footer — reported as a
- * store failure with a misleading `code="<none>"`, the whole batch refused, the
- * client replaying the same id into the same refusal forever until `MAX_UNACKED`
- * evicts it as a `failed` bubble. A peer-controlled permanent wedge of its own
- * conversation, from a one-line edit. Deriving it makes THAT hole
- * unrepresentable.
+ * asks for this ("two doors, and they must not drift to two numbers").
+ *
+ * ⚠️ THIS `usableId` GATE IS NOW THE SOLE LENGTH BACKSTOP — #243 half 2a REMOVED
+ * THE SECOND ONE. Before this slice a surviving over-length id would still throw
+ * at the accept seam, inside `journalEventForInboundUser`. That mapper is no
+ * longer on the accept path: the seam mints the durable id SERVER-side
+ * (`delivery-journal.ts`'s `appendInboundUser`, `webchannel-user-<seq>`), which
+ * does not bound anything because the id is its own short mint. So the length of
+ * a CLIENT-supplied token is bounded ONLY here — `usableId` runs at key
+ * production (`ingressDedupeKey`) and again in the item loop on
+ * `item.message.random_id` before it reaches `appendInboundUser`, and both share
+ * this one bound. There is
+ * no accept-seam throw to catch a leak past it anymore. If this number were ever
+ * raised ALONE, an id of length 129 would be admitted here and indexed in the
+ * journal's `idempotency_key` column unbounded (the storage-amplification surface
+ * the paragraph above exists to hold shut), with no second door to stop it.
+ * Deriving it from the exported constant is what keeps THAT hole unrepresentable.
  *
  * ⚠️ IT DOES NOT MAKE THE CLASS UNREPRESENTABLE. Several more `128`s bound this
  * same `user_message.id` at later doors, each hardcoded INDEPENDENTLY and
@@ -82,20 +89,25 @@ export const MAX_CANCELLED_INBOUND_FALLBACK_BYTES = 256 * 1024;
 /**
  * The per-account dedupe key for an inbound item (persistent AND fallback).
  *
- * #243 half 1: the dedupe key SOURCE moves from the wire `id` to the client
- * idempotency `random_id`, but nothing else about identity moves — the durable id
- * is still the wire `id`, journaled and acked exactly as before. Two rules, in
- * order:
+ * #243 half 1: the dedupe key SOURCE moved from the wire `id` to the client
+ * idempotency `random_id`. #243 half 2a then moved the DURABLE id off the wire
+ * `id` too — the accept seam mints it server-side. So the wire `id`'s remaining
+ * jobs are (a) gating admission here and (b) the ack the client drains its ledger
+ * by; it is no longer what is journaled. Two rules, in order:
  *
- *  1. A valid, in-bounds wire `id` is STILL REQUIRED to produce a key. It is the
- *     durable id the accept seam journals (`journalEventForInboundUser`) and the
- *     ack layer replies with, both of which THROW/refuse on an absent, empty,
- *     non-string or over-length id. Gating on it here is what keeps the append
- *     loop's "cannot refuse what reaches it" invariant true: an item without a
- *     usable wire id gets NO key and takes the id-less admit-but-don't-journal
- *     path (the deliberate N8 gap #243 half 2 closes), exactly as before this
- *     slice. This is UNCHANGED behaviour, not a new gate — before half 1 the wire
- *     id WAS the key, so "no usable wire id" already meant "no key".
+ *  1. A valid, in-bounds wire `id` is STILL REQUIRED to produce a key. The ack
+ *     layer replies with it (the client's replay ledger is keyed by it), and it
+ *     is the FALLBACK idempotency key the accept seam journals under when the
+ *     client sent no `random_id` (`appendInboundUser`'s `randomId ?? turnId`).
+ *     Gating on it here is what keeps the append loop's "cannot refuse what
+ *     reaches it" invariant true: an item without a usable wire id gets NO key
+ *     and takes the id-less admit-but-don't-journal path (the deliberate N8 gap),
+ *     exactly as before this slice. This is UNCHANGED behaviour, not a new gate —
+ *     before half 1 the wire id WAS the key, so "no usable wire id" already meant
+ *     "no key". What CHANGED is only the reason the durable side is safe: the id
+ *     the seam writes is now a server mint, not this validated wire id, so the
+ *     length bound protecting the journal lives at `usableId` here (see the
+ *     constant's docblock), not at a mapper throw in the footer.
  *  2. Given a usable wire id, the key BODY is the client `random_id` when it is
  *     itself a usable id, else the wire `id` (older clients that send no
  *     `random_id`, or any non-user frame). So a conforming client dedupes on
@@ -615,19 +627,25 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               offer.commit();
               // KNOWN GAP, DELIBERATELY LEFT VISIBLE (#239 half 3). An item with
               // no dedupe key is still ADMITTED here: it runs a turn and the
-              // client shows its bubble. It is not journaled, because
-              // `journalEventForInboundUser` THROWS on an id that is absent,
-              // empty, non-string or over-length — a durable row would either be
-              // impossible to key or would collapse distinct messages onto one
-              // (its docblock has the reproduced failures). So this is live text
-              // history will not have: an N8 gap we are CHOOSING to leave, which
-              // is why it is a warn and not silence.
+              // client shows its bubble. It is not journaled because it never
+              // reaches the journal at all — with no key it takes THIS branch and
+              // never enters `journalPending`, so the footer's `appendInboundUser`
+              // is never called for it. The reason is now STRUCTURAL (no key ⇒ no
+              // append), not a mapper throw: #243 half 2a replaced the old
+              // `journalEventForInboundUser` accept-seam call — whose throw used
+              // to be what stopped an id-less item — with a server mint that runs
+              // only for keyed items. So this is live text history will not have:
+              // an N8 gap we are CHOOSING to leave, which is why it is a warn and
+              // not silence.
               //
-              // ⚠️ DO NOT "FIX" IT BY MINTING A SERVER-SIDE ID HERE. Server-
-              // assigned user ids reconciled against a client `random_id` are
-              // doc §16.2-1, issue **#243**; minting one at this seam would pin
-              // a shape that design has not chosen yet, under an id the client
-              // has never heard of.
+              // ⚠️ DO NOT "FIX" IT BY MINTING A SERVER ID FOR THIS ITEM. #243
+              // half 2a DOES mint server ids — but only for items with a dedupe
+              // key (`randomId ?? wireId`), which is what makes a mint idempotent
+              // across replays and reconcilable to the client. This item has
+              // NEITHER a usable wire id NOR a `random_id`, so a mint here could
+              // be echoed to nothing, could not dedupe a replay, and would be a
+              // phantom row under an id the client has never heard of. The gap is
+              // the honest outcome for an item with no stable identity.
               //
               // Only a NON-CONFORMING client reaches this: `nats-client.ts`
               // mints an id for every `user_message` it publishes, and the

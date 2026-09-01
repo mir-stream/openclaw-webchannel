@@ -285,6 +285,13 @@ export interface DeliveryJournal {
    * by for the deduped-retry echo. Pass `undefined` for an older client that sent
    * no usable `random_id`: it is still journaled (keyed by its wire id) and still
    * idempotent, but carries no `random_id` echo.
+   *
+   * ⚠️ PRECONDITION: `randomId` (and `turnId`) are CALLER-VALIDATED. Both are
+   * stored and `randomId ?? turnId` is INDEXED, but this method does not re-bound
+   * them — the caller (`ingress-dedupe.ts`) already gates them through `usableId`
+   * (non-empty, ≤ 128), which is what makes `randomId ?? turnId` equal
+   * `ingressDedupeKey`'s keyBody. See the method body's note (#270: bound what you
+   * index, at the door).
    */
   appendInboundUser(
     conversationId: string,
@@ -551,6 +558,16 @@ function openJournalConnection(
     // idempotent both ways. Cheap (one PRAGMA at open), and needed because #271's
     // version gate does not exist yet — this is the same "schema is malleable
     // before there is a deployed install" window the DDL comment above relies on.
+    //
+    // ⚠️ CONSCIOUS ASSUMPTION: user rows written BEFORE this slice carry
+    // `idempotency_key = NULL` (the ALTER back-fills nothing), so they are outside
+    // the partial index and the check-first below cannot see them. A post-migration
+    // REPLAY of such a message would miss the idempotency check and insert a SECOND
+    // row — the old row keyed on the wire id (as `message_id`), the new one on the
+    // server mint. That is tolerable ONLY inside this same window: there is no
+    // deployed install whose journal predates the slice, and #240's destructive
+    // cutover already discarded any pre-journal history, so no such old row exists
+    // to double. When #271's version gate lands, this assumption is what it retires.
     const journalColumns = db
       .prepare("PRAGMA table_info(journal_event)")
       .all() as Array<{ name: string }>;
@@ -850,11 +867,23 @@ export function openDeliveryJournal(options: {
     },
 
     appendInboundUser(conversationId, input) {
-      // The STABLE idempotency key mirrors ingress-dedupe.ts's `ingressDedupeKey`
-      // keyBody: the client `random_id` when it sent one, else its wire id (which
-      // the client reuses verbatim on every replay). It is what makes this method
-      // idempotent even though the durable id is now server-minted rather than the
-      // wire id the old `journal_user_once` net keyed on.
+      // The STABLE idempotency key is the client `random_id` when it sent one,
+      // else its wire id (which the client reuses verbatim on every replay). It is
+      // what makes this method idempotent even though the durable id is now
+      // server-minted rather than the wire id the old `journal_user_once` net
+      // keyed on.
+      //
+      // ⚠️ PRECONDITION — `randomId` IS CALLER-VALIDATED; THIS METHOD DOES NOT
+      // RE-BOUND IT. It is stored verbatim and INDEXED (`journal_user_idempotency_once`),
+      // so its length matters, but the bound lives at the caller by design (#270's
+      // "bound what you index, at the door"): `ingress-dedupe.ts` passes
+      // `usableId(item.message.random_id) ? item.message.random_id : undefined`,
+      // i.e. a non-empty string ≤ `MAX_INGRESS_DEDUPE_ID_LENGTH` (128) or
+      // `undefined`. That is exactly `ingressDedupeKey`'s keyBody rule, so
+      // `randomId ?? turnId` here EQUALS the dedupe key body — but only because
+      // the caller already gated it. A caller that skipped that gate would index
+      // an unbounded client token; the coupling is deliberate and must stay
+      // conscious. `turnId` (the wire id) is likewise the caller's gated value.
       const idempotencyKey = input.randomId ?? input.turnId;
       // The id is SERVER-MINTED, so this path does NOT run the client-supplied-id
       // validation `append` and `journalEventForInboundUser` apply — that guard
