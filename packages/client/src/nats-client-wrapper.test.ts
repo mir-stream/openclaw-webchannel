@@ -3578,6 +3578,44 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     expect(pendingBubbles(w)).toHaveLength(0);
     expect(held(w)).toHaveLength(0);
   });
+
+  // #243 half 1: `random_id` is minted inside the inner client's `sendUserMessage`,
+  // so EVERY send path (idle publish AND held release) puts one on the assembled
+  // wire frame. With no session key the inner drain is a no-op, so the frame stays
+  // on `outboundQueue` — the earliest place it exists (same technique as the #320
+  // cursor test). Read the FIELD off that frame, distinct from the wire `id`.
+  const outboundOf = (w: Wrapper) =>
+    (inner(w) as unknown as { outboundQueue: Array<Record<string, unknown>> }).outboundQueue;
+
+  it("#243: an idle publish stamps a random_id on the wire frame, distinct from the wire id", () => {
+    const w = makeWrapper();
+    w.send("hello");
+    const frame = outboundOf(w).find((m) => m.type === "user_message" && m.text === "hello");
+    expect(frame).toBeDefined();
+    expect(typeof frame!.random_id).toBe("string");
+    expect((frame!.random_id as string).length).toBeGreaterThan(0);
+    expect(frame!.random_id).not.toBe(frame!.id);
+  });
+
+  it("#243: a HELD message carries a random_id on the frame it publishes at release", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    deliver(w, { type: "typing" });
+    w.send("held-1");
+    w.send("held-2"); // latched behind held-1
+    expect(outboundOf(w).filter((m) => m.type === "user_message")).toHaveLength(0); // still held
+    deliver(w, { type: "agent_message", id: "webchannel-A", text: "the reply", turnId: "T" });
+
+    const frames = outboundOf(w).filter((m) => m.type === "user_message");
+    expect(frames.map((f) => f.text)).toEqual(["held-1", "held-2"]);
+    for (const f of frames) {
+      expect(typeof f.random_id).toBe("string");
+      expect((f.random_id as string).length).toBeGreaterThan(0);
+      expect(f.random_id).not.toBe(f.id);
+    }
+    // Two distinct held messages → two distinct idempotency keys.
+    expect(frames[0]!.random_id).not.toBe(frames[1]!.random_id);
+  });
 });
 
 // ---------------------------------------------------------------------------

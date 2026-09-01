@@ -7,7 +7,7 @@ import {
   type RetentionSessionToken,
 } from "./inbound-retention.js";
 
-export type UserMessageLike = { type: "user_message"; text: string; id?: string };
+export type UserMessageLike = { type: "user_message"; text: string; id?: string; random_id?: string };
 
 /**
  * #99: the wireIds of every message folded into one coalesced turn, in arrival
@@ -44,7 +44,10 @@ export const MAX_COALESCED_MEMBER_ID_LENGTH = 128;
  *
  * A non-string `id` is dropped rather than carried: retention already ignores
  * one (`offer`, below), so this only makes the frame consistent with how the
- * rest of the pipeline reads it.
+ * rest of the pipeline reads it. `random_id` (#243 half 1) is a KNOWN wire field
+ * and is preserved on the same non-string-drop rule, so it survives this strip
+ * and reaches `ingressDedupeKey`; dropping it here would silently defeat the
+ * random_id dedupe by always falling back to the wire `id`.
  *
  * WHAT THIS DOES NOT DO: it strips fields, it does not validate them. `text` is
  * copied through UNVALIDATED — a missing or non-string `text` reaches
@@ -58,6 +61,7 @@ export function normalizeInboundUserMessage(raw: UserMessageLike): UserMessageLi
     type: "user_message",
     text: raw.text,
     ...(typeof raw.id === "string" ? { id: raw.id } : {}),
+    ...(typeof raw.random_id === "string" ? { random_id: raw.random_id } : {}),
   };
 }
 
