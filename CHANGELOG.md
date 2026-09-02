@@ -72,8 +72,8 @@
 ### Fixed
 
 - **A turn whose answer count does not line up no longer loses an answer (#340,
-  extends #260).** When a turn ends with a final count that does not match the
-  count of answers that actually streamed — in either direction — the plugin
+  extends #260).** When a turn ends with two or more finals whose count does not
+  match the count of answers that actually streamed — in either direction — the plugin
   used to place the finals on the bubbles it did have, and the
   end-of-turn snapshot then restored those bubbles to their streamed text,
   deleting a message whose only copy was in the final it displaced. It now

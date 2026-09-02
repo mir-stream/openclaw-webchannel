@@ -909,7 +909,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(view.find((e) => e.kind === "text" && e.id === idC)).toMatchObject({ text: "C" });
   });
 
-  it("M340b: K==1 with a partial arriving AFTER the final was buffered — the final lands NON-authoritatively, so the snapshot keeps the streamed text (pins `exactCorrelation` in `authoritative`)", async () => {
+  it("M340b: K==1 with a partial arriving AFTER the final was buffered — the landing is NON-authoritative and the snapshot keeps the streamed text (pins `exactCorrelation` in `authoritative`; the outcome is the pre-existing K==1 hole, not a product claim)", async () => {
     // Before #340, M212g/M238d pinned the `exactCorrelation` conjunct of
     // `authoritative:` through the K>=2 shortfall branch. #340 deleted that
     // branch (a K>=2 shortfall now reaches no lane), so the conjunct's only live
@@ -922,6 +922,18 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     // non-authoritative and the snapshot carries the lane's streamed text, not a
     // final the precondition proved could not be attributed. Drop the conjunct
     // and the snapshot says "tail".
+    //
+    // ⚠️ WHAT THIS PINS AND WHAT IT DOES NOT. It pins the conjunct's CONTRACT: an
+    // unprovable landing is never marked authoritative. The OUTCOME — the snapshot
+    // republishes "late" over "tail", so the final's text survives in no lane, no
+    // independent bubble and no history row — is the pre-existing K==1 hole
+    // (this test passes identically against develop's adapter), tracked with
+    // `finalize`'s precondition and #262, and it is NOT the intended render. The
+    // ordering itself does not occur on the real seam: core emits the turn-end
+    // finals after the run's partials (`[core] dispatch-from-config.ts` builds
+    // `replies` once the run has ended), so a partial cannot follow its own
+    // message's final. Do not cite this test as "the snapshot should drop the
+    // final".
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary(); // first boundary: no-op
     h.draft.pushAnswerText({ text: "A" }); // msg1 streams + materializes

@@ -254,10 +254,11 @@ type AssistantDraftLane = {
    * or by `flushBufferedOrdinaryFinals` when order-correlation is exact
    * (`exactCorrelation` — every final has a streamed lane to pair with) and THIS
    * target's `streamedVisibleAnswerText` proves it streamed its own prefix. Left
-   * false on the K==1 branch when the correlation is not exact — the Case-X
-   * textless current lane, or a current lane that streamed AFTER its final was
-   * buffered (`streamed.length > 1`, pinned by M340b); on a K>=2 count shortfall
-   * no lane receives a final at all (#340), so every lane keeps it false. Note
+   * false on the K==1 branch for the Case-X textless current lane (by the second
+   * conjunct — that shape is usually exact) and for a current lane that streamed
+   * AFTER its final was buffered (by `exactCorrelation`: two streamed lanes, so
+   * `streamed.length > 1`; pinned by M340b); on a K>=2 count shortfall no lane
+   * receives a final at all (#340), so every lane keeps it false. Note
    * the predicate is CARDINALITY-based, so a compensating desync (a deduped final
    * plus an unstreamed message) can still pass it — a pre-#238 hole, not closed
    * here (#262). The snapshot uses `answerText` when this is true (preserving the
@@ -746,9 +747,9 @@ export function createProgressDraftController(params: {
   const bufferedOrdinaryFinals: string[] = [];
   // #212: wire ids of independent bubbles the plugin KNOWS carry answer content
   // already represented by a lane in the `turn_snapshot`. Since #238 there is
-  // exactly ONE producer — the failed-lane recovery block (the
-  // `supersedesAnswerLane: true` call in `finalize`'s immediate path), whose lane is
-  // in `answers` by its streamed text. (The overflow-final producer is gone: its
+  // exactly ONE producer — the failed-lane recovery block in
+  // `deliverAuthorizedBlock`, the only `sendIndependent(…, { supersedesAnswerLane })`
+  // call — whose lane is in `answers` by its streamed text. (The overflow-final producer is gone: its
   // flag's value was `streamed.length === finals.length`, unreachable at an
   // overflow under the new candidate list.) The snapshot names these in `remove`
   // so the client drops exactly them and preserves every other agent bubble
@@ -944,7 +945,7 @@ export function createProgressDraftController(params: {
     // 2 materialized, 3 finals made the flag true WITH an overflow, which is the
     // `remove: [tcId]` base's M212a asserted. And NOT because an overflow bubble's
     // content never streamed — measured false, it often has (see the flush's
-    // overflow branch).
+    // no-target branch, which on a shortfall takes every final).
     options?: { supersedesAnswerLane?: boolean },
   ): boolean => {
     if (!text) {
@@ -1822,9 +1823,9 @@ export function createProgressDraftController(params: {
   // measured false and is the premise that would justify deleting the bubble.
   // EVERY bubble this function produces (leading error, stray extra, notice,
   // overflow final) is preserved by the client. `sendIndependent` keeps the option
-  // for its one remaining user, the failed-lane recovery block (the
-  // `supersedesAnswerLane: true` call in `finalize`'s immediate path), whose
-  // duplicate IS provable.
+  // for its one remaining user, the failed-lane recovery block in
+  // `deliverAuthorizedBlock` (the only `sendIndependent(…, { supersedesAnswerLane })`
+  // call), whose duplicate IS provable.
   const deliverTerminalIndependent = (text: string): boolean => {
     // ONE STORY, in the order it happens:
     //
@@ -1866,10 +1867,10 @@ export function createProgressDraftController(params: {
     // `finalize`'s immediate collapse / current-lane-has-text / lone-message path,
     // or from `flushBufferedOrdinaryFinals` when order-correlation is exact
     // (`exactCorrelation`) and THIS target's `streamedVisibleAnswerText` is true.
-    // Otherwise — the K==1 branch with the correlation not exact: the Case-X
-    // textless current lane, or a current lane that streamed after its final was
-    // buffered (M340b) — the snapshot falls back to the corruption-immune
-    // `streamedAnswerText`. (A K>=2 shortfall no longer reaches this function at
+    // Otherwise — on the K==1 branch: the Case-X textless current lane (second
+    // conjunct false), or a current lane that streamed after its final was
+    // buffered (`exactCorrelation` false, M340b) — the snapshot falls back to the
+    // corruption-immune `streamedAnswerText`. (A K>=2 shortfall no longer reaches this function at
     // all: #340 gives it no targets.)
     options?: { authoritative?: boolean },
   ): boolean => {
