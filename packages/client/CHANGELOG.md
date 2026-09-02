@@ -20,8 +20,9 @@
   (#245), the `reasoning`/`tool`/`approval` `history` rows (#242), and
   `ack.committed[]` (#243). The transport is core NATS pub/sub — at-most-once,
   no retention — so a browser with no `seq` cannot detect a dropped frame and
-  never asks for the heal: one drop and its transcript is permanently, invisibly
-  wrong. It also drops role-less `history` rows, which stalls "load older"
+  never asks for the heal. Its transcript is then invisibly wrong for the rest of
+  the session, repaired only incidentally by the history snapshot it receives at
+  its next reconnect. It also drops role-less `history` rows, which stalls "load older"
   forever once the agent has `capabilities.reasoningDurable` on (**#309**, closed
   by this).
 

@@ -37,10 +37,14 @@
  *    user id the server minted plus its seq (#243). A v3 peer stays on the wire,
  *    looks healthy, and is wrong in two ways it cannot itself detect:
  *      · No `seq` ⇒ no gap detection ⇒ it never sends `get_difference`. This
- *        transport is core NATS pub/sub, AT-MOST-ONCE with no retention, so one
- *        dropped frame is a PERMANENT divergence — nothing later heals it. #244
- *        exists because the heal has to exist; a peer that cannot ask for it is
- *        not "degraded", it is silently holding a wrong transcript.
+ *        transport is core NATS pub/sub, AT-MOST-ONCE with no retention, so a
+ *        dropped frame leaves a hole the peer CANNOT SEE and therefore never asks
+ *        to heal. Not permanent — `sendHistorySnapshot` fires on EVERY successful
+ *        register (`nats-register.ts`) and a released client fresh-inserts the
+ *        rows it lacks — but that repair is INCIDENTAL: it needs a reconnect the
+ *        user has no reason to perform, so the transcript stays silently wrong
+ *        for the rest of the session, with no signal on either side. #244 exists
+ *        so the hole ITSELF triggers the heal instead of luck doing it.
  *      · It DROPS `history` rows that carry no `role` — the `case "history"`
  *        guard every released build has, which is the very thing that made that
  *        widening safe — so its transcript holds no reasoning id to cite as a

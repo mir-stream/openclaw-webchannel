@@ -9,7 +9,7 @@
   browser bundle must be redeployed at the same time. A v3 browser against a v4
   agent is refused with a terminal `protocol_mismatch` (426) before any key work;
   a v4 browser against a v3 agent is refused the same way. The version has been
-  mandatory in both directions since `0.3.0` (protocol v2), so there is no
+  mandatory in both directions since protocol v2, so there is no
   partial-upgrade mode and no silent degradation — the failure is loud and
   diagnosable by design.
 
@@ -23,12 +23,19 @@
   - **has no `seq`, so it never asks for a gap-sync (#244).** Durable frames now
     carry a per-conversation `seq`; a client that sees a hole sends
     `get_difference` and folds the `difference` reply. This transport is core
-    NATS pub/sub — at-most-once, no retention — so for a peer that cannot detect
-    the hole, one dropped frame is a **permanent, never-healed divergence**. It
-    does not look broken afterwards. It looks like a slightly different
-    conversation, forever.
+    NATS pub/sub — at-most-once, no retention — so a dropped frame leaves a v3
+    peer with a hole it **cannot detect and therefore never asks to heal**. The
+    damage is not permanent: the register-time history snapshot fires on every
+    successful register, and a released client fresh-inserts the rows it lacks,
+    so a reconnect repairs it. But that repair is **incidental** — it takes a
+    reconnect the user has no reason to perform — so until then the transcript is
+    silently wrong, with no signal on either side. #244 exists so the hole itself
+    triggers the heal instead of luck doing it.
   - **ignores `user_committed` (#245),** so a message sent from one device does
-    not appear on the account's other devices until the agent next responds.
+    not appear on the account's other devices until each of them next
+    **reconnects** and pulls a fresh history snapshot. (Not "until the agent next
+    responds": agent frames carry no `user` row, and without `seq` there is no
+    gap-sync to fetch one.)
   - **drops `history` rows of kind `reasoning` / `tool` / `approval` (#242),** on
     the same `role` guard that made that widening safe. Its transcript therefore
     holds no reasoning id to cite as a paging cursor, and **"load older" stalls

@@ -294,7 +294,8 @@ becomes `failed { reason: "overloaded", retryable: true }`; retry is a deliberat
 caller/user action and creates a new id. Before either ACK or rejection arrives,
 the client reliability layer replays the same id live with capped exponential
 backoff, as well as immediately on reconnect. Client and plugin must be upgraded
-together — the wire protocol is now **v3**.
+together — the wire protocol is now **v4** (v3 in `0.4.0`, the register hop
+described below; v4 in #246 — see the CHANGELOG).
 
 ### BREAKING: protocol v3 register hop
 
@@ -315,8 +316,8 @@ See [`../../docs/AUTH.md`](../../docs/AUTH.md) for the reasoning.
 The boolean `delivered` is gone. Migration: `delivered === true` ↔
 `sendState === "accepted" || sendState === "completed"`; render a failure from
 `sendState === "failed"` + `sendFailure`. `openclaw-webchannel-client` and
-`openclaw-webchannel` ship in lockstep — upgrade both together (the
-protocol v3 registration is mandatory in both directions).
+`openclaw-webchannel` ship in lockstep — upgrade both together (the register
+protocol version is mandatory in both directions, and is **v4** today).
 
 See [`../../docs/STATUS.md`](../../docs/STATUS.md) for current deployment status
 and [`../../docs/TRUST_AND_ONBOARDING.md`](../../docs/TRUST_AND_ONBOARDING.md) for

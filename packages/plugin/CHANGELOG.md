@@ -21,8 +21,11 @@
   (#245), the `reasoning`/`tool`/`approval` `history` rows (#242), and
   `ack.committed[]` (#243). The `seq` case is the one that forces the bump:
   transport here is core NATS pub/sub, at-most-once with no retention, so a peer
-  that cannot detect a hole cannot heal one — a single drop is a permanent
-  divergence with no signal on either side.
+  that cannot detect a hole never asks to heal one. It is not permanent —
+  `sendHistorySnapshot` fires on every successful register and a released client
+  fresh-inserts the rows it lacks — but the repair is incidental rather than
+  triggered, so the peer renders a silently wrong transcript until its next
+  reconnect, with no signal on either side.
 
   **#309 is closed by this.** An older client drops role-less `history` rows, so
   its cursor can never cite a reasoning id and "load older" stalls permanently

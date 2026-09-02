@@ -375,11 +375,19 @@ export type OutboundWsMessage =
        * frames here PLUS that echo; together they are gapless. Without the echo
        * carrying it, the first agent frame of every turn would look like a gap.
        *
-       * ADDITIVE AND OPTIONAL: older clients ignore it, and a frame whose journal
-       * append was refused or failed — or a non-durable frame (a live reasoning
-       * DRAFT, an id-less `agent_message`) — ships WITHOUT it (the client
-       * tolerates the absence). Half A only EXPOSES the field — nothing consumes
-       * it yet.
+       * OPTIONAL ON THE WIRE, AND STILL SO: a frame whose journal append was
+       * refused or failed — or a non-durable frame (a live reasoning DRAFT, an
+       * id-less `agent_message`) — ships WITHOUT it, and the client tolerates the
+       * absence.
+       *
+       * ⚠️ TWO CLAIMS THAT USED TO SIT HERE ARE BOTH DEAD. "Half A only EXPOSES
+       * the field — nothing consumes it yet" ended with #244 half B: the client
+       * tracks `lastAppliedSeq` off this field and fires `getDifference` on a gap
+       * (`nats-client-wrapper.ts`). And "older clients ignore it" is no longer a
+       * back-compat guarantee worth stating — #246 took the wire to v4 under an
+       * exact-match register gate, so a client that ignores `seq` cannot connect.
+       * Optionality is now about which FRAMES carry it, not about which PEERS
+       * read it.
        */
       seq?: number;
     }
@@ -524,8 +532,12 @@ export type OutboundWsMessage =
        * `seq` and the client can tell a contiguous stream from a gap against this
        * number. Populated only on the register-time SNAPSHOT (`history-serve.ts`'s
        * `sendSnapshot`); a `load_history` PAGE serves OLDER rows and carries no
-       * high-water. ADDITIVE AND OPTIONAL — older clients ignore it, and half A
-       * only exposes it (no client consumes it yet).
+       * high-water — which is why it stays optional on the wire. It is NOT
+       * optional for the peer: since #244 half B the client seeds its cursor from
+       * this field (`nats-client-wrapper.ts`'s `case "history"`), and since #246's
+       * v4 exact-match gate a client that ignores it cannot connect. The old
+       * "additive and optional — older clients ignore it, and half A only exposes
+       * it" reading is dead on both halves.
        */
       highWaterSeq?: number;
     }
@@ -536,10 +548,13 @@ export type OutboundWsMessage =
       /**
        * #243 half 2a (doc §16.2-1): the durable user messageId the SERVER minted
        * for each fresh admission, and the SAME id re-echoed for a deduped retry,
-       * keyed by the client `random_id`. Additive and optional — an older client
-       * that only reads `ids` is unaffected, and the CURRENT client IGNORES it
-       * (adoption is half 2b; `drainAcked` still keys on `ids`). It rides `ack`
-       * because that frame already reports per-id acceptance; see `IngressResultFrame`.
+       * keyed by the client `random_id`. ⚠️ "The CURRENT client IGNORES it
+       * (adoption is half 2b)" WAS TRUE AND NO LONGER IS — half 2b landed, and the
+       * client adopts its optimistic bubble onto `messageId` off this array
+       * (`nats-client-wrapper.ts`). Nor is "an older client that only reads `ids`
+       * is unaffected" a live guarantee: #246's v4 exact-match gate refuses such a
+       * peer. It rides `ack` because that frame already reports per-id acceptance;
+       * see `IngressResultFrame`.
        *
        * #244 half A: each entry now also carries the user message's per-conversation
        * `seq`. The inbound user turn-opener consumes a seq (`appendInboundUser`,
@@ -547,7 +562,10 @@ export type OutboundWsMessage =
        * without this the client would see the turn's first agent frame at seq N
        * while holding last-applied N-2 — a phantom gap on every turn (doc §16.2-6).
        * This ack echo is the user seq's only carrier. A deduped retry echoes the
-       * SAME first-admission seq. Still ignored by the current client in half A.
+       * SAME first-admission seq. ⚠️ "Still ignored by the current client in half
+       * A" IS STALE: half B consumes it — `advanceCursor(entry.seq)` per entry in
+       * the wrapper's `ack` arm. (`adoptCommittedIds` alone still ignores `seq`;
+       * that is one call site, not the frame.)
        */
       committed?: Array<{ random_id: string; messageId: string; seq: number }>;
     }
