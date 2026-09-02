@@ -146,7 +146,7 @@ export const ALLOWED_RAW_INTERPOLATIONS: readonly AllowedRawInterpolation[] = [
     file: "nats-channel.ts",
     site:
       "[nats-channel] Publish failed AFTER the durable commit for peer (seq=); " +
-      "the row is stored and the client heals it via gap-sync:",
+      "the row is stored and delivery is now gap-sync's:",
     expression: "seq",
     // #347: the per-conversation seq `journalOutbound` allocated. A number the
     // journal minted, never peer data, and the operator's only handle on WHICH
