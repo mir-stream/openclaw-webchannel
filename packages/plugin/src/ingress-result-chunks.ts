@@ -10,8 +10,13 @@ export const MAX_INGRESS_RESULT_ID_LENGTH = 128;
  * frame — the frame that already tells the client "this inbound id was accepted"
  * is the natural place to also say "and here is the durable id we minted for it".
  * The client IGNORES it in 2a (adoption is half 2b); see `nats-client.ts`.
+ *
+ * #244 half A: `seq` carries the user message's per-conversation sequence. The
+ * user turn-opener consumes a seq (`appendInboundUser`) but rides no durable wire
+ * frame, so this echo is the only way the client learns it — without it the first
+ * agent frame of every turn reads as a phantom gap (doc §16.2-6).
  */
-export type CommittedUserMessage = { random_id: string; messageId: string };
+export type CommittedUserMessage = { random_id: string; messageId: string; seq: number };
 
 export type IngressResultFrame =
   | { type: "ack"; ids: string[]; committed?: CommittedUserMessage[] }

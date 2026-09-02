@@ -131,11 +131,15 @@ class FakeJournal implements DeliveryJournal {
   appendInboundUser(): { seq: number; inserted: boolean; messageId: string } {
     throw new Error("appendInboundUser is not exercised by the egress seam");
   }
-  lookupUserMessageIdByRandomId(): string | undefined {
+  lookupUserMessageIdByRandomId(): { messageId: string; seq: number } | undefined {
     return undefined;
   }
   read(): DeliveryJournalRow[] {
     return [];
+  }
+  // #244 half A: the high-water is the last seq this fake allocated.
+  maxSeq(): number {
+    return this.seq;
   }
   close(): void {
     /* no-op */
@@ -733,6 +737,254 @@ describe("#239 — egress seam against a real journal", () => {
     expect(rows.map((row) => row.seq)).toEqual([1, 2, 3, 4]);
     // A different peer is a different conversation in the same file.
     expect(journal.read("peer-other")).toEqual([]);
+  });
+});
+
+/**
+ * #244 half A — the per-conversation `seq` on the DURABLE outbound wire frames.
+ *
+ * The journal already allocated a contiguous per-conversation `seq` at egress
+ * (#239); half A stops discarding it. `sendToPeer` stamps the `seq` `append`
+ * returned onto EVERY durable frame — all SEVEN types
+ * `journalEventForOutbound` maps: `agent_message`, `progress`, `turn_snapshot`,
+ * `reasoning` (the journaled `final` frame, `reasoningDurable` on only),
+ * `tool_activity`, `approval_request`, `approval_resolved` — so a future client
+ * (half B) can track a last-applied seq and detect gaps (doc §16.2-6, Telegram
+ * pts/qts).
+ *
+ * ⚠️ ALL SEVEN, NOT A SUBSET, BECAUSE CONTIGUITY IS THE PROPERTY. Each durable
+ * frame consumes a per-conversation seq; if only some rode the wire the client's
+ * stream would have holes where the others consumed one unseen, and half B would
+ * read those as phantom gaps and fire a spurious `getDifference`. The contiguity
+ * test below is the one that would have caught the three-frames-only version.
+ *
+ * ⚠️ THE ASSERTIONS READ `transport.frames`, the whole parsed frame — the `seq`
+ * lives INSIDE the payload, which `Call`'s publish variant deliberately does not
+ * carry (see `RecordingTransport`).
+ */
+describe("#244 half A — seq on the durable wire frames", () => {
+  const tempRoots: string[] = [];
+  const openJournals: DeliveryJournal[] = [];
+
+  afterEach(() => {
+    while (openJournals.length > 0) openJournals.pop()?.close();
+    while (tempRoots.length > 0) {
+      rmSync(tempRoots.pop() as string, { recursive: true, force: true });
+    }
+  });
+
+  it("stamps the append-allocated seq on agent_message/progress/turn_snapshot, monotone within the conversation", () => {
+    const { channel, transport } = makeChannel();
+
+    expect(channel.sendProgress(PEER, "a-1", "Working…", "turn-1")).toBe(true);
+    expect(channel.sendText(PEER, "first", "a-1", "turn-1")).toBe(true);
+    expect(channel.sendText(PEER, "second", "a-2", "turn-1")).toBe(true);
+    expect(
+      channel.sendTurnSnapshot(PEER, "turn-1", [{ id: "a-1", text: "first" }], []),
+    ).toBe(true);
+
+    // The FakeJournal allocates 1,2,3,4 in append order; each durable frame
+    // carries its own row's seq, contiguous and ascending.
+    expect(transport.frames.map((f) => [f.type, f.seq])).toEqual([
+      ["progress", 1],
+      ["agent_message", 2],
+      ["agent_message", 3],
+      ["turn_snapshot", 4],
+    ]);
+  });
+
+  it("stamps seq on the four newly-covered durable frames — reasoning(final)/tool_activity/approval_request/approval_resolved", () => {
+    // #242 made reasoning (opt-in), tool activity and approvals DURABLE, so each
+    // occupies a per-conversation seq and must carry it on the wire.
+    const { channel, transport } = makeChannel({ reasoningDurable: true });
+
+    expect(channel.sendReasoning(PEER, "r-1", "turn-1", "final thought", true)).toBe(true);
+    expect(
+      channel.sendToolActivity(PEER, { id: "t-1", turnId: "turn-1", name: "grep" }),
+    ).toBe(true);
+    expect(
+      channel.sendApprovalRequest(PEER, {
+        id: "ap-1",
+        kind: "exec",
+        title: "Run",
+        prompt: "run: ls",
+        options: [{ decision: "allow-once", label: "Allow", style: "primary" }],
+      }),
+    ).toBe(true);
+    expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once")).toBe(true);
+
+    expect(transport.frames.map((f) => [f.type, f.seq])).toEqual([
+      ["reasoning", 1],
+      ["tool_activity", 2],
+      ["approval_request", 3],
+      ["approval_resolved", 4],
+    ]);
+  });
+
+  it("reasoning carries a seq only when reasoningDurable is ON", () => {
+    // OFF (default): even the burst-CLOSING `final` frame is not journaled, so it
+    // consumes no seq and carries none.
+    const off = makeChannel();
+    expect(off.channel.sendReasoning(PEER, "r-1", "turn-1", "closed", true)).toBe(true);
+    expect(off.transport.frames).toHaveLength(1);
+    expect(off.transport.frames[0].seq).toBeUndefined();
+
+    // ON: the `final` frame is journaled and carries its seq. (A live DRAFT — no
+    // `final` — is still never journaled; see the ephemeral test.)
+    const on = makeChannel({ reasoningDurable: true });
+    expect(on.channel.sendReasoning(PEER, "r-1", "turn-1", "closed", true)).toBe(true);
+    expect(on.transport.frames).toHaveLength(1);
+    expect(on.transport.frames[0].seq).toBe(1);
+  });
+
+  it("stamps NO seq on ephemeral frames — typing, turn_settled, ack, history, commands, and a live reasoning DRAFT", () => {
+    // `reasoningDurable` ON so the only reason the reasoning draft below carries
+    // no seq is that it is a DRAFT (no `final`), not the account policy.
+    const { channel, transport } = makeChannel({ reasoningDurable: true });
+
+    expect(channel.sendTyping(PEER)).toBe(true);
+    expect(channel.sendReasoning(PEER, "r-1", "turn-1", "thinking…")).toBe(true);
+    expect(channel.sendTurnSettled(PEER, "turn-1", "ok")).toBe(true);
+    expect(channel.sendAck(PEER, ["u-1"])).toBe(true);
+    expect(
+      channel.sendHistory(PEER, [{ id: "h-1", role: "agent", text: "old" }]),
+    ).toBe(true);
+    expect(channel.sendCommands(PEER, [])).toBe(true);
+
+    // None of these is journaled, so not one published frame carries a `seq`.
+    for (const frame of transport.frames) {
+      expect(frame.seq).toBeUndefined();
+    }
+  });
+
+  it("ships a durable frame WITHOUT a seq when the journal append fails — §15.8 send result unchanged", () => {
+    const { channel, transport, journal } = makeChannel();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    journal.throwOnAppend = true;
+
+    // A caught journal failure must not change the send result, and it leaves the
+    // frame with no seq to stamp — the client tolerates the absence.
+    expect(channel.sendText(PEER, "hello", "a-1", "turn-1")).toBe(true);
+
+    expect(transport.frames).toHaveLength(1);
+    expect(transport.frames[0].type).toBe("agent_message");
+    expect(transport.frames[0].seq).toBeUndefined();
+    warn.mockRestore();
+  });
+
+  it("an id-less durable frame ships without a seq (never journaled)", () => {
+    const { channel, transport } = makeChannel();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // No usable id ⇒ `isIdlessDurableFrame` short-circuits before `append`, so
+    // there is no seq — the frame still reaches the wire.
+    expect(channel.sendText(PEER, "unattributed")).toBe(true);
+
+    expect(transport.frames).toHaveLength(1);
+    expect(transport.frames[0].seq).toBeUndefined();
+    error.mockRestore();
+  });
+
+  it("through the REAL store, each durable frame's wire seq equals its journal row's seq", () => {
+    const root = mkdtempSync(join(tmpdir(), "webchannel-egress-seq-"));
+    tempRoots.push(root);
+    const journal = openDeliveryJournal({
+      databasePath: join(root, "tuple", "delivery-journal.sqlite"),
+    });
+    openJournals.push(journal);
+    const transport = new RecordingTransport([]);
+    const channel = new NatsChannel(
+      transport as unknown as NatsTransport,
+      ACCOUNT,
+      TENANT,
+      undefined,
+      undefined,
+      { deliveryJournal: journal },
+    );
+
+    channel.sendProgress(PEER, "a-1", "Working…", "turn-1");
+    channel.sendText(PEER, "first answer", "a-1", "turn-1");
+    channel.sendText(PEER, "second answer", "a-2", "turn-1");
+    channel.sendTurnSnapshot(
+      PEER,
+      "turn-1",
+      [{ id: "a-1", text: "first answer" }, { id: "a-2", text: "second answer" }],
+      [],
+    );
+
+    const rowSeqs = journal.read(PEER).map((row) => row.seq);
+    const wireSeqs = transport.frames.map((f) => f.seq);
+    // The wire seq the client sees IS the durable row's seq — same value, same
+    // order — so the client's cursor and the store agree by construction.
+    expect(wireSeqs).toEqual(rowSeqs);
+    expect(wireSeqs).toEqual([1, 2, 3, 4]);
+  });
+
+  it("CONTIGUITY — client-observable seqs (ack echo + durable wire frames) form a gapless 1..N run", () => {
+    // ⚠️ RECONCILED FROM CLIENT-OBSERVABLE DATA ONLY, WHICH IS THE WHOLE POINT.
+    // The user opener consumes seq 1 but rides NO durable frame — its seq reaches
+    // the client only on the `ack.committed` echo (FIX 1). reasoning + tool each
+    // consume a seq too. This assertion reads the ack seq off the published FRAME
+    // and the durable seqs off the wire; it reads neither the journal nor the
+    // `appendInboundUser` return. So it goes RED if the user seq is dropped from
+    // the ack (FIX 1 reverted) OR any durable frame stops carrying its seq — the
+    // earlier `[user.seq, ...]` form passed on a value the client never sees and
+    // masked exactly that hole.
+    const root = mkdtempSync(join(tmpdir(), "webchannel-egress-contig-"));
+    tempRoots.push(root);
+    const journal = openDeliveryJournal({
+      databasePath: join(root, "tuple", "delivery-journal.sqlite"),
+    });
+    openJournals.push(journal);
+    const transport = new RecordingTransport([]);
+    const channel = new NatsChannel(
+      transport as unknown as NatsTransport,
+      ACCOUNT,
+      TENANT,
+      undefined,
+      undefined,
+      { deliveryJournal: journal, reasoningDurable: true },
+    );
+
+    // Accept seam: the user opener is journaled (seq 1) and the runtime echoes
+    // that seq on the ack — mirror BOTH steps exactly as `ingress-dedupe.ts` does
+    // (it reads the seq off `appendInboundUser`'s return and puts it in
+    // `committed`). The seq is passed IN here; the assertion reads it back OUT of
+    // the published frame, never from this return value.
+    const user = journal.appendInboundUser(PEER, {
+      text: "why?",
+      turnId: "w-1",
+      randomId: "rnd-1",
+    });
+    channel.sendAck(PEER, ["w-1"], [
+      { random_id: "rnd-1", messageId: user.messageId, seq: user.seq },
+    ]);
+
+    // Every egress frame of the turn is durable and rides the wire with its seq.
+    channel.sendReasoning(PEER, "r-1", "turn-1", "let me look", true);
+    channel.sendToolActivity(PEER, { id: "t-1", turnId: "turn-1", name: "grep" });
+    channel.sendText(PEER, "here is the answer", "a-1", "turn-1");
+    channel.sendTurnSnapshot(
+      PEER,
+      "turn-1",
+      [{ id: "a-1", text: "here is the answer" }],
+      [],
+    );
+
+    // Reconcile from CLIENT-OBSERVABLE data only: seqs on the ack echo PLUS seqs
+    // on the durable wire frames.
+    const ackFrame = transport.frames.find((f) => f.type === "ack");
+    const ackSeqs = ((ackFrame?.committed ?? []) as Array<{ seq: number }>).map(
+      (c) => c.seq,
+    );
+    const wireSeqs = transport.frames
+      .filter((f) => f.type !== "ack")
+      .map((f) => f.seq as number | undefined);
+    const observed = [...ackSeqs, ...wireSeqs].sort((a, b) => Number(a) - Number(b));
+
+    // A gapless 1..N run with no undefined holes: everything the client receives
+    // accounts for every seq the conversation allocated, so half B sees no gap.
+    expect(observed).toEqual([1, 2, 3, 4, 5]);
   });
 });
 

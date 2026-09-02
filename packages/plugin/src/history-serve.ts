@@ -456,7 +456,11 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
     kind: ServeKind,
     peerId: string,
     messages: HistoryMessage[],
-    options: { sendEmpty: boolean },
+    // #244 half A: `highWaterSeq` is the conversation's MAX(seq) baseline. The
+    // SNAPSHOT path passes it; the PAGE path leaves it `undefined` (a page serves
+    // older rows and carries no high-water). Both the wire frame and the byte
+    // measurement below include it so the budget accounts for the extra field.
+    options: { sendEmpty: boolean; highWaterSeq?: number },
   ): void => {
     const limit = channel.effectiveOutboundLimit();
     const fitted = fitHistoryFrame(messages, {
@@ -466,7 +470,12 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
       // `fitHistoryFrame` treats that as "do not budget" rather than falling
       // back to a plaintext estimate, because the send is about to be refused
       // fail-closed for the same missing key.
-      measure: (rows) => channel.outboundWireSize(peerId, { type: "history", messages: rows }),
+      measure: (rows) =>
+        channel.outboundWireSize(peerId, {
+          type: "history",
+          messages: rows,
+          ...(options.highWaterSeq !== undefined ? { highWaterSeq: options.highWaterSeq } : {}),
+        }),
     });
 
     if (fitted.skipped.length > 0) {
@@ -518,7 +527,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
     // fact lives today.
     if (fitted.rows.length === 0 && !options.sendEmpty) return;
 
-    if (!channel.sendHistory(peerId, fitted.rows)) {
+    if (!channel.sendHistory(peerId, fitted.rows, options.highWaterSeq)) {
       const suppressed = admit(kind, "publish-failed");
       if (suppressed !== undefined) {
         try {
@@ -626,6 +635,13 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
 
   return {
     sendSnapshot(peerId: string): void {
+      // #244 half A: the conversation's high-water `seq` at snapshot time,
+      // captured in `produce` (inside the read guard) and stamped onto the
+      // `history` frame in `emit`. `maxSeq` is a single MAX(seq) index read, NOT
+      // a fold — so it does NOT reintroduce the §15.4 materialized read model the
+      // header warns against (that ban is about AVOIDING the replay; this stands
+      // alongside the fold `serveHistoryRequest` still performs).
+      let highWaterSeq: number | undefined;
       runDeferred(
         "snapshot",
         snapshotsInFlight,
@@ -643,6 +659,10 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
             limit: config.limit,
           });
           reportProjectionHealth("snapshot", peerId, served);
+          // Read the high-water inside the guard: a throw here is a read failure
+          // like any other and must suppress the frame, not ship a snapshot with
+          // a wrong baseline.
+          highWaterSeq = journal.maxSeq(peerId);
           return served.messages;
         },
         (messages) => {
@@ -651,7 +671,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
           // above has already spoken if the emptiness was manufactured by rows
           // this build could not read.
           if (messages.length > 0) {
-            publishFitted("snapshot", peerId, messages, { sendEmpty: false });
+            publishFitted("snapshot", peerId, messages, { sendEmpty: false, highWaterSeq });
           }
         },
       );

@@ -303,7 +303,7 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
   sendAck?: (
     peerId: string,
     ids: string[],
-    committed?: Array<{ random_id: string; messageId: string }>,
+    committed?: Array<{ random_id: string; messageId: string; seq: number }>,
   ) => boolean;
   sendInboundRejected?: (peerId: string, ids: string[]) => boolean;
   outcomeStore?: IngressOutcomeStore;
@@ -530,7 +530,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
        * the first `ack` frame (see the footer). Empty for older clients that sent
        * no usable `random_id` — those are still acked, just not echoed.
        */
-      const committedBatch: Array<{ random_id: string; messageId: string }> = [];
+      const committedBatch: Array<{ random_id: string; messageId: string; seq: number }> = [];
       /**
        * The chosen results, held until the footer. **NOTHING may be `add`ed to
        * either chunk writer inside the item loop.**
@@ -769,13 +769,21 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               // still acked: an older client with no `random_id`, or the #275
               // window skew where the outcome marker outlived the row's presence
               // in this store — neither of which the client consumes in 2a anyway.
+              //
+              // #244 half A: the lookup now returns the first admission's `seq`
+              // alongside its `messageId`, and the retry echoes BOTH unchanged —
+              // never a fresh seq, exactly as it never mints a fresh id.
               if (randomId !== undefined && deps.deliveryJournal) {
-                const messageId = deps.deliveryJournal.lookupUserMessageIdByRandomId(
+                const committed = deps.deliveryJournal.lookupUserMessageIdByRandomId(
                   peerId,
                   randomId,
                 );
-                if (messageId !== undefined) {
-                  committedBatch.push({ random_id: randomId, messageId });
+                if (committed !== undefined) {
+                  committedBatch.push({
+                    random_id: randomId,
+                    messageId: committed.messageId,
+                    seq: committed.seq,
+                  });
                 }
               }
             } else rejectedIds.push(id);
@@ -980,7 +988,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               // Synchronous and in arrival order, because `seq` order is the
               // stream's order and the stream's order IS the identity model
               // (doc §16.5.3). No batching, no deferral.
-              const { messageId } = deps.deliveryJournal.appendInboundUser(peerId, {
+              const { messageId, seq } = deps.deliveryJournal.appendInboundUser(peerId, {
                 text: pending.text,
                 turnId: pending.wireId,
                 ...(pending.randomId !== undefined ? { randomId: pending.randomId } : {}),
@@ -988,8 +996,12 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               // The echo is keyed by `random_id`, so it exists only for a
               // conforming client. An older client is still journaled (under a
               // server id) and acked; it simply carries no `committed` entry.
+              //
+              // #244 half A: the echo carries the user message's `seq` too — this
+              // is its ONLY wire carrier (the user opener rides no durable frame),
+              // and without it the turn's first agent frame reads as a phantom gap.
               if (pending.randomId !== undefined) {
-                committedBatch.push({ random_id: pending.randomId, messageId });
+                committedBatch.push({ random_id: pending.randomId, messageId, seq });
               }
             }
           } catch (error) {

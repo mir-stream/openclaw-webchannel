@@ -91,14 +91,15 @@ function thread(prefix: string): JournalEvent[] {
  */
 function recordingChannel(): {
   channel: HistoryChannelSurface;
-  sent: Array<{ peerId: string; messages: HistoryMessage[] }>;
+  sent: Array<{ peerId: string; messages: HistoryMessage[]; highWaterSeq?: number }>;
 } {
-  const sent: Array<{ peerId: string; messages: HistoryMessage[] }> = [];
+  const sent: Array<{ peerId: string; messages: HistoryMessage[]; highWaterSeq?: number }> = [];
   return {
     sent,
     channel: {
-      sendHistory(peerId: string, messages: HistoryMessage[]) {
-        sent.push({ peerId, messages });
+      // #244 half A: capture the high-water baseline the snapshot path stamps.
+      sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number) {
+        sent.push({ peerId, messages, highWaterSeq });
         return true;
       },
       outboundWireSize: (_peerId, payload) =>
@@ -191,6 +192,41 @@ describe("createHistoryServer — peer scoping (the assertion the old test could
     server.servePage(OTHER_PEER, { before: "b3" });
     scheduler.flush();
     expect(sent[1].messages.map((m) => m.id)).toEqual(["b1", "b2"]);
+  });
+});
+
+describe("createHistoryServer — #244 half A snapshot high-water", () => {
+  it("stamps the SNAPSHOT with highWaterSeq = the conversation's MAX(seq)", () => {
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    // A durable egress frame after the thread advances the seq further, so the
+    // high-water is NOT just the count of served rows — it is the journal max.
+    journal.append(PEER, { kind: "bubble", answerId: "a9", text: "later", turnId: "turn-a" });
+
+    const { server, sent, scheduler } = harness(journal);
+    server.sendSnapshot(PEER);
+    scheduler.flush();
+
+    expect(sent).toHaveLength(1);
+    // Four rows written ⇒ MAX(seq) is 4, and that is the authoritative baseline
+    // the client resumes gap detection from — independent of how many rows the
+    // windowed snapshot actually carried.
+    expect(journal.maxSeq(PEER)).toBe(4);
+    expect(sent[0].highWaterSeq).toBe(4);
+  });
+
+  it("carries NO highWaterSeq on a load_history PAGE (older rows, not the baseline)", () => {
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+
+    const { server, sent, scheduler } = harness(journal);
+    // A tail page still carries no high-water — only the register-time snapshot
+    // is the authoritative baseline.
+    server.servePage(PEER, {});
+    scheduler.flush();
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0].highWaterSeq).toBeUndefined();
   });
 });
 

@@ -75,7 +75,7 @@ type Item = {
  */
 type Call =
   | { call: "append"; conversationId: string; event: JournalEvent }
-  | { call: "ack"; ids: string[]; committed?: Array<{ random_id: string; messageId: string }> }
+  | { call: "ack"; ids: string[]; committed?: Array<{ random_id: string; messageId: string; seq: number }> }
   | { call: "rejected"; ids: string[] }
   | { call: "offer-commit"; text: string | undefined }
   | { call: "offer-rollback"; text: string | undefined }
@@ -146,11 +146,16 @@ class FakeJournal implements DeliveryJournal {
   lookupUserMessageIdByRandomId(
     conversationId: string,
     randomId: string,
-  ): string | undefined {
-    return this.byKey.get(`${conversationId}:${randomId}`)?.messageId;
+  ): { messageId: string; seq: number } | undefined {
+    const row = this.byKey.get(`${conversationId}:${randomId}`);
+    return row === undefined ? undefined : { messageId: row.messageId, seq: row.seq };
   }
   read(): DeliveryJournalRow[] {
     return [];
+  }
+  // #244 half A: the high-water is the last seq this fake allocated.
+  maxSeq(): number {
+    return this.appended;
   }
   close(): void {
     /* no-op */
@@ -199,11 +204,14 @@ class FlakyJournal implements DeliveryJournal {
   lookupUserMessageIdByRandomId(
     conversationId: string,
     randomId: string,
-  ): string | undefined {
+  ): { messageId: string; seq: number } | undefined {
     return this.inner.lookupUserMessageIdByRandomId(conversationId, randomId);
   }
   read(conversationId: string): DeliveryJournalRow[] {
     return this.inner.read(conversationId);
+  }
+  maxSeq(conversationId: string): number {
+    return this.inner.maxSeq(conversationId);
   }
   close(): void {
     this.inner.close();
@@ -892,7 +900,9 @@ describe("#243 half 2a — the server assigns the durable user id and echoes it"
       expect(ackOf(calls)).toEqual({
         call: "ack",
         ids: ["u-1"],
-        committed: [{ random_id: "r-1", messageId: "webchannel-user-1" }],
+        // #244 half A: the echo also carries the user message's seq (its only
+        // wire carrier — the user opener rides no durable frame).
+        committed: [{ random_id: "r-1", messageId: "webchannel-user-1", seq: 1 }],
       });
     } finally {
       journal.close();
@@ -906,7 +916,7 @@ describe("#243 half 2a — the server assigns the durable user id and echoes it"
       const first = makeSeam({ journal });
       await first.onFlush([item("hello", "u-1", "r-1")]);
       expect(ackOf(first.calls).committed).toEqual([
-        { random_id: "r-1", messageId: "webchannel-user-1" },
+        { random_id: "r-1", messageId: "webchannel-user-1", seq: 1 },
       ]);
       expect(journal.read(PEER).map((row) => row.seq)).toEqual([1]);
 
@@ -923,7 +933,8 @@ describe("#243 half 2a — the server assigns the durable user id and echoes it"
       expect(ackOf(second.calls)).toEqual({
         call: "ack",
         ids: ["u-1"],
-        committed: [{ random_id: "r-1", messageId: "webchannel-user-1" }],
+        // The retry re-echoes the SAME first-admission seq, never a fresh one.
+        committed: [{ random_id: "r-1", messageId: "webchannel-user-1", seq: 1 }],
       });
       // Still exactly one row — the SAME id, no duplicate.
       expect(journal.read(PEER).map((row) => row.event)).toEqual([
@@ -961,8 +972,8 @@ describe("#243 half 2a — the server assigns the durable user id and echoes it"
       // The ack re-echoes BOTH, `r-1` under its already-minted id.
       expect(ackOf(round2.calls).committed).toEqual(
         expect.arrayContaining([
-          { random_id: "r-1", messageId: "webchannel-user-1" },
-          { random_id: "r-2", messageId: "webchannel-user-2" },
+          { random_id: "r-1", messageId: "webchannel-user-1", seq: 1 },
+          { random_id: "r-2", messageId: "webchannel-user-2", seq: 2 },
         ]),
       );
     } finally {

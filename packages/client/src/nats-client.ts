@@ -193,8 +193,12 @@ export type InboundMessage = {
    * the server id) is half 2b; the field is declared now only so the wire
    * TYPECHECKS. Re-declared loosely, like every other field here (zero-dep
    * package; runtime discrimination).
+   *
+   * #244 half A: each entry also carries the user message's per-conversation
+   * `seq` (its only wire carrier — the user opener rides no durable frame). Still
+   * IGNORED in half A; declared optional here so the loose wire shape typechecks.
    */
-  committed?: Array<{ random_id: string; messageId: string }>;
+  committed?: Array<{ random_id: string; messageId: string; seq?: number }>;
   reason?: "overloaded";
   text?: string;
   turnId?: string;
@@ -324,6 +328,18 @@ export type InboundMessage = {
   resolved?: Array<{ id: string; decision: string }>;
   before?: string;
   limit?: number;
+  /**
+   * #244 half A (doc §16.2-6): the per-conversation `seq` on a DURABLE frame
+   * (`agent_message`/`progress`/`turn_snapshot`), and `highWaterSeq` the
+   * conversation's authoritative baseline on the register-time `history`
+   * snapshot. DELIBERATELY IGNORED in half A — nothing here tracks a last-applied
+   * seq or detects gaps; that is half B. Declared now only so the wire
+   * TYPECHECKS. Re-declared loosely, like every other field here (zero-dep
+   * package; runtime discrimination).
+   */
+  seq?: number;
+  /** #244 half A — see `seq`. */
+  highWaterSeq?: number;
   /** P0-3: the slash-command catalog on a `commands` frame. */
   commands?: CommandCatalogEntry[];
 };
