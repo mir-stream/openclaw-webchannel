@@ -154,7 +154,9 @@ function successfulIds(frames: DraftAttempt[]): string[] {
 // placement/bubble/seal mapping itself. `sendProgress` publishes a `progress`
 // frame and `finalizeDraft` an `agent_message` one (`nats-channel.ts`'s
 // `finalizeDraft → sendText`); the drain's `turn_snapshot` is appended last
-// because `terminalDrain` emits it after every final.
+// because `terminalDrain` emits it after every final. VALID ONLY WHILE EVERY SEND
+// SUCCEEDED: the seam journals BEFORE it publishes (`nats-channel.ts`), so with a
+// `decide` that refuses a frame this helper under-counts the journal.
 function journalFor(h: ReturnType<typeof makeDraftHarness>): JournalEvent[] {
   const wire: OutboundWsMessage[] = [
     ...h.frames.map((frame): OutboundWsMessage =>
@@ -905,6 +907,47 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(view.some((e) => e.kind === "text" && e.text === "tB")).toBe(true);
     expect(view.find((e) => e.kind === "text" && e.id === idA)).toMatchObject({ text: "A" });
     expect(view.find((e) => e.kind === "text" && e.id === idC)).toMatchObject({ text: "C" });
+  });
+
+  it("M340b: K==1 with a partial arriving AFTER the final was buffered — the final lands NON-authoritatively, so the snapshot keeps the streamed text (pins `exactCorrelation` in `authoritative`)", async () => {
+    // Before #340, M212g/M238d pinned the `exactCorrelation` conjunct of
+    // `authoritative:` through the K>=2 shortfall branch. #340 deleted that
+    // branch (a K>=2 shortfall now reaches no lane), so the conjunct's only live
+    // case is this one: K==1, the current lane was TEXTLESS when the final was
+    // buffered (the buffering precondition), then streamed a partial before the
+    // drain. `pushAnswerText` gates only on `state.stopped || lane.settled`, so
+    // the shape is reachable. The flush routes the buffered final onto the current
+    // lane (`[currentLane()]`), but `exactCorrelation` reads
+    // `streamed.length === 1` and there are TWO streamed lanes, so the landing is
+    // non-authoritative and the snapshot carries the lane's streamed text, not a
+    // final the precondition proved could not be attributed. Drop the conjunct
+    // and the snapshot says "tail".
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary(); // first boundary: no-op
+    h.draft.pushAnswerText({ text: "A" }); // msg1 streams + materializes
+    await h.draft.flush();
+    h.draft.handleAssistantMessageBoundary(); // → msg2's lane, textless so far
+    await h.draft.finalize("tail"); // buffered: current lane textless, text-bearing lanes exist
+    h.draft.pushAnswerText({ text: "late" }); // msg2 streams AFTER its final was buffered
+    await h.draft.flush();
+    await h.draft.drain();
+
+    const idA = h.frames.find((frame) => frame.text === "A")!.id;
+    const idB = h.frames.find((frame) => frame.text === "late")!.id;
+    const laneLabel = (id: string) => (id === idA ? "A" : id === idB ? "B" : "X");
+    expect(h.frames.map((f) => `${f.type}:${laneLabel(f.id)}=${f.text}`)).toEqual([
+      "progress:A=A",
+      "final:A=A",
+      "progress:B=late",
+      "final:B=late",
+      "final:B=tail",
+    ]);
+    expect(h.snapshots).toHaveLength(1);
+    expect(h.snapshots[0].answers).toEqual([
+      { id: idA, text: "A" },
+      { id: idB, text: "late" },
+    ]);
+    expect(h.snapshots[0].remove).toEqual([]);
   });
 
   // #172 — a block carries no content the partials did not already stream (core

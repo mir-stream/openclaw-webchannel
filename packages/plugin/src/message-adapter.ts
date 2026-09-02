@@ -254,8 +254,10 @@ type AssistantDraftLane = {
    * or by `flushBufferedOrdinaryFinals` when order-correlation is exact
    * (`exactCorrelation` — every final has a streamed lane to pair with) and THIS
    * target's `streamedVisibleAnswerText` proves it streamed its own prefix. Left
-   * false for the K==1 Case-X textless current lane; on a K>=2 count shortfall no
-   * lane receives a final at all (#340), so every lane keeps it false. Note
+   * false on the K==1 branch when the correlation is not exact — the Case-X
+   * textless current lane, or a current lane that streamed AFTER its final was
+   * buffered (`streamed.length > 1`, pinned by M340b); on a K>=2 count shortfall
+   * no lane receives a final at all (#340), so every lane keeps it false. Note
    * the predicate is CARDINALITY-based, so a compensating desync (a deduped final
    * plus an unstreamed message) can still pass it — a pre-#238 hole, not closed
    * here (#262). The snapshot uses `answerText` when this is true (preserving the
@@ -744,7 +746,8 @@ export function createProgressDraftController(params: {
   const bufferedOrdinaryFinals: string[] = [];
   // #212: wire ids of independent bubbles the plugin KNOWS carry answer content
   // already represented by a lane in the `turn_snapshot`. Since #238 there is
-  // exactly ONE producer — the failed-lane recovery block (:2424), whose lane is
+  // exactly ONE producer — the failed-lane recovery block (the
+  // `supersedesAnswerLane: true` call in `finalize`'s immediate path), whose lane is
   // in `answers` by its streamed text. (The overflow-final producer is gone: its
   // flag's value was `streamed.length === finals.length`, unreachable at an
   // overflow under the new candidate list.) The snapshot names these in `remove`
@@ -1774,7 +1777,9 @@ export function createProgressDraftController(params: {
     if (typeof transport.sendTurnSnapshot !== "function") return;
     // The SAME set `flushBufferedOrdinaryFinals` walks with its cursor WHEN the
     // correlation is exact — by construction, not coincidence (#238). When it is
-    // not, that flush walks nothing and this set is untouched by it (#340).
+    // not: on K>=2 the flush walks nothing (#340); on K==1 it may still route the
+    // buffered final onto the current lane NON-authoritatively, and this map then
+    // carries that lane's STREAMED text (M340b).
     const answers = streamedAnswerLanes()
       .map((lane) => ({
         id: lane.id ?? nextMessageId(),
@@ -1817,7 +1822,8 @@ export function createProgressDraftController(params: {
   // measured false and is the premise that would justify deleting the bubble.
   // EVERY bubble this function produces (leading error, stray extra, notice,
   // overflow final) is preserved by the client. `sendIndependent` keeps the option
-  // for its one remaining user, the failed-lane recovery block (:2423), whose
+  // for its one remaining user, the failed-lane recovery block (the
+  // `supersedesAnswerLane: true` call in `finalize`'s immediate path), whose
   // duplicate IS provable.
   const deliverTerminalIndependent = (text: string): boolean => {
     // ONE STORY, in the order it happens:
@@ -1860,9 +1866,11 @@ export function createProgressDraftController(params: {
     // `finalize`'s immediate collapse / current-lane-has-text / lone-message path,
     // or from `flushBufferedOrdinaryFinals` when order-correlation is exact
     // (`exactCorrelation`) and THIS target's `streamedVisibleAnswerText` is true.
-    // Otherwise — the K==1 Case-X textless current lane — the snapshot falls back
-    // to the corruption-immune `streamedAnswerText`. (A K>=2 shortfall no longer
-    // reaches this function at all: #340 gives it no targets.)
+    // Otherwise — the K==1 branch with the correlation not exact: the Case-X
+    // textless current lane, or a current lane that streamed after its final was
+    // buffered (M340b) — the snapshot falls back to the corruption-immune
+    // `streamedAnswerText`. (A K>=2 shortfall no longer reaches this function at
+    // all: #340 gives it no targets.)
     options?: { authoritative?: boolean },
   ): boolean => {
     target.answerText = text;
@@ -1939,8 +1947,9 @@ export function createProgressDraftController(params: {
   //
   // A final with no target becomes its own independent bubble: never a degrade,
   // never a skip (plan §0.2 N10). On a shortfall that is EVERY final, so a lane
-  // that also streamed can show its text twice — the deliberate trade, because a
-  // duplicate is recoverable and a deletion is not (M212g).
+  // that also streamed shows its text twice whenever its final equals its
+  // streamed text — the normal case — the deliberate trade, because a duplicate
+  // is recoverable and a deletion is not (M212g).
   const flushBufferedOrdinaryFinals = (): void => {
     if (bufferedOrdinaryFinals.length === 0) return;
     const finals = bufferedOrdinaryFinals.splice(0);
@@ -1991,16 +2000,19 @@ export function createProgressDraftController(params: {
       // reads `streamed.length === 1`, and the pair is not vacuous there — a
       // partial arriving on the current lane after its final was buffered makes
       // `streamedVisibleAnswerText` true, and with another text lane in the turn
-      // this half is the only one still false.
+      // this half is the only one still false. That shape is PINNED by M340b:
+      // drop this conjunct and its snapshot carries the buffered final as
+      // AUTHORITATIVE text on a lane the buffering precondition proved could not
+      // be attributed. (Before #340, M212g and M238d pinned this conjunct through
+      // the K>=2 shortfall branch; #340 deleted that branch, so the pin moved.)
       //
-      // MEASURED on this branch: dropping either conjunct alone leaves
-      // `message-adapter.test.ts` green. That is not a coverage gap, it is
-      // structural — `answerTextIsAuthoritative` has exactly ONE reader
+      // The second conjunct is NOT pinned, and that is structural rather than a
+      // coverage gap: `answerTextIsAuthoritative` has exactly ONE reader
       // (`emitTurnSnapshot`) and that reader iterates `streamedAnswerLanes()`,
-      // filtering on the very predicate the second conjunct tests, so a lane that
-      // would be wrongly marked is never read. DO NOT take that as licence to
-      // delete either: the coupling is incidental, and what is being stated here is
-      // the flag's contract.
+      // filtering on the very predicate this conjunct tests, so a lane that would
+      // be wrongly marked is never read. DO NOT take that as licence to delete it:
+      // the coupling is incidental, and what is being stated here is the flag's
+      // contract.
       emitAuthoritativeFinalOnLane(target, text, {
         authoritative: exactCorrelation && target.streamedVisibleAnswerText,
       });

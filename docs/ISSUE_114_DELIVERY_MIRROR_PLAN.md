@@ -940,7 +940,7 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 
 **우리 쪽 위험은 core가 아니라 2번이 깨지는 지점에 있다.** 순서-대응은 **우리 레인 시퀀스가 final 시퀀스와 보조를 맞출 때만** 성립한다. 레인 하나를 목록에서 떨어뜨리면 그 순간 어긋난다 — `flushBufferedOrdinaryFinals`가 후보를 `materializedAnswerLanes()`(전송 성공한 레인만)로 좁히던 것이 정확히 그 결함이었다(#238이 exact 경로에서 제거). 스트리밍은 했지만 전송이 실패한 레인이 빠지면서 인덱스가 밀리고, 그게 M173e의 오염이자 M212a가 유일본 텍스트를 삭제하는 원인이었다. **고칠 것은 core에서 못 받는 정보가 아니라 우리가 스스로 버린 순서다.**
 
-**개수가 어긋나면 어떤 목록도 답이 아니다 (#340).** 개수 불일치 상태의 착지는 전부 non-authoritative라서 `emitTurnSnapshot`이 그 레인을 `streamedAnswerText`로 다시 발행하고, 착지한 final을 지운다 — 좁은 목록(`materializedAnswerLanes()`)도 같은 레인들의 부분집합일 뿐이라 똑같이 지운다. 그래서 **K≥2 shortfall에서는 아무 레인에도 라우팅하지 않는다**(`targets = []`). 짝을 못 찾은 final은 전부 새 버블 — 아래 마지막 불릿이 말하는 그 degrade가 이제 코드의 실제 동작이다. 중복은 복구 가능하고 삭제는 아니다.
+**개수가 어긋나면 어떤 목록도 답이 아니다 (#340).** 개수 불일치 상태의 착지는 전부 non-authoritative라서 `emitTurnSnapshot`이 그 레인을 `streamedAnswerText`로 다시 발행하고, 착지한 final을 지운다 — 좁은 목록(`materializedAnswerLanes()`)도 같은 레인들의 부분집합일 뿐이라 똑같이 지운다. 그래서 **K≥2 shortfall에서는 아무 레인에도 라우팅하지 않는다**(`targets = []`). 짝을 못 찾은 final은 전부 새 버블 — 아래 마지막 불릿의 "남는 final은 새 말풍선"은 이제 그 특수 사례다(shortfall에서는 남는 것만이 아니라 전부가 새 말풍선이다). 중복은 복구 가능하고 삭제는 아니다.
 
 **정직하게 남겨두는 미확인/잔여 위험 (추측으로 메우지 말 것):**
 - core는 채널에 넘기기 **전에** 일부 항목을 건너뛴다 — reasoning/commentary 미옵트인, `suppressDelivery`, 그리고 **동일 payload dedupe**(`sentFinalPayloadDedupeKeys`, `[core] dispatch-from-config.ts:3937-3941`). **순서는 보존되지만 개수는 줄 수 있다.** 특히 두 메시지의 텍스트가 완전히 같으면 뒤엣것이 dedupe로 사라진다.
