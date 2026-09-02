@@ -765,13 +765,15 @@ export interface WebChannelPeerChannel {
    * `updateEntry`; this docblock does not restate it.
    *
    * ⚠️ THE ROW WRITTEN HERE HAS NO LIVE FRAME BEHIND IT, and that is correct
-   * rather than a gap. An unexpired card was re-armed live by the register-time
-   * `approval_snapshot` (which replays the pending store, not the journal), so
-   * this write is history catching up with live; an EXPIRED card is withheld
-   * from the snapshot, so its catch-up row is history GAINING a card live never
-   * showed — the disclosed N8-gaining shape. Either way the seq it consumes
-   * rides no frame, so a peer sees a hole and heals it with `get_difference`
-   * (#244 half B) — the mechanism that exists for exactly this.
+   * rather than a gap. Whether live showed the card depends on whether a peer
+   * REGISTERED while it was pending (the register-time `approval_snapshot`
+   * re-arms it from the pending store — and does NOT mark the row journaled), not
+   * on expiry: a card a peer saw that way and that was then resolved from
+   * elsewhere has live behind it, and this write is history catching up; a card
+   * no peer registered for before it was resolved or expired gets a row live
+   * never showed — the disclosed N8-gaining shape. Either way the seq it
+   * consumes rides no frame, so a peer sees a hole and heals it with
+   * `get_difference` (#244 half B) — the mechanism that exists for exactly this.
    */
   sendApprovalResolved(
     peerId: string,

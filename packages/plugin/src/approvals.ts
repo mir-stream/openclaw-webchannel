@@ -368,9 +368,9 @@ export function listPendingApprovalsForPeer(
       // applies: routine expiry no longer deletes anything here.
       // ⚠️ This delete does not consult `requestJournaled`: a record still OWING
       // its row whose finalize is more than a grace period late is deleted too,
-      // and that finalize then journals a lone verdict — the pair rule's
-      // exception, on its third path (cap, backstop, and this late-finalize
-      // shape). Narrower than deleting at expiry, not closed.
+      // and that finalize then journals a lone verdict — the backstop's
+      // late-finalize shape, one of the TWO deletion paths (cap, backstop) the
+      // pair rule's exception names. Narrower than deleting at expiry, not closed.
       console.warn(
         `[webchannel] pending-approval ${logSafe(entry.payload.id)} (account ${logSafe(entry.accountKey)}, ` +
           `peer ${logSafe(entry.sessionKey)}) pruned after ${PENDING_APPROVAL_MAX_AGE_MS}ms with no ` +
@@ -1066,7 +1066,8 @@ export function createClawApprovalNativeRuntimeSpec(
         //   THE ONE EXCEPTION: when the pending record is already gone, this leg
         //   cannot tell whether the row was written and has no payload to write
         //   one, so it journals the verdict ALONE. That is deliberate — it is the
-        //   `pending !== undefined` term of `requestRowOwed` below — and it is why the consumer-side
+        //   `pending !== undefined` term of `requestRowOwed` below — and it is why
+        //   the consumer-side
         //   no-op in `durable-view-reducer.ts`'s `applyApprovalResolution` is a
         //   live fallback rather than dead code.
         //
@@ -1089,14 +1090,15 @@ export function createClawApprovalNativeRuntimeSpec(
         // peers on one account (core's fan-out plan dedupes per `sessionKey`, and
         // `finalizeWrappedEntries` iterates the entries), and the store keeps one
         // record per (account, approvalId) — so a record whose `sessionKey` is
-        // not this entry's is treated as OWING the row, which gives the second
-        // peer's conversation its own REQUEST row. Only that much: the verdict
-        // row goes to the first peer to finalize (`sendApprovalResolved`'s
-        // first-write-wins gate drops a second peer's — pre-existing), and a peer
-        // that already had its row from delivery gets a benign duplicate (an
-        // upsert by id; one seq no frame carries). Multi-target delivery is not
-        // configured today (no `resolveApproverDmTargets`), so this is the shape
-        // the guard is ready for, not one it fully handles.
+        // not this entry's is treated as OWING the row. That is the guard's
+        // READINESS for multi-target delivery, not a handled case: today the
+        // SECOND peer to finalize gets NEITHER row — `updateEntry` deletes the
+        // record first (so its `pending` is undefined) and `sendApprovalResolved`'s
+        // first-write-wins gate returns before the catch-up (pre-existing). The
+        // FIRST peer to finalize may get a benign duplicate request row if it
+        // already had one from delivery (an upsert by id; one seq no frame
+        // carries). Multi-target delivery is not configured today (no
+        // `resolveApproverDmTargets`); revisit both when it is.
         const requestRowOwed =
           pending !== undefined &&
           (pending.sessionKey !== entry.sessionKey || !pending.requestJournaled);
