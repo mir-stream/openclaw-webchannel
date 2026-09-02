@@ -20,15 +20,13 @@
   (#245), the `reasoning`/`tool`/`approval` `history` rows (#242), and
   `ack.committed[]` (#243). The transport is core NATS pub/sub — at-most-once,
   no retention — so a browser with no `seq` cannot detect a dropped frame and
-  never asks for the heal. Its transcript is then invisibly wrong, and what
-  repairs it is incidental and bounded: the history snapshot any device's register
-  puts on the shared `.out` carries only the newest `history.limit` projected rows
-  (50 by default). A hole inside that window closes; an older one cannot, since
-  `loadHistory({ before })` pages strictly older than a cursor and never *into* a
-  hole — it outlives every reconnect for the life of the tab's state, and only a
-  reload repairs it. It also drops role-less `history` rows, which stalls "load older"
-  forever once the agent has `capabilities.reasoningDurable` on (**#309**, closed
-  by this).
+  never asks for the heal. Its transcript is then invisibly wrong. The one thing
+  that reaches it unasked is the history snapshot requested on every successful
+  register, carrying only the newest `history.limit` projected rows (50 by
+  default) — incidental, not a repair path: a bounded window, folded by id, so it
+  neither reaches an older hole nor overwrites a bubble it already holds. It also
+  drops role-less `history` rows, which stalls "load older" forever once the agent
+  has `capabilities.reasoningDurable` on (**#309**, closed by this).
 
   **No capability negotiation was added.** Under an exact-match gate every peer
   is at this exact version, so there is nothing to withhold per peer, and the one

@@ -38,20 +38,15 @@
  *    looks healthy, and is wrong in two ways it cannot itself detect:
  *      · No `seq` ⇒ no gap detection ⇒ it never sends `get_difference`. This
  *        transport is core NATS pub/sub, AT-MOST-ONCE with no retention, so a
- *        dropped frame leaves a hole the peer CANNOT SEE and therefore never asks
- *        to heal. What repairs it is incidental AND BOUNDED. A history snapshot
- *        is REQUESTED on every successful register (`nats-register.ts`; the send
- *        coalesces while one is already in flight for that peer and is suppressed
- *        on an empty projection) and it rides the shared `.out`, so ANY device's
- *        register delivers it to all of them — but it carries only the newest
- *        `history.limit` PROJECTED ROWS (50 by default), and fewer usable ones
- *        still for a v3 peer with `reasoningDurable` on, which drops the
- *        role-less rows. A hole inside that window closes. An OLDER one does not:
- *        the v3 peer's only other door is `loadHistory({before})`, which pages
- *        strictly OLDER than a cursor and can never page INTO a mid-transcript
- *        hole. That hole outlives every reconnect for the life of the tab's
- *        state, and only a RELOAD — empty state, full re-page — repairs it.
- *        #244 exists so the hole ITSELF triggers the heal instead of luck.
+ *        dropped frame leaves a hole the peer CANNOT SEE and never asks to heal.
+ *        The one thing that reaches it unasked is the history snapshot requested
+ *        on every successful register (`nats-register.ts`), carrying only the
+ *        newest `history.limit` projected rows (50 by default), less the
+ *        role-less rows its own `case "history"` guard drops. That is
+ *        INCIDENTAL, NOT A REPAIR PATH: it is a bounded window, and the peer
+ *        folds it by id, so it neither reaches an older hole nor overwrites a
+ *        bubble the peer already holds. #244 exists so the hole ITSELF triggers
+ *        the heal instead of luck.
  *      · It DROPS `history` rows that carry no `role` — the `case "history"`
  *        guard every released build has, which is the very thing that made that
  *        widening safe — so its transcript holds no reasoning id to cite as a

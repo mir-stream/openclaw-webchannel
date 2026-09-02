@@ -21,16 +21,12 @@
   (#245), the `reasoning`/`tool`/`approval` `history` rows (#242), and
   `ack.committed[]` (#243). The `seq` case is the one that forces the bump:
   transport here is core NATS pub/sub, at-most-once with no retention, so a peer
-  that cannot detect a hole never asks to heal one. What repairs it is incidental
-  and bounded: a history snapshot is *requested* on every successful register
-  (coalesced while one is in flight, suppressed on an empty projection) and rides
-  the shared `.out`, so any device's register delivers it to all of them — but it
-  carries only the newest `history.limit` projected rows (50 by default), fewer
-  usable still for a v3 peer with `reasoningDurable` on. A hole inside that window
-  closes; an older one cannot, because `load_history` pages strictly older than a
-  cursor and never *into* a hole. That hole outlives every reconnect for the life
-  of the tab's state — only a reload repairs it — and nothing signals it on either
-  side.
+  that cannot detect a hole never asks to heal one. The one thing that reaches it
+  unasked is the history snapshot requested on every successful register, carrying
+  only the newest `history.limit` projected rows (50 by default), less the
+  role-less rows its own `history` guard drops. That is incidental, not a repair
+  path: a bounded window, folded by id, so it neither reaches an older hole nor
+  overwrites a bubble the peer already holds.
 
   **#309 is closed by this.** An older client drops role-less `history` rows, so
   its cursor can never cite a reasoning id and "load older" stalls permanently

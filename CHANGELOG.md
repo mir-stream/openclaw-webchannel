@@ -24,19 +24,13 @@
     carry a per-conversation `seq`; a client that sees a hole sends
     `get_difference` and folds the `difference` reply. This transport is core
     NATS pub/sub — at-most-once, no retention — so a dropped frame leaves a v3
-    peer with a hole it **cannot detect and therefore never asks to heal**. What
-    repairs it is incidental **and bounded**. A history snapshot is *requested* on
-    every successful register (the send coalesces while one is already in flight
-    for that peer, and is suppressed on an empty projection) and it rides the
-    shared `.out`, so any device's register delivers it to all of them — but it
-    carries only the newest `history.limit` **projected rows** (50 by default),
-    and fewer usable ones still for a v3 peer with `reasoningDurable` on, which
-    drops the role-less rows. A hole inside that window closes. **An older one
-    does not:** the v3 peer's only other door is `loadHistory({ before })`, which
-    pages strictly *older* than a cursor and can never page *into* a
-    mid-transcript hole. That hole outlives every reconnect for the life of the
-    tab's state; only a **reload** — empty state, full re-page — repairs it. #244
-    exists so the hole itself triggers the heal instead of luck doing it.
+    peer with a hole it **cannot detect and therefore never asks to heal**. The
+    one thing that reaches it unasked is the history snapshot requested on every
+    successful register, carrying only the newest `history.limit` projected rows
+    (50 by default), less the role-less rows its own `history` guard drops. That
+    is **incidental, not a repair path**: a bounded window, folded by id, so it
+    neither reaches an older hole nor overwrites a bubble the peer already holds.
+    #244 exists so the hole itself triggers the heal instead of luck doing it.
   - **ignores `user_committed` (#245),** so a message sent from one device does
     not appear on the account's other devices until **any device on the account
     next registers** and the resulting history snapshot reaches them all (it
