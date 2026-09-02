@@ -193,6 +193,20 @@ because the thing it names does not exist. The correction:
     so it is not a fallback. Price that against the minimization benefit before
     pulling the lever; it was a much cheaper action while the journal was a
     shadow store.
+
+    ⚠️ **TYPED EDIT/DELETE ROWS (`messageEdited` / `messageDeleted`) ARE IN THE
+    MODEL BUT NOT YET ON DISK.** #241 half 1 added the v6 typed-mutation kinds to
+    the event union so the store can express an edit or a permanent delete without
+    the old order-sensitive overwrite/revive. They are listed here because this
+    inventory names every kind the journal *can* hold and the enforcing test binds
+    to the union — but half 1 ships **no producer**, so no `messageEdited` or
+    `messageDeleted` row is written at any configuration today. When half 2 wires
+    the egress producer, the content class each carries is: **`messageEdited`
+    holds the REVISED message text** — the same plaintext class as the
+    `agent_message`/`kind:"user"` row it revises, nothing new in kind — and
+    **`messageDeleted` holds NO message text at all**, only the target id, a
+    monotonic `revision`, and an optional `turnId` (it is a tombstone; the text is
+    replaced by `""`). Re-price this note the moment a producer lands.
   - legacy migration artifacts under `$HOME/.openclaw-webchannel/`.
 
   That is the complete list of FILES, and — since the corrections above — of the

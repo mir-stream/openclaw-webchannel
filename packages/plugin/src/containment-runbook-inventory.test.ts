@@ -78,6 +78,11 @@ const RUNBOOK_TOKENS: Record<JournalEvent["kind"], string> = {
   tool: "`tool_activity`",
   approval: "`approval_request`",
   approvalResolution: "`approval_resolved`",
+  // #241 half 1: typed edit/delete kinds. Dormant — no producer emits them yet,
+  // so the runbook names them as model-only rows not on disk today, but the
+  // inventory must still name them because this map binds to the union.
+  messageEdited: "`messageEdited`",
+  messageDeleted: "`messageDeleted`",
 };
 
 function inventorySection(): string {

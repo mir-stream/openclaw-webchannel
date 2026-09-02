@@ -934,6 +934,19 @@ function extractMessageId(event: JournalEvent): string | null {
       // id-alone identity that **#320** exists to replace. When tool rows need a
       // column to key on, it is the composite — a schema change, not this switch.
       return null;
+    case "messageEdited":
+    case "messageDeleted":
+      // #241 half 1 (typed event model). Both name the TEXT message they mutate,
+      // so `message_id` is that id — the column names the revised/deleted row,
+      // which is the whole reason it exists. Safe against the two partial dedupe
+      // indexes: `journal_user_once`/`journal_placement_once` are
+      // `WHERE kind = 'user'`/`'placement'`, so a `messageEdited`/`messageDeleted`
+      // row is outside both predicates and can never conflict. Added by hand
+      // because this switch's `default` is #253's retain fallback, not a `never`
+      // gate (see the docblock above), so a forgotten kind would silently store
+      // `message_id = NULL` rather than failing to compile. Dormant in half 1: no
+      // producer emits these, so no such row is written.
+      return event.id;
     default:
       return null;
   }

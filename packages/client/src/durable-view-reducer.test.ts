@@ -2076,3 +2076,163 @@ describe("#242 half 4: a REPLAYED approval is never clickable", () => {
     expect(card.actionable).toBe(false);
   });
 });
+
+// ── #241 half 1: typed event model + monotonic revision + permanent typed
+//    delete + "edited" marker (doc §15.3, §16.2-3, §16.2-4) ──
+//
+// MODEL ONLY. No producer emits `messageEdited`/`messageDeleted` yet (the egress
+// mapper switches over WIRE FRAME types and none maps to these), so these
+// transitions are DORMANT: every existing anchor above stays byte-identical
+// because none of the guards below can fire without a tombstone or a mutation
+// event. These cases drive the transitions directly to pin the irreversible
+// data-model decisions before half 2's live cutover.
+describe("#241 half 1: revision-dominant messageEdited", () => {
+  const base = (): DurableView =>
+    reduceDurableView([{ kind: "bubble", answerId: "A", text: "hello", turnId: TURN }]);
+
+  it("a DOMINANT revision replaces the text, sets `edited`, keeps the slot, and stamps the revision", () => {
+    // Two entries so we can prove the slot POSITION is preserved, not just the id.
+    const two = reduceDurableView([
+      { kind: "user", id: "U", text: "hi" },
+      { kind: "bubble", answerId: "A", text: "hello", turnId: TURN },
+    ]);
+    const withUser = applyDurableEvent(two, {
+      kind: "messageEdited",
+      id: "A",
+      text: "hello (fixed)",
+      revision: 1,
+    });
+    const a = findText(withUser, "A");
+    expect(a?.text).toBe("hello (fixed)");
+    expect(a?.edited).toBe(true);
+    expect(a?.revision).toBe(1);
+    expect(a?.turnId).toBe(TURN); // carried forward when the event omits it
+    // slot preserved: U is still first, A still second.
+    expect(withUser.map((m) => m.id)).toEqual(["U", "A"]);
+  });
+
+  it("a revision beats the ABSENT (⇒ 0) base revision; a subsequent event needs a STRICTLY greater one", () => {
+    const r1 = applyDurableEvent(base(), {
+      kind: "messageEdited",
+      id: "A",
+      text: "v1",
+      revision: 1,
+    });
+    expect(findText(r1, "A")?.revision).toBe(1);
+    // EQUAL revision is stale → no-op by reference (§16.2-4 "stale revision 거부").
+    expect(applyDurableEvent(r1, { kind: "messageEdited", id: "A", text: "v1b", revision: 1 })).toBe(r1);
+    // LOWER revision is stale → no-op by reference.
+    expect(applyDurableEvent(r1, { kind: "messageEdited", id: "A", text: "v0", revision: 0 })).toBe(r1);
+    // A GREATER revision dominates.
+    const r2 = applyDurableEvent(r1, { kind: "messageEdited", id: "A", text: "v2", revision: 2 });
+    expect(findText(r2, "A")?.text).toBe("v2");
+    expect(findText(r2, "A")?.revision).toBe(2);
+  });
+
+  it("a present event `turnId` OVERRIDES the carried one", () => {
+    const next = applyDurableEvent(base(), {
+      kind: "messageEdited",
+      id: "A",
+      text: "x",
+      revision: 1,
+      turnId: "turn-2",
+    });
+    expect(findText(next, "A")?.turnId).toBe("turn-2");
+  });
+
+  it("an edit of an ABSENT id is a NO-OP (no create-or-update — creation stays on user/bubble)", () => {
+    const view = base();
+    expect(applyDurableEvent(view, { kind: "messageEdited", id: "Z", text: "z", revision: 1 })).toBe(view);
+  });
+
+  it("an edit of a TOMBSTONED entry is a NO-OP (a deleted message is not editable)", () => {
+    const tombstoned = applyDurableEvent(base(), { kind: "messageDeleted", id: "A", revision: 1 });
+    expect(findText(tombstoned, "A")?.deleted).toBe(true);
+    // Even a dominant revision cannot re-edit it — restore is a new id (§16.2-3).
+    expect(applyDurableEvent(tombstoned, { kind: "messageEdited", id: "A", text: "back", revision: 5 })).toBe(
+      tombstoned,
+    );
+  });
+});
+
+describe("#241 half 1: permanent typed delete (tombstone, no resurrect)", () => {
+  const base = (): DurableView =>
+    reduceDurableView([{ kind: "bubble", answerId: "A", text: "hello", turnId: TURN }]);
+
+  it("a DOMINANT delete replaces the entry with a RETAINED tombstone at its slot", () => {
+    const view = base();
+    const next = applyDurableEvent(view, { kind: "messageDeleted", id: "A", revision: 1 });
+    expect(next).not.toBe(view);
+    // Retained in the array — NOT filtered out — so a later same-id event can see
+    // it and refuse to resurrect it.
+    expect(next).toHaveLength(1);
+    const a = findText(next, "A");
+    expect(a?.deleted).toBe(true);
+    expect(a?.text).toBe("");
+    expect(a?.revision).toBe(1);
+    expect(a?.turnId).toBe(TURN);
+  });
+
+  it("a STALE/EQUAL revision delete is a NO-OP, and so is a DOUBLE delete at the same revision", () => {
+    const tombstoned = applyDurableEvent(base(), { kind: "messageDeleted", id: "A", revision: 1 });
+    // equal revision → stale → no-op by reference (double-delete).
+    expect(applyDurableEvent(tombstoned, { kind: "messageDeleted", id: "A", revision: 1 })).toBe(tombstoned);
+    // lower revision → stale → no-op by reference.
+    expect(applyDurableEvent(tombstoned, { kind: "messageDeleted", id: "A", revision: 0 })).toBe(tombstoned);
+  });
+
+  it("a delete of an ABSENT id is a NO-OP", () => {
+    const view = base();
+    expect(applyDurableEvent(view, { kind: "messageDeleted", id: "Z", revision: 1 })).toBe(view);
+  });
+
+  it("NO-RESURRECT: a later same-id `bubble` does not revive a tombstone", () => {
+    const view = reduceDurableView([
+      { kind: "bubble", answerId: "A", text: "hello", turnId: TURN },
+      { kind: "messageDeleted", id: "A", revision: 1 },
+      { kind: "bubble", answerId: "A", text: "REVIVED", turnId: TURN },
+    ]);
+    expect(view).toHaveLength(1); // no duplicate appended
+    expect(findText(view, "A")?.deleted).toBe(true);
+    expect(findText(view, "A")?.text).toBe("");
+  });
+
+  it("NO-RESURRECT: a later `seal.answers` naming the id does not revive it, and other answers still apply", () => {
+    const view = reduceDurableView([
+      { kind: "bubble", answerId: "A", text: "hello", turnId: TURN },
+      { kind: "bubble", answerId: "B", text: "world", turnId: TURN },
+      { kind: "messageDeleted", id: "A", revision: 1 },
+      { kind: "seal", turnId: TURN, answers: [{ id: "A", text: "REVIVED" }, { id: "B", text: "world!" }] },
+    ]);
+    expect(findText(view, "A")?.deleted).toBe(true);
+    expect(findText(view, "A")?.text).toBe("");
+    expect(findText(view, "B")?.text).toBe("world!"); // the live answer still seals
+  });
+
+  it("NO-RESURRECT: a later `placement` claiming the slot is a STRICT no-op on a tombstone", () => {
+    const tombstoned = reduceDurableView([
+      { kind: "bubble", answerId: "A", text: "hello", turnId: TURN },
+      { kind: "messageDeleted", id: "A", revision: 1 },
+    ]);
+    // Asserted BY REFERENCE, not just "still deleted": `placement` carries no
+    // text, so its update branch would spread `...prev` and keep the tombstone
+    // deleted even WITHOUT the guard — churning only `turnId`. The guard's real
+    // job is to leave the tombstone entirely untouched, which `.toBe` pins and a
+    // "still deleted" assertion cannot.
+    const next = applyDurableEvent(tombstoned, {
+      kind: "placement",
+      answerId: "A",
+      turnId: "turn-2",
+    });
+    expect(next).toBe(tombstoned);
+    expect(next).toHaveLength(1);
+    expect(findText(next, "A")?.deleted).toBe(true);
+  });
+
+  it("is PURE: neither the input view nor the input event is mutated on the delete path", () => {
+    const view = Object.freeze(base().map((m) => Object.freeze({ ...m }))) as DurableView;
+    const event = Object.freeze({ kind: "messageDeleted", id: "A", revision: 1 }) as DurableEvent;
+    // Would throw under strict mode if either were written in place.
+    expect(() => applyDurableEvent(view, event)).not.toThrow();
+  });
+});
