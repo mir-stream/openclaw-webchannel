@@ -3566,9 +3566,60 @@ export class WebChannelNATSClient {
         this.applyDurable(event, local);
         return;
       }
+      case "user": {
+        // #337 — a LOST ack leaves the optimistic user bubble un-adopted at its
+        // local id (`adoptCommittedIds` runs only on the ack). The turn's first
+        // agent frame opens a gap, and this difference re-delivers the same user
+        // event under the SERVER id (`webchannel-user-<seq>`) — a DISTINCT id — so
+        // a bare `applyDurable` would `applyUser`-append a SECOND user bubble.
+        //
+        // Adopt the un-adopted bubble by `random_id` FIRST — the SAME correlation
+        // the ack path uses — re-keying it to `event.id` BEFORE the fold, so
+        // `applyUser`'s `findTextIndex` now finds it and no-ops (one bubble). If
+        // `randomId` is absent (older row/older client), unknown, or already
+        // adopted (ack won the race, its linkage drained), this is a no-op and we
+        // fall through to `applyDurable` — today's append. NEVER text-matched.
+        if (typeof event.randomId === "string" && event.randomId.length > 0) {
+          this.adoptUserBubbleByRandomId(event.randomId, event.id);
+        }
+        this.applyDurable(event);
+        return;
+      }
       default:
         this.applyDurable(event);
     }
+  }
+
+  /**
+   * #337 — adopt ONE un-adopted optimistic user bubble onto its server id by
+   * `random_id`, the resolve+rekey+delete core `adoptCommittedIds` runs per ack
+   * entry, narrowed to a single linkage for the difference fold.
+   *
+   * The linkage is CONSUMED (`delete`) unconditionally, exactly as the ack path
+   * does: the echo — via ack OR via a re-delivered difference — is terminal for
+   * this `random_id`. Whichever path runs first drains it, so the other's
+   * `randomIdToReceiptKey.get` returns undefined and it becomes a no-op (no
+   * double-adopt, no crash) — the ordering safety the ack/difference race needs.
+   *
+   * A `random_id` with no live linkage (already adopted, or never sent from this
+   * client) resolves to `undefined` ⇒ no re-key; the caller then folds unchanged
+   * (`applyUser` no-ops on an already-held id, or appends a genuinely new final).
+   */
+  private adoptUserBubbleByRandomId(randomId: string, serverId: string): void {
+    const receiptKey = this.randomIdToReceiptKey.get(randomId);
+    // Consume the linkage — terminal for this random_id (mirrors adoptCommittedIds).
+    this.randomIdToReceiptKey.delete(randomId);
+    if (receiptKey === undefined) return;
+    let changed = false;
+    const messages = this.state.messages.map((m): ChatMessage => {
+      // Only a sent USER echo re-keys. `role === "user"` narrows to `ChatBubble`;
+      // `receiptKey` links it to its send. An already-server-id bubble is a no-op.
+      if (m.role !== "user" || m.receiptKey !== receiptKey) return m;
+      if (m.id === serverId) return m;
+      changed = true;
+      return { ...m, id: serverId };
+    });
+    if (changed) this.setState({ messages });
   }
 
   /**

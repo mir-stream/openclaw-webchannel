@@ -658,6 +658,29 @@ describe("characterization: a re-delivered `user` row folds idempotently (#244 h
       ]),
     ).toThrow(/Cannot read properties of undefined \(reading 'id'\)/);
   });
+
+  it("#337 — `applyUser` IGNORES `randomId`: it folds identically with or without it", () => {
+    // `randomId` is CARRIED for the wrapper's difference fold (adopt-by-random_id),
+    // never REDUCED. The reducer must fold a user event byte-identically whether or
+    // not it carries one, and the text node it produces must not leak the field —
+    // otherwise `history == live` would depend on a field the live path never sets.
+    const withRandom = reduceDurableView([
+      { kind: "user", id: "u-0", text: "hello", turnId: "w-0", randomId: "rand-1" },
+    ]);
+    const without = reduceDurableView([
+      { kind: "user", id: "u-0", text: "hello", turnId: "w-0" },
+    ]);
+    expect(withRandom).toEqual(without);
+    expect(withRandom).toEqual([
+      { kind: "text", id: "u-0", role: "user", text: "hello", turnId: "w-0" },
+    ]);
+    // And it stays id-idempotent even when a re-delivery carries a randomId.
+    const redelivered = reduceDurableView([
+      { kind: "user", id: "u-0", text: "hello", turnId: "w-0", randomId: "rand-1" },
+      { kind: "user", id: "u-0", text: "hello", turnId: "w-0", randomId: "rand-1" },
+    ]);
+    expect(redelivered).toHaveLength(1);
+  });
 });
 
 // ---------------------------------------------------------------------------

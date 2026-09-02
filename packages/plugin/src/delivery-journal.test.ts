@@ -719,12 +719,26 @@ describe("#243 half 2a — appendInboundUser (server-assigned id) + idempotency"
 
     expect(first).toEqual({ seq: 1, inserted: true, messageId: "webchannel-user-1" });
     expect(second).toEqual({ seq: 2, inserted: true, messageId: "webchannel-user-2" });
-    // The durable row's id is the server mint; turnId is the wire id; the client
-    // random_id is NOT in the reducer-visible event (it lives only in the column).
+    // The durable row's id is the server mint; turnId is the wire id; #337 also
+    // carries the client `random_id` INTO the payload (a distinct field, not the
+    // idempotency_key column) so a difference re-delivery can re-key the client's
+    // un-adopted optimistic bubble by it.
+    expect(journal.read("conv").map((row) => row.event)).toEqual([
+      { kind: "user", id: "webchannel-user-1", text: "hi", turnId: "wire-1", randomId: "r-1" },
+      { kind: "user", id: "webchannel-user-2", text: "yo", turnId: "wire-2", randomId: "r-2" },
+    ]);
+  });
+
+  it("#337 — omits randomId from the payload when the client sent none", () => {
+    // An older client sends no random_id → the row keys on its wire id and the
+    // event carries NO randomId, so the client fold falls back to append (safe).
+    const journal = open(newJournalPath());
+    journal.appendInboundUser("conv", { text: "hi", turnId: "wire-1" });
     expect(journal.read("conv").map((row) => row.event)).toEqual([
       { kind: "user", id: "webchannel-user-1", text: "hi", turnId: "wire-1" },
-      { kind: "user", id: "webchannel-user-2", text: "yo", turnId: "wire-2" },
     ]);
+    // Concretely: the key is absent, not present-and-undefined.
+    expect(journal.read("conv")[0].event).not.toHaveProperty("randomId");
   });
 
   it("never mints an id that could collide with an agent (nextMessageId) id", () => {

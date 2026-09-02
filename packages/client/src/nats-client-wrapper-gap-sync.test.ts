@@ -47,8 +47,38 @@ type Internals = {
   handleMessage: (msg: InboundMessage) => void;
   lastAppliedSeq: number;
   differenceInFlight: boolean;
+  // #337: the `random_id → receiptKey` linkage `mintRandomId` records on a send and
+  // both the ack (`adoptCommittedIds`) and the difference fold consume to adopt.
+  randomIdToReceiptKey: Map<string, string>;
   client: { getDifference: (afterSeq: number) => void };
 };
+
+/**
+ * #337 — inject one un-adopted optimistic user bubble (a send whose ack has NOT
+ * been folded), plus the `random_id → receiptKey` linkage the real send path
+ * records. Mirrors the shape `nextPublishedUserMessages` produces.
+ */
+function seedOptimisticUser(
+  w: Internals,
+  opts: { localId: string; receiptKey: string; randomId: string; text: string; wireId: string },
+): void {
+  w.state.messages = [
+    {
+      id: opts.localId,
+      role: "user",
+      text: opts.text,
+      turnId: opts.wireId,
+      wireId: opts.wireId,
+      receiptKey: opts.receiptKey,
+      sendState: "sent",
+      pending: false,
+    },
+  ];
+  w.randomIdToReceiptKey.set(opts.randomId, opts.receiptKey);
+}
+
+const userIds = (w: Internals): string[] =>
+  project(w).filter((m) => (m as { role?: string }).role === "user").map((m) => (m as { id: string }).id);
 
 /** A wrapper with `client.getDifference` replaced by a spy — the request seam. */
 function spied(): { w: Internals; getDifference: ReturnType<typeof vi.fn> } {
@@ -400,5 +430,124 @@ describe("#244 half B — a re-delivered/stale difference never corrupts the vie
     expect(w.lastAppliedSeq).toBe(cursorBefore);
     expect(w.differenceInFlight).toBe(false);
     expect(getDifference).not.toHaveBeenCalled();
+  });
+});
+
+describe("#337 — a difference user event adopts an un-adopted optimistic bubble by random_id", () => {
+  it("LOST ACK: re-keys the held bubble to the server id — exactly ONE user bubble", () => {
+    // The core bug. The ack for the send NEVER arrives, so the optimistic bubble
+    // stays at its LOCAL id (`u-0`) — adoption runs only on the ack. The turn's
+    // first agent frame (seq3) opens a gap, and the difference re-delivers the SAME
+    // user event under the SERVER id `webchannel-user-2` carrying its `randomId`.
+    const { w, getDifference } = spied();
+    w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+    seedOptimisticUser(w, { localId: "u-0", receiptKey: "r-0", randomId: "rand-1", text: "hello", wireId: "t1" });
+    expect(userIds(w)).toEqual(["u-0"]); // held at the local id, un-adopted
+
+    // seq3 with cursor 1 → gap → get_difference(1); the frame is buffered.
+    w.handleMessage({ type: "agent_message", id: "a3", text: "answer 3", turnId: "t1", seq: 3 });
+    expect(getDifference).toHaveBeenCalledWith(1);
+    w.handleMessage({
+      type: "difference",
+      events: [
+        { seq: 2, event: { kind: "user", id: "webchannel-user-2", text: "hello", turnId: "t1", randomId: "rand-1" } },
+        { seq: 3, event: { kind: "bubble", answerId: "a3", text: "answer 3", turnId: "t1" } },
+      ],
+    });
+
+    // ⚠️ ONE user bubble, re-keyed to the server id — NOT two (u-0 + webchannel-user-2).
+    expect(userIds(w)).toEqual(["webchannel-user-2"]);
+    const users = project(w).filter((m) => (m as { role?: string }).role === "user");
+    expect((users[0] as { text: string }).text).toBe("hello");
+    // The linkage was consumed by the fold.
+    expect(w.randomIdToReceiptKey.has("rand-1")).toBe(false);
+  });
+
+  it("NO random_id: falls back to append (today's behavior) — never text-matches", () => {
+    // An older client sent no random_id, so the row carries none. Without a
+    // correlation the fold CANNOT adopt (and must never guess by text): the held
+    // bubble keeps its local id and the re-delivered final appends. This is the
+    // deliberately-kept safe fallback, not a regression.
+    const { w, getDifference } = spied();
+    w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+    seedOptimisticUser(w, { localId: "u-0", receiptKey: "r-0", randomId: "rand-1", text: "hello", wireId: "t1" });
+
+    w.handleMessage({ type: "agent_message", id: "a3", text: "answer 3", turnId: "t1", seq: 3 });
+    expect(getDifference).toHaveBeenCalledWith(1);
+    w.handleMessage({
+      type: "difference",
+      events: [
+        { seq: 2, event: { kind: "user", id: "webchannel-user-2", text: "hello", turnId: "t1" } },
+        { seq: 3, event: { kind: "bubble", answerId: "a3", text: "answer 3", turnId: "t1" } },
+      ],
+    });
+
+    // The optimistic bubble is untouched (still `u-0`) and the final appended.
+    expect(userIds(w)).toEqual(["u-0", "webchannel-user-2"]);
+    // The linkage is left intact for a later ack to adopt.
+    expect(w.randomIdToReceiptKey.get("rand-1")).toBe("r-0");
+  });
+
+  it("HAPPY PATH: ack adopted first drains the linkage — a re-delivered difference stays ONE bubble", () => {
+    // The ack lands (adopting the bubble to the server id and draining the
+    // linkage) WHILE a get_difference is in flight; the difference then re-delivers
+    // the same user event. The drained linkage means no re-adopt, and applyUser
+    // no-ops on the already-held id — one bubble, no double-adopt.
+    const { w, getDifference } = spied();
+    w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+    seedOptimisticUser(w, { localId: "u-0", receiptKey: "r-0", randomId: "rand-1", text: "hello", wireId: "t1" });
+
+    // seq4 opens the gap → get_difference(1) in flight (floor stays 1).
+    w.handleMessage({ type: "agent_message", id: "a4", text: "answer 4", turnId: "t1", seq: 4 });
+    expect(getDifference).toHaveBeenCalledWith(1);
+    // The ack arrives mid-flight: adoptCommittedIds re-keys the bubble AND drains
+    // the linkage (its seq advance is deferred; adoption still runs live).
+    w.handleMessage({
+      type: "ack",
+      ids: ["u-0"],
+      committed: [{ random_id: "rand-1", messageId: "webchannel-user-2", seq: 2 }],
+    });
+    expect(userIds(w)).toEqual(["webchannel-user-2"]);
+    expect(w.randomIdToReceiptKey.has("rand-1")).toBe(false);
+
+    // The difference re-delivers the user event; the drained linkage → no re-key,
+    // applyUser no-ops on the already-held id.
+    w.handleMessage({
+      type: "difference",
+      events: [
+        { seq: 2, event: { kind: "user", id: "webchannel-user-2", text: "hello", turnId: "t1", randomId: "rand-1" } },
+        { seq: 4, event: { kind: "bubble", answerId: "a4", text: "answer 4", turnId: "t1" } },
+      ],
+    });
+    expect(userIds(w)).toEqual(["webchannel-user-2"]);
+  });
+
+  it("LATE ACK: the fold adopts first — a later ack finds the linkage drained and skips (no double, no crash)", () => {
+    // The mirror of the happy path: the difference fold adopts the bubble and
+    // drains the linkage; a LATE ack for the same send then finds nothing to adopt
+    // and is a clean no-op — the bubble is already correct.
+    const { w, getDifference } = spied();
+    w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+    seedOptimisticUser(w, { localId: "u-0", receiptKey: "r-0", randomId: "rand-1", text: "hello", wireId: "t1" });
+
+    w.handleMessage({ type: "agent_message", id: "a3", text: "answer 3", turnId: "t1", seq: 3 });
+    expect(getDifference).toHaveBeenCalledWith(1);
+    w.handleMessage({
+      type: "difference",
+      events: [
+        { seq: 2, event: { kind: "user", id: "webchannel-user-2", text: "hello", turnId: "t1", randomId: "rand-1" } },
+        { seq: 3, event: { kind: "bubble", answerId: "a3", text: "answer 3", turnId: "t1" } },
+      ],
+    });
+    expect(userIds(w)).toEqual(["webchannel-user-2"]);
+
+    // The late ack: adoptCommittedIds resolves rand-1 to undefined (fold drained
+    // it) and skips. No second adopt, no throw.
+    w.handleMessage({
+      type: "ack",
+      ids: ["u-0"],
+      committed: [{ random_id: "rand-1", messageId: "webchannel-user-2", seq: 2 }],
+    });
+    expect(userIds(w)).toEqual(["webchannel-user-2"]);
   });
 });

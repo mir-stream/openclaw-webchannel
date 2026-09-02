@@ -958,6 +958,14 @@ export function openDeliveryJournal(options: {
           id: messageId,
           text: input.text,
           ...(input.turnId === undefined ? {} : { turnId: input.turnId }),
+          // #337: carry the client's `random_id` INTO the payload (a distinct
+          // field, NOT the `idempotency_key` column — that column is
+          // `randomId ?? turnId` and can't be disambiguated). `read()`→`row.event`
+          // then ships it verbatim in `serveDifference`, so the client can re-key
+          // an un-adopted optimistic user bubble by it and no-op the fold. Absent
+          // when an older client sent no random_id ⇒ the client falls back to
+          // append (safe). The reducer never reads it (folds by `id`).
+          ...(input.randomId === undefined ? {} : { randomId: input.randomId }),
         };
         const result = insertEvent.run(
           conversationId,
