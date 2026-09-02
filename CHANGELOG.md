@@ -24,13 +24,12 @@
     carry a per-conversation `seq`; a client that sees a hole sends
     `get_difference` and folds the `difference` reply. This transport is core
     NATS pub/sub — at-most-once, no retention — so a dropped frame leaves a v3
-    peer with a hole it **cannot detect and therefore never asks to heal**. The
-    one thing that reaches it unasked is the history snapshot requested on every
-    successful register, carrying only the newest `history.limit` projected rows
-    (50 by default), less the role-less rows its own `history` guard drops. That
-    is **incidental, not a repair path**: a bounded window, folded by id, so it
-    neither reaches an older hole nor overwrites a bubble the peer already holds.
-    #244 exists so the hole itself triggers the heal instead of luck doing it.
+    peer with a hole it **cannot detect and therefore never asks to heal**. What
+    reaches it unasked — the history snapshot requested on every successful
+    register, a `turn_snapshot` at the end of a streamed turn — is **incidental,
+    not a repair path**: it rides the same at-most-once transport and nothing
+    aims it at the hole. #244 exists so the hole itself triggers the heal
+    instead of luck doing it.
   - **ignores `user_committed` (#245),** so a message sent from one device does
     not appear on the account's other devices until **any device on the account
     next registers** and the resulting history snapshot reaches them all (it

@@ -42,14 +42,11 @@
  *      · No `seq` ⇒ no gap detection ⇒ it never sends `get_difference`. This
  *        transport is core NATS pub/sub, AT-MOST-ONCE with no retention, so a
  *        dropped frame leaves a hole the peer CANNOT SEE and never asks to heal.
- *        The one thing that reaches it unasked is the history snapshot requested
- *        on every successful register (`nats-register.ts`), carrying only the
- *        newest `history.limit` projected rows (50 by default), less the
- *        role-less rows its own `case "history"` guard drops. That is
- *        INCIDENTAL, NOT A REPAIR PATH: it is a bounded window, and the peer
- *        folds it by id, so it neither reaches an older hole nor overwrites a
- *        bubble the peer already holds. #244 exists so the hole ITSELF triggers
- *        the heal instead of luck.
+ *        What reaches it unasked — the history snapshot requested on every
+ *        successful register (`nats-register.ts`), a `turn_snapshot` at the end
+ *        of a streamed turn — is INCIDENTAL, NOT A REPAIR PATH: it rides the
+ *        same at-most-once transport and nothing aims it at the hole. #244
+ *        exists so the hole ITSELF triggers the heal instead of luck.
  *      · It DROPS `history` rows that carry no `role` — its own `case "history"`
  *        guard, which is the very thing that made that widening safe — so its
  *        transcript holds no reasoning id to cite as a `before` cursor and "load

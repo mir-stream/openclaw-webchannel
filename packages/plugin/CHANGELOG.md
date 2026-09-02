@@ -21,12 +21,10 @@
   (#245), the `reasoning`/`tool`/`approval` `history` rows (#242), and
   `ack.committed[]` (#243). The `seq` case is the one that forces the bump:
   transport here is core NATS pub/sub, at-most-once with no retention, so a peer
-  that cannot detect a hole never asks to heal one. The one thing that reaches it
-  unasked is the history snapshot requested on every successful register, carrying
-  only the newest `history.limit` projected rows (50 by default), less the
-  role-less rows its own `history` guard drops. That is incidental, not a repair
-  path: a bounded window, folded by id, so it neither reaches an older hole nor
-  overwrites a bubble the peer already holds.
+  that cannot detect a hole never asks to heal one. What reaches it unasked — the
+  history snapshot requested on every successful register, a `turn_snapshot` at
+  the end of a streamed turn — is incidental, not a repair path: it rides the
+  same at-most-once transport and nothing aims it at the hole.
 
   **#309 is closed by this.** An older client drops role-less `history` rows, so
   its cursor can never cite a reasoning id and "load older" stalls permanently

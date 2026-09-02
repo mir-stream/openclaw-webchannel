@@ -259,8 +259,8 @@ unsupported.
 draft and answer frames), but the current plugin emits a `turn_settled` for every
 member with the same outcome, anchor last. The client promotes only the exact
 `turnId === wireId` match, so all member receipts resolve. (Historically,
-anchor-only plugin builds — everything before `0.5.0`, where per-member
-`turn_settled` shipped — left non-anchor receipts at `accepted`, and the
+plugin builds before `0.5.0`, where per-member `turn_settled` shipped, left
+non-anchor receipts at `accepted`, and the
 turn-activity prefix sweep closed their indicators without inventing receipt
 success. Those builds speak protocol v3 or older, which a v4 client refuses, so
 that path is no longer reachable; the sweep remains for lost or missing member
