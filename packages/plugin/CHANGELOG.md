@@ -44,6 +44,19 @@
   slice is in `protocol.ts`'s "When to bump", which now carries v4 as its second
   worked example.
 
+### Fixed
+
+- **A K>=2 count shortfall no longer routes buffered finals onto lanes (#340,
+  extends #260).** `flushBufferedOrdinaryFinals` used to fall back to
+  `materializedAnswerLanes()` when the finals and the streamed lanes disagreed in
+  number; every landing there is non-authoritative, so `emitTurnSnapshot`
+  republished the lane with its `streamedAnswerText` and destroyed the final —
+  permanently, since #240 removed the core-transcript read that healed it on
+  reload. `targets` is now empty in that case and each unpaired final goes out
+  through `deliverTerminalIndependent` in order, matching the built-in Telegram
+  channel: a final finalizes the one draft it provably owns or becomes a new
+  message, never an edit of a past bubble.
+
 ## 0.7.0
 
 ### Added

@@ -69,6 +69,16 @@
   without them buys a connection and a silently wrong transcript, which is the
   precise failure this bump exists to prevent.
 
+### Fixed
+
+- **A turn whose answer count does not line up no longer loses an answer (#340,
+  extends #260).** When a turn ends with more finals than answers that actually
+  streamed, the plugin used to place them on the bubbles it did have — and the
+  end-of-turn snapshot then restored those bubbles to their streamed text,
+  deleting a message whose only copy was in the final it displaced. It now
+  places none of them: every unmatched final becomes its own new bubble, which
+  can duplicate a visible answer but can never erase one.
+
 ## 0.7.0
 
 Two unrelated changes ship together. **The two published libraries are renamed**
