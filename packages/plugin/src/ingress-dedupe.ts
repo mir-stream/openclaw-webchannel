@@ -35,23 +35,26 @@
  * beats wide at-least-once for this surface. That deviation from the sketch is
  * deliberate and settled, and the ORDER is unchanged.
  *
- * ⚠️ WHAT CHANGED IS THAT THE WINDOW NOW HEALS (#344), FOR MOST OF IT. Neither
- * of the two doors onto a durable `accepted` marker treats it as proof of an
- * accept any more: the journal is the SSOT (doc §15.7), so when it has no row
- * under this id's identity (`randomId ?? wireId` — the dedupe key's body, which
- * is exactly what `appendInboundUser` stores as `idempotency_key`), the marker
- * loses.
- *  - THIS SEAM'S found/accepted branch RE-ADMITS the replay: journaled,
- *    dispatched, acked, and echoed when the client sent a `random_id`.
- *  - `inbound-overflow-resolver.ts`'s accepted arm — the door for an id whose
- *    raw frame could not be retained — PUBLISHES NOTHING, because a resolver can
- *    only report a verdict, never admit a message. Silence keeps the client's
- *    ledger entry, so the message is replayed and taken by this seam. Its ack
- *    was the worse half of the bug: it drained the ledger, so there was no next
- *    replay at all.
+ * ⚠️ WHAT CHANGED IS THAT THE WINDOW NOW HEALS (#344), FOR MOST OF IT. No reader
+ * treats a durable `accepted` marker as proof of an accept any more: the journal
+ * is the SSOT (doc §15.7), so when it has no row under this id's identity
+ * (`randomId ?? wireId` — the dedupe key's body, which is exactly what
+ * `appendInboundUser` stores as `idempotency_key`), the marker loses.
+ *
+ * ⭐ UNDER ONE RULE, STATED ONCE AND NOT REPEATED HERE: **THE READER RULE**, on
+ * `OutcomeLookup` in `ingress-outcome.ts`. In short — `accepted` is not a
+ * verdict, and THIS SEAM'S found/accepted branch is the only reader allowed to
+ * turn it into one, because it is the only reader holding the journal. Row
+ * present ⇒ re-ack with the echo; row absent ⇒ RE-ADMIT (journaled, dispatched,
+ * acked). Every other reader defers instead of answering, so the replay keeps
+ * arriving until it reaches here.
+ *
  * A crash anywhere between the marker and the row is therefore recovered by the
- * client's next replay through either door. See that branch, that arm, and the
- * footer's ordering block (which states the cost).
+ * client's next replay that gets this far. See that branch and the footer's
+ * ordering block (which states the cost). Two rounds of this fix were spent
+ * discovering readers that were answering instead of deferring — the resolver,
+ * then the debouncer's fast path — which is why the rule lives in one place and
+ * is cited rather than restated.
  *
  * ⚠️ AND IT IS ONLY SAFE BECAUSE `cancelled` IS ITS OWN OUTCOME — the first
  * version of this fix was wrong here, so the reason is worth keeping. "Marker,
@@ -1182,10 +1185,12 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         //     the retention budget is full never reaches here: it overflows into
         //     `inbound-overflow-resolver.ts`, which for the same orphan publishes
         //     NOTHING rather than re-admitting. The message is not re-run and not
-        //     dropped either — it is simply left unresolved, so the client keeps
-        //     it and lands here on a later, less loaded replay. Round 2 stated
-        //     this bullet as if this seam were the only door; that reading also
-        //     hid the fact that the resolver was ACKING those orphans away.
+        //     dropped either — it is left unresolved, so the client keeps it and
+        //     lands here on a later, less loaded replay. That is a property of
+        //     THE READER RULE (`OutcomeLookup` in `ingress-outcome.ts`) holding
+        //     at every reader, not of this seam: round 2 stated it as if this
+        //     seam were the only door, and both readers it did not name were
+        //     answering `accepted` themselves at the time.
         //  2. ONE-OFF, ON UPGRADE: a cancellation recorded as `accepted` by an
         //     older build is indistinguishable from (1) for that marker's TTL, so
         //     if its ack was also lost, the aborted turn re-runs once. The file

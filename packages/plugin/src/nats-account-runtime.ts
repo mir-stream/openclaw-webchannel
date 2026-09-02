@@ -1151,10 +1151,12 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         peekOutcome: (peerId, id) =>
           processIngressOutcomes.peek(accountId, `${peerId}:${id}`),
         onKnownOutcome: (peerId, id, outcome) => {
-          // #344: `overloaded` is the ONLY outcome the peer hears about as a
-          // refusal. `cancelled` (text `/stop` killed) acks exactly like
-          // `accepted` did before the split — the ledger entry must drain and the
-          // peer must not be told its message was rejected for backpressure.
+          // #344: reached ONLY for an `IngressRefusal` — the debouncer never
+          // short-circuits an `accepted` (THE READER RULE, `OutcomeLookup` in
+          // `ingress-outcome.ts`), and the parameter's type says so. Of the two,
+          // `overloaded` is the one the peer hears as a refusal; `cancelled`
+          // (text `/stop` killed) acks so the ledger entry drains, and must not
+          // be reported as backpressure.
           if (outcome === "overloaded") channel.sendInboundRejected(peerId, [id]);
           else channel.sendAck(peerId, [id]);
         },

@@ -230,11 +230,18 @@ export class BoundedOverflowResolver {
         if (this.options.lookupUserRow !== undefined && row === undefined) {
           // PUBLISH NOTHING, exactly like the `unknown` arm below — and for the
           // same reason: this resolver has no way to admit a message, only to
-          // report a verdict, and there is no true verdict to report. Silence
-          // leaves the client's ledger entry intact, so the message is replayed
-          // and taken by the ordinary flush path, which journals it, dispatches
-          // the turn and echoes the minted id. The retention pressure that sent
-          // it here is transient; the loss it used to cause was not.
+          // report a verdict, and there is no true verdict to report. The
+          // client's ledger entry survives, so the message is replayed and taken
+          // by the flush path. The retention pressure that sent it here is
+          // transient; the loss it used to cause was not.
+          //
+          // ⚠️ SILENCE IS ONLY WORTH ANYTHING BECAUSE EVERY OTHER READER IS
+          // SILENT TOO. It was not, for a round: `outcomeStore.lookup()` above
+          // WARMS THE HOT CACHE, and the debouncer's `peekOutcome` fast path
+          // reads that cache before it charges retention — so the replay this
+          // return was protecting got acked there instead, and never reached the
+          // flush at all. Both defer now, under one rule; do not weaken either
+          // half alone. THE READER RULE: `OutcomeLookup` in `ingress-outcome.ts`.
           return;
         }
         // #333 path 6: when the row DOES exist, carry the `committed` echo. This

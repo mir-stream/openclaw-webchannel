@@ -5,10 +5,11 @@ import type {
   RetentionSessionToken,
 } from "./inbound-retention.js";
 import { estimateRetainedMessageBytes } from "./inbound-retention.js";
-// #344: the debouncer only RELAYS a known outcome (it never branches on the
-// value), so it binds the union rather than restating its members — a fourth
-// outcome must not need an edit here.
-import type { IngressOutcome } from "./ingress-outcome.js";
+// #344: `IngressRefusal` is the subset a reader without the journal may act on —
+// see THE READER RULE on `OutcomeLookup` in that file. Bound as types rather than
+// restated as literals, so a fourth outcome does not need an edit here and an
+// `accepted` fast-path decision does not typecheck.
+import type { IngressOutcome, IngressRefusal } from "./ingress-outcome.js";
 
 export type RetainedDebounceEntry<Item> = {
   item: Item;
@@ -28,7 +29,7 @@ export type BoundedDebouncePushResult =
   | { status: "accepted" }
   | { status: "duplicate-inflight" }
   | { status: "overflow-inflight" }
-  | { status: "known-outcome"; outcome: IngressOutcome }
+  | { status: "known-outcome"; outcome: IngressRefusal }
   | { status: "overflow"; reason: RetentionLimitReason; chargedBytes?: number }
   | { status: "disposed" };
 
@@ -57,7 +58,7 @@ export type BoundedInboundDebouncerOptions<Item> = {
   isOverflowClaimed?: (key: string, id: string) => boolean;
   /** Synchronous `/stop` tombstone lookup; authoritative over cached outcomes. */
   isCancelledFallback?: (key: string, id: string) => boolean;
-  onKnownOutcome?: (key: string, id: string, outcome: IngressOutcome) => void;
+  onKnownOutcome?: (key: string, id: string, outcome: IngressRefusal) => void;
   onOverflow?: (params: {
     key: string;
     item: Item;
@@ -381,10 +382,26 @@ export function createBoundedInboundDebouncer<Item>(
       if (options.isOverflowClaimed?.(key, id)) return { status: "overflow-inflight" };
       recoverCancelled = options.isCancelledFallback?.(key, id) ?? false;
       // A cancellation fallback represents text `/stop` already killed. It must
-      // recover accepted/ACK even if a stale/conflicting hot overload exists.
+      // recover its suppression/ACK even if a stale/conflicting hot overload
+      // exists.
       if (!recoverCancelled) {
         const known = options.peekOutcome?.(key, id);
-        if (known) {
+        // ⭐ #344 — A REFUSAL SHORT-CIRCUITS; AN `accepted` DOES NOT. This is THE
+        // READER RULE (`OutcomeLookup` in `ingress-outcome.ts`): only the flush
+        // path holds the journal, so only it can tell an admitted-and-journaled
+        // message from a crash-window orphan. Answering `accepted` here would ack
+        // an orphan away and drain the client's ledger entry — the message would
+        // never be journaled and never answered, and no later replay would exist
+        // to fix it.
+        //
+        // ⚠️ THIS FAST PATH IS EXACTLY WHERE THAT BIT. `peek` reads a HOT CACHE
+        // that `lookupUnlocked`'s found path and `write.commit()` both warm, so
+        // an orphan the overflow resolver had just declined to answer was
+        // instantly decidable here — the resolver's silence bought nothing while
+        // this arm still spoke. Deferring costs one flush for a genuine accepted
+        // replay, on a path #355 shows is already dead for conforming clients
+        // (the request is keyed by the wire id, the marker by `random_id`).
+        if (known !== undefined && known !== "accepted") {
           options.onKnownOutcome?.(key, id, known);
           return { status: "known-outcome", outcome: known };
         }

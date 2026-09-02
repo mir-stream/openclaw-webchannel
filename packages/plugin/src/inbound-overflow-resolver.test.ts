@@ -673,3 +673,161 @@ describe("BoundedOverflowResolver — the journal is the accept authority (#344)
     expect(acks).toEqual(["u-1"]);
   });
 });
+
+/**
+ * #344 round 4 — SILENCE ONLY PRESERVES A REPLAY IF EVERY READER STAYS SILENT.
+ *
+ * Round 3 taught this resolver to withhold a verdict for an `accepted` marker
+ * with no journal row, on the reasoning that the client's ledger entry survives
+ * and the next replay reaches the flush path. It did not. `outcomeStore.lookup()`
+ * WARMS THE PROCESS HOT CACHE on its found path (so does `write.commit()`), and
+ * the debouncer's `peekOutcome` fast path reads that cache BEFORE it charges
+ * retention — so the very next replay was acked away by `onKnownOutcome` and
+ * never reached `onFlush`, the journal, or the found branch. The resolver's
+ * silence bought nothing while a second reader still answered.
+ *
+ * These drive the REAL debouncer + resolver + outcome store + journal + flush
+ * seam, in the older-client key shape (no `random_id`, so the overflow request's
+ * `${peer}:${wireId}` and the marker's key agree — the shape that makes the
+ * resolver's accepted arm reachable at all, per #355).
+ */
+describe("#344: an accepted orphan survives the fast path, the resolver and the budget", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
+  });
+
+  const ACCOUNT = "acct";
+  const PEER = "peer-0";
+
+  /** The whole ingress chain, wired the way `nats-account-runtime.ts` wires it. */
+  const buildChain = async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-p1-journal-"));
+    dirs.push(dir);
+    const journal = openDeliveryJournal({ databasePath: join(dir, "journal.db") });
+    const outcomeStore = createIngressOutcomeStore({
+      accepted: memoryDedupe(), overloaded: memoryDedupe(), cancelled: memoryDedupe(),
+    });
+    // The crash-window state: a durable `accepted` marker, an empty journal.
+    const seeded = await outcomeStore.record(ACCOUNT, `${PEER}:u-1`, "accepted");
+    if (seeded.status !== "recorded") throw new Error("could not seed the marker");
+    seeded.write.commit();
+
+    const acks: string[] = [];
+    const rejects: string[] = [];
+    const dispatched: string[] = [];
+    const resolver = new BoundedOverflowResolver({
+      outcomeStore,
+      lookupUserRow: ({ peerId }, idempotencyKey) =>
+        journal.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
+      sendAck: ({ id }) => { acks.push(id); return true; },
+      sendRejected: ({ id }) => { rejects.push(id); return true; },
+    });
+    const budget = new InboundRetentionBudget({
+      maxMessagesPerSession: 1, maxBytesPerSession: 1,
+      maxMessagesPerProcess: 1, maxBytesPerProcess: 1,
+    });
+    const tokens = new Map<string, ReturnType<InboundRetentionBudget["createSessionToken"]>>();
+    const sessionToken = (peer: string) => {
+      let token = tokens.get(peer);
+      if (!token) { token = budget.createSessionToken(); tokens.set(peer, token); }
+      return token;
+    };
+    const debouncer = createBoundedInboundDebouncer<any>({
+      debounceMs: 0,
+      buildKey: (item: any) => item.peerId,
+      sessionToken,
+      budget,
+      measure: () => 1,
+      getId: (item: any) => item.message.id,
+      isOverflowClaimed: (peer, id) => resolver.hasActiveClaim(ACCOUNT, `${peer}:${id}`),
+      peekOutcome: (peer, id) => outcomeStore.peek(ACCOUNT, `${peer}:${id}`),
+      onKnownOutcome: (_peer, id, outcome) => {
+        if (outcome === "overloaded") rejects.push(id);
+        else acks.push(id);
+      },
+      onOverflow: ({ key: peer, id }) => {
+        resolver.tryStart({
+          accountId: ACCOUNT, peerId: peer, key: `${peer}:${id}`, id: id!,
+          sessionToken: sessionToken(peer),
+        });
+      },
+      onFlush: createIngressOnFlush<any>({
+        accountId: ACCOUNT,
+        outcomeStore,
+        beginBatch: () => ({
+          offer: (message: any, reservation: any) => {
+            reservation?.transfer("pending");
+            return {
+              status: "accepted" as const,
+              commit: () => { dispatched.push(message.text); reservation?.release(); },
+              rollback: () => reservation?.release(),
+            };
+          },
+          finish: vi.fn(),
+        }),
+        sendAck: (_peer, ids) => { acks.push(...ids); return true; },
+        sendInboundRejected: (_peer, ids) => { rejects.push(...ids); return true; },
+        deliveryJournal: journal,
+        logWarn: () => {},
+      }),
+    });
+    const replay = () => debouncer.push({
+      peerId: PEER, message: { type: "user_message", text: "hello", id: "u-1" },
+    });
+    return { journal, budget, debouncer, replay, acks, rejects, dispatched };
+  };
+
+  it("stays silent through BOTH replays while retention is still full", async () => {
+    const chain = await buildChain();
+    try {
+      const blocker = chain.budget.tryReserve(chain.budget.createSessionToken(), 1, "pending");
+      if (blocker.status !== "accepted") throw new Error("unexpected blocker rejection");
+
+      // Replay 1 overflows into the resolver, which declines to answer.
+      expect(chain.replay()).toMatchObject({ status: "overflow" });
+      await tick(); await tick();
+
+      // Replay 2, with the budget STILL full. Before round 4 this one was acked
+      // by the fast path off the hot entry replay 1's lookup had just warmed.
+      expect(chain.replay()).toMatchObject({ status: "overflow" });
+      await tick(); await tick();
+
+      expect(chain.acks).toEqual([]);
+      expect(chain.rejects).toEqual([]);
+      expect(chain.journal.read(PEER)).toEqual([]);
+      blocker.reservation.release();
+    } finally {
+      chain.debouncer.dispose();
+      chain.journal.close();
+    }
+  });
+
+  it("and once retention frees, the replay is journaled, dispatched and acked", async () => {
+    const chain = await buildChain();
+    try {
+      const blocker = chain.budget.tryReserve(chain.budget.createSessionToken(), 1, "pending");
+      if (blocker.status !== "accepted") throw new Error("unexpected blocker rejection");
+      expect(chain.replay()).toMatchObject({ status: "overflow" });
+      await tick(); await tick();
+      expect(chain.journal.read(PEER)).toEqual([]);
+
+      blocker.reservation.release();
+      expect(chain.replay()).toEqual({ status: "accepted" });
+      await tick(); await tick();
+
+      // The message the marker said was already accepted is finally in the SSOT,
+      // answered, and acked once — by the flush path, the only reader with the
+      // journal. Acked BARE: this client sent no `random_id` to key an echo by.
+      expect(chain.journal.read(PEER).map((row) => row.event)).toEqual([
+        { kind: "user", id: "webchannel-user-1", text: "hello", turnId: "u-1" },
+      ]);
+      expect(chain.dispatched).toEqual(["hello"]);
+      expect(chain.acks).toEqual(["u-1"]);
+      expect(chain.rejects).toEqual([]);
+    } finally {
+      chain.debouncer.dispose();
+      chain.journal.close();
+    }
+  });
+});

@@ -114,10 +114,12 @@
   replay inside the window — and it cannot be repaired after the fact, because
   the two cases are indistinguishable in the old marker.
 
-  The same rule applies at the second door — the path a message takes when the
-  server is too busy to hold its raw frame. That one used to acknowledge the lost
-  message, which stopped the sending device from retrying it at all; it now stays
-  silent, so the message comes back and is answered on a later attempt. Messages
+  The same rule now applies wherever that marker is read, not just in the accept
+  path. Two other places used to answer for it — the busy-server path that runs
+  when a message's raw frame cannot be held, and a fast path that replies from an
+  in-memory cache before the message is even queued. Both acknowledged the lost
+  message, which stopped the sending device retrying it at all; both now stay out
+  of it, so the message comes back and is answered on a later attempt. Messages
   from older clients that send no idempotency token are recovered as well, and an
   operator log line that always blamed backpressure now names the verdict that
   actually applied.

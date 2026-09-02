@@ -672,12 +672,21 @@ count and byte budget like any other message while pending.
 - wrap three process-wide accepted/overloaded/cancelled persistent dedupe
   instances behind the account-namespaced tri-state `IngressOutcomeStore` API;
 - expose a synchronous process-wide 2,048-entry/2-MiB hot index containing
-  accepted and durable-overloaded outcomes for pre-debounce classification;
-- record exactly one selected outcome per fresh id and make overload win if an
-  impossible dual marker is observed;
+  accepted, durable-overloaded and cancelled outcomes for pre-debounce
+  classification (#344 added `cancelled`). ⚠️ Only the two REFUSALS are
+  classifiable there: since #344 the debouncer's short-circuit ignores an
+  `accepted` peek, because deciding one needs the delivery journal and only the
+  flush path has it — see THE READER RULE on `OutcomeLookup` in
+  `ingress-outcome.ts`;
+- record exactly one selected outcome per fresh id, and if an impossible dual
+  marker is observed let the STRONGEST SUPPRESSION win — `OUTCOME_PRECEDENCE` is
+  `cancelled` → `overloaded` → `accepted` since #344, so this is no longer
+  "overload wins": killed text must not be reclassified as backpressure;
 - turn `onDiskError` epochs into conservative `unknown` lookup results;
-- report record durability and forget a memory-only overload before returning
-  `unknown`, so callers cannot publish a non-durable terminal rejection;
+- report record durability and forget a memory-only marker for EITHER refusal
+  before returning `unknown` (#344 extended this from `overloaded` to `cancelled`
+  too), so callers cannot publish a non-durable terminal rejection and a
+  suppression cannot be lost on restart;
 - retain failed receipt rollbacks in one bounded process-wide 2,048-entry/2-MiB
   exact-marker quarantine; retry cleanup before hot/cold classification and
   poison the process store fail-closed if recovery metadata cannot fit;

@@ -27,6 +27,17 @@ import {
  *                  `inbound_rejected`.
  */
 export type IngressOutcome = "accepted" | "overloaded" | "cancelled";
+
+/**
+ * The outcomes ANY reader may turn into a result on its own — see THE READER
+ * RULE on `OutcomeLookup` below. Both are refusals, and no journal fact can
+ * change a refusal, so they need no journal to be acted on.
+ *
+ * Used as a TYPE, not just documentation: the debouncer's known-outcome
+ * short-circuit is typed by it, so "the fast path decided an `accepted`" cannot
+ * be written down.
+ */
+export type IngressRefusal = Exclude<IngressOutcome, "accepted">;
 export type IngressOutcomeFailureCategory =
   | "lookup-overloaded"
   | "lookup-accepted"
@@ -45,13 +56,13 @@ export type IngressOutcomeFailureCategory =
   | "rollback-recovery-cancelled"
   | "rollback-recovery-poisoned"
   | "adapter-lookup"
-  // ⚠️ NO `adapter-record-cancelled` SIBLING, DELIBERATELY. These three name a
-  // record whose ADAPTER THREW, and they exist because `ingress-dedupe.ts`
-  // reports that through `warnOutcomeFailure`. Its `cancelled` record — the
-  // cancelled-inbound fallback branch, the only one in this package that catches
-  // a throw — has its own dedicated line ("cancelled-inbound fallback outcome
-  // retry failed"), so a fourth category here would have no emitter. Add it the
-  // day a call site needs it, not for the shape of the list.
+  // ⚠️ NO `adapter-record-cancelled` SIBLING, DELIBERATELY — and the reason is
+  // "no emitter", not "no other caller". These three name a record whose ADAPTER
+  // THREW, and they exist because some call site routes that throw into
+  // `warnOutcomeFailure`. No `cancelled` call site does: each one already handles
+  // its own throw another way (a dedicated log line, or a catch that leaves the
+  // retry to the fallback tombstone). So a fourth category here would be dead
+  // surface. Add it the day a call site actually reports through this sink.
   | "adapter-record-accepted"
   | "adapter-record-overloaded";
 export type IngressOutcomeFailureWarning = (
@@ -65,28 +76,43 @@ export type IngressOutcomeFailureWarning = (
  * its marker through the SDK store the moment it is called, and the accept
  * seam's journal row is written later, so a crash — or any build that recorded
  * markers before the journal existed — can leave a marker with no row. The
- * journal is the authority on that disagreement, and BOTH readers of this result
- * apply it: `ingress-dedupe.ts`'s found/accepted branch RE-ADMITS when the row is
- * missing, and `inbound-overflow-resolver.ts`'s accepted arm PUBLISHES NOTHING
- * (it can only report a verdict, so withholding one leaves the client's ledger
- * entry intact for the seam to take).
+ * ⭐ THE READER RULE — THE ONE STATEMENT, CITED FROM EVERYWHERE ELSE.
  *
- * ⚠️ THE CENSUS IS THE CLAIM, AND IT WAS WRONG FOR A ROUND. This used to end "a
- * caller that treats this result as a terminal accept without the same check is
- * reintroducing #344" — while the PR that wrote the sentence still shipped
- * exactly such a caller in the resolver. So: any NEW reader owes the same check,
- * and the two above are the complete set today. Grep before adding a third —
- * `outcomeStore.lookup(` and `peek(` are the entry points.
+ *   `accepted` IS NOT A VERDICT. It records that a message was admitted for a
+ *   turn; whether that admission SURVIVED is a fact only the delivery journal
+ *   holds. So the flush path's found/accepted branch (`ingress-dedupe.ts`) — the
+ *   only reader that has the journal — is the only reader that may turn an
+ *   `accepted` outcome into a result: row present ⇒ re-ack with the `committed`
+ *   echo, row absent ⇒ RE-ADMIT. Every other reader treats `accepted` as NOT
+ *   MINE TO DECIDE and passes the item on so it reaches that branch.
+ *
+ *   The two refusals are the opposite. `overloaded` and `cancelled` are
+ *   decidable ANYWHERE (`IngressRefusal` above), because no journal fact can
+ *   change them.
+ *
+ * ⚠️ WRITE THE RULE, NOT A CENSUS — twice now a list of "the readers that apply
+ * this" shipped in the same change as a reader it omitted. Round 2's census
+ * missed `inbound-overflow-resolver.ts`; round 3's replacement census missed the
+ * debouncer's `peekOutcome`/`onKnownOutcome` fast path, and even printed the grep
+ * that finds it. A rule holds for readers nobody has enumerated; a list is stale
+ * the moment it is written.
+ *
+ * ⚠️ AND THE FAST PATH IS WHY THE RULE HAS TO BE UNIFORM RATHER THAN PER-SITE.
+ * A reader that merely declines to answer does not thereby preserve the message:
+ * `lookupUnlocked` WARMS THE HOT CACHE on its found path (and so does
+ * `write.commit()`), and `peek` reads that cache. So the overflow resolver's
+ * silent return left the next replay to be acked away by the debouncer before it
+ * could reach `onFlush` — two readers with opposite rules, and the weaker one
+ * ran first. Both now defer, which is what makes the silence mean anything.
  *
  * ⚠️ AND THAT IS EXACTLY WHY `cancelled` IS ITS OWN OUTCOME. "Marker present,
  * no journal row" has two producers with OPPOSITE required handling: the crash
  * window (re-admit) and a `/stop` suppression (drop). While both recorded
  * `accepted`, the accept seam could not tell them apart and re-ran killed text —
  * the round-1 defect on this slice. Read the outcome, not the row, to decide
- * WHICH question to ask; ask the journal for a VERDICT only on `accepted`. (Both
- * readers still LOOK UP the row on `cancelled`, but only to carry the
- * `committed` echo for a message that was journaled before the `/stop` landed —
- * the row never changes the cancelled verdict.)
+ * WHICH question to ask. (A journal-holding reader still LOOKS UP the row on
+ * `cancelled`, but only to carry the `committed` echo for a message that was
+ * journaled before the `/stop` landed — the row never changes that verdict.)
  */
 export type OutcomeLookup =
   | { status: "found"; outcome: IngressOutcome }
@@ -359,13 +385,22 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
         //
         // For `cancelled` it IS a change (#344 round 3), stated rather than
         // hidden: while a cancellation was spelled `accepted` it inherited, and
-        // now it pins. That is sound because `record()` above fails a faulted
-        // `cancelled` write CLOSED, so no memory-only cancelled marker can be
-        // created in the first place — every cancelled hot entry originates
-        // "durable" here or in `write.commit()`, and by induction stays durable.
-        // Which is also why the three cancellation writers do NOT check
-        // `durability`: the check would be provably inert, and a dead guard reads
-        // as a live one to the next person.
+        // now it pins. It is sound because `record()` above fails a faulted
+        // `cancelled` write CLOSED and deletes the marker the SDK had already
+        // inserted, so no `recorded` receipt for `cancelled` is ever memory-only
+        // — which is why the three cancellation writers do NOT check
+        // `durability`: that check would be inert, and a dead guard reads as a
+        // live one to the next person.
+        //
+        // ⚠️ NOT "no memory-only cancelled marker can exist" — that was the round
+        // 3 wording and it over-claimed. The compensating `store.forget(...)` in
+        // that arm is best-effort (`catch { /* recovery is retry */ }`), so a
+        // throw there leaves the SDK's IN-MEMORY cancelled marker alive, and a
+        // later `lookupUnlocked` finds it and stamps it `durable` here. Harmless
+        // today, precisely and only because nothing gates on cancelled
+        // durability and the fallback tombstone — not the marker — is what
+        // carries the suppression until a durable write lands. A future gate on
+        // it would have to close this hole first.
         const existing = hot.get(hotKey(accountId, key));
         putHot(
           accountId,

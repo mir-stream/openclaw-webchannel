@@ -131,6 +131,20 @@
   flush path to admit, journal and answer. It also carries the `committed` echo
   when a row does exist, which that arm never did.
 
+- **…and so does the debouncer's known-outcome fast path (#344).** Withholding a
+  verdict only preserves a replay if every reader withholds it.
+  `outcomeStore.lookup()` warms the process hot cache on its found path (so does
+  `write.commit()`), and `bounded-inbound-debouncer.ts`'s `peekOutcome`
+  short-circuit reads that cache *before* charging retention — so the replay the
+  resolver had just declined to answer was acked away there instead, and never
+  reached `onFlush`, the journal, or the found branch. The short-circuit now
+  fires only for a refusal: `onKnownOutcome` and the `known-outcome` push result
+  are typed `IngressRefusal` (`Exclude<IngressOutcome, "accepted">`), so a
+  fast-path decision on `accepted` no longer typechecks. The cost is one flush
+  for a genuine accepted replay. This is now one rule with one statement — THE
+  READER RULE, on `OutcomeLookup` in `ingress-outcome.ts`: only the flush path
+  holds the journal, so only it may turn an `accepted` outcome into a result.
+
 - **The accept seam's journal question covers older clients too (#344).** The
   lookup is keyed by `randomId ?? wireId` — the dedupe key's body, which is
   exactly what `appendInboundUser` stores as `idempotency_key` — instead of
