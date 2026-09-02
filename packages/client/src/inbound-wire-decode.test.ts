@@ -148,6 +148,11 @@ describe("#246 half A — decodeInboundMessage: the durable frames", () => {
     refuses({ type: "turn_snapshot", turnId: "t1", answers: [{ id: "a1" }] });
     refuses({ type: "turn_snapshot", turnId: "t1", answers: "a1" });
     refuses({ type: "turn_snapshot", turnId: "t1", remove: [7] });
+    // An EMPTY id or remove entry is refused at the door: `applyTurnSnapshot`
+    // would filter it out and then report the frame as folded, advancing the
+    // cursor past content it dropped (round-3 review).
+    refuses({ type: "turn_snapshot", turnId: "t1", answers: [{ id: "", text: "final" }] });
+    refuses({ type: "turn_snapshot", turnId: "t1", remove: [""] });
     // An empty seal is an accepted no-op, not a malformed frame.
     accepts({ type: "turn_snapshot", turnId: "t1" });
   });

@@ -391,7 +391,7 @@ export function journalEventForOutbound(
       // non-empty turnId, non-empty string text. The reason to track it is that
       // both margins are expensive: journaling a frame the client REFUSES puts a
       // message in history that live never rendered (N8, gaining), and refusing
-      // one the client ACCEPTS loses delivered content (N10).
+      // one the client ACCEPTS loses delivered content (N8, losing).
       //
       // The one difference, stated rather than glossed: the client's `!msg.id`
       // is a TRUTHINESS test, so it would accept a truthy NON-STRING id (`7`,

@@ -2060,7 +2060,10 @@ export class WebChannelNATSClient {
    * until the canonical `seal` is re-served), while a snapshot with nothing to
    * seal and nothing to remove is ACCEPTED (`true` — an empty seal is a real,
    * foldable no-op; refusing it would buy a `get_difference` round-trip to
-   * re-fetch a row that changes nothing).
+   * re-fetch a row that changes nothing). "Nothing" means the wire arrays were
+   * absent or empty: the door (`decodeInboundMessage`) refuses an empty answer
+   * id or remove entry, so the filters below cannot reduce a frame that carried
+   * content to this early return.
    */
   private applyTurnSnapshot(msg: InboundMessage): boolean {
     const turnId = msg.turnId;
@@ -3545,8 +3548,11 @@ export class WebChannelNATSClient {
     // and not a regression: before this `finally` the same throw wedged the
     // stream permanently.) The drain below then re-dispatches the buffered
     // frames, the first still-gapped one re-requests with a fresh retry budget,
-    // and the stream heals on the next reply. Pinned by "a fold that throws
-    // cannot wedge gap-sync" in `nats-client-wrapper-gap-sync.test.ts`.
+    // and the stream heals on the next reply — for a TRANSIENT throw; a
+    // deterministic one re-requests the same range each round, which is the
+    // pre-existing shape of any reply that fails to close a gap. Pinned by "a
+    // fold that throws cannot wedge gap-sync" in
+    // `nats-client-wrapper-gap-sync.test.ts`.
     try {
       for (const { seq, event } of events) {
         // Fold everything the request asked for (`seq > floor`); a `seq <= floor`

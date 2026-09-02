@@ -180,14 +180,27 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
 }
 
-/** `Array<{id: string; text: string}>` — the `answers` shape of a seal/turn_snapshot. */
+/**
+ * `Array<{id: string; text: string}>` — the `answers` shape of a seal/turn_snapshot.
+ * The id must be NON-EMPTY: `applyTurnSnapshot` filters an empty one out before
+ * its "nothing to fold" early return, so an empty-id entry accepted here would be
+ * dropped AND counted as folded — the one refusal the door and the folder must
+ * not disagree on (round-3 review of #246 half A). The plugin mints every id
+ * (`message-adapter.ts` `nextMessageId()`), so no legitimate frame carries one.
+ */
 function isAnswerArray(value: unknown): boolean {
   return (
     Array.isArray(value) &&
     value.every(
-      (entry) => isRecord(entry) && isString(field(entry, "id")) && isString(field(entry, "text")),
+      (entry) =>
+        isRecord(entry) && isNonEmptyString(field(entry, "id")) && isString(field(entry, "text")),
     )
   );
+}
+
+/** `string[]` with no empty member — the `remove` shape (same rule as `isAnswerArray`). */
+function isNonEmptyStringArray(value: unknown): boolean {
+  return Array.isArray(value) && value.every((entry) => isNonEmptyString(entry));
 }
 
 const invalid = (type: KnownInboundType, reason: string): InboundDecodeResult => ({
@@ -207,9 +220,9 @@ const accept = (raw: Record<string, unknown>): InboundDecodeResult => ({
  * reading what the PRODUCER can emit and what the CONSUMER already tolerates —
  * not by applying "required in the type ⇒ required here" uniformly. Both margins
  * cost something real: refusing a frame the plugin legitimately sends drops
- * delivered content (N8) or buys a needless `get_difference` round-trip per
- * frame, while accepting a shape the handler cannot express lets a malformed
- * value into the view (N8). The per-`case` notes below record which way each
+ * delivered content (N8, losing) or buys a needless `get_difference` round-trip
+ * per frame, while accepting a shape the handler cannot express lets a malformed
+ * value into the view (N8, gaining). The per-`case` notes below record which way each
  * field went and why.
  */
 export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
@@ -321,11 +334,13 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
     case "turn_snapshot": {
       // `turnId` is the key the seal folds on — `applyTurnSnapshot` refuses an
       // empty one, so refusing it here is the same rule at the door. `answers`
-      // and `remove` are checked as SHAPES only where present: the handler's own
-      // filters (non-empty answer ids, duplicate-id dedupe) are content rules and
-      // stay there. Absence is tolerated because the handler tolerates it — an
-      // answer-less, remove-less snapshot is an accepted no-op, not a malformed
-      // frame.
+      // and `remove` are checked as shapes where present, and an EMPTY id or
+      // remove entry is a shape failure here too: the handler filters those out
+      // silently, and a frame filtered down to nothing would otherwise be counted
+      // as folded (cursor advanced) with its content dropped. Duplicate-id dedupe
+      // stays with the handler. Absence is tolerated because the handler
+      // tolerates it — an answer-less, remove-less snapshot is an accepted no-op,
+      // not a malformed frame.
       if (!isNonEmptyString(field(raw, "turnId"))) {
         return invalid(known, "turnId must be non-empty");
       }
@@ -334,7 +349,7 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
         return invalid(known, "answers must be an array of {id, text}");
       }
       const remove = field(raw, "remove");
-      if (remove !== undefined && !isStringArray(remove)) {
+      if (remove !== undefined && !isNonEmptyStringArray(remove)) {
         return invalid(known, "remove must be an array of strings");
       }
       return accept(raw);

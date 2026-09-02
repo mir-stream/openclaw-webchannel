@@ -815,7 +815,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
       request: { before?: string; beforeTurnId?: string; limit?: number },
     ): void {
       // PURE, so it stays on the dispatch turn: `planHistoryFetch` validates the
-      // wire `limit` (the NATS dispatch's decoder checks only that it is a
+      // wire `limit` (the NATS receive door's decoder checks only that it is a
       // number or absent — #246 half A — and forwards every other question
       // here: range, finiteness, flooring) and picks paginate-vs-tail from
       // `before`, carrying `beforeTurnId` into
