@@ -152,6 +152,6 @@ describe("public export surface (package entry)", () => {
   });
 
   it("re-exports the wire-protocol version constant", () => {
-    expect(WEBCHANNEL_PROTOCOL_VERSION).toBe(3);
+    expect(WEBCHANNEL_PROTOCOL_VERSION).toBe(4);
   });
 });

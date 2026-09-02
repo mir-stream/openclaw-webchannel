@@ -689,11 +689,17 @@ describe("#245 Part B — the multi-device user_committed broadcast", () => {
     expect(w.lastAppliedSeq).toBe(5);
   });
 
-  it("an OLDER client with no user_committed handling is unaffected (frame ignored, gap-sync converges)", () => {
-    // Simulate an older wrapper: user_committed is not in ITS seq-bearing set and
-    // not in ITS frame switch, so it neither advances the cursor nor folds. Here we
-    // just never deliver it (the older client would drop it) and confirm the stream
-    // still converges through the gap path — the additive-frame back-compat claim.
+  it("a user_committed that never arrives still converges through gap-sync (at-most-once drop)", () => {
+    // The frame is never delivered — which is what an at-most-once core-NATS drop
+    // looks like from the wrapper's side: no cursor advance, no fold, no signal.
+    // Confirm the stream still converges through the gap path.
+    //
+    // ⚠️ THIS USED TO BE NAMED FOR AN "OLDER CLIENT" AND IT IS THE SAME TEST, ONLY
+    // HONESTLY LABELLED. #246 took the wire to v4 with an exact-match register
+    // gate, so a client that does not handle `user_committed` is REFUSED and is no
+    // longer a reachable peer; the behaviour pinned here is not back-compat but the
+    // at-most-once guarantee (`channel-contract.ts`'s `user_committed` docblock),
+    // which is why it is still worth pinning. Do not delete it as "dead compat".
     const { w, getDifference } = spied();
     w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
     w.handleMessage({ type: "agent_message", id: "a3", text: "answer 3", turnId: "t1", seq: 3 });

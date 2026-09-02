@@ -138,8 +138,7 @@ buffered and coalesced into a single turn keyed by the last of them. The current
 plugin emits one same-outcome `turn_settled` per coalesced member, in arrival
 order with the anchor last; the client promotes the exact receipt each frame
 names. A settle also closes the turn it names **and every turn published before
-it**. That prefix sweep remains for older anchor-only v3 plugin builds and for
-lost/missing earlier member frames. Both outcomes
+it**. That prefix sweep remains for lost/missing earlier member frames. Both outcomes
 sweep, as does an outcome-less legacy settle; sweeping turn activity never
 fabricates a receipt outcome.
 
@@ -259,10 +258,12 @@ unsupported.
 **Coalesced receipts:** a burst still has one ANCHOR (the last member, used by
 draft and answer frames), but the current plugin emits a `turn_settled` for every
 member with the same outcome, anchor last. The client promotes only the exact
-`turnId === wireId` match, so all member receipts resolve. Older anchor-only v3
-plugin builds leave non-anchor receipts at
-`accepted`; the turn-activity prefix sweep closes their indicators without
-inventing receipt success.
+`turnId === wireId` match, so all member receipts resolve. (Historically,
+plugin builds before `0.5.0`, where per-member `turn_settled` shipped, left
+non-anchor receipts at `accepted`, and the turn-activity prefix sweep closed
+their indicators without inventing receipt success. Those builds speak protocol
+v3 or older, which a v4 client refuses, so that path is no longer reachable; the
+sweep remains for lost or missing member frames.)
 
 **Answer-delivery vs turn outcome:** if the agent's final answer frame fails to
 send but the turn itself settled without error, the message still reaches
@@ -294,7 +295,8 @@ becomes `failed { reason: "overloaded", retryable: true }`; retry is a deliberat
 caller/user action and creates a new id. Before either ACK or rejection arrives,
 the client reliability layer replays the same id live with capped exponential
 backoff, as well as immediately on reconnect. Client and plugin must be upgraded
-together — the wire protocol is now **v3**.
+together — the wire protocol is now **v4** (v3 in `0.4.0`, the register hop
+described below; v4 in #246 — see the CHANGELOG).
 
 ### BREAKING: protocol v3 register hop
 
@@ -315,8 +317,8 @@ See [`../../docs/AUTH.md`](../../docs/AUTH.md) for the reasoning.
 The boolean `delivered` is gone. Migration: `delivered === true` ↔
 `sendState === "accepted" || sendState === "completed"`; render a failure from
 `sendState === "failed"` + `sendFailure`. `openclaw-webchannel-client` and
-`openclaw-webchannel` ship in lockstep — upgrade both together (the
-protocol v3 registration is mandatory in both directions).
+`openclaw-webchannel` ship in lockstep — upgrade both together (the register
+protocol version is mandatory in both directions, and is **v4** today).
 
 See [`../../docs/STATUS.md`](../../docs/STATUS.md) for current deployment status
 and [`../../docs/TRUST_AND_ONBOARDING.md`](../../docs/TRUST_AND_ONBOARDING.md) for

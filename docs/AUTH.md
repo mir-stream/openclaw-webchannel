@@ -10,13 +10,17 @@ no browser-facing connection or token route.
 3. The browser generates a fresh random `clientNonce` for this register attempt and
    sends it, with its JWT and proof-of-possession response, on the account-scoped
    register subject.
-4. The plugin verifies the wire protocol version, then signature, issuer, audience,
-   `clientNonce` format, and proof of possession before registering peer subjects.
+4. The plugin verifies signature, issuer, audience, and tenant/subject FIRST, then
+   the wire protocol version, then `clientNonce` format and proof of possession,
+   before registering peer subjects. The version check deliberately sits behind
+   authentication so an unauthenticated request gains no account/version oracle
+   (`nats-register.ts` carries the ordering rationale).
 5. The agent returns the conversation key wrapped to the SaaS-attested device key,
    with both the peer id and that `clientNonce` bound into the wrap AAD.
 
-The wire protocol version is **3**. Client and plugin must ship together; a
-mismatch is refused with a terminal `protocol_mismatch` (426) before any key work.
+The wire protocol version is **4** (3 → 4 in #246). Client and plugin must ship
+together; a mismatch is refused with a terminal `protocol_mismatch` (426) before
+any key work.
 
 ### Register-reply freshness (`clientNonce`)
 

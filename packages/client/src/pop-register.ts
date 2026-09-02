@@ -219,8 +219,10 @@ export class PopCapacityError extends Error {
  * third-party plugin). This is exactly the silent-break class the version
  * handshake exists to kill: without this guard the malformed value degrades to
  * `undefined` in a permissive copy-through and mask a plugin speaking an
- * unintelligible contract. Protocol v2 is mandatory: missing and wrong-typed
- * values are terminal, without coercion.
+ * unintelligible contract. The CURRENT protocol version is mandatory (it is
+ * whatever `WEBCHANNEL_PROTOCOL_VERSION` says today — do not re-number this
+ * sentence on the next bump): missing and wrong-typed values are terminal,
+ * without coercion.
  */
 export class ProtocolVersionMalformedError extends ProtocolMismatchError {
   constructor(received: unknown) {
@@ -237,7 +239,7 @@ export class ProtocolVersionMalformedError extends ProtocolMismatchError {
 /**
  * Classify a `registerWithPop` throw as TERMINAL (true) vs TRANSIENT (false).
  *
- * TERMINAL = a rejected proof/token (`PopRejectedError`), mandatory-v2 mismatch
+ * TERMINAL = a rejected proof/token (`PopRejectedError`), a protocol-version mismatch
  * (`ProtocolMismatchError`), account capacity rejection (`PopCapacityError`),
  * or non-transient server failure (`PopServerError`): redialing the same peer
  * cannot change the reply.
@@ -408,8 +410,9 @@ export async function registerWithPop(
       }
       throw new PopServerError(registerReply.code);
     }
-    // Protocol v2 is breaking and mandatory in both directions. Missing and
-    // malformed values are terminal just like a numeric mismatch.
+    // The current protocol version is mandatory in BOTH directions (see
+    // protocol.ts). Missing and malformed values are terminal just like a
+    // numeric mismatch.
     const pv: unknown = registerReply.protocolVersion;
     if (typeof pv !== "number" || !Number.isSafeInteger(pv)) {
       throw new ProtocolVersionMalformedError(pv);

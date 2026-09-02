@@ -96,9 +96,10 @@ export type HistoryTextMessage = {
  * ⚠️ IT HAS NO `role`, AND THAT IS NOT AN OVERSIGHT TO FIX. The live `reasoning`
  * frame carries none and `DurableMessage` (the reducer's SSOT shape, which this
  * mirrors) refuses to invent one — a fabricated author inside the system of
- * record is the N8 shape. The absence is also what makes the widening SAFE FOR
- * OLDER CLIENTS, which is the reason the union is shaped this way rather than
- * as an optional `role`:
+ * record is the N8 shape. The absence is ALSO what MADE the widening safe for
+ * older clients, which is the reason the union is shaped this way rather than as
+ * an optional `role` — read the SUPERSESSION note under the census before citing
+ * that half, because since #246 it is history and the N8 half is not:
  *
  *   MEASURED against the shipped client's `case "history"`
  *   (`packages/client/src/nats-client-wrapper.ts`): its per-row validation runs
@@ -122,6 +123,18 @@ export type HistoryTextMessage = {
  *   (`archive/issue-53-pre-rebase-checkpoint`, `issue-94-pr2-superseded`) are
  *   working checkpoints, not releases. 15 is the number of things a peer can
  *   actually be running. Re-derive it with `git tag --list 'v*'`, not `git tag`.
+ *
+ *   ⚠️ SUPERSEDED AS A COMPATIBILITY ARGUMENT BY #246 — KEPT AS THE RECORD OF WHY
+ *   THIS UNION IS SHAPED THIS WAY. `WEBCHANNEL_PROTOCOL_VERSION` went 3 → 4 and
+ *   both sides refuse a mismatch, so every one of those 15 tags is now REFUSED AT
+ *   REGISTER (terminal `protocol_mismatch`, 426) and none of them can receive
+ *   this row at all. The census is still TRUE, and it is still why the row was
+ *   safe to ship in #242 before that gate existed — but do not cite it as a live
+ *   back-compat guarantee, and do not "restore compatibility" by re-adding a
+ *   `role`: the N8 reason in the first paragraph is the one that still binds.
+ *   The same supersession applies verbatim to the tool and approval variants
+ *   below: each restates the census for its own row and each defers to this block
+ *   for the reasoning, so the note is written here ONCE rather than three times.
  *
  * `turnId` is REQUIRED, following the live frame (`turnId: string`) and
  * `DurableMessage`'s reasoning variant. `ts` is the same hydration metadata the
@@ -362,11 +375,19 @@ export type OutboundWsMessage =
        * frames here PLUS that echo; together they are gapless. Without the echo
        * carrying it, the first agent frame of every turn would look like a gap.
        *
-       * ADDITIVE AND OPTIONAL: older clients ignore it, and a frame whose journal
-       * append was refused or failed — or a non-durable frame (a live reasoning
-       * DRAFT, an id-less `agent_message`) — ships WITHOUT it (the client
-       * tolerates the absence). Half A only EXPOSES the field — nothing consumes
-       * it yet.
+       * OPTIONAL ON THE WIRE, AND STILL SO: a frame whose journal append was
+       * refused or failed — or a non-durable frame (a live reasoning DRAFT, an
+       * id-less `agent_message`) — ships WITHOUT it, and the client tolerates the
+       * absence.
+       *
+       * ⚠️ TWO CLAIMS THAT USED TO SIT HERE ARE BOTH DEAD. "Half A only EXPOSES
+       * the field — nothing consumes it yet" ended with #244 half B: the client
+       * tracks `lastAppliedSeq` off this field and fires `getDifference` on a gap
+       * (`nats-client-wrapper.ts`). And "older clients ignore it" is no longer a
+       * back-compat guarantee worth stating — #246 took the wire to v4 under an
+       * exact-match register gate, so a client that ignores `seq` cannot connect.
+       * Optionality is now about which FRAMES carry it, not about which PEERS
+       * read it.
        */
       seq?: number;
     }
@@ -483,8 +504,10 @@ export type OutboundWsMessage =
    * mis-routed final top-up. `remove` names the bubble ids the plugin KNOWS it
    * mis-routed answer content onto (overflow independents; recovery blocks whose
    * lane is now in `answers`). The client replaces ONLY these — every other
-   * turn agent bubble (notices, errors, adopted history) is preserved. Additive
-   * and safely ignorable by an old client (no protocol bump).
+   * turn agent bubble (notices, errors, adopted history) is preserved. It shipped
+   * in 0.7.0 as additive and safely ignorable by an old client, under protocol v3
+   * and with no bump; #246 has since taken the wire to v4, so "an old client
+   * ignores it" no longer describes a peer that can connect.
    */
   | {
       type: "turn_snapshot";
@@ -509,8 +532,14 @@ export type OutboundWsMessage =
        * `seq` and the client can tell a contiguous stream from a gap against this
        * number. Populated only on the register-time SNAPSHOT (`history-serve.ts`'s
        * `sendSnapshot`); a `load_history` PAGE serves OLDER rows and carries no
-       * high-water. ADDITIVE AND OPTIONAL — older clients ignore it, and half A
-       * only exposes it (no client consumes it yet).
+       * high-water — which is why it stays optional on the wire. It is NOT
+       * optional for the peer: since #244 half B the client seeds its cursor from
+       * this field — in `nats-client-wrapper.ts`'s `handleMessage` POST-DISPATCH
+       * block, which runs after `case "history"` has hydrated and says so, NOT in
+       * the case arm itself — and since #246's
+       * v4 exact-match gate a client that ignores it cannot connect. The old
+       * "additive and optional — older clients ignore it, and half A only exposes
+       * it" reading is dead on both halves.
        */
       highWaterSeq?: number;
     }
@@ -521,10 +550,13 @@ export type OutboundWsMessage =
       /**
        * #243 half 2a (doc §16.2-1): the durable user messageId the SERVER minted
        * for each fresh admission, and the SAME id re-echoed for a deduped retry,
-       * keyed by the client `random_id`. Additive and optional — an older client
-       * that only reads `ids` is unaffected, and the CURRENT client IGNORES it
-       * (adoption is half 2b; `drainAcked` still keys on `ids`). It rides `ack`
-       * because that frame already reports per-id acceptance; see `IngressResultFrame`.
+       * keyed by the client `random_id`. ⚠️ "The CURRENT client IGNORES it
+       * (adoption is half 2b)" WAS TRUE AND NO LONGER IS — half 2b landed, and the
+       * client adopts its optimistic bubble onto `messageId` off this array
+       * (`nats-client-wrapper.ts`). Nor is "an older client that only reads `ids`
+       * is unaffected" a live guarantee: #246's v4 exact-match gate refuses such a
+       * peer. It rides `ack` because that frame already reports per-id acceptance;
+       * see `IngressResultFrame`.
        *
        * #244 half A: each entry now also carries the user message's per-conversation
        * `seq`. The inbound user turn-opener consumes a seq (`appendInboundUser`,
@@ -532,7 +564,10 @@ export type OutboundWsMessage =
        * without this the client would see the turn's first agent frame at seq N
        * while holding last-applied N-2 — a phantom gap on every turn (doc §16.2-6).
        * This ack echo is the user seq's only carrier. A deduped retry echoes the
-       * SAME first-admission seq. Still ignored by the current client in half A.
+       * SAME first-admission seq. ⚠️ "Still ignored by the current client in half
+       * A" IS STALE: half B consumes it — `advanceCursor(entry.seq)` per entry in
+       * the wrapper's `ack` arm. (`adoptCommittedIds` alone still ignores `seq`;
+       * that is one call site, not the frame.)
        */
       committed?: Array<{ random_id: string; messageId: string; seq: number }>;
     }
@@ -561,11 +596,17 @@ export type OutboundWsMessage =
    * its optimistic bubble onto this `id` by matching `random_id` (the same
    * correlation `ack.committed`/#337 use) and then folds a no-op — ONE bubble. A
    * non-origin device has no linkage for this `random_id`, so the adopt is a
-   * no-op and it APPENDS the user event. Absent for an older (non-`random_id`)
-   * client's send. ADDITIVE — an older client that does not know this type drops
-   * it (not in its seq-bearing set / frame switch), and the gap-sync fallback
-   * still converges the user event when the next agent frame opens a gap; the
-   * broadcast is at-most-once and purely an IMMEDIACY optimization over that path.
+   * no-op and it APPENDS the user event. Absent for a send that carried no
+   * `random_id`.
+   *
+   * ⚠️ THE GAP-SYNC FALLBACK IS NOT A BACK-COMPAT STORY — IT IS THE AT-MOST-ONCE
+   * STORY, which is why #246's v4 bump leaves it standing. This broadcast rides
+   * core NATS pub/sub, so it can simply be DROPPED en route to a fully current
+   * device; when it is, the next agent frame opens a gap and `get_difference`
+   * converges the user event anyway. The broadcast is purely an IMMEDIACY
+   * optimization over that path. (It read as "an older client that does not know
+   * this type drops it" before v4; under exact-match there is no such peer — the
+   * property is unchanged, only the reason for it.)
    */
   | { type: "user_committed"; id: string; text: string; turnId?: string; seq: number; random_id?: string }
   /**

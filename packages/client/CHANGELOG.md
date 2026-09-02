@@ -1,5 +1,41 @@
 # Changelog — openclaw-webchannel-client
 
+## Unreleased
+
+### Breaking (wire protocol v4)
+
+- **`WEBCHANNEL_PROTOCOL_VERSION` goes 3 → 4 (#246).** The exported constant
+  changes value; no client API changes. The client sends it on the register
+  request and requires it on the register reply, both already exact-match and
+  both already terminal (`pop-register.ts`), so this release adds no new gate —
+  it changes the number those gates compare against. Against a `0.7.0` (v3)
+  agent this client now fails with a terminal `protocol-mismatch` and no re-auth
+  affordance, instead of connecting. Upgrade the gateway plugin and the browser
+  bundle together.
+
+  **Why this is a bump and not another additive frame.** The v6 frames stayed
+  safely ignorable for RENDERING and are not for CORRECTNESS. A `0.7.0` browser
+  also declares `3`, so it passed the old gate and then ignored the durable
+  `seq` and the `get_difference`/`difference` gap-sync (#244), `user_committed`
+  (#245), the `reasoning`/`tool`/`approval` `history` rows (#242), and
+  `ack.committed[]` (#243). The transport is core NATS pub/sub — at-most-once,
+  no retention — so a browser with no `seq` cannot detect a dropped frame and
+  never asks for the heal. Its transcript is then invisibly wrong. What reaches
+  it unasked — the history snapshot requested on every successful register, a
+  `turn_snapshot` at the end of a streamed turn — is incidental, not a repair
+  path: it rides the same at-most-once transport and nothing aims it at the
+  hole. The browser also drops role-less `history` rows, which stalls "load
+  older" forever once the agent has `capabilities.reasoningDurable` on
+  (**#309**, closed by this).
+
+  **No capability negotiation was added.** Under an exact-match gate every peer
+  is at this exact version, so there is nothing to withhold per peer, and the one
+  frame shape that would need it — a live delete/edit — is not on this wire
+  (`messageDeleted`/`messageEdited` are durable event kinds with no producer).
+  `protocol.ts` carries v4 as the second worked example under "When to bump", and
+  the next slice that adds a frame an equal-version peer must act on decides
+  bump-vs-negotiate there.
+
 ## 0.7.0
 
 ### Added
