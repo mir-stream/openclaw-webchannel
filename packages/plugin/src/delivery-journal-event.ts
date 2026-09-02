@@ -493,7 +493,7 @@ export function journalEventForOutbound(
       // The admission rule tracks the client's `case "tool_activity"` exactly —
       // non-empty string `id` and `turnId`, and `argKeys` filtered to strings —
       // so nothing is journaled that the client refuses (N8, gaining) and
-      // nothing the client accepts is dropped (N10).
+      // nothing the client accepts is dropped (N8, losing).
       return isUsableMessageId(frame.id) && isUsableMessageId(frame.turnId)
         ? {
             kind: "tool",
@@ -582,7 +582,7 @@ export function journalEventForOutbound(
       // the payload is either enumerated (`kind`, `options[].decision`) or
       // free text the client renders as-is with no non-empty requirement (the
       // live `case "approval_request"` defaults each of them, `title: msg.title ?? ""`).
-      // Refusing a blank title here would drop a card live rendered (N10).
+      // Refusing a blank title here would drop a card live rendered (N8, losing).
       return isUsableMessageId(frame.id)
         ? {
             kind: "approval",

@@ -1496,7 +1496,7 @@ export class NatsChannel implements WebChannelPeerChannel {
       // That is BENIGN and deliberately not widened — the client's
       // `case "tool_activity"` refuses exactly the same frame, so nothing
       // rendered live is missing from history (no N8), and unlike an id-less
-      // `agent_message` there is no delivered TEXT being discarded (no N10).
+      // `agent_message` there is no about-to-be-published TEXT being discarded (no N8 loss).
       // Post-#238 the `agent_message` case is a REGRESSION detector; the tool
       // case would be an ordinary refusal, which is why it is not one.
       //
@@ -1568,7 +1568,7 @@ export class NatsChannel implements WebChannelPeerChannel {
    *    store: nothing reads it, so a failed write degrades something not yet
    *    load-bearing", and #240 half 2 ended that: the journal is now the ONLY
    *    history store. A failed append here does NOT stop the publish (the send
-   *    proceeds; since #347, with no row, a publish throw then reports `false`),
+   *    proceeds; with no row a publish throw then reports `false`),
    *    so what it costs today is a frame the peer
    *    SAW live and will not see on reconnect — live ≠ history, the exact
    *    divergence this store exists to kill. That is `error`-shaped, and

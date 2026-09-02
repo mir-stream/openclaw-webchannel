@@ -580,7 +580,8 @@ describe("journalEventForInboundUser", () => {
 
   it("does NOT bound the length of a plugin-minted agent id", () => {
     // The asymmetry is deliberate: agent ids are ours, and treating an over-long
-    // one as id-less would drop DELIVERED text from the journal (N10). Only the
+    // one as id-less would drop text about to be published from the journal (N8,
+    // losing). Only the
     // client-supplied inbound id is bounded.
     const longAgentId = "a".repeat(1_000);
     expect(
