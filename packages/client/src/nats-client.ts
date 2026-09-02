@@ -376,8 +376,10 @@ export type InboundMessage = {
    * the `get_difference` this answers — the correlation that lets a device tell
    * its own reply from another device's on the shared `.out` subject; `partial`
    * is Telegram's `differenceSlice` ("re-request from where you got to");
-   * `maxSeq` is the conversation's high-water at read time, i.e. what a
-   * non-`partial` reply says the client is now synced to. Loose here like every
+   * `maxSeq` is the highest seq the reply ACCOUNTS FOR — the client's new cursor,
+   * which on a complete reply is the conversation's high-water and on a partial
+   * one is the boundary of the window the server examined, NOT the high-water
+   * (`history-serve.ts` is the producer and owns that rule). Loose here like every
    * other field (zero-dep package; runtime discrimination in
    * `inbound-wire-decode.ts`, which REQUIRES all four on a `difference`).
    */

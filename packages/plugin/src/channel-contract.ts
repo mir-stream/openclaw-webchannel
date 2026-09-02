@@ -343,8 +343,11 @@ export type InboundWsMessage =
    * reply ECHOES `afterSeq` and `nonce` verbatim, and a device folds only a reply
    * matching its own outstanding request. Without it, device A at floor 100 folds
    * device B's reply for floor 300 and silently skips 101..300 — #351, NOT-list
-   * N8. The client mints it from `randomInboxToken()` (24 hex chars); the door
-   * decoder refuses a `get_difference` without a usable one.
+   * N8. The client mints it with `randomInboxToken()`; the door decoder refuses a
+   * `get_difference` without a usable one (non-empty, within the shared id
+   * bound), which is the whole contract — that generator falls back to
+   * `Math.random` on a host without WebCrypto, so neither its length nor its
+   * alphabet is fixed.
    */
   | { type: "get_difference"; afterSeq: number; nonce: string }
   | { type: "load_commands" };
@@ -668,10 +671,11 @@ export type OutboundWsMessage =
    *    too large to be received in one request … the query must be repeated, using
    *    the intermediate status as the current status". `true` means the server cut
    *    the list (the `MAX_DIFFERENCE_EVENTS` read cap or the `max_payload` byte
-   *    budget), so the client re-requests IMMEDIATELY from the max seq it just
-   *    folded rather than waiting for the next durable frame to re-open the gap.
-   *    A partial reply always carries at least one event, so the re-request always
-   *    moves forward.
+   *    budget), so the client re-requests IMMEDIATELY from `maxSeq` rather than
+   *    waiting for the next durable frame to re-open the gap. Forward progress
+   *    comes from `maxSeq` and from nothing else — a partial reply may carry NO
+   *    events at all, which is exactly what a window whose every row was
+   *    undeliverable ships.
    *  - `maxSeq` — THE HIGHEST SEQ THIS REPLY ACCOUNTS FOR, which is more than the
    *    seqs it carries events for. The client advances its cursor to it. On a
    *    complete reply that is the conversation's high-water at read time (what

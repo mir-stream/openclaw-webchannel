@@ -533,6 +533,246 @@ describe("#356 — partial replies (Telegram's differenceSlice)", () => {
   });
 });
 
+describe("#343/#356 — a held frame is dropped only when the reply CARRIED its seq", () => {
+  it("THE REPRO: a live bubble the reply could not carry survives the catch-up", () => {
+    // Cursor 1; the live `agent_message{seq:3}` ARRIVED (so its own send fit this
+    // peer's wire) and is held behind the gap. The reply carries seq 2 and says
+    // it covers through 3 — because the server SKIPPED row 3 as undeliverable
+    // (#343). Dropping the held frame against the CURSOR loses a bubble the user
+    // is already looking at, for the rest of the session.
+    //
+    // The band is real: a `difference` envelope around the same content measures
+    // ~121 B more than the live frame's, so a row inside that band is
+    // live-deliverable and difference-undeliverable — #343's own razor edge,
+    // arriving from the other side.
+    const { w, getDifference } = spied();
+    seed(w, 1);
+    w.handleMessage({ type: "agent_message", id: "a3", text: "answer 3", turnId: "t1", seq: 3 });
+    expect(getDifference).toHaveBeenCalledWith(1, outstandingNonce(w));
+    w.handleMessage(
+      reply(
+        w,
+        [{ seq: 2, event: { kind: "bubble", answerId: "a2", text: "answer 2", turnId: "t1" } }],
+        { maxSeq: 3 },
+      ),
+    );
+
+    // ⚠️ BOTH BUBBLES. seq 2 came from the reply; seq 3 was re-folded from the
+    // buffer because no event in the reply carried it.
+    expect(project(w).map((m) => (m as { text: string }).text)).toEqual([
+      "answer 2", "answer 3",
+    ]);
+    expect(cursorLast(w)).toBe(3);
+    expect(isCatchingUp(w)).toBe(false);
+  });
+
+  it("an INTERIOR skipped seq is not dropped either — the rule is the set, not a high-water", () => {
+    // Events [2, 4] with row 3 skipped. A last-carried-seq high-water would be 4
+    // and would drop a held frame at 3, which is the same loss one position over.
+    const { w } = spied();
+    seed(w, 1);
+    w.handleMessage({ type: "agent_message", id: "a3", text: "answer 3", turnId: "t1", seq: 3 });
+    w.handleMessage({ type: "agent_message", id: "a4", text: "answer 4", turnId: "t1", seq: 4 });
+    w.handleMessage(
+      reply(
+        w,
+        [
+          { seq: 2, event: { kind: "bubble", answerId: "a2", text: "answer 2", turnId: "t1" } },
+          { seq: 4, event: { kind: "bubble", answerId: "a4", text: "answer 4", turnId: "t1" } },
+        ],
+        { maxSeq: 4 },
+      ),
+    );
+
+    expect(project(w).map((m) => (m as { text: string }).text)).toEqual([
+      "answer 2", "answer 4", "answer 3",
+    ]);
+  });
+
+  it("a frame carried by a PARTIAL slice is not re-folded after the next one lands", () => {
+    // The buffer survives a slice boundary, so filtering it only on the final
+    // re-dispatch would let a frame the FIRST reply carried fold after the
+    // SECOND — and a `progress` is where that is visible rather than absorbed:
+    // its live handler writes the DRAFT text, so re-folding it after the durable
+    // `bubble` has landed overwrites an authored answer with a stale prefix.
+    const { w } = spied();
+    seed(w, 1);
+    // seq 9 opens the gap; the live progress for lane A (seq 5) is then held.
+    w.handleMessage({ type: "agent_message", id: "z9", text: "answer 9", turnId: "t1", seq: 9 });
+    w.handleMessage({ type: "progress", id: "A", text: "Wor", turnId: "t1", seq: 5 });
+
+    // Slice 1 carries seq 5 — the `placement` for that very lane — and stops.
+    w.handleMessage(
+      reply(
+        w,
+        [{ seq: 5, event: { kind: "placement", answerId: "A", turnId: "t1" } }],
+        { partial: true, maxSeq: 5 },
+      ),
+    );
+    expect(isCatchingUp(w)).toBe(true);
+
+    // Slice 2 authors the answer and completes the range.
+    w.handleMessage(
+      reply(w, [
+        { seq: 6, event: { kind: "bubble", answerId: "A", text: "final A", turnId: "t1" } },
+        { seq: 9, event: { kind: "bubble", answerId: "z9", text: "answer 9", turnId: "t1" } },
+      ], { maxSeq: 9 }),
+    );
+
+    // ⚠️ THE AUTHORED TEXT SURVIVES. Carried forward unfiltered, the held
+    // progress re-folds here and takes A back to "Wor".
+    const a = project(w).find((m) => (m as { id: string }).id === "A");
+    expect((a as { text: string }).text).toBe("final A");
+    expect(cursorLast(w)).toBe(9);
+  });
+
+  it("a held frame the reply DID carry is still dropped — no double-apply", () => {
+    // The property the buffer exists for, unchanged: the reply is authoritative
+    // for a row it carried, so the held copy of that same row must not re-fold.
+    const { w } = spied();
+    seed(w, 1);
+    seedOptimisticUser(w, {
+      localId: "u-0", receiptKey: "r-0", randomId: "rand-1", text: "hello", wireId: "t1",
+    });
+    w.handleMessage({ type: "agent_message", id: "a4", text: "answer 4", turnId: "t1", seq: 4 });
+    // The multi-device broadcast for the same user row arrives DURING the
+    // catch-up and is held; the reply then carries that very row.
+    w.handleMessage({
+      type: "user_committed",
+      id: "webchannel-user-2", text: "hello", turnId: "t1", seq: 2, random_id: "rand-1",
+    });
+    w.handleMessage(
+      reply(w, [
+        { seq: 2, event: { kind: "user", id: "webchannel-user-2", text: "hello", turnId: "t1", randomId: "rand-1" } },
+        { seq: 4, event: { kind: "bubble", answerId: "a4", text: "answer 4", turnId: "t1" } },
+      ]),
+    );
+
+    expect(userIds(w)).toEqual(["webchannel-user-2"]);
+    expect(project(w).map((m) => (m as { text: string }).text)).toEqual(["hello", "answer 4"]);
+  });
+
+  it("#343 — the give-up path carries nothing, so it drops nothing", () => {
+    // No reply ever landed, so "the reply already delivered it" is false of every
+    // held frame — including a repeated-seq `progress`, which the cursor ignores
+    // and the view still needs.
+    vi.useFakeTimers();
+    try {
+      const { w } = spied();
+      seed(w, 5);
+      seedOptimisticUser(w, {
+        localId: "u-0", receiptKey: "r-0", randomId: "rand-1", text: "hello", wireId: "t1",
+      });
+      w.handleMessage({
+        type: "ack",
+        ids: ["u-0"],
+        committed: [{ random_id: "rand-1", messageId: "webchannel-user-9", seq: 9 }],
+      });
+      // seq 6 opens the answer's lane, then two more draft frames REUSE seq 6
+      // (the journal dedupes `placement` on its answer id).
+      w.handleMessage({ type: "progress", id: "A", text: "Wor", turnId: "t1", seq: 6 });
+      w.handleMessage({ type: "progress", id: "A", text: "Working on it…", turnId: "t1", seq: 6 });
+      for (let i = 0; i < 4; i++) vi.advanceTimersByTime(5_000);
+
+      const draft = w.state.messages.find((m) => m.id === "A") as { text?: string } | undefined;
+      expect(draft?.text).toBe("Working on it…");
+      expect(cursorLast(w)).toBe(6);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("#356 — a seq-less frame is never held: it has no row to double-apply", () => {
+  it("a reasoning DRAFT folds during a catch-up instead of landing after the durable final", () => {
+    // Only a `final: true` reasoning frame is journaled, so a streaming draft
+    // carries NO seq. Held, it re-dispatches AFTER the reply's fold — and because
+    // a draft is CUMULATIVE, a mid-burst one then overwrites the durable final
+    // with a prefix of itself. It has no row, so no reply can re-deliver it and
+    // nothing can double-apply: it belongs on the view now.
+    const { w } = spied();
+    seed(w, 1);
+    w.handleMessage({ type: "agent_message", id: "a4", text: "answer 4", turnId: "t1", seq: 4 });
+    expect(isCatchingUp(w)).toBe(true);
+
+    // Two seq-less drafts arrive while the request is outstanding.
+    w.handleMessage({ type: "reasoning", id: "r1", turnId: "t1", text: "thinking par" });
+    const midCatchUp = w.state.messages.find((m) => m.id === "r1") as { text?: string } | undefined;
+    // ⚠️ FOLDED IMMEDIATELY, not held.
+    expect(midCatchUp?.text).toBe("thinking par");
+
+    // The reply then carries the DURABLE reasoning row, which is the full text.
+    w.handleMessage(
+      reply(w, [
+        {
+          seq: 2,
+          event: { kind: "reasoning", id: "r1", turnId: "t1", text: "thinking paragraph, complete" },
+        },
+        { seq: 4, event: { kind: "bubble", answerId: "a4", text: "answer 4", turnId: "t1" } },
+      ]),
+    );
+
+    // ⚠️ THE DURABLE TEXT SURVIVES. Held, the draft would have landed last and
+    // truncated it back to "thinking par".
+    const healed = w.state.messages.find((m) => m.id === "r1") as { text?: string } | undefined;
+    expect(healed?.text).toBe("thinking paragraph, complete");
+    expect(cursorLast(w)).toBe(4);
+  });
+
+  it("a seq-less frame folded mid-catch-up moves no cursor and opens no gap", () => {
+    const { w, getDifference } = spied();
+    seed(w, 1);
+    w.handleMessage({ type: "agent_message", id: "a4", text: "answer 4", turnId: "t1", seq: 4 });
+    expect(getDifference).toHaveBeenCalledTimes(1);
+    w.handleMessage({ type: "reasoning", id: "r1", turnId: "t1", text: "thinking" });
+    expect(getDifference).toHaveBeenCalledTimes(1);
+    expect(cursorLast(w)).toBe(1);
+    expect(isCatchingUp(w)).toBe(true);
+  });
+});
+
+describe("#356 — the client does not depend on the server for its own liveness", () => {
+  it("a partial reply that covers nothing SETTLES instead of re-requesting forever", () => {
+    // `history-serve.ts` guarantees a partial reply covers past the floor it
+    // answers. A reply that decodes and violates it would otherwise re-request
+    // the same floor at RTT speed, with no timer involved and no bound.
+    // ⚠️ THE GAP IS OPENED BY A BARE CARRIER, SO THE BUFFER IS EMPTY — and that
+    // isolates the property. With a held frame in the buffer, settling
+    // re-dispatches it and it re-opens the same gap through the ORDINARY path,
+    // which is correct, bounded by the retry budget, and indistinguishable from
+    // the defect. What is under test is the reply's own re-request, so there must
+    // be nothing else able to issue one.
+    const { w, getDifference } = spied();
+    seed(w, 100);
+    seedOptimisticUser(w, {
+      localId: "u-0", receiptKey: "r-0", randomId: "rand-1", text: "hello", wireId: "t1",
+    });
+    w.handleMessage({
+      type: "ack",
+      ids: ["u-0"],
+      committed: [{ random_id: "rand-1", messageId: "webchannel-user-400", seq: 400 }],
+    });
+    expect(getDifference).toHaveBeenCalledTimes(1);
+
+    // A RESPONDING PEER, which is what makes this a loop rather than one bad
+    // reply. Answer every outstanding request with the same non-advancing partial
+    // reply, and bound the rounds so a regression fails instead of hanging.
+    let replies = 0;
+    for (let round = 0; round < 20 && isCatchingUp(w); round++) {
+      replies += 1;
+      w.handleMessage(reply(w, [], { partial: true, maxSeq: 100 }));
+    }
+
+    // ONE reply consumed, and the round-trip is over: it settled at the floor it
+    // already had rather than re-asking about it. Without the guard this runs the
+    // full 20 rounds at RTT speed — no timer involved, no bound.
+    expect(replies).toBe(1);
+    expect(getDifference).toHaveBeenCalledTimes(1);
+    expect(isCatchingUp(w)).toBe(false);
+    expect(cursorLast(w)).toBe(100);
+  });
+});
+
 describe("#351 — a reply is folded only by the device that asked for it", () => {
   it("THE REPRO: another device's reply on the shared .out is ignored; this device's own reply heals", () => {
     // Device A is catching up from floor 1; device B, on the same peer and the

@@ -133,16 +133,44 @@
     only on the device that originated the send (the `random_id` resolves a local
     linkage), and a seq above the contiguous next one opens a gap instead of
     closing it.
+  - **#343 (client half)** — a frame held during a catch-up is now dropped only
+    when the reply actually carried an event for its seq, never merely because the
+    cursor covers it: a row the server could not send is covered but absent, and
+    the held frame is proof its own live send succeeded. The give-up path carries
+    nothing and so drops nothing.
+  - A seq-less frame of a durable type (a streaming reasoning draft — only the
+    closing frame is journaled) is no longer held during a catch-up. It has no
+    journal row, so no reply can re-deliver it; held, it landed after the reply
+    and a cumulative draft overwrote the durable text with a prefix of itself.
+  - A `partial` reply that does not cover past the floor it answers now settles
+    instead of re-requesting. The server upholds that invariant; the client no
+    longer depends on it for its own liveness.
   - **#343** — one journal row too large for a peer's `max_payload` wedged
     `fitDifference`, so that device received nothing for the rest of the session.
     Such a row is now skipped with an operator-actionable log line, exactly as the
-    history page budget already skipped it, and the reply spans across it.
-  - **#348** — `fitDifference` re-sealed the whole prefix once per removed row
-    (O(n²), up to ~125 000 seals for an oversize 500-row reply) on the account's
-    dispatch turn, and `get_difference` had no per-peer bound at all. It is a
-    bisection now (13 measurements for that same reply), deferred off the dispatch
-    turn, and latched per peer so a burst coalesces into one reply answering the
-    newest request.
+    history page budget already skipped it, and the reply spans across it; the
+    reply's `maxSeq` is what carries the client past the hole.
+  - **#348** — `fitDifference` re-measured the surviving prefix once per removed
+    row on the account's dispatch turn, and `get_difference` had no per-peer bound
+    at all. It now measures each row once and bisects the survivors. On a 500-row
+    page that overflows: **512 `outboundWireSize` calls over 2 392
+    row-measurements, 0.74 MB serialized**, against develop's **424 calls over
+    122 324 row-measurements, 31.75 MB** — more calls, because a call now measures
+    one row rather than up to 500, and 43× less actually serialized. The case that
+    decided the shape is the one an authenticated peer can aim at the account's
+    event loop: a window in which no row fits at all costs **502 calls / 1 000
+    row-measurements / 0.13 MB** here, against **4 500 / 249 278 / 22.05 MB** for
+    a bisection-per-skip. (Develop's and the bisection-per-skip figures are
+    modelled against the same measurement stub — neither loop is in the tree to
+    run — and were measured independently by review.)
+  - **#348 (the dispatch turn)** — `serveDifference` is deferred like the other
+    two read paths, with a bounded per-peer QUEUE rather than their
+    drop-a-concurrent-request latch: a difference names a floor and a nonce, so a
+    dropped request leaves a device waiting on its 5 s timeout, and N tabs of one
+    account gap on the same frame at the same instant. Every request is answered,
+    one read+publish in flight per peer, at most 8 outstanding. Both halves of the
+    deferred body are now guarded — out there a throw would be an
+    `uncaughtException`, not a dropped frame.
 
 ## 0.7.0
 

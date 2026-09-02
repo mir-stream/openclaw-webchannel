@@ -130,36 +130,38 @@
   channel: a final finalizes the one draft it provably owns or becomes a new
   message, never an edit of a past bubble.
 
-- **The client's gap-sync state machine is now one modelled cursor (#356).**
-  Seven reviewers found eight defects concentrated in one seam — a cursor number
-  surrounded by an in-flight flag, a gap buffer, deferred advances and a timer
-  generation, all able to disagree about what had already been applied. It is
-  replaced by an explicit three-state cursor following Telegram's update-delivery
-  rules, and the fields that disagreed are deleted rather than re-guarded. Closes:
-  - **#350** — the cursor gap-detected from `0` before the register snapshot
-    seeded it, so a reload mid-turn pulled the entire conversation back through
-    the fold in 500-event pages. It now adopts its first observation as the
-    baseline and asks for nothing.
-  - **#351** — `difference` carried no echo of the request it answered and every
-    device of a peer shares the `.out` subject, so a device could fold another
-    device's reply and silently skip its own range.
-  - **#352** — a partial reply plus an `ack`/`highWaterSeq` advance deferred
-    during the round-trip pushed the cursor past events the reply never carried,
-    and the buffer drain then discarded them.
-  - **#345** — `ack.committed[].seq` was advance-only. It now moves the cursor
-    only on the device that originated the send (the `random_id` resolves a local
-    linkage), and a seq above the contiguous next one opens a gap instead of
-    closing it.
+- **The `get_difference` serve path is byte-fit, bounded and queued (#356).**
+  Seven reviewers found eight defects concentrated in the gap-sync seam; the ones
+  that live on this side of the wire are below. (The client half — the cursor
+  state machine, #350/#351/#352/#345 — is in the client package's changelog.) The
+  wire also gained the correlation and catch-up fields that make the client half
+  possible, under Breaking above. Closes:
   - **#343** — one journal row too large for a peer's `max_payload` wedged
     `fitDifference`, so that device received nothing for the rest of the session.
     Such a row is now skipped with an operator-actionable log line, exactly as the
-    history page budget already skipped it, and the reply spans across it.
-  - **#348** — `fitDifference` re-sealed the whole prefix once per removed row
-    (O(n²), up to ~125 000 seals for an oversize 500-row reply) on the account's
-    dispatch turn, and `get_difference` had no per-peer bound at all. It is a
-    bisection now (13 measurements for that same reply), deferred off the dispatch
-    turn, and latched per peer so a burst coalesces into one reply answering the
-    newest request.
+    history page budget already skipped it, and the reply spans across it; the
+    reply's `maxSeq` is what carries the client past the hole.
+  - **#348** — `fitDifference` re-measured the surviving prefix once per removed
+    row on the account's dispatch turn, and `get_difference` had no per-peer bound
+    at all. It now measures each row once and bisects the survivors. On a 500-row
+    page that overflows: **512 `outboundWireSize` calls over 2 392
+    row-measurements, 0.74 MB serialized**, against develop's **424 calls over
+    122 324 row-measurements, 31.75 MB** — more calls, because a call now measures
+    one row rather than up to 500, and 43× less actually serialized. The case that
+    decided the shape is the one an authenticated peer can aim at the account's
+    event loop: a window in which no row fits at all costs **502 calls / 1 000
+    row-measurements / 0.13 MB** here, against **4 500 / 249 278 / 22.05 MB** for
+    a bisection-per-skip. (Develop's and the bisection-per-skip figures are
+    modelled against the same measurement stub — neither loop is in the tree to
+    run — and were measured independently by review.)
+  - **#348 (the dispatch turn)** — `serveDifference` is deferred like the other
+    two read paths, with a bounded per-peer QUEUE rather than their
+    drop-a-concurrent-request latch: a difference names a floor and a nonce, so a
+    dropped request leaves a device waiting on its 5 s timeout, and N tabs of one
+    account gap on the same frame at the same instant. Every request is answered,
+    one read+publish in flight per peer, at most 8 outstanding. Both halves of the
+    deferred body are now guarded — out there a throw would be an
+    `uncaughtException`, not a dropped frame.
 
 ## 0.7.0
 

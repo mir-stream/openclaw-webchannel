@@ -70,16 +70,18 @@
     only on the device that originated the send (the `random_id` resolves a local
     linkage), and a seq above the contiguous next one opens a gap instead of
     closing it.
-  - **#343** — one journal row too large for a peer's `max_payload` wedged
-    `fitDifference`, so that device received nothing for the rest of the session.
-    Such a row is now skipped with an operator-actionable log line, exactly as the
-    history page budget already skipped it, and the reply spans across it.
-  - **#348** — `fitDifference` re-sealed the whole prefix once per removed row
-    (O(n²), up to ~125 000 seals for an oversize 500-row reply) on the account's
-    dispatch turn, and `get_difference` had no per-peer bound at all. It is a
-    bisection now (13 measurements for that same reply), deferred off the dispatch
-    turn, and latched per peer so a burst coalesces into one reply answering the
-    newest request.
+  - **#343 (client half)** — a frame held during a catch-up is now dropped only
+    when the reply actually carried an event for its seq, never merely because the
+    cursor covers it: a row the server could not send is covered but absent, and
+    the held frame is proof its own live send succeeded. The give-up path carries
+    nothing and so drops nothing.
+  - A seq-less frame of a durable type (a streaming reasoning draft — only the
+    closing frame is journaled) is no longer held during a catch-up. It has no
+    journal row, so no reply can re-deliver it; held, it landed after the reply
+    and a cumulative draft overwrote the durable text with a prefix of itself.
+  - A `partial` reply that does not cover past the floor it answers now settles
+    instead of re-requesting. The server upholds that invariant; the client no
+    longer depends on it for its own liveness.
 
 ## 0.7.0
 

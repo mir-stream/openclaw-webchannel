@@ -39,8 +39,9 @@
  *    `difference` with `afterSeq`, plus `partial` and `maxSeq` — all four of
  *    which a peer must ACT on (ignore the echo and it folds another device's
  *    reply; ignore `partial` and it strands the rest of a sliced range).
- *    A v3 peer stays on the wire,
- *    looks healthy, and is wrong in two ways it cannot itself detect:
+ *
+ *    A v3 peer stays on the wire, looks healthy, and is wrong in two ways it
+ *    cannot itself detect:
  *      · No `seq` ⇒ no gap detection ⇒ it never sends `get_difference`. This
  *        transport is core NATS pub/sub, AT-MOST-ONCE with no retention, so a
  *        dropped frame leaves a hole the peer CANNOT SEE and never asks to heal.

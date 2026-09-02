@@ -23,7 +23,7 @@
 
 - **플러그인이 SSOT다. 그리고 SSOT는 플러그인이 "자기 저장소"에 담는다.**
   플러그인이 답변마다 자기 id를 발급하고, 그 id로 live 전송하고, **자기 store에 durable하게 쓰고, history를 자기 store에서만 서빙한다.**
-- **클라이언트 = 텔레그램 앱이다 — "순수 view"가 아니다** (사용자 정정 2026-09-02). 텔레그램 앱은 로컬 상태(`pts` ≙ 우리 `lastAppliedSeq`)와 로컬 캐시를 갖고, `getDifference` 상태 머신을 돌리고, `random_id`로 낙관적 전송을 하고, 서버가 확정한 id·seq 위로 자기 상태를 재조정한다. 우리 클라이언트도 정확히 그만큼 한다(seq 커서, gap-sync, random_id 채택). 클라이언트가 **하지 않는** 것은 identity의 **발명**이다: text·위치로 identity를 추측하지 않고, 서버가 준 id를 그대로 신뢰한다. 이전 문구 "클라이언트는 순수 view다"는 오직 이 뜻이었다 — "클라이언트 상태가 없다"로 읽지 말 것. 이 문서의 다른 곳에 남은 "순수 view"도 같은 뜻으로만 읽는다.
+- **클라이언트 = 텔레그램 앱이다 — "순수 view"가 아니다** (사용자 정정 2026-09-02). 텔레그램 앱은 로컬 상태(`pts` ≙ 우리 seq 커서 — #356 이후 `SeqCursor`의 `last`/`afterSeq`)와 로컬 캐시를 갖고, `getDifference` 상태 머신을 돌리고, `random_id`로 낙관적 전송을 하고, 서버가 확정한 id·seq 위로 자기 상태를 재조정한다. 우리 클라이언트도 정확히 그만큼 한다(seq 커서, gap-sync, random_id 채택). 클라이언트가 **하지 않는** 것은 identity의 **발명**이다: text·위치로 identity를 추측하지 않고, 서버가 준 id를 그대로 신뢰한다. 이전 문구 "클라이언트는 순수 view다"는 오직 이 뜻이었다 — "클라이언트 상태가 없다"로 읽지 말 것. 이 문서의 다른 곳에 남은 "순수 view"도 같은 뜻으로만 읽는다.
 - **core transcript는 클라이언트용으로 읽지 않는다.** core transcript는 core의 LLM-문맥 자료다(그 목적으로는 이미 잘 동작한다). 우리가 클라이언트에게 보여줄 대화는 **우리 journal**이다. 두 저장소는 목적이 다르며 섞지 않는다.
 - 미래의 Tool message·reasoning까지 우리가 다루려면 core가 무엇을 저장하느냐에 **의존할 수 없다.** 그래서 identity와 저장을 플러그인이 소유한다.
 
@@ -961,7 +961,7 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 
 ### 16.7 gap-sync = Telegram updates 모델 (#356 half A, 2026-09-02)
 
-§16.2-6이 "per-conversation seq + `getDifference(afterSeq)`"를 지시했고 #244 half B가 그걸 구현했지만, **클라이언트 쪽은 모델이 아니라 규칙 더미로 자랐다** — 커서 숫자 + in-flight 플래그 + gap 버퍼 + 지연 advance + 타이머 generation. v6 병합 후 리뷰에서 리뷰어 일곱이 **그 한 seam에서 결함 여덟 개**를 찾았고(#349 #350 #351 #352 #345 #343 #348 #342), 전부 그 필드들끼리 "무엇이 이미 적용됐나"에 대해 의견이 갈린 자리였다. 이 저장소의 교훈(#301: 한 seam에서 네 라운드에 걸친 네 결함을 아홉 번째 규칙이 아니라 **규칙군 삭제**로 닫았다)에 따라, 반쪽 A는 **상태를 타입으로** 만들었다: `SeqCursor`(`nats-client-wrapper.ts`).
+§16.2-6이 "per-conversation seq + `getDifference(afterSeq)`"를 지시했고 #244 half B가 그걸 구현했지만, **클라이언트 쪽은 모델이 아니라 규칙 더미로 자랐다** — 커서 숫자 + in-flight 플래그 + gap 버퍼 + 지연 advance + 타이머 generation. v6 병합 후 리뷰에서 리뷰어 일곱이 **그 한 seam에서 결함 여덟 개**를 찾았고(#349 #350 #351 #352 #345 #343 #348 #342), 전부 그 필드들끼리 "무엇이 이미 적용됐나"에 대해 의견이 갈린 자리였다. 이 저장소의 교훈(#301: 한 seam에서 네 라운드에 걸친 네 결함을 다섯 번째 규칙이 아니라 **규칙군 삭제**로 닫았다)에 따라, 반쪽 A는 **상태를 타입으로** 만들었다: `SeqCursor`(`nats-client-wrapper.ts`).
 
 **모델은 `core.telegram.org/api/updates`이고, 우리 역할은 그대로 대응된다** — 우리 플러그인 = 텔레그램 플러그인 + 텔레그램 **서버**, 우리 클라이언트 = 텔레그램 **앱**(§0). `seq` ⇢ `pts`, 커서 ⇢ 앱의 `local_pts`, `get_difference` ⇢ `updates.getDifference`, 스냅샷의 `highWaterSeq` ⇢ `updates.getState`, `partial` ⇢ `updates.differenceSlice`.
 
@@ -971,14 +971,15 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 - `catching-up` — `get_difference` 하나가 미결. `afterSeq`가 **요청의 floor이자 커서**다. 숫자를 하나만 두는 것이 핵심: 예전엔 둘이었고(`pendingDeferredSeq`), PARTIAL 응답 위에 그걸 얹는 것이 정확히 구간 유실의 기전이었다(#352).
 
 **세 갈래 판정** (`pts_count`는 우리에겐 항상 1 — durable 프레임 하나 = 저널 행 하나):
-`seq === last + 1` → 적용 · `seq <= last` → 이미 커버됨 · `seq > last + 1` → **GAP**. `ack.committed[].seq`와 `history.highWaterSeq`도 **같은 판정**을 지난다 — 위쪽이면 무조건 advance가 아니라 GAP이다(#345 shape B, #352).
+`seq === last + 1` → 적용 · `seq <= last` → 이미 커버됨 · `seq > last + 1` → **GAP**. `history.highWaterSeq`도 **같은 판정**을 지난다 — 위쪽이면 무조건 advance가 아니라 GAP이다(#345 shape B, #352). `ack.committed[].seq`는 **origin 기기에서만** 그 판정을 지난다(아래 편차 5).
 
 ⚠️ **텔레그램과 어긋나는 곳은 넷뿐이고, 넷 다 근거가 있다.**
-1. **에코 상관(correlation)** — 텔레그램은 세션의 연결로 주소를 잡는다. 우리 기기들은 `.out` 하나를 공유하고 wire 상 신원이 없다(§16.2-8, per-device registry 없음). 그래서 `difference`가 요청의 `afterSeq`·`nonce`를 **그대로 되돌려주고**, 기기는 **자기 요청과 일치하는 응답만** fold한다. 없으면 floor 100인 기기가 floor 300짜리 응답을 먹고 101..300을 조용히 건너뛴다(#351, N8).
+1. **에코 상관(correlation)** — 텔레그램은 세션의 연결로 주소를 잡는다. 우리 기기들은 `.out` 하나를 공유하고 wire 상 신원이 없다 — per-device registry가 없다는 사실의 출처는 `nats-channel.ts`의 `registerPeer`와 `channel-contract.ts`의 `user_committed` 독블록이다(§16.2-8은 broadcast 조항이지 addressing 조항이 아니다). 그래서 `difference`가 요청의 `afterSeq`·`nonce`를 **그대로 되돌려주고**, 기기는 **자기 요청과 일치하는 응답만** fold한다. 없으면 floor 100인 기기가 floor 300짜리 응답을 먹고 101..300을 조용히 건너뛴다(#351, N8).
 2. **`seq <= last`도 fold한다** — 텔레그램은 "이미 적용됨, 무시"라고 말하지만 **우리 `seq`는 이벤트가 아니라 행을 센다**. `delivery-journal.ts`가 `placement`를 answer id로 dedupe하므로 스트리밍 답변의 **모든 `progress` 프레임이 같은 seq**를 달고 온다. 무시하면 모든 draft가 첫 청크에서 얼어붙는다. 커서만 무시하고 프레임은 fold한다.
 3. **커서 영속화 없음** — 아직 in-memory다(반쪽 B).
-4. **give-up이 존재한다** — 텔레그램의 `getDifference`는 세션 연결 위의 RPC라 전송이 실패를 알려준다. 우리 건 publish로 답하는 publish라, 타이머가 유일한 감지 수단이다.
+4. **give-up이 존재한다** — 텔레그램의 `getDifference`는 세션 연결 위의 RPC라 전송이 실패를 알려준다. 우리 건 publish로 답하는 publish라, 타이머가 유일한 감지 수단이다. 그리고 give-up은 버퍼를 **버리지 않는다**: 응답이 온 적이 없으니 "이미 배달됨"이 참인 프레임이 하나도 없다(#343).
+5. **ack의 seq는 origin 기기에서만 커서를 움직인다** — 텔레그램은 sent-message 업데이트가 보낸 세션으로만 가므로 이 구분이 공짜다. 우리 ack는 공유 `.out`을 타고 모든 기기에 도달하므로, `random_id`가 로컬 전송 링키지를 푸는 기기(=origin)에서만 판정을 지나고 나머지는 무시한다. 무시하지 않으면 broadcast를 놓친 비-origin 기기가 자기 gap을 스스로 닫아버린다(#345 shape A).
 
-**서버 쪽**(`history-serve.ts`): `fitDifference`는 `history-frame-budget.ts`와 **같은 알고리즘의 prefix 판본**이 됐다 — 이분 탐색 + blocker 한 번 측정으로 "혼자서도 안 들어가는 행은 **건너뛰기**"(#343; 그 행은 자기 live 전송도 같은 한계에 걸려 못 갔으므로 생략이 곧 `live == history`)와 "여기서 예산이 끝났다"(→ `partial: true`)를 가른다. 한 행씩 줄이며 매번 전체를 다시 seal하던 O(n²)(500행 페이지에서 최대 ~12.5만 회)는 **13회**로 떨어졌고, 경로 자체가 다른 두 read처럼 **deferred + per-peer latch**가 됐다(#348). latch는 `runDeferred`와 달리 **드롭이 아니라 최신 요청으로 coalesce**한다 — floor는 앞으로만 가므로 나중 요청이 앞 요청을 포함하고, 밀려난 nonce의 기기는 에코 불일치로 무시한 뒤 자기 타임아웃에 재요청한다.
+**서버 쪽**(`history-serve.ts`): `fitDifference`는 **행마다 한 번씩 재는 pass 하나 + 생존자에 대한 이분 탐색 하나**가 됐다 — "혼자서도 안 들어가는 행은 **건너뛰기**"(#343; 그 행은 자기 live 전송도 같은 한계에 걸려 못 갔으므로 생략이 곧 `live == history`)와 "여기서 예산이 끝났다"(→ `partial: true`)를 가른다. ⚠️ **`history-frame-budget.ts`의 모양을 그대로 쓰지 않았고 그건 의도다** — 그 모듈은 skip마다 이분 탐색을 다시 돈다. history page에선 문제없지만 difference에선 peer가 조준할 수 있다(아래 수치). **단위를 섞지 말 것.** develop의 루프는 반복마다 `outboundWireSize`(=`sealEnvelope`) **한 번**이므로 500행 페이지에서 **424 호출**이고, ~12.2만은 그 호출들이 직렬화한 **행 수의 합**(Σ prefix 길이 ≈ n²/2)이다 — #348이 말한 수치가 이쪽이다. 새 fit은 같은 페이지에서 **512 호출 / 2 392 행 / 0.74 MB**(develop: 424 / 122 324 / 31.75 MB — 이 줄은 코드가 트리에 없어 같은 stub에 대해 **모델링**한 값이고, 리뷰가 독립 측정으로 확인했다)다. 호출 수는 늘고 실제 직렬화량은 43배 줄었다 — 한 호출이 재는 행 수가 다르기 때문이고, 그게 이 교환의 전부다. 노린 것은 **peer가 조준할 수 있는 최악 케이스**다: 전 행이 배달 불가인 500행 창에서 pass마다 이분 탐색을 다시 도는 모양은 **4 500 호출 / 249 278 행 / 22.05 MB**(≈9초 이벤트 루프 점유)인데, 행마다 한 번만 재는 모양은 **502 / 1 000 / 0.13 MB**다. 경로 자체도 다른 두 read처럼 **deferred**가 됐고, per-peer **큐**가 붙었다(#348). `runDeferred`처럼 드롭하지도, 최신 요청으로 coalesce하지도 **않는다** — 요청마다 floor와 nonce가 다르고 응답이 그 쌍에 주소지정되므로, 드롭이든 coalesce든 한 기기를 5초 타임아웃에 세워두는 것이다. 한 계정의 N개 탭이 같은 프레임에서 동시에 gap을 열면 그게 정확히 N−1개 기기의 지연이 된다. 그래서 **큐(최대 8, 초과 시 가장 최신 대기 요청을 교체)**로 전부 답한다. 묶는 것은 **동시성과 깊이지 rate가 아니다**(다른 두 latch와 같다).
 
 **반쪽 B(별도 PR)**: #349 replay 오버레이, #342 재접속 `get_difference` + tier-1 history 갱신, 커서 영속화.

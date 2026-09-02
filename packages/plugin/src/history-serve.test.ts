@@ -100,15 +100,25 @@ function recordingChannel(limit = 8 * 1024 * 1024): {
   differences: Array<{ peerId: string } & DifferenceReply>;
   /** #348: every `outboundWireSize` call, i.e. every seal the byte fit paid for. */
   measurements: number;
+  /**
+   * #348: the sum of `events.length` over those calls — the quantity that
+   * actually reaches `sealEnvelope`. A call measuring one row and a call
+   * measuring 500 are both ONE call and are not the same work, which is the
+   * distinction the original "125 000 seals" claim collapsed.
+   */
+  rowMeasurements: number;
 } {
   const sent: Array<{ peerId: string; messages: HistoryMessage[]; highWaterSeq?: number }> = [];
   const differences: Array<{ peerId: string } & DifferenceReply> = [];
-  const counter = { n: 0 };
+  const counter = { n: 0, rows: 0 };
   return {
     sent,
     differences,
     get measurements() {
       return counter.n;
+    },
+    get rowMeasurements() {
+      return counter.rows;
     },
     channel: {
       // #244 half A: capture the high-water baseline the snapshot path stamps.
@@ -122,6 +132,8 @@ function recordingChannel(limit = 8 * 1024 * 1024): {
       },
       outboundWireSize: (_peerId, payload) => {
         counter.n += 1;
+        const events = (payload as { events?: unknown[] }).events;
+        counter.rows += Array.isArray(events) ? events.length : 0;
         return Buffer.byteLength(JSON.stringify(payload), "utf8");
       },
       effectiveOutboundLimit: () => limit,
@@ -1002,12 +1014,19 @@ describe("createHistoryServer.serveDifference — #244 half B / #356", () => {
     expect(h.differences[0].maxSeq).toBe(1);
   });
 
-  it("#348 — an oversize 500-row difference is fitted with a handful of seals, not O(n²)", () => {
-    // `outboundWireSize` is a full `sealEnvelope`. The old loop dropped ONE row
-    // per iteration and re-measured the whole prefix each time: for a 500-row page
-    // that overflows, up to ~125 000 seals, synchronously on the dispatch turn.
-    // The bisection is logarithmic — this counts the calls rather than trusting
-    // the shape.
+  it("#348 — an oversize 500-row difference is fitted without re-measuring the prefix per row", () => {
+    // `outboundWireSize` is a full `sealEnvelope`, and the unit that matters is
+    // how much gets serialized, not how many calls are made — a call measuring
+    // ONE row is not a call measuring 500.
+    //
+    // MEASURED on exactly this page (500 rows, ~180 B of text each, limit 20 000),
+    // against this file's own stub:
+    //   this fit                512 calls /   2 392 row-measurements / 0.74 MB
+    //   develop (modelled)      424 calls / 122 324 row-measurements / 31.75 MB
+    // More calls, 51× fewer row-measurements, 43× fewer bytes. Develop's row is
+    // MODELLED — its loop is not in the tree to run — and is corroborated by the
+    // reviewer who measured it independently. The assertion is on
+    // row-measurements because that is the unit that tracks the work.
     const journal = openJournal();
     for (let i = 1; i <= MAX_DIFFERENCE_EVENTS; i++) {
       journal.append(PEER, {
@@ -1022,38 +1041,104 @@ describe("createHistoryServer.serveDifference — #244 half B / #356", () => {
 
     expect(h.differences).toHaveLength(1);
     expect(h.differences[0].partial).toBe(true);
-    // Measured: 13 (whole, empty, surviving-whole, ~9 bisection steps, blocker).
-    // The bound is what matters — the old shape needed hundreds for this page.
-    expect(h.recording.measurements).toBeLessThanOrEqual(16);
-    expect(h.recording.measurements).toBeGreaterThan(0);
+    // ⚠️ THE ASSERTION IS ON ROW-MEASUREMENTS, NOT CALLS. Develop's loop pays
+    // Σ prefix lengths ≈ n²/2 here; this fit pays one row per row plus a
+    // logarithmic bisection. A bound of 5 000 is ~24× under develop's 122 324 and
+    // ~2× over the measured 2 392, so it survives a small change of page shape
+    // and still fails loudly if the per-row pass ever grows a loop around it.
+    expect(h.recording.rowMeasurements).toBeLessThanOrEqual(5_000);
+    expect(h.recording.rowMeasurements).toBeGreaterThan(0);
+    // The call count is recorded too, so a future edit that trades one for the
+    // other is visible rather than silent.
+    expect(h.recording.measurements).toBeLessThanOrEqual(600);
   });
 
-  it("#348 — one outstanding read per peer: a burst coalesces into ONE reply, answering the NEWEST request", () => {
-    // The latch the other two read paths have, with the one behavioural change a
-    // request/reply shape allows: a later floor supersedes an earlier one, so the
-    // burst collapses onto the newest `(afterSeq, nonce)` rather than the oldest.
-    // A device whose request was coalesced away sees a frame that is not its own,
-    // ignores it (the echo), and re-issues on its own timeout.
+  it("#348 — an ALL-UNDELIVERABLE 500-row window is bounded too (the peer-drivable one)", () => {
+    // ⚠️ THIS IS THE CASE A BISECTION-PER-SKIP LOSES, AND IT IS REACHABLE BY A
+    // PEER: `get_difference{afterSeq:0}` on a conversation whose rows are all
+    // oversize for this peer's `max_payload`. Re-running the bisection after
+    // every skip costs one pass per row — 4 500 calls, 249 278 row-measurements,
+    // 22.05 MB serialized (modelled against this stub; the reviewer measured the
+    // same shape at ~9 s of blocked event loop on one scheduled callback). One
+    // per-row pass answers the same question in 502 calls / 1 000
+    // row-measurements / 0.13 MB, which is what the bounds below pin.
+    const journal = openJournal();
+    for (let i = 1; i <= MAX_DIFFERENCE_EVENTS; i++) {
+      journal.append(PEER, { kind: "bubble", answerId: `a${i}`, turnId: "t1", text: "padding" });
+    }
+    // No single row fits; an EMPTY frame still does (below that the budget hands
+    // the reply on whole instead, by design).
+    const h = harness(journal, {}, 120);
+    serveDifference(h, 0);
+
+    expect(h.recording.measurements).toBeLessThanOrEqual(600);
+    expect(h.recording.rowMeasurements).toBeLessThanOrEqual(2_000);
+    // And it is still a correct answer, not a cheap one.
+    expect(h.differences).toHaveLength(1);
+    expect(h.differences[0].events).toEqual([]);
+    expect(h.differences[0].partial).toBe(false);
+    expect(h.differences[0].maxSeq).toBeGreaterThan(h.differences[0].afterSeq);
+  });
+
+  it("#348/#356 — a burst is QUEUED and every request gets its own reply, one read at a time", () => {
+    // ⚠️ EVERY REQUEST IS ANSWERED, AND THAT IS THE MULTI-DEVICE PROPERTY. N tabs
+    // of one account share one `.out` subject, gap on the SAME dropped frame in
+    // the same instant, and each asks from its own floor under its own nonce.
+    // Newest-wins coalescing would answer one and silence N−1 — and since their
+    // timers were armed together, their retries re-collide in lockstep, so each
+    // silenced device eats 4 × 5 s and then gives up. A device folds only the
+    // reply echoing its own `(afterSeq, nonce)`, so N replies are what N devices
+    // need.
     const journal = openJournal();
     for (const event of thread("a")) journal.append(PEER, event);
     const h = harness(journal);
 
-    h.server.serveDifference(PEER, 0, "n-1");
-    h.server.serveDifference(PEER, 1, "n-2");
-    h.server.serveDifference(PEER, 2, "n-3");
-    // ONE scheduled read for the three requests.
+    h.server.serveDifference(PEER, 0, "tab-1");
+    h.server.serveDifference(PEER, 1, "tab-2");
+    h.server.serveDifference(PEER, 2, "tab-3");
+    // ONE read scheduled, not three: concurrency is what the queue bounds.
     expect(h.scheduler.pending).toBe(1);
     h.scheduler.flush();
 
-    expect(h.differences).toHaveLength(1);
-    expect(h.differences[0].nonce).toBe("n-3");
-    expect(h.differences[0].afterSeq).toBe(2);
-    expect(h.differences[0].events.map((e) => e.seq)).toEqual([3]);
+    // Three replies, in request order, each echoing its own request.
+    expect(h.differences).toHaveLength(3);
+    expect(h.differences.map((d) => d.nonce)).toEqual(["tab-1", "tab-2", "tab-3"]);
+    expect(h.differences.map((d) => d.afterSeq)).toEqual([0, 1, 2]);
+    expect(h.differences[0].events.map((e) => e.seq)).toEqual([1, 2, 3]);
+    expect(h.differences[2].events.map((e) => e.seq)).toEqual([3]);
 
-    // The latch RELEASES: a later request is served normally.
-    serveDifference(h, 0, "n-4");
-    expect(h.differences).toHaveLength(2);
-    expect(h.differences[1].nonce).toBe("n-4");
+    // The queue RELEASES: a later request is served normally.
+    serveDifference(h, 0, "tab-4");
+    expect(h.differences).toHaveLength(4);
+    expect(h.differences[3].nonce).toBe("tab-4");
+  });
+
+  it("#356 — the queue is bounded: past it the NEWEST request displaces the newest queued one", () => {
+    // Answering every request cannot mean an unbounded backlog. Past the bound a
+    // new request replaces the newest QUEUED one — never the head, which would
+    // spend the budget on stale floors while the current one waits — and the
+    // displaced device re-issues on its own timeout.
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    const h = harness(journal);
+
+    // EIGHT un-answered requests per peer, the one about to run included.
+    for (let i = 1; i <= 10; i++) h.server.serveDifference(PEER, 0, `n-${i}`);
+    expect(h.scheduler.pending).toBe(1);
+    h.scheduler.flush();
+
+    expect(h.differences).toHaveLength(8);
+    const answered = h.differences.map((d) => d.nonce);
+    // The head and the middle survive in order; each of `n-8`/`n-9` was
+    // displaced in turn by the request behind it, and the NEWEST floor is the
+    // one still holding the last slot.
+    expect(answered.slice(0, 7)).toEqual([
+      "n-1", "n-2", "n-3", "n-4", "n-5", "n-6", "n-7",
+    ]);
+    expect(answered[7]).toBe("n-10");
+    expect(answered).not.toContain("n-8");
+    expect(answered).not.toContain("n-9");
+    expect(h.warns.some((w) => w.includes("displaced the newest of 8"))).toBe(true);
   });
 
   it("#348 — nothing runs on the dispatch turn (the fit is no longer free)", () => {
@@ -1066,6 +1151,95 @@ describe("createHistoryServer.serveDifference — #244 half B / #356", () => {
     expect(h.scheduler.pending).toBe(1);
     h.scheduler.flush();
     expect(h.differences).toHaveLength(1);
+  });
+
+  it("#356 — a THROWING byte fit cannot escape the scheduled callback", () => {
+    // ⚠️ AN ESCAPE HERE IS AN `uncaughtException`, NOT A DROPPED FRAME. On develop
+    // `serveDifference` ran inline on the inbound dispatch turn, inside
+    // `nats-transport.ts`'s `safeEmitFor` catch. This slice defers it, so there
+    // is nothing left on the stack: a throw out of `outboundWireSize` (i.e.
+    // `sealEnvelope`) takes the gateway down. The route is real —
+    // `JSON.stringify` of a 500-row page raises `RangeError: Invalid string
+    // length` on exactly the oversize population this fit exists for.
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    const h = harness(journal, {
+      channel: {
+        sendHistory: () => true,
+        sendDifference: () => true,
+        outboundWireSize: () => {
+          throw new RangeError("Invalid string length");
+        },
+        effectiveOutboundLimit: () => 8 * 1024 * 1024,
+      } as HistoryChannelSurface,
+    });
+
+    h.server.serveDifference(PEER, 0, "n-1");
+    // The body runs on a LATER turn, so the property is that running it does not
+    // throw at all — not that the caller survives.
+    expect(() => h.scheduler.flush()).not.toThrow();
+    expect(h.errors).toHaveLength(1);
+    expect(h.errors[0]).toContain("difference publish failed");
+    expect(h.errors[0]).toContain("Invalid string length");
+    // NOT mislabelled as a journal fault — the read succeeded.
+    expect(h.errors[0]).not.toContain("read failed");
+  });
+
+  it("#356 — a THROWING sendDifference cannot escape the scheduled callback either", () => {
+    // The other half of the same hazard: `sendToPeer`'s fail-closed diagnostic
+    // sits outside its own `try`, so the send itself can throw.
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    const h = harness(journal, {
+      channel: {
+        sendHistory: () => true,
+        sendDifference: () => {
+          throw new Error("transport closed");
+        },
+        outboundWireSize: (_peerId, payload) =>
+          Buffer.byteLength(JSON.stringify(payload), "utf8"),
+        effectiveOutboundLimit: () => 8 * 1024 * 1024,
+      } as HistoryChannelSurface,
+    });
+
+    h.server.serveDifference(PEER, 0, "n-1");
+    expect(() => h.scheduler.flush()).not.toThrow();
+    expect(h.errors).toHaveLength(1);
+    expect(h.errors[0]).toContain("difference publish failed");
+    expect(h.errors[0]).toContain("transport closed");
+    expect(h.errors[0]).not.toContain("read failed");
+  });
+
+  it("#356 — a FAILED publish does not latch the peer out of its own catch-up", () => {
+    // The queue entry is held across the whole read+publish, so releasing it is
+    // not automatic: a reply that throws must still release, or one bad send
+    // silences this peer for the life of the process. (This is the CATCH path,
+    // which is the reachable one — the drain loop's `finally` is unreachable
+    // defence and its docblock says so.)
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    let fail = true;
+    const delivered: string[] = [];
+    const h = harness(journal, {
+      channel: {
+        sendHistory: () => true,
+        sendDifference: (_peerId, reply) => {
+          if (fail) throw new Error("transport closed");
+          delivered.push(reply.nonce);
+          return true;
+        },
+        outboundWireSize: (_peerId, payload) =>
+          Buffer.byteLength(JSON.stringify(payload), "utf8"),
+        effectiveOutboundLimit: () => 8 * 1024 * 1024,
+      } as HistoryChannelSurface,
+    });
+
+    h.server.serveDifference(PEER, 0, "n-1");
+    h.scheduler.flush();
+    expect(delivered).toEqual([]);
+    fail = false;
+    serveDifference(h, 0, "n-2");
+    expect(delivered).toEqual(["n-2"]);
   });
 
   it("on a read failure, logs and sends NOTHING (never an empty frame that would falsely advance)", () => {

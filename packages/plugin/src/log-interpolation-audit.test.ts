@@ -194,12 +194,20 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
     // same footing as the counts below), the three budget counts, the peer's
     // advertised `limit`, and the throttle's own `suppressed`.
     //
-    // #356 moved these five lines onto the SAME `admit` throttle the history lines
-    // use — before it they were the one failure path in this file that bypassed it
-    // — which is why each now carries a `(suppressed=)`, and it added the byte
-    // budget's two reports plus the coalesce warn.
+    // #356 moved these lines onto the SAME `admit` throttle the history lines use
+    // — before it they were the one failure path in this file that bypassed it —
+    // which is why each carries a `(suppressed=)`, and it added the byte budget's
+    // two reports plus the queue-bound warn.
+    //
+    // Round 2 added the SIXTH line: `publish failed … (afterSeq=…)`, for a THROWN
+    // send as against a refused one. Both report `publish-failed`; only the thrown
+    // one names the request, because the refused one already names the frame it
+    // refused. `MAX_QUEUED_DIFFERENCE_REQUESTS` is raw and is a module constant,
+    // not peer data.
     "history-serve.ts  ::  request.afterSeq  @  webchannel: difference read failed for (afterSeq=): (suppressed=)",
     "history-serve.ts  ::  suppressed  @  webchannel: difference read failed for (afterSeq=): (suppressed=)",
+    "history-serve.ts  ::  request.afterSeq  @  webchannel: difference publish failed for (afterSeq=): (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: difference publish failed for (afterSeq=): (suppressed=)",
     "history-serve.ts  ::  fitted.entries.length  @  webchannel: difference publish failed for : the channel refused a -event frame; see the channel log (suppressed=)",
     "history-serve.ts  ::  suppressed  @  webchannel: difference publish failed for : the channel refused a -event frame; see the channel log (suppressed=)",
     "history-serve.ts  ::  fitted.skipped.length  @  webchannel: difference skipped undeliverable row(s) for ; each one alone exceeds this peer's effective max_payload of bytes and can never be sent, live or replayed (#311/#343): (suppressed=)",
@@ -208,7 +216,8 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
     "history-serve.ts  ::  fitted.trimmed  @  webchannel: difference for was shortened to fit the peer's effective max_payload of bytes: newer event(s) left for the next request (partial=true) (suppressed=)",
     "history-serve.ts  ::  limit  @  webchannel: difference for was shortened to fit the peer's effective max_payload of bytes: newer event(s) left for the next request (partial=true) (suppressed=)",
     "history-serve.ts  ::  suppressed  @  webchannel: difference for was shortened to fit the peer's effective max_payload of bytes: newer event(s) left for the next request (partial=true) (suppressed=)",
-    "history-serve.ts  ::  suppressed  @  webchannel: difference request for coalesced into the one already scheduled; the reply will answer the newest afterSeq and the superseded request re-issues on its own timeout (suppressed=)",
+    "history-serve.ts  ::  MAX_QUEUED_DIFFERENCE_REQUESTS  @  webchannel: difference request for displaced the newest of already queued for this peer; the displaced request re-issues on its own timeout (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: difference request for displaced the newest of already queued for this peer; the displaced request re-issues on its own timeout (suppressed=)",
     "history-serve.ts  ::  fitted.rows.length  @  webchannel: history publish failed for : the channel refused a -row frame; see the channel log for the cause (suppressed=)",
     "history-serve.ts  ::  fitted.skipped.length  @  webchannel: history skipped undeliverable row(s) for ; each one alone exceeds this peer's effective max_payload of bytes and can never be sent, live or replayed (#311): (suppressed=)",
     "history-serve.ts  ::  fitted.trimmed  @  webchannel: history for was shortened to fit the peer's effective max_payload of bytes: older row(s) left out of this page and still reachable with load_history (suppressed=)",
@@ -379,12 +388,13 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // {peerId, fitted.length} = 5 more interpolations (35→40). `peerId` and `err`
   // are `logSafe`-wrapped; `afterSeq` (validated integer) and `fitted.length`
   // (count) are in KNOWN_RAW above.
-  // #356 takes the difference path to five statements (10→13) and 53
-  // interpolations (40→53). Three are new lines — the byte budget's skipped-row
-  // and shortened reports, mirroring the history ones, and the per-peer coalesce
-  // warn — and the two pre-existing ones each gained a `suppressed` because this
-  // path now goes through `admit` like every other failure path in the file.
-  "history-serve.ts": { statements: 13, interpolations: 53 },
+  // #356 takes the difference path to SIX statements (10→14) and 58
+  // interpolations (40→58). Four are new lines — the byte budget's skipped-row
+  // and shortened reports (mirroring the history ones), the queue-bound warn, and
+  // the THROWN-publish report round 2 added — and the two pre-existing ones each
+  // gained a `suppressed` because this path now goes through `admit` like every
+  // other failure path in the file.
+  "history-serve.ts": { statements: 14, interpolations: 58 },
   "nats-register.ts": { statements: 18, interpolations: 20 },
 };
 
