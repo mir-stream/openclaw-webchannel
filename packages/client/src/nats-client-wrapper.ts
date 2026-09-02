@@ -99,6 +99,68 @@ function normalizeAssistantMessageIndex(value: unknown): number | undefined {
     ? value
     : undefined;
 }
+
+/**
+ * #244 half B — the inbound frame types that carry a per-conversation `seq`, i.e.
+ * the DURABLE frames the plugin stamps `seq` on (`isSeqBearingFrame` in
+ * `delivery-journal-event.ts` is the server-side twin, and its drift test pins the
+ * set). These are the frames gap detection watches and the ones buffered while a
+ * `get_difference` is in flight. A frame of one of these types WITHOUT a `seq`
+ * (an id-less `agent_message`, a live reasoning DRAFT) is still handled normally —
+ * it just carries no cursor, so it neither advances nor gaps.
+ */
+const SEQ_BEARING_INBOUND_TYPES: ReadonlySet<string> = new Set([
+  "agent_message",
+  "progress",
+  "turn_snapshot",
+  "reasoning",
+  "tool_activity",
+  "approval_request",
+  "approval_resolved",
+]);
+
+function isSeqBearingInbound(msg: { type?: unknown }): boolean {
+  return typeof msg.type === "string" && SEQ_BEARING_INBOUND_TYPES.has(msg.type);
+}
+
+/**
+ * #244 half B (HIGH-2) — how long to wait for a `difference` reply before
+ * re-issuing the request, and how many times to re-issue before giving up into a
+ * re-detect. The request and reply both ride the at-most-once `.out`, so either
+ * can vanish; this is what keeps a dropped one from wedging the stream in-session.
+ */
+const GET_DIFFERENCE_TIMEOUT_MS = 5_000;
+const GET_DIFFERENCE_MAX_RETRIES = 3;
+
+/**
+ * #244 half B — the `DurableEvent` kinds this build's reducer knows. A
+ * `difference` from a NEWER plugin may carry a kind outside this set (#253's
+ * retained-unknown rows); the client SKIPS folding it but still advances its
+ * cursor past its seq — exactly as the server's `projectJournalHistory` counts an
+ * `unsupportedEvents` row rather than stalling on it. Kept in step with
+ * `applyDurableEvent`'s switch (`durable-view-reducer.ts`).
+ */
+const KNOWN_DURABLE_EVENT_KINDS: ReadonlySet<string> = new Set([
+  "user",
+  "placement",
+  "bubble",
+  "seal",
+  "reasoning",
+  "tool",
+  "approval",
+  "approvalResolution",
+  "messageEdited",
+  "messageDeleted",
+]);
+
+function isFoldableDurableEvent(event: unknown): event is DurableEvent {
+  return (
+    !!event &&
+    typeof event === "object" &&
+    typeof (event as { kind?: unknown }).kind === "string" &&
+    KNOWN_DURABLE_EVENT_KINDS.has((event as { kind: string }).kind)
+  );
+}
 // P1-9: the client-side mirror of core's abort predicate (§3.3). Intentionally
 // NOT re-exported from the public barrel; imported directly here and by the
 // plugin-side contract test.
@@ -785,6 +847,9 @@ export class WebChannelNATSClient {
       this.sessionEstablished = false;
       if (!connected || wasSessionEstablished) this.consumeHeldStallForRawLoss();
       this.clearStaleDraftWatch();
+      // #244 half B: the in-flight catch-up and its buffer belong to the connection
+      // that just dropped; a reconnect re-seeds the cursor and re-detects live.
+      this.teardownGapSync();
       // P0-4: a CL2 terminal instance is PERMANENTLY retired — the onState handler
       // must not mutate status/error at all, on EITHER edge. This matters because
       // a registration-path terminal sets only the WCNC-level `terminalReached`
@@ -1012,6 +1077,9 @@ export class WebChannelNATSClient {
       const heldEntries = this.takeHeld();
       // P1-9: tear down the connection-scoped staleness valve (§3.6.2).
       this.clearStaleDraftWatch();
+      // #244 half B: this lifecycle will never receive its pending `difference`;
+      // stop the timer and drop the buffer so nothing leaks past close().
+      this.teardownGapSync();
       // #96: this lifecycle will never see another `turn_settled`. Clear its
       // turns before raw teardown, but delay the public flip until disconnect()
       // has completed so no state listener can reopen onto the old socket.
@@ -2812,6 +2880,51 @@ export class WebChannelNATSClient {
    *  instance, not per frame — a legacy plugin emits one per reply. */
   private warnedIdlessDurableFrame = false;
 
+  // ---- #244 half B — per-conversation seq tracking + gap recovery -----------
+  //
+  // ONE conversation per client here (`peerId` is fixed at construction and the
+  // `.out` stream is single-conversation), so a single cursor suffices — no
+  // per-conversation map. `0` is the empty-journal baseline (`delivery-journal`'s
+  // `maxSeq` returns 0 for no rows), and it is SEEDED from the reconnect snapshot's
+  // `highWaterSeq` (`case "history"`). A durable frame at `lastAppliedSeq + 1` is
+  // contiguous; one beyond it is a gap.
+  private lastAppliedSeq = 0;
+  /**
+   * True while a `get_difference` round-trip is outstanding. Durable frames that
+   * arrive in this window are BUFFERED (`gapBuffer`) rather than folded — folding
+   * one the difference will also carry would double-apply a non-idempotent event
+   * (`seal` reorders; `user`/`messageEdited` are not idempotent).
+   */
+  private differenceInFlight = false;
+  /** Durable frames held during a catch-up, drained in arrival order once it lands. */
+  private gapBuffer: InboundMessage[] = [];
+  /**
+   * The `afterSeq` the OUTSTANDING `get_difference` was issued with. HIGH-1: the
+   * fold floor keys off THIS, never the live cursor — because a non-buffered frame
+   * (an `ack`'s user seq, a `history` high-water) can advance the cursor mid-flight,
+   * and reading it live would gate the whole catch-up range out (silent data loss).
+   */
+  private pendingAfterSeq = 0;
+  /**
+   * HIGH-1: a cursor advance owed by an `ack`/`history` that arrived DURING a
+   * catch-up. The seq advance is DEFERRED (the frame's id-adoption/hydration still
+   * runs live) so the cursor stays frozen at `pendingAfterSeq` and every event
+   * folds in seq order after the difference; this max is applied once the
+   * difference lands. `0` means nothing deferred.
+   */
+  private pendingDeferredSeq = 0;
+  /**
+   * HIGH-2 (liveness): the `get_difference` request AND its `difference` reply both
+   * ride the same at-most-once `.out` this feature exists to survive, and the
+   * server sends nothing on a read fault — so a dropped request/reply would wedge
+   * `differenceInFlight` true FOREVER, buffering every later frame with no drain.
+   * This timer re-issues the request (bounded), then gives up INTO a re-detect so
+   * the transcript self-heals IN-SESSION (never waiting on reconnect, half C).
+   */
+  private differenceTimer: ReturnType<typeof setTimeout> | null = null;
+  private differenceTimerGeneration = 0;
+  private differenceRetries = 0;
+
   // ---------------------------------------------------------------------------
   // P0-4 — receipt records + send-state projection (D5)
   // ---------------------------------------------------------------------------
@@ -3128,6 +3241,192 @@ export class WebChannelNATSClient {
   // ---------------------------------------------------------------------------
 
   private handleMessage(msg: InboundMessage): void {
+    // #244 half B: the catch-up response is orchestration (fold N events, then
+    // drain the buffer), not a single state transition, so it is handled ahead of
+    // the ordinary dispatch and outside the seq-bearing path below.
+    if (msg.type === "difference") {
+      this.applyDifference(msg);
+      return;
+    }
+
+    // #244 half B: DURABLE (seq-bearing) frames drive gap detection and are
+    // buffered while a `get_difference` is in flight. Every other frame passes
+    // straight through — a `difference` is the only inbound frame that itself
+    // advances the cursor without being folded live.
+    if (isSeqBearingInbound(msg)) {
+      if (this.differenceInFlight) {
+        // Held, not folded — see `gapBuffer`. Drained (or discarded as covered)
+        // when the difference lands.
+        this.gapBuffer.push(msg);
+        return;
+      }
+      const seq = typeof msg.seq === "number" ? msg.seq : undefined;
+      if (seq !== undefined && seq > this.lastAppliedSeq + 1) {
+        // GAP: frames (lastApplied, seq) were dropped — NATS is at-most-once, so a
+        // hole in the contiguous seq stream is a real drop. Hold this frame and
+        // request everything after the cursor; buffer the rest until it lands.
+        // Exactly ONE `get_difference` per gap: `differenceInFlight` gates re-entry.
+        this.gapBuffer.push(msg);
+        this.requestDifference(this.lastAppliedSeq);
+        return;
+      }
+      this.applyFrame(msg);
+      // High-water advance: a deduped retry or a `messageEdited`-style revision may
+      // REUSE or repeat a seq, so the cursor only ever moves forward and a
+      // `seq <= lastApplied` is never read as a gap.
+      if (seq !== undefined && seq > this.lastAppliedSeq) this.lastAppliedSeq = seq;
+      return;
+    }
+
+    this.applyFrame(msg);
+
+    // Two NON-seq-bearing frames still carry a seq BASELINE the cursor tracks.
+    if (msg.type === "history") {
+      // The reconnect snapshot's authoritative high-water — the baseline half B
+      // resumes gap detection from (doc §16.2-6). `case "history"` has already
+      // hydrated; seed the cursor to it, never backward. (A `load_history` PAGE
+      // omits `highWaterSeq`, so this only fires for the register-time snapshot.)
+      if (typeof msg.highWaterSeq === "number") this.advanceCursor(msg.highWaterSeq);
+    } else if (msg.type === "ack") {
+      // The inbound USER opener consumes a seq but rides no durable frame — half A
+      // echoes that seq here. Advance the high-water so the turn's first agent
+      // frame at userSeq+1 reads as contiguous instead of a phantom gap. ADVANCE
+      // ONLY, never gap-detect on the ack. Two DISTINCT no-duplicate paths, do not
+      // conflate them: (1) HAPPY PATH — this ack ran `adoptCommittedIds` above,
+      // re-keying the local optimistic bubble to `webchannel-user-<seq>`; a later
+      // `difference` re-carrying that `user` event then folds as a no-op only
+      // BECAUSE the id is already held. (2) `applyUser` is additionally
+      // id-idempotent (`durable-view-reducer.ts`), which covers a RE-DELIVERED
+      // difference (a retry double-reply) — the second fold of an already-placed
+      // `webchannel-user-<seq>` is a no-op.
+      //
+      // ⚠️ These cover adoption-ran and re-delivery. They do NOT cover a LOST ack:
+      // if this ack never arrives, adoption never runs, the optimistic bubble keeps
+      // its LOCAL id, and the FIRST `difference` requested for the turn's agent-frame
+      // gap re-delivers the `user` event under `webchannel-user-<seq>` — a DISTINCT
+      // id — so `applyUser` appends a second (duplicate) user bubble in-session
+      // (N8 class). Idempotency cannot see it: there is no shared id to dedupe on
+      // without the ack. Tracked as #337 (adopt the difference-delivered user event
+      // by `random_id`, reusing #243's spine — never by text); recovered on
+      // reconnect until then. A pre-user gap from another device is likewise left to
+      // reconnect recovery (half C) rather than gap-detected here.
+      //
+      // ⚠️ HIGH-1: `advanceCursor` DEFERS this while a `get_difference` is in
+      // flight. `applyFrame` above already ran (the id-adoption is live and
+      // order-independent); only the SEQ advance is held, so the cursor stays
+      // frozen at `pendingAfterSeq` and the caught-up range does not get gated out
+      // of the fold. The deferred max is applied when the difference lands.
+      for (const entry of msg.committed ?? []) {
+        if (typeof entry?.seq === "number") this.advanceCursor(entry.seq);
+      }
+    }
+  }
+
+  /**
+   * #244 half B (HIGH-1) — raise the seq high-water, or DEFER the raise while a
+   * catch-up is in flight. Never moves the cursor backward. Deferring keeps the
+   * fold floor frozen so a mid-flight `ack`/`history` cannot gate out the very
+   * events the difference is about to deliver; the deferred max is applied in
+   * `applyDifference`.
+   */
+  private advanceCursor(seq: number): void {
+    if (this.differenceInFlight) {
+      if (seq > this.pendingDeferredSeq) this.pendingDeferredSeq = seq;
+      return;
+    }
+    if (seq > this.lastAppliedSeq) this.lastAppliedSeq = seq;
+  }
+
+  /**
+   * #244 half B — issue a fresh `get_difference` for a newly detected gap: freeze
+   * the fold floor at `afterSeq`, reset the retry budget, and arm the liveness
+   * timer (HIGH-2). One in flight at a time; `differenceInFlight` gates re-entry.
+   */
+  private requestDifference(afterSeq: number): void {
+    this.differenceInFlight = true;
+    this.pendingAfterSeq = afterSeq;
+    this.pendingDeferredSeq = 0;
+    this.differenceRetries = 0;
+    this.client.getDifference(afterSeq);
+    this.armDifferenceTimer();
+  }
+
+  /** HIGH-2 — arm (or re-arm) the in-flight timeout; a stale fire is ignored by generation. */
+  private armDifferenceTimer(): void {
+    this.cancelDifferenceTimer();
+    const generation = ++this.differenceTimerGeneration;
+    this.differenceTimer = setTimeout(() => {
+      if (this.differenceTimerGeneration !== generation || !this.differenceInFlight) return;
+      this.differenceTimer = null;
+      this.onDifferenceTimeout();
+    }, GET_DIFFERENCE_TIMEOUT_MS);
+  }
+
+  /** Null ownership before clearTimeout so a reentrant arm always wins. */
+  private cancelDifferenceTimer(): void {
+    this.differenceTimerGeneration++;
+    if (this.differenceTimer !== null) {
+      clearTimeout(this.differenceTimer);
+      this.differenceTimer = null;
+    }
+  }
+
+  /**
+   * HIGH-2 — the reply (or the request) was lost on the at-most-once `.out`. Re-issue
+   * the SAME request a bounded number of times; if it keeps failing, GIVE UP INTO A
+   * RE-DETECT: reset the in-flight state and re-dispatch the buffered frames so the
+   * first one still showing a gap requests fresh (with a fresh retry budget). Either
+   * way the stream self-heals in-session without waiting on reconnect.
+   */
+  private onDifferenceTimeout(): void {
+    if (this.differenceRetries < GET_DIFFERENCE_MAX_RETRIES) {
+      this.differenceRetries++;
+      this.client.getDifference(this.pendingAfterSeq);
+      this.armDifferenceTimer();
+      return;
+    }
+    // Gave up after the bounded burst. Stop the in-flight state and DROP the buffer
+    // (dropping never loses content — durable frames are journaled, so the next
+    // detected gap re-fetches them). The cursor stays frozen at `pendingAfterSeq`,
+    // so the NEXT durable frame re-detects the gap and requests fresh (fresh retry
+    // budget). This self-heals on the next traffic without a re-request storm while
+    // the server is unreachable — deliberately NOT an immediate re-drain, which
+    // would spin bursts back to back.
+    this.teardownGapSync();
+  }
+
+  /**
+   * #244 half B — clear all in-flight catch-up state WITHOUT applying any deferred
+   * cursor advance (the difference never landed, so the caught-up range is still
+   * missing; keeping the cursor frozen is what lets a re-detect request it again).
+   * Leaves `gapBuffer` untouched for the caller to drain. Also used on teardown.
+   */
+  private resetGapSync(): void {
+    this.cancelDifferenceTimer();
+    this.differenceInFlight = false;
+    this.differenceRetries = 0;
+    this.pendingDeferredSeq = 0;
+  }
+
+  /**
+   * #244 half B — connection-scoped teardown: reset the in-flight catch-up AND drop
+   * the buffer. Called on raw transport loss and on `close()` alongside the other
+   * connection-scoped valves (`clearStaleDraftWatch`). The buffered frames belong to
+   * the old connection; a reconnect re-seeds the cursor from a fresh `history`
+   * snapshot and re-detects any gap live. The cursor itself is left untouched (the
+   * snapshot's high-water only advances it, never backward).
+   */
+  private teardownGapSync(): void {
+    this.resetGapSync();
+    this.gapBuffer = [];
+  }
+
+  /**
+   * The ordinary per-frame dispatch: observe held-turn activity against the
+   * pre-frame latch, fold the frame, then re-evaluate the release gate. Split out
+   * of `handleMessage` so the #244 gap-sync path can gate/buffer around it.
+   */
+  private applyFrame(msg: InboundMessage): void {
     // Observe authenticated turn activity against the pre-frame live-turn latch.
     // Reducers may settle that latch or invoke public listeners, so this must be
     // the first operation for every decrypted frame.
@@ -3138,6 +3437,157 @@ export class WebChannelNATSClient {
     // release gate after the reducer settles (a no-op when nothing is held or a
     // turn is still in flight).
     this.maybeRelease();
+  }
+
+  /**
+   * #244 half B — fold a `difference` catch-up onto the view, advance the cursor,
+   * then drain the frames buffered while the request was in flight.
+   *
+   * The events are folded through the SAME `applyDurable` reducer path live frames
+   * fold through — RAW journal events, no client-local overlays, so the result
+   * converges on the durable (history) truth for the caught-up range. The cursor
+   * advances PAST every seq in the response — including one whose kind this build
+   * cannot fold (a newer plugin) — so an unknown tail is never re-requested forever
+   * (the server's `projectJournalHistory` treats such a row the same way, as an
+   * `unsupportedEvents` skip).
+   *
+   * ⚠️ HIGH-1: the fold floor is `pendingAfterSeq` — the `afterSeq` this request
+   * was ISSUED with — NOT the live cursor. A non-buffered frame (an `ack`'s user
+   * seq, a `history` high-water) can advance the cursor mid-flight; keying the
+   * fold on the live cursor would then gate out the entire caught-up range (silent
+   * data loss). Those advances were deferred into `pendingDeferredSeq` and are
+   * folded back into the cursor here, so the final cursor reflects both the
+   * difference and anything that arrived during it.
+   *
+   * ⚠️ A difference is ONLY meaningful while a request is OUTSTANDING. If one lands
+   * with no request in flight it is DROPPED here, before the timer or the fold are
+   * touched. This kills two duplicate-fold paths: (a) the retry double-reply — the
+   * original and a re-issued request both answer, the first heals
+   * (`differenceInFlight=false`) and the second must not re-fold (`floor` is still
+   * `pendingAfterSeq`, so it would re-append every `seq > floor` — and `applyUser`
+   * being idempotent (Fix 1) covers the user bubble, but dropping the whole stale
+   * reply is the cheaper, exact guard for ALL kinds); (b) a reply landing after
+   * teardown/give-up. Dropping loses nothing — durable frames are journaled, and
+   * the frozen-cursor + next-frame re-detect path re-requests what is still missing.
+   */
+  private applyDifference(msg: InboundMessage): void {
+    // No request outstanding ⇒ this reply is stale/duplicate. Drop it WITHOUT
+    // cancelling any timer (there is none to cancel that belongs to it) or draining.
+    if (!this.differenceInFlight) return;
+    // The reply landed — stop the liveness timer before folding.
+    this.cancelDifferenceTimer();
+    const floor = this.pendingAfterSeq;
+    const raw = Array.isArray(msg.events) ? msg.events : [];
+    const events = raw
+      .filter(
+        (e): e is { seq: number; event: unknown } =>
+          !!e && typeof e === "object" && typeof (e as { seq?: unknown }).seq === "number",
+      )
+      // The server sends ascending `seq`; sort defensively so the fold order is a
+      // property of this method, not of the wire.
+      .sort((a, b) => a.seq - b.seq);
+
+    let maxSeq = floor;
+    for (const { seq, event } of events) {
+      // Fold everything the request asked for (`seq > floor`); a `seq <= floor` is
+      // a raced/duplicate overlap we already hold. Skip an unknown kind's fold but
+      // still let its seq advance the cursor (an unknown tail must not re-request
+      // forever) — the server's projection treats it the same way.
+      if (seq > floor && isFoldableDurableEvent(event)) {
+        this.foldDifferenceEvent(event);
+      }
+      if (seq > maxSeq) maxSeq = seq;
+    }
+    // The cursor now reflects the folded range AND any advance deferred while the
+    // request was in flight (an `ack`/`history` seq), never moving backward.
+    this.lastAppliedSeq = Math.max(this.lastAppliedSeq, maxSeq, this.pendingDeferredSeq);
+    this.differenceInFlight = false;
+    this.differenceRetries = 0;
+    this.pendingDeferredSeq = 0;
+    this.drainGapBuffer();
+    // A difference can settle a held-turn condition (it is durable turn content),
+    // and the fold above bypassed the per-frame gate; re-evaluate it once here.
+    this.maybeRelease();
+  }
+
+  /**
+   * #244 half B — fold ONE raw catch-up event, applying the SAME client-local
+   * overlay the corresponding LIVE handler applies.
+   *
+   * ⚠️ THE OVERLAY IS LOAD-BEARING, NOT DECORATION — this is the subtlety half B
+   * turns on. `working`/`draftOnly` are client-local flags the wire never carries
+   * (a journal `placement` has no text; a `bubble`/`seal` authors durable text and
+   * RETIRES the draft). A BARE `applyDurable(bubble)` folded onto a live draft
+   * bubble keeps that bubble `draftOnly:true` — and `projectDurableFromClient`
+   * blanks a `draftOnly` bubble to `""`, so the caught-up text would VANISH from
+   * the durable view. Re-supplying the exact overlays `case "agent_message"` /
+   * `case "progress"` / `applyTurnSnapshot` supply is what makes a gap heal to a
+   * view byte-identical to the no-gap fold (live == history). Every other event
+   * kind (`user`/`reasoning`/`tool`/`approval`/…) carries no such flag, so it folds
+   * with no overlay exactly as its live handler does — an approval, like a
+   * history-replayed one, is inert until an `approval_snapshot` arms it.
+   */
+  private foldDifferenceEvent(event: DurableEvent): void {
+    switch (event.kind) {
+      case "bubble":
+        // Mirror `case "agent_message"`: durable text authored ⇒ no longer a draft.
+        this.applyDurable(event, {
+          [event.answerId]: { working: false, draftOnly: undefined },
+        });
+        return;
+      case "placement": {
+        // Mirror `case "progress"`: the slot claim is a working draft. The draft
+        // TEXT is not journaled, so it stays empty until a `bubble`/`seal` authors
+        // it (the same lane the live progress carried, minus the volatile text).
+        //
+        // ⚠️ MED-3: `draftOnly` is CLAIMED ONLY when the bubble is absent or is
+        // itself already a draft — the SAME `claimsDraft` guard the live `progress`
+        // handler applies. A placement landing on an ALREADY-AUTHORED bubble (a
+        // re-progress, or a placement re-served after its answer arrived) must NOT
+        // re-mark it droppable: `projectDurableFromClient` would then blank the
+        // authored answer to `""` (the "answer destroyed" case the live docblock
+        // guards). `working: true` is still set unconditionally, exactly as live —
+        // it is not a durable flag, so it never blanks the projection.
+        const held = this.state.messages.find(
+          (m) => m.kind === undefined && m.id === event.answerId,
+        );
+        const claimsDraft = held === undefined || held.draftOnly === true;
+        this.applyDurable(event, {
+          [event.answerId]: { working: true, ...(claimsDraft ? { draftOnly: true } : {}) },
+        });
+        return;
+      }
+      case "seal": {
+        // Mirror `applyTurnSnapshot`: each sealed answer is authored durable text.
+        const local = Object.create(null) as DurableLocalOverlay;
+        for (const a of event.answers) {
+          local[a.id] = { working: false, draftOnly: undefined };
+        }
+        this.applyDurable(event, local);
+        return;
+      }
+      default:
+        this.applyDurable(event);
+    }
+  }
+
+  /**
+   * #244 half B — replay the frames buffered during a catch-up, in arrival order.
+   *
+   * A buffered frame the difference already covered (`seq <= lastApplied`) is
+   * DISCARDED — re-folding it would double-apply a non-idempotent event. Anything
+   * still beyond the cursor is re-dispatched through `handleMessage`, so a buffered
+   * frame that reveals a FURTHER gap re-enters gap-sync cleanly, re-buffering the
+   * remainder onto the (freshly emptied) buffer.
+   */
+  private drainGapBuffer(): void {
+    const buffered = this.gapBuffer;
+    this.gapBuffer = [];
+    for (const m of buffered) {
+      const seq = typeof m.seq === "number" ? m.seq : undefined;
+      if (seq !== undefined && seq <= this.lastAppliedSeq) continue;
+      this.handleMessage(m);
+    }
   }
 
   private handleFrame(msg: InboundMessage): void {

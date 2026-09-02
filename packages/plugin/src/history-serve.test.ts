@@ -89,22 +89,30 @@ function thread(prefix: string): JournalEvent[] {
  * The byte behaviour has its own two files (`history-frame-budget.test.ts`,
  * `history-frame-oversize.test.ts`).
  */
-function recordingChannel(): {
+function recordingChannel(limit = 8 * 1024 * 1024): {
   channel: HistoryChannelSurface;
   sent: Array<{ peerId: string; messages: HistoryMessage[]; highWaterSeq?: number }>;
+  // #244 half B: the `difference` frames the serve path emitted.
+  differences: Array<{ peerId: string; events: Array<{ seq: number; event: unknown }> }>;
 } {
   const sent: Array<{ peerId: string; messages: HistoryMessage[]; highWaterSeq?: number }> = [];
+  const differences: Array<{ peerId: string; events: Array<{ seq: number; event: unknown }> }> = [];
   return {
     sent,
+    differences,
     channel: {
       // #244 half A: capture the high-water baseline the snapshot path stamps.
       sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number) {
         sent.push({ peerId, messages, highWaterSeq });
         return true;
       },
+      sendDifference(peerId, events) {
+        differences.push({ peerId, events });
+        return true;
+      },
       outboundWireSize: (_peerId, payload) =>
         Buffer.byteLength(JSON.stringify(payload), "utf8"),
-      effectiveOutboundLimit: () => 8 * 1024 * 1024,
+      effectiveOutboundLimit: () => limit,
     },
   };
 }
@@ -135,8 +143,9 @@ function manualScheduler(): {
 function harness(
   journal: DeliveryJournal,
   overrides: Partial<HistoryServerDeps> = {},
+  channelLimit?: number,
 ) {
-  const { channel, sent } = recordingChannel();
+  const { channel, sent, differences } = recordingChannel(channelLimit);
   const scheduler = manualScheduler();
   const errors: string[] = [];
   const warns: string[] = [];
@@ -151,7 +160,7 @@ function harness(
     schedule: scheduler.schedule,
     ...overrides,
   });
-  return { server, sent, scheduler, errors, warns };
+  return { server, sent, differences, scheduler, errors, warns };
 }
 
 describe("createHistoryServer — peer scoping (the assertion the old test could not make)", () => {
@@ -723,6 +732,9 @@ describe("createHistoryServer — a publish failure is not blamed on the journal
         sendHistory() {
           throw new Error("transport closed");
         },
+        sendDifference() {
+          throw new Error("transport closed");
+        },
         outboundWireSize: (_peerId, payload) =>
           Buffer.byteLength(JSON.stringify(payload), "utf8"),
         effectiveOutboundLimit: () => 8 * 1024 * 1024,
@@ -739,5 +751,105 @@ describe("createHistoryServer — a publish failure is not blamed on the journal
     expect(errors[0]).toContain("history snapshot publish failed");
     expect(errors[0]).not.toContain("journal read failed");
     expect(errors[0]).toContain("transport closed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #244 half B — serveDifference (get_difference catch-up)
+// ---------------------------------------------------------------------------
+describe("createHistoryServer.serveDifference — #244 half B", () => {
+  it("serves RAW events with seq > afterSeq, in seq order, WITHOUT running the reducer", () => {
+    const journal = openJournal();
+    // thread("a") = [user a1, bubble a2, user a3] → seqs 1, 2, 3.
+    const appended = thread("a");
+    for (const event of appended) journal.append(PEER, event);
+
+    const { server, differences } = harness(journal);
+    server.serveDifference(PEER, 1);
+
+    expect(differences).toHaveLength(1);
+    const { peerId, events } = differences[0];
+    expect(peerId).toBe(PEER);
+    // seq > 1 only: the bubble (seq 2) and the follow-up user (seq 3).
+    expect(events.map((e) => e.seq)).toEqual([2, 3]);
+
+    // ⚠️ RAW events, NOT a projected page. A reducer/projection would hand back
+    // `HistoryMessage`s — a bubble as `{id, role:"agent", text, ts}`. These are
+    // the JOURNAL EVENTS verbatim: a `bubble` with `answerId`, a `user` with
+    // `kind`. This is the assertion that proves half B is #286-free.
+    expect(events[0].event).toEqual(appended[1]); // { kind:"bubble", answerId:"a2", ... }
+    expect(events[1].event).toEqual(appended[2]); // { kind:"user", id:"a3", ... }
+    expect((events[0].event as { kind: string }).kind).toBe("bubble");
+    expect((events[0].event as { role?: unknown }).role).toBeUndefined();
+  });
+
+  it("afterSeq=0 returns the whole journal, oldest first", () => {
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    const { server, differences } = harness(journal);
+    server.serveDifference(PEER, 0);
+    expect(differences[0].events.map((e) => e.seq)).toEqual([1, 2, 3]);
+  });
+
+  it("answers an already-current afterSeq with an EMPTY difference (not silence)", () => {
+    // The client's `case "difference"` no-ops the fold and drains its buffer on an
+    // empty response; sending nothing would strand a client that buffered.
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    const { server, differences } = harness(journal);
+    server.serveDifference(PEER, 3);
+    expect(differences).toHaveLength(1);
+    expect(differences[0].events).toEqual([]);
+  });
+
+  it("scopes to the requesting peer — never another peer's rows", () => {
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    for (const event of thread("b")) journal.append(OTHER_PEER, event);
+    const { server, differences } = harness(journal);
+    server.serveDifference(PEER, 0);
+    const ids = differences[0].events.map((e) => {
+      const ev = e.event as { answerId?: string; id?: string };
+      return ev.answerId ?? ev.id;
+    });
+    // a's ids only (a1/a2/a3), never b's.
+    expect(ids).toEqual(["a1", "a2", "a3"]);
+  });
+
+  it("byte-fits an oversize difference to the OLDEST contiguous prefix, re-requestable", () => {
+    const journal = openJournal();
+    // Ten bubbles → seqs 1..10, each carrying its own text.
+    for (let i = 1; i <= 10; i++) {
+      journal.append(PEER, {
+        kind: "bubble",
+        answerId: `a${i}`,
+        turnId: `t${i}`,
+        text: `answer number ${i} with some padding text`,
+      });
+    }
+    // A tiny limit so the whole set cannot fit — but a single event still can.
+    const { server, differences } = harness(journal, {}, 220);
+    server.serveDifference(PEER, 0);
+
+    expect(differences).toHaveLength(1);
+    const seqs = differences[0].events.map((e) => e.seq);
+    // Non-empty (forward progress guaranteed) and the OLDEST prefix (starts at 1).
+    expect(seqs.length).toBeGreaterThan(0);
+    expect(seqs.length).toBeLessThan(10);
+    expect(seqs[0]).toBe(1);
+    // Contiguous ascending from 1 — no permutation, no hole.
+    expect(seqs).toEqual(seqs.map((_, i) => i + 1));
+  });
+
+  it("on a read failure, logs and sends NOTHING (never an empty frame that would falsely advance)", () => {
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    const { server, differences, errors } = harness(journal);
+    // Close the handle so the next read throws (database is not open).
+    journal.close();
+    server.serveDifference(PEER, 0);
+    expect(differences).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("difference read failed");
   });
 });

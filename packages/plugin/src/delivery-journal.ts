@@ -868,9 +868,11 @@ export function openDeliveryJournal(options: {
         // first attempt actually landed is an ordinary event, not an error:
         // return the FIRST row's seq and report `inserted: false`. Writing the
         // row twice would put the user's message in history twice while live
-        // shows it once (N8), and worse — `applyUser` blind-appends, so a
-        // duplicated id makes a later `applySeal` index past the end and THROW
-        // (the reducer's BOUNDARY 1 precondition).
+        // shows it once (N8) — the durable SSOT must stay single-copy. (Since
+        // #244 half B `applyUser` is also id-idempotent, so a duplicate that DID
+        // slip through folds to one bubble rather than overrunning a later
+        // `applySeal`; that is defense in depth, not the reason this dedupe exists
+        // — the SSOT-integrity/N8 reason above is.)
         //
         // ⚠️ GATED ON THE KINDS THAT ACTUALLY HAVE A UNIQUE INDEX. Only `user`
         // and `placement` do. For a `bubble` the lookup is not unique — it would

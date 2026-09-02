@@ -213,6 +213,9 @@ function serveVia(
         sent.push(messages);
         return true;
       },
+      // #244 half B: this suite is about history SCOPE; a stub keeps the surface
+      // complete without exercising the difference path.
+      sendDifference: () => true,
       // #311's byte budget. Plaintext sizing against a limit no test here can
       // reach, so every page takes the fast path and the assertions below are
       // about SCOPE, exactly as before.

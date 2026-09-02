@@ -1,5 +1,12 @@
 import { ANON_PEER_ID } from "./auth.js";
 import type { CommandCatalogEntry } from "./commands-catalog.js";
+// #244 half B: the `difference` frame carries RAW journal events for the client
+// to fold onto the view it already holds — so it is typed by the client reducer's
+// `DurableEvent`, the SAME type the journal stores (`delivery-journal-event.ts`'s
+// `JournalEvent` is an alias of it). TYPE-ONLY and cross-package by source path,
+// exactly like `delivery-journal-event.ts`'s import of the same type: erased under
+// `verbatimModuleSyntax`, so it adds no runtime dependency and no import cycle.
+import type { DurableEvent } from "../../client/src/durable-view-reducer.js";
 
 export const WEBCHANNEL_ID = "webchannel";
 export { ANON_PEER_ID };
@@ -304,6 +311,16 @@ export type InboundWsMessage =
    * peer-supplied (#293) and that claim is false of them.
    */
   | { type: "load_history"; before?: string; beforeTurnId?: string; limit?: number }
+  /**
+   * #244 half B (doc §16.2-6, Telegram pts/qts): request the durable events the
+   * client is MISSING — everything with `seq > afterSeq`. The client sends this
+   * when a durable frame arrives with a `seq` beyond the contiguous next one (a
+   * gap: an at-most-once NATS drop left a hole), passing its last-applied seq as
+   * `afterSeq`. The server answers with a `difference` frame (below). This is the
+   * mid-stream analogue of `load_history`: same read, but RAW events forward from
+   * a cursor rather than a projected page backward from one.
+   */
+  | { type: "get_difference"; afterSeq: number }
   | { type: "load_commands" };
 
 export type OutboundWsMessage =
@@ -519,7 +536,32 @@ export type OutboundWsMessage =
        */
       committed?: Array<{ random_id: string; messageId: string; seq: number }>;
     }
-  | { type: "inbound_rejected"; ids: string[]; reason: "overloaded" };
+  | { type: "inbound_rejected"; ids: string[]; reason: "overloaded" }
+  /**
+   * #244 half B (doc §16.2-6): the answer to `get_difference` — the RAW journal
+   * events with `seq > afterSeq`, each paired with its `seq`, in ascending `seq`
+   * order. The client folds each `event` through the SAME reducer it folds live
+   * frames through (`applyDurableEvent`), advances its last-applied seq to the max
+   * seq here, then drains any frames it buffered while the request was in flight.
+   *
+   * ⚠️ RAW EVENTS, NOT A PROJECTED PAGE — and that is what keeps half B #286-free.
+   * The `history` snapshot/page runs the quadratic full replay
+   * (`projectJournalHistory`) server-side and ships `HistoryMessage[]`; a
+   * difference ships the journal rows VERBATIM and lets the client fold them onto
+   * the view it already holds. The server does NOT run the reducer here.
+   *
+   * ⚠️ NOT SEQ-BEARING and NOT journaled — like `history`, it is a server→client
+   * REPLAY, so `isSeqBearingFrame`/`journalEventForOutbound` both reject/null it.
+   * A `seq` on the FRAME would be meaningless (it carries many); the per-event
+   * `seq` inside `events` is the cursor the client advances.
+   *
+   * ⚠️ MAY BE PARTIAL. The server caps the response (a huge gap would overflow
+   * `max_payload`); the client advances to the max seq it received and re-requests
+   * for the rest when the next durable frame (or a buffered one) still sits beyond
+   * the contiguous next seq. So a difference guarantees FORWARD PROGRESS, not
+   * completeness in one round-trip.
+   */
+  | { type: "difference"; events: Array<{ seq: number; event: DurableEvent }> };
 
 export interface WebChannelPeerChannel {
   sendText(
@@ -574,6 +616,15 @@ export interface WebChannelPeerChannel {
    * Additive and optional — see the `history` member of `OutboundWsMessage`.
    */
   sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number): boolean;
+  /**
+   * #244 half B: answer a `get_difference` with RAW events (`seq > afterSeq`), in
+   * ascending `seq` order. Optional so an older channel impl is not forced to
+   * implement it — see the `difference` member of `OutboundWsMessage`.
+   */
+  sendDifference?(
+    peerId: string,
+    events: Array<{ seq: number; event: DurableEvent }>,
+  ): boolean;
   sendApprovalRequest(peerId: string, request: ApprovalRequestPayload): boolean;
   sendApprovalResolved(peerId: string, id: string, decision: ApprovalDecision): boolean;
   sendApprovalSnapshot(peerId: string, approvals: ApprovalRequestPayload[], resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean;
@@ -595,6 +646,7 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendTurnSnapshot(_peerId: string, _turnId: string, _answers: Array<{ id: string; text: string }>, _remove: string[]): boolean { return false; }
   sendTyping(_peerId: string): boolean { return false; }
   sendHistory(_peerId: string, _messages: HistoryMessage[], _highWaterSeq?: number): boolean { return false; }
+  sendDifference(_peerId: string, _events: Array<{ seq: number; event: DurableEvent }>): boolean { return false; }
   sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload): boolean { return false; }
   sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision): boolean { return false; }
   sendApprovalSnapshot(_peerId: string, _approvals: ApprovalRequestPayload[], _resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean { return false; }

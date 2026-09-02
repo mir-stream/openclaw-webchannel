@@ -600,54 +600,54 @@ describe("applyReasoning — one completed burst per event", () => {
 });
 
 // ---------------------------------------------------------------------------
-// CHARACTERIZATION — the duplicate-`user` precondition
+// CHARACTERIZATION — a re-delivered `user` row folds idempotently (#244 half B)
 // ---------------------------------------------------------------------------
 //
-// These record what the reducer DOES on a journal that violates its stated
-// precondition (no duplicate `user` rows). They are NOT endorsements, and the
-// behavior is deliberately not "fixed" here: it is a faithful port of what the
-// client's own hand-rolled loop did before the rewire (the client now reaches
-// this same code, so the "REAL client throws too" case below no longer proves
-// independence), and inventing a dedupe rule the client lacks is exactly the
-// defect class this slice forbids. Idempotent append is the
-// JOURNAL's job (slice #239's persist-before-publish boundary).
+// ⚠️ REWRITTEN FROM "user is the one non-idempotent transition" — THAT IS NO
+// LONGER TRUE. #244 half B made `applyUser` id-idempotent: a `get_difference`
+// catch-up ships raw journal events and a re-delivered/overlapping `difference`
+// re-folds them, so re-folding a `user` event became a real RUNTIME path, not just
+// a precondition violation. The old block recorded (and endorsed as "the journal's
+// job") the blind append that duplicated an immutable user final and then crashed
+// the next `seal` on a slot overrun. Both are now fixed AT THE REDUCER — one
+// property, matching how every other fold arm dedups by id.
 //
-// The hazard is real: §15.8 mandates non-destructive retry of a failed journal
-// append, so a retry whose first attempt landed writes the row twice.
+// The hazard was real: §15.8 mandates non-destructive retry of a failed journal
+// append, and the catch-up path re-delivers; either could fold the row twice.
 
-describe("characterization: a duplicated `user` row violates the reducer's precondition", () => {
+describe("characterization: a re-delivered `user` row folds idempotently (#244 half B)", () => {
   const duplicated: DurableEvent[] = [
     { kind: "user", id: "u-0", text: "same message", turnId: "w-0" },
     { kind: "user", id: "u-0", text: "same message", turnId: "w-0" },
   ];
 
-  it("appends the bubble TWICE (`user` is the one non-idempotent transition)", () => {
-    // `placement`/`bubble` upsert and `seal` is keyed by answer id, so replaying
-    // those is harmless. `user` blind-appends, mirroring `publish()`.
+  it("folds a duplicate id to ONE bubble (`applyUser` is id-idempotent)", () => {
+    // Every fold arm now dedups by id: `placement`/`bubble` upsert, `seal` is keyed
+    // by answer id, and `user` no longer blind-appends — a held id is a no-op.
     const view = reduceDurableView(duplicated);
-    expect(view.map((m) => m.id)).toEqual(["u-0", "u-0"]);
-    // History would show the user's message twice while live shows it once —
-    // the N8 live≠history duplicate class, reintroduced at the fold.
-    expect(view).toHaveLength(2);
+    expect(view.map((m) => m.id)).toEqual(["u-0"]);
+    expect(view).toHaveLength(1);
   });
 
-  it("makes a later `seal` THROW rather than return a view", () => {
-    // With a duplicate id present, `slots.length > answers.length`, so the slot
-    // refill indexes `answers[idx]` past the end. A pure projection that crashes.
-    // Matched on the MESSAGE too: a bare `toThrow(TypeError)` would go green on
-    // any unrelated TypeError and stop describing this defect.
+  it("a later `seal` does NOT throw — there is no duplicate slot to overrun", () => {
+    // Previously a duplicate id made `slots.length > answers.length` and the refill
+    // indexed `answers[idx]` past the end (a pure projection that crashed). With one
+    // bubble the counts line up and the seal reconciles cleanly.
     expect(() =>
       reduceDurableView([
         ...duplicated,
         { kind: "seal", turnId: TURN, answers: [{ id: "u-0", text: "sealed" }], remove: [] },
       ]),
-    ).toThrow(/Cannot read properties of undefined \(reading 'id'\)/);
+    ).not.toThrow();
   });
 
-  it("is faithful: the REAL client throws on the same input", () => {
-    // Non-circular check that the crash is a PORTED behavior, not one this
-    // module introduced. Drive the real client with the same duplicated view
-    // plus the same snapshot frame.
+  it("characterization retained: a duplicate SEEDED directly into the view still crashes the client", () => {
+    // ⚠️ This is a DIFFERENT precondition from the fold above. `applyUser`'s
+    // idempotency stops the FOLD from ever producing a duplicate, but a duplicate
+    // injected straight into `state.messages` (bypassing the reducer) is still
+    // garbage-in: `seed()` puts both rows in state and the snapshot's `seal` then
+    // overruns exactly as before. Kept as the faithful record that the reducer
+    // guards its own fold, not arbitrary pre-seeded state.
     const duplicatedView: DurableView = [
       { kind: "text", id: "u-0", role: "user", text: "same message", turnId: "w-0" },
       { kind: "text", id: "u-0", role: "user", text: "same message", turnId: "w-0" },
@@ -2387,5 +2387,49 @@ describe("#241 half 2: seal.remove tombstones (not filter), no resurrect", () =>
     );
     expect(clientVisible).toEqual(serverVisible);
     expect(clientVisible.map((m) => m.id)).toEqual(["A"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #244 half B — the fold is IDEMPOTENT under a re-delivered difference
+// ---------------------------------------------------------------------------
+//
+// A `get_difference` catch-up ships RAW journal events, and a re-delivered or
+// overlapping `difference` (a retry double-reply, a stale reply) re-folds them.
+// Every fold arm must therefore be id-idempotent — `applyUser` was the one arm
+// that appended unconditionally, duplicating an IMMUTABLE user final. These pin
+// the contract at the reducer, where it is one property rather than a wrapper rule.
+describe("#244 half B — applyUser is id-idempotent (re-delivery safe)", () => {
+  it("no-ops when the id is already held — never a second user bubble", () => {
+    const view = reduceDurableView([
+      { kind: "user", id: "webchannel-user-3", text: "hi", turnId: TURN },
+    ]);
+    expect(view).toHaveLength(1);
+    const again = applyDurableEvent(view, {
+      kind: "user",
+      id: "webchannel-user-3",
+      text: "hi",
+      turnId: TURN,
+    });
+    expect(again).toHaveLength(1);
+    // Return-by-reference no-op, exactly like applyPlacement's durable no-op.
+    expect(again).toBe(view);
+  });
+
+  it("a representative difference batch folds byte-identically when applied TWICE", () => {
+    // user + placement + bubble + seal — the kinds a real catch-up carries. The
+    // second fold must change nothing: this is the twice-applied guard for ALL
+    // arms, not just user.
+    const batch: DurableEvent[] = [
+      { kind: "user", id: "webchannel-user-1", text: "question", turnId: TURN },
+      { kind: "placement", answerId: "A", turnId: TURN },
+      { kind: "bubble", answerId: "A", text: "final A", turnId: TURN },
+      { kind: "seal", turnId: TURN, answers: [{ id: "A", text: "final A" }], remove: [] },
+    ];
+    const once = batch.reduce<DurableView>((v, e) => applyDurableEvent(v, e), []);
+    const twice = batch.reduce<DurableView>((v, e) => applyDurableEvent(v, e), once);
+    expect(twice).toEqual(once);
+    // And specifically: exactly one user bubble survives the double fold.
+    expect(twice.filter((m) => m.kind === "text" && m.role === "user")).toHaveLength(1);
   });
 });

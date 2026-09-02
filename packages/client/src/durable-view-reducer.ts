@@ -899,11 +899,31 @@ export function reduceDurableView(events: readonly DurableEvent[]): DurableView 
   return events.reduce<DurableView>((view, event) => applyDurableEvent(view, event), []);
 }
 
-/** Final user materialization always APPENDS a fresh u- bubble at the tail. */
+/**
+ * Final user materialization — APPEND a fresh u- bubble at the tail, unless the id
+ * is already held, in which case NO-OP (return the input by reference).
+ *
+ * ⚠️ id-IDEMPOTENT, AND THAT IS A CONTRACT, NOT A NICETY (#244 half B). A `user`
+ * event can be folded MORE THAN ONCE: a `get_difference` catch-up ships raw journal
+ * events, and a re-delivered/overlapping `difference` (a retry double-reply, a
+ * stale reply landing after a heal) would re-fold this event. Appending
+ * unconditionally then duplicates the user bubble — a user final is IMMUTABLE, so
+ * a second copy is pure corruption, and it is the exact "folds as a no-op by id"
+ * guarantee the wrapper's ack-path docblock relies on. Every other durable fold
+ * (`bubble`/`placement`/`tool`/`approval`/`seal`) already dedups by id; this one
+ * did not, and that was the one non-idempotent arm.
+ *
+ * The whole-log `reduceDurableView` is unaffected: a journal never holds two rows
+ * under one user id (the id is minted with the seq, uniquely), so "no-op when
+ * present" can never wrongly drop a distinct message there. Text is deliberately
+ * NOT updated on an existing id — a user final does not change, so no-op is the
+ * contract (mirrors `applyPlacement`'s durable no-op return-by-reference).
+ */
 function applyUser(
   view: DurableView,
   event: { id: string; text: string; turnId?: string },
 ): DurableView {
+  if (findTextIndex(view, event.id) !== -1) return view;
   return [
     ...view,
     { kind: "text", id: event.id, role: "user", text: event.text, turnId: event.turnId },

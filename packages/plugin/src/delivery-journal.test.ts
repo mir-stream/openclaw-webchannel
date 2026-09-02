@@ -221,11 +221,13 @@ describe("idempotent append", () => {
   });
 
   it("keeps a replayed journal REDUCIBLE — no applySeal throw (BOUNDARY 1)", () => {
-    // The whole reason dedupe lives here. `applyUser` blind-appends, so a
-    // duplicated user id puts two entries under one id in the view; a later
-    // `seal` naming that id then finds MORE slots than answers and indexes
-    // `answers[idx]` past the end. Assert the ABSENCE of that crash, not just
-    // the row count.
+    // Two layers keep a replay reducible, and this pins BOTH. (1) The journal
+    // dedupes `user` at append, so a duplicated id never persists a second row —
+    // that is what keeps the durable SSOT single-copy (an N8 guard: history must
+    // not show a message live shows once). (2) Since #244 half B `applyUser` is
+    // itself id-idempotent, so even a stream that DID carry the duplicate folds
+    // to one bubble — defense in depth, and the reason a later `seal` naming that
+    // id no longer overruns its slots.
     const journal = open(newJournalPath());
     const user: JournalEvent = { kind: "user", id: "u-0", text: "ask", turnId: TURN };
     const seal: JournalEvent = {
@@ -243,12 +245,14 @@ describe("idempotent append", () => {
     const view = reduceDurableView(replayed);
     expect(view.map((message) => message.id)).toEqual(["u-0"]);
 
-    // Contrast: the SAME stream with the duplicate the journal refused is what
-    // the reducer's characterization test records as throwing. Without this
-    // line the assertion above could pass for the wrong reason.
-    expect(() => reduceDurableView([user, user, seal] as DurableEvent[])).toThrow(
-      /Cannot read properties of undefined \(reading 'id'\)/,
-    );
+    // Contrast: the SAME stream WITH the duplicate the journal refused. Before
+    // #244 half B this threw (a duplicated `user` overran the seal's slots); now
+    // the reducer dedupes it independently, folding to one `u-0` and sealing
+    // cleanly. Without this line the assertion above could pass for the wrong
+    // reason (only the journal dedupe, not the reducer's own idempotency).
+    expect(reduceDurableView([user, user, seal] as DurableEvent[]).map((m) => m.id)).toEqual([
+      "u-0",
+    ]);
   });
 
   it("writes a repeated `placement` once", () => {

@@ -181,7 +181,10 @@ export type InboundMessage = {
     // id-carrying `user_message` at ingress so the client can drain its unacked
     // replay ledger; unknown ids are a silent no-op.
     | "ack"
-    | "inbound_rejected";
+    | "inbound_rejected"
+    // #244 half B: the gap-recovery catch-up response (carries `events`). The
+    // wrapper folds each raw event through its reducer and advances its seq cursor.
+    | "difference";
   id?: string;
   /** P0-7b: the acknowledged `user_message` ids on an `ack` frame. */
   ids?: string[];
@@ -340,6 +343,14 @@ export type InboundMessage = {
   seq?: number;
   /** #244 half A — see `seq`. */
   highWaterSeq?: number;
+  /**
+   * #244 half B: the RAW journal events on a `difference` frame — each `event` is
+   * an untyped wire object the wrapper folds through its reducer, paired with the
+   * per-conversation `seq` the wrapper advances its cursor to. Loose here (zero-dep
+   * package, runtime discrimination); the strong shape is `channel-contract.ts`'s
+   * `difference` member.
+   */
+  events?: Array<{ seq: number; event: unknown }>;
   /** P0-3: the slash-command catalog on a `commands` frame. */
   commands?: CommandCatalogEntry[];
 };
@@ -362,6 +373,10 @@ export type OutboundMessage =
   // addressed by the pair `(turnId, id)`. Additive — omitting it is the id-only
   // cursor every older peer sends.
   | { type: "load_history"; before?: string; beforeTurnId?: string; limit?: number }
+  // #244 half B: request the durable events with `seq > afterSeq` — the client's
+  // gap-recovery round-trip. Mirrors `channel-contract.ts`'s `get_difference`
+  // (zero-dep package, so declared here rather than imported).
+  | { type: "get_difference"; afterSeq: number }
   // P0-3: request the slash-command discovery catalog.
   | { type: "load_commands" };
 
@@ -1600,6 +1615,15 @@ export class WebChannelNatsClient {
    */
   loadHistory(before?: string, limit?: number, beforeTurnId?: string): void {
     this.enqueue({ type: "load_history", before, beforeTurnId, limit });
+  }
+
+  /**
+   * #244 half B: request the durable events with `seq > afterSeq` (gap recovery).
+   * Buffered until the handshake completes, like `loadHistory`. The wrapper calls
+   * this when it detects a seq gap; the server answers with a `difference` frame.
+   */
+  getDifference(afterSeq: number): void {
+    this.enqueue({ type: "get_difference", afterSeq });
   }
 
   /** Request the slash-command catalog (buffered until the handshake completes). */
