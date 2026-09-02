@@ -5,7 +5,11 @@ import {
   overflowResolverMetadataBytes,
 } from "./inbound-overflow-resolver.js";
 import { InboundRetentionBudget } from "./inbound-retention.js";
-import { createIngressOutcomeStore, type IngressOutcomeStore } from "./ingress-outcome.js";
+import {
+  createIngressOutcomeStore,
+  type IngressOutcome,
+  type IngressOutcomeStore,
+} from "./ingress-outcome.js";
 import { createBoundedInboundDebouncer } from "./bounded-inbound-debouncer.js";
 import {
   CancelledInboundFallbackTombstones,
@@ -13,7 +17,7 @@ import {
 } from "./ingress-dedupe.js";
 
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
-const recorded = (outcome: "accepted" | "overloaded" = "overloaded") => {
+const recorded = (outcome: IngressOutcome = "overloaded") => {
   const write = {
     outcome,
     created: true,
@@ -98,11 +102,14 @@ describe("BoundedOverflowResolver", () => {
       accountId: "a", peerId: "p", key: "p:i", id: "i", sessionToken: token,
       recoverCancelled: true,
     })).toEqual({ status: "started" });
-    expect(store.record).toHaveBeenCalledWith("a", "p:i", "accepted", {
-      replaceOpposite: true,
+    // #344: the cancelled-recovery write records `cancelled`, not `accepted` —
+    // it writes no journal row on purpose, and under `accepted` the accept seam
+    // read that as its crash window and re-ran the killed text.
+    expect(store.record).toHaveBeenCalledWith("a", "p:i", "cancelled", {
+      replaceOthers: true,
     });
     expect(resolver.invalidateSession(token)).toBe(true);
-    const late = recorded("accepted");
+    const late = recorded("cancelled");
     finishRecord(late.result);
     await tick();
     await tick();
@@ -178,7 +185,13 @@ describe("BoundedOverflowResolver", () => {
       overloadedValues.add(scoped);
       return fresh;
     });
-    const store = createIngressOutcomeStore({ accepted, overloaded });
+    // #344: a third outcome store. This test never records `cancelled`, so an
+    // empty one is enough.
+    const store = createIngressOutcomeStore({
+      accepted,
+      overloaded,
+      cancelled: persistent(new Set<string>()),
+    });
     const sendRejected = vi.fn(() => true);
     const resolver = new BoundedOverflowResolver({
       outcomeStore: store, sendAck: () => true, sendRejected,
@@ -339,7 +352,7 @@ describe("BoundedOverflowResolver", () => {
     expect(resolver.hasActiveClaim("a", "p:i")).toBe(false);
   });
 
-  it("recovers a stopped replay as accepted through the bounded overflow gate", async () => {
+  it("recovers a stopped replay as CANCELLED through the bounded overflow gate", async () => {
     const accountId = "acct";
     const peerId = "peer";
     const id = "stopped";
@@ -361,15 +374,15 @@ describe("BoundedOverflowResolver", () => {
     const overloaded = new Set<string>([`${accountId}:${key}`]);
     let finishRecord!: (value: any) => void;
     const recordGate = new Promise<any>((resolve) => { finishRecord = resolve; });
-    const recovery = recorded("accepted");
+    const recovery = recorded("cancelled");
     recovery.write.commit.mockImplementation(() => {
       accepted.add(`${accountId}:${key}`);
     });
     const store = {
       peek: vi.fn(() => "overloaded" as const),
       lookup: vi.fn(),
-      record: vi.fn((recordAccount: string, recordKey: string, outcome: string, options?: { replaceOpposite?: boolean }) => {
-        if (options?.replaceOpposite && outcome === "accepted") {
+      record: vi.fn((recordAccount: string, recordKey: string, outcome: string, options?: { replaceOthers?: boolean }) => {
+        if (options?.replaceOthers && outcome === "cancelled") {
           overloaded.delete(`${recordAccount}:${recordKey}`);
         }
         return recordGate;
@@ -431,8 +444,10 @@ describe("BoundedOverflowResolver", () => {
     expect(overflowRequest?.recoverCancelled).toBe(true);
     expect(store.peek).not.toHaveBeenCalled();
     expect(store.lookup).not.toHaveBeenCalled();
-    expect(store.record).toHaveBeenCalledWith(accountId, key, "accepted", {
-      replaceOpposite: true,
+    // #344: `cancelled` — see the resolver's own comment on why this id must
+    // never be reclassified, and why borrowing `accepted` for it was the bug.
+    expect(store.record).toHaveBeenCalledWith(accountId, key, "cancelled", {
+      replaceOthers: true,
     });
     expect(resolver.usage()).toEqual({
       tasks: 1,

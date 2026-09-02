@@ -92,6 +92,28 @@
   any messages that arrived while it was waiting, rather than at the point the
   browser showed it on reconnect.
 
+- **A user message lost in the accept seam's crash window is now recovered on
+  replay, and a `/stop`-killed one still is not (#344, extends #292).** The
+  plugin recorded its dedupe marker before writing the delivery-journal row, so a
+  crash between the two left a marker with no row; the client's replay then found
+  the marker, was acked as a duplicate, and the message was absent from the
+  journal — which is the only history store — forever, while the sending device
+  kept showing a "sent" bubble. The journal is now the authority: an `accepted`
+  marker with no row for that `random_id` is not evidence of an accept, so the
+  replay is admitted, journaled and answered instead of dropped. The durable
+  write order is unchanged (marker first, row second); only the rule for reading
+  a disagreement changed.
+
+  Making that safe needed a second change, because "marker, no row" was also how
+  a `/stop` suppression was stored on purpose. Cancelled text now records a
+  distinct `cancelled` outcome, so a replay of it is still acked and dropped and
+  never re-runs. **Upgrade note:** a cancellation recorded by an earlier build
+  sits under the old `accepted` marker and stays ambiguous until it expires (7
+  days). If that message's ack was also lost, its next replay re-runs the aborted
+  turn once. It needs all three — a pre-upgrade cancellation, a lost ack, and a
+  replay inside the window — and it cannot be repaired after the fact, because
+  the two cases are indistinguishable in the old marker.
+
 - **A turn whose answer count does not line up no longer loses an answer (#340,
   extends #260).** When a turn ends with two or more finals whose count does not
   match the count of answers that actually streamed — in either direction — the plugin

@@ -45,10 +45,38 @@
  * the item loop and the footer's ordering block (which also states the cost:
  * a marker with no row re-runs its turn ONCE).
  *
+ * ⚠️ AND IT IS ONLY SAFE BECAUSE `cancelled` IS ITS OWN OUTCOME — the first
+ * version of this fix was wrong here, so the reason is worth keeping. "Marker,
+ * no row" is NOT only the crash window: the three `/stop` suppression writers
+ * (`nats-account-runtime.ts`'s `onCancel`, this file's cancelled-inbound
+ * fallback, `inbound-overflow-resolver.ts`'s `recoverCancelled`) write a marker
+ * and DELIBERATELY no row. While they spelled that `accepted`, the two states
+ * were byte-identical, and a cancelled message whose ack was lost — `sendAck`
+ * returned false, or the peer was offline and the at-most-once `.out` frame
+ * evaporated — came back on reconnect and was RE-ADMITTED: `/stop` undone, the
+ * killed turn run. They now record `cancelled` (`ingress-outcome.ts`), which the
+ * found branch drops with an ack and never re-admits. The journal answers "was
+ * this accepted?"; only the outcome can answer "was it ever meant to be?".
+ *
+ * ⚠️ MIGRATION, NARROW BUT REAL. A cancellation recorded by a build BEFORE this
+ * change sits in the `accepted` namespace and stays ambiguous for that marker's
+ * 7-day TTL: if that same message's ack was ALSO lost, its next replay finds
+ * `accepted` with no row and re-runs the turn once. It needs a pre-upgrade
+ * cancellation AND a lost ack AND a replay inside the TTL. Not repaired on
+ * purpose — the two namespaces cannot be told apart after the fact, and
+ * re-running one aborted turn is the lesser error than re-introducing the drop
+ * this slice exists to remove.
+ *
  * ⚠️ THREE THINGS THE HEALING DOES NOT COVER, so this heading is not retired.
- *  1. AN ITEM WITH NO `random_id`. Its journal row is keyed by the wire id,
- *     which `lookupUserMessageIdByRandomId` cannot query, so absence proves
- *     nothing and the marker still wins. Older clients only.
+ *  1. AN ITEM WITH NO `random_id`. Its journal row is keyed by the wire id, and
+ *     this seam does NOT query the journal by that — a scope choice, not a
+ *     limit: `appendInboundUser` stores `idempotency_key = randomId ?? turnId`
+ *     and `lookupUserMessageIdByRandomId` reads that same column, so the wire id
+ *     WOULD resolve an older client's row. It is not passed because the echo
+ *     this branch feeds is keyed by `random_id` and an older client has none, so
+ *     widening it buys an existence check and nothing else. The marker still
+ *     wins for those items; extending the check to the wire id is a follow-up,
+ *     not an impossibility.
  *  2. THE ID-LESS ADMIT PATH. No usable wire id ⇒ no dedupe key ⇒ neither a
  *     marker nor a row is ever written for it, so there is nothing here to heal;
  *     the item is admitted un-deduped and reported as a gap exactly as before
@@ -409,9 +437,17 @@ type JournalWarning =
    * `random_id`. The journal is the accept authority, so the marker is not
    * evidence of an accept: the item is RE-ADMITTED (journaled, dispatched,
    * acked with a fresh `committed` echo) instead of being re-acked as a
-   * duplicate. Its own member because it is a recovery, not a gap — nothing is
-   * lost when it fires — and because sharing a window with the
+   * duplicate. Its own member because sharing a window with the
    * `unjournalable-*` lines would let either hide the other.
+   *
+   * ⚠️ READ IT AS "A TURN IS RE-RUNNING", NOT "ALL IS WELL". In the normal case
+   * it is a pure recovery — a message that would have been dropped now runs. But
+   * a marker left by a build from BEFORE `cancelled` became its own outcome may
+   * be a `/stop` suppression wearing the `accepted` namespace, and this line is
+   * then the sound of an aborted turn being re-run once (the migration note in
+   * the file header bounds it: pre-upgrade cancellation × lost ack × 7-day TTL).
+   * A burst right after an upgrade is that; a steady trickle is the crash window
+   * doing its job.
    */
   | "orphaned-accept-marker";
 
@@ -479,10 +515,12 @@ function createRateLimitedJournalWarning(
  * serialized flush path, not the raw handler.
  *
  * PRODUCTION outcome/lease branch, per flush batch:
- *  - lookup the durable accepted/overloaded outcome before admission — and, for
- *    an `accepted` one, CONFIRM IT AGAINST THE JOURNAL, which is the authority
- *    (#344): a marker with no row for the item's `random_id` is not an accept,
- *    so the item is re-admitted down the fresh path instead of re-acked;
+ *  - look up the durable terminal outcome before admission and act on WHICH one
+ *    it is (#344): `overloaded` → `inbound_rejected`; `cancelled` (text `/stop`
+ *    killed, never journaled on purpose) → ack and drop; `accepted` → CONFIRM IT
+ *    AGAINST THE JOURNAL, which is the authority — a marker with no row for the
+ *    item's `random_id` is not an accept, so the item is re-admitted down the
+ *    fresh path instead of re-acked;
  *  - offer fresh work against the dispatcher lease and record exactly one chosen
  *    outcome before committing the lease;
  *  - commit each FRESH admission's `user` event to the v6 delivery journal —
@@ -781,8 +819,15 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               result = await deps.outcomeStore.record(
                 accountId,
                 key,
-                "accepted",
-                { replaceOpposite: true },
+                // ⭐ #344 — `cancelled`, NOT `accepted`. This is the second of the
+                // three suppression writers (with `nats-account-runtime.ts`'s
+                // `onCancel` and `inbound-overflow-resolver.ts`'s
+                // `recoverCancelled`), and all three deliberately write NO journal
+                // row. Under `accepted` that state was indistinguishable from the
+                // accept seam's crash window, so the found branch below re-admitted
+                // killed text on any replay whose ack was lost.
+                "cancelled",
+                { replaceOthers: true },
               );
               if (result.status !== "recorded") {
                 logWarn?.("webchannel: cancelled-inbound fallback outcome retry failed");
@@ -797,9 +842,9 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               continue;
             }
             if (result?.status !== "recorded") {
-              // The fallback is authoritative accepted suppression, but without
-              // a successful replacement write it has no publishable chosen
-              // outcome. Preserve peer FIFO until that retry succeeds.
+              // The fallback is authoritative cancellation suppression, but
+              // without a successful replacement write it has no publishable
+              // chosen outcome. Preserve peer FIFO until that retry succeeds.
               release();
               fifoBlocked = true;
               continue;
@@ -837,9 +882,28 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // whole and this id's durable outcome is unchanged, so the replay
             // lands here again and is classified again — acked, rejected, or
             // (#344, below) re-admitted, whichever the two stores then say.
-            if (existing.outcome !== "accepted") {
+            if (existing.outcome === "overloaded") {
               release();
               rejectedIds.push(id);
+              continue;
+            }
+            // ⭐ #344 — A CANCELLED REPLAY IS DROPPED, NOT RE-ADMITTED, AND THIS
+            // ARM IS WHY THE OUTCOME HAD TO SPLIT. Text `/stop` killed has a
+            // marker and, on purpose, NO journal row — the same shape the crash
+            // window leaves. Read only the row and the two are one state; read
+            // the outcome and they are two. So this arm answers the row question
+            // by NOT ASKING IT.
+            //
+            // ACK, never `inbound_rejected`: the ack is what drains the client's
+            // replay ledger so it stops re-sending dead text, and a rejection
+            // would tell the peer its message hit backpressure, which is a lie.
+            // No `committed` echo either — there is no row to echo, and inventing
+            // one would put a durable id on the wire for a message history does
+            // not have. This is exactly what the branch did before the split,
+            // when the same suppression was spelled `accepted`.
+            if (existing.outcome === "cancelled") {
+              release();
+              ackIds.push(id);
               continue;
             }
             // #243 half 2a — THE DEDUPED-RETRY ECHO. The retry is caught here,
@@ -875,9 +939,11 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // site: the one append stays in the footer.
             //
             // The three ways out of the check, and why each still acks:
-            //  - no `random_id` (an older client): its rows are keyed by the wire
-            //    id, which this lookup cannot query, so absence proves nothing.
-            //    Unchanged behaviour — ack, no echo.
+            //  - no `random_id` (an older client): its row is keyed by the wire
+            //    id and this seam does not query by that. A SCOPE choice, not a
+            //    limit — `appendInboundUser` writes `idempotency_key =
+            //    randomId ?? turnId` and this lookup reads that column, so the
+            //    wire id would resolve it. Unchanged behaviour: ack, no echo.
             //  - no `deps.deliveryJournal` (P0-7a wiring, and this file's own
             //    pre-journal tests): there is no authority to consult.
             //  - a row exists: the ordinary deduped retry, re-echoing the FIRST
@@ -925,13 +991,13 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               // alongside it would create the dual terminal outcome
               // `lookupUnlocked` treats as an invariant violation, so replace it
               // — exactly what the cancelled-inbound fallback does in the other
-              // direction. `replaceOpposite` fails CLOSED (`status: "unknown"`),
+              // direction. `replaceOthers` fails CLOSED (`status: "unknown"`),
               // which lands on the same FIFO barrier below.
               result = await deps.outcomeStore.record(
                 accountId,
                 key,
                 "overloaded",
-                readmitted ? { replaceOpposite: true } : undefined,
+                readmitted ? { replaceOthers: true } : undefined,
               );
             } catch {
               warnOutcomeFailure(accountId, "adapter-record-overloaded");
@@ -1013,12 +1079,13 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         // `/stop` or peer retirement can invalidate an earlier committed offer
         // while this same batch is stalled on a later lookup/write. Nothing in
         // an invalidated generation may reach the dispatcher or publish its
-        // normal result. Cancellation keeps accepted markers as tombstones;
-        // teardown removes them so a replacement runtime is not poisoned.
+        // normal result. Cancellation keeps the killed ids' markers as tombstones
+        // (`cancelled` since #344, `accepted` before it); teardown removes them so
+        // a replacement runtime is not poisoned.
         const invalidated = !isActive() || retained.some((entry) => !entry.isActive());
         if (invalidated) {
           // Release key-operation gates through exact-write rollback before
-          // waiting for cancellation, whose accepted replacement write may be
+          // waiting for cancellation, whose `cancelled` replacement write may be
           // queued behind one of them.
           await rollbackWrites();
           await Promise.all(
@@ -1063,12 +1130,26 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         // That check is what makes the crash window the file header describes
         // HEAL on the client's replay instead of losing the message forever.
         //
-        // ⚠️ THE COST, STATED: a marker with no row is re-admitted, so a marker
-        // left by a PRE-JOURNAL plugin version — or one whose row is gone (an
-        // erased or cut-over journal file, doc §15.6) — re-runs that message's
-        // turn ONCE on its next replay instead of silently dropping it. Bounded
-        // by the marker store's 7-day TTL and by the client's ledger (only a
-        // message the client is still replaying can reach this at all).
+        // ⚠️ THE QUESTION IS ASKED ONLY OF `accepted`, AND THAT IS THE FIX'S
+        // LOAD-BEARING HALF. "No row" is a deliberate, permanent state for the
+        // three `/stop` suppression writers, so the journal cannot arbitrate
+        // there — asking it would undo the cancellation. They record `cancelled`
+        // (a distinct terminal outcome, `ingress-outcome.ts`), which the item
+        // loop drops with an ack and never re-admits. One store answers "was it
+        // accepted?"; the other answers "was it ever meant to run?", and only the
+        // second can tell the crash window from a `/stop`.
+        //
+        // ⚠️ THE COST, STATED, IN TWO PARTS.
+        //  1. ONGOING: an `accepted` marker whose row is genuinely gone — a
+        //     pre-journal build, or an erased or cut-over journal file (doc
+        //     §15.6) — re-runs that message's turn ONCE on its next replay
+        //     instead of being dropped. Bounded by the marker store's 7-day TTL
+        //     and by the client's ledger (only a message the client is still
+        //     replaying reaches this at all).
+        //  2. ONE-OFF, ON UPGRADE: a cancellation recorded as `accepted` by an
+        //     older build is indistinguishable from (1) for that marker's TTL, so
+        //     if its ack was also lost, the aborted turn re-runs once. The file
+        //     header carries the full statement.
         //
         // ⚠️ THE ASYMMETRY WITH THE EGRESS SEAM IS DELIBERATE AND IS THE WHOLE
         // POINT OF THIS BLOCK. At egress (§15.8, `nats-channel.ts`'s

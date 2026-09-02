@@ -5,6 +5,10 @@ import type {
   RetentionSessionToken,
 } from "./inbound-retention.js";
 import { estimateRetainedMessageBytes } from "./inbound-retention.js";
+// #344: the debouncer only RELAYS a known outcome (it never branches on the
+// value), so it binds the union rather than restating its members — a fourth
+// outcome must not need an edit here.
+import type { IngressOutcome } from "./ingress-outcome.js";
 
 export type RetainedDebounceEntry<Item> = {
   item: Item;
@@ -12,7 +16,7 @@ export type RetainedDebounceEntry<Item> = {
   id?: string;
   /** False after this key/account generation has been retired. */
   isActive(): boolean;
-  /** True when `/stop` owns this pre-run entry's terminal accepted outcome. */
+  /** True when `/stop` owns this pre-run entry's terminal `cancelled` outcome. */
   isCancellationRequested(): boolean;
   /** True after peer/account teardown revokes cancellation delivery ownership. */
   isRetired(): boolean;
@@ -24,7 +28,7 @@ export type BoundedDebouncePushResult =
   | { status: "accepted" }
   | { status: "duplicate-inflight" }
   | { status: "overflow-inflight" }
-  | { status: "known-outcome"; outcome: "accepted" | "overloaded" }
+  | { status: "known-outcome"; outcome: IngressOutcome }
   | { status: "overflow"; reason: RetentionLimitReason; chargedBytes?: number }
   | { status: "disposed" };
 
@@ -49,11 +53,11 @@ export type BoundedInboundDebouncerOptions<Item> = {
   onFlush(entries: readonly RetainedDebounceEntry<Item>[]): Promise<void> | void;
   onCancel?: (entries: readonly RetainedDebounceEntry<Item>[]) => Promise<void> | void;
   getId?: (item: Item) => string | undefined;
-  peekOutcome?: (key: string, id: string) => "accepted" | "overloaded" | undefined;
+  peekOutcome?: (key: string, id: string) => IngressOutcome | undefined;
   isOverflowClaimed?: (key: string, id: string) => boolean;
   /** Synchronous `/stop` tombstone lookup; authoritative over cached outcomes. */
   isCancelledFallback?: (key: string, id: string) => boolean;
-  onKnownOutcome?: (key: string, id: string, outcome: "accepted" | "overloaded") => void;
+  onKnownOutcome?: (key: string, id: string, outcome: IngressOutcome) => void;
   onOverflow?: (params: {
     key: string;
     item: Item;

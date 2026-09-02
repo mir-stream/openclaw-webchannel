@@ -453,6 +453,22 @@ describe("index-nats.ts wiring contract — ingress ack (P0-7b)", () => {
     // the tested helper (else a reconnect replays text the user aborted).
     expect(RUNTIME_SOURCE).toMatch(/onCancel:/);
     expect(RUNTIME_SOURCE).toMatch(/recordCancelledInboundItems\(/);
+    // ⭐ #344: that suppression must record `cancelled`, NEVER `accepted`. Both
+    // write a marker and no journal row, so while it was spelled `accepted` the
+    // accept seam could not tell a `/stop` from its own crash window and
+    // re-admitted killed text whenever this ack was lost. Pinned HERE because the
+    // outcome value is chosen at the wiring site, not inside the tested helper.
+    expect(RUNTIME_SOURCE).toMatch(
+      /processIngressOutcomes\.record\(\s*accountId,\s*key,\s*"cancelled",\s*\{\s*replaceOthers:\s*true,?\s*\},?\s*\)/,
+    );
+    expect(RUNTIME_SOURCE).not.toMatch(
+      /processIngressOutcomes\.record\(\s*accountId,\s*key,\s*"accepted"/,
+    );
+    // And the peer hears a refusal for exactly one outcome. `cancelled` acks, so
+    // the client's ledger drains instead of replaying dead text forever.
+    expect(RUNTIME_SOURCE).toMatch(
+      /if\s*\(outcome === "overloaded"\)\s*channel\.sendInboundRejected\(peerId,\s*\[id\]\);/,
+    );
     // The control-lane branch bypasses the debouncer/onFlush, so it acks its own
     // id-carrying frame directly (else its ledger entry never drains).
     expect(RUNTIME_SOURCE).toMatch(

@@ -37,13 +37,21 @@
  *  - THE TWO KNOWN GAPS (id-less and non-string-text items are ADMITTED and run
  *    but are NOT journaled) surfaced as a warn, because they are live text
  *    history will not have.
- *  - THE JOURNAL AS THE DEDUPE AUTHORITY (#344). An `accepted` outcome marker
- *    with no journal row is the crash state between the seam's two durable
- *    writes, and re-acking on it lost the message from the SSOT forever. The
- *    test SEEDS that state through the REAL outcome store — the `lookups` fake
- *    cannot, because it reports every record as freshly `created` — and asserts
- *    the whole recovery: one row, one turn, one recovery warn, a `committed`
- *    echo, and an ordinary deduped re-ack on the NEXT replay.
+ *  - THE JOURNAL AS THE DEDUPE AUTHORITY, AND ITS LIMIT (#344). An `accepted`
+ *    marker with no journal row is the crash state between the seam's two durable
+ *    writes, and re-acking on it lost the message from the SSOT forever. One test
+ *    SEEDS that state through the REAL outcome store — the `lookups` fake cannot,
+ *    because it reports every record as freshly `created` — and asserts the whole
+ *    recovery: one row, one turn, one recovery warn, a `committed` echo, and an
+ *    ordinary deduped re-ack on the NEXT replay.
+ *    ⚠️ TWO MORE TESTS PIN THE OTHER HALF, and they are the ones that would have
+ *    caught the round-1 defect: "marker, no row" is ALSO how a `/stop`
+ *    suppression is stored, on purpose, through two different doors
+ *    (`recordCancelledInboundItems` and the cancelled-inbound fallback). They
+ *    drive the real suppression writers with a LOST ack — the trigger, and no
+ *    crash anywhere — and assert the replay is acked and dropped: no row, no
+ *    offer, no `user_committed`, no echo. What separates them from the recovery
+ *    test is the OUTCOME (`cancelled` vs `accepted`), never the row.
  *  - One test against a REAL `openDeliveryJournal`, because nothing else proves
  *    the seam and the store compose.
  */
@@ -56,7 +64,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
 
 import { createIngressOnFlush } from "./ingress-dedupe.js";
-import { CancelledInboundFallbackTombstones } from "./ingress-dedupe.js";
+import {
+  CancelledInboundFallbackTombstones,
+  recordCancelledInboundItems,
+} from "./ingress-dedupe.js";
 import {
   openDeliveryJournal,
   type DeliveryJournal,
@@ -936,6 +947,7 @@ describe("#239 — the accept seam against a REAL delivery journal", () => {
       const outcomeStore = createIngressOutcomeStore({
         accepted: memoryDedupe(),
         overloaded: memoryDedupe(),
+        cancelled: memoryDedupe(),
       });
       const seeded = await outcomeStore.record(ACCOUNT, `${PEER}:r-1`, "accepted");
       if (seeded.status !== "recorded") throw new Error("could not seed the accepted marker");
@@ -992,6 +1004,110 @@ describe("#239 — the accept seam against a REAL delivery journal", () => {
           committed: [{ random_id: "r-1", messageId: "webchannel-user-1", seq: 1 }],
         },
       ]);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("#344: a /stop-cancelled replay is ACKED and dropped — never re-admitted", async () => {
+    const { journal } = openIn();
+    try {
+      // THE ROUND-1 DEFECT, AS A TEST. `/stop` suppression writes a marker and
+      // DELIBERATELY no journal row — the same shape the crash window leaves. The
+      // first version of #344 read "marker, no row" as "crash, re-admit" and re-ran
+      // the killed text. Nothing here is a crash: it is the ordinary lost-ack path.
+      const outcomeStore = createIngressOutcomeStore({
+        accepted: memoryDedupe(),
+        overloaded: memoryDedupe(),
+        cancelled: memoryDedupe(),
+      });
+      // 1. The user sends `u-1`/`r-1`, then hits `/stop` before it flushes.
+      //    `onCancel` records the suppression and acks — and the ACK IS LOST
+      //    (`sendAck` false: the peer is gone, and `.out` is at-most-once).
+      const lostAck = vi.fn(() => false);
+      await recordCancelledInboundItems(
+        [item("delete everything", "u-1", "r-1")],
+        ACCOUNT,
+        async (key) => {
+          const result = await outcomeStore.record(ACCOUNT, key, "cancelled", { replaceOthers: true });
+          if (result.status !== "recorded") throw result.error;
+          result.write.commit();
+          return true;
+        },
+        lostAck,
+      );
+      expect(lostAck).toHaveBeenCalledWith(PEER, ["u-1"]);
+      // The state the seam will meet: a marker, and an empty journal.
+      expect(await outcomeStore.lookup(ACCOUNT, `${PEER}:r-1`)).toEqual({
+        status: "found",
+        outcome: "cancelled",
+      });
+      expect(journal.read(PEER)).toEqual([]);
+
+      // 2. The client still holds `u-1` in its ledger and replays it on reconnect.
+      const replay = makeSeam({ journal, outcomeStore });
+      await replay.onFlush([item("delete everything", "u-1", "r-1")]);
+
+      // Acked so the ledger drains — and NOTHING else. No row, no turn, no
+      // broadcast, no `committed` echo, and no `inbound_rejected` (the peer must
+      // not be told its own `/stop` was backpressure).
+      expect(journal.read(PEER)).toEqual([]);
+      expect(replay.calls).toEqual([{ call: "ack", ids: ["u-1"] }]);
+
+      // 3. And it stays dropped: the marker outlives any number of replays.
+      const again = makeSeam({ journal, outcomeStore });
+      await again.onFlush([item("delete everything", "u-1", "r-1")]);
+      expect(journal.read(PEER)).toEqual([]);
+      expect(again.calls).toEqual([{ call: "ack", ids: ["u-1"] }]);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("#344: the cancelled-inbound FALLBACK path drops its replay the same way", async () => {
+    const { journal } = openIn();
+    try {
+      // The other door onto the same state: the `/stop` suppression WRITE failed,
+      // so `recordCancelledInboundItems` armed a tombstone instead, and the retry
+      // happens inside the seam's own fallback branch. It must reach the same
+      // verdict as the branch above — a marker, no row, and no re-admission.
+      const outcomeStore = createIngressOutcomeStore({
+        accepted: memoryDedupe(),
+        overloaded: memoryDedupe(),
+        cancelled: memoryDedupe(),
+      });
+      const fallback = new CancelledInboundFallbackTombstones();
+      const lostAck = vi.fn(() => false);
+      await recordCancelledInboundItems(
+        [item("delete everything", "u-1", "r-1")],
+        ACCOUNT,
+        async () => { throw new Error("suppression store unavailable"); },
+        lostAck,
+        undefined,
+        fallback,
+      );
+      expect(fallback.has(`${PEER}:r-1`, ACCOUNT)).toBe(true);
+      expect(await outcomeStore.lookup(ACCOUNT, `${PEER}:r-1`)).toEqual({ status: "not-found" });
+
+      // Replay 1 takes the fallback branch: it retries the suppression write,
+      // acks directly, and clears the tombstone. No row, no turn.
+      const first = makeSeam({ journal, outcomeStore, cancelledFallback: fallback });
+      await first.onFlush([item("delete everything", "u-1", "r-1")]);
+      expect(journal.read(PEER)).toEqual([]);
+      expect(first.calls).toEqual([{ call: "ack", ids: ["u-1"] }]);
+      expect(fallback.has(`${PEER}:r-1`, ACCOUNT)).toBe(false);
+      // What it wrote is the CANCELLED marker — the whole point of the retry.
+      expect(await outcomeStore.lookup(ACCOUNT, `${PEER}:r-1`)).toEqual({
+        status: "found",
+        outcome: "cancelled",
+      });
+
+      // Replay 2 no longer has a tombstone, so it goes through the ordinary
+      // outcome lookup — and lands on the cancelled arm, not the re-admit one.
+      const second = makeSeam({ journal, outcomeStore });
+      await second.onFlush([item("delete everything", "u-1", "r-1")]);
+      expect(journal.read(PEER)).toEqual([]);
+      expect(second.calls).toEqual([{ call: "ack", ids: ["u-1"] }]);
     } finally {
       journal.close();
     }

@@ -140,8 +140,12 @@ export class BoundedOverflowResolver {
         const recorded = await this.options.outcomeStore.record(
           request.accountId,
           request.key,
-          "accepted",
-          { replaceOpposite: true },
+          // #344: the outcome now SAYS "killed" instead of borrowing `accepted`.
+          // The comment above already required this and the marker could not
+          // express it — the accept seam read the borrowed `accepted` (with no
+          // journal row) as a crash-window replay and re-ran the killed text.
+          "cancelled",
+          { replaceOthers: true },
         );
         if (task.cancelled || this.disposed) {
           if (recorded.status === "recorded") await recorded.write.rollback();
@@ -158,8 +162,10 @@ export class BoundedOverflowResolver {
       const known = await this.options.outcomeStore.lookup(request.accountId, request.key);
       if (task.cancelled || this.disposed) return;
       if (known.status === "found") {
-        if (known.outcome === "accepted") await this.options.sendAck(request);
-        else await this.options.sendRejected(request);
+        // #344: `overloaded` is the only outcome that publishes a refusal;
+        // `cancelled` acks, exactly as it did while it was spelled `accepted`.
+        if (known.outcome === "overloaded") await this.options.sendRejected(request);
+        else await this.options.sendAck(request);
         return;
       }
       if (known.status === "unknown") return;

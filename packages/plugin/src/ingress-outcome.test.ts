@@ -29,6 +29,18 @@ function fake() {
   };
 }
 
+/**
+ * #344 added a third outcome store (`cancelled`). Tests that do not exercise it
+ * get a fresh empty one instead of restating it at every construction site; the
+ * ones that DO exercise it pass their own.
+ */
+type StoreOptions = Parameters<typeof createIngressOutcomeStore>[0];
+function makeStore(
+  options: Omit<StoreOptions, "cancelled"> & { cancelled?: PersistentDedupe },
+): IngressOutcomeStore {
+  return createIngressOutcomeStore({ cancelled: fake().store, ...options });
+}
+
 async function commit(
   store: IngressOutcomeStore,
   accountId: string,
@@ -49,7 +61,7 @@ describe("IngressOutcomeStore", () => {
       options.onDiskError(new Error("secret lookup peer:id"));
       return false;
     });
-    const store = createIngressOutcomeStore({
+    const store = makeStore({
       accepted: accepted.store,
       overloaded: overloaded.store,
       warnFailure,
@@ -78,7 +90,7 @@ describe("IngressOutcomeStore", () => {
   it("namespaces accounts and gives overloaded precedence over impossible dual markers", async () => {
     const accepted = fake(); const overloaded = fake();
     const warn = vi.fn();
-    const store = createIngressOutcomeStore({ accepted: accepted.store, overloaded: overloaded.store, warnInvariant: warn });
+    const store = makeStore({ accepted: accepted.store, overloaded: overloaded.store, warnInvariant: warn });
     await commit(store, "a", "p:i", "accepted");
     expect(await store.lookup("b", "p:i")).toEqual({ status: "not-found" });
     overloaded.values.add("a:p:i");
@@ -93,7 +105,7 @@ describe("IngressOutcomeStore", () => {
       options.onDiskError(new Error("disk"));
       return true;
     });
-    const store = createIngressOutcomeStore({ accepted: accepted.store, overloaded: overloaded.store });
+    const store = makeStore({ accepted: accepted.store, overloaded: overloaded.store });
     expect((await store.record("a", "k", "overloaded")).status).toBe("unknown");
     expect(overloaded.values.has("a:k")).toBe(false);
     expect(store.peek("a", "k")).toBeUndefined();
@@ -102,7 +114,7 @@ describe("IngressOutcomeStore", () => {
   it("fails closed when replacing the opposite marker reports a disk error", async () => {
     const accepted = fake(); const overloaded = fake();
     const warnFailure = vi.fn();
-    const store = createIngressOutcomeStore({
+    const store = makeStore({
       accepted: accepted.store,
       overloaded: overloaded.store,
       warnFailure,
@@ -115,7 +127,7 @@ describe("IngressOutcomeStore", () => {
       return false;
     });
 
-    const result = await store.record("a", "k", "accepted", { replaceOpposite: true });
+    const result = await store.record("a", "k", "accepted", { replaceOthers: true });
     expect(result).toEqual({ status: "unknown", error: disk });
     expect(warnFailure).toHaveBeenCalledWith("a", "replace-with-accepted");
     expect(accepted.store.checkAndRecord).not.toHaveBeenCalled();
@@ -130,7 +142,7 @@ describe("IngressOutcomeStore", () => {
 
   it("keeps cancelled fallback and emits no ACK when opposite replacement fails", async () => {
     const accepted = fake(); const overloaded = fake();
-    const store = createIngressOutcomeStore({ accepted: accepted.store, overloaded: overloaded.store });
+    const store = makeStore({ accepted: accepted.store, overloaded: overloaded.store });
     await commit(store, "a", "p:i", "overloaded");
     (overloaded.store.forget as any).mockImplementation(async (_key: string, options: any) => {
       options.onDiskError(new Error("durable overload remains"));
@@ -164,7 +176,7 @@ describe("IngressOutcomeStore", () => {
 
   it("bounds the hot cache globally by count", async () => {
     const accepted = fake(); const overloaded = fake();
-    const store = createIngressOutcomeStore({ accepted: accepted.store, overloaded: overloaded.store, maxHotEntries: 2 });
+    const store = makeStore({ accepted: accepted.store, overloaded: overloaded.store, maxHotEntries: 2 });
     await commit(store, "a", "1", "accepted");
     await commit(store, "b", "2", "accepted");
     await commit(store, "c", "3", "accepted");
@@ -174,7 +186,7 @@ describe("IngressOutcomeStore", () => {
 
   it("enforces the default 2,048-entry hot-cache cap across accounts", async () => {
     const accepted = fake(); const overloaded = fake();
-    const store = createIngressOutcomeStore({ accepted: accepted.store, overloaded: overloaded.store });
+    const store = makeStore({ accepted: accepted.store, overloaded: overloaded.store });
     for (let index = 0; index <= MAX_INGRESS_OUTCOME_HOT_ENTRIES; index++) {
       await commit(store, `account-${index % 3}`, `key-${index}`, "accepted");
     }
@@ -184,7 +196,7 @@ describe("IngressOutcomeStore", () => {
 
   it("enforces the default 2 MiB hot-cache byte cap across accounts", async () => {
     const accepted = fake(); const overloaded = fake();
-    const store = createIngressOutcomeStore({
+    const store = makeStore({
       accepted: accepted.store,
       overloaded: overloaded.store,
       maxHotEntries: MAX_INGRESS_OUTCOME_HOT_ENTRIES,
@@ -211,7 +223,7 @@ describe("IngressOutcomeStore", () => {
       accepted.values.add(scoped);
       return fresh;
     });
-    const store = createIngressOutcomeStore({ accepted: accepted.store, overloaded: overloaded.store });
+    const store = makeStore({ accepted: accepted.store, overloaded: overloaded.store });
 
     const oldPending = store.record("a", "p:i", "accepted");
     await Promise.resolve();
@@ -230,6 +242,62 @@ describe("IngressOutcomeStore", () => {
     expect(await store.lookup("a", "p:i")).toEqual({ status: "found", outcome: "accepted" });
   });
 
+  it("#344: cancelled outranks both other markers on lookup, and replaceOthers clears them", async () => {
+    // The two halves of making `cancelled` a first-class terminal outcome.
+    const accepted = fake(); const overloaded = fake(); const cancelled = fake();
+    const invariants: string[] = [];
+    const store = createIngressOutcomeStore({
+      accepted: accepted.store,
+      overloaded: overloaded.store,
+      cancelled: cancelled.store,
+      warnInvariant: (message) => invariants.push(message),
+    });
+
+    // WRITE HALF: `replaceOthers` means EVERY other outcome, not "the opposite".
+    // With three outcomes those stopped being the same set, and a cancellation
+    // that left an `accepted` marker behind would be re-admitted by the accept
+    // seam — the exact defect the split exists to close.
+    accepted.values.add("a:p:i");
+    overloaded.values.add("a:p:i");
+    const suppression = await store.record("a", "p:i", "cancelled", { replaceOthers: true });
+    if (suppression.status !== "recorded") throw new Error("suppression unexpectedly unknown");
+    suppression.write.commit();
+    expect(accepted.values.has("a:p:i")).toBe(false);
+    expect(overloaded.values.has("a:p:i")).toBe(false);
+    expect(cancelled.values.has("a:p:i")).toBe(true);
+    expect(await store.lookup("a", "p:i")).toEqual({ status: "found", outcome: "cancelled" });
+    expect(invariants).toEqual([]);
+
+    // READ HALF: if a partial failure ever leaves two markers, the strongest
+    // suppression wins and the weaker one is deleted with a named violation.
+    // `cancelled` over `overloaded` is the decision documented on
+    // OUTCOME_PRECEDENCE: killed text must not be reported as backpressure.
+    overloaded.values.add("a:p:i");
+    accepted.values.add("a:p:i");
+    expect(await store.lookup("a", "p:i")).toEqual({ status: "found", outcome: "cancelled" });
+    expect(invariants).toEqual([
+      "webchannel: ingress outcome invariant violation (dual marker); cancelled wins",
+      "webchannel: ingress outcome invariant violation (dual marker); cancelled wins",
+    ]);
+    expect(overloaded.values.has("a:p:i")).toBe(false);
+    expect(accepted.values.has("a:p:i")).toBe(false);
+
+    // And the pre-existing rung is untouched: overloaded still beats accepted.
+    const other = fake(); const otherOverloaded = fake();
+    const second = createIngressOutcomeStore({
+      accepted: other.store,
+      overloaded: otherOverloaded.store,
+      cancelled: fake().store,
+      warnInvariant: (message) => invariants.push(message),
+    });
+    other.values.add("a:p:j");
+    otherOverloaded.values.add("a:p:j");
+    expect(await second.lookup("a", "p:j")).toEqual({ status: "found", outcome: "overloaded" });
+    expect(invariants.at(-1)).toBe(
+      "webchannel: ingress outcome invariant violation (dual marker); overloaded wins",
+    );
+  });
+
   it("re-recording an EXISTING accepted marker still reports `recorded`, as a follower", async () => {
     // #344's accept path depends on this shape. When the journal has no row for
     // a marked `random_id`, `ingress-dedupe.ts` re-admits the message down the
@@ -238,7 +306,7 @@ describe("IngressOutcomeStore", () => {
     // stall on its FIFO barrier and the message would never be journaled, so the
     // recovery rests on this contract rather than on a fresh insert.
     const accepted = fake(); const overloaded = fake();
-    const store = createIngressOutcomeStore({ accepted: accepted.store, overloaded: overloaded.store });
+    const store = makeStore({ accepted: accepted.store, overloaded: overloaded.store });
 
     const first = await store.record("a", "p:i", "accepted");
     if (first.status !== "recorded") throw new Error("first write unexpectedly unknown");
@@ -273,7 +341,7 @@ describe("IngressOutcomeStore", () => {
         return target.values.delete(`${options.namespace}:${key}`);
       });
       const warnFailure = vi.fn();
-      const store = createIngressOutcomeStore({
+      const store = makeStore({
         accepted: accepted.store,
         overloaded: overloaded.store,
         warnFailure,
@@ -317,7 +385,7 @@ describe("IngressOutcomeStore", () => {
       options.onDiskError?.(new Error("disk unavailable"));
       return false;
     });
-    const store = createIngressOutcomeStore({
+    const store = makeStore({
       accepted: accepted.store,
       overloaded: overloaded.store,
       maxRollbackRecoveryEntries: 1,
@@ -357,7 +425,7 @@ describe("IngressOutcomeStore", () => {
       concurrent--;
       return true;
     });
-    const store = createIngressOutcomeStore({ accepted: accepted.store, overloaded: overloaded.store });
+    const store = makeStore({ accepted: accepted.store, overloaded: overloaded.store });
     const first = store.record("a", "p:i", "overloaded");
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     const follower = store.record("a", "p:i", "overloaded");

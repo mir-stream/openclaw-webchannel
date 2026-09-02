@@ -107,6 +107,36 @@
   store does not have — the server-side invention N8 forbids — so it is disclosed
   rather than fixed.
 
+- **`ingress-dedupe.ts`'s accept seam treats the delivery journal as the dedupe
+  authority (#344, extends #292).** `outcomeStore.record(…, "accepted")` persists
+  through the SDK dedupe store at call time while `appendInboundUser` runs in the
+  batch footer, so the durable order is marker-first, row-second and a crash
+  between them stranded the message: the replay hit the `existing.status ===
+  "found"` branch, was re-acked as a duplicate, and never reached the journal.
+  The found/accepted branch now calls `lookupUserMessageIdByRandomId` and, when
+  the row is missing, falls through to the fresh-accept path — one journal call
+  site still, and `appendInboundUser`'s `journal_user_idempotency_once` guard
+  keeps it idempotent. The order is deliberately NOT reversed: a row without a
+  marker replays as a fresh admission and answers the same text twice.
+
+- **`/stop` suppression is its own terminal outcome (#344).** `IngressOutcome`
+  gains `cancelled`, with its own `PersistentDedupe` namespace
+  (`webchannel-inbound-cancelled`) and its own rung — above `overloaded`, above
+  `accepted` — in the lookup precedence. The three suppression writers
+  (`nats-account-runtime.ts`'s `onCancel`, `ingress-dedupe.ts`'s
+  cancelled-inbound fallback, `inbound-overflow-resolver.ts`'s `recoverCancelled`)
+  record it instead of borrowing `accepted`. They write no journal row on
+  purpose, which is byte-identical to the crash window above, so without the split
+  a cancelled message whose ack was lost would have been re-admitted and its
+  aborted turn re-run. A `cancelled` replay is acked and dropped — never
+  `inbound_rejected`, never re-admitted, never echoed a `committed` id.
+  `record()`'s `replaceOpposite` option is renamed `replaceOthers` and now clears
+  every other outcome's marker, which is what its fail-closed comment always
+  described. **Upgrade note:** cancellations recorded by an earlier build remain
+  in the `accepted` namespace for their 7-day TTL and are indistinguishable from a
+  crash-window marker; one whose ack was also lost re-runs its turn once on the
+  next replay.
+
 - **A K>=2 count shortfall no longer routes buffered finals onto lanes (#340,
   extends #260).** `flushBufferedOrdinaryFinals` used to fall back to
   `materializedAnswerLanes()` when the finals and the streamed lanes disagreed in

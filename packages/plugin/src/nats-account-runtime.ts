@@ -1136,8 +1136,12 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         peekOutcome: (peerId, id) =>
           processIngressOutcomes.peek(accountId, `${peerId}:${id}`),
         onKnownOutcome: (peerId, id, outcome) => {
-          if (outcome === "accepted") channel.sendAck(peerId, [id]);
-          else channel.sendInboundRejected(peerId, [id]);
+          // #344: `overloaded` is the ONLY outcome the peer hears about as a
+          // refusal. `cancelled` (text `/stop` killed) acks exactly like
+          // `accepted` did before the split — the ledger entry must drain and the
+          // peer must not be told its message was rejected for backpressure.
+          if (outcome === "overloaded") channel.sendInboundRejected(peerId, [id]);
+          else channel.sendAck(peerId, [id]);
         },
         onOverflow: ({ key: peerId, id, reason, chargedBytes, recoverCancelled }) => {
           pressureLogger.record({
@@ -1162,17 +1166,22 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           // P0-7b: a `/stop` cancels debounce-buffered messages that never reached
           // onFlush, so they were never dedupe-recorded and never acked — yet the
           // client's replay ledger still holds them. Record their ids (so an
-          // in-flight replay is dropped as accepted) and ACK them. The bounded
+          // in-flight replay is dropped as CANCELLED, #344) and ACK them. The bounded
           // debouncer keeps reservations charged until this callback settles.
           await recordCancelledInboundItems(
             entries.map((entry) => entry.item),
             accountId,
             async (key) => {
+              // ⭐ #344 — `cancelled`, NOT `accepted`. This suppression writes a
+              // marker and DELIBERATELY no journal row, which is byte-identical
+              // to the accept seam's crash window; recording it as `accepted`
+              // made a lost ack replay as a re-admission and re-run the very text
+              // `/stop` killed. The distinct outcome is what tells the two apart.
               const result = await processIngressOutcomes.record(
                 accountId,
                 key,
-                "accepted",
-                { replaceOpposite: true },
+                "cancelled",
+                { replaceOthers: true },
               );
               if (result.status !== "recorded") throw result.error;
               result.write.commit();

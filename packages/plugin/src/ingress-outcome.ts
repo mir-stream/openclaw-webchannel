@@ -4,18 +4,45 @@ import {
   type PersistentDedupe,
 } from "openclaw/plugin-sdk/persistent-dedupe";
 
-export type IngressOutcome = "accepted" | "overloaded";
+/**
+ * The terminal verdicts an inbound id can carry. Each has its OWN durable
+ * marker store — they are set-membership stores, so a distinct outcome is a
+ * distinct namespace, not a value in a shared row.
+ *
+ * - `accepted`   — admitted for a turn. The delivery journal is the authority on
+ *                  whether that actually completed; see `OutcomeLookup` below.
+ * - `overloaded` — refused for backpressure. The peer gets `inbound_rejected`.
+ * - `cancelled`  — ⭐ #344: text `/stop` KILLED, suppressed on purpose and
+ *                  DELIBERATELY NEVER JOURNALED. Split out of `accepted` in this
+ *                  slice, and the split is the whole point: the three
+ *                  cancellation writers (`nats-account-runtime.ts`'s `onCancel`,
+ *                  `ingress-dedupe.ts`'s cancelled-inbound fallback,
+ *                  `inbound-overflow-resolver.ts`'s `recoverCancelled`) used to
+ *                  record `accepted` with no row, which is byte-identical to the
+ *                  crash-window state the accept seam must RE-ADMIT. One marker
+ *                  value cannot mean both "not journaled yet, run it" and "never
+ *                  journal this, drop it", so it is now two.
+ *                  A replay under this marker is ACKED (so the client's ledger
+ *                  drains) and dropped — never re-admitted, never
+ *                  `inbound_rejected`.
+ */
+export type IngressOutcome = "accepted" | "overloaded" | "cancelled";
 export type IngressOutcomeFailureCategory =
   | "lookup-overloaded"
   | "lookup-accepted"
+  | "lookup-cancelled"
   | "record-accepted"
   | "record-overloaded"
+  | "record-cancelled"
   | "replace-with-accepted"
   | "replace-with-overloaded"
+  | "replace-with-cancelled"
   | "rollback-accepted"
   | "rollback-overloaded"
+  | "rollback-cancelled"
   | "rollback-recovery-accepted"
   | "rollback-recovery-overloaded"
+  | "rollback-recovery-cancelled"
   | "rollback-recovery-poisoned"
   | "adapter-lookup"
   | "adapter-record-accepted"
@@ -32,9 +59,16 @@ export type IngressOutcomeFailureWarning = (
  * seam's journal row is written later, so a crash — or any build that recorded
  * markers before the journal existed — can leave a marker with no row. The
  * journal is the authority on that disagreement; `ingress-dedupe.ts`'s
- * found/accepted branch consults it and re-admits when the row is missing. A
+ * found/accepted branch consults it and RE-ADMITS when the row is missing. A
  * caller that treats this result as a terminal accept without the same check is
  * reintroducing #344.
+ *
+ * ⚠️ AND THAT IS EXACTLY WHY `cancelled` IS ITS OWN OUTCOME. "Marker present,
+ * no journal row" has two producers with OPPOSITE required handling: the crash
+ * window (re-admit) and a `/stop` suppression (drop). While both recorded
+ * `accepted`, the accept seam could not tell them apart and re-ran killed text —
+ * the round-1 defect on this slice. Read the outcome, not the row, to decide
+ * WHICH question to ask; read the journal only for `accepted`.
  */
 export type OutcomeLookup =
   | { status: "found"; outcome: IngressOutcome }
@@ -65,7 +99,7 @@ export interface IngressOutcomeStore {
     accountId: string,
     key: string,
     outcome: IngressOutcome,
-    options?: { replaceOpposite?: boolean },
+    options?: { replaceOthers?: boolean },
   ): Promise<OutcomeRecordResult>;
   forget(accountId: string, key: string, outcome: IngressOutcome): Promise<boolean>;
   hotSize(): { entries: number; bytes: number };
@@ -81,6 +115,12 @@ const HOT_ENTRY_OVERHEAD = 64;
 type OutcomeStoreOptions = {
   accepted: PersistentDedupe;
   overloaded: PersistentDedupe;
+  /**
+   * #344. Its own namespace, because a `PersistentDedupe` stores set membership
+   * and nothing else — there is no field to hang a verdict on, so a third
+   * verdict is a third store.
+   */
+  cancelled: PersistentDedupe;
   maxHotEntries?: number;
   maxHotBytes?: number;
   maxRollbackRecoveryEntries?: number;
@@ -104,6 +144,25 @@ function hotKey(accountId: string, key: string): string {
 function hotBytes(accountId: string, key: string): number {
   return Buffer.byteLength(accountId, "utf8") + Buffer.byteLength(key, "utf8") + HOT_ENTRY_OVERHEAD;
 }
+
+/**
+ * Lookup precedence, STRONGEST SUPPRESSION FIRST — and the order is a decision,
+ * not an accident (#344).
+ *
+ * A key must carry exactly one terminal outcome; `replaceOthers` is what keeps
+ * that true at write time. This order decides who wins if a partial failure ever
+ * leaves two, and it is the fail-safe direction: `accepted` is the only verdict
+ * that RUNS the text, so it loses to both refusals.
+ *
+ * `cancelled` outranks `overloaded` on purpose. Both refuse, but they tell the
+ * peer different things — `cancelled` acks silently, `overloaded` publishes
+ * `inbound_rejected`. `inbound-overflow-resolver.ts`'s `recoverCancelled` branch
+ * already states the rule this encodes: text the user killed "must never be
+ * reclassified as overloaded merely because its replay arrived while the raw
+ * retention budget was full." That resolver enforces it at write time; this
+ * enforces the same thing at read time.
+ */
+const OUTCOME_PRECEDENCE = ["cancelled", "overloaded", "accepted"] as const;
 
 /** Durability-aware adapter around mutually-exclusive persistent dedupe stores. */
 export function createIngressOutcomeStore(options: OutcomeStoreOptions): IngressOutcomeStore {
@@ -195,6 +254,14 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
     options.warnFailure?.(accountId, `rollback-${outcome}`);
   };
 
+  /** The one place an outcome maps to its backing store. */
+  const storeFor = (outcome: IngressOutcome): PersistentDedupe =>
+    outcome === "accepted"
+      ? options.accepted
+      : outcome === "overloaded"
+        ? options.overloaded
+        : options.cancelled;
+
   const hasRecent = async (
     store: PersistentDedupe,
     accountId: string,
@@ -232,48 +299,57 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
   };
 
   const lookupUnlocked = async (accountId: string, key: string): Promise<OutcomeLookup> => {
-    let rejected: { found: boolean; diskError?: unknown };
-    try {
-      rejected = await hasRecent(options.overloaded, accountId, key);
-    } catch (error) {
-      options.warnFailure?.(accountId, "lookup-overloaded");
-      return { status: "unknown", error };
-    }
-    if (rejected.found) {
-      let accepted: { found: boolean; diskError?: unknown } | undefined;
-      try { accepted = await hasRecent(options.accepted, accountId, key); } catch { /* overload remains authoritative */ }
-      if (accepted?.found) {
-        options.warnInvariant?.("webchannel: ingress outcome invariant violation (dual marker); overloaded wins");
-        await options.accepted.forget(key, { namespace: accountId }).catch(() => false);
+    // Probe in precedence order and stop at the first hit. A store fault at ANY
+    // rung is still `unknown` for the whole lookup — a lower rung's silence
+    // cannot be read as absence when a higher one could not be read at all.
+    for (let rung = 0; rung < OUTCOME_PRECEDENCE.length; rung++) {
+      const outcome = OUTCOME_PRECEDENCE[rung]!;
+      let probe: { found: boolean; diskError?: unknown };
+      try {
+        probe = await hasRecent(storeFor(outcome), accountId, key);
+      } catch (error) {
+        options.warnFailure?.(accountId, `lookup-${outcome}`);
+        return { status: "unknown", error };
       }
-      putHot(accountId, key, "overloaded", "durable");
-      return { status: "found", outcome: "overloaded" };
-    }
-    if (rejected.diskError !== undefined) {
-      options.warnFailure?.(accountId, "lookup-overloaded");
-      return { status: "unknown", error: rejected.diskError };
-    }
-
-    let accepted: { found: boolean; diskError?: unknown };
-    try {
-      accepted = await hasRecent(options.accepted, accountId, key);
-    } catch (error) {
-      options.warnFailure?.(accountId, "lookup-accepted");
-      return { status: "unknown", error };
-    }
-    if (accepted.found) {
-      const existing = hot.get(hotKey(accountId, key));
-      putHot(
-        accountId,
-        key,
-        "accepted",
-        existing?.outcome === "accepted" ? existing.durability : "durable",
-      );
-      return { status: "found", outcome: "accepted" };
-    }
-    if (accepted.diskError !== undefined) {
-      options.warnFailure?.(accountId, "lookup-accepted");
-      return { status: "unknown", error: accepted.diskError };
+      if (probe.found) {
+        // Exactly one terminal outcome may survive. A WEAKER marker alongside
+        // this one is an invariant violation: say so and delete it, best-effort,
+        // exactly as the overloaded-vs-accepted case has always done. A probe
+        // that throws here is skipped rather than escalated — the winning
+        // outcome is already known and returning `unknown` would lose it.
+        for (let weaker = rung + 1; weaker < OUTCOME_PRECEDENCE.length; weaker++) {
+          const loser = OUTCOME_PRECEDENCE[weaker]!;
+          let also: { found: boolean; diskError?: unknown } | undefined;
+          try { also = await hasRecent(storeFor(loser), accountId, key); } catch { /* winner stands */ }
+          if (!also?.found) continue;
+          options.warnInvariant?.(
+            `webchannel: ingress outcome invariant violation (dual marker); ${outcome} wins`,
+          );
+          await storeFor(loser).forget(key, { namespace: accountId }).catch(() => false);
+        }
+        // ⚠️ THE DURABILITY RULE IS PER-OUTCOME AND IS NOT AN OVERSIGHT.
+        // `accepted` INHERITS a matching hot entry's durability; the two
+        // refusals are pinned `durable`. Unifying them would change what a
+        // memory-only marker can authorize — `ingress-dedupe.ts` and
+        // `inbound-overflow-resolver.ts` both gate publishing `inbound_rejected`
+        // on `durability === "durable"`, and promoting an overloaded hot entry
+        // is the behaviour those gates were written against. Left exactly as it
+        // was before #344.
+        const existing = hot.get(hotKey(accountId, key));
+        putHot(
+          accountId,
+          key,
+          outcome,
+          outcome === "accepted" && existing?.outcome === "accepted"
+            ? existing.durability
+            : "durable",
+        );
+        return { status: "found", outcome };
+      }
+      if (probe.diskError !== undefined) {
+        options.warnFailure?.(accountId, `lookup-${outcome}`);
+        return { status: "unknown", error: probe.diskError };
+      }
     }
     return { status: "not-found" };
   };
@@ -289,7 +365,7 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
     const mapKey = hotKey(accountId, key);
     const recovery = rollbackRecovery.get(mapKey);
     if (!recovery) return { status: "ok" };
-    const store = recovery.outcome === "accepted" ? options.accepted : options.overloaded;
+    const store = storeFor(recovery.outcome);
     let diskError: unknown;
     try {
       await store.forget(key, {
@@ -336,8 +412,7 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
 
     async record(accountId, key, outcome, recordOptions) {
       const releaseOperation = await acquireOperation(accountId, key);
-      const store = outcome === "accepted" ? options.accepted : options.overloaded;
-      const oppositeStore = outcome === "accepted" ? options.overloaded : options.accepted;
+      const store = storeFor(outcome);
       let diskError: unknown;
       let fresh: boolean;
       try {
@@ -346,25 +421,32 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
           releaseOperation();
           return recovery;
         }
-        if (recordOptions?.replaceOpposite) {
-          let forgetDiskError: unknown;
-          try {
-            await oppositeStore.forget(key, {
-              namespace: accountId,
-              onDiskError: (error) => { forgetDiskError = error; },
-            });
-          } catch (error) {
-            options.warnFailure?.(accountId, `replace-with-${outcome}`);
-            releaseOperation();
-            return { status: "unknown", error };
-          }
-          // The SDK forget API reports storage failures only through this hook.
-          // Fail closed: recording/ACKing the replacement while a durable
-          // opposite marker may remain would create a dual terminal outcome.
-          if (forgetDiskError !== undefined) {
-            options.warnFailure?.(accountId, `replace-with-${outcome}`);
-            releaseOperation();
-            return { status: "unknown", error: forgetDiskError };
+        if (recordOptions?.replaceOthers) {
+          // EVERY other outcome, not "the opposite" — #344 made the set three, and
+          // the property this enforces was never about pairs: after this write no
+          // conflicting terminal marker may survive. With two outcomes the two
+          // readings coincided, which is why the old name held up.
+          for (const other of OUTCOME_PRECEDENCE) {
+            if (other === outcome) continue;
+            let forgetDiskError: unknown;
+            try {
+              await storeFor(other).forget(key, {
+                namespace: accountId,
+                onDiskError: (error) => { forgetDiskError = error; },
+              });
+            } catch (error) {
+              options.warnFailure?.(accountId, `replace-with-${outcome}`);
+              releaseOperation();
+              return { status: "unknown", error };
+            }
+            // The SDK forget API reports storage failures only through this hook.
+            // Fail closed: recording/ACKing the replacement while a durable
+            // conflicting marker may remain would create a dual terminal outcome.
+            if (forgetDiskError !== undefined) {
+              options.warnFailure?.(accountId, `replace-with-${outcome}`);
+              releaseOperation();
+              return { status: "unknown", error: forgetDiskError };
+            }
           }
           deleteHot(accountId, key);
         }
@@ -442,7 +524,7 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
 
     async forget(accountId, key, outcome) {
       const releaseOperation = await acquireOperation(accountId, key);
-      const store = outcome === "accepted" ? options.accepted : options.overloaded;
+      const store = storeFor(outcome);
       try {
         const recovery = await recoverFailedRollbackUnlocked(accountId, key);
         if (recovery.status === "unknown") return false;
@@ -495,14 +577,19 @@ export function createRateLimitedOutcomeInvariantWarning(
 const OUTCOME_FAILURE_CATEGORIES: readonly IngressOutcomeFailureCategory[] = [
   "lookup-overloaded",
   "lookup-accepted",
+  "lookup-cancelled",
   "record-accepted",
   "record-overloaded",
+  "record-cancelled",
   "replace-with-accepted",
   "replace-with-overloaded",
+  "replace-with-cancelled",
   "rollback-accepted",
   "rollback-overloaded",
+  "rollback-cancelled",
   "rollback-recovery-accepted",
   "rollback-recovery-overloaded",
+  "rollback-recovery-cancelled",
   "rollback-recovery-poisoned",
   "adapter-lookup",
   "adapter-record-accepted",
@@ -555,12 +642,16 @@ const processFailureWarning = createRateLimitedOutcomeFailureWarning((message) =
   console.warn(message),
 );
 
-/** One accepted/overloaded store pair and one hot cache for the whole process. */
+/** One store per outcome, and one hot cache, for the whole process. */
 export function getProcessIngressOutcomeStore(): IngressOutcomeStore {
   if (!processStore) {
     processStore = createIngressOutcomeStore({
       accepted: createPersistentDedupe({ ...DEDUPE_OPTIONS, namespacePrefix: "persistent-dedupe" }),
       overloaded: createPersistentDedupe({ ...DEDUPE_OPTIONS, namespacePrefix: "webchannel-inbound-overloaded" }),
+      // #344. A NEW namespace, so it starts empty: a `/stop` suppression written
+      // by an older build lives in the `accepted` namespace and STAYS there. See
+      // the migration note in `ingress-dedupe.ts`'s header.
+      cancelled: createPersistentDedupe({ ...DEDUPE_OPTIONS, namespacePrefix: "webchannel-inbound-cancelled" }),
       warnInvariant: processInvariantWarning,
       warnFailure: processFailureWarning,
     });
