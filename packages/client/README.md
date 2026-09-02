@@ -138,8 +138,7 @@ buffered and coalesced into a single turn keyed by the last of them. The current
 plugin emits one same-outcome `turn_settled` per coalesced member, in arrival
 order with the anchor last; the client promotes the exact receipt each frame
 names. A settle also closes the turn it names **and every turn published before
-it**. That prefix sweep remains for older anchor-only v3 plugin builds and for
-lost/missing earlier member frames. Both outcomes
+it**. That prefix sweep remains for lost/missing earlier member frames. Both outcomes
 sweep, as does an outcome-less legacy settle; sweeping turn activity never
 fabricates a receipt outcome.
 
@@ -259,10 +258,12 @@ unsupported.
 **Coalesced receipts:** a burst still has one ANCHOR (the last member, used by
 draft and answer frames), but the current plugin emits a `turn_settled` for every
 member with the same outcome, anchor last. The client promotes only the exact
-`turnId === wireId` match, so all member receipts resolve. Older anchor-only v3
-plugin builds leave non-anchor receipts at
-`accepted`; the turn-activity prefix sweep closes their indicators without
-inventing receipt success.
+`turnId === wireId` match, so all member receipts resolve. (Historically,
+anchor-only plugin builds — `0.4.0` and earlier, before per-member `turn_settled`
+shipped in `0.5.0` — left non-anchor receipts at `accepted`, and the
+turn-activity prefix sweep closed their indicators without inventing receipt
+success. Those builds speak protocol v3, which a v4 client refuses, so that path
+is no longer reachable; the sweep remains for lost or missing member frames.)
 
 **Answer-delivery vs turn outcome:** if the agent's final answer frame fails to
 send but the turn itself settled without error, the message still reaches

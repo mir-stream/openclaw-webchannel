@@ -39,12 +39,19 @@
  *      · No `seq` ⇒ no gap detection ⇒ it never sends `get_difference`. This
  *        transport is core NATS pub/sub, AT-MOST-ONCE with no retention, so a
  *        dropped frame leaves a hole the peer CANNOT SEE and therefore never asks
- *        to heal. Not permanent — `sendHistorySnapshot` fires on EVERY successful
- *        register (`nats-register.ts`) and a released client fresh-inserts the
- *        rows it lacks — but that repair is INCIDENTAL: it needs a reconnect the
- *        user has no reason to perform, so the transcript stays silently wrong
- *        for the rest of the session, with no signal on either side. #244 exists
- *        so the hole ITSELF triggers the heal instead of luck doing it.
+ *        to heal. What repairs it is incidental AND BOUNDED. A history snapshot
+ *        is REQUESTED on every successful register (`nats-register.ts`; the send
+ *        coalesces while one is already in flight for that peer and is suppressed
+ *        on an empty projection) and it rides the shared `.out`, so ANY device's
+ *        register delivers it to all of them — but it carries only the newest
+ *        `history.limit` PROJECTED ROWS (50 by default), and fewer usable ones
+ *        still for a v3 peer with `reasoningDurable` on, which drops the
+ *        role-less rows. A hole inside that window closes. An OLDER one does not:
+ *        the v3 peer's only other door is `loadHistory({before})`, which pages
+ *        strictly OLDER than a cursor and can never page INTO a mid-transcript
+ *        hole. That hole outlives every reconnect for the life of the tab's
+ *        state, and only a RELOAD — empty state, full re-page — repairs it.
+ *        #244 exists so the hole ITSELF triggers the heal instead of luck.
  *      · It DROPS `history` rows that carry no `role` — the `case "history"`
  *        guard every released build has, which is the very thing that made that
  *        widening safe — so its transcript holds no reasoning id to cite as a

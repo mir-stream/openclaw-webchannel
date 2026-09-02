@@ -534,7 +534,9 @@ export type OutboundWsMessage =
        * `sendSnapshot`); a `load_history` PAGE serves OLDER rows and carries no
        * high-water — which is why it stays optional on the wire. It is NOT
        * optional for the peer: since #244 half B the client seeds its cursor from
-       * this field (`nats-client-wrapper.ts`'s `case "history"`), and since #246's
+       * this field — in `nats-client-wrapper.ts`'s `handleMessage` POST-DISPATCH
+       * block, which runs after `case "history"` has hydrated and says so, NOT in
+       * the case arm itself — and since #246's
        * v4 exact-match gate a client that ignores it cannot connect. The old
        * "additive and optional — older clients ignore it, and half A only exposes
        * it" reading is dead on both halves.
