@@ -271,8 +271,9 @@ type OutcomeLookup =
   | { status: "unknown"; error: unknown };
 ```
 
-The adapter uses mutually exclusive accepted/overloaded keys backed by two
-**process-wide** pinned `createPersistentDedupe` instances:
+The adapter uses mutually exclusive accepted/overloaded/cancelled keys backed by
+three **process-wide** pinned `createPersistentDedupe` instances (`cancelled`
+split out of `accepted` in #344):
 
 ```text
 accepted store            = existing persistent-dedupe namespace family
@@ -340,11 +341,15 @@ emits no terminal result, and lets the client retry. A durable overload marker
 survives a crash after record but before publish; a delivered rejection already
 gave the client its terminal state. Thus every restart ordering has at least one
 recovery owner and a memory-only rejection is never mistaken for durable state.
-Cancellation-fallback recovery uses `record(accepted, { replaceOpposite: true })`.
-The opposite-store delete observes its own `onDiskError`; if a durable overload
-may remain, replacement returns `unknown`, releases the per-key gate, keeps the
-fallback, and emits no ACK. This prevents a dual marker whose later lookup would
-otherwise choose overload.
+Cancellation-fallback recovery uses `record(cancelled, { replaceOthers: true })`
+(#344: a suppression writes no journal row on purpose, so it must not share the
+`accepted` marker with the accept seam's crash window). Each other store's delete
+observes its own `onDiskError`; if a durable conflicting marker may remain,
+replacement returns `unknown`, releases the per-key gate, keeps the fallback, and
+emits no ACK. This prevents a dual marker at all — note the earlier wording, "a
+dual marker whose later lookup would otherwise choose overload", is now inverted:
+under `OUTCOME_PRECEDENCE` a surviving overload beside `cancelled` LOSES, so the
+harm of skipping the delete is a stale marker, not a wrong winner.
 
 An accepted/overloaded write receipt retains its per-key operation gate until
 `commit()` or `rollback()`. Rollback observes the SDK `forget(...).onDiskError`
@@ -664,8 +669,8 @@ count and byte budget like any other message while pending.
 
 `packages/plugin/src/ingress-outcome.ts`
 
-- wrap two process-wide accepted/overloaded persistent dedupe instances behind
-  the account-namespaced tri-state `IngressOutcomeStore` API;
+- wrap three process-wide accepted/overloaded/cancelled persistent dedupe
+  instances behind the account-namespaced tri-state `IngressOutcomeStore` API;
 - expose a synchronous process-wide 2,048-entry/2-MiB hot index containing
   accepted and durable-overloaded outcomes for pre-debounce classification;
 - record exactly one selected outcome per fresh id and make overload win if an

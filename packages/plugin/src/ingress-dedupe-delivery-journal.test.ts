@@ -543,22 +543,58 @@ describe("#239 — the inbound accept journals before it acks", () => {
     // second call site; the ack still has to go out so the client's ledger entry
     // drains.
     //
-    // #344 does NOT change this item: it carries no `random_id`, so its row is
-    // keyed by the wire id and `lookupUserMessageIdByRandomId` cannot query it —
-    // absence would prove nothing, and the marker still decides. The
-    // `random_id`-carrying half of the same claim (row EXISTS ⇒ still a plain
-    // re-ack) is pinned by "#344: re-admits an accepted marker with NO journal
-    // row" replay 2, and by the #243 half 2a deduped-retry test.
+    // ⚠️ THE FIRST ADMISSION IS NOW REAL, AND IT HAD TO BECOME REAL (#344 round
+    // 3). This test used to assert its premise while contradicting it: the
+    // fixture had an `accepted` marker and an EMPTY journal, which is not "a
+    // message journaled earlier" — it is precisely the crash-window orphan the
+    // seam must re-admit. It passed only because the branch never asked the
+    // journal. Round 3 widened the question to `randomId ?? wireId`, so it asks
+    // for this item too, and the false fixture failed. Round 1 below journals the
+    // message for real; round 2 is the replay the title describes.
+    const lookups: Record<string, OutcomeLookup> = {};
+    const { calls, onFlush } = makeSeam({ lookups });
+
+    await onFlush([item("hello", "u-1")]);
+    expect(appends(calls)).toHaveLength(1);
+
+    // Now the durable outcome exists — the state a replay actually meets.
+    lookups[`${PEER}:u-1`] = { status: "found", outcome: "accepted" };
+    calls.length = 0;
+    await onFlush([item("hello", "u-1")]);
+
+    expect(appends(calls)).toEqual([]);
+    // Positive: the replay really did take the found/accepted branch — it acked,
+    // and it never offered or recorded anything. No `committed` echo: this client
+    // sent no `random_id`, so there is no key to echo the minted id under.
+    expect(calls).toEqual([{ call: "ack", ids: ["u-1"] }]);
+  });
+
+  it("#344: an OLDER client's orphaned marker is re-admitted too, keyed by the wire id", async () => {
+    // The other half of round 3's widening, and the reason it is not cosmetic:
+    // an older client sends no `random_id`, so `appendInboundUser` keys its row
+    // by the wire id (`idempotency_key = randomId ?? turnId`). Round 2 queried
+    // only `random_id` and therefore could not answer the existence question for
+    // these clients at all — their crash-window messages stayed dropped, and the
+    // comment called that a limit. It is the same lookup, one argument wider.
     const { calls, onFlush } = makeSeam({
       lookups: { [`${PEER}:u-1`]: { status: "found", outcome: "accepted" } },
     });
 
     await onFlush([item("hello", "u-1")]);
 
-    expect(appends(calls)).toEqual([]);
-    // Positive: the replay really did take the found/accepted branch — it acked,
-    // and it never offered or recorded anything.
-    expect(calls).toEqual([{ call: "ack", ids: ["u-1"] }]);
+    // Re-admitted: journaled under a server id and dispatched, exactly like a
+    // conforming client's orphan — but acked BARE, because a `committed` entry
+    // needs a `random_id` to key it by and this client has none.
+    expect(appends(calls)).toEqual([
+      {
+        call: "append",
+        conversationId: PEER,
+        event: { kind: "user", id: "webchannel-user-1", text: "hello", turnId: "u-1" },
+      },
+    ]);
+    expect(calls).toContainEqual({ call: "ack", ids: ["u-1"] });
+    expect(kinds(calls)).toContain("offer-commit");
+    expect(warns(calls)[0]!.message).toContain('dedupe_id="u-1"');
   });
 
   it("acks the cancelled-inbound fallback WITHOUT appending", async () => {
@@ -983,7 +1019,7 @@ describe("#239 — the accept seam against a REAL delivery journal", () => {
       );
       // `logSafe` quotes it — the whole point of #123's discipline on a
       // peer-supplied token, so assert the QUOTED form.
-      expect(warns(first.calls)[0]!.message).toContain('random_id="r-1"');
+      expect(warns(first.calls)[0]!.message).toContain('dedupe_id="r-1"');
       expect(warns(first.calls)[0]!.message).toContain(
         "action=journal-is-authoritative-turn-re-runs-once",
       );
@@ -1108,6 +1144,58 @@ describe("#239 — the accept seam against a REAL delivery journal", () => {
       await second.onFlush([item("delete everything", "u-1", "r-1")]);
       expect(journal.read(PEER)).toEqual([]);
       expect(second.calls).toEqual([{ call: "ack", ids: ["u-1"] }]);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("#344: a cancelled replay whose row EXISTS is acked WITH the committed echo", async () => {
+    const { journal } = openIn();
+    try {
+      // "There is no row to echo" was an absolute the code does not hold (round
+      // 2's comment). A message can be journaled and THEN cancelled: `/stop`
+      // landing in the flush-footer window records `cancelled` with
+      // `replaceOthers`, which deletes the `accepted` marker and leaves the row.
+      const outcomeStore = createIngressOutcomeStore({
+        accepted: memoryDedupe(),
+        overloaded: memoryDedupe(),
+        cancelled: memoryDedupe(),
+      });
+
+      // 1. Admitted and journaled for real.
+      const admit = makeSeam({ journal, outcomeStore });
+      await admit.onFlush([item("hello", "u-1", "r-1")]);
+      expect(journal.read(PEER).map((row) => row.seq)).toEqual([1]);
+      expect(ackOf(admit.calls).committed).toEqual([
+        { random_id: "r-1", messageId: "webchannel-user-1", seq: 1 },
+      ]);
+
+      // 2. `/stop` lands after the row and replaces the accepted marker.
+      const suppression = await outcomeStore.record(ACCOUNT, `${PEER}:r-1`, "cancelled", {
+        replaceOthers: true,
+      });
+      if (suppression.status !== "recorded") throw new Error("could not record the suppression");
+      suppression.write.commit();
+      expect(await outcomeStore.lookup(ACCOUNT, `${PEER}:r-1`)).toEqual({
+        status: "found",
+        outcome: "cancelled",
+      });
+
+      // 3. The replay (its ack was lost) is still dropped — no second row, no
+      //    turn — but it CARRIES THE ECHO, so the client can adopt the durable id
+      //    of the bubble it is already showing. Withholding it would lose an id
+      //    the branch handed out before this slice.
+      const replay = makeSeam({ journal, outcomeStore });
+      await replay.onFlush([item("hello", "u-1", "r-1")]);
+
+      expect(journal.read(PEER).map((row) => row.seq)).toEqual([1]);
+      expect(replay.calls).toEqual([
+        {
+          call: "ack",
+          ids: ["u-1"],
+          committed: [{ random_id: "r-1", messageId: "webchannel-user-1", seq: 1 }],
+        },
+      ]);
     } finally {
       journal.close();
     }

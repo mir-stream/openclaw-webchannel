@@ -35,15 +35,23 @@
  * beats wide at-least-once for this surface. That deviation from the sketch is
  * deliberate and settled, and the ORDER is unchanged.
  *
- * ⚠️ WHAT CHANGED IS THAT THE WINDOW NOW HEALS (#344), FOR MOST OF IT. The
- * production outcome/lease branch no longer treats an `accepted` marker as proof
- * of an accept: the journal is the SSOT (doc §15.7), so when a marker has no
- * journal row for the item's `random_id`, the replay is RE-ADMITTED — journaled,
- * dispatched, acked with a fresh `committed` echo — instead of being re-acked as
- * a duplicate. A crash anywhere between the marker and the row is therefore
- * recovered by the client's very next replay. See the found/accepted branch in
- * the item loop and the footer's ordering block (which also states the cost:
- * a marker with no row re-runs its turn ONCE).
+ * ⚠️ WHAT CHANGED IS THAT THE WINDOW NOW HEALS (#344), FOR MOST OF IT. Neither
+ * of the two doors onto a durable `accepted` marker treats it as proof of an
+ * accept any more: the journal is the SSOT (doc §15.7), so when it has no row
+ * under this id's identity (`randomId ?? wireId` — the dedupe key's body, which
+ * is exactly what `appendInboundUser` stores as `idempotency_key`), the marker
+ * loses.
+ *  - THIS SEAM'S found/accepted branch RE-ADMITS the replay: journaled,
+ *    dispatched, acked, and echoed when the client sent a `random_id`.
+ *  - `inbound-overflow-resolver.ts`'s accepted arm — the door for an id whose
+ *    raw frame could not be retained — PUBLISHES NOTHING, because a resolver can
+ *    only report a verdict, never admit a message. Silence keeps the client's
+ *    ledger entry, so the message is replayed and taken by this seam. Its ack
+ *    was the worse half of the bug: it drained the ledger, so there was no next
+ *    replay at all.
+ * A crash anywhere between the marker and the row is therefore recovered by the
+ * client's next replay through either door. See that branch, that arm, and the
+ * footer's ordering block (which states the cost).
  *
  * ⚠️ AND IT IS ONLY SAFE BECAUSE `cancelled` IS ITS OWN OUTCOME — the first
  * version of this fix was wrong here, so the reason is worth keeping. "Marker,
@@ -67,21 +75,19 @@
  * re-running one aborted turn is the lesser error than re-introducing the drop
  * this slice exists to remove.
  *
- * ⚠️ THREE THINGS THE HEALING DOES NOT COVER, so this heading is not retired.
- *  1. AN ITEM WITH NO `random_id`. Its journal row is keyed by the wire id, and
- *     this seam does NOT query the journal by that — a scope choice, not a
- *     limit: `appendInboundUser` stores `idempotency_key = randomId ?? turnId`
- *     and `lookupUserMessageIdByRandomId` reads that same column, so the wire id
- *     WOULD resolve an older client's row. It is not passed because the echo
- *     this branch feeds is keyed by `random_id` and an older client has none, so
- *     widening it buys an existence check and nothing else. The marker still
- *     wins for those items; extending the check to the wire id is a follow-up,
- *     not an impossibility.
- *  2. THE ID-LESS ADMIT PATH. No usable wire id ⇒ no dedupe key ⇒ neither a
+ * ⚠️ TWO THINGS THE HEALING DOES NOT COVER, so this heading is not retired.
+ * (It was THREE until round 3. An older client that sends no `random_id` used to
+ * head this list, on the grounds that its row "is keyed by the wire id, which
+ * this seam does not query" — true of the code, but the reason given for it was
+ * wrong: the existence check IS the whole fix for those clients, not a bonus on
+ * top of an echo they cannot receive. The lookup is now `randomId ?? wireId` and
+ * they heal like everyone else; they are simply acked bare, since a `committed`
+ * entry needs a `random_id` to key it by.)
+ *  1. THE ID-LESS ADMIT PATH. No usable wire id ⇒ no dedupe key ⇒ neither a
  *     marker nor a row is ever written for it, so there is nothing here to heal;
  *     the item is admitted un-deduped and reported as a gap exactly as before
  *     (see `journalGap("no-usable-id")` and its call site for the owning issue).
- *  3. THE LEGACY BOOLEAN-DEDUPE BRANCH at the bottom of this file
+ *  2. THE LEGACY BOOLEAN-DEDUPE BRANCH at the bottom of this file
  *     (`filterFreshInboundItems`), which has no journal and no outcome store —
  *     it still drops a crash-window replay exactly as the paragraph above
  *     describes.
@@ -887,39 +893,67 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               rejectedIds.push(id);
               continue;
             }
+            // #243 half 2a — THE DEDUPED-RETRY ECHO. A retry is caught here,
+            // BEFORE any re-append, so it must not mint a fresh id or write a
+            // second row (a new id would slip past the journal's
+            // `journal_user_idempotency_once` guard, whose key is the OLD
+            // identity, and duplicate the durable message). Instead recover the
+            // id the FIRST admission minted, from the row, and echo the SAME
+            // value. #244 half A: that includes the first admission's `seq` —
+            // both are echoed unchanged, never freshly minted.
+            //
+            // ⚠️ QUERIED BY `randomId ?? id`, WHICH IS THE DEDUPE KEY'S BODY AND
+            // THE ROW'S `idempotency_key` (#344 round 3). `appendInboundUser`
+            // stores `randomId ?? turnId` in that column and
+            // `lookupUserMessageIdByRandomId` reads it, so this one value asks
+            // both stores about the same message — including for an older client
+            // that sent no `random_id`, whose row is keyed by the wire id. The
+            // round-2 version passed only `randomId`, which made the existence
+            // question unanswerable for exactly those clients and left their
+            // crash-window messages dropped; that was a scope choice described as
+            // if it were a limit, and it is neither now.
+            const idempotencyKey = randomId ?? id;
+            const row = deps.deliveryJournal?.lookupUserMessageIdByRandomId(
+              peerId,
+              idempotencyKey,
+            );
+            // The echo is keyed by `random_id`, so it exists only when the client
+            // sent one — putting a WIRE id in that field would have the client
+            // re-key a bubble by a value it never used as a `random_id`. An older
+            // client is looked up, but never echoed to. (`inbound-overflow-
+            // resolver.ts` draws the same line for the same reason.)
+            const committed = randomId !== undefined ? row : undefined;
             // ⭐ #344 — A CANCELLED REPLAY IS DROPPED, NOT RE-ADMITTED, AND THIS
             // ARM IS WHY THE OUTCOME HAD TO SPLIT. Text `/stop` killed has a
-            // marker and, on purpose, NO journal row — the same shape the crash
+            // marker and, typically, NO journal row — the same shape the crash
             // window leaves. Read only the row and the two are one state; read
-            // the outcome and they are two. So this arm answers the row question
-            // by NOT ASKING IT.
+            // the outcome and they are two. So this arm decides WITHOUT the row:
+            // absence proves nothing about a suppression that was never meant to
+            // have one.
             //
             // ACK, never `inbound_rejected`: the ack is what drains the client's
             // replay ledger so it stops re-sending dead text, and a rejection
             // would tell the peer its message hit backpressure, which is a lie.
-            // No `committed` echo either — there is no row to echo, and inventing
-            // one would put a durable id on the wire for a message history does
-            // not have. This is exactly what the branch did before the split,
-            // when the same suppression was spelled `accepted`.
+            //
+            // ⚠️ IT STILL ECHOES A ROW THAT EXISTS, and "there is no row to echo"
+            // was wrong as an absolute (round 2). A message can be journaled and
+            // THEN cancelled: `/stop` landing in the flush-footer window records
+            // `cancelled` with `replaceOthers`, which deletes the `accepted`
+            // marker but not the row. Withholding the echo there loses the id the
+            // client needs to adopt its bubble — which the branch did echo before
+            // this slice. The verdict ignores the row; the echo does not.
             if (existing.outcome === "cancelled") {
               release();
               ackIds.push(id);
+              if (randomId !== undefined && committed !== undefined) {
+                committedBatch.push({
+                  random_id: randomId,
+                  messageId: committed.messageId,
+                  seq: committed.seq,
+                });
+              }
               continue;
             }
-            // #243 half 2a — THE DEDUPED-RETRY ECHO. The retry is caught here,
-            // BEFORE any re-append, so it must not mint a fresh id or write a
-            // second row (a new id would slip past the journal's
-            // `journal_user_idempotency_once` guard, whose key is the OLD
-            // `random_id`, and duplicate the durable message). Instead recover
-            // the id the FIRST admission minted, from the row, and echo the SAME
-            // value.
-            //
-            // #244 half A: the lookup now returns the first admission's `seq`
-            // alongside its `messageId`, and the retry echoes BOTH unchanged —
-            // never a fresh seq, exactly as it never mints a fresh id.
-            const committed = randomId !== undefined && deps.deliveryJournal
-              ? deps.deliveryJournal.lookupUserMessageIdByRandomId(peerId, randomId)
-              : undefined;
             // ⭐ #344 — THE JOURNAL IS THE DEDUPE AUTHORITY; THE MARKER IS AN
             // OPTIMIZATION LAYER. The Telegram server dedupes a re-sent message
             // by `random_id` against the messages it has STORED — the stored
@@ -932,24 +966,19 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // forever while the origin device kept a "sent" bubble (#344, the
             // crash door onto #292).
             //
-            // So: marker says accepted, the item carries a `random_id`, this
-            // seam HAS a journal, and the journal has no row for it ⇒ it was NOT
-            // accepted. Fall through to the fresh-accept path, which journals it
-            // and dispatches the turn. Nothing here is a second journal call
-            // site: the one append stays in the footer.
+            // So: marker says accepted, this seam HAS a journal, and the journal
+            // has no row under this id's identity ⇒ it was NOT accepted. Fall
+            // through to the fresh-accept path, which journals it and dispatches
+            // the turn. Nothing here is a second journal call site: the one
+            // append stays in the footer.
             //
-            // The three ways out of the check, and why each still acks:
-            //  - no `random_id` (an older client): its row is keyed by the wire
-            //    id and this seam does not query by that. A SCOPE choice, not a
-            //    limit — `appendInboundUser` writes `idempotency_key =
-            //    randomId ?? turnId` and this lookup reads that column, so the
-            //    wire id would resolve it. Unchanged behaviour: ack, no echo.
+            // The two ways out of the check, and why each still acks:
             //  - no `deps.deliveryJournal` (P0-7a wiring, and this file's own
             //    pre-journal tests): there is no authority to consult.
             //  - a row exists: the ordinary deduped retry, re-echoing the FIRST
-            //    admission's id and seq.
-            const orphanedMarker =
-              randomId !== undefined && deps.deliveryJournal !== undefined && committed === undefined;
+            //    admission's id and seq (to a conforming client; an older one is
+            //    acked bare, as above).
+            const orphanedMarker = deps.deliveryJournal !== undefined && row === undefined;
             if (!orphanedMarker) {
               release();
               ackIds.push(id);
@@ -968,10 +997,13 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // or a marker minted by a pre-journal build, and an operator seeing
             // a run of these is seeing turns re-run (see the footer's ordering
             // block for the bounded cost).
+            //
+            // `dedupe_id` rather than `random_id`: it is `randomId ?? wireId`,
+            // whichever this id is actually keyed by in both stores.
             warnJournal(
               "orphaned-accept-marker",
               "webchannel: accepted outcome marker has no journal row, re-admitting " +
-                `peer=${logSafe(peerId)} random_id=${logSafe(randomId)} ` +
+                `peer=${logSafe(peerId)} dedupe_id=${logSafe(idempotencyKey)} ` +
                 "action=journal-is-authoritative-turn-re-runs-once",
             );
             readmitted = true;
@@ -1146,6 +1178,14 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         //     instead of being dropped. Bounded by the marker store's 7-day TTL
         //     and by the client's ledger (only a message the client is still
         //     replaying reaches this at all).
+        //     ⚠️ "RE-RUNS ONCE" IS ABOUT THIS SEAM. A replay that arrives while
+        //     the retention budget is full never reaches here: it overflows into
+        //     `inbound-overflow-resolver.ts`, which for the same orphan publishes
+        //     NOTHING rather than re-admitting. The message is not re-run and not
+        //     dropped either — it is simply left unresolved, so the client keeps
+        //     it and lands here on a later, less loaded replay. Round 2 stated
+        //     this bullet as if this seam were the only door; that reading also
+        //     hid the fact that the resolver was ACKING those orphans away.
         //  2. ONE-OFF, ON UPGRADE: a cancellation recorded as `accepted` by an
         //     older build is indistinguishable from (1) for that marker's TTL, so
         //     if its ack was also lost, the aborted turn re-runs once. The file

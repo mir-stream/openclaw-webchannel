@@ -22,12 +22,52 @@ export type OverflowResolverStart =
 
 export type BoundedOverflowResolverOptions = {
   outcomeStore: IngressOutcomeStore;
-  sendAck(request: OverflowResolutionRequest): boolean | Promise<boolean>;
+  /**
+   * #344 — THE DELIVERY JOURNAL, WHICH IS THE ACCEPT AUTHORITY (doc §15.7).
+   * This resolver is the SECOND door onto a durable `accepted` marker, and round
+   * 2 fixed only the first (`ingress-dedupe.ts`'s found branch), so the same
+   * orphan that seam re-admits was still being acked away here.
+   *
+   * Optional because the resolver is constructed at module scope, before any
+   * account has opened a journal, and because callers that predate the journal
+   * still build one. Absent means "no authority to consult" and the accepted arm
+   * keeps its pre-#344 behaviour — the same fallback the accept seam uses.
+   */
+  lookupUserRow?(
+    request: OverflowResolutionRequest,
+    idempotencyKey: string,
+  ): { messageId: string; seq: number } | undefined;
+  sendAck(
+    request: OverflowResolutionRequest,
+    committed?: Array<{ random_id: string; messageId: string; seq: number }>,
+  ): boolean | Promise<boolean>;
   sendRejected(request: OverflowResolutionRequest): boolean | Promise<boolean>;
   onCancelledRecovered?(request: OverflowResolutionRequest): void;
   maxTasks?: number;
   maxMetadataBytes?: number;
 };
+
+/**
+ * The identity BOTH stores key this id by.
+ *
+ * `request.key` is `${peerId}:<body>`, and the body is `ingressDedupeKey`'s —
+ * the client `random_id` when it sent a usable one, else the wire id.
+ * `appendInboundUser` writes that SAME value as the row's `idempotency_key`
+ * (`randomId ?? turnId`), and `lookupUserMessageIdByRandomId` reads that column.
+ * So deriving the journal key from the outcome key, rather than carrying a
+ * second field, is what makes "the marker and the row are about the same
+ * message" true by construction instead of by convention — and asking the two
+ * stores about different messages is the exact defect class #344 exists for.
+ *
+ * Falls back to the wire id if the key is not `${peerId}:`-prefixed. Both
+ * construction sites build it that way (`ingressDedupeKey` and
+ * `nats-account-runtime.ts`'s `onOverflow`), so this is a totality guard, not a
+ * second supported shape.
+ */
+function idempotencyKeyOf(request: OverflowResolutionRequest): string {
+  const prefix = `${request.peerId}:`;
+  return request.key.startsWith(prefix) ? request.key.slice(prefix.length) : request.id;
+}
 
 type ActiveTask = { request: OverflowResolutionRequest; bytes: number; cancelled: boolean; released: boolean };
 
@@ -162,10 +202,48 @@ export class BoundedOverflowResolver {
       const known = await this.options.outcomeStore.lookup(request.accountId, request.key);
       if (task.cancelled || this.disposed) return;
       if (known.status === "found") {
-        // #344: `overloaded` is the only outcome that publishes a refusal;
+        // #344: `overloaded` is the only outcome that publishes a refusal.
+        if (known.outcome === "overloaded") {
+          await this.options.sendRejected(request);
+          return;
+        }
+        const idempotencyKey = idempotencyKeyOf(request);
+        const row = this.userRowFor(request, idempotencyKey);
         // `cancelled` acks, exactly as it did while it was spelled `accepted`.
-        if (known.outcome === "overloaded") await this.options.sendRejected(request);
-        else await this.options.sendAck(request);
+        // Its VERDICT asks the journal nothing — a `/stop` suppression has no row
+        // on purpose, so absence proves nothing — but it still echoes a row that
+        // happens to exist (a message journaled before the `/stop` landed).
+        if (known.outcome === "cancelled") {
+          await this.options.sendAck(
+            request,
+            this.committedEchoFor(request, idempotencyKey, row),
+          );
+          return;
+        }
+        // ⭐ #344 — `accepted` GETS THE SAME JOURNAL QUESTION THE ACCEPT SEAM
+        // ASKS, AND THIS IS THE SECOND DOOR ONTO IT. Round 2 fixed the found
+        // branch in `ingress-dedupe.ts` and left this one, so a crash-window
+        // orphan replayed while the retention budget was full still landed here
+        // and was acked as a terminal accept — the client drained its ledger and
+        // the message was never journaled and never answered. Same rule, same
+        // authority: a marker with no row is not evidence of an accept.
+        if (this.options.lookupUserRow !== undefined && row === undefined) {
+          // PUBLISH NOTHING, exactly like the `unknown` arm below — and for the
+          // same reason: this resolver has no way to admit a message, only to
+          // report a verdict, and there is no true verdict to report. Silence
+          // leaves the client's ledger entry intact, so the message is replayed
+          // and taken by the ordinary flush path, which journals it, dispatches
+          // the turn and echoes the minted id. The retention pressure that sent
+          // it here is transient; the loss it used to cause was not.
+          return;
+        }
+        // #333 path 6: when the row DOES exist, carry the `committed` echo. This
+        // arm used to ack bare, so a replay resolved through overflow left the
+        // client with an un-adopted optimistic bubble until the next gap-sync.
+        await this.options.sendAck(
+          request,
+          this.committedEchoFor(request, idempotencyKey, row),
+        );
         return;
       }
       if (known.status === "unknown") return;
@@ -188,6 +266,46 @@ export class BoundedOverflowResolver {
     } finally {
       this.release(task);
     }
+  }
+
+  /**
+   * This id's journal row, or `undefined` for all three of "no journal wired",
+   * "no row", and "the journal threw". Collapsing the three is deliberate at the
+   * ONE call site that can act on it: the accepted arm re-checks
+   * `options.lookupUserRow !== undefined` so an absent journal keeps the old
+   * behaviour, and a fault is then treated as "no row" — the fail-safe
+   * direction, since it withholds a terminal accept instead of inventing one.
+   */
+  private userRowFor(
+    request: OverflowResolutionRequest,
+    idempotencyKey: string,
+  ): { messageId: string; seq: number } | undefined {
+    try {
+      return this.options.lookupUserRow?.(request, idempotencyKey);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The `ack.committed` echo — present only when a row exists AND the identity
+   * it is keyed by is a real client `random_id`.
+   *
+   * The second condition is why this is not just "the row". `idempotencyKeyOf`
+   * yields `random_id ?? wireId`, and an echo whose `random_id` field carries a
+   * WIRE id would have the client re-key an optimistic bubble by a value it
+   * never used as a `random_id`. `ingress-dedupe.ts` draws the same line by only
+   * ever pushing `committedBatch` entries when `randomId !== undefined`; here the
+   * equivalent test is that the key body differs from the wire id. An older
+   * client therefore still gets a bare ack — exactly as it does at that seam.
+   */
+  private committedEchoFor(
+    request: OverflowResolutionRequest,
+    idempotencyKey: string,
+    row: { messageId: string; seq: number } | undefined,
+  ): Array<{ random_id: string; messageId: string; seq: number }> | undefined {
+    if (row === undefined || idempotencyKey === request.id) return undefined;
+    return [{ random_id: idempotencyKey, messageId: row.messageId, seq: row.seq }];
   }
 
   private release(task: ActiveTask): void {

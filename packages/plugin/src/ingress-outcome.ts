@@ -45,6 +45,13 @@ export type IngressOutcomeFailureCategory =
   | "rollback-recovery-cancelled"
   | "rollback-recovery-poisoned"
   | "adapter-lookup"
+  // ⚠️ NO `adapter-record-cancelled` SIBLING, DELIBERATELY. These three name a
+  // record whose ADAPTER THREW, and they exist because `ingress-dedupe.ts`
+  // reports that through `warnOutcomeFailure`. Its `cancelled` record — the
+  // cancelled-inbound fallback branch, the only one in this package that catches
+  // a throw — has its own dedicated line ("cancelled-inbound fallback outcome
+  // retry failed"), so a fourth category here would have no emitter. Add it the
+  // day a call site needs it, not for the shape of the list.
   | "adapter-record-accepted"
   | "adapter-record-overloaded";
 export type IngressOutcomeFailureWarning = (
@@ -58,17 +65,28 @@ export type IngressOutcomeFailureWarning = (
  * its marker through the SDK store the moment it is called, and the accept
  * seam's journal row is written later, so a crash — or any build that recorded
  * markers before the journal existed — can leave a marker with no row. The
- * journal is the authority on that disagreement; `ingress-dedupe.ts`'s
- * found/accepted branch consults it and RE-ADMITS when the row is missing. A
+ * journal is the authority on that disagreement, and BOTH readers of this result
+ * apply it: `ingress-dedupe.ts`'s found/accepted branch RE-ADMITS when the row is
+ * missing, and `inbound-overflow-resolver.ts`'s accepted arm PUBLISHES NOTHING
+ * (it can only report a verdict, so withholding one leaves the client's ledger
+ * entry intact for the seam to take).
+ *
+ * ⚠️ THE CENSUS IS THE CLAIM, AND IT WAS WRONG FOR A ROUND. This used to end "a
  * caller that treats this result as a terminal accept without the same check is
- * reintroducing #344.
+ * reintroducing #344" — while the PR that wrote the sentence still shipped
+ * exactly such a caller in the resolver. So: any NEW reader owes the same check,
+ * and the two above are the complete set today. Grep before adding a third —
+ * `outcomeStore.lookup(` and `peek(` are the entry points.
  *
  * ⚠️ AND THAT IS EXACTLY WHY `cancelled` IS ITS OWN OUTCOME. "Marker present,
  * no journal row" has two producers with OPPOSITE required handling: the crash
  * window (re-admit) and a `/stop` suppression (drop). While both recorded
  * `accepted`, the accept seam could not tell them apart and re-ran killed text —
  * the round-1 defect on this slice. Read the outcome, not the row, to decide
- * WHICH question to ask; read the journal only for `accepted`.
+ * WHICH question to ask; ask the journal for a VERDICT only on `accepted`. (Both
+ * readers still LOOK UP the row on `cancelled`, but only to carry the
+ * `committed` echo for a message that was journaled before the `/stop` landed —
+ * the row never changes the cancelled verdict.)
  */
 export type OutcomeLookup =
   | { status: "found"; outcome: IngressOutcome }
@@ -125,7 +143,12 @@ type OutcomeStoreOptions = {
   maxHotBytes?: number;
   maxRollbackRecoveryEntries?: number;
   maxRollbackRecoveryBytes?: number;
-  warnInvariant?: (message: string) => void;
+  /**
+   * #344: takes the WINNING outcome, not a message — the emitted line is built
+   * by `createRateLimitedOutcomeInvariantWarning` so it cannot disagree with the
+   * decision that triggered it.
+   */
+  warnInvariant?: (winner: IngressOutcome) => void;
   warnFailure?: IngressOutcomeFailureWarning;
 };
 
@@ -322,19 +345,27 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
           let also: { found: boolean; diskError?: unknown } | undefined;
           try { also = await hasRecent(storeFor(loser), accountId, key); } catch { /* winner stands */ }
           if (!also?.found) continue;
-          options.warnInvariant?.(
-            `webchannel: ingress outcome invariant violation (dual marker); ${outcome} wins`,
-          );
+          options.warnInvariant?.(outcome);
           await storeFor(loser).forget(key, { namespace: accountId }).catch(() => false);
         }
         // ⚠️ THE DURABILITY RULE IS PER-OUTCOME AND IS NOT AN OVERSIGHT.
-        // `accepted` INHERITS a matching hot entry's durability; the two
-        // refusals are pinned `durable`. Unifying them would change what a
-        // memory-only marker can authorize — `ingress-dedupe.ts` and
-        // `inbound-overflow-resolver.ts` both gate publishing `inbound_rejected`
-        // on `durability === "durable"`, and promoting an overloaded hot entry
-        // is the behaviour those gates were written against. Left exactly as it
-        // was before #344.
+        // `accepted` INHERITS a matching hot entry's durability; the two refusals
+        // are pinned `durable`. For `overloaded` that is unchanged behaviour, and
+        // unifying it away would change what a memory-only marker can authorize:
+        // `ingress-dedupe.ts` and `inbound-overflow-resolver.ts` both gate
+        // publishing `inbound_rejected` on `durability === "durable"`, and
+        // promoting an overloaded hot entry is what those gates were written
+        // against.
+        //
+        // For `cancelled` it IS a change (#344 round 3), stated rather than
+        // hidden: while a cancellation was spelled `accepted` it inherited, and
+        // now it pins. That is sound because `record()` above fails a faulted
+        // `cancelled` write CLOSED, so no memory-only cancelled marker can be
+        // created in the first place — every cancelled hot entry originates
+        // "durable" here or in `write.commit()`, and by induction stays durable.
+        // Which is also why the three cancellation writers do NOT check
+        // `durability`: the check would be provably inert, and a dead guard reads
+        // as a live one to the next person.
         const existing = hot.get(hotKey(accountId, key));
         putHot(
           accountId,
@@ -461,9 +492,25 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
       }
       if (diskError !== undefined) {
         options.warnFailure?.(accountId, `record-${outcome}`);
-        if (outcome === "overloaded") {
-          // SDK has already inserted a memory marker. It must not authorize a
-          // terminal rejection, so remove memory first and best-effort disk state.
+        // ⚠️ BOTH REFUSALS FAIL CLOSED; ONLY `accepted` MAY GO MEMORY-ONLY.
+        // #344 round 3 extended this from `overloaded` alone. The SDK has already
+        // inserted a memory marker, and a memory-only marker dies with the
+        // process:
+        //  - `overloaded` — it must not authorize a terminal rejection (the
+        //    original reason);
+        //  - `cancelled` — a suppression lost on restart lets the client's replay
+        //    run the turn `/stop` killed, which is the same class of harm this
+        //    whole slice exists to remove. Fail closed so the write is retried:
+        //    all three cancellation writers already treat `unknown` correctly —
+        //    `recordCancelledInboundItems` arms the fallback tombstone, the seam's
+        //    fallback branch holds peer FIFO, and the overflow resolver publishes
+        //    nothing and keeps its tombstone.
+        // `accepted` is deliberately NOT here: a memory-only accept marker that
+        // is lost merely re-admits the message, which the journal's idempotency
+        // then collapses — the benign direction, and the one the accept path was
+        // written against.
+        if (outcome !== "accepted") {
+          // Remove memory first, then best-effort disk state.
           try { await store.forget(key, { namespace: accountId }); } catch { /* recovery is retry */ }
           deleteHot(accountId, key, outcome);
           releaseOperation();
@@ -551,24 +598,47 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
   };
 }
 
+/**
+ * Rate-limited dual-marker warning, ONE THROTTLE ENTRY PER WINNING OUTCOME.
+ *
+ * ⚠️ IT TAKES THE WINNER, NOT A MESSAGE, AND THAT IS THE FIX (#344 round 2→3).
+ * It used to accept a `message: string`, IGNORE it, and emit a hardcoded
+ * "…overloaded wins". While `overloaded` was the only winner that was merely
+ * redundant; once `cancelled` could win too, the operator log named the wrong
+ * verdict — "overloaded wins" says the peer got `inbound_rejected` when it got a
+ * silent ack, which is the opposite diagnosis. Building the line HERE, from a
+ * closed union, is what makes the emitted text and the store's decision the same
+ * fact instead of two that can drift.
+ *
+ * Taking the union rather than the string also keeps the old property the
+ * discarded parameter was protecting: the keyspace is three static entries, so
+ * no caller — present or future — can grow this limiter's state with a value off
+ * the wire. The previous signature only made that unenforceable.
+ */
 export function createRateLimitedOutcomeInvariantWarning(
   warn: (message: string) => void,
   now: () => number = Date.now,
   intervalMs = 60_000,
-): (message: string) => void {
-  let lastAt = Number.NEGATIVE_INFINITY;
-  let suppressed = 0;
-  return () => {
+): (winner: IngressOutcome) => void {
+  const state = new Map<IngressOutcome, { lastAt: number; suppressed: number }>(
+    OUTCOME_PRECEDENCE.map((outcome) => [
+      outcome,
+      { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
+    ]),
+  );
+  return (winner) => {
+    const entry = state.get(winner);
+    if (!entry) return;
     const at = now();
-    if (at - lastAt < intervalMs) {
-      suppressed++;
+    if (at - entry.lastAt < intervalMs) {
+      entry.suppressed++;
       return;
     }
-    const suppressedSinceLast = suppressed;
-    lastAt = at;
-    suppressed = 0;
+    const suppressedSinceLast = entry.suppressed;
+    entry.lastAt = at;
+    entry.suppressed = 0;
     warn(
-      "webchannel: ingress outcome invariant violation (dual marker); overloaded wins " +
+      `webchannel: ingress outcome invariant violation (dual marker); ${winner} wins ` +
         `(suppressed=${suppressedSinceLast})`,
     );
   };
@@ -627,6 +697,19 @@ export function createRateLimitedOutcomeFailureWarning(
   };
 }
 
+/**
+ * PER-STORE, AND THERE ARE NOW THREE OF THEM (#344).
+ *
+ * These are each `createPersistentDedupe`'s own caps, so the process ceiling is
+ * 3 × (2 048 memory entries + 5 000 SQLite rows), not the numbers written here —
+ * up from 2 × when `cancelled` shared the `accepted` namespace. The growth is
+ * bounded and small (one short key per entry, a few hundred KiB of memory at the
+ * cap) and it is the honest shape of the data: three disjoint verdicts, and a
+ * key can hold only one of them, so the SUM across the three namespaces is still
+ * one entry per deduped message. What actually grew is the worst case where all
+ * three namespaces are simultaneously at their independent caps — a state no
+ * single traffic pattern produces, since each message contributes to exactly one.
+ */
 const DEDUPE_OPTIONS = {
   ttlMs: 7 * 24 * 60 * 60 * 1_000,
   memoryMaxSize: 2_048,

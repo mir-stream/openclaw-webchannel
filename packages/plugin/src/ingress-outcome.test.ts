@@ -87,6 +87,47 @@ describe("IngressOutcomeStore", () => {
     expect(warned.join(" ")).not.toMatch(/secret|peer:id|content/);
   });
 
+  it("#344: a faulted `cancelled` write fails CLOSED and leaves no memory-only marker", async () => {
+    // Round 3 extended `record()`'s disk-error cleanup from `overloaded` alone to
+    // BOTH refusals. The reason is the one this whole slice exists for: the SDK
+    // has already inserted a memory marker, and a memory-only suppression dies
+    // with the process — so a restart would let the client's replay run the turn
+    // `/stop` killed. `accepted` deliberately stays memory-only-tolerant: losing
+    // an accept marker only re-admits, which the journal's idempotency collapses.
+    const accepted = fake(); const overloaded = fake(); const cancelled = fake();
+    const store = makeStore({
+      accepted: accepted.store,
+      overloaded: overloaded.store,
+      cancelled: cancelled.store,
+    });
+
+    (cancelled.store.checkAndRecord as any).mockImplementationOnce(async (key: string, options: any) => {
+      options.onDiskError(new Error("disk full"));
+      cancelled.values.add(`${options.namespace}:${key}`); // the SDK's memory marker
+      return true;
+    });
+    const suppression = await store.record("a", "p:i", "cancelled", { replaceOthers: true });
+
+    // UNKNOWN, not a memory-only `recorded`: every cancellation writer treats that
+    // as "retry later" (fallback tombstone / peer FIFO / publish nothing), which
+    // is what keeps the suppression alive across the fault.
+    expect(suppression.status).toBe("unknown");
+    // And the memory marker the SDK inserted is gone, so a later lookup cannot
+    // rediscover a suppression that was never durable.
+    expect(cancelled.values.has("a:p:i")).toBe(false);
+    expect(await store.lookup("a", "p:i")).toEqual({ status: "not-found" });
+
+    // The contrast, in the same test so the asymmetry cannot be read as an
+    // oversight: `accepted` still returns a usable memory-only receipt.
+    (accepted.store.checkAndRecord as any).mockImplementationOnce(async (_key: string, options: any) => {
+      options.onDiskError(new Error("disk full"));
+      return true;
+    });
+    const admit = await store.record("a", "p:j", "accepted");
+    if (admit.status !== "recorded") throw new Error("accepted unexpectedly failed closed");
+    expect(admit.durability).toBe("memory-only");
+  });
+
   it("namespaces accounts and gives overloaded precedence over impossible dual markers", async () => {
     const accepted = fake(); const overloaded = fake();
     const warn = vi.fn();
@@ -275,10 +316,9 @@ describe("IngressOutcomeStore", () => {
     overloaded.values.add("a:p:i");
     accepted.values.add("a:p:i");
     expect(await store.lookup("a", "p:i")).toEqual({ status: "found", outcome: "cancelled" });
-    expect(invariants).toEqual([
-      "webchannel: ingress outcome invariant violation (dual marker); cancelled wins",
-      "webchannel: ingress outcome invariant violation (dual marker); cancelled wins",
-    ]);
+    // The store reports the WINNER; the line is built by the limiter (see
+    // "names the WINNING outcome…" below, which asserts the console text).
+    expect(invariants).toEqual(["cancelled", "cancelled"]);
     expect(overloaded.values.has("a:p:i")).toBe(false);
     expect(accepted.values.has("a:p:i")).toBe(false);
 
@@ -293,9 +333,7 @@ describe("IngressOutcomeStore", () => {
     other.values.add("a:p:j");
     otherOverloaded.values.add("a:p:j");
     expect(await second.lookup("a", "p:j")).toEqual({ status: "found", outcome: "overloaded" });
-    expect(invariants.at(-1)).toBe(
-      "webchannel: ingress outcome invariant violation (dual marker); overloaded wins",
-    );
+    expect(invariants.at(-1)).toBe("overloaded");
   });
 
   it("re-recording an EXISTING accepted marker still reports `recorded`, as a follower", async () => {
@@ -438,18 +476,48 @@ describe("IngressOutcomeStore", () => {
     expect(overloaded.values.has("a:p:i")).toBe(false);
   });
 
-  it("rate-limits the process dual-marker warning with bounded content-free state", () => {
+  it("names the WINNING outcome in the emitted dual-marker line, throttled per winner", () => {
+    // #344 round 3: this limiter used to take a `message`, DISCARD it, and print
+    // a hardcoded "overloaded wins". Measured before the fix: passing
+    // "…cancelled wins" emitted "…overloaded wins" — the log told the operator
+    // the peer had been sent `inbound_rejected` when it had been silently acked.
+    // So the assertion that matters is the CONSOLE TEXT, not what the store built.
     let now = 0;
     const warn = vi.fn();
     const limited = createRateLimitedOutcomeInvariantWarning(warn, () => now, 100);
-    limited("secret-peer:id-one");
-    limited("other-peer:id-two");
+
+    limited("cancelled");
     expect(warn).toHaveBeenCalledTimes(1);
-    now = 100;
-    limited("third-secret");
+    expect(warn.mock.calls[0]?.[0]).toBe(
+      "webchannel: ingress outcome invariant violation (dual marker); cancelled wins (suppressed=0)",
+    );
+
+    // Per-WINNER windows: a different winner is not suppressed by this one, so a
+    // burst of one shape cannot hide the other — the same reason
+    // `JournalWarning` splits its members in `ingress-dedupe.ts`.
+    limited("overloaded");
     expect(warn).toHaveBeenCalledTimes(2);
-    expect(warn.mock.calls[1]?.[0]).toContain("suppressed=1");
-    expect(warn.mock.calls.flat().join(" ")).not.toMatch(/secret|peer|id-one|id-two/);
+    expect(warn.mock.calls[1]?.[0]).toBe(
+      "webchannel: ingress outcome invariant violation (dual marker); overloaded wins (suppressed=0)",
+    );
+
+    // Within one window, same winner: counted, not emitted.
+    limited("cancelled");
+    expect(warn).toHaveBeenCalledTimes(2);
+    now = 100;
+    limited("cancelled");
+    expect(warn).toHaveBeenCalledTimes(3);
+    expect(warn.mock.calls[2]?.[0]).toBe(
+      "webchannel: ingress outcome invariant violation (dual marker); cancelled wins (suppressed=1)",
+    );
+
+    // The state is three static entries keyed by a closed union, so nothing off
+    // the wire can reach it. The old signature took an arbitrary string and only
+    // stayed safe by discarding it; this one cannot be handed a peer value at all
+    // (`limited("peer:id")` does not typecheck), which is why the previous
+    // version of this test — three secret-looking strings and a redaction check —
+    // is gone rather than rewritten.
+    expect(warn.mock.calls.flat().join(" ")).not.toMatch(/peer|secret/);
   });
 
   it("rate-limits fixed failure categories and redacts unsafe account labels", () => {

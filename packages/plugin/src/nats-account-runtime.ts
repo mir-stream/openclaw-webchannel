@@ -205,6 +205,13 @@ type AccountRuntime = {
   sessionTokens: Map<string, RetentionSessionToken>;
   inboundDebouncer: BoundedInboundDebouncer<any>;
   inboundDispatcher: SerializedInboundDispatcher<any>;
+  /**
+   * #344: the module-scope overflow resolver reaches this account's journal the
+   * same way it reaches its channel — through this map. Absent only for a
+   * runtime published before its journal opened, which cannot happen on the
+   * start path but is typed honestly rather than asserted.
+   */
+  deliveryJournal?: DeliveryJournal;
   owner: object;
   dispose: () => Promise<import("./nats-account-coordinator.js").DisposeReport>;
 };
@@ -232,8 +239,16 @@ const processCancelledInboundFallback = new CancelledInboundFallbackTombstones(
 );
 const processOverflowResolver = new BoundedOverflowResolver({
   outcomeStore: processIngressOutcomes,
-  sendAck: ({ accountId, peerId, id }) =>
-    accountRuntimes.get(accountId)?.channel.sendAck(peerId, [id]) ?? false,
+  // #344: the accept authority, resolved per account exactly like `sendAck`
+  // below. A disposed runtime yields `undefined`, and a closed handle throws
+  // into the resolver's own catch — both leave the id unresolved, which is the
+  // fail-safe direction (the client replays and the flush path decides).
+  lookupUserRow: ({ accountId, peerId }, idempotencyKey) =>
+    accountRuntimes
+      .get(accountId)
+      ?.deliveryJournal?.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
+  sendAck: ({ accountId, peerId, id }, committed) =>
+    accountRuntimes.get(accountId)?.channel.sendAck(peerId, [id], committed) ?? false,
   sendRejected: ({ accountId, peerId, id }) =>
     accountRuntimes.get(accountId)?.channel.sendInboundRejected(peerId, [id]) ?? false,
   onCancelledRecovered: ({ accountId, key }) => {
@@ -1620,6 +1635,9 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
               sessionTokens,
               inboundDebouncer: inboundDebouncer!,
               inboundDispatcher: inboundDispatcher!,
+              // #344: the overflow resolver's accept authority. Same handle the
+              // channel and the accept seam already hold.
+              ...(deliveryJournal ? { deliveryJournal } : {}),
               owner: ownerIdentity,
               dispose,
             };

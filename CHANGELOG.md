@@ -114,6 +114,14 @@
   replay inside the window — and it cannot be repaired after the fact, because
   the two cases are indistinguishable in the old marker.
 
+  The same rule applies at the second door — the path a message takes when the
+  server is too busy to hold its raw frame. That one used to acknowledge the lost
+  message, which stopped the sending device from retrying it at all; it now stays
+  silent, so the message comes back and is answered on a later attempt. Messages
+  from older clients that send no idempotency token are recovered as well, and an
+  operator log line that always blamed backpressure now names the verdict that
+  actually applied.
+
 - **A turn whose answer count does not line up no longer loses an answer (#340,
   extends #260).** When a turn ends with two or more finals whose count does not
   match the count of answers that actually streamed — in either direction — the plugin

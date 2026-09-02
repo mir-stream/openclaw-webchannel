@@ -119,6 +119,39 @@
   keeps it idempotent. The order is deliberately NOT reversed: a row without a
   marker replays as a fresh admission and answers the same text twice.
 
+- **The overflow resolver applies the same journal authority (#344).**
+  `inbound-overflow-resolver.ts` is the second door onto a durable `accepted`
+  marker — the path an id takes when its raw frame could not be retained — and it
+  read the marker as a terminal accept. For a crash-window orphan (or any marker
+  orphaned by §15.6's journal cutover) it ACKED, so the client drained its replay
+  ledger and the message was lost permanently, which is worse than the accept
+  seam's version of the same bug. It now takes an optional `lookupUserRow` dep
+  and, when the journal has no row, publishes nothing at all: a resolver can only
+  report a verdict, so withholding one leaves the ledger entry for the ordinary
+  flush path to admit, journal and answer. It also carries the `committed` echo
+  when a row does exist, which that arm never did.
+
+- **The accept seam's journal question covers older clients too (#344).** The
+  lookup is keyed by `randomId ?? wireId` — the dedupe key's body, which is
+  exactly what `appendInboundUser` stores as `idempotency_key` — instead of
+  `random_id` alone. A client that sends no idempotency token now has its
+  crash-window message recovered like any other; it is simply acked bare, since a
+  `committed` entry needs a `random_id` to key it by.
+
+- **The dual-marker warning names the outcome that actually won (#344).**
+  `createRateLimitedOutcomeInvariantWarning` accepted a message, discarded it,
+  and emitted a hardcoded "overloaded wins". Harmless while `overloaded` was the
+  only possible winner; with `cancelled` it told the operator the peer had been
+  sent `inbound_rejected` when it had been silently acked. It now takes the
+  winning outcome — a closed union, so the throttle keyspace stays three static
+  entries — and builds the line itself, with one window per winner.
+
+- **A faulted `cancelled` write fails closed (#344).** `record()`'s disk-error
+  cleanup was gated on `overloaded`; it now covers both refusals. A memory-only
+  suppression dies with the process, and its next replay would run the turn
+  `/stop` killed. `accepted` deliberately keeps its memory-only receipt: losing
+  that marker only re-admits, which the journal's idempotency collapses.
+
 - **`/stop` suppression is its own terminal outcome (#344).** `IngressOutcome`
   gains `cancelled`, with its own `PersistentDedupe` namespace
   (`webchannel-inbound-cancelled`) and its own rung — above `overloaded`, above
@@ -129,7 +162,8 @@
   purpose, which is byte-identical to the crash window above, so without the split
   a cancelled message whose ack was lost would have been re-admitted and its
   aborted turn re-run. A `cancelled` replay is acked and dropped — never
-  `inbound_rejected`, never re-admitted, never echoed a `committed` id.
+  `inbound_rejected` and never re-admitted. It still carries the `committed` echo
+  when a row happens to exist (a message journaled before the `/stop` landed).
   `record()`'s `replaceOpposite` option is renamed `replaceOthers` and now clears
   every other outcome's marker, which is what its fail-closed comment always
   described. **Upgrade note:** cancellations recorded by an earlier build remain

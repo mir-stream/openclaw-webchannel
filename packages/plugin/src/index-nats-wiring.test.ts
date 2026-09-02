@@ -461,9 +461,11 @@ describe("index-nats.ts wiring contract — ingress ack (P0-7b)", () => {
     expect(RUNTIME_SOURCE).toMatch(
       /processIngressOutcomes\.record\(\s*accountId,\s*key,\s*"cancelled",\s*\{\s*replaceOthers:\s*true,?\s*\},?\s*\)/,
     );
-    expect(RUNTIME_SOURCE).not.toMatch(
-      /processIngressOutcomes\.record\(\s*accountId,\s*key,\s*"accepted"/,
-    );
+    // NOTE: deliberately NOT a negative pin on `"accepted"` at this call site.
+    // A `not.toMatch` there would false-fail the day some legitimate record
+    // appears in the same shape, and it proves nothing the positive pin above
+    // does not — `record()` takes ONE outcome, so matching `"cancelled"` at
+    // `(accountId, key, …)` already excludes any other value in that slot.
     // And the peer hears a refusal for exactly one outcome. `cancelled` acks, so
     // the client's ledger drains instead of replaying dead text forever.
     expect(RUNTIME_SOURCE).toMatch(
