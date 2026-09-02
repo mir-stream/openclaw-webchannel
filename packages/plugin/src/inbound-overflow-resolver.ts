@@ -235,7 +235,7 @@ export class BoundedOverflowResolver {
           // by the flush path. The retention pressure that sent it here is
           // transient; the loss it used to cause was not.
           //
-          // ⚠️ SILENCE IS ONLY WORTH ANYTHING BECAUSE EVERY OTHER READER IS
+          // ⚠️ SILENCE IS ONLY WORTH ANYTHING BECAUSE EVERY OTHER READER THAT CANNOT ADMIT IS
           // SILENT TOO. It was not, for a round: `outcomeStore.lookup()` above
           // WARMS THE HOT CACHE, and the debouncer's `peekOutcome` fast path
           // reads that cache before it charges retention — so the replay this

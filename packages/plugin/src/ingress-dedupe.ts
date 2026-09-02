@@ -44,7 +44,7 @@
  * ⭐ UNDER ONE RULE, STATED ONCE AND NOT REPEATED HERE: **THE READER RULE**, on
  * `OutcomeLookup` in `ingress-outcome.ts`. In short — `accepted` is not a
  * verdict, and THIS SEAM'S found/accepted branch is the only reader allowed to
- * turn it into one, because it is the only reader holding the journal. Row
+ * RE-ADMIT on it, because it is the only reader that can admit a message. Row
  * present ⇒ re-ack with the echo; row absent ⇒ RE-ADMIT (journaled, dispatched,
  * acked). Every other reader defers instead of answering, so the replay keeps
  * arriving until it reaches here.

@@ -675,9 +675,9 @@ count and byte budget like any other message while pending.
   accepted, durable-overloaded and cancelled outcomes for pre-debounce
   classification (#344 added `cancelled`). ⚠️ Only the two REFUSALS are
   classifiable there: since #344 the debouncer's short-circuit ignores an
-  `accepted` peek, because deciding one needs the delivery journal and only the
-  flush path has it — see THE READER RULE on `OutcomeLookup` in
-  `ingress-outcome.ts`;
+  `accepted` peek, because answering one needs either the journal row (to re-ack)
+  or the power to admit (when there is no row), and the fast path has neither —
+  see THE READER RULE on `OutcomeLookup` in `ingress-outcome.ts`;
 - record exactly one selected outcome per fresh id, and if an impossible dual
   marker is observed let the STRONGEST SUPPRESSION win — `OUTCOME_PRECEDENCE` is
   `cancelled` → `overloaded` → `accepted` since #344, so this is no longer

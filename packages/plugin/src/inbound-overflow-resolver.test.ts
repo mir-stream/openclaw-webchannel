@@ -817,8 +817,8 @@ describe("#344: an accepted orphan survives the fast path, the resolver and the 
       await tick(); await tick();
 
       // The message the marker said was already accepted is finally in the SSOT,
-      // answered, and acked once — by the flush path, the only reader with the
-      // journal. Acked BARE: this client sent no `random_id` to key an echo by.
+      // answered, and acked once — by the flush path, the only reader that can
+      // ADMIT. Acked BARE: this client sent no `random_id` to key an echo by.
       expect(chain.journal.read(PEER).map((row) => row.event)).toEqual([
         { kind: "user", id: "webchannel-user-1", text: "hello", turnId: "u-1" },
       ]);

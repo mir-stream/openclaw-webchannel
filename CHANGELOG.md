@@ -119,7 +119,9 @@
   when a message's raw frame cannot be held, and a fast path that replies from an
   in-memory cache before the message is even queued. Both acknowledged the lost
   message, which stopped the sending device retrying it at all; both now stay out
-  of it, so the message comes back and is answered on a later attempt. Messages
+  of it — the queue path answers it in the same attempt whenever retention
+  allows, the busy-server path leaves it for a later one — so the message
+  comes back and is answered. Messages
   from older clients that send no idempotency token are recovered as well, and an
   operator log line that always blamed backpressure now names the verdict that
   actually applied.

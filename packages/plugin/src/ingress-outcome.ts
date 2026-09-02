@@ -79,12 +79,17 @@ export type IngressOutcomeFailureWarning = (
  * ⭐ THE READER RULE — THE ONE STATEMENT, CITED FROM EVERYWHERE ELSE.
  *
  *   `accepted` IS NOT A VERDICT. It records that a message was admitted for a
- *   turn; whether that admission SURVIVED is a fact only the delivery journal
- *   holds. So the flush path's found/accepted branch (`ingress-dedupe.ts`) — the
- *   only reader that has the journal — is the only reader that may turn an
- *   `accepted` outcome into a result: row present ⇒ re-ack with the `committed`
- *   echo, row absent ⇒ RE-ADMIT. Every other reader treats `accepted` as NOT
- *   MINE TO DECIDE and passes the item on so it reaches that branch.
+ *   turn; whether that admission SURVIVED is a fact the delivery journal holds.
+ *   The discriminator between readers is ADMISSION CAPABILITY, not journal
+ *   access: the flush path's found/accepted branch (`ingress-dedupe.ts`) is the
+ *   only reader that can ADMIT a message, so it is the only reader that may
+ *   answer an `accepted` outcome whose row is ABSENT — it RE-ADMITS. A reader
+ *   that cannot admit (the overflow resolver, which does hold the journal; the
+ *   debouncer's fast path, which does not) may answer an `accepted` outcome ONLY
+ *   when the row is present (re-ack with the `committed` echo) and must
+ *   otherwise stay silent so the item reaches the flush. The debouncer's fast
+ *   path never answers `accepted` at all — it cannot read the row and cannot
+ *   admit, so nothing it could say is safe.
  *
  *   The two refusals are the opposite. `overloaded` and `cancelled` are
  *   decidable ANYWHERE (`IngressRefusal` above), because no journal fact can

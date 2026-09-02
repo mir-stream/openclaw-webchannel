@@ -387,9 +387,9 @@ export function createBoundedInboundDebouncer<Item>(
       if (!recoverCancelled) {
         const known = options.peekOutcome?.(key, id);
         // ⭐ #344 — A REFUSAL SHORT-CIRCUITS; AN `accepted` DOES NOT. This is THE
-        // READER RULE (`OutcomeLookup` in `ingress-outcome.ts`): only the flush
-        // path holds the journal, so only it can tell an admitted-and-journaled
-        // message from a crash-window orphan. Answering `accepted` here would ack
+        // READER RULE (`OutcomeLookup` in `ingress-outcome.ts`): this path can
+        // neither read the journal row nor ADMIT a message, so nothing it could
+        // say about `accepted` is safe. Answering `accepted` here would ack
         // an orphan away and drain the client's ledger entry — the message would
         // never be journaled and never answered, and no later replay would exist
         // to fix it.
@@ -398,8 +398,11 @@ export function createBoundedInboundDebouncer<Item>(
         // that `lookupUnlocked`'s found path and `write.commit()` both warm, so
         // an orphan the overflow resolver had just declined to answer was
         // instantly decidable here — the resolver's silence bought nothing while
-        // this arm still spoke. Deferring costs one flush for a genuine accepted
-        // replay, on a path #355 shows is already dead for conforming clients
+        // this arm still spoke. Deferring costs a retention reservation plus one
+        // flush per genuine accepted replay (under FULL retention such replays
+        // overflow and drain ~1 per round instead of N — the client re-drains on
+        // a later replay, nothing is lost), on a path #355 shows is already dead
+        // for conforming clients
         // (the request is keyed by the wire id, the marker by `random_id`).
         if (known !== undefined && known !== "accepted") {
           options.onKnownOutcome?.(key, id, known);

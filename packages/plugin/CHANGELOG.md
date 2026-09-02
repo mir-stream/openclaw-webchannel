@@ -140,10 +140,14 @@
   reached `onFlush`, the journal, or the found branch. The short-circuit now
   fires only for a refusal: `onKnownOutcome` and the `known-outcome` push result
   are typed `IngressRefusal` (`Exclude<IngressOutcome, "accepted">`), so a
-  fast-path decision on `accepted` no longer typechecks. The cost is one flush
-  for a genuine accepted replay. This is now one rule with one statement — THE
-  READER RULE, on `OutcomeLookup` in `ingress-outcome.ts`: only the flush path
-  holds the journal, so only it may turn an `accepted` outcome into a result.
+  fast-path decision on `accepted` no longer typechecks. The cost is a
+  retention reservation plus one flush per genuine accepted replay; under full
+  retention such replays overflow and drain about one per round instead of all
+  at once (nothing is lost — the client re-drains later), on a path only a
+  client without `random_id` reaches. This is now one rule with one statement —
+  THE READER RULE, on `OutcomeLookup` in `ingress-outcome.ts`: the reader that
+  can ADMIT a message is the only one that may answer an `accepted` outcome
+  with no row; a reader that cannot admit may answer it only when the row exists.
 
 - **The accept seam's journal question covers older clients too (#344).** The
   lookup is keyed by `randomId ?? wireId` — the dedupe key's body, which is
