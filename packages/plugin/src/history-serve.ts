@@ -815,7 +815,8 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
       request: { before?: string; beforeTurnId?: string; limit?: number },
     ): void {
       // PURE, so it stays on the dispatch turn: `planHistoryFetch` validates the
-      // wire `limit` (the NATS dispatch forwards `message.limit` unvalidated)
+      // wire `limit` (the NATS dispatch's decoder checks only that it is a safe
+      // integer or absent — #246 half A — and forwards the RANGE question here)
       // and picks paginate-vs-tail from `before`, carrying `beforeTurnId` into
       // the page plan. It cannot throw and it does not touch the store.
       const plan = planHistoryFetch(request, config.pageSize);

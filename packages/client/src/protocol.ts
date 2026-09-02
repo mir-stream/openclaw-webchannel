@@ -55,15 +55,19 @@
  *    served"). Both sides already reject a mismatch, so the constant IS the
  *    enforcement — no new gate was added.
  *  - DO NOT BUMP for a new frame type only when its semantics are optional and
- *    safely ignorable by an old peer. Measured, not assumed: this side has no
- *    dispatch switch at all — `deliverInbound` (nats-client.ts) matches two
- *    specific types and forwards EVERY frame, known or not, to its message
- *    listeners; the plugin's inbound dispatch ends in a `default:` that only
- *    warns and drops the frame (`nats-channel.ts`). That proves wire tolerance,
- *    not semantic compatibility. If correctness requires the peer to act on a
- *    new frame (for example reset or revocation), BUMP or negotiate a capability.
- *    `InboundMessage["type"]` is a compile-time union only and rejects nothing
- *    at runtime.
+ *    safely ignorable by an old peer. Measured, not assumed — and re-measured
+ *    after #246 half A put a runtime decoder on both sides' receive doors: an
+ *    unknown or malformed frame is REFUSED AT THE DOOR and dropped with one
+ *    warn, so `deliverInbound` (nats-client.ts) no longer forwards an
+ *    unrecognised frame to the message listeners, and the plugin's door
+ *    (`nats-channel.ts`) refuses one before `dispatchInbound` sees it. The
+ *    tolerance is UNCHANGED in what it yields — an old peer still ignores a
+ *    frame it does not know, it just does so visibly and earlier — and it still
+ *    proves only wire tolerance, not semantic compatibility. If correctness
+ *    requires the peer to act on a new frame (for example reset or revocation),
+ *    BUMP or negotiate a capability. `InboundMessage["type"]` is still a
+ *    compile-time union that rejects nothing by itself; what rejects at runtime
+ *    is `inbound-wire-decode.ts`'s `KNOWN_INBOUND_TYPES`.
  *
  * ⚠️ v4 ADDED NO CAPABILITY NEGOTIATION, AND THAT IS A DECISION — NOT AN
  * OVERSIGHT TO "FINISH". #309 framed the fix as negotiation, and negotiation is

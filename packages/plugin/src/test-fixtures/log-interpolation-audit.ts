@@ -160,6 +160,22 @@ export const ALLOWED_RAW_INTERPOLATIONS: readonly AllowedRawInterpolation[] = [
     expression: "skew",
     reason: "Date.now() minus authenticated numeric timestamp (number)",
   },
+  {
+    file: "nats-channel.ts",
+    site: "[nats-channel] Invalid from :",
+    expression: "failure.type",
+    reason:
+      // #246 half A. `InboundWsDecodeFailure`'s `invalid-fields` arm types this
+      // as `KnownInboundWsType` — the five-literal union in
+      // `inbound-wire-decode.ts`, which the decoder assigns ONLY after matching
+      // the peer's `type` against that set. The peer's own bytes reach the OTHER
+      // arm (`unknown-type`), whose line wraps them in `logSafe`. It stays raw so
+      // the record keeps the exact `Invalid approval_decision from "peer"` text
+      // the two guards this replaced already emitted (pinned by
+      // `nats-channel-typing.test.ts`); quoting it would rename the record for
+      // every operator grep that matches on it.
+      "five-literal union KnownInboundWsType (inbound-wire-decode.ts)",
+  },
   // Retry/lifecycle counters on the `event=webchannel.*` records.
   {
     file: "nats-account-runtime.ts",

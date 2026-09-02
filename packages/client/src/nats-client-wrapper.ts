@@ -140,39 +140,21 @@ function isSeqBearingInbound(msg: { type?: unknown }): boolean {
 const GET_DIFFERENCE_TIMEOUT_MS = 5_000;
 const GET_DIFFERENCE_MAX_RETRIES = 3;
 
-/**
- * #244 half B — the `DurableEvent` kinds this build's reducer knows. A
- * `difference` from a NEWER plugin may carry a kind outside this set (#253's
- * retained-unknown rows); the client SKIPS folding it but still advances its
- * cursor past its seq — exactly as the server's `projectJournalHistory` counts an
- * `unsupportedEvents` row rather than stalling on it. Kept in step with
- * `applyDurableEvent`'s switch (`durable-view-reducer.ts`).
- */
-const KNOWN_DURABLE_EVENT_KINDS: ReadonlySet<string> = new Set([
-  "user",
-  "placement",
-  "bubble",
-  "seal",
-  "reasoning",
-  "tool",
-  "approval",
-  "approvalResolution",
-  "messageEdited",
-  "messageDeleted",
-]);
-
-function isFoldableDurableEvent(event: unknown): event is DurableEvent {
-  return (
-    !!event &&
-    typeof event === "object" &&
-    typeof (event as { kind?: unknown }).kind === "string" &&
-    KNOWN_DURABLE_EVENT_KINDS.has((event as { kind: string }).kind)
-  );
-}
+// #244 half B's `KNOWN_DURABLE_EVENT_KINDS` / `isFoldableDurableEvent` MOVED to
+// `inbound-wire-decode.ts` as `decodeDurableEvent` (#246 half A). The kind check
+// was only ever half the question — `foldDifferenceEvent` dereferences fields the
+// reducer never sees (it iterates a `seal`'s `answers`), so a known-kind event
+// with a malformed body threw INSIDE the fold. The replacement validates the
+// shape each arm actually uses and reports WHY, while treating an unknown kind
+// exactly as before: skipped, cursor still advanced.
 // P1-9: the client-side mirror of core's abort predicate (§3.3). Intentionally
 // NOT re-exported from the public barrel; imported directly here and by the
 // plugin-side contract test.
 import { isLikelyAbortText, isExplicitStop } from "./abort-mirror.js";
+// #246 half A: the runtime wire decoder. `decodeDurableEvent` validates ONE raw
+// journal event before the catch-up fold touches it; `isWireSeq` is the shared
+// "this number may move the cursor" predicate.
+import { decodeDurableEvent, isCommittedEcho, isWireSeq } from "./inbound-wire-decode.js";
 
 // ---------------------------------------------------------------------------
 // WebChannel NATS Client
@@ -2070,9 +2052,19 @@ export class WebChannelNATSClient {
    *    that reproduces the old body's answer objects, for the reused and the
    *    minted branch alike.
    */
-  private applyTurnSnapshot(msg: InboundMessage): void {
+  /**
+   * ⚠️ RETURNS "WAS THIS FRAME FOLDED" (#246 half A) — `turn_snapshot` is
+   * SEQ-BEARING, so this verdict is what `handleFrame` hands the cursor. The two
+   * early returns are deliberately DIFFERENT answers: a `turnId`-less frame is
+   * REFUSED (`false` — nothing this method can key on, so the gap must stay open
+   * until the canonical `seal` is re-served), while a snapshot with nothing to
+   * seal and nothing to remove is ACCEPTED (`true` — an empty seal is a real,
+   * foldable no-op; refusing it would buy a `get_difference` round-trip to
+   * re-fetch a row that changes nothing).
+   */
+  private applyTurnSnapshot(msg: InboundMessage): boolean {
     const turnId = msg.turnId;
-    if (typeof turnId !== "string" || turnId.length === 0) return;
+    if (typeof turnId !== "string" || turnId.length === 0) return false;
     const rawAnswers = (Array.isArray(msg.answers) ? msg.answers : []).filter(
       (a): a is { id: string; text: string } =>
         !!a &&
@@ -2090,7 +2082,7 @@ export class WebChannelNATSClient {
     const remove = (Array.isArray(msg.remove) ? msg.remove : []).filter(
       (r): r is string => typeof r === "string" && r.length > 0,
     );
-    if (answers.length === 0 && remove.length === 0) return;
+    if (answers.length === 0 && remove.length === 0) return true;
 
     // Answer ids are wire-controlled; `__proto__` must be an ordinary overlay key.
     const local = Object.create(null) as DurableLocalOverlay;
@@ -2099,6 +2091,7 @@ export class WebChannelNATSClient {
       local[a.id] = { working: false, draftOnly: undefined };
     }
     this.applyDurable({ kind: "seal", turnId, answers, remove }, local, { isTyping: false });
+    return true;
   }
 
   private finalizeDraftsForTurn(turnId?: string): void {
@@ -3203,10 +3196,12 @@ export class WebChannelNATSClient {
     // receiptKey → server messageId, for the entries we can resolve this frame.
     const adopt = new Map<string, string>();
     for (const entry of committed) {
-      if (!entry || typeof entry !== "object") continue;
+      // #246 half A: the three hand-rolled checks that were here are now the
+      // shared `isCommittedEcho` predicate — the SAME rule the door decoder and
+      // the cursor advance apply, so no entry can be good enough for one of the
+      // three and not the others.
+      if (!isCommittedEcho(entry)) continue;
       const { random_id: randomId, messageId } = entry;
-      if (typeof randomId !== "string" || randomId.length === 0) continue;
-      if (typeof messageId !== "string" || messageId.length === 0) continue;
       const receiptKey = this.randomIdToReceiptKey.get(randomId);
       // Consume the linkage: the echo is terminal for this `random_id` (its
       // ledger entry drained on this same `ack`, so no replay reuses it).
@@ -3278,11 +3273,20 @@ export class WebChannelNATSClient {
         this.requestDifference(this.lastAppliedSeq);
         return;
       }
-      this.applyFrame(msg);
+      const folded = this.applyFrame(msg);
       // High-water advance: a deduped retry or a `messageEdited`-style revision may
       // REUSE or repeat a seq, so the cursor only ever moves forward and a
       // `seq <= lastApplied` is never read as a gap.
-      if (seq !== undefined && seq > this.lastAppliedSeq) this.lastAppliedSeq = seq;
+      //
+      // ⚠️ `folded` GATES IT (#246 half A), AND THAT GATE IS THE SLICE. This line
+      // used to run unconditionally, so a frame `handleFrame` REFUSED (an
+      // empty-id `user_committed`, a turnId-less `tool_activity`, …) still moved
+      // the cursor past its seq — the event was lost AND the gap that would have
+      // re-fetched it was closed by the same statement. Leaving the cursor alone
+      // makes the next frame read as a gap, which is what gets the canonical row
+      // re-served. See `handleFrame` for the invariant and
+      // `inbound-wire-decode.ts` for why the catch-up door does the opposite.
+      if (folded && seq !== undefined && seq > this.lastAppliedSeq) this.lastAppliedSeq = seq;
       return;
     }
 
@@ -3294,7 +3298,12 @@ export class WebChannelNATSClient {
       // resumes gap detection from (doc §16.2-6). `case "history"` has already
       // hydrated; seed the cursor to it, never backward. (A `load_history` PAGE
       // omits `highWaterSeq`, so this only fires for the register-time snapshot.)
-      if (typeof msg.highWaterSeq === "number") this.advanceCursor(msg.highWaterSeq);
+      // #246 half A: `isWireSeq`, not `typeof === "number"`. The cursor is a
+      // monotone high-water, so a `NaN`/fractional/over-large value accepted here
+      // would park it beyond every real seq and gate out the whole stream after
+      // it. The frame's own decoder already refuses such a value at the door;
+      // this is the second guard, at the site that would suffer.
+      if (isWireSeq(msg.highWaterSeq)) this.advanceCursor(msg.highWaterSeq);
     } else if (msg.type === "ack") {
       // The inbound USER opener consumes a seq but rides no durable frame — half A
       // echoes that seq here. Advance the high-water so the turn's first agent
@@ -3324,8 +3333,17 @@ export class WebChannelNATSClient {
       // order-independent); only the SEQ advance is held, so the cursor stays
       // frozen at `pendingAfterSeq` and the caught-up range does not get gated out
       // of the fold. The deferred max is applied when the difference lands.
+      // #246 half A: the WHOLE entry must be well-formed, not just its `seq`.
+      // This entry is the user opener's only seq carrier, and it is evidence
+      // that a row was committed only if the entry naming that row is intact —
+      // so it is gated on the SAME `isCommittedEcho` predicate `adoptCommittedIds`
+      // uses, and on the same non-negative-safe-integer rule the other cursor
+      // sites use (a `NaN`/over-large seq accepted here parks the high-water
+      // beyond every real seq and gates out the rest of the stream). The door
+      // decoder refuses such a frame outright; this keeps the cursor site
+      // independent of the decoder being complete.
       for (const entry of msg.committed ?? []) {
-        if (typeof entry?.seq === "number") this.advanceCursor(entry.seq);
+        if (isCommittedEcho(entry) && entry.seq !== undefined) this.advanceCursor(entry.seq);
       }
     }
   }
@@ -3434,17 +3452,21 @@ export class WebChannelNATSClient {
    * pre-frame latch, fold the frame, then re-evaluate the release gate. Split out
    * of `handleMessage` so the #244 gap-sync path can gate/buffer around it.
    */
-  private applyFrame(msg: InboundMessage): void {
+  private applyFrame(msg: InboundMessage): boolean {
     // Observe authenticated turn activity against the pre-frame live-turn latch.
     // Reducers may settle that latch or invoke public listeners, so this must be
     // the first operation for every decrypted frame.
     const preFrameLiveTurn = this.turnInFlight();
     this.observeHeldTurnActivity(msg, preFrameLiveTurn);
-    this.handleFrame(msg);
+    // #246 half A: the verdict travels to the caller — the seq cursor advances
+    // only for a frame that was actually folded. See `handleFrame`.
+    const folded = this.handleFrame(msg);
     // P1-9 §3.2: every handled frame is a state transition — re-evaluate the
     // release gate after the reducer settles (a no-op when nothing is held or a
-    // turn is still in flight).
+    // turn is still in flight). Deliberately NOT gated on `folded`: the latch
+    // observation above already ran, and a re-evaluation is idempotent.
     this.maybeRelease();
+    return folded;
   }
 
   /**
@@ -3489,33 +3511,74 @@ export class WebChannelNATSClient {
     const events = raw
       .filter(
         (e): e is { seq: number; event: unknown } =>
-          !!e && typeof e === "object" && typeof (e as { seq?: unknown }).seq === "number",
+          // #246 half A: `isWireSeq`, not `typeof === "number"`. `maxSeq` becomes
+          // the cursor, so a `NaN` (which loses every comparison and would leave
+          // the cursor short) or an over-large value (which would park it past
+          // every real seq) is worse here than a missing entry.
+          !!e && typeof e === "object" && isWireSeq((e as { seq?: unknown }).seq),
       )
       // The server sends ascending `seq`; sort defensively so the fold order is a
       // property of this method, not of the wire.
       .sort((a, b) => a.seq - b.seq);
 
     let maxSeq = floor;
-    for (const { seq, event } of events) {
-      // Fold everything the request asked for (`seq > floor`); a `seq <= floor` is
-      // a raced/duplicate overlap we already hold. Skip an unknown kind's fold but
-      // still let its seq advance the cursor (an unknown tail must not re-request
-      // forever) — the server's projection treats it the same way.
-      if (seq > floor && isFoldableDurableEvent(event)) {
-        this.foldDifferenceEvent(event);
+    // ⚠️ `try/finally` (#246 half A): the in-flight bookkeeping below MUST run
+    // even if a fold throws. `notifyMessageListeners` (`nats-client.ts`) swallows
+    // a listener's throw, so an escape from here would leave `differenceInFlight`
+    // stuck TRUE — every later durable frame silently buffered until the
+    // transport drops, with no timer left to re-issue anything (it was cancelled
+    // two lines up). `decodeDurableEvent` is what makes such a throw unreachable;
+    // this is the belt to its braces, and it is cheap.
+    //
+    // ⚠️ IT DEGRADES, IT DOES NOT PRETEND. `maxSeq` is raised AFTER each fold, so
+    // a throw leaves the cursor at the last event actually applied; the drain
+    // below then re-dispatches the buffered frames, the first still-gapped one
+    // re-requests the same range with a fresh retry budget, and the stream heals
+    // on the next reply. Pinned by "a fold that throws cannot wedge gap-sync" in
+    // `nats-client-wrapper-gap-sync.test.ts`.
+    try {
+      for (const { seq, event } of events) {
+        // Fold everything the request asked for (`seq > floor`); a `seq <= floor`
+        // is a raced/duplicate overlap we already hold.
+        //
+        // A refused event is SKIPPED and its seq STILL ADVANCES the cursor —
+        // both for a kind this build does not know (a newer plugin; #253) and
+        // for a known kind whose shape the fold cannot use. A difference is the
+        // authoritative answer to a gap, so freezing the cursor on a row we
+        // cannot fold would re-request that same row forever. The server's
+        // `projectJournalHistory` treats such a row the same way (it counts an
+        // `unsupportedEvents` skip). This is the DELIBERATE OPPOSITE of the live
+        // path, where a refused frame must NOT advance — `decodeDurableEvent`'s
+        // docblock states the asymmetry once, for both sites.
+        if (seq > floor) {
+          const decoded = decodeDurableEvent(event);
+          if (decoded.ok) {
+            this.foldDifferenceEvent(decoded.event);
+          } else if (decoded.kind === "malformed") {
+            // Only the MALFORMED case is reported: an unknown kind is an
+            // ordinary version skew and would be noise on every frame from a
+            // newer server, while a known kind we cannot fold is a real defect
+            // somewhere upstream.
+            console.warn(
+              `[nats-wrapper] skipping malformed ${decoded.eventKind} event at seq ${seq} ` +
+                `in a difference: ${decoded.reason}`,
+            );
+          }
+        }
+        if (seq > maxSeq) maxSeq = seq;
       }
-      if (seq > maxSeq) maxSeq = seq;
+    } finally {
+      // The cursor now reflects the folded range AND any advance deferred while the
+      // request was in flight (an `ack`/`history` seq), never moving backward.
+      this.lastAppliedSeq = Math.max(this.lastAppliedSeq, maxSeq, this.pendingDeferredSeq);
+      this.differenceInFlight = false;
+      this.differenceRetries = 0;
+      this.pendingDeferredSeq = 0;
+      this.drainGapBuffer();
+      // A difference can settle a held-turn condition (it is durable turn content),
+      // and the fold above bypassed the per-frame gate; re-evaluate it once here.
+      this.maybeRelease();
     }
-    // The cursor now reflects the folded range AND any advance deferred while the
-    // request was in flight (an `ack`/`history` seq), never moving backward.
-    this.lastAppliedSeq = Math.max(this.lastAppliedSeq, maxSeq, this.pendingDeferredSeq);
-    this.differenceInFlight = false;
-    this.differenceRetries = 0;
-    this.pendingDeferredSeq = 0;
-    this.drainGapBuffer();
-    // A difference can settle a held-turn condition (it is durable turn content),
-    // and the fold above bypassed the per-frame gate; re-evaluate it once here.
-    this.maybeRelease();
   }
 
   /**
@@ -3653,6 +3716,12 @@ export class WebChannelNATSClient {
    * still beyond the cursor is re-dispatched through `handleMessage`, so a buffered
    * frame that reveals a FURTHER gap re-enters gap-sync cleanly, re-buffering the
    * remainder onto the (freshly emptied) buffer.
+   *
+   * ⚠️ THIS IS NOT A SECOND CURSOR SITE, AND MUST NOT BECOME ONE (#246 half A).
+   * It re-enters through `handleMessage`, so a drained frame advances the cursor
+   * through the ONE gated statement there — refused ⇒ no advance. Advancing here
+   * as well (or instead) would reintroduce exactly the loss this slice fixed, on
+   * the buffered path.
    */
   private drainGapBuffer(): void {
     const buffered = this.gapBuffer;
@@ -3664,7 +3733,33 @@ export class WebChannelNATSClient {
     }
   }
 
-  private handleFrame(msg: InboundMessage): void {
+  /**
+   * Fold ONE inbound frame onto the view.
+   *
+   * ⚠️ RETURNS "WAS THIS FRAME FOLDED", AND THE SEQ CURSOR DEPENDS ON IT (#246
+   * half A). `true` means the frame was ACCEPTED and applied — INCLUDING an
+   * accepted no-op (an empty `history`, a `turn_snapshot` with nothing to seal,
+   * an `approval_resolved` naming a card this view does not hold). `false` means
+   * the frame was REFUSED as malformed and NOTHING was applied.
+   *
+   * ⚠️ THIS USED TO RETURN `void`, AND THAT WAS THE BUG. Every shape check in
+   * here is a bare early `return`, indistinguishable from a successful fold to
+   * the caller — so `handleMessage` advanced `lastAppliedSeq` past a seq-bearing
+   * frame it had just REFUSED. The event was then lost forever: the cursor
+   * covered its seq, so no later frame read a gap, and the `get_difference` that
+   * would have re-served the canonical journal row was never sent. The invariant
+   * is now: A SEQ-BEARING FRAME ADVANCES THE CURSOR IFF IT WAS FOLDED.
+   *
+   * ⚠️ AND THE INVARIANT LIVES HERE, NOT IN THE DOOR DECODER. `decodeInboundMessage`
+   * makes most of these refusals unreachable in production, which is exactly why
+   * the cursor must not be wired to it: a decoder that misses a case would
+   * silently reintroduce the loss. Two independent guards, and the cheap one is
+   * the one that cannot be incomplete.
+   *
+   * See `inbound-wire-decode.ts`'s `decodeDurableEvent` for why a refusal inside
+   * a `difference` does the OPPOSITE (skip, but advance) — one rule, two doors.
+   */
+  private handleFrame(msg: InboundMessage): boolean {
     switch (msg.type) {
       case "history": {
         const rawIncoming = Array.isArray(msg.messages) ? msg.messages : [];
@@ -3753,7 +3848,7 @@ export class WebChannelNATSClient {
               (m as { text?: unknown }).text === ""
             ),
         );
-        if (incoming.length === 0) return;
+        if (incoming.length === 0) return true;
 
         const existing = this.state.messages;
         /**
@@ -4261,7 +4356,7 @@ export class WebChannelNATSClient {
           inserts.set(cursor, atCursor);
         }
 
-        if (inserts.size === 0 && !adopted) return;
+        if (inserts.size === 0 && !adopted) return true;
 
         // Rebuild `next` with each fresh group spliced in at its cursor. Slot i
         // holds the messages that must precede `next[i]`; slot `next.length`
@@ -4273,12 +4368,12 @@ export class WebChannelNATSClient {
           if (i < next.length) merged.push(next[i]);
         }
         this.setState({ messages: merged });
-        return;
+        return true;
       }
 
       case "typing": {
         this.setState({ isTyping: true });
-        return;
+        return true;
       }
 
       case "commands": {
@@ -4286,7 +4381,7 @@ export class WebChannelNATSClient {
         // request just refreshes it). NOT turn activity, so isTyping is left
         // untouched.
         this.setState({ commands: Array.isArray(msg.commands) ? msg.commands : [] });
-        return;
+        return true;
       }
 
       case "ack": {
@@ -4304,7 +4399,7 @@ export class WebChannelNATSClient {
         // re-key preserves that overlay. An ack without `committed` is a no-op
         // here (the tier-2/3 history fallback reconciles that bubble).
         this.adoptCommittedIds(msg.committed);
-        return;
+        return true;
       }
 
       case "user_committed": {
@@ -4322,7 +4417,7 @@ export class WebChannelNATSClient {
         // `applyUser` is id-idempotent, so a re-delivery (this broadcast PLUS a
         // later gap-sync difference of the same event) is a no-op.
         const id = typeof msg.id === "string" ? msg.id : "";
-        if (id.length === 0 || typeof msg.text !== "string") return;
+        if (id.length === 0 || typeof msg.text !== "string") return false;
         this.foldUserEvent({
           kind: "user",
           id,
@@ -4330,13 +4425,13 @@ export class WebChannelNATSClient {
           ...(typeof msg.turnId === "string" ? { turnId: msg.turnId } : {}),
           ...(typeof msg.random_id === "string" ? { randomId: msg.random_id } : {}),
         });
-        return;
+        return true;
       }
 
       case "inbound_rejected": {
         // The low-level client has already removed ledger entries and emitted
         // failed{overloaded}; receipt/bubble state arrives through onSendState.
-        return;
+        return true;
       }
 
       case "approval_request": {
@@ -4350,7 +4445,7 @@ export class WebChannelNATSClient {
         // `approvalId` and is what `approval_decision` sends back, so a card
         // under `""` was undecidable anyway.
         const id = msg.id ?? "";
-        if (id.length === 0) return;
+        if (id.length === 0) return false;
         const merged = this.nextDurableMessages({
           kind: "approval",
           id,
@@ -4372,7 +4467,7 @@ export class WebChannelNATSClient {
           messages: markApprovalActionable(merged, id),
           isTyping: false,
         });
-        return;
+        return true;
       }
 
       case "approval_resolved": {
@@ -4384,7 +4479,7 @@ export class WebChannelNATSClient {
         // can express. The wire types `decision` as an `ApprovalDecision`, so
         // only a malformed peer produces one, and the journal mapper refuses the
         // same shape.
-        if (id.length === 0 || decision === undefined) return;
+        if (id.length === 0 || decision === undefined) return false;
         // Server-confirmed resolution: the DECISION is durable state and the
         // reducer folds it (`applyApprovalResolution`); `resolutionConfirmed` is
         // client-local and marks it authoritative, so the snapshot reconciler
@@ -4396,7 +4491,7 @@ export class WebChannelNATSClient {
           decision,
         });
         this.setState({ messages: markApprovalConfirmed(merged, id) });
-        return;
+        return true;
       }
 
       case "approval_snapshot": {
@@ -4582,7 +4677,7 @@ export class WebChannelNATSClient {
             ...(rehydratedActionable ? { isTyping: false } : {}),
           });
         }
-        return;
+        return true;
       }
 
       case "progress": {
@@ -4637,11 +4732,11 @@ export class WebChannelNATSClient {
         // P1-9 §3.6.2: a progress upsert on a watched draft proves the turn is
         // still alive — disarm its staleness entry.
         this.staleDraftWatch.delete(answerId);
-        return;
+        return true;
       }
 
       case "reasoning": {
-        if (!msg.id || !msg.turnId || typeof msg.text !== "string" || msg.text.length === 0) return;
+        if (!msg.id || !msg.turnId || typeof msg.text !== "string" || msg.text.length === 0) return false;
         // ⚠️ #242 half 2: THROUGH THE SHARED REDUCER, like every other durable
         // frame. Half 1 called a private `upsertReasoning` over a side array;
         // that method is deleted, and with it the second implementation the v6
@@ -4674,15 +4769,15 @@ export class WebChannelNATSClient {
         // P1-9 §3.6.2: reasoning correlates by turnId — disarm any watched draft
         // for this turn (the turn is demonstrably still producing frames).
         this.disarmStaleDraftsByTurn(msg.turnId);
-        return;
+        return true;
       }
 
       case "tool_activity": {
         // #97: structured tool-call activity. Required correlation keys `id` and
         // `turnId` must be non-empty strings; drop otherwise. Only the KEY NAMES
         // in `argKeys` are carried — no arg values ever reach state.
-        if (typeof msg.id !== "string" || msg.id.length === 0) return;
-        if (typeof msg.turnId !== "string" || msg.turnId.length === 0) return;
+        if (typeof msg.id !== "string" || msg.id.length === 0) return false;
+        if (typeof msg.turnId !== "string" || msg.turnId.length === 0) return false;
         // ⚠️ #242 half 3: THROUGH THE SHARED REDUCER, NOT A SIDE ARRAY. The
         // event is the FRAME, verbatim — a delta. `applyTool` folds it onto the
         // call it refines, which is why the terminal frame's missing `name` and
@@ -4709,7 +4804,7 @@ export class WebChannelNATSClient {
         // Like reasoning, a tool_activity frame correlates by turnId and proves
         // the turn is still producing frames — disarm any watched stale draft.
         this.disarmStaleDraftsByTurn(msg.turnId);
-        return;
+        return true;
       }
 
       case "turn_settled": {
@@ -4750,12 +4845,11 @@ export class WebChannelNATSClient {
         // draft whose turnId matches (in the normal flow the final agent_message
         // already did this, a no-op). Never swaps the id.
         this.finalizeDraftsForTurn(msg.turnId);
-        return;
+        return true;
       }
 
       case "turn_snapshot": {
-        this.applyTurnSnapshot(msg);
-        return;
+        return this.applyTurnSnapshot(msg);
       }
 
       case "agent_message": {
@@ -4785,7 +4879,7 @@ export class WebChannelNATSClient {
           );
           // P1-9 §3.6.2: the final upsert also proves liveness — disarm.
           this.staleDraftWatch.delete(id);
-          return;
+          return true;
         }
 
         // Preserve the legacy id-less path's existing two public transitions:
@@ -4824,8 +4918,18 @@ export class WebChannelNATSClient {
             ? { [mintedId]: { assistantMessageIndex } }
             : undefined,
         );
-        return;
+        return true;
       }
     }
+    // ⚠️ NO `default:`, AND FALLING OFF THE END IS STILL THE IGNORE — this is
+    // the same deliberate absence `durable-view-reducer.ts`'s BOUNDARY note
+    // describes for LIVE frames: a type from a newer server does nothing rather
+    // than throwing. What changed in #246 half A is only that the ignore is now
+    // EXPLICIT (`false` — not folded) instead of an implicit `undefined`, and
+    // that the frame no longer gets this far: the door decoder refuses an
+    // unknown type with one warn. Nothing hangs on the value either way, because
+    // an unknown type is not in `SEQ_BEARING_INBOUND_TYPES` and so never reaches
+    // the cursor.
+    return false;
   }
 }
