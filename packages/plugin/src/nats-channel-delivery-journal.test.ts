@@ -13,8 +13,10 @@
  *    a single sequence rather than an inference from two spies' call counts —
  *    which is exactly the inference that would keep passing if the hook were
  *    moved below the publish.
- *  - The journal CANNOT change a send result — and cannot THROW, which is worse
- *    still. §15.8 names the forbidden `false` (it rolls back the caller's
+ *  - The journal cannot THROW into the send, and a journal FAULT must not block
+ *    the push; since #347, whether a row was COMMITTED is exactly what decides
+ *    what a later publish failure reports (see the commit-then-throw test).
+ *    §15.8 names the forbidden `false` (it rolls back the caller's
  *    reservation and retries the content under a DIFFERENT id); a throw is worse
  *    because `message-adapter.ts`'s delivery path moves a thrown send to `failed`
  *    and never re-sends it. Both the mapper and `append` are covered.

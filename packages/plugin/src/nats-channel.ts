@@ -1176,8 +1176,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     // returns `false` — #347 narrowed that to "when nothing was journaled": a
     // throw out of seal or publish AFTER a durable row was committed now returns
     // `true` (see the catch). What the lift DID change is exception containment
-    // on this
-    // one path: the `console.warn` below used to sit inside the `try`, so a
+    // on this one path: the `console.warn` below used to sit inside the `try`, so a
     // faulting host `console` became `return false`, and now it escapes
     // `sendToPeer` — which matches the disposed/transport-down refusal above,
     // where that has always been true.
@@ -1255,11 +1254,17 @@ export class NatsChannel implements WebChannelPeerChannel {
     // message up on its next `getDifference`. Since #244 we have precisely that
     // machine: every journaled frame consumes a per-conversation `seq`, so a peer
     // that never received this one stops one short of that seq, sees the hole at
-    // the next durable frame (the turn's seq-bearing `turn_snapshot` if nothing
-    // else) and heals it with `get_difference`, served from this very row. If this
-    // frame was the conversation's last, the peer's next register serves the row
-    // in its history snapshot instead — same store, same id. Once the row is
-    // committed, the send has succeeded in the only sense the SSOT recognises.
+    // the next SEQ-BEARING frame (the turn's `turn_snapshot` if nothing else) and
+    // heals it with `get_difference`, served from this very row — PROVIDED its
+    // cursor gap-tests every seq it learns, including the `ack` echo of its own
+    // next message. That is #356 half A's cursor (PR #362); the earlier client's
+    // advance-only ack CLOSED such a hole for the session when an ack arrived
+    // before the next seq-bearing frame. If this frame was the conversation's
+    // last, the peer's next register serves the row in its history snapshot
+    // instead — same store, same id — unless the row alone exceeds the peer's
+    // wire budget (#311 skips it): #325's write side, the one shape no path can
+    // carry. Once the row is committed, the send has succeeded in the only sense
+    // the SSOT recognises; what remains is delivery, and delivery is gap-sync's.
     //
     // ⚠️ THE OLD `false` WAS THE DEFECT, NOT A CONSERVATIVE DEFAULT — and #278's
     // paragraph calling the `bubble` case "the SAFE direction … the id is stable"
@@ -1278,8 +1283,8 @@ export class NatsChannel implements WebChannelPeerChannel {
     // discriminator is `seq !== undefined`, the same value the stamp below uses.
     // A frame that allocated no seq has NO row and nothing for `get_difference` to
     // serve, so for it a publish failure is still a failed send and still returns
-    // `false`: every non-durable type (`typing`, `turn_settled`, `commands`,
-    // `history`, `difference`, the ingress `ack`/`inbound_rejected` chunks — read
+    // `false`: every frame `journalOutbound` does not journal (the non-durable
+    // types and a durable frame with an unusable id — read
     // `journalEventForOutbound`/`isSeqBearingFrame` for the exact set), an id-less
     // durable frame, a frame this account's policy does not journal, and a frame
     // whose journal write faulted. The three refusals ABOVE keep returning `false`
@@ -1332,15 +1337,16 @@ export class NatsChannel implements WebChannelPeerChannel {
     } catch (err) {
       // #347 — COMMITTED IS SENT. A durable row was written above this `try`, so
       // the publish was the PUSH and not the send: the peer's cursor stops one
-      // short of this frame's `seq`, the next durable frame reveals the hole, and
-      // `get_difference` serves this row (a reconnect's history snapshot serves it
-      // too — both read the same store). Reporting `false` here is what made the
+      // short of this frame's `seq`, the next seq-bearing frame reveals the hole
+      // to a #362-model cursor, and `get_difference` serves this row (a
+      // reconnect's history snapshot serves it too, unless the row alone exceeds
+      // the peer's wire budget — #325). Reporting `false` here is what made the
       // caller re-mint an id and store the same text twice. One line per frame,
       // naming the seq so an operator can see WHICH row gap-sync has to carry.
       if (seq !== undefined) {
         console.error(
           `[nats-channel] Publish failed AFTER the durable commit for peer ${logSafe(peerId)} ` +
-            `(seq=${seq}); the row is stored and the client heals it via gap-sync: ` +
+            `(seq=${seq}); the row is stored and delivery is now gap-sync's: ` +
             `${logSafe(formatCaughtDiagnostic(err))}`,
         );
         return true;
@@ -1537,8 +1543,10 @@ export class NatsChannel implements WebChannelPeerChannel {
         peerId,
         journalFailureDiagnostic(error),
       );
-      // A caught failure yields NO seq — the frame ships without one (§15.8: the
-      // failure must never change the send result). Falls through to `undefined`.
+      // A caught failure yields NO seq — the frame ships without one (§15.8: a
+      // journal fault must not block the push). Since #347 that `undefined` IS
+      // what decides what a later publish failure reports: no row ⇒ `false`.
+      // Falls through to `undefined`.
     }
     return undefined;
   }

@@ -5,8 +5,9 @@
  * write is a HARD REQUIREMENT of accepting one. A user message that is not in
  * the journal was not accepted. That makes this seam the deliberate MIRROR IMAGE
  * of the egress seam covered by `nats-channel-delivery-journal.test.ts`: there a
- * journal failure must never change the send result (the text has already left
- * for the client — refusing would lose delivered text, N10); here a journal
+ * journal failure must not block the push (the journal write precedes the
+ * publish; blocking on a faulted history write would lose the live message —
+ * N8, losing); here a journal
  * failure IS an accept failure, because nothing has been confirmed to anyone yet.
  *
  * What these pin, and why each one is here rather than "obvious":

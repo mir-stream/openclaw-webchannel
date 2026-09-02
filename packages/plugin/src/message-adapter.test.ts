@@ -186,8 +186,9 @@ function successfulIds(frames: DraftAttempt[]): string[] {
 // so the two sets differ in exactly one shape — a row committed whose publish then
 // threw — and the harness records that shape explicitly (`"commit-throw"`) rather
 // than leaving it to be inferred. A REFUSED send is not the ambiguous case it once
-// was: since #347 a `false` from `sendToPeer` means the frame never reached
-// `journalOutbound`, so "no wire frame" and "no row" coincide.
+// was: since #347 a `false` from `sendToPeer` means NO ROW was committed (a
+// refusal above the journal, or an append that faulted), so "no wire frame" and
+// "no row" coincide.
 function journalFor(h: ReturnType<typeof makeDraftHarness>): JournalEvent[] {
   const wire: OutboundWsMessage[] = [
     ...h.journaled.map((frame): OutboundWsMessage =>
