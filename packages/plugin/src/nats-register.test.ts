@@ -210,7 +210,10 @@ describe("handleRegisterRequest (register over NATS)", () => {
   it.each([
     ["absent", undefined],
     ["old", WEBCHANNEL_PROTOCOL_VERSION - 1],
-    ["malformed", "2"],
+    // A numeric STRING that would coerce to a match — derived from the constant so
+    // it stays the coercion case after a bump. Presence with the wrong type is the
+    // offense; the gate must not coerce.
+    ["malformed", String(WEBCHANNEL_PROTOCOL_VERSION)],
   ])("rejects %s authenticated register protocol versions before peer establishment", async (_label, protocolVersion) => {
     const h = makeHarness();
     await h.run({ op: "register", token: "jwt", protocolVersion });

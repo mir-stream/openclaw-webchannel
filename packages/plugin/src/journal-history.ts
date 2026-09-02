@@ -1256,15 +1256,22 @@ export function recentHistoryPage(
  * drives this function, the widget's picker and the client's merge together and
  * pins it. A cursor may be ANY projected message id, reasoning included.
  *
- * ⚠️ AN OLDER CLIENT STALLS THE SAME WAY, AND THE REPAIR IS NOT HERE. It DROPS
- * role-less rows (see `channel-contract.ts`), so its transcript can never hold a
- * reasoning id to cite and its cursor sticks on the same bubble. The tempting
- * server-side fix — "every page must contain at least one role-bearing row" — is
- * a supersession rule invented in the projection, which is N8 and is the exact
- * defect class this module exists to prevent. It is a consequence of opting into
- * `capabilities.reasoningDurable` while a peer runs a stale client, and the real
- * fix is **#246** (protocol version + runtime wire validation), which lets the
- * server know a peer cannot read the row before it serves one.
+ * ⚠️ AN OLDER CLIENT STALLED THE SAME WAY, AND THE REPAIR WAS NEVER HERE. It
+ * DROPS role-less rows (see `channel-contract.ts`), so its transcript can never
+ * hold a reasoning id to cite and its cursor sticks on the same bubble. The
+ * tempting server-side fix — "every page must contain at least one role-bearing
+ * row" — is a supersession rule invented in the projection, which is N8 and is
+ * the exact defect class this module exists to prevent. THAT FIX STAYS FORBIDDEN
+ * even now that the stall is closed; nothing in the next paragraph licenses it.
+ *
+ * ⚠️ #246 CLOSED THE STALL BY REFUSING THE PEER, NOT BY NEGOTIATING WITH IT.
+ * `WEBCHANNEL_PROTOCOL_VERSION` went 3 → 4 and both sides reject a mismatch, so a
+ * client old enough to drop role-less rows is refused at register with a terminal
+ * `protocol_mismatch` (426) before any key work — it never reaches this
+ * projection to stall in it. #309 named exactly two possible fixes (withhold the
+ * row per peer, or refuse the connection) and this is the second, so #309's
+ * operator-side mitigation — "do not enable `capabilities.reasoningDurable` on an
+ * account serving stale clients" — is RETIRED, not merely made easier.
  */
 export function historyPageBefore(
   messages: readonly ProjectedHistoryMessage[],

@@ -1,5 +1,67 @@
 # Changelog
 
+## Unreleased
+
+### Breaking (wire protocol v4)
+
+- **`WEBCHANNEL_PROTOCOL_VERSION` goes 3 → 4 (#246).** The plugin, client, and
+  SaaS packages must be released together, and every gateway **and** every
+  browser bundle must be redeployed at the same time. A v3 browser against a v4
+  agent is refused with a terminal `protocol_mismatch` (426) before any key work;
+  a v4 browser against a v3 agent is refused the same way. The version has been
+  mandatory in both directions since `0.3.0` (protocol v2), so there is no
+  partial-upgrade mode and no silent degradation — the failure is loud and
+  diagnosable by design.
+
+  **Why a bump, when every v6 frame shipped as "additive and safely ignorable".**
+  For RENDERING that description was accurate, and it stays accurate. For
+  CORRECTNESS it is not, and the v6 slices crossed that line. The `0.7.0` client
+  also declares protocol `3`, so it passes the old exact-match gate and then
+  silently ignores the frames that keep it in sync. Concretely, a v3 peer talking
+  to a v6 agent:
+
+  - **has no `seq`, so it never asks for a gap-sync (#244).** Durable frames now
+    carry a per-conversation `seq`; a client that sees a hole sends
+    `get_difference` and folds the `difference` reply. This transport is core
+    NATS pub/sub — at-most-once, no retention — so for a peer that cannot detect
+    the hole, one dropped frame is a **permanent, never-healed divergence**. It
+    does not look broken afterwards. It looks like a slightly different
+    conversation, forever.
+  - **ignores `user_committed` (#245),** so a message sent from one device does
+    not appear on the account's other devices until the agent next responds.
+  - **drops `history` rows of kind `reasoning` / `tool` / `approval` (#242),** on
+    the same `role` guard that made that widening safe. Its transcript therefore
+    holds no reasoning id to cite as a paging cursor, and **"load older" stalls
+    forever** once an operator enables `capabilities.reasoningDurable` — issue
+    **#309**, which this closes.
+  - **ignores `ack.committed[]` (#243),** the server-minted durable message id
+    and its `seq`, so its own sent messages keep client-minted ids the server's
+    system of record does not share.
+
+  **No capability negotiation was added, and that is a decision.** #309 framed
+  the fix as negotiation, and negotiation is what you need in order to *withhold*
+  a frame kind from one peer while serving it to another. Under an exact-match
+  version gate there is no such peer — everything that registers is at this exact
+  version. The one shape that would need per-peer withholding, a **live**
+  delete/edit frame, is not on this wire at all: `messageDeleted` /
+  `messageEdited` exist only as durable event kinds with no producer, reachable
+  through `difference`/`history`. A capability carrier would therefore ship with
+  zero consumers, and an unexercised mechanism is the kind that is discovered
+  broken the first time it matters. The next slice that adds a frame an
+  equal-version peer must act on decides bump-vs-negotiate then, under the rule
+  written in `protocol.ts`.
+
+  **SaaS.** `packages/saas` never gates on the protocol version — the enrollment
+  body's `protocolVersion` is advisory diagnostics, sanitized and stored, never
+  part of the trust chain and never an input to approval — so nothing there
+  changes behaviourally. It still moves version with the other two under the
+  repo's 3-way version lockstep.
+
+  **If you hand-roll a client,** send `protocolVersion: 4` only once it actually
+  handles `seq` plus the `get_difference`/`difference` round-trip. Declaring `4`
+  without them buys a connection and a silently wrong transcript, which is the
+  precise failure this bump exists to prevent.
+
 ## 0.7.0
 
 Two unrelated changes ship together. **The two published libraries are renamed**

@@ -1,5 +1,47 @@
 # Changelog — openclaw-webchannel
 
+## Unreleased
+
+### Breaking (wire protocol v4)
+
+- **`WEBCHANNEL_PROTOCOL_VERSION` goes 3 → 4 (#246).** The register gate is
+  unchanged in shape — it was already exact-match and already ran before PoP and
+  key establishment (`nats-register.ts`) — so this release adds no new gate. It
+  changes the number the gate compares against, which is the whole enforcement:
+  a browser declaring `3` now gets `{ error: "protocol_mismatch", code: 426,
+  protocolVersion: 4 }` and never reaches key delivery, and a `4` plugin is
+  refused by a `3` client for the mirror reason. Release the plugin, client, and
+  SaaS packages together.
+
+  **Why the v6 frames stopped being "additive and safely ignorable".** They are
+  still safely ignorable for RENDERING; they are not for CORRECTNESS. The shipped
+  `0.7.0` client also declares `3`, so before this bump it passed the gate and
+  then ignored the per-conversation `seq` on durable frames and the
+  `get_difference`/`difference` gap-sync (#244), the `user_committed` broadcast
+  (#245), the `reasoning`/`tool`/`approval` `history` rows (#242), and
+  `ack.committed[]` (#243). The `seq` case is the one that forces the bump:
+  transport here is core NATS pub/sub, at-most-once with no retention, so a peer
+  that cannot detect a hole cannot heal one — a single drop is a permanent
+  divergence with no signal on either side.
+
+  **#309 is closed by this.** An older client drops role-less `history` rows, so
+  its cursor can never cite a reasoning id and "load older" stalls permanently
+  once `capabilities.reasoningDurable` is on. #309 named exactly two fixes —
+  withhold the row per peer, or refuse the connection — and this is the refusal.
+  Its operator-side mitigation ("do not enable `reasoningDurable` while serving
+  stale clients") is retired. The forbidden server-side repair is still
+  forbidden: "every page must contain at least one role-bearing row" invents a
+  supersession rule inside the projection, which is NOT-list N8. See
+  `journal-history.ts`'s `historyPageBefore` docblock.
+
+  **No capability negotiation was added.** Under an exact-match gate there is no
+  peer to withhold a frame from, and the one shape that would need per-peer
+  withholding — a live delete/edit frame — does not exist here:
+  `messageDeleted`/`messageEdited` are durable event kinds with no producer. A
+  carrier with zero consumers is an unexercised mechanism. The rule for the next
+  slice is in `protocol.ts`'s "When to bump", which now carries v4 as its second
+  worked example.
+
 ## 0.7.0
 
 ### Added

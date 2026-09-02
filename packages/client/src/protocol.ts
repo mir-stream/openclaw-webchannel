@@ -16,6 +16,9 @@
  * `clientNonce` bound into the wrapped-conversation-key AAD (freshness anchor
  * against a replayed register reply), and `unregister` requires a PoP proof.
  *
+ * v4 (breaking, #246): the v6 delivery-render frames are not optional garnish —
+ * a peer that ignores them DIVERGES SILENTLY. See the worked example below.
+ *
  * When to bump (#160)
  * ───────────────────
  * Bumping is breaking for every deployment simultaneously: both sides reject a
@@ -25,6 +28,29 @@
  *  - BUMP when the register handshake contract changes: required request or
  *    reply fields, challenge/response semantics, or what the key delivery is
  *    bound to. v3 above is the worked example.
+ *  - BUMP when correctness — not merely rendering — requires the peer to ACT on
+ *    a new frame or field. **v4 is the worked example (#246).** v6 added: a
+ *    per-conversation `seq` on every durable inbound frame plus the
+ *    `get_difference`/`difference` round-trip that heals a hole in it (#244);
+ *    the `user_committed` multi-device broadcast (#245); `history` rows of kind
+ *    `reasoning`/`tool`/`approval` (#242); and `ack.committed[]`, the durable
+ *    user id the server minted plus its seq (#243). A v3 peer stays on the wire,
+ *    looks healthy, and is wrong in two ways it cannot itself detect:
+ *      · No `seq` ⇒ no gap detection ⇒ it never sends `get_difference`. This
+ *        transport is core NATS pub/sub, AT-MOST-ONCE with no retention, so one
+ *        dropped frame is a PERMANENT divergence — nothing later heals it. #244
+ *        exists because the heal has to exist; a peer that cannot ask for it is
+ *        not "degraded", it is silently holding a wrong transcript.
+ *      · It DROPS `history` rows that carry no `role` — the `case "history"`
+ *        guard every released build has, which is the very thing that made that
+ *        widening safe — so its transcript holds no reasoning id to cite as a
+ *        `before` cursor and "load older" STALLS FOREVER once an operator
+ *        enables `capabilities.reasoningDurable` (#309).
+ *    #309 named the only two fixes: withhold the row per peer, or refuse the
+ *    connection. This bump is the refusal, and it retires #309's operator-side
+ *    mitigation ("do not enable `reasoningDurable` while a stale client is
+ *    served"). Both sides already reject a mismatch, so the constant IS the
+ *    enforcement — no new gate was added.
  *  - DO NOT BUMP for a new frame type only when its semantics are optional and
  *    safely ignorable by an old peer. Measured, not assumed: this side has no
  *    dispatch switch at all — `deliverInbound` (nats-client.ts) matches two
@@ -36,7 +62,20 @@
  *    `InboundMessage["type"]` is a compile-time union only and rejects nothing
  *    at runtime.
  *
+ * ⚠️ v4 ADDED NO CAPABILITY NEGOTIATION, AND THAT IS A DECISION — NOT AN
+ * OVERSIGHT TO "FINISH". #309 framed the fix as negotiation, and negotiation is
+ * what you need in order to WITHHOLD a frame kind from ONE peer while serving it
+ * to another. Under an exact-match version gate there is no such peer: everything
+ * that registers is at this exact version. The one shape that would need per-peer
+ * withholding — a LIVE delete/edit frame — is not on this wire at all:
+ * `messageDeleted`/`messageEdited` are `DurableEvent` kinds with NO PRODUCER
+ * (`durable-view-reducer.ts`), reachable only through `difference`/`history`. So
+ * a capability carrier would ship with zero consumers, and an unexercised
+ * mechanism is one that gets discovered broken the first time it matters. The
+ * slice that adds the first frame an EQUAL-version peer must act on decides
+ * bump-vs-negotiate then, under the rule above.
+ *
  * NOTE: this is a DIFFERENT layer from the E2E message-envelope version
  * (`ENVELOPE_VERSION` / `v:1`), which versions the encrypted payload format.
  */
-export const WEBCHANNEL_PROTOCOL_VERSION = 3;
+export const WEBCHANNEL_PROTOCOL_VERSION = 4;

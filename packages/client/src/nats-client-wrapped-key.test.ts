@@ -896,7 +896,7 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
   });
 
-  it("malformed: a numeric-string '1' is NOT coerced → also TERMINAL (presence with the wrong type is the offense)", async () => {
+  it("malformed: the CURRENT version as a numeric string is NOT coerced → also TERMINAL (presence with the wrong type is the offense)", async () => {
     const K = new Uint8Array(randomBytes(32));
     const agentId = makeAgentIdentity();
     const { client, deviceKP } = await makeClient(agentId.publicB64url);
@@ -907,20 +907,22 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     client.onError((e) => errors.push(e));
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
-    // "1" would "match" WEBCHANNEL_PROTOCOL_VERSION if we coerced — we must not:
-    // Protocol versions are numeric; a string is malformed even if coercible.
+    // This value WOULD "match" WEBCHANNEL_PROTOCOL_VERSION if we coerced — which
+    // is the whole point, so it is derived from the constant and cannot go stale
+    // on the next bump. We must not coerce: protocol versions are numeric, and a
+    // string is malformed even when it is coercible to the right number.
     server.handler = registerAgentHandler(
       PEER,
       (cn) => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, cn),
       undefined,
-      { protocolVersion: "1" },
+      { protocolVersion: String(WEBCHANNEL_PROTOCOL_VERSION) },
     );
     client.sendUserMessage("never-sent");
     await settle();
 
     expect(infos).toHaveLength(0);
     expect(errors).toHaveLength(1);
-    expect(errors[0].message).toContain('"1"');
+    expect(errors[0].message).toContain(JSON.stringify(String(WEBCHANNEL_PROTOCOL_VERSION)));
     expect(server.readyState).toBe(FakeNatsWS.CLOSED);
     expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
   });

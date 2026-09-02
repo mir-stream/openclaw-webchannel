@@ -274,7 +274,8 @@ async function replayJwt(): Promise<number> {
       token: jwt,
       nonce: ch.nonce,
       signature,
-      // Both fields are mandatory on the v3 register request. `protocolVersion`
+      // Both fields are mandatory on the register request (v4 since #246; the
+      // constant below is the source of truth). `protocolVersion`
       // was already required at v2 and its omission here was a pre-existing bug:
       // the agent answers 426 before PoP, so this scenario could never reach the
       // replay it means to test. `clientNonce` is the v3 freshness anchor; this

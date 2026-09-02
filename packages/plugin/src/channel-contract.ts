@@ -96,9 +96,10 @@ export type HistoryTextMessage = {
  * ⚠️ IT HAS NO `role`, AND THAT IS NOT AN OVERSIGHT TO FIX. The live `reasoning`
  * frame carries none and `DurableMessage` (the reducer's SSOT shape, which this
  * mirrors) refuses to invent one — a fabricated author inside the system of
- * record is the N8 shape. The absence is also what makes the widening SAFE FOR
- * OLDER CLIENTS, which is the reason the union is shaped this way rather than
- * as an optional `role`:
+ * record is the N8 shape. The absence is ALSO what MADE the widening safe for
+ * older clients, which is the reason the union is shaped this way rather than as
+ * an optional `role` — read the SUPERSESSION note under the census before citing
+ * that half, because since #246 it is history and the N8 half is not:
  *
  *   MEASURED against the shipped client's `case "history"`
  *   (`packages/client/src/nats-client-wrapper.ts`): its per-row validation runs
@@ -122,6 +123,18 @@ export type HistoryTextMessage = {
  *   (`archive/issue-53-pre-rebase-checkpoint`, `issue-94-pr2-superseded`) are
  *   working checkpoints, not releases. 15 is the number of things a peer can
  *   actually be running. Re-derive it with `git tag --list 'v*'`, not `git tag`.
+ *
+ *   ⚠️ SUPERSEDED AS A COMPATIBILITY ARGUMENT BY #246 — KEPT AS THE RECORD OF WHY
+ *   THIS UNION IS SHAPED THIS WAY. `WEBCHANNEL_PROTOCOL_VERSION` went 3 → 4 and
+ *   both sides refuse a mismatch, so every one of those 15 tags is now REFUSED AT
+ *   REGISTER (terminal `protocol_mismatch`, 426) and none of them can receive
+ *   this row at all. The census is still TRUE, and it is still why the row was
+ *   safe to ship in #242 before that gate existed — but do not cite it as a live
+ *   back-compat guarantee, and do not "restore compatibility" by re-adding a
+ *   `role`: the N8 reason in the first paragraph is the one that still binds.
+ *   The same supersession applies verbatim to the tool and approval variants
+ *   below: each restates the census for its own row and each defers to this block
+ *   for the reasoning, so the note is written here ONCE rather than three times.
  *
  * `turnId` is REQUIRED, following the live frame (`turnId: string`) and
  * `DurableMessage`'s reasoning variant. `ts` is the same hydration metadata the
@@ -483,8 +496,10 @@ export type OutboundWsMessage =
    * mis-routed final top-up. `remove` names the bubble ids the plugin KNOWS it
    * mis-routed answer content onto (overflow independents; recovery blocks whose
    * lane is now in `answers`). The client replaces ONLY these — every other
-   * turn agent bubble (notices, errors, adopted history) is preserved. Additive
-   * and safely ignorable by an old client (no protocol bump).
+   * turn agent bubble (notices, errors, adopted history) is preserved. It shipped
+   * in 0.7.0 as additive and safely ignorable by an old client, under protocol v3
+   * and with no bump; #246 has since taken the wire to v4, so "an old client
+   * ignores it" no longer describes a peer that can connect.
    */
   | {
       type: "turn_snapshot";
@@ -561,11 +576,17 @@ export type OutboundWsMessage =
    * its optimistic bubble onto this `id` by matching `random_id` (the same
    * correlation `ack.committed`/#337 use) and then folds a no-op — ONE bubble. A
    * non-origin device has no linkage for this `random_id`, so the adopt is a
-   * no-op and it APPENDS the user event. Absent for an older (non-`random_id`)
-   * client's send. ADDITIVE — an older client that does not know this type drops
-   * it (not in its seq-bearing set / frame switch), and the gap-sync fallback
-   * still converges the user event when the next agent frame opens a gap; the
-   * broadcast is at-most-once and purely an IMMEDIACY optimization over that path.
+   * no-op and it APPENDS the user event. Absent for a send that carried no
+   * `random_id`.
+   *
+   * ⚠️ THE GAP-SYNC FALLBACK IS NOT A BACK-COMPAT STORY — IT IS THE AT-MOST-ONCE
+   * STORY, which is why #246's v4 bump leaves it standing. This broadcast rides
+   * core NATS pub/sub, so it can simply be DROPPED en route to a fully current
+   * device; when it is, the next agent frame opens a gap and `get_difference`
+   * converges the user event anyway. The broadcast is purely an IMMEDIACY
+   * optimization over that path. (It read as "an older client that does not know
+   * this type drops it" before v4; under exact-match there is no such peer — the
+   * property is unchanged, only the reason for it.)
    */
   | { type: "user_committed"; id: string; text: string; turnId?: string; seq: number; random_id?: string }
   /**

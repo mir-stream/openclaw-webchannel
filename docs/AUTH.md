@@ -15,8 +15,9 @@ no browser-facing connection or token route.
 5. The agent returns the conversation key wrapped to the SaaS-attested device key,
    with both the peer id and that `clientNonce` bound into the wrap AAD.
 
-The wire protocol version is **3**. Client and plugin must ship together; a
-mismatch is refused with a terminal `protocol_mismatch` (426) before any key work.
+The wire protocol version is **4** (3 → 4 in #246). Client and plugin must ship
+together; a mismatch is refused with a terminal `protocol_mismatch` (426) before
+any key work.
 
 ### Register-reply freshness (`clientNonce`)
 

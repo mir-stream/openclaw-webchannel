@@ -176,9 +176,12 @@
  * the Telegram app does (our plugin = the Telegram plugin + the Telegram
  * server; our client = the Telegram app). A CLOSED union cannot
  * express that — five members no more than four — so it is owned by #241 (typed
- * event model) and #246 (protocol
- * version + runtime wire validation), NOT by this slice. Do not add a `default`
- * here to silence a reviewer: the absence is deliberate, and this is the reason.
+ * event model) and #253 (retain + render unsupported), NOT by this slice. (An
+ * earlier revision named #246 here; #246 is the protocol version bump + runtime
+ * wire validation, a different issue — `journal-history.ts` carries the same
+ * correction. A version gate refuses a peer, it does not render a row.) Do not
+ * add a `default` here to silence a reviewer: the absence is deliberate, and this
+ * is the reason.
  * (doc `docs/ISSUE_114_DELIVERY_MIRROR_PLAN.md` §0.2 — the NOT-list.)
  *
  * DEPENDENCY CONTRACT: this file is STRICTLY dependency-free and Node-free — it
