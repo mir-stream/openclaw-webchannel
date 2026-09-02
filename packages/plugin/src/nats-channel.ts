@@ -716,8 +716,12 @@ export class NatsChannel implements WebChannelPeerChannel {
    * key exists (returns false, never plaintext). An EMPTY `ids` is a no-op that
    * returns true without publishing (nothing to ack — e.g. an all-id-less batch).
    */
-  sendAck(peerId: string, ids: string[]): boolean {
-    return this.sendIngressResult(peerId, "ack", ids);
+  sendAck(
+    peerId: string,
+    ids: string[],
+    committed?: Array<{ random_id: string; messageId: string }>,
+  ): boolean {
+    return this.sendIngressResult(peerId, "ack", ids, committed);
   }
 
   sendInboundRejected(peerId: string, ids: string[]): boolean {
@@ -1035,6 +1039,9 @@ export class NatsChannel implements WebChannelPeerChannel {
     peerId: string,
     type: IngressResultFrame["type"],
     candidates: readonly unknown[],
+    // #243 half 2a: the server-assigned-id echo for an `ack`, attached to the
+    // first published frame by the chunk writer and measured on the wire with it.
+    committed?: Array<{ random_id: string; messageId: string }>,
   ): boolean {
     if (candidates.length === 0) return true;
     const advertisedLimit = this.transport.effectiveOutboundLimit;
@@ -1049,6 +1056,7 @@ export class NatsChannel implements WebChannelPeerChannel {
           this.outboundWireSize(peerId, frame)
             ?? Buffer.byteLength(JSON.stringify(frame), "utf8"),
         ...(effectiveOutboundLimit !== undefined ? { effectiveOutboundLimit } : {}),
+        ...(type === "ack" && committed && committed.length > 0 ? { committed } : {}),
         onTooSmall: () => this.warnResultLimitTooSmall(),
       });
       for (const candidate of candidates) writer.add(candidate);

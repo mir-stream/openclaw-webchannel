@@ -622,11 +622,21 @@ export function journalEventForOutbound(
 }
 
 /**
- * The inbound user message's journal event.
+ * The inbound user message's journal event, from a CLIENT-supplied id.
  *
  * Exported alongside the outbound mapper so half 3 has nothing to invent at the
  * accept seam: doc §15.7 makes the plugin the ONLY SSOT for user messages, so
  * this event is the durable record of the accept, written before the ack.
+ *
+ * ⚠️ NO LONGER ON THE ACCEPT PATH AS OF #243 half 2a. The accept seam now mints
+ * the durable id SERVER-side inside the store's transaction
+ * (`delivery-journal.ts`'s `appendInboundUser`, tied to the seq per doc §16.2-1),
+ * so it builds its `user` event there and does not route through this mapper. The
+ * client-supplied-id VALIDATION below therefore guards no live caller today — it
+ * is retained for any hand-built `user` event and for the tests that pin the
+ * contract, and because `append` enforces the same bound at the mechanism. Item 4
+ * of the slice: the accept seam's id check moved from "bound hostile input" to
+ * "trust our own mint".
  *
  * ⚠️ THROWS on an id that is absent, empty, not a string, or longer than
  * `MAX_INBOUND_USER_ID_LENGTH`. That is the whole point of it existing as a

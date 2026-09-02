@@ -183,6 +183,16 @@ export type InboundMessage = {
   id?: string;
   /** P0-7b: the acknowledged `user_message` ids on an `ack` frame. */
   ids?: string[];
+  /**
+   * #243 half 2a: the server-assigned durable `messageId` per client `random_id`,
+   * echoed on an `ack` frame. DELIBERATELY IGNORED in 2a — `drainAcked` still
+   * keys on `ids`, and the durable id is still reconciled by text/position (the
+   * `case "history"` tiers). Adopting this echo (re-keying the local message to
+   * the server id) is half 2b; the field is declared now only so the wire
+   * TYPECHECKS. Re-declared loosely, like every other field here (zero-dep
+   * package; runtime discrimination).
+   */
+  committed?: Array<{ random_id: string; messageId: string }>;
   reason?: "overloaded";
   text?: string;
   turnId?: string;

@@ -436,7 +436,19 @@ export type OutboundWsMessage =
   | { type: "typing" }
   | { type: "history"; messages: HistoryMessage[] }
   | { type: "commands"; commands: CommandCatalogEntry[] }
-  | { type: "ack"; ids: string[] }
+  | {
+      type: "ack";
+      ids: string[];
+      /**
+       * #243 half 2a (doc §16.2-1): the durable user messageId the SERVER minted
+       * for each fresh admission, and the SAME id re-echoed for a deduped retry,
+       * keyed by the client `random_id`. Additive and optional — an older client
+       * that only reads `ids` is unaffected, and the CURRENT client IGNORES it
+       * (adoption is half 2b; `drainAcked` still keys on `ids`). It rides `ack`
+       * because that frame already reports per-id acceptance; see `IngressResultFrame`.
+       */
+      committed?: Array<{ random_id: string; messageId: string }>;
+    }
   | { type: "inbound_rejected"; ids: string[]; reason: "overloaded" };
 
 export interface WebChannelPeerChannel {
@@ -490,7 +502,11 @@ export interface WebChannelPeerChannel {
   sendApprovalRequest(peerId: string, request: ApprovalRequestPayload): boolean;
   sendApprovalResolved(peerId: string, id: string, decision: ApprovalDecision): boolean;
   sendApprovalSnapshot(peerId: string, approvals: ApprovalRequestPayload[], resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean;
-  sendAck?(peerId: string, ids: string[]): boolean;
+  sendAck?(
+    peerId: string,
+    ids: string[],
+    committed?: Array<{ random_id: string; messageId: string }>,
+  ): boolean;
   sendInboundRejected?(peerId: string, ids: string[]): boolean;
 }
 
@@ -507,6 +523,6 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload): boolean { return false; }
   sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision): boolean { return false; }
   sendApprovalSnapshot(_peerId: string, _approvals: ApprovalRequestPayload[], _resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean { return false; }
-  sendAck(_peerId: string, ids: string[]): boolean { return ids.length === 0; }
+  sendAck(_peerId: string, ids: string[], _committed?: Array<{ random_id: string; messageId: string }>): boolean { return ids.length === 0; }
   sendInboundRejected(_peerId: string, ids: string[]): boolean { return ids.length === 0; }
 }

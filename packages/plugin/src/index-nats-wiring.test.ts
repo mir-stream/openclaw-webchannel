@@ -444,8 +444,10 @@ describe("index-nats.ts wiring contract — ingress ack (P0-7b)", () => {
   it("wires sendAck into the onFlush factory, the debouncer onCancel, and the control-lane branch", () => {
     // The onFlush factory must be handed a sendAck so admitted (fresh + duplicate)
     // ids drain the client's replay ledger.
+    // #243 half 2a: the factory's sendAck forwards `committed` (the server-id echo)
+    // through to the channel alongside the ids.
     expect(RUNTIME_SOURCE).toMatch(
-      /sendAck:\s*\(peerId,\s*ids\)\s*=>\s*channel\.sendAck\(peerId,\s*ids\)/,
+      /sendAck:\s*\(peerId,\s*ids,\s*committed\)\s*=>\s*channel\.sendAck\(peerId,\s*ids,\s*committed\)/,
     );
     // The debouncer's onCancel must record+ack /stop-cancelled buffered items via
     // the tested helper (else a reconnect replays text the user aborted).

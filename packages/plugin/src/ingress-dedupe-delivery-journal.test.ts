@@ -64,7 +64,7 @@ const PEER = "peer-0";
 
 type Item = {
   peerId: string;
-  message: { type: "user_message"; text?: string; id?: string };
+  message: { type: "user_message"; text?: string; id?: string; random_id?: string };
 };
 
 /**
@@ -75,7 +75,7 @@ type Item = {
  */
 type Call =
   | { call: "append"; conversationId: string; event: JournalEvent }
-  | { call: "ack"; ids: string[] }
+  | { call: "ack"; ids: string[]; committed?: Array<{ random_id: string; messageId: string }> }
   | { call: "rejected"; ids: string[] }
   | { call: "offer-commit"; text: string | undefined }
   | { call: "offer-rollback"; text: string | undefined }
@@ -83,12 +83,13 @@ type Call =
   | { call: "write-rollback"; key: string }
   | { call: "warn"; message: string };
 
-const item = (text: string | undefined, id?: string): Item => ({
+const item = (text: string | undefined, id?: string, randomId?: string): Item => ({
   peerId: PEER,
   message: {
     type: "user_message",
     ...(text !== undefined ? { text } : {}),
     ...(id !== undefined ? { id } : {}),
+    ...(randomId !== undefined ? { random_id: randomId } : {}),
   },
 });
 
@@ -102,6 +103,8 @@ class FakeJournal implements DeliveryJournal {
     errstr: "database is locked",
   });
   private appended = 0;
+  /** #243 half 2a: idempotency key → {seq, minted server messageId}. */
+  private readonly byKey = new Map<string, { seq: number; messageId: string }>();
   constructor(private readonly calls: Call[]) {}
   append(
     conversationId: string,
@@ -111,6 +114,40 @@ class FakeJournal implements DeliveryJournal {
     if (this.appended === this.throwOnAppendNumber) throw this.throwValue;
     this.calls.push({ call: "append", conversationId, event });
     return { seq: this.appended, inserted: true };
+  }
+  // #243 half 2a: mirror the real store — idempotent on `randomId ?? turnId`
+  // (check-first, no append/throw on a replay), mint the durable id from seq
+  // (`webchannel-user-<seq>`), log the append, and remember the mapping.
+  appendInboundUser(
+    conversationId: string,
+    input: { text: string; turnId?: string; randomId?: string },
+  ): { seq: number; inserted: boolean; messageId: string } {
+    const key = input.randomId ?? input.turnId;
+    if (key !== undefined) {
+      const existing = this.byKey.get(`${conversationId}:${key}`);
+      if (existing !== undefined) {
+        return { seq: existing.seq, inserted: false, messageId: existing.messageId };
+      }
+    }
+    this.appended++;
+    if (this.appended === this.throwOnAppendNumber) throw this.throwValue;
+    const seq = this.appended;
+    const messageId = `webchannel-user-${seq}`;
+    const event: JournalEvent = {
+      kind: "user",
+      id: messageId,
+      text: input.text,
+      ...(input.turnId !== undefined ? { turnId: input.turnId } : {}),
+    };
+    this.calls.push({ call: "append", conversationId, event });
+    if (key !== undefined) this.byKey.set(`${conversationId}:${key}`, { seq, messageId });
+    return { seq, inserted: true, messageId };
+  }
+  lookupUserMessageIdByRandomId(
+    conversationId: string,
+    randomId: string,
+  ): string | undefined {
+    return this.byKey.get(`${conversationId}:${randomId}`)?.messageId;
   }
   read(): DeliveryJournalRow[] {
     return [];
@@ -144,6 +181,26 @@ class FlakyJournal implements DeliveryJournal {
       });
     }
     return this.inner.append(conversationId, event);
+  }
+  appendInboundUser(
+    conversationId: string,
+    input: { text: string; turnId?: string; randomId?: string },
+  ): { seq: number; inserted: boolean; messageId: string } {
+    this.appended++;
+    if (this.appended === this.throwOnAppendNumber) {
+      throw Object.assign(new Error("database is locked"), {
+        code: "ERR_SQLITE_ERROR",
+        errcode: 5,
+        errstr: "database is locked",
+      });
+    }
+    return this.inner.appendInboundUser(conversationId, input);
+  }
+  lookupUserMessageIdByRandomId(
+    conversationId: string,
+    randomId: string,
+  ): string | undefined {
+    return this.inner.lookupUserMessageIdByRandomId(conversationId, randomId);
   }
   read(conversationId: string): DeliveryJournalRow[] {
     return this.inner.read(conversationId);
@@ -222,8 +279,12 @@ function makeSeam(options?: {
       },
       finish: vi.fn(),
     }),
-    sendAck: (_peerId, ids) => {
-      calls.push({ call: "ack", ids: [...ids] });
+    sendAck: (_peerId, ids, committed) => {
+      calls.push({
+        call: "ack",
+        ids: [...ids],
+        ...(committed && committed.length > 0 ? { committed: committed.map((c) => ({ ...c })) } : {}),
+      });
       return true;
     },
     sendInboundRejected: (_peerId, ids) => {
@@ -283,9 +344,10 @@ describe("#239 — the inbound accept journals before it acks", () => {
       {
         call: "append",
         conversationId: PEER,
-        // conversationId === peerId (doc §16.2-7), the item's OWN id and text,
-        // and `turnId` = that same wire id — see the mirror argument below.
-        event: { kind: "user", id: "u-1", text: "hello", turnId: "u-1" },
+        // conversationId === peerId (doc §16.2-7). #243 half 2a: the durable `id`
+        // is now SERVER-MINTED (`webchannel-user-<seq>`), NOT the wire id; `turnId`
+        // stays the wire id — see the mirror argument below.
+        event: { kind: "user", id: "webchannel-user-1", text: "hello", turnId: "u-1" },
       },
       { call: "write-commit", key: `${PEER}:u-1` },
       { call: "offer-commit", text: "hello" },
@@ -293,8 +355,9 @@ describe("#239 — the inbound accept journals before it acks", () => {
     ]);
     // `turnId` is this message's OWN wire id — the client's
     // `nextPublishedUserMessages` stamps exactly that on its live user bubble,
-    // and `inbound.ts` derives the plugin's turn id from `message.id` too.
-    expect(appends(calls)[0]!.event).toMatchObject({ turnId: "u-1" });
+    // and `inbound.ts` derives the plugin's turn id from `message.id` too. The
+    // durable `id` is the server mint, distinct from both.
+    expect(appends(calls)[0]!.event).toMatchObject({ id: "webchannel-user-1", turnId: "u-1" });
   });
 
   it("writes ONE row per accepted item, in arrival order — never one coalesced row", async () => {
@@ -306,9 +369,9 @@ describe("#239 — the inbound accept journals before it acks", () => {
     // the client drew three user bubbles. Three rows is what makes history equal
     // live (N8).
     expect(appends(calls).map((entry) => entry.event)).toEqual([
-      { kind: "user", id: "u-1", text: "first", turnId: "u-1" },
-      { kind: "user", id: "u-2", text: "second", turnId: "u-2" },
-      { kind: "user", id: "u-3", text: "third", turnId: "u-3" },
+      { kind: "user", id: "webchannel-user-1", text: "first", turnId: "u-1" },
+      { kind: "user", id: "webchannel-user-2", text: "second", turnId: "u-2" },
+      { kind: "user", id: "webchannel-user-3", text: "third", turnId: "u-3" },
     ]);
     // …and every append precedes the single ack frame.
     expect(kinds(calls).lastIndexOf("append")).toBeLessThan(
@@ -728,8 +791,8 @@ describe("#239 — the accept seam against a REAL delivery journal", () => {
       expect(calls).toContainEqual({ call: "ack", ids: ["u-1", "u-2"] });
       const rows = journal.read(PEER);
       expect(rows.map((row) => row.event)).toEqual([
-        { kind: "user", id: "u-1", text: "first", turnId: "u-1" },
-        { kind: "user", id: "u-2", text: "second", turnId: "u-2" },
+        { kind: "user", id: "webchannel-user-1", text: "first", turnId: "u-1" },
+        { kind: "user", id: "webchannel-user-2", text: "second", turnId: "u-2" },
       ]);
       expect(rows.map((row) => row.seq)).toEqual([1, 2]);
       expect(rows.every((row) => row.kind === "user")).toBe(true);
@@ -764,9 +827,14 @@ describe("#239 — the accept seam against a REAL delivery journal", () => {
       expect(second.calls).toContainEqual({ call: "ack", ids: ["u-1", "u-2"] });
       const rows = journal.read(PEER);
       // TWO rows, not three: the replayed `u-1` collapsed onto its existing row.
+      // #243 half 2a: the collapse now works via `appendInboundUser`'s
+      // idempotency on the STABLE key (here the wire id `u-1`, since these items
+      // carry no `random_id`) rather than the old `journal_user_once`-on-wire-id —
+      // the durable id is server-minted, so `u-1`'s replay finds seq 1 and mints
+      // no second id. (See the `random_id`-carrying test for the conforming path.)
       expect(rows.map((row) => row.event)).toEqual([
-        { kind: "user", id: "u-1", text: "first", turnId: "u-1" },
-        { kind: "user", id: "u-2", text: "second", turnId: "u-2" },
+        { kind: "user", id: "webchannel-user-1", text: "first", turnId: "u-1" },
+        { kind: "user", id: "webchannel-user-2", text: "second", turnId: "u-2" },
       ]);
     } finally {
       journal.close();
@@ -788,5 +856,117 @@ describe("#239 — the accept seam against a REAL delivery journal", () => {
     expect(warns(seam.calls)[0]!.message).toContain(
       "delivery journal append failed at the inbound accept",
     );
+  });
+});
+
+describe("#243 half 2a — the server assigns the durable user id and echoes it", () => {
+  const dirs: string[] = [];
+  const openIn = (): { journal: DeliveryJournal } => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-243-journal-"));
+    dirs.push(dir);
+    return { journal: openDeliveryJournal({ databasePath: join(dir, "journal.db") }) };
+  };
+  afterEach(() => {
+    while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
+  });
+
+  const ackOf = (calls: Call[]): Extract<Call, { call: "ack" }> => {
+    const ack = calls.find((entry) => entry.call === "ack");
+    if (!ack || ack.call !== "ack") throw new Error("no ack frame emitted");
+    return ack;
+  };
+
+  it("journals a fresh message under a SERVER id (not the wire id) and echoes it on the ack", async () => {
+    const { journal } = openIn();
+    try {
+      const { calls, onFlush } = makeSeam({ journal });
+
+      await onFlush([item("hello", "u-1", "r-1")]);
+
+      // Durable id is the server mint; `turnId` is the wire id; neither is the
+      // client `random_id`.
+      expect(journal.read(PEER).map((row) => row.event)).toEqual([
+        { kind: "user", id: "webchannel-user-1", text: "hello", turnId: "u-1" },
+      ]);
+      // The ack carries the random_id → server messageId mapping.
+      expect(ackOf(calls)).toEqual({
+        call: "ack",
+        ids: ["u-1"],
+        committed: [{ random_id: "r-1", messageId: "webchannel-user-1" }],
+      });
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("a deduped retry (same random_id) echoes the SAME server id and writes no second row", async () => {
+    const { journal } = openIn();
+    try {
+      // First admission: minted and journaled under the server id.
+      const first = makeSeam({ journal });
+      await first.onFlush([item("hello", "u-1", "r-1")]);
+      expect(ackOf(first.calls).committed).toEqual([
+        { random_id: "r-1", messageId: "webchannel-user-1" },
+      ]);
+      expect(journal.read(PEER).map((row) => row.seq)).toEqual([1]);
+
+      // The retry is caught by the outcome store (found/accepted) BEFORE any
+      // re-append — the seam must recover and re-echo the FIRST id, and must NOT
+      // mint a fresh one or write a second row.
+      const second = makeSeam({
+        journal,
+        // key is `${PEER}:${random_id}` (ingressDedupeKey uses the random_id body).
+        lookups: { [`${PEER}:r-1`]: { status: "found", outcome: "accepted" } },
+      });
+      await second.onFlush([item("hello", "u-1", "r-1")]);
+
+      expect(ackOf(second.calls)).toEqual({
+        call: "ack",
+        ids: ["u-1"],
+        committed: [{ random_id: "r-1", messageId: "webchannel-user-1" }],
+      });
+      // Still exactly one row — the SAME id, no duplicate.
+      expect(journal.read(PEER).map((row) => row.event)).toEqual([
+        { kind: "user", id: "webchannel-user-1", text: "hello", turnId: "u-1" },
+      ]);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("a partial-write replay that reaches the append is idempotent on the random_id", async () => {
+    // The #283 partial-batch case, now with a conforming client: round 1 lands
+    // one row then the batch is refused (outcome rolled back), so round 2's retry
+    // is NOT caught by the outcome store and reaches `appendInboundUser` again.
+    // Its idempotency on the random_id is what prevents a duplicate now that the
+    // durable id is server-minted (the old `journal_user_once`-on-wire-id net is
+    // gone). It also re-echoes the same server id.
+    const { journal } = openIn();
+    try {
+      const flaky = new FlakyJournal(journal, 2);
+      const round1 = makeSeam({ journal: flaky });
+      await round1.onFlush([item("first", "u-1", "r-1"), item("second", "u-2", "r-2")]);
+      expect(round1.calls).not.toContainEqual(expect.objectContaining({ call: "ack" }));
+      expect(journal.read(PEER).map((row) => row.seq)).toEqual([1]);
+
+      // Round 2 against the healthy store: fresh path (outcome not-found), so
+      // `appendInboundUser` runs for both — and `r-1` finds its existing row.
+      const round2 = makeSeam({ journal });
+      await round2.onFlush([item("first", "u-1", "r-1"), item("second", "u-2", "r-2")]);
+
+      expect(journal.read(PEER).map((row) => row.event)).toEqual([
+        { kind: "user", id: "webchannel-user-1", text: "first", turnId: "u-1" },
+        { kind: "user", id: "webchannel-user-2", text: "second", turnId: "u-2" },
+      ]);
+      // The ack re-echoes BOTH, `r-1` under its already-minted id.
+      expect(ackOf(round2.calls).committed).toEqual(
+        expect.arrayContaining([
+          { random_id: "r-1", messageId: "webchannel-user-1" },
+          { random_id: "r-2", messageId: "webchannel-user-2" },
+        ]),
+      );
+    } finally {
+      journal.close();
+    }
   });
 });
