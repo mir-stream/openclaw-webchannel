@@ -22,7 +22,12 @@
  *    encodes. A send we DECLINE to attempt (transport down, no session key yet)
  *    is journaled NOT AT ALL, because all three refusal checks sit ABOVE
  *    `journalOutbound`. A wire write that THROWS after the commit IS journaled,
- *    and that is the window §16.2-2 is actually about.
+ *    and that is the window §16.2-2 is actually about — and since #347 it is
+ *    also a SUCCESSFUL send: the row is in the SSOT, it holds a `seq`, and the
+ *    peer heals the frame it never received with `get_difference`. A publish
+ *    throw on a frame that got NO row still returns `false`, because there is
+ *    nothing for gap-sync to serve — a non-durable type, an id-less durable
+ *    frame, or one whose journal write faulted. Both sides are pinned below.
  *    ⚠️ EXCEPT FOR THE TWO APPROVAL FRAMES (#341), WHICH THIS FILE ALSO PINS.
  *    `approval_request`/`approval_resolved` are appended by
  *    `publishApprovalFrame` BEFORE `sendToPeer` is called, so a refused approval
@@ -647,31 +652,64 @@ describe("#239 — egress persist-before-publish", () => {
     warn.mockRestore();
   });
 
-  it("DOES journal when the wire write itself throws — the window §16.2-2 describes", () => {
-    // The one surviving write-then-not-delivered case, and the one that is
-    // genuinely safe: the record is committed and `publish` blows up after it.
-    // History has the message and the reconnect catches up, rather than the
-    // client holding a message the store lacks. Distinguishing this from the two
-    // refusals above is the entire point of where the hook sits.
+  it("#347 — a wire write that throws AFTER the commit is journaled AND reported as SENT", () => {
+    // COMMITTED IS SENT. We are the Telegram server: the message exists once the
+    // store holds it under an id and a seq; the publish is the PUSH. A push that
+    // fails is healed by the peer's next `get_difference`, which is served from
+    // this very row — never by re-sending the content under a NEW id, which is
+    // what the old `false` made `message-adapter.ts` do (#347: history 2× tA,
+    // live 1×). Distinguishing this from the two refusals above is the entire
+    // point of where the hook sits.
     const { calls, channel, transport } = makeChannel();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     transport.publish = () => {
       throw new Error("relay rejected the publish");
     };
 
-    expect(channel.sendText(PEER, "committed then lost", "a-1")).toBe(false);
+    expect(channel.sendText(PEER, "committed then pushed badly", "a-1")).toBe(true);
 
     expect(calls).toEqual([
       {
         call: "append",
         conversationId: PEER,
-        event: { kind: "bubble", answerId: "a-1", text: "committed then lost" },
+        event: { kind: "bubble", answerId: "a-1", text: "committed then pushed badly" },
       },
     ]);
-    // The pre-existing publish-failure diagnostic, untouched by this slice.
-    expect(error.mock.calls[0][0]).toContain(
-      "[nats-channel] Failed to send to peer",
-    );
+    // ONE line per frame, naming the seq so an operator can see WHICH row
+    // gap-sync is expected to carry — and NOT the undelivered-send wording, which
+    // would now be false.
+    expect(error).toHaveBeenCalledTimes(1);
+    const line = error.mock.calls[0][0] as string;
+    expect(line).toContain("[nats-channel] Publish failed AFTER the durable commit");
+    // The seq `FakeJournal` allocated for this, the conversation's first row.
+    expect(line).toContain("(seq=1)");
+    expect(line).toContain("gap-sync");
+    expect(line).not.toContain("Failed to send to peer");
+    // Never the message text.
+    expect(line).not.toContain("committed then pushed badly");
+    error.mockRestore();
+  });
+
+  it("#347 — a publish throw on a NON-durable frame still returns false (no row, nothing to heal from)", () => {
+    // The other side of the split, and the reason the discriminator is "was a row
+    // committed" rather than "did the publish throw". `turn_settled` allocates no
+    // seq, so the peer's cursor never stalls on it and `get_difference` has
+    // nothing to serve: the caller must still be told the send failed.
+    const { calls, channel, transport } = makeChannel();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    transport.publish = () => {
+      throw new Error("relay rejected the publish");
+    };
+
+    expect(channel.sendTurnSettled(PEER, "turn-1", "ok")).toBe(false);
+    expect(channel.sendTyping(PEER)).toBe(false);
+
+    expect(appends(calls)).toEqual([]);
+    expect(error).toHaveBeenCalledTimes(2);
+    for (const call of error.mock.calls) {
+      expect(call[0] as string).toContain("[nats-channel] Failed to send to peer");
+      expect(call[0] as string).not.toContain("gap-sync");
+    }
     error.mockRestore();
   });
 

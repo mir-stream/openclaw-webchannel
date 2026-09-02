@@ -322,7 +322,16 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // both PREFIXES are unchanged (the invalid-fields line gained a `: <reason>`
   // suffix), which is what keeps the existing greps and the
   // `nats-channel-typing.test.ts` assertions matching.
-  "nats-channel.ts": { statements: 22, interpolations: 35 },
+  //
+  // #347 splits `sendToPeer`'s publish catch in two — a frame whose durable row
+  // was COMMITTED reports the send as successful and says so on its own line, and
+  // the pre-existing `Failed to send to peer` line now covers only the frames
+  // with no row. 22→23 statements and 35→38 interpolations: the new line carries
+  // `logSafe(peerId)`, `logSafe(formatCaughtDiagnostic(err))` and the journal's
+  // `seq`. Only `seq` is raw, and it is a NUMBER the journal minted, so it is
+  // allowlisted in `ALLOWED_RAW_INTERPOLATIONS` with its reason rather than
+  // banked as debt here — `KNOWN_RAW["nats-channel.ts"]` stays empty.
+  "nats-channel.ts": { statements: 23, interpolations: 38 },
   // ⚠️ ZERO, AND THE ENTRY STAYS — BUT IT GUARANTEES LESS THAN IT LOOKS LIKE.
   // #240 half 2 deleted the whole core-transcript reader out of `history.ts`
   // (the shape-drift warn, the two cursor-miss warns and the two best-effort
