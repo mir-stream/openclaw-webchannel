@@ -87,9 +87,10 @@ type DraftAttempt = {
  *                has a `catch`, and these tests pin it.
  *  - `"commit-throw"` — #347: the durable row WAS committed and the wire write
  *                then threw. The seam reports the send as SUCCESSFUL (the row is
- *                in the SSOT under a seq and the peer heals the missing frame
- *                with `get_difference`), so the lane keeps its id and nothing is
- *                re-sent under a new one. A row exists; no frame reached the wire.
+ *                in the SSOT under a seq; a #362-model cursor heals the missing
+ *                frame with `get_difference`), so the lane keeps its id and
+ *                nothing is re-sent under a new one. A row exists; no frame
+ *                reached the wire.
  */
 type DraftOutcome = boolean | "throw" | "commit-throw";
 
@@ -1023,8 +1024,11 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     await h.draft.finalize("tA"); // commits, then the publish throws
     await h.draft.drain();
 
-    // Both frames were attempted, and NOTHING reached the wire — the peer learns
-    // this turn only through gap-sync, which is the case the contract is for.
+    // Both lane frames were attempted and neither reached the wire. The harness's
+    // `sendTurnSnapshot` is not routed through `decide`, so the seal DOES ship —
+    // the peer materialises `tA` live from the snapshot's `answers` (the reducer
+    // mints an absent id) and gap-sync heals only the missing `bubble` row. What
+    // the contract pins is that both carry the SAME id.
     expect(h.attempts.map((a) => `${a.type}=${a.text}`)).toEqual([
       "progress=A",
       "final=tA",

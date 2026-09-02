@@ -1220,7 +1220,8 @@ export class NatsChannel implements WebChannelPeerChannel {
     // from the client's view, so a row would only make history show what live
     // never showed". #242 half 1 falsified that by giving the funnel a second
     // durable kind: a refused reasoning CLOSE frame carries `lastDeliveredText`,
-    // text the transport ACCEPTED and the peer is still rendering, and the
+    // text of a send that SUCCEEDED and that the peer renders (live, or via
+    // gap-sync after a commit-then-throw — #347), and the
     // delivery-failure bookkeeping the parenthetical relied on is bubble/
     // placement state that reasoning frames have none of.
     //
@@ -1257,13 +1258,16 @@ export class NatsChannel implements WebChannelPeerChannel {
     // the next SEQ-BEARING frame (the turn's `turn_snapshot` if nothing else) and
     // heals it with `get_difference`, served from this very row — PROVIDED its
     // cursor gap-tests every seq it learns, including the `ack` echo of its own
-    // next message. That is #356 half A's cursor (PR #362); the earlier client's
-    // advance-only ack CLOSED such a hole for the session when an ack arrived
-    // before the next seq-bearing frame. If this frame was the conversation's
-    // last, the peer's next register serves the row in its history snapshot
-    // instead — same store, same id — unless the row alone exceeds the peer's
-    // wire budget (#311 skips it): #325's write side, the one shape no path can
-    // carry. Once the row is committed, the send has succeeded in the only sense
+    // next message. That is #356 half A's cursor (PR #362, which lands BEFORE
+    // this change); the client before it has an advance-only ack that CLOSES
+    // such a hole for the session when an ack arrives before the next
+    // seq-bearing frame. If this frame was the conversation's last, the peer's
+    // next register serves the row in its history snapshot instead — same
+    // store, same id — unless the row alone exceeds the peer's wire budget
+    // (#311 skips it): #325's write side, the one shape no path can carry (and
+    // before #362's fit skips it, a `difference` carrying it is refused whole
+    // and re-requested — a wall, not a miss). Once the row is committed, the
+    // send has succeeded in the only sense
     // the SSOT recognises; what remains is delivery, and delivery is gap-sync's.
     //
     // ⚠️ THE OLD `false` WAS THE DEFECT, NOT A CONSERVATIVE DEFAULT — and #278's
@@ -1436,8 +1440,9 @@ export class NatsChannel implements WebChannelPeerChannel {
    * ⚠️ WHAT IS NO LONGER TRUE — AND IS SAID HERE RATHER THAN LEFT AS THE OLDER,
    * SIMPLER CLAIM ("the send result is computed entirely from the wire write
    * below the hook"). Since #347 `sendToPeer` DOES branch on this return: a
-   * publish that throws after a row was committed reports `true`, because the
-   * client heals the missing frame from that row via `get_difference`. So a
+   * publish that throws after a row was committed reports `true`, because a
+   * #362-model client heals the missing frame from that row via
+   * `get_difference`. So a
    * journal fault does change the result in ONE shape — the publish ALSO throws,
    * and with no row there is nothing to heal from, so the honest answer is
    * `false`. That is the same answer the no-journal build gives, which is why it
@@ -1613,7 +1618,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     // with NO journal: a frame with no row publishes and its boolean is decided
     // by the wire write, exactly as before the journal existed. ⚠️ It is NOT
     // "the journal cannot change the boolean" — since #347 a COMMITTED row turns
-    // a thrown publish into `true` (gap-sync carries it). A frame that reached
+    // a thrown publish into `true` (delivery is gap-sync's). A frame that reached
     // either warning has no row, so it does not get that treatment.
     const line =
       `[nats-channel] delivery journal ${category} for peer ${logSafe(peerId)}; ` +

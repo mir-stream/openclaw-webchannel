@@ -2827,7 +2827,8 @@ export function createReasoningDraftController(params: {
   //  - "a refusal means the peer never received the frame, so recording it would
   //    put content in history that live never showed" — false for precisely the
   //    frame this defers. The close frame's payload IS `lastDeliveredText`, text
-  //    the transport accepted and the peer is rendering.
+  //    of a send that SUCCEEDED — since #347, one whose row was committed; the
+  //    peer is rendering it, or (commit-then-throw) will hold it via gap-sync.
   // Both were reached by reasoning about what the CONTENT means. The mechanism
   // above is about where the checks SIT, which is checkable. If you find
   // yourself explaining this a third way, the explanation is the problem.
@@ -2889,6 +2890,10 @@ export function createReasoningDraftController(params: {
     //                                         close frame is even attempted; a
     //                                         durable block, if one follows, is
     //                                         the only delivery and the only row.
+    //                                         (A commit-then-throw burst is NOT
+    //                                         this row since #347: its sends
+    //                                         succeeded, `lastDeliveredText` is
+    //                                         set, and the close frame ships.)
     //   empty burst                         → the early return above. Nothing.
     //
     // A `pushDurableBlock` that follows any of these arrives under its OWN id as
@@ -2951,8 +2956,9 @@ export function createReasoningDraftController(params: {
       params.turnId,
       currentText,
     );
-    // Only a send the transport ACCEPTED changes what the client holds, so this
-    // lags `currentText` across a refusal instead of tracking it. That lag is
+    // Only a send that SUCCEEDED changes what the client holds — since #347 that
+    // is "the row was committed" (the peer may hold it only after gap-sync), so
+    // this lags `currentText` across a REFUSAL instead of tracking it. That lag is
     // the whole mechanism — see `lastDeliveredText`'s declaration and
     // `closeLiveBurst`'s case table.
     if (liveSnapshotDelivered) lastDeliveredText = currentText;

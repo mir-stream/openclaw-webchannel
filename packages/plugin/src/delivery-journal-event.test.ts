@@ -134,8 +134,8 @@ describe("an id-less agent_message is not persisted, and IS observable", () => {
   };
 
   it("returns null rather than minting a server-side id", () => {
-    // Post-#238 this frame is a REGRESSION, not a case to handle: the frame has
-    // already left for the client, which mints its own local `a-<n>`, so a
+    // Post-#238 this frame is a REGRESSION, not a case to handle: the frame is
+    // about to be published to the client, which mints its own local `a-<n>`, so a
     // journal row under a different id is the very N8 divergence this store
     // exists to kill. #243 is the real repair (mint BEFORE egress).
     expect(journalEventForOutbound(idless)).toBeNull();

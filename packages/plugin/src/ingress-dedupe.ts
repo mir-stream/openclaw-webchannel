@@ -939,10 +939,13 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         //
         // ⚠️ THE ASYMMETRY WITH THE EGRESS SEAM IS DELIBERATE AND IS THE WHOLE
         // POINT OF THIS BLOCK. At egress (§15.8, `nats-channel.ts`'s
-        // `journalOutbound`) a journal failure must NEVER change the send
-        // result — log, never throw, never return `false` — because by then the
-        // text has already left for the client and refusing would lose delivered
-        // text (N10). HERE nothing this seam is the SSOT for has been confirmed
+        // `journalOutbound`) a journal fault must never BLOCK the push — log,
+        // never throw, never refuse the send by itself — because the journal
+        // write precedes the publish there, and blocking the push on a faulted
+        // history write would turn one missing history row into a lost LIVE
+        // message (N8, losing). (Since #347 whether that row was committed is
+        // what a LATER publish failure reports — no row ⇒ `false`.) HERE nothing
+        // this seam is the SSOT for has been confirmed
         // to anyone yet: no chunk-writer result is on the wire, no turn has run,
         // and the journal is the authority that decides whether the message
         // exists at all. So here a journal failure IS an accept failure.

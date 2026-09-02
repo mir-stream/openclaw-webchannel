@@ -187,9 +187,9 @@ function isUsableMessageId(id: unknown): id is string {
  * OBSERVABLE predicate rather than as a silent `null`. Half 2 logs it at `error`.
  *
  * ⚠️ DO NOT "handle" it by minting a server-side id here and keeping the text.
- * N10 says never drop text, and that instinct is right in general — but by the
- * time a frame reaches this mapper it has ALREADY LEFT for the client, which
- * mints its own local `a-<n>` for it. A journal row under a DIFFERENT id is
+ * N8 says live and history must agree, and the instinct to keep text is right
+ * in general — but a frame that reaches this mapper is about to be PUBLISHED to
+ * the client, which mints its own local `a-<n>` for it. A journal row under a DIFFERENT id is
  * precisely the live≠history divergence (N8) this store exists to kill. The real
  * repair is the plugin minting the id BEFORE the frame goes out, so client and
  * journal agree by construction — doc §16.2-1, issue **#243**. Not built here.

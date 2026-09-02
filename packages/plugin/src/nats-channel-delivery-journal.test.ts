@@ -25,8 +25,9 @@
  *    is journaled NOT AT ALL, because all three refusal checks sit ABOVE
  *    `journalOutbound`. A wire write that THROWS after the commit IS journaled,
  *    and that is the window §16.2-2 is actually about — and since #347 it is
- *    also a SUCCESSFUL send: the row is in the SSOT, it holds a `seq`, and the
- *    peer heals the frame it never received with `get_difference`. A publish
+ *    also a SUCCESSFUL send: the row is in the SSOT, it holds a `seq`, and a
+ *    #362-model cursor heals the frame it never received with `get_difference`
+ *    (an oversize row, #325, is the one shape no path carries). A publish
  *    throw on a frame that got NO row still returns `false`, because there is
  *    nothing for gap-sync to serve — a non-durable type, an id-less durable
  *    frame, or one whose journal write faulted. Both sides are pinned below.
