@@ -79,12 +79,39 @@ const MAX_INGRESS_DEDUPE_ID_LENGTH = MAX_INBOUND_USER_ID_LENGTH;
 export const MAX_CANCELLED_INBOUND_FALLBACK_TOMBSTONES = 256;
 export const MAX_CANCELLED_INBOUND_FALLBACK_BYTES = 256 * 1024;
 
-/** Apply the same bounded/non-empty id rule to persistent and fallback keys. */
+/**
+ * The per-account dedupe key for an inbound item (persistent AND fallback).
+ *
+ * #243 half 1: the dedupe key SOURCE moves from the wire `id` to the client
+ * idempotency `random_id`, but nothing else about identity moves — the durable id
+ * is still the wire `id`, journaled and acked exactly as before. Two rules, in
+ * order:
+ *
+ *  1. A valid, in-bounds wire `id` is STILL REQUIRED to produce a key. It is the
+ *     durable id the accept seam journals (`journalEventForInboundUser`) and the
+ *     ack layer replies with, both of which THROW/refuse on an absent, empty,
+ *     non-string or over-length id. Gating on it here is what keeps the append
+ *     loop's "cannot refuse what reaches it" invariant true: an item without a
+ *     usable wire id gets NO key and takes the id-less admit-but-don't-journal
+ *     path (the deliberate N8 gap #243 half 2 closes), exactly as before this
+ *     slice. This is UNCHANGED behaviour, not a new gate — before half 1 the wire
+ *     id WAS the key, so "no usable wire id" already meant "no key".
+ *  2. Given a usable wire id, the key BODY is the client `random_id` when it is
+ *     itself a usable id, else the wire `id` (older clients that send no
+ *     `random_id`, or any non-user frame). So a conforming client dedupes on
+ *     `random_id`; everything else dedupes exactly as it did before.
+ *
+ * Both fields share the one `MAX_INGRESS_DEDUPE_ID_LENGTH` bound and the
+ * `${peerId}:<key>` namespacing.
+ */
+function usableId(value: string | undefined): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_INGRESS_DEDUPE_ID_LENGTH;
+}
 export function ingressDedupeKey(item: IngressDedupeItem): string | undefined {
   const id = item.message.id;
-  return typeof id === "string" && id.length > 0 && id.length <= MAX_INGRESS_DEDUPE_ID_LENGTH
-    ? `${item.peerId}:${id}`
-    : undefined;
+  if (!usableId(id)) return undefined;
+  const keyBody = usableId(item.message.random_id) ? item.message.random_id : id;
+  return `${item.peerId}:${keyBody}`;
 }
 
 /** Per-account, insertion-ordered safety net for cancelled-item record failures. */
@@ -156,7 +183,7 @@ export type IngressDedupeCheck = (
  */
 export type IngressDedupeItem = {
   peerId: string;
-  message: { id?: string; text?: string };
+  message: { id?: string; text?: string; random_id?: string };
 };
 
 /**
@@ -188,7 +215,9 @@ export type IngressDedupeLogSinks = {
  *    warn-per-fault; this catch is a safety net for anything beyond that.
  *
  * `namespace` is the account id, so ids are isolated per account and one peer
- * cannot dedupe against (poison) another peer's ids. The key is `${peerId}:${id}`.
+ * cannot dedupe against (poison) another peer's ids. The key is `${peerId}:<key>`,
+ * where `<key>` is the client `random_id` when present and the wire `id`
+ * otherwise (#243 half 1; see `ingressDedupeKey`).
  */
 export async function filterFreshInboundItems<T extends IngressDedupeItem>(
   items: readonly T[],
@@ -945,9 +974,13 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // opposite operator responses, so merging them would normally be
             // wrong — but after the `MAX_INGRESS_DEDUPE_ID_LENGTH` collapse
             // above, `journalEventForInboundUser` CANNOT refuse anything that
-            // reaches here: its id came through `ingressDedupeKey`'s identical
-            // predicate at the identical bound, and its text was just narrowed
-            // to `string`. So today this line has exactly one real source, and a
+            // reaches here: its id (the wire `id`, `pending.id`) came through
+            // `ingressDedupeKey`'s identical predicate at the identical bound —
+            // and that is still true after #243 half 1, which added a `random_id`
+            // key BODY but left the wire-id GATE (`usableId(id)`) as the sole
+            // admission to this else-branch, precisely so this invariant holds —
+            // and its text was just narrowed to `string`. So today this line has
+            // exactly one real source, and a
             // `code="<none>"` diagnostic on it means a construction bug, not a
             // sick database. The `try` still spans the mapper because #242
             // widens the event set and may add refusals — and THAT is when the

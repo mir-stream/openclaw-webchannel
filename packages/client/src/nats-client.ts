@@ -320,7 +320,15 @@ export type OutboundMessage =
   // P0-7a: `id` is a stable, unique id stamped per logical send so the agent can
   // dedupe a re-delivered frame at ingress. Always set on the send path below;
   // typed optional to mirror the wire union (older clients omit it).
-  | { type: "user_message"; text: string; id?: string }
+  //
+  // #243 half 1: `random_id` is the client's idempotency key — a fresh token
+  // minted once per logical user message and REUSED on every retry (it rides the
+  // stored ledger entry, so a replayed frame carries the same value). The plugin
+  // deduplicates on `random_id` when present. It is SEPARATE from `id`: today `id`
+  // is still the durable id, but half 2 makes the server mint the durable id, at
+  // which point retry idempotency can no longer ride the journal's message_id and
+  // must already be riding `random_id`. Typed optional to mirror the wire union.
+  | { type: "user_message"; text: string; id?: string; random_id?: string }
   | { type: "approval_decision"; id: string; decision: string }
   // #320: `beforeTurnId` completes the page cursor for a TOOL row, which is
   // addressed by the pair `(turnId, id)`. Additive — omitting it is the id-only
@@ -1475,8 +1483,16 @@ export class WebChannelNatsClient {
    * once and MUST be currently reserved and absent from the tracker/queue/ledger
    * — a violation THROWS (a programmer error, never a fabricated receipt). Omit
    * it (direct callers, tests) to self-reserve a fresh id.
+   *
+   * `randomId` (#243 half 1): the idempotency key the plugin deduplicates on. It
+   * is minted ONCE here per logical send and stamped onto the outbound frame; the
+   * unacked ledger stores that exact frame object, so every reconnect replay
+   * (`flushQueue`) re-publishes the SAME `random_id` — idempotency across retries
+   * without relying on the durable `id`. Distinct from the wire `id`, which stays
+   * exactly as today. Defaulted to a fresh token; injectable for deterministic
+   * tests.
    */
-  sendUserMessage(text: string, reservedId?: string): string {
+  sendUserMessage(text: string, reservedId?: string, randomId: string = randomInboxToken()): string {
     const id = reservedId === undefined ? this.reserveWireId() : reservedId;
     this.consumeReservedId(id);
     // Seed without notifying. For a live send, its queue position must be owned
@@ -1515,7 +1531,7 @@ export class WebChannelNatsClient {
     // Authoritative outbound ownership precedes every public callback. A nested
     // send appends behind this entry; whichever stack frame starts the drain will
     // therefore publish in logical call order.
-    this.outboundQueue.push({ type: "user_message", text, id });
+    this.outboundQueue.push({ type: "user_message", text, id, random_id: randomId });
     this.emitSendState(id, "queued");
     this.drainOutboundQueue();
     return id;

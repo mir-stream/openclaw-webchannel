@@ -481,6 +481,29 @@ describe("normalizeInboundUserMessage", () => {
     const raw = { type: "user_message", text: "hi", id: 5 } as unknown as UserMessageLike;
     expect(normalizeInboundUserMessage(raw)).toEqual({ type: "user_message", text: "hi" });
   });
+
+  it("#243: PRESERVES a string random_id (a known wire field the dedupe reads)", () => {
+    const raw = {
+      type: "user_message",
+      text: "hi",
+      id: "wire-1",
+      random_id: "rand-1",
+      junk: "x",
+    } as unknown as UserMessageLike;
+    // Dropping random_id here would silently defeat the #243 dedupe (it would
+    // always fall back to the wire id), so it must survive the strip.
+    expect(normalizeInboundUserMessage(raw)).toEqual({
+      type: "user_message",
+      text: "hi",
+      id: "wire-1",
+      random_id: "rand-1",
+    });
+  });
+
+  it("#243: drops a non-string random_id (same rule as a non-string id)", () => {
+    const raw = { type: "user_message", text: "hi", id: "w", random_id: 7 } as unknown as UserMessageLike;
+    expect(normalizeInboundUserMessage(raw)).toEqual({ type: "user_message", text: "hi", id: "w" });
+  });
 });
 
 describe("createSerializedInboundDispatcher with coalesce (P1-8b layer b)", () => {

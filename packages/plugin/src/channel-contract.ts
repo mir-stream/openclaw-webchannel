@@ -272,7 +272,14 @@ export type ApprovalRequestPayload = {
 };
 
 export type InboundWsMessage =
-  | { type: "user_message"; text: string; id?: string }
+  // #243 half 1: `random_id` is the client's idempotency key — a fresh token the
+  // client mints per logical user message and reuses on every retry. The plugin's
+  // ingress dedupe keys on it (see `ingressDedupeKey`) instead of the wire `id`.
+  // It is SEPARATE from `id`, which remains the durable id in half 1; half 2 moves
+  // durable-id ownership to the server and this key is what carries retry
+  // idempotency once it can no longer ride the journal's message_id. Optional to
+  // mirror the wire (older clients omit it).
+  | { type: "user_message"; text: string; id?: string; random_id?: string }
   | { type: "approval_decision"; id: string; decision: ApprovalDecision }
   /**
    * Page older history.
