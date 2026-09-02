@@ -1567,9 +1567,11 @@ describe("live == history for approvals: what the plugin serves (#242 half 4)", 
   it("a resolution naming a card the journal does not hold changes nothing", () => {
     // `applyApprovalResolution` no-ops rather than appending a contentless card
     // built from an id and a verdict — that would be the server INVENTING a
-    // message (N8). Unreachable in a full replay (both frames ride the one
-    // `sendToPeer` funnel, so the request row always precedes), and pinned here
-    // because the alternative is the tempting one.
+    // message (N8). Unreachable in a full replay since #341 (both rows are
+    // written at the moment the plugin RECORDS each state change, above the
+    // transport's refusals, so the request row always precedes — before that a
+    // refused request really did leave this orphan), and pinned here because the
+    // alternative is the tempting one.
     const orphan = journalEventForOutbound({
       type: "approval_resolved",
       id: "never-requested",

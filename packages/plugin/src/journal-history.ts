@@ -963,8 +963,10 @@ function recordFirstSeen(
     case "approval":
       // #242 half 4. The card's moment is when the PROMPT WAS SHOWN, not when it
       // was decided — first-write-wins gives exactly that, because the request
-      // row always precedes its resolution in this stream (both frames leave
-      // through the one `sendToPeer` funnel).
+      // row always precedes its resolution in this stream (both rows are written
+      // by `nats-channel.ts`'s `publishApprovalFrame`, at the moment the plugin
+      // records each state change — #341 — so a refused push cannot leave the
+      // resolution here without its request).
       note(event.id);
       return;
     case "approvalResolution":

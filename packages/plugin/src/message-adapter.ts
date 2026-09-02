@@ -2796,14 +2796,27 @@ export function createReasoningDraftController(params: {
   // The mechanism, and nothing beyond it: `sendToPeer`'s three refusal checks —
   // disposed, transport down, no session key — all sit ABOVE `journalOutbound`,
   // so a frame the funnel DECLINES is never offered to the mapper at all. That
-  // is the funnel's shape. It is one generic hook over every frame type, and
-  // from a single refused frame it cannot tell one carrying text an earlier
-  // ACCEPTED frame already delivered (this burst's close frame, which carries
-  // `lastDeliveredText`) from one carrying text the peer never saw. Journaling
-  // refusals wholesale records the second kind — N8, gaining. Journaling only
-  // the first kind requires a distinction the funnel cannot make. Either way it
-  // is a new seam or a second hook, which is NOT-list N6b/N6c, which is why
-  // **#304 needs a design round and not a patch**.
+  // is the funnel's shape. The hook there is generic, and from a single refused
+  // frame it cannot tell one carrying text an earlier ACCEPTED frame already
+  // delivered (this burst's close frame, which carries `lastDeliveredText`) from
+  // one carrying text the peer never saw. Journaling refusals wholesale records
+  // the second kind — N8, gaining. Journaling only the first kind requires a
+  // distinction the funnel cannot make. Either way it is a new seam or a second
+  // hook, which is NOT-list N6b/N6c, which is why **#304 needs a design round
+  // and not a patch**.
+  //
+  // ⚠️ TWO FRAME TYPES DID GET THAT SECOND SEAM (#341), AND THEY ARE NOT A
+  // PRECEDENT FOR THIS ONE — say so here, because "the funnel journals every
+  // frame type the same way" is no longer literally true and the next reader
+  // will find `publishApprovalFrame` and ask. `approval_request` /
+  // `approval_resolved` are appended above the refusals because the approval's
+  // state exists SERVER-SIDE independently of the push (`approvals.ts` records
+  // it in the pending/resolved stores and the register-time `approval_snapshot`
+  // re-delivers from them) and its id is core's, stable across attempts. A
+  // reasoning burst has neither property: its content exists ONLY as text the
+  // transport accepted, which is precisely the distinction named above. The
+  // exception was affordable there because the distinction was already made
+  // elsewhere; here it is not made anywhere.
   //
   // ⚠️ DO NOT WRITE A THIRD JUSTIFICATION HERE. Two have already shipped and
   // both were false, which is the actual lesson of this comment:

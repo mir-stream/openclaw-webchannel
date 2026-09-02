@@ -46,6 +46,24 @@
 
 ### Fixed
 
+- **Approval frames are journaled at the moment the plugin records them, not at
+  publish (#341, extends #304).** `approval_request`/`approval_resolved` were
+  appended inside `sendToPeer`, below its disposed/transport-down/no-session-key
+  refusals, so a refused prompt got no `approval` row while `deliverPending` had
+  already written the pending record and the register-time `approval_snapshot`
+  re-delivered the card live. The user decided, the `approvalResolution` row
+  landed with no `approval` row to fold onto, and history showed neither (N8/N3).
+  The append moved up to `NatsChannel.publishApprovalFrame`, which runs above the
+  refusals and stamps the row's `seq` onto the frame it then publishes;
+  `sendToPeer` skips those two types so no row is written twice, and
+  `deliverPending` passes `{ redelivery }` so a re-armed card is not journaled
+  again (approval rows carry no `message_id`, so nothing downstream would dedupe
+  them — #355). The exception is scoped to these two frame types: an approval's
+  state exists server-side whether or not the push lands and its id is core's,
+  stable across attempts, neither of which holds for the reasoning residual
+  (#304). An account with no live channel has no journal either, so that drop
+  branch still writes no row.
+
 - **A K>=2 count shortfall no longer routes buffered finals onto lanes (#340,
   extends #260).** `flushBufferedOrdinaryFinals` used to fall back to
   `materializedAnswerLanes()` when the finals and the streamed lanes disagreed in

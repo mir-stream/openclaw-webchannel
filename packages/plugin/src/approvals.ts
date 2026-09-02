@@ -209,14 +209,28 @@ function pendingApprovalKey(accountId: string | null | undefined, approvalId: st
   return `${bindingAccountKey(accountId)}${PENDING_APPROVAL_KEY_SEP}${approvalId}`;
 }
 
-/** Record (or refresh) a pending approval; bounded, evicts oldest at the cap. */
+/**
+ * Record (or refresh) a pending approval; bounded, evicts oldest at the cap.
+ *
+ * Returns TRUE when this (account, approvalId) had no record — i.e. this call
+ * CREATED the pending approval rather than refreshing one. #341 uses that to
+ * journal the durable `approval` row exactly once per card: `deliverPending`
+ * passes `{ redelivery: !created }` to `sendApprovalRequest`, and a re-delivery
+ * (stateless register, retry) re-arms the live card without appending a second
+ * row. Nothing downstream can dedupe those rows for us — `delivery-journal.ts`'s
+ * `extractMessageId` has no `approval` arm, so they carry a null `message_id`
+ * and no unique index sees them (#355).
+ */
 function recordPendingApproval(
   accountId: string | null | undefined,
   payload: ApprovalRequestPayload,
   sessionKey: string,
   deliveredAtMs: number,
-): void {
+): boolean {
   const key = pendingApprovalKey(accountId, payload.id);
+  // Read BEFORE the delete-then-set below, which would erase the very distinction
+  // this returns.
+  const created = !pendingApprovals.has(key);
   // Insertion-ordered Map: delete-then-set moves a repeat delivery to the newest
   // slot so a re-delivery refreshes rather than dupes (and never evicts itself).
   pendingApprovals.delete(key);
@@ -245,6 +259,7 @@ function recordPendingApproval(
     accountKey: bindingAccountKey(accountId),
     deliveredAtMs,
   });
+  return created;
 }
 
 /** Erase this account's pending record for an approval (called at finalize). */
@@ -830,11 +845,33 @@ export function createClawApprovalNativeRuntimeSpec(
         // socket" drop below too. A prompt that could not be delivered live thus
         // becomes recoverable on the peer's next register (its register-time
         // `approval_snapshot`) instead of being permanently lost.
-        recordPendingApproval(accountId, pendingPayload, sessionKey, Date.now());
+        //
+        // Since #341 the snapshot is no longer the SOLE carrier of such a card:
+        // the send below journals the durable `approval` row on the same refused
+        // paths, so history holds it too. The record here is still what makes the
+        // card actionable again, and it is what tells the send whether this call
+        // created the card (see `redelivery` below).
+        const created = recordPendingApproval(
+          accountId,
+          pendingPayload,
+          sessionKey,
+          Date.now(),
+        );
         const channel = transportFor(accountId);
         if (!channel) {
           // F2 fail-closed: no live channel for this account (skipped/unknown).
           // Refuse to misroute onto the primary channel; drop with a warn.
+          //
+          // ⚠️ AND THIS BRANCH WRITES NO DURABLE ROW EITHER — #341 did NOT close
+          // this case, and saying so is the point. The delivery journal is opened
+          // per account by `nats-account-runtime.ts` and handed to that account's
+          // channel; "no live channel for this account" therefore means "no
+          // journal for this account" (a lifecycle that failed to start closes the
+          // handle it opened). The pending record above is all this account has,
+          // and the register-time `approval_snapshot` remains its only carrier —
+          // which is exactly the shape #341 fixed for the OTHER refusals. Do not
+          // "fix" it by journaling onto the closure/primary channel: that writes
+          // one account's card into another account's history.
           console.warn(
             `[webchannel] approval ${logSafe(pendingPayload.id)} not delivered: no live channel for ` +
               `account ${logSafe(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)} (skipped or unknown) — refusing to misroute`,
@@ -847,7 +884,16 @@ export function createClawApprovalNativeRuntimeSpec(
         // disconnected between the request and the prompt). The frame is
         // correctly not delivered, and that is otherwise invisible, so log it
         // (no logger in scope here; match the `[webchannel]` console style).
-        const delivered = channel.sendApprovalRequest(sessionKey, pendingPayload);
+        //
+        // #341: the channel journals the `approval` row ABOVE its refusals, so
+        // this call persists the card whether or not the push lands — and
+        // `redelivery` tells it which of these calls CREATED the card, since only
+        // the pending store knows. That keeps the durable row and the pending
+        // record one act: the state is stored when it is created, delivery is a
+        // separate attempt (`nats-channel.ts`'s `publishApprovalFrame`).
+        const delivered = channel.sendApprovalRequest(sessionKey, pendingPayload, {
+          redelivery: !created,
+        });
         if (!delivered) {
           console.warn(
             `[webchannel] approval ${logSafe(pendingPayload.id)} not delivered: no matching open ` +
@@ -886,12 +932,21 @@ export function createClawApprovalNativeRuntimeSpec(
         );
         const channel = transportFor(accountId ?? entry.accountId);
         if (!channel) {
+          // Same shape as `deliverPending`'s F2 branch, and the same residual:
+          // no channel for this account means no journal for it either, so the
+          // verdict lives only in the resolved store above until the snapshot
+          // carries it. See that branch for why journaling elsewhere is worse.
           console.warn(
             `[webchannel] approval ${logSafe(entry.approvalId)} resolve frame dropped: no live channel ` +
               `for account ${logSafe(accountId ?? entry.accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)}`,
           );
           return;
         }
+        // #341: journals the `approvalResolution` row above the transport's
+        // refusals, so the verdict is durable even if the resolve frame is not
+        // published. Its partner `approval` row was written the same way at
+        // delivery, so the pair can no longer come apart (the orphan resolution
+        // `applyApprovalResolution` folds onto nothing was the whole bug).
         channel.sendApprovalResolved(
           entry.sessionKey,
           entry.approvalId,

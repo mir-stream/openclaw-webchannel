@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } from "vitest";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -54,6 +55,18 @@ import {
 import { DEFAULT_WEBCHANNEL_TENANT } from "./account-config.js";
 import { resolveWebchannelSessionRoute } from "./session-route.js";
 import { decodeStrictLogfmt } from "./test-fixtures/strict-logfmt.js";
+// #341 drives the REAL channel, because the approval journal seam lives on it.
+import { NatsChannel } from "./nats-channel.js";
+import type { NatsTransport } from "./nats-transport.js";
+import type { DeliveryJournal } from "./delivery-journal.js";
+import type { JournalEvent } from "./delivery-journal-event.js";
+// The shared reducer, folded here for the same reason `delivery-journal.test.ts`
+// and `message-adapter.test.ts` fold it: it is what a client replays, so it is
+// the only honest statement of "history shows the card and the decision".
+import {
+  reduceDurableView,
+  type DurableEvent,
+} from "../../client/src/durable-view-reducer.js";
 
 // A minimal valid pending exec approval view (the shape core hands to
 // `presentation.buildPendingPayload`). Contract: the
@@ -888,7 +901,9 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
       pendingPayload,
     });
 
-    expect(sentB).toHaveBeenCalledWith("alice", pendingPayload);
+    // #341: the third argument is the record-time signal — this call CREATED the
+    // pending record, so the channel journals the card's row.
+    expect(sentB).toHaveBeenCalledWith("alice", pendingPayload, { redelivery: false });
     expect(sentA).not.toHaveBeenCalled();
     expect(sentFallback).not.toHaveBeenCalled();
     // The entry records the delivering account for the finalize leg.
@@ -964,7 +979,11 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
       view: view as any,
       pendingPayload: buildApprovalRequestPayload(view),
     });
-    expect(onlySent).toHaveBeenCalledWith("web-anon", expect.objectContaining({ id: "exec-legacy" }));
+    expect(onlySent).toHaveBeenCalledWith(
+      "web-anon",
+      expect.objectContaining({ id: "exec-legacy" }),
+      { redelivery: false },
+    );
   });
 
   it("widget-click authz is PER ACCOUNT: account-A approver cannot resolve via account B", async () => {
@@ -2083,5 +2102,215 @@ describe("approval-origin barrier placement (#267)", () => {
     expect(register).toHaveBeenCalledTimes(1);
     abort.abort();
     await monitorPromise;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #341 — a refused approval_request is journaled anyway, so its resolution is
+// never an orphan.
+//
+// The whole slice is about the case the transport REFUSES, so these drive the
+// real `NatsChannel` (a `FakePeerChannel` would journal nothing — the append
+// lives on the channel, at `publishApprovalFrame`) and fold the rows the journal
+// actually received through the SHARED reducer, which is what a client replays.
+// Asserting the rows alone would prove the store was written and not that
+// history shows the card and the consent, which is the bug.
+// ---------------------------------------------------------------------------
+describe("#341 approval rows survive a refused push", () => {
+  /** Transport that can be taken offline mid-test; records published types. */
+  class ToggleTransport extends EventEmitter {
+    connected = true;
+    effectiveOutboundLimit = 1_000_000;
+    readonly published: string[] = [];
+    private sid = 0;
+    subscribe(): number {
+      return ++this.sid;
+    }
+    unsubscribe(): void {
+      /* no-op */
+    }
+    publish(_subject: string, payload: string): void {
+      this.published.push((JSON.parse(payload) as { type: string }).type);
+    }
+  }
+
+  /** Journal stand-in recording the events the channel appends, in order. */
+  class RecordingJournal {
+    readonly events: JournalEvent[] = [];
+    private seq = 0;
+    append(_conversationId: string, event: JournalEvent) {
+      this.events.push(event);
+      return { seq: ++this.seq, inserted: true };
+    }
+    appendInboundUser(): never {
+      throw new Error("not exercised by the approval seam");
+    }
+    lookupUserMessageIdByRandomId(): undefined {
+      return undefined;
+    }
+    read(): [] {
+      return [];
+    }
+    maxSeq(): number {
+      return this.seq;
+    }
+    close(): void {
+      /* no-op */
+    }
+  }
+
+  const PEER = "web-anon";
+
+  function makeChannel(): { transport: ToggleTransport; journal: RecordingJournal; channel: NatsChannel } {
+    const transport = new ToggleTransport();
+    const journal = new RecordingJournal();
+    const channel = new NatsChannel(
+      transport as unknown as NatsTransport,
+      "acct",
+      "tenant",
+      undefined,
+      undefined,
+      { deliveryJournal: journal as unknown as DeliveryJournal },
+    );
+    return { transport, journal, channel };
+  }
+
+  function payload(id: string): ApprovalRequestPayload {
+    return {
+      id,
+      kind: "exec",
+      title: "Exec Approval Required",
+      description: "A command needs your approval.",
+      prompt: "Exec Approval Required: rm -rf /tmp/cache",
+      options: [
+        { decision: "allow-once", label: "Allow Once", style: "success" },
+        { decision: "deny", label: "Deny", style: "danger" },
+      ],
+    };
+  }
+
+  async function deliver(
+    spec: ReturnType<typeof createClawApprovalNativeRuntimeSpec>,
+    p: ApprovalRequestPayload,
+  ) {
+    return spec.transport.deliverPending({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      plannedTarget: {} as any,
+      preparedTarget: { sessionKey: PEER },
+      request: {} as any,
+      approvalKind: "exec",
+      view: fakePendingExecView(p.id) as any,
+      pendingPayload: p,
+    } as any);
+  }
+
+  beforeEach(() => {
+    __pendingApprovalsTestHook.clear();
+    __resolvedApprovalsTestHook.clear();
+    __approvalAccountBindingTestHook.clear();
+  });
+
+  it("journals the card while the transport refuses, then the decision — and history holds both", async () => {
+    const { transport, journal, channel } = makeChannel();
+    const spec = createClawApprovalNativeRuntimeSpec(channel as unknown as any);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // The #341 window: the transport is down when the prompt is delivered, so the
+    // frame is refused and the register-time snapshot is what shows the card.
+    transport.connected = false;
+    const entry = await deliver(spec, payload("exec-341"));
+    expect(transport.published).toEqual([]);
+    expect(journal.events).toEqual([
+      {
+        kind: "approval",
+        id: "exec-341",
+        approvalKind: "exec",
+        title: "Exec Approval Required",
+        description: "A command needs your approval.",
+        prompt: "Exec Approval Required: rm -rf /tmp/cache",
+        options: [
+          { decision: "allow-once", label: "Allow Once", style: "success" },
+          { decision: "deny", label: "Deny", style: "danger" },
+        ],
+      },
+    ]);
+    // The pending record is still written too — the two are one act now.
+    expect(listPendingApprovalsForPeer(null, PEER).map((p) => p.id)).toEqual(["exec-341"]);
+
+    // The peer re-registers, sees the snapshot's card and decides. By now the
+    // transport is back, so the resolve frame really is published.
+    transport.connected = true;
+    await spec.transport.updateEntry!({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      entry,
+      payload: { decision: "allow-once" },
+      phase: "resolved",
+    } as any);
+    warn.mockRestore();
+
+    expect(transport.published).toEqual(["approval_resolved"]);
+    expect(journal.events.map((e) => e.kind)).toEqual(["approval", "approvalResolution"]);
+
+    // ⭐ THE ASSERTION THE ISSUE IS ABOUT. Before #341 the stream was
+    // [approvalResolution] alone, `applyApprovalResolution` folded it onto
+    // nothing, and history showed neither the card nor the consent.
+    const view = reduceDurableView(journal.events as unknown as DurableEvent[]);
+    expect(view).toEqual([
+      {
+        kind: "approval",
+        id: "exec-341",
+        approvalKind: "exec",
+        title: "Exec Approval Required",
+        description: "A command needs your approval.",
+        prompt: "Exec Approval Required: rm -rf /tmp/cache",
+        options: [
+          { decision: "allow-once", label: "Allow Once", style: "success" },
+          { decision: "deny", label: "Deny", style: "danger" },
+        ],
+        resolvedDecision: "allow-once",
+      },
+    ]);
+  });
+
+  it("a re-delivered prompt refreshes the pending record and writes NO second row", async () => {
+    // `deliverPending` runs again for a still-pending card (stateless register /
+    // retry). The card was created once, so the journal holds one row — nothing
+    // downstream could collapse a second one (#355).
+    const { journal, channel } = makeChannel();
+    const spec = createClawApprovalNativeRuntimeSpec(channel as unknown as any);
+
+    const p = payload("exec-redelivered");
+    await deliver(spec, p);
+    await deliver(spec, p);
+
+    expect(journal.events.map((e) => e.kind)).toEqual(["approval"]);
+    expect(listPendingApprovalsForPeer(null, PEER).map((x) => x.id)).toEqual([
+      "exec-redelivered",
+    ]);
+  });
+
+  it("F2 (no live channel for the account) still writes NO row — the residual, pinned", async () => {
+    // Not an oversight: the delivery journal is opened per account and handed to
+    // that account's channel, so "no channel for this account" means "no journal
+    // for this account". The pending record and the snapshot remain its only
+    // carriers. Pinned so a future reader meets the boundary rather than assuming
+    // #341 covered it.
+    const { journal } = makeChannel();
+    const spec = createClawApprovalNativeRuntimeSpec(
+      new FakePeerChannel(),
+      () => undefined,
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await deliver(spec, payload("exec-no-channel"));
+    warn.mockRestore();
+
+    expect(journal.events).toEqual([]);
+    expect(listPendingApprovalsForPeer(null, PEER).map((x) => x.id)).toEqual([
+      "exec-no-channel",
+    ]);
   });
 });

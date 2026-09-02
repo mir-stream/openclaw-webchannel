@@ -1380,17 +1380,26 @@ function applyApproval(
  * content at all, so the "card" would have no title, no prompt and no options.
  * That is the server-side invention N8 forbids.
  *
- * ⚠️ AND IT IS UNREACHABLE IN A FULL REPLAY, WHICH IS WHY THE NO-OP IS SAFE
- * RATHER THAN LOSSY. The resolution is only ever published for an approval this
- * plugin already delivered — `approvals.ts`'s `updateEntry` fires off the entry
- * that `deliverPending` returned — and both frames go out through the SAME
- * `sendToPeer` funnel, so the request row precedes the resolution row in the
- * one ordered stream. `projectJournalHistory` folds the WHOLE journal before it
- * pages (see `historyTail`/`pageBefore`, which slice the projected MESSAGES),
- * so a page boundary cannot separate them either. The reachable case is a
- * client applying a live `approval_resolved` for a card it never received —
- * which is exactly today's behaviour (`patchApproval` maps over the array and
- * matches nothing).
+ * ⚠️ AND IT IS UNREACHABLE IN A FULL REPLAY — BUT NOT FOR THE REASON THIS BLOCK
+ * GAVE FOR THREE SLICES, WHICH WAS FALSE. It read "the resolution is only ever
+ * published for an approval this plugin already delivered — `updateEntry` fires
+ * off the entry that `deliverPending` returned". `deliverPending` returns an
+ * entry on its REFUSED branches too, so a card the transport dropped, re-armed
+ * live by the register-time `approval_snapshot` and then decided by the user
+ * produced exactly the orphan this function no-ops on: live showed the card and
+ * the verdict, history showed neither (#341, N8/N3).
+ *
+ * What makes the no-op safe now is that the pair is written at the moment the
+ * plugin RECORDS the approval, not at the moment it publishes it:
+ * `nats-channel.ts`'s `publishApprovalFrame` appends both rows ABOVE the
+ * transport's refusals, so a request row exists whenever a resolution row does,
+ * and it precedes it in the one ordered stream. `projectJournalHistory` folds
+ * the WHOLE journal before it pages (see `historyTail`/`pageBefore`, which slice
+ * the projected MESSAGES), so a page boundary cannot separate them either.
+ *
+ * The reachable case is a client applying a live `approval_resolved` for a card
+ * it never received — which is exactly today's behaviour (`patchApproval` maps
+ * over the array and matches nothing).
  */
 function applyApprovalResolution(
   view: DurableView,

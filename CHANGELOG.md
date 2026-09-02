@@ -71,6 +71,16 @@
 
 ### Fixed
 
+- **An approval prompt the transport could not deliver now appears in history,
+  with the decision the user made on it (#341, extends #304).** The card was
+  already recorded server-side and re-shown live on the next reconnect, so the
+  user could act on it — but only the *published* frame was stored, so a prompt
+  sent while the connection was down left no record, and the resulting decision
+  attached to nothing. A reloaded transcript then showed the agent running a
+  command with nothing saying anyone authorised it. Approval state is now stored
+  when the plugin records it rather than when it manages to send it, so the card
+  and the consent survive the outage together.
+
 - **A turn whose answer count does not line up no longer loses an answer (#340,
   extends #260).** When a turn ends with two or more finals whose count does not
   match the count of answers that actually streamed — in either direction — the plugin

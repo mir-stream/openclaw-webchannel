@@ -350,9 +350,12 @@ export type OutboundWsMessage =
       /**
        * #244 half A (doc §16.2-6, Telegram pts/qts): the per-conversation
        * contiguous `seq` this frame's DURABLE row was allocated at egress
-       * (`delivery-journal.ts` `append` → `{seq}`), stamped by `sendToPeer` after
-       * the persist-before-publish commit. Monotone within a conversation; a
-       * future client (half B) tracks the last-applied `seq` and detects gaps.
+       * (`delivery-journal.ts` `append` → `{seq}`), stamped immediately after the
+       * persist-before-publish commit — by `sendToPeer` for this frame and every
+       * other durable type, and by `publishApprovalFrame` for the two approval
+       * frames, which commit one layer above it (#341). Monotone within a
+       * conversation; a future client (half B) tracks the last-applied `seq` and
+       * detects gaps.
        *
        * ⚠️ IT RIDES EVERY DURABLE FRAME, NOT JUST THIS ONE, AND CONTIGUITY IS THE
        * REASON. Each frame `journalEventForOutbound` maps to a journal event
@@ -364,7 +367,8 @@ export type OutboundWsMessage =
        * some of them the client's stream would have holes where the others
        * consumed a seq unseen — and half B would read those as phantom gaps and
        * fire a spurious `getDifference`. So the field is declared on all seven and
-       * `sendToPeer` stamps it on whichever frame was actually journaled.
+       * whichever frame was actually journaled is stamped with its row's seq (see
+       * the note above on which method does the stamping).
        *
        * ⚠️ ONE SEQ-CONSUMER IS NOT AN OUTBOUND FRAME: the INBOUND USER opener.
        * `appendInboundUser` allocates from the SAME per-conversation counter, so a
@@ -708,7 +712,26 @@ export interface WebChannelPeerChannel {
     peerId: string,
     message: { id: string; text: string; turnId?: string; seq: number; random_id?: string },
   ): boolean;
-  sendApprovalRequest(peerId: string, request: ApprovalRequestPayload): boolean;
+  /**
+   * #341: `redelivery` says THIS APPROVAL'S STATE IS ALREADY RECORDED — the
+   * caller (`approvals.ts`'s `deliverPending`) found the id already in its
+   * pending store, so this call is a re-arming push of a card the plugin
+   * created earlier, not the creation of one. The implementation journals the
+   * `approval` row only for the CREATING call; a re-delivery publishes without
+   * writing a second row.
+   *
+   * ⚠️ THE CALLER OWNS THIS FACT, NOT THE CHANNEL. Only `approvals.ts` holds the
+   * per-(account, approvalId) record that distinguishes the two, and the journal
+   * cannot: `delivery-journal.ts`'s `extractMessageId` has no `approval` arm, so
+   * approval rows carry a null `message_id` and no unique index can collapse a
+   * duplicate (#355). Omitted ⇒ `false` ⇒ journal, which is the safe default for
+   * any caller that does not track delivery attempts.
+   */
+  sendApprovalRequest(
+    peerId: string,
+    request: ApprovalRequestPayload,
+    options?: { redelivery?: boolean },
+  ): boolean;
   sendApprovalResolved(peerId: string, id: string, decision: ApprovalDecision): boolean;
   sendApprovalSnapshot(peerId: string, approvals: ApprovalRequestPayload[], resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean;
   sendAck?(
@@ -731,7 +754,7 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendHistory(_peerId: string, _messages: HistoryMessage[], _highWaterSeq?: number): boolean { return false; }
   sendDifference(_peerId: string, _events: Array<{ seq: number; event: DurableEvent }>): boolean { return false; }
   sendUserCommitted(_peerId: string, _message: { id: string; text: string; turnId?: string; seq: number; random_id?: string }): boolean { return false; }
-  sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload): boolean { return false; }
+  sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload, _options?: { redelivery?: boolean }): boolean { return false; }
   sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision): boolean { return false; }
   sendApprovalSnapshot(_peerId: string, _approvals: ApprovalRequestPayload[], _resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean { return false; }
   sendAck(_peerId: string, ids: string[], _committed?: Array<{ random_id: string; messageId: string; seq: number }>): boolean { return ids.length === 0; }

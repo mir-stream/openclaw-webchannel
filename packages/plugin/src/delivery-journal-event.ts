@@ -631,8 +631,18 @@ export function journalEventForOutbound(
       // It is a server→client REPLAY of approval state the store already holds,
       // exactly like the `history` case below: journaling it would write the
       // store's own output back into the store, duplicating rows the
-      // `approval`/`approvalResolution` events already carry now that half 4 has
-      // landed. Do not schedule it.
+      // `approval`/`approvalResolution` events already carry. Do not schedule it.
+      //
+      // ⚠️ "THE STORE ALREADY HOLDS IT" WAS NOT TRUE WHEN THIS WAS WRITTEN, and
+      // the gap it left is worth remembering rather than quietly closing. Half 4
+      // journaled approvals inside `sendToPeer`, below its refusals, so a card
+      // the transport refused got NO row while the pending map kept it and this
+      // frame re-delivered it live — the snapshot was then the SOLE carrier of a
+      // card the user saw and acted on, and its resolution landed as an orphan
+      // (#341, N8/N3). #341 moved the append above the refusals
+      // (`nats-channel.ts`'s `publishApprovalFrame`), which is what makes the
+      // premise above hold. The verdict here never changed; only its premise
+      // became true.
       //
       // ⚠️ IT IS ALSO WHAT MAKES A REPLAYED CARD SAFE, so do not read "not
       // durable" as "not load-bearing". `nats-register.ts` sends this frame on
