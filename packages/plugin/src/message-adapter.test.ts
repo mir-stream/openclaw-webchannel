@@ -927,8 +927,10 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     // unprovable landing is never marked authoritative. The OUTCOME — the snapshot
     // republishes "late" over "tail", so the final's text survives in no lane, no
     // independent bubble and no history row — is the pre-existing K==1 hole
-    // (this test passes identically against develop's adapter), tracked with
-    // `finalize`'s precondition and #262, and it is NOT the intended render. The
+    // (this test passes identically against develop's adapter), tracked only as
+    // the #260/#262 family — nothing names this K==1 late-partial erasure, because
+    // the ordering cannot occur on the real seam — and it is NOT the intended
+    // render. The
     // ordering itself does not occur on the real seam: core emits the turn-end
     // finals after the run's partials (`[core] dispatch-from-config.ts` builds
     // `replies` once the run has ended), so a partial cannot follow its own

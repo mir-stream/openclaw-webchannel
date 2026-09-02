@@ -749,8 +749,9 @@ export function createProgressDraftController(params: {
   // already represented by a lane in the `turn_snapshot`. Since #238 there is
   // exactly ONE producer — the failed-lane recovery block in
   // `deliverAuthorizedBlock`, the only `sendIndependent(…, { supersedesAnswerLane })`
-  // call — whose lane is in `answers` by its streamed text. (The overflow-final producer is gone: its
-  // flag's value was `streamed.length === finals.length`, unreachable at an
+  // call — whose lane is in `answers` by its streamed text. (The overflow-final
+  // producer is gone: its flag's value was `streamed.length === finals.length`,
+  // unreachable at an
   // overflow under the new candidate list.) The snapshot names these in `remove`
   // so the client drops exactly them and preserves every other agent bubble
   // (notices/errors). A missed id leaves a corruption bubble; a wrongly-added id
@@ -1761,10 +1762,11 @@ export function createProgressDraftController(params: {
   //    corruption-immune `streamedAnswerText`.
   //  - `remove` = the ids of independent bubbles that PROVABLY duplicate a lane in
   //    `answers` — since #238 that is exactly one shape, the failed-lane recovery
-  //    block. An overflow final is NOT one of them, and deliberately so: it MAY
-  //    duplicate a lane here (measured — see the flush's overflow branch), but the
-  //    flush cannot tell when, and a visible duplicate is recoverable where a
-  //    deletion is not (M212g). The client drops ONLY these and preserves every
+  //    block. A final with no target (the flush's no-target branch — on a
+  //    shortfall, every final) is NOT one of them, and deliberately so: it
+  //    duplicates a lane here whenever its own lane streamed (measured, and since
+  //    #340 routinely), but the flush cannot tell which, and a visible duplicate
+  //    is recoverable where a deletion is not (M212g). The client drops ONLY these and preserves every
   //    other agent bubble.
   //
   // Case X (K==1) is DELIBERATELY not addressed: it is byte-identical to the
@@ -1814,11 +1816,11 @@ export function createProgressDraftController(params: {
     }
   };
 
-  // #238: this used to forward a `supersedesAnswerLane` option for the
-  // overflow-final site. The flag's old value there was `streamed.length ===
-  // finals.length`, which under the new candidate list cannot hold at an overflow
-  // (see the flush's overflow branch) — so the option had no reachable true case
-  // here and is gone. That is a CARDINALITY argument and only that: do NOT
+  // #238: this used to forward a `supersedesAnswerLane` option for the flush's
+  // no-target site. The flag's old value there was `streamed.length ===
+  // finals.length`, which cannot hold when a final has no target (an empty
+  // `targets` means the counts disagree) — so the option had no reachable true
+  // case here and is gone. That is a CARDINALITY argument and only that: do NOT
   // paraphrase it as "an overflow final's content never streamed", which is
   // measured false and is the premise that would justify deleting the bubble.
   // EVERY bubble this function produces (leading error, stray extra, notice,
@@ -1975,8 +1977,9 @@ export function createProgressDraftController(params: {
     finals.forEach((text, index) => {
       const target = targets[index];
       if (!target) {
-        // #238: this final has no target — it ran past the end of the candidate
-        // list, or (#340) the list is empty because the counts disagree. No
+        // #238/#340: this final has no target, which since #340 means the
+        // candidate list is EMPTY because the counts disagree (the only way here:
+        // K==1 has one target, an exact K>=2 has one per final). No
         // `supersedesAnswerLane` is passed, and the reason is pure CARDINALITY, not
         // provenance: the flag's old value was `streamed.length === finals.length`,
         // and reaching here requires `targets.length < finals.length` — which on
