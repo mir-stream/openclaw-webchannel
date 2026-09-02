@@ -872,10 +872,10 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(finalTextsOn(idA)).toEqual(["A"]);
     expect(finalTextsOn(idC)).toEqual(["C"]);
     // Three DISTINCT independent bubbles, in core's array order.
-    const overflowIds = h.frames
+    const independentIds = h.frames
       .filter((f) => f.id !== idA && f.id !== idC)
       .map((f) => f.id);
-    expect(new Set(overflowIds).size).toBe(3);
+    expect(new Set(independentIds).size).toBe(3);
     expect(bubbleOrder(h.frames)).toEqual(["A", "C", "tA", "tB", "tC"]);
 
     // The snapshot republishes only the two streamed lanes, with their streamed

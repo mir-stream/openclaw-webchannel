@@ -751,8 +751,8 @@ export function createProgressDraftController(params: {
   // `deliverAuthorizedBlock`, the only `sendIndependent(…, { supersedesAnswerLane })`
   // call — whose lane is in `answers` by its streamed text. (The overflow-final
   // producer is gone: its flag's value was `streamed.length === finals.length`,
-  // unreachable at an
-  // overflow under the new candidate list.) The snapshot names these in `remove`
+  // unreachable at an overflow under the new candidate list.) The snapshot names
+  // these in `remove`
   // so the client drops exactly them and preserves every other agent bubble
   // (notices/errors). A missed id leaves a corruption bubble; a wrongly-added id
   // would lose content — captured ONLY at that one mint site, never from a
@@ -1764,10 +1764,10 @@ export function createProgressDraftController(params: {
   //    `answers` — since #238 that is exactly one shape, the failed-lane recovery
   //    block. A final with no target (the flush's no-target branch — on a
   //    shortfall, every final) is NOT one of them, and deliberately so: it
-  //    duplicates a lane here whenever its own lane streamed (measured, and since
-  //    #340 routinely), but the flush cannot tell which, and a visible duplicate
-  //    is recoverable where a deletion is not (M212g). The client drops ONLY these and preserves every
-  //    other agent bubble.
+  //    duplicates a lane here whenever its final equals its streamed text — the
+  //    normal case — but the flush cannot tell which, and a visible duplicate is
+  //    recoverable where a deletion is not (M212g). The client drops ONLY these
+  //    and preserves every other agent bubble.
   //
   // Case X (K==1) is DELIBERATELY not addressed: it is byte-identical to the
   // legitimate non-streaming-last collapse (M173c/M15a/M15b), so its tool bubble
@@ -1824,7 +1824,7 @@ export function createProgressDraftController(params: {
   // paraphrase it as "an overflow final's content never streamed", which is
   // measured false and is the premise that would justify deleting the bubble.
   // EVERY bubble this function produces (leading error, stray extra, notice,
-  // overflow final) is preserved by the client. `sendIndependent` keeps the option
+  // no-target final) is preserved by the client. `sendIndependent` keeps the option
   // for its one remaining user, the failed-lane recovery block in
   // `deliverAuthorizedBlock` (the only `sendIndependent(…, { supersedesAnswerLane })`
   // call), whose duplicate IS provable.
