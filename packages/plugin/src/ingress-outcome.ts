@@ -24,6 +24,18 @@ export type IngressOutcomeFailureWarning = (
   accountId: string,
   category: IngressOutcomeFailureCategory,
 ) => void;
+/**
+ * ⚠️ `{status:"found", outcome:"accepted"}` IS NOT PROOF THAT THE MESSAGE WAS
+ * ACCEPTED (#292, #344). This store is an OPTIMIZATION LAYER over the delivery
+ * journal, which is the SSOT for user messages (doc §15.7): `record()` persists
+ * its marker through the SDK store the moment it is called, and the accept
+ * seam's journal row is written later, so a crash — or any build that recorded
+ * markers before the journal existed — can leave a marker with no row. The
+ * journal is the authority on that disagreement; `ingress-dedupe.ts`'s
+ * found/accepted branch consults it and re-admits when the row is missing. A
+ * caller that treats this result as a terminal accept without the same check is
+ * reintroducing #344.
+ */
 export type OutcomeLookup =
   | { status: "found"; outcome: IngressOutcome }
   | { status: "not-found" }

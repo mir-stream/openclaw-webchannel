@@ -21,18 +21,42 @@
  * THE CRASH WINDOW (deliberate at-most-once tradeoff — stated honestly).
  * `checkAndRecord` records the id BEFORE the turn runs. So there is a narrow
  * window — from the record to the turn actually starting — where a PROCESS CRASH
- * loses the message permanently: on restart the P0-7b replay queue re-sends the
- * SAME id, we see it as already-recorded, and drop it — deduping away the very
- * message the replay queue exists to recover. We accept this because the
- * alternative (claim/commit: record only AFTER the turn's effect persists)
- * trades this rare case for a far worse-in-practice one — it RE-ADMITS duplicates
- * on every crash-AFTER-effect and every partial-delivery, which are much more
- * common than crash-in-window, and rationale (b) means a per-id commit/rollback
- * is wrong for merged turns anyway. Crucially the loss window here is
- * record→turn-start — sub-millisecond on the serialized flush path — versus the
- * wide duplicate-turn window claim/commit would open (record→effect-persisted,
- * spanning the whole agent run). Narrow at-most-once beats wide at-least-once for
- * this surface. This deviation from the sketch is deliberate and settled.
+ * used to lose the message permanently: on restart the P0-7b replay queue
+ * re-sends the SAME id, we saw it as already-recorded, and dropped it — deduping
+ * away the very message the replay queue exists to recover. We accepted this
+ * because the alternative (claim/commit: record only AFTER the turn's effect
+ * persists) trades this rare case for a far worse-in-practice one — it RE-ADMITS
+ * duplicates on every crash-AFTER-effect and every partial-delivery, which are
+ * much more common than crash-in-window, and rationale (b) means a per-id
+ * commit/rollback is wrong for merged turns anyway. Crucially the loss window
+ * here is record→turn-start — sub-millisecond on the serialized flush path —
+ * versus the wide duplicate-turn window claim/commit would open
+ * (record→effect-persisted, spanning the whole agent run). Narrow at-most-once
+ * beats wide at-least-once for this surface. That deviation from the sketch is
+ * deliberate and settled, and the ORDER is unchanged.
+ *
+ * ⚠️ WHAT CHANGED IS THAT THE WINDOW NOW HEALS (#344), FOR MOST OF IT. The
+ * production outcome/lease branch no longer treats an `accepted` marker as proof
+ * of an accept: the journal is the SSOT (doc §15.7), so when a marker has no
+ * journal row for the item's `random_id`, the replay is RE-ADMITTED — journaled,
+ * dispatched, acked with a fresh `committed` echo — instead of being re-acked as
+ * a duplicate. A crash anywhere between the marker and the row is therefore
+ * recovered by the client's very next replay. See the found/accepted branch in
+ * the item loop and the footer's ordering block (which also states the cost:
+ * a marker with no row re-runs its turn ONCE).
+ *
+ * ⚠️ THREE THINGS THE HEALING DOES NOT COVER, so this heading is not retired.
+ *  1. AN ITEM WITH NO `random_id`. Its journal row is keyed by the wire id,
+ *     which `lookupUserMessageIdByRandomId` cannot query, so absence proves
+ *     nothing and the marker still wins. Older clients only.
+ *  2. THE ID-LESS ADMIT PATH. No usable wire id ⇒ no dedupe key ⇒ neither a
+ *     marker nor a row is ever written for it, so there is nothing here to heal;
+ *     the item is admitted un-deduped and reported as a gap exactly as before
+ *     (see `journalGap("no-usable-id")` and its call site for the owning issue).
+ *  3. THE LEGACY BOOLEAN-DEDUPE BRANCH at the bottom of this file
+ *     (`filterFreshInboundItems`), which has no journal and no outcome store —
+ *     it still drops a crash-window replay exactly as the paragraph above
+ *     describes.
  */
 
 /**
@@ -379,7 +403,17 @@ type JournalWarning =
    * batch — hiding precisely the reason nothing else is tracking.
    */
   | "unjournalable-user-id"
-  | "unjournalable-user-text";
+  | "unjournalable-user-text"
+  /**
+   * #344 — an `accepted` outcome marker with NO journal row for the same
+   * `random_id`. The journal is the accept authority, so the marker is not
+   * evidence of an accept: the item is RE-ADMITTED (journaled, dispatched,
+   * acked with a fresh `committed` echo) instead of being re-acked as a
+   * duplicate. Its own member because it is a recovery, not a gap — nothing is
+   * lost when it fires — and because sharing a window with the
+   * `unjournalable-*` lines would let either hide the other.
+   */
+  | "orphaned-accept-marker";
 
 /** Match `ingress-outcome.ts`'s limiter and `nats-channel.ts`'s journal warnings. */
 const JOURNAL_WARNING_INTERVAL_MS = 60_000;
@@ -390,9 +424,12 @@ const JOURNAL_WARNING_INTERVAL_MS = 60_000;
  * uses in this file's imports.
  *
  * Throttled because every category is PEER-DRIVEN at full ingress rate: each
- * `unjournalable-user-*` line fires once per malformed frame, and a failing
- * store fails for every batch. One line per inbound message would bury the log
- * the `#123` discipline exists to keep readable.
+ * `unjournalable-user-*` line fires once per malformed frame, a failing store
+ * fails for every batch, and `orphaned-accept-marker` fires once per replayed
+ * item whenever the marker store and the journal disagree in bulk (a cut-over or
+ * erased journal file makes that EVERY replay in the client's ledger). One line
+ * per inbound message would bury the log the `#123` discipline exists to keep
+ * readable.
  *
  * One limiter per `createIngressOnFlush`, i.e. per ACCOUNT — so a broken account
  * cannot silence a healthy one, but WITHIN an account the window is shared across
@@ -411,6 +448,7 @@ function createRateLimitedJournalWarning(
     "append-failed": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
     "unjournalable-user-id": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
     "unjournalable-user-text": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
+    "orphaned-accept-marker": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
   };
   return (category, body) => {
     const entry = state[category];
@@ -441,7 +479,10 @@ function createRateLimitedJournalWarning(
  * serialized flush path, not the raw handler.
  *
  * PRODUCTION outcome/lease branch, per flush batch:
- *  - lookup the durable accepted/overloaded outcome before admission;
+ *  - lookup the durable accepted/overloaded outcome before admission — and, for
+ *    an `accepted` one, CONFIRM IT AGAINST THE JOURNAL, which is the authority
+ *    (#344): a marker with no row for the item's `random_id` is not an accept,
+ *    so the item is re-admitted down the fresh path instead of re-acked;
  *  - offer fresh work against the dispatcher lease and record exactly one chosen
  *    outcome before committing the lease;
  *  - commit each FRESH admission's `user` event to the v6 delivery journal —
@@ -722,6 +763,11 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           // what a fresh admission is journaled under and what a retry echoes by.
           // Absent for an older client that sent none — then there is no echo.
           const randomId = usableId(item.message.random_id) ? item.message.random_id : undefined;
+          // #344: set when the found/accepted branch below refuses the marker as
+          // evidence and falls through to the fresh-accept path. The only thing
+          // it changes downstream is that this key already carries a durable
+          // `accepted` marker, which matters to the overloaded record.
+          let readmitted = false;
 
           // A cancellation tombstone is authoritative and must run before an
           // ordinary outcome lookup or dispatcher admission. It represents text
@@ -785,42 +831,85 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             continue;
           }
           if (existing.status === "found") {
-            release();
             // Deferred to the footer like every other result — see `ackIds`.
-            // A REPLAY's ack is therefore also withheld when a fresh sibling's
+            // A REPLAY's result is therefore also withheld when a fresh sibling's
             // journal write fails. Deliberate, and harmless: the batch retries
-            // whole, and this id's durable outcome is already `accepted`, so the
-            // replay simply lands here again and acks then.
-            if (existing.outcome === "accepted") {
+            // whole and this id's durable outcome is unchanged, so the replay
+            // lands here again and is classified again — acked, rejected, or
+            // (#344, below) re-admitted, whichever the two stores then say.
+            if (existing.outcome !== "accepted") {
+              release();
+              rejectedIds.push(id);
+              continue;
+            }
+            // #243 half 2a — THE DEDUPED-RETRY ECHO. The retry is caught here,
+            // BEFORE any re-append, so it must not mint a fresh id or write a
+            // second row (a new id would slip past the journal's
+            // `journal_user_idempotency_once` guard, whose key is the OLD
+            // `random_id`, and duplicate the durable message). Instead recover
+            // the id the FIRST admission minted, from the row, and echo the SAME
+            // value.
+            //
+            // #244 half A: the lookup now returns the first admission's `seq`
+            // alongside its `messageId`, and the retry echoes BOTH unchanged —
+            // never a fresh seq, exactly as it never mints a fresh id.
+            const committed = randomId !== undefined && deps.deliveryJournal
+              ? deps.deliveryJournal.lookupUserMessageIdByRandomId(peerId, randomId)
+              : undefined;
+            // ⭐ #344 — THE JOURNAL IS THE DEDUPE AUTHORITY; THE MARKER IS AN
+            // OPTIMIZATION LAYER. The Telegram server dedupes a re-sent message
+            // by `random_id` against the messages it has STORED — the stored
+            // message IS the dedupe record, so there is no marker that can
+            // outlive it. Our marker CAN: `record()` persists it through the SDK
+            // store before the footer's `appendInboundUser` runs (that order is
+            // deliberate and stays — see the footer's ordering block), so a crash
+            // between the two leaves an `accepted` marker with no row. Re-acking
+            // on that marker is what made the message absent from the SSOT
+            // forever while the origin device kept a "sent" bubble (#344, the
+            // crash door onto #292).
+            //
+            // So: marker says accepted, the item carries a `random_id`, this
+            // seam HAS a journal, and the journal has no row for it ⇒ it was NOT
+            // accepted. Fall through to the fresh-accept path, which journals it
+            // and dispatches the turn. Nothing here is a second journal call
+            // site: the one append stays in the footer.
+            //
+            // The three ways out of the check, and why each still acks:
+            //  - no `random_id` (an older client): its rows are keyed by the wire
+            //    id, which this lookup cannot query, so absence proves nothing.
+            //    Unchanged behaviour — ack, no echo.
+            //  - no `deps.deliveryJournal` (P0-7a wiring, and this file's own
+            //    pre-journal tests): there is no authority to consult.
+            //  - a row exists: the ordinary deduped retry, re-echoing the FIRST
+            //    admission's id and seq.
+            const orphanedMarker =
+              randomId !== undefined && deps.deliveryJournal !== undefined && committed === undefined;
+            if (!orphanedMarker) {
+              release();
               ackIds.push(id);
-              // #243 half 2a — THE DEDUPED-RETRY ECHO. The retry is caught here,
-              // BEFORE any re-append, so it must not mint a fresh id or write a
-              // second row (a new id would slip past `journal_user_once`, whose
-              // key is the OLD id, and duplicate the durable message). Instead
-              // recover the id the FIRST admission minted, from the row's
-              // `random_id`, and echo the SAME value. Absent lookup ⇒ no echo but
-              // still acked: an older client with no `random_id`, or the #275
-              // window skew where the outcome marker outlived the row's presence
-              // in this store — neither of which the client consumes in 2a anyway.
-              //
-              // #244 half A: the lookup now returns the first admission's `seq`
-              // alongside its `messageId`, and the retry echoes BOTH unchanged —
-              // never a fresh seq, exactly as it never mints a fresh id.
-              if (randomId !== undefined && deps.deliveryJournal) {
-                const committed = deps.deliveryJournal.lookupUserMessageIdByRandomId(
-                  peerId,
-                  randomId,
-                );
-                if (committed !== undefined) {
-                  committedBatch.push({
-                    random_id: randomId,
-                    messageId: committed.messageId,
-                    seq: committed.seq,
-                  });
-                }
+              if (randomId !== undefined && committed !== undefined) {
+                committedBatch.push({
+                  random_id: randomId,
+                  messageId: committed.messageId,
+                  seq: committed.seq,
+                });
               }
-            } else rejectedIds.push(id);
-            continue;
+              continue;
+            }
+            // Per item, throttled by category like every other journal warning.
+            // It is a RECOVERY, not a loss: the line exists because the marker
+            // and the journal disagreed, which is either the crash window above
+            // or a marker minted by a pre-journal build, and an operator seeing
+            // a run of these is seeing turns re-run (see the footer's ordering
+            // block for the bounded cost).
+            warnJournal(
+              "orphaned-accept-marker",
+              "webchannel: accepted outcome marker has no journal row, re-admitting " +
+                `peer=${logSafe(peerId)} random_id=${logSafe(randomId)} ` +
+                "action=journal-is-authoritative-turn-re-runs-once",
+            );
+            readmitted = true;
+            // Fall through to the fresh-accept path below, reservation still held.
           }
 
           const offer = lease.offer(item.message, reservation);
@@ -831,7 +920,19 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           if (offer.status === "rejected") {
             let result: OutcomeRecordResult | undefined;
             try {
-              result = await deps.outcomeStore.record(accountId, key, "overloaded");
+              // #344: a re-admitted item (see the found/accepted branch) still
+              // carries its old `accepted` marker. Recording `overloaded`
+              // alongside it would create the dual terminal outcome
+              // `lookupUnlocked` treats as an invariant violation, so replace it
+              // — exactly what the cancelled-inbound fallback does in the other
+              // direction. `replaceOpposite` fails CLOSED (`status: "unknown"`),
+              // which lands on the same FIFO barrier below.
+              result = await deps.outcomeStore.record(
+                accountId,
+                key,
+                "overloaded",
+                readmitted ? { replaceOpposite: true } : undefined,
+              );
             } catch {
               warnOutcomeFailure(accountId, "adapter-record-overloaded");
               // The same FIFO barrier below handles thrown adapters and explicit
@@ -891,13 +992,15 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // direction, the same class of error NOT-list N6b records (the
             // egress seam's own two-round mistake).
             //
-            // The `existing.status === "found"` branch above is deliberately NOT
-            // collected: it is not a fresh admission of new text, so this seam is
-            // not its journal author, and collecting it would only add a second
-            // call site. (It would NOT merely be a `journal_user_once` no-op —
-            // that holds only where a row already exists, and #292 is precisely
-            // the case where one does not. Do not read this as "a hook here
-            // would be inert"; #292 may well want one.)
+            // STILL THE ONLY COLLECTION SITE, and #344 is why that survived a
+            // second demand for one. The `existing.status === "found"` branch
+            // above has a case that DOES need a row — an `accepted` marker with
+            // no journal row, which #292 named and #344 measured a crash door
+            // onto — but it gets there by FALLING THROUGH to this path rather
+            // than by a hook of its own. So a re-admitted item is journaled by
+            // this exact line, under the same rules, and "a deduped retry writes
+            // no row" stays true: a retry that reaches this line was, by the
+            // journal's own verdict, never accepted.
             if (deps.deliveryJournal) {
               journalPending.push({ wireId: id, randomId, text: item.message.text });
             }
@@ -932,17 +1035,48 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         //
         // The plugin is the ONLY SSOT for user messages, so a durable journal
         // write is a HARD REQUIREMENT of accepting one, not best-effort: a user
-        // message that is not in the journal WAS NOT ACCEPTED. It runs BEFORE
-        // `pendingWrites` commit because §15.7's ordering is journal-first →
-        // then confirm; the dedupe/outcome store is explicitly an optimization
-        // layer whose authority the journal supersedes.
+        // message that is not in the journal WAS NOT ACCEPTED.
+        //
+        // ⚠️ §15.7's "journal-first → then confirm" IS ABOUT THE WIRE, NOT THE
+        // STORE, AND THIS BLOCK USED TO CONFLATE THEM (#344). On the wire the
+        // ordering holds exactly: the append runs here, above `pendingWrites`
+        // commit and above the only place either chunk writer is touched, so no
+        // ack leaves before the row is durable. In the STORE the ordering is the
+        // other way round — `outcomeStore.record(…, "accepted")` in the item loop
+        // persists its marker through the SDK store at that moment, so the
+        // durable sequence is marker-first, row-second, and a crash between them
+        // leaves an `accepted` marker with no row.
+        //
+        // THAT ORDER STAYS. Writing the row first would open the mirror window
+        // instead: a row with no marker, which a replay reads as a FRESH
+        // admission — `appendInboundUser` collapses onto the existing row
+        // (`inserted: false`) but the offer is still dispatched, so the same text
+        // gets one user row and two answers. That is not hypothetical; it is the
+        // marker-eviction bullet #355 already carries, and reordering here would
+        // add a crash door onto it.
+        //
+        // WHAT CHANGED IS THE RULE FOR READING THE TWO WHEN THEY DISAGREE: the
+        // journal is the authority and the marker is an optimization layer, so an
+        // `accepted` marker with no row is not evidence of an accept. The
+        // found/accepted branch in the item loop enforces it — it consults this
+        // journal and re-admits (journals + dispatches) rather than re-acking.
+        // That check is what makes the crash window the file header describes
+        // HEAL on the client's replay instead of losing the message forever.
+        //
+        // ⚠️ THE COST, STATED: a marker with no row is re-admitted, so a marker
+        // left by a PRE-JOURNAL plugin version — or one whose row is gone (an
+        // erased or cut-over journal file, doc §15.6) — re-runs that message's
+        // turn ONCE on its next replay instead of silently dropping it. Bounded
+        // by the marker store's 7-day TTL and by the client's ledger (only a
+        // message the client is still replaying can reach this at all).
         //
         // ⚠️ THE ASYMMETRY WITH THE EGRESS SEAM IS DELIBERATE AND IS THE WHOLE
         // POINT OF THIS BLOCK. At egress (§15.8, `nats-channel.ts`'s
         // `journalOutbound`) a journal failure must NEVER change the send
-        // result — log, never throw, never return `false` — because by then the
-        // text has already left for the client and refusing would lose delivered
-        // text (N10). HERE nothing this seam is the SSOT for has been confirmed
+        // result — log, never throw, never return `false` — because the journal
+        // write PRECEDES the publish there, and blocking the push on a faulted
+        // history write would turn one missing history row into a lost LIVE
+        // message (N8, losing). HERE nothing this seam is the SSOT for has been confirmed
         // to anyone yet: no chunk-writer result is on the wire, no turn has run,
         // and the journal is the authority that decides whether the message
         // exists at all. So here a journal failure IS an accept failure.

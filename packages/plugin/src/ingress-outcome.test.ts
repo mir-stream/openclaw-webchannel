@@ -230,6 +230,34 @@ describe("IngressOutcomeStore", () => {
     expect(await store.lookup("a", "p:i")).toEqual({ status: "found", outcome: "accepted" });
   });
 
+  it("re-recording an EXISTING accepted marker still reports `recorded`, as a follower", async () => {
+    // #344's accept path depends on this shape. When the journal has no row for
+    // a marked `random_id`, `ingress-dedupe.ts` re-admits the message down the
+    // FRESH path — which calls `record(…, "accepted")` for a key that is already
+    // marked. If that answered anything but `status: "recorded"` the seam would
+    // stall on its FIFO barrier and the message would never be journaled, so the
+    // recovery rests on this contract rather than on a fresh insert.
+    const accepted = fake(); const overloaded = fake();
+    const store = createIngressOutcomeStore({ accepted: accepted.store, overloaded: overloaded.store });
+
+    const first = await store.record("a", "p:i", "accepted");
+    if (first.status !== "recorded") throw new Error("first write unexpectedly unknown");
+    expect(first.write.created).toBe(true);
+    first.write.commit();
+
+    const again = await store.record("a", "p:i", "accepted");
+    if (again.status !== "recorded") throw new Error("re-record unexpectedly unknown");
+    // A FOLLOWER: durable and usable, but it did not create the marker...
+    expect(again.durability).toBe("durable");
+    expect(again.write.created).toBe(false);
+    // ...so its rollback has no authority to delete it. That is what makes a
+    // refused re-admission batch safe: the marker survives, and the next replay
+    // takes the same recovery path instead of hitting a wiped outcome store.
+    expect(await again.write.rollback()).toBe(false);
+    expect(accepted.values.has("a:p:i")).toBe(true);
+    expect(await store.lookup("a", "p:i")).toEqual({ status: "found", outcome: "accepted" });
+  });
+
   it.each(["accepted", "overloaded"] as const)(
     "quarantines a %s marker after rollback deletion fails until exact cleanup recovers",
     async (outcome) => {
