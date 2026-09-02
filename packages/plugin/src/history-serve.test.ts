@@ -25,8 +25,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import { openDeliveryJournal, type DeliveryJournal } from "./delivery-journal.js";
 import type { JournalEvent } from "./delivery-journal-event.js";
 import { DEFAULT_HISTORY_CONFIG, type HistoryMessage } from "./history.js";
+import type { DifferenceReply } from "./channel-contract.js";
 import {
   createHistoryServer,
+  MAX_DIFFERENCE_EVENTS,
   type HistoryChannelSurface,
   type HistoryServerDeps,
 } from "./history-serve.js";
@@ -92,26 +94,36 @@ function thread(prefix: string): JournalEvent[] {
 function recordingChannel(limit = 8 * 1024 * 1024): {
   channel: HistoryChannelSurface;
   sent: Array<{ peerId: string; messages: HistoryMessage[]; highWaterSeq?: number }>;
-  // #244 half B: the `difference` frames the serve path emitted.
-  differences: Array<{ peerId: string; events: Array<{ seq: number; event: unknown }> }>;
+  // #244 half B / #356: the `difference` frames the serve path emitted, with the
+  // whole reply body — the echo and the two catch-up signals are as much of the
+  // contract as the events are.
+  differences: Array<{ peerId: string } & DifferenceReply>;
+  /** #348: every `outboundWireSize` call, i.e. every seal the byte fit paid for. */
+  measurements: number;
 } {
   const sent: Array<{ peerId: string; messages: HistoryMessage[]; highWaterSeq?: number }> = [];
-  const differences: Array<{ peerId: string; events: Array<{ seq: number; event: unknown }> }> = [];
+  const differences: Array<{ peerId: string } & DifferenceReply> = [];
+  const counter = { n: 0 };
   return {
     sent,
     differences,
+    get measurements() {
+      return counter.n;
+    },
     channel: {
       // #244 half A: capture the high-water baseline the snapshot path stamps.
       sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number) {
         sent.push({ peerId, messages, highWaterSeq });
         return true;
       },
-      sendDifference(peerId, events) {
-        differences.push({ peerId, events });
+      sendDifference(peerId, reply) {
+        differences.push({ peerId, ...reply });
         return true;
       },
-      outboundWireSize: (_peerId, payload) =>
-        Buffer.byteLength(JSON.stringify(payload), "utf8"),
+      outboundWireSize: (_peerId, payload) => {
+        counter.n += 1;
+        return Buffer.byteLength(JSON.stringify(payload), "utf8");
+      },
       effectiveOutboundLimit: () => limit,
     },
   };
@@ -145,7 +157,8 @@ function harness(
   overrides: Partial<HistoryServerDeps> = {},
   channelLimit?: number,
 ) {
-  const { channel, sent, differences } = recordingChannel(channelLimit);
+  const recording = recordingChannel(channelLimit);
+  const { channel, sent, differences } = recording;
   const scheduler = manualScheduler();
   const errors: string[] = [];
   const warns: string[] = [];
@@ -160,7 +173,20 @@ function harness(
     schedule: scheduler.schedule,
     ...overrides,
   });
-  return { server, sent, differences, scheduler, errors, warns };
+  return { server, sent, differences, scheduler, errors, warns, recording };
+}
+
+/**
+ * #356 — drive one `get_difference` end to end. `serveDifference` is DEFERRED
+ * now (it was inline before this slice), so every call site has to flush.
+ */
+function serveDifference(
+  h: ReturnType<typeof harness>,
+  afterSeq: number,
+  nonce = "nonce-a",
+): void {
+  h.server.serveDifference(PEER, afterSeq, nonce);
+  h.scheduler.flush();
 }
 
 describe("createHistoryServer — peer scoping (the assertion the old test could not make)", () => {
@@ -755,20 +781,20 @@ describe("createHistoryServer — a publish failure is not blamed on the journal
 });
 
 // ---------------------------------------------------------------------------
-// #244 half B — serveDifference (get_difference catch-up)
+// #244 half B / #356 — serveDifference (get_difference catch-up)
 // ---------------------------------------------------------------------------
-describe("createHistoryServer.serveDifference — #244 half B", () => {
+describe("createHistoryServer.serveDifference — #244 half B / #356", () => {
   it("serves RAW events with seq > afterSeq, in seq order, WITHOUT running the reducer", () => {
     const journal = openJournal();
     // thread("a") = [user a1, bubble a2, user a3] → seqs 1, 2, 3.
     const appended = thread("a");
     for (const event of appended) journal.append(PEER, event);
 
-    const { server, differences } = harness(journal);
-    server.serveDifference(PEER, 1);
+    const h = harness(journal);
+    serveDifference(h, 1);
 
-    expect(differences).toHaveLength(1);
-    const { peerId, events } = differences[0];
+    expect(h.differences).toHaveLength(1);
+    const { peerId, events } = h.differences[0];
     expect(peerId).toBe(PEER);
     // seq > 1 only: the bubble (seq 2) and the follow-up user (seq 3).
     expect(events.map((e) => e.seq)).toEqual([2, 3]);
@@ -783,32 +809,60 @@ describe("createHistoryServer.serveDifference — #244 half B", () => {
     expect((events[0].event as { role?: unknown }).role).toBeUndefined();
   });
 
+  it("#351 — echoes the request's afterSeq and nonce verbatim, so a device can recognise its own reply", () => {
+    // The shared `.out` fan-out means every device of the peer receives this
+    // frame. The echo is the ONLY thing that tells them apart, so it must be
+    // exactly what was asked, not a value the server re-derived.
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    const h = harness(journal);
+    serveDifference(h, 1, "device-a-7f3c");
+    expect(h.differences[0].afterSeq).toBe(1);
+    expect(h.differences[0].nonce).toBe("device-a-7f3c");
+
+    serveDifference(h, 2, "device-b-91aa");
+    expect(h.differences[1].afterSeq).toBe(2);
+    expect(h.differences[1].nonce).toBe("device-b-91aa");
+  });
+
+  it("#356 — a complete reply is partial:false and carries the journal's maxSeq", () => {
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    const h = harness(journal);
+    serveDifference(h, 1);
+    expect(h.differences[0].partial).toBe(false);
+    expect(h.differences[0].maxSeq).toBe(3);
+  });
+
   it("afterSeq=0 returns the whole journal, oldest first", () => {
     const journal = openJournal();
     for (const event of thread("a")) journal.append(PEER, event);
-    const { server, differences } = harness(journal);
-    server.serveDifference(PEER, 0);
-    expect(differences[0].events.map((e) => e.seq)).toEqual([1, 2, 3]);
+    const h = harness(journal);
+    serveDifference(h, 0);
+    expect(h.differences[0].events.map((e) => e.seq)).toEqual([1, 2, 3]);
   });
 
-  it("answers an already-current afterSeq with an EMPTY difference (not silence)", () => {
-    // The client's `case "difference"` no-ops the fold and drains its buffer on an
-    // empty response; sending nothing would strand a client that buffered.
+  it("answers an already-current afterSeq with an EMPTY, non-partial difference (not silence)", () => {
+    // The client's `case "difference"` settles at `maxSeq` and re-dispatches its
+    // buffer on an empty non-partial reply; sending nothing would strand a client
+    // that buffered until its request times out.
     const journal = openJournal();
     for (const event of thread("a")) journal.append(PEER, event);
-    const { server, differences } = harness(journal);
-    server.serveDifference(PEER, 3);
-    expect(differences).toHaveLength(1);
-    expect(differences[0].events).toEqual([]);
+    const h = harness(journal);
+    serveDifference(h, 3);
+    expect(h.differences).toHaveLength(1);
+    expect(h.differences[0].events).toEqual([]);
+    expect(h.differences[0].partial).toBe(false);
+    expect(h.differences[0].maxSeq).toBe(3);
   });
 
   it("scopes to the requesting peer — never another peer's rows", () => {
     const journal = openJournal();
     for (const event of thread("a")) journal.append(PEER, event);
     for (const event of thread("b")) journal.append(OTHER_PEER, event);
-    const { server, differences } = harness(journal);
-    server.serveDifference(PEER, 0);
-    const ids = differences[0].events.map((e) => {
+    const h = harness(journal);
+    serveDifference(h, 0);
+    const ids = h.differences[0].events.map((e) => {
       const ev = e.event as { answerId?: string; id?: string };
       return ev.answerId ?? ev.id;
     });
@@ -816,7 +870,7 @@ describe("createHistoryServer.serveDifference — #244 half B", () => {
     expect(ids).toEqual(["a1", "a2", "a3"]);
   });
 
-  it("byte-fits an oversize difference to the OLDEST contiguous prefix, re-requestable", () => {
+  it("byte-fits an oversize difference to the OLDEST contiguous prefix, and says partial", () => {
     const journal = openJournal();
     // Ten bubbles → seqs 1..10, each carrying its own text.
     for (let i = 1; i <= 10; i++) {
@@ -828,28 +882,203 @@ describe("createHistoryServer.serveDifference — #244 half B", () => {
       });
     }
     // A tiny limit so the whole set cannot fit — but a single event still can.
-    const { server, differences } = harness(journal, {}, 220);
-    server.serveDifference(PEER, 0);
+    const h = harness(journal, {}, 260);
+    serveDifference(h, 0);
 
-    expect(differences).toHaveLength(1);
-    const seqs = differences[0].events.map((e) => e.seq);
+    expect(h.differences).toHaveLength(1);
+    const seqs = h.differences[0].events.map((e) => e.seq);
     // Non-empty (forward progress guaranteed) and the OLDEST prefix (starts at 1).
     expect(seqs.length).toBeGreaterThan(0);
     expect(seqs.length).toBeLessThan(10);
     expect(seqs[0]).toBe(1);
     // Contiguous ascending from 1 — no permutation, no hole.
     expect(seqs).toEqual(seqs.map((_, i) => i + 1));
+    // ⚠️ AND IT SAYS SO. Before #356 the client had to wait for the NEXT durable
+    // frame to notice the remainder was missing; `partial` makes it re-request now.
+    expect(h.differences[0].partial).toBe(true);
+    // `maxSeq` is what this reply ACCOUNTS FOR, not the journal's high-water: the
+    // trimmed events are still owed, so coverage stops at the last one served.
+    expect(h.differences[0].maxSeq).toBe(seqs[seqs.length - 1]);
+    // ⚠️ THE INVARIANT THAT KEEPS A PARTIAL REPLY FROM SPINNING IN PLACE.
+    expect(h.differences[0].maxSeq).toBeGreaterThan(h.differences[0].afterSeq);
+    // A warn, not an error: the trimmed events are re-requestable, not lost.
+    expect(h.warns.some((w) => w.includes("difference for") && w.includes("shortened"))).toBe(true);
+  });
+
+  it("#356 — a read capped at MAX_DIFFERENCE_EVENTS is partial even when every event fits", () => {
+    // The two halves of `partial` are independent: this one is the ROW CAP, with
+    // a byte limit nothing here approaches. It is why the read asks for
+    // MAX_DIFFERENCE_EVENTS + 1 rows — "there is more" is observed, not inferred.
+    const journal = openJournal();
+    for (let i = 1; i <= MAX_DIFFERENCE_EVENTS + 5; i++) {
+      journal.append(PEER, { kind: "bubble", answerId: `a${i}`, turnId: "t1", text: "x" });
+    }
+    const h = harness(journal);
+    serveDifference(h, 0);
+    expect(h.differences[0].events).toHaveLength(MAX_DIFFERENCE_EVENTS);
+    expect(h.differences[0].partial).toBe(true);
+    // Coverage is the WINDOW boundary, not the journal's high-water: the five
+    // rows beyond the cap are exactly what the client re-requests.
+    expect(h.differences[0].maxSeq).toBe(MAX_DIFFERENCE_EVENTS);
+
+    // And the exact boundary is not off by one: a read that exactly fills the cap
+    // with nothing behind it is COMPLETE.
+    const exact = openJournal();
+    for (let i = 1; i <= MAX_DIFFERENCE_EVENTS; i++) {
+      exact.append(PEER, { kind: "bubble", answerId: `a${i}`, turnId: "t1", text: "x" });
+    }
+    const h2 = harness(exact);
+    serveDifference(h2, 0);
+    expect(h2.differences[0].events).toHaveLength(MAX_DIFFERENCE_EVENTS);
+    expect(h2.differences[0].partial).toBe(false);
+  });
+
+  it("#343 — ONE undeliverable row is SKIPPED and the rest are served (it used to wedge the device)", () => {
+    // The measured shape from the issue: a row whose SEALED size alone exceeds
+    // this peer's max_payload. `nats-channel.ts` journals before it publishes, so
+    // such a row is in the store precisely because its own live send was refused —
+    // the peer never saw it live, and omitting it is what preserves live==history.
+    //
+    // BEFORE: `fitDifference` bottomed out at `slice(0, 1)` and handed the single
+    // oversize row to the channel, which refused the whole frame. The device got
+    // NOTHING, on this request and on every retry, for the rest of the session.
+    const journal = openJournal();
+    journal.append(PEER, { kind: "bubble", answerId: "a1", turnId: "t1", text: "one" });
+    journal.append(PEER, { kind: "bubble", answerId: "a2", turnId: "t2", text: "X".repeat(4000) });
+    journal.append(PEER, { kind: "bubble", answerId: "a3", turnId: "t3", text: "three" });
+    journal.append(PEER, { kind: "bubble", answerId: "a4", turnId: "t4", text: "four" });
+
+    const h = harness(journal, {}, 1000);
+    serveDifference(h, 0);
+
+    expect(h.differences).toHaveLength(1);
+    // The reply SPANS the undeliverable row: 1, then 3 and 4.
+    expect(h.differences[0].events.map((e) => e.seq)).toEqual([1, 3, 4]);
+    // ⚠️ NOT partial. Seq 2 is undeliverable, not deferred — the client advances
+    // past it (`maxSeq`), and re-requesting it would wedge the device on it
+    // forever, which is exactly the defect.
+    expect(h.differences[0].partial).toBe(false);
+    expect(h.differences[0].maxSeq).toBe(4);
+    // The operator gets one actionable line naming the row and its size.
+    const skipLine = h.errors.find((e) => e.includes("undeliverable"));
+    expect(skipLine).toBeDefined();
+    expect(skipLine).toContain("seq 2");
+  });
+
+  it("#356 — a partial reply ALWAYS covers past afterSeq, even when every row it examined was undeliverable", () => {
+    // ⚠️ THE ONE WAY A PARTIAL REPLY COULD HAVE SPUN IN PLACE. A window whose
+    // every row is undeliverable ships ZERO events; if `maxSeq` were the journal's
+    // high-water the client would jump past rows it never saw, and if it were the
+    // fold's max it would re-request the same floor forever. It is the window
+    // boundary: the client advances past the undeliverable run and asks for the
+    // rest.
+    const journal = openJournal();
+    for (let i = 1; i <= MAX_DIFFERENCE_EVENTS + 3; i++) {
+      journal.append(PEER, { kind: "bubble", answerId: `a${i}`, turnId: "t1", text: "padding" });
+    }
+    // Small enough that no single row fits, large enough that an EMPTY frame does
+    // (below that the budget hands the reply on whole instead, by design).
+    const h = harness(journal, {}, 120);
+    serveDifference(h, 0);
+
+    expect(h.differences).toHaveLength(1);
+    expect(h.differences[0].events).toEqual([]);
+    expect(h.differences[0].partial).toBe(true);
+    expect(h.differences[0].maxSeq).toBe(MAX_DIFFERENCE_EVENTS);
+    expect(h.differences[0].maxSeq).toBeGreaterThan(h.differences[0].afterSeq);
+  });
+
+  it("#343 — a difference whose ONLY row is undeliverable answers empty rather than sending nothing", () => {
+    // The degenerate case of the same rule. The old code shipped the oversize row
+    // and the channel refused the frame; now the client gets an honest "you are
+    // synced to maxSeq", which is what lets its cursor move past the hole.
+    const journal = openJournal();
+    journal.append(PEER, { kind: "bubble", answerId: "a1", turnId: "t1", text: "X".repeat(4000) });
+    const h = harness(journal, {}, 1000);
+    serveDifference(h, 0);
+    expect(h.differences).toHaveLength(1);
+    expect(h.differences[0].events).toEqual([]);
+    expect(h.differences[0].partial).toBe(false);
+    expect(h.differences[0].maxSeq).toBe(1);
+  });
+
+  it("#348 — an oversize 500-row difference is fitted with a handful of seals, not O(n²)", () => {
+    // `outboundWireSize` is a full `sealEnvelope`. The old loop dropped ONE row
+    // per iteration and re-measured the whole prefix each time: for a 500-row page
+    // that overflows, up to ~125 000 seals, synchronously on the dispatch turn.
+    // The bisection is logarithmic — this counts the calls rather than trusting
+    // the shape.
+    const journal = openJournal();
+    for (let i = 1; i <= MAX_DIFFERENCE_EVENTS; i++) {
+      journal.append(PEER, {
+        kind: "bubble",
+        answerId: `a${i}`,
+        turnId: "t1",
+        text: `answer ${i} `.repeat(20),
+      });
+    }
+    const h = harness(journal, {}, 20_000);
+    serveDifference(h, 0);
+
+    expect(h.differences).toHaveLength(1);
+    expect(h.differences[0].partial).toBe(true);
+    // Measured: 13 (whole, empty, surviving-whole, ~9 bisection steps, blocker).
+    // The bound is what matters — the old shape needed hundreds for this page.
+    expect(h.recording.measurements).toBeLessThanOrEqual(16);
+    expect(h.recording.measurements).toBeGreaterThan(0);
+  });
+
+  it("#348 — one outstanding read per peer: a burst coalesces into ONE reply, answering the NEWEST request", () => {
+    // The latch the other two read paths have, with the one behavioural change a
+    // request/reply shape allows: a later floor supersedes an earlier one, so the
+    // burst collapses onto the newest `(afterSeq, nonce)` rather than the oldest.
+    // A device whose request was coalesced away sees a frame that is not its own,
+    // ignores it (the echo), and re-issues on its own timeout.
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    const h = harness(journal);
+
+    h.server.serveDifference(PEER, 0, "n-1");
+    h.server.serveDifference(PEER, 1, "n-2");
+    h.server.serveDifference(PEER, 2, "n-3");
+    // ONE scheduled read for the three requests.
+    expect(h.scheduler.pending).toBe(1);
+    h.scheduler.flush();
+
+    expect(h.differences).toHaveLength(1);
+    expect(h.differences[0].nonce).toBe("n-3");
+    expect(h.differences[0].afterSeq).toBe(2);
+    expect(h.differences[0].events.map((e) => e.seq)).toEqual([3]);
+
+    // The latch RELEASES: a later request is served normally.
+    serveDifference(h, 0, "n-4");
+    expect(h.differences).toHaveLength(2);
+    expect(h.differences[1].nonce).toBe("n-4");
+  });
+
+  it("#348 — nothing runs on the dispatch turn (the fit is no longer free)", () => {
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    const h = harness(journal);
+    h.server.serveDifference(PEER, 0, "n-1");
+    // The byte fit is a sequence of seals; it must not ride the inbound dispatch.
+    expect(h.differences).toHaveLength(0);
+    expect(h.scheduler.pending).toBe(1);
+    h.scheduler.flush();
+    expect(h.differences).toHaveLength(1);
   });
 
   it("on a read failure, logs and sends NOTHING (never an empty frame that would falsely advance)", () => {
     const journal = openJournal();
     for (const event of thread("a")) journal.append(PEER, event);
-    const { server, differences, errors } = harness(journal);
+    const h = harness(journal);
     // Close the handle so the next read throws (database is not open).
     journal.close();
-    server.serveDifference(PEER, 0);
-    expect(differences).toHaveLength(0);
-    expect(errors).toHaveLength(1);
-    expect(errors[0]).toContain("difference read failed");
+    serveDifference(h, 0);
+    expect(h.differences).toHaveLength(0);
+    expect(h.errors).toHaveLength(1);
+    expect(h.errors[0]).toContain("difference read failed");
+    // #343: it goes through the same throttle as every other failure line here.
+    expect(h.errors[0]).toContain("suppressed=");
   });
 });

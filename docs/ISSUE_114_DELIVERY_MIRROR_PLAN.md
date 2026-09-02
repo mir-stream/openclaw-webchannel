@@ -958,3 +958,27 @@ claude 18 + codex 18을 병합(중복 제거). 라벨: **[S]**=structural-perman
 - **wire 런타임 검증.** "typed"가 TS 전용, 런타임은 `JSON.parse(...) as T` 무검증 → 악성/깨진 mutation·seq 프레임이 reducer 오염 가능(`nats-channel.ts`). v6에 런타임 디코딩/불변식. (codex-disc #17)
 - **원본 inbound 각각 journaling** (병합 전) — §16.3 행 정정과 동일. (codex-disc #16)
 - 후속(구조적 아님): agent-down ingress 보관(JetStream/relay spool; S3 무손실 부분), delivery/read-state 프로토콜, message mutation API, HA journal ownership.
+
+### 16.7 gap-sync = Telegram updates 모델 (#356 half A, 2026-09-02)
+
+§16.2-6이 "per-conversation seq + `getDifference(afterSeq)`"를 지시했고 #244 half B가 그걸 구현했지만, **클라이언트 쪽은 모델이 아니라 규칙 더미로 자랐다** — 커서 숫자 + in-flight 플래그 + gap 버퍼 + 지연 advance + 타이머 generation. v6 병합 후 리뷰에서 리뷰어 일곱이 **그 한 seam에서 결함 여덟 개**를 찾았고(#349 #350 #351 #352 #345 #343 #348 #342), 전부 그 필드들끼리 "무엇이 이미 적용됐나"에 대해 의견이 갈린 자리였다. 이 저장소의 교훈(#301: 한 seam에서 네 라운드에 걸친 네 결함을 아홉 번째 규칙이 아니라 **규칙군 삭제**로 닫았다)에 따라, 반쪽 A는 **상태를 타입으로** 만들었다: `SeqCursor`(`nats-client-wrapper.ts`).
+
+**모델은 `core.telegram.org/api/updates`이고, 우리 역할은 그대로 대응된다** — 우리 플러그인 = 텔레그램 플러그인 + 텔레그램 **서버**, 우리 클라이언트 = 텔레그램 **앱**(§0). `seq` ⇢ `pts`, 커서 ⇢ 앱의 `local_pts`, `get_difference` ⇢ `updates.getDifference`, 스냅샷의 `highWaterSeq` ⇢ `updates.getState`, `partial` ⇢ `updates.differenceSlice`.
+
+**세 상태.**
+- `unseeded` — baseline이 없으니 gap을 계산할 수 없다. **처음 관측한 seq를 baseline으로 채택**한다(보통 스냅샷의 `highWaterSeq`, durable 프레임이 먼저 오면 그 프레임의 seq). 요청은 하지 않는다. 예전 코드는 `0`에서 시작해 첫 프레임을 gap으로 읽고 **대화 전체를 500개짜리 페이지로 되끌었다**(#350). ⚠️ 그렇다고 "스냅샷이 올 때까지 버퍼"는 답이 아니다 — `history-serve.ts`는 **빈 스냅샷을 억제**하므로 신규 대화는 `history` 프레임을 아예 못 받고, 그 클라는 첫 턴을 영원히 붙들게 된다.
+- `synced` — 평소 상태. `last`가 `local_pts`.
+- `catching-up` — `get_difference` 하나가 미결. `afterSeq`가 **요청의 floor이자 커서**다. 숫자를 하나만 두는 것이 핵심: 예전엔 둘이었고(`pendingDeferredSeq`), PARTIAL 응답 위에 그걸 얹는 것이 정확히 구간 유실의 기전이었다(#352).
+
+**세 갈래 판정** (`pts_count`는 우리에겐 항상 1 — durable 프레임 하나 = 저널 행 하나):
+`seq === last + 1` → 적용 · `seq <= last` → 이미 커버됨 · `seq > last + 1` → **GAP**. `ack.committed[].seq`와 `history.highWaterSeq`도 **같은 판정**을 지난다 — 위쪽이면 무조건 advance가 아니라 GAP이다(#345 shape B, #352).
+
+⚠️ **텔레그램과 어긋나는 곳은 넷뿐이고, 넷 다 근거가 있다.**
+1. **에코 상관(correlation)** — 텔레그램은 세션의 연결로 주소를 잡는다. 우리 기기들은 `.out` 하나를 공유하고 wire 상 신원이 없다(§16.2-8, per-device registry 없음). 그래서 `difference`가 요청의 `afterSeq`·`nonce`를 **그대로 되돌려주고**, 기기는 **자기 요청과 일치하는 응답만** fold한다. 없으면 floor 100인 기기가 floor 300짜리 응답을 먹고 101..300을 조용히 건너뛴다(#351, N8).
+2. **`seq <= last`도 fold한다** — 텔레그램은 "이미 적용됨, 무시"라고 말하지만 **우리 `seq`는 이벤트가 아니라 행을 센다**. `delivery-journal.ts`가 `placement`를 answer id로 dedupe하므로 스트리밍 답변의 **모든 `progress` 프레임이 같은 seq**를 달고 온다. 무시하면 모든 draft가 첫 청크에서 얼어붙는다. 커서만 무시하고 프레임은 fold한다.
+3. **커서 영속화 없음** — 아직 in-memory다(반쪽 B).
+4. **give-up이 존재한다** — 텔레그램의 `getDifference`는 세션 연결 위의 RPC라 전송이 실패를 알려준다. 우리 건 publish로 답하는 publish라, 타이머가 유일한 감지 수단이다.
+
+**서버 쪽**(`history-serve.ts`): `fitDifference`는 `history-frame-budget.ts`와 **같은 알고리즘의 prefix 판본**이 됐다 — 이분 탐색 + blocker 한 번 측정으로 "혼자서도 안 들어가는 행은 **건너뛰기**"(#343; 그 행은 자기 live 전송도 같은 한계에 걸려 못 갔으므로 생략이 곧 `live == history`)와 "여기서 예산이 끝났다"(→ `partial: true`)를 가른다. 한 행씩 줄이며 매번 전체를 다시 seal하던 O(n²)(500행 페이지에서 최대 ~12.5만 회)는 **13회**로 떨어졌고, 경로 자체가 다른 두 read처럼 **deferred + per-peer latch**가 됐다(#348). latch는 `runDeferred`와 달리 **드롭이 아니라 최신 요청으로 coalesce**한다 — floor는 앞으로만 가므로 나중 요청이 앞 요청을 포함하고, 밀려난 nonce의 기기는 에코 불일치로 무시한 뒤 자기 타임아웃에 재요청한다.
+
+**반쪽 B(별도 PR)**: #349 replay 오버레이, #342 재접속 `get_difference` + tier-1 history 갱신, 커서 영속화.

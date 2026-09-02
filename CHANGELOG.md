@@ -69,6 +69,18 @@
   without them buys a connection and a silently wrong transcript, which is the
   precise failure this bump exists to prevent.
 
+- **`get_difference` / `difference` gain correlation and catch-up fields (#356).**
+  `get_difference` now carries a required `nonce` alongside `afterSeq`, and the
+  `difference` reply echoes both back and adds `partial` and `maxSeq`. All four
+  are required on the v4 wire and both receive doors refuse a frame missing one.
+  They are not decoration: our devices share one `.out` subject and have no wire
+  identity, so the echo is the only thing that tells a device its own reply from
+  another device's (without it, a device folds a stranger's reply and skips its
+  own range); `partial` is Telegram's `differenceSlice` signal, without which the
+  remainder of a sliced range is stranded until the next durable frame; and
+  `maxSeq` is what a complete reply advances the cursor to, which is how a row
+  the server can never send to this peer stops wedging it.
+
 ### Fixed
 
 - **An approval prompt the transport could not deliver now appears in history,
@@ -100,6 +112,37 @@
   deleting a message whose only copy was in the final it displaced. It now
   places none of them: every unmatched final becomes its own new bubble, which
   can duplicate a visible answer but can never erase one.
+
+- **The client's gap-sync state machine is now one modelled cursor (#356).**
+  Seven reviewers found eight defects concentrated in one seam — a cursor number
+  surrounded by an in-flight flag, a gap buffer, deferred advances and a timer
+  generation, all able to disagree about what had already been applied. It is
+  replaced by an explicit three-state cursor following Telegram's update-delivery
+  rules, and the fields that disagreed are deleted rather than re-guarded. Closes:
+  - **#350** — the cursor gap-detected from `0` before the register snapshot
+    seeded it, so a reload mid-turn pulled the entire conversation back through
+    the fold in 500-event pages. It now adopts its first observation as the
+    baseline and asks for nothing.
+  - **#351** — `difference` carried no echo of the request it answered and every
+    device of a peer shares the `.out` subject, so a device could fold another
+    device's reply and silently skip its own range.
+  - **#352** — a partial reply plus an `ack`/`highWaterSeq` advance deferred
+    during the round-trip pushed the cursor past events the reply never carried,
+    and the buffer drain then discarded them.
+  - **#345** — `ack.committed[].seq` was advance-only. It now moves the cursor
+    only on the device that originated the send (the `random_id` resolves a local
+    linkage), and a seq above the contiguous next one opens a gap instead of
+    closing it.
+  - **#343** — one journal row too large for a peer's `max_payload` wedged
+    `fitDifference`, so that device received nothing for the rest of the session.
+    Such a row is now skipped with an operator-actionable log line, exactly as the
+    history page budget already skipped it, and the reply spans across it.
+  - **#348** — `fitDifference` re-sealed the whole prefix once per removed row
+    (O(n²), up to ~125 000 seals for an oversize 500-row reply) on the account's
+    dispatch turn, and `get_difference` had no per-peer bound at all. It is a
+    bisection now (13 measurements for that same reply), deferred off the dispatch
+    turn, and latched per peer so a burst coalesces into one reply answering the
+    newest request.
 
 ## 0.7.0
 

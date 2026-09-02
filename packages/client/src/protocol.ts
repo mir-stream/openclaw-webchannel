@@ -34,7 +34,12 @@
  *    `get_difference`/`difference` round-trip that heals a hole in it (#244);
  *    the `user_committed` multi-device broadcast (#245); `history` rows of kind
  *    `reasoning`/`tool`/`approval` (#242); and `ack.committed[]`, the durable
- *    user id the server minted plus its seq (#243). A v3 peer stays on the wire,
+ *    user id the server minted plus its seq (#243); and #356's correlation and
+ *    catch-up fields on that round-trip — `get_difference.nonce`, echoed back on
+ *    `difference` with `afterSeq`, plus `partial` and `maxSeq` — all four of
+ *    which a peer must ACT on (ignore the echo and it folds another device's
+ *    reply; ignore `partial` and it strands the rest of a sliced range).
+ *    A v3 peer stays on the wire,
  *    looks healthy, and is wrong in two ways it cannot itself detect:
  *      · No `seq` ⇒ no gap detection ⇒ it never sends `get_difference`. This
  *        transport is core NATS pub/sub, AT-MOST-ONCE with no retention, so a
