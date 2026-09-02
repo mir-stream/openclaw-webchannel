@@ -68,6 +68,8 @@ dist/durable-view-reducer.d.ts
 dist/durable-view-reducer.js
 dist/e2e-crypto-browser.d.ts
 dist/e2e-crypto-browser.js
+dist/inbound-wire-decode.d.ts
+dist/inbound-wire-decode.js
 dist/index.d.ts
 dist/index.js
 dist/nats-client-wrapper.d.ts
