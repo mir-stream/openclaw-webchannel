@@ -267,17 +267,24 @@ type CarriedRows = { seqs: ReadonlySet<number>; authoredIds: ReadonlySet<string>
  * (§15.9 — the draft text is deliberately never journaled), so it cannot
  * supersede the `progress` frames that fill that slot, and a test pins that.
  *
- * ⚠️ THE OTHER `[]` ARMS ARE UNREACHABLE TODAY AND NO TEST PINS THEM — say so
- * rather than implying a guard that fires. `uncarried` consults this function
- * only for a DRAFT-SHAPED held frame (seq-less, or a `progress`), and no frame of
- * that shape carries a `user`/`tool`/`approval`/`approvalResolution` id: those
- * frames all carry their own seq. So the `approvalResolution` defect this
- * function was rewritten for is actually closed by the seq/id dichotomy in
- * `uncarried`, and defeating this table alone leaves the suite green (measured);
- * defeating BOTH reproduces it. What the arms buy is that the next kind cannot
- * default into "authors text" — which is exactly how `approvalResolution` got in
- * — and `messageEdited`/`messageDeleted` (no producer on this wire) are listed so
- * the `never` below has to be re-answered if one ever appears.
+ * ⚠️ THE OTHER `[]` ARMS ARE REACHABLE ONLY THROUGH ONE NARROW PATH, AND NO TEST
+ * PINS THEM — say which path, rather than implying a guard that fires. This
+ * function is consulted only for a DRAFT-SHAPED held frame (seq-less, or a
+ * `progress`), and a `tool_activity`/`approval_request` normally carries its own
+ * seq. It can arrive WITHOUT one: `nats-channel.ts` ships a durable frame
+ * unstamped when the journal append fails (§15.8), and such a frame is seq-less
+ * and lands in the draft branch. `[]` is the safe direction there — it keeps the
+ * held frame, and a held frame the reply already delivered is at worst an
+ * idempotent re-fold, where dropping one the reply did NOT deliver is content
+ * gone for the session.
+ *
+ * Which is why the `approvalResolution` defect this table was rewritten for is
+ * actually closed by the seq/id dichotomy in `uncarried` and by the seq-ordered
+ * merge in `applyDifference`: defeating this table alone leaves the suite green
+ * (measured). What the arms buy is that the next kind cannot default into
+ * "authors text" — exactly how `approvalResolution` got in — and
+ * `messageEdited`/`messageDeleted` (no producer on this wire) are listed so the
+ * `never` below has to be re-answered if one ever appears.
  */
 function authoredIdsOf(event: DurableEvent): string[] {
   switch (event.kind) {
@@ -3603,8 +3610,13 @@ export class WebChannelNATSClient {
       timer: null,
     };
     this.cursor = cursor;
-    this.client.getDifference(afterSeq, cursor.nonce);
+    // ⚠️ ARM BEFORE PUBLISHING. `getDifference` reaches the transport, and a throw
+    // out of it is swallowed by `notifyMessageListeners` when this runs inside a
+    // fold — which would leave the cursor `catching-up` with `timer: null`: no
+    // re-issue, no give-up, every later durable frame held in silence. Arming
+    // first costs one timer that fires into an unchanged cursor at worst.
     this.armCatchUpTimer(cursor);
+    this.client.getDifference(afterSeq, cursor.nonce);
   }
 
   /**
@@ -3652,10 +3664,9 @@ export class WebChannelNATSClient {
    * re-dispatch would let a frame the first slice delivered survive across the
    * boundary and fold after the second one.
    *
-   * `undefined` means the caller has nothing to measure against: the give-up path,
-   * where the budget ran out without any reply that delivered anything. (A reply
-   * that lands and delivers nothing is a STALL — it does not reach here at all,
-   * because it does not end the round-trip.)
+   * `undefined` means the caller has nothing to measure against: the ONE give-up
+   * path, in `onCatchUpTimeout`, where the budget ran out. A reply that lands and
+   * delivers nothing never reaches here — it is a STALL, and a stall ends nothing.
    *
    * ── ONE DICHOTOMY, ON WHETHER THE HELD FRAME CARRIES DURABLE TEXT OF ITS OWN ──
    *
@@ -3912,8 +3923,53 @@ export class WebChannelNATSClient {
       // property of this method, not of the wire.
       .sort((a, b) => a.seq - b.seq);
 
+    // ── THE MERGE PLAN, DECIDED BEFORE ANYTHING FOLDS ──
+    //
+    // ⚠️ A HELD FRAME BELOW THE REPLY'S ROWS MUST FOLD *AMONG* THEM, NOT AFTER.
+    // The reducers are last-write-wins, so re-dispatching the buffer in arrival
+    // order after the fold lets a stale frame overwrite what the reply just
+    // established. Measured three ways, all of them the #343-skip shape this
+    // branch exists for — the reply covers the seq and carries no event for it:
+    // a held `tool_activity{start}@11` re-applied after a folded `tool{end,ok}@12`
+    // left the card `{phase:"start", status:"ok"}` for the session; a held
+    // `approval_request@11` re-applied after a folded `approvalResolution@12`
+    // appended a CLICKABLE card for an approval the server had already resolved;
+    // a held `agent_message{A}@11` re-applied after a `seal@12` whose `remove`
+    // names A brought A back.
+    //
+    // So the buffer is split by the range this reply ANSWERS:
+    //  - `below` — seq-bearing held frames inside `(afterSeq, declaredCovered]`.
+    //    Merged with the reply's events in SEQ ORDER and applied through
+    //    `applyFrame` DIRECTLY: the cursor is `catching-up`, so `observeSeq` would
+    //    only re-buffer them, and their seqs are already inside `covered`.
+    //  - `rest` — everything else: seq-less frames, whose order relative to the
+    //    reply is all they have, and seq-bearing frames ABOVE the range, which the
+    //    next request or the settle is for.
+    //
+    // `declaredCovered` is what the reply CLAIMS to answer. It is computed here,
+    // before the fold, because the merge order cannot depend on the fold's
+    // outcome; the fold can only ever end at or below it.
+    const declaredCovered = Math.max(
+      cursor.afterSeq,
+      isWireSeq(msg.maxSeq) ? msg.maxSeq : 0,
+      events.length > 0 ? events[events.length - 1]!.seq : 0,
+    );
+    const below: InboundMessage[] = [];
+    const rest: InboundMessage[] = [];
+    for (const held of cursor.buffer) {
+      const heldSeq = isWireSeq(held.seq) ? held.seq : undefined;
+      if (heldSeq !== undefined && heldSeq > cursor.afterSeq && heldSeq <= declaredCovered) {
+        below.push(held);
+      } else {
+        rest.push(held);
+      }
+    }
+    below.sort((a, b) => (a.seq as number) - (b.seq as number));
+
     let last = cursor.afterSeq;
     let completed = false;
+    let nextEvent = 0;
+    let nextHeld = 0;
     // What this reply actually DELIVERED — see `CarriedRows`. Both sets take an
     // entry only for an event that was decoded AND folded: a row this build
     // cannot read advances the cursor past itself (the documented asymmetry) but
@@ -3923,45 +3979,67 @@ export class WebChannelNATSClient {
     // ⚠️ `try/finally` (#246 half A): the transition below MUST run even if a fold
     // throws. `notifyMessageListeners` (`nats-client.ts`) swallows a listener's
     // throw, so an escape from here would leave the cursor stuck in `catching-up`
-    // with its liveness timer already cancelled — every later durable frame
-    // silently held, with nothing left to re-issue anything.
-    // `decodeDurableEvent` is what makes such a throw unreachable; this is the
-    // belt to its braces, and it is cheap.
+    // with every later durable frame silently held. `decodeDurableEvent` is what
+    // makes such a throw unreachable; this is the belt to its braces, and it is
+    // cheap.
     //
     // ⚠️ IT DEGRADES, IT DOES NOT PRETEND. `last` is raised AFTER each event is
     // handled, so a throw leaves the cursor at the last event actually applied —
     // and `completed` is what stops the server's `maxSeq` from papering over the
     // rest.
     //
-    // ⚠️ AND THE SELF-HEAL AFTER A THROW IS CONDITIONAL — say which condition.
-    // If frames were HELD during the round-trip, the re-dispatch below re-detects
-    // the gap and asks again with a fresh retry budget (a TRANSIENT throw heals;
-    // a deterministic one re-requests the same range each round, the pre-existing
-    // shape of any reply that fails to close a gap). If the buffer is EMPTY —
-    // a gap opened by an `ack` echo, say — nothing re-detects anything: the
-    // cursor simply sits below the event that threw until the next durable frame
-    // arrives and reads the hole. Degraded, not wedged, which is the property
-    // the `finally` is here for.
+    // ⚠️ AND THE RECOVERY AFTER A THROW IS THE TIMER'S, NOT THE BUFFER'S. A throw
+    // before the first event folds moves no floor, so it is a STALL: the cursor,
+    // its budget and its deadline all stay, nothing is re-dispatched, and
+    // `onCatchUpTimeout` re-issues on its own cadence and eventually gives up. A
+    // throw PART-WAY leaves the cursor at the last applied event and settles or
+    // re-requests from there. Either way the buffer is not consulted for recovery.
     try {
-      for (const { seq, event } of events) {
-        // Fold everything the request asked for; a `seq <= last` is a
-        // raced/duplicate overlap we already hold.
-        if (seq <= last) continue;
-        const decoded = decodeDurableEvent(event);
-        if (decoded.ok) {
-          this.foldDifferenceEvent(decoded.event);
-          carriedSeqs.add(seq);
-          for (const id of authoredIdsOf(decoded.event)) authoredIds.add(id);
-        } else if (decoded.kind === "malformed") {
-          // Only the MALFORMED case is reported: an unknown kind is an ordinary
-          // version skew and would be noise on every frame from a newer server,
-          // while a known kind we cannot fold is a real defect somewhere upstream.
-          console.warn(
-            `[nats-wrapper] skipping malformed ${decoded.eventKind} event at seq ${seq} ` +
-              `in a difference: ${decoded.reason}`,
-          );
+      // ONE ASCENDING PASS over the reply's events and `below`, together. At an
+      // equal seq the reply's event goes FIRST: it is the durable row, and the
+      // held frame is a live rendering of that same row.
+      while (nextEvent < events.length || nextHeld < below.length) {
+        const entry = events[nextEvent];
+        const held = below[nextHeld];
+        const heldSeq = held === undefined ? undefined : (held.seq as number);
+        if (entry !== undefined && (heldSeq === undefined || entry.seq <= heldSeq)) {
+          nextEvent += 1;
+          const seq = entry.seq;
+          // Fold everything the request asked for; a `seq <= last` is a
+          // raced/duplicate overlap we already hold.
+          if (seq <= last) continue;
+          const decoded = decodeDurableEvent(entry.event);
+          if (decoded.ok) {
+            this.foldDifferenceEvent(decoded.event);
+            carriedSeqs.add(seq);
+            for (const id of authoredIdsOf(decoded.event)) authoredIds.add(id);
+          } else if (decoded.kind === "malformed") {
+            // Only the MALFORMED case is reported: an unknown kind is an ordinary
+            // version skew and would be noise on every frame from a newer server,
+            // while a known kind we cannot fold is a real defect somewhere
+            // upstream.
+            console.warn(
+              `[nats-wrapper] skipping malformed ${decoded.eventKind} event at seq ${seq} ` +
+                `in a difference: ${decoded.reason}`,
+            );
+          }
+          last = seq;
+          continue;
         }
-        last = seq;
+        nextHeld += 1;
+        // The reply's event for this seq, if it had one, has already been handled
+        // — both sequences ascend and ties go to the event — so `carriedSeqs` is
+        // authoritative here: this held frame folds iff the reply did not deliver
+        // its row.
+        //
+        // A `progress` folds ANYWAY, and by ORDER rather than by an exemption:
+        // its row is a text-less `placement`, so folding it immediately after that
+        // placement is what keeps the draft the user is watching, and a
+        // `bubble`/`seal` later in the same merge then authors over it — exactly
+        // as it would have live.
+        if (held!.type === "progress" || !carriedSeqs.has(heldSeq!)) {
+          this.applyFrame(held!);
+        }
       }
       completed = true;
     } finally {
@@ -3987,8 +4065,10 @@ export class WebChannelNATSClient {
         // here instead, which starts a FRESH `GET_DIFFERENCE_TIMEOUT_MS`: a peer
         // stalling faster than that pushed the deadline back on every reply and
         // the timeout never fired. Measured over 10 simulated minutes at a 50 ms
-        // stall cadence: ONE request, still catching-up, 12 001 frames held,
-        // nothing rendered — worse than the loop the stall rule replaced.
+        // stall cadence: ONE request, still catching-up, nothing ever re-asked —
+        // worse than the loop the stall rule replaced. (What this bounds is the
+        // REQUEST RATE. Frames still accumulate while a catch-up is open, which is
+        // the design; the defect was that nothing could ever answer them.)
         if (!this.stalled(msg, covered, completed, cursor)) {
           // The round-trip IS over, so the request's deadline has nothing left to
           // protect. Both branches below install a NEW cursor, and this is the one
@@ -3997,11 +4077,11 @@ export class WebChannelNATSClient {
           if (msg.partial === true) {
             // Telegram's `updates.differenceSlice`: "the query must be repeated,
             // using the intermediate status as the current status." The
-            // intermediate status is `covered`; the held frames carry FORWARD,
-            // minus the ones this slice delivered.
-            this.openCatchUp(covered, this.uncarried(cursor.buffer, carried));
+            // intermediate status is `covered`; what carries forward is `rest` —
+            // `below` was consumed by the merge above.
+            this.openCatchUp(covered, this.uncarried(rest, carried));
           } else {
-            this.settleSynced(covered, cursor.buffer, carried);
+            this.settleSynced(covered, rest, carried);
           }
         }
       }

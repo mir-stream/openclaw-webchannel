@@ -600,8 +600,12 @@ describe("#356 — partial replies (Telegram's differenceSlice)", () => {
       ),
     );
 
+    // ⚠️ AND IN SEQ ORDER, NOT ARRIVAL ORDER. The held seq-3 frame folds BETWEEN
+    // the reply's seq-2 and seq-4 events, which is where a reload's seq-ordered
+    // projection puts it — rounds 3 and 4 re-dispatched it last and carried a
+    // documented live≠history residual for it.
     expect(project(w).map((m) => (m as { text: string }).text)).toEqual([
-      "answer 2", "answer 4", "answer 3",
+      "answer 2", "answer 3", "answer 4",
     ]);
   });
 
@@ -695,15 +699,13 @@ describe("#356 — partial replies (Telegram's differenceSlice)", () => {
         ]),
       );
 
-      // The held broadcast folded on re-dispatch: the question is on the view.
+      // The held broadcast folded in the merge: the question is on the view.
       expect(userIds(w)).toEqual(["webchannel-user-2"]);
-      // ⚠️ AND IT IS BELOW THE ANSWER, WHICH IS THE HONEST RESIDUAL OF THIS RULE.
-      // The reply could not deliver seq 2, so the only copy is the held frame and
-      // it necessarily folds after the reply's rows; a reload re-projects it from
-      // seq order and puts it back on top. Order wrong beats CONTENT MISSING,
-      // which is what dropping it against "the reply carried this seq" would
-      // have cost — and it needs a row this build cannot decode to happen at all.
-      expect(project(w).map((m) => (m as { text: string }).text)).toEqual(["answer 4", "hello"]);
+      // ⚠️ AND ABOVE THE ANSWER, WHERE IT BELONGS. Rounds 3 and 4 folded it after
+      // the reply's rows and carried that as a documented live≠history residual;
+      // the seq-ordered merge closes it — the held frame IS the row for seq 2, so
+      // it folds in seq 2's place.
+      expect(project(w).map((m) => (m as { text: string }).text)).toEqual(["hello", "answer 4"]);
     } finally {
       warn.mockRestore();
     }
@@ -794,8 +796,83 @@ describe("#356 — partial replies (Telegram's differenceSlice)", () => {
       ),
     );
 
-    // ⚠️ THE CARD IS STILL THERE.
-    expect(w.state.messages.some((m) => m.id === "ap1")).toBe(true);
+    // ⚠️ THE CARD IS STILL THERE *AND* IT IS RESOLVED. Presence alone passed on
+    // the wrong state: re-applying the held request AFTER the folded resolution
+    // appended a card with no `resolvedDecision`, i.e. a CLICKABLE prompt for an
+    // approval the server had already answered. The seq-ordered merge folds the
+    // request at seq 11 and the resolution at seq 12, in that order.
+    const card = (w.state as unknown as {
+      approvals: Array<{ id: string; resolvedDecision?: string; actionable?: boolean }>;
+    }).approvals.find((a) => a.id === "ap1");
+    expect(card).toBeDefined();
+    expect(card?.resolvedDecision).toBe("allow-once");
+    expect(card?.actionable).toBe(false);
+    expect(cursorLast(w)).toBe(20);
+  });
+
+  it("#356 — a held tool phase BELOW the reply's rows does not overwrite the phase it delivered", () => {
+    // P1 shape 1. Cursor 9; the live START phase opens the gap and is held; the
+    // server skips row 11 as undeliverable (#343) and serves the END phase at 12.
+    // Re-dispatched after the fold, the stale START overwrote the END through the
+    // last-write-wins upsert and the card sat at `{phase:"start", status:"ok"}`
+    // for the session — round 3 dropped it by id, round 4 reopened it in the
+    // mirror direction. The merge folds seq 11 then seq 12.
+    const { w } = spied();
+    seed(w, 9);
+    w.handleMessage({ type: "agent_message", id: "z20", text: "answer 20", turnId: "t1", seq: 20 });
+    w.handleMessage({
+      type: "tool_activity",
+      id: "T", turnId: "t1", name: "bash", phase: "start", seq: 11,
+    });
+    w.handleMessage(
+      reply(
+        w,
+        [
+          {
+            seq: 12,
+            event: { kind: "tool", id: "T", turnId: "t1", name: "bash", phase: "end", status: "ok" },
+          },
+        ],
+        { maxSeq: 20 },
+      ),
+    );
+
+    const tool = w.state.messages.find((m) => m.id === "T") as {
+      phase?: string; status?: string;
+    } | undefined;
+    expect(tool?.phase).toBe("end");
+    expect(tool?.status).toBe("ok");
+    expect(cursorLast(w)).toBe(20);
+  });
+
+  it("#356 — a held answer BELOW a folded seal does not survive the seal's `remove`", () => {
+    // P1 shape 3, and the one where the old order silently RESURRECTED content.
+    // The seal at seq 12 removes answer A; the held `agent_message{A}@11` — the
+    // live rendering of the row the server skipped — re-applied after it and
+    // brought A back. In seq order the answer folds first and the seal removes it.
+    const { w } = spied();
+    seed(w, 9);
+    w.handleMessage({ type: "agent_message", id: "z20", text: "answer 20", turnId: "t1", seq: 20 });
+    w.handleMessage({ type: "agent_message", id: "A", text: "abandoned", turnId: "t1", seq: 11 });
+    w.handleMessage(
+      reply(
+        w,
+        [
+          {
+            seq: 12,
+            event: {
+              kind: "seal",
+              turnId: "t1",
+              answers: [{ id: "B", text: "kept" }],
+              remove: ["A"],
+            },
+          },
+        ],
+        { maxSeq: 20 },
+      ),
+    );
+
+    expect(project(w).map((m) => (m as { id: string }).id)).not.toContain("A");
     expect(cursorLast(w)).toBe(20);
   });
 
@@ -985,11 +1062,17 @@ describe("#356 — a reply that answers NOTHING is a stall, not a settle", () =>
     // ⚠️ THE ROUND-3 BUG THIS REPLACES, AND WHY THE OLD TEST MISSED IT. Round 3
     // re-armed the timer on every stall, which is a FRESH
     // `GET_DIFFERENCE_TIMEOUT_MS` — so a peer stalling faster than that pushed
-    // the deadline back forever and the timeout never fired. Measured over 10
-    // simulated minutes: ONE request, still catching-up, 12 001 held frames at a
-    // 50 ms cadence, nothing rendered. The old test advanced exactly 5 000 ms per
-    // stall, which is the one cadence at which re-arming and not re-arming look
-    // the same. This one sweeps three.
+    // the deadline back forever and the timeout never fired: over 10 simulated
+    // minutes at a 50 ms cadence, ONE request, still catching-up, nothing ever
+    // re-asked. The old test advanced exactly 5 000 ms per stall, which is the one
+    // cadence at which re-arming and not re-arming look the same. This one sweeps
+    // three.
+    //
+    // ⚠️ WHAT IS BOUNDED IS THE REQUEST RATE, NOT THE BUFFER. Frames arriving
+    // during a catch-up are held until a reply answers, however long that takes —
+    // that is the design, and it is what makes the view correct when the answer
+    // finally comes. The defect was not "frames accumulate"; it was that NOTHING
+    // was ever asked again, so the answer could not come at all.
     vi.useFakeTimers();
     try {
       const { w, getDifference } = spied();
@@ -1917,8 +2000,8 @@ describe("#246 half A — a refused seq-bearing frame must not advance the curso
     //
     // ⚠️ AND A THROW BEFORE THE FIRST EVENT LANDS IS A STALL, NOT A SETTLE. The
     // client learned nothing, so the request is in effect still outstanding: the
-    // cursor and its retry budget stay, the liveness timer is re-armed, and
-    // NOTHING is re-issued on this turn. Settling instead would re-dispatch the
+    // cursor, its retry budget AND its deadline all stay untouched, and NOTHING is
+    // re-issued on this turn. Settling instead would re-dispatch the
     // buffer, re-open the gap and re-request immediately with a fresh budget —
     // and a deterministic throw makes that a loop at round-trip speed (measured:
     // 21 requests over 20 replies).

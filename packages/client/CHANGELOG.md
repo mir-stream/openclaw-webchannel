@@ -75,13 +75,21 @@
     cursor covers it: a row the server could not send is covered but absent, and
     the held frame is proof its own live send succeeded. The give-up path carries
     nothing and so drops nothing.
-  - Frames held during a catch-up are re-dispatched in arrival order, seq-less
-    ones included — applying those immediately put a reasoning lane ABOVE the user
-    question that opened the turn (`reasoningDurable` is off by default, so every
-    reasoning frame is seq-less), which a reload then re-projects the other way.
-    What the reply supersedes is decided per id rather than per position: a held
-    frame whose id the reply authored durable text for is dropped, so a cumulative
-    draft can no longer overwrite the durable row with a prefix of itself.
+  - Frames held during a catch-up are folded in SEQ ORDER, merged with the
+    reply's own events rather than re-dispatched after them. The reducers are
+    last-write-wins, so a held frame BELOW the reply's rows — the shape that
+    arises whenever the server skips a row as undeliverable (#343) — overwrote
+    what the reply had just established: a stale tool `start` phase buried a
+    delivered `end`, a held `approval_request` re-appended a clickable card for an
+    approval the server had already resolved, and an answer a folded `seal`
+    removed came back. Seq-less frames, which have no place in that order, fold
+    after it in arrival order — applying those immediately put a
+    reasoning lane ABOVE the user question that opened the turn
+    (`reasoningDurable` is off by default, so every reasoning frame is seq-less),
+    which a reload then re-projects the other way. For those, what the reply
+    supersedes is decided by id: a held draft whose id the reply authored durable
+    text for is dropped, so a cumulative draft can no longer overwrite the durable
+    row with a prefix of itself.
   - A held `progress` is never dropped for a carried `placement`. It maps to that
     row, which claims the slot and journals no text, so dropping it on "the reply
     delivered this seq" blanked the draft the user was watching — permanently, for
@@ -97,8 +105,12 @@
     on its own cadence. Settling instead
     re-dispatched the buffer, which re-opened the gap on the spot with a fresh
     budget: measured at 51 requests for 50 non-advancing replies, at round-trip
-    speed, each costing the server a read and a byte fit. An empty COMPLETE reply
-    is not a stall — that is the spurious-gap unwind and must still close.
+    speed, each costing the server a read and a byte fit. An empty COMPLETE reply is a
+    stall too whenever a frame is still HELD — a held frame is evidence the gap
+    was real. Only an empty complete reply with an EMPTY buffer is the
+    spurious-gap unwind, and that one settles. The price is named: a spurious
+    detection now costs a full give-up cycle whenever anything is held, which is
+    strictly better than the storm it replaces.
 
 ## 0.7.0
 
