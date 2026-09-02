@@ -73,6 +73,15 @@ function cursorLast(w: Internals): number | undefined {
 
 const isCatchingUp = (w: Internals): boolean => w.cursor.state === "catching-up";
 
+/** The outstanding request's retry count — the budget a stall now shares. */
+function retriesOf(w: Internals): number {
+  const c = w.cursor;
+  return c.state === "catching-up" ? c.retries : 0;
+}
+
+/** Mirrors `nats-client-wrapper.ts`'s constant (not exported — it is internal). */
+const GET_DIFFERENCE_MAX_RETRIES = 3;
+
 /** The nonce of the outstanding request — what a reply has to echo. */
 function outstandingNonce(w: Internals): string {
   const c = w.cursor;
@@ -541,8 +550,8 @@ describe("#343/#356 — a held frame is dropped only when the reply CARRIED its 
     // (#343). Dropping the held frame against the CURSOR loses a bubble the user
     // is already looking at, for the rest of the session.
     //
-    // The band is real: a `difference` envelope around the same content measures
-    // ~121 B more than the live frame's, so a row inside that band is
+    // The band is real: a `difference` envelope around the same content is larger
+    // than the live frame's that carried it, so a row inside that band is
     // live-deliverable and difference-undeliverable — #343's own razor edge,
     // arriving from the other side.
     const { w, getDifference } = spied();
@@ -626,6 +635,73 @@ describe("#343/#356 — a held frame is dropped only when the reply CARRIED its 
     expect(cursorLast(w)).toBe(9);
   });
 
+  it("a `progress` at a CARRIED seq is kept — a placement carries no text", () => {
+    // ⚠️ THE SEQ RULE ALONE BLANKS THE DRAFT THE USER IS WATCHING. A `progress`
+    // maps to a `placement` row, which claims the slot and journals no text
+    // (§15.9). So when the reply carries that seq, "already delivered" is true of
+    // the SLOT and false of the TEXT — and dropping the held drafts leaves the
+    // lane empty until the next frame, permanently if the answer stalls.
+    // Re-folding one is an idempotent draft upsert on the same id.
+    const { w } = spied();
+    seed(w, 10);
+    // seq 14 opens the gap; three drafts for lane A then arrive, all at the
+    // placement's seq 12 (the journal dedupes `placement` on its answer id).
+    w.handleMessage({ type: "agent_message", id: "z14", text: "answer 14", turnId: "t1", seq: 14 });
+    w.handleMessage({ type: "progress", id: "A", text: "Wor", turnId: "t1", seq: 12 });
+    w.handleMessage({ type: "progress", id: "A", text: "Working on", turnId: "t1", seq: 12 });
+    w.handleMessage({ type: "progress", id: "A", text: "Working on it…", turnId: "t1", seq: 12 });
+
+    // The reply carries the placement for that lane — and nothing that authors it.
+    w.handleMessage(
+      reply(w, [
+        { seq: 11, event: { kind: "user", id: "webchannel-user-11", text: "go", turnId: "t1" } },
+        { seq: 12, event: { kind: "placement", answerId: "A", turnId: "t1" } },
+        { seq: 14, event: { kind: "bubble", answerId: "z14", text: "answer 14", turnId: "t1" } },
+      ]),
+    );
+
+    // ⚠️ THE DRAFT SURVIVES, at its latest text.
+    const draft = w.state.messages.find((m) => m.id === "A") as { text?: string } | undefined;
+    expect(draft?.text).toBe("Working on it…");
+    expect(cursorLast(w)).toBe(14);
+  });
+
+  it("#246 — a seq the reply could not DECODE does not drop the held frame that carries it", () => {
+    // The reply carried an event for seq 2 and this build refused it, so nothing
+    // was delivered for that seq. The held live frame at seq 2 is the only usable
+    // copy; dropping it against "the reply carried this seq" loses it.
+    const { w } = spied();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      seed(w, 1);
+      w.handleMessage({ type: "agent_message", id: "a4", text: "answer 4", turnId: "t1", seq: 4 });
+      // The live frame for seq 2 arrives and is held.
+      w.handleMessage({
+        type: "user_committed",
+        id: "webchannel-user-2", text: "hello", turnId: "t1", seq: 2, random_id: "rand-1",
+      });
+      w.handleMessage(
+        reply(w, [
+          // Known kind, unusable shape — refused by `decodeDurableEvent`.
+          { seq: 2, event: { kind: "user", id: "webchannel-user-2", turnId: "t1" } },
+          { seq: 4, event: { kind: "bubble", answerId: "a4", text: "answer 4", turnId: "t1" } },
+        ]),
+      );
+
+      // The held broadcast folded on re-dispatch: the question is on the view.
+      expect(userIds(w)).toEqual(["webchannel-user-2"]);
+      // ⚠️ AND IT IS BELOW THE ANSWER, WHICH IS THE HONEST RESIDUAL OF THIS RULE.
+      // The reply could not deliver seq 2, so the only copy is the held frame and
+      // it necessarily folds after the reply's rows; a reload re-projects it from
+      // seq order and puts it back on top. Order wrong beats CONTENT MISSING,
+      // which is what dropping it against "the reply carried this seq" would
+      // have cost — and it needs a row this build cannot decode to happen at all.
+      expect(project(w).map((m) => (m as { text: string }).text)).toEqual(["answer 4", "hello"]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("a held frame the reply DID carry is still dropped — no double-apply", () => {
     // The property the buffer exists for, unchanged: the reply is authoritative
     // for a row it carried, so the held copy of that same row must not re-fold.
@@ -683,25 +759,50 @@ describe("#343/#356 — a held frame is dropped only when the reply CARRIED its 
   });
 });
 
-describe("#356 — a seq-less frame is never held: it has no row to double-apply", () => {
-  it("a reasoning DRAFT folds during a catch-up instead of landing after the durable final", () => {
-    // Only a `final: true` reasoning frame is journaled, so a streaming draft
-    // carries NO seq. Held, it re-dispatches AFTER the reply's fold — and because
-    // a draft is CUMULATIVE, a mid-burst one then overwrites the durable final
-    // with a prefix of itself. It has no row, so no reply can re-deliver it and
-    // nothing can double-apply: it belongs on the view now.
+describe("#356 — a seq-less frame is HELD, and the reply's durable row supersedes it", () => {
+  it("ORDER: a seq-less reasoning draft lands BELOW the rows the reply delivers", () => {
+    // ⚠️ `reasoningDurable` IS OFF BY DEFAULT, so EVERY reasoning frame is
+    // seq-less. Applying one immediately during a catch-up puts it above
+    // everything the reply is about to fold — here, above the user question that
+    // opened the turn — and `applyReasoning` upserts by id, so it stays there for
+    // the session. A reload re-projects from seq order and disagrees: live ≠
+    // history on the ordinary gap path.
+    const { w } = spied();
+    seed(w, 10);
+    // seq 13 opens the gap and is held.
+    w.handleMessage({ type: "agent_message", id: "a13", text: "answer 13", turnId: "t1", seq: 13 });
+    expect(isCatchingUp(w)).toBe(true);
+    // A seq-less reasoning draft arrives DURING the round-trip.
+    w.handleMessage({ type: "reasoning", id: "r1", turnId: "t1", text: "thinking" });
+    // Held, not applied: nothing is on the view yet.
+    expect(w.state.messages).toHaveLength(0);
+
+    // The reply delivers the rows BELOW it: the user opener and the first answer.
+    w.handleMessage(
+      reply(w, [
+        { seq: 11, event: { kind: "user", id: "webchannel-user-11", text: "hello", turnId: "t1" } },
+        { seq: 12, event: { kind: "bubble", answerId: "a12", text: "answer 12", turnId: "t1" } },
+        { seq: 13, event: { kind: "bubble", answerId: "a13", text: "answer 13", turnId: "t1" } },
+      ]),
+    );
+
+    // ⚠️ THE REASONING IS BELOW THE QUESTION THAT STARTED THE TURN, which is the
+    // order a reload re-projects from seq.
+    expect(w.state.messages.map((m) => m.id)).toEqual([
+      "webchannel-user-11", "a12", "a13", "r1",
+    ]);
+    expect(cursorLast(w)).toBe(13);
+  });
+
+  it("NO OVERWRITE: a held draft whose id the reply AUTHORED is dropped, not re-folded", () => {
+    // The other half, and the reason holding one is safe. A cumulative draft
+    // re-folded after the durable row would take the text back to a prefix of
+    // itself. `uncarried`'s first rule drops it: the reply authored that id.
     const { w } = spied();
     seed(w, 1);
     w.handleMessage({ type: "agent_message", id: "a4", text: "answer 4", turnId: "t1", seq: 4 });
-    expect(isCatchingUp(w)).toBe(true);
-
-    // Two seq-less drafts arrive while the request is outstanding.
     w.handleMessage({ type: "reasoning", id: "r1", turnId: "t1", text: "thinking par" });
-    const midCatchUp = w.state.messages.find((m) => m.id === "r1") as { text?: string } | undefined;
-    // ⚠️ FOLDED IMMEDIATELY, not held.
-    expect(midCatchUp?.text).toBe("thinking par");
 
-    // The reply then carries the DURABLE reasoning row, which is the full text.
     w.handleMessage(
       reply(w, [
         {
@@ -712,14 +813,31 @@ describe("#356 — a seq-less frame is never held: it has no row to double-apply
       ]),
     );
 
-    // ⚠️ THE DURABLE TEXT SURVIVES. Held, the draft would have landed last and
-    // truncated it back to "thinking par".
     const healed = w.state.messages.find((m) => m.id === "r1") as { text?: string } | undefined;
     expect(healed?.text).toBe("thinking paragraph, complete");
     expect(cursorLast(w)).toBe(4);
   });
 
-  it("a seq-less frame folded mid-catch-up moves no cursor and opens no gap", () => {
+  it("a held draft the reply did NOT author still folds, after the reply's rows", () => {
+    // The complement: with `reasoningDurable` off there IS no durable reasoning
+    // row, so nothing supersedes the draft and dropping it would lose the lane.
+    const { w } = spied();
+    seed(w, 1);
+    w.handleMessage({ type: "agent_message", id: "a4", text: "answer 4", turnId: "t1", seq: 4 });
+    w.handleMessage({ type: "reasoning", id: "r1", turnId: "t1", text: "thinking" });
+    w.handleMessage(
+      reply(w, [
+        { seq: 2, event: { kind: "bubble", answerId: "a2", text: "answer 2", turnId: "t1" } },
+        { seq: 4, event: { kind: "bubble", answerId: "a4", text: "answer 4", turnId: "t1" } },
+      ]),
+    );
+
+    const held = w.state.messages.find((m) => m.id === "r1") as { text?: string } | undefined;
+    expect(held?.text).toBe("thinking");
+    expect(w.state.messages.map((m) => m.id)).toEqual(["a2", "a4", "r1"]);
+  });
+
+  it("a seq-less frame moves no cursor and opens no gap", () => {
     const { w, getDifference } = spied();
     seed(w, 1);
     w.handleMessage({ type: "agent_message", id: "a4", text: "answer 4", turnId: "t1", seq: 4 });
@@ -731,45 +849,86 @@ describe("#356 — a seq-less frame is never held: it has no row to double-apply
   });
 });
 
-describe("#356 — the client does not depend on the server for its own liveness", () => {
-  it("a partial reply that covers nothing SETTLES instead of re-requesting forever", () => {
-    // `history-serve.ts` guarantees a partial reply covers past the floor it
-    // answers. A reply that decodes and violates it would otherwise re-request
-    // the same floor at RTT speed, with no timer involved and no bound.
-    // ⚠️ THE GAP IS OPENED BY A BARE CARRIER, SO THE BUFFER IS EMPTY — and that
-    // isolates the property. With a held frame in the buffer, settling
-    // re-dispatches it and it re-opens the same gap through the ORDINARY path,
-    // which is correct, bounded by the retry budget, and indistinguishable from
-    // the defect. What is under test is the reply's own re-request, so there must
-    // be nothing else able to issue one.
+describe("#356 — a reply that answers NOTHING is a stall, not a settle", () => {
+  it("THE REPRO: non-advancing partial replies cost ONE request, not one per reply", () => {
+    // ⚠️ ROUND 2 GUARDED THIS AND THE GUARD WAS INERT IN THE ORDINARY CASE.
+    // Settling at the unchanged floor re-dispatches the BUFFER; the held frame
+    // that opened the gap is still beyond the cursor, so `observeSeq` re-opens
+    // the catch-up on the spot — with `retries` back at 0, because `openCatchUp`
+    // mints a fresh cursor. Measured before this fix: 50 replies → 51 requests,
+    // `retries: 0`, no time passing, each one costing the server a read and a
+    // byte fit. The guard only helped when the buffer was EMPTY.
+    vi.useFakeTimers();
+    try {
+      const { w, getDifference } = spied();
+      seed(w, 100);
+      // A HELD FRAME IN THE BUFFER — the configuration round 2's guard missed.
+      w.handleMessage({ type: "agent_message", id: "a400", text: "answer 400", turnId: "t1", seq: 400 });
+      expect(getDifference).toHaveBeenCalledTimes(1);
+
+      // A responding peer that answers nothing, 50 times, with no clock.
+      for (let i = 0; i < 50; i++) {
+        w.handleMessage(reply(w, [], { partial: true, maxSeq: 100 }));
+      }
+
+      // ⚠️ STILL ONE REQUEST. The round-trip never ended, so nothing re-opened it.
+      expect(getDifference).toHaveBeenCalledTimes(1);
+      expect(isCatchingUp(w)).toBe(true);
+      expect(cursorLast(w)).toBe(100);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a stall re-issues on the TIMER's cadence and spends the ordinary budget", () => {
+    vi.useFakeTimers();
+    try {
+      const { w, getDifference } = spied();
+      seed(w, 100);
+      w.handleMessage({ type: "agent_message", id: "a400", text: "answer 400", turnId: "t1", seq: 400 });
+
+      // Each cycle: the peer answers nothing, then the liveness timer fires.
+      for (let i = 0; i < GET_DIFFERENCE_MAX_RETRIES; i++) {
+        w.handleMessage(reply(w, [], { partial: true, maxSeq: 100 }));
+        vi.advanceTimersByTime(5_000);
+      }
+      // Initial + MAX_RETRIES re-issues, exactly as a SILENT peer would cost.
+      expect(getDifference).toHaveBeenCalledTimes(GET_DIFFERENCE_MAX_RETRIES + 1);
+      expect(retriesOf(w)).toBe(GET_DIFFERENCE_MAX_RETRIES);
+
+      // The budget is spent: the next stall GIVES UP, and the give-up re-dispatches
+      // the held frame, which re-opens the gap with a fresh budget. That is the
+      // steady state — one cycle per ~20 s, never one request per round-trip.
+      w.handleMessage(reply(w, [], { partial: true, maxSeq: 100 }));
+      expect(getDifference).toHaveBeenCalledTimes(GET_DIFFERENCE_MAX_RETRIES + 2);
+      expect(retriesOf(w)).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an EMPTY COMPLETE reply is not a stall — the spurious-gap unwind still closes", () => {
+    // `partial: false` with no events is the server saying "there is nothing past
+    // your floor". It moves no floor either, and it must still settle or a raced
+    // detection would never close.
     const { w, getDifference } = spied();
-    seed(w, 100);
+    seed(w, 4);
+    // A bare carrier opens the gap, so the buffer is empty and the settle is
+    // observable on its own.
     seedOptimisticUser(w, {
       localId: "u-0", receiptKey: "r-0", randomId: "rand-1", text: "hello", wireId: "t1",
     });
     w.handleMessage({
       type: "ack",
       ids: ["u-0"],
-      committed: [{ random_id: "rand-1", messageId: "webchannel-user-400", seq: 400 }],
+      committed: [{ random_id: "rand-1", messageId: "webchannel-user-9", seq: 9 }],
     });
     expect(getDifference).toHaveBeenCalledTimes(1);
 
-    // A RESPONDING PEER, which is what makes this a loop rather than one bad
-    // reply. Answer every outstanding request with the same non-advancing partial
-    // reply, and bound the rounds so a regression fails instead of hanging.
-    let replies = 0;
-    for (let round = 0; round < 20 && isCatchingUp(w); round++) {
-      replies += 1;
-      w.handleMessage(reply(w, [], { partial: true, maxSeq: 100 }));
-    }
-
-    // ONE reply consumed, and the round-trip is over: it settled at the floor it
-    // already had rather than re-asking about it. Without the guard this runs the
-    // full 20 rounds at RTT speed — no timer involved, no bound.
-    expect(replies).toBe(1);
-    expect(getDifference).toHaveBeenCalledTimes(1);
+    w.handleMessage(reply(w, [], { maxSeq: 4 }));
     expect(isCatchingUp(w)).toBe(false);
-    expect(cursorLast(w)).toBe(100);
+    expect(getDifference).toHaveBeenCalledTimes(1);
+    expect(cursorLast(w)).toBe(4);
   });
 });
 
@@ -1573,57 +1732,107 @@ describe("#246 half A — a refused seq-bearing frame must not advance the curso
     }
   });
 
-  it("a fold that throws cannot wedge gap-sync — the round-trip closes out and re-detects", () => {
+  it("#356 — a listener that closes the client during the fold is not overridden by the transition", () => {
+    // `applyDurable` runs reducers and public listeners, and a listener may call
+    // `close()` — which runs `resetCursorForConnection` and lands a valid `synced`
+    // cursor with no timer and no buffer. The `finally` then transitioned on top
+    // of it and re-entered `catching-up` ON A CLOSED CLIENT: a request nothing
+    // will answer, a timer nothing will clear. Object identity is the same test
+    // the timer uses.
+    const { w, getDifference } = spied();
+    seed(w, 1);
+    w.handleMessage({ type: "agent_message", id: "a4", text: "answer 4", turnId: "t1", seq: 4 });
+    expect(getDifference).toHaveBeenCalledTimes(1);
+
+    const instance = w as unknown as {
+      foldDifferenceEvent?: () => void;
+      close: () => void;
+    };
+    instance.foldDifferenceEvent = () => {
+      instance.close();
+    };
+    // A PARTIAL reply, so the un-guarded path would re-open the catch-up.
+    w.handleMessage(
+      reply(
+        w,
+        [{ seq: 2, event: { kind: "bubble", answerId: "a2", text: "answer 2", turnId: "t1" } }],
+        { partial: true, maxSeq: 2 },
+      ),
+    );
+
+    expect(isCatchingUp(w)).toBe(false);
+    expect(getDifference).toHaveBeenCalledTimes(1);
+  });
+
+  it("a fold that throws cannot wedge gap-sync — it stalls, on the timer's cadence", () => {
     // The test above proves the VALIDATOR keeps the known throw out of the arm.
     // This one DEFEATS the validator — a perfectly well-formed event, a fold made
     // to throw — because the property that must hold is not "this event shape is
     // handled" but "no throw from the fold can wedge gap-sync".
     //
-    // ⚠️ AND THE SERVER'S `maxSeq` MUST NOT PAPER OVER IT. The reply says "you are
-    // synced to 2"; the fold of seq 2 threw, so the client is NOT, and the cursor
-    // stays at 1. The `completed` flag in `applyDifference` is what makes the
-    // difference between degrading honestly and claiming a range that was never
-    // applied.
-    const { w, getDifference } = spied();
-    seed(w, 1);
-    w.handleMessage({ type: "agent_message", id: "a3", text: "answer 3", turnId: "t1", seq: 3 });
-    expect(getDifference).toHaveBeenCalledTimes(1);
-    expect(getDifference).toHaveBeenCalledWith(1, outstandingNonce(w));
+    // ⚠️ AND A THROW BEFORE THE FIRST EVENT LANDS IS A STALL, NOT A SETTLE. The
+    // client learned nothing, so the request is in effect still outstanding: the
+    // cursor and its retry budget stay, the liveness timer is re-armed, and
+    // NOTHING is re-issued on this turn. Settling instead would re-dispatch the
+    // buffer, re-open the gap and re-request immediately with a fresh budget —
+    // and a deterministic throw makes that a loop at round-trip speed (measured:
+    // 21 requests over 20 replies).
+    //
+    // ⚠️ THE SERVER'S `maxSeq` MUST NOT PAPER OVER IT EITHER. The reply says "you
+    // are synced to 2"; the fold of seq 2 threw, so the client is NOT, and the
+    // cursor stays at 1. `completed` is what makes the difference between
+    // degrading honestly and claiming a range that was never applied.
+    vi.useFakeTimers();
+    try {
+      const { w, getDifference } = spied();
+      seed(w, 1);
+      w.handleMessage({ type: "agent_message", id: "a3", text: "answer 3", turnId: "t1", seq: 3 });
+      expect(getDifference).toHaveBeenCalledTimes(1);
+      const first = outstandingNonce(w);
 
-    const instance = w as unknown as { foldDifferenceEvent?: () => void };
-    const thrower = reply(
-      w,
-      [{ seq: 2, event: { kind: "bubble", answerId: "a2", text: "answer 2", turnId: "t1" } }],
-      { maxSeq: 2 },
-    );
-    instance.foldDifferenceEvent = () => {
-      throw new Error("fold blew up");
-    };
-    // The throw escapes THIS call because the test drives `handleMessage`
-    // directly; in production `notifyMessageListeners` swallows it, which is
-    // exactly why the cleanup cannot live after the loop.
-    expect(() => w.handleMessage(thrower)).toThrow("fold blew up");
+      const instance = w as unknown as { foldDifferenceEvent?: () => void };
+      const thrower = reply(
+        w,
+        [{ seq: 2, event: { kind: "bubble", answerId: "a2", text: "answer 2", turnId: "t1" } }],
+        { maxSeq: 2 },
+      );
+      instance.foldDifferenceEvent = () => {
+        throw new Error("fold blew up");
+      };
+      // The throw escapes THIS call because the test drives `handleMessage`
+      // directly; in production `notifyMessageListeners` swallows it, which is
+      // exactly why the cleanup cannot live after the loop.
+      expect(() => w.handleMessage(thrower)).toThrow("fold blew up");
 
-    // Nothing folded, so the cursor did NOT move past the failed event…
-    expect(cursorLast(w)).toBe(1);
-    // …and the buffer was re-dispatched: the seq-3 frame re-detected the gap and
-    // asked again. THAT is the difference between degrading and wedging.
-    expect(getDifference).toHaveBeenCalledTimes(2);
-    expect(getDifference).toHaveBeenLastCalledWith(1, outstandingNonce(w));
+      // Nothing folded, so the cursor did NOT move past the failed event…
+      expect(cursorLast(w)).toBe(1);
+      // …and nothing was re-issued on this turn: the round-trip is still open.
+      expect(getDifference).toHaveBeenCalledTimes(1);
+      expect(isCatchingUp(w)).toBe(true);
 
-    // End to end: with the fold working again, the re-issued request heals the
-    // stream exactly as an ordinary one does.
-    delete instance.foldDifferenceEvent;
-    w.handleMessage(
-      reply(w, [
-        { seq: 2, event: { kind: "bubble", answerId: "a2", text: "answer 2", turnId: "t1" } },
-        { seq: 3, event: { kind: "bubble", answerId: "a3", text: "answer 3", turnId: "t1" } },
-      ]),
-    );
-    expect(project(w).map((m) => (m as { text: string }).text)).toEqual([
-      "answer 2", "answer 3",
-    ]);
-    expect(cursorLast(w)).toBe(3);
-    expect(isCatchingUp(w)).toBe(false);
+      // The re-issue comes from the TIMER, with a fresh nonce, on the ordinary
+      // cadence. THAT is the difference between degrading and wedging.
+      delete instance.foldDifferenceEvent;
+      vi.advanceTimersByTime(5_000);
+      expect(getDifference).toHaveBeenCalledTimes(2);
+      expect(getDifference).toHaveBeenLastCalledWith(1, outstandingNonce(w));
+      expect(outstandingNonce(w)).not.toBe(first);
+
+      // End to end: with the fold working again, the re-issued request heals the
+      // stream exactly as an ordinary one does.
+      w.handleMessage(
+        reply(w, [
+          { seq: 2, event: { kind: "bubble", answerId: "a2", text: "answer 2", turnId: "t1" } },
+          { seq: 3, event: { kind: "bubble", answerId: "a3", text: "answer 3", turnId: "t1" } },
+        ]),
+      );
+      expect(project(w).map((m) => (m as { text: string }).text)).toEqual([
+        "answer 2", "answer 3",
+      ]);
+      expect(cursorLast(w)).toBe(3);
+      expect(isCatchingUp(w)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

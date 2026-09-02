@@ -229,6 +229,48 @@ type SeqCursor =
       timer: ReturnType<typeof setTimeout> | null;
     };
 
+/**
+ * #356 — what ONE `difference` reply actually delivered, which is what decides
+ * whether a frame held during the round-trip is now redundant.
+ *
+ * TWO sets, because a held frame can be superseded on either of two keys and the
+ * seq alone is not enough:
+ *  - `seqs` — the seqs the reply FOLDED. Not the range it covers: a row the
+ *    server could not send to this peer is covered but absent, and a row this
+ *    build could not decode was carried but not applied. Neither may drop a held
+ *    frame that IS foldable.
+ *  - `authoredIds` — the ids the reply authored durable TEXT for. This is what
+ *    supersedes a DRAFT, which carries no seq of its own when the account has
+ *    `reasoningDurable` off (only a closing reasoning frame is ever journaled).
+ *    A `placement` contributes NOTHING here on purpose: it claims a slot and
+ *    authors no text, so it cannot supersede the draft that fills it.
+ */
+type CarriedRows = { seqs: ReadonlySet<number>; authoredIds: ReadonlySet<string> };
+
+/**
+ * The ids ONE folded durable event authored text for — what a held live frame is
+ * measured against in `uncarried`.
+ *
+ * ⚠️ `placement` YIELDS NOTHING, AND THAT IS THE WHOLE POINT OF THE FUNCTION. It
+ * claims a slot and carries no text (§15.9 — the draft text is deliberately never
+ * journaled), so it cannot supersede the `progress` frames that fill that slot.
+ * Every other kind names the row it wrote, and a `seal` names one per answer.
+ * `messageDeleted` names a row it removed, which supersedes a held frame for that
+ * id just as authoring does.
+ */
+function authoredIdsOf(event: DurableEvent): string[] {
+  switch (event.kind) {
+    case "placement":
+      return [];
+    case "bubble":
+      return [event.answerId];
+    case "seal":
+      return event.answers.map((a) => a.id);
+    default:
+      return [event.id];
+  }
+}
+
 type SyncedCursor = Extract<SeqCursor, { state: "synced" }>;
 type CatchingUpCursor = Extract<SeqCursor, { state: "catching-up" }>;
 
@@ -3430,29 +3472,28 @@ export class WebChannelNATSClient {
   private observeSeq(seq: number | undefined, frame: InboundMessage | undefined): void {
     const cursor = this.cursor;
 
-    // CATCHING-UP: a reply is owed, so nothing with a ROW behind it may be applied
-    // or advanced until it lands.
+    // CATCHING-UP: a reply is owed, so no durable frame may be applied or advanced
+    // until it lands. EVERY seq-bearing-type frame is held, in arrival order —
+    // with a seq or without one — and a bare carrier (an `ack` echo, a snapshot
+    // high-water) is DROPPED, because its frame's live effects already ran and
+    // applying its seq on top of a PARTIAL reply is exactly how a range got
+    // skipped (#352).
     //
-    //  - a frame WITH a seq is HELD: folding one the difference is also about to
-    //    carry would apply the same row twice, and `user` is not idempotent
-    //    across the two ids a lost ack leaves behind (#337 — the local optimistic
-    //    id and the server's `webchannel-user-<seq>`);
-    //  - a frame with NO seq is APPLIED NOW. It has no journal row, so no reply
-    //    can re-deliver it and nothing can double-apply. Holding it was a defect:
-    //    only a `final: true` reasoning frame is journaled, so an unthrottled
-    //    reasoning DRAFT is seq-less — held, it lands AFTER the reply's durable
-    //    final and a cumulative draft overwrites it with a prefix of itself. It
-    //    never touches the cursor either way;
-    //  - a bare carrier (an `ack` echo, a snapshot high-water) is DROPPED: its
-    //    frame's live effects already ran, and applying its seq on top of a
-    //    PARTIAL reply is exactly how a range got skipped (#352).
+    // ⚠️ A SEQ-LESS FRAME IS HELD TOO, AND THAT IS ABOUT ORDER, NOT ABOUT
+    // DOUBLE-APPLYING. It has no journal row, so no reply can re-deliver it —
+    // but the reply's events are the rows BELOW it, and applying it first puts it
+    // above them for the session. Concretely: `reasoningDurable` is OFF by
+    // default, so EVERY reasoning frame is seq-less; applied during a catch-up
+    // for `user@11`/`bubble@12`, the reasoning lane renders ABOVE the user
+    // question that opened the turn (`applyReasoning` upserts by id and keeps its
+    // position), and a reload re-projects it from seq order — live ≠ history on
+    // the ordinary gap path.
+    //
+    // What it must NOT cost is the draft being overwritten by its own stale
+    // prefix on the way back in; `uncarried` owns that, by dropping a held frame
+    // whose id the reply AUTHORED durable text for.
     if (cursor.state === "catching-up") {
-      if (frame === undefined) return;
-      if (seq === undefined) {
-        this.applyFrame(frame);
-        return;
-      }
-      cursor.buffer.push(frame);
+      if (frame !== undefined) cursor.buffer.push(frame);
       return;
     }
 
@@ -3507,9 +3548,16 @@ export class WebChannelNATSClient {
    *
    * `buffer` is passed in rather than started empty because the two callers hand
    * over different things: a fresh gap contributes the frame that revealed it,
-   * while a PARTIAL reply hands the whole buffer straight back (Telegram: "the
-   * query must be repeated, using the intermediate status as the current status" —
-   * the frames held for the first request are still held for the second).
+   * while a PARTIAL reply hands back the frames it did not itself deliver
+   * (Telegram: "the query must be repeated, using the intermediate status as the
+   * current status").
+   *
+   * ⚠️ THIS MINTS A FRESH CURSOR, SO IT RESETS `retries` TO 0 — and that is only
+   * correct because both callers have PROGRESS behind them: a gap newly detected
+   * from a moved cursor, or a slice that covered past the floor it answered. A
+   * reply that moved NOTHING must never come through here; it goes to
+   * `onCatchUpStalled`, which keeps the budget, because otherwise a peer that
+   * answers nothing gets an unbounded fresh budget every round-trip.
    */
   private openCatchUp(afterSeq: number, buffer: InboundMessage[]): void {
     const cursor: CatchingUpCursor = {
@@ -3534,16 +3582,17 @@ export class WebChannelNATSClient {
    * to `openCatchUp`, and `resetCursorForConnection` drops the buffer rather
    * than folding it.
    *
-   * `carriedSeqs` is the reply's own — `undefined` on the give-up path, where no
-   * reply landed and therefore nothing may be dropped. See `redispatchBuffered`.
+   * `carried` is the reply's own — `undefined` on the give-up and stall paths,
+   * where no reply delivered anything and therefore nothing may be dropped. See
+   * `uncarried`.
    */
   private settleSynced(
     last: number,
     buffered: InboundMessage[],
-    carriedSeqs: ReadonlySet<number> | undefined,
+    carried: CarriedRows | undefined,
   ): void {
     this.cursor = { state: "synced", last };
-    this.redispatchBuffered(buffered, carriedSeqs);
+    this.redispatchBuffered(buffered, carried);
   }
 
   /**
@@ -3558,9 +3607,11 @@ export class WebChannelNATSClient {
    * for exactly those seqs "the reply already delivered it" is false — and
    * dropping one loses a bubble the user already saw, for the session. The band
    * is real, not theoretical: a `difference` envelope around the same content is
-   * ~121 B larger than the live frame's (measured 1218 vs 1097), so a row inside
-   * that band is live-deliverable and difference-undeliverable, which is #343's
-   * own razor-edge band arriving from the other side.
+   * larger than the live frame's that carried it, so a row inside that band is
+   * live-deliverable and difference-undeliverable — #343's own razor edge,
+   * arriving from the other side. (The width of the band is not quoted here: two
+   * independent measurements disagreed on it, and the argument needs only that
+   * it is non-zero.)
    *
    * So the rule is: drop a buffered frame only when an event in the reply
    * actually carried its seq. Anything else re-folds through `observeSeq`'s
@@ -3587,34 +3638,68 @@ export class WebChannelNATSClient {
    */
   private redispatchBuffered(
     buffered: InboundMessage[],
-    carriedSeqs: ReadonlySet<number> | undefined,
+    carried: CarriedRows | undefined,
   ): void {
-    for (const m of this.uncarried(buffered, carriedSeqs)) this.handleMessage(m);
+    for (const m of this.uncarried(buffered, carried)) this.handleMessage(m);
   }
 
   /**
-   * The held frames a reply did NOT carry an event for — the ones still owed to
-   * the view.
+   * The held frames a reply did NOT supersede — the ones still owed to the view.
    *
    * Split out because BOTH exits from a reply need it and they need it at
    * different moments: a complete reply re-dispatches these (`settleSynced`),
    * while a PARTIAL one carries them into the next request. Filtering only on the
-   * re-dispatch would let a frame the first reply carried survive across a slice
-   * boundary and fold after the second one — a double-apply that today is
-   * absorbed (`applyUser` is id-idempotent) and tomorrow is a new event kind's
-   * problem.
+   * re-dispatch would let a frame the first slice delivered survive across the
+   * boundary and fold after the second one.
    *
-   * `undefined` means nothing was carried (the give-up path), so nothing is
-   * filtered.
+   * `undefined` means nothing was carried — the give-up and stall paths, where no
+   * reply landed — so nothing is filtered.
+   *
+   * ── THE THREE RULES, IN THIS ORDER ──
+   *
+   * 1. **The reply AUTHORED text for this frame's id ⇒ drop.** The durable row is
+   *    the final word on that id and the held frame is, by construction, older.
+   *    This is the only rule that reaches a SEQ-LESS frame, and it is why a
+   *    reasoning draft held through a catch-up does not come back and overwrite
+   *    the durable reasoning row with a prefix of itself.
+   * 2. **Otherwise a `progress` is KEPT, even at a seq the reply carried.** A
+   *    `progress` is a DRAFT UPSERT and the row it maps to is a `placement`,
+   *    which carries no text at all — so "the reply already delivered this seq"
+   *    is true of the slot and false of the text. Dropping them blanks the draft
+   *    the user is watching until the next frame, permanently if the answer never
+   *    produces one. Re-folding is harmless: an upsert of the same draft text on
+   *    the same id.
+   * 3. **Otherwise, the reply folded this frame's seq ⇒ drop.** The ordinary
+   *    double-apply guard, and the reason the buffer exists at all.
+   *
+   * ⚠️ WHAT IS DELIBERATELY NOT A RULE: "the cursor now covers this seq". The
+   * cursor after a reply also covers seqs the server SKIPPED as undeliverable at
+   * this peer's `max_payload` (#343) — inside `maxSeq`, carried by no event. A
+   * frame sitting in this buffer is PROOF that its own live send succeeded, so
+   * for those seqs "already delivered" is false, and dropping one loses a bubble
+   * the user already saw. The band is real rather than theoretical: a
+   * `difference` envelope around the same content is larger than the live frame's
+   * that carried it, so a row inside that band is live-deliverable and
+   * difference-undeliverable — #343's own razor edge, arriving from the other
+   * side.
+   *
+   * ⚠️ THIS IS NOT A SECOND CURSOR SITE, AND MUST NOT BECOME ONE (#246 half A).
+   * `redispatchBuffered` re-enters through `handleMessage`, so a re-dispatched
+   * frame moves the cursor through the ONE gated statement in `observeSeq` —
+   * refused ⇒ no advance. A frame that still reveals a gap re-opens one cleanly,
+   * re-buffering the remainder onto the fresh cursor's buffer.
    */
   private uncarried(
     buffered: InboundMessage[],
-    carriedSeqs: ReadonlySet<number> | undefined,
+    carried: CarriedRows | undefined,
   ): InboundMessage[] {
-    if (carriedSeqs === undefined) return buffered;
+    if (carried === undefined) return buffered;
     return buffered.filter((m) => {
+      const id = typeof m.id === "string" && m.id.length > 0 ? m.id : undefined;
+      if (id !== undefined && carried.authoredIds.has(id)) return false;
+      if (m.type === "progress") return true;
       const seq = isWireSeq(m.seq) ? m.seq : undefined;
-      return seq === undefined || !carriedSeqs.has(seq);
+      return seq === undefined || !carried.seqs.has(seq);
     });
   }
 
@@ -3637,6 +3722,61 @@ export class WebChannelNATSClient {
       clearTimeout(cursor.timer);
       cursor.timer = null;
     }
+  }
+
+  /**
+   * #356 round 3 — did this reply FAIL TO MOVE THE FLOOR while claiming there was
+   * more to give?
+   *
+   * Two shapes, one condition. A `partial: true` reply whose coverage does not
+   * exceed the floor it answered, and a reply whose fold threw before a single
+   * event landed — in both the client learned nothing and the request is, in
+   * effect, still outstanding.
+   *
+   * ⚠️ AND AN EMPTY COMPLETE REPLY IS NOT ONE OF THEM. `partial: false` with no
+   * events is the SPURIOUS-GAP UNWIND: the server read the journal, found nothing
+   * past the floor, and said so. It moves no floor and must still settle, or a
+   * raced detection would never close.
+   */
+  private stalled(
+    msg: InboundMessage,
+    covered: number,
+    completed: boolean,
+    cursor: CatchingUpCursor,
+  ): boolean {
+    if (covered > cursor.afterSeq) return false;
+    return msg.partial === true || !completed;
+  }
+
+  /**
+   * #356 round 3 — a reply landed, matched, and answered NOTHING. Treat it as a
+   * lost reply: same budget, same cadence.
+   *
+   * ⚠️ SETTLING HERE WAS AN UNBOUNDED REQUEST LOOP, AND THE GUARD THAT WAS MEANT
+   * TO STOP IT WAS INERT IN THE ORDINARY CASE. Round 2 settled at the unchanged
+   * floor on the theory that the client would then wait for the next durable
+   * frame. It does not: settling re-dispatches the BUFFER, the held frame that
+   * opened this gap is still beyond the cursor, and `observeSeq` re-opens the
+   * catch-up on the spot — with `retries` back at 0, because `openCatchUp` mints a
+   * fresh cursor. Measured on the wrapper: 50 non-advancing `partial` replies
+   * produced 51 requests with `retries: 0` and no time passing, each costing the
+   * server a read and a byte fit. The guard only ever helped when the buffer
+   * happened to be EMPTY, which is the rare shape.
+   *
+   * So the reply does not end the round-trip: the cursor stays, its retry count
+   * stays, and the liveness timer is re-armed. `onCatchUpTimeout` owns the
+   * counter and the re-issue, so a peer that keeps answering nothing costs one
+   * request per `GET_DIFFERENCE_TIMEOUT_MS` — the give-up cadence — instead of
+   * one per round-trip. When the budget is spent it gives up exactly as a silent
+   * peer does.
+   */
+  private onCatchUpStalled(cursor: CatchingUpCursor): void {
+    if (cursor.retries >= GET_DIFFERENCE_MAX_RETRIES) {
+      // `undefined`: this reply delivered nothing, so nothing may be dropped.
+      this.settleSynced(cursor.afterSeq, cursor.buffer, undefined);
+      return;
+    }
+    this.armCatchUpTimer(cursor);
   }
 
   /**
@@ -3784,11 +3924,12 @@ export class WebChannelNATSClient {
 
     let last = cursor.afterSeq;
     let completed = false;
-    // The seqs this reply actually CARRIED AN EVENT FOR — which is not the same
-    // as the range it covers, because a row the server could not send to this
-    // peer is covered but absent. `redispatchBuffered` argues why the difference
-    // is a delivered bubble.
+    // What this reply actually DELIVERED — see `CarriedRows`. Both sets take an
+    // entry only for an event that was decoded AND folded: a row this build
+    // cannot read advances the cursor past itself (the documented asymmetry) but
+    // delivers nothing, so it may not drop a held frame that IS foldable.
     const carriedSeqs = new Set<number>();
+    const authoredIds = new Set<string>();
     // ⚠️ `try/finally` (#246 half A): the transition below MUST run even if a fold
     // throws. `notifyMessageListeners` (`nats-client.ts`) swallows a listener's
     // throw, so an escape from here would leave the cursor stuck in `catching-up`
@@ -3819,6 +3960,8 @@ export class WebChannelNATSClient {
         const decoded = decodeDurableEvent(event);
         if (decoded.ok) {
           this.foldDifferenceEvent(decoded.event);
+          carriedSeqs.add(seq);
+          for (const id of authoredIdsOf(decoded.event)) authoredIds.add(id);
         } else if (decoded.kind === "malformed") {
           // Only the MALFORMED case is reported: an unknown kind is an ordinary
           // version skew and would be noise on every frame from a newer server,
@@ -3828,35 +3971,36 @@ export class WebChannelNATSClient {
               `in a difference: ${decoded.reason}`,
           );
         }
-        carriedSeqs.add(seq);
         last = seq;
       }
       completed = true;
     } finally {
-      // `maxSeq` is the highest seq this reply ACCOUNTS FOR, which is more than
-      // the events it carried: a seq the server SKIPPED as undeliverable at this
-      // peer's `max_payload` (#343) is covered but unsendable, and freezing on it
-      // would wedge this device for the session. It is adopted only when the
-      // whole reply was processed — after a throw it would claim a range that was
-      // never applied.
-      const covered = completed && isWireSeq(msg.maxSeq) ? Math.max(last, msg.maxSeq) : last;
-      // Telegram's `updates.differenceSlice`: "the query must be repeated, using
-      // the intermediate status as the current status." The intermediate status
-      // is `covered`, and the held frames stay held.
-      //
-      // ⚠️ `covered > cursor.afterSeq` IS THIS CLIENT'S OWN LIVENESS, NOT A
-      // RESTATEMENT OF THE SERVER'S INVARIANT. `history-serve.ts` does guarantee
-      // a partial reply covers past the floor it answers — but a reply that
-      // decodes and says `partial: true, maxSeq === afterSeq` would otherwise
-      // re-request the same floor at RTT speed forever, and "the peer upholds its
-      // contract" is not something a loop like that may depend on. Settling
-      // instead costs one re-detect from the next durable frame.
-      if (msg.partial === true && covered > cursor.afterSeq) {
-        // The held frames carry FORWARD, minus the ones this slice already
-        // delivered — see `uncarried`.
-        this.openCatchUp(covered, this.uncarried(cursor.buffer, carriedSeqs));
-      } else {
-        this.settleSynced(covered, cursor.buffer, carriedSeqs);
+      // ⚠️ ONLY IF THIS CATCH-UP IS STILL THE LIVE ONE. The fold runs reducers and
+      // public listeners, and a listener may call `close()` — which runs
+      // `resetCursorForConnection` and lands a valid `synced` cursor. Transitioning
+      // on top of that would re-enter `catching-up` on a closed client, with a
+      // request nothing will answer and a timer nothing will clear. Object
+      // identity, the same test the timer uses.
+      if (this.cursor === cursor) {
+        // `maxSeq` is the highest seq this reply ACCOUNTS FOR, which is more than
+        // the events it carried: a seq the server SKIPPED as undeliverable at this
+        // peer's `max_payload` (#343) is covered but unsendable, and freezing on
+        // it would wedge this device for the session. It is adopted only when the
+        // whole reply was processed — after a throw it would claim a range that
+        // was never applied.
+        const covered = completed && isWireSeq(msg.maxSeq) ? Math.max(last, msg.maxSeq) : last;
+        const carried: CarriedRows = { seqs: carriedSeqs, authoredIds };
+        if (this.stalled(msg, covered, completed, cursor)) {
+          this.onCatchUpStalled(cursor);
+        } else if (msg.partial === true) {
+          // Telegram's `updates.differenceSlice`: "the query must be repeated,
+          // using the intermediate status as the current status." The intermediate
+          // status is `covered`; the held frames carry FORWARD, minus the ones
+          // this slice delivered.
+          this.openCatchUp(covered, this.uncarried(cursor.buffer, carried));
+        } else {
+          this.settleSynced(covered, cursor.buffer, carried);
+        }
       }
       // A difference can settle a held-turn condition (it is durable turn content),
       // and the fold above bypassed the per-frame gate; re-evaluate it once here.

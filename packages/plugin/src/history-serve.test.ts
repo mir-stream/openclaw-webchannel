@@ -1058,10 +1058,16 @@ describe("createHistoryServer.serveDifference — #244 half B / #356", () => {
     // PEER: `get_difference{afterSeq:0}` on a conversation whose rows are all
     // oversize for this peer's `max_payload`. Re-running the bisection after
     // every skip costs one pass per row — 4 500 calls, 249 278 row-measurements,
-    // 22.05 MB serialized (modelled against this stub; the reviewer measured the
-    // same shape at ~9 s of blocked event loop on one scheduled callback). One
-    // per-row pass answers the same question in 502 calls / 1 000
-    // row-measurements / 0.13 MB, which is what the bounds below pin.
+    // 22.05 MB serialized, all on ONE scheduled callback. One per-row pass answers
+    // the same question in 502 calls / 1 000 row-measurements / 0.13 MB, which is
+    // what the bounds below pin.
+    //
+    // ⚠️ IN WALL TIME THAT IS TENS OF MILLISECONDS, NOT SECONDS. Round 2 wrote
+    // "~9 s of blocked event loop" and that was a RATIO ("~9× develop") rendered
+    // as a duration — the same unit substitution this file's other comment was
+    // opened to fix. Measured: 58 ms against this stub (median of five; review
+    // independently got 74 ms on other hardware) and ~146 ms through the real
+    // `sealEnvelope` (review's measurement). The per-row pass is 0.6 ms.
     const journal = openJournal();
     for (let i = 1; i <= MAX_DIFFERENCE_EVENTS; i++) {
       journal.append(PEER, { kind: "bubble", answerId: `a${i}`, turnId: "t1", text: "padding" });
@@ -1122,7 +1128,8 @@ describe("createHistoryServer.serveDifference — #244 half B / #356", () => {
     for (const event of thread("a")) journal.append(PEER, event);
     const h = harness(journal);
 
-    // EIGHT un-answered requests per peer, the one about to run included.
+    // EIGHT queued. Nothing is being served yet (the scheduler is manual), so
+    // here the queue is the whole outstanding set.
     for (let i = 1; i <= 10; i++) h.server.serveDifference(PEER, 0, `n-${i}`);
     expect(h.scheduler.pending).toBe(1);
     h.scheduler.flush();

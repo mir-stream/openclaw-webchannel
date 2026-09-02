@@ -75,13 +75,25 @@
     cursor covers it: a row the server could not send is covered but absent, and
     the held frame is proof its own live send succeeded. The give-up path carries
     nothing and so drops nothing.
-  - A seq-less frame of a durable type (a streaming reasoning draft — only the
-    closing frame is journaled) is no longer held during a catch-up. It has no
-    journal row, so no reply can re-deliver it; held, it landed after the reply
-    and a cumulative draft overwrote the durable text with a prefix of itself.
-  - A `partial` reply that does not cover past the floor it answers now settles
-    instead of re-requesting. The server upholds that invariant; the client no
-    longer depends on it for its own liveness.
+  - Frames held during a catch-up are re-dispatched in arrival order, seq-less
+    ones included — applying those immediately put a reasoning lane ABOVE the user
+    question that opened the turn (`reasoningDurable` is off by default, so every
+    reasoning frame is seq-less), which a reload then re-projects the other way.
+    What the reply supersedes is decided per id rather than per position: a held
+    frame whose id the reply authored durable text for is dropped, so a cumulative
+    draft can no longer overwrite the durable row with a prefix of itself.
+  - A held `progress` is never dropped, even at a seq the reply carried. It maps
+    to a `placement`, which claims the slot and journals no text, so dropping it
+    blanked the draft the user was watching — permanently, for an answer that
+    never produced another frame.
+  - A reply that MOVES NO FLOOR — a `partial` one whose coverage does not exceed
+    the floor it answers, or one whose fold threw before a single event landed —
+    is a STALL, not a settle: the round-trip stays open, the retry budget stays
+    spent, and the liveness timer re-issues on its own cadence. Settling instead
+    re-dispatched the buffer, which re-opened the gap on the spot with a fresh
+    budget: measured at 51 requests for 50 non-advancing replies, at round-trip
+    speed, each costing the server a read and a byte fit. An empty COMPLETE reply
+    is not a stall — that is the spurious-gap unwind and must still close.
 
 ## 0.7.0
 

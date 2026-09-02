@@ -207,9 +207,10 @@ export type DifferenceEntry = { seq: number; event: DurableEvent };
 type DifferenceRequest = { afterSeq: number; nonce: string };
 
 /**
- * #356 — how many UN-ANSWERED `get_difference` requests one peer may hold at
- * once, the one about to run included. Past it, a new request displaces the
- * newest queued one.
+ * #356 — how many `get_difference` requests one peer may have QUEUED, on top of
+ * the one being served. Past it, a new request displaces the newest queued one.
+ * (Before the first run there is nothing being served, so the queue alone is the
+ * whole outstanding set; during a run it is this many plus that one.)
  *
  * The queue is per PEER, and a peer is an account's whole DEVICE SET — there is
  * no per-device registry, so this is the only place a device count can be
