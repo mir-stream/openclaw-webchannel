@@ -147,18 +147,18 @@ export const MAX_INBOUND_USER_ID_LENGTH = 128;
  * PLUGIN-MINTED (`message-adapter.ts`'s `nextMessageId()`, `webchannel-<ms>-<6
  * chars>` — 31 chars, verified in-tree). Applying the bound to agent ids would
  * classify an over-long minted id as id-less, and an id-less durable frame is
- * dropped from the journal — silently discarding DELIVERED text, which is N10.
- * Refusing to store is the safe answer for input we did not create; it is the
- * unsafe answer for output we already sent.
+ * dropped from the journal — silently discarding text that is about to be
+ * published, which is N8 (losing). Refusing to store is the safe answer for
+ * input we did not create; it is the unsafe answer for our own output.
  *
  * ⚠️ AND SINCE #242 half 3 THERE IS AN EXCEPTION TO "PLUGIN-MINTED" — NAMED HERE
  * SO THE PARAGRAPH ABOVE IS NOT READ AS COVERING EVERY CALLER. The
  * `tool_activity` branch calls this predicate on a TOOL id, and that id is NOT
  * ours: `inbound.ts`'s `createCall` prefers the upstream `toolCallId`/`itemId`
  * straight off the agent event stream, so any non-empty string of any length can
- * arrive here. The reasoning above still decides the ANSWER — the frame has
- * already been delivered to the client under that id, so refusing to store it is
- * the N8/N10 divergence, not a defence — but the premise it rests on is
+ * arrive here. The reasoning above still decides the ANSWER — the frame is about
+ * to be published to the client under that id, so refusing to store it is the
+ * N8 divergence, not a defence — but the premise it rests on is
  * narrower than it reads. The unbounded SIZE that follows is **#321**; the fix
  * belongs at the producer or the wire, not in this predicate. DO NOT ADD A BOUND
  * HERE.

@@ -1220,8 +1220,8 @@ export class NatsChannel implements WebChannelPeerChannel {
     // from the client's view, so a row would only make history show what live
     // never showed". #242 half 1 falsified that by giving the funnel a second
     // durable kind: a refused reasoning CLOSE frame carries `lastDeliveredText`,
-    // text of a send that SUCCEEDED and that the peer renders (live, or via
-    // gap-sync after a commit-then-throw — #347), and the
+    // text the transport ACCEPTED and the peer is still rendering (push frames
+    // are never journaled, so #347 does not reach that text), and the
     // delivery-failure bookkeeping the parenthetical relied on is bubble/
     // placement state that reasoning frames have none of.
     //
@@ -1568,7 +1568,8 @@ export class NatsChannel implements WebChannelPeerChannel {
    *    store: nothing reads it, so a failed write degrades something not yet
    *    load-bearing", and #240 half 2 ended that: the journal is now the ONLY
    *    history store. A failed append here does NOT stop the publish (the send
-   *    proceeds and returns `true`), so what it costs today is a frame the peer
+   *    proceeds; since #347, with no row, a publish throw then reports `false`),
+   *    so what it costs today is a frame the peer
    *    SAW live and will not see on reconnect — live ≠ history, the exact
    *    divergence this store exists to kill. That is `error`-shaped, and
    *    arguably fail-closed-shaped. Half 2 deliberately did not change either:
@@ -1576,8 +1577,8 @@ export class NatsChannel implements WebChannelPeerChannel {
    *    changes outside a read-path cutover. Recorded here as OWED work, not as a
    *    justified level — do not read this bullet as an endorsement of `warn`.
    *  - `idless-durable-frame` → `console.error`. Post-#238 this cannot happen
-   *    without a regression, and when it does it means DELIVERED text is missing
-   *    from the store — a defect, not a hiccup. `delivery-journal-event.ts`'s
+   *    without a regression, and when it does it means text about to be
+   *    published is missing from the store — a defect, not a hiccup. `delivery-journal-event.ts`'s
    *    `isIdlessDurableFrame` docblock already states this level ("Half 2 logs
    *    it at `error`"); the two files must not disagree.
    *

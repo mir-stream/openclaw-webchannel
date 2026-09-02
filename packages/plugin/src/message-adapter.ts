@@ -2827,8 +2827,9 @@ export function createReasoningDraftController(params: {
   //  - "a refusal means the peer never received the frame, so recording it would
   //    put content in history that live never showed" — false for precisely the
   //    frame this defers. The close frame's payload IS `lastDeliveredText`, text
-  //    of a send that SUCCEEDED — since #347, one whose row was committed; the
-  //    peer is rendering it, or (commit-then-throw) will hold it via gap-sync.
+  //    the transport accepted and the peer is rendering. (Push frames omit
+  //    `final`, so they are never journaled — #347's committed-row case cannot
+  //    arise for the text this variable holds.)
   // Both were reached by reasoning about what the CONTENT means. The mechanism
   // above is about where the checks SIT, which is checkable. If you find
   // yourself explaining this a third way, the explanation is the problem.
@@ -2886,14 +2887,22 @@ export function createReasoningDraftController(params: {
     //                                         all — while the peer keeps
     //                                         rendering the text it did receive.
     //                                         ⚠️ STILL OPEN. #304.
+    //                                         (#347 adds ONE variant: when the
+    //                                         close frame is durable
+    //                                         (`reasoningDurable`) its row can
+    //                                         COMMIT and its publish then throw
+    //                                         → `sendToPeer` returns `true`, ONE
+    //                                         row, and the peer heals it by
+    //                                         gap-sync. Only a refusal ABOVE the
+    //                                         journal leaves no row.)
     //   all-refused                         → `lastDeliveredText` is empty, so no
     //                                         close frame is even attempted; a
     //                                         durable block, if one follows, is
     //                                         the only delivery and the only row.
-    //                                         (A commit-then-throw burst is NOT
-    //                                         this row since #347: its sends
-    //                                         succeeded, `lastDeliveredText` is
-    //                                         set, and the close frame ships.)
+    //                                         (Push frames are never journaled,
+    //                                         so a throwing transport puts every
+    //                                         push here — #347 changes nothing
+    //                                         for them.)
     //   empty burst                         → the early return above. Nothing.
     //
     // A `pushDurableBlock` that follows any of these arrives under its OWN id as
@@ -2956,9 +2965,10 @@ export function createReasoningDraftController(params: {
       params.turnId,
       currentText,
     );
-    // Only a send that SUCCEEDED changes what the client holds — since #347 that
-    // is "the row was committed" (the peer may hold it only after gap-sync), so
-    // this lags `currentText` across a REFUSAL instead of tracking it. That lag is
+    // Only a send the transport ACCEPTED changes what the client holds, so this
+    // lags `currentText` across a refusal instead of tracking it. (This push
+    // omits `final`, so it is never journaled: `true` here still means the wire
+    // write succeeded — #347's committed-row case cannot arise.) That lag is
     // the whole mechanism — see `lastDeliveredText`'s declaration and
     // `closeLiveBurst`'s case table.
     if (liveSnapshotDelivered) lastDeliveredText = currentText;
