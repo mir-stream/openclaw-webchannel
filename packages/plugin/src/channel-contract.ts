@@ -760,16 +760,18 @@ export interface WebChannelPeerChannel {
    * #341: `journalRequestFirst` carries THE CARD'S OWN PAYLOAD when its durable
    * `approval` row was never written — the delivery attempt found no channel for
    * the account, or its append was swallowed. The implementation stores that row
-   * BEFORE the resolution's, so the projection folds a card with its decision
-   * rather than an orphan verdict; and if it cannot store it, it stores NEITHER,
-   * because a resolution row with no request row is precisely the orphan.
+   * BEFORE the resolution's. The rule that binds the two rows, and its one
+   * exception, is stated ONCE — "THE APPROVAL PAIR RULE" at `approvals.ts`'s
+   * `updateEntry`; this docblock does not restate it.
    *
    * ⚠️ THE ROW WRITTEN HERE HAS NO LIVE FRAME BEHIND IT, and that is correct
-   * rather than a gap. The card the user acted on was re-armed live by the
-   * register-time `approval_snapshot` (which replays the pending store, not the
-   * journal), so live showed it; this write is history catching up with live. The
-   * seq it consumes rides no frame, so a peer sees a hole and heals it with
-   * `get_difference` (#244 half B) — the mechanism that exists for exactly this.
+   * rather than a gap. An unexpired card was re-armed live by the register-time
+   * `approval_snapshot` (which replays the pending store, not the journal), so
+   * this write is history catching up with live; an EXPIRED card is withheld
+   * from the snapshot, so its catch-up row is history GAINING a card live never
+   * showed — the disclosed N8-gaining shape. Either way the seq it consumes
+   * rides no frame, so a peer sees a hole and heals it with `get_difference`
+   * (#244 half B) — the mechanism that exists for exactly this.
    */
   sendApprovalResolved(
     peerId: string,

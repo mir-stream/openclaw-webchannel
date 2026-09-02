@@ -1397,7 +1397,6 @@ function applyApproval(
  * code. The other reachable case is unchanged: a client applying a live
  * `approval_resolved` for a card it never received (`patchApproval` maps over the
  * array and matches nothing).
-
  */
 function applyApprovalResolution(
   view: DurableView,
