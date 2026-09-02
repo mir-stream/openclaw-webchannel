@@ -319,12 +319,27 @@ function deletePendingApproval(accountId: string | null | undefined, approvalId:
 
 /**
  * List the approvals STILL PENDING for a specific (account, peer) — the payload
- * set the register-time `approval_snapshot` carries. Lazy-prunes on read:
- * an entry whose `expiresAtMs` is in the past (defense in depth — the runtime's
- * expiry path normally erases it via `updateEntry`), and an entry WITHOUT an
- * `expiresAtMs` older than `PENDING_APPROVAL_MAX_AGE_MS`, so an orphan whose
- * finalize never fired (e.g. the approval monitor was disposed on channel stop)
- * can never be re-delivered as an actionable zombie card forever.
+ * set the register-time `approval_snapshot` carries.
+ *
+ * ⚠️ EXPIRY HIDES AN ENTRY FROM THE LISTING; ONLY THE ABANDONMENT BACKSTOP
+ * DELETES ONE. The two used to be the same branch, and collapsing them cost
+ * #341 its invariant on a third path (round 2 shipped with it). This function
+ * runs for EVERY registering peer of EVERY account, so the old code deleted any
+ * past-`expiresAtMs` record the moment anyone registered — including one whose
+ * durable `approval` row is still OWED (raised while the account had no channel,
+ * so `deliverPending` had nowhere to write). Core's expiry finalize is a timer,
+ * and a poll-phase register callback runs before a due timer under load, so the
+ * record was routinely gone by the time `updateEntry` needed its payload to
+ * write that row — leaving the lone `approvalResolution` this slice exists to
+ * prevent. The record now survives until `updateEntry` clears it, which is the
+ * only place that knows the card is finished with.
+ *
+ * The backstop that ACTUALLY frees memory is unchanged in purpose and now covers
+ * both shapes: an entry is deleted `PENDING_APPROVAL_MAX_AGE_MS` after the
+ * moment its finalize should have run (its expiry, or its delivery when it has
+ * none), so an orphan whose finalize never fired — the approval monitor disposed
+ * on channel stop — can never be re-delivered as an actionable zombie card
+ * forever, and cannot accumulate either.
  */
 export function listPendingApprovalsForPeer(
   accountId: string | null | undefined,
@@ -336,23 +351,29 @@ export function listPendingApprovalsForPeer(
   for (const [key, entry] of pendingApprovals) {
     const expiresAtMs = entry.payload.expiresAtMs;
     const expired = typeof expiresAtMs === "number" && expiresAtMs <= now;
-    const tooOld =
-      expiresAtMs === undefined && now - entry.deliveredAtMs > PENDING_APPROVAL_MAX_AGE_MS;
-    if (expired || tooOld) {
-      // A no-expiry entry pruned by the max-age backstop is an ORPHAN whose
-      // finalize hook never fired (e.g. the approval monitor was disposed on
-      // channel stop). Warn so a systematic finalize leak is visible — an
-      // expiry-driven prune is routine and stays quiet.
-      if (tooOld) {
-        console.warn(
-          `[webchannel] pending-approval ${logSafe(entry.payload.id)} (account ${logSafe(entry.accountKey)}, ` +
-            `peer ${logSafe(entry.sessionKey)}) pruned after ${PENDING_APPROVAL_MAX_AGE_MS}ms with no ` +
-            `finalize — likely an orphaned approval (monitor disposed?)`,
-        );
-      }
+    // The moment a finalize was due, plus the grace period. For a card with an
+    // expiry that is its expiry (core fires the expiry finalize then); for one
+    // without, its delivery, exactly as before.
+    const finalizeDueAtMs = typeof expiresAtMs === "number" ? expiresAtMs : entry.deliveredAtMs;
+    const abandoned = now - finalizeDueAtMs > PENDING_APPROVAL_MAX_AGE_MS;
+    if (abandoned) {
+      // Reaching here means no finalize ran for a full grace period after one was
+      // due, whether or not the card had an expiry — an ORPHAN either way (e.g.
+      // the approval monitor was disposed on channel stop), so both shapes warn.
+      // The old "an expiry-driven prune is routine and stays quiet" no longer
+      // applies: routine expiry no longer deletes anything here.
+      console.warn(
+        `[webchannel] pending-approval ${logSafe(entry.payload.id)} (account ${logSafe(entry.accountKey)}, ` +
+          `peer ${logSafe(entry.sessionKey)}) pruned after ${PENDING_APPROVAL_MAX_AGE_MS}ms with no ` +
+          `finalize — likely an orphaned approval (monitor disposed?)`,
+      );
       pendingApprovals.delete(key);
       continue;
     }
+    // Past its expiry: withheld from the snapshot (the client must never be
+    // handed an expired card as actionable) but KEPT, because `updateEntry` may
+    // still owe this card its durable row. Deliberately not a delete.
+    if (expired) continue;
     if (entry.accountKey === accountKey && entry.sessionKey === sessionKey) {
       result.push(entry.payload);
     }
@@ -1016,35 +1037,59 @@ export function createClawApprovalNativeRuntimeSpec(
           );
           return;
         }
-        // #341: journals the `approvalResolution` row above the transport's
-        // refusals, so the verdict is durable even if the resolve frame is not
-        // published.
+        // ┌───────────────────────────────────────────────────────────────────┐
+        // │ THE APPROVAL PAIR RULE (#341) — THE ONE STATEMENT OF IT.          │
+        // └───────────────────────────────────────────────────────────────────┘
         //
-        // `journalRequestFirst` is the SYMMETRY that makes the pair inseparable.
-        // Delivery writes the request row whenever a channel existed; when it did
-        // not — the account was mid-restart, F2 — or when its append was
-        // swallowed, the card still reached the user live (the snapshot re-arms
-        // from the pending store, not the journal) and can still be resolved or
-        // expire. Handing the payload over lets the channel store the card
-        // immediately before its verdict, and refuse to store the verdict alone if
-        // it cannot.
+        // ⚠️ EVERY OTHER SITE POINTS HERE INSTEAD OF RESTATING IT. Round 2 stated
+        // it in seven places, absolutely, while the producer had a documented
+        // exception; a rule that is re-derived per site is a rule that goes stale
+        // per site. If you need to change it, change it here and leave the
+        // pointers alone.
         //
-        // ⚠️ A MISSING `pending` RECORD IS TREATED AS "THE ROW EXISTS", AND THAT IS
-        // A CHOICE, not an oversight. It is undefined only when the record was
-        // evicted at the 512 cap or pruned at the 60-minute backstop, i.e. long
-        // after a delivery that in the ordinary case had a live channel and wrote
-        // the row. Withholding the resolution there would lose a real verdict for
-        // a card history DOES hold — a permanently-unresolved card, which is the
-        // larger divergence. Passing the catch-up payload we no longer have is not
-        // an option, so the alternatives are "resolution row" or "nothing", and
-        // the residual risk of the first is an orphan that folds to a no-op.
+        //   A durable `approvalResolution` row is journaled ONLY once this card's
+        //   `approval` row exists — written at delivery when the account had a
+        //   live channel (above the transport's refusals, so a refused push still
+        //   stores the card), otherwise written HERE, immediately before the
+        //   verdict. If the card cannot be stored, the verdict is not stored
+        //   either.
+        //
+        //   THE ONE EXCEPTION: when the pending record is already gone, this leg
+        //   cannot tell whether the row was written and has no payload to write
+        //   one, so it journals the verdict ALONE. That is deliberate — see the
+        //   `pending === undefined` note below — and it is why the consumer-side
+        //   no-op in `durable-view-reducer.ts`'s `applyApprovalResolution` is a
+        //   live fallback rather than dead code.
+        //
+        // Why the exception is narrow: only the 512-entry cap and the
+        // abandonment backstop delete a record, and both are long after a
+        // delivery that in the ordinary case had a live channel and wrote the
+        // row. Expiry does NOT delete one — `listPendingApprovalsForPeer` merely
+        // withholds an expired card from the snapshot — precisely because the
+        // expiry finalize is the leg most likely to owe a row.
+        //
+        // Withholding the verdict in the exception case would lose a real
+        // decision for a card history DOES hold (a permanently-unresolved card),
+        // which is the larger divergence; the residual risk of writing it is an
+        // orphan that folds to a no-op.
+        //
+        // ⚠️ `requestJournaled` IS SCOPED TO THE PEER IT WAS SET FOR, AND THIS
+        // READ ENFORCES THAT, not just the write in `recordPendingApproval`. The
+        // journal's conversation id is the peerId, so a row written for peer B
+        // says nothing about peer A's conversation. One approval CAN reach two
+        // peers on one account (core's fan-out plan dedupes per `sessionKey`, and
+        // `finalizeWrappedEntries` iterates the entries), and the store keeps one
+        // record per (account, approvalId) — so a record whose `sessionKey` is
+        // not this entry's is treated as OWING the row, which is what makes the
+        // second peer's conversation get its own card instead of a lone verdict.
+        const requestRowOwed =
+          pending !== undefined &&
+          (pending.sessionKey !== entry.sessionKey || !pending.requestJournaled);
         channel.sendApprovalResolved(
           entry.sessionKey,
           entry.approvalId,
           payload.decision,
-          pending !== undefined && !pending.requestJournaled
-            ? { journalRequestFirst: pending.payload }
-            : undefined,
+          requestRowOwed ? { journalRequestFirst: pending!.payload } : undefined,
         );
       },
     },

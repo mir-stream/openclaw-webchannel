@@ -1236,28 +1236,43 @@ describe("webchannel pending-approval store (#15)", () => {
     expect(listPendingApprovalsForPeer("a", "nobody")).toEqual([]);
   });
 
-  it("listPendingApprovalsForPeer prunes past-expiresAtMs and stale no-expiry entries, keeps fresh ones", () => {
+  it("listPendingApprovalsForPeer withholds expired entries but only DELETES abandoned ones", () => {
+    // ⚠️ WITHHOLDING AND DELETING ARE DIFFERENT BRANCHES SINCE #341, and this test
+    // was rewritten when they split. Expiry alone used to delete, and because this
+    // function runs for every registering peer of every account, that routinely
+    // destroyed the payload a still-owed durable row needed at finalize (see the
+    // "#341 … EXPIRED card keeps its record" test). Deletion is now the
+    // abandonment backstop's job alone: one grace period after a finalize was due.
     const now = Date.now();
-    // Past expiry → pruned even though its deliveredAt is recent.
+    // Past expiry, inside the grace period → withheld from the listing, KEPT.
     __pendingApprovalsTestHook.record("a", payload("expired", now - 1_000), "alice", now);
-    // No expiry, delivered longer ago than the max age → pruned.
+    // Past expiry by more than the grace period → abandoned, deleted.
+    __pendingApprovalsTestHook.record(
+      "a",
+      payload("expired-abandoned", now - PENDING_APPROVAL_MAX_AGE_MS - 1_000),
+      "alice",
+      now - PENDING_APPROVAL_MAX_AGE_MS - 1_000,
+    );
+    // No expiry, delivered longer ago than the max age → abandoned, deleted.
     __pendingApprovalsTestHook.record(
       "a",
       payload("stale-no-expiry"),
       "alice",
       now - PENDING_APPROVAL_MAX_AGE_MS - 1_000,
     );
-    // No expiry, delivered just now → kept.
+    // No expiry, delivered just now → listed.
     __pendingApprovalsTestHook.record("a", payload("fresh-no-expiry"), "alice", now);
-    // Future expiry → kept.
+    // Future expiry → listed.
     __pendingApprovalsTestHook.record("a", payload("future", now + 60_000), "alice", now);
 
+    // An expired card is NEVER offered as actionable, whether or not it survives.
     expect(listPendingApprovalsForPeer("a", "alice").map((p) => p.id).sort()).toEqual([
       "fresh-no-expiry",
       "future",
     ]);
-    // Prune is destructive: the pruned entries are gone from the store entirely.
-    expect(__pendingApprovalsTestHook.size()).toBe(2);
+    // Three survive the walk: the two listed, plus the expired-but-recent one held
+    // for a finalize that may still owe it a durable row.
+    expect(__pendingApprovalsTestHook.size()).toBe(3);
   });
 
   it("caps the store, evicting the oldest and retaining the newest", () => {
@@ -2152,17 +2167,20 @@ describe("#341 approval rows survive a refused push", () => {
     readonly events: JournalEvent[] = [];
     /** The seq each recorded event was allocated — the order the projection folds. */
     readonly seqs: number[] = [];
+    /** The conversation (peerId) each recorded event landed in, index-aligned. */
+    readonly conversations: string[] = [];
     /** One-shot: make the NEXT append throw, the way a real store failure does. */
     failNext = false;
     /** Persistent: make every append of these kinds throw. */
     readonly failKinds = new Set<JournalEvent["kind"]>();
     private seq = 0;
-    append(_conversationId: string, event: JournalEvent) {
+    append(conversationId: string, event: JournalEvent) {
       if (this.failNext || this.failKinds.has(event.kind)) {
         this.failNext = false;
         throw new Error("journal unavailable");
       }
       this.events.push(event);
+      this.conversations.push(conversationId);
       this.seqs.push(++this.seq);
       return { seq: this.seq, inserted: true };
     }
@@ -2427,6 +2445,151 @@ describe("#341 approval rows survive a refused push", () => {
     expect(view).toEqual([
       expect.objectContaining({ id: "exec-swallowed", resolvedDecision: "deny" }),
     ]);
+  });
+
+  it("an EXPIRED card keeps its record, so the expiry finalize can still write the row", async () => {
+    // P2-1: `listPendingApprovalsForPeer` runs for every registering peer of every
+    // account and used to DELETE any past-`expiresAtMs` entry. A card raised under
+    // F2 owes its row to the resolve leg, and core fires the expiry finalize from a
+    // timer — a poll-phase register callback beats a due timer under load — so the
+    // register routinely destroyed the payload the finalize was about to need, and
+    // the verdict landed alone. The record now survives the listing.
+    const { journal, channel } = makeChannel();
+    let live = false;
+    const spec = createClawApprovalNativeRuntimeSpec(
+      new FakePeerChannel(),
+      () => (live ? (channel as unknown as any) : undefined),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // Raised with no channel for the account, and already past its expiry.
+    const expiring = { ...payload("exec-expired"), expiresAtMs: Date.now() - 1_000 };
+    const entry = await deliver(spec, expiring);
+    expect(journal.events).toEqual([]);
+
+    // Any peer registering anywhere walks every entry. The card is withheld from
+    // the snapshot (it is expired — never offer it as actionable) but KEPT.
+    expect(listPendingApprovalsForPeer(null, PEER)).toEqual([]);
+
+    // The account is back by the time core's expiry finalize runs.
+    live = true;
+    await spec.transport.updateEntry!({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      entry,
+      payload: { decision: "deny" },
+      phase: "expired",
+    } as any);
+    warn.mockRestore();
+
+    expect(journal.events.map((e) => e.kind)).toEqual(["approval", "approvalResolution"]);
+    expect(journal.seqs).toEqual([1, 2]);
+    expect(reduceDurableView(journal.events as unknown as DurableEvent[])).toEqual([
+      expect.objectContaining({ id: "exec-expired", resolvedDecision: "deny" }),
+    ]);
+  });
+
+  it("a row written for peer B does not satisfy peer A's resolution", async () => {
+    // `requestJournaled` is scoped to the peer it was set for, because the
+    // journal's conversation id IS the peerId. The store keeps ONE record per
+    // (account, approvalId), so the second delivery's success would otherwise read
+    // as "the row exists" when A's finalize came along — and A's conversation
+    // would get a verdict with no card. Latent today (core plans one target), but
+    // `finalizeWrappedEntries` iterates entries.
+    const { journal, channel } = makeChannel();
+    let live = false;
+    const spec = createClawApprovalNativeRuntimeSpec(
+      new FakePeerChannel(),
+      () => (live ? (channel as unknown as any) : undefined),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const card = payload("exec-two-peers");
+
+    // Peer A: no channel, so no row is written for A's conversation.
+    const entryA = await spec.transport.deliverPending({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      plannedTarget: {} as any,
+      preparedTarget: { sessionKey: "peer-A" },
+      request: {} as any,
+      approvalKind: "exec",
+      view: fakePendingExecView(card.id) as any,
+      pendingPayload: card,
+    } as any);
+
+    // Peer B: the channel is back, so B's conversation DOES get the row.
+    live = true;
+    await spec.transport.deliverPending({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      plannedTarget: {} as any,
+      preparedTarget: { sessionKey: "peer-B" },
+      request: {} as any,
+      approvalKind: "exec",
+      view: fakePendingExecView(card.id) as any,
+      pendingPayload: card,
+    } as any);
+    expect(journal.conversations).toEqual(["peer-B"]);
+
+    // Finalizing A must NOT read B's success as its own.
+    await spec.transport.updateEntry!({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      entry: entryA,
+      payload: { decision: "allow-once" },
+      phase: "resolved",
+    } as any);
+    warn.mockRestore();
+
+    expect(journal.conversations).toEqual(["peer-B", "peer-A", "peer-A"]);
+    expect(journal.events.map((e) => e.kind)).toEqual([
+      "approval",
+      "approval",
+      "approvalResolution",
+    ]);
+    // A's own conversation folds to a card WITH its decision, not a lone verdict.
+    const inA = journal.events.filter((_e, i) => journal.conversations[i] === "peer-A");
+    expect(reduceDurableView(inA as unknown as DurableEvent[])).toEqual([
+      expect.objectContaining({ id: "exec-two-peers", resolvedDecision: "allow-once" }),
+    ]);
+  });
+
+  it("a caught-up card with a FAILED verdict append leaves the card, not nothing", async () => {
+    // The other leg of `journalRequestFirst`, which had no proof: the catch-up
+    // request row lands and the resolution append then fails (swallowed, §15.8).
+    // History holds an undecided card — the safe direction, and the one the
+    // reducer renders without inventing anything.
+    const { journal, channel } = makeChannel();
+    let live = false;
+    const spec = createClawApprovalNativeRuntimeSpec(
+      new FakePeerChannel(),
+      () => (live ? (channel as unknown as any) : undefined),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const entry = await deliver(spec, payload("exec-verdict-lost"));
+    live = true;
+    journal.failKinds.add("approvalResolution");
+    await spec.transport.updateEntry!({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      entry,
+      payload: { decision: "deny" },
+      phase: "resolved",
+    } as any);
+    warn.mockRestore();
+
+    expect(journal.events.map((e) => e.kind)).toEqual(["approval"]);
+    const view = reduceDurableView(journal.events as unknown as DurableEvent[]);
+    expect(view).toEqual([expect.objectContaining({ id: "exec-verdict-lost" })]);
+    // Undecided, and by an ABSENT key rather than an explicit undefined — the
+    // shape `applyApproval` builds when no resolution ever folded in.
+    expect(view[0]).not.toHaveProperty("resolvedDecision");
   });
 
   it("when the LATE request row cannot be written either, the verdict row is skipped too", async () => {

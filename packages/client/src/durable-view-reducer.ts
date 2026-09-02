@@ -1380,36 +1380,24 @@ function applyApproval(
  * content at all, so the "card" would have no title, no prompt and no options.
  * That is the server-side invention N8 forbids.
  *
- * ⚠️ AND IT IS UNREACHABLE IN A FULL REPLAY — BUT NOT FOR THE REASON THIS BLOCK
- * GAVE FOR THREE SLICES, WHICH WAS FALSE. It read "the resolution is only ever
- * published for an approval this plugin already delivered — `updateEntry` fires
- * off the entry that `deliverPending` returned". `deliverPending` returns an
- * entry on its REFUSED branches too, so a card the transport dropped, re-armed
- * live by the register-time `approval_snapshot` and then decided by the user
- * produced exactly the orphan this function no-ops on: live showed the card and
- * the verdict, history showed neither (#341, N8/N3).
+ * ⚠️ AND IT IS RARE RATHER THAN UNREACHABLE — DO NOT UPGRADE THIS TO A
+ * GUARANTEE. Three revisions of this block have claimed a full replay cannot
+ * reach it, each from a different premise, and each premise was falsified within
+ * a slice or two (the last: "both rows are written above the refusals", which
+ * ignored that the account→channel map is transient). The producer's actual
+ * guarantee, and the one exception that survives it, are stated ONCE — at
+ * `approvals.ts`'s `updateEntry`, under THE APPROVAL PAIR RULE. Read it there;
+ * do not restate it here.
  *
- * What makes the no-op safe now is a rule the PRODUCER enforces, stated exactly:
- * a resolution row is journaled only once its request row exists. `approvals.ts`
- * writes the request row at delivery when the account had a live channel — above
- * the transport's refusals, so a refused push still stores the card — and
- * otherwise hands the card's payload to the resolution leg, which stores it
- * immediately before the verdict; if that write fails too, NEITHER row is
- * written. So a resolution row implies a request row earlier in the same ordered
- * stream. `projectJournalHistory` folds the WHOLE journal before it pages (see
- * `historyTail`/`pageBefore`, which slice the projected MESSAGES), so a page
- * boundary cannot separate them either.
- *
- * ⚠️ ROUND 1 OF #341 CLAIMED THIS FROM THE WRONG PREMISE — "both rows are written
- * above the refusals, so the request row always exists". The account→channel map
- * is TRANSIENT (`nats-account-runtime.ts` deletes and re-adds it across a
- * restart), so an approval delivered with no channel and resolved with one wrote
- * the resolution alone: the same orphan, on a path the fix had not considered.
- * The invariant is a producer rule, not a consequence of where a hook sits.
- *
- * The reachable case is a client applying a live `approval_resolved` for a card
- * it never received — which is exactly today's behaviour (`patchApproval` maps
- * over the array and matches nothing).
+ * What that rule means for this function: the ordinary stream really does carry
+ * the request row first, and `projectJournalHistory` folds the WHOLE journal
+ * before it pages (see `historyTail`/`pageBefore`, which slice the projected
+ * MESSAGES), so a page boundary cannot separate the pair either — but the rule's
+ * exception journals a verdict alone, so this no-op is a LIVE FALLBACK, not dead
+ * code. The other reachable case is unchanged: a client applying a live
+ * `approval_resolved` for a card it never received (`patchApproval` maps over the
+ * array and matches nothing).
+
  */
 function applyApprovalResolution(
   view: DurableView,

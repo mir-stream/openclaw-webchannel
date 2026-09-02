@@ -53,7 +53,7 @@
     "packages/plugin/src/approval-e2e-crypto.test.ts": 32,
     "packages/plugin/src/approval-origin-delivery-integration.test.ts": 9,
     "packages/plugin/src/approval-origin.test.ts": 51,
-    "packages/plugin/src/approvals.test.ts": 95,
+    "packages/plugin/src/approvals.test.ts": 98,
     "packages/plugin/src/auth-admission.test.ts": 6,
     "packages/plugin/src/auth.test.ts": 22,
     "packages/plugin/src/bounded-inbound-debouncer.test.ts": 16,

@@ -890,12 +890,13 @@ export class NatsChannel implements WebChannelPeerChannel {
    * so a refused close frame cannot be distinguished from content the peer never
    * saw. See `message-adapter.ts`'s `lastDeliveredText` declaration.
    *
-   * ⚠️ THIS IS HALF THE RULE, NOT ALL OF IT. Journaling above the refusals only
-   * helps when a channel EXISTS to journal through, and the account→channel map
-   * is transient — so a card can be created with no channel and resolved with
-   * one. `sendApprovalResolved`'s `journalRequestFirst` is the other half, and the
-   * two together are the invariant: a resolution row is written only once its
-   * request row exists.
+   * ⚠️ THIS IS HALF THE MECHANISM, NOT THE RULE. Journaling above the refusals
+   * only helps when a channel EXISTS to journal through, and the account→channel
+   * map is transient — so a card can be created with no channel and resolved with
+   * one. `sendApprovalResolved`'s `journalRequestFirst` is the other half. The
+   * rule the two serve, and the one exception to it, are stated once at
+   * `approvals.ts`'s `updateEntry` (THE APPROVAL PAIR RULE); this docblock
+   * deliberately does not restate it.
    *
    * `seq` is stamped HERE for the same reason it is stamped in `sendToPeer`: the
    * row consumed a per-conversation seq and the frame the peer receives must
@@ -1133,13 +1134,19 @@ export class NatsChannel implements WebChannelPeerChannel {
    * journal hook lives HERE: one hook covers the whole surface, including the
    * direct-ACK paths doc §15.7 worried about.
    *
-   * ⚠️ "AND NOWHERE ELSE" WAS TRUE UNTIL #341 AND IS NOT ANY MORE. There is
-   * exactly one other journal call site on this class, and it is named: the two
-   * approval frames are appended by `publishApprovalFrame` BEFORE they reach this
-   * method, and the hook below skips them so they are never written twice
-   * (`extractMessageId` has no `approval` arm, so a second row would not dedupe —
-   * #355). Everything else still journals here and only here; the reasons the
-   * approvals are the exception, and why they are not a precedent, are at
+   * ⚠️ "AND NOWHERE ELSE" WAS TRUE UNTIL #341 AND IS NOT ANY MORE. There are TWO
+   * other journal call sites on this class, both named:
+   *  - `publishApprovalFrame`, which appends the two approval frames BEFORE they
+   *    reach this method (the hook below skips them so they are never written
+   *    twice — `extractMessageId` has no `approval` arm, so a second row would
+   *    not dedupe, #355);
+   *  - `sendApprovalResolved`'s CATCH-UP append, which is the only place in the
+   *    tree that writes a durable row for a frame that NEVER SHIPS: the card's
+   *    `approval` row, minted so the verdict about to be journaled is not an
+   *    orphan. It consumes a seq no frame carries, by design — the peer heals
+   *    that hole with `get_difference` (#244 half B).
+   * Everything else still journals here and only here; the reasons the approvals
+   * are the exception, and why they are not a precedent, are at
    * `publishApprovalFrame`.
    *
    * (The class's one other `this.transport.publish` — `handleRegister`'s

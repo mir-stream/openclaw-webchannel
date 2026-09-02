@@ -82,13 +82,15 @@
   and the consent survive the outage together. If the outage was total — no
   connection for the whole account at the moment the prompt was raised — the card
   is stored when it is decided instead, and if even that is impossible neither
-  the card nor the decision is stored, so a verdict never appears without the
-  request it answers.
+  the card nor the decision is stored.
 
-  One consequence is deliberate and worth knowing: a prompt raised while a
+  Two consequences are deliberate and worth knowing. A prompt raised while a
   browser was closed, never delivered, and left to time out is now visible in
   that conversation's history as denied — the record of something the server
-  asked and answered on its own, which the browser never had a chance to see.
+  asked and answered on its own, which the browser never had a chance to see. And
+  a card stored late, at the moment it was decided, appears in history *after*
+  any messages that arrived while it was waiting, rather than at the point the
+  browser showed it on reconnect.
 
 - **A turn whose answer count does not line up no longer loses an answer (#340,
   extends #260).** When a turn ends with two or more finals whose count does not

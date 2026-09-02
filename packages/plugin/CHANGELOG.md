@@ -74,7 +74,21 @@
   — a refused push journals, a swallowed append does not), and `updateEntry`
   hands the card's payload to `sendApprovalResolved` as `journalRequestFirst`
   when it is still owed. The channel writes the request row first and the
-  resolution second; if the request row cannot be written, neither is.
+  resolution second; if the request row cannot be written, neither is. The rule
+  and its one exception — a pending record already evicted, where the verdict is
+  journaled alone and the reducer's no-op is the fallback — are stated once, at
+  `approvals.ts`'s `updateEntry`; every other site points there rather than
+  restating them.
+
+  Two supporting changes fall out of that. `listPendingApprovalsForPeer` now
+  WITHHOLDS an expired card from the snapshot instead of deleting its record —
+  deletion is left to the cap and the abandonment backstop (which now covers both
+  entry shapes, one grace period after a finalize was due) — because it runs for
+  every registering peer and was routinely destroying the payload the expiry
+  finalize still needed to write the card's row. And `requestJournaled` is now
+  enforced as peer-scoped on the READ side as well as the write: the journal's
+  conversation id is the peerId, so a row written for one peer does not satisfy
+  another peer's resolution.
 
   **Disclosed N8-gaining direction.** The journal keeps a card forever while
   `approval_snapshot` replays only what is still pending, so a card created while
@@ -84,6 +98,14 @@
   That is the Telegram-server model working as intended (the server created the
   service message and recorded its outcome; the device missed the window), and it
   is accepted knowingly rather than overlooked.
+
+  The same applies to ORDER on the catch-up path: a card whose `approval` row is
+  minted at resolution time takes a seq from that moment, so
+  `projectJournalHistory` places it after anything delivered while it was open,
+  where the client's `approval_snapshot` leg placed it at register time. Same
+  card, later slot. Repairing it would mean reordering rows on a timestamp the
+  store does not have — the server-side invention N8 forbids — so it is disclosed
+  rather than fixed.
 
 - **A K>=2 count shortfall no longer routes buffered finals onto lanes (#340,
   extends #260).** `flushBufferedOrdinaryFinals` used to fall back to

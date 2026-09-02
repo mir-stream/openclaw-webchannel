@@ -640,21 +640,29 @@ export function journalEventForOutbound(
       // frame re-delivered it live — the snapshot was then the SOLE carrier of a
       // card the user saw and acted on, and its resolution landed as an orphan
       // (#341, N8/N3). #341 made the store hold it: the row is written at the
-      // delivery act above the refusals, or failing that at resolution time (see
-      // `approvals.ts`'s two legs). The verdict here never changed; only its
-      // premise became true.
+      // delivery act above the refusals, or failing that at resolution time (THE
+      // APPROVAL PAIR RULE, stated at `approvals.ts`'s `updateEntry`). The verdict
+      // here never changed; only its premise became true.
       //
-      // ⚠️ AND THE TWO STORES ARE NOW DELIBERATELY ASYMMETRIC IN ONE DIRECTION —
-      // an N8 reader should meet this here rather than derive it. This frame
+      // ⚠️ AND THE TWO STORES ARE NOW DELIBERATELY ASYMMETRIC — an N8 reader
+      // should meet both directions here rather than derive them. This frame
       // replays only what is STILL PENDING (plus recently-resolved outcomes); the
-      // journal keeps the card forever. So a card created while the peer was
-      // disconnected, never pushed, and then EXPIRED before the peer returned is
-      // absent from this frame and present in history, carrying the
-      // denial-equivalent verdict `buildExpiredResult` produced — a decision the
-      // user never saw live. That is intended Telegram-server behaviour, not a
-      // leak: the server created the service message and recorded what became of
-      // it; the device simply missed the window. It is history GAINING a row live
-      // never showed, so it is worth stating that it was accepted knowingly.
+      // journal keeps the card forever. Two consequences, both accepted:
+      //
+      //  - CONTENT. A card created while the peer was disconnected, never pushed,
+      //    and then EXPIRED before the peer returned is absent from this frame and
+      //    present in history, carrying the denial-equivalent verdict
+      //    `buildExpiredResult` produced — a decision the user never saw live.
+      //  - ORDER. When a card's `approval` row is caught up at resolution time, it
+      //    is minted THEN, so history places it among the messages that arrived
+      //    while it was open rather than where this frame placed it live (the
+      //    client arms a snapshot card at register time). Same card, later slot.
+      //
+      // Both are the Telegram-server model working as intended — the server
+      // created the service message and recorded what became of it; the device
+      // missed the window — not leaks, and not repairable by reordering rows on a
+      // timestamp the store does not have (that is the server-side invention N8
+      // forbids).
       //
       // ⚠️ IT IS ALSO WHAT MAKES A REPLAYED CARD SAFE, so do not read "not
       // durable" as "not load-bearing". `nats-register.ts` sends this frame on
