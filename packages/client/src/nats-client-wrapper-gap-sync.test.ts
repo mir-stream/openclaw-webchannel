@@ -525,24 +525,31 @@ describe("#356 — partial replies (Telegram's differenceSlice)", () => {
     expect(cursorLast(w)).toBe(5);
   });
 
-  it("an EMPTY non-partial reply unwinds the round-trip at the server's high-water", () => {
-    const { w, getDifference } = spied();
-    seed(w, 4);
-    w.handleMessage({ type: "agent_message", id: "a9", text: "answer 9", turnId: "t1", seq: 9 });
-    expect(getDifference).toHaveBeenCalledTimes(1);
-    const before = project(w);
-    w.handleMessage(reply(w, [], { maxSeq: 4 }));
-    // Nothing folded, and the round-trip is closed out rather than waiting on the
-    // 5 s timeout — which is the whole reason an empty read is ANSWERED.
-    expect(project(w)).toEqual(before);
-    // `maxSeq` (4) does not cover the held seq-9 frame, so re-dispatching it
-    // re-opens the gap under a fresh request rather than losing it.
-    expect(getDifference).toHaveBeenCalledTimes(2);
-    expect(getDifference).toHaveBeenLastCalledWith(4, outstandingNonce(w));
-  });
-});
+  it("#356 — an empty COMPLETE reply with a frame still HELD is a stall, not an unwind", () => {
+    // ⚠️ ROUND 2'S STORM, ARRIVING THROUGH THE `partial: false` DOOR. Settling on
+    // a reply that covers nothing re-dispatches the buffer, the held frame
+    // re-opens the same gap on the spot, and `openCatchUp` hands out a fresh
+    // retry budget. Measured before this fix: 50 empty complete replies → 51
+    // requests, no time passing. A held frame is evidence the gap was REAL, so an
+    // answer that covers nothing is a stall whatever the flag says — the
+    // spurious-gap unwind turns on the BUFFER, not on `partial`.
+    vi.useFakeTimers();
+    try {
+      const { w, getDifference } = spied();
+      seed(w, 4);
+      w.handleMessage({ type: "agent_message", id: "a9", text: "answer 9", turnId: "t1", seq: 9 });
+      expect(getDifference).toHaveBeenCalledTimes(1);
 
-describe("#343/#356 — a held frame is dropped only when the reply CARRIED its seq", () => {
+      for (let i = 0; i < 50; i++) w.handleMessage(reply(w, [], { maxSeq: 4 }));
+
+      expect(getDifference).toHaveBeenCalledTimes(1);
+      expect(isCatchingUp(w)).toBe(true);
+      expect(cursorLast(w)).toBe(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("THE REPRO: a live bubble the reply could not carry survives the catch-up", () => {
     // Cursor 1; the live `agent_message{seq:3}` ARRIVED (so its own send fit this
     // peer's wire) and is held behind the gap. The reply carries seq 2 and says
@@ -700,6 +707,96 @@ describe("#343/#356 — a held frame is dropped only when the reply CARRIED its 
     } finally {
       warn.mockRestore();
     }
+  });
+
+  it("#343/#356 — a seq-BEARING held frame is governed by its seq alone, never by its id", () => {
+    // ⚠️ AN ID-AUTHORED DROP IS UNBOUNDED ABOVE THE RANGE THE REPLY COVERED, and a
+    // tool card is the proof: tool rows are NOT deduped, so every phase is its own
+    // row. A slice carrying `tool{T, phase:"start"}@12` must not drop a held
+    // `tool_activity{T, phase:"end"}@20` — the next slice then skips row 20 as
+    // undeliverable (#343) and the card stays "running" for the session.
+    const { w } = spied();
+    seed(w, 10);
+    // seq 20 opens the gap and is held: the tool's END phase, already rendered.
+    w.handleMessage({
+      type: "tool_activity",
+      id: "T", turnId: "t1", name: "bash", phase: "end", status: "ok", seq: 20,
+    });
+    // A slice carries the START phase for the SAME id, at a lower seq.
+    w.handleMessage(
+      reply(
+        w,
+        [{ seq: 12, event: { kind: "tool", id: "T", turnId: "t1", name: "bash", phase: "start" } }],
+        { partial: true, maxSeq: 12 },
+      ),
+    );
+    expect(isCatchingUp(w)).toBe(true);
+    // The next slice completes the range WITHOUT row 20 (the server skipped it).
+    w.handleMessage(
+      reply(
+        w,
+        [{ seq: 15, event: { kind: "bubble", answerId: "a15", text: "answer 15", turnId: "t1" } }],
+        { maxSeq: 20 },
+      ),
+    );
+
+    // ⚠️ THE END PHASE SURVIVED, so the card is not stuck running.
+    const tool = w.state.messages.find((m) => m.id === "T") as { phase?: string } | undefined;
+    expect(tool?.phase).toBe("end");
+    expect(cursorLast(w)).toBe(20);
+  });
+
+  it("#356 — a held NEWER row is not dropped because the reply authored an OLDER one for its id", () => {
+    // ⚠️ THE DICHOTOMY ON ITS OWN. `bubble` rows are not deduped, so one answer id
+    // can own several — an answer re-finalized after an edit is a second row at a
+    // higher seq. The held `agent_message@20` IS that newer row, already rendered;
+    // the reply carries the OLDER `bubble@12` for the same id. An id-keyed drop
+    // would discard the newer text and leave the older one on the view.
+    const { w } = spied();
+    seed(w, 10);
+    w.handleMessage({ type: "agent_message", id: "A", text: "final A (revised)", turnId: "t1", seq: 20 });
+    w.handleMessage(
+      reply(
+        w,
+        [{ seq: 12, event: { kind: "bubble", answerId: "A", text: "final A", turnId: "t1" } }],
+        { maxSeq: 20 },
+      ),
+    );
+
+    // ⚠️ THE NEWER TEXT WINS, because the held frame is governed by its SEQ (20,
+    // which the reply never carried) and not by its id.
+    const a = project(w).find((m) => (m as { id: string }).id === "A");
+    expect((a as { text: string }).text).toBe("final A (revised)");
+    expect(cursorLast(w)).toBe(20);
+  });
+
+  it("#343/#356 — an `approvalResolution` does not author the card, so a held request survives", () => {
+    // ⚠️ THE `default: return [event.id]` DEFECT. `approvalResolution` carries no
+    // content of its own and its id is the APPROVAL's, so a reply serving one
+    // looked like it had authored the card — and the held `approval_request` the
+    // user was looking at was dropped. Measured: view `[{id:"z20"}]`, card gone
+    // for the session.
+    const { w } = spied();
+    seed(w, 9);
+    w.handleMessage({ type: "agent_message", id: "z20", text: "answer 20", turnId: "t1", seq: 20 });
+    // The live card arrives and is held.
+    w.handleMessage({
+      type: "approval_request",
+      id: "ap1", kind: "exec", title: "run it", prompt: "ok?", options: [], seq: 11,
+    });
+    // The server skips row 11 as undeliverable (#343 — a free-form prompt) and
+    // serves only the resolution for that same id.
+    w.handleMessage(
+      reply(
+        w,
+        [{ seq: 12, event: { kind: "approvalResolution", id: "ap1", decision: "allow-once" } }],
+        { maxSeq: 20 },
+      ),
+    );
+
+    // ⚠️ THE CARD IS STILL THERE.
+    expect(w.state.messages.some((m) => m.id === "ap1")).toBe(true);
+    expect(cursorLast(w)).toBe(20);
   });
 
   it("a held frame the reply DID carry is still dropped — no double-apply", () => {
@@ -880,14 +977,56 @@ describe("#356 — a reply that answers NOTHING is a stall, not a settle", () =>
     }
   });
 
-  it("a stall re-issues on the TIMER's cadence and spends the ordinary budget", () => {
+  it.each([
+    ["faster than the timeout", 50],
+    ["at a second", 1_000],
+    ["just inside the timeout", 4_999],
+  ])("a stall at ANY cadence (%s) costs at most one request per timeout", (_label, cadence) => {
+    // ⚠️ THE ROUND-3 BUG THIS REPLACES, AND WHY THE OLD TEST MISSED IT. Round 3
+    // re-armed the timer on every stall, which is a FRESH
+    // `GET_DIFFERENCE_TIMEOUT_MS` — so a peer stalling faster than that pushed
+    // the deadline back forever and the timeout never fired. Measured over 10
+    // simulated minutes: ONE request, still catching-up, 12 001 held frames at a
+    // 50 ms cadence, nothing rendered. The old test advanced exactly 5 000 ms per
+    // stall, which is the one cadence at which re-arming and not re-arming look
+    // the same. This one sweeps three.
+    vi.useFakeTimers();
+    try {
+      const { w, getDifference } = spied();
+      seed(w, 100);
+      // A HELD FRAME IN THE BUFFER — the configuration round 2's guard missed.
+      w.handleMessage({ type: "agent_message", id: "a400", text: "answer 400", turnId: "t1", seq: 400 });
+      expect(getDifference).toHaveBeenCalledTimes(1);
+
+      // Ten simulated minutes of a peer that answers nothing, at this cadence.
+      const elapsed = 10 * 60 * 1_000;
+      for (let t = 0; t < elapsed; t += cadence) {
+        if (isCatchingUp(w)) w.handleMessage(reply(w, [], { partial: true, maxSeq: 100 }));
+        vi.advanceTimersByTime(cadence);
+      }
+
+      // ⚠️ THE BOUND IS THE TIMEOUT, NOT THE STALL CADENCE. Each give-up cycle is
+      // `MAX_RETRIES + 1` requests over `MAX_RETRIES + 1` timeouts, so the rate
+      // never exceeds one request per `GET_DIFFERENCE_TIMEOUT_MS` however fast
+      // the peer replies.
+      const ceiling = Math.ceil(elapsed / 5_000) + 1;
+      expect(getDifference.mock.calls.length).toBeLessThanOrEqual(ceiling);
+      // And it is not wedged either: the give-up cycles kept running, so the
+      // stream is trying rather than frozen.
+      expect(getDifference.mock.calls.length).toBeGreaterThan(ceiling / 2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a stall spends the ordinary budget and then gives up, re-dispatching the buffer", () => {
     vi.useFakeTimers();
     try {
       const { w, getDifference } = spied();
       seed(w, 100);
       w.handleMessage({ type: "agent_message", id: "a400", text: "answer 400", turnId: "t1", seq: 400 });
 
-      // Each cycle: the peer answers nothing, then the liveness timer fires.
+      // Each cycle: the peer answers nothing, then the ORIGINAL deadline fires.
       for (let i = 0; i < GET_DIFFERENCE_MAX_RETRIES; i++) {
         w.handleMessage(reply(w, [], { partial: true, maxSeq: 100 }));
         vi.advanceTimersByTime(5_000);
@@ -896,10 +1035,16 @@ describe("#356 — a reply that answers NOTHING is a stall, not a settle", () =>
       expect(getDifference).toHaveBeenCalledTimes(GET_DIFFERENCE_MAX_RETRIES + 1);
       expect(retriesOf(w)).toBe(GET_DIFFERENCE_MAX_RETRIES);
 
-      // The budget is spent: the next stall GIVES UP, and the give-up re-dispatches
-      // the held frame, which re-opens the gap with a fresh budget. That is the
-      // steady state — one cycle per ~20 s, never one request per round-trip.
-      w.handleMessage(reply(w, [], { partial: true, maxSeq: 100 }));
+      // The budget is spent. Further stalls change nothing — only the DEADLINE
+      // ends the round-trip, which is what keeps the rate at one request per
+      // timeout however fast the peer answers.
+      for (let i = 0; i < 20; i++) w.handleMessage(reply(w, [], { partial: true, maxSeq: 100 }));
+      expect(getDifference).toHaveBeenCalledTimes(GET_DIFFERENCE_MAX_RETRIES + 1);
+
+      // At the next deadline it gives up: settle, re-dispatch the held frame,
+      // which re-opens the gap with a fresh budget. That is the steady state —
+      // one cycle per (MAX_RETRIES + 1) timeouts.
+      vi.advanceTimersByTime(5_000);
       expect(getDifference).toHaveBeenCalledTimes(GET_DIFFERENCE_MAX_RETRIES + 2);
       expect(retriesOf(w)).toBe(0);
     } finally {

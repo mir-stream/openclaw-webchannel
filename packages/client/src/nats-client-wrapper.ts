@@ -201,10 +201,12 @@ const GET_DIFFERENCE_MAX_RETRIES = 3;
  *    floor that request asked about AND the cursor: while a reply is in flight
  *    NOTHING else may move the cursor, which is why there is no second number
  *    here. The old code had one (`pendingDeferredSeq`), and applying it on top of
- *    a PARTIAL reply is precisely how a range got skipped (#352). Seq-bearing
- *    frames are held in `buffer`; an `ack`/`history` seq is ignored outright (its
- *    frame's live effects — id adoption, hydration — have already run, and its
- *    seq is re-learned from the reply or from the next live frame).
+ *    a PARTIAL reply is precisely how a range got skipped (#352). EVERY frame of a
+ *    seq-bearing type is held in `buffer`, in arrival order — with a seq or
+ *    without one, because order is the reason to hold a seq-less frame; an
+ *    `ack`/`history` seq is ignored outright (its frame's live effects — id
+ *    adoption, hydration — have already run, and its seq is re-learned from the
+ *    reply or from the next live frame).
  *
  * ── THE CORRELATION ──
  *
@@ -248,26 +250,58 @@ type SeqCursor =
 type CarriedRows = { seqs: ReadonlySet<number>; authoredIds: ReadonlySet<string> };
 
 /**
- * The ids ONE folded durable event authored text for — what a held live frame is
- * measured against in `uncarried`.
+ * The ids ONE folded durable event AUTHORED RENDERABLE TEXT for — what a held
+ * DRAFT is measured against in `uncarried`.
  *
- * ⚠️ `placement` YIELDS NOTHING, AND THAT IS THE WHOLE POINT OF THE FUNCTION. It
- * claims a slot and carries no text (§15.9 — the draft text is deliberately never
- * journaled), so it cannot supersede the `progress` frames that fill that slot.
- * Every other kind names the row it wrote, and a `seal` names one per answer.
- * `messageDeleted` names a row it removed, which supersedes a held frame for that
- * id just as authoring does.
+ * ⚠️ EXPLICIT PER KIND, WITH AN EXHAUSTIVENESS CHECK, BECAUSE A `default` ARM WAS
+ * A DEFECT. Round 3 wrote `default: return [event.id]`, which quietly enrolled
+ * every id-bearing kind — including `approvalResolution`, whose id is the
+ * APPROVAL's and which `durable-view-reducer.ts` says outright "carries no
+ * content of its own". A reply serving a resolution therefore looked like it had
+ * authored the card, and a held `approval_request` for that card was dropped: the
+ * card the user was looking at vanished for the session. Only three kinds author
+ * text a draft can be superseded by, and the `never` below makes a new kind a
+ * compile error rather than a silent enrolment.
+ *
+ * `placement` is the load-bearing `[]`: it claims a slot and journals no text
+ * (§15.9 — the draft text is deliberately never journaled), so it cannot
+ * supersede the `progress` frames that fill that slot, and a test pins that.
+ *
+ * ⚠️ THE OTHER `[]` ARMS ARE UNREACHABLE TODAY AND NO TEST PINS THEM — say so
+ * rather than implying a guard that fires. `uncarried` consults this function
+ * only for a DRAFT-SHAPED held frame (seq-less, or a `progress`), and no frame of
+ * that shape carries a `user`/`tool`/`approval`/`approvalResolution` id: those
+ * frames all carry their own seq. So the `approvalResolution` defect this
+ * function was rewritten for is actually closed by the seq/id dichotomy in
+ * `uncarried`, and defeating this table alone leaves the suite green (measured);
+ * defeating BOTH reproduces it. What the arms buy is that the next kind cannot
+ * default into "authors text" — which is exactly how `approvalResolution` got in
+ * — and `messageEdited`/`messageDeleted` (no producer on this wire) are listed so
+ * the `never` below has to be re-answered if one ever appears.
  */
 function authoredIdsOf(event: DurableEvent): string[] {
   switch (event.kind) {
-    case "placement":
-      return [];
     case "bubble":
       return [event.answerId];
     case "seal":
       return event.answers.map((a) => a.id);
-    default:
+    case "reasoning":
       return [event.id];
+    case "placement":
+    case "user":
+    case "tool":
+    case "approval":
+    case "approvalResolution":
+    case "messageEdited":
+    case "messageDeleted":
+      return [];
+    default: {
+      // A new `DurableEvent` kind must be classified here, not defaulted into
+      // "authors text" — which is exactly how `approvalResolution` got in.
+      const exhaustive: never = event;
+      void exhaustive;
+      return [];
+    }
   }
 }
 
@@ -3555,9 +3589,9 @@ export class WebChannelNATSClient {
    * ⚠️ THIS MINTS A FRESH CURSOR, SO IT RESETS `retries` TO 0 — and that is only
    * correct because both callers have PROGRESS behind them: a gap newly detected
    * from a moved cursor, or a slice that covered past the floor it answered. A
-   * reply that moved NOTHING must never come through here; it goes to
-   * `onCatchUpStalled`, which keeps the budget, because otherwise a peer that
-   * answers nothing gets an unbounded fresh budget every round-trip.
+   * reply that moved NOTHING must never come through here — `stalled` diverts it,
+   * keeping the budget and the deadline, because otherwise a peer that answers
+   * nothing gets an unbounded fresh budget every round-trip.
    */
   private openCatchUp(afterSeq: number, buffer: InboundMessage[]): void {
     const cursor: CatchingUpCursor = {
@@ -3596,45 +3630,11 @@ export class WebChannelNATSClient {
   }
 
   /**
-   * Re-dispatch held frames in arrival order, dropping only the ones a reply
-   * actually CARRIED an event for.
-   *
-   * ⚠️ `carriedThrough` IS THE LAST SEQ AN EVENT IN THE REPLY HAD — NOT THE
-   * CURSOR, AND THE DIFFERENCE IS DELIVERED CONTENT. The cursor after a reply
-   * also covers seqs the server SKIPPED as undeliverable at this peer's
-   * `max_payload` (#343): those are inside `maxSeq` but no event carried them.
-   * A frame sitting in this buffer is PROOF that its own live send succeeded, so
-   * for exactly those seqs "the reply already delivered it" is false — and
-   * dropping one loses a bubble the user already saw, for the session. The band
-   * is real, not theoretical: a `difference` envelope around the same content is
-   * larger than the live frame's that carried it, so a row inside that band is
-   * live-deliverable and difference-undeliverable — #343's own razor edge,
-   * arriving from the other side. (The width of the band is not quoted here: two
-   * independent measurements disagreed on it, and the argument needs only that
-   * it is non-zero.)
-   *
-   * So the rule is: drop a buffered frame only when an event in the reply
-   * actually carried its seq. Anything else re-folds through `observeSeq`'s
-   * `seq <= last` arm, which is exactly the arm that exists because our seq
-   * numbers ROWS and several live frames legitimately map onto one.
-   *
-   * ⚠️ THE SET OF CARRIED SEQS, NOT A HIGH-WATER OF THEM. A high-water is right
-   * for a skipped seq ABOVE every carried event and wrong for one BETWEEN two of
-   * them — events `[2, 4]` with row 3 skipped would drop a held live frame at 3,
-   * which is the same loss one position over. The set has no interior hole, and
-   * it costs one allocation on a path that just folded N events.
-   *
-   * ⚠️ AND ON THE GIVE-UP PATH THERE IS NO `carriedThrough` AT ALL. Nothing was
-   * carried — no reply ever landed — so nothing may be dropped: every held frame
-   * re-dispatches, including the repeated-seq `progress` frames the cursor
-   * ignores but the view still needs. `undefined` says that, rather than a
-   * sentinel that reads like a seq.
-   *
-   * ⚠️ THIS IS NOT A SECOND CURSOR SITE, AND MUST NOT BECOME ONE (#246 half A).
-   * It re-enters through `handleMessage`, so a re-dispatched frame moves the
-   * cursor through the ONE gated statement in `observeSeq` — refused ⇒ no advance.
-   * A frame that still reveals a gap re-opens one cleanly, re-buffering the
-   * remainder onto the fresh cursor's buffer.
+   * Re-dispatch held frames in ARRIVAL ORDER, minus the ones the reply
+   * superseded. `uncarried` owns which those are and argues every case; this
+   * method owns only the order, and the order is the point — a held frame folds
+   * after the reply's events, which is where a reload's seq-ordered projection
+   * puts it.
    */
   private redispatchBuffered(
     buffered: InboundMessage[],
@@ -3652,36 +3652,37 @@ export class WebChannelNATSClient {
    * re-dispatch would let a frame the first slice delivered survive across the
    * boundary and fold after the second one.
    *
-   * `undefined` means nothing was carried — the give-up and stall paths, where no
-   * reply landed — so nothing is filtered.
+   * `undefined` means the caller has nothing to measure against: the give-up path,
+   * where the budget ran out without any reply that delivered anything. (A reply
+   * that lands and delivers nothing is a STALL — it does not reach here at all,
+   * because it does not end the round-trip.)
    *
-   * ── THE THREE RULES, IN THIS ORDER ──
+   * ── ONE DICHOTOMY, ON WHETHER THE HELD FRAME CARRIES DURABLE TEXT OF ITS OWN ──
    *
-   * 1. **The reply AUTHORED text for this frame's id ⇒ drop.** The durable row is
-   *    the final word on that id and the held frame is, by construction, older.
-   *    This is the only rule that reaches a SEQ-LESS frame, and it is why a
-   *    reasoning draft held through a catch-up does not come back and overwrite
-   *    the durable reasoning row with a prefix of itself.
-   * 2. **Otherwise a `progress` is KEPT, even at a seq the reply carried.** A
-   *    `progress` is a DRAFT UPSERT and the row it maps to is a `placement`,
-   *    which carries no text at all — so "the reply already delivered this seq"
-   *    is true of the slot and false of the text. Dropping them blanks the draft
-   *    the user is watching until the next frame, permanently if the answer never
-   *    produces one. Re-folding is harmless: an upsert of the same draft text on
-   *    the same id.
-   * 3. **Otherwise, the reply folded this frame's seq ⇒ drop.** The ordinary
-   *    double-apply guard, and the reason the buffer exists at all.
+   * **A DRAFT-SHAPED frame** — one with no seq (an unthrottled reasoning frame,
+   * which is every reasoning frame while `reasoningDurable` is off), or a
+   * `progress`, whose row is a text-less `placement` — is superseded only by the
+   * reply AUTHORING its id. Nothing else can supersede a draft: the seq it shares
+   * with its `placement` says the SLOT was delivered, not the text, and dropping
+   * on that blanks the draft the user is watching, permanently for an answer that
+   * never produces another frame.
    *
-   * ⚠️ WHAT IS DELIBERATELY NOT A RULE: "the cursor now covers this seq". The
-   * cursor after a reply also covers seqs the server SKIPPED as undeliverable at
-   * this peer's `max_payload` (#343) — inside `maxSeq`, carried by no event. A
-   * frame sitting in this buffer is PROOF that its own live send succeeded, so
-   * for those seqs "already delivered" is false, and dropping one loses a bubble
-   * the user already saw. The band is real rather than theoretical: a
-   * `difference` envelope around the same content is larger than the live frame's
-   * that carried it, so a row inside that band is live-deliverable and
-   * difference-undeliverable — #343's own razor edge, arriving from the other
-   * side.
+   * **Every other held frame** is superseded only by the reply FOLDING its seq.
+   * Not by the id: an id-authored drop is unbounded above the range the reply
+   * covered, and a tool card is the proof — tool rows are not deduped, so every
+   * phase is its own row, and a slice carrying `tool{T, phase:"start"}@12` would
+   * otherwise drop a held `tool_activity{T, phase:"end"}@20` that the next slice
+   * then skips as undeliverable (#343). The card stays "running" for the session.
+   * Not by the cursor either: after a reply the cursor also covers seqs the
+   * server SKIPPED (#343) — inside `maxSeq`, carried by no event — and a frame
+   * sitting in this buffer is PROOF that its own live send succeeded. A
+   * `difference` envelope for the same content is larger than the live frame that
+   * carried it, so a row inside that band is live-deliverable and
+   * difference-undeliverable: #343's own razor edge, arriving from the other side.
+   *
+   * ⚠️ AND "FOLDED", NOT "CARRIED": an event this build could not decode advances
+   * the cursor past itself (the documented asymmetry) and delivers nothing, so it
+   * may not drop the held frame that is the only usable copy of that row.
    *
    * ⚠️ THIS IS NOT A SECOND CURSOR SITE, AND MUST NOT BECOME ONE (#246 half A).
    * `redispatchBuffered` re-enters through `handleMessage`, so a re-dispatched
@@ -3695,11 +3696,12 @@ export class WebChannelNATSClient {
   ): InboundMessage[] {
     if (carried === undefined) return buffered;
     return buffered.filter((m) => {
-      const id = typeof m.id === "string" && m.id.length > 0 ? m.id : undefined;
-      if (id !== undefined && carried.authoredIds.has(id)) return false;
-      if (m.type === "progress") return true;
       const seq = isWireSeq(m.seq) ? m.seq : undefined;
-      return seq === undefined || !carried.seqs.has(seq);
+      if (seq === undefined || m.type === "progress") {
+        const id = typeof m.id === "string" && m.id.length > 0 ? m.id : undefined;
+        return id === undefined || !carried.authoredIds.has(id);
+      }
+      return !carried.seqs.has(seq);
     });
   }
 
@@ -3725,18 +3727,30 @@ export class WebChannelNATSClient {
   }
 
   /**
-   * #356 round 3 — did this reply FAIL TO MOVE THE FLOOR while claiming there was
-   * more to give?
+   * #356 — did this reply FAIL TO MOVE THE FLOOR, i.e. answer nothing?
+   *
+   * A stall is treated exactly as a LOST reply: the round-trip stays open on its
+   * original deadline, and `onCatchUpTimeout` re-issues on its own cadence and
+   * gives up when the budget is spent. Settling instead re-dispatches the buffer,
+   * the held frame re-opens the same gap on the spot, and `openCatchUp` hands out
+   * a fresh retry budget — an unbounded request loop at round-trip speed
+   * (measured: 51 requests for 50 non-advancing replies, no time passing).
    *
    * Two shapes, one condition. A `partial: true` reply whose coverage does not
    * exceed the floor it answered, and a reply whose fold threw before a single
    * event landed — in both the client learned nothing and the request is, in
    * effect, still outstanding.
    *
-   * ⚠️ AND AN EMPTY COMPLETE REPLY IS NOT ONE OF THEM. `partial: false` with no
-   * events is the SPURIOUS-GAP UNWIND: the server read the journal, found nothing
-   * past the floor, and said so. It moves no floor and must still settle, or a
-   * raced detection would never close.
+   * ⚠️ AND THE SPURIOUS-GAP UNWIND IS THE ONE EXEMPTION, WHICH TURNS ON THE
+   * BUFFER — not on `partial`. `partial: false` with no events is the server
+   * saying "there is nothing past your floor", and a detection that was spurious
+   * must be able to close on it. But that is only true when the buffer is EMPTY.
+   * With a frame still held, settling re-dispatches it, the frame re-opens the
+   * same gap on the spot, and `openCatchUp` hands out a fresh retry budget —
+   * round 2's storm, arriving through the `partial: false` door: measured at 51
+   * requests for 50 empty complete replies, with no time passing. A held frame
+   * means the gap was real, so an answer that covers nothing is a stall whatever
+   * the flag says.
    */
   private stalled(
     msg: InboundMessage,
@@ -3745,38 +3759,7 @@ export class WebChannelNATSClient {
     cursor: CatchingUpCursor,
   ): boolean {
     if (covered > cursor.afterSeq) return false;
-    return msg.partial === true || !completed;
-  }
-
-  /**
-   * #356 round 3 — a reply landed, matched, and answered NOTHING. Treat it as a
-   * lost reply: same budget, same cadence.
-   *
-   * ⚠️ SETTLING HERE WAS AN UNBOUNDED REQUEST LOOP, AND THE GUARD THAT WAS MEANT
-   * TO STOP IT WAS INERT IN THE ORDINARY CASE. Round 2 settled at the unchanged
-   * floor on the theory that the client would then wait for the next durable
-   * frame. It does not: settling re-dispatches the BUFFER, the held frame that
-   * opened this gap is still beyond the cursor, and `observeSeq` re-opens the
-   * catch-up on the spot — with `retries` back at 0, because `openCatchUp` mints a
-   * fresh cursor. Measured on the wrapper: 50 non-advancing `partial` replies
-   * produced 51 requests with `retries: 0` and no time passing, each costing the
-   * server a read and a byte fit. The guard only ever helped when the buffer
-   * happened to be EMPTY, which is the rare shape.
-   *
-   * So the reply does not end the round-trip: the cursor stays, its retry count
-   * stays, and the liveness timer is re-armed. `onCatchUpTimeout` owns the
-   * counter and the re-issue, so a peer that keeps answering nothing costs one
-   * request per `GET_DIFFERENCE_TIMEOUT_MS` — the give-up cadence — instead of
-   * one per round-trip. When the budget is spent it gives up exactly as a silent
-   * peer does.
-   */
-  private onCatchUpStalled(cursor: CatchingUpCursor): void {
-    if (cursor.retries >= GET_DIFFERENCE_MAX_RETRIES) {
-      // `undefined`: this reply delivered nothing, so nothing may be dropped.
-      this.settleSynced(cursor.afterSeq, cursor.buffer, undefined);
-      return;
-    }
-    this.armCatchUpTimer(cursor);
+    return msg.partial === true || !completed || cursor.buffer.length > 0;
   }
 
   /**
@@ -3905,8 +3888,15 @@ export class WebChannelNATSClient {
     // Gate 2: not the reply to OUR request ⇒ another device's, or a superseded
     // retry's. Silent: on a shared subject this is ordinary traffic, not a fault.
     if (msg.nonce !== cursor.nonce || msg.afterSeq !== cursor.afterSeq) return;
-    // Ours, and it landed — stop the liveness timer before folding.
-    this.clearCatchUpTimer(cursor);
+    // ⚠️ THE LIVENESS TIMER IS *NOT* STOPPED HERE, AND THAT IS THE ROUND-4 FIX.
+    // It used to be cleared the moment a matching reply arrived, on the theory
+    // that the round-trip was over. A STALL is a reply that ends nothing — so
+    // clearing here and re-arming there handed the deadline to the peer: any
+    // peer stalling faster than `GET_DIFFERENCE_TIMEOUT_MS` pushed the deadline
+    // back forever and the timer never fired. Measured over 10 simulated minutes
+    // at a 50 ms stall cadence: ONE request, still catching-up, 12 001 frames
+    // held, nothing rendered. The deadline now belongs to the REQUEST: only a
+    // reply that actually ends the round-trip clears it (see the `finally`).
 
     const raw = Array.isArray(msg.events) ? msg.events : [];
     const events = raw
@@ -3990,16 +3980,29 @@ export class WebChannelNATSClient {
         // was never applied.
         const covered = completed && isWireSeq(msg.maxSeq) ? Math.max(last, msg.maxSeq) : last;
         const carried: CarriedRows = { seqs: carriedSeqs, authoredIds };
-        if (this.stalled(msg, covered, completed, cursor)) {
-          this.onCatchUpStalled(cursor);
-        } else if (msg.partial === true) {
-          // Telegram's `updates.differenceSlice`: "the query must be repeated,
-          // using the intermediate status as the current status." The intermediate
-          // status is `covered`; the held frames carry FORWARD, minus the ones
-          // this slice delivered.
-          this.openCatchUp(covered, this.uncarried(cursor.buffer, carried));
-        } else {
-          this.settleSynced(covered, cursor.buffer, carried);
+        // ⚠️ A STALL ENDS NOTHING, AND "NOTHING" INCLUDES THE DEADLINE. The
+        // cursor stays, its retry budget is preserved, and the timer the REQUEST
+        // armed is left exactly where it was — `onCatchUpTimeout` is the only
+        // thing that re-issues and the only thing that gives up. Round 3 re-armed
+        // here instead, which starts a FRESH `GET_DIFFERENCE_TIMEOUT_MS`: a peer
+        // stalling faster than that pushed the deadline back on every reply and
+        // the timeout never fired. Measured over 10 simulated minutes at a 50 ms
+        // stall cadence: ONE request, still catching-up, 12 001 frames held,
+        // nothing rendered — worse than the loop the stall rule replaced.
+        if (!this.stalled(msg, covered, completed, cursor)) {
+          // The round-trip IS over, so the request's deadline has nothing left to
+          // protect. Both branches below install a NEW cursor, and this is the one
+          // place that retires the old one's timer.
+          this.clearCatchUpTimer(cursor);
+          if (msg.partial === true) {
+            // Telegram's `updates.differenceSlice`: "the query must be repeated,
+            // using the intermediate status as the current status." The
+            // intermediate status is `covered`; the held frames carry FORWARD,
+            // minus the ones this slice delivered.
+            this.openCatchUp(covered, this.uncarried(cursor.buffer, carried));
+          } else {
+            this.settleSynced(covered, cursor.buffer, carried);
+          }
         }
       }
       // A difference can settle a held-turn condition (it is durable turn content),

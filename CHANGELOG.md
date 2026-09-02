@@ -145,14 +145,19 @@
     What the reply supersedes is decided per id rather than per position: a held
     frame whose id the reply authored durable text for is dropped, so a cumulative
     draft can no longer overwrite the durable row with a prefix of itself.
-  - A held `progress` is never dropped, even at a seq the reply carried. It maps
-    to a `placement`, which claims the slot and journals no text, so dropping it
-    blanked the draft the user was watching — permanently, for an answer that
-    never produced another frame.
+  - A held `progress` is never dropped for a carried `placement`. It maps to that
+    row, which claims the slot and journals no text, so dropping it on "the reply
+    delivered this seq" blanked the draft the user was watching — permanently, for
+    an answer that never produced another frame. What DOES supersede a draft is
+    the reply authoring its id, which is the same rule that governs a seq-less
+    frame: a held frame carrying no durable text of its own is measured by id, and
+    every other held frame by seq alone.
   - A reply that MOVES NO FLOOR — a `partial` one whose coverage does not exceed
     the floor it answers, or one whose fold threw before a single event landed —
-    is a STALL, not a settle: the round-trip stays open, the retry budget stays
-    spent, and the liveness timer re-issues on its own cadence. Settling instead
+    is a STALL, not a settle: the round-trip stays open, the retry budget is preserved,
+    and the timer the REQUEST armed — never re-armed by the stall, which would
+    hand the deadline to a peer that stalls faster than the timeout — re-issues
+    on its own cadence. Settling instead
     re-dispatched the buffer, which re-opened the gap on the spot with a fresh
     budget: measured at 51 requests for 50 non-advancing replies, at round-trip
     speed, each costing the server a read and a byte fit. An empty COMPLETE reply
