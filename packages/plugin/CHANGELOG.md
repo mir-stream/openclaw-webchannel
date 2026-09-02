@@ -61,8 +61,29 @@
   them — #355). The exception is scoped to these two frame types: an approval's
   state exists server-side whether or not the push lands and its id is core's,
   stable across attempts, neither of which holds for the reasoning residual
-  (#304). An account with no live channel has no journal either, so that drop
-  branch still writes no row.
+  (#304).
+
+  **An account with no live channel has no journal either, and that state is
+  TRANSIENT** — `nats-account-runtime.ts` deletes the runtime on stop and
+  re-adds it on the next start, so an approval can be delivered with no channel
+  and resolved (or expired) with one. Journaling the resolution there would
+  reproduce the original orphan, so the invariant is stated as a producer rule
+  and enforced at both legs: *a resolution row is journaled only once its request
+  row exists.* `deliverPending` records on the pending entry whether the row was
+  actually written (`sendApprovalRequest` now returns `{ delivered, journaled }`
+  — a refused push journals, a swallowed append does not), and `updateEntry`
+  hands the card's payload to `sendApprovalResolved` as `journalRequestFirst`
+  when it is still owed. The channel writes the request row first and the
+  resolution second; if the request row cannot be written, neither is.
+
+  **Disclosed N8-gaining direction.** The journal keeps a card forever while
+  `approval_snapshot` replays only what is still pending, so a card created while
+  the peer was disconnected, never pushed, and then EXPIRED before it returned is
+  served by `projectJournalHistory` with the denial-equivalent verdict
+  `buildExpiredResult` produced — history showing a decision live never showed.
+  That is the Telegram-server model working as intended (the server created the
+  service message and recorded its outcome; the device missed the window), and it
+  is accepted knowingly rather than overlooked.
 
 - **A K>=2 count shortfall no longer routes buffered finals onto lanes (#340,
   extends #260).** `flushBufferedOrdinaryFinals` used to fall back to

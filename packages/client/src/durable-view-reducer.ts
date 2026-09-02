@@ -1389,13 +1389,23 @@ function applyApproval(
  * produced exactly the orphan this function no-ops on: live showed the card and
  * the verdict, history showed neither (#341, N8/N3).
  *
- * What makes the no-op safe now is that the pair is written at the moment the
- * plugin RECORDS the approval, not at the moment it publishes it:
- * `nats-channel.ts`'s `publishApprovalFrame` appends both rows ABOVE the
- * transport's refusals, so a request row exists whenever a resolution row does,
- * and it precedes it in the one ordered stream. `projectJournalHistory` folds
- * the WHOLE journal before it pages (see `historyTail`/`pageBefore`, which slice
- * the projected MESSAGES), so a page boundary cannot separate them either.
+ * What makes the no-op safe now is a rule the PRODUCER enforces, stated exactly:
+ * a resolution row is journaled only once its request row exists. `approvals.ts`
+ * writes the request row at delivery when the account had a live channel — above
+ * the transport's refusals, so a refused push still stores the card — and
+ * otherwise hands the card's payload to the resolution leg, which stores it
+ * immediately before the verdict; if that write fails too, NEITHER row is
+ * written. So a resolution row implies a request row earlier in the same ordered
+ * stream. `projectJournalHistory` folds the WHOLE journal before it pages (see
+ * `historyTail`/`pageBefore`, which slice the projected MESSAGES), so a page
+ * boundary cannot separate them either.
+ *
+ * ⚠️ ROUND 1 OF #341 CLAIMED THIS FROM THE WRONG PREMISE — "both rows are written
+ * above the refusals, so the request row always exists". The account→channel map
+ * is TRANSIENT (`nats-account-runtime.ts` deletes and re-adds it across a
+ * restart), so an approval delivered with no channel and resolved with one wrote
+ * the resolution alone: the same orphan, on a path the fix had not considered.
+ * The invariant is a producer rule, not a consequence of where a hook sits.
  *
  * The reachable case is a client applying a live `approval_resolved` for a card
  * it never received — which is exactly today's behaviour (`patchApproval` maps

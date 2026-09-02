@@ -842,7 +842,8 @@ describe("#244 half A — seq on the durable wire frames", () => {
         prompt: "run: ls",
         options: [{ decision: "allow-once", label: "Allow", style: "primary" }],
       }),
-    ).toBe(true);
+      // #341: this sender reports delivery AND the durable write separately.
+    ).toEqual({ delivered: true, journaled: true });
     expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once")).toBe(true);
 
     expect(transport.frames.map((f) => [f.type, f.seq])).toEqual([
@@ -1323,7 +1324,12 @@ describe("#341 — the approval frames journal above the refusals", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     transport.connected = false;
 
-    expect(channel.sendApprovalRequest(PEER, REQUEST)).toBe(false);
+    // Refused on the wire, STORED in the journal — the two halves of the result
+    // disagreeing is the entire slice, so assert both rather than one.
+    expect(channel.sendApprovalRequest(PEER, REQUEST)).toEqual({
+      delivered: false,
+      journaled: true,
+    });
 
     // The row exists even though NOTHING was published — the point of the slice.
     expect(calls).toEqual([
@@ -1391,7 +1397,10 @@ describe("#341 — the approval frames journal above the refusals", () => {
     // a duplicate seq-consuming event.
     const { calls, channel, transport } = makeChannel();
 
-    expect(channel.sendApprovalRequest(PEER, REQUEST)).toBe(true);
+    expect(channel.sendApprovalRequest(PEER, REQUEST)).toEqual({
+      delivered: true,
+      journaled: true,
+    });
     expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once")).toBe(true);
 
     expect(calls.map((entry) => (entry.call === "append" ? entry.event.kind : entry.call))).toEqual([
@@ -1414,8 +1423,15 @@ describe("#341 — the approval frames journal above the refusals", () => {
     // once; the re-arming push carries no seq because it consumed none.
     const { calls, channel, transport } = makeChannel();
 
-    expect(channel.sendApprovalRequest(PEER, REQUEST)).toBe(true);
-    expect(channel.sendApprovalRequest(PEER, REQUEST, { redelivery: true })).toBe(true);
+    expect(channel.sendApprovalRequest(PEER, REQUEST)).toEqual({
+      delivered: true,
+      journaled: true,
+    });
+    // Re-armed live, not re-stored.
+    expect(channel.sendApprovalRequest(PEER, REQUEST, { redelivery: true })).toEqual({
+      delivered: true,
+      journaled: false,
+    });
 
     expect(appends(calls)).toHaveLength(1);
     expect(transport.frames.map((f) => [f.type, f.seq])).toEqual([
@@ -1445,7 +1461,12 @@ describe("#341 — the approval frames journal above the refusals", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     journal.throwOnAppend = true;
 
-    expect(channel.sendApprovalRequest(PEER, REQUEST)).toBe(true);
+    // Published anyway, and the caller is TOLD the row is missing — which is what
+    // lets `approvals.ts` write it at resolution time instead.
+    expect(channel.sendApprovalRequest(PEER, REQUEST)).toEqual({
+      delivered: true,
+      journaled: false,
+    });
 
     expect(appends(calls)).toEqual([]);
     expect(calls).toEqual([{ call: "publish", subject: OUT, type: "approval_request" }]);

@@ -639,6 +639,22 @@ export type OutboundWsMessage =
    */
   | { type: "difference"; events: Array<{ seq: number; event: DurableEvent }> };
 
+/**
+ * #341 — what `sendApprovalRequest` reports back. TWO independent outcomes, and
+ * conflating them is what round 1 got wrong:
+ *  - `delivered` — did the frame reach the wire? The historic boolean return, and
+ *    still the only thing the delivery warning branches on.
+ *  - `journaled` — did the durable `approval` row get written? It is TRUE on a
+ *    refused push (that is the whole point of #341) and FALSE both for a
+ *    re-delivery, which must not write a second row, and for an append the
+ *    journal swallowed. `approvals.ts` carries it into the pending record so the
+ *    resolution leg knows whether it still owes the row.
+ */
+export type ApprovalRequestSendResult = {
+  delivered: boolean;
+  journaled: boolean;
+};
+
 export interface WebChannelPeerChannel {
   sendText(
     peerId: string,
@@ -713,26 +729,54 @@ export interface WebChannelPeerChannel {
     message: { id: string; text: string; turnId?: string; seq: number; random_id?: string },
   ): boolean;
   /**
-   * #341: `redelivery` says THIS APPROVAL'S STATE IS ALREADY RECORDED — the
-   * caller (`approvals.ts`'s `deliverPending`) found the id already in its
-   * pending store, so this call is a re-arming push of a card the plugin
-   * created earlier, not the creation of one. The implementation journals the
-   * `approval` row only for the CREATING call; a re-delivery publishes without
-   * writing a second row.
+   * #341: `redelivery` says A DURABLE ROW FOR THIS CARD ALREADY EXISTS in this
+   * peer's conversation, so this call is a re-arming push of a service message
+   * the plugin already stored, not the storing of one. The implementation
+   * journals the `approval` row only when that is false; a re-delivery publishes
+   * without writing a second row.
    *
    * ⚠️ THE CALLER OWNS THIS FACT, NOT THE CHANNEL. Only `approvals.ts` holds the
-   * per-(account, approvalId) record that distinguishes the two, and the journal
-   * cannot: `delivery-journal.ts`'s `extractMessageId` has no `approval` arm, so
-   * approval rows carry a null `message_id` and no unique index can collapse a
-   * duplicate (#355). Omitted ⇒ `false` ⇒ journal, which is the safe default for
-   * any caller that does not track delivery attempts.
+   * per-(account, approvalId) record that tracks it, and the journal cannot:
+   * `delivery-journal.ts`'s `extractMessageId` has no `approval` arm, so approval
+   * rows carry a null `message_id` and no unique index can collapse a duplicate
+   * (#355). Omitted ⇒ `false` ⇒ journal, which is the safe default for any caller
+   * that does not track delivery attempts.
+   *
+   * ⚠️ AND THE RESULT REPORTS BOTH OUTCOMES BECAUSE THEY GENUINELY DIFFER. A
+   * refused push still stores the card (`delivered: false, journaled: true`), and
+   * a store whose append was swallowed (§15.8) still publishes it
+   * (`delivered: true, journaled: false`). The caller needs the second field to
+   * know whether the resolution leg must write the row late — round 1 of #341
+   * inferred it from "a channel resolved", and the account map is transient, so
+   * an account absent at delivery and present at resolution reproduced the exact
+   * orphan the slice exists to kill.
    */
   sendApprovalRequest(
     peerId: string,
     request: ApprovalRequestPayload,
     options?: { redelivery?: boolean },
+  ): ApprovalRequestSendResult;
+  /**
+   * #341: `journalRequestFirst` carries THE CARD'S OWN PAYLOAD when its durable
+   * `approval` row was never written — the delivery attempt found no channel for
+   * the account, or its append was swallowed. The implementation stores that row
+   * BEFORE the resolution's, so the projection folds a card with its decision
+   * rather than an orphan verdict; and if it cannot store it, it stores NEITHER,
+   * because a resolution row with no request row is precisely the orphan.
+   *
+   * ⚠️ THE ROW WRITTEN HERE HAS NO LIVE FRAME BEHIND IT, and that is correct
+   * rather than a gap. The card the user acted on was re-armed live by the
+   * register-time `approval_snapshot` (which replays the pending store, not the
+   * journal), so live showed it; this write is history catching up with live. The
+   * seq it consumes rides no frame, so a peer sees a hole and heals it with
+   * `get_difference` (#244 half B) — the mechanism that exists for exactly this.
+   */
+  sendApprovalResolved(
+    peerId: string,
+    id: string,
+    decision: ApprovalDecision,
+    options?: { journalRequestFirst?: ApprovalRequestPayload },
   ): boolean;
-  sendApprovalResolved(peerId: string, id: string, decision: ApprovalDecision): boolean;
   sendApprovalSnapshot(peerId: string, approvals: ApprovalRequestPayload[], resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean;
   sendAck?(
     peerId: string,
@@ -754,8 +798,8 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendHistory(_peerId: string, _messages: HistoryMessage[], _highWaterSeq?: number): boolean { return false; }
   sendDifference(_peerId: string, _events: Array<{ seq: number; event: DurableEvent }>): boolean { return false; }
   sendUserCommitted(_peerId: string, _message: { id: string; text: string; turnId?: string; seq: number; random_id?: string }): boolean { return false; }
-  sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload, _options?: { redelivery?: boolean }): boolean { return false; }
-  sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision): boolean { return false; }
+  sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload, _options?: { redelivery?: boolean }): ApprovalRequestSendResult { return { delivered: false, journaled: false }; }
+  sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision, _options?: { journalRequestFirst?: ApprovalRequestPayload }): boolean { return false; }
   sendApprovalSnapshot(_peerId: string, _approvals: ApprovalRequestPayload[], _resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean { return false; }
   sendAck(_peerId: string, ids: string[], _committed?: Array<{ random_id: string; messageId: string; seq: number }>): boolean { return ids.length === 0; }
   sendInboundRejected(_peerId: string, ids: string[]): boolean { return ids.length === 0; }

@@ -639,10 +639,22 @@ export function journalEventForOutbound(
       // the transport refused got NO row while the pending map kept it and this
       // frame re-delivered it live — the snapshot was then the SOLE carrier of a
       // card the user saw and acted on, and its resolution landed as an orphan
-      // (#341, N8/N3). #341 moved the append above the refusals
-      // (`nats-channel.ts`'s `publishApprovalFrame`), which is what makes the
-      // premise above hold. The verdict here never changed; only its premise
-      // became true.
+      // (#341, N8/N3). #341 made the store hold it: the row is written at the
+      // delivery act above the refusals, or failing that at resolution time (see
+      // `approvals.ts`'s two legs). The verdict here never changed; only its
+      // premise became true.
+      //
+      // ⚠️ AND THE TWO STORES ARE NOW DELIBERATELY ASYMMETRIC IN ONE DIRECTION —
+      // an N8 reader should meet this here rather than derive it. This frame
+      // replays only what is STILL PENDING (plus recently-resolved outcomes); the
+      // journal keeps the card forever. So a card created while the peer was
+      // disconnected, never pushed, and then EXPIRED before the peer returned is
+      // absent from this frame and present in history, carrying the
+      // denial-equivalent verdict `buildExpiredResult` produced — a decision the
+      // user never saw live. That is intended Telegram-server behaviour, not a
+      // leak: the server created the service message and recorded what became of
+      // it; the device simply missed the window. It is history GAINING a row live
+      // never showed, so it is worth stating that it was accepted knowingly.
       //
       // ⚠️ IT IS ALSO WHAT MAKES A REPLAYED CARD SAFE, so do not read "not
       // durable" as "not load-bearing". `nats-register.ts` sends this frame on

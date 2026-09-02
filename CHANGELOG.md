@@ -79,7 +79,16 @@
   attached to nothing. A reloaded transcript then showed the agent running a
   command with nothing saying anyone authorised it. Approval state is now stored
   when the plugin records it rather than when it manages to send it, so the card
-  and the consent survive the outage together.
+  and the consent survive the outage together. If the outage was total — no
+  connection for the whole account at the moment the prompt was raised — the card
+  is stored when it is decided instead, and if even that is impossible neither
+  the card nor the decision is stored, so a verdict never appears without the
+  request it answers.
+
+  One consequence is deliberate and worth knowing: a prompt raised while a
+  browser was closed, never delivered, and left to time out is now visible in
+  that conversation's history as denied — the record of something the server
+  asked and answered on its own, which the browser never had a chance to see.
 
 - **A turn whose answer count does not line up no longer loses an answer (#340,
   extends #260).** When a turn ends with two or more finals whose count does not

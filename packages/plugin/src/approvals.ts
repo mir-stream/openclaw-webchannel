@@ -201,6 +201,24 @@ type PendingApprovalEntry = {
   accountKey: string;
   /** `Date.now()` at delivery — the max-age prune uses it for no-`expiresAtMs` entries. */
   deliveredAtMs: number;
+  /**
+   * #341: has this card's durable `approval` row been written yet? It is the one
+   * fact the resolution leg cannot re-derive, and it lives HERE rather than on the
+   * `ClawApprovalEntry` core hands back, for two reasons: a re-delivery builds a
+   * FRESH runtime entry (so a flag there would be reset by the very retry that
+   * must not re-journal), and `updateEntry` already reads this record for the
+   * payload it needs to write the row late.
+   *
+   * ⚠️ SCOPED TO THIS ENTRY'S `sessionKey`, and `recordPendingApproval` RESETS it
+   * when a delivery arrives for a different peer. The row is keyed by peerId (the
+   * journal's conversation id) while this map is keyed by (account, approvalId),
+   * so "already journaled" is only true of the conversation it was journaled in.
+   * Today at most one peer per (account, approvalId) is reachable — the webchannel
+   * capability passes no `resolveApproverDmTargets`, so core plans a single target
+   * — but core's fan-out plan dedupes per `sessionKey` and could hand us two, and
+   * the second peer's conversation genuinely needs its own row.
+   */
+  requestJournaled: boolean;
 };
 
 const pendingApprovals = new Map<string, PendingApprovalEntry>();
@@ -212,14 +230,15 @@ function pendingApprovalKey(accountId: string | null | undefined, approvalId: st
 /**
  * Record (or refresh) a pending approval; bounded, evicts oldest at the cap.
  *
- * Returns TRUE when this (account, approvalId) had no record — i.e. this call
- * CREATED the pending approval rather than refreshing one. #341 uses that to
- * journal the durable `approval` row exactly once per card: `deliverPending`
- * passes `{ redelivery: !created }` to `sendApprovalRequest`, and a re-delivery
- * (stateless register, retry) re-arms the live card without appending a second
- * row. Nothing downstream can dedupe those rows for us — `delivery-journal.ts`'s
- * `extractMessageId` has no `approval` arm, so they carry a null `message_id`
- * and no unique index sees them (#355).
+ * Returns the entry's `requestJournaled` state AS IT STOOD BEFORE this call — i.e.
+ * "does a durable `approval` row for this card already exist in this peer's
+ * conversation". #341 gates the journal on it rather than on "is this a new
+ * record", and the difference matters: a first delivery whose append was
+ * SWALLOWED (§15.8) leaves a record with no row, and the next re-delivery must
+ * write it rather than skip it as a duplicate. Nothing downstream can dedupe
+ * approval rows for us — `delivery-journal.ts`'s `extractMessageId` has no
+ * `approval` arm, so they carry a null `message_id` and no unique index sees them
+ * (#355).
  */
 function recordPendingApproval(
   accountId: string | null | undefined,
@@ -228,9 +247,12 @@ function recordPendingApproval(
   deliveredAtMs: number,
 ): boolean {
   const key = pendingApprovalKey(accountId, payload.id);
-  // Read BEFORE the delete-then-set below, which would erase the very distinction
-  // this returns.
-  const created = !pendingApprovals.has(key);
+  // Read BEFORE the delete-then-set below, which would erase the very state this
+  // returns. A record for a DIFFERENT peer carries no claim about this one's
+  // conversation, so it reads as not-journaled (see the field's docblock).
+  const previous = pendingApprovals.get(key);
+  const requestJournaled =
+    previous !== undefined && previous.sessionKey === sessionKey && previous.requestJournaled;
   // Insertion-ordered Map: delete-then-set moves a repeat delivery to the newest
   // slot so a re-delivery refreshes rather than dupes (and never evicts itself).
   pendingApprovals.delete(key);
@@ -258,8 +280,36 @@ function recordPendingApproval(
     sessionKey,
     accountKey: bindingAccountKey(accountId),
     deliveredAtMs,
+    requestJournaled,
   });
-  return created;
+  return requestJournaled;
+}
+
+/**
+ * #341: note that this card's durable `approval` row now exists, so neither a
+ * re-delivery nor the resolution leg writes a second one. No-op if the record is
+ * already gone (finalized/evicted between the send and this call) — the flag only
+ * ever suppresses a duplicate write, so losing it is the safe direction.
+ */
+function markPendingApprovalJournaled(
+  accountId: string | null | undefined,
+  approvalId: string,
+): void {
+  const entry = pendingApprovals.get(pendingApprovalKey(accountId, approvalId));
+  if (entry) entry.requestJournaled = true;
+}
+
+/**
+ * #341: read this account's pending record without disturbing it. `updateEntry`
+ * needs BOTH of its fields before it erases the record — the payload, to write a
+ * durable `approval` row that delivery could not write, and `requestJournaled`, to
+ * know whether it has to.
+ */
+function readPendingApproval(
+  accountId: string | null | undefined,
+  approvalId: string,
+): PendingApprovalEntry | undefined {
+  return pendingApprovals.get(pendingApprovalKey(accountId, approvalId));
 }
 
 /** Erase this account's pending record for an approval (called at finalize). */
@@ -846,12 +896,14 @@ export function createClawApprovalNativeRuntimeSpec(
         // becomes recoverable on the peer's next register (its register-time
         // `approval_snapshot`) instead of being permanently lost.
         //
-        // Since #341 the snapshot is no longer the SOLE carrier of such a card:
-        // the send below journals the durable `approval` row on the same refused
-        // paths, so history holds it too. The record here is still what makes the
-        // card actionable again, and it is what tells the send whether this call
-        // created the card (see `redelivery` below).
-        const created = recordPendingApproval(
+        // Since #341 the snapshot is no longer the SOLE carrier of such a card
+        // whenever a channel exists: the send below journals the durable
+        // `approval` row on the refused paths too, so history holds it. When no
+        // channel exists at all there is no journal either, and the resolution leg
+        // writes the row late (see `updateEntry`). The record here is what makes
+        // the card actionable again on the next register, and it is where the
+        // "row already written?" bit lives.
+        const requestJournaled = recordPendingApproval(
           accountId,
           pendingPayload,
           sessionKey,
@@ -862,16 +914,23 @@ export function createClawApprovalNativeRuntimeSpec(
           // F2 fail-closed: no live channel for this account (skipped/unknown).
           // Refuse to misroute onto the primary channel; drop with a warn.
           //
-          // ⚠️ AND THIS BRANCH WRITES NO DURABLE ROW EITHER — #341 did NOT close
-          // this case, and saying so is the point. The delivery journal is opened
-          // per account by `nats-account-runtime.ts` and handed to that account's
-          // channel; "no live channel for this account" therefore means "no
-          // journal for this account" (a lifecycle that failed to start closes the
-          // handle it opened). The pending record above is all this account has,
-          // and the register-time `approval_snapshot` remains its only carrier —
-          // which is exactly the shape #341 fixed for the OTHER refusals. Do not
-          // "fix" it by journaling onto the closure/primary channel: that writes
-          // one account's card into another account's history.
+          // ⚠️ THIS BRANCH WRITES NO DURABLE ROW *YET*, AND THE DELAY IS THE
+          // DESIGN. The delivery journal is opened per account by
+          // `nats-account-runtime.ts` and handed to that account's channel, so
+          // "no live channel for this account" means "no journal for this
+          // account" — there is nowhere to write. Journaling onto the
+          // closure/primary channel instead would file one account's card in
+          // another account's history, which is worse than waiting.
+          //
+          // It does NOT leave the card unstorable, which is what round 1 of #341
+          // assumed. This state is TRANSIENT: the runtime map is deleted and
+          // re-populated across a restart/reconnect, so the account is usually
+          // back by the time the card is resolved (the snapshot re-armed it live
+          // on the peer's next register, or it simply expired). `updateEntry`
+          // therefore writes this row LATE, from the pending payload recorded
+          // above, immediately before the resolution's — see the
+          // `journalRequestFirst` argument there. `requestJournaled` stays false
+          // here precisely so that leg knows it still owes the row.
           console.warn(
             `[webchannel] approval ${logSafe(pendingPayload.id)} not delivered: no live channel for ` +
               `account ${logSafe(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)} (skipped or unknown) — refusing to misroute`,
@@ -887,14 +946,19 @@ export function createClawApprovalNativeRuntimeSpec(
         //
         // #341: the channel journals the `approval` row ABOVE its refusals, so
         // this call persists the card whether or not the push lands — and
-        // `redelivery` tells it which of these calls CREATED the card, since only
-        // the pending store knows. That keeps the durable row and the pending
-        // record one act: the state is stored when it is created, delivery is a
-        // separate attempt (`nats-channel.ts`'s `publishApprovalFrame`).
-        const delivered = channel.sendApprovalRequest(sessionKey, pendingPayload, {
-          redelivery: !created,
+        // `redelivery` tells it whether a row for this peer's conversation
+        // already exists, which only the pending store knows. That keeps the
+        // durable row and the pending record one act: the state is stored when it
+        // is created, delivery is a separate attempt
+        // (`nats-channel.ts`'s `publishApprovalFrame`).
+        const sent = channel.sendApprovalRequest(sessionKey, pendingPayload, {
+          redelivery: requestJournaled,
         });
-        if (!delivered) {
+        // Note it only when the append actually landed. A swallowed one (§15.8)
+        // leaves the flag false, so the next re-delivery writes the row, and
+        // failing that the resolution leg does.
+        if (sent.journaled) markPendingApprovalJournaled(accountId, pendingPayload.id);
+        if (!sent.delivered) {
           console.warn(
             `[webchannel] approval ${logSafe(pendingPayload.id)} not delivered: no matching open ` +
               `socket for ${logSafe(sessionKey)} (account ${logSafe(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)})`,
@@ -910,6 +974,13 @@ export function createClawApprovalNativeRuntimeSpec(
         // Finalize is terminal for this approval — release the id→account
         // binding (resolved AND expired both route here).
         deliveredApprovalAccounts.delete(entry.approvalId);
+        // #341: READ BEFORE THE ERASE BELOW. If delivery could not write this
+        // card's durable `approval` row — no channel for the account then, or a
+        // swallowed append — the resolution leg has to write it, and the payload
+        // it needs lives only in this record. The erase must stay where it is (it
+        // has to run even when the resolve frame cannot be sent), so the read
+        // moves above it rather than the erase moving down.
+        const pending = readPendingApproval(accountId ?? entry.accountId, entry.approvalId);
         // #15: drop THIS handler's account-scoped pending record, so a later
         // register no longer re-delivers a finalized card. Placed next to the
         // binding delete — BEFORE the channel-resolution early return — so the
@@ -932,10 +1003,13 @@ export function createClawApprovalNativeRuntimeSpec(
         );
         const channel = transportFor(accountId ?? entry.accountId);
         if (!channel) {
-          // Same shape as `deliverPending`'s F2 branch, and the same residual:
-          // no channel for this account means no journal for it either, so the
-          // verdict lives only in the resolved store above until the snapshot
-          // carries it. See that branch for why journaling elsewhere is worse.
+          // Same shape as `deliverPending`'s F2 branch: no channel for this
+          // account means no journal for it either, so the verdict lives only in
+          // the resolved store above until the snapshot carries it. Nothing is
+          // journaled here — and if the card's request row was never written
+          // either, that is the RIGHT outcome, not a second gap: a resolution row
+          // alone is the orphan, so history correctly holds neither rather than
+          // half of a card.
           console.warn(
             `[webchannel] approval ${logSafe(entry.approvalId)} resolve frame dropped: no live channel ` +
               `for account ${logSafe(accountId ?? entry.accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)}`,
@@ -944,13 +1018,33 @@ export function createClawApprovalNativeRuntimeSpec(
         }
         // #341: journals the `approvalResolution` row above the transport's
         // refusals, so the verdict is durable even if the resolve frame is not
-        // published. Its partner `approval` row was written the same way at
-        // delivery, so the pair can no longer come apart (the orphan resolution
-        // `applyApprovalResolution` folds onto nothing was the whole bug).
+        // published.
+        //
+        // `journalRequestFirst` is the SYMMETRY that makes the pair inseparable.
+        // Delivery writes the request row whenever a channel existed; when it did
+        // not — the account was mid-restart, F2 — or when its append was
+        // swallowed, the card still reached the user live (the snapshot re-arms
+        // from the pending store, not the journal) and can still be resolved or
+        // expire. Handing the payload over lets the channel store the card
+        // immediately before its verdict, and refuse to store the verdict alone if
+        // it cannot.
+        //
+        // ⚠️ A MISSING `pending` RECORD IS TREATED AS "THE ROW EXISTS", AND THAT IS
+        // A CHOICE, not an oversight. It is undefined only when the record was
+        // evicted at the 512 cap or pruned at the 60-minute backstop, i.e. long
+        // after a delivery that in the ordinary case had a live channel and wrote
+        // the row. Withholding the resolution there would lose a real verdict for
+        // a card history DOES hold — a permanently-unresolved card, which is the
+        // larger divergence. Passing the catch-up payload we no longer have is not
+        // an option, so the alternatives are "resolution row" or "nothing", and
+        // the residual risk of the first is an orphan that folds to a no-op.
         channel.sendApprovalResolved(
           entry.sessionKey,
           entry.approvalId,
           payload.decision,
+          pending !== undefined && !pending.requestJournaled
+            ? { journalRequestFirst: pending.payload }
+            : undefined,
         );
       },
     },

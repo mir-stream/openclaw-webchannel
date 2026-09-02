@@ -18,7 +18,7 @@
 
 import { inspect } from "node:util";
 import type { NatsTransport, NatsMessage } from "./nats-transport.js";
-import type { ApprovalDecision, ApprovalRequestPayload, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
+import type { ApprovalDecision, ApprovalRequestPayload, ApprovalRequestSendResult, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
 import type { KeyPair } from "./e2e-crypto.js";
 import type { ConversationKeyStore } from "./conversation-key-store.js";
 import { wrapConversationKey } from "./late-join-decryptor.js";
@@ -851,7 +851,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     peerId: string,
     request: ApprovalRequestPayload,
     options?: { redelivery?: boolean },
-  ): boolean {
+  ): ApprovalRequestSendResult {
     const payload: ApprovalOutboundFrame = {
       type: "approval_request",
       ...request,
@@ -890,18 +890,32 @@ export class NatsChannel implements WebChannelPeerChannel {
    * so a refused close frame cannot be distinguished from content the peer never
    * saw. See `message-adapter.ts`'s `lastDeliveredText` declaration.
    *
+   * ⚠️ THIS IS HALF THE RULE, NOT ALL OF IT. Journaling above the refusals only
+   * helps when a channel EXISTS to journal through, and the account→channel map
+   * is transient — so a card can be created with no channel and resolved with
+   * one. `sendApprovalResolved`'s `journalRequestFirst` is the other half, and the
+   * two together are the invariant: a resolution row is written only once its
+   * request row exists.
+   *
    * `seq` is stamped HERE for the same reason it is stamped in `sendToPeer`: the
    * row consumed a per-conversation seq and the frame the peer receives must
    * carry THAT one (#244 half A). A re-delivery writes no row and so carries no
    * seq, exactly like any other unjournaled frame.
+   *
+   * Reports BOTH outcomes rather than a send boolean, because for these frames
+   * they come apart in both directions — see `ApprovalRequestSendResult`.
    */
   private publishApprovalFrame(
     peerId: string,
     payload: ApprovalOutboundFrame,
     journal: boolean,
-  ): boolean {
+  ): ApprovalRequestSendResult {
     const seq = journal ? this.journalOutbound(peerId, payload) : undefined;
-    return this.sendToPeer(peerId, seq !== undefined ? { ...payload, seq } : payload);
+    const delivered = this.sendToPeer(
+      peerId,
+      seq !== undefined ? { ...payload, seq } : payload,
+    );
+    return { delivered, journaled: seq !== undefined };
   }
 
   /**
@@ -911,7 +925,12 @@ export class NatsChannel implements WebChannelPeerChannel {
    * - The first peer to resolve an approvalId wins
    * - Subsequent resolutions for the same approvalId are dropped
    */
-  sendApprovalResolved(peerId: string, id: string, decision: ApprovalDecision): boolean {
+  sendApprovalResolved(
+    peerId: string,
+    id: string,
+    decision: ApprovalDecision,
+    options?: { journalRequestFirst?: ApprovalRequestPayload },
+  ): boolean {
     // First-write-wins exactly-once: check if already resolved
     const existingResolver = this.approvalResolutions.get(id);
     // #341: the request side takes its "already recorded" signal from the caller;
@@ -941,8 +960,36 @@ export class NatsChannel implements WebChannelPeerChannel {
       }
     }
 
+    // #341 — THE CARD'S ROW FIRST, OR NEITHER ROW AT ALL.
+    //
+    // The caller passes `journalRequestFirst` when delivery could not write the
+    // `approval` row: the account had no live channel at the time (a TRANSIENT
+    // state — `nats-account-runtime.ts` deletes and re-adds the runtime across a
+    // restart/reconnect), or the append was swallowed. Both leave a card the
+    // register-time `approval_snapshot` still shows live, so the user (or the
+    // expiry) can resolve one whose request row does not exist.
+    //
+    // Storing it here restores the invariant the projection needs: the request
+    // row precedes its resolution in the one ordered stream. And if THAT append
+    // fails too, the resolution's is skipped, because a resolution row with no
+    // request row is exactly the orphan `applyApprovalResolution` folds onto
+    // nothing — the defect this slice exists to kill. Keeping both decisions on
+    // this line, next to both appends, is why the catch-up is an option here
+    // rather than a separate journal-only call the caller has to sequence.
+    let journalResolution = firstResolution;
+    const catchUpRequest = options?.journalRequestFirst;
+    if (journalResolution && catchUpRequest !== undefined) {
+      const requestSeq = this.journalOutbound(peerId, {
+        type: "approval_request",
+        ...catchUpRequest,
+      });
+      // `undefined` also covers "this channel has no journal at all", where
+      // skipping the resolution row costs nothing — there is no store to skip in.
+      if (requestSeq === undefined) journalResolution = false;
+    }
+
     const payload: ApprovalOutboundFrame = { type: "approval_resolved", id, decision };
-    return this.publishApprovalFrame(peerId, payload, firstResolution);
+    return this.publishApprovalFrame(peerId, payload, journalResolution).delivered;
   }
 
   /**
