@@ -181,24 +181,45 @@ function isStringArray(value: unknown): value is string[] {
 }
 
 /**
- * `Array<{id: string; text: string}>` — the `answers` shape of a seal/turn_snapshot.
- * The id must be NON-EMPTY: `applyTurnSnapshot` filters an empty one out before
- * its "nothing to fold" early return, so an empty-id entry accepted here would be
- * dropped AND counted as folded — the one refusal the door and the folder must
- * not disagree on (round-3 review of #246 half A). The plugin mints every id
- * (`message-adapter.ts` `nextMessageId()`), so no legitimate frame carries one.
+ * `Array<{id: string; text: string}>` — the `answers` SHAPE, used by the durable
+ * `seal` decoder. Shape only: an EMPTY id is tolerated here because the reducer's
+ * `applySeal` filters such an entry itself and folds the rest, whereas a refusal
+ * on the difference path is unrecoverable — `applyDifference` skips a malformed
+ * event AND advances the cursor past it, so the whole seal (text, order,
+ * `remove`) would be lost for one bad entry. Tolerating is the cheaper error.
  */
 function isAnswerArray(value: unknown): boolean {
   return (
     Array.isArray(value) &&
     value.every(
-      (entry) =>
-        isRecord(entry) && isNonEmptyString(field(entry, "id")) && isString(field(entry, "text")),
+      (entry) => isRecord(entry) && isString(field(entry, "id")) && isString(field(entry, "text")),
     )
   );
 }
 
-/** `string[]` with no empty member — the `remove` shape (same rule as `isAnswerArray`). */
+/**
+ * `isAnswerArray` plus a NON-EMPTY id — the LIVE `turn_snapshot` rule, and
+ * deliberately stricter than the durable one above. `applyTurnSnapshot` filters
+ * an empty-id entry out BEFORE its "nothing to fold" early return, so an entry
+ * accepted here would be dropped AND reported as folded (cursor advanced) — the
+ * one refusal the door and the folder must not disagree on (round-3 review of
+ * #246 half A). Refusing costs one `get_difference` round-trip, which re-serves
+ * the canonical `seal` through the tolerant decoder above. The plugin mints every
+ * id (`message-adapter.ts` `nextMessageId()`), so no legitimate frame carries one.
+ */
+function isFoldableAnswerArray(value: unknown): boolean {
+  return (
+    isAnswerArray(value) &&
+    (value as Array<Record<string, unknown>>).every((entry) => isNonEmptyString(entry.id))
+  );
+}
+
+/**
+ * `string[]` with no empty member — the LIVE `turn_snapshot.remove` rule, for
+ * the same reason as `isFoldableAnswerArray`. The durable `seal.remove` stays on
+ * `isStringArray`: `applySeal` drops an empty entry itself, and a seal reached
+ * through `difference` has no folded-verdict to mis-report.
+ */
 function isNonEmptyStringArray(value: unknown): boolean {
   return Array.isArray(value) && value.every((entry) => isNonEmptyString(entry));
 }
@@ -345,12 +366,12 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
         return invalid(known, "turnId must be non-empty");
       }
       const answers = field(raw, "answers");
-      if (answers !== undefined && !isAnswerArray(answers)) {
-        return invalid(known, "answers must be an array of {id, text}");
+      if (answers !== undefined && !isFoldableAnswerArray(answers)) {
+        return invalid(known, "answers must be an array of {id: non-empty string, text: string}");
       }
       const remove = field(raw, "remove");
       if (remove !== undefined && !isNonEmptyStringArray(remove)) {
-        return invalid(known, "remove must be an array of strings");
+        return invalid(known, "remove must be an array of non-empty strings");
       }
       return accept(raw);
     }
@@ -644,7 +665,9 @@ export function decodeDurableEvent(event: unknown): DurableEventDecodeResult {
     case "seal":
       // `answers` is ITERATED by the fold arm before the reducer sees it, and
       // each entry's `id` is used as an overlay key — the exact shape whose
-      // absence throws.
+      // absence throws. SHAPE only (`isAnswerArray`, not the live door's
+      // non-empty variant): `applySeal` filters an empty id per entry, and a
+      // refusal here would cost the whole seal — see the helper's docblock.
       if (!isNonEmptyString(field(event, "turnId"))) return bad("turnId must be non-empty");
       if (!isAnswerArray(field(event, "answers"))) {
         return bad("answers must be an array of {id, text}");

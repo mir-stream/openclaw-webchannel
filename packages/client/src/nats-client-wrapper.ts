@@ -4753,7 +4753,9 @@ export class WebChannelNATSClient {
       }
 
       case "reasoning": {
-        if (!msg.id || !msg.turnId || typeof msg.text !== "string" || msg.text.length === 0) return false;
+        if (!msg.id || !msg.turnId || typeof msg.text !== "string" || msg.text.length === 0) {
+          return false;
+        }
         // ⚠️ #242 half 2: THROUGH THE SHARED REDUCER, like every other durable
         // frame. Half 1 called a private `upsertReasoning` over a side array;
         // that method is deleted, and with it the second implementation the v6

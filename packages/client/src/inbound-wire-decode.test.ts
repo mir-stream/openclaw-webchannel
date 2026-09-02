@@ -341,6 +341,17 @@ describe("#246 half A — decodeDurableEvent: the difference fold's events", () 
     expect(decodeDurableEvent({ kind: "bubble", answerId: "", text: "x" }).ok).toBe(false);
   });
 
+  it("seal tolerates an empty answer id / remove entry (the reducer filters them) — unlike the live turn_snapshot door", () => {
+    // The live door refuses these because `applyTurnSnapshot` would report the
+    // frame folded after filtering them out; on the difference path a refusal
+    // skips the whole seal AND advances the cursor, so the shape check stays
+    // tolerant and `applySeal`'s own per-entry filter does the dropping.
+    expect(
+      decodeDurableEvent({ kind: "seal", turnId: "t1", answers: [{ id: "", text: "x" }, { id: "a1", text: "y" }] }).ok,
+    ).toBe(true);
+    expect(decodeDurableEvent({ kind: "seal", turnId: "t1", answers: [], remove: [""] }).ok).toBe(true);
+  });
+
   it("reads OWN properties only", () => {
     const inherited = Object.create({ text: "final" }) as { kind?: string; answerId?: string };
     inherited.kind = "bubble";

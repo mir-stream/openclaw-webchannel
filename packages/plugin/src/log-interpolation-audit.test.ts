@@ -295,7 +295,8 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   //     raw, `logSafe(peerId)`, `logSafe(failure.reason)`).
   // The one raw value is the five-literal `KnownInboundWsType`, allowlisted with
   // its reason in `ALLOWED_RAW_INTERPOLATIONS` rather than banked here as debt —
-  // both texts are unchanged, which is what keeps the existing greps and the
+  // both PREFIXES are unchanged (the invalid-fields line gained a `: <reason>`
+  // suffix), which is what keeps the existing greps and the
   // `nats-channel-typing.test.ts` assertions matching.
   "nats-channel.ts": { statements: 22, interpolations: 35 },
   // ⚠️ ZERO, AND THE ENTRY STAYS — BUT IT GUARANTEES LESS THAN IT LOOKS LIKE.
