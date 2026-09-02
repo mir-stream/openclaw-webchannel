@@ -3263,7 +3263,11 @@ export class WebChannelNATSClient {
         this.gapBuffer.push(msg);
         return;
       }
-      const seq = typeof msg.seq === "number" ? msg.seq : undefined;
+      // #246 half A: `isWireSeq`, the same predicate every other cursor site
+      // uses. The door refuses a non-wire `seq` before this runs; this keeps the
+      // cursor site independent of the decoder being complete (an `Infinity`
+      // here would be a gap that no difference can ever close).
+      const seq = isWireSeq(msg.seq) ? msg.seq : undefined;
       if (seq !== undefined && seq > this.lastAppliedSeq + 1) {
         // GAP: frames (lastApplied, seq) were dropped — NATS is at-most-once, so a
         // hole in the contiguous seq stream is a real drop. Hold this frame and
@@ -3526,8 +3530,9 @@ export class WebChannelNATSClient {
     // even if a fold throws. `notifyMessageListeners` (`nats-client.ts`) swallows
     // a listener's throw, so an escape from here would leave `differenceInFlight`
     // stuck TRUE — every later durable frame silently buffered until the
-    // transport drops, with no timer left to re-issue anything (it was cancelled
-    // two lines up). `decodeDurableEvent` is what makes such a throw unreachable;
+    // transport drops, with no timer left to re-issue anything
+    // (`cancelDifferenceTimer()` already ran above, before the fold).
+    // `decodeDurableEvent` is what makes such a throw unreachable;
     // this is the belt to its braces, and it is cheap.
     //
     // ⚠️ IT DEGRADES, IT DOES NOT PRETEND. `maxSeq` is raised AFTER each fold, so

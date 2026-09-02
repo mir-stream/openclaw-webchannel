@@ -207,7 +207,7 @@ const accept = (raw: Record<string, unknown>): InboundDecodeResult => ({
  * reading what the PRODUCER can emit and what the CONSUMER already tolerates —
  * not by applying "required in the type ⇒ required here" uniformly. Both margins
  * cost something real: refusing a frame the plugin legitimately sends drops
- * delivered content (N10) or buys a needless `get_difference` round-trip per
+ * delivered content (N8) or buys a needless `get_difference` round-trip per
  * frame, while accepting a shape the handler cannot express lets a malformed
  * value into the view (N8). The per-`case` notes below record which way each
  * field went and why.
@@ -706,10 +706,12 @@ export function decodeDurableEvent(event: unknown): DurableEventDecodeResult {
       if (!optionalString(event, "turnId")) return bad("turnId must be a string");
       return ok();
   }
-  // Unreachable: `kind` was checked against the set above. Written as a refusal
-  // rather than a cast so a kind added to the set without a `case` here degrades
-  // to "skipped and reported", never to an unvalidated fold.
-  return { ok: false, kind: "unknown-kind" };
+  // Unreachable while every listed kind has a `case`: `kind` was checked against
+  // the set above. Written as a MALFORMED refusal rather than a cast or an
+  // `unknown-kind` so a kind added to the list without a `case` here is skipped
+  // AND reported (`applyDifference` warns only on `malformed`; `unknown-kind` is
+  // silent by design) — never folded unvalidated, never silently dropped.
+  return bad("no decoder case");
 }
 
 /** True when the field is absent or a string — the shape of every optional `turnId`. */
