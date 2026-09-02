@@ -18,6 +18,7 @@ import {
   makeAgentIdentity,
   registerAgent,
   settle,
+  settleUntil,
   type AgentIdentity,
   type ServerHandler,
 } from "./nats-client-wrapped.test-harness.js";
@@ -1995,5 +1996,195 @@ describe("P0-4 turn_settled.outcome sealing (T-sl)", () => {
       });
       expect(openMessage(wire, K)).toEqual({ type: "turn_settled", turnId: "t-1", outcome });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #243 half 2b — the client ADOPTS the server-assigned durable messageId echoed
+// on the `ack` (`committed: {random_id, messageId}[]`, minted by half 2a). After
+// adoption the optimistic `u-<n>` user bubble carries the SERVER id, so client
+// and journal agree on ONE id and a later history/full-replay matches by id
+// (tier 1) instead of by text (`case "history"` tier 2). The tier-2/3 text
+// fallback stays — a send whose ack carries NO `committed` is left at `u-<n>`
+// and reconciled by text on the next snapshot, exactly as before (removing that
+// fallback is half 3).
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — #243 half 2b: client adopts the server messageId (ack echo)", () => {
+  type Inbound = { type?: string; id?: string; random_id?: string };
+
+  /**
+   * A registered wrapper whose server, per inbound `user_message`, records
+   * `{id, random_id}` and (when `ack`) replies `ack{ids}` — optionally carrying
+   * a `committed` echo whose `messageId` is `committedId(inbound)`. Returning
+   * `undefined` from `committedId` acks WITHOUT `committed` (the fast-path / no
+   * echo case), which is how the fallback is exercised.
+   */
+  async function connect(opts: {
+    committedId?: (inbound: Inbound) => string | undefined;
+    ack?: boolean;
+  } = {}): Promise<{ wrapper: WebChannelNATSClient; K: Uint8Array; inbound: Inbound[] }> {
+    const ack = opts.ack ?? true;
+    const pop = await generateDevicePopKeyPair();
+    const x = await generateDeviceX25519();
+    const identity = makeAgentIdentity();
+    const K = new Uint8Array(32).fill(55);
+    const inbound: Inbound[] = [];
+    const registration = registerAgent(K, x.publicRaw, identity);
+    const handler: ServerHandler = async (s, p, server, reply) => {
+      await registration(s, p, server, reply);
+      if (s !== IN) return;
+      const msg = openMessage(p, K) as Inbound | null;
+      if (msg?.type !== "user_message" || !msg.id) return;
+      inbound.push({ id: msg.id, random_id: msg.random_id });
+      if (!ack) return;
+      const frame: Record<string, unknown> = { type: "ack", ids: [msg.id] };
+      const messageId = opts.committedId?.(msg);
+      if (messageId !== undefined && msg.random_id) {
+        frame.committed = [{ random_id: msg.random_id, messageId }];
+      }
+      server.deliverToClient(
+        OUT,
+        sealMessage({ accountId: AGENT, tenant: TENANT, sub: PEER }, K, frame as unknown as OutboundMessage),
+      );
+    };
+    FakeNatsWS.sharedHandler = handler;
+    const wrapper = new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: JWT,
+      accountId: AGENT,
+      tenant: TENANT,
+      peerId: PEER,
+      heartbeatIntervalMs: 0,
+      registration: {
+        devicePrivateKey: pop.privateKey,
+        deviceX25519PrivateKey: x.privateKey,
+        pinnedAgentPublicKey: identity.publicB64url,
+      },
+    });
+    wrapper.connect();
+    await settle();
+    return { wrapper, K, inbound };
+  }
+
+  const SERVER_ID = "webchannel-user-1";
+
+  it("re-keys the optimistic bubble to the SERVER id, matched by random_id", async () => {
+    const h = await connect({ committedId: () => SERVER_ID });
+    h.wrapper.send("hello");
+    await settle();
+
+    const bubble = userBubble(h.wrapper, "hello")!;
+    // The durable id is now the server id — NOT the local `u-<n>` echo.
+    expect(bubble.id).toBe(SERVER_ID);
+    expect(bubble.id.startsWith("u-")).toBe(false);
+    // The echo it adopted was matched by THIS send's random_id.
+    expect(h.inbound).toHaveLength(1);
+    expect(h.inbound[0]!.random_id).toBeTruthy();
+    h.wrapper.close();
+  });
+
+  it("preserves the receipt/send-state overlay across the re-key", async () => {
+    const h = await connect({ committedId: () => SERVER_ID });
+    const receipt = h.wrapper.send("hello")!;
+    await settle();
+
+    const bubble = userBubble(h.wrapper, "hello")!;
+    expect(bubble.id).toBe(SERVER_ID);
+    // The overlay the receipt path depends on survives the id churn.
+    expect(bubble.receiptKey).toBeDefined();
+    expect(bubble.wireId).toBeDefined();
+    expect(bubble.sendState).toBe("accepted");
+    // The receipt handle (keyed by receiptKey, not the bubble id) still tracks it.
+    expect(receipt.snapshot().state).toBe("accepted");
+
+    // And a later turn_settled{ok} still promotes THIS bubble to completed —
+    // proving `promoteAnchor` (wireId-keyed) reaches the re-keyed bubble.
+    deliverOut(h.K, { type: "turn_settled", turnId: bubble.wireId!, outcome: "ok" });
+    await settle();
+    expect(userBubble(h.wrapper, "hello")!.sendState).toBe("completed");
+    expect(receipt.snapshot().state).toBe("completed");
+    h.wrapper.close();
+  });
+
+  it("live == history: after adoption a snapshot row of the server id tier-1 matches (no duplicate)", async () => {
+    const h = await connect({ committedId: () => SERVER_ID });
+    h.wrapper.send("hello");
+    await settle();
+    expect(userBubble(h.wrapper, "hello")!.id).toBe(SERVER_ID);
+
+    // The journal serves the user row under the SAME server id. It must match by
+    // id (tier 1) and touch nothing — one bubble, still the server id.
+    deliverOut(h.K, { type: "history", messages: [{ role: "user", id: SERVER_ID, text: "hello" }] });
+    await settle();
+
+    const hellos = h.wrapper.getState().messages.filter((m) => m.role === "user" && m.text === "hello");
+    expect(hellos).toHaveLength(1);
+    expect(hellos[0]!.id).toBe(SERVER_ID);
+    h.wrapper.close();
+  });
+
+  it("fallback: an ack with NO committed leaves the bubble at u-<n>, and tier-2 text still reconciles it", async () => {
+    // `committedId` returns undefined → the server acks WITHOUT a `committed`
+    // echo (the plugin fast-path / overflow / cancelled ack gaps).
+    const h = await connect({ committedId: () => undefined });
+    h.wrapper.send("hello");
+    await settle();
+
+    // Not adopted — still the local echo.
+    const local = userBubble(h.wrapper, "hello")!;
+    expect(local.id.startsWith("u-")).toBe(true);
+
+    // The tier-2/3 text/position fallback (deliberately kept) reconciles it when
+    // the snapshot arrives carrying the server id for the same text.
+    const FALLBACK_ID = "webchannel-user-9";
+    deliverOut(h.K, { type: "history", messages: [{ role: "user", id: FALLBACK_ID, text: "hello" }] });
+    await settle();
+
+    const hellos = h.wrapper.getState().messages.filter((m) => m.role === "user" && m.text === "hello");
+    expect(hellos).toHaveLength(1); // adopted, not duplicated
+    expect(hellos[0]!.id).toBe(FALLBACK_ID);
+    h.wrapper.close();
+  });
+
+  it("a committed echo whose random_id we never sent is a silent no-op", async () => {
+    const h = await connect({ committedId: () => SERVER_ID });
+    h.wrapper.send("hello");
+    await settle();
+    const before = userBubble(h.wrapper, "hello")!.id;
+    expect(before).toBe(SERVER_ID);
+
+    // A stray echo for an unknown random_id must not touch any bubble.
+    deliverOut(h.K, {
+      type: "ack",
+      ids: [],
+      committed: [{ random_id: "not-a-real-token", messageId: "webchannel-user-999" }],
+    });
+    await settle();
+    const hellos = h.wrapper.getState().messages.filter((m) => m.role === "user" && m.text === "hello");
+    expect(hellos).toHaveLength(1);
+    expect(hellos[0]!.id).toBe(before); // unchanged
+    h.wrapper.close();
+  });
+
+  it("retry reuses the SAME random_id on a reconnect replay (wrapper-minted, ledgered once)", async () => {
+    // Never ack → the frame stays in the unacked ledger; a reconnect replays it.
+    const h = await connect({ ack: false });
+    h.wrapper.send("retry-me");
+    await settle();
+    expect(h.inbound).toHaveLength(1);
+    const first = h.inbound[0]!.random_id;
+    expect(first).toBeTruthy();
+
+    // Drop the socket → auto-reconnect → flushQueue replays the ledger.
+    FakeNatsWS.instances.at(-1)!.close();
+    await settleUntil(() => h.inbound.length >= 2, {
+      label: "the unacked send is re-delivered after reconnect",
+    });
+
+    const replayed = h.inbound.filter((m) => m.random_id !== undefined);
+    expect(h.inbound.length).toBeGreaterThanOrEqual(2);
+    // Every re-delivery of this ledgered send carries the SAME random_id.
+    for (const m of replayed) expect(m.random_id).toBe(first);
+    h.wrapper.close();
   });
 });

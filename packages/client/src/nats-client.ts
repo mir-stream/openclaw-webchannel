@@ -41,13 +41,15 @@ export const MAX_PAYLOAD = 8 * 1024 * 1024;
 export const MAX_BUFFERED_BYTES = MAX_CONTROL_LINE + MAX_PAYLOAD + 4;
 
 /**
- * A random, subject-safe token for a request/reply inbox segment (hex only, so
- * it never contains a `.`/`*`/`>` that would break the subject hierarchy).
- * Prefers `crypto.getRandomValues`; falls back to `Math.random` in hosts without
- * WebCrypto (the reply subject is not a secret — it only needs to be unguessable
- * enough to avoid collisions).
+ * A random, subject-safe token (hex only, so it never contains a `.`/`*`/`>`
+ * that would break the subject hierarchy). Two callers: a request/reply inbox
+ * segment, and (#243) the `user_message` idempotency `random_id` the wrapper
+ * mints per send. Exported for the latter so the wrapper and the low-level
+ * client share one generator. Prefers `crypto.getRandomValues`; falls back to
+ * `Math.random` in hosts without WebCrypto (neither use is a secret — the token
+ * only needs to be unguessable enough to avoid collisions).
  */
-function randomInboxToken(): string {
+export function randomInboxToken(): string {
   const g = (globalThis as { crypto?: { getRandomValues?: (a: Uint8Array) => Uint8Array } }).crypto;
   if (g?.getRandomValues) {
     const b = new Uint8Array(12);
