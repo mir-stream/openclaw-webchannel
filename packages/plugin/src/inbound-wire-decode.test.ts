@@ -174,20 +174,35 @@ describe("#246 half A — decodeInboundWsMessage: load_history", () => {
     accepts({ type: "load_history", before: "tool-1", beforeTurnId: "turn-b", limit: 10 });
   });
 
-  it("refuses a non-string cursor or a non-integer limit", () => {
+  it("refuses a non-string cursor or a non-number limit", () => {
     refuses({ type: "load_history", before: {} });
     refuses({ type: "load_history", before: 5 });
     refuses({ type: "load_history", beforeTurnId: ["turn-b"] });
     refuses({ type: "load_history", limit: "10" });
-    refuses({ type: "load_history", limit: 1.5 });
-    refuses({ type: "load_history", limit: Number.NaN });
+    refuses({ type: "load_history", limit: [10] });
+    refuses({ type: "load_history", limit: null });
   });
 
-  it("leaves the RANGE and the cursor's meaning to planHistoryFetch", () => {
-    // Shape only: a negative or absurd limit is a semantic question the pager
-    // owns, and a cursor naming no row is an honest empty page, not a protocol
-    // error. Duplicating either rule here would be a second schema.
+  it("ACCEPTS a fractional limit — `planHistoryFetch` floors it and serves a page", () => {
+    // ⚠️ REGRESSION PIN. An earlier revision of this decoder required
+    // `Number.isSafeInteger`, which is a SEMANTIC rule, not a shape check: the
+    // client's public `loadHistory({ limit?: number })` types `20.5` as legal and
+    // `planHistoryFetch` serves it as a 20-row page (`Math.floor`), so the door
+    // was dropping a legal request with a warn and "load older" never returned.
+    accepts({ type: "load_history", limit: 20.5 });
+  });
+
+  it("leaves the RANGE and every non-finite value to planHistoryFetch", () => {
+    // Shape only: a negative, absurd, `NaN` or `Infinity` limit is a semantic
+    // question the pager owns, and it already answers all of them — its predicate
+    // is `typeof … === "number" && Number.isFinite(…) && … > 0`, so anything else
+    // falls back to the configured page size instead of faulting. A cursor naming
+    // no row is likewise an honest empty page, not a protocol error. Duplicating
+    // either rule here would be a second schema free to disagree with the first.
     accepts({ type: "load_history", limit: -1 });
+    accepts({ type: "load_history", limit: 0 });
+    accepts({ type: "load_history", limit: Number.NaN });
+    accepts({ type: "load_history", limit: Number.POSITIVE_INFINITY });
     accepts({ type: "load_history", limit: 1_000_000 });
     accepts({ type: "load_history", before: "no-such-row" });
   });

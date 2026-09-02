@@ -1820,9 +1820,16 @@ export class WebChannelNatsClient {
    * forwarded whatever came back to every listener, whatever its type.
    *
    * A null return covers both failures on purpose — an undecryptable payload and
-   * a decrypted-but-malformed one are both "drop this frame" to every caller, and
-   * only the second is worth a line (the first is already expected during a key
-   * rotation and is the caller's own fail-closed path).
+   * a decrypted-but-malformed one are both "drop this frame" to every caller.
+   * Only the SECOND is logged, and the reason is not that the first is harmless:
+   * it is that the first is the door's PRE-EXISTING fail-closed drop and this
+   * slice did not touch it. `openMessage` returns null for anything that is not a
+   * v1 envelope or that fails to decrypt/parse, both callers have always read that
+   * as "drop, never process as plaintext" (the same rule the pre-key buffering in
+   * `handleRaw` states), and it was silent before #246 half A. Adding a line there
+   * would be a separate change with its own volume question — a peer publishing
+   * junk to `.out` would log per frame — so the new diagnostic is scoped to what
+   * the decoder itself refuses.
    */
   private openInboundFrame(payload: string, key: Uint8Array): InboundMessage | null {
     const raw = openMessage(payload, key);

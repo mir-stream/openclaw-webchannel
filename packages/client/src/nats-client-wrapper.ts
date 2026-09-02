@@ -3531,11 +3531,17 @@ export class WebChannelNATSClient {
     // this is the belt to its braces, and it is cheap.
     //
     // ⚠️ IT DEGRADES, IT DOES NOT PRETEND. `maxSeq` is raised AFTER each fold, so
-    // a throw leaves the cursor at the last event actually applied; the drain
-    // below then re-dispatches the buffered frames, the first still-gapped one
-    // re-requests the same range with a fresh retry budget, and the stream heals
-    // on the next reply. Pinned by "a fold that throws cannot wedge gap-sync" in
-    // `nats-client-wrapper-gap-sync.test.ts`.
+    // a throw leaves the cursor at the last event actually applied — OR at the
+    // deferred `ack`/`history` advance if that is higher, which is #352's
+    // partial-reply shape and is left to that fix. (Concretely: a difference
+    // carrying 2,3,4 whose fold of 3 throws, with an opener `ack` for seq 5
+    // deferred mid-flight, ends at `max(1, 2, 5) = 5` — seqs 3-4 then wait for a
+    // reconnect. Reachable through a throw as well as through a partial reply,
+    // and not a regression: before this `finally` the same throw wedged the
+    // stream permanently.) The drain below then re-dispatches the buffered
+    // frames, the first still-gapped one re-requests with a fresh retry budget,
+    // and the stream heals on the next reply. Pinned by "a fold that throws
+    // cannot wedge gap-sync" in `nats-client-wrapper-gap-sync.test.ts`.
     try {
       for (const { seq, event } of events) {
         // Fold everything the request asked for (`seq > floor`); a `seq <= floor`

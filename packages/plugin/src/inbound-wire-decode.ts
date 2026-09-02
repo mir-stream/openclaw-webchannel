@@ -19,13 +19,26 @@
  *  - the ONE bound that already exists on this path — `MAX_INBOUND_USER_ID_LENGTH`
  *    — is applied to the two client-supplied ids.
  *
- * ⚠️ SHAPE, NOT SEMANTICS, AND THE LINE IS DELIBERATE. `load_history`'s cursor
- * semantics stay in `planHistoryFetch`/`historyPageBefore` (a non-matching
- * cursor is an honest empty page, not a protocol error) and `get_difference`'s
- * `afterSeq` range check is a shape check that happens to be numeric. Duplicating
- * a semantic rule here would create a second schema free to disagree with the
- * one that owns it — the same reason `journal-history.ts`'s `isKnownJournalEvent`
- * checks the kind and nothing else.
+ * ⚠️ SHAPE, NOT SEMANTICS, AND THE LINE IS DELIBERATE. `load_history` is checked
+ * to the TYPES the contract declares and no further — `before`/`beforeTurnId`
+ * strings, `limit` a number — because every question beyond that is
+ * `planHistoryFetch`/`historyPageBefore`'s, and they ANSWER all of them: a
+ * fractional limit is floored and served, a non-finite or non-positive one falls
+ * back to the configured page size, a cursor naming no row is an honest empty
+ * page. Duplicating any of that here would create a second schema free to
+ * disagree with the one that owns it — the same reason `journal-history.ts`'s
+ * `isKnownJournalEvent` checks the kind and nothing else.
+ *
+ * ⚠️ `get_difference`'s `afterSeq` IS RANGE-CHECKED, AND THAT IS NOT A CONTRADICTION
+ * OF THE PARAGRAPH ABOVE — it is the same rule with a different downstream. There
+ * is no planner on that path: the value goes STRAIGHT into
+ * `delivery-journal.read`, which REFUSES a non-integer or negative window by
+ * throwing. So the check has no owner further down to defer to, and it is the
+ * pre-existing guard (`nats-channel.ts`'s `dispatchInbound`, #244 half B) moved
+ * here unchanged rather than a new rule invented at this seam. The test to apply
+ * before adding a numeric check here is not "is it a number" but "does anything
+ * downstream already decide this" — for `load_history.limit` something did, and
+ * an earlier revision of this file broke a legal request by not asking.
  *
  * ⚠️ WHY THE DECODER IS AT LEAST AS STRICT AS THE INGRESS SEAM. `user_message`'s
  * `id` and `random_id` are refused here unless they satisfy the SAME predicate
@@ -215,8 +228,23 @@ export function decodeInboundWsMessage(raw: unknown): InboundWsDecodeResult {
         return invalid(known, "beforeTurnId must be a string");
       }
       const limit = field(raw, "limit");
-      if (limit !== undefined && !Number.isSafeInteger(limit)) {
-        return invalid(known, "limit must be a safe integer");
+      // ⚠️ `typeof === "number"` AND NOTHING MORE — NOT `Number.isSafeInteger`.
+      // Round 1 caught that as a SEMANTIC rule wearing a shape check's clothes,
+      // and it broke a legal request. `planHistoryFetch` (`history.ts`) admits
+      // `typeof request.limit === "number" && Number.isFinite(request.limit) &&
+      // request.limit > 0` and then `Math.min(Math.floor(request.limit),
+      // MAX_WIRE_HISTORY_LIMIT)`, so a FRACTIONAL limit is legal and served
+      // (`20.5` → a 20-row page; pinned by "floors a fractional wire limit
+      // (integer-only contract)" in `history.test.ts`), and the client's public
+      // `loadHistory({ limit?: number })` types it as such. Everything that
+      // predicate rejects — `NaN`, `Infinity`, `0`, a negative — it already
+      // handles, by falling back to the configured page size rather than
+      // faulting; its docblock says exactly why (a non-finite limit would slip
+      // past the page selectors' own `limit <= 0` check). Refusing those here
+      // would not add safety, and refusing `20.5` cost the user "load older"
+      // entirely: the frame is dropped with a warn and no page ever comes back.
+      if (limit !== undefined && typeof limit !== "number") {
+        return invalid(known, "limit must be a number");
       }
       return { ok: true, message: raw as unknown as InboundWsMessage };
     }

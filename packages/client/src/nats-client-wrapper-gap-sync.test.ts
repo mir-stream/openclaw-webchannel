@@ -926,8 +926,10 @@ describe("#246 half A — a refused seq-bearing frame must not advance the curso
     // ⚠️ WHAT "NOT WEDGED" MEANS HERE, MEASURED RATHER THAN ASSUMED. The
     // `try/finally` in `applyDifference` does NOT pretend the fold succeeded: it
     // runs the bookkeeping (in-flight cleared, cursor advanced only as far as the
-    // loop actually got — seq 2 never counted, so it stays at 1) and DRAINS the
-    // buffer. The buffered frame then re-detects the same gap and issues a FRESH
+    // loop actually got — seq 2 never counted, so it stays at 1 HERE, where
+    // nothing was deferred; a deferred `ack`/`history` seq above the throw point
+    // would still carry it higher, which is #352's partial-reply shape) and
+    // DRAINS the buffer. The buffered frame then re-detects the same gap and issues a FRESH
     // request with a fresh retry budget, which is the self-heal. Without the
     // `finally`, none of that runs: `differenceInFlight` stays true with its
     // liveness timer already cancelled, the buffer is never drained, and every

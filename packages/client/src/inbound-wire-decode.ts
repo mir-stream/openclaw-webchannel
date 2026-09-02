@@ -437,13 +437,15 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
       // do (an additive field would be stripped with it), and it would put a
       // second, quieter admission rule beside the two consumers that already have
       // one. So the whole frame goes, and nothing is lost by it: every one of the
-      // ack's three jobs has a healing path — the unacked ledger replays on the
-      // next session (deduped by `random_id`), id adoption is re-run by the
-      // difference fold's `randomId` match (#337), and the un-advanced user seq
-      // shows up as the very next agent frame's gap, which `get_difference`
-      // heals. Both consumers keep their own per-entry guards regardless: this
-      // decoder is not allowed to be the only thing standing between the wire and
-      // the cursor.
+      // ack's three jobs has a healing path — an unacked ledger entry is
+      // re-published BOTH in-session (`armLiveRetryTimer`/`retryDueUnacked` in
+      // `nats-client.ts` re-seal every entry whose retry is due, on the same
+      // connection) and on the next session's replay, deduped either way by
+      // `random_id`; id adoption is re-run by the difference fold's `randomId`
+      // match (#337); and the un-advanced user seq shows up as the very next
+      // agent frame's gap, which `get_difference` heals. Both consumers keep
+      // their own per-entry guards regardless: this decoder is not allowed to be
+      // the only thing standing between the wire and the cursor.
       const ids = field(raw, "ids");
       if (ids !== undefined && !isStringArray(ids)) {
         return invalid(known, "ids must be an array of strings");
