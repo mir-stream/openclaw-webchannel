@@ -109,7 +109,7 @@
     "packages/plugin/src/log-safe.test.ts": 18,
     "packages/plugin/src/manifest-schema.test.ts": 19,
     "packages/plugin/src/message-adapter-ordinal-attachment.test.ts": 5,
-    "packages/plugin/src/message-adapter.test.ts": 176,
+    "packages/plugin/src/message-adapter.test.ts": 178,
     "packages/plugin/src/multidevice-broadcast.test.ts": 12,
     "packages/plugin/src/multiplex.test.ts": 21,
     "packages/plugin/src/nats-account-runtime.test.ts": 38,

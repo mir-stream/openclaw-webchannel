@@ -254,7 +254,11 @@ type AssistantDraftLane = {
    * or by `flushBufferedOrdinaryFinals` when order-correlation is exact
    * (`exactCorrelation` — every final has a streamed lane to pair with) and THIS
    * target's `streamedVisibleAnswerText` proves it streamed its own prefix. Left
-   * false on a count shortfall, or for the K==1 Case-X textless current lane. Note
+   * false on the K==1 branch for the Case-X textless current lane (by the second
+   * conjunct — that shape is usually exact) and for a current lane that streamed
+   * AFTER its final was buffered (by `exactCorrelation`: two streamed lanes, so
+   * `streamed.length > 1`; pinned by M340b); on a K>=2 count shortfall no lane
+   * receives a final at all (#340), so every lane keeps it false. Note
    * the predicate is CARDINALITY-based, so a compensating desync (a deduped final
    * plus an unstreamed message) can still pass it — a pre-#238 hole, not closed
    * here (#262). The snapshot uses `answerText` when this is true (preserving the
@@ -743,10 +747,12 @@ export function createProgressDraftController(params: {
   const bufferedOrdinaryFinals: string[] = [];
   // #212: wire ids of independent bubbles the plugin KNOWS carry answer content
   // already represented by a lane in the `turn_snapshot`. Since #238 there is
-  // exactly ONE producer — the failed-lane recovery block (:2424), whose lane is
-  // in `answers` by its streamed text. (The overflow-final producer is gone: its
-  // flag's value was `streamed.length === finals.length`, unreachable at an
-  // overflow under the new candidate list.) The snapshot names these in `remove`
+  // exactly ONE producer — the failed-lane recovery block in
+  // `deliverAuthorizedBlock`, the only `sendIndependent(…, { supersedesAnswerLane })`
+  // call — whose lane is in `answers` by its streamed text. (The overflow-final
+  // producer is gone: its flag's value was `streamed.length === finals.length`,
+  // unreachable at an overflow under the new candidate list.) The snapshot names
+  // these in `remove`
   // so the client drops exactly them and preserves every other agent bubble
   // (notices/errors). A missed id leaves a corruption bubble; a wrongly-added id
   // would lose content — captured ONLY at that one mint site, never from a
@@ -940,7 +946,7 @@ export function createProgressDraftController(params: {
     // 2 materialized, 3 finals made the flag true WITH an overflow, which is the
     // `remove: [tcId]` base's M212a asserted. And NOT because an overflow bubble's
     // content never streamed — measured false, it often has (see the flush's
-    // overflow branch).
+    // no-target branch, which on a shortfall takes every final).
     options?: { supersedesAnswerLane?: boolean },
   ): boolean => {
     if (!text) {
@@ -1083,8 +1089,9 @@ export function createProgressDraftController(params: {
   // #173: the answer lanes that streamed VISIBLE answer text AND actually reached
   // the client (`resolution === "materialized"`).
   //
-  // Two callers: `finalize`'s AMBIGUITY PRECONDITION, and the flush's SHORTFALL
-  // fallback list.
+  // ONE caller: `finalize`'s AMBIGUITY PRECONDITION. (#340 deleted the other —
+  // the flush's shortfall fallback list, which routed finals onto lanes the
+  // snapshot then overwrote.)
   //
   // The precondition asks "is this textless-current-lane shape ambiguous at all,
   // or is the current lane the unambiguous target?" — and materialization is the
@@ -1106,12 +1113,10 @@ export function createProgressDraftController(params: {
   // false, the shape is declared unambiguous, the flush never runs at all — and so
   // #238's cursor never reaches that shape. Out of scope for this slice.
   //
-  // It is deliberately NOT the flush's candidate list in the exact-correlation
-  // case — see `streamedAnswerLanes` and `flushBufferedOrdinaryFinals`. Narrowing
-  // the CANDIDATES by materialization is what skewed the order; narrowing the
-  // PRECONDITION by it is what makes the shape decidable. Two different questions
-  // that happen to share a predicate — and, on a shortfall, a third: the safest
-  // list to route onto when the pairing cannot be trusted anyway.
+  // It is deliberately NOT the flush's candidate list — see `streamedAnswerLanes`
+  // and `flushBufferedOrdinaryFinals`. Narrowing the CANDIDATES by materialization
+  // is what skewed the order; narrowing the PRECONDITION by it is what makes the
+  // shape decidable. Two different questions that happen to share a predicate.
   const materializedAnswerLanes = (): AssistantDraftLane[] =>
     state.lanes.filter(
       (lane) => lane.streamedVisibleAnswerText && lane.resolution === "materialized",
@@ -1130,9 +1135,9 @@ export function createProgressDraftController(params: {
   // order is the only correlation on offer. Dropping a lane whose frame failed to
   // ship throws part of that order away and skews every later index (plan §16.5.3).
   //
-  // That cuts BOTH ways, which is why `flushBufferedOrdinaryFinals` gates its use:
-  // every lane in this set is one the snapshot republishes, so routing a final onto
-  // one under a shortfall lets the snapshot overwrite it. See the gate there.
+  // That cuts BOTH ways, which is why `flushBufferedOrdinaryFinals` gates its use
+  // on the counts agreeing: every lane here is one the snapshot republishes, so a
+  // final routed onto one it does not provably own would be erased. See the gate.
   const streamedAnswerLanes = (): AssistantDraftLane[] =>
     state.lanes.filter((lane) => lane.streamedVisibleAnswerText);
 
@@ -1757,11 +1762,12 @@ export function createProgressDraftController(params: {
   //    corruption-immune `streamedAnswerText`.
   //  - `remove` = the ids of independent bubbles that PROVABLY duplicate a lane in
   //    `answers` — since #238 that is exactly one shape, the failed-lane recovery
-  //    block. An overflow final is NOT one of them, and deliberately so: it MAY
-  //    duplicate a lane here (measured — see the flush's overflow branch), but the
-  //    flush cannot tell when, and a visible duplicate is recoverable where a
-  //    deletion is not (M212g). The client drops ONLY these and preserves every
-  //    other agent bubble.
+  //    block. A final with no target (the flush's no-target branch — on a
+  //    shortfall, every final) is NOT one of them, and deliberately so: it
+  //    duplicates a lane here whenever its final equals its streamed text — the
+  //    normal case — but the flush cannot tell which, and a visible duplicate is
+  //    recoverable where a deletion is not (M212g). The client drops ONLY these
+  //    and preserves every other agent bubble.
   //
   // Case X (K==1) is DELIBERATELY not addressed: it is byte-identical to the
   // legitimate non-streaming-last collapse (M173c/M15a/M15b), so its tool bubble
@@ -1772,8 +1778,11 @@ export function createProgressDraftController(params: {
     // No correlation key ⇒ the client cannot scope the reconciliation to a turn.
     if (turnId === undefined) return;
     if (typeof transport.sendTurnSnapshot !== "function") return;
-    // The SAME set `flushBufferedOrdinaryFinals` walks with its cursor, by
-    // construction rather than by coincidence (#238).
+    // The SAME set `flushBufferedOrdinaryFinals` walks with its cursor WHEN the
+    // correlation is exact — by construction, not coincidence (#238). When it is
+    // not: on K>=2 the flush walks nothing (#340); on K==1 it may still route the
+    // buffered final onto the current lane NON-authoritatively, and this map then
+    // carries that lane's STREAMED text (M340b).
     const answers = streamedAnswerLanes()
       .map((lane) => ({
         id: lane.id ?? nextMessageId(),
@@ -1807,17 +1816,18 @@ export function createProgressDraftController(params: {
     }
   };
 
-  // #238: this used to forward a `supersedesAnswerLane` option for the
-  // overflow-final site. The flag's old value there was `streamed.length ===
-  // finals.length`, which under the new candidate list cannot hold at an overflow
-  // (see the flush's overflow branch) — so the option had no reachable true case
-  // here and is gone. That is a CARDINALITY argument and only that: do NOT
+  // #238: this used to forward a `supersedesAnswerLane` option for the flush's
+  // no-target site. The flag's old value there was `streamed.length ===
+  // finals.length`, which cannot hold when a final has no target (an empty
+  // `targets` means the counts disagree) — so the option had no reachable true
+  // case here and is gone. That is a CARDINALITY argument and only that: do NOT
   // paraphrase it as "an overflow final's content never streamed", which is
   // measured false and is the premise that would justify deleting the bubble.
   // EVERY bubble this function produces (leading error, stray extra, notice,
-  // overflow final) is preserved by the client. `sendIndependent` keeps the option
-  // for its one remaining user, the failed-lane recovery block (:2423), whose
-  // duplicate IS provable.
+  // no-target final) is preserved by the client. `sendIndependent` keeps the option
+  // for its one remaining user, the failed-lane recovery block in
+  // `deliverAuthorizedBlock` (the only `sendIndependent(…, { supersedesAnswerLane })`
+  // call), whose duplicate IS provable.
   const deliverTerminalIndependent = (text: string): boolean => {
     // ONE STORY, in the order it happens:
     //
@@ -1858,10 +1868,12 @@ export function createProgressDraftController(params: {
     // #212: true only when this final is provably THIS lane's own: from
     // `finalize`'s immediate collapse / current-lane-has-text / lone-message path,
     // or from `flushBufferedOrdinaryFinals` when order-correlation is exact
-    // (`exactCorrelation`) and THIS target's
-    // `streamedVisibleAnswerText` is true. Otherwise — a count shortfall, or the
-    // K==1 Case-X textless current lane — the snapshot falls back to the
-    // corruption-immune `streamedAnswerText`.
+    // (`exactCorrelation`) and THIS target's `streamedVisibleAnswerText` is true.
+    // Otherwise — on the K==1 branch: the Case-X textless current lane (second
+    // conjunct false), or a current lane that streamed after its final was
+    // buffered (`exactCorrelation` false, M340b) — the snapshot falls back to the
+    // corruption-immune `streamedAnswerText`. (A K>=2 shortfall no longer reaches this function at
+    // all: #340 gives it no targets.)
     options?: { authoritative?: boolean },
   ): boolean => {
     target.answerText = text;
@@ -1913,31 +1925,34 @@ export function createProgressDraftController(params: {
   //            The snapshot leaves that bubble alone rather than guessing — M212b.)
   //   K >= 2 → the tool-only-last (#173) shape: one final per text-bearing
   //            message, in generation order. The cursor walks the streamed lanes
-  //            when the correlation is exact and the materialized ones otherwise
-  //            (see below); the textless current (tool-only) lane receives none.
+  //            when the correlation is exact and NOTHING otherwise (see below);
+  //            the textless current (tool-only) lane receives none.
   //
-  // WIDENING THE CANDIDATE LIST IS GATED ON THE CORRELATION BEING EXACT, and that
-  // gate is load-bearing, not caution. `streamedAnswerLanes()` is the right list
-  // when order-correlation holds: it keeps the lane whose send failed, so the
-  // cursor stays in step (M173e). But widening also widens the set of lanes a
-  // MIS-ROUTED final can land on, and a lane in that set is one `emitTurnSnapshot`
-  // REPUBLISHES. Under a shortfall the landing is non-authoritative, so the
-  // snapshot overwrites the bubble with `streamedAnswerText` — destroying the
-  // final's text. Measured on the shape [msg1 streams "A"; msg2 text-bearing but
-  // streams NOTHING; msg3 streams but every frame fails; msg4 tool-only]: the
-  // ungated version routed msg2's final onto msg3's lane and the snapshot then
-  // republished that bubble as msg3's streamed prefix, erasing msg2's only copy of
-  // its answer. `materializedAnswerLanes()` kept msg2's final as its own bubble.
+  // A SHORTFALL ROUTES NOTHING (#340), which is exactly Telegram's rule. There a
+  // final either finalizes the ONE open draft it provably belongs to (`[core]
+  // extensions/telegram/src/lane-delivery-text-deliverer.ts:550-556`, the
+  // `finalizePreview` stream path) or becomes a NEW message (`:597`, the plain
+  // `sendPayload`; `rotateFinalizedStream` `:276-284` and
+  // `bot-message-dispatch.ts`'s `prepareAnswerLaneForText` `:1333-1356` force one
+  // once the lane is finalized). It never edits a PAST bubble. Pairing by order
+  // across N lanes is that cursor generalized (plan §16.5.3 Q2) and it is sound
+  // only while the counts agree; the generalization has no degraded mode.
   //
-  // The property that makes the gate free: when it is false EVERY landing is
-  // non-authoritative, so every final routed onto a lane is discarded by the
-  // snapshot regardless. Routing under a shortfall buys nothing and can only cost
-  // content, whereas a narrower list pushes more finals into overflow bubbles the
-  // client preserves. So on a shortfall we fall back to the pre-#238 list, and
-  // behaviour is byte-identical to it.
+  // Widening was tried in the shortfall case and it DELETES CONTENT. Every landing
+  // there is non-authoritative, so `emitTurnSnapshot` republishes the lane with
+  // its `streamedAnswerText` and erases whatever final arrived. Measured on [msg1
+  // streams "A"; msg2 text-bearing but streams NOTHING; msg3 streams "C"; msg4
+  // tool-only]: msg2's tB landed on msg3's lane, the snapshot restored "C", and
+  // msg2's answer then existed NOWHERE — live or history, since #240 removed the
+  // core-transcript read that used to heal it on reload (#340). The pre-#238
+  // `materializedAnswerLanes()` is no safer: it is a shorter list of the same
+  // republished lanes. Only the empty one cannot lose content.
   //
-  // A final that runs PAST the end of the candidate list becomes its own
-  // independent bubble: never a degrade, never a skip (plan §0.2 N10).
+  // A final with no target becomes its own independent bubble: never a degrade,
+  // never a skip (plan §0.2 N10). On a shortfall that is EVERY final, so a lane
+  // that also streamed shows its text twice whenever its final equals its
+  // streamed text — the normal case — the deliberate trade, because a duplicate
+  // is recoverable and a deletion is not (M212g).
   const flushBufferedOrdinaryFinals = (): void => {
     if (bufferedOrdinaryFinals.length === 0) return;
     const finals = bufferedOrdinaryFinals.splice(0);
@@ -1957,72 +1972,51 @@ export function createProgressDraftController(params: {
     // certifies is narrower: the counts agree, so no final is left without a
     // partner and no partner without a final.
     const exactCorrelation = streamed.length === finals.length;
-    // This SUBSUMES the previous revision's separate "did the cursor consume the
-    // whole candidate list" test (`targets.length === finals.length`), and it is
-    // strictly stronger rather than a rename:
-    //   - When it is TRUE, `targets === streamed` and the lengths match, so the two
-    //     agree. (Asserted across the whole suite during review: on the K>=2 branch
-    //     they never diverged.)
-    //   - When it is FALSE they can still disagree — `targets` falls back to
-    //     `materializedAnswerLanes()`, whose length may coincidentally equal
-    //     `finals.length` when there are MORE streamed lanes than finals (a deduped
-    //     final). The old test would have certified that pairing; this one does not,
-    //     and must not, because a deduped final is exactly a shift.
-    //   - On the K==1 branch it reads `streamed.length === 1`, restoring the
-    //     non-vacuous coverage the deleted `everyFinalHasStreamedLane` gave there.
-    //     `targets.length === finals.length` was trivially true for a one-element
-    //     hand-built list and certified nothing.
     const targets =
-      finals.length === 1
-        ? [currentLane()]
-        : exactCorrelation
-          ? streamed
-          : materializedAnswerLanes();
+      finals.length === 1 ? [currentLane()] : exactCorrelation ? streamed : [];
     finals.forEach((text, index) => {
       const target = targets[index];
       if (!target) {
-        // #238: this final ran past the end of the candidate list. No
+        // #238/#340: this final has no target, which since #340 means the
+        // candidate list is EMPTY because the counts disagree (the only way here:
+        // K==1 has one target, an exact K>=2 has one per final). No
         // `supersedesAnswerLane` is passed, and the reason is pure CARDINALITY, not
         // provenance: the flag's old value was `streamed.length === finals.length`,
-        // and overflow requires `targets.length < finals.length` — which on this
-        // branch means `exactCorrelation` is false, since a true one sets
+        // and reaching here requires `targets.length < finals.length` — which on
+        // this branch means `exactCorrelation` is false, since a true one sets
         // `targets = streamed` with matching lengths. The two are mutually
         // exclusive, so the flag had no reachable true case.
         //
-        // Do NOT restate this as "an overflow final's content never streamed".
-        // MEASURED FALSE: with msg2 streaming nothing and msg3 streaming "C",
-        // targets are [A,C], so tB lands on C and it is tC — msg3's OWN final, from
-        // a message that did stream — that overflows. The bubble genuinely can
-        // duplicate a lane in `answers`. Leaving it visible is the deliberate
-        // trade: a duplicate is recoverable, a deletion is not (M212g).
+        // Do NOT restate this as "this final's content never streamed". MEASURED
+        // FALSE, and since #340 routinely so: on a shortfall EVERY final lands
+        // here, including one whose own lane streamed and is in `answers`. The
+        // bubble genuinely can duplicate a lane there. Leaving it visible is the
+        // deliberate trade: a duplicate is recoverable, a deletion is not (M212g).
         deliverTerminalIndependent(text);
         return;
       }
       target.deferredAngleMarkerTail = undefined;
       target.lastPartialSourceText = "";
-      // `exactCorrelation` is the turn-level test above and it is COVERED: dropping
-      // it turns M212g and M238d red.
+      // BE PRECISE ABOUT WHAT EACH CONJUNCT NOW DOES — #340 narrowed both.
       //
-      // The per-target conjunct asks whether THIS lane streamed its own prefix. It
-      // matters most on the K==1 branch, where `targets` is a hand-built
-      // `[currentLane()]` rather than a filtered list, so nothing structurally
-      // guarantees the lane streamed — on the buffered path it has not (that is the
-      // buffering precondition in `finalize`), which is Case X / M173d, and a final
-      // landing there may belong to an earlier message.
+      // `exactCorrelation` can only read FALSE here on the K==1 branch: a false one
+      // on K>=2 leaves `targets` EMPTY, so no lane is reached at all. On K==1 it
+      // reads `streamed.length === 1`, and the pair is not vacuous there — a
+      // partial arriving on the current lane after its final was buffered makes
+      // `streamedVisibleAnswerText` true, and with another text lane in the turn
+      // this half is the only one still false. That shape is PINNED by M340b:
+      // drop this conjunct and its snapshot carries the buffered final as
+      // AUTHORITATIVE text on a lane the buffering precondition proved could not
+      // be attributed. (Before #340, M212g and M238d pinned this conjunct through
+      // the K>=2 shortfall branch; #340 deleted that branch, so the pin moved.)
       //
-      // BE PRECISE ABOUT ITS STATUS, because the previous revision was not.
-      // MEASURED: dropping this conjunct alone leaves the whole suite green — both
-      // before and after the shortfall fix. That is not a coverage gap, it is
-      // structural: `answerTextIsAuthoritative` has exactly ONE reader
-      // (`emitTurnSnapshot`, :1780) and that reader iterates `streamedAnswerLanes()`,
+      // The second conjunct is NOT pinned, and that is structural rather than a
+      // coverage gap: `answerTextIsAuthoritative` has exactly ONE reader
+      // (`emitTurnSnapshot`) and that reader iterates `streamedAnswerLanes()`,
       // filtering on the very predicate this conjunct tests, so a lane that would
-      // be wrongly marked is never read. DO NOT take that as licence to delete it —
-      // the coupling is incidental, the flag's contract is what is being stated, and
-      // the previous revision leaned on this same green result while the turn-level
-      // gate was ALSO vacuous on K==1 (`targets.length === finals.length` is
-      // trivially true for a one-element list), which left that branch stating a
-      // guarantee nothing computed. `exactCorrelation` reads `streamed.length === 1`
-      // there, so both conjuncts now say something.
+      // be wrongly marked is never read. DO NOT take that as licence to delete it:
+      // the coupling is incidental, and what is being stated here is the flag's
+      // contract.
       emitAuthoritativeFinalOnLane(target, text, {
         authoritative: exactCorrelation && target.streamedVisibleAnswerText,
       });
