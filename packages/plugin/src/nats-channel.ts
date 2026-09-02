@@ -739,6 +739,35 @@ export class NatsChannel implements WebChannelPeerChannel {
   }
 
   /**
+   * #245 Part B: broadcast a just-committed inbound USER message to all of the
+   * account's devices on the shared `.out` subject (the fan-out — there is no
+   * per-device registry, doc §16.2-8). The origin reconciles its optimistic
+   * bubble via `random_id`; a non-origin device appends it and advances its seq
+   * cursor so the turn's first agent frame reads as contiguous.
+   *
+   * ⚠️ NOT journaled and NOT seq-bearing — the `user` event is ALREADY committed
+   * (this frame's `id`/`seq`/`random_id` come from `appendInboundUser`), so
+   * `journalEventForOutbound` returns null and `isSeqBearingFrame` rejects it.
+   * The `seq` is set HERE, at construction; `sendToPeer` leaves it untouched
+   * (it only stamps `seq` onto frames `isSeqBearingFrame` accepts). Contrast the
+   * durable senders, whose `seq` is allocated by `sendToPeer`'s persist step.
+   */
+  sendUserCommitted(
+    peerId: string,
+    message: { id: string; text: string; turnId?: string; seq: number; random_id?: string },
+  ): boolean {
+    const payload: OutboundWsMessage = {
+      type: "user_committed",
+      id: message.id,
+      text: message.text,
+      seq: message.seq,
+      ...(message.turnId !== undefined ? { turnId: message.turnId } : {}),
+      ...(message.random_id !== undefined ? { random_id: message.random_id } : {}),
+    };
+    return this.sendToPeer(peerId, payload);
+  }
+
+  /**
    * Send the slash-command catalog to peer (P0-3 discovery). Rides the same
    * sealed `.out` path as every other outbound frame.
    */

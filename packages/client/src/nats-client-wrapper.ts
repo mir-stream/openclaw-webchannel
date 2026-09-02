@@ -117,6 +117,14 @@ const SEQ_BEARING_INBOUND_TYPES: ReadonlySet<string> = new Set([
   "tool_activity",
   "approval_request",
   "approval_resolved",
+  // #245 Part B: the multi-device user-message broadcast carries the user opener's
+  // `seq`, so it drives gap detection and advances the cursor like any durable
+  // frame — a non-origin device that receives it stays contiguous with the turn's
+  // first agent frame at `seq+1` (rather than reading it as a phantom gap), and a
+  // missed broadcast surfaces as a gap the next agent frame's `get_difference`
+  // heals. Unlike the durable frames it is NOT journaled server-side (the `user`
+  // event already is); its `seq` is the committed opener's, set at the plugin.
+  "user_committed",
 ]);
 
 function isSeqBearingInbound(msg: { type?: unknown }): boolean {
@@ -3573,21 +3581,36 @@ export class WebChannelNATSClient {
         // event under the SERVER id (`webchannel-user-<seq>`) — a DISTINCT id — so
         // a bare `applyDurable` would `applyUser`-append a SECOND user bubble.
         //
-        // Adopt the un-adopted bubble by `random_id` FIRST — the SAME correlation
-        // the ack path uses — re-keying it to `event.id` BEFORE the fold, so
-        // `applyUser`'s `findTextIndex` now finds it and no-ops (one bubble). If
-        // `randomId` is absent (older row/older client), unknown, or already
-        // adopted (ack won the race, its linkage drained), this is a no-op and we
-        // fall through to `applyDurable` — today's append. NEVER text-matched.
-        if (typeof event.randomId === "string" && event.randomId.length > 0) {
-          this.adoptUserBubbleByRandomId(event.randomId, event.id);
-        }
-        this.applyDurable(event);
+        // #245 Part B folds the live broadcast the SAME way (`case "user_committed"`
+        // in `handleFrame`), so the adopt-then-fold body lives in ONE place.
+        this.foldUserEvent(event);
         return;
       }
       default:
         this.applyDurable(event);
     }
+  }
+
+  /**
+   * #337 / #245 Part B — adopt an un-adopted optimistic user bubble by `random_id`
+   * THEN fold the user event, the ONE body shared by the `get_difference` catch-up
+   * (`foldDifferenceEvent`'s `case "user"`) and the live multi-device broadcast
+   * (`handleFrame`'s `case "user_committed"`).
+   *
+   * Adopt FIRST — the SAME correlation the ack path uses — re-keying the local
+   * bubble to `event.id` BEFORE the fold, so `applyUser`'s `findTextIndex` now
+   * finds it and no-ops (ONE bubble on the ORIGIN device). If `randomId` is absent
+   * (older row/older client), unknown, or already adopted (the ack won the race
+   * and drained the linkage), the adopt is a no-op and `applyUser` APPENDS —
+   * which is exactly what a NON-ORIGIN device (no linkage for this `random_id`)
+   * wants. NEVER text-matched. `applyUser` is id-idempotent, so a re-delivery
+   * (broadcast PLUS a later gap-sync difference of the same event) is a no-op.
+   */
+  private foldUserEvent(event: Extract<DurableEvent, { kind: "user" }>): void {
+    if (typeof event.randomId === "string" && event.randomId.length > 0) {
+      this.adoptUserBubbleByRandomId(event.randomId, event.id);
+    }
+    this.applyDurable(event);
   }
 
   /**
@@ -4281,6 +4304,32 @@ export class WebChannelNATSClient {
         // re-key preserves that overlay. An ack without `committed` is a no-op
         // here (the tier-2/3 history fallback reconciles that bubble).
         this.adoptCommittedIds(msg.committed);
+        return;
+      }
+
+      case "user_committed": {
+        // #245 Part B: the immediate multi-device broadcast of a just-committed
+        // inbound user message. Fold it exactly as the `get_difference` catch-up
+        // folds a `user` event (`foldDifferenceEvent`'s `case "user"`) — adopt by
+        // `random_id` THEN fold — so the two paths cannot diverge:
+        //  - ORIGIN device: the adopt re-keys its optimistic bubble onto the server
+        //    `id` (or no-ops if the ack already drained the `random_id` linkage),
+        //    and `applyUser` then no-ops — ONE bubble.
+        //  - NON-ORIGIN device: no linkage for this `random_id`, so the adopt is a
+        //    no-op and `applyUser` APPENDS the user bubble. The seq-bearing path in
+        //    `handleMessage` has already advanced this device's cursor, so the
+        //    turn's first agent frame is contiguous (no false gap).
+        // `applyUser` is id-idempotent, so a re-delivery (this broadcast PLUS a
+        // later gap-sync difference of the same event) is a no-op.
+        const id = typeof msg.id === "string" ? msg.id : "";
+        if (id.length === 0 || typeof msg.text !== "string") return;
+        this.foldUserEvent({
+          kind: "user",
+          id,
+          text: msg.text,
+          ...(typeof msg.turnId === "string" ? { turnId: msg.turnId } : {}),
+          ...(typeof msg.random_id === "string" ? { randomId: msg.random_id } : {}),
+        });
         return;
       }
 

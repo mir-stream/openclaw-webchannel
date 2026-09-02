@@ -1106,6 +1106,10 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         // #243 half 2a: forward the server-assigned-id echo so it rides the ack.
         sendAck: (peerId, ids, committed) => channel.sendAck(peerId, ids, committed),
         sendInboundRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids),
+        // #245 Part B: broadcast a just-committed user message to the account's
+        // devices for immediate multi-device echo (Telegram model). One publish to
+        // the shared `.out` subject; the gap-sync path stays the fallback.
+        sendUserCommitted: (peerId, message) => channel.sendUserCommitted(peerId, message),
         // v6 (#239 half 3): the SAME handle the channel got for the egress seam,
         // opened above from this account's (tenant, accountId) tuple. Doc §15.7
         // makes this write part of accepting a user message, so a missing handle

@@ -76,6 +76,8 @@ type Item = {
 type Call =
   | { call: "append"; conversationId: string; event: JournalEvent }
   | { call: "ack"; ids: string[]; committed?: Array<{ random_id: string; messageId: string; seq: number }> }
+  // #245 Part B: the multi-device broadcast of a just-committed user message.
+  | { call: "user_committed"; peerId: string; message: { id: string; text: string; turnId?: string; seq: number; random_id?: string } }
   | { call: "rejected"; ids: string[] }
   | { call: "offer-commit"; text: string | undefined }
   | { call: "offer-rollback"; text: string | undefined }
@@ -299,6 +301,12 @@ function makeSeam(options?: {
       calls.push({ call: "rejected", ids: [...ids] });
       return true;
     },
+    // #245 Part B: record the broadcast so tests can assert it fires on a NEW
+    // admission and NOT on a dedup retry.
+    sendUserCommitted: (peerId, message) => {
+      calls.push({ call: "user_committed", peerId, message: { ...message } });
+      return true;
+    },
     ...(options?.effectiveOutboundLimit !== undefined
       ? { effectiveOutboundLimit: () => options.effectiveOutboundLimit! }
       : {}),
@@ -348,6 +356,11 @@ describe("#239 — the inbound accept journals before it acks", () => {
     // ONE interleaved sequence, asserted whole: the append is first and the ack
     // is last. Moving the hook below the footer's result block reorders exactly
     // this array.
+    //
+    // #245 Part B: the `user_committed` BROADCAST rides right after the append
+    // (inside the append loop, on `inserted === true`) and before the ack —
+    // append-before-broadcast-before-ack. This message carries no `random_id`, so
+    // the broadcast carries none either (and the ack has no `committed` echo).
     expect(calls).toEqual([
       {
         call: "append",
@@ -356,6 +369,11 @@ describe("#239 — the inbound accept journals before it acks", () => {
         // is now SERVER-MINTED (`webchannel-user-<seq>`), NOT the wire id; `turnId`
         // stays the wire id — see the mirror argument below.
         event: { kind: "user", id: "webchannel-user-1", text: "hello", turnId: "u-1" },
+      },
+      {
+        call: "user_committed",
+        peerId: PEER,
+        message: { id: "webchannel-user-1", text: "hello", turnId: "u-1", seq: 1 },
       },
       { call: "write-commit", key: `${PEER}:u-1` },
       { call: "offer-commit", text: "hello" },
@@ -977,6 +995,128 @@ describe("#243 half 2a — the server assigns the durable user id and echoes it"
           { random_id: "r-2", messageId: "webchannel-user-2", seq: 2 },
         ]),
       );
+    } finally {
+      journal.close();
+    }
+  });
+});
+
+describe("#245 Part B — a NEW admission broadcasts user_committed; a dedup retry does not", () => {
+  const dirs: string[] = [];
+  const openIn = (): { journal: DeliveryJournal } => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-245b-journal-"));
+    dirs.push(dir);
+    return { journal: openDeliveryJournal({ databasePath: join(dir, "journal.db") }) };
+  };
+  afterEach(() => {
+    while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
+  });
+
+  const broadcasts = (calls: Call[]) =>
+    calls.filter((entry): entry is Extract<Call, { call: "user_committed" }> =>
+      entry.call === "user_committed");
+
+  it("broadcasts the committed user event {id,text,turnId,seq,random_id} on a fresh admission, and journals it EXACTLY ONCE", async () => {
+    const { journal } = openIn();
+    try {
+      const { calls, onFlush } = makeSeam({ journal });
+
+      await onFlush([item("hello", "u-1", "r-1")]);
+
+      // ONE broadcast to the peer, carrying the SERVER-minted id, the wire turnId,
+      // the committed seq, and the client random_id (origin's reconciliation key).
+      expect(broadcasts(calls)).toEqual([
+        {
+          call: "user_committed",
+          peerId: PEER,
+          message: { id: "webchannel-user-1", text: "hello", turnId: "u-1", seq: 1, random_id: "r-1" },
+        },
+      ]);
+      // The user event is in the journal EXACTLY ONCE — the broadcast is a delivery
+      // of the already-committed row, not a second write.
+      expect(journal.read(PEER).map((row) => row.event)).toEqual([
+        { kind: "user", id: "webchannel-user-1", text: "hello", turnId: "u-1", randomId: "r-1" },
+      ]);
+      // It rides on/after the commit — never before the append.
+      expect(kinds(calls).indexOf("append")).toBeLessThan(kinds(calls).indexOf("user_committed"));
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("broadcasts even for an older (no-random_id) client — the seq still lets non-origin devices stay contiguous", async () => {
+    const { journal } = openIn();
+    try {
+      const { calls, onFlush } = makeSeam({ journal });
+
+      await onFlush([item("hello", "u-1")]); // no random_id
+
+      expect(broadcasts(calls)).toEqual([
+        {
+          call: "user_committed",
+          peerId: PEER,
+          message: { id: "webchannel-user-1", text: "hello", turnId: "u-1", seq: 1 },
+        },
+      ]);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("does NOT re-broadcast a dedup retry caught by the outcome store (no re-append)", async () => {
+    const { journal } = openIn();
+    try {
+      const first = makeSeam({ journal });
+      await first.onFlush([item("hello", "u-1", "r-1")]);
+      expect(broadcasts(first.calls)).toHaveLength(1);
+
+      // The retry is classified found/accepted BEFORE any re-append — no append, so
+      // no broadcast, and still one row.
+      const second = makeSeam({
+        journal,
+        lookups: { [`${PEER}:r-1`]: { status: "found", outcome: "accepted" } },
+      });
+      await second.onFlush([item("hello", "u-1", "r-1")]);
+
+      expect(broadcasts(second.calls)).toEqual([]);
+      expect(journal.read(PEER).map((row) => row.seq)).toEqual([1]);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("does NOT re-broadcast a replay that reaches the append with inserted:false; a genuinely new sibling in the same batch DOES", async () => {
+    // The #283 partial-batch shape: round 1 lands `r-1` then throws on the 2nd
+    // append (batch refused, outcome rolled back). Round 2 is not caught by the
+    // outcome store, so it re-reaches `appendInboundUser` for BOTH — `r-1` returns
+    // inserted:false (no re-broadcast), `r-2` is genuinely new (broadcasts once).
+    const { journal } = openIn();
+    try {
+      const flaky = new FlakyJournal(journal, 2);
+      const round1 = makeSeam({ journal: flaky });
+      await round1.onFlush([item("first", "u-1", "r-1"), item("second", "u-2", "r-2")]);
+      // Round 1 committed `r-1`'s row before the throw, and broadcast it.
+      expect(broadcasts(round1.calls)).toEqual([
+        {
+          call: "user_committed",
+          peerId: PEER,
+          message: { id: "webchannel-user-1", text: "first", turnId: "u-1", seq: 1, random_id: "r-1" },
+        },
+      ]);
+
+      const round2 = makeSeam({ journal });
+      await round2.onFlush([item("first", "u-1", "r-1"), item("second", "u-2", "r-2")]);
+
+      // ONLY `r-2` broadcasts — `r-1` re-appended idempotently (inserted:false).
+      expect(broadcasts(round2.calls)).toEqual([
+        {
+          call: "user_committed",
+          peerId: PEER,
+          message: { id: "webchannel-user-2", text: "second", turnId: "u-2", seq: 2, random_id: "r-2" },
+        },
+      ]);
+      // Two distinct rows total, each journaled once.
+      expect(journal.read(PEER).map((row) => row.seq)).toEqual([1, 2]);
     } finally {
       journal.close();
     }
