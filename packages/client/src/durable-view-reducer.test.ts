@@ -88,6 +88,17 @@ function findText(view: DurableView, id: string): DurableTextMessage | undefined
   return found === undefined ? undefined : asText(found);
 }
 
+/**
+ * The VISIBLE view — the durable view with #241 tombstones stripped, exactly as
+ * both consumers do (`mergeDurable` on the client, `projectJournalHistory` on the
+ * plugin). A tombstone is RETAINED in the reducer's view so a later same-id event
+ * cannot resurrect it, but it never renders; equivalence with the pre-#241
+ * filter behavior is a claim about this visible projection, not the raw view.
+ */
+function stripTombstones(view: DurableView): DurableView {
+  return view.filter((m) => !(m.kind === "text" && m.deleted === true));
+}
+
 describe("reduceDurableView — durable view extraction (v6 slice 1)", () => {
   it("slot-claim ordering: a held answer keeps the slot it claimed via first progress (P0 #1)", () => {
     // A claims its slot (first progress / placement) BEFORE the independent
@@ -108,19 +119,30 @@ describe("reduceDurableView — durable view extraction (v6 slice 1)", () => {
     ]);
   });
 
-  it("late remove-then-readd RESURRECTS the bubble (order-sensitive, NOT tombstone dominance)", () => {
+  it("late remove-then-readd does NOT resurrect: tombstone DOMINANCE (#241 half 2, §16.2-3)", () => {
     const events: DurableEvent[] = [
       { kind: "placement", answerId: "A", turnId: TURN },
       { kind: "bubble", answerId: "A", turnId: TURN, text: "answer A" },
       { kind: "bubble", answerId: "X", turnId: TURN, text: "mis-routed overflow" },
-      // The plugin realises X was mis-routed and removes it in the snapshot.
+      // The plugin realises X was mis-routed and removes it in the snapshot: X is
+      // TOMBSTONED in place (retained), NOT filtered out.
       { kind: "seal", turnId: TURN, answers: [{ id: "A", text: "answer A" }], remove: ["X"] },
-      // ...but a LATER durable frame for X arrives → X is re-appended (resurrect).
+      // ...and a LATER durable frame for X arrives → the no-resurrect guard refuses
+      // it. Before #241 this re-appended X (order-sensitive revive); now the delete
+      // is permanent and restore is a new id or an explicit restore.
       { kind: "bubble", answerId: "X", turnId: TURN, text: "X, resurrected" },
     ];
     const view = reduceDurableView(events);
+    // X is RETAINED as a tombstone at its slot — the id list is unchanged, but…
     expect(view.map((m) => m.id)).toEqual(["A", "X"]);
-    expect(findText(view, "X")?.text).toBe("X, resurrected");
+    const x = findText(view, "X");
+    expect(x?.deleted).toBe(true);
+    expect(x?.text).toBe(""); // tombstone, not "X, resurrected"
+    // …and it is invisible: strip tombstones and only A remains.
+    expect(stripTombstones(view).map((m) => m.id)).toEqual(["A"]);
+    // Proof the FLIP fires: if the guard were reverted (resurrect), X's text would
+    // be "X, resurrected" and it would be visible. It is neither.
+    expect(x?.text).not.toBe("X, resurrected");
   });
 
   it("remove ∩ answers within one seal: answers WIN (X present)", () => {
@@ -248,7 +270,8 @@ describe("reduceDurableView — durable view extraction (v6 slice 1)", () => {
 
 /** A non-trivial stream: user echo, slot claims, an out-of-order final, a seal
  *  carrying BOTH `answers` (with a mint + a reorder) and `remove`, and a
- *  post-seal resurrect. Exercises every transition in the table. */
+ *  post-seal same-id bubble that is REFUSED (tombstone dominance, #241 half 2 —
+ *  it used to resurrect). Exercises every transition in the table. */
 const MIXED_STREAM: DurableEvent[] = [
   { kind: "user", id: "u-0", text: "do the thing", turnId: "w-0" },
   { kind: "placement", answerId: "A", turnId: TURN },
@@ -291,7 +314,21 @@ describe("step / fold agreement: reduceDurableView === fold of applyDurableEvent
     // answers next to their predecessors" pins it against the REAL
     // `applyTurnSnapshot`), and this slice mirrors current behavior rather than
     // correcting it.
+    //
+    // X is RETAINED at the tail as a #241 tombstone (the trailing bubble did NOT
+    // resurrect it), so it still occupies a slot in the RAW view id list…
     expect(view.map((m) => m.id)).toEqual(["u-0", "B", "A", "NOTICE", "C", "X"]);
+    expect(findText(view, "X")?.deleted).toBe(true);
+    expect(findText(view, "X")?.text).toBe(""); // tombstone, not "X, resurrected"
+    // …but it is INVISIBLE: the visible order (tombstones stripped, as both
+    // consumers render) drops X.
+    expect(stripTombstones(view).map((m) => m.id)).toEqual([
+      "u-0",
+      "B",
+      "A",
+      "NOTICE",
+      "C",
+    ]);
   });
 
   it("every prefix of the stream agrees between step-wise and whole-log replay", () => {
@@ -1357,7 +1394,15 @@ describe("equivalence anchor: reduceDurableView(seal) ≡ real turn_snapshot han
         { kind: "seal", ...c.seal },
       ]);
       const realResult = realApplyTurnSnapshot(starting, c.seal);
-      expect(reducerResult).toEqual(realResult);
+      // ⚠️ #241 half 2: compared on the VISIBLE view (tombstones stripped). The
+      // reducer RETAINS a `seal.remove`d id as a tombstone so no later event can
+      // resurrect it; the real client drops it from `state.messages` at
+      // `mergeDurable`, so its projection never carries one. This IS the live ==
+      // history proof for `seal`: the server's full-replay view (`reducerResult`)
+      // and the client's incremental one (`realResult`) agree on what RENDERS.
+      // For every case without a `remove`, `stripTombstones` is a no-op, so this
+      // is strictly the old assertion there.
+      expect(stripTombstones(reducerResult)).toEqual(realResult);
     });
   }
 });
@@ -2234,5 +2279,113 @@ describe("#241 half 1: permanent typed delete (tombstone, no resurrect)", () => 
     const event = Object.freeze({ kind: "messageDeleted", id: "A", revision: 1 }) as DurableEvent;
     // Would throw under strict mode if either were written in place.
     expect(() => applyDurableEvent(view, event)).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #241 half 2 — permanent tombstone cutover: `seal.remove` TOMBSTONES, kills the
+// order-sensitive revive. This is the LIVE behavior (a `seal.remove` is emitted
+// today), unlike the half-1 `messageDeleted` block above, which is still dormant.
+// ---------------------------------------------------------------------------
+describe("#241 half 2: seal.remove tombstones (not filter), no resurrect", () => {
+  it("seal.remove REPLACES the id with a retained tombstone at its slot — not a filter drop", () => {
+    const view = reduceDurableView([
+      { kind: "bubble", answerId: "A", turnId: TURN, text: "A" },
+      { kind: "bubble", answerId: "X", turnId: TURN, text: "mis-routed overflow" },
+      { kind: "seal", turnId: TURN, answers: [{ id: "A", text: "A" }], remove: ["X"] },
+    ]);
+    // Retained (length 2, X still present) rather than filtered (which would be
+    // length 1). The tombstone shape matches `applyMessageDeleted`'s (minus the
+    // revision a `seal.remove` has none of), and keeps its slot after A.
+    expect(view.map((m) => m.id)).toEqual(["A", "X"]);
+    expect(findText(view, "X")).toEqual({
+      kind: "text",
+      id: "X",
+      role: "agent",
+      text: "",
+      turnId: TURN,
+      deleted: true,
+    });
+    // Invisible to both consumers.
+    expect(stripTombstones(view).map((m) => m.id)).toEqual(["A"]);
+  });
+
+  it("a seal.remove of an ALREADY-tombstoned id is a clean no-op (stays tombstoned)", () => {
+    const view = reduceDurableView([
+      { kind: "bubble", answerId: "A", turnId: TURN, text: "A" },
+      { kind: "bubble", answerId: "X", turnId: TURN, text: "X" },
+      { kind: "seal", turnId: TURN, answers: [{ id: "A", text: "A" }], remove: ["X"] },
+      // Second seal names the already-tombstoned X again.
+      { kind: "seal", turnId: TURN, answers: [{ id: "A", text: "A" }], remove: ["X"] },
+    ]);
+    expect(findText(view, "X")?.deleted).toBe(true);
+    expect(findText(view, "X")?.text).toBe("");
+    expect(stripTombstones(view).map((m) => m.id)).toEqual(["A"]);
+  });
+
+  it("end-to-end no-resurrect: [bubble X, seal(remove X), bubble X] leaves X tombstoned", () => {
+    const view = reduceDurableView([
+      { kind: "bubble", answerId: "X", turnId: TURN, text: "X" },
+      { kind: "seal", turnId: TURN, answers: [{ id: "keep", text: "keep" }], remove: ["X"] },
+      { kind: "bubble", answerId: "X", turnId: TURN, text: "X, resurrected" },
+    ]);
+    expect(findText(view, "X")?.deleted).toBe(true);
+    expect(findText(view, "X")?.text).toBe(""); // NOT "X, resurrected"
+    expect(stripTombstones(view).map((m) => m.id)).toEqual(["keep"]);
+  });
+
+  it("VISIBLE order equivalence: tombstoning-then-strip == the pre-#241 filter, multi-answer topology", () => {
+    // A representative interleaving: two answers, a non-answer notice, and a
+    // removed bubble, with the seal REORDERING the answers. The pre-#241 code
+    // physically filtered X out then reordered; the new code tombstones X in place
+    // and the consumers strip it. The VISIBLE result must be identical.
+    const prior: DurableEvent[] = [
+      { kind: "bubble", answerId: "A", turnId: TURN, text: "A" },
+      { kind: "bubble", answerId: "X", turnId: TURN, text: "mis-routed" },
+      { kind: "bubble", answerId: "NOTICE", turnId: TURN, text: "a notice" },
+      { kind: "bubble", answerId: "B", turnId: TURN, text: "B" },
+    ];
+    const seal: DurableEvent = {
+      kind: "seal",
+      turnId: TURN,
+      answers: [
+        { id: "B", text: "B (sealed)" },
+        { id: "A", text: "A (sealed)" },
+      ],
+      remove: ["X"],
+    };
+    // The pre-#241 order = what a physical filter of the removed id would yield:
+    // answers reorder among themselves ([B, A]); NOTICE keeps its slot; X gone.
+    const preSliceFilterOrder = ["B", "NOTICE", "A"];
+    const view = reduceDurableView([...prior, seal]);
+    expect(stripTombstones(view).map((m) => m.id)).toEqual(preSliceFilterOrder);
+    // And the removed id is retained as a tombstone in the raw view (proof it is
+    // tombstoned, not filtered).
+    expect(findText(view, "X")?.deleted).toBe(true);
+  });
+
+  it("live == history: client incremental fold and full replay agree (visible) on a remove", () => {
+    // The client folds ONE frame at a time (`realDrive`), re-deriving its input
+    // from `state.messages` — where tombstones were stripped. The server REPLAYS
+    // the whole journal (`reduceDurableView`), retaining tombstones. Both must
+    // show the same VISIBLE messages, which is the whole live == history bet.
+    const priorEvents: DurableEvent[] = [
+      { kind: "bubble", answerId: "A", turnId: TURN, text: "A" },
+      { kind: "bubble", answerId: "X", turnId: TURN, text: "overflow" },
+    ];
+    const starting = reduceDurableView(priorEvents);
+    const clientVisible = realApplyTurnSnapshot(starting, {
+      turnId: TURN,
+      answers: [{ id: "A", text: "A" }],
+      remove: ["X"],
+    });
+    const serverVisible = stripTombstones(
+      reduceDurableView([
+        ...priorEvents,
+        { kind: "seal", turnId: TURN, answers: [{ id: "A", text: "A" }], remove: ["X"] },
+      ]),
+    );
+    expect(clientVisible).toEqual(serverVisible);
+    expect(clientVisible.map((m) => m.id)).toEqual(["A"]);
   });
 });

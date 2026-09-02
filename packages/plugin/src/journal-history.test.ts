@@ -17,8 +17,9 @@
  *     that an illegal `chunkRows` is REFUSED before any read, and that a reader
  *     which fails to advance terminates instead of spinning;
  *   - `ts`: first-appearance sourcing, including the seal-MINTED answer that
- *     never egressed a bubble and the post-`remove` resurrect that must keep its
- *     ORIGINAL moment, plus the fallback and the anchor that feeds it;
+ *     never egressed a bubble and the post-`remove` same-id bubble that is now
+ *     REFUSED (tombstone dominance, #241 half 2 — it used to resurrect), plus the
+ *     fallback and the anchor that feeds it;
  *   - unknown kinds: counted, excluded, and harmless to the surrounding fold;
  *   - paging: every edge of the two pure selectors;
  *   - `serveHistoryRequest`: plan dispatch, and that a store failure
@@ -85,8 +86,9 @@ const T_STEP = 10;
  * The representative journal: a user echo, slot claims, a notice, durable
  * bubbles, a seal that BOTH reorders two answers and MINTS a third that never
  * egressed a bubble (the #215 create-or-update recovery) and removes a
- * mis-routed overflow bubble, then a post-`remove` same-id bubble that
- * RESURRECTS it.
+ * mis-routed overflow bubble, then a post-`remove` same-id bubble that is
+ * REFUSED — since #241 half 2 the `remove` tombstones the id and no later frame
+ * resurrects it (the events are unchanged; only the OUTCOME flipped).
  *
  * ⚠️ COPIED from `durable-view-reducer-contract.test.ts`'s `STREAM` (itself a
  * copy of the client test's `MIXED_STREAM`) rather than imported, and that is
@@ -207,18 +209,18 @@ describe("projectJournalHistory — the fold", () => {
     const projection = projectJournalHistory(read, CONV);
     expect(projection.unsupportedEvents).toBe(0);
     expect(projection.tsFallbacks).toBe(0);
-    // The seal drops X and reorders the answer slots to [B, A]; C is MINTED next
-    // to its predecessor answer A, which shifts NOTICE one slot right; the
-    // trailing bubble then RESURRECTS X at the tail. Every one of those is the
-    // REDUCER's doing — this file asserts the projection carries them through
-    // unchanged, it does not re-derive them.
+    // The seal TOMBSTONES X and reorders the answer slots to [B, A]; C is MINTED
+    // next to its predecessor answer A, which shifts NOTICE one slot right; the
+    // trailing bubble does NOT resurrect X (tombstone dominance, #241 half 2), and
+    // the tombstone is STRIPPED here — so X is absent from the served history.
+    // Every one of those is the REDUCER's doing (plus this module's strip) — this
+    // file asserts the projection carries them through, it does not re-derive them.
     expect(projection.messages).toEqual([
       { id: "u-0", role: "user", text: "do the thing", ts: T0 + 0 * T_STEP },
       { id: "B", role: "agent", text: "B (sealed)", ts: T0 + 4 * T_STEP },
       { id: "A", role: "agent", text: "A (sealed)", ts: T0 + 1 * T_STEP },
       { id: "NOTICE", role: "agent", text: "a notice", ts: T0 + 3 * T_STEP },
       { id: "C", role: "agent", text: "C (minted)", ts: T0 + 7 * T_STEP },
-      { id: "X", role: "agent", text: "X, resurrected", ts: T0 + 6 * T_STEP },
     ]);
   });
 
@@ -227,8 +229,10 @@ describe("projectJournalHistory — the fold", () => {
     // its own ordering rule — or "helpfully" sorts by ts — this is what goes red.
     const { read } = fakeReader(rowsFor(MIXED_STREAM));
     const projected = projectJournalHistory(read, CONV).messages;
+    // Compared against the VISIBLE reducer view (#241 half 2: the tombstone from
+    // `seal.remove` X is retained in the fold but stripped from the served list).
     expect(projected.map((m) => m.id)).toEqual(
-      reduceDurableView(MIXED_STREAM).map((m) => m.id),
+      visibleView(reduceDurableView(MIXED_STREAM)).map((m) => m.id),
     );
     // And the stream is one where the two orders genuinely differ: B's first
     // appearance is LATER than A's, yet the seal puts B first. A ts sort would
@@ -241,14 +245,15 @@ describe("projectJournalHistory — the fold", () => {
   it("carries the reducer's full durable view, text included", () => {
     // ⚠️ NO KIND FILTER SINCE #242 half 2. Half 1 filtered the reducer's view to
     // `kind === "text"` here, because the emitted list was the view MINUS
-    // reasoning. The emitted list is the WHOLE view now, so the equality is the
-    // stronger, unfiltered one — and it stays a no-op distinction on
-    // `MIXED_STREAM`, which holds no `reasoning` event; the reasoning case has
-    // its own describe below.
+    // reasoning. The emitted list is the WHOLE view now — minus #241 tombstones,
+    // which `visibleView` strips from the reducer side to match the served list —
+    // so the equality is the stronger, unfiltered one, and it stays a no-op
+    // distinction for reasoning on `MIXED_STREAM`, which holds no `reasoning`
+    // event; the reasoning case has its own describe below.
     const { read } = fakeReader(rowsFor(MIXED_STREAM));
     const projected = projectJournalHistory(read, CONV).messages;
     expect(projected.map(comparableRow)).toEqual(
-      reduceDurableView(MIXED_STREAM).map(comparableRow),
+      visibleView(reduceDurableView(MIXED_STREAM)).map(comparableRow),
     );
   });
 });
@@ -292,6 +297,16 @@ function findTextRow(
     throw new Error(`expected a text history row for id=${id}, received kind=${found.kind}`);
   }
   return found;
+}
+
+/**
+ * The reducer's view with #241 tombstones stripped — the projection's `messages`
+ * are compared against THIS, not the raw view, because a `seal.remove`d id is
+ * retained in the fold as a tombstone (so no later event resurrects it) but is
+ * dropped at the emit step. `projectJournalHistory` strips it; this mirrors that.
+ */
+function visibleView(view: readonly DurableMessage[]): DurableMessage[] {
+  return view.filter((m) => !(m.kind === "text" && m.deleted === true));
 }
 
 function comparableRow(m: ProjectedHistoryMessage | DurableMessage) {
@@ -489,10 +504,11 @@ describe("projectJournalHistory — chunking", () => {
     }
     // It throws BEFORE reading, so a bad page size cannot half-project.
     expect(calls).toEqual([]);
-    // 1 is legal — the smallest page, not an error.
+    // 1 is legal — the smallest page, not an error. Five served rows: the six
+    // durable ids minus the #241-tombstoned X (`seal.remove`, stripped at emit).
     expect(
       projectJournalHistory(read, CONV, { chunkRows: 1 }).messages,
-    ).toHaveLength(6);
+    ).toHaveLength(5);
   });
 
   it("gives the SAME projection at every chunk size as one big read", () => {
@@ -501,9 +517,11 @@ describe("projectJournalHistory — chunking", () => {
     // rows it already consumed, because its only non-idempotent event
     // (`applyUser`) sits at seq 1 where no overlap reaches it. See
     // `RE_FOLD_SENSITIVE_STREAM`'s comment for the measurement.
+    // Message counts are the durable id count MINUS the #241-tombstoned X, which
+    // `seal.remove` retains in the fold but the projection strips at emit.
     const streams: Array<[string, JournalEvent[], number]> = [
-      ["MIXED_STREAM", MIXED_STREAM, 6],
-      ["RE_FOLD_SENSITIVE_STREAM", RE_FOLD_SENSITIVE_STREAM, 7],
+      ["MIXED_STREAM", MIXED_STREAM, 5],
+      ["RE_FOLD_SENSITIVE_STREAM", RE_FOLD_SENSITIVE_STREAM, 6],
     ];
     for (const [label, events, expectedMessages] of streams) {
       const rows = rowsFor(events);
@@ -765,13 +783,15 @@ describe("projectJournalHistory — where ts comes from", () => {
     expect(minted?.ts).toBe(T0 + 7 * T_STEP);
   });
 
-  it("a post-remove RESURRECT keeps its ORIGINAL ts, not the resurrecting row's", () => {
+  it("a post-remove same-id bubble is REFUSED — X is tombstoned and absent from the served history (#241 half 2)", () => {
     // X is bubbled at index 6, removed by the seal at 7, and re-bubbled at 8.
-    // First-appearance means the moment the user first saw it, which is 6.
+    // Before #241 the re-bubble resurrected X (keeping its original ts=6); now the
+    // `remove` tombstones it, the re-bubble's no-resurrect guard refuses it, and
+    // the tombstone is stripped from the projection — so X is not served at all.
     const { read } = fakeReader(rowsFor(MIXED_STREAM));
-    const resurrected = findTextRow(projectJournalHistory(read, CONV).messages, "X");
-    expect(resurrected?.ts).toBe(T0 + 6 * T_STEP);
-    expect(resurrected?.text).toBe("X, resurrected");
+    const served = projectJournalHistory(read, CONV).messages;
+    expect(findTextRow(served, "X")).toBeUndefined();
+    expect(served.some((m) => m.id === "X")).toBe(false);
   });
 
   it("records first appearance for EVERY id a seal names, not just minted ones", () => {
@@ -1125,7 +1145,9 @@ describe("serveHistoryRequest — the composition seam both call sites use", () 
    * they carry, so what is worth pinning here is the dispatch and the failure
    * policy — not the selectors, which have their own describes above.
    */
-  const IDS = ["u-0", "B", "A", "NOTICE", "C", "X"];
+  // The served (visible) order: the durable ids minus the #241-tombstoned X
+  // (`seal.remove`, stripped at emit — it used to resurrect at the tail).
+  const IDS = ["u-0", "B", "A", "NOTICE", "C"];
 
   it("routes a `recent` plan to the tail of the full projection", () => {
     const { read } = fakeReader(rowsFor(MIXED_STREAM));

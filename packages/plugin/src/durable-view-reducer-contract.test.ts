@@ -80,7 +80,8 @@ const TURN = "turn-1";
  * A representative journal — a user echo, slot claims (first `progress`), a
  * notice, durable agent bubbles, a seal carrying BOTH `answers` (reordering two
  * lanes AND minting a third that never egressed a bubble — the #215 recovery)
- * and `remove` (a mis-routed overflow bubble), then a post-seal resurrect.
+ * and `remove` (a mis-routed overflow bubble), then a post-seal same-id bubble
+ * that is REFUSED (tombstone dominance, #241 half 2 — it used to resurrect).
  *
  * This is a VERBATIM copy of `MIXED_STREAM` in
  * `packages/client/src/durable-view-reducer.test.ts` — copied rather than shared,
@@ -123,11 +124,12 @@ const STREAM: DurableEvent[] = [
 describe("shared durable-view reducer — the plugin consumes the client module", () => {
   it("imports and folds the client's reducer to the same view the client asserts", () => {
     const view = reduceDurableView(STREAM);
-    // The seal drops X and reorders the answer slots to [B, A]; C is MINTED next
-    // to its predecessor answer A, which shifts NOTICE one slot right; the
-    // trailing bubble then RESURRECTS X at the tail. Every one of those is
-    // current live-client behavior, anchored in the client-side test against the
-    // REAL private `applyTurnSnapshot`.
+    // The seal TOMBSTONES X and reorders the answer slots to [B, A]; C is MINTED
+    // next to its predecessor answer A, which shifts NOTICE one slot right; the
+    // trailing bubble does NOT resurrect X (tombstone dominance, #241 half 2 —
+    // it used to). X is RETAINED as a tombstone at its slot, so the id list is
+    // unchanged, but its content is the empty deleted marker. Every one of those
+    // is the shared reducer's doing.
     expect(view.map((m) => m.id)).toEqual(["u-0", "B", "A", "NOTICE", "C", "X"]);
     expect(view).toEqual<DurableView>([
       { kind: "text", id: "u-0", role: "user", text: "do the thing", turnId: "w-0" },
@@ -135,7 +137,7 @@ describe("shared durable-view reducer — the plugin consumes the client module"
       { kind: "text", id: "A", role: "agent", text: "A (sealed)", turnId: TURN },
       { kind: "text", id: "NOTICE", role: "agent", text: "a notice", turnId: TURN },
       { kind: "text", id: "C", role: "agent", text: "C (minted)", turnId: TURN },
-      { kind: "text", id: "X", role: "agent", text: "X, resurrected", turnId: TURN },
+      { kind: "text", id: "X", role: "agent", text: "", turnId: TURN, deleted: true },
     ]);
   });
 

@@ -86,14 +86,19 @@
  * happens to have a row in each section below. `reasoning` has NO path in the
  * first section — see its row.)
  *
- * ⚠️ #241 half 1 ADDS MORE by-reference returns, and they are DORMANT rather than
- * a fifth exhaustive count. Every one is gated on a TOMBSTONE or a mutation
- * event that no producer emits yet: `applyMessageEdited`'s absent-id/stale/
- * tombstone no-ops, `applyMessageDeleted`'s absent-id/stale no-ops, and the
- * tombstone no-resurrect guards added to `applyPlacement`/`applyBubble`. None can
- * fire without a `messageDeleted`/`messageEdited` event, so on any existing
- * stream the FOUR above remain exhaustive — which is exactly why this slice is
- * additive and every legacy anchor stays byte-identical.
+ * ⚠️ #241 ADDS MORE by-reference returns, and half 2 CHANGED which of them are
+ * dormant. `applyMessageEdited`'s absent-id/stale/tombstone no-ops and
+ * `applyMessageDeleted`'s absent-id/stale no-ops are STILL dormant — no producer
+ * emits `messageEdited`/`messageDeleted` yet. But the tombstone no-resurrect
+ * guards in `applyPlacement`/`applyBubble` (and `applySeal`'s answer filter) are
+ * now REACHABLE, because half 2's `applySeal` produces a tombstone from
+ * `seal.remove`. So a `placement`/`bubble` naming a seal-removed id returns its
+ * input by reference — a same-array path the pre-#241 FOUR did not have. It is
+ * unreachable LIVE (the plugin never re-sends a removed id — the lane guards in
+ * `message-adapter.ts` and monotonic id minting), so no production stream takes
+ * it, but a reducer-level test that constructs the sequence does. The FOUR rows
+ * remain exhaustive for a stream with no `seal.remove`; add `seal.remove` and the
+ * no-resurrect returns join them.
  *   - `placement`, repeat claim whose turnId resolves unchanged  → SAME array
  *   - `seal`, early return (no valid answers and no removes)     → SAME array
  *   - `seal`, empty/blank turnId early return                    → SAME array
@@ -309,14 +314,21 @@ export type DurableMessage =
        */
       readonly edited?: boolean;
       /**
-       * The TOMBSTONE marker for a permanent typed delete (#241 half 1, doc
-       * §16.2-3). A `messageDeleted` replaces the entry IN PLACE with a tombstone
+       * The TOMBSTONE marker for a permanent typed delete (#241, doc §16.2-3). A
+       * `messageDeleted` replaces the entry IN PLACE with a tombstone
        * (`text: ""`, `deleted: true`) that stays in the array at its slot — the
        * fold RETAINS it so a later same-id event can see it and refuse to
        * resurrect it (order-sensitive revive is gone; restore is a new id or an
-       * explicit restore per §16.2-3). Dormant in half 1: with no `messageDeleted`
-       * producer, no tombstone can exist, which is what makes every no-resurrect
-       * guard below provably unreachable for an existing stream. Read `=== true`.
+       * explicit restore per §16.2-3). ⚠️ SINCE HALF 2 the tombstone also has a
+       * SECOND producer: `applySeal`'s `remove` writes exactly this shape in place
+       * (a `messageDeleted` is the future third one, still dormant). So a tombstone
+       * DOES exist on a live stream now — but the no-resurrect GUARDS below still
+       * fire only in a constructed whole-log fold, because egress emits no later
+       * same-id event after a `seal.remove` (id non-reuse + terminal-drain
+       * snapshot); the server's full replay is the side they protect (#329 tracks
+       * making the client's no-resurrect structural). Both consumers STRIP
+       * `deleted === true` at render/serve, so a tombstone never renders. Read
+       * `=== true`.
        */
       readonly deleted?: boolean;
     }
@@ -972,12 +984,15 @@ function applyPlacement(
 ): DurableView {
   const idx = findTextIndex(view, event.answerId);
   const prev = idx === -1 ? undefined : view[idx];
-  // ⚠️ NO-RESURRECT (#241 half 1, doc §16.2-3). A placement claiming a slot for a
+  // ⚠️ NO-RESURRECT (#241, doc §16.2-3). A placement claiming a slot for a
   // TOMBSTONED id must not revive it — the delete is permanent, so this is a
-  // no-op returning the input by reference. UNREACHABLE without a `messageDeleted`
-  // event: no tombstone can exist otherwise, so this branch cannot fire for any
-  // existing stream and `placement`'s behavior stays byte-identical. It is stated
-  // as `deleted === true` (not truthiness) so only an actual tombstone trips it.
+  // no-op returning the input by reference. Half 2's `applySeal` produces the
+  // tombstone this guards against, but the guard itself FIRES only in a
+  // constructed whole-log fold — never in production nor on the incremental
+  // client, because egress emits no `progress`/`bubble` for a `seal.remove`d id
+  // after its snapshot (see the file header at the array-identity table: id
+  // non-reuse + terminal-drain snapshot). It is stated as `deleted === true`
+  // (not truthiness) so only an actual tombstone trips it.
   if (prev !== undefined && prev.kind === "text" && prev.deleted === true) return view;
   // `prev.kind !== "text"` CANNOT fire — `findTextIndex`'s predicate already
   // decided it, and TS simply cannot carry a `findIndex` callback's narrowing to
@@ -1000,9 +1015,13 @@ function applyPlacement(
 
 /**
  * Durable agent frame — upsert by id: update text in place if the id is held
- * (keeping its claimed slot), else APPEND at the tail. This is what makes
- * remove-then-late-readd RESURRECT (order-sensitive, not tombstone dominance): a
- * `seal` remove drops the id, and a LATER `bubble` re-appends it.
+ * (keeping its claimed slot), else APPEND at the tail. Before #241 this was what
+ * made remove-then-late-readd RESURRECT (order-sensitive): a `seal` remove
+ * dropped the id and a LATER `bubble` re-appended it. #241 replaced that with
+ * permanent tombstone dominance — `seal.remove` now TOMBSTONES in place and the
+ * no-resurrect guard below refuses to overwrite or re-append a tombstoned id, so
+ * `[bubble X, seal(remove X), bubble X]` leaves X a tombstone, not resurrected
+ * (doc §16.2-3; restore is a new id or an explicit restore).
  *
  * NOTE the asymmetry in `role`, which is the client's pre-rewire behavior
  * preserved: the UPDATE branch spreads the held entry and writes only
@@ -1018,12 +1037,17 @@ function applyBubble(
 ): DurableView {
   const idx = findTextIndex(view, event.answerId);
   const prev = idx === -1 ? undefined : view[idx];
-  // ⚠️ NO-RESURRECT (#241 half 1, doc §16.2-3). This is the transition the old
+  // ⚠️ NO-RESURRECT (#241, doc §16.2-3). This is the transition the old
   // order-sensitive revive lived on: a `seal.remove` dropped an id and a LATER
   // `bubble` re-appended it. A tombstone replaces that — a `bubble` whose id
   // resolves to a tombstone must neither overwrite the tombstone (update branch)
   // nor append a duplicate (append branch), so it is a no-op here, BEFORE either.
-  // UNREACHABLE without a `messageDeleted`, so existing streams are byte-identical.
+  // This is what makes `[bubble X, seal(remove X), bubble X]` leave X tombstoned
+  // — but that sequence is reachable only in a constructed whole-log fold: in
+  // production and on the incremental client, egress emits no `bubble` for a
+  // `seal.remove`d id after its snapshot, so this guard never fires there (the
+  // server's full replay is the side the tombstone actually protects). #329
+  // tracks making the client's no-resurrect structural rather than egress-reliant.
   if (prev !== undefined && prev.kind === "text" && prev.deleted === true) return view;
   // Same shape and same reason as `applyPlacement`'s: the second disjunct is
   // unreachable and is how TS is told what `findTextIndex` already guaranteed.
@@ -1430,8 +1454,12 @@ function applyMessageDeleted(
  * `applyTurnSnapshot` is now only the
  * frame→event mapper that feeds this. The contract is EXPLICIT (never a blanket
  * drop):
- *  - `remove` ids are dropped (ANSWER BUBBLES only — a seal never touches a
- *    reasoning block; see step 1's note);
+ *  - `remove` ids are TOMBSTONED IN PLACE (#241 half 2) — replaced by a retained
+ *    `{ text: "", deleted: true }` tombstone at their slot, NOT filtered out, so
+ *    the delete is permanent and no later same-id event resurrects them. Both
+ *    consumers strip tombstones at render/serve, so removed = invisible exactly
+ *    as before. ANSWER BUBBLES only — a seal never touches a reasoning block; see
+ *    step 1's note;
  *  - `answers` are upserted by id (existing bubble reused, absent id MINTED —
  *    #215 failed-frame recovery) then reordered into snapshot order among the
  *    slots answer bubbles already occupy — every non-answer bubble keeps its
@@ -1455,31 +1483,56 @@ function applySeal(
   const dedupedAnswers = rawAnswers.filter((a) =>
     answerSeen.has(a.id) ? false : (answerSeen.add(a.id), true),
   );
-  // ⚠️ NO-RESURRECT (#241 half 1, doc §16.2-3). An `answers` entry naming a
-  // TOMBSTONED id must not revive it — `seal.answers`'s create-or-update (#215
-  // failed-frame recovery) is exactly the revive path the permanent delete
-  // replaces, and letting a tombstone through step 2 below would build a
-  // `{ ...tombstone, text }` half-state that is `deleted: true` yet non-empty.
-  // Skip those ids so the tombstone stays put as a non-answer slot. The set is
-  // EMPTY without a `messageDeleted` event, so `answers === dedupedAnswers`
-  // logically for every existing stream and the reordering below is unchanged.
+  // ⚠️ NO-RESURRECT (#241, doc §16.2-3). An `answers` entry naming a TOMBSTONED
+  // id must not revive it — `seal.answers`'s create-or-update (#215 failed-frame
+  // recovery) is exactly the revive path the permanent delete replaces, and
+  // letting a tombstone through step 2 below would build a `{ ...tombstone, text }`
+  // half-state that is `deleted: true` yet non-empty. Skip those ids so the
+  // tombstone stays put as a non-answer slot. This set covers PRE-EXISTING
+  // tombstones (a prior `messageDeleted`, dormant until its producer lands); the
+  // same-frame `remove` case is handled the other way, by `removeSet` excluding
+  // answer ids just below, so a same-seal answer WINS over a same-seal remove
+  // (which keeps the #215-recovery-vs-remove characterization intact). Both are
+  // one rule — a tombstone is never revived by an answer — and `answers ∩ remove
+  // = ∅` in production makes the distinction unobservable there.
   const tombstonedIds = new Set<string>();
   for (const m of view) if (m.kind === "text" && m.deleted === true) tombstonedIds.add(m.id);
   const answers =
     tombstonedIds.size === 0
       ? dedupedAnswers
       : dedupedAnswers.filter((a) => !tombstonedIds.has(a.id));
+  // Hoisted here (was rebuilt after step 2) so `remove` can exclude answer ids.
+  const answerIds = new Set(answers.map((a) => a.id));
+  // ⚠️ #241 half 2: `remove` excludes ids this seal ALSO names in `answers`. An id
+  // in both would otherwise be tombstoned by step 1 AND re-authored by step 2,
+  // producing the `deleted: true` yet non-empty half-state above. Excluding it
+  // lets the authoritative answer win cleanly. Disjoint in production
+  // (`remove` = `supersededAnswerBubbleIds`, `message-adapter.ts`), so this only
+  // bites the contrived overlap the characterization tests drive.
   const removeSet = new Set(
     (Array.isArray(event.remove) ? event.remove : []).filter(
-      (r): r is string => typeof r === "string" && r.length > 0,
+      (r): r is string =>
+        typeof r === "string" && r.length > 0 && !answerIds.has(r),
     ),
   );
   if (answers.length === 0 && removeSet.size === 0) return view;
 
-  // 1. Drop the plugin-named superseded (mis-routed) answer bubbles.
-  //    Both branches produce a fresh MUTABLE working copy (`filter`/`slice` off a
-  //    readonly array widen to `DurableMessage[]`), so steps 3-4 below may splice
-  //    and assign freely without ever touching the caller's `view`.
+  // 1. TOMBSTONE the plugin-named superseded (mis-routed) answer bubbles IN
+  //    PLACE — #241 half 2, doc §16.2-3. This REPLACES the old physical `filter`
+  //    drop: the entry keeps its slot as a retained tombstone (`text: ""`,
+  //    `deleted: true`, the same shape `applyMessageDeleted` writes, minus the
+  //    revision `seal.remove` has none of) so a later same-id
+  //    `bubble`/`placement`/`seal.answers` finds it via `findTextIndex` and its
+  //    no-resurrect guard refuses to revive it — killing the order-sensitive
+  //    revive `[bubble X, seal(remove X), bubble X]` used to have. The tombstone
+  //    is a NON-ANSWER slot (`remove` excludes answer ids above, so a removed id
+  //    is never in `answerIds`); the reorder in steps 2-4 leaves it exactly where
+  //    it is, and both consumers STRIP `deleted === true` at render/serve, so the
+  //    VISIBLE order matches the old filter for every disjoint (production)
+  //    topology. `removeSet` of an already-tombstoned id re-writes the same
+  //    tombstone (a value no-op that stays tombstoned). Both branches produce a
+  //    fresh MUTABLE working copy so steps 3-4 may splice/assign without ever
+  //    touching the caller's `view`.
   //
   //    ⚠️ EVERY id TEST IN THIS FUNCTION IS GUARDED BY `kind === "text"`. A
   //    `turn_snapshot` reconciles the turn's ANSWER BUBBLES; it says nothing
@@ -1489,7 +1542,11 @@ function applySeal(
   //    delivered content if it ever were.
   const msgs: DurableMessage[] =
     removeSet.size > 0
-      ? view.filter((m) => !(m.kind === "text" && removeSet.has(m.id)))
+      ? view.map((m) =>
+          m.kind === "text" && removeSet.has(m.id)
+            ? { kind: "text", id: m.id, role: m.role, text: "", turnId: m.turnId, deleted: true }
+            : m,
+        )
       : view.slice();
 
   // 2. Desired answer objects, in authoritative order, reusing any existing
@@ -1506,7 +1563,7 @@ function applySeal(
         : { kind: "text", id: a.id, role: "agent", text: a.text, turnId },
     );
   }
-  const answerIds = new Set(answers.map((a) => a.id));
+  // `answerIds` is hoisted above (so `remove` could exclude answer ids).
   const isAnswerSlot = (m: DurableMessage): boolean =>
     m.kind === "text" && answerIds.has(m.id);
 

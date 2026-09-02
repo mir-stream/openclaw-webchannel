@@ -176,10 +176,12 @@
  * `HISTORY_REPLAY_CHUNK_ROWS`-sized pages, so what is alive at once is the
  * projected view, ONE chunk, and the `firstSeenMs` map — that last one is easy to
  * omit from this sentence and it is not free: it is O(DISTINCT IDS EVER NAMED),
- * which is strictly larger than the view, because an id removed by a `seal` and
- * never resurrected stays in the map while leaving the view. It is the same
- * ORDER as the view (one small entry per id, no text), so the bound holds — but
- * "the view and one chunk" is not the whole list.
+ * which is at least as large as the EMITTED list. An id removed by a `seal` used
+ * to be dropped from the view outright; since #241 half 2 it STAYS in the folded
+ * view as a tombstone and is stripped only at the emit step below — so it sits in
+ * BOTH the map and the folded view, but not in the emitted history. It is the
+ * same ORDER as the view (one small entry per id, no text), so the bound holds —
+ * but "the view and one chunk" is not the whole list.
  *
  * ⚠️ THAT BOUNDS THE LIVE SET, NOT THE ALLOCATION CHURN, and the distinction was
  * measured. Allocation is the reducer's DEFAULT: a transition that changes the
@@ -597,13 +599,14 @@ export type JournalHistoryProjection = {
  * new kind which introduces an id cannot ship `ts: undefined` or `NaN` onto the
  * wire while nobody notices. The counter is how the caller finds out it happened.
  *
- * ⚠️ IT IS COUNTED OVER THE EMITTED LIST, WHICH IS NOW THE WHOLE VIEW. Half 1
- * dropped reasoning before this step, so this note used to say reasoning could
- * "neither raise nor mask this counter". Half 2 emits reasoning, and the emitted
- * list and the view have the same members again — so a reasoning message with no
- * recorded first appearance DOES raise the counter. The counter's meaning is
- * unchanged (it is about what `ts` reaches the WIRE); what changed is that the
- * two lists no longer differ, so there is no gap left for it to miss.
+ * ⚠️ IT IS COUNTED OVER THE EMITTED LIST, WHICH IS THE VIEW MINUS TOMBSTONES.
+ * Half 1 dropped reasoning before this step, so this note used to say reasoning
+ * could "neither raise nor mask this counter". #242 half 2 emits reasoning, so a
+ * reasoning message with no recorded first appearance DOES raise the counter. The
+ * one class still NOT emitted is a #241 tombstone (a `seal.remove`d id): it is
+ * skipped above before the `ts` lookup, so it can neither raise nor mask the
+ * counter — and it was dated at its first appearance anyway. The counter's
+ * meaning is unchanged (it is about what `ts` reaches the WIRE).
  */
 export function projectJournalHistory(
   read: JournalReader,
@@ -684,6 +687,17 @@ export function projectJournalHistory(
   let tsFallbacks = 0;
   const messages: ProjectedHistoryMessage[] = [];
   for (const message of view) {
+    // ⚠️ #241 half 2: STRIP TOMBSTONES. A permanent typed delete — today only a
+    // `seal.remove` — leaves a `{ kind: "text", deleted: true, text: "" }` entry
+    // in the folded view at its slot so a later same-id event cannot resurrect it
+    // (the reducer's no-resurrect guards). It must never be SERVED as history:
+    // dropping it here makes a removed id invisible, exactly as the pre-#241
+    // `filter`-based `seal` did. This is the PLUGIN half of the strip; the client
+    // drops the same entries in `mergeDurable`, and both fold the SAME reducer —
+    // so history == live. Skipping before the `ts` lookup means a tombstone never
+    // raises `tsFallbacks` (its id was already dated at its first appearance and
+    // that date is simply not emitted).
+    if (message.kind === "text" && message.deleted === true) continue;
     // ⚠️ #242 half 2: REASONING IS EMITTED. Half 1 had a `continue` here, because
     // `HistoryMessage` was `{id, role, text, ts}` and a role-less reasoning
     // message had no `role` to fill. `channel-contract.ts`'s row is now a TAGGED
