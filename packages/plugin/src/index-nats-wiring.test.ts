@@ -543,12 +543,14 @@ describe("index-nats.ts account lifecycle ownership", () => {
 describe("nats-account-runtime.ts wiring contract — #99 inbound frame normalization", () => {
   /**
    * Layer (a) of #99. `coalescedIds` is plugin-internal state meaning "these
-   * receipts settle with this turn", and the decode path is a cast, not a
-   * validation (`JSON.parse(...) as InboundWsMessage` in nats-channel.ts, whose
-   * `user_message` case forwards the object with no field checks). So the ONLY
-   * thing standing between a peer-supplied member list and the turn handler is
-   * this normalization — and its position: it must run before the control lane,
-   * before the ack, and before the debouncer.
+   * receipts settle with this turn", and the decode path does not stop it:
+   * #246 half A's `decodeInboundWsMessage` (nats-channel.ts) validates the
+   * KNOWN fields of a `user_message` and deliberately passes UNKNOWN ones
+   * through — the wire is additive — after which the `user_message` case
+   * forwards the object as it stands. So the ONLY thing standing between a
+   * peer-supplied member list and the turn handler is still this normalization
+   * — and its position: it must run before the control lane, before the ack,
+   * and before the debouncer.
    *
    * The handler body itself is untestable routing (it is closed over inside
    * `buildNatsAccount`); the normalization is a tested pure function

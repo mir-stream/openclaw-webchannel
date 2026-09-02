@@ -58,11 +58,14 @@
  *    served"). Both sides already reject a mismatch, so the constant IS the
  *    enforcement — no new gate was added.
  *  - DO NOT BUMP for a new frame type only when its semantics are optional and
- *    safely ignorable by an old peer. Measured, not assumed: this side's inbound
- *    dispatch ends in a `default:` that only `console.warn`s and drops the frame
- *    (`nats-channel.ts`), and the client has no dispatch switch at all —
- *    `deliverInbound` matches two specific types and forwards EVERY frame, known
- *    or not, to its message listeners (`nats-client.ts`). That proves wire
+ *    safely ignorable by an old peer. Measured, not assumed — and re-measured
+ *    after #246 half A moved both sides behind a runtime decoder: an unknown or
+ *    malformed frame is now REFUSED AT THE RECEIVE DOOR and dropped with one
+ *    warn, on both sides (`decodeInboundWsMessage` in `nats-channel.ts`;
+ *    `decodeInboundMessage` in `nats-client.ts`, so `deliverInbound` no longer
+ *    forwards an unrecognised frame to the message listeners). The tolerance is
+ *    UNCHANGED in what it yields — an old peer still ignores a frame it does not
+ *    know, it just does so visibly and earlier — and it still proves only wire
  *    tolerance, not semantic compatibility. If correctness requires the peer to
  *    act on a new frame (for example reset or revocation), BUMP or negotiate a
  *    capability.

@@ -2451,11 +2451,12 @@ describe("handleInboundMessage — #99 coalesced-group settlement", () => {
   });
 
   /**
-   * The settle loop reads `coalescedIds` off the turn message, and that message
-   * used to be reachable from the wire verbatim (the decode path casts instead
-   * of validating). Layer (a) strips the field at ingress; these pin layer (b),
-   * the read-site guard, so a path that ever forgets to strip degrades to "only
-   * the anchor settles" instead of stranding the whole turn.
+   * The settle loop reads `coalescedIds` off the turn message, and a peer can
+   * still attach that field: #246 half A's door decoder refuses malformed KNOWN
+   * fields but passes UNKNOWN ones through untouched, because the wire is
+   * additive. Layer (a) strips the field at ingress; these pin layer (b), the
+   * read-site guard, so a path that ever forgets to strip degrades to "only the
+   * anchor settles" instead of stranding the whole turn.
    *
    * The failure this prevents is severe and silent: the member loop runs BEFORE
    * the anchor is pushed, so a throw here emits ZERO settle frames, the

@@ -714,3 +714,267 @@ describe("#245 Part B — the multi-device user_committed broadcast", () => {
     expect(project(w).map((m) => (m as { text: string }).text)).toEqual(["hello", "answer 3"]);
   });
 });
+
+/**
+ * #246 half A — THE CURSOR INVARIANT: a seq-bearing frame advances
+ * `lastAppliedSeq` IFF it was folded.
+ *
+ * Every shape check inside `handleFrame` used to be a bare early `return`, which
+ * the caller could not tell from a successful fold — so the cursor advanced past
+ * a frame that had just been REFUSED. That is unrecoverable data loss, not a
+ * cosmetic slip: the event is gone AND the gap that would have re-fetched it is
+ * closed by the same statement, so no later frame ever reads a hole there.
+ *
+ * ⚠️ THESE DRIVE `handleMessage` DIRECTLY, NOT THE DECODED DOOR, AND THAT IS THE
+ * POINT. `decodeInboundMessage` refuses most of these frames before the wrapper
+ * ever sees them, which is exactly why the cursor must not be wired to it: a
+ * decoder that misses a case must degrade to "one wasted round-trip", never back
+ * to silent loss. The malformed frames below are the ones that reach the reducer
+ * when the door is bypassed — the shape `handleFrame` itself has to refuse.
+ */
+describe("#246 half A — a refused seq-bearing frame must not advance the cursor", () => {
+  /** The confirmed defect's frame: `user_committed` with an empty id. */
+  const malformedUserCommitted = (seq: number): InboundMessage => ({
+    type: "user_committed",
+    id: "",
+    text: "hello",
+    turnId: "t1",
+    seq,
+    random_id: "rand-1",
+  });
+
+  it("drops a malformed user_committed and leaves the cursor where it was", () => {
+    const { w, getDifference } = spied();
+    w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+    w.handleMessage(malformedUserCommitted(2));
+
+    // Nothing folded — and, the load-bearing half, nothing advanced.
+    expect(userIds(w)).toEqual([]);
+    expect(w.lastAppliedSeq).toBe(1);
+    // Refusing is not itself a gap: the frame simply did not happen.
+    expect(getDifference).not.toHaveBeenCalled();
+  });
+
+  it("the NEXT well-formed frame then reads as a gap and requests get_difference(afterSeq=N)", () => {
+    const { w, getDifference } = spied();
+    w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+    w.handleMessage(malformedUserCommitted(2)); // refused; cursor stays 1
+    // seq3 against a cursor of 1 is beyond the contiguous next seq ⇒ the refused
+    // seq2 shows up as the hole it is.
+    w.handleMessage({ type: "agent_message", id: "a3", text: "answer 3", turnId: "t1", seq: 3 });
+
+    expect(getDifference).toHaveBeenCalledTimes(1);
+    expect(getDifference).toHaveBeenCalledWith(1);
+    expect(w.differenceInFlight).toBe(true);
+  });
+
+  it("the difference re-serves the canonical row → the view equals a clean delivery", () => {
+    // A: the well-formed stream, no refusal anywhere.
+    const a = spied();
+    a.w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+    a.w.handleMessage({
+      type: "user_committed",
+      id: "webchannel-user-2", text: "hello", turnId: "t1", seq: 2, random_id: "rand-1",
+    });
+    a.w.handleMessage({ type: "agent_message", id: "a3", text: "answer 3", turnId: "t1", seq: 3 });
+
+    // B: the same stream, but the broadcast arrives malformed and is refused.
+    const b = spied();
+    b.w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+    b.w.handleMessage(malformedUserCommitted(2));
+    b.w.handleMessage({ type: "agent_message", id: "a3", text: "answer 3", turnId: "t1", seq: 3 });
+    expect(b.getDifference).toHaveBeenCalledWith(1);
+    const difference: InboundMessage = {
+      type: "difference",
+      events: [
+        { seq: 2, event: { kind: "user", id: "webchannel-user-2", text: "hello", turnId: "t1", randomId: "rand-1" } },
+        { seq: 3, event: { kind: "bubble", answerId: "a3", text: "answer 3", turnId: "t1" } },
+      ],
+    };
+    b.w.handleMessage(difference);
+
+    // ⚠️ THE HEAL: the row the malformed frame carried is back, exactly once, and
+    // the two devices' durable views are byte-identical.
+    expect(project(b.w)).toEqual(project(a.w));
+    expect(userIds(b.w)).toEqual(["webchannel-user-2"]);
+    expect(b.w.lastAppliedSeq).toBe(3);
+    expect(b.w.differenceInFlight).toBe(false);
+
+    // APPLIED TWICE (the rule from #308): re-deliver the identical difference.
+    // It changes nothing because no request is outstanding — the stale-reply
+    // guard drops it whole — which is the property that has to survive, since a
+    // retry double-reply delivers exactly this.
+    const healed = project(b.w);
+    b.w.handleMessage(difference);
+    expect(project(b.w)).toEqual(healed);
+    expect(userIds(b.w)).toEqual(["webchannel-user-2"]);
+    expect(b.w.lastAppliedSeq).toBe(3);
+  });
+
+  it("a malformed KNOWN-kind event inside a difference is SKIPPED and its seq still advances", () => {
+    // The catch-up door's OPPOSITE rule: a difference is the authoritative answer
+    // to a gap, so a row it cannot fold must not freeze the cursor — that would
+    // re-request the same unusable row forever.
+    const { w, getDifference } = spied();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+      w.handleMessage({ type: "agent_message", id: "a4", text: "answer 4", turnId: "t1", seq: 4 });
+      expect(getDifference).toHaveBeenCalledWith(1);
+      w.handleMessage({
+        type: "difference",
+        events: [
+          // Known kind, unusable shape: a `bubble` with no text.
+          { seq: 2, event: { kind: "bubble", answerId: "a2", turnId: "t1" } },
+          { seq: 3, event: { kind: "bubble", answerId: "a3", text: "answer 3", turnId: "t1" } },
+          { seq: 4, event: { kind: "bubble", answerId: "a4", text: "answer 4", turnId: "t1" } },
+        ],
+      });
+
+      // seq2 was not folded, seq3/seq4 were, and the cursor cleared the whole range.
+      expect(project(w).map((m) => (m as { text: string }).text)).toEqual([
+        "answer 3", "answer 4",
+      ]);
+      expect(w.lastAppliedSeq).toBe(4);
+      expect(w.differenceInFlight).toBe(false);
+      // No re-request loop: the catch-up closed on the first round-trip.
+      expect(getDifference).toHaveBeenCalledTimes(1);
+      // The skip is REPORTED — an unknown kind is version skew, a malformed known
+      // kind is a defect upstream and must not be silent.
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("skipping malformed bubble event"));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("an ack whose committed entry is malformed adopts nothing and moves no cursor", () => {
+    const { w } = spied();
+    w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+    seedOptimisticUser(w, {
+      localId: "u-0", receiptKey: "r-0", randomId: "rand-1", text: "hello", wireId: "t1",
+    });
+
+    // A well-formed `seq` riding an entry whose identity is not: the seq is only
+    // evidence that a user row was committed if the entry naming that row is
+    // intact, so neither the re-key nor the cursor may act on it.
+    w.handleMessage({
+      type: "ack",
+      ids: ["u-0"],
+      committed: [{ random_id: "rand-1", messageId: "", seq: 4 } as unknown as {
+        random_id: string; messageId: string; seq?: number;
+      }],
+    });
+
+    expect(userIds(w)).toEqual(["u-0"]);
+    expect(w.lastAppliedSeq).toBe(1);
+    // The linkage is NOT consumed: the echo never happened, so a real one still
+    // has to be able to adopt this bubble.
+    expect(w.randomIdToReceiptKey.has("rand-1")).toBe(true);
+  });
+
+  it("a difference carrying a seal with no answers cannot wedge gap-sync", () => {
+    // `foldDifferenceEvent`'s `case "seal"` iterates `event.answers` BEFORE the
+    // reducer sees it, so a missing `answers` threw INSIDE the fold. The throw is
+    // swallowed by the client's listener dispatch, leaving `differenceInFlight`
+    // stuck true with its liveness timer already cancelled — every later durable
+    // frame buffered forever, in silence.
+    const { w, getDifference } = spied();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+      w.handleMessage({ type: "agent_message", id: "a4", text: "answer 4", turnId: "t1", seq: 4 });
+      expect(getDifference).toHaveBeenCalledWith(1);
+
+      expect(() =>
+        w.handleMessage({
+          type: "difference",
+          events: [
+            { seq: 2, event: { kind: "bubble", answerId: "a2", text: "answer 2", turnId: "t1" } },
+            // The wedge: a `seal` with no `answers` at all.
+            { seq: 3, event: { kind: "seal", turnId: "t1" } },
+            { seq: 4, event: { kind: "bubble", answerId: "a4", text: "answer 4", turnId: "t1" } },
+          ],
+        }),
+      ).not.toThrow();
+
+      // Skipped, not folded — and the whole range still cleared.
+      expect(w.lastAppliedSeq).toBe(4);
+      expect(w.differenceInFlight).toBe(false);
+      expect(project(w).map((m) => (m as { text: string }).text)).toEqual([
+        "answer 2", "answer 4",
+      ]);
+
+      // And the stream is LIVE again: the next contiguous frame folds normally
+      // rather than being buffered behind a stuck in-flight flag.
+      w.handleMessage({ type: "agent_message", id: "a5", text: "answer 5", turnId: "t1", seq: 5 });
+      expect(w.lastAppliedSeq).toBe(5);
+      expect(getDifference).toHaveBeenCalledTimes(1);
+      expect(project(w).map((m) => (m as { text: string }).text)).toEqual([
+        "answer 2", "answer 4", "answer 5",
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("a fold that throws cannot wedge gap-sync — the round-trip closes out and re-detects", () => {
+    // The test above proves the VALIDATOR keeps the known throw out of the arm.
+    // This one DEFEATS the validator — a perfectly well-formed event, a fold made
+    // to throw — because the property that must hold is not "this event shape is
+    // handled" but "no throw from the fold can wedge gap-sync".
+    //
+    // ⚠️ WHAT "NOT WEDGED" MEANS HERE, MEASURED RATHER THAN ASSUMED. The
+    // `try/finally` in `applyDifference` does NOT pretend the fold succeeded: it
+    // runs the bookkeeping (in-flight cleared, cursor advanced only as far as the
+    // loop actually got — seq 2 never counted, so it stays at 1 HERE, where
+    // nothing was deferred; a deferred `ack`/`history` seq above the throw point
+    // would still carry it higher, which is #352's partial-reply shape) and
+    // DRAINS the buffer. The buffered frame then re-detects the same gap and issues a FRESH
+    // request with a fresh retry budget, which is the self-heal. Without the
+    // `finally`, none of that runs: `differenceInFlight` stays true with its
+    // liveness timer already cancelled, the buffer is never drained, and every
+    // later durable frame is buffered in silence until the transport drops.
+    const { w, getDifference } = spied();
+    w.handleMessage({ type: "history", messages: [], highWaterSeq: 1 });
+    w.handleMessage({ type: "agent_message", id: "a3", text: "answer 3", turnId: "t1", seq: 3 });
+    expect(getDifference).toHaveBeenCalledTimes(1);
+    expect(getDifference).toHaveBeenCalledWith(1);
+
+    const instance = w as unknown as { foldDifferenceEvent?: () => void };
+    instance.foldDifferenceEvent = () => {
+      throw new Error("fold blew up");
+    };
+    // The throw escapes THIS call because the test drives `handleMessage`
+    // directly; in production `notifyMessageListeners` swallows it, which is
+    // exactly why the cleanup cannot live after the loop.
+    expect(() =>
+      w.handleMessage({
+        type: "difference",
+        events: [{ seq: 2, event: { kind: "bubble", answerId: "a2", text: "answer 2", turnId: "t1" } }],
+      }),
+    ).toThrow("fold blew up");
+
+    // Nothing folded, so the cursor did NOT move past the failed event…
+    expect(w.lastAppliedSeq).toBe(1);
+    // …and the buffer was drained: the seq-3 frame re-detected the gap and asked
+    // again. THAT is the difference between degrading and wedging.
+    expect(getDifference).toHaveBeenCalledTimes(2);
+    expect(getDifference).toHaveBeenLastCalledWith(1);
+
+    // End to end: with the fold working again, the re-issued request heals the
+    // stream exactly as an ordinary one does.
+    delete instance.foldDifferenceEvent;
+    w.handleMessage({
+      type: "difference",
+      events: [
+        { seq: 2, event: { kind: "bubble", answerId: "a2", text: "answer 2", turnId: "t1" } },
+        { seq: 3, event: { kind: "bubble", answerId: "a3", text: "answer 3", turnId: "t1" } },
+      ],
+    });
+    expect(project(w).map((m) => (m as { text: string }).text)).toEqual([
+      "answer 2", "answer 3",
+    ]);
+    expect(w.lastAppliedSeq).toBe(3);
+    expect(w.differenceInFlight).toBe(false);
+  });
+});

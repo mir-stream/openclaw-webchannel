@@ -189,9 +189,14 @@ export type IngressDedupeCheck = (
  * message's CONTENT, not just its id. Both fields are OPTIONAL because this
  * constraint is deliberately the minimum an item must satisfy — production
  * instantiates it with `WebchannelUserMessage`, whose `text` is a required
- * `string` — and because the wire is decoded with a cast
- * (`JSON.parse(...) as InboundWsMessage` in `nats-channel.ts`), so a peer that
- * omits `text` really does reach this type with it absent.
+ * `string`.
+ *
+ * ⚠️ THE SECOND REASON THIS USED TO GIVE IS GONE: "the wire is decoded with a
+ * cast, so a peer that omits `text` really does reach this type with it absent."
+ * #246 half A replaced that cast with `decodeInboundWsMessage`, which refuses a
+ * `user_message` whose `text` is not a string, so no such item arrives from the
+ * NATS door any more. The optionality stays for the FIRST reason — it is the
+ * minimum this seam requires of any caller, and its tests inject items directly.
  */
 export type IngressDedupeItem = {
   peerId: string;
@@ -596,13 +601,28 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
       const journalGap = (reason: "no-usable-id" | "non-string-text") => {
         if (!deps.deliveryJournal) return;
         // The action is PER REASON. #243 (server-assigned user ids) is the fix
-        // for `no-usable-id` and does not address `non-string-text` at all —
-        // that one needs wire-level validation of `text`, which
-        // `normalizeInboundUserMessage` explicitly declines to do — so pointing
-        // both at #243 would send an operator to an issue that can never close
-        // their line. The throttle CATEGORY is per reason for the same reason:
-        // one shared 60 s window lets whichever reason fires first hide the
-        // other, and the one with no owning issue must not be the hidden one.
+        // for `no-usable-id` and does not address `non-string-text` at all, so
+        // pointing both at #243 would send an operator to an issue that can never
+        // close their line. The throttle CATEGORY is per reason for the same
+        // reason: one shared 60 s window lets whichever reason fires first hide
+        // the other.
+        //
+        // ⚠️ `non-string-text` IS NOW UNREACHABLE FROM THE NATS WIRE, and its
+        // `action=` token is deliberately unchanged. This used to say the reason
+        // "needs wire-level validation of `text`, which
+        // `normalizeInboundUserMessage` explicitly declines to do" — #246 half A
+        // added exactly that validation, at the receive door rather than in the
+        // normalizer (`decodeInboundWsMessage` refuses a `user_message` whose
+        // `text` is not a string). What remains reachable is a DIRECT caller of
+        // this seam that did not come through that door. The emitted token still
+        // reads `no-owning-issue`: it names the OPERATOR's action, it is what
+        // every existing grep and the #123 audit baseline match on, and renaming
+        // a log token is a change with its own blast radius — not a free
+        // side-effect of closing the door.
+        //
+        // `no-usable-id` is UNAFFECTED and stays reachable: the decoder refuses a
+        // PRESENT-but-unusable id, while an ABSENT one is legal on the wire
+        // (older clients send none) and is exactly what produces no dedupe key.
         const idLess = reason === "no-usable-id";
         const action = idLess
           ? "action=live-only-history-gap-issue-243"
@@ -943,10 +963,16 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           // TEXT gap for a message that never ran. (The `no-usable-id` line
           // still fires from the item loop, and correctly so: that item runs
           // even when the batch is refused. Its call site carries the
-          // asymmetry.) A non-string `text` reaches us only from a
-          // non-conforming client — `normalizeInboundUserMessage` copies
-          // `raw.text` unvalidated off a frame decoded with a cast. `append`
-          // would TAKE it (only `user` IDS are validated there), but the shared
+          // asymmetry.) A non-string `text` can no longer reach us THROUGH THE
+          // NATS DOOR at all: #246 half A decodes every inbound frame there and
+          // refuses a `user_message` whose `text` is not a string (the older
+          // reading — "reaches us from a non-conforming client, because
+          // `normalizeInboundUserMessage` copies `raw.text` unvalidated off a
+          // frame decoded with a cast" — described the cast that is gone). The
+          // check stays because this seam has callers that are not that door, and
+          // because what follows is still exactly what would happen if one
+          // arrived: `append` would TAKE it (only `user` IDS are validated
+          // there), but the shared
           // reducer types `user.text` as a `string`, so a row holding one is a
           // durable row no reader can render. Same verdict as an unusable id:
           // admit, do not journal, say so. And the gap is sharper than a plain

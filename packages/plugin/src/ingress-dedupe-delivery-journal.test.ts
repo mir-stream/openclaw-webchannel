@@ -537,10 +537,13 @@ describe("#239 — the inbound accept journals before it acks", () => {
   });
 
   it("admits an item whose text is not a string, does NOT journal it, and warns", async () => {
-    // The other half of the same gap. `normalizeInboundUserMessage` copies
-    // `raw.text` unvalidated off a frame decoded with a cast, so a non-string
-    // genuinely arrives; the shared reducer types `user.text` as `string`, so a
-    // row holding one is a durable row no reader can render.
+    // The other half of the same gap. Since #246 half A a non-string `text`
+    // cannot arrive through the NATS door — `decodeInboundWsMessage` refuses it
+    // — so what this pins is the seam's own behaviour for a caller that did not
+    // come through that door, which is exactly how the item below is injected.
+    // `normalizeInboundUserMessage` still copies `raw.text` as given, and the
+    // shared reducer types `user.text` as `string`, so a row holding one is a
+    // durable row no reader can render.
     const { calls, onFlush } = makeSeam();
     const malformed = item(undefined, "u-1");
     (malformed.message as { text?: unknown }).text = 42;

@@ -1212,10 +1212,12 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         if (!runtimeActive) return;
         if (rawMessage.type !== "user_message") return; // approvals routed below
         // #99: rebuild the frame from its KNOWN wire fields before anything else
-        // touches it. The decode path is a cast (`JSON.parse(...) as
-        // InboundWsMessage`, nats-channel.ts) and its `user_message` case
-        // forwards the object with no field checks, so a peer could attach ANY
-        // property — including `coalescedIds`, which is plugin-internal state
+        // touches it. The door's decoder (#246 half A) refuses a malformed KNOWN
+        // field but passes UNKNOWN ones through untouched — the wire is additive,
+        // so an unrecognised field may belong to a newer peer — and the
+        // `user_message` case forwards the object as it stands. A peer can
+        // therefore still attach ANY property to a well-formed frame — including
+        // `coalescedIds`, which is plugin-internal state
         // meaning "these receipts settle with this turn". Stripping it here is
         // what makes `coalesceUserMessages` its ONLY producer: a peer cannot
         // name ids it never sent, cannot make the settle loop iterate a

@@ -391,12 +391,13 @@ export function journalEventForOutbound(
       // non-empty turnId, non-empty string text. The reason to track it is that
       // both margins are expensive: journaling a frame the client REFUSES puts a
       // message in history that live never rendered (N8, gaining), and refusing
-      // one the client ACCEPTS loses delivered content (N10).
+      // one the client ACCEPTS loses delivered content (N8, losing).
       //
       // The one difference, stated rather than glossed: the client's `!msg.id`
       // is a TRUTHINESS test, so it would accept a truthy NON-STRING id (`7`,
       // `["a"]`), while `isUsableMessageId` requires `typeof === "string"`. That
-      // is deliberate — the wire performs no runtime validation, and a
+      // is deliberate — nothing runtime-validates an OUTBOUND frame (#246
+      // half A decodes the INBOUND doors only, and these frames are ours), and a
       // non-string id fails much later at SQLite bind time — and it is
       // unreachable in practice, since the only producer of these frames is
       // `message-adapter.ts`'s controller passing a minted string. So "the same

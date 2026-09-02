@@ -25,6 +25,9 @@ import {
   unwrapConversationKey,
 } from "./e2e-crypto-browser.js";
 import { importEd25519SeedKey, signNonce } from "./nats-nkey-browser.js";
+// #246 half A: the runtime decoder every decrypted frame passes through before
+// any listener sees it. Zero-dependency and hand-rolled, like this package.
+import { decodeInboundMessage } from "./inbound-wire-decode.js";
 import {
   registerWithPop,
   isTerminalRegisterError,
@@ -252,7 +255,11 @@ export type InboundMessage = {
    * not import the plugin's `HistoryMessage`. It mirrors that TAGGED UNION
    * (#242 half 2) flattened into one optional-field record, so the wrapper's
    * `case "history"` does the discrimination at runtime, where it has to anyway:
-   * these values come off the wire and nothing has validated them.
+   * these values come off the wire and NOTHING HAS VALIDATED THE ROWS. #246
+   * half A's door decoder stops at the frame envelope here — it checks that
+   * `messages` IS an array and nothing about what is in it — deliberately, so
+   * that the row union has exactly one runtime discriminator instead of two
+   * free to disagree.
    *  - `kind` absent  → a chat bubble; `role` is `"user" | "agent"`;
    *  - `kind: "reasoning"` → a completed reasoning burst; NO `role`, and
    *    `turnId` is required.
@@ -1796,15 +1803,58 @@ export class WebChannelNatsClient {
       // (disconnect() → resetSession nulls sessionKey). Bail mid-loop rather than
       // decrypting the rest against a key that no longer belongs to this session.
       if (!this.sessionKey) return;
-      const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
+      const msg = this.openInboundFrame(payload, this.sessionKey);
       if (msg) this.deliverInbound(msg);
     }
   }
 
   /**
-   * Deliver a decrypted inbound frame. P0-7b: an `ack` frame first drains the
+   * #246 half A — the ONE decode door. Decrypt a sealed `.out` payload, then
+   * DECODE it against this build's wire contract; a frame that fails is logged
+   * once and dropped, so nothing downstream (listeners, the wrapper's reducer,
+   * its seq cursor) ever sees a shape it cannot express.
+   *
+   * ⚠️ THIS REPLACED `openMessage(...) as InboundMessage`, AT BOTH DOORS. The
+   * cast was a claim, not a check: `openMessage` returns `unknown` (it can only
+   * promise the envelope decrypted, never what was inside), and `deliverInbound`
+   * forwarded whatever came back to every listener, whatever its type.
+   *
+   * A null return covers both failures on purpose — an undecryptable payload and
+   * a decrypted-but-malformed one are both "drop this frame" to every caller.
+   * Only the SECOND is logged, and the reason is not that the first is harmless:
+   * it is that the first is the door's PRE-EXISTING fail-closed drop and this
+   * slice did not touch it. `openMessage` returns null for anything that is not a
+   * v1 envelope or that fails to decrypt/parse, both callers have always read that
+   * as "drop, never process as plaintext" (the same rule the pre-key buffering in
+   * `handleRaw` states), and it was silent before #246 half A. Adding a line there
+   * would be a separate change with its own volume question — a peer publishing
+   * junk to `.out` would log per frame — so the new diagnostic is scoped to what
+   * the decoder itself refuses.
+   */
+  private openInboundFrame(payload: string, key: Uint8Array): InboundMessage | null {
+    const raw = openMessage(payload, key);
+    if (raw === null) return null;
+    const decoded = decodeInboundMessage(raw);
+    if (decoded.ok) return decoded.message;
+    const failure = decoded.failure;
+    console.warn(
+      `[nats-client] dropping malformed inbound frame: ` +
+        (failure.kind === "unknown-type"
+          ? `unknown type ${JSON.stringify(failure.type)}`
+          : `${failure.type} — ${failure.reason}`),
+    );
+    return null;
+  }
+
+  /**
+   * Deliver a DECODED inbound frame. P0-7b: an `ack` frame first drains the
    * matching ids from the unacked ledger, then (like every other frame) is
    * forwarded to the message listeners — the wrapper reducer consumes it too.
+   *
+   * "Every frame" now means every frame of a KNOWN type whose shape this build
+   * understands: `openInboundFrame` refuses anything else before this runs
+   * (#246 half A). So `msg.ids` below is a string array or absent, which is what
+   * `drainAcked`'s `new Set(ids)` has always assumed and never checked.
    */
   private deliverInbound(msg: InboundMessage): void {
     if (msg.type === "ack") this.drainAcked(msg.ids);
@@ -2227,7 +2277,7 @@ export class WebChannelNatsClient {
         }
         return;
       }
-      const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
+      const msg = this.openInboundFrame(payload, this.sessionKey);
       if (msg) this.deliverInbound(msg);
       return;
     }

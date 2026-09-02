@@ -163,8 +163,9 @@
  * consumer, exactly as `journal-history.ts` does it. Both obvious fixes are still
  * wrong, in the spirit of §0.2:
  *   - `default: return view;`, mirroring `handleFrame`'s ignore-unknown
- *     (the wrapper's `handleFrame` — which has no `default:` either; it returns
- *     `void`, so falling off the end IS its ignore) — REJECTED. That
+ *     (the wrapper's `handleFrame` still has no `default:`; since #246 half A it
+ *     returns `boolean` — "was this frame folded" — so falling off the end is an
+ *     explicit `return false`, and that IS its ignore) — REJECTED. That
  *     faithfulness is about LIVE WIRE FRAMES, where ignoring a frame from a
  *     newer server is right. A JOURNAL REPLAY is the opposite: the store is the
  *     SSOT, so silently dropping rows it does not understand is the server
@@ -183,6 +184,17 @@
  * add a `default` here to silence a reviewer: the absence is deliberate, and this
  * is the reason.
  * (doc `docs/ISSUE_114_DELIVERY_MIRROR_PLAN.md` §0.2 — the NOT-list.)
+ *
+ * ⚠️ #246's RUNTIME WIRE VALIDATION (half A) HAS LANDED AND DELIBERATELY DID NOT
+ * TOUCH THIS SWITCH — so read the ownership line above as naming what is STILL
+ * outstanding, not what has not started. What half A added is a second consumer
+ * -side guard, in the shape this note prescribes: `inbound-wire-decode.ts`'s
+ * `decodeDurableEvent` refuses an out-of-union kind (and a known kind with an
+ * unusable shape) at the client's `get_difference` catch-up door, BEFORE the fold
+ * — the client-side twin of `journal-history.ts`'s `isKnownJournalEvent`, and for
+ * the same reason. It does not make the union expressive: a skipped row is still
+ * a row nothing renders, so "retain + render as unsupported" remains unbuilt and
+ * still needs #241's typed event model to say it.
  *
  * DEPENDENCY CONTRACT: this file is STRICTLY dependency-free and Node-free — it
  * has no imports at all, not even `node:` built-ins. Two reasons: the client

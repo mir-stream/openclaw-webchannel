@@ -31,11 +31,22 @@ export const MAX_COALESCED_MEMBER_ID_LENGTH = 128;
  * everything else — in particular `coalescedIds`, which is plugin-internal
  * state that no peer may supply.
  *
- * The decode path casts rather than validates (`JSON.parse(...) as
- * InboundWsMessage`, `nats-channel.ts`) and its `user_message` case forwards the
- * object untouched, so without this every extra property a peer attaches
- * reaches the turn handler. Applying it at the runtime's message handler makes
- * `coalesceUserMessages` the only producer of a member list.
+ * The `user_message` case forwards the object untouched, so without this every
+ * extra property a peer attaches reaches the turn handler. Applying it at the
+ * runtime's message handler makes `coalesceUserMessages` the only producer of a
+ * member list.
+ *
+ * ⚠️ THE "THE DECODE PATH CASTS RATHER THAN VALIDATES" PREMISE THIS USED TO OPEN
+ * WITH IS NO LONGER TRUE, AND THE FUNCTION IS STILL NEEDED. #246 half A replaced
+ * the `JSON.parse(...) as InboundWsMessage` cast at both of `nats-channel.ts`'s
+ * receive doors with `decodeInboundWsMessage`, so a frame reaching here has a
+ * `text` that IS a string and an `id`/`random_id` that are usable ids or absent.
+ * What that decoder deliberately does NOT do is strip: it refuses malformed
+ * KNOWN fields and passes unknown ones through untouched, because the wire is
+ * additive and an unrecognised field may belong to a newer peer. So the two are
+ * complementary — the decoder decides what is well-formed, this decides what a
+ * peer is allowed to supply at all — and `coalescedIds` still needs dropping
+ * here.
  *
  * It lives here, beside the field's type/producer/reader, so the whole "never
  * from the wire" contract is one file's worth of code; the runtime handler
@@ -50,11 +61,17 @@ export const MAX_COALESCED_MEMBER_ID_LENGTH = 128;
  * random_id dedupe by always falling back to the wire `id`.
  *
  * WHAT THIS DOES NOT DO: it strips fields, it does not validate them. `text` is
- * copied through UNVALIDATED — a missing or non-string `text` reaches
- * `isAbortRequestText` and core exactly as it did before, which is the
- * pre-existing decode contract (the cast in `nats-channel.ts` never checked it
- * either). Do not read the name as a validation boundary; adding one is a
- * separate change with its own blast radius.
+ * copied through as-is — this function asks no question about it — and that is
+ * still the right reading of the name: it is not a validation boundary.
+ *
+ * ⚠️ WHAT CHANGED IS WHERE THE ANSWER COMES FROM, NOT WHAT THIS DOES. The old
+ * text said a missing or non-string `text` "reaches `isAbortRequestText` and core
+ * exactly as it did before"; since #246 half A it cannot arrive from the NATS
+ * wire at all, because `decodeInboundWsMessage` refuses a `user_message` whose
+ * `text` is not a string. The type below still permits one, and this function
+ * still copies whatever it is given — the guarantee belongs to the door, so a
+ * DIRECT caller of this function (the tests, any future non-wire producer) gets
+ * no such promise.
  */
 export function normalizeInboundUserMessage(raw: UserMessageLike): UserMessageLike {
   return {
@@ -69,14 +86,21 @@ export function normalizeInboundUserMessage(raw: UserMessageLike): UserMessageLi
  * Read `coalescedIds` off a message that may NOT be trustworthy, and never
  * throw doing it.
  *
- * The frame this field rides on is decoded with a cast (`JSON.parse(...) as
- * InboundWsMessage` in `nats-channel.ts`) and the `user_message` case forwards
- * it unvalidated, so historically any peer-supplied property survived into the
- * handler. `nats-account-runtime.ts` now strips the frame down to its known
- * wire fields at ingress, which makes `coalesceUserMessages` the field's only
- * producer — this helper is the second layer, so that a future path that
- * forgets to strip degrades to "no members settled beyond the anchor" instead
- * of a thrown turn. Both read sites go through it.
+ * The frame this field rides on used to be decoded with a cast
+ * (`JSON.parse(...) as InboundWsMessage` in `nats-channel.ts`), and the
+ * `user_message` case forwards whatever it gets, so historically any
+ * peer-supplied property survived into the handler. Two layers closed that:
+ * `nats-account-runtime.ts` strips the frame down to its known wire fields at
+ * ingress, which makes `coalesceUserMessages` the field's only producer, and
+ * this helper is the second, so that a future path that forgets to strip
+ * degrades to "no members settled beyond the anchor" instead of a thrown turn.
+ * Both read sites go through it.
+ *
+ * ⚠️ #246 half A ADDED A RUNTIME DECODER AT THE DOOR, AND IT DOES NOT REPLACE
+ * EITHER LAYER. `decodeInboundWsMessage` refuses malformed KNOWN fields and
+ * passes UNKNOWN ones through untouched (the wire is additive), so a peer can
+ * still attach `coalescedIds` to a perfectly well-formed `user_message`.
+ * Stripping remains the only thing that stops it.
  *
  * Hostile shapes and what they become:
  *  - not an array (`5`, `"abc"`, an object) → `[]`. A bare `for…of` over `5`

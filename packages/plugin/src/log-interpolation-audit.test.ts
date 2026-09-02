@@ -283,7 +283,22 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   "auth.ts": { statements: 16, interpolations: 5 },
   // #244 half B added the `Invalid get_difference` guard warn (one statement,
   // one `logSafe(peerId)` interpolation): 22→23 statements, 33→34 interpolations.
-  "nats-channel.ts": { statements: 23, interpolations: 34 },
+  //
+  // #246 half A moved inbound validation to the receive door and left ONE warn
+  // helper (`warnRefusedInbound`) where `dispatchInbound` had three guards.
+  // 23→22 statements and 34→35 interpolations, accounted exactly:
+  //   REMOVED (3 statements, 3 interpolations) — `Invalid approval_decision from `
+  //     and `Invalid get_difference from ` (one `logSafe(peerId)` each) and the
+  //     `default:`'s `Unknown message type: ` (one `logSafe(…type)`);
+  //   ADDED (2 statements, 4 interpolations) — the helper's unknown-type line
+  //     (`logSafe(failure.type)`) and its invalid-fields line (`failure.type`
+  //     raw, `logSafe(peerId)`, `logSafe(failure.reason)`).
+  // The one raw value is the five-literal `KnownInboundWsType`, allowlisted with
+  // its reason in `ALLOWED_RAW_INTERPOLATIONS` rather than banked here as debt —
+  // both PREFIXES are unchanged (the invalid-fields line gained a `: <reason>`
+  // suffix), which is what keeps the existing greps and the
+  // `nats-channel-typing.test.ts` assertions matching.
+  "nats-channel.ts": { statements: 22, interpolations: 35 },
   // ⚠️ ZERO, AND THE ENTRY STAYS — BUT IT GUARANTEES LESS THAN IT LOOKS LIKE.
   // #240 half 2 deleted the whole core-transcript reader out of `history.ts`
   // (the shape-drift warn, the two cursor-miss warns and the two best-effort

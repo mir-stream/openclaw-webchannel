@@ -29,6 +29,11 @@ import type { CommandCatalogEntry } from "./commands-catalog.js";
 import { createIngressResultChunkWriter } from "./ingress-result-chunks.js";
 import type { IngressResultFrame } from "./ingress-result-chunks.js";
 import { logSafe } from "./log-safe.js";
+// #246 half A: the runtime decoder both receive doors run before anything acts on
+// a frame. Pure and dependency-light (types + one shared length bound), so it adds
+// no runtime dependency of its own.
+import { decodeInboundWsMessage } from "./inbound-wire-decode.js";
+import type { InboundWsDecodeFailure } from "./inbound-wire-decode.js";
 /**
  * v6 delivery journal (#239). TYPE-ONLY on purpose — the store resolves
  * `node:sqlite` lazily and this import is erased, so `nats-channel.ts` keeps
@@ -1402,9 +1407,19 @@ export class NatsChannel implements WebChannelPeerChannel {
     }
 
     // Plaintext mode (legacy / gateway-parity): payload is JSON.
+    //
+    // ⚠️ THE `try` STILL WRAPS THE DISPATCH, NOT JUST THE PARSE, AND THAT IS
+    // PRE-EXISTING BEHAVIOUR THIS SLICE DELIBERATELY LEFT ALONE: a handler that
+    // throws is reported on the line below rather than escaping into the
+    // transport's `message` emit. #246 half A only inserts the decode between
+    // the two.
     try {
-      const message = JSON.parse(msg.payload.toString()) as InboundWsMessage;
-      this.dispatchInbound(peerId, message);
+      const decoded = decodeInboundWsMessage(JSON.parse(msg.payload.toString()) as unknown);
+      if (!decoded.ok) {
+        this.warnRefusedInbound(peerId, decoded.failure);
+        return;
+      }
+      this.dispatchInbound(peerId, decoded.message);
     } catch (err) {
       console.error(
         `[nats-channel] Failed to parse message from ${logSafe(peerId)}: ${logSafe(formatCaughtDiagnostic(err))}`,
@@ -1485,12 +1500,16 @@ export class NatsChannel implements WebChannelPeerChannel {
       );
       return;
     }
-    let message: InboundWsMessage;
+    // #246 half A: `openEnvelope` returns the decrypted payload as `unknown` and
+    // this used to cast it straight to `InboundWsMessage`. It is decoded below
+    // instead — the cast was the second of the two doors that let an arbitrary
+    // JSON value reach `dispatchInbound`.
+    let raw: unknown;
     let messageId: string;
     let ts: number;
     try {
       const opened = openEnvelope(msg.payload, key);
-      message = opened.message as InboundWsMessage;
+      raw = opened.message;
       messageId = opened.routing.messageId;
       ts = opened.routing.ts;
     } catch (err) {
@@ -1503,10 +1522,41 @@ export class NatsChannel implements WebChannelPeerChannel {
     // relay can neither forge nor mutate them — a replay is a byte-identical
     // re-publish. Enforce freshness BEFORE dispatch so a captured frame can't
     // re-run the turn.
+    //
+    // ⚠️ FRESHNESS RUNS BEFORE THE DECODE, DELIBERATELY. The gate is not a
+    // filter, it RECORDS: it inserts `messageId` into the per-peer replay LRU.
+    // Decoding first would drop a malformed frame before its id was recorded, so
+    // a later byte-identical re-publish of that same frame would look fresh.
     if (!this.acceptFreshInbound(peerId, messageId, ts)) {
       return;
     }
-    this.dispatchInbound(peerId, message);
+    const decoded = decodeInboundWsMessage(raw);
+    if (!decoded.ok) {
+      this.warnRefusedInbound(peerId, decoded.failure);
+      return;
+    }
+    this.dispatchInbound(peerId, decoded.message);
+  }
+
+  /**
+   * #246 half A — the ONE log line a refused inbound frame produces, at either
+   * door. Exactly one warn per dropped frame, and never the frame's body: an
+   * `unknown-type` failure carries the peer's raw `type` (wrapped), and every
+   * other failure carries a KNOWN type plus a reason string this codebase owns.
+   *
+   * The two texts are the ones that were already here — `dispatchInbound`'s
+   * `default:` emitted the first and its `approval_decision`/`get_difference`
+   * guards emitted the second — so an operator's greps and the tests that pin
+   * them keep matching after the validation moved to the door.
+   */
+  private warnRefusedInbound(peerId: string, failure: InboundWsDecodeFailure): void {
+    if (failure.kind === "unknown-type") {
+      console.warn(`[nats-channel] Unknown message type: ${logSafe(failure.type)}`);
+      return;
+    }
+    console.warn(
+      `[nats-channel] Invalid ${failure.type} from ${logSafe(peerId)}: ${logSafe(failure.reason)}`,
+    );
   }
 
   /**
@@ -1554,7 +1604,30 @@ export class NatsChannel implements WebChannelPeerChannel {
     return true;
   }
 
-  /** Route a decoded inbound message to the registered handler. */
+  /**
+   * Route a DECODED inbound message to the registered handler.
+   *
+   * ⚠️ PURE ROUTING SINCE #246 half A — every frame reaching this method has
+   * already passed `decodeInboundWsMessage` at the door it came through, so this
+   * is not a validation seam and must not grow back into one. The
+   * `approval_decision` and `get_difference` guards that used to live here are
+   * the decoder's `case`s now, unchanged in effect; keeping a copy here would be
+   * a second schema free to disagree with the first.
+   *
+   * There is likewise no `default:` any more: an unknown `type` never gets past
+   * the decoder, and the `Unknown message type` warn it used to emit is now on
+   * `warnRefusedInbound`.
+   *
+   * ⚠️ THAT DOES NOT MAKE THIS SWITCH tsc-EXHAUSTIVE, AND DO NOT WRITE THAT IT
+   * DOES. This method returns `void`, so a `switch` missing a union member
+   * compiles clean and silently routes nothing. What IS checked at compile time
+   * is one step earlier: `inbound-wire-decode.ts`'s `KnownInboundWsTypesAreExact`
+   * fails tsc if `InboundWsMessage` grows a member the decoder does not list, and
+   * the decoder's own switch RETURNS a value so a missing `case` there cannot
+   * compile. A new member therefore cannot reach this method unrouted without
+   * someone having edited the decoder — but adding the `case` here is still a
+   * manual step.
+   */
   private dispatchInbound(peerId: string, message: InboundWsMessage): void {
     switch (message.type) {
       case "user_message":
@@ -1562,20 +1635,14 @@ export class NatsChannel implements WebChannelPeerChannel {
         break;
 
       case "approval_decision":
-        if (
-          typeof message.id !== "string" ||
-          !(["allow-once", "allow-always", "deny"] as const).includes(message.decision)
-        ) {
-          console.warn(`[nats-channel] Invalid approval_decision from ${logSafe(peerId)}`);
-          break;
-        }
         this.onApprovalDecision?.(peerId, message.id, message.decision);
         break;
 
       case "load_history":
-        // Forwarded UNVALIDATED, as `before`/`limit` always were —
-        // `planHistoryFetch` is the one validator on this path and
-        // `historyPageBefore` treats a non-matching pair as an honest miss.
+        // Shape-checked at the door; the CURSOR SEMANTICS are still owned
+        // downstream — `planHistoryFetch` is the one validator for what
+        // `before`/`beforeTurnId`/`limit` MEAN, and `historyPageBefore` answers a
+        // non-matching pair with an honest empty page rather than an error.
         this.onLoadHistory?.(peerId, {
           before: message.before,
           beforeTurnId: message.beforeTurnId,
@@ -1584,30 +1651,16 @@ export class NatsChannel implements WebChannelPeerChannel {
         break;
 
       case "get_difference":
-        // #244 half B. VALIDATED here, unlike `load_history` (whose validator is
-        // `planHistoryFetch` downstream): the serve path passes `afterSeq`
-        // straight to `delivery-journal.read`, which requires a non-negative
-        // integer, and the wire is peer-controlled and validates nothing. A
-        // malformed request is dropped rather than reflected as a fault.
-        if (
-          typeof message.afterSeq !== "number" ||
-          !Number.isInteger(message.afterSeq) ||
-          message.afterSeq < 0
-        ) {
-          console.warn(`[nats-channel] Invalid get_difference from ${logSafe(peerId)}`);
-          break;
-        }
+        // #244 half B: the serve path passes `afterSeq` straight to
+        // `delivery-journal.read`, which requires a non-negative integer. That
+        // check now runs at the door (#246 half A), which is why nothing is
+        // repeated here.
         this.onGetDifference?.(peerId, message.afterSeq);
         break;
 
       case "load_commands":
         this.onLoadCommands?.(peerId);
         break;
-
-      default:
-        console.warn(
-          `[nats-channel] Unknown message type: ${logSafe((message as { type: string }).type)}`,
-        );
     }
   }
 }

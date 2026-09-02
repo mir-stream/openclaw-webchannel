@@ -351,11 +351,12 @@ describe("coalesceUserMessages", () => {
     });
 
     /**
-     * Hostile shapes. `coalescedIds` used to be reachable from the wire (the
-     * decode path casts instead of validating), and a throw here is NOT a safe
-     * failure: `startTurn` catches it with `maybeForget(); return;`, so the
-     * whole turn is discarded — ACKed, never run, never answered, never settled.
-     * Strictly worse than the bug #99 fixes.
+     * Hostile shapes. `coalescedIds` is reachable from the wire — #246 half A's
+     * door decoder validates the KNOWN fields of a `user_message` and passes
+     * unknown ones through, so an attached member list still arrives — and a
+     * throw here is NOT a safe failure: `startTurn` catches it with
+     * `maybeForget(); return;`, so the whole turn is discarded — ACKed, never
+     * run, never answered, never settled. Strictly worse than the bug #99 fixes.
      */
     describe("#99 hostile `coalescedIds` shapes never throw", () => {
       const hostile: Array<[string, unknown]> = [
