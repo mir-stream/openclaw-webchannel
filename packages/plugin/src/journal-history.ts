@@ -961,10 +961,23 @@ function recordFirstSeen(
       note(event.id);
       return;
     case "approval":
-      // #242 half 4. The card's moment is when the PROMPT WAS SHOWN, not when it
-      // was decided — first-write-wins gives exactly that, because the request
-      // row always precedes its resolution in this stream (both frames leave
-      // through the one `sendToPeer` funnel).
+      // #242 half 4. First-write-wins dates the card by ITS OWN FIRST ROW, which
+      // is the request row (the resolution introduces no message — see the arm
+      // below). The pairing that guarantees the request row comes first, and its
+      // one exception, are stated once at `approvals.ts`'s `updateEntry` (THE
+      // APPROVAL PAIR RULE).
+      //
+      // ⚠️ THAT IS NOT ALWAYS "WHEN THE PROMPT WAS SHOWN", AND THIS COMMENT USED
+      // TO SAY IT WAS. When the request row is CAUGHT UP at resolution time —
+      // the card was raised while its account had no live channel, so delivery
+      // had nowhere to write — the row is minted then, so it is dated and
+      // ORDERED by the decision rather than by the prompt. Two agent messages
+      // delivered while such a card was open take the earlier seqs, and history
+      // renders the card below them, where live (the client's `approval_snapshot`
+      // leg) placed it at register time. Live ≠ history in ORDER on that path,
+      // disclosed in both CHANGELOGs and at the mapper's `approval_snapshot`
+      // case; it is not repairable here, because reordering rows by a timestamp
+      // the store does not have is the server-side invention this module forbids.
       note(event.id);
       return;
     case "approvalResolution":

@@ -46,6 +46,67 @@
 
 ### Fixed
 
+- **Approval frames are journaled at the moment the plugin records them, not at
+  publish (#341, extends #304).** `approval_request`/`approval_resolved` were
+  appended inside `sendToPeer`, below its disposed/transport-down/no-session-key
+  refusals, so a refused prompt got no `approval` row while `deliverPending` had
+  already written the pending record and the register-time `approval_snapshot`
+  re-delivered the card live. The user decided, the `approvalResolution` row
+  landed with no `approval` row to fold onto, and history showed neither (N8/N3).
+  The append moved up to `NatsChannel.publishApprovalFrame`, which runs above the
+  refusals and stamps the row's `seq` onto the frame it then publishes;
+  `sendToPeer` skips those two types so no row is written twice, and
+  `deliverPending` passes `{ redelivery }` so a re-armed card is not journaled
+  again (approval rows carry no `message_id`, so nothing downstream would dedupe
+  them — #355). The exception is scoped to these two frame types: an approval's
+  state exists server-side whether or not the push lands and its id is core's,
+  stable across attempts, neither of which holds for the reasoning residual
+  (#304).
+
+  **An account with no live channel has no journal either, and that state is
+  TRANSIENT** — `nats-account-runtime.ts` deletes the runtime on stop and
+  re-adds it on the next start, so an approval can be delivered with no channel
+  and resolved (or expired) with one. Journaling the resolution there would
+  reproduce the original orphan, so the invariant is stated as a producer rule
+  and enforced at both legs: *a resolution row is journaled only once its request
+  row exists.* `deliverPending` records on the pending entry whether the row was
+  actually written (`sendApprovalRequest` now returns `{ delivered, journaled }`
+  — a refused push journals, a swallowed append does not), and `updateEntry`
+  hands the card's payload to `sendApprovalResolved` as `journalRequestFirst`
+  when it is still owed. The channel writes the request row first and the
+  resolution second; if the request row cannot be written, neither is. The rule
+  and its one exception — a pending record already evicted, where the verdict is
+  journaled alone and the reducer's no-op is the fallback — are stated once, at
+  `approvals.ts`'s `updateEntry`; every other site points there rather than
+  restating them.
+
+  Two supporting changes fall out of that. `listPendingApprovalsForPeer` now
+  WITHHOLDS an expired card from the snapshot instead of deleting its record —
+  deletion is left to the cap and the abandonment backstop (which now covers both
+  entry shapes, one grace period after a finalize was due) — because it runs for
+  every registering peer and was routinely destroying the payload the expiry
+  finalize still needed to write the card's row. And `requestJournaled` is now
+  enforced as peer-scoped on the READ side as well as the write: the journal's
+  conversation id is the peerId, so a row written for one peer does not satisfy
+  another peer's resolution.
+
+  **Disclosed N8-gaining direction.** The journal keeps a card forever while
+  `approval_snapshot` replays only what is still pending, so a card created while
+  the peer was disconnected, never pushed, and then EXPIRED before it returned is
+  served by `projectJournalHistory` with the denial-equivalent verdict
+  `buildExpiredResult` produced — history showing a decision live never showed.
+  That is the Telegram-server model working as intended (the server created the
+  service message and recorded its outcome; the device missed the window), and it
+  is accepted knowingly rather than overlooked.
+
+  The same applies to ORDER on the catch-up path: a card whose `approval` row is
+  minted at resolution time takes a seq from that moment, so
+  `projectJournalHistory` places it after anything delivered while it was open,
+  where the client's `approval_snapshot` leg placed it at register time. Same
+  card, later slot. Repairing it would mean reordering rows on a timestamp the
+  store does not have — the server-side invention N8 forbids — so it is disclosed
+  rather than fixed.
+
 - **A K>=2 count shortfall no longer routes buffered finals onto lanes (#340,
   extends #260).** `flushBufferedOrdinaryFinals` used to fall back to
   `materializedAnswerLanes()` when the finals and the streamed lanes disagreed in

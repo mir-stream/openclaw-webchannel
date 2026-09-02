@@ -1567,9 +1567,12 @@ describe("live == history for approvals: what the plugin serves (#242 half 4)", 
   it("a resolution naming a card the journal does not hold changes nothing", () => {
     // `applyApprovalResolution` no-ops rather than appending a contentless card
     // built from an id and a verdict — that would be the server INVENTING a
-    // message (N8). Unreachable in a full replay (both frames ride the one
-    // `sendToPeer` funnel, so the request row always precedes), and pinned here
-    // because the alternative is the tempting one.
+    // message (N8). #341 made the producer refuse to journal a verdict whose card
+    // it cannot store — see THE APPROVAL PAIR RULE at `approvals.ts`'s
+    // `updateEntry` for the rule and the one case that still reaches this arm, so
+    // read the no-op as a LIVE FALLBACK rather than dead code. Pinned here
+    // because the alternative — inventing a card from an id and a verdict — is
+    // the tempting one.
     const orphan = journalEventForOutbound({
       type: "approval_resolved",
       id: "never-requested",

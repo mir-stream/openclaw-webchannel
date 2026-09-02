@@ -186,8 +186,11 @@ function recordApprovalAccount(approvalId: string, accountId: string | null | un
  * Bounded (evict oldest) exactly like `deliveredApprovalAccounts`: approvals are
  * agent-minted (a browser cannot forge one), so the cap is a backstop against an
  * abandoned entry whose finalize never ran, not a client-reachable growth
- * vector. Entries are erased at finalize (`updateEntry`) and lazily pruned on
- * read (past-`expiresAtMs`, or no-`expiresAtMs` older than the max age).
+ * vector. Entries are erased at finalize (`updateEntry`), or deleted by the
+ * abandonment backstop on read — `PENDING_APPROVAL_MAX_AGE_MS` after a finalize
+ * was DUE (`expiresAtMs` when set, else `deliveredAtMs`). A past-`expiresAtMs`
+ * entry is WITHHELD from listings but kept (#341: `updateEntry` still needs its
+ * payload to write the request row).
  */
 export const PENDING_APPROVAL_MAX_AGE_MS = 60 * 60 * 1000; // 60 min
 export const PENDING_APPROVAL_CAP = 512;
@@ -201,6 +204,24 @@ type PendingApprovalEntry = {
   accountKey: string;
   /** `Date.now()` at delivery — the max-age prune uses it for no-`expiresAtMs` entries. */
   deliveredAtMs: number;
+  /**
+   * #341: has this card's durable `approval` row been written yet? It is the one
+   * fact the resolution leg cannot re-derive, and it lives HERE rather than on the
+   * `ClawApprovalEntry` core hands back, for two reasons: a re-delivery builds a
+   * FRESH runtime entry (so a flag there would be reset by the very retry that
+   * must not re-journal), and `updateEntry` already reads this record for the
+   * payload it needs to write the row late.
+   *
+   * ⚠️ SCOPED TO THIS ENTRY'S `sessionKey`, and `recordPendingApproval` RESETS it
+   * when a delivery arrives for a different peer. The row is keyed by peerId (the
+   * journal's conversation id) while this map is keyed by (account, approvalId),
+   * so "already journaled" is only true of the conversation it was journaled in.
+   * Today at most one peer per (account, approvalId) is reachable — the webchannel
+   * capability passes no `resolveApproverDmTargets`, so core plans a single target
+   * — but core's fan-out plan dedupes per `sessionKey` and could hand us two, and
+   * the second peer's conversation genuinely needs its own row.
+   */
+  requestJournaled: boolean;
 };
 
 const pendingApprovals = new Map<string, PendingApprovalEntry>();
@@ -209,14 +230,32 @@ function pendingApprovalKey(accountId: string | null | undefined, approvalId: st
   return `${bindingAccountKey(accountId)}${PENDING_APPROVAL_KEY_SEP}${approvalId}`;
 }
 
-/** Record (or refresh) a pending approval; bounded, evicts oldest at the cap. */
+/**
+ * Record (or refresh) a pending approval; bounded, evicts oldest at the cap.
+ *
+ * Returns the entry's `requestJournaled` state AS IT STOOD BEFORE this call — i.e.
+ * "does a durable `approval` row for this card already exist in this peer's
+ * conversation". #341 gates the journal on it rather than on "is this a new
+ * record", and the difference matters: a first delivery whose append was
+ * SWALLOWED (§15.8) leaves a record with no row, and the next re-delivery must
+ * write it rather than skip it as a duplicate. Nothing downstream can dedupe
+ * approval rows for us — `delivery-journal.ts`'s `extractMessageId` has no
+ * `approval` arm, so they carry a null `message_id` and no unique index sees them
+ * (#355).
+ */
 function recordPendingApproval(
   accountId: string | null | undefined,
   payload: ApprovalRequestPayload,
   sessionKey: string,
   deliveredAtMs: number,
-): void {
+): boolean {
   const key = pendingApprovalKey(accountId, payload.id);
+  // Read BEFORE the delete-then-set below, which would erase the very state this
+  // returns. A record for a DIFFERENT peer carries no claim about this one's
+  // conversation, so it reads as not-journaled (see the field's docblock).
+  const previous = pendingApprovals.get(key);
+  const requestJournaled =
+    previous !== undefined && previous.sessionKey === sessionKey && previous.requestJournaled;
   // Insertion-ordered Map: delete-then-set moves a repeat delivery to the newest
   // slot so a re-delivery refreshes rather than dupes (and never evicts itself).
   pendingApprovals.delete(key);
@@ -244,7 +283,36 @@ function recordPendingApproval(
     sessionKey,
     accountKey: bindingAccountKey(accountId),
     deliveredAtMs,
+    requestJournaled,
   });
+  return requestJournaled;
+}
+
+/**
+ * #341: note that this card's durable `approval` row now exists, so neither a
+ * re-delivery nor the resolution leg writes a second one. No-op if the record is
+ * already gone (finalized/evicted between the send and this call) — the flag only
+ * ever suppresses a duplicate write, so losing it is the safe direction.
+ */
+function markPendingApprovalJournaled(
+  accountId: string | null | undefined,
+  approvalId: string,
+): void {
+  const entry = pendingApprovals.get(pendingApprovalKey(accountId, approvalId));
+  if (entry) entry.requestJournaled = true;
+}
+
+/**
+ * #341: read this account's pending record without disturbing it. `updateEntry`
+ * needs BOTH of its fields before it erases the record — the payload, to write a
+ * durable `approval` row that delivery could not write, and `requestJournaled`, to
+ * know whether it has to.
+ */
+function readPendingApproval(
+  accountId: string | null | undefined,
+  approvalId: string,
+): PendingApprovalEntry | undefined {
+  return pendingApprovals.get(pendingApprovalKey(accountId, approvalId));
 }
 
 /** Erase this account's pending record for an approval (called at finalize). */
@@ -254,12 +322,28 @@ function deletePendingApproval(accountId: string | null | undefined, approvalId:
 
 /**
  * List the approvals STILL PENDING for a specific (account, peer) — the payload
- * set the register-time `approval_snapshot` carries. Lazy-prunes on read:
- * an entry whose `expiresAtMs` is in the past (defense in depth — the runtime's
- * expiry path normally erases it via `updateEntry`), and an entry WITHOUT an
- * `expiresAtMs` older than `PENDING_APPROVAL_MAX_AGE_MS`, so an orphan whose
- * finalize never fired (e.g. the approval monitor was disposed on channel stop)
- * can never be re-delivered as an actionable zombie card forever.
+ * set the register-time `approval_snapshot` carries.
+ *
+ * ⚠️ EXPIRY HIDES AN ENTRY FROM THE LISTING; ONLY THE ABANDONMENT BACKSTOP
+ * DELETES ONE. The two used to be the same branch, and collapsing them cost
+ * #341 its invariant on a third path (round 2 shipped with it). This function
+ * runs for EVERY registering peer of EVERY account, so the old code deleted any
+ * past-`expiresAtMs` record the moment anyone registered — including one whose
+ * durable `approval` row is still OWED (raised while the account had no channel,
+ * so `deliverPending` had nowhere to write). Core's expiry finalize is a timer,
+ * and a poll-phase register callback runs before a due timer under load, so the
+ * record was routinely gone by the time `updateEntry` needed its payload to
+ * write that row — leaving the lone `approvalResolution` this slice exists to
+ * prevent. The record now survives until `updateEntry` clears it — or until the
+ * cap or the backstop below deletes it, the two paths the pair rule's exception
+ * names.
+ *
+ * The backstop that ACTUALLY frees memory is unchanged in purpose and now covers
+ * both shapes: an entry is deleted `PENDING_APPROVAL_MAX_AGE_MS` after the
+ * moment its finalize should have run (its expiry, or its delivery when it has
+ * none), so an orphan whose finalize never fired — the approval monitor disposed
+ * on channel stop — can never be re-delivered as an actionable zombie card
+ * forever, and cannot accumulate either.
  */
 export function listPendingApprovalsForPeer(
   accountId: string | null | undefined,
@@ -271,23 +355,34 @@ export function listPendingApprovalsForPeer(
   for (const [key, entry] of pendingApprovals) {
     const expiresAtMs = entry.payload.expiresAtMs;
     const expired = typeof expiresAtMs === "number" && expiresAtMs <= now;
-    const tooOld =
-      expiresAtMs === undefined && now - entry.deliveredAtMs > PENDING_APPROVAL_MAX_AGE_MS;
-    if (expired || tooOld) {
-      // A no-expiry entry pruned by the max-age backstop is an ORPHAN whose
-      // finalize hook never fired (e.g. the approval monitor was disposed on
-      // channel stop). Warn so a systematic finalize leak is visible — an
-      // expiry-driven prune is routine and stays quiet.
-      if (tooOld) {
-        console.warn(
-          `[webchannel] pending-approval ${logSafe(entry.payload.id)} (account ${logSafe(entry.accountKey)}, ` +
-            `peer ${logSafe(entry.sessionKey)}) pruned after ${PENDING_APPROVAL_MAX_AGE_MS}ms with no ` +
-            `finalize — likely an orphaned approval (monitor disposed?)`,
-        );
-      }
+    // The moment a finalize was due, plus the grace period. For a card with an
+    // expiry that is its expiry (core fires the expiry finalize then); for one
+    // without, its delivery, exactly as before.
+    const finalizeDueAtMs = typeof expiresAtMs === "number" ? expiresAtMs : entry.deliveredAtMs;
+    const abandoned = now - finalizeDueAtMs > PENDING_APPROVAL_MAX_AGE_MS;
+    if (abandoned) {
+      // Reaching here means no finalize ran for a full grace period after one was
+      // due, whether or not the card had an expiry — an ORPHAN either way (e.g.
+      // the approval monitor was disposed on channel stop), so both shapes warn.
+      // The old "an expiry-driven prune is routine and stays quiet" no longer
+      // applies: routine expiry no longer deletes anything here.
+      // ⚠️ This delete does not consult `requestJournaled`: a record still OWING
+      // its row whose finalize is more than a grace period late is deleted too,
+      // and that finalize then journals a lone verdict — the backstop's
+      // late-finalize shape, one of the TWO deletion paths (cap, backstop) the
+      // pair rule's exception names. Narrower than deleting at expiry, not closed.
+      console.warn(
+        `[webchannel] pending-approval ${logSafe(entry.payload.id)} (account ${logSafe(entry.accountKey)}, ` +
+          `peer ${logSafe(entry.sessionKey)}) pruned after ${PENDING_APPROVAL_MAX_AGE_MS}ms with no ` +
+          `finalize — likely an orphaned approval (monitor disposed?)`,
+      );
       pendingApprovals.delete(key);
       continue;
     }
+    // Past its expiry: withheld from the snapshot (the client must never be
+    // handed an expired card as actionable) but KEPT, because `updateEntry` may
+    // still owe this card its durable row. Deliberately not a delete.
+    if (expired) continue;
     if (entry.accountKey === accountKey && entry.sessionKey === sessionKey) {
       result.push(entry.payload);
     }
@@ -830,11 +925,42 @@ export function createClawApprovalNativeRuntimeSpec(
         // socket" drop below too. A prompt that could not be delivered live thus
         // becomes recoverable on the peer's next register (its register-time
         // `approval_snapshot`) instead of being permanently lost.
-        recordPendingApproval(accountId, pendingPayload, sessionKey, Date.now());
+        //
+        // Since #341 the snapshot is no longer the SOLE carrier of such a card
+        // whenever a channel exists: the send below journals the durable
+        // `approval` row on the refused paths too, so history holds it. When no
+        // channel exists at all there is no journal either, and the resolution leg
+        // writes the row late (see `updateEntry`). The record here is what makes
+        // the card actionable again on the next register, and it is where the
+        // "row already written?" bit lives.
+        const requestJournaled = recordPendingApproval(
+          accountId,
+          pendingPayload,
+          sessionKey,
+          Date.now(),
+        );
         const channel = transportFor(accountId);
         if (!channel) {
           // F2 fail-closed: no live channel for this account (skipped/unknown).
           // Refuse to misroute onto the primary channel; drop with a warn.
+          //
+          // ⚠️ THIS BRANCH WRITES NO DURABLE ROW *YET*, AND THE DELAY IS THE
+          // DESIGN. The delivery journal is opened per account by
+          // `nats-account-runtime.ts` and handed to that account's channel, so
+          // "no live channel for this account" means "no journal for this
+          // account" — there is nowhere to write. Journaling onto the
+          // closure/primary channel instead would file one account's card in
+          // another account's history, which is worse than waiting.
+          //
+          // It does NOT leave the card unstorable, which is what round 1 of #341
+          // assumed. This state is TRANSIENT: the runtime map is deleted and
+          // re-populated across a restart/reconnect, so the account is usually
+          // back by the time the card is resolved (the snapshot re-armed it live
+          // on the peer's next register, or it simply expired). `updateEntry`
+          // therefore writes this row LATE, from the pending payload recorded
+          // above, immediately before the resolution's — see the
+          // `journalRequestFirst` argument there. `requestJournaled` stays false
+          // here precisely so that leg knows it still owes the row.
           console.warn(
             `[webchannel] approval ${logSafe(pendingPayload.id)} not delivered: no live channel for ` +
               `account ${logSafe(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)} (skipped or unknown) — refusing to misroute`,
@@ -847,8 +973,22 @@ export function createClawApprovalNativeRuntimeSpec(
         // disconnected between the request and the prompt). The frame is
         // correctly not delivered, and that is otherwise invisible, so log it
         // (no logger in scope here; match the `[webchannel]` console style).
-        const delivered = channel.sendApprovalRequest(sessionKey, pendingPayload);
-        if (!delivered) {
+        //
+        // #341: the channel journals the `approval` row ABOVE its refusals, so
+        // this call persists the card whether or not the push lands — and
+        // `redelivery` tells it whether a row for this peer's conversation
+        // already exists, which only the pending store knows. That keeps the
+        // durable row and the pending record one act: the state is stored when it
+        // is created, delivery is a separate attempt
+        // (`nats-channel.ts`'s `publishApprovalFrame`).
+        const sent = channel.sendApprovalRequest(sessionKey, pendingPayload, {
+          redelivery: requestJournaled,
+        });
+        // Note it only when the append actually landed. A swallowed one (§15.8)
+        // leaves the flag false, so the next re-delivery writes the row, and
+        // failing that the resolution leg does.
+        if (sent.journaled) markPendingApprovalJournaled(accountId, pendingPayload.id);
+        if (!sent.delivered) {
           console.warn(
             `[webchannel] approval ${logSafe(pendingPayload.id)} not delivered: no matching open ` +
               `socket for ${logSafe(sessionKey)} (account ${logSafe(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)})`,
@@ -864,6 +1004,13 @@ export function createClawApprovalNativeRuntimeSpec(
         // Finalize is terminal for this approval — release the id→account
         // binding (resolved AND expired both route here).
         deliveredApprovalAccounts.delete(entry.approvalId);
+        // #341: READ BEFORE THE ERASE BELOW. If delivery could not write this
+        // card's durable `approval` row — no channel for the account then, or a
+        // swallowed append — the resolution leg has to write it, and the payload
+        // it needs lives only in this record. The erase must stay where it is (it
+        // has to run even when the resolve frame cannot be sent), so the read
+        // moves above it rather than the erase moving down.
+        const pending = readPendingApproval(accountId ?? entry.accountId, entry.approvalId);
         // #15: drop THIS handler's account-scoped pending record, so a later
         // register no longer re-delivers a finalized card. Placed next to the
         // binding delete — BEFORE the channel-resolution early return — so the
@@ -886,16 +1033,80 @@ export function createClawApprovalNativeRuntimeSpec(
         );
         const channel = transportFor(accountId ?? entry.accountId);
         if (!channel) {
+          // Same shape as `deliverPending`'s F2 branch: no channel for this
+          // account means no journal for it either, so the verdict lives only in
+          // the resolved store above until the snapshot carries it. Nothing is
+          // journaled here — and if the card's request row was never written
+          // either, that is the RIGHT outcome, not a second gap: a resolution row
+          // alone is the orphan, so history correctly holds neither rather than
+          // half of a card.
           console.warn(
             `[webchannel] approval ${logSafe(entry.approvalId)} resolve frame dropped: no live channel ` +
               `for account ${logSafe(accountId ?? entry.accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)}`,
           );
           return;
         }
+        // ┌───────────────────────────────────────────────────────────────────┐
+        // │ THE APPROVAL PAIR RULE (#341) — THE ONE STATEMENT OF IT.          │
+        // └───────────────────────────────────────────────────────────────────┘
+        //
+        // ⚠️ EVERY OTHER SITE POINTS HERE INSTEAD OF RESTATING IT. Round 2 stated
+        // it in seven places, absolutely, while the producer had a documented
+        // exception; a rule that is re-derived per site is a rule that goes stale
+        // per site. If you need to change it, change it here and leave the
+        // pointers alone.
+        //
+        //   A durable `approvalResolution` row is journaled ONLY once this card's
+        //   `approval` row exists — written at delivery when the account had a
+        //   live channel (above the transport's refusals, so a refused push still
+        //   stores the card), otherwise written HERE, immediately before the
+        //   verdict. If the card cannot be stored, the verdict is not stored
+        //   either.
+        //
+        //   THE ONE EXCEPTION: when the pending record is already gone, this leg
+        //   cannot tell whether the row was written and has no payload to write
+        //   one, so it journals the verdict ALONE. That is deliberate — it is the
+        //   `pending !== undefined` term of `requestRowOwed` below — and it is why
+        //   the consumer-side
+        //   no-op in `durable-view-reducer.ts`'s `applyApprovalResolution` is a
+        //   live fallback rather than dead code.
+        //
+        // Why the exception is narrow: only the 512-entry cap and the
+        // abandonment backstop delete a record, and both are long after a
+        // delivery that in the ordinary case had a live channel and wrote the
+        // row. Expiry does NOT delete one — `listPendingApprovalsForPeer` merely
+        // withholds an expired card from the snapshot — precisely because the
+        // expiry finalize is the leg most likely to owe a row.
+        //
+        // Withholding the verdict in the exception case would lose a real
+        // decision for a card history DOES hold (a permanently-unresolved card),
+        // which is the larger divergence; the residual risk of writing it is an
+        // orphan that folds to a no-op.
+        //
+        // ⚠️ `requestJournaled` IS SCOPED TO THE PEER IT WAS SET FOR, AND THIS
+        // READ ENFORCES THAT, not just the write in `recordPendingApproval`. The
+        // journal's conversation id is the peerId, so a row written for peer B
+        // says nothing about peer A's conversation. One approval CAN reach two
+        // peers on one account (core's fan-out plan dedupes per `sessionKey`, and
+        // `finalizeWrappedEntries` iterates the entries), and the store keeps one
+        // record per (account, approvalId) — so a record whose `sessionKey` is
+        // not this entry's is treated as OWING the row. That is the guard's
+        // READINESS for multi-target delivery, not a handled case: today the
+        // SECOND peer to finalize gets NEITHER row — `updateEntry` deletes the
+        // record first (so its `pending` is undefined) and `sendApprovalResolved`'s
+        // first-write-wins gate returns before the catch-up (pre-existing). The
+        // FIRST peer to finalize may get a benign duplicate request row if it
+        // already had one from delivery (an upsert by id; one seq no frame
+        // carries). Multi-target delivery is not configured today (no
+        // `resolveApproverDmTargets`); revisit both when it is.
+        const requestRowOwed =
+          pending !== undefined &&
+          (pending.sessionKey !== entry.sessionKey || !pending.requestJournaled);
         channel.sendApprovalResolved(
           entry.sessionKey,
           entry.approvalId,
           payload.decision,
+          requestRowOwed ? { journalRequestFirst: pending!.payload } : undefined,
         );
       },
     },

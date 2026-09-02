@@ -23,6 +23,13 @@
  *    is journaled NOT AT ALL, because all three refusal checks sit ABOVE
  *    `journalOutbound`. A wire write that THROWS after the commit IS journaled,
  *    and that is the window §16.2-2 is actually about.
+ *    ⚠️ EXCEPT FOR THE TWO APPROVAL FRAMES (#341), WHICH THIS FILE ALSO PINS.
+ *    `approval_request`/`approval_resolved` are appended by
+ *    `publishApprovalFrame` BEFORE `sendToPeer` is called, so a refused approval
+ *    push DOES get its row — deliberately, because the approval's state exists
+ *    server-side whether or not the push lands and the id is core's, stable
+ *    across attempts. The `#341` describe block below asserts that direction;
+ *    the refusal tests above it are `sendText` and stay as they are.
  *    ⚠️ WHY the refusal side is not simply fixed — and why #304's residual is
  *    deferred rather than patched — is the GENERAL rule, and it is stated ONCE,
  *    at `message-adapter.ts`'s `lastDeliveredText` declaration. This docblock
@@ -835,7 +842,8 @@ describe("#244 half A — seq on the durable wire frames", () => {
         prompt: "run: ls",
         options: [{ decision: "allow-once", label: "Allow", style: "primary" }],
       }),
-    ).toBe(true);
+      // #341: this sender reports delivery AND the durable write separately.
+    ).toEqual({ delivered: true, journaled: true });
     expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once")).toBe(true);
 
     expect(transport.frames.map((f) => [f.type, f.seq])).toEqual([
@@ -1281,5 +1289,190 @@ describe("#242 — with reasoningDurable ON, a live stream costs ONE row per bur
     controller.endBurst();
     warn.mockRestore();
     expect(appends(calls)).toEqual([]);
+  });
+});
+
+/**
+ * #341 — APPROVAL STATE IS JOURNALED WHEN THE PLUGIN RECORDS IT, NOT WHEN IT
+ * PUBLISHES IT.
+ *
+ * These INVERT the direction the `sendText` refusal tests above pin, for the two
+ * approval frames only, and the inversion is the whole slice. Before it, an
+ * `approval_request` the transport refused got no row while `approvals.ts` kept
+ * it in the pending map and the register-time `approval_snapshot` re-delivered it
+ * live; the user decided, and the resulting `approvalResolution` row folded onto
+ * nothing (`applyApprovalResolution` returns the view unchanged), so history
+ * showed neither the card nor the consent — N8/N3.
+ *
+ * The refusal tests above stay exactly as they are: they drive `sendText`, whose
+ * caller re-mints an id per attempt (#278), which is why the generic hook stays
+ * below the refusals. An approval id is core's and is stable across attempts, and
+ * the state exists server-side whether or not the push lands — see
+ * `publishApprovalFrame`.
+ */
+describe("#341 — the approval frames journal above the refusals", () => {
+  const REQUEST = {
+    id: "ap-1",
+    kind: "exec" as const,
+    title: "Run",
+    prompt: "run: ls",
+    options: [{ decision: "allow-once" as const, label: "Allow", style: "primary" as const }],
+  };
+
+  it("journals the approval row when the disconnected transport refuses the request", () => {
+    const { calls, channel, transport } = makeChannel();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    transport.connected = false;
+
+    // Refused on the wire, STORED in the journal — the two halves of the result
+    // disagreeing is the entire slice, so assert both rather than one.
+    expect(channel.sendApprovalRequest(PEER, REQUEST)).toEqual({
+      delivered: false,
+      journaled: true,
+    });
+
+    // The row exists even though NOTHING was published — the point of the slice.
+    expect(calls).toEqual([
+      {
+        call: "append",
+        conversationId: PEER,
+        event: {
+          kind: "approval",
+          id: "ap-1",
+          approvalKind: "exec",
+          title: "Run",
+          prompt: "run: ls",
+          options: [{ decision: "allow-once", label: "Allow", style: "primary" }],
+        },
+      },
+    ]);
+    // Pin WHICH refusal was reached, the same discipline the `sendText` refusal
+    // tests use: "false + one row" must not silently become a test of some other
+    // guard added above this one.
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("Transport not connected"),
+    );
+    warn.mockRestore();
+  });
+
+  it("journals the resolution row when the fail-closed encryption guard refuses it", () => {
+    // The other refusal, and the one #341's report actually names (a peer mid-
+    // registration). Encrypted channel, no session key for this peer ⇒ refused
+    // before the wire, and the verdict is still recorded.
+    const calls: Call[] = [];
+    const transport = new RecordingTransport(calls);
+    const journal = new FakeJournal(calls);
+    const channel = new NatsChannel(
+      transport as unknown as NatsTransport,
+      ACCOUNT,
+      TENANT,
+      {
+        keyStore: { getOrCreate: () => new Uint8Array(32).fill(7) } as never,
+        identityKeyPair: generateKeyPair(),
+      },
+      undefined,
+      { deliveryJournal: journal },
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once")).toBe(false);
+
+    expect(calls).toEqual([
+      {
+        call: "append",
+        conversationId: PEER,
+        event: { kind: "approvalResolution", id: "ap-1", decision: "allow-once" },
+      },
+    ]);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("no session key yet"),
+    );
+    warn.mockRestore();
+  });
+
+  it("journals EXACTLY ONE row per frame when the transport accepts it — no double append", () => {
+    // `sendToPeer` used to own this append and must no longer make it: an
+    // approval row carries a null `message_id` (`extractMessageId` has no
+    // approval arm, #355), so a second row would NOT dedupe — it would replay as
+    // a duplicate seq-consuming event.
+    const { calls, channel, transport } = makeChannel();
+
+    expect(channel.sendApprovalRequest(PEER, REQUEST)).toEqual({
+      delivered: true,
+      journaled: true,
+    });
+    expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once")).toBe(true);
+
+    expect(calls.map((entry) => (entry.call === "append" ? entry.event.kind : entry.call))).toEqual([
+      "approval",
+      "publish",
+      "approvalResolution",
+      "publish",
+    ]);
+    // Persist-before-publish still holds, and the seq the row consumed is the one
+    // that rides the wire — stamped a layer up, but stamped (#244 half A).
+    expect(transport.frames.map((f) => [f.type, f.seq])).toEqual([
+      ["approval_request", 1],
+      ["approval_resolved", 2],
+    ]);
+  });
+
+  it("a re-delivery publishes the card again and writes NO second row", () => {
+    // `approvals.ts`'s `deliverPending` re-sends a still-pending card on a
+    // stateless register/retry. The card was created once, so it is journaled
+    // once; the re-arming push carries no seq because it consumed none.
+    const { calls, channel, transport } = makeChannel();
+
+    expect(channel.sendApprovalRequest(PEER, REQUEST)).toEqual({
+      delivered: true,
+      journaled: true,
+    });
+    // Re-armed live, not re-stored.
+    expect(channel.sendApprovalRequest(PEER, REQUEST, { redelivery: true })).toEqual({
+      delivered: true,
+      journaled: false,
+    });
+
+    expect(appends(calls)).toHaveLength(1);
+    expect(transport.frames.map((f) => [f.type, f.seq])).toEqual([
+      ["approval_request", 1],
+      ["approval_request", undefined],
+    ]);
+  });
+
+  it("a repeated resolution from the same peer publishes but does not write a second row", () => {
+    // `sendApprovalResolved`'s first-write-wins lets the ORIGINAL resolver
+    // through a second time (unchanged behaviour); only the first one is state
+    // the plugin recorded, so only the first is a row.
+    const { calls, channel } = makeChannel();
+
+    expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once")).toBe(true);
+    expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once")).toBe(true);
+
+    expect(appends(calls)).toHaveLength(1);
+    expect(calls.filter((entry) => entry.call === "publish")).toHaveLength(2);
+  });
+
+  it("a journal failure still cannot change the send result", () => {
+    // The moved hook keeps `journalOutbound`'s contract: the swallow is the
+    // mechanism, and a faulting store must not turn a deliverable approval into
+    // a refused one (§15.8).
+    const { calls, channel, journal } = makeChannel();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    journal.throwOnAppend = true;
+
+    // Published anyway, and the caller is TOLD the row is missing — which is what
+    // lets `approvals.ts` write it at resolution time instead.
+    expect(channel.sendApprovalRequest(PEER, REQUEST)).toEqual({
+      delivered: true,
+      journaled: false,
+    });
+
+    expect(appends(calls)).toEqual([]);
+    expect(calls).toEqual([{ call: "publish", subject: OUT, type: "approval_request" }]);
+    expect(warn.mock.calls[0][0]).toContain(
+      "[nats-channel] delivery journal append-failed",
+    );
+    warn.mockRestore();
   });
 });

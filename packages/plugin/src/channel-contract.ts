@@ -350,9 +350,12 @@ export type OutboundWsMessage =
       /**
        * #244 half A (doc §16.2-6, Telegram pts/qts): the per-conversation
        * contiguous `seq` this frame's DURABLE row was allocated at egress
-       * (`delivery-journal.ts` `append` → `{seq}`), stamped by `sendToPeer` after
-       * the persist-before-publish commit. Monotone within a conversation; a
-       * future client (half B) tracks the last-applied `seq` and detects gaps.
+       * (`delivery-journal.ts` `append` → `{seq}`), stamped immediately after the
+       * persist-before-publish commit — by `sendToPeer` for this frame and every
+       * other durable type, and by `publishApprovalFrame` for the two approval
+       * frames, which commit one layer above it (#341). Monotone within a
+       * conversation; a future client (half B) tracks the last-applied `seq` and
+       * detects gaps.
        *
        * ⚠️ IT RIDES EVERY DURABLE FRAME, NOT JUST THIS ONE, AND CONTIGUITY IS THE
        * REASON. Each frame `journalEventForOutbound` maps to a journal event
@@ -364,7 +367,8 @@ export type OutboundWsMessage =
        * some of them the client's stream would have holes where the others
        * consumed a seq unseen — and half B would read those as phantom gaps and
        * fire a spurious `getDifference`. So the field is declared on all seven and
-       * `sendToPeer` stamps it on whichever frame was actually journaled.
+       * whichever frame was actually journaled is stamped with its row's seq (see
+       * the note above on which method does the stamping).
        *
        * ⚠️ ONE SEQ-CONSUMER IS NOT AN OUTBOUND FRAME: the INBOUND USER opener.
        * `appendInboundUser` allocates from the SAME per-conversation counter, so a
@@ -635,6 +639,22 @@ export type OutboundWsMessage =
    */
   | { type: "difference"; events: Array<{ seq: number; event: DurableEvent }> };
 
+/**
+ * #341 — what `sendApprovalRequest` reports back. TWO independent outcomes, and
+ * conflating them is what round 1 got wrong:
+ *  - `delivered` — did the frame reach the wire? The historic boolean return, and
+ *    still the only thing the delivery warning branches on.
+ *  - `journaled` — did the durable `approval` row get written? It is TRUE on a
+ *    refused push (that is the whole point of #341) and FALSE both for a
+ *    re-delivery, which must not write a second row, and for an append the
+ *    journal swallowed. `approvals.ts` carries it into the pending record so the
+ *    resolution leg knows whether it still owes the row.
+ */
+export type ApprovalRequestSendResult = {
+  delivered: boolean;
+  journaled: boolean;
+};
+
 export interface WebChannelPeerChannel {
   sendText(
     peerId: string,
@@ -708,8 +728,59 @@ export interface WebChannelPeerChannel {
     peerId: string,
     message: { id: string; text: string; turnId?: string; seq: number; random_id?: string },
   ): boolean;
-  sendApprovalRequest(peerId: string, request: ApprovalRequestPayload): boolean;
-  sendApprovalResolved(peerId: string, id: string, decision: ApprovalDecision): boolean;
+  /**
+   * #341: `redelivery` says A DURABLE ROW FOR THIS CARD ALREADY EXISTS in this
+   * peer's conversation, so this call is a re-arming push of a service message
+   * the plugin already stored, not the storing of one. The implementation
+   * journals the `approval` row only when that is false; a re-delivery publishes
+   * without writing a second row.
+   *
+   * ⚠️ THE CALLER OWNS THIS FACT, NOT THE CHANNEL. Only `approvals.ts` holds the
+   * per-(account, approvalId) record that tracks it, and the journal cannot:
+   * `delivery-journal.ts`'s `extractMessageId` has no `approval` arm, so approval
+   * rows carry a null `message_id` and no unique index can collapse a duplicate
+   * (#355). Omitted ⇒ `false` ⇒ journal, which is the safe default for any caller
+   * that does not track delivery attempts.
+   *
+   * ⚠️ AND THE RESULT REPORTS BOTH OUTCOMES BECAUSE THEY GENUINELY DIFFER. A
+   * refused push still stores the card (`delivered: false, journaled: true`), and
+   * a store whose append was swallowed (§15.8) still publishes it
+   * (`delivered: true, journaled: false`). The caller needs the second field to
+   * know whether the resolution leg must write the row late — round 1 of #341
+   * inferred it from "a channel resolved", and the account map is transient, so
+   * an account absent at delivery and present at resolution reproduced the exact
+   * orphan the slice exists to kill.
+   */
+  sendApprovalRequest(
+    peerId: string,
+    request: ApprovalRequestPayload,
+    options?: { redelivery?: boolean },
+  ): ApprovalRequestSendResult;
+  /**
+   * #341: `journalRequestFirst` carries THE CARD'S OWN PAYLOAD when its durable
+   * `approval` row was never written — the delivery attempt found no channel for
+   * the account, or its append was swallowed. The implementation stores that row
+   * BEFORE the resolution's. The rule that binds the two rows, and its one
+   * exception, is stated ONCE — "THE APPROVAL PAIR RULE" at `approvals.ts`'s
+   * `updateEntry`; this docblock does not restate it.
+   *
+   * ⚠️ THE ROW WRITTEN HERE HAS NO LIVE FRAME BEHIND IT, and that is correct
+   * rather than a gap. Whether live showed the card depends on whether a peer
+   * REGISTERED while it was pending (the register-time `approval_snapshot`
+   * re-arms it from the pending store — and does NOT mark the row journaled), not
+   * on expiry: a card a peer saw that way and that was then resolved from
+   * elsewhere has live behind it, and this write is history catching up; a card
+   * no peer registered for before it was resolved or expired gets a row live
+   * never showed — the disclosed N8-gaining shape. Either way the seq it
+   * consumes rides no frame, so a peer sees a hole and heals it with
+   * `get_difference` (#244 half B) — the mechanism that exists for exactly this.
+   */
+  sendApprovalResolved(
+    peerId: string,
+    id: string,
+    decision: ApprovalDecision,
+    options?: { journalRequestFirst?: ApprovalRequestPayload },
+  ): boolean;
   sendApprovalSnapshot(peerId: string, approvals: ApprovalRequestPayload[], resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean;
   sendAck?(
     peerId: string,
@@ -731,8 +802,8 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendHistory(_peerId: string, _messages: HistoryMessage[], _highWaterSeq?: number): boolean { return false; }
   sendDifference(_peerId: string, _events: Array<{ seq: number; event: DurableEvent }>): boolean { return false; }
   sendUserCommitted(_peerId: string, _message: { id: string; text: string; turnId?: string; seq: number; random_id?: string }): boolean { return false; }
-  sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload): boolean { return false; }
-  sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision): boolean { return false; }
+  sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload, _options?: { redelivery?: boolean }): ApprovalRequestSendResult { return { delivered: false, journaled: false }; }
+  sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision, _options?: { journalRequestFirst?: ApprovalRequestPayload }): boolean { return false; }
   sendApprovalSnapshot(_peerId: string, _approvals: ApprovalRequestPayload[], _resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean { return false; }
   sendAck(_peerId: string, ids: string[], _committed?: Array<{ random_id: string; messageId: string; seq: number }>): boolean { return ids.length === 0; }
   sendInboundRejected(_peerId: string, ids: string[]): boolean { return ids.length === 0; }

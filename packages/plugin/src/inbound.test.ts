@@ -344,7 +344,9 @@ function makeFakeTransport(options?: {
       return true;
     },
     sendHistory: () => true,
-    sendApprovalRequest: () => true,
+    // #341: the result reports delivery AND whether the durable row was written;
+    // this stub owns no journal, so `journaled` is false.
+    sendApprovalRequest: () => ({ delivered: true, journaled: false }),
     sendApprovalResolved: () => true,
     sendApprovalSnapshot: () => true,
   } as WebChannelPeerChannel;

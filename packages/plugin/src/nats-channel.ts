@@ -18,7 +18,7 @@
 
 import { inspect } from "node:util";
 import type { NatsTransport, NatsMessage } from "./nats-transport.js";
-import type { ApprovalDecision, ApprovalRequestPayload, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
+import type { ApprovalDecision, ApprovalRequestPayload, ApprovalRequestSendResult, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
 import type { KeyPair } from "./e2e-crypto.js";
 import type { ConversationKeyStore } from "./conversation-key-store.js";
 import { wrapConversationKey } from "./late-join-decryptor.js";
@@ -191,6 +191,31 @@ export type NatsChannelDurability = {
    */
   reasoningDurable?: boolean;
 };
+
+/**
+ * #341: the two frames whose journal append happens in `publishApprovalFrame`,
+ * ABOVE `sendToPeer`'s refusals, instead of inside it below them. Written as an
+ * `Extract` over the wire union rather than a hand-rolled shape so the `seq`
+ * stamping in `publishApprovalFrame` needs no cast and a change to either wire
+ * member reaches it as a compile error.
+ */
+type ApprovalOutboundFrame = Extract<
+  OutboundWsMessage,
+  { type: "approval_request" | "approval_resolved" }
+>;
+
+/**
+ * The runtime half of `ApprovalOutboundFrame`, used by `sendToPeer` to skip the
+ * generic journal hook for the two frames `publishApprovalFrame` already
+ * appended. Deliberately NOT folded into `isSeqBearingFrame`: that predicate
+ * answers "does this type carry a seq on the wire", which is still YES for both
+ * of these (they just get stamped one layer up).
+ */
+function isApprovalOutboundFrame(
+  frame: OutboundWsMessage,
+): frame is ApprovalOutboundFrame {
+  return frame.type === "approval_request" || frame.type === "approval_resolved";
+}
 
 /** S2 defaults — high enough that normal operation never evicts. */
 const DEFAULT_MAX_PEERS = 10_000;
@@ -816,16 +841,82 @@ export class NatsChannel implements WebChannelPeerChannel {
 
   /**
    * Send approval request to peer.
+   *
+   * #341: journals BEFORE the refusals rather than below them — see
+   * `publishApprovalFrame`. `options.redelivery` marks a re-arming push of a
+   * card this plugin already recorded, which publishes without a second row
+   * (`channel-contract.ts` states why the CALLER owns that fact).
    */
   sendApprovalRequest(
     peerId: string,
     request: ApprovalRequestPayload,
-  ): boolean {
-    const payload: OutboundWsMessage = {
+    options?: { redelivery?: boolean },
+  ): ApprovalRequestSendResult {
+    const payload: ApprovalOutboundFrame = {
       type: "approval_request",
       ...request,
     };
-    return this.sendToPeer(peerId, payload);
+    return this.publishApprovalFrame(peerId, payload, options?.redelivery !== true);
+  }
+
+  /**
+   * #341 — THE APPROVAL FRAMES' OWN JOURNAL SEAM, ABOVE `sendToPeer`'s REFUSALS.
+   *
+   * Every other durable frame is journaled inside `sendToPeer`, below its three
+   * refusals, and that placement is load-bearing (read its docblock before
+   * moving anything). These two are the stated exception, so the append happens
+   * HERE — before the frame is even offered to the funnel — and `sendToPeer`
+   * skips them.
+   *
+   * WHY THE EXCEPTION HOLDS FOR THESE TWO AND NOTHING ELSE:
+   *  - THE STATE EXISTS SERVER-SIDE WHETHER OR NOT THE PUSH LANDS. `approvals.ts`
+   *    records the pending approval (`recordPendingApproval`) and the resolved
+   *    outcome (`recordResolvedApproval`) unconditionally, and the register-time
+   *    `approval_snapshot` re-delivers from those stores. A refused push
+   *    therefore does not mean "the user never saw this" — the snapshot shows the
+   *    card on the next register, the user acts on it, and #341's bug is exactly
+   *    the resolution landing as an orphan because the request row was never
+   *    written. Telegram stores the service message when it is CREATED; delivery
+   *    to a device is a separate act.
+   *  - THE ID IS STABLE ACROSS ATTEMPTS, so there is no re-mint hazard. It is
+   *    core's `approvalId` (`crypto.randomUUID()`), copied verbatim by
+   *    `buildApprovalRequestPayload` and reused by every re-delivery — the
+   *    opposite of `message-adapter.ts`'s `reserveProvisional`, whose fresh
+   *    `nextMessageId()` per failed attempt is the whole reason the generic hook
+   *    sits below the refusals (#278, N6b).
+   *
+   * ⚠️ NOT A PRECEDENT FOR THE REASONING RESIDUAL (#304). That one has neither
+   * property: a burst's content exists only as the text the transport accepted,
+   * so a refused close frame cannot be distinguished from content the peer never
+   * saw. See `message-adapter.ts`'s `lastDeliveredText` declaration.
+   *
+   * ⚠️ THIS IS HALF THE MECHANISM, NOT THE RULE. Journaling above the refusals
+   * only helps when a channel EXISTS to journal through, and the account→channel
+   * map is transient — so a card can be created with no channel and resolved with
+   * one. `sendApprovalResolved`'s `journalRequestFirst` is the other half. The
+   * rule the two serve, and the one exception to it, are stated once at
+   * `approvals.ts`'s `updateEntry` (THE APPROVAL PAIR RULE); this docblock
+   * deliberately does not restate it.
+   *
+   * `seq` is stamped HERE for the same reason it is stamped in `sendToPeer`: the
+   * row consumed a per-conversation seq and the frame the peer receives must
+   * carry THAT one (#244 half A). A re-delivery writes no row and so carries no
+   * seq, exactly like any other unjournaled frame.
+   *
+   * Reports BOTH outcomes rather than a send boolean, because for these frames
+   * they come apart in both directions — see `ApprovalRequestSendResult`.
+   */
+  private publishApprovalFrame(
+    peerId: string,
+    payload: ApprovalOutboundFrame,
+    journal: boolean,
+  ): ApprovalRequestSendResult {
+    const seq = journal ? this.journalOutbound(peerId, payload) : undefined;
+    const delivered = this.sendToPeer(
+      peerId,
+      seq !== undefined ? { ...payload, seq } : payload,
+    );
+    return { delivered, journaled: seq !== undefined };
   }
 
   /**
@@ -835,9 +926,21 @@ export class NatsChannel implements WebChannelPeerChannel {
    * - The first peer to resolve an approvalId wins
    * - Subsequent resolutions for the same approvalId are dropped
    */
-  sendApprovalResolved(peerId: string, id: string, decision: ApprovalDecision): boolean {
+  sendApprovalResolved(
+    peerId: string,
+    id: string,
+    decision: ApprovalDecision,
+    options?: { journalRequestFirst?: ApprovalRequestPayload },
+  ): boolean {
     // First-write-wins exactly-once: check if already resolved
     const existingResolver = this.approvalResolutions.get(id);
+    // #341: the request side takes its "already recorded" signal from the caller;
+    // here the channel already holds it, so the FIRST write journals and a repeat
+    // from the same peer (which still publishes, as it always has) does not write
+    // a second `approvalResolution` row. Unreachable from `updateEntry`, which is
+    // terminal per (account, approval) — belt and braces, and it keeps the two
+    // approval frames' dedupe stories identical.
+    const firstResolution = existingResolver === undefined;
     if (existingResolver !== undefined) {
       if (existingResolver !== peerId) {
         console.log(
@@ -858,8 +961,36 @@ export class NatsChannel implements WebChannelPeerChannel {
       }
     }
 
-    const payload: OutboundWsMessage = { type: "approval_resolved", id, decision };
-    return this.sendToPeer(peerId, payload);
+    // #341 — THE CARD'S ROW FIRST, OR NEITHER ROW AT ALL.
+    //
+    // The caller passes `journalRequestFirst` when delivery could not write the
+    // `approval` row: the account had no live channel at the time (a TRANSIENT
+    // state — `nats-account-runtime.ts` deletes and re-adds the runtime across a
+    // restart/reconnect), or the append was swallowed. Both leave a card the
+    // register-time `approval_snapshot` still shows live, so the user (or the
+    // expiry) can resolve one whose request row does not exist.
+    //
+    // Storing it here restores the invariant the projection needs: the request
+    // row precedes its resolution in the one ordered stream. And if THAT append
+    // fails too, the resolution's is skipped, because a resolution row with no
+    // request row is exactly the orphan `applyApprovalResolution` folds onto
+    // nothing — the defect this slice exists to kill. Keeping both decisions on
+    // this line, next to both appends, is why the catch-up is an option here
+    // rather than a separate journal-only call the caller has to sequence.
+    let journalResolution = firstResolution;
+    const catchUpRequest = options?.journalRequestFirst;
+    if (journalResolution && catchUpRequest !== undefined) {
+      const requestSeq = this.journalOutbound(peerId, {
+        type: "approval_request",
+        ...catchUpRequest,
+      });
+      // `undefined` also covers "this channel has no journal at all", where
+      // skipping the resolution row costs nothing — there is no store to skip in.
+      if (requestSeq === undefined) journalResolution = false;
+    }
+
+    const payload: ApprovalOutboundFrame = { type: "approval_resolved", id, decision };
+    return this.publishApprovalFrame(peerId, payload, journalResolution).delivered;
   }
 
   /**
@@ -1000,11 +1131,29 @@ export class NatsChannel implements WebChannelPeerChannel {
    * `sendReasoning`, `sendToolActivity`, `sendTurnSettled`, `sendTurnSnapshot`,
    * typing, history, commands, the approval frames, and (via
    * `sendIngressResult`) the ack and inbound_rejected chunks. That is why the v6
-   * journal hook lives HERE and nowhere else: one hook covers the whole surface,
-   * including the direct-ACK paths doc §15.7 worried about. (The class's one
-   * other `this.transport.publish` — `handleRegister`'s request-reply on the
-   * requester's `reginbox` subject — is a raw handshake string rather than an
-   * `OutboundWsMessage`, and carries nothing durable.)
+   * journal hook lives HERE: one hook covers the whole surface, including the
+   * direct-ACK paths doc §15.7 worried about.
+   *
+   * ⚠️ "AND NOWHERE ELSE" WAS TRUE UNTIL #341 AND IS NOT ANY MORE. There are TWO
+   * other journal call sites on this class, both named:
+   *  - `publishApprovalFrame`, which appends the two approval frames BEFORE they
+   *    reach this method (the hook below skips them so they are never written
+   *    twice — `extractMessageId` has no `approval` arm, so a second row would
+   *    not dedupe, #355);
+   *  - `sendApprovalResolved`'s CATCH-UP append, which is the only place in the
+   *    tree that writes a durable row for a frame that NEVER SHIPS: the card's
+   *    `approval` row, minted so the verdict about to be journaled is not an
+   *    orphan. It consumes a seq no frame carries, by design — the peer heals
+   *    that hole with `get_difference` (#244 half B).
+   * Everything else still journals here and only here; the reasons the approvals
+   * are the exception, and why they are not a precedent, are at
+   * `publishApprovalFrame`.
+   *
+   * (The class's one other `this.transport.publish` — `handleRegister`'s
+   * request-reply on the requester's `reginbox` subject — is a raw handshake
+   * string rather than an `OutboundWsMessage`, and carries nothing durable. That
+   * is unchanged: this method is still the single EGRESS point, which is a
+   * different claim from the journal one above.)
    */
   private sendToPeer(peerId: string, payload: OutboundWsMessage): boolean {
     if (this.disposed || !this.transport.connected) {
@@ -1085,7 +1234,21 @@ export class NatsChannel implements WebChannelPeerChannel {
     // rather than the client holding a message the store lacks.
     //
     // ⚠️ NOT universally — see #278 for the case and its conditions.
-    const seq = this.journalOutbound(peerId, payload);
+    //
+    // ⚠️ AND #341 CARVED OUT THE TWO APPROVAL FRAMES, WHICH IS WHY THE CALL IS
+    // GUARDED. They were journaled here until an `approval_request` the transport
+    // refused turned out to be re-delivered live by the register-time
+    // `approval_snapshot` and acted on, while its `approvalResolution` row landed
+    // as an orphan the reducer folds onto nothing (N8/N3). Their append moved UP,
+    // to `publishApprovalFrame`, which runs before this method is even called; the
+    // guard below is what stops the row being written a second time here. It is
+    // the whole extent of the exception — every other frame type still journals on
+    // this line, below the three refusals. The argument for the carve-out (and for
+    // why it does not transfer to #304) is at `publishApprovalFrame`; do not
+    // restate it here.
+    const seq = isApprovalOutboundFrame(payload)
+      ? undefined
+      : this.journalOutbound(peerId, payload);
 
     // #244 half A: stamp the per-conversation `seq` the journal allocated onto
     // the durable frame BEFORE sealing/publishing (persist-before-publish means
@@ -1194,6 +1357,11 @@ export class NatsChannel implements WebChannelPeerChannel {
   /**
    * Commit one outbound frame to the delivery journal. Called by `sendToPeer`
    * BEFORE publishing; see the block comment there for the ordering rationale.
+   * Since #341 it has a SECOND caller — `publishApprovalFrame`, which commits the
+   * two approval frames one layer up, above the refusals `sendToPeer` applies —
+   * so "before publishing" still holds for both, but "below the refusals" is a
+   * property of the CALL SITE, not of this method. Everything below is written
+   * about the write path itself and is true of either caller.
    *
    * ⚠️ THIS FUNCTION CANNOT CHANGE A SEND RESULT, AND THAT IS THE WHOLE POINT.
    * #244 half A gave it a return value — the appended per-conversation `seq`, or
