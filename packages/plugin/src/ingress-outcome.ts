@@ -483,11 +483,26 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
       const store = storeFor(outcome);
       let diskError: unknown;
       let fresh: boolean;
+      let alreadyCancelled = false;
       try {
         const recovery = await recoverFailedRollbackUnlocked(accountId, key);
         if (recovery.status === "unknown") {
           releaseOperation();
           return recovery;
+        }
+        if (outcome === "cancelled") {
+          // A cold SDK checkAndRecord can report fresh+diskError even when the
+          // durable marker already exists. Establish ownership before writing,
+          // or cleanup of that failed attempt could erase an older suppression.
+          try {
+            const existing = await hasRecent(store, accountId, key);
+            if (existing.diskError !== undefined) throw existing.diskError;
+            alreadyCancelled = existing.found;
+          } catch (error) {
+            options.warnFailure?.(accountId, "lookup-cancelled");
+            releaseOperation();
+            return { status: "unknown", error };
+          }
         }
         if (recordOptions?.reclaimAccepted && outcome === "accepted") {
           // The caller proved the old marker is an orphan. Reclaim it under
@@ -534,7 +549,7 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
         // A cancelled replacement is written BEFORE weaker markers are erased.
         // Keep them until a later lookup: rollback of this receipt can then
         // remove only the new cancellation without losing the previous verdict.
-        fresh = await store.checkAndRecord(key, {
+        fresh = alreadyCancelled ? false : await store.checkAndRecord(key, {
           namespace: accountId,
           onDiskError: (error) => { diskError = error; },
         });

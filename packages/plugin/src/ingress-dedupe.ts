@@ -1023,12 +1023,9 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
 
           let recorded: OutcomeRecordResult | undefined;
           try {
-            recorded = await deps.outcomeStore.record(
-              accountId,
-              key,
-              "accepted",
-              readmitted ? { reclaimAccepted: true } : undefined,
-            );
+            recorded = readmitted
+              ? await deps.outcomeStore.record(accountId, key, "accepted", { reclaimAccepted: true })
+              : await deps.outcomeStore.record(accountId, key, "accepted");
           } catch {
             warnOutcomeFailure(accountId, "adapter-record-accepted");
             // A thrown storage adapter is the same unresolved classification as

@@ -68,6 +68,59 @@ describe("IngressOutcomeStore", () => {
     expect(await restarted.lookup("a", "p:i")).toEqual({ status: "found", outcome: "accepted" });
   });
 
+  it.each(["write", "lookup callback", "lookup throw"] as const)(
+    "preserves a cold durable cancellation when %s fails",
+    async (fault) => {
+      const dir = mkdtempSync(join(tmpdir(), "wc-existing-cancellation-"));
+      const dedupe = () => createPersistentDedupe({
+        pluginId: "webchannel",
+        namespacePrefix: "cancelled",
+        ttlMs: 60_000,
+        memoryMaxSize: 100,
+        stateMaxEntries: 100,
+        env: { ...process.env, OPENCLAW_STATE_DIR: dir },
+      });
+      try {
+        await dedupe().checkAndRecord("p:i", { namespace: "a" });
+        const cancelled = dedupe();
+        expect(cancelled.memorySize()).toBe(0);
+        const diskError = new Error("transient cancellation storage failure");
+        // A cold SDK write can return true+onDiskError although the old durable
+        // marker exists. This attempt must never reach that destructive path.
+        const record = vi.spyOn(cancelled, "checkAndRecord").mockImplementationOnce(async (_key, options) => {
+          options?.onDiskError?.(diskError);
+          return true;
+        });
+        const forget = vi.spyOn(cancelled, "forget");
+        if (fault !== "write") {
+          vi.spyOn(cancelled, "hasRecent").mockImplementationOnce(async (_key, options) => {
+            if (fault === "lookup throw") throw diskError;
+            options?.onDiskError?.(diskError);
+            return false;
+          });
+        }
+        const store = makeStore({ accepted: fake().store, overloaded: fake().store, cancelled });
+        const result = await store.record("a", "p:i", "cancelled", { replaceOthers: true });
+        if (fault === "write") {
+          if (result.status !== "recorded") throw new Error("existing cancellation unexpectedly unknown");
+          expect(result.durability).toBe("durable");
+          expect(result.write.created).toBe(false);
+          expect(await result.write.rollback()).toBe(false);
+        } else {
+          expect(result).toEqual({ status: "unknown", error: diskError });
+        }
+        expect(record).not.toHaveBeenCalled();
+        expect(forget).not.toHaveBeenCalled();
+        expect(store.rollbackRecoverySize().entries).toBe(0);
+        expect(await dedupe().hasRecent("p:i", { namespace: "a" })).toBe(true);
+        // Both outcomes release their key gate and retain the suppression.
+        expect(await store.lookup("a", "p:i")).toEqual({ status: "found", outcome: "cancelled" });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("quarantines SDK cancellation write and cleanup faults without erasing the durable accept", async () => {
     const dir = mkdtempSync(join(tmpdir(), "wc-cancellation-outcome-"));
     const blocked = join(dir, "blocked-state");
@@ -86,6 +139,9 @@ describe("IngressOutcomeStore", () => {
       const store = makeStore({ accepted, overloaded: dedupe("overloaded"), cancelled });
       await commit(store, "a", "p:i", "accepted");
 
+      // Absence was established before storage failed. Keep subsequent write
+      // and cleanup on the real SDK's blocked-state disk-error paths.
+      vi.spyOn(cancelled, "hasRecent").mockResolvedValueOnce(false);
       // The real SDK inserts memory on write failure; forget clears memory but
       // reports its disk failure through onDiskError, without throwing.
       expect((await store.record("a", "p:i", "cancelled", { replaceOthers: true })).status).toBe("unknown");
