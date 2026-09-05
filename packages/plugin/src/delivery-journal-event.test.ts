@@ -134,8 +134,8 @@ describe("an id-less agent_message is not persisted, and IS observable", () => {
   };
 
   it("returns null rather than minting a server-side id", () => {
-    // Post-#238 this frame is a REGRESSION, not a case to handle: the frame has
-    // already left for the client, which mints its own local `a-<n>`, so a
+    // Post-#238 this frame is a REGRESSION, not a case to handle: the frame is
+    // about to be published to the client, which mints its own local `a-<n>`, so a
     // journal row under a different id is the very N8 divergence this store
     // exists to kill. #243 is the real repair (mint BEFORE egress).
     expect(journalEventForOutbound(idless)).toBeNull();
@@ -580,7 +580,8 @@ describe("journalEventForInboundUser", () => {
 
   it("does NOT bound the length of a plugin-minted agent id", () => {
     // The asymmetry is deliberate: agent ids are ours, and treating an over-long
-    // one as id-less would drop DELIVERED text from the journal (N10). Only the
+    // one as id-less would drop text about to be published from the journal (N8,
+    // losing). Only the
     // client-supplied inbound id is bounded.
     const longAgentId = "a".repeat(1_000);
     expect(

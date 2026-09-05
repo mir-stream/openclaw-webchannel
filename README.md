@@ -50,7 +50,6 @@ packages/plugin   The OpenClaw channel plugin (NATS transport)
 packages/client   Framework-agnostic browser client (headless connection + protocol + state)
 packages/saas     Trust-chain core + reference enrollment/bootstrap servers (reference, NOT prod)
 docs/             Design + status docs (start with STATUS.md and TRUST_AND_ONBOARDING.md)
-.ouroboros/       Ouroboros seeds / handoffs that drove the build (historical record)
 ```
 
 ## Run it (the production NATS path)
