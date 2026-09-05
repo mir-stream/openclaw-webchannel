@@ -38,6 +38,8 @@
  *    server-side whether or not the push lands and the id is core's, stable
  *    across attempts. The `#341` describe block below asserts that direction;
  *    the refusal tests above it are `sendText` and stay as they are.
+ *    Approval results keep delivery and storage separate: a failed push still
+ *    reports `delivered: false` even when `journaled` is true.
  *    ⚠️ WHY the refusal side is not simply fixed — and why #304's residual is
  *    deferred rather than patched — is the GENERAL rule, and it is stated ONCE,
  *    at `message-adapter.ts`'s `lastDeliveredText` declaration. This docblock

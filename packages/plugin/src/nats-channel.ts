@@ -1171,10 +1171,10 @@ export class NatsChannel implements WebChannelPeerChannel {
     //
     // Lifted out of the `try` below ONLY so the journal hook can sit between the
     // REFUSALS and the WIRE WRITE. The predicate and its position are unchanged
-    // and still run before anything is journaled or published; `sealEnvelope`
+    // and still run before this method journals or publishes; `sealEnvelope`
     // deliberately stays inside the `try`, so a throw while sealing still
     // returns `false` — #347 narrowed that to "when nothing was journaled": a
-    // throw out of seal or publish AFTER a durable row was committed now returns
+    // throw out of seal or publish AFTER this method committed a row now returns
     // `true` (see the catch). What the lift DID change is exception containment
     // on this one path: the `console.warn` below used to sit inside the `try`, so a
     // faulting host `console` became `return false`, and now it escapes
@@ -1248,6 +1248,9 @@ export class NatsChannel implements WebChannelPeerChannel {
     // this line, below the three refusals. The argument for the carve-out (and for
     // why it does not transfer to #304) is at `publishApprovalFrame`; do not
     // restate it here.
+    // For approvals the local `seq` stays undefined, so this method still reports
+    // the push outcome. `publishApprovalFrame` reports storage separately in
+    // `journaled`; its `delivered` field must not become true on a failed push.
     //
     // We are the Telegram SERVER (doc §0). A message exists the moment the server
     // has STORED it under an id; pushing it to a device is a SEPARATE act, and a
@@ -1283,8 +1286,8 @@ export class NatsChannel implements WebChannelPeerChannel {
     // manufactured by us. Re-sending under a new id is the pre-#244 repair, when a
     // lost publish really was a lost message; gap-sync is the repair now.
     //
-    // ⚠️ THE SPLIT IS "WAS A ROW COMMITTED", NOT "WHICH FRAME TYPE" — and the
-    // discriminator is `seq !== undefined`, the same value the stamp below uses.
+    // For frames journaled HERE, the result depends on whether a row was
+    // committed: `seq !== undefined`, the same value the stamp below uses.
     // A frame that allocated no seq has NO row and nothing for `get_difference` to
     // serve, so for it a publish failure is still a failed send and still returns
     // `false`: every frame `journalOutbound` does not journal (the non-durable
@@ -1302,7 +1305,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     // the durable frame BEFORE sealing/publishing (persist-before-publish means
     // the seq is known here).
     //
-    // ⚠️ EVERY DURABLE FRAME, NOT A SUBSET — contiguity is the point. `seq` is
+    // For frames journaled here (approvals arrive already stamped), `seq` is
     // defined IFF the frame was appended, and a frame is appended IFF it is one of
     // the durable types `journalEventForOutbound` maps. `isSeqBearingFrame` is the
     // single expression of that set (co-located with the mapper, with a drift test
@@ -1312,7 +1315,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     // durable frames would leave the client's stream with holes where the others
     // silently consumed a seq — a phantom gap for half B. A frame that was not
     // journaled (`seq === undefined` — non-durable, id-less, or a caught failure)
-    // ships unchanged, without a `seq`.
+    // ships unchanged. An approval retains the seq stamped by its own seam.
     //
     // ⚠️ THE INBOUND USER OPENER is the one other seq-consumer, and it is NOT here
     // because it is not an outbound frame: its seq rides the `ack.committed` echo
