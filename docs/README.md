@@ -1,7 +1,7 @@
 # docs/ — index
 
-현재 동작 상태의 **단일 진실원은 [`STATUS.md`](STATUS.md)**다. 커밋 메시지·Ouroboros
-seed(`.ouroboros/*`)·평가 점수에 "AC 100% / complete"가 보여도, 그것과 충돌하면 STATUS.md가 옳다.
+현재 동작 상태의 **단일 진실원은 [`STATUS.md`](STATUS.md)**다. 커밋 메시지·과거 기획
+문서·평가 점수에 "AC 100% / complete"가 보여도, 그것과 충돌하면 STATUS.md가 옳다.
 
 | 문서 | 무엇 | 성격 |
 |---|---|---|
@@ -26,4 +26,3 @@ P1-1의 현재 제품 계약은 원 리뷰의 multi-agent 제안이 아니라
 
 패키지별 문서는 각 패키지 README 참조: `packages/plugin/README.md`,
 `packages/client/README.md`, `packages/saas/README.md`.
-Ouroboros 빌드 히스토리는 `.ouroboros/` (역사 기록).
