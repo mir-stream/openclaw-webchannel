@@ -107,6 +107,88 @@
   store does not have — the server-side invention N8 forbids — so it is disclosed
   rather than fixed.
 
+- **`ingress-dedupe.ts`'s accept seam treats the delivery journal as the dedupe
+  authority (#344, extends #292).** `outcomeStore.record(…, "accepted")` persists
+  through the SDK dedupe store at call time while `appendInboundUser` runs in the
+  batch footer, so the durable order is marker-first, row-second and a crash
+  between them stranded the message: the replay hit the `existing.status ===
+  "found"` branch, was re-acked as a duplicate, and never reached the journal.
+  The found/accepted branch now calls `lookupUserMessageIdByRandomId` and, when
+  the row is missing, falls through to the fresh-accept path — one journal call
+  site still, and `appendInboundUser`'s `journal_user_idempotency_once` guard
+  keeps it idempotent. The order is deliberately NOT reversed: a row without a
+  marker replays as a fresh admission and answers the same text twice.
+
+- **The overflow resolver applies the same journal authority (#344).**
+  `inbound-overflow-resolver.ts` is the second door onto a durable `accepted`
+  marker — the path an id takes when its raw frame could not be retained — and it
+  read the marker as a terminal accept. For a crash-window orphan (or any marker
+  orphaned by §15.6's journal cutover) it ACKED, so the client drained its replay
+  ledger and the message was lost permanently, which is worse than the accept
+  seam's version of the same bug. It now takes an optional `lookupUserRow` dep
+  and, when the journal has no row, publishes nothing at all: a resolver can only
+  report a verdict, so withholding one leaves the ledger entry for the ordinary
+  flush path to admit, journal and answer. It also carries the `committed` echo
+  when a row does exist, which that arm never did.
+
+- **…and so does the debouncer's known-outcome fast path (#344).** Withholding a
+  verdict only preserves a replay if every reader withholds it.
+  `outcomeStore.lookup()` warms the process hot cache on its found path (so does
+  `write.commit()`), and `bounded-inbound-debouncer.ts`'s `peekOutcome`
+  short-circuit reads that cache *before* charging retention — so the replay the
+  resolver had just declined to answer was acked away there instead, and never
+  reached `onFlush`, the journal, or the found branch. The short-circuit now
+  fires only for a refusal: `onKnownOutcome` and the `known-outcome` push result
+  are typed `IngressRefusal` (`Exclude<IngressOutcome, "accepted">`), so a
+  fast-path decision on `accepted` no longer typechecks. The cost is a
+  retention reservation plus one flush per genuine accepted replay; under full
+  retention such replays overflow and drain about one per round instead of all
+  at once (nothing is lost — the client re-drains later), on a path only a
+  client without `random_id` reaches. This is now one rule with one statement —
+  THE READER RULE, on `OutcomeLookup` in `ingress-outcome.ts`: the reader that
+  can ADMIT a message is the only one that may answer an `accepted` outcome
+  with no row; a reader that cannot admit may answer it only when the row exists.
+
+- **The accept seam's journal question covers older clients too (#344).** The
+  lookup is keyed by `randomId ?? wireId` — the dedupe key's body, which is
+  exactly what `appendInboundUser` stores as `idempotency_key` — instead of
+  `random_id` alone. A client that sends no idempotency token now has its
+  crash-window message recovered like any other; it is simply acked bare, since a
+  `committed` entry needs a `random_id` to key it by.
+
+- **The dual-marker warning names the outcome that actually won (#344).**
+  `createRateLimitedOutcomeInvariantWarning` accepted a message, discarded it,
+  and emitted a hardcoded "overloaded wins". Harmless while `overloaded` was the
+  only possible winner; with `cancelled` it told the operator the peer had been
+  sent `inbound_rejected` when it had been silently acked. It now takes the
+  winning outcome — a closed union, so the throttle keyspace stays three static
+  entries — and builds the line itself, with one window per winner.
+
+- **A faulted `cancelled` write fails closed (#344).** `record()`'s disk-error
+  cleanup was gated on `overloaded`; it now covers both refusals. A memory-only
+  suppression dies with the process, and its next replay would run the turn
+  `/stop` killed. `accepted` deliberately keeps its memory-only receipt: losing
+  that marker only re-admits, which the journal's idempotency collapses.
+
+- **`/stop` suppression is its own terminal outcome (#344).** `IngressOutcome`
+  gains `cancelled`, with its own `PersistentDedupe` namespace
+  (`webchannel-inbound-cancelled`) and its own rung — above `overloaded`, above
+  `accepted` — in the lookup precedence. The three suppression writers
+  (`nats-account-runtime.ts`'s `onCancel`, `ingress-dedupe.ts`'s
+  cancelled-inbound fallback, `inbound-overflow-resolver.ts`'s `recoverCancelled`)
+  record it instead of borrowing `accepted`. They write no journal row on
+  purpose, which is byte-identical to the crash window above, so without the split
+  a cancelled message whose ack was lost would have been re-admitted and its
+  aborted turn re-run. A `cancelled` replay is acked and dropped — never
+  `inbound_rejected` and never re-admitted. It still carries the `committed` echo
+  when a row happens to exist (a message journaled before the `/stop` landed).
+  `record()`'s `replaceOpposite` option is renamed `replaceOthers`. Cancellation
+  persists first and retains weaker markers until a later lookup cleans them,
+  so failure or rollback of the replacement preserves the previous verdict. **Upgrade note:** cancellations recorded by an earlier build remain
+  in the `accepted` namespace for their 7-day TTL and are indistinguishable from a
+  crash-window marker; one whose ack was also lost re-runs its turn once on the
+  next replay.
+
 - **A K>=2 count shortfall no longer routes buffered finals onto lanes (#340,
   extends #260).** `flushBufferedOrdinaryFinals` used to fall back to
   `materializedAnswerLanes()` when the finals and the streamed lanes disagreed in

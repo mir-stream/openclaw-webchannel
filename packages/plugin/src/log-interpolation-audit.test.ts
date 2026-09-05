@@ -245,7 +245,16 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // line and `journalable.length`/`journalFailureDiagnostic(error)` on the
   // failure line. Only `peerId` is peer-controlled and only `peerId` is wrapped;
   // the other four are in KNOWN_RAW above with the property each one rests on.
-  "ingress-dedupe.ts": { statements: 15, interpolations: 13 },
+  //
+  // #344 adds ONE more — the `orphaned-accept-marker` recovery line (15→16) and
+  // its TWO interpolations (13→15), `peerId` and `dedupe_id`. BOTH are
+  // peer-controlled and BOTH are `logSafe`-wrapped, which is why this file's
+  // KNOWN_RAW list above is unchanged: the new line adds coverage without adding
+  // debt. (`dedupe_id` — `random_id ?? wireId` — is bounded to 128 chars by
+  // `usableId` before it ever reaches the log, but the wrapping is what makes it
+  // safe, not the bound. It was spelled `random_id=` until round 3 widened the
+  // journal lookup to cover clients that send no `random_id`.)
+  "ingress-dedupe.ts": { statements: 16, interpolations: 15 },
   "approvals.ts": { statements: 9, interpolations: 24 },
   // #240 half 2 rewired both history read sites onto the delivery journal, then
   // review round 1 EXTRACTED both into `history-serve.ts`. 23→19 statements,

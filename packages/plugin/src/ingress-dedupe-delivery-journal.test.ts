@@ -37,6 +37,21 @@
  *  - THE TWO KNOWN GAPS (id-less and non-string-text items are ADMITTED and run
  *    but are NOT journaled) surfaced as a warn, because they are live text
  *    history will not have.
+ *  - THE JOURNAL AS THE DEDUPE AUTHORITY, AND ITS LIMIT (#344). An `accepted`
+ *    marker with no journal row is the crash state between the seam's two durable
+ *    writes, and re-acking on it lost the message from the SSOT forever. One test
+ *    SEEDS that state through the REAL outcome store — the `lookups` fake cannot,
+ *    because it reports every record as freshly `created` — and asserts the whole
+ *    recovery: one row, one turn, one recovery warn, a `committed` echo, and an
+ *    ordinary deduped re-ack on the NEXT replay.
+ *    ⚠️ TWO MORE TESTS PIN THE OTHER HALF, and they are the ones that would have
+ *    caught the round-1 defect: "marker, no row" is ALSO how a `/stop`
+ *    suppression is stored, on purpose, through two different doors
+ *    (`recordCancelledInboundItems` and the cancelled-inbound fallback). They
+ *    drive the real suppression writers with a LOST ack — the trigger, and no
+ *    crash anywhere — and assert the replay is acked and dropped: no row, no
+ *    offer, no `user_committed`, no echo. What separates them from the recovery
+ *    test is the OUTCOME (`cancelled` vs `accepted`), never the row.
  *  - One test against a REAL `openDeliveryJournal`, because nothing else proves
  *    the seam and the store compose.
  */
@@ -46,16 +61,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { PersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
 
 import { createIngressOnFlush } from "./ingress-dedupe.js";
-import { CancelledInboundFallbackTombstones } from "./ingress-dedupe.js";
+import {
+  CancelledInboundFallbackTombstones,
+  recordCancelledInboundItems,
+} from "./ingress-dedupe.js";
 import {
   openDeliveryJournal,
   type DeliveryJournal,
   type DeliveryJournalRow,
 } from "./delivery-journal.js";
 import type { JournalEvent } from "./delivery-journal-event.js";
-import type { IngressOutcomeStore, OutcomeLookup } from "./ingress-outcome.js";
+import {
+  createIngressOutcomeStore,
+  type IngressOutcomeStore,
+  type OutcomeLookup,
+} from "./ingress-outcome.js";
 import { InboundRetentionBudget } from "./inbound-retention.js";
 import type { RetainedDebounceEntry } from "./bounded-inbound-debouncer.js";
 
@@ -221,12 +244,38 @@ class FlakyJournal implements DeliveryJournal {
 }
 
 /**
+ * In-memory `PersistentDedupe`, so a test can drive the REAL
+ * `createIngressOutcomeStore` instead of the `lookups` fake. #344 needs it: the
+ * fake store below always reports `created: true`, so only the real adapter can
+ * exercise the existing marker's reclaim and subsequent receipt rollback.
+ */
+function memoryDedupe(): PersistentDedupe {
+  const values = new Set<string>();
+  const scoped = (key: string, options?: { namespace?: string }) => `${options?.namespace}:${key}`;
+  return {
+    hasRecent: async (key: string, options?: { namespace?: string }) => values.has(scoped(key, options)),
+    checkAndRecord: async (key: string, options?: { namespace?: string }) => {
+      const scopedKey = scoped(key, options);
+      const fresh = !values.has(scopedKey);
+      values.add(scopedKey);
+      return fresh;
+    },
+    forget: async (key: string, options?: { namespace?: string }) => values.delete(scoped(key, options)),
+    warmup: vi.fn(),
+    clearMemory: vi.fn(),
+    memorySize: vi.fn(),
+  } as unknown as PersistentDedupe;
+}
+
+/**
  * The production outcome/lease branch, wired against fakes that all write into
  * one `calls` array. `lookups` decides each key's classification; everything
  * else takes the ordinary fresh-admission path.
  */
 function makeSeam(options?: {
   lookups?: Record<string, OutcomeLookup>;
+  /** Drive the REAL outcome store instead of `lookups` (#344). */
+  outcomeStore?: IngressOutcomeStore;
   onLookup?: (key: string) => void;
   cancelledFallback?: CancelledInboundFallbackTombstones;
   journal?: DeliveryJournal | undefined;
@@ -240,7 +289,7 @@ function makeSeam(options?: {
   const journal = options?.omitJournal
     ? undefined
     : options?.journal ?? new FakeJournal(calls);
-  const store = {
+  const fakeStore = {
     peek: vi.fn(),
     lookup: vi.fn(async (_accountId: string, key: string): Promise<OutcomeLookup> => {
       options?.onLookup?.(key);
@@ -264,6 +313,7 @@ function makeSeam(options?: {
     hotSize: vi.fn(),
     rollbackRecoverySize: vi.fn(),
   } as unknown as IngressOutcomeStore;
+  const store = options?.outcomeStore ?? fakeStore;
 
   const onFlush = createIngressOnFlush<Item>({
     accountId: ACCOUNT,
@@ -346,6 +396,49 @@ const appends = (calls: Call[]) =>
 const warns = (calls: Call[]) =>
   calls.filter((entry): entry is Extract<Call, { call: "warn" }> =>
     entry.call === "warn");
+const ackOf = (calls: Call[]): Extract<Call, { call: "ack" }> => {
+  const ack = calls.find((entry) => entry.call === "ack");
+  if (!ack || ack.call !== "ack") throw new Error("no ack frame emitted");
+  return ack;
+};
+
+describe("recovered admission rollback", () => {
+  it("retries an orphan's turn after a later append fails", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-364-rollback-"));
+    const journal = openDeliveryJournal({ databasePath: join(dir, "journal.db") });
+    try {
+      const outcomeStore = createIngressOutcomeStore({
+        accepted: memoryDedupe(), overloaded: memoryDedupe(), cancelled: memoryDedupe(),
+      });
+      const seed = await outcomeStore.record(ACCOUNT, `${PEER}:r-1`, "accepted");
+      if (seed.status !== "recorded") throw new Error("seed failed");
+      seed.write.commit();
+      const failed = makeSeam({ journal: new FlakyJournal(journal, 2), outcomeStore });
+      await failed.onFlush([item("recovered", "u-1", "r-1"), item("sibling", "u-2", "r-2")]);
+      expect(journal.read(PEER)).toHaveLength(1);
+      expect(failed.calls.filter((call) => call.call === "offer-commit")).toEqual([]);
+      expect(failed.calls.filter((call) => call.call === "ack")).toEqual([]);
+      expect(await outcomeStore.lookup(ACCOUNT, `${PEER}:r-1`)).toEqual({ status: "not-found" });
+      const retry = makeSeam({ journal, outcomeStore });
+      await retry.onFlush([item("recovered", "u-1", "r-1")]);
+      expect(retry.calls.filter((call) => call.call === "offer-commit")).toEqual([
+        { call: "offer-commit", text: "recovered" },
+      ]);
+      const row = journal.lookupUserMessageIdByRandomId(PEER, "r-1")!;
+      expect(journal.read(PEER)).toHaveLength(1);
+      expect(ackOf(retry.calls).committed).toEqual([
+        { random_id: "r-1", messageId: row.messageId, seq: row.seq },
+      ]);
+      const duplicate = makeSeam({ journal, outcomeStore });
+      await duplicate.onFlush([item("recovered", "u-1", "r-1")]);
+      expect(kinds(duplicate.calls)).toEqual(["ack"]);
+      expect(journal.read(PEER)).toHaveLength(1);
+    } finally {
+      journal.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("#239 — the inbound accept journals before it acks", () => {
   it("appends the user event BEFORE the ack reaches the wire", async () => {
@@ -483,18 +576,62 @@ describe("#239 — the inbound accept journals before it acks", () => {
 
   it("re-acks an already-accepted outcome WITHOUT appending a second row", async () => {
     // A replay of a message admitted — and journaled — earlier. Re-journaling it
-    // would be a no-op on `journal_user_once` and would only add a second call
-    // site; the ack still has to go out so the client's ledger entry drains.
+    // would be a no-op on the journal's idempotency key and would only add a
+    // second call site; the ack still has to go out so the client's ledger entry
+    // drains.
+    //
+    // ⚠️ THE FIRST ADMISSION IS NOW REAL, AND IT HAD TO BECOME REAL (#344 round
+    // 3). This test used to assert its premise while contradicting it: the
+    // fixture had an `accepted` marker and an EMPTY journal, which is not "a
+    // message journaled earlier" — it is precisely the crash-window orphan the
+    // seam must re-admit. It passed only because the branch never asked the
+    // journal. Round 3 widened the question to `randomId ?? wireId`, so it asks
+    // for this item too, and the false fixture failed. Round 1 below journals the
+    // message for real; round 2 is the replay the title describes.
+    const lookups: Record<string, OutcomeLookup> = {};
+    const { calls, onFlush } = makeSeam({ lookups });
+
+    await onFlush([item("hello", "u-1")]);
+    expect(appends(calls)).toHaveLength(1);
+
+    // Now the durable outcome exists — the state a replay actually meets.
+    lookups[`${PEER}:u-1`] = { status: "found", outcome: "accepted" };
+    calls.length = 0;
+    await onFlush([item("hello", "u-1")]);
+
+    expect(appends(calls)).toEqual([]);
+    // Positive: the replay really did take the found/accepted branch — it acked,
+    // and it never offered or recorded anything. No `committed` echo: this client
+    // sent no `random_id`, so there is no key to echo the minted id under.
+    expect(calls).toEqual([{ call: "ack", ids: ["u-1"] }]);
+  });
+
+  it("#344: an OLDER client's orphaned marker is re-admitted too, keyed by the wire id", async () => {
+    // The other half of round 3's widening, and the reason it is not cosmetic:
+    // an older client sends no `random_id`, so `appendInboundUser` keys its row
+    // by the wire id (`idempotency_key = randomId ?? turnId`). Round 2 queried
+    // only `random_id` and therefore could not answer the existence question for
+    // these clients at all — their crash-window messages stayed dropped, and the
+    // comment called that a limit. It is the same lookup, one argument wider.
     const { calls, onFlush } = makeSeam({
       lookups: { [`${PEER}:u-1`]: { status: "found", outcome: "accepted" } },
     });
 
     await onFlush([item("hello", "u-1")]);
 
-    expect(appends(calls)).toEqual([]);
-    // Positive: the replay really did take the found/accepted branch — it acked,
-    // and it never offered or recorded anything.
-    expect(calls).toEqual([{ call: "ack", ids: ["u-1"] }]);
+    // Re-admitted: journaled under a server id and dispatched, exactly like a
+    // conforming client's orphan — but acked BARE, because a `committed` entry
+    // needs a `random_id` to key it by and this client has none.
+    expect(appends(calls)).toEqual([
+      {
+        call: "append",
+        conversationId: PEER,
+        event: { kind: "user", id: "webchannel-user-1", text: "hello", turnId: "u-1" },
+      },
+    ]);
+    expect(calls).toContainEqual({ call: "ack", ids: ["u-1"] });
+    expect(kinds(calls)).toContain("offer-commit");
+    expect(warns(calls)[0]!.message).toContain('dedupe_id="u-1"');
   });
 
   it("acks the cancelled-inbound fallback WITHOUT appending", async () => {
@@ -870,6 +1007,237 @@ describe("#239 — the accept seam against a REAL delivery journal", () => {
     }
   });
 
+  it("#344: re-admits an accepted marker with NO journal row, and dedupes the NEXT replay", async () => {
+    const { journal } = openIn();
+    try {
+      // THE CRASH STATE, PRODUCED RATHER THAN ASSUMED. `record()` persists its
+      // marker through the SDK store the moment it is called; the seam's
+      // `appendInboundUser` runs later, in the footer. A kill between the two
+      // leaves exactly this: a durable `accepted` marker for `r-1` and an empty
+      // journal. Seeded through the REAL outcome store, so the seam then meets a
+      // marker it did not create — which is also the only way to show that
+      // re-recording an existing marker does not stop the accept path.
+      const outcomeStore = createIngressOutcomeStore({
+        accepted: memoryDedupe(),
+        overloaded: memoryDedupe(),
+        cancelled: memoryDedupe(),
+      });
+      const seeded = await outcomeStore.record(ACCOUNT, `${PEER}:r-1`, "accepted");
+      if (seeded.status !== "recorded") throw new Error("could not seed the accepted marker");
+      seeded.write.commit();
+      expect(await outcomeStore.lookup(ACCOUNT, `${PEER}:r-1`)).toEqual({
+        status: "found",
+        outcome: "accepted",
+      });
+      expect(journal.lookupUserMessageIdByRandomId(PEER, "r-1")).toBeUndefined();
+
+      // REPLAY 1 — the two stores disagree and the JOURNAL wins: the message is
+      // journaled, the turn is offered, and the ack carries a fresh `committed`
+      // echo. Before #344 this replay was re-acked as a duplicate and the text
+      // was absent from the SSOT forever.
+      const first = makeSeam({ journal, outcomeStore });
+      await first.onFlush([item("hello", "u-1", "r-1")]);
+
+      expect(journal.read(PEER).map((row) => row.event)).toEqual([
+        { kind: "user", id: "webchannel-user-1", text: "hello", turnId: "u-1", randomId: "r-1" },
+      ]);
+      // The whole sequence, not just the row: the recovery is announced, the
+      // #245 broadcast fires (this IS a new admission), the turn is dispatched
+      // ONCE, and the ack is last. No `write-commit`/`write-rollback` entries —
+      // those are the fake store's, and this test drives the real one.
+      expect(kinds(first.calls)).toEqual(["warn", "user_committed", "offer-commit", "ack"]);
+      expect(ackOf(first.calls)).toEqual({
+        call: "ack",
+        ids: ["u-1"],
+        committed: [{ random_id: "r-1", messageId: "webchannel-user-1", seq: 1 }],
+      });
+      expect(warns(first.calls)[0]!.message).toContain(
+        "accepted outcome marker has no journal row, re-admitting",
+      );
+      // `logSafe` quotes it — the whole point of #123's discipline on a
+      // peer-supplied token, so assert the QUOTED form.
+      expect(warns(first.calls)[0]!.message).toContain('dedupe_id="r-1"');
+      expect(warns(first.calls)[0]!.message).toContain(
+        "action=journal-is-authoritative-turn-re-runs-once",
+      );
+
+      // REPLAY 2 — the marker is unchanged but the ROW now exists, so this is an
+      // ordinary deduped retry again: no second row, no second turn, no recovery
+      // line (this seam has its own fresh warning limiter, so silence is a
+      // decision here rather than a suppressed duplicate), and the SAME id/seq
+      // echoed back.
+      const second = makeSeam({ journal, outcomeStore });
+      await second.onFlush([item("hello", "u-1", "r-1")]);
+
+      expect(journal.read(PEER).map((row) => row.seq)).toEqual([1]);
+      expect(second.calls).toEqual([
+        {
+          call: "ack",
+          ids: ["u-1"],
+          committed: [{ random_id: "r-1", messageId: "webchannel-user-1", seq: 1 }],
+        },
+      ]);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("#344: a /stop-cancelled replay is ACKED and dropped — never re-admitted", async () => {
+    const { journal } = openIn();
+    try {
+      // THE ROUND-1 DEFECT, AS A TEST. `/stop` suppression writes a marker and
+      // DELIBERATELY no journal row — the same shape the crash window leaves. The
+      // first version of #344 read "marker, no row" as "crash, re-admit" and re-ran
+      // the killed text. Nothing here is a crash: it is the ordinary lost-ack path.
+      const outcomeStore = createIngressOutcomeStore({
+        accepted: memoryDedupe(),
+        overloaded: memoryDedupe(),
+        cancelled: memoryDedupe(),
+      });
+      // 1. The user sends `u-1`/`r-1`, then hits `/stop` before it flushes.
+      //    `onCancel` records the suppression and acks — and the ACK IS LOST
+      //    (`sendAck` false: the peer is gone, and `.out` is at-most-once).
+      const lostAck = vi.fn(() => false);
+      await recordCancelledInboundItems(
+        [item("delete everything", "u-1", "r-1")],
+        ACCOUNT,
+        async (key) => {
+          const result = await outcomeStore.record(ACCOUNT, key, "cancelled", { replaceOthers: true });
+          if (result.status !== "recorded") throw result.error;
+          result.write.commit();
+          return true;
+        },
+        lostAck,
+      );
+      expect(lostAck).toHaveBeenCalledWith(PEER, ["u-1"]);
+      // The state the seam will meet: a marker, and an empty journal.
+      expect(await outcomeStore.lookup(ACCOUNT, `${PEER}:r-1`)).toEqual({
+        status: "found",
+        outcome: "cancelled",
+      });
+      expect(journal.read(PEER)).toEqual([]);
+
+      // 2. The client still holds `u-1` in its ledger and replays it on reconnect.
+      const replay = makeSeam({ journal, outcomeStore });
+      await replay.onFlush([item("delete everything", "u-1", "r-1")]);
+
+      // Acked so the ledger drains — and NOTHING else. No row, no turn, no
+      // broadcast, no `committed` echo, and no `inbound_rejected` (the peer must
+      // not be told its own `/stop` was backpressure).
+      expect(journal.read(PEER)).toEqual([]);
+      expect(replay.calls).toEqual([{ call: "ack", ids: ["u-1"] }]);
+
+      // 3. And it stays dropped: the marker outlives any number of replays.
+      const again = makeSeam({ journal, outcomeStore });
+      await again.onFlush([item("delete everything", "u-1", "r-1")]);
+      expect(journal.read(PEER)).toEqual([]);
+      expect(again.calls).toEqual([{ call: "ack", ids: ["u-1"] }]);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("#344: the cancelled-inbound FALLBACK path drops its replay the same way", async () => {
+    const { journal } = openIn();
+    try {
+      // The other door onto the same state: the `/stop` suppression WRITE failed,
+      // so `recordCancelledInboundItems` armed a tombstone instead, and the retry
+      // happens inside the seam's own fallback branch. It must reach the same
+      // verdict as the branch above — a marker, no row, and no re-admission.
+      const outcomeStore = createIngressOutcomeStore({
+        accepted: memoryDedupe(),
+        overloaded: memoryDedupe(),
+        cancelled: memoryDedupe(),
+      });
+      const fallback = new CancelledInboundFallbackTombstones();
+      const lostAck = vi.fn(() => false);
+      await recordCancelledInboundItems(
+        [item("delete everything", "u-1", "r-1")],
+        ACCOUNT,
+        async () => { throw new Error("suppression store unavailable"); },
+        lostAck,
+        undefined,
+        fallback,
+      );
+      expect(fallback.has(`${PEER}:r-1`, ACCOUNT)).toBe(true);
+      expect(await outcomeStore.lookup(ACCOUNT, `${PEER}:r-1`)).toEqual({ status: "not-found" });
+
+      // Replay 1 takes the fallback branch: it retries the suppression write,
+      // acks directly, and clears the tombstone. No row, no turn.
+      const first = makeSeam({ journal, outcomeStore, cancelledFallback: fallback });
+      await first.onFlush([item("delete everything", "u-1", "r-1")]);
+      expect(journal.read(PEER)).toEqual([]);
+      expect(first.calls).toEqual([{ call: "ack", ids: ["u-1"] }]);
+      expect(fallback.has(`${PEER}:r-1`, ACCOUNT)).toBe(false);
+      // What it wrote is the CANCELLED marker — the whole point of the retry.
+      expect(await outcomeStore.lookup(ACCOUNT, `${PEER}:r-1`)).toEqual({
+        status: "found",
+        outcome: "cancelled",
+      });
+
+      // Replay 2 no longer has a tombstone, so it goes through the ordinary
+      // outcome lookup — and lands on the cancelled arm, not the re-admit one.
+      const second = makeSeam({ journal, outcomeStore });
+      await second.onFlush([item("delete everything", "u-1", "r-1")]);
+      expect(journal.read(PEER)).toEqual([]);
+      expect(second.calls).toEqual([{ call: "ack", ids: ["u-1"] }]);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("#344: a cancelled replay whose row EXISTS is acked WITH the committed echo", async () => {
+    const { journal } = openIn();
+    try {
+      // "There is no row to echo" was an absolute the code does not hold (round
+      // 2's comment). A message can be journaled and THEN cancelled: `/stop`
+      // landing in the flush-footer window records `cancelled` with
+      // `replaceOthers`, which deletes the `accepted` marker and leaves the row.
+      const outcomeStore = createIngressOutcomeStore({
+        accepted: memoryDedupe(),
+        overloaded: memoryDedupe(),
+        cancelled: memoryDedupe(),
+      });
+
+      // 1. Admitted and journaled for real.
+      const admit = makeSeam({ journal, outcomeStore });
+      await admit.onFlush([item("hello", "u-1", "r-1")]);
+      expect(journal.read(PEER).map((row) => row.seq)).toEqual([1]);
+      expect(ackOf(admit.calls).committed).toEqual([
+        { random_id: "r-1", messageId: "webchannel-user-1", seq: 1 },
+      ]);
+
+      // 2. `/stop` lands after the row and replaces the accepted marker.
+      const suppression = await outcomeStore.record(ACCOUNT, `${PEER}:r-1`, "cancelled", {
+        replaceOthers: true,
+      });
+      if (suppression.status !== "recorded") throw new Error("could not record the suppression");
+      suppression.write.commit();
+      expect(await outcomeStore.lookup(ACCOUNT, `${PEER}:r-1`)).toEqual({
+        status: "found",
+        outcome: "cancelled",
+      });
+
+      // 3. The replay (its ack was lost) is still dropped — no second row, no
+      //    turn — but it CARRIES THE ECHO, so the client can adopt the durable id
+      //    of the bubble it is already showing. Withholding it would lose an id
+      //    the branch handed out before this slice.
+      const replay = makeSeam({ journal, outcomeStore });
+      await replay.onFlush([item("hello", "u-1", "r-1")]);
+
+      expect(journal.read(PEER).map((row) => row.seq)).toEqual([1]);
+      expect(replay.calls).toEqual([
+        {
+          call: "ack",
+          ids: ["u-1"],
+          committed: [{ random_id: "r-1", messageId: "webchannel-user-1", seq: 1 }],
+        },
+      ]);
+    } finally {
+      journal.close();
+    }
+  });
+
   it("refuses the accept when the REAL store is unusable", async () => {
     const { journal } = openIn();
     // A closed handle is the `ERR_INVALID_STATE` shape half 2 measured.
@@ -898,12 +1266,6 @@ describe("#243 half 2a — the server assigns the durable user id and echoes it"
   afterEach(() => {
     while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
   });
-
-  const ackOf = (calls: Call[]): Extract<Call, { call: "ack" }> => {
-    const ack = calls.find((entry) => entry.call === "ack");
-    if (!ack || ack.call !== "ack") throw new Error("no ack frame emitted");
-    return ack;
-  };
 
   it("journals a fresh message under a SERVER id (not the wire id) and echoes it on the ack", async () => {
     const { journal } = openIn();

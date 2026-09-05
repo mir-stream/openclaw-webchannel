@@ -205,6 +205,13 @@ type AccountRuntime = {
   sessionTokens: Map<string, RetentionSessionToken>;
   inboundDebouncer: BoundedInboundDebouncer<any>;
   inboundDispatcher: SerializedInboundDispatcher<any>;
+  /**
+   * #344: the module-scope overflow resolver reaches this account's journal the
+   * same way it reaches its channel — through this map. Absent only for a
+   * runtime published before its journal opened, which cannot happen on the
+   * start path but is typed honestly rather than asserted.
+   */
+  deliveryJournal?: DeliveryJournal;
   owner: object;
   dispose: () => Promise<import("./nats-account-coordinator.js").DisposeReport>;
 };
@@ -232,8 +239,16 @@ const processCancelledInboundFallback = new CancelledInboundFallbackTombstones(
 );
 const processOverflowResolver = new BoundedOverflowResolver({
   outcomeStore: processIngressOutcomes,
-  sendAck: ({ accountId, peerId, id }) =>
-    accountRuntimes.get(accountId)?.channel.sendAck(peerId, [id]) ?? false,
+  // #344: the accept authority, resolved per account exactly like `sendAck`
+  // below. A disposed runtime yields `undefined`, and a closed handle throws
+  // into the resolver's own catch — both leave the id unresolved, which is the
+  // fail-safe direction (the client replays and the flush path decides).
+  lookupUserRow: ({ accountId, peerId }, idempotencyKey) =>
+    accountRuntimes
+      .get(accountId)
+      ?.deliveryJournal?.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
+  sendAck: ({ accountId, peerId, id }, committed) =>
+    accountRuntimes.get(accountId)?.channel.sendAck(peerId, [id], committed) ?? false,
   sendRejected: ({ accountId, peerId, id }) =>
     accountRuntimes.get(accountId)?.channel.sendInboundRejected(peerId, [id]) ?? false,
   onCancelledRecovered: ({ accountId, key }) => {
@@ -1136,8 +1151,14 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         peekOutcome: (peerId, id) =>
           processIngressOutcomes.peek(accountId, `${peerId}:${id}`),
         onKnownOutcome: (peerId, id, outcome) => {
-          if (outcome === "accepted") channel.sendAck(peerId, [id]);
-          else channel.sendInboundRejected(peerId, [id]);
+          // #344: reached ONLY for an `IngressRefusal` — the debouncer never
+          // short-circuits an `accepted` (THE READER RULE, `OutcomeLookup` in
+          // `ingress-outcome.ts`), and the parameter's type says so. Of the two,
+          // `overloaded` is the one the peer hears as a refusal; `cancelled`
+          // (text `/stop` killed) acks so the ledger entry drains, and must not
+          // be reported as backpressure.
+          if (outcome === "overloaded") channel.sendInboundRejected(peerId, [id]);
+          else channel.sendAck(peerId, [id]);
         },
         onOverflow: ({ key: peerId, id, reason, chargedBytes, recoverCancelled }) => {
           pressureLogger.record({
@@ -1162,17 +1183,22 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           // P0-7b: a `/stop` cancels debounce-buffered messages that never reached
           // onFlush, so they were never dedupe-recorded and never acked — yet the
           // client's replay ledger still holds them. Record their ids (so an
-          // in-flight replay is dropped as accepted) and ACK them. The bounded
+          // in-flight replay is dropped as CANCELLED, #344) and ACK them. The bounded
           // debouncer keeps reservations charged until this callback settles.
           await recordCancelledInboundItems(
             entries.map((entry) => entry.item),
             accountId,
             async (key) => {
+              // ⭐ #344 — `cancelled`, NOT `accepted`. This suppression writes a
+              // marker and DELIBERATELY no journal row, which is byte-identical
+              // to the accept seam's crash window; recording it as `accepted`
+              // made a lost ack replay as a re-admission and re-run the very text
+              // `/stop` killed. The distinct outcome is what tells the two apart.
               const result = await processIngressOutcomes.record(
                 accountId,
                 key,
-                "accepted",
-                { replaceOpposite: true },
+                "cancelled",
+                { replaceOthers: true },
               );
               if (result.status !== "recorded") throw result.error;
               result.write.commit();
@@ -1611,6 +1637,9 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
               sessionTokens,
               inboundDebouncer: inboundDebouncer!,
               inboundDispatcher: inboundDispatcher!,
+              // #344: the overflow resolver's accept authority. Same handle the
+              // channel and the accept seam already hold.
+              ...(deliveryJournal ? { deliveryJournal } : {}),
               owner: ownerIdentity,
               dispose,
             };
