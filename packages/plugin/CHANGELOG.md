@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Changed
+
+- **A durable frame the delivery journal COMMITTED is reported as sent, even if
+  its publish fails (#347, extends #278/#325).** The plugin is the Telegram
+  *server*: a message exists once the store holds it under an id and a
+  per-conversation `seq`, and the publish is the *push*. A push that fails is now
+  left to the client's next `get_difference` (the gap-sync machine #244
+  shipped; for this shape it needs #356 half A's cursor — PR #362, which lands
+  first — to gap-test its own ack echo) instead of being re-sent under a second id — which is what the old
+  `false` return made the adapter do, producing one answer's text twice in
+  history while live showed it once. A frame that got no row — every non-durable
+  type, an id-less durable frame, or one whose journal write faulted — still
+  reports a publish failure as a failed send, and the three refusals above the
+  journal (disposed, transport down, no session key) are unchanged.
+
 ### Breaking (wire protocol v4)
 
 - **`WEBCHANNEL_PROTOCOL_VERSION` goes 3 → 4 (#246).** The register gate is
@@ -213,18 +228,6 @@
 
 ### Changed
 
-- **A durable frame the delivery journal COMMITTED is reported as sent, even if
-  its publish fails (#347, extends #278/#325).** The plugin is the Telegram
-  *server*: a message exists once the store holds it under an id and a
-  per-conversation `seq`, and the publish is the *push*. A push that fails is now
-  left to the client's next `get_difference` (the gap-sync machine #244
-  shipped; for this shape it needs #356 half A's cursor — PR #362, which lands
-  first — to gap-test its own ack echo) instead of being re-sent under a second id — which is what the old
-  `false` return made the adapter do, producing one answer's text twice in
-  history while live showed it once. A frame that got no row — every non-durable
-  type, an id-less durable frame, or one whose journal write faulted — still
-  reports a publish failure as a failed send, and the three refusals above the
-  journal (disposed, transport down, no session key) are unchanged.
 - **`WebChannelPeerChannel` gains a required `sendTurnSnapshot(peerId, turnId,
   answers, remove)`.** `NatsChannel` and `NullPeerChannel` implement it. This is
   an internal channel contract, not a published entry point — the plugin ships
