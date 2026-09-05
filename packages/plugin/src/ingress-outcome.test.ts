@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import type { PersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createPersistentDedupe, type PersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
 import {
   MAX_INGRESS_OUTCOME_HOT_BYTES,
   MAX_INGRESS_OUTCOME_HOT_ENTRIES,
@@ -53,6 +56,99 @@ async function commit(
 }
 
 describe("IngressOutcomeStore", () => {
+  it("a failed cancellation replacement keeps the existing durable accept", async () => {
+    const accepted = fake(); const overloaded = fake(); const cancelled = fake();
+    const store = makeStore({ accepted: accepted.store, overloaded: overloaded.store, cancelled: cancelled.store });
+    await commit(store, "a", "p:i", "accepted");
+    (cancelled.store.checkAndRecord as any).mockImplementationOnce(async () => {
+      throw new Error("cancelled database unavailable");
+    });
+    expect((await store.record("a", "p:i", "cancelled", { replaceOthers: true })).status).toBe("unknown");
+    const restarted = makeStore({ accepted: accepted.store, overloaded: overloaded.store, cancelled: cancelled.store });
+    expect(await restarted.lookup("a", "p:i")).toEqual({ status: "found", outcome: "accepted" });
+  });
+
+  it("quarantines SDK cancellation write and cleanup faults without erasing the durable accept", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-cancellation-outcome-"));
+    const blocked = join(dir, "blocked-state");
+    writeFileSync(blocked, "not a directory");
+    const dedupe = (namespacePrefix: string, stateDir = dir) => createPersistentDedupe({
+      pluginId: "webchannel",
+      namespacePrefix,
+      ttlMs: 60_000,
+      memoryMaxSize: 100,
+      stateMaxEntries: 100,
+      env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+    });
+    try {
+      const accepted = dedupe("accepted");
+      const cancelled = dedupe("cancelled", blocked);
+      const store = makeStore({ accepted, overloaded: dedupe("overloaded"), cancelled });
+      await commit(store, "a", "p:i", "accepted");
+
+      // The real SDK inserts memory on write failure; forget clears memory but
+      // reports its disk failure through onDiskError, without throwing.
+      expect((await store.record("a", "p:i", "cancelled", { replaceOthers: true })).status).toBe("unknown");
+      expect(store.rollbackRecoverySize()).toMatchObject({ entries: 1, poisoned: false });
+      expect(store.peek("a", "p:i")).toBeUndefined();
+      expect((await store.lookup("a", "p:i")).status).toBe("unknown");
+      expect(await dedupe("accepted").hasRecent("p:i", { namespace: "a" })).toBe(true);
+
+      rmSync(blocked);
+      const restarted = makeStore({
+        accepted: dedupe("accepted"), overloaded: dedupe("overloaded"),
+        cancelled: dedupe("cancelled", blocked),
+      });
+      expect(await restarted.lookup("a", "p:i")).toEqual({ status: "found", outcome: "accepted" });
+      expect(await store.lookup("a", "p:i")).toEqual({ status: "found", outcome: "accepted" });
+      expect(store.rollbackRecoverySize().entries).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, true])("preserves the previous verdict when cancellation rollback cleanup fails=%s", async (failCleanup) => {
+    const accepted = fake(); const overloaded = fake(); const cancelled = fake();
+    const store = makeStore({ accepted: accepted.store, overloaded: overloaded.store, cancelled: cancelled.store });
+    await commit(store, "a", "p:i", "accepted");
+    const suppression = await store.record("a", "p:i", "cancelled", { replaceOthers: true });
+    if (suppression.status !== "recorded") throw new Error("suppression unexpectedly unknown");
+    expect(suppression.write.created).toBe(true);
+    expect(accepted.values.has("a:p:i")).toBe(true);
+    if (failCleanup) {
+      vi.mocked(cancelled.store.forget).mockImplementationOnce(async (_key, options) => {
+        options?.onDiskError?.(new Error("cleanup failed"));
+        return false;
+      });
+    }
+    expect(await suppression.write.rollback()).toBe(!failCleanup);
+    expect(accepted.values.has("a:p:i")).toBe(true);
+    expect(await store.lookup("a", "p:i")).toEqual({ status: "found", outcome: "accepted" });
+    expect(cancelled.values.has("a:p:i")).toBe(false);
+  });
+
+  it("reclaims an orphan under the key gate and quarantines failed erasure before recording", async () => {
+    const accepted = fake();
+    const store = makeStore({ accepted: accepted.store, overloaded: fake().store });
+    await commit(store, "a", "p:i", "accepted");
+    vi.mocked(accepted.store.forget).mockImplementationOnce(async (_key, options) => {
+      options?.onDiskError?.(new Error("orphan erasure failed"));
+      return false;
+    });
+    expect((await store.record("a", "p:i", "accepted", { reclaimAccepted: true })).status).toBe("unknown");
+    expect(accepted.store.checkAndRecord).toHaveBeenCalledTimes(1);
+    expect(store.peek("a", "p:i")).toBeUndefined();
+    expect(store.rollbackRecoverySize().entries).toBe(1);
+
+    const retry = await store.record("a", "p:i", "accepted", { reclaimAccepted: true });
+    if (retry.status !== "recorded") throw new Error("reclaim unexpectedly unknown");
+    expect(retry.write.created).toBe(true);
+    const lookup = store.lookup("a", "p:i");
+    expect(await retry.write.rollback()).toBe(true);
+    expect(await lookup).toEqual({ status: "not-found" });
+    expect(store.rollbackRecoverySize().entries).toBe(0);
+  });
+
   it("warns for cold lookup and accepted/overloaded record storage failures without error data", async () => {
     const accepted = fake(); const overloaded = fake();
     const warned: string[] = [];
@@ -181,7 +277,7 @@ describe("IngressOutcomeStore", () => {
     });
   });
 
-  it("keeps cancelled fallback and emits no ACK when opposite replacement fails", async () => {
+  it("ACKs durable cancellation even when later weaker-marker cleanup fails", async () => {
     const accepted = fake(); const overloaded = fake();
     const store = makeStore({ accepted: accepted.store, overloaded: overloaded.store });
     await commit(store, "a", "p:i", "overloaded");
@@ -208,8 +304,9 @@ describe("IngressOutcomeStore", () => {
     })).toEqual({ status: "started" });
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-    expect(sendAck).not.toHaveBeenCalled();
-    expect(fallback.has("p:i", "a")).toBe(true);
+    expect(sendAck).toHaveBeenCalledWith(expect.objectContaining({ peerId: "p", id: "i" }));
+    expect(fallback.has("p:i", "a")).toBe(false);
+    expect(await store.lookup("a", "p:i")).toEqual({ status: "found", outcome: "cancelled" });
     expect(overloaded.values.has("a:p:i")).toBe(true);
     expect(accepted.values.has("a:p:i")).toBe(false);
     expect(resolver.usage()).toEqual({ tasks: 0, metadataBytes: 0 });
@@ -283,7 +380,7 @@ describe("IngressOutcomeStore", () => {
     expect(await store.lookup("a", "p:i")).toEqual({ status: "found", outcome: "accepted" });
   });
 
-  it("#344: cancelled outranks both other markers on lookup, and replaceOthers clears them", async () => {
+  it("cancelled replacements retain weaker markers until lookup and suppress them after restart", async () => {
     // The two halves of making `cancelled` a first-class terminal outcome.
     const accepted = fake(); const overloaded = fake(); const cancelled = fake();
     const invariants: string[] = [];
@@ -294,23 +391,26 @@ describe("IngressOutcomeStore", () => {
       warnInvariant: (message) => invariants.push(message),
     });
 
-    // WRITE HALF: `replaceOthers` means EVERY other outcome, not "the opposite".
-    // With three outcomes those stopped being the same set, and a cancellation
-    // that left an `accepted` marker behind would be re-admitted by the accept
-    // seam — the exact defect the split exists to close.
+    // Keep old markers until the replacement receipt settles; cancellation's
+    // higher precedence makes the pair safe even across a process restart.
     accepted.values.add("a:p:i");
     overloaded.values.add("a:p:i");
     const suppression = await store.record("a", "p:i", "cancelled", { replaceOthers: true });
     if (suppression.status !== "recorded") throw new Error("suppression unexpectedly unknown");
     suppression.write.commit();
+    expect(accepted.values.has("a:p:i")).toBe(true);
+    expect(overloaded.values.has("a:p:i")).toBe(true);
+    expect(cancelled.values.has("a:p:i")).toBe(true);
+    const restarted = makeStore({
+      accepted: accepted.store, overloaded: overloaded.store, cancelled: cancelled.store,
+      warnInvariant: (winner) => invariants.push(winner),
+    });
+    expect(await restarted.lookup("a", "p:i")).toEqual({ status: "found", outcome: "cancelled" });
     expect(accepted.values.has("a:p:i")).toBe(false);
     expect(overloaded.values.has("a:p:i")).toBe(false);
-    expect(cancelled.values.has("a:p:i")).toBe(true);
-    expect(await store.lookup("a", "p:i")).toEqual({ status: "found", outcome: "cancelled" });
     expect(invariants).toEqual([]);
 
-    // READ HALF: if a partial failure ever leaves two markers, the strongest
-    // suppression wins and the weaker one is deleted with a named violation.
+    // Cleanup may also be retried with the same precedence.
     // `cancelled` over `overloaded` is the decision documented on
     // OUTCOME_PRECEDENCE: killed text must not be reported as backpressure.
     overloaded.values.add("a:p:i");
@@ -318,7 +418,7 @@ describe("IngressOutcomeStore", () => {
     expect(await store.lookup("a", "p:i")).toEqual({ status: "found", outcome: "cancelled" });
     // The store reports the WINNER; the line is built by the limiter (see
     // "names the WINNING outcome…" below, which asserts the console text).
-    expect(invariants).toEqual(["cancelled", "cancelled"]);
+    expect(invariants).toEqual([]);
     expect(overloaded.values.has("a:p:i")).toBe(false);
     expect(accepted.values.has("a:p:i")).toBe(false);
 
@@ -337,12 +437,8 @@ describe("IngressOutcomeStore", () => {
   });
 
   it("re-recording an EXISTING accepted marker still reports `recorded`, as a follower", async () => {
-    // #344's accept path depends on this shape. When the journal has no row for
-    // a marked `random_id`, `ingress-dedupe.ts` re-admits the message down the
-    // FRESH path — which calls `record(…, "accepted")` for a key that is already
-    // marked. If that answered anything but `status: "recorded"` the seam would
-    // stall on its FIFO barrier and the message would never be journaled, so the
-    // recovery rests on this contract rather than on a fresh insert.
+    // Ordinary repeat writes remain followers. Journal-proven orphan recovery
+    // explicitly opts into reclaimAccepted and owns a new receipt instead.
     const accepted = fake(); const overloaded = fake();
     const store = makeStore({ accepted: accepted.store, overloaded: overloaded.store });
 
@@ -356,9 +452,7 @@ describe("IngressOutcomeStore", () => {
     // A FOLLOWER: durable and usable, but it did not create the marker...
     expect(again.durability).toBe("durable");
     expect(again.write.created).toBe(false);
-    // ...so its rollback has no authority to delete it. That is what makes a
-    // refused re-admission batch safe: the marker survives, and the next replay
-    // takes the same recovery path instead of hitting a wiped outcome store.
+    // ...so its rollback has no authority to delete it.
     expect(await again.write.rollback()).toBe(false);
     expect(accepted.values.has("a:p:i")).toBe(true);
     expect(await store.lookup("a", "p:i")).toEqual({ status: "found", outcome: "accepted" });

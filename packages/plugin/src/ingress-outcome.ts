@@ -148,7 +148,12 @@ export interface IngressOutcomeStore {
     accountId: string,
     key: string,
     outcome: IngressOutcome,
-    options?: { replaceOthers?: boolean },
+    options?: {
+      /** Replace conflicting outcomes; cancelled keeps weaker markers until lookup. */
+      replaceOthers?: boolean;
+      /** The admission seam proved this accepted marker has no journal row. */
+      reclaimAccepted?: boolean;
+    },
   ): Promise<OutcomeRecordResult>;
   forget(accountId: string, key: string, outcome: IngressOutcome): Promise<boolean>;
   hotSize(): { entries: number; bytes: number };
@@ -203,9 +208,9 @@ function hotBytes(accountId: string, key: string): number {
  * Lookup precedence, STRONGEST SUPPRESSION FIRST — and the order is a decision,
  * not an accident (#344).
  *
- * A key must carry exactly one terminal outcome; `replaceOthers` is what keeps
- * that true at write time. This order decides who wins if a partial failure ever
- * leaves two, and it is the fail-safe direction: `accepted` is the only verdict
+ * Cancellation replacement keeps the weaker marker until a later lookup cleans
+ * it, so a failed write or rolled-back receipt cannot erase the old suppression.
+ * This order decides who wins while both exist: `accepted` is the only verdict
  * that RUNS the text, so it loses to both refusals.
  *
  * `cancelled` outranks `overloaded` on purpose. Both refuse, but they tell the
@@ -366,9 +371,9 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
         return { status: "unknown", error };
       }
       if (probe.found) {
-        // Exactly one terminal outcome may survive. A WEAKER marker alongside
-        // this one is an invariant violation: say so and delete it, best-effort,
-        // exactly as the overloaded-vs-accepted case has always done. A probe
+        // Cancelled replacements deliberately retain their weaker markers until
+        // their receipt settles. Clean those up here; overloaded-vs-accepted is
+        // still an invariant violation. A probe
         // that throws here is skipped rather than escalated — the winning
         // outcome is already known and returning `unknown` would lose it.
         for (let weaker = rung + 1; weaker < OUTCOME_PRECEDENCE.length; weaker++) {
@@ -376,7 +381,7 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
           let also: { found: boolean; diskError?: unknown } | undefined;
           try { also = await hasRecent(storeFor(loser), accountId, key); } catch { /* winner stands */ }
           if (!also?.found) continue;
-          options.warnInvariant?.(outcome);
+          if (outcome !== "cancelled") options.warnInvariant?.(outcome);
           await storeFor(loser).forget(key, { namespace: accountId }).catch(() => false);
         }
         // ⚠️ THE DURABILITY RULE IS PER-OUTCOME AND IS NOT AN OVERSIGHT.
@@ -388,24 +393,9 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
         // promoting an overloaded hot entry is what those gates were written
         // against.
         //
-        // For `cancelled` it IS a change (#344 round 3), stated rather than
-        // hidden: while a cancellation was spelled `accepted` it inherited, and
-        // now it pins. It is sound because `record()` above fails a faulted
-        // `cancelled` write CLOSED and deletes the marker the SDK had already
-        // inserted, so no `recorded` receipt for `cancelled` is ever memory-only
-        // — which is why the three cancellation writers do NOT check
-        // `durability`: that check would be inert, and a dead guard reads as a
-        // live one to the next person.
-        //
-        // ⚠️ NOT "no memory-only cancelled marker can exist" — that was the round
-        // 3 wording and it over-claimed. The compensating `store.forget(...)` in
-        // that arm is best-effort (`catch { /* recovery is retry */ }`), so a
-        // throw there leaves the SDK's IN-MEMORY cancelled marker alive, and a
-        // later `lookupUnlocked` finds it and stamps it `durable` here. Harmless
-        // today, precisely and only because nothing gates on cancelled
-        // durability and the fallback tombstone — not the marker — is what
-        // carries the suppression until a durable write lands. A future gate on
-        // it would have to close this hole first.
+        // `cancelled` fails a faulted write closed. Failed removal of the SDK's
+        // memory-only marker enters rollback recovery before any lookup, so it
+        // cannot authorize cleanup of a durable, weaker marker here.
         const existing = hot.get(hotKey(accountId, key));
         putHot(
           accountId,
@@ -425,6 +415,23 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
     return { status: "not-found" };
   };
 
+  const eraseMarkerUnlocked = async (
+    accountId: string,
+    key: string,
+    outcome: IngressOutcome,
+  ): Promise<{ status: "ok" } | { status: "unknown"; error: unknown }> => {
+    let diskError: unknown;
+    try {
+      await storeFor(outcome).forget(key, {
+        namespace: accountId,
+        onDiskError: (error) => { diskError = error; },
+      });
+    } catch (error) {
+      return { status: "unknown", error };
+    }
+    return diskError !== undefined ? { status: "unknown", error: diskError } : { status: "ok" };
+  };
+
   const recoverFailedRollbackUnlocked = async (
     accountId: string,
     key: string,
@@ -436,20 +443,10 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
     const mapKey = hotKey(accountId, key);
     const recovery = rollbackRecovery.get(mapKey);
     if (!recovery) return { status: "ok" };
-    const store = storeFor(recovery.outcome);
-    let diskError: unknown;
-    try {
-      await store.forget(key, {
-        namespace: accountId,
-        onDiskError: (error) => { diskError = error; },
-      });
-    } catch (error) {
+    const erased = await eraseMarkerUnlocked(accountId, key, recovery.outcome);
+    if (erased.status === "unknown") {
       options.warnFailure?.(accountId, `rollback-recovery-${recovery.outcome}`);
-      return { status: "unknown", error };
-    }
-    if (diskError !== undefined) {
-      options.warnFailure?.(accountId, `rollback-recovery-${recovery.outcome}`);
-      return { status: "unknown", error: diskError };
+      return erased;
     }
     // `false` is also a successful cleanup: it means the exact marker is already
     // absent. The key gate prevents a replacement generation from being created
@@ -492,7 +489,20 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
           releaseOperation();
           return recovery;
         }
-        if (recordOptions?.replaceOthers) {
+        if (recordOptions?.reclaimAccepted && outcome === "accepted") {
+          // The caller proved the old marker is an orphan. Reclaim it under
+          // this same gate so the new admission owns its rollback, including
+          // when a sibling append fails after this item's row was inserted.
+          // A failed erase must not turn the next write into a follower.
+          const reclaimed = await eraseMarkerUnlocked(accountId, key, outcome);
+          if (reclaimed.status === "unknown") {
+            rememberFailedRollback(accountId, key, outcome, "durable");
+            releaseOperation();
+            return reclaimed;
+          }
+          deleteHot(accountId, key, outcome);
+        }
+        if (recordOptions?.replaceOthers && outcome !== "cancelled") {
           // EVERY other outcome, not "the opposite" — #344 made the set three, and
           // the property this enforces was never about pairs: after this write no
           // conflicting terminal marker may survive. With two outcomes the two
@@ -521,6 +531,9 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
           }
           deleteHot(accountId, key);
         }
+        // A cancelled replacement is written BEFORE weaker markers are erased.
+        // Keep them until a later lookup: rollback of this receipt can then
+        // remove only the new cancellation without losing the previous verdict.
         fresh = await store.checkAndRecord(key, {
           namespace: accountId,
           onDiskError: (error) => { diskError = error; },
@@ -550,8 +563,13 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
         // then collapses — the benign direction, and the one the accept path was
         // written against.
         if (outcome !== "accepted") {
-          // Remove memory first, then best-effort disk state.
-          try { await store.forget(key, { namespace: accountId }); } catch { /* recovery is retry */ }
+          // The SDK inserts memory before reporting its disk fault. Quarantine
+          // failed cleanup so a later lookup cannot mistake that marker for a
+          // durable cancellation and erase the previous accepted suppression.
+          const erased = await eraseMarkerUnlocked(accountId, key, outcome);
+          if (erased.status === "unknown") {
+            rememberFailedRollback(accountId, key, outcome, "memory-only");
+          }
           deleteHot(accountId, key, outcome);
           releaseOperation();
           return { status: "unknown", error: diskError };

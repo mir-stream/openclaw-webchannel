@@ -182,9 +182,9 @@
   aborted turn re-run. A `cancelled` replay is acked and dropped — never
   `inbound_rejected` and never re-admitted. It still carries the `committed` echo
   when a row happens to exist (a message journaled before the `/stop` landed).
-  `record()`'s `replaceOpposite` option is renamed `replaceOthers` and now clears
-  every other outcome's marker, which is what its fail-closed comment always
-  described. **Upgrade note:** cancellations recorded by an earlier build remain
+  `record()`'s `replaceOpposite` option is renamed `replaceOthers`. Cancellation
+  persists first and retains weaker markers until a later lookup cleans them,
+  so failure or rollback of the replacement preserves the previous verdict. **Upgrade note:** cancellations recorded by an earlier build remain
   in the `accepted` namespace for their 7-day TTL and are indistinguishable from a
   crash-window marker; one whose ack was also lost re-runs its turn once on the
   next replay.

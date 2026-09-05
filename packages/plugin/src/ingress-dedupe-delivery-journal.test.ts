@@ -246,9 +246,8 @@ class FlakyJournal implements DeliveryJournal {
 /**
  * In-memory `PersistentDedupe`, so a test can drive the REAL
  * `createIngressOutcomeStore` instead of the `lookups` fake. #344 needs it: the
- * fake store below always reports `created: true`, so only the real one can show
- * that re-recording an EXISTING `accepted` marker still returns
- * `status: "recorded"` and lets the accept path proceed.
+ * fake store below always reports `created: true`, so only the real adapter can
+ * exercise the existing marker's reclaim and subsequent receipt rollback.
  */
 function memoryDedupe(): PersistentDedupe {
   const values = new Set<string>();
@@ -402,6 +401,44 @@ const ackOf = (calls: Call[]): Extract<Call, { call: "ack" }> => {
   if (!ack || ack.call !== "ack") throw new Error("no ack frame emitted");
   return ack;
 };
+
+describe("recovered admission rollback", () => {
+  it("retries an orphan's turn after a later append fails", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-364-rollback-"));
+    const journal = openDeliveryJournal({ databasePath: join(dir, "journal.db") });
+    try {
+      const outcomeStore = createIngressOutcomeStore({
+        accepted: memoryDedupe(), overloaded: memoryDedupe(), cancelled: memoryDedupe(),
+      });
+      const seed = await outcomeStore.record(ACCOUNT, `${PEER}:r-1`, "accepted");
+      if (seed.status !== "recorded") throw new Error("seed failed");
+      seed.write.commit();
+      const failed = makeSeam({ journal: new FlakyJournal(journal, 2), outcomeStore });
+      await failed.onFlush([item("recovered", "u-1", "r-1"), item("sibling", "u-2", "r-2")]);
+      expect(journal.read(PEER)).toHaveLength(1);
+      expect(failed.calls.filter((call) => call.call === "offer-commit")).toEqual([]);
+      expect(failed.calls.filter((call) => call.call === "ack")).toEqual([]);
+      expect(await outcomeStore.lookup(ACCOUNT, `${PEER}:r-1`)).toEqual({ status: "not-found" });
+      const retry = makeSeam({ journal, outcomeStore });
+      await retry.onFlush([item("recovered", "u-1", "r-1")]);
+      expect(retry.calls.filter((call) => call.call === "offer-commit")).toEqual([
+        { call: "offer-commit", text: "recovered" },
+      ]);
+      const row = journal.lookupUserMessageIdByRandomId(PEER, "r-1")!;
+      expect(journal.read(PEER)).toHaveLength(1);
+      expect(ackOf(retry.calls).committed).toEqual([
+        { random_id: "r-1", messageId: row.messageId, seq: row.seq },
+      ]);
+      const duplicate = makeSeam({ journal, outcomeStore });
+      await duplicate.onFlush([item("recovered", "u-1", "r-1")]);
+      expect(kinds(duplicate.calls)).toEqual(["ack"]);
+      expect(journal.read(PEER)).toHaveLength(1);
+    } finally {
+      journal.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("#239 — the inbound accept journals before it acks", () => {
   it("appends the user event BEFORE the ack reaches the wire", async () => {

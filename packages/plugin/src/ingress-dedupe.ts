@@ -18,74 +18,31 @@
  *       cannot happen here — this runs inside the debouncer's `onFlush`, which is
  *       same-peer serialized by core's keyChains, so checks are already ordered.
  *
- * THE CRASH WINDOW (deliberate at-most-once tradeoff — stated honestly).
- * `checkAndRecord` records the id BEFORE the turn runs. So there is a narrow
- * window — from the record to the turn actually starting — where a PROCESS CRASH
- * used to lose the message permanently: on restart the P0-7b replay queue
- * re-sends the SAME id, we saw it as already-recorded, and dropped it — deduping
- * away the very message the replay queue exists to recover. We accepted this
- * because the alternative (claim/commit: record only AFTER the turn's effect
- * persists) trades this rare case for a far worse-in-practice one — it RE-ADMITS
- * duplicates on every crash-AFTER-effect and every partial-delivery, which are
- * much more common than crash-in-window, and rationale (b) means a per-id
- * commit/rollback is wrong for merged turns anyway. Crucially the loss window
- * here is record→turn-start — sub-millisecond on the serialized flush path —
- * versus the wide duplicate-turn window claim/commit would open
- * (record→effect-persisted, spanning the whole agent run). Narrow at-most-once
- * beats wide at-least-once for this surface. That deviation from the sketch is
- * deliberate and settled, and the ORDER is unchanged.
+ * THE CRASH WINDOW. Outcome markers are persisted before the journal row and
+ * before the dispatcher starts the turn. #344 recovers the marker→row window:
+ * an accepted marker without a row under `randomId ?? wireId` is reclaimed and
+ * re-admitted through this seam's ordinary journal/dispatch path. The new
+ * receipt owns rollback if a later batch append fails. Other readers follow
+ * THE READER RULE on `OutcomeLookup` in `ingress-outcome.ts` and leave an orphan
+ * unresolved until it reaches this admission seam.
  *
- * ⚠️ WHAT CHANGED IS THAT THE WINDOW NOW HEALS (#344), FOR MOST OF IT. No reader
- * treats a durable `accepted` marker as proof of an accept any more: the journal
- * is the SSOT (doc §15.7), so when it has no row under this id's identity
- * (`randomId ?? wireId` — the dedupe key's body, which is exactly what
- * `appendInboundUser` stores as `idempotency_key`), the marker loses.
+ * A journal row does not prove that the turn started. A crash after the row is
+ * persisted but before dispatch still leaves marker+row, and replay re-acks it
+ * without starting the lost turn. Recovering durable queued work is separate
+ * from this marker→row repair; the store/dispatch order is unchanged.
  *
- * ⭐ UNDER ONE RULE, STATED ONCE AND NOT REPEATED HERE: **THE READER RULE**, on
- * `OutcomeLookup` in `ingress-outcome.ts`. In short — `accepted` is not a
- * verdict, and THIS SEAM'S found/accepted branch is the only reader allowed to
- * RE-ADMIT on it, because it is the only reader that can admit a message. Row
- * present ⇒ re-ack with the echo; row absent ⇒ RE-ADMIT (journaled, dispatched,
- * acked). Every other reader defers instead of answering, so the replay keeps
- * arriving until it reaches here.
- *
- * A crash anywhere between the marker and the row is therefore recovered by the
- * client's next replay that gets this far. See that branch and the footer's
- * ordering block (which states the cost). Two rounds of this fix were spent
- * discovering readers that were answering instead of deferring — the resolver,
- * then the debouncer's fast path — which is why the rule lives in one place and
- * is cited rather than restated.
- *
- * ⚠️ AND IT IS ONLY SAFE BECAUSE `cancelled` IS ITS OWN OUTCOME — the first
- * version of this fix was wrong here, so the reason is worth keeping. "Marker,
- * no row" is NOT only the crash window: the three `/stop` suppression writers
- * (`nats-account-runtime.ts`'s `onCancel`, this file's cancelled-inbound
- * fallback, `inbound-overflow-resolver.ts`'s `recoverCancelled`) write a marker
- * and DELIBERATELY no row. While they spelled that `accepted`, the two states
- * were byte-identical, and a cancelled message whose ack was lost — `sendAck`
- * returned false, or the peer was offline and the at-most-once `.out` frame
- * evaporated — came back on reconnect and was RE-ADMITTED: `/stop` undone, the
- * killed turn run. They now record `cancelled` (`ingress-outcome.ts`), which the
- * found branch drops with an ack and never re-admits. The journal answers "was
- * this accepted?"; only the outcome can answer "was it ever meant to be?".
+ * Cancellation uses its own `cancelled` outcome so a replay of text `/stop`
+ * killed cannot be confused with an orphan. It is ACKed without re-admission;
+ * journal-aware readers include the existing committed echo when available.
  *
  * ⚠️ MIGRATION, NARROW BUT REAL. A cancellation recorded by a build BEFORE this
  * change sits in the `accepted` namespace and stays ambiguous for that marker's
  * 7-day TTL: if that same message's ack was ALSO lost, its next replay finds
  * `accepted` with no row and re-runs the turn once. It needs a pre-upgrade
- * cancellation AND a lost ack AND a replay inside the TTL. Not repaired on
- * purpose — the two namespaces cannot be told apart after the fact, and
- * re-running one aborted turn is the lesser error than re-introducing the drop
- * this slice exists to remove.
+ * cancellation AND a lost ack AND a replay inside the TTL. This implementation
+ * cannot identify which producer wrote an old marker.
  *
- * ⚠️ TWO THINGS THE HEALING DOES NOT COVER, so this heading is not retired.
- * (It was THREE until round 3. An older client that sends no `random_id` used to
- * head this list, on the grounds that its row "is keyed by the wire id, which
- * this seam does not query" — true of the code, but the reason given for it was
- * wrong: the existence check IS the whole fix for those clients, not a bonus on
- * top of an echo they cannot receive. The lookup is now `randomId ?? wireId` and
- * they heal like everyone else; they are simply acked bare, since a `committed`
- * entry needs a `random_id` to key it by.)
+ * This repair also does not cover:
  *  1. THE ID-LESS ADMIT PATH. No usable wire id ⇒ no dedupe key ⇒ neither a
  *     marker nor a row is ever written for it, so there is nothing here to heal;
  *     the item is admitted un-deduped and reported as a gap exactly as before
@@ -812,8 +769,8 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           const randomId = usableId(item.message.random_id) ? item.message.random_id : undefined;
           // #344: set when the found/accepted branch below refuses the marker as
           // evidence and falls through to the fresh-accept path. The only thing
-          // it changes downstream is that this key already carries a durable
-          // `accepted` marker, which matters to the overloaded record.
+          // it changes downstream is ownership of the old accepted marker:
+          // admission reclaims it for rollback; overload replaces it.
           let readmitted = false;
 
           // A cancellation tombstone is authoritative and must run before an
@@ -941,8 +898,8 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // ⚠️ IT STILL ECHOES A ROW THAT EXISTS, and "there is no row to echo"
             // was wrong as an absolute (round 2). A message can be journaled and
             // THEN cancelled: `/stop` landing in the flush-footer window records
-            // `cancelled` with `replaceOthers`, which deletes the `accepted`
-            // marker but not the row. Withholding the echo there loses the id the
+            // `cancelled` with `replaceOthers`; lookup later cleans the weaker
+            // accepted marker, while the row remains. Withholding the echo there loses the id the
             // client needs to adopt its bubble — which the branch did echo before
             // this slice. The verdict ignores the row; the echo does not.
             if (existing.outcome === "cancelled") {
@@ -1066,7 +1023,12 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
 
           let recorded: OutcomeRecordResult | undefined;
           try {
-            recorded = await deps.outcomeStore.record(accountId, key, "accepted");
+            recorded = await deps.outcomeStore.record(
+              accountId,
+              key,
+              "accepted",
+              readmitted ? { reclaimAccepted: true } : undefined,
+            );
           } catch {
             warnOutcomeFailure(accountId, "adapter-record-accepted");
             // A thrown storage adapter is the same unresolved classification as
@@ -1162,8 +1124,8 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         // `accepted` marker with no row is not evidence of an accept. The
         // found/accepted branch in the item loop enforces it — it consults this
         // journal and re-admits (journals + dispatches) rather than re-acking.
-        // That check is what makes the crash window the file header describes
-        // HEAL on the client's replay instead of losing the message forever.
+        // This repairs only a crash between marker and row. A crash after the
+        // row but before turn start still re-acks without recovering dispatch.
         //
         // ⚠️ THE QUESTION IS ASKED ONLY OF `accepted`, AND THAT IS THE FIX'S
         // LOAD-BEARING HALF. "No row" is a deliberate, permanent state for the
