@@ -102,10 +102,14 @@ function normalizeAssistantMessageIndex(value: unknown): number | undefined {
 
 /**
  * #244 half B — the inbound frame types that carry a per-conversation `seq`, i.e.
- * the DURABLE frames the plugin stamps `seq` on (`isSeqBearingFrame` in
- * `delivery-journal-event.ts` is the server-side twin, and its drift test pins the
- * set). These are the frames gap detection watches and the ones buffered while a
- * `get_difference` is in flight. A frame of one of these types WITHOUT a `seq`
+ * the DURABLE frames the plugin stamps `seq` on. `isSeqBearingFrame`
+ * (`delivery-journal-event.ts`) is the server-side twin of the OUTBOUND seven,
+ * and its drift test pins those seven against the journal mapper — it does NOT
+ * pin this list, which has an eighth member: `user_committed`, which that
+ * predicate explicitly REJECTS (its seq is set at construction, not stamped at
+ * egress). Seven plus that echo is what makes this client's stream contiguous.
+ * These are the frames gap detection watches and the ones held while a
+ * `get_difference` is outstanding. A frame of one of these types WITHOUT a `seq`
  * (an id-less `agent_message`, a live reasoning DRAFT) is still handled normally —
  * it just carries no cursor, so it neither advances nor gaps.
  */
@@ -136,9 +140,180 @@ function isSeqBearingInbound(msg: { type?: unknown }): boolean {
  * re-issuing the request, and how many times to re-issue before giving up into a
  * re-detect. The request and reply both ride the at-most-once `.out`, so either
  * can vanish; this is what keeps a dropped one from wedging the stream in-session.
+ *
+ * Telegram has no equivalent because its `getDifference` is an RPC on a session
+ * connection: the transport tells the app when a call was lost. Ours is a
+ * fire-and-forget publish answered by another publish, so the timer is the only
+ * thing that can notice.
  */
 const GET_DIFFERENCE_TIMEOUT_MS = 5_000;
 const GET_DIFFERENCE_MAX_RETRIES = 3;
+
+/**
+ * #356 — THE SEQ CURSOR, AS THE STATE MACHINE TELEGRAM SPECIFIES.
+ *
+ * This replaces a cursor number plus five satellite fields (`differenceInFlight`,
+ * `gapBuffer`, `pendingAfterSeq`, `pendingDeferredSeq`, a timer generation) that
+ * SEVEN reviewers found EIGHT defects in — every one of them a pair of those
+ * fields disagreeing about what was already applied. The fix is not a ninth rule:
+ * it is that the states are now the type, so the disagreeing combinations cannot
+ * be written down.
+ *
+ * The model is `core.telegram.org/api/updates`, which our roles map onto exactly
+ * (our plugin = Telegram's plugin AND server; our client = the Telegram APP).
+ * `seq` is `pts`; this cursor is the app's `local_pts`; `get_difference` is
+ * `updates.getDifference`; the `history` snapshot's `highWaterSeq` is
+ * `updates.getState`. Our `pts_count` is always 1 — every durable frame is one
+ * journal row — so Telegram's three-way test collapses to:
+ *
+ *   seq === last + 1  → apply           ("the update can be applied")
+ *   seq <= last       → already covered ("the update was already applied")
+ *   seq >  last + 1   → GAP             ("an update gap that must be filled")
+ *
+ * ── THE STATES ──
+ *
+ *  - `unseeded` — NO baseline yet, so no gap can be computed: Telegram's app
+ *    never calls `getDifference` before it holds a `pts`. The FIRST seq this
+ *    client observes — the snapshot's `highWaterSeq` (`getState`, the normal
+ *    case) or, if a durable frame beats it, that frame's own seq — becomes the
+ *    baseline, and the frame that carried it folds. Nothing is requested.
+ *
+ *    ⚠️ ADOPTING THE FIRST OBSERVATION IS THE POINT, AND WAITING FOR THE SNAPSHOT
+ *    WOULD BE A WORSE BUG THAN THE ONE THIS FIXES. `lastAppliedSeq` used to start
+ *    at 0, so the first live frame of a reload mid-turn read as a gap from 0 and
+ *    pulled the ENTIRE conversation back through the fold in 500-event pages
+ *    (#350). But holding frames until a `history` snapshot arrives is not the
+ *    cure: `history-serve.ts` SUPPRESSES an empty snapshot ("an empty snapshot is
+ *    nothing to hydrate"), so a brand-new conversation never receives one and
+ *    would hold every frame forever. A client that has just connected cannot know
+ *    of a hole BELOW its first observation, and must not invent one; what it can
+ *    see from there on is contiguous.
+ *
+ *    ⚠️ AND THAT LEAVES A REAL RESIDUAL, NAMED HERE RATHER THAN LEFT IMPLICIT:
+ *    rows BELOW the first observation arrive only in the register-time snapshot's
+ *    projection. If that snapshot is lost on the at-most-once `.out`, nothing
+ *    in-session fetches them — the cursor is already above them, so no gap is
+ *    detected — and the transcript is short until the next register. A persisted
+ *    cursor plus a reconnect `get_difference` is what closes it (half B, #342);
+ *    seeding from 0 to cover it is NOT, because that is #350.
+ *  - `synced` — the ordinary state. `last` is `local_pts`.
+ *  - `catching-up` — one `get_difference` is outstanding. `afterSeq` is BOTH the
+ *    floor that request asked about AND the cursor: while a reply is in flight
+ *    NOTHING else may move the cursor, which is why there is no second number
+ *    here. The old code had one (`pendingDeferredSeq`), and applying it on top of
+ *    a PARTIAL reply is precisely how a range got skipped (#352). EVERY frame of a
+ *    seq-bearing type is held in `buffer`, in arrival order — with a seq or
+ *    without one, because order is the reason to hold a seq-less frame; an
+ *    `ack`/`history` seq is ignored outright (its frame's live effects — id
+ *    adoption, hydration — have already run, and its seq is re-learned from the
+ *    reply or from the next live frame).
+ *
+ * ── THE CORRELATION ──
+ *
+ * `nonce` is minted per REQUEST (a retry gets a fresh one) and the reply echoes
+ * it with `afterSeq`. Both must match or the reply is ignored. Telegram does not
+ * need this: each session has its own connection, so a `difference` cannot reach
+ * a device that did not ask for it. Our devices share one `.out` subject and have
+ * no wire identity, so without the echo device A folds device B's reply and
+ * silently skips its own range (#351, NOT-list N8).
+ */
+type SeqCursor =
+  | { state: "unseeded" }
+  | { state: "synced"; last: number }
+  | {
+      state: "catching-up";
+      /** The outstanding request's floor, which is also the cursor. */
+      afterSeq: number;
+      /** Re-minted on every re-issue; the reply must echo THIS one. */
+      nonce: string;
+      buffer: InboundMessage[];
+      retries: number;
+      timer: ReturnType<typeof setTimeout> | null;
+    };
+
+/**
+ * #356 — what ONE `difference` reply actually delivered, which is what decides
+ * whether a frame held during the round-trip is now redundant.
+ *
+ * TWO sets, because a held frame can be superseded on either of two keys and the
+ * seq alone is not enough:
+ *  - `seqs` — the seqs the reply FOLDED. Not the range it covers: a row the
+ *    server could not send to this peer is covered but absent, and a row this
+ *    build could not decode was carried but not applied. Neither may drop a held
+ *    frame that IS foldable.
+ *  - `authoredIds` — the ids the reply authored durable TEXT for. This is what
+ *    supersedes a DRAFT, which carries no seq of its own when the account has
+ *    `reasoningDurable` off (only a closing reasoning frame is ever journaled).
+ *    A `placement` contributes NOTHING here on purpose: it claims a slot and
+ *    authors no text, so it cannot supersede the draft that fills it.
+ */
+type CarriedRows = { seqs: ReadonlySet<number>; authoredIds: ReadonlySet<string> };
+
+/**
+ * The ids ONE folded durable event AUTHORED RENDERABLE TEXT for — what a held
+ * DRAFT is measured against in `uncarried`.
+ *
+ * ⚠️ EXPLICIT PER KIND, WITH AN EXHAUSTIVENESS CHECK, BECAUSE A `default` ARM WAS
+ * A DEFECT. Round 3 wrote `default: return [event.id]`, which quietly enrolled
+ * every id-bearing kind — including `approvalResolution`, whose id is the
+ * APPROVAL's and which `durable-view-reducer.ts` says outright "carries no
+ * content of its own". A reply serving a resolution therefore looked like it had
+ * authored the card, and a held `approval_request` for that card was dropped: the
+ * card the user was looking at vanished for the session. Only three kinds author
+ * text a draft can be superseded by, and the `never` below makes a new kind a
+ * compile error rather than a silent enrolment.
+ *
+ * `placement` is the load-bearing `[]`: it claims a slot and journals no text
+ * (§15.9 — the draft text is deliberately never journaled), so it cannot
+ * supersede the `progress` frames that fill that slot, and a test pins that.
+ *
+ * ⚠️ THE OTHER `[]` ARMS ARE REACHABLE ONLY THROUGH ONE NARROW PATH, AND NO TEST
+ * PINS THEM — say which path, rather than implying a guard that fires. This
+ * function is consulted only for a DRAFT-SHAPED held frame (seq-less, or a
+ * `progress`), and a `tool_activity`/`approval_request` normally carries its own
+ * seq. It can arrive WITHOUT one: `nats-channel.ts` ships a durable frame
+ * unstamped when the journal append fails (§15.8), and such a frame is seq-less
+ * and lands in the draft branch. `[]` is the safe direction there — it keeps the
+ * held frame, and a held frame the reply already delivered is at worst an
+ * idempotent re-fold, where dropping one the reply did NOT deliver is content
+ * gone for the session.
+ *
+ * Which is why the `approvalResolution` defect this table was rewritten for is
+ * actually closed by the seq/id dichotomy in `uncarried` and by the seq-ordered
+ * merge in `applyDifference`: defeating this table alone leaves the suite green
+ * (measured). What the arms buy is that the next kind cannot default into
+ * "authors text" — exactly how `approvalResolution` got in — and
+ * `messageEdited`/`messageDeleted` (no producer on this wire) are listed so the
+ * `never` below has to be re-answered if one ever appears.
+ */
+function authoredIdsOf(event: DurableEvent): string[] {
+  switch (event.kind) {
+    case "bubble":
+      return [event.answerId];
+    case "seal":
+      return event.answers.map((a) => a.id);
+    case "reasoning":
+      return [event.id];
+    case "placement":
+    case "user":
+    case "tool":
+    case "approval":
+    case "approvalResolution":
+    case "messageEdited":
+    case "messageDeleted":
+      return [];
+    default: {
+      // A new `DurableEvent` kind must be classified here, not defaulted into
+      // "authors text" — which is exactly how `approvalResolution` got in.
+      const exhaustive: never = event;
+      void exhaustive;
+      return [];
+    }
+  }
+}
+
+type SyncedCursor = Extract<SeqCursor, { state: "synced" }>;
+type CatchingUpCursor = Extract<SeqCursor, { state: "catching-up" }>;
 
 // #244 half B's `KNOWN_DURABLE_EVENT_KINDS` / `isFoldableDurableEvent` MOVED to
 // `inbound-wire-decode.ts` as `decodeDurableEvent` (#246 half A). The kind check
@@ -838,8 +1013,9 @@ export class WebChannelNATSClient {
       if (!connected || wasSessionEstablished) this.consumeHeldStallForRawLoss();
       this.clearStaleDraftWatch();
       // #244 half B: the in-flight catch-up and its buffer belong to the connection
-      // that just dropped; a reconnect re-seeds the cursor and re-detects live.
-      this.teardownGapSync();
+      // that just dropped; the cursor itself survives, and the reconnect snapshot's
+      // high-water re-detects any gap through the ordinary check.
+      this.resetCursorForConnection();
       // P0-4: a CL2 terminal instance is PERMANENTLY retired — the onState handler
       // must not mutate status/error at all, on EITHER edge. This matters because
       // a registration-path terminal sets only the WCNC-level `terminalReached`
@@ -1069,7 +1245,7 @@ export class WebChannelNATSClient {
       this.clearStaleDraftWatch();
       // #244 half B: this lifecycle will never receive its pending `difference`;
       // stop the timer and drop the buffer so nothing leaks past close().
-      this.teardownGapSync();
+      this.resetCursorForConnection();
       // #96: this lifecycle will never see another `turn_settled`. Clear its
       // turns before raw teardown, but delay the public flip until disconnect()
       // has completed so no state listener can reopen onto the old socket.
@@ -2884,50 +3060,14 @@ export class WebChannelNATSClient {
    *  instance, not per frame — a legacy plugin emits one per reply. */
   private warnedIdlessDurableFrame = false;
 
-  // ---- #244 half B — per-conversation seq tracking + gap recovery -----------
+  // ---- #244 half B / #356 — the per-conversation seq cursor -----------------
   //
   // ONE conversation per client here (`peerId` is fixed at construction and the
   // `.out` stream is single-conversation), so a single cursor suffices — no
-  // per-conversation map. `0` is the empty-journal baseline (`delivery-journal`'s
-  // `maxSeq` returns 0 for no rows), and it is SEEDED from the reconnect snapshot's
-  // `highWaterSeq` (`case "history"`). A durable frame at `lastAppliedSeq + 1` is
-  // contiguous; one beyond it is a gap.
-  private lastAppliedSeq = 0;
-  /**
-   * True while a `get_difference` round-trip is outstanding. Durable frames that
-   * arrive in this window are BUFFERED (`gapBuffer`) rather than folded — folding
-   * one the difference will also carry would double-apply a non-idempotent event
-   * (`seal` reorders; `user`/`messageEdited` are not idempotent).
-   */
-  private differenceInFlight = false;
-  /** Durable frames held during a catch-up, drained in arrival order once it lands. */
-  private gapBuffer: InboundMessage[] = [];
-  /**
-   * The `afterSeq` the OUTSTANDING `get_difference` was issued with. HIGH-1: the
-   * fold floor keys off THIS, never the live cursor — because a non-buffered frame
-   * (an `ack`'s user seq, a `history` high-water) can advance the cursor mid-flight,
-   * and reading it live would gate the whole catch-up range out (silent data loss).
-   */
-  private pendingAfterSeq = 0;
-  /**
-   * HIGH-1: a cursor advance owed by an `ack`/`history` that arrived DURING a
-   * catch-up. The seq advance is DEFERRED (the frame's id-adoption/hydration still
-   * runs live) so the cursor stays frozen at `pendingAfterSeq` and every event
-   * folds in seq order after the difference; this max is applied once the
-   * difference lands. `0` means nothing deferred.
-   */
-  private pendingDeferredSeq = 0;
-  /**
-   * HIGH-2 (liveness): the `get_difference` request AND its `difference` reply both
-   * ride the same at-most-once `.out` this feature exists to survive, and the
-   * server sends nothing on a read fault — so a dropped request/reply would wedge
-   * `differenceInFlight` true FOREVER, buffering every later frame with no drain.
-   * This timer re-issues the request (bounded), then gives up INTO a re-detect so
-   * the transcript self-heals IN-SESSION (never waiting on reconnect, half C).
-   */
-  private differenceTimer: ReturnType<typeof setTimeout> | null = null;
-  private differenceTimerGeneration = 0;
-  private differenceRetries = 0;
+  // per-conversation map. It starts UNSEEDED: this client holds no `pts` until the
+  // register-time `history` snapshot's `highWaterSeq` arrives, and Telegram's app
+  // asks for nothing before then. See `SeqCursor` for the states and the rules.
+  private cursor: SeqCursor = { state: "unseeded" };
 
   // ---------------------------------------------------------------------------
   // P0-4 — receipt records + send-state projection (D5)
@@ -3248,210 +3388,445 @@ export class WebChannelNATSClient {
 
   private handleMessage(msg: InboundMessage): void {
     // #244 half B: the catch-up response is orchestration (fold N events, then
-    // drain the buffer), not a single state transition, so it is handled ahead of
-    // the ordinary dispatch and outside the seq-bearing path below.
+    // either re-request or settle and drain), not a single state transition, so
+    // it is handled ahead of the ordinary dispatch and outside the seq-bearing
+    // path below.
     if (msg.type === "difference") {
       this.applyDifference(msg);
       return;
     }
 
-    // #244 half B: DURABLE (seq-bearing) frames drive gap detection and are
-    // buffered while a `get_difference` is in flight. Every other frame passes
-    // straight through — a `difference` is the only inbound frame that itself
-    // advances the cursor without being folded live.
+    // #244 half B: DURABLE (seq-bearing) frames are what the cursor is about.
+    // Every other frame passes straight through — a `difference` is the only
+    // inbound frame that itself moves the cursor without being folded live.
     if (isSeqBearingInbound(msg)) {
-      if (this.differenceInFlight) {
-        // Held, not folded — see `gapBuffer`. Drained (or discarded as covered)
-        // when the difference lands.
-        this.gapBuffer.push(msg);
-        return;
-      }
       // #246 half A: `isWireSeq`, the same predicate every other cursor site
       // uses. The door refuses a non-wire `seq` before this runs; this keeps the
       // cursor site independent of the decoder being complete (an `Infinity`
-      // here would be a gap that no difference can ever close).
-      const seq = isWireSeq(msg.seq) ? msg.seq : undefined;
-      if (seq !== undefined && seq > this.lastAppliedSeq + 1) {
-        // GAP: frames (lastApplied, seq) were dropped — NATS is at-most-once, so a
-        // hole in the contiguous seq stream is a real drop. Hold this frame and
-        // request everything after the cursor; buffer the rest until it lands.
-        // Exactly ONE `get_difference` per gap: `differenceInFlight` gates re-entry.
-        this.gapBuffer.push(msg);
-        this.requestDifference(this.lastAppliedSeq);
-        return;
-      }
-      const folded = this.applyFrame(msg);
-      // High-water advance: a deduped retry or a `messageEdited`-style revision may
-      // REUSE or repeat a seq, so the cursor only ever moves forward and a
-      // `seq <= lastApplied` is never read as a gap.
-      //
-      // ⚠️ `folded` GATES IT (#246 half A), AND THAT GATE IS THE SLICE. This line
-      // used to run unconditionally, so a frame `handleFrame` REFUSED (an
-      // empty-id `user_committed`, a turnId-less `tool_activity`, …) still moved
-      // the cursor past its seq — the event was lost AND the gap that would have
-      // re-fetched it was closed by the same statement. Leaving the cursor alone
-      // makes the next frame read as a gap, which is what gets the canonical row
-      // re-served. See `handleFrame` for the invariant and
-      // `inbound-wire-decode.ts` for why the catch-up door does the opposite.
-      if (folded && seq !== undefined && seq > this.lastAppliedSeq) this.lastAppliedSeq = seq;
+      // here would be a gap that no difference can ever close). A seq-bearing
+      // TYPE without a seq (an id-less `agent_message`, a live reasoning DRAFT)
+      // is still handled — it just carries no cursor.
+      this.observeSeq(isWireSeq(msg.seq) ? msg.seq : undefined, msg);
       return;
     }
 
+    // ⚠️ READ BEFORE `applyFrame`, WHICH CONSUMES THE EVIDENCE. `adoptCommittedIds`
+    // DELETES each `random_id` linkage it resolves, and that linkage is the only
+    // thing that distinguishes this device's own receipt from another device's —
+    // see `originCommittedSeqs`. Asking afterwards would always answer "not mine".
+    const ownCommittedSeqs = msg.type === "ack" ? this.originCommittedSeqs(msg) : undefined;
+
     this.applyFrame(msg);
 
-    // Two NON-seq-bearing frames still carry a seq BASELINE the cursor tracks.
+    // Two NON-seq-bearing frames still carry a seq the cursor tracks. Both go
+    // through the SAME three-way check as a durable frame (#345, #352): a value
+    // above the contiguous next seq is a GAP, never a bare advance.
     if (msg.type === "history") {
-      // The reconnect snapshot's authoritative high-water — the baseline half B
-      // resumes gap detection from (doc §16.2-6). `case "history"` has already
-      // hydrated; seed the cursor to it, never backward. (A `load_history` PAGE
-      // omits `highWaterSeq`, so this only fires for the register-time snapshot.)
+      // The register-time snapshot's authoritative high-water — Telegram's
+      // `updates.getState`, and the normal way an unseeded cursor gets its
+      // baseline. `case "history"` has already hydrated. A `load_history` PAGE
+      // omits `highWaterSeq`, so this only fires for the register-time snapshot.
+      //
       // #246 half A: `isWireSeq`, not `typeof === "number"`. The cursor is a
       // monotone high-water, so a `NaN`/fractional/over-large value accepted here
       // would park it beyond every real seq and gate out the whole stream after
       // it. The frame's own decoder already refuses such a value at the door;
       // this is the second guard, at the site that would suffer.
-      if (isWireSeq(msg.highWaterSeq)) this.advanceCursor(msg.highWaterSeq);
-    } else if (msg.type === "ack") {
+      if (isWireSeq(msg.highWaterSeq)) this.observeSeq(msg.highWaterSeq, undefined);
+    } else if (ownCommittedSeqs !== undefined) {
       // The inbound USER opener consumes a seq but rides no durable frame — half A
-      // echoes that seq here. Advance the high-water so the turn's first agent
-      // frame at userSeq+1 reads as contiguous instead of a phantom gap. ADVANCE
-      // ONLY, never gap-detect on the ack. Two DISTINCT no-duplicate paths, do not
-      // conflate them: (1) HAPPY PATH — this ack ran `adoptCommittedIds` above,
-      // re-keying the local optimistic bubble to `webchannel-user-<seq>`; a later
-      // `difference` re-carrying that `user` event then folds as a no-op only
-      // BECAUSE the id is already held. (2) `applyUser` is additionally
-      // id-idempotent (`durable-view-reducer.ts`), which covers a RE-DELIVERED
-      // difference (a retry double-reply) — the second fold of an already-placed
-      // `webchannel-user-<seq>` is a no-op.
-      //
-      // ⚠️ These cover adoption-ran and re-delivery. They do NOT cover a LOST ack:
-      // if this ack never arrives, adoption never runs, the optimistic bubble keeps
-      // its LOCAL id, and the FIRST `difference` requested for the turn's agent-frame
-      // gap re-delivers the `user` event under `webchannel-user-<seq>` — a DISTINCT
-      // id — so `applyUser` appends a second (duplicate) user bubble in-session
-      // (N8 class). Idempotency cannot see it: there is no shared id to dedupe on
-      // without the ack. Tracked as #337 (adopt the difference-delivered user event
-      // by `random_id`, reusing #243's spine — never by text); recovered on
-      // reconnect until then. A pre-user gap from another device is likewise left to
-      // reconnect recovery (half C) rather than gap-detected here.
-      //
-      // ⚠️ HIGH-1: `advanceCursor` DEFERS this while a `get_difference` is in
-      // flight. `applyFrame` above already ran (the id-adoption is live and
-      // order-independent); only the SEQ advance is held, so the cursor stays
-      // frozen at `pendingAfterSeq` and the caught-up range does not get gated out
-      // of the fold. The deferred max is applied when the difference lands.
-      // #246 half A: the WHOLE entry must be well-formed, not just its `seq`.
-      // This entry is the user opener's only seq carrier, and it is evidence
-      // that a row was committed only if the entry naming that row is intact —
-      // so it is gated on the SAME `isCommittedEcho` predicate `adoptCommittedIds`
-      // uses, and on the same non-negative-safe-integer rule the other cursor
-      // sites use (a `NaN`/over-large seq accepted here parks the high-water
-      // beyond every real seq and gates out the rest of the stream). The door
-      // decoder refuses such a frame outright; this keeps the cursor site
-      // independent of the decoder being complete.
-      for (const entry of msg.committed ?? []) {
-        if (isCommittedEcho(entry) && entry.seq !== undefined) this.advanceCursor(entry.seq);
-      }
+      // echoes that seq on the ack. Only THIS DEVICE'S echoes reach here.
+      for (const seq of ownCommittedSeqs) this.observeSeq(seq, undefined);
     }
   }
 
   /**
-   * #244 half B (HIGH-1) — raise the seq high-water, or DEFER the raise while a
-   * catch-up is in flight. Never moves the cursor backward. Deferring keeps the
-   * fold floor frozen so a mid-flight `ack`/`history` cannot gate out the very
-   * events the difference is about to deliver; the deferred max is applied in
-   * `applyDifference`.
+   * #345 — the `ack.committed` seqs that are THIS DEVICE'S OWN RECEIPT: an entry
+   * whose `random_id` still resolves a local send linkage.
+   *
+   * ⚠️ THE FILTER IS THE FIX, AND IT IS THE TELEGRAM SPLIT WE OTHERWISE LACK. An
+   * ack rides the per-peer `.out`, which #245 Part B uses as the multi-device
+   * fan-out, so every device of the peer receives the origin's ack. On the ORIGIN
+   * the echoed seq names a row this device is already holding (the optimistic
+   * bubble, re-keyed onto `webchannel-user-<seq>` by `adoptCommittedIds` in the
+   * same frame), so the cursor may move over it. On any OTHER device it names a
+   * row that was never folded: advancing there closes the very gap that would
+   * have fetched it, and the turn renders an answer with no question (#345 shape
+   * A). Telegram gets this split for free — a sent-message update goes to the
+   * session that sent it — and the linkage is our only substitute for a session.
+   *
+   * A non-origin device therefore IGNORES the seq entirely rather than gap-testing
+   * it: the row it names may legitimately be one this device has not seen, and the
+   * turn's first agent frame at `seq + 1` opens the gap that heals it one moment
+   * later. So the cost of ignoring is at most one round-trip, and only when the
+   * `user_committed` broadcast for that row was also dropped.
+   *
+   * ⚠️ MUST BE CALLED BEFORE `applyFrame`. `adoptCommittedIds` consumes each
+   * linkage it resolves, so afterwards every entry looks foreign.
    */
-  private advanceCursor(seq: number): void {
-    if (this.differenceInFlight) {
-      if (seq > this.pendingDeferredSeq) this.pendingDeferredSeq = seq;
+  private originCommittedSeqs(msg: InboundMessage): number[] {
+    const seqs: number[] = [];
+    for (const entry of msg.committed ?? []) {
+      // #246 half A: the WHOLE entry must be well-formed, not just its `seq` —
+      // the same `isCommittedEcho` predicate `adoptCommittedIds` and the door
+      // decoder apply. A `seq` is evidence that a row was committed only if the
+      // entry naming that row is intact.
+      if (!isCommittedEcho(entry) || entry.seq === undefined) continue;
+      if (!this.randomIdToReceiptKey.has(entry.random_id)) continue;
+      seqs.push(entry.seq);
+    }
+    return seqs;
+  }
+
+  /**
+   * #356 — THE ONE CURSOR FUNCTION. Every seq this client learns about goes
+   * through here, and it is the only place the cursor moves or a gap is opened.
+   *
+   * `frame` is the seq-bearing frame that CARRIED the seq, or `undefined` for a
+   * carrier that is not itself durable content (an `ack` echo, a `history`
+   * high-water): those have already had their live effect, so there is nothing to
+   * hold or to fold — only their seq passes through.
+   *
+   * The three-way test is Telegram's, with `pts_count` fixed at 1:
+   *
+   *  - `seq > last + 1` — GAP. Hold the frame and ask for everything after the
+   *    cursor. This is the only path into `catching-up`.
+   *  - `seq === last + 1` — apply, and advance IFF the fold accepted it (#246
+   *    half A: a REFUSED frame must not move the cursor, or the event is lost AND
+   *    the gap that would re-fetch it is closed by the same statement).
+   *  - `seq <= last` — already covered by the cursor, so it can never be a gap and
+   *    never moves the cursor backward.
+   *
+   * ⚠️ `seq <= last` IS STILL FOLDED, WHICH IS THE ONE PLACE WE DO NOT DO WHAT
+   * TELEGRAM SAYS ("the update was already applied, and must be ignored"), AND
+   * THE REASON IS THAT OUR SEQ IS NOT A `pts`. A `pts` counts EVENTS; our `seq`
+   * numbers durable ROWS, and several live frames legitimately map onto ONE row:
+   * `delivery-journal.ts` dedupes `placement` on its answer id, so every
+   * `progress` frame of a streaming answer — the whole draft, chunk by chunk —
+   * carries the SAME seq as the first one. Ignoring them would freeze every
+   * streaming draft at its first chunk. So the cursor treats a repeated seq as
+   * "nothing new to learn", while the frame itself folds exactly as it did
+   * before this slice. (The BUFFER is the other story: a frame the catch-up has
+   * just authoritatively answered for is dropped rather than re-folded — see
+   * `redispatchBuffered`, where dropping is about the reply, not about the seq.)
+   */
+  private observeSeq(seq: number | undefined, frame: InboundMessage | undefined): void {
+    const cursor = this.cursor;
+
+    // CATCHING-UP: a reply is owed, so no durable frame may be applied or advanced
+    // until it lands. EVERY seq-bearing-type frame is held, in arrival order —
+    // with a seq or without one — and a bare carrier (an `ack` echo, a snapshot
+    // high-water) is DROPPED, because its frame's live effects already ran and
+    // applying its seq on top of a PARTIAL reply is exactly how a range got
+    // skipped (#352).
+    //
+    // ⚠️ A SEQ-LESS FRAME IS HELD TOO, AND THAT IS ABOUT ORDER, NOT ABOUT
+    // DOUBLE-APPLYING. It has no journal row, so no reply can re-deliver it —
+    // but the reply's events are the rows BELOW it, and applying it first puts it
+    // above them for the session. Concretely: `reasoningDurable` is OFF by
+    // default, so EVERY reasoning frame is seq-less; applied during a catch-up
+    // for `user@11`/`bubble@12`, the reasoning lane renders ABOVE the user
+    // question that opened the turn (`applyReasoning` upserts by id and keeps its
+    // position), and a reload re-projects it from seq order — live ≠ history on
+    // the ordinary gap path.
+    //
+    // What it must NOT cost is the draft being overwritten by its own stale
+    // prefix on the way back in; `uncarried` owns that, by dropping a held frame
+    // whose id the reply AUTHORED durable text for.
+    if (cursor.state === "catching-up") {
+      if (frame !== undefined) cursor.buffer.push(frame);
       return;
     }
-    if (seq > this.lastAppliedSeq) this.lastAppliedSeq = seq;
+
+    // UNSEEDED: adopt this observation as the baseline. `seq - 1` rather than
+    // `seq`, so the frame that carried it goes through the ordinary apply path
+    // below — including the #246 gate, which leaves the cursor one short if the
+    // fold refuses it, so the NEXT frame reads as the gap that re-serves it. A
+    // frame of a seq-bearing TYPE that carries NO seq establishes nothing and is
+    // simply folded (it is a live draft with no durable row behind it).
+    let synced: SyncedCursor;
+    if (cursor.state === "unseeded") {
+      if (seq === undefined) {
+        if (frame !== undefined) this.applyFrame(frame);
+        return;
+      }
+      synced = { state: "synced", last: Math.max(0, seq - 1) };
+      this.cursor = synced;
+    } else {
+      synced = cursor;
+    }
+
+    // SYNCED — Telegram's three-way test, against the baseline above.
+
+    if (seq !== undefined && seq > synced.last + 1) {
+      // GAP: the seqs between are gone — NATS is at-most-once, so a hole in the
+      // contiguous stream is a real drop. Ask for everything after the cursor and
+      // hold this frame until the answer lands.
+      this.openCatchUp(synced.last, frame === undefined ? [] : [frame]);
+      return;
+    }
+
+    if (frame === undefined) {
+      // A bare carrier at or below `last + 1`: nothing to fold, so the seq is the
+      // whole content. Never backward.
+      if (seq !== undefined && seq > synced.last) synced.last = seq;
+      return;
+    }
+
+    const folded = this.applyFrame(frame);
+    // Re-read: `applyFrame` runs reducers and public listeners, so the cursor it
+    // returns to may not be the object read above. Advancing only in `synced` is
+    // the same rule stated once more, at the one site that could violate it.
+    const after = this.cursor;
+    if (folded && seq !== undefined && after.state === "synced" && seq > after.last) {
+      after.last = seq;
+    }
   }
 
   /**
-   * #244 half B — issue a fresh `get_difference` for a newly detected gap: freeze
-   * the fold floor at `afterSeq`, reset the retry budget, and arm the liveness
-   * timer (HIGH-2). One in flight at a time; `differenceInFlight` gates re-entry.
+   * Enter `catching-up`: mint a fresh nonce, send `get_difference(afterSeq, nonce)`,
+   * arm the liveness timer, and take ownership of the frames to hold meanwhile.
+   *
+   * `buffer` is passed in rather than started empty because the two callers hand
+   * over different things: a fresh gap contributes the frame that revealed it,
+   * while a PARTIAL reply hands back the frames it did not itself deliver
+   * (Telegram: "the query must be repeated, using the intermediate status as the
+   * current status").
+   *
+   * ⚠️ THIS MINTS A FRESH CURSOR, SO IT RESETS `retries` TO 0 — and that is only
+   * correct because both callers have PROGRESS behind them: a gap newly detected
+   * from a moved cursor, or a slice that covered past the floor it answered. A
+   * reply that moved NOTHING must never come through here — `stalled` diverts it,
+   * keeping the budget and the deadline, because otherwise a peer that answers
+   * nothing gets an unbounded fresh budget every round-trip.
    */
-  private requestDifference(afterSeq: number): void {
-    this.differenceInFlight = true;
-    this.pendingAfterSeq = afterSeq;
-    this.pendingDeferredSeq = 0;
-    this.differenceRetries = 0;
-    this.client.getDifference(afterSeq);
-    this.armDifferenceTimer();
+  private openCatchUp(afterSeq: number, buffer: InboundMessage[]): void {
+    const cursor: CatchingUpCursor = {
+      state: "catching-up",
+      afterSeq,
+      nonce: randomInboxToken(),
+      buffer,
+      retries: 0,
+      timer: null,
+    };
+    this.cursor = cursor;
+    // ⚠️ ARM BEFORE PUBLISHING. `getDifference` reaches the transport, and a throw
+    // out of it is swallowed by `notifyMessageListeners` when this runs inside a
+    // fold — which would leave the cursor `catching-up` with `timer: null`: no
+    // re-issue, no give-up, every later durable frame held in silence. Arming
+    // first costs one timer that fires into an unchanged cursor at worst.
+    this.armCatchUpTimer(cursor);
+    this.client.getDifference(afterSeq, cursor.nonce);
   }
 
-  /** HIGH-2 — arm (or re-arm) the in-flight timeout; a stale fire is ignored by generation. */
-  private armDifferenceTimer(): void {
-    this.cancelDifferenceTimer();
-    const generation = ++this.differenceTimerGeneration;
-    this.differenceTimer = setTimeout(() => {
-      if (this.differenceTimerGeneration !== generation || !this.differenceInFlight) return;
-      this.differenceTimer = null;
-      this.onDifferenceTimeout();
+  /**
+   * Land in `synced` at `last` and re-dispatch what was held.
+   *
+   * The two ways a catch-up ENDS — a complete reply, and a give-up after the
+   * retry budget — and nothing else: the `unseeded` seed installs its cursor
+   * inline (it holds no buffer to re-dispatch), a partial reply hands straight
+   * to `openCatchUp`, and `resetCursorForConnection` drops the buffer rather
+   * than folding it.
+   *
+   * `carried` is the reply's own — `undefined` on the give-up and stall paths,
+   * where no reply delivered anything and therefore nothing may be dropped. See
+   * `uncarried`.
+   */
+  private settleSynced(
+    last: number,
+    buffered: InboundMessage[],
+    carried: CarriedRows | undefined,
+  ): void {
+    this.cursor = { state: "synced", last };
+    this.redispatchBuffered(buffered, carried);
+  }
+
+  /**
+   * Re-dispatch held frames in ARRIVAL ORDER, minus the ones the reply
+   * superseded. `uncarried` owns which those are and argues every case; this
+   * method owns only the order, and the order is the point — a held frame folds
+   * after the reply's events, which is where a reload's seq-ordered projection
+   * puts it.
+   */
+  private redispatchBuffered(
+    buffered: InboundMessage[],
+    carried: CarriedRows | undefined,
+  ): void {
+    for (const m of this.uncarried(buffered, carried)) this.handleMessage(m);
+  }
+
+  /**
+   * The held frames a reply did NOT supersede — the ones still owed to the view.
+   *
+   * Split out because BOTH exits from a reply need it and they need it at
+   * different moments: a complete reply re-dispatches these (`settleSynced`),
+   * while a PARTIAL one carries them into the next request. Filtering only on the
+   * re-dispatch would let a frame the first slice delivered survive across the
+   * boundary and fold after the second one.
+   *
+   * `undefined` means the caller has nothing to measure against: the ONE give-up
+   * path, in `onCatchUpTimeout`, where the budget ran out. A reply that lands and
+   * delivers nothing never reaches here — it is a STALL, and a stall ends nothing.
+   *
+   * ── ONE DICHOTOMY, ON WHETHER THE HELD FRAME CARRIES DURABLE TEXT OF ITS OWN ──
+   *
+   * **A DRAFT-SHAPED frame** — one with no seq (an unthrottled reasoning frame,
+   * which is every reasoning frame while `reasoningDurable` is off), or a
+   * `progress`, whose row is a text-less `placement` — is superseded only by the
+   * reply AUTHORING its id. Nothing else can supersede a draft: the seq it shares
+   * with its `placement` says the SLOT was delivered, not the text, and dropping
+   * on that blanks the draft the user is watching, permanently for an answer that
+   * never produces another frame.
+   *
+   * **Every other held frame** is superseded only by the reply FOLDING its seq.
+   * Not by the id: an id-authored drop is unbounded above the range the reply
+   * covered, and a tool card is the proof — tool rows are not deduped, so every
+   * phase is its own row, and a slice carrying `tool{T, phase:"start"}@12` would
+   * otherwise drop a held `tool_activity{T, phase:"end"}@20` that the next slice
+   * then skips as undeliverable (#343). The card stays "running" for the session.
+   * Not by the cursor either: after a reply the cursor also covers seqs the
+   * server SKIPPED (#343) — inside `maxSeq`, carried by no event — and a frame
+   * sitting in this buffer is PROOF that its own live send succeeded. A
+   * `difference` envelope for the same content is larger than the live frame that
+   * carried it, so a row inside that band is live-deliverable and
+   * difference-undeliverable: #343's own razor edge, arriving from the other side.
+   *
+   * ⚠️ AND "FOLDED", NOT "CARRIED": an event this build could not decode advances
+   * the cursor past itself (the documented asymmetry) and delivers nothing, so it
+   * may not drop the held frame that is the only usable copy of that row.
+   *
+   * ⚠️ THIS IS NOT A SECOND CURSOR SITE, AND MUST NOT BECOME ONE (#246 half A).
+   * `redispatchBuffered` re-enters through `handleMessage`, so a re-dispatched
+   * frame moves the cursor through the ONE gated statement in `observeSeq` —
+   * refused ⇒ no advance. A frame that still reveals a gap re-opens one cleanly,
+   * re-buffering the remainder onto the fresh cursor's buffer.
+   */
+  private uncarried(
+    buffered: InboundMessage[],
+    carried: CarriedRows | undefined,
+  ): InboundMessage[] {
+    if (carried === undefined) return buffered;
+    return buffered.filter((m) => {
+      const seq = isWireSeq(m.seq) ? m.seq : undefined;
+      if (seq === undefined || m.type === "progress") {
+        const id = typeof m.id === "string" && m.id.length > 0 ? m.id : undefined;
+        return id === undefined || !carried.authoredIds.has(id);
+      }
+      return !carried.seqs.has(seq);
+    });
+  }
+
+  /** HIGH-2 — arm (or re-arm) the reply timeout for this catch-up. */
+  private armCatchUpTimer(cursor: CatchingUpCursor): void {
+    this.clearCatchUpTimer(cursor);
+    cursor.timer = setTimeout(() => {
+      // ⚠️ OBJECT IDENTITY REPLACES THE OLD GENERATION COUNTER. Every transition
+      // installs a NEW cursor object, so "is the cursor still the one that armed
+      // me" is exactly the question the counter used to answer — with no second
+      // number to keep in step.
+      if (this.cursor !== cursor) return;
+      cursor.timer = null;
+      this.onCatchUpTimeout(cursor);
     }, GET_DIFFERENCE_TIMEOUT_MS);
   }
 
-  /** Null ownership before clearTimeout so a reentrant arm always wins. */
-  private cancelDifferenceTimer(): void {
-    this.differenceTimerGeneration++;
-    if (this.differenceTimer !== null) {
-      clearTimeout(this.differenceTimer);
-      this.differenceTimer = null;
+  private clearCatchUpTimer(cursor: CatchingUpCursor): void {
+    if (cursor.timer !== null) {
+      clearTimeout(cursor.timer);
+      cursor.timer = null;
     }
   }
 
   /**
-   * HIGH-2 — the reply (or the request) was lost on the at-most-once `.out`. Re-issue
-   * the SAME request a bounded number of times; if it keeps failing, GIVE UP INTO A
-   * RE-DETECT: reset the in-flight state and re-dispatch the buffered frames so the
-   * first one still showing a gap requests fresh (with a fresh retry budget). Either
-   * way the stream self-heals in-session without waiting on reconnect.
+   * #356 — did this reply FAIL TO MOVE THE FLOOR, i.e. answer nothing?
+   *
+   * A stall is treated exactly as a LOST reply: the round-trip stays open on its
+   * original deadline, and `onCatchUpTimeout` re-issues on its own cadence and
+   * gives up when the budget is spent. Settling instead re-dispatches the buffer,
+   * the held frame re-opens the same gap on the spot, and `openCatchUp` hands out
+   * a fresh retry budget — an unbounded request loop at round-trip speed
+   * (measured: 51 requests for 50 non-advancing replies, no time passing).
+   *
+   * Two shapes, one condition. A `partial: true` reply whose coverage does not
+   * exceed the floor it answered, and a reply whose fold threw before a single
+   * event landed — in both the client learned nothing and the request is, in
+   * effect, still outstanding.
+   *
+   * ⚠️ AND THE SPURIOUS-GAP UNWIND IS THE ONE EXEMPTION, WHICH TURNS ON THE
+   * BUFFER — not on `partial`. `partial: false` with no events is the server
+   * saying "there is nothing past your floor", and a detection that was spurious
+   * must be able to close on it. But that is only true when the buffer is EMPTY.
+   * With a frame still held, settling re-dispatches it, the frame re-opens the
+   * same gap on the spot, and `openCatchUp` hands out a fresh retry budget —
+   * round 2's storm, arriving through the `partial: false` door: measured at 51
+   * requests for 50 empty complete replies, with no time passing. A held frame
+   * means the gap was real, so an answer that covers nothing is a stall whatever
+   * the flag says.
    */
-  private onDifferenceTimeout(): void {
-    if (this.differenceRetries < GET_DIFFERENCE_MAX_RETRIES) {
-      this.differenceRetries++;
-      this.client.getDifference(this.pendingAfterSeq);
-      this.armDifferenceTimer();
+  private stalled(
+    msg: InboundMessage,
+    covered: number,
+    completed: boolean,
+    cursor: CatchingUpCursor,
+  ): boolean {
+    if (covered > cursor.afterSeq) return false;
+    return msg.partial === true || !completed || cursor.buffer.length > 0;
+  }
+
+  /**
+   * HIGH-2 — the reply (or the request) was lost on the at-most-once `.out`, or
+   * the server's read faulted and it sent nothing.
+   *
+   * Re-issue the SAME `afterSeq` with a FRESH nonce, a bounded number of times.
+   * The nonce is re-minted rather than reused so the two replies of a
+   * request/retry race are distinguishable: the first to arrive matches, and the
+   * second matches nothing and is dropped whole, which is a cheaper guard against
+   * a double fold than making every event kind idempotent.
+   *
+   * On giving up, settle at the current floor and re-dispatch what was held: the
+   * frames are still foldable content and the give-up path must not throw away
+   * ones it can still use (#343). A frame that is still beyond the cursor re-opens
+   * the gap with a fresh retry budget, so a persistently unanswerable request
+   * settles into one attempt per `GET_DIFFERENCE_TIMEOUT_MS` rather than stopping
+   * — the same rate the old "freeze and wait for the next live frame" path
+   * produced whenever traffic continued, and now also present when it does not.
+   * A transport drop stops it (`resetCursorForConnection`).
+   */
+  private onCatchUpTimeout(cursor: CatchingUpCursor): void {
+    if (cursor.retries < GET_DIFFERENCE_MAX_RETRIES) {
+      cursor.retries += 1;
+      cursor.nonce = randomInboxToken();
+      this.client.getDifference(cursor.afterSeq, cursor.nonce);
+      this.armCatchUpTimer(cursor);
       return;
     }
-    // Gave up after the bounded burst. Stop the in-flight state and DROP the buffer
-    // (dropping never loses content — durable frames are journaled, so the next
-    // detected gap re-fetches them). The cursor stays frozen at `pendingAfterSeq`,
-    // so the NEXT durable frame re-detects the gap and requests fresh (fresh retry
-    // budget). This self-heals on the next traffic without a re-request storm while
-    // the server is unreachable — deliberately NOT an immediate re-drain, which
-    // would spin bursts back to back.
-    this.teardownGapSync();
+    // `undefined`: no reply landed, so nothing was carried and nothing may be
+    // dropped — every held frame re-dispatches, repeated-seq `progress` frames
+    // included (#343: the give-up path must not throw away what it can fold).
+    this.settleSynced(cursor.afterSeq, cursor.buffer, undefined);
   }
 
   /**
-   * #244 half B — clear all in-flight catch-up state WITHOUT applying any deferred
-   * cursor advance (the difference never landed, so the caught-up range is still
-   * missing; keeping the cursor frozen is what lets a re-detect request it again).
-   * Leaves `gapBuffer` untouched for the caller to drain. Also used on teardown.
+   * #244 half B — connection-scoped reset: the outstanding request and the frames
+   * held for it belong to the connection that just dropped. Called on raw
+   * transport loss and on `close()`, alongside the other connection-scoped valves
+   * (`clearStaleDraftWatch`).
+   *
+   * The CURSOR IS KEPT — Telegram's app keeps its `pts` across connections, and so
+   * do we; only the in-flight request, its timer and its buffer go. A reconnect
+   * re-runs `updates.getState` (the register-time snapshot), and its `highWaterSeq`
+   * re-detects any gap through the ordinary three-way check.
    */
-  private resetGapSync(): void {
-    this.cancelDifferenceTimer();
-    this.differenceInFlight = false;
-    this.differenceRetries = 0;
-    this.pendingDeferredSeq = 0;
-  }
-
-  /**
-   * #244 half B — connection-scoped teardown: reset the in-flight catch-up AND drop
-   * the buffer. Called on raw transport loss and on `close()` alongside the other
-   * connection-scoped valves (`clearStaleDraftWatch`). The buffered frames belong to
-   * the old connection; a reconnect re-seeds the cursor from a fresh `history`
-   * snapshot and re-detects any gap live. The cursor itself is left untouched (the
-   * snapshot's high-water only advances it, never backward).
-   */
-  private teardownGapSync(): void {
-    this.resetGapSync();
-    this.gapBuffer = [];
+  private resetCursorForConnection(): void {
+    const cursor = this.cursor;
+    if (cursor.state === "catching-up") {
+      this.clearCatchUpTimer(cursor);
+      this.cursor = { state: "synced", last: cursor.afterSeq };
+      return;
+    }
+    // `synced`/`unseeded` hold nothing connection-scoped: there is no request, no
+    // timer and no buffer, and the baseline (or the absence of one) is exactly
+    // what the next connection should resume from.
   }
 
   /**
@@ -3477,48 +3852,68 @@ export class WebChannelNATSClient {
   }
 
   /**
-   * #244 half B — fold a `difference` catch-up onto the view, advance the cursor,
-   * then drain the frames buffered while the request was in flight.
+   * #244 half B / #356 — fold a `difference` catch-up onto the view, then either
+   * re-request (the reply was a slice) or settle and re-dispatch what was held.
    *
    * The events are folded through the SAME `applyDurable` reducer path live frames
-   * fold through — RAW journal events, no client-local overlays, so the result
-   * converges on the durable (history) truth for the caught-up range. The cursor
-   * advances PAST every seq in the response — including one whose kind this build
-   * cannot fold (a newer plugin) — so an unknown tail is never re-requested forever
-   * (the server's `projectJournalHistory` treats such a row the same way, as an
-   * `unsupportedEvents` skip).
+   * fold through — RAW journal events, no client-local overlays beyond the ones
+   * `foldDifferenceEvent` re-supplies — so the result converges on the durable
+   * (history) truth for the caught-up range.
    *
-   * ⚠️ HIGH-1: the fold floor is `pendingAfterSeq` — the `afterSeq` this request
-   * was ISSUED with — NOT the live cursor. A non-buffered frame (an `ack`'s user
-   * seq, a `history` high-water) can advance the cursor mid-flight; keying the
-   * fold on the live cursor would then gate out the entire caught-up range (silent
-   * data loss). Those advances were deferred into `pendingDeferredSeq` and are
-   * folded back into the cursor here, so the final cursor reflects both the
-   * difference and anything that arrived during it.
+   * ⚠️ TWO GATES BEFORE ANYTHING IS TOUCHED, AND THEY ARE DIFFERENT QUESTIONS.
+   *  1. Is a request outstanding at all? A `difference` is only meaningful in
+   *     `catching-up`; one arriving in any other state is stale (a reply that lost
+   *     the race with a retry's reply, or one landing after a give-up or a
+   *     reconnect) and is DROPPED WHOLE, which is the exact guard against a
+   *     re-fold for EVERY event kind.
+   *  2. Is it MINE? `.out` is shared by every device of this peer (#245 Part B —
+   *     the subject IS the fan-out), so a reply to ANOTHER device's request lands
+   *     here too. Before #356 nothing asked: device A, catching up from floor 100,
+   *     folded device B's reply for floor 300, advanced its cursor to B's max, and
+   *     silently lost 101..300 (#351, NOT-list N8). The reply echoes the request's
+   *     `afterSeq` and `nonce`; both must match this cursor's, or it is ignored in
+   *     silence — the other device is being answered, not us, and our own reply or
+   *     our timeout is still coming.
    *
-   * ⚠️ A difference is ONLY meaningful while a request is OUTSTANDING. If one lands
-   * with no request in flight it is DROPPED here, before the timer or the fold are
-   * touched. This kills two duplicate-fold paths: (a) the retry double-reply — the
-   * original and a re-issued request both answer, the first heals
-   * (`differenceInFlight=false`) and the second must not re-fold (`floor` is still
-   * `pendingAfterSeq`, so it would re-append every `seq > floor` — and `applyUser`
-   * being idempotent (Fix 1) covers the user bubble, but dropping the whole stale
-   * reply is the cheaper, exact guard for ALL kinds); (b) a reply landing after
-   * teardown/give-up. Dropping loses nothing — durable frames are journaled, and
-   * the frozen-cursor + next-frame re-detect path re-requests what is still missing.
+   * ⚠️ THE FOLD FLOOR IS THE CURSOR, AND THAT IS NOW A TAUTOLOGY RATHER THAN A
+   * COINCIDENCE. `catching-up` holds ONE number: nothing may move the cursor while
+   * a reply is owed, so there is no "live cursor" that could drift away from the
+   * floor the request was issued with, and no deferred advance to reconcile
+   * afterwards. That drift, plus a PARTIAL reply, was #352 — the deferred `ack`
+   * seq landed above the reply's range and the drain then discarded the buffered
+   * events between them.
+   *
+   * ⚠️ A REFUSED EVENT IS SKIPPED AND ITS SEQ STILL ADVANCES — the DELIBERATE
+   * OPPOSITE of the live path, where a refused frame must NOT advance. A difference
+   * is the authoritative answer to a gap, so freezing the cursor on a row this
+   * build cannot fold would re-request that same row forever. The server's
+   * `projectJournalHistory` treats such a row the same way (an `unsupportedEvents`
+   * skip). `decodeDurableEvent`'s docblock states the asymmetry once, for both
+   * sites.
    */
   private applyDifference(msg: InboundMessage): void {
-    // No request outstanding ⇒ this reply is stale/duplicate. Drop it WITHOUT
-    // cancelling any timer (there is none to cancel that belongs to it) or draining.
-    if (!this.differenceInFlight) return;
-    // The reply landed — stop the liveness timer before folding.
-    this.cancelDifferenceTimer();
-    const floor = this.pendingAfterSeq;
+    const cursor = this.cursor;
+    // Gate 1: no request outstanding ⇒ stale/duplicate. Drop it WITHOUT touching
+    // any timer (none belongs to it) or draining anything.
+    if (cursor.state !== "catching-up") return;
+    // Gate 2: not the reply to OUR request ⇒ another device's, or a superseded
+    // retry's. Silent: on a shared subject this is ordinary traffic, not a fault.
+    if (msg.nonce !== cursor.nonce || msg.afterSeq !== cursor.afterSeq) return;
+    // ⚠️ THE LIVENESS TIMER IS *NOT* STOPPED HERE, AND THAT IS THE ROUND-4 FIX.
+    // It used to be cleared the moment a matching reply arrived, on the theory
+    // that the round-trip was over. A STALL is a reply that ends nothing — so
+    // clearing here and re-arming there handed the deadline to the peer: any
+    // peer stalling faster than `GET_DIFFERENCE_TIMEOUT_MS` pushed the deadline
+    // back forever and the timer never fired. Measured over 10 simulated minutes
+    // at a 50 ms stall cadence: ONE request, still catching-up, 12 001 frames
+    // held, nothing rendered. The deadline now belongs to the REQUEST: only a
+    // reply that actually ends the round-trip clears it (see the `finally`).
+
     const raw = Array.isArray(msg.events) ? msg.events : [];
     const events = raw
       .filter(
         (e): e is { seq: number; event: unknown } =>
-          // #246 half A: `isWireSeq`, not `typeof === "number"`. `maxSeq` becomes
+          // #246 half A: `isWireSeq`, not `typeof === "number"`. These seqs become
           // the cursor, so a `NaN` (which loses every comparison and would leave
           // the cursor short) or an over-large value (which would park it past
           // every real seq) is worse here than a missing entry.
@@ -3528,70 +3923,168 @@ export class WebChannelNATSClient {
       // property of this method, not of the wire.
       .sort((a, b) => a.seq - b.seq);
 
-    let maxSeq = floor;
-    // ⚠️ `try/finally` (#246 half A): the in-flight bookkeeping below MUST run
-    // even if a fold throws. `notifyMessageListeners` (`nats-client.ts`) swallows
-    // a listener's throw, so an escape from here would leave `differenceInFlight`
-    // stuck TRUE — every later durable frame silently buffered until the
-    // transport drops, with no timer left to re-issue anything
-    // (`cancelDifferenceTimer()` already ran above, before the fold).
-    // `decodeDurableEvent` is what makes such a throw unreachable;
-    // this is the belt to its braces, and it is cheap.
+    // ── THE MERGE PLAN, DECIDED BEFORE ANYTHING FOLDS ──
     //
-    // ⚠️ IT DEGRADES, IT DOES NOT PRETEND. `maxSeq` is raised AFTER each fold, so
-    // a throw leaves the cursor at the last event actually applied — OR at the
-    // deferred `ack`/`history` advance if that is higher, which is #352's
-    // partial-reply shape and is left to that fix. (Concretely: a difference
-    // carrying 2,3,4 whose fold of 3 throws, with an opener `ack` for seq 5
-    // deferred mid-flight, ends at `max(1, 2, 5) = 5` — seqs 3-4 then wait for a
-    // reconnect. Reachable through a throw as well as through a partial reply,
-    // and not a regression: before this `finally` the same throw wedged the
-    // stream permanently.) The drain below then re-dispatches the buffered
-    // frames, the first still-gapped one re-requests with a fresh retry budget,
-    // and the stream heals on the next reply — for a TRANSIENT throw; a
-    // deterministic one re-requests the same range each round, which is the
-    // pre-existing shape of any reply that fails to close a gap. Pinned by "a
-    // fold that throws cannot wedge gap-sync" in
-    // `nats-client-wrapper-gap-sync.test.ts`.
+    // ⚠️ A HELD FRAME BELOW THE REPLY'S ROWS MUST FOLD *AMONG* THEM, NOT AFTER.
+    // The reducers are last-write-wins, so re-dispatching the buffer in arrival
+    // order after the fold lets a stale frame overwrite what the reply just
+    // established. Measured three ways, all of them the #343-skip shape this
+    // branch exists for — the reply covers the seq and carries no event for it:
+    // a held `tool_activity{start}@11` re-applied after a folded `tool{end,ok}@12`
+    // left the card `{phase:"start", status:"ok"}` for the session; a held
+    // `approval_request@11` re-applied after a folded `approvalResolution@12`
+    // appended a CLICKABLE card for an approval the server had already resolved;
+    // a held `agent_message{A}@11` re-applied after a `seal@12` whose `remove`
+    // names A brought A back.
+    //
+    // So the buffer is split by the range this reply ANSWERS:
+    //  - `below` — seq-bearing held frames inside `(afterSeq, declaredCovered]`.
+    //    Merged with the reply's events in SEQ ORDER and applied through
+    //    `applyFrame` DIRECTLY: the cursor is `catching-up`, so `observeSeq` would
+    //    only re-buffer them, and their seqs are already inside `covered`.
+    //  - `rest` — everything else: seq-less frames, whose order relative to the
+    //    reply is all they have, and seq-bearing frames ABOVE the range, which the
+    //    next request or the settle is for.
+    //
+    // `declaredCovered` is what the reply CLAIMS to answer. It is computed here,
+    // before the fold, because the merge order cannot depend on the fold's
+    // outcome; the fold can only ever end at or below it.
+    const declaredCovered = Math.max(
+      cursor.afterSeq,
+      isWireSeq(msg.maxSeq) ? msg.maxSeq : 0,
+      events.length > 0 ? events[events.length - 1]!.seq : 0,
+    );
+    const below: InboundMessage[] = [];
+    const rest: InboundMessage[] = [];
+    for (const held of cursor.buffer) {
+      const heldSeq = isWireSeq(held.seq) ? held.seq : undefined;
+      if (heldSeq !== undefined && heldSeq > cursor.afterSeq && heldSeq <= declaredCovered) {
+        below.push(held);
+      } else {
+        rest.push(held);
+      }
+    }
+    below.sort((a, b) => (a.seq as number) - (b.seq as number));
+
+    let last = cursor.afterSeq;
+    let completed = false;
+    let nextEvent = 0;
+    let nextHeld = 0;
+    // What this reply actually DELIVERED — see `CarriedRows`. Both sets take an
+    // entry only for an event that was decoded AND folded: a row this build
+    // cannot read advances the cursor past itself (the documented asymmetry) but
+    // delivers nothing, so it may not drop a held frame that IS foldable.
+    const carriedSeqs = new Set<number>();
+    const authoredIds = new Set<string>();
+    // ⚠️ `try/finally` (#246 half A): the transition below MUST run even if a fold
+    // throws. `notifyMessageListeners` (`nats-client.ts`) swallows a listener's
+    // throw, so an escape from here would leave the cursor stuck in `catching-up`
+    // with every later durable frame silently held. `decodeDurableEvent` is what
+    // makes such a throw unreachable; this is the belt to its braces, and it is
+    // cheap.
+    //
+    // ⚠️ IT DEGRADES, IT DOES NOT PRETEND. `last` is raised AFTER each event is
+    // handled, so a throw leaves the cursor at the last event actually applied —
+    // and `completed` is what stops the server's `maxSeq` from papering over the
+    // rest.
+    //
+    // ⚠️ AND THE RECOVERY AFTER A THROW IS THE TIMER'S, NOT THE BUFFER'S. A throw
+    // before the first event folds moves no floor, so it is a STALL: the cursor,
+    // its budget and its deadline all stay, nothing is re-dispatched, and
+    // `onCatchUpTimeout` re-issues on its own cadence and eventually gives up. A
+    // throw PART-WAY leaves the cursor at the last applied event and settles or
+    // re-requests from there. Either way the buffer is not consulted for recovery.
     try {
-      for (const { seq, event } of events) {
-        // Fold everything the request asked for (`seq > floor`); a `seq <= floor`
-        // is a raced/duplicate overlap we already hold.
-        //
-        // A refused event is SKIPPED and its seq STILL ADVANCES the cursor —
-        // both for a kind this build does not know (a newer plugin; #253) and
-        // for a known kind whose shape the fold cannot use. A difference is the
-        // authoritative answer to a gap, so freezing the cursor on a row we
-        // cannot fold would re-request that same row forever. The server's
-        // `projectJournalHistory` treats such a row the same way (it counts an
-        // `unsupportedEvents` skip). This is the DELIBERATE OPPOSITE of the live
-        // path, where a refused frame must NOT advance — `decodeDurableEvent`'s
-        // docblock states the asymmetry once, for both sites.
-        if (seq > floor) {
-          const decoded = decodeDurableEvent(event);
+      // ONE ASCENDING PASS over the reply's events and `below`, together. At an
+      // equal seq the reply's event goes FIRST: it is the durable row, and the
+      // held frame is a live rendering of that same row.
+      while (nextEvent < events.length || nextHeld < below.length) {
+        const entry = events[nextEvent];
+        const held = below[nextHeld];
+        const heldSeq = held === undefined ? undefined : (held.seq as number);
+        if (entry !== undefined && (heldSeq === undefined || entry.seq <= heldSeq)) {
+          nextEvent += 1;
+          const seq = entry.seq;
+          // Fold everything the request asked for; a `seq <= last` is a
+          // raced/duplicate overlap we already hold.
+          if (seq <= last) continue;
+          const decoded = decodeDurableEvent(entry.event);
           if (decoded.ok) {
             this.foldDifferenceEvent(decoded.event);
+            carriedSeqs.add(seq);
+            for (const id of authoredIdsOf(decoded.event)) authoredIds.add(id);
           } else if (decoded.kind === "malformed") {
-            // Only the MALFORMED case is reported: an unknown kind is an
-            // ordinary version skew and would be noise on every frame from a
-            // newer server, while a known kind we cannot fold is a real defect
-            // somewhere upstream.
+            // Only the MALFORMED case is reported: an unknown kind is an ordinary
+            // version skew and would be noise on every frame from a newer server,
+            // while a known kind we cannot fold is a real defect somewhere
+            // upstream.
             console.warn(
               `[nats-wrapper] skipping malformed ${decoded.eventKind} event at seq ${seq} ` +
                 `in a difference: ${decoded.reason}`,
             );
           }
+          last = seq;
+          continue;
         }
-        if (seq > maxSeq) maxSeq = seq;
+        nextHeld += 1;
+        // The reply's event for this seq, if it had one, has already been handled
+        // — both sequences ascend and ties go to the event — so `carriedSeqs` is
+        // authoritative here: this held frame folds iff the reply did not deliver
+        // its row.
+        //
+        // A `progress` folds ANYWAY, and by ORDER rather than by an exemption:
+        // its row is a text-less `placement`, so folding it immediately after that
+        // placement is what keeps the draft the user is watching, and a
+        // `bubble`/`seal` later in the same merge then authors over it — exactly
+        // as it would have live.
+        if (held!.type === "progress" || !carriedSeqs.has(heldSeq!)) {
+          this.applyFrame(held!);
+        }
       }
+      completed = true;
     } finally {
-      // The cursor now reflects the folded range AND any advance deferred while the
-      // request was in flight (an `ack`/`history` seq), never moving backward.
-      this.lastAppliedSeq = Math.max(this.lastAppliedSeq, maxSeq, this.pendingDeferredSeq);
-      this.differenceInFlight = false;
-      this.differenceRetries = 0;
-      this.pendingDeferredSeq = 0;
-      this.drainGapBuffer();
+      // ⚠️ ONLY IF THIS CATCH-UP IS STILL THE LIVE ONE. The fold runs reducers and
+      // public listeners, and a listener may call `close()` — which runs
+      // `resetCursorForConnection` and lands a valid `synced` cursor. Transitioning
+      // on top of that would re-enter `catching-up` on a closed client, with a
+      // request nothing will answer and a timer nothing will clear. Object
+      // identity, the same test the timer uses.
+      if (this.cursor === cursor) {
+        // `maxSeq` is the highest seq this reply ACCOUNTS FOR, which is more than
+        // the events it carried: a seq the server SKIPPED as undeliverable at this
+        // peer's `max_payload` (#343) is covered but unsendable, and freezing on
+        // it would wedge this device for the session. It is adopted only when the
+        // whole reply was processed — after a throw it would claim a range that
+        // was never applied.
+        const covered = completed && isWireSeq(msg.maxSeq) ? Math.max(last, msg.maxSeq) : last;
+        const carried: CarriedRows = { seqs: carriedSeqs, authoredIds };
+        // ⚠️ A STALL ENDS NOTHING, AND "NOTHING" INCLUDES THE DEADLINE. The
+        // cursor stays, its retry budget is preserved, and the timer the REQUEST
+        // armed is left exactly where it was — `onCatchUpTimeout` is the only
+        // thing that re-issues and the only thing that gives up. Round 3 re-armed
+        // here instead, which starts a FRESH `GET_DIFFERENCE_TIMEOUT_MS`: a peer
+        // stalling faster than that pushed the deadline back on every reply and
+        // the timeout never fired. Measured over 10 simulated minutes at a 50 ms
+        // stall cadence: ONE request, still catching-up, nothing ever re-asked —
+        // worse than the loop the stall rule replaced. (What this bounds is the
+        // REQUEST RATE. Frames still accumulate while a catch-up is open, which is
+        // the design; the defect was that nothing could ever answer them.)
+        if (!this.stalled(msg, covered, completed, cursor)) {
+          // The round-trip IS over, so the request's deadline has nothing left to
+          // protect. Both branches below install a NEW cursor, and this is the one
+          // place that retires the old one's timer.
+          this.clearCatchUpTimer(cursor);
+          if (msg.partial === true) {
+            // Telegram's `updates.differenceSlice`: "the query must be repeated,
+            // using the intermediate status as the current status." The
+            // intermediate status is `covered`; what carries forward is `rest` —
+            // `below` was consumed by the merge above.
+            this.openCatchUp(covered, this.uncarried(rest, carried));
+          } else {
+            this.settleSynced(covered, rest, carried);
+          }
+        }
+      }
       // A difference can settle a held-turn condition (it is durable turn content),
       // and the fold above bypassed the per-frame gate; re-evaluate it once here.
       this.maybeRelease();
@@ -3726,31 +4219,6 @@ export class WebChannelNATSClient {
   }
 
   /**
-   * #244 half B — replay the frames buffered during a catch-up, in arrival order.
-   *
-   * A buffered frame the difference already covered (`seq <= lastApplied`) is
-   * DISCARDED — re-folding it would double-apply a non-idempotent event. Anything
-   * still beyond the cursor is re-dispatched through `handleMessage`, so a buffered
-   * frame that reveals a FURTHER gap re-enters gap-sync cleanly, re-buffering the
-   * remainder onto the (freshly emptied) buffer.
-   *
-   * ⚠️ THIS IS NOT A SECOND CURSOR SITE, AND MUST NOT BECOME ONE (#246 half A).
-   * It re-enters through `handleMessage`, so a drained frame advances the cursor
-   * through the ONE gated statement there — refused ⇒ no advance. Advancing here
-   * as well (or instead) would reintroduce exactly the loss this slice fixed, on
-   * the buffered path.
-   */
-  private drainGapBuffer(): void {
-    const buffered = this.gapBuffer;
-    this.gapBuffer = [];
-    for (const m of buffered) {
-      const seq = typeof m.seq === "number" ? m.seq : undefined;
-      if (seq !== undefined && seq <= this.lastAppliedSeq) continue;
-      this.handleMessage(m);
-    }
-  }
-
-  /**
    * Fold ONE inbound frame onto the view.
    *
    * ⚠️ RETURNS "WAS THIS FRAME FOLDED", AND THE SEQ CURSOR DEPENDS ON IT (#246
@@ -3761,8 +4229,8 @@ export class WebChannelNATSClient {
    *
    * ⚠️ THIS USED TO RETURN `void`, AND THAT WAS THE BUG. Every shape check in
    * here is a bare early `return`, indistinguishable from a successful fold to
-   * the caller — so `handleMessage` advanced `lastAppliedSeq` past a seq-bearing
-   * frame it had just REFUSED. The event was then lost forever: the cursor
+   * the caller — so the cursor advanced past a seq-bearing frame it had just
+   * REFUSED. The event was then lost forever: the cursor
    * covered its seq, so no later frame read a gap, and the `get_difference` that
    * would have re-served the canonical journal row was never sent. The invariant
    * is now: A SEQ-BEARING FRAME ADVANCES THE CURSOR IFF IT WAS FOLDED.

@@ -371,6 +371,22 @@ export type InboundMessage = {
    * `difference` member.
    */
   events?: Array<{ seq: number; event: unknown }>;
+  /**
+   * #356: the four non-`events` fields of a `difference`. `afterSeq`/`nonce` echo
+   * the `get_difference` this answers — the correlation that lets a device tell
+   * its own reply from another device's on the shared `.out` subject; `partial`
+   * is Telegram's `differenceSlice` ("re-request from where you got to");
+   * `maxSeq` is the highest seq the reply ACCOUNTS FOR — the client's new cursor,
+   * which on a complete reply is the conversation's high-water and on a partial
+   * one is the boundary of the window the server examined, NOT the high-water
+   * (`history-serve.ts` is the producer and owns that rule). Loose here like every
+   * other field (zero-dep package; runtime discrimination in
+   * `inbound-wire-decode.ts`, which REQUIRES all four on a `difference`).
+   */
+  afterSeq?: number;
+  nonce?: string;
+  partial?: boolean;
+  maxSeq?: number;
   /** P0-3: the slash-command catalog on a `commands` frame. */
   commands?: CommandCatalogEntry[];
 };
@@ -395,8 +411,9 @@ export type OutboundMessage =
   | { type: "load_history"; before?: string; beforeTurnId?: string; limit?: number }
   // #244 half B: request the durable events with `seq > afterSeq` — the client's
   // gap-recovery round-trip. Mirrors `channel-contract.ts`'s `get_difference`
-  // (zero-dep package, so declared here rather than imported).
-  | { type: "get_difference"; afterSeq: number }
+  // (zero-dep package, so declared here rather than imported). #356's `nonce` is
+  // the per-request correlation the reply echoes back.
+  | { type: "get_difference"; afterSeq: number; nonce: string }
   // P0-3: request the slash-command discovery catalog.
   | { type: "load_commands" };
 
@@ -1638,12 +1655,18 @@ export class WebChannelNatsClient {
   }
 
   /**
-   * #244 half B: request the durable events with `seq > afterSeq` (gap recovery).
-   * Buffered until the handshake completes, like `loadHistory`. The wrapper calls
-   * this when it detects a seq gap; the server answers with a `difference` frame.
+   * #244 half B / #356: request the durable events with `seq > afterSeq` (gap
+   * recovery). Buffered until the handshake completes, like `loadHistory`. The
+   * wrapper calls this when it detects a seq gap; the server answers with a
+   * `difference` frame echoing `afterSeq` and `nonce`.
+   *
+   * `nonce` is REQUIRED and is the caller's to mint — one fresh token per
+   * request, including per retry — because it is what the wrapper matches the
+   * reply against. Minting it here would hide the identity the caller has to
+   * remember. `randomInboxToken()` is the generator both sides already share.
    */
-  getDifference(afterSeq: number): void {
-    this.enqueue({ type: "get_difference", afterSeq });
+  getDifference(afterSeq: number, nonce: string): void {
+    this.enqueue({ type: "get_difference", afterSeq, nonce });
   }
 
   /** Request the slash-command catalog (buffered until the handshake completes). */

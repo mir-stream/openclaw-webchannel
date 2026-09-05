@@ -17,7 +17,8 @@
  *    primitive type;
  *  - every OPTIONAL field, when present, has the declared primitive type;
  *  - the ONE bound that already exists on this path — `MAX_INBOUND_USER_ID_LENGTH`
- *    — is applied to the two client-supplied ids.
+ *    — is applied to the three client-supplied tokens (`user_message`'s `id` and
+ *    `random_id`, and #356's `get_difference.nonce`; each `case` says why).
  *
  * ⚠️ SHAPE, NOT SEMANTICS, AND THE LINE IS DELIBERATE. `load_history` is checked
  * to the TYPES the contract declares and no further — `before`/`beforeTurnId`
@@ -256,6 +257,22 @@ export function decodeInboundWsMessage(raw: unknown): InboundWsDecodeResult {
       const afterSeq = field(raw, "afterSeq");
       if (typeof afterSeq !== "number" || !Number.isInteger(afterSeq) || afterSeq < 0) {
         return invalid(known, "afterSeq must be a non-negative integer");
+      }
+      // #356: the correlation token. REQUIRED — this is the v4 wire, and a
+      // `get_difference` without one cannot be answered in a way its sender can
+      // tell apart from another device's reply on the shared `.out` (#351).
+      //
+      // ⚠️ BOUNDED, AND THE BOUND HAS A DOWNSTREAM REASON — the rule this file's
+      // header states (do not add a check whose question something further down
+      // already answers; DO add one that nothing owns). Nothing owns this: the
+      // nonce is ECHOED VERBATIM into the `difference` frame, so its bytes are
+      // spent from that reply's `max_payload` budget. An unbounded one is a peer
+      // deciding how many journal rows its own catch-up may carry — and, past the
+      // limit, that even an empty reply cannot be sent. Same predicate and same
+      // number as the two client-supplied ids above, deliberately not a third.
+      const nonce = field(raw, "nonce");
+      if (!isUsableWireId(nonce)) {
+        return invalid(known, "nonce must be a non-empty string within the id length bound");
       }
       return { ok: true, message: raw as unknown as InboundWsMessage };
     }

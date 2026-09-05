@@ -44,6 +44,18 @@
   slice is in `protocol.ts`'s "When to bump", which now carries v4 as its second
   worked example.
 
+- **`get_difference` / `difference` gain correlation and catch-up fields (#356).**
+  `get_difference` now carries a required `nonce` alongside `afterSeq`, and the
+  `difference` reply echoes both back and adds `partial` and `maxSeq`. All four
+  are required on the v4 wire and both receive doors refuse a frame missing one.
+  They are not decoration: our devices share one `.out` subject and have no wire
+  identity, so the echo is the only thing that tells a device its own reply from
+  another device's (without it, a device folds a stranger's reply and skips its
+  own range); `partial` is Telegram's `differenceSlice` signal, without which the
+  remainder of a sliced range is stranded until the next durable frame; and
+  `maxSeq` is what a complete reply advances the cursor to, which is how a row
+  the server can never send to this peer stops wedging it.
+
 ### Fixed
 
 - **Approval frames are journaled at the moment the plugin records them, not at
@@ -117,6 +129,39 @@
   through `deliverTerminalIndependent` in order, matching the built-in Telegram
   channel: a final finalizes the one draft it provably owns or becomes a new
   message, never an edit of a past bubble.
+
+- **The `get_difference` serve path is byte-fit, bounded and queued (#356).**
+  Seven reviewers found eight defects concentrated in the gap-sync seam; the ones
+  that live on this side of the wire are below. (The client half — the cursor
+  state machine, #350/#351/#352/#345 — is in the client package's changelog.) The
+  wire also gained the correlation and catch-up fields that make the client half
+  possible, under Breaking above. Closes:
+  - **#343** — one journal row too large for a peer's `max_payload` wedged
+    `fitDifference`, so that device received nothing for the rest of the session.
+    Such a row is now skipped with an operator-actionable log line, exactly as the
+    history page budget already skipped it, and the reply spans across it; the
+    reply's `maxSeq` is what carries the client past the hole.
+  - **#348** — `fitDifference` re-measured the surviving prefix once per removed
+    row on the account's dispatch turn, and `get_difference` had no per-peer bound
+    at all. It now measures each row once and bisects the survivors. On a 500-row
+    page that overflows: **512 `outboundWireSize` calls over 2 392
+    row-measurements, 0.74 MB serialized**, against develop's **424 calls over
+    122 324 row-measurements, 31.75 MB** — more calls, because a call now measures
+    one row rather than up to 500, and 43× less actually serialized. The case that
+    decided the shape is the one an authenticated peer can aim at the account's
+    event loop: a window in which no row fits at all costs **502 calls / 1 000
+    row-measurements / 0.13 MB** here, against **4 500 / 249 278 / 22.05 MB** for
+    a bisection-per-skip. (Develop's and the bisection-per-skip figures are
+    modelled against the same measurement stub — neither loop is in the tree to
+    run — and were measured independently by review.)
+  - **#348 (the dispatch turn)** — `serveDifference` is deferred like the other
+    two read paths, with a bounded per-peer QUEUE rather than their
+    drop-a-concurrent-request latch: a difference names a floor and a nonce, so a
+    dropped request leaves a device waiting on its 5 s timeout, and N tabs of one
+    account gap on the same frame at the same instant. Every request is answered,
+    one read+publish in flight per peer, at most 8 outstanding. Both halves of the
+    deferred body are now guarded — out there a throw would be an
+    `uncaughtException`, not a dropped frame.
 
 ## 0.7.0
 

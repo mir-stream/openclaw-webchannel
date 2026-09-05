@@ -20,7 +20,7 @@
  * is a shipped property of the browser bundle, not an accident.
  *
  * ⚠️ A REFUSED FRAME IS DROPPED, AND FOR A SEQ-BEARING FRAME THAT IS THE WHOLE
- * POINT. The wrapper advances `lastAppliedSeq` only for a frame it actually
+ * POINT. The wrapper advances its seq cursor only for a frame it actually
  * FOLDED (`handleFrame` returns that), so a refused frame leaves the cursor
  * alone, the next frame reads as a gap, `get_difference` re-serves the canonical
  * journal row and the view converges. Advancing past a frame we refused would
@@ -522,7 +522,7 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
       return accept(raw);
 
     case "difference": {
-      // TOP LEVEL ONLY — each event is validated where it is FOLDED
+      // TOP LEVEL ONLY for `events` — each event is validated where it is FOLDED
       // (`decodeDurableEvent`, below), because that is where the live-vs-catch-up
       // asymmetry lives: a refused LIVE frame must not advance the cursor, while
       // a refused event INSIDE a difference must, or the catch-up is re-requested
@@ -530,6 +530,34 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
       const events = field(raw, "events");
       if (events !== undefined && !Array.isArray(events)) {
         return invalid(known, "events must be an array");
+      }
+      // ⚠️ #356: THE FOUR ENVELOPE FIELDS ARE REQUIRED, NOT OPTIONAL, AND THE
+      // STRICTNESS IS THE POINT. This is the v4 wire under an exact-match
+      // register gate, so every peer that can reach this door sends all four; a
+      // frame missing one is not an older server, it is a malformed frame. And
+      // each is load-bearing in a way a default could not fake:
+      //  - `afterSeq`/`nonce` are the ONLY thing separating this device's reply
+      //    from another device's on the shared `.out`. Defaulting either would
+      //    make every reply match every request — #351 exactly.
+      //  - `partial` decides whether the client re-requests or settles.
+      //    Defaulting it to `false` on a sliced reply strands the remainder.
+      //  - `maxSeq` BECOMES the cursor on a non-partial reply, so it goes through
+      //    `isWireSeq` for the reason that predicate exists: a `NaN` leaves the
+      //    cursor short and an over-large value parks it past every real seq,
+      //    gating out the whole stream after it.
+      // A refusal here costs one round-trip (the wrapper's timeout re-issues),
+      // which is strictly cheaper than acting on a reply we cannot attribute.
+      if (!isWireSeq(field(raw, "afterSeq"))) {
+        return invalid(known, "afterSeq must be a non-negative safe integer");
+      }
+      if (!isNonEmptyString(field(raw, "nonce"))) {
+        return invalid(known, "nonce must be a non-empty string");
+      }
+      if (typeof field(raw, "partial") !== "boolean") {
+        return invalid(known, "partial must be a boolean");
+      }
+      if (!isWireSeq(field(raw, "maxSeq"))) {
+        return invalid(known, "maxSeq must be a non-negative safe integer");
       }
       return accept(raw);
     }
@@ -608,10 +636,11 @@ export type DurableEventDecodeResult =
  * reducer would notice. `foldDifferenceEvent` iterates `event.answers` for a
  * `seal` and indexes `event.answerId` for a `bubble`/`placement` BEFORE the
  * reducer sees them, so a missing `answers` throws inside the fold. That throw is
- * swallowed by the client's listener dispatch, which leaves `differenceInFlight`
- * stuck true and buffers every later durable frame until the transport drops —
- * a silent wedge. `applyDifference` carries a `finally` against it too; this
- * predicate is what makes the arm unreachable in the first place.
+ * swallowed by the client's listener dispatch, which would leave the cursor stuck
+ * in `catching-up` with its liveness timer already cancelled, holding every later
+ * durable frame until the transport drops — a silent wedge. `applyDifference`
+ * carries a `finally` against it too; this predicate is what makes the arm
+ * unreachable in the first place.
  */
 export function decodeDurableEvent(event: unknown): DurableEventDecodeResult {
   if (!isRecord(event)) return { ok: false, kind: "unknown-kind" };

@@ -69,6 +69,18 @@
   without them buys a connection and a silently wrong transcript, which is the
   precise failure this bump exists to prevent.
 
+- **`get_difference` / `difference` gain correlation and catch-up fields (#356).**
+  `get_difference` now carries a required `nonce` alongside `afterSeq`, and the
+  `difference` reply echoes both back and adds `partial` and `maxSeq`. All four
+  are required on the v4 wire and both receive doors refuse a frame missing one.
+  They are not decoration: our devices share one `.out` subject and have no wire
+  identity, so the echo is the only thing that tells a device its own reply from
+  another device's (without it, a device folds a stranger's reply and skips its
+  own range); `partial` is Telegram's `differenceSlice` signal, without which the
+  remainder of a sliced range is stranded until the next durable frame; and
+  `maxSeq` is what a complete reply advances the cursor to, which is how a row
+  the server can never send to this peer stops wedging it.
+
 ### Fixed
 
 - **An approval prompt the transport could not deliver now appears in history,
@@ -100,6 +112,97 @@
   deleting a message whose only copy was in the final it displaced. It now
   places none of them: every unmatched final becomes its own new bubble, which
   can duplicate a visible answer but can never erase one.
+
+- **The client's gap-sync state machine is now one modelled cursor (#356).**
+  Seven reviewers found eight defects concentrated in one seam — a cursor number
+  surrounded by an in-flight flag, a gap buffer, deferred advances and a timer
+  generation, all able to disagree about what had already been applied. It is
+  replaced by an explicit three-state cursor following Telegram's update-delivery
+  rules, and the fields that disagreed are deleted rather than re-guarded. Closes:
+  - **#350** — the cursor gap-detected from `0` before the register snapshot
+    seeded it, so a reload mid-turn pulled the entire conversation back through
+    the fold in 500-event pages. It now adopts its first observation as the
+    baseline and asks for nothing.
+  - **#351** — `difference` carried no echo of the request it answered and every
+    device of a peer shares the `.out` subject, so a device could fold another
+    device's reply and silently skip its own range.
+  - **#352** — a partial reply plus an `ack`/`highWaterSeq` advance deferred
+    during the round-trip pushed the cursor past events the reply never carried,
+    and the buffer drain then discarded them.
+  - **#345** — `ack.committed[].seq` was advance-only. It now moves the cursor
+    only on the device that originated the send (the `random_id` resolves a local
+    linkage), and a seq above the contiguous next one opens a gap instead of
+    closing it.
+  - **#343 (client half)** — a frame held during a catch-up is now dropped only
+    when the reply actually carried an event for its seq, never merely because the
+    cursor covers it: a row the server could not send is covered but absent, and
+    the held frame is proof its own live send succeeded. The give-up path carries
+    nothing and so drops nothing.
+  - Frames held during a catch-up are folded in SEQ ORDER, merged with the
+    reply's own events rather than re-dispatched after them. The reducers are
+    last-write-wins, so a held frame BELOW the reply's rows — the shape that
+    arises whenever the server skips a row as undeliverable (#343) — overwrote
+    what the reply had just established: a stale tool `start` phase buried a
+    delivered `end`, a held `approval_request` re-appended a clickable card for an
+    approval the server had already resolved, and an answer a folded `seal`
+    removed came back. Seq-less frames, which have no place in that order, fold
+    after it in arrival order — applying those immediately put a
+    reasoning lane ABOVE the user question that opened the turn
+    (`reasoningDurable` is off by default, so every reasoning frame is seq-less),
+    which a reload then re-projects the other way. For those, what the reply
+    supersedes is decided by id: a held draft whose id the reply authored durable
+    text for is dropped, so a cumulative draft can no longer overwrite the durable
+    row with a prefix of itself.
+  - A held `progress` is never dropped for a carried `placement`. It maps to that
+    row, which claims the slot and journals no text, so dropping it on "the reply
+    delivered this seq" blanked the draft the user was watching — permanently, for
+    an answer that never produced another frame. What DOES supersede a draft is
+    the reply authoring its id, which is the same rule that governs a seq-less
+    frame: a held frame carrying no durable text of its own is measured by id, and
+    every other held frame by seq alone.
+  - A reply that MOVES NO FLOOR — a `partial` one whose coverage does not exceed
+    the floor it answers, or one whose fold threw before a single event landed —
+    is a STALL, not a settle: the round-trip stays open, the retry budget is preserved,
+    and the timer the REQUEST armed — never re-armed by the stall, which would
+    hand the deadline to a peer that stalls faster than the timeout — re-issues
+    on its own cadence. Settling instead
+    re-dispatched the buffer, which re-opened the gap on the spot with a fresh
+    budget: measured at 51 requests for 50 non-advancing replies, at round-trip
+    speed, each costing the server a read and a byte fit. An empty COMPLETE reply is a
+    stall too whenever a frame is still HELD — a held frame is evidence the gap
+    was real. Only an empty complete reply with an EMPTY buffer is the
+    spurious-gap unwind, and that one settles. The price is named: a spurious
+    detection now costs a full give-up cycle whenever anything is held, which is
+    strictly better than the storm it replaces.
+
+- **The `get_difference` serve path is byte-fit, bounded and queued (#356).**
+  The server half of the same slice; the client-cursor half is above.
+  - **#343** — one journal row too large for a peer's `max_payload` wedged
+    `fitDifference`, so that device received nothing for the rest of the session.
+    Such a row is now skipped with an operator-actionable log line, exactly as the
+    history page budget already skipped it, and the reply spans across it; the
+    reply's `maxSeq` is what carries the client past the hole.
+  - **#348** — `fitDifference` re-measured the surviving prefix once per removed
+    row on the account's dispatch turn, and `get_difference` had no per-peer bound
+    at all. It now measures each row once and bisects the survivors. On a 500-row
+    page that overflows: **512 `outboundWireSize` calls over 2 392
+    row-measurements, 0.74 MB serialized**, against develop's **424 calls over
+    122 324 row-measurements, 31.75 MB** — more calls, because a call now measures
+    one row rather than up to 500, and 43× less actually serialized. The case that
+    decided the shape is the one an authenticated peer can aim at the account's
+    event loop: a window in which no row fits at all costs **502 calls / 1 000
+    row-measurements / 0.13 MB** here, against **4 500 / 249 278 / 22.05 MB** for
+    a bisection-per-skip. (Develop's and the bisection-per-skip figures are
+    modelled against the same measurement stub — neither loop is in the tree to
+    run — and were measured independently by review.)
+  - **#348 (the dispatch turn)** — `serveDifference` is deferred like the other
+    two read paths, with a bounded per-peer QUEUE rather than their
+    drop-a-concurrent-request latch: a difference names a floor and a nonce, so a
+    dropped request leaves a device waiting on its 5 s timeout, and N tabs of one
+    account gap on the same frame at the same instant. Every request is answered,
+    one read+publish in flight per peer, at most 8 outstanding. Both halves of the
+    deferred body are now guarded — out there a throw would be an
+    `uncaughtException`, not a dropped frame.
 
 ## 0.7.0
 

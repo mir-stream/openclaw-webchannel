@@ -1388,11 +1388,14 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // ---- #244 half B (per account): get_difference catch-up handler --------
       // Serves RAW events (`seq > afterSeq`) for the client to fold onto the view
       // it already holds — NO reducer/projection, so it does not touch the #286
-      // quadratic replay. `afterSeq` is already validated at the dispatch boundary
-      // (`nats-channel.ts`'s `get_difference` case); `serveDifference` is guarded
-      // end to end.
-      channel.setGetDifferenceHandler((peerId, afterSeq) => {
-        historyServer.serveDifference(peerId, afterSeq);
+      // quadratic replay. `afterSeq` and #356's `nonce` are both validated at the
+      // receive door (`inbound-wire-decode.ts`), so this hop only carries them;
+      // `serveDifference` echoes the pair back so the requesting device can
+      // recognise its own reply on the shared `.out`. It runs DEFERRED, so its
+      // read and its publish each carry their own catch — out there an escape
+      // would be an `uncaughtException`, not a dropped frame.
+      channel.setGetDifferenceHandler((peerId, afterSeq, nonce) => {
+        historyServer.serveDifference(peerId, afterSeq, nonce);
       });
 
       // ---- Step 5b (per account): command-catalog load handler (P0-3) ------

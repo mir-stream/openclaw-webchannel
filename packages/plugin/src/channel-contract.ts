@@ -325,15 +325,31 @@ export type InboundWsMessage =
    */
   | { type: "load_history"; before?: string; beforeTurnId?: string; limit?: number }
   /**
-   * #244 half B (doc §16.2-6, Telegram pts/qts): request the durable events the
-   * client is MISSING — everything with `seq > afterSeq`. The client sends this
-   * when a durable frame arrives with a `seq` beyond the contiguous next one (a
-   * gap: an at-most-once NATS drop left a hole), passing its last-applied seq as
-   * `afterSeq`. The server answers with a `difference` frame (below). This is the
-   * mid-stream analogue of `load_history`: same read, but RAW events forward from
-   * a cursor rather than a projected page backward from one.
+   * #244 half B / #356 (doc §16.7, Telegram `updates.getDifference`): request the
+   * durable events the client is MISSING — everything with `seq > afterSeq`. The
+   * client sends this when a durable frame arrives with a `seq` beyond the
+   * contiguous next one (Telegram: "if `local_pts + pts_count < pts`, there's an
+   * update gap that must be filled"), passing its last-applied seq as `afterSeq`.
+   * The server answers with a `difference` frame (below). This is the mid-stream
+   * analogue of `load_history`: same read, but RAW events forward from a cursor
+   * rather than a projected page backward from one.
+   *
+   * ⚠️ `nonce` IS THE CORRELATION, AND IT EXISTS BECAUSE OF THE ONE PLACE WE
+   * DIVERGE FROM TELEGRAM (#356, doc §16.7). Telegram addresses each SESSION's
+   * connection, so a `difference` cannot reach a device that did not ask for it.
+   * Our devices share ONE `.out` subject and have no wire identity at all
+   * (`nats-register.ts` verifies `subject peerId == JWT peerId`; `nats-channel.ts`
+   * keeps no per-device registry). So correlation rides the frame instead: the
+   * reply ECHOES `afterSeq` and `nonce` verbatim, and a device folds only a reply
+   * matching its own outstanding request. Without it, device A at floor 100 folds
+   * device B's reply for floor 300 and silently skips 101..300 — #351, NOT-list
+   * N8. The client mints it with `randomInboxToken()`; the door decoder refuses a
+   * `get_difference` without a usable one (non-empty, within the shared id
+   * bound), which is the whole contract — that generator falls back to
+   * `Math.random` on a host without WebCrypto, so neither its length nor its
+   * alphabet is fixed.
    */
-  | { type: "get_difference"; afterSeq: number }
+  | { type: "get_difference"; afterSeq: number; nonce: string }
   | { type: "load_commands" };
 
 export type OutboundWsMessage =
@@ -386,7 +402,7 @@ export type OutboundWsMessage =
        *
        * ⚠️ TWO CLAIMS THAT USED TO SIT HERE ARE BOTH DEAD. "Half A only EXPOSES
        * the field — nothing consumes it yet" ended with #244 half B: the client
-       * tracks `lastAppliedSeq` off this field and fires `getDifference` on a gap
+       * tracks its seq cursor off this field and fires `get_difference` on a gap
        * (`nats-client-wrapper.ts`). And "older clients ignore it" is no longer a
        * back-compat guarantee worth stating — #246 took the wire to v4 under an
        * exact-match register gate, so a client that ignores `seq` cannot connect.
@@ -569,9 +585,21 @@ export type OutboundWsMessage =
        * while holding last-applied N-2 — a phantom gap on every turn (doc §16.2-6).
        * This ack echo is the user seq's only carrier. A deduped retry echoes the
        * SAME first-admission seq. ⚠️ "Still ignored by the current client in half
-       * A" IS STALE: half B consumes it — `advanceCursor(entry.seq)` per entry in
-       * the wrapper's `ack` arm. (`adoptCommittedIds` alone still ignores `seq`;
-       * that is one call site, not the frame.)
+       * A" IS STALE: half B consumes it — the wrapper's `ack` arm feeds each
+       * entry's seq to the one cursor function. (`adoptCommittedIds` alone still
+       * ignores `seq`; that is one call site, not the frame.)
+       *
+       * ⚠️ #356 — THE ECHO IS THE ORIGIN DEVICE'S RECEIPT, AND ONLY ITS CURSOR MAY
+       * MOVE ON IT. This frame rides the per-peer `.out`, which #245 Part B uses as
+       * the multi-device fan-out, so EVERY device of the peer receives another
+       * device's ack. A non-origin device holds no bubble for that row, so
+       * advancing its cursor on this seq would close the very gap that would have
+       * fetched the row — it renders the answer with no question (#345 shape A).
+       * The wrapper therefore acts on an entry only when its `random_id` resolves
+       * a LOCAL send linkage, which is true exactly on the origin device;
+       * elsewhere the seq is ignored and the turn's first agent frame opens the
+       * gap that heals it. Telegram has the same split for free — a sent-message
+       * update goes to the session that sent it.
        */
       committed?: Array<{ random_id: string; messageId: string; seq: number }>;
     }
@@ -614,11 +642,12 @@ export type OutboundWsMessage =
    */
   | { type: "user_committed"; id: string; text: string; turnId?: string; seq: number; random_id?: string }
   /**
-   * #244 half B (doc §16.2-6): the answer to `get_difference` — the RAW journal
-   * events with `seq > afterSeq`, each paired with its `seq`, in ascending `seq`
-   * order. The client folds each `event` through the SAME reducer it folds live
-   * frames through (`applyDurableEvent`), advances its last-applied seq to the max
-   * seq here, then drains any frames it buffered while the request was in flight.
+   * #244 half B / #356 (doc §16.7): the answer to `get_difference` — the RAW
+   * journal events with `seq > afterSeq`, each paired with its `seq`, in ascending
+   * `seq` order. The client folds each `event` through the SAME reducer it folds
+   * live frames through (`applyDurableEvent`), advancing its cursor per folded
+   * event, then either re-requests (`partial`) or settles at `maxSeq` and drains
+   * the frames it buffered while the request was in flight.
    *
    * ⚠️ RAW EVENTS, NOT A PROJECTED PAGE — and that is what keeps half B #286-free.
    * The `history` snapshot/page runs the quadratic full replay
@@ -631,13 +660,69 @@ export type OutboundWsMessage =
    * A `seq` on the FRAME would be meaningless (it carries many); the per-event
    * `seq` inside `events` is the cursor the client advances.
    *
-   * ⚠️ MAY BE PARTIAL. The server caps the response (a huge gap would overflow
-   * `max_payload`); the client advances to the max seq it received and re-requests
-   * for the rest when the next durable frame (or a buffered one) still sits beyond
-   * the contiguous next seq. So a difference guarantees FORWARD PROGRESS, not
-   * completeness in one round-trip.
+   * The four non-`events` fields, and the Telegram rule each one implements:
+   *
+   *  - `afterSeq` / `nonce` — the request this answers, echoed VERBATIM. Telegram
+   *    addresses each session's own connection; our devices share one `.out`
+   *    subject, so the echo is what tells a device "this reply is mine". A device
+   *    that folds a reply it did not ask for skips its own range (#351, N8). See
+   *    `get_difference` above for why we cannot address the device instead.
+   *  - `partial` — Telegram's `updates.differenceSlice`: "the full difference was
+   *    too large to be received in one request … the query must be repeated, using
+   *    the intermediate status as the current status". `true` means the server cut
+   *    the list (the `MAX_DIFFERENCE_EVENTS` read cap or the `max_payload` byte
+   *    budget), so the client re-requests IMMEDIATELY from `maxSeq` rather than
+   *    waiting for the next durable frame to re-open the gap. Forward progress
+   *    comes from `maxSeq` and from nothing else — a partial reply may carry NO
+   *    events at all, which is exactly what a window whose every row was
+   *    undeliverable ships.
+   *  - `maxSeq` — THE HIGHEST SEQ THIS REPLY ACCOUNTS FOR, which is more than the
+   *    seqs it carries events for. The client advances its cursor to it. On a
+   *    complete reply that is the conversation's high-water at read time (what
+   *    `updates.getState` reports), which is what makes an EMPTY non-partial reply
+   *    meaningful — a spurious gap unwinds without waiting on the request timeout.
+   *    On a PARTIAL one it is the boundary of the window this reply examined, and
+   *    it is ALWAYS strictly above `afterSeq`: the re-request must ask about a
+   *    higher floor or the pair spins in place. That matters for the degenerate
+   *    window whose every row was undeliverable — zero events, and the client
+   *    still has to get past them.
+   *
+   * ⚠️ A SEQ MISSING FROM `events` IN A NON-PARTIAL REPLY IS UNDELIVERABLE, NOT
+   * MISSING, and the client advances past it on purpose. `history-serve.ts`'s
+   * `fitDifference` SKIPS a row that alone exceeds this peer's `max_payload` — the
+   * same rule `history-frame-budget.ts` applies to a history page, for the same
+   * reason (`nats-channel.ts` journals BEFORE it publishes, so such a row is in
+   * the store precisely because its own live send hit the same limit: the peer
+   * never saw it, and omitting it is what PRESERVES `live == history`). Freezing
+   * the cursor on it instead would wedge this device's gap-sync for the whole
+   * session (#343).
    */
-  | { type: "difference"; events: Array<{ seq: number; event: DurableEvent }> };
+  | {
+      type: "difference";
+      afterSeq: number;
+      nonce: string;
+      events: Array<{ seq: number; event: DurableEvent }>;
+      partial: boolean;
+      maxSeq: number;
+    };
+
+/**
+ * #356 — the body of a `difference` frame, minus its `type`. Named because three
+ * layers pass it around unchanged (`history-serve.ts` builds it,
+ * `nats-channel.ts` seals it, the client folds it) and a positional signature had
+ * already grown to five arguments.
+ */
+export type DifferenceReply = {
+  /** The `get_difference.afterSeq` this answers, echoed verbatim. */
+  afterSeq: number;
+  /** The `get_difference.nonce` this answers, echoed verbatim. */
+  nonce: string;
+  events: Array<{ seq: number; event: DurableEvent }>;
+  /** The server cut the list — Telegram's `differenceSlice`; re-request. */
+  partial: boolean;
+  /** The highest seq this reply accounts for — the client's new cursor. */
+  maxSeq: number;
+};
 
 /**
  * #341 — what `sendApprovalRequest` reports back. TWO independent outcomes, and
@@ -709,14 +794,14 @@ export interface WebChannelPeerChannel {
    */
   sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number): boolean;
   /**
-   * #244 half B: answer a `get_difference` with RAW events (`seq > afterSeq`), in
-   * ascending `seq` order. Optional so an older channel impl is not forced to
-   * implement it — see the `difference` member of `OutboundWsMessage`.
+   * #244 half B / #356: answer a `get_difference` with RAW events
+   * (`seq > afterSeq`), in ascending `seq` order, plus the correlation echo and
+   * the two catch-up signals. ONE parameter object rather than positional
+   * arguments: the four non-`events` fields are read together by the client's
+   * cursor and are meaningless apart. Optional so an older channel impl is not
+   * forced to implement it — see the `difference` member of `OutboundWsMessage`.
    */
-  sendDifference?(
-    peerId: string,
-    events: Array<{ seq: number; event: DurableEvent }>,
-  ): boolean;
+  sendDifference?(peerId: string, reply: DifferenceReply): boolean;
   /**
    * #245 Part B: broadcast a just-committed inbound user message to the account's
    * devices. Optional so an older channel impl is not forced to implement it — see
@@ -800,7 +885,7 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendTurnSnapshot(_peerId: string, _turnId: string, _answers: Array<{ id: string; text: string }>, _remove: string[]): boolean { return false; }
   sendTyping(_peerId: string): boolean { return false; }
   sendHistory(_peerId: string, _messages: HistoryMessage[], _highWaterSeq?: number): boolean { return false; }
-  sendDifference(_peerId: string, _events: Array<{ seq: number; event: DurableEvent }>): boolean { return false; }
+  sendDifference(_peerId: string, _reply: DifferenceReply): boolean { return false; }
   sendUserCommitted(_peerId: string, _message: { id: string; text: string; turnId?: string; seq: number; random_id?: string }): boolean { return false; }
   sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload, _options?: { redelivery?: boolean }): ApprovalRequestSendResult { return { delivered: false, journaled: false }; }
   sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision, _options?: { journalRequestFirst?: ApprovalRequestPayload }): boolean { return false; }
