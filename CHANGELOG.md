@@ -78,8 +78,8 @@
   another device's (without it, a device folds a stranger's reply and skips its
   own range); `partial` is Telegram's `differenceSlice` signal, without which the
   remainder of a sliced range is stranded until the next durable frame; and
-  `maxSeq` is what a complete reply advances the cursor to, which is how a row
-  the server can never send to this peer stops wedging it.
+  `maxSeq` is what a complete reply advances the cursor to, so an individually
+  oversized difference row no longer wedges catch-up.
 
 ### Fixed
 
@@ -179,9 +179,9 @@
   The server half of the same slice; the client-cursor half is above.
   - **#343** — one journal row too large for a peer's `max_payload` wedged
     `fitDifference`, so that device received nothing for the rest of the session.
-    Such a row is now skipped with an operator-actionable log line, exactly as the
-    history page budget already skipped it, and the reply spans across it; the
-    reply's `maxSeq` is what carries the client past the hole.
+    Rows that individually exceed the difference envelope's budget are now
+    omitted with a diagnostic, and `maxSeq` carries the client past them. This
+    does not establish whether their differently sized live frames were delivered.
   - **#348** — `fitDifference` re-measured the surviving prefix once per removed
     row on the account's dispatch turn, and `get_difference` had no per-peer bound
     at all. It now measures each row once and bisects the survivors. On a 500-row
@@ -199,8 +199,9 @@
     two read paths, with a bounded per-peer QUEUE rather than their
     drop-a-concurrent-request latch: a difference names a floor and a nonce, so a
     dropped request leaves a device waiting on its 5 s timeout, and N tabs of one
-    account gap on the same frame at the same instant. Every request is answered,
-    one read+publish in flight per peer, at most 8 outstanding. Both halves of the
+    account gap on the same frame at the same instant. One read+publish runs per
+    peer with at most 8 queued requests; overflow replaces the newest pending
+    request, whose device can retry on timeout. Both halves of the
     deferred body are now guarded — out there a throw would be an
     `uncaughtException`, not a dropped frame.
 

@@ -876,6 +876,55 @@ describe("#356 — partial replies (Telegram's differenceSlice)", () => {
     expect(cursorLast(w)).toBe(20);
   });
 
+  it.each([
+    { floor: 5, partial: false },
+    { floor: 6, partial: false },
+    { floor: 5, partial: true },
+    { floor: 6, partial: true },
+  ])("repeated progress below a seal stays removed (floor=$floor, partial=$partial)", ({ floor, partial }) => {
+    const { w } = spied();
+    seed(w, 4);
+    w.handleMessage({ type: "progress", id: "P", text: "Working…", turnId: "t1", seq: 5 });
+    const toolStart = {
+      seq: 6,
+      event: { kind: "tool", id: "T", turnId: "t1", name: "bash", phase: "start" },
+    };
+    if (floor === 6) {
+      w.handleMessage({ type: "tool_activity", id: "T", turnId: "t1", name: "bash", phase: "start", seq: 6 });
+    }
+    w.handleMessage({ type: "tool_activity", id: "U", turnId: "t1", name: "bash", phase: "end", status: "ok", seq: 8 });
+    expect(cursorLast(w)).toBe(floor);
+    expect(isCatchingUp(w)).toBe(true);
+    // Progress reuses P's placement seq, equal to or below the request floor.
+    w.handleMessage({ type: "progress", id: "P", text: "Still working…", turnId: "t1", seq: 5 });
+    w.handleMessage({ type: "agent_message", id: "P", text: "X".repeat(500), turnId: "t1", seq: 9 });
+    w.handleMessage({ type: "agent_message", id: "B", text: "short final", turnId: "t1", seq: 10 });
+
+    // Measured controller path: a failed partial send leaves preview P available
+    // for an authorized recovery block; a later final owns B and the seal removes
+    // P. The recovery bubble at seq 9 fitted live but is omitted here because its
+    // larger difference envelope does not fit. No reply event authors P.
+    w.handleMessage(reply(w, [
+      ...(floor === 5 ? [toolStart] : []),
+      { seq: 7, event: { kind: "tool", id: "U", turnId: "t1", name: "bash", phase: "start" } },
+      { seq: 8, event: { kind: "tool", id: "U", turnId: "t1", name: "bash", phase: "end", status: "ok" } },
+      { seq: 10, event: { kind: "bubble", answerId: "B", text: "short final", turnId: "t1" } },
+      { seq: 11, event: { kind: "seal", turnId: "t1", answers: [{ id: "B", text: "short final" }], remove: ["P"] } },
+    ], { partial, maxSeq: 11 }));
+    if (partial) {
+      expect(isCatchingUp(w)).toBe(true);
+      w.handleMessage(reply(w, [
+        { seq: 12, event: { kind: "bubble", answerId: "C", text: "next answer", turnId: "t2" } },
+      ]));
+    }
+
+    // P must fold before the seal, not after it or after a later partial slice.
+    expect(w.state.messages.some((m) => m.id === "P")).toBe(false);
+    expect(w.state.messages.find((m) => m.id === "B")?.text).toBe("short final");
+    expect(cursorLast(w)).toBe(partial ? 12 : 11);
+    expect(isCatchingUp(w)).toBe(false);
+  });
+
   it("a held frame the reply DID carry is still dropped — no double-apply", () => {
     // The property the buffer exists for, unchanged: the reply is authoritative
     // for a row it carried, so the held copy of that same row must not re-fold.

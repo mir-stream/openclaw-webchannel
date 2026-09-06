@@ -946,10 +946,8 @@ describe("createHistoryServer.serveDifference — #244 half B / #356", () => {
   });
 
   it("#343 — ONE undeliverable row is SKIPPED and the rest are served (it used to wedge the device)", () => {
-    // The measured shape from the issue: a row whose SEALED size alone exceeds
-    // this peer's max_payload. `nats-channel.ts` journals before it publishes, so
-    // such a row is in the store precisely because its own live send was refused —
-    // the peer never saw it live, and omitting it is what preserves live==history.
+    // A row whose sealed difference size alone exceeds this peer's max_payload
+    // must not prevent the fitting rows from reaching the client.
     //
     // BEFORE: `fitDifference` bottomed out at `slice(0, 1)` and handed the single
     // oversize row to the channel, which refused the whole frame. The device got
@@ -972,7 +970,7 @@ describe("createHistoryServer.serveDifference — #244 half B / #356", () => {
     expect(h.differences[0].partial).toBe(false);
     expect(h.differences[0].maxSeq).toBe(4);
     // The operator gets one actionable line naming the row and its size.
-    const skipLine = h.errors.find((e) => e.includes("undeliverable"));
+    const skipLine = h.errors.find((e) => e.includes("difference skipped") && e.includes("oversized"));
     expect(skipLine).toBeDefined();
     expect(skipLine).toContain("seq 2");
   });

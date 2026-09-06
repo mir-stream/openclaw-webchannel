@@ -45,8 +45,8 @@
   another device's (without it, a device folds a stranger's reply and skips its
   own range); `partial` is Telegram's `differenceSlice` signal, without which the
   remainder of a sliced range is stranded until the next durable frame; and
-  `maxSeq` is what a complete reply advances the cursor to, which is how a row
-  the server can never send to this peer stops wedging it.
+  `maxSeq` is what a complete reply advances the cursor to, so an individually
+  oversized difference row no longer wedges catch-up.
 
 ### Fixed
 

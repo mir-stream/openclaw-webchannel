@@ -3937,8 +3937,9 @@ export class WebChannelNATSClient {
     // a held `agent_message{A}@11` re-applied after a `seal@12` whose `remove`
     // names A brought A back.
     //
-    // So the buffer is split by the range this reply ANSWERS:
-    //  - `below` — seq-bearing held frames inside `(afterSeq, declaredCovered]`.
+    // So the buffer is split at the upper bound this reply ANSWERS:
+    //  - `below` — seq-bearing held frames at or below `declaredCovered`, including
+    //    repeated progress at/below `afterSeq` (its placement seq is reused).
     //    Merged with the reply's events in SEQ ORDER and applied through
     //    `applyFrame` DIRECTLY: the cursor is `catching-up`, so `observeSeq` would
     //    only re-buffer them, and their seqs are already inside `covered`.
@@ -3958,7 +3959,7 @@ export class WebChannelNATSClient {
     const rest: InboundMessage[] = [];
     for (const held of cursor.buffer) {
       const heldSeq = isWireSeq(held.seq) ? held.seq : undefined;
-      if (heldSeq !== undefined && heldSeq > cursor.afterSeq && heldSeq <= declaredCovered) {
+      if (heldSeq !== undefined && heldSeq <= declaredCovered) {
         below.push(held);
       } else {
         rest.push(held);

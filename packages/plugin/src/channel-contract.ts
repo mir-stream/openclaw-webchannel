@@ -687,15 +687,10 @@ export type OutboundWsMessage =
    *    window whose every row was undeliverable — zero events, and the client
    *    still has to get past them.
    *
-   * ⚠️ A SEQ MISSING FROM `events` IN A NON-PARTIAL REPLY IS UNDELIVERABLE, NOT
-   * MISSING, and the client advances past it on purpose. `history-serve.ts`'s
-   * `fitDifference` SKIPS a row that alone exceeds this peer's `max_payload` — the
-   * same rule `history-frame-budget.ts` applies to a history page, for the same
-   * reason (`nats-channel.ts` journals BEFORE it publishes, so such a row is in
-   * the store precisely because its own live send hit the same limit: the peer
-   * never saw it, and omitting it is what PRESERVES `live == history`). Freezing
-   * the cursor on it instead would wedge this device's gap-sync for the whole
-   * session (#343).
+   * `history-serve.ts`'s `fitDifference` omits rows that individually exceed this
+   * peer's `max_payload` in a difference envelope. The client advances past those
+   * seqs so one oversized row cannot wedge catch-up (#343). A difference envelope
+   * differs from the live frame, so a skip does not prove live non-delivery.
    */
   | {
       type: "difference";

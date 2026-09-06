@@ -772,7 +772,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
    * 1. the whole reply fits — one measurement and it is on its way, which is the
    *    case essentially every reply takes;
    * 2. it does not: measure EVERY row alone, once, and partition into the ones
-   *    that cannot be sent at all (skipped, below) and the survivors;
+   *    that cannot fit alone in a difference (skipped, below) and the survivors;
    * 3. one bisection over the survivors for the largest fitting prefix. Every
    *    survivor fits alone, so that prefix is never empty, which is what
    *    guarantees a trimmed reply carries something to advance on;
@@ -816,16 +816,12 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
    * 170× on the page an authenticated peer can aim at the account's event loop
    * (#348). `history-serve.test.ts` pins both rows of this table.
    *
-   * ⚠️ AND WHY THE SKIP IS NOT N8. The old bottom-out was `entries.slice(0, 1)`:
+   * The old bottom-out was `entries.slice(0, 1)`:
    * hand the single oversize row to `sendDifference`, which refuses it, and the
-   * device gets NOTHING — every retry, for the whole session (#343). The
-   * docblock justifying that ("each event was already delivered LIVE … so a
-   * single event always fits") was false in both directions, and
-   * `history-frame-budget.ts` exists because such rows are demonstrably in the
-   * store: `nats-channel.ts` journals BEFORE it publishes, so a row too big for
-   * this wire is there PRECISELY BECAUSE its own live send hit the same
-   * `RangeError`. The peer never saw it live, so omitting it PRESERVES
-   * `live == history` — showing it is what would break it.
+   * device gets NOTHING — every retry, for the whole session (#343). Skipping
+   * individually oversized difference rows lets catch-up proceed. The difference
+   * envelope differs from the live frame, so a skip does not establish whether
+   * the peer received that row live.
    *
    * Whether a skipped seq is COVERED by the reply is decided by the caller, not
    * here: `publishDifference`'s `coveredThrough` is the one place that rule
@@ -876,8 +872,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
     if (emptyFrame === undefined || emptyFrame > limit) return unchanged();
 
     // ── 2. ONE PER-ROW PASS. Each row is measured exactly once, in the frame
-    // shape it would ship in, so "can this peer ever receive this row" is
-    // answered here and nowhere else.
+    // shape it would ship in, to decide whether it fits alone in this difference.
     const skipped: SkippedDifferenceRow[] = [];
     const survivors: DifferenceEntry[] = [];
     for (const entry of entries) {
@@ -952,15 +947,15 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
       const suppressed = admit("difference", "oversize-skipped");
       if (suppressed !== undefined) {
         // `error`, and the same level and reason the history budget's skip uses:
-        // content exists in this peer's store that can NEVER be delivered to it
-        // at this `max_payload`, and this is the one line naming WHICH rows.
+        // content in this peer's store is omitted from this difference because
+        // it exceeds the budget, and this line names WHICH rows.
         const detail = summarizeSkippedDifferenceRows(fitted.skipped);
         try {
           logger?.error?.(
-            `webchannel: difference skipped ${fitted.skipped.length} undeliverable ` +
-              `row(s) for ${logSafe(peerId)}; each one alone exceeds this peer's ` +
-              `effective max_payload of ${limit} bytes and can never be sent, live ` +
-              `or replayed (#311/#343): ${logSafe(detail)} (suppressed=${suppressed})`,
+            `webchannel: difference skipped ${fitted.skipped.length} oversized ` +
+              `row(s) for ${logSafe(peerId)}; each one alone in a difference exceeds ` +
+              `this peer's effective max_payload of ${limit} bytes ` +
+              `(#311/#343): ${logSafe(detail)} (suppressed=${suppressed})`,
           );
         } catch { /* a faulting logger must not escape this callback */ }
       }
@@ -1034,8 +1029,8 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
   /**
    * Serve the HEAD of this peer's queue on a fresh turn, then schedule the next
    * if any remain. The entry is held for the whole read+publish, so a peer never
-   * has two of either in flight, and a request that arrives during a run is
-   * picked up by the next turn rather than dropped.
+   * has two of either in flight. Retained requests run in FIFO order, subject to
+   * the queue's overflow replacement rule.
    */
   const scheduleNextDifference = (peerId: string): void => {
     schedule(() => {
@@ -1049,7 +1044,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
         runDifference(peerId, request);
       } finally {
         // `queue` is the LIVE array, so requests that arrived during the run are
-        // already in it and the next turn picks them up.
+        // retained in it for subsequent turns, subject to the queue bound.
         //
         // ⚠️ THE `finally` IS UNREACHABLE DEFENCE TODAY, AND NO TEST PINS IT —
         // say so rather than implying otherwise. `runDifference` guards its read
@@ -1164,7 +1159,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
 
   return {
     serveDifference(peerId: string, afterSeq: number, nonce: string): void {
-      // ⚠️ ONE READ+PUBLISH IN FLIGHT PER PEER, AND EVERY REQUEST STILL ANSWERED.
+      // ONE READ+PUBLISH IN FLIGHT PER PEER, WITH A BOUNDED FIFO QUEUE.
       // The other two read paths latch per peer and DROP a concurrent request
       // (`runDeferred`), which is right for them: a snapshot and a page each
       // answer a question that is still true when the survivor lands, so the
@@ -1178,8 +1173,8 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
       // broadcast, in the same instant, from different floors. Newest-wins would
       // answer one and silence N−1 — and, because their timers were armed
       // together, their retries re-collide in lockstep: 4 rounds of 5 s each,
-      // then a give-up, for every device but one. Before this slice every
-      // request was answered; a queue keeps that true.
+      // then a give-up, for every device but one. The queue retains concurrent
+      // requests up to the bound described below.
       //
       // ⚠️ WHAT THIS BOUNDS IS CONCURRENCY AND DEPTH, NOT RATE — the same thing
       // the file header says about the other two latches, and it is worth
