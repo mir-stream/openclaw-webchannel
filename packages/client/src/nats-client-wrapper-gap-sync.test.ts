@@ -1427,6 +1427,101 @@ describe("#244 half B — HIGH-2: get_difference is not fire-and-forget", () => 
   });
 });
 
+describe("#356 — retired lifecycle stops catch-up orchestration", () => {
+  it.each([
+    { carrier: "history", reconnect: false },
+    { carrier: "history", reconnect: true },
+    { carrier: "ack", reconnect: false },
+    { carrier: "ack", reconnect: true },
+  ])("does not observe $carrier after its subscriber closes (reconnect=$reconnect)", ({ carrier, reconnect }) => {
+    vi.useFakeTimers();
+    const { w, getDifference } = spied();
+    const instance = w as unknown as WebChannelNATSClient;
+    const connect = vi.spyOn(w.client as unknown as { connect: () => void }, "connect").mockImplementation(() => {});
+    let retired = false;
+    const incomingId = carrier === "history" ? "a20" : "webchannel-user-20";
+    const unsubscribe = instance.subscribe((state) => {
+      if (retired || !state.messages.some((m) => m.id === incomingId)) return;
+      retired = true;
+      instance.close();
+      if (reconnect) {
+        instance.connect();
+        w.handleMessage({ type: "agent_message", id: "replacement", text: "new connection", seq: 6 });
+      }
+    });
+    try {
+      seed(w, 5);
+      if (carrier === "history") {
+        w.handleMessage({
+          type: "history", messages: [{ id: incomingId, role: "agent", text: "snapshot" }], highWaterSeq: 20,
+        });
+      } else {
+        seedOptimisticUser(w, {
+          localId: "u-0", receiptKey: "r-0", randomId: "rand-1", text: "hello", wireId: "t1",
+        });
+        w.handleMessage({
+          type: "ack", ids: ["u-0"],
+          committed: [{ random_id: "rand-1", messageId: incomingId, seq: 20 }],
+        });
+      }
+      expect(retired).toBe(true);
+      expect(connect).toHaveBeenCalledTimes(reconnect ? 1 : 0);
+      expect(cursorLast(w)).toBe(reconnect ? 6 : 5);
+      expect(isCatchingUp(w)).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+      vi.advanceTimersByTime(30_000);
+      expect(getDifference).not.toHaveBeenCalled();
+    } finally {
+      unsubscribe();
+      instance.close();
+      connect.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([false, true])("stops give-up redispatch when its first subscriber closes (reconnect=%s)", (reconnect) => {
+    vi.useFakeTimers();
+    const { w, getDifference } = spied();
+    const instance = w as unknown as WebChannelNATSClient;
+    const connect = vi.spyOn(w.client as unknown as { connect: () => void }, "connect").mockImplementation(() => {});
+    let retired = false;
+    const unsubscribe = instance.subscribe((state) => {
+      if (retired || !state.messages.some((m) => m.id === "a6")) return;
+      retired = true;
+      instance.close();
+      if (reconnect) {
+        instance.connect();
+        w.handleMessage({ type: "agent_message", id: "replacement", text: "new connection", seq: 6 });
+      }
+    });
+    try {
+      seed(w, 5);
+      // A high-water observation opens a real catch-up with no held frame.
+      w.handleMessage({ type: "history", messages: [], highWaterSeq: 20 });
+      expect(getDifference).toHaveBeenCalledTimes(1);
+      w.handleMessage({ type: "agent_message", id: "a6", text: "answer 6", seq: 6 });
+      w.handleMessage({ type: "agent_message", id: "a10", text: "retired frame", seq: 10 });
+      expect(retired).toBe(false);
+      // After the initial request and three retries, only a6 is contiguous.
+      vi.advanceTimersByTime(20_000);
+      expect(retired).toBe(true);
+      expect(connect).toHaveBeenCalledTimes(reconnect ? 1 : 0);
+      expect(w.state.messages.some((m) => m.id === "a6")).toBe(true);
+      expect(w.state.messages.some((m) => m.id === "a10")).toBe(false);
+      expect(w.state.messages.some((m) => m.id === "replacement")).toBe(reconnect);
+      expect(isCatchingUp(w)).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+      vi.advanceTimersByTime(30_000);
+      expect(getDifference).toHaveBeenCalledTimes(4);
+    } finally {
+      unsubscribe();
+      instance.close();
+      connect.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("#345 — an ack's committed seq belongs to the device that sent it", () => {
   it("ORIGIN: an ack whose random_id resolves a local send advances the cursor", () => {
     const { w, getDifference } = spied();

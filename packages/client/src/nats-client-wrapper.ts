@@ -3416,7 +3416,11 @@ export class WebChannelNATSClient {
     // see `originCommittedSeqs`. Asking afterwards would always answer "not mine".
     const ownCommittedSeqs = msg.type === "ack" ? this.originCommittedSeqs(msg) : undefined;
 
+    const lifecycle = this.wrapperLifecycleGeneration;
     this.applyFrame(msg);
+    // Public subscribers may close or reconnect while the frame is applied.
+    // Its trailing observations belong only to the lifecycle that received it.
+    if (this.wrapperLifecycleGeneration !== lifecycle) return;
 
     // Two NON-seq-bearing frames still carry a seq the cursor tracks. Both go
     // through the SAME three-way check as a durable frame (#345, #352): a value
@@ -3436,7 +3440,11 @@ export class WebChannelNATSClient {
     } else if (ownCommittedSeqs !== undefined) {
       // The inbound USER opener consumes a seq but rides no durable frame — half A
       // echoes that seq on the ack. Only THIS DEVICE'S echoes reach here.
-      for (const seq of ownCommittedSeqs) this.observeSeq(seq, undefined);
+      for (const seq of ownCommittedSeqs) {
+        // Opening a gap publishes a request, which can also retire this lifecycle.
+        if (this.wrapperLifecycleGeneration !== lifecycle) return;
+        this.observeSeq(seq, undefined);
+      }
     }
   }
 
@@ -3652,7 +3660,12 @@ export class WebChannelNATSClient {
     buffered: InboundMessage[],
     carried: CarriedRows | undefined,
   ): void {
-    for (const m of this.uncarried(buffered, carried)) this.handleMessage(m);
+    const lifecycle = this.wrapperLifecycleGeneration;
+    for (const m of this.uncarried(buffered, carried)) {
+      // A callback from an earlier frame can retire this entire local buffer.
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
+      this.handleMessage(m);
+    }
   }
 
   /**
