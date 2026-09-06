@@ -807,6 +807,13 @@ export class WebChannelNATSClient {
     agentProtocolVersion: null,
     agentPluginVersion: null,
   };
+  /** Replayed empty slots retain reducer order without becoming visible drafts. */
+  private readonly replayPlacementIds = new Set<string>();
+  /** Only synchronous fold/drain scopes hold these arrays; retired frames stay weak. */
+  private readonly activeReplayBuffers = new Set<InboundMessage[]>();
+  private readonly retiredBufferedProgress = new WeakSet<InboundMessage>();
+  private visibleStateSource = this.state;
+  private visibleState = this.state;
 
   private readonly listeners = new Set<Listener>();
   /** Counts public state fanouts so a staged bubble is exposed exactly once. */
@@ -1194,7 +1201,25 @@ export class WebChannelNATSClient {
 
   /** Get current state */
   getState(): WebChannelState {
-    return this.state;
+    if (this.visibleStateSource !== this.state) {
+      this.visibleStateSource = this.state;
+      this.visibleState = this.state;
+      if (this.replayPlacementIds.size > 0) {
+        const retained = new Set<string>();
+        const messages = this.state.messages.filter((m) => {
+          if (m.kind !== undefined || m.role !== "agent" || !this.replayPlacementIds.has(m.id)) return true;
+          retained.add(m.id);
+          return false;
+        });
+        for (const id of this.replayPlacementIds) {
+          if (!retained.has(id)) this.replayPlacementIds.delete(id);
+        }
+        if (messages.length !== this.state.messages.length) {
+          this.visibleState = { ...this.state, messages };
+        }
+      }
+    }
+    return this.visibleState;
   }
 
   /** Subscribe to state changes */
@@ -1357,6 +1382,7 @@ export class WebChannelNATSClient {
     // explicit command clears the buffer).
     if (isLikelyAbortText(trimmed)) {
       if (isExplicitStop(trimmed)) {
+        this.retireBufferedProgress();
         this.stopCommitDepth++;
         let stopCommitted = false;
         try {
@@ -2564,7 +2590,7 @@ export class WebChannelNATSClient {
     this.stateNotificationSeq++;
     for (const listener of this.listeners) {
       try {
-        listener(this.state);
+        listener(this.getState());
       } catch (e) {
         console.error("[nats-wrapper] state listener threw:", e);
       }
@@ -3018,6 +3044,12 @@ export class WebChannelNATSClient {
     // with a documented exception is the shape nobody checks.
     extra?: StatePatch,
   ): void {
+    // Authored content exposes a retained replay slot, including an explicitly
+    // empty durable answer. Placement alone never establishes live activity.
+    if (event.kind === "bubble") this.replayPlacementIds.delete(event.answerId);
+    if (event.kind === "seal") {
+      for (const answer of event.answers) this.replayPlacementIds.delete(answer.id);
+    }
     this.setState({ messages: this.nextDurableMessages(event, local), ...extra });
   }
 
@@ -3661,10 +3693,32 @@ export class WebChannelNATSClient {
     carried: CarriedRows | undefined,
   ): void {
     const lifecycle = this.wrapperLifecycleGeneration;
-    for (const m of this.uncarried(buffered, carried)) {
-      // A callback from an earlier frame can retire this entire local buffer.
-      if (this.wrapperLifecycleGeneration !== lifecycle) return;
-      this.handleMessage(m);
+    this.activeReplayBuffers.add(buffered);
+    try {
+      for (const m of this.uncarried(buffered, carried)) {
+        // A callback can retire this lifecycle or stop a later buffered draft.
+        if (this.wrapperLifecycleGeneration !== lifecycle) return;
+        if (!this.retiredBufferedProgress.has(m)) this.handleMessage(m);
+      }
+    } finally {
+      this.activeReplayBuffers.delete(buffered);
+    }
+  }
+
+  /** A genuine turn end retires its already-received drafts before replay. */
+  private retireBufferedProgress(turnId?: string): void {
+    const retire = (frame: InboundMessage): boolean => {
+      if (frame.type !== "progress" || (turnId !== undefined && frame.turnId !== turnId)) return false;
+      this.retiredBufferedProgress.add(frame);
+      return true;
+    };
+    if (this.cursor.state === "catching-up") {
+      this.cursor.buffer = this.cursor.buffer.filter((frame) => !retire(frame));
+    }
+    // A fold may already have copied below/rest, or installed synced for a
+    // give-up drain. Retire those exact objects too, never future frames by id.
+    for (const buffer of this.activeReplayBuffers) {
+      for (const frame of buffer) retire(frame);
     }
   }
 
@@ -3718,8 +3772,9 @@ export class WebChannelNATSClient {
     buffered: InboundMessage[],
     carried: CarriedRows | undefined,
   ): InboundMessage[] {
-    if (carried === undefined) return buffered;
     return buffered.filter((m) => {
+      if (this.retiredBufferedProgress.has(m)) return false;
+      if (carried === undefined) return true;
       const seq = isWireSeq(m.seq) ? m.seq : undefined;
       if (seq === undefined || m.type === "progress") {
         const id = typeof m.id === "string" && m.id.length > 0 ? m.id : undefined;
@@ -4008,6 +4063,8 @@ export class WebChannelNATSClient {
     // `onCatchUpTimeout` re-issues on its own cadence and eventually gives up. A
     // throw PART-WAY leaves the cursor at the last applied event and settles or
     // re-requests from there. Either way the buffer is not consulted for recovery.
+    const replayBuffer = cursor.buffer;
+    this.activeReplayBuffers.add(replayBuffer);
     try {
       // ONE ASCENDING PASS over the reply's events and `below`, together. At an
       // equal seq the reply's event goes FIRST: it is the durable row, and the
@@ -4051,12 +4108,14 @@ export class WebChannelNATSClient {
         // placement is what keeps the draft the user is watching, and a
         // `bubble`/`seal` later in the same merge then authors over it — exactly
         // as it would have live.
-        if (held!.type === "progress" || !carriedSeqs.has(heldSeq!)) {
+        if (!this.retiredBufferedProgress.has(held!)
+          && (held!.type === "progress" || !carriedSeqs.has(heldSeq!))) {
           this.applyFrame(held!);
         }
       }
       completed = true;
     } finally {
+      this.activeReplayBuffers.delete(replayBuffer);
       // ⚠️ ONLY IF THIS CATCH-UP IS STILL THE LIVE ONE. The fold runs reducers and
       // public listeners, and a listener may call `close()` — which runs
       // `resetCursorForConnection` and lands a valid `synced` cursor. Transitioning
@@ -4106,21 +4165,10 @@ export class WebChannelNATSClient {
   }
 
   /**
-   * #244 half B — fold ONE raw catch-up event, applying the SAME client-local
-   * overlay the corresponding LIVE handler applies.
-   *
-   * ⚠️ THE OVERLAY IS LOAD-BEARING, NOT DECORATION — this is the subtlety half B
-   * turns on. `working`/`draftOnly` are client-local flags the wire never carries
-   * (a journal `placement` has no text; a `bubble`/`seal` authors durable text and
-   * RETIRES the draft). A BARE `applyDurable(bubble)` folded onto a live draft
-   * bubble keeps that bubble `draftOnly:true` — and `projectDurableFromClient`
-   * blanks a `draftOnly` bubble to `""`, so the caught-up text would VANISH from
-   * the durable view. Re-supplying the exact overlays `case "agent_message"` /
-   * `case "progress"` / `applyTurnSnapshot` supply is what makes a gap heal to a
-   * view byte-identical to the no-gap fold (live == history). Every other event
-   * kind (`user`/`reasoning`/`tool`/`approval`/…) carries no such flag, so it folds
-   * with no overlay exactly as its live handler does — an approval, like a
-   * history-replayed one, is inert until an `approval_snapshot` arms it.
+   * Replay durable content without inventing current activity (#349). A
+   * placement preserves an existing live draft or reserves a hidden empty slot.
+   * Bubble/seal authoring still clears draftOnly so the durable projection keeps
+   * the authored text. Other event kinds retain their usual replay handling.
    */
   private foldDifferenceEvent(event: DurableEvent): void {
     switch (event.kind) {
@@ -4131,25 +4179,11 @@ export class WebChannelNATSClient {
         });
         return;
       case "placement": {
-        // Mirror `case "progress"`: the slot claim is a working draft. The draft
-        // TEXT is not journaled, so it stays empty until a `bubble`/`seal` authors
-        // it (the same lane the live progress carried, minus the volatile text).
-        //
-        // ⚠️ MED-3: `draftOnly` is CLAIMED ONLY when the bubble is absent or is
-        // itself already a draft — the SAME `claimsDraft` guard the live `progress`
-        // handler applies. A placement landing on an ALREADY-AUTHORED bubble (a
-        // re-progress, or a placement re-served after its answer arrived) must NOT
-        // re-mark it droppable: `projectDurableFromClient` would then blank the
-        // authored answer to `""` (the "answer destroyed" case the live docblock
-        // guards). `working: true` is still set unconditionally, exactly as live —
-        // it is not a durable flag, so it never blanks the projection.
         const held = this.state.messages.find(
           (m) => m.kind === undefined && m.id === event.answerId,
         );
-        const claimsDraft = held === undefined || held.draftOnly === true;
-        this.applyDurable(event, {
-          [event.answerId]: { working: true, ...(claimsDraft ? { draftOnly: true } : {}) },
-        });
+        if (held === undefined) this.replayPlacementIds.add(event.answerId);
+        this.applyDurable(event);
         return;
       }
       case "seal": {
@@ -4809,6 +4843,17 @@ export class WebChannelNATSClient {
             // it is cut now because keying the index makes that state the ONLY
             // way the two can disagree.
             if (li !== undefined) {
+              const slot = next[li]!;
+              if (slot.kind === undefined && slot.role === "agent" && m.role === "agent"
+                && this.replayPlacementIds.delete(m.id)) {
+                // A private placement has no content to deduplicate. Hydrate
+                // this slot only; ordinary tier-1 refresh remains separate.
+                next[li] = {
+                  ...slot, text: m.text, working: false,
+                  ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
+                };
+                adopted = true;
+              }
               cursor = li + 1;
               // ⚠️ CLAIM IT. A bubble already identified BY ID must not stay a
               // later row's tier-2 adoption target. Like the retirement in
@@ -5218,7 +5263,9 @@ export class WebChannelNATSClient {
         const heldBubble = this.state.messages.find(
           (m) => m.kind === undefined && m.id === answerId,
         );
-        const claimsDraft = heldBubble === undefined || heldBubble.draftOnly === true;
+        const claimsDraft = heldBubble === undefined || heldBubble.draftOnly === true
+          || this.replayPlacementIds.has(answerId);
+        this.replayPlacementIds.delete(answerId);
         this.applyDurable(
           {
             kind: "placement",
@@ -5309,6 +5356,7 @@ export class WebChannelNATSClient {
       }
 
       case "turn_settled": {
+        if (msg.turnId) this.retireBufferedProgress(msg.turnId);
         // Consume before outcome promotion or UI settlement: either operation
         // can fan out synchronously, and a delayed publish callback must not open
         // a turn whose settle has already arrived.

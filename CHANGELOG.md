@@ -133,6 +133,10 @@
     only on the device that originated the send (the `random_id` resolves a local
     linkage), and a seq above the contiguous next one opens a gap instead of
     closing it.
+  - **#349** — Catch-up no longer turns past placement rows into working
+    drafts. Empty slots stay internal to preserve order across slices; live
+    progress or authored content makes them visible. Existing live drafts stay
+    active, while explicit turn completion or `/stop` retires buffered progress.
   - **#343 (client half)** — a frame held during a catch-up is now dropped only
     when the reply actually carried an event for its seq, never merely because the
     cursor covers it: a row the server could not send is covered but absent, and

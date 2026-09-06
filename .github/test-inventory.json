@@ -36,7 +36,7 @@
     "packages/client/src/nats-client-wrapper-agent-liveness.test.ts": 19,
     "packages/client/src/nats-client-wrapper-gap-sync.test.ts": 82,
     "packages/client/src/nats-client-wrapper-hydration.test.ts": 32,
-    "packages/client/src/nats-client-wrapper-sendstate.test.ts": 64,
+    "packages/client/src/nats-client-wrapper-sendstate.test.ts": 76,
     "packages/client/src/nats-client-wrapper-turn-active.test.ts": 38,
     "packages/client/src/nats-client-wrapper.test.ts": 111,
     "packages/client/src/nats-p04-integration.test.ts": 2,
