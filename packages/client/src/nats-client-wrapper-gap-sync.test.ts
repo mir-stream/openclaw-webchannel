@@ -1428,6 +1428,45 @@ describe("#244 half B — HIGH-2: get_difference is not fire-and-forget", () => 
 });
 
 describe("#356 — retired lifecycle stops catch-up orchestration", () => {
+  it.each([false, true])("stops the difference merge after a subscriber closes (reconnect=%s)", (reconnect) => {
+    vi.useFakeTimers();
+    const { w, getDifference } = spied();
+    const instance = w as unknown as WebChannelNATSClient;
+    const connect = vi.spyOn(w.client as unknown as { connect: () => void }, "connect").mockImplementation(() => {});
+    let retired = false;
+    const unsubscribe = instance.subscribe((state) => {
+      if (retired || !state.messages.some((m) => m.id === "T")) return;
+      retired = true;
+      instance.close();
+      if (reconnect) {
+        instance.connect();
+        w.handleMessage({ type: "agent_message", id: "replacement", text: "new connection", seq: 2 });
+      }
+    });
+    try {
+      seed(w, 1);
+      w.handleMessage({ type: "agent_message", id: "A", text: "X".repeat(500), turnId: "t1", seq: 3 });
+      // A's live frame can fit while its difference envelope is oversized.
+      // The held copy must not survive teardown triggered by the earlier row.
+      w.handleMessage(reply(w, [
+        { seq: 2, event: { kind: "tool", id: "T", name: "bash", phase: "end", turnId: "t1" } },
+      ], { maxSeq: 3 }));
+      expect(retired).toBe(true);
+      expect(connect).toHaveBeenCalledTimes(reconnect ? 1 : 0);
+      expect(instance.getState().messages.map((m) => m.id)).toEqual(reconnect ? ["T", "replacement"] : ["T"]);
+      expect(cursorLast(w)).toBe(reconnect ? 2 : 1);
+      expect(isCatchingUp(w)).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+      vi.advanceTimersByTime(30_000);
+      expect(getDifference).toHaveBeenCalledTimes(1);
+    } finally {
+      unsubscribe();
+      instance.close();
+      connect.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     { carrier: "history", reconnect: false },
     { carrier: "history", reconnect: true },

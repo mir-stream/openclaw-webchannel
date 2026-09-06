@@ -4070,6 +4070,8 @@ export class WebChannelNATSClient {
       // equal seq the reply's event goes FIRST: it is the durable row, and the
       // held frame is a live rendering of that same row.
       while (nextEvent < events.length || nextHeld < below.length) {
+        // A subscriber may close/reconnect while an earlier row is folded.
+        if (this.cursor !== cursor) return;
         const entry = events[nextEvent];
         const held = below[nextHeld];
         const heldSeq = held === undefined ? undefined : (held.seq as number);
