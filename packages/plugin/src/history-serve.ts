@@ -230,9 +230,9 @@ const MAX_QUEUED_DIFFERENCE_REQUESTS = 8;
 type SkippedDifferenceRow = { seq: number; bytes: number };
 
 type FittedDifference = {
-  /** The events to publish: an order-preserving subsequence, oldest first. */
-  entries: DifferenceEntry[];
-  /** Rows that can NEVER be sent to this peer. Operator-actionable. */
+  /** The exact reply measured by the fitter, ready to publish unchanged. */
+  reply: DifferenceReply;
+  /** Rows that cannot fit alone in their difference envelope. */
   skipped: SkippedDifferenceRow[];
   /**
    * How many NEWER events the byte budget left out. Not data loss: the reply
@@ -757,160 +757,86 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
   };
 
   /**
-   * #244 half B / #356 — trim a difference to the peer's wire, keeping the
-   * OLDEST prefix and SKIPPING any row that cannot be sent to this peer at all.
-   *
-   * ⚠️ THE OPPOSITE END FROM `fitHistoryFrame`, ON PURPOSE. A history page keeps
-   * the NEWEST rows because the pager reaches the older ones. A difference must
-   * keep the OLDEST because the client advances its cursor through the range it
-   * receives and re-requests from there: dropping the tail is re-requestable
-   * (that is what `partial` says), dropping the head would strand a permanent
-   * hole below the new cursor. Order is never permuted.
-   *
-   * ── THE SHAPE: ONE PER-ROW PASS, THEN ONE BISECTION ──
-   *
-   * 1. the whole reply fits — one measurement and it is on its way, which is the
-   *    case essentially every reply takes;
-   * 2. it does not: measure EVERY row alone, once, and partition into the ones
-   *    that cannot fit alone in a difference (skipped, below) and the survivors;
-   * 3. one bisection over the survivors for the largest fitting prefix. Every
-   *    survivor fits alone, so that prefix is never empty, which is what
-   *    guarantees a trimmed reply carries something to advance on;
-   * 4. nothing can be decided (no session key, or an unusable/tiny limit) —
-   *    returned unchanged, so the send fails loudly at the channel rather than
-   *    quietly here.
-   *
-   * ⚠️ IT IS NOT `fitHistoryFrame`'s SHAPE, AND THE DIFFERENCE IS DELIBERATE.
-   * That module re-runs its bisection after every skip, which is fine for a page
-   * whose undeliverable rows are a handful. Applied to a difference it is
-   * peer-drivable: a 500-row window in which NO row fits costs one pass per row,
-   * each with a fresh bisection, all on one scheduled callback.
-   *
-   * ⚠️ THE NUMBERS, AND WHERE EACH ONE COMES FROM — because the first version of
-   * this docblock quoted "125 000 seals" and that was two units run together.
-   * A `sizeOf` call is ONE `outboundWireSize` (one `sealEnvelope`); what it
-   * serializes is the ROW COUNT of that call. Develop's loop made one call per
-   * removed row, so its calls are O(n) and its row-measurements are Σ prefix
-   * lengths ≈ n²/2 — the ~125 000 belongs to the second unit, which is what #348
-   * itself said.
-   *
-   * Measured against this file's own test stub, 500 rows each way. The two rows
-   * marked (modelled) are this algorithm's predecessors re-implemented against
-   * the same stub — their code is not in the tree to run:
-   *
-   *                              calls   row-measurements   serialized
-   *   ordinary oversize page
-   *     develop (modelled)         424            122 324      31.75 MB
-   *     bisect-per-skip (modelled)  13              1 931       0.50 MB
-   *     this shape                 512              2 392       0.74 MB
-   *   all-undeliverable window
-   *     develop (modelled)         500            125 250      10.84 MB
-   *     bisect-per-skip (modelled) 4 500           249 278      22.05 MB
-   *     this shape                 502              1 000       0.13 MB
-   *
-   * ⚠️ SO IT COSTS MORE CALLS ON THE ORDINARY PAGE, AND SAYING OTHERWISE WOULD BE
-   * THE SAME MISTAKE AGAIN. 13 → 512 calls, because a call here measures ONE row
-   * where a bisection step measures up to 500; the quantity that actually reaches
-   * `sealEnvelope` goes 0.50 → 0.74 MB, about half as much again. That is the
-   * trade: half as much again on a page that was already overflowing, against
-   * 170× on the page an authenticated peer can aim at the account's event loop
-   * (#348). `history-serve.test.ts` pins both rows of this table.
-   *
-   * The old bottom-out was `entries.slice(0, 1)`:
-   * hand the single oversize row to `sendDifference`, which refuses it, and the
-   * device gets NOTHING — every retry, for the whole session (#343). Skipping
-   * individually oversized difference rows lets catch-up proceed. The difference
-   * envelope differs from the live frame, so a skip does not establish whether
-   * the peer received that row live.
-   *
-   * Whether a skipped seq is COVERED by the reply is decided by the caller, not
-   * here: `publishDifference`'s `coveredThrough` is the one place that rule
-   * lives, because it depends on the trim as well as the skip.
-   *
-   * ⚠️ MEASURED WITH `partial: false`. The flag is decided by this function's
-   * result, so it cannot be known while measuring; `false` is the longer JSON
-   * literal, so the frame that ships is never larger than what was budgeted.
+   * Keep the oldest fitting prefix, skipping only individually oversized rows.
+   * Each size check uses the partial/maxSeq coverage that reply would publish:
+   * conservative high-water metadata may falsely classify a fitting row as lost.
+   * One per-row pass plus one bisection bounds measurements without re-running a
+   * prefix search for every skipped row (#343/#348).
    */
   const fitDifference = (
     peerId: string,
-    envelope: { afterSeq: number; nonce: string; maxSeq: number },
-    entries: DifferenceEntry[],
+    request: DifferenceRequest,
+    produced: { entries: DifferenceEntry[]; capped: boolean; maxSeq: number },
   ): FittedDifference => {
-    const unchanged = (): FittedDifference => ({ entries, skipped: [], trimmed: 0 });
+    const { entries } = produced;
+    const windowMax = entries.at(-1)?.seq ?? request.afterSeq;
+    // Covering less than the physical window leaves a partial reply even when
+    // every remaining row was oversized. Completing the window also covers the
+    // journal high-water, unless the read found rows beyond its cap.
+    const makeReply = (events: DifferenceEntry[], coveredThrough = windowMax): DifferenceReply => {
+      const partial = produced.capped || coveredThrough < windowMax;
+      return {
+        afterSeq: request.afterSeq,
+        nonce: request.nonce,
+        events,
+        partial,
+        maxSeq: partial ? coveredThrough : Math.max(windowMax, produced.maxSeq),
+      };
+    };
+    const wholeReply = makeReply(entries);
+    const unchanged = (): FittedDifference => ({ reply: wholeReply, skipped: [], trimmed: 0 });
     if (entries.length === 0) return unchanged();
     const limit = channel.effectiveOutboundLimit();
-    // An unusable limit means "no bound known" — send as-is and let the channel
-    // decide, the same idiom `fitHistoryFrame` uses.
     if (!Number.isSafeInteger(limit) || limit < 0) return unchanged();
-    const sizeOf = (rows: DifferenceEntry[]): number | undefined => {
-      const bytes = channel.outboundWireSize(peerId, {
-        type: "difference",
-        afterSeq: envelope.afterSeq,
-        nonce: envelope.nonce,
-        events: rows,
-        partial: false,
-        maxSeq: envelope.maxSeq,
-      });
+    const sizeOf = (reply: DifferenceReply): number | undefined => {
+      const bytes = channel.outboundWireSize(peerId, { type: "difference", ...reply });
       return typeof bytes === "number" && Number.isSafeInteger(bytes) && bytes >= 0
         ? bytes
         : undefined;
     };
 
-    // ── 1. THE FAST PATH: one measurement, and the reply is on its way. ──
-    const whole = sizeOf(entries);
-    // No session key yet: the send is about to fail-closed for the same reason,
-    // so there is nothing to budget. Hand it on unchanged.
-    if (whole === undefined) return unchanged();
-    if (whole <= limit) return unchanged();
+    const wholeBytes = sizeOf(wholeReply);
+    if (wholeBytes === undefined || wholeBytes <= limit) return unchanged();
+    // If even an empty coverage reply cannot fit, leave failure to the channel.
+    const emptyReply = makeReply([]);
+    const emptyBytes = sizeOf(emptyReply);
+    if (emptyBytes === undefined || emptyBytes > limit) return unchanged();
 
-    // Below here the reply is known not to fit, and every extra measurement is
-    // paid only by a reply that was going to be REFUSED whole.
-
-    // If not even an empty frame fits, no subset does — hand it on and let the
-    // publish fail loudly rather than impersonating "nothing to send".
-    const emptyFrame = sizeOf([]);
-    if (emptyFrame === undefined || emptyFrame > limit) return unchanged();
-
-    // ── 2. ONE PER-ROW PASS. Each row is measured exactly once, in the frame
-    // shape it would ship in, to decide whether it fits alone in this difference.
     const skipped: SkippedDifferenceRow[] = [];
     const survivors: DifferenceEntry[] = [];
     for (const entry of entries) {
-      const bytes = sizeOf([entry]);
+      // A singleton can end at its own seq while physical rows remain. Its
+      // terminal counterpart must include completion/high-water metadata.
+      const bytes = sizeOf(makeReply([entry], entry.seq));
       if (bytes === undefined) return unchanged();
       if (bytes > limit) skipped.push({ seq: entry.seq, bytes });
       else survivors.push(entry);
     }
-    // Every row is undeliverable. An empty reply is the honest answer — the
-    // caller's `coveredThrough` is what moves the client past them (#343).
-    if (survivors.length === 0) return { entries: [], skipped, trimmed: 0 };
+    if (survivors.length === 0) return { reply: emptyReply, skipped, trimmed: 0 };
 
-    // ── 3. Dropping the undeliverable rows may have been enough on its own.
-    const survivingWhole = sizeOf(survivors);
-    if (survivingWhole === undefined) return unchanged();
-    if (survivingWhole <= limit) return { entries: survivors, skipped, trimmed: 0 };
+    const survivingWhole = makeReply(survivors);
+    const survivingBytes = sizeOf(survivingWhole);
+    if (survivingBytes === undefined) return unchanged();
+    if (survivingBytes <= limit) return { reply: survivingWhole, skipped, trimmed: 0 };
 
-    // ── 4. Largest fitting PREFIX of the survivors, by bisection. Sealed size is
-    // monotone in row count, so the predicate is monotone and the search exact:
-    // ~9 measurements at 500 rows. `lo` fits — and here that is not the empty
-    // frame but a REAL floor: step 2 proved every survivor fits alone, so a
-    // one-row prefix fits and `lo` lands at 1 or above. That is what makes a
-    // trimmed reply non-empty, which the client needs in order to advance.
-    let lo = 0;
-    let hi = survivors.length;
+    // The first singleton was proven to fit. Search through ALL survivors:
+    // their own last seq may fit even when covering a skipped tail does not.
+    let lo = 1;
+    let hi = survivors.length + 1;
+    let reply = makeReply([survivors[0]!], survivors[0]!.seq);
     while (hi - lo > 1) {
       const mid = (lo + hi) >> 1;
-      const bytes = sizeOf(survivors.slice(0, mid));
+      const candidate = makeReply(survivors.slice(0, mid), survivors[mid - 1]!.seq);
+      const bytes = sizeOf(candidate);
       if (bytes === undefined) return unchanged();
-      if (bytes <= limit) lo = mid;
-      else hi = mid;
+      if (bytes <= limit) {
+        lo = mid;
+        reply = candidate;
+      } else {
+        hi = mid;
+      }
     }
-
-    return {
-      entries: survivors.slice(0, lo),
-      skipped,
-      trimmed: survivors.length - lo,
-    };
+    return { reply, skipped, trimmed: survivors.length - lo };
   };
 
   /**
@@ -926,22 +852,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
     produced: { entries: DifferenceEntry[]; capped: boolean; maxSeq: number },
   ): void => {
     const limit = channel.effectiveOutboundLimit();
-    const windowMax = produced.entries.at(-1)?.seq ?? request.afterSeq;
-    const fitted = fitDifference(
-      peerId,
-      {
-        afterSeq: request.afterSeq,
-        nonce: request.nonce,
-        // ⚠️ THE UPPER BOUND ON `coveredThrough`, NOT THE VALUE — which is not
-        // known yet, because it depends on what this fit decides. Every branch
-        // below yields at most `max(windowMax, journal high-water)`, so measuring
-        // with that can only OVERSTATE the frame by a digit or two, never
-        // understate it. (`partial` is measured as `false` for the same reason:
-        // it is the longer JSON literal.)
-        maxSeq: Math.max(windowMax, produced.maxSeq),
-      },
-      produced.entries,
-    );
+    const fitted = fitDifference(peerId, request, produced);
 
     if (fitted.skipped.length > 0) {
       const suppressed = admit("difference", "oversize-skipped");
@@ -979,46 +890,14 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
       }
     }
 
-    // Telegram's `difference` vs `differenceSlice`: TRUE iff rows exist beyond
-    // what this reply accounts for. A row the budget SKIPPED does not count — it
-    // is undeliverable, not deferred, and re-requesting it would wedge the device
-    // on it forever.
-    const partial = produced.capped || fitted.trimmed > 0;
-    // ⚠️ `maxSeq` IS "THE HIGHEST SEQ THIS REPLY ACCOUNTS FOR", AND ON A PARTIAL
-    // REPLY THAT IS NOT THE JOURNAL'S HIGH-WATER. The client advances to it and
-    // re-requests from there, so it MUST be strictly above `afterSeq` whenever
-    // `partial` is set or the pair loops forever on the same floor. Three cases,
-    // and the middle one is the one that would otherwise loop:
-    //  - rows were TRIMMED for bytes: coverage stops at the last event actually
-    //    served (a row skipped ABOVE that point is not covered and is simply
-    //    re-examined on the next request);
-    //  - nothing was trimmed: every row the read returned is either in `events`
-    //    or was skipped as undeliverable, so the whole WINDOW is accounted for —
-    //    including the degenerate window whose every row was undeliverable, which
-    //    ships zero events and must still move the client past them;
-    //  - and when the read was not capped either, the window reached the end, so
-    //    the journal's own high-water (read BEFORE the rows) applies too.
-    const coveredThrough =
-      fitted.trimmed > 0
-        ? (fitted.entries.at(-1)?.seq ?? request.afterSeq)
-        : produced.capped
-          ? windowMax
-          : Math.max(windowMax, produced.maxSeq);
-
-    const reply: DifferenceReply = {
-      afterSeq: request.afterSeq,
-      nonce: request.nonce,
-      events: fitted.entries,
-      partial,
-      maxSeq: coveredThrough,
-    };
+    const { reply } = fitted;
     if (!channel.sendDifference?.(peerId, reply)) {
       const suppressed = admit("difference", "publish-failed");
       if (suppressed !== undefined) {
         try {
           logger?.error?.(
             `webchannel: difference publish failed for ${logSafe(peerId)}: the ` +
-              `channel refused a ${fitted.entries.length}-event frame; see the ` +
+              `channel refused a ${reply.events.length}-event frame; see the ` +
               `channel log (suppressed=${suppressed})`,
           );
         } catch { /* a faulting logger must not escape this callback */ }

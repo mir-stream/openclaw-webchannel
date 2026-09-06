@@ -208,7 +208,7 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
     "history-serve.ts  ::  suppressed  @  webchannel: difference read failed for (afterSeq=): (suppressed=)",
     "history-serve.ts  ::  request.afterSeq  @  webchannel: difference publish failed for (afterSeq=): (suppressed=)",
     "history-serve.ts  ::  suppressed  @  webchannel: difference publish failed for (afterSeq=): (suppressed=)",
-    "history-serve.ts  ::  fitted.entries.length  @  webchannel: difference publish failed for : the channel refused a -event frame; see the channel log (suppressed=)",
+    "history-serve.ts  ::  reply.events.length  @  webchannel: difference publish failed for : the channel refused a -event frame; see the channel log (suppressed=)",
     "history-serve.ts  ::  suppressed  @  webchannel: difference publish failed for : the channel refused a -event frame; see the channel log (suppressed=)",
     "history-serve.ts  ::  fitted.skipped.length  @  webchannel: difference skipped oversized row(s) for ; each one alone in a difference exceeds this peer's effective max_payload of bytes (#311/#343): (suppressed=)",
     "history-serve.ts  ::  limit  @  webchannel: difference skipped oversized row(s) for ; each one alone in a difference exceeds this peer's effective max_payload of bytes (#311/#343): (suppressed=)",

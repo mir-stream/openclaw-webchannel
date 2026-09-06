@@ -26,6 +26,7 @@ import { openDeliveryJournal, type DeliveryJournal } from "./delivery-journal.js
 import type { JournalEvent } from "./delivery-journal-event.js";
 import { DEFAULT_HISTORY_CONFIG, type HistoryMessage } from "./history.js";
 import type { DifferenceReply } from "./channel-contract.js";
+import { sealEnvelope } from "./e2e-session.js";
 import {
   createHistoryServer,
   MAX_DIFFERENCE_EVENTS,
@@ -945,6 +946,61 @@ describe("createHistoryServer.serveDifference — #244 half B / #356", () => {
     expect(h2.differences[0].partial).toBe(false);
   });
 
+  it.each([
+    { shape: "capped window", afterSeq: 9, firstSeq: 10, oversizedTail: false },
+    { shape: "single survivor with skipped tail", afterSeq: 998, firstSeq: 999, oversizedTail: true },
+  ])("fits the actual encrypted difference envelope: $shape", ({ afterSeq, firstSeq, oversizedTail }) => {
+    const journal = openJournal();
+    for (let seq = 1; seq <= 1000; seq++) {
+      journal.append(PEER, {
+        kind: "bubble", answerId: `a${seq}`, turnId: "t1",
+        text: seq === firstSeq ? "X".repeat(500) : oversizedTail && seq === 1000 ? "X".repeat(2000) : "x",
+      });
+    }
+    const routing = { accountId: "acct-1", tenant: "tenant-1", sub: PEER };
+    const key = new Uint8Array(32);
+    const wireSize = (payload: unknown) => sealEnvelope(routing, key, payload).length;
+    const row = journal.read(PEER, { afterSeq, limit: 1 })[0]!;
+    const singleton = {
+      type: "difference", afterSeq, nonce: "request-nonce",
+      events: [{ seq: row.seq, event: row.event }], partial: true, maxSeq: firstSeq,
+    };
+    const limit = wireSize(singleton);
+    // Completion/high-water metadata crosses a digit boundary and rejects the
+    // same row, even though its actual partial singleton fits exactly.
+    expect(wireSize({ ...singleton, partial: false, maxSeq: 1000 })).toBeGreaterThan(limit);
+    const h = harness(journal, {}, limit);
+    h.recording.channel.outboundWireSize = (_peerId, payload) => wireSize(payload);
+
+    const received: number[] = [];
+    let floor = afterSeq;
+    const target = oversizedTail ? 1000 : 20;
+    for (let requests = 0; requests < 5 && floor < target; requests++) {
+      serveDifference(h, floor, "request-nonce");
+      expect(h.differences).toHaveLength(requests + 1);
+      const { peerId, ...reply } = h.differences.at(-1)!;
+      expect(peerId).toBe(PEER);
+      expect(wireSize({ type: "difference", ...reply })).toBeLessThanOrEqual(limit);
+      expect(reply.maxSeq).toBeGreaterThan(floor);
+      if (requests === 0) {
+        expect(reply.events.map((entry) => entry.seq)).toEqual([firstSeq]);
+        expect(reply.partial).toBe(true);
+        expect(reply.maxSeq).toBe(firstSeq);
+      }
+      received.push(...reply.events.map((entry) => entry.seq));
+      floor = reply.maxSeq;
+    }
+    expect(floor).toBeGreaterThanOrEqual(target);
+    if (oversizedTail) {
+      expect(received).toEqual([firstSeq]);
+      expect(h.differences.at(-1)?.events).toEqual([]);
+      expect(h.differences.at(-1)?.partial).toBe(false);
+    } else {
+      // Successive requests deliver every fitting successor through this range.
+      expect(received).toEqual(Array.from({ length: floor - afterSeq }, (_, i) => afterSeq + i + 1));
+    }
+  });
+
   it("#343 — ONE undeliverable row is SKIPPED and the rest are served (it used to wedge the device)", () => {
     // A row whose sealed difference size alone exceeds this peer's max_payload
     // must not prevent the fitting rows from reaching the client.
@@ -1013,18 +1069,8 @@ describe("createHistoryServer.serveDifference — #244 half B / #356", () => {
   });
 
   it("#348 — an oversize 500-row difference is fitted without re-measuring the prefix per row", () => {
-    // `outboundWireSize` is a full `sealEnvelope`, and the unit that matters is
-    // how much gets serialized, not how many calls are made — a call measuring
-    // ONE row is not a call measuring 500.
-    //
-    // MEASURED on exactly this page (500 rows, ~180 B of text each, limit 20 000),
-    // against this file's own stub:
-    //   this fit                512 calls /   2 392 row-measurements / 0.74 MB
-    //   develop (modelled)      424 calls / 122 324 row-measurements / 31.75 MB
-    // More calls, 51× fewer row-measurements, 43× fewer bytes. Develop's row is
-    // MODELLED — its loop is not in the tree to run — and is corroborated by the
-    // reviewer who measured it independently. The assertion is on
-    // row-measurements because that is the unit that tracks the work.
+    // Count rows serialized across measurements: a singleton check and a
+    // 500-row prefix check are both one call but do different amounts of work.
     const journal = openJournal();
     for (let i = 1; i <= MAX_DIFFERENCE_EVENTS; i++) {
       journal.append(PEER, {
@@ -1039,11 +1085,8 @@ describe("createHistoryServer.serveDifference — #244 half B / #356", () => {
 
     expect(h.differences).toHaveLength(1);
     expect(h.differences[0].partial).toBe(true);
-    // ⚠️ THE ASSERTION IS ON ROW-MEASUREMENTS, NOT CALLS. Develop's loop pays
-    // Σ prefix lengths ≈ n²/2 here; this fit pays one row per row plus a
-    // logarithmic bisection. A bound of 5 000 is ~24× under develop's 122 324 and
-    // ~2× over the measured 2 392, so it survives a small change of page shape
-    // and still fails loudly if the per-row pass ever grows a loop around it.
+    // Bound the one per-row pass plus one prefix bisection. Re-measuring a
+    // shrinking full prefix for every removed row exceeds this budget.
     expect(h.recording.rowMeasurements).toBeLessThanOrEqual(5_000);
     expect(h.recording.rowMeasurements).toBeGreaterThan(0);
     // The call count is recorded too, so a future edit that trades one for the
@@ -1052,20 +1095,8 @@ describe("createHistoryServer.serveDifference — #244 half B / #356", () => {
   });
 
   it("#348 — an ALL-UNDELIVERABLE 500-row window is bounded too (the peer-drivable one)", () => {
-    // ⚠️ THIS IS THE CASE A BISECTION-PER-SKIP LOSES, AND IT IS REACHABLE BY A
-    // PEER: `get_difference{afterSeq:0}` on a conversation whose rows are all
-    // oversize for this peer's `max_payload`. Re-running the bisection after
-    // every skip costs one pass per row — 4 500 calls, 249 278 row-measurements,
-    // 22.05 MB serialized, all on ONE scheduled callback. One per-row pass answers
-    // the same question in 502 calls / 1 000 row-measurements / 0.13 MB, which is
-    // what the bounds below pin.
-    //
-    // ⚠️ IN WALL TIME THAT IS TENS OF MILLISECONDS, NOT SECONDS. Round 2 wrote
-    // "~9 s of blocked event loop" and that was a RATIO ("~9× develop") rendered
-    // as a duration — the same unit substitution this file's other comment was
-    // opened to fix. Measured: 58 ms against this stub (median of five; review
-    // independently got 74 ms on other hardware) and ~146 ms through the real
-    // `sealEnvelope` (review's measurement). The per-row pass is 0.6 ms.
+    // A peer can request a window where no singleton fits. Skipping each row
+    // must not restart the prefix search and multiply serialized-row work.
     const journal = openJournal();
     for (let i = 1; i <= MAX_DIFFERENCE_EVENTS; i++) {
       journal.append(PEER, { kind: "bubble", answerId: `a${i}`, turnId: "t1", text: "padding" });

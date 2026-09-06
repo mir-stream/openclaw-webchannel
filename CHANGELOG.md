@@ -184,17 +184,11 @@
     does not establish whether their differently sized live frames were delivered.
   - **#348** — `fitDifference` re-measured the surviving prefix once per removed
     row on the account's dispatch turn, and `get_difference` had no per-peer bound
-    at all. It now measures each row once and bisects the survivors. On a 500-row
-    page that overflows: **512 `outboundWireSize` calls over 2 392
-    row-measurements, 0.74 MB serialized**, against develop's **424 calls over
-    122 324 row-measurements, 31.75 MB** — more calls, because a call now measures
-    one row rather than up to 500, and 43× less actually serialized. The case that
-    decided the shape is the one an authenticated peer can aim at the account's
-    event loop: a window in which no row fits at all costs **502 calls / 1 000
-    row-measurements / 0.13 MB** here, against **4 500 / 249 278 / 22.05 MB** for
-    a bisection-per-skip. (Develop's and the bisection-per-skip figures are
-    modelled against the same measurement stub — neither loop is in the tree to
-    run — and were measured independently by review.)
+    at all. It now uses one per-row pass and one bisection over surviving prefixes.
+    Singleton checks and prefix fitting use the same actual `partial`/`maxSeq`
+    envelope that is published, so conservative metadata cannot falsely skip a
+    fitting row. A skipped tail is covered in a later request if including its
+    coverage metadata would overflow an otherwise fitting partial reply.
   - **#348 (the dispatch turn)** — `serveDifference` is deferred like the other
     two read paths, with a bounded per-peer QUEUE rather than their
     drop-a-concurrent-request latch: a difference names a floor and a nonce, so a
