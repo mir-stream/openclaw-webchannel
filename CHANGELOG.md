@@ -93,8 +93,8 @@
   another device's (without it, a device folds a stranger's reply and skips its
   own range); `partial` is Telegram's `differenceSlice` signal, without which the
   remainder of a sliced range is stranded until the next durable frame; and
-  `maxSeq` is what a complete reply advances the cursor to, which is how a row
-  the server can never send to this peer stops wedging it.
+  `maxSeq` is what a complete reply advances the cursor to, so an individually
+  oversized difference row no longer wedges catch-up.
 
 ### Fixed
 
@@ -118,6 +118,40 @@
   a card stored late, at the moment it was decided, appears in history *after*
   any messages that arrived while it was waiting, rather than at the point the
   browser showed it on reconnect.
+
+- **A user message lost in the accept seam's crash window is now recovered on
+  replay, and a `/stop`-killed one still is not (#344, extends #292).** The
+  plugin recorded its dedupe marker before writing the delivery-journal row, so a
+  crash between the two left a marker with no row; the client's replay then found
+  the marker, was acked as a duplicate, and the message was absent from the
+  journal — which is the only history store — forever, while the sending device
+  kept showing a "sent" bubble. The journal is now the authority: an `accepted`
+  marker with no row for that `random_id` is not evidence of an accept, so the
+  replay is admitted, journaled and answered instead of dropped. The durable
+  write order is unchanged (marker first, row second); only the rule for reading
+  a disagreement changed.
+
+  Making that safe needed a second change, because "marker, no row" was also how
+  a `/stop` suppression was stored on purpose. Cancelled text now records a
+  distinct `cancelled` outcome, so a replay of it is still acked and dropped and
+  never re-runs. **Upgrade note:** a cancellation recorded by an earlier build
+  sits under the old `accepted` marker and stays ambiguous until it expires (7
+  days). If that message's ack was also lost, its next replay re-runs the aborted
+  turn once. It needs all three — a pre-upgrade cancellation, a lost ack, and a
+  replay inside the window — and it cannot be repaired after the fact, because
+  the two cases are indistinguishable in the old marker.
+
+  The same rule now applies wherever that marker is read, not just in the accept
+  path. Two other places used to answer for it — the busy-server path that runs
+  when a message's raw frame cannot be held, and a fast path that replies from an
+  in-memory cache before the message is even queued. Both acknowledged the lost
+  message, which stopped the sending device retrying it at all; both now stay out
+  of it — the queue path answers it in the same attempt whenever retention
+  allows, the busy-server path leaves it for a later one — so the message
+  comes back and is answered. Messages
+  from older clients that send no idempotency token are recovered as well, and an
+  operator log line that always blamed backpressure now names the verdict that
+  actually applied.
 
 - **A turn whose answer count does not line up no longer loses an answer (#340,
   extends #260).** When a turn ends with two or more finals whose count does not
@@ -148,6 +182,10 @@
     only on the device that originated the send (the `random_id` resolves a local
     linkage), and a seq above the contiguous next one opens a gap instead of
     closing it.
+  - **#349** — Catch-up no longer turns past placement rows into working
+    drafts. Empty slots stay internal to preserve order across slices; live
+    progress or authored content makes them visible. Existing live drafts stay
+    active, while explicit turn completion or `/stop` retires buffered progress.
   - **#343 (client half)** — a frame held during a catch-up is now dropped only
     when the reply actually carried an event for its seq, never merely because the
     cursor covers it: a row the server could not send is covered but absent, and
@@ -194,28 +232,23 @@
   The server half of the same slice; the client-cursor half is above.
   - **#343** — one journal row too large for a peer's `max_payload` wedged
     `fitDifference`, so that device received nothing for the rest of the session.
-    Such a row is now skipped with an operator-actionable log line, exactly as the
-    history page budget already skipped it, and the reply spans across it; the
-    reply's `maxSeq` is what carries the client past the hole.
+    Rows that individually exceed the difference envelope's budget are now
+    omitted with a diagnostic, and `maxSeq` carries the client past them. This
+    does not establish whether their differently sized live frames were delivered.
   - **#348** — `fitDifference` re-measured the surviving prefix once per removed
     row on the account's dispatch turn, and `get_difference` had no per-peer bound
-    at all. It now measures each row once and bisects the survivors. On a 500-row
-    page that overflows: **512 `outboundWireSize` calls over 2 392
-    row-measurements, 0.74 MB serialized**, against develop's **424 calls over
-    122 324 row-measurements, 31.75 MB** — more calls, because a call now measures
-    one row rather than up to 500, and 43× less actually serialized. The case that
-    decided the shape is the one an authenticated peer can aim at the account's
-    event loop: a window in which no row fits at all costs **502 calls / 1 000
-    row-measurements / 0.13 MB** here, against **4 500 / 249 278 / 22.05 MB** for
-    a bisection-per-skip. (Develop's and the bisection-per-skip figures are
-    modelled against the same measurement stub — neither loop is in the tree to
-    run — and were measured independently by review.)
+    at all. It now uses one per-row pass and one bisection over surviving prefixes.
+    Singleton checks and prefix fitting use the same actual `partial`/`maxSeq`
+    envelope that is published, so conservative metadata cannot falsely skip a
+    fitting row. A skipped tail is covered in a later request if including its
+    coverage metadata would overflow an otherwise fitting partial reply.
   - **#348 (the dispatch turn)** — `serveDifference` is deferred like the other
     two read paths, with a bounded per-peer QUEUE rather than their
     drop-a-concurrent-request latch: a difference names a floor and a nonce, so a
     dropped request leaves a device waiting on its 5 s timeout, and N tabs of one
-    account gap on the same frame at the same instant. Every request is answered,
-    one read+publish in flight per peer, at most 8 outstanding. Both halves of the
+    account gap on the same frame at the same instant. One read+publish runs per
+    peer with at most 8 queued requests; overflow replaces the newest pending
+    request, whose device can retry on timeout. Both halves of the
     deferred body are now guarded — out there a throw would be an
     `uncaughtException`, not a dropped frame.
 

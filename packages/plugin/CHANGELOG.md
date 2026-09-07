@@ -68,8 +68,8 @@
   another device's (without it, a device folds a stranger's reply and skips its
   own range); `partial` is Telegram's `differenceSlice` signal, without which the
   remainder of a sliced range is stranded until the next durable frame; and
-  `maxSeq` is what a complete reply advances the cursor to, which is how a row
-  the server can never send to this peer stops wedging it.
+  `maxSeq` is what a complete reply advances the cursor to, so an individually
+  oversized difference row no longer wedges catch-up.
 
 ### Fixed
 
@@ -134,6 +134,88 @@
   store does not have — the server-side invention N8 forbids — so it is disclosed
   rather than fixed.
 
+- **`ingress-dedupe.ts`'s accept seam treats the delivery journal as the dedupe
+  authority (#344, extends #292).** `outcomeStore.record(…, "accepted")` persists
+  through the SDK dedupe store at call time while `appendInboundUser` runs in the
+  batch footer, so the durable order is marker-first, row-second and a crash
+  between them stranded the message: the replay hit the `existing.status ===
+  "found"` branch, was re-acked as a duplicate, and never reached the journal.
+  The found/accepted branch now calls `lookupUserMessageIdByRandomId` and, when
+  the row is missing, falls through to the fresh-accept path — one journal call
+  site still, and `appendInboundUser`'s `journal_user_idempotency_once` guard
+  keeps it idempotent. The order is deliberately NOT reversed: a row without a
+  marker replays as a fresh admission and answers the same text twice.
+
+- **The overflow resolver applies the same journal authority (#344).**
+  `inbound-overflow-resolver.ts` is the second door onto a durable `accepted`
+  marker — the path an id takes when its raw frame could not be retained — and it
+  read the marker as a terminal accept. For a crash-window orphan (or any marker
+  orphaned by §15.6's journal cutover) it ACKED, so the client drained its replay
+  ledger and the message was lost permanently, which is worse than the accept
+  seam's version of the same bug. It now takes an optional `lookupUserRow` dep
+  and, when the journal has no row, publishes nothing at all: a resolver can only
+  report a verdict, so withholding one leaves the ledger entry for the ordinary
+  flush path to admit, journal and answer. It also carries the `committed` echo
+  when a row does exist, which that arm never did.
+
+- **…and so does the debouncer's known-outcome fast path (#344).** Withholding a
+  verdict only preserves a replay if every reader withholds it.
+  `outcomeStore.lookup()` warms the process hot cache on its found path (so does
+  `write.commit()`), and `bounded-inbound-debouncer.ts`'s `peekOutcome`
+  short-circuit reads that cache *before* charging retention — so the replay the
+  resolver had just declined to answer was acked away there instead, and never
+  reached `onFlush`, the journal, or the found branch. The short-circuit now
+  fires only for a refusal: `onKnownOutcome` and the `known-outcome` push result
+  are typed `IngressRefusal` (`Exclude<IngressOutcome, "accepted">`), so a
+  fast-path decision on `accepted` no longer typechecks. The cost is a
+  retention reservation plus one flush per genuine accepted replay; under full
+  retention such replays overflow and drain about one per round instead of all
+  at once (nothing is lost — the client re-drains later), on a path only a
+  client without `random_id` reaches. This is now one rule with one statement —
+  THE READER RULE, on `OutcomeLookup` in `ingress-outcome.ts`: the reader that
+  can ADMIT a message is the only one that may answer an `accepted` outcome
+  with no row; a reader that cannot admit may answer it only when the row exists.
+
+- **The accept seam's journal question covers older clients too (#344).** The
+  lookup is keyed by `randomId ?? wireId` — the dedupe key's body, which is
+  exactly what `appendInboundUser` stores as `idempotency_key` — instead of
+  `random_id` alone. A client that sends no idempotency token now has its
+  crash-window message recovered like any other; it is simply acked bare, since a
+  `committed` entry needs a `random_id` to key it by.
+
+- **The dual-marker warning names the outcome that actually won (#344).**
+  `createRateLimitedOutcomeInvariantWarning` accepted a message, discarded it,
+  and emitted a hardcoded "overloaded wins". Harmless while `overloaded` was the
+  only possible winner; with `cancelled` it told the operator the peer had been
+  sent `inbound_rejected` when it had been silently acked. It now takes the
+  winning outcome — a closed union, so the throttle keyspace stays three static
+  entries — and builds the line itself, with one window per winner.
+
+- **A faulted `cancelled` write fails closed (#344).** `record()`'s disk-error
+  cleanup was gated on `overloaded`; it now covers both refusals. A memory-only
+  suppression dies with the process, and its next replay would run the turn
+  `/stop` killed. `accepted` deliberately keeps its memory-only receipt: losing
+  that marker only re-admits, which the journal's idempotency collapses.
+
+- **`/stop` suppression is its own terminal outcome (#344).** `IngressOutcome`
+  gains `cancelled`, with its own `PersistentDedupe` namespace
+  (`webchannel-inbound-cancelled`) and its own rung — above `overloaded`, above
+  `accepted` — in the lookup precedence. The three suppression writers
+  (`nats-account-runtime.ts`'s `onCancel`, `ingress-dedupe.ts`'s
+  cancelled-inbound fallback, `inbound-overflow-resolver.ts`'s `recoverCancelled`)
+  record it instead of borrowing `accepted`. They write no journal row on
+  purpose, which is byte-identical to the crash window above, so without the split
+  a cancelled message whose ack was lost would have been re-admitted and its
+  aborted turn re-run. A `cancelled` replay is acked and dropped — never
+  `inbound_rejected` and never re-admitted. It still carries the `committed` echo
+  when a row happens to exist (a message journaled before the `/stop` landed).
+  `record()`'s `replaceOpposite` option is renamed `replaceOthers`. Cancellation
+  persists first and retains weaker markers until a later lookup cleans them,
+  so failure or rollback of the replacement preserves the previous verdict. **Upgrade note:** cancellations recorded by an earlier build remain
+  in the `accepted` namespace for their 7-day TTL and are indistinguishable from a
+  crash-window marker; one whose ack was also lost re-runs its turn once on the
+  next replay.
+
 - **A K>=2 count shortfall no longer routes buffered finals onto lanes (#340,
   extends #260).** `flushBufferedOrdinaryFinals` used to fall back to
   `materializedAnswerLanes()` when the finals and the streamed lanes disagreed in
@@ -153,28 +235,23 @@
   possible, under Breaking above. Closes:
   - **#343** — one journal row too large for a peer's `max_payload` wedged
     `fitDifference`, so that device received nothing for the rest of the session.
-    Such a row is now skipped with an operator-actionable log line, exactly as the
-    history page budget already skipped it, and the reply spans across it; the
-    reply's `maxSeq` is what carries the client past the hole.
+    Rows that individually exceed the difference envelope's budget are now
+    omitted with a diagnostic, and `maxSeq` carries the client past them. This
+    does not establish whether their differently sized live frames were delivered.
   - **#348** — `fitDifference` re-measured the surviving prefix once per removed
     row on the account's dispatch turn, and `get_difference` had no per-peer bound
-    at all. It now measures each row once and bisects the survivors. On a 500-row
-    page that overflows: **512 `outboundWireSize` calls over 2 392
-    row-measurements, 0.74 MB serialized**, against develop's **424 calls over
-    122 324 row-measurements, 31.75 MB** — more calls, because a call now measures
-    one row rather than up to 500, and 43× less actually serialized. The case that
-    decided the shape is the one an authenticated peer can aim at the account's
-    event loop: a window in which no row fits at all costs **502 calls / 1 000
-    row-measurements / 0.13 MB** here, against **4 500 / 249 278 / 22.05 MB** for
-    a bisection-per-skip. (Develop's and the bisection-per-skip figures are
-    modelled against the same measurement stub — neither loop is in the tree to
-    run — and were measured independently by review.)
+    at all. It now uses one per-row pass and one bisection over surviving prefixes.
+    Singleton checks and prefix fitting use the same actual `partial`/`maxSeq`
+    envelope that is published, so conservative metadata cannot falsely skip a
+    fitting row. A skipped tail is covered in a later request if including its
+    coverage metadata would overflow an otherwise fitting partial reply.
   - **#348 (the dispatch turn)** — `serveDifference` is deferred like the other
     two read paths, with a bounded per-peer QUEUE rather than their
     drop-a-concurrent-request latch: a difference names a floor and a nonce, so a
     dropped request leaves a device waiting on its 5 s timeout, and N tabs of one
-    account gap on the same frame at the same instant. Every request is answered,
-    one read+publish in flight per peer, at most 8 outstanding. Both halves of the
+    account gap on the same frame at the same instant. One read+publish runs per
+    peer with at most 8 queued requests; overflow replaces the newest pending
+    request, whose device can retry on timeout. Both halves of the
     deferred body are now guarded — out there a throw would be an
     `uncaughtException`, not a dropped frame.
 

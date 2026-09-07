@@ -45,8 +45,8 @@
   another device's (without it, a device folds a stranger's reply and skips its
   own range); `partial` is Telegram's `differenceSlice` signal, without which the
   remainder of a sliced range is stranded until the next durable frame; and
-  `maxSeq` is what a complete reply advances the cursor to, which is how a row
-  the server can never send to this peer stops wedging it.
+  `maxSeq` is what a complete reply advances the cursor to, so an individually
+  oversized difference row no longer wedges catch-up.
 
 ### Fixed
 
@@ -70,6 +70,10 @@
     only on the device that originated the send (the `random_id` resolves a local
     linkage), and a seq above the contiguous next one opens a gap instead of
     closing it.
+  - **#349** — Catch-up no longer turns past placement rows into working
+    drafts. Empty slots stay internal to preserve order across slices; live
+    progress or authored content makes them visible. Existing live drafts stay
+    active, while explicit turn completion or `/stop` retires buffered progress.
   - **#343 (client half)** — a frame held during a catch-up is now dropped only
     when the reply actually carried an event for its seq, never merely because the
     cursor covers it: a row the server could not send is covered but absent, and

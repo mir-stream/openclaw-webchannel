@@ -208,11 +208,11 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
     "history-serve.ts  ::  suppressed  @  webchannel: difference read failed for (afterSeq=): (suppressed=)",
     "history-serve.ts  ::  request.afterSeq  @  webchannel: difference publish failed for (afterSeq=): (suppressed=)",
     "history-serve.ts  ::  suppressed  @  webchannel: difference publish failed for (afterSeq=): (suppressed=)",
-    "history-serve.ts  ::  fitted.entries.length  @  webchannel: difference publish failed for : the channel refused a -event frame; see the channel log (suppressed=)",
+    "history-serve.ts  ::  reply.events.length  @  webchannel: difference publish failed for : the channel refused a -event frame; see the channel log (suppressed=)",
     "history-serve.ts  ::  suppressed  @  webchannel: difference publish failed for : the channel refused a -event frame; see the channel log (suppressed=)",
-    "history-serve.ts  ::  fitted.skipped.length  @  webchannel: difference skipped undeliverable row(s) for ; each one alone exceeds this peer's effective max_payload of bytes and can never be sent, live or replayed (#311/#343): (suppressed=)",
-    "history-serve.ts  ::  limit  @  webchannel: difference skipped undeliverable row(s) for ; each one alone exceeds this peer's effective max_payload of bytes and can never be sent, live or replayed (#311/#343): (suppressed=)",
-    "history-serve.ts  ::  suppressed  @  webchannel: difference skipped undeliverable row(s) for ; each one alone exceeds this peer's effective max_payload of bytes and can never be sent, live or replayed (#311/#343): (suppressed=)",
+    "history-serve.ts  ::  fitted.skipped.length  @  webchannel: difference skipped oversized row(s) for ; each one alone in a difference exceeds this peer's effective max_payload of bytes (#311/#343): (suppressed=)",
+    "history-serve.ts  ::  limit  @  webchannel: difference skipped oversized row(s) for ; each one alone in a difference exceeds this peer's effective max_payload of bytes (#311/#343): (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: difference skipped oversized row(s) for ; each one alone in a difference exceeds this peer's effective max_payload of bytes (#311/#343): (suppressed=)",
     "history-serve.ts  ::  fitted.trimmed  @  webchannel: difference for was shortened to fit the peer's effective max_payload of bytes: newer event(s) left for the next request (partial=true) (suppressed=)",
     "history-serve.ts  ::  limit  @  webchannel: difference for was shortened to fit the peer's effective max_payload of bytes: newer event(s) left for the next request (partial=true) (suppressed=)",
     "history-serve.ts  ::  suppressed  @  webchannel: difference for was shortened to fit the peer's effective max_payload of bytes: newer event(s) left for the next request (partial=true) (suppressed=)",
@@ -269,7 +269,16 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // line and `journalable.length`/`journalFailureDiagnostic(error)` on the
   // failure line. Only `peerId` is peer-controlled and only `peerId` is wrapped;
   // the other four are in KNOWN_RAW above with the property each one rests on.
-  "ingress-dedupe.ts": { statements: 15, interpolations: 13 },
+  //
+  // #344 adds ONE more — the `orphaned-accept-marker` recovery line (15→16) and
+  // its TWO interpolations (13→15), `peerId` and `dedupe_id`. BOTH are
+  // peer-controlled and BOTH are `logSafe`-wrapped, which is why this file's
+  // KNOWN_RAW list above is unchanged: the new line adds coverage without adding
+  // debt. (`dedupe_id` — `random_id ?? wireId` — is bounded to 128 chars by
+  // `usableId` before it ever reaches the log, but the wrapping is what makes it
+  // safe, not the bound. It was spelled `random_id=` until round 3 widened the
+  // journal lookup to cover clients that send no `random_id`.)
+  "ingress-dedupe.ts": { statements: 16, interpolations: 15 },
   "approvals.ts": { statements: 9, interpolations: 24 },
   // #240 half 2 rewired both history read sites onto the delivery journal, then
   // review round 1 EXTRACTED both into `history-serve.ts`. 23→19 statements,

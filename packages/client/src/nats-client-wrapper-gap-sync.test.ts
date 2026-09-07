@@ -876,6 +876,55 @@ describe("#356 — partial replies (Telegram's differenceSlice)", () => {
     expect(cursorLast(w)).toBe(20);
   });
 
+  it.each([
+    { floor: 5, partial: false },
+    { floor: 6, partial: false },
+    { floor: 5, partial: true },
+    { floor: 6, partial: true },
+  ])("repeated progress below a seal stays removed (floor=$floor, partial=$partial)", ({ floor, partial }) => {
+    const { w } = spied();
+    seed(w, 4);
+    w.handleMessage({ type: "progress", id: "P", text: "Working…", turnId: "t1", seq: 5 });
+    const toolStart = {
+      seq: 6,
+      event: { kind: "tool", id: "T", turnId: "t1", name: "bash", phase: "start" },
+    };
+    if (floor === 6) {
+      w.handleMessage({ type: "tool_activity", id: "T", turnId: "t1", name: "bash", phase: "start", seq: 6 });
+    }
+    w.handleMessage({ type: "tool_activity", id: "U", turnId: "t1", name: "bash", phase: "end", status: "ok", seq: 8 });
+    expect(cursorLast(w)).toBe(floor);
+    expect(isCatchingUp(w)).toBe(true);
+    // Progress reuses P's placement seq, equal to or below the request floor.
+    w.handleMessage({ type: "progress", id: "P", text: "Still working…", turnId: "t1", seq: 5 });
+    w.handleMessage({ type: "agent_message", id: "P", text: "X".repeat(500), turnId: "t1", seq: 9 });
+    w.handleMessage({ type: "agent_message", id: "B", text: "short final", turnId: "t1", seq: 10 });
+
+    // Measured controller path: a failed partial send leaves preview P available
+    // for an authorized recovery block; a later final owns B and the seal removes
+    // P. The recovery bubble at seq 9 fitted live but is omitted here because its
+    // larger difference envelope does not fit. No reply event authors P.
+    w.handleMessage(reply(w, [
+      ...(floor === 5 ? [toolStart] : []),
+      { seq: 7, event: { kind: "tool", id: "U", turnId: "t1", name: "bash", phase: "start" } },
+      { seq: 8, event: { kind: "tool", id: "U", turnId: "t1", name: "bash", phase: "end", status: "ok" } },
+      { seq: 10, event: { kind: "bubble", answerId: "B", text: "short final", turnId: "t1" } },
+      { seq: 11, event: { kind: "seal", turnId: "t1", answers: [{ id: "B", text: "short final" }], remove: ["P"] } },
+    ], { partial, maxSeq: 11 }));
+    if (partial) {
+      expect(isCatchingUp(w)).toBe(true);
+      w.handleMessage(reply(w, [
+        { seq: 12, event: { kind: "bubble", answerId: "C", text: "next answer", turnId: "t2" } },
+      ]));
+    }
+
+    // P must fold before the seal, not after it or after a later partial slice.
+    expect(w.state.messages.some((m) => m.id === "P")).toBe(false);
+    expect(w.state.messages.find((m) => m.id === "B")?.text).toBe("short final");
+    expect(cursorLast(w)).toBe(partial ? 12 : 11);
+    expect(isCatchingUp(w)).toBe(false);
+  });
+
   it("a held frame the reply DID carry is still dropped — no double-apply", () => {
     // The property the buffer exists for, unchanged: the reply is authoritative
     // for a row it carried, so the held copy of that same row must not re-fold.
@@ -1373,6 +1422,140 @@ describe("#244 half B — HIGH-2: get_difference is not fire-and-forget", () => 
       expect(isCatchingUp(w)).toBe(true);
       expect(cursorLast(w)).toBe(5);
     } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("#356 — retired lifecycle stops catch-up orchestration", () => {
+  it.each([false, true])("stops the difference merge after a subscriber closes (reconnect=%s)", (reconnect) => {
+    vi.useFakeTimers();
+    const { w, getDifference } = spied();
+    const instance = w as unknown as WebChannelNATSClient;
+    const connect = vi.spyOn(w.client as unknown as { connect: () => void }, "connect").mockImplementation(() => {});
+    let retired = false;
+    const unsubscribe = instance.subscribe((state) => {
+      if (retired || !state.messages.some((m) => m.id === "T")) return;
+      retired = true;
+      instance.close();
+      if (reconnect) {
+        instance.connect();
+        w.handleMessage({ type: "agent_message", id: "replacement", text: "new connection", seq: 2 });
+      }
+    });
+    try {
+      seed(w, 1);
+      w.handleMessage({ type: "agent_message", id: "A", text: "X".repeat(500), turnId: "t1", seq: 3 });
+      // A's live frame can fit while its difference envelope is oversized.
+      // The held copy must not survive teardown triggered by the earlier row.
+      w.handleMessage(reply(w, [
+        { seq: 2, event: { kind: "tool", id: "T", name: "bash", phase: "end", turnId: "t1" } },
+      ], { maxSeq: 3 }));
+      expect(retired).toBe(true);
+      expect(connect).toHaveBeenCalledTimes(reconnect ? 1 : 0);
+      expect(instance.getState().messages.map((m) => m.id)).toEqual(reconnect ? ["T", "replacement"] : ["T"]);
+      expect(cursorLast(w)).toBe(reconnect ? 2 : 1);
+      expect(isCatchingUp(w)).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+      vi.advanceTimersByTime(30_000);
+      expect(getDifference).toHaveBeenCalledTimes(1);
+    } finally {
+      unsubscribe();
+      instance.close();
+      connect.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    { carrier: "history", reconnect: false },
+    { carrier: "history", reconnect: true },
+    { carrier: "ack", reconnect: false },
+    { carrier: "ack", reconnect: true },
+  ])("does not observe $carrier after its subscriber closes (reconnect=$reconnect)", ({ carrier, reconnect }) => {
+    vi.useFakeTimers();
+    const { w, getDifference } = spied();
+    const instance = w as unknown as WebChannelNATSClient;
+    const connect = vi.spyOn(w.client as unknown as { connect: () => void }, "connect").mockImplementation(() => {});
+    let retired = false;
+    const incomingId = carrier === "history" ? "a20" : "webchannel-user-20";
+    const unsubscribe = instance.subscribe((state) => {
+      if (retired || !state.messages.some((m) => m.id === incomingId)) return;
+      retired = true;
+      instance.close();
+      if (reconnect) {
+        instance.connect();
+        w.handleMessage({ type: "agent_message", id: "replacement", text: "new connection", seq: 6 });
+      }
+    });
+    try {
+      seed(w, 5);
+      if (carrier === "history") {
+        w.handleMessage({
+          type: "history", messages: [{ id: incomingId, role: "agent", text: "snapshot" }], highWaterSeq: 20,
+        });
+      } else {
+        seedOptimisticUser(w, {
+          localId: "u-0", receiptKey: "r-0", randomId: "rand-1", text: "hello", wireId: "t1",
+        });
+        w.handleMessage({
+          type: "ack", ids: ["u-0"],
+          committed: [{ random_id: "rand-1", messageId: incomingId, seq: 20 }],
+        });
+      }
+      expect(retired).toBe(true);
+      expect(connect).toHaveBeenCalledTimes(reconnect ? 1 : 0);
+      expect(cursorLast(w)).toBe(reconnect ? 6 : 5);
+      expect(isCatchingUp(w)).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+      vi.advanceTimersByTime(30_000);
+      expect(getDifference).not.toHaveBeenCalled();
+    } finally {
+      unsubscribe();
+      instance.close();
+      connect.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([false, true])("stops give-up redispatch when its first subscriber closes (reconnect=%s)", (reconnect) => {
+    vi.useFakeTimers();
+    const { w, getDifference } = spied();
+    const instance = w as unknown as WebChannelNATSClient;
+    const connect = vi.spyOn(w.client as unknown as { connect: () => void }, "connect").mockImplementation(() => {});
+    let retired = false;
+    const unsubscribe = instance.subscribe((state) => {
+      if (retired || !state.messages.some((m) => m.id === "a6")) return;
+      retired = true;
+      instance.close();
+      if (reconnect) {
+        instance.connect();
+        w.handleMessage({ type: "agent_message", id: "replacement", text: "new connection", seq: 6 });
+      }
+    });
+    try {
+      seed(w, 5);
+      // A high-water observation opens a real catch-up with no held frame.
+      w.handleMessage({ type: "history", messages: [], highWaterSeq: 20 });
+      expect(getDifference).toHaveBeenCalledTimes(1);
+      w.handleMessage({ type: "agent_message", id: "a6", text: "answer 6", seq: 6 });
+      w.handleMessage({ type: "agent_message", id: "a10", text: "retired frame", seq: 10 });
+      expect(retired).toBe(false);
+      // After the initial request and three retries, only a6 is contiguous.
+      vi.advanceTimersByTime(20_000);
+      expect(retired).toBe(true);
+      expect(connect).toHaveBeenCalledTimes(reconnect ? 1 : 0);
+      expect(w.state.messages.some((m) => m.id === "a6")).toBe(true);
+      expect(w.state.messages.some((m) => m.id === "a10")).toBe(false);
+      expect(w.state.messages.some((m) => m.id === "replacement")).toBe(reconnect);
+      expect(isCatchingUp(w)).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+      vi.advanceTimersByTime(30_000);
+      expect(getDifference).toHaveBeenCalledTimes(4);
+    } finally {
+      unsubscribe();
+      instance.close();
+      connect.mockRestore();
       vi.useRealTimers();
     }
   });

@@ -2188,3 +2188,279 @@ describe("WebChannelNATSClient — #243 half 2b: client adopts the server messag
     h.wrapper.close();
   });
 });
+
+describe("#349 — replay placements preserve order without inventing live activity", () => {
+  async function answerDifference(
+    h: Setup,
+    events: Array<{ seq: number; event: unknown }>,
+    opts: { partial?: boolean; maxSeq: number },
+  ): Promise<void> {
+    const request = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+      .filter((message) => message.type === "get_difference").at(-1);
+    expect(request?.type).toBe("get_difference");
+    if (request?.type !== "get_difference") throw new Error("difference request missing");
+    deliverOut(h.K, {
+      type: "difference", afterSeq: request.afterSeq, nonce: request.nonce,
+      events, partial: opts.partial ?? false, maxSeq: opts.maxSeq,
+    });
+    await settle();
+  }
+
+  it.each([false, true])("publishes after replaying an abandoned placement (reconnect=%s)", async (reconnect) => {
+    const h = await connectWrapper();
+    const snapshots: string[][] = [];
+    const snapshotMatchesGetter: boolean[] = [];
+    const unsubscribe = h.wrapper.subscribe((state) => {
+      snapshots.push(state.messages.map((m) => m.id));
+      snapshotMatchesGetter.push(state === h.wrapper.getState());
+    });
+    try {
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 1 });
+      await settle();
+      if (reconnect) {
+        h.wrapper.close();
+        h.wrapper.connect();
+        await settle();
+        deliverOut(h.K, {
+          type: "history", messages: [{ id: "B", role: "agent", text: "done" }], highWaterSeq: 4,
+        });
+      } else {
+        deliverOut(h.K, { type: "agent_message", id: "B", text: "done", turnId: "later", seq: 3 });
+      }
+      await settle();
+      await answerDifference(h, [
+        { seq: 2, event: { kind: "placement", answerId: "P", turnId: "abandoned" } },
+        { seq: 3, event: { kind: "bubble", answerId: "B", text: "done", turnId: "later" } },
+        { seq: 4, event: { kind: "seal", turnId: "later", answers: [{ id: "B", text: "done" }], remove: [] } },
+      ], { maxSeq: 4 });
+      deliverOut(h.K, { type: "turn_settled", turnId: "later", outcome: "ok" });
+      await settle();
+      expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(["B"]);
+      expect(snapshots.every((ids) => !ids.includes("P"))).toBe(true);
+      expect(snapshotMatchesGetter.every(Boolean)).toBe(true);
+      expect(h.wrapper.getState()).toBe(h.wrapper.getState());
+      const receipt = h.wrapper.send("after completed replay")!;
+      await settle();
+      expect(receipt.snapshot().state).toBe("accepted");
+      expect(h.received).toEqual([userBubble(h.wrapper, "after completed replay")?.wireId]);
+    } finally {
+      unsubscribe();
+      h.wrapper.close();
+    }
+  });
+
+  it("preserves an existing live draft and holds sends until actual completion", async () => {
+    const h = await connectWrapper();
+    try {
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 1 });
+      // A live draft may lack a seq when its placement journal write failed.
+      deliverOut(h.K, { type: "progress", id: "A", text: "live partial", turnId: "live" });
+      deliverOut(h.K, { type: "agent_message", id: "B", text: "other", turnId: "live", seq: 4 });
+      await settle();
+      await answerDifference(h, [
+        { seq: 2, event: { kind: "placement", answerId: "A", turnId: "live" } },
+      ], { partial: true, maxSeq: 2 });
+      expect(h.wrapper.getState().messages.find((m) => m.id === "A"))
+        .toMatchObject({ text: "live partial", working: true, draftOnly: true });
+      const receipt = h.wrapper.send("held behind real draft")!;
+      await settle();
+      expect(receipt.snapshot().state).toBe("queued");
+      expect(h.received).toEqual([]);
+      await answerDifference(h, [
+        { seq: 3, event: { kind: "bubble", answerId: "A", text: "authored answer", turnId: "live" } },
+        { seq: 4, event: { kind: "bubble", answerId: "B", text: "other", turnId: "live" } },
+        { seq: 5, event: { kind: "seal", turnId: "live", answers: [{ id: "A", text: "authored answer" }, { id: "B", text: "other" }], remove: [] } },
+      ], { maxSeq: 5 });
+      deliverOut(h.K, { type: "turn_settled", turnId: "live", outcome: "ok" });
+      await settle();
+      const answer = h.wrapper.getState().messages.find((m) => m.id === "A");
+      expect(answer).toMatchObject({ text: "authored answer", working: false });
+      expect(answer?.draftOnly).toBeUndefined();
+      expect(receipt.snapshot().state).toBe("accepted");
+      expect(h.received).toEqual([userBubble(h.wrapper, "held behind real draft")?.wireId]);
+    } finally {
+      h.wrapper.close();
+    }
+  });
+
+  it.each(["bubble", "seal", "history"])("materializes the original slot from %s after partial replies", async (source) => {
+    const h = await connectWrapper();
+    try {
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 1 });
+      deliverOut(h.K, { type: "agent_message", id: "B", text: "second", turnId: "T", seq: 3 });
+      await settle();
+      await answerDifference(h, [
+        { seq: 2, event: { kind: "placement", answerId: "P", turnId: "T" } },
+      ], { partial: true, maxSeq: 2 });
+      expect(h.wrapper.getState().messages).toEqual([]);
+      await answerDifference(h, [
+        { seq: 3, event: { kind: "bubble", answerId: "B", text: "second", turnId: "T" } },
+      ], { partial: true, maxSeq: 3 });
+      expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(["B"]);
+      if (source === "history") {
+        await answerDifference(h, [], { maxSeq: 3 });
+        deliverOut(h.K, { type: "history", messages: [{ id: "P", role: "agent", text: "first", ts: 123 }] });
+        await settle();
+      } else {
+        const event = source === "bubble"
+          ? { kind: "bubble", answerId: "P", text: "first", turnId: "T" }
+          : { kind: "seal", turnId: "T", answers: [{ id: "P", text: "first" }], remove: [] };
+        await answerDifference(h, [{ seq: 4, event }], { maxSeq: 4 });
+      }
+      expect(h.wrapper.getState().messages.map((m) => [m.id, m.text])).toEqual([["P", "first"], ["B", "second"]]);
+      expect(h.wrapper.getState().messages.some((m) => m.working || m.draftOnly)).toBe(false);
+    } finally {
+      h.wrapper.close();
+    }
+  });
+
+  it("turns a private replay slot into a live draft that still settles normally", async () => {
+    const h = await connectWrapper();
+    try {
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 1 });
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 3 });
+      await settle();
+      await answerDifference(h, [
+        { seq: 2, event: { kind: "placement", answerId: "P", turnId: "live" } },
+        { seq: 3, event: { kind: "bubble", answerId: "B", text: "other", turnId: "earlier" } },
+      ], { maxSeq: 3 });
+      deliverOut(h.K, { type: "progress", id: "P", text: "live now", turnId: "live", seq: 2 });
+      await settle();
+      expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(["P", "B"]);
+      expect(h.wrapper.getState().messages[0]).toMatchObject({ text: "live now", working: true, draftOnly: true });
+      const receipt = h.wrapper.send("held behind materialized draft")!;
+      expect(receipt.snapshot().state).toBe("queued");
+      deliverOut(h.K, { type: "turn_settled", turnId: "live", outcome: "ok" });
+      await settle();
+      expect(h.wrapper.getState().messages.some((m) => m.id === "P")).toBe(false);
+      expect(receipt.snapshot().state).toBe("accepted");
+      expect(h.received).toEqual([userBubble(h.wrapper, "held behind materialized draft")?.wireId]);
+    } finally {
+      h.wrapper.close();
+    }
+  });
+
+  it.each(["turn_settled", "/stop"])("retires buffered progress on %s before catch-up replays it", async (end) => {
+    const h = await connectWrapper();
+    try {
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 1 });
+      deliverOut(h.K, { type: "tool_activity", id: "T", name: "bash", phase: "end", turnId: "done", seq: 3 });
+      deliverOut(h.K, { type: "progress", id: "P", text: "past draft", turnId: "done", seq: 2 });
+      deliverOut(h.K, { type: "progress", id: "Q", text: "another live turn", turnId: "other", seq: 4 });
+      await settle();
+      if (end === "/stop") h.wrapper.send("/stop");
+      else deliverOut(h.K, { type: "turn_settled", turnId: "done", outcome: "ok" });
+      await settle();
+      await answerDifference(h, [
+        { seq: 2, event: { kind: "placement", answerId: "P", turnId: "done" } },
+        { seq: 3, event: { kind: "tool", id: "T", name: "bash", phase: "end", turnId: "done" } },
+        { seq: 4, event: { kind: "placement", answerId: "Q", turnId: "other" } },
+      ], { maxSeq: 4 });
+      expect(h.wrapper.getState().messages.some((m) => m.id === "P")).toBe(false);
+      expect(h.wrapper.getState().messages.find((m) => m.id === "T")?.kind).toBe("tool");
+      const receipt = h.wrapper.send("after buffered turn end")!;
+      if (end === "turn_settled") {
+        expect(h.wrapper.getState().messages.find((m) => m.id === "Q"))
+          .toMatchObject({ text: "another live turn", working: true });
+        expect(receipt.snapshot().state).toBe("queued");
+        expect(h.received).toEqual([]);
+        deliverOut(h.K, { type: "turn_settled", turnId: "other", outcome: "ok" });
+      } else {
+        expect(h.wrapper.getState().messages.some((m) => m.id === "Q")).toBe(false);
+      }
+      await settle();
+      expect(receipt.snapshot().state).toBe("accepted");
+      expect(publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .filter((message) => message.type === "user_message").map((message) => message.text))
+        .toEqual(end === "/stop" ? ["/stop", "after buffered turn end"] : ["after buffered turn end"]);
+    } finally {
+      h.wrapper.close();
+    }
+  });
+
+  it.each(["difference", "give-up"])("honors a subscriber's /stop during %s before replaying later held progress", async (path) => {
+    const h = await connectWrapper();
+    let stopped = false;
+    const unsubscribe = h.wrapper.subscribe((state) => {
+      if (!stopped && state.messages.some((m) => m.kind === "tool" && m.id === "T")) {
+        stopped = true;
+        h.wrapper.send("/stop");
+      }
+    });
+    try {
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 1 });
+      if (path === "difference") {
+        deliverOut(h.K, { type: "progress", id: "P", text: "held draft", turnId: "T1", seq: 3 });
+        await settle();
+        await answerDifference(h, [
+          { seq: 2, event: { kind: "tool", id: "T", name: "bash", phase: "end", turnId: "T1" } },
+          { seq: 3, event: { kind: "placement", answerId: "P", turnId: "T1" } },
+        ], { maxSeq: 3 });
+      } else {
+        deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 4 });
+        deliverOut(h.K, { type: "tool_activity", id: "T", name: "bash", phase: "end", turnId: "T1" });
+        deliverOut(h.K, { type: "progress", id: "P", text: "held draft", turnId: "T1" });
+        await settle();
+        // Drive the timeout callback of the real request to its give-up branch.
+        // Notification, /stop, and subsequent publication still use the wrapper
+        // and encrypted fake NATS transport, without a private state injection.
+        const internals = h.wrapper as unknown as {
+          cursor: unknown;
+          clearCatchUpTimer: (cursor: unknown) => void;
+          onCatchUpTimeout: (cursor: unknown) => void;
+        };
+        const cursor = internals.cursor;
+        internals.clearCatchUpTimer(cursor);
+        for (let retry = 0; retry < 4; retry++) {
+          internals.onCatchUpTimeout(cursor);
+          internals.clearCatchUpTimer(cursor);
+        }
+        await settle();
+      }
+      expect(stopped).toBe(true);
+      expect(h.wrapper.getState().messages.some((m) => m.id === "P")).toBe(false);
+      expect(h.wrapper.getState().messages.find((m) => m.id === "T")?.kind).toBe("tool");
+      const receipt = h.wrapper.send("after callback stop")!;
+      await settle();
+      expect(receipt.snapshot().state).toBe("accepted");
+      expect(publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .filter((message) => message.type === "user_message").map((message) => message.text))
+        .toEqual(["/stop", "after callback stop"]);
+      // Retirement is per frame object, so a fresh delivery for the same id
+      // remains eligible and can establish new live activity.
+      deliverOut(h.K, { type: "progress", id: "P", text: "fresh progress", turnId: "T1" });
+      await settle();
+      expect(h.wrapper.getState().messages.find((m) => m.id === "P"))
+        .toMatchObject({ text: "fresh progress", working: true, draftOnly: true });
+    } finally {
+      unsubscribe();
+      h.wrapper.close();
+    }
+  });
+
+  it("keeps other message kinds visible at the same id and exposes an authored empty answer", async () => {
+    const h = await connectWrapper();
+    try {
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 1 });
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 5 });
+      await settle();
+      await answerDifference(h, [
+        { seq: 2, event: { kind: "placement", answerId: "P", turnId: "T" } },
+        { seq: 3, event: { kind: "reasoning", id: "P", text: "thinking", turnId: "T" } },
+        { seq: 4, event: { kind: "tool", id: "P", name: "bash", phase: "end", turnId: "T" } },
+        { seq: 5, event: { kind: "approval", id: "P", approvalKind: "exec", title: "request", prompt: "run", options: [] } },
+      ], { maxSeq: 5 });
+      expect(h.wrapper.getState().messages.map((m) => m.kind)).toEqual(["reasoning", "tool", "approval"]);
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 7 });
+      await settle();
+      await answerDifference(h, [
+        { seq: 6, event: { kind: "bubble", answerId: "P", text: "", turnId: "T" } },
+        { seq: 7, event: { kind: "seal", turnId: "T", answers: [{ id: "P", text: "" }], remove: [] } },
+      ], { maxSeq: 7 });
+      expect(h.wrapper.getState().messages[0]).toMatchObject({ id: "P", role: "agent", text: "", working: false });
+      expect(h.wrapper.getState().messages.map((m) => m.kind)).toEqual([undefined, "reasoning", "tool", "approval"]);
+    } finally {
+      h.wrapper.close();
+    }
+  });
+});
