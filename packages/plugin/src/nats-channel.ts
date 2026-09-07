@@ -18,7 +18,7 @@
 
 import { inspect } from "node:util";
 import type { NatsTransport, NatsMessage } from "./nats-transport.js";
-import type { ApprovalDecision, ApprovalRequestPayload, ApprovalRequestSendResult, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
+import type { ApprovalDecision, ApprovalRequestPayload, ApprovalRequestSendResult, DifferenceReply, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
 import type { KeyPair } from "./e2e-crypto.js";
 import type { ConversationKeyStore } from "./conversation-key-store.js";
 import { wrapConversationKey } from "./late-join-decryptor.js";
@@ -50,11 +50,6 @@ import {
   type JournalPolicy,
   journalFailureDiagnostic,
 } from "./delivery-journal-event.js";
-// #244 half B: `sendDifference` carries RAW journal events, typed by the client
-// reducer's `DurableEvent` (the same type `JournalEvent` aliases). TYPE-ONLY and
-// erased, so it adds no runtime dependency — the same property the `DeliveryJournal`
-// import above states.
-import type { DurableEvent } from "../../client/src/durable-view-reducer.js";
 
 /** Preserve caught-error detail without changing primitive thrown-value rendering. */
 function formatCaughtDiagnostic(value: unknown): unknown {
@@ -346,7 +341,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     request: { before?: string; beforeTurnId?: string; limit?: number },
   ) => void;
   // #244 half B: `get_difference` catch-up handler.
-  private onGetDifference?: (peerId: string, afterSeq: number) => void;
+  private onGetDifference?: (peerId: string, afterSeq: number, nonce: string) => void;
   private onLoadCommands?: (peerId: string) => void;
   private onPeerUnregister?: (peerId: string) => void;
   /** Bounded, content-free configuration-warning state for result max_payload. */
@@ -750,7 +745,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   }
 
   /**
-   * #244 half B: answer a `get_difference` with RAW journal events
+   * #244 half B / #356: answer a `get_difference` with RAW journal events
    * (`seq > afterSeq`), in ascending `seq` order, for the client to fold onto the
    * view it already holds. Rides the same sealed `.out` path as every other frame.
    *
@@ -759,12 +754,16 @@ export class NatsChannel implements WebChannelPeerChannel {
    * it), so `sendToPeer` stamps no `seq` on the FRAME; the per-event `seq` inside
    * `events` is the cursor. This is the #286-free path: the server ships raw rows
    * and does NOT run the reducer/projection (contrast `sendHistory`).
+   *
+   * ⚠️ `.out` IS SHARED BY EVERY DEVICE OF THE PEER (#245 Part B — the subject IS
+   * the fan-out, there is no per-device registry), so this reply reaches devices
+   * that did not ask for it. `afterSeq`/`nonce` ride the frame for exactly that
+   * reason: they are echoed straight from the request, and a device folds only
+   * the reply matching its own outstanding one (#351). This method does not mint
+   * or check them — it carries what `history-serve.ts` echoed.
    */
-  sendDifference(
-    peerId: string,
-    events: Array<{ seq: number; event: DurableEvent }>,
-  ): boolean {
-    const payload: OutboundWsMessage = { type: "difference", events };
+  sendDifference(peerId: string, reply: DifferenceReply): boolean {
+    const payload: OutboundWsMessage = { type: "difference", ...reply };
     return this.sendToPeer(peerId, payload);
   }
 
@@ -1051,11 +1050,15 @@ export class NatsChannel implements WebChannelPeerChannel {
   }
 
   /**
-   * #244 half B: set the `get_difference` catch-up handler. Fires on a
+   * #244 half B / #356: set the `get_difference` catch-up handler. Fires on a
    * `get_difference` request; the handler reads the journal for `seq > afterSeq`
-   * and calls `sendDifference`.
+   * and calls `sendDifference` with `afterSeq`/`nonce` echoed back, so the
+   * requesting device can tell the reply from another device's on the shared
+   * `.out` subject.
    */
-  setGetDifferenceHandler(handler: (peerId: string, afterSeq: number) => void): void {
+  setGetDifferenceHandler(
+    handler: (peerId: string, afterSeq: number, nonce: string) => void,
+  ): void {
     this.onGetDifference = handler;
   }
 
@@ -1822,8 +1825,9 @@ export class NatsChannel implements WebChannelPeerChannel {
         // #244 half B: the serve path passes `afterSeq` straight to
         // `delivery-journal.read`, which requires a non-negative integer. That
         // check now runs at the door (#246 half A), which is why nothing is
-        // repeated here.
-        this.onGetDifference?.(peerId, message.afterSeq);
+        // repeated here — and #356's `nonce` is checked there too (non-empty,
+        // bounded), so this hop carries both through untouched.
+        this.onGetDifference?.(peerId, message.afterSeq, message.nonce);
         break;
 
       case "load_commands":

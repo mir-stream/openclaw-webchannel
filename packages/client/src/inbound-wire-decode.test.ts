@@ -9,7 +9,7 @@
  * a `get_difference` round-trip (or delivered content) rather than nothing.
  *
  * The cursor consequence of a refusal — the invariant that a seq-bearing frame
- * advances `lastAppliedSeq` iff it was folded — is pinned in
+ * advances the seq cursor iff it was folded — is pinned in
  * `nats-client-wrapper-gap-sync.test.ts`, against the wrapper.
  */
 
@@ -51,7 +51,7 @@ const VALID: Record<string, unknown> = {
   ack: { type: "ack", ids: ["u-0"], committed: [{ random_id: "r-1", messageId: "m-1", seq: 8 }] },
   inbound_rejected: { type: "inbound_rejected", ids: ["u-0"], reason: "overloaded" },
   user_committed: { type: "user_committed", id: "webchannel-user-2", text: "hi", turnId: "t1", seq: 2, random_id: "r-1" },
-  difference: { type: "difference", events: [] },
+  difference: { type: "difference", afterSeq: 1, nonce: "n0", events: [], partial: false, maxSeq: 1 },
 };
 
 describe("#246 half A — decodeInboundMessage: the frame envelope", () => {
@@ -215,9 +215,32 @@ describe("#246 half A — decodeInboundMessage: the bulk frames", () => {
   });
 
   it("difference requires an events ARRAY and leaves each event to the fold", () => {
-    refuses({ type: "difference", events: {} });
-    accepts({ type: "difference" });
-    accepts({ type: "difference", events: [{ seq: 1, event: { kind: "nonsense" } }] });
+    const envelope = { afterSeq: 1, nonce: "n0", partial: false, maxSeq: 1 };
+    refuses({ type: "difference", ...envelope, events: {} });
+    accepts({ type: "difference", ...envelope });
+    accepts({ type: "difference", ...envelope, events: [{ seq: 1, event: { kind: "nonsense" } }] });
+  });
+
+  it("#356 — difference requires all four envelope fields, and requires them USABLE", () => {
+    // These four are the reply's identity (`afterSeq`/`nonce`) and its two
+    // catch-up signals (`partial`/`maxSeq`). None can be defaulted: a missing
+    // echo makes every reply match every request (#351), a missing `partial`
+    // strands the remainder of a slice, and `maxSeq` BECOMES the cursor.
+    const envelope = { afterSeq: 1, nonce: "n0", partial: false, maxSeq: 4 };
+    accepts({ type: "difference", ...envelope, events: [] });
+
+    refuses({ type: "difference", nonce: "n0", partial: false, maxSeq: 4 });
+    refuses({ type: "difference", afterSeq: 1, partial: false, maxSeq: 4 });
+    refuses({ type: "difference", afterSeq: 1, nonce: "n0", maxSeq: 4 });
+    refuses({ type: "difference", afterSeq: 1, nonce: "n0", partial: false });
+
+    refuses({ type: "difference", ...envelope, afterSeq: -1 });
+    refuses({ type: "difference", ...envelope, afterSeq: Number.NaN });
+    refuses({ type: "difference", ...envelope, nonce: "" });
+    refuses({ type: "difference", ...envelope, nonce: 7 });
+    refuses({ type: "difference", ...envelope, partial: "true" });
+    refuses({ type: "difference", ...envelope, maxSeq: 1.5 });
+    refuses({ type: "difference", ...envelope, maxSeq: Number.MAX_VALUE });
   });
 
   it("commands and inbound_rejected are checked at the envelope", () => {

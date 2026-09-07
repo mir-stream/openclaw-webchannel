@@ -39,7 +39,7 @@ describe("#246 half A — decodeInboundWsMessage: the frame envelope", () => {
       user_message: { type: "user_message", text: "hello" },
       approval_decision: { type: "approval_decision", id: "exec-1", decision: "deny" },
       load_history: { type: "load_history" },
-      get_difference: { type: "get_difference", afterSeq: 0 },
+      get_difference: { type: "get_difference", afterSeq: 0, nonce: "n0" },
       load_commands: { type: "load_commands" },
     };
     // Every member of the exported set has a case here — a new inbound type
@@ -209,18 +209,31 @@ describe("#246 half A — decodeInboundWsMessage: load_history", () => {
 });
 
 describe("#246 half A — decodeInboundWsMessage: get_difference (moved guard, same rule)", () => {
-  it("accepts a non-negative integer afterSeq", () => {
-    accepts({ type: "get_difference", afterSeq: 0 });
-    accepts({ type: "get_difference", afterSeq: 42 });
+  it("accepts a non-negative integer afterSeq with a usable nonce", () => {
+    accepts({ type: "get_difference", afterSeq: 0, nonce: "n0" });
+    accepts({ type: "get_difference", afterSeq: 42, nonce: "a".repeat(128) });
   });
 
   it("refuses everything `delivery-journal.read` cannot take", () => {
-    refuses({ type: "get_difference" });
-    refuses({ type: "get_difference", afterSeq: -1 });
-    refuses({ type: "get_difference", afterSeq: 1.5 });
-    refuses({ type: "get_difference", afterSeq: "3" });
-    refuses({ type: "get_difference", afterSeq: Number.NaN });
-    refuses({ type: "get_difference", afterSeq: null });
+    refuses({ type: "get_difference", nonce: "n0" });
+    refuses({ type: "get_difference", afterSeq: -1, nonce: "n0" });
+    refuses({ type: "get_difference", afterSeq: 1.5, nonce: "n0" });
+    refuses({ type: "get_difference", afterSeq: "3", nonce: "n0" });
+    refuses({ type: "get_difference", afterSeq: Number.NaN, nonce: "n0" });
+    refuses({ type: "get_difference", afterSeq: null, nonce: "n0" });
+  });
+
+  it("#356 — refuses a request with no usable nonce: it could not be correlated", () => {
+    // The nonce is what a device matches the reply against on the shared `.out`.
+    // A request without one can only be answered ambiguously, so it is refused at
+    // the door rather than answered into the void.
+    refuses({ type: "get_difference", afterSeq: 0 });
+    refuses({ type: "get_difference", afterSeq: 0, nonce: "" });
+    refuses({ type: "get_difference", afterSeq: 0, nonce: 7 });
+    refuses({ type: "get_difference", afterSeq: 0, nonce: null });
+    // Bounded like the other two client-supplied tokens: it is echoed verbatim
+    // into the reply, so its bytes come out of that reply's payload budget.
+    refuses({ type: "get_difference", afterSeq: 0, nonce: "a".repeat(129) });
   });
 });
 

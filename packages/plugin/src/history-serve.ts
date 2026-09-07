@@ -159,6 +159,7 @@
  * model — that is **#286**, and a private incremental fold in the plugin is a
  * second implementation of the reducer, which is N8.
  */
+import type { DifferenceReply } from "./channel-contract.js";
 import type { DeliveryJournal } from "./delivery-journal.js";
 import { fitHistoryFrame, type SkippedHistoryRow } from "./history-frame-budget.js";
 import type { HistoryConfig, HistoryMessage } from "./history.js";
@@ -190,13 +191,55 @@ export type HistoryChannelSurface = Pick<
  * carries. It bounds the READ (`delivery-journal.read`'s `limit`); the real bound
  * on the wire is the BYTE budget applied in `fitDifference` below. A gap is
  * normally a handful of dropped frames, so this rarely binds — and when it does,
- * the client advances to the max seq it received and re-requests for the rest, so
- * a capped response costs a round-trip, never data (doc §16.2-6).
+ * the reply says so (`partial: true`) and the client re-requests from where it got
+ * to, so a capped response costs a round-trip, never data (doc §16.2-6, §16.7).
+ *
+ * ⚠️ #356: the READ ASKS FOR ONE MORE THAN THIS. That extra row is never sent; it
+ * is how "the journal holds more than one reply can carry" becomes an observed
+ * fact rather than an inference from a full page.
  */
 export const MAX_DIFFERENCE_EVENTS = 500;
 
 /** One raw catch-up entry: a journal row's `seq` and its event, folded client-side. */
 export type DifferenceEntry = { seq: number; event: DurableEvent };
+
+/** #356 — the request one `difference` answers, echoed back on the reply. */
+type DifferenceRequest = { afterSeq: number; nonce: string };
+
+/**
+ * #356 — how many `get_difference` requests one peer may have QUEUED, on top of
+ * the one being served. Past it, a new request displaces the newest queued one.
+ * (Before the first run there is nothing being served, so the queue alone is the
+ * whole outstanding set; during a run it is this many plus that one.)
+ *
+ * The queue is per PEER, and a peer is an account's whole DEVICE SET — there is
+ * no per-device registry, so this is the only place a device count can be
+ * expressed at all. A conforming device has at most ONE request outstanding (its
+ * cursor holds one nonce), so this is a device bound, and it is deliberately the
+ * same number `PopChallengeStore` allows for live nonces per peer
+ * (`DEFAULT_MAX_NONCES_PER_PEER = 8`) — the existing answer in this codebase to
+ * "how many of one peer's devices does the plugin keep state for at once".
+ */
+const MAX_QUEUED_DIFFERENCE_REQUESTS = 8;
+
+/**
+ * #343 — a difference row that alone exceeds this peer's wire, with the size
+ * that proved it. The `history` twin is `SkippedHistoryRow`; this one is keyed by
+ * `seq` because a difference addresses rows by seq, not by projected id.
+ */
+type SkippedDifferenceRow = { seq: number; bytes: number };
+
+type FittedDifference = {
+  /** The exact reply measured by the fitter, ready to publish unchanged. */
+  reply: DifferenceReply;
+  /** Rows that cannot fit alone in their difference envelope. */
+  skipped: SkippedDifferenceRow[];
+  /**
+   * How many NEWER events the byte budget left out. Not data loss: the reply
+   * carries `partial: true` and the client re-requests from where it got to.
+   */
+  trimmed: number;
+};
 
 /** Minimal logger shape — matches OpenClaw's optional-method logger. */
 export type HistoryServerLogger = {
@@ -251,35 +294,55 @@ export type HistoryServer = {
     request: { before?: string; beforeTurnId?: string; limit?: number },
   ): void;
   /**
-   * #244 half B — answer a `get_difference(afterSeq)`: read this peer's journal
-   * for `seq > afterSeq`, byte-fit the RAW events, and `sendDifference`.
+   * #244 half B / #356 — answer a `get_difference(afterSeq, nonce)`: read this
+   * peer's journal for `seq > afterSeq`, byte-fit the RAW events, and
+   * `sendDifference` with `afterSeq`/`nonce` echoed plus `partial`/`maxSeq`.
    *
    * ⚠️ RAW EVENTS, NO REDUCER. Unlike `sendSnapshot`/`servePage` this does NOT
    * call `serveHistoryRequest`/`projectJournalHistory` — the #286 quadratic
    * replay — because the client already holds the folded view and folds the
    * difference onto it. This is the whole reason half B is #286-free.
    *
-   * ⚠️ NOT DEFERRED. The read is a single bounded, indexed `read(afterSeq, limit)`
-   * — O(limit) rows, no fold — so unlike the two projection paths it stays on the
-   * dispatch turn (the same choice `servePage`'s docblock defends the OTHER way
-   * for the fold). It is wrapped in a try/catch: a read fault logs and sends
-   * NOTHING — never an empty frame, which would falsely advance the client's
-   * cursor past the range it is missing.
+   * ⚠️ DEFERRED AND QUEUED PER PEER (#348), which is a REVERSAL of what this
+   * docblock used to say. "Not deferred: the read is a single bounded indexed
+   * read, O(limit) rows, no fold" was true of the READ and never covered the
+   * BYTE FIT, which is a sequence of `sealEnvelope` calls on the same turn — and
+   * with nothing bounding this path an authenticated peer could loop
+   * `get_difference{afterSeq:0}` and hold the account's dispatch. It is now
+   * `schedule`d like the other two, with a bounded per-peer QUEUE rather than
+   * their drop-a-concurrent-request latch: a difference names a floor and a
+   * nonce, so dropping one leaves a device waiting on its timeout. What is
+   * bounded is CONCURRENCY (one read+publish in flight) and DEPTH
+   * (`MAX_QUEUED_DIFFERENCE_REQUESTS`), not rate — see the file header, which
+   * says the same of the other two.
    *
-   * ⚠️ SENDING NOTHING ON A FAULT IS SAFE ONLY BECAUSE THE CLIENT SELF-HEALS. The
-   * request went unanswered; there is no server- or client-side path here that
-   * "eventually retries" on its own. The client arms a TIMEOUT on its in-flight
-   * `get_difference` (`nats-client-wrapper.ts`) and re-issues it when no
-   * `difference` arrives — that timer, not any buffered-frame mechanism, is what
-   * recovers a dropped request/reply or a read fault. An EMPTY-SUCCESSFUL read is
-   * a different thing and IS still answered (an empty `difference`), so an
-   * already-current `afterSeq` unwinds cleanly rather than waiting on the timeout.
+   * ⚠️ BOTH HALVES ARE GUARDED, AND THE DEFERRAL IS WHY THAT MATTERS MORE THAN
+   * IT USED TO. A read fault and a publish fault are caught separately, under
+   * their own labels; nothing escapes the scheduled callback, because out there
+   * an escape is an `uncaughtException`, not a dropped frame.
+   *
+   * ⚠️ A READ FAULT SENDS NOTHING, and that is safe only because the client
+   * self-heals: it arms a timeout on its outstanding request, re-issues with a
+   * fresh nonce, and gives up into a re-detect. Sending an empty frame instead
+   * would carry `partial: false` and a `maxSeq`, i.e. "you are synced" — falsely
+   * advancing the client past the range it is missing. An EMPTY-SUCCESSFUL read
+   * is a different thing and IS answered, which is what unwinds a spurious
+   * detection without waiting on that timeout.
    */
-  serveDifference(peerId: string, afterSeq: number): void;
+  serveDifference(peerId: string, afterSeq: number, nonce: string): void;
 };
 
-/** What a diagnostic is about. Closed set; one throttle entry per (kind, reason). */
-type ServeKind = "snapshot" | "page";
+/**
+ * What a diagnostic is about. Closed set; one throttle entry per (kind, reason).
+ *
+ * #356 added `difference`. Before it, `serveDifference`'s two `error` lines went
+ * straight to the logger and bypassed `admit` entirely — the one failure path in
+ * this file exempt from the throttle the header says every failure path must use,
+ * and the most peer-drivable of them (#343). It is a `ServeKind` now for the same
+ * reason the other two are: a corrupt journal or a disposed account makes the read
+ * throw immediately, so an unthrottled line is one per event-loop turn forever.
+ */
+type ServeKind = "snapshot" | "page" | "difference";
 type DiagnosticReason =
   | "dropped"
   | "read-failed"
@@ -289,7 +352,7 @@ type DiagnosticReason =
   | "oversize-skipped"
   | "budget-trimmed";
 
-const SERVE_KINDS: readonly ServeKind[] = ["snapshot", "page"];
+const SERVE_KINDS: readonly ServeKind[] = ["snapshot", "page", "difference"];
 /**
  * ⚠️ EVERY MEMBER OF `DiagnosticReason` MUST APPEAR HERE. This array is what
  * seeds the `diagnostics` map, and `admit` reads that map with a non-null
@@ -325,6 +388,16 @@ function summarizeSkippedRows(skipped: readonly SkippedHistoryRow[]): string {
   return rest > 0 ? `${named} +${rest} more` : named;
 }
 
+/** `seq N (M B), seq N (M B) +K more` — the `difference` twin of the above. */
+function summarizeSkippedDifferenceRows(skipped: readonly SkippedDifferenceRow[]): string {
+  const named = skipped
+    .slice(0, MAX_SKIPPED_IDS_LOGGED)
+    .map((row) => `seq ${row.seq} (${row.bytes} B)`)
+    .join(", ");
+  const rest = skipped.length - MAX_SKIPPED_IDS_LOGGED;
+  return rest > 0 ? `${named} +${rest} more` : named;
+}
+
 /**
  * Same 60 s window the two sibling throttles in this package use
  * (`nats-channel.ts`'s `warnDeliveryJournal`, `ingress-outcome.ts`'s
@@ -341,6 +414,14 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
   // folding would cost a reconnecting tab its TAIL, which no retry recovers.
   const snapshotsInFlight = new Set<string>();
   const pagesInFlight = new Set<string>();
+  /**
+   * #356 — the per-peer `get_difference` queue. Present ⇒ this peer has a read
+   * scheduled or running; the array holds the requests still to answer, oldest
+   * first. A QUEUE rather than one slot because every request must get its own
+   * reply — `serveDifference` argues why, and `MAX_QUEUED_DIFFERENCE_REQUESTS`
+   * is what keeps it from becoming a backlog.
+   */
+  const pendingDifferences = new Map<string, DifferenceRequest[]>();
 
   // ⚠️ THE THROTTLE IS THE HOUSE SHAPE, RE-INSTANTIATED, NOT `warnDeliveryJournal`
   // EXPORTED — and that is a deliberate answer, not an oversight. That method is
@@ -676,95 +757,339 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
   };
 
   /**
-   * #244 half B — trim a difference to the peer's wire, keeping the OLDEST
-   * contiguous prefix (lowest seqs).
-   *
-   * ⚠️ THE OPPOSITE END FROM `fitHistoryFrame`, ON PURPOSE. A history page keeps
-   * the NEWEST rows because the pager reaches the older ones. A difference must
-   * keep the OLDEST because the client advances its cursor to the max seq it
-   * receives and re-requests from there: dropping the tail is re-requestable,
-   * dropping the head would strand a permanent hole below the new cursor. Order is
-   * never permuted.
-   *
-   * Each event was already delivered LIVE as its own frame that fit this wire, so
-   * a single event always fits and the kept prefix is non-empty whenever the input
-   * is — which is what guarantees the client makes FORWARD PROGRESS rather than
-   * stalling on a `difference` the channel would refuse.
+   * Keep the oldest fitting prefix, skipping only individually oversized rows.
+   * Each size check uses the partial/maxSeq coverage that reply would publish:
+   * conservative high-water metadata may falsely classify a fitting row as lost.
+   * One per-row pass plus one bisection bounds measurements without re-running a
+   * prefix search for every skipped row (#343/#348).
    */
-  const fitDifference = (peerId: string, entries: DifferenceEntry[]): DifferenceEntry[] => {
-    if (entries.length === 0) return entries;
+  const fitDifference = (
+    peerId: string,
+    request: DifferenceRequest,
+    produced: { entries: DifferenceEntry[]; capped: boolean; maxSeq: number },
+  ): FittedDifference => {
+    const { entries } = produced;
+    const windowMax = entries.at(-1)?.seq ?? request.afterSeq;
+    // Covering less than the physical window leaves a partial reply even when
+    // every remaining row was oversized. Completing the window also covers the
+    // journal high-water, unless the read found rows beyond its cap.
+    const makeReply = (events: DifferenceEntry[], coveredThrough = windowMax): DifferenceReply => {
+      const partial = produced.capped || coveredThrough < windowMax;
+      return {
+        afterSeq: request.afterSeq,
+        nonce: request.nonce,
+        events,
+        partial,
+        maxSeq: partial ? coveredThrough : Math.max(windowMax, produced.maxSeq),
+      };
+    };
+    const wholeReply = makeReply(entries);
+    const unchanged = (): FittedDifference => ({ reply: wholeReply, skipped: [], trimmed: 0 });
+    if (entries.length === 0) return unchanged();
     const limit = channel.effectiveOutboundLimit();
-    // An unusable limit means "no bound known" — send as-is and let the channel
-    // decide, the same idiom `fitHistoryFrame` uses.
-    if (!Number.isSafeInteger(limit) || limit < 0) return entries;
-    const sizeOf = (rows: DifferenceEntry[]): number | undefined =>
-      channel.outboundWireSize(peerId, { type: "difference", events: rows });
-    const whole = sizeOf(entries);
-    // No session key yet: the send is about to fail-closed for the same reason, so
-    // there is nothing to budget. Hand it on unchanged.
-    if (whole === undefined) return entries;
-    if (whole <= limit) return entries;
-    // Oversize: keep the largest fitting PREFIX. Bounded by row count and only
-    // paid by a response that would otherwise be refused whole.
-    let hi = entries.length;
-    while (hi > 1) {
-      const prefix = entries.slice(0, hi - 1);
-      const size = sizeOf(prefix);
-      hi -= 1;
-      if (size !== undefined && size <= limit) return prefix;
+    if (!Number.isSafeInteger(limit) || limit < 0) return unchanged();
+    const sizeOf = (reply: DifferenceReply): number | undefined => {
+      const bytes = channel.outboundWireSize(peerId, { type: "difference", ...reply });
+      return typeof bytes === "number" && Number.isSafeInteger(bytes) && bytes >= 0
+        ? bytes
+        : undefined;
+    };
+
+    const wholeBytes = sizeOf(wholeReply);
+    if (wholeBytes === undefined || wholeBytes <= limit) return unchanged();
+    // If even an empty coverage reply cannot fit, leave failure to the channel.
+    const emptyReply = makeReply([]);
+    const emptyBytes = sizeOf(emptyReply);
+    if (emptyBytes === undefined || emptyBytes > limit) return unchanged();
+
+    const skipped: SkippedDifferenceRow[] = [];
+    const survivors: DifferenceEntry[] = [];
+    for (const entry of entries) {
+      // A singleton can end at its own seq while physical rows remain. Its
+      // terminal counterpart must include completion/high-water metadata.
+      const bytes = sizeOf(makeReply([entry], entry.seq));
+      if (bytes === undefined) return unchanged();
+      if (bytes > limit) skipped.push({ seq: entry.seq, bytes });
+      else survivors.push(entry);
     }
-    // One event and it still does not fit (the #311 undeliverable case, and it was
-    // deliverable live so this is near-impossible). Hand it on; the channel refuses
-    // it loudly rather than this function impersonating "no events to send".
-    return entries.slice(0, 1);
+    if (survivors.length === 0) return { reply: emptyReply, skipped, trimmed: 0 };
+
+    const survivingWhole = makeReply(survivors);
+    const survivingBytes = sizeOf(survivingWhole);
+    if (survivingBytes === undefined) return unchanged();
+    if (survivingBytes <= limit) return { reply: survivingWhole, skipped, trimmed: 0 };
+
+    // The first singleton was proven to fit. Search through ALL survivors:
+    // their own last seq may fit even when covering a skipped tail does not.
+    let lo = 1;
+    let hi = survivors.length + 1;
+    let reply = makeReply([survivors[0]!], survivors[0]!.seq);
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      const candidate = makeReply(survivors.slice(0, mid), survivors[mid - 1]!.seq);
+      const bytes = sizeOf(candidate);
+      if (bytes === undefined) return unchanged();
+      if (bytes <= limit) {
+        lo = mid;
+        reply = candidate;
+      } else {
+        hi = mid;
+      }
+    }
+    return { reply, skipped, trimmed: survivors.length - lo };
   };
 
-  const publishDifference = (peerId: string, entries: DifferenceEntry[]): void => {
-    const fitted = fitDifference(peerId, entries);
-    if (!channel.sendDifference?.(peerId, fitted)) {
+  /**
+   * Byte-fit one difference, report what the budget did, and publish it.
+   *
+   * `capped` is the OTHER half of `partial`: the read asked for
+   * `MAX_DIFFERENCE_EVENTS + 1` rows precisely so that "there are more rows than
+   * one reply may carry" is a fact rather than an inference.
+   */
+  const publishDifference = (
+    peerId: string,
+    request: DifferenceRequest,
+    produced: { entries: DifferenceEntry[]; capped: boolean; maxSeq: number },
+  ): void => {
+    const limit = channel.effectiveOutboundLimit();
+    const fitted = fitDifference(peerId, request, produced);
+
+    if (fitted.skipped.length > 0) {
+      const suppressed = admit("difference", "oversize-skipped");
+      if (suppressed !== undefined) {
+        // `error`, and the same level and reason the history budget's skip uses:
+        // content in this peer's store is omitted from this difference because
+        // it exceeds the budget, and this line names WHICH rows.
+        const detail = summarizeSkippedDifferenceRows(fitted.skipped);
+        try {
+          logger?.error?.(
+            `webchannel: difference skipped ${fitted.skipped.length} oversized ` +
+              `row(s) for ${logSafe(peerId)}; each one alone in a difference exceeds ` +
+              `this peer's effective max_payload of ${limit} bytes ` +
+              `(#311/#343): ${logSafe(detail)} (suppressed=${suppressed})`,
+          );
+        } catch { /* a faulting logger must not escape this callback */ }
+      }
+    }
+
+    if (fitted.trimmed > 0) {
+      const suppressed = admit("difference", "budget-trimmed");
+      if (suppressed !== undefined) {
+        // `warn`, NOT `error`, and the wording matters as much as the level: the
+        // rows left out are the NEWEST of the requested range and the reply says
+        // so (`partial: true`), so the client re-requests them on the spot. This
+        // is a round-trip, not data loss.
+        try {
+          logger?.warn?.(
+            `webchannel: difference for ${logSafe(peerId)} was shortened to fit the ` +
+              `peer's effective max_payload of ${limit} bytes: ${fitted.trimmed} ` +
+              `newer event(s) left for the next request (partial=true) ` +
+              `(suppressed=${suppressed})`,
+          );
+        } catch { /* a faulting logger must not escape this callback */ }
+      }
+    }
+
+    const { reply } = fitted;
+    if (!channel.sendDifference?.(peerId, reply)) {
+      const suppressed = admit("difference", "publish-failed");
+      if (suppressed !== undefined) {
+        try {
+          logger?.error?.(
+            `webchannel: difference publish failed for ${logSafe(peerId)}: the ` +
+              `channel refused a ${reply.events.length}-event frame; see the ` +
+              `channel log (suppressed=${suppressed})`,
+          );
+        } catch { /* a faulting logger must not escape this callback */ }
+      }
+    }
+  };
+
+  /**
+   * Serve the HEAD of this peer's queue on a fresh turn, then schedule the next
+   * if any remain. The entry is held for the whole read+publish, so a peer never
+   * has two of either in flight. Retained requests run in FIFO order, subject to
+   * the queue's overflow replacement rule.
+   */
+  const scheduleNextDifference = (peerId: string): void => {
+    schedule(() => {
+      const queue = pendingDifferences.get(peerId);
+      const request = queue?.shift();
+      if (queue === undefined || request === undefined) {
+        pendingDifferences.delete(peerId);
+        return;
+      }
       try {
-        logger?.error?.(
-          `webchannel: difference publish failed for ${logSafe(peerId)}: the ` +
-            `channel refused a ${fitted.length}-event frame; see the channel log`,
-        );
-      } catch { /* a faulting logger must not escape the dispatch turn */ }
+        runDifference(peerId, request);
+      } finally {
+        // `queue` is the LIVE array, so requests that arrived during the run are
+        // retained in it for subsequent turns, subject to the queue bound.
+        //
+        // ⚠️ THE `finally` IS UNREACHABLE DEFENCE TODAY, AND NO TEST PINS IT —
+        // say so rather than implying otherwise. `runDifference` guards its read
+        // and its publish separately and every diagnostic inside them is itself
+        // wrapped, so there is no path by which it throws; deleting the `finally`
+        // leaves this file's tests green (measured). It is kept because the cost
+        // of being wrong is the peer latched out of its own catch-up for the life
+        // of the process, and because `runDeferred` releases its in-flight set
+        // the same way for the same reason. What IS pinned is the reachable
+        // half — a failed publish releasing the queue.
+        if (queue.length > 0) scheduleNextDifference(peerId);
+        else pendingDifferences.delete(peerId);
+      }
+    });
+  };
+
+  /**
+   * The deferred body of ONE `get_difference`, for one queued request.
+   */
+  const runDifference = (peerId: string, request: DifferenceRequest): void => {
+    let produced: { entries: DifferenceEntry[]; capped: boolean; maxSeq: number };
+    try {
+      // High-water first, rows second. NOT a race guard — both are synchronous
+      // `better-sqlite3` calls inside one function body with no `await`, so
+      // nothing can interleave between them and either order is equally atomic.
+      // The order is kept because it reads in the direction the values are used:
+      // the baseline, then the window measured against it.
+      const maxSeq = journal.maxSeq(peerId);
+      // RAW read: `read` already filters `seq > afterSeq` and orders by seq
+      // ascending. NO reducer, NO projection — the whole point (doc §16.2-6):
+      // the client folds these onto the view it already holds.
+      //
+      // `+ 1` IS THE PARTIAL PROBE. Reading one row past the cap is how "the
+      // journal holds more than this reply can carry" becomes an observed fact;
+      // the extra row is never sent.
+      const rows = journal.read(peerId, {
+        afterSeq: request.afterSeq,
+        limit: MAX_DIFFERENCE_EVENTS + 1,
+      });
+      produced = {
+        maxSeq,
+        capped: rows.length > MAX_DIFFERENCE_EVENTS,
+        // The row's event is `RetainedJournalEvent` — a newer build's row may
+        // carry a kind this build does not know (#253). It is shipped VERBATIM:
+        // the CLIENT skips an unknown kind while still advancing its cursor past
+        // it (as `projectJournalHistory` does with `unsupportedEvents`), so
+        // filtering here would strand the cursor below an unknown tail and
+        // re-request forever.
+        entries: rows
+          .slice(0, MAX_DIFFERENCE_EVENTS)
+          .map((row) => ({ seq: row.seq, event: row.event as DurableEvent })),
+      };
+    } catch (err) {
+      // READ FAULT: log and send NOTHING. This does NOT unwind the client — an
+      // unanswered request is recovered by the client's in-flight TIMEOUT
+      // (`nats-client-wrapper.ts`), which re-issues with a fresh nonce and then
+      // gives up into a re-detect. Sending an empty frame here would be worse
+      // than silence: `partial: false` + a `maxSeq` would falsely advance the
+      // client PAST the range it is still missing.
+      const suppressed = admit("difference", "read-failed");
+      if (suppressed !== undefined) {
+        try {
+          logger?.error?.(
+            `webchannel: difference read failed for ${logSafe(peerId)} ` +
+              `(afterSeq=${request.afterSeq}): ${logSafe(err)} ` +
+              `(suppressed=${suppressed})`,
+          );
+        } catch { /* a faulting logger must not escape this callback */ }
+      }
+      return;
+    }
+    // An EMPTY-SUCCESSFUL read (afterSeq already current) is a DIFFERENT case
+    // from the fault above and IS answered, with an empty non-`partial`
+    // difference carrying `maxSeq`. That frame is what unwinds a spurious or
+    // raced detection immediately instead of at the client's timeout.
+    //
+    // ⚠️ THE PUBLISH HALF NEEDS ITS OWN `try`, AND #356 IS WHAT MADE THAT TRUE.
+    // Two try blocks, two labels, exactly as `runDeferred` splits them, and for
+    // the same reason: a throw out of `channel.outboundWireSize` (i.e.
+    // `sealEnvelope`) or out of `channel.sendDifference` is the SEND half
+    // failing, not a journal fault, and labelling it "read failed" points an
+    // operator at a database that is fine.
+    //
+    // But the STAKES changed here, which is why it is not merely tidy. On
+    // develop this body ran INLINE on the inbound dispatch turn, inside
+    // `nats-transport.ts`'s `safeEmitFor` catch, so a throw cost one dropped
+    // frame. This slice moved it into a `schedule(...)` callback, where nothing
+    // is left on the stack to catch anything: an escape is an
+    // `uncaughtException` and the gateway process goes down. Both routes are
+    // real — `JSON.stringify` of a 500-row page can raise `RangeError: Invalid
+    // string length` on the very population `fitDifference` exists for, and
+    // `sendToPeer`'s fail-closed diagnostic sits outside its own `try`.
+    try {
+      publishDifference(peerId, request, produced);
+    } catch (err) {
+      // The SAME `publish-failed` reason a REFUSED send reports, deliberately:
+      // it is one operator-visible event ("this peer did not get its
+      // difference"), and giving a thrown one its own vocabulary would mean an
+      // operator has to know both to grep for it.
+      const suppressed = admit("difference", "publish-failed");
+      if (suppressed !== undefined) {
+        try {
+          logger?.error?.(
+            `webchannel: difference publish failed for ${logSafe(peerId)} ` +
+              `(afterSeq=${request.afterSeq}): ${logSafe(err)} ` +
+              `(suppressed=${suppressed})`,
+          );
+        } catch { /* a faulting logger must not escape this callback */ }
+      }
     }
   };
 
   return {
-    serveDifference(peerId: string, afterSeq: number): void {
-      let entries: DifferenceEntry[];
-      try {
-        // RAW read: `read` already filters `seq > afterSeq` and orders by seq
-        // ascending. NO reducer, NO projection — the whole point (doc §16.2-6):
-        // the client folds these onto the view it already holds.
-        const rows = journal.read(peerId, { afterSeq, limit: MAX_DIFFERENCE_EVENTS });
-        // The row's event is `RetainedJournalEvent` — a newer build's row may carry
-        // a kind this build does not know (#253). It is shipped VERBATIM: the
-        // CLIENT skips an unknown kind while still advancing its cursor past it (as
-        // `projectJournalHistory` does with `unsupportedEvents`), so filtering here
-        // would strand the cursor below an unknown tail and re-request forever.
-        entries = rows.map((row) => ({ seq: row.seq, event: row.event as DurableEvent }));
-      } catch (err) {
-        // READ FAULT: log and send NOTHING. This does NOT unwind the client — an
-        // unanswered request is recovered by the client's in-flight TIMEOUT
-        // (`nats-client-wrapper.ts`), which re-issues and then re-detects. Sending
-        // an empty frame here would be worse than silence: it would falsely advance
-        // the client PAST the range it is still missing.
-        try {
-          logger?.error?.(
-            `webchannel: difference read failed for ${logSafe(peerId)} ` +
-              `(afterSeq=${afterSeq}): ${logSafe(err)}`,
-          );
-        } catch { /* a faulting logger must not escape the dispatch turn */ }
+    serveDifference(peerId: string, afterSeq: number, nonce: string): void {
+      // ONE READ+PUBLISH IN FLIGHT PER PEER, WITH A BOUNDED FIFO QUEUE.
+      // The other two read paths latch per peer and DROP a concurrent request
+      // (`runDeferred`), which is right for them: a snapshot and a page each
+      // answer a question that is still true when the survivor lands, so the
+      // dropped caller loses nothing. A `get_difference` is not like that. It
+      // names a FLOOR and carries a `nonce`, and the reply is addressed to that
+      // pair — so a dropped request is a device left waiting on its 5 s timeout.
+      //
+      // ⚠️ AND COALESCING TO THE NEWEST IS THE SAME BUG WEARING A BETTER NAME.
+      // The configuration this feature exists for is N devices of one account on
+      // ONE shared `.out` subject (#245 Part B). They gap on the SAME dropped
+      // broadcast, in the same instant, from different floors. Newest-wins would
+      // answer one and silence N−1 — and, because their timers were armed
+      // together, their retries re-collide in lockstep: 4 rounds of 5 s each,
+      // then a give-up, for every device but one. The queue retains concurrent
+      // requests up to the bound described below.
+      //
+      // ⚠️ WHAT THIS BOUNDS IS CONCURRENCY AND DEPTH, NOT RATE — the same thing
+      // the file header says about the other two latches, and it is worth
+      // repeating because an earlier revision of this comment claimed a rate
+      // bound it did not have. A peer that issues one request per event-loop
+      // turn still gets one read per turn (so does `load_history` on develop).
+      // What cannot happen is two reads or two publishes at once, or an
+      // unbounded backlog: past `MAX_QUEUED_DIFFERENCE_REQUESTS` the newest
+      // request displaces the newest queued one.
+      const queued = pendingDifferences.get(peerId);
+      if (queued !== undefined) {
+        if (queued.length >= MAX_QUEUED_DIFFERENCE_REQUESTS) {
+          // The NEWEST queued entry is the one replaced: a later floor from the
+          // same device supersedes its own earlier one, while dropping from the
+          // HEAD would spend the budget answering stale floors. Everything else
+          // already queued still gets its reply, and the displaced device
+          // re-issues on its own timeout.
+          queued[queued.length - 1] = { afterSeq, nonce };
+          const suppressed = admit("difference", "dropped");
+          if (suppressed !== undefined) {
+            try {
+              logger?.warn?.(
+                `webchannel: difference request for ${logSafe(peerId)} displaced the ` +
+                  `newest of ${MAX_QUEUED_DIFFERENCE_REQUESTS} already queued for this ` +
+                  `peer; the displaced request re-issues on its own timeout ` +
+                  `(suppressed=${suppressed})`,
+              );
+            } catch { /* a faulting logger must not fail the dispatch turn */ }
+          }
+          return;
+        }
+        queued.push({ afterSeq, nonce });
         return;
       }
-      // EMPTY-SUCCESSFUL read (afterSeq already current) — a DIFFERENT case from the
-      // fault above, and it IS answered: an empty `difference`. The client's
-      // `case "difference"` no-ops the fold and drains its buffer, unwinding a
-      // spurious/raced detection without waiting on its timeout. Sending nothing
-      // here would leave a client that DID buffer stuck until that timeout fires.
-      publishDifference(peerId, entries);
+      pendingDifferences.set(peerId, [{ afterSeq, nonce }]);
+      scheduleNextDifference(peerId);
     },
 
     sendSnapshot(peerId: string): void {
