@@ -264,29 +264,33 @@ rejected id. The implementation replaces direct `checkAndRecord` use at this
 seam with an `IngressOutcomeStore` whose logical value is one of:
 
 ```ts
-type IngressOutcome = "accepted" | "overloaded";
+type IngressOutcome = "accepted" | "overloaded" | "cancelled";
 type OutcomeLookup =
   | { status: "found"; outcome: IngressOutcome }
   | { status: "not-found" }
   | { status: "unknown"; error: unknown };
 ```
 
-The adapter uses mutually exclusive accepted/overloaded keys backed by two
-**process-wide** pinned `createPersistentDedupe` instances:
+The adapter uses separate accepted/overloaded/cancelled keys backed by
+three **process-wide** pinned `createPersistentDedupe` instances (`cancelled`
+split out of `accepted` in #344):
 
 ```text
 accepted store            = existing persistent-dedupe namespace family
 overloaded store          = webchannel-inbound-overloaded namespace family
+cancelled store           = webchannel-inbound-cancelled namespace family
 logical namespace         = accountId (routing isolation, not a resource quota)
 TTL / shared memory caps  = 7d / 2,048 per store across the process
 disk state cap            = 5,000 per SDK namespace
 ```
 
-An id is written to **exactly one** namespace, only after capacity admission has
-selected its outcome. A rejection is never pre-recorded as ordinary/accepted.
-Lookup checks overloaded first and accepted second. If both exist because of
-legacy/corrupt state, overloaded wins, a rate-limited invariant warning fires,
-and accepted is forgotten best-effort. This precedence prevents a false ACK.
+A fresh id is written to its selected outcome's namespace. A rejection is never
+pre-recorded as ordinary/accepted. Lookup checks cancelled, overloaded, then
+accepted. Cancellation replacement retains weaker markers until lookup removes
+them best-effort; the cancelled verdict wins throughout. Overloaded alongside
+accepted remains an invariant violation: overload wins and accepted is removed
+best-effort. An accepted marker still needs the journal check described in
+`OutcomeLookup` before any reader may re-ACK it.
 
 The SDK swallows disk errors and otherwise makes `hasRecent(false)` ambiguous.
 The adapter therefore observes its `onDiskError` epoch around every call. A
@@ -340,13 +344,15 @@ emits no terminal result, and lets the client retry. A durable overload marker
 survives a crash after record but before publish; a delivered rejection already
 gave the client its terminal state. Thus every restart ordering has at least one
 recovery owner and a memory-only rejection is never mistaken for durable state.
-Cancellation-fallback recovery uses `record(accepted, { replaceOpposite: true })`.
-The opposite-store delete observes its own `onDiskError`; if a durable overload
-may remain, replacement returns `unknown`, releases the per-key gate, keeps the
-fallback, and emits no ACK. This prevents a dual marker whose later lookup would
-otherwise choose overload.
+Cancellation-fallback recovery uses `record(cancelled, { replaceOthers: true })`.
+It persists cancelled before removing weaker markers. Those markers remain until
+a later lookup, so a failed cancellation write or receipt rollback preserves the
+previous verdict. Cleanup failure cannot override the higher-precedence durable
+cancellation. A cancellation write fault returns `unknown`; failure to remove
+the SDK's memory-only marker enters the same quarantine as a failed rollback,
+preventing it from authorizing deletion of an older durable marker.
 
-An accepted/overloaded write receipt retains its per-key operation gate until
+A write receipt retains its per-key operation gate until
 `commit()` or `rollback()`. Rollback observes the SDK `forget(...).onDiskError`
 hook. If exact deletion fails, the marker is placed in a separate process-wide
 rollback-recovery quarantine capped at **2,048 entries / 2 MiB** of measured
@@ -355,7 +361,11 @@ account/key metadata and removed from synchronous hot classification. Later
 marker generation under the same key gate. Until cleanup succeeds it returns
 `unknown`, so a same-process cold lookup cannot rediscover the stale marker and
 ACK/reject work whose dispatcher offer was rolled back. Once deletion succeeds,
-classification resumes from `not-found` and the retry may be freshly admitted.
+classification resumes against any remaining markers. For a recovered accepted
+orphan, the admission seam erases the old marker under this gate before recording
+again, so its new receipt owns rollback even if a sibling journal append fails.
+Failed erasure enters the same quarantine; ordinary follower receipts remain
+unable to delete a marker they did not create.
 
 Quarantine entries are never evicted to make room, because eviction would forget
 known-unsafe state. If its count/byte bound cannot accept another failed marker,
@@ -480,7 +490,7 @@ process count/byte budget instead of creating an uncharged async fan-out.
 A raw overflow cannot synchronously distinguish an accepted replay from a fresh
 id when the persistent cache is cold. The exception is the synchronous bounded
 cancelled-item fallback: it is authoritative before the hot outcome cache and
-marks the existing no-wait task as accepted-recovery. Raw overflow is handled by
+marks the existing no-wait task as cancellation recovery. Raw overflow is handled by
 a process-wide `BoundedOverflowResolver`:
 
 - at most one active resolver per session, 64 per process, and 1 MiB of measured
@@ -489,10 +499,12 @@ a process-wide `BoundedOverflowResolver`:
 - an active task retains only bounded routing/key/id metadata, never message
   text/object; UTF-8 route/key/id bytes plus fixed overhead are charged against
   the separate 1 MiB resolver-metadata ceiling;
-- it performs full outcome lookup: accepted -> ACK, overloaded -> rejection,
-  not-found -> record overloaded durably -> rejection;
-- in accepted-recovery mode it skips ordinary lookup, records accepted with
-  opposite replacement, sends only ACK, and deletes the fallback only after
+- it performs full outcome lookup: accepted with a journal row -> ACK and any
+  committed echo; accepted without a row -> no result, leaving replay for the
+  admission seam; cancelled -> ACK; overloaded -> rejection; not-found -> record
+  overloaded durably -> rejection;
+- in cancellation-recovery mode it skips ordinary lookup, records cancelled with
+  replacement, sends only ACK, and deletes the fallback only after
   record+ACK succeed while the task remains active;
 - unknown/read/write failure emits no result. A memory-only overload write is
   forgotten as specified in §3.3 and the same-id client retry tries again;
@@ -664,15 +676,24 @@ count and byte budget like any other message while pending.
 
 `packages/plugin/src/ingress-outcome.ts`
 
-- wrap two process-wide accepted/overloaded persistent dedupe instances behind
-  the account-namespaced tri-state `IngressOutcomeStore` API;
+- wrap three process-wide accepted/overloaded/cancelled persistent dedupe
+  instances behind the account-namespaced tri-state `IngressOutcomeStore` API;
 - expose a synchronous process-wide 2,048-entry/2-MiB hot index containing
-  accepted and durable-overloaded outcomes for pre-debounce classification;
-- record exactly one selected outcome per fresh id and make overload win if an
-  impossible dual marker is observed;
+  accepted, durable-overloaded and cancelled outcomes for pre-debounce
+  classification (#344 added `cancelled`). ⚠️ Only the two REFUSALS are
+  classifiable there: since #344 the debouncer's short-circuit ignores an
+  `accepted` peek, because answering one needs either the journal row (to re-ack)
+  or the power to admit (when there is no row), and the fast path has neither —
+  see THE READER RULE on `OutcomeLookup` in `ingress-outcome.ts`;
+- record the selected outcome per fresh id, and let the strongest suppression
+  win while replacement markers coexist — `OUTCOME_PRECEDENCE` is
+  `cancelled` → `overloaded` → `accepted` since #344, so this is no longer
+  "overload wins": killed text must not be reclassified as backpressure;
 - turn `onDiskError` epochs into conservative `unknown` lookup results;
-- report record durability and forget a memory-only overload before returning
-  `unknown`, so callers cannot publish a non-durable terminal rejection;
+- report record durability and forget a memory-only marker for EITHER refusal
+  before returning `unknown` (#344 extended this from `overloaded` to `cancelled`
+  too), so callers cannot publish a non-durable terminal rejection and a
+  suppression cannot be lost on restart;
 - retain failed receipt rollbacks in one bounded process-wide 2,048-entry/2-MiB
   exact-marker quarantine; retry cleanup before hot/cold classification and
   poison the process store fail-closed if recovery metadata cannot fit;

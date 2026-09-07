@@ -831,13 +831,21 @@ describe("real createPersistentDedupe (hermetic, isolated state dir)", () => {
         ...persistentOptions,
         namespacePrefix: "webchannel-inbound-overloaded",
       });
+      // #344: the third outcome namespace, real like its siblings so this
+      // survives-a-restart probe covers it too.
+      const cancelled = createPersistentDedupe({
+        ...persistentOptions,
+        namespacePrefix: "webchannel-inbound-cancelled",
+      });
       return {
         accepted,
         overloaded,
+        cancelled,
         failures,
         store: createIngressOutcomeStore({
           accepted,
           overloaded,
+          cancelled,
           warnFailure: (_accountId, category) => failures.push(category),
         }),
       };
@@ -1008,9 +1016,9 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
         _accountId: string,
         key: string,
         _outcome: IngressOutcome,
-        options?: { replaceOpposite?: boolean },
+        options?: { replaceOthers?: boolean },
       ) => {
-        if (!options?.replaceOpposite) return normalA.result;
+        if (!options?.replaceOthers) return normalA.result;
         return key === "p:a" ? cancellationAWait : cancelledB.result;
       }),
       forget: vi.fn(), hotSize: vi.fn(), rollbackRecoverySize: vi.fn(),
@@ -1048,7 +1056,7 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
             "acct",
             `${entry.item.peerId}:${entry.id}`,
             "accepted",
-            { replaceOpposite: true },
+            { replaceOthers: true },
           );
           if (result.status === "recorded") result.write.commit();
         }
@@ -1061,7 +1069,7 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
     expect(budget.usage()).toEqual({ messages: 2, bytes: 2 });
     expect(debouncer.cancelKey("p", { notify: true })).toBe(true);
     await vi.waitFor(() => expect(store.record).toHaveBeenCalledWith(
-      "acct", "p:a", "accepted", { replaceOpposite: true },
+      "acct", "p:a", "accepted", { replaceOthers: true },
     ));
 
     // Cancellation(A) is now queued behind normal receipt(A). Resolving B's
@@ -1263,7 +1271,7 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
       onCancel: async (entries) => {
         for (const entry of entries) {
           const key = `${entry.item.peerId}:${entry.id}`;
-          const result = await store.record("acct", key, "accepted", { replaceOpposite: true });
+          const result = await store.record("acct", key, "accepted", { replaceOthers: true });
           if (result.status === "recorded") result.write.commit();
         }
         await cancellationAck;
@@ -1391,7 +1399,11 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
     expect(budget.usage()).toEqual({ messages: 0, bytes: 0 });
   });
 
-  it("preserves a cancellation-owned accepted marker when a normal write settles late", async () => {
+  it("preserves the cancellation-owned marker when a normal write settles late", async () => {
+    // #344 renamed this from "…accepted marker": the cancellation now owns a
+    // `cancelled` marker in its own namespace, so the accept path's late rollback
+    // cannot reach it by construction rather than by discipline. Both are
+    // asserted below — the old property and the one that now subsumes it.
     let finishRecord!: (value: any) => void;
     const record = new Promise<any>((resolve) => { finishRecord = resolve; });
     let active = true;
@@ -1444,6 +1456,7 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
     expect(commit).not.toHaveBeenCalled();
     expect(late.write.rollback).toHaveBeenCalledTimes(1);
     expect(store.forget).not.toHaveBeenCalledWith("acct", "p:i", "accepted");
+    expect(store.forget).not.toHaveBeenCalledWith("acct", "p:i", "cancelled");
     expect(sendAck).not.toHaveBeenCalled();
     expect(budget.usage()).toEqual({ messages: 0, bytes: 0 });
   });
@@ -1490,7 +1503,20 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
       forget: vi.fn(async (key: string, options?: { namespace?: string }) =>
         overloadedValues.delete(scoped(key, options))),
     } as unknown as PersistentDedupe;
-    const outcomeStore = createIngressOutcomeStore({ accepted, overloaded });
+    const outcomeStore = createIngressOutcomeStore({
+      accepted,
+      overloaded,
+      // #344: unused by this test — a genuinely EMPTY third namespace. It must
+      // not borrow `overloaded`'s membership: `cancelled` outranks `overloaded`
+      // in the lookup precedence, so a shared `hasRecent` would report every
+      // overloaded key as cancelled.
+      cancelled: {
+        hasRecent: vi.fn(async () => false),
+        checkAndRecord: vi.fn(async () => true),
+        forget: vi.fn(async () => false),
+        warmup: vi.fn(), clearMemory: vi.fn(), memorySize: vi.fn(),
+      } as unknown as PersistentDedupe,
+    });
     let dispatches = 0;
     const offer = vi.fn((_message: Item["message"], reservation?: {
       release(): void;
@@ -1605,8 +1631,11 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
     expect(store.lookup).not.toHaveBeenCalled();
     expect(offer).not.toHaveBeenCalled();
     expect(store.record).toHaveBeenCalledTimes(2);
-    expect(store.record).toHaveBeenNthCalledWith(2, "acct", "p:i", "accepted", {
-      replaceOpposite: true,
+    // #344: the fallback's retry records `cancelled`. It writes no journal row
+    // on purpose, so it must not share a marker value with the accept seam's
+    // crash window — that collision is what re-ran `/stop`-killed text.
+    expect(store.record).toHaveBeenNthCalledWith(2, "acct", "p:i", "cancelled", {
+      replaceOthers: true,
     });
     expect(sendAck).toHaveBeenCalledWith("p", ["i"]);
   });
