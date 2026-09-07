@@ -76,7 +76,23 @@ type DraftAttempt = {
   text: string;
 };
 
-type DraftOutcome = boolean | "throw";
+/**
+ * What the SEAM (`nats-channel.ts`'s `sendToPeer`) does with one attempt.
+ *
+ *  - `true`    — journaled, published, reported sent.
+ *  - `false`   — REFUSED above `journalOutbound` (disposed / transport down /
+ *                no session key yet): no row, no wire frame, reported failed.
+ *  - `"throw"` — the channel implementation itself threw out to the adapter.
+ *                `NatsChannel` never does this (it catches); the adapter still
+ *                has a `catch`, and these tests pin it.
+ *  - `"commit-throw"` — #347: the durable row WAS committed and the wire write
+ *                then threw. The seam reports the send as SUCCESSFUL (the row is
+ *                in the SSOT under a seq; a #362-model cursor heals the missing
+ *                frame with `get_difference`), so the lane keeps its id and
+ *                nothing is re-sent under a new one. A row exists; no frame
+ *                reached the wire.
+ */
+type DraftOutcome = boolean | "throw" | "commit-throw";
 
 function makeDraftHarness(options?: {
   throttleMs?: number;
@@ -86,6 +102,10 @@ function makeDraftHarness(options?: {
 }) {
   const attempts: DraftAttempt[] = [];
   const frames: DraftAttempt[] = [];
+  // #347: the attempts that produced a DURABLE ROW, in egress order. Identical to
+  // `frames` unless a `decide` returns `"commit-throw"` — the one shape where the
+  // two diverge, because the seam journals BEFORE it publishes.
+  const journaled: DraftAttempt[] = [];
   // #212: the turn_snapshot frames the controller emits at drain, in order.
   const snapshots: Array<{
     turnId: string;
@@ -98,7 +118,14 @@ function makeDraftHarness(options?: {
     options?.onAttempt?.(attempt, attemptIndex);
     const outcome = options?.decide?.(attempt, attemptIndex) ?? true;
     if (outcome === "throw") throw new Error(`transport threw for ${attempt.text}`);
-    if (outcome) frames.push(attempt);
+    if (outcome === "commit-throw") {
+      journaled.push(attempt);
+      return true;
+    }
+    if (outcome) {
+      frames.push(attempt);
+      journaled.push(attempt);
+    }
     return outcome;
   };
   const transport = {
@@ -124,7 +151,7 @@ function makeDraftHarness(options?: {
     throttleMs: options?.throttleMs ?? 0,
     logger: options?.logger ?? { warn: () => {} },
   });
-  return { draft, attempts, frames, snapshots };
+  return { draft, attempts, frames, journaled, snapshots };
 }
 
 const toolStart = (itemId = "tool-1") => ({
@@ -154,12 +181,18 @@ function successfulIds(frames: DraftAttempt[]): string[] {
 // placement/bubble/seal mapping itself. `sendProgress` publishes a `progress`
 // frame and `finalizeDraft` an `agent_message` one (`nats-channel.ts`'s
 // `finalizeDraft → sendText`); the drain's `turn_snapshot` is appended last
-// because `terminalDrain` emits it after every final. VALID ONLY WHILE EVERY SEND
-// SUCCEEDED: the seam journals BEFORE it publishes (`nats-channel.ts`), so with a
-// `decide` that refuses a frame this helper under-counts the journal.
+// because `terminalDrain` emits it after every final.
+//
+// #347: it reads `journaled`, NOT `frames`. The seam journals BEFORE it publishes,
+// so the two sets differ in exactly one shape — a row committed whose publish then
+// threw — and the harness records that shape explicitly (`"commit-throw"`) rather
+// than leaving it to be inferred. A REFUSED send is not the ambiguous case it once
+// was: since #347 a `false` from `sendToPeer` means NO ROW was committed (a
+// refusal above the journal, or an append that faulted), so "no wire frame" and
+// "no row" coincide.
 function journalFor(h: ReturnType<typeof makeDraftHarness>): JournalEvent[] {
   const wire: OutboundWsMessage[] = [
-    ...h.frames.map((frame): OutboundWsMessage =>
+    ...h.journaled.map((frame): OutboundWsMessage =>
       frame.type === "progress"
         ? { type: "progress", id: frame.id, text: frame.text, turnId: "turn-1" }
         : { type: "agent_message", id: frame.id, text: frame.text, turnId: "turn-1" },
@@ -962,6 +995,71 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       { id: idB, text: "late" },
     ]);
     expect(h.snapshots[0].remove).toEqual([]);
+  });
+
+  it("M347: a final that COMMITS and then fails to publish KEEPS its lane's id — one id carries the text across the journal and the snapshot", async () => {
+    // #347's measured shape, replayed against the seam's contract. Every
+    // `progress` frame is REFUSED (the fail-closed no-session-key window, before
+    // the key arrives), so the lane reaches its final with no id; the final's row
+    // COMMITS and its publish then throws.
+    //
+    // Under the old `return false` the lane never took the reservation id
+    // (`lane.id ??= reservation.id` runs only inside `if (sent)`), so
+    // `emitTurnSnapshot` minted a SECOND id — `lane.id ?? nextMessageId()` — for
+    // text the journal already held under the first. Measured then:
+    // `journal bubble:nhehlx=tA, seal[7sacz3=tA]` ⇒ history `[nhehlx="tA",
+    // 7sacz3="tA"]` while live showed one bubble. That is N8 in the gaining
+    // direction, and committed-is-sent removes the second id at its source rather
+    // than folding it downstream.
+    //
+    // ⚠️ THE PIN IS THE ID COUNT, not the frame count. Restore `return false` in
+    // `sendToPeer`'s catch (here: `"commit-throw"` → `false`) and the snapshot
+    // answers a DIFFERENT id from the journaled bubble, which is the defect.
+    const h = makeDraftHarness({
+      decide: (attempt) => (attempt.type === "progress" ? false : "commit-throw"),
+    });
+    h.draft.handleAssistantMessageBoundary(); // first boundary: no-op
+    h.draft.pushAnswerText({ text: "A" }); // its progress frame is refused
+    await h.draft.flush();
+    await h.draft.finalize("tA"); // commits, then the publish throws
+    await h.draft.drain();
+
+    // Both lane frames were attempted and neither reached the wire. The harness's
+    // `sendTurnSnapshot` is not routed through `decide`, so the seal DOES ship —
+    // the peer materialises `tA` live from the snapshot's `answers` (the reducer
+    // mints an absent id) and gap-sync heals only the missing `bubble` row. What
+    // the contract pins is that both carry the SAME id.
+    expect(h.attempts.map((a) => `${a.type}=${a.text}`)).toEqual([
+      "progress=A",
+      "final=tA",
+    ]);
+    expect(h.frames).toEqual([]);
+
+    // ONE id. The committed final's id is the lane's, and the snapshot reuses it
+    // instead of minting a replacement.
+    const committedId = h.attempts.find((a) => a.type === "final")!.id;
+    expect(h.snapshots).toHaveLength(1);
+    expect(h.snapshots[0].answers).toEqual([{ id: committedId, text: "tA" }]);
+    // Nothing is superseded: no independent recovery bubble was created, so there
+    // is nothing for the client to delete.
+    expect(h.snapshots[0].remove).toEqual([]);
+
+    // HISTORY. The rows the seam actually wrote — the committed `bubble` and the
+    // snapshot's `seal` — mapped by the REAL mapper and folded by the REAL shared
+    // reducer. Both name `committedId`, so the reader gets tA exactly ONCE.
+    const journal = journalFor(h);
+    expect(journal).toEqual([
+      { kind: "bubble", answerId: committedId, text: "tA", turnId: "turn-1" },
+      {
+        kind: "seal",
+        turnId: "turn-1",
+        answers: [{ id: committedId, text: "tA" }],
+        remove: [],
+      },
+    ]);
+    const view = reduceDurableView(journal);
+    expect(view).toHaveLength(1);
+    expect(view[0]).toMatchObject({ id: committedId, text: "tA" });
   });
 
   // #172 — a block carries no content the partials did not already stream (core

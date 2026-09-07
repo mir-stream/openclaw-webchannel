@@ -23,7 +23,9 @@
  * BEFORE: `NatsTransport.publish` threw a `RangeError`; `sendToPeer` caught it,
  * logged one line and returned `false`; both call sites in `history-serve.ts`
  * discarded that `false`. The peer received NO frame — not a short one — on
- * every reconnect, and the module that owns the read said nothing.
+ * every reconnect, and the module that owns the read said nothing. (A `history`
+ * frame is NON-durable, so #347 did not change that `false` — it is only the
+ * DURABLE writes seeded below whose oversize send now reports `true`.)
  *
  * NOW: `history-frame-budget.ts` fits the page to the peer's sealed limit before
  * it is published. The frame IS published, carrying the NEWEST rows that fit;
@@ -599,6 +601,14 @@ describe("#311 — a row too big to send is SKIPPED, and the page spans across i
    * it is a shrinking page that would break it. And a byte budget alone cannot
    * help here: a page of ONE row is still over the bound, so without the skip
    * the row is a permanent wall the pager can never get behind.
+   *
+   * ⚠️ #347 CHANGED WHAT THE SEND REPORTS, NOT WHAT THE PEER GOT. `sendReasoning`
+   * now returns `true` for this row — the journal committed it, so it is sent in
+   * the only sense the SSOT recognises and gap-sync owns the delivery. The peer
+   * still never receives the bytes, live or replayed, which is what the argument
+   * above rests on: an oversize row is exactly the one that CANNOT be healed by
+   * `get_difference` either, since a `difference` frame carrying it is over the
+   * same limit. That is #325's write-side cap, still open.
    */
   it("skips the undeliverable row, serves the rest, and names it at error", () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -610,15 +620,17 @@ describe("#311 — a row too big to send is SKIPPED, and the page spans across i
     seedReasoningBursts(h, 2, 1024);
     h.transport.effectiveOutboundLimit = STOCK_MAX_PAYLOAD;
     const huge = "x".repeat(STOCK_MAX_PAYLOAD + 1);
-    expect(h.channel.sendReasoning(PEER, "r-big", "turn-big", huge, true)).toBe(false);
+    // #347: `true` — the row COMMITTED, and the publish throwing afterwards is a
+    // failed push, not a failed send. The bytes still never reached the peer.
+    expect(h.channel.sendReasoning(PEER, "r-big", "turn-big", huge, true)).toBe(true);
     h.transport.effectiveOutboundLimit = SEEDING_LIMIT;
     for (let i = 0; i < 2; i++) {
       expect(h.channel.sendReasoning(PEER, `late-${i}`, `turn-late-${i}`, "y".repeat(1024), true))
         .toBe(true);
     }
 
-    // The live send of the big row was refused, and the row was written anyway:
-    // the journal hook sits above the publish.
+    // The big row's live publish threw, and the row was written anyway: the
+    // journal hook sits above the publish.
     expect(h.journal.read(PEER)).toHaveLength(5);
 
     error.mockClear();
@@ -654,13 +666,14 @@ describe("#311 — a row too big to send is SKIPPED, and the page spans across i
 
     h.transport.effectiveOutboundLimit = STOCK_MAX_PAYLOAD;
     for (let i = 0; i < 2; i++) {
+      // #347: committed ⇒ sent. The publish threw; the row exists either way.
       expect(h.channel.sendReasoning(
         PEER,
         `r-big-${i}`,
         `turn-big-${i}`,
         "x".repeat(STOCK_MAX_PAYLOAD + 1),
         true,
-      )).toBe(false);
+      )).toBe(true);
     }
 
     error.mockClear();

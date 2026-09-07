@@ -144,6 +144,17 @@ export const ALLOWED_RAW_INTERPOLATIONS: readonly AllowedRawInterpolation[] = [
   },
   {
     file: "nats-channel.ts",
+    site:
+      "[nats-channel] Publish failed AFTER the durable commit for peer (seq=); " +
+      "the row is stored and delivery is now gap-sync's:",
+    expression: "seq",
+    // #347: the per-conversation seq `journalOutbound` allocated. A number the
+    // journal minted, never peer data, and the operator's only handle on WHICH
+    // row gap-sync has to carry.
+    reason: "journal-allocated sequence number",
+  },
+  {
+    file: "nats-channel.ts",
     site: '"[nats-channel] ingress result frame cannot fit effective NATS max_payload; "increase the server limit (suppressed=)',
     expression: "suppressed",
     reason: "suppressed-warning counter (number)",

@@ -1171,10 +1171,12 @@ export class NatsChannel implements WebChannelPeerChannel {
     //
     // Lifted out of the `try` below ONLY so the journal hook can sit between the
     // REFUSALS and the WIRE WRITE. The predicate and its position are unchanged
-    // and still run before anything is journaled or published; `sealEnvelope`
+    // and still run before this method journals or publishes; `sealEnvelope`
     // deliberately stays inside the `try`, so a throw while sealing still
-    // returns `false`. What the lift DID change is exception containment on this
-    // one path: the `console.warn` below used to sit inside the `try`, so a
+    // returns `false` — #347 narrowed that to "when nothing was journaled": a
+    // throw out of seal or publish AFTER this method committed a row now returns
+    // `true` (see the catch). What the lift DID change is exception containment
+    // on this one path: the `console.warn` below used to sit inside the `try`, so a
     // faulting host `console` became `return false`, and now it escapes
     // `sendToPeer` — which matches the disposed/transport-down refusal above,
     // where that has always been true.
@@ -1218,7 +1220,8 @@ export class NatsChannel implements WebChannelPeerChannel {
     // from the client's view, so a row would only make history show what live
     // never showed". #242 half 1 falsified that by giving the funnel a second
     // durable kind: a refused reasoning CLOSE frame carries `lastDeliveredText`,
-    // text the transport ACCEPTED and the peer is still rendering, and the
+    // text the transport ACCEPTED and the peer is still rendering (push frames
+    // are never journaled, so #347 does not reach that text), and the
     // delivery-failure bookkeeping the parenthetical relied on is bubble/
     // placement state that reasoning frames have none of.
     //
@@ -1229,14 +1232,10 @@ export class NatsChannel implements WebChannelPeerChannel {
     // retracted rationales. **#304** is the open residual. Do not restate it
     // here; four restatements of it have already shipped wrong.
     //
-    // The window §16.2-2 actually describes is the one that REMAINS: `sealEnvelope`
-    // or `transport.publish` throwing after this line, so the record is committed
-    // and the frame does not reach the peer. For a `bubble` that is the SAFE
-    // direction on purpose — the id is stable and the projection is
-    // last-write-wins by id, so history has it and the reconnect catches up,
-    // rather than the client holding a message the store lacks.
-    //
-    // ⚠️ NOT universally — see #278 for the case and its conditions.
+    // The window §16.2-2 describes is the one that REMAINS: `sealEnvelope` or
+    // `transport.publish` throwing after this line, so the record is committed
+    // and the frame does not reach the peer. ⭐ #347: THAT IS A SUCCESSFUL SEND,
+    // and the `catch` below returns `true` for it.
     //
     // ⚠️ AND #341 CARVED OUT THE TWO APPROVAL FRAMES, WHICH IS WHY THE CALL IS
     // GUARDED. They were journaled here until an `approval_request` the transport
@@ -1249,6 +1248,55 @@ export class NatsChannel implements WebChannelPeerChannel {
     // this line, below the three refusals. The argument for the carve-out (and for
     // why it does not transfer to #304) is at `publishApprovalFrame`; do not
     // restate it here.
+    // For approvals the local `seq` stays undefined, so this method still reports
+    // the push outcome. `publishApprovalFrame` reports storage separately in
+    // `journaled`; its `delivered` field must not become true on a failed push.
+    //
+    // We are the Telegram SERVER (doc §0). A message exists the moment the server
+    // has STORED it under an id; pushing it to a device is a SEPARATE act, and a
+    // push that fails is not a failed send — the device that missed it picks the
+    // message up on its next `getDifference`. Since #244 we have precisely that
+    // machine: every journaled frame consumes a per-conversation `seq`, so a peer
+    // that never received this one stops one short of that seq, sees the hole at
+    // the next SEQ-BEARING frame (the turn's `turn_snapshot` if nothing else) and
+    // heals it with `get_difference`, served from this very row — PROVIDED its
+    // cursor gap-tests every seq it learns, including the `ack` echo of its own
+    // next message. That is #356 half A's cursor (PR #362, which lands BEFORE
+    // this change); the client before it has an advance-only ack that CLOSES
+    // such a hole for the session when an ack arrives before the next
+    // seq-bearing frame. If this frame was the conversation's last, the peer's
+    // next register serves the row in its history snapshot instead — same
+    // store, same id — unless the row alone exceeds the peer's wire budget
+    // (#311 skips it): #325's write side, the one shape no path can carry (and
+    // before #362's fit skips it, a `difference` carrying it is refused whole
+    // and re-requested — a wall, not a miss). Once the row is committed, the
+    // send has succeeded in the only sense
+    // the SSOT recognises; what remains is delivery, and delivery is gap-sync's.
+    //
+    // ⚠️ THE OLD `false` WAS THE DEFECT, NOT A CONSERVATIVE DEFAULT — and #278's
+    // paragraph calling the `bubble` case "the SAFE direction … the id is stable"
+    // is DELETED rather than narrowed, because it was false over exactly the
+    // population it claimed. `message-adapter.ts` trusts this boolean: `lane.id
+    // ??= reservation.id` runs ONLY on a success, so a committed-then-unpublished
+    // final left its lane with no id, `emitTurnSnapshot` minted a SECOND id
+    // (`lane.id ?? nextMessageId()`) for text the journal already held under the
+    // first, and the failed-lane recovery re-sent the same content as a third
+    // bubble. Measured in #347: journal `bubble:X=tA` + `seal[Y=tA]` ⇒ history
+    // shows tA TWICE while live shows it once — N8 in the gaining direction,
+    // manufactured by us. Re-sending under a new id is the pre-#244 repair, when a
+    // lost publish really was a lost message; gap-sync is the repair now.
+    //
+    // For frames journaled HERE, the result depends on whether a row was
+    // committed: `seq !== undefined`, the same value the stamp below uses.
+    // A frame that allocated no seq has NO row and nothing for `get_difference` to
+    // serve, so for it a publish failure is still a failed send and still returns
+    // `false`: every frame `journalOutbound` does not journal (the non-durable
+    // types and a durable frame with an unusable id — read
+    // `journalEventForOutbound`/`isSeqBearingFrame` for the exact set), an id-less
+    // durable frame, a frame this account's policy does not journal, and a frame
+    // whose journal write faulted. The three refusals ABOVE keep returning `false`
+    // for the same reason: no row exists, so the caller's rollback and its
+    // failed-lane recovery are the correct response there.
     const seq = isApprovalOutboundFrame(payload)
       ? undefined
       : this.journalOutbound(peerId, payload);
@@ -1257,7 +1305,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     // the durable frame BEFORE sealing/publishing (persist-before-publish means
     // the seq is known here).
     //
-    // ⚠️ EVERY DURABLE FRAME, NOT A SUBSET — contiguity is the point. `seq` is
+    // For frames journaled here (approvals arrive already stamped), `seq` is
     // defined IFF the frame was appended, and a frame is appended IFF it is one of
     // the durable types `journalEventForOutbound` maps. `isSeqBearingFrame` is the
     // single expression of that set (co-located with the mapper, with a drift test
@@ -1267,7 +1315,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     // durable frames would leave the client's stream with holes where the others
     // silently consumed a seq — a phantom gap for half B. A frame that was not
     // journaled (`seq === undefined` — non-durable, id-less, or a caught failure)
-    // ships unchanged, without a `seq`.
+    // ships unchanged. An approval retains the seq stamped by its own seam.
     //
     // ⚠️ THE INBOUND USER OPENER is the one other seq-consumer, and it is NOT here
     // because it is not an outbound frame: its seq rides the `ack.committed` echo
@@ -1294,6 +1342,22 @@ export class NatsChannel implements WebChannelPeerChannel {
       this.transport.publish(subject, JSON.stringify(outbound));
       return true;
     } catch (err) {
+      // #347 — COMMITTED IS SENT. A durable row was written above this `try`, so
+      // the publish was the PUSH and not the send: the peer's cursor stops one
+      // short of this frame's `seq`, the next seq-bearing frame reveals the hole
+      // to a #362-model cursor, and `get_difference` serves this row (a
+      // reconnect's history snapshot serves it too, unless the row alone exceeds
+      // the peer's wire budget — #325). Reporting `false` here is what made the
+      // caller re-mint an id and store the same text twice. One line per frame,
+      // naming the seq so an operator can see WHICH row gap-sync has to carry.
+      if (seq !== undefined) {
+        console.error(
+          `[nats-channel] Publish failed AFTER the durable commit for peer ${logSafe(peerId)} ` +
+            `(seq=${seq}); the row is stored and delivery is now gap-sync's: ` +
+            `${logSafe(formatCaughtDiagnostic(err))}`,
+        );
+        return true;
+      }
       console.error(
         `[nats-channel] Failed to send to peer ${logSafe(peerId)}: ${logSafe(formatCaughtDiagnostic(err))}`,
       );
@@ -1366,16 +1430,26 @@ export class NatsChannel implements WebChannelPeerChannel {
    * property of the CALL SITE, not of this method. Everything below is written
    * about the write path itself and is true of either caller.
    *
-   * ⚠️ THIS FUNCTION CANNOT CHANGE A SEND RESULT, AND THAT IS THE WHOLE POINT.
-   * #244 half A gave it a return value — the appended per-conversation `seq`, or
-   * `undefined` when nothing durable was written (an id-less/non-durable frame or
-   * a CAUGHT failure) — but that value is METADATA the caller stamps onto the
-   * outbound frame, NEVER a boolean `sendToPeer` branches on. The send result is
-   * still computed entirely from the wire write below the hook; a journal fault
-   * yields `undefined` (the frame ships WITHOUT a `seq`), it never becomes a
-   * `false`/thrown send. Every failure of the JOURNAL WRITE PATH — both mapper
-   * calls as well as `append` — is swallowed into a rate-limited warning and
-   * returns `undefined`. Emitting that warning
+   * ⚠️ A JOURNAL FAULT CANNOT FAIL A SEND THAT WOULD OTHERWISE HAVE SUCCEEDED,
+   * AND THAT IS THE WHOLE POINT. #244 half A gave this a return value — the
+   * appended per-conversation `seq`, or `undefined` when nothing durable was
+   * written (an id-less/non-durable frame or a CAUGHT failure). Every failure of
+   * the JOURNAL WRITE PATH — both mapper calls as well as `append` — is swallowed
+   * into a rate-limited warning and returns `undefined`, so the frame ships
+   * WITHOUT a `seq` and its outcome is decided by the wire write exactly as it
+   * would be with no journal configured at all. It never becomes a `false`/thrown
+   * send on a publish that worked.
+   *
+   * ⚠️ WHAT IS NO LONGER TRUE — AND IS SAID HERE RATHER THAN LEFT AS THE OLDER,
+   * SIMPLER CLAIM ("the send result is computed entirely from the wire write
+   * below the hook"). Since #347 `sendToPeer` DOES branch on this return: a
+   * publish that throws after a row was committed reports `true`, because a
+   * #362-model client heals the missing frame from that row via
+   * `get_difference`. So a
+   * journal fault does change the result in ONE shape — the publish ALSO throws,
+   * and with no row there is nothing to heal from, so the honest answer is
+   * `false`. That is the same answer the no-journal build gives, which is why it
+   * does not resurrect §15.8's forbidden outcome. Emitting the warning
    * is itself a bare `console` call, on exactly the same footing as the
    * `console.warn` this method's caller makes on each refusal and the
    * `console.error` in its publish catch: a host that installed a faulting
@@ -1425,7 +1499,7 @@ export class NatsChannel implements WebChannelPeerChannel {
       // That is BENIGN and deliberately not widened — the client's
       // `case "tool_activity"` refuses exactly the same frame, so nothing
       // rendered live is missing from history (no N8), and unlike an id-less
-      // `agent_message` there is no delivered TEXT being discarded (no N10).
+      // `agent_message` there is no about-to-be-published TEXT being discarded (no N8 loss).
       // Post-#238 the `agent_message` case is a REGRESSION detector; the tool
       // case would be an ordinary refusal, which is why it is not one.
       //
@@ -1477,8 +1551,10 @@ export class NatsChannel implements WebChannelPeerChannel {
         peerId,
         journalFailureDiagnostic(error),
       );
-      // A caught failure yields NO seq — the frame ships without one (§15.8: the
-      // failure must never change the send result). Falls through to `undefined`.
+      // A caught failure yields NO seq — the frame ships without one (§15.8: a
+      // journal fault must not block the push). Since #347 that `undefined` IS
+      // what decides what a later publish failure reports: no row ⇒ `false`.
+      // Falls through to `undefined`.
     }
     return undefined;
   }
@@ -1495,7 +1571,8 @@ export class NatsChannel implements WebChannelPeerChannel {
    *    store: nothing reads it, so a failed write degrades something not yet
    *    load-bearing", and #240 half 2 ended that: the journal is now the ONLY
    *    history store. A failed append here does NOT stop the publish (the send
-   *    proceeds and returns `true`), so what it costs today is a frame the peer
+   *    proceeds; with no row a publish throw then reports `false`),
+   *    so what it costs today is a frame the peer
    *    SAW live and will not see on reconnect — live ≠ history, the exact
    *    divergence this store exists to kill. That is `error`-shaped, and
    *    arguably fail-closed-shaped. Half 2 deliberately did not change either:
@@ -1503,8 +1580,8 @@ export class NatsChannel implements WebChannelPeerChannel {
    *    changes outside a read-path cutover. Recorded here as OWED work, not as a
    *    justified level — do not read this bullet as an endorsement of `warn`.
    *  - `idless-durable-frame` → `console.error`. Post-#238 this cannot happen
-   *    without a regression, and when it does it means DELIVERED text is missing
-   *    from the store — a defect, not a hiccup. `delivery-journal-event.ts`'s
+   *    without a regression, and when it does it means text about to be
+   *    published is missing from the store — a defect, not a hiccup. `delivery-journal-event.ts`'s
    *    `isIdlessDurableFrame` docblock already states this level ("Half 2 logs
    *    it at `error`"); the two files must not disagree.
    *
@@ -1540,10 +1617,13 @@ export class NatsChannel implements WebChannelPeerChannel {
     // "this frame never reached the peer". The hook runs BELOW all three
     // refusals, so on every path that reaches either warning the frame goes on
     // to be published: the operator's remediation is "delivered, no durable
-    // row", not "undelivered". The single exception is the wire write throwing
-    // after the commit, and that path logs its own `Failed to send to peer`
-    // line. What the journal genuinely cannot change is the boolean
-    // `sendToPeer` returns.
+    // row", not "undelivered". The single exception is the wire write throwing,
+    // and that path logs its own line. "Unchanged" is measured against a build
+    // with NO journal: a frame with no row publishes and its boolean is decided
+    // by the wire write, exactly as before the journal existed. ⚠️ It is NOT
+    // "the journal cannot change the boolean" — since #347 a COMMITTED row turns
+    // a thrown publish into `true` (delivery is gap-sync's). A frame that reached
+    // either warning has no row, so it does not get that treatment.
     const line =
       `[nats-channel] delivery journal ${category} for peer ${logSafe(peerId)}; ` +
       `this frame has no durable row, the send result is unchanged` +

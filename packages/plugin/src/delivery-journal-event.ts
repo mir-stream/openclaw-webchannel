@@ -147,18 +147,18 @@ export const MAX_INBOUND_USER_ID_LENGTH = 128;
  * PLUGIN-MINTED (`message-adapter.ts`'s `nextMessageId()`, `webchannel-<ms>-<6
  * chars>` — 31 chars, verified in-tree). Applying the bound to agent ids would
  * classify an over-long minted id as id-less, and an id-less durable frame is
- * dropped from the journal — silently discarding DELIVERED text, which is N10.
- * Refusing to store is the safe answer for input we did not create; it is the
- * unsafe answer for output we already sent.
+ * dropped from the journal — silently discarding text that is about to be
+ * published, which is N8 (losing). Refusing to store is the safe answer for
+ * input we did not create; it is the unsafe answer for our own output.
  *
  * ⚠️ AND SINCE #242 half 3 THERE IS AN EXCEPTION TO "PLUGIN-MINTED" — NAMED HERE
  * SO THE PARAGRAPH ABOVE IS NOT READ AS COVERING EVERY CALLER. The
  * `tool_activity` branch calls this predicate on a TOOL id, and that id is NOT
  * ours: `inbound.ts`'s `createCall` prefers the upstream `toolCallId`/`itemId`
  * straight off the agent event stream, so any non-empty string of any length can
- * arrive here. The reasoning above still decides the ANSWER — the frame has
- * already been delivered to the client under that id, so refusing to store it is
- * the N8/N10 divergence, not a defence — but the premise it rests on is
+ * arrive here. The reasoning above still decides the ANSWER — the frame is about
+ * to be published to the client under that id, so refusing to store it is the
+ * N8 divergence, not a defence — but the premise it rests on is
  * narrower than it reads. The unbounded SIZE that follows is **#321**; the fix
  * belongs at the producer or the wire, not in this predicate. DO NOT ADD A BOUND
  * HERE.
@@ -187,9 +187,9 @@ function isUsableMessageId(id: unknown): id is string {
  * OBSERVABLE predicate rather than as a silent `null`. Half 2 logs it at `error`.
  *
  * ⚠️ DO NOT "handle" it by minting a server-side id here and keeping the text.
- * N10 says never drop text, and that instinct is right in general — but by the
- * time a frame reaches this mapper it has ALREADY LEFT for the client, which
- * mints its own local `a-<n>` for it. A journal row under a DIFFERENT id is
+ * N8 says live and history must agree, and the instinct to keep text is right
+ * in general — but a frame that reaches this mapper is about to be PUBLISHED to
+ * the client, which mints its own local `a-<n>` for it. A journal row under a DIFFERENT id is
  * precisely the live≠history divergence (N8) this store exists to kill. The real
  * repair is the plugin minting the id BEFORE the frame goes out, so client and
  * journal agree by construction — doc §16.2-1, issue **#243**. Not built here.
@@ -493,7 +493,7 @@ export function journalEventForOutbound(
       // The admission rule tracks the client's `case "tool_activity"` exactly —
       // non-empty string `id` and `turnId`, and `argKeys` filtered to strings —
       // so nothing is journaled that the client refuses (N8, gaining) and
-      // nothing the client accepts is dropped (N10).
+      // nothing the client accepts is dropped (N8, losing).
       return isUsableMessageId(frame.id) && isUsableMessageId(frame.turnId)
         ? {
             kind: "tool",
@@ -582,7 +582,7 @@ export function journalEventForOutbound(
       // the payload is either enumerated (`kind`, `options[].decision`) or
       // free text the client renders as-is with no non-empty requirement (the
       // live `case "approval_request"` defaults each of them, `title: msg.title ?? ""`).
-      // Refusing a blank title here would drop a card live rendered (N10).
+      // Refusing a blank title here would drop a card live rendered (N8, losing).
       return isUsableMessageId(frame.id)
         ? {
             kind: "approval",
