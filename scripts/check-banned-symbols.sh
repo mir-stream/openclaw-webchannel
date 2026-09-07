@@ -15,7 +15,7 @@ cd "$REPO"
 PATTERN='WebChannelClient|WebChannelTransport|handleUpgrade|[?]ticket=|key_exchange|devOpen|DEV_OPEN|subscribeWildcard|handleHandshake|resolveAdmissionMode|devOpenAgentIdentity'
 
 if git grep -nE --untracked "$PATTERN" -- \
-  packages examples demo e2e .ouroboros README.md CHANGELOG.md docs .github scripts \
+  packages examples demo e2e README.md CHANGELOG.md docs .github scripts \
   ':(exclude)packages/plugin/src/account-config.ts' \
   ':(exclude)packages/plugin/src/account-config.test.ts' \
   ':(exclude)packages/plugin/src/nats-credential-source.ts' \

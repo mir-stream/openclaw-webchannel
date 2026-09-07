@@ -347,7 +347,7 @@ describe("journalEventForOutbound returns null for every non-durable frame", () 
     // #244 half B: a `difference` is a server→client REPLAY of events the store
     // already holds — journaling it would write the store's own output back in,
     // exactly like `history`. NOT seq-bearing either (the drift describe pins that).
-    ["difference (a REPLAY — never durable)", { type: "difference", events: [] }],
+    ["difference (a REPLAY — never durable)", { type: "difference", afterSeq: 0, nonce: "n0", events: [], partial: false, maxSeq: 0 }],
     // #245 Part B: a `user_committed` is the multi-device BROADCAST of a user event
     // the store ALREADY committed (`appendInboundUser`) — journaling it would write
     // the store's own output back in, exactly like `difference`/`history`. NOT
@@ -742,7 +742,7 @@ describe("#244 half A — isSeqBearingFrame tracks the mapper's non-null set", (
     ack: { type: "ack", ids: [] },
     inbound_rejected: { type: "inbound_rejected", ids: [], reason: "overloaded" },
     // #244 half B — a REPLAY frame; mapper returns null, predicate must reject.
-    difference: { type: "difference", events: [] },
+    difference: { type: "difference", afterSeq: 0, nonce: "n0", events: [], partial: false, maxSeq: 0 },
     // #245 Part B — a BROADCAST of an already-committed event; mapper returns null,
     // predicate must reject (its seq is set at construction, not stamped here).
     user_committed: { type: "user_committed", id: "webchannel-user-1", text: "hi", seq: 1 },

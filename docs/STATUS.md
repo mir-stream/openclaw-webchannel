@@ -12,8 +12,8 @@ superseded the 2026-07-01 snapshot, which predated register-over-NATS, the showc
 multi-device, the setup wizard, publishing, and the delivered-issuer fix)._
 
 This document supersedes any "AC 100% / complete / verified" claim found in commit messages,
-Ouroboros seeds (`.ouroboros/*`), evaluator scores, or older notes. Where those conflict with
-this file, **this file is correct.**
+historical plans, evaluator scores, or older notes. Where those conflict with this file,
+**this file is correct.**
 
 > **Branch note:** `main` and `develop` are converged (merged `--no-ff`, both E2E-gate GREEN:
 > develop `79f082e`+`7603b85`, main `9a157eb`). Feature history flowed
