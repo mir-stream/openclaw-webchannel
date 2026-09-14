@@ -94,6 +94,7 @@ long-lived branches:
 | Device-flow enrollment + `channels add` wizard (config-only interactive; `--flag` form enrolls) | `setup-wizard.ts` + Gate A preflight; AC6 real-HTTP device-flow E2E; `run-enrolled-transport` real-NATS harness |
 | Multi-device conversation keys (wrap-delivered at register; no registration on register path) | `conversation-key-store.ts`, `nats-client-wrapped-key.test.ts` (fail-closed terminals), `demo/verify-multidevice.mjs` 6/6 |
 | Multi-account multiplex + accountId-aware approvals | `multiplex.ts`, `approvals.ts` (+3-lens adversarial review F1/F2 fixed); `demo/verify-multiplex.mjs`, `demo/multiplex.sh` |
+| Account-selected outbound sends (both core send surfaces resolve `ctx.accountId`'s live runtime — tenant, key, journal, subject; no fallback to another account; listed default for unscoped sends) | `outbound-account.ts`, `nats-account-runtime.test.ts` (#371 describe), PR #376 |
 | JWKS rotation + eviction (admin-driven, 500→401 fix) | `jwks.ts`; `demo/verify-rotate.mjs`, `verify-evict.mjs` |
 | Trust chain, NATS user-cred minting, external (Synadia/NGS) account signing | `packages/saas`; `external-nats-account.test.ts`, `nats-permissions-realserver.test.ts`; demo `DEMO_RELAY=synadia` live |
 | Public API boundary (barrel = contract; internals unreachable) | `examples/minimal-consumer/test/boundary.test.mjs`, `examples/webchannel-app/test/no-internal-imports.test.mjs` (CI) |
@@ -103,7 +104,7 @@ long-lived branches:
 
 | Gap | Detail |
 |---|---|
-| **S1 outbound facade** (proactive/approval outbound is primary-account-only) | Cross-account disclosure risk on the agent-initiated leg; the approvals half is done, the outbound facade is the open half. [`BACKLOG.md`](BACKLOG.md) §S1. |
+| **S1 residual — unscoped agent-initiated approvals** | An approval carrying neither `turnSourceAccountId` nor a session-bound account is claimed by every LIVE account's handler, so it fans out to all of them (reachable only from agent-initiated/cron approvals; a user turn always carries the account). [`BACKLOG.md`](BACKLOG.md) §S1 F3. |
 | **C2 (unauthenticated registration) — residual scope only** | Closed on the production register path (conversation key is register-delivered to the JWT-attested device key; `handshake-verifier` deleted). Register-hop is now the sole admission path; the residual is the accepted-risk/untrusted-relay caveat there (the relay carries the admission frames but cannot forge admission). [`BACKLOG.md`](BACKLOG.md) §C2. |
 | Direct gateway transport removal | ✅ complete; browser traffic uses the NATS relay only. |
 | Demo/reference server hardening (review SEC1/2/5) | The reference/demo SaaS servers are deliberately demo-grade (in-memory stores, printed admin token); production-hardening rewrite is a pending decision. |

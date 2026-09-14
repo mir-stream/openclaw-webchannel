@@ -1,6 +1,18 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { ChannelOutboundContext } from "openclaw/plugin-sdk/channel-contract";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import WebSocket from "ws";
 
+import { NatsChannel } from "./nats-channel.js";
+import { ConversationKeyStore } from "./conversation-key-store.js";
+import { openDeliveryJournal } from "./delivery-journal.js";
+import { tupleStoragePaths } from "./storage-paths.js";
+import { generateKeyPair } from "./e2e-crypto.js";
+import { openEnvelope } from "./e2e-session.js";
 import {
   NatsConnectionClosedError,
   NatsHandshakeTimeoutError,
@@ -25,6 +37,7 @@ import {
   connectedPublishedAccountIds,
   createAccountExecutionApi,
   createAttemptAbortScope,
+  createNatsWebChannelPlugin,
   formatRelayOrigin,
   fullJitterDelayMs,
   notifyAccountQuarantine,
@@ -32,9 +45,216 @@ import {
   resolveAccountPublicationFailure,
   resolvePrivateReadiness,
   runAccountStartupLoop,
-  selectPrimaryRuntime,
   shouldLogRetryAttempt,
 } from "./nats-account-runtime.js";
+
+describe("outbound account selection through the production NATS facade (#371)", () => {
+  const peerId = "shared-peer";
+  const cleanups: Array<() => void> = [];
+  afterEach(() => {
+    for (const cleanup of cleanups.splice(0).reverse()) cleanup();
+  });
+
+  class RecordingTransport extends EventEmitter {
+    connected = true;
+    effectiveOutboundLimit = 1_000_000;
+    frames: Array<{ subject: string; payload: Buffer }> = [];
+    subscribe(): number { return 1; }
+    unsubscribe(): void {}
+    publish(subject: string, payload: string | Uint8Array): void {
+      this.frames.push({ subject, payload: Buffer.from(payload) });
+    }
+  }
+
+  function runtime(accountId: string, tenant: string, peers = [peerId]) {
+    const root = mkdtempSync(join(tmpdir(), "webchannel-outbound-account-"));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const scope = { accountId, tenant, storageRoot: root, home: root };
+    const keyStore = new ConversationKeyStore(scope);
+    const journal = openDeliveryJournal({ databasePath: tupleStoragePaths(scope).deliveryJournalPath });
+    cleanups.push(() => journal.close());
+    const transport = new RecordingTransport();
+    const channel = new NatsChannel(
+      transport as unknown as NatsTransport, accountId, tenant,
+      { keyStore, identityKeyPair: generateKeyPair() }, undefined,
+      { deliveryJournal: journal },
+    );
+    cleanups.push(() => channel.dispose());
+    for (const peer of peers) channel.registerPeer(peer);
+    return { accountId, tenant, keyStore, journal, transport, channel };
+  }
+
+  type Runtime = ReturnType<typeof runtime>;
+  function config(ids: string[], defaultAccount?: string): OpenClawConfig {
+    return { channels: { webchannel: {
+      accounts: Object.fromEntries(ids.map((id) => [id, { dmSecurity: "allowlist", allowFrom: [id] }])),
+      ...(defaultAccount === undefined ? {} : { defaultAccount }),
+    } } };
+  }
+
+  const senders = ["outbound", "message"] as const;
+  async function send(
+    plugin: ReturnType<typeof createNatsWebChannelPlugin>,
+    seam: typeof senders[number],
+    cfg: OpenClawConfig,
+    accountId?: string | null,
+    to = peerId,
+  ) {
+    const ctx = { cfg, to, text: "account-private message", accountId } satisfies ChannelOutboundContext;
+    if (seam === "outbound") return (await plugin.outbound!.sendText!(ctx)).messageId;
+    const result = await plugin.message!.send!.text!(ctx);
+    expect(result.receipt.primaryPlatformMessageId).toBe(result.messageId);
+    return result.messageId;
+  }
+
+  function expectDelivered(target: Runtime, id: string | undefined, peer = peerId) {
+    expect(id).toEqual(expect.stringMatching(/\S/));
+    expect(target.transport.frames).toHaveLength(1);
+    const frame = target.transport.frames[0];
+    expect(frame.subject).toBe(`webchannel.${target.tenant}.${target.accountId}.${peer}.out`);
+    expect(frame.payload.toString()).not.toContain("account-private message");
+    const decrypted = openEnvelope(frame.payload, target.keyStore.getOrCreate(peer));
+    expect(decrypted.routing).toMatchObject({ tenant: target.tenant, accountId: target.accountId, sub: peer });
+    expect(decrypted.message).toMatchObject({ type: "agent_message", id, text: "account-private message" });
+    expect(target.journal.read(peer).map((row) => row.event)).toEqual([
+      { kind: "bubble", answerId: id, text: "account-private message" },
+    ]);
+  }
+
+  function expectUntouched(target: Runtime, peer = peerId) {
+    expect(target.transport.frames).toEqual([]);
+    expect(target.journal.read(peer)).toEqual([]);
+  }
+
+  describe.each(senders)("%s", (seam) => {
+    it.each(["tenant-a", "tenant-b"])("isolates a shared peer when the requested tenant is %s", async (tenant) => {
+      const primary = runtime("default", "tenant-a");
+      const named = runtime("other", tenant);
+      const runtimes = new Map([["default", primary], ["other", named]]);
+      const plugin = createNatsWebChannelPlugin(runtimes);
+      const id = await send(plugin, seam, config([...runtimes.keys()]), "other");
+      expectDelivered(named, id);
+      expectUntouched(primary);
+      expect(() => openEnvelope(named.transport.frames[0].payload, primary.keyStore.getOrCreate(peerId))).toThrow();
+    });
+
+    it("sends to a peer registered only on the requested account", async () => {
+      const primary = runtime("default", "tenant-a", []);
+      const named = runtime("other", "tenant-b", ["named-only"]);
+      const plugin = createNatsWebChannelPlugin(new Map([["default", primary], ["other", named]]));
+      const id = await send(plugin, seam, config(["default", "other"]), "other", "named-only");
+      expectDelivered(named, id, "named-only");
+      expectUntouched(primary, "named-only");
+    });
+
+    it.each([
+      // An unresolvable runtime is refused before the send; a resolvable but
+      // dead one is refused by the send itself. Neither reaches a sibling.
+      { state: "absent", rejects: /not running/ },
+      { state: "removed", rejects: /not running/ },
+      { state: "disposed", rejects: /returned false/ },
+      { state: "disconnected", rejects: /returned false/ },
+    ])("refuses a $state target without falling back", async ({ state, rejects }) => {
+      const primary = runtime("default", "tenant-a");
+      const named = runtime("other", "tenant-b");
+      const runtimes = new Map([["default", primary]]);
+      if (state !== "absent") runtimes.set("other", named);
+      const plugin = createNatsWebChannelPlugin(runtimes);
+      if (state === "removed") { runtimes.delete("other"); named.channel.dispose(); }
+      if (state === "disposed") named.channel.dispose();
+      if (state === "disconnected") named.transport.connected = false;
+      await expect(send(plugin, seam, config(["default", "other"]), "other")).rejects.toThrow(rejects);
+      expectUntouched(primary);
+      expectUntouched(named);
+    });
+
+    it("delivers on the listed spelling when core canonicalizes the account id", async () => {
+      const primary = runtime("default", "tenant-a");
+      const named = runtime("Acme", "tenant-b");
+      const plugin = createNatsWebChannelPlugin(new Map([["default", primary], ["Acme", named]]));
+      // Core starts the account as listed but canonicalizes the id on its
+      // core-initiated send paths, so `ctx.accountId` arrives lowercased.
+      expectDelivered(named, await send(plugin, seam, config(["default", "Acme"]), "acme"));
+      expectUntouched(primary);
+    });
+
+    it("refuses a canonical account id no running runtime answers", async () => {
+      const primary = runtime("default", "tenant-a");
+      const plugin = createNatsWebChannelPlugin(new Map([["default", primary]]));
+      await expect(send(plugin, seam, config(["default", "Acme"]), "acme")).rejects.toThrow(/not running/);
+      expectUntouched(primary);
+    });
+
+    it.each([undefined, null])("honors configured defaultAccount for accountId=%s", async (accountId) => {
+      const primary = runtime("default", "tenant-a");
+      const named = runtime("other", "tenant-b");
+      const plugin = createNatsWebChannelPlugin(new Map([["default", primary], ["other", named]]));
+      const cfg = config(["default", "other"], "other");
+      const id = await send(plugin, seam, cfg, accountId);
+      expectDelivered(named, id);
+      expectUntouched(primary);
+      expect(plugin.config.defaultAccountId!(cfg)).toBe("other");
+      expect(plugin.config.resolveAccount(cfg, accountId)).toMatchObject({ accountId: "other", allowFrom: ["other"] });
+      expect(plugin.config.inspectAccount!(cfg, accountId)).toMatchObject({ configured: true });
+    });
+
+    it("preserves explicit default even when configured defaultAccount names another account", async () => {
+      const primary = runtime("default", "tenant-a");
+      const named = runtime("other", "tenant-b");
+      const plugin = createNatsWebChannelPlugin(new Map([["default", primary], ["other", named]]));
+      expectDelivered(primary, await send(plugin, seam, config(["default", "other"], "other"), "default"));
+      expectUntouched(named);
+    });
+
+    it.each([
+      { ids: ["default"], preferred: undefined, target: "default" },
+      { ids: ["other", "default"], preferred: undefined, target: "default" },
+      { ids: ["zulu", "alpha"], preferred: undefined, target: "alpha" },
+      { ids: ["zulu", "alpha"], preferred: "unknown", target: "alpha" },
+      { ids: ["default", "Acme"], preferred: "Acme", target: "Acme" },
+    ])("selects the configured default deterministically: $ids / $preferred", async ({ ids, preferred, target }) => {
+      const runtimes = new Map(ids.map((id) => [id, runtime(id, "tenant-a")]));
+      const plugin = createNatsWebChannelPlugin(runtimes);
+      const cfg = config(ids, preferred);
+      expectDelivered(runtimes.get(target)!, await send(plugin, seam, cfg));
+      expect(plugin.config.defaultAccountId!(cfg)).toBe(target);
+      for (const [id, account] of runtimes) if (id !== target) expectUntouched(account);
+    });
+
+    it.each([undefined, null])("keeps flat configuration on default for accountId=%s", async (accountId) => {
+      const account = runtime("default", "tenant-a");
+      const plugin = createNatsWebChannelPlugin(new Map([["default", account]]));
+      const cfg: OpenClawConfig = { channels: { webchannel: { dmSecurity: "allowlist" } } };
+      expectDelivered(account, await send(plugin, seam, cfg, accountId));
+      expect(plugin.config.defaultAccountId!(cfg)).toBe("default");
+    });
+
+    it("does not choose a live sibling when the configured default has not started", async () => {
+      const primary = runtime("default", "tenant-a");
+      const plugin = createNatsWebChannelPlugin(new Map([["default", primary]]));
+      await expect(send(plugin, seam, config(["default", "other"], "other"))).rejects.toThrow(/not running/);
+      expectUntouched(primary);
+    });
+
+    it("resolves runtime replacement including a new tenant on every send", async () => {
+      const primary = runtime("default", "tenant-a");
+      const old = runtime("other", "tenant-b");
+      const runtimes = new Map([["default", primary], ["other", old]]);
+      const plugin = createNatsWebChannelPlugin(runtimes);
+      const cfg = config([...runtimes.keys()]);
+      expectDelivered(old, await send(plugin, seam, cfg, "other"));
+      old.channel.dispose();
+      runtimes.delete("other");
+      await expect(send(plugin, seam, cfg, "other")).rejects.toThrow(/not running/);
+      const replacement = runtime("other", "tenant-c");
+      runtimes.set("other", replacement);
+      expectDelivered(replacement, await send(plugin, seam, cfg, "other"));
+      expect(old.transport.frames).toHaveLength(1);
+      expect(old.journal.read(peerId)).toHaveLength(1);
+      expectUntouched(primary);
+    });
+  });
+});
 
 class ImmediateCloseWebSocket {
   readyState: number = WebSocket.CONNECTING;
@@ -729,15 +949,6 @@ describe("account serving aggregate", () => {
 });
 
 describe("NatsAccountRuntimeCoordinator", () => {
-  it("selects default dynamically, else the lexicographically smallest serving id", () => {
-    const runtimes = new Map([["z", 3], ["b", 2]]);
-    expect(selectPrimaryRuntime(runtimes)).toBe(2);
-    runtimes.set("default", 1);
-    expect(selectPrimaryRuntime(runtimes)).toBe(1);
-    runtimes.delete("default"); runtimes.delete("b");
-    expect(selectPrimaryRuntime(runtimes)).toBe(3);
-  });
-
   it("deduplicates consecutive structural installs but keeps A-B-A monotone", () => {
     const coordinator = new NatsAccountRuntimeCoordinator();
     expect(coordinator.installFull({ registrationMode: "tool-discovery", config: { a: 1 }, runtime: 0, logger: 0 })).toBeUndefined();

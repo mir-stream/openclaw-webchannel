@@ -112,7 +112,7 @@
     "packages/plugin/src/message-adapter.test.ts": 179,
     "packages/plugin/src/multidevice-broadcast.test.ts": 12,
     "packages/plugin/src/multiplex.test.ts": 21,
-    "packages/plugin/src/nats-account-runtime.test.ts": 38,
+    "packages/plugin/src/nats-account-runtime.test.ts": 79,
     "packages/plugin/src/nats-channel-ack.test.ts": 8,
     "packages/plugin/src/nats-channel-admission-boundary.test.ts": 4,
     "packages/plugin/src/nats-channel-commands.test.ts": 4,

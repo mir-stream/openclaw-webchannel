@@ -101,10 +101,9 @@ import { logSafe } from "./log-safe.js";
 /**
  * Resolve the transport a given account's approval frames should ride. `null`/
  * `undefined` accountId means "unscoped" (legacy single-account callers); a
- * resolver may map that to the default account. Returning `undefined` makes the
- * caller fall back to the capability's closure-bound transport (the single-
- * account / legacy-WS path), so a missing resolver or unknown account degrades
- * to today's behavior instead of dropping the frame.
+ * resolver may map that to the default account. With a resolver wired,
+ * `undefined` FAILS CLOSED — the frame is dropped rather than misrouted; only a
+ * resolver-less single-transport wiring uses the closure-bound transport.
  */
 export type ResolveAccountTransport = (
   accountId: string | null | undefined,
@@ -841,11 +840,11 @@ export function createClawApprovalNativeRuntimeSpec(
   //
   // FAIL-CLOSED (adversarial-round F2): when a resolver IS wired (the NATS
   // multi-account entry), a MISS returns `undefined` and the caller DROPS the
-  // frame — it must NEVER fall back to the closure `transport` (the primary
-  // channel), or an account that `registerFull` skipped (creds-missing /
-  // connect-fail) would have its prompt delivered on the PRIMARY account's
-  // channel — re-opening the exact cross-account misroute S1 closes. Only a
-  // resolver-less single-channel wiring uses the closure transport, where
+  // frame — it must NEVER fall back to the closure `transport`, or an account
+  // that `registerFull` skipped (creds-missing / connect-fail) would have its
+  // prompt delivered on ANOTHER account's channel — re-opening the exact
+  // cross-account misroute S1 closes. Only a resolver-less single-channel
+  // wiring uses the closure transport, where
   // there is exactly one account and no misroute is possible.
   const hasResolver = typeof resolveAccountTransport === "function";
   const transportFor = (
@@ -942,14 +941,14 @@ export function createClawApprovalNativeRuntimeSpec(
         const channel = transportFor(accountId);
         if (!channel) {
           // F2 fail-closed: no live channel for this account (skipped/unknown).
-          // Refuse to misroute onto the primary channel; drop with a warn.
+          // Refuse to misroute onto the closure transport; drop with a warn.
           //
           // ⚠️ THIS BRANCH WRITES NO DURABLE ROW *YET*, AND THE DELAY IS THE
           // DESIGN. The delivery journal is opened per account by
           // `nats-account-runtime.ts` and handed to that account's channel, so
           // "no live channel for this account" means "no journal for this
           // account" — there is nowhere to write. Journaling onto the
-          // closure/primary channel instead would file one account's card in
+          // closure transport instead would file one account's card in
           // another account's history, which is worse than waiting.
           //
           // It does NOT leave the card unstorable, which is what round 1 of #341

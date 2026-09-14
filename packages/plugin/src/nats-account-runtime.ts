@@ -12,6 +12,7 @@
 import { fileURLToPath } from "node:url";
 
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
+import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 
 import { NatsChannel } from "./nats-channel.js";
 import type { RegisterChannelSurface } from "./nats-channel.js";
@@ -76,7 +77,7 @@ import { handleRegisterRequest } from "./nats-register.js";
 import { resolveHistoryConfig } from "./history.js";
 import { createHistoryServer, type HistoryServer } from "./history-serve.js";
 import { createCommandCatalogProvider } from "./commands-catalog.js";
-import { WEBCHANNEL_ID, type WebChannelPeerChannel } from "./channel-contract.js";
+import { WEBCHANNEL_ID, NullPeerChannel } from "./channel-contract.js";
 import {
   NatsConnectionClosedError,
   type NatsTransport,
@@ -125,7 +126,6 @@ import {
   resolveAccountPublicationFailure,
   runAccountStartupLoop,
   resolvePrivateReadiness,
-  selectPrimaryRuntime,
   shouldLogRetryAttempt,
   waitForAbort,
 } from "./nats-account-coordinator.js";
@@ -160,7 +160,6 @@ export {
   runAccountStartupLoop,
   resolvePrivateReadiness,
   retryCeilingMs,
-  selectPrimaryRuntime,
   shouldLogRetryAttempt,
   waitForAbort,
 } from "./nats-account-coordinator.js";
@@ -287,47 +286,37 @@ function reportServingAggregate(api: any): void {
   });
 }
 
-/**
- * Lazy transport facade.
- *
- * `createWebChannelPlugin` needs a transport at module-load time, but in NATS
- * mode the real `NatsChannel` only exists after its account lifecycle commits.
- * This Proxy forwards every transport method call to the live
- * `NatsChannel` once it is bound; before binding, method calls are no-ops
- * returning `false`. `NatsChannel` implements the outbound surface the plugin's
- * message/outbound adapters use (sendText, sendProgress, finalizeDraft,
- * sendTyping, sendApprovalRequest/Resolved — see `WebChannelPeerChannel`).
- */
-let boundChannel: NatsChannel | null = null;
-function rebindPrimary(): void {
-  const primary = selectPrimaryRuntime(accountRuntimes);
-  boundChannel = primary?.channel ?? null;
+/** Build the production facade over the account lifecycle's live runtime map. */
+export function createNatsWebChannelPlugin(
+  runtimes: ReadonlyMap<string, Pick<AccountRuntime, "channel">>,
+  opts?: Omit<
+    NonNullable<Parameters<typeof createWebChannelPlugin>[1]>,
+    "resolveApprovalTransport" | "resolveOutboundTransport"
+  >,
+) {
+  // Core starts our accounts under the id as LISTED in config ("Acme"), but
+  // canonicalizes the id on its core-initiated send paths (the agent `message`
+  // tool, heartbeat targets, routed replies), so `ctx.accountId` can arrive as
+  // "acme". Match the exact key first, then the canonical form. Within one
+  // config generation this is unambiguous: `inspectWebchannelAccountIds` rejects
+  // every configured id that shares a `normalizeAccountId` result, so at most
+  // one runtime can match.
+  const resolveOutboundRuntime = (accountId: string) => {
+    const exact = runtimes.get(accountId);
+    if (exact) return exact;
+    const canonical = normalizeAccountId(accountId);
+    for (const [id, runtime] of runtimes) if (normalizeAccountId(id) === canonical) return runtime;
+    return undefined;
+  };
+  // Both capabilities use live account resolvers; there is no primary binding.
+  return createWebChannelPlugin(new NullPeerChannel(), {
+    ...opts,
+    resolveOutboundTransport: (accountId) => resolveOutboundRuntime(accountId)?.channel,
+    resolveApprovalTransport: (accountId) => runtimes.get(accountId ?? "default")?.channel,
+  });
 }
 
-const lazyTransport: WebChannelPeerChannel = new Proxy({} as WebChannelPeerChannel, {
-  get(_t, prop) {
-    const target = boundChannel as unknown as Record<string, unknown> | null;
-    if (!target) return () => false;
-    const value = target[prop as string];
-    return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
-  },
-});
-
-/**
- * Create the WebChannel plugin, backed by the lazy NATS transport facade.
- *
- * S1 (accountId-aware approvals): the approval capability additionally gets a
- * PER-ACCOUNT transport resolver over `accountRuntimes`, so each account's
- * native approval handler (core starts one per configured account) delivers
- * and finalizes prompts on ITS OWN channel — never the primary facade. The
- * resolver reads the live map at call time (each account lifecycle publishes
- * only after its private wiring fence); an unscoped (null) context reads the
- * `"default"` account, and an unknown account falls back to the lazy facade
- * inside the capability (legacy primary behavior, never a dropped frame).
- */
-const webChannelPlugin = createWebChannelPlugin(lazyTransport, {
-  resolveApprovalTransport: (accountId) =>
-    accountRuntimes.get(accountId ?? "default")?.channel,
+const webChannelPlugin = createNatsWebChannelPlugin(accountRuntimes, {
   startNatsAccount: (ctx) => startNatsAccountLifecycle(ctx),
   onInvalidAccountId: (_cfg, invalid) => {
     const install = accountCoordinator.currentInstall();
@@ -1610,8 +1599,6 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         if (runtimeRef && accountRuntimes.get(accountId) === runtimeRef) accountRuntimes.delete(accountId);
         published = false;
         try { reportServingAggregate(api); } catch { /* rollback continues */ }
-        if (boundChannel === channel) boundChannel = null;
-        try { rebindPrimary(); } catch { boundChannel = null; }
         setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: failedAttempts, lastError: "account publication rolled back" }));
       };
       let publicationFailureState: {
@@ -1648,7 +1635,6 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             };
             accountRuntimes.set(accountId, runtimeRef);
             published = true;
-            rebindPrimary();
             return runtimeRef;
           },
           writeServingStatus: () => writeStatus({
@@ -1697,8 +1683,6 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         accountRuntimes.delete(accountId);
         published = false;
         reportServingAggregate(api);
-        if (boundChannel === channel) boundChannel = null;
-        try { rebindPrimary(); } catch { boundChannel = null; }
         setStatus({ connected: false, restartPending: false, reconnectAttempts: 0, lastError: null });
       }
       const disposeReport = await dispose();

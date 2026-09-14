@@ -44,6 +44,7 @@ import {
   DEFAULT_ACCOUNT_ID,
   normalizeAccountId,
 } from "openclaw/plugin-sdk/account-id";
+import { resolveListedDefaultAccountId } from "openclaw/plugin-sdk/account-core";
 
 import {
   assertValidAccountId,
@@ -364,6 +365,17 @@ function assertNoRemovedConfig(account: WebchannelAccountConfig): void {
  */
 export function listWebchannelAccountIds(cfg: unknown): string[] {
   return inspectWebchannelAccountIds(cfg).validIds;
+}
+
+/** Select from configuration, so unavailable accounts never redirect a send. */
+export function resolveDefaultWebchannelAccountId(cfg: unknown): string {
+  const preferred = readWebchannelSection(cfg)?.defaultAccount;
+  return resolveListedDefaultAccountId({
+    accountIds: listWebchannelAccountIds(cfg),
+    configuredDefaultAccountId: typeof preferred === "string" ? preferred.trim() : undefined,
+    // Unlike Telegram bot aliases, these ids are exact storage/subject identities.
+    normalizeListedAccountId: (id) => id,
+  });
 }
 
 /**
