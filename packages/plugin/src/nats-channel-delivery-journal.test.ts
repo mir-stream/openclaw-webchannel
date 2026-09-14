@@ -1,61 +1,5 @@
-/**
- * v6 #239 half 2 — the EGRESS persist-before-publish seam.
- *
- * `NatsChannel.sendToPeer` is the single outbound choke point, and this slice
- * gives the delivery journal its first call site there: every durable frame is
- * committed to the plugin-owned store BEFORE it is published (NOT-list N6, doc
- * §16.2-2, which deliberately reverses v5 §15.8's commit-after).
- *
- * What these pin, and why each one is here rather than "obvious":
- *
- *  - ORDER, on ONE interleaved log. The fake journal and the fake transport
- *    record into the SAME array, so "the append happened first" is a fact about
- *    a single sequence rather than an inference from two spies' call counts —
- *    which is exactly the inference that would keep passing if the hook were
- *    moved below the publish.
- *  - The journal cannot THROW into the send, and a journal FAULT must not block
- *    the push; since #347, whether a row was COMMITTED is exactly what decides
- *    what a later publish failure reports (see the commit-then-throw test).
- *    §15.8 names the forbidden `false` (it rolls back the caller's
- *    reservation and retries the content under a DIFFERENT id); a throw is worse
- *    because `message-adapter.ts`'s delivery path moves a thrown send to `failed`
- *    and never re-sends it. Both the mapper and `append` are covered.
- *  - REFUSAL vs FAILED WRITE, which is the distinction the hook's position
- *    encodes. A send we DECLINE to attempt (transport down, no session key yet)
- *    is journaled NOT AT ALL, because all three refusal checks sit ABOVE
- *    `journalOutbound`. A wire write that THROWS after the commit IS journaled,
- *    and that is the window §16.2-2 is actually about — and since #347 it is
- *    also a SUCCESSFUL send: the row is in the SSOT, it holds a `seq`, and a
- *    #362-model cursor heals the frame it never received with `get_difference`
- *    (an oversize row, #325, is the one shape no path carries). A publish
- *    throw on a frame that got NO row still returns `false`, because there is
- *    nothing for gap-sync to serve — a non-durable type, an id-less durable
- *    frame, or one whose journal write faulted. Both sides are pinned below.
- *    ⚠️ EXCEPT FOR THE TWO APPROVAL FRAMES (#341), WHICH THIS FILE ALSO PINS.
- *    `approval_request`/`approval_resolved` are appended by
- *    `publishApprovalFrame` BEFORE `sendToPeer` is called, so a refused approval
- *    push DOES get its row — deliberately, because the approval's state exists
- *    server-side whether or not the push lands and the id is core's, stable
- *    across attempts. The `#341` describe block below asserts that direction;
- *    the refusal tests above it are `sendText` and stay as they are.
- *    Approval results keep delivery and storage separate: a failed push still
- *    reports `delivered: false` even when `journaled` is true.
- *    ⚠️ WHY the refusal side is not simply fixed — and why #304's residual is
- *    deferred rather than patched — is the GENERAL rule, and it is stated ONCE,
- *    at `message-adapter.ts`'s `lastDeliveredText` declaration. This docblock
- *    used to restate it and no longer does: the version it carried was an
- *    id-re-minting argument that reads as general but describes only
- *    `reserveProvisional`'s PLACEMENT path, and this file now also owns the #242
- *    reasoning characterization tests, where it is false.
- *    ⚠️ TWO PLACEMENT-SCOPED STATEMENTS DO REMAIN IN THIS FILE, and they are
- *    TRUE where they sit — the `placement{X₁},{X₂},{X₃}` argument on the
- *    disconnected-refusal test, and "the client never saw this text either" on
- *    the fail-closed one. Both are about a refused `sendText`, where the peer
- *    genuinely received nothing. DO NOT GENERALISE EITHER to the reasoning close
- *    frame, which carries `lastDeliveredText` — text the peer IS rendering. Four
- *    wrong generalisations of this rule have shipped; that is the failure mode.
- *  - One test against a REAL journal, because the two halves of #239 shipped
- *    separately and nothing else proves they compose.
+/** Egress acceptance: commit before push, explicit store failure, stable identity,
+ * policy-excluded previews, lifecycle/key fences and approval dual outcomes.
  */
 
 import { EventEmitter } from "node:events";
@@ -73,6 +17,7 @@ import {
 } from "./delivery-journal.js";
 import type { JournalEvent } from "./delivery-journal-event.js";
 import { createReasoningDraftController } from "./message-adapter.js";
+import { DurableSendError } from "./durable-send-error.js";
 import { NatsChannel } from "./nats-channel.js";
 import type { NatsTransport } from "./nats-transport.js";
 
@@ -391,46 +336,28 @@ describe("#239 — egress persist-before-publish", () => {
     ]);
   });
 
-  it("publishes and returns true when append throws, warning once and suppressing the repeat", () => {
+  it("refuses the push when append throws, reporting each error and throttling diagnostics", () => {
     const { calls, channel, journal } = makeChannel();
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
     journal.throwOnAppend = true;
 
-    // §15.8's forbidden outcome: a `false` here would roll the caller's
-    // reservation back and make it retry the same text under a new id.
-    expect(channel.sendText(PEER, "hello", "a-1")).toBe(true);
-    expect(channel.sendText(PEER, "hello again", "a-2")).toBe(true);
+    expect(() => channel.sendText(PEER, "hello", "a-1")).toThrow(DurableSendError);
+    expect(() => channel.sendText(PEER, "hello again", "a-2")).toThrow(DurableSendError);
 
-    expect(calls).toEqual([
-      { call: "publish", subject: OUT, type: "agent_message" },
-      { call: "publish", subject: OUT, type: "agent_message" },
-    ]);
-    // Rate-limited: the second failure inside the 60 s window is counted, not
-    // logged. Category, peer, and the value-free SQLite status only — never the
-    // message text, and never `error.message` (free-form; see
-    // `journalFailureDiagnostic`'s measurement).
+    expect(calls).toEqual([]);
     expect(warn).toHaveBeenCalledTimes(1);
     const line = warn.mock.calls[0][0] as string;
-    expect(line).toContain("[nats-channel] delivery journal append-failed");
-    expect(line).toContain("the send result is unchanged");
-    expect(line).toContain("suppressed=0");
+    expect(line).toContain('[nats-channel] delivery journal "append-failed"');
+    expect(line).toContain("durable send refused");
+    expect(line).toContain('suppressed="0"');
     expect(line).not.toContain("hello");
     expect(line).not.toContain("journal unavailable");
     warn.mockRestore();
   });
 
-  it("isolates a throw from the MAPPER, not just from append", () => {
-    // The failure-isolation `try` covers the whole journal write path. Driven
-    // through the real public API with a malformed `remove`, which reaches
-    // `journalEventForOutbound`'s `[...frame.remove]` and throws a TypeError —
-    // i.e. no stubbing, a real throw on the real path.
-    //
-    // Why it matters more than a `false` return: `sendToPeer`'s callers are
-    // written for a boolean, and `message-adapter.ts`'s delivery comment spells
-    // out that a THROWN send moves the message to `failed` and never re-sends
-    // it. A shadow store must not be able to lose a message.
+  it("reports a mapper failure as a durable send error", () => {
     const { calls, channel } = makeChannel();
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
 
     expect(() =>
       channel.sendTurnSnapshot(
@@ -439,32 +366,21 @@ describe("#239 — egress persist-before-publish", () => {
         [{ id: "a-1", text: "final" }],
         undefined as never,
       ),
-    ).not.toThrow();
+    ).toThrow(DurableSendError);
 
     expect(appends(calls)).toEqual([]);
-    expect(calls).toEqual([
-      { call: "publish", subject: OUT, type: "turn_snapshot" },
-    ]);
+    expect(calls).toEqual([]);
     expect(warn).toHaveBeenCalledTimes(1);
     const line = warn.mock.calls[0][0] as string;
-    expect(line).toContain("[nats-channel] delivery journal append-failed");
-    // A plain TypeError carries no SQLite status, and its free-form message
-    // stays out of the log either way.
-    expect(line).toContain('code="<none>"');
+    expect(line).toContain('[nats-channel] delivery journal "append-failed"');
+    expect(line).toContain('code=\\"<none>\\"');
     expect(line).not.toContain("errcode=");
     warn.mockRestore();
   });
 
-  it("isolates a throw from reading the DIAGNOSTIC off a hostile error value", () => {
-    // The catch handler must itself be inside the mechanism it enforces:
-    // `journalFailureDiagnostic` reads `code`/`errcode`/`errstr` off an
-    // arbitrary caught value, so a throwing getter (or a Proxy trap) would
-    // escape `journalOutbound`'s catch and then `sendToPeer` — the same
-    // "permanently lost message" outcome the wide `try` exists to prevent.
-    // "Nothing throws from a getter today" was rejected for the mapper; it is
-    // rejected here too.
+  it("reports a durable send error even with a hostile diagnostic getter", () => {
     const { calls, channel, journal } = makeChannel();
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
     journal.throwOnAppend = true;
     journal.throwValue = Object.defineProperty(new Error("boom"), "code", {
       get() {
@@ -472,26 +388,14 @@ describe("#239 — egress persist-before-publish", () => {
       },
     });
 
-    expect(() => channel.sendText(PEER, "hostile", "a-1")).not.toThrow();
+    expect(() => channel.sendText(PEER, "hostile", "a-1")).toThrow(DurableSendError);
 
-    expect(calls).toEqual([
-      { call: "publish", subject: OUT, type: "agent_message" },
-    ]);
-    expect((warn.mock.calls[0][0] as string)).toContain('code="<unreadable>"');
+    expect(calls).toEqual([]);
+    expect((warn.mock.calls[0][0] as string)).toContain('code=\\"<unreadable>\\"');
     warn.mockRestore();
   });
 
   it("reports code AND the SQLite errcode/errstr pair of a real store failure", () => {
-    // ⚠️ THE POSITIVE FIXTURE FOR `errcode`/`errstr`. Without it both
-    // `parts.push` lines could be deleted and the suite stayed green — every
-    // other mention in this file is a `not.toContain`, and the append-after-close
-    // case below is the one measured shape that carries no errcode. A Node or
-    // node:sqlite change that stopped delivering `errcode` as a number would
-    // then ship silently.
-    //
-    // Recorded, not invented: the schema is dropped from a SECOND connection on
-    // the same file, which is measured row 2 of `journalFailureDiagnostic`'s
-    // table.
     const calls: Call[] = [];
     const transport = new RecordingTransport(calls);
     const root = mkdtempSync(join(tmpdir(), "webchannel-egress-journal-sql-"));
@@ -505,20 +409,17 @@ describe("#239 — egress persist-before-publish", () => {
       undefined,
       { deliveryJournal: journal },
     );
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
     const sidecar = new DatabaseSync(databasePath);
     sidecar.exec("DROP TABLE journal_event");
 
-    expect(channel.sendText(PEER, "schema pulled out", "a-1")).toBe(true);
+    expect(() => channel.sendText(PEER, "schema pulled out", "a-1")).toThrow(DurableSendError);
 
-    expect(calls).toEqual([
-      { call: "publish", subject: OUT, type: "agent_message" },
-    ]);
+    expect(calls).toEqual([]);
     const line = warn.mock.calls[0][0] as string;
-    expect(line).toContain('code="ERR_SQLITE_ERROR"');
+    expect(line).toContain('code=\\"ERR_SQLITE_ERROR\\"');
     expect(line).toContain("errcode=1");
-    expect(line).toContain('errstr="SQL logic error"');
-    // Free-form `message` and the frame's text both stay out.
+    expect(line).toContain('errstr=\\"SQL logic error\\"');
     expect(line).not.toContain("no such table");
     expect(line).not.toContain("schema pulled out");
     warn.mockRestore();
@@ -528,9 +429,6 @@ describe("#239 — egress persist-before-publish", () => {
   });
 
   it("reports code alone when the failure carries no SQLite status", () => {
-    // The complementary shape: node:sqlite's own state errors have no
-    // errcode/errstr, so the diagnostic must degrade to `code` rather than print
-    // `errcode=undefined`.
     const calls: Call[] = [];
     const transport = new RecordingTransport(calls);
     const root = mkdtempSync(join(tmpdir(), "webchannel-egress-journal-err-"));
@@ -545,84 +443,50 @@ describe("#239 — egress persist-before-publish", () => {
       undefined,
       { deliveryJournal: journal },
     );
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    // A real, non-synthetic failure: the handle is closed under the channel.
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
     journal.close();
 
-    expect(channel.sendText(PEER, "after close", "a-1")).toBe(true);
+    expect(() => channel.sendText(PEER, "after close", "a-1")).toThrow(DurableSendError);
 
-    expect(calls).toEqual([
-      { call: "publish", subject: OUT, type: "agent_message" },
-    ]);
+    expect(calls).toEqual([]);
     const line = warn.mock.calls[0][0] as string;
-    expect(line).toContain('code="ERR_INVALID_STATE"');
-    // node:sqlite's own state errors carry no SQLite status pair.
+    expect(line).toContain('code=\\"ERR_INVALID_STATE\\"');
     expect(line).not.toContain("errcode=");
-    // Measured: the marker never reaches `message`, but `message` is excluded on
-    // principle and this pins that it is not being interpolated.
     expect(line).not.toContain("database is not open");
     expect(line).not.toContain("after close");
     warn.mockRestore();
     rmSync(root, { recursive: true, force: true });
   });
 
-  it("refuses to journal an id-less durable frame, logs it at ERROR, but still delivers it", () => {
+  it("refuses an id-less durable frame and logs at ERROR", () => {
     const { calls, channel } = makeChannel();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    // Post-#238 every durable frame carries a plugin-minted id, so this is a
-    // REGRESSION INDICATOR. Minting one here would file the row under an id the
-    // client (which mints its own local one) never sees — N8.
-    expect(channel.sendText(PEER, "unattributed")).toBe(true);
-    expect(channel.sendText(PEER, "also unattributed")).toBe(true);
+    expect(() => channel.sendText(PEER, "unattributed")).toThrow(DurableSendError);
+    expect(() => channel.sendText(PEER, "also unattributed")).toThrow(DurableSendError);
 
     expect(appends(calls)).toEqual([]);
-    expect(calls).toEqual([
-      { call: "publish", subject: OUT, type: "agent_message" },
-      { call: "publish", subject: OUT, type: "agent_message" },
-    ]);
-    // ERROR, not warn: delivered text is missing from the store, which is a
-    // defect. `delivery-journal-event.ts`'s `isIdlessDurableFrame` docblock says
-    // half 2 logs it at `error`, and the two files must not disagree.
+    expect(calls).toEqual([]);
     expect(warn).not.toHaveBeenCalled();
     expect(error).toHaveBeenCalledTimes(1);
     const line = error.mock.calls[0][0] as string;
-    expect(line).toContain("[nats-channel] delivery journal idless-durable-frame");
-    expect(line).toContain("suppressed=0");
-    // No message text, and no SQLite status (nothing failed — the frame was
-    // refused before the store was touched).
+    expect(line).toContain('[nats-channel] delivery journal "idless-durable-frame"');
+    expect(line).toContain('suppressed="0"');
     expect(line).not.toContain("unattributed");
     expect(line).not.toContain("code=");
     error.mockRestore();
     warn.mockRestore();
   });
 
-  it("journals NOTHING when the disconnected transport refuses the send", () => {
-    // ⚠️ A REFUSAL IS NOT A FAILED PUBLISH, and journaling one is actively
-    // harmful — this pins the direction, which an earlier revision had backwards.
-    // The caller re-mints on failure (`message-adapter.ts`'s `reserveProvisional`
-    // returns a fresh `nextMessageId()` whenever the provisional preview is
-    // unavailable, and `lane.id ??= reservation.id` only runs on success), so
-    // journaling refusals during a blip writes `placement{X₁}`, `X₂`, `X₃`… one
-    // per revision, under ids that never existed live. `journal_placement_once`
-    // cannot collapse them, and at #240 replay each becomes a phantom empty
-    // bubble — N8 in the GAINING direction.
+  it("accepts a durable send while the relay is disconnected", () => {
     const { calls, channel, transport } = makeChannel();
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     transport.connected = false;
-
-    expect(channel.sendText(PEER, "sent into a blip", "a-1")).toBe(false);
-
-    expect(calls).toEqual([]);
-    // Assert WHICH refusal was reached, rather than inferring it from
-    // "false + nothing journaled" — that pair would also be satisfied by some
-    // future guard added ABOVE this one, which would make the test pass while
-    // testing something else entirely.
-    expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining("Transport not connected"),
-    );
-    warn.mockRestore();
+    expect(channel.sendText(PEER, "sent into a blip", "a-1")).toBe(true);
+    expect(calls).toEqual([{
+      call: "append", conversationId: PEER,
+      event: { kind: "bubble", answerId: "a-1", text: "sent into a blip" },
+    }]);
   });
 
   it("journals NOTHING when the fail-closed encryption guard refuses the send", () => {
@@ -685,10 +549,9 @@ describe("#239 — egress persist-before-publish", () => {
     // would now be false.
     expect(error).toHaveBeenCalledTimes(1);
     const line = error.mock.calls[0][0] as string;
-    expect(line).toContain("[nats-channel] Publish failed AFTER the durable commit");
+    expect(line).toContain("[nats-channel] Push failed for peer");
     // The seq `FakeJournal` allocated for this, the conversation's first row.
-    expect(line).toContain("(seq=1)");
-    expect(line).toContain("gap-sync");
+    expect(line).toContain('committedSeq="1"');
     expect(line).not.toContain("Failed to send to peer");
     // Never the message text.
     expect(line).not.toContain("committed then pushed badly");
@@ -712,7 +575,7 @@ describe("#239 — egress persist-before-publish", () => {
     expect(appends(calls)).toEqual([]);
     expect(error).toHaveBeenCalledTimes(2);
     for (const call of error.mock.calls) {
-      expect(call[0] as string).toContain("[nats-channel] Failed to send to peer");
+      expect(call[0] as string).toContain("[nats-channel] Push failed for peer");
       expect(call[0] as string).not.toContain("gap-sync");
     }
     error.mockRestore();
@@ -933,32 +796,17 @@ describe("#244 half A — seq on the durable wire frames", () => {
     }
   });
 
-  it("ships a durable frame WITHOUT a seq when the journal append fails — §15.8 send result unchanged", () => {
+  it("never ships a durable frame without seq after append failure", () => {
     const { channel, transport, journal } = makeChannel();
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     journal.throwOnAppend = true;
-
-    // A caught journal failure must not change the send result, and it leaves the
-    // frame with no seq to stamp — the client tolerates the absence.
-    expect(channel.sendText(PEER, "hello", "a-1", "turn-1")).toBe(true);
-
-    expect(transport.frames).toHaveLength(1);
-    expect(transport.frames[0].type).toBe("agent_message");
-    expect(transport.frames[0].seq).toBeUndefined();
-    warn.mockRestore();
+    expect(() => channel.sendText(PEER, "hello", "a-1", "turn-1")).toThrow(DurableSendError);
+    expect(transport.frames).toEqual([]);
   });
 
-  it("an id-less durable frame ships without a seq (never journaled)", () => {
+  it("never ships an id-less durable frame with a journal configured", () => {
     const { channel, transport } = makeChannel();
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-
-    // No usable id ⇒ `isIdlessDurableFrame` short-circuits before `append`, so
-    // there is no seq — the frame still reaches the wire.
-    expect(channel.sendText(PEER, "unattributed")).toBe(true);
-
-    expect(transport.frames).toHaveLength(1);
-    expect(transport.frames[0].seq).toBeUndefined();
-    error.mockRestore();
+    expect(() => channel.sendText(PEER, "unattributed")).toThrow(DurableSendError);
+    expect(transport.frames).toEqual([]);
   });
 
   it("through the REAL store, each durable frame's wire seq equals its journal row's seq", () => {
@@ -1263,18 +1111,7 @@ describe("#242 — with reasoningDurable ON, a live stream costs ONE row per bur
     ]);
   });
 
-  it("CHARACTERIZATION — a transport STILL down at close loses the burst entirely (#304)", () => {
-    // ⚠️ RECORDS THE RESIDUAL, DOES NOT ENDORSE IT. Identical to the test above
-    // except the transport never recovers, which is the ORDINARY shape of a
-    // reconnect or a fail-closed no-session-key window: the condition that
-    // refused the last `push` is still in effect when the burst closes, so
-    // `sendToPeer` refuses the close frame too — above `journalOutbound`, by
-    // design — and the peer keeps rendering text that has no durable record.
-    //
-    // Two publishes reached the wire and ZERO rows were written. Not fixable at
-    // this seam; WHY is stated ONCE, at `message-adapter.ts`'s
-    // `lastDeliveredText` declaration, and deliberately not restated here — two
-    // earlier restatements of it shipped false. #304 owns the residual.
+  it("stores the displayed burst when the relay stays down at close", () => {
     const { calls, transport, channel } = makeChannel({ reasoningDurable: true });
     const controller = createReasoningDraftController({
       transport: channel,
@@ -1289,16 +1126,13 @@ describe("#242 — with reasoningDurable ON, a live stream costs ONE row per bur
     controller.endBurst();
     warn.mockRestore();
 
-    // The peer received two frames and is still rendering "Let me think"…
     expect(calls.filter((entry) => entry.call === "publish")).toHaveLength(2);
-    // …and the journal holds nothing for the burst.
-    expect(appends(calls)).toEqual([]);
+    expect(appends(calls)).toEqual([expect.objectContaining({
+      event: { kind: "reasoning", id: expect.any(String), turnId: "turn-1", text: "Let me think" },
+    })]);
   });
 
-  it("CHARACTERIZATION — the same residual on the stop() teardown path (#304)", () => {
-    // The likelier trigger in production: the dropped connection is what ends
-    // the turn, so `inbound.ts`'s `reasoning?.stop()` runs while the transport
-    // is still refusing.
+  it("stores the displayed burst at stop during relay loss", () => {
     const { calls, transport, channel } = makeChannel({ reasoningDurable: true });
     const controller = createReasoningDraftController({
       transport: channel,
@@ -1313,7 +1147,9 @@ describe("#242 — with reasoningDurable ON, a live stream costs ONE row per bur
     warn.mockRestore();
 
     expect(calls.filter((entry) => entry.call === "publish")).toHaveLength(1);
-    expect(appends(calls)).toEqual([]);
+    expect(appends(calls)).toEqual([expect.objectContaining({
+      event: { kind: "reasoning", id: expect.any(String), turnId: "turn-1", text: "Let me" },
+    })]);
   });
 
   it("an open burst with no delivered snapshot writes nothing", () => {
@@ -1335,24 +1171,8 @@ describe("#242 — with reasoningDurable ON, a live stream costs ONE row per bur
   });
 });
 
-/**
- * #341 — APPROVAL STATE IS JOURNALED WHEN THE PLUGIN RECORDS IT, NOT WHEN IT
- * PUBLISHES IT.
- *
- * These INVERT the direction the `sendText` refusal tests above pin, for the two
- * approval frames only, and the inversion is the whole slice. Before it, an
- * `approval_request` the transport refused got no row while `approvals.ts` kept
- * it in the pending map and the register-time `approval_snapshot` re-delivered it
- * live; the user decided, and the resulting `approvalResolution` row folded onto
- * nothing (`applyApprovalResolution` returns the view unchanged), so history
- * showed neither the card nor the consent — N8/N3.
- *
- * The refusal tests above stay exactly as they are: they drive `sendText`, whose
- * caller re-mints an id per attempt (#278), which is why the generic hook stays
- * below the refusals. An approval id is core's and is stable across attempts, and
- * the state exists server-side whether or not the push lands — see
- * `publishApprovalFrame`.
- */
+/** Approvals retain server-owned pending state even without peer registration.
+ * Their result distinguishes a stored row from a live push. */
 describe("#341 — the approval frames journal above the refusals", () => {
   const REQUEST = {
     id: "ap-1",
@@ -1392,9 +1212,7 @@ describe("#341 — the approval frames journal above the refusals", () => {
     // Pin WHICH refusal was reached, the same discipline the `sendText` refusal
     // tests use: "false + one row" must not silently become a test of some other
     // guard added above this one.
-    expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining("Transport not connected"),
-    );
+
     warn.mockRestore();
   });
 
@@ -1496,25 +1314,20 @@ describe("#341 — the approval frames journal above the refusals", () => {
     expect(calls.filter((entry) => entry.call === "publish")).toHaveLength(2);
   });
 
-  it("a journal failure still cannot change the send result", () => {
-    // The moved hook keeps `journalOutbound`'s contract: the swallow is the
-    // mechanism, and a faulting store must not turn a deliverable approval into
-    // a refused one (§15.8).
+  it("an approval append failure reports neither delivered nor journaled", () => {
     const { calls, channel, journal } = makeChannel();
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
     journal.throwOnAppend = true;
 
-    // Published anyway, and the caller is TOLD the row is missing — which is what
-    // lets `approvals.ts` write it at resolution time instead.
     expect(channel.sendApprovalRequest(PEER, REQUEST)).toEqual({
-      delivered: true,
+      delivered: false,
       journaled: false,
     });
 
     expect(appends(calls)).toEqual([]);
-    expect(calls).toEqual([{ call: "publish", subject: OUT, type: "approval_request" }]);
+    expect(calls).toEqual([]);
     expect(warn.mock.calls[0][0]).toContain(
-      "[nats-channel] delivery journal append-failed",
+      '[nats-channel] delivery journal "append-failed"',
     );
     warn.mockRestore();
   });

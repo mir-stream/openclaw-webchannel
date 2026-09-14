@@ -10,6 +10,7 @@ vi.mock("openclaw/plugin-sdk/reply-payload", () => ({
     typeof payload?.text === "string" && payload.text.includes(WARNING_SENTINEL),
 }));
 
+import { DurableSendError } from "./durable-send-error.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
@@ -541,6 +542,20 @@ describe("handleInboundMessage — #97 structured tool activity", () => {
   }
 
   afterEach(() => stopAgentLifecycleSubscription());
+
+  it("reports a tool journal failure without replaying the tool or hiding it behind an accepted answer", async () => {
+    const made = makeActivityApi(async (turn, emit) => {
+      turn.replyOptions?.onAgentRunStart?.("run-store-fault");
+      emit({ stream: "tool", runId: "run-store-fault", data: { phase: "result", name: "bash", toolCallId: "tool-store-fault" } });
+      await turn.delivery.deliver({ text: "answer" }, { kind: "final" });
+    });
+    const { transport, settles } = makeFakeTransport();
+    const sends = vi.fn(() => { throw new DurableSendError("tool_activity", "tool-store-fault"); });
+    transport.sendToolActivity = sends;
+    await handleInboundMessage(made.api, transport, "peer-1", { type: "user_message", text: "hi", id: "turn-tool-fault" });
+    expect(sends).toHaveBeenCalledTimes(1);
+    expect(settles).toEqual(["error"]);
+  });
 
   it("uses run-scoped global tool events as the sole structured source while preserving reply draft callbacks", async () => {
     const made = makeActivityApi(async (turn, emit) => {
@@ -3603,5 +3618,57 @@ describe("dispatch-failure logging cannot itself throw (#123)", () => {
       .filter((text) => text.includes("inbound dispatch failed"));
     expect(records).toHaveLength(1);
     expect(records[0]!.split("\n")).toHaveLength(1);
+  });
+});
+
+
+describe("durable output completion (#295)", () => {
+  it.each(["off", "immediate", "buffered", "snapshot"] as const)("does not settle ok after a persistent %s storage failure", async (mode) => {
+    const { transport, settles } = makeFakeTransport();
+    const fail = () => { throw new DurableSendError("agent_message", "failed-id"); };
+    if (mode === "off") transport.sendText = fail;
+    else if (mode === "snapshot") transport.sendTurnSnapshot = fail;
+    else {
+      const original = transport.finalizeDraft;
+      transport.finalizeDraft = (...args) => args[2] === "first" ? original(...args) : fail();
+    }
+    const { api } = makeFakeApi({ streamingMode: mode === "off" ? "off" : "partial", runImpl: async (turn) => {
+      turn.replyOptions?.onAssistantMessageStart?.();
+      if (mode === "buffered" || mode === "snapshot") {
+        turn.replyOptions?.onPartialReply?.({ text: "first" });
+        if (mode === "buffered") turn.replyOptions?.onAssistantMessageStart?.();
+      }
+      await turn.delivery.deliver({ text: "authored final" }, { kind: "final" });
+    } });
+    await handleInboundMessage(api, transport, "peer-1", { type: "user_message", id: "turn-failure", text: "hi" });
+    expect(settles).toEqual(["error"]);
+  });
+
+  it.each(["immediate", "notice", "buffered", "snapshot"] as const)("settles ok after %s output-only recovery without a stale failure latch", async (mode) => {
+    const { transport, settles } = makeFakeTransport();
+    const original = mode === "snapshot" ? transport.sendTurnSnapshot : transport.finalizeDraft;
+    let failed = false;
+    if (mode === "snapshot") {
+      transport.sendTurnSnapshot = (...args) => {
+        if (!failed) { failed = true; throw new DurableSendError("turn_snapshot"); }
+        return (original as WebChannelPeerChannel["sendTurnSnapshot"])(...args);
+      };
+    } else {
+      transport.finalizeDraft = (...args) => {
+        if (args[2] !== "first" && !failed) { failed = true; throw new DurableSendError("agent_message", args[1]); }
+        return (original as WebChannelPeerChannel["finalizeDraft"])(...args);
+      };
+    }
+    const { api } = makeFakeApi({ streamingMode: "partial", runImpl: async (turn) => {
+      turn.replyOptions?.onAssistantMessageStart?.();
+      if (mode === "buffered" || mode === "snapshot") {
+        turn.replyOptions?.onPartialReply?.({ text: "first" });
+        if (mode === "buffered") turn.replyOptions?.onAssistantMessageStart?.();
+      }
+      await turn.delivery.deliver({ text: "authored final", ...(mode === "notice" ? { isStatusNotice: true } : {}) }, { kind: "final" });
+    } });
+    await handleInboundMessage(api, transport, "peer-1", { type: "user_message", id: "turn-recovered", text: "hi" });
+    expect(failed).toBe(true);
+    expect(settles).toEqual(["ok"]);
   });
 });

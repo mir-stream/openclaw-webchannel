@@ -153,7 +153,7 @@ describe("outbound account selection through the production NATS facade (#371)",
       { state: "absent", rejects: /not running/ },
       { state: "removed", rejects: /not running/ },
       { state: "disposed", rejects: /returned false/ },
-      { state: "disconnected", rejects: /returned false/ },
+      { state: "store-failed", rejects: /not stored/ },
     ])("refuses a $state target without falling back", async ({ state, rejects }) => {
       const primary = runtime("default", "tenant-a");
       const named = runtime("other", "tenant-b");
@@ -162,10 +162,23 @@ describe("outbound account selection through the production NATS facade (#371)",
       const plugin = createNatsWebChannelPlugin(runtimes);
       if (state === "removed") { runtimes.delete("other"); named.channel.dispose(); }
       if (state === "disposed") named.channel.dispose();
-      if (state === "disconnected") named.transport.connected = false;
+      if (state === "store-failed") vi.spyOn(named.journal, "append").mockImplementation(() => { throw new Error("store failure"); });
       await expect(send(plugin, seam, config(["default", "other"]), "other")).rejects.toThrow(rejects);
       expectUntouched(primary);
       expectUntouched(named);
+    });
+
+    it("accepts output in the requested account's store while its relay is down", async () => {
+      const primary = runtime("default", "tenant-a");
+      const named = runtime("other", "tenant-b");
+      named.transport.connected = false;
+      const plugin = createNatsWebChannelPlugin(new Map([["default", primary], ["other", named]]));
+      const id = await send(plugin, seam, config(["default", "other"]), "other");
+      expectUntouched(primary);
+      expect(named.transport.frames).toEqual([]);
+      expect(named.journal.read(peerId).map(({ event }) => event)).toEqual([
+        { kind: "bubble", answerId: id, text: "account-private message" },
+      ]);
     });
 
     it("delivers on the listed spelling when core canonicalizes the account id", async () => {

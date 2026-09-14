@@ -17,6 +17,7 @@ import {
   stripInlineDirectiveTagsForDelivery,
 } from "openclaw/plugin-sdk/text-chunking";
 
+import { DurableSendError } from "./durable-send-error.js";
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
 import { resolveOutboundTransport, type ResolveOutboundTransport } from "./outbound-account.js";
@@ -236,6 +237,8 @@ type AssistantDraftLane = {
   assistantMessageIndex?: number;
   /** Assigned only after a successful first wire frame for this lane. */
   id?: string;
+  /** A failed store retains this reservation for output-only retry. */
+  pendingReservation?: ProvisionalReservation;
   /** A provisional id is tentative for the duration of one send transaction. */
   tentativeProvisionalId?: string;
   answerText: string;
@@ -611,6 +614,8 @@ function deferAngleMarkerTail(
  * they are delivered independently with their own sequence and wire id.
  */
 export type ProgressDraftController = {
+  /** True while any authored terminal output has not been accepted. */
+  readonly deliveryFailed: boolean;
   /**
    * Legacy cleanup signal for inbound: true means some wire frame succeeded
    * while the ordinary-answer terminal slot is still open. Inbound may use it
@@ -762,7 +767,27 @@ export function createProgressDraftController(params: {
   // (notices/errors). A missed id leaves a corruption bubble; a wrongly-added id
   // would lose content — captured ONLY at that one mint site, never from a
   // notice/error path.
-  const supersededAnswerBubbleIds: string[] = [];
+  const supersededAnswerBubbleIds = new Map<string, AssistantDraftLane>();
+  // Retry only known-rejected channel output, never the agent task. Each closure
+  // retains its delivery reservation and authored payload. Later revisions of a
+  // lane replace that lane's pending attempt under the same reserved ID.
+  const pendingDurableSends = new Map<string, () => boolean>();
+  const failedTerminalSends = new Set<string>();
+  const attemptSend = (key: string, terminal: boolean, send: () => boolean): boolean => {
+    try {
+      const accepted = send();
+      pendingDurableSends.delete(key);
+      if (accepted) failedTerminalSends.delete(key);
+      else if (terminal) failedTerminalSends.add(key);
+      return accepted;
+    } catch (error) {
+      if (error instanceof DurableSendError) {
+        pendingDurableSends.set(key, () => attemptSend(key, terminal, send));
+      }
+      if (terminal) failedTerminalSends.add(key);
+      return false;
+    }
+  };
 
   const warn = (message: string): void => {
     try {
@@ -904,28 +929,37 @@ export function createProgressDraftController(params: {
     options?: { speculative?: boolean },
   ): boolean => {
     const owner: ProvisionalClaimOwner = { kind: "lane", generation: lane.generation };
-    const reservation = lane.id
+    const reservation = lane.pendingReservation ?? (lane.id
       ? { owner, id: lane.id, usesPreview: false }
-      : reserveProvisional(owner, lane);
-    let sent = false;
-    let failure: DeliveryFailureKind | undefined;
-    try {
-      sent =
-        frameType === "progress"
+      : reserveProvisional(owner, lane));
+    const key = `lane:${lane.generation}`;
+    let failure: DeliveryFailureKind = "false";
+    const sent = attemptSend(key, frameType === "final", () => {
+      let accepted: boolean;
+      try {
+        accepted = frameType === "progress"
           ? transport.sendProgress(sessionKey, reservation.id, text, params.turnId) === true
           : transport.finalizeDraft(sessionKey, reservation.id, text, params.turnId) === true;
-      if (!sent) failure = "false";
-    } catch {
-      failure = "throw";
-    }
-    if (sent) {
-      lane.id ??= reservation.id;
-      lane.started = true;
-      lane.resolution = "materialized";
-      commitReservation(reservation, lane);
-      return true;
-    }
-    rollbackReservation(reservation, lane);
+      } catch (error) {
+        failure = "throw";
+        if (error instanceof DurableSendError) lane.pendingReservation = reservation;
+        throw error;
+      }
+      if (accepted) {
+        lane.id ??= reservation.id;
+        lane.pendingReservation = undefined;
+        lane.started = true;
+        lane.resolution = "materialized";
+        if (frameType === "final") lane.settleOutcome = true;
+        commitReservation(reservation, lane);
+      } else {
+        lane.pendingReservation = undefined;
+        rollbackReservation(reservation, lane);
+      }
+      return accepted;
+    });
+    if (sent) return true;
+    if (!pendingDurableSends.has(key)) rollbackReservation(reservation, lane);
     // A speculative attempt must never reduce what the lane is guaranteed at
     // drain: stamping `lastFailedDelivery` here would make
     // `laneTerminalSuppressed` true and delete text that was only ever HELD, not
@@ -952,7 +986,7 @@ export function createProgressDraftController(params: {
     // `remove: [tcId]` base's M212a asserted. And NOT because an overflow bubble's
     // content never streamed — measured false, it often has (see the flush's
     // no-target branch, which on a shortfall takes every final).
-    options?: { supersedesAnswerLane?: boolean },
+    options?: { supersedesAnswerLane?: AssistantDraftLane },
   ): boolean => {
     if (!text) {
       warn("independent delivery skipped empty text without a transport attempt");
@@ -961,36 +995,19 @@ export function createProgressDraftController(params: {
     const sequence = ++state.nextDeliverySequence;
     const owner: ProvisionalClaimOwner = { kind: "independent", deliverySequence: sequence };
     const reservation = reserveProvisional(owner);
-    let sent = false;
-    let failure: DeliveryFailureKind | undefined;
-    try {
-      sent =
-        (assistantMessageIndex === undefined
-          ? transport.finalizeDraft(sessionKey, reservation.id, text, params.turnId)
-          : transport.finalizeDraft(
-              sessionKey,
-              reservation.id,
-              text,
-              params.turnId,
-              assistantMessageIndex,
-            )) === true;
-      if (!sent) failure = "false";
-    } catch {
-      failure = "throw";
-    }
-    if (sent) {
-      commitReservation(reservation);
-      if (options?.supersedesAnswerLane === true) {
-        supersededAnswerBubbleIds.push(reservation.id);
-      }
-      return true;
-    }
-    rollbackReservation(reservation);
-    warn(
-      `independent delivery sequence ${sequence} returned ${failure ?? "false"}; ` +
-        "its provisional claim was rolled back",
-    );
-    return false;
+    const key = `independent:${sequence}`;
+    const sent = attemptSend(key, true, () => {
+      const accepted = (assistantMessageIndex === undefined
+        ? transport.finalizeDraft(sessionKey, reservation.id, text, params.turnId)
+        : transport.finalizeDraft(sessionKey, reservation.id, text, params.turnId, assistantMessageIndex)) === true;
+      if (accepted) {
+        commitReservation(reservation);
+        if (options?.supersedesAnswerLane) supersededAnswerBubbleIds.set(reservation.id, options.supersedesAnswerLane);
+      } else rollbackReservation(reservation);
+      return accepted;
+    });
+    if (!sent && !pendingDurableSends.has(key)) rollbackReservation(reservation);
+    return sent;
   };
 
   /**
@@ -1097,16 +1114,6 @@ export function createProgressDraftController(params: {
   // ONE caller: `finalize`'s AMBIGUITY PRECONDITION. (#340 deleted the other —
   // the flush's shortfall fallback list, which routed finals onto lanes the
   // snapshot then overwrote.)
-  //
-  // The precondition asks "is this textless-current-lane shape ambiguous at all,
-  // or is the current lane the unambiguous target?" — and materialization is the
-  // right test for DECIDABILITY, which is a narrower justification than the one
-  // that used to sit here. That claim was: with no answer lane on the client's
-  // screen there is no earlier bubble a final could be topping up. It is FALSE, and
-  // measured so — `emitTurnSnapshot` publishes never-materialized lanes under a
-  // freshly minted id, and the client MINTS a bubble for an id it does not know
-  // (`packages/client/src/nats-client-wrapper.ts:1533-1544`). A never-materialized
-  // lane can absolutely own a bubble by the end of the turn.
   //
   // The real reason it works is empirical, not deductive: an unmaterialized lane
   // has no live wire presence AT THIS INSTANT, so treating the shape as the
@@ -1737,71 +1744,44 @@ export function createProgressDraftController(params: {
       resolveSettle = resolve;
     });
     invalidateScaffoldWriter();
-    let sent = false;
-    try {
-      sent = transport.finalizeDraft(sessionKey, preview.id, preview.text, params.turnId) === true;
-    } catch {
-      warn("provisional preview cleanup delivery threw");
-    }
+    const sent = attemptSend("preview", true, () => {
+      const accepted = transport.finalizeDraft(sessionKey, preview.id, preview.text, params.turnId) === true;
+      preview.settleOutcome = accepted;
+      if (accepted) {
+        state.durableDeliverySucceeded = true;
+        state.started = true;
+      }
+      return accepted;
+    });
     preview.settleOutcome = sent;
-    if (sent) {
-      state.durableDeliverySucceeded = true;
-      state.started = true;
-    }
     resolveSettle(sent);
     return sent;
   };
 
-  // #212 (Phase 3, targeted): publish the plugin's AUTHORITATIVE ordered set of
-  // the turn's agent ANSWER bubbles so the client renders them verbatim (fixing
-  // #174 ordering and dissolving the #215 K>=2 mid-lane corruption). Called at the
-  // terminal drain AFTER `flushBufferedOrdinaryFinals` (so every lane's text and
-  // the superseded-id set are final) and BEFORE `turn_settled`.
-  //
-  //  - `answers` = the answer lanes (those that streamed visible text) in
-  //    generation order. `id` reuses the lane's own materialized wire id, or a
-  //    freshly minted id for a lane that streamed but never reached the wire
-  //    (failed-frame recovery — the client mints that bubble). `text` is the
-  //    lane's AUTHORITATIVE text when a correctly-routed final settled it
-  //    (`answerTextIsAuthoritative`, preserving the final's tail), else the
-  //    corruption-immune `streamedAnswerText`.
-  //  - `remove` = the ids of independent bubbles that PROVABLY duplicate a lane in
-  //    `answers` — since #238 that is exactly one shape, the failed-lane recovery
-  //    block. A final with no target (the flush's no-target branch — on a
-  //    shortfall, every final) is NOT one of them, and deliberately so: it
-  //    duplicates a lane here whenever its final equals its streamed text — the
-  //    normal case — but the flush cannot tell which, and a visible duplicate is
-  //    recoverable where a deletion is not (M212g). The client drops ONLY these
-  //    and preserves every other agent bubble.
-  //
-  // Case X (K==1) is DELIBERATELY not addressed: it is byte-identical to the
-  // legitimate non-streaming-last collapse (M173c/M15a/M15b), so its tool bubble
-  // is neither an `answers` lane (it never streamed) nor in `remove` — it is
-  // preserved, unchanged, exactly as before.
+  // Reconcile only lanes with an accepted terminal frame, reusing their IDs.
+  // An unfinalized or rejected lane cannot become durable just because this
+  // callback ran. Recovery bubbles are removed only when their replacement is
+  // included in this snapshot. Pending store writes must complete first.
   const emitTurnSnapshot = (): void => {
     const turnId = params.turnId;
     // No correlation key ⇒ the client cannot scope the reconciliation to a turn.
     if (turnId === undefined) return;
     if (typeof transport.sendTurnSnapshot !== "function") return;
-    // The SAME set `flushBufferedOrdinaryFinals` walks with its cursor WHEN the
-    // correlation is exact — by construction, not coincidence (#238). When it is
-    // not: on K>=2 the flush walks nothing (#340); on K==1 it may still route the
-    // buffered final onto the current lane NON-authoritatively, and this map then
-    // carries that lane's STREAMED text (M340b).
+    if (pendingDurableSends.size > 0) return;
     const answers = streamedAnswerLanes()
+      .filter((lane) => lane.id !== undefined && lane.settleOutcome === true)
       .map((lane) => ({
-        id: lane.id ?? nextMessageId(),
+        id: lane.id!,
         text: lane.answerTextIsAuthoritative ? lane.answerText : lane.streamedAnswerText,
       }));
-    const remove = [...new Set(supersededAnswerBubbleIds)];
+    const answerIds = new Set(answers.map((answer) => answer.id));
+    const remove = [...supersededAnswerBubbleIds]
+      .filter(([, lane]) => lane.id !== undefined && answerIds.has(lane.id))
+      .map(([id]) => id);
     if (answers.length === 0 && remove.length === 0) return;
-    try {
-      transport.sendTurnSnapshot(sessionKey, turnId, answers, remove);
-    } catch {
-      // A render-fidelity overlay: a failed emit degrades to the pre-#212
-      // arrival-order render — it never blocks the drain or `turn_settled`.
-      warn("turn_snapshot delivery threw; live-turn agent order falls back to arrival order");
-    }
+    attemptSend("snapshot", true, () =>
+      transport.sendTurnSnapshot(sessionKey, turnId, answers, remove) === true,
+    );
   };
 
   const terminalDrain = (settleCurrent: boolean): void => {
@@ -2029,6 +2009,9 @@ export function createProgressDraftController(params: {
   };
 
   return {
+    get deliveryFailed() {
+      return pendingDurableSends.size > 0 || failedTerminalSends.size > 0;
+    },
     get started() {
       return state.started && !state.finalReconciliation.ordinaryAnswerSettled;
     },
@@ -2413,14 +2396,10 @@ export function createProgressDraftController(params: {
             return false;
           }
           emitHeldLaneTextBeforeIndependentDelivery();
-          // #212: reaching here with a streamed target lane means that lane's
-          // frame FAILED (`laneTerminalSuppressed`) — this block is recovering its
-          // content. That lane is in the snapshot's `answers` (by streamed text),
-          // so this independent recovery bubble duplicates it and is named in
-          // `remove`. An unstamped/tool-only-lane block carries UNIQUE content and
-          // is preserved (flag stays unset).
+          // Retain the candidate lane with this recovery bubble. The snapshot
+          // may remove it only if that lane later has an accepted replacement.
           return sendIndependent(input.text, input.assistantMessageIndex, {
-            supersedesAnswerLane: targetLane?.streamedVisibleAnswerText === true,
+            supersedesAnswerLane: targetLane?.streamedVisibleAnswerText ? targetLane : undefined,
           });
         },
         false,
@@ -2553,11 +2532,8 @@ export function createProgressDraftController(params: {
           if (!active.streamedVisibleAnswerText && textBearingLanes.length > 0) {
             state.finalReconciliation.ordinaryAnswerSettled = true;
             bufferedOrdinaryFinals.push(text);
-            // Provisional: the real send happens at drain (a synchronous status is
-            // impossible here). Deliberately optimistic — inbound treats the final
-            // as delivered, and it will be unless the turn is `stop`ped before
-            // drain, in which case the streamed lane text still stands and a reload
-            // heals. Never leaves a dangling promise.
+            // Queued locally; drain owns the eventual send. Inbound must also
+            // inspect deliveryFailed after drain before completing this turn.
             return true;
           }
           // Immediate path: the current lane is the sole, unambiguous target. The
@@ -2608,7 +2584,19 @@ export function createProgressDraftController(params: {
           clearProgressTimer();
           clearEmptyPredecessorTimer();
           state.pendingProgress = undefined;
+          const retried = new Set(pendingDurableSends.keys());
+          for (const retry of [...pendingDurableSends.values()]) retry();
           terminalDrain(true);
+          // Buffered finals first attempt storage during drain. Retry their
+          // rejected output before the snapshot, under the same reservations.
+          let recoveredOutput = false;
+          for (const [key, retry] of [...pendingDurableSends]) {
+            if (key !== "snapshot" && !retried.has(key) && retry()) recoveredOutput = true;
+          }
+          if (recoveredOutput && pendingDurableSends.size === 0) emitTurnSnapshot();
+          // The first snapshot attempt can happen above, after output recovers.
+          // Give it one retry here, unless its key was already retried at entry.
+          if (!retried.has("snapshot")) pendingDurableSends.get("snapshot")?.();
         },
         undefined,
       ),
@@ -2622,14 +2610,9 @@ export function createProgressDraftController(params: {
           clearProgressTimer();
           clearEmptyPredecessorTimer();
           state.pendingProgress = undefined;
-          // #173: a stop without a drain discards any buffered finals. This can
-          // lose content, not just a re-send: an ordinary final may carry a tail
-          // the last streamed partial never emitted (VERIFY-1 is still open), so a
-          // dropped buffered final can lose a final-only tail the streamed lane
-          // does NOT hold. Accepted by design — a reload heals it from durable
-          // history — and what must not happen is a dangling promise, which
-          // `finalize` already prevents by resolving each buffered final
-          // provisionally.
+          // Stop must not silently discard already-authored buffered finals.
+          // It does not finalize unfinalized partial text.
+          flushBufferedOrdinaryFinals();
           bufferedOrdinaryFinals.length = 0;
         },
         undefined,
@@ -2651,6 +2634,7 @@ export type ReasoningStreamUpdate = {
 };
 
 export type ReasoningDraftController = {
+  readonly deliveryFailed: boolean;
   /** Consume one cumulative update from the native live-reasoning callback. */
   push: (update: ReasoningStreamUpdate) => void;
   /** Consume one complete durable reasoning block from the delivery adapter. */
@@ -2693,8 +2677,7 @@ export type ReasoningDraftController = {
  *
  * So "exactly one per close call" is false and "at most one per burst, and zero
  * only when the burst reached nobody" is the property. See `closeLiveBurst` for
- * the O(n²) argument the flag replaces and for the five-case table behind the
- * `lastDeliveredText` gate.
+ * the close-frame policy and the `lastDeliveredText` gate.
  *
  * VERIFIED INTERNAL BEHAVIOR (OpenClaw 2026.7.1-2): every emitter sends either
  * a snapshot or the cumulative FULL text so far — NEVER a bare delta:
@@ -2752,179 +2735,32 @@ export function createReasoningDraftController(params: {
   //
   // ⚠️ THIS FLAG IS ABOUT THE *LAST* SEND, AND THAT IS THE ONLY QUESTION IT MAY
   // BE ASKED. It is deliberately NOT the gate on the burst's durable frame — see
-  // `lastDeliveredText` below for the hole that produced and for what is left of
-  // it (#304 tracks the remainder; the argument is here, not there).
+  // `lastDeliveredText` below retains earlier accepted snapshots too.
   let liveSnapshotDelivered = false;
-  // ⚠️ THE BURST TEXT THE CLIENT ACTUALLY HAS (#242 half 1, #304). Assigned ONLY
-  // when `sendReasoning` returned true, so it lags `currentText` whenever a send
-  // is refused, and cleared with `currentText` at close.
-  //
-  // It replaces an obvious-but-wrong gate — "did the LAST send land?" — which
-  // discards a burst the user demonstrably watched: with `push "a"` delivered,
-  // `push "ab"` refused, and then `endBurst()`, that gate emits ZERO durable
-  // frames even though the peer is still rendering "a". Tracking the last
-  // DELIVERED text answers the two questions that actually matter — did ANY of
-  // this burst reach the client, and what text does it hold — with one variable.
-  //
-  // ⚠️ WHAT THIS FIXES IS NARROWER THAN AN EARLIER REVISION OF THIS COMMENT
-  // CLAIMED, AND THE DIFFERENCE IS A REAL RESIDUAL HOLE. That revision named the
-  // triggers as "a NATS reconnect, the fail-closed 'no session key yet' window"
-  // and presented this variable as closing them. It does not: those same two
-  // conditions refuse the CLOSE FRAME as well. `sendToPeer` returns `false` at
-  // its disposed/transport-down check and at its missing-session-key check, and
-  // BOTH sit ABOVE `journalOutbound` — deliberately, so a refused send is never
-  // journaled. So the fix is conditional on RECOVERY:
-  //
-  //   transport recovered by close time → the close frame is published and
-  //                                       journaled, carrying the delivered
-  //                                       prefix. THIS is what changed.
-  //   transport STILL refusing at close → the close frame is refused too, and
-  //                                       the burst gets NO row at all, while
-  //                                       the peer keeps rendering the text it
-  //                                       already received. STILL OPEN.
-  //
-  // MEASURED against the real `NatsChannel` with `reasoningDurable: true`: push
-  // "Let me" (published), push "Let me think" (published), transport down, push
-  // "…about this" (refused), `endBurst()` → 2 publishes, 0 rows. The `stop()`
-  // teardown path has the same ZERO-ROW residual (its own characterization runs
-  // a two-push script → 1 publish, 0 rows; the publish counts differ because the
-  // scripts do, the row count is the point). The recovered control writes 1 row
-  // carrying "Let me".
-  //
-  // ⚠️ AND THE SEAM CANNOT FIX THE RESIDUAL — do not try here. THIS IS THE ONE
-  // PLACE THAT STATES THE GENERAL RULE; every other site points here rather than
-  // restating it, deliberately (see the warning at the end of this block). Two
-  // PLACEMENT-SCOPED statements remain in
-  // `nats-channel-delivery-journal.test.ts`, true of a refused `sendText` where
-  // the peer received nothing, and marked there as not generalisable to here.
-  //
-  // The mechanism, and nothing beyond it: `sendToPeer`'s three refusal checks —
-  // disposed, transport down, no session key — all sit ABOVE `journalOutbound`,
-  // so a frame the funnel DECLINES is never offered to the mapper at all. That
-  // is the funnel's shape. The hook there is generic, and from a single refused
-  // frame it cannot tell one carrying text an earlier ACCEPTED frame already
-  // delivered (this burst's close frame, which carries `lastDeliveredText`) from
-  // one carrying text the peer never saw. Journaling refusals wholesale records
-  // the second kind — N8, gaining. Journaling only the first kind requires a
-  // distinction the funnel cannot make. Either way it is a new seam or a second
-  // hook, which is NOT-list N6b/N6c, which is why **#304 needs a design round
-  // and not a patch**.
-  //
-  // ⚠️ TWO FRAME TYPES DID GET THAT SECOND SEAM (#341), AND THEY ARE NOT A
-  // PRECEDENT FOR THIS ONE — say so here, because "the funnel journals every
-  // frame type the same way" is no longer literally true and the next reader
-  // will find `publishApprovalFrame` and ask. `approval_request` /
-  // `approval_resolved` are appended above the refusals because the approval's
-  // state exists SERVER-SIDE independently of the push (`approvals.ts` records
-  // it in the pending/resolved stores and the register-time `approval_snapshot`
-  // re-delivers from them) and its id is core's, stable across attempts. A
-  // reasoning burst has neither property: its content exists ONLY as text the
-  // transport accepted, which is precisely the distinction named above. The
-  // exception was affordable there because the distinction was already made
-  // elsewhere; here it is not made anywhere.
-  //
-  // ⚠️ DO NOT WRITE A THIRD JUSTIFICATION HERE. Two have already shipped and
-  // both were false, which is the actual lesson of this comment:
-  //  - "the caller re-mints an id per attempt, so refusals manufacture phantom
-  //    rows under ids that never existed live" — that is `reserveProvisional`'s
-  //    PLACEMENT path. `push` reuses ONE id for the whole burst and rotates only
-  //    at close, so refusals here would repeat one id: an upsert, not a fan-out;
-  //  - "a refusal means the peer never received the frame, so recording it would
-  //    put content in history that live never showed" — false for precisely the
-  //    frame this defers. The close frame's payload IS `lastDeliveredText`, text
-  //    the transport accepted and the peer is rendering. (Push frames omit
-  //    `final`, so they are never journaled — #347's committed-row case cannot
-  //    arise for the text this variable holds.)
-  // Both were reached by reasoning about what the CONTENT means. The mechanism
-  // above is about where the checks SIT, which is checkable. If you find
-  // yourself explaining this a third way, the explanation is the problem.
+  // Live reasoning is ephemeral. Close only text accepted by a live preview;
+  // a durable block separately authors its complete text. When reasoningDurable
+  // is enabled this close can commit even while the relay is disconnected.
   let lastDeliveredText = "";
   let stopped = false;
+  const pendingReasoning = new Map<string, Parameters<WebChannelPeerChannel["sendReasoning"]>>();
+  const sendReasoning: WebChannelPeerChannel["sendReasoning"] = (...args) => {
+    try {
+      const sent = params.transport.sendReasoning(...args);
+      if (sent) pendingReasoning.delete(args[1]);
+      return sent;
+    } catch (error) {
+      if (!(error instanceof DurableSendError)) throw error;
+      pendingReasoning.set(args[1], args);
+      return false;
+    }
+  };
 
   const closeLiveBurst = (): void => {
     if (currentText.length === 0) return;
-    // ── #242 half 1: THE BURST'S ONE DURABLE FRAME ──
-    //
-    // `push` sends a frame for every cumulative update that CHANGES the text —
-    // an exact repeat is its only no-op, and there is no throttle or coalescing
-    // — and each frame carries the full text so far, so journaling the live
-    // stream would write one row per token,
-    // each holding the whole burst — O(n²) bytes, multiplied into an already
-    // quadratic history replay (#286). Instead the burst emits ONE extra frame
-    // carrying `final: true`, and `journalEventForOutbound` records only frames
-    // carrying it. Same distinction §15.9 already draws between the rolling
-    // `progress` draft (indicator) and `agent_message` (durable content);
-    // reasoning simply had no `progress` equivalent, so every one of its frames
-    // looked durable.
-    //
-    // ⚠️ IT CARRIES `lastDeliveredText`, NOT `currentText`, AND IS GATED ON THE
-    // SAME VARIABLE — "history records what was DELIVERED", N10 stated
-    // positively. That NARROWS the loss; it does not end it. What remains is
-    // deferred for one reason, and it is stated HERE rather than by pointer: the
-    // seam cannot journal a refused send (N6b — see the declaration of
-    // `lastDeliveredText` above for the full chain), and a second journal hook
-    // inside this controller is N6b/N6c. **#304 tracks the remainder.**
-    //
-    // ⚠️ CITE #304 AS THE TRACKER, NEVER AS THE EXPLANATION. Its original filing
-    // is about the gap this file has since CLOSED — its candidate fix reads
-    // "track `anySnapshotDelivered` alongside `liveSnapshotDelivered` … captured
-    // at send time rather than read off `currentText`", which is
-    // `lastDeliveredText` as shipped right here. A reader sent to that body to
-    // learn why the residual is deferred finds an argument for deferring
-    // something already done, and the obvious next move is to close the issue —
-    // taking the tracker away from a burst the peer watched and no row records.
-    // The reasons live in this file; the issue exists to keep the remainder
-    // visible.
-    //
-    // The cases, and the row count each actually produces:
-    //
-    //   ordinary   every push landed        → close frame carries the full text.
-    //                                         ONE row.
-    //   mixed,     early pushes landed, a   → close frame carries what the client
-    //   RECOVERED  later one refused, the     ACTUALLY HAS. Published and
-    //              transport is back up      journaled: ONE row, and it is an
-    //              at close time             upsert-by-id no-op for the client.
-    //                                        ⭐ THIS is the case this variable
-    //                                        fixed; before it, ZERO rows.
-    //   mixed,     the transport is STILL   → the close frame is REFUSED too
-    //   STILL      refusing when the burst    (`sendToPeer` returns false above
-    //   DOWN       closes                     `journalOutbound`), so NO row at
-    //                                         all — while the peer keeps
-    //                                         rendering the text it did receive.
-    //                                         ⚠️ STILL OPEN. #304.
-    //                                         (#347 adds ONE variant: when the
-    //                                         close frame is durable
-    //                                         (`reasoningDurable`) its row can
-    //                                         COMMIT and its publish then throw
-    //                                         → `sendToPeer` returns `true`, ONE
-    //                                         row, and the peer heals it by
-    //                                         gap-sync. Only a refusal ABOVE the
-    //                                         journal leaves no row.)
-    //   all-refused                         → `lastDeliveredText` is empty, so no
-    //                                         close frame is even attempted; a
-    //                                         durable block, if one follows, is
-    //                                         the only delivery and the only row.
-    //                                         (Push frames are never journaled,
-    //                                         so a throwing transport puts every
-    //                                         push here — #347 changes nothing
-    //                                         for them.)
-    //   empty burst                         → the early return above. Nothing.
-    //
-    // A `pushDurableBlock` that follows any of these arrives under its OWN id as
-    // a second block, so two blocks live is two rows — matching, not duplicated.
-    //
-    // Characterization tests pin every row above INCLUDING the still-open one;
-    // they record the behaviour, they do not endorse it.
-    //
-    // The id is the live burst's own, so for the client the frame is an upsert
-    // by id over text it already holds. The one real cost is one extra copy of
-    // the burst's text on the wire per burst; accepted.
-    //
-    // The text is a DISPLAY text (post-strip), never `lastRawText` (btw's raw
-    // cumulative payload, which still carries earlier bursts). History must
-    // record what live displayed.
+    // Persist one close frame for the displayed burst, subject to account
+    // policy. An output-only retry retains this ID and this exact text.
     if (lastDeliveredText.length > 0) {
-      params.transport.sendReasoning(
+      sendReasoning(
         params.sessionKey,
         id,
         params.turnId,
@@ -2964,7 +2800,7 @@ export function createReasoningDraftController(params: {
     // replaces the current text wholesale.
     if (normalized === currentText) return;
     currentText = normalized;
-    liveSnapshotDelivered = params.transport.sendReasoning(
+    liveSnapshotDelivered = sendReasoning(
       params.sessionKey,
       id,
       params.turnId,
@@ -2980,6 +2816,7 @@ export function createReasoningDraftController(params: {
   };
 
   return {
+    get deliveryFailed() { return pendingReasoning.size > 0; },
     push,
     pushDurableBlock: (update) => {
       if (stopped) return;
@@ -3018,7 +2855,7 @@ export function createReasoningDraftController(params: {
       // whole durable reasoning block, not a cumulative draft — so it carries
       // `final: true` on its single frame. There is deliberately no second
       // "closing" frame for it: that would be two durable rows for one block.
-      params.transport.sendReasoning(params.sessionKey, id, params.turnId, text, true);
+      sendReasoning(params.sessionKey, id, params.turnId, text, true);
       id = nextMessageId();
     },
     endBurst: () => {
@@ -3041,7 +2878,7 @@ export function createReasoningDraftController(params: {
       //
       // Idempotent: `closeLiveBurst` early-returns on an empty burst, and it
       // clears `currentText`, so a second `stop()` — or a `stop()` after
-      // `endBurst` — emits nothing.
+      // `endBurst` — only retries any rejected output.
       //
       // ⚠️ THIS FRAME IS JOURNALED AFTER THE TURN'S `seal`, AND THAT IS A KNOWN
       // ORDERING DIVERGENCE. `inbound.ts` awaits `draft?.drain()` — which emits
@@ -3072,7 +2909,14 @@ export function createReasoningDraftController(params: {
       // The old sentence was true about the seal and read as if it covered the
       // answers. `journal-history.ts`'s conversion loop (GAP 2b) is where the
       // divergence is now stated; still NOT a change to make here.
+      const pendingAtStop = new Map(pendingReasoning);
+      for (const args of pendingAtStop.values()) sendReasoning(...args);
+      const closingId = id;
       closeLiveBurst();
+      // Production stops once. Give a newly rejected close its one output-only
+      // retry here, without retrying earlier pending failures a second time.
+      const pendingClose = pendingReasoning.get(closingId);
+      if (pendingClose && !pendingAtStop.has(closingId)) sendReasoning(...pendingClose);
       stopped = true;
     },
   };

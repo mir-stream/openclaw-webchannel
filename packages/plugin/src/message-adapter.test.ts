@@ -717,11 +717,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(snap.remove).not.toContain(noticeId);
   });
 
-  it("M212f: a failed-lane recovery block is named in `remove` (its lane is now an answer)", async () => {
-    // M172b shape: A streams but its progress frame fails (not materialized); the
-    // authorized block recovers A's content independently. Under the snapshot, A's
-    // streamed text IS an answer (minted id), so the recovery block DUPLICATES it
-    // and is named in `remove`.
+  it("M212f: a recovery block survives when the failed lane has no accepted final", async () => {
     const h = makeDraftHarness({
       decide: (attempt) =>
         attempt.type === "progress" && attempt.text === "A answer" ? false : true,
@@ -733,11 +729,8 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     await h.draft.drain();
 
     const blockId = h.frames.find((frame) => frame.text === "A answer")!.id;
-    expect(h.snapshots).toHaveLength(1);
-    const snap = h.snapshots[0];
-    // A appears as an answer (minted id, streamed text); the recovery block is removed.
-    expect(snap.answers.map((a) => a.text)).toEqual(["A answer"]);
-    expect(snap.remove).toEqual([blockId]);
+    expect(h.snapshots).toEqual([]);
+    expect(h.frames.filter((frame) => frame.id === blockId).map((frame) => frame.text)).toEqual(["A answer"]);
   });
 
   it("M212g: an overflow final whose message NEVER STREAMED is UNIQUE content — never named in `remove` (content-loss guard)", async () => {
@@ -846,9 +839,9 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     // and the client is told to render "Cstream" in its place.
     expect(snap.answers.map((a) => a.id)).not.toContain(tbFrame!.id);
     expect(snap.remove).not.toContain(tbFrame!.id);
-    // The two streamed lanes are published with their streamed text (the shortfall
-    // leaves both without a final of their own), and nothing is deleted.
-    expect(snap.answers.map((a) => a.text)).toEqual(["A", "Cstream"]);
+    // Only A has an accepted lane final. A failed, unfinalized Cstream must
+    // not become a completed durable answer merely because a snapshot ran.
+    expect(snap.answers.map((a) => a.text)).toEqual(["A"]);
     expect(snap.remove).toEqual([]);
   });
 
