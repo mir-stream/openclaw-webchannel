@@ -948,6 +948,9 @@ export async function handleInboundMessage(
   // turn's ANSWER, which is what the outcome actually means (see the settle
   // computation in `finally`).
   let answerDelivered = false;
+  // Payload order classifies trailing tool warnings even when a block was
+  // suppressed in favor of its draft. Store acceptance is checked separately.
+  let answerPayloadSeen = false;
   let terminalErrorSeen = false;
   // Final reconciliation is deliberately independent of block callback counts
   // and of `answerDelivered` (which also tracks actual block output for #87).
@@ -1037,7 +1040,11 @@ export async function handleInboundMessage(
     toolActivitySink = createAgentToolActivitySink({
       turnId,
       send: (activity) => {
-        transport.sendToolActivity(wsKey, activity);
+        try {
+          if (!transport.sendToolActivity(wsKey, activity)) turnOutcome = "error";
+        } catch {
+          turnOutcome = "error";
+        }
       },
     });
   }
@@ -1490,7 +1497,7 @@ export async function handleInboundMessage(
                 // resolving different copies of the openclaw module would make
                 // the lookup silently return false.
                 //
-                // `!answerDelivered` carries those cases. Core builds the payload
+                // `!answerPayloadSeen` carries those cases. Core builds the payload
                 // array as [terminal error?, ..., answers..., tool warning?]
                 // (payloads-*.js:180/:251/:285) and the dispatcher sends every
                 // element (dispatch-*.js:1966), so a terminal error PRECEDES the
@@ -1518,22 +1525,16 @@ export async function handleInboundMessage(
                     if (
                       kind === "final" &&
                       !isReplyPayloadNonTerminalToolErrorWarning(payload) &&
-                      !answerDelivered
+                      !answerPayloadSeen
                     ) {
                       terminalErrorSeen = true;
                     }
                   } else if (!isNotice) {
-                    answerDelivered = true;
+                    answerPayloadSeen = true;
                   }
                 }
-                // P0-4 DECISION: `visibleReplySent:false` (a final-frame send that
-                // failed) does NOT suppress the later `turn_settled{outcome:"ok"}`
-                // — the turn genuinely settled without error, so the client's
-                // send-receipt correctly reaches `completed` (it tracks the USER
-                // message's fate, not answer delivery). The dropped answer text is
-                // recovered by the register-time history snapshot (recovery lanes
-                // §5 L3/L6), never by faking the turn outcome.
-                //
+                // Acceptance is recorded only after the channel accepts the
+                // output. Buffered draft finals also require the drain verdict.
                 // #111: only an authorized BLOCK may expose the pinned
                 // runtime's observed assistant ordinal. It is attempt-local and
                 // may repeat inside one user turn after model fallback, so it is
@@ -1552,6 +1553,7 @@ export async function handleInboundMessage(
                       : {}),
                     ...noticeFlags,
                   });
+                  if (sent && payload.isError !== true && !isNotice) answerDelivered = true;
                   return { visibleReplySent: sent };
                 }
                 if (draft && kind === "final") {
@@ -1561,7 +1563,10 @@ export async function handleInboundMessage(
                     text,
                     finalReconciliation,
                   );
-                  if (sent) finalReplyDelivered = true;
+                  if (sent) {
+                    finalReplyDelivered = true;
+                    if (payload.isError !== true && !isNotice) answerDelivered = true;
+                  }
                   return { visibleReplySent: sent };
                 }
                 // #238: the plugin owns identity and mints it AT the delivery
@@ -1597,9 +1602,12 @@ export async function handleInboundMessage(
                         assistantMessageIndex,
                       );
                 if (sent && kind === "final") finalReplyDelivered = true;
+                if (sent && (kind === "final" || kind === "block") && payload.isError !== true && !isNotice) answerDelivered = true;
+                if (!sent) turnOutcome = "error";
                 return { visibleReplySent: sent };
               },
               onError: (_error, info) => {
+                turnOutcome = "error";
                 draft?.noteDeliveryLifecycle("error", {
                   deliveryKind: info.kind,
                 });
@@ -1640,12 +1648,17 @@ export async function handleInboundMessage(
     } else if (!controlLane && !finalReplyDelivered) {
       // #238: mint at the delivery act here too — the apology is a real durable
       // bubble on the client, so the plugin (not the viewer) names it.
-      const sent = transport.sendText(
-        wsKey,
-        "Sorry — something went wrong while answering. Please try again.",
-        nextMessageId(),
-        turnId,
-      );
+      let sent = false;
+      try {
+        sent = transport.sendText(
+          wsKey,
+          "Sorry — something went wrong while answering. Please try again.",
+          nextMessageId(),
+          turnId,
+        );
+      } catch {
+        // A store failure must not escape cleanup or manufacture a receipt.
+      }
       if (!sent) {
         api.logger?.warn?.(
           `webchannel: error fallback reply was not delivered for peer=${logSafe(wsKey)} turn=${logSafe(turnId)}`,
@@ -1670,6 +1683,7 @@ export async function handleInboundMessage(
     // no-op when no draft was created or it was already stopped by finalize().
     draft?.stop();
     reasoning?.stop();
+    if (draft?.deliveryFailed || reasoning?.deliveryFailed) turnOutcome = "error";
     // #87: settle `error` when core handed us a terminal failure instead of an
     // answer (see the classification in the delivery seam). This only ever
     // ASSIGNS `"error"`, so it can never downgrade the `catch` above. A turn
@@ -1679,10 +1693,6 @@ export async function handleInboundMessage(
     // A terminal error that arrives BEFORE partial answer text still wins — the
     // turn failed, and partial output is not a completed answer.
     //
-    // This is distinct from the `visibleReplySent:false` decision at the
-    // delivery seam: that one is about our transport failing to ship an answer
-    // the turn DID produce, which is recovered by the history snapshot. This is
-    // about the turn producing no answer at all.
     // #87: core's own verdict for this turn's agent run decides the outcome.
     // It is authoritative — it separates the two payload shapes this seam
     // cannot (an answered turn reporting a failed mutating tool vs an answered

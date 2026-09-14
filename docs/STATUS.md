@@ -1,5 +1,13 @@
 # Project Status — single source of truth
 
+Round 2 (#370 + #295): active admitted conversations accept authored durable
+output into the journal during relay outages. Store failure refuses the push and
+success receipt; draft output retries retain their original IDs and unresolved
+failures settle the turn as an error. History/difference recovers committed output.
+Reasoning previews remain policy-controlled, tool failures do not replay tool
+execution, and approval results still distinguish delivery from journaling.
+This work does not provide durable agent task scheduling or replay external effects.
+
 Issue #57 / protocol v2 bounds pre-debounce and busy-turn retained work by
 shared per-session/process count and charged-byte limits. Newest overflow is
 tail-rejected with a durable correlated client failure, and peer/account teardown

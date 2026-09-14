@@ -727,7 +727,7 @@ export type DifferenceReply = {
  *  - `journaled` — did the durable `approval` row get written? It is TRUE on a
  *    refused push (that is the whole point of #341) and FALSE both for a
  *    re-delivery, which must not write a second row, and for an append the
- *    journal swallowed. `approvals.ts` carries it into the pending record so the
+ *    journal rejected. `approvals.ts` carries it into the pending record so the
  *    resolution leg knows whether it still owes the row.
  */
 export type ApprovalRequestSendResult = {
@@ -735,6 +735,11 @@ export type ApprovalRequestSendResult = {
   journaled: boolean;
 };
 
+/** Durable send booleans report server acceptance: a committed frame returns
+ * true even when its live push fails. A store fault throws DurableSendError and
+ * must not produce a success receipt. Ephemeral/policy-excluded frames report
+ * live push success only. Approval methods keep their explicit dual outcome.
+ */
 export interface WebChannelPeerChannel {
   sendText(
     peerId: string,
@@ -822,14 +827,10 @@ export interface WebChannelPeerChannel {
    * (#355). Omitted ⇒ `false` ⇒ journal, which is the safe default for any caller
    * that does not track delivery attempts.
    *
-   * ⚠️ AND THE RESULT REPORTS BOTH OUTCOMES BECAUSE THEY GENUINELY DIFFER. A
-   * refused push still stores the card (`delivered: false, journaled: true`), and
-   * a store whose append was swallowed (§15.8) still publishes it
-   * (`delivered: true, journaled: false`). The caller needs the second field to
-   * know whether the resolution leg must write the row late — round 1 of #341
-   * inferred it from "a channel resolved", and the account map is transient, so
-   * an account absent at delivery and present at resolution reproduced the exact
-   * orphan the slice exists to kill.
+   * A refused push can still store the card (delivered:false, journaled:true).
+   * A failed append refuses the push too (false/false), so the caller still
+   * owes the request row before a later resolution. Redelivery retains the
+   * existing row and reports only its live push in delivered.
    */
   sendApprovalRequest(
     peerId: string,
@@ -839,7 +840,7 @@ export interface WebChannelPeerChannel {
   /**
    * #341: `journalRequestFirst` carries THE CARD'S OWN PAYLOAD when its durable
    * `approval` row was never written — the delivery attempt found no channel for
-   * the account, or its append was swallowed. The implementation stores that row
+   * the account, or its append failed. The implementation stores that row
    * BEFORE the resolution's. The rule that binds the two rows, and its one
    * exception, is stated ONCE — "THE APPROVAL PAIR RULE" at `approvals.ts`'s
    * `updateEntry`; this docblock does not restate it.

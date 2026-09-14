@@ -17,6 +17,7 @@
  */
 
 import { inspect } from "node:util";
+import { DurableSendError } from "./durable-send-error.js";
 import type { NatsTransport, NatsMessage } from "./nats-transport.js";
 import type { ApprovalDecision, ApprovalRequestPayload, ApprovalRequestSendResult, DifferenceReply, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
 import type { KeyPair } from "./e2e-crypto.js";
@@ -242,11 +243,7 @@ const DELIVERY_JOURNAL_WARNING_INTERVAL_MS = 60_000;
  * status `journalFailureDiagnostic` extracts. Never message text.
  */
 type DeliveryJournalWarning =
-  /**
-   * The journal write path threw (either mapper call, or `append`). The send
-   * proceeds unchanged and the frame goes on to be published — see
-   * `journalOutbound`.
-   */
+  /** Mapper or append failed; the durable push is refused. */
   | "append-failed"
   /** A durable frame carrying no usable id reached egress. Post-#238 a regression. */
   | "idless-durable-frame";
@@ -270,6 +267,9 @@ export class NatsChannel implements WebChannelPeerChannel {
 
   // Per-peer approval deduplication (approvalId -> peerId who first resolved)
   private readonly approvalResolutions = new Map<string, string>();
+  // Request committed during catch-up, but resolution append still needs retry.
+  private readonly approvalCatchUpSeqs = new Map<string, number>();
+  private readonly approvalPendingResolutionJournal = new Set<string>();
 
   /**
    * S2: unconditional memory bounds. The NATS path has no peer-disconnect
@@ -350,18 +350,7 @@ export class NatsChannel implements WebChannelPeerChannel {
 
   // ---- v6 delivery journal (#239 half 2) -----------------------------------
 
-  /**
-   * The plugin-owned durable event log, or `null` when this channel does not
-   * journal (see `NatsChannelDurability`). Written on the egress path only;
-   * NOTHING IN THIS CLASS reads it back, so no send result depends on it.
-   *
-   * ⚠️ THAT IS A STATEMENT ABOUT THIS CLASS, NOT ABOUT THE PLUGIN — it stopped
-   * being both in #240. The journal is no longer a shadow store: it is the ONLY
-   * history store, projected by `journal-history.ts` and served from the two
-   * read sites in `history-serve.ts`. What survives here is the narrower
-   * property that matters to this file: the egress path writes and never reads,
-   * so journaling cannot change what a `send` returns.
-   */
+  /** Plugin-owned acceptance authority; history/difference read it elsewhere. */
   private readonly deliveryJournal: DeliveryJournal | null;
   /**
    * #242 half 1: the per-account journaling policy, resolved once at account
@@ -589,6 +578,8 @@ export class NatsChannel implements WebChannelPeerChannel {
     this.peerSessionKeys.clear();
     this.seenMessageIds.clear();
     this.approvalResolutions.clear();
+    this.approvalCatchUpSeqs.clear();
+    this.approvalPendingResolutionJournal.clear();
     this.onMessage = undefined;
     this.onApprovalDecision = undefined;
     this.onLoadHistory = undefined;
@@ -855,61 +846,24 @@ export class NatsChannel implements WebChannelPeerChannel {
       type: "approval_request",
       ...request,
     };
-    return this.publishApprovalFrame(peerId, payload, options?.redelivery !== true);
+    try {
+      return this.publishApprovalFrame(peerId, payload, options?.redelivery !== true);
+    } catch (error) {
+      if (!(error instanceof DurableSendError)) throw error;
+      return { delivered: false, journaled: false };
+    }
   }
 
-  /**
-   * #341 — THE APPROVAL FRAMES' OWN JOURNAL SEAM, ABOVE `sendToPeer`'s REFUSALS.
-   *
-   * Every other durable frame is journaled inside `sendToPeer`, below its three
-   * refusals, and that placement is load-bearing (read its docblock before
-   * moving anything). These two are the stated exception, so the append happens
-   * HERE — before the frame is even offered to the funnel — and `sendToPeer`
-   * skips them.
-   *
-   * WHY THE EXCEPTION HOLDS FOR THESE TWO AND NOTHING ELSE:
-   *  - THE STATE EXISTS SERVER-SIDE WHETHER OR NOT THE PUSH LANDS. `approvals.ts`
-   *    records the pending approval (`recordPendingApproval`) and the resolved
-   *    outcome (`recordResolvedApproval`) unconditionally, and the register-time
-   *    `approval_snapshot` re-delivers from those stores. A refused push
-   *    therefore does not mean "the user never saw this" — the snapshot shows the
-   *    card on the next register, the user acts on it, and #341's bug is exactly
-   *    the resolution landing as an orphan because the request row was never
-   *    written. Telegram stores the service message when it is CREATED; delivery
-   *    to a device is a separate act.
-   *  - THE ID IS STABLE ACROSS ATTEMPTS, so there is no re-mint hazard. It is
-   *    core's `approvalId` (`crypto.randomUUID()`), copied verbatim by
-   *    `buildApprovalRequestPayload` and reused by every re-delivery — the
-   *    opposite of `message-adapter.ts`'s `reserveProvisional`, whose fresh
-   *    `nextMessageId()` per failed attempt is the whole reason the generic hook
-   *    sits below the refusals (#278, N6b).
-   *
-   * ⚠️ NOT A PRECEDENT FOR THE REASONING RESIDUAL (#304). That one has neither
-   * property: a burst's content exists only as the text the transport accepted,
-   * so a refused close frame cannot be distinguished from content the peer never
-   * saw. See `message-adapter.ts`'s `lastDeliveredText` declaration.
-   *
-   * ⚠️ THIS IS HALF THE MECHANISM, NOT THE RULE. Journaling above the refusals
-   * only helps when a channel EXISTS to journal through, and the account→channel
-   * map is transient — so a card can be created with no channel and resolved with
-   * one. `sendApprovalResolved`'s `journalRequestFirst` is the other half. The
-   * rule the two serve, and the one exception to it, are stated once at
-   * `approvals.ts`'s `updateEntry` (THE APPROVAL PAIR RULE); this docblock
-   * deliberately does not restate it.
-   *
-   * `seq` is stamped HERE for the same reason it is stamped in `sendToPeer`: the
-   * row consumed a per-conversation seq and the frame the peer receives must
-   * carry THAT one (#244 half A). A re-delivery writes no row and so carries no
-   * seq, exactly like any other unjournaled frame.
-   *
-   * Reports BOTH outcomes rather than a send boolean, because for these frames
-   * they come apart in both directions — see `ApprovalRequestSendResult`.
+  /** Pending approvals exist server-side independently of peer registration.
+   * Preserve that admission exception and report storage and push separately.
+   * Store faults refuse the push; a redelivery already owns its stored row.
    */
   private publishApprovalFrame(
     peerId: string,
     payload: ApprovalOutboundFrame,
     journal: boolean,
   ): ApprovalRequestSendResult {
+    if (this.disposed) return { delivered: false, journaled: false };
     const seq = journal ? this.journalOutbound(peerId, payload) : undefined;
     const delivered = this.sendToPeer(
       peerId,
@@ -932,6 +886,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     options?: { journalRequestFirst?: ApprovalRequestPayload },
   ): boolean {
     // First-write-wins exactly-once: check if already resolved
+    if (this.disposed) return false;
     const existingResolver = this.approvalResolutions.get(id);
     // #341: the request side takes its "already recorded" signal from the caller;
     // here the channel already holds it, so the FIRST write journals and a repeat
@@ -939,7 +894,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     // a second `approvalResolution` row. Unreachable from `updateEntry`, which is
     // terminal per (account, approval) — belt and braces, and it keeps the two
     // approval frames' dedupe stories identical.
-    const firstResolution = existingResolver === undefined;
+    const firstResolution = existingResolver === undefined || this.approvalPendingResolutionJournal.has(id);
     if (existingResolver !== undefined) {
       if (existingResolver !== peerId) {
         console.log(
@@ -957,6 +912,8 @@ export class NatsChannel implements WebChannelPeerChannel {
         const oldest = this.approvalResolutions.keys().next().value as string | undefined;
         if (oldest === undefined) break;
         this.approvalResolutions.delete(oldest);
+        this.approvalCatchUpSeqs.delete(oldest);
+        this.approvalPendingResolutionJournal.delete(oldest);
       }
     }
 
@@ -965,7 +922,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     // The caller passes `journalRequestFirst` when delivery could not write the
     // `approval` row: the account had no live channel at the time (a TRANSIENT
     // state — `nats-account-runtime.ts` deletes and re-adds the runtime across a
-    // restart/reconnect), or the append was swallowed. Both leave a card the
+    // restart), or the append failed. Both leave a card the
     // register-time `approval_snapshot` still shows live, so the user (or the
     // expiry) can resolve one whose request row does not exist.
     //
@@ -976,20 +933,32 @@ export class NatsChannel implements WebChannelPeerChannel {
     // nothing — the defect this slice exists to kill. Keeping both decisions on
     // this line, next to both appends, is why the catch-up is an option here
     // rather than a separate journal-only call the caller has to sequence.
-    let journalResolution = firstResolution;
-    const catchUpRequest = options?.journalRequestFirst;
-    if (journalResolution && catchUpRequest !== undefined) {
-      const requestSeq = this.journalOutbound(peerId, {
-        type: "approval_request",
-        ...catchUpRequest,
-      });
-      // `undefined` also covers "this channel has no journal at all", where
-      // skipping the resolution row costs nothing — there is no store to skip in.
-      if (requestSeq === undefined) journalResolution = false;
+    try {
+      let journalResolution = firstResolution;
+      const catchUpRequest = options?.journalRequestFirst;
+      if (journalResolution && catchUpRequest !== undefined && !this.approvalCatchUpSeqs.has(id)) {
+        const requestSeq = this.journalOutbound(peerId, {
+          type: "approval_request",
+          ...catchUpRequest,
+        });
+        if (requestSeq === undefined) journalResolution = false;
+        else {
+          this.approvalCatchUpSeqs.set(id, requestSeq);
+          while (this.approvalCatchUpSeqs.size > this.maxApprovalResolutions) {
+            this.approvalCatchUpSeqs.delete(this.approvalCatchUpSeqs.keys().next().value!);
+          }
+        }
+      }
+      const payload: ApprovalOutboundFrame = { type: "approval_resolved", id, decision };
+      const result = this.publishApprovalFrame(peerId, payload, journalResolution);
+      this.approvalCatchUpSeqs.delete(id);
+      this.approvalPendingResolutionJournal.delete(id);
+      return result.delivered;
+    } catch (error) {
+      if (!(error instanceof DurableSendError)) throw error;
+      if (firstResolution) this.approvalPendingResolutionJournal.add(id);
+      return false;
     }
-
-    const payload: ApprovalOutboundFrame = { type: "approval_resolved", id, decision };
-    return this.publishApprovalFrame(peerId, payload, journalResolution).delivered;
   }
 
   /**
@@ -1128,240 +1097,42 @@ export class NatsChannel implements WebChannelPeerChannel {
     return `webchannel.${this.tenant}.${this.accountId}.${peerId}.out`;
   }
 
-  /**
-   * THE single egress point for every `OutboundWsMessage`. Every public sender
-   * funnels through it — `sendText`/`finalizeDraft`, `sendProgress`,
-   * `sendReasoning`, `sendToolActivity`, `sendTurnSettled`, `sendTurnSnapshot`,
-   * typing, history, commands, the approval frames, and (via
-   * `sendIngressResult`) the ack and inbound_rejected chunks. That is why the v6
-   * journal hook lives HERE: one hook covers the whole surface, including the
-   * direct-ACK paths doc §15.7 worried about.
-   *
-   * ⚠️ "AND NOWHERE ELSE" WAS TRUE UNTIL #341 AND IS NOT ANY MORE. There are TWO
-   * other journal call sites on this class, both named:
-   *  - `publishApprovalFrame`, which appends the two approval frames BEFORE they
-   *    reach this method (the hook below skips them so they are never written
-   *    twice — `extractMessageId` has no `approval` arm, so a second row would
-   *    not dedupe, #355);
-   *  - `sendApprovalResolved`'s CATCH-UP append, which is the only place in the
-   *    tree that writes a durable row for a frame that NEVER SHIPS: the card's
-   *    `approval` row, minted so the verdict about to be journaled is not an
-   *    orphan. It consumes a seq no frame carries, by design — the peer heals
-   *    that hole with `get_difference` (#244 half B).
-   * Everything else still journals here and only here; the reasons the approvals
-   * are the exception, and why they are not a precedent, are at
-   * `publishApprovalFrame`.
-   *
-   * (The class's one other `this.transport.publish` — `handleRegister`'s
-   * request-reply on the requester's `reginbox` subject — is a raw handshake
-   * string rather than an `OutboundWsMessage`, and carries nothing durable. That
-   * is unchanged: this method is still the single EGRESS point, which is a
-   * different claim from the journal one above.)
+  /** Durable acceptance is the commit; publishing is a separate best-effort push.
+   * Lifecycle and key authority precede both. A relay outage does not revoke
+   * an active conversation's authority to store already-authored output.
+   * Approvals arrive stamped by their own pending-state seam and report push
+   * success here, keeping delivered independent from journaled.
    */
   private sendToPeer(peerId: string, payload: OutboundWsMessage): boolean {
-    if (this.disposed || !this.transport.connected) {
-      console.warn("[nats-channel] Transport not connected, cannot send");
+    if (this.disposed) return false;
+    const sessionKey = this.encryptionRequired ? this.peerSessionKeys.get(peerId) : undefined;
+    if (this.encryptionRequired && !sessionKey) {
+      console.warn(
+        `[nats-channel] Refusing to send to ${logSafe(peerId)}: no session key yet (fail-closed, no plaintext)`,
+      );
       return false;
     }
-
-    const subject = this.outboundSubject(peerId);
-
-    // Fail-closed: refuse to publish until registration established a
-    // session key. We NEVER fall back to plaintext on the relay.
-    //
-    // Lifted out of the `try` below ONLY so the journal hook can sit between the
-    // REFUSALS and the WIRE WRITE. The predicate and its position are unchanged
-    // and still run before this method journals or publishes; `sealEnvelope`
-    // deliberately stays inside the `try`, so a throw while sealing still
-    // returns `false` — #347 narrowed that to "when nothing was journaled": a
-    // throw out of seal or publish AFTER this method committed a row now returns
-    // `true` (see the catch). What the lift DID change is exception containment
-    // on this one path: the `console.warn` below used to sit inside the `try`, so a
-    // faulting host `console` became `return false`, and now it escapes
-    // `sendToPeer` — which matches the disposed/transport-down refusal above,
-    // where that has always been true.
-    let sessionKey: Uint8Array | undefined;
-    if (this.encryptionRequired) {
-      sessionKey = this.peerSessionKeys.get(peerId);
-      if (!sessionKey) {
-        console.warn(
-          `[nats-channel] Refusing to send to ${logSafe(peerId)}: no session key yet (fail-closed, no plaintext)`,
-        );
-        return false;
-      }
-    }
-
-    // ---- v6 PERSIST-BEFORE-PUBLISH (#239, NOT-list N6, doc §16.2-2) --------
-    //
-    // The durable record is committed BEFORE THE WIRE WRITE. That is the whole
-    // claim, and it is deliberately narrow: it is NOT "before we decide whether
-    // to write". It reverses the older §15.8 commit-after decision, because at
-    // the egress moment the text is already known — Telegram's
-    // persist-then-deliver, and our plugin is the Telegram server.
-    //
-    // ⚠️ IT SITS BELOW THE THREE REFUSALS (disposed, transport down, no session
-    // key) AND MUST STAY THERE. Journaling a REFUSED send was tried and is
-    // actively harmful, because of what the caller does with the `false`:
-    // `message-adapter.ts`'s `reserveProvisional` hands out a FRESH
-    // `nextMessageId()` on every attempt once the provisional preview is
-    // unavailable, `lane.id ??= reservation.id` only runs on success, and
-    // `rollbackReservation` is a no-op for a fresh id — so a peer mid-
-    // registration or a transport blip during a streaming answer does not
-    // produce one recoverable row, it produces `placement{X₁}`, `placement{X₂}`,
-    // `placement{X₃}`… one per revision, each under an id that never existed
-    // live and will never be used again. `journal_placement_once` cannot collapse
-    // them (different `message_id` each time), and at #240 replay every one
-    // becomes a phantom empty bubble: N8 in the GAINING direction, at an
-    // unbounded rate, manufactured entirely by us.
-    //
-    // ⚠️ EVERYTHING ABOVE IS SCOPED TO THE PLACEMENT PATH, AND IT IS THE ONLY
-    // ARGUMENT THIS DOCBLOCK MAKES. It used to close with a general one — "a
-    // refusal loses nothing by not being journaled; the text is already gone
-    // from the client's view, so a row would only make history show what live
-    // never showed". #242 half 1 falsified that by giving the funnel a second
-    // durable kind: a refused reasoning CLOSE frame carries `lastDeliveredText`,
-    // text the transport ACCEPTED and the peer is still rendering (push frames
-    // are never journaled, so #347 does not reach that text), and the
-    // delivery-failure bookkeeping the parenthetical relied on is bubble/
-    // placement state that reasoning frames have none of.
-    //
-    // The refused-send question is therefore NOT settled by this docblock, and
-    // the position of the hook is not the same thing as a reason it must stay.
-    // The GENERAL reason lives in exactly one place — `message-adapter.ts`'s
-    // `lastDeliveredText` declaration, which carries the mechanism and both
-    // retracted rationales. **#304** is the open residual. Do not restate it
-    // here; four restatements of it have already shipped wrong.
-    //
-    // The window §16.2-2 describes is the one that REMAINS: `sealEnvelope` or
-    // `transport.publish` throwing after this line, so the record is committed
-    // and the frame does not reach the peer. ⭐ #347: THAT IS A SUCCESSFUL SEND,
-    // and the `catch` below returns `true` for it.
-    //
-    // ⚠️ AND #341 CARVED OUT THE TWO APPROVAL FRAMES, WHICH IS WHY THE CALL IS
-    // GUARDED. They were journaled here until an `approval_request` the transport
-    // refused turned out to be re-delivered live by the register-time
-    // `approval_snapshot` and acted on, while its `approvalResolution` row landed
-    // as an orphan the reducer folds onto nothing (N8/N3). Their append moved UP,
-    // to `publishApprovalFrame`, which runs before this method is even called; the
-    // guard below is what stops the row being written a second time here. It is
-    // the whole extent of the exception — every other frame type still journals on
-    // this line, below the three refusals. The argument for the carve-out (and for
-    // why it does not transfer to #304) is at `publishApprovalFrame`; do not
-    // restate it here.
-    // For approvals the local `seq` stays undefined, so this method still reports
-    // the push outcome. `publishApprovalFrame` reports storage separately in
-    // `journaled`; its `delivered` field must not become true on a failed push.
-    //
-    // We are the Telegram SERVER (doc §0). A message exists the moment the server
-    // has STORED it under an id; pushing it to a device is a SEPARATE act, and a
-    // push that fails is not a failed send — the device that missed it picks the
-    // message up on its next `getDifference`. Since #244 we have precisely that
-    // machine: every journaled frame consumes a per-conversation `seq`, so a peer
-    // that never received this one stops one short of that seq, sees the hole at
-    // the next SEQ-BEARING frame (the turn's `turn_snapshot` if nothing else) and
-    // heals it with `get_difference`, served from this very row — PROVIDED its
-    // cursor gap-tests every seq it learns, including the `ack` echo of its own
-    // next message. That is #356 half A's cursor (PR #362, which lands BEFORE
-    // this change); the client before it has an advance-only ack that CLOSES
-    // such a hole for the session when an ack arrives before the next
-    // seq-bearing frame. If this frame was the conversation's last, the peer's
-    // next register serves the row in its history snapshot instead — same
-    // store, same id — unless the row alone exceeds the peer's wire budget
-    // (#311 skips it): #325's write side, the one shape no path can carry (and
-    // before #362's fit skips it, a `difference` carrying it is refused whole
-    // and re-requested — a wall, not a miss). Once the row is committed, the
-    // send has succeeded in the only sense
-    // the SSOT recognises; what remains is delivery, and delivery is gap-sync's.
-    //
-    // ⚠️ THE OLD `false` WAS THE DEFECT, NOT A CONSERVATIVE DEFAULT — and #278's
-    // paragraph calling the `bubble` case "the SAFE direction … the id is stable"
-    // is DELETED rather than narrowed, because it was false over exactly the
-    // population it claimed. `message-adapter.ts` trusts this boolean: `lane.id
-    // ??= reservation.id` runs ONLY on a success, so a committed-then-unpublished
-    // final left its lane with no id, `emitTurnSnapshot` minted a SECOND id
-    // (`lane.id ?? nextMessageId()`) for text the journal already held under the
-    // first, and the failed-lane recovery re-sent the same content as a third
-    // bubble. Measured in #347: journal `bubble:X=tA` + `seal[Y=tA]` ⇒ history
-    // shows tA TWICE while live shows it once — N8 in the gaining direction,
-    // manufactured by us. Re-sending under a new id is the pre-#244 repair, when a
-    // lost publish really was a lost message; gap-sync is the repair now.
-    //
-    // For frames journaled HERE, the result depends on whether a row was
-    // committed: `seq !== undefined`, the same value the stamp below uses.
-    // A frame that allocated no seq has NO row and nothing for `get_difference` to
-    // serve, so for it a publish failure is still a failed send and still returns
-    // `false`: every frame `journalOutbound` does not journal (the non-durable
-    // types and a durable frame with an unusable id — read
-    // `journalEventForOutbound`/`isSeqBearingFrame` for the exact set), an id-less
-    // durable frame, a frame this account's policy does not journal, and a frame
-    // whose journal write faulted. The three refusals ABOVE keep returning `false`
-    // for the same reason: no row exists, so the caller's rollback and its
-    // failed-lane recovery are the correct response there.
     const seq = isApprovalOutboundFrame(payload)
       ? undefined
       : this.journalOutbound(peerId, payload);
-
-    // #244 half A: stamp the per-conversation `seq` the journal allocated onto
-    // the durable frame BEFORE sealing/publishing (persist-before-publish means
-    // the seq is known here).
-    //
-    // For frames journaled here (approvals arrive already stamped), `seq` is
-    // defined IFF the frame was appended, and a frame is appended IFF it is one of
-    // the durable types `journalEventForOutbound` maps. `isSeqBearingFrame` is the
-    // single expression of that set (co-located with the mapper, with a drift test
-    // pinning the two identical); it also NARROWS the union so `{ ...payload, seq }`
-    // is type-honest (no cast). At runtime the predicate is implied by
-    // `seq !== undefined`, but tsc cannot see that invariant. Stamping only some
-    // durable frames would leave the client's stream with holes where the others
-    // silently consumed a seq — a phantom gap for half B. A frame that was not
-    // journaled (`seq === undefined` — non-durable, id-less, or a caught failure)
-    // ships unchanged. An approval retains the seq stamped by its own seam.
-    //
-    // ⚠️ THE INBOUND USER OPENER is the one other seq-consumer, and it is NOT here
-    // because it is not an outbound frame: its seq rides the `ack.committed` echo
-    // (`ingress-dedupe.ts`), not a durable frame. Frames-here + that echo = every
-    // seq the client sees, which is what keeps its stream gapless.
-    const outbound: OutboundWsMessage =
-      seq !== undefined && isSeqBearingFrame(payload)
-        ? { ...payload, seq }
-        : payload;
-
+    if (!this.transport.connected) return seq !== undefined;
+    const outbound: OutboundWsMessage = seq !== undefined && isSeqBearingFrame(payload)
+      ? { ...payload, seq }
+      : payload;
     try {
-      if (sessionKey) {
-        // `sessionKey`, not `this.encryptionRequired` — equivalent, because an
-        // encrypted channel without a key has already returned above.
-        const wire = sealEnvelope(
-          { accountId: this.accountId, tenant: this.tenant, sub: peerId },
-          sessionKey,
-          outbound,
-        );
-        this.transport.publish(subject, wire);
-        return true;
-      }
-
-      this.transport.publish(subject, JSON.stringify(outbound));
+      const subject = this.outboundSubject(peerId);
+      const wire = sessionKey
+        ? sealEnvelope({ accountId: this.accountId, tenant: this.tenant, sub: peerId }, sessionKey, outbound)
+        : JSON.stringify(outbound);
+      this.transport.publish(subject, wire);
       return true;
     } catch (err) {
-      // #347 — COMMITTED IS SENT. A durable row was written above this `try`, so
-      // the publish was the PUSH and not the send: the peer's cursor stops one
-      // short of this frame's `seq`, the next seq-bearing frame reveals the hole
-      // to a #362-model cursor, and `get_difference` serves this row (a
-      // reconnect's history snapshot serves it too, unless the row alone exceeds
-      // the peer's wire budget — #325). Reporting `false` here is what made the
-      // caller re-mint an id and store the same text twice. One line per frame,
-      // naming the seq so an operator can see WHICH row gap-sync has to carry.
-      if (seq !== undefined) {
-        console.error(
-          `[nats-channel] Publish failed AFTER the durable commit for peer ${logSafe(peerId)} ` +
-            `(seq=${seq}); the row is stored and delivery is now gap-sync's: ` +
-            `${logSafe(formatCaughtDiagnostic(err))}`,
-        );
-        return true;
-      }
       console.error(
-        `[nats-channel] Failed to send to peer ${logSafe(peerId)}: ${logSafe(formatCaughtDiagnostic(err))}`,
+        `[nats-channel] Push failed for peer ${logSafe(peerId)} committedSeq=${logSafe(seq ?? "none")} error=${logSafe(formatCaughtDiagnostic(err))}`,
       );
-      return false;
+      // #363: once committed, callers retain the same ID; difference/history
+      // carries the stored frame even if encryption or publishing failed.
+      return seq !== undefined;
     }
   }
 
@@ -1421,183 +1192,29 @@ export class NatsChannel implements WebChannelPeerChannel {
     );
   }
 
-  /**
-   * Commit one outbound frame to the delivery journal. Called by `sendToPeer`
-   * BEFORE publishing; see the block comment there for the ordering rationale.
-   * Since #341 it has a SECOND caller — `publishApprovalFrame`, which commits the
-   * two approval frames one layer up, above the refusals `sendToPeer` applies —
-   * so "before publishing" still holds for both, but "below the refusals" is a
-   * property of the CALL SITE, not of this method. Everything below is written
-   * about the write path itself and is true of either caller.
-   *
-   * ⚠️ A JOURNAL FAULT CANNOT FAIL A SEND THAT WOULD OTHERWISE HAVE SUCCEEDED,
-   * AND THAT IS THE WHOLE POINT. #244 half A gave this a return value — the
-   * appended per-conversation `seq`, or `undefined` when nothing durable was
-   * written (an id-less/non-durable frame or a CAUGHT failure). Every failure of
-   * the JOURNAL WRITE PATH — both mapper calls as well as `append` — is swallowed
-   * into a rate-limited warning and returns `undefined`, so the frame ships
-   * WITHOUT a `seq` and its outcome is decided by the wire write exactly as it
-   * would be with no journal configured at all. It never becomes a `false`/thrown
-   * send on a publish that worked.
-   *
-   * ⚠️ WHAT IS NO LONGER TRUE — AND IS SAID HERE RATHER THAN LEFT AS THE OLDER,
-   * SIMPLER CLAIM ("the send result is computed entirely from the wire write
-   * below the hook"). Since #347 `sendToPeer` DOES branch on this return: a
-   * publish that throws after a row was committed reports `true`, because a
-   * #362-model client heals the missing frame from that row via
-   * `get_difference`. So a
-   * journal fault does change the result in ONE shape — the publish ALSO throws,
-   * and with no row there is nothing to heal from, so the honest answer is
-   * `false`. That is the same answer the no-journal build gives, which is why it
-   * does not resurrect §15.8's forbidden outcome. Emitting the warning
-   * is itself a bare `console` call, on exactly the same footing as the
-   * `console.warn` this method's caller makes on each refusal and the
-   * `console.error` in its publish catch: a host that installed a faulting
-   * `console` escapes `sendToPeer` with or without this hook, so there is no
-   * fourth `try` here pretending otherwise. §15.8
-   * names the forbidden outcome exactly: turning a journal failure into
-   * `sendToPeer` → `false` would roll back the caller's reservation and make it
-   * retry the same content under a DIFFERENT id — the store meant to preserve
-   * identity would be the thing destroying it.
-   *
-   * ⚠️ AND THAT REASON IS THE ONE THAT SURVIVED #240. This paragraph used to end
-   * "the journal is a shadow store until #240; nothing reads it, so nothing may
-   * depend on it" — which is now false, since the journal is the only history
-   * store. It does not change the ruling: §15.8's argument is about the CALLER's
-   * id-reminting retry, not about whether anyone reads the store, so swallowing
-   * the failure is still strictly better than a `false` return here. What the
-   * cutover does change is the COST of the swallow (see `warnDeliveryJournal`).
-   *
-   * ⚠️ SYNCHRONOUS, IN EGRESS ORDER. No batching, no queue, no promise. §15.8's
-   * last bullet: a deferred append reorders the stream, and the stream's ORDER
-   * *is* the identity model (doc §16.5.3 — there is no pointer from a final back
-   * to its answer, there is only order).
+  /** Synchronous persist-before-publish. Undefined means policy-excluded or
+   * legacy no-store mode, never a swallowed store failure. Production always
+   * supplies a journal. Refusing an invalid durable text ID avoids live output
+   * that the server could never identify or recover.
    */
   private journalOutbound(peerId: string, payload: OutboundWsMessage): number | undefined {
-    const journal = this.deliveryJournal;
-    if (!journal) return undefined;
-
-    // ⚠️ THE `try` COVERS THE WHOLE JOURNAL WRITE PATH — BOTH MAPPER CALLS AS
-    // WELL AS `append` — AND THE SCOPE IS THE POINT. The isolation above must be
-    // enforced by this MECHANISM, not by the type checker happening to know that
-    // today's two mapper functions do not throw: `sendToPeer`'s callers are
-    // written for a boolean, and a throw escaping here is strictly WORSE than
-    // the `false` return §15.8 forbids. `message-adapter.ts`'s delivery comment
-    // spells the consequence out — a thrown send moves the message to `failed`
-    // and it is never re-sent, i.e. permanently lost, where a `false` at least
-    // retries. Nothing in the tree can throw through here today; the `try` is
-    // what keeps that true after the mapper grows (#242 widens the event set).
+    if (!this.deliveryJournal) return undefined;
+    if (isIdlessDurableFrame(payload)) {
+      this.warnDeliveryJournal("idless-durable-frame", peerId);
+      throw new DurableSendError(payload.type);
+    }
     try {
-      // Checked BEFORE the mapper, which cannot distinguish "not durable" from
-      // "durable but unusable": both come back as `null`.
-      //
-      // ⚠️ AND THIS DETECTOR COVERS ONLY ONE OF THE TWO UNUSABLE CLASSES — say so
-      // rather than let the sentence above read as a general guarantee.
-      // `isIdlessDurableFrame` tests `agent_message` alone. Since #242 half 3
-      // there is a second class: a `tool_activity` frame whose `id` or `turnId`
-      // is not a usable string also maps to `null`, and it goes unlogged here.
-      // That is BENIGN and deliberately not widened — the client's
-      // `case "tool_activity"` refuses exactly the same frame, so nothing
-      // rendered live is missing from history (no N8), and unlike an id-less
-      // `agent_message` there is no about-to-be-published TEXT being discarded (no N8 loss).
-      // Post-#238 the `agent_message` case is a REGRESSION detector; the tool
-      // case would be an ordinary refusal, which is why it is not one.
-      //
-      // Post-#238 every durable frame carries a plugin-minted id, from
-      // `message-adapter.ts`'s `nextMessageId()` at the delivery act. The call
-      // sites are deliberately NOT listed here — there are a dozen across
-      // `message-adapter.ts`, `inbound.ts`, `channel.ts` and
-      // `nats-account-runtime.ts`, and a partial census is worse than none: it
-      // invites the next reader to "correct" it. The reducer's BOUNDARY 1
-      // enumerates the ones that USED to be id-less, which is the list that
-      // matters. So this branch is a REGRESSION DETECTOR, not a case we handle — hence
-      // `error`, not `warn`, and `delivery-journal-event.ts`'s
-      // `isIdlessDurableFrame` docblock says so explicitly ("Half 2 logs it at
-      // `error`"). We do not mint an id here and store the text anyway: by this
-      // point the frame is on its way to the client, which mints its OWN local
-      // id for an id-less bubble, so a row under a different id is exactly the
-      // `live ≠ history` divergence (N8) the store exists to kill. The real
-      // repair is a server-assigned id before egress — doc §16.2-1, issue #243.
-      if (isIdlessDurableFrame(payload)) {
-        this.warnDeliveryJournal("idless-durable-frame", peerId);
-        return undefined;
-      }
-
-      // `null` = this frame is not (or not yet) a durable message. The mapper
-      // owns that verdict and documents every case; do not second-guess it here.
       const event = journalEventForOutbound(payload, this.journalPolicy);
       if (!event) return undefined;
-
-      // D1 — THE CONVERSATION ID IS THE `peerId`. The journal FILE is already
-      // scoped to (tenant, accountId) by its path (`storage-paths.ts`'s
-      // `deliveryJournalPath`), so the peerId completes the triple. It is the
-      // authenticated JWT `sub` claim: immutable, plugin-owned, and with no
-      // dependence on core's mutable route or agentId. Doc §16.2-7 — which is
-      // also why this seam needs no route knowledge and therefore none of
-      // §15.5's per-turn route-scoped callback (the "P-J probe" is dissolved,
-      // not deferred).
-      //
-      // #244 half A: return the per-conversation `seq` `append` allocated so
-      // `sendToPeer` can stamp it onto the durable outbound frame. `inserted` is
-      // deliberately ignored — an idempotent no-op still names the row's own
-      // `seq`, which is the correct value to publish (a retry re-ships the frame
-      // the FIRST admission was assigned).
-      return journal.append(peerId, event).seq;
+      return this.deliveryJournal.append(peerId, event).seq;
     } catch (error) {
-      // `append-failed` covers the whole write path, mapper throw included: from
-      // the caller's side both are "this frame got no durable row".
-      this.warnDeliveryJournal(
-        "append-failed",
-        peerId,
-        journalFailureDiagnostic(error),
-      );
-      // A caught failure yields NO seq — the frame ships without one (§15.8: a
-      // journal fault must not block the push). Since #347 that `undefined` IS
-      // what decides what a later publish failure reports: no row ⇒ `false`.
-      // Falls through to `undefined`.
+      this.warnDeliveryJournal("append-failed", peerId, journalFailureDiagnostic(error));
+      throw new DurableSendError(payload.type, "id" in payload ? payload.id : undefined);
     }
-    return undefined;
   }
 
-  /**
-   * Rate-limited journal diagnostic. Fixed category set, 60 s per category, with
-   * the suppressed count carried into the next line — the shape
-   * `warnResultLimitTooSmall` above and `ingress-outcome.ts`'s
-   * `createRateLimitedOutcomeFailureWarning` already use.
-   *
-   * ⚠️ TWO SINKS, ONE THROTTLE, AND THE SPLIT IS DELIBERATE:
-   *  - `append-failed` → `console.warn`. ⚠️ THE ARGUMENT THAT PICKED `warn` HAS
-   *    EXPIRED AND THE SINK HAS NOT MOVED. It read "the journal is a SHADOW
-   *    store: nothing reads it, so a failed write degrades something not yet
-   *    load-bearing", and #240 half 2 ended that: the journal is now the ONLY
-   *    history store. A failed append here does NOT stop the publish (the send
-   *    proceeds; with no row a publish throw then reports `false`),
-   *    so what it costs today is a frame the peer
-   *    SAW live and will not see on reconnect — live ≠ history, the exact
-   *    divergence this store exists to kill. That is `error`-shaped, and
-   *    arguably fail-closed-shaped. Half 2 deliberately did not change either:
-   *    raising the sink and, much more so, refusing the publish are behaviour
-   *    changes outside a read-path cutover. Recorded here as OWED work, not as a
-   *    justified level — do not read this bullet as an endorsement of `warn`.
-   *  - `idless-durable-frame` → `console.error`. Post-#238 this cannot happen
-   *    without a regression, and when it does it means text about to be
-   *    published is missing from the store — a defect, not a hiccup. `delivery-journal-event.ts`'s
-   *    `isIdlessDurableFrame` docblock already states this level ("Half 2 logs
-   *    it at `error`"); the two files must not disagree.
-   *
-   * Both stay THROTTLED at the same interval. The failure mode either category
-   * announces is sustained (one line per outbound frame), so an unthrottled
-   * `error` would bury the log; the `suppressed=N` count is what makes the
-   * difference between one hiccup and a live regression visible.
-   *
-   * ⚠️ NO MESSAGE TEXT, EVER. The line has exactly THREE variable parts and no
-   * others: the fixed `category`; the `peerId`, quoted and escaped through
-   * `logSafe` like every other peer-derived value in this class (#123
-   * log-record integrity); and `diagnostic` — the one part derived from an
-   * arbitrary caught value, which is why it never comes from the caller
-   * directly but only from `journalFailureDiagnostic`, whose docblock records
-   * the measurement showing its three fields are value-free. (`suppressed` is
-   * this class's own counter.)
+  /** Rate-limited, value-free diagnostics. The caller observes every failure
+   * through DurableSendError even while repeated log records are suppressed.
    */
   private warnDeliveryJournal(
     category: DeliveryJournalWarning,
@@ -1613,23 +1230,10 @@ export class NatsChannel implements WebChannelPeerChannel {
     const suppressed = entry.suppressed;
     entry.lastAt = now;
     entry.suppressed = 0;
-    // ⚠️ "the send result is unchanged" — NOT "delivery is unaffected", and NOT
-    // "this frame never reached the peer". The hook runs BELOW all three
-    // refusals, so on every path that reaches either warning the frame goes on
-    // to be published: the operator's remediation is "delivered, no durable
-    // row", not "undelivered". The single exception is the wire write throwing,
-    // and that path logs its own line. "Unchanged" is measured against a build
-    // with NO journal: a frame with no row publishes and its boolean is decided
-    // by the wire write, exactly as before the journal existed. ⚠️ It is NOT
-    // "the journal cannot change the boolean" — since #347 a COMMITTED row turns
-    // a thrown publish into `true` (delivery is gap-sync's). A frame that reached
-    // either warning has no row, so it does not get that treatment.
-    const line =
-      `[nats-channel] delivery journal ${category} for peer ${logSafe(peerId)}; ` +
-      `this frame has no durable row, the send result is unchanged` +
-      `${diagnostic === undefined ? "" : ` ${diagnostic}`} (suppressed=${suppressed})`;
-    if (category === "idless-durable-frame") console.error(line);
-    else console.warn(line);
+    console.error(
+      `[nats-channel] delivery journal ${logSafe(category)} for peer ${logSafe(peerId)}; ` +
+        `durable send refused; diagnostic=${logSafe(diagnostic ?? "none")} suppressed=${logSafe(suppressed)}`,
+    );
   }
 
   private handleNatsMessage(msg: NatsMessage): void {
