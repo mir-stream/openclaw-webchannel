@@ -8,6 +8,13 @@ Reasoning previews remain policy-controlled, tool failures do not replay tool
 execution, and approval results still distinguish delivery from journaling.
 This work does not provide durable agent task scheduling or replay external effects.
 
+Round 3B (#346 + #342): history reconciles user sends by explicit random ID
+mappings and refreshes rows using journal modification sequences. Warm snapshots
+recover the retained gap before hydration; byte-trimmed cold snapshots recover
+from zero. Cursor and row-version state remain scoped to the in-memory view.
+Individually oversized difference events retain the existing skip policy (#343);
+this work does not recover content that cannot fit one difference frame.
+
 Issue #57 / protocol v2 bounds pre-debounce and busy-turn retained work by
 shared per-session/process count and charged-byte limits. Newest overflow is
 tail-rejected with a durable correlated client failure, and peer/account teardown
@@ -48,7 +55,7 @@ historical plans, evaluator scores, or older notes. Where those conflict with th
   peer (`conversation-key-store.ts`, 0600 on disk) and **wrap-delivers it in the register
   response to the JWT-attested device key** — the register path has NO unauthenticated
   registration anymore (the old `handshake-verifier` is deleted). Two devices on one user each
-  decrypt live traffic + snapshots; W6 id/text/positional dedup handles echo adoption.
+  decrypt live traffic + snapshots; exact random-ID mappings reconcile local echoes.
   Register-hop (bootstrap JWT + PoP) is now the SOLE admission path — P0-2 deleted the
   unauthenticated X25519 handshake and the dev/open-NATS mode entirely.
 - **Multi-account multiplex** — one gateway serves `channels.webchannel.accounts.<id>` with

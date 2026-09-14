@@ -3,6 +3,7 @@ import { WebChannelNATSClient } from "./nats-client-wrapper.js";
 import {
   inboundSubject,
   outboundSubject,
+  registerSubject,
   type OutboundMessage,
 } from "./nats-client.js";
 import { openMessage, sealMessage } from "./e2e-crypto-browser.js";
@@ -105,6 +106,96 @@ const publishedInputs = (socket: FakeNatsWS, K: Uint8Array): OutboundMessage[] =
     .filter(({ subject }) => subject === IN)
     .map(({ payload }) => openMessage(payload, K) as OutboundMessage | null)
     .filter((message): message is OutboundMessage => message !== null);
+
+describe("#346 public send history reconciliation", () => {
+  it.each([
+    ["history", "ack"], ["ack", "history"], ["committed", "history", "ack"],
+    ["history", "committed", "ack"], ["difference", "history", "ack"], ["unmapped", "ack"],
+  ])("converges equal other-device text through %j", async (...order: string[]) => {
+    const h = await connectWrapper({ ack: false });
+    try {
+      const receipt = h.wrapper.send("same")!;
+      await settle();
+      const sent = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .find((m) => m.type === "user_message")! as Extract<OutboundMessage, { type: "user_message" }>;
+      const snapshot = { type: "history", highWaterSeq: 2, messages: [
+        { id: "other-server", role: "user", text: "same", seq: 1, randomId: "other-random" },
+        { id: "own-server", role: "user", text: "same", seq: 2, randomId: sent.random_id },
+      ] };
+      for (const step of order) {
+        if (step === "ack") deliverOut(h.K, { type: "ack", ids: [sent.id], committed: [
+          { random_id: sent.random_id, messageId: "own-server", seq: 2 },
+        ] });
+        else if (step === "committed") deliverOut(h.K, { type: "user_committed", id: "own-server",
+          text: "same", random_id: sent.random_id, turnId: sent.id, seq: 2 });
+        else if (step === "unmapped") deliverOut(h.K, { ...snapshot,
+          messages: snapshot.messages.map(({ randomId: _randomId, ...row }) => row) });
+        else if (step === "difference") {
+          deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 0 });
+          await settle();
+          deliverOut(h.K, snapshot);
+          await settle();
+          const request = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+            .find((m) => m.type === "get_difference")! as Extract<OutboundMessage, { type: "get_difference" }>;
+          deliverOut(h.K, { type: "difference", afterSeq: request.afterSeq, nonce: request.nonce,
+            partial: false, maxSeq: 2, events: snapshot.messages.map((row) => ({ seq: row.seq,
+              event: { kind: "user", id: row.id, text: row.text, randomId: row.randomId } })) });
+        } else deliverOut(h.K, snapshot);
+        await settle();
+      }
+      deliverOut(h.K, snapshot);
+      deliverOut(h.K, snapshot);
+      await settle();
+      expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(["other-server", "own-server"]);
+      expect(h.wrapper.getState().messages[1]).toMatchObject({ receiptKey: receipt.id, wireId: sent.id, sendState: "accepted" });
+      deliverOut(h.K, { type: "turn_settled", turnId: sent.id, outcome: "ok" });
+      await settle();
+      expect(receipt.snapshot().state).toBe("completed");
+      expect(h.wrapper.getState().messages[1].sendState).toBe("completed");
+    } finally { h.wrapper.close(); }
+  });
+
+  it("hydrates the buffered reconnect snapshot before ledger replay, retaining the own receipt", async () => {
+    const h = await connectWrapper({ ack: false });
+    try {
+      const receipt = h.wrapper.send("same")!;
+      await settle();
+      const sent = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .find((m) => m.type === "user_message")! as Extract<OutboundMessage, { type: "user_message" }>;
+      const events: string[] = [];
+      h.wrapper.subscribe((state) => {
+        if (state.messages.some((row) => row.id === "own-server")) events.push("hydrated");
+      });
+      const original = FakeNatsWS.sharedHandler!;
+      FakeNatsWS.sharedHandler = async (subject, payload, server, replyTo) => {
+        if (subject === registerSubject(TENANT, AGENT, PEER) && JSON.parse(payload).op === "register") {
+          events.push("snapshot");
+          server.deliverToClient(OUT, sealMessage({ accountId: AGENT, tenant: TENANT, sub: PEER }, h.K,
+            { type: "history", highWaterSeq: 2, messages: [
+              { id: "other-server", role: "user", text: "same", seq: 1, randomId: "other" },
+              { id: "own-server", role: "user", text: "same", seq: 2, randomId: sent.random_id },
+            ] } as unknown as OutboundMessage));
+        }
+        await original(subject, payload, server, replyTo);
+        if (subject === IN && (openMessage(payload, h.K) as { type?: string } | null)?.type === "user_message") {
+          events.push("replay");
+          server.deliverToClient(OUT, sealMessage({ accountId: AGENT, tenant: TENANT, sub: PEER }, h.K,
+            { type: "ack", ids: [sent.id], committed: [{ random_id: sent.random_id, messageId: "own-server", seq: 2 }] } as unknown as OutboundMessage));
+        }
+      };
+      FakeNatsWS.instances.at(-1)!.close();
+      await settleUntil(() => events.includes("replay") && receipt.snapshot().state === "accepted", { label: "reconnect replay acknowledged" });
+      expect(events.indexOf("snapshot")).toBeLessThan(events.indexOf("hydrated"));
+      expect(events.indexOf("hydrated")).toBeLessThan(events.indexOf("replay"));
+      expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(["other-server", "own-server"]);
+      expect(h.wrapper.getState().messages[1]).toMatchObject({ receiptKey: receipt.id, wireId: sent.id, sendState: "accepted" });
+      deliverOut(h.K, { type: "turn_settled", turnId: sent.id, outcome: "ok" });
+      await settle();
+      expect(receipt.snapshot().state).toBe("completed");
+      expect(h.wrapper.getState().messages[1].sendState).toBe("completed");
+    } finally { h.wrapper.close(); }
+  });
+});
 /** Record the distinct sendState sequence of the first user bubble matching `text`. */
 function trackBubble(w: WebChannelNATSClient, text: string): string[] {
   const seq: string[] = [];
@@ -2123,7 +2214,7 @@ describe("WebChannelNATSClient — #243 half 2b: client adopts the server messag
     h.wrapper.close();
   });
 
-  it("fallback: an ack with NO committed leaves the bubble at u-<n>, and tier-2 text still reconciles it", async () => {
+  it("legacy unmapped ACK/history preserve both identities without text guessing", async () => {
     // `committedId` returns undefined → the server acks WITHOUT a `committed`
     // echo (the plugin fast-path / overflow / cancelled ack gaps).
     const h = await connect({ committedId: () => undefined });
@@ -2141,7 +2232,8 @@ describe("WebChannelNATSClient — #243 half 2b: client adopts the server messag
     await settle();
 
     const hellos = h.wrapper.getState().messages.filter((m) => m.role === "user" && m.text === "hello");
-    expect(hellos).toHaveLength(1); // adopted, not duplicated
+    expect(hellos).toHaveLength(2);
+    expect(hellos[1]!.id).toBe(local.id);
     expect(hellos[0]!.id).toBe(FALLBACK_ID);
     h.wrapper.close();
   });

@@ -1,315 +1,17 @@
 /**
- * v6 delivery-render — HISTORY PROJECTED OUT OF THE PLUGIN'S OWN JOURNAL
- * (issue #240, doc §15.4).
+ * Project the plugin-owned journal through the shared durable reducer. The
+ * reducer defines content, typed identity, tombstones and visible order; this
+ * module adds first-seen timestamps, modification sequences and exact user
+ * origin mappings, then selects a page. Neither timestamps nor modification
+ * sequences are position keys: seals can reorder answer slots.
  *
- * The plugin is the Telegram *server*: it owns the durable store and the client
- * is a pure view of it (doc §0). History used to be read back out of core's
- * agent transcript, which is precisely what §0 forbids (NOT-list N2); #240
- * half 2 deleted that path, and this module replaced it — one conversation's
- * journal, folded into the message list the `history` frame carries.
- *
- * ⚠️ IT REPLAYS THE SHARED REDUCER. IT DOES NOT RE-IMPLEMENT IT. Every ordering,
- * supersession, tombstone and resurrect rule comes from
- * `packages/client/src/durable-view-reducer.ts`'s `applyDurableEvent` — the SAME
- * function the live client render folds frame-by-frame. That is the whole v6
- * bet: `history == live` holds BY CONSTRUCTION rather than because two
- * implementations happen to agree, and a server-side projection free to invent
- * one rule of its own is the exact regression this redesign exists to kill (N8).
- * Everything below is PROJECTION concern — chunking, `ts`, unknown kinds, paging,
- * and the `firstSeenMs` bookkeeping — and none of it may grow into a second
- * transition table. That list is what this module OWNS; it is not a list of
- * every way the two views can differ, and the next block is the counter-example.
- *
- * ── ⚠️ KNOWN live≠history GAPS, AND THIS MODULE IS WHERE THEY BECOME VISIBLE ──
- *
- * "`history == live` by construction" is the bet, not a proof, and there are
- * three standing exceptions that show up the moment a real conversation is
- * replayed. READ THIS BEFORE CONCLUDING THE PROJECTION IS WRONG.
- *
- * GAP 1 — the phantom empty bubble:
- *
- * A lane that receives a `progress` and then NEITHER a `bubble` NOR a
- * `seal.answers` entry — an aborted turn, or a connection dropped before the
- * drain — leaves a `placement` whose text is never authored. The two sides then
- * disagree:
- *   - REPLAY (here): `applyPlacement`'s APPEND BRANCH (the one taken when no
- *     text entry holds the id) adds `{kind:"text", role:"agent", text:""}` and
- *     nothing in the reducer or the journal ever removes it, so
- *     `projectJournalHistory` emits a PHANTOM EMPTY AGENT BUBBLE;
- *   - LIVE: the client renders nothing there. `mergeDurable` skips the entry —
- *     its `if (this.isSpentDraft(next)) continue;` guard, just before the
- *     `out.push` (`nats-client-wrapper.ts`; both of these are cited by SYMBOL
- *     because the line numbers here rotted within one commit) — and
- *     `isSpentDraft` keys on the CLIENT-LOCAL `draftOnly` flag, deliberately
- *     never journaled, because §15.9 classifies the rolling draft as an
- *     indicator rather than a message.
- * So the rule that hides it is expressed in a field the server does not have.
- * That is N8 by OMISSION, and it is the reason this file cannot claim the
- * equality unconditionally.
- *
- * GAP 2 — REASONING (#242). ⚠️ THE DROP THIS BLOCK USED TO DESCRIBE IS GONE.
- * Half 1 made reasoning durable server-side and then dropped it from the emitted
- * list, because the wire row's `role` was `"user" | "agent"` and a reasoning
- * message has none. Half 2 widened `channel-contract.ts`'s row into a TAGGED
- * UNION and the conversion loop below now emits the reasoning variant. What is
- * left of this gap is two SMALLER, named residuals — neither of them a shape
- * limit, and neither fixable in this module:
- *
- *  - GAP 2a — A BURST WHOSE TRANSPORT IS STILL REFUSING AT CLOSE GETS NO ROW
- *    (**#304**). The burst's one durable frame is the `final: true` close frame,
- *    and `sendToPeer`'s disposed / transport-down / no-session-key refusals all
- *    sit ABOVE `journalOutbound` — so if the transport is down when the burst
- *    closes (a NATS reconnect, or the fail-closed no-session-key window), the
- *    frame is refused and nothing is journaled, WHILE THE PEER KEEPS RENDERING
- *    the prefix it already received. Half 1 could describe that as an invisible
- *    gap; half 2 makes it visible, as "reasoning I watched vanished on reload".
- *    The seam cannot journal a refused send (N6b) and a second hook inside the
- *    controller is N6b/N6c, so #304 needs a design round, not a patch. The full
- *    mechanism and its case table live at `lastDeliveredText`'s declaration in
- *    `message-adapter.ts`; do not restate them, and do not "fix" this here.
- *  - GAP 2b — LIVE AND REPLAY CAN DISAGREE ON A BURST'S POSITION. They agree
- *    IFF no `placement`/`bubble` row is journaled BETWEEN that burst's first
- *    delivered frame and its closing frame. ⚠️ DO NOT re-attribute this to "a
- *    burst closed by the turn teardown" — this bullet said exactly that and it
- *    is the false dichotomy the conversion loop below retracts at length, with
- *    a frame-level counterexample whose burst closes MID-TURN via `endBurst`.
- *    The interleaving is the variable; the closing mechanism is not. See that
- *    note for the statement.
- *
- * Both are content/order divergences on top of a shared reducer, not second
- * transition tables, so neither changes the rule this module lives by.
- *
- * GAP 3 — TOOL (#242 half 3). A LOST DELTA YIELDS A ROW THAT IS WRONG, NOT A
- * ROW THAT IS ABSENT, and that is the whole difference from GAP 2a above. For
- * reasoning the durable frame is one per burst, so a refused close means NO ROW;
- * for tool the design is one row per FRAME, merged by `applyTool` at replay, so
- * losing any single frame leaves a MERGED PARTIAL that renders confidently:
- *
- *  - LOSE THE `start` FRAME and history folds `{phase:"end",
- *    status:"completed"}` — the widget renders `🔧 tool — completed`, nameless
- *    and argKey-less, where live rendered `read_file(path, limit)`. ⚠️ THAT IS
- *    VERBATIM THE OUTCOME `delivery-journal-event.ts`'s `case "tool_activity"`
- *    CITES AS ITS REASON FOR REJECTING A `final`-FLAG DESIGN. So the design
- *    refuses a DETERMINISTIC partial and currently accepts a NONDETERMINISTIC
- *    one; that is a real asymmetry, and it is recorded rather than resolved.
- *  - LOSE THE TERMINAL FRAME and the row is stuck mid-flight (`phase:"update"`,
- *    no `status`) FOREVER — every future reload renders a call that never
- *    finishes, because nothing later can close it.
- *
- * Two reachable causes, neither hypothetical: (a) the append throwing, which
- * `nats-channel.ts`'s `journalOutbound` catches and reports as `append-failed`
- * while the PUBLISH proceeds — so the peer sees the frame and the journal does
- * not; and (b) #304's refusal window, since `journalOutbound` sits below
- * `sendToPeer`'s three refusal checks exactly as GAP 2a describes.
- *
- * ⚠️ RECORDED, NOT REPAIRED — and do not "fix" it here. Reconstructing a missing
- * `start` from the frames that did land, or closing a stuck call at replay, is a
- * supersession rule invented server-side (N8), which is what the header above
- * forbids this module. The repair belongs with #304's design round.
- *
- *
- * ⚠️ IT IS NOT THIS SLICE'S TO FIX, AND THE OBVIOUS FIX IS FORBIDDEN HERE. The
- * repair is derivable from the log alone — "a placement whose answerId never
- * reappears" — and writing that fold into this module is EXACTLY the second
- * transition table the paragraph above forbids: a supersession rule invented
- * server-side, which is how N8 gets reintroduced by the code meant to prevent
- * it. **#251** owns what should render for such a lane (settled: nothing — core's
- * built-in Telegram extension deletes an unfinalized preview at turn end) and
- * **#264** owns deriving it from events alone, which may require a turn-close
- * event and therefore **#241** / the reducer's BOUNDARY 2. The placement mapper
- * in `delivery-journal-event.ts` records the same fact at the point the event is
- * created; this block exists so the reader who hits the phantom bubble in a
- * replay finds it here too.
- *
- * ⚠️ THIS IS NOW THE ONLY HISTORY READ PATH. #240 half 2 wired both call sites
- * (the register-time snapshot and the `load_history` pager) to
- * `serveHistoryRequest` below and DELETED the core transcript reader with them:
- * the `runtime.subagent` session-message read, the `AsyncResource`
- * operator-scope detour, the transcript normalizer and `history-sanitize.ts`
- * are gone from this package. `history.ts` survives as the wire type + config +
- * request-plan module and nothing else. Both call sites live in
- * `history-serve.ts`, which owns the deferral, the per-peer in-flight bound and
- * the failure policy; `nats-account-runtime.ts` only wires it.
- *
- * ⚠️ THE CLIENT'S AGENT-SIDE ADOPTION TIERS ARE GONE, and that is a consequence
- * of this module rather than a separate cleanup. Because the journal serves the
- * delivery-act id, an agent bubble the client rendered live carries the id the
- * snapshot carries — so it matches by ID, and an agent row that does NOT match
- * by id has no local counterpart at all. Four data-loss defects were found in
- * that block across four review rounds before the tiers were deleted rather
- * than patched a fifth time. `case "history"` in `nats-client-wrapper.ts` now
- * matches an agent row by id or fresh-inserts it; it never guesses.
- *
- * ⚠️ USER ROWS STILL TEXT-MATCH, AND THE RESIDUAL IS REAL. The client renders a
- * user echo under a local `u-<n>` while the accept seam journals the inbound
- * WIRE id, so user ids do NOT agree and tier 2 is how the echo is recovered.
- * That is the ordinal/text inference N5 forbids, still running on one path.
- * **#302** owns removing it and stays OPEN, blocked on **#243** giving a user
- * message one shared id. (The #104/#227/#228 doc §5 originally cited for this
- * are all CLOSED.)
- *
- * ⚠️ NEVER SANITIZE HERE. Do not reintroduce `sanitizeHistoryText` or anything
- * like it. The journal stores the EXACT text that was published to the client,
- * so re-sanitizing on the way out would make history differ from live by
- * construction — N8, introduced by the one module whose job is to prevent it.
- * The deleted sanitizer existed ONLY because the core-transcript reader received
- * raw model output that the live path never showed verbatim; that input no
- * longer reaches this package, so the module had no subject left.
- *
- * ⚠️ AND NEVER SORT. The reducer's slot-claim order IS the order — a `placement`
- * fixes a lane's position, and a `seal` may legitimately permute answer slots
- * afterwards, so the `ts` values below can be NON-MONOTONE with respect to the
- * emitted array. That is correct, not a bug: sorting by `ts` would override the
- * reducer and reintroduce N8. Measured, because `HistoryMessage`'s docblock used
- * to claim the widget "can sort by recency" and that claim was stale: there is no
- * `.sort(`/`.toSorted(` in any non-test file under `packages/client/src`, and
- * none in the widget tree at `demo/web/src/` either — where `presentation.ts` and
- * `app.ts` actually render the list. `ts` is hydration metadata, not an ordering
- * key. The docblock was corrected in half 2; this is the measurement behind it.
- *
- * ── MEMORY IS BOUNDED BY CONSTRUCTION ──
- *
- * `DeliveryJournal.read`'s docblock flags its unbounded default as a MEMORY
- * DECISION and quantifies it: at 20 000 rows of ~1.2 KB an unbounded read materializes
- * AND `JSON.parse`s the whole conversation synchronously — ~75 ms and ~25 MB of
- * live objects. This module answers that by never issuing one. It folds in
- * `HISTORY_REPLAY_CHUNK_ROWS`-sized pages, so what is alive at once is the
- * projected view, ONE chunk, and the `firstSeenMs` map — that last one is easy to
- * omit from this sentence and it is not free: it is O(DISTINCT IDS EVER NAMED),
- * which is at least as large as the EMITTED list. An id removed by a `seal` used
- * to be dropped from the view outright; since #241 half 2 it STAYS in the folded
- * view as a tombstone and is stripped only at the emit step below — so it sits in
- * BOTH the map and the folded view, but not in the emitted history. It is the
- * same ORDER as the view (one small entry per id, no text), so the bound holds —
- * but "the view and one chunk" is not the whole list.
- *
- * ⚠️ THAT BOUNDS THE LIVE SET, NOT THE ALLOCATION CHURN, and the distinction was
- * measured. Allocation is the reducer's DEFAULT: a transition that changes the
- * durable view returns a NEW array covering the whole view (structural sharing at
- * the ENTRY level, not the array level), so a 20 000-event replay allocates and
- * discards up to ~20 000 arrays of up to 10 000 pointers. UP TO, not exactly —
- * three paths hand the input array straight back instead: `applyPlacement`'s
- * `turnId === prev.turnId` no-op on a repeat claim, `applySeal`'s
- * no-valid-answers-and-no-removes early return, and `applySeal`'s blank-turnId
- * guard. That list is EXHAUSTIVE, and the ARRAY IDENTITY table in
- * `durable-view-reducer.ts`'s own header is where it is maintained — read it
- * there rather than re-deriving it here. `MIXED_STREAM` in the test file
- * exercises the first, via its repeat placement claim. So ~20 000 is an UPPER
- * BOUND on the arrays, not a count of them. The measurement is unaffected: heap
- * BEFORE a forced GC came out HIGHER for the chunked replay (+85.5 MB) than for
- * the unbounded read (+48.0 MB), while retained heap after one came out lower
- * (+11.8 MB vs +22.0 MB). Neither number is a defect — one is garbage, one is the
- * live set — but do not quote the chunking as a bound on GC pressure. It is a
- * bound on what is retained.
- *
- * ── COST: A PAGE IS A FULL REPLAY, AND THE REPLAY IS QUADRATIC ──
- *
- * Both page selectors below operate on the FULL projection, so serving any page
- * replays the entire conversation. That is correct (the reducer is the only
- * thing allowed to decide order) but it is not free, and doc §15.4 says
- * pagination should eventually come off the materialized `journal_message` read
- * model. That table is NOT built here — it is **#286**, filed off the numbers
- * below.
- *
- * MEASURED against a real `openDeliveryJournal` on this dev box (zfs, WAL +
- * `synchronous = FULL`), a realistic mixed stream (user / 3 placements /
- * 3 bubbles / seal per turn) at the ~1.2 KB payload size the store docblock
- * calls dominant, warm cache, best of three runs, milliseconds:
- *
- *   events  messages  raw unbounded read  fold only  project@128  @512  @4096
- *    1 000       500                 2.9        3.3          6.8    6.2    5.9
- *    5 000     2 500                15.0       62.0         77.6   77.0   74.2
- *   10 000     5 000                30.8      269.6        316.7  312.7  310.4
- *   20 000    10 000                60.9    1 323.3      1 449.6 1449.1 1430.9
- *
- * ⚠️ THOSE NUMBERS ARE NOW A FLOOR, NOT AN ESTIMATE, AND THE FIXTURE IS WHY.
- * It is 8 events per turn (user / 3 placements / 3 bubbles / seal) and contains
- * NO TOOL EVENTS AT ALL — it could not, because tool activity journaled nothing
- * when this was measured. Half 3 changed that: every `tool_activity` FRAME is a
- * row, so on an account with streaming on, ONE tool call adds at least three
- * events to the turn (`start` / `update` / `end`) and a chatty tool adds one more
- * per `update`. A turn with a handful of tool calls is therefore several times
- * the fixture's event count, against a fold that is quadratic in it. No new
- * numbers are offered here — measure them if you need them — but do not quote the
- * table as the cost for a streaming-mode account. It UNDERSTATES it, by a factor
- * this fixture cannot say.
- *
- * ⚠️ AND THE FIRST PLACE THAT LANDS IS THE REGISTER-TIME SNAPSHOT, not paging.
- * `history-serve.ts` folds the whole journal on EVERY register, and the rate of
- * that hop is unbounded for an authenticated peer — already filed as **#298**,
- * which owns bounding the trigger. #298 and #286 stay independent levers (one
- * makes the fold cheaper, one bounds how often it runs); what half 3 changes is
- * only how much each register costs.
- *
- * Three things fall out of that table, and only the first was expected:
- *
- *  1. CHUNK SIZE IS NOT A TIME/MEMORY TRADE — and that has to be stated in the
- *     unit that is true at each end, because the RATIO is not flat. 128 vs 4096
- *     is +1.3% at 20 000 events (1449.6 vs 1430.9) and +2.0% at 10 000; the
- *     spread WIDENS as a fraction on short conversations (+4.6% at 5 000, +15.3%
- *     at 1 000), because there the fold is small enough that the extra reads
- *     stop disappearing into it. But at 1 000 events that 15.3% is 0.9 ms of
- *     wall clock (6.8 vs 5.9). So: ~1% where the projection is expensive, under
- *     a millisecond where it is not, and no size where the memory bound buys
- *     back time worth having — see `HISTORY_REPLAY_CHUNK_ROWS`. Quote BOTH ends
- *     in their own unit; a single percentage across the table is false at three
- *     of these four sizes whichever one you pick.
- *  2. THE SQL IS NOT THE COST. The raw unbounded read is linear and small
- *     (~61 ms at 20 000 — the same ORDER as the ~75 ms in
- *     `DeliveryJournal.read`'s docblock, not a match for it; the two runs differ
- *     by 19%); the projection is 24x that.
- *  3. ⚠️ THE COST IS THE SHARED REDUCER'S FOLD, AND IT IS QUADRATIC IN
- *     CONVERSATION LENGTH. `fold only` is `reduceDurableView` over rows already
- *     parsed, so the gap up to `project@512` is this module's own overhead — the
- *     reads, the `JSON.parse`, the `firstSeenMs` bookkeeping and the final
- *     `view.map`. That overhead is 9.5% at 20 000 events (1449.1 vs 1323.3),
- *     and it is a much larger fraction of a much smaller number lower down the
- *     table: 16% at 10 000, 24% at 5 000, 88% at 1 000 — where the entire
- *     projection is 6.2 ms and the constant costs simply have nothing to hide
- *     behind. Read it as "the fold dominates once the conversation is long
- *     enough for the projection to matter", never as a fixed ~9% surcharge.
- *     The fold itself grows ~4–5x per 2x of events (62.0 → 269.6 is 4.35x,
- *     269.6 → 1 323.3 is 4.91x — quote the range, not one exponent) because
- *     ALL FOUR upserting applies scan by `view.findIndex` —
- *     `applyPlacement`/`applyBubble`, plus `applyReasoning` (half 2) and
- *     `applyTool` (half 3), which is the highest-frequency of the four since it
- *     folds one row per FRAME rather than per message — and each
- *     view-changing transition allocates a fresh array of the whole view. That
- *     is inherent to the reducer, is fine LIVE (one event at a time
- *     against a short view), and must NOT be "optimized" here — a faster private
- *     fold in the plugin is a second implementation, which is N8. The fix is the
- *     materialized read model of §15.4 (**#286**), which replays incrementally
- *     from a checkpoint instead of from zero; the hard part there is PROVING a
- *     checkpointed projection equivalent to a full replay, not the table.
- *
- * Memory behaves as intended and was measured the same way (heap retained after
- * a forced GC, 20 000 events): the unbounded read holds +22.0 MB live, the
- * chunked projection +11.8 MB — and the latter is the RESULT (10 000 messages),
- * not a transient.
- *
- * So: fine per RECONNECT at today's conversation lengths, already ~1.4 s at
- * 20 000 events, and not viable per page-scroll. That is #286's job.
- *
- * ⚠️ AND HALF 2 SHIPPED THE CUTOVER ANYWAY, WITH MITIGATIONS THAT ARE NOT A FIX.
- * `history-serve.ts` does two things, and they are worth stating separately
- * because an earlier version of this paragraph ran them together and got the
- * second one wrong:
- *  - DEFERRAL. Both call sites schedule the fold, so it never runs on the turn
- *    that requested it — the register reply publishes before the snapshot is
- *    projected. This changes WHO ELSE GETS TO RUN, not the CPU spent.
- *  - A PER-PEER IN-FLIGHT LATCH. For ONE peer a burst of `load_history` frames
- *    does NOT become "one turn per page": the first is scheduled and the rest
- *    are DROPPED. Interleaving one fold per turn is what happens across
- *    DIFFERENT peers.
- * Neither is a bound on depth or on rate. A 20 000-event conversation still
- * costs ~1.4 s of blocked loop PER PAGE, and pages are unbounded — a depth bound
- * was built and reverted because total length is checkable before a fold and
- * cursor depth is not, so a length gate destroys reach instead of limiting it
- * (`history-serve.ts`'s header has the full argument). Do not read the deferral
- * or the latch as the cost being handled; #286 is the fix.
+ * Replay stays chunked and synchronous; every page still folds the conversation
+ * (#286 read optimization is separate). Reasoning preview placement can differ
+ * from its durable close event's position. Unknown event kinds are counted and
+ * reported by history-serve; they do not become invented history rows.
  */
+import { DurableRowVersions, durableRowKey } from "../../client/src/durable-row-versions.js";
 import {
-  applyDurableEvent,
   type DurableMessage,
   type DurableView,
 } from "../../client/src/durable-view-reducer.js";
@@ -646,6 +348,8 @@ export function projectJournalHistory(
   }
 
   let view: DurableView = [];
+  const versions = new DurableRowVersions();
+  const randomIds = new Map<string, string>();
   const firstSeenMs = new Map<string, number>();
   let unsupportedEvents = 0;
   let afterSeq = 0;
@@ -676,7 +380,10 @@ export function projectJournalHistory(
         continue;
       }
       recordFirstSeen(firstSeenMs, event, row.createdMs);
-      view = applyDurableEvent(view, event);
+      if (event.kind === "user" && event.randomId !== undefined && !randomIds.has(event.id)) {
+        randomIds.set(event.id, event.randomId);
+      }
+      view = versions.apply(view, event, row.seq);
     }
     // A short chunk is the end of the log — the ordinary exit. An exactly-full
     // final chunk costs one more (empty) read, which is the price of not
@@ -783,7 +490,12 @@ export function projectJournalHistory(
       // here to keep the type honest rather than as a policy.
       ts = lastCreatedMs ?? 0;
     }
-    messages.push(historyRowFor(message, ts));
+    messages.push({
+      ...historyRowFor(message, ts),
+      seq: versions.seq(durableRowKey(message)),
+      ...(message.kind === "text" && message.role === "user" && randomIds.has(message.id)
+        ? { randomId: randomIds.get(message.id) } : {}),
+    });
   }
 
   return { messages, unsupportedEvents, tsFallbacks };
@@ -856,7 +568,12 @@ function historyRowFor(
         ts,
       };
     case "text":
-      return { id: message.id, role: message.role, text: message.text, ts };
+      return {
+        id: message.id, role: message.role, text: message.text, ts,
+        ...(message.turnId !== undefined ? { turnId: message.turnId } : {}),
+        ...(message.revision !== undefined ? { revision: message.revision } : {}),
+        ...(message.edited !== undefined ? { edited: message.edited } : {}),
+      };
     default: {
       const unhandled: never = message;
       void unhandled;
@@ -1306,30 +1023,8 @@ export function historyPageBefore(
   return messages.slice(Math.max(0, idx - limit), idx);
 }
 
-/**
- * A projected row's `turnId`, or `undefined` for the variants that HAVE NO SUCH
- * FIELD (`channel-contract.ts`: the field is absent on text AND on #242 half 4's
- * approval rows — reasoning and tool are the two that carry it, and the union is
- * discriminated on `kind`). So a bubble or approval id can never be matched by a
- * pair cursor, which is correct: the wire shape is the whole reason, and nothing
- * mints a pair cursor for one.
- *
- * ⚠️ DO NOT RE-ADD "AND BUBBLE IDS ARE GLOBALLY UNIQUE" AS A SECOND REASON — it
- * was here, and it is FALSE for the user half. `ingress-dedupe.ts` journals the
- * peer-supplied wire id VERBATIM, and inbound user ids are client-supplied,
- * checked only for non-emptiness and `MAX_INBOUND_USER_ID_LENGTH` (**#293**, and
- * `historyPageBefore`'s guard note above names the same three doors). Neither
- * check constrains the content, and a plugin-minted id fits well inside 128
- * chars, so a peer can echo one. Agent bubble ids are `nextMessageId()`-minted;
- * user ones are not, so a uniqueness premise layered on top of the wire-shape
- * reason would be a claim this projection cannot make.
- */
+/** Tool/reasoning cursors include their turn; text/approval cursors remain ID-only. */
 function rowTurnId(message: ProjectedHistoryMessage): string | undefined {
-  // Only the variants that CARRY a `turnId` field can seat a pair cursor:
-  // reasoning and tool. Text bubbles (`kind === undefined`) never had one, and
-  // #242 half 4's approval rows deliberately do not either — an approval is
-  // identified by its plugin-minted request `id` alone, like a bubble, so it
-  // pages by the id-only cursor. Anything without the field returns undefined.
   return message.kind === "reasoning" || message.kind === "tool" ? message.turnId : undefined;
 }
 

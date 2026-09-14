@@ -94,7 +94,7 @@ function thread(prefix: string): JournalEvent[] {
  */
 function recordingChannel(limit = 8 * 1024 * 1024): {
   channel: HistoryChannelSurface;
-  sent: Array<{ peerId: string; messages: HistoryMessage[]; highWaterSeq?: number }>;
+  sent: Array<{ peerId: string; messages: HistoryMessage[]; highWaterSeq?: number; snapshotComplete?: boolean }>;
   // #244 half B / #356: the `difference` frames the serve path emitted, with the
   // whole reply body — the echo and the two catch-up signals are as much of the
   // contract as the events are.
@@ -109,7 +109,7 @@ function recordingChannel(limit = 8 * 1024 * 1024): {
    */
   rowMeasurements: number;
 } {
-  const sent: Array<{ peerId: string; messages: HistoryMessage[]; highWaterSeq?: number }> = [];
+  const sent: Array<{ peerId: string; messages: HistoryMessage[]; highWaterSeq?: number; snapshotComplete?: boolean }> = [];
   const differences: Array<{ peerId: string } & DifferenceReply> = [];
   const counter = { n: 0, rows: 0 };
   return {
@@ -123,8 +123,8 @@ function recordingChannel(limit = 8 * 1024 * 1024): {
     },
     channel: {
       // #244 half A: capture the high-water baseline the snapshot path stamps.
-      sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number) {
-        sent.push({ peerId, messages, highWaterSeq });
+      sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number, snapshotComplete?: boolean) {
+        sent.push({ peerId, messages, highWaterSeq, snapshotComplete });
         return true;
       },
       sendDifference(peerId, reply) {
@@ -348,24 +348,20 @@ describe("createHistoryServer — plan dispatch and empty results", () => {
     expect(sent[1].messages.map((m) => m.id)).toEqual(["u-6", "u-7", "u-8"]);
   });
 
-  it("SUPPRESSES an empty snapshot but SENDS an empty page", () => {
-    // The asymmetry is deliberate. An empty snapshot is nothing to hydrate. An
-    // empty page is still an ANSWER — a no-op for our own client (its
-    // `case "history"` returns early on a zero-length list and `loadHistory`
-    // keeps no pending state to clear), and the end-of-history signal for a
-    // third-party client that tracks its request. Sending nothing is worse for
-    // both.
+  it("sends an empty snapshot baseline and an empty page", () => {
     const journal = openJournal();
     const { server, sent, scheduler } = harness(journal);
 
     server.sendSnapshot("peer-who-never-spoke");
     scheduler.flush();
-    expect(sent).toEqual([]);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].messages).toEqual([]);
+    expect(sent[0].highWaterSeq).toBe(0);
 
     server.servePage("peer-who-never-spoke", {});
     scheduler.flush();
-    expect(sent).toHaveLength(1);
-    expect(sent[0].messages).toEqual([]);
+    expect(sent).toHaveLength(2);
+    expect(sent[1].messages).toEqual([]);
   });
 });
 
@@ -682,8 +678,9 @@ describe("createHistoryServer — a non-authoritative projection is never silent
     server.sendSnapshot(PEER);
     scheduler.flush();
 
-    // The frame is still suppressed — that part is unchanged and correct.
-    expect(sent).toEqual([]);
+    // Unknown-event diagnostics remain visible even for an empty baseline.
+    expect(sent).toHaveLength(1);
+    expect(sent[0].messages).toEqual([]);
     // But it is no longer silent, and the line names the count.
     expect(errors).toHaveLength(1);
     expect(errors[0]).toContain("projection is NOT authoritative");

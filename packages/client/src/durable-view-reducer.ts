@@ -1602,6 +1602,16 @@ function applySeal(
         )
       : view.slice();
 
+  // A warm client may not have paged this ID yet. Retain the server's removal
+  // even then, so a delayed older page/difference cannot create it afterwards.
+  // These hidden slots never contribute to the visible answer order.
+  const heldTextIds = new Set(msgs.filter((m) => m.kind === "text").map((m) => m.id));
+  for (const id of removeSet) {
+    if (!heldTextIds.has(id)) {
+      msgs.push({ kind: "text", id, role: "agent", text: "", turnId, deleted: true });
+    }
+  }
+
   // 2. Desired answer objects, in authoritative order, reusing any existing
   //    bubble (so a live bubble's fields survive).
   const existingById = new Map<string, DurableTextMessage>();
@@ -1660,7 +1670,7 @@ function applySeal(
  * durable fields is a compile error there.
  */
 type ClientTranscriptEntry =
-  | { kind?: undefined; id: string; role: DurableRole; text: string; turnId?: string; draftOnly?: boolean }
+  | { kind?: undefined; id: string; role: DurableRole; text: string; turnId?: string; draftOnly?: boolean; revision?: number; edited?: boolean }
   | { kind: "reasoning"; id: string; turnId: string; text: string }
   | {
       kind: "tool";
@@ -1764,6 +1774,8 @@ export function projectDurable(messages: ClientTranscriptEntry[]): DurableView {
       role: m.role,
       text: m.text,
       turnId: m.turnId,
+      ...(m.revision !== undefined ? { revision: m.revision } : {}),
+      ...(m.edited !== undefined ? { edited: m.edited } : {}),
     };
   });
 }

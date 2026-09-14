@@ -294,6 +294,11 @@ export type InboundMessage = {
    * never be admitted from the wire.
    */
   messages?: Array<{
+    /** Last row modification in the journal, not an ordering key. */
+    seq?: number;
+    randomId?: string;
+    revision?: number;
+    edited?: boolean;
     id: string;
     kind?: string;
     role?: string;
@@ -355,6 +360,8 @@ export type InboundMessage = {
   seq?: number;
   /** #244 half A — see `seq`. */
   highWaterSeq?: number;
+  /** False when byte fitting omitted requested snapshot content. */
+  snapshotComplete?: boolean;
   /**
    * #245 Part B: on a `user_committed` frame, the client-minted idempotency
    * `random_id` of the send this echoes — the origin device's reconciliation key

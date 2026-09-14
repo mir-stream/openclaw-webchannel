@@ -44,6 +44,15 @@ function makeWrapper(): WebChannelNATSClient {
   });
 }
 
+// These history fixtures start at public send(), then receive explicit server
+// acknowledgement. No content/ordinal matching is provided by the fixture.
+function sendMapped(w: WebChannelNATSClient, text: string, id: string): void {
+  const receipt = w.send(text)!;
+  const internals = w as unknown as { randomIdToReceiptKey: Map<string, string> };
+  const randomId = [...internals.randomIdToReceiptKey].find(([, key]) => key === receipt.id)![0];
+  deliver(w, { type: "ack", committed: [{ random_id: randomId, messageId: id }] });
+}
+
 type AnyFrame = { type: string; [k: string]: unknown };
 
 /** Drive the private inbound dispatcher directly (no socket needed). */
@@ -195,7 +204,7 @@ describe("#95 WP B — cold reload is a faithful reconstruction of the row seque
 describe("#95 WP B — live timeline converges to the row sequence", () => {
   /**
    * The ordinary post-cutover case: every agent row TIER-1 matches (same
-   * delivery-act id), the user row tier-2 adopts, and the live and reloaded
+   * delivery-act id), the user row matches its explicit acknowledgement, and the live and reloaded
    * timelines agree exactly.
    *
    * ⚠️ RE-BASED ONTO JOURNAL IDS. This used to deliver `TWO_STEP_ROWS`
@@ -208,7 +217,7 @@ describe("#95 WP B — live timeline converges to the row sequence", () => {
    */
   it("a live session and a cold reload of the same transcript agree", () => {
     const live = makeWrapper();
-    live.send("which agents are configured?");
+    sendMapped(live, "which agents are configured?", "wire-8f3a1c");
     deliver(live, { type: "agent_message", id: "webchannel-1", text: "Let me check that." });
     deliver(live, {
       type: "agent_message",
@@ -248,7 +257,7 @@ describe("#95 WP B — live timeline converges to the row sequence", () => {
    */
   it("does not positionally adopt an agent row that matches no local text", () => {
     const w = makeWrapper();
-    w.send("which agents are configured?");
+    sendMapped(w, "which agents are configured?", "wire-8f3a1c");
     // An answer THIS device rendered live.
     deliver(w, {
       type: "agent_message",
@@ -301,7 +310,7 @@ describe("#95 WP B — live timeline converges to the row sequence", () => {
    */
   it("converges when incoming rows outnumber seeded live bubbles", () => {
     const w = makeWrapper();
-    w.send("which agents are configured?");
+    sendMapped(w, "which agents are configured?", "wire-8f3a1c");
     deliver(w, {
       type: "agent_message",
       id: "webchannel-2",
@@ -488,23 +497,8 @@ describe("#240 half 2 — the agent path no longer adopts (tiers 2 and 3 deleted
   });
 });
 
-/**
- * #240 half 2 — THE USER PATH STILL ADOPTS, AND MUST.
- *
- * Tier 2 is retained for user rows only. This is an N5 text inference the north
- * star forbids, kept because the ids do not agree yet: the client renders its
- * echo under `mintLocalBubbleId("u")` → `u-<n>` and carries the wire id only as
- * the durable event's `turnId`, while the plugin journals the WIRE id. So a user
- * row legitimately misses tier 1, and deleting tier 2 for users would
- * fresh-insert every user row of every snapshot — duplicating every message this
- * device has sent.
- *
- * The residual is owned by **#302**, which stays OPEN, and is unblocked only by
- * **#243**. These tests are what makes the retention safe to ship in the
- * meantime; they must keep passing until #243 changes the id story.
- */
-describe("#240 half 2 — the user path still converges (tier 2 retained, #302/#243)", () => {
-  it("adopts the wire id onto the local echo — one bubble, not two", () => {
+describe("#346 explicit user history adoption", () => {
+  it("preserves an unmapped legacy row and local echo without guessing", () => {
     const w = makeWrapper();
     w.send("hello there");
     const localId = w.getState().messages[0].id;
@@ -514,7 +508,8 @@ describe("#240 half 2 — the user path still converges (tier 2 retained, #302/#
     // the inbound WIRE id, which is a random token and never the `u-<n>` echo.
     deliver(w, history({ id: "wire-3f9c22", role: "user", text: "hello there", ts: 1 }));
 
-    expect(w.getState().messages).toHaveLength(1);
+    expect(w.getState().messages).toHaveLength(2);
+    expect(w.getState().messages[1].id).toBe(localId);
     expect(w.getState().messages[0].id).toBe("wire-3f9c22");
     expect(w.getState().messages[0].text).toBe("hello there");
   });
@@ -523,8 +518,8 @@ describe("#240 half 2 — the user path still converges (tier 2 retained, #302/#
     // Where a broken pool duplicates: same text twice. Each snapshot row must
     // take its own local echo, in order — not both land on the first.
     const w = makeWrapper();
-    w.send("ping");
-    w.send("ping");
+    sendMapped(w, "ping", "wire-aaa111");
+    sendMapped(w, "ping", "wire-bbb222");
     expect(w.getState().messages).toHaveLength(2);
 
     deliver(
@@ -562,7 +557,7 @@ describe("#240 half 2 — an unauthored placement row is dropped on arrival", ()
     // the journal cannot, because that rule keys on the client-local `draftOnly`
     // flag, which §15.9 deliberately never journals.
     const w = makeWrapper();
-    w.send("hi");
+    sendMapped(w, "hi", "wire-77aa10");
     deliver(w, { type: "agent_message", id: "webchannel-2", text: "real answer" });
 
     deliver(
@@ -696,13 +691,13 @@ describe("history hydration — reasoning rows (#242 half 2)", () => {
     expect(w.getState().messages.map((m) => m.id)).toEqual(["a1"]);
   });
 
-  it("tier 2 can never adopt onto, or from, a reasoning row", () => {
+  it("explicit user mapping cannot adopt onto, or from, a reasoning row", () => {
     // The user echo and the reasoning block carry IDENTICAL text, so a
     // text-only match would swap them. Two independent guards stop it: the
     // incoming row's `if (m.role === "user")`, and the adoptable pool's
     // `isAdoptableUserEcho`.
     const w = makeWrapper();
-    w.send("same text");
+    sendMapped(w, "same text", "wire-u1");
     deliver(w, { type: "reasoning", id: "r-live", turnId: "t1", text: "same text" });
     deliver(
       w,
@@ -712,7 +707,7 @@ describe("history hydration — reasoning rows (#242 half 2)", () => {
       ),
     );
     const ids = w.getState().messages.map((m) => m.id);
-    // The user echo adopted the WIRE id (tier 2, as designed) ...
+    // The user echo adopted its explicitly acknowledged server ID ...
     expect(ids).toContain("wire-u1");
     expect(ids).not.toContain("u-0");
     // ... the live reasoning block kept its own id, untouched ...

@@ -78,6 +78,13 @@ export { ANON_PEER_ID };
  * Full rationale: `docs/ISSUE_95_HISTORY_CONTRACT_PLAN.md`.
  */
 export type HistoryTextMessage = {
+  /** Explicit origin mapping; absent for legacy journal rows. */
+  randomId?: string;
+  turnId?: string;
+  revision?: number;
+  edited?: boolean;
+  /** Last journal modification of this row; never its display position. */
+  seq?: number;
   /**
    * Never present. The discriminant lives here as `undefined` so tsc treats the
    * two variants as a discriminated union rather than as two overlapping
@@ -141,6 +148,8 @@ export type HistoryTextMessage = {
  * text variant carries — see `history.ts`'s note; it is NOT an ordering key.
  */
 export type HistoryReasoningMessage = {
+  /** Last journal modification of this row; never its display position. */
+  seq?: number;
   kind: "reasoning";
   id: string;
   turnId: string;
@@ -191,6 +200,8 @@ export type HistoryReasoningMessage = {
  * class to the same frame. A reader meeting a large page meets it here.
  */
 export type HistoryToolMessage = {
+  /** Last journal modification of this row; never its display position. */
+  seq?: number;
   kind: "tool";
   id: string;
   turnId: string;
@@ -244,6 +255,8 @@ export type HistoryToolMessage = {
  * opt-in, so it appears at the DEFAULT configuration.
  */
 export type HistoryApprovalMessage = {
+  /** Last journal modification of this row; never its display position. */
+  seq?: number;
   kind: "approval";
   id: string;
   approvalKind: "exec" | "plugin";
@@ -562,6 +575,8 @@ export type OutboundWsMessage =
        * it" reading is dead on both halves.
        */
       highWaterSeq?: number;
+      /** False when byte fitting omitted requested snapshot content. */
+      snapshotComplete?: boolean;
     }
   | { type: "commands"; commands: CommandCatalogEntry[] }
   | {
@@ -792,7 +807,7 @@ export interface WebChannelPeerChannel {
    * attached to the register-time SNAPSHOT frame only (the pager omits it).
    * Additive and optional — see the `history` member of `OutboundWsMessage`.
    */
-  sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number): boolean;
+  sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number, snapshotComplete?: boolean): boolean;
   /**
    * #244 half B / #356: answer a `get_difference` with RAW events
    * (`seq > afterSeq`), in ascending `seq` order, plus the correlation echo and
@@ -880,7 +895,7 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendTurnSettled(_peerId: string, _turnId: string, _outcome: "ok" | "error"): boolean { return false; }
   sendTurnSnapshot(_peerId: string, _turnId: string, _answers: Array<{ id: string; text: string }>, _remove: string[]): boolean { return false; }
   sendTyping(_peerId: string): boolean { return false; }
-  sendHistory(_peerId: string, _messages: HistoryMessage[], _highWaterSeq?: number): boolean { return false; }
+  sendHistory(_peerId: string, _messages: HistoryMessage[], _highWaterSeq?: number, _snapshotComplete?: boolean): boolean { return false; }
   sendDifference(_peerId: string, _reply: DifferenceReply): boolean { return false; }
   sendUserCommitted(_peerId: string, _message: { id: string; text: string; turnId?: string; seq: number; random_id?: string }): boolean { return false; }
   sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload, _options?: { redelivery?: boolean }): ApprovalRequestSendResult { return { delivered: false, journaled: false }; }

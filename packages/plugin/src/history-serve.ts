@@ -597,7 +597,9 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
         channel.outboundWireSize(peerId, {
           type: "history",
           messages: rows,
-          ...(options.highWaterSeq !== undefined ? { highWaterSeq: options.highWaterSeq } : {}),
+          ...(options.highWaterSeq !== undefined ? {
+            highWaterSeq: options.highWaterSeq, snapshotComplete: rows.length === messages.length,
+          } : {}),
         }),
     });
 
@@ -648,9 +650,10 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
     // than as "this window cannot be shown". There is no wire signal for the
     // latter — **#296** owns adding one — so the `error` above is where that
     // fact lives today.
-    if (fitted.rows.length === 0 && !options.sendEmpty) return;
+    if (fitted.rows.length === 0 && !options.sendEmpty && options.highWaterSeq === undefined) return;
 
-    if (!channel.sendHistory(peerId, fitted.rows, options.highWaterSeq)) {
+    if (!channel.sendHistory(peerId, fitted.rows, options.highWaterSeq,
+      options.highWaterSeq === undefined ? undefined : fitted.rows.length === messages.length)) {
       const suppressed = admit(kind, "publish-failed");
       if (suppressed !== undefined) {
         try {
@@ -1124,13 +1127,9 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
           return served.messages;
         },
         (messages) => {
-          // Kept as `> 0`, not "always send": an empty snapshot is nothing to
-          // hydrate. Safe to suppress ONLY because `reportProjectionHealth`
-          // above has already spoken if the emptiness was manufactured by rows
-          // this build could not read.
-          if (messages.length > 0) {
-            publishFitted("snapshot", peerId, messages, { sendEmpty: false, highWaterSeq });
-          }
+          // An empty conversation still supplies its baseline. If byte fitting
+          // removes content, snapshotComplete=false prevents false cold seeding.
+          publishFitted("snapshot", peerId, messages, { sendEmpty: true, highWaterSeq });
         },
       );
     },

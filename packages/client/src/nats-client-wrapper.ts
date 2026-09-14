@@ -11,6 +11,7 @@
  * - Message format preserved (compatible with existing UI)
  */
 
+import { DurableRowVersions, durableRowKey } from "./durable-row-versions.js";
 import type {
   WebChannelOptions,
   WebChannelState,
@@ -176,16 +177,15 @@ const GET_DIFFERENCE_MAX_RETRIES = 3;
  *    never calls `getDifference` before it holds a `pts`. The FIRST seq this
  *    client observes — the snapshot's `highWaterSeq` (`getState`, the normal
  *    case) or, if a durable frame beats it, that frame's own seq — becomes the
- *    baseline, and the frame that carried it folds. Nothing is requested.
+ *    baseline, and the frame that carried it folds. A byte-incomplete snapshot
+ *    explicitly cannot seed that baseline; it recovers from zero instead.
  *
  *    ⚠️ ADOPTING THE FIRST OBSERVATION IS THE POINT, AND WAITING FOR THE SNAPSHOT
  *    WOULD BE A WORSE BUG THAN THE ONE THIS FIXES. `lastAppliedSeq` used to start
  *    at 0, so the first live frame of a reload mid-turn read as a gap from 0 and
  *    pulled the ENTIRE conversation back through the fold in 500-event pages
  *    (#350). But holding frames until a `history` snapshot arrives is not the
- *    cure: `history-serve.ts` SUPPRESSES an empty snapshot ("an empty snapshot is
- *    nothing to hydrate"), so a brand-new conversation never receives one and
- *    would hold every frame forever. A client that has just connected cannot know
+ *    cure: live traffic may beat the baseline. A client that just connected cannot know
  *    of a hole BELOW its first observation, and must not invent one; what it can
  *    see from there on is contiguous.
  *
@@ -671,17 +671,17 @@ type KeyedTranscriptEntry =
 function transcriptEntryKey(entry: KeyedTranscriptEntry): string {
   switch (entry.kind) {
     case undefined:
-      return `t\0${entry.id}`;
+      return JSON.stringify(["text", entry.id]);
     case "reasoning":
-      return `r\0${entry.id}`;
+      return JSON.stringify(["reasoning", entry.id]);
     case "tool":
-      return `x\0${toolEntryKey(entry.turnId, entry.id)}`;
+      return JSON.stringify(["tool", entry.turnId, entry.id]);
     // #242 half 4. Keyed by `id` alone, like the first two and unlike `tool`:
     // an approval id is the gateway's own `approvalId` (the value the client
     // sends back on `approval_decision`), so it is the whole identity and there
     // is no second field to compose.
     case "approval":
-      return `p\0${entry.id}`;
+      return JSON.stringify(["approval", entry.id]);
     default: {
       const unhandled: never = entry;
       void unhandled;
@@ -758,7 +758,7 @@ function indexTranscriptByKind(messages: readonly ChatMessage[]): TranscriptInde
  * sites that must remember it.
  */
 function toolEntryKey(turnId: string, id: string): string {
-  return `${turnId}\0${id}`;
+  return JSON.stringify([turnId, id]);
 }
 
 /**
@@ -2951,6 +2951,8 @@ export class WebChannelNATSClient {
         ...base,
         id: entry.id,
         role: entry.role,
+        ...(entry.revision !== undefined ? { revision: entry.revision } : {}),
+        ...(entry.edited !== undefined ? { edited: entry.edited } : {}),
         // Rule 2's carve-out: while the bubble holds only a draft, `text` is the
         // client's, not the view's.
         text: draftOnly === true && !overlaySetsText && base !== undefined
@@ -2988,8 +2990,20 @@ export class WebChannelNATSClient {
     local?: DurableLocalOverlay,
   ): ChatMessage[] {
     const before = this.durableProjection();
-    const after = applyDurableEvent(before, event);
-    return this.mergeDurable(this.state.messages, after, local);
+    const floor = this.cursor.state === "unseeded" ? 0
+      : this.cursor.state === "synced" ? this.cursor.last : this.cursor.afterSeq;
+    const allowedLocal = local === undefined ? undefined : Object.fromEntries(
+      Object.entries(local).filter(([id]) => {
+        const key = transcriptEntryKey({ id });
+        const held = this.state.messages.find((row) => row.kind === undefined && row.id === id);
+        return this.rowVersions.allows(key, this.frameSeq)
+          || (event.kind === "placement" && !this.rowVersions.deleted(key)
+            && (held?.draftOnly === true || local[id]?.draftOnly === true || this.replayPlacementIds.has(id))
+            && this.frameSeq === this.rowVersions.seq(key));
+      }),
+    );
+    const after = this.rowVersions.apply(before, event, this.frameSeq, floor);
+    return this.mergeDurable(this.state.messages, after, allowedLocal);
   }
 
   /**
@@ -3100,6 +3114,9 @@ export class WebChannelNATSClient {
   // register-time `history` snapshot's `highWaterSeq` arrives, and Telegram's app
   // asks for nothing before then. See `SeqCursor` for the states and the rules.
   private cursor: SeqCursor = { state: "unseeded" };
+  private readonly rowVersions = new DurableRowVersions();
+  private frameSeq: number | undefined;
+  private observedHistoryHighWater = 0;
 
   // ---------------------------------------------------------------------------
   // P0-4 — receipt records + send-state projection (D5)
@@ -3327,77 +3344,18 @@ export class WebChannelNATSClient {
     this.setState({ messages, ...(extraState ?? {}) });
   }
 
-  /**
-   * #243 half 2b: adopt the server-assigned durable ids echoed on an `ack`.
-   *
-   * `committed` is `{random_id, messageId}[]` (#243 half 2a): the plugin minted
-   * ONE durable `messageId` per inbound user message and echoes it against the
-   * client's idempotency `random_id`. For each entry we resolve `random_id →
-   * receiptKey` (the linkage `mintRandomId` recorded), find the optimistic
-   * `u-<n>` bubble carrying that receiptKey, and RE-KEY its durable id to the
-   * server `messageId`. After this the client's `user` id equals the id the
-   * delivery journal holds, so a later `history`/full-replay of the same
-   * conversation TIER-1 matches by id (`case "history"`) instead of adopting by
-   * text/position (tier 2/3) — live == history under one shared id, which is
-   * what #302 is blocked on.
-   *
-   * ⚠️ RE-KEYING A DURABLE ID ON THE CLIENT is the same in-place `id` rewrite
-   * `case "history"`'s `adoptAt` already performs on a user bubble; it is safe
-   * for exactly the reason `ChatBubble.receiptKey`'s docblock (`types.ts`) states
-   * — "history adoption rewrites `id` in place but keeps this key, so the receipt
-   * survives id churn." The receipt record and its `wireId` alias are keyed by
-   * `receiptKey`/`wireId`, NOT by the bubble id, and the spread preserves
-   * `receiptKey` (this method even MATCHES on it) — so `patchBubbleByReceiptKey`,
-   * `promoteAnchor`, and the send-state path all keep working; and the durable
-   * projection re-derives the bubble under its new id every frame, so the overlay
-   * carries across `mergeDurable` by `(kind,id)` (which is the loss `mergeDurable`'s
-   * own header warns about — averted here because the re-key lands in
-   * `state.messages` before the next projection reads it). We change ONLY `id`;
-   * `text`/`ts`/`sendState`/`pending` are the
-   * bubble's own and stay — the same fields `adoptAt` keeps (it discards only
-   * `assistantMessageIndex`, which a user bubble never carries).
-   *
-   * A `random_id` with no linkage (never sent from this client), or one whose
-   * bubble was retracted, is a silent no-op — and a send whose ack carries NO
-   * `committed` at all simply never reaches here, leaving its bubble at `u-<n>`
-   * for the tier-2/3 text fallback (deliberately kept; removing it is half 3).
-   */
+  /** Reconcile an ACK's explicit random_id → server ID mapping with local receipts. */
   private adoptCommittedIds(
     // #244 half A adds an optional `seq` to each entry (the user message's wire
     // seq). Adoption ignores it — this method re-keys by `messageId` only.
     committed: Array<{ random_id: string; messageId: string; seq?: number }> | undefined,
   ): void {
     if (!Array.isArray(committed) || committed.length === 0) return;
-    // receiptKey → server messageId, for the entries we can resolve this frame.
-    const adopt = new Map<string, string>();
+    const lifecycle = this.wrapperLifecycleGeneration;
     for (const entry of committed) {
-      // #246 half A: the three hand-rolled checks that were here are now the
-      // shared `isCommittedEcho` predicate — the SAME rule the door decoder and
-      // the cursor advance apply, so no entry can be good enough for one of the
-      // three and not the others.
-      if (!isCommittedEcho(entry)) continue;
-      const { random_id: randomId, messageId } = entry;
-      const receiptKey = this.randomIdToReceiptKey.get(randomId);
-      // Consume the linkage: the echo is terminal for this `random_id` (its
-      // ledger entry drained on this same `ack`, so no replay reuses it).
-      this.randomIdToReceiptKey.delete(randomId);
-      if (receiptKey === undefined) continue;
-      adopt.set(receiptKey, messageId);
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
+      if (isCommittedEcho(entry)) this.adoptUserBubbleByRandomId(entry.random_id, entry.messageId);
     }
-    if (adopt.size === 0) return;
-
-    let changed = false;
-    const messages = this.state.messages.map((m): ChatMessage => {
-      // Only a sent USER echo adopts. `role === "user"` narrows to `ChatBubble`
-      // (the other union members have no `role`), and `receiptKey` links it to
-      // its send.
-      if (m.role !== "user" || m.receiptKey === undefined) return m;
-      const serverId = adopt.get(m.receiptKey);
-      if (serverId === undefined || serverId === m.id) return m;
-      changed = true;
-      return { ...m, id: serverId };
-    });
-    if (changed) this.setState({ messages });
   }
 
   /**
@@ -3442,6 +3400,24 @@ export class WebChannelNATSClient {
       return;
     }
 
+    if (msg.type === "history" && isWireSeq(msg.highWaterSeq)) {
+      const cursor = this.cursor;
+      if (cursor.state === "catching-up") {
+        this.observedHistoryHighWater = Math.max(this.observedHistoryHighWater, msg.highWaterSeq);
+        return;
+      }
+      if (cursor.state === "unseeded" && msg.snapshotComplete === false) {
+        this.observedHistoryHighWater = Math.max(this.observedHistoryHighWater, msg.highWaterSeq);
+        this.openCatchUp(0, []);
+        return;
+      }
+      if (cursor.state === "synced" && msg.highWaterSeq > cursor.last) {
+        this.observedHistoryHighWater = Math.max(this.observedHistoryHighWater, msg.highWaterSeq);
+        this.openCatchUp(cursor.last, []);
+        return;
+      }
+    }
+
     // ⚠️ READ BEFORE `applyFrame`, WHICH CONSUMES THE EVIDENCE. `adoptCommittedIds`
     // DELETES each `random_id` linkage it resolves, and that linkage is the only
     // thing that distinguishes this device's own receipt from another device's —
@@ -3468,7 +3444,10 @@ export class WebChannelNATSClient {
       // would park it beyond every real seq and gate out the whole stream after
       // it. The frame's own decoder already refuses such a value at the door;
       // this is the second guard, at the site that would suffer.
-      if (isWireSeq(msg.highWaterSeq)) this.observeSeq(msg.highWaterSeq, undefined);
+      if (isWireSeq(msg.highWaterSeq)) {
+        this.observedHistoryHighWater = Math.max(this.observedHistoryHighWater, msg.highWaterSeq);
+        this.observeSeq(msg.highWaterSeq, undefined);
+      }
     } else if (ownCommittedSeqs !== undefined) {
       // The inbound USER opener consumes a seq but rides no durable frame — half A
       // echoes that seq on the ack. Only THIS DEVICE'S echoes reach here.
@@ -3838,7 +3817,8 @@ export class WebChannelNATSClient {
     cursor: CatchingUpCursor,
   ): boolean {
     if (covered > cursor.afterSeq) return false;
-    return msg.partial === true || !completed || cursor.buffer.length > 0;
+    return msg.partial === true || !completed || cursor.buffer.length > 0
+      || covered < this.observedHistoryHighWater;
   }
 
   /**
@@ -3910,7 +3890,11 @@ export class WebChannelNATSClient {
     this.observeHeldTurnActivity(msg, preFrameLiveTurn);
     // #246 half A: the verdict travels to the caller — the seq cursor advances
     // only for a frame that was actually folded. See `handleFrame`.
-    const folded = this.handleFrame(msg);
+    const previousSeq = this.frameSeq;
+    this.frameSeq = isWireSeq(msg.seq) ? msg.seq : undefined;
+    let folded: boolean;
+    try { folded = this.handleFrame(msg); }
+    finally { this.frameSeq = previousSeq; }
     // P1-9 §3.2: every handled frame is a state transition — re-evaluate the
     // release gate after the reducer settles (a no-op when nothing is held or a
     // turn is still in flight). Deliberately NOT gated on `folded`: the latch
@@ -4083,7 +4067,10 @@ export class WebChannelNATSClient {
           if (seq <= last) continue;
           const decoded = decodeDurableEvent(entry.event);
           if (decoded.ok) {
-            this.foldDifferenceEvent(decoded.event);
+            const previousSeq = this.frameSeq;
+            this.frameSeq = seq;
+            try { this.foldDifferenceEvent(decoded.event); }
+            finally { this.frameSeq = previousSeq; }
             carriedSeqs.add(seq);
             for (const id of authoredIdsOf(decoded.event)) authoredIds.add(id);
           } else if (decoded.kind === "malformed") {
@@ -4149,7 +4136,7 @@ export class WebChannelNATSClient {
           // protect. Both branches below install a NEW cursor, and this is the one
           // place that retires the old one's timer.
           this.clearCatchUpTimer(cursor);
-          if (msg.partial === true) {
+          if (msg.partial === true || covered < this.observedHistoryHighWater) {
             // Telegram's `updates.differenceSlice`: "the query must be repeated,
             // using the intermediate status as the current status." The
             // intermediate status is `covered`; what carries forward is `rest` —
@@ -4214,58 +4201,160 @@ export class WebChannelNATSClient {
     }
   }
 
-  /**
-   * #337 / #245 Part B — adopt an un-adopted optimistic user bubble by `random_id`
-   * THEN fold the user event, the ONE body shared by the `get_difference` catch-up
-   * (`foldDifferenceEvent`'s `case "user"`) and the live multi-device broadcast
-   * (`handleFrame`'s `case "user_committed"`).
-   *
-   * Adopt FIRST — the SAME correlation the ack path uses — re-keying the local
-   * bubble to `event.id` BEFORE the fold, so `applyUser`'s `findTextIndex` now
-   * finds it and no-ops (ONE bubble on the ORIGIN device). If `randomId` is absent
-   * (older row/older client), unknown, or already adopted (the ack won the race
-   * and drained the linkage), the adopt is a no-op and `applyUser` APPENDS —
-   * which is exactly what a NON-ORIGIN device (no linkage for this `random_id`)
-   * wants. NEVER text-matched. `applyUser` is id-idempotent, so a re-delivery
-   * (broadcast PLUS a later gap-sync difference of the same event) is a no-op.
-   */
+  /** Fold the actual user event in stream order, retaining exact local send identity. */
   private foldUserEvent(event: Extract<DurableEvent, { kind: "user" }>): void {
+    const lifecycle = this.wrapperLifecycleGeneration;
     if (typeof event.randomId === "string" && event.randomId.length > 0) {
       this.adoptUserBubbleByRandomId(event.randomId, event.id);
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
+    }
+    // An ACK gives identity, not a journal position. When the actual user event
+    // first arrives, let the canonical append place it after earlier events in
+    // this difference/live stream, carrying the optimistic receipt as overlay.
+    const optimistic = this.state.messages.find((m) => m.role === "user" && m.id === event.id
+      && m.receiptKey !== undefined && this.rowVersions.seq(transcriptEntryKey(m)) === undefined);
+    if (optimistic !== undefined) {
+      const before = projectDurableFromClient(this.state.messages.filter((m) => m !== optimistic));
+      const after = this.rowVersions.apply(before, event, this.frameSeq);
+      this.setState({ messages: this.mergeDurable(this.state.messages, after) });
+      return;
     }
     this.applyDurable(event);
   }
 
-  /**
-   * #337 — adopt ONE un-adopted optimistic user bubble onto its server id by
-   * `random_id`, the resolve+rekey+delete core `adoptCommittedIds` runs per ack
-   * entry, narrowed to a single linkage for the difference fold.
-   *
-   * The linkage is CONSUMED (`delete`) unconditionally, exactly as the ack path
-   * does: the echo — via ack OR via a re-delivered difference — is terminal for
-   * this `random_id`. Whichever path runs first drains it, so the other's
-   * `randomIdToReceiptKey.get` returns undefined and it becomes a no-op (no
-   * double-adopt, no crash) — the ordering safety the ack/difference race needs.
-   *
-   * A `random_id` with no live linkage (already adopted, or never sent from this
-   * client) resolves to `undefined` ⇒ no re-key; the caller then folds unchanged
-   * (`applyUser` no-ops on an already-held id, or appends a genuinely new final).
-   */
+  /** Merge an exact origin echo with an already-hydrated server row atomically. */
   private adoptUserBubbleByRandomId(randomId: string, serverId: string): void {
     const receiptKey = this.randomIdToReceiptKey.get(randomId);
     // Consume the linkage — terminal for this random_id (mirrors adoptCommittedIds).
     this.randomIdToReceiptKey.delete(randomId);
     if (receiptKey === undefined) return;
+    const own = this.state.messages.find((m): m is ChatBubble => m.kind === undefined && m.role === "user" && m.receiptKey === receiptKey);
+    if (own === undefined) return;
+    const server = this.state.messages.find((m): m is ChatBubble => m.kind === undefined && m.role === "user" && m.id === serverId && m !== own);
+    const adopted: ChatMessage = { ...own, ...(server ?? {}), id: serverId,
+      receiptKey: own.receiptKey, wireId: own.wireId, sendState: own.sendState,
+      sendFailure: own.sendFailure, pending: own.pending,
+    };
+    const anchor = server ?? own;
+    const messages: ChatMessage[] = [];
+    for (const row of this.state.messages) {
+      if (row === anchor) messages.push(adopted);
+      else if (row !== own && !(row.role === "user" && row.id === serverId)) messages.push(row);
+    }
+    this.setState({ messages });
+  }
+
+  /** Merge projected rows by explicit identity and modification evidence. */
+  private hydrateHistory(msg: InboundMessage): void {
+    const rows = Array.isArray(msg.messages) ? msg.messages : [];
+    const lifecycle = this.wrapperLifecycleGeneration;
+    // Mapping is independent of content freshness. A stale page may still carry
+    // the first explicit acknowledgement of a locally published send.
+    for (const row of rows) {
+      if (row?.kind === undefined && row.role === "user" && typeof row.id === "string"
+        && row.id.length > 0 && typeof row.text === "string" && typeof row.randomId === "string" && row.randomId.length > 0) {
+        this.adoptUserBubbleByRandomId(row.randomId, row.id);
+        if (this.wrapperLifecycleGeneration !== lifecycle) return;
+      }
+    }
+    const existing = this.state.messages;
+    const indexes = new Map(existing.map((row, i) => [transcriptEntryKey(row), i]));
+    let view = this.durableProjection();
+    const local: DurableLocalOverlay = Object.create(null);
+    const timestamps = new Map<string, number>();
+    const resolved = new Set<string>();
+    const inserts = new Map<number, string[]>();
+    const seen = new Set<string>();
+    let cursor = 0;
     let changed = false;
-    const messages = this.state.messages.map((m): ChatMessage => {
-      // Only a sent USER echo re-keys. `role === "user"` narrows to `ChatBubble`;
-      // `receiptKey` links it to its send. An already-server-id bubble is a no-op.
-      if (m.role !== "user" || m.receiptKey !== receiptKey) return m;
-      if (m.id === serverId) return m;
-      changed = true;
-      return { ...m, id: serverId };
+    for (const row of rows) {
+      if (!row || typeof row.id !== "string" || row.id.length === 0) continue;
+      if (row.seq !== undefined && !isWireSeq(row.seq)) continue;
+      let raw: unknown;
+      if (row.kind === "tool") {
+        raw = { kind: "tool", id: row.id, turnId: row.turnId,
+          ...(row.name !== undefined ? { name: row.name } : {}),
+          ...(row.phase !== undefined ? { phase: row.phase } : {}),
+          ...(row.status !== undefined ? { status: row.status } : {}),
+          ...(row.summary !== undefined ? { summary: row.summary } : {}),
+          ...(Array.isArray(row.argKeys) ? { argKeys: row.argKeys.filter((k): k is string => typeof k === "string") } : {}),
+        };
+      } else if (row.kind === "approval") {
+        raw = { kind: "approval", id: row.id, approvalKind: row.approvalKind,
+          title: row.title, description: row.description, prompt: row.prompt,
+          options: row.options, expiresAtMs: row.expiresAtMs };
+      } else if (row.kind === "reasoning") {
+        if (row.text === "") continue;
+        raw = { kind: "reasoning", id: row.id, turnId: row.turnId, text: row.text };
+      } else if (row.kind === undefined && (row.role === "user" || row.role === "agent")) {
+        if (row.role === "agent" && row.text === "") continue;
+        raw = row.role === "user"
+          ? { kind: "user", id: row.id, text: row.text, turnId: row.turnId }
+          : { kind: "bubble", answerId: row.id, text: row.text, turnId: row.turnId };
+      } else continue;
+      const decoded = decodeDurableEvent(raw);
+      if (!decoded.ok) continue;
+      const key = transcriptEntryKey({ ...row, kind: row.kind } as KeyedTranscriptEntry);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const index = indexes.get(key);
+      if (index !== undefined) cursor = index + 1;
+      if (this.rowVersions.deleted(key)) continue;
+      // Missing version evidence permits insertion, never an overwrite of live
+      // state. Replay-only empty placements are the existing #362 exception.
+      const placeholder = row.kind === undefined && row.role === "agent"
+        && this.replayPlacementIds.has(row.id);
+      if (index !== undefined && !placeholder && (row.seq === undefined
+        || !this.rowVersions.allows(key, row.seq))) continue;
+      const before = view;
+      // A snapshot row is already the full result of its journal prefix. Fold
+      // its fields through the existing event arms; the row's seq fences later
+      // delayed live/difference frames as well as other history pages.
+      view = this.rowVersions.apply(view, decoded.event, row.seq);
+      if (row.kind === undefined && row.revision !== undefined && isWireSeq(row.revision)) {
+        view = applyDurableEvent(view, { kind: "messageEdited", id: row.id,
+          text: row.text!, revision: row.revision, turnId: row.turnId });
+      }
+      if (row.kind === "approval" && isApprovalDecision(row.resolvedDecision)) {
+        view = applyDurableEvent(view, { kind: "approvalResolution", id: row.id, decision: row.resolvedDecision });
+        resolved.add(row.id);
+      }
+      if (!view.some((entry) => durableRowKey(entry) === key)) continue;
+      if (row.seq !== undefined) this.rowVersions.remember(key, row.seq);
+      if (row.kind === undefined && row.role === "agent") {
+        local[row.id] = { working: false, draftOnly: undefined };
+        this.replayPlacementIds.delete(row.id);
+      }
+      if (typeof row.ts === "number") timestamps.set(key, row.ts);
+      if (index === undefined) {
+        const at = inserts.get(cursor) ?? [];
+        at.push(key);
+        inserts.set(cursor, at);
+      }
+      changed ||= view !== before || placeholder || timestamps.has(key);
+    }
+    if (!changed) return;
+    const folded = this.mergeDurable(existing, view, local).map((row) => {
+      const ts = timestamps.get(transcriptEntryKey(row));
+      let next = ts === undefined ? row : { ...row, ts };
+      if (row.kind === "approval" && resolved.has(row.id)) {
+        next = { ...next, resolutionConfirmed: true } as ChatApprovalMessage;
+      }
+      return next;
     });
-    if (changed) this.setState({ messages });
+    const byKey = new Map(folded.map((row) => [transcriptEntryKey(row), row]));
+    const messages: ChatMessage[] = [];
+    for (let i = 0; i <= existing.length; i++) {
+      for (const key of inserts.get(i) ?? []) {
+        const row = byKey.get(key);
+        if (row !== undefined) messages.push(row);
+      }
+      if (i < existing.length) {
+        const row = byKey.get(transcriptEntryKey(existing[i]!));
+        if (row !== undefined) messages.push(row);
+      }
+    }
+    this.setState({ messages });
   }
 
   /**
@@ -4296,626 +4385,9 @@ export class WebChannelNATSClient {
    */
   private handleFrame(msg: InboundMessage): boolean {
     switch (msg.type) {
-      case "history": {
-        const rawIncoming = Array.isArray(msg.messages) ? msg.messages : [];
-        /**
-         * ⚠️ DROP EMPTY-TEXT AGENT ROWS BEFORE ANYTHING ELSE LOOKS AT THEM.
-         *
-         * A lane that got a `progress` and then neither a `bubble` nor a
-         * `seal.answers` entry — an aborted turn, or a connection dropped before
-         * the drain — leaves a PLACEMENT whose text is never authored. The
-         * server's replay emits it as `{role:"agent", text:""}` because
-         * `applyPlacement` appends one and nothing in the journal removes it
-         * (`journal-history.ts`'s header documents this as N8-by-omission), and
-         * the server CANNOT drop it: the rule that hides it live keys on
-         * `draftOnly`, a client-local flag §15.9 deliberately never journals.
-         *
-         * ⚠️ WHY IT STILL EXISTS NOW THAT AGENT ROWS CANNOT ADOPT. It was added
-         * because the row DESTROYED a delivered answer: matching no local text it
-         * fell through to the positional probe, which took the next real agent
-         * bubble and overwrote it with `{id: P, text: ""}` (N10). That probe is
-         * deleted, so the row can no longer damage anything — it would simply
-         * fresh-insert. The filter is retained for the ORIGINAL, smaller reason,
-         * which the damage had overshadowed: live renders nothing for such a
-         * lane, so a history that renders an empty bubble diverges from live for
-         * no benefit (N8). Deriving the row away server-side is #251/#264.
-         *
-         * ⚠️ THIS IS NOT A NEW RULE — IT IS THE ONE THIS CLIENT ALREADY APPLIES
-         * LIVE, moved to the only other door the same lane can arrive through.
-         * `isSpentDraft`/`dropSpentDrafts` delete a spent draft at turn end
-         * (#251, settled against core's built-in Telegram extension, which
-         * deletes an unfinalized preview rather than keeping it). An empty agent
-         * bubble renders nothing either way, so this converges history to live
-         * instead of inventing a third behaviour.
-         *
-         * ⚠️ A `history` FRAME IS NOT "ALWAYS AFTER TURN END" — an earlier
-         * revision of this paragraph said so, and the Phase-6 note below
-         * contradicts it: a snapshot arrives at every device MID-SESSION. The
-         * justification does not need that claim. A lane still in flight
-         * projects `{agent, ""}` and is filtered — same outcome as the live
-         * draft it mirrors, which also renders nothing. A lane that already
-         * published a bubble carries its text, so it tier-1 matches its own
-         * `working:true` draft by id and is left alone (tier 1 is a no-op; a
-         * working draft is never an adoption target either).
-         *
-         * Keeping it client-local is also where
-         * **#264** says the derivation belongs — a server-side "placement whose
-         * answerId never reappears" fold would be a supersession rule invented
-         * in the projection, which is the N8 the store exists to prevent.
-         *
-         * ⚠️ RESIDUAL, STATED BECAUSE `isSpentDraft`'s OWN DOCBLOCK NAMES IT:
-         * this keys on `text === ""`, which `isSpentDraft` deliberately does NOT,
-         * so it also drops a LEGITIMATELY empty durable message. Those are not
-         * structurally impossible — every answer/final path guards non-empty
-         * text, but the generic outbound seam (`channel.ts:311`) forwards core's
-         * `ctx.text` unchecked. The consequence is invisible: an empty bubble
-         * renders nothing whether it is dropped or kept. We cannot do better
-         * here, because `draftOnly` is exactly the discriminator the wire does
-         * not carry.
-         *
-         * ⚠️ IT CANNOT EAT A REASONING ROW, AND THE REASON IS THE `role` TEST,
-         * NOT THE TEXT TEST (#242 half 2 — checked, because "empty text" would
-         * be the tempting thing to blame). A reasoning row carries NO `role`, so
-         * the first conjunct is already false and the row is kept whatever its
-         * text says.
-         *
-         * ⚠️ THAT IS WHY AN EMPTY REASONING ROW IS REFUSED IN THE REASONING
-         * BRANCH INSTEAD, and it is a different rule with a different reason.
-         * Live, `case "reasoning"` drops a frame whose `text` is empty
-         * (`msg.text.length === 0`). Without a matching admission rule here the
-         * same content would be DROPPED live and KEPT from history — an empty
-         * `<details>` the live path would never draw, which is an N8 divergence
-         * this door introduced. It is not enough that the plugin's
-         * `closeLiveBurst` only emits a burst frame when
-         * `lastDeliveredText.length > 0`: that makes such a row unreachable FROM
-         * OUR PLUGIN, not absent, and this reducer's standing policy is that a
-         * history row is validated on its own rather than on trust in the
-         * server. (Contrast the empty USER row below, which is deliberately
-         * KEPT: nothing drops an empty user bubble live either, so keeping it is
-         * what agrees.)
-         */
-        const incoming = rawIncoming.filter(
-          (m) =>
-            !(
-              m &&
-              typeof m === "object" &&
-              (m as { role?: unknown }).role === "agent" &&
-              (m as { text?: unknown }).text === ""
-            ),
-        );
-        if (incoming.length === 0) return true;
-
-        const existing = this.state.messages;
-        /**
-         * The tier-1 key: (KIND, identity), never the id alone.
-         *
-         * ⚠️ `state.messages` MIXES KINDS SINCE #242 half 2 (three of them since
-         * half 3), and the id spaces are NOT provably disjoint —
-         * `durable-view-reducer.ts`'s `findTextIndex` docblock retracts the
-         * id-shape argument outright (agent answer ids come from the same
-         * `nextMessageId()` as reasoning ids, and USER ids are client-supplied,
-         * validated only as a non-empty string within
-         * `MAX_INBOUND_USER_ID_LENGTH`, so a peer can send `webchannel-…`
-         * verbatim). Indexing a mixed array by id alone is therefore the whole
-         * defect class; keying it is the fix, and it is one property rather than
-         * a rule each site has to remember.
-         *
-         * ⚠️ THE LOCAL LAMBDA IS GONE — IT WAS THE NEXT INSTANCE OF THE DEFECT,
-         * NOT A HELPER. It read
-         * `` `${kind === "reasoning" ? "r" : "t"}\0${id}` ``: a two-way test with
-         * an `else`, so half 3's tool entries would have keyed as BUBBLES and
-         * collided silently. `transcriptEntryKey` switches on a closed union
-         * with a `never` default, so a fourth kind (half 4's approvals) fails to
-         * compile instead. It also carries tool's composite `(turnId, id)` key,
-         * which a `(kind, id)` lambda could not express — and it is the SAME
-         * function `mergeDurable` keys local entries with, so the wire side and
-         * the local side cannot drift.
-         */
-        const seen = new Set(existing.map((m) => transcriptEntryKey(m)));
-
-        // Phase 6 (stateless register, shared conversation key): a snapshot
-        // triggered by ANY device's register — this device's reconnect or a
-        // second device joining — arrives at every device mid-session on the
-        // shared `.out`. Messages already rendered LIVE on this device sit in
-        // state under LOCAL id namespaces, so plain id-dedup could duplicate
-        // them.
-        //
-        // ⚠️ #240 HALF 2 CHANGED WHERE THE SNAPSHOT'S IDS COME FROM, AND THE
-        // AGENT-SIDE GUESSING TIERS WERE DELETED BECAUSE OF IT. History is no
-        // longer core's transcript; it is a projection of the plugin's own
-        // delivery journal, whose ids ARE the ids minted at the delivery act —
-        // the same `webchannel-…` values the live frames carried. So:
-        //   - AGENT rows: if this device rendered the answer, its bubble carries
-        //     that id and TIER 1 matches. Therefore an agent row that MISSES tier
-        //     1 has no local counterpart, and any text- or position-based
-        //     adoption of one is guaranteed to overwrite a different message.
-        //     Tiers 2 and 3 are closed to agent rows for that reason.
-        //   - USER rows: the local echo is `u-<n>` (`mintLocalBubbleId`) while
-        //     the journal stores the inbound WIRE id, so a user row legitimately
-        //     misses tier 1 and TIER 2 is how it is recovered. Removing tier 2
-        //     here would fresh-insert every user row on every snapshot and
-        //     duplicate everything this device sent. **#302** owns removing it,
-        //     and is blocked on **#243** giving a user message one shared id.
-        //
-        // ⚠️ THE HONEST COST, STATED WHERE IT IS PAID: text matching is the
-        // ordinal/text inference NOT-list N5 forbids, and it still runs on the
-        // user path. That is not an oversight — it is unremovable until #243.
-        //
-        // ⚠️ WHY DELETION RATHER THAN MORE RULES. Four data-loss defects were
-        // found in this block across four consecutive review rounds, each fixed
-        // by adding a rule, and each new rule failed to cover the next instance:
-        // a tier-1 match that did not claim its bubble; the unauthored placement
-        // row firing the positional probe; `adoptAt` not retiring the id it
-        // displaced; and a hydrated bubble being treated as live because the old
-        // `isLocalLiveId` was a bare `webchannel-` prefix test. All four were on
-        // the agent path. Do not reintroduce a tier here to "restore coverage" —
-        // the coverage it restores is the coverage that lost the messages.
-        //
-        // Matching happens in two tiers, in snapshot order:
-        //   1. id — a message whose canonical id we already hold is a no-op.
-        //      This is where every AGENT row either matches or falls through to
-        //      a fresh insert;
-        //   2. exact text+role — USER ROWS ONLY. Adopt the server id onto the
-        //      first text-matching local echo.
-        // ⚠️ A REASONING ROW USES TIER 1 AND THE FRESH INSERT, AND NOTHING ELSE
-        // (#242 half 2). It is handled in its own branch below, ahead of the
-        // `role` validation, for a reason worth stating here too: reasoning ids
-        // are PLUGIN-minted and identical live and in the snapshot, so tier 1 is
-        // the normal outcome — and tier 2 is closed to it twice over (the
-        // incoming row's `if (m.role === "user")` and the pool's
-        // `isAdoptableUserEcho`).
-        // PLACEMENT of the unmatched (fresh) messages is ORDERED, not a blanket
-        // prepend (#16). We carry an insertion CURSOR = the index into `next`
-        // before which the next fresh message lands; every match/adoption walks
-        // it to `matchedIndex + 1`. So a mid-session snapshot whose overlapping
-        // prefix matches the local tail inserts its unseen suffix chronologically
-        // AFTER that prefix (a turn sent from another device, or turns that
-        // landed while this tab was disconnected, appear at the bottom — not the
-        // top). Pagination and zero-overlap frames match nothing → the cursor
-        // stays 0 → the whole page prepends in order (unchanged); initial
-        // hydration into empty state inserts everything at 0 in order (unchanged).
-        // A `working:true` progress draft is never an adoption target: its
-        // live id must survive for the upcoming progress/final upserts.
-        // Known cosmetic edge (accepted): if TWO devices send the identical
-        // text near-simultaneously, text-only matching can adopt the OTHER
-        // device's server id onto this device's bubble — the ids swap between
-        // the two bubbles, but the bubble COUNT stays exactly right and every
-        // later snapshot still dedups, so nothing duplicates or disappears.
-        // ⚠️ USER ROWS ONLY — the agent branch of this predicate was DELETED, and
-        // its NAME is why. It used to be `isLocalLiveId`, and it read
-        // `!m.working && (id.startsWith("a-") || id.startsWith("webchannel-"))`.
-        // Post-cutover a history-HYDRATED agent bubble also carries
-        // `webchannel-`, so the prefix stopped discriminating "rendered live on
-        // this device" from "handed to us by the server" — and an older page
-        // then adopted onto a bubble a previous snapshot had hydrated, destroying
-        // the newer answer. The predicate is now named for what it actually
-        // tests.
-        //
-        // P1-9 §6.3, still load-bearing: a held (pending) or /stop-retracted user
-        // bubble is LOCAL-ONLY (never on the wire, never in the journal). It must
-        // NEVER be an adoption target — a snapshot row with identical text (the
-        // same text sent from another device) would otherwise steal its server id
-        // onto our UNSENT bubble, and the later release would run/duplicate it.
-        // ⚠️ A TYPE PREDICATE, not a `boolean` — #242 half 2. `m.role === "user"`
-        // already excludes a reasoning entry at RUNTIME (it has no role), and
-        // the predicate makes tsc carry that fact to the `adoptKey(m.role, …)`
-        // below instead of leaving `role` possibly-undefined there. It is also
-        // the second of the two independent guards that keep tier 2 off a
-        // reasoning row; the other is the `if (m.role === "user")` on the
-        // incoming row.
-        const isAdoptableUserEcho = (m: ChatMessage): m is ChatBubble =>
-          m.role === "user" &&
-          m.id.startsWith("u-") &&
-          m.pending !== true &&
-          m.retracted !== true;
-        const adoptKey = (role: string, text: string): string => `${role} ${text}`;
-
-        const next = existing.slice();
-        // Last-wins on a duplicate key, exactly as before — the change is the
-        // KEY, not the policy, so the non-collision case is unaffected.
-        const localIndexByKey = new Map<string, number>();
-        next.forEach((m, i) => localIndexByKey.set(transcriptEntryKey(m), i));
-        const claimed = new Set<number>();
-        const adoptable = new Map<string, number[]>();
-        next.forEach((m, i) => {
-          if (isAdoptableUserEcho(m)) {
-            const key = adoptKey(m.role, m.text);
-            const idxs = adoptable.get(key) ?? [];
-            idxs.push(i);
-            adoptable.set(key, idxs);
-          }
-        });
-
-        let adopted = false;
-        /**
-         * Fresh (unmatched) snapshot messages, grouped by the INSERTION CURSOR
-         * value in effect when each was seen — the index into `next` BEFORE
-         * which they must land. We cannot splice into `next` mid-loop (that
-         * invalidates every cached local index in
-         * `localIndexByKey`/`claimed`/`adoptable`), so the placement is deferred
-         * to a single rebuild after the loop. Multiple fresh messages sharing a
-         * cursor keep their snapshot order (appended to the same array).
-         */
-        const inserts = new Map<number, ChatMessage[]>();
-        /**
-         * Index into `next` before which the NEXT fresh message is inserted.
-         * Advances to `matchedIndex + 1` past every matched (tier 1) or adopted
-         * (tier 2/3) message, so a snapshot's unseen tail lands chronologically
-         * AFTER the overlapping matched prefix instead of being prepended (#16).
-         */
-        let cursor = 0;
-
-        const adoptAt = (idx: number, m: { id: string; text: string; ts?: number }): boolean => {
-          // INVARIANT: `seen` and `localIndexByKey` describe `next` exactly.
-          // `adoptAt` is the only thing that mutates `next` inside the loop, so
-          // it is the only place that can break them.
-          //
-          // ⚠️ EVERY KEY BELOW IS A BUBBLE KEY, AND THAT IS CHECKED, NOT
-          // ASSUMED. This closure has ONE call site — the tier-2 branch, gated
-          // `if (m.role === "user")` — so the incoming row is a user bubble; and
-          // `idx` comes only from the `adoptable` pool, seeded solely from
-          // `isAdoptableUserEcho`, a type predicate that narrows to
-          // `ChatBubble`. So the displaced entry is a bubble too, and a
-          // reasoning key can never be the right one here.
-          //
-          // ⚠️ THE REACHABLE TRIGGER IS GONE and the earlier version of this
-          // comment claiming "MEASURED DATA LOSS WITHOUT THIS LINE" no longer
-          // describes this tree. It was true while AGENT rows could adopt: the
-          // snapshot carried the very id being displaced as its own later row,
-          // which then tier-1 "matched" a bubble it no longer occupied and was
-          // dropped. Only user echoes adopt now, and the sole id a user adoption
-          // can displace is a local `u-<n>` that no snapshot row ever carries.
-          // Kept anyway: two lines that keep the bookkeeping unconditionally true
-          // beat a live premise about what ids can appear.
-          // ⚠️ NARROWED, NOT CAST (#242 half 3). The argument above proves the
-          // target is a bubble, and until half 3 the SPREAD below happened to
-          // type-check anyway; with a third arm it stopped, because
-          // `ChatToolMessage` pins `text` to `undefined` and this writes a
-          // string. Rather than cast the proof back in, the refusal is made
-          // explicit and REPORTED: the caller falls through to the fresh-insert
-          // path, so an invariant violation costs a duplicate row rather than a
-          // dropped one or a malformed entry. `adopted`/`claimed`/`cursor` are
-          // all left untouched on that path, which is what keeps `seen` and
-          // `localIndexByKey` describing `next` exactly.
-          const target = next[idx];
-          if (target.kind !== undefined) return false;
-          const displacedId = target.id;
-          // Keep the canonical stored text on adoption, so this device
-          // converges to exactly what a reloading device would render. The
-          // observed live block ordinal is deliberately discarded: history
-          // cannot validate or persist this run/attempt-local metadata.
-          const { assistantMessageIndex: _liveOrdinal, ...adoptedMessage } = target;
-          next[idx] = {
-            ...adoptedMessage,
-            id: m.id,
-            text: m.text,
-            ts: m.ts,
-          };
-          // `displacedId !== m.id` always here (equality is a tier-1 hit, which
-          // never reaches an adoption), so this cannot erase what we just set.
-          seen.delete(transcriptEntryKey({ id: displacedId }));
-          localIndexByKey.delete(transcriptEntryKey({ id: displacedId }));
-          claimed.add(idx);
-          localIndexByKey.set(transcriptEntryKey({ id: m.id }), idx);
-          adopted = true;
-          cursor = idx + 1;
-          return true;
-        };
-
-        for (const m of incoming) {
-          if (!m || typeof m !== "object") continue;
-          if (typeof m.id !== "string" || m.id.length === 0) continue;
-          // ⚠️ THE TOOL BRANCH RUNS BEFORE THE `text` GUARD, AND MUST. A tool row
-          // is the ONE history variant with no `text` at all — its content is the
-          // name/phase/status/argKeys surface — so leaving it below the guard
-          // would drop EVERY tool row on the way in while live rendered them
-          // (N10, and an N8 live≠history gap). Found by the compiler only
-          // indirectly; verified by the round-trip test.
-          /**
-           * ⚠️ #242 half 3: A TOOL ROW TAKES TIER 1 OR A FRESH INSERT, exactly
-           * like a reasoning row, and all four properties in the docblock above
-           * carry over unchanged — with one addition that is NOT cosmetic:
-           *
-           *  5. THE KEY IS `(kind, turnId, id)`. `transcriptEntryKey` composes
-           *     the tool arm from BOTH identity fields, so tier 1 here asks the same
-           *     question `applyTool` and `indexTranscriptByKind` ask. Keying a
-           *     tool row by id alone would tier-1 match two different calls that
-           *     happen to share a producer id across turns and DROP the second —
-           *     N10 content loss, and the same shape as the defect property 4
-           *     records, one field further out.
-           *
-           * ⚠️ THE ROW IS A MERGED CALL, NOT A FRAME, so it is inserted whole.
-           * The journal stores one row per frame and the PLUGIN's projection
-           * folds them through the same `applyTool` before serving; by the time a
-           * row reaches this client it is already the merge result. That is why
-           * there is no accumulation to do here and no partial to reconcile.
-           *
-           * `turnId` is REQUIRED on this variant (the wire types it `string`), so
-           * a row without one is dropped rather than inserted with a fabricated
-           * correlation — the same rule the reasoning branch applies. There is
-           * deliberately NO non-empty test on the other fields: unlike reasoning's
-           * `text`, every one of them is optional on the wire and an empty
-           * `status` is a real state a live frame can produce, so refusing one
-           * here would drop a row live rendered.
-           */
-          if (m.kind === "tool") {
-            if (typeof m.turnId !== "string" || m.turnId.length === 0) continue;
-            const key = transcriptEntryKey({ kind: "tool", id: m.id, turnId: m.turnId });
-            if (seen.has(key)) {
-              const li = localIndexByKey.get(key);
-              if (li !== undefined) {
-                cursor = li + 1;
-                claimed.add(li);
-              }
-              continue;
-            }
-            seen.add(key);
-            const atCursorTool = inserts.get(cursor) ?? [];
-            atCursorTool.push({
-              kind: "tool",
-              id: m.id,
-              turnId: m.turnId,
-              ...(typeof m.name === "string" ? { name: m.name } : {}),
-              ...(typeof m.phase === "string" ? { phase: m.phase } : {}),
-              ...(typeof m.status === "string" ? { status: m.status } : {}),
-              ...(typeof m.summary === "string" ? { summary: m.summary } : {}),
-              ...(Array.isArray(m.argKeys)
-                ? { argKeys: m.argKeys.filter((k): k is string => typeof k === "string") }
-                : {}),
-              ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
-            });
-            inserts.set(cursor, atCursorTool);
-            continue;
-          }
-          /**
-           * ⚠️ #242 half 4: AN APPROVAL ROW TAKES TIER 1 OR A FRESH INSERT, and
-           * it MUST sit above the `text` guard for the same reason the tool
-           * branch does — an approval row carries no `text` at all (its content
-           * is the title/prompt/options surface), so below the guard every one
-           * of them would be dropped while live rendered them (N10, and an N8
-           * live≠history gap).
-           *
-           * The four properties in the reasoning branch's docblock carry over
-           * unchanged: tier 1 is the normal outcome (an approval id is the
-           * gateway's `approvalId`, identical live and in the projection); tier
-           * 2 cannot reach it (gated `if (m.role === "user")`, and the pool is
-           * seeded only from `isAdoptableUserEcho`); a miss fresh-inserts at the
-           * cursor; and tier 1 can only match an entry of this row's own kind,
-           * because `transcriptEntryKey` keys by (kind, id).
-           *
-           * ⚠️ AND THE ROW IS INSERTED WITHOUT `actionable` — THAT IS THE POINT
-           * OF THE WHOLE SLICE, NOT AN OMISSION. A card rebuilt here is a
-           * REPLAY: the durable stream may record it as still pending while it
-           * has since expired or been decided on another device, and a click
-           * would send a decision nobody is waiting for. It renders inert until
-           * a register-time `approval_snapshot` lists it as pending again, which
-           * is the one authority for "still open". Do not "restore" the bit here
-           * to make a reloaded card usable; the snapshot already does that, on
-           * every register, and it does it from the server's own pending set.
-           *
-           * `resolvedDecision` IS adopted from the row, because live showed the
-           * decided card with its outcome and history must not hide it (N8/N10).
-           * It is validated against the three real decisions rather than trusted:
-           * these values come off the wire unvalidated, and the client's
-           * `"unknown"` sentinel must never enter through this door — it is a
-           * local reconciliation outcome, and a server that sent one would be
-           * asserting a resolution that never happened.
-           */
-          if (m.kind === "approval") {
-            const key = transcriptEntryKey({ kind: "approval", id: m.id });
-            if (seen.has(key)) {
-              const li = localIndexByKey.get(key);
-              if (li !== undefined) {
-                cursor = li + 1;
-                claimed.add(li);
-              }
-              continue;
-            }
-            seen.add(key);
-            const atCursorApproval = inserts.get(cursor) ?? [];
-            atCursorApproval.push({
-              kind: "approval",
-              id: m.id,
-              approvalKind: m.approvalKind === "plugin" ? "plugin" : "exec",
-              title: typeof m.title === "string" ? m.title : "",
-              ...(typeof m.description === "string" ? { description: m.description } : {}),
-              prompt: typeof m.prompt === "string" ? m.prompt : "",
-              options: Array.isArray(m.options)
-                ? (m.options as ApprovalOption[])
-                : [],
-              ...(typeof m.expiresAtMs === "number" ? { expiresAtMs: m.expiresAtMs } : {}),
-              // ⚠️ A SERVED DECISION IS SERVER-CONFIRMED BY CONSTRUCTION, and
-              // saying so here is not decoration — it is what stops a replayed
-              // card RE-SENDING a decision. The only producer of an
-              // `approvalResolution` row is an `approval_resolved` frame the
-              // plugin itself published, so a decision that came out of the
-              // journal is by definition the server's own answer, never
-              // `decide()`'s optimistic guess. Leaving the flag off would make
-              // the next `approval_snapshot` that still lists the card as
-              // pending (stale by milliseconds, or a server that never erased
-              // it) take Leg C and re-send a decision this device never made.
-              // It is also the one field that made the live and replayed cards
-              // differ — measured, not predicted: the both-sides test went red
-              // on exactly this key.
-              ...(isApprovalDecision(m.resolvedDecision)
-                ? { resolvedDecision: m.resolvedDecision, resolutionConfirmed: true }
-                : {}),
-              ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
-            });
-            inserts.set(cursor, atCursorApproval);
-            continue;
-          }
-          if (typeof m.text !== "string") continue;
-          /**
-           * ⚠️ #242 half 2: A REASONING ROW TAKES TIER 1 OR A FRESH INSERT, AND
-           * NOTHING ELSE. Four properties make that safe, and all four were
-           * checked rather than assumed:
-           *
-           *  1. TIER 1 IS THE NORMAL OUTCOME. A reasoning id is minted by the
-           *     PLUGIN (`nextMessageId()` inside the reasoning controller) and
-           *     travels on the live `reasoning` frame; `journalEventForOutbound`
-           *     copies that same `frame.id` into the journal row. So the id this
-           *     device rendered live IS the id the snapshot carries, and
-           *     `seen.has(transcriptEntryKey(m))` matches it — no
-           *     adoption, no duplicate.
-           *  2. TIER 2 CANNOT REACH IT, TWICE OVER. The adoption branch is
-           *     gated `if (m.role === "user")`, which a role-less row fails; and
-           *     the pool itself is seeded only from `isAdoptableUserEcho`, which
-           *     tests `m.role === "user"`. So no reasoning row can adopt, and no
-           *     reasoning bubble can BE adopted onto.
-           *  3. A MISS FRESH-INSERTS AT THE CURSOR, exactly like an agent row
-           *     that misses tier 1 — which is the right answer for the same
-           *     reason: with plugin-minted ids, a miss means this device has no
-           *     local counterpart at all.
-           *  4. TIER 1 CAN ONLY MATCH AN ENTRY OF THE ROW'S OWN KIND, because
-           *     `seen`/`localIndexByKey` are keyed by (KIND, id) rather than by
-           *     id — see `transcriptEntryKey` for why the id spaces cannot be
-           *     assumed disjoint. This was the fourth outcome
-           *     the first revision of this list did not enumerate, and it was
-           *     the defect: a kind-blind tier 1 counted a collision with an
-           *     entry of the OTHER kind as a match and DROPPED the row — never
-           *     inserted, never rendered, though it renders fine on a fresh
-           *     load (N10, live≠history content loss). A miss now falls to the
-           *     fresh insert, which is already the right answer for "this device
-           *     has no local counterpart" (property 3).
-           *
-           *     ⚠️ KEYING THE INDEX IS THE FIX; A CONJUNCT ON TOP OF AN ID-KEYED
-           *     INDEX WAS TRIED FIRST AND WAS WRONG. That version left the map
-           *     keyed by id and guarded tier 1 with `kindAgrees`. Page 1
-           *     fresh-inserted correctly — and then, because the map is
-           *     LAST-WINS, `get(id)` on the resulting same-id pair resolved to
-           *     the OTHER kind's entry forever, `kindAgrees` never became true
-           *     again, and the row inserted AGAIN on every subsequent page.
-           *     Measured: three identical pages yielded three text entries
-           *     beside the one reasoning entry. A snapshot lands on every
-           *     register, so unbounded duplicate growth per reconnect is worse
-           *     than the drop it replaced. Keyed, page 2 is an ordinary tier-1
-           *     match and the whole thing is idempotent — which is why the
-           *     conjunct is gone rather than repaired.
-           *
-           * `turnId` is REQUIRED on this variant (the wire types it `string`),
-           * so a row without one is dropped rather than inserted with a
-           * fabricated correlation.
-           */
-          if (m.kind === "reasoning") {
-            if (typeof m.turnId !== "string" || m.turnId.length === 0) continue;
-            // ⚠️ THE SAME ADMISSION RULE `case "reasoning"` APPLIES LIVE. Its
-            // guard is `msg.text.length === 0`, and a history row must meet it
-            // too or the identical content renders from one door and not the
-            // other — see the empty-row note at the top of this case.
-            if (m.text.length === 0) continue;
-            // Keyed, so this can only ever meet a REASONING entry (property 4).
-            const key = transcriptEntryKey({ kind: "reasoning", id: m.id });
-            if (seen.has(key)) {
-              const li = localIndexByKey.get(key);
-              if (li !== undefined) {
-                cursor = li + 1;
-                claimed.add(li);
-              }
-              continue;
-            }
-            seen.add(key);
-            const atCursorReasoning = inserts.get(cursor) ?? [];
-            atCursorReasoning.push({
-              kind: "reasoning",
-              id: m.id,
-              turnId: m.turnId,
-              text: m.text,
-              ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
-            });
-            inserts.set(cursor, atCursorReasoning);
-            continue;
-          }
-          if (m.role !== "user" && m.role !== "agent") continue;
-          // Keyed, so this can only ever meet a BUBBLE — see property 4 in the
-          // reasoning branch's docblock above for the whole argument.
-          const key = transcriptEntryKey({ id: m.id });
-          if (seen.has(key)) {
-            const li = localIndexByKey.get(key);
-            // Tier-1 match: walk the cursor past this already-held message so
-            // later fresh messages insert after it. A key we cannot locate
-            // locally leaves the cursor untouched.
-            //
-            // ⚠️ THAT CASE IS REACHABLE, AND THE PARENTHETICAL THAT USED TO SIT
-            // HERE DENIED IT — it read "should not happen — `seen` is seeded
-            // from `next`". `seen` is ALSO added to by the fresh-insert paths
-            // below, which do not touch `localIndexByKey`, so a key in `seen`
-            // with no local index is the ordinary within-page repeat: still a
-            // match, still a drop. It was already wrong before #242 half 2, and
-            // it is cut now because keying the index makes that state the ONLY
-            // way the two can disagree.
-            if (li !== undefined) {
-              const slot = next[li]!;
-              if (slot.kind === undefined && slot.role === "agent" && m.role === "agent"
-                && this.replayPlacementIds.delete(m.id)) {
-                // A private placement has no content to deduplicate. Hydrate
-                // this slot only; ordinary tier-1 refresh remains separate.
-                next[li] = {
-                  ...slot, text: m.text, working: false,
-                  ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
-                };
-                adopted = true;
-              }
-              cursor = li + 1;
-              // ⚠️ CLAIM IT. A bubble already identified BY ID must not stay a
-              // later row's tier-2 adoption target. Like the retirement in
-              // `adoptAt`, this is now bookkeeping rather than a live fix — the
-              // pool holds only unadopted `u-<n>` echoes, which cannot be
-              // tier-1 matched (the journal never serves that id). The measured
-              // loss it was added for was on the AGENT path, which no longer
-              // adopts at all.
-              //
-              // `claimed` alone is sufficient: tier 2 shifts claimed indices off
-              // the front of each pool before using one, so this entry is purged
-              // when it is reached. No pool surgery, no loop restructuring.
-              claimed.add(li);
-            }
-            continue;
-          }
-
-          seen.add(key);
-          // Tier 2: exact text+role — ⚠️ USER ROWS ONLY, and the role test is
-          // EXPLICIT rather than left to the pool being empty for agent keys.
-          // Implicit-by-empty-pool is exactly the kind of coupling that produced
-          // the four defects this deletion closes: it reads as "agent rows may
-          // adopt, there just happens to be nothing to adopt onto", which is one
-          // pool-seeding edit away from being wrong again.
-          if (m.role === "user") {
-            const idxs = adoptable.get(adoptKey(m.role, m.text));
-            while (idxs && idxs.length > 0 && claimed.has(idxs[0])) idxs.shift();
-            if (
-              idxs &&
-              idxs.length > 0 &&
-              adoptAt(idxs.shift()!, { id: m.id, text: m.text, ts: m.ts })
-            ) {
-              continue;
-            }
-          }
-          const atCursor = inserts.get(cursor) ?? [];
-          atCursor.push({
-            id: m.id,
-            role: m.role,
-            text: m.text,
-            ts: m.ts,
-            working: false,
-          });
-          inserts.set(cursor, atCursor);
-        }
-
-        if (inserts.size === 0 && !adopted) return true;
-
-        // Rebuild `next` with each fresh group spliced in at its cursor. Slot i
-        // holds the messages that must precede `next[i]`; slot `next.length`
-        // holds any tail appended after the last local message.
-        const merged: ChatMessage[] = [];
-        for (let i = 0; i <= next.length; i++) {
-          const ins = inserts.get(i);
-          if (ins) merged.push(...ins);
-          if (i < next.length) merged.push(next[i]);
-        }
-        this.setState({ messages: merged });
+      case "history":
+        this.hydrateHistory(msg);
         return true;
-      }
 
       case "typing": {
         this.setState({ isTyping: true });
@@ -4943,7 +4415,7 @@ export class WebChannelNATSClient {
         // client and server converge on one id (`adoptCommittedIds`). It runs
         // after `onSendState` has already flipped the bubble to `accepted`; the
         // re-key preserves that overlay. An ack without `committed` is a no-op
-        // here (the tier-2/3 history fallback reconciles that bubble).
+        // here; later history/difference can still carry the exact mapping.
         this.adoptCommittedIds(msg.committed);
         return true;
       }

@@ -11,6 +11,19 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
 import type { InboundMessage, NatsClientOptions } from "./nats-client.js";
+
+function randomIdForReceipt(wrapper: WebChannelNATSClient, receiptId: string): string {
+  const links = (wrapper as unknown as { randomIdToReceiptKey: Map<string, string> }).randomIdToReceiptKey;
+  return [...links].find(([, key]) => key === receiptId)![0];
+}
+function sendMapped(wrapper: WebChannelNATSClient, text: string, serverId: string): void {
+  const receipt = wrapper.send(text)!;
+  const randomId = randomIdForReceipt(wrapper, receipt.id);
+  (wrapper as unknown as { handleMessage(m: InboundMessage): void }).handleMessage({
+    type: "ack", committed: [{ random_id: randomId, messageId: serverId }],
+  });
+}
+
 // P1-9 wire-order harness: P0-2 deleted the unauthenticated `.handshake` path, so
 // the session-gate / wire-order tests below establish the conversation key the
 // way production does — a PoP register round-trip whose reply carries K wrapped
@@ -314,7 +327,7 @@ describe("WebChannelNATSClient — P1-7 error cause on state", () => {
 describe("WebChannelNATSClient — W6 idempotent history hydration", () => {
   type HistoryFrame = {
     type: "history";
-    messages: Array<{ id: string; role: string; text: string; ts?: number }>;
+    messages: Array<{ id: string; role: string; text: string; ts?: number; randomId?: string }>;
   };
 
   function makeWrapper(): WebChannelNATSClient {
@@ -352,7 +365,8 @@ describe("WebChannelNATSClient — W6 idempotent history hydration", () => {
 
   it("adopts the server id onto a locally-echoed user message instead of duplicating it", () => {
     const wrapper = makeWrapper();
-    wrapper.send("hello agent"); // local echo → synthetic id "u-0"
+    const receipt = wrapper.send("hello agent")!;
+    const randomId = randomIdForReceipt(wrapper, receipt.id); // local echo → synthetic id "u-0"
     expect(wrapper.getState().messages).toEqual([
       expect.objectContaining({ id: "u-0", role: "user", text: "hello agent" }),
     ]);
@@ -360,7 +374,7 @@ describe("WebChannelNATSClient — W6 idempotent history hydration", () => {
     // Mid-session snapshot carries the SAME message under its server id.
     deliver(wrapper, {
       type: "history",
-      messages: [{ id: "srv-9", role: "user", text: "hello agent", ts: 42 }],
+      messages: [{ id: "srv-9", randomId, role: "user", text: "hello agent", ts: 42 }],
     });
 
     const messages = wrapper.getState().messages;
@@ -369,7 +383,7 @@ describe("WebChannelNATSClient — W6 idempotent history hydration", () => {
     // A THIRD delivery of the same snapshot is now a plain id-dedup no-op.
     deliver(wrapper, {
       type: "history",
-      messages: [{ id: "srv-9", role: "user", text: "hello agent", ts: 42 }],
+      messages: [{ id: "srv-9", randomId, role: "user", text: "hello agent", ts: 42 }],
     });
     expect(wrapper.getState().messages).toHaveLength(1);
   });
@@ -401,8 +415,8 @@ describe("WebChannelNATSClient — W6 idempotent history hydration", () => {
 
   it("does not adopt across different texts, and repeated identical texts adopt one-to-one", () => {
     const wrapper = makeWrapper();
-    wrapper.send("ping"); // u-0
-    wrapper.send("ping"); // u-1 (repeated identical text)
+    sendMapped(wrapper, "ping", "s1");
+    sendMapped(wrapper, "ping", "s2"); // repeated identical text
     deliver(wrapper, {
       type: "history",
       messages: [
@@ -556,7 +570,7 @@ describe("WebChannelNATSClient — W6 agent-bubble id adoption", () => {
   it("fresh-inserts an agent row that matches no local id, even right after a matched row", () => {
     const wrapper2 = makeWrapper();
     // Turn rendered live on this device: user send (local echo) + agent reply.
-    wrapper2.send("hello");
+    sendMapped(wrapper2, "hello", "wire-u1");
     deliver(wrapper2, { type: "agent_message", id: "webchannel-1-live", text: "short live reply" });
     expect(wrapper2.getState().messages).toHaveLength(2);
 
@@ -624,7 +638,7 @@ describe("WebChannelNATSClient — #16 ordered history insertion", () => {
   it("regression: a snapshot's newer tail is APPENDED after the matched local prefix, not prepended", () => {
     const w = makeWrapper();
     // Local live state: a turn rendered on THIS device (user echo + agent bubble).
-    w.send("hi"); // u-0
+    sendMapped(w, "hi", "wire-u1"); // u-0
     deliver(w, { type: "agent_message", id: "webchannel-live-1", text: "hello back" });
     expect(w.getState().messages.map((m) => m.text)).toEqual(["hi", "hello back"]);
 
@@ -743,8 +757,8 @@ describe("WebChannelNATSClient — #16 ordered history insertion", () => {
   it("gap insertion: a fresh message between two matched local messages lands BETWEEN them", () => {
     const w = makeWrapper();
     // Two live user echoes on this device (no agent turns between them locally).
-    w.send("first"); // u-0
-    w.send("third"); // u-1
+    sendMapped(w, "first", "s-first"); // u-0
+    sendMapped(w, "third", "s-third"); // u-1
     expect(w.getState().messages.map((m) => m.text)).toEqual(["first", "third"]);
 
     // Snapshot: matches local idx 0, a FRESH unseen message, then matches idx 1.
@@ -861,7 +875,7 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
    */
   it("C2: a snapshot of a two-bubble turn matches BOTH lanes by id instead of duplicating", () => {
     const w = makeWrapper();
-    w.send("hello"); // u-0 local echo
+    sendMapped(w, "hello", "wire-u1"); // u-0 local echo
     liveBubble(w, "webchannel-a", "T", "…", "live A");
     liveBubble(w, "webchannel-b", "T", "…", "live B");
     expect(w.getState().messages).toHaveLength(3);
@@ -912,7 +926,7 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
     // §8-1: lane A never settled on this device (its frames were lost), so the
     // only agent bubble here is lane B — the SECOND reply. The snapshot carries
     // both rows, because both were delivered SOMEWHERE and so both are journaled.
-    w.send("hello"); // u-0
+    sendMapped(w, "hello", "wire-u1"); // u-0
     liveBubble(w, "webchannel-b", "T", "…", "live B");
     expect(w.getState().messages).toHaveLength(2);
 
@@ -967,7 +981,7 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
     // the LATER lane never rendered here at all — the tab was away or the
     // frames were dropped — so the snapshot carries a trailing reply this
     // device has no local bubble for.
-    w.send("hello"); // u-0
+    sendMapped(w, "hello", "wire-u1"); // u-0
     liveBubble(w, "webchannel-a", "T", "…", "live A");
     expect(w.getState().messages).toHaveLength(2);
 
@@ -1009,7 +1023,7 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
     // against two stored rows, with lane C corresponding to no row at all.
     // (This is NOT the §6.5.1 defensive-rotation divergence, where the last
     // stored row DOES correspond to the last live bubble. C4b covers that.)
-    w.send("hello"); // u-0
+    sendMapped(w, "hello", "wire-u1"); // u-0
     liveBubble(w, "webchannel-a", "T", "…", "live A");
     liveBubble(w, "webchannel-b", "T", "…", "live B");
     liveBubble(w, "webchannel-c", "T", "…", "live C");
@@ -1116,7 +1130,7 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
   // session-vs-reload gap.
   it("C4b: §6.5.1 — a defensively-rotated rewrite renders identically live and on reload", () => {
     const w = makeWrapper();
-    w.send("hello"); // u-0
+    sendMapped(w, "hello", "wire-u1"); // u-0
     liveBubble(w, "webchannel-a", "T", "…", "msg A");
     // One assistant message, rewritten mid-flight across a defensive rotation:
     // lane B held the pre-rewrite rendering, lane C the final one.
@@ -1254,7 +1268,7 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
     // Before core's terminal array arrives, both lanes have been materialized by
     // the ordinary lane path. A register snapshot then re-delivers them — under
     // the SAME ids, because that is what the journal stores.
-    w.send("hello"); // u-0 local echo
+    sendMapped(w, "hello", "wire-u1"); // u-0 local echo
     liveBubble(w, "webchannel-a", "T", "A partial…", "A streamed");
     liveBubble(w, "webchannel-b", "T", "B partial…", "B streamed");
     deliver(w, {
@@ -3134,7 +3148,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
   it("12: a held chip between the user row and the reply causes no duplicate agent bubble", () => {
     const w = makeWrapper();
     goOnline(w);
-    w.send("u2"); // normal user send (idle)
+    sendMapped(w, "u2", "wire-u2"); // normal user send (idle)
     deliver(w, { type: "typing" });
     w.send("h3"); // held pending
     // Multi-frame reply: A1 and A2 both live; A2 stays WORKING so the hold survives.
@@ -3175,14 +3189,17 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
   it("12b: after release (moved to tail), a snapshot reconciles cleanly with no duplicates", () => {
     const w = makeWrapper();
     goOnline(w);
-    w.send("u2");
+    sendMapped(w, "u2", "wire-u2");
     deliver(w, { type: "typing" });
-    w.send("h3"); // held
+    const heldReceipt = w.send("h3")!; // held
     deliver(w, { type: "agent_message", id: "webchannel-A", text: "A reply", turnId: "T" });
     // Reply settled the turn → h3 released and MOVED TO THE TAIL: [u2, A, h3].
     expect(messages(w).map((m) => m.text)).toEqual(["u2", "A reply", "h3"]);
     expect(pendingBubbles(w)).toHaveLength(0);
 
+    (w as unknown as { handleMessage(m: InboundMessage): void }).handleMessage({
+      type: "ack", committed: [{ random_id: randomIdForReceipt(w, heldReceipt.id), messageId: "wire-h3" }],
+    });
     // Snapshot carries the whole conversation in order, plus a newer reply R
     // that this device never rendered (so it fresh-inserts at the tail).
     deliver(w, {

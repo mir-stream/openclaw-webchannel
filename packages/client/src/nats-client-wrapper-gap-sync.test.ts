@@ -1492,7 +1492,7 @@ describe("#356 — retired lifecycle stops catch-up orchestration", () => {
       seed(w, 5);
       if (carrier === "history") {
         w.handleMessage({
-          type: "history", messages: [{ id: incomingId, role: "agent", text: "snapshot" }], highWaterSeq: 20,
+          type: "history", messages: [{ id: incomingId, role: "agent", text: "snapshot", seq: 5 }], highWaterSeq: 5,
         });
       } else {
         seedOptimisticUser(w, {
@@ -1672,13 +1672,14 @@ describe("#345 — a snapshot high-water goes through the same check", () => {
     expect(getDifference).toHaveBeenCalledWith(5, outstandingNonce(w));
   });
 
-  it("an unchanged or contiguous high-water asks for nothing", () => {
+  it("an unchanged high-water asks for nothing; even a contiguous unseen snapshot needs content", () => {
     const { w, getDifference } = spied();
     seed(w, 5);
     seed(w, 5);
-    seed(w, 6);
     expect(getDifference).not.toHaveBeenCalled();
-    expect(cursorLast(w)).toBe(6);
+    seed(w, 6);
+    expect(getDifference).toHaveBeenCalledWith(5, outstandingNonce(w));
+    expect(cursorLast(w)).toBe(5);
   });
 });
 
