@@ -101,16 +101,17 @@
 - **A core-initiated message now goes out on the account it was addressed to,
   not on whichever account the gateway bound first (#371).** On a gateway serving
   two accounts, every send core starts on its own — an agent `message` tool send,
-  a heartbeat, a routed reply — rode a single "primary" channel picked at startup
-  (`default`, else the alphabetically first account). A message meant for account
+  a heartbeat, a routed reply — rode a single "primary" channel the gateway
+  re-picked whenever an account came up or went down (`default`, else the
+  alphabetically first live account). A message meant for account
   B was therefore emitted under account A's tenant, key and stored history, and
   could surface in a browser attached to A. Both send surfaces now resolve the
   requested account's live runtime at the moment of the send. Two consequences
   are deliberate: a target account that is stopped, disconnected or not
   configured now FAILS the send with a visible error instead of quietly going out
   through another account; and a send that carries no account follows the
-  configured `defaultAccount` when it names a configured account, then `default`,
-  then the first configured account. Account ids still match exactly first — but
+  configured `defaultAccount` when it exactly names a configured account, then
+  `default`, then the alphabetically first configured account. Account ids still match exactly first — but
   because core lowercases ids on some of its own send paths, a lowercased id also
   matches the account you listed (e.g. `acme` reaches `Acme`).
 

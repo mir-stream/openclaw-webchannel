@@ -297,9 +297,10 @@ export function createNatsWebChannelPlugin(
   // Core starts our accounts under the id as LISTED in config ("Acme"), but
   // canonicalizes the id on its core-initiated send paths (the agent `message`
   // tool, heartbeat targets, routed replies), so `ctx.accountId` can arrive as
-  // "acme". Match the exact key first, then the canonical form. This cannot be
-  // ambiguous: `inspectWebchannelAccountIds` rejects every configured id that
-  // shares a `normalizeAccountId` result, so at most one runtime can match.
+  // "acme". Match the exact key first, then the canonical form. Within one
+  // config generation this is unambiguous: `inspectWebchannelAccountIds` rejects
+  // every configured id that shares a `normalizeAccountId` result, so at most
+  // one runtime can match.
   const resolveOutboundRuntime = (accountId: string) => {
     const exact = runtimes.get(accountId);
     if (exact) return exact;

@@ -29,7 +29,7 @@ stub).
 **Origin:** PR #5 (multiplex / 가-2 rename) adversarial review, 2026-07-01. Deferred, previously
 untracked (this entry is the first written record outside the session notes).
 
-**Behavior before #376** (`packages/plugin/index-nats.ts`, "lazy transport facade"): the plugin core
+**Behavior before #376** (`packages/plugin/src/nats-account-runtime.ts`, "lazy transport facade"): the plugin core
 is created once at module load against a single `lazyTransport` Proxy; after `account startup` builds
 one `NatsChannel` per account, the Proxy is bound to **one PRIMARY channel** (`"default"`, else the
 first built account). Everything the core initiates **without a per-message account context** rides
@@ -95,8 +95,8 @@ core-initiated send surfaces (`outbound.sendText` in `channel.ts`, `message.send
 `message-adapter.ts`) now resolve the LIVE runtime of `ctx.accountId` at each send
 (`outbound-account.ts`), so the tenant, conversation key, delivery journal and subject are that
 account's. Decided semantics: **per-account by `ctx.accountId`**; an **unscoped** (null/undefined)
-send selects the listed default — configured `defaultAccount` when it names a listed account, else
-`default`, else the first configured account; a target that is missing, removed, disposed or
+send selects the listed default — configured `defaultAccount` when it exactly names a listed
+account, else `default`, else the alphabetically first configured account; a target that is missing, removed, disposed or
 disconnected **fails the send with no fallback** to any other account; and core's **canonical id
 form** (it lowercases/dash-trims on the message-tool, heartbeat and routed-reply paths while
 starting accounts under the listed spelling) is tolerated at the runtime lookup — unambiguous
