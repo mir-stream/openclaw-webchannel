@@ -14,6 +14,10 @@ import { openEnvelope } from "./e2e-session.js";
 import { createClawMessageAdapter, createReasoningDraftController } from "./message-adapter.js";
 import { NatsChannel } from "./nats-channel.js";
 import type { NatsTransport } from "./nats-transport.js";
+import { reduceDurableView } from "../../client/src/durable-view-reducer.js";
+import type { JournalEvent } from "./delivery-journal-event.js";
+import { journalEventForOutbound } from "./delivery-journal-event.js";
+import type { OutboundWsMessage } from "./channel-contract.js";
 
 const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
 const cleanup: Array<() => void> = [];
@@ -44,6 +48,55 @@ function setup(options?: { encrypted?: boolean; reasoningDurable?: boolean }) {
   const fail = () => db.exec("CREATE TRIGGER fail_write BEFORE INSERT ON journal_event BEGIN SELECT RAISE(ABORT, 'injected failure'); END");
   return { journal, db, transport, channel, draft, history, fail, key, databasePath };
 }
+
+it("#262: compensating final dedupe cannot overwrite either independently streamed answer ID", async () => {
+  const { draft, channel, journal, history, transport, key } = setup({ encrypted: true });
+  const finals = vi.spyOn(channel, "finalizeDraft");
+  const snapshots = vi.spyOn(channel, "sendTurnSnapshot");
+  draft.pushAnswerText({ text: "Repeated answer" });
+  await draft.flush();
+  draft.handleAssistantMessageBoundary();
+  draft.pushAnswerText({ text: "Repeated answer" });
+  await draft.flush();
+  draft.handleAssistantMessageBoundary(); // B acquires text only at core message-end.
+  draft.handleAssistantMessageBoundary(); // Textless terminal message prevents collapse.
+  const authoredIds = finals.mock.calls.map((args) => args[1]);
+  expect(new Set(authoredIds).size).toBe(2);
+  // Reachability: embedded message-end does not invoke onPartialReply, and the
+  // dispatcher dedupes [A,A,B] to [A,B] before calling channel delivery.
+  expect(await draft.finalize("Repeated answer")).toBe(true);
+  expect(await draft.finalize("New final-only answer")).toBe(true);
+  await draft.drain();
+  draft.stop();
+  expect(snapshots.mock.calls.at(-1)![2]).toContainEqual({ id: authoredIds[1], text: "Repeated answer" });
+  for (const id of authoredIds) {
+    expect(finals.mock.calls.filter((args) => args[1] === id).map((args) => args[2])).toEqual(["Repeated answer"]);
+    expect(snapshots.mock.calls.at(-1)![2]).toContainEqual({ id, text: "Repeated answer" });
+    expect(history()).toContainEqual(expect.objectContaining({ id, text: "Repeated answer" }));
+  }
+  const finalOnlyId = finals.mock.calls.find((args) => args[2] === "New final-only answer")![1];
+  expect(authoredIds).not.toContain(finalOnlyId);
+  expect(history()).toContainEqual(expect.objectContaining({ id: finalOnlyId, text: "New final-only answer" }));
+  const events = journal.read("peer", { afterSeq: 0, limit: 100 }).map(({ event }) => event);
+  expect(events.every((event) => ["placement", "bubble", "seal"].includes(event.kind))).toBe(true);
+  const view = reduceDurableView(events as JournalEvent[]);
+  expect(view.filter((entry) => entry.kind === "text").map(({ id, text }) => ({ id, text })))
+    .toEqual(history().map((entry) => ({ id: entry.id, text: "text" in entry ? entry.text : undefined })));
+  for (const id of authoredIds) expect(view.find((entry) => entry.id === id)).toMatchObject({ text: "Repeated answer" });
+  expect(view.find((entry) => entry.id === finalOnlyId)).toMatchObject({ text: "New final-only answer" });
+  const liveEvents = transport.publish.mock.calls
+    .map((call) => journalEventForOutbound(openEnvelope(call[1] as Uint8Array, key).message as OutboundWsMessage))
+    .filter((event): event is JournalEvent => event !== null);
+  expect(reduceDurableView(liveEvents)).toEqual(view);
+  const tasks: Array<() => void> = [];
+  const server = createHistoryServer({ journal, channel, config: DEFAULT_HISTORY_CONFIG, schedule: (fn) => { tasks.push(fn); } });
+  server.serveDifference("peer", 0, "identity-difference");
+  for (const task of tasks.splice(0)) task();
+  const difference = openEnvelope(transport.publish.mock.calls.at(-1)![1] as Uint8Array, key).message as OutboundWsMessage;
+  expect(difference).toMatchObject({ type: "difference", nonce: "identity-difference" });
+  if (difference.type !== "difference") throw new Error("expected difference frame");
+  expect(reduceDurableView(difference.events.map(({ event }) => event))).toEqual(view);
+});
 
 it.each([false, true])("stores an authored final during relay loss (streamed=%s) with one history identity", async (streamed) => {
   const { transport, draft, history, journal } = setup();
