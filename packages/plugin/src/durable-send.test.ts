@@ -347,6 +347,55 @@ it.each([false, true])("one reasoning stop retries its newly rejected close once
   }
 });
 
+it.each(["Check the file.", "Check the file. Then run tests."])(
+  "#373: independent native reasoning survives close storage retry without prefix loss: %s",
+  (secondText) => {
+    const { channel, journal, fail, db, history } = setup({ reasoningDurable: true });
+    const reasoning = createReasoningDraftController({ transport: channel, sessionKey: "peer", turnId: "turn" });
+    const attempts = vi.spyOn(channel, "sendReasoning");
+    reasoning.startRun("native");
+    reasoning.startMessage();
+    reasoning.push({ text: "Check the file." });
+    fail();
+    reasoning.endBurst(); // The first message's rejected close keeps its ID/text.
+    reasoning.startMessage();
+    reasoning.push({ text: secondText });
+    reasoning.stop(); // First close failure for message 2 arises inside stop.
+    const pending = attempts.mock.calls.filter((args) => args[4] === true);
+    expect(new Set(pending.map((args) => args[1])).size).toBe(2);
+    expect(reasoning.deliveryFailed).toBe(true);
+    expect(journal.maxSeq("peer")).toBe(0);
+    db.exec("DROP TRIGGER fail_write");
+    attempts.mockClear();
+    reasoning.stop();
+    reasoning.stop();
+    expect(reasoning.deliveryFailed).toBe(false);
+    expect(attempts.mock.calls).toEqual([pending[0], pending.find((args) => args[1] !== pending[0][1])]);
+    const expected = [{ id: attempts.mock.calls[0][1], text: "Check the file." }, { id: attempts.mock.calls[1][1], text: secondText }];
+    expect(history().map((entry) => ({ id: entry.id, text: "text" in entry ? entry.text : undefined }))).toEqual(expected);
+    const events = journal.read("peer", { afterSeq: 0, limit: 100 }).map(({ event }) => event);
+    expect(events.every((event) => event.kind === "reasoning")).toBe(true);
+    expect(reduceDurableView(events as JournalEvent[]).map((entry) => ({ id: entry.id, text: "text" in entry ? entry.text : undefined }))).toEqual(expected);
+  },
+);
+
+it.each([false, true])("#373: native repeated reasoning keeps the same live policy and durable opt-in (durable=%s)", (durable) => {
+  const { channel, journal, history } = setup({ reasoningDurable: durable });
+  const reasoning = createReasoningDraftController({ transport: channel, sessionKey: "peer", turnId: "turn" });
+  const attempts = vi.spyOn(channel, "sendReasoning");
+  for (const text of ["Check the file.", "Check the file."]) {
+    reasoning.startMessage();
+    reasoning.push({ text });
+    reasoning.endBurst();
+  }
+  reasoning.stop();
+  const finals = attempts.mock.calls.filter((args) => args[4] === true);
+  expect(finals.map((args) => args[3])).toEqual(["Check the file.", "Check the file."]);
+  expect(new Set(finals.map((args) => args[1])).size).toBe(2);
+  expect(history()).toHaveLength(durable ? 2 : 0);
+  expect(journal.read("peer", { afterSeq: 0, limit: 100 })).toHaveLength(durable ? 2 : 0);
+});
+
 it("reasoning stop retries older pending output first and bounds attempts for its new close", () => {
   const { channel, journal, fail, db } = setup({ reasoningDurable: true });
   const reasoning = createReasoningDraftController({ transport: channel, sessionKey: "peer", turnId: "turn" });

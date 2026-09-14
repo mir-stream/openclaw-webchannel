@@ -14,6 +14,7 @@ import { DurableSendError } from "./durable-send-error.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
+import type { GetReplyOptions } from "openclaw/plugin-sdk/reply-runtime";
 
 import {
   deliverDraftFinalPayload,
@@ -89,6 +90,8 @@ type AssembledTurnLike = {
     onPatchSummary?: (p: unknown) => void;
     onPartialReply?: (p: { text?: string }) => void;
     onAssistantMessageStart?: () => void;
+    onReasoningStream?: GetReplyOptions["onReasoningStream"];
+    onReasoningEnd?: GetReplyOptions["onReasoningEnd"];
   };
   delivery: {
     deliver: (
@@ -98,6 +101,8 @@ type AssembledTurnLike = {
         isStatusNotice?: boolean;
         isFallbackNotice?: boolean;
         isCompactionNotice?: boolean;
+        isReasoning?: boolean;
+        isReasoningSnapshot?: boolean;
       },
       info?: { kind?: string; assistantMessageIndex?: number },
     ) => Promise<{ visibleReplySent: boolean }>;
@@ -108,7 +113,7 @@ type LifecycleEvent = { stream?: string; runId?: string; data?: unknown };
 type LifecycleListener = (evt: LifecycleEvent) => void;
 
 function makeFakeApi(params: {
-  streamingMode: "off" | "partial" | "progress";
+  streamingMode: "off" | "partial" | "progress" | "block";
   runImpl: (turn: AssembledTurnLike) => Promise<void>;
   /** Expose the host's agent-events surface (#87 lifecycle verdict). */
   withAgentEvents?: boolean;
@@ -2145,6 +2150,72 @@ describe("handleInboundMessage — #173 collapse-aware final routing", () => {
     expect(independentFinal).toBeDefined();
     if (laneId) expect(independentFinal!.id).not.toBe(laneId);
   });
+});
+
+describe("handleInboundMessage — #373 native reasoning boundaries", () => {
+  it.each(["partial", "progress", "off", "block"] as const)(
+    "%s mode preserves repeated prefixes and equal independent reasoning messages",
+    async (streamingMode) => {
+      const texts = ["Check the file.", "Check the file. Then run tests.", "Check the file. Then run tests."];
+      const { transport, settles } = makeFakeTransport();
+      const reasoning = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+      let sawMessageBoundary = false;
+      const { api } = makeFakeApi({
+        streamingMode,
+        runImpl: async (turn) => {
+          turn.replyOptions?.onAgentRunStart?.("reasoning-run");
+          for (const text of texts) {
+            // These are the actual public callbacks, in embedded message order.
+            sawMessageBoundary = typeof turn.replyOptions?.onAssistantMessageStart === "function";
+            await turn.replyOptions?.onAssistantMessageStart?.();
+            await turn.replyOptions?.onReasoningStream?.({ text });
+            await turn.replyOptions?.onReasoningEnd?.();
+          }
+          await turn.delivery.deliver({ text: "done" }, { kind: "final" });
+        },
+      });
+      await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text: "check", id: `reasoning-${streamingMode}` });
+      const finals = reasoning.mock.calls.filter((args) => args[4] === true);
+      expect(finals.map((args) => args[3])).toEqual(texts);
+      expect(new Set(finals.map((args) => args[1])).size).toBe(3);
+      expect(sawMessageBoundary).toBe(true);
+      expect(settles).toEqual(["ok"]);
+    },
+  );
+
+  it.each(["btw", "codex-snapshot", "cli-replay"] as const)(
+    "%s public callback sequence preserves cumulative text and replay ownership",
+    async (source) => {
+      const { transport, settles } = makeFakeTransport();
+      const reasoning = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+      const { api } = makeFakeApi({
+        streamingMode: "off",
+        runImpl: async (turn) => {
+          const callbacks = turn.replyOptions!;
+          callbacks.onAgentRunStart?.("cumulative-run");
+          if (source === "btw") {
+            callbacks.onAssistantMessageStart?.();
+            await callbacks.onReasoningStream?.({ text: "AAA", isReasoning: true });
+            await callbacks.onReasoningEnd?.();
+            await callbacks.onReasoningStream?.({ text: "AAA\nBBB", isReasoning: true });
+            await callbacks.onReasoningEnd?.();
+          } else {
+            await callbacks.onReasoningStream?.({ text: "AAA", isReasoningSnapshot: true });
+            if (source === "codex-snapshot") callbacks.onAssistantMessageStart?.();
+            await callbacks.onReasoningStream?.({ text: "AAA\n\nBBB", isReasoningSnapshot: true });
+            if (source === "codex-snapshot") await callbacks.onReasoningEnd?.();
+            else await turn.delivery.deliver({ text: "AAA\n\nBBB", isReasoning: true }, { kind: "final" });
+          }
+          await turn.delivery.deliver({ text: "done" }, { kind: "final" });
+        },
+      });
+      await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text: "check", id: `reasoning-${source}` });
+      const finals = reasoning.mock.calls.filter((args) => args[4] === true);
+      expect(finals.map((args) => args[3])).toEqual(source === "btw" ? ["AAA", "BBB"] : ["AAA\n\nBBB"]);
+      expect(new Set(reasoning.mock.calls.map((args) => args[1])).size).toBe(source === "btw" ? 2 : 1);
+      expect(settles).toEqual(["ok"]);
+    },
+  );
 });
 
 

@@ -3829,7 +3829,7 @@ describe("ReasoningDraftController", () => {
 
   it("suppresses the CLI final replay only while its equal live burst is open", () => {
     const { controller, frames } = setup();
-    controller.push({ text: "Plan" });
+    controller.push({ text: "Plan", isReasoningSnapshot: true });
     // Pinned CLI shape: no onReasoningEnd; the final live snapshot is prepended
     // to the result as an equal durable isReasoning payload.
     controller.pushDurableBlock({ text: "Plan" });
@@ -3851,7 +3851,7 @@ describe("ReasoningDraftController", () => {
 
   it("emits the CLI durable replay when its matching live send was rejected", () => {
     const { controller, frames } = setup([false, true]);
-    controller.push({ text: "Plan" });
+    controller.push({ text: "Plan", isReasoningSnapshot: true });
     controller.pushDurableBlock({ text: "Plan" });
 
     expect(frames.map((frame) => frame.text)).toEqual(["Plan"]);
@@ -4125,6 +4125,116 @@ describe("ReasoningDraftController — btw stale-burst defense", () => {
     return { controller, frames };
   }
 
+  it.each([true, false])("#373: native message boundaries preserve equal text and prefixes (endPrevious=%s)", (endPrevious) => {
+    const { controller, frames } = setup();
+    controller.startRun("native-run");
+    const texts = ["Check the file.", "Check the file.", "Check the file. Then run tests."];
+    for (const text of texts) {
+      controller.startMessage();
+      controller.push({ text });
+      if (endPrevious) controller.endBurst();
+    }
+    controller.stop();
+    expect(liveTexts(frames)).toEqual(texts);
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(texts);
+    expect(new Set(finalFrames(frames).map((frame) => frame.id)).size).toBe(3);
+  });
+
+  it("#373: btw's one message retains its cumulative accumulator across endBurst", () => {
+    const { controller, frames } = setup();
+    controller.startMessage(); // btw fires this once, not at each thinking_end.
+    controller.push({ text: "AAA" });
+    controller.endBurst();
+    controller.push({ text: "AAA\nBBB" });
+    controller.endBurst();
+    controller.push({ text: "AAA\nBBB\nCCC" });
+    controller.stop();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "BBB", "CCC"]);
+    expect(new Set(finalFrames(frames).map((frame) => frame.id)).size).toBe(3);
+  });
+
+  it("#373: Codex turn snapshots cross its answer-start callback on one live ID", () => {
+    const { controller, frames } = setup();
+    controller.startRun("snapshot-run");
+    controller.push({ text: "AAA", isReasoningSnapshot: true });
+    controller.startMessage(); // Codex emits answer-start after initial reasoning.
+    controller.push({ text: "AAA\n\nBBB", isReasoningSnapshot: true });
+    controller.endBurst(); // Codex projector ends reasoning once at turn completion.
+    controller.stop();
+    expect(liveTexts(frames)).toEqual(["AAA", "AAA\n\nBBB"]);
+    expect(new Set(frames.map((frame) => frame.id)).size).toBe(1);
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA\n\nBBB"]);
+  });
+
+  it("#373: explicit snapshots replace in full after a prior close", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "AAA", isReasoningSnapshot: true });
+    controller.endBurst();
+    controller.push({ text: "AAA", isReasoningSnapshot: true });
+    controller.stop();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "AAA"]);
+    expect(new Set(finalFrames(frames).map((frame) => frame.id)).size).toBe(2);
+  });
+
+  it.each([false, true])("#373: a new run resets the accumulator; duplicate notification is inert (snapshot=%s)", (snapshot) => {
+    const { controller, frames } = setup();
+    controller.startRun("run-1");
+    controller.push({ text: "AAA", isReasoningSnapshot: snapshot });
+    controller.startRun("run-1");
+    controller.push({ text: "AAA more", isReasoningSnapshot: snapshot });
+    controller.endBurst();
+    controller.startRun("run-2");
+    controller.push({ text: "AAA more", isReasoningSnapshot: snapshot });
+    controller.stop();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA more", "AAA more"]);
+    expect(new Set(finalFrames(frames).map((frame) => frame.id)).size).toBe(2);
+    expect(liveFrames(frames)[0].id).toBe(liveFrames(frames)[1].id);
+  });
+
+  it("#373: a native boundary prevents equal durable text from consuming the previous open live ID", () => {
+    const { controller, frames } = setup();
+    controller.startMessage();
+    controller.push({ text: "AAA" });
+    controller.startMessage();
+    controller.pushDurableBlock({ text: "AAA" });
+    controller.stop();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "AAA"]);
+    expect(new Set(finalFrames(frames).map((frame) => frame.id)).size).toBe(2);
+  });
+
+  it("#373: equal unmarked live and durable messages do not imply CLI replay ownership", () => {
+    const { controller, frames } = setup();
+    controller.startMessage();
+    controller.push({ text: "AAA" });
+    controller.pushDurableBlock({ text: "AAA" });
+    controller.stop();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "AAA"]);
+    expect(new Set(finalFrames(frames).map((frame) => frame.id)).size).toBe(2);
+  });
+
+  it("#373: a marked snapshot cannot claim an equal durable block across a message boundary", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "AAA", isReasoningSnapshot: true });
+    controller.startMessage();
+    controller.pushDurableBlock({ text: "AAA" });
+    controller.stop();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "AAA"]);
+    expect(new Set(finalFrames(frames).map((frame) => frame.id)).size).toBe(2);
+  });
+
+  it("#373: CLI's unmarked durable replay closes its accepted marked live snapshot on the same ID", () => {
+    const { controller, frames } = setup();
+    controller.startRun("cli-run");
+    controller.push({ text: "Plan", isReasoningSnapshot: true });
+    controller.pushDurableBlock({ text: "Plan" });
+    controller.pushDurableBlock({ text: "Plan" });
+    controller.stop();
+    const finals = finalFrames(frames);
+    expect(finals.map((frame) => frame.text)).toEqual(["Plan", "Plan"]);
+    expect(finals[0].id).toBe(liveFrames(frames)[0].id);
+    expect(finals[1].id).not.toBe(finals[0].id);
+  });
+
   it("strips a prior burst's stale prefix from a later btw burst (under the rotated id)", () => {
     // btw never resets its `reasoningText` accumulator at thinking_end, so burst 2's
     // cumulative payload still carries burst 1's full text as a raw prefix.
@@ -4160,27 +4270,20 @@ describe("ReasoningDraftController — btw stale-burst defense", () => {
     expect(finalFrames(frames).map((f) => f.text)).toEqual(["AAA"]);
   });
 
-  it("recognizes an open burst's exact raw snapshot after display-prefix stripping", () => {
+  it("does not infer a snapshot replay from an unmarked cumulative stream's equal raw text", () => {
     const { controller, frames } = setup();
+    controller.startMessage();
     controller.push({ text: "AAA" });
     controller.endBurst();
-    controller.push({ text: "AAABBB" }); // displayed as BBB; raw snapshot is AAABBB
-
+    controller.push({ text: "AAABBB" }); // btw's current burst displays BBB.
+    // btw does not produce CLI's durable snapshot replay. A complete block
+    // arriving here is a separate delivery act, even if its text matches raw.
     controller.pushDurableBlock({ text: "AAABBB" });
     expect(liveTexts(frames)).toEqual(["AAA", "BBB"]);
-    // #242: both bursts have now closed (endBurst, then the replay), each with
-    // one durable frame carrying its DISPLAYED text — never the raw payload.
-    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "BBB"]);
-
-    // The replay closed the live burst; equality no longer suppresses an
-    // independent durable block.
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "BBB", "AAABBB"]);
     controller.pushDurableBlock({ text: "AAABBB" });
-    expect(liveTexts(frames)).toEqual(["AAA", "BBB"]);
-    expect(finalFrames(frames).map((frame) => frame.text)).toEqual([
-      "AAA",
-      "BBB",
-      "AAABBB",
-    ]);
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "BBB", "AAABBB", "AAABBB"]);
+    expect(new Set(finalFrames(frames).map((frame) => frame.id)).size).toBe(4);
   });
 
   it("falls through to a plain replace when a later burst does not carry the stale prefix", () => {

@@ -2380,6 +2380,10 @@ export type ReasoningStreamUpdate = {
 
 export type ReasoningDraftController = {
   readonly deliveryFailed: boolean;
+  /** A new public agent run starts a fresh accumulator; duplicate notification is inert. */
+  startRun: (runId: string) => void;
+  /** The public assistant-message-start boundary, interpreted with the next payload. */
+  startMessage: () => void;
   /** Consume one cumulative update from the native live-reasoning callback. */
   push: (update: ReasoningStreamUpdate) => void;
   /** Consume one complete durable reasoning block from the delivery adapter. */
@@ -2389,72 +2393,24 @@ export type ReasoningDraftController = {
 };
 
 /**
- * Normalizes OpenClaw's LIVE reasoning updates into cumulative, replace-by-id
- * wire frames. Each `onReasoningEnd` boundary rotates the id so separate live
- * reasoning bursts remain distinct in the UI. Complete durable blocks take the
- * separate `pushDurableBlock` path: each is emitted whole under a fresh id and
- * never participates in live-stream stale-prefix accounting. The sole replay
- * exception is pinned core's CLI path: while a live burst is still OPEN, its
- * exact final raw/display snapshot is delivered again as a durable block. A
- * successfully delivered exact match closes the live burst without emitting a
- * duplicate; equality or prefix overlap between independent durable blocks is
- * never deduplicated. If the live transport rejected its latest snapshot, the
- * durable block remains the fallback and is emitted normally.
+ * Reasoning updates replace the current live draft; endBurst closes its accepted
+ * preview under the same ID. A new assistant-message boundary resets the native
+ * accumulator, so independent equal messages and repeated prefixes stay whole.
  *
- * #242 half 1 — ONE DURABLE FRAME PER BURST. A frame carrying `final: true` is
- * what LETS the delivery journal record a burst, and the journal records
- * NOTHING else this controller sends. (Whether it records anything at all is the
- * account's `capabilities.reasoningDurable`, default OFF — gated at the
- * journaling seam, never here, so this controller's wire output is identical
- * either way.) The invariant is per BURST, not per call:
+ * Unmarked updates can accumulate across thinking_end within ONE message (btw
+ * emits one message-start and retains reasoningText; embedded full thinking also
+ * accumulates within a message). Only that scope may subtract already closed
+ * accumulator text. Explicit isReasoningSnapshot updates replace in full: the
+ * Codex app-server projector aggregates reasoning items across its one answer
+ * start and closes at turn completion. A message-start alone cannot reset it.
+ * A new run resets either scope, using the public onAgentRunStart callback.
  *
- *   `endBurst`                    — closes the live burst: ONE frame, or ZERO
- *                                   when nothing of it was delivered.
- *   `stop()`                      — same, on the turn's way out.
- *   `pushDurableBlock`, branch A  — the CLI replay: closes the live burst (one
- *     (replay suppression)          or zero) and suppresses the block itself,
- *                                   because the block IS that burst.
- *   `pushDurableBlock`, branch B  — an independent block: closes the live burst
- *     (independent block)           (one or zero) AND emits the block, which is
- *                                   already complete and so carries the flag on
- *                                   its own single frame. Up to TWO frames —
- *                                   two BURSTS, not one burst twice.
- *
- * So "exactly one per close call" is false and "at most one per burst, and zero
- * only when the burst reached nobody" is the property. See `closeLiveBurst` for
- * the close-frame policy and the `lastDeliveredText` gate.
- *
- * VERIFIED INTERNAL BEHAVIOR (OpenClaw 2026.7.1-2): every emitter sends either
- * a snapshot or the cumulative FULL text so far — NEVER a bare delta:
- *  - the ACP runner emits the full accumulated text with `isReasoningSnapshot:
- *    true`;
- *  - the btw runner emits cumulative full text (`reasoningText += delta` then
- *    emits `reasoningText`, no snapshot flag).
- * So normalization is a plain REPLACE: ignore empty/non-string text, no-op an
- * exact duplicate of the current text, otherwise replace and send. No
- * snapshot/startsWith/endsWith/concat heuristic is needed.
- *
- * btw STALE-BURST DEFENSE: the btw `reasoningText` accumulator (declared
- * internally and verified at OpenClaw 2026.7.1-2) is NEVER reset at
- * `thinking_end`, even though that same event fires `onReasoningEnd`. So a
- * SECOND thinking burst in one attempt emits cumulative text that still carries
- * burst 1's full text as a raw prefix (btw concatenates raw deltas, whitespace
- * and all). Under our per-burst id
- * rotation that would render burst 1 duplicated inside burst 2's lane. We defend
- * with a `stalePrefix`: on `endBurst` we set it to the just-closed burst's LAST
- * RAW payload (that raw cumulative text already contains every prior burst — so
- * assign, don't append our trimmed display text, which loses inter-burst
- * whitespace and misfires from burst 3 on), and on `push` we strip that prefix
- * (plus any leading whitespace) from an incoming cumulative payload before the
- * replace logic runs. The ACP runner cannot hit this — its internal
- * `maybeEndReasoning` fires `onReasoningEnd` at most once per attempt (a
- * `reasoningEnded` guard), verified at OpenClaw 2026.7.1-2. The strip is
- * conservative: a payload that does NOT start with the accumulated prefix falls
- * through unchanged, so the worst case is the pre-fix duplicated display,
- * never lost text — as long as the emitter's accumulator persists for the
- * controller's lifetime (the pinned single-invocation contract). A fresh runner
- * re-streaming byte-identical reasoning into a reused controller could jump-strip
- * mid-stream; no pinned path does that today.
+ * Complete durable blocks author independent IDs. An exact accepted open live
+ * snapshot replay can close its existing ID; after a message/run boundary or
+ * burst close, equality cannot suppress an independent block. Rejected final storage
+ * retains the exact ID/text for output-only retry. Only final:true is journaled,
+ * subject to reasoningDurable; ephemeral previews and last-accepted-text policy
+ * remain unchanged. Source trace and deliberate limits: MESSAGE_DELIVERY_IDENTITY.md.
  */
 export function createReasoningDraftController(params: {
   transport: WebChannelPeerChannel;
@@ -2463,16 +2419,13 @@ export function createReasoningDraftController(params: {
 }): ReasoningDraftController {
   let id = nextMessageId();
   let currentText = "";
-  // Prefix a later burst's payload carries under btw (stale-burst defense). btw's
-  // `reasoningText` is its RAW cumulative accumulator, so the prefix is exactly the
-  // last raw payload of the just-closed burst — NOT our trimmed display text (the
-  // two differ whenever whitespace separates bursts, e.g. "\n\n" from a thinking
-  // model). `endBurst` therefore ASSIGNS `stalePrefix = lastRawText` (the raw
-  // payload already contains every prior burst), not `+=` our stripped text.
-  let stalePrefix = "";
-  // The last raw payload seen this burst (before stripping), captured so endBurst
-  // can hand the raw cumulative text to `stalePrefix`.
+  // Raw text closed within the current message's cumulative stream, never a
+  // cross-message identity key. Preserve whitespace in this source baseline.
+  let closedAccumulatorText = "";
   let lastRawText = "";
+  let lastUpdateIsSnapshot = false;
+  let messageBoundaryPending = false;
+  let runId: string | undefined;
   // Replay suppression is safe only when the matching live snapshot actually
   // reached the transport. A rejected live send leaves the durable result as the
   // only delivery path, so it must not be discarded merely because its text
@@ -2513,36 +2466,47 @@ export function createReasoningDraftController(params: {
         true,
       );
     }
-    // The NEXT live burst's raw payload carries this closed burst's LAST RAW text
-    // as its prefix (btw's accumulator is cumulative and already holds all prior
-    // bursts), so assign — don't append our trimmed display text, which would
-    // drop any inter-burst whitespace and break the prefix match from burst 3 on.
-    stalePrefix = lastRawText;
+    closedAccumulatorText = lastRawText;
     id = nextMessageId();
     currentText = "";
     lastDeliveredText = "";
     liveSnapshotDelivered = false;
   };
 
+  const resetAccumulator = (): void => {
+    closeLiveBurst();
+    closedAccumulatorText = "";
+    lastRawText = "";
+    lastUpdateIsSnapshot = false;
+    messageBoundaryPending = false;
+  };
+
+  // Defer interpreting message-start until the next payload declares its form.
+  // A turn snapshot can cross that callback without resetting its accumulator;
+  // an unmarked native update belongs to the newly opened assistant message.
+  const acceptMessageBoundary = (snapshot: boolean): void => {
+    if (!messageBoundaryPending) return;
+    if (!snapshot) resetAccumulator();
+    messageBoundaryPending = false;
+  };
+
   const push = (update: ReasoningStreamUpdate): void => {
     if (stopped) return;
     const text = typeof update.text === "string" ? update.text : "";
     if (text.length === 0) return;
-    // Remember the RAW payload before any stripping (see stalePrefix above).
+    const snapshot = update.isReasoningSnapshot === true;
+    acceptMessageBoundary(snapshot);
+    lastUpdateIsSnapshot = snapshot;
     lastRawText = text;
-    // btw stale-burst defense (see the contract above): a later burst's cumulative
-    // payload still carries every prior burst's text as a leading prefix. Strip it
-    // (and any whitespace the deltas left between bursts) so this burst's lane
-    // shows only its own text. A payload that does not carry the prefix is left
-    // as-is (conservative — never drop text we can't confidently attribute).
+    // Within one explicitly bounded cumulative stream, remove only text already
+    // closed by that stream. Snapshot payloads always replace with their full text.
     let normalized = text;
-    if (stalePrefix.length > 0 && normalized.startsWith(stalePrefix)) {
-      normalized = normalized.slice(stalePrefix.length).replace(/^\s+/, "");
+    if (!snapshot && closedAccumulatorText && normalized.startsWith(closedAccumulatorText)) {
+      normalized = normalized.slice(closedAccumulatorText.length).replace(/^\s+/, "");
       if (normalized.length === 0) return;
     }
-    // Cumulative/snapshot REPLACE (see the verified contract above): a payload is
-    // always the full text so far, so an exact match is a no-op and anything else
-    // replaces the current text wholesale.
+    // Replace the current burst's preview. Equality is a no-op only inside this
+    // open delivery scope, after consuming any native message boundary.
     if (normalized === currentText) return;
     currentText = normalized;
     liveSnapshotDelivered = sendReasoning(
@@ -2562,11 +2526,24 @@ export function createReasoningDraftController(params: {
 
   return {
     get deliveryFailed() { return pendingReasoning.size > 0; },
+    startRun: (nextRunId) => {
+      if (stopped || runId === nextRunId) return;
+      resetAccumulator();
+      runId = nextRunId;
+    },
+    startMessage: () => {
+      if (!stopped) messageBoundaryPending = true;
+    },
     push,
     pushDurableBlock: (update) => {
       if (stopped) return;
       const text = typeof update.text === "string" ? update.text : "";
       if (text.length === 0) return;
+
+      // A complete block cannot inherit replay ownership across a message
+      // boundary. CLI's marked live snapshot has no intervening message-start
+      // callback on its bridge before the unmarked durable result arrives.
+      acceptMessageBoundary(false);
 
       // Pinned core's CLI runtime bridges each thinking snapshot to the live
       // callback, then prepends the captured FINAL snapshot to its result as an
@@ -2584,6 +2561,7 @@ export function createReasoningDraftController(params: {
       // this path, and it carries the burst's full text rather than a truncated
       // prefix.
       if (
+        lastUpdateIsSnapshot &&
         liveSnapshotDelivered &&
         currentText.length > 0 &&
         (text === currentText || text === lastRawText)
@@ -2593,7 +2571,7 @@ export function createReasoningDraftController(params: {
       }
 
       // Preserve an in-flight live burst before emitting this independent block.
-      // Only closing LIVE state updates `stalePrefix`; the durable text itself is
+      // Only closing LIVE state updates the accumulator; the durable text itself is
       // sent whole and then rotates the id without touching that accumulator.
       closeLiveBurst();
       // #242 half 1: this block is ALREADY COMPLETE when it is sent — it is a
