@@ -79,6 +79,53 @@ it("shares one fresh admission across same-batch wire correlations and second re
   expect(h.runs).toHaveLength(1);
 });
 
+it("cancels a same-batch alias while a later logical lookup is pending", async () => {
+  const h = setup();
+  const lookup = h.store.lookup.bind(h.store);
+  let resume!: () => void;
+  let laterLookupPending = false;
+  const gate = new Promise<void>((resolve) => { resume = resolve; });
+  vi.spyOn(h.store, "lookup").mockImplementation(async (...args) => {
+    const result = await lookup(...args);
+    if (args[1] === "peer:later") {
+      laterLookupPending = true;
+      await gate;
+    }
+    return result;
+  });
+  try {
+    for (const value of [item("wire-first", "logical"), item("wire-alias", "logical"), item("wire-later", "later")]) {
+      expect(h.debouncer.push(value).status).toBe("accepted");
+    }
+    await vi.waitFor(() => expect(laterLookupPending).toBe(true));
+    expect(h.debouncer.usage()).toEqual({ waiting: 0, inflight: 3, keys: 1 });
+    expect(h.budget.usage().messages).toBe(3);
+    expect(() => {
+      expect(h.debouncer.cancelKey("peer", { notify: true })).toBe(true);
+      h.dispatcher.clearPending("peer");
+    }).not.toThrow();
+    expect(h.acks).toEqual([]);
+    expect(h.runs).toEqual([]);
+    expect(h.journal.read("peer")).toEqual([]);
+  } finally {
+    resume();
+    await h.idle();
+  }
+  expect(h.acks).toEqual([{ peerId: "peer", ids: ["wire-first", "wire-alias", "wire-later"], committed: undefined }]);
+  expect(h.debouncer.diagnostics()).toEqual({ capturedEntries: 0, queuedBatches: 0, workers: 0 });
+  expect(h.budget.usage()).toEqual({ messages: 0, bytes: 0 });
+  for (const logicalId of ["logical", "later"]) {
+    expect(await h.store.lookup("account", `peer:${logicalId}`)).toEqual({ status: "found", outcome: "cancelled" });
+    const wireId = `${logicalId}-retry`;
+    expect(h.debouncer.push(item(wireId, logicalId))).toEqual({ status: "known-outcome", outcome: "cancelled" });
+    expect(h.acks.at(-1)).toEqual({ peerId: "peer", ids: [wireId], committed: undefined });
+  }
+  expect(h.rejected).toEqual([]);
+  expect(h.runs).toEqual([]);
+  expect(h.journal.read("peer")).toEqual([]);
+  expect(h.budget.usage()).toEqual({ messages: 0, bytes: 0 });
+});
+
 it.each([
   ["waiting", "count"], ["inflight", "count"],
   ["waiting", "measurement"], ["inflight", "measurement"],
@@ -427,7 +474,7 @@ function setup(options: { accountId?: string; store?: ReturnType<typeof createIn
     expect(resolver.usage()).toEqual({ tasks: 0, metadataBytes: 0 });
     expect(debouncer.usage()).toEqual({ waiting: 0, inflight: 0, keys: 0 });
   });
-  return { store, journal, budget, token, fallback, resolver, debouncer, flush, runs, acks, rejected, pressure,
+  return { store, journal, budget, token, fallback, resolver, dispatcher, debouncer, flush, runs, acks, rejected, pressure,
     fill, release, idle, accountId, loseAck: (lose: boolean) => { ackSuccess = !lose; } };
 }
 

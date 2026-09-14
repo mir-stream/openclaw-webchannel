@@ -784,7 +784,9 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           const { key, wireId: id, randomId, idempotencyKey } = identity;
           const pendingOutcome = pendingOutcomes.get(key);
           if (pendingOutcome !== undefined) {
-            release();
+            // A later lookup can yield to /stop, which still needs to acquire
+            // this alias's cancellation hold before the batch settles.
+            deferredReleases.push(release);
             if (pendingOutcome === "overloaded") rejectedIds.push(id);
             else {
               ackIds.push(id);
