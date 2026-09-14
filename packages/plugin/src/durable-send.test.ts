@@ -216,6 +216,66 @@ it.each([false, true])("reasoning durability policy remains explicit on store fa
   expect(journal.read("peer", { afterSeq: 0, limit: 100 }).filter(({ event }) => event.kind === "reasoning")).toHaveLength(durable ? 1 : 0);
 });
 
+it.each([false, true])("one reasoning stop retries its newly rejected close once (persistent=%s)", (persistent) => {
+  const { channel, journal, transport, fail, db } = setup({ reasoningDurable: true });
+  const reasoning = createReasoningDraftController({ transport: channel, sessionKey: "peer", turnId: "turn" });
+  const attempts = vi.spyOn(channel, "sendReasoning");
+  reasoning.push({ text: "  displayed reasoning\n" });
+  const originalId = attempts.mock.calls[0]![1];
+  attempts.mockClear();
+  transport.publish.mockClear();
+  fail();
+  if (!persistent) {
+    const append = journal.append.bind(journal);
+    vi.spyOn(journal, "append").mockImplementationOnce((...args) => {
+      try { return append(...args); }
+      finally { db.exec("DROP TRIGGER fail_write"); }
+    });
+  }
+
+  reasoning.stop();
+
+  const closeArgs = ["peer", originalId, "turn", "  displayed reasoning\n", true];
+  expect(attempts.mock.calls).toEqual([closeArgs, closeArgs]);
+  expect(reasoning.deliveryFailed).toBe(persistent);
+  expect(transport.publish).toHaveBeenCalledTimes(persistent ? 0 : 1);
+  const rows = journal.read("peer", { afterSeq: 0, limit: 100 });
+  expect(rows).toHaveLength(persistent ? 0 : 1);
+  if (!persistent) {
+    expect(rows[0]!.event).toMatchObject({ kind: "reasoning", id: originalId, text: "  displayed reasoning\n" });
+    reasoning.stop();
+    expect(attempts.mock.calls).toEqual([closeArgs, closeArgs]);
+  }
+});
+
+it("reasoning stop retries older pending output first and bounds attempts for its new close", () => {
+  const { channel, journal, fail, db } = setup({ reasoningDurable: true });
+  const reasoning = createReasoningDraftController({ transport: channel, sessionKey: "peer", turnId: "turn" });
+  const attempts = vi.spyOn(channel, "sendReasoning");
+  fail();
+  reasoning.pushDurableBlock({ text: "earlier reasoning" });
+  const olderArgs = attempts.mock.calls[0]!;
+  reasoning.push({ text: "current reasoning" });
+  const currentId = attempts.mock.calls[1]![1];
+  const closeArgs = ["peer", currentId, "turn", "current reasoning", true];
+  attempts.mockClear();
+
+  reasoning.stop();
+
+  expect(attempts.mock.calls).toEqual([olderArgs, closeArgs, closeArgs]);
+  expect(reasoning.deliveryFailed).toBe(true);
+  expect(journal.maxSeq("peer")).toBe(0);
+  db.exec("DROP TRIGGER fail_write");
+  attempts.mockClear();
+  reasoning.stop();
+  expect(attempts.mock.calls).toEqual([olderArgs, closeArgs]);
+  expect(reasoning.deliveryFailed).toBe(false);
+  expect(journal.read("peer", { afterSeq: 0, limit: 100 }).map(({ event }) => event)).toEqual([
+    expect.objectContaining({ kind: "reasoning", id: olderArgs[1], text: "earlier reasoning" }),
+    expect.objectContaining({ kind: "reasoning", id: currentId, text: "current reasoning" }),
+  ]);
+});
+
 it("tool events fail closed and an explicit same-event retry retains its ID", () => {
   const { channel, fail, db, journal, transport } = setup();
   const activity = { id: "tool-id", turnId: "turn", name: "read_file", phase: "result" };

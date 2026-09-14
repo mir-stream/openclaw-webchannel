@@ -2875,7 +2875,7 @@ export function createReasoningDraftController(params: {
       //
       // Idempotent: `closeLiveBurst` early-returns on an empty burst, and it
       // clears `currentText`, so a second `stop()` — or a `stop()` after
-      // `endBurst` — emits nothing.
+      // `endBurst` — only retries any rejected output.
       //
       // ⚠️ THIS FRAME IS JOURNALED AFTER THE TURN'S `seal`, AND THAT IS A KNOWN
       // ORDERING DIVERGENCE. `inbound.ts` awaits `draft?.drain()` — which emits
@@ -2906,8 +2906,14 @@ export function createReasoningDraftController(params: {
       // The old sentence was true about the seal and read as if it covered the
       // answers. `journal-history.ts`'s conversion loop (GAP 2b) is where the
       // divergence is now stated; still NOT a change to make here.
-      for (const args of [...pendingReasoning.values()]) sendReasoning(...args);
+      const pendingAtStop = new Map(pendingReasoning);
+      for (const args of pendingAtStop.values()) sendReasoning(...args);
+      const closingId = id;
       closeLiveBurst();
+      // Production stops once. Give a newly rejected close its one output-only
+      // retry here, without retrying earlier pending failures a second time.
+      const pendingClose = pendingReasoning.get(closingId);
+      if (pendingClose && !pendingAtStop.has(closingId)) sendReasoning(...pendingClose);
       stopped = true;
     },
   };
