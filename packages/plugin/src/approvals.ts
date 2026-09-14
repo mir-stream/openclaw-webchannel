@@ -842,8 +842,9 @@ export function createClawApprovalNativeRuntimeSpec(
   // multi-account entry), a MISS returns `undefined` and the caller DROPS the
   // frame — it must NEVER fall back to the closure `transport`, or an account
   // that `registerFull` skipped (creds-missing / connect-fail) would have its
-  // prompt delivered on ANOTHER account's channel — re-opening the exact cross-account misroute S1 closes. Only a
-  // resolver-less single-channel wiring uses the closure transport, where
+  // prompt delivered on ANOTHER account's channel — re-opening the exact
+  // cross-account misroute S1 closes. Only a resolver-less single-channel
+  // wiring uses the closure transport, where
   // there is exactly one account and no misroute is possible.
   const hasResolver = typeof resolveAccountTransport === "function";
   const transportFor = (
