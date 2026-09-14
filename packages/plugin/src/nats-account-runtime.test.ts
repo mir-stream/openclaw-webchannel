@@ -45,7 +45,6 @@ import {
   resolveAccountPublicationFailure,
   resolvePrivateReadiness,
   runAccountStartupLoop,
-  selectPrimaryRuntime,
   shouldLogRetryAttempt,
 } from "./nats-account-runtime.js";
 
@@ -148,7 +147,14 @@ describe("outbound account selection through the production NATS facade (#371)",
       expectUntouched(primary, "named-only");
     });
 
-    it.each(["absent", "removed", "disposed", "disconnected"])("refuses an %s target without falling back", async (state) => {
+    it.each([
+      // An unresolvable runtime is refused before the send; a resolvable but
+      // dead one is refused by the send itself. Neither reaches a sibling.
+      { state: "absent", rejects: /not running/ },
+      { state: "removed", rejects: /not running/ },
+      { state: "disposed", rejects: /returned false/ },
+      { state: "disconnected", rejects: /returned false/ },
+    ])("refuses a $state target without falling back", async ({ state, rejects }) => {
       const primary = runtime("default", "tenant-a");
       const named = runtime("other", "tenant-b");
       const runtimes = new Map([["default", primary]]);
@@ -157,9 +163,26 @@ describe("outbound account selection through the production NATS facade (#371)",
       if (state === "removed") { runtimes.delete("other"); named.channel.dispose(); }
       if (state === "disposed") named.channel.dispose();
       if (state === "disconnected") named.transport.connected = false;
-      await expect(send(plugin, seam, config(["default", "other"]), "other")).rejects.toThrow();
+      await expect(send(plugin, seam, config(["default", "other"]), "other")).rejects.toThrow(rejects);
       expectUntouched(primary);
       expectUntouched(named);
+    });
+
+    it("delivers on the listed spelling when core canonicalizes the account id", async () => {
+      const primary = runtime("default", "tenant-a");
+      const named = runtime("Acme", "tenant-b");
+      const plugin = createNatsWebChannelPlugin(new Map([["default", primary], ["Acme", named]]));
+      // Core starts the account as listed but canonicalizes the id on its
+      // core-initiated send paths, so `ctx.accountId` arrives lowercased.
+      expectDelivered(named, await send(plugin, seam, config(["default", "Acme"]), "acme"));
+      expectUntouched(primary);
+    });
+
+    it("refuses a canonical account id no running runtime answers", async () => {
+      const primary = runtime("default", "tenant-a");
+      const plugin = createNatsWebChannelPlugin(new Map([["default", primary]]));
+      await expect(send(plugin, seam, config(["default", "Acme"]), "acme")).rejects.toThrow(/not running/);
+      expectUntouched(primary);
     });
 
     it.each([undefined, null])("honors configured defaultAccount for accountId=%s", async (accountId) => {
@@ -209,7 +232,7 @@ describe("outbound account selection through the production NATS facade (#371)",
     it("does not choose a live sibling when the configured default has not started", async () => {
       const primary = runtime("default", "tenant-a");
       const plugin = createNatsWebChannelPlugin(new Map([["default", primary]]));
-      await expect(send(plugin, seam, config(["default", "other"], "other"))).rejects.toThrow();
+      await expect(send(plugin, seam, config(["default", "other"], "other"))).rejects.toThrow(/not running/);
       expectUntouched(primary);
     });
 
@@ -222,7 +245,7 @@ describe("outbound account selection through the production NATS facade (#371)",
       expectDelivered(old, await send(plugin, seam, cfg, "other"));
       old.channel.dispose();
       runtimes.delete("other");
-      await expect(send(plugin, seam, cfg, "other")).rejects.toThrow();
+      await expect(send(plugin, seam, cfg, "other")).rejects.toThrow(/not running/);
       const replacement = runtime("other", "tenant-c");
       runtimes.set("other", replacement);
       expectDelivered(replacement, await send(plugin, seam, cfg, "other"));
@@ -926,15 +949,6 @@ describe("account serving aggregate", () => {
 });
 
 describe("NatsAccountRuntimeCoordinator", () => {
-  it("selects default dynamically, else the lexicographically smallest serving id", () => {
-    const runtimes = new Map([["z", 3], ["b", 2]]);
-    expect(selectPrimaryRuntime(runtimes)).toBe(2);
-    runtimes.set("default", 1);
-    expect(selectPrimaryRuntime(runtimes)).toBe(1);
-    runtimes.delete("default"); runtimes.delete("b");
-    expect(selectPrimaryRuntime(runtimes)).toBe(3);
-  });
-
   it("deduplicates consecutive structural installs but keeps A-B-A monotone", () => {
     const coordinator = new NatsAccountRuntimeCoordinator();
     expect(coordinator.installFull({ registrationMode: "tool-discovery", config: { a: 1 }, runtime: 0, logger: 0 })).toBeUndefined();

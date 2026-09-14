@@ -12,6 +12,7 @@
 import { fileURLToPath } from "node:url";
 
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
+import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 
 import { NatsChannel } from "./nats-channel.js";
 import type { RegisterChannelSurface } from "./nats-channel.js";
@@ -159,7 +160,6 @@ export {
   runAccountStartupLoop,
   resolvePrivateReadiness,
   retryCeilingMs,
-  selectPrimaryRuntime,
   shouldLogRetryAttempt,
   waitForAbort,
 } from "./nats-account-coordinator.js";
@@ -294,10 +294,23 @@ export function createNatsWebChannelPlugin(
     "resolveApprovalTransport" | "resolveOutboundTransport"
   >,
 ) {
+  // Core starts our accounts under the id as LISTED in config ("Acme"), but
+  // canonicalizes the id on its core-initiated send paths (the agent `message`
+  // tool, heartbeat targets, routed replies), so `ctx.accountId` can arrive as
+  // "acme". Match the exact key first, then the canonical form. This cannot be
+  // ambiguous: `inspectWebchannelAccountIds` rejects every configured id that
+  // shares a `normalizeAccountId` result, so at most one runtime can match.
+  const resolveOutboundRuntime = (accountId: string) => {
+    const exact = runtimes.get(accountId);
+    if (exact) return exact;
+    const canonical = normalizeAccountId(accountId);
+    for (const [id, runtime] of runtimes) if (normalizeAccountId(id) === canonical) return runtime;
+    return undefined;
+  };
   // Both capabilities use live account resolvers; there is no primary binding.
   return createWebChannelPlugin(new NullPeerChannel(), {
     ...opts,
-    resolveOutboundTransport: (accountId) => runtimes.get(accountId)?.channel,
+    resolveOutboundTransport: (accountId) => resolveOutboundRuntime(accountId)?.channel,
     resolveApprovalTransport: (accountId) => runtimes.get(accountId ?? "default")?.channel,
   });
 }
