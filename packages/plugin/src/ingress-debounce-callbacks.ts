@@ -54,6 +54,10 @@ export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(d
     },
     onOverflow: (params) => {
       deps.onPressure?.(params);
+      // A waiting/inflight original (including cancellation) owns the verdict.
+      // This alias has no reservation: leave it for retry instead of racing that
+      // owner with an independent durable overload decision.
+      if (params.deferToRetained) return;
       const { key: peerId, item, recoverCancelled } = params;
       const identity = ingressIdentity(item);
       if (!identity) return;

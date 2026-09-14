@@ -9,7 +9,7 @@ import { createIngressDebounceCallbacks } from "./ingress-debounce-callbacks.js"
 import { CancelledInboundFallbackTombstones, createIngressOnFlush, ingressDedupeKey, recordCancelledInboundItems } from "./ingress-dedupe.js";
 import { createIngressOutcomeStore } from "./ingress-outcome.js";
 import { BoundedOverflowResolver } from "./inbound-overflow-resolver.js";
-import { InboundRetentionBudget } from "./inbound-retention.js";
+import { estimateRetainedMessageBytes, InboundRetentionBudget } from "./inbound-retention.js";
 import { coalesceUserMessages, createSerializedInboundDispatcher, type UserMessageLike } from "./inbound-queue.js";
 
 type Item = { peerId: string; message: UserMessageLike & { random_id?: string } };
@@ -77,6 +77,134 @@ it("shares one fresh admission across same-batch wire correlations and second re
     expect(h.acks.at(-1)?.committed).toEqual(h.acks[0].committed);
   }
   expect(h.runs).toHaveLength(1);
+});
+
+it.each([
+  ["waiting", "count"], ["inflight", "count"],
+  ["waiting", "measurement"], ["inflight", "measurement"],
+])("leaves an over-limit alias for retry while its original is %s (%s)", async (stage, limit) => {
+  let failMeasurement = false;
+  const h = setup({ measure: (value) => {
+    if (failMeasurement) throw new Error("measurement failed");
+    return estimateRetainedMessageBytes(value.message);
+  } });
+  let resumeLookup = () => {};
+  let lookupFinished = false;
+  if (stage === "inflight") {
+    const lookup = h.store.lookup.bind(h.store);
+    const gate = new Promise<void>((resolve) => { resumeLookup = resolve; });
+    vi.spyOn(h.store, "lookup").mockImplementationOnce(async (...args) => {
+      const result = await lookup(...args);
+      lookupFinished = true;
+      await gate;
+      return result;
+    });
+  }
+  if (limit === "count") h.fill(31);
+  try {
+    expect(h.debouncer.push(item("wire-first", "logical")).status).toBe("accepted");
+    if (stage === "inflight") {
+      await vi.waitFor(() => expect(lookupFinished).toBe(true));
+      expect(h.debouncer.usage().inflight).toBe(1);
+    } else {
+      expect(h.debouncer.usage().waiting).toBe(1);
+    }
+    expect(h.debouncer.push(item("wire-first", "logical")).status).toBe("duplicate-inflight");
+    const retained = h.budget.usage();
+    failMeasurement = limit === "measurement";
+    expect(h.debouncer.push(item("wire-retry", "logical"))).toMatchObject({
+      status: "overflow", reason: limit === "count" ? "session-message-count" : "session-byte-count",
+    });
+    failMeasurement = false;
+    expect(h.pressure).toHaveBeenCalledOnce();
+    expect(h.pressure).toHaveBeenCalledWith(expect.objectContaining({ deferToRetained: true }));
+    expect(h.budget.usage()).toEqual(retained);
+    expect(h.resolver.usage()).toEqual({ tasks: 0, metadataBytes: 0 });
+    expect(h.acks).toEqual([]);
+    expect(h.rejected).toEqual([]);
+  } finally {
+    resumeLookup();
+    await h.idle();
+  }
+  expect(h.runs).toHaveLength(1);
+  expect(h.journal.read("peer")).toHaveLength(1);
+  const row = h.journal.lookupUserMessageIdByRandomId("peer", "logical")!;
+  const committed = [{ random_id: "logical", ...row }];
+  expect(h.acks).toEqual([{ peerId: "peer", ids: ["wire-first"], committed }]);
+  expect(await h.store.lookup("account", "peer:logical")).toEqual({ status: "found", outcome: "accepted" });
+  expect(h.budget.usage()).toEqual(limit === "count" ? { messages: 31, bytes: 31 * 512 } : { messages: 0, bytes: 0 });
+  h.release();
+  for (const wireId of ["wire-retry", "wire-second-retry"]) {
+    expect(h.debouncer.push(item(wireId, "logical")).status).toBe("accepted");
+    await h.idle();
+    expect(h.acks.at(-1)).toEqual({ peerId: "peer", ids: [wireId], committed });
+  }
+  expect(h.rejected).toEqual([]);
+  expect(h.runs).toHaveLength(1);
+  expect(h.journal.read("peer")).toHaveLength(1);
+  expect(h.budget.usage()).toEqual({ messages: 0, bytes: 0 });
+  expect(await h.store.lookup("account", "peer:logical")).toEqual({ status: "found", outcome: "accepted" });
+});
+
+it("keeps an overflow-first verdict when an alias arrives after normal capacity returns", async () => {
+  const h = setup();
+  h.fill();
+  const lookup = h.store.lookup.bind(h.store);
+  let resume!: () => void;
+  const gate = new Promise<void>((resolve) => { resume = resolve; });
+  vi.spyOn(h.store, "lookup").mockImplementationOnce(async (...args) => { await gate; return lookup(...args); });
+  try {
+    expect(h.debouncer.push(item("wire-first", "logical")).status).toBe("overflow");
+    expect(h.resolver.hasActiveClaim("account", "peer:logical")).toBe(true);
+    h.release();
+    expect(h.debouncer.push(item("wire-retry", "logical")).status).toBe("overflow-inflight");
+    expect(h.resolver.usage().tasks).toBe(1);
+    expect(h.debouncer.usage()).toEqual({ waiting: 0, inflight: 0, keys: 0 });
+    expect(h.budget.usage()).toEqual({ messages: 0, bytes: 0 });
+  } finally {
+    resume();
+    await h.idle();
+  }
+  expect(h.acks).toEqual([]);
+  expect(h.rejected.map((value) => value.ids)).toEqual([["wire-first"], ["wire-retry"]]);
+  expect(h.runs).toEqual([]);
+  expect(h.journal.read("peer")).toEqual([]);
+  expect(await h.store.lookup("account", "peer:logical")).toEqual({ status: "found", outcome: "overloaded" });
+  expect(h.debouncer.push(item("wire-second-retry", "logical"))).toEqual({ status: "known-outcome", outcome: "overloaded" });
+  expect(h.rejected.at(-1)?.ids).toEqual(["wire-second-retry"]);
+});
+
+it("leaves an over-limit alias to the original's pending cancellation", async () => {
+  const h = setup();
+  h.fill(31);
+  const record = h.store.record.bind(h.store);
+  let resume!: () => void;
+  const gate = new Promise<void>((resolve) => { resume = resolve; });
+  const cancellation = vi.spyOn(h.store, "record").mockImplementationOnce(async (...args) => { await gate; return record(...args); });
+  try {
+    expect(h.debouncer.push(item("wire-first", "logical")).status).toBe("accepted");
+    expect(h.debouncer.cancelKey("peer", { notify: true })).toBe(true);
+    await vi.waitFor(() => expect(cancellation).toHaveBeenCalledOnce());
+    const retained = h.budget.usage();
+    expect(h.debouncer.push(item("wire-retry", "logical")).status).toBe("overflow");
+    expect(h.pressure).toHaveBeenCalledWith(expect.objectContaining({ deferToRetained: true }));
+    expect(h.resolver.usage()).toEqual({ tasks: 0, metadataBytes: 0 });
+    expect(h.budget.usage()).toEqual(retained);
+    expect(h.acks).toEqual([]);
+    expect(h.rejected).toEqual([]);
+  } finally {
+    resume();
+    await h.idle();
+  }
+  expect(h.budget.usage()).toEqual({ messages: 31, bytes: 31 * 512 });
+  h.release();
+  expect(h.debouncer.push(item("wire-retry", "logical"))).toEqual({ status: "known-outcome", outcome: "cancelled" });
+  expect(h.acks.map((value) => value.ids)).toEqual([["wire-first"], ["wire-retry"]]);
+  expect(h.rejected).toEqual([]);
+  expect(h.runs).toEqual([]);
+  expect(h.journal.read("peer")).toEqual([]);
+  expect(await h.store.lookup("account", "peer:logical")).toEqual({ status: "found", outcome: "cancelled" });
+  expect(h.budget.usage()).toEqual({ messages: 0, bytes: 0 });
 });
 
 it("preserves a later explicit random_id echo when a same-batch original used wire fallback", async () => {
@@ -221,7 +349,7 @@ it("isolates account and peer outcomes when logical and wire IDs match", async (
 const cleanup: Array<() => void> = [];
 afterEach(() => { cleanup.splice(0).reverse().forEach((close) => close()); });
 
-function setup(options: { accountId?: string; store?: ReturnType<typeof createIngressOutcomeStore>; cold?: boolean } = {}) {
+function setup(options: { accountId?: string; store?: ReturnType<typeof createIngressOutcomeStore>; cold?: boolean; measure?: (value: Item) => number } = {}) {
   const accountId = options.accountId ?? "account";
   const dir = mkdtempSync(join(tmpdir(), "ingress-identity-"));
   const persistent = (namespacePrefix: string) => createPersistentDedupe({
@@ -241,6 +369,7 @@ function setup(options: { accountId?: string; store?: ReturnType<typeof createIn
   const fallback = new CancelledInboundFallbackTombstones();
   const acks: Array<{ peerId: string; ids: string[]; committed?: Echo }> = [];
   const rejected: Array<{ peerId: string; ids: string[] }> = [];
+  const pressure = vi.fn();
   let ackSuccess = true;
   const sendAck = (peerId: string, ids: string[], committed?: Echo) => {
     acks.push({ peerId, ids: [...ids], committed });
@@ -265,9 +394,11 @@ function setup(options: { accountId?: string; store?: ReturnType<typeof createIn
   });
   const debouncer = createBoundedInboundDebouncer<Item>({
     debounceMs: 0, buildKey: (value) => value.peerId, sessionToken: () => token, budget,
+    measure: options.measure ?? ((value) => estimateRetainedMessageBytes(value.message)),
     ...createIngressDebounceCallbacks<Item>({
       accountId, outcomeStore: admissionStore, overflowResolver: resolver,
       cancelledFallback: fallback, deliveryJournal: journal, sessionToken: () => token, sendAck, sendRejected,
+      onPressure: pressure,
     }),
     onFlush: flush,
     onCancel: async (entries) => recordCancelledInboundItems(
@@ -280,8 +411,8 @@ function setup(options: { accountId?: string; store?: ReturnType<typeof createIn
     ),
   });
   const reservations: Array<{ requestRelease(): unknown }> = [];
-  const fill = () => {
-    for (let i = 0; i < 32; i++) {
+  const fill = (count = 32) => {
+    for (let i = 0; i < count; i++) {
       const result = budget.tryReserve(token, 512, "pending");
       expect(result.status).toBe("accepted");
       if (result.status === "accepted") reservations.push(result.reservation);
@@ -296,7 +427,7 @@ function setup(options: { accountId?: string; store?: ReturnType<typeof createIn
     expect(resolver.usage()).toEqual({ tasks: 0, metadataBytes: 0 });
     expect(debouncer.usage()).toEqual({ waiting: 0, inflight: 0, keys: 0 });
   });
-  return { store, journal, budget, token, fallback, resolver, debouncer, flush, runs, acks, rejected,
+  return { store, journal, budget, token, fallback, resolver, debouncer, flush, runs, acks, rejected, pressure,
     fill, release, idle, accountId, loseAck: (lose: boolean) => { ackSuccess = !lose; } };
 }
 

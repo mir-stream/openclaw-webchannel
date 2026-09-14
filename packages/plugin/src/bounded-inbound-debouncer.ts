@@ -72,6 +72,8 @@ export type BoundedInboundDebouncerOptions<Item> = {
     reason: RetentionLimitReason;
     chargedBytes?: number;
     recoverCancelled: boolean;
+    /** A retained entry owns this logical verdict; leave this alias for retry. */
+    deferToRetained: boolean;
   }) => void;
   measure?: (item: Item) => number;
   setTimer?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
@@ -158,6 +160,14 @@ export function createBoundedInboundDebouncer<Item>(
   const idIndexKey = (key: string, id: string) => `${key.length}:${key}${id}`;
   const correlationKey = (key: string, dedupeKey: string, id: string) =>
     idIndexKey(key, idIndexKey(dedupeKey, id));
+  const hasRetainedLogicalKey = (key: string, dedupeKey: string | undefined) => {
+    if (dedupeKey === undefined) return false;
+    if (waiting.get(key)?.entries.some((entry) => entry.dedupeKey === dedupeKey)) return true;
+    for (const entry of inflightByKey.get(key) ?? []) {
+      if (entry.dedupeKey === dedupeKey) return true;
+    }
+    return false;
+  };
   const generation = (key: string) => keyGeneration.get(key) ?? 0;
   const bumpGeneration = (key: string) => keyGeneration.set(key, generation(key) + 1);
 
@@ -431,7 +441,10 @@ export function createBoundedInboundDebouncer<Item>(
       charge = checkedCharge(measure, item);
     } catch {
       const reason: RetentionLimitReason = "session-byte-count";
-      options.onOverflow?.({ key, item, id, dedupeKey, reason, recoverCancelled });
+      options.onOverflow?.({
+        key, item, id, dedupeKey, reason, recoverCancelled,
+        deferToRetained: hasRetainedLogicalKey(key, dedupeKey),
+      });
       return { status: "overflow", reason };
     }
     const result = options.budget.tryReserve(
@@ -448,6 +461,7 @@ export function createBoundedInboundDebouncer<Item>(
         reason: result.reason,
         chargedBytes: charge,
         recoverCancelled,
+        deferToRetained: hasRetainedLogicalKey(key, dedupeKey),
       });
       return { status: "overflow", reason: result.reason, chargedBytes: charge };
     }
