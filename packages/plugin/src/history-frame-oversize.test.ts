@@ -685,7 +685,7 @@ describe("#311 — a row too big to send is SKIPPED, and the page spans across i
     h.server.sendSnapshot(PEER);
     h.flush();
 
-    const expected = { type: "history", messages: [], highWaterSeq: 2, snapshotComplete: false };
+    const expected = { type: "history" as const, messages: [], highWaterSeq: 2, snapshotComplete: false };
     expect(h.journal.maxSeq(PEER)).toBe(expected.highWaterSeq);
     expect(h.transport.payloads).toHaveLength(1);
     expect(openEnvelope(h.transport.payloads[0]!, h.sessionKey).message).toEqual(expected);
