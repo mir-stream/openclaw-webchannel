@@ -310,4 +310,12 @@ describe("#372 — SDK-selected intentional identityLinks", () => {
     expect(keyFor(api, "alice")).toBe(keyFor(realApi(), "alice"));
     expect(keyFor(api, "Alice")).not.toBe(keyFor(api, "alice"));
   });
+
+  it("keeps distinct UTF-16 canonical names apart, including unpaired surrogates", () => {
+    const identityLinks = { "\ud800": ["a"], "\ud801": ["b"], "\ufffd": ["c"] };
+    const peers = ["a", "b", "c"];
+    expect(new Set(peers.map((peer) => legacyKey(peer, identityLinks))).size).toBe(3);
+    const api = realApi({ session: { identityLinks } });
+    expect(new Set(peers.map((peer) => keyFor(api, peer))).size).toBe(3);
+  });
 });

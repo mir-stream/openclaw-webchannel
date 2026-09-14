@@ -18,7 +18,9 @@ The session peer is one of:
   byte of the verified `sub`. For example, `Alice` becomes `p:416c696365` and
   `alice` becomes `p:616c696365`.
 - `l:<digest>` for an explicitly linked peer: the full lowercase SHA-256 digest
-  of the selected canonical identity name after trimming and lowercasing.
+  of the selected canonical identity name after trimming and lowercasing,
+  encoded as UTF-16LE. This preserves even unpaired surrogate code units in
+  configured JSON strings; UTF-8 would replace them with the same U+FFFD bytes.
 
 The complete key is:
 

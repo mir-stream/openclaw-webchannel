@@ -31,8 +31,8 @@ import { assertValidSubjectToken } from "./subject-token.js";
 /** Enforced independently of the gateway's global DM scope. */
 export const WEBCHANNEL_ENFORCED_DM_SCOPE = "per-account-channel-peer" as const;
 
-function scopeToken(value: string): string {
-  return createHash("sha256").update(value, "utf8").digest("hex");
+function scopeToken(value: string, encoding: "utf8" | "utf16le" = "utf8"): string {
+  return createHash("sha256").update(value, encoding).digest("hex");
 }
 
 /**
@@ -79,7 +79,9 @@ function sessionPeerId(
     });
     const canonical = canonicalByKey.get(selectedKey);
     if (canonical !== undefined) {
-      return `l:${scopeToken(canonical.trim().toLowerCase())}`;
+      // JSON permits unpaired UTF-16 surrogates in configured names. UTF-8
+      // replaces them with U+FFFD; hash the code units to preserve SDK identity.
+      return `l:${scopeToken(canonical.trim().toLowerCase(), "utf16le")}`;
     }
   }
   return `p:${Buffer.from(peerId, "ascii").toString("hex")}`;
