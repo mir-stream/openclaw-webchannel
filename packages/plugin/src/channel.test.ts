@@ -517,8 +517,8 @@ describe("webchannel inbound round-trip", () => {
       // resolveWebchannelSessionRoute IGNORES this sessionKey and rebuilds it via
       // the REAL buildAgentSessionKey with the forced per-account-channel-peer
       // scope — so the recorded key below is the ENFORCED isolation key
-      // (agent:main:webchannel:<accountId>:direct:<peer>:tenant:<sha256>), not
-      // this naive value.
+      // (agent:main:webchannel:<accountId>:direct:p:<hex peer>:tenant:<sha256>:peer-v2),
+      // not this naive value.
       // We still return a value here to prove the override wins.
       sessionKey: `agent:main:${input.channel}:${input.peer.id}`,
       mainSessionKey: "agent:main:main",

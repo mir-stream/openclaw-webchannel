@@ -37,10 +37,11 @@ ASCII hex is injective for the complete accepted peer space and survives core's
 trimming/lowercasing unchanged. The `p:`/`l:` tags separate unlinked identities
 from configured canonical names; neither raw peers nor encoded payloads can inject
 another component. With 64-character agent and account components and a
-128-character peer, the complete key is 492 characters, within the 512-character
-boundary. Linked names use a digest to keep even long or delimiter-bearing
-operator names bounded. Tenant and linked-name isolation retain SHA-256's
-collision-resistance assumption; unlinked peer encoding does not use a hash.
+128-character peer, the complete key is 492 characters (pinned by
+`session-route.test.ts`). Linked names use a digest to keep even long or
+delimiter-bearing operator names bounded. Tenant and linked-name isolation
+retain SHA-256's collision-resistance assumption; unlinked peer encoding does
+not use a hash.
 
 ## Configured identity links
 

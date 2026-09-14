@@ -116,7 +116,7 @@ describe("resolveWebchannelSessionRoute (forced per-user isolation)", () => {
     expect(route.lastRoutePolicy).toBe("session");
   });
 
-  it("keeps maximum validated raw components within 512 when identityLinks are absent", () => {
+  it("pins the maximum validated raw-component key at 492 characters when identityLinks are absent", () => {
     const maxAgentId = "g".repeat(64);
     const maxAccountId = "a".repeat(64);
     const maxPeerId = "p".repeat(128);
