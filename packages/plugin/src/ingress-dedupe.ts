@@ -134,14 +134,30 @@ export const MAX_CANCELLED_INBOUND_FALLBACK_BYTES = 256 * 1024;
  * Both fields share the one `MAX_INGRESS_DEDUPE_ID_LENGTH` bound and the
  * `${peerId}:<key>` namespacing.
  */
-function usableId(value: string | undefined): value is string {
+function usableId(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= MAX_INGRESS_DEDUPE_ID_LENGTH;
 }
-export function ingressDedupeKey(item: IngressDedupeItem): string | undefined {
+export type IngressIdentity = {
+  /** Wire correlation only; never substitute the logical key in result frames. */
+  wireId: string;
+  /** Per-account outcome/claim/fallback key, including the authenticated peer. */
+  key: string;
+  /** The journal's idempotency_key, with the same fallback as the outcome key. */
+  idempotencyKey: string;
+  /** Presence is explicit: a usable random_id may equal the wire id. */
+  randomId?: string;
+};
+
+export function ingressIdentity(item: IngressDedupeItem): IngressIdentity | undefined {
   const id = item.message.id;
   if (!usableId(id)) return undefined;
-  const keyBody = usableId(item.message.random_id) ? item.message.random_id : id;
-  return `${item.peerId}:${keyBody}`;
+  const randomId = usableId(item.message.random_id) ? item.message.random_id : undefined;
+  const idempotencyKey = randomId ?? id;
+  return { wireId: id, key: `${item.peerId}:${idempotencyKey}`, idempotencyKey, randomId };
+}
+
+export function ingressDedupeKey(item: IngressDedupeItem): string | undefined {
+  return ingressIdentity(item)?.key;
 }
 
 /** Per-account, insertion-ordered safety net for cancelled-item record failures. */
@@ -320,8 +336,7 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
    */
   /**
    * #243 half 2a: `committed` carries the server-assigned `random_id → messageId`
-   * echo. Optional and back-compatible — every non-echo caller (cancelled
-   * fallback, legacy branch) passes two args exactly as before.
+   * echo. Non-echo callers pass two args exactly as before.
    */
   sendAck?: (
     peerId: string,
@@ -624,6 +639,11 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
        */
       const ackIds: string[] = [];
       const rejectedIds: string[] = [];
+      // A write holds this key's outcome gate until the footer. Repeated logical
+      // requests in this batch share that decision, retaining each wire ID for
+      // the result instead of awaiting our own gate or offering a second turn.
+      const pendingOutcomes = new Map<string, "accepted" | "overloaded">();
+      const pendingEchoes = new Set<string>();
       let finalized = false;
       let fifoBlocked = false;
 
@@ -698,8 +718,8 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             fifoBlocked = true;
             continue;
           }
-          const key = ingressDedupeKey(item);
-          if (!key) {
+          const identity = ingressIdentity(item);
+          if (!identity) {
             const offer = lease.offer(item.message, reservation);
             if (offer.status === "accepted") {
               offer.commit();
@@ -761,12 +781,19 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             } else release();
             continue;
           }
-          const id = item.message.id as string;
-          // #243 half 2a: the usable client `random_id` this item was keyed on
-          // (the same predicate `ingressDedupeKey` uses for the key BODY). It is
-          // what a fresh admission is journaled under and what a retry echoes by.
-          // Absent for an older client that sent none — then there is no echo.
-          const randomId = usableId(item.message.random_id) ? item.message.random_id : undefined;
+          const { key, wireId: id, randomId, idempotencyKey } = identity;
+          const pendingOutcome = pendingOutcomes.get(key);
+          if (pendingOutcome !== undefined) {
+            // A later lookup can yield to /stop, which still needs to acquire
+            // this alias's cancellation hold before the batch settles.
+            deferredReleases.push(release);
+            if (pendingOutcome === "overloaded") rejectedIds.push(id);
+            else {
+              ackIds.push(id);
+              if (randomId !== undefined) pendingEchoes.add(randomId);
+            }
+            continue;
+          }
           // #344: set when the found/accepted branch below refuses the marker as
           // evidence and falls through to the fresh-accept path. The only thing
           // it changes downstream is ownership of the old accepted marker:
@@ -817,7 +844,13 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             }
             let acked = false;
             result.write.commit();
-            acked = deps.sendAck?.(item.peerId, [id]) ?? false;
+            let row;
+            try {
+              row = deps.deliveryJournal?.lookupUserMessageIdByRandomId(peerId, idempotencyKey);
+            } catch { /* Cancellation remains authoritative without a journal row. */ }
+            acked = (row && randomId !== undefined
+              ? deps.sendAck?.(item.peerId, [id], [{ random_id: randomId, ...row }])
+              : deps.sendAck?.(item.peerId, [id])) ?? false;
             if (!acked) logWarn?.("webchannel: cancelled-inbound fallback result delivery failed");
             if (acked) cancelledFallback.delete(key, accountId);
             release();
@@ -872,7 +905,6 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // question unanswerable for exactly those clients and left their
             // crash-window messages dropped; that was a scope choice described as
             // if it were a limit, and it is neither now.
-            const idempotencyKey = randomId ?? id;
             const row = deps.deliveryJournal?.lookupUserMessageIdByRandomId(
               peerId,
               idempotencyKey,
@@ -1004,6 +1036,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             }
             if (result?.status === "recorded" && result.durability === "durable") {
               pendingWrites.push(result.write);
+              pendingOutcomes.set(key, "overloaded");
               deferredReleases.push(release);
               rejectedIds.push(id);
             } else {
@@ -1039,6 +1072,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             fifoBlocked = true;
           } else if (recorded?.status === "recorded") {
             pendingWrites.push(recorded.write);
+            pendingOutcomes.set(key, "accepted");
             commitOffers.push(offer.commit);
             ackIds.push(id);
             // ---- v6 #239 half 3: THE ONE FRESH ADMISSION OF NEW USER TEXT ----
@@ -1427,6 +1461,11 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             return;
           }
           for (const reason of unjournalableText) journalGap(reason);
+        }
+        for (const randomId of pendingEchoes) {
+          if (committedBatch.some((echo) => echo.random_id === randomId)) continue;
+          const row = deps.deliveryJournal?.lookupUserMessageIdByRandomId(peerId, randomId);
+          if (row) committedBatch.push({ random_id: randomId, ...row });
         }
         for (const write of pendingWrites) write.commit();
         for (const commit of commitOffers) commit();

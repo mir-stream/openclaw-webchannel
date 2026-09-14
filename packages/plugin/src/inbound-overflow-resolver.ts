@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import type { IngressOutcomeStore } from "./ingress-outcome.js";
+import { MAX_INGRESS_RESULT_IDS } from "./ingress-result-chunks.js";
 import type { RetentionSessionToken } from "./inbound-retention.js";
 
 export const MAX_OVERFLOW_RESOLVERS_PER_PROCESS = 64;
@@ -11,14 +12,16 @@ export type OverflowResolutionRequest = {
   peerId: string;
   key: string;
   id: string;
+  /** Usable client random_id; presence cannot be inferred from equality with id. */
+  randomId?: string;
   sessionToken: RetentionSessionToken;
   /** `/stop` fallback recovery is authoritative over ordinary overload lookup. */
   recoverCancelled?: boolean;
 };
 
 export type OverflowResolverStart =
-  | { status: "started" }
-  | { status: "busy-session" | "busy-key" | "process-count" | "process-bytes" | "invalid" | "disposed" };
+  | { status: "started" | "joined" }
+  | { status: "busy-session" | "busy-key" | "process-count" | "correlation-count" | "process-bytes" | "invalid" | "disposed" };
 
 export type BoundedOverflowResolverOptions = {
   outcomeStore: IngressOutcomeStore;
@@ -47,35 +50,26 @@ export type BoundedOverflowResolverOptions = {
   maxMetadataBytes?: number;
 };
 
-/**
- * The identity BOTH stores key this id by.
- *
- * `request.key` is `${peerId}:<body>`, and the body is `ingressDedupeKey`'s —
- * the client `random_id` when it sent a usable one, else the wire id.
- * `appendInboundUser` writes that SAME value as the row's `idempotency_key`
- * (`randomId ?? turnId`), and `lookupUserMessageIdByRandomId` reads that column.
- * So deriving the journal key from the outcome key, rather than carrying a
- * second field, is what makes "the marker and the row are about the same
- * message" true by construction instead of by convention — and asking the two
- * stores about different messages is the exact defect class #344 exists for.
- *
- * Falls back to the wire id if the key is not `${peerId}:`-prefixed. Both
- * construction sites build it that way (`ingressDedupeKey` and
- * `nats-account-runtime.ts`'s `onOverflow`), so this is a totality guard, not a
- * second supported shape.
- */
+/** The journal key is the body of the canonical peer-scoped outcome key. */
 function idempotencyKeyOf(request: OverflowResolutionRequest): string {
   const prefix = `${request.peerId}:`;
   return request.key.startsWith(prefix) ? request.key.slice(prefix.length) : request.id;
 }
 
-type ActiveTask = { request: OverflowResolutionRequest; bytes: number; cancelled: boolean; released: boolean };
+type ActiveTask = {
+  request: OverflowResolutionRequest;
+  correlations: OverflowResolutionRequest[];
+  bytes: number;
+  cancelled: boolean;
+  released: boolean;
+};
 
 export function overflowResolverMetadataBytes(request: OverflowResolutionRequest): number {
   return Buffer.byteLength(request.accountId, "utf8")
     + Buffer.byteLength(request.peerId, "utf8")
     + Buffer.byteLength(request.key, "utf8")
     + Buffer.byteLength(request.id, "utf8")
+    + Buffer.byteLength(request.randomId ?? "", "utf8")
     + 1 // recoverCancelled mode bit
     + OVERFLOW_RESOLVER_METADATA_OVERHEAD;
 }
@@ -106,24 +100,36 @@ export class BoundedOverflowResolver {
       typeof request.accountId !== "string" || typeof request.peerId !== "string"
       || typeof request.key !== "string" || typeof request.id !== "string"
       || request.id.length === 0 || request.id.length > 128
+      || (request.randomId !== undefined && (typeof request.randomId !== "string"
+        || request.randomId.length === 0 || request.randomId.length > 128))
       || (request.recoverCancelled !== undefined && typeof request.recoverCancelled !== "boolean")
     ) return { status: "invalid" };
-    if (this.activeBySession.has(request.sessionToken)) return { status: "busy-session" };
+    const active = this.activeBySession.get(request.sessionToken);
+    if (active) {
+      if (active.cancelled || active.request.accountId !== request.accountId
+        || active.request.peerId !== request.peerId || active.request.key !== request.key
+        || (request.recoverCancelled === true && !active.request.recoverCancelled)
+        || active.correlations.some((value) => value.id === request.id && value.randomId === request.randomId)) {
+        return { status: "busy-session" };
+      }
+      // New wire correlations share one logical verdict without adding storage
+      // tasks or retaining source frames. Both count and charged bytes are bounded.
+      if (active.correlations.length >= MAX_INGRESS_RESULT_IDS) return { status: "correlation-count" };
+      const bytes = overflowResolverMetadataBytes(request);
+      if (bytes > this.maxMetadataBytes - this.activeBytes) return { status: "process-bytes" };
+      active.correlations.push(this.copyRequest(request));
+      active.bytes += bytes;
+      this.activeBytes += bytes;
+      return { status: "joined" };
+    }
     if (this.hasActiveClaim(request.accountId, request.key)) return { status: "busy-key" };
     if (this.activeBySession.size >= this.maxTasks) return { status: "process-count" };
     const bytes = overflowResolverMetadataBytes(request);
     if (bytes > this.maxMetadataBytes - this.activeBytes) return { status: "process-bytes" };
 
     // Copy only bounded metadata. The source message/object is never captured.
-    const retained: OverflowResolutionRequest = {
-      accountId: request.accountId,
-      peerId: request.peerId,
-      key: request.key,
-      id: request.id,
-      sessionToken: request.sessionToken,
-      recoverCancelled: request.recoverCancelled === true,
-    };
-    const task: ActiveTask = { request: retained, bytes, cancelled: false, released: false };
+    const retained = this.copyRequest(request);
+    const task: ActiveTask = { request: retained, correlations: [retained], bytes, cancelled: false, released: false };
     this.activeBySession.set(retained.sessionToken, task);
     let accountClaims = this.activeClaimsByAccount.get(retained.accountId);
     if (!accountClaims) {
@@ -168,24 +174,23 @@ export class BoundedOverflowResolver {
     return { tasks: this.activeBySession.size, metadataBytes: this.activeBytes };
   }
 
+  private copyRequest(request: OverflowResolutionRequest): OverflowResolutionRequest {
+    return {
+      accountId: request.accountId, peerId: request.peerId, key: request.key,
+      id: request.id, randomId: request.randomId, sessionToken: request.sessionToken,
+      recoverCancelled: request.recoverCancelled === true,
+    };
+  }
+
   private async resolve(task: ActiveTask): Promise<void> {
     const request = task.request;
     try {
+      let outcome: "accepted" | "cancelled" | "overloaded";
+      let row: { messageId: string; seq: number } | undefined;
       if (request.recoverCancelled) {
-        // A failed `/stop` suppression write means this id was deliberately
-        // killed. It must never be reclassified as overloaded merely because its
-        // replay arrived while the raw retention budget was full. Replace any
-        // conflicting marker, publish only ACK, and keep the fallback unless
-        // persistence + ACK both succeed while this task is still active.
+        // /stop fallback is authoritative over an ordinary overload marker.
         const recorded = await this.options.outcomeStore.record(
-          request.accountId,
-          request.key,
-          // #344: the outcome now SAYS "killed" instead of borrowing `accepted`.
-          // The comment above already required this and the marker could not
-          // express it — the accept seam read the borrowed `accepted` (with no
-          // journal row) as a crash-window replay and re-ran the killed text.
-          "cancelled",
-          { replaceOthers: true },
+          request.accountId, request.key, "cancelled", { replaceOthers: true },
         );
         if (task.cancelled || this.disposed) {
           if (recorded.status === "recorded") await recorded.write.rollback();
@@ -193,81 +198,47 @@ export class BoundedOverflowResolver {
         }
         if (recorded.status !== "recorded") return;
         recorded.write.commit();
-        const acked = await this.options.sendAck(request);
-        if (!task.cancelled && !this.disposed && acked) {
-          this.options.onCancelledRecovered?.(request);
+        outcome = "cancelled";
+        row = this.userRowFor(request, idempotencyKeyOf(request));
+      } else {
+        const known = await this.options.outcomeStore.lookup(request.accountId, request.key);
+        if (task.cancelled || this.disposed || known.status === "unknown") return;
+        if (known.status === "found") {
+          outcome = known.outcome;
+          if (outcome !== "overloaded") row = this.userRowFor(request, idempotencyKeyOf(request));
+          // #364: a marker alone cannot prove acceptance. Leave an orphan
+          // unresolved for normal admission; cancelled needs no journal row.
+          if (outcome === "accepted" && this.options.lookupUserRow !== undefined && row === undefined) return;
+        } else {
+          const recorded = await this.options.outcomeStore.record(request.accountId, request.key, "overloaded");
+          if (task.cancelled || this.disposed) {
+            if (recorded.status === "recorded") await recorded.write.rollback();
+            return;
+          }
+          if (recorded.status !== "recorded") return;
+          if (recorded.durability !== "durable") {
+            await recorded.write.rollback();
+            return;
+          }
+          recorded.write.commit();
+          outcome = "overloaded";
         }
-        return;
       }
-      const known = await this.options.outcomeStore.lookup(request.accountId, request.key);
-      if (task.cancelled || this.disposed) return;
-      if (known.status === "found") {
-        // #344: `overloaded` is the only outcome that publishes a refusal.
-        if (known.outcome === "overloaded") {
-          await this.options.sendRejected(request);
-          return;
+      // New correlations may join while an async result send is pending. Drain
+      // them here before releasing the claim; no source frame is captured.
+      for (const correlation of task.correlations) {
+        if (task.cancelled || this.disposed) return;
+        if (outcome === "overloaded") await this.options.sendRejected(correlation);
+        else {
+          const echo = this.committedEchoFor(correlation, row);
+          const acked = await (echo
+            ? this.options.sendAck(correlation, echo)
+            : this.options.sendAck(correlation));
+          if (request.recoverCancelled && !task.cancelled && !this.disposed && acked) {
+            this.options.onCancelledRecovered?.(correlation);
+          }
         }
-        const idempotencyKey = idempotencyKeyOf(request);
-        const row = this.userRowFor(request, idempotencyKey);
-        // `cancelled` acks, exactly as it did while it was spelled `accepted`.
-        // Its VERDICT asks the journal nothing — a `/stop` suppression has no row
-        // on purpose, so absence proves nothing — but it still echoes a row that
-        // happens to exist (a message journaled before the `/stop` landed).
-        if (known.outcome === "cancelled") {
-          await this.options.sendAck(
-            request,
-            this.committedEchoFor(request, idempotencyKey, row),
-          );
-          return;
-        }
-        // ⭐ #344 — `accepted` GETS THE SAME JOURNAL QUESTION THE ACCEPT SEAM
-        // ASKS, AND THIS IS THE SECOND DOOR ONTO IT. Round 2 fixed the found
-        // branch in `ingress-dedupe.ts` and left this one, so a crash-window
-        // orphan replayed while the retention budget was full still landed here
-        // and was acked as a terminal accept — the client drained its ledger and
-        // the message was never journaled and never answered. Same rule, same
-        // authority: a marker with no row is not evidence of an accept.
-        if (this.options.lookupUserRow !== undefined && row === undefined) {
-          // PUBLISH NOTHING, exactly like the `unknown` arm below — and for the
-          // same reason: this resolver has no way to admit a message, only to
-          // report a verdict, and there is no true verdict to report. The
-          // client's ledger entry survives, so the message is replayed and taken
-          // by the flush path. The retention pressure that sent it here is
-          // transient; the loss it used to cause was not.
-          //
-          // ⚠️ SILENCE IS ONLY WORTH ANYTHING BECAUSE EVERY OTHER READER THAT CANNOT ADMIT IS
-          // SILENT TOO. It was not, for a round: `outcomeStore.lookup()` above
-          // WARMS THE HOT CACHE, and the debouncer's `peekOutcome` fast path
-          // reads that cache before it charges retention — so the replay this
-          // return was protecting got acked there instead, and never reached the
-          // flush at all. Both defer now, under one rule; do not weaken either
-          // half alone. THE READER RULE: `OutcomeLookup` in `ingress-outcome.ts`.
-          return;
-        }
-        // #333 path 6: when the row DOES exist, carry the `committed` echo. This
-        // arm used to ack bare, so a replay resolved through overflow left the
-        // client with an un-adopted optimistic bubble until the next gap-sync.
-        await this.options.sendAck(
-          request,
-          this.committedEchoFor(request, idempotencyKey, row),
-        );
-        return;
       }
-      if (known.status === "unknown") return;
-      const recorded = await this.options.outcomeStore.record(request.accountId, request.key, "overloaded");
-      if (task.cancelled || this.disposed) {
-        // Roll back this exact write while its per-key operation gate is still
-        // held. A replacement lookup/write cannot overtake this cleanup.
-        if (recorded.status === "recorded") await recorded.write.rollback();
-        return;
-      }
-      if (recorded.status !== "recorded") return;
-      if (recorded.durability !== "durable") {
-        await recorded.write.rollback();
-        return;
-      }
-      recorded.write.commit();
-      await this.options.sendRejected(request);
     } catch {
       // Same-id live retry remains the recovery owner.
     } finally {
@@ -294,25 +265,13 @@ export class BoundedOverflowResolver {
     }
   }
 
-  /**
-   * The `ack.committed` echo — present only when a row exists AND the identity
-   * it is keyed by is a real client `random_id`.
-   *
-   * The second condition is why this is not just "the row". `idempotencyKeyOf`
-   * yields `random_id ?? wireId`, and an echo whose `random_id` field carries a
-   * WIRE id would have the client re-key an optimistic bubble by a value it
-   * never used as a `random_id`. `ingress-dedupe.ts` draws the same line by only
-   * ever pushing `committedBatch` entries when `randomId !== undefined`; here the
-   * equivalent test is that the key body differs from the wire id. An older
-   * client therefore still gets a bare ack — exactly as it does at that seam.
-   */
+  /** Echo only an explicitly supplied, usable random_id, even when it equals id. */
   private committedEchoFor(
     request: OverflowResolutionRequest,
-    idempotencyKey: string,
     row: { messageId: string; seq: number } | undefined,
   ): Array<{ random_id: string; messageId: string; seq: number }> | undefined {
-    if (row === undefined || idempotencyKey === request.id) return undefined;
-    return [{ random_id: idempotencyKey, messageId: row.messageId, seq: row.seq }];
+    if (row === undefined || request.randomId === undefined) return undefined;
+    return [{ random_id: request.randomId, messageId: row.messageId, seq: row.seq }];
   }
 
   private release(task: ActiveTask): void {

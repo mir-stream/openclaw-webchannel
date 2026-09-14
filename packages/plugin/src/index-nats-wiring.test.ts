@@ -420,10 +420,9 @@ describe("index-nats.ts wiring contract — ingress dedupe onFlush (P0-7a)", () 
     expect(RUNTIME_SOURCE).toMatch(/createBoundedInboundDebouncer/);
     expect(RUNTIME_SOURCE).not.toMatch(/createInboundDebouncer</);
     expect(RUNTIME_SOURCE).not.toContain("createPersistentDedupe");
-    expect(RUNTIME_SOURCE).toMatch(/isOverflowClaimed:/);
-    expect(RUNTIME_SOURCE).toMatch(/processOverflowResolver\.hasActiveClaim/);
-    expect(RUNTIME_SOURCE).toMatch(/isCancelledFallback:/);
-    expect(RUNTIME_SOURCE).toMatch(/recoverCancelled/);
+    expect(RUNTIME_SOURCE).toMatch(/\.\.\.createIngressDebounceCallbacks<DebounceItem>\(\{/);
+    expect(RUNTIME_SOURCE).toMatch(/overflowResolver:\s*processOverflowResolver/);
+    expect(RUNTIME_SOURCE).toMatch(/cancelledFallback:\s*cancelledInboundFallback/);
     expect(RUNTIME_SOURCE).toMatch(/onCancelledRecovered:/);
   });
 
@@ -466,10 +465,10 @@ describe("index-nats.ts wiring contract — ingress ack (P0-7b)", () => {
     // appears in the same shape, and it proves nothing the positive pin above
     // does not — `record()` takes ONE outcome, so matching `"cancelled"` at
     // `(accountId, key, …)` already excludes any other value in that slot.
-    // And the peer hears a refusal for exactly one outcome. `cancelled` acks, so
-    // the client's ledger drains instead of replaying dead text forever.
+    // The shared production callback helper selects the verdict; the runtime
+    // forwards its wire correlations to the account's channel.
     expect(RUNTIME_SOURCE).toMatch(
-      /if\s*\(outcome === "overloaded"\)\s*channel\.sendInboundRejected\(peerId,\s*\[id\]\);/,
+      /sendRejected:\s*\(peerId,\s*ids\)\s*=>\s*channel\.sendInboundRejected\(peerId,\s*ids\)/,
     );
     // The control-lane branch bypasses the debouncer/onFlush, so it acks its own
     // id-carrying frame directly (else its ledger entry never drains).

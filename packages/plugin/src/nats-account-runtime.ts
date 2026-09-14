@@ -51,6 +51,7 @@ import {
 } from "./bounded-inbound-debouncer.js";
 import { getProcessIngressOutcomeStore } from "./ingress-outcome.js";
 import { BoundedOverflowResolver } from "./inbound-overflow-resolver.js";
+import { createIngressDebounceCallbacks } from "./ingress-debounce-callbacks.js";
 import { InboundPressureLogger } from "./inbound-pressure-log.js";
 import { isControlLaneMessage, shouldDropBufferedInputOnStop } from "./control-lane.js";
 import { resolveCommandGate } from "./command-gate.js";
@@ -1132,41 +1133,25 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         // Charge the authenticated wire message only. `peerId` is routing
         // metadata on the repo-owned wrapper.
         measure: (item) => estimateRetainedMessageBytes(item.message),
-        getId: (item) => item.message.id,
-        isOverflowClaimed: (peerId, id) =>
-          processOverflowResolver.hasActiveClaim(accountId, `${peerId}:${id}`),
-        isCancelledFallback: (peerId, id) =>
-          cancelledInboundFallback.has(`${peerId}:${id}`, accountId),
-        peekOutcome: (peerId, id) =>
-          processIngressOutcomes.peek(accountId, `${peerId}:${id}`),
-        onKnownOutcome: (peerId, id, outcome) => {
-          // #344: reached ONLY for an `IngressRefusal` — the debouncer never
-          // short-circuits an `accepted` (THE READER RULE, `OutcomeLookup` in
-          // `ingress-outcome.ts`), and the parameter's type says so. Of the two,
-          // `overloaded` is the one the peer hears as a refusal; `cancelled`
-          // (text `/stop` killed) acks so the ledger entry drains, and must not
-          // be reported as backpressure.
-          if (outcome === "overloaded") channel.sendInboundRejected(peerId, [id]);
-          else channel.sendAck(peerId, [id]);
-        },
-        onOverflow: ({ key: peerId, id, reason, chargedBytes, recoverCancelled }) => {
-          pressureLogger.record({
-            accountId,
-            internalReason: reason,
-            rejectedMessages: 1,
-            rejectedChargedBytes: chargedBytes ?? 0,
-            snapshot: processInboundRetention.snapshot(sessionToken(peerId)),
-          });
-          if (typeof id !== "string" || id.length === 0 || id.length > 128) return;
-          processOverflowResolver.tryStart({
-            accountId,
-            peerId,
-            id,
-            key: `${peerId}:${id}`,
-            sessionToken: sessionToken(peerId),
-            recoverCancelled,
-          });
-        },
+        ...createIngressDebounceCallbacks<DebounceItem>({
+          accountId,
+          outcomeStore: processIngressOutcomes,
+          overflowResolver: processOverflowResolver,
+          cancelledFallback: cancelledInboundFallback,
+          deliveryJournal,
+          sessionToken,
+          sendAck: (peerId, ids, committed) => channel.sendAck(peerId, ids, committed),
+          sendRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids),
+          onPressure: ({ key: peerId, reason, chargedBytes }) => {
+            pressureLogger.record({
+              accountId,
+              internalReason: reason,
+              rejectedMessages: 1,
+              rejectedChargedBytes: chargedBytes ?? 0,
+              snapshot: processInboundRetention.snapshot(sessionToken(peerId)),
+            });
+          },
+        }),
         onFlush: onIngressFlush,
         onCancel: async (entries) => {
           // P0-7b: a `/stop` cancels debounce-buffered messages that never reached

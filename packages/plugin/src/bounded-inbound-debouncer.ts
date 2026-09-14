@@ -15,6 +15,7 @@ export type RetainedDebounceEntry<Item> = {
   item: Item;
   reservation: RetentionReservation;
   id?: string;
+  dedupeKey?: string;
   /** False after this key/account generation has been retired. */
   isActive(): boolean;
   /** True when `/stop` owns this pre-run entry's terminal `cancelled` outcome. */
@@ -54,18 +55,25 @@ export type BoundedInboundDebouncerOptions<Item> = {
   onFlush(entries: readonly RetainedDebounceEntry<Item>[]): Promise<void> | void;
   onCancel?: (entries: readonly RetainedDebounceEntry<Item>[]) => Promise<void> | void;
   getId?: (item: Item) => string | undefined;
-  peekOutcome?: (key: string, id: string) => IngressOutcome | undefined;
-  isOverflowClaimed?: (key: string, id: string) => boolean;
+  /** Logical outcome identity. Defaults to the wire ID for generic callers. */
+  getDedupeKey?: (item: Item) => string | undefined;
+  peekOutcome?: (key: string, dedupeKey: string) => IngressOutcome | undefined;
+  isOverflowClaimed?: (key: string, dedupeKey: string) => boolean;
+  /** Attach a new wire correlation to a bounded, active logical resolution. */
+  onOverflowClaimed?: (item: Item) => void;
   /** Synchronous `/stop` tombstone lookup; authoritative over cached outcomes. */
-  isCancelledFallback?: (key: string, id: string) => boolean;
-  onKnownOutcome?: (key: string, id: string, outcome: IngressRefusal) => void;
+  isCancelledFallback?: (key: string, dedupeKey: string) => boolean;
+  onKnownOutcome?: (key: string, id: string, outcome: IngressRefusal, item: Item) => void;
   onOverflow?: (params: {
     key: string;
     item: Item;
     id?: string;
+    dedupeKey?: string;
     reason: RetentionLimitReason;
     chargedBytes?: number;
     recoverCancelled: boolean;
+    /** A retained entry owns this logical verdict; leave this alias for retry. */
+    deferToRetained: boolean;
   }) => void;
   measure?: (item: Item) => number;
   setTimer?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
@@ -150,6 +158,16 @@ export function createBoundedInboundDebouncer<Item>(
   let disposed = false;
 
   const idIndexKey = (key: string, id: string) => `${key.length}:${key}${id}`;
+  const correlationKey = (key: string, dedupeKey: string, id: string) =>
+    idIndexKey(key, idIndexKey(dedupeKey, id));
+  const hasRetainedLogicalKey = (key: string, dedupeKey: string | undefined) => {
+    if (dedupeKey === undefined) return false;
+    if (waiting.get(key)?.entries.some((entry) => entry.dedupeKey === dedupeKey)) return true;
+    for (const entry of inflightByKey.get(key) ?? []) {
+      if (entry.dedupeKey === dedupeKey) return true;
+    }
+    return false;
+  };
   const generation = (key: string) => keyGeneration.get(key) ?? 0;
   const bumpGeneration = (key: string) => keyGeneration.set(key, generation(key) + 1);
 
@@ -208,7 +226,9 @@ export function createBoundedInboundDebouncer<Item>(
           if (state) state.releaseCancellationHold = undefined;
         }
       }
-      if (validId(entry.id)) inflightIds.delete(idIndexKey(key, entry.id));
+      if (validId(entry.id) && entry.dedupeKey !== undefined) {
+        inflightIds.delete(correlationKey(key, entry.dedupeKey, entry.id));
+      }
       if (owner === "cancel" || owner === "retire") state?.resolveCancellation?.();
     }
     if (!chains.has(key) && !waiting.has(key) && !inflightByKey.has(key)) {
@@ -377,15 +397,19 @@ export function createBoundedInboundDebouncer<Item>(
     if (disposed) return { status: "disposed" };
     const key = options.buildKey(item);
     const id = options.getId?.(item);
+    const dedupeKey = options.getDedupeKey ? options.getDedupeKey(item) : id;
     let recoverCancelled = false;
-    if (validId(id)) {
-      if (options.isOverflowClaimed?.(key, id)) return { status: "overflow-inflight" };
-      recoverCancelled = options.isCancelledFallback?.(key, id) ?? false;
+    if (validId(id) && dedupeKey !== undefined) {
+      if (options.isOverflowClaimed?.(key, dedupeKey)) {
+        options.onOverflowClaimed?.(item);
+        return { status: "overflow-inflight" };
+      }
+      recoverCancelled = options.isCancelledFallback?.(key, dedupeKey) ?? false;
       // A cancellation fallback represents text `/stop` already killed. It must
       // recover its suppression/ACK even if a stale/conflicting hot overload
       // exists.
       if (!recoverCancelled) {
-        const known = options.peekOutcome?.(key, id);
+        const known = options.peekOutcome?.(key, dedupeKey);
         // ⭐ #344 — A REFUSAL SHORT-CIRCUITS; AN `accepted` DOES NOT. This is THE
         // READER RULE (`OutcomeLookup` in `ingress-outcome.ts`): this path can
         // neither read the journal row nor ADMIT a message, so nothing it could
@@ -401,15 +425,15 @@ export function createBoundedInboundDebouncer<Item>(
         // this arm still spoke. Deferring costs a retention reservation plus one
         // flush per genuine accepted replay (under FULL retention such replays
         // overflow and drain ~1 per round instead of N — the client re-drains on
-        // a later replay, nothing is lost), on a path #355 shows is already dead
-        // for conforming clients
-        // (the request is keyed by the wire id, the marker by `random_id`).
+        // a later replay, nothing is lost).
         if (known !== undefined && known !== "accepted") {
-          options.onKnownOutcome?.(key, id, known);
+          options.onKnownOutcome?.(key, id, known, item);
           return { status: "known-outcome", outcome: known };
         }
       }
-      if (inflightIds.has(idIndexKey(key, id))) return { status: "duplicate-inflight" };
+      // Only an identical wire correlation may be dropped while pending. A new
+      // wire ID for this logical key needs its own bounded entry and response.
+      if (inflightIds.has(correlationKey(key, dedupeKey, id))) return { status: "duplicate-inflight" };
     }
 
     let charge: number | undefined;
@@ -417,7 +441,10 @@ export function createBoundedInboundDebouncer<Item>(
       charge = checkedCharge(measure, item);
     } catch {
       const reason: RetentionLimitReason = "session-byte-count";
-      options.onOverflow?.({ key, item, id, reason, recoverCancelled });
+      options.onOverflow?.({
+        key, item, id, dedupeKey, reason, recoverCancelled,
+        deferToRetained: hasRetainedLogicalKey(key, dedupeKey),
+      });
       return { status: "overflow", reason };
     }
     const result = options.budget.tryReserve(
@@ -430,9 +457,11 @@ export function createBoundedInboundDebouncer<Item>(
         key,
         item,
         id,
+        dedupeKey,
         reason: result.reason,
         chargedBytes: charge,
         recoverCancelled,
+        deferToRetained: hasRetainedLogicalKey(key, dedupeKey),
       });
       return { status: "overflow", reason: result.reason, chargedBytes: charge };
     }
@@ -462,9 +491,10 @@ export function createBoundedInboundDebouncer<Item>(
       isRetired: () => state.retired,
       waitForCancellation: () => state.cancellationSettled ?? Promise.resolve(),
       ...(validId(id) ? { id } : {}),
+      dedupeKey,
     };
     entryStates.set(entry, state);
-    if (validId(id)) inflightIds.add(idIndexKey(key, id));
+    if (validId(id) && dedupeKey !== undefined) inflightIds.add(correlationKey(key, dedupeKey, id));
     const existing = waiting.get(key);
     if (existing) {
       existing.entries.push(entry);
