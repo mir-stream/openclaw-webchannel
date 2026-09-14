@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { resolveAgentRoute as resolveSdkAgentRoute } from "openclaw/plugin-sdk/routing";
 
 /**
  * Tenant every fake api in this file is served under. Declared explicitly (not
@@ -833,7 +834,7 @@ describe("webchannel inbound round-trip", () => {
     // authorization namespace.
     expect(recordInboundSession).toHaveBeenCalledTimes(1);
     expect(captured.recordedSessionKey).toBe(
-      `agent:main:webchannel:default:direct:web-anon:tenant:${FIXTURE_TENANT_TOKEN}`,
+      `agent:main:webchannel:default:direct:p:7765622d616e6f6e:tenant:${FIXTURE_TENANT_TOKEN}:peer-v2`,
     );
     // The recorded reply `to` lines up with the socket-map key we deliver to.
     expect(captured.recordedTo).toBe("web-anon");
@@ -841,6 +842,36 @@ describe("webchannel inbound round-trip", () => {
     // No-progress config => the plain append path, which since #238 carries a
     // plugin-minted id (the client no longer invents `a-N` for it).
     expect(sendSpy).toHaveBeenCalledWith("web-anon", "hi back", MINTED_ID, expect.any(String));
+  });
+
+  it("#372 uses each case-distinct peer's same key for dispatch, recording and stop, keeping reply.to raw", async () => {
+    const transport = new FakePeerChannel();
+    const send = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api, recordInboundSession } = makeFakeApi(captured);
+    api.runtime.channel.routing.resolveAgentRoute = vi.fn(resolveSdkAgentRoute);
+    const keys = new Map<string, string>();
+    for (const peer of ["Alice", "alice"]) {
+      for (const controlLane of [false, true]) {
+        await handleInboundMessage(api, transport, peer, {
+          type: "user_message", text: controlLane ? "/stop" : "hello",
+        }, "default", { controlLane });
+        const key = captured.recordedSessionKey!;
+        expect(key).toMatch(/:direct:p:[a-f0-9]+:tenant:[a-f0-9]{64}:peer-v2$/);
+        if (controlLane) expect(key).toBe(keys.get(peer));
+        else keys.set(peer, key);
+        expect(api.runtime.channel.inbound.buildContext).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            from: peer, sender: { id: peer, name: peer }, reply: { to: peer },
+            route: expect.objectContaining({ routeSessionKey: key, dispatchSessionKey: key }),
+          }),
+        );
+        expect(recordInboundSession).toHaveBeenLastCalledWith(expect.objectContaining({ sessionKey: key }));
+        expect(captured.recordedTo).toBe(peer);
+        expect(send).toHaveBeenLastCalledWith(peer, "hi back", MINTED_ID, expect.any(String));
+      }
+    }
+    expect(keys.get("Alice")).not.toBe(keys.get("alice"));
   });
 
   it("threads accountId into resolveAgentRoute (binding.account routing — Cycle 2)", async () => {

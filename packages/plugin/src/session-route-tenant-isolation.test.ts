@@ -72,7 +72,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, it, expect, vi } from "vitest";
 
-import { parseAgentSessionKey } from "openclaw/plugin-sdk/routing";
+import { parseAgentSessionKey, resolveAgentRoute } from "openclaw/plugin-sdk/routing";
 
 import { openDeliveryJournal, type DeliveryJournal } from "./delivery-journal.js";
 import type { JournalEvent } from "./delivery-journal-event.js";
@@ -315,9 +315,8 @@ function scopeToken(tenant: string): string {
 
 /**
  * A plugin api serving `accountId` under `tenant`. `resolveAgentRoute` is a
- * stub (the helper discards its session key and rebuilds one with the REAL
- * `buildAgentSessionKey`). The tenant is also present in config so the fixtures
- * model a real account, but session routing receives the immutable serving-plan
+ * real SDK helper (the plugin rebuilds only its session key). The tenant is also
+ * present in config, but session routing receives the immutable serving-plan
  * tenant explicitly, exactly as production does.
  */
 function makeApi(tenant: string) {
@@ -330,15 +329,7 @@ function makeApi(tenant: string) {
     runtime: {
       channel: {
         routing: {
-          resolveAgentRoute: (input: any) => ({
-            agentId: "main",
-            channel: input.channel,
-            accountId: input.accountId ?? "",
-            sessionKey: "agent:main:main",
-            mainSessionKey: "agent:main:main",
-            lastRoutePolicy: "main" as const,
-            matchedBy: "default" as const,
-          }),
+          resolveAgentRoute,
         },
       },
     },
@@ -439,10 +430,10 @@ describe("#112 — tenant scoping of the webchannel session key (WRITE path)", (
     // derived strings differing only in case are ONE stored key.
     expect(storeKey(t1)).not.toBe(storeKey(t2));
     expect(storeKey(t1)).toBe(
-      `agent:main:webchannel:${ACCOUNT}:direct:${PEER}:tenant:${scopeToken(T1)}`,
+      `agent:main:webchannel:${ACCOUNT}:direct:p:757365722d3432:tenant:${scopeToken(T1)}:peer-v2`,
     );
     expect(storeKey(t2)).toBe(
-      `agent:main:webchannel:${ACCOUNT}:direct:${PEER}:tenant:${scopeToken(T2)}`,
+      `agent:main:webchannel:${ACCOUNT}:direct:p:757365722d3432:tenant:${scopeToken(T2)}:peer-v2`,
     );
   });
 
@@ -456,8 +447,8 @@ describe("#112 — tenant scoping of the webchannel session key (WRITE path)", (
       "Acme",
     ).sessionKey;
     expect(derived).toBe(
-      `agent:main:webchannel:${ACCOUNT}:direct:${PEER}:tenant:` +
-        "37036cd8f9746d335038eca92f8a73ae5f1bca4779a1e55e5812e37743b2f5bf",
+      `agent:main:webchannel:${ACCOUNT}:direct:p:757365722d3432:tenant:` +
+        "37036cd8f9746d335038eca92f8a73ae5f1bca4779a1e55e5812e37743b2f5bf:peer-v2",
     );
     expect(storeKey(derived)).toBe(derived);
   });
