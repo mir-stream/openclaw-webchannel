@@ -8,6 +8,7 @@ import type { ChannelDoctorAdapter, ChannelStatusAdapter } from "openclaw/plugin
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
 import { createClawMessageAdapter, nextMessageId } from "./message-adapter.js";
+import { resolveOutboundTransport, type ResolveOutboundTransport } from "./outbound-account.js";
 import {
   createClawApprovalCapability,
   startClawApprovalMonitor,
@@ -22,6 +23,7 @@ import {
   listWebchannelAccountIds,
   readAccountsMap,
   readWebchannelSection,
+  resolveDefaultWebchannelAccountId,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { webchannelSetup } from "./setup.js";
@@ -48,7 +50,7 @@ import {
 export const DEFAULT_WEBCHANNEL_ACCOUNT_ID = ACCOUNT_CONFIG_DEFAULT_WEBCHANNEL_ACCOUNT_ID;
 
 type ResolvedAccount = {
-  accountId: string | null;
+  accountId: string;
   enabled: boolean;
   allowFrom: string[];
   dmPolicy: string | undefined;
@@ -88,13 +90,11 @@ function resolveAccount(
   // treated as the `"default"` account; a per-account config resolves the named
   // account's leaf fields. `resolveWebchannelAccountConfig` owns the shape
   // detection so a single-account deployment is a regression-free pass-through.
-  const account = resolveWebchannelAccountConfig(
-    cfg,
-    accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID,
-  );
+  const id = accountId ?? resolveDefaultWebchannelAccountId(cfg);
+  const account = resolveWebchannelAccountConfig(cfg, id);
   return {
-    accountId: accountId ?? null,
-    enabled: isWebchannelAccountEnabled(cfg, accountId),
+    accountId: id,
+    enabled: isWebchannelAccountEnabled(cfg, id),
     allowFrom: (account.allowFrom as string[] | undefined) ?? [],
     dmPolicy: account.dmSecurity as string | undefined,
   };
@@ -107,7 +107,7 @@ function isWebchannelAccountConfigured(
   const section = readWebchannelSection(cfg);
   if (!section || !hasWebchannelConfig(cfg)) return false;
 
-  const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+  const id = accountId ?? resolveDefaultWebchannelAccountId(cfg);
   const accounts = readAccountsMap(section);
   if (Object.keys(accounts).length > 0) {
     return listWebchannelAccountIds(cfg).includes(id);
@@ -136,11 +136,11 @@ function isWebchannelAccountConfigured(
 export function createWebChannelPlugin(
   transport: WebChannelPeerChannel,
   opts?: {
+    /** Live account lookup for both outbound send surfaces; a miss must fail. */
+    resolveOutboundTransport?: ResolveOutboundTransport;
     /**
-     * S1 (accountId-aware approvals): resolve a specific account's transport
-     * for native approval delivery/finalize. The NATS entry passes a resolver
-     * over its per-account runtimes; the legacy single-transport WS entry omits
-     * it and every account falls back to `transport` (unchanged behavior).
+     * Resolve a specific account's transport for native approval delivery and
+     * finalize. A miss fails closed; single-transport callers can omit this.
     */
     resolveApprovalTransport?: ResolveAccountTransport;
     startNatsAccount?: (ctx: any) => Promise<void>;
@@ -209,10 +209,11 @@ export function createWebChannelPlugin(
           return inspection.validIds;
         },
         resolveAccount,
+        defaultAccountId: resolveDefaultWebchannelAccountId,
         inspectAccount: (cfg: OpenClawConfig, accountId?: string | null) => {
           const configured = isWebchannelAccountConfigured(cfg, accountId);
           return {
-            enabled: isWebchannelAccountEnabled(cfg, accountId),
+            enabled: isWebchannelAccountEnabled(cfg, accountId ?? resolveDefaultWebchannelAccountId(cfg)),
             configured,
             tokenStatus: configured ? "available" : "missing",
           };
@@ -234,7 +235,7 @@ export function createWebChannelPlugin(
       // See src/setup-wizard.ts.
       setupWizard: webchannelSetupWizard,
     })), {
-      message: createClawMessageAdapter(transport),
+      message: createClawMessageAdapter(transport, opts?.resolveOutboundTransport),
       doctor: createWebchannelDoctorAdapter(),
       status: createWebchannelStatusAdapter(),
       // `approvalCapability` is a top-level ChannelPlugin field (sibling of
@@ -282,7 +283,7 @@ export function createWebChannelPlugin(
         sendText: async (ctx) => {
           // The inbound round-trip delivers replies through the turn's
           // `delivery.deliver` adapter (see src/inbound.ts), NOT here. This
-          // outbound seam only fires for core-initiated (untargeted) sends.
+          // outbound seam handles core-initiated sends to the requested account.
           // `ctx.to` is the recorded reply target — now the REAL per-peer
           // `wsKey` (inbound.ts records `reply.to = wsKey`), so target it
           // directly. If it is absent or stale, throw so core observes a failed
@@ -308,7 +309,8 @@ export function createWebChannelPlugin(
           // prone). Mint order matters: the id must exist before the send, and a
           // failed send still throws exactly as before.
           const id = nextMessageId();
-          if (!transport.sendText(ctx.to, ctx.text, id)) {
+          const target = resolveOutboundTransport(ctx, transport, opts?.resolveOutboundTransport);
+          if (!target.sendText(ctx.to, ctx.text, id)) {
             throw new Error(
               `[webchannel] outbound send failed: targeted send returned false for peer ${ctx.to}`,
             );

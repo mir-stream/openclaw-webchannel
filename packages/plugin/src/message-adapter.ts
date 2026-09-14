@@ -19,6 +19,7 @@ import {
 
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
+import { resolveOutboundTransport, type ResolveOutboundTransport } from "./outbound-account.js";
 
 /**
  * Stable per-message id we generate for each outbound logical send. This becomes
@@ -120,7 +121,10 @@ export function buildClawReceipt(id: string): MessageReceipt {
  * We return a real receipt whose primary id is our generated per-message id;
  * this is also the fallback send used if core ever drives the adapter directly.
  */
-export function createClawMessageAdapter(transport: WebChannelPeerChannel) {
+export function createClawMessageAdapter(
+  transport: WebChannelPeerChannel,
+  resolveAccountTransport?: ResolveOutboundTransport,
+) {
   return defineChannelMessageAdapter({
     id: WEBCHANNEL_ID,
     // Final delivery is plain text only.
@@ -155,7 +159,8 @@ export function createClawMessageAdapter(transport: WebChannelPeerChannel) {
         if (!ctx.to) {
           throw new Error("[webchannel] message.send.text failed: ctx.to is absent");
         }
-        if (!transport.sendText(ctx.to, ctx.text, id)) {
+        const target = resolveOutboundTransport(ctx, transport, resolveAccountTransport);
+        if (!target.sendText(ctx.to, ctx.text, id)) {
           throw new Error(
             `[webchannel] message.send.text failed: targeted send returned false for peer ${ctx.to}`,
           );
