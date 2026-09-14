@@ -75,7 +75,7 @@
     "packages/plugin/src/delivery-journal.test.ts": 37,
     "packages/plugin/src/dm-allowlist.test.ts": 5,
     "packages/plugin/src/doctor.test.ts": 48,
-    "packages/plugin/src/durable-send.test.ts": 22,
+    "packages/plugin/src/durable-send.test.ts": 24,
     "packages/plugin/src/durable-view-reducer-contract.test.ts": 2,
     "packages/plugin/src/e2e-crypto.test.ts": 36,
     "packages/plugin/src/e2e-envelope.test.ts": 63,

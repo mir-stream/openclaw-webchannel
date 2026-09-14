@@ -82,6 +82,12 @@ it.each(["immediate", "notice", "buffered", "snapshot"] as const)("recovers %s o
   else if (kind === "immediate") expect(await draft.finalize("answer")).toBe(false);
   await draft.drain();
   expect(draft.deliveryFailed).toBe(true);
+  if (kind === "snapshot") {
+    expect(snapshotAttempts).toHaveBeenCalledTimes(2);
+    await draft.drain();
+    expect(snapshotAttempts).toHaveBeenCalledTimes(3); // one retry of the older pending snapshot
+    expect(draft.deliveryFailed).toBe(true);
+  }
   const idsBefore = finalAttempts.mock.calls.map((args) => args[1]);
   const snapshotsBefore = snapshotAttempts.mock.calls.map((args) => args[2]);
   db.exec("DROP TRIGGER fail_write");
@@ -97,6 +103,46 @@ it.each(["immediate", "notice", "buffered", "snapshot"] as const)("recovers %s o
   if (kind === "snapshot") expect(snapshotAttempts.mock.calls.every((args) => JSON.stringify(args[2]) === JSON.stringify(snapshotsBefore[0]))).toBe(true);
   const bubbles = journal.read("peer", { afterSeq: 0, limit: 100 }).filter(({ event }) => event.kind === "bubble");
   expect(bubbles).toHaveLength(expected.length);
+});
+
+it.each([false, true])("one drain retries its first snapshot failure after output recovery (buffered=%s)", async (buffered) => {
+  const { channel, draft, journal, db, fail, history } = setup();
+  const finals = vi.spyOn(channel, "finalizeDraft");
+  const snapshots = vi.spyOn(channel, "sendTurnSnapshot");
+  draft.pushAnswerText({ text: "first answer" });
+  await draft.flush();
+  if (buffered) {
+    draft.handleAssistantMessageBoundary();
+    expect(await draft.finalize("second answer")).toBe(true);
+  } else {
+    expect(await draft.finalize("first answer")).toBe(true);
+  }
+  const firstId = finals.mock.calls[0]![1];
+  const rejectFirst = new Set(buffered ? ["bubble", "seal"] : ["seal"]);
+  const append = journal.append.bind(journal);
+  vi.spyOn(journal, "append").mockImplementation((...args) => {
+    if (!rejectFirst.delete(args[1].kind)) return append(...args);
+    fail();
+    try { return append(...args); }
+    finally { db.exec("DROP TRIGGER fail_write"); }
+  });
+
+  await draft.drain();
+  draft.stop();
+
+  expect(draft.deliveryFailed).toBe(false);
+  expect(rejectFirst.size).toBe(0);
+  expect(snapshots.mock.calls).toEqual([snapshots.mock.calls[0], snapshots.mock.calls[0]]);
+  const secondFinals = finals.mock.calls.filter((args) => args[2] === "second answer");
+  expect(secondFinals).toHaveLength(buffered ? 2 : 0);
+  if (buffered) expect(secondFinals[1]).toEqual(secondFinals[0]);
+  expect(history()).toEqual(buffered ? [
+    expect.objectContaining({ id: firstId, text: "first answer" }),
+    expect.objectContaining({ id: secondFinals[0]![1], text: "second answer" }),
+  ] : [expect.objectContaining({ id: firstId, text: "first answer" })]);
+  expect(journal.read("peer", { afterSeq: 0, limit: 100 }).filter(({ event }) => event.kind === "seal")).toEqual([
+    expect.objectContaining({ event: { kind: "seal", turnId: "turn", answers: snapshots.mock.calls[0]![2], remove: snapshots.mock.calls[0]![3] } }),
+  ]);
 });
 
 it("identical independent finals stay distinct after the first final's store failure", async () => {

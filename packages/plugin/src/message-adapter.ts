@@ -2587,13 +2587,16 @@ export function createProgressDraftController(params: {
           const retried = new Set(pendingDurableSends.keys());
           for (const retry of [...pendingDurableSends.values()]) retry();
           terminalDrain(true);
-          // Buffered finals and the snapshot first attempt storage during drain.
-          // Give each newly rejected output one retry too, under its reservation.
+          // Buffered finals first attempt storage during drain. Retry their
+          // rejected output before the snapshot, under the same reservations.
           let recoveredOutput = false;
           for (const [key, retry] of [...pendingDurableSends]) {
-            if (!retried.has(key) && retry() && key !== "snapshot") recoveredOutput = true;
+            if (key !== "snapshot" && !retried.has(key) && retry()) recoveredOutput = true;
           }
           if (recoveredOutput && pendingDurableSends.size === 0) emitTurnSnapshot();
+          // The first snapshot attempt can happen above, after output recovers.
+          // Give it one retry here, unless its key was already retried at entry.
+          if (!retried.has("snapshot")) pendingDurableSends.get("snapshot")?.();
         },
         undefined,
       ),
