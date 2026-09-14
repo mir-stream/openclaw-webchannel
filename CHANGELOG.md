@@ -4,6 +4,16 @@
 
 ### Changed
 
+- **Case-distinct JWT peers now have distinct core sessions (#372).** Raw peer
+  IDs such as `Alice` and `alice` are encoded before SDK session normalization;
+  configured bindings and intentional `identityLinks` keep their SDK selection,
+  while an unlinked peer whose raw ID merely equals a canonical link name no
+  longer shares that group's context. Every peer starts fresh core context on
+  upgrade, including numeric IDs and linked groups; old context is never
+  automatically adopted. Journal history, wire identities and encryption keys
+  are retained. Drain active turns and restart the gateway; see
+  [session identity and rollout](docs/SESSION_IDENTITY.md).
+
 - **A durable frame the delivery journal COMMITTED is reported as sent, even if
   its publish fails (#347, extends #278/#325).** The plugin is the Telegram
   *server*: a message exists once the store holds it under an id and a

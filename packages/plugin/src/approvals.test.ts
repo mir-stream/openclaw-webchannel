@@ -1663,8 +1663,8 @@ describe("#93 origin routing — active lease + persisted session store", () => 
 
   it("#131: derives the persisted approval-origin key through production routing", () => {
     expect(SESSION_KEY).toBe(
-      "agent:rota:webchannel:default:direct:peercase-1:tenant:" +
-        "91e0a4247f5124d880e9876cb8ff7fefdfd74782832996312741357aa8b7fa4e",
+      "agent:rota:webchannel:default:direct:p:50656572436173652d31:tenant:" +
+        "91e0a4247f5124d880e9876cb8ff7fefdfd74782832996312741357aa8b7fa4e:peer-v2",
     );
   });
 
