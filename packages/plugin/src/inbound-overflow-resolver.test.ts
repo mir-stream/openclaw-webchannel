@@ -51,6 +51,83 @@ const recorded = (outcome: IngressOutcome = "overloaded") => {
 };
 
 describe("BoundedOverflowResolver", () => {
+  it("bounds joined wire correlations by count and charged metadata, then releases all claims", async () => {
+    let finish!: (value: any) => void;
+    const lookup = new Promise<any>((resolve) => { finish = resolve; });
+    const store = { lookup: vi.fn(() => lookup) } as unknown as IngressOutcomeStore;
+    const token = new InboundRetentionBudget().createSessionToken();
+    const request = (i: number) => ({
+      accountId: "a", peerId: "p", key: "p:logical", id: `wire-${i}`, randomId: "logical", sessionToken: token,
+    });
+    const sendRejected = vi.fn((_request: { id: string }) => true);
+    const resolver = new BoundedOverflowResolver({ outcomeStore: store, sendAck: () => true, sendRejected });
+    expect(resolver.tryStart(request(0))).toEqual({ status: "started" });
+    let bytes = overflowResolverMetadataBytes(request(0));
+    for (let i = 1; i < 64; i++) {
+      expect(resolver.tryStart(request(i))).toEqual({ status: "joined" });
+      bytes += overflowResolverMetadataBytes(request(i));
+    }
+    expect(resolver.usage()).toEqual({ tasks: 1, metadataBytes: bytes });
+    expect(resolver.tryStart(request(64))).toEqual({ status: "correlation-count" });
+    const byteLimited = new BoundedOverflowResolver({
+      outcomeStore: store, sendAck: () => true, sendRejected: () => true,
+      maxMetadataBytes: overflowResolverMetadataBytes(request(0)) * 2,
+    });
+    expect(byteLimited.tryStart(request(0))).toEqual({ status: "started" });
+    expect(byteLimited.tryStart(request(1))).toEqual({ status: "joined" });
+    expect(byteLimited.tryStart(request(2))).toEqual({ status: "process-bytes" });
+    expect(store.lookup).toHaveBeenCalledTimes(2);
+    finish({ status: "found", outcome: "overloaded" });
+    await vi.waitFor(() => expect(resolver.usage()).toEqual({ tasks: 0, metadataBytes: 0 }));
+    expect(byteLimited.usage()).toEqual({ tasks: 0, metadataBytes: 0 });
+    expect(sendRejected.mock.calls.map(([value]) => value.id)).toEqual(Array.from({ length: 64 }, (_, i) => `wire-${i}`));
+    expect(resolver.hasActiveClaim("a", "p:logical")).toBe(false);
+  });
+
+  it("drains new correlations added during async delivery before releasing the logical claim", async () => {
+    let finishAck!: () => void;
+    const gate = new Promise<void>((resolve) => { finishAck = resolve; });
+    const store = { record: vi.fn(async () => recorded("cancelled").result) } as unknown as IngressOutcomeStore;
+    const ids: string[] = [];
+    const resolver = new BoundedOverflowResolver({
+      outcomeStore: store, sendRejected: () => true,
+      sendAck: async ({ id }) => { ids.push(id); if (id === "first") await gate; return true; },
+    });
+    const request = { accountId: "a", peerId: "p", key: "p:logical", id: "first", randomId: "logical", recoverCancelled: true, sessionToken: new InboundRetentionBudget().createSessionToken() };
+    resolver.tryStart(request);
+    await vi.waitFor(() => expect(ids).toEqual(["first"]));
+    expect(resolver.tryStart({ ...request, id: "retry", recoverCancelled: false })).toEqual({ status: "joined" });
+    finishAck();
+    await vi.waitFor(() => expect(resolver.usage()).toEqual({ tasks: 0, metadataBytes: 0 }));
+    expect(ids).toEqual(["first", "retry"]);
+  });
+
+  it("keeps joined metadata charged through retirement and isolates account and peer claims", async () => {
+    let finish!: (value: any) => void;
+    const lookup = new Promise<any>((resolve) => { finish = resolve; });
+    const store = { lookup: vi.fn(() => lookup) } as unknown as IngressOutcomeStore;
+    const budget = new InboundRetentionBudget();
+    const sendAck = vi.fn(() => true);
+    const resolver = new BoundedOverflowResolver({ outcomeStore: store, sendAck, sendRejected: () => true });
+    const first = { accountId: "a", peerId: "p", key: "p:logical", id: "first", randomId: "logical", sessionToken: budget.createSessionToken() };
+    resolver.tryStart(first);
+    resolver.tryStart({ ...first, id: "retry" });
+    resolver.tryStart({ ...first, accountId: "b", sessionToken: budget.createSessionToken() });
+    resolver.tryStart({ ...first, peerId: "q", key: "q:logical", sessionToken: budget.createSessionToken() });
+    expect(resolver.usage().tasks).toBe(3);
+    expect(resolver.invalidateSession(first.sessionToken)).toBe(true);
+    const retained = resolver.usage();
+    expect(resolver.tryStart({ ...first, id: "later" })).toEqual({ status: "busy-session" });
+    expect(resolver.usage()).toEqual(retained);
+    expect(resolver.hasActiveClaim("a", "p:logical")).toBe(true);
+    finish({ status: "found", outcome: "cancelled" });
+    await vi.waitFor(() => expect(resolver.usage()).toEqual({ tasks: 0, metadataBytes: 0 }));
+    expect(sendAck).toHaveBeenCalledTimes(2);
+    expect(resolver.hasActiveClaim("a", "p:logical")).toBe(false);
+    expect(resolver.hasActiveClaim("b", "p:logical")).toBe(false);
+    expect(resolver.hasActiveClaim("a", "q:logical")).toBe(false);
+  });
+
   it("requires a durable overload marker and enforces one task per session", async () => {
     let finish!: (value: any) => void;
     const lookup = new Promise<any>((resolve) => { finish = resolve; });
@@ -557,7 +634,7 @@ describe("BoundedOverflowResolver — the journal is the accept authority (#344)
       });
 
       expect(resolver.tryStart({
-        accountId: ACCOUNT, peerId: PEER, key: `${PEER}:r-1`, id: "u-1",
+        accountId: ACCOUNT, peerId: PEER, key: `${PEER}:r-1`, id: "u-1", randomId: "r-1",
         sessionToken: new InboundRetentionBudget().createSessionToken(),
       })).toEqual({ status: "started" });
       await tick(); await tick();
@@ -636,7 +713,7 @@ describe("BoundedOverflowResolver — the journal is the accept authority (#344)
       });
 
       resolver.tryStart({
-        accountId: ACCOUNT, peerId: PEER, key: `${PEER}:r-1`, id: "u-1",
+        accountId: ACCOUNT, peerId: PEER, key: `${PEER}:r-1`, id: "u-1", randomId: "r-1",
         sessionToken: new InboundRetentionBudget().createSessionToken(),
       });
       await tick(); await tick();
@@ -665,7 +742,7 @@ describe("BoundedOverflowResolver — the journal is the accept authority (#344)
     });
 
     resolver.tryStart({
-      accountId: ACCOUNT, peerId: PEER, key: `${PEER}:r-1`, id: "u-1",
+      accountId: ACCOUNT, peerId: PEER, key: `${PEER}:r-1`, id: "u-1", randomId: "r-1",
       sessionToken: new InboundRetentionBudget().createSessionToken(),
     });
     await tick(); await tick();
