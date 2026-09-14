@@ -709,6 +709,7 @@ describe("webchannel inbound round-trip", () => {
 
   it("warns once when turn_settled cannot be sent, without reporting false success", async () => {
     const transport = new FakePeerChannel();
+    vi.spyOn(transport, "sendText").mockReturnValue(true);
     const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(false);
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
     // Reasoning explicitly OFF so `warn` has exactly one possible source and the
@@ -1550,10 +1551,11 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it.each(["false", "throw"] as const)(
-    "I6: a lane-A terminal %s leaves the queue alive for B",
+    "I6: a lane-A terminal %s leaves the queue alive for B but keeps the turn failed",
     async (failure) => {
       const transport = new FakePeerChannel();
       vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      vi.spyOn(transport, "sendTurnSnapshot").mockReturnValue(true);
       let first = true;
       const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockImplementation(() => {
         if (!first) return true;
@@ -1589,7 +1591,7 @@ describe("webchannel inbound round-trip", () => {
       expect(settledSpy).toHaveBeenCalledWith(
         "web-anon",
         `turn-i6-${failure}`,
-        "ok",
+        "error",
       );
     },
   );
@@ -2098,6 +2100,7 @@ describe("webchannel inbound round-trip", () => {
   it("I13: an ordinary answer and a trailing tool-warning final both remain visible", async () => {
     const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    vi.spyOn(transport, "sendTurnSnapshot").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
     const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
@@ -2791,6 +2794,8 @@ describe("webchannel inbound round-trip", () => {
     "streams reasoning independently of the answer streaming mode when capabilities.reasoning is on (mode=%s)",
     async (mode) => {
       const transport = new FakePeerChannel();
+      vi.spyOn(transport, "sendText").mockReturnValue(true);
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
       const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
       const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
       const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
@@ -3106,6 +3111,7 @@ describe("webchannel inbound round-trip", () => {
       // it would stay on — defeating their intent in the privacy-losing
       // direction. That regression goes red here.
       const transport = new FakePeerChannel();
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
       const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
       const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
       let seenReplyOptions: any = "unset";
