@@ -750,7 +750,7 @@ describe("#244 half A — seq on the durable wire frames", () => {
       }),
       // #341: this sender reports delivery AND the durable write separately.
     ).toEqual({ delivered: true, journaled: true });
-    expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once")).toBe(true);
+    expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once").delivered).toBe(true);
 
     expect(transport.frames.map((f) => [f.type, f.seq])).toEqual([
       ["reasoning", 1],
@@ -1236,7 +1236,7 @@ describe("#341 — the approval frames journal above the refusals", () => {
     );
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once")).toBe(false);
+    expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once").delivered).toBe(false);
 
     expect(calls).toEqual([
       {
@@ -1262,7 +1262,7 @@ describe("#341 — the approval frames journal above the refusals", () => {
       delivered: true,
       journaled: true,
     });
-    expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once")).toBe(true);
+    expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once").delivered).toBe(true);
 
     expect(calls.map((entry) => (entry.call === "append" ? entry.event.kind : entry.call))).toEqual([
       "approval",
@@ -1307,8 +1307,8 @@ describe("#341 — the approval frames journal above the refusals", () => {
     // the plugin recorded, so only the first is a row.
     const { calls, channel } = makeChannel();
 
-    expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once")).toBe(true);
-    expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once")).toBe(true);
+    expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once").delivered).toBe(true);
+    expect(channel.sendApprovalResolved(PEER, "ap-1", "allow-once").delivered).toBe(true);
 
     expect(appends(calls)).toHaveLength(1);
     expect(calls.filter((entry) => entry.call === "publish")).toHaveLength(2);

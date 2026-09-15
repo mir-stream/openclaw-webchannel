@@ -334,7 +334,7 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   //
   // Round 2 combines push diagnostics and brings the formerly hoisted journal
   // diagnostic into the AST audit. Every interpolation uses logSafe.
-  "nats-channel.ts": { statements: 22, interpolations: 40 },
+  "nats-channel.ts": { statements: 22, interpolations: 41 },
   // ⚠️ ZERO, AND THE ENTRY STAYS — BUT IT GUARANTEES LESS THAN IT LOOKS LIKE.
   // #240 half 2 deleted the whole core-transcript reader out of `history.ts`
   // (the shape-drift warn, the two cursor-miss warns and the two best-effort

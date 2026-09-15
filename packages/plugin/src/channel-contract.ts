@@ -734,6 +734,24 @@ export type DifferenceReply = {
   maxSeq: number;
 };
 
+export type ApprovalResolutionSendResult = {
+  /** Whether this call agrees with the original peer and decision. */
+  accepted: boolean;
+  delivered: boolean;
+  /** True once the resolution row is committed, independently of relay state. */
+  journaled: boolean;
+  status: "journaled" | "pending" | "exhausted" | "abandoned" | "unavailable" | "conflict";
+};
+
+export type ApprovalResolutionSendOptions = {
+  journalRequestFirst?: ApprovalRequestPayload;
+  abortSignal?: AbortSignal;
+  /** Synchronous first-winner notification before any durable/live output.
+   * This means the peer/decision claim was accepted, not that storage succeeded.
+   */
+  onClaim?: () => void;
+};
+
 /**
  * #341 — what `sendApprovalRequest` reports back. TWO independent outcomes, and
  * conflating them is what round 1 got wrong:
@@ -753,7 +771,7 @@ export type ApprovalRequestSendResult = {
 /** Durable send booleans report server acceptance: a committed frame returns
  * true even when its live push fails. A store fault throws DurableSendError and
  * must not produce a success receipt. Ephemeral/policy-excluded frames report
- * live push success only. Approval methods keep their explicit dual outcome.
+ * live push success only. Approval methods report storage and live delivery separately.
  */
 export interface WebChannelPeerChannel {
   sendText(
@@ -875,8 +893,8 @@ export interface WebChannelPeerChannel {
     peerId: string,
     id: string,
     decision: ApprovalDecision,
-    options?: { journalRequestFirst?: ApprovalRequestPayload },
-  ): boolean;
+    options?: ApprovalResolutionSendOptions,
+  ): ApprovalResolutionSendResult;
   sendApprovalSnapshot(peerId: string, approvals: ApprovalRequestPayload[], resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean;
   sendAck?(
     peerId: string,
@@ -899,7 +917,7 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendDifference(_peerId: string, _reply: DifferenceReply): boolean { return false; }
   sendUserCommitted(_peerId: string, _message: { id: string; text: string; turnId?: string; seq: number; random_id?: string }): boolean { return false; }
   sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload, _options?: { redelivery?: boolean }): ApprovalRequestSendResult { return { delivered: false, journaled: false }; }
-  sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision, _options?: { journalRequestFirst?: ApprovalRequestPayload }): boolean { return false; }
+  sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision, options?: ApprovalResolutionSendOptions): ApprovalResolutionSendResult { options?.onClaim?.(); return { accepted: true, delivered: false, journaled: false, status: "unavailable" }; }
   sendApprovalSnapshot(_peerId: string, _approvals: ApprovalRequestPayload[], _resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean { return false; }
   sendAck(_peerId: string, ids: string[], _committed?: Array<{ random_id: string; messageId: string; seq: number }>): boolean { return ids.length === 0; }
   sendInboundRejected(_peerId: string, ids: string[]): boolean { return ids.length === 0; }

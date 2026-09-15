@@ -116,7 +116,7 @@ describe("S2 — NatsChannel memory bounds", () => {
     const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant", cryptoConfig(), {
       maxApprovalResolutions: 3,
     });
-    const resolutions = channel["approvalResolutions"] as Map<string, string>;
+    const resolutions = channel["approvalOutputs"];
 
     for (let i = 0; i < 5; i++) {
       channel.sendApprovalResolved(`peer-${i}`, `approval-${i}`, "allow-once");
@@ -124,9 +124,9 @@ describe("S2 — NatsChannel memory bounds", () => {
 
     expect(resolutions.size).toBe(3);
     // Oldest two evicted; newest three retained.
-    expect(resolutions.has("approval-0")).toBe(false);
-    expect(resolutions.has("approval-1")).toBe(false);
-    expect(resolutions.has("approval-4")).toBe(true);
+    expect(Boolean(resolutions.resolver("approval-0"))).toBe(false);
+    expect(Boolean(resolutions.resolver("approval-1"))).toBe(false);
+    expect(Boolean(resolutions.resolver("approval-4"))).toBe(true);
   });
 
   it("keeps first-write-wins dedup working within the retained window", () => {
@@ -138,7 +138,7 @@ describe("S2 — NatsChannel memory bounds", () => {
     channel.registerPeer("peer-b");
 
     // First resolver wins; a different peer's duplicate is dropped (false).
-    expect(channel.sendApprovalResolved("peer-a", "appr", "allow-once")).toBe(true);
-    expect(channel.sendApprovalResolved("peer-b", "appr", "deny")).toBe(false);
+    expect(channel.sendApprovalResolved("peer-a", "appr", "allow-once").delivered).toBe(true);
+    expect(channel.sendApprovalResolved("peer-b", "appr", "deny").delivered).toBe(false);
   });
 });

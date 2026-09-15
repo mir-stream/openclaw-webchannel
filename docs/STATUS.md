@@ -26,6 +26,19 @@ Reasoning previews remain policy-controlled, tool failures do not replay tool
 execution, and approval results still distinguish delivery from journaling.
 This work does not provide durable agent task scheduling or replay external effects.
 
+Round 5 (#381): approval finalization retains the original account channel, raw
+peer, decision and any owed request. SQLite failures retry only that output on
+the active channel (three retries after 1s, 5s and 30s; one timer, 16 outputs per
+callback, at most 512 failed outputs / 2 MiB of charged payload). Request rows
+already committed during catch-up are not duplicated. Journal acceptance is
+separate from live delivery, so relay loss does not retry committed output.
+Approval snapshots retire actions immediately while storage remains pending.
+Exhaustion, capacity eviction and teardown remain observable failures; monitor
+abort and channel disposal cancel recovery. No channel at finalization means no
+recovery owner. This is in-memory recovery within the active runtime, with no
+action/task replay or restart-persistent recovery. Controlled production-handler
+probes use real SQLite, NatsChannel, encryption and materialized/raw history.
+
 Round 3B (#346 + #342): history reconciles user sends by explicit random ID
 mappings and refreshes rows using journal modification sequences. Warm snapshots
 recover the retained gap before hydration; byte-trimmed cold snapshots recover
