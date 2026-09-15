@@ -1334,11 +1334,11 @@ export async function handleInboundMessage(
                     // Native reasoning resets per assistant message, independently
                     // of answer streaming mode. Both controllers receive the same
                     // public boundary, before that message's partial callbacks.
-                    ...(reasoning || answerStreamingEnabled
+                    ...(reasoning || (draft && answerStreamingEnabled)
                       ? ({
                           onAssistantMessageStart: () => {
                             reasoning?.startMessage();
-                            if (answerStreamingEnabled) draft!.handleAssistantMessageBoundary();
+                            if (draft && answerStreamingEnabled) draft.handleAssistantMessageBoundary();
                           },
                         } satisfies Pick<GetReplyOptions, "onAssistantMessageStart">)
                       : {}),

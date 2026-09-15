@@ -362,6 +362,39 @@ function makeFakeTransport(options?: {
 const userMessage = { type: "user_message" as const, text: "/stop" };
 
 describe("handleInboundMessage — control-lane authorization stamp", () => {
+  it("delivers a partial-mode control turn without wiring a draft message boundary", async () => {
+    let sawMessageBoundary: boolean | undefined;
+    let visibleReplySent: boolean | undefined;
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      runImpl: async (turn) => {
+        // Controlled public callback sequence after core continues a plain-text
+        // control turn; this fixture does not run core's abort/command authorization.
+        turn.replyOptions?.onAgentRunStart?.("control-run");
+        sawMessageBoundary = typeof turn.replyOptions?.onAssistantMessageStart === "function";
+        turn.replyOptions?.onAssistantMessageStart?.();
+        turn.replyOptions?.onPartialReply?.({ text: "I can help." });
+        visibleReplySent = (await turn.delivery.deliver(
+          { text: "I can help." },
+          { kind: "final" },
+        )).visibleReplySent;
+      },
+    });
+    const { transport, texts, progress, finalizes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "stop",
+      id: "control-turn",
+    }, "default", { controlLane: true });
+
+    expect(visibleReplySent).toBe(true);
+    expect(sawMessageBoundary).toBe(false);
+    expect(texts.map(({ text }) => text)).toEqual(["I can help."]);
+    expect(progress).toEqual([]);
+    expect(finalizes).toEqual([]);
+  });
+
   it("stamps access.commands.authorized=true ONLY for controlLane turns", async () => {
     const { api, captured } = makeFakeApi({
       streamingMode: "off",
