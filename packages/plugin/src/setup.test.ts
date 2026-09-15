@@ -377,6 +377,17 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     return { log: vi.fn() };
   }
 
+  it.each([{ Acme: {} }, { Acme: {}, acme: {} }])("refuses canonical-only or colliding write targets before reading credentials", async (accounts) => {
+    const cfg = { channels: { webchannel: { accounts } } } as never;
+    const runtime = makeRuntime();
+    await webchannelSetup.afterAccountConfigWritten({
+      previousCfg: cfg, cfg, accountId: "acme", input: {}, runtime,
+    });
+    expect(runtime.log).toHaveBeenCalledWith(expect.stringContaining("no exact valid written account"));
+    expect(readMock).not.toHaveBeenCalled();
+    expect(acquireMock).not.toHaveBeenCalled();
+  });
+
   it.each([42, "relative/state"])(
     "contains invalid storageRoot %j as an account-scoped setup diagnostic",
     async (storageRoot) => {

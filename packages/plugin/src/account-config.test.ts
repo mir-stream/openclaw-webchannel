@@ -695,9 +695,9 @@ describe("account-config: resolveWebchannelAccountConfig (base merge)", () => {
     expect(acct.accounts).toBeUndefined();
   });
 
-  it("returns base for a missing named account (inherits shared base only)", () => {
+  it("returns no account data for a missing named read target", () => {
     const cfg = { channels: { webchannel: { auth: { strategy: "jwt" }, accounts: { acctA: {} } } } };
-    expect(resolveWebchannelAccountConfig(cfg, "nope")).toEqual({ auth: { strategy: "jwt" } });
+    expect(resolveWebchannelAccountConfig(cfg, "nope")).toEqual({});
   });
 });
 

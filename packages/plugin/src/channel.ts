@@ -20,10 +20,8 @@ import {
   hasWebchannelConfig,
   inspectWebchannelAccountIds,
   isWebchannelAccountEnabled,
-  listWebchannelAccountIds,
-  readAccountsMap,
-  readWebchannelSection,
   resolveDefaultWebchannelAccountId,
+  resolveWebchannelAccountId,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { webchannelSetup } from "./setup.js";
@@ -34,10 +32,8 @@ import {
   type WebchannelProbe,
 } from "./doctor.js";
 
-// Single default account id for Phase 1. `listAccountIds` MUST return ≥1 entry
-// and the plugin MUST expose `gateway.startAccount`, otherwise core's channel
-// monitor (`startChannelInternal`) short-circuits and never starts the native
-// approval bootstrap (verified at 2026.7.1-2). We
+// The plugin exposes `gateway.startAccount` so core's channel monitor can start
+// the native approval bootstrap for each valid listed account. We
 // register the `approval.native` runtime context from that monitor; see
 // startClawApprovalMonitor in src/approvals.ts.
 //
@@ -86,15 +82,12 @@ function resolveAccount(
   cfg: OpenClawConfig,
   accountId?: string | null,
 ): ResolvedAccount {
-  // 가-1: account-aware resolution. A flat (legacy single-account) config is
-  // treated as the `"default"` account; a per-account config resolves the named
-  // account's leaf fields. `resolveWebchannelAccountConfig` owns the shape
-  // detection so a single-account deployment is a regression-free pass-through.
-  const id = accountId ?? resolveDefaultWebchannelAccountId(cfg);
-  const account = resolveWebchannelAccountConfig(cfg, id);
+  const id = resolveWebchannelAccountId(cfg, accountId);
+  const account = resolveWebchannelAccountConfig(cfg, accountId);
   return {
-    accountId: id,
-    enabled: isWebchannelAccountEnabled(cfg, id),
+    // An unresolved request remains visible but carries no usable account data.
+    accountId: id ?? accountId ?? resolveDefaultWebchannelAccountId(cfg),
+    enabled: isWebchannelAccountEnabled(cfg, accountId),
     allowFrom: (account.allowFrom as string[] | undefined) ?? [],
     dmPolicy: account.dmSecurity as string | undefined,
   };
@@ -104,19 +97,7 @@ function isWebchannelAccountConfigured(
   cfg: OpenClawConfig,
   accountId?: string | null,
 ): boolean {
-  const section = readWebchannelSection(cfg);
-  if (!section || !hasWebchannelConfig(cfg)) return false;
-
-  const id = accountId ?? resolveDefaultWebchannelAccountId(cfg);
-  const accounts = readAccountsMap(section);
-  if (Object.keys(accounts).length > 0) {
-    return listWebchannelAccountIds(cfg).includes(id);
-  }
-
-  // Flat configuration represents only the implicit default account. Structural
-  // keys alone do not configure that account, and must not configure arbitrary
-  // account ids synthesized by a caller.
-  return id === DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+  return hasWebchannelConfig(cfg) && resolveWebchannelAccountId(cfg, accountId) !== undefined;
 }
 
 /**
@@ -213,7 +194,8 @@ export function createWebChannelPlugin(
         inspectAccount: (cfg: OpenClawConfig, accountId?: string | null) => {
           const configured = isWebchannelAccountConfigured(cfg, accountId);
           return {
-            enabled: isWebchannelAccountEnabled(cfg, accountId ?? resolveDefaultWebchannelAccountId(cfg)),
+            accountId: resolveWebchannelAccountId(cfg, accountId) ?? accountId ?? resolveDefaultWebchannelAccountId(cfg),
+            enabled: isWebchannelAccountEnabled(cfg, accountId),
             configured,
             tokenStatus: configured ? "available" : "missing",
           };

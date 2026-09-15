@@ -199,11 +199,11 @@ describe("webchannel plugin", () => {
     expect(plugin.config.isConfigured!(account, cfg)).toBe(true);
 
     const ghost = plugin.config.resolveAccount(cfg, "ghost");
-    expect(ghost.enabled).toBe(true);
-    expect(plugin.config.isEnabled!(ghost, cfg)).toBe(true);
+    expect(ghost.enabled).toBe(false);
+    expect(plugin.config.isEnabled!(ghost, cfg)).toBe(false);
     expect(plugin.config.isConfigured!(ghost, cfg)).toBe(false);
     expect(plugin.config.inspectAccount!(cfg, "ghost")).toMatchObject({
-      enabled: true,
+      enabled: false,
       configured: false,
       tokenStatus: "missing",
     });
@@ -304,11 +304,11 @@ describe("webchannel plugin", () => {
     }
 
     const ghost = plugin.config.resolveAccount(cfg, "ghost");
-    expect(ghost.enabled).toBe(true);
-    expect(plugin.config.isEnabled!(ghost, cfg)).toBe(true);
+    expect(ghost.enabled).toBe(false);
+    expect(plugin.config.isEnabled!(ghost, cfg)).toBe(false);
     expect(plugin.config.isConfigured!(ghost, cfg)).toBe(false);
     expect(plugin.config.inspectAccount!(cfg, "ghost")).toMatchObject({
-      enabled: true,
+      enabled: false,
       configured: false,
     });
 
