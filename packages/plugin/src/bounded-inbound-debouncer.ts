@@ -146,7 +146,7 @@ export function createBoundedInboundDebouncer<Item>(
       retired: boolean;
       cancellationSettled?: Promise<void>;
       resolveCancellation?: () => void;
-      releaseCancellationHold?: () => void;
+      releaseIndexedHold?: () => void;
     }
   >();
   const runningCallbacks = new Map<
@@ -217,14 +217,12 @@ export function createBoundedInboundDebouncer<Item>(
       // drops its indexes. Cancellation/retirement always requests release.
       const requestRelease = owner !== "flush" || entry.reservation.owner !== "pending";
       releaseEntry(key, entry, requestRelease);
-      if (owner === "cancel" || owner === "retire") {
-        // A cancellation callback that already began may have copied the entry.
-        // Its pre-acquired hold remains the physical-retention charge until that
-        // callback settles. A queued callback that never began is severable.
-        if (owner === "cancel" || !state?.cancellationCallbackRunning) {
-          state?.releaseCancellationHold?.();
-          if (state) state.releaseCancellationHold = undefined;
-        }
+      // Index removal returns its hold unless a started cancellation callback
+      // still owns copies. Retirement may let the flush unwind before that
+      // callback, so *any* settling owner must preserve its hold until it ends.
+      if (!state?.cancellationCallbackRunning) {
+        state?.releaseIndexedHold?.();
+        if (state) state.releaseIndexedHold = undefined;
       }
       if (validId(entry.id) && entry.dedupeKey !== undefined) {
         inflightIds.delete(correlationKey(key, entry.dedupeKey, entry.id));
@@ -340,14 +338,15 @@ export function createBoundedInboundDebouncer<Item>(
     });
   };
 
-  const clearCapturedBatches = (key: string) => {
+  const clearCapturedBatches = (key: string, retireRunning = true) => {
     const chain = chains.get(key);
     if (!chain) return;
     // The one currently executing callback cannot be aborted, but its explicit
     // reservation holds keep every possibly copied entry charged. Clearing its
-    // caller-owned array removes one reference; queued batches that never began
-    // are removed wholesale without per-generation Promise continuations.
-    if (chain.running) chain.running.entries.length = 0;
+    // caller-owned array on retirement removes one reference. Queued batches
+    // cannot start after any generation cancellation: sever them before their
+    // cancellation owner settles and releases the charge for those captures.
+    if (retireRunning && chain.running) chain.running.entries.length = 0;
     for (const batch of chain.queued) batch.entries.length = 0;
     chain.queued.length = 0;
   };
@@ -475,12 +474,18 @@ export function createBoundedInboundDebouncer<Item>(
       retired: boolean;
       cancellationSettled?: Promise<void>;
       resolveCancellation?: () => void;
-      releaseCancellationHold?: () => void;
+      releaseIndexedHold?: () => void;
     } = {
       cancellationRequested: false,
       cancellationPending: false,
       cancellationCallbackRunning: false,
       retired: false,
+      // Acquire before publishing into waiting/inflight indexes, while the
+      // reservation is open. A flush/dispatcher may request release while this
+      // entry is still indexed; /stop must already own the hold it will use for
+      // async suppression and delivery. Normal settlement returns it on index
+      // removal; cancellation transfers it through its callback's settlement.
+      releaseIndexedHold: result.reservation.hold(),
     };
     const entry: RetainedDebounceEntry<Item> = {
       item,
@@ -525,6 +530,7 @@ export function createBoundedInboundDebouncer<Item>(
     // Invalidate the whole old key generation before either cancellation
     // persistence or a stalled normal continuation can resume.
     bumpGeneration(key);
+    clearCapturedBatches(key, retireInflight);
 
     if (cancelOptions?.notify && options.onCancel) {
       for (const entry of newlyCancelled) {
@@ -532,10 +538,9 @@ export function createBoundedInboundDebouncer<Item>(
         if (state) {
           state.cancellationRequested = true;
           state.cancellationPending = true;
-          // Pin before returning from cancelKey; `/stop` immediately calls the
-          // dispatcher clear path, whose release request must remain charged
-          // until this entry's async suppression + ACK settles.
-          state.releaseCancellationHold ??= entry.reservation.hold();
+          // The index already owns the hold, even if onFlush requested release.
+          // Transfer it to cancellation without reacquiring: a failed hold here
+          // would leave earlier cancellation promises without a scheduled owner.
           state.cancellationSettled ??= new Promise<void>((resolve) => {
             state.resolveCancellation = resolve;
           });
@@ -588,7 +593,6 @@ export function createBoundedInboundDebouncer<Item>(
     } else {
       settleEntries(key, newlyCancelled, retireInflight ? "retire" : "cancel");
       if (retireInflight) {
-        clearCapturedBatches(key);
         clearQueuedCancellationBatches(key);
       }
     }

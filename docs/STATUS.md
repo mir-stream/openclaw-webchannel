@@ -1,5 +1,12 @@
 # Project Status — single source of truth
 
+Round 5 (#382): `/stop` can cancel batches containing retained terminal replays
+while a later outcome lookup or write is pending. Indexed entries acquire their
+cancellation hold before any release request; running callbacks stay charged
+until settlement, and cancelled generations sever queued batch captures. The
+committed replay row keeps its identity, cancellation suppresses fresh work,
+and subsequent ingress proceeds after ownership settles.
+
 Round 4 (#286): snapshots and history pages use an incrementally maintained SQLite
 read model. The raw journal remains authoritative; canonical reducer rows,
 positions, tombstones and metadata are committed with their checkpoint. Cold
