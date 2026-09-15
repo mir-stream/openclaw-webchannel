@@ -14,6 +14,10 @@ import { openEnvelope } from "./e2e-session.js";
 import { createClawMessageAdapter, createReasoningDraftController } from "./message-adapter.js";
 import { NatsChannel } from "./nats-channel.js";
 import type { NatsTransport } from "./nats-transport.js";
+import { reduceDurableView } from "../../client/src/durable-view-reducer.js";
+import type { JournalEvent } from "./delivery-journal-event.js";
+import { journalEventForOutbound } from "./delivery-journal-event.js";
+import type { OutboundWsMessage } from "./channel-contract.js";
 
 const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
 const cleanup: Array<() => void> = [];
@@ -44,6 +48,111 @@ function setup(options?: { encrypted?: boolean; reasoningDurable?: boolean }) {
   const fail = () => db.exec("CREATE TRIGGER fail_write BEFORE INSERT ON journal_event BEGIN SELECT RAISE(ABORT, 'injected failure'); END");
   return { journal, db, transport, channel, draft, history, fail, key, databasePath };
 }
+
+it("#262: compensating final dedupe cannot overwrite either independently streamed answer ID", async () => {
+  const { draft, channel, journal, history, transport, key } = setup({ encrypted: true });
+  const finals = vi.spyOn(channel, "finalizeDraft");
+  const snapshots = vi.spyOn(channel, "sendTurnSnapshot");
+  draft.pushAnswerText({ text: "Repeated answer" });
+  await draft.flush();
+  draft.handleAssistantMessageBoundary();
+  draft.pushAnswerText({ text: "Repeated answer" });
+  await draft.flush();
+  draft.handleAssistantMessageBoundary(); // B acquires text only at core message-end.
+  draft.handleAssistantMessageBoundary(); // Textless terminal message prevents collapse.
+  const authoredIds = finals.mock.calls.map((args) => args[1]);
+  expect(new Set(authoredIds).size).toBe(2);
+  // Reachability: embedded message-end does not invoke onPartialReply, and the
+  // dispatcher dedupes [A,A,B] to [A,B] before calling channel delivery.
+  expect(await draft.finalize("Repeated answer")).toBe(true);
+  expect(await draft.finalize("New final-only answer")).toBe(true);
+  await draft.drain();
+  draft.stop();
+  expect(snapshots.mock.calls.at(-1)![2]).toContainEqual({ id: authoredIds[1], text: "Repeated answer" });
+  for (const id of authoredIds) {
+    expect(finals.mock.calls.filter((args) => args[1] === id).map((args) => args[2])).toEqual(["Repeated answer"]);
+    expect(snapshots.mock.calls.at(-1)![2]).toContainEqual({ id, text: "Repeated answer" });
+    expect(history()).toContainEqual(expect.objectContaining({ id, text: "Repeated answer" }));
+  }
+  const finalOnlyId = finals.mock.calls.find((args) => args[2] === "New final-only answer")![1];
+  expect(authoredIds).not.toContain(finalOnlyId);
+  expect(history()).toContainEqual(expect.objectContaining({ id: finalOnlyId, text: "New final-only answer" }));
+  const events = journal.read("peer", { afterSeq: 0, limit: 100 }).map(({ event }) => event);
+  expect(events.every((event) => ["placement", "bubble", "seal"].includes(event.kind))).toBe(true);
+  const view = reduceDurableView(events as JournalEvent[]);
+  expect(view.filter((entry) => entry.kind === "text").map(({ id, text }) => ({ id, text })))
+    .toEqual(history().map((entry) => ({ id: entry.id, text: "text" in entry ? entry.text : undefined })));
+  for (const id of authoredIds) expect(view.find((entry) => entry.id === id)).toMatchObject({ text: "Repeated answer" });
+  expect(view.find((entry) => entry.id === finalOnlyId)).toMatchObject({ text: "New final-only answer" });
+  const liveEvents = transport.publish.mock.calls
+    .map((call) => journalEventForOutbound(openEnvelope(call[1] as Uint8Array, key).message as OutboundWsMessage))
+    .filter((event): event is JournalEvent => event !== null);
+  expect(reduceDurableView(liveEvents)).toEqual(view);
+  const tasks: Array<() => void> = [];
+  const server = createHistoryServer({ journal, channel, config: DEFAULT_HISTORY_CONFIG, schedule: (fn) => { tasks.push(fn); } });
+  server.serveDifference("peer", 0, "identity-difference");
+  for (const task of tasks.splice(0)) task();
+  const difference = openEnvelope(transport.publish.mock.calls.at(-1)![1] as Uint8Array, key).message as OutboundWsMessage;
+  expect(difference).toMatchObject({ type: "difference", nonce: "identity-difference" });
+  if (difference.type !== "difference") throw new Error("expected difference frame");
+  expect(reduceDurableView(difference.events.map(({ event }) => event))).toEqual(view);
+});
+
+it.each([false, true])("#262: buffered finals retain delivery order after a rejected head (persistent=%s)", async (persistent) => {
+  const { draft, channel, journal, db, fail, history, transport, key } = setup({ encrypted: true });
+  const finals = vi.spyOn(channel, "finalizeDraft");
+  for (const text of ["A", "B"]) {
+    draft.pushAnswerText({ text });
+    await draft.flush();
+    draft.handleAssistantMessageBoundary();
+  }
+  expect(await draft.finalize("A-full")).toBe(true);
+  expect(await draft.finalize("B-full")).toBe(true);
+  let rejectHead = true;
+  const append = journal.append.bind(journal);
+  vi.spyOn(journal, "append").mockImplementation((...args) => {
+    if (!rejectHead || args[1].kind !== "bubble" || args[1].text !== "A-full") return append(...args);
+    if (!persistent) rejectHead = false;
+    fail();
+    try { return append(...args); }
+    finally { db.exec("DROP TRIGGER fail_write"); }
+  });
+
+  await draft.drain();
+  const headAttempts = () => finals.mock.calls.filter((args) => args[2] === "A-full");
+  const suffixAttempts = () => finals.mock.calls.filter((args) => args[2] === "B-full");
+  const headId = headAttempts()[0]![1];
+  expect(headAttempts()).toHaveLength(2);
+  if (persistent) {
+    expect(draft.deliveryFailed).toBe(true);
+    expect(history().map((message) => "text" in message ? message.text : undefined)).toEqual(["A", "B"]);
+    expect(suffixAttempts()).toEqual([]);
+    await draft.drain();
+    expect(draft.deliveryFailed).toBe(true);
+    expect(headAttempts()).toHaveLength(3);
+    expect(suffixAttempts()).toEqual([]);
+    rejectHead = false;
+    await draft.drain();
+  }
+
+  expect(draft.deliveryFailed).toBe(false);
+  expect(history().map((message) => "text" in message ? message.text : undefined)).toEqual(["A", "B", "A-full", "B-full"]);
+  expect(new Set(headAttempts().map((args) => args[1]))).toEqual(new Set([headId]));
+  expect(suffixAttempts()).toHaveLength(1);
+  expect(suffixAttempts()[0]![1]).not.toBe(headId);
+  const finalCalls = [...finals.mock.calls];
+  await draft.drain();
+  draft.stop();
+  draft.stop();
+  expect(finals.mock.calls).toEqual(finalCalls);
+  const events = journal.read("peer", { afterSeq: 0, limit: 100 }).map(({ event }) => event);
+  expect(events.filter((event) => event.kind === "bubble")).toHaveLength(4);
+  const liveEvents = transport.publish.mock.calls
+    .map((call) => journalEventForOutbound(openEnvelope(call[1] as Uint8Array, key).message as OutboundWsMessage))
+    .filter((event): event is JournalEvent => event !== null);
+  expect(reduceDurableView(liveEvents)).toEqual(reduceDurableView(events as JournalEvent[]));
+  expect(reduceDurableView(liveEvents).map((entry) => "text" in entry ? entry.text : undefined)).toEqual(["A", "B", "A-full", "B-full"]);
+});
 
 it.each([false, true])("stores an authored final during relay loss (streamed=%s) with one history identity", async (streamed) => {
   const { transport, draft, history, journal } = setup();
@@ -292,6 +401,55 @@ it.each([false, true])("one reasoning stop retries its newly rejected close once
     reasoning.stop();
     expect(attempts.mock.calls).toEqual([closeArgs, closeArgs]);
   }
+});
+
+it.each(["Check the file.", "Check the file. Then run tests."])(
+  "#373: independent native reasoning survives close storage retry without prefix loss: %s",
+  (secondText) => {
+    const { channel, journal, fail, db, history } = setup({ reasoningDurable: true });
+    const reasoning = createReasoningDraftController({ transport: channel, sessionKey: "peer", turnId: "turn" });
+    const attempts = vi.spyOn(channel, "sendReasoning");
+    reasoning.startRun("native");
+    reasoning.startMessage();
+    reasoning.push({ text: "Check the file." });
+    fail();
+    reasoning.endBurst(); // The first message's rejected close keeps its ID/text.
+    reasoning.startMessage();
+    reasoning.push({ text: secondText });
+    reasoning.stop(); // First close failure for message 2 arises inside stop.
+    const pending = attempts.mock.calls.filter((args) => args[4] === true);
+    expect(new Set(pending.map((args) => args[1])).size).toBe(2);
+    expect(reasoning.deliveryFailed).toBe(true);
+    expect(journal.maxSeq("peer")).toBe(0);
+    db.exec("DROP TRIGGER fail_write");
+    attempts.mockClear();
+    reasoning.stop();
+    reasoning.stop();
+    expect(reasoning.deliveryFailed).toBe(false);
+    expect(attempts.mock.calls).toEqual([pending[0], pending.find((args) => args[1] !== pending[0][1])]);
+    const expected = [{ id: attempts.mock.calls[0][1], text: "Check the file." }, { id: attempts.mock.calls[1][1], text: secondText }];
+    expect(history().map((entry) => ({ id: entry.id, text: "text" in entry ? entry.text : undefined }))).toEqual(expected);
+    const events = journal.read("peer", { afterSeq: 0, limit: 100 }).map(({ event }) => event);
+    expect(events.every((event) => event.kind === "reasoning")).toBe(true);
+    expect(reduceDurableView(events as JournalEvent[]).map((entry) => ({ id: entry.id, text: "text" in entry ? entry.text : undefined }))).toEqual(expected);
+  },
+);
+
+it.each([false, true])("#373: native repeated reasoning keeps the same live policy and durable opt-in (durable=%s)", (durable) => {
+  const { channel, journal, history } = setup({ reasoningDurable: durable });
+  const reasoning = createReasoningDraftController({ transport: channel, sessionKey: "peer", turnId: "turn" });
+  const attempts = vi.spyOn(channel, "sendReasoning");
+  for (const text of ["Check the file.", "Check the file."]) {
+    reasoning.startMessage();
+    reasoning.push({ text });
+    reasoning.endBurst();
+  }
+  reasoning.stop();
+  const finals = attempts.mock.calls.filter((args) => args[4] === true);
+  expect(finals.map((args) => args[3])).toEqual(["Check the file.", "Check the file."]);
+  expect(new Set(finals.map((args) => args[1])).size).toBe(2);
+  expect(history()).toHaveLength(durable ? 2 : 0);
+  expect(journal.read("peer", { afterSeq: 0, limit: 100 })).toHaveLength(durable ? 2 : 0);
 });
 
 it("reasoning stop retries older pending output first and bounds attempts for its new close", () => {

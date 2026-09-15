@@ -1266,6 +1266,7 @@ export async function handleInboundMessage(
                     // this far is a real agent run and claims too — as
                     // `presence`, so it is recorded but never selectable.
                     onAgentRunStart: (runId) => {
+                      reasoning?.startRun(runId);
                       agentRunId = runId;
                       agentRunIds.add(runId);
                       if (
@@ -1330,6 +1331,17 @@ export async function handleInboundMessage(
                           | "onReasoningEnd"
                         >)
                       : {}),
+                    // Native reasoning resets per assistant message, independently
+                    // of answer streaming mode. Both controllers receive the same
+                    // public boundary, before that message's partial callbacks.
+                    ...(reasoning || (draft && answerStreamingEnabled)
+                      ? ({
+                          onAssistantMessageStart: () => {
+                            reasoning?.startMessage();
+                            if (draft && answerStreamingEnabled) draft.handleAssistantMessageBoundary();
+                          },
+                        } satisfies Pick<GetReplyOptions, "onAssistantMessageStart">)
+                      : {}),
                     // Progress-draft callbacks (only when a draft exists, i.e.
                     // streaming.mode "progress"/"partial"). These fire DURING the
                     // agent run and feed the rolling draft. We also set
@@ -1380,12 +1392,6 @@ export async function handleInboundMessage(
                                     replace: p.replace,
                                   });
                                 },
-                                onAssistantMessageStart: () => {
-                                  // Core fires this before that message's first
-                                  // chunk, and the two callbacks share one FIFO,
-                                  // so neither can overtake the other.
-                                  draft!.handleAssistantMessageBoundary();
-                                },
                                 onBlockReplyQueued: (payload, context) => {
                                   // Durable reasoning belongs exclusively to the
                                   // reasoning lane. Letting it reserve an answer
@@ -1406,7 +1412,6 @@ export async function handleInboundMessage(
                           | "onToolStart"
                           | "onItemEvent"
                           | "onPartialReply"
-                          | "onAssistantMessageStart"
                           | "onBlockReplyQueued"
                         >)
                       : {}),

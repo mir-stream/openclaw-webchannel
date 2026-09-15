@@ -294,22 +294,10 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(successfulIds(h.frames)).toHaveLength(3);
   });
 
-  // #173 — collapse-aware final routing. Which lane an ordinary final belongs to
-  // depends on the LAST assistant message, per the verified core contract
-  // (payloads-1r4oLFNi.js:335/:424/:426): a text-bearing last message COLLAPSES
-  // to exactly one final (the last message's text); a tool-only last message
-  // emits one final per text-bearing message, in order. Tool-only messages still
-  // fire `onAssistantMessageStart`, so in the tool-only shape `currentLane()` at
-  // finalize time is the TEXTLESS tool lane — the reason the old
-  // `finalize`→`currentLane()` produced [A,A,B].
-  //
-  // When the current lane is textless AND text-bearing lanes exist, the shape is
-  // undecidable until the turn ends: the collapse-with-nonstreaming-last shape
-  // (K==1 → the final is the current lane's own text, e.g. M15a/M15b) is
-  // byte-identical at finalize time to the tool-only-last #173 shape (K>=2 → one
-  // final per text-bearing lane). Only the drain-time COUNT separates them, so
-  // those finals are BUFFERED and resolved at drain.
-  it("M173a: tool-only last message — two finals settle each text lane's own bubble in order [A][B] at drain", async () => {
+  // #262 removes the old count-based pairing that these fixtures once required.
+  // The same topologies now assert closed-draft preservation and full final
+  // delivery under independent IDs; only an owned current draft is updated.
+  it("M173a: tool-only last message — two unclaimed finals retain closed drafts and receive independent IDs", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary(); // first boundary: no-op
     h.draft.pushAnswerText({ text: "first ans" }); // lane A (gen 0)
@@ -331,18 +319,17 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     );
     expect(finalsBeforeDrain).toEqual([]);
 
-    // Drain knows K==2 → the #173 fallback: final#i → i-th text-bearing lane.
+    // Drain delivers both acts in order without selecting a past lane.
     await h.draft.drain();
 
     expect(idA).not.toBe(idB);
-    // Every final landed on a text lane's OWN id — no third (independent) bubble.
-    expect(successfulIds(h.frames)).toEqual([idA, idB]);
-    // The authoritative final tops up each lane's own bubble in order → [A][B].
-    const finalsById = (id: string) =>
-      h.frames.filter((frame) => frame.type === "final" && frame.id === id).map((f) => f.text);
-    expect(finalsById(idA)).toEqual(["first ans", "first answer"]);
-    expect(finalsById(idB)).toEqual(["second ans", "second answer"]);
-    expect(bubbleOrder(h.frames)).toEqual(["first answer", "second answer"]);
+    const independent = h.frames.filter((frame) => frame.type === "final" && frame.id !== idA && frame.id !== idB);
+    expect(independent.map((frame) => frame.text)).toEqual(["first answer", "second answer"]);
+    expect(new Set(independent.map((frame) => frame.id)).size).toBe(2);
+    const finalsById = (id: string) => h.frames.filter((frame) => frame.type === "final" && frame.id === id).map((f) => f.text);
+    expect(finalsById(idA)).toEqual(["first ans"]);
+    expect(finalsById(idB)).toEqual(["second ans"]);
+    expect(bubbleOrder(h.frames)).toEqual(["first ans", "second ans", "first answer", "second answer"]);
   });
 
   it("M173b: text-bearing last message (collapse) — the single final settles the current lane IMMEDIATELY; earlier lanes keep their streamed text", async () => {
@@ -370,11 +357,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(successfulIds(h.frames)).toHaveLength(3);
   });
 
-  it("M173c: collapse whose last message streamed no partial — single buffered final settles the current lane at drain [A][B][C]", async () => {
-    // Real core shape (same as M15a/M15b): A and B stream; the LAST message C has
-    // text but streams no partial, so its lane is textless at finalize time. Core
-    // collapses to ONE final = C's text. K==1 at drain → the final is the current
-    // (textless) lane's own text → C gets its own bubble.
+  it("M173c: collapse whose last message streamed no partial — the buffered final receives an independent delivery ID at drain [A][B][C]", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
     h.draft.pushAnswerText({ text: "message A" });
@@ -393,20 +376,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(successfulIds(h.frames)).toHaveLength(3);
   });
 
-  it("M173d (Case X): a single streamed answer then a tool-only last message tops up the tool lane", async () => {
-    // [one text answer A, then a tool-only LAST message] collapses to K==1 with a
-    // textless current lane (the tool lane), so the lone final tops up that tool
-    // lane rather than lane A. This matches prior behaviour and is NOT a
-    // regression (the old keyframe never touched a one-text-lane turn either).
-    //
-    // It is left alone ON PURPOSE, and not because anything upstream forbids a
-    // fix: at this seam the shape is byte-identical to the legitimate
-    // non-streaming-last collapse (M173c/M15a/M15b), so there is nothing to
-    // distinguish "the final belongs to A" from "the final is the last message's
-    // own text" without guessing. The flush's cursor does not guess — it settles
-    // the current draft (plan §16.5.3 Q3: no retroactive attribution, and none
-    // needed) — and the snapshot leaves this bubble untouched rather than
-    // deleting it (M212b). This test pins the behaviour so a change is deliberate.
+  it("M173d (Case X): a final after a textless boundary owns a new delivery ID", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
     h.draft.pushAnswerText({ text: "the ans" }); // lane A (gen 0), the only text lane
@@ -417,36 +387,13 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     await expect(h.draft.finalize("the answer")).resolves.toBe(true); // buffered
     await h.draft.drain();
 
-    // K==1 → the final tops up the current (tool) lane, a SEPARATE bubble from A.
+    // The final's own delivery act creates a separate bubble from A.
     const idTool = h.frames.find((frame) => frame.text === "the answer")!.id;
     expect(idTool).not.toBe(idA);
     expect(bubbleOrder(h.frames)).toEqual(["the ans", "the answer"]);
   });
 
-  it("M173e (#238): K>=2 mid-lane materialization failure — the cursor keeps step, every final lands on its OWN lane", async () => {
-    // Topology A,B,C (all text) + a tool-only LAST message; B's frames drop on a
-    // transient wire failure so B never materializes. Core emits finals [tA,tB,tC]
-    // as an ORDERED array (`[core] dispatch-from-config.ts:3886`, loop at `:3910`).
-    //
-    // This is the EXACT-CORRELATION case: three finals, three streamed lanes. So
-    // the candidate list widens to `streamedAnswerLanes()` and the forward-only
-    // cursor keeps step with core's array, each final settling the lane that
-    // actually streamed its prefix.
-    //
-    // This fixture used to pin the OPPOSITE: with `materializedAnswerLanes()` as
-    // the candidate list, B fell out ([A,C]) and every later index skewed — tB
-    // landed on C (corrupting a lane that had produced its own text) and tC
-    // overflowed to a stray bubble. That was never a core limitation; it was
-    // order we discarded ourselves (plan §16.5.3).
-    //
-    // Contrast M238d, where the counts do NOT agree: there the widening is
-    // withheld, precisely because a mis-routed final landing on a streamed lane
-    // gets overwritten by the snapshot.
-    //
-    // B's bubble is BORN HERE, at drain: its earlier frames all failed, so it
-    // owned no wire id and the final is its first successful send. That is why it
-    // arrives LAST on the wire — and why the ordered `turn_snapshot` below, not
-    // arrival order, is what the client renders (M212a).
+  it("M173e (#238): mid-lane refusal does not let later finals replace an accepted draft", async () => {
     const h = makeDraftHarness({
       // Fail every frame carrying B's text (progress AND final) so lane B never
       // materializes, modelling a mid-sequence transient publish failure.
@@ -473,42 +420,17 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     await expect(h.draft.finalize("tC")).resolves.toBe(true); // buffered
     await h.draft.drain();
 
-    // tA → A and tC → C, each on its OWN id. No lane is overwritten with another
-    // message's text, and there is no overflow at all.
-    const lastFinalOn = (id: string) =>
-      h.frames.filter((frame) => frame.type === "final" && frame.id === id).at(-1)!.text;
-    expect(lastFinalOn(idA)).toBe("tA");
-    expect(lastFinalOn(idC)).toBe("tC");
-    // tB reaches the wire on a THIRD id — lane B's own, minted by this first
-    // successful send. Under the old candidate list B's content never shipped as a
-    // frame at all; here it does.
-    const tbFrame = h.frames.find((frame) => frame.text === "tB")!;
-    expect(tbFrame.id).not.toBe(idA);
-    expect(tbFrame.id).not.toBe(idC);
-    // Arrival order is [tA][tC][tB] because B had no slot to claim until now. The
-    // snapshot is what fixes the render (M212a); pinned here so the asymmetry
-    // between wire order and snapshot order stays a deliberate, visible fact.
-    expect(bubbleOrder(h.frames)).toEqual(["tA", "tC", "tB"]);
+    const lastFinalOn = (id: string) => h.frames.filter((frame) => frame.type === "final" && frame.id === id).at(-1)!.text;
+    expect(lastFinalOn(idA)).toBe("A");
+    expect(lastFinalOn(idC)).toBe("C");
+    const independent = h.frames.filter((frame) => frame.type === "final" && frame.id !== idA && frame.id !== idC);
+    expect(independent.map((frame) => frame.text)).toEqual(["tA", "tB", "tC"]);
+    expect(new Set(independent.map((frame) => frame.id)).size).toBe(3);
+    expect(bubbleOrder(h.frames)).toEqual(["A", "C", "tA", "tB", "tC"]);
   });
 
-  // #212 (Phase 3, targeted) — the authoritative `turn_snapshot` emitted at drain.
-  // These ADD snapshot assertions on the #215 shapes; the existing frame-level
-  // assertions above (M173a-e) are deliberately left unchanged.
-  it("M212a (#238): mid-lane K>=2 — the snapshot carries each lane's AUTHORITATIVE final in order, and removes nothing", async () => {
-    // Same topology as M173e: A,B,C all stream; B's frames all fail (never
-    // materializes); tool-only last. Finals [tA,tB,tC].
-    //
-    // Before #238 the finals mis-routed (tB→C, tC→a stray bubble) and this
-    // fixture's job was DAMAGE CONTROL: republish the streamed [A][B][C] and name
-    // the stray in `remove`. Both halves of that are now obsolete. The cursor
-    // routes every final correctly, so:
-    //   - the snapshot carries each lane's FULL final text (tA/tB/tC), not the
-    //     truncated last partial — `exactCorrelation` holds (3 finals,
-    //     3 streamed candidates), so each final is authoritative for its own lane;
-    //   - there is no overflow bubble, so `remove` is empty. That matters beyond
-    //     tidiness: the old `remove` entry pointed at tC, whose text existed
-    //     NOWHERE in `answers` (they carried the streamed prefixes), so the client
-    //     was being told to delete unique content.
+  // Snapshot checks preserve both accepted draft content and full final tails.
+  it("M212a (#238): mid-lane refusal — snapshot and history preserve accepted drafts and all full finals", async () => {
     const h = makeDraftHarness({ decide: (attempt) => attempt.text !== "B" });
     h.draft.handleAssistantMessageBoundary();
     h.draft.pushAnswerText({ text: "A" });
@@ -532,30 +454,16 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(h.snapshots).toHaveLength(1);
     const snap = h.snapshots[0];
     expect(snap.turnId).toBe("turn-1");
-    // Authoritative final text per lane, in GENERATION order — which is also the
-    // repair for M173e's [tA][tC][tB] arrival order.
-    expect(snap.answers.map((a) => a.text)).toEqual(["tA", "tB", "tC"]);
-    // A and C keep their materialized ids; B's id is the one its drain-time final
-    // minted, and it is a real wire id the client already has a bubble for.
-    expect(snap.answers[0].id).toBe(idA);
-    expect(snap.answers[2].id).toBe(idC);
-    const tbId = h.frames.find((frame) => frame.text === "tB")!.id;
-    expect(snap.answers[1].id).toBe(tbId);
-    // Nothing to remove: every final found its own lane, so no bubble duplicates
-    // another and no unique content is deleted.
+    expect(snap.answers).toEqual([{ id: idA, text: "A" }, { id: idC, text: "C" }]);
     expect(snap.remove).toEqual([]);
+    const view = reduceDurableView(journalFor(h));
+    expect(view.map((entry) => entry.kind === "text" ? entry.text : entry.kind)).toEqual(["A", "C", "tA", "tB", "tC"]);
+    expect(view.find((entry) => entry.id === idA)).toMatchObject({ text: "A" });
+    expect(view.find((entry) => entry.id === idC)).toMatchObject({ text: "C" });
+    expect(view.some((entry) => entry.kind === "text" && entry.text === "B")).toBe(false);
   });
 
-  it("M212a2 (P3-F1): clean K>=2 tool-only-last — the snapshot carries each lane's FULL authoritative final, not the truncated partial", async () => {
-    // The provably-sound K>=2 shape (M173a at the frame level): A and B both
-    // stream AND materialize, then a tool-only LAST message leaves the current
-    // lane textless. Core buffers finals [tA,tB] and drain pairs them one-to-one
-    // onto [A,B] — no overflow, every text lane streamed, so the routing is
-    // certain. Each final's tail therefore belongs to its lane and the snapshot
-    // MUST show the FULL final text ("first answer"/"second answer"), NOT the last
-    // streamed partial ("first ans"/"second ans"). Before P3-F1 the buffered path
-    // left `answerText` non-authoritative on THIS sound path too, so the snapshot
-    // collapsed each lane back to its partial (a truncated tail on reload).
+  it("M212a2 (P3-F1): equal counts — full final tails survive separately through the snapshot and reducer", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary(); // first boundary: no-op
     h.draft.pushAnswerText({ text: "first ans" }); // lane A (gen 0), streams + materializes
@@ -574,19 +482,19 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(idA).not.toBe(idB);
     expect(h.snapshots).toHaveLength(1);
     const snap = h.snapshots[0];
-    // The full, correctly-routed final for each streamed lane — no truncation.
     expect(snap.answers).toEqual([
-      { id: idA, text: "first answer" },
-      { id: idB, text: "second answer" },
+      { id: idA, text: "first ans" },
+      { id: idB, text: "second ans" },
     ]);
-    // One-to-one pairing, no overflow bubble to supersede.
     expect(snap.remove).toEqual([]);
+    const view = reduceDurableView(journalFor(h));
+    expect(view.map((entry) => entry.kind === "text" ? entry.text : entry.kind)).toEqual(["first ans", "second ans", "first answer", "second answer"]);
+    const fullFinals = view.filter((entry) => entry.kind === "text" && ["first answer", "second answer"].includes(entry.text));
+    expect(fullFinals).toHaveLength(2);
+    expect(fullFinals.every((entry) => entry.id !== idA && entry.id !== idB)).toBe(true);
   });
 
   it("M212b: Case X (K==1) — snapshot is [A] streamed with an EMPTY remove; the tool bubble is untouched (M173d preserved)", async () => {
-    // Byte-identical to M173c at the plugin layer, so the snapshot deliberately
-    // does NOT touch the tool bubble: it is neither an answer lane (never
-    // streamed) nor superseded. M173d's frame-level behaviour is unchanged.
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
     h.draft.pushAnswerText({ text: "the ans" });
@@ -611,10 +519,6 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
   });
 
   it("M212c: collapse with a non-streaming last message — snapshot is [A][B] with empty remove; message C is left intact", async () => {
-    // M173c shape: A,B stream; C has text but streams no partial → its final is
-    // routed to C's textless lane (a legitimate NEW bubble). The snapshot must NOT
-    // claim to remove or reorder C — C is neither in `answers` (it never streamed)
-    // nor in `remove`, so the client preserves it exactly.
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
     h.draft.pushAnswerText({ text: "message A" });
@@ -935,33 +839,8 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(view.find((e) => e.kind === "text" && e.id === idC)).toMatchObject({ text: "C" });
   });
 
-  it("M340b: K==1 with a partial arriving AFTER the final was buffered — the landing is NON-authoritative and the snapshot keeps the streamed text (pins `exactCorrelation` in `authoritative`; the outcome is the pre-existing K==1 hole, not a product claim)", async () => {
-    // Before #340, M212g/M238d pinned the `exactCorrelation` conjunct of
-    // `authoritative:` through the K>=2 shortfall branch. #340 deleted that
-    // branch (a K>=2 shortfall now reaches no lane), so the conjunct's only live
-    // case is this one: K==1, the current lane was TEXTLESS when the final was
-    // buffered (the buffering precondition), then streamed a partial before the
-    // drain. `pushAnswerText` gates only on `state.stopped || lane.settled`, so
-    // the shape is reachable. The flush routes the buffered final onto the current
-    // lane (`[currentLane()]`), but `exactCorrelation` reads
-    // `streamed.length === 1` and there are TWO streamed lanes, so the landing is
-    // non-authoritative and the snapshot carries the lane's streamed text, not a
-    // final the precondition proved could not be attributed. Drop the conjunct
-    // and the snapshot says "tail".
-    //
-    // ⚠️ WHAT THIS PINS AND WHAT IT DOES NOT. It pins the conjunct's CONTRACT: an
-    // unprovable landing is never marked authoritative. The OUTCOME — the snapshot
-    // republishes "late" over "tail", so the final's text survives in no lane, no
-    // independent bubble and no history row — is the pre-existing K==1 hole
-    // (this test passes identically against develop's adapter), tracked only as
-    // the #260/#262 family — nothing names this K==1 late-partial erasure, because
-    // the ordering cannot occur on the real seam — and it is NOT the intended
-    // render. The
-    // ordering itself does not occur on the real seam: core emits the turn-end
-    // finals after the run's partials (`[core] dispatch-from-config.ts` builds
-    // `replies` once the run has ended), so a partial cannot follow its own
-    // message's final. Do not cite this test as "the snapshot should drop the
-    // final".
+  it("M340b: a partial after buffering cannot capture or erase the earlier final", async () => {
+    // Defensive callback-order fixture: core turn-end finals normally follow all partials.
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary(); // first boundary: no-op
     h.draft.pushAnswerText({ text: "A" }); // msg1 streams + materializes
@@ -980,7 +859,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       "final:A=A",
       "progress:B=late",
       "final:B=late",
-      "final:B=tail",
+      "final:X=tail",
     ]);
     expect(h.snapshots).toHaveLength(1);
     expect(h.snapshots[0].answers).toEqual([
@@ -988,6 +867,11 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       { id: idB, text: "late" },
     ]);
     expect(h.snapshots[0].remove).toEqual([]);
+    const tailId = h.frames.find((frame) => frame.text === "tail")!.id;
+    expect([idA, idB]).not.toContain(tailId);
+    const view = reduceDurableView(journalFor(h));
+    expect(view.find((entry) => entry.id === tailId)).toMatchObject({ text: "tail" });
+    expect(view.find((entry) => entry.id === idB)).toMatchObject({ text: "late" });
   });
 
   it("M347: a final that COMMITS and then fails to publish KEEPS its lane's id — one id carries the text across the journal and the snapshot", async () => {
@@ -3945,7 +3829,7 @@ describe("ReasoningDraftController", () => {
 
   it("suppresses the CLI final replay only while its equal live burst is open", () => {
     const { controller, frames } = setup();
-    controller.push({ text: "Plan" });
+    controller.push({ text: "Plan", isReasoningSnapshot: true });
     // Pinned CLI shape: no onReasoningEnd; the final live snapshot is prepended
     // to the result as an equal durable isReasoning payload.
     controller.pushDurableBlock({ text: "Plan" });
@@ -3967,7 +3851,7 @@ describe("ReasoningDraftController", () => {
 
   it("emits the CLI durable replay when its matching live send was rejected", () => {
     const { controller, frames } = setup([false, true]);
-    controller.push({ text: "Plan" });
+    controller.push({ text: "Plan", isReasoningSnapshot: true });
     controller.pushDurableBlock({ text: "Plan" });
 
     expect(frames.map((frame) => frame.text)).toEqual(["Plan"]);
@@ -4241,6 +4125,116 @@ describe("ReasoningDraftController — btw stale-burst defense", () => {
     return { controller, frames };
   }
 
+  it.each([true, false])("#373: native message boundaries preserve equal text and prefixes (endPrevious=%s)", (endPrevious) => {
+    const { controller, frames } = setup();
+    controller.startRun("native-run");
+    const texts = ["Check the file.", "Check the file.", "Check the file. Then run tests."];
+    for (const text of texts) {
+      controller.startMessage();
+      controller.push({ text });
+      if (endPrevious) controller.endBurst();
+    }
+    controller.stop();
+    expect(liveTexts(frames)).toEqual(texts);
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(texts);
+    expect(new Set(finalFrames(frames).map((frame) => frame.id)).size).toBe(3);
+  });
+
+  it("#373: btw's one message retains its cumulative accumulator across endBurst", () => {
+    const { controller, frames } = setup();
+    controller.startMessage(); // btw fires this once, not at each thinking_end.
+    controller.push({ text: "AAA" });
+    controller.endBurst();
+    controller.push({ text: "AAA\nBBB" });
+    controller.endBurst();
+    controller.push({ text: "AAA\nBBB\nCCC" });
+    controller.stop();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "BBB", "CCC"]);
+    expect(new Set(finalFrames(frames).map((frame) => frame.id)).size).toBe(3);
+  });
+
+  it("#373: Codex turn snapshots cross its answer-start callback on one live ID", () => {
+    const { controller, frames } = setup();
+    controller.startRun("snapshot-run");
+    controller.push({ text: "AAA", isReasoningSnapshot: true });
+    controller.startMessage(); // Codex emits answer-start after initial reasoning.
+    controller.push({ text: "AAA\n\nBBB", isReasoningSnapshot: true });
+    controller.endBurst(); // Codex projector ends reasoning once at turn completion.
+    controller.stop();
+    expect(liveTexts(frames)).toEqual(["AAA", "AAA\n\nBBB"]);
+    expect(new Set(frames.map((frame) => frame.id)).size).toBe(1);
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA\n\nBBB"]);
+  });
+
+  it("#373: explicit snapshots replace in full after a prior close", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "AAA", isReasoningSnapshot: true });
+    controller.endBurst();
+    controller.push({ text: "AAA", isReasoningSnapshot: true });
+    controller.stop();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "AAA"]);
+    expect(new Set(finalFrames(frames).map((frame) => frame.id)).size).toBe(2);
+  });
+
+  it.each([false, true])("#373: a new run resets the accumulator; duplicate notification is inert (snapshot=%s)", (snapshot) => {
+    const { controller, frames } = setup();
+    controller.startRun("run-1");
+    controller.push({ text: "AAA", isReasoningSnapshot: snapshot });
+    controller.startRun("run-1");
+    controller.push({ text: "AAA more", isReasoningSnapshot: snapshot });
+    controller.endBurst();
+    controller.startRun("run-2");
+    controller.push({ text: "AAA more", isReasoningSnapshot: snapshot });
+    controller.stop();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA more", "AAA more"]);
+    expect(new Set(finalFrames(frames).map((frame) => frame.id)).size).toBe(2);
+    expect(liveFrames(frames)[0].id).toBe(liveFrames(frames)[1].id);
+  });
+
+  it("#373: a native boundary prevents equal durable text from consuming the previous open live ID", () => {
+    const { controller, frames } = setup();
+    controller.startMessage();
+    controller.push({ text: "AAA" });
+    controller.startMessage();
+    controller.pushDurableBlock({ text: "AAA" });
+    controller.stop();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "AAA"]);
+    expect(new Set(finalFrames(frames).map((frame) => frame.id)).size).toBe(2);
+  });
+
+  it("#373: equal unmarked live and durable messages do not imply CLI replay ownership", () => {
+    const { controller, frames } = setup();
+    controller.startMessage();
+    controller.push({ text: "AAA" });
+    controller.pushDurableBlock({ text: "AAA" });
+    controller.stop();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "AAA"]);
+    expect(new Set(finalFrames(frames).map((frame) => frame.id)).size).toBe(2);
+  });
+
+  it("#373: a marked snapshot cannot claim an equal durable block across a message boundary", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "AAA", isReasoningSnapshot: true });
+    controller.startMessage();
+    controller.pushDurableBlock({ text: "AAA" });
+    controller.stop();
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "AAA"]);
+    expect(new Set(finalFrames(frames).map((frame) => frame.id)).size).toBe(2);
+  });
+
+  it("#373: CLI's unmarked durable replay closes its accepted marked live snapshot on the same ID", () => {
+    const { controller, frames } = setup();
+    controller.startRun("cli-run");
+    controller.push({ text: "Plan", isReasoningSnapshot: true });
+    controller.pushDurableBlock({ text: "Plan" });
+    controller.pushDurableBlock({ text: "Plan" });
+    controller.stop();
+    const finals = finalFrames(frames);
+    expect(finals.map((frame) => frame.text)).toEqual(["Plan", "Plan"]);
+    expect(finals[0].id).toBe(liveFrames(frames)[0].id);
+    expect(finals[1].id).not.toBe(finals[0].id);
+  });
+
   it("strips a prior burst's stale prefix from a later btw burst (under the rotated id)", () => {
     // btw never resets its `reasoningText` accumulator at thinking_end, so burst 2's
     // cumulative payload still carries burst 1's full text as a raw prefix.
@@ -4276,27 +4270,20 @@ describe("ReasoningDraftController — btw stale-burst defense", () => {
     expect(finalFrames(frames).map((f) => f.text)).toEqual(["AAA"]);
   });
 
-  it("recognizes an open burst's exact raw snapshot after display-prefix stripping", () => {
+  it("does not infer a snapshot replay from an unmarked cumulative stream's equal raw text", () => {
     const { controller, frames } = setup();
+    controller.startMessage();
     controller.push({ text: "AAA" });
     controller.endBurst();
-    controller.push({ text: "AAABBB" }); // displayed as BBB; raw snapshot is AAABBB
-
+    controller.push({ text: "AAABBB" }); // btw's current burst displays BBB.
+    // btw does not produce CLI's durable snapshot replay. A complete block
+    // arriving here is a separate delivery act, even if its text matches raw.
     controller.pushDurableBlock({ text: "AAABBB" });
     expect(liveTexts(frames)).toEqual(["AAA", "BBB"]);
-    // #242: both bursts have now closed (endBurst, then the replay), each with
-    // one durable frame carrying its DISPLAYED text — never the raw payload.
-    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "BBB"]);
-
-    // The replay closed the live burst; equality no longer suppresses an
-    // independent durable block.
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "BBB", "AAABBB"]);
     controller.pushDurableBlock({ text: "AAABBB" });
-    expect(liveTexts(frames)).toEqual(["AAA", "BBB"]);
-    expect(finalFrames(frames).map((frame) => frame.text)).toEqual([
-      "AAA",
-      "BBB",
-      "AAABBB",
-    ]);
+    expect(finalFrames(frames).map((frame) => frame.text)).toEqual(["AAA", "BBB", "AAABBB", "AAABBB"]);
+    expect(new Set(finalFrames(frames).map((frame) => frame.id)).size).toBe(4);
   });
 
   it("falls through to a plain replace when a later burst does not carry the stale prefix", () => {

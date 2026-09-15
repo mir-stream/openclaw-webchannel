@@ -14,6 +14,7 @@ import { DurableSendError } from "./durable-send-error.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
+import type { GetReplyOptions } from "openclaw/plugin-sdk/reply-runtime";
 
 import {
   deliverDraftFinalPayload,
@@ -89,6 +90,8 @@ type AssembledTurnLike = {
     onPatchSummary?: (p: unknown) => void;
     onPartialReply?: (p: { text?: string }) => void;
     onAssistantMessageStart?: () => void;
+    onReasoningStream?: GetReplyOptions["onReasoningStream"];
+    onReasoningEnd?: GetReplyOptions["onReasoningEnd"];
   };
   delivery: {
     deliver: (
@@ -98,6 +101,8 @@ type AssembledTurnLike = {
         isStatusNotice?: boolean;
         isFallbackNotice?: boolean;
         isCompactionNotice?: boolean;
+        isReasoning?: boolean;
+        isReasoningSnapshot?: boolean;
       },
       info?: { kind?: string; assistantMessageIndex?: number },
     ) => Promise<{ visibleReplySent: boolean }>;
@@ -108,7 +113,7 @@ type LifecycleEvent = { stream?: string; runId?: string; data?: unknown };
 type LifecycleListener = (evt: LifecycleEvent) => void;
 
 function makeFakeApi(params: {
-  streamingMode: "off" | "partial" | "progress";
+  streamingMode: "off" | "partial" | "progress" | "block";
   runImpl: (turn: AssembledTurnLike) => Promise<void>;
   /** Expose the host's agent-events surface (#87 lifecycle verdict). */
   withAgentEvents?: boolean;
@@ -357,6 +362,39 @@ function makeFakeTransport(options?: {
 const userMessage = { type: "user_message" as const, text: "/stop" };
 
 describe("handleInboundMessage — control-lane authorization stamp", () => {
+  it("delivers a partial-mode control turn without wiring a draft message boundary", async () => {
+    let sawMessageBoundary: boolean | undefined;
+    let visibleReplySent: boolean | undefined;
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      runImpl: async (turn) => {
+        // Controlled public callback sequence after core continues a plain-text
+        // control turn; this fixture does not run core's abort/command authorization.
+        turn.replyOptions?.onAgentRunStart?.("control-run");
+        sawMessageBoundary = typeof turn.replyOptions?.onAssistantMessageStart === "function";
+        turn.replyOptions?.onAssistantMessageStart?.();
+        turn.replyOptions?.onPartialReply?.({ text: "I can help." });
+        visibleReplySent = (await turn.delivery.deliver(
+          { text: "I can help." },
+          { kind: "final" },
+        )).visibleReplySent;
+      },
+    });
+    const { transport, texts, progress, finalizes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "stop",
+      id: "control-turn",
+    }, "default", { controlLane: true });
+
+    expect(visibleReplySent).toBe(true);
+    expect(sawMessageBoundary).toBe(false);
+    expect(texts.map(({ text }) => text)).toEqual(["I can help."]);
+    expect(progress).toEqual([]);
+    expect(finalizes).toEqual([]);
+  });
+
   it("stamps access.commands.authorized=true ONLY for controlLane turns", async () => {
     const { api, captured } = makeFakeApi({
       streamingMode: "off",
@@ -2003,15 +2041,7 @@ describe("deliverDraftFinalPayload — independent routing policy", () => {
   });
 });
 
-/**
- * #173 — the plugin now emits the corrected sequence DIRECTLY over its lane
- * frames. No keyframe, no client-side reconstruction.
- *
- * The tool-only-last shape (core emits ordinary finals [A,B] for two streamed
- * messages, then a tool-only last message whose boundary makes the current lane
- * textless) is settled at drain: final#1 tops up lane A on its OWN id, final#2
- * settles lane B on its OWN id. No independent bubble is created.
- */
+// #262: delivery owns IDs. Textless-terminal finals cannot reopen past drafts.
 describe("handleInboundMessage — #173 collapse-aware final routing", () => {
   const ordinary = { type: "user_message" as const, text: "do the thing" };
 
@@ -2036,7 +2066,37 @@ describe("handleInboundMessage — #173 collapse-aware final routing", () => {
     requireCallback(turn.replyOptions?.onAssistantMessageStart, "onAssistantMessageStart")();
   };
 
-  it("tool-only last message: final#1 tops up lane A's id, final#2 settles lane B's id, no independent bubble", async () => {
+  it("#262: deduped A/A/final-only B/textless terminal preserves both authored A IDs", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      runImpl: async (turn) => {
+        openNextAnswerLane(turn);
+        streamAnswerLane(turn, "Repeated answer");
+        openNextAnswerLane(turn);
+        streamAnswerLane(turn, "Repeated answer");
+        openNextAnswerLane(turn); // B: text only at message-end; no partial callback.
+        openNextAnswerLane(turn); // Textless terminal message; no canonical collapse.
+        // Trace-confirmed dispatch result of [A,A,B] after core's final dedupe.
+        await turn.delivery.deliver({ text: "Repeated answer" }, { kind: "final" });
+        await turn.delivery.deliver({ text: "New final-only answer" }, { kind: "final" });
+      },
+    });
+    const { transport, finalizes, snapshotFrames, settles } = makeFakeTransport();
+    await handleInboundMessage(api, transport, "peer-1", { ...ordinary, id: "compensating-turn" });
+    const authoredIds = finalizes.slice(0, 2).map(({ id }) => id);
+    expect(new Set(authoredIds).size).toBe(2);
+    for (const id of authoredIds) {
+      expect(finalizes.filter((frame) => frame.id === id).map(({ text }) => text)).toEqual(["Repeated answer"]);
+      expect(snapshotFrames.at(-1)!.answers).toContainEqual({ id, text: "Repeated answer" });
+    }
+    const unclaimed = finalizes.filter((frame) => !authoredIds.includes(frame.id));
+    expect(unclaimed.map(({ text }) => text)).toEqual(["Repeated answer", "New final-only answer"]);
+    expect(new Set(unclaimed.map(({ id }) => id)).size).toBe(2);
+    expect(snapshotFrames.at(-1)!.remove).toEqual([]);
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it("tool-only last message: past IDs retain their own text and finals get independent IDs", async () => {
     const { api } = makeFakeApi({
       streamingMode: "partial",
       runImpl: async (turn) => {
@@ -2063,14 +2123,12 @@ describe("handleInboundMessage — #173 collapse-aware final routing", () => {
     const laneBId = finalizes.find((f) => f.text === "second ans")!.id;
     expect(laneAId).not.toBe(laneBId);
 
-    // Every finalizeDraft landed on lane A's or lane B's own id — no third
-    // (independent) bubble id, which is what [A,A,B] would have required.
-    expect(new Set(finalizes.map((f) => f.id))).toEqual(new Set([laneAId, laneBId]));
-    // Each lane ends on its OWN authoritative final text, in order → [A][B].
-    const lastFinalOn = (id: string) =>
-      finalizes.filter((f) => f.id === id).at(-1)!.text;
-    expect(lastFinalOn(laneAId)).toBe("first answer");
-    expect(lastFinalOn(laneBId)).toBe("second answer");
+    const lastFinalOn = (id: string) => finalizes.filter((f) => f.id === id).at(-1)!.text;
+    expect(lastFinalOn(laneAId)).toBe("first ans");
+    expect(lastFinalOn(laneBId)).toBe("second ans");
+    const independent = finalizes.filter((f) => f.id !== laneAId && f.id !== laneBId);
+    expect(independent.map((f) => f.text)).toEqual(["first answer", "second answer"]);
+    expect(new Set(independent.map((f) => f.id)).size).toBe(2);
     // final#1 ("first answer") is applied before final#2 ("second answer").
     const firstAnswerAt = finalizes.findIndex((f) => f.text === "first answer");
     const secondAnswerAt = finalizes.findIndex((f) => f.text === "second answer");
@@ -2125,6 +2183,72 @@ describe("handleInboundMessage — #173 collapse-aware final routing", () => {
     expect(independentFinal).toBeDefined();
     if (laneId) expect(independentFinal!.id).not.toBe(laneId);
   });
+});
+
+describe("handleInboundMessage — #373 native reasoning boundaries", () => {
+  it.each(["partial", "progress", "off", "block"] as const)(
+    "%s mode preserves repeated prefixes and equal independent reasoning messages",
+    async (streamingMode) => {
+      const texts = ["Check the file.", "Check the file. Then run tests.", "Check the file. Then run tests."];
+      const { transport, settles } = makeFakeTransport();
+      const reasoning = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+      let sawMessageBoundary = false;
+      const { api } = makeFakeApi({
+        streamingMode,
+        runImpl: async (turn) => {
+          turn.replyOptions?.onAgentRunStart?.("reasoning-run");
+          for (const text of texts) {
+            // These are the actual public callbacks, in embedded message order.
+            sawMessageBoundary = typeof turn.replyOptions?.onAssistantMessageStart === "function";
+            await turn.replyOptions?.onAssistantMessageStart?.();
+            await turn.replyOptions?.onReasoningStream?.({ text });
+            await turn.replyOptions?.onReasoningEnd?.();
+          }
+          await turn.delivery.deliver({ text: "done" }, { kind: "final" });
+        },
+      });
+      await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text: "check", id: `reasoning-${streamingMode}` });
+      const finals = reasoning.mock.calls.filter((args) => args[4] === true);
+      expect(finals.map((args) => args[3])).toEqual(texts);
+      expect(new Set(finals.map((args) => args[1])).size).toBe(3);
+      expect(sawMessageBoundary).toBe(true);
+      expect(settles).toEqual(["ok"]);
+    },
+  );
+
+  it.each(["btw", "codex-snapshot", "cli-replay"] as const)(
+    "%s public callback sequence preserves cumulative text and replay ownership",
+    async (source) => {
+      const { transport, settles } = makeFakeTransport();
+      const reasoning = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+      const { api } = makeFakeApi({
+        streamingMode: "off",
+        runImpl: async (turn) => {
+          const callbacks = turn.replyOptions!;
+          callbacks.onAgentRunStart?.("cumulative-run");
+          if (source === "btw") {
+            callbacks.onAssistantMessageStart?.();
+            await callbacks.onReasoningStream?.({ text: "AAA", isReasoning: true });
+            await callbacks.onReasoningEnd?.();
+            await callbacks.onReasoningStream?.({ text: "AAA\nBBB", isReasoning: true });
+            await callbacks.onReasoningEnd?.();
+          } else {
+            await callbacks.onReasoningStream?.({ text: "AAA", isReasoningSnapshot: true });
+            if (source === "codex-snapshot") callbacks.onAssistantMessageStart?.();
+            await callbacks.onReasoningStream?.({ text: "AAA\n\nBBB", isReasoningSnapshot: true });
+            if (source === "codex-snapshot") await callbacks.onReasoningEnd?.();
+            else await turn.delivery.deliver({ text: "AAA\n\nBBB", isReasoning: true }, { kind: "final" });
+          }
+          await turn.delivery.deliver({ text: "done" }, { kind: "final" });
+        },
+      });
+      await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text: "check", id: `reasoning-${source}` });
+      const finals = reasoning.mock.calls.filter((args) => args[4] === true);
+      expect(finals.map((args) => args[3])).toEqual(source === "btw" ? ["AAA", "BBB"] : ["AAA\n\nBBB"]);
+      expect(new Set(reasoning.mock.calls.map((args) => args[1])).size).toBe(source === "btw" ? 2 : 1);
+      expect(settles).toEqual(["ok"]);
+    },
+  );
 });
 
 

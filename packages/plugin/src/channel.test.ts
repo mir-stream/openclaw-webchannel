@@ -2780,6 +2780,7 @@ describe("webchannel inbound round-trip", () => {
     // production — which is exactly the failure that shipped.
     expect(seenReplyOptions).toEqual({
       onAgentRunStart: expect.any(Function),
+      onAssistantMessageStart: expect.any(Function),
       streamReasoningInNonStreamModes: true,
       reasoningPayloadsEnabled: true,
       onReasoningStream: expect.any(Function),

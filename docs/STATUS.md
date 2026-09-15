@@ -1,5 +1,15 @@
 # Project Status — single source of truth
 
+Round 3A (#262): turn-end finals no longer match past assistant drafts by count
+or position. Closed draft IDs keep their authored text; a final without an owned
+current draft gets an independent delivery ID. Full final text survives live,
+snapshot reconciliation, and journal history, including deduped finals and
+messages with no partial callbacks. See [delivery identity](MESSAGE_DELIVERY_IDENTITY.md).
+Reasoning (#373) now consumes native assistant-message boundaries in every
+streaming mode, preserving independent equal text and repeated prefixes. Btw
+accumulation remains scoped to its one message; marked snapshots replace in full
+and only an accepted open snapshot can be consumed by its durable replay.
+
 Round 2 (#370 + #295): active admitted conversations accept authored durable
 output into the journal during relay outages. Store failure refuses the push and
 success receipt; draft output retries retain their original IDs and unresolved
