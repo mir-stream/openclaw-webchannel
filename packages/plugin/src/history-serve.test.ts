@@ -489,14 +489,14 @@ describe("createHistoryServer — read failure sends NO frame", () => {
     const { server, sent, scheduler, errors, warns } = harness(journal, {
       journal: {
         ...journal,
-        read: (() => {
+        historyPage: (() => {
           let first = true;
-          return (conversationId: string, options?: { afterSeq?: number; limit?: number }) => {
+          return (...args: Parameters<NonNullable<DeliveryJournal["historyPage"]>>) => {
             if (first) {
               first = false;
               throw new Error("transient sqlite fault");
             }
-            return journal.read(conversationId, options);
+            return journal.historyPage!(...args);
           };
         })(),
       } as DeliveryJournal,

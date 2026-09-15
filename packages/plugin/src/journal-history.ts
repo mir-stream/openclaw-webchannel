@@ -5,8 +5,8 @@
  * origin mappings, then selects a page. Neither timestamps nor modification
  * sequences are position keys: seals can reorder answer slots.
  *
- * Replay stays chunked and synchronous; every page still folds the conversation
- * (#286 read optimization is separate). Reasoning preview placement can differ
+ * Full replay remains the reference projection and the injected-reader fallback.
+ * Production pages use the journal's incremental SQLite read model. Reasoning placement can differ
  * from its durable close event's position. Unknown event kinds are counted and
  * reported by history-serve; they do not become invented history rows.
  */
@@ -40,28 +40,7 @@ import type { HistoryFetchPlan, ProjectedHistoryMessage } from "./history.js";
  */
 export type JournalReader = DeliveryJournal["read"];
 
-/**
- * Rows pulled per `read` call during a replay.
- *
- * WHY 512. At the ~1.2 KB payload size `delivery-journal.ts` measures as
- * dominant, one chunk is ~0.6 MB of live row objects, so the peak this module
- * holds is the projected view plus that — against the +22.0 MB an unbounded read
- * retains at 20 000 rows (measured; the store docblock says ~25 MB). Smaller
- * would shrink an already-small number while multiplying prepared-statement
- * round trips (20 000 rows is 40 reads at this size, 400 at 50); larger walks
- * back toward the unbounded read and makes the bound stop meaning anything.
- *
- * ⚠️ THE VALUE IS NOT A TIME/MEMORY TRADE — THAT WAS MEASURED, AND THERE IS NO
- * TRADE TO MAKE. Across 128, 512 and 4096 the whole spread is 1.3% at 20 000
- * events and 2.0% at 10 000; it widens to 15.3% at 1 000 events, which is 0.9 ms
- * of wall clock (see the table in the file header). Both ends say the same thing,
- * because the replay's cost is the reducer's fold and not the reads: ~1% where
- * the projection is expensive, under a millisecond where it is cheap. So pick the
- * value on memory alone and do not "tune" it for speed; there is nothing there to
- * win.
- *
- * The projected VIEW is not bounded by this and cannot be — it is the answer.
- */
+/** Raw chunk size for the full-replay reference/injected-reader fallback. */
 export const HISTORY_REPLAY_CHUNK_ROWS = 512;
 
 /**
@@ -164,7 +143,7 @@ export const KNOWN_EVENT_KINDS: Record<JournalEvent["kind"], true> = {
  * anchors (**#288**). A grep-stable predicate survives that churn; a number does
  * not, and a number that has gone stale reads as authority.)
  */
-function isKnownJournalEvent(
+export function isKnownJournalEvent(
   event: RetainedJournalEvent,
 ): event is JournalEvent {
   return (
@@ -519,7 +498,7 @@ export function projectJournalHistory(
  * first-seen/fallback decision and counts `tsFallbacks`, and moving that in here
  * would put the counter behind a second door.
  */
-function historyRowFor(
+export function historyRowFor(
   message: DurableMessage,
   ts: number,
 ): ProjectedHistoryMessage {
@@ -624,8 +603,8 @@ function historyRowFor(
  * repair is still not a copy of the guards — it is the reducer reporting which
  * events it admitted.
  */
-function recordFirstSeen(
-  firstSeenMs: Map<string, number>,
+export function recordFirstSeen(
+  firstSeenMs: { has(id: string): boolean; set(id: string, ms: number): unknown },
   event: JournalEvent,
   createdMs: number,
 ): void {
@@ -1112,4 +1091,12 @@ export function serveHistoryRequest(
     unsupportedEvents,
     tsFallbacks,
   };
+}
+
+/** Production bounded query, with the pure full replay retained for injected readers. */
+export function serveHistoryRequestStep(
+  journal: DeliveryJournal, conversationId: string, plan: HistoryFetchPlan, targetSeq?: number,
+): import("./materialized-history.js").HistoryPageStep {
+  if (journal.historyPage !== undefined) return journal.historyPage(conversationId, plan, targetSeq);
+  return { pending: false, ...serveHistoryRequest(journal.read, conversationId, plan), highWaterSeq: journal.maxSeq(conversationId) };
 }

@@ -64,6 +64,8 @@ import {
   type JournalEvent,
 } from "./delivery-journal-event.js";
 import { ensurePrivateDirectory } from "./private-file.js";
+import { createMaterializedHistory, type HistoryPageStep, type HistoryWork } from "./materialized-history.js";
+import type { HistoryFetchPlan } from "./history.js";
 
 /** Main database plus every journal-mode sidecar that can hold database pages. */
 const SQLITE_DATABASE_FILE_SUFFIXES = ["", "-wal", "-shm", "-journal"] as const;
@@ -360,6 +362,8 @@ export interface DeliveryJournal {
    * `history` frame's `highWaterSeq` baseline without re-folding to learn the max.
    */
   maxSeq(conversationId: string): number;
+  /** Bounded, rebuildable history query; omitted only by injected legacy readers. */
+  historyPage?(conversationId: string, plan: HistoryFetchPlan, targetSeq?: number): HistoryPageStep;
   /** Checkpoint, stop WAL maintenance, and close the handle. Idempotent. */
   close(): void;
 }
@@ -726,6 +730,8 @@ export function openDeliveryJournal(options: {
   databasePath: string;
   /** Injectable clock. Tests pin `created_ms`; production passes nothing. */
   now?: () => number;
+  /** Optional work counters for diagnostics and structural performance checks. */
+  onHistoryWork?: (work: HistoryWork) => void;
 }): DeliveryJournal {
   const databasePath = options.databasePath;
   const now = options.now ?? Date.now;
@@ -789,8 +795,13 @@ export function openDeliveryJournal(options: {
   } = statements;
 
   let closed = false;
+  const history = createMaterializedHistory(db, options.onHistoryWork);
 
   return {
+    historyPage(conversationId, plan, targetSeq) {
+      if (closed) throw new Error("webchannel: delivery journal is closed");
+      return history.page(conversationId, plan, targetSeq);
+    },
     append(conversationId, event) {
       // ⚠️ THE EMPTY-`user`-ID REFUSAL LIVES HERE, AT THE MECHANISM, not only in
       // `journalEventForInboundUser`. That mapper guards one door; `append` is
