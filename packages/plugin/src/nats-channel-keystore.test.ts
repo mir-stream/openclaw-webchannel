@@ -394,6 +394,8 @@ describe("NatsChannel keyStore mode (register admission)", () => {
         role: "agent",
         text: "retained transcript",
         ts: 1_700_000_000_000,
+        seq: 1,
+        turnId: "turn-1",
       }],
     }]);
     expect(newDevice.failed).toBe(0);

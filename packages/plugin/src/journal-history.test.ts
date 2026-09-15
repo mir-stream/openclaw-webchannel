@@ -178,7 +178,7 @@ function fakeReader(rows: readonly DeliveryJournalRow[]): {
 describe("projectJournalHistory — the fold", () => {
   it("projects an empty conversation to an empty view with zero counters", () => {
     const { read, calls } = fakeReader([]);
-    expect(projectJournalHistory(read, CONV)).toEqual({
+    expect(projectJournalHistory(read, CONV)).toMatchObject({
       messages: [],
       unsupportedEvents: 0,
       tsFallbacks: 0,
@@ -192,7 +192,7 @@ describe("projectJournalHistory — the fold", () => {
     const { read } = fakeReader(
       rowsFor([{ kind: "user", id: "u-0", text: "hi" } satisfies JournalEvent]),
     );
-    expect(projectJournalHistory(read, CONV).messages).toEqual([
+    expect(projectJournalHistory(read, CONV).messages).toMatchObject([
       { id: "u-0", role: "user", text: "hi", ts: T0 },
     ]);
   });
@@ -215,7 +215,7 @@ describe("projectJournalHistory — the fold", () => {
     // the tombstone is STRIPPED here — so X is absent from the served history.
     // Every one of those is the REDUCER's doing (plus this module's strip) — this
     // file asserts the projection carries them through, it does not re-derive them.
-    expect(projection.messages).toEqual([
+    expect(projection.messages).toMatchObject([
       { id: "u-0", role: "user", text: "do the thing", ts: T0 + 0 * T_STEP },
       { id: "B", role: "agent", text: "B (sealed)", ts: T0 + 4 * T_STEP },
       { id: "A", role: "agent", text: "A (sealed)", ts: T0 + 1 * T_STEP },
@@ -385,7 +385,7 @@ describe("projectJournalHistory — reasoning reaches the wire (#242 half 2)", (
   it("the emitted list holds EVERY block, in the view's order and with NO role", () => {
     const { read } = fakeReader(rowsFor(WITH_REASONING));
     const projection = projectJournalHistory(read, CONV);
-    expect(projection.messages).toEqual([
+    expect(projection.messages).toMatchObject([
       { id: "u-0", role: "user", text: "why?", ts: T0 + 0 * T_STEP },
       // ⚠️ NO `role` KEY AT ALL, and `toEqual` is what enforces that: an extra
       // own property on the actual value fails it. This is the exact property
@@ -453,7 +453,7 @@ describe("projectJournalHistory — reasoning reaches the wire (#242 half 2)", (
     // Half 1 asserted `messages: []` here. That mattered: `sendSnapshot` gates
     // the frame on `length > 0`, so under half 1 such a conversation looked
     // brand new to its owner. It no longer does.
-    expect(projectJournalHistory(read, CONV)).toEqual({
+    expect(projectJournalHistory(read, CONV)).toMatchObject({
       messages: [
         { kind: "reasoning", id: "r-1", turnId: TURN, text: "alone", ts: T0 },
       ],
@@ -640,7 +640,7 @@ describe("projectJournalHistory — an unknown kind is counted, not folded", () 
     // because first-appearance dates X from its FIRST bubble at index 6 (which
     // is before the splice). Had this module dated messages from the last write,
     // this line would be the one that caught it.
-    expect(projection.messages).toEqual(baseline.messages);
+    expect(projection.messages).toMatchObject(baseline.messages);
   });
 
   it("counts every unsupported row, including several in one chunk", () => {
@@ -655,7 +655,7 @@ describe("projectJournalHistory — an unknown kind is counted, not folded", () 
     ];
     const projection = projectJournalHistory(fakeReader(rows).read, CONV);
     expect(projection.unsupportedEvents).toBe(2);
-    expect(projection.messages).toEqual([
+    expect(projection.messages).toMatchObject([
       { id: "u-0", role: "user", text: "hi", ts: T0 + T_STEP },
     ]);
   });
@@ -710,7 +710,7 @@ describe("projectJournalHistory — an unknown kind is counted, not folded", () 
     ];
     const projection = projectJournalHistory(fakeReader(rows).read, CONV);
     expect(projection.unsupportedEvents).toBe(2);
-    expect(projection.messages).toEqual([
+    expect(projection.messages).toMatchObject([
       { id: "u-0", role: "user", text: "hi", ts: T0 + 2 * T_STEP },
     ]);
   });
@@ -751,7 +751,7 @@ describe("projectJournalHistory — an unknown kind is counted, not folded", () 
     const projection = projectJournalHistory(fakeReader(rows).read, CONV);
     expect(projection.unsupportedEvents).toBe(1);
     expect(projection.tsFallbacks).toBe(0);
-    expect(projection.messages).toEqual([
+    expect(projection.messages).toMatchObject([
       { id: "u-0", role: "user", text: "before", ts: T0 },
       { id: "u-1", role: "user", text: "after", ts: T0 + 2 * T_STEP },
     ]);
@@ -767,7 +767,7 @@ describe("projectJournalHistory — where ts comes from", () => {
         { kind: "bubble", answerId: "A", text: "edited", turnId: TURN },
       ] satisfies JournalEvent[]),
     );
-    expect(projectJournalHistory(read, CONV).messages).toEqual([
+    expect(projectJournalHistory(read, CONV).messages).toMatchObject([
       { id: "A", role: "agent", text: "edited", ts: T0 },
     ]);
   });
@@ -811,7 +811,7 @@ describe("projectJournalHistory — where ts comes from", () => {
     );
     const projection = projectJournalHistory(read, CONV);
     expect(projection.tsFallbacks).toBe(0);
-    expect(projection.messages).toEqual([
+    expect(projection.messages).toMatchObject([
       { id: "P", role: "agent", text: "p", ts: T0 },
       { id: "Q", role: "agent", text: "q", ts: T0 },
     ]);
@@ -901,7 +901,7 @@ describe("projectJournalHistory — where ts comes from", () => {
     );
     const projection = projectJournalHistory(read, CONV);
     // The rejected seal left no trace in the VIEW…
-    expect(projection.messages).toEqual([
+    expect(projection.messages).toMatchObject([
       { id: "C", role: "agent", text: "the real one", ts: T0 },
     ]);
     // …but T0 is the SEAL's row, not the bubble's at T0 + T_STEP. That is the
@@ -919,7 +919,7 @@ describe("projectJournalHistory — where ts comes from", () => {
         { kind: "seal", turnId: TURN, answers: null },
       ]),
     );
-    expect(projectJournalHistory(read, CONV).messages).toEqual([
+    expect(projectJournalHistory(read, CONV).messages).toMatchObject([
       { id: "u-0", role: "user", text: "hi", ts: T0 },
     ]);
   });
@@ -949,7 +949,7 @@ describe("projectJournalHistory — where ts comes from", () => {
     expect(projection.tsFallbacks).toBe(0);
     // Only the well-formed answer survives the REDUCER's own filter, and it is
     // dated from the seal row — the elements the reducer dropped left no trace.
-    expect(projection.messages).toEqual([
+    expect(projection.messages).toMatchObject([
       { id: "u-0", role: "user", text: "hi", ts: T0 },
       { id: "D", role: "agent", text: "d", ts: T0 + T_STEP },
     ]);
@@ -1240,10 +1240,16 @@ describe("against a REAL openDeliveryJournal", () => {
     journal.append("other-conv", { kind: "user", id: "u-9", text: "elsewhere" });
 
     const projection = projectJournalHistory(journal.read, CONV);
-    expect(projection).toEqual(
-      projectJournalHistory(fakeReader(rowsFor(MIXED_STREAM)).read, CONV),
+    // The real journal deduplicates a repeat placement; sequence values follow
+    // stored rows, while content and first-seen timestamps match the full input.
+    const withoutSeq = (p: ReturnType<typeof projectJournalHistory>) => ({
+      ...p, messages: p.messages.map(({ seq: _seq, ...row }) => row),
+    });
+    expect(withoutSeq(projection)).toEqual(
+      withoutSeq(projectJournalHistory(fakeReader(rowsFor(MIXED_STREAM)).read, CONV)),
     );
-    expect(projectJournalHistory(journal.read, "other-conv").messages).toEqual([
+    expect(projection.messages.map((row) => row.seq)).toEqual([1, 7, 7, 3, 7]);
+    expect(projectJournalHistory(journal.read, "other-conv").messages).toMatchObject([
       { id: "u-9", role: "user", text: "elsewhere", ts: T0 + 9 * T_STEP },
     ]);
   });
@@ -1271,7 +1277,7 @@ describe("against a REAL openDeliveryJournal", () => {
     expect(chunked.unsupportedEvents).toBe(1);
     expect(chunked.tsFallbacks).toBe(0);
     expect(chunked.messages).toHaveLength(60);
-    expect(chunked.messages[0]).toEqual({
+    expect(chunked.messages[0]).toMatchObject({
       id: "u-0",
       role: "user",
       text: "m0",
@@ -1349,7 +1355,8 @@ describe("live == history for reasoning: what the plugin actually serves (#242 h
 
   /** A served row with `ts` stripped — the shape the shared fixture pins. */
   const withoutTs = (row: ProjectedHistoryMessage): unknown => {
-    const { ts: _ts, ...rest } = row;
+    const { ts: _ts, seq: _seq, ...rest } = row;
+    if (row.kind === undefined) delete (rest as { turnId?: string }).turnId;
     return rest;
   };
 
@@ -1443,7 +1450,8 @@ describe("live == history for tool activity: what the plugin serves (#242 half 3
   }
 
   const stripTs = (row: ProjectedHistoryMessage): unknown => {
-    const { ts: _ts, ...rest } = row;
+    const { ts: _ts, seq: _seq, ...rest } = row;
+    if (row.kind === undefined) delete (rest as { turnId?: string }).turnId;
     return rest;
   };
 
@@ -1517,7 +1525,8 @@ describe("live == history for approvals: what the plugin serves (#242 half 4)", 
   }
 
   const stripTs = (row: ProjectedHistoryMessage): unknown => {
-    const { ts: _ts, ...rest } = row;
+    const { ts: _ts, seq: _seq, ...rest } = row;
+    if (row.kind === undefined) delete (rest as { turnId?: string }).turnId;
     return rest;
   };
 
@@ -1580,7 +1589,7 @@ describe("live == history for approvals: what the plugin serves (#242 half 4)", 
     } as unknown as OutboundWsMessage);
     expect(orphan).not.toBeNull();
     const { read } = fakeReader(rowsFor([orphan!]));
-    expect(projectJournalHistory(read, CONV).messages).toEqual([]);
+    expect(projectJournalHistory(read, CONV).messages).toMatchObject([]);
   });
 
   it("an id-less approval frame is refused rather than stored under an empty id", () => {

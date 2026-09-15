@@ -455,6 +455,30 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
       if (highWaterSeq !== undefined && !isWireSeq(highWaterSeq)) {
         return invalid(known, "highWaterSeq must be a non-negative safe integer");
       }
+      const complete = field(raw, "snapshotComplete");
+      if (complete !== undefined && typeof complete !== "boolean") {
+        return invalid(known, "snapshotComplete must be a boolean");
+      }
+      for (const row of messages) {
+        if (!isRecord(row)) continue;
+        const rowSeq = field(row, "seq");
+        if (rowSeq !== undefined && (!isWireSeq(rowSeq)
+          || (isWireSeq(highWaterSeq) && rowSeq > highWaterSeq))) {
+          return invalid(known, "history row seq must be a safe integer within the snapshot range");
+        }
+        const revision = field(row, "revision");
+        if (revision !== undefined && !isWireSeq(revision)) {
+          return invalid(known, "history revision must be a non-negative safe integer");
+        }
+        const randomId = field(row, "randomId");
+        if (randomId !== undefined && !isNonEmptyString(randomId)) {
+          return invalid(known, "history randomId must be a non-empty string");
+        }
+        const edited = field(row, "edited");
+        if (edited !== undefined && typeof edited !== "boolean") {
+          return invalid(known, "history edited must be a boolean");
+        }
+      }
       return accept(raw);
     }
 

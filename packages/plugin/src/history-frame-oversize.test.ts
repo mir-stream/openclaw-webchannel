@@ -48,6 +48,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { openDeliveryJournal, type DeliveryJournal } from "./delivery-journal.js";
 import { generateKeyPair } from "./e2e-crypto.js";
+import { openEnvelope } from "./e2e-session.js";
 import {
   DEFAULT_HISTORY_CONFIG,
   MAX_WIRE_HISTORY_LIMIT,
@@ -113,6 +114,8 @@ class LimitedTransport extends EventEmitter {
   connected = true;
   effectiveOutboundLimit = SEEDING_LIMIT;
   readonly published: Array<{ subject: string; bytes: number }> = [];
+  readonly payloads: Buffer[] = [];
+  capturePayloads = false;
   private sid = 0;
   subscribe(): number {
     return ++this.sid;
@@ -128,6 +131,7 @@ class LimitedTransport extends EventEmitter {
       );
     }
     this.published.push({ subject, bytes: buf.length });
+    if (this.capturePayloads) this.payloads.push(buf);
   }
 }
 
@@ -136,6 +140,7 @@ type Harness = {
   transport: LimitedTransport;
   channel: NatsChannel;
   server: HistoryServer;
+  sessionKey: Uint8Array;
   /** What `NatsChannel.sendHistory` RETURNED, per call. `history-serve` drops it. */
   sendHistoryResults: boolean[];
   /** The projected rows `history-serve` handed to the channel, per call. */
@@ -196,9 +201,9 @@ function harness(opts: {
     // The REAL channel, wrapped only to observe the boolean `history-serve.ts`
     // discards. Every byte still goes through `NatsChannel.sendHistory`.
     channel: {
-      sendHistory(peerId: string, messages: HistoryMessage[]): boolean {
+      sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number, snapshotComplete?: boolean): boolean {
         servedFrames.push(messages);
-        const ok = channel.sendHistory(peerId, messages);
+        const ok = channel.sendHistory(peerId, messages, highWaterSeq, snapshotComplete);
         sendHistoryResults.push(ok);
         return ok;
       },
@@ -222,6 +227,7 @@ function harness(opts: {
     transport,
     channel,
     server,
+    sessionKey,
     sendHistoryResults,
     servedFrames,
     errors,
@@ -253,6 +259,8 @@ function seedBubbles(h: Harness, count: number, textBytes: number): void {
 /** Forget the seeding traffic; from here `published` is the answer's frames only. */
 function armAt(h: Harness, limit: number): void {
   h.transport.published.length = 0;
+  h.transport.payloads.length = 0;
+  h.transport.capturePayloads = true;
   h.transport.effectiveOutboundLimit = limit;
 }
 
@@ -655,11 +663,7 @@ describe("#311 — a row too big to send is SKIPPED, and the page spans across i
     expect(h.warns).toEqual([]);
   });
 
-  it("a conversation of NOTHING BUT undeliverable rows sends no snapshot, loudly", () => {
-    // The frame would be empty, and an empty SNAPSHOT is suppressed exactly as
-    // it always was — an empty chat is what the peer sees either way. What must
-    // not happen is that it is silent: the `error` above is the only place this
-    // fact exists, because the wire has no "history unavailable" signal (#296).
+  it("an oversize-only conversation sends an explicit incomplete baseline within the sealed budget, loudly", () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(console, "log").mockImplementation(() => {});
     const h = harness({ reasoningDurable: true });
@@ -681,8 +685,17 @@ describe("#311 — a row too big to send is SKIPPED, and the page spans across i
     h.server.sendSnapshot(PEER);
     h.flush();
 
-    expect(outboundFrames(h)).toEqual([]);
-    expect(h.sendHistoryResults).toEqual([]);
+    const expected = { type: "history" as const, messages: [], highWaterSeq: 2, snapshotComplete: false };
+    expect(h.journal.maxSeq(PEER)).toBe(expected.highWaterSeq);
+    expect(h.transport.payloads).toHaveLength(1);
+    expect(openEnvelope(h.transport.payloads[0]!, h.sessionKey).message).toEqual(expected);
+    expect(() => openEnvelope(h.transport.payloads[0]!, new Uint8Array(32))).toThrow();
+    expect(outboundFrames(h)).toEqual([{
+      subject: OUT,
+      bytes: h.channel.outboundWireSize(PEER, expected),
+    }]);
+    expect(outboundFrames(h)[0]!.bytes).toBeLessThanOrEqual(STOCK_MAX_PAYLOAD);
+    expect(h.sendHistoryResults).toEqual([true]);
     expect(h.errors).toHaveLength(1);
     expect(h.errors[0]).toContain("skipped 2 undeliverable row(s)");
     expect(h.errors[0]).toContain("r-big-0");

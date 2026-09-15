@@ -204,6 +204,18 @@ describe("#246 half A — decodeInboundMessage: the approval frames", () => {
 });
 
 describe("#246 half A — decodeInboundMessage: the bulk frames", () => {
+  it("validates additive history modification and mapping metadata without narrowing valid IDs", () => {
+    const row = { kind: "tool", turnId: "a\0b", id: "c", seq: 4 };
+    accepts({ type: "history", messages: [row], highWaterSeq: 4, snapshotComplete: true });
+    for (const seq of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, "4", 5]) {
+      refuses({ type: "history", messages: [{ ...row, seq }], highWaterSeq: 4 });
+    }
+    refuses({ type: "history", messages: [row], snapshotComplete: "false" });
+    for (const metadata of [{ randomId: "" }, { randomId: 2 }, { revision: -1 }, { edited: "yes" }]) {
+      refuses({ type: "history", messages: [{ id: "u", role: "user", text: "x", ...metadata }] });
+    }
+    accepts({ type: "history", messages: [{ id: "u", role: "user", text: "x", randomId: "r\0id", seq: 9, revision: 2, edited: true }] });
+  });
   it("history requires a messages ARRAY and a usable high-water", () => {
     refuses({ type: "history" });
     refuses({ type: "history", messages: {} });

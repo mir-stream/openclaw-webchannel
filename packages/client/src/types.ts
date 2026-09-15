@@ -100,6 +100,8 @@ export type SendReceipt = {
  * SORT block carries the measurement.)
  */
 export type ChatBubble = {
+  revision?: number;
+  edited?: boolean;
   /**
    * Never present on a bubble — the discriminant of the `ChatMessage` union,
    * declared as `undefined` here so that (a) tsc narrows the union on it and

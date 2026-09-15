@@ -721,7 +721,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   /**
    * Send history snapshot to peer.
    */
-  sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number): boolean {
+  sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number, snapshotComplete?: boolean): boolean {
     // #244 half A: `highWaterSeq` is the conversation's authoritative MAX(seq),
     // attached to the register-time SNAPSHOT only (`history-serve.ts` passes it
     // there and omits it for the pager). Additive/optional — a `history` frame is
@@ -731,6 +731,7 @@ export class NatsChannel implements WebChannelPeerChannel {
       type: "history",
       messages,
       ...(highWaterSeq !== undefined ? { highWaterSeq } : {}),
+      ...(snapshotComplete !== undefined ? { snapshotComplete } : {}),
     };
     return this.sendToPeer(peerId, payload);
   }
