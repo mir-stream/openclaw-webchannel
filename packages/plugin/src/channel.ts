@@ -4,9 +4,11 @@ import {
 } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import type { ChannelDoctorAdapter, ChannelStatusAdapter } from "openclaw/plugin-sdk/channel-contract";
+import { waitUntilAbort } from "openclaw/plugin-sdk/channel-runtime";
 
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
+import { logSafe } from "./log-safe.js";
 import { createClawMessageAdapter, nextMessageId } from "./message-adapter.js";
 import { resolveOutboundTransport, type ResolveOutboundTransport } from "./outbound-account.js";
 import {
@@ -240,9 +242,34 @@ export function createWebChannelPlugin(
       // Contract: `ChannelGatewayAdapter` is exported by
       // `openclaw/plugin-sdk/channel-runtime`.
       gateway: {
-        startAccount: (ctx: any) => opts?.startNatsAccount
-          ? composeAccountLifecycles(ctx, opts.startNatsAccount)
-          : startClawApprovalMonitor(ctx),
+        startAccount: async (ctx: any) => {
+          if (ctx.abortSignal.aborted) return;
+          // Reads accept aliases, but core retains the raw task key. Starting
+          // either monitor under an alias would split lifecycle ownership from
+          // the listed account's storage and live runtime identity.
+          const accountId = resolveWebchannelAccountId(ctx.cfg, ctx.accountId);
+          if (accountId === undefined || accountId !== ctx.accountId) {
+            const remedy = accountId === undefined
+              ? "choose an exact valid listed account ID"
+              : `use the exact listed account ID ${logSafe(accountId)}`;
+            const lastError = `webchannel: cannot start account ${logSafe(ctx.accountId)}; ${remedy}.`;
+            try {
+              ctx.setStatus?.({
+                accountId: ctx.accountId,
+                configured: false, running: false, connected: undefined, restartPending: false,
+                lastError,
+              });
+            } catch { /* diagnostic failure must not start an invalid owner */ }
+            try { ctx.log?.error?.(lastError); } catch { /* refusal survives logger failure */ }
+            // A completed task triggers core's restart loop. Keep this refused
+            // task dormant until its host stops it, without owning any runtime.
+            await waitUntilAbort(ctx.abortSignal);
+            return;
+          }
+          return opts?.startNatsAccount
+            ? composeAccountLifecycles(ctx, opts.startNatsAccount)
+            : startClawApprovalMonitor(ctx);
+        },
       },
     } satisfies WebchannelAdapters & Record<string, unknown>)),
 

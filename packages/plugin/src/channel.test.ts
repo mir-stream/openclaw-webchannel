@@ -120,6 +120,136 @@ describe("account lifecycle composition", () => {
     const task = composeAccountLifecycles(context(host.signal), async () => {});
     await expect(task).rejects.toThrow(/nats account lifecycle exited before host abort/);
   });
+
+  it("refuses a gateway lifecycle alias without disturbing the exact listed owner", async () => {
+    const cfg = { channels: { webchannel: { accounts: { Acme: {} } } } } as any;
+    const exact = new AbortController();
+    const alias = new AbortController();
+    const error = vi.fn(() => { throw new Error("logger failed"); });
+    const disposed = vi.fn();
+    const register = vi.fn(({ accountId }: { accountId: string }) => ({
+      dispose: () => disposed(accountId),
+    }));
+    const cleanup = vi.fn();
+    const startNatsAccount = vi.fn(async (ctx: any) => {
+      if (!ctx.abortSignal.aborted) {
+        await new Promise<void>((resolve) => ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }));
+      }
+      cleanup(ctx.accountId);
+    });
+    const plugin = createWebChannelPlugin(new FakePeerChannel(), { startNatsAccount });
+    const start = (accountId: string, abortSignal: AbortSignal, setStatus = vi.fn()) =>
+      plugin.gateway!.startAccount!({
+        cfg,
+        accountId,
+        account: plugin.config.resolveAccount(cfg, accountId),
+        abortSignal,
+        setStatus,
+        log: { error },
+        channelRuntime: { runtimeContexts: { register } },
+      } as any);
+    const exactTask = start("Acme", exact.signal);
+    let aliasTask: Promise<unknown> | undefined;
+    try {
+      await Promise.resolve();
+      expect(startNatsAccount).toHaveBeenCalledTimes(1);
+      expect(register).toHaveBeenCalledWith(expect.objectContaining({ accountId: "Acme" }));
+      // Core accepts the alias for reads but retains it as the raw task key.
+      const aliasAccount = plugin.config.resolveAccount(cfg, "acme");
+      expect(aliasAccount.accountId).toBe("Acme");
+      expect(plugin.config.isConfigured!(aliasAccount, cfg)).toBe(true);
+      const aliasStatus = vi.fn();
+      aliasTask = start("acme", alias.signal, aliasStatus);
+      let aliasSettled = false;
+      void aliasTask.then(() => { aliasSettled = true; }, () => { aliasSettled = true; });
+      await Promise.resolve();
+      expect(startNatsAccount).toHaveBeenCalledTimes(1);
+      expect(register).toHaveBeenCalledTimes(1);
+      expect(aliasStatus).toHaveBeenCalledWith(expect.objectContaining({
+        accountId: "acme", configured: false, running: false, connected: undefined, restartPending: false,
+        lastError: expect.stringMatching(/exact listed account ID "Acme"/),
+      }));
+      expect(error.mock.calls).toEqual([[aliasStatus.mock.calls[0][0].lastError]]);
+      expect(aliasSettled).toBe(false);
+
+      alias.abort();
+      await expect(aliasTask).resolves.toBeUndefined();
+      expect(startNatsAccount.mock.calls[0][0].abortSignal.aborted).toBe(false);
+      expect(cleanup).not.toHaveBeenCalled();
+      expect(disposed).not.toHaveBeenCalled();
+    } finally {
+      alias.abort();
+      exact.abort();
+      await Promise.all([exactTask, aliasTask]);
+    }
+    expect(cleanup.mock.calls).toEqual([["Acme"]]);
+    expect(disposed.mock.calls).toEqual([["Acme"]]);
+  });
+
+  it("refuses aliases before an approval-only gateway monitor can register", async () => {
+    const host = new AbortController();
+    const register = vi.fn(() => ({ dispose: vi.fn() }));
+    const plugin = createWebChannelPlugin(new FakePeerChannel());
+    const task = plugin.gateway!.startAccount!({
+      cfg: { channels: { webchannel: { accounts: { Acme: {} } } } },
+      accountId: "acme", abortSignal: host.signal,
+      setStatus: vi.fn(), channelRuntime: { runtimeContexts: { register } },
+    } as any);
+    try {
+      await Promise.resolve();
+      expect(register).not.toHaveBeenCalled();
+    } finally {
+      host.abort();
+      await task;
+    }
+  });
+
+  it("starts the implicit flat default through the public gateway lifecycle", async () => {
+    const host = new AbortController();
+    const dispose = vi.fn();
+    const register = vi.fn(() => ({ dispose }));
+    const startNatsAccount = vi.fn(async (ctx: any) => {
+      if (!ctx.abortSignal.aborted) {
+        await new Promise<void>((resolve) => ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }));
+      }
+    });
+    const plugin = createWebChannelPlugin(new FakePeerChannel(), { startNatsAccount });
+    const task = plugin.gateway!.startAccount!({
+      cfg: { channels: { webchannel: { tenant: FIXTURE_TENANT } } },
+      accountId: "default", abortSignal: host.signal,
+      channelRuntime: { runtimeContexts: { register } },
+    } as any);
+    try {
+      await Promise.resolve();
+      expect(startNatsAccount).toHaveBeenCalledTimes(1);
+      expect(startNatsAccount).toHaveBeenCalledWith(expect.objectContaining({ accountId: "default" }));
+      expect(register).toHaveBeenCalledTimes(1);
+      expect(register).toHaveBeenCalledWith(expect.objectContaining({ accountId: "default" }));
+    } finally {
+      host.abort();
+      await task;
+    }
+    expect(dispose).toHaveBeenCalledOnce();
+  });
+
+  it("does not start either lifecycle or report refusal after the host already aborted", async () => {
+    const host = new AbortController();
+    host.abort();
+    const register = vi.fn(() => ({ dispose: vi.fn() }));
+    const setStatus = vi.fn();
+    const startNatsAccount = vi.fn(async () => {});
+    const plugin = createWebChannelPlugin(new FakePeerChannel(), { startNatsAccount });
+    for (const accountId of ["Acme", "acme"]) {
+      await expect(plugin.gateway!.startAccount!({
+        cfg: { channels: { webchannel: { accounts: { Acme: {} } } } },
+        accountId, abortSignal: host.signal, setStatus,
+        channelRuntime: { runtimeContexts: { register } },
+      } as any)).resolves.toBeUndefined();
+    }
+    expect(startNatsAccount).not.toHaveBeenCalled();
+    expect(register).not.toHaveBeenCalled();
+    expect(setStatus).not.toHaveBeenCalled();
+  });
 });
 
 describe("webchannel plugin", () => {

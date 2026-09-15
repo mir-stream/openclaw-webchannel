@@ -48,8 +48,10 @@ browser/Playwright variant against a hosted SaaS issuer is follow-up #13. See ST
 Account read/lookup rules are defined in
 [`resolveWebchannelAccountId`](src/account-config.ts): core aliases resolve to
 the exact listed account spelling, which remains the tenant/JWT/subject/storage
-identity. Setup keeps its existing write-ID policy. `openclaw doctor` reports an
-invalid `channels.webchannel.defaultAccount`, its selected fallback and a remedy;
+identity. Gateway lifecycle starts require the exact listed ID; an alias is
+refused before approval or NATS startup.
+Setup keeps its existing write-ID policy. `openclaw doctor` reports an invalid
+`channels.webchannel.defaultAccount`, its selected fallback and a remedy;
 selection alone does not establish runtime availability.
 
 ## Enrollment & credentials (NATS mode)

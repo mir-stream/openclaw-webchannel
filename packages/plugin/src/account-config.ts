@@ -407,6 +407,8 @@ export function resolveDefaultWebchannelAccountId(cfg: unknown): string {
  * trimming; a case-mismatched preference stays invalid and diagnosable. Setup
  * writes use their existing ID policy and resolveWebchannelAccountConfigForSetup
  * for exact write-target merges, including shared base for a new account.
+ * Gateway lifecycle starts require the exact listed ID before either approval
+ * or NATS ownership starts; core's task key must match the storage identity.
  */
 export function resolveWebchannelAccountId(
   cfg: unknown,
