@@ -190,6 +190,8 @@ export function decodeInboundWsMessage(raw: unknown): InboundWsDecodeResult {
       if (id !== undefined && !isUsableWireId(id)) {
         return invalid(known, "id must be a non-empty string within the id length bound");
       }
+      const retryOf = field(raw, "retry_of");
+      if (retryOf !== undefined && !isUsableWireId(retryOf)) return invalid(known, "retry_of must be a message id");
       const randomId = field(raw, "random_id");
       if (randomId !== undefined && !isUsableWireId(randomId)) {
         return invalid(

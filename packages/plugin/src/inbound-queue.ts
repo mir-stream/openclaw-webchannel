@@ -7,7 +7,7 @@ import {
   type RetentionSessionToken,
 } from "./inbound-retention.js";
 
-export type UserMessageLike = { type: "user_message"; text: string; id?: string; random_id?: string };
+export type UserMessageLike = { type: "user_message"; text: string; id?: string; random_id?: string; retry_of?: string };
 
 /**
  * #99: the wireIds of every message folded into one coalesced turn, in arrival
@@ -79,6 +79,7 @@ export function normalizeInboundUserMessage(raw: UserMessageLike): UserMessageLi
     text: raw.text,
     ...(typeof raw.id === "string" ? { id: raw.id } : {}),
     ...(typeof raw.random_id === "string" ? { random_id: raw.random_id } : {}),
+    ...(typeof raw.retry_of === "string" ? { retry_of: raw.retry_of } : {}),
   };
 }
 

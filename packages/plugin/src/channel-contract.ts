@@ -1,3 +1,4 @@
+import type { RequestState } from "../../client/src/durable-view-reducer.js";
 import { ANON_PEER_ID } from "./auth.js";
 import type { CommandCatalogEntry } from "./commands-catalog.js";
 // #244 half B: the `difference` frame carries RAW journal events for the client
@@ -78,6 +79,8 @@ export { ANON_PEER_ID };
  * Full rationale: `docs/ISSUE_95_HISTORY_CONTRACT_PLAN.md`.
  */
 export type HistoryTextMessage = {
+  requestState?: RequestState;
+  retryOf?: string;
   /** Explicit origin mapping; absent for legacy journal rows. */
   randomId?: string;
   turnId?: string;
@@ -312,7 +315,7 @@ export type InboundWsMessage =
   // durable-id ownership to the server and this key is what carries retry
   // idempotency once it can no longer ride the journal's message_id. Optional to
   // mirror the wire (older clients omit it).
-  | { type: "user_message"; text: string; id?: string; random_id?: string }
+  | { type: "user_message"; text: string; id?: string; random_id?: string; retry_of?: string }
   | { type: "approval_decision"; id: string; decision: ApprovalDecision }
   /**
    * Page older history.
@@ -526,6 +529,7 @@ export type OutboundWsMessage =
       /** #244 half A — see `agent_message`. Every `tool_activity` delta is durable. */
       seq?: number;
     }
+  | { type: "request_state"; id: string; state: RequestState; turnId: string; seq: number }
   | { type: "turn_settled"; turnId: string; outcome: "ok" | "error" }
   /**
    * #212 (Phase 3, targeted): the plugin's authoritative, ordered set of the
@@ -655,7 +659,9 @@ export type OutboundWsMessage =
    * this type drops it" before v4; under exact-match there is no such peer — the
    * property is unchanged, only the reason for it.)
    */
-  | { type: "user_committed"; id: string; text: string; turnId?: string; seq: number; random_id?: string }
+  | { type: "user_committed";
+      requestState?: RequestState;
+      retryOf?: string; id: string; text: string; turnId?: string; seq: number; random_id?: string }
   /**
    * #244 half B / #356 (doc §16.7): the answer to `get_difference` — the RAW
    * journal events with `seq > afterSeq`, each paired with its `seq`, in ascending

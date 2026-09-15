@@ -374,7 +374,7 @@ export async function createWidget(
         nextMdCache.set(key, rendered);
         child = rendered;
       }
-      bubbles.push(el(
+      const bubble = el(
         "div",
         {
           style:
@@ -387,7 +387,16 @@ export async function createWidget(
             (m.working ? ";opacity:.7;font-style:italic" : ""),
         },
         [child],
-      ));
+      );
+      if (isUser && m.requestState === "interrupted") {
+        const retry = el("button", {}, ["Retry"]) as HTMLButtonElement;
+        retry.onclick = () => { client?.retryInterrupted(m.id); };
+        bubble.append(el("div", {}, ["Interrupted · result unknown. Check any effects before retrying.", retry]));
+      } else if (isUser && m.requestState === "cancelled") {
+        bubble.append(el("div", {}, ["Cancelled"]));
+      }
+      if (isUser && m.retryOf) bubble.append(el("small", {}, ["Retry of an interrupted request"]));
+      bubbles.push(bubble);
     }
 
     // Activity hint (#96). `activityHint` owns the decision: the reasoning lane

@@ -1,3 +1,4 @@
+import type { RequestState } from "./durable-view-reducer.js";
 /**
  * WebChannel NATS Client — Browser-side NATS connection.
  *
@@ -167,6 +168,7 @@ export type InboundMessage = {
     // `applyTool` folds them into one durable message.
     // `argKeys` are argument KEY NAMES only — never values.
     | "tool_activity"
+    | "request_state"
     | "turn_settled"
     // #212 (Phase 3): the plugin's authoritative ordered set of the turn's agent
     // ANSWER bubbles (carries `answers` + `remove`, keyed by `turnId`). Additive
@@ -231,6 +233,9 @@ export type InboundMessage = {
    * plugin import.
    */
   outcome?: "ok" | "error";
+  state?: RequestState;
+  requestState?: RequestState;
+  retryOf?: string;
   kind?: "exec" | "plugin";
   title?: string;
   /**
@@ -297,6 +302,8 @@ export type InboundMessage = {
     /** Last row modification in the journal, not an ordering key. */
     seq?: number;
     randomId?: string;
+    requestState?: RequestState;
+    retryOf?: string;
     revision?: number;
     edited?: boolean;
     id: string;
@@ -410,7 +417,7 @@ export type OutboundMessage =
   // is still the durable id, but half 2 makes the server mint the durable id, at
   // which point retry idempotency can no longer ride the journal's message_id and
   // must already be riding `random_id`. Typed optional to mirror the wire union.
-  | { type: "user_message"; text: string; id?: string; random_id?: string }
+  | { type: "user_message"; text: string; id?: string; random_id?: string; retry_of?: string }
   | { type: "approval_decision"; id: string; decision: string }
   // #320: `beforeTurnId` completes the page cursor for a TOOL row, which is
   // addressed by the pair `(turnId, id)`. Additive — omitting it is the id-only
@@ -1579,7 +1586,7 @@ export class WebChannelNatsClient {
    * exactly as today. Defaulted to a fresh token; injectable for deterministic
    * tests.
    */
-  sendUserMessage(text: string, reservedId?: string, randomId: string = randomInboxToken()): string {
+  sendUserMessage(text: string, reservedId?: string, randomId: string = randomInboxToken(), retryOf?: string): string {
     const id = reservedId === undefined ? this.reserveWireId() : reservedId;
     this.consumeReservedId(id);
     // Seed without notifying. For a live send, its queue position must be owned
@@ -1618,7 +1625,7 @@ export class WebChannelNatsClient {
     // Authoritative outbound ownership precedes every public callback. A nested
     // send appends behind this entry; whichever stack frame starts the drain will
     // therefore publish in logical call order.
-    this.outboundQueue.push({ type: "user_message", text, id, random_id: randomId });
+    this.outboundQueue.push({ type: "user_message", text, id, random_id: randomId, ...(retryOf ? { retry_of: retryOf } : {}) });
     this.emitSendState(id, "queued");
     this.drainOutboundQueue();
     return id;

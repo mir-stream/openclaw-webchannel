@@ -69,6 +69,7 @@ export const HISTORY_REPLAY_CHUNK_ROWS = 512;
  * without saying why here.
  */
 export const KNOWN_EVENT_KINDS: Record<JournalEvent["kind"], true> = {
+  requestState: true,
   user: true,
   placement: true,
   bubble: true,
@@ -549,6 +550,8 @@ export function historyRowFor(
     case "text":
       return {
         id: message.id, role: message.role, text: message.text, ts,
+        ...(message.requestState ? { requestState: message.requestState } : {}),
+        ...(message.retryOf ? { retryOf: message.retryOf } : {}),
         ...(message.turnId !== undefined ? { turnId: message.turnId } : {}),
         ...(message.revision !== undefined ? { revision: message.revision } : {}),
         ...(message.edited !== undefined ? { edited: message.edited } : {}),
@@ -693,6 +696,7 @@ export function recordFirstSeen(
         if (answer && typeof answer === "object") note(answer.id);
       }
       return;
+    case "requestState":
     case "messageEdited":
     case "messageDeleted":
       // #241 half 1 (typed event model). `note` is first-write-wins, so noting

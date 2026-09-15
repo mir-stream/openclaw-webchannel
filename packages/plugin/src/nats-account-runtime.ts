@@ -1,3 +1,5 @@
+import { prepareCoreDispatch, registerCoreDispatchRecoveryService, waitForCoreDispatchRecovery } from "./dispatch-core-recovery.js";
+import { createDispatchRecovery, type DispatchRecovery } from "./dispatch-recovery.js";
 /**
  * WebChannel NATS per-account runtime and plugin definition.
  *
@@ -31,8 +33,6 @@ import {
   stopAgentLifecycleSubscription,
 } from "./inbound.js";
 import {
-  createSerializedInboundDispatcher,
-  coalesceUserMessages,
   normalizeInboundUserMessage,
 } from "./inbound-queue.js";
 import type { CoalescedMemberIds, SerializedInboundDispatcher } from "./inbound-queue.js";
@@ -987,6 +987,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       const pressureLogger = new InboundPressureLogger(
         (message) => (api.logger?.warn ?? console.warn)?.(message),
       );
+      let dispatchRecovery: DispatchRecovery | undefined;
       let inboundDispatcher: SerializedInboundDispatcher<WebchannelUserMessage> | undefined;
       let inboundDebouncer: BoundedInboundDebouncer<DebounceItem> | undefined;
       let disposePromise: Promise<import("./nats-account-coordinator.js").DisposeReport> | undefined;
@@ -995,6 +996,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         disposePromise = (async () => {
           const errors: Array<{ phase: string; error: unknown }> = [];
           runtimeActive = false;
+          try { dispatchRecovery?.dispose(); } catch (error) { errors.push({ phase: "dispatch-recovery", error }); }
           try { attemptAbort.dispose(); } catch (error) { errors.push({ phase: "attempt-abort-listener", error }); }
           try { inboundDebouncer?.dispose(); } catch (error) { errors.push({ phase: "debouncer", error }); }
           try { inboundDispatcher?.dispose(); } catch (error) { errors.push({ phase: "dispatcher", error }); }
@@ -1051,27 +1053,23 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // Each account gets its OWN serialized dispatcher bound to its channel and
       // accountId, so inbound turns resolve THIS account's route (binding.account)
       // and replies deliver back over THIS account's channel.
-      inboundDispatcher =
-        createSerializedInboundDispatcher<WebchannelUserMessage>(
-          (peerId, message) =>
-            handleInboundMessage(
-              api,
-              channel,
-              peerId,
-              message,
-              accountId,
-              tenant,
-            ),
-          {
-            // P1-8b layer (b): busy-time coalesce. A message that arrives while a
-            // turn is already running for its session buffers and is merged into
-            // ONE follow-up turn on completion (Telegram parity), instead of
-            // chaining a separate turn each.
-            coalesce: coalesceUserMessages,
-            budget: processInboundRetention,
-            sessionToken,
-          },
-        );
+      if (!deliveryJournal?.dispatch) throw new Error("webchannel: durable dispatch store required");
+      dispatchRecovery = createDispatchRecovery({
+        store: deliveryJournal.dispatch,
+        handler: (peerId, message, onSettled, ownership) => handleInboundMessage(api, channel, peerId, message, accountId, tenant, {
+          onSettled,
+          ...(ownership ? { dispatchAbortSignal: ownership.abortSignal } : {}),          ...(ownership ? { beforeCore: (agentId: string, sessionKey: string) => {
+            if (!dispatchRecovery!.owns()) throw new Error("webchannel: dispatch owner retired before core call");
+            prepareCoreDispatch(api.config, agentId, sessionKey, { owner: ownership.owner, batch: ownership.batch, peerId }, deliveryJournal!);
+          } } : {}),
+        }),
+        acquirePeer: (peerId) => channel.acquireRecoveryPeer(peerId),
+        notify: (change) => { channel.sendRequestState(change); },
+        isActive: () => runtimeActive,
+        warn: (error) => api.logger?.warn?.(`webchannel: dispatch recovery failed: ${logSafe(error)}`),
+        dispatcherOptions: { budget: processInboundRetention, sessionToken },
+      });
+      inboundDispatcher = dispatchRecovery.dispatcher;
       const cancelledInboundFallback = processCancelledInboundFallback;
 
       // P1-8b layer (a): repo-owned bounded idle pre-run debounce (Telegram
@@ -1094,7 +1092,8 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       const onIngressFlush = createIngressOnFlush<DebounceItem>({
         accountId,
         outcomeStore: processIngressOutcomes,
-        beginBatch: (peerId) => inboundDispatcher!.beginBatch(peerId),
+        beginBatch: (peerId) => dispatchRecovery!.beginBatch(peerId),
+        dispatchRecovery,
         // #243 half 2a: forward the server-assigned-id echo so it rides the ack.
         sendAck: (peerId, ids, committed) => channel.sendAck(peerId, ids, committed),
         sendInboundRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids),
@@ -1179,7 +1178,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
 
       const retirePeerIngress = (peerId: string): void => {
         inboundDebouncer!.cancelKey(peerId, { notify: false });
-        inboundDispatcher!.clearPending(peerId);
+        dispatchRecovery!.retirePeer(peerId);
         const token = sessionTokens.get(peerId);
         if (token) processOverflowResolver.invalidateSession(token);
         sessionTokens.delete(peerId);
@@ -1268,8 +1267,12 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           //     abort actually succeeded (their follow-up runs after the abort) —
           //     accepted over destroying input for a peer whose turn survives.
           if (shouldDropBufferedInputOnStop(message, commandGate, peerId)) {
+            // Fail closed before releasing any queued work if cancellation cannot persist.
+            try { dispatchRecovery!.cancel(peerId); }
+            catch (error) { api.logger?.warn?.(`webchannel: dispatch cancellation failed: ${logSafe(error)}`); return; }
             const debounceCancelled = inboundDebouncer!.cancelKey(peerId, { notify: true });
             const pendingDropped = inboundDispatcher!.clearPending(peerId);
+            dispatchRecovery!.retirePeer(peerId);
             if (debounceCancelled || pendingDropped.length > 0) {
               api.logger?.info?.(
                 `webchannel: /stop dropped buffered input (debounced=${debounceCancelled}, pending=${pendingDropped.length})`,
@@ -1628,6 +1631,11 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         });
         if (committed instanceof Promise) await committed;
         reportServingAggregate(api);
+        void waitForCoreDispatchRecovery().then(() => {
+          if (!runtimeActive) return;
+          dispatchRecovery!.start();
+          channel.setDispatchOwnerFence(() => dispatchRecovery!.owns());
+        }).catch(error => api.logger?.error?.(`webchannel: dispatch startup failed: ${logSafe(error)}`));
         markCommitted();
       } catch (err) {
         // If the helper already disposed, its synchronous snapshot still
@@ -1717,6 +1725,7 @@ export default defineChannelPluginEntry({
         stopAgentLifecycleSubscription();
       },
     });
+    registerCoreDispatchRecoveryService(api);
     accountCoordinator.installFull(api);
     api.logger.info(
       `webchannel: loaded plugin bundle (plugin=webchannel, source=${LOADED_PLUGIN_BUNDLE_PATH})`,

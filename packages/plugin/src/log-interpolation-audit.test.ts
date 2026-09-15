@@ -88,6 +88,7 @@ const ENFORCED = [
   "ingress-dedupe.ts",
   "approvals.ts",
   "nats-account-runtime.ts",
+  "dispatch-core-recovery.ts",
   "auth.ts",
   "nats-channel.ts",
   "history.ts",
@@ -106,6 +107,7 @@ const ENFORCED = [
  * baseline, which is how this list shrinks to nothing instead of rotting.
  */
 const KNOWN_RAW: Record<string, readonly string[]> = {
+  "dispatch-core-recovery.ts": [],
   "inbound.ts": [],
 
   /**
@@ -259,11 +261,12 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
  * DELIBERATELY — that is the point.
  */
 const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: number }> = {
+  "dispatch-core-recovery.ts": { statements: 6, interpolations: 1 },
   // #173 (Phase 1) removed the settlement keyframe and its three warns (the
   // timed-out read, the not-delivered send, and the empty-projection skip —
   // 4+2+3 interpolations), restoring this to 6/12 now that the plugin emits the
   // corrected [A][B] sequence directly and no resync read exists to narrate.
-  "inbound.ts": { statements: 6, interpolations: 12 },
+  "inbound.ts": { statements: 7, interpolations: 12 },
   // #239 half 3 adds the two delivery-journal warnings (13→15) and their six
   // interpolations (7→13): `peerId` twice, plus `reason`/`action` on the gap
   // line and `journalable.length`/`journalFailureDiagnostic(error)` on the
@@ -278,7 +281,7 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // `usableId` before it ever reaches the log, but the wrapping is what makes it
   // safe, not the bound. It was spelled `random_id=` until round 3 widened the
   // journal lookup to cover clients that send no `random_id`.)
-  "ingress-dedupe.ts": { statements: 16, interpolations: 15 },
+  "ingress-dedupe.ts": { statements: 17, interpolations: 15 },
   "approvals.ts": { statements: 9, interpolations: 24 },
   // #240 half 2 rewired both history read sites onto the delivery journal, then
   // review round 1 EXTRACTED both into `history-serve.ts`. 23→19 statements,
@@ -312,7 +315,7 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // NO entry to `KNOWN_RAW` above — which is the whole point of checking both
   // numbers rather than just the floor: a raw value would have shown up there
   // instead, and the baseline is exact-multiset.
-  "nats-account-runtime.ts": { statements: 20, interpolations: 38 },
+  "nats-account-runtime.ts": { statements: 25, interpolations: 41 },
   "auth.ts": { statements: 16, interpolations: 5 },
   // #244 half B added the `Invalid get_difference` guard warn (one statement,
   // one `logSafe(peerId)` interpolation): 22→23 statements, 33→34 interpolations.

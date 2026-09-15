@@ -897,6 +897,10 @@ export async function handleInboundMessage(
   servingTenant: string,
   options?: {
     controlLane?: boolean;
+    dispatchAbortSignal?: AbortSignal;
+    /** Persist the exact dispatch batch before a successful transient settlement. */
+    onSettled?: (outcome: "ok" | "error") => boolean;
+    beforeCore?: (agentId: string, sessionKey: string) => void;
     /** Injectable only so the session opt-out privacy boundary is testable. */
     reasoningOptOutStore?: ReasoningOptOutStoreAccess;
   },
@@ -1071,6 +1075,7 @@ export async function handleInboundMessage(
   // NOT vestigial — the write-side reason above is the stronger one, and it is
   // now the whole reason. See `session-route.ts`'s module docblock.
   const route = resolveWebchannelSessionRoute(api, accountId, wsKey, servingTenant);
+  options?.beforeCore?.(route.agentId, route.sessionKey);
 
   // #93: build this turn's approval-origin lease handle. Creating it claims
   // NOTHING — `activate()` in `onAgentRunStart` is what publishes the claim, so
@@ -1254,6 +1259,8 @@ export async function handleInboundMessage(
             // reasoning and draft callbacks inside it are conditional, each on
             // its own lane having opened.
             replyOptions: {
+                    ...(options?.dispatchAbortSignal ? { abortSignal: options.dispatchAbortSignal } : {}),
+                    ...(options?.dispatchAbortSignal ? { onTurnAdopted: () => { if (options.dispatchAbortSignal!.aborted) throw new Error("webchannel: dispatch retired before core run"); } } : {}),
                     // #87: always wired, on every turn and every streaming mode
                     // — this is how the turn learns which agent run's lifecycle
                     // terminal is its own.
@@ -1829,7 +1836,8 @@ export async function handleInboundMessage(
       );
     }
 
-    if (settlementEligible) {
+    const settlementStored = options?.onSettled?.(settlementEligible ? turnOutcome : "error") ?? true;
+    if (settlementEligible && settlementStored) {
       // #99: this turn may be the merge of N buffered user messages (P1-8b layer
       // (b) coalescing). Each of them was ACKed and holds its own P0-4 receipt,
       // and only a `turn_settled` naming that exact wireId can move it off

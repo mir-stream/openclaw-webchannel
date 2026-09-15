@@ -46,6 +46,8 @@
  * monotonic revision are **#241** (doc §16.2-3/4); a second `bubble` for one
  * answer id is untyped last-write-wins until then, see `append` below.
  */
+import { createDispatchStore, type DispatchStore } from "./dispatch-store.js";
+import type { RequestState } from "../../client/src/durable-view-reducer.js";
 import { chmodSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -212,6 +214,8 @@ export type DeliveryJournalRow = {
 };
 
 export interface DeliveryJournal {
+  /** Present on the production SQLite journal; absent only on legacy test adapters. */
+  dispatch?: DispatchStore;
   /**
    * Append one event and return its per-conversation `seq`.
    *
@@ -763,6 +767,13 @@ export function openDeliveryJournal(options: {
 
   // 2. Open. SQLite creates the main file here, at 0666 & ~umask.
   const db = new DatabaseSync(databasePath);
+  // Refuse future dispatch formats before running any journal migration/pragma.
+  try {
+    const meta = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal_meta'").get();
+    const version = meta ? db.prepare("SELECT value FROM journal_meta WHERE key='dispatch_schema_version'").get() as { value: string } | undefined : undefined;
+    if (version && version.value !== "1") throw new Error("webchannel: unsupported dispatch schema version; use the writer version or newer");
+  } catch (error) { closeQuietly(db); throw error; }
+
 
   // Steps 3-6 and the statement preparation all run against an OPEN handle, and
   // every one of them can throw — `chmodDatabaseFiles` rethrows a non-ENOENT
@@ -797,7 +808,81 @@ export function openDeliveryJournal(options: {
   let closed = false;
   const history = createMaterializedHistory(db, options.onHistoryWork);
 
+  const appendUserUnlocked = (conversationId: string, input: { text: string; turnId?: string; randomId?: string; requestState?: RequestState; retryOf?: string }) => {
+    const idempotencyKey = input.randomId ?? input.turnId;
+        // CHECK-FIRST, inside the txn: a replay of a message we already journaled
+        // (same key) returns the FIRST row's id, never a second row. This is the
+        // idempotency net #243 half 2a needs — persist-before-publish means a
+        // batch can commit a row and then be refused, and the client replays it;
+        // this returns the committed row instead of duplicating it. Same-peer
+        // serialization plus this immediate txn make the check-then-insert atomic.
+        if (idempotencyKey !== undefined) {
+          const existing = selectUserByIdempotencyKey.get(
+            conversationId,
+            idempotencyKey,
+          ) as { seq: number; message_id: string } | undefined;
+          if (existing !== undefined) {
+            return {
+              seq: Number(existing.seq),
+              inserted: false,
+              messageId: existing.message_id,
+            };
+          }
+        }
+        const seq = Number(
+          (selectNextSeq.get(conversationId) as { next: number }).next,
+        );
+        const messageId = mintServerUserMessageId(seq);
+        const event: JournalEvent = {
+          kind: "user",
+          id: messageId,
+          text: input.text,
+          ...(input.turnId === undefined ? {} : { turnId: input.turnId }),
+          // #337: carry the client's `random_id` INTO the payload (a distinct
+          // field, NOT the `idempotency_key` column — that column is
+          // `randomId ?? turnId` and can't be disambiguated). `read()`→`row.event`
+          // then ships it verbatim in `serveDifference`, so the client can re-key
+          // an un-adopted optimistic user bubble by it and no-op the fold. Absent
+          // when an older client sent no random_id ⇒ the client falls back to
+          // append (safe). The reducer never reads it (folds by `id`).
+          ...(input.randomId === undefined ? {} : { randomId: input.randomId }),
+          ...(input.requestState ? { requestState: input.requestState } : {}),
+          ...(input.retryOf ? { retryOf: input.retryOf } : {}),
+        };
+        const result = insertEvent.run(
+          conversationId,
+          seq,
+          "user",
+          messageId,
+          input.turnId ?? null,
+          JSON.stringify(event),
+          now(),
+          idempotencyKey ?? null,
+        );
+        // With the check above passed, a fresh `seq` yields a fresh `message_id`
+        // and a fresh `idempotency_key`, so neither unique index can conflict. A
+        // zero-change insert here is therefore a construction bug — fail loudly
+        // rather than return a seq that names some other row.
+        if (Number(result.changes) === 0) {
+          throw new Error(
+            "webchannel: appendInboundUser insert conflicted after an idempotency " +
+              `miss (key ${String(idempotencyKey)}, id ${messageId}) — construction bug`,
+          );
+        }
+        return { seq, inserted: true, messageId };
+
+  };
+
+  const appendEventUnlocked = (peer: string, event: JournalEvent) => {
+    const seq = Number((selectNextSeq.get(peer) as { next: number }).next);
+    insertEvent.run(peer, seq, event.kind, extractMessageId(event), extractTurnId(event), JSON.stringify(event), now(), null);
+    return { seq };
+  };
+  let dispatch: DispatchStore;
+  try { dispatch = createDispatchStore(db, appendUserUnlocked, appendEventUnlocked); }
+  catch (error) { maintenance.close(); closeQuietly(db); throw error; }
   return {
+    dispatch,
     historyPage(conversationId, plan, targetSeq) {
       if (closed) throw new Error("webchannel: delivery journal is closed");
       return history.page(conversationId, plan, targetSeq);
@@ -915,91 +1000,7 @@ export function openDeliveryJournal(options: {
     },
 
     appendInboundUser(conversationId, input) {
-      // The STABLE idempotency key is the client `random_id` when it sent one,
-      // else its wire id (which the client reuses verbatim on every replay). It is
-      // what makes this method idempotent even though the durable id is now
-      // server-minted rather than the wire id the old `journal_user_once` net
-      // keyed on.
-      //
-      // ⚠️ PRECONDITION — `randomId` IS CALLER-VALIDATED; THIS METHOD DOES NOT
-      // RE-BOUND IT. It is stored verbatim and INDEXED (`journal_user_idempotency_once`),
-      // so its length matters, but the bound lives at the caller by design (#270's
-      // "bound what you index, at the door"): `ingress-dedupe.ts` passes
-      // `usableId(item.message.random_id) ? item.message.random_id : undefined`,
-      // i.e. a non-empty string ≤ `MAX_INGRESS_DEDUPE_ID_LENGTH` (128) or
-      // `undefined`. That is exactly `ingressDedupeKey`'s keyBody rule, so
-      // `randomId ?? turnId` here EQUALS the dedupe key body — but only because
-      // the caller already gated it. A caller that skipped that gate would index
-      // an unbounded client token; the coupling is deliberate and must stay
-      // conscious. `turnId` (the wire id) is likewise the caller's gated value.
-      const idempotencyKey = input.randomId ?? input.turnId;
-      // The id is SERVER-MINTED, so this path does NOT run the client-supplied-id
-      // validation `append` and `journalEventForInboundUser` apply — that guard
-      // exists to bound HOSTILE input, and this id is our own mint
-      // (`webchannel-user-<seq>`), short and always well-formed. #243 half 2a item
-      // 4: the check shifts from "bound hostile input" to "trust our own mint",
-      // exactly as agent ids are already unchecked. `turnId` is still the client's
-      // wire id and is only ever handled structurally.
-      return runSqliteImmediateTransactionSync(db, () => {
-        // CHECK-FIRST, inside the txn: a replay of a message we already journaled
-        // (same key) returns the FIRST row's id, never a second row. This is the
-        // idempotency net #243 half 2a needs — persist-before-publish means a
-        // batch can commit a row and then be refused, and the client replays it;
-        // this returns the committed row instead of duplicating it. Same-peer
-        // serialization plus this immediate txn make the check-then-insert atomic.
-        if (idempotencyKey !== undefined) {
-          const existing = selectUserByIdempotencyKey.get(
-            conversationId,
-            idempotencyKey,
-          ) as { seq: number; message_id: string } | undefined;
-          if (existing !== undefined) {
-            return {
-              seq: Number(existing.seq),
-              inserted: false,
-              messageId: existing.message_id,
-            };
-          }
-        }
-        const seq = Number(
-          (selectNextSeq.get(conversationId) as { next: number }).next,
-        );
-        const messageId = mintServerUserMessageId(seq);
-        const event: JournalEvent = {
-          kind: "user",
-          id: messageId,
-          text: input.text,
-          ...(input.turnId === undefined ? {} : { turnId: input.turnId }),
-          // #337: carry the client's `random_id` INTO the payload (a distinct
-          // field, NOT the `idempotency_key` column — that column is
-          // `randomId ?? turnId` and can't be disambiguated). `read()`→`row.event`
-          // then ships it verbatim in `serveDifference`, so the client can re-key
-          // an un-adopted optimistic user bubble by it and no-op the fold. Absent
-          // when an older client sent no random_id ⇒ the client falls back to
-          // append (safe). The reducer never reads it (folds by `id`).
-          ...(input.randomId === undefined ? {} : { randomId: input.randomId }),
-        };
-        const result = insertEvent.run(
-          conversationId,
-          seq,
-          "user",
-          messageId,
-          input.turnId ?? null,
-          JSON.stringify(event),
-          now(),
-          idempotencyKey ?? null,
-        );
-        // With the check above passed, a fresh `seq` yields a fresh `message_id`
-        // and a fresh `idempotency_key`, so neither unique index can conflict. A
-        // zero-change insert here is therefore a construction bug — fail loudly
-        // rather than return a seq that names some other row.
-        if (Number(result.changes) === 0) {
-          throw new Error(
-            "webchannel: appendInboundUser insert conflicted after an idempotency " +
-              `miss (key ${String(idempotencyKey)}, id ${messageId}) — construction bug`,
-          );
-        }
-        return { seq, inserted: true, messageId };
-      });
+      return runSqliteImmediateTransactionSync(db, () => appendUserUnlocked(conversationId, input));
     },
 
     lookupUserMessageIdByRandomId(conversationId, randomId) {
@@ -1244,6 +1245,7 @@ function extractMessageId(event: JournalEvent): string | null {
       // id-alone identity that **#320** exists to replace. When tool rows need a
       // column to key on, it is the composite — a schema change, not this switch.
       return null;
+    case "requestState":
     case "messageEdited":
     case "messageDeleted":
       // #241 half 1 (typed event model). Both name the TEXT message they mutate,

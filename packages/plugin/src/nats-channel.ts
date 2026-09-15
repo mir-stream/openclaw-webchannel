@@ -1,3 +1,4 @@
+import type { DispatchChange } from "./dispatch-store.js";
 /**
  * NATS Channel — Plugin-side NATS message channel.
  *
@@ -320,6 +321,8 @@ export class NatsChannel implements WebChannelPeerChannel {
    * channel (the constructor requires it when `encryptionRequired`); null only
    * in the non-encrypted test construction. See NatsChannelCryptoOptions.
    */
+  private readonly recoveryKeys = new Map<string, { key: Uint8Array; refs: number }>();
+  private dispatchOwnerActive: (() => boolean) | undefined;
   private readonly keyStore: ConversationKeyStore | null;
   /**
    * F2: agent SaaS-attested static identity key pair used to wrap K to a device
@@ -456,6 +459,29 @@ export class NatsChannel implements WebChannelPeerChannel {
    * Subscribes to the peer's inbound subject. Called when a browser
    * connects with its bootstrap JWT (peerId from JWT sub claim).
    */
+  /** Accepted work already has peer authority. Restore outbound only; never subscribe inbound. */
+  acquireRecoveryPeer(peerId: string): (() => void) | undefined {
+    if (this.disposed) return undefined;
+    const held = this.recoveryKeys.get(peerId);
+    const key = held?.key ?? this.keyStore?.get(peerId);
+    if (!key) return undefined;
+    const entry = held ?? { key, refs: 0 };
+    entry.refs++;
+    this.recoveryKeys.set(peerId, entry);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (--entry.refs === 0 && this.recoveryKeys.get(peerId) === entry) this.recoveryKeys.delete(peerId);
+    };
+  }
+
+  setDispatchOwnerFence(active: () => boolean): void { this.dispatchOwnerActive = active; }
+
+  sendRequestState(change: DispatchChange): boolean {
+    return this.sendToPeer(change.peerId, { type: "request_state", id: change.id, state: change.state, turnId: change.turnId, seq: change.seq });
+  }
+
   registerPeer(peerId: string): void {
     if (this.disposed) throw new Error("NatsChannel is disposed");
     // Phase 6 (keyStore mode): establish the peer's STABLE conversation key K
@@ -589,6 +615,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     for (const sid of this.peerSubscriptions.values()) this.transport.unsubscribe(sid);
     this.peerSubscriptions.clear();
     this.peerSessionKeys.clear();
+    this.recoveryKeys.clear();
     this.seenMessageIds.clear();
     this.onMessage = undefined;
     this.onApprovalDecision = undefined;
@@ -785,13 +812,15 @@ export class NatsChannel implements WebChannelPeerChannel {
    */
   sendUserCommitted(
     peerId: string,
-    message: { id: string; text: string; turnId?: string; seq: number; random_id?: string },
+    message: { id: string; text: string; turnId?: string; seq: number; random_id?: string; requestState?: "queued"; retryOf?: string },
   ): boolean {
     const payload: OutboundWsMessage = {
       type: "user_committed",
       id: message.id,
       text: message.text,
       seq: message.seq,
+      ...(message.requestState ? { requestState: message.requestState } : {}),
+      ...(message.retryOf ? { retryOf: message.retryOf } : {}),
       ...(message.turnId !== undefined ? { turnId: message.turnId } : {}),
       ...(message.random_id !== undefined ? { random_id: message.random_id } : {}),
     };
@@ -1053,8 +1082,8 @@ export class NatsChannel implements WebChannelPeerChannel {
    * success here, keeping delivered independent from journaled.
    */
   private sendToPeer(peerId: string, payload: OutboundWsMessage): boolean {
-    if (this.disposed) return false;
-    const sessionKey = this.encryptionRequired ? this.peerSessionKeys.get(peerId) : undefined;
+    if (this.disposed || (this.dispatchOwnerActive && !this.dispatchOwnerActive())) return false;
+    const sessionKey = this.encryptionRequired ? (this.peerSessionKeys.get(peerId) ?? this.recoveryKeys.get(peerId)?.key) : undefined;
     if (this.encryptionRequired && !sessionKey) {
       console.warn(
         `[nats-channel] Refusing to send to ${logSafe(peerId)}: no session key yet (fail-closed, no plaintext)`,
