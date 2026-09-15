@@ -159,17 +159,19 @@ describe("#381 production approval finalization with SQLite storage faults", () 
     const f = fixture();
     const entry = await f.deliver();
     const publish = f.transport.publish.bind(f.transport);
-    let observed = false;
+    const observed: Array<{
+      pending: ReturnType<typeof listPendingApprovalsForPeer>;
+      resolved: ReturnType<typeof listResolvedApprovalsForPeer>;
+    }> = [];
     vi.spyOn(f.transport, "publish").mockImplementation((subject, payload) => {
       if (JSON.parse(typeof payload === "string" ? payload : Buffer.from(payload).toString()).type === "approval_resolved") {
-        observed = true;
-        expect(listPendingApprovalsForPeer(ACCOUNT, PEER)).toEqual([]);
-        expect(listResolvedApprovalsForPeer(ACCOUNT, PEER)).toEqual([{ id: f.card.id, decision: "allow-once" }]);
+        observed.push({ pending: listPendingApprovalsForPeer(ACCOUNT, PEER), resolved: listResolvedApprovalsForPeer(ACCOUNT, PEER) });
       }
       publish(subject, payload);
     });
     await f.finalize(entry);
-    expect(observed).toBe(true);
+    // Assert outside publish: its errors are intentionally caught by the channel.
+    expect(observed).toEqual([{ pending: [], resolved: [{ id: f.card.id, decision: "allow-once" }] }]);
     expect(f.history()[0]).toMatchObject({ resolvedDecision: "allow-once" });
   });
 

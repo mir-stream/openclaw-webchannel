@@ -986,6 +986,7 @@ describe("e2e/local/ports.json", () => {
     { file: "packages/plugin/src/auth.ts", value: 4000, count: 1, reason: "JWKS fetch timeout in ms" },
     { file: "packages/plugin/src/enrollment-client.ts", value: 5000, count: 1, reason: "RFC 8628 polling floor in ms" },
     { file: "packages/plugin/src/ingress-result-chunks.ts", value: 1024, count: 1, reason: "byte-size multiplier" },
+    { file: "packages/plugin/src/approval-output-recovery.ts", value: 1024, count: 2, reason: "approval output byte-budget multipliers" },
     { file: "packages/plugin/src/nats-transport.ts", value: 1024, count: 4, reason: "protocol buffer-size multiplier" },
     { file: "packages/plugin/src/preflight.ts", value: 5000, count: 1, reason: "relay-dial timeout in ms" },
     { file: "packages/saas/src/setup-trust-chain.ts", value: 2048, count: 2, reason: "RSA key size in bits" },
