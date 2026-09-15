@@ -25,6 +25,7 @@ import {
   readAccountsMap,
   readWebchannelSection,
   resolveAccountStorageRoot,
+  resolveWebchannelAccountId,
   resolveWebchannelAccountConfig,
   type WebchannelAccountConfig,
 } from "./account-config.js";
@@ -48,33 +49,34 @@ export type PlanAccountsOptions = {
   warn?: (msg: string) => void;
 };
 
-/** Plan one raw account id without applying cross-account warnings. */
+/** Resolve one account for serving, preserving its listed identity. */
 export function planWebchannelAccount(
   cfg: unknown,
-  accountId: string,
+  accountId?: string | null,
   opts: PlanAccountsOptions = {},
 ): AccountPlanEntry | undefined {
+  const id = resolveWebchannelAccountId(cfg, accountId);
   // Share the exact status predicate and skip before acquisition identity,
   // credential resolution, or any future per-account runtime I/O.
-  if (!isWebchannelAccountEnabled(cfg, accountId)) return undefined;
+  if (id === undefined || !isWebchannelAccountEnabled(cfg, id)) return undefined;
 
   // Removed-key policy is evaluated on raw locations before acquisition or the
   // shallow effective merge, so a channel-base tombstone cannot be shadowed by
   // an account-local auth.jwt object.
-  assertNoRemovedAudienceConfig(cfg, accountId);
+  assertNoRemovedAudienceConfig(cfg, id);
 
   // Identity with config-over-env precedence. For a named account this is
   // config-only; for the synthesized default with no config it is env-derived.
-  const { identity } = resolveAcquisitionEnvPrecedence(cfg, accountId, {
+  const { identity } = resolveAcquisitionEnvPrecedence(cfg, id, {
     ...(opts.env !== undefined ? { env: opts.env } : {}),
     ...(opts.warn !== undefined ? { warn: opts.warn } : {}),
   });
 
-  const account = resolveWebchannelAccountConfig(cfg, accountId);
+  const account = resolveWebchannelAccountConfig(cfg, id);
   const storageRoot = resolveAccountStorageRoot(account);
   return {
     status: "serve",
-    accountId,
+    accountId: id,
     tenant: identity.tenant,
     ...(identity.saasBaseUrl !== undefined ? { saasBaseUrl: identity.saasBaseUrl } : {}),
     ...(storageRoot !== undefined ? { storageRoot } : {}),

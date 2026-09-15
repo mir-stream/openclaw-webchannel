@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChannelOutboundContext } from "openclaw/plugin-sdk/channel-contract";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
+import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import WebSocket from "ws";
 
 import { NatsChannel } from "./nats-channel.js";
@@ -181,13 +182,63 @@ describe("outbound account selection through the production NATS facade (#371)",
       ]);
     });
 
-    it("delivers on the listed spelling when core canonicalizes the account id", async () => {
+    it.each(["Acme", "-Acme", "_Acme"])("delivers on the listed spelling %s when core canonicalizes the account id", async (listed) => {
+      const primary = runtime("default", "tenant-a");
+      const named = runtime(listed, "tenant-b");
+      const plugin = createNatsWebChannelPlugin(new Map([["default", primary], [listed, named]]));
+      // Core starts the account as listed but canonicalizes the id on its
+      // core-initiated send paths, so `ctx.accountId` arrives lowercased.
+      expectDelivered(named, await send(plugin, seam, config(["default", listed]), normalizeAccountId(listed)));
+      expectUntouched(primary);
+    });
+
+    it.each(["missing", "!!!", "constructor", "a.b", "a".repeat(65), "-"])("refuses explicit invalid/unknown %j without a sibling send", async (input) => {
+      const primary = runtime("default", "tenant-a");
+      const named = runtime("a-b", "tenant-b");
+      const plugin = createNatsWebChannelPlugin(new Map([["default", primary], ["a-b", named]]));
+      await expect(send(plugin, seam, config(["default", "a-b"], "a-b"), input)).rejects.toThrow(/not a valid listed account/);
+      expectUntouched(primary);
+      expectUntouched(named);
+    });
+
+    it("refuses a configured collision even if a runtime from the previous config still exists", async () => {
       const primary = runtime("default", "tenant-a");
       const named = runtime("Acme", "tenant-b");
       const plugin = createNatsWebChannelPlugin(new Map([["default", primary], ["Acme", named]]));
-      // Core starts the account as listed but canonicalizes the id on its
-      // core-initiated send paths, so `ctx.accountId` arrives lowercased.
-      expectDelivered(named, await send(plugin, seam, config(["default", "Acme"]), "acme"));
+      for (const input of ["Acme", "acme", "ACME"]) {
+        await expect(send(plugin, seam, config(["default", "Acme", "acme"]), input)).rejects.toThrow(/not a valid listed account/);
+      }
+      expectUntouched(primary);
+      expectUntouched(named);
+    });
+
+    it("refuses disabled canonical and unscoped targets without selecting an enabled sibling", async () => {
+      const primary = runtime("default", "tenant-a");
+      const named = runtime("Acme", "tenant-b");
+      const plugin = createNatsWebChannelPlugin(new Map([["default", primary], ["Acme", named]]));
+      const cfg = { channels: { webchannel: { defaultAccount: "Acme", accounts: {
+        default: {}, Acme: { enabled: false },
+      } } } };
+      for (const input of ["acme", undefined, null, ""]) {
+        await expect(send(plugin, seam, cfg, input)).rejects.toThrow(/"Acme" is disabled/);
+      }
+      expectUntouched(primary);
+      expectUntouched(named);
+    });
+
+    it("requires the new listed spelling's runtime after a config change", async () => {
+      const primary = runtime("default", "tenant-a");
+      const stale = runtime("Acme", "tenant-b");
+      const runtimes = new Map([["default", primary], ["Acme", stale]]);
+      const plugin = createNatsWebChannelPlugin(runtimes);
+      // New config is resolved now, but only the old spelling is still running.
+      await expect(send(plugin, seam, config(["default", "acme"]), "acme")).rejects.toThrow(/not running/);
+      expectUntouched(primary);
+      expectUntouched(stale);
+      const current = runtime("acme", "tenant-c");
+      runtimes.set("acme", current);
+      expectDelivered(current, await send(plugin, seam, config(["default", "acme"]), "Acme"));
+      expectUntouched(stale);
       expectUntouched(primary);
     });
 
@@ -198,7 +249,7 @@ describe("outbound account selection through the production NATS facade (#371)",
       expectUntouched(primary);
     });
 
-    it.each([undefined, null])("honors configured defaultAccount for accountId=%s", async (accountId) => {
+    it.each([undefined, null, "", " \t "])("honors configured defaultAccount for accountId=%s", async (accountId) => {
       const primary = runtime("default", "tenant-a");
       const named = runtime("other", "tenant-b");
       const plugin = createNatsWebChannelPlugin(new Map([["default", primary], ["other", named]]));

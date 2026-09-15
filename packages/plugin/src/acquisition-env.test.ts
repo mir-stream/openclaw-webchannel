@@ -93,7 +93,7 @@ describe("resolveAcquisitionEnvPrecedence", () => {
   });
 
   it("does not crash when env is present but config wins (no throw)", () => {
-    const cfg = { channels: { webchannel: { acctA: { tenant: "tA" } } } };
+    const cfg = { channels: { webchannel: { accounts: { acctA: { tenant: "tA" } } } } };
     expect(() =>
       resolveAcquisitionEnvPrecedence(cfg, "acctA", {
         env: { WEBCHANNEL_TENANT: "x" },

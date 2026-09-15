@@ -22,9 +22,6 @@
  * Reading through `resolveWebchannelAccountConfig` reconstructs the full account
  * config regardless of which fields ended up where.
  *
- * Cycle 1 keeps single-account `"default"` working end-to-end; multi-account
- * multiplex SERVING is Cycle 2. `"default"` is a NORMAL account id.
- *
  * ── Account id is a TRUST BOUNDARY ──────────────────────────────────────────
  * accountId participates in the exact storage identity, so it MUST be validated
  * before deriving an opaque tuple namespace. Raw tenant/account values are
@@ -43,6 +40,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import {
   DEFAULT_ACCOUNT_ID,
   normalizeAccountId,
+  normalizeOptionalAccountId,
 } from "openclaw/plugin-sdk/account-id";
 import { resolveListedDefaultAccountId } from "openclaw/plugin-sdk/account-core";
 
@@ -268,7 +266,8 @@ export function hasWebchannelConfig(cfg: unknown): boolean {
 /**
  * Resolve whether an account is enabled for both status and runtime planning.
  * A channel-level false disables every account; otherwise an explicit named
- * account false disables only that account. Missing flags default to enabled.
+ * account false disables only that account. Missing flags default to enabled
+ * for a resolved listed account; an unresolved id is disabled.
  */
 export function isWebchannelAccountEnabled(
   cfg: unknown,
@@ -277,7 +276,8 @@ export function isWebchannelAccountEnabled(
   const section = readWebchannelSection(cfg);
   if (section?.enabled === false) return false;
 
-  const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+  const id = resolveWebchannelAccountId(cfg, accountId);
+  if (id === undefined) return false;
   const account = readAccountsMap(section)[id];
   return !(account && typeof account === "object" && account.enabled === false);
 }
@@ -360,22 +360,81 @@ function assertNoRemovedConfig(account: WebchannelAccountConfig): void {
  * accounts (issue #17). `"default"` is listed only when it is an explicit key of
  * `accounts`, or when `accounts` is empty/absent (the fallback).
  *
- * MUST return ≥1 entry (core's channel monitor short-circuits otherwise).
- * Sorted for stable ordering (mirrors core).
+ * An explicit all-invalid/colliding map returns [] so no runtime can start.
+ * Valid ids are sorted for stable ordering (mirrors core).
  */
 export function listWebchannelAccountIds(cfg: unknown): string[] {
   return inspectWebchannelAccountIds(cfg).validIds;
 }
 
-/** Select from configuration, so unavailable accounts never redirect a send. */
-export function resolveDefaultWebchannelAccountId(cfg: unknown): string {
+/** Pure selection plus explicit-invalid diagnostics, consumed by doctor. */
+export function resolveDefaultWebchannelAccountSelection(cfg: unknown) {
   const preferred = readWebchannelSection(cfg)?.defaultAccount;
-  return resolveListedDefaultAccountId({
-    accountIds: listWebchannelAccountIds(cfg),
+  const accountIds = listWebchannelAccountIds(cfg);
+  const accountId = resolveListedDefaultAccountId({
+    accountIds,
     configuredDefaultAccountId: typeof preferred === "string" ? preferred.trim() : undefined,
-    // Unlike Telegram bot aliases, these ids are exact storage/subject identities.
+    // Preference is exact even though read/send lookup accepts canonical aliases.
     normalizeListedAccountId: (id) => id,
   });
+  return {
+    accountId,
+    accountIds,
+    configuredDefaultAccount: preferred,
+    invalidConfiguredDefault: preferred !== undefined &&
+      !(typeof preferred === "string" && accountIds.includes(preferred.trim())),
+  };
+}
+
+/** Select from configuration, so unavailable accounts never redirect a send. */
+export function resolveDefaultWebchannelAccountId(cfg: unknown): string {
+  return resolveDefaultWebchannelAccountSelection(cfg).accountId;
+}
+
+/**
+ * Account READ / LOOKUP rule (config facade, acquisition, planning, outbound):
+ * nullish/blank means the configured default selection. Nonblank input is trimmed,
+ * validated, then matched exactly against valid listed ids, then by a unique
+ * public SDK canonical equivalent. Always return the LISTED spelling: it owns
+ * tenant bindings, JWT audience, subjects, keys and storage. Never rename it.
+ *
+ * Unknown, malformed and colliding identities return undefined. In particular,
+ * the SDK's malformed-input fallback to "default" is not a lookup alias. An
+ * empty valid list has no resolved id, even if default selection returns the
+ * SDK placeholder. Availability never changes selection to a sibling account.
+ *
+ * defaultAccount preference separately requires exact listed spelling after
+ * trimming; a case-mismatched preference stays invalid and diagnosable. Setup
+ * writes use their existing ID policy and resolveWebchannelAccountConfigForSetup
+ * for exact write-target merges, including shared base for a new account.
+ * Gateway lifecycle starts require the exact listed ID before either approval
+ * or NATS ownership starts; core's task key must match the storage identity.
+ */
+export function resolveWebchannelAccountId(
+  cfg: unknown,
+  accountId?: string | null,
+): string | undefined {
+  if (accountId != null && typeof accountId !== "string") return undefined;
+  const requested = accountId?.trim();
+  const selection = resolveDefaultWebchannelAccountSelection(cfg);
+  if (!requested) {
+    return selection.accountIds.includes(selection.accountId) ? selection.accountId : undefined;
+  }
+  if (!isValidAccountId(requested)) return undefined;
+  if (selection.accountIds.includes(requested)) return requested;
+  const canonical = normalizeOptionalAccountId(requested);
+  if (canonical === undefined) return undefined;
+  const matches = selection.accountIds.filter((id) => normalizeAccountId(id) === canonical);
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+/** Identity-producing callers must not manufacture a scope for a lookup miss. */
+export function requireWebchannelAccountId(cfg: unknown, accountId?: string | null): string {
+  const id = resolveWebchannelAccountId(cfg, accountId);
+  if (id === undefined) {
+    throw new Error(`webchannel: account ${JSON.stringify(accountId)} does not resolve to a valid listed account`);
+  }
+  return id;
 }
 
 /**
@@ -385,15 +444,29 @@ export function resolveDefaultWebchannelAccountId(cfg: unknown): string {
  *   - Flat single-account config (no `accounts`) + `"default"` ⇒ the flat base
  *     (backward-compatible single-account behavior).
  *   - Per-account config ⇒ shared base + the named account's override.
+ *   - Unresolved read id ⇒ no account data ({}); see resolveWebchannelAccountId.
  */
 export function resolveWebchannelAccountConfig(
+  cfg: unknown,
+  accountId?: string | null,
+): WebchannelAccountConfig {
+  const id = resolveWebchannelAccountId(cfg, accountId);
+  return id === undefined ? {} : resolveWebchannelAccountConfigForSetup(cfg, id);
+}
+
+/**
+ * Exact write-target merge for setup, including shared base for a NEW id.
+ * This does not resolve aliases or prove that an account exists/is servable.
+ */
+export function resolveWebchannelAccountConfigForSetup(
   cfg: unknown,
   accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
 ): WebchannelAccountConfig {
   const section = readWebchannelSection(cfg);
   if (!section) return {};
   const base = channelLevelBase(section);
-  const override = readAccountsMap(section)[accountId] ?? {};
+  const accounts = readAccountsMap(section);
+  const override = Object.prototype.hasOwnProperty.call(accounts, accountId) ? accounts[accountId] ?? {} : {};
   const resolved = mergeAccountConfig(base, override);
   assertNoRemovedConfig(resolved);
   return resolved;
@@ -410,17 +483,18 @@ export function resolveWebchannelAccountConfig(
  */
 export function resolveAcquisitionIdentity(
   cfg: unknown,
-  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  accountId?: string | null,
 ): WebchannelAcquisitionIdentity {
-  const account = resolveWebchannelAccountConfig(cfg, accountId);
+  const id = requireWebchannelAccountId(cfg, accountId);
+  const account = resolveWebchannelAccountConfig(cfg, id);
   const top = cfg as
     | { tenant?: string; saas?: { baseUrl?: string } }
     | undefined;
   const accountSaas = (account.saas as { baseUrl?: string } | undefined)?.baseUrl;
 
-  const isDefault = accountId === DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+  const isDefault = id === DEFAULT_WEBCHANNEL_ACCOUNT_ID;
   return {
-    accountId,
+    accountId: id,
     tenant:
       (account.tenant as string | undefined) ??
       (isDefault ? top?.tenant : undefined) ??
@@ -668,7 +742,7 @@ export function resolveReasoningDurable(accountConfig: WebchannelAccountConfig):
 /** Read an account's merged `nats` config block (for credential-source resolution). */
 export function resolveAccountNatsConfig(
   cfg: unknown,
-  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  accountId?: string | null,
 ): WebchannelNatsConfig | undefined {
   const account = resolveWebchannelAccountConfig(cfg, accountId);
   return account.nats as WebchannelNatsConfig | undefined;

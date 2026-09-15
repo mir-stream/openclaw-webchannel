@@ -609,8 +609,7 @@ void _assertDecisionInSync;
  * `resolveWebchannelAccountConfig` merges the channel-level shared base under
  * the `accounts.<id>` override (execApprovals is one of its NESTED_OBJECT_KEYS,
  * so per-field account overrides compose with channel-wide defaults). A null/
- * absent accountId reads the `"default"` account, which for a flat single-
- * account config is exactly the old channel-level read (regression-free).
+ * absent/blank accountId uses the shared account read/lookup rule.
  */
 function readExecApprovals(
   cfg: OpenClawConfig,
@@ -621,7 +620,7 @@ function readExecApprovals(
   agentFilter?: string[];
   sessionFilter?: string[];
 } | undefined {
-  const account = resolveWebchannelAccountConfig(cfg, accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID);
+  const account = resolveWebchannelAccountConfig(cfg, accountId);
   return account.execApprovals as ReturnType<typeof readExecApprovals>;
 }
 

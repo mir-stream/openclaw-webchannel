@@ -62,7 +62,8 @@ import {
   readWebchannelSection,
   resolveAcquisitionIdentity,
   resolveAccountStorageRoot,
-  resolveWebchannelAccountConfig,
+  resolveWebchannelAccountId,
+  resolveWebchannelAccountConfigForSetup,
 } from "./account-config.js";
 import { acquireCredentials } from "./acquire-credentials.js";
 import {
@@ -344,7 +345,7 @@ export const webchannelSetup = {
     if (identity.saasBaseUrl !== undefined) {
       // Full-block seam. Read the existing account so a re-run preserves the
       // operator's manual issuer pin unless the flag explicitly overrides.
-      const existing = resolveWebchannelAccountConfig(cfg, id);
+      const existing = resolveWebchannelAccountConfigForSetup(cfg, id);
       const existingJwt = (existing.auth as { jwt?: { issuer?: string } } | undefined)
         ?.jwt;
       const patch = buildFullAccountPatch({
@@ -386,10 +387,17 @@ export const webchannelSetup = {
     runtime: SetupRuntime;
   }): Promise<void> => {
     const id = normalizeAccountId(accountId);
+    if (resolveWebchannelAccountId(cfg, id) !== id) {
+      runtime.log(
+        `[webchannel] account "${id}": no exact valid written account; refusing credential acquisition. Correct the account configuration and retry.`,
+      );
+      return;
+    }
 
     // Resolve the effective account config (channel-level base merged under the
     // account override), then the credential mode (config > input > enrolled).
-    const account = resolveWebchannelAccountConfig(cfg, id);
+    // This is the exact ID just written by setup, never an alias for a sibling.
+    const account = resolveWebchannelAccountConfigForSetup(cfg, id);
     let mode: "static" | "enrolled";
     try {
       const configuredMode = (

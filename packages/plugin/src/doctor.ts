@@ -22,6 +22,8 @@ import {
   listWebchannelAccountIds,
   loadPersistedCredentialDocument,
   RemovedAudienceConfigError,
+  resolveDefaultWebchannelAccountSelection,
+  resolveWebchannelAccountId,
 } from "./account-config.js";
 import { createMemoizedPersistedAccessor, prepareAccountAuth } from "./account-auth.js";
 import type { AuthConfig, ResolvedJwtVerifierConfig } from "./auth.js";
@@ -50,6 +52,7 @@ import {
 
 export type DoctorCheckId =
   | "invalid-account-id"
+  | "invalid-default-account"
   | "configuration-invalid"
   | "encryption-disabled"
   | "creds-missing"
@@ -102,6 +105,27 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
   const injectedLoadCreds = deps.loadPersistedEnrolledCreds;
   const findings: DoctorFinding[] = [];
   const top = cfg as { nats?: { url?: string }; saas?: { baseUrl?: string } };
+
+  const selection = resolveDefaultWebchannelAccountSelection(cfg);
+  if (selection.invalidConfiguredDefault) {
+    const hasFallback = selection.accountIds.includes(selection.accountId);
+    const fallback = !hasFallback
+      ? "No valid listed account is available; no fallback account can start."
+      : `The selected fallback is ${JSON.stringify(selection.accountId)}` +
+        (isWebchannelAccountEnabled(cfg, selection.accountId)
+          ? "; selection does not imply that it is running."
+          : ", which is disabled and will not serve.");
+    findings.push({
+      accountId: selection.accountId,
+      checkId: "invalid-default-account",
+      kind: "config",
+      severity: "warn",
+      message: `Configured defaultAccount ${JSON.stringify(selection.configuredDefaultAccount)} does not exactly name a valid listed account. ${fallback}`,
+      fix: hasFallback
+        ? `Set channels.webchannel.defaultAccount to an exact listed id (${selection.accountIds.map((id) => JSON.stringify(id)).join(", ")}), or remove defaultAccount to use the existing fallback order.`
+        : "Correct the invalid/colliding account entries, then set channels.webchannel.defaultAccount to an exact valid listed id or remove the preference.",
+    });
+  }
 
   const inspection = inspectWebchannelAccountIds(cfg);
   for (const invalid of inspection.invalid) {
@@ -382,7 +406,9 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
 }
 
 export function formatDoctorWarning(finding: DoctorFinding): string {
-  const prefix = finding.checkId === "invalid-account-id"
+  const prefix = finding.checkId === "invalid-default-account"
+    ? "channels.webchannel.defaultAccount"
+    : finding.checkId === "invalid-account-id"
     ? `channels.webchannel.accounts[${JSON.stringify(finding.accountId)}]`
     : `channels.webchannel.${finding.accountId}`;
   return `- ${prefix}: ${finding.severity.toUpperCase()} [${finding.checkId}] ${finding.message} Fix: ${finding.fix}`;
@@ -428,9 +454,10 @@ export async function probeWebchannelAccount(params: {
   timeoutMs: number;
   cfg: OpenClawConfig;
 }, deps: ProbeDeps = {}): Promise<WebchannelProbe> {
-  const accountId = params.account.accountId ?? "default";
+  const resolvedId = resolveWebchannelAccountId(params.cfg, params.account.accountId);
+  const accountId = resolvedId ?? params.account.accountId ?? "default";
   try {
-    if (!listWebchannelAccountIds(params.cfg).includes(accountId)) {
+    if (resolvedId === undefined) {
       throw new Error(`account ${accountId} is not configured`);
     }
     const plan = planWebchannelAccount(params.cfg, accountId, {

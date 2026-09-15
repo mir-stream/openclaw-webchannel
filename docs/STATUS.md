@@ -1,5 +1,14 @@
 # Project Status — single source of truth
 
+Round 6 (#378): config reads, account inspection, acquisition/planning, status
+credential probes and both core outbound adapters share account lookup. Nullish
+and blank IDs use the configured selection; exact and unique SDK canonical
+matches return the listed spelling. Unknown, malformed and colliding targets
+cannot borrow another account. Exact listed tenant/JWT/subject/storage identity
+and setup write semantics remain stable. Doctor reports invalid explicit
+`defaultAccount` values, the unchanged fallback and a remedy, including disabled
+or absent fallback accounts. See the [account rule](../packages/plugin/src/account-config.ts).
+
 Round 5 (#382): `/stop` can cancel batches containing retained terminal replays
 while a later outcome lookup or write is pending. Indexed entries acquire their
 cancellation hold before any release request; running callbacks stay charged
