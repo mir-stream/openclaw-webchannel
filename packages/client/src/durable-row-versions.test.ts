@@ -3,6 +3,18 @@ import { applyDurableEvent, type DurableEvent, type DurableView } from "./durabl
 import { DurableRowVersions, durableRowKey } from "./durable-row-versions.js";
 
 describe("journal modification evidence from the shared reducer", () => {
+  it("fences stale updates after a fresh client projection without mutating the held view", () => {
+    const versions = new DurableRowVersions();
+    const initial = versions.apply([], { kind: "bubble", answerId: "a", text: "old" }, 1);
+    const projected = initial.map((row) => ({ ...row }));
+    const current = versions.apply(projected, { kind: "bubble", answerId: "a", text: "current" }, 3);
+    Object.freeze(current);
+    Object.freeze(current[0]);
+    expect(versions.apply(current, { kind: "bubble", answerId: "a", text: "stale" }, 2)).toEqual(current);
+    expect(versions.seq(durableRowKey(current[0]!))).toBe(3);
+    expect(projected[0]).toMatchObject({ text: "old" });
+  });
+
   it("records an absent removal through the canonical reducer's hidden tombstone", () => {
     const versions = new DurableRowVersions();
     const event: DurableEvent = { kind: "seal", turnId: "t", answers: [], remove: ["unseen"] };

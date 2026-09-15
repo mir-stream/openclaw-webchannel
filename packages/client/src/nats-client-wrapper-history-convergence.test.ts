@@ -11,12 +11,164 @@ function setup() {
     handleMessage(m: InboundMessage): void;
     client: { getDifference: ReturnType<typeof vi.fn> };
     cursor: { state: string; afterSeq: number; nonce: string; last: number };
+    resetCursorForConnection(): void;
   };
   inner.client.getDifference = vi.fn();
   return { wrapper, inner, send: (m: InboundMessage) => inner.handleMessage(m) };
 }
 
 describe("#342 history row authority", () => {
+  it("skips a null history member and hydrates the valid following row", () => {
+    const { wrapper, send } = setup();
+    try {
+      const snapshot = { type: "history", messages: [null, { id: "valid", role: "agent", text: "valid" }] } as unknown as InboundMessage;
+      send(snapshot); send(snapshot);
+      expect(wrapper.getState().messages).toMatchObject([{ id: "valid", text: "valid" }]);
+    } finally { wrapper.close(); }
+  });
+
+  it("retains a complete snapshot's older prefix after a live frame seeded the cursor", () => {
+    const { wrapper, inner, send } = setup();
+    try {
+      send({ type: "agent_message", id: "a99", text: "live", seq: 99 });
+      const snapshot: InboundMessage = { type: "history", highWaterSeq: 100, messages: [98, 99, 100]
+        .map((seq) => ({ id: `a${seq}`, role: "agent" as const, text: `a${seq}`, seq })) };
+      send(snapshot); send(snapshot);
+      expect(inner.client.getDifference.mock.calls.map(([afterSeq]) => afterSeq)).toEqual([99]);
+      send({ type: "difference", afterSeq: 99, nonce: inner.cursor.nonce, maxSeq: 100, partial: false,
+        events: [{ seq: 100, event: { kind: "bubble", answerId: "a100", text: "a100" } }] });
+      const expected = wrapper.getState().messages;
+      expect(expected.map((m) => m.id)).toEqual(["a98", "a99", "a100"]);
+      expect(expected[1].text).toBe("live");
+      send(snapshot); send(snapshot);
+      expect(wrapper.getState().messages).toEqual(expected);
+      expect(inner.cursor.last).toBe(100);
+    } finally { wrapper.close(); }
+  });
+
+  it.each([98, 99, 100])("recovers an incomplete first snapshot at %i after live99 in journal order", (highWaterSeq) => {
+    const { wrapper, inner, send } = setup();
+    try {
+      send({ type: "agent_message", id: "a99", text: "live", seq: 99 });
+      const snapshot: InboundMessage = { type: "history", highWaterSeq, snapshotComplete: false,
+        messages: [{ id: `a${highWaterSeq}`, role: "agent", text: "snapshot", seq: highWaterSeq }] };
+      send(snapshot); send(snapshot);
+      expect(inner.cursor.afterSeq).toBe(0);
+      const maxSeq = Math.max(99, highWaterSeq);
+      send({ type: "difference", afterSeq: 0, nonce: inner.cursor.nonce, maxSeq, partial: false,
+        events: Array.from({ length: maxSeq }, (_, i) => ({ seq: i + 1,
+          event: { kind: "bubble", answerId: `a${i + 1}`, text: `${i + 1}` } })) });
+      const expected = wrapper.getState().messages;
+      expect(expected.map((m) => m.id)).toEqual(Array.from({ length: maxSeq }, (_, i) => `a${i + 1}`));
+      expect(expected[98].text).toBe("live");
+      send(snapshot);
+      expect(wrapper.getState().messages).toEqual(expected);
+      expect(inner.cursor.last).toBe(maxSeq);
+      expect(inner.client.getDifference).toHaveBeenCalledTimes(1);
+    } finally { wrapper.close(); }
+  });
+
+  it("restarts an existing live-seeded catch-up at zero for the first incomplete snapshot", () => {
+    const { wrapper, inner, send } = setup();
+    try {
+      send({ type: "agent_message", id: "a99", text: "99", seq: 99 });
+      send({ type: "agent_message", id: "a101", text: "101", seq: 101 });
+      const oldNonce = inner.cursor.nonce;
+      send({ type: "history", highWaterSeq: 99, snapshotComplete: false, messages: [] });
+      expect(inner.client.getDifference.mock.calls.map(([afterSeq]) => afterSeq)).toEqual([99, 0]);
+      send({ type: "difference", afterSeq: 99, nonce: oldNonce, maxSeq: 101, partial: false, events: [] });
+      expect(inner.cursor.afterSeq).toBe(0);
+      send({ type: "difference", afterSeq: 0, nonce: inner.cursor.nonce, maxSeq: 100, partial: false,
+        events: Array.from({ length: 100 }, (_, i) => ({ seq: i + 1,
+          event: { kind: "bubble", answerId: `a${i + 1}`, text: `${i + 1}` } })) });
+      expect(wrapper.getState().messages.map((m) => m.id)).toEqual(Array.from({ length: 101 }, (_, i) => `a${i + 1}`));
+      expect(inner.cursor.last).toBe(101);
+    } finally { wrapper.close(); }
+  });
+
+  it("keeps cold recovery order through paging and a higher snapshot received between pages", () => {
+    const { wrapper, inner, send } = setup();
+    const reply = (afterSeq: number, maxSeq: number, partial: boolean) => send({ type: "difference",
+      afterSeq, nonce: inner.cursor.nonce, maxSeq, partial,
+      events: Array.from({ length: maxSeq - afterSeq }, (_, i) => ({ seq: afterSeq + i + 1,
+        event: { kind: "bubble", answerId: `a${afterSeq + i + 1}`, text: `${afterSeq + i + 1}` } })) });
+    try {
+      send({ type: "agent_message", id: "a99", text: "99", seq: 99 });
+      send({ type: "history", highWaterSeq: 100, snapshotComplete: false, messages: [] });
+      reply(0, 50, true);
+      expect(wrapper.getState().messages.map((m) => m.id)).toEqual([...Array.from({ length: 50 }, (_, i) => `a${i + 1}`), "a99"]);
+      send({ type: "history", highWaterSeq: 102, messages: [{ id: "a102", role: "agent", text: "102", seq: 102 }] });
+      reply(50, 100, false);
+      expect(inner.cursor.afterSeq).toBe(100);
+      reply(100, 102, false);
+      expect(wrapper.getState().messages.map((m) => m.id)).toEqual(Array.from({ length: 102 }, (_, i) => `a${i + 1}`));
+      expect(inner.cursor.last).toBe(102);
+    } finally { wrapper.close(); }
+  });
+
+  it("uses canonical seal order during cold recovery while retaining newer live text", () => {
+    const { wrapper, inner, send } = setup();
+    try {
+      send({ type: "agent_message", id: "A", text: "new A", turnId: "t", seq: 4 });
+      send({ type: "history", highWaterSeq: 4, snapshotComplete: false, messages: [] });
+      send({ type: "difference", afterSeq: 0, nonce: inner.cursor.nonce, maxSeq: 4, partial: false, events: [
+        { seq: 1, event: { kind: "bubble", answerId: "A", text: "old A", turnId: "t" } },
+        { seq: 2, event: { kind: "bubble", answerId: "B", text: "B", turnId: "t" } },
+        { seq: 3, event: { kind: "seal", turnId: "t", answers: [{ id: "B", text: "final B" }, { id: "A", text: "old A" }], remove: [] } },
+        { seq: 4, event: { kind: "bubble", answerId: "A", text: "new A", turnId: "t" } },
+      ] });
+      expect(wrapper.getState().messages.map((m) => [m.id, m.text])).toEqual([["B", "final B"], ["A", "new A"]]);
+    } finally { wrapper.close(); }
+  });
+
+  it("hydrates retained snapshot rows on timeout without renewing the retry budget", () => {
+    vi.useFakeTimers();
+    const { wrapper, inner, send } = setup();
+    try {
+      send({ type: "agent_message", id: "a99", text: "99", seq: 99 });
+      send({ type: "history", highWaterSeq: 100, messages: [98, 99, 100]
+        .map((seq) => ({ id: `a${seq}`, role: "agent" as const, text: `${seq}`, seq })) });
+      vi.advanceTimersByTime(60_000);
+      expect(inner.client.getDifference).toHaveBeenCalledTimes(4);
+      expect(inner.cursor).toMatchObject({ state: "synced", last: 99 });
+      expect(wrapper.getState().messages.map((m) => m.id)).toEqual(["a98", "a99", "a100"]);
+    } finally { wrapper.close(); vi.useRealTimers(); }
+  });
+
+  it("retains a received snapshot prefix across reconnect and a narrower replacement snapshot", () => {
+    const { wrapper, inner, send } = setup();
+    try {
+      send({ type: "agent_message", id: "a99", text: "99", seq: 99 });
+      send({ type: "history", highWaterSeq: 100, messages: [98, 99, 100]
+        .map((seq) => ({ id: `a${seq}`, role: "agent" as const, text: `${seq}`, seq })) });
+      inner.resetCursorForConnection();
+      send({ type: "history", highWaterSeq: 101, messages: [{ id: "a101", role: "agent", text: "101", seq: 101 }] });
+      send({ type: "difference", afterSeq: 99, nonce: inner.cursor.nonce, maxSeq: 101, partial: false,
+        events: [100, 101].map((seq) => ({ seq, event: { kind: "bubble", answerId: `a${seq}`, text: `${seq}` } })) });
+      expect(wrapper.getState().messages.map((m) => m.id)).toEqual(["a98", "a99", "a100", "a101"]);
+    } finally { wrapper.close(); }
+  });
+
+  it("retains partially reconstructed cold order across timeout and reconnect", () => {
+    vi.useFakeTimers();
+    const { wrapper, inner, send } = setup();
+    try {
+      send({ type: "agent_message", id: "a4", text: "4", seq: 4 });
+      send({ type: "history", highWaterSeq: 5, snapshotComplete: false, messages: [] });
+      send({ type: "difference", afterSeq: 0, nonce: inner.cursor.nonce, maxSeq: 2, partial: true,
+        events: [1, 2].map((seq) => ({ seq, event: { kind: "bubble", answerId: `a${seq}`, text: `${seq}` } })) });
+      vi.advanceTimersByTime(60_000);
+      expect(inner.client.getDifference).toHaveBeenCalledTimes(5);
+      expect(inner.cursor).toMatchObject({ state: "synced", last: 2 });
+      inner.resetCursorForConnection();
+      send({ type: "history", highWaterSeq: 2, messages: [] });
+      expect(inner.cursor.afterSeq).toBe(2);
+      send({ type: "difference", afterSeq: 2, nonce: inner.cursor.nonce, maxSeq: 5, partial: false,
+        events: [3, 4, 5].map((seq) => ({ seq, event: { kind: "bubble", answerId: `a${seq}`, text: `${seq}` } })) });
+      expect(wrapper.getState().messages.map((m) => m.id)).toEqual(["a1", "a2", "a3", "a4", "a5"]);
+      expect(inner.cursor.last).toBe(5);
+    } finally { wrapper.close(); vi.useRealTimers(); }
+  });
   it("refreshes a newer approval outcome without rearming it on stale history", () => {
     const { wrapper, send } = setup();
     try {
@@ -55,7 +207,7 @@ describe("#342 history row authority", () => {
     try {
       send({ type: "user_committed", id: "old", text: "old", seq: 1 });
       send({ type: "history", highWaterSeq: 4, messages: [] });
-      send({ type: "history", highWaterSeq: 8, messages: [{ id: "tail", role: "agent", text: "tail", seq: 8 }] });
+      send({ type: "history", highWaterSeq: 8, messages: [{ id: "a8", role: "agent", text: "8", seq: 8 }] });
       send({ type: "difference", afterSeq: 1, nonce: inner.cursor.nonce, partial: true, maxSeq: 3,
         events: [2, 3].map((seq) => ({ seq, event: { kind: "bubble", answerId: `a${seq}`, text: `${seq}` } })) });
       expect(inner.cursor.afterSeq).toBe(3);

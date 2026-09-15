@@ -3002,8 +3002,8 @@ export class WebChannelNATSClient {
             && this.frameSeq === this.rowVersions.seq(key));
       }),
     );
-    const after = this.rowVersions.apply(before, event, this.frameSeq, floor);
-    return this.mergeDurable(this.state.messages, after, allowedLocal);
+    const after = this.applyVersionedDurable(before, event, floor);
+    return this.orderRecoveredMessages(this.mergeDurable(this.state.messages, after, allowedLocal));
   }
 
   /**
@@ -3117,6 +3117,49 @@ export class WebChannelNATSClient {
   private readonly rowVersions = new DurableRowVersions();
   private frameSeq: number | undefined;
   private observedHistoryHighWater = 0;
+  private historyBaselineEstablished = false;
+  private pendingHistorySnapshots: InboundMessage[] = [];
+  // Only a first, explicitly incomplete snapshot needs reconstruction from
+  // zero. The ordinary view keeps live content/receipts while this canonical
+  // replay supplies the missing prefix's order, including seal reordering.
+  private recoveringHistoryOrder: DurableView | undefined;
+
+  private applyVersionedDurable(view: DurableView, event: DurableEvent, floor = 0): DurableView {
+    const cursor = this.cursor;
+    if (this.recoveringHistoryOrder !== undefined && this.frameSeq !== undefined
+      && ((cursor.state === "catching-up" && this.frameSeq > cursor.afterSeq)
+        || (cursor.state === "synced" && this.frameSeq === cursor.last + 1))) {
+      this.recoveringHistoryOrder = applyDurableEvent(this.recoveringHistoryOrder, event);
+    }
+    return this.rowVersions.apply(view, event, this.frameSeq, floor);
+  }
+
+  private orderRecoveredMessages(messages: ChatMessage[]): ChatMessage[] {
+    if (this.recoveringHistoryOrder === undefined) return messages;
+    const byKey = new Map(messages.map((row) => [transcriptEntryKey(row), row]));
+    const ordered: ChatMessage[] = [];
+    for (const row of this.recoveringHistoryOrder) {
+      const key = durableRowKey(row);
+      const held = byKey.get(key);
+      if (held !== undefined) {
+        ordered.push(held);
+        byKey.delete(key);
+      }
+    }
+    // Rows outside the recovered prefix retain their content and local state.
+    return ordered.concat(messages.filter((row) => byKey.has(transcriptEntryKey(row))));
+  }
+
+  private hydratePendingHistory(): void {
+    const lifecycle = this.wrapperLifecycleGeneration;
+    while (this.pendingHistorySnapshots.length > 0) {
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
+      const snapshot = this.pendingHistorySnapshots.shift()!;
+      // Hydration consumes content only. Re-dispatching an ahead high-water on
+      // timeout would reopen the same gap with a fresh retry budget.
+      this.applyFrame(snapshot);
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // P0-4 — receipt records + send-state projection (D5)
@@ -3402,20 +3445,39 @@ export class WebChannelNATSClient {
 
     if (msg.type === "history" && isWireSeq(msg.highWaterSeq)) {
       const cursor = this.cursor;
+      this.observedHistoryHighWater = Math.max(this.observedHistoryHighWater, msg.highWaterSeq);
+      if (!this.historyBaselineEstablished && this.recoveringHistoryOrder === undefined
+        && msg.snapshotComplete === false) {
+        // A live frame can seed the cursor before the first snapshot. That
+        // observation proves no historical prefix, even if it is newer than
+        // this byte-trimmed snapshot or already opened an ordinary catch-up.
+        const last = cursor.state === "unseeded" ? 0
+          : cursor.state === "synced" ? cursor.last : cursor.afterSeq;
+        this.observedHistoryHighWater = Math.max(this.observedHistoryHighWater, last);
+        this.pendingHistorySnapshots.push(msg);
+        this.recoveringHistoryOrder = [];
+        if (cursor.state === "catching-up") this.clearCatchUpTimer(cursor);
+        this.openCatchUp(0, cursor.state === "catching-up" ? cursor.buffer : []);
+        return;
+      }
+      if (msg.snapshotComplete !== false && this.recoveringHistoryOrder === undefined) {
+        // This complete prefix may await catch-up, but is retained with the
+        // view even across reconnect. A later trimmed snapshot need not restart
+        // its already-established baseline from zero.
+        this.historyBaselineEstablished = true;
+      }
       if (cursor.state === "catching-up") {
-        this.observedHistoryHighWater = Math.max(this.observedHistoryHighWater, msg.highWaterSeq);
+        this.pendingHistorySnapshots.push(msg);
         return;
       }
-      if (cursor.state === "unseeded" && msg.snapshotComplete === false) {
-        this.observedHistoryHighWater = Math.max(this.observedHistoryHighWater, msg.highWaterSeq);
-        this.openCatchUp(0, []);
-        return;
-      }
-      if (cursor.state === "synced" && msg.highWaterSeq > cursor.last) {
-        this.observedHistoryHighWater = Math.max(this.observedHistoryHighWater, msg.highWaterSeq);
+      if (cursor.state === "synced" && this.observedHistoryHighWater > cursor.last) {
+        this.pendingHistorySnapshots.push(msg);
         this.openCatchUp(cursor.last, []);
         return;
       }
+      const lifecycle = this.wrapperLifecycleGeneration;
+      this.hydratePendingHistory();
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
     }
 
     // ⚠️ READ BEFORE `applyFrame`, WHICH CONSUMES THE EVIDENCE. `adoptCommittedIds`
@@ -3599,6 +3661,10 @@ export class WebChannelNATSClient {
     const after = this.cursor;
     if (folded && seq !== undefined && after.state === "synced" && seq > after.last) {
       after.last = seq;
+      if (this.recoveringHistoryOrder !== undefined && seq >= this.observedHistoryHighWater) {
+        this.recoveringHistoryOrder = undefined;
+        this.historyBaselineEstablished = true;
+      }
     }
   }
 
@@ -3657,6 +3723,14 @@ export class WebChannelNATSClient {
     carried: CarriedRows | undefined,
   ): void {
     this.cursor = { state: "synced", last };
+    if (carried !== undefined && last >= this.observedHistoryHighWater
+      && this.recoveringHistoryOrder !== undefined) {
+      this.recoveringHistoryOrder = undefined;
+      this.historyBaselineEstablished = true;
+    }
+    const lifecycle = this.wrapperLifecycleGeneration;
+    this.hydratePendingHistory();
+    if (this.wrapperLifecycleGeneration !== lifecycle) return;
     this.redispatchBuffered(buffered, carried);
   }
 
@@ -3866,6 +3940,8 @@ export class WebChannelNATSClient {
    * re-detects any gap through the ordinary three-way check.
    */
   private resetCursorForConnection(): void {
+    // Received snapshot rows and any recovered prefix belong to the retained
+    // view, unlike the transport-correlated request and its live-frame buffer.
     const cursor = this.cursor;
     if (cursor.state === "catching-up") {
       this.clearCatchUpTimer(cursor);
@@ -4215,8 +4291,8 @@ export class WebChannelNATSClient {
       && m.receiptKey !== undefined && this.rowVersions.seq(transcriptEntryKey(m)) === undefined);
     if (optimistic !== undefined) {
       const before = projectDurableFromClient(this.state.messages.filter((m) => m !== optimistic));
-      const after = this.rowVersions.apply(before, event, this.frameSeq);
-      this.setState({ messages: this.mergeDurable(this.state.messages, after) });
+      const after = this.applyVersionedDurable(before, event);
+      this.setState({ messages: this.orderRecoveredMessages(this.mergeDurable(this.state.messages, after)) });
       return;
     }
     this.applyDurable(event);
@@ -4251,7 +4327,7 @@ export class WebChannelNATSClient {
     // Mapping is independent of content freshness. A stale page may still carry
     // the first explicit acknowledgement of a locally published send.
     for (const row of rows) {
-      if (row?.kind === undefined && row.role === "user" && typeof row.id === "string"
+      if (row && row.kind === undefined && row.role === "user" && typeof row.id === "string"
         && row.id.length > 0 && typeof row.text === "string" && typeof row.randomId === "string" && row.randomId.length > 0) {
         this.adoptUserBubbleByRandomId(row.randomId, row.id);
         if (this.wrapperLifecycleGeneration !== lifecycle) return;
