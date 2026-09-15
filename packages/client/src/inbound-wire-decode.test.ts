@@ -51,6 +51,7 @@ const VALID: Record<string, unknown> = {
   ack: { type: "ack", ids: ["u-0"], committed: [{ random_id: "r-1", messageId: "m-1", seq: 8 }] },
   inbound_rejected: { type: "inbound_rejected", ids: ["u-0"], reason: "overloaded" },
   user_committed: { type: "user_committed", id: "webchannel-user-2", text: "hi", turnId: "t1", seq: 2, random_id: "r-1" },
+  request_state: { type: "request_state", id: "webchannel-user-2", turnId: "t1", state: "started", seq: 3 },
   difference: { type: "difference", afterSeq: 1, nonce: "n0", events: [], partial: false, maxSeq: 1 },
 };
 

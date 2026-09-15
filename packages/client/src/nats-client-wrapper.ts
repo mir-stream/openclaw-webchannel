@@ -1557,9 +1557,14 @@ export class WebChannelNATSClient {
     this.stageReceiptStateThenCommit(
       receiptKey,
       { messages },
-      () => { this.client.sendUserMessage(trimmed, wireId, randomId, retryOf); },
+      () => { this.sendUserMessage(trimmed, wireId, randomId, retryOf); },
     );
     return this.makeReceipt(receiptKey);
+  }
+
+  private sendUserMessage(text: string, wireId: string, randomId: string, retryOf?: string): void {
+    if (retryOf === undefined) this.client.sendUserMessage(text, wireId, randomId);
+    else this.client.sendUserMessage(text, wireId, randomId, retryOf);
   }
 
   // ---------------------------------------------------------------------------
@@ -1831,10 +1836,10 @@ export class WebChannelNATSClient {
       this.stageReceiptStateThenCommit(
         entry.receiptKey,
         { messages },
-        () => { this.client.sendUserMessage(entry.text, wireId, randomId, entry.retryOf); },
+        () => { this.sendUserMessage(entry.text, wireId, randomId, entry.retryOf); },
       );
     } else {
-      this.client.sendUserMessage(entry.text, wireId, randomId, entry.retryOf);
+      this.sendUserMessage(entry.text, wireId, randomId, entry.retryOf);
     }
   }
 
@@ -1965,14 +1970,14 @@ export class WebChannelNATSClient {
           this.stageReceiptStateThenCommit(
             receiptKey,
             { messages },
-            () => { this.client.sendUserMessage(text, wireId, randomId, retryOf); },
+            () => { this.sendUserMessage(text, wireId, randomId, retryOf); },
           );
         } else {
           // No bubble remains to stage. The authoritative `sent`/`accepted`
           // receipt callback still opens and exposes the turn only after the
           // low-level publish succeeds; `heldReleaseCommitDepth` keeps a listener
           // reached by that fanout from jumping this entry's FIFO position.
-          this.client.sendUserMessage(text, wireId, randomId, retryOf);
+          this.sendUserMessage(text, wireId, randomId, retryOf);
         }
       }
     } finally {

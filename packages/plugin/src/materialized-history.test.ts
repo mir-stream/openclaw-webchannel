@@ -178,8 +178,8 @@ describe('materialized history — canonical prefix and storage invariants', () 
     equivalent(journal); expect(journal.read('peer')).toEqual(raw);
     expect(f.work.reduce((sum, w) => sum + w.rebuilds, 0)).toBeGreaterThan(0);
     expect(f.work.reduce((sum, w) => sum + w.rawEventsApplied, 0)).toBe(raw.length);
-    expect(db.prepare("SELECT value FROM journal_meta WHERE key='history_materialization_version'").get()).toMatchObject({ value: '1' });
-    expect(db.prepare('SELECT valid,version,seq FROM journal_history_checkpoint').get()).toMatchObject({ valid: 1, version: '1', seq: journal.maxSeq('peer') });
+    expect(db.prepare("SELECT value FROM journal_meta WHERE key='history_materialization_version'").get()).toMatchObject({ value: '2' });
+    expect(db.prepare('SELECT valid,version,seq FROM journal_history_checkpoint').get()).toMatchObject({ valid: 1, version: '2', seq: journal.maxSeq('peer') });
   });
 
   it('upgrades a legacy raw-journal fixture lazily without a startup projection', () => {
