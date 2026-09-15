@@ -18,6 +18,59 @@ function setup() {
 }
 
 describe("#342 history row authority", () => {
+  it("fills sparse terminal tool metadata from repeated full history at the same version", () => {
+    const { wrapper, inner, send } = setup();
+    try {
+      send({ type: "tool_activity", id: "tool", turnId: "t", phase: "end", status: "ok", seq: 4 });
+      const snapshot: InboundMessage = { type: "history", highWaterSeq: 4, messages: [
+        { kind: "tool", id: "tool", turnId: "t", name: "read_file", argKeys: ["path", "limit"],
+          summary: "Read file", phase: "end", status: "ok", seq: 4 },
+      ] };
+      send(snapshot); send(snapshot);
+      expect(wrapper.getState().messages).toMatchObject([
+        { kind: "tool", name: "read_file", argKeys: ["path", "limit"], summary: "Read file", phase: "end", status: "ok" },
+      ]);
+      expect(inner.cursor.last).toBe(4);
+      expect(inner.client.getDifference).not.toHaveBeenCalled();
+      send({ type: "tool_activity", id: "tool", turnId: "t", name: "new name", argKeys: ["new"],
+        summary: "New outcome", phase: "end", status: "error", seq: 5 });
+      const newer = wrapper.getState().messages;
+      send(snapshot); send(snapshot);
+      expect(wrapper.getState().messages).toEqual(newer);
+    } finally { wrapper.close(); }
+  });
+
+  it.each([false, true])("reconstructs sparse tool content during cold recovery while fencing newer state: %s", (newerHistory) => {
+    const { wrapper, inner, send } = setup();
+    try {
+      send({ type: "tool_activity", id: "tool", turnId: "t", phase: "end", status: "ok", seq: 4 });
+      const snapshot: InboundMessage = { type: "history", highWaterSeq: 4, snapshotComplete: false, messages: [] };
+      send(snapshot); send(snapshot);
+      if (newerHistory) {
+        send({ type: "history", messages: [{ kind: "tool", id: "tool", turnId: "t", name: "new name",
+          argKeys: ["new"], summary: "New outcome", phase: "end", status: "error", seq: 6 }] });
+      }
+      send({ type: "difference", afterSeq: 0, nonce: inner.cursor.nonce, maxSeq: 2, partial: true, events: [
+        { seq: 1, event: { kind: "tool", id: "tool", turnId: "t", name: "read_file", phase: "start", argKeys: ["path", "limit"] } },
+        { seq: 2, event: { kind: "tool", id: "tool", turnId: "t", phase: "update", summary: "Read file" } },
+      ] });
+      expect(wrapper.getState().messages[0]).toMatchObject({ phase: "end", status: newerHistory ? "error" : "ok" });
+      send({ type: "difference", afterSeq: 2, nonce: inner.cursor.nonce, maxSeq: 4, partial: false, events: [
+        { seq: 3, event: { kind: "bubble", answerId: "a3", text: "done" } },
+        { seq: 4, event: { kind: "tool", id: "tool", turnId: "t", phase: "end", status: "ok" } },
+      ] });
+      const expected = wrapper.getState().messages;
+      expect(expected.map((row) => row.id)).toEqual(["tool", "a3"]);
+      expect(expected[0]).toMatchObject(newerHistory
+        ? { name: "new name", argKeys: ["new"], summary: "New outcome", phase: "end", status: "error" }
+        : { name: "read_file", argKeys: ["path", "limit"], summary: "Read file", phase: "end", status: "ok" });
+      send(snapshot); send(snapshot);
+      expect(wrapper.getState().messages).toEqual(expected);
+      expect(inner.cursor.last).toBe(4);
+      expect(inner.client.getDifference).toHaveBeenCalledTimes(2);
+    } finally { wrapper.close(); }
+  });
+
   it("skips a null history member and hydrates the valid following row", () => {
     const { wrapper, send } = setup();
     try {

@@ -3130,6 +3130,21 @@ export class WebChannelNATSClient {
       && ((cursor.state === "catching-up" && this.frameSeq > cursor.afterSeq)
         || (cursor.state === "synced" && this.frameSeq === cursor.last + 1))) {
       this.recoveringHistoryOrder = applyDurableEvent(this.recoveringHistoryOrder, event);
+      if (event.kind === "tool") {
+        const tool = event;
+        const reconstructed = this.recoveringHistoryOrder.find(
+          (row) => row.kind === "tool" && row.turnId === tool.turnId && row.id === tool.id,
+        );
+        if (reconstructed?.kind === "tool") {
+          // A terminal tool delta can omit fields supplied by its opener. The
+          // recovered prefix supplies the full row, once replay reaches the
+          // held version; an earlier prefix still passes through the fence.
+          if (this.rowVersions.seq(durableRowKey(reconstructed)) === this.frameSeq) {
+            return applyDurableEvent(view, reconstructed);
+          }
+          event = reconstructed;
+        }
+      }
     }
     return this.rowVersions.apply(view, event, this.frameSeq, floor);
   }
@@ -4380,13 +4395,18 @@ export class WebChannelNATSClient {
       // state. Replay-only empty placements are the existing #362 exception.
       const placeholder = row.kind === undefined && row.role === "agent"
         && this.replayPlacementIds.has(row.id);
+      // Unlike a sparse live delta, a projected tool row contains the fold of
+      // all its events. Equal-version projection can restore omitted metadata.
+      const completeToolVersion = row.kind === "tool" && row.seq !== undefined
+        && row.seq === this.rowVersions.seq(key);
       if (index !== undefined && !placeholder && (row.seq === undefined
-        || !this.rowVersions.allows(key, row.seq))) continue;
+        || (!completeToolVersion && !this.rowVersions.allows(key, row.seq)))) continue;
       const before = view;
       // A snapshot row is already the full result of its journal prefix. Fold
       // its fields through the existing event arms; the row's seq fences later
       // delayed live/difference frames as well as other history pages.
-      view = this.rowVersions.apply(view, decoded.event, row.seq);
+      view = completeToolVersion ? applyDurableEvent(view, decoded.event)
+        : this.rowVersions.apply(view, decoded.event, row.seq);
       if (row.kind === undefined && row.revision !== undefined && isWireSeq(row.revision)) {
         view = applyDurableEvent(view, { kind: "messageEdited", id: row.id,
           text: row.text!, revision: row.revision, turnId: row.turnId });
