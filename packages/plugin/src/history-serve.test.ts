@@ -13,8 +13,8 @@
  *
  * The scheduler is INJECTED throughout rather than awaited. Production passes
  * `setImmediate`; every test here passes a manual queue, so "the fold does not
- * run on the calling turn" and "a second request while one is in flight is
- * dropped" are asserted deterministically instead of raced.
+ * run on the calling turn" and the per-kind concurrent-request behavior are
+ * asserted deterministically instead of raced.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -503,6 +503,7 @@ describe("createHistoryServer — read failure sends NO frame", () => {
     });
 
     server.sendSnapshot(PEER);
+    server.sendSnapshot(PEER); // Coalesced refresh must also clear on failure.
     scheduler.flush();
     expect(errors).toHaveLength(1);
     expect(sent).toEqual([]);
@@ -515,21 +516,52 @@ describe("createHistoryServer — read failure sends NO frame", () => {
   });
 });
 
-describe("createHistoryServer — the per-peer in-flight CONCURRENCY bound (not #286)", () => {
-  it("drops a concurrent SNAPSHOT for the same peer and warns", () => {
+describe("createHistoryServer — the per-peer in-flight CONCURRENCY bound", () => {
+  it("coalesces concurrent SNAPSHOT requests for the same peer", () => {
     const journal = openJournal();
     for (const event of thread("a")) journal.append(PEER, event);
     const { server, sent, scheduler, warns } = harness(journal);
 
     server.sendSnapshot(PEER);
-    server.sendSnapshot(PEER); // first is still queued → dropped
+    server.sendSnapshot(PEER); // The queued callback will include this request.
     expect(scheduler.pending).toBe(1);
-    expect(warns).toHaveLength(1);
-    expect(warns[0]).toContain("history snapshot dropped");
-    expect(warns[0]).toContain("suppressed=0");
+    expect(warns).toEqual([]);
 
     scheduler.flush();
     expect(sent).toHaveLength(1);
+  });
+
+  it("refreshes a pending snapshot target once per new request, without chasing later appends", () => {
+    const journal = openJournal();
+    for (let i = 1; i <= 400; i++) {
+      journal.append(PEER, { kind: "bubble", answerId: `a${i}`, text: `${i}` });
+    }
+    const queue: Array<() => void> = [];
+    const { server, sent, warns } = harness(journal, { schedule: (fn) => queue.push(fn) });
+    server.sendSnapshot(PEER);
+    queue.shift()!(); // Samples 400 and yields before finishing the cold build.
+    expect(sent).toEqual([]);
+    expect(queue).toHaveLength(1);
+
+    journal.append(PEER, { kind: "bubble", answerId: "a401", text: "later registration" });
+    server.sendSnapshot(PEER);
+    server.sendSnapshot(PEER);
+    expect(queue).toHaveLength(1);
+    queue.shift()!(); // Coalesced requests sample a new finite target of 401.
+    expect(sent).toEqual([]);
+    journal.append(PEER, { kind: "bubble", answerId: "a402", text: "after the refresh" });
+    while (queue.length) queue.shift()!();
+
+    expect(warns).toEqual([]);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].highWaterSeq).toBe(401);
+    expect(sent[0].messages.at(-1)).toMatchObject({ id: "a401", seq: 401 });
+
+    server.sendSnapshot(PEER);
+    while (queue.length) queue.shift()!();
+    expect(sent).toHaveLength(2);
+    expect(sent[1].highWaterSeq).toBe(402);
+    expect(sent[1].messages.at(-1)).toMatchObject({ id: "a402", seq: 402 });
   });
 
   it("drops a concurrent PAGE for the same peer and warns", () => {
@@ -599,14 +631,14 @@ describe("createHistoryServer — the per-peer in-flight CONCURRENCY bound (not 
     let clock = 0;
     const { server, scheduler, warns } = harness(journal, { now: () => clock });
 
-    server.sendSnapshot(PEER);
-    for (let i = 0; i < 5; i++) server.sendSnapshot(PEER);
+    server.servePage(PEER, {});
+    for (let i = 0; i < 5; i++) server.servePage(PEER, {});
     expect(warns).toHaveLength(1);
     expect(warns[0]).toContain("suppressed=0");
 
     // Past the window, the next drop reports the four it swallowed.
     clock += 60_001;
-    server.sendSnapshot(PEER);
+    server.servePage(PEER, {});
     expect(warns).toHaveLength(2);
     expect(warns[1]).toContain("suppressed=4");
 

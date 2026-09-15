@@ -59,7 +59,8 @@ the checkout; `sourceHashes` identify the measured code even before a results co
 
 ## Results
 
-All times below are milliseconds; ranges show the two observations.
+All times below are milliseconds; ranges show the two observations. Materialized
+results measure the sources in initial PR head `00fa6ce0c672abec9a3e40f1d1d0ee24efb721b2`.
 
 | Stream | Raw events | Baseline unchanged | Materialized unchanged | Deep page | Reopen | Cold build | Version rebuild |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -115,7 +116,10 @@ passed the frozen old-projection comparison on the same journal.
 
 These are measurements of the named operations on this host, not CI timing gates.
 The baseline artifact was measured before editing production code. Candidate code
-hashes accompany its results; commit/PR validation uses those exact source files.
+hashes accompany its results and match initial PR head `00fa6ce`. A subsequent
+convergence fix changed `history-serve.ts` to refresh a pending snapshot's finite
+target when another browser registers. The full-size benchmark was not rerun for
+that revision; the JSON preserves the original measured source hashes.
 
 ## Canonical state and ordering
 
@@ -172,6 +176,11 @@ actual coherent checkpoint. It never samples a separate journal MAX after readin
 rows. Raw difference continues to serve ordered journal events with the existing
 individually oversized-event policy (#343).
 
+Concurrent snapshot requests for one peer share a replay. A later registration
+refreshes its finite target on the next scheduled step, covering events committed
+before that browser subscribed. Subsequent appends alone do not move the target.
+Page requests retain their separate concurrency latch.
+
 Derived tables are created lazily on the first history query. Missing, incompatible,
 or version-mismatched schema is recreated; invalid/missing/ahead checkpoints rebuild
 the affected conversation. The version marker is checked on every query because a
@@ -211,8 +220,9 @@ peers, coherent high-water and dense rank-rebuild failure/reopen.
 Existing durable-send fixtures now read through the materialized query and assert
 full-replay equivalence: relay loss, failed-store same-ID retry, buffered-final FIFO,
 independent final/reasoning IDs and reopen recovery. Encrypted history integration
-covers >500-event warm recovery, byte-trimmed cold recovery, exact optimistic origin
-adoption, repeated snapshots/pages and equal-version sparse terminal tool restoration.
+covers >500-event warm recovery, byte-trimmed cold recovery, a cold browser joining
+during pending snapshot catch-up, exact optimistic origin adoption, repeated
+snapshots/pages and equal-version sparse terminal tool restoration.
 Client recovery/receipt and account/peer routing fixtures remain part of focused
 validation; the final-HEAD E2E Gate owns the full suite, packaging and live harnesses.
 
@@ -220,16 +230,18 @@ The coordinator's separate 24-seed generator passed 3,840 prefix checks, periodi
 hidden-state comparisons, 2,184 pages and 120 reopen checks against frozen
 `914c6e3` projection/version code in 23.38 s. This initial independent check predates
 schema-shape/rank-input validation; it is not represented as final-HEAD CI evidence.
-The coordinator then reran the final code at 1k events for both streams (two runs)
-and 600 dense insertions, checking the frozen oracle. All six production hashes
-matched the full-size committed candidate artifact and final sources exactly.
-That final independent run measured warm unchanged 0.94–1.53 ms with zero raw /
+The coordinator then reran the initial PR code at 1k events for both streams (two
+runs) and 600 dense insertions, checking the frozen oracle. All six production
+hashes matched the full-size committed candidate artifact and `00fa6ce` sources.
+That independent run measured warm unchanged 0.94–1.53 ms with zero raw /
 window reads or rewrites; hot query p50/p95/max 2.64/3.72/69.07 ms, at most 128
 rank writes per batch and final key length 23. The coordinator independently
-inspected the full-size results and reported no outstanding validated blocker.
+inspected the full-size results. These measurements predate the subsequent
+snapshot-registration convergence fix.
 
-Local validation completed under the shared lock: client/plugin/E2E typechecks,
-workspace builds, exact one-worker collection inventory, and focused canonical,
+Before initial PR head `00fa6ce`, local validation completed under the shared lock:
+client/plugin/E2E typechecks, workspace builds, exact one-worker collection
+inventory, and focused canonical,
 materialization, history-server, durable-send, encrypted recovery, client receipt,
 account/peer isolation and ingress-identity tests. No full local suite was run.
 

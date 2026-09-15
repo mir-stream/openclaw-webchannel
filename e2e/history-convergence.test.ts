@@ -126,6 +126,36 @@ describe("history producer → sealed frame → browser decoder → wrapper", ()
     expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(["old", ...Array.from({ length: 602 }, (_, i) => `a${i + 2}`)]);
   });
 
+  it("covers a cold same-peer browser that registers during snapshot catch-up", () => {
+    const h = setup();
+    for (let i = 1; i <= 400; i++) {
+      h.journal.append("peer", { kind: "bubble", answerId: `a${i}`, text: `${i}` });
+    }
+    h.server.sendSnapshot("peer"); // An earlier browser's registration.
+    h.queue.shift()!(); // The first bounded callback captures 400 and yields.
+    expect(h.transport.frames).toEqual([]);
+    expect(h.queue).toHaveLength(1);
+
+    expect(h.channel.sendText("peer", "before the cold browser joined", "a401")).toBe(true);
+    h.transport.frames.length = 0; // The cold browser has not subscribed yet.
+    expect(h.wrapper.getState().messages).toEqual([]);
+    h.server.sendSnapshot("peer"); // Its registration shares the pending replay.
+    expect(h.queue).toHaveLength(1);
+    while (h.queue.length) h.queue.shift()!();
+
+    expect(h.transport.frames).toHaveLength(1);
+    const snapshot = h.decode(h.transport.frames[0]!);
+    expect(snapshot).toMatchObject({ type: "history", highWaterSeq: 401, snapshotComplete: true });
+    expect(snapshot.messages!.at(-1)).toMatchObject({ id: "a401", seq: 401 });
+    h.deliver();
+    expect(h.inner.cursor).toMatchObject({ state: "synced", last: 401 });
+    expect(h.wrapper.getState().messages.map(row => row.id)).toEqual(
+      Array.from({ length: 50 }, (_, i) => `a${i + 352}`),
+    );
+    expect(h.wrapper.getState().messages.at(-1)).toMatchObject({ text: "before the cold browser joined" });
+    expect(h.queue).toEqual([]);
+  });
+
   it("measures snapshot completeness on the actual sealed envelope and recovers byte trimming", () => {
     const h = setup(1800);
     for (let i = 1; i <= 8; i++) h.journal.append("peer", { kind: "bubble", answerId: `a${i}`, text: "content ".repeat(25) });

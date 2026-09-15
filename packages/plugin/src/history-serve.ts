@@ -269,6 +269,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
   // ⚠️ SEPARATE SETS. See the file header: a snapshot dropped because a PAGE is
   // folding would cost a reconnecting tab its TAIL, which no retry recovers.
   const snapshotsInFlight = new Set<string>();
+  const snapshotsNeedingRefresh = new Set<string>();
   const pagesInFlight = new Set<string>();
   /**
    * #356 — the per-peer `get_difference` queue. Present ⇒ this peer has a read
@@ -591,7 +592,10 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
       } finally {
         // In the `finally` so a throw cannot latch the peer out of its own
         // history for the life of the process.
-        if (!pending) inFlight.delete(peerId);
+        if (!pending) {
+          inFlight.delete(peerId);
+          if (kind === "snapshot") snapshotsNeedingRefresh.delete(peerId);
+        }
       }
       if (pending) { schedule(run); return; }
       if (messages === undefined) return;
@@ -895,10 +899,8 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
   return {
     serveDifference(peerId: string, afterSeq: number, nonce: string): void {
       // ONE READ+PUBLISH IN FLIGHT PER PEER, WITH A BOUNDED FIFO QUEUE.
-      // The other two read paths latch per peer and DROP a concurrent request
-      // (`runDeferred`), which is right for them: a snapshot and a page each
-      // answer a question that is still true when the survivor lands, so the
-      // dropped caller loses nothing. A `get_difference` is not like that. It
+      // Snapshots coalesce concurrent requests by refreshing their finite target;
+      // pages retain their separate per-peer latch. A `get_difference`
       // names a FLOOR and carries a `nonce`, and the reply is addressed to that
       // pair — so a dropped request is a device left waiting on its 5 s timeout.
       //
@@ -949,6 +951,13 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
     },
 
     sendSnapshot(peerId: string): void {
+      if (snapshotsInFlight.has(peerId)) {
+        // A later browser may have missed events committed after the active
+        // snapshot's target. Refresh on its next scheduled step so the shared
+        // reply covers this registration, without queuing another replay.
+        snapshotsNeedingRefresh.add(peerId);
+        return;
+      }
       let highWaterSeq: number | undefined;
       let targetSeq: number | undefined;
       runDeferred(
@@ -956,6 +965,9 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
         snapshotsInFlight,
         peerId,
         () => {
+          // Consume before reading so failures cannot retain refresh state.
+          // Only a new request moves the finite target; appends alone do not.
+          if (snapshotsNeedingRefresh.delete(peerId)) targetSeq = undefined;
           const served = serveHistoryRequestStep(journal, peerId, {
             kind: "recent", limit: config.limit,
           }, targetSeq);
