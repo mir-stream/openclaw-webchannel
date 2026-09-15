@@ -1,5 +1,13 @@
 # Project Status — single source of truth
 
+Round 4 (#286): snapshots and history pages use an incrementally maintained SQLite
+read model. The raw journal remains authoritative; canonical reducer rows,
+positions, tombstones and metadata are committed with their checkpoint. Cold
+builds, catch-up and dense-slot rank rebuilding yield between transactions.
+Unchanged pages, including after reopen, read indexed page rows without raw replay
+or conversation hydration. Durable append acceptance and raw difference recovery
+retain their existing contracts. See [design, measurements and validation](benchmarks/history-materialization.md).
+
 Round 3A (#262): turn-end finals no longer match past assistant drafts by count
 or position. Closed draft IDs keep their authored text; a final without an owned
 current draft gets an independent delivery ID. Full final text survives live,

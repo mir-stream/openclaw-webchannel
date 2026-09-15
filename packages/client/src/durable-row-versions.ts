@@ -22,6 +22,11 @@ export class DurableRowVersions {
   private previousView: DurableView | undefined;
   private unchangedRows = new WeakSet<DurableMessage>();
 
+  /** Restore a canonical journal prefix, including permanent deletion fences. */
+  restore(row: DurableMessage, seq: number): void {
+    this.rows.set(durableRowKey(row), { seq, deleted: row.kind === "text" && row.deleted === true });
+  }
+
   seq(key: string): number | undefined { return this.rows.get(key)?.seq; }
   deleted(key: string): boolean { return this.rows.get(key)?.deleted === true; }
   remember(key: string, seq: number): void {
@@ -75,4 +80,63 @@ export class DurableRowVersions {
     this.previousView = next;
     return next;
   }
+}
+
+/** A persisted reducer row. Order belongs to storage; it is never a row version. */
+export type DurableWindowEntry = { row: DurableMessage; seq: number; order: string };
+export interface DurableWindowReader {
+  get(key: string): DurableWindowEntry | undefined;
+  neighbor(order: string, direction: "before" | "after"): DurableWindowEntry | undefined;
+  last(): DurableWindowEntry | undefined;
+}
+
+/** The identities an event can change. Keep this exhaustive with the reducer. */
+function eventRowKeys(event: DurableEvent): string[] {
+  const text = (id: string) => JSON.stringify(["text", id]);
+  switch (event.kind) {
+    case "user": case "messageEdited": case "messageDeleted": return [text(event.id)];
+    case "placement": case "bubble": return [text(event.answerId)];
+    case "reasoning": return [JSON.stringify(["reasoning", event.id])];
+    case "tool": return [JSON.stringify(["tool", event.turnId, event.id])];
+    case "approval": case "approvalResolution": return [JSON.stringify(["approval", event.id])];
+    case "seal": return [...new Set([
+      ...(Array.isArray(event.answers) ? event.answers.flatMap(a =>
+        a && typeof a.id === "string" ? [text(a.id)] : []) : []),
+      ...(Array.isArray(event.remove) ? event.remove.flatMap(id =>
+        typeof id === "string" ? [text(id)] : []) : []),
+    ])];
+  }
+}
+
+/**
+ * Apply the SAME canonical reducer to an event's complete dependency window.
+ *
+ * Every transition addresses explicit typed identities. Seal additionally uses
+ * their relative slots, adjacent insertion positions, and the tail for absent
+ * removals/new answers. Immediate neighbors anchor omitted intervals: no event
+ * can read or move their interiors. Loading those anchors lets the canonical
+ * array reducer decide all content/order without hydrating an unrelated row.
+ *
+ * This interface is for strictly increasing journal prefixes. Live out-of-order
+ * delivery continues to use DurableRowVersions over its full in-memory view.
+ */
+export function applyDurableEventWindow(reader: DurableWindowReader, event: DurableEvent, seq: number): {
+  before: DurableWindowEntry[]; after: DurableView; versions: DurableRowVersions;
+} {
+  const entries = new Map<string, DurableWindowEntry>();
+  const add = (entry: DurableWindowEntry | undefined) => {
+    if (entry !== undefined) entries.set(durableRowKey(entry.row), entry);
+  };
+  for (const key of eventRowKeys(event)) {
+    const entry = reader.get(key);
+    if (entry === undefined) continue;
+    add(entry);
+    add(reader.neighbor(entry.order, "before"));
+    add(reader.neighbor(entry.order, "after"));
+  }
+  add(reader.last());
+  const before = [...entries.values()].sort((a, b) => a.order < b.order ? -1 : a.order > b.order ? 1 : 0);
+  const versions = new DurableRowVersions();
+  for (const entry of before) versions.restore(entry.row, entry.seq);
+  return { before, after: versions.apply(before.map(entry => entry.row), event, seq), versions };
 }

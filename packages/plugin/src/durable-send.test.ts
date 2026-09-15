@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { openDeliveryJournal } from "./delivery-journal.js";
-import { projectJournalHistory } from "./journal-history.js";
+import { projectJournalHistory, serveHistoryRequestStep } from "./journal-history.js";
 import { createProgressDraftController } from "./message-adapter.js";
 import { createHistoryServer } from "./history-serve.js";
 import { DEFAULT_HISTORY_CONFIG } from "./history.js";
@@ -44,7 +44,18 @@ function setup(options?: { encrypted?: boolean; reasoningDurable?: boolean }) {
   const draft = createProgressDraftController({ transport: channel, sessionKey: "peer", turnId: "turn", channelConfig: {}, throttleMs: 0 });
   draft.handleAssistantMessageBoundary();
   cleanup.push(() => draft.stop());
-  const history = () => projectJournalHistory(journal.read.bind(journal), "peer").messages;
+  const history = () => {
+    let target: number | undefined;
+    for (let i = 0; i < 1000; i++) {
+      const result = serveHistoryRequestStep(journal, "peer", { kind: "recent", limit: Infinity }, target);
+      if (!result.pending) {
+        expect(result.messages).toEqual(projectJournalHistory(journal.read, "peer").messages);
+        return result.messages;
+      }
+      target = result.targetSeq;
+    }
+    throw new Error("materialized history did not finish");
+  };
   const fail = () => db.exec("CREATE TRIGGER fail_write BEFORE INSERT ON journal_event BEGIN SELECT RAISE(ABORT, 'injected failure'); END");
   return { journal, db, transport, channel, draft, history, fail, key, databasePath };
 }
@@ -328,7 +339,11 @@ it("recovers the same encrypted final through difference and reopened history af
   expect(frame).toMatchObject({ type: "difference", nonce: "request-1", events: [expect.objectContaining({ event: { kind: "bubble", answerId: id, text: "authored while disconnected", turnId: "turn" } })] });
   const reopened = openDeliveryJournal({ databasePath });
   try {
-    expect(projectJournalHistory(reopened.read.bind(reopened), "peer").messages).toEqual([expect.objectContaining({ id, text: "authored while disconnected" })]);
+    const restored = serveHistoryRequestStep(reopened, "peer", { kind: "recent", limit: 50 });
+    expect(restored.pending).toBe(false);
+    if (restored.pending) throw new Error("one-event materialization did not finish");
+    expect(restored.messages).toEqual([expect.objectContaining({ id, text: "authored while disconnected" })]);
+    expect(restored.messages).toEqual(projectJournalHistory(reopened.read, "peer").messages);
   } finally { reopened.close(); }
 });
 

@@ -1,170 +1,26 @@
 /**
- * v6 delivery-render — THE LIVE HISTORY READ PATH (issue #240 half 2, doc §15.6).
+ * Serve journal-owned snapshots/pages and raw ordered difference events.
+ * The file is account-scoped; conversationId is the authenticated raw peer ID.
  *
- * Both things a peer can ask for — the register-time snapshot and a
- * `load_history` page — are the same three steps: pick a plan, replay this
- * peer's journal through the shared reducer (`journal-history.ts`), publish the
- * result — byte-fitted to the peer's wire since #311 (`history-frame-budget.ts`,
- * applied in `publishFitted` below). This module owns those two bodies so that
- * `nats-account-runtime.ts` is left holding wiring and no policy.
+ * Snapshots/pages catch up the rebuildable SQLite model in bounded scheduled
+ * transactions, then select indexed rows in canonical reducer order. The two
+ * in-flight latches remain held across every yield. They bound concurrent work
+ * per peer/kind; they impose no history depth limit or request-rate policy.
  *
- * ⚠️ IT LIVES HERE BECAUSE IT COULD NOT BE TESTED WHERE IT LIVED BEFORE, AND
- * THAT WAS NOT A STYLE PROBLEM. Both bodies were closures inside
- * `buildNatsAccount`, unreachable from any test, so the tenant-isolation suite
- * "covered" them by TRANSCRIBING them into a helper. MEASURED consequence:
- * changing the production call from `serveHistoryRequest(journal.read, peerId,
- * …)` to `…, accountId, …` — which lets every peer under one
- * `(tenant, accountId)` read every other peer's conversation — left all 21
- * tests in `session-route-tenant-isolation.test.ts` GREEN. A security test that
- * cannot observe the code it certifies is not one. `history-serve.test.ts`
- * drives the real `createHistoryServer` against a real `openDeliveryJournal`,
- * and that mutation is now caught.
+ * A snapshot's high-water comes from the same transaction as its selected rows.
+ * Byte fitting may mark it incomplete so client recovery starts from the proper
+ * prefix. Difference still reads the raw journal and retains the existing
+ * individually oversized-event skip policy (#343).
  *
- * ── WHAT SCOPES A HISTORY READ ──
- *
- * `conversationId === peerId`, and that is the whole story. Both write seams key
- * the journal by peerId (`nats-channel.ts` at egress, `ingress-dedupe.ts` at the
- * inbound accept), and the FILE is already scoped to one `(tenant, accountId)`
- * by `tupleStoragePaths(...).deliveryJournalPath`. `peerId` is the authenticated
- * JWT `sub`, so a peer can only ever name itself. There is NO session key, NO
- * route resolution and NO core transcript read on this path — that was NOT-list
- * N2 and it is gone. Do not reintroduce a core read "as a fallback": it would be
- * a second opinion about what was said.
- *
- * ── READ FAILURE: LOG, AND SEND NOTHING ──
- *
- * `serveHistoryRequest` does not catch, and neither does this module turn a
- * failure into an empty answer. On a throw: `logger.error`, and NO `history`
- * frame at all. With the journal as the only store, answering a broken read with
- * `[]` would impersonate an empty conversation to its owner — doc §15.6's
- * "조용한 빈-세션 위장 금지" reached from the read side. An empty answer from a
- * SUCCESSFUL read is a different thing and is still sent for a page.
- *
- * ⚠️ BE PRECISE ABOUT WHAT THE EMPTY PAGE DOES FOR *OUR* CLIENT: nothing. Its
- * `case "history"` returns early on a zero-length list and `loadHistory` keeps
- * no pending state, so an empty page does not "stop it asking" — it is a
- * no-op, which is the honest outcome. A third-party client that tracks its own
- * request gets the end-of-history answer. Sending nothing at all would be worse
- * for both, which is why this is still the right value.
- *
- * HONEST LIMIT: the client still sees an empty chat either way, because there is
- * no wire signal for "history unavailable" — a peer that receives no `history`
- * frame cannot distinguish it from a new conversation. This log is the only
- * place the failure is visible, so the honest policy stops at the wire.
- * **#296** owns adding the signal.
- *
- * ── ⚠️ WHY THE TWO IN-FLIGHT LATCHES EXIST: A PEER COULD PIN THE PROCESS ──
- *
- * `load_history` reaches `dispatchInbound` (`nats-channel.ts`) with no rate
- * limit, no in-flight cap and no coalescing — it does not go through
- * `inboundDebouncer` or `SerializedInboundDispatcher`, which are `user_message`
- * -only. The reader this replaced was an async gateway call hard-capped at 1000
- * messages; this one is a SYNCHRONOUS replay, quadratic in conversation length
- * (~1.45–1.51 s at 20 000 events across #286's two runs; `journal-history.ts`'s
- * own table is one run and tops out at 1449.6 ms). So 50
- * frames carrying distinct cursors against one long conversation was ~72 s of
- * blocked event loop, on the one loop serving every tenant in the process.
- * `setImmediate` does not help with that: it interleaves other work between
- * folds, it does not reduce the CPU or the concurrency.
- *
- * ── ⚠️ HALF 2 SHIPS WITH NEITHER OF #286's DISJUNCTS. READ THIS BEFORE CITING
- *    THE LATCH AS A BOUND. ──
- *
- * #286's scope note offers two ways half 2 could ship safely: "the snapshot path
- * only", or "a bound on how far back paging goes" — a DEPTH bound. **Neither is
- * satisfied here.** The snapshot is unbounded and so are pages. The latch below
- * is a third thing: it bounds a BURST of frames stacking folds. It is not a
- * depth bound and not a rate bound, and it must not be quoted as either.
- *
- * ⚠️ A DEPTH BOUND WAS BUILT AND THEN REVERTED, so the next reader does not
- * rebuild it. The only thing checkable BEFORE a fold is total conversation
- * length (via `seq`); DEPTH — how far back a cursor sits — is not, because
- * locating a cursor in the projection IS the fold. A length gate is therefore
- * not a weaker version of the old wall, it is a different and WORSE product:
- * the deleted `pageBefore` always served the newest `MAX_FETCH_WINDOW` (1 000)
- * messages and returned `[]` only for a cursor outside that window, so a
- * 3 000-message conversation could still page back through its newest 1 000. A
- * length gate at the same number gives a 1 200-message conversation a reach of
- * ZERO — the first "Load older" click and every one after it answers `[]`, and
- * 1 150 messages the pre-cutover build served become unreachable at any depth.
- * "Reproduces the old reach" was measured against the wrong quantity.
- *
- * ⚠️ WHY SHIPPING UNBOUNDED IS NONETHELESS THE RIGHT CALL, stated as the actual
- * argument rather than a shrug: bounding pages while the snapshot stays
- * unbounded is THEATRE. The register hop is unrated (#298), and it drives the
- * snapshot — an unbounded fold on a path that has no bound BY DESIGN, since a
- * truncated snapshot is a wrong chat rather than a slow one.
- *
- * ⚠️ "TRUNCATED" THERE MEANS REPLAY DEPTH, NOT THE SERVED WINDOW — read as the
- * latter the sentence is simply false, because `sendSnapshot` below asks for
- * `{kind:"recent", limit: config.limit}` — which at the DEFAULT config
- * (`DEFAULT_HISTORY_CONFIG.limit` is 50) windows every snapshot to the newest
- * 50 messages. That number is `channels.webchannel.history.limit` and an
- * operator can set it to anything; what is unconditional is that the snapshot is
- * windowed at all, not the width. What must not be
- * truncated is the FOLD: `serveHistoryRequest` projects the WHOLE journal and
- * `recentHistoryPage`/`historyPageBefore` slice that result. Truncating the
- * INPUT instead is not available — the projection is a fold from the start of
- * the stream with no way to resume partway (materializing one is exactly #286),
- * so a shortened replay yields a different conversation rather than a shorter
- * one. Windowing the OUTPUT is cheap and correct. `MAX_WIRE_HISTORY_LIMIT`
- * (`history.ts`) likewise bounds only the output of a peer-requested page — it
- * is not a fold bound and does not touch the argument below.
- *
- * The process is
- * therefore already exposed to unbounded serial folds; the page path adds
- * nothing qualitatively new to that exposure, only more of it. A page bound
- * would buy a real product regression for no change in the worst case.
- *
- * ⚠️ SO THE DECISION IS LIVE, AND IT IS NOT THIS FILE'S. #286 says the cost "IS
- * a blocker for serving long conversations. Decide which when half 2 lands."
- * Half 2 landed WITHOUT either disjunct. That decision now belongs to whoever
- * merges this — it was not made here, and this comment is not it being made.
- *
- * ⚠️ TWO SETS, NOT ONE, AND THAT IS THE WHOLE REASON THIS IS SAFE. A snapshot
- * must never be dropped because a PAGE fold is running: a page answers with
- * OLDER messages, so a reconnecting tab that lost its snapshot would lose its
- * TAIL — the most recent messages — and never recover them.
- *
- * Each drop is harmless for its own reason, and neither reason covers the other:
- *  - SNAPSHOT: the register-time snapshot is stateless and idempotent
- *    (`nats-register.ts` fires it on EVERY register, and the client's
- *    id-idempotent hydration absorbs duplicates). Dropping one because ANOTHER
- *    SNAPSHOT FOR THE SAME PEER is already folding loses nothing: same
- *    conversation, same store, an answer is already on its way.
- *  - PAGE: the next cursor comes out of the previous page's answer, so a
- *    conforming client never has two page requests outstanding. Dropping a
- *    concurrent one costs a non-conforming client an answer it was not entitled
- *    to assume it could ask for.
- *
- * ⚠️ THIS BOUNDS CONCURRENCY, NOT RATE, AND THE RESIDUAL IS REAL — VERIFIED, NOT
- * ASSUMED. The register hop is effectively unbounded in rate for an
- * authenticated peer: `handleRegisterRequest` gates on JWT + tenant + subject
- * match + `clientNonce` + a single-use PoP nonce, and `PopChallengeStore` caps
- * only the number of LIVE nonces per peer (`DEFAULT_MAX_NONCES_PER_PEER = 8`),
- * never the rate at which a peer may challenge→register→challenge→register. So
- * one authenticated peer can still drive SERIAL snapshot folds back to back and
- * occupy the loop indefinitely; the latch stops it from stacking N of them at
- * once, which is what turned a burst into minutes. Pre-cutover a register cost
- * an async core call; post-cutover it costs a synchronous quadratic fold, which
- * is a new deployment-visible property — **#298** owns bounding the trigger, and
- * it is the lever that matters most given nothing bounds depth.
- *
- * ⚠️ #298 AND #286 ARE INDEPENDENT LEVERS AND NEITHER SUBSUMES THE OTHER: #286
- * makes the replay cheaper, #298 bounds how often it can be triggered. Fixing
- * one does not retire the other.
- *
- * ⚠️ AND DO NOT "FIX" THE COST HERE. A projection cache, a high-water-`seq`
- * memo, or anything else that avoids the replay is §15.4's materialized read
- * model — that is **#286**, and a private incremental fold in the plugin is a
- * second implementation of the reducer, which is N8.
+ * Read/projection faults log and emit no frame; a successful empty result is
+ * distinct from failure. There is no transcript fallback or empty-success catch.
  */
 import type { DifferenceReply } from "./channel-contract.js";
 import type { DeliveryJournal } from "./delivery-journal.js";
 import { fitHistoryFrame, type SkippedHistoryRow } from "./history-frame-budget.js";
 import type { HistoryConfig, HistoryMessage } from "./history.js";
 import { planHistoryFetch } from "./history.js";
-import { serveHistoryRequest, type ServedHistory } from "./journal-history.js";
+import { serveHistoryRequestStep, type ServedHistory } from "./journal-history.js";
 import { logSafe } from "./log-safe.js";
 import type { NatsChannel } from "./nats-channel.js";
 // #244 half B: a `difference` carries RAW journal events, typed by the client
@@ -413,6 +269,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
   // ⚠️ SEPARATE SETS. See the file header: a snapshot dropped because a PAGE is
   // folding would cost a reconnecting tab its TAIL, which no retry recovers.
   const snapshotsInFlight = new Set<string>();
+  const snapshotsNeedingRefresh = new Set<string>();
   const pagesInFlight = new Set<string>();
   /**
    * #356 — the per-peer `get_difference` queue. Present ⇒ this peer has a read
@@ -667,20 +524,12 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
     }
   };
 
-  /**
-   * The one deferred body both entry points share.
-   *
-   * `produce` returns `undefined` to mean "answer nothing at all" — the read
-   * failed, and no `history` frame may be sent (see the header). `emit` decides
-   * what a successful answer does with its messages, because the two kinds
-   * differ there: a snapshot with nothing to say sends no frame, while an empty
-   * page is still an answer.
-   */
+  /** Keep the latch through catch-up yields; release it on success or failure. */
   const runDeferred = (
     kind: ServeKind,
     inFlight: Set<string>,
     peerId: string,
-    produce: () => HistoryMessage[],
+    produce: () => HistoryMessage[] | { pending: true },
     emit: (messages: HistoryMessage[]) => void,
   ): void => {
     if (inFlight.has(peerId)) {
@@ -708,7 +557,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
       return;
     }
     inFlight.add(peerId);
-    schedule(() => {
+    const run = () => {
       // ⚠️ THE READ IS INSIDE THE `try`; THE PUBLISH IS NOT. An earlier revision
       // ran `emit` inside it, so a throw out of `channel.sendHistory` — reachable,
       // see `nats-channel.ts`'s publish path — was logged as "journal read
@@ -725,8 +574,11 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
       // send, which never throws — that is reported inside `publishFitted`
       // under the same `publish-failed` reason.
       let messages: HistoryMessage[] | undefined;
+      let pending = false;
       try {
-        messages = produce();
+        const produced = produce();
+        if (Array.isArray(produced)) messages = produced;
+        else pending = true;
       } catch (err) {
         const suppressed = admit(kind, "read-failed");
         if (suppressed !== undefined) {
@@ -740,8 +592,12 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
       } finally {
         // In the `finally` so a throw cannot latch the peer out of its own
         // history for the life of the process.
-        inFlight.delete(peerId);
+        if (!pending) {
+          inFlight.delete(peerId);
+          if (kind === "snapshot") snapshotsNeedingRefresh.delete(peerId);
+        }
       }
+      if (pending) { schedule(run); return; }
       if (messages === undefined) return;
       try {
         emit(messages);
@@ -756,7 +612,8 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
           } catch { /* a faulting logger must not escape this callback */ }
         }
       }
-    });
+    };
+    schedule(run);
   };
 
   /**
@@ -1042,10 +899,8 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
   return {
     serveDifference(peerId: string, afterSeq: number, nonce: string): void {
       // ONE READ+PUBLISH IN FLIGHT PER PEER, WITH A BOUNDED FIFO QUEUE.
-      // The other two read paths latch per peer and DROP a concurrent request
-      // (`runDeferred`), which is right for them: a snapshot and a page each
-      // answer a question that is still true when the survivor lands, so the
-      // dropped caller loses nothing. A `get_difference` is not like that. It
+      // Snapshots coalesce concurrent requests by refreshing their finite target;
+      // pages retain their separate per-peer latch. A `get_difference`
       // names a FLOOR and carries a `nonce`, and the reply is addressed to that
       // pair — so a dropped request is a device left waiting on its 5 s timeout.
       //
@@ -1096,34 +951,31 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
     },
 
     sendSnapshot(peerId: string): void {
-      // #244 half A: the conversation's high-water `seq` at snapshot time,
-      // captured in `produce` (inside the read guard) and stamped onto the
-      // `history` frame in `emit`. `maxSeq` is a single MAX(seq) index read, NOT
-      // a fold — so it does NOT reintroduce the §15.4 materialized read model the
-      // header warns against (that ban is about AVOIDING the replay; this stands
-      // alongside the fold `serveHistoryRequest` still performs).
+      if (snapshotsInFlight.has(peerId)) {
+        // A later browser may have missed events committed after the active
+        // snapshot's target. Refresh on its next scheduled step so the shared
+        // reply covers this registration, without queuing another replay.
+        snapshotsNeedingRefresh.add(peerId);
+        return;
+      }
       let highWaterSeq: number | undefined;
+      let targetSeq: number | undefined;
       runDeferred(
         "snapshot",
         snapshotsInFlight,
         peerId,
         () => {
-          // UNBOUNDED on purpose — but NOT because #286 licenses it. #286's
-          // first disjunct is "ship the snapshot path ONLY" (i.e. do not ship
-          // the pager); it says nothing about the snapshot's own depth, and this
-          // slice shipped the pager anyway, so neither disjunct is met (header).
-          // The reason depth is not gated HERE is the product one: a truncated
-          // snapshot is a wrong chat, not a slow one. The residual that leaves
-          // is #298.
-          const served = serveHistoryRequest(journal.read, peerId, {
-            kind: "recent",
-            limit: config.limit,
-          });
+          // Consume before reading so failures cannot retain refresh state.
+          // Only a new request moves the finite target; appends alone do not.
+          if (snapshotsNeedingRefresh.delete(peerId)) targetSeq = undefined;
+          const served = serveHistoryRequestStep(journal, peerId, {
+            kind: "recent", limit: config.limit,
+          }, targetSeq);
+          if (served.pending) { targetSeq = served.targetSeq; return served; }
           reportProjectionHealth("snapshot", peerId, served);
-          // Read the high-water inside the guard: a throw here is a read failure
-          // like any other and must suppress the frame, not ship a snapshot with
-          // a wrong baseline.
-          highWaterSeq = journal.maxSeq(peerId);
+          // This high-water and these rows share one SQLite snapshot, including
+          // when another handle advanced beyond our original finite target.
+          highWaterSeq = served.highWaterSeq;
           return served.messages;
         },
         (messages) => {
@@ -1145,6 +997,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
       // `before`, carrying `beforeTurnId` into
       // the page plan. It cannot throw and it does not touch the store.
       const plan = planHistoryFetch(request, config.pageSize);
+      let targetSeq: number | undefined;
       // ⚠️ DEFERRED FOR A DIFFERENT REASON THAN THE SNAPSHOT — name which one.
       // Nothing is racing this handler (a `load_history` answer is an ordinary
       // publish, not a request/reply), so no reply is being unblocked. What the
@@ -1155,12 +1008,8 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
         pagesInFlight,
         peerId,
         () => {
-          // ⚠️ UNBOUNDED IN DEPTH — see the header. Every page is a full replay
-          // of the whole conversation, so this is the expensive path and nothing
-          // gates it but the in-flight latch above. A pre-fold length gate was
-          // built and reverted (it destroys reach rather than limiting it); the
-          // fix is #286's materialized read model, not a cheaper check here.
-          const served = serveHistoryRequest(journal.read, peerId, plan);
+          const served = serveHistoryRequestStep(journal, peerId, plan, targetSeq);
+          if (served.pending) { targetSeq = served.targetSeq; return served; }
           reportProjectionHealth("page", peerId, served);
           return served.messages;
         },

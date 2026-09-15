@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { HistoryWork } from "../packages/plugin/src/materialized-history.js";
 import { openDeliveryJournal } from "../packages/plugin/src/delivery-journal.js";
 import { ConversationKeyStore } from "../packages/plugin/src/conversation-key-store.js";
 import { generateKeyPair } from "../packages/plugin/src/e2e-crypto.js";
@@ -19,7 +20,8 @@ afterEach(() => { while (cleanups.length) cleanups.pop()!(); });
 
 function setup(limit = 1_000_000) {
   const root = mkdtempSync(join(tmpdir(), "history-convergence-"));
-  const journal = openDeliveryJournal({ databasePath: join(root, "journal.sqlite") });
+  const work: HistoryWork[] = [];
+  const journal = openDeliveryJournal({ databasePath: join(root, "journal.sqlite"), onHistoryWork: row => work.push(row) });
   const keys = new ConversationKeyStore({ tenant: "tenant", accountId: "account", storageRoot: root });
   class Transport extends EventEmitter {
     connected = true;
@@ -56,7 +58,15 @@ function setup(limit = 1_000_000) {
   };
   const deliver = () => { for (const frame of transport.frames.splice(0)) inner.handleMessage(decode(frame)); };
   cleanups.push(() => { wrapper.close(); channel.dispose(); journal.close(); rmSync(root, { recursive: true, force: true }); });
-  return { journal, channel, server, transport, wrapper, inner, queue, decode, deliver };
+  const snapshot = () => {
+    server.sendSnapshot("peer");
+    for (let steps = 0; steps < 1000; steps++) {
+      queue.shift()!();
+      if (transport.frames.some(frame => decode(frame).type === "history")) return;
+    }
+    throw new Error("snapshot did not complete");
+  };
+  return { journal, channel, server, transport, wrapper, inner, queue, decode, deliver, snapshot, work };
 }
 
 describe("history producer → sealed frame → browser decoder → wrapper", () => {
@@ -65,7 +75,7 @@ describe("history producer → sealed frame → browser decoder → wrapper", ()
     h.journal.append("peer", { kind: "seal", turnId: "t", answers: [], remove: ["unseen"] });
     h.journal.append("peer", { kind: "bubble", answerId: "unseen", text: "late retry" });
     h.journal.append("peer", { kind: "bubble", answerId: "kept", text: "kept" });
-    h.server.sendSnapshot("peer"); h.queue.shift()!(); h.deliver();
+    h.snapshot(); h.deliver();
     expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(["kept"]);
     expect(h.inner.cursor.last).toBe(3);
   });
@@ -81,7 +91,7 @@ describe("history producer → sealed frame → browser decoder → wrapper", ()
     expect(h.channel.sendTurnSnapshot("peer", "own-wire", [{ id: "A", text: "sealed answer" }], [])).toBe(true);
     h.journal.append("peer", { kind: "messageEdited", id: "A", text: "edited answer", revision: 2 });
     h.transport.frames.length = 0; // This cold browser missed all live egress.
-    h.server.sendSnapshot("peer"); h.queue.shift()!();
+    h.snapshot();
     const snapshot = h.decode(h.transport.frames[0]!);
     expect(snapshot).toMatchObject({ type: "history", highWaterSeq: 9, snapshotComplete: true });
     expect(snapshot.messages).toMatchObject([
@@ -100,9 +110,9 @@ describe("history producer → sealed frame → browser decoder → wrapper", ()
   it("recovers a warm >500-event gap in order while live updates arrive between difference pages", () => {
     const h = setup();
     h.journal.append("peer", { kind: "user", id: "old", text: "old" });
-    h.server.sendSnapshot("peer"); h.queue.shift()!(); h.deliver();
+    h.snapshot(); h.deliver();
     for (let i = 2; i <= 602; i++) h.journal.append("peer", { kind: "bubble", answerId: `a${i}`, text: `${i}` });
-    h.server.sendSnapshot("peer"); h.queue.shift()!(); h.deliver();
+    h.snapshot(); h.deliver();
     expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(["old"]);
     expect(h.inner.cursor.afterSeq).toBe(1);
     h.queue.shift()!(); h.deliver(); // First 500 events, continuation now queued.
@@ -111,13 +121,45 @@ describe("history producer → sealed frame → browser decoder → wrapper", ()
     h.deliver(); // Held by the active device-specific difference request.
     h.queue.shift()!(); h.deliver();
     expect(h.inner.cursor.last).toBe(603);
+    expect(h.work.some(w => w.batches > 0)).toBe(true);
+    expect(h.work.every(w => w.pageRowsRead <= 50)).toBe(true);
     expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(["old", ...Array.from({ length: 602 }, (_, i) => `a${i + 2}`)]);
+  });
+
+  it("covers a cold same-peer browser that registers during snapshot catch-up", () => {
+    const h = setup();
+    for (let i = 1; i <= 400; i++) {
+      h.journal.append("peer", { kind: "bubble", answerId: `a${i}`, text: `${i}` });
+    }
+    h.server.sendSnapshot("peer"); // An earlier browser's registration.
+    h.queue.shift()!(); // The first bounded callback captures 400 and yields.
+    expect(h.transport.frames).toEqual([]);
+    expect(h.queue).toHaveLength(1);
+
+    expect(h.channel.sendText("peer", "before the cold browser joined", "a401")).toBe(true);
+    h.transport.frames.length = 0; // The cold browser has not subscribed yet.
+    expect(h.wrapper.getState().messages).toEqual([]);
+    h.server.sendSnapshot("peer"); // Its registration shares the pending replay.
+    expect(h.queue).toHaveLength(1);
+    while (h.queue.length) h.queue.shift()!();
+
+    expect(h.transport.frames).toHaveLength(1);
+    const snapshot = h.decode(h.transport.frames[0]!);
+    expect(snapshot).toMatchObject({ type: "history", highWaterSeq: 401, snapshotComplete: true });
+    expect(snapshot.messages!.at(-1)).toMatchObject({ id: "a401", seq: 401 });
+    h.deliver();
+    expect(h.inner.cursor).toMatchObject({ state: "synced", last: 401 });
+    expect(h.wrapper.getState().messages.map(row => row.id)).toEqual(
+      Array.from({ length: 50 }, (_, i) => `a${i + 352}`),
+    );
+    expect(h.wrapper.getState().messages.at(-1)).toMatchObject({ text: "before the cold browser joined" });
+    expect(h.queue).toEqual([]);
   });
 
   it("measures snapshot completeness on the actual sealed envelope and recovers byte trimming", () => {
     const h = setup(1800);
     for (let i = 1; i <= 8; i++) h.journal.append("peer", { kind: "bubble", answerId: `a${i}`, text: "content ".repeat(25) });
-    h.server.sendSnapshot("peer"); h.queue.shift()!();
+    h.snapshot();
     const snapshot = h.decode(h.transport.frames[0]!);
     expect(snapshot.snapshotComplete).toBe(false);
     expect(snapshot.messages!.length).toBeLessThan(8);
@@ -126,6 +168,52 @@ describe("history producer → sealed frame → browser decoder → wrapper", ()
     expect(h.wrapper.getState().messages).toEqual([]);
     for (let requests = 0; h.queue.length && requests < 10; requests++) { h.queue.shift()!(); h.deliver(); }
     expect(h.inner.cursor.last).toBe(8);
+    expect(h.work.some(w => w.pageRowsRead > 0)).toBe(true);
     expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(Array.from({ length: 8 }, (_, i) => `a${i + 1}`));
   });
+
+  it("restores equal-version sparse terminal tools from repeated materialized encrypted snapshots and pages", () => {
+    const h = setup();
+    h.channel.sendToolActivity("peer", { id: "tool", turnId: "turn", name: "read_file", argKeys: ["path"], phase: "start", summary: "reading" });
+    h.transport.frames.length = 0; // Opener was missed by this browser.
+    h.channel.sendToolActivity("peer", { id: "tool", turnId: "turn", phase: "end", status: "completed" });
+    h.deliver();
+    h.snapshot(); h.deliver();
+    h.work.length = 0;
+    h.snapshot(); h.deliver();
+    expect(h.work).toMatchObject([{ rawEventsRead: 0, materializedRowsRead: 0, materializedRowsWritten: 0, pageRowsRead: 1 }]);
+    expect(h.wrapper.getState().messages).toMatchObject([{ id: "tool", name: "read_file", argKeys: ["path"], summary: "reading", phase: "end", status: "completed" }]);
+    h.channel.sendText("peer", "tail", "tail"); h.deliver();
+    h.server.servePage("peer", { before: "tail", limit: 50 });
+    while (h.queue.length) h.queue.shift()!();
+    h.deliver();
+    expect(h.wrapper.getState().messages.filter(row => row.id === "tool")).toHaveLength(1);
+    expect(h.wrapper.getState().messages[0]).toMatchObject({ name: "read_file", argKeys: ["path"], phase: "end", status: "completed" });
+  });
+
+
+  it("adopts only the exact optimistic origin from materialized history before its acknowledgement", () => {
+    const h = setup();
+    const sent: Array<{ text: string; wireId: string; randomId: string }> = [];
+    (h.inner.client as unknown as { sendUserMessage(text: string, id: string, randomId: string): void }).sendUserMessage =
+      (text, wireId, randomId) => { sent.push({ text, wireId, randomId }); };
+    const receipt = h.wrapper.send("same")!;
+    expect(sent).toHaveLength(1);
+    const original = sent[0]!;
+    const other = h.journal.appendInboundUser("peer", { text: "same", turnId: "other-wire", randomId: "other-origin" });
+    const own = h.journal.appendInboundUser("peer", { text: original.text, turnId: original.wireId, randomId: original.randomId });
+    h.snapshot(); h.deliver();
+    h.snapshot(); h.deliver();
+    expect(h.wrapper.getState().messages.map(row => row.id)).toEqual([other.messageId, own.messageId]);
+    expect(h.wrapper.getState().messages.filter(row => row.id === own.messageId)).toHaveLength(1);
+    h.channel.sendAck("peer", [original.wireId], [{ random_id: original.randomId, messageId: own.messageId, seq: own.seq }]);
+    h.deliver();
+    // This fixture invokes the wrapper after decoding; low-level receipt tracker
+    // transitions are exercised by nats-client-wrapper-sendstate.test.ts.
+    expect(receipt.snapshot().state).toBe("queued");
+    expect(h.wrapper.getState().messages.find(row => row.id === own.messageId)).toMatchObject({ receiptKey: receipt.id, sendState: "queued" });
+    expect(h.wrapper.getState().messages.map(row => row.id)).toEqual([other.messageId, own.messageId]);
+    expect(h.work.at(-1)).toMatchObject({ rawEventsRead: 0, materializedRowsRead: 0, materializedRowsWritten: 0, pageRowsRead: 2 });
+  });
+
 });
