@@ -876,10 +876,16 @@ export class NatsChannel implements WebChannelPeerChannel {
   ): ApprovalRequestSendResult {
     if (this.disposed) return { delivered: false, journaled: false };
     const seq = journal ? this.journalOutbound(peerId, payload) : undefined;
-    const delivered = this.sendToPeer(
-      peerId,
-      seq !== undefined ? { ...payload, seq } : payload,
-    );
+    let delivered = false;
+    try {
+      delivered = this.sendToPeer(
+        peerId,
+        seq !== undefined ? { ...payload, seq } : payload,
+      );
+    } catch {
+      // A failed live push or its diagnostic cannot revoke the journal commit
+      // and make approval output recovery append the same resolution again.
+    }
     return { delivered, journaled: seq !== undefined };
   }
 

@@ -209,6 +209,39 @@ describe("#381 production approval finalization with SQLite storage faults", () 
     expect(vi.getTimerCount()).toBe(f.maintenanceTimers);
   });
 
+  it.each(["unregistered-warning", "publish-error"] as const)("preserves a committed resolution when the %s diagnostic throws", async reason => {
+    const f = fixture({ encrypted: true });
+    const entry = await f.deliver();
+    const diagnosticError = new Error("diagnostic unavailable");
+    if (reason === "unregistered-warning") {
+      f.channel.unregisterPeer(PEER);
+      vi.mocked(console.warn).mockImplementation(() => { throw diagnosticError; });
+    } else {
+      vi.spyOn(f.transport, "publish").mockImplementation(() => { throw new Error("relay unavailable"); });
+      vi.mocked(console.error).mockImplementation(() => { throw diagnosticError; });
+    }
+    const send = vi.spyOn(f.channel, "sendApprovalResolved");
+    const append = vi.spyOn(f.journal, "append");
+    const finalizerErrors: unknown[] = [];
+    // The SDK catches finalizer errors without retrying. The later ephemeral
+    // snapshot still uses the ordinary send path and its diagnostic can throw.
+    await f.finalize(entry).catch(error => { finalizerErrors.push(error); });
+    expect(finalizerErrors).toEqual([diagnosticError]);
+    const accepted = { accepted: true, delivered: false, journaled: true, status: "journaled" };
+    expect(send.mock.results[0]!.value).toEqual(accepted);
+    expect(f.channel.getApprovalOutputRecoveryStatus()).toEqual({ pending: 0, exhausted: 0, abandoned: 0, retainedBytes: 0 });
+    expect(listPendingApprovalsForPeer(ACCOUNT, PEER)).toEqual([]);
+    expect(listResolvedApprovalsForPeer(ACCOUNT, PEER)).toEqual([{ id: f.card.id, decision: "allow-once" }]);
+    expect(f.journal.read(PEER).map(row => row.event.kind)).toEqual(["approval", "approvalResolution"]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(f.channel.sendApprovalResolved(PEER, f.card.id, "allow-once")).toEqual(accepted);
+    expect(append).toHaveBeenCalledTimes(1);
+    expect(f.journal.read(PEER).map(row => row.event.kind)).toEqual(["approval", "approvalResolution"]);
+    expect(f.history()).toEqual([expect.objectContaining({ id: f.card.id, prompt: "Original request", resolvedDecision: "allow-once" })]);
+    expect(f.channel.getApprovalOutputRecoveryStatus()).toEqual({ pending: 0, exhausted: 0, abandoned: 0, retainedBytes: 0 });
+    expect(vi.getTimerCount()).toBe(f.maintenanceTimers);
+  });
+
   it("bounds persistent failures and reports exhausted output without claiming journal success", async () => {
     const f = fixture();
     const entry = await f.deliver();
