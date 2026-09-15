@@ -699,7 +699,11 @@ export function createProgressDraftController(params: {
   let ordinaryFinalSendInProgress = false;
   // Finals without an owned current draft wait for held predecessors to drain.
   // Buffering controls delivery timing only; it never assigns a past lane.
-  const bufferedOrdinaryFinals: string[] = [];
+  const bufferedOrdinaryFinals: Array<{
+    text: string;
+    started: boolean;
+    complete: boolean;
+  }> = [];
   // #212: wire ids of independent bubbles the plugin KNOWS carry answer content
   // already represented by a lane in the `turn_snapshot`. Since #238 there is
   // exactly ONE producer — the failed-lane recovery block in
@@ -931,7 +935,7 @@ export function createProgressDraftController(params: {
     // `remove: [tcId]` base's M212a asserted. And NOT because an overflow bubble's
     // content never streamed — measured false, it often has (see the flush's
     // no-target branch, which on a shortfall takes every final).
-    options?: { supersedesAnswerLane?: AssistantDraftLane },
+    options?: { supersedesAnswerLane?: AssistantDraftLane; markComplete?: () => void },
   ): boolean => {
     if (!text) {
       warn("independent delivery skipped empty text without a transport attempt");
@@ -949,9 +953,13 @@ export function createProgressDraftController(params: {
         commitReservation(reservation);
         if (options?.supersedesAnswerLane) supersededAnswerBubbleIds.set(reservation.id, options.supersedesAnswerLane);
       } else rollbackReservation(reservation);
+      options?.markComplete?.();
       return accepted;
     });
-    if (!sent && !pendingDurableSends.has(key)) rollbackReservation(reservation);
+    if (!sent && !pendingDurableSends.has(key)) {
+      rollbackReservation(reservation);
+      options?.markComplete?.();
+    }
     return sent;
   };
 
@@ -1709,7 +1717,7 @@ export function createProgressDraftController(params: {
 
   // Independent delivery owns its own ID, including unclaimed ordinary finals.
   // Only an explicitly known recovery block may later supersede another ID.
-  const deliverTerminalIndependent = (text: string): boolean => {
+  const deliverTerminalIndependent = (text: string, markComplete?: () => void): boolean => {
     // ONE STORY, in the order it happens:
     //
     // 1. Retire tentative state, which opens ordering barriers.
@@ -1730,7 +1738,7 @@ export function createProgressDraftController(params: {
     resolveDeferredAngleMarkerTail(currentLane(), { preserveExact: true });
     retireTentativeState();
     emitHeldLaneTextBeforeIndependentDelivery();
-    const sent = sendIndependent(text);
+    const sent = sendIndependent(text, undefined, { markComplete });
     releaseReadyLanes({ emitCurrentProgress: false });
     return sent;
   };
@@ -1765,9 +1773,19 @@ export function createProgressDraftController(params: {
   // for EACH one. Closed lanes are never candidates: core may dedupe finals or
   // produce text only at message-end, so neither count nor order correlates this
   // array with past drafts. A retry stays inside sendIndependent and reuses that
-  // act's reservation. The snapshot leaves all these independent IDs intact.
+  // act's reservation. The rejected head keeps its unsent suffix here; completion
+  // only marks that entry, and drain resumes the FIFO without recursive sends.
+  // The snapshot leaves all these independent IDs intact.
   const flushBufferedOrdinaryFinals = (): void => {
-    for (const text of bufferedOrdinaryFinals.splice(0)) deliverTerminalIndependent(text);
+    while (bufferedOrdinaryFinals.length > 0) {
+      const head = bufferedOrdinaryFinals[0]!;
+      if (!head.started) {
+        head.started = true;
+        deliverTerminalIndependent(head.text, () => { head.complete = true; });
+      }
+      if (!head.complete) return;
+      bufferedOrdinaryFinals.shift();
+    }
   };
 
   return {
@@ -2282,7 +2300,7 @@ export function createProgressDraftController(params: {
             (!active.streamedVisibleAnswerText && hasMaterializedAnswerLane())
           ) {
             state.finalReconciliation.ordinaryAnswerSettled = true;
-            bufferedOrdinaryFinals.push(text);
+            bufferedOrdinaryFinals.push({ text, started: false, complete: false });
             return true; // drain owns delivery and reports any unresolved failure
           }
           if (state.finalReconciliation.ordinaryAnswerSettled) {
@@ -2335,8 +2353,13 @@ export function createProgressDraftController(params: {
           // Buffered finals first attempt storage during drain. Retry their
           // rejected output before the snapshot, under the same reservations.
           let recoveredOutput = false;
-          for (const [key, retry] of [...pendingDurableSends]) {
-            if (key !== "snapshot" && !retried.has(key) && retry()) recoveredOutput = true;
+          // Iterate the live map: advancing the FIFO may introduce a newly
+          // rejected suffix, which gets the same one retry as its predecessor.
+          for (const [key, retry] of pendingDurableSends) {
+            if (key !== "snapshot" && !retried.has(key)) {
+              if (retry()) recoveredOutput = true;
+              flushBufferedOrdinaryFinals();
+            }
           }
           if (recoveredOutput && pendingDurableSends.size === 0) emitTurnSnapshot();
           // The first snapshot attempt can happen above, after output recovers.
@@ -2358,7 +2381,6 @@ export function createProgressDraftController(params: {
           // Stop must not silently discard already-authored buffered finals.
           // It does not finalize unfinalized partial text.
           flushBufferedOrdinaryFinals();
-          bufferedOrdinaryFinals.length = 0;
         },
         undefined,
       );

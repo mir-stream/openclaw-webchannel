@@ -98,6 +98,62 @@ it("#262: compensating final dedupe cannot overwrite either independently stream
   expect(reduceDurableView(difference.events.map(({ event }) => event))).toEqual(view);
 });
 
+it.each([false, true])("#262: buffered finals retain delivery order after a rejected head (persistent=%s)", async (persistent) => {
+  const { draft, channel, journal, db, fail, history, transport, key } = setup({ encrypted: true });
+  const finals = vi.spyOn(channel, "finalizeDraft");
+  for (const text of ["A", "B"]) {
+    draft.pushAnswerText({ text });
+    await draft.flush();
+    draft.handleAssistantMessageBoundary();
+  }
+  expect(await draft.finalize("A-full")).toBe(true);
+  expect(await draft.finalize("B-full")).toBe(true);
+  let rejectHead = true;
+  const append = journal.append.bind(journal);
+  vi.spyOn(journal, "append").mockImplementation((...args) => {
+    if (!rejectHead || args[1].kind !== "bubble" || args[1].text !== "A-full") return append(...args);
+    if (!persistent) rejectHead = false;
+    fail();
+    try { return append(...args); }
+    finally { db.exec("DROP TRIGGER fail_write"); }
+  });
+
+  await draft.drain();
+  const headAttempts = () => finals.mock.calls.filter((args) => args[2] === "A-full");
+  const suffixAttempts = () => finals.mock.calls.filter((args) => args[2] === "B-full");
+  const headId = headAttempts()[0]![1];
+  expect(headAttempts()).toHaveLength(2);
+  if (persistent) {
+    expect(draft.deliveryFailed).toBe(true);
+    expect(history().map((message) => "text" in message ? message.text : undefined)).toEqual(["A", "B"]);
+    expect(suffixAttempts()).toEqual([]);
+    await draft.drain();
+    expect(draft.deliveryFailed).toBe(true);
+    expect(headAttempts()).toHaveLength(3);
+    expect(suffixAttempts()).toEqual([]);
+    rejectHead = false;
+    await draft.drain();
+  }
+
+  expect(draft.deliveryFailed).toBe(false);
+  expect(history().map((message) => "text" in message ? message.text : undefined)).toEqual(["A", "B", "A-full", "B-full"]);
+  expect(new Set(headAttempts().map((args) => args[1]))).toEqual(new Set([headId]));
+  expect(suffixAttempts()).toHaveLength(1);
+  expect(suffixAttempts()[0]![1]).not.toBe(headId);
+  const finalCalls = [...finals.mock.calls];
+  await draft.drain();
+  draft.stop();
+  draft.stop();
+  expect(finals.mock.calls).toEqual(finalCalls);
+  const events = journal.read("peer", { afterSeq: 0, limit: 100 }).map(({ event }) => event);
+  expect(events.filter((event) => event.kind === "bubble")).toHaveLength(4);
+  const liveEvents = transport.publish.mock.calls
+    .map((call) => journalEventForOutbound(openEnvelope(call[1] as Uint8Array, key).message as OutboundWsMessage))
+    .filter((event): event is JournalEvent => event !== null);
+  expect(reduceDurableView(liveEvents)).toEqual(reduceDurableView(events as JournalEvent[]));
+  expect(reduceDurableView(liveEvents).map((entry) => "text" in entry ? entry.text : undefined)).toEqual(["A", "B", "A-full", "B-full"]);
+});
+
 it.each([false, true])("stores an authored final during relay loss (streamed=%s) with one history identity", async (streamed) => {
   const { transport, draft, history, journal } = setup();
   if (streamed) { draft.pushAnswerText({ text: "partial" }); await draft.flush(); }
