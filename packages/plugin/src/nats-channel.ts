@@ -18,8 +18,9 @@
 
 import { inspect } from "node:util";
 import { DurableSendError } from "./durable-send-error.js";
+import { ApprovalOutputRecovery } from "./approval-output-recovery.js";
 import type { NatsTransport, NatsMessage } from "./nats-transport.js";
-import type { ApprovalDecision, ApprovalRequestPayload, ApprovalRequestSendResult, DifferenceReply, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
+import type { ApprovalDecision, ApprovalRequestPayload, ApprovalRequestSendResult, ApprovalResolutionSendOptions, ApprovalResolutionSendResult, DifferenceReply, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
 import type { KeyPair } from "./e2e-crypto.js";
 import type { ConversationKeyStore } from "./conversation-key-store.js";
 import { wrapConversationKey } from "./late-join-decryptor.js";
@@ -265,11 +266,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   // Per-peer subscriptions (peerId -> sid)
   private readonly peerSubscriptions = new Map<string, number>();
 
-  // Per-peer approval deduplication (approvalId -> peerId who first resolved)
-  private readonly approvalResolutions = new Map<string, string>();
-  // Request committed during catch-up, but resolution append still needs retry.
-  private readonly approvalCatchUpSeqs = new Map<string, number>();
-  private readonly approvalPendingResolutionJournal = new Set<string>();
+  private readonly approvalOutputs: ApprovalOutputRecovery;
 
   /**
    * S2: unconditional memory bounds. The NATS path has no peer-disconnect
@@ -282,7 +279,6 @@ export class NatsChannel implements WebChannelPeerChannel {
    * unbounded growth (churn or abuse), turning a slow OOM into a fixed ceiling.
    */
   private readonly maxPeers: number;
-  private readonly maxApprovalResolutions: number;
 
   /**
    * F4 anti-replay state. The untrusted relay can re-publish a captured sealed
@@ -420,8 +416,6 @@ export class NatsChannel implements WebChannelPeerChannel {
       );
     }
     this.maxPeers = limits?.maxPeers ?? DEFAULT_MAX_PEERS;
-    this.maxApprovalResolutions =
-      limits?.maxApprovalResolutions ?? DEFAULT_MAX_APPROVAL_RESOLUTIONS;
     this.replayWindowMs = limits?.replayWindowMs ?? DEFAULT_REPLAY_WINDOW_MS;
     this.maxSeenMessageIdsPerPeer =
       limits?.maxSeenMessageIdsPerPeer ?? DEFAULT_MAX_SEEN_MESSAGE_IDS_PER_PEER;
@@ -430,6 +424,24 @@ export class NatsChannel implements WebChannelPeerChannel {
     // durability object in a test, a future caller) must fail CLOSED, matching
     // `resolveReasoningDurable`'s own rule for a present malformed value.
     this.journalPolicy = { reasoningDurable: durability?.reasoningDurable === true };
+
+    this.approvalOutputs = new ApprovalOutputRecovery({
+      maxResolutions: limits?.maxApprovalResolutions ?? DEFAULT_MAX_APPROVAL_RESOLUTIONS,
+      hasJournal: this.deliveryJournal !== null,
+      journalRequest: (peerId, request) => {
+        if (this.journalOutbound(peerId, { type: "approval_request", ...request }) === undefined) {
+          throw new DurableSendError("approval_request", request.id);
+        }
+      },
+      sendResolution: (peerId, id, decision, journal) =>
+        this.publishApprovalFrame(peerId, { type: "approval_resolved", id, decision }, journal),
+      onFailure: (id, reason, attempts) => {
+        console.warn(
+          `[nats-channel] approval output unjournaled account=${logSafe(this.accountId)} ` +
+            `approval=${logSafe(id)} reason=${logSafe(reason)} attempts=${logSafe(attempts)}`,
+        );
+      },
+    });
 
     // Retain the exact listener identity so account teardown can detach it.
     this.transportMessageListener = (msg: NatsMessage) => {
@@ -568,6 +580,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.approvalOutputs.dispose();
     this.transport.off("message", this.transportMessageListener);
     if (this.registerSid !== undefined) {
       this.transport.unsubscribe(this.registerSid);
@@ -577,9 +590,6 @@ export class NatsChannel implements WebChannelPeerChannel {
     this.peerSubscriptions.clear();
     this.peerSessionKeys.clear();
     this.seenMessageIds.clear();
-    this.approvalResolutions.clear();
-    this.approvalCatchUpSeqs.clear();
-    this.approvalPendingResolutionJournal.clear();
     this.onMessage = undefined;
     this.onApprovalDecision = undefined;
     this.onLoadHistory = undefined;
@@ -874,92 +884,24 @@ export class NatsChannel implements WebChannelPeerChannel {
   }
 
   /**
-   * Resolve approval request (send decision back to peer).
-   *
-   * Implements first-write-wins exactly-once:
-   * - The first peer to resolve an approvalId wins
-   * - Subsequent resolutions for the same approvalId are dropped
+   * Retain the first peer AND decision before attempting storage. Recovery only
+   * retries this output on this channel; journal acceptance is independent from
+   * live delivery. A repeated pending call joins the scheduled work.
    */
   sendApprovalResolved(
     peerId: string,
     id: string,
     decision: ApprovalDecision,
-    options?: { journalRequestFirst?: ApprovalRequestPayload },
-  ): boolean {
-    // First-write-wins exactly-once: check if already resolved
-    if (this.disposed) return false;
-    const existingResolver = this.approvalResolutions.get(id);
-    // #341: the request side takes its "already recorded" signal from the caller;
-    // here the channel already holds it, so the FIRST write journals and a repeat
-    // from the same peer (which still publishes, as it always has) does not write
-    // a second `approvalResolution` row. Unreachable from `updateEntry`, which is
-    // terminal per (account, approval) — belt and braces, and it keeps the two
-    // approval frames' dedupe stories identical.
-    const firstResolution = existingResolver === undefined || this.approvalPendingResolutionJournal.has(id);
-    if (existingResolver !== undefined) {
-      if (existingResolver !== peerId) {
-        console.log(
-          `[nats-channel] Approval ${logSafe(id)} already resolved by ${logSafe(existingResolver)}, dropping duplicate from ${logSafe(peerId)}`,
-        );
-        return false;
-      }
-    } else {
-      // First resolution: record it
-      this.approvalResolutions.set(id, peerId);
-      // S2: bound the dedup map. It only needs to remember an id long enough to
-      // drop near-simultaneous duplicate resolutions; evicting the oldest once
-      // over the cap keeps memory fixed without weakening that window.
-      while (this.approvalResolutions.size > this.maxApprovalResolutions) {
-        const oldest = this.approvalResolutions.keys().next().value as string | undefined;
-        if (oldest === undefined) break;
-        this.approvalResolutions.delete(oldest);
-        this.approvalCatchUpSeqs.delete(oldest);
-        this.approvalPendingResolutionJournal.delete(oldest);
-      }
-    }
+    options?: ApprovalResolutionSendOptions,
+  ): ApprovalResolutionSendResult {
+    return this.approvalOutputs.send(peerId, id, decision, options);
+  }
 
-    // #341 — THE CARD'S ROW FIRST, OR NEITHER ROW AT ALL.
-    //
-    // The caller passes `journalRequestFirst` when delivery could not write the
-    // `approval` row: the account had no live channel at the time (a TRANSIENT
-    // state — `nats-account-runtime.ts` deletes and re-adds the runtime across a
-    // restart), or the append failed. Both leave a card the
-    // register-time `approval_snapshot` still shows live, so the user (or the
-    // expiry) can resolve one whose request row does not exist.
-    //
-    // Storing it here restores the invariant the projection needs: the request
-    // row precedes its resolution in the one ordered stream. And if THAT append
-    // fails too, the resolution's is skipped, because a resolution row with no
-    // request row is exactly the orphan `applyApprovalResolution` folds onto
-    // nothing — the defect this slice exists to kill. Keeping both decisions on
-    // this line, next to both appends, is why the catch-up is an option here
-    // rather than a separate journal-only call the caller has to sequence.
-    try {
-      let journalResolution = firstResolution;
-      const catchUpRequest = options?.journalRequestFirst;
-      if (journalResolution && catchUpRequest !== undefined && !this.approvalCatchUpSeqs.has(id)) {
-        const requestSeq = this.journalOutbound(peerId, {
-          type: "approval_request",
-          ...catchUpRequest,
-        });
-        if (requestSeq === undefined) journalResolution = false;
-        else {
-          this.approvalCatchUpSeqs.set(id, requestSeq);
-          while (this.approvalCatchUpSeqs.size > this.maxApprovalResolutions) {
-            this.approvalCatchUpSeqs.delete(this.approvalCatchUpSeqs.keys().next().value!);
-          }
-        }
-      }
-      const payload: ApprovalOutboundFrame = { type: "approval_resolved", id, decision };
-      const result = this.publishApprovalFrame(peerId, payload, journalResolution);
-      this.approvalCatchUpSeqs.delete(id);
-      this.approvalPendingResolutionJournal.delete(id);
-      return result.delivered;
-    } catch (error) {
-      if (!(error instanceof DurableSendError)) throw error;
-      if (firstResolution) this.approvalPendingResolutionJournal.add(id);
-      return false;
-    }
+  /** Failed output remains distinguishable from accepted journal rows, including
+   * exhaustion and cancellation/eviction. Counts survive channel disposal.
+   */
+  getApprovalOutputRecoveryStatus() {
+    return this.approvalOutputs.status();
   }
 
   /**
@@ -1553,14 +1495,10 @@ export type RegisterChannelSurface = Pick<
  * Clear approval resolution record (for testing or cleanup).
  */
 export function clearApprovalResolutions(channel: NatsChannel): void {
-  // Access private field via type cast
-  (channel as unknown as { approvalResolutions: Map<string, string> }).approvalResolutions.clear();
+  channel["approvalOutputs"].clear();
 }
 
-/**
- * Get approval resolution record (for testing).
- */
+/** Get the retained first resolver (test seam). */
 export function getApprovalResolution(channel: NatsChannel, approvalId: string): string | undefined {
-  const map = (channel as unknown as { approvalResolutions: Map<string, string> }).approvalResolutions as Map<string, string>;
-  return map.get(approvalId);
+  return channel["approvalOutputs"].resolver(approvalId);
 }

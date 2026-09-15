@@ -353,7 +353,7 @@ function makeFakeTransport(options?: {
     // #341: the result reports delivery AND whether the durable row was written;
     // this stub owns no journal, so `journaled` is false.
     sendApprovalRequest: () => ({ delivered: true, journaled: false }),
-    sendApprovalResolved: () => true,
+    sendApprovalResolved: () => ({ accepted: true, delivered: true, journaled: true, status: "journaled" as const }),
     sendApprovalSnapshot: () => true,
   } as WebChannelPeerChannel;
   return { transport, finalizes, texts, progress, toolActivities, typing, settles, settleFrames, snapshotFrames };

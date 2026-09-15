@@ -186,7 +186,7 @@ describe("webchannel native approval runtime", () => {
     vi.spyOn(transport, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
     const resolvedSpy = vi
       .spyOn(transport, "sendApprovalResolved")
-      .mockReturnValue(true);
+      .mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
 
     const spec = createClawApprovalNativeRuntimeSpec(transport);
     const view = fakePendingExecView();
@@ -233,9 +233,10 @@ describe("webchannel native approval runtime", () => {
     // #341: the fourth argument hands the card's payload over so the channel can
     // store the `approval` row it never got to store. This double journals
     // nothing, so it is always owed here — with a real channel that already wrote
-    // the row at delivery the argument is `undefined`.
+    // the row at delivery only the onClaim snapshot hook is needed.
     expect(resolvedSpy).toHaveBeenCalledWith("web-anon", "exec-1", "allow-once", {
       journalRequestFirst: expect.objectContaining({ id: "exec-1" }),
+      onClaim: expect.any(Function),
     });
   });
 });
@@ -810,8 +811,8 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
     const transportB = new FakePeerChannel();
     const sentA = vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
     const sentB = vi.spyOn(transportB, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
-    const resolvedA = vi.spyOn(transportA, "sendApprovalResolved").mockReturnValue(true);
-    const resolvedB = vi.spyOn(transportB, "sendApprovalResolved").mockReturnValue(true);
+    const resolvedA = vi.spyOn(transportA, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
+    const resolvedB = vi.spyOn(transportB, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
     const fallback = new FakePeerChannel();
     const sentFallback = vi.spyOn(fallback, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
     const byAccount: Record<string, FakePeerChannel> = { a: transportA, b: transportB };
@@ -929,15 +930,15 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
       payload: { decision: "deny" },
       phase: "resolved",
     } as any);
-    // #341: `undefined` because this test hand-builds the entry and never ran
+    // #341: no catch-up payload because this test hand-builds the entry and never ran
     // `deliverPending`, so there is no pending record to read. That is the same
     // shape as a record evicted before finalize, and it takes the same answer —
     // no catch-up payload to offer, so the resolution row is written on its own
     // (see `updateEntry`'s note on why that is the right side to err on).
-    expect(resolvedB).toHaveBeenCalledWith("alice", "exec-b3", "deny", undefined);
+    expect(resolvedB).toHaveBeenCalledWith("alice", "exec-b3", "deny", { onClaim: expect.any(Function) });
     expect(resolvedA).not.toHaveBeenCalled();
 
-    // Defensive path: unscoped context falls back to the entry's recorded account.
+    // A second callback for this entry is terminal, including an alternate decision.
     resolvedB.mockClear();
     await spec.transport.updateEntry!({
       cfg: cfgTwoAccounts,
@@ -947,7 +948,7 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
       payload: { decision: "allow-once" },
       phase: "resolved",
     } as any);
-    expect(resolvedB).toHaveBeenCalledWith("alice", "exec-b3", "allow-once", undefined);
+    expect(resolvedB).not.toHaveBeenCalled(); // Finalization is terminal even with an alternate decision.
     expect(resolvedA).not.toHaveBeenCalled();
   });
 
@@ -1056,7 +1057,7 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
     } as any);
     // `undefined` for the same reason as the finalize-routing test above: no
     // `deliverPending` ran, so there is no pending record to catch up from.
-    expect(resolvedB).toHaveBeenCalledWith("alice", "exec-b7", "deny", undefined);
+    expect(resolvedB).toHaveBeenCalledWith("alice", "exec-b7", "deny", { onClaim: expect.any(Function) });
 
     // Binding released → a post-finalize resolve attempt is rejected.
     resolveApprovalOverGateway.mockClear();
@@ -1179,7 +1180,7 @@ describe("webchannel pending-approval store (#15)", () => {
   it("updateEntry erases the entry for BOTH resolved and expired finalize", async () => {
     const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
-    vi.spyOn(transport, "sendApprovalResolved").mockReturnValue(true);
+    vi.spyOn(transport, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
     const spec = createClawApprovalNativeRuntimeSpec(transport);
 
     const resolved = payload("exec-r");
@@ -1200,8 +1201,8 @@ describe("webchannel pending-approval store (#15)", () => {
     const transportB = new FakePeerChannel();
     vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
     vi.spyOn(transportB, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
-    vi.spyOn(transportA, "sendApprovalResolved").mockReturnValue(true);
-    vi.spyOn(transportB, "sendApprovalResolved").mockReturnValue(true);
+    vi.spyOn(transportA, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
+    vi.spyOn(transportB, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
     const byAccount: Record<string, FakePeerChannel> = { a: transportA, b: transportB };
     const spec = createClawApprovalNativeRuntimeSpec(
       new FakePeerChannel(),
@@ -1391,7 +1392,7 @@ describe("webchannel recently-resolved store (#19)", () => {
   it("updateEntry records the REAL decision at finalize (captured for the snapshot)", async () => {
     const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
-    vi.spyOn(transport, "sendApprovalResolved").mockReturnValue(true);
+    vi.spyOn(transport, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
     const spec = createClawApprovalNativeRuntimeSpec(transport);
 
     const p = payload("exec-r");
@@ -1408,7 +1409,7 @@ describe("webchannel recently-resolved store (#19)", () => {
   it("an EXPIRY records the decision the builder produces ('deny'), driven through buildExpiredResult", async () => {
     const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
-    vi.spyOn(transport, "sendApprovalResolved").mockReturnValue(true);
+    vi.spyOn(transport, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
     const spec = createClawApprovalNativeRuntimeSpec(transport);
 
     // Prove the recorded decision comes from the BUILDER, not a test literal: take
@@ -1441,8 +1442,8 @@ describe("webchannel recently-resolved store (#19)", () => {
     const transportB = new FakePeerChannel();
     vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
     vi.spyOn(transportB, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
-    vi.spyOn(transportA, "sendApprovalResolved").mockReturnValue(true);
-    vi.spyOn(transportB, "sendApprovalResolved").mockReturnValue(true);
+    vi.spyOn(transportA, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
+    vi.spyOn(transportB, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
     const byAccount: Record<string, FakePeerChannel> = { a: transportA, b: transportB };
     const spec = createClawApprovalNativeRuntimeSpec(
       new FakePeerChannel(),

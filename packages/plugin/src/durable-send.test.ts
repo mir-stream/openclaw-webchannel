@@ -357,7 +357,7 @@ it("missing keys, unregistered peers and disposed channels cannot accept ordinar
   channel.dispose();
   expect(channel.sendText("peer", "retired", "id-3")).toBe(false);
   expect(channel.sendApprovalRequest("peer", { id: "approval", title: "approval" } as never)).toEqual({ delivered: false, journaled: false });
-  expect(channel.sendApprovalResolved("peer", "approval", "allow-once")).toBe(false);
+  expect(channel.sendApprovalResolved("peer", "approval", "allow-once").delivered).toBe(false);
   expect(journal.maxSeq("peer")).toBe(0);
   expect(transport.publish).not.toHaveBeenCalled();
 });
@@ -506,16 +506,19 @@ it("tool events fail closed and an explicit same-event retry retains its ID", ()
   expect(journal.read("peer", { afterSeq: 0, limit: 100 })).toEqual([expect.objectContaining({ event: expect.objectContaining({ kind: "tool", id: "tool-id" }) })]);
 });
 
-it("approval catch-up retries a failed resolution without duplicating its committed request", () => {
+it("approval catch-up retries a failed resolution without duplicating its committed request", async () => {
+  vi.useFakeTimers();
+  cleanup.push(() => vi.useRealTimers());
   const { channel, db, journal, transport } = setup();
   const request = { id: "approval-id", title: "Run command", kind: "exec", description: "test", prompt: "run command", options: [] } as never;
   db.exec("CREATE TRIGGER fail_resolution BEFORE INSERT ON journal_event WHEN json_extract(NEW.payload, '$.kind') = 'approvalResolution' BEGIN SELECT RAISE(ABORT, 'injected failure'); END");
-  expect(channel.sendApprovalResolved("peer", "approval-id", "allow-once", { journalRequestFirst: request })).toBe(false);
+  expect(channel.sendApprovalResolved("peer", "approval-id", "allow-once", { journalRequestFirst: request }).delivered).toBe(false);
   expect(transport.publish).not.toHaveBeenCalled();
-  expect(channel.sendApprovalResolved("other-peer", "approval-id", "deny", { journalRequestFirst: request })).toBe(false);
+  expect(channel.sendApprovalResolved("other-peer", "approval-id", "deny", { journalRequestFirst: request }).delivered).toBe(false);
   db.exec("DROP TRIGGER fail_resolution");
-  expect(channel.sendApprovalResolved("peer", "approval-id", "allow-once", { journalRequestFirst: request })).toBe(true);
-  expect(channel.sendApprovalResolved("peer", "approval-id", "allow-once", { journalRequestFirst: request })).toBe(true);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(channel.sendApprovalResolved("peer", "approval-id", "allow-once", { journalRequestFirst: request }).delivered).toBe(true);
+  expect(channel.sendApprovalResolved("peer", "approval-id", "allow-once", { journalRequestFirst: request }).delivered).toBe(true);
   expect(journal.read("peer", { afterSeq: 0, limit: 100 }).map(({ event }) => event.kind)).toEqual(["approval", "approvalResolution"]);
 });
 
