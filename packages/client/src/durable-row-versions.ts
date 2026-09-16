@@ -94,7 +94,7 @@ export interface DurableWindowReader {
 function eventRowKeys(event: DurableEvent): string[] {
   const text = (id: string) => JSON.stringify(["text", id]);
   switch (event.kind) {
-    case "user": case "messageEdited": case "messageDeleted": return [text(event.id)];
+    case "requestState": case "user": case "messageEdited": case "messageDeleted": return [text(event.id)];
     case "placement": case "bubble": return [text(event.answerId)];
     case "reasoning": return [JSON.stringify(["reasoning", event.id])];
     case "tool": return [JSON.stringify(["tool", event.turnId, event.id])];

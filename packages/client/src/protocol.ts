@@ -91,4 +91,4 @@
  * NOTE: this is a DIFFERENT layer from the E2E message-envelope version
  * (`ENVELOPE_VERSION` / `v:1`), which versions the encrypted payload format.
  */
-export const WEBCHANNEL_PROTOCOL_VERSION = 4;
+export const WEBCHANNEL_PROTOCOL_VERSION = 5;

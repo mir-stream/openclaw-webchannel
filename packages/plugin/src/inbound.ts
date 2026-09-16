@@ -897,6 +897,10 @@ export async function handleInboundMessage(
   servingTenant: string,
   options?: {
     controlLane?: boolean;
+    dispatchAbortSignal?: AbortSignal;
+    /** Persist the exact dispatch batch before a successful transient settlement. */
+    onSettled?: (outcome: "ok" | "error") => boolean;
+    beforeCore?: (agentId: string, sessionKey: string) => void;
     /** Injectable only so the session opt-out privacy boundary is testable. */
     reasoningOptOutStore?: ReasoningOptOutStoreAccess;
   },
@@ -1071,6 +1075,7 @@ export async function handleInboundMessage(
   // NOT vestigial — the write-side reason above is the stronger one, and it is
   // now the whole reason. See `session-route.ts`'s module docblock.
   const route = resolveWebchannelSessionRoute(api, accountId, wsKey, servingTenant);
+  options?.beforeCore?.(route.agentId, route.sessionKey);
 
   // #93: build this turn's approval-origin lease handle. Creating it claims
   // NOTHING — `activate()` in `onAgentRunStart` is what publishes the claim, so
@@ -1254,6 +1259,8 @@ export async function handleInboundMessage(
             // reasoning and draft callbacks inside it are conditional, each on
             // its own lane having opened.
             replyOptions: {
+                    ...(options?.dispatchAbortSignal ? { abortSignal: options.dispatchAbortSignal } : {}),
+                    ...(options?.dispatchAbortSignal ? { onTurnAdopted: () => { if (options.dispatchAbortSignal!.aborted) throw new Error("webchannel: dispatch retired before core run"); } } : {}),
                     // #87: always wired, on every turn and every streaming mode
                     // — this is how the turn learns which agent run's lifecycle
                     // terminal is its own.
@@ -1631,7 +1638,19 @@ export async function handleInboundMessage(
     await draft?.drain();
   } catch (err) {
     turnOutcome = "error";
-    api.logger.error?.(`webchannel: inbound dispatch failed: ${logSafe(err)}`);
+    // A CANCELLED dispatch is not a failure to apologize for. `/stop` between
+    // the claim and core's admission (or the `onTurnAdopted` refusal above)
+    // makes core throw the abort reason, and the user has already been told
+    // what they asked for: an apology bubble here is a durable, journaled
+    // "something went wrong" for a turn the user themselves stopped. The
+    // outcome stays `error` and the drain still runs — only the bubble and the
+    // severity change.
+    const dispatchAborted = options?.dispatchAbortSignal?.aborted === true;
+    if (dispatchAborted) {
+      api.logger.info?.(`webchannel: inbound dispatch was cancelled before core admission: ${logSafe(err)}`);
+    } else {
+      api.logger.error?.(`webchannel: inbound dispatch failed: ${logSafe(err)}`);
+    }
     // Surface a thrown turn independently before terminal cleanup. That gives
     // the apology the first claim attempt on an ownerless tool preview without
     // replacing any assistant lane that already streamed real text. A turn
@@ -1639,7 +1658,7 @@ export async function handleInboundMessage(
     // below remains its idempotent terminal cleanup.
     if (draft) {
       try {
-        if (!finalReplyDelivered) {
+        if (!finalReplyDelivered && !dispatchAborted) {
           await draft.deliverIndependentFinal({
             text: "Sorry — something went wrong while answering. Please try again.",
           });
@@ -1650,7 +1669,7 @@ export async function handleInboundMessage(
           `webchannel: draft error-drain failed: ${logSafe(drainErr)}`,
         );
       }
-    } else if (!controlLane && !finalReplyDelivered) {
+    } else if (!controlLane && !finalReplyDelivered && !dispatchAborted) {
       // #238: mint at the delivery act here too — the apology is a real durable
       // bubble on the client, so the plugin (not the viewer) names it.
       let sent = false;
@@ -1829,6 +1848,25 @@ export async function handleInboundMessage(
       );
     }
 
+    // ⚠️ THE DURABLE WRITE IS NOT A GATE ON THE FRAME. `onSettled` persists this
+    // batch's dispatch outcome and reports whether it moved any row; a batch
+    // `/stop` already cancelled moves none. Withholding `turn_settled` for that
+    // is a regression: the frame is what every OTHER device's `isTyping` waits
+    // on in the pre-first-token window, and nothing re-sends it. Eligibility
+    // alone decides the frame, exactly as it did before durable dispatch —
+    // including when the store THROWS. A SQLite fault at this exact instant
+    // would otherwise escape from inside this `finally`, skipping the block
+    // below entirely (and masking any in-flight error on its way into the
+    // dispatcher's `.catch`), so the one promise this comment makes would be
+    // broken by the one failure mode it exists for. The outcome is already
+    // decided; this call only records it.
+    try {
+      options?.onSettled?.(settlementEligible ? turnOutcome : "error");
+    } catch (error) {
+      api.logger?.warn?.(
+        `webchannel: durable settle failed for peer=${logSafe(wsKey)} turn=${logSafe(turnId)} error=${logSafe(error)}`,
+      );
+    }
     if (settlementEligible) {
       // #99: this turn may be the merge of N buffered user messages (P1-8b layer
       // (b) coalescing). Each of them was ACKed and holds its own P0-4 receipt,

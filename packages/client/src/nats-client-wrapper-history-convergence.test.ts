@@ -391,3 +391,24 @@ describe("#342 history row authority", () => {
     } finally { wrapper.close(); }
   });
 });
+
+
+it("durable started/interrupted states survive delayed older history and client recreation", () => {
+  const h = setup();
+  const queued: InboundMessage = { type: "history", highWaterSeq: 1, messages: [{ id: "server-user", role: "user", text: "request", turnId: "wire", randomId: "random", requestState: "queued", seq: 1 }] };
+  try {
+    h.send(queued);
+    h.send({ type: "request_state", id: "server-user", turnId: "wire", state: "started", seq: 2 });
+    h.send(queued);
+    expect(h.wrapper.getState().messages[0].requestState).toBe("started");
+    h.send({ type: "request_state", id: "server-user", turnId: "wire", state: "interrupted", seq: 3 });
+    h.send({ type: "history", messages: [{ ...queued.messages![0], requestState: "started", seq: 2 }] });
+    expect(h.wrapper.getState().messages[0].requestState).toBe("interrupted");
+    const fresh = setup();
+    try {
+      fresh.send({ type: "history", highWaterSeq: 3, messages: [{ ...queued.messages![0], requestState: "interrupted", seq: 3 }] });
+      fresh.send(queued);
+      expect(fresh.wrapper.getState().messages[0]).toMatchObject({ id: "server-user", requestState: "interrupted" });
+    } finally { fresh.wrapper.close(); }
+  } finally { h.wrapper.close(); }
+});

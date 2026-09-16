@@ -51,6 +51,7 @@ export type {
   CommandCatalogEntry,
   CommandCatalogArg,
   // P0-4: the observable send-result contract.
+  RequestState,
   SendState,
   SendFailure,
   SendReceipt,

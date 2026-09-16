@@ -1,3 +1,5 @@
+import type { RequestState } from "./durable-view-reducer.js";
+export type { RequestState } from "./durable-view-reducer.js";
 /**
  * Public types for the headless WebChannel client.
  *
@@ -148,7 +150,9 @@ export type ChatBubble = {
    * `accepted`; an outcome-less legacy frame
    * leaves even the member it names at `accepted`.
    */
-  sendState?: "queued" | "sent" | "accepted" | "completed" | "failed";
+  requestState?: RequestState;
+  retryOf?: string;
+  sendState?: "queued" | "sent" | "accepted" | "completed" | "failed" | "interrupted";
   /** P0-4: present only when `sendState === "failed"` — the failure detail. */
   sendFailure?: SendFailure;
   /**

@@ -60,6 +60,7 @@ export const KNOWN_INBOUND_TYPES = [
   "progress",
   "reasoning",
   "tool_activity",
+  "request_state",
   "turn_settled",
   "turn_snapshot",
   "approval_request",
@@ -338,6 +339,10 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
       return accept(raw);
     }
 
+    case "request_state": {
+      if (!isNonEmptyString(field(raw, "id")) || !isNonEmptyString(field(raw, "turnId")) || !isRequestState(field(raw, "state"))) return invalid(known, "invalid request state");
+      return accept(raw);
+    }
     case "turn_settled": {
       // ⚠️ `outcome` IS CHECKED AS A STRING, NOT AGAINST THE TWO LITERALS, AND
       // THAT IS DELIBERATE. The handler already treats anything that is neither
@@ -601,7 +606,11 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
  * the cursor — exactly as the server's `projectJournalHistory` counts an
  * `unsupportedEvents` row rather than stalling on it.
  */
+export const isRequestState = (value: unknown): value is import("./durable-view-reducer.js").RequestState =>
+  typeof value === "string" && ["queued", "started", "completed", "failed", "interrupted", "cancelled"].includes(value);
+
 const KNOWN_DURABLE_EVENT_KIND_LIST = [
+  "requestState",
   "user",
   "placement",
   "bubble",
@@ -684,6 +693,9 @@ export function decodeDurableEvent(event: unknown): DurableEventDecodeResult {
   });
 
   switch (kind) {
+    case "requestState":
+      if (!isNonEmptyString(field(event, "id")) || !isRequestState(field(event, "state"))) return bad("invalid request state");
+      return ok();
     case "user":
       // The journal refuses an id-less user row at its own mechanism
       // (`delivery-journal.ts`'s `append` throws on one, and `appendInboundUser`
@@ -693,6 +705,8 @@ export function decodeDurableEvent(event: unknown): DurableEventDecodeResult {
       if (!isString(field(event, "text"))) return bad("text must be a string");
       if (!optionalString(event, "turnId")) return bad("turnId must be a string");
       if (!optionalString(event, "randomId")) return bad("randomId must be a string");
+      if (field(event, "requestState") !== undefined && !isRequestState(field(event, "requestState"))) return bad("invalid request state");
+      if (!optionalString(event, "retryOf")) return bad("retryOf must be a string");
       return ok();
 
     case "placement":

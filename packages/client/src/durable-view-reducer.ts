@@ -232,6 +232,8 @@
  * calls it. There is one implementation of the reconciliation, and it is here.
  */
 
+export type RequestState = "queued" | "started" | "completed" | "failed" | "interrupted" | "cancelled";
+
 export type DurableRole = "user" | "agent";
 
 /**
@@ -308,6 +310,8 @@ export type DurableMessage =
       readonly kind: "text";
       readonly id: string;
       readonly role: DurableRole;
+      readonly requestState?: RequestState;
+      readonly retryOf?: string;
       readonly text: string;
       readonly turnId?: string;
       /**
@@ -718,7 +722,8 @@ export type DurableEvent =
    * re-delivered user event no-ops instead of appending a second bubble. Absent on
    * an older row / an older client's send ⇒ the fold falls back to append (safe).
    */
-  | { kind: "user"; id: string; text: string; turnId?: string; randomId?: string }
+  | { kind: "user"; id: string; text: string; turnId?: string; randomId?: string; requestState?: RequestState; retryOf?: string }
+  | { kind: "requestState"; id: string; state: RequestState }
   | { kind: "placement"; answerId: string; turnId?: string }
   | { kind: "bubble"; answerId: string; text: string; turnId?: string }
   | {
@@ -891,6 +896,15 @@ export function applyDurableEvent(
   switch (event.kind) {
     case "user":
       return applyUser(view, event);
+    case "requestState": {
+      const index = view.findIndex(m => m.kind === "text" && m.role === "user" && m.id === event.id);
+      if (index === -1) return view;
+      const prior = view[index];
+      if (prior.kind !== "text" || prior.deleted || prior.requestState === event.state) return view;
+      const next = view.slice();
+      next[index] = { ...prior, requestState: event.state };
+      return next;
+    }
     case "placement":
       return applyPlacement(view, event);
     case "bubble":
@@ -948,12 +962,12 @@ export function reduceDurableView(events: readonly DurableEvent[]): DurableView 
  */
 function applyUser(
   view: DurableView,
-  event: { id: string; text: string; turnId?: string },
+  event: { id: string; text: string; turnId?: string; requestState?: RequestState; retryOf?: string },
 ): DurableView {
   if (findTextIndex(view, event.id) !== -1) return view;
   return [
     ...view,
-    { kind: "text", id: event.id, role: "user", text: event.text, turnId: event.turnId },
+    { kind: "text", id: event.id, role: "user", text: event.text, turnId: event.turnId, ...(event.requestState ? { requestState: event.requestState } : {}), ...(event.retryOf ? { retryOf: event.retryOf } : {}) },
   ];
 }
 
@@ -1670,7 +1684,7 @@ function applySeal(
  * durable fields is a compile error there.
  */
 type ClientTranscriptEntry =
-  | { kind?: undefined; id: string; role: DurableRole; text: string; turnId?: string; draftOnly?: boolean; revision?: number; edited?: boolean }
+  | { kind?: undefined; id: string; role: DurableRole; text: string; turnId?: string; draftOnly?: boolean; revision?: number; edited?: boolean; requestState?: RequestState; retryOf?: string }
   | { kind: "reasoning"; id: string; turnId: string; text: string }
   | {
       kind: "tool";
@@ -1774,6 +1788,8 @@ export function projectDurable(messages: ClientTranscriptEntry[]): DurableView {
       role: m.role,
       text: m.text,
       turnId: m.turnId,
+      ...(m.requestState !== undefined ? { requestState: m.requestState } : {}),
+      ...(m.retryOf !== undefined ? { retryOf: m.retryOf } : {}),
       ...(m.revision !== undefined ? { revision: m.revision } : {}),
       ...(m.edited !== undefined ? { edited: m.edited } : {}),
     };
