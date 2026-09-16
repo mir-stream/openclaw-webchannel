@@ -719,6 +719,7 @@ describe("#242 half 4 — the approval frames are durable, TWO events, no policy
  */
 describe("#244 half A — isSeqBearingFrame tracks the mapper's non-null set", () => {
   const SAMPLES: Record<OutboundWsMessage["type"], OutboundWsMessage> = {
+    request_state: { type: "request_state", id: "user", turnId: TURN, state: "interrupted", seq: 1 },
     // DURABLE — mapper returns non-null, predicate must accept.
     agent_message: { type: "agent_message", text: "a", id: "a-1", turnId: TURN },
     progress: { type: "progress", id: "a-1", text: "working", turnId: TURN },

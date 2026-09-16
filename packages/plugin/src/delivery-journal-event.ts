@@ -689,6 +689,7 @@ export function journalEventForOutbound(
       // output back in, exactly like `history` above. NOT seq-bearing either —
       // `isSeqBearingFrame` rejects it, and the drift test pins the two agreeing.
       return null;
+    case "request_state":
     case "user_committed":
       // #245 Part B — the immediate multi-device BROADCAST of a user message the
       // store ALREADY committed (`appendInboundUser` minted its id/seq before this

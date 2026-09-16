@@ -70,6 +70,7 @@ const SECTION_END = "- **Rotating K does not disconnect anyone";
  * the strings.
  */
 const RUNBOOK_TOKENS: Record<JournalEvent["kind"], string> = {
+  requestState: "requestState",
   user: 'kind:"user"',
   placement: "`progress` placements",
   bubble: "`agent_message`",

@@ -96,7 +96,7 @@
 import { createRequire } from "node:module";
 
 /** The plugin's wire-protocol version. Kept in lockstep with the client. */
-export const WEBCHANNEL_PROTOCOL_VERSION = 4;
+export const WEBCHANNEL_PROTOCOL_VERSION = 5;
 
 let cachedPluginVersion: string | null | undefined;
 

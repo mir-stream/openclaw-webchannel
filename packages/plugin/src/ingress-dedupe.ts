@@ -1,3 +1,4 @@
+import type { DispatchRecovery } from "./dispatch-recovery.js";
 /**
  * P0-7a — browser→agent ingress idempotency (first half).
  *
@@ -18,18 +19,12 @@
  *       cannot happen here — this runs inside the debouncer's `onFlush`, which is
  *       same-peer serialized by core's keyChains, so checks are already ordered.
  *
- * THE CRASH WINDOW. Outcome markers are persisted before the journal row and
- * before the dispatcher starts the turn. #344 recovers the marker→row window:
- * an accepted marker without a row under `randomId ?? wireId` is reclaimed and
- * re-admitted through this seam's ordinary journal/dispatch path. The new
- * receipt owns rollback if a later batch append fails. Other readers follow
- * THE READER RULE on `OutcomeLookup` in `ingress-outcome.ts` and leave an orphan
- * unresolved until it reaches this admission seam.
- *
- * A journal row does not prove that the turn started. A crash after the row is
- * persisted but before dispatch still leaves marker+row, and replay re-acks it
- * without starting the lost turn. Recovering durable queued work is separate
- * from this marker→row repair; the store/dispatch order is unchanged.
+ * New normal requests use the optional production dispatch-recovery dependency:
+ * one journal transaction stores the user row and queued payload before ACK.
+ * The durable dispatcher claims started work before core, automatically recovers
+ * only queued work, and records uncertain work as interrupted after restart.
+ * Existing historical rows have no unstarted proof and remain replay-suppressed.
+ * Accepted markers without a row still use the #344 recovery path below.
  *
  * Cancellation uses its own `cancelled` outcome so a replay of text `/stop`
  * killed cannot be confused with an orphan. It is ACKed without re-admission;
@@ -134,7 +129,7 @@ export const MAX_CANCELLED_INBOUND_FALLBACK_BYTES = 256 * 1024;
  * Both fields share the one `MAX_INGRESS_DEDUPE_ID_LENGTH` bound and the
  * `${peerId}:<key>` namespacing.
  */
-function usableId(value: unknown): value is string {
+export function usableId(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= MAX_INGRESS_DEDUPE_ID_LENGTH;
 }
 export type IngressIdentity = {
@@ -234,7 +229,7 @@ export type IngressDedupeCheck = (
  */
 export type IngressDedupeItem = {
   peerId: string;
-  message: { id?: string; text?: string; random_id?: string };
+  message: { id?: string; text?: string; random_id?: string; retry_of?: string };
 };
 
 /**
@@ -354,7 +349,7 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
    */
   sendUserCommitted?: (
     peerId: string,
-    message: { id: string; text: string; turnId?: string; seq: number; random_id?: string },
+    message: { id: string; text: string; turnId?: string; seq: number; random_id?: string; requestState?: "queued"; retryOf?: string },
   ) => boolean;
   sendInboundRejected?: (peerId: string, ids: string[]) => boolean;
   outcomeStore?: IngressOutcomeStore;
@@ -377,6 +372,7 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
    * `NatsChannelDurability` gets on the egress side).
    */
   deliveryJournal?: DeliveryJournal;
+  dispatchRecovery?: Pick<DispatchRecovery, "accept">;
   /** Routine duplicate-drop sink (info). */
   logInfo?: (message: string) => void;
   /** Fail-open fault sink (warn). */
@@ -599,7 +595,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
        * user bubbles, so N `user` rows is what makes history equal live (N8). The
        * coalesced message is a dispatch concern and never reaches this array.
        */
-      const journalPending: Array<{ wireId: string; randomId: string | undefined; text: unknown }> = [];
+      const journalPending: Array<{ wireId: string; randomId: string | undefined; text: unknown; retryOf?: string }> = [];
       /**
        * #243 half 2a — the batch's `random_id → messageId` echo, in the order the
        * ids are collected. A FRESH admission contributes its newly minted id
@@ -1002,6 +998,15 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // Fall through to the fresh-accept path below, reservation still held.
           }
 
+          const durableRequest = deps.dispatchRecovery ? deps.deliveryJournal?.dispatch?.lookup(peerId, idempotencyKey) : undefined;
+          const historicalRow = deps.dispatchRecovery && !durableRequest
+            ? deps.deliveryJournal?.lookupUserMessageIdByRandomId(peerId, idempotencyKey) : undefined;
+          if (durableRequest || historicalRow) {
+            release();
+            ackIds.push(id);
+            if (randomId !== undefined) committedBatch.push({ random_id: randomId, messageId: (durableRequest ?? historicalRow)!.messageId, seq: (durableRequest ?? historicalRow)!.seq });
+            continue;
+          }
           const offer = lease.offer(item.message, reservation);
           if (offer.status === "disposed") {
             release();
@@ -1096,7 +1101,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // no row" stays true: a retry that reaches this line was, by the
             // journal's own verdict, never accepted.
             if (deps.deliveryJournal) {
-              journalPending.push({ wireId: id, randomId, text: item.message.text });
+              journalPending.push({ wireId: id, randomId, text: item.message.text, ...(item.message.retry_of ? { retryOf: item.message.retry_of } : {}) });
             }
           } else {
             rollbackOnce();
@@ -1155,8 +1160,8 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         // `accepted` marker with no row is not evidence of an accept. The
         // found/accepted branch in the item loop enforces it — it consults this
         // journal and re-admits (journals + dispatches) rather than re-acking.
-        // This repairs only a crash between marker and row. A crash after the
-        // row but before turn start still re-acks without recovering dispatch.
+        // Production also commits queued dispatch payloads with the user rows.
+        // Startup recovery owns that work independently of client retransmission.
         //
         // ⚠️ THE QUESTION IS ASKED ONLY OF `accepted`, AND THAT IS THE FIX'S
         // LOAD-BEARING HALF. "No row" is a deliberate, permanent state for the
@@ -1233,14 +1238,19 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           // admit, do not journal, say so. And the gap is sharper than a plain
           // omission — the turn still runs and the egress seam journals its
           // answer, so history gains an agent answer with NO preceding user row.
-          const journalable: Array<{ wireId: string; randomId: string | undefined; text: string }> = [];
+          const journalable: Array<{ wireId: string; randomId: string | undefined; text: string; retryOf?: string }> = [];
           const unjournalableText: Array<"non-string-text"> = [];
           for (const pending of journalPending) {
             if (typeof pending.text === "string") {
-              journalable.push({ wireId: pending.wireId, randomId: pending.randomId, text: pending.text });
+              journalable.push({ wireId: pending.wireId, randomId: pending.randomId, text: pending.text, ...(pending.retryOf ? { retryOf: pending.retryOf } : {}) });
             } else unjournalableText.push("non-string-text");
           }
           try {
+            const durableBatch = deps.dispatchRecovery?.accept(peerId, journalPending.map(pending => {
+              if (typeof pending.text !== "string") throw new Error("webchannel: dispatch requires text");
+              return { text: pending.text, turnId: pending.wireId, ...(pending.randomId !== undefined ? { randomId: pending.randomId } : {}), ...(pending.retryOf ? { retryOf: pending.retryOf } : {}) };
+            }));
+            let dispatchIndex = 0;
             for (const pending of journalable) {
               // `conversationId` is the peerId — doc §16.2-7, identical to the
               // egress seam. The journal FILE is already scoped to
@@ -1282,11 +1292,26 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               // Synchronous and in arrival order, because `seq` order is the
               // stream's order and the stream's order IS the identity model
               // (doc §16.5.3). No batching, no deferral.
-              const { messageId, seq, inserted } = deps.deliveryJournal.appendInboundUser(peerId, {
+              // The dispatch store VALIDATES `retry_of` and returns what it
+              // actually stored, so the echo, the broadcast and history all
+              // carry the same provenance the journal row does — never the
+              // requested one. An invalid `retry_of` comes back absent.
+              const durable = durableBatch?.[dispatchIndex++];
+              const { messageId, seq, inserted } = durable ?? deps.deliveryJournal.appendInboundUser(peerId, {
                 text: pending.text,
                 turnId: pending.wireId,
                 ...(pending.randomId !== undefined ? { randomId: pending.randomId } : {}),
               });
+              // `inserted` only: this is a FRESH admission's stored provenance.
+              // A dedupe retry echoes the first admission's row, and a
+              // historical row has no dispatch lifecycle at all — neither says
+              // anything about this frame's `retry_of`.
+              if (pending.retryOf !== undefined && durable?.inserted === true && durable.retryOf === undefined) {
+                logInfo?.(
+                  "webchannel: inbound retry provenance dropped; running as an ordinary send " +
+                    `peer=${logSafe(peerId)} reason=retry_of-is-not-an-interrupted-request`,
+                );
+              }
               // The echo is keyed by `random_id`, so it exists only for a
               // conforming client. An older client is still journaled (under a
               // server id) and acked; it simply carries no `committed` entry.
@@ -1326,6 +1351,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
                   text: pending.text,
                   turnId: pending.wireId,
                   seq,
+                  ...(durableBatch ? { requestState: "queued" as const, ...(durable?.retryOf ? { retryOf: durable.retryOf } : {}) } : {}),
                   ...(pending.randomId !== undefined ? { random_id: pending.randomId } : {}),
                 });
               }

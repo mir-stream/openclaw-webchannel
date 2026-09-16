@@ -90,6 +90,7 @@ type DeferredReplacementOperation =
       localId: string;
       text: string;
       receiptKey: string;
+      retryOf?: string;
     }
   | { kind: "approval-decision"; id: string; decision: ApprovalDecision }
   | { kind: "load-history"; before?: string; beforeTurnId?: string; limit?: number }
@@ -115,6 +116,7 @@ function normalizeAssistantMessageIndex(value: unknown): number | undefined {
  * it just carries no cursor, so it neither advances nor gaps.
  */
 const SEQ_BEARING_INBOUND_TYPES: ReadonlySet<string> = new Set([
+  "request_state",
   "agent_message",
   "progress",
   "turn_snapshot",
@@ -299,6 +301,7 @@ function authoredIdsOf(event: DurableEvent): string[] {
     case "tool":
     case "approval":
     case "approvalResolution":
+    case "requestState":
     case "messageEdited":
     case "messageDeleted":
       return [];
@@ -827,7 +830,7 @@ export class WebChannelNATSClient {
    * released FIFO once the turn settles AND the session key exists. Each entry's
    * `localId` is the id of its `pending: true` transcript bubble.
    */
-  private readonly held: Array<{ localId: string; text: string; receiptKey: string }> = [];
+  private readonly held: Array<{ localId: string; text: string; receiptKey: string; retryOf?: string }> = [];
   /** Every outbound operation staged for a connect requested inside close(). */
   private readonly deferredReplacementOperations: DeferredReplacementOperation[] = [];
   /** Keeps reentrant operations behind entries already staged for replacement. */
@@ -871,11 +874,11 @@ export class WebChannelNATSClient {
    */
   private readonly randomIdToReceiptKey = new Map<string, string>();
   /** P0-4: forward rank for the receipt-level monotonic guard (incl. `completed`). */
-  private static readonly RECEIPT_RANK: Record<"queued" | "sent" | "accepted" | "completed", number> = {
+  private static readonly RECEIPT_RANK: Record<"queued" | "sent" | "accepted" | "completed" | "interrupted", number> = {
     queued: 0,
     sent: 1,
     accepted: 2,
-    completed: 3,
+    completed: 3, interrupted: 3,
   };
   /**
    * P1-9 §3.2: true only between a session KEY establishment (onSession, fired
@@ -1367,7 +1370,16 @@ export class WebChannelNATSClient {
    * ignore it). `undefined` ONLY for trimmed-empty input (R2b-3): no bubble, no
    * tracker mutation, no fabricated receipt.
    */
-  send(text: string): SendReceipt | undefined {
+  send(text: string): SendReceipt | undefined { return this.sendWithProvenance(text); }
+
+  /** A deliberate new execution; the interrupted original and its result remain visible. */
+  retryInterrupted(messageId: string): SendReceipt | undefined {
+    const original = this.state.messages.find(m => m.kind === undefined && m.role === "user" && m.id === messageId);
+    if (!original || original.requestState !== "interrupted" || isLikelyAbortText(original.text)) return undefined;
+    return this.sendWithProvenance(original.text, original.id);
+  }
+
+  private sendWithProvenance(text: string, retryOf?: string): SendReceipt | undefined {
     const trimmed = text.trim();
     if (!trimmed) return undefined;
 
@@ -1428,7 +1440,7 @@ export class WebChannelNATSClient {
     if (this.shouldHold()) {
       const receiptKey = this.newReceiptKey();
       const localId = this.mintLocalBubbleId("u");
-      const heldEntry = { localId, text: trimmed, receiptKey };
+      const heldEntry = { localId, text: trimmed, receiptKey, ...(retryOf ? { retryOf } : {}) };
       this.held.push(heldEntry);
       if (this.deferredReplacementOpen()) {
         this.replacementHeldNeedsFreshEpisode = true;
@@ -1452,7 +1464,7 @@ export class WebChannelNATSClient {
       this.heldAdmissionNotificationDepth++;
       try {
         this.appendMessage({
-          id: localId, role: "user", text: trimmed, pending: true, receiptKey, sendState: "queued",
+          id: localId, role: "user", text: trimmed, pending: true, receiptKey, sendState: "queued", ...(retryOf ? { retryOf } : {}),
         });
         this.ensureHeldStallEpisode();
       } finally {
@@ -1471,7 +1483,7 @@ export class WebChannelNATSClient {
     // #96: an ordinary user message — the plugin runs it as a normal turn and
     // answers with `turn_settled`, so its first `sent`/`accepted` transition can
     // open a turn.
-    return this.publish(trimmed, true);
+    return this.publish(trimmed, true, retryOf);
   }
 
   /**
@@ -1515,9 +1527,9 @@ export class WebChannelNATSClient {
    * text the server routes onto the control lane. The CALLER already knows which
    * branch it is; publish must never re-sniff the text.
    */
-  private publish(trimmed: string, settlementEligible: boolean): SendReceipt {
+  private publish(trimmed: string, settlementEligible: boolean, retryOf?: string): SendReceipt {
     if (this.shouldDeferReplacementOperation()) {
-      return this.deferReplacementPublish(trimmed, settlementEligible);
+      return this.deferReplacementPublish(trimmed, settlementEligible, retryOf);
     }
     const receiptKey = this.newReceiptKey();
     const wireId = this.client.reserveWireId();
@@ -1539,15 +1551,20 @@ export class WebChannelNATSClient {
       bubbleId,
       trimmed,
       wireId,
-      { wireId, receiptKey, sendState: "queued" },
+      { wireId, receiptKey, sendState: "queued", ...(retryOf ? { retryOf } : {}) },
     );
     const randomId = this.mintRandomId(receiptKey);
     this.stageReceiptStateThenCommit(
       receiptKey,
       { messages },
-      () => { this.client.sendUserMessage(trimmed, wireId, randomId); },
+      () => { this.sendUserMessage(trimmed, wireId, randomId, retryOf); },
     );
     return this.makeReceipt(receiptKey);
+  }
+
+  private sendUserMessage(text: string, wireId: string, randomId: string, retryOf?: string): void {
+    if (retryOf === undefined) this.client.sendUserMessage(text, wireId, randomId);
+    else this.client.sendUserMessage(text, wireId, randomId, retryOf);
   }
 
   // ---------------------------------------------------------------------------
@@ -1731,11 +1748,12 @@ export class WebChannelNATSClient {
   private deferReplacementPublish(
     trimmed: string,
     settlementEligible: boolean,
+    retryOf?: string,
   ): SendReceipt {
     const receiptKey = this.newReceiptKey();
     const localId = this.mintLocalBubbleId("u");
     this.deferredReplacementOperations.push({
-      kind: "user", localId, text: trimmed, receiptKey,
+      kind: "user", localId, text: trimmed, receiptKey, ...(retryOf ? { retryOf } : {}),
     });
     this.receipts.set(receiptKey, {
       id: receiptKey,
@@ -1818,10 +1836,10 @@ export class WebChannelNATSClient {
       this.stageReceiptStateThenCommit(
         entry.receiptKey,
         { messages },
-        () => { this.client.sendUserMessage(entry.text, wireId, randomId); },
+        () => { this.sendUserMessage(entry.text, wireId, randomId, entry.retryOf); },
       );
     } else {
-      this.client.sendUserMessage(entry.text, wireId, randomId);
+      this.sendUserMessage(entry.text, wireId, randomId, entry.retryOf);
     }
   }
 
@@ -1930,7 +1948,7 @@ export class WebChannelNATSClient {
         // final entry the timer/lifecycle transaction has now committed.
         if (this.held[0] !== heldEntry) return;
         this.held.shift();
-        const { localId, text, receiptKey } = heldEntry;
+        const { localId, text, receiptKey, retryOf } = heldEntry;
         // P0-4 commit order: reserve the wireId, register the alias, stage the bubble
         // at the tail, THEN let the low level own/publish A before exposing that move.
         const wireId = this.client.reserveWireId();
@@ -1952,14 +1970,14 @@ export class WebChannelNATSClient {
           this.stageReceiptStateThenCommit(
             receiptKey,
             { messages },
-            () => { this.client.sendUserMessage(text, wireId, randomId); },
+            () => { this.sendUserMessage(text, wireId, randomId, retryOf); },
           );
         } else {
           // No bubble remains to stage. The authoritative `sent`/`accepted`
           // receipt callback still opens and exposes the turn only after the
           // low-level publish succeeds; `heldReleaseCommitDepth` keeps a listener
           // reached by that fanout from jumping this entry's FIFO position.
-          this.client.sendUserMessage(text, wireId, randomId);
+          this.sendUserMessage(text, wireId, randomId, retryOf);
         }
       }
     } finally {
@@ -2002,7 +2020,7 @@ export class WebChannelNATSClient {
     this.failHeldEntries(this.takeHeld(), failure);
   }
 
-  private takeHeld(): Array<{ localId: string; text: string; receiptKey: string }> {
+  private takeHeld(): Array<{ localId: string; text: string; receiptKey: string; retryOf?: string }> {
     const entries = this.held.splice(0);
     if (entries.length > 0) {
       this.endHeldStallEpisode();
@@ -2951,6 +2969,8 @@ export class WebChannelNATSClient {
         ...base,
         id: entry.id,
         role: entry.role,
+        ...(entry.requestState ? { requestState: entry.requestState } : {}),
+        ...(entry.retryOf ? { retryOf: entry.retryOf } : {}),
         ...(entry.revision !== undefined ? { revision: entry.revision } : {}),
         ...(entry.edited !== undefined ? { edited: entry.edited } : {}),
         // Rule 2's carve-out: while the bubble holds only a draft, `text` is the
@@ -3240,6 +3260,7 @@ export class WebChannelNATSClient {
       rec.drainingTransitions ||
       wrapperState === "failed" ||
       wrapperState === "completed" ||
+      wrapperState === "interrupted" ||
       !rec.wireId
     ) {
       return wrapperSnapshot;
@@ -3259,7 +3280,7 @@ export class WebChannelNATSClient {
   /** Monotonic receipt guard (wrapper-level, incl. `completed`): queued<sent<accepted<completed; failed/completed terminal. */
   private receiptAdvances(from: ReceiptRecord["state"], to: NonNullable<ChatMessage["sendState"]>): boolean {
     if (from === to) return false;
-    if (from === "failed" || from === "completed") return false; // terminal
+    if (from === "failed" || from === "completed" || from === "interrupted") return false; // terminal
     if (to === "failed") return true; // failable from any non-terminal state
     return WebChannelNATSClient.RECEIPT_RANK[to] > WebChannelNATSClient.RECEIPT_RANK[from];
   }
@@ -3425,7 +3446,7 @@ export class WebChannelNATSClient {
    * non-anchor receipt at `accepted`; the turn-activity prefix sweep does not
    * fabricate a receipt outcome.
    */
-  private promoteAnchor(turnId: string, state: "completed" | "failed", failure?: SendFailure): void {
+  private promoteAnchor(turnId: string, state: "completed" | "failed" | "interrupted", failure?: SendFailure): void {
     const anchor = this.state.messages.find((m) => m.role === "user" && m.wireId === turnId);
     if (anchor?.receiptKey) this.receiptTransition(anchor.receiptKey, state, failure);
   }
@@ -4275,6 +4296,18 @@ export class WebChannelNATSClient {
         this.applyDurable(event, local);
         return;
       }
+      case "requestState": {
+        // A catch-up consumes a lifecycle row exactly like `history` and the
+        // live `request_state` frame do. `applyDurable` alone only paints the
+        // row: the receipt promotion, the buffered-progress retirement and the
+        // turn closure all live in `reconcileRequestStates`, so without this the
+        // send stays `accepted` and the turn stays open until the next history
+        // load — for the interrupted case, exactly the state the user is being
+        // asked to act on.
+        this.applyDurable(event);
+        this.reconcileRequestStates();
+        return;
+      }
       case "user": {
         // #337 — a LOST ack leaves the optimistic user bubble un-adopted at its
         // local id (`adoptCommittedIds` runs only on the ack). The turn's first
@@ -4336,6 +4369,21 @@ export class WebChannelNATSClient {
   }
 
   /** Merge projected rows by explicit identity and modification evidence. */
+  private reconcileRequestStates(): void {
+    for (const row of [...this.state.messages]) {
+      if (row.kind !== undefined || row.role !== "user" || !row.requestState || row.requestState === "queued" || row.requestState === "started") continue;
+      const turnId = row.wireId ?? row.turnId;
+      if (!turnId) continue;
+      if (row.requestState === "interrupted") this.promoteAnchor(turnId, "interrupted");
+      else if (row.requestState === "completed") this.promoteAnchor(turnId, "completed");
+      else this.promoteAnchor(turnId, "failed", { reason: row.requestState === "cancelled" ? "cancelled" : "turn-failed", retryable: row.requestState === "failed" });
+      this.retireBufferedProgress(turnId);
+      const closed = this.closeTurnsThrough(this.consumeTurnOpeningsThrough(turnId));
+      this.finalizeDraftsForTurn(turnId);
+      if (closed) this.setState({ turnActive: false, isTyping: false });
+    }
+  }
+
   private hydrateHistory(msg: InboundMessage): void {
     const rows = Array.isArray(msg.messages) ? msg.messages : [];
     const lifecycle = this.wrapperLifecycleGeneration;
@@ -4380,7 +4428,7 @@ export class WebChannelNATSClient {
       } else if (row.kind === undefined && (row.role === "user" || row.role === "agent")) {
         if (row.role === "agent" && row.text === "") continue;
         raw = row.role === "user"
-          ? { kind: "user", id: row.id, text: row.text, turnId: row.turnId }
+          ? { kind: "user", id: row.id, text: row.text, turnId: row.turnId, requestState: row.requestState, retryOf: row.retryOf }
           : { kind: "bubble", answerId: row.id, text: row.text, turnId: row.turnId };
       } else continue;
       const decoded = decodeDurableEvent(raw);
@@ -4407,6 +4455,9 @@ export class WebChannelNATSClient {
       // delayed live/difference frames as well as other history pages.
       view = completeToolVersion ? applyDurableEvent(view, decoded.event)
         : this.rowVersions.apply(view, decoded.event, row.seq);
+      if (decoded.event.kind === "user" && decoded.event.requestState) {
+        view = applyDurableEvent(view, { kind: "requestState", id: row.id, state: decoded.event.requestState });
+      }
       if (row.kind === undefined && row.revision !== undefined && isWireSeq(row.revision)) {
         view = applyDurableEvent(view, { kind: "messageEdited", id: row.id,
           text: row.text!, revision: row.revision, turnId: row.turnId });
@@ -4483,6 +4534,7 @@ export class WebChannelNATSClient {
     switch (msg.type) {
       case "history":
         this.hydrateHistory(msg);
+        this.reconcileRequestStates();
         return true;
 
       case "typing": {
@@ -4538,6 +4590,8 @@ export class WebChannelNATSClient {
           text: msg.text,
           ...(typeof msg.turnId === "string" ? { turnId: msg.turnId } : {}),
           ...(typeof msg.random_id === "string" ? { randomId: msg.random_id } : {}),
+          ...(msg.requestState ? { requestState: msg.requestState } : {}),
+          ...(msg.retryOf ? { retryOf: msg.retryOf } : {}),
         });
         return true;
       }
@@ -4925,6 +4979,12 @@ export class WebChannelNATSClient {
         return true;
       }
 
+      case "request_state": {
+        if (!msg.id || !msg.state) return false;
+        this.applyDurable({ kind: "requestState", id: msg.id, state: msg.state });
+        this.reconcileRequestStates();
+        return true;
+      }
       case "turn_settled": {
         if (msg.turnId) this.retireBufferedProgress(msg.turnId);
         // Consume before outcome promotion or UI settlement: either operation

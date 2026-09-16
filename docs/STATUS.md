@@ -1,5 +1,19 @@
 # Project Status — single source of truth
 
+Round 7 (#369), option 2: newly accepted normal requests retain their original
+payload and dispatch lifecycle in SQLite. Startup automatically recovers proven
+unstarted work; started requests without confirmed completion become durable
+“Interrupted · result unknown” messages. Existing output stays visible, and the
+app's Retry action creates a new logical send linked to the original. Explicit
+cancellation and completed work do not auto-run again. An awaited startup service
+retires only restart-aborted core work at explicitly recorded WebChannel session
+keys, even when account transport startup fails; on a persistent storage or
+account-planning fault it deliberately holds core's remaining plugin-service
+startup (and every channel's restart recovery) rather than let core re-run
+interrupted work. Core session resets remain available. Historical rows without lifecycle metadata are never replayed or
+assigned invented statuses. Client/plugin protocol 5 requires lockstep rollout.
+See [dispatch recovery and upgrade boundaries](DISPATCH_RECOVERY.md).
+
 Round 6 (#378): config reads, account inspection, acquisition/planning, status
 credential probes and both core outbound adapters share account lookup. Nullish
 and blank IDs use the configured selection; exact and unique SDK canonical

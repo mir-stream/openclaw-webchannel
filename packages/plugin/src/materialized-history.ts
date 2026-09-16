@@ -12,7 +12,7 @@ import type { HistoryFetchPlan } from './history.js';
 import type { RetainedJournalEvent } from './delivery-journal.js';
 import { historyRowFor, isKnownJournalEvent, recordFirstSeen, type ServedHistory } from './journal-history.js';
 
-export const HISTORY_MATERIALIZATION_VERSION = '1';
+export const HISTORY_MATERIALIZATION_VERSION = '2';
 export const HISTORY_MATERIALIZATION_CHUNK_ROWS = 128;
 export const HISTORY_MATERIALIZATION_SLICE_MS = 8;
 export const HISTORY_RANK_MAX_LENGTH = 64;

@@ -271,6 +271,20 @@ async function mountBrowserUi(): Promise<void> {
           }
           if (badge.textContent) div.append(badge);
         }
+        if (m.role === "user" && m.requestState === "interrupted") {
+          const status = document.createElement("div");
+          status.textContent = "Interrupted · result unknown. Check any effects before retrying.";
+          const retry = document.createElement("button");
+          retry.textContent = "Retry";
+          retry.onclick = () => { client?.retryInterrupted(m.id); };
+          status.append(retry);
+          div.append(status);
+        } else if (m.role === "user" && m.requestState === "cancelled") {
+          const status = document.createElement("div"); status.textContent = "Cancelled"; div.append(status);
+        }
+        if (m.role === "user" && m.retryOf) {
+          const provenance = document.createElement("small"); provenance.textContent = "Retry of an interrupted request"; div.append(provenance);
+        }
         return div;
       }),
     );

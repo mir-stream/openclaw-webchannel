@@ -237,6 +237,9 @@ because the thing it names does not exist. The correction:
   Nothing on this list is a ciphertext store to invalidate:
   the one file holding conversation content, `delivery-journal.sqlite`, holds it
   in the clear, so the only lever over it is deletion, not invalidation.
+  Dispatch payloads and `requestState` transitions also persist in that journal;
+  interrupted requests retain any committed output and need deliberate retry.
+
 - **Rotating K does not disconnect anyone and does not revoke anything.** It is
   one of two independent controls. Section 2 tells you which ones you need.
 

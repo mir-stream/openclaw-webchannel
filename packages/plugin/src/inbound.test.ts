@@ -3796,3 +3796,82 @@ describe("durable output completion (#295)", () => {
     expect(settles).toEqual(["ok"]);
   });
 });
+
+describe("durable dispatch hooks (#369)", () => {
+  it("emits turn_settled for every eligible turn even when the durable settle stored nothing", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async (turn) => {
+      await turn.delivery.deliver({ text: "answered" }, { kind: "final" });
+    } });
+    const { transport, settleFrames } = makeFakeTransport();
+    const outcomes: Array<"ok" | "error"> = [];
+
+    // `/stop` already cancelled this batch, so the store moves no row and the
+    // hook reports `false`. The frame is what the account's OTHER devices clear
+    // `isTyping` on, and nothing re-sends it — so it must go out regardless.
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message", text: "hi", id: "turn-unstored",
+    }, "default", { onSettled: (outcome) => { outcomes.push(outcome); return false; } });
+
+    expect(outcomes).toEqual(["ok"]);
+    expect(settleFrames).toEqual([{ turnId: "turn-unstored", outcome: "ok" }]);
+  });
+
+  it("emits turn_settled even when the durable settle THROWS, and says so once", async () => {
+    const { api, warnings } = makeFakeApi({ streamingMode: "off", runImpl: async (turn) => {
+      await turn.delivery.deliver({ text: "answered" }, { kind: "final" });
+    } });
+    const { transport, settleFrames } = makeFakeTransport();
+
+    // A store fault at the settle instant. Unguarded it escapes from inside the
+    // `finally`, so the settle block below it never runs and no device is ever
+    // told this turn ended — the one failure mode the frame matters most for.
+    await expect(handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message", text: "hi", id: "turn-throwing-settle",
+    }, "default", { onSettled: () => { throw new Error("injected settle fault"); } })).resolves.toBeUndefined();
+
+    expect(settleFrames).toEqual([{ turnId: "turn-throwing-settle", outcome: "ok" }]);
+    // Exactly one line, naming the peer, the turn and the fault — filtered
+    // rather than compared whole, because the #113 reasoning diagnostic is a
+    // once-per-process latch whose firing depends on test order in this file.
+    expect(warnings.filter((w) => w.includes("durable settle failed"))).toEqual([
+      'webchannel: durable settle failed for peer="peer-1" turn="turn-throwing-settle" error="Error: injected settle fault"',
+    ]);
+  });
+
+  it.each(["off", "progress"] as const)("delivers no apology when /stop aborted the dispatch before core admitted it (%s)", async (streamingMode) => {
+    const { api, warnings } = makeFakeApi({ streamingMode, runImpl: async () => {
+      // Core throws the abort reason when the dispatch signal fires between the
+      // claim and admission (and from `onTurnAdopted`'s refusal).
+      throw new Error("webchannel: dispatch retired before core run");
+    } });
+    const { transport, texts, finalizes, settles } = makeFakeTransport();
+    const aborted = new AbortController();
+    aborted.abort();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message", text: "cancel me", id: "turn-aborted",
+    }, "default", { dispatchAbortSignal: aborted.signal });
+
+    // The user asked for the stop; a durable "something went wrong" bubble is
+    // not an answer to it. The outcome is still `error`.
+    expect(texts).toEqual([]);
+    expect(finalizes).toEqual([]);
+    expect(settles).toEqual(["error"]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("still apologizes for an ordinary thrown turn while a dispatch signal is wired", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {
+      throw new Error("provider exploded");
+    } });
+    const { transport, texts } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message", text: "boom", id: "turn-thrown",
+    }, "default", { dispatchAbortSignal: new AbortController().signal });
+
+    expect(texts.map((f) => f.text)).toEqual([
+      "Sorry — something went wrong while answering. Please try again.",
+    ]);
+  });
+});

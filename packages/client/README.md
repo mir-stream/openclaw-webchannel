@@ -331,3 +331,18 @@ npm run build
 npm run typecheck
 npm test
 ```
+
+### Interrupted requests (protocol 5)
+
+`ChatBubble.requestState` is server-authoritative and survives history hydration:
+`queued`, `started`, `completed`, `failed`, `interrupted`, or `cancelled`. Transport
+`sendState: "accepted"` only means acceptance. An own receipt can also become
+`interrupted`; this is an unknown result, not an ordinary retry-safe failure.
+
+Show **Interrupted · result unknown** with any retained output. A deliberate
+`client.retryInterrupted(message.id)` creates a new execution with fresh wire and
+logical IDs and `retry_of` provenance. The interrupted original remains visible.
+The method refuses completed, cancelled, missing and non-user messages. Ordinary
+transport retransmission uses the original IDs and never becomes this action.
+The demo and reference app expose a Retry button with a reminder to check effects.
+Deploy client and plugin together; protocol 5 is required on both.
