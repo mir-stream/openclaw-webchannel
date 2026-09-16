@@ -1853,8 +1853,20 @@ export async function handleInboundMessage(
     // `/stop` already cancelled moves none. Withholding `turn_settled` for that
     // is a regression: the frame is what every OTHER device's `isTyping` waits
     // on in the pre-first-token window, and nothing re-sends it. Eligibility
-    // alone decides the frame, exactly as it did before durable dispatch.
-    options?.onSettled?.(settlementEligible ? turnOutcome : "error");
+    // alone decides the frame, exactly as it did before durable dispatch —
+    // including when the store THROWS. A SQLite fault at this exact instant
+    // would otherwise escape from inside this `finally`, skipping the block
+    // below entirely (and masking any in-flight error on its way into the
+    // dispatcher's `.catch`), so the one promise this comment makes would be
+    // broken by the one failure mode it exists for. The outcome is already
+    // decided; this call only records it.
+    try {
+      options?.onSettled?.(settlementEligible ? turnOutcome : "error");
+    } catch (error) {
+      api.logger?.warn?.(
+        `webchannel: durable settle failed for peer=${logSafe(wsKey)} turn=${logSafe(turnId)} error=${logSafe(error)}`,
+      );
+    }
     if (settlementEligible) {
       // #99: this turn may be the merge of N buffered user messages (P1-8b layer
       // (b) coalescing). Each of them was ACKed and holds its own P0-4 receipt,

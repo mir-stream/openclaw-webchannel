@@ -121,10 +121,23 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
       if (state === "completed" || state === "failed") sql("DELETE FROM journal_dispatch_core WHERE batch=?").run(batch);
       return changes;
     }),
-    recoverInterrupted: (owner) => runSqliteImmediateTransactionSync(db, () => {
-      checkOwner(owner);
-      return transition(sql("SELECT * FROM journal_dispatch WHERE state='started' AND owner<>? ORDER BY peer_id,user_seq LIMIT 32").all(owner) as Stored[], "interrupted");
-    }),
+    recoverInterrupted: (owner) => {
+      // LOCK-FREE FIRST. The recovery tick calls this every 100 ms per account
+      // and the answer is "nothing" in every tick but the first after a
+      // restart. BEGIN IMMEDIATE takes the write lock, so while anything else
+      // holds it — an operator `sqlite3` session with an open transaction, a
+      // locking backup — each tick blocked the gateway's event loop for the
+      // whole busy timeout. This read takes no lock and cannot see a row this
+      // owner must act on and miss it: a row only ENTERS `started` under
+      // another owner by a write that happened before this read.
+      if (!sql("SELECT 1 FROM journal_dispatch WHERE state='started' AND owner<>? LIMIT 1").get(owner)) return [];
+      // Found work ⇒ the transaction is worth its lock, and it re-reads inside
+      // it: the read above is a filter, never the authority.
+      return runSqliteImmediateTransactionSync(db, () => {
+        checkOwner(owner);
+        return transition(sql("SELECT * FROM journal_dispatch WHERE state='started' AND owner<>? ORDER BY peer_id,user_seq LIMIT 32").all(owner) as Stored[], "interrupted");
+      });
+    },
     cancel: (owner, peer) => runSqliteImmediateTransactionSync(db, () => {
       checkOwner(owner);
       return transition(sql("SELECT * FROM journal_dispatch WHERE peer_id=? AND state IN ('queued','started') ORDER BY user_seq LIMIT 32").all(peer) as Stored[], "cancelled");

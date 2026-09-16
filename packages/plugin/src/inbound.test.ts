@@ -3816,6 +3816,28 @@ describe("durable dispatch hooks (#369)", () => {
     expect(settleFrames).toEqual([{ turnId: "turn-unstored", outcome: "ok" }]);
   });
 
+  it("emits turn_settled even when the durable settle THROWS, and says so once", async () => {
+    const { api, warnings } = makeFakeApi({ streamingMode: "off", runImpl: async (turn) => {
+      await turn.delivery.deliver({ text: "answered" }, { kind: "final" });
+    } });
+    const { transport, settleFrames } = makeFakeTransport();
+
+    // A store fault at the settle instant. Unguarded it escapes from inside the
+    // `finally`, so the settle block below it never runs and no device is ever
+    // told this turn ended — the one failure mode the frame matters most for.
+    await expect(handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message", text: "hi", id: "turn-throwing-settle",
+    }, "default", { onSettled: () => { throw new Error("injected settle fault"); } })).resolves.toBeUndefined();
+
+    expect(settleFrames).toEqual([{ turnId: "turn-throwing-settle", outcome: "ok" }]);
+    // Exactly one line, naming the peer, the turn and the fault — filtered
+    // rather than compared whole, because the #113 reasoning diagnostic is a
+    // once-per-process latch whose firing depends on test order in this file.
+    expect(warnings.filter((w) => w.includes("durable settle failed"))).toEqual([
+      'webchannel: durable settle failed for peer="peer-1" turn="turn-throwing-settle" error="Error: injected settle fault"',
+    ]);
+  });
+
   it.each(["off", "progress"] as const)("delivers no apology when /stop aborted the dispatch before core admitted it (%s)", async (streamingMode) => {
     const { api, warnings } = makeFakeApi({ streamingMode, runImpl: async () => {
       // Core throws the abort reason when the dispatch signal fires between the

@@ -27,6 +27,12 @@ all actual queued batch members before calling the handler. Cancellation exclude
 members before merging, and batch completion updates every member. An account
 replacement invalidates old starts, aborts active core calls, and refuses stale
 channel output. Queue teardown retains durable queued work for the replacement.
+A browser **unregister** or peer eviction is the same kind of teardown: it clears
+only the in-memory dispatcher and session key, so rows already accepted stay
+`queued` and the recovery pump runs them — the peer's stable key is reloaded from
+the key store, and the missing-key case below applies unchanged. Their output is
+journaled, and the device sees it on its next history load. On base, pending
+buffered input was dropped on unregister; accepted work now always runs.
 The recovery pump admits at most 32 rows per page through the existing bounded
 dispatcher and continues without a browser retry. It restores an existing exact
 peer key for outbound delivery only; browser inbound still requires registration.
@@ -51,8 +57,11 @@ Newly active runs and unrelated session keys remain outside that predicate.
 The pinned SDK can turn read/JSON errors into empty results. A strict backing-file
 read and a consistency check therefore precede trusting its answer. Storage faults
 keep the service's startup promise pending; even a throwing diagnostic cannot
-release that barrier. New plugin dispatch waits for this service. The service also
-writes interrupted status in the plugin journal when transport startup fails.
+release that barrier. New plugin dispatch waits for this service. When transport
+startup fails it also writes interrupted status in the plugin journal — but only
+for batches that reached `beforeCore` and therefore have a core binding. A started
+batch that never reached core has no binding for this service to find and stays
+`started` until the account runtime's own recovery pump marks it interrupted.
 
 **The hold is deliberately wider than WebChannel.** Core awaits each plugin
 service in sequence and schedules its own restart recovery only after that loop

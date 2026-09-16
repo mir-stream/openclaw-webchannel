@@ -272,7 +272,16 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // and its ONE interpolation (12→13), `logSafe(err)`. Same value and same
   // wrapping as the `inbound dispatch failed` line it stands beside, so this
   // file's KNOWN_RAW list above is unchanged.
-  "inbound.ts": { statements: 8, interpolations: 13 },
+  //
+  // Round 2 adds ONE more — the guarded durable-settle warn that keeps a
+  // THROWING `onSettled` from suppressing `turn_settled` (8→9) and its THREE
+  // interpolations (13→16), `wsKey`, `turnId` and the caught `error`, all
+  // `logSafe`-wrapped. It is written in the `peer=… turn=… error=…` logfmt
+  // shape rather than with a trailing `: ${…}`, because EVASION 17 below
+  // rejects punctuation directly after a quoted value — that adjacency is what
+  // makes the emitted record undecodable, so the shape is the fix and there is
+  // no baseline entry to add.
+  "inbound.ts": { statements: 9, interpolations: 16 },
   // #239 half 3 adds the two delivery-journal warnings (13→15) and their six
   // interpolations (7→13): `peerId` twice, plus `reason`/`action` on the gap
   // line and `journalable.length`/`journalFailureDiagnostic(error)` on the
