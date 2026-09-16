@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync, readdirSync, statSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { readFileSync, statSync } from "node:fs";
 import { resolveStorePath, type OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
 import { getSessionEntry, updateSessionStoreEntry, type SessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 import { openDeliveryJournal, type DeliveryJournal } from "./delivery-journal.js";
-import { defaultStorageRoot, DELIVERY_JOURNAL_FILE_NAME } from "./storage-paths.js";
+import { planAccounts } from "./multiplex.js";
+import { tupleStoragePaths } from "./storage-paths.js";
 import type { CoreDispatchBinding } from "./dispatch-store.js";
 import { logSafe } from "./log-safe.js";
 
@@ -43,50 +43,56 @@ export function prepareCoreDispatch(cfg: OpenClawConfig, agentId: string, sessio
   journal.dispatch!.bindCore(binding);
 }
 
-function configuredRoots(cfg: OpenClawConfig): string[] {
-  const channel = cfg.channels?.webchannel as { storageRoot?: unknown; accounts?: Record<string, { storageRoot?: unknown }> } | undefined;
-  return [...new Set([defaultStorageRoot(), channel?.storageRoot, ...Object.values(channel?.accounts ?? {}).map(a => a.storageRoot)].filter((v): v is string => typeof v === "string" && isAbsolute(v) && !v.includes("\0")))];
-}
-
-/** Discover expected associations from our journal even if the SDK reports an empty store. */
-export async function retireInterruptedCoreDispatches(cfg: OpenClawConfig, roots = configuredRoots(cfg)): Promise<void> {
-  for (const root of roots) {
-    let dirs: import("node:fs").Dirent[];
-    try { dirs = readdirSync(root, { withFileTypes: true }); }
+/** Discover expected associations from our journal even if the SDK reports an empty store.
+ *
+ * ⚠️ ONLY THE JOURNALS OF THE ACCOUNTS THIS PROCESS SERVES. Scanning every
+ * `v2_*` directory under the storage roots opened OTHER processes' journals:
+ * two gateways sharing one HOME (a multi-profile host) serve different accounts
+ * out of the same default root, and process B would read process A's bindings,
+ * find `owns(binding.owner)` true in A's own journal, and mark A's LIVE batch
+ * interrupted while retiring its binding. It also opened — and mutated — the
+ * stale journals of accounts that have since been removed from the config.
+ * `planAccounts` is the same pure, config-only plan the runtime serves from, so
+ * this service can only ever touch what this process owns.
+ */
+export async function retireInterruptedCoreDispatches(cfg: OpenClawConfig): Promise<void> {
+  for (const account of planAccounts(cfg, { warn: () => {} })) {
+    const path = tupleStoragePaths({
+      tenant: account.tenant,
+      accountId: account.accountId,
+      ...(account.storageRoot ? { storageRoot: account.storageRoot } : {}),
+    }).deliveryJournalPath;
+    // An account that has never accepted work has no journal file, and opening
+    // one would create it.
+    try { statSync(path); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
-    for (const dir of dirs) {
-      if (!dir.name.startsWith("v2_") || (!dir.isDirectory() && !(dir.isSymbolicLink() && statSync(join(root, dir.name)).isDirectory()))) continue;
-      const path = join(root, dir.name, DELIVERY_JOURNAL_FILE_NAME);
-      try { statSync(path); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
-      const journal = openDeliveryJournal({ databasePath: path });
-      try {
-        for (;;) {
-          const bindings = journal.dispatch!.coreBindings();
-          let progressed = false;
-          for (const binding of bindings) {
-            if (binding.processId === state.processId) continue;
-            const entry = verifiedCoreEntry(binding.storePath, binding.sessionKey);
-            // Core marks previous-process orphaned work before plugin services.
-            // A current-process active run clears abortedLastRun and is excluded.
-            if (entry?.status === "running" && entry.abortedLastRun === true) {
-              await updateSessionStoreEntry({ storePath: binding.storePath, sessionKey: binding.sessionKey, requireWriteSuccess: true, update: current => {
-                // Recheck the complete entry under the SDK's writer lock. A
-                // reset, new run, or background update requires a fresh read.
-                if (JSON.stringify(current) !== JSON.stringify(entry)) throw new Error("webchannel: core retirement entry changed");
-                return { status: "failed", abortedLastRun: true, endedAt: Date.now(), pendingFinalDelivery: undefined, pendingFinalDeliveryText: undefined, pendingFinalDeliveryContext: undefined, pendingFinalDeliveryIntentId: undefined, restartRecoveryDeliveryContext: undefined, restartRecoveryDeliveryRunId: undefined };
-              } });
-              const after = verifiedCoreEntry(binding.storePath, binding.sessionKey);
-              if (after?.status === "running" && after.abortedLastRun === true) throw new Error("webchannel: core retirement was not persisted");
-            }
-            if (journal.dispatch!.owns(binding.owner)) journal.dispatch!.settle(binding.owner, binding.peerId, binding.batch, "interrupted");
-            journal.dispatch!.retireCore(binding.batch);
-            progressed = true;
+    const journal = openDeliveryJournal({ databasePath: path });
+    try {
+      for (;;) {
+        const bindings = journal.dispatch!.coreBindings();
+        let progressed = false;
+        for (const binding of bindings) {
+          if (binding.processId === state.processId) continue;
+          const entry = verifiedCoreEntry(binding.storePath, binding.sessionKey);
+          // Core marks previous-process orphaned work before plugin services.
+          // A current-process active run clears abortedLastRun and is excluded.
+          if (entry?.status === "running" && entry.abortedLastRun === true) {
+            await updateSessionStoreEntry({ storePath: binding.storePath, sessionKey: binding.sessionKey, requireWriteSuccess: true, update: current => {
+              // Recheck the complete entry under the SDK's writer lock. A
+              // reset, new run, or background update requires a fresh read.
+              if (JSON.stringify(current) !== JSON.stringify(entry)) throw new Error("webchannel: core retirement entry changed");
+              return { status: "failed", abortedLastRun: true, endedAt: Date.now(), pendingFinalDelivery: undefined, pendingFinalDeliveryText: undefined, pendingFinalDeliveryContext: undefined, pendingFinalDeliveryIntentId: undefined, restartRecoveryDeliveryContext: undefined, restartRecoveryDeliveryRunId: undefined };
+            } });
+            const after = verifiedCoreEntry(binding.storePath, binding.sessionKey);
+            if (after?.status === "running" && after.abortedLastRun === true) throw new Error("webchannel: core retirement was not persisted");
           }
-          if (!progressed || bindings.length < 32) break;
+          if (journal.dispatch!.owns(binding.owner)) journal.dispatch!.settle(binding.owner, binding.peerId, binding.batch, "interrupted");
+          journal.dispatch!.retireCore(binding.batch);
+          progressed = true;
         }
-      } finally { journal.close(); }
-    }
+        if (!progressed || bindings.length < 32) break;
+      }
+    } finally { journal.close(); }
   }
 }
 

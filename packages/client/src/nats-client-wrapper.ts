@@ -4296,6 +4296,18 @@ export class WebChannelNATSClient {
         this.applyDurable(event, local);
         return;
       }
+      case "requestState": {
+        // A catch-up consumes a lifecycle row exactly like `history` and the
+        // live `request_state` frame do. `applyDurable` alone only paints the
+        // row: the receipt promotion, the buffered-progress retirement and the
+        // turn closure all live in `reconcileRequestStates`, so without this the
+        // send stays `accepted` and the turn stays open until the next history
+        // load — for the interrupted case, exactly the state the user is being
+        // asked to act on.
+        this.applyDurable(event);
+        this.reconcileRequestStates();
+        return;
+      }
       case "user": {
         // #337 — a LOST ack leaves the optimistic user bubble un-adopted at its
         // local id (`adoptCommittedIds` runs only on the ack). The turn's first

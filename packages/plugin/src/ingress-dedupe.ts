@@ -129,7 +129,7 @@ export const MAX_CANCELLED_INBOUND_FALLBACK_BYTES = 256 * 1024;
  * Both fields share the one `MAX_INGRESS_DEDUPE_ID_LENGTH` bound and the
  * `${peerId}:<key>` namespacing.
  */
-function usableId(value: unknown): value is string {
+export function usableId(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= MAX_INGRESS_DEDUPE_ID_LENGTH;
 }
 export type IngressIdentity = {
@@ -1292,11 +1292,26 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               // Synchronous and in arrival order, because `seq` order is the
               // stream's order and the stream's order IS the identity model
               // (doc §16.5.3). No batching, no deferral.
-              const { messageId, seq, inserted } = durableBatch?.[dispatchIndex++] ?? deps.deliveryJournal.appendInboundUser(peerId, {
+              // The dispatch store VALIDATES `retry_of` and returns what it
+              // actually stored, so the echo, the broadcast and history all
+              // carry the same provenance the journal row does — never the
+              // requested one. An invalid `retry_of` comes back absent.
+              const durable = durableBatch?.[dispatchIndex++];
+              const { messageId, seq, inserted } = durable ?? deps.deliveryJournal.appendInboundUser(peerId, {
                 text: pending.text,
                 turnId: pending.wireId,
                 ...(pending.randomId !== undefined ? { randomId: pending.randomId } : {}),
               });
+              // `inserted` only: this is a FRESH admission's stored provenance.
+              // A dedupe retry echoes the first admission's row, and a
+              // historical row has no dispatch lifecycle at all — neither says
+              // anything about this frame's `retry_of`.
+              if (pending.retryOf !== undefined && durable?.inserted === true && durable.retryOf === undefined) {
+                logInfo?.(
+                  "webchannel: inbound retry provenance dropped; running as an ordinary send " +
+                    `peer=${logSafe(peerId)} reason=retry_of-is-not-an-interrupted-request`,
+                );
+              }
               // The echo is keyed by `random_id`, so it exists only for a
               // conforming client. An older client is still journaled (under a
               // server id) and acked; it simply carries no `committed` entry.
@@ -1336,7 +1351,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
                   text: pending.text,
                   turnId: pending.wireId,
                   seq,
-                  ...(durableBatch ? { requestState: "queued" as const, ...(pending.retryOf ? { retryOf: pending.retryOf } : {}) } : {}),
+                  ...(durableBatch ? { requestState: "queued" as const, ...(durable?.retryOf ? { retryOf: durable.retryOf } : {}) } : {}),
                   ...(pending.randomId !== undefined ? { random_id: pending.randomId } : {}),
                 });
               }

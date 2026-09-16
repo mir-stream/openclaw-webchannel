@@ -1638,7 +1638,19 @@ export async function handleInboundMessage(
     await draft?.drain();
   } catch (err) {
     turnOutcome = "error";
-    api.logger.error?.(`webchannel: inbound dispatch failed: ${logSafe(err)}`);
+    // A CANCELLED dispatch is not a failure to apologize for. `/stop` between
+    // the claim and core's admission (or the `onTurnAdopted` refusal above)
+    // makes core throw the abort reason, and the user has already been told
+    // what they asked for: an apology bubble here is a durable, journaled
+    // "something went wrong" for a turn the user themselves stopped. The
+    // outcome stays `error` and the drain still runs — only the bubble and the
+    // severity change.
+    const dispatchAborted = options?.dispatchAbortSignal?.aborted === true;
+    if (dispatchAborted) {
+      api.logger.info?.(`webchannel: inbound dispatch was cancelled before core admission: ${logSafe(err)}`);
+    } else {
+      api.logger.error?.(`webchannel: inbound dispatch failed: ${logSafe(err)}`);
+    }
     // Surface a thrown turn independently before terminal cleanup. That gives
     // the apology the first claim attempt on an ownerless tool preview without
     // replacing any assistant lane that already streamed real text. A turn
@@ -1646,7 +1658,7 @@ export async function handleInboundMessage(
     // below remains its idempotent terminal cleanup.
     if (draft) {
       try {
-        if (!finalReplyDelivered) {
+        if (!finalReplyDelivered && !dispatchAborted) {
           await draft.deliverIndependentFinal({
             text: "Sorry — something went wrong while answering. Please try again.",
           });
@@ -1657,7 +1669,7 @@ export async function handleInboundMessage(
           `webchannel: draft error-drain failed: ${logSafe(drainErr)}`,
         );
       }
-    } else if (!controlLane && !finalReplyDelivered) {
+    } else if (!controlLane && !finalReplyDelivered && !dispatchAborted) {
       // #238: mint at the delivery act here too — the apology is a real durable
       // bubble on the client, so the plugin (not the viewer) names it.
       let sent = false;
@@ -1836,8 +1848,14 @@ export async function handleInboundMessage(
       );
     }
 
-    const settlementStored = options?.onSettled?.(settlementEligible ? turnOutcome : "error") ?? true;
-    if (settlementEligible && settlementStored) {
+    // ⚠️ THE DURABLE WRITE IS NOT A GATE ON THE FRAME. `onSettled` persists this
+    // batch's dispatch outcome and reports whether it moved any row; a batch
+    // `/stop` already cancelled moves none. Withholding `turn_settled` for that
+    // is a regression: the frame is what every OTHER device's `isTyping` waits
+    // on in the pre-first-token window, and nothing re-sends it. Eligibility
+    // alone decides the frame, exactly as it did before durable dispatch.
+    options?.onSettled?.(settlementEligible ? turnOutcome : "error");
+    if (settlementEligible) {
       // #99: this turn may be the merge of N buffered user messages (P1-8b layer
       // (b) coalescing). Each of them was ACKed and holds its own P0-4 receipt,
       // and only a `turn_settled` naming that exact wireId can move it off

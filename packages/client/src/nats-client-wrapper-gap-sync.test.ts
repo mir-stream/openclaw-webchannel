@@ -2248,3 +2248,42 @@ describe("#246 half A — a refused seq-bearing frame must not advance the curso
     }
   });
 });
+
+describe("#369 — a catch-up consumes requestState the way live does", () => {
+  it("moves an own accepted send to interrupted when the difference carries its lifecycle row", () => {
+    const wrapper = newWrapper();
+    const w = wrapper as unknown as Internals;
+    try {
+      seed(w, 0);
+      const receipt = wrapper.send("check the transfer")!;
+      const randomId = [...w.randomIdToReceiptKey.keys()][0]!;
+      const wireId = (w.state.messages[0] as { wireId: string }).wireId;
+      // The plugin's committed broadcast adopts the optimistic bubble onto the
+      // server row and opens its lifecycle at `queued` (seq 1).
+      w.handleMessage({
+        type: "user_committed", id: "webchannel-user-1", text: "check the transfer",
+        turnId: wireId, random_id: randomId, seq: 1, requestState: "queued",
+      } as unknown as InboundMessage);
+      expect(userIds(w)).toEqual(["webchannel-user-1"]);
+
+      // A missed seq-2 frame: the turn's next frame opens the gap, and the
+      // catch-up is where the `interrupted` row now arrives.
+      w.handleMessage({ type: "agent_message", id: "a3", text: "partial", turnId: wireId, seq: 3 });
+      expect(isCatchingUp(w)).toBe(true);
+      w.handleMessage(reply(w, [{
+        seq: 2,
+        event: { kind: "requestState", id: "webchannel-user-1", state: "interrupted" },
+      }], { maxSeq: 3 }));
+
+      // Reconciled, not merely painted: without it the send sits at its
+      // pre-difference state until some later history load.
+      const row = w.state.messages.find((m) => m.role === "user") as Record<string, unknown>;
+      expect(row.requestState).toBe("interrupted");
+      expect(row.sendState).toBe("interrupted");
+      expect(receipt.snapshot().state).toBe("interrupted");
+      expect(cursorLast(w)).toBe(3);
+    } finally {
+      wrapper.close();
+    }
+  });
+});

@@ -7,8 +7,10 @@ unstarted work; started requests without confirmed completion become durable
 app's Retry action creates a new logical send linked to the original. Explicit
 cancellation and completed work do not auto-run again. An awaited startup service
 retires only restart-aborted core work at explicitly recorded WebChannel session
-keys, even when account transport startup fails. Core session resets remain
-available. Historical rows without lifecycle metadata are never replayed or
+keys, even when account transport startup fails; on a persistent storage or
+account-planning fault it deliberately holds core's remaining plugin-service
+startup (and every channel's restart recovery) rather than let core re-run
+interrupted work. Core session resets remain available. Historical rows without lifecycle metadata are never replayed or
 assigned invented statuses. Client/plugin protocol 5 requires lockstep rollout.
 See [dispatch recovery and upgrade boundaries](DISPATCH_RECOVERY.md).
 

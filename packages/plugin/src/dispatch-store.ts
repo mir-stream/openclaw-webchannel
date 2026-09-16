@@ -10,7 +10,8 @@ export type DispatchRow = {
 };
 export type DispatchChange = { peerId: string; id: string; turnId: string; state: RequestState; seq: number };
 export type CoreDispatchBinding = { processId: string; agentId: string; sessionKey: string; storePath: string; owner: string; batch: string; peerId: string };
-export type UserCommit = { messageId: string; seq: number; inserted: boolean };
+/** `retryOf` is the VALIDATED provenance actually stored, never the requested one. */
+export type UserCommit = { messageId: string; seq: number; inserted: boolean; retryOf?: string };
 export interface DispatchStore {
   bindCore(binding: CoreDispatchBinding): void;
   coreBindings(): CoreDispatchBinding[];
@@ -77,17 +78,24 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
       return inputs.map((input) => {
         const key = input.randomId ?? input.turnId;
         const existing = lookup(peer, key);
-        if (existing) return { messageId: existing.messageId, seq: existing.seq, inserted: false };
-        // Provenance can only name an interrupted request in this exact conversation.
-        if (input.retryOf !== undefined) {
-          const original = sql("SELECT state FROM journal_dispatch WHERE peer_id=? AND message_id=?").get(peer, input.retryOf) as { state: RequestState } | undefined;
-          if (original?.state !== "interrupted") throw new Error("webchannel: retry requires an interrupted request");
-        }
-        const row = appendUser(peer, { ...input, requestState: "queued" });
+        // A retransmission echoes the provenance of the row it already has, not
+        // the one it just asked for again.
+        if (existing) return { messageId: existing.messageId, seq: existing.seq, inserted: false, ...(existing.input.retryOf ? { retryOf: existing.input.retryOf } : {}) };
+        // Provenance can only name an interrupted request in this exact
+        // conversation. An unknown or ineligible `retry_of` is DROPPED, never
+        // thrown: accept() runs inside the ingress journal-append transaction,
+        // so a throw would roll the whole flush batch back — no ack, no
+        // rejection, co-flushed legitimate messages lost, and the client
+        // retransmitting that frame until its ledger evicts it. The message is
+        // an ordinary send instead, and every surface reads the stored value.
+        const original = input.retryOf === undefined ? undefined
+          : sql("SELECT state FROM journal_dispatch WHERE peer_id=? AND message_id=?").get(peer, input.retryOf) as { state: RequestState } | undefined;
+        const accepted: DispatchInput = original?.state === "interrupted" ? input : { ...input, retryOf: undefined };
+        const row = appendUser(peer, { ...accepted, requestState: "queued" });
         // An existing historical user row cannot prove it was never started.
         if (!row.inserted) return row;
-        sql("INSERT INTO journal_dispatch VALUES(?,?,?,?,?,'queued',NULL,NULL)").run(peer, key, row.messageId, row.seq, JSON.stringify(input));
-        return row;
+        sql("INSERT INTO journal_dispatch VALUES(?,?,?,?,?,'queued',NULL,NULL)").run(peer, key, row.messageId, row.seq, JSON.stringify(accepted));
+        return accepted.retryOf === undefined ? row : { ...row, retryOf: accepted.retryOf };
       });
     }),
     lookup,

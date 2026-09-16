@@ -1,9 +1,14 @@
 import type { DispatchChange, DispatchInput, DispatchRow, DispatchStore } from "./dispatch-store.js";
+import { usableId } from "./ingress-dedupe.js";
 import { coalesceUserMessages, createSerializedInboundDispatcher, type BatchOffer, type DispatcherBatchLease, type SerializedInboundDispatcher, type SerializedInboundDispatcherOptions, type UserMessageLike, type CoalescedMemberIds } from "./inbound-queue.js";
 
 type DispatchMember = { key: string } | { legacy: UserMessageLike; token: { active: boolean } };
 type Message = UserMessageLike & CoalescedMemberIds & { dispatchKeys?: readonly string[]; dispatchMembers?: readonly DispatchMember[] };
-const keyFor = (m: Message) => m.random_id ?? m.id;
+/** Exactly `ingressIdentity`: no usable wire id means no key, so no dispatch row
+ * is ever accepted for it and this wrapper must run it as a legacy member. Keying
+ * it by `random_id` alone would track a member whose `claim` finds nothing, and
+ * the message would be silently dropped after its batch committed. */
+const keyFor = (m: Message) => usableId(m.id) ? (usableId(m.random_id) ? m.random_id : m.id) : undefined;
 const messageFor = (row: DispatchRow): Message => ({ type: "user_message", text: row.input.text, id: row.input.turnId, ...(row.input.randomId ? { random_id: row.input.randomId } : {}), ...(row.input.retryOf ? { retry_of: row.input.retryOf } : {}), dispatchKeys: [row.key] });
 
 /** One runtime owns bounded offers; SQLite owns accepted work across runtimes. */

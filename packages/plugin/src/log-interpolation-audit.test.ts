@@ -266,7 +266,13 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // timed-out read, the not-delivered send, and the empty-projection skip —
   // 4+2+3 interpolations), restoring this to 6/12 now that the plugin emits the
   // corrected [A][B] sequence directly and no resync read exists to narrate.
-  "inbound.ts": { statements: 7, interpolations: 12 },
+  //
+  // #369 adds ONE — the cancelled-before-core-admission info line that replaces
+  // the apology's `error` for a dispatch the user's own `/stop` aborted (7→8)
+  // and its ONE interpolation (12→13), `logSafe(err)`. Same value and same
+  // wrapping as the `inbound dispatch failed` line it stands beside, so this
+  // file's KNOWN_RAW list above is unchanged.
+  "inbound.ts": { statements: 8, interpolations: 13 },
   // #239 half 3 adds the two delivery-journal warnings (13→15) and their six
   // interpolations (7→13): `peerId` twice, plus `reason`/`action` on the gap
   // line and `journalable.length`/`journalFailureDiagnostic(error)` on the
@@ -281,7 +287,13 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // `usableId` before it ever reaches the log, but the wrapping is what makes it
   // safe, not the bound. It was spelled `random_id=` until round 3 widened the
   // journal lookup to cover clients that send no `random_id`.)
-  "ingress-dedupe.ts": { statements: 17, interpolations: 15 },
+  //
+  // #369 adds ONE more — the `retry provenance dropped` info line the accept
+  // seam emits when the dispatch store refuses to record a `retry_of` that does
+  // not name an interrupted request (17→18) and its ONE interpolation (16),
+  // `peerId`, which is peer-controlled and `logSafe`-wrapped. KNOWN_RAW is
+  // unchanged for the same reason #344's line left it unchanged.
+  "ingress-dedupe.ts": { statements: 18, interpolations: 16 },
   "approvals.ts": { statements: 9, interpolations: 24 },
   // #240 half 2 rewired both history read sites onto the delivery journal, then
   // review round 1 EXTRACTED both into `history-serve.ts`. 23→19 statements,

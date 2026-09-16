@@ -136,6 +136,34 @@ it("intentional retry is a new request with provenance; original transport repla
   await h.flush([message("B")]); expect(h.runs).toHaveLength(2);
 });
 
+it("an invalid retry_of is dropped, never thrown: the batch runs and carries no provenance", async () => {
+  const h = open();
+  await h.flush([message("B")]); await new Promise(setImmediate);
+  const completed = h.journal.dispatch!.lookup("RawPeer", "logical-B")!;
+  expect(completed.state).toBe("completed");
+  const retry = message("R");
+  await h.flush([message("X"), { ...retry, message: { ...retry.message, retry_of: completed.messageId } }]);
+  // Both ran — the invalid provenance cost neither message its turn, and the
+  // whole batch was still acked in one flush.
+  expect(h.runs.map(m => m.text)).toEqual(["B", "X\n\nR"]);
+  expect(h.acks.at(-1)?.ids).toEqual(["X", "R"]);
+  const row = h.journal.dispatch!.lookup("RawPeer", "logical-R")!;
+  expect(row.input.retryOf).toBeUndefined();
+  expect(row.state).toBe("completed");
+  expect(h.journal.dispatch!.lookup("RawPeer", "logical-X")?.state).toBe("completed");
+  const rows = projectJournalHistory(h.journal.read, "RawPeer").messages;
+  expect(rows.find(m => m.id === row.messageId)).toMatchObject({ text: "R" });
+  expect(rows.some(m => "retryOf" in m)).toBe(false);
+});
+
+it("keys a random_id-only frame the way ingress does: it runs as a legacy message", async () => {
+  const h = open();
+  await h.flush([{ peerId: "RawPeer", message: { type: "user_message", random_id: "x", text: "legacy" } }]);
+  expect(h.runs.map(m => m.text)).toEqual(["legacy"]);
+  expect(h.journal.dispatch!.peers()).toEqual([]);
+  expect(h.journal.dispatch!.lookup("RawPeer", "x")).toBeUndefined();
+});
+
 it("atomically rolls back user rows and recoverable payloads when a later batch insert fails", async () => {
   const h = open();
   const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
