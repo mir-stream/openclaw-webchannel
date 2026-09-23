@@ -427,6 +427,27 @@ describe("handleInboundMessage — control-lane authorization stamp", () => {
 });
 
 describe("handleInboundMessage — typing indicator gating", () => {
+  it("keeps core control identity stable across wire retries and isolated by tenant/account/peer", async () => {
+    const ids: unknown[] = [];
+    for (const [peer, account, tenant, wire] of [
+      ["peer", "default", "tenant", "wire-1"],
+      ["peer", "default", "tenant", "wire-2"],
+      ["peer", "default", "other-tenant", "wire-1"],
+      ["other-peer", "default", "tenant", "wire-1"],
+      ["peer", "other", "tenant", "wire-1"],
+    ]) {
+      const { api, captured } = makeFakeApi({ streamingMode: "off", runImpl: async () => {},
+        channelConfig: { accounts: { default: {}, other: {} } } });
+      const { transport } = makeFakeTransport();
+      await handleInboundMessageForServingTenant(api, transport, peer,
+        { ...userMessage, id: wire, random_id: "same-logical-stop" }, account, tenant, { controlLane: true });
+      expect(captured.buildContext?.messageId).toEqual(expect.any(String));
+      ids.push(captured.buildContext?.messageId);
+    }
+    expect(ids[0]).toBe(ids[1]);
+    expect(new Set(ids)).toHaveProperty("size", 4);
+  });
+
   it("sends a typing frame for an ordinary turn", async () => {
     const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
     const { transport, typing } = makeFakeTransport();

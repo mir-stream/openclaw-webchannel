@@ -39,6 +39,8 @@ export type BoundedInboundDebouncer<Item> = {
   /** Compatibility alias for the pinned SDK primitive's call sites. */
   enqueue(item: Item): Promise<BoundedDebouncePushResult>;
   cancelKey(key: string, options?: { notify?: boolean }): boolean;
+  /** Synchronous bounded snapshot; persist before invalidating this generation. */
+  retainedItems(key: string): readonly Item[];
   /** Retires all work; `inflight` includes callbacks that still physically retain entries. */
   dispose(): { waiting: number; inflight: number };
   /** Live physical entry/key ownership, including invalidated callbacks awaiting settlement. */
@@ -606,6 +608,7 @@ export function createBoundedInboundDebouncer<Item>(
     push,
     enqueue: async (item) => push(item),
     cancelKey,
+    retainedItems: (key) => [...new Set([...(inflightByKey.get(key) ?? []), ...(waiting.get(key)?.entries ?? [])])].map(entry => entry.item),
     dispose: () => {
       if (disposed) return { waiting: 0, inflight: runningCallbacks.size };
       disposed = true;

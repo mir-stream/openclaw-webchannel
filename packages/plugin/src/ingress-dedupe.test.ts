@@ -616,7 +616,7 @@ describe("recordCancelledInboundItems — P0-7b (/stop-cancelled buffered messag
     expect(acks).toEqual([]);
   });
 
-  it("fails open: a throwing checkAndRecord still acks (best-effort) and logs", async () => {
+  it("withholds ACK when cancellation persistence fails", async () => {
     const checkAndRecord = vi.fn(async () => {
       throw new Error("disk boom");
     });
@@ -629,8 +629,8 @@ describe("recordCancelledInboundItems — P0-7b (/stop-cancelled buffered messag
       (peerId, ids) => { acks.push({ peerId, ids }); return true; },
       log,
     );
-    // Record threw, but the ack still fires (drains the ledger) and a warn is logged.
-    expect(acks).toEqual([{ peerId: "p1", ids: ["idA"] }]);
+    // A memory-only result cannot settle the client's durable replay ledger.
+    expect(acks).toEqual([]);
     expect(log).toHaveBeenCalledTimes(1);
   });
 
@@ -1637,7 +1637,7 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
     expect(store.record).toHaveBeenNthCalledWith(2, "acct", "p:i", "cancelled", {
       replaceOthers: true,
     });
-    expect(sendAck).toHaveBeenCalledWith("p", ["i"]);
+    expect(sendAck).toHaveBeenCalledWith("p", ["i"], undefined, ["i"]);
   });
 });
 

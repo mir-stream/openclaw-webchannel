@@ -440,42 +440,21 @@ describe("index-nats.ts wiring contract — ingress dedupe onFlush (P0-7a)", () 
 });
 
 describe("index-nats.ts wiring contract — ingress ack (P0-7b)", () => {
-  it("wires sendAck into the onFlush factory, the debouncer onCancel, and the control-lane branch", () => {
+  it("wires normal receipts and atomic stop receipts into the account channel", () => {
     // The onFlush factory must be handed a sendAck so admitted (fresh + duplicate)
     // ids drain the client's replay ledger.
     // #243 half 2a: the factory's sendAck forwards `committed` (the server-id echo)
-    // through to the channel alongside the ids.
+    // through to the channel alongside the ids and durable cancellation proof.
     expect(RUNTIME_SOURCE).toMatch(
-      /sendAck:\s*\(peerId,\s*ids,\s*committed\)\s*=>\s*channel\.sendAck\(peerId,\s*ids,\s*committed\)/,
+      /sendAck:\s*\(peerId,\s*ids,\s*committed,\s*cancelled\)\s*=>\s*channel\.sendAck\(peerId,\s*ids,\s*committed,\s*cancelled\)/,
     );
-    // The debouncer's onCancel must record+ack /stop-cancelled buffered items via
-    // the tested helper (else a reconnect replays text the user aborted).
-    expect(RUNTIME_SOURCE).toMatch(/onCancel:/);
-    expect(RUNTIME_SOURCE).toMatch(/recordCancelledInboundItems\(/);
-    // ⭐ #344: that suppression must record `cancelled`, NEVER `accepted`. Both
-    // write a marker and no journal row, so while it was spelled `accepted` the
-    // accept seam could not tell a `/stop` from its own crash window and
-    // re-admitted killed text whenever this ack was lost. Pinned HERE because the
-    // outcome value is chosen at the wiring site, not inside the tested helper.
-    expect(RUNTIME_SOURCE).toMatch(
-      /processIngressOutcomes\.record\(\s*accountId,\s*key,\s*"cancelled",\s*\{\s*replaceOthers:\s*true,?\s*\},?\s*\)/,
-    );
-    // NOTE: deliberately NOT a negative pin on `"accepted"` at this call site.
-    // A `not.toMatch` there would false-fail the day some legitimate record
-    // appears in the same shape, and it proves nothing the positive pin above
-    // does not — `record()` takes ONE outcome, so matching `"cancelled"` at
-    // `(accountId, key, …)` already excludes any other value in that slot.
-    // The shared production callback helper selects the verdict; the runtime
-    // forwards its wire correlations to the account's channel.
-    expect(RUNTIME_SOURCE).toMatch(
-      /sendRejected:\s*\(peerId,\s*ids\)\s*=>\s*channel\.sendInboundRejected\(peerId,\s*ids\)/,
-    );
-    // The control-lane branch bypasses the debouncer/onFlush, so it acks its own
-    // id-carrying frame directly (else its ledger entry never drains).
-    expect(RUNTIME_SOURCE).toMatch(
-      /if\s*\(message\.id\s*&&\s*!channel\.sendAck\(peerId,\s*\[message\.id\]\)\)/,
-    );
-    expect(RUNTIME_SOURCE.match(/control-lane ack failed/g)).toHaveLength(1);
+    // Production control routing uses the same atomic coordinator as the
+    // behavioral SQLite/crash regressions, with the existing authorization gate.
+    expect(RUNTIME_SOURCE).toMatch(/stopControl = createStopControl<DebounceItem>\(/);
+    expect(RUNTIME_SOURCE).toMatch(/stopControl!\.handle\(\{ peerId, message \}, shouldDropBufferedInputOnStop\(message, commandGate, peerId\)\)/);
+    expect(RUNTIME_SOURCE).not.toContain("recordCancelledInboundItems");
+    expect(RUNTIME_SOURCE).toMatch(/await stopControl\?\.dispose\(\)/);
+
   });
 });
 
@@ -588,7 +567,7 @@ describe("nats-account-runtime.ts wiring contract — #99 inbound frame normaliz
     // everything and would let this ordering check pass vacuously.
     expect(NORMALIZE).toBeGreaterThan(HANDLER_START);
     expect(NORMALIZE).toBeLessThan(RUNTIME_SOURCE.indexOf("isControlLaneMessage(message)"));
-    expect(NORMALIZE).toBeLessThan(RUNTIME_SOURCE.indexOf("channel.sendAck(peerId, [message.id])"));
+    expect(NORMALIZE).toBeLessThan(RUNTIME_SOURCE.indexOf("stopControl!.handle({ peerId, message }"));
     expect(NORMALIZE).toBeLessThan(RUNTIME_SOURCE.indexOf(".enqueue({ peerId, message })"));
   });
 

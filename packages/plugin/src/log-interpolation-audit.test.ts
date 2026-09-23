@@ -281,7 +281,8 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // rejects punctuation directly after a quoted value — that adjacency is what
   // makes the emitted record undecodable, so the shape is the fix and there is
   // no baseline entry to add.
-  "inbound.ts": { statements: 9, interpolations: 16 },
+  // Stop ownership adds one constant pre-context retirement error.
+  "inbound.ts": { statements: 10, interpolations: 16 },
   // #239 half 3 adds the two delivery-journal warnings (13→15) and their six
   // interpolations (7→13): `peerId` twice, plus `reason`/`action` on the gap
   // line and `journalable.length`/`journalFailureDiagnostic(error)` on the
@@ -302,7 +303,8 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // not name an interrupted request (17→18) and its ONE interpolation (16),
   // `peerId`, which is peer-controlled and `logSafe`-wrapped. KNOWN_RAW is
   // unchanged for the same reason #344's line left it unchanged.
-  "ingress-dedupe.ts": { statements: 18, interpolations: 16 },
+  // Stop lookup failure adds one constant diagnostic before admission.
+  "ingress-dedupe.ts": { statements: 19, interpolations: 16 },
   "approvals.ts": { statements: 9, interpolations: 24 },
   // #240 half 2 rewired both history read sites onto the delivery journal, then
   // review round 1 EXTRACTED both into `history-serve.ts`. 23→19 statements,
@@ -336,7 +338,8 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // NO entry to `KNOWN_RAW` above — which is the whole point of checking both
   // numbers rather than just the floor: a raw value would have shown up there
   // instead, and the baseline is exact-multiset.
-  "nats-account-runtime.ts": { statements: 25, interpolations: 41 },
+  // Atomic stop coordination replaces the old callback/drop/ACK diagnostics.
+  "nats-account-runtime.ts": { statements: 21, interpolations: 35 },
   "auth.ts": { statements: 16, interpolations: 5 },
   // #244 half B added the `Invalid get_difference` guard warn (one statement,
   // one `logSafe(peerId)` interpolation): 22→23 statements, 33→34 interpolations.
