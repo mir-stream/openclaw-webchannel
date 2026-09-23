@@ -23,6 +23,9 @@ const EXPECTED: Record<string, InventoryEntry> = {
   "demo/chaos-nats.ts :: /bootstrap template": {
     count: 1, classification: "demo attack/replay harness consumer",
   },
+  "demo/saas-server-auth.test.ts :: /bootstrap literal": {
+    count: 1, classification: "negative logout test proving an invalidated session cannot bootstrap",
+  },
   "demo/saas-server.ts :: /bootstrap literal": {
     count: 1, classification: "deployable session-authorized scalar route",
   },
@@ -34,6 +37,12 @@ const EXPECTED: Record<string, InventoryEntry> = {
   },
   "demo/verify-evict.mjs :: /bootstrap template": {
     count: 1, classification: "demo signing-key eviction harness consumer",
+  },
+  "demo/web/src/app-session.dom.test.ts :: /bootstrap literal": {
+    count: 3, classification: "test-only mocked bootstrap response and account-switch/logout delay selectors",
+  },
+  "demo/web/src/widget-session.dom.test.ts :: /bootstrap literal": {
+    count: 3, classification: "test-only mocked bootstrap registration fixture and teardown/initial-mount cancellation selectors",
   },
   "demo/web/src/widget.ts :: /bootstrap literal": {
     count: 1, classification: "deployable demo single-lane consumer",
