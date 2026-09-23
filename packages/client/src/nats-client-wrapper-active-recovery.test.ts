@@ -41,7 +41,8 @@ async function setup(options: { timeout?: number; heartbeat?: number; recovery?:
   const pop = await generateDevicePopKeyPair();
   const key = new Uint8Array(32).fill(39);
   const registration = registerAgent(key, x.publicRaw, identity);
-  const control = { admitted: true, ack: true, registrations: 0, interrupted: false, settleBeforeAck: false };
+  const control = { admitted: true, ack: true, registrations: 0, interrupted: false, settleBeforeAck: false,
+    cancelled: new Set<string>() };
   const received: Array<Extract<OutboundMessage, { type: "user_message" }>> = [];
   const differences: Array<Extract<OutboundMessage, { type: "get_difference" }>> = [];
   const deliver = (frame: InboundMessage, server = FakeNatsWS.instances.at(-1)!) => {
@@ -69,7 +70,8 @@ async function setup(options: { timeout?: number; heartbeat?: number; recovery?:
     if (frame.type === "user_message") {
       received.push(frame);
       if (control.settleBeforeAck) deliver({ type: "turn_settled", turnId: frame.id }, server);
-      if (control.ack) deliver({ type: "ack", ids: [frame.id!] }, server);
+      if (control.ack) deliver({ type: "ack", ids: [frame.id!],
+        ...(control.cancelled.has(frame.id!) ? { cancelled: [frame.id!] } : {}) }, server);
     } else if (frame.type === "get_difference") {
       differences.push(frame);
       deliver({ type: "difference", afterSeq: frame.afterSeq, nonce: frame.nonce, maxSeq: 2, partial: false,
@@ -142,6 +144,26 @@ describe("accepted-turn application recovery", () => {
     h.deliver({ type: "turn_settled", turnId: h.received[0]!.id, outcome: "ok" });
     expect(receipt.snapshot().state).toBe("completed");
     expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+  });
+
+  it("consumes a lost cancellation ACK on replacement replay without watching an absent journal row", async () => {
+    const h = await setup({ timeout: 80, heartbeat: 5 });
+    h.control.ack = false;
+    const receipt = h.wrapper.send("cancelled before admission")!;
+    const id = h.received[0]!.id!;
+    expect(receipt.snapshot().state).toBe("sent");
+    // The durable cancellation survives, but its initial receipt was lost.
+    h.control.cancelled.add(id);
+    h.control.ack = true;
+    FakeNatsWS.instances.at(-1)!.close();
+    await settleUntil(() => receipt.snapshot().state === "accepted" && h.wrapper.getState().connected,
+      { label: "terminal cancellation ACK on replay" });
+    expect(h.received.map((frame) => frame.id)).toEqual([id, id]);
+    expect(inside(h.wrapper).applicationTurns.size).toBe(0);
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(h.control.registrations).toBe(2);
+    expect(receipt.snapshot().state).toBe("accepted");
   });
 
   it.each([
@@ -252,6 +274,183 @@ describe("accepted-turn application recovery", () => {
     expect(h.receipt.snapshot().state).toBe("accepted");
     vi.advanceTimersByTime(TIMEOUT);
     expect(h.request).toHaveBeenCalledTimes(1);
+  });
+
+  it("retires only the cancellation ACK's exact IDs while normal committed ACKs still adopt identity", async () => {
+    const h = await setup();
+    vi.useFakeTimers();
+    h.control.ack = false;
+    const first = h.wrapper.send("quiet admitted turn")!;
+    const cancelled = h.wrapper.send("cancelled debounce input")!;
+    const later = h.wrapper.send("later admitted turn")!;
+    const [a, b, c] = h.received;
+    h.deliver({ type: "ack", ids: [a!.id!, b!.id!, c!.id!], cancelled: [b!.id!],
+      committed: [{ random_id: a!.random_id!, messageId: "durable-A" }] });
+    expect([first, cancelled, later].map((receipt) => receipt.snapshot().state)).toEqual(["accepted", "accepted", "accepted"]);
+    expect([...inside(h.wrapper).applicationTurns.keys()]).toEqual([a!.id, c!.id]);
+    expect(h.wrapper.getState().messages[0].id).toBe("durable-A");
+    expect(h.wrapper.getState().turnActive).toBe(true);
+    // A foreign/duplicate cancellation proves nothing about either neighbor.
+    h.deliver({ type: "ack", ids: [b!.id!, "other-device"], cancelled: [b!.id!, "other-device"] });
+    expect([...inside(h.wrapper).applicationTurns.keys()]).toEqual([a!.id, c!.id]);
+    // Ordinary coalesced settlement retains its prefix semantics.
+    h.deliver({ type: "turn_settled", turnId: c!.id });
+    expect(inside(h.wrapper).applicationTurns.size).toBe(0);
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+  });
+
+  it.each([false, true])("retires a cancellation before acceptance fanout (already ACKed=%s)", async (alreadyAcked) => {
+    const h = await setup();
+    vi.useFakeTimers();
+    h.control.ack = alreadyAcked;
+    const receipt = h.wrapper.send("cancelled")!;
+    const id = h.received[0]!.id!;
+    let observed: { watched: boolean; active: boolean | undefined } | undefined;
+    receipt.subscribe(({ state }) => {
+      if (state === "accepted") {
+        observed = { watched: inside(h.wrapper).applicationTurns.has(id), active: h.wrapper.getState().turnActive };
+      }
+    });
+    const request = vi.spyOn(inside(h.wrapper).client, "requestApplicationRecovery").mockReturnValue(true);
+    h.deliver({ type: "ack", ids: [id], cancelled: [id] });
+    expect(observed).toEqual(alreadyAcked ? undefined : { watched: false, active: false });
+    expect(inside(h.wrapper).applicationTurns.size).toBe(0);
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+    vi.advanceTimersByTime(5 * TIMEOUT);
+    expect(request).not.toHaveBeenCalled();
+    expect(receipt.snapshot().state).toBe("accepted");
+  });
+
+  it("commits all cancellation facts before any ACK listener can run an older timer", async () => {
+    const h = await withClock();
+    h.control.ack = false;
+    const second = h.wrapper.send("second cancelled input")!;
+    const secondId = h.received[1]!.id!;
+    second.subscribe(({ state }) => {
+      if (state === "accepted") vi.advanceTimersByTime(TIMEOUT);
+    });
+    h.deliver({ type: "ack", ids: [secondId, h.turnId], cancelled: [secondId, h.turnId] });
+    expect(h.request).not.toHaveBeenCalled();
+    expect(inside(h.wrapper).applicationTurns.size).toBe(0);
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+  });
+
+  it("preserves a new accepted turn sent reentrantly by a cancelled input's receipt listener", async () => {
+    const h = await setup();
+    vi.useFakeTimers();
+    h.control.ack = false;
+    const receipt = h.wrapper.send("cancelled input")!;
+    const id = h.received[0]!.id!;
+    receipt.subscribe(({ state }) => {
+      if (state === "accepted") {
+        h.control.ack = true;
+        h.wrapper.send("new work");
+      }
+    });
+    h.deliver({ type: "ack", ids: [id], cancelled: [id] });
+    expect([...inside(h.wrapper).applicationTurns.keys()]).toEqual([h.received[1]!.id]);
+    expect(h.wrapper.getState().turnActive).toBe(true);
+    const request = vi.spyOn(inside(h.wrapper).client, "requestApplicationRecovery").mockReturnValue(true);
+    vi.advanceTimersByTime(TIMEOUT);
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancellation timer cleanup cannot retire new work created by that cleanup hook", async () => {
+    const h = await withClock();
+    const oldTimer = inside(h.wrapper).activeTurnStallTimer;
+    const clear = globalThis.clearTimeout;
+    let sent = false;
+    vi.spyOn(globalThis, "clearTimeout").mockImplementation((timer) => {
+      clear(timer);
+      if (timer === oldTimer && !sent) {
+        sent = true;
+        h.wrapper.send("replacement work");
+      }
+    });
+    h.deliver({ type: "ack", ids: [h.turnId], cancelled: [h.turnId] });
+    expect(sent).toBe(true);
+    expect([...inside(h.wrapper).applicationTurns.keys()]).toEqual([h.received[1]!.id]);
+    expect(h.wrapper.getState().turnActive).toBe(true);
+    vi.advanceTimersByTime(TIMEOUT);
+    expect(h.request).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["typing", "draft"] as const)("settles cancelled running %s UI when the ordinary settlement was lost", async (activity) => {
+    const h = await withClock();
+    h.deliver(activity === "typing" ? { type: "typing" }
+      : { type: "progress", id: "cancelled-draft", turnId: h.turnId, text: "partial" });
+    h.deliver({ type: "ack", ids: [h.turnId], cancelled: [h.turnId] });
+    expect(h.wrapper.getState()).toMatchObject({ turnActive: false, isTyping: false });
+    expect(h.wrapper.getState().messages.some((row) => row.working)).toBe(false);
+    expect(h.receipt.snapshot().state).toBe("accepted");
+    vi.advanceTimersByTime(5 * TIMEOUT);
+    expect(h.request).not.toHaveBeenCalled();
+    // A delayed copy cannot clear fresh unscoped activity from another device.
+    h.deliver({ type: "typing" });
+    h.deliver({ type: "ack", ids: [h.turnId], cancelled: [h.turnId] });
+    expect(h.wrapper.getState().isTyping).toBe(true);
+  });
+
+  it("cancelling B cannot clear unrelated A's typing, draft, or turn ownership", async () => {
+    const h = await withClock();
+    h.wrapper.send("B");
+    const b = h.received[1]!.id!;
+    h.deliver({ type: "progress", id: "draft-A", turnId: h.turnId, text: "A is working" });
+    h.deliver({ type: "progress", id: "draft-B", turnId: b, text: "B is working" });
+    h.deliver({ type: "typing" });
+    h.deliver({ type: "ack", ids: [b], cancelled: [b] });
+    expect(h.wrapper.getState()).toMatchObject({ turnActive: true, isTyping: true });
+    expect(h.wrapper.getState().messages.find((row) => row.id === "draft-A")?.working).toBe(true);
+    expect(h.wrapper.getState().messages.some((row) => row.id === "draft-B" && row.working)).toBe(false);
+    expect([...inside(h.wrapper).applicationTurns.keys()]).toEqual([h.turnId]);
+    vi.advanceTimersByTime(TIMEOUT);
+    expect(h.request).toHaveBeenCalledTimes(1);
+  });
+
+  it("a fresh cancellation ACK cannot clear typing received reentrantly after its proof", async () => {
+    const h = await setup();
+    vi.useFakeTimers();
+    h.control.ack = false;
+    const receipt = h.wrapper.send("cancelled input")!;
+    const id = h.received[0]!.id!;
+    h.deliver({ type: "typing" });
+    receipt.subscribe(({ state }) => {
+      if (state === "accepted") h.deliver({ type: "typing" });
+    });
+    h.deliver({ type: "ack", ids: [id], cancelled: [id] });
+    expect(h.wrapper.getState().isTyping).toBe(true);
+    expect(inside(h.wrapper).applicationTurns.size).toBe(0);
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+  });
+
+  it.each(["malformed", "not-subset"] as const)("rejects %s cancellation data before any receipt or watchdog effect", async (kind) => {
+    const h = await setup();
+    vi.useFakeTimers();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.control.ack = false;
+    const receipt = h.wrapper.send("must remain unacked")!;
+    const id = h.received[0]!.id!;
+    h.deliver({ type: "ack", ids: [id], cancelled: kind === "malformed" ? [1] : ["foreign"] } as InboundMessage);
+    expect(receipt.snapshot().state).toBe("sent");
+    expect(inside(h.wrapper).client.unackedLedger.has(id)).toBe(true);
+    expect(inside(h.wrapper).applicationTurns.has(id)).toBe(true);
+    h.deliver({ type: "ack", ids: [id] });
+    expect(receipt.snapshot().state).toBe("accepted");
+    expect(inside(h.wrapper).activeTurnStallTimer).not.toBeNull();
+  });
+
+  it.each(["queued", "started"] as const)("keeps recovery for durable %s work after another input was cancelled", async (state) => {
+    const h = await withClock();
+    const other = h.wrapper.send("cancelled neighbor")!;
+    const otherId = h.received[1]!.id!;
+    h.deliver({ type: "ack", ids: [otherId], cancelled: [otherId] });
+    h.deliver({ type: "history", messages: [{ id: "durable-work", role: "user", text: "work",
+      randomId: h.received[0]!.random_id, turnId: h.turnId, requestState: state, seq: 1 }] });
+    expect(other.snapshot().state).toBe("accepted");
+    expect([...inside(h.wrapper).applicationTurns.keys()]).toEqual([h.turnId]);
+    vi.advanceTimersByTime(TIMEOUT);
+    expect(h.request).toHaveBeenCalledTimes(1);
+    expect(h.receipt.snapshot().state).toBe("accepted");
   });
 
   it.each(["close", "terminal"] as const)("cleans up on %s and fences an already queued callback", async (end) => {

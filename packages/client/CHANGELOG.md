@@ -10,6 +10,17 @@
   history/difference state on silence. Accepted tasks are never republished or
   failed by the timeout; server settlement, close, and terminal errors retire the
   watch. Idle tabs remain unpolled, and `0` disables the new watch as well.
+- Consume protocol 6 `ack.cancelled` evidence before acceptance callbacks, so an
+  input durably stopped before admission does not become permanent recovery work.
+  Cancelled IDs must belong to the same ACK; malformed frames are rejected before
+  any ACK effect. Other accepted work and ordinary coalesced settlement are preserved.
+
+### Breaking (wire protocol v6)
+
+- Client and plugin require a paired upgrade to protocol 6. The existing
+  exact-match registration gate rejects older peers: durable cancellation ACK
+  evidence must be understood to distinguish delivery acceptance from work that
+  still needs recovery. No new public SDK method or package-version bump is added.
 
 ### Breaking (wire protocol v4)
 
