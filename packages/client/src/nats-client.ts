@@ -198,6 +198,8 @@ export type InboundMessage = {
   id?: string;
   /** P0-7b: the acknowledged `user_message` ids on an `ack` frame. */
   ids?: string[];
+  /** Protocol 6: exact ack.ids durably cancelled by the server, not task admissions. */
+  cancelled?: string[];
   /**
    * #243 half 2a: the server-assigned durable `messageId` per client `random_id`,
    * echoed on an `ack` frame. DELIBERATELY IGNORED in 2a — `drainAcked` still
@@ -486,9 +488,11 @@ export type WebChannelNatsClientOptions = Omit<NatsClientOptions, "jwt" | "regis
   jwt: string;
   registration: NonNullable<NatsClientOptions["registration"]>;
   /**
-   * Maximum time published or locally-held application work may receive no
+   * Maximum time published, accepted, or locally-held application work may receive no
    * authenticated ingress/turn activity before one soft reconnect is requested.
-   * Default 30,000ms; 0 disables both automatic application-recovery lanes.
+   * Default 30,000ms; 0 disables automatic application-stall recovery.
+   * The state wrapper keeps watching accepted turns after replacement readiness
+   * until server settlement; silence never fails or re-executes accepted work.
    */
   ackStallTimeoutMs?: number;
   /** Deterministic live ingress-outcome retry seams (tests/embedded runtimes). */
@@ -1363,7 +1367,12 @@ export class WebChannelNatsClient {
    * duplicate ack (or an ack after eviction) is correctly rejected; the set is
    * conversation-bounded (the same order of magnitude as `state.messages`).
    */
-  private readonly sendTracker = new Map<string, { state: SendState; failure?: SendFailure; lastAttemptAt?: number }>();
+  private readonly sendTracker = new Map<string, {
+    state: SendState;
+    failure?: SendFailure;
+    lastAttemptAt?: number;
+    ingressCancelled?: boolean;
+  }>();
   /** Forward rank for the monotonic guard; `failed` is handled separately (terminal). */
   private static readonly SEND_RANK: Record<"queued" | "sent" | "accepted", number> = {
     queued: 0,
@@ -1780,6 +1789,11 @@ export class WebChannelNatsClient {
     };
   }
 
+  /** @internal Durable cancellation is separate from the delivery receipt state. */
+  isIngressCancelled(id: string): boolean {
+    return this.sendTracker.get(id)?.ingressCancelled === true;
+  }
+
   /**
    * P0-4 (R5-1/R6-1): mint a unique wire id and RESERVE it, one-shot. The wrapper
    * calls this BEFORE creating the bubble/receipt so a `sendUserMessage(text, id)`
@@ -1894,7 +1908,7 @@ export class WebChannelNatsClient {
    * `drainAcked`'s `new Set(ids)` has always assumed and never checked.
    */
   private deliverInbound(msg: InboundMessage): void {
-    if (msg.type === "ack") this.drainAcked(msg.ids);
+    if (msg.type === "ack") this.drainAcked(msg.ids, msg.cancelled);
     if (msg.type === "inbound_rejected" && msg.reason === "overloaded") {
       this.drainRejected(msg.ids);
     }
@@ -1906,9 +1920,18 @@ export class WebChannelNatsClient {
    * P0-4: also advance each acked id to `accepted` (the tracker's guard makes a
    * duplicate/late/post-terminal ack a no-op).
    */
-  private drainAcked(ids?: string[]): void {
+  private drainAcked(ids?: string[], cancelled?: string[]): void {
     if (!ids) return;
-    this.drainOwnedResult([...new Set(ids)], (id) => {
+    const frameIds = new Set(ids);
+    // The decoder validated the entire frame. Commit EVERY owned cancellation
+    // before timer cleanup or the first acceptance callback can reenter. This
+    // also records a late cancellation whose ordinary ACK was already consumed.
+    // Unknown/other-device IDs allocate no tracker state.
+    for (const id of cancelled ?? []) {
+      const entry = frameIds.has(id) ? this.sendTracker.get(id) : undefined;
+      if (entry) entry.ingressCancelled = true;
+    }
+    this.drainOwnedResult([...frameIds], (id) => {
       this.trackerAdvance(id, "accepted");
     });
   }

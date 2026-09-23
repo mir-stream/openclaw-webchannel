@@ -59,6 +59,8 @@ type ReceiptRecord = {
   settlementEligible: boolean;
   /** One-way latch: the first authoritative publish/settle decision consumes it. */
   turnOpeningConsumed: boolean;
+  /** A repeated cancellation proof cannot clear a later turn's unscoped typing. */
+  cancellationUiReconciled?: boolean;
   state: NonNullable<ChatMessage["sendState"]>;
   failure?: SendFailure;
   // P0-4 (review R5): mirrors `SendReceipt.snapshot()` — a concrete, non-optional
@@ -901,6 +903,22 @@ export class WebChannelNATSClient {
   private heldStallMutationEpoch = 0;
   private heldStallTimer: ReturnType<typeof setTimeout> | null = null;
   private heldStallTimerGeneration = 0;
+  /**
+   * Published candidates in send order, retained across raw reconnects. Only
+   * accepted receipts arm recovery; delivery acceptance is not task settlement.
+   * Unlike the advisory openTurns set, transport loss cannot retire this work.
+   */
+  private readonly applicationTurns = new Map<string, ReceiptRecord>();
+  /** Local candidates at the latest typing frame; not exclusive activity owners. */
+  private typingLocalCandidates = new Set<string>();
+  /** One cancellation cleanup decision for this typing episode, never a task outcome. */
+  private deferredCancelledTyping: { candidates: Set<string>; lifecycle: number } | undefined;
+  /** Prevent cleanup from observing a partially folded inbound/recovery transaction. */
+  private cancellationReconciliationDepth = 0;
+  /** Release only after cleanup subscribers finish supplying reentrant activity. */
+  private cancellationTypingCleanupDepth = 0;
+  private activeTurnStallTimer: ReturnType<typeof setTimeout> | null = null;
+  private activeTurnStallGeneration = 0;
   /** Defers held-admission UI fanout until the first owner's timer commit ends. */
   private heldAdmissionNotificationDepth = 0;
   private heldAdmissionNotificationPending = false;
@@ -1016,10 +1034,13 @@ export class WebChannelNATSClient {
       // tracker `sent` must see false and consume without opening.
       this.rawTransportConnected = connected;
       const wasSessionEstablished = this.sessionEstablished;
-      this.wrapperLifecycleGeneration++;
+      const lifecycle = ++this.wrapperLifecycleGeneration;
+      this.deferredCancelledTyping = undefined;
       // Raw transport is never public readiness. Invalidate the release gate
       // before timer cleanup or any wrapper state callback.
       this.sessionEstablished = false;
+      this.cancelActiveTurnStallTimer();
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
       if (!connected || wasSessionEstablished) this.consumeHeldStallForRawLoss();
       this.clearStaleDraftWatch();
       // #244 half B: the in-flight catch-up and its buffer belong to the connection
@@ -1112,6 +1133,10 @@ export class WebChannelNATSClient {
         return;
       }
       this.maybeRelease();
+      // A successful replacement registration proves application readiness,
+      // not completion. Keep watching accepted work if its snapshot has not
+      // settled it, including a legitimately silent turn that is still running.
+      if (this.wrapperLifecycleGeneration === lifecycle) this.refreshActiveTurnWatch();
     });
 
     // P0-4: the authoritative tracker drives every send-state transition. Route
@@ -1144,6 +1169,9 @@ export class WebChannelNATSClient {
       this.connectDeferredUntilCloseCompletes = false;
       this.replacementHeldNeedsFreshEpisode = false;
       this.wrapperLifecycleGeneration++;
+      this.deferredCancelledTyping = undefined;
+      this.applicationTurns.clear();
+      this.cancelActiveTurnStallTimer();
       const deferredEntries = this.deferredReplacementOperations.splice(0);
       // P0-4 (D5 held/terminal): the queued/ledgered sends were already swept to
       // failed{terminal} by the low-level terminal sequence BEFORE this listener
@@ -1262,13 +1290,16 @@ export class WebChannelNATSClient {
     // occurring from one of THIS close's callouts can set the intent again.
     this.connectDeferredUntilCloseCompletes = false;
     this.wrapperLifecycleGeneration++;
+    this.deferredCancelledTyping = undefined;
     this.closeTransactionDepth++;
     try {
+      this.applicationTurns.clear();
       // Detach only this lifecycle's wrapper ownership before any timer or raw
       // teardown callout. Work created after a reentrant connect is replacement
       // ownership and remains in the live collections.
       const deferredEntries = this.deferredReplacementOperations.splice(0);
       const heldEntries = this.takeHeld();
+      this.cancelActiveTurnStallTimer();
       // P1-9: tear down the connection-scoped staleness valve (§3.6.2).
       this.clearStaleDraftWatch();
       // #244 half B: this lifecycle will never receive its pending `difference`;
@@ -1563,6 +1594,13 @@ export class WebChannelNATSClient {
   }
 
   private sendUserMessage(text: string, wireId: string, randomId: string, retryOf?: string): void {
+    const receiptKey = this.wireIdToReceiptKey.get(wireId);
+    const receipt = receiptKey ? this.receipts.get(receiptKey) : undefined;
+    if (receipt?.settlementEligible && receipt.state === "queued") {
+      // Install before publishing: an authenticated ACK or settlement can be
+      // delivered synchronously by the transport, before the sent callback.
+      this.applicationTurns.set(wireId, receipt);
+    }
     if (retryOf === undefined) this.client.sendUserMessage(text, wireId, randomId);
     else this.client.sendUserMessage(text, wireId, randomId, retryOf);
   }
@@ -1865,6 +1903,7 @@ export class WebChannelNATSClient {
     // transaction. They release only after the outer stop owns its queue slot.
     if (this.stopCommitDepth > 0) return true;
     if (this.heldReleaseCommitDepth > 0) return true;
+    if (this.cancellationTypingCleanupDepth > 0) return true;
     return this.turnInFlight() || this.held.length > 0;
   }
 
@@ -1911,6 +1950,7 @@ export class WebChannelNATSClient {
       this.deferredReplacementOpen() ||
       this.stopCommitDepth > 0 ||
       this.heldReleaseCommitDepth > 0 ||
+      this.cancellationTypingCleanupDepth > 0 ||
       this.held.length === 0 ||
       this.turnInFlight() ||
       !this.state.connected ||
@@ -2046,6 +2086,95 @@ export class WebChannelNATSClient {
     for (const entry of entries) {
       if (entry.kind !== "user") continue;
       this.receiptTransition(entry.receiptKey, "failed", failure);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Accepted-turn application liveness (independent of delivery retries)
+  // ---------------------------------------------------------------------------
+
+  private hasAcceptedApplicationTurn(): boolean {
+    for (const [id, receipt] of this.applicationTurns) {
+      // A cancellation ACK can be committed in the inner tracker while its
+      // receipt callback is queued behind a subscriber. It already owns the
+      // verdict: no timer may request recovery during that callback window.
+      if (receipt.state === "accepted" && !this.client.isIngressCancelled(id)) return true;
+    }
+    return false;
+  }
+
+  /** Cancel only the named input; it proves nothing about a coalesced prefix. */
+  private retireCancelledApplicationTurn(wireId: string): boolean {
+    this.applicationTurns.delete(wireId);
+    const key = this.wireIdToReceiptKey.get(wireId);
+    const receipt = key ? this.receipts.get(key) : undefined;
+    if (receipt) receipt.turnOpeningConsumed = true;
+    return this.closeTurn(wireId);
+  }
+
+  private cancelActiveTurnStallTimer(): number {
+    const generation = ++this.activeTurnStallGeneration;
+    const timer = this.activeTurnStallTimer;
+    this.activeTurnStallTimer = null;
+    if (timer !== null) clearTimeout(timer);
+    return generation;
+  }
+
+  /** Retire the same coalesced prefix as turn_settled, even after raw loss. */
+  private settleApplicationTurnsThrough(turnId: string): void {
+    if (!this.applicationTurns.has(turnId)) return;
+    for (const id of this.applicationTurns.keys()) {
+      this.applicationTurns.delete(id);
+      if (id === turnId) break;
+    }
+  }
+
+  private refreshActiveTurnWatch(reset = false): void {
+    const timeout = this.client.getAckStallTimeoutMs();
+    const ready = () => timeout > 0 && this.heldSessionReady() && this.hasAcceptedApplicationTurn();
+    if (!ready()) {
+      this.cancelActiveTurnStallTimer();
+      return;
+    }
+    if (!reset && this.activeTurnStallTimer !== null) return;
+    const lifecycle = this.wrapperLifecycleGeneration;
+    const generation = this.cancelActiveTurnStallTimer();
+    const current = () => this.activeTurnStallGeneration === generation
+      && this.wrapperLifecycleGeneration === lifecycle && ready();
+    if (!current()) return;
+    const timer = setTimeout(() => {
+      if (!current()) return;
+      this.activeTurnStallTimer = null;
+      this.activeTurnStallGeneration++;
+      // The shared recovery path consumes unacked recovery; its raw-loss edge
+      // cancels both wrapper watchdogs before any replacement session can arm.
+      // ACKed payloads are absent from the replay ledger and are never resent.
+      this.client.requestApplicationRecovery();
+    }, timeout);
+    // Timer hooks may close/reopen, settle, or deliver newer activity. Never
+    // install this handle over the newer generation's ownership.
+    if (!current() || this.activeTurnStallTimer !== null) {
+      clearTimeout(timer);
+      return;
+    }
+    this.activeTurnStallTimer = timer;
+    (timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+  }
+
+  private observeActiveTurnActivity(msg: InboundMessage): void {
+    if (!this.hasAcceptedApplicationTurn()) return;
+    switch (msg.type) {
+      case "typing":
+      case "progress":
+      case "reasoning":
+      case "tool_activity":
+      case "agent_message":
+      case "turn_snapshot":
+      case "turn_settled":
+      case "request_state":
+      case "approval_request":
+      case "approval_resolved":
+        this.refreshActiveTurnWatch(true);
     }
   }
 
@@ -2596,6 +2725,7 @@ export class WebChannelNATSClient {
    * send, a staged-bubble exposure, or a held drain midway through its FIFO commit.
    */
   private setState(patch: StatePatch): void {
+    if (patch.isTyping === false) this.deferredCancelledTyping = undefined;
     this.state = nextStateFrom(this.state, patch);
     this.notifyStateListeners();
   }
@@ -3320,6 +3450,11 @@ export class WebChannelNATSClient {
         // #96: publication authority lives in the low-level tracker. Fold the
         // first `sent`/`accepted` opening into this same bubble/state fanout;
         // queued ownership alone never claims that the agent has a live turn.
+        // A durable cancellation ACK still accepts delivery, but cannot open
+        // application work even if it beat the first sent/accepted callback.
+        const cancelledTurnClosed = rec.wireId !== undefined
+          && this.client.isIngressCancelled(rec.wireId)
+          && this.retireCancelledApplicationTurn(rec.wireId);
         const turnOpened = this.openTurnFromReceipt(rec, next.state);
         // #96: close the turn of a send whose failure is our best evidence that
         // no turn will ever settle for it (see the `overloaded` note below — it
@@ -3362,10 +3497,13 @@ export class WebChannelNATSClient {
         // still held and has no wireId, while a `closed` receipt becomes terminal
         // before any authoritative publish transition can open it. Neither can
         // reach an open turn, so neither is a turn-closing mechanism.)
-        const turnClosed =
+        const turnClosed = cancelledTurnClosed || (
           next.state === "failed"
           && next.failure?.reason === "overloaded"
-          && this.closeTurn(rec.wireId);
+          && this.closeTurn(rec.wireId));
+        if (next.state === "completed" || next.state === "interrupted" || next.state === "failed") {
+          if (rec.wireId) this.applicationTurns.delete(rec.wireId);
+        }
         this.patchBubbleByReceiptKey(
           receiptKey,
           {
@@ -3385,6 +3523,11 @@ export class WebChannelNATSClient {
           } catch (e) {
             console.error("[nats-wrapper] receipt subscriber threw:", e);
           }
+        }
+        if (next.state === "accepted" && rec.wireId && this.applicationTurns.has(rec.wireId)) {
+          this.refreshActiveTurnWatch(true);
+        } else if (!this.hasAcceptedApplicationTurn()) {
+          this.cancelActiveTurnStallTimer();
         }
       }
     } finally {
@@ -3456,6 +3599,82 @@ export class WebChannelNATSClient {
   // ---------------------------------------------------------------------------
 
   private handleMessage(msg: InboundMessage): void {
+    this.cancellationReconciliationDepth++;
+    try { this.handleInboundMessage(msg); }
+    finally {
+      this.cancellationReconciliationDepth--;
+      this.reconcileCancelledTyping();
+    }
+  }
+
+  /** Consume a cancellation decision only after ordered recovery has drained. */
+  private reconcileCancelledTyping(): void {
+    const pending = this.deferredCancelledTyping;
+    if (!pending) return;
+    if (pending.lifecycle !== this.wrapperLifecycleGeneration
+      || pending.candidates !== this.typingLocalCandidates || !this.state.isTyping) {
+      this.deferredCancelledTyping = undefined;
+      return;
+    }
+    if (this.cancellationReconciliationDepth > 0 || this.cursor.state === "catching-up"
+      || this.pendingHistorySnapshots.length > 0) return;
+    // One decision, consumed before fanout. Live, history and buffered evidence
+    // now share the existing versioned projection; do not fold a second view or
+    // keep a proof around to erase activity when an unrelated owner later ends.
+    this.deferredCancelledTyping = undefined;
+    if (this.applicationTurns.size > 0 || this.openTurns.size > 0
+      || this.state.messages.some((row) => row.working
+        || (row.kind === undefined && row.role === "user"
+          && (row.requestState === "queued" || row.requestState === "started")
+          && !this.client.isIngressCancelled(row.wireId ?? row.turnId ?? "")))) return;
+    this.cancellationTypingCleanupDepth++;
+    try { this.setState({ isTyping: false }); }
+    finally { this.cancellationTypingCleanupDepth--; }
+    if (pending.lifecycle === this.wrapperLifecycleGeneration) this.maybeRelease();
+  }
+
+  private handleInboundMessage(msg: InboundMessage): void {
+    // Duplicate cancellation ACKs have no new receipt transition. Retire their
+    // exact ownership here too, before any reducer/subscriber callout. Keep the
+    // accepted delivery receipt; this signal does not invent a journal row.
+    if (msg.type === "ack" && msg.cancelled !== undefined) {
+      const lifecycle = this.wrapperLifecycleGeneration;
+      let closed = false;
+      const finalize: string[] = [];
+      for (const id of msg.cancelled) {
+        if (!msg.ids?.includes(id)) continue;
+        closed = this.retireCancelledApplicationTurn(id) || closed;
+        const key = this.wireIdToReceiptKey.get(id);
+        const receipt = key ? this.receipts.get(key) : undefined;
+        if (receipt?.settlementEligible && !receipt.cancellationUiReconciled) {
+          receipt.cancellationUiReconciled = true;
+          finalize.push(id);
+        }
+      }
+      const typingCandidates = this.typingLocalCandidates;
+      const cancelsTypingCandidate = finalize.some((id) => typingCandidates.has(id));
+      for (const id of finalize) typingCandidates.delete(id);
+      if (cancelsTypingCandidate) {
+        this.deferredCancelledTyping = { candidates: typingCandidates, lifecycle };
+      }
+      if (!this.hasAcceptedApplicationTurn()) this.cancelActiveTurnStallTimer();
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
+      for (const id of finalize) {
+        this.retireBufferedProgress(id);
+        this.finalizeDraftsForTurn(id);
+        if (this.wrapperLifecycleGeneration !== lifecycle) return;
+      }
+      // Exact turn/draft retirement is immediate. Unscoped typing cleanup waits
+      // for the outer fold and any outstanding gap/history reconciliation.
+      const clearActive = closed && this.openTurns.size === 0;
+      if (clearActive) this.setState({ turnActive: false });
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
+    }
+    // Observe authenticated live arrival before gap buffering. Replaying that
+    // buffer later is not new evidence of application activity.
+    const activityLifecycle = this.wrapperLifecycleGeneration;
+    this.observeActiveTurnActivity(msg);
+    if (this.wrapperLifecycleGeneration !== activityLifecycle) return;
     // #244 half B: the catch-up response is orchestration (fold N events, then
     // either re-request or settle and drain), not a single state transition, so
     // it is handled ahead of the ordinary dispatch and outside the seq-bearing
@@ -3758,6 +3977,18 @@ export class WebChannelNATSClient {
     buffered: InboundMessage[],
     carried: CarriedRows | undefined,
   ): void {
+    // Timeout fallback also drains outside handleMessage. Nested ACK callbacks
+    // must wait for every pending snapshot and buffered frame, not the temporary
+    // synced cursor installed before that drain.
+    this.cancellationReconciliationDepth++;
+    try { this.drainSynced(last, buffered, carried); }
+    finally {
+      this.cancellationReconciliationDepth--;
+      this.reconcileCancelledTyping();
+    }
+  }
+
+  private drainSynced(last: number, buffered: InboundMessage[], carried: CarriedRows | undefined): void {
     this.cursor = { state: "synced", last };
     if (carried !== undefined && last >= this.observedHistoryHighWater
       && this.recoveringHistoryOrder !== undefined) {
@@ -4374,14 +4605,17 @@ export class WebChannelNATSClient {
       if (row.kind !== undefined || row.role !== "user" || !row.requestState || row.requestState === "queued" || row.requestState === "started") continue;
       const turnId = row.wireId ?? row.turnId;
       if (!turnId) continue;
+      const placement = this.consumeTurnOpeningsThrough(turnId);
+      this.settleApplicationTurnsThrough(turnId);
       if (row.requestState === "interrupted") this.promoteAnchor(turnId, "interrupted");
       else if (row.requestState === "completed") this.promoteAnchor(turnId, "completed");
       else this.promoteAnchor(turnId, "failed", { reason: row.requestState === "cancelled" ? "cancelled" : "turn-failed", retryable: row.requestState === "failed" });
       this.retireBufferedProgress(turnId);
-      const closed = this.closeTurnsThrough(this.consumeTurnOpeningsThrough(turnId));
+      const closed = this.closeTurnsThrough(placement);
       this.finalizeDraftsForTurn(turnId);
       if (closed) this.setState({ turnActive: false, isTyping: false });
     }
+    if (!this.hasAcceptedApplicationTurn()) this.cancelActiveTurnStallTimer();
   }
 
   private hydrateHistory(msg: InboundMessage): void {
@@ -4538,6 +4772,12 @@ export class WebChannelNATSClient {
         return true;
 
       case "typing": {
+        // Cancellation facts are committed before ACK callbacks. A new typing
+        // frame arriving reentrantly after that proof cannot belong to a
+        // cancelled local candidate, even before the ACK's UI cleanup runs.
+        this.typingLocalCandidates = new Set([...this.applicationTurns.keys()]
+          .filter((id) => !this.client.isIngressCancelled(id)));
+        this.deferredCancelledTyping = undefined;
         this.setState({ isTyping: true });
         return true;
       }
@@ -4991,6 +5231,7 @@ export class WebChannelNATSClient {
         // can fan out synchronously, and a delayed publish callback must not open
         // a turn whose settle has already arrived.
         const turnPlacement = this.consumeTurnOpeningsThrough(msg.turnId);
+        if (msg.turnId) this.settleApplicationTurnsThrough(msg.turnId);
         // P0-4 (§1): promote the exact send named by an EXPLICIT outcome.
         // `"ok"` → `accepted → completed` where turnId === wireId; `"error"`
         // → `failed{turn-failed, retryable:true}`. The current plugin emits one
@@ -5024,6 +5265,7 @@ export class WebChannelNATSClient {
         // draft whose turnId matches (in the normal flow the final agent_message
         // already did this, a no-op). Never swaps the id.
         this.finalizeDraftsForTurn(msg.turnId);
+        if (!this.hasAcceptedApplicationTurn()) this.cancelActiveTurnStallTimer();
         return true;
       }
 

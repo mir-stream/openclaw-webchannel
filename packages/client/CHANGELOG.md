@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Fixed
+
+- Recover accepted, unsettled local turns after a plugin-only restart even when
+  the relay remains healthy. The existing `ackStallTimeoutMs` policy now watches
+  authenticated application activity after ACK and refreshes registration and
+  history/difference state on silence. Accepted tasks are never republished or
+  failed by the timeout; server settlement, close, and terminal errors retire the
+  watch. Idle tabs remain unpolled, and `0` disables the new watch as well.
+- Consume protocol 6 `ack.cancelled` evidence before acceptance callbacks, so an
+  input durably stopped before admission does not become permanent recovery work.
+  Cancelled IDs must belong to the same ACK; malformed frames are rejected before
+  any ACK effect. Other accepted work and ordinary coalesced settlement are preserved.
+- Preserve another device's queued/started typing and held follow-ups when a
+  delayed first cancellation ACK arrives for an unrelated local input. Cleanup
+  consults reconciled request state, including history and callback updates.
+- Defer cancellation typing cleanup while gap/history evidence is buffered, then
+  check it after the ordered recovery drain. Empty or terminal recovery completes
+  cleanup; newer typing and connection teardown retire the pending decision.
+
+### Breaking (wire protocol v6)
+
+- Client and plugin require a paired upgrade to protocol 6. The existing
+  exact-match registration gate rejects older peers: durable cancellation ACK
+  evidence must be understood to distinguish delivery acceptance from work that
+  still needs recovery. No new public SDK method or package-version bump is added.
+
 ### Breaking (wire protocol v4)
 
 - **`WEBCHANNEL_PROTOCOL_VERSION` goes 3 → 4 (#246).** The exported constant

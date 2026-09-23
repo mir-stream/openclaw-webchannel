@@ -95,7 +95,7 @@ was installed, and the replay ledger drained. A raw socket open by itself remain
 with `connected: false`. This avoids releasing locally-held work into a keyless
 replacement connection.
 
-`ackStallTimeoutMs` controls two reactive recovery signals with one shared policy:
+`ackStallTimeoutMs` controls three reactive recovery signals with one shared policy:
 
 - default `30_000` ms; accepted values are integers from `0` through
   `2_147_483_647`;
@@ -103,7 +103,9 @@ replacement connection.
   requests at most one soft reconnect per continuous no-result interval;
 - an ordinary follow-up held behind a live turn/FIFO gate with no authenticated
   turn activity requests the same recovery path once;
-- `0` disables both automatic signals. It does not disable live publish retries,
+- an accepted, unsettled local turn with no authenticated application activity
+  requests reconnect/register recovery even when the relay still answers PING;
+- `0` disables all three automatic signals. It does not disable live publish retries,
   heartbeat/raw-loss recovery, manual reconnect, or authenticated readiness.
 
 The timeout is a recovery policy, not a delivery deadline. Missing ACK is
@@ -113,10 +115,35 @@ wire ID; the detector never synthesizes `/stop`, releases it, or bypasses FIFO.
 Only the existing reconnect → register → key → same-ID replay → session-ready and
 stale-draft/FIFO paths change those states.
 
-A legitimately silent turn with a held follow-up can therefore cause one harmless
-extra reconnect. Raise the timeout or set it to `0` for workloads where long
-silent turns are normal. A completely idle tab has no active-work signal and is
-not proactively probed by this recovery mode.
+Accepted turns stay under observation across transport replacement until a server
+settlement arrives (or the client is closed/retired). Authenticated live activity
+and successful replacement readiness start a fresh interval. Registration snapshots
+and difference recovery can therefore surface a missed `interrupted`, completed,
+cancelled, or failed outcome. An accepted task is absent from the replay ledger:
+recovery never republishes it or infers an execution outcome from silence.
+
+Protocol 6 ACKs may carry `cancelled`, an authenticated subset of that frame's
+acknowledged wire IDs. This is explicit server evidence that those inputs were
+durably cancelled, including inputs stopped before a journal row existed. The
+client retires only those IDs from the activity watch before acceptance callbacks
+can run. Their delivery receipts remain `accepted`; no task result or journal row
+is fabricated. Ordinary ACKs, empty/truncated history, and a local `/stop` request
+alone do not prove cancellation. Upgrade the client and plugin together.
+
+Cancellation cleanup preserves typing and held follow-ups when another request
+is known to be queued or started, including work sent by another device. A late
+first cancellation ACK cannot claim that request's unscoped typing merely because
+the cancelled input was still a local send candidate.
+While a gap or pending history is being reconciled, typing cleanup waits for the
+existing ordered recovery drain. It then checks the reconciled work once; newer
+typing or a connection lifecycle change discards the old cleanup decision.
+Cancellation receipt acceptance and exact activity-watch retirement stay immediate.
+
+A legitimately silent accepted turn can cause another reconnect each interval;
+a held-only episode still requests at most one. Raise the timeout or set it to `0`
+for workloads where long silent turns are normal. The watchdogs share the existing
+recovery path so coincident deadlines do not start duplicate reconnects. A completely
+idle tab has no active-work signal and is not proactively probed by this mode.
 
 ### Turn activity: `turnActive` vs `isTyping`
 
@@ -295,8 +322,8 @@ becomes `failed { reason: "overloaded", retryable: true }`; retry is a deliberat
 caller/user action and creates a new id. Before either ACK or rejection arrives,
 the client reliability layer replays the same id live with capped exponential
 backoff, as well as immediately on reconnect. Client and plugin must be upgraded
-together — the wire protocol is now **v4** (v3 in `0.4.0`, the register hop
-described below; v4 in #246 — see the CHANGELOG).
+together — the wire protocol is now **v6** (v3 in `0.4.0`, the register hop
+described below; v4 in #246; v6 adds durable cancellation ACK evidence).
 
 ### BREAKING: protocol v3 register hop
 
@@ -318,7 +345,7 @@ The boolean `delivered` is gone. Migration: `delivered === true` ↔
 `sendState === "accepted" || sendState === "completed"`; render a failure from
 `sendState === "failed"` + `sendFailure`. `openclaw-webchannel-client` and
 `openclaw-webchannel` ship in lockstep — upgrade both together (the register
-protocol version is mandatory in both directions, and is **v4** today).
+protocol version is mandatory in both directions, and is **v6** today).
 
 See [`../../docs/STATUS.md`](../../docs/STATUS.md) for current deployment status
 and [`../../docs/TRUST_AND_ONBOARDING.md`](../../docs/TRUST_AND_ONBOARDING.md) for
