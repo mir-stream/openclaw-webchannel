@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- Recover accepted, unsettled local turns after a plugin-only restart even when
+  the relay remains healthy. The existing `ackStallTimeoutMs` policy now watches
+  authenticated application activity after ACK and refreshes registration and
+  history/difference state on silence. Accepted tasks are never republished or
+  failed by the timeout; server settlement, close, and terminal errors retire the
+  watch. Idle tabs remain unpolled, and `0` disables the new watch as well.
+
 ### Breaking (wire protocol v4)
 
 - **`WEBCHANNEL_PROTOCOL_VERSION` goes 3 → 4 (#246).** The exported constant

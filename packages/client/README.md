@@ -95,7 +95,7 @@ was installed, and the replay ledger drained. A raw socket open by itself remain
 with `connected: false`. This avoids releasing locally-held work into a keyless
 replacement connection.
 
-`ackStallTimeoutMs` controls two reactive recovery signals with one shared policy:
+`ackStallTimeoutMs` controls three reactive recovery signals with one shared policy:
 
 - default `30_000` ms; accepted values are integers from `0` through
   `2_147_483_647`;
@@ -103,7 +103,9 @@ replacement connection.
   requests at most one soft reconnect per continuous no-result interval;
 - an ordinary follow-up held behind a live turn/FIFO gate with no authenticated
   turn activity requests the same recovery path once;
-- `0` disables both automatic signals. It does not disable live publish retries,
+- an accepted, unsettled local turn with no authenticated application activity
+  requests reconnect/register recovery even when the relay still answers PING;
+- `0` disables all three automatic signals. It does not disable live publish retries,
   heartbeat/raw-loss recovery, manual reconnect, or authenticated readiness.
 
 The timeout is a recovery policy, not a delivery deadline. Missing ACK is
@@ -113,10 +115,18 @@ wire ID; the detector never synthesizes `/stop`, releases it, or bypasses FIFO.
 Only the existing reconnect → register → key → same-ID replay → session-ready and
 stale-draft/FIFO paths change those states.
 
-A legitimately silent turn with a held follow-up can therefore cause one harmless
-extra reconnect. Raise the timeout or set it to `0` for workloads where long
-silent turns are normal. A completely idle tab has no active-work signal and is
-not proactively probed by this recovery mode.
+Accepted turns stay under observation across transport replacement until a server
+settlement arrives (or the client is closed/retired). Authenticated live activity
+and successful replacement readiness start a fresh interval. Registration snapshots
+and difference recovery can therefore surface a missed `interrupted`, completed,
+cancelled, or failed outcome. An accepted task is absent from the replay ledger:
+recovery never republishes it or infers an execution outcome from silence.
+
+A legitimately silent accepted turn can cause another reconnect each interval;
+a held-only episode still requests at most one. Raise the timeout or set it to `0`
+for workloads where long silent turns are normal. The watchdogs share the existing
+recovery path so coincident deadlines do not start duplicate reconnects. A completely
+idle tab has no active-work signal and is not proactively probed by this mode.
 
 ### Turn activity: `turnActive` vs `isTyping`
 

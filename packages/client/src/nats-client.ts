@@ -486,9 +486,11 @@ export type WebChannelNatsClientOptions = Omit<NatsClientOptions, "jwt" | "regis
   jwt: string;
   registration: NonNullable<NatsClientOptions["registration"]>;
   /**
-   * Maximum time published or locally-held application work may receive no
+   * Maximum time published, accepted, or locally-held application work may receive no
    * authenticated ingress/turn activity before one soft reconnect is requested.
-   * Default 30,000ms; 0 disables both automatic application-recovery lanes.
+   * Default 30,000ms; 0 disables automatic application-stall recovery.
+   * The state wrapper keeps watching accepted turns after replacement readiness
+   * until server settlement; silence never fails or re-executes accepted work.
    */
   ackStallTimeoutMs?: number;
   /** Deterministic live ingress-outcome retry seams (tests/embedded runtimes). */
