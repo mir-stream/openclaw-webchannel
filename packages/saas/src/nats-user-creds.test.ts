@@ -6,6 +6,7 @@ import { issueBrowserCredentials, MemoryBrowserCredentialLedger } from "./index.
 import { mintNatsUserCreds } from "./nats-user-creds.js";
 
 const nowSec = 1_800_000_000;
+const ONE_HOUR_SECONDS = 60 * 60;
 const accountSeed = new TextDecoder().decode(createAccount().getSeed());
 const base = { accountSeed, tenant: "tenant-x", peerId: "alice" };
 
@@ -53,7 +54,7 @@ describe.each([false, true])("browser credential TTL validation (ledger=%s)", (w
     },
   );
 
-  it.each([1, 60, 3600])("issues an integer expiry for a valid %s-second TTL", async (ttlSeconds) => {
+  it.each([1, 60, ONE_HOUR_SECONDS])("issues an integer expiry for a valid %s-second TTL", async (ttlSeconds) => {
     const { options, ledger, recordIssuance } = issuanceOptions();
     const creds = await issueBrowserCredentials({ ...options, ttlSeconds });
     const claim = decode<User>(creds.userJwt);
