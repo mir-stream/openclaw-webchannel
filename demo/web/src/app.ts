@@ -31,6 +31,38 @@ let laneTeardown: (() => void) | null = null;
 let activeAccount: string | null = null;
 let grantedAccounts: string[] = [];
 let mePollTimer: number | null = null;
+let laneOwner: AbortController | null = null;
+let sessionOwner = new AbortController();
+let sessionUsername: string | null = null;
+let suspended = false;
+let logoutState: "idle" | "pending" | "failed" = "idle";
+type SavedLane = { username: string; accountId: string; draft: string };
+let savedLane: SavedLane | undefined;
+
+function ownsSession(owner: AbortController): boolean {
+  return !suspended && sessionOwner === owner && !owner.signal.aborted;
+}
+
+function clearLane(): void {
+  laneOwner?.abort();
+  laneOwner = null;
+  laneTeardown?.();
+  laneTeardown = null;
+  activeAccount = null;
+}
+
+/** Retire pending mounts as well as panes whose teardown is already available. */
+function resetSession(): AbortController {
+  sessionOwner.abort();
+  if (mePollTimer !== null) window.clearInterval(mePollTimer);
+  mePollTimer = null;
+  clearLane();
+  while (paneTeardowns.length) paneTeardowns.pop()?.();
+  grantedAccounts = [];
+  sessionUsername = null;
+  sessionOwner = new AbortController();
+  return sessionOwner;
+}
 
 function $(id: string): HTMLElement {
   const node = document.getElementById(id);
@@ -50,18 +82,24 @@ function renderLlmBadge(): void {
 }
 
 /** (Re)mount the active chat lane for `accountId`, tearing down the prior one. */
-async function mountLane(accountId: string): Promise<void> {
-  if (laneTeardown) {
-    laneTeardown();
-    laneTeardown = null;
-  }
+async function mountLane(accountId: string, draft = ""): Promise<void> {
+  clearLane();
+  const owner = new AbortController();
+  laneOwner = owner;
   activeAccount = accountId;
   const laneBody = $("chat-lane");
-  laneBody.replaceChildren(el("div", { style: "color:var(--muted);font-size:12px" }, ["connecting…"]));
+  const mount = el("div");
+  laneBody.replaceChildren(mount);
   try {
-    laneTeardown = await createWidget(laneBody, config, accountId);
+    const teardown = await createWidget(mount, config, accountId, owner.signal, draft);
+    if (laneOwner !== owner || owner.signal.aborted) {
+      teardown();
+      return;
+    }
+    laneTeardown = teardown;
   } catch (err) {
-    laneBody.replaceChildren(
+    if (laneOwner !== owner || owner.signal.aborted) return;
+    mount.replaceChildren(
       el("div", { style: "color:var(--bad);font-size:12px" }, [`lane failed: ${(err as Error).message}`]),
     );
   }
@@ -109,25 +147,28 @@ function renderTabsWithActive(acct: string): void {
  * Reconcile the tab set to a fresh grant list. Adds/removes tabs; if the active
  * account was revoked, switches to the first remaining (or clears the lane).
  */
-async function reconcileGrants(accounts: string[]): Promise<void> {
+async function reconcileGrants(accounts: string[], owner: AbortController): Promise<void> {
+  if (!ownsSession(owner)) return;
   const prev = grantedAccounts.join(",");
   grantedAccounts = accounts;
   if (accounts.join(",") === prev) return; // no change
 
   if (activeAccount && !accounts.includes(activeAccount)) {
     // Active lane was revoked.
-    if (laneTeardown) { laneTeardown(); laneTeardown = null; }
-    activeAccount = null;
+    clearLane();
     $("chat-lane").replaceChildren();
   }
   if (!activeAccount && accounts.length > 0) {
     activeAccount = accounts[0];
     await mountLane(accounts[0]);
+    if (!ownsSession(owner)) return;
   }
   renderTabs();
 }
 
-async function mountForSession(me: Me): Promise<void> {
+async function mountForSession(me: Me, owner: AbortController, restore?: SavedLane): Promise<void> {
+  if (!ownsSession(owner)) return;
+  sessionUsername = me.username;
   const appEl = $("app");
   const who = $("whoami");
   who.textContent = `${me.username}${me.isAdmin ? " (admin)" : ""}`;
@@ -155,8 +196,33 @@ async function mountForSession(me: Me): Promise<void> {
   Object.assign(config.accounts, me.accounts);
   grantedAccounts = Object.keys(me.accounts);
   renderTabs();
+  $("login").classList.add("hidden");
+  appEl.classList.remove("hidden");
+
+  // One poll at a time; responses from a retired login cannot restore grants.
+  let polling = false;
+  mePollTimer = window.setInterval(async () => {
+    if (polling || !ownsSession(owner)) return;
+    polling = true;
+    try {
+      const res = await api<Me>("/me", { signal: owner.signal });
+      if (!ownsSession(owner)) return;
+      if (res.ok && res.data.accounts) {
+        Object.assign(config.accounts, res.data.accounts);
+        await reconcileGrants(Object.keys(res.data.accounts), owner);
+      }
+    } catch {
+      // A later poll can recover a network error; cancellation retires this poll.
+    } finally {
+      polling = false;
+    }
+  }, 3000);
+
   if (grantedAccounts.length > 0) {
-    await mountLane(grantedAccounts[0]);
+    // A cached draft belongs only to this user and this still-granted account.
+    const lane = restore?.username === me.username && grantedAccounts.includes(restore.accountId) ? restore : undefined;
+    await mountLane(lane?.accountId ?? grantedAccounts[0], lane?.draft);
+    if (!ownsSession(owner)) return;
     renderTabs();
   }
   // Wiretap watches the whole tenant subtree via OPERATOR observer creds (minted
@@ -164,8 +230,14 @@ async function mountForSession(me: Me): Promise<void> {
   // them). It is account-independent, so mount once — for admins only.
   if (me.isAdmin && grantedAccounts.length > 0) {
     try {
-      paneTeardowns.push(await createWiretap($("wiretap-body"), config, grantedAccounts[0]));
+      const teardown = await createWiretap($("wiretap-body"), config, grantedAccounts[0], owner.signal);
+      if (!ownsSession(owner)) {
+        teardown();
+        return;
+      }
+      paneTeardowns.push(teardown);
     } catch (err) {
+      if (!ownsSession(owner)) return;
       $("wiretap-body").replaceChildren(
         el("div", { style: "color:var(--bad);font-size:12px" }, [`wiretap failed: ${(err as Error).message}`]),
       );
@@ -177,44 +249,84 @@ async function mountForSession(me: Me): Promise<void> {
       ]),
     );
   }
-
-  $("login").classList.add("hidden");
-  appEl.classList.remove("hidden");
-
-  // Poll /me for live grant/revoke (scene ①).
-  mePollTimer = window.setInterval(async () => {
-    const res = await api<Me>("/me");
-    if (res.ok && res.data.accounts) {
-      Object.assign(config.accounts, res.data.accounts); // pick up runtime-added rendezvous
-      await reconcileGrants(Object.keys(res.data.accounts));
-    }
-  }, 3000);
 }
 
 async function tryResumeSession(): Promise<void> {
-  const { ok, data } = await api<Me>("/me");
-  if (ok && data.username) await mountForSession(data);
+  const owner = sessionOwner;
+  try {
+    const { ok, data } = await api<Me>("/me", { signal: owner.signal });
+    if (!ownsSession(owner)) return;
+    const restore = savedLane;
+    savedLane = undefined;
+    if (ok && data.username) await mountForSession(data, owner, restore);
+    else showSignIn();
+  } catch {
+    if (!ownsSession(owner)) return;
+    savedLane = undefined;
+    showSignIn();
+    $("login-err").textContent = "Session lookup failed. Sign in to continue.";
+  }
+}
+
+/** Remove cached identity and grant UI before a new session lookup can finish. */
+function clearSessionUi(): void {
+  $("app").classList.add("hidden");
+  $("whoami").classList.add("hidden");
+  $("whoami").textContent = "";
+  for (const id of ["chat-body", "admin-body", "wiretap-body"]) $(id).replaceChildren();
+}
+
+function showSignIn(): void {
+  clearSessionUi();
+  $("login").classList.remove("hidden");
+  $("login-err").textContent = "";
+  ($("login-btn") as HTMLButtonElement).disabled = false;
+  const logout = $("logout") as HTMLButtonElement;
+  logout.classList.add("hidden");
+  logout.disabled = false;
+  logout.textContent = "Log out";
+}
+
+function showLogoutFailure(): void {
+  clearSessionUi();
+  $("login").classList.remove("hidden");
+  $("login-err").textContent = "Log out failed or was interrupted. Your server session may still be active. Try Log out again.";
+  ($("login-btn") as HTMLButtonElement).disabled = true;
+  const logout = $("logout") as HTMLButtonElement;
+  logout.classList.remove("hidden");
+  logout.disabled = false;
+  logout.textContent = "Retry log out";
 }
 
 function wireLogin(): void {
   const btn = $("login-btn") as HTMLButtonElement;
   const err = $("login-err");
   const doLogin = async () => {
+    if (suspended || logoutState !== "idle" || btn.disabled) return;
+    savedLane = undefined;
+    const owner = resetSession();
     err.textContent = "";
     btn.disabled = true;
     const username = ($("username") as HTMLInputElement).value.trim();
     const password = ($("password") as HTMLInputElement).value;
-    const res = await api<{ ok?: boolean; error?: string }>("/login", {
-      method: "POST",
-      body: { username, password },
-    });
-    btn.disabled = false;
-    if (!res.ok || !res.data.ok) {
-      err.textContent = res.data.error ?? "login failed";
-      return;
+    try {
+      const res = await api<{ ok?: boolean; error?: string }>("/login", {
+        method: "POST",
+        body: { username, password },
+        signal: owner.signal,
+      });
+      if (!ownsSession(owner)) return;
+      if (!res.ok || !res.data.ok) {
+        err.textContent = res.data.error ?? "login failed";
+        return;
+      }
+      const me = await api<Me>("/me", { signal: owner.signal });
+      if (ownsSession(owner) && me.ok) await mountForSession(me.data, owner);
+    } catch (error) {
+      if (ownsSession(owner)) err.textContent = error instanceof Error ? error.message : "login failed";
+    } finally {
+      if (ownsSession(owner)) btn.disabled = false;
     }
-    const me = await api<Me>("/me");
-    if (me.ok) await mountForSession(me.data);
   };
   btn.onclick = doLogin;
   ($("password") as HTMLInputElement).onkeydown = (e) => {
@@ -223,18 +335,75 @@ function wireLogin(): void {
 }
 
 function wireLogout(): void {
-  $("logout").onclick = async () => {
-    if (mePollTimer !== null) clearInterval(mePollTimer);
-    if (laneTeardown) laneTeardown();
-    while (paneTeardowns.length) paneTeardowns.pop()?.();
-    location.reload();
+  const logout = $("logout") as HTMLButtonElement;
+  logout.onclick = async () => {
+    if (suspended || logoutState === "pending") return;
+    logoutState = "pending";
+    savedLane = undefined;
+    const owner = resetSession();
+    logout.disabled = true;
+    logout.textContent = "Signing out…";
+    const login = $("login-btn") as HTMLButtonElement;
+    login.disabled = true;
+    $("login").classList.add("hidden");
+    clearSessionUi();
+    ($("password") as HTMLInputElement).value = "";
+    try {
+      const res = await api("/logout", { method: "POST", signal: owner.signal });
+      if (!ownsSession(owner)) return;
+      // A lost prior response or an already-expired sid is also signed out.
+      if (!res.ok && res.status !== 401) throw new Error(`HTTP ${res.status}`);
+      logoutState = "idle";
+      showSignIn();
+    } catch {
+      if (!ownsSession(owner)) return;
+      logoutState = "failed";
+      showLogoutFailure();
+      // Keep login disabled until logout settles so its cookie expiry cannot
+      // race a new login's Set-Cookie response.
+    } finally {
+      if (ownsSession(owner)) logout.disabled = false;
+    }
   };
 }
 
+function suspendPage(event: PageTransitionEvent): void {
+  if (suspended) return;
+  if (event.persisted && sessionUsername && activeAccount && logoutState === "idle") {
+    savedLane = {
+      username: sessionUsername,
+      accountId: activeAccount,
+      draft: document.querySelector<HTMLInputElement>("#chat-lane input")?.value ?? "",
+    };
+  }
+  suspended = true;
+  // Aborting a logout request cannot prove that its server-side mutation ran.
+  // Its late callbacks lose ownership; restoration must keep sign-in blocked.
+  if (logoutState === "pending") logoutState = "failed";
+  resetSession();
+  clearSessionUi();
+}
+
+function restorePage(event: PageTransitionEvent): void {
+  if (!event.persisted || !suspended) return;
+  suspended = false;
+  if (logoutState === "failed") {
+    showLogoutFailure();
+    return;
+  }
+  showSignIn();
+  void tryResumeSession();
+}
+
+let booted = false;
 function boot(): void {
+  if (booted) return;
+  booted = true;
   renderLlmBadge();
   wireLogin();
   wireLogout();
+  window.addEventListener("pagehide", suspendPage);
+  window.addEventListener("pageshow", restorePage);
   void tryResumeSession();
 }
 

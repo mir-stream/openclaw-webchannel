@@ -2,7 +2,8 @@
   "note": "Collected (non-skipped) test count per file, from 'vitest list'. Checked EXACTLY by scripts/check-test-inventory.mjs in the e2e gate: a drop is a deleted or skipped test, a rise means this file is stale. Regenerate with 'npm run test:inventory:update'. No totals field on purpose — see the script's SHAPE note.",
   "files": {
     "demo/enroll-validation.test.ts": 2,
-    "demo/saas-server-auth.test.ts": 1,
+    "demo/saas-server-auth.test.ts": 4,
+    "demo/web/src/app-session.dom.test.ts": 20,
     "demo/web/src/error-copy.test.ts": 7,
     "demo/web/src/history-paging.test.ts": 7,
     "demo/web/src/markdown.dom.test.ts": 10,
@@ -10,6 +11,7 @@
     "demo/web/src/presentation.dom.test.ts": 6,
     "demo/web/src/presentation.test.ts": 31,
     "demo/web/src/widget-dispatch-recovery.test.ts": 1,
+    "demo/web/src/widget-session.dom.test.ts": 10,
     "e2e/conversation-key-rotation-reconnect.test.ts": 1,
     "e2e/history-convergence.test.ts": 7,
     "e2e/local/harness.test.ts": 13,
