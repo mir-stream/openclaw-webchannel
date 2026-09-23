@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { webcrypto } from "node:crypto";
 
 import { verifyJwt, type JwtIdentity } from "./jwt.js";
@@ -49,13 +49,13 @@ function b64url(obj: unknown): string {
 }
 
 async function signJwt(
-  payload: Record<string, unknown>,
+  payload: Record<string, unknown> | string,
   opts: { kid?: string; alg?: string } = {},
 ): Promise<string> {
   await ensureKeypair();
   const header = { alg: opts.alg ?? "RS256", typ: "JWT", kid: opts.kid ?? "test-kid" };
   const h = b64url(header);
-  const p = b64url(payload);
+  const p = typeof payload === "string" ? Buffer.from(payload, "utf8").toString("base64url") : b64url(payload);
   const signingInput = `${h}.${p}`;
   const sig = await webcrypto.subtle.sign(
     "RSASSA-PKCS1-v1_5",
@@ -538,6 +538,49 @@ describe("verifyJwt claim validation (AC3)", () => {
         audience: AUDIENCE,
       }),
     ).toBeNull();
+  });
+});
+
+describe("verifyJwt not-before validation", () => {
+  const nowSec = 1_800_000_000;
+  const claims = { iss: ISSUER, aud: AUDIENCE, sub: "user-42", exp: nowSec + 7200 };
+  beforeEach(() => { vi.spyOn(Date, "now").mockReturnValue(nowSec * 1000); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it.each([
+    { nbf: undefined, clockSkewSec: 0, accepted: true },
+    { nbf: nowSec - 1, clockSkewSec: 0, accepted: true },
+    { nbf: nowSec, clockSkewSec: 0, accepted: true },
+    { nbf: nowSec + 3600, clockSkewSec: 0, accepted: false },
+    { nbf: nowSec + 60, clockSkewSec: undefined, accepted: true },
+    { nbf: nowSec + 61, clockSkewSec: undefined, accepted: false },
+    { nbf: nowSec + 120, clockSkewSec: 120, accepted: true },
+    { nbf: nowSec + 121, clockSkewSec: 120, accepted: false },
+    { nbf: nowSec + 1, clockSkewSec: 0, accepted: false },
+  ])("nbf=$nbf with clockSkewSec=$clockSkewSec accepts=$accepted", async ({ nbf, clockSkewSec, accepted }) => {
+    const token = await signJwt({ ...claims, nbf });
+    const identity = await verifyJwt(token, { jwks: resolver(), issuer: ISSUER, audience: AUDIENCE, clockSkewSec });
+    expect(identity).toEqual(accepted ? { peerId: "user-42" } : null);
+  });
+
+  it.each([null, "1800000000", true, [], {}].map((nbf) => ({ nbf })))("rejects a malformed present nbf ($nbf)", async ({ nbf }) => {
+    const token = await signJwt({ ...claims, nbf });
+    expect(await verifyJwt(token, { jwks: resolver(), issuer: ISSUER, audience: AUDIENCE })).toBeNull();
+  });
+
+  it.each(["1e400", "-1e400"])("rejects a signed NumericDate that overflows to infinity (%s)", async (nbf) => {
+    // Keep the JSON number literal: JSON.stringify(Infinity) would test null instead.
+    const token = await signJwt(`${JSON.stringify(claims).slice(0, -1)},"nbf":${nbf}}`);
+    expect(await verifyJwt(token, { jwks: resolver(), issuer: ISSUER, audience: AUDIENCE })).toBeNull();
+  });
+
+  it("honors fractional NumericDate boundaries without rounding nbf", async () => {
+    const token = await signJwt({ ...claims, nbf: nowSec + 0.5 });
+    const opts = { jwks: resolver(), issuer: ISSUER, audience: AUDIENCE, clockSkewSec: 0 };
+    vi.mocked(Date.now).mockReturnValue(nowSec * 1000 + 499);
+    expect(await verifyJwt(token, opts)).toBeNull();
+    vi.mocked(Date.now).mockReturnValue(nowSec * 1000 + 500);
+    expect(await verifyJwt(token, opts)).toEqual({ peerId: "user-42" });
   });
 });
 
