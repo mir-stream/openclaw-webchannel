@@ -90,6 +90,7 @@ const debouncer = createBoundedInboundDebouncer<Item>({
 });
 const stop = createStopControl({ journal, recovery, debouncer, sendAck, isActive: () => true, warn: error => errors.push(String(error)),
   retireOverflow: () => { resolver.invalidateSession(session); },
+  pendingOverflowKey: () => resolver.pendingLogicalKey(session),
   dispatchControl: async (_peer, value) => { controls.push(value.id!); log("controls.jsonl", { phase, id: value.id }); },
 });
 if (phase === "crash" && boundary === "after-commit") {

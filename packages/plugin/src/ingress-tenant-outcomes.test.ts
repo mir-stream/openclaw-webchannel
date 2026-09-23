@@ -11,10 +11,11 @@ import { CancelledInboundFallbackTombstones, createIngressOnFlush } from "./ingr
 import { createIngressOutcomeStore, createRateLimitedOutcomeFailureWarning, LegacyIngressOutcomeAmbiguity, type IngressOutcome } from "./ingress-outcome.js";
 import { ingressScopeNamespace, type IngressScope } from "./ingress-scope.js";
 import { BoundedOverflowResolver, type OverflowResolutionRequest } from "./inbound-overflow-resolver.js";
-import { estimateRetainedMessageBytes, InboundRetentionBudget } from "./inbound-retention.js";
+import { DEFAULT_BUSY_TURN_LIMITS, estimateRetainedMessageBytes, InboundRetentionBudget } from "./inbound-retention.js";
 import type { UserMessageLike } from "./inbound-queue.js";
 import { tupleStoragePaths } from "./storage-paths.js";
 import type { StorageScopeIdentity } from "./storage-identity.js";
+import { createStopControl } from "./stop-control.js";
 
 const A = { tenant: "tenant-A", accountId: "ExactAccount" };
 const B = { tenant: "tenant-B", accountId: "ExactAccount" };
@@ -52,20 +53,25 @@ async function record(store: ReturnType<typeof createIngressOutcomeStore>, scope
 
 /** Real SDK state + tuple SQLite + production ingress/recovery/debounce composition.
  * Core dispatch is controlled; this is not a live gateway or browser test. */
-function runtime(path: string, storageScope: StorageScopeIdentity, persisted = persistence(path), fallback = new CancelledInboundFallbackTombstones()) {
+function runtime(path: string, storageScope: StorageScopeIdentity, persisted = persistence(path), fallback = new CancelledInboundFallbackTombstones(), options: { debounceMs?: number; capacity?: number } = {}) {
   const { store } = persisted;
   const journal = openDeliveryJournal({ databasePath: tupleStoragePaths({ storageRoot: path, ...storageScope }).deliveryJournalPath });
-  const budget = new InboundRetentionBudget();
+  const budget = new InboundRetentionBudget({ ...DEFAULT_BUSY_TURN_LIMITS,
+    ...(options.capacity === undefined ? {} : { maxMessagesPerSession: options.capacity }),
+  });
   const tokens = new Map<string, symbol>();
   const sessionToken = (peer: string) => {
     if (!tokens.has(peer)) tokens.set(peer, budget.createSessionToken());
     return tokens.get(peer)!;
   };
   const runs: UserMessageLike[] = [];
-  const acks: Array<{ ids: string[]; committed?: Array<{ random_id: string; messageId: string; seq: number }> }> = [];
+  const acks: Array<{ ids: string[]; cancelled?: string[]; committed?: Array<{ random_id: string; messageId: string; seq: number }> }> = [];
   const rejected: string[][] = [];
   const errors: unknown[] = [];
-  const sendAck = (_peer: string, ids: string[], committed?: typeof acks[number]["committed"]) => { acks.push({ ids, committed }); return true; };
+  const sendAck = (_peer: string, ids: string[], committed?: typeof acks[number]["committed"], cancelled?: string[]) => {
+    expect((cancelled ?? []).every(id => ids.includes(id))).toBe(true);
+    acks.push({ ids, committed, cancelled }); return true;
+  };
   const sendRejected = (_peer: string, ids: string[]) => { rejected.push(ids); return true; };
   const recovery = createDispatchRecovery({
     store: journal.dispatch!, acquirePeer: () => () => {}, notify: () => {}, isActive: () => true,
@@ -76,7 +82,7 @@ function runtime(path: string, storageScope: StorageScopeIdentity, persisted = p
   recovery.start();
   const resolver = new BoundedOverflowResolver({ outcomeStore: store,
     lookupUserRow: ({ peerId }, key) => journal.lookupUserMessageIdByRandomId(peerId, key),
-    sendAck: ({ peerId, id }, committed) => sendAck(peerId, [id], committed),
+    sendAck: ({ peerId, id }, committed, cancelled) => sendAck(peerId, [id], committed, cancelled ? [id] : undefined),
     sendRejected: ({ peerId, id }) => sendRejected(peerId, [id]),
     onCancelledRecovered: ({ storageScope, key }) => fallback.delete(key, storageScope),
   });
@@ -89,8 +95,17 @@ function runtime(path: string, storageScope: StorageScopeIdentity, persisted = p
     accountId: storageScope.accountId, storageScope, outcomeStore: store, deliveryJournal: journal,
     overflowResolver: resolver, cancelledFallback: fallback, sessionToken, sendAck, sendRejected,
   });
-  const debouncer = createBoundedInboundDebouncer<Item>({ debounceMs: 0, buildKey: value => value.peerId,
+  const debouncer = createBoundedInboundDebouncer<Item>({ debounceMs: options.debounceMs ?? 0, buildKey: value => value.peerId,
     budget, sessionToken, measure: value => estimateRetainedMessageBytes(value.message), ...callbacks, onFlush: flush });
+  const control = vi.fn(async () => {});
+  const stop = createStopControl({ journal, recovery, debouncer, sendAck, dispatchControl: control,
+    pendingOverflowKey: peer => {
+      const token = tokens.get(peer);
+      return token ? resolver.pendingLogicalKey(token) : undefined;
+    },
+    retireOverflow: peer => { const token = tokens.get(peer); if (token) resolver.invalidateSession(token); },
+    isActive: () => true, warn: error => { errors.push(error); },
+  });
   const idle = () => vi.waitFor(() => {
     expect(resolver.usage()).toEqual({ tasks: 0, metadataBytes: 0 });
     expect(budget.usage()).toEqual({ messages: 0, bytes: 0 });
@@ -101,14 +116,14 @@ function runtime(path: string, storageScope: StorageScopeIdentity, persisted = p
     if (closed) return;
     closed = true;
     debouncer.dispose(); resolver.dispose(); recovery.dispose();
-    await idle(); journal.close();
+    await stop.dispose(); await idle(); journal.close();
   };
   cleanups.push(close);
   const overflow = (wire = "overflow") => callbacks.onOverflow!({
     key: "peer", item: item(wire), reason: "session-message-count", chargedBytes: 512,
     recoverCancelled: fallback.has(KEY, storageScope), deferToRetained: false,
   });
-  return { ...persisted, journal, recovery, resolver, callbacks, debouncer, flush, runs, acks, rejected, fallback, idle, close, overflow };
+  return { ...persisted, journal, recovery, resolver, callbacks, debouncer, stop, control, flush, runs, acks, rejected, fallback, idle, close, overflow };
 }
 
 it.each(["cancelled", "overloaded"] as const)("isolates %s from a same-account tenant in hot, cold and reopened ingress", async outcome => {
@@ -130,8 +145,30 @@ it.each(["cancelled", "overloaded"] as const)("isolates %s from a same-account t
   expect(coldA.runs).toEqual([]); expect(coldA.journal.read("peer")).toEqual([]);
   expect(coldA.acks.map(x => x.ids)).toEqual(outcome === "cancelled" ? [["replay-A"]] : []);
   expect(coldA.rejected).toEqual(outcome === "overloaded" ? [["replay-A"]] : []);
+  if (outcome === "cancelled") expect(coldA.acks[0].cancelled).toEqual(["replay-A"]);
   expect(coldB.runs).toEqual([]); expect(coldB.rejected).toEqual([]);
   expect(coldB.acks[0].committed).toEqual(b.acks[0].committed);
+  expect(b.acks[0].cancelled).toBeUndefined();
+  expect(coldB.acks[0].cancelled).toBeUndefined();
+});
+
+it.each(["flush", "overflow"] as const)("keeps cancellation proof and committed echo for a scoped SDK cancellation with a journal row through %s", async phase => {
+  const path = root(); const p = persistence(path);
+  const a = runtime(path, A, p);
+  const row = a.journal.appendInboundUser("peer", { text: "killed", turnId: "original", randomId: "logical" });
+  await record(p.store, A, "cancelled");
+  await a.close();
+  const cold = runtime(path, A);
+  const b = runtime(path, B);
+  if (phase === "flush") await cold.flush([item("cold-replay")]);
+  else { cold.overflow("cold-replay"); await cold.idle(); }
+  expect(cold.acks).toEqual([{ ids: ["cold-replay"], cancelled: ["cold-replay"],
+    committed: [{ random_id: "logical", messageId: row.messageId, seq: row.seq }] }]);
+  expect(cold.debouncer.push(item("hot-replay"))).toEqual({ status: "known-outcome", outcome: "cancelled" });
+  expect(cold.acks.at(-1)?.cancelled).toEqual(["hot-replay"]);
+  expect(cold.runs).toEqual([]);
+  await b.flush([item("other-tenant")]); await b.idle();
+  expect(b.runs).toHaveLength(1); expect(b.acks[0].cancelled).toBeUndefined();
 });
 
 it("keeps account and authenticated peer separation inside each tenant", async () => {
@@ -196,7 +233,10 @@ it.each(["accepted", "cancelled", "overloaded"] as const)("uses only exact tuple
   const cold = runtime(path, A);
   await cold.flush([item("replay")]); cold.overflow(); await cold.idle();
   expect(cold.acks.map(x => x.ids)).toEqual([["replay"], ["overflow"]]);
-  for (const ack of cold.acks) expect(ack.committed).toEqual([{ random_id: "logical", messageId: row.messageId, seq: row.seq }]);
+  for (const ack of cold.acks) {
+    expect(ack.committed).toEqual([{ random_id: "logical", messageId: row.messageId, seq: row.seq }]);
+    expect(ack.cancelled).toBeUndefined();
+  }
   expect(cold.runs).toEqual([]); expect(cold.rejected).toEqual([]);
   await b.flush([item()]); b.overflow(); await b.idle();
   expect(b.acks).toEqual([]); expect(b.rejected).toEqual([]); expect(b.runs).toEqual([]);
@@ -214,6 +254,7 @@ it.each(["accepted", "cancelled", "overloaded"] as const)("uses durable tuple ca
   await cold.flush([item("cold-replay")]);
   await other.flush([item()]);
   expect(cold.acks.map(x => x.ids)).toEqual([["hot-replay"], ["cold-replay"]]);
+  expect(cold.acks.map(x => x.cancelled)).toEqual([["hot-replay"], ["cold-replay"]]);
   expect(cold.journal.read("peer")).toEqual([]); expect(cold.runs).toEqual([]);
   expect(other.acks).toEqual([]); expect(other.runs).toEqual([]);
 });
@@ -233,7 +274,7 @@ it("repairs a new scoped accepted orphan once and keeps the journal authoritativ
   expect(cold.acks.every(ack => JSON.stringify(ack.committed) === JSON.stringify(echo))).toBe(true);
 });
 
-it("keeps failed cancellation fallback and durable recovery within its tenant", async () => {
+it.each(["flush", "overflow"] as const)("keeps failed cancellation fallback and durable recovery within its tenant through %s", async phase => {
   const path = root(); const p = persistence(path); const fallback = new CancelledInboundFallbackTombstones();
   await record(p.store, A, "accepted");
   const check = p.raw.cancelled.checkAndRecord.bind(p.raw.cancelled);
@@ -251,8 +292,13 @@ it("keeps failed cancellation fallback and durable recovery within its tenant", 
   expect(b.callbacks.isCancelledFallback!("peer", KEY)).toBe(false);
   await b.flush([item()]); await b.idle(); expect(b.runs).toHaveLength(1);
   fault.mockRestore();
-  a.overflow(); await a.idle();
-  expect(a.acks.map(x => x.ids)).toEqual([["overflow"]]); expect(fallback.has(KEY, A)).toBe(false);
+  if (phase === "flush") await a.flush([item("recovered")]);
+  else a.overflow("recovered");
+  await a.idle();
+  expect(a.acks.map(x => x.ids)).toEqual([["recovered"]]);
+  expect(a.acks[0].cancelled).toEqual(["recovered"]);
+  expect(b.acks[0].cancelled).toBeUndefined();
+  expect(fallback.has(KEY, A)).toBe(false);
   await a.close();
   expect(await persistence(path).store.lookup(A, KEY)).toEqual({ status: "found", outcome: "cancelled" });
   expect(await persistence(path).store.lookup(B, KEY)).toEqual({ status: "found", outcome: "accepted" });
@@ -311,4 +357,53 @@ it.each(["accepted", "cancelled", "overloaded"] as const)("does not renew the ex
   now.mockReturnValue(start + TTL);
   expect(await warm.store.lookup(A, KEY)).toEqual({ status: "not-found" });
   expect(await persistence(path).store.lookup(B, KEY)).toEqual({ status: "not-found" });
+});
+
+
+it.each(["lookup", "write"] as const)("keeps initial and reopened cancellation proof for a tenant's overflow-only target held at %s", async phase => {
+  const path = root(); const p = persistence(path);
+  const a = runtime(path, A, p, undefined, { debounceMs: 60_000, capacity: 1 });
+  const b = runtime(path, B, p);
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let reached = false;
+  const lookup = p.store.lookup.bind(p.store);
+  const recordOutcome = p.store.record.bind(p.store);
+  if (phase === "lookup") {
+    vi.spyOn(p.store, "lookup").mockImplementation(async (...args) => {
+      const result = await lookup(...args);
+      if (typeof args[0] !== "string" && args[0].tenant === A.tenant && args[1] === KEY) { reached = true; await held; }
+      return result;
+    });
+  } else {
+    vi.spyOn(p.store, "record").mockImplementation(async (...args) => {
+      const result = await recordOutcome(...args);
+      if (typeof args[0] !== "string" && args[0].tenant === A.tenant && args[1] === KEY && args[2] === "overloaded") { reached = true; await held; }
+      return result;
+    });
+  }
+  const stopMessage = item("stop-wire", "stop-logical"); stopMessage.message.text = "/stop";
+  try {
+    expect(a.debouncer.push(item("retained-wire", "retained"))).toEqual({ status: "accepted" });
+    expect(a.debouncer.push(item("overflow-wire"))).toMatchObject({ status: "overflow" });
+    await vi.waitFor(() => expect(reached).toBe(true));
+    expect(a.stop.handle(stopMessage, true)).toMatchObject({ fresh: true, targetCount: 2 });
+    expect(a.journal.dispatch!.isCancelled("peer", "logical")).toBe(true);
+    expect(a.journal.dispatch!.lookup("peer", "logical")).toBeUndefined();
+    expect(a.acks.map(ack => ({ ids: ack.ids, cancelled: ack.cancelled }))).toEqual([
+      { ids: ["retained-wire"], cancelled: ["retained-wire"] }, { ids: ["stop-wire"], cancelled: undefined },
+    ]);
+    expect(a.debouncer.push(item("held-retry"))).toEqual({ status: "known-outcome", outcome: "cancelled" });
+    expect(a.acks.at(-1)?.cancelled).toEqual(["held-retry"]);
+    await b.flush([item("other-tenant")]); await b.idle();
+    expect(b.runs).toHaveLength(1); expect(b.acks[0].cancelled).toBeUndefined();
+  } finally { release(); }
+  await a.idle(); expect(a.runs).toEqual([]); expect(a.rejected).toEqual([]); expect(a.control).toHaveBeenCalledOnce();
+  await a.close();
+  const cold = runtime(path, A);
+  await cold.flush([item("reopened-retained", "retained"), item("reopened-overflow")]);
+  expect(cold.acks[0].cancelled).toEqual(["reopened-retained", "reopened-overflow"]);
+  expect(cold.runs).toEqual([]); expect(cold.journal.read("peer")).toEqual([]);
+  expect(cold.stop.handle(stopMessage, true)).toMatchObject({ targetCount: 2 });
+  expect(cold.control).not.toHaveBeenCalled(); expect(cold.acks.at(-1)?.cancelled).toBeUndefined();
 });

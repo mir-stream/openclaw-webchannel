@@ -47,6 +47,18 @@ stop target suppresses the original input after reopen; a committed user row
 re-ACKs its original receipt without a fresh dispatch or marker migration. A row
 in another tenant's journal proves nothing for the current tenant.
 
+Protocol 6 cancellation receipts carry `ack.cancelled`, a subset of the same
+frame's wire IDs. A committed user row proves acceptance but does not disprove a
+later scoped cancellation. Flush and overflow lookup therefore check the current
+tenant's cancellation marker before emitting that row's receipt, without reading
+or adopting legacy markers for this purpose. Initial stop receipts for targets,
+cold/hot replays and durable fallback recovery preserve both the cancellation
+proof and any committed echo; the stop command's own ACK is receipt-only.
+
+The stop transaction also captures the resolver's one bounded overflow-only
+logical ID before retirement. Its retry cannot execute after cancellation, and
+the target belongs only to that tenant's journal and peer session.
+
 New tenant-scoped accepted markers still use ordinary orphan repair: if the
 matching journal row is absent, the normal admission path journals and dispatches
 once. Journaled requests remain deduplicated when the optimization marker is
@@ -54,9 +66,10 @@ absent. Cancellation write failures still withhold a receipt and recover through
 the same scoped fallback; the parent `/stop` implementation retains its atomic
 SQLite receipt/target transaction and replay behavior.
 
-No journal schema, wire protocol, credential format, or core dispatch policy is
-changed. Downgrading to an account-only outcome reader does not provide these
-identity guarantees.
+Tenant scoping adds no journal schema, credential format or dispatch policy
+change. It is stacked on the protocol 6 stop parent, whose cancellation ACK
+contract requires the matching client consumer. Downgrading to an account-only
+outcome reader does not provide these identity guarantees.
 
 ## Focused evidence
 
@@ -66,6 +79,9 @@ production ingress/recovery/debounce functions. It covers tenant/account/peer
 separation, warm and cold reads, journal reopen, all three ambiguous legacy
 outcomes, exact tuple acceptance and cancellation proof, accepted orphan repair,
 missing markers, cancellation failure/recovery, pending overflow isolation,
-legacy read faults and the existing TTL boundary. The agent dispatch recipient
+legacy read faults and the existing TTL boundary. Protocol 6 cases additionally
+check cancellation proof with a committed row, initial target versus command
+receipts, and overflow-only cancellation held at lookup/write then reopened.
+The agent dispatch recipient
 is controlled; these are not live gateway or browser tests. The parent's
 separate stop crash tests exercise actual child-process SIGKILL and reopen.

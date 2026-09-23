@@ -11,6 +11,7 @@ export function createStopControl<Item extends IngressDedupeItem>(deps: {
   recovery: DispatchRecovery;
   debouncer: Pick<BoundedInboundDebouncer<Item>, "retainedItems" | "cancelKey">;
   sendAck: DeliveryAck;
+  pendingOverflowKey(peer: string): string | undefined;
   retireOverflow(peer: string): void;
   dispatchControl(peer: string, message: Item["message"]): Promise<void>;
   isActive(): boolean;
@@ -20,12 +21,13 @@ export function createStopControl<Item extends IngressDedupeItem>(deps: {
   let disposed = false;
   const active = () => !disposed && deps.isActive() && deps.recovery.owns();
   const warn = (error: unknown) => { try { deps.warn(error); } catch { /* diagnostics */ } };
-  const ack = (item: Item) => {
+  const ack = (item: Item, cancelled = false) => {
     const identity = ingressIdentity(item);
     if (!identity || !active()) return;
     const row = deps.journal.lookupUserMessageIdByRandomId(item.peerId, identity.idempotencyKey);
     if (!deps.sendAck(item.peerId, [identity.wireId], row && identity.randomId !== undefined
-      ? [{ random_id: identity.randomId, ...row }] : undefined)) warn(new Error("webchannel: control receipt delivery failed"));
+      ? [{ random_id: identity.randomId, ...row }] : undefined,
+      cancelled ? [identity.wireId] : undefined)) warn(new Error("webchannel: control receipt delivery failed"));
   };
   return {
     handle(item: Item, cancelBuffered: boolean) {
@@ -39,10 +41,15 @@ export function createStopControl<Item extends IngressDedupeItem>(deps: {
         // retries without ACK while it is busy; duplicates already have receipts.
         if (pending.has(peer)) return;
         const buffered = cancelBuffered ? deps.debouncer.retainedItems(peer) : [];
-        const receipt = deps.recovery.recordStop(peer, key, buffered.flatMap(entry => {
+        const targets = buffered.flatMap(entry => {
           const identity = ingressIdentity(entry);
           return identity ? [identity.idempotencyKey] : [];
-        }), cancelBuffered);
+        });
+        // The bounded overflow resolver can own an ID with no reservation or
+        // dispatch row. Capture it in the same transaction before retiring it.
+        const overflowKey = cancelBuffered ? deps.pendingOverflowKey(peer) : undefined;
+        if (overflowKey !== undefined) targets.push(overflowKey);
+        const receipt = deps.recovery.recordStop(peer, key, targets, cancelBuffered);
         if (!receipt.fresh) { ack(item); return receipt; }
 
         // Hold new starts until core's async session-wide abort has returned.
@@ -70,7 +77,7 @@ export function createStopControl<Item extends IngressDedupeItem>(deps: {
         } catch (error) { release(); warn(error); }
         if (cancelBuffered) {
           deps.recovery.publishStop(peer, key);
-          for (const entry of buffered) ack(entry);
+          for (const entry of buffered) ack(entry, true);
         }
         ack(item);
         return receipt;
@@ -84,4 +91,4 @@ export function createStopControl<Item extends IngressDedupeItem>(deps: {
     },
   };
 }
-type DeliveryAck = (peer: string, ids: string[], committed?: Array<{ random_id: string; messageId: string; seq: number }>) => boolean;
+type DeliveryAck = (peer: string, ids: string[], committed?: Array<{ random_id: string; messageId: string; seq: number }>, cancelled?: string[]) => boolean;

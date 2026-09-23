@@ -65,9 +65,9 @@ describe("WebChannelNatsClient PoP registration wiring (NATS)",()=>{
     expect((h.client as unknown as {sessionKey:Uint8Array}).sessionKey).toBeTruthy();h.client.disconnect();
   });
 
-  it("protocol mismatch is terminal and never publishes inbound",async()=>{
+  it.each([5, WEBCHANNEL_PROTOCOL_VERSION + 1])("protocol %s mismatch is terminal and never publishes inbound",async(protocolVersion)=>{
     const h=await makeClient();const errors:Error[]=[];
-    FakeNatsWS.sharedHandler=registerAgent(new Uint8Array(32).fill(5),h.devicePublicRaw,h.identity,{versions:{protocolVersion:WEBCHANNEL_PROTOCOL_VERSION + 1}});
+    FakeNatsWS.sharedHandler=registerAgent(new Uint8Array(32).fill(5),h.devicePublicRaw,h.identity,{versions:{protocolVersion}});
     h.client.onError(e=>errors.push(e));h.client.connect();h.client.sendUserMessage("blocked");await settle();
     expect(errors[0]?.message).toMatch(/protocol/i);
     expect(FakeNatsWS.instances[0].readyState).toBe(FakeNatsWS.CLOSED);
