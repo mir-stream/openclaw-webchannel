@@ -23,7 +23,7 @@ import { WebChannelNATSClient, filterCommandCatalog } from "../../../packages/cl
 import type { WebChannelState, ApprovalRequest, ChatBubble } from "../../../packages/client/src/types.js";
 import { api, b64url, el, type DemoConfig } from "./config.js";
 import { renderMarkdown } from "./markdown.js";
-import { terminalErrorCopy } from "./error-copy.js";
+import { sendStatusCopy, terminalErrorCopy } from "./error-copy.js";
 import {
   orderConversationPresentation,
   captureOpenReasoningIds,
@@ -53,8 +53,9 @@ export async function createWidget(
   bodyEl: HTMLElement,
   config: DemoConfig,
   accountId: string,
+  signal?: AbortSignal,
 ): Promise<() => void> {
-  bodyEl.replaceChildren();
+  if (signal?.aborted) return () => {};
 
   const rv = config.accounts[accountId];
   if (!rv) throw new Error(`no rendezvous entry for account "${accountId}"`);
@@ -95,9 +96,37 @@ export async function createWidget(
       "border:1px solid var(--border);border-radius:6px;background:#161b22;max-height:180px;overflow:auto",
   });
   const composer = el("div", { style: "display:flex;gap:8px;margin-top:10px" }, [input, sendBtn]);
-  bodyEl.append(topBar, mdHint, errBox, list, cmdMenu, composer);
+  // A stale teardown may remove only its own mount, never a newer account's UI.
+  const root = el("div", {}, [topBar, mdHint, errBox, list, cmdMenu, composer]);
+  bodyEl.replaceChildren(root);
 
   let client: WebChannelNATSClient | null = null;
+  let unsubscribe: (() => void) | null = null;
+  let disposed = false;
+  let authGeneration = 0;
+  let authController: AbortController | null = null;
+  const debug = globalThis as unknown as Record<string, unknown>;
+  const readState = () => client?.getState();
+
+  function releaseClient(): void {
+    unsubscribe?.();
+    unsubscribe = null;
+    const previous = client;
+    client = null;
+    previous?.close();
+  }
+
+  function dispose(): void {
+    if (disposed) return;
+    disposed = true;
+    authGeneration++;
+    authController?.abort();
+    releaseClient();
+    signal?.removeEventListener("abort", dispose);
+    if (debug.__webchannelState === readState) delete debug.__webchannelState;
+    root.remove();
+  }
+  signal?.addEventListener("abort", dispose, { once: true });
   // P0-3 typeahead state. `commandsRequestedAt` makes catalog discovery LAZY
   // and self-healing: we record WHEN we last asked (reset to null in
   // connectLane, so a re-auth re-requests for the fresh client). If the catalog
@@ -224,7 +253,7 @@ export async function createWidget(
       el("div", {
         style: "display:flex;align-items:center;gap:6px;margin-top:4px;font-size:11px;opacity:.9",
       }, [
-        el("span", { style: "flex:1" }, ["⏳ queued — sends when the agent finishes"]),
+        renderSendStatus(m) ?? el("span", { style: "flex:1" }, ["Queued · waiting for the agent to finish"]),
         dismiss,
       ]),
     ]);
@@ -267,6 +296,30 @@ export async function createWidget(
         dismiss,
       ]),
     ]);
+  }
+
+  function renderSendStatus(message: ChatBubble): HTMLElement | undefined {
+    const copy = sendStatusCopy(message);
+    if (!copy) return undefined;
+    const status = el("div", {
+      class: "send-status",
+      "data-send-state": message.sendState!,
+      style: "font-size:11px;margin-top:4px",
+    }, [el("strong", {}, [copy.label])]);
+    if (copy.hint) status.append(el("div", {}, [copy.hint]));
+    if (copy.restoreDraft) {
+      // Restoring text never re-executes a task; Send remains a separate choice.
+      const restore = el("button", { style: "margin-top:4px;font-size:11px" }, ["Restore draft"]) as HTMLButtonElement;
+      restore.onclick = () => {
+        if (disposed) return;
+        input.value = input.value.trim() ? `${input.value} ${message.text}` : message.text;
+        input.focus();
+        renderMenu();
+        refreshComposerMode();
+      };
+      status.append(restore);
+    }
+    return status;
   }
 
   function render(state: WebChannelState): void {
@@ -388,6 +441,10 @@ export async function createWidget(
         },
         [child],
       );
+      if (isUser) {
+        const status = renderSendStatus(m);
+        if (status) bubble.append(status);
+      }
       if (isUser && m.requestState === "interrupted") {
         const retry = el("button", {}, ["Retry"]) as HTMLButtonElement;
         retry.onclick = () => { client?.retryInterrupted(m.id); };
@@ -487,8 +544,13 @@ export async function createWidget(
    * Device keys are regenerated per connect; the prior client is disconnected.
    */
   async function connectLane(ttlSeconds?: number): Promise<void> {
-    client?.close();
-    client = null;
+    if (disposed) return;
+    const generation = ++authGeneration;
+    authController?.abort();
+    const controller = new AbortController();
+    authController = controller;
+    const ownsAuth = () => !disposed && generation === authGeneration;
+    releaseClient();
     // Fresh client → re-request the command catalog on the next `/` (its state
     // starts without a catalog).
     commandsRequestedAt = null;
@@ -496,70 +558,78 @@ export async function createWidget(
     statusPill.textContent = "● connecting…";
     statusPill.style.color = "var(--warn)";
     errBox.classList.add("hidden");
+    // Drafting is allowed during authentication, but there is no SDK owner yet.
+    input.disabled = false;
+    sendBtn.disabled = true;
+    sendBtn.dataset.mode = "send";
+    sendBtn.textContent = "Send";
+    renderMenu();
 
-    // Device keys (PoP private key non-extractable).
-    const x25519 = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])) as CryptoKeyPair;
-    const deviceX25519PublicKey = b64url(await crypto.subtle.exportKey("raw", x25519.publicKey));
-    const ed25519 = (await crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign", "verify"])) as CryptoKeyPair;
-    const edPubJwk = (await crypto.subtle.exportKey("jwk", ed25519.publicKey)) as { x?: string };
-    if (!edPubJwk.x) throw new Error("Ed25519 public JWK missing 'x'");
-    const devicePopPublicKey = edPubJwk.x;
+    try {
+      // Device keys (PoP private key non-extractable).
+      const x25519 = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])) as CryptoKeyPair;
+      if (!ownsAuth()) return;
+      const deviceX25519PublicKey = b64url(await crypto.subtle.exportKey("raw", x25519.publicKey));
+      if (!ownsAuth()) return;
+      const ed25519 = (await crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign", "verify"])) as CryptoKeyPair;
+      if (!ownsAuth()) return;
+      const edPubJwk = (await crypto.subtle.exportKey("jwk", ed25519.publicKey)) as { x?: string };
+      if (!ownsAuth()) return;
+      if (!edPubJwk.x) throw new Error("Ed25519 public JWK missing 'x'");
+      const devicePopPublicKey = edPubJwk.x;
 
-    const creds = await api<{ userJwt?: string; userSeedRaw?: string; natsUrl?: string }>(
-      "/nats-user",
-      { method: "POST", body: ttlSeconds ? { role: "browser", ttlSeconds } : { role: "browser" } },
-    );
-    if (!creds.ok || !creds.data.userJwt || !creds.data.userSeedRaw) {
-      throw new Error(`nats-user failed (HTTP ${creds.status})`);
-    }
-    const boot = await api<{ jwt?: string; peerId?: string; natsUrl?: string; agentPublicKey?: string }>(
-      "/bootstrap",
-      { method: "POST", body: { accountId, deviceX25519PublicKey, devicePopPublicKey } },
-    );
-    if (!boot.ok || !boot.data.jwt || !boot.data.peerId) {
-      throw new Error(`bootstrap failed (HTTP ${boot.status}) ${JSON.stringify(boot.data)}`);
-    }
-    // F2: the register hop unwraps K against this SaaS-pinned agent key.
-    if (!boot.data.agentPublicKey) {
-      throw new Error("bootstrap response missing agentPublicKey (register-hop requires it)");
-    }
+      const creds = await api<{ userJwt?: string; userSeedRaw?: string; natsUrl?: string }>(
+        "/nats-user",
+        { method: "POST", body: ttlSeconds ? { role: "browser", ttlSeconds } : { role: "browser" }, signal: controller.signal },
+      );
+      if (!ownsAuth()) return;
+      if (!creds.ok || !creds.data.userJwt || !creds.data.userSeedRaw) {
+        throw new Error(`nats-user failed (HTTP ${creds.status})`);
+      }
+      const boot = await api<{ jwt?: string; peerId?: string; natsUrl?: string; agentPublicKey?: string }>(
+        "/bootstrap",
+        { method: "POST", body: { accountId, deviceX25519PublicKey, devicePopPublicKey }, signal: controller.signal },
+      );
+      if (!ownsAuth()) return;
+      if (!boot.ok || !boot.data.jwt || !boot.data.peerId) {
+        throw new Error(`bootstrap failed (HTTP ${boot.status}) ${JSON.stringify(boot.data)}`);
+      }
+      // F2: the register hop unwraps K against this SaaS-pinned agent key.
+      if (!boot.data.agentPublicKey) {
+        throw new Error("bootstrap response missing agentPublicKey (register-hop requires it)");
+      }
 
-    const natsUrl = boot.data.natsUrl ?? creds.data.natsUrl ?? rv.natsUrl;
+      const natsUrl = boot.data.natsUrl ?? creds.data.natsUrl ?? rv.natsUrl;
 
-    client = new WebChannelNATSClient({
-      natsUrl,
-      bootstrapJwt: boot.data.jwt,
-      accountId,
-      tenant: config.tenant,
-      peerId: boot.data.peerId,
-      natsCredentials: { userJwt: creds.data.userJwt, userSeedRaw: creds.data.userSeedRaw },
-      registration: {
-        // The register subject is derived from tenant/accountId/peerId; the
-        // client drives challenge→register over NATS request/reply (no gateway URL).
-        devicePrivateKey: ed25519.privateKey,
-        // Phase 6: register-delivered conversation key (no registration).
-        deviceX25519PrivateKey: x25519.privateKey,
-        // F2: pin the SaaS-attested agent key for K authentication.
-        pinnedAgentPublicKey: boot.data.agentPublicKey,
-      },
-    });
-    client.subscribe(render);
-    // Driver/debug hook: the verify-*.mjs drivers read message ids to make
-    // dedup assertions stronger than DOM text matching allows.
-    (globalThis as unknown as Record<string, unknown>).__webchannelState = () => client?.getState();
-    render(client.getState());
-    client.connect();
-  }
-
-  /**
-   * Fire-and-forget lane (re)connect. A failed re-auth (the /nats-user or
-   * /bootstrap SaaS fetch) rejects BEFORE any client exists, so no state event
-   * renders it — without this catch the errBox stays hidden and the pill sticks
-   * on "connecting…". Renders the failure into errBox with a retry that repeats
-   * the SAME request (incl. scene ⑤'s short TTL).
-   */
-  function connectLaneGuarded(ttlSeconds?: number): void {
-    connectLane(ttlSeconds).catch((err: unknown) => {
+      const nextClient = new WebChannelNATSClient({
+        natsUrl,
+        bootstrapJwt: boot.data.jwt,
+        accountId,
+        tenant: config.tenant,
+        peerId: boot.data.peerId,
+        natsCredentials: { userJwt: creds.data.userJwt, userSeedRaw: creds.data.userSeedRaw },
+        registration: {
+          // The register subject is derived from tenant/accountId/peerId; the
+          // client drives challenge→register over NATS request/reply (no gateway URL).
+          devicePrivateKey: ed25519.privateKey,
+          // Phase 6: register-delivered conversation key (no registration).
+          deviceX25519PrivateKey: x25519.privateKey,
+          // F2: pin the SaaS-attested agent key for K authentication.
+          pinnedAgentPublicKey: boot.data.agentPublicKey,
+        },
+      });
+      client = nextClient;
+      unsubscribe = nextClient.subscribe((state) => {
+        if (ownsAuth() && client === nextClient) render(state);
+      });
+      // Driver/debug hook: the verify-*.mjs drivers read message ids to make
+      // dedup assertions stronger than DOM text matching allows.
+      debug.__webchannelState = readState;
+      render(nextClient.getState());
+      nextClient.connect();
+    } catch (err: unknown) {
+      if (!ownsAuth()) return;
+      releaseClient();
       statusPill.textContent = "● error";
       statusPill.style.color = "var(--bad)";
       const retry = el("button", { class: "primary", style: "margin-top:8px;font-size:12px" }, ["Re-authenticate"]) as HTMLButtonElement;
@@ -571,9 +641,13 @@ export async function createWidget(
         retry,
       );
       errBox.classList.remove("hidden");
-      input.disabled = true;
+      input.disabled = false;
       sendBtn.disabled = true;
-    });
+    }
+  }
+
+  function connectLaneGuarded(ttlSeconds?: number): void {
+    void connectLane(ttlSeconds);
   }
 
   // ── Wiring ────────────────────────────────────────────────────────────────
@@ -593,8 +667,9 @@ export async function createWidget(
   shortBtn.onclick = () => { connectLaneGuarded(SHORT_TTL_SECONDS); };
   const submit = () => {
     const text = input.value.trim();
-    if (!text) return;
-    client?.send(text);
+    if (!text || disposed || !client || client.getState().status === "error") return;
+    // send() returns a receipt only once the SDK owns the draft.
+    if (!client.send(text)) return;
     input.value = "";
     renderMenu(); // hide the typeahead once the message is sent
     // Clearing the draft programmatically fires no `oninput`, and send()'s own
@@ -608,6 +683,7 @@ export async function createWidget(
   // can never disagree. Stop sends the literal "/stop" through the SAME send
   // path a typed "/stop" would take.
   sendBtn.onclick = () => {
+    if (disposed || sendBtn.disabled) return;
     if (sendBtn.dataset.mode === "stop") {
       client?.send("/stop");
       return;
@@ -634,8 +710,5 @@ export async function createWidget(
 
   await connectLane();
 
-  return () => {
-    client?.close();
-    bodyEl.replaceChildren();
-  };
+  return dispose;
 }

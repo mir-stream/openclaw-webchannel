@@ -9,7 +9,7 @@
  * (state carries no cause) resolves to the `unknown` entry — the safe default of
  * still offering re-auth (a useless click is cheaper than a dead-end screen).
  */
-import type { WebChannelErrorCause } from "../../../packages/client/src/index.js";
+import type { ChatBubble, WebChannelErrorCause } from "../../../packages/client/src/index.js";
 
 export type TerminalErrorCopy = {
   /** Bold heading — names WHAT failed. */
@@ -72,4 +72,45 @@ const COPY: Record<WebChannelErrorCause, TerminalErrorCopy> = {
  */
 export function terminalErrorCopy(cause: WebChannelErrorCause | undefined): TerminalErrorCopy {
   return COPY[cause ?? "unknown"] ?? COPY.unknown;
+}
+
+/** Delivery receipts do not prove execution; requestState is rendered separately. */
+export function sendStatusCopy(message: ChatBubble): { label: string; hint?: string; restoreDraft?: boolean } | undefined {
+  switch (message.sendState) {
+    case "queued": return { label: message.pending ? "Queued · waiting for the agent to finish" : "Queued · waiting to send" };
+    case "sent": return { label: "Sent · awaiting acceptance" };
+    case "accepted": return { label: "Accepted by agent" };
+    case "completed": return { label: "Completed" };
+    // The durable request status already explains interrupted execution.
+    case "interrupted": return undefined;
+    case "failed": {
+      const failure = message.sendFailure;
+      const restoreDraft = failure?.retryable === true;
+      switch (failure?.reason) {
+        case "overloaded": return {
+          label: "Send failed · agent overloaded",
+          hint: "The agent did not accept this message. Restore the draft and send when ready.",
+          restoreDraft,
+        };
+        case "turn-failed": return {
+          label: "Request failed after acceptance",
+          hint: "The task may have had effects. Check the result before sending again.",
+          restoreDraft,
+        };
+        case "evicted": return {
+          label: "Send failed · delivery unconfirmed",
+          hint: "The delivery tracking limit was reached. The task may have run; check before sending again.",
+          restoreDraft,
+        };
+        case "terminal": {
+          const copy = terminalErrorCopy(failure.cause);
+          return { label: `Send failed · ${copy.heading}`, hint: `${copy.hint} Check any effects before sending again.` };
+        }
+        case "closed": return { label: "Send failed · connection closed", hint: "Delivery is unconfirmed. Check any effects before sending again." };
+        case "cancelled": return { label: "Send failed · cancelled" };
+        default: return { label: "Send failed", hint: "Check the connection and any effects before sending again." };
+      }
+    }
+    default: return undefined;
+  }
 }
