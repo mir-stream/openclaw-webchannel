@@ -1,3 +1,5 @@
+import { ingressScopeNamespace, type IngressScope } from "./ingress-scope.js";
+import type { StorageScopeIdentity } from "./storage-identity.js";
 import { Buffer } from "node:buffer";
 import type { IngressOutcomeStore } from "./ingress-outcome.js";
 import { MAX_INGRESS_RESULT_IDS } from "./ingress-result-chunks.js";
@@ -9,6 +11,7 @@ const OVERFLOW_RESOLVER_METADATA_OVERHEAD = 192;
 
 export type OverflowResolutionRequest = {
   accountId: string;
+  storageScope?: StorageScopeIdentity;
   peerId: string;
   key: string;
   id: string;
@@ -67,6 +70,8 @@ type ActiveTask = {
 
 export function overflowResolverMetadataBytes(request: OverflowResolutionRequest): number {
   return Buffer.byteLength(request.accountId, "utf8")
+    + Buffer.byteLength(request.storageScope?.tenant ?? "", "utf8")
+    + Buffer.byteLength(request.storageScope?.accountId ?? "", "utf8")
     + Buffer.byteLength(request.peerId, "utf8")
     + Buffer.byteLength(request.key, "utf8")
     + Buffer.byteLength(request.id, "utf8")
@@ -78,7 +83,7 @@ export function overflowResolverMetadataBytes(request: OverflowResolutionRequest
 /** No-wait bounded resolution for ids whose raw frame could not be retained. */
 export class BoundedOverflowResolver {
   private readonly activeBySession = new Map<RetentionSessionToken, ActiveTask>();
-  private readonly activeClaimsByAccount = new Map<string, Map<string, ActiveTask>>();
+  private readonly activeClaimsByNamespace = new Map<string, Map<string, ActiveTask>>();
   private activeBytes = 0;
   private disposed = false;
   private readonly maxTasks: number;
@@ -91,8 +96,8 @@ export class BoundedOverflowResolver {
     if (!Number.isSafeInteger(this.maxMetadataBytes) || this.maxMetadataBytes < 0) throw new TypeError("maxMetadataBytes is invalid");
   }
 
-  hasActiveClaim(accountId: string, key: string): boolean {
-    return this.activeClaimsByAccount.get(accountId)?.has(key) ?? false;
+  hasActiveClaim(scope: IngressScope, key: string): boolean {
+    return this.activeClaimsByNamespace.get(ingressScopeNamespace(scope))?.has(key) ?? false;
   }
 
   tryStart(request: OverflowResolutionRequest): OverflowResolverStart {
@@ -105,9 +110,13 @@ export class BoundedOverflowResolver {
         || request.randomId.length === 0 || request.randomId.length > 128))
       || (request.recoverCancelled !== undefined && typeof request.recoverCancelled !== "boolean")
     ) return { status: "invalid" };
+    try {
+      if (request.storageScope && request.storageScope.accountId !== request.accountId) return { status: "invalid" };
+      ingressScopeNamespace(request.storageScope ?? request.accountId);
+    } catch { return { status: "invalid" }; }
     const active = this.activeBySession.get(request.sessionToken);
     if (active) {
-      if (active.cancelled || active.request.accountId !== request.accountId
+      if (active.cancelled || ingressScopeNamespace(active.request.storageScope ?? active.request.accountId) !== ingressScopeNamespace(request.storageScope ?? request.accountId)
         || active.request.peerId !== request.peerId || active.request.key !== request.key
         || (request.recoverCancelled === true && !active.request.recoverCancelled)
         || active.correlations.some((value) => value.id === request.id && value.randomId === request.randomId)) {
@@ -123,7 +132,7 @@ export class BoundedOverflowResolver {
       this.activeBytes += bytes;
       return { status: "joined" };
     }
-    if (this.hasActiveClaim(request.accountId, request.key)) return { status: "busy-key" };
+    if (this.hasActiveClaim(request.storageScope ?? request.accountId, request.key)) return { status: "busy-key" };
     if (this.activeBySession.size >= this.maxTasks) return { status: "process-count" };
     const bytes = overflowResolverMetadataBytes(request);
     if (bytes > this.maxMetadataBytes - this.activeBytes) return { status: "process-bytes" };
@@ -132,10 +141,10 @@ export class BoundedOverflowResolver {
     const retained = this.copyRequest(request);
     const task: ActiveTask = { request: retained, correlations: [retained], bytes, cancelled: false, released: false };
     this.activeBySession.set(retained.sessionToken, task);
-    let accountClaims = this.activeClaimsByAccount.get(retained.accountId);
+    let accountClaims = this.activeClaimsByNamespace.get(ingressScopeNamespace(retained.storageScope ?? retained.accountId));
     if (!accountClaims) {
       accountClaims = new Map();
-      this.activeClaimsByAccount.set(retained.accountId, accountClaims);
+      this.activeClaimsByNamespace.set(ingressScopeNamespace(retained.storageScope ?? retained.accountId), accountClaims);
     }
     accountClaims.set(retained.key, task);
     this.activeBytes += bytes;
@@ -157,10 +166,10 @@ export class BoundedOverflowResolver {
     return true;
   }
 
-  invalidateAccount(accountId: string): number {
+  invalidateAccount(scope: IngressScope): number {
     let count = 0;
     for (const task of [...this.activeBySession.values()]) {
-      if (task.request.accountId !== accountId) continue;
+      if (ingressScopeNamespace(task.request.storageScope ?? task.request.accountId) !== ingressScopeNamespace(scope)) continue;
       if (task.cancelled) continue;
       task.cancelled = true;
       count++;
@@ -184,7 +193,9 @@ export class BoundedOverflowResolver {
 
   private copyRequest(request: OverflowResolutionRequest): OverflowResolutionRequest {
     return {
-      accountId: request.accountId, peerId: request.peerId, key: request.key,
+      accountId: request.accountId,
+      ...(request.storageScope ? { storageScope: Object.freeze({ ...request.storageScope }) } : {}),
+      peerId: request.peerId, key: request.key,
       id: request.id, randomId: request.randomId, sessionToken: request.sessionToken,
       recoverCancelled: request.recoverCancelled === true,
     };
@@ -198,7 +209,7 @@ export class BoundedOverflowResolver {
       if (request.recoverCancelled) {
         // /stop fallback is authoritative over an ordinary overload marker.
         const recorded = await this.options.outcomeStore.record(
-          request.accountId, request.key, "cancelled", { replaceOthers: true },
+          request.storageScope ?? request.accountId, request.key, "cancelled", { replaceOthers: true },
         );
         if (task.cancelled || this.disposed) {
           if (recorded.status === "recorded") await recorded.write.rollback();
@@ -213,7 +224,12 @@ export class BoundedOverflowResolver {
         outcome = "cancelled";
         row = this.userRowFor(request, idempotencyKeyOf(request));
       } else {
-        const known = await this.options.outcomeStore.lookup(request.accountId, request.key);
+        // Exact tuple journal proof precedes unbound historical markers, while
+        // a scoped cancellation still supplies this ACK's cancellation metadata.
+        row = request.storageScope ? this.userRowFor(request, idempotencyKeyOf(request)) : undefined;
+        const known = row
+          ? await this.options.outcomeStore.lookup(request.storageScope ?? request.accountId, request.key, { journalAccepted: true })
+          : await this.options.outcomeStore.lookup(request.storageScope ?? request.accountId, request.key);
         if (task.cancelled || this.disposed || known.status === "unknown") return;
         if (known.status === "found") {
           outcome = known.outcome;
@@ -222,7 +238,7 @@ export class BoundedOverflowResolver {
           // unresolved for normal admission; cancelled needs no journal row.
           if (outcome === "accepted" && this.options.lookupUserRow !== undefined && row === undefined) return;
         } else {
-          const recorded = await this.options.outcomeStore.record(request.accountId, request.key, "overloaded");
+          const recorded = await this.options.outcomeStore.record(request.storageScope ?? request.accountId, request.key, "overloaded");
           if (task.cancelled || this.disposed) {
             if (recorded.status === "recorded") await recorded.write.rollback();
             return;
@@ -292,9 +308,9 @@ export class BoundedOverflowResolver {
     if (this.activeBySession.get(task.request.sessionToken) === task) {
       this.activeBySession.delete(task.request.sessionToken);
     }
-    const accountClaims = this.activeClaimsByAccount.get(task.request.accountId);
+    const accountClaims = this.activeClaimsByNamespace.get(ingressScopeNamespace(task.request.storageScope ?? task.request.accountId));
     if (accountClaims?.get(task.request.key) === task) accountClaims.delete(task.request.key);
-    if (accountClaims?.size === 0) this.activeClaimsByAccount.delete(task.request.accountId);
+    if (accountClaims?.size === 0) this.activeClaimsByNamespace.delete(ingressScopeNamespace(task.request.storageScope ?? task.request.accountId));
     this.activeBytes -= task.bytes;
     if (this.activeBytes < 0) throw new Error("overflow resolver metadata accounting underflow");
   }

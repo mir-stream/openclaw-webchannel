@@ -1,3 +1,4 @@
+import type { StorageScopeIdentity } from "./storage-identity.js";
 import type { BoundedInboundDebouncerOptions } from "./bounded-inbound-debouncer.js";
 import type { CancelledInboundFallbackTombstones, IngressDedupeItem } from "./ingress-dedupe.js";
 import { ingressDedupeKey, ingressIdentity } from "./ingress-dedupe.js";
@@ -13,6 +14,7 @@ type CallbackOptions<Item> = Pick<BoundedInboundDebouncerOptions<Item>,
 /** The account runtime's pre-debounce and overflow wiring, shared with integration tests. */
 export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(deps: {
   accountId: string;
+  storageScope?: StorageScopeIdentity;
   outcomeStore: IngressOutcomeStore;
   overflowResolver: BoundedOverflowResolver;
   cancelledFallback: CancelledInboundFallbackTombstones;
@@ -23,21 +25,22 @@ export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(d
   onPressure?: BoundedInboundDebouncerOptions<Item>["onOverflow"];
 }): CallbackOptions<Item> {
   const { accountId, outcomeStore, overflowResolver, cancelledFallback } = deps;
+  const outcomeScope = deps.storageScope ?? accountId;
   return {
     getId: (item) => ingressIdentity(item)?.wireId,
     getDedupeKey: ingressDedupeKey,
-    isOverflowClaimed: (peerId, key) => !deps.deliveryJournal.dispatch?.isCancelled(peerId, key.slice(peerId.length + 1)) && overflowResolver.hasActiveClaim(accountId, key),
+    isOverflowClaimed: (peerId, key) => !deps.deliveryJournal.dispatch?.isCancelled(peerId, key.slice(peerId.length + 1)) && overflowResolver.hasActiveClaim(outcomeScope, key),
     onOverflowClaimed: (item) => {
       const identity = ingressIdentity(item)!;
       overflowResolver.tryStart({
-        accountId, peerId: item.peerId, id: identity.wireId, key: identity.key,
+        accountId, storageScope: deps.storageScope, peerId: item.peerId, id: identity.wireId, key: identity.key,
         randomId: identity.randomId, sessionToken: deps.sessionToken(item.peerId),
-        recoverCancelled: cancelledFallback.has(identity.key, accountId),
+        recoverCancelled: cancelledFallback.has(identity.key, outcomeScope),
       });
     },
-    isCancelledFallback: (peerId, key) => !deps.deliveryJournal.dispatch?.isCancelled(peerId, key.slice(peerId.length + 1)) && cancelledFallback.has(key, accountId),
+    isCancelledFallback: (peerId, key) => !deps.deliveryJournal.dispatch?.isCancelled(peerId, key.slice(peerId.length + 1)) && cancelledFallback.has(key, outcomeScope),
     peekOutcome: (peerId, key) => deps.deliveryJournal.dispatch?.isCancelled(peerId, key.slice(peerId.length + 1))
-      ? "cancelled" : outcomeStore.peek(accountId, key),
+      ? "cancelled" : outcomeStore.peek(outcomeScope, key),
     onKnownOutcome: (peerId, id, outcome, item) => {
       if (outcome === "overloaded") deps.sendRejected(peerId, [id]);
       else {
@@ -63,7 +66,7 @@ export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(d
       const identity = ingressIdentity(item);
       if (!identity) return;
       overflowResolver.tryStart({
-        accountId, peerId, id: identity.wireId, key: identity.key, randomId: identity.randomId,
+        accountId, storageScope: deps.storageScope, peerId, id: identity.wireId, key: identity.key, randomId: identity.randomId,
         sessionToken: deps.sessionToken(peerId), recoverCancelled,
       });
     },
