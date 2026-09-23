@@ -20,7 +20,7 @@ export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(d
   cancelledFallback: CancelledInboundFallbackTombstones;
   deliveryJournal: Pick<DeliveryJournal, "lookupUserMessageIdByRandomId" | "dispatch">;
   sessionToken(peerId: string): RetentionSessionToken;
-  sendAck(peerId: string, ids: string[], committed?: Array<{ random_id: string; messageId: string; seq: number }>): boolean;
+  sendAck(peerId: string, ids: string[], committed?: Array<{ random_id: string; messageId: string; seq: number }>, cancelled?: string[]): boolean;
   sendRejected(peerId: string, ids: string[]): boolean;
   onPressure?: BoundedInboundDebouncerOptions<Item>["onOverflow"];
 }): CallbackOptions<Item> {
@@ -53,7 +53,7 @@ export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(d
         } catch { /* A journal fault does not undo a known cancellation. */ }
         deps.sendAck(peerId, [id], row && identity.randomId !== undefined
           ? [{ random_id: identity.randomId, ...row }]
-          : undefined);
+          : undefined, outcome === "cancelled" ? [id] : undefined);
       }
     },
     onOverflow: (params) => {

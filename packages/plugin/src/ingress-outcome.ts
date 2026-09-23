@@ -156,7 +156,10 @@ export interface OutcomeWriteReceipt {
 
 export interface IngressOutcomeStore {
   peek(scope: IngressScope, key: string): IngressOutcome | undefined;
-  lookup(scope: IngressScope, key: string): Promise<OutcomeLookup>;
+  lookup(scope: IngressScope, key: string, options?: {
+    /** Exact tuple user row exists; still check scoped cancellation for ACK proof. */
+    journalAccepted?: boolean;
+  }): Promise<OutcomeLookup>;
   record(
     scope: IngressScope,
     key: string,
@@ -370,7 +373,7 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
     };
   };
 
-  const lookupUnlocked = async (namespace: string, key: string): Promise<OutcomeLookup> => {
+  const lookupUnlocked = async (namespace: string, key: string, journalAccepted = false): Promise<OutcomeLookup> => {
     // Probe in precedence order and stop at the first hit. A store fault at ANY
     // rung is still `unknown` for the whole lookup — a lower rung's silence
     // cannot be read as absence when a higher one could not be read at all.
@@ -424,6 +427,10 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
         options.warnFailure?.(namespace, `lookup-${outcome}`);
         return { status: "unknown", error: probe.diskError };
       }
+      // A user row proves acceptance but does not disprove a later cancellation.
+      // Inspect that scoped marker first; never attribute a legacy marker to the
+      // row's tenant or let it change this receipt's cancellation metadata.
+      if (journalAccepted) return { status: "found", outcome: "accepted" };
     }
     return { status: "not-found" };
   };
@@ -500,13 +507,13 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
       return hot.get(hotKey(namespace, key))?.outcome;
     },
 
-    async lookup(scope, key) {
+    async lookup(scope, key, lookupOptions) {
       const namespace = ingressScopeNamespace(scope);
       const releaseOperation = await acquireOperation(namespace, key);
       try {
         const recovery = await recoverFailedRollbackUnlocked(namespace, key);
         if (recovery.status === "unknown") return recovery;
-        const scoped = await lookupUnlocked(namespace, key);
+        const scoped = await lookupUnlocked(namespace, key, lookupOptions?.journalAccepted);
         return scoped.status === "not-found" ? await lookupLegacy(scope, key) : scoped;
       } catch (error) {
         return { status: "unknown", error };

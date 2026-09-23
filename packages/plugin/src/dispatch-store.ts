@@ -167,7 +167,15 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
     settle: (owner, peer, batch, state) => runSqliteImmediateTransactionSync(db, () => {
       checkOwner(owner);
       const changes = transition(sql("SELECT * FROM journal_dispatch WHERE peer_id=? AND owner=? AND batch=? AND state='started' ORDER BY user_seq").all(peer, owner, batch) as Stored[], state);
-      if (state === "completed" || state === "failed") sql("DELETE FROM journal_dispatch_core WHERE batch=?").run(batch);
+      // The SDK's abort race can return before underlying core work persists a
+      // terminal session state. A late settlement of cancelled/interrupted work
+      // must keep the binding for verified startup retirement, even when other
+      // members of the batch can still transition. Normal settlement retires
+      // only the batch it actually completed.
+      if ((state === "completed" || state === "failed") && changes.length > 0
+        && !sql("SELECT 1 FROM journal_dispatch WHERE peer_id=? AND owner=? AND batch=? AND state IN ('cancelled','interrupted') LIMIT 1").get(peer, owner, batch)) {
+        sql("DELETE FROM journal_dispatch_core WHERE batch=?").run(batch);
+      }
       return changes;
     }),
     recoverInterrupted: (owner) => {

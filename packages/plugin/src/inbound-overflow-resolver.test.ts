@@ -566,7 +566,7 @@ describe("BoundedOverflowResolver", () => {
     expect(overloaded).toEqual(new Set());
     expect(acked).toHaveBeenCalledWith(expect.objectContaining({
       accountId, peerId, id, key, recoverCancelled: true,
-    }));
+    }), undefined, true);
     expect(rejected).not.toHaveBeenCalled();
     expect(dispatched).not.toHaveBeenCalled();
     expect(fallback.has(key, accountId)).toBe(false);

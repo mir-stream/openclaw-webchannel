@@ -17,7 +17,7 @@ import { tupleStoragePaths } from "./storage-paths.js";
 import { createStopControl } from "./stop-control.js";
 
 type Item = { peerId: string; message: UserMessageLike };
-type Ack = { peerId: string; ids: string[]; committed?: Array<{ random_id: string; messageId: string; seq: number }> };
+type Ack = { peerId: string; ids: string[]; cancelled?: string[]; committed?: Array<{ random_id: string; messageId: string; seq: number }> };
 const item = (key: string, device = "device-1", peerId = "RawPeer"): Item => ({
   peerId, message: { type: "user_message", id: `${device}:${key}`, random_id: `logical-${key}`, text: key === "S" ? "/stop" : key },
 });
@@ -70,8 +70,8 @@ function setup(options: {
   const acks: Ack[] = [];
   const errors: unknown[] = [];
   const rejected: string[][] = [];
-  const sendAck = (peerId: string, ids: string[], committed?: Ack["committed"]) => {
-    const ack = { peerId, ids: [...ids], committed };
+  const sendAck = (peerId: string, ids: string[], committed?: Ack["committed"], cancelled?: string[]) => {
+    const ack = { peerId, ids: [...ids], committed, cancelled };
     options.onAck?.(ack);
     acks.push(ack);
     return !(options.loseStopAck && ids.includes("device-2:S"));
@@ -93,7 +93,7 @@ function setup(options: {
   const fallback = new CancelledInboundFallbackTombstones();
   const resolver = new BoundedOverflowResolver({
     outcomeStore: store, lookupUserRow: ({ peerId }, key) => journal.lookupUserMessageIdByRandomId(peerId, key),
-    sendAck: ({ peerId, id }, committed) => sendAck(peerId, [id], committed),
+    sendAck: ({ peerId, id }, committed, cancelled) => sendAck(peerId, [id], committed, cancelled ? [id] : undefined),
     sendRejected: ({ peerId, id }) => sendRejected(peerId, [id]),
   });
   const flush = createIngressOnFlush<Item>({
@@ -113,6 +113,7 @@ function setup(options: {
   });
   const core = vi.fn(async (_peer: string, _message: UserMessageLike) => { await coreHold.promise; });
   const stop = createStopControl({ journal, recovery, debouncer, dispatchControl: core, sendAck,
+    pendingOverflowKey: peer => resolver.pendingLogicalKey(sessionToken(peer)),
     retireOverflow: peer => { resolver.invalidateSession(sessionToken(peer)); },
     isActive: () => active, warn: error => errors.push(error) });
   const idle = () => vi.waitFor(() => {
@@ -135,7 +136,7 @@ function setup(options: {
     await close();
   });
   return { root, paths, journal, store, budget, recovery, debouncer, resolver, stop, runs, core, acks, errors, rejected, onCancel,
-    flush, idle, close, release: (key: string) => holds.get(`logical-${key}`)?.resolve(), releaseCore: coreHold.resolve };
+    fallback, flush, idle, close, release: (key: string) => holds.get(`logical-${key}`)?.resolve(), releaseCore: coreHold.resolve };
 }
 
 it("commits another device's debounced target before the stop ACK, surviving immediate teardown and reopen", async () => {
@@ -151,6 +152,7 @@ it("commits another device's debounced target before the stop ACK, surviving imm
   expect(h.debouncer.push(item("A"))).toEqual({ status: "accepted" });
   expect(h.stop.handle(item("S", "device-2"), true)).toMatchObject({ fresh: true, targetCount: 1 });
   expect(h.acks.map(ack => ack.ids)).toEqual([["device-1:A"], ["device-2:S"]]);
+  expect(h.acks.map(ack => ack.cancelled)).toEqual([["device-1:A"], undefined]);
   expect(h.budget.usage()).toEqual({ messages: 0, bytes: 0 });
   await h.close();
   expect(h.onCancel).not.toHaveBeenCalled();
@@ -160,6 +162,7 @@ it("commits another device's debounced target before the stop ACK, surviving imm
   expect(fresh.runs).toEqual([]);
   expect(fresh.journal.read("RawPeer")).toEqual([]);
   expect(fresh.acks.map(ack => ack.ids)).toEqual([["device-1-retry:A"], ["device-1-retry-again:A"]]);
+  expect(fresh.acks.map(ack => ack.cancelled)).toEqual([["device-1-retry:A"], ["device-1-retry-again:A"]]);
 });
 
 it("one stop durably covers running, busy-queued and debounce targets without re-running them after reopen", async () => {
@@ -181,6 +184,7 @@ it("one stop durably covers running, busy-queued and debounce targets without re
   await new Promise(setImmediate);
   expect(fresh.runs).toEqual([]);
   expect(fresh.acks.at(-1)?.committed).toHaveLength(2);
+  expect(fresh.acks.at(-1)?.cancelled).toEqual(["retry:A", "retry:B", "retry:C"]);
 });
 
 it.each([false, true])("a lost stop ACK cannot cancel new running/buffered work on retransmission (reopen=%s)", async reopen => {
@@ -202,6 +206,7 @@ it.each([false, true])("a lost stop ACK cannot cancel new running/buffered work 
   expect(h.budget.usage()).toEqual(charge);
   expect(h.journal.dispatch!.isCancelled("RawPeer", "logical-C")).toBe(false);
   expect(h.acks.at(-1)?.ids).toEqual(["device-2-retry:S"]);
+  expect(h.acks.at(-1)?.cancelled).toBeUndefined();
   h.release("B");
   await h.idle();
   expect(h.runs.map(run => run.message.text)).toEqual(["B", "C"]);
@@ -291,6 +296,65 @@ it.each(["accepted", "overloaded"] as const)("durable cancellation wins over a s
   await h.store.lookup("ExactAccount", "RawPeer:logical-A");
   expect(h.debouncer.push(item("A", "hot-retry"))).toEqual({ status: "known-outcome", outcome: "cancelled" });
   expect(h.acks.map(ack => ack.ids)).toEqual([["cold-retry:A"], ["hot-retry:A"]]);
+  expect(h.acks.map(ack => ack.cancelled)).toEqual([["cold-retry:A"], ["hot-retry:A"]]);
+});
+
+it.each(["flush", "overflow"] as const)("proves a cold durable SDK cancellation through %s and later hot replay without a journal row", async phase => {
+  const original = setup();
+  const write = await original.store.record("ExactAccount", "RawPeer:logical-B", "cancelled");
+  if (write.status !== "recorded") throw write.error;
+  expect(write.durability).toBe("durable"); write.write.commit();
+  await original.close();
+  const h = setup({ root: original.root, capacity: 1 });
+  expect(h.store.peek("ExactAccount", "RawPeer:logical-B")).toBeUndefined();
+  if (phase === "flush") await h.flush([item("B", "cold")]);
+  else {
+    h.debouncer.push(item("A"));
+    expect(h.debouncer.push(item("B", "cold"))).toMatchObject({ status: "overflow" });
+    await vi.waitFor(() => expect(h.resolver.usage().tasks).toBe(0));
+  }
+  expect(h.acks).toEqual([{ peerId: "RawPeer", ids: ["cold:B"], committed: undefined, cancelled: ["cold:B"] }]);
+  expect(h.debouncer.push(item("B", "hot"))).toEqual({ status: "known-outcome", outcome: "cancelled" });
+  expect(h.acks.at(-1)?.cancelled).toEqual(["hot:B"]);
+  expect(h.journal.lookupUserMessageIdByRandomId("RawPeer", "logical-B")).toBeUndefined();
+  expect(h.runs).toEqual([]);
+});
+
+it.each(["flush", "overflow"] as const)("withholds cancellation proof for memory-only and unknown fallback writes through %s", async phase => {
+  const h = setup({ capacity: 1 });
+  h.fallback.add("RawPeer:logical-B", "ExactAccount");
+  const commit = vi.fn(); const rollback = vi.fn(async () => true);
+  const record = h.store.record.bind(h.store);
+  const fault = vi.spyOn(h.store, "record").mockImplementationOnce(async () => ({ status: "recorded",
+    durability: "memory-only", write: { outcome: "cancelled", durability: "memory-only", created: true, commit, rollback },
+  })).mockImplementationOnce(async () => ({ status: "unknown", error: new Error("write unavailable") }));
+  const retry = async (device: string) => {
+    if (phase === "flush") await h.flush([item("B", device)]);
+    else {
+      expect(h.debouncer.push(item("B", device))).toMatchObject({ status: "overflow" });
+      await vi.waitFor(() => expect(h.resolver.usage().tasks).toBe(0));
+    }
+  };
+  if (phase === "overflow") h.debouncer.push(item("A"));
+  await retry("memory"); await retry("unknown");
+  expect(commit).not.toHaveBeenCalled(); expect(rollback).toHaveBeenCalledOnce();
+  expect(h.acks).toEqual([]); expect(h.rejected).toEqual([]); expect(h.runs).toEqual([]);
+  expect(h.fallback.has("RawPeer:logical-B", "ExactAccount")).toBe(true);
+  // A durable retry can now prove cancellation, and the stored marker survives reopen.
+  fault.mockImplementation(record);
+  await retry("durable");
+  expect(h.acks.at(-1)?.cancelled).toEqual(["durable:B"]);
+  expect(await h.store.lookup("ExactAccount", "RawPeer:logical-B")).toEqual({ status: "found", outcome: "cancelled" });
+});
+
+it("withholds every receipt when the durable cancellation read fails", async () => {
+  const h = setup();
+  h.debouncer.push(item("A")); h.stop.handle(item("S", "device-2"), true);
+  h.acks.length = 0;
+  vi.spyOn(h.journal.dispatch!, "isCancelled").mockImplementation(() => { throw new Error("SQLite read unavailable"); });
+  await h.flush([item("A", "read-fault")]);
+  expect(() => h.debouncer.push(item("A", "hot-read-fault"))).toThrow("SQLite read unavailable");
+  expect(h.acks).toEqual([]); expect(h.runs).toEqual([]);
 });
 
 it.each(["lookup", "overloaded"] as const)("retires a cold overflow alias held at its SDK %s return before sending the stop ACK", async phase => {
@@ -330,6 +394,50 @@ it.each(["lookup", "overloaded"] as const)("retires a cold overflow alias held a
     expect(await h.store.lookup("ExactAccount", "RawPeer:logical-A")).toEqual({ status: "not-found" });
     expect(h.journal.dispatch!.lookup("RawPeer", "logical-A")?.state).toBe("cancelled");
   } finally { resume.resolve(); h.release("A"); spy.mockRestore(); }
+});
+
+it.each(["lookup", "overloaded"] as const)("atomically captures overflow-only B held at its SDK %s return before retiring it", async phase => {
+  const h = setup({ capacity: 1, onAck: ack => {
+    if (ack.ids.includes("device-2:S")) {
+      expect(h.journal.dispatch!.isCancelled("RawPeer", "logical-B")).toBe(true);
+    }
+  } });
+  expect(h.debouncer.push(item("A"))).toEqual({ status: "accepted" });
+  const entered = gate(); const resume = gate();
+  const lookup = h.store.lookup.bind(h.store);
+  const record = h.store.record.bind(h.store);
+  const pause = async () => { entered.resolve(); await resume.promise; };
+  const spy = phase === "lookup"
+    ? vi.spyOn(h.store, "lookup").mockImplementation(async (...args) => {
+      const result = await lookup(...args);
+      if (args[1] === "RawPeer:logical-B") await pause();
+      return result;
+    })
+    : vi.spyOn(h.store, "record").mockImplementation(async (...args) => {
+      const result = await record(...args);
+      if (args[1] === "RawPeer:logical-B" && args[2] === "overloaded") await pause();
+      return result;
+    });
+  try {
+    expect(h.debouncer.push(item("B"))).toMatchObject({ status: "overflow" });
+    await entered.promise;
+    expect(h.journal.dispatch!.lookup("RawPeer", "logical-B")).toBeUndefined();
+    expect(h.debouncer.retainedItems("RawPeer").map(entry => entry.message.text)).toEqual(["A"]);
+    expect(h.stop.handle(item("S", "device-2"), true)).toMatchObject({ targetCount: 2 });
+    expect(h.journal.dispatch!.isCancelled("RawPeer", "logical-B")).toBe(true);
+    expect(h.debouncer.push(item("B", "retry-while-held"))).toEqual({ status: "known-outcome", outcome: "cancelled" });
+    resume.resolve(); spy.mockRestore();
+    await h.idle();
+    expect(await h.store.lookup("ExactAccount", "RawPeer:logical-B")).toEqual({ status: "not-found" });
+    expect(h.rejected).toEqual([]);
+    expect(h.runs).toEqual([]);
+    await h.close();
+    const fresh = setup({ root: h.root, debounceMs: 0 });
+    expect(fresh.debouncer.push(item("B", "reopen-retry"))).toEqual({ status: "known-outcome", outcome: "cancelled" });
+    await fresh.flush([item("B", "cold-flush-retry")]);
+    expect(fresh.runs).toEqual([]);
+    expect(fresh.journal.read("RawPeer")).toEqual([]);
+  } finally { resume.resolve(); spy.mockRestore(); }
 });
 
 it("isolates cancellation and command receipts by exact tenant, account and raw peer", async () => {

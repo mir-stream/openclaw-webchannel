@@ -847,8 +847,9 @@ export class NatsChannel implements WebChannelPeerChannel {
     peerId: string,
     ids: string[],
     committed?: Array<{ random_id: string; messageId: string; seq: number }>,
+    cancelled?: string[],
   ): boolean {
-    return this.sendIngressResult(peerId, "ack", ids, committed);
+    return this.sendIngressResult(peerId, "ack", ids, committed, cancelled);
   }
 
   sendInboundRejected(peerId: string, ids: string[]): boolean {
@@ -1128,6 +1129,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     // first published frame by the chunk writer and measured on the wire with it.
     // #244 half A: each entry also carries the user message's per-conversation seq.
     committed?: Array<{ random_id: string; messageId: string; seq: number }>,
+    cancelled?: string[],
   ): boolean {
     if (candidates.length === 0) return true;
     const advertisedLimit = this.transport.effectiveOutboundLimit;
@@ -1145,7 +1147,10 @@ export class NatsChannel implements WebChannelPeerChannel {
         ...(type === "ack" && committed && committed.length > 0 ? { committed } : {}),
         onTooSmall: () => this.warnResultLimitTooSmall(),
       });
-      for (const candidate of candidates) writer.add(candidate);
+      // Match only exact wire IDs from this ACK; never reflect stray proof IDs.
+      // The writer carries each proof with its own ID through count/byte splits.
+      for (const candidate of candidates) writer.add(candidate, type === "ack"
+        && typeof candidate === "string" && cancelled?.includes(candidate));
       return writer.finish();
     } catch (err) {
       console.error(

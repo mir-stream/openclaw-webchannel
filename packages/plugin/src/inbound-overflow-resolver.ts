@@ -46,6 +46,7 @@ export type BoundedOverflowResolverOptions = {
   sendAck(
     request: OverflowResolutionRequest,
     committed?: Array<{ random_id: string; messageId: string; seq: number }>,
+    cancelled?: boolean,
   ): boolean | Promise<boolean>;
   sendRejected(request: OverflowResolutionRequest): boolean | Promise<boolean>;
   onCancelledRecovered?(request: OverflowResolutionRequest): void;
@@ -151,6 +152,13 @@ export class BoundedOverflowResolver {
     return { status: "started" };
   }
 
+  /** One bounded logical target, captured synchronously before /stop commits.
+   * The resolver may own an ID with no retained frame or dispatch row yet. */
+  pendingLogicalKey(sessionToken: RetentionSessionToken): string | undefined {
+    const task = this.activeBySession.get(sessionToken);
+    return !this.disposed && task && !task.cancelled ? idempotencyKeyOf(task.request) : undefined;
+  }
+
   invalidateSession(sessionToken: RetentionSessionToken): boolean {
     const task = this.activeBySession.get(sessionToken);
     if (!task || task.cancelled) return false;
@@ -208,14 +216,19 @@ export class BoundedOverflowResolver {
           return;
         }
         if (recorded.status !== "recorded") return;
+        if (recorded.durability !== "durable") {
+          await recorded.write.rollback();
+          return;
+        }
         recorded.write.commit();
         outcome = "cancelled";
         row = this.userRowFor(request, idempotencyKeyOf(request));
       } else {
-        // Exact tuple journal proof precedes unbound historical markers. It
-        // proves acceptance without migrating or refreshing any SDK marker.
+        // Exact tuple journal proof precedes unbound historical markers, while
+        // a scoped cancellation still supplies this ACK's cancellation metadata.
         row = request.storageScope ? this.userRowFor(request, idempotencyKeyOf(request)) : undefined;
-        const known = row ? { status: "found" as const, outcome: "accepted" as const }
+        const known = row
+          ? await this.options.outcomeStore.lookup(request.storageScope ?? request.accountId, request.key, { journalAccepted: true })
           : await this.options.outcomeStore.lookup(request.storageScope ?? request.accountId, request.key);
         if (task.cancelled || this.disposed || known.status === "unknown") return;
         if (known.status === "found") {
@@ -246,9 +259,9 @@ export class BoundedOverflowResolver {
         if (outcome === "overloaded") await this.options.sendRejected(correlation);
         else {
           const echo = this.committedEchoFor(correlation, row);
-          const acked = await (echo
-            ? this.options.sendAck(correlation, echo)
-            : this.options.sendAck(correlation));
+          const acked = await (outcome === "cancelled"
+            ? this.options.sendAck(correlation, echo, true)
+            : echo ? this.options.sendAck(correlation, echo) : this.options.sendAck(correlation));
           if (request.recoverCancelled && !task.cancelled && !this.disposed && acked) {
             this.options.onCancelledRecovered?.(correlation);
           }

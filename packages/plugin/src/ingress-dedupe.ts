@@ -343,6 +343,7 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
     peerId: string,
     ids: string[],
     committed?: Array<{ random_id: string; messageId: string; seq: number }>,
+    cancelled?: string[],
   ) => boolean;
   /**
    * #245 Part B: broadcast a just-committed inbound user message to the account's
@@ -633,6 +634,9 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
        * item's whole message for the life of the batch.
        */
       const ackIds: string[] = [];
+      // At most one flag per retained wire ID; the footer splits proofs together
+      // with those IDs, after every write/journal decision has committed.
+      const cancelledIds = new Set<string>();
       const rejectedIds: string[] = [];
       // A write holds this key's outcome gate until the footer. Repeated logical
       // requests in this batch share that decision, retaining each wire ID for
@@ -783,6 +787,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             if (deps.deliveryJournal?.dispatch?.isCancelled(peerId, idempotencyKey)) {
               const row = deps.deliveryJournal.lookupUserMessageIdByRandomId(peerId, idempotencyKey);
               ackIds.push(id);
+              cancelledIds.add(id);
               if (row && randomId !== undefined) committedBatch.push({ random_id: randomId, ...row });
               release();
               continue;
@@ -853,21 +858,27 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               fifoBlocked = true;
               continue;
             }
+            if (result.durability !== "durable") {
+              await result.write.rollback();
+              release();
+              fifoBlocked = true;
+              continue;
+            }
             let acked = false;
             result.write.commit();
             let row;
             try {
               row = deps.deliveryJournal?.lookupUserMessageIdByRandomId(peerId, idempotencyKey);
             } catch { /* Cancellation remains authoritative without a journal row. */ }
-            acked = (row && randomId !== undefined
-              ? deps.sendAck?.(item.peerId, [id], [{ random_id: randomId, ...row }])
-              : deps.sendAck?.(item.peerId, [id])) ?? false;
+            acked = deps.sendAck?.(item.peerId, [id], row && randomId !== undefined
+              ? [{ random_id: randomId, ...row }] : undefined, [id]) ?? false;
             if (!acked) logWarn?.("webchannel: cancelled-inbound fallback result delivery failed");
             if (acked) cancelledFallback.delete(key, outcomeScope);
             release();
             continue;
           }
 
+          let journalAccepted = false;
           if (deps.storageScope && deps.deliveryJournal) {
             let row;
             try {
@@ -878,17 +889,14 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               fifoBlocked = true;
               continue;
             }
-            if (row) {
-              release();
-              ackIds.push(id);
-              if (randomId !== undefined) committedBatch.push({ random_id: randomId, ...row });
-              continue;
-            }
+            journalAccepted = row !== undefined;
           }
 
           let existing: OutcomeLookup;
           try {
-            existing = await deps.outcomeStore.lookup(outcomeScope, key);
+            existing = journalAccepted
+              ? await deps.outcomeStore.lookup(outcomeScope, key, { journalAccepted: true })
+              : await deps.outcomeStore.lookup(outcomeScope, key);
           } catch (error) {
             warnOutcomeFailure(accountId, "adapter-lookup");
             existing = { status: "unknown", error };
@@ -966,6 +974,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             if (existing.outcome === "cancelled") {
               release();
               ackIds.push(id);
+              cancelledIds.add(id);
               if (randomId !== undefined && committed !== undefined) {
                 committedBatch.push({
                   random_id: randomId,
@@ -1037,6 +1046,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           if (durableRequest || historicalRow) {
             release();
             ackIds.push(id);
+            if (durableRequest?.state === "cancelled") cancelledIds.add(id);
             if (randomId !== undefined) committedBatch.push({ random_id: randomId, messageId: (durableRequest ?? historicalRow)!.messageId, seq: (durableRequest ?? historicalRow)!.seq });
             continue;
           }
@@ -1548,11 +1558,13 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         // it on ITS first frame (`sendIngressResult`).
         const ack = createIngressResultChunkWriter({
           type: "ack",
-          // Pass the third arg ONLY when there is an echo to carry, so an ack
-          // with no `committed` calls `sendAck` with its original two-arg shape.
+          // Preserve the ordinary ACK shape, forwarding cancellation proof only
+          // for the IDs the writer put in this frame (including after splitting).
           publish: (frame) => {
             const committed = frame.type === "ack" ? frame.committed : undefined;
-            return (committed && committed.length > 0
+            return (frame.type === "ack" && frame.cancelled
+              ? deps.sendAck?.(peerId, frame.ids, committed, frame.cancelled)
+              : committed && committed.length > 0
               ? deps.sendAck?.(peerId, frame.ids, committed)
               : deps.sendAck?.(peerId, frame.ids)) ?? false;
           },
@@ -1561,7 +1573,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           ...(committedBatch.length > 0 ? { committed: committedBatch } : {}),
           onTooSmall: () => logWarn?.("webchannel: result frame cannot fit effective NATS max_payload"),
         });
-        for (const id of ackIds) ack.add(id);
+        for (const id of ackIds) ack.add(id, cancelledIds.has(id));
         ack.finish();
         for (const id of rejectedIds) rejected.add(id);
         rejected.finish();

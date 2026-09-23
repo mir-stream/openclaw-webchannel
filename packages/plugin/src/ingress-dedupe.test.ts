@@ -1637,7 +1637,7 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
     expect(store.record).toHaveBeenNthCalledWith(2, "acct", "p:i", "cancelled", {
       replaceOthers: true,
     });
-    expect(sendAck).toHaveBeenCalledWith("p", ["i"]);
+    expect(sendAck).toHaveBeenCalledWith("p", ["i"], undefined, ["i"]);
   });
 });
 
