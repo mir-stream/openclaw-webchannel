@@ -444,9 +444,9 @@ describe("index-nats.ts wiring contract — ingress ack (P0-7b)", () => {
     // The onFlush factory must be handed a sendAck so admitted (fresh + duplicate)
     // ids drain the client's replay ledger.
     // #243 half 2a: the factory's sendAck forwards `committed` (the server-id echo)
-    // through to the channel alongside the ids.
+    // through to the channel alongside the ids and durable cancellation proof.
     expect(RUNTIME_SOURCE).toMatch(
-      /sendAck:\s*\(peerId,\s*ids,\s*committed\)\s*=>\s*channel\.sendAck\(peerId,\s*ids,\s*committed\)/,
+      /sendAck:\s*\(peerId,\s*ids,\s*committed,\s*cancelled\)\s*=>\s*channel\.sendAck\(peerId,\s*ids,\s*committed,\s*cancelled\)/,
     );
     // Production control routing uses the same atomic coordinator as the
     // behavioral SQLite/crash regressions, with the existing authorization gate.

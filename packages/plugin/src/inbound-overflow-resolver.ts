@@ -43,6 +43,7 @@ export type BoundedOverflowResolverOptions = {
   sendAck(
     request: OverflowResolutionRequest,
     committed?: Array<{ random_id: string; messageId: string; seq: number }>,
+    cancelled?: boolean,
   ): boolean | Promise<boolean>;
   sendRejected(request: OverflowResolutionRequest): boolean | Promise<boolean>;
   onCancelledRecovered?(request: OverflowResolutionRequest): void;
@@ -142,6 +143,13 @@ export class BoundedOverflowResolver {
     return { status: "started" };
   }
 
+  /** One bounded logical target, captured synchronously before /stop commits.
+   * The resolver may own an ID with no retained frame or dispatch row yet. */
+  pendingLogicalKey(sessionToken: RetentionSessionToken): string | undefined {
+    const task = this.activeBySession.get(sessionToken);
+    return !this.disposed && task && !task.cancelled ? idempotencyKeyOf(task.request) : undefined;
+  }
+
   invalidateSession(sessionToken: RetentionSessionToken): boolean {
     const task = this.activeBySession.get(sessionToken);
     if (!task || task.cancelled) return false;
@@ -197,6 +205,10 @@ export class BoundedOverflowResolver {
           return;
         }
         if (recorded.status !== "recorded") return;
+        if (recorded.durability !== "durable") {
+          await recorded.write.rollback();
+          return;
+        }
         recorded.write.commit();
         outcome = "cancelled";
         row = this.userRowFor(request, idempotencyKeyOf(request));
@@ -231,9 +243,9 @@ export class BoundedOverflowResolver {
         if (outcome === "overloaded") await this.options.sendRejected(correlation);
         else {
           const echo = this.committedEchoFor(correlation, row);
-          const acked = await (echo
-            ? this.options.sendAck(correlation, echo)
-            : this.options.sendAck(correlation));
+          const acked = await (outcome === "cancelled"
+            ? this.options.sendAck(correlation, echo, true)
+            : echo ? this.options.sendAck(correlation, echo) : this.options.sendAck(correlation));
           if (request.recoverCancelled && !task.cancelled && !this.disposed && acked) {
             this.options.onCancelledRecovered?.(correlation);
           }

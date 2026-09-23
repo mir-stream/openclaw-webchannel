@@ -2,10 +2,13 @@
 
 `/stop` cancellation (review R1/R2): control receipts and exact cancellation targets
 now commit together in the tenant/account SQLite journal before ACK. This includes
-debounce entries not yet accepted, durable queued work and the current started
+debounce entries not yet accepted, the pending overflow-only ID, durable queued work and the current started
 request. Original input replays stay suppressed across restart; replaying an
 accepted stop returns its receipt without aborting later work. New dispatch waits
 for the first live core abort to settle, including across account replacement.
+Cancelled core bindings survive an early SDK abort return until verified startup
+retirement. Protocol 6 adds authenticated same-frame `ack.cancelled` proof, including
+cancellation replays with no journal row; matching client consumption is required.
 Dispatch schema 2 upgrades schema 1 and prevents older writers from opening it.
 See [cancellation boundaries](DISPATCH_RECOVERY.md#stop-cancellation).
 
@@ -20,7 +23,7 @@ keys, even when account transport startup fails; on a persistent storage or
 account-planning fault it deliberately holds core's remaining plugin-service
 startup (and every channel's restart recovery) rather than let core re-run
 interrupted work. Core session resets remain available. Historical rows without lifecycle metadata are never replayed or
-assigned invented statuses. Client/plugin protocol 5 requires lockstep rollout.
+assigned invented statuses. Client/plugin protocol 6 requires lockstep rollout.
 See [dispatch recovery and upgrade boundaries](DISPATCH_RECOVERY.md).
 
 Round 6 (#378): config reads, account inspection, acquisition/planning, status
