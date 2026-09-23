@@ -1,5 +1,5 @@
 {
-  "note": "Collected (non-skipped) test count per file, from 'vitest list'. Checked EXACTLY by scripts/check-test-inventory.mjs in the e2e gate: a drop is a deleted or skipped test, a rise means this file is stale. Regenerate with 'npm run test:inventory:update'. No totals field on purpose — see the script's SHAPE note.",
+  "note": "Collected (non-skipped) test count per file, from 'vitest list'. Checked EXACTLY by scripts/check-test-inventory.mjs in the e2e gate: a drop is a deleted or skipped test, a rise means this file is stale. Regenerate with 'npm run test:inventory:update'. No totals field on purpose \u2014 see the script's SHAPE note.",
   "files": {
     "demo/enroll-validation.test.ts": 2,
     "demo/saas-server-auth.test.ts": 1,
@@ -102,7 +102,7 @@
     "packages/plugin/src/inbound-queue.test.ts": 41,
     "packages/plugin/src/inbound-retention.test.ts": 3,
     "packages/plugin/src/inbound-wire-decode.test.ts": 22,
-    "packages/plugin/src/inbound.test.ts": 118,
+    "packages/plugin/src/inbound.test.ts": 119,
     "packages/plugin/src/index-nats-wiring.test.ts": 34,
     "packages/plugin/src/ingress-cancellation-integration.test.ts": 20,
     "packages/plugin/src/ingress-dedupe-delivery-journal.test.ts": 33,
@@ -159,6 +159,8 @@
     "packages/plugin/src/session-route.test.ts": 18,
     "packages/plugin/src/setup-wizard.test.ts": 27,
     "packages/plugin/src/setup.test.ts": 39,
+    "packages/plugin/src/stop-control.test.ts": 17,
+    "packages/plugin/src/stop-crash.test.ts": 3,
     "packages/plugin/src/storage-identity.test.ts": 25,
     "packages/plugin/src/storage-paths.test.ts": 6,
     "packages/plugin/src/storage-version-downgrade.test.ts": 29,

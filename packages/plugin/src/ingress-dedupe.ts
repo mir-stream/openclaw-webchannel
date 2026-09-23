@@ -527,18 +527,10 @@ function createRateLimitedJournalWarning(
  *
  * CONTROL-LANE NOTE: `/stop` (and the NL abort vocabulary) BYPASS the debouncer
  * entirely in setMessageHandler, so aborts never reach this path and are never
- * deduped — a duplicate abort is a harmless cosmetic double-bubble, and the abort
- * must not wait on SQLite. The control-lane branch acks its own frame separately.
- * Which means the v6 journal hook below does NOT cover it, and that is a real
- * live≠history gap rather than a decision that aborts are not messages: the
- * client's `send()` routes abort-shaped text through the very same `publish()` as
- * ordinary text, which applies a durable `user` event to its own view, so a
- * `/stop` — and every word in the wider NL abort vocabulary, which is ordinary
- * text like "wait" — DOES render a user bubble live. Issue **#281** owns it. It
- * is out of scope here because the control lane has different semantics: the
- * abort must not wait on SQLite (above), and that branch has no rollback path to
- * express "not accepted" with. Doc §15.7's last bullet asked the question; #281
- * carries the answer.
+ * deduped here. The control lane now has its own SQLite receipt/target ledger
+ * (`stop-control.ts`); it ACKs only after that commit and never invokes core for
+ * a duplicate command. Control commands still do not create durable user rows
+ * (the separate live/history gap tracked by #281).
  *
  * In that legacy branch, per-id recording happens inside
  * `filterFreshInboundItems` before coalesce/dispatch. Production does not use
@@ -778,6 +770,15 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             continue;
           }
           const { key, wireId: id, randomId, idempotencyKey } = identity;
+          // The tuple-scoped SQLite stop ledger is authoritative even with cold
+          // or conflicting SDK outcomes, and needs no repair write to ACK replay.
+          if (deps.deliveryJournal?.dispatch?.isCancelled(peerId, idempotencyKey)) {
+            const row = deps.deliveryJournal.lookupUserMessageIdByRandomId(peerId, idempotencyKey);
+            ackIds.push(id);
+            if (row && randomId !== undefined) committedBatch.push({ random_id: randomId, ...row });
+            release();
+            continue;
+          }
           const pendingOutcome = pendingOutcomes.get(key);
           if (pendingOutcome !== undefined) {
             // A later lookup can yield to /stop, which still needs to acquire
@@ -1635,16 +1636,11 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
  * ack-first is safe — here the message was KILLED, so a pre-record replay would
  * wrongly run it.)
  *
- * The bounded debouncer awaits this handler on behalf of every cancelled entry,
- * retaining its reservation until persistence and result delivery settle. A
- * record that throws is swallowed with a WARN
- * (`logWarn`, matching the fail-open severity split in `filterFreshInboundItems`)
- * and does NOT block the ack — a lost record only re-opens the pre-existing
- * pre-P0-7b replay window (a replay could run), which is strictly no worse than
- * before this fix. Id-less items are skipped entirely (an older client never
- * ledgers them, so there is nothing to record or ack). `cancelKey` is per-peer,
- * but ids are grouped by peer defensively so a single ack frame per peer carries
- * exactly its own ids.
+ * Legacy callback callers retain their reservation through this handler. A
+ * failed persistence write keeps only a live fallback and MUST NOT emit an ACK.
+ * Production /stop uses the atomic SQLite control ledger before retiring entries;
+ * it does not rely on this callback to remember its targets across restart.
+ * Id-less items have no replay identity and are skipped.
  */
 export async function recordCancelledInboundItems<T extends IngressDedupeItem>(
   items: readonly T[],
@@ -1668,12 +1664,12 @@ export async function recordCancelledInboundItems<T extends IngressDedupeItem>(
       suppressionReady = true;
     } catch {
       if (!canPublish()) return;
-      logWarn?.("webchannel: cancelled-inbound suppression record failed; result delivery remains best-effort");
+      logWarn?.("webchannel: cancelled-inbound suppression record failed; withholding receipt");
       cancelledFallback?.add(key, accountId);
     }
     if (!suppressionReady) cancelledFallback?.add(key, accountId);
-    // Ack regardless of the record outcome: the ack drains the client ledger, and
-    // the record is the fallback for when the ack cannot reach a disconnected client.
+    // A memory fallback prevents a live replay but is not durable acceptance.
+    if (!suppressionReady) continue;
     const ids = idsByPeer.get(item.peerId) ?? [];
     ids.push(id);
     idsByPeer.set(item.peerId, ids);

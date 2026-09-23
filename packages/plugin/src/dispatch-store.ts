@@ -12,7 +12,12 @@ export type DispatchChange = { peerId: string; id: string; turnId: string; state
 export type CoreDispatchBinding = { processId: string; agentId: string; sessionKey: string; storePath: string; owner: string; batch: string; peerId: string };
 /** `retryOf` is the VALIDATED provenance actually stored, never the requested one. */
 export type UserCommit = { messageId: string; seq: number; inserted: boolean; retryOf?: string };
+export type StopReceipt = { key: string; cancelBuffered: boolean; targetCount: number };
 export interface DispatchStore {
+  lookupStop(peerId: string, key: string): StopReceipt | undefined;
+  recordStop(owner: string, peerId: string, key: string, bufferedKeys: readonly string[], cancelBuffered: boolean): StopReceipt & { fresh: boolean };
+  isCancelled(peerId: string, key: string): boolean;
+  stopChanges(peerId: string, key: string, after?: number): DispatchChange[];
   bindCore(binding: CoreDispatchBinding): void;
   coreBindings(): CoreDispatchBinding[];
   retireCore(batch: string): void;
@@ -34,7 +39,7 @@ const decode = (r: Stored): DispatchRow => ({ peerId: r.peer_id, key: r.logical_
 /** Shares the journal connection: user row, recoverable payload and status commit together. */
 export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string, input: DispatchInput & { requestState: RequestState }) => UserCommit, appendEvent: (peer: string, event: DurableEvent) => { seq: number }): DispatchStore {
   const version = db.prepare("SELECT value FROM journal_meta WHERE key='dispatch_schema_version'").get() as { value: string } | undefined;
-  if (version && version.value !== "1") throw new Error("webchannel: unsupported dispatch schema version; use the writer version or newer");
+  if (version && version.value !== "1" && version.value !== "2") throw new Error("webchannel: unsupported dispatch schema version; use the writer version or newer");
   runSqliteImmediateTransactionSync(db, () => {
     db.exec(`CREATE TABLE IF NOT EXISTS journal_dispatch_core (batch TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS journal_dispatch (
@@ -42,8 +47,15 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
       user_seq INTEGER NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL,
       owner TEXT, batch TEXT, PRIMARY KEY(peer_id,logical_key));
       CREATE INDEX IF NOT EXISTS journal_dispatch_queue ON journal_dispatch(state,peer_id,user_seq);
-      CREATE INDEX IF NOT EXISTS journal_dispatch_batch ON journal_dispatch(peer_id,owner,batch,state);`);
-    db.prepare("INSERT OR IGNORE INTO journal_meta VALUES('dispatch_schema_version','1')").run();
+      CREATE INDEX IF NOT EXISTS journal_dispatch_batch ON journal_dispatch(peer_id,owner,batch,state);
+      CREATE TABLE IF NOT EXISTS journal_stop (
+        peer_id TEXT NOT NULL, logical_key TEXT NOT NULL, cancel_buffered INTEGER NOT NULL,
+        target_count INTEGER NOT NULL, PRIMARY KEY(peer_id,logical_key));
+      CREATE TABLE IF NOT EXISTS journal_stop_target (
+        peer_id TEXT NOT NULL, logical_key TEXT NOT NULL, stop_key TEXT NOT NULL,
+        state_seq INTEGER, PRIMARY KEY(peer_id,logical_key));
+      CREATE INDEX IF NOT EXISTS journal_stop_result ON journal_stop_target(peer_id,stop_key,state_seq);`);
+    db.prepare("INSERT INTO journal_meta VALUES('dispatch_schema_version','2') ON CONFLICT(key) DO UPDATE SET value='2'").run();
   });
   const sql = (s: string) => db.prepare(s);
   const owns = (owner: string) => (sql("SELECT value FROM journal_meta WHERE key='dispatch_owner'").get() as { value: string } | undefined)?.value === owner;
@@ -52,6 +64,11 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
     const row = sql("SELECT * FROM journal_dispatch WHERE peer_id=? AND logical_key=?").get(peer, key) as Stored | undefined;
     return row && decode(row);
   };
+  const isCancelled = (peer: string, key: string) => !!sql("SELECT 1 FROM journal_stop_target WHERE peer_id=? AND logical_key=?").get(peer, key);
+  const lookupStop = (peer: string, key: string): StopReceipt | undefined => {
+    const row = sql("SELECT cancel_buffered,target_count FROM journal_stop WHERE peer_id=? AND logical_key=?").get(peer, key) as { cancel_buffered: number; target_count: number } | undefined;
+    return row && { key, cancelBuffered: row.cancel_buffered === 1, targetCount: Number(row.target_count) };
+  };
   const transition = (rows: Stored[], state: RequestState): DispatchChange[] => rows.map((row) => {
     sql("UPDATE journal_dispatch SET state=? WHERE peer_id=? AND logical_key=?").run(state, row.peer_id, row.logical_key);
     const input = JSON.parse(row.payload) as DispatchInput;
@@ -59,6 +76,37 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
     return { peerId: row.peer_id, id: row.message_id, turnId: input.turnId, state, seq };
   });
   return {
+    lookupStop,
+    isCancelled,
+    recordStop: (owner, peer, key, bufferedKeys, cancelBuffered) => runSqliteImmediateTransactionSync(db, () => {
+      checkOwner(owner);
+      const previous = lookupStop(peer, key);
+      if (previous) return { ...previous, fresh: false };
+      if (cancelBuffered) {
+        // One transaction freezes BOTH the not-yet-accepted IDs and every
+        // accepted queued/started target. A failure cannot leave a partial stop.
+        sql("INSERT OR IGNORE INTO journal_stop_target SELECT peer_id,logical_key,?,NULL FROM journal_dispatch WHERE peer_id=? AND state IN ('queued','started')").run(key, peer);
+        for (const target of new Set(bufferedKeys)) {
+          sql("INSERT OR IGNORE INTO journal_stop_target VALUES(?,?,?,NULL)").run(peer, target, key);
+        }
+        // Page within the same transaction: an arbitrarily old durable backlog
+        // must not become an unbounded in-memory array of payloads/results.
+        for (;;) {
+          const rows = sql("SELECT * FROM journal_dispatch WHERE peer_id=? AND state IN ('queued','started') ORDER BY user_seq LIMIT 32").all(peer) as Stored[];
+          for (const [index, change] of transition(rows, "cancelled").entries()) {
+            sql("UPDATE journal_stop_target SET state_seq=? WHERE peer_id=? AND logical_key=?").run(change.seq, peer, rows[index]!.logical_key);
+          }
+          if (rows.length < 32) break;
+        }
+      }
+      const targetCount = Number((sql("SELECT count(*) AS n FROM journal_stop_target WHERE peer_id=? AND stop_key=?").get(peer, key) as { n: number }).n);
+      sql("INSERT INTO journal_stop VALUES(?,?,?,?)").run(peer, key, Number(cancelBuffered), targetCount);
+      return { key, cancelBuffered, targetCount, fresh: true };
+    }),
+    stopChanges: (peer, key, after = 0) => (sql(`SELECT d.message_id,d.payload,t.state_seq FROM journal_stop_target t
+      JOIN journal_dispatch d ON d.peer_id=t.peer_id AND d.logical_key=t.logical_key
+      WHERE t.peer_id=? AND t.stop_key=? AND t.state_seq>? ORDER BY t.state_seq LIMIT 32`).all(peer, key, after) as { message_id: string; payload: string; state_seq: number }[])
+      .map(row => ({ peerId: peer, id: row.message_id, turnId: (JSON.parse(row.payload) as DispatchInput).turnId, state: "cancelled", seq: Number(row.state_seq) })),
     bindCore: binding => runSqliteImmediateTransactionSync(db, () => {
       checkOwner(binding.owner);
       const rows = sql("SELECT 1 FROM journal_dispatch WHERE peer_id=? AND owner=? AND batch=? AND state='started' LIMIT 1").get(binding.peerId, binding.owner, binding.batch);
@@ -81,6 +129,7 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
         // A retransmission echoes the provenance of the row it already has, not
         // the one it just asked for again.
         if (existing) return { messageId: existing.messageId, seq: existing.seq, inserted: false, ...(existing.input.retryOf ? { retryOf: existing.input.retryOf } : {}) };
+        if (isCancelled(peer, key)) throw new Error("webchannel: cancelled ingress cannot be accepted");
         // Provenance can only name an interrupted request in this exact
         // conversation. An unknown or ineligible `retry_of` is DROPPED, never
         // thrown: accept() runs inside the ingress journal-append transaction,
@@ -107,7 +156,7 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
       const rows: DispatchRow[] = [];
       for (const key of new Set(keys)) {
         const row = lookup(peer, key);
-        if (row?.state !== "queued") continue;
+        if (row?.state !== "queued" || isCancelled(peer, key)) continue;
         const result = sql("UPDATE journal_dispatch SET state='started',owner=?,batch=? WHERE peer_id=? AND logical_key=? AND state='queued'").run(owner, batch, peer, key);
         if (Number(result.changes) !== 1) throw new Error("webchannel: dispatch claim lost");
         const { seq: stateSeq } = appendEvent(peer, { kind: "requestState", id: row.messageId, state: "started" });

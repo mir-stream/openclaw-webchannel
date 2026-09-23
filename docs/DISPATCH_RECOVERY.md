@@ -38,6 +38,55 @@ dispatcher and continues without a browser retry. It restores an existing exact
 peer key for outbound delivery only; browser inbound still requires registration.
 Missing keys retain queued work; current DM admission policy still applies.
 
+## Stop cancellation
+
+The control lane owns a durable receipt keyed by the authenticated raw peer and
+logical `random_id` (wire ID fallback). Its SQLite file is already scoped to the
+exact tenant/account tuple. In one immediate transaction it stores the receipt,
+exact IDs retained by debounce, all queued/started dispatch targets, and their
+cancelled lifecycle events. A partial write rolls the entire stop back. No stop
+ACK, target ACK, buffer retirement or abort signal precedes this commit. The
+legacy cancellation callback also withholds ACK on persistence failure; its
+memory fallback is not durable acceptance.
+
+The live abort still bypasses the normal FIFO. It follows the synchronous SQLite
+commit, without awaiting SDK outcome-store callbacks. A dispatcher lease holds
+later starts until the first core control invocation settles, so a delayed
+session-wide abort cannot reach new work. Account teardown drains that invocation
+before permitting a replacement runtime. A stuck core control call therefore
+holds that peer's new dispatch and account replacement; the receipt and target
+suppression remain durable. Different control requests received while that core
+call is pending get no ACK and rely on client retry; they allocate no waiting
+control payload. Same-ID retries immediately receive the existing receipt.
+
+After ACK loss or restart, the same stop only replays its receipt. It never
+recaptures the current queue and never invokes core again. Cancelled original
+inputs are recognized before hot outcomes, overflow resolution and ordinary
+admission; store acceptance/claim also enforce suppression. A cancelled input
+that already has a user row retains its original server ID and history. Inputs
+cancelled before acceptance have only a tombstone, with no invented user row.
+The receipt confirms the server's cancellation decision, not rollback of an
+external effect. A process crash between commit and live abort needs no abort
+replay: plugin dispatch is cancelled, and existing core restart retirement owns
+any recorded started core run.
+
+Only authorized explicit `/stop` clears queued/debounce input, using the existing
+command gate. Broader abort vocabulary and refused commands retain their core
+policy and have deduped control receipts without a buffered-input cancellation.
+Core receives a stable message ID scoped by tenant/account/raw peer as an
+additional dedupe layer. ID-less legacy controls have no retransmission identity;
+conforming clients always supply one. Control user-bubble history remains the
+separate #281 gap. This change does not migrate old SDK terminal markers or fix
+their separate legacy namespace issue (review R5).
+
+Control receipts and target metadata have the same indefinite on-disk retention
+as dispatch lifecycle records; evicting them would permit old replays to execute.
+No message payload is copied into the stop tables. Target capture uses the
+existing bounded debounce reservations, and dispatch updates/notifications page
+32 rows at a time without collecting a whole durable backlog. Dispatch schema 2
+upgrades schema 1 transactionally; earlier schema-1 writers refuse the file.
+There is no wire protocol or SDK pin change. Do not downgrade this database.
+
 ## Core restart recovery
 
 Before entering core, the plugin records the exact isolated core session key and
@@ -109,6 +158,18 @@ registered wrapper and demo DOM test hydrate journal-derived history, recreate t
 widget, and click Retry. The E2E Gate additionally exercises the real gateway and
 provider loop, including a `/new` turn through durable dispatch. None of these
 checks prove exactly-once behavior in arbitrary external tools.
+
+[Stop coordinator regressions](../packages/plugin/src/stop-control.test.ts) combine
+production ingress, debounce, dispatch recovery and real SQLite/public SDK stores.
+They cover ACK loss, later-turn protection, stalled lookups/writes and overflow,
+authorization, tuple isolation, retention, schema upgrade and partial transaction
+failure. [Three stop crash cases](../packages/plugin/src/stop-crash.test.ts) kill
+OS processes before commit, after commit before ACK, and inside the stop ACK
+callback, then reopen twice and retransmit originals and the same stop. The core
+recipient and ACK sink are controlled: these tests prove SQLite/process boundaries,
+not real browser/NATS/core delivery. The prior audit's R1 microtask probe and R2
+source trace were narrower evidence. The existing E2E Gate supplies broader
+real-gateway validation; it is not a live reproduction of these fault injections.
 
 The core integrity check is tied to the pinned public SDK's JSON session-store
 format. It reads the complete backing file, checks the relevant identity/state

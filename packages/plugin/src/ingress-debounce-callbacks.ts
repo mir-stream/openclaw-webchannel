@@ -16,7 +16,7 @@ export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(d
   outcomeStore: IngressOutcomeStore;
   overflowResolver: BoundedOverflowResolver;
   cancelledFallback: CancelledInboundFallbackTombstones;
-  deliveryJournal: Pick<DeliveryJournal, "lookupUserMessageIdByRandomId">;
+  deliveryJournal: Pick<DeliveryJournal, "lookupUserMessageIdByRandomId" | "dispatch">;
   sessionToken(peerId: string): RetentionSessionToken;
   sendAck(peerId: string, ids: string[], committed?: Array<{ random_id: string; messageId: string; seq: number }>): boolean;
   sendRejected(peerId: string, ids: string[]): boolean;
@@ -26,7 +26,7 @@ export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(d
   return {
     getId: (item) => ingressIdentity(item)?.wireId,
     getDedupeKey: ingressDedupeKey,
-    isOverflowClaimed: (_peerId, key) => overflowResolver.hasActiveClaim(accountId, key),
+    isOverflowClaimed: (peerId, key) => !deps.deliveryJournal.dispatch?.isCancelled(peerId, key.slice(peerId.length + 1)) && overflowResolver.hasActiveClaim(accountId, key),
     onOverflowClaimed: (item) => {
       const identity = ingressIdentity(item)!;
       overflowResolver.tryStart({
@@ -35,8 +35,9 @@ export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(d
         recoverCancelled: cancelledFallback.has(identity.key, accountId),
       });
     },
-    isCancelledFallback: (_peerId, key) => cancelledFallback.has(key, accountId),
-    peekOutcome: (_peerId, key) => outcomeStore.peek(accountId, key),
+    isCancelledFallback: (peerId, key) => !deps.deliveryJournal.dispatch?.isCancelled(peerId, key.slice(peerId.length + 1)) && cancelledFallback.has(key, accountId),
+    peekOutcome: (peerId, key) => deps.deliveryJournal.dispatch?.isCancelled(peerId, key.slice(peerId.length + 1))
+      ? "cancelled" : outcomeStore.peek(accountId, key),
     onKnownOutcome: (peerId, id, outcome, item) => {
       if (outcome === "overloaded") deps.sendRejected(peerId, [id]);
       else {

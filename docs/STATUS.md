@@ -1,5 +1,14 @@
 # Project Status — single source of truth
 
+`/stop` cancellation (review R1/R2): control receipts and exact cancellation targets
+now commit together in the tenant/account SQLite journal before ACK. This includes
+debounce entries not yet accepted, durable queued work and the current started
+request. Original input replays stay suppressed across restart; replaying an
+accepted stop returns its receipt without aborting later work. New dispatch waits
+for the first live core abort to settle, including across account replacement.
+Dispatch schema 2 upgrades schema 1 and prevents older writers from opening it.
+See [cancellation boundaries](DISPATCH_RECOVERY.md#stop-cancellation).
+
 Round 7 (#369), option 2: newly accepted normal requests retain their original
 payload and dispatch lifecycle in SQLite. Startup automatically recovers proven
 unstarted work; started requests without confirmed completion become durable
