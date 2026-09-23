@@ -26,6 +26,9 @@ function inside(wrapper: WebChannelNATSClient) {
     activeTurnStallTimer: unknown;
     applicationTurns: Map<string, unknown>;
     heldStallTimer: unknown;
+    cursor: { state: string; last?: number; buffer?: InboundMessage[] };
+    pendingHistorySnapshots: InboundMessage[];
+    deferredCancelledTyping: unknown;
     client: {
       requestApplicationRecovery: () => boolean;
       liveRetryTimer: unknown;
@@ -41,7 +44,7 @@ async function setup(options: { timeout?: number; heartbeat?: number; recovery?:
   const pop = await generateDevicePopKeyPair();
   const key = new Uint8Array(32).fill(39);
   const registration = registerAgent(key, x.publicRaw, identity);
-  const control = { admitted: true, ack: true, registrations: 0, interrupted: false, settleBeforeAck: false,
+  const control = { admitted: true, ack: true, answerDifferences: true, registrations: 0, interrupted: false, settleBeforeAck: false,
     cancelled: new Set<string>() };
   const received: Array<Extract<OutboundMessage, { type: "user_message" }>> = [];
   const differences: Array<Extract<OutboundMessage, { type: "get_difference" }>> = [];
@@ -74,6 +77,7 @@ async function setup(options: { timeout?: number; heartbeat?: number; recovery?:
         ...(control.cancelled.has(frame.id!) ? { cancelled: [frame.id!] } : {}) }, server);
     } else if (frame.type === "get_difference") {
       differences.push(frame);
+      if (!control.answerDifferences) return;
       deliver({ type: "difference", afterSeq: frame.afterSeq, nonce: frame.nonce, maxSeq: 2, partial: false,
         events: options.recovery === "difference" ? [
           { seq: 1, event: { kind: "user", id: "server-user", text: row().text,
@@ -446,6 +450,292 @@ describe("accepted-turn application recovery", () => {
       "A stopped before admission", "A stopped before admission", "C held behind B",
     ]);
     expect([...inside(h.wrapper).applicationTurns.keys()]).toEqual([h.received[2]!.id]);
+  });
+
+  it.each(["gap", "pending history"] as const)("preserves buffered remote work through cancellation during %s", async (source) => {
+    const h = await setup();
+    vi.useFakeTimers();
+    h.control.ack = false;
+    h.control.answerDifferences = false;
+    const a = h.wrapper.send("cancelled A")!;
+    const id = h.received[0]!.id!;
+    if (source === "gap") {
+      h.deliver({ type: "user_committed", id: "remote-user", text: "remote B",
+        turnId: "remote-B", requestState: "queued", seq: 2 });
+      h.deliver({ type: "request_state", id: "remote-user", turnId: "remote-B", state: "started", seq: 3 });
+      expect(inside(h.wrapper).cursor.buffer).toHaveLength(2);
+    } else {
+      h.deliver({ type: "history", highWaterSeq: 3, messages: [{ id: "remote-user", role: "user",
+        text: "remote B", turnId: "remote-B", requestState: "started", seq: 3 }] });
+      expect(inside(h.wrapper).pendingHistorySnapshots).toHaveLength(1);
+    }
+    h.deliver({ type: "typing" });
+    const c = h.wrapper.send("held C")!;
+    expect(h.wrapper.getState().messages.some((row) => row.id === "remote-user" || row.working)).toBe(false);
+    h.control.ack = true;
+    h.deliver({ type: "ack", ids: [id], cancelled: [id] });
+    expect(a.snapshot().state).toBe("accepted");
+    expect(inside(h.wrapper).applicationTurns.has(id)).toBe(false);
+    expect.soft(h.wrapper.getState().isTyping).toBe(true);
+    expect.soft(c.snapshot().state).toBe("queued");
+    expect(h.received).toHaveLength(1);
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+    const request = h.differences[0]!;
+    h.deliver({ type: "difference", afterSeq: request.afterSeq, nonce: request.nonce, maxSeq: 3, partial: false,
+      events: [
+        { seq: 1, event: { kind: "bubble", answerId: "old", text: "older answer" } },
+        { seq: 2, event: { kind: "user", id: "remote-user", text: "remote B", turnId: "remote-B", requestState: "queued" } },
+        { seq: 3, event: { kind: "requestState", id: "remote-user", state: "started" } },
+      ] });
+    expect(inside(h.wrapper).cursor).toMatchObject({ state: "synced", last: 3 });
+    expect(inside(h.wrapper).pendingHistorySnapshots).toHaveLength(0);
+    expect(h.wrapper.getState().messages.find((row) => row.id === "remote-user")?.requestState).toBe("started");
+    expect(h.wrapper.getState().isTyping).toBe(true);
+    expect(c.snapshot().state).toBe("queued");
+    expect(h.received).toHaveLength(1);
+    h.deliver({ type: "request_state", id: "remote-user", turnId: "remote-B", state: "completed", seq: 4 });
+    h.deliver({ type: "turn_settled", turnId: "remote-B", outcome: "ok" });
+    expect(c.snapshot().state).toBe("accepted");
+    expect(a.snapshot().state).toBe("accepted");
+    expect(h.received.map((frame) => frame.text)).toEqual(["cancelled A", "held C"]);
+  });
+
+  it.each(["empty", "terminal"] as const)("finishes deferred cancellation when recovery proves %s neighboring work", async (neighbor) => {
+    const h = await withClock();
+    h.control.answerDifferences = false;
+    const remote = { id: "remote-user", role: "user" as const, text: "remote B",
+      turnId: "remote-B", requestState: "started" as const, seq: 3 };
+    h.deliver({ type: "history", highWaterSeq: 4, messages: neighbor === "terminal" ? [remote] : [] });
+    h.deliver({ type: "typing" });
+    const c = h.wrapper.send("held C")!;
+    h.deliver({ type: "ack", ids: [h.turnId], cancelled: [h.turnId] });
+    expect(h.wrapper.getState().isTyping).toBe(true);
+    expect(c.snapshot().state).toBe("queued");
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+    const request = h.differences[0]!;
+    h.deliver({ type: "difference", afterSeq: request.afterSeq, nonce: request.nonce, maxSeq: 4, partial: false,
+      events: neighbor === "terminal" ? [
+        { seq: 2, event: { kind: "user", id: remote.id, text: remote.text, turnId: remote.turnId, requestState: "queued" } },
+        { seq: 3, event: { kind: "requestState", id: remote.id, state: "started" } },
+        { seq: 4, event: { kind: "requestState", id: remote.id, state: "completed" } },
+      ] : [] });
+    expect(h.wrapper.getState().isTyping).toBe(false);
+    expect(c.snapshot().state).toBe("accepted");
+    expect(h.receipt.snapshot().state).toBe("accepted");
+    expect(inside(h.wrapper).deferredCancelledTyping).toBeUndefined();
+    expect(h.received.map((frame) => frame.text)).toEqual(["work", "held C"]);
+    if (neighbor === "terminal") {
+      // Pending older started history was drained after the newer terminal row.
+      expect(h.wrapper.getState().messages.find((row) => row.id === remote.id)?.requestState).toBe("completed");
+    }
+    h.deliver({ type: "turn_settled", turnId: h.received[1]!.id, outcome: "ok" });
+    vi.advanceTimersByTime(5 * TIMEOUT);
+    expect(h.request).not.toHaveBeenCalled();
+    expect(h.control.registrations).toBe(1);
+  });
+
+  it("keeps the cancellation decision through partial and stale catch-up replies", async () => {
+    const h = await withClock();
+    h.control.answerDifferences = false;
+    h.deliver({ type: "user_committed", id: "remote-user", text: "remote B",
+      turnId: "remote-B", requestState: "queued", seq: 2 });
+    h.deliver({ type: "request_state", id: "remote-user", turnId: "remote-B", state: "started", seq: 3 });
+    h.deliver({ type: "typing" });
+    const c = h.wrapper.send("held C")!;
+    h.deliver({ type: "ack", ids: [h.turnId], cancelled: [h.turnId] });
+    const first = h.differences[0]!;
+    h.deliver({ type: "difference", afterSeq: first.afterSeq, nonce: first.nonce, maxSeq: 1, partial: true,
+      events: [{ seq: 1, event: { kind: "bubble", answerId: "old", text: "older answer" } }] });
+    expect(h.differences).toHaveLength(2);
+    h.deliver({ type: "difference", afterSeq: first.afterSeq, nonce: first.nonce, maxSeq: 3, partial: false, events: [] });
+    expect(inside(h.wrapper).cursor.state).toBe("catching-up");
+    expect(h.wrapper.getState().isTyping).toBe(true);
+    expect(c.snapshot().state).toBe("queued");
+    const second = h.differences[1]!;
+    // The live buffered rows supply the evidence when the reply covers their
+    // seqs but cannot carry their envelopes. The ordinary ordered drain owns it.
+    h.deliver({ type: "difference", afterSeq: second.afterSeq, nonce: second.nonce, maxSeq: 3, partial: false, events: [] });
+    expect(h.wrapper.getState().messages.find((row) => row.id === "remote-user")?.requestState).toBe("started");
+    expect(h.wrapper.getState().isTyping).toBe(true);
+    expect(c.snapshot().state).toBe("queued");
+    expect(inside(h.wrapper).deferredCancelledTyping).toBeUndefined();
+    expect(h.received).toHaveLength(1);
+    h.deliver({ type: "turn_settled", turnId: "remote-B", outcome: "ok" });
+    expect(h.received.map((frame) => frame.text)).toEqual(["work", "held C"]);
+  });
+
+  it.each([false, true])("discards a deferred proof when newer typing arrives (inside recovery callback=%s)", async (reentrant) => {
+    const h = await withClock();
+    h.control.answerDifferences = false;
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [] });
+    h.deliver({ type: "typing" });
+    const c = h.wrapper.send("held C")!;
+    h.deliver({ type: "ack", ids: [h.turnId], cancelled: [h.turnId] });
+    let newTyping = false;
+    const deliverTyping = () => { newTyping = true; h.deliver({ type: "typing" }); };
+    const unsubscribe = h.wrapper.subscribe((state) => {
+      if (reentrant && !newTyping && state.messages.some((row) => row.id === "old")) deliverTyping();
+    });
+    if (!reentrant) deliverTyping();
+    const request = h.differences[0]!;
+    h.deliver({ type: "difference", afterSeq: request.afterSeq, nonce: request.nonce, maxSeq: 2, partial: false,
+      events: [{ seq: 1, event: { kind: "bubble", answerId: "old", text: "older answer" } }] });
+    unsubscribe();
+    expect(newTyping).toBe(true);
+    expect(inside(h.wrapper).deferredCancelledTyping).toBeUndefined();
+    expect(h.wrapper.getState().isTyping).toBe(true);
+    expect(c.snapshot().state).toBe("queued");
+    h.deliver({ type: "ack", ids: [h.turnId], cancelled: [h.turnId] });
+    expect(h.wrapper.getState().isTyping).toBe(true);
+    expect(h.received).toHaveLength(1);
+    h.deliver({ type: "turn_settled", turnId: "new-remote", outcome: "ok" });
+    expect(c.snapshot().state).toBe("accepted");
+  });
+
+  it.each([false, true])("resolves cancellation on bounded history timeout with timeout zero (remote active=%s)", async (remoteActive) => {
+    const h = await setup({ timeout: 0 });
+    vi.useFakeTimers();
+    h.control.answerDifferences = false;
+    const a = h.wrapper.send("cancelled A")!;
+    const id = h.received[0]!.id!;
+    h.deliver({ type: "history", highWaterSeq: 2, messages: remoteActive ? [{ id: "remote-user", role: "user",
+      text: "remote B", turnId: "remote-B", requestState: "started", seq: 2 }] : [] });
+    h.deliver({ type: "typing" });
+    const c = h.wrapper.send("held C")!;
+    h.deliver({ type: "ack", ids: [id], cancelled: [id] });
+    vi.advanceTimersByTime(19_999);
+    expect(h.wrapper.getState().isTyping).toBe(true);
+    expect(c.snapshot().state).toBe("queued");
+    vi.advanceTimersByTime(1);
+    expect(h.differences).toHaveLength(4); // Existing catch-up budget, no new timer.
+    expect(inside(h.wrapper).pendingHistorySnapshots).toHaveLength(0);
+    expect(inside(h.wrapper).deferredCancelledTyping).toBeUndefined();
+    expect(h.wrapper.getState().isTyping).toBe(remoteActive);
+    expect(c.snapshot().state).toBe(remoteActive ? "queued" : "accepted");
+    expect(a.snapshot().state).toBe("accepted");
+    if (remoteActive) h.deliver({ type: "turn_settled", turnId: "remote-B", outcome: "ok" });
+    expect(h.received.map((frame) => frame.text)).toEqual(["cancelled A", "held C"]);
+    vi.advanceTimersByTime(30_000);
+    expect(h.control.registrations).toBe(1);
+    expect(h.differences).toHaveLength(4);
+  });
+
+  it("defers a first proof delivered inside timeout hydration until remaining buffered evidence drains", async () => {
+    const h = await setup({ timeout: 0 });
+    vi.useFakeTimers();
+    h.control.answerDifferences = false;
+    const a = h.wrapper.send("cancelled A")!;
+    const id = h.received[0]!.id!;
+    // The timeout installs synced before hydrating this last snapshot; the
+    // sequenceless remote opener still belongs to the subsequent buffer drain.
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [{ id: "old", role: "agent", text: "older answer", seq: 1 }] });
+    h.deliver({ type: "user_committed", id: "remote-user", text: "remote B", turnId: "remote-B", requestState: "started" });
+    h.deliver({ type: "typing" });
+    const c = h.wrapper.send("held C")!;
+    let cancelled = false;
+    const unsubscribe = h.wrapper.subscribe((state) => {
+      if (!cancelled && state.messages.some((row) => row.id === "old")) {
+        cancelled = true;
+        h.deliver({ type: "ack", ids: [id], cancelled: [id] });
+      }
+    });
+    vi.advanceTimersByTime(20_000);
+    unsubscribe();
+    expect(cancelled).toBe(true);
+    expect(h.wrapper.getState().messages.find((row) => row.id === "remote-user")?.requestState).toBe("started");
+    expect(h.wrapper.getState().isTyping).toBe(true);
+    expect(c.snapshot().state).toBe("queued");
+    expect(a.snapshot().state).toBe("accepted");
+    expect(inside(h.wrapper).deferredCancelledTyping).toBeUndefined();
+    expect(h.received).toHaveLength(1);
+    h.deliver({ type: "turn_settled", turnId: "remote-B", outcome: "ok" });
+    expect(c.snapshot().state).toBe("accepted");
+  });
+
+  it("cannot release a hold when deferred cleanup fanout supplies newer remote activity", async () => {
+    const h = await withClock();
+    h.control.answerDifferences = false;
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [] });
+    h.deliver({ type: "typing" });
+    const c = h.wrapper.send("held C")!;
+    h.deliver({ type: "ack", ids: [h.turnId], cancelled: [h.turnId] });
+    let reentered = false;
+    const unsubscribe = h.wrapper.subscribe((state) => {
+      if (!reentered && !state.isTyping) {
+        reentered = true;
+        h.deliver({ type: "user_committed", id: "new-user", text: "new remote work",
+          turnId: "new-remote", requestState: "started", seq: 3 });
+        h.deliver({ type: "typing" });
+      }
+    });
+    const request = h.differences[0]!;
+    h.deliver({ type: "difference", afterSeq: request.afterSeq, nonce: request.nonce, maxSeq: 2, partial: false, events: [] });
+    unsubscribe();
+    expect(reentered).toBe(true);
+    expect(h.wrapper.getState().isTyping).toBe(true);
+    expect(inside(h.wrapper).deferredCancelledTyping).toBeUndefined();
+    expect(c.snapshot().state).toBe("queued");
+    expect(h.received).toHaveLength(1);
+    h.deliver({ type: "turn_settled", turnId: "new-remote", outcome: "ok" });
+    expect(h.received.map((frame) => frame.text)).toEqual(["work", "held C"]);
+  });
+
+  it.each(["close", "terminal"] as const)("retires deferred cancellation on %s before stale recovery can publish a hold", async (end) => {
+    const h = await withClock();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    h.control.answerDifferences = false;
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [] });
+    h.deliver({ type: "typing" });
+    const c = h.wrapper.send("held C")!;
+    h.deliver({ type: "ack", ids: [h.turnId], cancelled: [h.turnId] });
+    expect(inside(h.wrapper).deferredCancelledTyping).toBeDefined();
+    const oldServer = FakeNatsWS.instances.at(-1)!;
+    const request = h.differences[0]!;
+    if (end === "close") h.wrapper.close();
+    else oldServer.onmessage?.({ data: "-ERR 'Authorization Violation'\r\n" });
+    expect(inside(h.wrapper).deferredCancelledTyping).toBeUndefined();
+    expect(c.snapshot().state).toBe("failed");
+    h.deliver({ type: "difference", afterSeq: request.afterSeq, nonce: request.nonce, maxSeq: 2, partial: false, events: [] }, oldServer);
+    vi.advanceTimersByTime(30_000);
+    expect(h.wrapper.getState().isTyping).toBe(false);
+    expect(h.received).toHaveLength(1);
+    expect(h.request).not.toHaveBeenCalled();
+  });
+
+  it("raw loss discards deferred cleanup before replacement typing and history reconciliation", async () => {
+    const h = await setup({ timeout: 0 });
+    vi.useFakeTimers();
+    h.control.answerDifferences = false;
+    const a = h.wrapper.send("cancelled A")!;
+    const id = h.received[0]!.id!;
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [] });
+    h.deliver({ type: "typing" });
+    const c = h.wrapper.send("held C")!;
+    h.deliver({ type: "ack", ids: [id], cancelled: [id] });
+    expect(inside(h.wrapper).deferredCancelledTyping).toBeDefined();
+    const first = h.differences[0]!;
+    FakeNatsWS.instances.at(-1)!.close();
+    expect(inside(h.wrapper).deferredCancelledTyping).toBeUndefined();
+    let replacementTyping = false;
+    const unsubscribe = h.wrapper.subscribe((state) => {
+      if (state.connected && !replacementTyping) {
+        replacementTyping = true;
+        h.deliver({ type: "typing" });
+      }
+    });
+    await vi.waitFor(() => expect(h.control.registrations).toBe(2));
+    await vi.waitFor(() => expect(replacementTyping).toBe(true));
+    unsubscribe();
+    h.deliver({ type: "difference", afterSeq: first.afterSeq, nonce: first.nonce, maxSeq: 2, partial: false, events: [] });
+    const replacement = h.differences.at(-1)!;
+    expect(replacement.nonce).not.toBe(first.nonce);
+    h.deliver({ type: "difference", afterSeq: replacement.afterSeq, nonce: replacement.nonce, maxSeq: 2, partial: false, events: [] });
+    expect(h.wrapper.getState().isTyping).toBe(true);
+    expect(c.snapshot().state).toBe("queued");
+    expect(a.snapshot().state).toBe("accepted");
+    expect(h.received).toHaveLength(1);
+    h.deliver({ type: "turn_settled", turnId: "replacement-remote", outcome: "ok" });
+    expect(h.received.map((frame) => frame.text)).toEqual(["cancelled A", "held C"]);
   });
 
   it.each([

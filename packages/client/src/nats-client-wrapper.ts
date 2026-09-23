@@ -911,6 +911,12 @@ export class WebChannelNATSClient {
   private readonly applicationTurns = new Map<string, ReceiptRecord>();
   /** Local candidates at the latest typing frame; not exclusive activity owners. */
   private typingLocalCandidates = new Set<string>();
+  /** One cancellation cleanup decision for this typing episode, never a task outcome. */
+  private deferredCancelledTyping: { candidates: Set<string>; lifecycle: number } | undefined;
+  /** Prevent cleanup from observing a partially folded inbound/recovery transaction. */
+  private cancellationReconciliationDepth = 0;
+  /** Release only after cleanup subscribers finish supplying reentrant activity. */
+  private cancellationTypingCleanupDepth = 0;
   private activeTurnStallTimer: ReturnType<typeof setTimeout> | null = null;
   private activeTurnStallGeneration = 0;
   /** Defers held-admission UI fanout until the first owner's timer commit ends. */
@@ -1029,6 +1035,7 @@ export class WebChannelNATSClient {
       this.rawTransportConnected = connected;
       const wasSessionEstablished = this.sessionEstablished;
       const lifecycle = ++this.wrapperLifecycleGeneration;
+      this.deferredCancelledTyping = undefined;
       // Raw transport is never public readiness. Invalidate the release gate
       // before timer cleanup or any wrapper state callback.
       this.sessionEstablished = false;
@@ -1162,6 +1169,7 @@ export class WebChannelNATSClient {
       this.connectDeferredUntilCloseCompletes = false;
       this.replacementHeldNeedsFreshEpisode = false;
       this.wrapperLifecycleGeneration++;
+      this.deferredCancelledTyping = undefined;
       this.applicationTurns.clear();
       this.cancelActiveTurnStallTimer();
       const deferredEntries = this.deferredReplacementOperations.splice(0);
@@ -1282,6 +1290,7 @@ export class WebChannelNATSClient {
     // occurring from one of THIS close's callouts can set the intent again.
     this.connectDeferredUntilCloseCompletes = false;
     this.wrapperLifecycleGeneration++;
+    this.deferredCancelledTyping = undefined;
     this.closeTransactionDepth++;
     try {
       this.applicationTurns.clear();
@@ -1894,6 +1903,7 @@ export class WebChannelNATSClient {
     // transaction. They release only after the outer stop owns its queue slot.
     if (this.stopCommitDepth > 0) return true;
     if (this.heldReleaseCommitDepth > 0) return true;
+    if (this.cancellationTypingCleanupDepth > 0) return true;
     return this.turnInFlight() || this.held.length > 0;
   }
 
@@ -1940,6 +1950,7 @@ export class WebChannelNATSClient {
       this.deferredReplacementOpen() ||
       this.stopCommitDepth > 0 ||
       this.heldReleaseCommitDepth > 0 ||
+      this.cancellationTypingCleanupDepth > 0 ||
       this.held.length === 0 ||
       this.turnInFlight() ||
       !this.state.connected ||
@@ -2714,6 +2725,7 @@ export class WebChannelNATSClient {
    * send, a staged-bubble exposure, or a held drain midway through its FIFO commit.
    */
   private setState(patch: StatePatch): void {
+    if (patch.isTyping === false) this.deferredCancelledTyping = undefined;
     this.state = nextStateFrom(this.state, patch);
     this.notifyStateListeners();
   }
@@ -3587,6 +3599,41 @@ export class WebChannelNATSClient {
   // ---------------------------------------------------------------------------
 
   private handleMessage(msg: InboundMessage): void {
+    this.cancellationReconciliationDepth++;
+    try { this.handleInboundMessage(msg); }
+    finally {
+      this.cancellationReconciliationDepth--;
+      this.reconcileCancelledTyping();
+    }
+  }
+
+  /** Consume a cancellation decision only after ordered recovery has drained. */
+  private reconcileCancelledTyping(): void {
+    const pending = this.deferredCancelledTyping;
+    if (!pending) return;
+    if (pending.lifecycle !== this.wrapperLifecycleGeneration
+      || pending.candidates !== this.typingLocalCandidates || !this.state.isTyping) {
+      this.deferredCancelledTyping = undefined;
+      return;
+    }
+    if (this.cancellationReconciliationDepth > 0 || this.cursor.state === "catching-up"
+      || this.pendingHistorySnapshots.length > 0) return;
+    // One decision, consumed before fanout. Live, history and buffered evidence
+    // now share the existing versioned projection; do not fold a second view or
+    // keep a proof around to erase activity when an unrelated owner later ends.
+    this.deferredCancelledTyping = undefined;
+    if (this.applicationTurns.size > 0 || this.openTurns.size > 0
+      || this.state.messages.some((row) => row.working
+        || (row.kind === undefined && row.role === "user"
+          && (row.requestState === "queued" || row.requestState === "started")
+          && !this.client.isIngressCancelled(row.wireId ?? row.turnId ?? "")))) return;
+    this.cancellationTypingCleanupDepth++;
+    try { this.setState({ isTyping: false }); }
+    finally { this.cancellationTypingCleanupDepth--; }
+    if (pending.lifecycle === this.wrapperLifecycleGeneration) this.maybeRelease();
+  }
+
+  private handleInboundMessage(msg: InboundMessage): void {
     // Duplicate cancellation ACKs have no new receipt transition. Retire their
     // exact ownership here too, before any reducer/subscriber callout. Keep the
     // accepted delivery receipt; this signal does not invent a journal row.
@@ -3607,6 +3654,9 @@ export class WebChannelNATSClient {
       const typingCandidates = this.typingLocalCandidates;
       const cancelsTypingCandidate = finalize.some((id) => typingCandidates.has(id));
       for (const id of finalize) typingCandidates.delete(id);
+      if (cancelsTypingCandidate) {
+        this.deferredCancelledTyping = { candidates: typingCandidates, lifecycle };
+      }
       if (!this.hasAcceptedApplicationTurn()) this.cancelActiveTurnStallTimer();
       if (this.wrapperLifecycleGeneration !== lifecycle) return;
       for (const id of finalize) {
@@ -3614,24 +3664,10 @@ export class WebChannelNATSClient {
         this.finalizeDraftsForTurn(id);
         if (this.wrapperLifecycleGeneration !== lifecycle) return;
       }
-      // Typing has no wire turn ID: local candidates cannot establish exclusive
-      // ownership. Another device's queued/started row also protects activity,
-      // even without a local receipt, open turn, or working draft. Read the
-      // current reconciled rows after timer/draft callouts; history and reentry
-      // may have supplied newer evidence. Exact cancellation facts can retire
-      // a local row before its terminal journal state arrives.
-      const clearTyping = cancelsTypingCandidate && this.typingLocalCandidates === typingCandidates
-        && this.applicationTurns.size === 0
-        && this.openTurns.size === 0 && !this.state.messages.some((row) => row.working
-          || (row.kind === undefined && row.role === "user"
-            && (row.requestState === "queued" || row.requestState === "started")
-            && !this.client.isIngressCancelled(row.wireId ?? row.turnId ?? "")))
-        && this.state.isTyping === true;
+      // Exact turn/draft retirement is immediate. Unscoped typing cleanup waits
+      // for the outer fold and any outstanding gap/history reconciliation.
       const clearActive = closed && this.openTurns.size === 0;
-      if (clearActive || clearTyping) this.setState({
-        ...(clearActive ? { turnActive: false } : {}),
-        ...(clearTyping ? { isTyping: false } : {}),
-      });
+      if (clearActive) this.setState({ turnActive: false });
       if (this.wrapperLifecycleGeneration !== lifecycle) return;
     }
     // Observe authenticated live arrival before gap buffering. Replaying that
@@ -3941,6 +3977,18 @@ export class WebChannelNATSClient {
     buffered: InboundMessage[],
     carried: CarriedRows | undefined,
   ): void {
+    // Timeout fallback also drains outside handleMessage. Nested ACK callbacks
+    // must wait for every pending snapshot and buffered frame, not the temporary
+    // synced cursor installed before that drain.
+    this.cancellationReconciliationDepth++;
+    try { this.drainSynced(last, buffered, carried); }
+    finally {
+      this.cancellationReconciliationDepth--;
+      this.reconcileCancelledTyping();
+    }
+  }
+
+  private drainSynced(last: number, buffered: InboundMessage[], carried: CarriedRows | undefined): void {
     this.cursor = { state: "synced", last };
     if (carried !== undefined && last >= this.observedHistoryHighWater
       && this.recoveringHistoryOrder !== undefined) {
@@ -4729,6 +4777,7 @@ export class WebChannelNATSClient {
         // cancelled local candidate, even before the ACK's UI cleanup runs.
         this.typingLocalCandidates = new Set([...this.applicationTurns.keys()]
           .filter((id) => !this.client.isIngressCancelled(id)));
+        this.deferredCancelledTyping = undefined;
         this.setState({ isTyping: true });
         return true;
       }
