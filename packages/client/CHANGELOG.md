@@ -14,6 +14,9 @@
   input durably stopped before admission does not become permanent recovery work.
   Cancelled IDs must belong to the same ACK; malformed frames are rejected before
   any ACK effect. Other accepted work and ordinary coalesced settlement are preserved.
+- Preserve another device's queued/started typing and held follow-ups when a
+  delayed first cancellation ACK arrives for an unrelated local input. Cleanup
+  consults reconciled request state, including history and callback updates.
 
 ### Breaking (wire protocol v6)
 
