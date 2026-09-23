@@ -23,7 +23,7 @@ import { WebChannelNATSClient, filterCommandCatalog } from "../../../packages/cl
 import type { WebChannelState, ApprovalRequest, ChatBubble } from "../../../packages/client/src/types.js";
 import { api, b64url, el, type DemoConfig } from "./config.js";
 import { renderMarkdown } from "./markdown.js";
-import { terminalErrorCopy } from "./error-copy.js";
+import { sendStatusCopy, terminalErrorCopy } from "./error-copy.js";
 import {
   orderConversationPresentation,
   captureOpenReasoningIds,
@@ -253,7 +253,7 @@ export async function createWidget(
       el("div", {
         style: "display:flex;align-items:center;gap:6px;margin-top:4px;font-size:11px;opacity:.9",
       }, [
-        el("span", { style: "flex:1" }, ["⏳ queued — sends when the agent finishes"]),
+        renderSendStatus(m) ?? el("span", { style: "flex:1" }, ["Queued · waiting for the agent to finish"]),
         dismiss,
       ]),
     ]);
@@ -296,6 +296,30 @@ export async function createWidget(
         dismiss,
       ]),
     ]);
+  }
+
+  function renderSendStatus(message: ChatBubble): HTMLElement | undefined {
+    const copy = sendStatusCopy(message);
+    if (!copy) return undefined;
+    const status = el("div", {
+      class: "send-status",
+      "data-send-state": message.sendState!,
+      style: "font-size:11px;margin-top:4px",
+    }, [el("strong", {}, [copy.label])]);
+    if (copy.hint) status.append(el("div", {}, [copy.hint]));
+    if (copy.restoreDraft) {
+      // Restoring text never re-executes a task; Send remains a separate choice.
+      const restore = el("button", { style: "margin-top:4px;font-size:11px" }, ["Restore draft"]) as HTMLButtonElement;
+      restore.onclick = () => {
+        if (disposed) return;
+        input.value = input.value.trim() ? `${input.value} ${message.text}` : message.text;
+        input.focus();
+        renderMenu();
+        refreshComposerMode();
+      };
+      status.append(restore);
+    }
+    return status;
   }
 
   function render(state: WebChannelState): void {
@@ -417,6 +441,10 @@ export async function createWidget(
         },
         [child],
       );
+      if (isUser) {
+        const status = renderSendStatus(m);
+        if (status) bubble.append(status);
+      }
       if (isUser && m.requestState === "interrupted") {
         const retry = el("button", {}, ["Retry"]) as HTMLButtonElement;
         retry.onclick = () => { client?.retryInterrupted(m.id); };

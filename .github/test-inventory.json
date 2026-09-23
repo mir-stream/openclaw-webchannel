@@ -11,7 +11,7 @@
     "demo/web/src/presentation.dom.test.ts": 6,
     "demo/web/src/presentation.test.ts": 31,
     "demo/web/src/widget-dispatch-recovery.test.ts": 1,
-    "demo/web/src/widget-session.dom.test.ts": 6,
+    "demo/web/src/widget-session.dom.test.ts": 10,
     "e2e/conversation-key-rotation-reconnect.test.ts": 1,
     "e2e/history-convergence.test.ts": 7,
     "e2e/local/harness.test.ts": 13,

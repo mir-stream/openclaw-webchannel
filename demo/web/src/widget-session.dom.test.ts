@@ -3,7 +3,8 @@ import { webcrypto } from "node:crypto";
 import { setImmediate } from "node:timers/promises";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createWidget } from "./widget.js";
-import { openMessage } from "../../../packages/client/src/e2e-crypto-browser.js";
+import { openMessage, sealMessage } from "../../../packages/client/src/e2e-crypto-browser.js";
+import { outboundSubject, type OutboundMessage } from "../../../packages/client/src/nats-client.js";
 import {
   AGENT, TENANT, PEER, JWT, FakeNatsWS, installFakeWebSocket,
   makeAgentIdentity, registerAgent, settleUntil,
@@ -13,6 +14,7 @@ const config = { tenant: TENANT, issuerUrl: "https://issuer.invalid", accounts: 
 const cleanup: Array<() => void> = [];
 const requests: Array<{ path: string; init: RequestInit }> = [];
 const sent: Array<Record<string, unknown>> = [];
+const key = new Uint8Array(32).fill(61);
 let beforeFetch: ((path: string, init: RequestInit) => Promise<void>) | undefined;
 let root: HTMLDivElement;
 
@@ -24,6 +26,17 @@ function deferred() {
 }
 function button(text: string): HTMLButtonElement {
   return Array.from(root.querySelectorAll("button")).find(b => b.textContent!.includes(text))!;
+}
+function deliver(frame: Record<string, unknown>) {
+  FakeNatsWS.instances.at(-1)!.deliverToClient(outboundSubject(TENANT, AGENT, PEER), sealMessage(
+    { tenant: TENANT, accountId: AGENT, sub: PEER }, key, frame as unknown as OutboundMessage,
+  ));
+}
+function submit(text: string) {
+  const input = root.querySelector("input")!;
+  input.value = text;
+  input.dispatchEvent(new Event("input"));
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
 }
 async function ready(count: number) {
   await settleUntil(() => FakeNatsWS.instances.length === count, { label: "owned socket" });
@@ -44,7 +57,6 @@ beforeEach(() => {
   sent.length = 0;
   beforeFetch = undefined;
   const identity = makeAgentIdentity();
-  const key = new Uint8Array(32).fill(61);
   vi.stubGlobal("fetch", vi.fn(async (path: string, init: RequestInit) => {
     requests.push({ path, init });
     // Deliberately ignore AbortSignal: ownership checks must also fence a
@@ -165,4 +177,65 @@ it("aborts an initial mount before its teardown promise resolves", async () => {
   teardown();
   expect(FakeNatsWS.instances).toHaveLength(0);
   expect(root.textContent).toBe("new account");
+});
+
+it("shows queued, sent, accepted and completed receipts without claiming acceptance on socket write", async () => {
+  cleanup.push(await createWidget(root, config, AGENT));
+  submit("receipt lifecycle");
+  expect(root.querySelector('[data-send-state="queued"]')?.textContent).toContain("Queued · waiting to send");
+  expect(sent).toEqual([]);
+  await ready(1);
+  await settleUntil(() => sent.length === 1, { label: "encrypted send" });
+  expect(root.querySelector('[data-send-state="sent"]')?.textContent).toBe("Sent · awaiting acceptance");
+  expect(root.textContent).not.toContain("Accepted by agent");
+  deliver({ type: "ack", ids: [sent[0].id] });
+  expect(root.querySelector('[data-send-state="accepted"]')?.textContent).toBe("Accepted by agent");
+  expect(root.textContent).not.toContain("Completed");
+  deliver({ type: "turn_settled", turnId: sent[0].id, outcome: "ok" });
+  expect(root.querySelector('[data-send-state="completed"]')?.textContent).toBe("Completed");
+});
+
+it("shows an encrypted overload rejection and restores text without sending or overwriting a draft", async () => {
+  await mount();
+  submit("rejected message");
+  await settleUntil(() => sent.length === 1, { label: "send before rejection" });
+  deliver({ type: "inbound_rejected", ids: [sent[0].id], reason: "overloaded" });
+  const status = root.querySelector('[data-send-state="failed"]')!;
+  expect(status.textContent).toContain("Send failed · agent overloaded");
+  expect(status.textContent).toContain("did not accept");
+  expect(root.textContent).toContain("● connected");
+  const input = root.querySelector("input")!;
+  input.value = "existing draft";
+  button("Restore draft").click();
+  expect(input.value).toBe("existing draft rejected message");
+  await setImmediate();
+  expect(sent).toHaveLength(1);
+  expect(root.querySelector('[data-send-state="failed"]')).not.toBeNull();
+});
+
+it("warns about possible effects after execution failure and never retries it automatically", async () => {
+  await mount();
+  submit("perform an operation");
+  await settleUntil(() => sent.length === 1, { label: "operation send" });
+  deliver({ type: "ack", ids: [sent[0].id] });
+  deliver({ type: "turn_settled", turnId: sent[0].id, outcome: "error" });
+  const status = root.querySelector('[data-send-state="failed"]')!;
+  expect(status.textContent).toContain("Request failed after acceptance");
+  expect(status.textContent).toContain("may have had effects");
+  button("Restore draft").click();
+  await setImmediate();
+  expect(sent).toHaveLength(1);
+  expect(root.querySelector("input")!.value).toBe("perform an operation");
+});
+
+it("shows terminal auth failures with re-authentication rather than a send retry", async () => {
+  await mount();
+  submit("awaiting acceptance");
+  await settleUntil(() => sent.length === 1, { label: "pending send" });
+  FakeNatsWS.instances[0].onmessage?.({ data: "-ERR 'Authentication Expired'\r\n" });
+  await settleUntil(() => !!root.querySelector('[data-send-state="failed"]'), { label: "terminal receipt" });
+  expect(root.querySelector('[data-send-state="failed"]')!.textContent).toContain("Credentials expired");
+  expect(button("Re-authenticate")).toBeDefined();
+  expect(button("Restore draft")).toBeUndefined();
+  expect(sent).toHaveLength(1);
 });
