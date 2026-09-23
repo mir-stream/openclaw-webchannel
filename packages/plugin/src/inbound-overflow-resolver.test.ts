@@ -467,7 +467,7 @@ describe("BoundedOverflowResolver", () => {
       fallback,
     );
     expect(fallback.has(key, accountId)).toBe(true);
-    expect(lostCancellationAck).toHaveBeenCalledWith(peerId, [id]);
+    expect(lostCancellationAck).not.toHaveBeenCalled();
 
     const accepted = new Set<string>();
     const overloaded = new Set<string>([`${accountId}:${key}`]);
@@ -566,7 +566,7 @@ describe("BoundedOverflowResolver", () => {
     expect(overloaded).toEqual(new Set());
     expect(acked).toHaveBeenCalledWith(expect.objectContaining({
       accountId, peerId, id, key, recoverCancelled: true,
-    }));
+    }), undefined, true);
     expect(rejected).not.toHaveBeenCalled();
     expect(dispatched).not.toHaveBeenCalled();
     expect(fallback.has(key, accountId)).toBe(false);

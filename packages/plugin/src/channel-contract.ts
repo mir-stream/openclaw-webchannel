@@ -586,6 +586,9 @@ export type OutboundWsMessage =
   | {
       type: "ack";
       ids: string[];
+      /** Protocol 6: exact wire IDs with durable cancellation, a subset of this
+       * frame's ids. Authenticated by the same sealed envelope as the ACK. */
+      cancelled?: string[];
       /**
        * #243 half 2a (doc §16.2-1): the durable user messageId the SERVER minted
        * for each fresh admission, and the SAME id re-echoed for a deduped retry,
@@ -906,6 +909,7 @@ export interface WebChannelPeerChannel {
     peerId: string,
     ids: string[],
     committed?: Array<{ random_id: string; messageId: string; seq: number }>,
+    cancelled?: string[],
   ): boolean;
   sendInboundRejected?(peerId: string, ids: string[]): boolean;
 }
@@ -925,6 +929,6 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload, _options?: { redelivery?: boolean }): ApprovalRequestSendResult { return { delivered: false, journaled: false }; }
   sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision, options?: ApprovalResolutionSendOptions): ApprovalResolutionSendResult { options?.onClaim?.(); return { accepted: true, delivered: false, journaled: false, status: "unavailable" }; }
   sendApprovalSnapshot(_peerId: string, _approvals: ApprovalRequestPayload[], _resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean { return false; }
-  sendAck(_peerId: string, ids: string[], _committed?: Array<{ random_id: string; messageId: string; seq: number }>): boolean { return ids.length === 0; }
+  sendAck(_peerId: string, ids: string[], _committed?: Array<{ random_id: string; messageId: string; seq: number }>, _cancelled?: string[]): boolean { return ids.length === 0; }
   sendInboundRejected(_peerId: string, ids: string[]): boolean { return ids.length === 0; }
 }

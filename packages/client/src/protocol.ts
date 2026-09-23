@@ -19,6 +19,13 @@
  * v4 (breaking, #246): the v6 delivery-render frames are not optional garnish —
  * a peer that ignores them DIVERGES SILENTLY. See the worked example below.
  *
+ * v6 (breaking): ack.cancelled proves durable cancellation for exact wire IDs
+ * in the same frame's ids. A cancelled request may have no journal row, so the
+ * client must retire its active watch on this proof instead of reconnecting
+ * forever for history that cannot exist. Ordinary ACKs and stop-command receipts
+ * supply no such proof. The exact-match gate requires the client/server change
+ * together; this adds no capability negotiation or envelope/package version bump.
+ *
  * When to bump (#160)
  * ───────────────────
  * Bumping is breaking for every deployment simultaneously: both sides reject a
@@ -91,4 +98,4 @@
  * NOTE: this is a DIFFERENT layer from the E2E message-envelope version
  * (`ENVELOPE_VERSION` / `v:1`), which versions the encrypted payload format.
  */
-export const WEBCHANNEL_PROTOCOL_VERSION = 5;
+export const WEBCHANNEL_PROTOCOL_VERSION = 6;

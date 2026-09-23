@@ -54,11 +54,11 @@ import { createIngressDebounceCallbacks } from "./ingress-debounce-callbacks.js"
 import { InboundPressureLogger } from "./inbound-pressure-log.js";
 import { isControlLaneMessage, shouldDropBufferedInputOnStop } from "./control-lane.js";
 import { resolveCommandGate } from "./command-gate.js";
+import { createStopControl } from "./stop-control.js";
 import { resolveInboundDebounceMs } from "openclaw/plugin-sdk/reply-runtime";
 import {
   CancelledInboundFallbackTombstones,
   createIngressOnFlush,
-  recordCancelledInboundItems,
 } from "./ingress-dedupe.js";
 import {
   handleApprovalDecision,
@@ -246,8 +246,8 @@ const processOverflowResolver = new BoundedOverflowResolver({
     accountRuntimes
       .get(accountId)
       ?.deliveryJournal?.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
-  sendAck: ({ accountId, peerId, id }, committed) =>
-    accountRuntimes.get(accountId)?.channel.sendAck(peerId, [id], committed) ?? false,
+  sendAck: ({ accountId, peerId, id }, committed, cancelled) =>
+    accountRuntimes.get(accountId)?.channel.sendAck(peerId, [id], committed, cancelled ? [id] : undefined) ?? false,
   sendRejected: ({ accountId, peerId, id }) =>
     accountRuntimes.get(accountId)?.channel.sendInboundRejected(peerId, [id]) ?? false,
   onCancelledRecovered: ({ accountId, key }) => {
@@ -988,6 +988,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         (message) => (api.logger?.warn ?? console.warn)?.(message),
       );
       let dispatchRecovery: DispatchRecovery | undefined;
+      let stopControl: ReturnType<typeof createStopControl<DebounceItem>> | undefined;
       let inboundDispatcher: SerializedInboundDispatcher<WebchannelUserMessage> | undefined;
       let inboundDebouncer: BoundedInboundDebouncer<DebounceItem> | undefined;
       let disposePromise: Promise<import("./nats-account-coordinator.js").DisposeReport> | undefined;
@@ -1028,6 +1029,8 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           // account. Do not "fix" it by moving `close()` earlier; that trades a
           // log line for the write window this ordering exists to prevent.
           // `close()` is idempotent.
+          // Drain old session-wide aborts before a replacement can start new turns.
+          try { await stopControl?.dispose(); } catch (error) { errors.push({ phase: "stop-control", error }); }
           try { deliveryJournal?.close(); } catch (error) { errors.push({ phase: "delivery-journal", error }); }
           const transportReport = await transport.closeGracefully();
           return { errors, transport: transportReport };
@@ -1095,7 +1098,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         beginBatch: (peerId) => dispatchRecovery!.beginBatch(peerId),
         dispatchRecovery,
         // #243 half 2a: forward the server-assigned-id echo so it rides the ack.
-        sendAck: (peerId, ids, committed) => channel.sendAck(peerId, ids, committed),
+        sendAck: (peerId, ids, committed, cancelled) => channel.sendAck(peerId, ids, committed, cancelled),
         sendInboundRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids),
         // #245 Part B: broadcast a just-committed user message to the account's
         // devices for immediate multi-device echo (Telegram model). One publish to
@@ -1126,7 +1129,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           cancelledFallback: cancelledInboundFallback,
           deliveryJournal,
           sessionToken,
-          sendAck: (peerId, ids, committed) => channel.sendAck(peerId, ids, committed),
+          sendAck: (peerId, ids, committed, cancelled) => channel.sendAck(peerId, ids, committed, cancelled),
           sendRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids),
           onPressure: ({ key: peerId, reason, chargedBytes }) => {
             pressureLogger.record({
@@ -1139,41 +1142,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           },
         }),
         onFlush: onIngressFlush,
-        onCancel: async (entries) => {
-          // P0-7b: a `/stop` cancels debounce-buffered messages that never reached
-          // onFlush, so they were never dedupe-recorded and never acked — yet the
-          // client's replay ledger still holds them. Record their ids (so an
-          // in-flight replay is dropped as CANCELLED, #344) and ACK them. The bounded
-          // debouncer keeps reservations charged until this callback settles.
-          await recordCancelledInboundItems(
-            entries.map((entry) => entry.item),
-            accountId,
-            async (key) => {
-              // ⭐ #344 — `cancelled`, NOT `accepted`. This suppression writes a
-              // marker and DELIBERATELY no journal row, which is byte-identical
-              // to the accept seam's crash window; recording it as `accepted`
-              // made a lost ack replay as a re-admission and re-run the very text
-              // `/stop` killed. The distinct outcome is what tells the two apart.
-              const result = await processIngressOutcomes.record(
-                accountId,
-                key,
-                "cancelled",
-                { replaceOthers: true },
-              );
-              if (result.status !== "recorded") throw result.error;
-              result.write.commit();
-              return true;
-            },
-            (peerId, ids) => channel.sendAck(peerId, ids),
-            (message) => api.logger?.warn?.(message),
-            cancelledInboundFallback,
-            () => entries.every((entry) => !entry.isRetired()),
-          ).catch((err) => {
-            api.logger?.warn?.(
-              `webchannel: cancelled-inbound handling failed: ${logSafe(err)}`,
-            );
-          });
-        },
+
       });
 
       const retirePeerIngress = (peerId: string): void => {
@@ -1194,6 +1163,37 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // send the peer a hedged notice. See src/command-gate.ts for the traced
       // core paths (all testable logic lives in the imported typed helpers).
       const commandGate = resolveCommandGate(api.config, accountId);
+      stopControl = createStopControl<DebounceItem>({
+        journal: deliveryJournal,
+        recovery: dispatchRecovery,
+        debouncer: inboundDebouncer,
+        pendingOverflowKey: (peerId) => {
+          const token = sessionTokens.get(peerId);
+          return token ? processOverflowResolver.pendingLogicalKey(token) : undefined;
+        },
+        retireOverflow: (peerId) => {
+          const token = sessionTokens.get(peerId);
+          if (token) processOverflowResolver.invalidateSession(token);
+        },
+        isActive: () => runtimeActive,
+        sendAck: (peerId, ids, committed, cancelled) => channel.sendAck(peerId, ids, committed, cancelled),
+        warn: (error) => api.logger?.warn?.(`webchannel: stop control failed: ${logSafe(error)}`),
+        dispatchControl: (peerId, message) => {
+          const operation = handleInboundMessage(api, channel, peerId, message, accountId, tenant, {
+            controlLane: true,
+            dispatchAbortSignal: attemptAbort.signal,
+          });
+          if (commandGate.delegated && !commandGate.isListed(peerId)) {
+            try {
+              channel.sendText(peerId,
+                "Stop may not be permitted for this user: this agent restricts " +
+                  "commands to an operator allowlist.",
+                nextMessageId());
+            } catch { /* Feedback failure cannot release ownership of the core call. */ }
+          }
+          return operation;
+        },
+      });
       channel.setMessageHandler((peerId, rawMessage) => {
         if (!runtimeActive) return;
         if (rawMessage.type !== "user_message") return; // approvals routed below
@@ -1219,114 +1219,11 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         // ack, not the debouncer — may see the raw frame, and that guard counts
         // the reads above this line, so do not add one.
         const message: WebchannelUserMessage = normalizeInboundUserMessage(rawMessage);
-        // Control lane (P1-8a): an abort ("/stop"/"stop"/…) must reach core's
-        // fast-abort WHILE the running turn is live, so it must NOT queue behind
-        // that turn on the per-session FIFO. Dispatch it directly, fire-and-
-        // forget, as an authorized control-lane turn. All the testable logic
-        // lives in `isControlLaneMessage` + `handleInboundMessage` (both under
-        // tsc + vitest); this file just routes.
-        //
-        // Unlike the FIFO path (inbound-queue.ts swallows a rejected turn), this
-        // direct dispatch has no chain to absorb a throw, and the pre-try work in
-        // handleInboundMessage (config/admission/route resolution, sendTyping)
-        // runs OUTSIDE its internal try/catch — so we MUST attach a rejection
-        // handler here or an unhandledRejection would take down the gateway.
-        //
-        // Authorization note: if an operator sets `commands.allowFrom` that
-        // EXCLUDES this peer, core's fast-abort returns handled:false (verified
-        // dist-B2e1grFo.js:1281) and the abort frame falls through to a NORMAL
-        // turn that races the running one, hits core's busy gate, and is dropped
-        // as busy. No wedge and no double-delivery — the /stop is simply ignored
-        // for an unauthorized sender.
+        // Control receipts and exact cancellation targets commit together before
+        // ACK. A replay returns that receipt without invoking core or clearing
+        // input accepted after the original stop.
         if (isControlLaneMessage(message)) {
-          // P1-8b: an EXPLICIT "/stop" (typed, or the widget Stop button which
-          // sends the literal "/stop") wants the text queued behind the running
-          // turn gone too — mirroring core fast-abort clearing its own followup
-          // lanes. Drop this peer's buffered input on BOTH layers before
-          // dispatching the abort: (a) any messages waiting in the pre-run
-          // debounce window (`cancelKey`), and (b) any messages buffered during
-          // the running turn (`clearPending`). Log at info only when something
-          // was actually dropped.
-          //
-          // The destructive drop is gated by `shouldDropBufferedInputOnStop`,
-          // which narrows on TWO axes (both live in the tested predicate):
-          //  1. EXPLICIT "/stop" only, NOT the broader `isControlLaneMessage`
-          //     vocabulary — a "halt"/"stop please" still aborts the running turn
-          //     for core parity, but a false-positive NL match must never
-          //     silently destroy a queued follow-up. Only the unambiguous "/stop"
-          //     opts in.
-          //  2. AUTHZ ASYMMETRY — the drop is all-or-nothing with the abort, and
-          //     the abort is core's call. When a commands/owner allowlist is
-          //     configured, core IGNORES our control-lane stamp (see the hedge
-          //     below + command-gate.ts): a non-listed peer's abort is refused,
-          //     the running turn keeps going. Dropping their buffers then would be
-          //     a PARTIAL /stop — turn survives, queued input destroyed. So we
-          //     drop only when the gate says core will honor this peer's abort
-          //     (`!delegated || isListed`). The mirror is biased toward NOT
-          //     dropping, so its only error is skipping cleanup for a peer whose
-          //     abort actually succeeded (their follow-up runs after the abort) —
-          //     accepted over destroying input for a peer whose turn survives.
-          if (shouldDropBufferedInputOnStop(message, commandGate, peerId)) {
-            // Fail closed before releasing any queued work if cancellation cannot persist.
-            try { dispatchRecovery!.cancel(peerId); }
-            catch (error) { api.logger?.warn?.(`webchannel: dispatch cancellation failed: ${logSafe(error)}`); return; }
-            const debounceCancelled = inboundDebouncer!.cancelKey(peerId, { notify: true });
-            const pendingDropped = inboundDispatcher!.clearPending(peerId);
-            dispatchRecovery!.retirePeer(peerId);
-            if (debounceCancelled || pendingDropped.length > 0) {
-              api.logger?.info?.(
-                `webchannel: /stop dropped buffered input (debounced=${debounceCancelled}, pending=${pendingDropped.length})`,
-              );
-            }
-          }
-          // P0-7b: ack the control-lane frame here too. It bypasses the
-          // debouncer/onFlush (and is never deduped), so without this its
-          // client-side ledger entry would never drain and every reconnect would
-          // replay the /stop. A replayed /stop that lands before this ack is a
-          // harmless no-op abort (accepted).
-          if (message.id && !channel.sendAck(peerId, [message.id])) {
-            api.logger?.warn?.(
-              `webchannel: control-lane ack failed for peer=${logSafe(peerId)} id=${logSafe(message.id)}`,
-            );
-          }
-          void handleInboundMessage(
-            api,
-            channel,
-            peerId,
-            message,
-            accountId,
-            tenant,
-            { controlLane: true },
-          ).catch((err) =>
-            api.logger?.error?.(
-              `webchannel: control-lane dispatch failed: ${logSafe(err)}`,
-            ),
-          );
-          // Feedback-only hedge for the stamp-ignored trap. Core's
-          // `resolveCommandSenderAuthorization` IGNORES our control-lane
-          // `access.commands.authorized` stamp whenever a commands/owner
-          // allowlist is configured (see src/command-gate.ts): a non-listed
-          // peer's /stop returns handled:false, falls through to a normal turn,
-          // and is dropped as busy — the run is NOT aborted and the widget's
-          // Stop button would otherwise sit silently inert with zero feedback.
-          // We STILL dispatch the abort above (core is the authority — the
-          // mirror can be wrong), and here we ADDITIONALLY warn the peer when
-          // our best-effort mirror says core will reject this sender. The gate
-          // is a conservative mirror biased toward showing this notice, so a
-          // false positive is only an extra hedged message, never a missed one.
-          // Best-effort send (ignore the boolean return), matching the rest of
-          // the outbound surface.
-          // #238: this notice is a real durable bubble, so the plugin mints its
-          // id at the delivery act rather than letting the viewer name it. Still
-          // best-effort — the boolean return stays deliberately ignored.
-          if (commandGate.delegated && !commandGate.isListed(peerId)) {
-            channel.sendText(
-              peerId,
-              "Stop may not be permitted for this user: this agent restricts " +
-                "commands to an operator allowlist.",
-              nextMessageId(),
-            );
-          }
+          stopControl!.handle({ peerId, message }, shouldDropBufferedInputOnStop(message, commandGate, peerId));
           return;
         }
         // Normal inbound: through layer (a) debounce → onFlush → per-session FIFO

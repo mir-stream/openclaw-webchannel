@@ -19,11 +19,13 @@ export const MAX_INGRESS_RESULT_ID_LENGTH = 128;
 export type CommittedUserMessage = { random_id: string; messageId: string; seq: number };
 
 export type IngressResultFrame =
-  | { type: "ack"; ids: string[]; committed?: CommittedUserMessage[] }
+  // cancelled is durable proof for a subset of this frame's exact wire ids.
+  | { type: "ack"; ids: string[]; committed?: CommittedUserMessage[]; cancelled?: string[] }
   | { type: "inbound_rejected"; ids: string[]; reason: "overloaded" };
 
 export type IngressResultChunkWriter = {
-  add(id: unknown): boolean;
+  /** cancelled requires durable evidence and always rides this ID's frame. */
+  add(id: unknown, cancelled?: boolean): boolean;
   finish(): boolean;
   retainedIds(): number;
 };
@@ -64,7 +66,8 @@ export function base64UrlLength(bytes: number): number {
 
 /**
  * Stream result ids through a single bounded chunk. No whole-flush id array or
- * Set is retained. Each frame deduplicates only its own at-most-64 ids.
+ * Set is retained. Each frame deduplicates only its own at-most-64 ids and carries
+ * only their cancellation flags; no proof may be separated from its wire ID.
  */
 export function createIngressResultChunkWriter(
   options: IngressResultChunkOptions,
@@ -80,6 +83,7 @@ export function createIngressResultChunkWriter(
     Buffer.byteLength(JSON.stringify(frame), "utf8"));
   let ids: string[] = [];
   let inChunk = new Set<string>();
+  let cancelledIds: string[] = [];
   let ok = true;
   // One-shot: attached to the first `ack` frame `flush` publishes, then cleared
   // so later frames in a chunked batch do not repeat it. `frameFor` reads it, so
@@ -89,35 +93,41 @@ export function createIngressResultChunkWriter(
       ? options.committed
       : [];
 
-  const frameFor = (values: string[]): IngressResultFrame => options.type === "ack"
-    ? { type: "ack", ids: values, ...(committedPending.length > 0 ? { committed: committedPending } : {}) }
+  const frameFor = (values: string[], cancelled: string[]): IngressResultFrame => options.type === "ack"
+    ? { type: "ack", ids: values, ...(committedPending.length > 0 ? { committed: committedPending } : {}),
+      ...(cancelled.length > 0 ? { cancelled } : {}) }
     : { type: "inbound_rejected", ids: values, reason: "overloaded" };
 
   const flush = (): boolean => {
     if (ids.length === 0) return true;
-    const frame = frameFor(ids);
+    const frame = frameFor(ids, cancelledIds);
     const sent = options.publish(frame);
     ok = sent && ok;
     ids = [];
     inChunk = new Set();
+    cancelledIds = [];
     // The echo has now ridden a frame; every subsequent frame omits it.
     committedPending = [];
     return sent;
   };
 
-  const add = (candidate: unknown): boolean => {
+  const add = (candidate: unknown, cancelled = false): boolean => {
     if (typeof candidate !== "string" || candidate.length === 0 || candidate.length > MAX_INGRESS_RESULT_ID_LENGTH) {
       return false;
     }
-    if (inChunk.has(candidate)) return true;
-    if (ids.length >= maxIds) flush();
-    let next = [...ids, candidate]; // bounded to maxIds (64)
-    let bytes = measure(frameFor(next));
+    const proof = options.type === "ack" && cancelled;
+    if (inChunk.has(candidate) && (!proof || cancelledIds.includes(candidate))) return true;
+    if (!inChunk.has(candidate) && ids.length >= maxIds) flush();
+    let next = inChunk.has(candidate) ? ids : [...ids, candidate]; // bounded to maxIds (64)
+    let nextCancelled = proof ? [...cancelledIds, candidate] : cancelledIds;
+    let bytes = measure(frameFor(next, nextCancelled));
     if (!Number.isSafeInteger(bytes) || bytes < 0) throw new TypeError("wire measurement is invalid");
     if (bytes > effectiveLimit && ids.length > 0) {
       flush();
       next = [candidate];
-      bytes = measure(frameFor(next));
+      nextCancelled = proof ? [candidate] : [];
+      bytes = measure(frameFor(next, nextCancelled));
+      if (!Number.isSafeInteger(bytes) || bytes < 0) throw new TypeError("wire measurement is invalid");
     }
     if (bytes > effectiveLimit) {
       options.onTooSmall?.();
@@ -125,6 +135,7 @@ export function createIngressResultChunkWriter(
       return false;
     }
     ids = next;
+    cancelledIds = nextCancelled;
     inChunk.add(candidate);
     return true;
   };
