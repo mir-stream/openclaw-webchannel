@@ -49,7 +49,7 @@ import {
   type BoundedInboundDebouncer,
 } from "./bounded-inbound-debouncer.js";
 import { getProcessIngressOutcomeStore } from "./ingress-outcome.js";
-import { BoundedOverflowResolver } from "./inbound-overflow-resolver.js";
+import { BoundedOverflowResolver, type OverflowResolutionRequest } from "./inbound-overflow-resolver.js";
 import { createIngressDebounceCallbacks } from "./ingress-debounce-callbacks.js";
 import { InboundPressureLogger } from "./inbound-pressure-log.js";
 import { isControlLaneMessage, shouldDropBufferedInputOnStop } from "./control-lane.js";
@@ -236,22 +236,26 @@ const processIngressOutcomes = getProcessIngressOutcomeStore();
 const processCancelledInboundFallback = new CancelledInboundFallbackTombstones(
   (message) => console.warn(message),
 );
+function runtimeForOverflow(request: OverflowResolutionRequest): AccountRuntime | undefined {
+  const runtime = accountRuntimes.get(request.accountId);
+  return runtime && request.storageScope?.accountId === runtime.accountId
+    && request.storageScope.tenant === runtime.tenant
+    && runtime.sessionTokens.get(request.peerId) === request.sessionToken ? runtime : undefined;
+}
 const processOverflowResolver = new BoundedOverflowResolver({
   outcomeStore: processIngressOutcomes,
   // #344: the accept authority, resolved per account exactly like `sendAck`
   // below. A disposed runtime yields `undefined`, and a closed handle throws
   // into the resolver's own catch — both leave the id unresolved, which is the
   // fail-safe direction (the client replays and the flush path decides).
-  lookupUserRow: ({ accountId, peerId }, idempotencyKey) =>
-    accountRuntimes
-      .get(accountId)
-      ?.deliveryJournal?.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
-  sendAck: ({ accountId, peerId, id }, committed) =>
-    accountRuntimes.get(accountId)?.channel.sendAck(peerId, [id], committed) ?? false,
-  sendRejected: ({ accountId, peerId, id }) =>
-    accountRuntimes.get(accountId)?.channel.sendInboundRejected(peerId, [id]) ?? false,
-  onCancelledRecovered: ({ accountId, key }) => {
-    processCancelledInboundFallback.delete(key, accountId);
+  lookupUserRow: (request, idempotencyKey) => runtimeForOverflow(request)
+    ?.deliveryJournal?.lookupUserMessageIdByRandomId(request.peerId, idempotencyKey),
+  sendAck: (request, committed) => runtimeForOverflow(request)
+    ?.channel.sendAck(request.peerId, [request.id], committed) ?? false,
+  sendRejected: (request) => runtimeForOverflow(request)
+    ?.channel.sendInboundRejected(request.peerId, [request.id]) ?? false,
+  onCancelledRecovered: ({ accountId, storageScope, key }) => {
+    processCancelledInboundFallback.delete(key, storageScope ?? accountId);
   },
 });
 const accountCoordinator = new NatsAccountRuntimeCoordinator();
@@ -399,6 +403,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
 
     {
       const { accountId, tenant, account } = plan;
+      const storageScope = Object.freeze({ tenant, accountId });
       const accountNatsCfg = account.nats as WebchannelNatsConfig | undefined;
       const accountEncryption = account.encryption as WebchannelEncryptionConfig | undefined;
       const accountDmSecurity = account.dmSecurity as string | undefined;
@@ -1001,7 +1006,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           try { attemptAbort.dispose(); } catch (error) { errors.push({ phase: "attempt-abort-listener", error }); }
           try { inboundDebouncer?.dispose(); } catch (error) { errors.push({ phase: "debouncer", error }); }
           try { inboundDispatcher?.dispose(); } catch (error) { errors.push({ phase: "dispatcher", error }); }
-          try { processOverflowResolver.invalidateAccount(accountId); } catch (error) { errors.push({ phase: "overflow-resolver", error }); }
+          try { processOverflowResolver.invalidateAccount(storageScope); } catch (error) { errors.push({ phase: "overflow-resolver", error }); }
           sessionTokens.clear();
           try { detachTransportListeners?.(); } catch (error) { errors.push({ phase: "transport-listeners", error }); }
           try { channel.dispose(); } catch (error) { errors.push({ phase: "channel", error }); }
@@ -1094,6 +1099,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       });
       const onIngressFlush = createIngressOnFlush<DebounceItem>({
         accountId,
+        storageScope,
         outcomeStore: processIngressOutcomes,
         beginBatch: (peerId) => dispatchRecovery!.beginBatch(peerId),
         dispatchRecovery,
@@ -1124,6 +1130,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         measure: (item) => estimateRetainedMessageBytes(item.message),
         ...createIngressDebounceCallbacks<DebounceItem>({
           accountId,
+          storageScope,
           outcomeStore: processIngressOutcomes,
           overflowResolver: processOverflowResolver,
           cancelledFallback: cancelledInboundFallback,

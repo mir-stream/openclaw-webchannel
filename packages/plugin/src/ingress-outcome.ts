@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { ingressScopeNamespace, type IngressScope } from "./ingress-scope.js";
 import {
   createPersistentDedupe,
   type PersistentDedupe,
@@ -39,6 +40,8 @@ export type IngressOutcome = "accepted" | "overloaded" | "cancelled";
  */
 export type IngressRefusal = Exclude<IngressOutcome, "accepted">;
 export type IngressOutcomeFailureCategory =
+  | "legacy-ambiguous"
+  | "lookup-legacy"
   | "lookup-overloaded"
   | "lookup-accepted"
   | "lookup-cancelled"
@@ -66,7 +69,8 @@ export type IngressOutcomeFailureCategory =
   | "adapter-record-accepted"
   | "adapter-record-overloaded";
 export type IngressOutcomeFailureWarning = (
-  accountId: string,
+  /** Wire account ID or opaque store namespace; the logger redacts namespaces. */
+  identity: string,
   category: IngressOutcomeFailureCategory,
 ) => void;
 /**
@@ -131,6 +135,15 @@ export type OutcomeRecordResult =
     }
   | { status: "unknown"; error: unknown };
 
+/** Historical membership cannot authorize a verdict for the current tenant. */
+export class LegacyIngressOutcomeAmbiguity extends Error {
+  readonly code = "legacy-ingress-outcome-ambiguous";
+  constructor() {
+    super("webchannel: legacy ingress outcome has no tenant ownership proof");
+    this.name = "LegacyIngressOutcomeAmbiguity";
+  }
+}
+
 export interface OutcomeWriteReceipt {
   readonly outcome: IngressOutcome;
   readonly created: boolean;
@@ -142,10 +155,10 @@ export interface OutcomeWriteReceipt {
 }
 
 export interface IngressOutcomeStore {
-  peek(accountId: string, key: string): IngressOutcome | undefined;
-  lookup(accountId: string, key: string): Promise<OutcomeLookup>;
+  peek(scope: IngressScope, key: string): IngressOutcome | undefined;
+  lookup(scope: IngressScope, key: string): Promise<OutcomeLookup>;
   record(
-    accountId: string,
+    scope: IngressScope,
     key: string,
     outcome: IngressOutcome,
     options?: {
@@ -155,7 +168,7 @@ export interface IngressOutcomeStore {
       reclaimAccepted?: boolean;
     },
   ): Promise<OutcomeRecordResult>;
-  forget(accountId: string, key: string, outcome: IngressOutcome): Promise<boolean>;
+  forget(scope: IngressScope, key: string, outcome: IngressOutcome): Promise<boolean>;
   hotSize(): { entries: number; bytes: number };
   rollbackRecoverySize(): { entries: number; bytes: number; poisoned: boolean };
 }
@@ -189,19 +202,19 @@ type OutcomeStoreOptions = {
 };
 
 type HotEntry = {
-  accountId: string;
+  namespace: string;
   key: string;
   outcome: IngressOutcome;
   durability: "durable" | "memory-only";
   bytes: number;
 };
 
-function hotKey(accountId: string, key: string): string {
-  return `${accountId.length}:${accountId}${key}`;
+function hotKey(namespace: string, key: string): string {
+  return `${namespace.length}:${namespace}${key}`;
 }
 
-function hotBytes(accountId: string, key: string): number {
-  return Buffer.byteLength(accountId, "utf8") + Buffer.byteLength(key, "utf8") + HOT_ENTRY_OVERHEAD;
+function hotBytes(namespace: string, key: string): number {
+  return Buffer.byteLength(namespace, "utf8") + Buffer.byteLength(key, "utf8") + HOT_ENTRY_OVERHEAD;
 }
 
 /**
@@ -253,13 +266,13 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
   );
 
   const putHot = (
-    accountId: string,
+    namespace: string,
     key: string,
     outcome: IngressOutcome,
     durability: "durable" | "memory-only" = "durable",
   ) => {
-    const mapKey = hotKey(accountId, key);
-    const bytes = hotBytes(accountId, key);
+    const mapKey = hotKey(namespace, key);
+    const bytes = hotBytes(namespace, key);
     const prior = hot.get(mapKey);
     if (prior) {
       totalHotBytes -= prior.bytes;
@@ -272,12 +285,12 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
       totalHotBytes -= hot.get(oldest)!.bytes;
       hot.delete(oldest);
     }
-    hot.set(mapKey, { accountId, key, outcome, durability, bytes });
+    hot.set(mapKey, { namespace, key, outcome, durability, bytes });
     totalHotBytes += bytes;
   };
 
-  const deleteHot = (accountId: string, key: string, outcome?: IngressOutcome) => {
-    const mapKey = hotKey(accountId, key);
+  const deleteHot = (namespace: string, key: string, outcome?: IngressOutcome) => {
+    const mapKey = hotKey(namespace, key);
     const entry = hot.get(mapKey);
     if (!entry || (outcome && entry.outcome !== outcome)) return;
     totalHotBytes -= entry.bytes;
@@ -285,15 +298,15 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
   };
 
   const rememberFailedRollback = (
-    accountId: string,
+    namespace: string,
     key: string,
     outcome: IngressOutcome,
     durability: "durable" | "memory-only",
   ): void => {
-    const mapKey = hotKey(accountId, key);
-    deleteHot(accountId, key, outcome);
+    const mapKey = hotKey(namespace, key);
+    deleteHot(namespace, key, outcome);
     if (rollbackRecoveryPoisoned || rollbackRecovery.has(mapKey)) return;
-    const bytes = hotBytes(accountId, key);
+    const bytes = hotBytes(namespace, key);
     if (
       maxRecoveryEntries === 0
       || bytes > maxRecoveryBytes
@@ -305,12 +318,12 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
       // this process. A process restart retains the plan's documented crash
       // tradeoff, but this live process can no longer silently ACK lost work.
       rollbackRecoveryPoisoned = true;
-      options.warnFailure?.(accountId, "rollback-recovery-poisoned");
+      options.warnFailure?.(namespace, "rollback-recovery-poisoned");
       return;
     }
-    rollbackRecovery.set(mapKey, { accountId, key, outcome, durability, bytes });
+    rollbackRecovery.set(mapKey, { namespace, key, outcome, durability, bytes });
     totalRollbackRecoveryBytes += bytes;
-    options.warnFailure?.(accountId, `rollback-${outcome}`);
+    options.warnFailure?.(namespace, `rollback-${outcome}`);
   };
 
   /** The one place an outcome maps to its backing store. */
@@ -323,23 +336,23 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
 
   const hasRecent = async (
     store: PersistentDedupe,
-    accountId: string,
+    namespace: string,
     key: string,
   ): Promise<{ found: boolean; diskError?: unknown }> => {
     let diskError: unknown;
     const found = await store.hasRecent(key, {
-      namespace: accountId,
+      namespace,
       onDiskError: (error) => { diskError = error; },
     });
     return { found, ...(diskError !== undefined ? { diskError } : {}) };
   };
 
   // Serialize the full lookup/write/conditional-cleanup lifecycle per
-  // account+key. A write receipt deliberately retains its turn until commit or
+  // storage namespace+key. A write receipt deliberately retains its turn until commit or
   // rollback, so replacement generations cannot overtake old cleanup.
   const operationTails = new Map<string, Promise<void>>();
-  const acquireOperation = async (accountId: string, key: string): Promise<() => void> => {
-    const mapKey = hotKey(accountId, key);
+  const acquireOperation = async (namespace: string, key: string): Promise<() => void> => {
+    const mapKey = hotKey(namespace, key);
     const previous = operationTails.get(mapKey) ?? Promise.resolve();
     let releaseCurrent!: () => void;
     const current = new Promise<void>((resolve) => { releaseCurrent = resolve; });
@@ -357,7 +370,7 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
     };
   };
 
-  const lookupUnlocked = async (accountId: string, key: string): Promise<OutcomeLookup> => {
+  const lookupUnlocked = async (namespace: string, key: string): Promise<OutcomeLookup> => {
     // Probe in precedence order and stop at the first hit. A store fault at ANY
     // rung is still `unknown` for the whole lookup — a lower rung's silence
     // cannot be read as absence when a higher one could not be read at all.
@@ -365,9 +378,9 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
       const outcome = OUTCOME_PRECEDENCE[rung]!;
       let probe: { found: boolean; diskError?: unknown };
       try {
-        probe = await hasRecent(storeFor(outcome), accountId, key);
+        probe = await hasRecent(storeFor(outcome), namespace, key);
       } catch (error) {
-        options.warnFailure?.(accountId, `lookup-${outcome}`);
+        options.warnFailure?.(namespace, `lookup-${outcome}`);
         return { status: "unknown", error };
       }
       if (probe.found) {
@@ -379,10 +392,10 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
         for (let weaker = rung + 1; weaker < OUTCOME_PRECEDENCE.length; weaker++) {
           const loser = OUTCOME_PRECEDENCE[weaker]!;
           let also: { found: boolean; diskError?: unknown } | undefined;
-          try { also = await hasRecent(storeFor(loser), accountId, key); } catch { /* winner stands */ }
+          try { also = await hasRecent(storeFor(loser), namespace, key); } catch { /* winner stands */ }
           if (!also?.found) continue;
           if (outcome !== "cancelled") options.warnInvariant?.(outcome);
-          await storeFor(loser).forget(key, { namespace: accountId }).catch(() => false);
+          await storeFor(loser).forget(key, { namespace }).catch(() => false);
         }
         // ⚠️ THE DURABILITY RULE IS PER-OUTCOME AND IS NOT AN OVERSIGHT.
         // `accepted` INHERITS a matching hot entry's durability; the two refusals
@@ -396,9 +409,9 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
         // `cancelled` fails a faulted write closed. Failed removal of the SDK's
         // memory-only marker enters rollback recovery before any lookup, so it
         // cannot authorize cleanup of a durable, weaker marker here.
-        const existing = hot.get(hotKey(accountId, key));
+        const existing = hot.get(hotKey(namespace, key));
         putHot(
-          accountId,
+          namespace,
           key,
           outcome,
           outcome === "accepted" && existing?.outcome === "accepted"
@@ -408,22 +421,43 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
         return { status: "found", outcome };
       }
       if (probe.diskError !== undefined) {
-        options.warnFailure?.(accountId, `lookup-${outcome}`);
+        options.warnFailure?.(namespace, `lookup-${outcome}`);
         return { status: "unknown", error: probe.diskError };
       }
     }
     return { status: "not-found" };
   };
 
+  const lookupLegacy = async (scope: IngressScope, key: string): Promise<OutcomeLookup> => {
+    if (typeof scope === "string") return { status: "not-found" };
+    // These markers have no tenant provenance. Credential migration does not
+    // establish their owner: one account namespace may contain multiple tenants.
+    // Probe membership only; normal lookup cleans weaker markers and is unsafe.
+    for (const outcome of OUTCOME_PRECEDENCE) {
+      try {
+        const probe = await hasRecent(storeFor(outcome), scope.accountId, key);
+        if (probe.diskError !== undefined) throw probe.diskError;
+        if (probe.found) {
+          options.warnFailure?.(scope.accountId, "legacy-ambiguous");
+          return { status: "unknown", error: new LegacyIngressOutcomeAmbiguity() };
+        }
+      } catch (error) {
+        options.warnFailure?.(scope.accountId, "lookup-legacy");
+        return { status: "unknown", error };
+      }
+    }
+    return { status: "not-found" };
+  };
+
   const eraseMarkerUnlocked = async (
-    accountId: string,
+    namespace: string,
     key: string,
     outcome: IngressOutcome,
   ): Promise<{ status: "ok" } | { status: "unknown"; error: unknown }> => {
     let diskError: unknown;
     try {
       await storeFor(outcome).forget(key, {
-        namespace: accountId,
+        namespace,
         onDiskError: (error) => { diskError = error; },
       });
     } catch (error) {
@@ -433,19 +467,19 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
   };
 
   const recoverFailedRollbackUnlocked = async (
-    accountId: string,
+    namespace: string,
     key: string,
   ): Promise<{ status: "ok" } | { status: "unknown"; error: unknown }> => {
     if (rollbackRecoveryPoisoned) {
-      options.warnFailure?.(accountId, "rollback-recovery-poisoned");
+      options.warnFailure?.(namespace, "rollback-recovery-poisoned");
       return { status: "unknown", error: rollbackRecoveryPoisonedError };
     }
-    const mapKey = hotKey(accountId, key);
+    const mapKey = hotKey(namespace, key);
     const recovery = rollbackRecovery.get(mapKey);
     if (!recovery) return { status: "ok" };
-    const erased = await eraseMarkerUnlocked(accountId, key, recovery.outcome);
+    const erased = await eraseMarkerUnlocked(namespace, key, recovery.outcome);
     if (erased.status === "unknown") {
-      options.warnFailure?.(accountId, `rollback-recovery-${recovery.outcome}`);
+      options.warnFailure?.(namespace, `rollback-recovery-${recovery.outcome}`);
       return erased;
     }
     // `false` is also a successful cleanup: it means the exact marker is already
@@ -453,24 +487,27 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
     // between this delete and releasing the quarantine.
     rollbackRecovery.delete(mapKey);
     totalRollbackRecoveryBytes -= recovery.bytes;
-    deleteHot(accountId, key, recovery.outcome);
+    deleteHot(namespace, key, recovery.outcome);
     return { status: "ok" };
   };
 
   return {
-    peek(accountId, key) {
-      if (rollbackRecoveryPoisoned || rollbackRecovery.has(hotKey(accountId, key))) {
+    peek(scope, key) {
+      const namespace = ingressScopeNamespace(scope);
+      if (rollbackRecoveryPoisoned || rollbackRecovery.has(hotKey(namespace, key))) {
         return undefined;
       }
-      return hot.get(hotKey(accountId, key))?.outcome;
+      return hot.get(hotKey(namespace, key))?.outcome;
     },
 
-    async lookup(accountId, key) {
-      const releaseOperation = await acquireOperation(accountId, key);
+    async lookup(scope, key) {
+      const namespace = ingressScopeNamespace(scope);
+      const releaseOperation = await acquireOperation(namespace, key);
       try {
-        const recovery = await recoverFailedRollbackUnlocked(accountId, key);
+        const recovery = await recoverFailedRollbackUnlocked(namespace, key);
         if (recovery.status === "unknown") return recovery;
-        return await lookupUnlocked(accountId, key);
+        const scoped = await lookupUnlocked(namespace, key);
+        return scoped.status === "not-found" ? await lookupLegacy(scope, key) : scoped;
       } catch (error) {
         return { status: "unknown", error };
       } finally {
@@ -478,28 +515,40 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
       }
     },
 
-    async record(accountId, key, outcome, recordOptions) {
-      const releaseOperation = await acquireOperation(accountId, key);
+    async record(scope, key, outcome, recordOptions) {
+      const namespace = ingressScopeNamespace(scope);
+      const releaseOperation = await acquireOperation(namespace, key);
       const store = storeFor(outcome);
       let diskError: unknown;
       let fresh: boolean;
       let alreadyCancelled = false;
       try {
-        const recovery = await recoverFailedRollbackUnlocked(accountId, key);
+        const recovery = await recoverFailedRollbackUnlocked(namespace, key);
         if (recovery.status === "unknown") {
           releaseOperation();
           return recovery;
+        }
+        if (typeof scope !== "string" && outcome !== "cancelled") {
+          // An explicit cancellation has its own authority. Admission/rejection
+          // must not overwrite an unresolved historical identity, even if a
+          // caller attempts a write without first performing a lookup.
+          const scoped = await lookupUnlocked(namespace, key);
+          const guard = scoped.status === "not-found" ? await lookupLegacy(scope, key) : scoped;
+          if (guard.status === "unknown") {
+            releaseOperation();
+            return guard;
+          }
         }
         if (outcome === "cancelled") {
           // A cold SDK checkAndRecord can report fresh+diskError even when the
           // durable marker already exists. Establish ownership before writing,
           // or cleanup of that failed attempt could erase an older suppression.
           try {
-            const existing = await hasRecent(store, accountId, key);
+            const existing = await hasRecent(store, namespace, key);
             if (existing.diskError !== undefined) throw existing.diskError;
             alreadyCancelled = existing.found;
           } catch (error) {
-            options.warnFailure?.(accountId, "lookup-cancelled");
+            options.warnFailure?.(namespace, "lookup-cancelled");
             releaseOperation();
             return { status: "unknown", error };
           }
@@ -509,13 +558,13 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
           // this same gate so the new admission owns its rollback, including
           // when a sibling append fails after this item's row was inserted.
           // A failed erase must not turn the next write into a follower.
-          const reclaimed = await eraseMarkerUnlocked(accountId, key, outcome);
+          const reclaimed = await eraseMarkerUnlocked(namespace, key, outcome);
           if (reclaimed.status === "unknown") {
-            rememberFailedRollback(accountId, key, outcome, "durable");
+            rememberFailedRollback(namespace, key, outcome, "durable");
             releaseOperation();
             return reclaimed;
           }
-          deleteHot(accountId, key, outcome);
+          deleteHot(namespace, key, outcome);
         }
         if (recordOptions?.replaceOthers && outcome !== "cancelled") {
           // EVERY other outcome, not "the opposite" — #344 made the set three, and
@@ -527,11 +576,11 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
             let forgetDiskError: unknown;
             try {
               await storeFor(other).forget(key, {
-                namespace: accountId,
+                namespace,
                 onDiskError: (error) => { forgetDiskError = error; },
               });
             } catch (error) {
-              options.warnFailure?.(accountId, `replace-with-${outcome}`);
+              options.warnFailure?.(namespace, `replace-with-${outcome}`);
               releaseOperation();
               return { status: "unknown", error };
             }
@@ -539,27 +588,27 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
             // Fail closed: recording/ACKing the replacement while a durable
             // conflicting marker may remain would create a dual terminal outcome.
             if (forgetDiskError !== undefined) {
-              options.warnFailure?.(accountId, `replace-with-${outcome}`);
+              options.warnFailure?.(namespace, `replace-with-${outcome}`);
               releaseOperation();
               return { status: "unknown", error: forgetDiskError };
             }
           }
-          deleteHot(accountId, key);
+          deleteHot(namespace, key);
         }
         // A cancelled replacement is written BEFORE weaker markers are erased.
         // Keep them until a later lookup: rollback of this receipt can then
         // remove only the new cancellation without losing the previous verdict.
         fresh = alreadyCancelled ? false : await store.checkAndRecord(key, {
-          namespace: accountId,
+          namespace,
           onDiskError: (error) => { diskError = error; },
         });
       } catch (error) {
-        options.warnFailure?.(accountId, `record-${outcome}`);
+        options.warnFailure?.(namespace, `record-${outcome}`);
         releaseOperation();
         return { status: "unknown", error };
       }
       if (diskError !== undefined) {
-        options.warnFailure?.(accountId, `record-${outcome}`);
+        options.warnFailure?.(namespace, `record-${outcome}`);
         // ⚠️ BOTH REFUSALS FAIL CLOSED; ONLY `accepted` MAY GO MEMORY-ONLY.
         // #344 round 3 extended this from `overloaded` alone. The SDK has already
         // inserted a memory marker, and a memory-only marker dies with the
@@ -581,16 +630,16 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
           // The SDK inserts memory before reporting its disk fault. Quarantine
           // failed cleanup so a later lookup cannot mistake that marker for a
           // durable cancellation and erase the previous accepted suppression.
-          const erased = await eraseMarkerUnlocked(accountId, key, outcome);
+          const erased = await eraseMarkerUnlocked(namespace, key, outcome);
           if (erased.status === "unknown") {
-            rememberFailedRollback(accountId, key, outcome, "memory-only");
+            rememberFailedRollback(namespace, key, outcome, "memory-only");
           }
-          deleteHot(accountId, key, outcome);
+          deleteHot(namespace, key, outcome);
           releaseOperation();
           return { status: "unknown", error: diskError };
         }
       }
-      const prior = hot.get(hotKey(accountId, key));
+      const prior = hot.get(hotKey(namespace, key));
       const durability: "durable" | "memory-only" = diskError !== undefined
         ? "memory-only"
         : !fresh && prior?.outcome === outcome
@@ -604,7 +653,7 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
         commit() {
           if (settled) return;
           settled = true;
-          putHot(accountId, key, outcome, durability);
+          putHot(namespace, key, outcome, durability);
           releaseOperation();
         },
         async rollback() {
@@ -618,22 +667,22 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
               let forgetDiskError: unknown;
               try {
                 removed = await store.forget(key, {
-                  namespace: accountId,
+                  namespace,
                   onDiskError: (error) => { forgetDiskError = error; },
                 });
               } catch {
-                rememberFailedRollback(accountId, key, outcome, durability);
+                rememberFailedRollback(namespace, key, outcome, durability);
                 return false;
               }
               if (forgetDiskError !== undefined) {
-                rememberFailedRollback(accountId, key, outcome, durability);
+                rememberFailedRollback(namespace, key, outcome, durability);
                 return false;
               }
             }
             return removed;
           } finally {
-            if (fresh && !rollbackRecovery.has(hotKey(accountId, key))) {
-              deleteHot(accountId, key, outcome);
+            if (fresh && !rollbackRecovery.has(hotKey(namespace, key))) {
+              deleteHot(namespace, key, outcome);
             }
             releaseOperation();
           }
@@ -642,16 +691,17 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
       return { status: "recorded", durability, write };
     },
 
-    async forget(accountId, key, outcome) {
-      const releaseOperation = await acquireOperation(accountId, key);
+    async forget(scope, key, outcome) {
+      const namespace = ingressScopeNamespace(scope);
+      const releaseOperation = await acquireOperation(namespace, key);
       const store = storeFor(outcome);
       try {
-        const recovery = await recoverFailedRollbackUnlocked(accountId, key);
+        const recovery = await recoverFailedRollbackUnlocked(namespace, key);
         if (recovery.status === "unknown") return false;
-        deleteHot(accountId, key, outcome);
+        deleteHot(namespace, key, outcome);
         let diskError: unknown;
         const removed = await store.forget(key, {
-          namespace: accountId,
+          namespace,
           onDiskError: (error) => { diskError = error; },
         });
         return diskError === undefined && removed;
@@ -718,6 +768,8 @@ export function createRateLimitedOutcomeInvariantWarning(
 }
 
 const OUTCOME_FAILURE_CATEGORIES: readonly IngressOutcomeFailureCategory[] = [
+  "legacy-ambiguous",
+  "lookup-legacy",
   "lookup-overloaded",
   "lookup-accepted",
   "lookup-cancelled",
@@ -751,7 +803,7 @@ export function createRateLimitedOutcomeFailureWarning(
       { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
     ]),
   );
-  return (accountId, category) => {
+  return (identity, category) => {
     const entry = state.get(category);
     if (!entry) return;
     const at = now();
@@ -759,29 +811,21 @@ export function createRateLimitedOutcomeFailureWarning(
       entry.suppressed = Math.min(entry.suppressed + 1, Number.MAX_SAFE_INTEGER);
       return;
     }
-    const safeAccount = /^[A-Za-z0-9._-]{1,64}$/.test(accountId) ? accountId : "<redacted>";
+    const safeAccount = /^[A-Za-z0-9._-]{1,64}$/.test(identity) ? identity : "<redacted>";
     const suppressed = entry.suppressed;
     entry.lastAt = at;
     entry.suppressed = 0;
     warn(
-      `webchannel: ingress outcome storage unavailable account=${safeAccount} ` +
+      `webchannel: ingress outcome ${category === "legacy-ambiguous" ? "legacy tenant ownership ambiguous" : "storage unavailable"} account=${safeAccount} ` +
         `category=${category} action=retry-fail-closed suppressed=${suppressed}`,
     );
   };
 }
 
 /**
- * PER-STORE, AND THERE ARE NOW THREE OF THEM (#344).
- *
- * These are each `createPersistentDedupe`'s own caps, so the process ceiling is
- * 3 × (2 048 memory entries + 5 000 SQLite rows), not the numbers written here —
- * up from 2 × when `cancelled` shared the `accepted` namespace. The growth is
- * bounded and small (one short key per entry, a few hundred KiB of memory at the
- * cap) and it is the honest shape of the data: three disjoint verdicts, and a
- * key can hold only one of them, so the SUM across the three namespaces is still
- * one entry per deduped message. What actually grew is the worst case where all
- * three namespaces are simultaneously at their independent caps — a state no
- * single traffic pattern produces, since each message contributes to exactly one.
+ * Existing SDK limits: memory is bounded per outcome instance; durable rows are
+ * bounded per SDK namespace (now tenant/account, historically account only).
+ * The legacy read guard retains the same TTL and never refreshes an old marker.
  */
 const DEDUPE_OPTIONS = {
   ttlMs: 7 * 24 * 60 * 60 * 1_000,
@@ -804,9 +848,8 @@ export function getProcessIngressOutcomeStore(): IngressOutcomeStore {
     processStore = createIngressOutcomeStore({
       accepted: createPersistentDedupe({ ...DEDUPE_OPTIONS, namespacePrefix: "persistent-dedupe" }),
       overloaded: createPersistentDedupe({ ...DEDUPE_OPTIONS, namespacePrefix: "webchannel-inbound-overloaded" }),
-      // #344. A NEW namespace, so it starts empty: a `/stop` suppression written
-      // by an older build lives in the `accepted` namespace and STAYS there. See
-      // the migration note in `ingress-dedupe.ts`'s header.
+      // Retain the existing role prefixes so legacy membership can be probed
+      // read-only; ingressScopeNamespace separates all new tuple-scoped writes.
       cancelled: createPersistentDedupe({ ...DEDUPE_OPTIONS, namespacePrefix: "webchannel-inbound-cancelled" }),
       warnInvariant: processInvariantWarning,
       warnFailure: processFailureWarning,

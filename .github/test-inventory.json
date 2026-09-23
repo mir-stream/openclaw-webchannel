@@ -113,6 +113,7 @@
     "packages/plugin/src/ingress-identity-integration.test.ts": 32,
     "packages/plugin/src/ingress-outcome.test.ts": 26,
     "packages/plugin/src/ingress-result-chunks.test.ts": 2,
+    "packages/plugin/src/ingress-tenant-outcomes.test.ts": 21,
     "packages/plugin/src/journal-history.test.ts": 67,
     "packages/plugin/src/jwks.test.ts": 24,
     "packages/plugin/src/jwt-cnf.test.ts": 9,

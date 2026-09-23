@@ -411,6 +411,9 @@ describe("index-nats.ts wiring contract — ingress dedupe onFlush (P0-7a)", () 
     // passed directly to the bounded debouncer.
     expect(RUNTIME_SOURCE).toMatch(/const onIngressFlush = createIngressOnFlush</);
     expect(RUNTIME_SOURCE).toMatch(/onFlush:\s*onIngressFlush/);
+    expect(RUNTIME_SOURCE).toContain("const storageScope = Object.freeze({ tenant, accountId })");
+    expect(RUNTIME_SOURCE).toMatch(/createIngressOnFlush<[^>]+>\(\{\s*accountId,\s*storageScope,/);
+    expect(RUNTIME_SOURCE).toMatch(/createIngressDebounceCallbacks<[^>]+>\(\{\s*accountId,\s*storageScope,/);
   });
 
   it("uses one module-scope process budget/outcome store and the bounded debouncer", () => {

@@ -1,3 +1,5 @@
+import { ingressScopeNamespace, type IngressScope } from "./ingress-scope.js";
+import type { StorageScopeIdentity } from "./storage-identity.js";
 import type { DispatchRecovery } from "./dispatch-recovery.js";
 /**
  * P0-7a — browser→agent ingress idempotency (first half).
@@ -30,12 +32,11 @@ import type { DispatchRecovery } from "./dispatch-recovery.js";
  * killed cannot be confused with an orphan. It is ACKed without re-admission;
  * journal-aware readers include the existing committed echo when available.
  *
- * ⚠️ MIGRATION, NARROW BUT REAL. A cancellation recorded by a build BEFORE this
- * change sits in the `accepted` namespace and stays ambiguous for that marker's
- * 7-day TTL: if that same message's ack was ALSO lost, its next replay finds
- * `accepted` with no row and re-runs the turn once. It needs a pre-upgrade
- * cancellation AND a lost ack AND a replay inside the TTL. This implementation
- * cannot identify which producer wrote an old marker.
+ * Production uses tenant/account storage identity for every outcome. Historical
+ * account-only markers (including accepted markers that may be old cancellations)
+ * remain ambiguous: without tuple journal proof they hold replay for retry,
+ * never authorize a result or a turn. They are neither adopted nor refreshed.
+ * New scoped accepted markers without a row still take the orphan-repair path.
  *
  * This repair also does not cover:
  *  1. THE ID-LESS ADMIT PATH. No usable wire id ⇒ no dedupe key ⇒ neither a
@@ -100,7 +101,7 @@ export const MAX_CANCELLED_INBOUND_FALLBACK_TOMBSTONES = 256;
 export const MAX_CANCELLED_INBOUND_FALLBACK_BYTES = 256 * 1024;
 
 /**
- * The per-account dedupe key for an inbound item (persistent AND fallback).
+ * The peer/logical key within an ingress storage scope (persistent AND fallback).
  *
  * #243 half 1: the dedupe key SOURCE moved from the wire `id` to the client
  * idempotency `random_id`. #243 half 2a then moved the DURABLE id off the wire
@@ -135,7 +136,7 @@ export function usableId(value: unknown): value is string {
 export type IngressIdentity = {
   /** Wire correlation only; never substitute the logical key in result frames. */
   wireId: string;
-  /** Per-account outcome/claim/fallback key, including the authenticated peer. */
+  /** Outcome/claim/fallback key within a storage scope, including the authenticated peer. */
   key: string;
   /** The journal's idempotency_key, with the same fallback as the outcome key. */
   idempotencyKey: string;
@@ -155,7 +156,7 @@ export function ingressDedupeKey(item: IngressDedupeItem): string | undefined {
   return ingressIdentity(item)?.key;
 }
 
-/** Per-account, insertion-ordered safety net for cancelled-item record failures. */
+/** Scoped, insertion-ordered safety net for cancelled-item record failures. */
 export class CancelledInboundFallbackTombstones {
   private readonly keys = new Map<string, number>();
   private bytes = 0;
@@ -168,15 +169,18 @@ export class CancelledInboundFallbackTombstones {
 
   get size(): number { return this.keys.size; }
   get byteSize(): number { return this.bytes; }
-  private scoped(key: string, accountId = "global"): string { return `${accountId.length}:${accountId}${key}`; }
-  has(key: string, accountId?: string): boolean {
-    return this.keys.has(this.scoped(key, accountId))
-      || (accountId !== undefined && this.keys.has(this.scoped(key)));
+  private scoped(key: string, scope: IngressScope = "global"): string {
+    const namespace = ingressScopeNamespace(scope);
+    return `${namespace.length}:${namespace}${key}`;
   }
-  delete(key: string, accountId?: string): boolean {
-    const scoped = this.scoped(key, accountId);
+  has(key: string, scope?: IngressScope): boolean {
+    return this.keys.has(this.scoped(key, scope))
+      || (typeof scope === "string" && this.keys.has(this.scoped(key)));
+  }
+  delete(key: string, scope?: IngressScope): boolean {
+    const scoped = this.scoped(key, scope);
     let bytes = this.keys.get(scoped);
-    if (bytes === undefined && accountId !== undefined) {
+    if (bytes === undefined && typeof scope === "string") {
       return this.delete(key);
     }
     if (bytes === undefined) return false;
@@ -185,8 +189,8 @@ export class CancelledInboundFallbackTombstones {
     return true;
   }
 
-  add(key: string, accountId?: string): void {
-    const scoped = this.scoped(key, accountId);
+  add(key: string, scope?: IngressScope): void {
+    const scoped = this.scoped(key, scope);
     if (this.keys.has(scoped)) return;
     const bytes = Buffer.byteLength(scoped, "utf8") + 48;
     if (bytes > this.byteCap) return;
@@ -260,14 +264,14 @@ export type IngressDedupeLogSinks = {
  *    sustained fault degrades to memory-only dedupe with the instance's own
  *    warn-per-fault; this catch is a safety net for anything beyond that.
  *
- * `namespace` is the account id, so ids are isolated per account and one peer
- * cannot dedupe against (poison) another peer's ids. The key is `${peerId}:<key>`,
+ * `namespace` is supplied by the caller (the legacy account ID or the scoped
+ * storage namespace). The key is `${peerId}:<key>`,
  * where `<key>` is the client `random_id` when present and the wire `id`
  * otherwise (#243 half 1; see `ingressDedupeKey`).
  */
 export async function filterFreshInboundItems<T extends IngressDedupeItem>(
   items: readonly T[],
-  accountId: string,
+  namespace: string,
   checkAndRecord: IngressDedupeCheck,
   sinks?: IngressDedupeLogSinks,
   isActive: () => boolean = () => true,
@@ -291,7 +295,7 @@ export async function filterFreshInboundItems<T extends IngressDedupeItem>(
     const id = item.message.id as string;
     let fresh: boolean;
     try {
-      fresh = await checkAndRecord(key, { namespace: accountId });
+      fresh = await checkAndRecord(key, { namespace });
       if (!isActive()) return [];
     } catch (err) {
       if (!isActive()) return [];
@@ -315,8 +319,10 @@ export async function filterFreshInboundItems<T extends IngressDedupeItem>(
 
 /** Dependencies for `createIngressOnFlush`, generic over the debouncer item `T`. */
 export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
-  /** Dedupe namespace — the serving account id (isolates ids per account). */
+  /** Serving wire account identity, used for routing and diagnostics. */
   accountId: string;
+  /** Required by production composition; omitted only by pre-tenant callers. */
+  storageScope?: StorageScopeIdentity;
   /** The per-account `PersistentDedupe.checkAndRecord` (record-at-ingress). */
   checkAndRecord?: IngressDedupeCheck;
   /** Route the surviving, coalesced message onto the per-session FIFO. */
@@ -398,6 +404,7 @@ type JournalWarning =
    */
   | "append-failed"
   | "stop-lookup-failed"
+  | "accept-lookup-failed"
   /**
    * An item was ADMITTED (it runs a turn and the client shows its bubble) but
    * could not be journaled, so history will not have it. A live≠history gap we
@@ -418,14 +425,10 @@ type JournalWarning =
    * duplicate. Its own member because sharing a window with the
    * `unjournalable-*` lines would let either hide the other.
    *
-   * ⚠️ READ IT AS "A TURN IS RE-RUNNING", NOT "ALL IS WELL". In the normal case
-   * it is a pure recovery — a message that would have been dropped now runs. But
-   * a marker left by a build from BEFORE `cancelled` became its own outcome may
-   * be a `/stop` suppression wearing the `accepted` namespace, and this line is
-   * then the sound of an aborted turn being re-run once (the migration note in
-   * the file header bounds it: pre-upgrade cancellation × lost ack × 7-day TTL).
-   * A burst right after an upgrade is that; a steady trickle is the crash window
-   * doing its job.
+   * Production reaches this only for a tenant-scoped marker. Account-only
+   * historical markers with no tuple row remain unknown at the migration guard,
+   * since they may represent an older cancellation. Explicit legacy callers
+   * retain their old behavior.
    */
   | "orphaned-accept-marker";
 
@@ -461,6 +464,7 @@ function createRateLimitedJournalWarning(
   const state: Record<JournalWarning, { lastAt: number; suppressed: number }> = {
     "append-failed": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
     "stop-lookup-failed": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
+    "accept-lookup-failed": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
     "unjournalable-user-id": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
     "unjournalable-user-text": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
     "orphaned-accept-marker": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
@@ -542,6 +546,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
   deps: IngressOnFlushDeps<T>,
 ): (items: readonly (T | RetainedDebounceEntry<T>)[]) => Promise<void> {
   const { accountId, checkAndRecord, dispatch, coalesce, sendAck, cancelledFallback, logInfo, logWarn } = deps;
+  const outcomeScope = deps.storageScope ?? accountId;
   const isActive = deps.isActive ?? (() => true);
   const sinks: IngressDedupeLogSinks = { info: logInfo, warn: logWarn };
   const warnOutcomeFailure = createRateLimitedOutcomeFailureWarning((message) => logWarn?.(message));
@@ -812,11 +817,11 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           // persistence first and ACK only after it succeeds; retain the
           // tombstone until both halves succeed. The replay reservation is
           // released exactly once.
-          if (cancelledFallback?.has(key, accountId)) {
+          if (cancelledFallback?.has(key, outcomeScope)) {
             let result: OutcomeRecordResult | undefined;
             try {
               result = await deps.outcomeStore.record(
-                accountId,
+                outcomeScope,
                 key,
                 // ⭐ #344 — `cancelled`, NOT `accepted`. This is the second of the
                 // three suppression writers (with `nats-account-runtime.ts`'s
@@ -858,14 +863,32 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               ? deps.sendAck?.(item.peerId, [id], [{ random_id: randomId, ...row }])
               : deps.sendAck?.(item.peerId, [id])) ?? false;
             if (!acked) logWarn?.("webchannel: cancelled-inbound fallback result delivery failed");
-            if (acked) cancelledFallback.delete(key, accountId);
+            if (acked) cancelledFallback.delete(key, outcomeScope);
             release();
             continue;
           }
 
+          if (deps.storageScope && deps.deliveryJournal) {
+            let row;
+            try {
+              row = deps.deliveryJournal.lookupUserMessageIdByRandomId(peerId, idempotencyKey);
+            } catch {
+              warnJournal("accept-lookup-failed", "webchannel: ingress journal lookup failed; withholding receipt");
+              release();
+              fifoBlocked = true;
+              continue;
+            }
+            if (row) {
+              release();
+              ackIds.push(id);
+              if (randomId !== undefined) committedBatch.push({ random_id: randomId, ...row });
+              continue;
+            }
+          }
+
           let existing: OutcomeLookup;
           try {
-            existing = await deps.outcomeStore.lookup(accountId, key);
+            existing = await deps.outcomeStore.lookup(outcomeScope, key);
           } catch (error) {
             warnOutcomeFailure(accountId, "adapter-lookup");
             existing = { status: "unknown", error };
@@ -1033,7 +1056,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               // direction. `replaceOthers` fails CLOSED (`status: "unknown"`),
               // which lands on the same FIFO barrier below.
               result = await deps.outcomeStore.record(
-                accountId,
+                outcomeScope,
                 key,
                 "overloaded",
                 readmitted ? { replaceOthers: true } : undefined,
@@ -1072,8 +1095,8 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           let recorded: OutcomeRecordResult | undefined;
           try {
             recorded = readmitted
-              ? await deps.outcomeStore.record(accountId, key, "accepted", { reclaimAccepted: true })
-              : await deps.outcomeStore.record(accountId, key, "accepted");
+              ? await deps.outcomeStore.record(outcomeScope, key, "accepted", { reclaimAccepted: true })
+              : await deps.outcomeStore.record(outcomeScope, key, "accepted");
           } catch {
             warnOutcomeFailure(accountId, "adapter-record-accepted");
             // A thrown storage adapter is the same unresolved classification as
@@ -1568,13 +1591,13 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
     for (const item of rawItems) {
       if (!isActive()) return;
       const key = ingressDedupeKey(item);
-      if (!key || !cancelledFallback?.has(key, accountId)) {
+      if (!key || !cancelledFallback?.has(key, outcomeScope)) {
         ordinary.push(item);
         continue;
       }
       let recorded = false;
       try {
-        await checkAndRecord(key, { namespace: accountId });
+        await checkAndRecord(key, { namespace: ingressScopeNamespace(outcomeScope) });
         if (!isActive()) return;
         recorded = true;
       } catch {
@@ -1585,7 +1608,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
       if (!isActive()) return;
       const acked = sendAck?.(item.peerId, [id]) ?? false;
       if (!acked) logWarn?.("webchannel: cancelled-inbound fallback result delivery failed");
-      if (recorded && acked) cancelledFallback.delete(key, accountId);
+      if (recorded && acked) cancelledFallback.delete(key, outcomeScope);
     }
 
     const anchor = ordinary[0];
@@ -1612,7 +1635,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
     }
     const fresh = await filterFreshInboundItems(
       ordinary,
-      accountId,
+      ingressScopeNamespace(outcomeScope),
       checkAndRecord,
       sinks,
       isActive,
@@ -1653,7 +1676,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
  */
 export async function recordCancelledInboundItems<T extends IngressDedupeItem>(
   items: readonly T[],
-  accountId: string,
+  scope: IngressScope,
   checkAndRecord: IngressDedupeCheck,
   sendAck: (peerId: string, ids: string[]) => boolean,
   logWarn?: (message: string) => void,
@@ -1668,15 +1691,15 @@ export async function recordCancelledInboundItems<T extends IngressDedupeItem>(
     const id = item.message.id as string;
     let suppressionReady = false;
     try {
-      await checkAndRecord(key, { namespace: accountId });
+      await checkAndRecord(key, { namespace: ingressScopeNamespace(scope) });
       if (!canPublish()) return;
       suppressionReady = true;
     } catch {
       if (!canPublish()) return;
       logWarn?.("webchannel: cancelled-inbound suppression record failed; withholding receipt");
-      cancelledFallback?.add(key, accountId);
+      cancelledFallback?.add(key, scope);
     }
-    if (!suppressionReady) cancelledFallback?.add(key, accountId);
+    if (!suppressionReady) cancelledFallback?.add(key, scope);
     // A memory fallback prevents a live replay but is not durable acceptance.
     if (!suppressionReady) continue;
     const ids = idsByPeer.get(item.peerId) ?? [];
