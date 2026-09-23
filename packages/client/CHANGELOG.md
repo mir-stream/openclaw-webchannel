@@ -17,6 +17,9 @@
 - Preserve another device's queued/started typing and held follow-ups when a
   delayed first cancellation ACK arrives for an unrelated local input. Cleanup
   consults reconciled request state, including history and callback updates.
+- Defer cancellation typing cleanup while gap/history evidence is buffered, then
+  check it after the ordered recovery drain. Empty or terminal recovery completes
+  cleanup; newer typing and connection teardown retire the pending decision.
 
 ### Breaking (wire protocol v6)
 

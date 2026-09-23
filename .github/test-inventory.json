@@ -39,7 +39,7 @@
     "packages/client/src/nats-client-sendstate.test.ts": 38,
     "packages/client/src/nats-client-wrapped-key.test.ts": 22,
     "packages/client/src/nats-client-wrapped-settle-until.test.ts": 4,
-    "packages/client/src/nats-client-wrapper-active-recovery.test.ts": 58,
+    "packages/client/src/nats-client-wrapper-active-recovery.test.ts": 72,
     "packages/client/src/nats-client-wrapper-agent-liveness.test.ts": 19,
     "packages/client/src/nats-client-wrapper-gap-sync.test.ts": 85,
     "packages/client/src/nats-client-wrapper-history-convergence.test.ts": 25,

@@ -134,6 +134,10 @@ Cancellation cleanup preserves typing and held follow-ups when another request
 is known to be queued or started, including work sent by another device. A late
 first cancellation ACK cannot claim that request's unscoped typing merely because
 the cancelled input was still a local send candidate.
+While a gap or pending history is being reconciled, typing cleanup waits for the
+existing ordered recovery drain. It then checks the reconciled work once; newer
+typing or a connection lifecycle change discards the old cleanup decision.
+Cancellation receipt acceptance and exact activity-watch retirement stay immediate.
 
 A legitimately silent accepted turn can cause another reconnect each interval;
 a held-only episode still requests at most one. Raise the timeout or set it to `0`
