@@ -9,13 +9,15 @@ import { createDispatchRecovery } from "./dispatch-recovery.js";
 import { createIngressDebounceCallbacks } from "./ingress-debounce-callbacks.js";
 import { CancelledInboundFallbackTombstones, createIngressOnFlush } from "./ingress-dedupe.js";
 import { createIngressOutcomeStore, createRateLimitedOutcomeFailureWarning, LegacyIngressOutcomeAmbiguity, type IngressOutcome } from "./ingress-outcome.js";
-import { ingressScopeNamespace, type IngressScope } from "./ingress-scope.js";
+import { createIngressScopeDedupe, ingressScopeNamespace, type IngressScope } from "./ingress-scope.js";
 import { BoundedOverflowResolver, type OverflowResolutionRequest } from "./inbound-overflow-resolver.js";
 import { DEFAULT_BUSY_TURN_LIMITS, estimateRetainedMessageBytes, InboundRetentionBudget } from "./inbound-retention.js";
 import type { UserMessageLike } from "./inbound-queue.js";
 import { tupleStoragePaths } from "./storage-paths.js";
 import type { StorageScopeIdentity } from "./storage-identity.js";
 import { createStopControl } from "./stop-control.js";
+import { isValidSubjectToken } from "./subject-token.js";
+import { isValidAccountId } from "./account-id.js";
 
 const A = { tenant: "tenant-A", accountId: "ExactAccount" };
 const B = { tenant: "tenant-B", accountId: "ExactAccount" };
@@ -36,8 +38,8 @@ function root() {
   cleanups.push(() => rmSync(path, { force: true, recursive: true }));
   return path;
 }
-function persistence(path: string) {
-  const raw = Object.fromEntries(Object.entries(prefixes).map(([outcome, namespacePrefix]) => [outcome, createPersistentDedupe({
+function persistence(path: string, createDedupe = createIngressScopeDedupe) {
+  const raw = Object.fromEntries(Object.entries(prefixes).map(([outcome, namespacePrefix]) => [outcome, createDedupe({
     pluginId: "webchannel", namespacePrefix, ttlMs: TTL, memoryMaxSize: 32, stateMaxEntries: 100,
     env: { ...process.env, OPENCLAW_STATE_DIR: join(path, "sdk") },
   })])) as Record<IngressOutcome, ReturnType<typeof createPersistentDedupe>>;
@@ -177,6 +179,49 @@ it("keeps account and authenticated peer separation inside each tenant", async (
   expect(await p.store.lookup({ ...A, accountId: "other" }, KEY)).toEqual({ status: "not-found" });
   expect(await p.store.lookup(A, "other-peer:logical")).toEqual({ status: "not-found" });
   expect(ingressScopeNamespace(A)).not.toBe(ingressScopeNamespace({ ...A, accountId: "exactaccount" }));
+});
+
+it.each(["cancelled", "overloaded"] as const)("does not apply a legacy %s marker through an SDK cache-key collision", async outcome => {
+  const path = root();
+  const legacyScope = { tenant: "legacy-tenant", accountId: "tenant" };
+  const legacyPeer = ingressScopeNamespace(A).slice("tenant:".length);
+  const legacyKey = `${legacyPeer}:${KEY}`;
+  expect(isValidAccountId(legacyScope.accountId)).toBe(true);
+  expect(isValidSubjectToken(legacyPeer)).toBe(true);
+  // The public SDK joins namespace and key with ':', so these valid inputs
+  // collide in memory even though they address different durable namespaces.
+  expect(`${legacyScope.accountId}:${legacyKey}`).toBe(`${ingressScopeNamespace(A)}:${KEY}`);
+  await persistence(path, createPersistentDedupe).raw[outcome].checkAndRecord(legacyKey, { namespace: legacyScope.accountId });
+
+  const p = persistence(path);
+  expect(await p.store.lookup(A, KEY)).toEqual({ status: "not-found" });
+  expect(await p.store.lookup(legacyScope, legacyKey)).toMatchObject({
+    status: "unknown", error: expect.any(LegacyIngressOutcomeAmbiguity),
+  });
+  const target = runtime(path, A, p);
+  await target.flush([item()]); await target.idle();
+  expect(target.runs).toHaveLength(1);
+  expect(target.rejected).toEqual([]);
+  expect(target.acks).toHaveLength(1);
+  expect(target.acks[0].cancelled).toBeUndefined();
+  expect(target.journal.read("peer").filter(row => row.event.kind === "user")).toHaveLength(1);
+
+  await target.close();
+  const cold = runtime(path, A);
+  await cold.flush([item("replay")]); cold.overflow(); await cold.idle();
+  expect(cold.runs).toEqual([]); expect(cold.rejected).toEqual([]);
+  expect(cold.acks.map(ack => ack.committed)).toEqual([target.acks[0].committed, target.acks[0].committed]);
+  expect(cold.acks.every(ack => ack.cancelled === undefined)).toBe(true);
+  expect(await cold.store.lookup(legacyScope, legacyKey)).toMatchObject({ status: "unknown" });
+});
+
+it.each(["cancelled", "overloaded"] as const)("does not treat a scoped %s cache entry as a legacy marker", async outcome => {
+  const p = persistence(root());
+  const legacyScope = { tenant: "legacy-tenant", accountId: "tenant" };
+  const legacyKey = `${ingressScopeNamespace(A).slice("tenant:".length)}:${KEY}`;
+  await record(p.store, A, outcome);
+  expect(await p.store.lookup(legacyScope, legacyKey)).toEqual({ status: "not-found" });
+  expect(await p.store.lookup(A, KEY)).toEqual({ status: "found", outcome });
 });
 
 it("isolates an unsettled write gate and rollback from another tenant's same logical key", async () => {

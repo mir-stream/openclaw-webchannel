@@ -1,9 +1,6 @@
 import { Buffer } from "node:buffer";
-import { ingressScopeNamespace, type IngressScope } from "./ingress-scope.js";
-import {
-  createPersistentDedupe,
-  type PersistentDedupe,
-} from "openclaw/plugin-sdk/persistent-dedupe";
+import { createIngressScopeDedupe, ingressScopeNamespace, type IngressScope } from "./ingress-scope.js";
+import type { PersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
 
 /**
  * The terminal verdicts an inbound id can carry. Each has its OWN durable
@@ -853,11 +850,11 @@ const processFailureWarning = createRateLimitedOutcomeFailureWarning((message) =
 export function getProcessIngressOutcomeStore(): IngressOutcomeStore {
   if (!processStore) {
     processStore = createIngressOutcomeStore({
-      accepted: createPersistentDedupe({ ...DEDUPE_OPTIONS, namespacePrefix: "persistent-dedupe" }),
-      overloaded: createPersistentDedupe({ ...DEDUPE_OPTIONS, namespacePrefix: "webchannel-inbound-overloaded" }),
+      accepted: createIngressScopeDedupe({ ...DEDUPE_OPTIONS, namespacePrefix: "persistent-dedupe" }),
+      overloaded: createIngressScopeDedupe({ ...DEDUPE_OPTIONS, namespacePrefix: "webchannel-inbound-overloaded" }),
       // Retain the existing role prefixes so legacy membership can be probed
       // read-only; ingressScopeNamespace separates all new tuple-scoped writes.
-      cancelled: createPersistentDedupe({ ...DEDUPE_OPTIONS, namespacePrefix: "webchannel-inbound-cancelled" }),
+      cancelled: createIngressScopeDedupe({ ...DEDUPE_OPTIONS, namespacePrefix: "webchannel-inbound-cancelled" }),
       warnInvariant: processInvariantWarning,
       warnFailure: processFailureWarning,
     });
