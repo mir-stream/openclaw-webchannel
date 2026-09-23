@@ -397,6 +397,7 @@ type JournalWarning =
    * emits this names both.)
    */
   | "append-failed"
+  | "stop-lookup-failed"
   /**
    * An item was ADMITTED (it runs a turn and the client shows its bubble) but
    * could not be journaled, so history will not have it. A live≠history gap we
@@ -459,6 +460,7 @@ function createRateLimitedJournalWarning(
 ): (category: JournalWarning, body: string) => void {
   const state: Record<JournalWarning, { lastAt: number; suppressed: number }> = {
     "append-failed": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
+    "stop-lookup-failed": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
     "unjournalable-user-id": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
     "unjournalable-user-text": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
     "orphaned-accept-marker": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
@@ -772,11 +774,18 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           const { key, wireId: id, randomId, idempotencyKey } = identity;
           // The tuple-scoped SQLite stop ledger is authoritative even with cold
           // or conflicting SDK outcomes, and needs no repair write to ACK replay.
-          if (deps.deliveryJournal?.dispatch?.isCancelled(peerId, idempotencyKey)) {
-            const row = deps.deliveryJournal.lookupUserMessageIdByRandomId(peerId, idempotencyKey);
-            ackIds.push(id);
-            if (row && randomId !== undefined) committedBatch.push({ random_id: randomId, ...row });
+          try {
+            if (deps.deliveryJournal?.dispatch?.isCancelled(peerId, idempotencyKey)) {
+              const row = deps.deliveryJournal.lookupUserMessageIdByRandomId(peerId, idempotencyKey);
+              ackIds.push(id);
+              if (row && randomId !== undefined) committedBatch.push({ random_id: randomId, ...row });
+              release();
+              continue;
+            }
+          } catch {
+            warnJournal("stop-lookup-failed", "webchannel: cancellation ledger lookup failed before inbound admission");
             release();
+            fifoBlocked = true;
             continue;
           }
           const pendingOutcome = pendingOutcomes.get(key);
