@@ -122,6 +122,14 @@ and difference recovery can therefore surface a missed `interrupted`, completed,
 cancelled, or failed outcome. An accepted task is absent from the replay ledger:
 recovery never republishes it or infers an execution outcome from silence.
 
+Protocol 6 ACKs may carry `cancelled`, an authenticated subset of that frame's
+acknowledged wire IDs. This is explicit server evidence that those inputs were
+durably cancelled, including inputs stopped before a journal row existed. The
+client retires only those IDs from the activity watch before acceptance callbacks
+can run. Their delivery receipts remain `accepted`; no task result or journal row
+is fabricated. Ordinary ACKs, empty/truncated history, and a local `/stop` request
+alone do not prove cancellation. Upgrade the client and plugin together.
+
 A legitimately silent accepted turn can cause another reconnect each interval;
 a held-only episode still requests at most one. Raise the timeout or set it to `0`
 for workloads where long silent turns are normal. The watchdogs share the existing
