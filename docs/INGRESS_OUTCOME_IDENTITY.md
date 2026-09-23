@@ -7,6 +7,13 @@ identify the authenticated peer and logical message ID (`random_id`, with the
 existing wire-ID fallback). The prefix cannot collide with a valid legacy
 account ID. Wire routing and diagnostics still receive the actual account ID.
 
+Scoped operations and legacy probes use separate SDK instances. The SDK's
+in-memory key joins the namespace and message key with `:`, so a legacy account
+`tenant` with key `v2_<hash>:peer:logical` would otherwise alias the scoped
+namespace `tenant:v2_<hash>` with key `peer:logical`. Legacy probes disable the
+SDK memory cache, retaining the existing process cache bound. Persisted
+namespaces and marker lifetimes remain unchanged.
+
 The outcome operation gates, hot cache, cancellation fallback tombstones and
 pending overflow claims all use that scope. Overflow replies also require the
 original tenant and peer session token to match the currently published runtime,
@@ -79,7 +86,8 @@ production ingress/recovery/debounce functions. It covers tenant/account/peer
 separation, warm and cold reads, journal reopen, all three ambiguous legacy
 outcomes, exact tuple acceptance and cancellation proof, accepted orphan repair,
 missing markers, cancellation failure/recovery, pending overflow isolation,
-legacy read faults and the existing TTL boundary. Protocol 6 cases additionally
+legacy read faults, cache-key collisions in both directions and the existing
+TTL boundary. Protocol 6 cases additionally
 check cancellation proof with a committed row, initial target versus command
 receipts, and overflow-only cancellation held at lookup/write then reopened.
 The agent dispatch recipient
