@@ -33,9 +33,14 @@ let grantedAccounts: string[] = [];
 let mePollTimer: number | null = null;
 let laneOwner: AbortController | null = null;
 let sessionOwner = new AbortController();
+let sessionUsername: string | null = null;
+let suspended = false;
+let logoutState: "idle" | "pending" | "failed" = "idle";
+type SavedLane = { username: string; accountId: string; draft: string };
+let savedLane: SavedLane | undefined;
 
 function ownsSession(owner: AbortController): boolean {
-  return sessionOwner === owner && !owner.signal.aborted;
+  return !suspended && sessionOwner === owner && !owner.signal.aborted;
 }
 
 function clearLane(): void {
@@ -54,6 +59,7 @@ function resetSession(): AbortController {
   clearLane();
   while (paneTeardowns.length) paneTeardowns.pop()?.();
   grantedAccounts = [];
+  sessionUsername = null;
   sessionOwner = new AbortController();
   return sessionOwner;
 }
@@ -76,7 +82,7 @@ function renderLlmBadge(): void {
 }
 
 /** (Re)mount the active chat lane for `accountId`, tearing down the prior one. */
-async function mountLane(accountId: string): Promise<void> {
+async function mountLane(accountId: string, draft = ""): Promise<void> {
   clearLane();
   const owner = new AbortController();
   laneOwner = owner;
@@ -85,7 +91,7 @@ async function mountLane(accountId: string): Promise<void> {
   const mount = el("div");
   laneBody.replaceChildren(mount);
   try {
-    const teardown = await createWidget(mount, config, accountId, owner.signal);
+    const teardown = await createWidget(mount, config, accountId, owner.signal, draft);
     if (laneOwner !== owner || owner.signal.aborted) {
       teardown();
       return;
@@ -160,8 +166,9 @@ async function reconcileGrants(accounts: string[], owner: AbortController): Prom
   renderTabs();
 }
 
-async function mountForSession(me: Me, owner: AbortController): Promise<void> {
+async function mountForSession(me: Me, owner: AbortController, restore?: SavedLane): Promise<void> {
   if (!ownsSession(owner)) return;
+  sessionUsername = me.username;
   const appEl = $("app");
   const who = $("whoami");
   who.textContent = `${me.username}${me.isAdmin ? " (admin)" : ""}`;
@@ -212,7 +219,9 @@ async function mountForSession(me: Me, owner: AbortController): Promise<void> {
   }, 3000);
 
   if (grantedAccounts.length > 0) {
-    await mountLane(grantedAccounts[0]);
+    // A cached draft belongs only to this user and this still-granted account.
+    const lane = restore?.username === me.username && grantedAccounts.includes(restore.accountId) ? restore : undefined;
+    await mountLane(lane?.accountId ?? grantedAccounts[0], lane?.draft);
     if (!ownsSession(owner)) return;
     renderTabs();
   }
@@ -246,17 +255,55 @@ async function tryResumeSession(): Promise<void> {
   const owner = sessionOwner;
   try {
     const { ok, data } = await api<Me>("/me", { signal: owner.signal });
-    if (ownsSession(owner) && ok && data.username) await mountForSession(data, owner);
+    if (!ownsSession(owner)) return;
+    const restore = savedLane;
+    savedLane = undefined;
+    if (ok && data.username) await mountForSession(data, owner, restore);
+    else showSignIn();
   } catch {
-    // Leave the sign-in screen available when session lookup cannot complete.
+    if (!ownsSession(owner)) return;
+    savedLane = undefined;
+    showSignIn();
+    $("login-err").textContent = "Session lookup failed. Sign in to continue.";
   }
+}
+
+/** Remove cached identity and grant UI before a new session lookup can finish. */
+function clearSessionUi(): void {
+  $("app").classList.add("hidden");
+  $("whoami").classList.add("hidden");
+  $("whoami").textContent = "";
+  for (const id of ["chat-body", "admin-body", "wiretap-body"]) $(id).replaceChildren();
+}
+
+function showSignIn(): void {
+  clearSessionUi();
+  $("login").classList.remove("hidden");
+  $("login-err").textContent = "";
+  ($("login-btn") as HTMLButtonElement).disabled = false;
+  const logout = $("logout") as HTMLButtonElement;
+  logout.classList.add("hidden");
+  logout.disabled = false;
+  logout.textContent = "Log out";
+}
+
+function showLogoutFailure(): void {
+  clearSessionUi();
+  $("login").classList.remove("hidden");
+  $("login-err").textContent = "Log out failed or was interrupted. Your server session may still be active. Try Log out again.";
+  ($("login-btn") as HTMLButtonElement).disabled = true;
+  const logout = $("logout") as HTMLButtonElement;
+  logout.classList.remove("hidden");
+  logout.disabled = false;
+  logout.textContent = "Retry log out";
 }
 
 function wireLogin(): void {
   const btn = $("login-btn") as HTMLButtonElement;
   const err = $("login-err");
   const doLogin = async () => {
-    if (btn.disabled) return;
+    if (suspended || logoutState !== "idle" || btn.disabled) return;
+    savedLane = undefined;
     const owner = resetSession();
     err.textContent = "";
     btn.disabled = true;
@@ -289,50 +336,74 @@ function wireLogin(): void {
 
 function wireLogout(): void {
   const logout = $("logout") as HTMLButtonElement;
-  let loggingOut = false;
   logout.onclick = async () => {
-    if (loggingOut) return;
-    loggingOut = true;
+    if (suspended || logoutState === "pending") return;
+    logoutState = "pending";
+    savedLane = undefined;
     const owner = resetSession();
     logout.disabled = true;
     logout.textContent = "Signing out…";
     const login = $("login-btn") as HTMLButtonElement;
     login.disabled = true;
     $("login").classList.add("hidden");
-    $("app").classList.add("hidden");
-    $("whoami").classList.add("hidden");
-    $("whoami").textContent = "";
-    for (const id of ["chat-body", "admin-body", "wiretap-body"]) $(id).replaceChildren();
+    clearSessionUi();
     ($("password") as HTMLInputElement).value = "";
     try {
       const res = await api("/logout", { method: "POST", signal: owner.signal });
       if (!ownsSession(owner)) return;
       // A lost prior response or an already-expired sid is also signed out.
       if (!res.ok && res.status !== 401) throw new Error(`HTTP ${res.status}`);
-      $("login-err").textContent = "";
-      $("login").classList.remove("hidden");
-      logout.classList.add("hidden");
-      logout.textContent = "Log out";
-      login.disabled = false;
+      logoutState = "idle";
+      showSignIn();
     } catch {
       if (!ownsSession(owner)) return;
-      $("login").classList.remove("hidden");
-      $("login-err").textContent = "Log out failed. Your server session may still be active. Try Log out again.";
-      logout.textContent = "Retry log out";
+      logoutState = "failed";
+      showLogoutFailure();
       // Keep login disabled until logout settles so its cookie expiry cannot
       // race a new login's Set-Cookie response.
     } finally {
-      loggingOut = false;
       if (ownsSession(owner)) logout.disabled = false;
     }
   };
 }
 
+function suspendPage(event: PageTransitionEvent): void {
+  if (suspended) return;
+  if (event.persisted && sessionUsername && activeAccount && logoutState === "idle") {
+    savedLane = {
+      username: sessionUsername,
+      accountId: activeAccount,
+      draft: document.querySelector<HTMLInputElement>("#chat-lane input")?.value ?? "",
+    };
+  }
+  suspended = true;
+  // Aborting a logout request cannot prove that its server-side mutation ran.
+  // Its late callbacks lose ownership; restoration must keep sign-in blocked.
+  if (logoutState === "pending") logoutState = "failed";
+  resetSession();
+  clearSessionUi();
+}
+
+function restorePage(event: PageTransitionEvent): void {
+  if (!event.persisted || !suspended) return;
+  suspended = false;
+  if (logoutState === "failed") {
+    showLogoutFailure();
+    return;
+  }
+  showSignIn();
+  void tryResumeSession();
+}
+
+let booted = false;
 function boot(): void {
+  if (booted) return;
+  booted = true;
   renderLlmBadge();
   wireLogin();
   wireLogout();
-  window.addEventListener("pagehide", () => { resetSession(); }, { once: true });
+  window.addEventListener("pagehide", suspendPage);
+  window.addEventListener("pageshow", restorePage);
   void tryResumeSession();
 }
 

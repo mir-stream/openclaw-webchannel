@@ -3,7 +3,7 @@
   "files": {
     "demo/enroll-validation.test.ts": 2,
     "demo/saas-server-auth.test.ts": 4,
-    "demo/web/src/app-session.dom.test.ts": 8,
+    "demo/web/src/app-session.dom.test.ts": 20,
     "demo/web/src/error-copy.test.ts": 7,
     "demo/web/src/history-paging.test.ts": 7,
     "demo/web/src/markdown.dom.test.ts": 10,

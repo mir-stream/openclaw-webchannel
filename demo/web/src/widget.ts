@@ -54,6 +54,7 @@ export async function createWidget(
   config: DemoConfig,
   accountId: string,
   signal?: AbortSignal,
+  initialDraft = "",
 ): Promise<() => void> {
   if (signal?.aborted) return () => {};
 
@@ -86,6 +87,8 @@ export async function createWidget(
       "font-size:12px;background:rgba(248,81,73,.08)",
   });
   const input = el("input", { placeholder: "Type a message…", style: "flex:1" }) as HTMLInputElement;
+  // Restore before asynchronous authentication so continued edits stay intact.
+  input.value = initialDraft;
   const sendBtn = el("button", { class: "primary" }, ["Send"]) as HTMLButtonElement;
   // P0-3 slash-command typeahead menu — a column of command buttons rendered
   // above the composer while the user is typing a `/command`. Hidden otherwise.
