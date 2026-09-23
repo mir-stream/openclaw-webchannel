@@ -407,6 +407,22 @@ describe("accepted-turn application recovery", () => {
     expect(h.request).toHaveBeenCalledTimes(1);
   });
 
+  it("a fresh cancellation ACK cannot clear typing received reentrantly after its proof", async () => {
+    const h = await setup();
+    vi.useFakeTimers();
+    h.control.ack = false;
+    const receipt = h.wrapper.send("cancelled input")!;
+    const id = h.received[0]!.id!;
+    h.deliver({ type: "typing" });
+    receipt.subscribe(({ state }) => {
+      if (state === "accepted") h.deliver({ type: "typing" });
+    });
+    h.deliver({ type: "ack", ids: [id], cancelled: [id] });
+    expect(h.wrapper.getState().isTyping).toBe(true);
+    expect(inside(h.wrapper).applicationTurns.size).toBe(0);
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+  });
+
   it.each(["malformed", "not-subset"] as const)("rejects %s cancellation data before any receipt or watchdog effect", async (kind) => {
     const h = await setup();
     vi.useFakeTimers();

@@ -909,6 +909,8 @@ export class WebChannelNATSClient {
    * Unlike the advisory openTurns set, transport loss cannot retire this work.
    */
   private readonly applicationTurns = new Map<string, ReceiptRecord>();
+  /** Local candidates present at the latest unscoped typing frame. */
+  private typingApplicationTurns = new Set<string>();
   private activeTurnStallTimer: ReturnType<typeof setTimeout> | null = null;
   private activeTurnStallGeneration = 0;
   /** Defers held-admission UI fanout until the first owner's timer commit ends. */
@@ -3602,6 +3604,9 @@ export class WebChannelNATSClient {
           finalize.push(id);
         }
       }
+      const typingOwners = this.typingApplicationTurns;
+      const ownsTyping = finalize.some((id) => typingOwners.has(id));
+      for (const id of finalize) typingOwners.delete(id);
       if (!this.hasAcceptedApplicationTurn()) this.cancelActiveTurnStallTimer();
       if (this.wrapperLifecycleGeneration !== lifecycle) return;
       for (const id of finalize) {
@@ -3612,7 +3617,8 @@ export class WebChannelNATSClient {
       // Typing has no wire turn ID. Clear it only for a fresh local proof with
       // no remaining local work or working draft; a cancelled neighbor or old
       // replay cannot clear another turn. Re-read after timer/draft callouts.
-      const clearTyping = finalize.length > 0 && this.applicationTurns.size === 0
+      const clearTyping = ownsTyping && this.typingApplicationTurns === typingOwners
+        && this.applicationTurns.size === 0
         && this.openTurns.size === 0 && !this.state.messages.some((row) => row.working)
         && this.state.isTyping === true;
       const clearActive = closed && this.openTurns.size === 0;
@@ -4712,6 +4718,11 @@ export class WebChannelNATSClient {
         return true;
 
       case "typing": {
+        // Cancellation facts are committed before ACK callbacks. A new typing
+        // frame arriving reentrantly after that proof cannot belong to a
+        // cancelled local candidate, even before the ACK's UI cleanup runs.
+        this.typingApplicationTurns = new Set([...this.applicationTurns.keys()]
+          .filter((id) => !this.client.isIngressCancelled(id)));
         this.setState({ isTyping: true });
         return true;
       }
