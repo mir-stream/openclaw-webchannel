@@ -288,9 +288,43 @@ function wireLogin(): void {
 }
 
 function wireLogout(): void {
-  $("logout").onclick = async () => {
-    resetSession();
-    location.reload();
+  const logout = $("logout") as HTMLButtonElement;
+  let loggingOut = false;
+  logout.onclick = async () => {
+    if (loggingOut) return;
+    loggingOut = true;
+    const owner = resetSession();
+    logout.disabled = true;
+    logout.textContent = "Signing out…";
+    const login = $("login-btn") as HTMLButtonElement;
+    login.disabled = true;
+    $("login").classList.add("hidden");
+    $("app").classList.add("hidden");
+    $("whoami").classList.add("hidden");
+    $("whoami").textContent = "";
+    for (const id of ["chat-body", "admin-body", "wiretap-body"]) $(id).replaceChildren();
+    ($("password") as HTMLInputElement).value = "";
+    try {
+      const res = await api("/logout", { method: "POST", signal: owner.signal });
+      if (!ownsSession(owner)) return;
+      // A lost prior response or an already-expired sid is also signed out.
+      if (!res.ok && res.status !== 401) throw new Error(`HTTP ${res.status}`);
+      $("login-err").textContent = "";
+      $("login").classList.remove("hidden");
+      logout.classList.add("hidden");
+      logout.textContent = "Log out";
+      login.disabled = false;
+    } catch {
+      if (!ownsSession(owner)) return;
+      $("login").classList.remove("hidden");
+      $("login-err").textContent = "Log out failed. Your server session may still be active. Try Log out again.";
+      logout.textContent = "Retry log out";
+      // Keep login disabled until logout settles so its cookie expiry cannot
+      // race a new login's Set-Cookie response.
+    } finally {
+      loggingOut = false;
+      if (ownsSession(owner)) logout.disabled = false;
+    }
   };
 }
 

@@ -576,6 +576,21 @@ export const demoSaasRequestHandler = async (req: IncomingMessage, res: ServerRe
       return;
     }
 
+    // Retire only the caller's current browser session. Already-issued NATS
+    // credentials and other devices' sid values have separate lifetimes.
+    if (path === "/logout") {
+      if (req.method !== "POST") {
+        res.setHeader("Allow", "POST");
+        return sendJson(res, { error: "Method not allowed" }, 405);
+      }
+      const user = sessionUser(req);
+      const sid = readCookie(req, "sid");
+      if (sid) sessions.delete(sid);
+      res.setHeader("Set-Cookie", "sid=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0");
+      if (!user) return sendJson(res, { error: "not authenticated" }, 401);
+      return sendJson(res, { ok: true });
+    }
+
     // ── /me — who am I + my rendezvous map (for the agent switcher). ──────
     if (req.method === "GET" && path === "/me") {
       const user = sessionUser(req);
