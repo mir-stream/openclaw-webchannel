@@ -407,6 +407,139 @@ describe("accepted-turn application recovery", () => {
     expect(h.request).toHaveBeenCalledTimes(1);
   });
 
+  it("preserves remote started typing and a held follow-up when the first cancellation proof arrives on retry", async () => {
+    const h = await setup({ timeout: 10_000 });
+    vi.useFakeTimers();
+    h.control.ack = false;
+    const cancelled = h.wrapper.send("A stopped before admission")!;
+    const a = h.received[0]!.id!;
+    // Another device stopped A, but this device missed that cancellation ACK.
+    // Its next turn B has authoritative running state, without any local owner
+    // or working draft to protect the conversation's unscoped typing.
+    h.deliver({ type: "user_committed", id: "remote-user", turnId: "remote-B",
+      random_id: "remote-random", text: "B from another device", requestState: "queued", seq: 1 });
+    h.deliver({ type: "request_state", id: "remote-user", turnId: "remote-B", state: "started", seq: 2 });
+    h.deliver({ type: "typing" });
+    const followup = h.wrapper.send("C held behind B")!;
+    expect(cancelled.snapshot().state).toBe("sent");
+    expect(followup.snapshot().state).toBe("queued");
+    expect(h.wrapper.getState().messages.some((row) => row.working)).toBe(false);
+
+    h.control.cancelled.add(a);
+    h.control.ack = true;
+    vi.advanceTimersByTime(1_100); // The ordinary same-ID delivery retry gets A's first proof.
+    expect(cancelled.snapshot().state).toBe("accepted");
+    expect(inside(h.wrapper).applicationTurns.has(a)).toBe(false);
+    expect(h.wrapper.getState().messages.find((row) => row.id === "remote-user")?.requestState).toBe("started");
+    expect.soft(h.wrapper.getState().isTyping).toBe(true);
+    expect.soft(followup.snapshot().state).toBe("queued");
+    expect(h.received.map((frame) => frame.id)).toEqual([a, a]);
+    expect(inside(h.wrapper).applicationTurns.size).toBe(0);
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+
+    h.deliver({ type: "request_state", id: "remote-user", turnId: "remote-B", state: "completed", seq: 3 });
+    h.deliver({ type: "turn_settled", turnId: "remote-B", outcome: "ok" });
+    expect(h.wrapper.getState().isTyping).toBe(false);
+    expect(followup.snapshot().state).toBe("accepted");
+    expect(cancelled.snapshot().state).toBe("accepted");
+    expect(h.received.map((frame) => frame.text)).toEqual([
+      "A stopped before admission", "A stopped before admission", "C held behind B",
+    ]);
+    expect([...inside(h.wrapper).applicationTurns.keys()]).toEqual([h.received[2]!.id]);
+  });
+
+  it.each([
+    ["live", "queued"], ["live", "started"], ["history", "queued"], ["history", "started"],
+  ] as const)("protects remote work learned from %s in state %s after typing", async (source, state) => {
+    const h = await withClock();
+    h.deliver({ type: "typing" });
+    const remote = { id: "remote-user", role: "user" as const, text: "remote work",
+      turnId: "remote-B", requestState: state, seq: 2 };
+    if (source === "history") h.deliver({ type: "history", messages: [remote] });
+    else {
+      h.deliver({ type: "user_committed", id: remote.id, text: remote.text,
+        turnId: remote.turnId, requestState: "queued", seq: 1 });
+      h.deliver({ type: "request_state", id: remote.id, turnId: remote.turnId, state, seq: 2 });
+    }
+    // A delayed older snapshot cannot remove the independently known work.
+    h.deliver({ type: "history", messages: [{ ...remote, requestState: "completed", seq: 1 }] });
+    const followup = h.wrapper.send("held")!;
+    h.deliver({ type: "ack", ids: [h.turnId], cancelled: [h.turnId] });
+    expect(h.wrapper.getState().messages.find((row) => row.id === remote.id)?.requestState).toBe(state);
+    expect(h.wrapper.getState().isTyping).toBe(true);
+    expect(followup.snapshot().state).toBe("queued");
+    expect(h.receipt.snapshot().state).toBe("accepted");
+    expect(inside(h.wrapper).applicationTurns.size).toBe(0);
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+    h.deliver({ type: "turn_settled", turnId: remote.turnId, outcome: "ok" });
+    expect(h.wrapper.getState().isTyping).toBe(false);
+    expect(followup.snapshot().state).toBe("accepted");
+  });
+
+  it.each([
+    ["live", "completed"], ["live", "failed"], ["live", "cancelled"], ["live", "interrupted"],
+    ["history", "completed"], ["history", "failed"], ["history", "cancelled"], ["history", "interrupted"],
+  ] as const)("allows cancellation cleanup after %s reconciles a remote %s outcome", async (source, state) => {
+    const h = await withClock();
+    const remote = { id: "remote-user", role: "user" as const, text: "remote work",
+      turnId: "remote-B", requestState: "started" as const, seq: 1 };
+    h.deliver({ type: "user_committed", id: remote.id, text: remote.text,
+      turnId: remote.turnId, requestState: remote.requestState, seq: 1 });
+    h.deliver({ type: "typing" });
+    if (source === "history") h.deliver({ type: "history", messages: [{ ...remote, requestState: state, seq: 2 }] });
+    else h.deliver({ type: "request_state", id: remote.id, turnId: remote.turnId, state, seq: 2 });
+    // Older active history must not resurrect a settled neighbor as an owner.
+    h.deliver({ type: "history", messages: [remote] });
+    expect(h.wrapper.getState().messages.find((row) => row.id === remote.id)?.requestState).toBe(state);
+    h.deliver({ type: "ack", ids: [h.turnId], cancelled: [h.turnId] });
+    expect(h.wrapper.getState().isTyping).toBe(false);
+    expect(h.receipt.snapshot().state).toBe("accepted");
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+    vi.advanceTimersByTime(3 * TIMEOUT);
+    expect(h.request).not.toHaveBeenCalled();
+  });
+
+  it.each(["queued", "started"] as const)("cleans up an exactly cancelled local %s row before its journal terminal arrives", async (requestState) => {
+    const h = await withClock();
+    h.deliver({ type: "user_committed", id: "local-user", text: "work", turnId: h.turnId,
+      random_id: h.received[0]!.random_id, requestState, seq: 1 });
+    h.deliver({ type: "typing" });
+    h.deliver({ type: "ack", ids: [h.turnId], cancelled: [h.turnId] });
+    expect(h.wrapper.getState().isTyping).toBe(false);
+    expect(h.wrapper.getState().messages.find((row) => row.id === "local-user")?.requestState).toBe(requestState);
+    expect(h.receipt.snapshot().state).toBe("accepted");
+    expect(inside(h.wrapper).applicationTurns.size).toBe(0);
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+    vi.advanceTimersByTime(3 * TIMEOUT);
+    expect(h.request).not.toHaveBeenCalled();
+  });
+
+  it("rechecks remote started ownership learned during exact draft cleanup", async () => {
+    const h = await withClock();
+    h.deliver({ type: "progress", id: "cancelled-draft", turnId: h.turnId, text: "partial" });
+    h.deliver({ type: "typing" });
+    const followup = h.wrapper.send("held")!;
+    let injected = false;
+    const unsubscribe = h.wrapper.subscribe((state) => {
+      if (!injected && !state.messages.some((row) => row.id === "cancelled-draft")) {
+        injected = true;
+        h.deliver({ type: "user_committed", id: "remote-user", text: "remote work",
+          turnId: "remote-B", requestState: "queued", seq: 1 });
+        h.deliver({ type: "request_state", id: "remote-user", turnId: "remote-B", state: "started", seq: 2 });
+      }
+    });
+    h.deliver({ type: "ack", ids: [h.turnId], cancelled: [h.turnId] });
+    unsubscribe();
+    expect(injected).toBe(true);
+    expect(h.wrapper.getState().isTyping).toBe(true);
+    expect(followup.snapshot().state).toBe("queued");
+    expect(h.receipt.snapshot().state).toBe("accepted");
+    expect(inside(h.wrapper).applicationTurns.size).toBe(0);
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+    h.deliver({ type: "turn_settled", turnId: "remote-B", outcome: "ok" });
+    expect(followup.snapshot().state).toBe("accepted");
+  });
+
   it("a fresh cancellation ACK cannot clear typing received reentrantly after its proof", async () => {
     const h = await setup();
     vi.useFakeTimers();

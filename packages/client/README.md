@@ -130,6 +130,11 @@ can run. Their delivery receipts remain `accepted`; no task result or journal ro
 is fabricated. Ordinary ACKs, empty/truncated history, and a local `/stop` request
 alone do not prove cancellation. Upgrade the client and plugin together.
 
+Cancellation cleanup preserves typing and held follow-ups when another request
+is known to be queued or started, including work sent by another device. A late
+first cancellation ACK cannot claim that request's unscoped typing merely because
+the cancelled input was still a local send candidate.
+
 A legitimately silent accepted turn can cause another reconnect each interval;
 a held-only episode still requests at most one. Raise the timeout or set it to `0`
 for workloads where long silent turns are normal. The watchdogs share the existing
