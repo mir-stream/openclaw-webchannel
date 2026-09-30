@@ -32,13 +32,14 @@ export function b64url(input: ArrayBuffer | Uint8Array): string {
 /** Same-origin JSON fetch that always carries the session cookie. */
 export async function api<T = unknown>(
   path: string,
-  init?: { method?: string; body?: unknown },
+  init?: { method?: string; body?: unknown; signal?: AbortSignal },
 ): Promise<{ ok: boolean; status: number; data: T }> {
   const res = await fetch(path, {
     method: init?.method ?? "GET",
     headers: init?.body ? { "Content-Type": "application/json" } : undefined,
     body: init?.body ? JSON.stringify(init.body) : undefined,
     credentials: "same-origin",
+    signal: init?.signal,
   });
   let data: T;
   try {

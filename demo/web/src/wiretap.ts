@@ -23,8 +23,9 @@ export async function createWiretap(
   bodyEl: HTMLElement,
   config: DemoConfig,
   accountId: string,
+  signal?: AbortSignal,
 ): Promise<() => void> {
-  bodyEl.replaceChildren();
+  if (signal?.aborted) return () => {};
 
   const rv = config.accounts[accountId];
   if (!rv) throw new Error(`no rendezvous entry for account "${accountId}"`);
@@ -42,80 +43,96 @@ export async function createWiretap(
     " frames (register / reginbox) are the enrollment exchange on the relay — visible, but replaying the JWT fails (single-use nonce) and the wrapped key is useless without the device key.",
   ]);
   const frames = el("div", { style: "display:flex;flex-direction:column;gap:6px;font-family:var(--mono)" });
-  bodyEl.append(statusLine, note, frames);
-
-  // Observer creds: a SUB-only NATS user (sub webchannel.{tenant}.>, NO pub). The
-  // wiretap must never publish — observer is strictly weaker than a browser (which
-  // is now pinned to its own peer subtree), so it can read every frame but can't
-  // inject one. Tenant-wide observer creds are an OPERATOR capability: they come
-  // from the admin-gated /admin/nats-user route, NOT the browser-facing /nats-user
-  // (which only ever mints per-peer browser creds). This pane therefore mounts for
-  // admin sessions only (see app.ts).
-  const creds = await api<{ userJwt?: string; userSeedRaw?: string; natsUrl?: string }>(
-    "/admin/nats-user",
-    { method: "POST", body: { role: "observer" } },
-  );
-  if (!creds.ok || !creds.data.userJwt || !creds.data.userSeedRaw) {
-    statusLine.textContent = `observer creds failed (HTTP ${creds.status})`;
-    statusLine.style.color = "var(--bad)";
-    return () => bodyEl.replaceChildren();
-  }
-  const natsUrl = creds.data.natsUrl ?? rv.natsUrl;
-
-  const client = new NatsClient({
-    url: natsUrl,
-    accountId,
-    tenant: config.tenant,
-    peerId: "wiretap-observer",
-    natsCredentials: { userJwt: creds.data.userJwt, userSeedRaw: creds.data.userSeedRaw },
-  });
-
-  let subscribed = false;
-  const wildcard = `webchannel.${config.tenant}.>`;
-
-  client.onState((connected) => {
-    if (connected) {
-      statusLine.textContent = `● observing ${wildcard}`;
-      statusLine.style.color = "var(--good)";
-      if (!subscribed) {
-        client.subscribe(wildcard);
-        subscribed = true;
-      }
-    } else {
-      statusLine.textContent = "● observer disconnected";
-      statusLine.style.color = "var(--warn)";
-      subscribed = false;
-    }
-  });
-
-  client.onRawMessage((subject: string, payload: string) => {
-    const leaf = subject.split(".").slice(-2).join(".");
-    // The admission exchange (register request + reginbox reply) rides the relay
-    // now — tag it so a viewer notices the JWT/PoP registration is visible yet safe.
-    // Match BOTH the request (`…{peerId}.register`) and the reply, whose subject
-    // is `…{peerId}.reginbox.{token}` (ends in the token, not `.reginbox`), via a
-    // segment check rather than an end-anchored test.
-    const isAdmission = subject.split(".").some((s) => s === "register" || s === "reginbox");
-    const row = el("div", {
-      style:
-        "border:1px solid " + (isAdmission ? "var(--warn)" : "var(--border)") +
-        ";border-radius:5px;padding:6px 8px;font-size:11px",
-    }, [
-      el("div", { style: "color:var(--accent);margin-bottom:3px" }, [
-        ...(isAdmission ? [el("span", { style: "color:var(--warn)" }, ["✦admission "])] : []),
-        leaf,
-      ]),
-      el("div", { style: "color:var(--muted);word-break:break-all;line-height:1.5" }, [toHex(payload)]),
-    ]);
-    frames.prepend(row);
-    // Cap the rendered frame list so a long session doesn't grow unbounded.
-    while (frames.childElementCount > 60) frames.lastElementChild?.remove();
-  });
-
-  client.connect();
-
-  return () => {
-    client.disconnect();
-    bodyEl.replaceChildren();
+  const root = el("div", {}, [statusLine, note, frames]);
+  bodyEl.replaceChildren(root);
+  let client: NatsClient | null = null;
+  let disposed = false;
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    signal?.removeEventListener("abort", dispose);
+    client?.disconnect();
+    root.remove();
   };
+  signal?.addEventListener("abort", dispose, { once: true });
+
+  try {
+    // Observer creds: a SUB-only NATS user (sub webchannel.{tenant}.>, NO pub). The
+    // wiretap must never publish — observer is strictly weaker than a browser (which
+    // is now pinned to its own peer subtree), so it can read every frame but can't
+    // inject one. Tenant-wide observer creds are an OPERATOR capability: they come
+    // from the admin-gated /admin/nats-user route, NOT the browser-facing /nats-user
+    // (which only ever mints per-peer browser creds). This pane therefore mounts for
+    // admin sessions only (see app.ts).
+    const creds = await api<{ userJwt?: string; userSeedRaw?: string; natsUrl?: string }>(
+      "/admin/nats-user",
+      { method: "POST", body: { role: "observer" }, signal },
+    );
+    if (disposed) return dispose;
+    if (!creds.ok || !creds.data.userJwt || !creds.data.userSeedRaw) {
+      statusLine.textContent = `observer creds failed (HTTP ${creds.status})`;
+      statusLine.style.color = "var(--bad)";
+      return dispose;
+    }
+    const natsUrl = creds.data.natsUrl ?? rv.natsUrl;
+
+    client = new NatsClient({
+      url: natsUrl,
+      accountId,
+      tenant: config.tenant,
+      peerId: "wiretap-observer",
+      natsCredentials: { userJwt: creds.data.userJwt, userSeedRaw: creds.data.userSeedRaw },
+    });
+
+    let subscribed = false;
+    const wildcard = `webchannel.${config.tenant}.>`;
+
+    client.onState((connected) => {
+      if (disposed) return;
+      if (connected) {
+        statusLine.textContent = `● observing ${wildcard}`;
+        statusLine.style.color = "var(--good)";
+        if (!subscribed) {
+          client?.subscribe(wildcard);
+          subscribed = true;
+        }
+      } else {
+        statusLine.textContent = "● observer disconnected";
+        statusLine.style.color = "var(--warn)";
+        subscribed = false;
+      }
+    });
+
+    client.onRawMessage((subject: string, payload: string) => {
+      if (disposed) return;
+      const leaf = subject.split(".").slice(-2).join(".");
+      // The admission exchange (register request + reginbox reply) rides the relay
+      // now — tag it so a viewer notices the JWT/PoP registration is visible yet safe.
+      // Match BOTH the request (`…{peerId}.register`) and the reply, whose subject
+      // is `…{peerId}.reginbox.{token}` (ends in the token, not `.reginbox`), via a
+      // segment check rather than an end-anchored test.
+      const isAdmission = subject.split(".").some((s) => s === "register" || s === "reginbox");
+      const row = el("div", {
+        style:
+          "border:1px solid " + (isAdmission ? "var(--warn)" : "var(--border)") +
+          ";border-radius:5px;padding:6px 8px;font-size:11px",
+      }, [
+        el("div", { style: "color:var(--accent);margin-bottom:3px" }, [
+          ...(isAdmission ? [el("span", { style: "color:var(--warn)" }, ["✦admission "])] : []),
+          leaf,
+        ]),
+        el("div", { style: "color:var(--muted);word-break:break-all;line-height:1.5" }, [toHex(payload)]),
+      ]);
+      frames.prepend(row);
+      // Cap the rendered frame list so a long session doesn't grow unbounded.
+      while (frames.childElementCount > 60) frames.lastElementChild?.remove();
+    });
+
+    client.connect();
+    return dispose;
+  } catch (err) {
+    dispose();
+    if (signal?.aborted) return dispose;
+    throw err;
+  }
 }
