@@ -572,6 +572,28 @@ describe("webchannel approval decision -> gateway", () => {
     );
   });
 
+  it("allows a widget click from a channel-qualified owner fallback", async () => {
+    const cfg: any = {
+      commands: { ownerAllowFrom: ["webchannel:alice"] },
+      channels: { webchannel: { execApprovals: { enabled: true } } },
+    };
+    await handleApprovalDecision(cfg, "exec-1", "deny", "alice");
+    expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(1);
+    expect(resolveApprovalOverGateway).toHaveBeenCalledWith(
+      expect.objectContaining({ approvalId: "exec-1", decision: "deny", senderId: "alice" }),
+    );
+  });
+
+  it("refuses a widget click from an owner of another channel", async () => {
+    const cfg: any = {
+      commands: { ownerAllowFrom: ["telegram:alice", "telegram:*"] },
+      channels: { webchannel: { execApprovals: { enabled: true } } },
+    };
+    await expect(handleApprovalDecision(cfg, "exec-1", "deny", "alice"))
+      .rejects.toThrow(/not a configured exec approver/);
+    expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
+  });
+
 });
 
 describe("webchannel approver resolution", () => {
@@ -619,6 +641,60 @@ describe("webchannel approver resolution", () => {
       "alice",
       "bob",
     ]);
+  });
+
+  it("normalizes and deduplicates webchannel owners without folding peer identity case", () => {
+    const cfg: any = {
+      commands: {
+        ownerAllowFrom: ["alice", " webchannel:alice ", " WEBCHANNEL : Bob ", "bob", "webchannel: ", "", 123],
+      },
+    };
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual(["alice", "Bob", "bob"]);
+  });
+
+  it("ignores other channel owners when deciding whether the native surface is configured", () => {
+    const cfg: any = {
+      commands: { ownerAllowFrom: ["telegram:alice", "discord:*", "unknown:bob"] },
+      channels: { webchannel: { execApprovals: { enabled: true } } },
+    };
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual([]);
+    const capability = createClawApprovalCapability(new FakePeerChannel()) as any;
+    expect(capability.getExecInitiatingSurfaceState({ cfg, action: "approve" }))
+      .toEqual({ kind: "disabled" });
+  });
+
+  it("uses normalized owners when explicit approvers is empty", () => {
+    const cfg: any = {
+      commands: { ownerAllowFrom: ["webchannel:alice"] },
+      channels: { webchannel: { execApprovals: { approvers: [] } } },
+    };
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual(["alice"]);
+  });
+
+  it.each([[" "], [123]])("does not fall back from a nonempty invalid explicit list (%j)", (entry) => {
+    const cfg: any = {
+      commands: { ownerAllowFrom: ["*"] },
+      channels: { webchannel: { execApprovals: { approvers: [entry] } } },
+    };
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual([]);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "alice" })).toBe(false);
+  });
+
+  it("preserves explicit peer IDs as literal strings instead of treating them as global owners", () => {
+    const cfg: any = {
+      commands: { ownerAllowFrom: ["*"] },
+      channels: { webchannel: { execApprovals: { approvers: [" webchannel:alice ", "telegram:bob"] } } },
+    };
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual(["webchannel:alice", "telegram:bob"]);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "alice" })).toBe(false);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "webchannel:alice" })).toBe(true);
+  });
+
+  it("preserves a channel-qualified owner wildcard for authenticated peers", () => {
+    const cfg: any = { commands: { ownerAllowFrom: ["webchannel:*"] } };
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual(["*"]);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "alice" })).toBe(true);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: " " })).toBe(false);
   });
 });
 

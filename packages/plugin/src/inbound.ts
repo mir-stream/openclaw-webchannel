@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 // #113: the reply-options contract, used to compile-check the reasoning fragment
 // below against the SDK rather than trusting the field name by eye.
@@ -13,6 +14,7 @@ import {
 import { WEBCHANNEL_ID, ANON_PEER_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel, InboundWsMessage } from "./channel-contract.js";
 import { resolveDmAdmission } from "./dm-allowlist.js";
+import { usableId } from "./ingress-dedupe.js";
 import {
   resolveWebchannelAccountConfig,
   resolveReasoningEnabled,
@@ -923,6 +925,11 @@ export async function handleInboundMessage(
   // (2) we stamp CommandAuthorized on the turn context (see the buildContext
   // call) so core's fast-abort accepts it.
   const controlLane = options?.controlLane === true;
+  // Core's dedupe route omits tenant and reduces a session key to its agent.
+  // Supply a stable, fully scoped platform ID; the wire ID remains ACK-only.
+  const coreMessageId = usableId(message.id) ? `webchannel-${createHash("sha256")
+    .update(JSON.stringify([servingTenant, accountId, peerId, usableId(message.random_id) ? message.random_id : message.id]))
+    .digest("hex")}` : undefined;
   // ⚠️ The non-fallback branch (`message.id`) is UNTRUSTED peer input used as an
   // identity: since #242 half 3, `(turnId, id)` keys durable tool rows in the
   // client reducer's `applyTool`, so a reused `message.id` (outside #275's
@@ -1188,7 +1195,7 @@ export async function handleInboundMessage(
       raw: message,
       adapter: {
         ingest: (raw) => ({
-          id: `webchannel-${Date.now()}`,
+          id: coreMessageId ?? `webchannel-${Date.now()}`,
           timestamp: Date.now(),
           rawText: raw.text,
           textForAgent: raw.text,
@@ -1196,8 +1203,10 @@ export async function handleInboundMessage(
           raw,
         }),
         resolveTurn: (input) => {
+          if (options?.dispatchAbortSignal?.aborted) throw new Error("webchannel: dispatch retired before context resolution");
           const ctxPayload = channelRuntime.inbound.buildContext({
             channel: WEBCHANNEL_ID,
+            ...(coreMessageId ? { messageId: coreMessageId } : {}),
             // S1: stamp the serving account on the turn context. Core copies
             // this into `ctx.AccountId` → the agent-run request's `accountId`
             // → the approval request's `turnSourceAccountId`, which is what

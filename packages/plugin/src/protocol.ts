@@ -14,6 +14,13 @@
  * v4 (breaking, #246): the v6 delivery-render frames are not optional garnish —
  * a peer that ignores them DIVERGES SILENTLY. See the worked example below.
  *
+ * v6 (breaking): ack.cancelled proves durable cancellation for exact wire IDs
+ * in the same frame's ids. A cancelled request may have no journal row, so the
+ * client must retire its active watch on this proof instead of reconnecting
+ * forever for history that cannot exist. Ordinary ACKs and stop-command receipts
+ * supply no such proof. The exact-match gate requires the client/server change
+ * together; this adds no capability negotiation or envelope/package version bump.
+ *
  * The lockstep is ENFORCED, not just asserted here:
  * `protocol-version-parity.test.ts` (this package) and
  * `protocol-version-lockstep.test.ts` (the e2e suite) each import BOTH constants
@@ -96,7 +103,7 @@
 import { createRequire } from "node:module";
 
 /** The plugin's wire-protocol version. Kept in lockstep with the client. */
-export const WEBCHANNEL_PROTOCOL_VERSION = 5;
+export const WEBCHANNEL_PROTOCOL_VERSION = 6;
 
 let cachedPluginVersion: string | null | undefined;
 

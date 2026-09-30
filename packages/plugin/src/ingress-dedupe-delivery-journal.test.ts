@@ -1250,10 +1250,11 @@ describe("#239 — the accept seam against a REAL delivery journal", () => {
     expect(seam.calls).not.toContainEqual(
       expect.objectContaining({ call: "ack" }),
     );
-    expect(kinds(seam.calls)).toContain("offer-rollback");
-    expect(warns(seam.calls)[0]!.message).toContain(
-      "delivery journal append failed at the inbound accept",
-    );
+    // The cancellation authority is consulted before admission; a closed store
+    // now refuses this input before creating any provisional offer or marker.
+    expect(kinds(seam.calls)).not.toContain("offer-commit");
+    expect(kinds(seam.calls)).not.toContain("write-commit");
+    expect(warns(seam.calls)[0]!.message).toContain("cancellation ledger lookup failed before inbound admission");
   });
 });
 

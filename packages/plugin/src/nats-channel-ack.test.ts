@@ -12,6 +12,9 @@ import { afterEach, describe, it, expect, vi } from "vitest";
 
 import { NatsChannel } from "./nats-channel.js";
 import type { NatsTransport } from "./nats-transport.js";
+import { generateKeyPair } from "./e2e-crypto.js";
+import { openEnvelope } from "./e2e-session.js";
+import type { IngressResultFrame } from "./ingress-result-chunks.js";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -51,6 +54,66 @@ function ackFrames(t: RecordingTransport): Array<{ subject: string; ids: string[
 }
 
 describe("P0-7b — NatsChannel.sendAck", () => {
+  it("packs only same-frame cancelled IDs across 64-ID chunks and preserves the committed echo", () => {
+    const transport = new RecordingTransport();
+    const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant");
+    const ids = Array.from({ length: 130 }, (_, i) => `wire-${i}`);
+    const cancelled = ids.filter((_, i) => i % 2 === 0);
+    const committed = [{ random_id: "logical-a", messageId: "stored-a", seq: 7 }];
+    expect(channel.sendAck("peer", [...ids, "", "x".repeat(129)], committed,
+      [...cancelled, "stray", "", "x".repeat(129)])).toBe(true);
+    const frames = transport.published.map(value => JSON.parse(value.payload));
+    expect(frames.map(frame => frame.ids.length)).toEqual([64, 64, 2]);
+    expect(frames.flatMap(frame => frame.ids)).toEqual(ids);
+    expect(frames.flatMap(frame => frame.cancelled ?? [])).toEqual(cancelled);
+    expect(frames.map(frame => frame.committed)).toEqual([committed, undefined, undefined]);
+    for (const frame of frames) expect(frame.cancelled.every((id: string) => frame.ids.includes(id))).toBe(true);
+  });
+
+  it("authenticates cancellation proof at the exact sealed byte limit and withholds it without a key or space", () => {
+    const transport = new RecordingTransport();
+    const key = new Uint8Array(32).fill(7);
+    const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant",
+      { keyStore: { getOrCreate: () => key } as never, identityKeyPair: generateKeyPair() });
+    const frame = { type: "ack" as const, ids: ["취소된-id"], cancelled: ["취소된-id"] };
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    expect(channel.sendAck("peer", frame.ids, undefined, frame.cancelled)).toBe(false);
+    expect(transport.published).toEqual([]);
+    channel.registerPeer("peer");
+    transport.effectiveOutboundLimit = channel.outboundWireSize("peer", frame)!;
+    expect(channel.sendAck("peer", frame.ids, undefined, frame.cancelled)).toBe(true);
+    expect(Buffer.byteLength(transport.published[0].payload)).toBe(transport.effectiveOutboundLimit);
+    expect(openEnvelope(Buffer.from(transport.published[0].payload), key).message).toEqual(frame);
+    expect(() => openEnvelope(Buffer.from(transport.published[0].payload), new Uint8Array(32).fill(8))).toThrow();
+    transport.effectiveOutboundLimit--;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(channel.sendAck("peer", frame.ids, undefined, frame.cancelled)).toBe(false);
+    expect(transport.published).toHaveLength(1);
+    error.mockRestore();
+  });
+
+  it("splits mixed cancellation ACKs by actual encrypted bytes without separating proof from its ID", () => {
+    const transport = new RecordingTransport();
+    const key = new Uint8Array(32).fill(9);
+    const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant",
+      { keyStore: { getOrCreate: () => key } as never, identityKeyPair: generateKeyPair() });
+    channel.registerPeer("peer");
+    const ids = Array.from({ length: 20 }, (_, i) => `요청-${i}-${"한".repeat(12)}`);
+    const cancelled = ids.filter((_, i) => i % 2 === 0);
+    const committed = [{ random_id: "logical", messageId: "stored", seq: 10 }];
+    transport.effectiveOutboundLimit = 650;
+    expect(channel.sendAck("peer", ids, committed, cancelled)).toBe(true);
+    expect(transport.published.length).toBeGreaterThan(2);
+    const frames = transport.published.map(({ payload }) => {
+      expect(Buffer.byteLength(payload)).toBeLessThanOrEqual(650);
+      return openEnvelope(Buffer.from(payload), key).message as Extract<IngressResultFrame, { type: "ack" }>;
+    });
+    expect(frames.flatMap(frame => frame.ids)).toEqual(ids);
+    expect(frames.flatMap(frame => frame.cancelled ?? [])).toEqual(cancelled);
+    expect(frames.flatMap(frame => frame.committed ?? [])).toEqual(committed);
+    for (const frame of frames) expect((frame.cancelled ?? []).every(id => frame.ids.includes(id))).toBe(true);
+  });
+
   it("seals an ack frame with the ids to the peer's .out (plaintext mode)", () => {
     const transport = new RecordingTransport();
     const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant");

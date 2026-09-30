@@ -157,7 +157,7 @@ export type VerifyJwtOptions = {
    */
   audience: string;
   /**
-   * Allowed clock-skew leeway in seconds when checking `exp`. Default 60.
+   * Allowed clock-skew leeway in seconds when checking `exp` and `nbf`. Default 60.
    */
   clockSkewSec?: number;
 };
@@ -176,6 +176,7 @@ export type VerifyJwtOptions = {
  *  - `iss` doesn't match (constant-time)
  *  - `aud` doesn't match (constant-time; array-aware)
  *  - `exp` is missing, non-numeric, or expired beyond `clockSkewSec`
+ *  - a present `nbf` is not a finite NumericDate or is beyond `clockSkewSec`
  *
  * We DO re-throw `jwks.getKey(kid)` failures because swallowing them would
  * silently accept or reject based on stale data — that's the kind of behavior
@@ -302,9 +303,18 @@ export async function verifyJwt(
   const exp = payload.exp;
   if (typeof exp !== "number" || !Number.isFinite(exp)) return null;
   const leeway = opts.clockSkewSec ?? 60;
-  const now = Math.floor(Date.now() / 1000);
-  // Reject if now is at or past expiry (allowing leeway).
-  if (now >= exp + leeway) return null;
+  const now = Date.now() / 1000;
+  // Preserve the existing whole-second expiry check (allowing leeway).
+  if (Math.floor(now) >= exp + leeway) return null;
+
+  // RFC 7519 §4.1.5: an optional nbf must be a finite NumericDate, and the
+  // token is usable at or after that instant (allowing the same clock skew).
+  // NumericDate permits fractions, so do not round the not-before boundary.
+  const nbf = payload.nbf;
+  if (nbf !== undefined) {
+    if (typeof nbf !== "number" || !Number.isFinite(nbf)) return null;
+    if (now + leeway < nbf) return null;
+  }
 
   // sub — non-empty string (peerId).
   if (typeof payload.sub !== "string" || payload.sub.length === 0) return null;

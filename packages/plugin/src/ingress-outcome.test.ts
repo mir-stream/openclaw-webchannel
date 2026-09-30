@@ -360,7 +360,7 @@ describe("IngressOutcomeStore", () => {
     })).toEqual({ status: "started" });
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-    expect(sendAck).toHaveBeenCalledWith(expect.objectContaining({ peerId: "p", id: "i" }));
+    expect(sendAck).toHaveBeenCalledWith(expect.objectContaining({ peerId: "p", id: "i" }), undefined, true);
     expect(fallback.has("p:i", "a")).toBe(false);
     expect(await store.lookup("a", "p:i")).toEqual({ status: "found", outcome: "cancelled" });
     expect(overloaded.values.has("a:p:i")).toBe(true);

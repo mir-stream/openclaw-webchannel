@@ -154,6 +154,22 @@ export function createDispatchRecovery(options: {
     timer.unref?.();
   }
   return {
+    recordStop(peer: string, key: string, bufferedKeys: readonly string[], cancelBuffered: boolean) {
+      if (!active()) throw new Error("webchannel: dispatch recovery is not active");
+      return store.recordStop(owner!, peer, key, bufferedKeys, cancelBuffered);
+    },
+    signalStop(peer: string) { cancelLegacy(peer); running.get(peer)?.abort(); },
+    publishStop(peer: string, key: string) {
+      let after = 0;
+      try {
+        while (active()) {
+          const changes = store.stopChanges(peer, key, after);
+          notify(changes);
+          if (changes.length < 32) break;
+          after = changes.at(-1)!.seq;
+        }
+      } catch (error) { warn(error); } // Committed journal remains authoritative.
+    },
     start() {
       if (owner || disposed) return;
       owner = store.activate();

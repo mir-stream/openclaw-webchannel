@@ -209,18 +209,6 @@ export const ALLOWED_RAW_INTERPOLATIONS: readonly AllowedRawInterpolation[] = [
   },
   {
     file: "nats-account-runtime.ts",
-    site: "webchannel: /stop dropped buffered input (debounced=, pending=)",
-    expression: "debounceCancelled",
-    reason: "boolean",
-  },
-  {
-    file: "nats-account-runtime.ts",
-    site: "webchannel: /stop dropped buffered input (debounced=, pending=)",
-    expression: "pendingDropped.length",
-    reason: "number",
-  },
-  {
-    file: "nats-account-runtime.ts",
     site: '"warn"event=webchannel.account_cleanup accountId= errors=',
     expression: "disposeReport.errors.length",
     reason: "number",

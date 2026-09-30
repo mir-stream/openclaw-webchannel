@@ -106,3 +106,19 @@ it("a crash before the first core session write leaves no core work to resume", 
   expect(getSessionEntry(h.scope)).toBeUndefined();
   expect(h.journal.dispatch!.lookup("peer", "logical-A")?.state).toBe("interrupted");
 });
+
+it("normal completion retires its own binding while an earlier cancelled batch retains its evidence", () => {
+  const h = fixture();
+  const first = h.journal.dispatch!.lookup("peer", "logical-A")!;
+  const owner = first.owner!;
+  h.journal.dispatch!.recordStop(owner, "peer", "stop-A", [], true);
+  expect(h.journal.dispatch!.settle(owner, "peer", first.batch!, "completed")).toEqual([]);
+  h.journal.dispatch!.accept(owner, "peer", [{ text: "B", turnId: "B", randomId: "logical-B" }]);
+  const second = h.journal.dispatch!.claim(owner, "peer", ["logical-B"])[0]!;
+  prepareCoreDispatch(h.cfg, "main", sessionKey, { owner, batch: second.batch!, peerId: "peer" }, h.journal);
+  expect(h.journal.dispatch!.coreBindings()).toHaveLength(2);
+  expect(h.journal.dispatch!.settle(owner, "peer", second.batch!, "completed")).toHaveLength(1);
+  expect(h.journal.dispatch!.coreBindings().map(binding => binding.batch)).toEqual([first.batch]);
+  expect(h.journal.dispatch!.lookup("peer", "logical-A")?.state).toBe("cancelled");
+  expect(h.journal.dispatch!.lookup("peer", "logical-B")?.state).toBe("completed");
+});

@@ -771,7 +771,7 @@ export function openDeliveryJournal(options: {
   try {
     const meta = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal_meta'").get();
     const version = meta ? db.prepare("SELECT value FROM journal_meta WHERE key='dispatch_schema_version'").get() as { value: string } | undefined : undefined;
-    if (version && version.value !== "1") throw new Error("webchannel: unsupported dispatch schema version; use the writer version or newer");
+    if (version && version.value !== "1" && version.value !== "2") throw new Error("webchannel: unsupported dispatch schema version; use the writer version or newer");
   } catch (error) { closeQuietly(db); throw error; }
 
 
