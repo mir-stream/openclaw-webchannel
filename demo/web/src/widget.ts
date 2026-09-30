@@ -453,7 +453,7 @@ export async function createWidget(
         retry.onclick = () => { client?.retryInterrupted(m.id); };
         bubble.append(el("div", {}, ["Interrupted · result unknown. Check any effects before retrying.", retry]));
       } else if (isUser && m.requestState === "cancelled") {
-        bubble.append(el("div", {}, ["Cancelled"]));
+        bubble.append(el("div", {}, ["Cancelled · the task may have started. Check any effects before sending again."]));
       }
       if (isUser && m.retryOf) bubble.append(el("small", {}, ["Retry of an interrupted request"]));
       bubbles.push(bubble);

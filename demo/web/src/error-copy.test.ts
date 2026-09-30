@@ -5,8 +5,8 @@
  */
 import { describe, expect, it } from "vitest";
 
-import type { WebChannelErrorCause } from "../../../packages/client/src/index.js";
-import { terminalErrorCopy } from "./error-copy.js";
+import type { ChatBubble, WebChannelErrorCause } from "../../../packages/client/src/index.js";
+import { sendStatusCopy, terminalErrorCopy } from "./error-copy.js";
 
 const ALL_CAUSES: WebChannelErrorCause[] = [
   "auth-expired",
@@ -60,5 +60,20 @@ describe("terminalErrorCopy", () => {
     const copy = terminalErrorCopy("capacity");
     expect(copy.heading).toMatch(/full/i);
     expect(copy.hint).toMatch(/operator/i);
+  });
+});
+
+describe("sendStatusCopy cancellation", () => {
+  const bubble = (extra: Partial<ChatBubble>) => ({
+    id: "m", role: "user", text: "x", sendState: "failed", sendFailure: { reason: "cancelled", retryable: false }, ...extra,
+  }) as ChatBubble;
+
+  it("never labels a cancel after acceptance as a failed send", () => {
+    // The durable request line owns the effects warning for this case.
+    expect(sendStatusCopy(bubble({ requestState: "cancelled" }))).toBeUndefined();
+  });
+
+  it("labels a cancel before delivery as not sent", () => {
+    expect(sendStatusCopy(bubble({}))).toEqual({ label: "Not sent · cancelled" });
   });
 });

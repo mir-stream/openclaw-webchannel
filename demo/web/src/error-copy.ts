@@ -107,7 +107,8 @@ export function sendStatusCopy(message: ChatBubble): { label: string; hint?: str
           return { label: `Send failed · ${copy.heading}`, hint: `${copy.hint} Check any effects before sending again.` };
         }
         case "closed": return { label: "Send failed · connection closed", hint: "Delivery is unconfirmed. Check any effects before sending again." };
-        case "cancelled": return { label: "Send failed · cancelled" };
+        // A durable cancel can follow acceptance; the request status line warns about effects.
+        case "cancelled": return message.requestState === "cancelled" ? undefined : { label: "Not sent · cancelled" };
         default: return { label: "Send failed", hint: "Check the connection and any effects before sending again." };
       }
     }
