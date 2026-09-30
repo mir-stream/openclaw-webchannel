@@ -515,6 +515,16 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
       if (ids !== undefined && !isStringArray(ids)) {
         return invalid(known, "ids must be an array of strings");
       }
+      const cancelled = field(raw, "cancelled");
+      if (cancelled !== undefined) {
+        if (!isNonEmptyStringArray(cancelled) || !isStringArray(ids)) {
+          return invalid(known, "cancelled must be an array of non-empty acknowledged ids");
+        }
+        const acknowledged = new Set(ids as string[]);
+        if ((cancelled as string[]).some((id) => !acknowledged.has(id))) {
+          return invalid(known, "cancelled ids must belong to this ack");
+        }
+      }
       const committed = field(raw, "committed");
       if (committed !== undefined) {
         if (!Array.isArray(committed) || !committed.every(isCommittedEcho)) {

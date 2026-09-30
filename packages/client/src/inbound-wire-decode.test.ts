@@ -284,6 +284,18 @@ describe("#246 half A — decodeInboundMessage: the bulk frames", () => {
     accepts({ type: "ack", ids: [] });
     accepts({ type: "ack" });
   });
+
+  it("ack cancellation evidence must contain only nonempty IDs acknowledged in the same frame", () => {
+    for (const cancelled of [null, "u-0", {}, [7], [""], ["foreign"], ["u-0", "foreign"]]) {
+      refuses({ type: "ack", ids: ["u-0"], cancelled });
+    }
+    refuses({ type: "ack", cancelled: ["u-0"] });
+    refuses({ type: "ack", ids: [], cancelled: ["u-0"] });
+    accepts({ type: "ack", ids: ["u-0", "u-1"], cancelled: ["u-1"],
+      committed: [{ random_id: "r-0", messageId: "m-0", seq: 8 }] });
+    accepts({ type: "ack", ids: ["u-0"], cancelled: ["u-0", "u-0"] });
+    accepts({ type: "ack", ids: [], cancelled: [] });
+  });
 });
 
 describe("#246 half A — isWireSeq / isCommittedEcho", () => {
