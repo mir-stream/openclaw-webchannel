@@ -423,7 +423,9 @@ export async function createWidget(
       // the renderer handles line breaks itself, so no pre-wrap (it'd double up).
       let child: Node | string;
       if (isUser) {
-        child = m.text;
+        // Own leaf: send-status children must not hide the text from exact-leaf
+        // drivers (verify-multidevice.mjs counts `#chat-body div` text leaves).
+        child = el("div", {}, [m.text]);
       } else {
         const key = `${m.id}\n${m.text}`;
         const rendered = mdCache.get(key) ?? renderMarkdown(m.text);
