@@ -7,7 +7,9 @@
 - Recover accepted, unsettled local turns after a plugin-only restart even when
   the relay remains healthy. The existing `ackStallTimeoutMs` policy now watches
   authenticated application activity after ACK and refreshes registration and
-  history/difference state on silence. Accepted tasks are never republished or
+  history/difference state once per silent interval; only new live activity or
+  a newly accepted send re-arms the watch, so a long silent turn does not cause
+  repeated reconnects. Accepted tasks are never republished or
   failed by the timeout; server settlement, close, and terminal errors retire the
   watch. Idle tabs remain unpolled, and `0` disables the new watch as well.
 - Consume protocol 6 `ack.cancelled` evidence before acceptance callbacks, so an

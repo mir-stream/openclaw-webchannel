@@ -138,16 +138,58 @@ describe("accepted-turn application recovery", () => {
     },
   );
 
-  it("continues watching a silent accepted turn across successful registrations without resending or settling it", async () => {
+  async function recoveredOnce() {
     const h = await setup({ timeout: 80 });
     const receipt = h.wrapper.send("silent operation")!;
-    await settleUntil(() => h.control.registrations >= 3 && h.wrapper.getState().connected,
-      { label: "second active-turn recovery" });
-    expect(receipt.snapshot().state).toBe("accepted");
+    await settleUntil(() => h.control.registrations === 2 && h.wrapper.getState().connected,
+      { label: "one active-turn recovery" });
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+    return { ...h, receipt };
+  }
+
+  it("recovers a silent accepted turn once, then keeps it without looping, resending, or settling it", async () => {
+    const h = await recoveredOnce();
+    // Recovery is not activity: the replacement session must not re-arm the watch.
+    await new Promise((resolve) => setTimeout(resolve, 5 * 80));
+    expect(h.control.registrations).toBe(2);
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+    expect(h.receipt.snapshot().state).toBe("accepted");
     expect(h.received).toHaveLength(1);
     h.deliver({ type: "turn_settled", turnId: h.received[0]!.id, outcome: "ok" });
-    expect(receipt.snapshot().state).toBe("completed");
+    expect(h.receipt.snapshot().state).toBe("completed");
     expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+  });
+
+  it.each([
+    { type: "typing" },
+    { type: "progress", id: "draft", text: "still running" },
+    { type: "request_state", id: "remote-user", turnId: "remote-B", state: "started" },
+  ] satisfies InboundMessage[])("re-enables the one-shot watch after recovery on live $type activity", async (frame) => {
+    const h = await recoveredOnce();
+    await new Promise((resolve) => setTimeout(resolve, 3 * 80));
+    expect(h.control.registrations).toBe(2);
+    h.deliver(frame);
+    expect(inside(h.wrapper).activeTurnStallTimer).not.toBeNull();
+    await settleUntil(() => h.control.registrations === 3 && h.wrapper.getState().connected,
+      { label: "recovery after new activity" });
+    await new Promise((resolve) => setTimeout(resolve, 5 * 80));
+    expect(h.control.registrations).toBe(3);
+    expect(h.receipt.snapshot().state).toBe("accepted");
+    expect(h.received).toHaveLength(1);
+  });
+
+  it("re-enables the one-shot watch after recovery when a new send is accepted", async () => {
+    const h = await recoveredOnce();
+    await new Promise((resolve) => setTimeout(resolve, 3 * 80));
+    expect(h.control.registrations).toBe(2);
+    const next = h.wrapper.send("next operation")!;
+    expect(next.snapshot().state).toBe("accepted");
+    expect(inside(h.wrapper).activeTurnStallTimer).not.toBeNull();
+    await settleUntil(() => h.control.registrations === 3 && h.wrapper.getState().connected,
+      { label: "recovery after new accepted turn" });
+    await new Promise((resolve) => setTimeout(resolve, 5 * 80));
+    expect(h.control.registrations).toBe(3);
+    expect(h.received).toHaveLength(2);
   });
 
   it("consumes a lost cancellation ACK on replacement replay without watching an absent journal row", async () => {

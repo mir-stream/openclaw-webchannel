@@ -139,9 +139,10 @@ existing ordered recovery drain. It then checks the reconciled work once; newer
 typing or a connection lifecycle change discards the old cleanup decision.
 Cancellation receipt acceptance and exact activity-watch retirement stay immediate.
 
-A legitimately silent accepted turn can cause another reconnect each interval;
-a held-only episode still requests at most one. Raise the timeout or set it to `0`
-for workloads where long silent turns are normal. The watchdogs share the existing
+Like a held-only episode, a silent accepted turn requests at most one reconnect
+per silent interval: recovery itself is not activity, so the watch re-arms only
+after new live activity or a newly accepted send. A second plugin restart during
+the same silent turn is therefore detected at the next activity frame. The watchdogs share the existing
 recovery path so coincident deadlines do not start duplicate reconnects. A completely
 idle tab has no active-work signal and is not proactively probed by this mode.
 

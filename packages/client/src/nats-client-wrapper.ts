@@ -919,6 +919,12 @@ export class WebChannelNATSClient {
   private cancellationTypingCleanupDepth = 0;
   private activeTurnStallTimer: ReturnType<typeof setTimeout> | null = null;
   private activeTurnStallGeneration = 0;
+  /**
+   * One recovery per silent interval, like the held lane: recovery itself is
+   * not activity, so re-arming on each replacement session would loop. Only new
+   * evidence (live activity, a newly accepted turn, teardown) re-enables it.
+   */
+  private activeTurnRecoveryIssued = false;
   /** Defers held-admission UI fanout until the first owner's timer commit ends. */
   private heldAdmissionNotificationDepth = 0;
   private heldAdmissionNotificationPending = false;
@@ -1171,6 +1177,7 @@ export class WebChannelNATSClient {
       this.wrapperLifecycleGeneration++;
       this.deferredCancelledTyping = undefined;
       this.applicationTurns.clear();
+      this.activeTurnRecoveryIssued = false;
       this.cancelActiveTurnStallTimer();
       const deferredEntries = this.deferredReplacementOperations.splice(0);
       // P0-4 (D5 held/terminal): the queued/ledgered sends were already swept to
@@ -1294,6 +1301,7 @@ export class WebChannelNATSClient {
     this.closeTransactionDepth++;
     try {
       this.applicationTurns.clear();
+      this.activeTurnRecoveryIssued = false;
       // Detach only this lifecycle's wrapper ownership before any timer or raw
       // teardown callout. Work created after a reentrant connect is replacement
       // ownership and remains in the live collections.
@@ -2136,6 +2144,8 @@ export class WebChannelNATSClient {
       this.cancelActiveTurnStallTimer();
       return;
     }
+    // The issued recovery owns this silent interval until new evidence clears it.
+    if (this.activeTurnRecoveryIssued) return;
     if (!reset && this.activeTurnStallTimer !== null) return;
     const lifecycle = this.wrapperLifecycleGeneration;
     const generation = this.cancelActiveTurnStallTimer();
@@ -2146,6 +2156,7 @@ export class WebChannelNATSClient {
       if (!current()) return;
       this.activeTurnStallTimer = null;
       this.activeTurnStallGeneration++;
+      this.activeTurnRecoveryIssued = true;
       // The shared recovery path consumes unacked recovery; its raw-loss edge
       // cancels both wrapper watchdogs before any replacement session can arm.
       // ACKed payloads are absent from the replay ledger and are never resent.
@@ -2174,6 +2185,7 @@ export class WebChannelNATSClient {
       case "request_state":
       case "approval_request":
       case "approval_resolved":
+        this.activeTurnRecoveryIssued = false;
         this.refreshActiveTurnWatch(true);
     }
   }
@@ -3525,6 +3537,8 @@ export class WebChannelNATSClient {
           }
         }
         if (next.state === "accepted" && rec.wireId && this.applicationTurns.has(rec.wireId)) {
+          // A newly accepted turn is new work, not the recovered silent one.
+          this.activeTurnRecoveryIssued = false;
           this.refreshActiveTurnWatch(true);
         } else if (!this.hasAcceptedApplicationTurn()) {
           this.cancelActiveTurnStallTimer();
