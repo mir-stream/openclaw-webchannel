@@ -41,7 +41,12 @@ fail closed.
 The rate-limited diagnostic identifies `category=legacy-ambiguous` and
 `action=retry-fail-closed`, without including the peer or logical ID. The
 availability consequence is limited to ambiguous historical IDs: those replays
-remain unresolved while unrelated new IDs and tenant-scoped traffic work.
+remain unresolved while unrelated new IDs and tenant-scoped traffic work. An
+ambiguous ID does not hold back other IDs from the same peer, even in the same
+flush; only transient storage faults act as a same-flush ordering barrier.
+Because an ambiguous ID is never acknowledged, a browser tab that still holds
+it unacknowledged keeps triggering the client's ack-stall recovery (reconnect)
+until the tab is reloaded or the legacy marker expires.
 Existing SDK expiry and capacity behavior is unchanged (the production dedupe
 TTL remains seven days); reads do not extend the original marker lifetime.
 This change neither introduces a retention policy nor restores evidence already

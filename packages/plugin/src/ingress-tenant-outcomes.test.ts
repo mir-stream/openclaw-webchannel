@@ -269,6 +269,33 @@ it.each(["accepted", "cancelled", "overloaded"] as const)("holds ambiguous legac
   expect(await cold.store.lookup(B, KEY)).toMatchObject({ status: "unknown" });
 });
 
+it.each(["accepted", "cancelled", "overloaded"] as const)("does not let an ambiguous legacy %s ID hold back a fresh same-peer ID in the same flush", async outcome => {
+  const path = root(); const p = persistence(path);
+  await record(p.store, A.accountId, outcome);
+  const a = runtime(path, A, p);
+  await a.flush([item(), item("new", "fresh")]); await a.idle();
+  expect(a.runs.map(run => run.random_id)).toEqual(["fresh"]);
+  expect(a.acks.map(ack => ack.ids)).toEqual([["new"]]);
+  expect(a.acks[0].committed?.map(row => row.random_id)).toEqual(["fresh"]);
+  expect(a.rejected).toEqual([]);
+  expect(a.journal.read("peer").filter(row => row.event.kind === "user")).toHaveLength(1);
+  expect(await p.store.lookup(A, KEY)).toMatchObject({ status: "unknown", error: expect.any(LegacyIngressOutcomeAmbiguity) });
+});
+
+it("keeps a transient legacy read fault as a same-flush barrier for later IDs", async () => {
+  const path = root(); const p = persistence(path);
+  const hasRecent = p.raw.cancelled.hasRecent.bind(p.raw.cancelled);
+  vi.spyOn(p.raw.cancelled, "hasRecent").mockImplementation(async (key, options) => {
+    if (options?.namespace === A.accountId && key === KEY) throw new Error("legacy state unavailable");
+    return hasRecent(key, options);
+  });
+  const a = runtime(path, A, p);
+  await a.flush([item(), item("new", "fresh")]); await a.idle();
+  expect(a.runs).toEqual([]); expect(a.acks).toEqual([]); expect(a.rejected).toEqual([]);
+  expect(a.journal.read("peer")).toEqual([]);
+  expect(p.warnings.some(line => line.includes("category=lookup-legacy"))).toBe(true);
+});
+
 it.each(["accepted", "cancelled", "overloaded"] as const)("uses only exact tuple journal acceptance ahead of legacy %s, including overflow and cold reopen", async outcome => {
   const path = root(); const p = persistence(path);
   await record(p.store, A.accountId, outcome);

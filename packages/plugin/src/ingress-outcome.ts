@@ -141,6 +141,12 @@ export class LegacyIngressOutcomeAmbiguity extends Error {
   }
 }
 
+/** Code-based check so a duplicated module instance still matches. */
+export function isLegacyIngressOutcomeAmbiguity(error: unknown): boolean {
+  return typeof error === "object" && error !== null
+    && (error as { code?: unknown }).code === "legacy-ingress-outcome-ambiguous";
+}
+
 export interface OutcomeWriteReceipt {
   readonly outcome: IngressOutcome;
   readonly created: boolean;

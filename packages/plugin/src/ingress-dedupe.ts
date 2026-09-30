@@ -34,8 +34,10 @@ import type { DispatchRecovery } from "./dispatch-recovery.js";
  *
  * Production uses tenant/account storage identity for every outcome. Historical
  * account-only markers (including accepted markers that may be old cancellations)
- * remain ambiguous: without tuple journal proof they hold replay for retry,
- * never authorize a result or a turn. They are neither adopted nor refreshed.
+ * remain ambiguous: without tuple journal proof they stay unresolved (no ACK,
+ * rejection, or turn) and never authorize a result. Unlike transient storage
+ * faults they are not a FIFO barrier: later IDs in the same flush still run.
+ * They are neither adopted nor refreshed.
  * New scoped accepted markers without a row still take the orphan-repair path.
  *
  * This repair also does not cover:
@@ -908,6 +910,10 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           }
           if (existing.status === "unknown") {
             release();
+            // Legacy ambiguity is not transient: this build can never admit the
+            // ID while its account-only marker lives, so there is nothing to
+            // order behind it. Leave it unresolved without stalling the suffix.
+            if (isLegacyIngressOutcomeAmbiguity(existing.error)) continue;
             fifoBlocked = true;
             continue;
           }
@@ -1733,7 +1739,7 @@ import type {
   OutcomeRecordResult,
   OutcomeWriteReceipt,
 } from "./ingress-outcome.js";
-import { createRateLimitedOutcomeFailureWarning } from "./ingress-outcome.js";
+import { createRateLimitedOutcomeFailureWarning, isLegacyIngressOutcomeAmbiguity } from "./ingress-outcome.js";
 import { createIngressResultChunkWriter } from "./ingress-result-chunks.js";
 import type { IngressResultFrame } from "./ingress-result-chunks.js";
 // #123: peer ids and message ids reach these log lines straight off the wire.
