@@ -645,19 +645,22 @@ function isExecApprovalsEnabled(cfg: OpenClawConfig, accountId?: string | null):
  * (mirrors Discord's exec-approvals.ts):
  *   1. channels.webchannel.execApprovals.approvers (typed array of peer ids)
  *   2. commands.ownerAllowFrom (global fallback)
- * Webchannel peer ids are arbitrary verified strings (the verifier's peerId),
- * so no normalization is needed beyond trim+drop-empty (cf. Discord's numeric
- * user-id parsing). resolveApprovalApprovers also dedupes.
+ * Explicit approvers are literal peer ids (trimmed). The global owner fallback
+ * follows command-gate.ts: bare ids apply here, `webchannel:` is stripped, and
+ * other channel prefixes are excluded. Peer identity remains case-sensitive;
+ * `*` keeps its account-scoped meaning. resolveApprovalApprovers also dedupes.
  */
 export function getWebChannelExecApprovalApprovers(params: {
   cfg: OpenClawConfig;
   accountId?: string | null;
 }): string[] {
   const explicit = readExecApprovals(params.cfg, params.accountId)?.approvers;
-  const source: readonly (string | number)[] =
-    Array.isArray(explicit) && explicit.length > 0
-      ? explicit
-      : (params.cfg.commands?.ownerAllowFrom ?? []);
+  // A nonempty explicit list still wins even if every entry is invalid. Do not
+  // turn an invalid explicit list into a broader owner/wildcard fallback.
+  const useExplicit = Array.isArray(explicit) && explicit.length > 0;
+  const source: readonly (string | number)[] = useExplicit
+    ? explicit
+    : (params.cfg.commands?.ownerAllowFrom ?? []);
   return resolveApprovalApprovers({
     explicit: source,
     normalizeApprover: (value) => {
@@ -665,6 +668,13 @@ export function getWebChannelExecApprovalApprovers(params: {
       // peer ids, so drop them (schema permits numbers only for cross-channel
       // config reuse like Discord/Telegram user ids).
       const s = typeof value === "string" ? value.trim() : "";
+      if (!useExplicit) {
+        const sep = s.indexOf(":");
+        if (sep > 0) {
+          if (s.slice(0, sep).trim().toLowerCase() !== WEBCHANNEL_ID) return undefined;
+          return s.slice(sep + 1).trim() || undefined;
+        }
+      }
       return s.length > 0 ? s : undefined;
     },
   });

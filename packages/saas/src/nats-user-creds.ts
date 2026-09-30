@@ -44,6 +44,10 @@ import { encodeUser, decode, type User } from "@nats-io/jwt";
 import { assertValidSubjectToken } from "./subject-token.js";
 import type { BrowserCredentialLedger } from "./browser-credential-ledger.js";
 
+// nats-server converts (exp - now) seconds to an int64 nanosecond time.Duration.
+// floor((2^63 - 1) / 1e9) is its largest whole-second lifetime without overflow.
+const MAX_NATS_USER_TTL_SECONDS = 9_223_372_036;
+
 /**
  * Logical role of the minted peer. Unlike the original design (perms identical
  * across roles), the role now DETERMINES the subject scope — see the module
@@ -80,7 +84,9 @@ export type MintNatsUserCredsOptions = {
    */
   issuerAccountId?: string;
   /**
-   * Optional lifetime (seconds) → the user JWT's `exp` claim. Omit for a
+   * Optional positive safe-integer lifetime (seconds) → the user JWT's `exp`
+   * claim, which must also be a positive safe integer. At most 9_223_372_036
+   * seconds (the relay's signed 64-bit nanosecond timer limit). Omit for a
    * non-expiring credential (the original behavior, byte-for-byte). When set, the
    * relay refuses the credential once it lapses; the client classifies the
    * resulting `-ERR Authentication Expired` as TERMINAL and surfaces a re-auth
@@ -120,6 +126,24 @@ export async function mintNatsUserCreds(
   opts: MintNatsUserCredsOptions,
 ): Promise<MintedNatsUserCreds> {
   const role = opts.role ?? "browser";
+  // NATS reads exp as an integer. Validate both the TTL and the calculated
+  // timestamp before minting, regardless of role or issuance-ledger usage.
+  const ttlSeconds = opts.ttlSeconds;
+  let exp: number | undefined;
+  if (ttlSeconds !== undefined) {
+    if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds <= 0) {
+      throw new Error(
+        "mintNatsUserCreds: ttlSeconds must be a finite positive number of whole seconds within the safe integer range",
+      );
+    }
+    exp = Math.floor(Date.now() / 1000) + ttlSeconds;
+    if (!Number.isSafeInteger(exp) || exp <= 0) {
+      throw new Error("mintNatsUserCreds: ttlSeconds must produce a positive safe integer exp timestamp");
+    }
+    if (ttlSeconds > MAX_NATS_USER_TTL_SECONDS) {
+      throw new Error(`mintNatsUserCreds: ttlSeconds exceeds the NATS expiration timer limit of ${MAX_NATS_USER_TTL_SECONDS} seconds`);
+    }
+  }
   // Reject any tenant that would break the subject hierarchy before it is
   // spliced into the `webchannel.{tenant}.>` permission grant.
   assertValidSubjectToken(opts.tenant, "tenant");
@@ -183,7 +207,6 @@ export async function mintNatsUserCreds(
   // Self-contained mode: no signer → `iss` = account public, no issuer_account.
   // Optional expiry → the JWT `exp` claim (unix seconds). Undefined ttl keeps the
   // original non-expiring behavior.
-  const exp = opts.ttlSeconds ? Math.floor(Date.now() / 1000) + opts.ttlSeconds : undefined;
   const userJwt = opts.issuerAccountId
     ? await encodeUser(
         `${role}-${opts.tenant}`,
@@ -253,10 +276,11 @@ export type IssueBrowserCredentialsOptions = {
    */
   issuerAccountId?: string;
   /**
-   * Optional lifetime (seconds). When set it MUST be a finite positive number —
-   * a `0`/negative/NaN/Infinity value would mint a NON-expiring or malformed-exp
-   * credential (a footgun), so this wrapper rejects it. Omit for a non-expiring
-   * credential.
+   * Optional lifetime in whole seconds. Must be a positive safe integer and
+   * produce a positive safe-integer `exp` timestamp; fractional, non-finite,
+   * non-positive or out-of-range values are rejected before minting. At most
+   * 9_223_372_036 seconds (the relay's expiration timer limit). Omit for a
+   * non-expiring credential. A ledger can impose stricter timestamp bounds.
    */
   ttlSeconds?: number;
   /**
@@ -304,8 +328,9 @@ function decodeMintedUserClaim(userJwt: string): { sub: string; iat: number; exp
  * Mint browser-login NATS credentials — the first public path for issuing a
  * per-peer-scoped browser credential (`role:"browser"`, pinned to
  * `webchannel.{tenant}.*.{peerId}.>`). A thin, safe wrapper over the internal
- * `mintNatsUserCreds`: `peerId` is type-required, `ttlSeconds` (if present) must
- * be `> 0`, and only the browser-relevant fields are returned ({@link BrowserCredentials}).
+ * `mintNatsUserCreds`: `peerId` is type-required, `ttlSeconds` (if present) and
+ * the resulting `exp` must be positive safe integers, and only the
+ * browser-relevant fields are returned ({@link BrowserCredentials}).
  *
  * The raw NKEY mint / role selection stays internal — an operator can only ever
  * mint a correctly-scoped browser credential through this door.
@@ -328,13 +353,6 @@ export async function issueBrowserCredentials(
   // pending options object must not bind a JWT minted for one peer to a ledger
   // row naming another.
   const { accountSeed, tenant, peerId, issuerAccountId, ttlSeconds, ledger, accountContext } = o;
-  if (ttlSeconds !== undefined && !(Number.isFinite(ttlSeconds) && ttlSeconds > 0)) {
-    // NaN/Infinity/fractional-or-negative all slip past a naive `<= 0` check and
-    // would mint a silently non-expiring or malformed-exp credential.
-    throw new Error(
-      "issueBrowserCredentials: ttlSeconds must be a finite positive number when provided (0/NaN/Infinity/negative would mint a non-expiring or malformed credential)",
-    );
-  }
   if (!peerId) {
     throw new Error("issueBrowserCredentials: peerId is required (the authenticated session subject)");
   }
@@ -351,7 +369,7 @@ export async function issueBrowserCredentials(
     tenant,
     peerId,
     ...(issuerAccountId ? { issuerAccountId } : {}),
-    ...(ttlSeconds ? { ttlSeconds } : {}),
+    ...(ttlSeconds !== undefined ? { ttlSeconds } : {}),
   });
   if (binding) {
     const claim = decodeMintedUserClaim(minted.userJwt);
