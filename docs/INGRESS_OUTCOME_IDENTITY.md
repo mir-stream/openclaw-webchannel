@@ -46,7 +46,9 @@ ambiguous ID does not hold back other IDs from the same peer, even in the same
 flush; only transient storage faults act as a same-flush ordering barrier.
 Because an ambiguous ID is never acknowledged, a browser tab that still holds
 it unacknowledged keeps triggering the client's ack-stall recovery (reconnect)
-until the tab is reloaded or the legacy marker expires.
+until the tab is reloaded or the legacy marker expires. Once the legacy marker
+expires, a replay of that ID is admitted as a fresh turn, after any same-peer
+IDs admitted in the meantime.
 Existing SDK expiry and capacity behavior is unchanged (the production dedupe
 TTL remains seven days); reads do not extend the original marker lifetime.
 This change neither introduces a retention policy nor restores evidence already

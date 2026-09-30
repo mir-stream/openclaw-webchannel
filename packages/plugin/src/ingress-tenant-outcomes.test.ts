@@ -418,6 +418,20 @@ it.each(["callback", "throw"])("holds unproven replay on legacy read %s failure 
   expect(p.warnings.some(line => line.includes("category=lookup-legacy"))).toBe(true);
 });
 
+it("names the wire account, not the tenant namespace, in scoped storage fault warnings", async () => {
+  const p = persistence(root());
+  const hasRecent = p.raw.cancelled.hasRecent.bind(p.raw.cancelled);
+  vi.spyOn(p.raw.cancelled, "hasRecent").mockImplementation(async (key, options) => {
+    if (options?.namespace !== ingressScopeNamespace(A)) return hasRecent(key, options);
+    options.onDiskError?.(new Error("scoped state unavailable")); return false;
+  });
+  expect(await p.store.lookup(A, KEY)).toMatchObject({ status: "unknown" });
+  expect(p.warnings).toHaveLength(1);
+  expect(p.warnings[0]).toContain(`account=${A.accountId} category=lookup-cancelled`);
+  expect(p.warnings[0]).not.toContain("<redacted>");
+  expect(p.warnings[0]).not.toContain("v2_");
+});
+
 it.each(["accepted", "cancelled", "overloaded"] as const)("does not renew the existing legacy %s TTL while holding ambiguous replay", async outcome => {
   const path = root(); const start = Date.now();
   const now = vi.spyOn(Date, "now").mockReturnValue(start);
