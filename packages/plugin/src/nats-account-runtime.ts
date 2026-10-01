@@ -65,6 +65,7 @@ import {
   listPendingApprovalsForPeer,
   listResolvedApprovalsForPeer,
   ApprovalBindingMissingError,
+  approvalDecisionRejectReason,
 } from "./approvals.js";
 import type { ResolvedJwtVerifierConfig } from "./auth.js";
 import { formatAccountReadiness, type JwksReadiness } from "./preflight.js";
@@ -78,6 +79,7 @@ import { resolveHistoryConfig } from "./history.js";
 import { createHistoryServer, type HistoryServer } from "./history-serve.js";
 import { createCommandCatalogProvider } from "./commands-catalog.js";
 import { WEBCHANNEL_ID, NullPeerChannel } from "./channel-contract.js";
+import type { ApprovalDecision, ApprovalDecisionRejectReason } from "./channel-contract.js";
 import {
   NatsConnectionClosedError,
   type NatsTransport,
@@ -1251,17 +1253,38 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // S1: pass THIS account's id so the fail-closed approver check reads the
       // account's own `execApprovals.approvers` — a peer who is an approver on
       // another account cannot resolve approvals via this account's channel.
+      const notifyApprovalDecisionRejected = (
+        peerId: string,
+        id: string,
+        decision: ApprovalDecision,
+        reason: ApprovalDecisionRejectReason,
+      ): void => {
+        if (!runtimeActive) return;
+        try {
+          channel.sendApprovalDecisionRejected(peerId, id, decision, reason);
+        } catch (err) {
+          api.logger.warn?.(`webchannel: approval rejection notice failed (${logSafe(id)}): ${logSafe(err)}`);
+        }
+      };
       channel.setApprovalDecisionHandler((peerId, id, decision) => {
         void handleApprovalDecision(api.config, id, decision, peerId, accountId).catch((err) => {
           // A missing delivery binding is EXPECTED in normal multi-device flows
           // (a Leg C snapshot re-send racing a finalize, or two devices both
           // clicking) — log it at warn, not error. Genuine authz rejections
           // (non-approver, cross-account) stay at error.
+          //
+          // #400: both are PROOF the click was not applied, so the peer is told
+          // (the server, not the app, owns the outcome). Any other failure is
+          // the gateway RPC, which may have applied — no proof, no frame
+          // (`approvalDecisionRejectReason` returns undefined); the next
+          // register's snapshot reconciles that card.
           if (err instanceof ApprovalBindingMissingError) {
             api.logger.warn?.(`webchannel: approval resolve ignored (${logSafe(id)}): ${logSafe(err.message)}`);
           } else {
             api.logger.error?.(`webchannel: approval resolve failed (${logSafe(id)}): ${logSafe(err)}`);
           }
+          const reason = approvalDecisionRejectReason(err);
+          if (reason !== undefined) notifyApprovalDecisionRejected(peerId, id, decision, reason);
         });
       });
 

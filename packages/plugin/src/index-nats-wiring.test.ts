@@ -467,6 +467,18 @@ describe("index-nats.ts wiring contract — approval decision account routing", 
       /setApprovalDecisionHandler\(\(peerId, id, decision\) =>[\s\S]*?handleApprovalDecision\(api\.config, id, decision, peerId, accountId\)/,
     );
   });
+
+  it("#400: tells the peer about every PROVEN refusal, through the tested mapper", () => {
+    // `approvalDecisionRejectReason` (approvals.test.ts) decides WHICH failures
+    // are refusals; this pins that the handler's catch actually consults it and
+    // publishes on the account channel with the click's own decision.
+    expect(RUNTIME_SOURCE).toMatch(
+      /handleApprovalDecision\(api\.config, id, decision, peerId, accountId\)\.catch\(\(err\) => \{[\s\S]*?const reason = approvalDecisionRejectReason\(err\);\s*if \(reason !== undefined\) notifyApprovalDecisionRejected\(peerId, id, decision, reason\);/,
+    );
+    expect(RUNTIME_SOURCE).toMatch(
+      /channel\.sendApprovalDecisionRejected\(peerId, id, decision, reason\)/,
+    );
+  });
 });
 
 describe("index-nats.ts browser-route absence", () => {

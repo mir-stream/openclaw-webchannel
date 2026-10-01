@@ -66,6 +66,7 @@ export const KNOWN_INBOUND_TYPES = [
   "approval_request",
   "approval_resolved",
   "approval_snapshot",
+  "approval_decision_rejected",
   "typing",
   "history",
   "commands",
@@ -440,6 +441,20 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
       if (resolved !== undefined && !isArrayOfRecords(resolved)) {
         return invalid(known, "resolved must be an array of objects");
       }
+      return accept(raw);
+    }
+
+    case "approval_decision_rejected": {
+      // #400. `decision` is STRICT: the wrapper matches it against the card's
+      // optimistic guess, so an unknown value could only ever match nothing.
+      // `reason` is any non-empty string — an unknown one from a newer plugin
+      // still proves the click was refused, and the wrapper handles it as the
+      // generic undo.
+      if (!isNonEmptyString(field(raw, "id"))) return invalid(known, "id must be non-empty");
+      if (!APPROVAL_DECISIONS.has(field(raw, "decision") as string)) {
+        return invalid(known, "decision must be allow-once, allow-always or deny");
+      }
+      if (!isNonEmptyString(field(raw, "reason"))) return invalid(known, "reason must be non-empty");
       return accept(raw);
     }
 

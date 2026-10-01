@@ -39,6 +39,8 @@ import {
   isWebChannelExecApprovalApprover,
   __approvalAccountBindingTestHook,
   ApprovalBindingMissingError,
+  approvalDecisionRejectReason,
+  ApprovalDecisionForbiddenError,
   listPendingApprovalsForPeer,
   PENDING_APPROVAL_MAX_AGE_MS,
   PENDING_APPROVAL_CAP,
@@ -1115,6 +1117,45 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
       handleApprovalDecision(cfgTwoAccounts, "exec-ghost", "deny", "bob", "b"),
     ).rejects.toThrow(/unknown or already resolved/);
     expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
+  });
+
+  it("#400: every pre-RPC refusal maps to the reason the peer is told; an RPC failure maps to none", async () => {
+    const reasonOf = async (call: Promise<void>) => {
+      try {
+        await call;
+      } catch (err) {
+        return approvalDecisionRejectReason(err);
+      }
+      throw new Error("expected a rejection");
+    };
+    resolveApprovalOverGateway.mockClear();
+    __approvalAccountBindingTestHook.clear();
+    // Binding missing — already resolved / expired / never delivered here.
+    expect(await reasonOf(handleApprovalDecision(cfgTwoAccounts, "exec-ghost", "deny", "bob", "b")))
+      .toBe("not-pending");
+    // Delivered on a, decided on b's channel. Collapsed into `not-approver` on
+    // purpose — information minimisation: a distinct reason would tell an
+    // approver replaying a foreign id that it is live on another account.
+    __approvalAccountBindingTestHook.record("exec-a9", "a");
+    expect(await reasonOf(handleApprovalDecision(cfgTwoAccounts, "exec-a9", "allow-once", "bob", "b")))
+      .toBe("not-approver");
+    // ann approves on a only.
+    __approvalAccountBindingTestHook.record("exec-b4", "b");
+    expect(await reasonOf(handleApprovalDecision(cfgTwoAccounts, "exec-b4", "deny", "ann", "b")))
+      .toBe("not-approver");
+    expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
+    // The authz refusals are still logged exactly as the plain `Error`s they
+    // replaced: `logSafe(err)` renders `String(err)`, which leads with `name`.
+    const forbidden = await handleApprovalDecision(cfgTwoAccounts, "exec-b4", "deny", "ann", "b")
+      .then(() => undefined, (err: unknown) => err);
+    expect(forbidden).toBeInstanceOf(ApprovalDecisionForbiddenError);
+    expect(String(forbidden)).toBe(
+      'Error: webchannel: peer "ann" is not a configured exec approver for account "b"',
+    );
+    // The gateway RPC may have applied (a timeout), so it is NOT a refusal.
+    resolveApprovalOverGateway.mockRejectedValueOnce(new Error("gateway timeout"));
+    expect(await reasonOf(handleApprovalDecision(cfgTwoAccounts, "exec-b4", "deny", "bob", "b")))
+      .toBeUndefined();
   });
 
   it("F1: a finalize (updateEntry) releases the binding so a later replay is rejected", async () => {

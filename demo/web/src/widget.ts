@@ -226,6 +226,15 @@ export async function createWidget(
               ]),
             ]
           : []),
+        // #400: the server refused this device's decision; the card shows the
+        // server's state again, and this says why the click did not land.
+        ...(a.decisionRejectedReason !== undefined
+          ? [
+              el("div", { style: "font-size:11px;color:var(--bad);margin-top:6px" }, [
+                `Decision not applied: ${a.decisionRejectedReason}`,
+              ]),
+            ]
+          : []),
       ],
     );
   }

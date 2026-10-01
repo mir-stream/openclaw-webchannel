@@ -178,6 +178,9 @@ export type InboundMessage = {
     | "approval_resolved"
     // #15: authoritative pending-approval snapshot (carries `approvals`).
     | "approval_snapshot"
+    // #400: the plugin REFUSED this device's `approval_decision` (carries
+    // `id`/`decision`/`reason`). Ephemeral; the wrapper undoes the optimistic mark.
+    | "approval_decision_rejected"
     | "typing"
     | "history"
     // P0-3: slash-command discovery catalog (carries `commands`).
@@ -214,7 +217,12 @@ export type InboundMessage = {
    * IGNORED in half A; declared optional here so the loose wire shape typechecks.
    */
   committed?: Array<{ random_id: string; messageId: string; seq?: number }>;
-  reason?: "overloaded";
+  /**
+   * `"overloaded"` on `inbound_rejected`; on `approval_decision_rejected` (#400)
+   * one of `"not-approver" | "not-pending"` today, and any
+   * other non-empty string from a newer plugin.
+   */
+  reason?: string;
   text?: string;
   turnId?: string;
   /**

@@ -307,6 +307,23 @@ export type ApprovalRequestPayload = {
   expiresAtMs?: number;
 };
 
+/**
+ * #400: why the plugin REFUSED an `approval_decision` before it reached the
+ * gateway — i.e. the decision was definitely NOT applied by that click.
+ *
+ *  - `not-approver` — the sender may not resolve this approval through this
+ *    account's channel: not in its approver set, OR the approval was
+ *    delivered on another account. The two are ONE reason on purpose — a
+ *    distinct cross-account answer would tell a replaying approver that the id
+ *    is live on some other account. The server log keeps them apart.
+ *  - `not-pending` — no live delivery binding: already resolved, expired, or
+ *    never delivered here. Telegram's "no longer pending" terminal receipt.
+ *
+ * A gateway RPC failure is NOT reported here: it may have applied (a timeout),
+ * so it is not a proof of refusal.
+ */
+export type ApprovalDecisionRejectReason = "not-approver" | "not-pending";
+
 export type InboundWsMessage =
   // #243 half 1: `random_id` is the client's idempotency key — a fresh token the
   // client mints per logical user message and reuses on every retry. The plugin's
@@ -557,6 +574,20 @@ export type OutboundWsMessage =
   | ({ type: "approval_request"; /** #244 half A — see `agent_message`. */ seq?: number } & ApprovalRequestPayload)
   | { type: "approval_resolved"; id: string; decision: ApprovalDecision; /** #244 half A — see `agent_message`. */ seq?: number }
   | { type: "approval_snapshot"; approvals: ApprovalRequestPayload[]; resolved?: Array<{ id: string; decision: ApprovalDecision }> }
+  /**
+   * #400: the plugin refused an `approval_decision` (see
+   * `ApprovalDecisionRejectReason`). Telegram answers the callback query; our
+   * devices share one `.out`, so the frame echoes `id` AND the refused
+   * `decision` and the client acts only on a card still showing that exact
+   * decision optimistically — a device that did not click, or whose card the
+   * server already confirmed, ignores it.
+   *
+   * NOT durable, NOT seq-bearing: it reports one click's fate, not a transcript
+   * change. No protocol bump: a peer that drops it keeps an unconfirmed guess,
+   * which the next register's `approval_snapshot` reconciles without ever
+   * confirming it — ignoring the frame costs feedback, not correctness.
+   */
+  | { type: "approval_decision_rejected"; id: string; decision: ApprovalDecision; reason: ApprovalDecisionRejectReason }
   | { type: "typing" }
   | {
       type: "history";

@@ -45,6 +45,7 @@ const VALID: Record<string, unknown> = {
   approval_request: { type: "approval_request", id: "x1", kind: "exec", title: "t", prompt: "p", options: [], seq: 6 },
   approval_resolved: { type: "approval_resolved", id: "x1", decision: "deny", seq: 7 },
   approval_snapshot: { type: "approval_snapshot", approvals: [], resolved: [] },
+  approval_decision_rejected: { type: "approval_decision_rejected", id: "x1", decision: "deny", reason: "not-approver" },
   typing: { type: "typing" },
   history: { type: "history", messages: [], highWaterSeq: 9 },
   commands: { type: "commands", commands: [] },
@@ -192,6 +193,17 @@ describe("#246 half A — decodeInboundMessage: the approval frames", () => {
     refuses({ type: "approval_resolved", id: "x1", decision: "unknown" });
     refuses({ type: "approval_resolved", id: "x1" });
     refuses({ type: "approval_resolved", id: "", decision: "deny" });
+  });
+
+  it("#400 approval_decision_rejected vets the decision strictly and the reason loosely", () => {
+    // The decision is matched against the card's guess; the reason may be one a
+    // newer plugin added, which the wrapper treats as the generic undo.
+    accepts({ type: "approval_decision_rejected", id: "x1", decision: "allow-once", reason: "some-future-reason" });
+    refuses({ type: "approval_decision_rejected", id: "x1", decision: "maybe", reason: "not-approver" });
+    refuses({ type: "approval_decision_rejected", id: "x1", reason: "not-approver" });
+    refuses({ type: "approval_decision_rejected", id: "", decision: "deny", reason: "not-approver" });
+    refuses({ type: "approval_decision_rejected", id: "x1", decision: "deny", reason: "" });
+    refuses({ type: "approval_decision_rejected", id: "x1", decision: "deny" });
   });
 
   it("approval_snapshot is checked at the envelope only", () => {
