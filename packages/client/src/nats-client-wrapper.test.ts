@@ -2967,7 +2967,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     const heldId = messages(w)[0].id;
 
     w.send(" /STOP "); // case/whitespace variant — trimmed before publish
-    expect(spy).toHaveBeenCalledWith("/STOP", expect.any(String), expect.any(String));
+    expect(spy).toHaveBeenCalledWith("/STOP", expect.any(String), expect.any(String), undefined, true);
     const marker = messages(w).find((m) => m.id === heldId)!;
     expect(marker.retracted).toBe(true);
     expect(marker.pending).toBe(false);
@@ -3529,7 +3529,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     // core's built-in Telegram extension deletes an unfinalized preview at turn
     // end (`[core] extensions/telegram/src/bot-message-dispatch.ts:2971-2975`).
     w.send("/stop");
-    expect(spy).toHaveBeenCalledWith("/stop", expect.any(String), expect.any(String));
+    expect(spy).toHaveBeenCalledWith("/stop", expect.any(String), expect.any(String), undefined, true);
     expect(messages(w).some((m) => m.id === "webchannel-d")).toBe(false);
 
     // The wedge is unlocked: a subsequent send publishes IMMEDIATELY (not held).
@@ -3585,7 +3585,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     expect(w.getState().isTyping).toBe(true);
 
     w.send("/stop");
-    expect(spy).toHaveBeenCalledWith("/stop", expect.any(String), expect.any(String));
+    expect(spy).toHaveBeenCalledWith("/stop", expect.any(String), expect.any(String), undefined, true);
     expect(w.getState().isTyping).toBe(false); // typing indicator cleared
 
     // Composer unlocked: a subsequent send publishes immediately (not held).

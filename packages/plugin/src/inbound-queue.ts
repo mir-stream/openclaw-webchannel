@@ -6,8 +6,10 @@ import {
   type RetentionReservation,
   type RetentionSessionToken,
 } from "./inbound-retention.js";
+import type { StopPendingInput } from "./channel-contract.js";
+import { isExplicitAbortCommand } from "./control-lane.js";
 
-export type UserMessageLike = { type: "user_message"; text: string; id?: string; random_id?: string; retry_of?: string };
+export type UserMessageLike = { type: "user_message"; text: string; id?: string; random_id?: string; retry_of?: string; cancel_pending?: StopPendingInput[] };
 
 /**
  * #99: the wireIds of every message folded into one coalesced turn, in arrival
@@ -80,6 +82,11 @@ export function normalizeInboundUserMessage(raw: UserMessageLike): UserMessageLi
     ...(typeof raw.id === "string" ? { id: raw.id } : {}),
     ...(typeof raw.random_id === "string" ? { random_id: raw.random_id } : {}),
     ...(typeof raw.retry_of === "string" ? { retry_of: raw.retry_of } : {}),
+    // Rebuilt from the decoded entries' two known fields only (#398), and kept
+    // only on the explicit stop that reads it; ordinary input never carries it.
+    ...(Array.isArray(raw.cancel_pending) && isExplicitAbortCommand(raw) ? { cancel_pending: raw.cancel_pending.map(entry => ({
+      id: entry.id, ...(typeof entry.random_id === "string" ? { random_id: entry.random_id } : {}),
+    })) } : {}),
   };
 }
 

@@ -15,8 +15,11 @@ export type UserCommit = { messageId: string; seq: number; inserted: boolean; re
 export type StopReceipt = { key: string; cancelBuffered: boolean; targetCount: number };
 export interface DispatchStore {
   lookupStop(peerId: string, key: string): StopReceipt | undefined;
-  recordStop(owner: string, peerId: string, key: string, bufferedKeys: readonly string[], cancelBuffered: boolean): StopReceipt & { fresh: boolean };
+  /** `pendingCancelled`: the named earlier keys this call itself made targets. */
+  recordStop(owner: string, peerId: string, key: string, bufferedKeys: readonly string[], cancelBuffered: boolean, pendingKeys?: readonly string[]): StopReceipt & { fresh: boolean; pendingCancelled?: string[] };
   isCancelled(peerId: string, key: string): boolean;
+  /** #398: durably cancelled with no dispatch row and no user row: never accepted. */
+  isUnaccepted(peerId: string, key: string): boolean;
   stopChanges(peerId: string, key: string, after?: number): DispatchChange[];
   bindCore(binding: CoreDispatchBinding): void;
   coreBindings(): CoreDispatchBinding[];
@@ -32,6 +35,10 @@ export interface DispatchStore {
   recoverInterrupted(owner: string): DispatchChange[];
   cancel(owner: string, peerId: string): DispatchChange[];
 }
+
+/** Per-peer bound on stop targets a client named but this server never held.
+ * Equal to the per-stop name cap, so one stop's names always fit. */
+export const MAX_STOP_PENDING_TARGETS = 256;
 
 type Stored = { peer_id: string; logical_key: string; message_id: string; user_seq: number; payload: string; state: RequestState; owner: string | null; batch: string | null };
 const decode = (r: Stored): DispatchRow => ({ peerId: r.peer_id, key: r.logical_key, messageId: r.message_id, seq: Number(r.user_seq), input: JSON.parse(r.payload) as DispatchInput, state: r.state, ...(r.owner ? { owner: r.owner } : {}), ...(r.batch ? { batch: r.batch } : {}) });
@@ -54,7 +61,9 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
       CREATE TABLE IF NOT EXISTS journal_stop_target (
         peer_id TEXT NOT NULL, logical_key TEXT NOT NULL, stop_key TEXT NOT NULL,
         state_seq INTEGER, PRIMARY KEY(peer_id,logical_key));
-      CREATE INDEX IF NOT EXISTS journal_stop_result ON journal_stop_target(peer_id,stop_key,state_seq);`);
+      CREATE INDEX IF NOT EXISTS journal_stop_result ON journal_stop_target(peer_id,stop_key,state_seq);
+      CREATE TABLE IF NOT EXISTS journal_stop_pending (
+        peer_id TEXT NOT NULL, logical_key TEXT NOT NULL, PRIMARY KEY(peer_id,logical_key));`);
     db.prepare("INSERT INTO journal_meta VALUES('dispatch_schema_version','2') ON CONFLICT(key) DO UPDATE SET value='2'").run();
   });
   const sql = (s: string) => db.prepare(s);
@@ -78,16 +87,53 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
   return {
     lookupStop,
     isCancelled,
-    recordStop: (owner, peer, key, bufferedKeys, cancelBuffered) => runSqliteImmediateTransactionSync(db, () => {
+    isUnaccepted: (peer, key) => !!sql(`SELECT 1 FROM journal_stop_target t WHERE t.peer_id=? AND t.logical_key=?
+      AND NOT EXISTS (SELECT 1 FROM journal_dispatch WHERE peer_id=t.peer_id AND logical_key=t.logical_key)
+      AND NOT EXISTS (SELECT 1 FROM journal_event WHERE conversation_id=t.peer_id AND kind='user' AND idempotency_key=t.logical_key)`).get(peer, key),
+    recordStop: (owner, peer, key, bufferedKeys, cancelBuffered, pendingKeys = []) => runSqliteImmediateTransactionSync(db, () => {
       checkOwner(owner);
       const previous = lookupStop(peer, key);
       if (previous) return { ...previous, fresh: false };
+      const pendingCancelled: string[] = [];
       if (cancelBuffered) {
         // One transaction freezes BOTH the not-yet-accepted IDs and every
         // accepted queued/started target. A failure cannot leave a partial stop.
         sql("INSERT OR IGNORE INTO journal_stop_target SELECT peer_id,logical_key,?,NULL FROM journal_dispatch WHERE peer_id=? AND state IN ('queued','started')").run(key, peer);
         for (const target of new Set(bufferedKeys)) {
           sql("INSERT OR IGNORE INTO journal_stop_target VALUES(?,?,?,NULL)").run(peer, target, key);
+        }
+        // #398: input the client sent before this stop but this server has not
+        // accepted yet. An accepted one is already covered above when it can
+        // still run; a settled row, a historical user row or an already handled
+        // control request already ran and must keep answering with its real
+        // outcome, never a false cancellation.
+        for (const target of new Set(pendingKeys)) {
+          const inserted = sql(`INSERT OR IGNORE INTO journal_stop_target SELECT ?,?,?,NULL
+            WHERE NOT EXISTS (SELECT 1 FROM journal_dispatch WHERE peer_id=? AND logical_key=?)
+              AND NOT EXISTS (SELECT 1 FROM journal_event WHERE conversation_id=? AND kind='user' AND idempotency_key=?)
+              AND NOT EXISTS (SELECT 1 FROM journal_stop WHERE peer_id=? AND logical_key=?)`)
+            .run(peer, target, key, peer, target, peer, target, peer, target);
+          if (Number(inserted.changes) === 1) {
+            sql("INSERT OR IGNORE INTO journal_stop_pending VALUES(?,?)").run(peer, target);
+            pendingCancelled.push(target);
+          }
+        }
+        // These targets are client-named, never server-held, so nothing else
+        // bounds them: an authenticated peer could name 256 invented keys on
+        // every stop, and the table is never pruned. Keep only the newest
+        // MAX_STOP_PENDING_TARGETS per peer. An evicted key loses its answer:
+        // if it ever arrives it is admitted like an unnamed one, the same
+        // documented outcome as input past the per-stop cap. The oldest go
+        // first; they are the least likely to still be in a client's ledger.
+        // The eviction only ever costs that same peer its own stale names.
+        if (pendingCancelled.length > 0) {
+          const excess = Number((sql("SELECT count(*) AS n FROM journal_stop_pending WHERE peer_id=?").get(peer) as { n: number }).n) - MAX_STOP_PENDING_TARGETS;
+          if (excess > 0) {
+            for (const row of sql("SELECT rowid AS id, logical_key FROM journal_stop_pending WHERE peer_id=? ORDER BY rowid LIMIT ?").all(peer, excess) as { id: number; logical_key: string }[]) {
+              sql("DELETE FROM journal_stop_target WHERE peer_id=? AND logical_key=?").run(peer, row.logical_key);
+              sql("DELETE FROM journal_stop_pending WHERE rowid=?").run(row.id);
+            }
+          }
         }
         // Page within the same transaction: an arbitrarily old durable backlog
         // must not become an unbounded in-memory array of payloads/results.
@@ -101,7 +147,7 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
       }
       const targetCount = Number((sql("SELECT count(*) AS n FROM journal_stop_target WHERE peer_id=? AND stop_key=?").get(peer, key) as { n: number }).n);
       sql("INSERT INTO journal_stop VALUES(?,?,?,?)").run(peer, key, Number(cancelBuffered), targetCount);
-      return { key, cancelBuffered, targetCount, fresh: true };
+      return { key, cancelBuffered, targetCount, fresh: true, pendingCancelled };
     }),
     stopChanges: (peer, key, after = 0) => (sql(`SELECT d.message_id,d.payload,t.state_seq FROM journal_stop_target t
       JOIN journal_dispatch d ON d.peer_id=t.peer_id AND d.logical_key=t.logical_key

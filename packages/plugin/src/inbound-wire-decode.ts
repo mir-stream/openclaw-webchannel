@@ -69,7 +69,7 @@
  * Size bounds on the frame as a whole are #294/#325 and are NOT here.
  */
 
-import type { ApprovalDecision, InboundWsMessage } from "./channel-contract.js";
+import { MAX_STOP_PENDING_INPUTS, type ApprovalDecision, type InboundWsMessage } from "./channel-contract.js";
 import { MAX_INBOUND_USER_ID_LENGTH } from "./delivery-journal-event.js";
 
 /**
@@ -198,6 +198,13 @@ export function decodeInboundWsMessage(raw: unknown): InboundWsDecodeResult {
           known,
           "random_id must be a non-empty string within the id length bound",
         );
+      }
+      // #398: each named input is keyed exactly like a user_message of its own.
+      const pending = field(raw, "cancel_pending");
+      if (pending !== undefined && (!Array.isArray(pending) || pending.length > MAX_STOP_PENDING_INPUTS
+        || !pending.every((entry) => isRecord(entry) && isUsableWireId(field(entry, "id"))
+          && (field(entry, "random_id") === undefined || isUsableWireId(field(entry, "random_id")))))) {
+        return invalid(known, "cancel_pending must be a bounded list of message ids");
       }
       return { ok: true, message: raw as unknown as InboundWsMessage };
     }

@@ -19,13 +19,15 @@ export const MAX_INGRESS_RESULT_ID_LENGTH = 128;
 export type CommittedUserMessage = { random_id: string; messageId: string; seq: number };
 
 export type IngressResultFrame =
-  // cancelled is durable proof for a subset of this frame's exact wire ids.
-  | { type: "ack"; ids: string[]; committed?: CommittedUserMessage[]; cancelled?: string[] }
+  // cancelled is durable proof for a subset of this frame's exact wire ids;
+  // unaccepted (#398) is the subset of cancelled this server never accepted.
+  | { type: "ack"; ids: string[]; committed?: CommittedUserMessage[]; cancelled?: string[]; unaccepted?: string[] }
   | { type: "inbound_rejected"; ids: string[]; reason: "overloaded" };
 
 export type IngressResultChunkWriter = {
-  /** cancelled requires durable evidence and always rides this ID's frame. */
-  add(id: unknown, cancelled?: boolean): boolean;
+  /** cancelled requires durable evidence and always rides this ID's frame, as
+   * does unaccepted (meaningful only with cancelled). */
+  add(id: unknown, cancelled?: boolean, unaccepted?: boolean): boolean;
   finish(): boolean;
   retainedIds(): number;
 };
@@ -84,6 +86,7 @@ export function createIngressResultChunkWriter(
   let ids: string[] = [];
   let inChunk = new Set<string>();
   let cancelledIds: string[] = [];
+  let unacceptedIds: string[] = [];
   let ok = true;
   // One-shot: attached to the first `ack` frame `flush` publishes, then cleared
   // so later frames in a chunked batch do not repeat it. `frameFor` reads it, so
@@ -93,40 +96,45 @@ export function createIngressResultChunkWriter(
       ? options.committed
       : [];
 
-  const frameFor = (values: string[], cancelled: string[]): IngressResultFrame => options.type === "ack"
+  const frameFor = (values: string[], cancelled: string[], unaccepted: string[]): IngressResultFrame => options.type === "ack"
     ? { type: "ack", ids: values, ...(committedPending.length > 0 ? { committed: committedPending } : {}),
-      ...(cancelled.length > 0 ? { cancelled } : {}) }
+      ...(cancelled.length > 0 ? { cancelled } : {}), ...(unaccepted.length > 0 ? { unaccepted } : {}) }
     : { type: "inbound_rejected", ids: values, reason: "overloaded" };
 
   const flush = (): boolean => {
     if (ids.length === 0) return true;
-    const frame = frameFor(ids, cancelledIds);
+    const frame = frameFor(ids, cancelledIds, unacceptedIds);
     const sent = options.publish(frame);
     ok = sent && ok;
     ids = [];
     inChunk = new Set();
     cancelledIds = [];
+    unacceptedIds = [];
     // The echo has now ridden a frame; every subsequent frame omits it.
     committedPending = [];
     return sent;
   };
 
-  const add = (candidate: unknown, cancelled = false): boolean => {
+  const add = (candidate: unknown, cancelled = false, unaccepted = false): boolean => {
     if (typeof candidate !== "string" || candidate.length === 0 || candidate.length > MAX_INGRESS_RESULT_ID_LENGTH) {
       return false;
     }
     const proof = options.type === "ack" && cancelled;
-    if (inChunk.has(candidate) && (!proof || cancelledIds.includes(candidate))) return true;
+    const neverAccepted = proof && unaccepted;
+    if (inChunk.has(candidate) && (!proof || cancelledIds.includes(candidate))
+      && (!neverAccepted || unacceptedIds.includes(candidate))) return true;
     if (!inChunk.has(candidate) && ids.length >= maxIds) flush();
     let next = inChunk.has(candidate) ? ids : [...ids, candidate]; // bounded to maxIds (64)
-    let nextCancelled = proof ? [...cancelledIds, candidate] : cancelledIds;
-    let bytes = measure(frameFor(next, nextCancelled));
+    let nextCancelled = proof && !cancelledIds.includes(candidate) ? [...cancelledIds, candidate] : cancelledIds;
+    let nextUnaccepted = neverAccepted && !unacceptedIds.includes(candidate) ? [...unacceptedIds, candidate] : unacceptedIds;
+    let bytes = measure(frameFor(next, nextCancelled, nextUnaccepted));
     if (!Number.isSafeInteger(bytes) || bytes < 0) throw new TypeError("wire measurement is invalid");
     if (bytes > effectiveLimit && ids.length > 0) {
       flush();
       next = [candidate];
       nextCancelled = proof ? [candidate] : [];
-      bytes = measure(frameFor(next, nextCancelled));
+      nextUnaccepted = neverAccepted ? [candidate] : [];
+      bytes = measure(frameFor(next, nextCancelled, nextUnaccepted));
       if (!Number.isSafeInteger(bytes) || bytes < 0) throw new TypeError("wire measurement is invalid");
     }
     if (bytes > effectiveLimit) {
@@ -136,6 +144,7 @@ export function createIngressResultChunkWriter(
     }
     ids = next;
     cancelledIds = nextCancelled;
+    unacceptedIds = nextUnaccepted;
     inChunk.add(candidate);
     return true;
   };

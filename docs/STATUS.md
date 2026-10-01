@@ -23,7 +23,7 @@ keys, even when account transport startup fails; on a persistent storage or
 account-planning fault it deliberately holds core's remaining plugin-service
 startup (and every channel's restart recovery) rather than let core re-run
 interrupted work. Core session resets remain available. Historical rows without lifecycle metadata are never replayed or
-assigned invented statuses. Client/plugin protocol 6 requires lockstep rollout.
+assigned invented statuses. Client/plugin protocol 7 requires lockstep rollout.
 See [dispatch recovery and upgrade boundaries](DISPATCH_RECOVERY.md).
 
 Round 6 (#378): config reads, account inspection, acquisition/planning, status

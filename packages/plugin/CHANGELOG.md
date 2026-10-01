@@ -27,6 +27,19 @@
   reports a publish failure as a failed send, and the three refusals above the
   journal (disposed, transport down, no session key) are unchanged.
 
+### Breaking (wire protocol v7)
+
+Gateway plugin and browser client require a paired upgrade to protocol 7
+(protocol 6 was never released); the exact-match register gate refuses every
+other version. One reason per bullet, matching `protocol.ts`:
+
+- **v7 — stop covers earlier unacknowledged input (#397, #398).** An explicit
+  `/stop` may carry `cancel_pending`; each named input this server has not
+  accepted is durably cancelled with the stop, so it cannot run when it arrives
+  later. `ack.unaccepted` declares, per ID and in that ID's own frame, the
+  cancelled IDs that have no dispatch row and no user row. A second stop that
+  arrives during an in-flight core abort now joins it with its own receipt.
+
 ### Breaking (wire protocol v4)
 
 - **`WEBCHANNEL_PROTOCOL_VERSION` goes 3 → 4 (#246).** The register gate is

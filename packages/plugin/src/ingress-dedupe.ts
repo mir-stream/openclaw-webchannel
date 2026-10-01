@@ -346,6 +346,7 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
     ids: string[],
     committed?: Array<{ random_id: string; messageId: string; seq: number }>,
     cancelled?: string[],
+    unaccepted?: string[],
   ) => boolean;
   /**
    * #245 Part B: broadcast a just-committed inbound user message to the account's
@@ -639,6 +640,8 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
       // At most one flag per retained wire ID; the footer splits proofs together
       // with those IDs, after every write/journal decision has committed.
       const cancelledIds = new Set<string>();
+      // #398: the subset of cancelledIds the SQLite ledger proves never accepted.
+      const unacceptedIds = new Set<string>();
       const rejectedIds: string[] = [];
       // A write holds this key's outcome gate until the footer. Repeated logical
       // requests in this batch share that decision, retaining each wire ID for
@@ -788,8 +791,10 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           try {
             if (deps.deliveryJournal?.dispatch?.isCancelled(peerId, idempotencyKey)) {
               const row = deps.deliveryJournal.lookupUserMessageIdByRandomId(peerId, idempotencyKey);
+              const neverAccepted = deps.deliveryJournal.dispatch.isUnaccepted(peerId, idempotencyKey);
               ackIds.push(id);
               cancelledIds.add(id);
+              if (neverAccepted) unacceptedIds.add(id);
               if (row && randomId !== undefined) committedBatch.push({ random_id: randomId, ...row });
               release();
               continue;
@@ -1568,7 +1573,9 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           // for the IDs the writer put in this frame (including after splitting).
           publish: (frame) => {
             const committed = frame.type === "ack" ? frame.committed : undefined;
-            return (frame.type === "ack" && frame.cancelled
+            return (frame.type === "ack" && frame.unaccepted
+              ? deps.sendAck?.(peerId, frame.ids, committed, frame.cancelled, frame.unaccepted)
+              : frame.type === "ack" && frame.cancelled
               ? deps.sendAck?.(peerId, frame.ids, committed, frame.cancelled)
               : committed && committed.length > 0
               ? deps.sendAck?.(peerId, frame.ids, committed)
@@ -1579,7 +1586,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           ...(committedBatch.length > 0 ? { committed: committedBatch } : {}),
           onTooSmall: () => logWarn?.("webchannel: result frame cannot fit effective NATS max_payload"),
         });
-        for (const id of ackIds) ack.add(id, cancelledIds.has(id));
+        for (const id of ackIds) ack.add(id, cancelledIds.has(id), unacceptedIds.has(id));
         ack.finish();
         for (const id of rejectedIds) rejected.add(id);
         rejected.finish();

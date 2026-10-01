@@ -56,9 +56,38 @@ later starts until the first core control invocation settles, so a delayed
 session-wide abort cannot reach new work. Account teardown drains that invocation
 before permitting a replacement runtime. A stuck core control call therefore
 holds that peer's new dispatch and account replacement; the receipt and target
-suppression remain durable. Different control requests received while that core
-call is pending get no ACK and rely on client retry; they allocate no waiting
-control payload. Same-ID retries immediately receive the existing receipt.
+suppression remain durable. A different control request received while that core
+call is pending joins it (#397): its own receipt and targets commit and it is
+ACKed at once, without a second core invocation. Its retransmission after the
+abort returns therefore replays that receipt instead of cancelling a turn started
+later. Same-ID retries immediately receive the existing receipt.
+
+An authorized explicit `/stop` also carries `cancel_pending` (protocol 7, #398):
+the earlier user messages that device still has no server result for. Each one
+without a dispatch row, user row or stop receipt becomes a target in the same
+transaction, and the stop answers exactly those with `cancelled` and
+`unaccepted`, split into ACK frames of at most 64 IDs like any other result. If
+that input arrives later, for example after an overloaded or blocked first
+delivery, it is cancelled rather than run. A named input the server already
+accepted keeps its ordinary receipt: a settled one keeps its real outcome, and a
+queued/started one is cancelled as above and reported through its request state.
+
+`ack.unaccepted` (protocol 7) is the server's per-ID declaration that a cancelled
+ID was never accepted: the SQLite stop ledger holds it with no dispatch row and
+no user row. Every ledger-backed cancellation ACK computes it the same way — the
+stop's own target ACKs, and later hot or cold arrivals — so an input cancelled in
+the debounce window is declared too. It rides the same frame as its ID; the
+`committed` echo, which rides only the first frame of a split, is never evidence
+for it. A journal fault, or an SDK-only cancellation without ledger evidence,
+omits it.
+
+Named targets are client-supplied, so they are bounded per peer: the newest 256
+rowless named targets are kept and older ones are evicted in the stop's
+transaction. An evicted key, like a pending input past the 256-name cap of one
+stop, has no cancellation answer: if it ever arrives it is admitted and can run. A control request whose own ID a later
+stop named is inert: it is ACKed as cancelled without a receipt or core call. The
+client shows a receipt as `failed{cancelled}` only when its ID is in
+`unaccepted`; any other cancellation keeps the accepted receipt.
 
 After ACK loss or restart, the same stop only replays its receipt. It never
 recaptures the current queue and never invokes core again. Cancelled original
@@ -160,7 +189,7 @@ Id-less legacy sends still execute, but have no durable dispatch recovery.
 The new dispatch schema rejects future versions before migrations; the history
 projection is rebuilt at version 2. Existing credential/key downgrade guards remain.
 Older binaries cannot enforce a lifecycle they do not understand: do not downgrade
-with pending work. Client and plugin must deploy together at protocol version 6.
+with pending work. Client and plugin must deploy together at protocol version 7.
 
 ## Evidence boundaries
 

@@ -1609,7 +1609,10 @@ export class WebChannelNATSClient {
       // delivered synchronously by the transport, before the sent callback.
       this.applicationTurns.set(wireId, receipt);
     }
-    if (retryOf === undefined) this.client.sendUserMessage(text, wireId, randomId);
+    // #398: the explicit stop names earlier unacknowledged input for durable
+    // cancellation. The low level snapshots it at this frame's queue position.
+    if (isExplicitStop(text)) this.client.sendUserMessage(text, wireId, randomId, undefined, true);
+    else if (retryOf === undefined) this.client.sendUserMessage(text, wireId, randomId);
     else this.client.sendUserMessage(text, wireId, randomId, retryOf);
   }
 
@@ -3655,6 +3658,7 @@ export class WebChannelNATSClient {
       const lifecycle = this.wrapperLifecycleGeneration;
       let closed = false;
       const finalize: string[] = [];
+      const notSent: string[] = [];
       for (const id of msg.cancelled) {
         if (!msg.ids?.includes(id)) continue;
         closed = this.retireCancelledApplicationTurn(id) || closed;
@@ -3664,6 +3668,9 @@ export class WebChannelNATSClient {
           receipt.cancellationUiReconciled = true;
           finalize.push(id);
         }
+        // #398: only the server knows it never accepted this input; it says so
+        // per id, in the same frame as the id.
+        if (receipt?.settlementEligible && msg.unaccepted?.includes(id)) notSent.push(key!);
       }
       const typingCandidates = this.typingLocalCandidates;
       const cancelsTypingCandidate = finalize.some((id) => typingCandidates.has(id));
@@ -3683,6 +3690,11 @@ export class WebChannelNATSClient {
       const clearActive = closed && this.openTurns.size === 0;
       if (clearActive) this.setState({ turnActive: false });
       if (this.wrapperLifecycleGeneration !== lifecycle) return;
+      // The bubble stays as cancelled input that never ran.
+      for (const key of notSent) {
+        this.receiptTransition(key, "failed", { reason: "cancelled", retryable: false });
+        if (this.wrapperLifecycleGeneration !== lifecycle) return;
+      }
     }
     // Observe authenticated live arrival before gap buffering. Replaying that
     // buffer later is not new evidence of application activity.

@@ -18,13 +18,18 @@ no browser-facing connection or token route.
 5. The agent returns the conversation key wrapped to the SaaS-attested device key,
    with both the peer id and that `clientNonce` bound into the wrap AAD.
 
-The wire protocol version is **6**. Client and plugin must ship
+The wire protocol version is **7**. Client and plugin must ship
 together; a mismatch is refused with a terminal `protocol_mismatch` (426) before
 any key work. Version 6 adds authenticated `ack.cancelled`: exact wire IDs whose
 cancellation is durable, restricted to the same frame's `ack.ids`. A client must
 retire the active watch for those IDs even when no journal row was created;
 otherwise it reconnects indefinitely for a cancelled pre-admission message.
 An ordinary ACK, including a stop-command receipt, supplies no cancellation proof.
+Version 7 adds `cancel_pending` on an explicit `/stop`: the earlier user messages
+that device has no server result for. The server durably cancels each one it has
+not accepted and answers it with `ack.cancelled`, so it cannot run after the stop.
+`ack.unaccepted`, a subset of `cancelled` in each ID's own frame, declares the
+cancelled IDs the server never accepted; only those show as cancelled input.
 This uses the existing exact-match gate without negotiation; the encrypted
 envelope remains version 1 and package versions are unchanged.
 

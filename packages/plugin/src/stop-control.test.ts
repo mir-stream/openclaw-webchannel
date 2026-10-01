@@ -17,7 +17,7 @@ import { tupleStoragePaths } from "./storage-paths.js";
 import { createStopControl } from "./stop-control.js";
 
 type Item = { peerId: string; message: UserMessageLike };
-type Ack = { peerId: string; ids: string[]; cancelled?: string[]; committed?: Array<{ random_id: string; messageId: string; seq: number }> };
+type Ack = { peerId: string; ids: string[]; cancelled?: string[]; unaccepted?: string[]; committed?: Array<{ random_id: string; messageId: string; seq: number }> };
 const item = (key: string, device = "device-1", peerId = "RawPeer"): Item => ({
   peerId, message: { type: "user_message", id: `${device}:${key}`, random_id: `logical-${key}`, text: key === "S" ? "/stop" : key },
 });
@@ -70,8 +70,8 @@ function setup(options: {
   const acks: Ack[] = [];
   const errors: unknown[] = [];
   const rejected: string[][] = [];
-  const sendAck = (peerId: string, ids: string[], committed?: Ack["committed"], cancelled?: string[]) => {
-    const ack = { peerId, ids: [...ids], committed, cancelled };
+  const sendAck = (peerId: string, ids: string[], committed?: Ack["committed"], cancelled?: string[], unaccepted?: string[]) => {
+    const ack = { peerId, ids: [...ids], committed, cancelled, ...(unaccepted ? { unaccepted } : {}) };
     options.onAck?.(ack);
     acks.push(ack);
     return !(options.loseStopAck && ids.includes("device-2:S"));
@@ -529,4 +529,155 @@ it("upgrades a schema 1 journal without changing existing queued or historical r
       expect(db.prepare("SELECT value FROM journal_meta WHERE key='dispatch_schema_version'").get()).toMatchObject({ value: "2" });
     } finally { migrated.close(); }
   } finally { db.close(); }
+});
+
+const stop = (key: string, device: string, cancelPending?: Item[]): Item => ({
+  peerId: "RawPeer",
+  message: { type: "user_message", id: `${device}:${key}`, random_id: `logical-${key}`, text: "/stop",
+    ...(cancelPending ? { cancel_pending: cancelPending.map(({ message }) => ({ id: message.id!, random_id: message.random_id })) } : {}) },
+});
+
+it.each([false, true])("#397 a second stop during the first core abort joins it; its retransmission cannot cancel a later turn (reopen=%s)", async reopen => {
+  const original = setup({ holdCore: true, hold: ["B"] });
+  original.stop.handle(stop("S1", "device-1"), true);
+  const joined = original.stop.handle(stop("S2", "device-2"), true)!;
+  expect(joined).toMatchObject({ fresh: true });
+  expect(original.acks.at(-1)).toMatchObject({ ids: ["device-2:S2"], cancelled: undefined });
+  expect(original.journal.dispatch!.lookupStop("RawPeer", "logical-S2")).toBeDefined();
+  original.releaseCore();
+  await vi.waitFor(() => expect(original.core).toHaveBeenCalledOnce());
+  await new Promise(setImmediate);
+  if (reopen) await original.close();
+  const h = reopen ? setup({ root: original.root, hold: ["B"] }) : original;
+  await h.flush([item("B", "device-3")]);
+  await vi.waitFor(() => expect(h.runs.map(run => run.message.text)).toEqual(["B"]));
+  expect(h.stop.handle(stop("S2", "device-2-retry"), true)).toEqual({ key: joined.key, cancelBuffered: true, targetCount: joined.targetCount });
+  expect(h.core).toHaveBeenCalledTimes(reopen ? 0 : 1);
+  expect(h.runs[0].signal?.aborted).toBe(false);
+  expect(h.journal.dispatch!.lookup("RawPeer", "logical-B")?.state).toBe("started");
+  expect(h.acks.at(-1)).toMatchObject({ ids: ["device-2-retry:S2"], cancelled: undefined });
+  h.release("B");
+  await vi.waitFor(() => expect(h.journal.dispatch!.lookup("RawPeer", "logical-B")?.state).toBe("completed"));
+});
+
+it("#397 a joining stop still cancels only the input that reached the server before it", async () => {
+  const h = setup({ holdCore: true, debounceMs: 10 });
+  h.stop.handle(stop("S1", "device-1"), true);
+  await h.flush([item("B", "device-3")]);
+  h.debouncer.push(item("C", "device-3"));
+  expect(h.stop.handle(stop("S2", "device-2"), true)).toMatchObject({ fresh: true, targetCount: 2 });
+  h.debouncer.push(item("D", "device-3"));
+  h.releaseCore();
+  await vi.waitFor(() => expect(h.runs.map(run => run.message.text)).toEqual(["D"]));
+  expect(h.journal.dispatch!.lookup("RawPeer", "logical-B")?.state).toBe("cancelled");
+  expect(h.journal.dispatch!.isCancelled("RawPeer", "logical-C")).toBe(true);
+  expect(h.journal.dispatch!.isCancelled("RawPeer", "logical-D")).toBe(false);
+  expect(h.core).toHaveBeenCalledOnce();
+});
+
+it.each([false, true])("#398 a stop durably cancels earlier input the server has not accepted, when it arrives later (reopen=%s)", async reopen => {
+  const original = setup({ hold: ["A"], debounceMs: 0 });
+  await original.flush([item("R")]);
+  await vi.waitFor(() => expect(original.journal.dispatch!.lookup("RawPeer", "logical-R")?.state).toBe("completed"));
+  await original.flush([item("A")]);
+  // M was sent before the stop but its first delivery was not admitted (for
+  // example an overload tail); R already ran with its ACK lost.
+  const receipt = original.stop.handle(stop("S", "device-1", [item("R"), item("A"), item("M")]), true);
+  expect(receipt).toMatchObject({ fresh: true, targetCount: 2 });
+  expect(original.journal.dispatch!.lookup("RawPeer", "logical-A")?.state).toBe("cancelled");
+  expect(original.journal.dispatch!.isCancelled("RawPeer", "logical-M")).toBe(true);
+  expect(original.journal.dispatch!.isCancelled("RawPeer", "logical-R")).toBe(false);
+  // Only M was never accepted. Accepted A keeps its ordinary receipt; its row
+  // already reports the cancellation through request state.
+  const named = original.acks.find(ack => ack.ids.includes("device-1:M"))!;
+  expect(named).toEqual({ peerId: "RawPeer", ids: ["device-1:M"], committed: undefined, cancelled: ["device-1:M"], unaccepted: ["device-1:M"] });
+  expect(original.acks.some(ack => ack.cancelled?.includes("device-1:A"))).toBe(false);
+  expect(original.acks.at(-1)).toMatchObject({ ids: ["device-1:S"], cancelled: undefined });
+  original.release("A");
+  if (reopen) await original.close();
+  const h = reopen ? setup({ root: original.root, debounceMs: 0 }) : original;
+  h.acks.length = 0;
+  expect(h.debouncer.push(item("M", "device-1-retry"))).toEqual({ status: "known-outcome", outcome: "cancelled" });
+  await h.flush([item("M", "device-1-cold"), item("R", "device-1-retry")]);
+  await new Promise(setImmediate);
+  expect(h.runs.map(run => run.message.text)).toEqual(reopen ? [] : ["R", "A"]);
+  expect(h.journal.lookupUserMessageIdByRandomId("RawPeer", "logical-M")).toBeUndefined();
+  expect(h.journal.dispatch!.lookup("RawPeer", "logical-R")?.state).toBe("completed");
+  expect(h.acks.map(ack => ack.cancelled)).toEqual([["device-1-retry:M"], ["device-1-cold:M"]]);
+  // Hot and cold later arrivals keep the server's never-accepted declaration.
+  expect(h.acks.map(ack => ack.unaccepted)).toEqual([["device-1-retry:M"], ["device-1-cold:M"]]);
+  expect(h.acks.at(-1)?.ids).toEqual(["device-1-cold:M", "device-1-retry:R"]);
+});
+
+it("#398 a stop names nothing when the command policy keeps buffered input", async () => {
+  const h = setup();
+  const control = stop("S", "device-1", [item("M")]);
+  control.message.text = "stop";
+  const cancelBuffered = shouldDropBufferedInputOnStop(control.message, { delegated: false, isListed: () => true }, control.peerId);
+  expect(h.stop.handle(control, cancelBuffered)).toMatchObject({ cancelBuffered: false, targetCount: 0 });
+  expect(h.journal.dispatch!.isCancelled("RawPeer", "logical-M")).toBe(false);
+  expect(h.acks.flatMap(ack => ack.ids)).toEqual(["device-1:S"]);
+});
+
+it("#398 an earlier stop named by a later one is inert when its retransmission arrives after a new turn", async () => {
+  const h = setup({ hold: ["B"] });
+  expect(h.stop.handle(stop("S2", "device-1", [stop("S1", "device-1")]), true)).toMatchObject({ fresh: true, targetCount: 1 });
+  await vi.waitFor(() => expect(h.core).toHaveBeenCalledOnce());
+  await new Promise(setImmediate);
+  await h.flush([item("B", "device-3")]);
+  await vi.waitFor(() => expect(h.runs.map(run => run.message.text)).toEqual(["B"]));
+  h.acks.length = 0;
+  expect(h.stop.handle(stop("S1", "device-1"), true)).toBeUndefined();
+  expect(h.core).toHaveBeenCalledOnce();
+  expect(h.runs[0].signal?.aborted).toBe(false);
+  expect(h.journal.dispatch!.lookupStop("RawPeer", "logical-S1")).toBeUndefined();
+  expect(h.acks).toEqual([{ peerId: "RawPeer", ids: ["device-1:S1"], committed: undefined, cancelled: ["device-1:S1"], unaccepted: ["device-1:S1"] }]);
+  h.release("B");
+  await vi.waitFor(() => expect(h.journal.dispatch!.lookup("RawPeer", "logical-B")?.state).toBe("completed"));
+});
+
+it("#398 a later stop cannot cancel an earlier stop that already has a receipt", async () => {
+  const h = setup({ loseStopAck: true });
+  const first = h.stop.handle(stop("S1", "device-2"), true)!;
+  await vi.waitFor(() => expect(h.core).toHaveBeenCalledOnce());
+  await new Promise(setImmediate);
+  h.acks.length = 0;
+  expect(h.stop.handle(stop("S2", "device-1", [stop("S1", "device-2")]), true)).toMatchObject({ fresh: true, targetCount: 0 });
+  expect(h.journal.dispatch!.isCancelled("RawPeer", "logical-S1")).toBe(false);
+  expect(h.acks.flatMap(ack => ack.cancelled ?? [])).toEqual([]);
+  expect(h.stop.handle(stop("S1", "device-2-retry"), true)).toEqual({ key: first.key, cancelBuffered: true, targetCount: first.targetCount });
+  expect(h.acks.at(-1)).toMatchObject({ ids: ["device-2-retry:S1"], cancelled: undefined });
+});
+
+it("#398 keeps only the newest named rowless targets per peer, so invented names cannot grow the ledger", async () => {
+  const h = setup();
+  const names = (prefix: string) => Array.from({ length: 200 }, (_, index) => item(`${prefix}${index}`));
+  expect(h.stop.handle(stop("S1", "device-1", names("old-")), true)).toMatchObject({ fresh: true, targetCount: 200 });
+  expect(h.stop.handle(stop("S2", "device-1", names("new-")), true)).toMatchObject({ fresh: true, targetCount: 200 });
+  const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
+  const db = new DatabaseSync(h.paths.deliveryJournalPath, { readOnly: true });
+  try {
+    expect(db.prepare("SELECT count(*) AS n FROM journal_stop_target WHERE peer_id='RawPeer'").get()).toMatchObject({ n: 256 });
+    expect(db.prepare("SELECT count(*) AS n FROM journal_stop_pending WHERE peer_id='RawPeer'").get()).toMatchObject({ n: 256 });
+  } finally { db.close(); }
+  // The 144 oldest names were evicted; the rest of S1's and all of S2's remain.
+  expect(h.journal.dispatch!.isCancelled("RawPeer", "logical-old-143")).toBe(false);
+  expect(h.journal.dispatch!.isCancelled("RawPeer", "logical-old-144")).toBe(true);
+  expect(h.journal.dispatch!.isCancelled("RawPeer", "logical-new-199")).toBe(true);
+  // Another peer's names are untouched by this peer's eviction.
+  expect(h.stop.handle({ ...stop("S3", "device-9", [item("other")]), peerId: "OtherPeer" }, true)).toMatchObject({ targetCount: 1 });
+  expect(h.journal.dispatch!.isCancelled("OtherPeer", "logical-other")).toBe(true);
+});
+
+it("#398 a fault reading the never-accepted evidence omits only that declaration, never a receipt", async () => {
+  const h = setup();
+  h.debouncer.push(item("A"));
+  vi.spyOn(h.journal.dispatch!, "isUnaccepted").mockImplementation(() => { throw new Error("SQLite read unavailable"); });
+  expect(h.stop.handle(stop("S", "device-2", [item("M")]), true)).toMatchObject({ fresh: true, targetCount: 2 });
+  expect(h.acks).toEqual([
+    { peerId: "RawPeer", ids: ["device-1:A"], committed: undefined, cancelled: ["device-1:A"] },
+    { peerId: "RawPeer", ids: ["device-1:M"], committed: undefined, cancelled: ["device-1:M"], unaccepted: ["device-1:M"] },
+    { peerId: "RawPeer", ids: ["device-2:S"], committed: undefined, cancelled: undefined },
+  ]);
+  expect(h.errors.map(String).join("\n")).toContain("SQLite read unavailable");
 });

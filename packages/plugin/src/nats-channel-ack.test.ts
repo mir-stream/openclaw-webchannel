@@ -70,6 +70,23 @@ describe("P0-7b — NatsChannel.sendAck", () => {
     for (const frame of frames) expect(frame.cancelled.every((id: string) => frame.ids.includes(id))).toBe(true);
   });
 
+  it("#398 packs each never-accepted declaration with its own cancelled ID across 64-ID chunks", () => {
+    const transport = new RecordingTransport();
+    const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant");
+    const ids = Array.from({ length: 130 }, (_, i) => `wire-${i}`);
+    const cancelled = ids.filter((_, i) => i % 2 === 0);
+    const unaccepted = cancelled.filter((_, i) => i % 3 === 0);
+    // Only a cancelled ID can be declared never accepted; strays are dropped.
+    expect(channel.sendAck("peer", ids, [{ random_id: "logical-a", messageId: "stored-a", seq: 7 }], cancelled,
+      [...unaccepted, "wire-1", "stray"])).toBe(true);
+    const frames = transport.published.map(value => JSON.parse(value.payload));
+    expect(frames.map(frame => frame.ids.length)).toEqual([64, 64, 2]);
+    expect(frames.flatMap(frame => frame.unaccepted ?? [])).toEqual(unaccepted);
+    for (const frame of frames) {
+      expect((frame.unaccepted ?? []).every((id: string) => frame.cancelled.includes(id))).toBe(true);
+    }
+  });
+
   it("authenticates cancellation proof at the exact sealed byte limit and withholds it without a key or space", () => {
     const transport = new RecordingTransport();
     const key = new Uint8Array(32).fill(7);

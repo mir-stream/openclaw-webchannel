@@ -23,6 +23,20 @@
   check it after the ordered recovery drain. Empty or terminal recovery completes
   cleanup; newer typing and connection teardown retire the pending decision.
 
+### Breaking (wire protocol v7)
+
+Client and plugin require a paired upgrade to protocol 7 (protocol 6 was never
+released). The existing exact-match registration gate rejects every other
+version. No package-version bump. One reason per bullet, matching
+`protocol.ts`:
+
+- **v7 — stop covers earlier unacknowledged input (#397, #398).** An explicit
+  `/stop` sends `cancel_pending`, the earlier user messages this device still
+  has no server result for. `ack.unaccepted` is the server's declaration that a
+  cancelled ID was never accepted; it rides the same frame as that ID, and only
+  it turns the receipt into `failed{cancelled}`. A cancelled ID without it keeps
+  its accepted receipt; its request state reports the cancellation.
+
 ### Breaking (wire protocol v6)
 
 - Client and plugin require a paired upgrade to protocol 6. The existing

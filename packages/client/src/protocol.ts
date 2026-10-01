@@ -26,6 +26,15 @@
  * supply no such proof. The exact-match gate requires the client/server change
  * together; this adds no capability negotiation or envelope/package version bump.
  *
+ * v7 (breaking, #398): an explicit `/stop` carries `cancel_pending`, the
+ * earlier user messages that device has no server result for. The server must
+ * durably cancel the ones it has not accepted; a peer that ignored the field
+ * would let that input run after the stop. `ack.unaccepted` (a subset of
+ * `ack.cancelled`, riding each ID's own frame) is the server's declaration that
+ * a cancelled ID was never accepted, and the only evidence a client may use to
+ * show it as cancelled input. No negotiation; the exact-match gate is the
+ * enforcement.
+ *
  * When to bump (#160)
  * ───────────────────
  * Bumping is breaking for every deployment simultaneously: both sides reject a
@@ -98,4 +107,4 @@
  * NOTE: this is a DIFFERENT layer from the E2E message-envelope version
  * (`ENVELOPE_VERSION` / `v:1`), which versions the encrypted payload format.
  */
-export const WEBCHANNEL_PROTOCOL_VERSION = 6;
+export const WEBCHANNEL_PROTOCOL_VERSION = 7;
