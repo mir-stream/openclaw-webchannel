@@ -1,5 +1,12 @@
 # Project Status — single source of truth
 
+History page correlation (#401): `load_history` carries a per-request `nonce` that
+the `history` page echoes. Pages ride the peer's shared `.out`; a device folds only
+a page echoing its own nonce, so another device's page no longer leaves a permanent
+hole in a different window. The register snapshot stays uncorrelated. Concurrent
+page requests from one peer's devices are queued (bounded) instead of dropped.
+Protocol 7; client and plugin require lockstep rollout.
+
 `/stop` cancellation (review R1/R2): control receipts and exact cancellation targets
 now commit together in the tenant/account SQLite journal before ACK. This includes
 debounce entries not yet accepted, the pending overflow-only ID, durable queued work and the current started
@@ -23,7 +30,7 @@ keys, even when account transport startup fails; on a persistent storage or
 account-planning fault it deliberately holds core's remaining plugin-service
 startup (and every channel's restart recovery) rather than let core re-run
 interrupted work. Core session resets remain available. Historical rows without lifecycle metadata are never replayed or
-assigned invented statuses. Client/plugin protocol 6 requires lockstep rollout.
+assigned invented statuses. Client/plugin protocol 7 requires lockstep rollout.
 See [dispatch recovery and upgrade boundaries](DISPATCH_RECOVERY.md).
 
 Round 6 (#378): config reads, account inspection, acquisition/planning, status

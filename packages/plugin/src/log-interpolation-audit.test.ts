@@ -220,6 +220,10 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
     "history-serve.ts  ::  suppressed  @  webchannel: difference for was shortened to fit the peer's effective max_payload of bytes: newer event(s) left for the next request (partial=true) (suppressed=)",
     "history-serve.ts  ::  MAX_QUEUED_DIFFERENCE_REQUESTS  @  webchannel: difference request for displaced the newest of already queued for this peer; the displaced request re-issues on its own timeout (suppressed=)",
     "history-serve.ts  ::  suppressed  @  webchannel: difference request for displaced the newest of already queued for this peer; the displaced request re-issues on its own timeout (suppressed=)",
+    // #401 — the page queue's bound warn, the page twin of the line above.
+    // `MAX_QUEUED_PAGE_REQUESTS` is a module constant; the peer id is wrapped.
+    "history-serve.ts  ::  MAX_QUEUED_PAGE_REQUESTS  @  webchannel: history page dropped for ; page requests are already queued for this peer (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: history page dropped for ; page requests are already queued for this peer (suppressed=)",
     "history-serve.ts  ::  fitted.rows.length  @  webchannel: history publish failed for : the channel refused a -row frame; see the channel log for the cause (suppressed=)",
     "history-serve.ts  ::  fitted.skipped.length  @  webchannel: history skipped undeliverable row(s) for ; each one alone exceeds this peer's effective max_payload of bytes and can never be sent, live or replayed (#311): (suppressed=)",
     "history-serve.ts  ::  fitted.trimmed  @  webchannel: history for was shortened to fit the peer's effective max_payload of bytes: older row(s) left out of this page and still reachable with load_history (suppressed=)",
@@ -433,7 +437,9 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // the THROWN-publish report round 2 added — and the two pre-existing ones each
   // gained a `suppressed` because this path now goes through `admit` like every
   // other failure path in the file.
-  "history-serve.ts": { statements: 14, interpolations: 58 },
+  // #401 adds the page queue's bound warn {peerId, MAX_QUEUED_PAGE_REQUESTS,
+  // suppressed} (14→15, 58→61); `peerId` is `logSafe`-wrapped.
+  "history-serve.ts": { statements: 15, interpolations: 61 },
   "nats-register.ts": { statements: 18, interpolations: 20 },
 };
 

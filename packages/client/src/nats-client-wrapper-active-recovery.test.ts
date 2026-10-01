@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
+import { ownHistoryPage } from "./history-page.test-harness.js";
 import { inboundSubject, outboundSubject, type InboundMessage, type OutboundMessage } from "./nats-client.js";
 import { openMessage, sealMessage } from "./e2e-crypto-browser.js";
 import { generateDevicePopKeyPair } from "./pop-register.js";
@@ -49,7 +50,8 @@ async function setup(options: { timeout?: number; heartbeat?: number; recovery?:
   const received: Array<Extract<OutboundMessage, { type: "user_message" }>> = [];
   const differences: Array<Extract<OutboundMessage, { type: "get_difference" }>> = [];
   const deliver = (frame: InboundMessage, server = FakeNatsWS.instances.at(-1)!) => {
-    server.deliverToClient(OUT, sealMessage({ accountId: AGENT, tenant: TENANT, sub: PEER }, key, frame));
+    server.deliverToClient(OUT, sealMessage({ accountId: AGENT, tenant: TENANT, sub: PEER }, key,
+      ownHistoryPage(wrapper, frame)));
   };
   const row = () => ({
     id: "server-user", role: "user" as const, text: received[0]!.text!,

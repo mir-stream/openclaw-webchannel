@@ -398,6 +398,10 @@ export type InboundMessage = {
    * (`history-serve.ts` is the producer and owns that rule). Loose here like every
    * other field (zero-dep package; runtime discrimination in
    * `inbound-wire-decode.ts`, which REQUIRES all four on a `difference`).
+   *
+   * #401: `nonce` ALSO rides a `history` PAGE, echoing the `load_history.nonce`
+   * it answers; the wrapper folds a page only when that echo is one of its own
+   * outstanding nonces. Optional there (never on the register snapshot).
    */
   afterSeq?: number;
   nonce?: string;
@@ -424,7 +428,9 @@ export type OutboundMessage =
   // #320: `beforeTurnId` completes the page cursor for a TOOL row, which is
   // addressed by the pair `(turnId, id)`. Additive — omitting it is the id-only
   // cursor every older peer sends.
-  | { type: "load_history"; before?: string; beforeTurnId?: string; limit?: number }
+  // #401: `nonce` is the per-request correlation the answering `history` page
+  // echoes, so only the requesting device folds it off the shared `.out`.
+  | { type: "load_history"; before?: string; beforeTurnId?: string; limit?: number; nonce?: string }
   // #244 half B: request the durable events with `seq > afterSeq` — the client's
   // gap-recovery round-trip. Mirrors `channel-contract.ts`'s `get_difference`
   // (zero-dep package, so declared here rather than imported). #356's `nonce` is
@@ -1673,9 +1679,13 @@ export class WebChannelNatsClient {
    * form is this class's shipped public signature, and appending keeps every
    * existing call site compiling and behaving identically. Pass it only for a
    * tool cursor — see `channel-contract.ts`'s `load_history` member.
+   *
+   * #401: `nonce` is appended last for the same reason. It is the caller's to
+   * mint and remember, like `getDifference`'s: the answering page echoes it, and
+   * the wrapper folds only a page echoing a nonce it is waiting for.
    */
-  loadHistory(before?: string, limit?: number, beforeTurnId?: string): void {
-    this.enqueue({ type: "load_history", before, beforeTurnId, limit });
+  loadHistory(before?: string, limit?: number, beforeTurnId?: string, nonce?: string): void {
+    this.enqueue({ type: "load_history", before, beforeTurnId, limit, ...(nonce !== undefined ? { nonce } : {}) });
   }
 
   /**

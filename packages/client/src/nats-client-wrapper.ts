@@ -155,6 +155,22 @@ const GET_DIFFERENCE_TIMEOUT_MS = 5_000;
 const GET_DIFFERENCE_MAX_RETRIES = 3;
 
 /**
+ * #401 — how many `load_history` nonces one device remembers. A page request
+ * has no timeout (an unanswered one costs the user a second click, not data), so
+ * this bound is what keeps a page lost en route from accumulating forever.
+ *
+ * ⚠️ IT MUST BE AT LEAST THE PLUGIN'S `MAX_OUTSTANDING_PAGE_REQUESTS`
+ * (`history-serve.ts`: one page folding + `MAX_QUEUED_PAGE_REQUESTS` = 8 queued
+ * = 9). The server answers up to that many of one peer's requests, in order; a
+ * smaller bound here would evict a nonce whose page is still coming, and that
+ * page would then be dropped as another device's. The client is zero-dependency
+ * and cannot import the plugin constant, so the relation is pinned where both
+ * packages meet: `e2e/history-convergence.test.ts` imports both ("the client
+ * remembers every page the server can owe").
+ */
+export const MAX_OUTSTANDING_HISTORY_PAGES = 9;
+
+/**
  * #356 — THE SEQ CURSOR, AS THE STATE MACHINE TELEGRAM SPECIFIES.
  *
  * This replaces a cursor number plus five satellite fields (`differenceInFlight`,
@@ -1313,6 +1329,8 @@ export class WebChannelNATSClient {
       // #244 half B: this lifecycle will never receive its pending `difference`;
       // stop the timer and drop the buffer so nothing leaks past close().
       this.resetCursorForConnection();
+      // #401: close drops the queued page requests, so their nonces go too.
+      this.historyPageNonces = [];
       // #96: this lifecycle will never see another `turn_settled`. Clear its
       // turns before raw teardown, but delay the public flip until disconnect()
       // has completed so no state listener can reopen onto the old socket.
@@ -1853,7 +1871,7 @@ export class WebChannelNATSClient {
       return;
     }
     if (entry.kind === "load-history") {
-      this.client.loadHistory(entry.before, entry.limit, entry.beforeTurnId);
+      this.client.loadHistory(entry.before, entry.limit, entry.beforeTurnId, this.mintHistoryPageNonce());
       return;
     }
     if (entry.kind === "load-commands") {
@@ -3281,6 +3299,18 @@ export class WebChannelNATSClient {
   private observedHistoryHighWater = 0;
   private historyBaselineEstablished = false;
   private pendingHistorySnapshots: InboundMessage[] = [];
+  /**
+   * #401 — this device's outstanding `load_history` nonces, oldest first. A page
+   * rides the peer's shared `.out`, so every device receives every page; only one
+   * echoing a nonce held here is this device's. See `claimHistoryPage`.
+   *
+   * NOT cleared on raw transport loss: a request still queued in the low-level
+   * client is published on the next session and answered there. Bounded instead
+   * (`MAX_OUTSTANDING_HISTORY_PAGES`), so a page lost en route costs one slot,
+   * not a leak; cleared on `close()`, which drops the queued requests too. A
+   * stale slot can only ever match its own echo, never another device's page.
+   */
+  private historyPageNonces: string[] = [];
   // Only a first, explicitly incomplete snapshot needs reconstruction from
   // zero. The ordinary view keeps live content/receipts while this canonical
   // replay supplies the missing prefix's order, including seal reordering.
@@ -4632,11 +4662,47 @@ export class WebChannelNATSClient {
     if (!this.hasAcceptedApplicationTurn()) this.cancelActiveTurnStallTimer();
   }
 
-  private hydrateHistory(msg: InboundMessage): void {
+  /** Mint, remember and return the correlation nonce for one page request. */
+  private mintHistoryPageNonce(): string {
+    const nonce = randomInboxToken();
+    this.historyPageNonces.push(nonce);
+    if (this.historyPageNonces.length > MAX_OUTSTANDING_HISTORY_PAGES) this.historyPageNonces.shift();
+    return nonce;
+  }
+
+  /**
+   * #401 — may this `history` frame's rows be folded into THIS device's view?
+   *
+   * A register-time SNAPSHOT (it carries `highWaterSeq`) is the newest window and
+   * is meant for every device: always yes. A load-older PAGE is the requester's
+   * alone. Telegram answers `messages.getHistory` on the asking session only; our
+   * page rides the peer's shared `.out`, and `hydrateHistory` inserts unmatched
+   * rows at the head of the view. A device whose window differs from the
+   * requester's would therefore prepend a page that is not contiguous with it,
+   * and its own "load older" — which pages from the view's oldest row — could
+   * never reach the rows in between.
+   *
+   * So a page is folded iff it echoes one of THIS device's outstanding nonces,
+   * which it consumes. A page with no nonce, or another device's, is not. There
+   * is no un-nonced fallback: the protocol 7 exact-match gate means the plugin
+   * on the other end echoes every nonce this wrapper sends.
+   */
+  private claimHistoryPage(msg: InboundMessage): boolean {
+    if (msg.highWaterSeq !== undefined) return true;
+    if (typeof msg.nonce !== "string") return false;
+    const index = this.historyPageNonces.indexOf(msg.nonce);
+    if (index < 0) return false;
+    this.historyPageNonces.splice(index, 1);
+    return true;
+  }
+
+  private hydrateHistory(msg: InboundMessage, foldRows = true): void {
     const rows = Array.isArray(msg.messages) ? msg.messages : [];
     const lifecycle = this.wrapperLifecycleGeneration;
     // Mapping is independent of content freshness. A stale page may still carry
-    // the first explicit acknowledgement of a locally published send.
+    // the first explicit acknowledgement of a locally published send — and so
+    // may another device's page, whose rows are otherwise not folded (#401):
+    // adoption re-keys a bubble this device already holds and inserts nothing.
     for (const row of rows) {
       if (row && row.kind === undefined && row.role === "user" && typeof row.id === "string"
         && row.id.length > 0 && typeof row.text === "string" && typeof row.randomId === "string" && row.randomId.length > 0) {
@@ -4644,6 +4710,7 @@ export class WebChannelNATSClient {
         if (this.wrapperLifecycleGeneration !== lifecycle) return;
       }
     }
+    if (!foldRows) return;
     const existing = this.state.messages;
     const indexes = new Map(existing.map((row, i) => [transcriptEntryKey(row), i]));
     let view = this.durableProjection();
@@ -4781,7 +4848,7 @@ export class WebChannelNATSClient {
   private handleFrame(msg: InboundMessage): boolean {
     switch (msg.type) {
       case "history":
-        this.hydrateHistory(msg);
+        this.hydrateHistory(msg, this.claimHistoryPage(msg));
         this.reconcileRequestStates();
         return true;
 

@@ -9,8 +9,8 @@ import { ConversationKeyStore } from "../packages/plugin/src/conversation-key-st
 import { generateKeyPair } from "../packages/plugin/src/e2e-crypto.js";
 import { NatsChannel } from "../packages/plugin/src/nats-channel.js";
 import type { NatsTransport } from "../packages/plugin/src/nats-transport.js";
-import { createHistoryServer } from "../packages/plugin/src/history-serve.js";
-import { WebChannelNATSClient } from "../packages/client/src/nats-client-wrapper.js";
+import { createHistoryServer, MAX_OUTSTANDING_PAGE_REQUESTS } from "../packages/plugin/src/history-serve.js";
+import { MAX_OUTSTANDING_HISTORY_PAGES, WebChannelNATSClient } from "../packages/client/src/nats-client-wrapper.js";
 import { openMessage } from "../packages/client/src/e2e-crypto-browser.js";
 import { decodeInboundMessage } from "../packages/client/src/inbound-wire-decode.js";
 import type { InboundMessage } from "../packages/client/src/nats-client.js";
@@ -184,13 +184,64 @@ describe("history producer → sealed frame → browser decoder → wrapper", ()
     expect(h.work).toMatchObject([{ rawEventsRead: 0, materializedRowsRead: 0, materializedRowsWritten: 0, pageRowsRead: 1 }]);
     expect(h.wrapper.getState().messages).toMatchObject([{ id: "tool", name: "read_file", argKeys: ["path"], summary: "reading", phase: "end", status: "completed" }]);
     h.channel.sendText("peer", "tail", "tail"); h.deliver();
-    h.server.servePage("peer", { before: "tail", limit: 50 });
+    // #401: the page answers THIS browser's request, so it carries its nonce;
+    // an unsolicited page would be dropped and assert nothing about the merge.
+    const internals = h.wrapper as unknown as { mintHistoryPageNonce(): string; historyPageNonces: string[] };
+    const nonce = internals.mintHistoryPageNonce();
+    h.server.servePage("peer", { before: "tail", limit: 50, nonce });
     while (h.queue.length) h.queue.shift()!();
     h.deliver();
+    // Folded, not dropped: the page was claimed against this browser's nonce.
+    expect(internals.historyPageNonces).not.toContain(nonce);
     expect(h.wrapper.getState().messages.filter(row => row.id === "tool")).toHaveLength(1);
     expect(h.wrapper.getState().messages[0]).toMatchObject({ name: "read_file", argKeys: ["path"], phase: "end", status: "completed" });
   });
 
+
+  it("#401: the client remembers every page the server can owe", () => {
+    // The server answers one folding page plus a full queue per peer, in order.
+    // A smaller client bound would evict a nonce whose page is still coming,
+    // and that page would be dropped on arrival as another device's.
+    expect(MAX_OUTSTANDING_PAGE_REQUESTS).toBe(9);
+    expect(MAX_OUTSTANDING_HISTORY_PAGES).toBeGreaterThanOrEqual(MAX_OUTSTANDING_PAGE_REQUESTS);
+  });
+
+  it("#401: a load-older page supplies the rows only it carries, to the requesting browser only", () => {
+    const h = setup();
+    // One row more than the snapshot window (limit 50): `page-only` is reachable
+    // ONLY through a page, so its presence proves the page was folded.
+    h.journal.append("peer", { kind: "bubble", answerId: "page-only", text: "older than the window" });
+    for (let i = 1; i <= 50; i++) h.journal.append("peer", { kind: "bubble", answerId: `b${i}`, text: `${i}` });
+    const other = new WebChannelNATSClient({ natsUrl: "ws://127.0.0.1:4222", bootstrapJwt: "test",
+      accountId: "account", tenant: "tenant", peerId: "peer",
+      registration: { devicePrivateKey: {} as CryptoKey, deviceX25519PrivateKey: {} as CryptoKey } });
+    cleanups.push(() => other.close());
+    const otherInner = other as unknown as { handleMessage(m: InboundMessage): void };
+    // Every sealed frame on the shared `.out` reaches BOTH browsers of the peer.
+    const broadcast = () => {
+      for (const frame of h.transport.frames.splice(0)) {
+        const message = h.decode(frame);
+        h.inner.handleMessage(message);
+        otherInner.handleMessage(message);
+      }
+    };
+    h.snapshot(); broadcast();
+    const window = Array.from({ length: 50 }, (_, i) => `b${i + 1}`);
+    expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(window);
+    expect(other.getState().messages.map((m) => m.id)).toEqual(window);
+
+    // The wrapper's real request path, answered by the real pager.
+    (h.inner.client as unknown as {
+      loadHistory(before?: string, limit?: number, beforeTurnId?: string, nonce?: string): void;
+    }).loadHistory = (before, limit, beforeTurnId, nonce) =>
+      h.server.servePage("peer", { before, limit, beforeTurnId, nonce });
+    h.wrapper.loadHistory({ before: "b1" });
+    while (h.queue.length) h.queue.shift()!();
+    broadcast();
+
+    expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(["page-only", ...window]);
+    expect(other.getState().messages.map((m) => m.id)).toEqual(window);
+  });
 
   it("adopts only the exact optimistic origin from materialized history before its acknowledgement", () => {
     const h = setup();

@@ -27,6 +27,31 @@
   reports a publish failure as a failed send, and the three refusals above the
   journal (disposed, transport down, no session key) are unchanged.
 
+### Breaking (wire protocol v7)
+
+Gateway plugin and browser client require a paired upgrade to protocol 7
+(protocol 6 was never released); the exact-match register gate refuses every
+other version. One reason per bullet, matching `protocol.ts`:
+
+- **v6 — durable cancellation ACK evidence.** `ack.cancelled` carries the exact
+  wire ids whose cancellation is durable, a subset of the same frame's `ids`.
+- **v7 — history page correlation (#401).** A `load_history` request's `nonce`
+  (optional on the wire; refused at the door only when present and unusable,
+  same bound as `get_difference.nonce`) is echoed verbatim as `history.nonce` on
+  the page that answers it, and is counted in that page's `max_payload` byte
+  budget. The register snapshot is never correlated. `sendHistory` gained an
+  optional 5th `nonce` argument.
+
+### Changed (history pages)
+
+- **Concurrent page requests from one peer are queued, not dropped (#401).** A
+  page now answers exactly one device's nonce, so the old drop-a-concurrent-page
+  latch turned a second device's click into nothing. Requests are answered one
+  fold at a time, in order, with at most 8 queued behind the one in flight
+  (`MAX_QUEUED_PAGE_REQUESTS`); past that a new request is dropped and warned
+  under the existing throttled `dropped` diagnostic. A read fault still starts
+  the next queued request.
+
 ### Breaking (wire protocol v4)
 
 - **`WEBCHANNEL_PROTOCOL_VERSION` goes 3 → 4 (#246).** The register gate is

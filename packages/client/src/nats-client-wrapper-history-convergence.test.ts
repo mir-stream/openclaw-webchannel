@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
+import { ownHistoryPage } from "./history-page.test-harness.js";
 import type { InboundMessage } from "./nats-client.js";
 
 function setup() {
@@ -14,7 +15,7 @@ function setup() {
     resetCursorForConnection(): void;
   };
   inner.client.getDifference = vi.fn();
-  return { wrapper, inner, send: (m: InboundMessage) => inner.handleMessage(m) };
+  return { wrapper, inner, send: (m: InboundMessage) => inner.handleMessage(ownHistoryPage(wrapper, m)) };
 }
 
 describe("#342 history row authority", () => {
