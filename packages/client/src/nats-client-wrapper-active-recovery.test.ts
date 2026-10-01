@@ -45,7 +45,7 @@ async function setup(options: { timeout?: number; heartbeat?: number; recovery?:
   const key = new Uint8Array(32).fill(39);
   const registration = registerAgent(key, x.publicRaw, identity);
   const control = { admitted: true, ack: true, answerDifferences: true, registrations: 0, interrupted: false, settleBeforeAck: false,
-    cancelled: new Set<string>() };
+    cancelled: new Set<string>(), started: false };
   const received: Array<Extract<OutboundMessage, { type: "user_message" }>> = [];
   const differences: Array<Extract<OutboundMessage, { type: "get_difference" }>> = [];
   const deliver = (frame: InboundMessage, server = FakeNatsWS.instances.at(-1)!) => {
@@ -64,7 +64,11 @@ async function setup(options: { timeout?: number; heartbeat?: number; recovery?:
         control.admitted = true;
       }
       return Promise.resolve(registration(subject, payload, server, reply)).then(() => {
-        if (isRegister) deliver({ type: "history", highWaterSeq: control.interrupted ? 2 : 0,
+        // #396: `started` models the replacement session's snapshot of a turn
+        // the plugin is still running.
+        if (isRegister && control.started) deliver({ type: "history", highWaterSeq: 2,
+          messages: [{ ...row(), requestState: "started" }] }, server);
+        else if (isRegister) deliver({ type: "history", highWaterSeq: control.interrupted ? 2 : 0,
           messages: control.interrupted && options.recovery === "snapshot" ? [row()] : [] }, server);
       });
     }
@@ -107,6 +111,73 @@ async function withClock() {
   expect(receipt.snapshot().state).toBe("accepted");
   return { ...h, receipt, request, turnId: h.received[0]!.id! };
 }
+
+// Runs before the fake-timer suite below: these real-time cases must not inherit
+// a restored `setTimeout` spy that was taken while fake timers were installed.
+describe("#396 quiet-turn liveness (plugin typing keepalive)", () => {
+  it("keeps a quiet accepted turn active, without recovery, while typing keepalives arrive inside every stall window", async () => {
+    const h = await setup({ timeout: 200 });
+    const receipt = h.wrapper.send("long tool call, streaming off")!;
+    expect(receipt.snapshot().state).toBe("accepted");
+    h.deliver({ type: "typing" });
+    // Several stall windows of silence except the keepalive (cadence < timeout,
+    // as the plugin's 4s against the client's 30s default).
+    for (let i = 0; i < 15; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      h.deliver({ type: "typing" });
+      expect(h.wrapper.getState()).toMatchObject({ connected: true, isTyping: true, turnActive: true });
+    }
+    expect(h.control.registrations).toBe(1);
+    expect(receipt.snapshot().state).toBe("accepted");
+    expect(h.received).toHaveLength(1);
+    // Sensitivity: the same turn without the keepalive does trip recovery.
+    await settleUntil(() => h.control.registrations === 2, { label: "recovery once the keepalive stops" });
+  });
+
+  it("restores turnActive from the server's started state after a recovery, keeping one recovery per silent interval", async () => {
+    const h = await setup({ timeout: 80 });
+    const receipt = h.wrapper.send("silent operation")!;
+    expect(h.wrapper.getState().turnActive).toBe(true);
+    h.control.started = true; // The replacement plugin is still running the turn.
+    await settleUntil(() => h.control.registrations === 2 && h.wrapper.getState().connected,
+      { label: "one active-turn recovery" });
+    await settleUntil(() => h.wrapper.getState().turnActive === true, { label: "turnActive from server state" });
+    expect(receipt.snapshot().state).toBe("accepted");
+    expect(h.received).toHaveLength(1);
+    // Server state is not activity evidence: no second recovery for this interval.
+    await new Promise((resolve) => setTimeout(resolve, 5 * 80));
+    expect(h.control.registrations).toBe(2);
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+    expect(h.wrapper.getState().turnActive).toBe(true);
+
+    // The re-opened turn still ends on its own settle, and a later reconcile of
+    // the same (still `started`) row cannot resurrect a settled turn.
+    h.deliver({ type: "turn_settled", turnId: h.received[0]!.id, outcome: "ok" });
+    expect(receipt.snapshot().state).toBe("completed");
+    expect(h.wrapper.getState()).toMatchObject({ turnActive: false, isTyping: false });
+    h.deliver({ type: "request_state", id: "unrelated-row", state: "completed" });
+    expect(h.wrapper.getState().turnActive).toBe(false);
+  });
+
+  it("re-opens behind a newer post-reconnect send in publish order, so the older settle cannot close it", async () => {
+    const h = await setup({ timeout: 300 });
+    const older = h.wrapper.send("silent operation")!;
+    await settleUntil(() => h.control.registrations === 2 && h.wrapper.getState().connected,
+      { label: "one active-turn recovery" });
+    expect(h.wrapper.getState().turnActive).toBe(false); // Snapshot carried no open row.
+    const newer = h.wrapper.send("follow-up")!;
+    expect(newer.snapshot().state).toBe("accepted");
+    expect(h.wrapper.getState().turnActive).toBe(true);
+    // Later server evidence that the OLDER turn is still running.
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [{ ...h.row(), requestState: "started" }] });
+    // Settling the older turn sweeps only its publish-order prefix.
+    h.deliver({ type: "turn_settled", turnId: h.received[0]!.id, outcome: "ok" });
+    expect(older.snapshot().state).toBe("completed");
+    expect(h.wrapper.getState().turnActive).toBe(true);
+    h.deliver({ type: "turn_settled", turnId: h.received[1]!.id, outcome: "ok" });
+    expect(h.wrapper.getState().turnActive).toBe(false);
+  });
+});
 
 describe("accepted-turn application recovery", () => {
   it.each(["snapshot", "difference"] as const)(
