@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 
-import { resolveCommandGate } from "./command-gate.js";
+import { resolveCommandGate, resolvePeerCommandAuthorization } from "./command-gate.js";
+import { resolveDmAdmission } from "./dm-allowlist.js";
 import type { CommandGateConfig } from "./command-gate.js";
 
 /**
@@ -142,5 +143,33 @@ describe("resolveCommandGate — commands.ownerAllowFrom (owner enforcement)", (
     const gate = resolveCommandGate(cfg, ACCOUNT);
     expect(gate.isListed("alice")).toBe(true);
     expect(gate.isListed("bob")).toBe(false);
+  });
+});
+
+// #407 / TD-2: the single command-authorization decision. Every peer the DM
+// policy admits is authorized for every registered command.
+describe("resolvePeerCommandAuthorization", () => {
+  it("authorizes every admitted peer, whatever admitted it", () => {
+    for (const cfg of [
+      undefined,
+      { dmSecurity: "open" },
+      { dmSecurity: "allowlist", allowFrom: ["alice"] },
+    ]) {
+      const admission = resolveDmAdmission("alice", cfg);
+      expect(admission.allowed).toBe(true);
+      expect(resolvePeerCommandAuthorization({ admission, peerId: "alice", accountId: ACCOUNT }))
+        .toBe(true);
+    }
+  });
+
+  it("does not authorize a peer the DM policy denies", () => {
+    for (const cfg of [
+      { dmSecurity: "allowlist", allowFrom: ["bob"] },
+      { dmSecurity: "allowlist", allowFrom: [] },
+    ]) {
+      const admission = resolveDmAdmission("alice", cfg);
+      expect(resolvePeerCommandAuthorization({ admission, peerId: "alice", accountId: ACCOUNT }))
+        .toBe(false);
+    }
   });
 });

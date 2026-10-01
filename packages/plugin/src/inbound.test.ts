@@ -14,6 +14,8 @@ import { DurableSendError } from "./durable-send-error.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
+import { buildChannelInboundEventContext } from "openclaw/plugin-sdk/channel-inbound";
+import { resolveCommandAuthorization } from "openclaw/plugin-sdk/command-auth";
 import type { GetReplyOptions } from "openclaw/plugin-sdk/reply-runtime";
 
 import {
@@ -62,9 +64,10 @@ function handleInboundMessage(
  * P1-8a — `handleInboundMessage` control-lane behaviour.
  *
  * Two invariants:
- *  - The abort authorization stamp (`access.commands.authorized`) is passed into
- *    core's `buildContext` ONLY for control-lane turns — never for ordinary
- *    turns (we must not broadly authorize text commands for every peer).
+ *  - The command authorization stamp (`access.commands.authorized`) is passed
+ *    into core's `buildContext` for EVERY admitted turn, control-lane and
+ *    ordinary alike (#407, TD-2: every admitted peer may run every registered
+ *    command; the decision lives in `resolvePeerCommandAuthorization`).
  *  - Terminal draft drain: when core aborts the RUNNING turn its `inbound.run`
  *    resolves WITHOUT delivering a final. The controller settles real lane
  *    text in generation order, or a lone visible tool scaffold for the
@@ -395,7 +398,7 @@ describe("handleInboundMessage — control-lane authorization stamp", () => {
     expect(finalizes).toEqual([]);
   });
 
-  it("stamps access.commands.authorized=true ONLY for controlLane turns", async () => {
+  it("stamps access.commands.authorized=true for controlLane turns", async () => {
     const { api, captured } = makeFakeApi({
       streamingMode: "off",
       runImpl: async () => {},
@@ -409,20 +412,67 @@ describe("handleInboundMessage — control-lane authorization stamp", () => {
     expect(captured.buildContext?.access?.commands?.authorized).toBe(true);
   });
 
-  it("does NOT stamp authorization for ordinary (non-control-lane) turns", async () => {
+  // #407. This replaces the earlier "does NOT stamp ordinary turns" contract:
+  // without the stamp core silently dropped `/new`, `/reset`, `/model`, … for
+  // every peer, while the widget's slash menu still offered them.
+  it("stamps access.commands.authorized=true for ordinary admitted turns", async () => {
+    for (const text of ["hello there", "/new", "/reset", "/model"]) {
+      const { api, captured } = makeFakeApi({
+        streamingMode: "off",
+        runImpl: async () => {},
+      });
+      const { transport } = makeFakeTransport();
+
+      await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text });
+
+      expect(captured.buildContext?.access?.commands?.authorized, text).toBe(true);
+    }
+  });
+
+  it("makes core treat an admitted peer's /new as an authorized command", async () => {
+    // The stamp only matters through core: rebuild the turn context with the
+    // pinned SDK's real builder (the one behind `channelRuntime.inbound.
+    // buildContext`) and ask core's own command authorization. Unauthorized,
+    // core's get-reply returns with no reply for a whole-message `/new`.
     const { api, captured } = makeFakeApi({
       streamingMode: "off",
       runImpl: async () => {},
+      channelConfig: { dmSecurity: "allowlist", allowFrom: ["peer-1"] },
     });
     const { transport } = makeFakeTransport();
 
-    await handleInboundMessage(api, transport, "peer-1", {
-      type: "user_message",
-      text: "hello there",
-    });
+    await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text: "/new" });
 
-    // No `access` key at all — the ordinary path must not touch command authz.
-    expect(captured.buildContext?.access).toBeUndefined();
+    const ctx = buildChannelInboundEventContext(
+      captured.buildContext as unknown as Parameters<typeof buildChannelInboundEventContext>[0],
+    );
+    expect(ctx.CommandAuthorized).toBe(true);
+    expect(
+      resolveCommandAuthorization({ ctx, cfg: {}, commandAuthorized: ctx.CommandAuthorized === true })
+        .isAuthorizedSender,
+    ).toBe(true);
+    // The operator allowlist trap is unchanged: core ignores the stamp and
+    // decides by membership (command-gate.ts).
+    expect(
+      resolveCommandAuthorization({
+        ctx,
+        cfg: { commands: { allowFrom: { webchannel: ["someone-else"] } } },
+        commandAuthorized: ctx.CommandAuthorized === true,
+      }).isAuthorizedSender,
+    ).toBe(false);
+  });
+
+  it("never builds a context for a peer the DM policy denies", async () => {
+    const { api, captured } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async () => {},
+      channelConfig: { dmSecurity: "allowlist", allowFrom: ["someone-else"] },
+    });
+    const { transport } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text: "/new" });
+
+    expect(captured.buildContext).toBeUndefined();
   });
 });
 

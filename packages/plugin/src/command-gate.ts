@@ -81,8 +81,41 @@
  * peerId against the trimmed list entries, plus the `"*"` wildcard.
  */
 
+import type { DmAdmission } from "./dm-allowlist.js";
+
 /** Core resolves `commands.allowFrom` by the channel's provider id. */
 const WEBCHANNEL_PROVIDER_ID = "webchannel";
+
+/**
+ * The plugin's single command-authorization decision (#407): the value stamped
+ * as `access.commands.authorized` on EVERY turn context we hand core, ordinary
+ * and control-lane alike.
+ *
+ * Core reads that stamp as `ctx.CommandAuthorized`. Unstamped, it is false, and
+ * core then drops a whole-message control command (`/new`, `/reset`, `/model`,
+ * …) with NO reply — the widget's slash menu offered a command that does
+ * nothing. Telegram stamps every message with the result of its DM-allowlist
+ * command gate (`bot-message-context.body.ts`); we stamp the result of ours.
+ *
+ * DECISION (TD-2, see docs/TELEGRAM_DIVERGENCES.md): every peer the DM policy
+ * admits is authorized for every registered command. Telegram authorizes only
+ * allowlisted peers; webchannel peers are JWT-authenticated by the tenant and
+ * forced into their own per-peer session (`resolveWebchannelSessionRoute`), so
+ * a command can only ever act on the sender's own session. Tenant-managed
+ * command permissions will be a server-side policy that plugs in HERE — keep
+ * every call site going through this function so that hook has one home.
+ *
+ * This does not override the allowlist trap in the module doc above: when an
+ * operator configures `commands.allowFrom` / `commands.ownerAllowFrom`, core
+ * ignores the stamp and decides by membership, exactly as before.
+ */
+export function resolvePeerCommandAuthorization(params: {
+  admission: DmAdmission;
+  peerId: string;
+  accountId: string;
+}): boolean {
+  return params.admission.allowed;
+}
 
 /**
  * Structural view of the only config we read. Kept loose (not the full
