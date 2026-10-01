@@ -1081,6 +1081,9 @@ export async function handleInboundMessage(
   // remaining `resolveWebchannelSessionRoute` in production. The forced scope is
   // NOT vestigial — the write-side reason above is the stronger one, and it is
   // now the whole reason. See `session-route.ts`'s module docblock.
+  // Core-initiated outbound (#403) mirrors into this same session through the
+  // shared `buildWebchannelPeerSessionKey`; it is an outbound route, not an
+  // inbound dispatch site.
   const route = resolveWebchannelSessionRoute(api, accountId, wsKey, servingTenant);
   options?.beforeCore?.(route.agentId, route.sessionKey);
 

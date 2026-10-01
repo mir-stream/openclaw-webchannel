@@ -14,11 +14,13 @@
  *
  * Inbound dispatch is the production derivation site. Dispatch, last-route and
  * stop must use its returned key; journal history does not derive a core key.
+ * Core-initiated outbound (#403) mirrors into the same session by calling the
+ * same builder from `outbound-target.ts`.
  */
 
 import { createHash } from "node:crypto";
 
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
+import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 import {
   buildAgentSessionKey,
   deriveLastRoutePolicy,
@@ -87,6 +89,33 @@ function sessionPeerId(
   return `p:${Buffer.from(peerId, "ascii").toString("hex")}`;
 }
 
+/**
+ * The ONE peer session-key builder. Inbound dispatch and core-initiated
+ * outbound (#403, `resolveOutboundSessionRoute`) must agree byte-for-byte, so
+ * neither site may restate the scope, the peer encoding or the tenant suffix.
+ */
+export function buildWebchannelPeerSessionKey(params: {
+  cfg: Pick<OpenClawConfig, "session">;
+  agentId: string;
+  accountId: string;
+  peerId: string;
+  servingTenant: string;
+}): string {
+  assertValidSubjectToken(params.peerId, "peerId");
+  assertValidSubjectToken(params.servingTenant, "tenant");
+  const baseSessionKey = buildAgentSessionKey({
+    agentId: params.agentId,
+    channel: WEBCHANNEL_ID,
+    accountId: params.accountId,
+    peer: {
+      kind: "direct",
+      id: sessionPeerId(WEBCHANNEL_ID, params.peerId, params.cfg.session?.identityLinks),
+    },
+    dmScope: WEBCHANNEL_ENFORCED_DM_SCOPE,
+  });
+  return `${baseSessionKey}:tenant:${scopeToken(params.servingTenant)}:peer-v2`;
+}
+
 /** Resolve bindings with the raw identity; encode only the core session peer. */
 export function resolveWebchannelSessionRoute(
   api: OpenClawPluginApi,
@@ -103,20 +132,15 @@ export function resolveWebchannelSessionRoute(
     peer: { kind: "direct", id: peerId },
   });
 
-  const baseSessionKey = buildAgentSessionKey({
-    agentId: route.agentId,
-    channel: route.channel,
-    accountId: route.accountId,
-    peer: {
-      kind: "direct",
-      id: sessionPeerId(route.channel, peerId, api.config.session?.identityLinks),
-    },
-    dmScope: WEBCHANNEL_ENFORCED_DM_SCOPE,
-  });
-
   // Never re-resolve the tenant from config/env: admission and NATS remain
   // bound to the immutable tenant captured by this account's serving plan.
-  const sessionKey = `${baseSessionKey}:tenant:${scopeToken(servingTenant)}:peer-v2`;
+  const sessionKey = buildWebchannelPeerSessionKey({
+    cfg: api.config,
+    agentId: route.agentId,
+    accountId: route.accountId,
+    peerId,
+    servingTenant,
+  });
   return {
     ...route,
     sessionKey,
