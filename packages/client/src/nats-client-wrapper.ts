@@ -40,6 +40,7 @@ import {
 import {
   applyDurableEvent,
   projectDurableFromClient,
+  requestFailureCauseOf,
   type DurableEvent,
   type DurableView,
 } from "./durable-view-reducer.js";
@@ -3112,6 +3113,7 @@ export class WebChannelNATSClient {
         id: entry.id,
         role: entry.role,
         ...(entry.requestState ? { requestState: entry.requestState } : {}),
+        ...(entry.failureCause ? { failureCause: entry.failureCause } : {}),
         ...(entry.retryOf ? { retryOf: entry.retryOf } : {}),
         ...(entry.revision !== undefined ? { revision: entry.revision } : {}),
         ...(entry.edited !== undefined ? { edited: entry.edited } : {}),
@@ -4623,7 +4625,16 @@ export class WebChannelNATSClient {
       this.settleApplicationTurnsThrough(turnId);
       if (row.requestState === "interrupted") this.promoteAnchor(turnId, "interrupted");
       else if (row.requestState === "completed") this.promoteAnchor(turnId, "completed");
-      else this.promoteAnchor(turnId, "failed", { reason: row.requestState === "cancelled" ? "cancelled" : "turn-failed", retryable: row.requestState === "failed" });
+      else {
+        // #404: the durable cause rides the first (and only) failed transition,
+        // so a live frame, a history page and a difference all fail it alike.
+        const cause = requestFailureCauseOf(row.requestState, row.failureCause);
+        this.promoteAnchor(turnId, "failed", {
+          reason: row.requestState === "cancelled" ? "cancelled" : "turn-failed",
+          retryable: row.requestState === "failed",
+          ...(cause ? { cause } : {}),
+        });
+      }
       this.retireBufferedProgress(turnId);
       const closed = this.closeTurnsThrough(placement);
       this.finalizeDraftsForTurn(turnId);
@@ -4704,7 +4715,9 @@ export class WebChannelNATSClient {
       view = completeToolVersion ? applyDurableEvent(view, decoded.event)
         : this.rowVersions.apply(view, decoded.event, row.seq);
       if (decoded.event.kind === "user" && decoded.event.requestState) {
-        view = applyDurableEvent(view, { kind: "requestState", id: row.id, state: decoded.event.requestState });
+        const failureCause = requestFailureCauseOf(decoded.event.requestState, row.failureCause);
+        view = applyDurableEvent(view, { kind: "requestState", id: row.id, state: decoded.event.requestState,
+          ...(failureCause ? { failureCause } : {}) });
       }
       if (row.kind === undefined && row.revision !== undefined && isWireSeq(row.revision)) {
         view = applyDurableEvent(view, { kind: "messageEdited", id: row.id,
@@ -5235,7 +5248,9 @@ export class WebChannelNATSClient {
 
       case "request_state": {
         if (!msg.id || !msg.state) return false;
-        this.applyDurable({ kind: "requestState", id: msg.id, state: msg.state });
+        const failureCause = requestFailureCauseOf(msg.state, msg.failureCause);
+        this.applyDurable({ kind: "requestState", id: msg.id, state: msg.state,
+          ...(failureCause ? { failureCause } : {}) });
         this.reconcileRequestStates();
         return true;
       }

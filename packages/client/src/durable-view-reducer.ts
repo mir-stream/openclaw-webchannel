@@ -234,6 +234,21 @@
 
 export type RequestState = "queued" | "started" | "completed" | "failed" | "interrupted" | "cancelled";
 
+/**
+ * #404: why a request ended `failed`, when the server classified it. Durable
+ * like the state it qualifies, so a reload or another device reads the same
+ * fact. `empty` — the agent finished the turn without any visible reply.
+ * Additive and optional: absent means unclassified, and an older reader ignores
+ * it and still sees a plain `failed`.
+ */
+export type RequestFailureCause = "empty";
+
+/** Only a `failed` row carries a cause, and only one this build knows. */
+export const requestFailureCauseOf = (
+  state: RequestState | undefined,
+  cause: unknown,
+): RequestFailureCause | undefined => (state === "failed" && cause === "empty" ? "empty" : undefined);
+
 export type DurableRole = "user" | "agent";
 
 /**
@@ -311,6 +326,8 @@ export type DurableMessage =
       readonly id: string;
       readonly role: DurableRole;
       readonly requestState?: RequestState;
+      /** #404: see `RequestFailureCause`. Present only with `requestState: "failed"`. */
+      readonly failureCause?: RequestFailureCause;
       readonly retryOf?: string;
       readonly text: string;
       readonly turnId?: string;
@@ -723,7 +740,7 @@ export type DurableEvent =
    * an older row / an older client's send ⇒ the fold falls back to append (safe).
    */
   | { kind: "user"; id: string; text: string; turnId?: string; randomId?: string; requestState?: RequestState; retryOf?: string }
-  | { kind: "requestState"; id: string; state: RequestState }
+  | { kind: "requestState"; id: string; state: RequestState; failureCause?: RequestFailureCause }
   | { kind: "placement"; answerId: string; turnId?: string }
   | { kind: "bubble"; answerId: string; text: string; turnId?: string }
   | {
@@ -900,9 +917,12 @@ export function applyDurableEvent(
       const index = view.findIndex(m => m.kind === "text" && m.role === "user" && m.id === event.id);
       if (index === -1) return view;
       const prior = view[index];
-      if (prior.kind !== "text" || prior.deleted || prior.requestState === event.state) return view;
+      const failureCause = requestFailureCauseOf(event.state, event.failureCause);
+      if (prior.kind !== "text" || prior.deleted
+        || (prior.requestState === event.state && prior.failureCause === failureCause)) return view;
       const next = view.slice();
-      next[index] = { ...prior, requestState: event.state };
+      const { failureCause: _priorCause, ...rest } = prior;
+      next[index] = { ...rest, requestState: event.state, ...(failureCause ? { failureCause } : {}) };
       return next;
     }
     case "placement":
@@ -1684,7 +1704,7 @@ function applySeal(
  * durable fields is a compile error there.
  */
 type ClientTranscriptEntry =
-  | { kind?: undefined; id: string; role: DurableRole; text: string; turnId?: string; draftOnly?: boolean; revision?: number; edited?: boolean; requestState?: RequestState; retryOf?: string }
+  | { kind?: undefined; id: string; role: DurableRole; text: string; turnId?: string; draftOnly?: boolean; revision?: number; edited?: boolean; requestState?: RequestState; failureCause?: RequestFailureCause; retryOf?: string }
   | { kind: "reasoning"; id: string; turnId: string; text: string }
   | {
       kind: "tool";
@@ -1789,6 +1809,7 @@ export function projectDurable(messages: ClientTranscriptEntry[]): DurableView {
       text: m.text,
       turnId: m.turnId,
       ...(m.requestState !== undefined ? { requestState: m.requestState } : {}),
+      ...(m.failureCause !== undefined ? { failureCause: m.failureCause } : {}),
       ...(m.retryOf !== undefined ? { retryOf: m.retryOf } : {}),
       ...(m.revision !== undefined ? { revision: m.revision } : {}),
       ...(m.edited !== undefined ? { edited: m.edited } : {}),

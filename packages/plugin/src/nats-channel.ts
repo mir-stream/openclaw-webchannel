@@ -479,7 +479,8 @@ export class NatsChannel implements WebChannelPeerChannel {
   setDispatchOwnerFence(active: () => boolean): void { this.dispatchOwnerActive = active; }
 
   sendRequestState(change: DispatchChange): boolean {
-    return this.sendToPeer(change.peerId, { type: "request_state", id: change.id, state: change.state, turnId: change.turnId, seq: change.seq });
+    return this.sendToPeer(change.peerId, { type: "request_state", id: change.id, state: change.state, turnId: change.turnId, seq: change.seq,
+      ...(change.failureCause ? { failureCause: change.failureCause } : {}) });
   }
 
   registerPeer(peerId: string): void {

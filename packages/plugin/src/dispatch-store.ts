@@ -1,14 +1,15 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { runSqliteImmediateTransactionSync } from "openclaw/plugin-sdk/sqlite-runtime";
-import type { DurableEvent, RequestState } from "../../client/src/durable-view-reducer.js";
+import type { DurableEvent, RequestFailureCause, RequestState } from "../../client/src/durable-view-reducer.js";
 
 export type DispatchInput = { text: string; turnId: string; randomId?: string; retryOf?: string };
 export type DispatchRow = {
   peerId: string; key: string; messageId: string; seq: number;
   input: DispatchInput; state: RequestState; owner?: string; batch?: string; stateSeq?: number;
 };
-export type DispatchChange = { peerId: string; id: string; turnId: string; state: RequestState; seq: number };
+/** #404: `failureCause` only on a `failed` change the turn classified; journaled with it. */
+export type DispatchChange = { peerId: string; id: string; turnId: string; state: RequestState; seq: number; failureCause?: RequestFailureCause };
 export type CoreDispatchBinding = { processId: string; agentId: string; sessionKey: string; storePath: string; owner: string; batch: string; peerId: string };
 /** `retryOf` is the VALIDATED provenance actually stored, never the requested one. */
 export type UserCommit = { messageId: string; seq: number; inserted: boolean; retryOf?: string };
@@ -28,7 +29,7 @@ export interface DispatchStore {
   queued(peerId?: string, after?: number, limit?: number): DispatchRow[];
   peers(after?: string, limit?: number): string[];
   claim(owner: string, peerId: string, keys: readonly string[]): DispatchRow[];
-  settle(owner: string, peerId: string, batch: string, state: "completed" | "failed" | "interrupted"): DispatchChange[];
+  settle(owner: string, peerId: string, batch: string, state: "completed" | "failed" | "interrupted", failureCause?: RequestFailureCause): DispatchChange[];
   recoverInterrupted(owner: string): DispatchChange[];
   cancel(owner: string, peerId: string): DispatchChange[];
 }
@@ -69,11 +70,14 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
     const row = sql("SELECT cancel_buffered,target_count FROM journal_stop WHERE peer_id=? AND logical_key=?").get(peer, key) as { cancel_buffered: number; target_count: number } | undefined;
     return row && { key, cancelBuffered: row.cancel_buffered === 1, targetCount: Number(row.target_count) };
   };
-  const transition = (rows: Stored[], state: RequestState): DispatchChange[] => rows.map((row) => {
+  // #404: the cause lives only in the journal event (an optional JSON field),
+  // never in `journal_dispatch`, so the dispatch schema is unchanged.
+  const transition = (rows: Stored[], state: RequestState, failureCause?: RequestFailureCause): DispatchChange[] => rows.map((row) => {
     sql("UPDATE journal_dispatch SET state=? WHERE peer_id=? AND logical_key=?").run(state, row.peer_id, row.logical_key);
     const input = JSON.parse(row.payload) as DispatchInput;
-    const { seq } = appendEvent(row.peer_id, { kind: "requestState", id: row.message_id, state });
-    return { peerId: row.peer_id, id: row.message_id, turnId: input.turnId, state, seq };
+    const cause = state === "failed" && failureCause ? { failureCause } : {};
+    const { seq } = appendEvent(row.peer_id, { kind: "requestState", id: row.message_id, state, ...cause });
+    return { peerId: row.peer_id, id: row.message_id, turnId: input.turnId, state, seq, ...cause };
   });
   return {
     lookupStop,
@@ -164,9 +168,9 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
       }
       return rows.sort((a, b) => a.seq - b.seq);
     }),
-    settle: (owner, peer, batch, state) => runSqliteImmediateTransactionSync(db, () => {
+    settle: (owner, peer, batch, state, failureCause) => runSqliteImmediateTransactionSync(db, () => {
       checkOwner(owner);
-      const changes = transition(sql("SELECT * FROM journal_dispatch WHERE peer_id=? AND owner=? AND batch=? AND state='started' ORDER BY user_seq").all(peer, owner, batch) as Stored[], state);
+      const changes = transition(sql("SELECT * FROM journal_dispatch WHERE peer_id=? AND owner=? AND batch=? AND state='started' ORDER BY user_seq").all(peer, owner, batch) as Stored[], state, failureCause);
       // The SDK's abort race can return before underlying core work persists a
       // terminal session state. A late settlement of cancelled/interrupted work
       // must keep the binding for verified startup retirement, even when other

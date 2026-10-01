@@ -166,6 +166,16 @@ describe("#246 half A — decodeInboundMessage: the durable frames", () => {
   });
 });
 
+describe("#404 — decodeInboundMessage: request_state failureCause", () => {
+  it("never refuses a request_state for its failureCause", () => {
+    // The reducer keeps only a cause this build knows; refusing the frame would
+    // drop the state transition itself, which is the worse failure.
+    for (const failureCause of ["empty", "rate-limited", 1, null, {}]) {
+      accepts({ type: "request_state", id: "u1", turnId: "t1", state: "failed", seq: 3, failureCause });
+    }
+  });
+});
+
 describe("#246 half A — decodeInboundMessage: the approval frames", () => {
   it("approval_request refuses an id-less card and a mistyped payload", () => {
     refuses({ ...(VALID.approval_request as object), id: "" });

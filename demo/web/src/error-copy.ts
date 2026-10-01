@@ -56,6 +56,13 @@ const COPY: Record<WebChannelErrorCause, TerminalErrorCopy> = {
     hint: "Registration failed on the agent — re-authenticate to retry, or try again later.",
     showReauth: true,
   },
+  // #404: only ever reaches the UI as a `turn-failed` send cause (see
+  // `sendStatusCopy`); the entry exists because the Record is exhaustive.
+  empty: {
+    heading: "No response generated",
+    hint: "The agent finished without replying — send the message again to retry.",
+    showReauth: false,
+  },
   unknown: {
     heading: "Connection failed",
     hint: "The connection ended with an unrecoverable error.",
@@ -92,11 +99,19 @@ export function sendStatusCopy(message: ChatBubble): { label: string; hint?: str
           hint: "The agent did not accept this message. Restore the draft and send when ready.",
           restoreDraft,
         };
-        case "turn-failed": return {
-          label: "Request failed after acceptance",
-          hint: "The task may have had effects. Check the result before sending again.",
-          restoreDraft,
-        };
+        case "turn-failed": return failure.cause === "empty"
+          ? {
+              // #404: the agent ran and produced nothing visible. Not a crash,
+              // and no placeholder agent bubble exists — this line is the signal.
+              label: "No response generated",
+              hint: "The agent finished without replying. Restore the draft and send it again to retry.",
+              restoreDraft,
+            }
+          : {
+              label: "Request failed after acceptance",
+              hint: "The task may have had effects. Check the result before sending again.",
+              restoreDraft,
+            };
         case "evicted": return {
           label: "Send failed · delivery unconfirmed",
           hint: "The delivery tracking limit was reached. The task may have run; check before sending again.",

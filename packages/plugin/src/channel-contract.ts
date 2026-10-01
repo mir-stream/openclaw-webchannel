@@ -1,4 +1,4 @@
-import type { RequestState } from "../../client/src/durable-view-reducer.js";
+import type { RequestFailureCause, RequestState } from "../../client/src/durable-view-reducer.js";
 import { ANON_PEER_ID } from "./auth.js";
 import type { CommandCatalogEntry } from "./commands-catalog.js";
 // #244 half B: the `difference` frame carries RAW journal events for the client
@@ -80,6 +80,8 @@ export { ANON_PEER_ID };
  */
 export type HistoryTextMessage = {
   requestState?: RequestState;
+  /** #404: durable reason for `requestState: "failed"`; see `RequestFailureCause`. */
+  failureCause?: RequestFailureCause;
   retryOf?: string;
   /** Explicit origin mapping; absent for legacy journal rows. */
   randomId?: string;
@@ -529,7 +531,12 @@ export type OutboundWsMessage =
       /** #244 half A — see `agent_message`. Every `tool_activity` delta is durable. */
       seq?: number;
     }
-  | { type: "request_state"; id: string; state: RequestState; turnId: string; seq: number }
+  /**
+   * #404: `failureCause` is additive, present only on a `failed` state the
+   * server classified, and is the same value the journal's `requestState`
+   * event stores. An older client ignores it and shows a plain failure.
+   */
+  | { type: "request_state"; id: string; state: RequestState; turnId: string; seq: number; failureCause?: RequestFailureCause }
   | { type: "turn_settled"; turnId: string; outcome: "ok" | "error" }
   /**
    * #212 (Phase 3, targeted): the plugin's authoritative, ordered set of the

@@ -15,7 +15,7 @@ const cleanup: Array<() => void> = [];
 afterEach(() => { for (const fn of cleanup.splice(0).reverse()) fn(); });
 const message = (id: string, peerId = "RawPeer", text = id) => ({ peerId, message: { type: "user_message" as const, id, random_id: `logical-${id}`, text } });
 const dirFor = () => { const dir = mkdtempSync(join(tmpdir(), "dispatch369-")); cleanup.push(() => rmSync(dir, { recursive: true, force: true })); return dir; };
-function open(dir = dirFor(), options: { hold?: Promise<void>; fail?: string; budget?: InboundRetentionBudget; key?: boolean } = {}) {
+function open(dir = dirFor(), options: { hold?: Promise<void>; fail?: string; budget?: InboundRetentionBudget; key?: boolean; failEmpty?: boolean } = {}) {
   const persistent = (namespacePrefix: string) => createPersistentDedupe({ pluginId: "webchannel", namespacePrefix, ttlMs: 60_000, memoryMaxSize: 100, stateMaxEntries: 100, env: { ...process.env, OPENCLAW_STATE_DIR: dir } });
   const store = createIngressOutcomeStore({ accepted: persistent("accepted"), overloaded: persistent("overloaded"), cancelled: persistent("cancelled") });
   const journal = openDeliveryJournal({ databasePath: join(dir, "journal.sqlite") });
@@ -28,7 +28,8 @@ function open(dir = dirFor(), options: { hold?: Promise<void>; fail?: string; bu
     if (m.id === "A") await options.hold;
     if (options.fail !== undefined && options.fail === m.id) throw new Error("injected after effect");
     journal.append(peer, { kind: "bubble", answerId: `answer-${m.id}`, text: `result ${m.text}`, turnId: m.id });
-    settle("ok");
+    if (options.failEmpty) settle("error", "empty");
+    else settle("ok");
   }, acquirePeer: () => options.key === false ? undefined : () => {}, notify: c => changes.push(c), isActive: () => true, warn: e => errors.push(e), dispatcherOptions: { budget: options.budget } });
   recovery.start();
   const flush = createIngressOnFlush<{ peerId: string; message: UserMessageLike }>({ accountId: "ExactAccount", outcomeStore: store, deliveryJournal: journal, dispatchRecovery: recovery, beginBatch: p => recovery.beginBatch(p), sendAck: (_, ids, committed) => { acks.push({ ids, committed }); return true; } });
@@ -233,4 +234,30 @@ it("stop in the mixed batch's pre-handler gap suppresses legacy and tracked memb
   });
   await h.flush([message("B"), { peerId: "RawPeer", message: { type: "user_message", text: "legacy C" } }]);
   expect(h.runs).toEqual([]);
+});
+
+it("#404 journals an `empty` failure cause with the failed state, live and across restart", async () => {
+  const h = open(undefined, { failEmpty: true });
+  await h.flush([message("A")]);
+  await vi.waitFor(() => expect(h.journal.dispatch!.lookup("RawPeer", "logical-A")?.state).toBe("failed"));
+  const id = h.journal.dispatch!.lookup("RawPeer", "logical-A")!.messageId;
+  expect(h.changes.at(-1)).toMatchObject({ id, turnId: "A", state: "failed", failureCause: "empty" });
+  const row = () => projectJournalHistory(h.journal.read, "RawPeer").messages.find(m => m.id === id);
+  expect(row()).toMatchObject({ requestState: "failed", failureCause: "empty" });
+  h.close();
+  const fresh = open(h.dir);
+  expect(projectJournalHistory(fresh.journal.read, "RawPeer").messages.find(m => m.id === id))
+    .toMatchObject({ requestState: "failed", failureCause: "empty" });
+});
+
+it("#404 never attaches a failure cause to a non-failed state", async () => {
+  const h = open(undefined, { hold: new Promise(() => {}) });
+  await h.flush([message("A")]);
+  await vi.waitFor(() => expect(h.journal.dispatch!.lookup("RawPeer", "logical-A")?.state).toBe("started"));
+  const row = h.journal.dispatch!.lookup("RawPeer", "logical-A")!;
+  const owner = row.owner!;
+  const changes = h.journal.dispatch!.settle(owner, "RawPeer", row.batch!, "interrupted", "empty");
+  expect(changes).toEqual([expect.not.objectContaining({ failureCause: expect.anything() })]);
+  expect(projectJournalHistory(h.journal.read, "RawPeer").messages.find(m => m.id === row.messageId))
+    .not.toHaveProperty("failureCause");
 });

@@ -412,3 +412,34 @@ it("durable started/interrupted states survive delayed older history and client 
     } finally { fresh.wrapper.close(); }
   } finally { h.wrapper.close(); }
 });
+
+it("#404 a failed request's durable cause survives history and difference on a fresh client", () => {
+  const row = { id: "server-user", role: "user", text: "request", turnId: "wire", requestState: "failed" as const, failureCause: "empty", seq: 2 };
+  const fromHistory = setup();
+  try {
+    fromHistory.send({ type: "history", highWaterSeq: 2, messages: [row] });
+    expect(fromHistory.wrapper.getState().messages[0]).toMatchObject({ requestState: "failed", failureCause: "empty" });
+  } finally { fromHistory.wrapper.close(); }
+
+  const fromDifference = setup();
+  try {
+    fromDifference.send({ type: "user_committed", id: "server-user", text: "request", turnId: "wire", seq: 1 });
+    // A zero-overlap snapshot ahead of the cursor opens an ordered catch-up.
+    fromDifference.send({ type: "history", highWaterSeq: 2, messages: [{ id: "unrelated", role: "agent", text: "x" }] });
+    expect(fromDifference.inner.cursor.afterSeq).toBe(1);
+    fromDifference.send({ type: "difference", afterSeq: 1, nonce: fromDifference.inner.cursor.nonce, partial: false, maxSeq: 2,
+      events: [{ seq: 2, event: { kind: "requestState", id: "server-user", state: "failed", failureCause: "empty" } }] });
+    expect(fromDifference.wrapper.getState().messages.find((m) => m.id === "server-user"))
+      .toMatchObject({ requestState: "failed", failureCause: "empty" });
+  } finally { fromDifference.wrapper.close(); }
+
+  // Only `failed` carries a cause, and only a cause this build knows.
+  const odd = setup();
+  try {
+    odd.send({ type: "history", highWaterSeq: 2, messages: [
+      { ...row, failureCause: "rate-limited" },
+      { ...row, id: "server-user-2", turnId: "wire-2", requestState: "completed" as const, seq: 2 },
+    ] });
+    for (const message of odd.wrapper.getState().messages) expect(message).not.toHaveProperty("failureCause");
+  } finally { odd.wrapper.close(); }
+});

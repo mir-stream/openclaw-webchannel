@@ -236,6 +236,12 @@ export type InboundMessage = {
    */
   outcome?: "ok" | "error";
   state?: RequestState;
+  /**
+   * #404 (additive; older plugins omit it): on a `request_state` frame with
+   * `state:"failed"`, the server's durable reason (`RequestFailureCause`).
+   * Typed loosely: the reducer keeps only a value this build knows.
+   */
+  failureCause?: string;
   requestState?: RequestState;
   retryOf?: string;
   kind?: "exec" | "plugin";
@@ -305,6 +311,8 @@ export type InboundMessage = {
     seq?: number;
     randomId?: string;
     requestState?: RequestState;
+    /** #404: see the frame-level `failureCause`; same rule on a history row. */
+    failureCause?: string;
     retryOf?: string;
     revision?: number;
     edited?: boolean;

@@ -341,6 +341,10 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
 
     case "request_state": {
       if (!isNonEmptyString(field(raw, "id")) || !isNonEmptyString(field(raw, "turnId")) || !isRequestState(field(raw, "state"))) return invalid(known, "invalid request state");
+      // #404: `failureCause` is deliberately NOT a refusal reason. The reducer
+      // keeps only a cause this build knows (`requestFailureCauseOf`), so an
+      // unknown or malformed one degrades to a plain `failed`; refusing the frame
+      // would instead drop the state transition itself.
       return accept(raw);
     }
     case "turn_settled": {

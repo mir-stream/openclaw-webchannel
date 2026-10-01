@@ -2456,3 +2456,25 @@ describe("#244 half B — applyUser is id-idempotent (re-delivery safe)", () => 
     expect(twice.filter((m) => m.kind === "text" && m.role === "user")).toHaveLength(1);
   });
 });
+
+describe("#404 requestState failureCause", () => {
+  const user = applyDurableEvent([], { kind: "user", id: "u", text: "hi", turnId: "t", requestState: "started" });
+
+  it("keeps a known cause on a failed request", () => {
+    expect(applyDurableEvent(user, { kind: "requestState", id: "u", state: "failed", failureCause: "empty" })[0])
+      .toMatchObject({ requestState: "failed", failureCause: "empty" });
+  });
+
+  it("drops a cause on any other state, or one this build does not know", () => {
+    expect(applyDurableEvent(user, { kind: "requestState", id: "u", state: "completed", failureCause: "empty" })[0])
+      .not.toHaveProperty("failureCause");
+    const unknown = { kind: "requestState", id: "u", state: "failed", failureCause: "rate-limited" } as unknown as DurableEvent;
+    expect(applyDurableEvent(user, unknown)[0]).not.toHaveProperty("failureCause");
+  });
+
+  it("projects the cause back out of a live transcript", () => {
+    expect(projectDurableFromClient([
+      { id: "u", role: "user", text: "hi", turnId: "t", requestState: "failed", failureCause: "empty" },
+    ])[0]).toMatchObject({ requestState: "failed", failureCause: "empty" });
+  });
+});

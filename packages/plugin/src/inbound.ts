@@ -10,9 +10,14 @@ import {
   isReplyPayloadNonTerminalToolErrorWarning,
   type ReplyPayload,
 } from "openclaw/plugin-sdk/reply-payload";
+import {
+  hasFinalInboundReplyDispatch,
+  type InboundReplyDispatchResult,
+} from "openclaw/plugin-sdk/channel-inbound";
 
 import { WEBCHANNEL_ID, ANON_PEER_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel, InboundWsMessage } from "./channel-contract.js";
+import type { RequestFailureCause } from "../../client/src/durable-view-reducer.js";
 import { resolveDmAdmission } from "./dm-allowlist.js";
 import { resolvePeerCommandAuthorization } from "./command-gate.js";
 import { usableId } from "./ingress-dedupe.js";
@@ -637,6 +642,14 @@ type AgentRunVerdict = "ok" | "error" | "aborted";
 const agentRunVerdicts = new Map<string, AgentRunVerdict>();
 /** Structured activity destination for each run currently owned by a turn. */
 const agentRunToolActivitySinks = new Map<string, AgentToolActivitySink>();
+/**
+ * #404: runs that requested an approval, drained by the turn that owns the run.
+ * A native approval card is delivered outside the turn's reply dispatch, so the
+ * dispatch result alone would call a turn that only asked for approval `empty`.
+ * Core publishes the request on this stream before the tool result returns to
+ * the model, so the turn's own settle always observes it.
+ */
+const agentRunApprovalRequests = new Set<string>();
 /** Live subscription, so a reload replaces rather than stacks listeners. */
 let lifecycleUnsubscribe: (() => void) | undefined;
 /** Invalidates callbacks retained by a host after unsubscribe/reload. */
@@ -751,6 +764,15 @@ export function startAgentLifecycleSubscription(api: OpenClawPluginApi): void {
         // other process-global listeners. The projector itself is fail-closed.
       }
     }
+    if (evt?.stream === "approval") {
+      if ((evt.data as { phase?: unknown } | undefined)?.phase !== "requested") return;
+      if (agentRunApprovalRequests.size >= MAX_TRACKED_RUNS && !agentRunApprovalRequests.has(runId)) {
+        const oldest = agentRunApprovalRequests.values().next();
+        if (!oldest.done) agentRunApprovalRequests.delete(oldest.value);
+      }
+      agentRunApprovalRequests.add(runId);
+      return;
+    }
     if (evt?.stream !== "lifecycle") return;
     const data = evt.data as { phase?: unknown; aborted?: unknown } | undefined;
     const phase = data?.phase;
@@ -818,6 +840,7 @@ function releaseAgentLifecycleSubscription(options: {
     toolActivityTeardownGeneration += 1;
     agentRunVerdicts.clear();
     agentRunToolActivitySinks.clear();
+    agentRunApprovalRequests.clear();
   }
   if (options.rearmDiagnostics) reasoningEmptyLaneWarned.clear();
   // #267: this function does NOT rotate the approval-origin epoch, and must not
@@ -841,6 +864,55 @@ function releaseAgentLifecycleSubscription(options: {
   // This is the same shape as #113's `rearmDiagnostics`: shared teardown state
   // that a mere (re)start must not touch. That flag exists two lines above for
   // exactly this reason.
+}
+
+/**
+ * #404: wrap a peer channel so a turn learns whether any user-visible frame of
+ * it was accepted. Only the content-bearing sends are observed; typing, settle
+ * and control frames are not something the user was shown. `Object.create`
+ * keeps every other member (and `this`) on the real channel.
+ */
+function observeVisibleSends(
+  transport: WebChannelPeerChannel,
+  onVisible: () => void,
+): WebChannelPeerChannel {
+  const observed = Object.create(transport) as WebChannelPeerChannel;
+  const note = (sent: boolean): boolean => {
+    if (sent) onVisible();
+    return sent;
+  };
+  observed.sendText = (...args) => note(transport.sendText(...args));
+  observed.sendProgress = (...args) => note(transport.sendProgress(...args));
+  observed.finalizeDraft = (...args) => note(transport.finalizeDraft(...args));
+  observed.sendReasoning = (...args) => note(transport.sendReasoning(...args));
+  observed.sendToolActivity = (...args) => note(transport.sendToolActivity(...args));
+  return observed;
+}
+
+/** The fields of core's dispatch result #404 reads; the SDK does not export its type. */
+type DispatchVisibilityFacts = NonNullable<Parameters<typeof hasFinalInboundReplyDispatch>[0]> & {
+  noVisibleReplyFallbackEligible?: boolean;
+  sourceReplyDeliveryMode?: string;
+};
+
+/**
+ * #404: core's own "no visible reply" verdict for a dispatched turn, read the
+ * way Telegram reads it: core marked the turn eligible for a no-visible-reply
+ * fallback (`noVisibleReplyFallbackEligible` — never set for a direct
+ * conversation that queued or observed a reply), no final was queued
+ * (`hasFinalInboundReplyDispatch`), and the turn was not message-tool-only,
+ * where silence on the source conversation is the contract.
+ */
+function isEmptyDispatch(
+  result: InboundReplyDispatchResult<DispatchVisibilityFacts> | undefined,
+): boolean {
+  if (!result?.dispatched) return false;
+  const dispatch = result.dispatchResult;
+  return (
+    dispatch?.noVisibleReplyFallbackEligible === true &&
+    dispatch.sourceReplyDeliveryMode !== "message_tool_only" &&
+    !hasFinalInboundReplyDispatch(dispatch)
+  );
 }
 
 /**
@@ -902,7 +974,11 @@ export async function handleInboundMessage(
     controlLane?: boolean;
     dispatchAbortSignal?: AbortSignal;
     /** Persist the exact dispatch batch before a successful transient settlement. */
-    onSettled?: (outcome: "ok" | "error") => boolean;
+    /**
+     * `failureCause` (#404) is journaled with the `failed` request state, so
+     * history, difference and other devices read the same reason.
+     */
+    onSettled?: (outcome: "ok" | "error", failureCause?: RequestFailureCause) => boolean;
     beforeCore?: (agentId: string, sessionKey: string) => void;
     /** Injectable only so the session opt-out privacy boundary is testable. */
     reasoningOptOutStore?: ReasoningOptOutStoreAccess;
@@ -955,6 +1031,18 @@ export async function handleInboundMessage(
   let reasoningPayloadSeen = false;
   let finalReplyDelivered = false;
   let turnOutcome: "ok" | "error" = "ok";
+  /** #404: set only together with an `error` outcome the plugin can classify. */
+  let turnCause: RequestFailureCause | undefined;
+  /**
+   * #404: did ANY user-visible frame of this turn reach the transport — answer,
+   * draft, tool activity or reasoning? The lanes all write through
+   * `visibleTransport`; the ordinary `transport` stays for typing and settle.
+   */
+  let visibleOutputSent = false;
+  const visibleTransport = observeVisibleSends(transport, () => {
+    visibleOutputSent = true;
+  });
+  let runResult: InboundReplyDispatchResult<DispatchVisibilityFacts> | undefined;
   // #87: a provider-rejected turn does NOT throw — core absorbs the failure and
   // returns its terminal error as an ordinary `isError` reply payload, so the
   // `catch` below never runs and the turn would settle `ok`. These two track the
@@ -1045,7 +1133,7 @@ export async function handleInboundMessage(
   const answerStreamingEnabled = streamingMode === "partial";
   if (draftEnabled) {
     draft = createProgressDraftController({
-      transport,
+      transport: visibleTransport,
       sessionKey: wsKey,
       turnId,
       channelConfig,
@@ -1055,7 +1143,7 @@ export async function handleInboundMessage(
       turnId,
       send: (activity) => {
         try {
-          if (!transport.sendToolActivity(wsKey, activity)) turnOutcome = "error";
+          if (!visibleTransport.sendToolActivity(wsKey, activity)) turnOutcome = "error";
         } catch {
           turnOutcome = "error";
         }
@@ -1162,7 +1250,7 @@ export async function handleInboundMessage(
       store: options?.reasoningOptOutStore,
     });
   if (reasoningEnabled) {
-    reasoning = createReasoningDraftController({ transport, sessionKey: wsKey, turnId });
+    reasoning = createReasoningDraftController({ transport: visibleTransport, sessionKey: wsKey, turnId });
   }
 
   // Native "Bot is typing…" affordance. We push the frame right after route
@@ -1194,7 +1282,7 @@ export async function handleInboundMessage(
     transport.sendTyping(wsKey);
   }
 
-    await channelRuntime.inbound.run({
+    runResult = await channelRuntime.inbound.run({
       channel: WEBCHANNEL_ID,
       accountId,
       raw: message,
@@ -1617,8 +1705,8 @@ export async function handleInboundMessage(
                 const messageId = nextMessageId();
                 const sent =
                   assistantMessageIndex === undefined
-                    ? transport.sendText(wsKey, text, messageId, turnId)
-                    : transport.sendText(
+                    ? visibleTransport.sendText(wsKey, text, messageId, turnId)
+                    : visibleTransport.sendText(
                         wsKey,
                         text,
                         messageId,
@@ -1723,8 +1811,8 @@ export async function handleInboundMessage(
     // #87: settle `error` when core handed us a terminal failure instead of an
     // answer (see the classification in the delivery seam). This only ever
     // ASSIGNS `"error"`, so it can never downgrade the `catch` above. A turn
-    // that answers nothing and never errored (tool-only work, an empty or
-    // suppressed reply) stays `ok`: silence is a legitimate clean completion.
+    // that answers nothing and never errored stays `ok` here; whether that
+    // silence was a visible completion is decided separately below (#404).
     //
     // A terminal error that arrives BEFORE partial answer text still wins — the
     // turn failed, and partial output is not a completed answer.
@@ -1749,6 +1837,29 @@ export async function handleInboundMessage(
     }
     // A `verdict === "ok"` never downgrades the `catch` above: this block only
     // ever ASSIGNS "error".
+
+    // #404: a turn that core finished with no visible reply and that showed the
+    // user nothing settles as a failure with cause `empty`. Telegram's
+    // equivalent (`bot-message-dispatch.ts`) sends a "No response generated"
+    // agent message on the same core signal; we report the fact as state
+    // instead (TD-3) and never author agent text. Only ever ASSIGNS "error".
+    const approvalRequested = [...agentRunIds].some((runId) => agentRunApprovalRequests.has(runId));
+    for (const runId of agentRunIds) agentRunApprovalRequests.delete(runId);
+    if (
+      turnOutcome === "ok" &&
+      settlementEligible &&
+      // Without the event stream an approval or an abort is invisible here, so
+      // the turn keeps the pre-#404 `ok` rather than risk a false failure.
+      toolActivitySubscriptionActive &&
+      verdict !== "aborted" &&
+      options?.dispatchAbortSignal?.aborted !== true &&
+      !visibleOutputSent &&
+      !approvalRequested &&
+      isEmptyDispatch(runResult)
+    ) {
+      turnOutcome = "error";
+      turnCause = "empty";
+    }
 
     // #113: the diagnostic that `capabilities.reasoning` owes its operator. The
     // lane opened and core delivered neither a live callback nor a durable
@@ -1873,7 +1984,8 @@ export async function handleInboundMessage(
     // broken by the one failure mode it exists for. The outcome is already
     // decided; this call only records it.
     try {
-      options?.onSettled?.(settlementEligible ? turnOutcome : "error");
+      if (turnCause === undefined) options?.onSettled?.(settlementEligible ? turnOutcome : "error");
+      else options?.onSettled?.("error", turnCause);
     } catch (error) {
       api.logger?.warn?.(
         `webchannel: durable settle failed for peer=${logSafe(wsKey)} turn=${logSafe(turnId)} error=${logSafe(error)}`,

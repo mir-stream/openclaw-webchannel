@@ -16,6 +16,7 @@ const ALL_CAUSES: WebChannelErrorCause[] = [
   "config",
   "capacity",
   "server",
+  "empty",
   "unknown",
 ];
 
@@ -75,5 +76,24 @@ describe("sendStatusCopy cancellation", () => {
 
   it("labels a cancel before delivery as not sent", () => {
     expect(sendStatusCopy(bubble({}))).toEqual({ label: "Not sent · cancelled" });
+  });
+});
+
+describe("sendStatusCopy empty turn (#404)", () => {
+  const bubble = (sendFailure: ChatBubble["sendFailure"]) => ({
+    id: "m", role: "user", text: "x", sendState: "failed", sendFailure,
+  }) as ChatBubble;
+
+  it("says no response was generated and offers the retry draft", () => {
+    expect(sendStatusCopy(bubble({ reason: "turn-failed", retryable: true, cause: "empty" }))).toEqual({
+      label: "No response generated",
+      hint: "The agent finished without replying. Restore the draft and send it again to retry.",
+      restoreDraft: true,
+    });
+  });
+
+  it("keeps the effects warning for an unclassified turn failure", () => {
+    expect(sendStatusCopy(bubble({ reason: "turn-failed", retryable: true }))?.label)
+      .toBe("Request failed after acceptance");
   });
 });

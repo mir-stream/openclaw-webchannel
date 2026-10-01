@@ -1,5 +1,5 @@
-import type { RequestState } from "./durable-view-reducer.js";
-export type { RequestState } from "./durable-view-reducer.js";
+import type { RequestFailureCause, RequestState } from "./durable-view-reducer.js";
+export type { RequestFailureCause, RequestState } from "./durable-view-reducer.js";
 /**
  * Public types for the headless WebChannel client.
  *
@@ -45,7 +45,9 @@ export type SendState = "queued" | "sent" | "accepted" | "failed";
  * - `overloaded`  — plugin rejected ingress due to bounded retained-work pressure;
  *                   caller-directed retry is allowed, but never automatic.
  * - `turn-failed` — the turn was admitted but settled with `outcome:"error"`;
- *                   caller-directed re-sending is allowed when ready.
+ *                   caller-directed re-sending is allowed when ready. `cause`
+ *                   is `"empty"` when the agent finished without any visible
+ *                   reply (#404); absent when the plugin did not classify it.
  * - `cancelled`   — the user intentionally cancelled the send (a `/stop`
  *                   hold-retraction or `retract()`); never retryable.
  *
@@ -56,7 +58,11 @@ export type SendState = "queued" | "sent" | "accepted" | "failed";
  */
 export type SendFailure = {
   reason: "closed" | "evicted" | "terminal" | "overloaded" | "turn-failed" | "cancelled";
-  /** For `reason === "terminal"`: the original connection-failure classification. */
+  /**
+   * For `reason === "terminal"`: the original connection-failure
+   * classification. For `reason === "turn-failed"`: `"empty"` when the plugin
+   * reported a turn that produced no visible reply (#404).
+   */
   cause?: WebChannelErrorCause;
   retryable: boolean;
   /** Wall-clock ms of the most recent publish attempt (absent if never attempted). */
@@ -151,6 +157,12 @@ export type ChatBubble = {
    * leaves even the member it names at `accepted`.
    */
   requestState?: RequestState;
+  /**
+   * #404: the server's durable reason for `requestState: "failed"`, when it
+   * classified one (`"empty"` — the agent finished without a visible reply).
+   * The same value becomes `sendFailure.cause` on this device's own send.
+   */
+  failureCause?: RequestFailureCause;
   retryOf?: string;
   sendState?: "queued" | "sent" | "accepted" | "completed" | "failed" | "interrupted";
   /** P0-4: present only when `sendState === "failed"` — the failure detail. */
@@ -592,6 +604,11 @@ export type WebChannelErrorCause =
   // (typically 5xx; the reply is deliberately a no-oracle, so another odd 4xx
   // lands here). Retry later.
   | "server"
+  // #404: NOT a connection failure. Rides only on `SendFailure.cause` for a
+  // `turn-failed` send: the agent finished the turn without any visible reply
+  // (an empty answer or a deliberate NO_REPLY). The plugin reports it as state
+  // instead of writing a placeholder agent message; re-sending is the recovery.
+  | "empty"
   // Fallback — any terminal error without a classified cause.
   | "unknown";
 

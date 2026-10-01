@@ -551,6 +551,7 @@ export function historyRowFor(
       return {
         id: message.id, role: message.role, text: message.text, ts,
         ...(message.requestState ? { requestState: message.requestState } : {}),
+        ...(message.failureCause ? { failureCause: message.failureCause } : {}),
         ...(message.retryOf ? { retryOf: message.retryOf } : {}),
         ...(message.turnId !== undefined ? { turnId: message.turnId } : {}),
         ...(message.revision !== undefined ? { revision: message.revision } : {}),

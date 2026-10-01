@@ -234,6 +234,51 @@ describe("WebChannelNATSClient — P0-4 receipt + sendState (wrapper)", () => {
     h.wrapper.close();
   });
 
+  // #404: the plugin journals the failure cause with the durable request state
+  // and pushes that `request_state` BEFORE `turn_settled`, so the receipt fails
+  // once, with its cause, and the later settle has nothing left to change.
+  async function failedSend(failureCause: unknown) {
+    const h = await connectWrapper({ ack: false });
+    const receipt = h.wrapper.send("silent")!;
+    await settle();
+    const sent = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+      .find((m) => m.type === "user_message")! as Extract<OutboundMessage, { type: "user_message" }>;
+    deliverOut(h.K, { type: "ack", ids: [sent.id], committed: [
+      { random_id: sent.random_id, messageId: "own-server", seq: 1 },
+    ] });
+    await settle();
+    const snapshots: Array<ReturnType<SendReceipt["snapshot"]>> = [];
+    receipt.subscribe((snapshot) => snapshots.push(snapshot));
+    deliverOut(h.K, {
+      type: "request_state", id: "own-server", turnId: sent.id, state: "failed", seq: 2,
+      ...(failureCause === undefined ? {} : { failureCause }),
+    });
+    await settle();
+    deliverOut(h.K, { type: "turn_settled", turnId: sent.id, outcome: "error" });
+    await settle();
+    return { h, receipt, snapshots };
+  }
+
+  it("fails the send once with cause empty from the durable request_state", async () => {
+    const { h, receipt, snapshots } = await failedSend("empty");
+    try {
+      const failure = { reason: "turn-failed", retryable: true, cause: "empty" };
+      expect(receipt.snapshot()).toEqual({ state: "failed", failure });
+      expect(snapshots).toEqual([{ state: "failed", failure }]);
+      expect(userBubble(h.wrapper, "silent")).toMatchObject({
+        requestState: "failed", failureCause: "empty", sendFailure: failure,
+      });
+    } finally { h.wrapper.close(); }
+  });
+
+  it.each([undefined, "rate-limited", 7])("treats failureCause %j as a plain turn failure", async (failureCause) => {
+    const { h, receipt } = await failedSend(failureCause);
+    try {
+      expect(receipt.snapshot()).toEqual({ state: "failed", failure: { reason: "turn-failed", retryable: true } });
+      expect(userBubble(h.wrapper, "silent")).not.toHaveProperty("failureCause");
+    } finally { h.wrapper.close(); }
+  });
+
   it("surfaces inbound_rejected as failed(overloaded) on the receipt and bubble", async () => {
     const h = await connectWrapper({ ack: false });
     const receipt = h.wrapper.send("over capacity")!;

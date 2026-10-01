@@ -122,6 +122,8 @@ function makeFakeApi(params: {
   withAgentEvents?: boolean;
   /** Extra `channels.webchannel` keys, e.g. the DM allowlist (#99 denial case). */
   channelConfig?: Record<string, unknown>;
+  /** #404: what `inbound.run` resolves with (core's `ChannelTurnResult`). */
+  runResult?: unknown;
 }): {
   api: OpenClawPluginApi;
   captured: { buildContext?: BuildContextParams };
@@ -165,6 +167,7 @@ function makeFakeApi(params: {
         const input = runParams.adapter.ingest(runParams.raw);
         const turn = runParams.adapter.resolveTurn(input);
         await params.runImpl(turn);
+        return params.runResult;
       },
     },
     session: {
@@ -3212,6 +3215,233 @@ describe("handleInboundMessage — #89 aborted runs are not failures", () => {
     await handleInboundMessage(made.api, transport, "peer-1", ordinary);
 
     expect(settles).toEqual(["error"]);
+  });
+});
+
+/**
+ * #404 — a turn core finished with no visible reply settles `error` with cause
+ * `empty` instead of a silent `ok`, and the plugin authors no agent text for it.
+ * The `runResult` fixtures are core's `ChannelTurnResult` shape: a direct
+ * conversation that neither queued nor observed a reply is marked
+ * `noVisibleReplyFallbackEligible` (dispatch-from-config), which is the signal
+ * Telegram's empty-response fallback reads.
+ */
+describe("handleInboundMessage — #404 empty turns", () => {
+  const RUN = "run-empty";
+  const EMPTY_DISPATCH = {
+    dispatched: true,
+    dispatchResult: {
+      queuedFinal: false,
+      counts: { tool: 0, block: 0, final: 0 },
+      noVisibleReplyFallbackEligible: true,
+    },
+  };
+
+  function emptyTurn(params: {
+    streamingMode?: "off" | "partial" | "progress" | "block";
+    runResult?: unknown;
+    channelConfig?: Record<string, unknown>;
+    runImpl?: (
+      turn: AssembledTurnLike,
+      emit: (event: LifecycleEvent) => void,
+    ) => Promise<void>;
+    subscribe?: boolean;
+    /** The run's lifecycle terminal, emitted last. */
+    terminal?: Record<string, unknown>;
+  } = {}) {
+    const holder: { emit?: (e: LifecycleEvent) => void } = {};
+    const made = makeFakeApi({
+      streamingMode: params.streamingMode ?? "off",
+      withAgentEvents: true,
+      runResult: "runResult" in params ? params.runResult : EMPTY_DISPATCH,
+      ...(params.channelConfig ? { channelConfig: params.channelConfig } : {}),
+      runImpl: async (turn) => {
+        turn.replyOptions?.onAgentRunStart?.(RUN);
+        const emit = (event: LifecycleEvent) => holder.emit?.(event);
+        await params.runImpl?.(turn, emit);
+        emit({ stream: "lifecycle", runId: RUN, data: params.terminal ?? { phase: "end" } });
+      },
+    });
+    holder.emit = made.emitLifecycle;
+    if (params.subscribe !== false) startAgentLifecycleSubscription(made.api);
+    return made;
+  }
+
+  afterEach(() => stopAgentLifecycleSubscription());
+
+  /**
+   * Run one turn and record what the durable settle was handed. The cause is
+   * journaled with the `failed` request state (dispatch-store), not put on
+   * `turn_settled`, so `durable` is where #404 is observable here.
+   */
+  async function settleTurn(
+    api: OpenClawPluginApi,
+    message: Parameters<typeof handleInboundMessage>[3],
+    options: NonNullable<Parameters<typeof handleInboundMessage>[5]> = {},
+  ) {
+    const fake = makeFakeTransport();
+    const durable: string[][] = [];
+    await handleInboundMessage(api, fake.transport, "peer-1", message, "default", {
+      ...options,
+      onSettled: (outcome, cause) => {
+        durable.push(cause === undefined ? [outcome] : [outcome, cause]);
+        return true;
+      },
+    });
+    return { ...fake, durable };
+  }
+
+  const hello = (id: string) => ({ type: "user_message" as const, text: "hello", id });
+
+  it("settles a silent (empty / NO_REPLY) turn as error cause `empty`, writing no agent text", async () => {
+    const { api } = emptyTurn();
+    const { durable, settleFrames, texts, finalizes } = await settleTurn(api, hello("turn-empty"));
+
+    expect(durable).toEqual([["error", "empty"]]);
+    // The live frame stays a plain outcome; the reason rides the durable state.
+    expect(settleFrames).toEqual([{ turnId: "turn-empty", outcome: "error" }]);
+    expect(texts).toEqual([]);
+    expect(finalizes).toEqual([]);
+  });
+
+  it("settles a coalesced group once with the `empty` cause and fails every member", async () => {
+    const { api } = emptyTurn();
+    const { durable, settleFrames } = await settleTurn(api, {
+      type: "user_message", text: "one\n\ntwo", id: "m-2", coalescedIds: ["m-1", "m-2"],
+    });
+
+    expect(durable).toEqual([["error", "empty"]]);
+    expect(settleFrames).toEqual([
+      { turnId: "m-1", outcome: "error" },
+      { turnId: "m-2", outcome: "error" },
+    ]);
+  });
+
+  it("stays `ok` when core queued or delivered a final", async () => {
+    for (const dispatchResult of [
+      { queuedFinal: true, counts: { tool: 0, block: 0, final: 0 } },
+      { queuedFinal: false, counts: { tool: 0, block: 0, final: 1 } },
+      { queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } },
+      {
+        queuedFinal: false,
+        counts: { tool: 0, block: 0, final: 0 },
+        noVisibleReplyFallbackEligible: true,
+        sourceReplyDeliveryMode: "message_tool_only",
+      },
+    ]) {
+      const { api } = emptyTurn({ runResult: { dispatched: true, dispatchResult } });
+      const { durable } = await settleTurn(api, hello("turn-final"));
+
+      expect(durable, JSON.stringify(dispatchResult)).toEqual([["ok"]]);
+      stopAgentLifecycleSubscription();
+    }
+  });
+
+  it("stays `ok` when core did not dispatch the turn at all", async () => {
+    const { api } = emptyTurn({ runResult: { dispatched: false, admission: { kind: "drop" } } });
+    const { durable } = await settleTurn(api, hello("turn-dropped"));
+
+    expect(durable).toEqual([["ok"]]);
+  });
+
+  it.each<{
+    name: string;
+    streamingMode: "off" | "partial" | "progress";
+    runImpl: (turn: AssembledTurnLike, emit: (event: LifecycleEvent) => void) => Promise<void>;
+  }>([
+    {
+      name: "a block reply",
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "partial answer" }, { kind: "block" });
+      },
+    },
+    {
+      name: "a tool payload",
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "ran a tool" }, { kind: "tool" });
+      },
+    },
+    {
+      name: "a progress draft",
+      streamingMode: "progress",
+      runImpl: async (turn) => {
+        turn.replyOptions?.onToolStart?.({ toolCallId: "t-1", name: "bash", phase: "start" });
+      },
+    },
+    {
+      name: "streamed answer text",
+      streamingMode: "partial",
+      runImpl: async (turn) => {
+        turn.replyOptions?.onPartialReply?.({ text: "thinking out loud" });
+      },
+    },
+    {
+      name: "structured tool activity",
+      streamingMode: "progress",
+      runImpl: async (_turn, emit) => {
+        emit({ stream: "tool", runId: RUN, data: { phase: "start", name: "bash", toolCallId: "t-2" } });
+      },
+    },
+    {
+      name: "an approval request",
+      streamingMode: "off",
+      runImpl: async (_turn, emit) => {
+        emit({ stream: "approval", runId: RUN, data: { phase: "requested", kind: "exec", status: "pending" } });
+      },
+    },
+  ])("is not empty once this turn showed the user $name", async ({ streamingMode, runImpl }) => {
+    const { api } = emptyTurn({ streamingMode, runImpl });
+    const { durable } = await settleTurn(api, hello("turn-visible"));
+
+    expect(durable).toEqual([["ok"]]);
+  });
+
+  it("is not empty when the run was aborted by /stop", async () => {
+    for (const phase of ["end", "error"]) {
+      const { api } = emptyTurn({ terminal: { phase, aborted: true } });
+      const { durable } = await settleTurn(api, hello("turn-stopped"));
+
+      expect(durable, phase).toEqual([["ok"]]);
+      stopAgentLifecycleSubscription();
+    }
+  });
+
+  it("is not empty when the dispatch was retired while core ran it", async () => {
+    const retired = new AbortController();
+    // Retired after core adopted the turn, so the run itself completes cleanly.
+    const { api } = emptyTurn({ runImpl: async () => { retired.abort(); } });
+    const { durable } = await settleTurn(api, hello("turn-retired"), {
+      dispatchAbortSignal: retired.signal,
+    });
+
+    expect(durable).toEqual([["ok"]]);
+  });
+
+  it("keeps a plain error (no cause) when the run itself failed", async () => {
+    const { api } = emptyTurn({ terminal: { phase: "error" } });
+    const { durable } = await settleTurn(api, hello("turn-failed"));
+
+    expect(durable).toEqual([["error"]]);
+  });
+
+  it("keeps the pre-#404 `ok` when the agent event stream is unavailable", async () => {
+    const { api } = emptyTurn({ subscribe: false });
+    const { durable } = await settleTurn(api, hello("turn-blind"));
+
+    expect(durable).toEqual([["ok"]]);
+  });
+
+  it("never classifies a control-lane turn", async () => {
+    const { api } = emptyTurn();
+    const { durable, settleFrames } = await settleTurn(api, {
+      type: "user_message", text: "/stop", id: "turn-control",
+    }, { controlLane: true });
+
+    // Never eligible: the durable hook gets a bare `error` and no frame is sent.
+    expect(durable).toEqual([["error"]]);
+    expect(settleFrames).toEqual([]);
   });
 });
 

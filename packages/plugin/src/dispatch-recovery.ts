@@ -1,3 +1,4 @@
+import type { RequestFailureCause } from "../../client/src/durable-view-reducer.js";
 import type { DispatchChange, DispatchInput, DispatchRow, DispatchStore } from "./dispatch-store.js";
 import { usableId } from "./ingress-dedupe.js";
 import { coalesceUserMessages, createSerializedInboundDispatcher, type BatchOffer, type DispatcherBatchLease, type SerializedInboundDispatcher, type SerializedInboundDispatcherOptions, type UserMessageLike, type CoalescedMemberIds } from "./inbound-queue.js";
@@ -14,7 +15,7 @@ const messageFor = (row: DispatchRow): Message => ({ type: "user_message", text:
 /** One runtime owns bounded offers; SQLite owns accepted work across runtimes. */
 export function createDispatchRecovery(options: {
   store: DispatchStore;
-  handler: (peer: string, message: Message, settle: (outcome: "ok" | "error") => boolean, ownership?: { owner: string; batch: string; abortSignal: AbortSignal }) => Promise<void>;
+  handler: (peer: string, message: Message, settle: (outcome: "ok" | "error", failureCause?: RequestFailureCause) => boolean, ownership?: { owner: string; batch: string; abortSignal: AbortSignal }) => Promise<void>;
   acquirePeer: (peer: string) => (() => void) | undefined;
   notify: (change: DispatchChange) => void;
   isActive: () => boolean;
@@ -68,9 +69,11 @@ export function createDispatchRecovery(options: {
       const message = coalesceUserMessages(inputs);
       if (!rows.length) { await options.handler(peer, message, () => active()); return; }
       const batch = rows[0]!.batch!;
-      const settle = (outcome: "ok" | "error") => {
+      const settle = (outcome: "ok" | "error", failureCause?: RequestFailureCause) => {
         if (!active()) return false;
-        const changes = store.settle(owner!, peer, batch, outcome === "ok" ? "completed" : "failed");
+        const changes = outcome === "ok"
+          ? store.settle(owner!, peer, batch, "completed")
+          : store.settle(owner!, peer, batch, "failed", failureCause);
         settled = true;
         notify(changes);
         return changes.length > 0;

@@ -235,6 +235,20 @@ describe("#239 — egress persist-before-publish", () => {
     expect(appends(calls)).toEqual([]);
   });
 
+  it("#404 — request_state carries the durable failureCause only when the change has one", () => {
+    const { transport, channel } = makeChannel();
+
+    expect(channel.sendRequestState({ peerId: PEER, id: "u-1", turnId: "turn-1", state: "failed", seq: 7 })).toBe(true);
+    expect(channel.sendRequestState({
+      peerId: PEER, id: "u-2", turnId: "turn-2", state: "failed", seq: 8, failureCause: "empty",
+    })).toBe(true);
+
+    expect(transport.frames).toEqual([
+      { type: "request_state", id: "u-1", state: "failed", turnId: "turn-1", seq: 7 },
+      { type: "request_state", id: "u-2", state: "failed", turnId: "turn-2", seq: 8, failureCause: "empty" },
+    ]);
+  });
+
   it("#245 Part B — sendUserCommitted publishes to the shared subject, journals nothing, and preserves the construction seq", () => {
     const { calls, transport, channel } = makeChannel();
 
