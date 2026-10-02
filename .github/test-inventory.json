@@ -100,7 +100,7 @@
     "packages/plugin/src/entry-exports.test.ts": 7,
     "packages/plugin/src/history-frame-budget.test.ts": 16,
     "packages/plugin/src/history-frame-oversize.test.ts": 12,
-    "packages/plugin/src/history-serve.test.ts": 54,
+    "packages/plugin/src/history-serve.test.ts": 60,
     "packages/plugin/src/history.test.ts": 12,
     "packages/plugin/src/inbound-debounce.test.ts": 6,
     "packages/plugin/src/inbound-overflow-resolver.test.ts": 18,

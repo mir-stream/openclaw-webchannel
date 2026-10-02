@@ -674,6 +674,97 @@ describe("createHistoryServer — the per-peer in-flight CONCURRENCY bound", () 
     expect(sent.at(-1)?.nonce).toBe("after");
   });
 
+  it("#401 — refuses an oversized waiting cursor but preserves active and later fitting pages", () => {
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    const { server, sent, scheduler, warns } = harness(journal);
+    const before = "x".repeat(64 * 1024);
+
+    // The active request still accepts an arbitrary-length cursor. This one
+    // misses the journal, so it must receive the usual empty page answer.
+    server.servePage(PEER, { before, nonce: "active" });
+    server.servePage(PEER, { before, nonce: "oversized" });
+    server.servePage(PEER, { before, nonce: "also-oversized" });
+    server.servePage(PEER, { before: "a3", nonce: "fits" });
+    expect(warns).toHaveLength(1); // The existing dropped throttle also applies.
+    expect(warns[0]).toContain("history page dropped");
+    expect(scheduler.pending).toBe(1);
+
+    scheduler.flush();
+    expect(sent.map((s) => s.nonce)).toEqual(["active", "fits"]);
+    expect(sent[0].messages).toEqual([]);
+    expect(sent[1].messages.map((m) => m.id)).toEqual(["a1", "a2"]);
+  });
+
+  it("#401 — charges both cursor strings and the nonce, including non-ASCII, per peer", () => {
+    const { server, sent, scheduler, warns } = harness(openJournal());
+    server.servePage(PEER, { nonce: "active" });
+    // Exactly 64 KiB: 8192 BMP units + 24572 surrogate units + 4 nonce units,
+    // at two bytes each. Omitting ANY field lets the next request slip in.
+    server.servePage(PEER, {
+      before: "界".repeat(8192),
+      beforeTurnId: "🦀".repeat(12286),
+      nonce: "fits",
+    });
+    expect(warns).toEqual([]);
+    server.servePage(PEER, { nonce: "x" });
+    expect(warns).toHaveLength(1);
+    server.servePage(OTHER_PEER, { nonce: "other-active" });
+    server.servePage(OTHER_PEER, { nonce: "other-waiting" });
+
+    scheduler.flush();
+    expect(sent.filter((s) => s.peerId === PEER).map((s) => s.nonce))
+      .toEqual(["active", "fits"]);
+    expect(sent.filter((s) => s.peerId === OTHER_PEER).map((s) => s.nonce))
+      .toEqual(["other-active", "other-waiting"]);
+  });
+
+  it.each(["success", "read fault", "publish throw", "publish refusal"] as const)(
+    "#401 — releases waiting charge before starting the next page after %s",
+    (outcome) => {
+      const journal = openJournal();
+      const callbacks: Array<() => void> = [];
+      const { server, sent, warns, errors, recording } = harness(journal, {
+        schedule: (fn) => void callbacks.push(fn),
+      });
+      // Each waiting request alone fills the byte budget (including its nonce).
+      const before = "x".repeat(32767);
+      server.servePage(PEER, { nonce: "active" });
+      server.servePage(PEER, { before, nonce: "a" });
+      callbacks.shift()!(); // Active finishes; a now owns the active slot.
+      server.servePage(PEER, { before, nonce: "b" });
+      expect(warns).toEqual([]);
+
+      const historyPage = journal.historyPage;
+      const sendHistory = recording.channel.sendHistory;
+      if (outcome === "read fault") {
+        journal.historyPage = () => { throw new Error("injected page read failure"); };
+      } else if (outcome === "publish throw") {
+        recording.channel.sendHistory = () => { throw new Error("injected publish failure"); };
+      } else if (outcome === "publish refusal") {
+        recording.channel.sendHistory = () => false;
+      }
+      callbacks.shift()!(); // a settles on every path; b becomes active.
+      journal.historyPage = historyPage;
+      recording.channel.sendHistory = sendHistory;
+      expect(errors).toHaveLength(outcome === "success" ? 0 : 1);
+
+      server.servePage(PEER, { before, nonce: "c" });
+      expect(warns).toEqual([]);
+      while (callbacks.length) callbacks.shift()!();
+      expect(sent.map((s) => s.nonce)).toEqual(
+        outcome === "success" ? ["active", "a", "b", "c"] : ["active", "b", "c"],
+      );
+
+      // A completely drained peer can again retain a full waiting budget.
+      server.servePage(PEER, { nonce: "after" });
+      server.servePage(PEER, { before, nonce: "d" });
+      expect(warns).toEqual([]);
+      while (callbacks.length) callbacks.shift()!();
+      expect(sent.slice(-2).map((s) => s.nonce)).toEqual(["after", "d"]);
+    },
+  );
+
   it("#401 — a read fault still starts the next queued page", () => {
     const journal = openJournal();
     for (const event of thread("a")) journal.append(PEER, event);

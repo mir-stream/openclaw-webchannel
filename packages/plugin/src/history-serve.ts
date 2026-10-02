@@ -100,6 +100,14 @@ type PageRequest = { before?: string; beforeTurnId?: string; limit?: number; non
 const MAX_QUEUED_PAGE_REQUESTS = 8;
 
 /**
+ * Waiting pages also share a 64 KiB charge per peer: two bytes per UTF-16
+ * code unit in `before`, `beforeTurnId`, and `nonce`. This conservatively
+ * charges string contents without serializing/scanning them; the count bound
+ * covers fixed request overhead. The active page is not charged or restricted.
+ */
+const MAX_QUEUED_PAGE_BYTES = 64 * 1024;
+
+/**
  * #401 — the most page requests one peer can have OUTSTANDING here: one folding
  * plus a full queue. The client's `MAX_OUTSTANDING_HISTORY_PAGES`
  * (`nats-client-wrapper.ts`) must be at least this, or a device could forget a
@@ -172,7 +180,8 @@ export type HistoryServer = {
   /**
    * Serve one `load_history` request. Same deferral, different reason — below.
    * #401: requests for one peer are answered one at a time, in order, with at
-   * most `MAX_QUEUED_PAGE_REQUESTS` waiting; past that a new one is dropped.
+   * most `MAX_QUEUED_PAGE_REQUESTS` waiting, within `MAX_QUEUED_PAGE_BYTES`;
+   * exceeding either waiting bound drops the new request.
    *
    * `beforeTurnId` completes the cursor for a tool row and is optional on the
    * wire; see `channel-contract.ts`'s `load_history` member. So is #401's
@@ -306,7 +315,10 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
    * #401 — the per-peer page queue. Present ⇒ this peer has a page scheduled or
    * folding; the array holds the requests still to answer, oldest first.
    */
-  const pendingPages = new Map<string, PageRequest[]>();
+  const pendingPages = new Map<string, {
+    requests: Array<{ request: PageRequest; chargedBytes: number }>;
+    chargedBytes: number;
+  }>();
   /**
    * #356 — the per-peer `get_difference` queue. Present ⇒ this peer has a read
    * scheduled or running; the array holds the requests still to answer, oldest
@@ -977,9 +989,15 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
         publishFitted("page", peerId, messages, { sendEmpty: true, nonce: request.nonce });
       },
       () => {
-        const next = pendingPages.get(peerId)?.shift();
+        const queued = pendingPages.get(peerId)!;
+        const next = queued.requests.shift();
         if (next === undefined) pendingPages.delete(peerId);
-        else startPage(peerId, next);
+        else {
+          // Release before starting it: only WAITING requests are charged,
+          // including when the preceding read or publish failed.
+          queued.chargedBytes -= next.chargedBytes;
+          startPage(peerId, next.request);
+        }
       },
     );
   };
@@ -1080,23 +1098,27 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
       // nonce of the one device that will fold its answer.
       const queued = pendingPages.get(peerId);
       if (queued !== undefined) {
-        if (queued.length >= MAX_QUEUED_PAGE_REQUESTS) {
+        const chargedBytes = 2 * ((request.before?.length ?? 0) +
+          (request.beforeTurnId?.length ?? 0) + (request.nonce?.length ?? 0));
+        if (queued.requests.length >= MAX_QUEUED_PAGE_REQUESTS ||
+            queued.chargedBytes + chargedBytes > MAX_QUEUED_PAGE_BYTES) {
           const suppressed = admit("page", "dropped");
           if (suppressed !== undefined) {
             try {
               logger?.warn?.(
                 `webchannel: history page dropped for ${logSafe(peerId)}; ` +
-                  `${MAX_QUEUED_PAGE_REQUESTS} page requests are already queued ` +
-                  `for this peer (suppressed=${suppressed})`,
+                  `waiting queue would exceed ${MAX_QUEUED_PAGE_REQUESTS} requests ` +
+                  `or ${MAX_QUEUED_PAGE_BYTES} charged bytes (suppressed=${suppressed})`,
               );
             } catch { /* a faulting logger must not fail the dispatch turn */ }
           }
           return;
         }
-        queued.push(request);
+        queued.requests.push({ request, chargedBytes });
+        queued.chargedBytes += chargedBytes;
         return;
       }
-      pendingPages.set(peerId, []);
+      pendingPages.set(peerId, { requests: [], chargedBytes: 0 });
       startPage(peerId, request);
     },
   };

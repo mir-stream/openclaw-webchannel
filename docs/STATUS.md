@@ -4,7 +4,10 @@ History page correlation (#401): `load_history` carries a per-request `nonce` th
 the `history` page echoes. Pages ride the peer's shared `.out`; a device folds only
 a page echoing its own nonce, so another device's page no longer leaves a permanent
 hole in a different window. The register snapshot stays uncorrelated. Concurrent
-page requests from one peer's devices are queued (bounded) instead of dropped.
+page requests from one peer's devices are queued: at most 8 waiting and a 64 KiB
+waiting-string charge (two bytes per UTF-16 code unit across both cursors and the
+nonce). Exceeding either bound drops the newest request with a throttled warning;
+the active request keeps its existing cursor semantics.
 Protocol 7; client and plugin require lockstep rollout.
 
 `/stop` cancellation (review R1/R2): control receipts and exact cancellation targets
