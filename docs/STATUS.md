@@ -1,5 +1,14 @@
 # Project Status — single source of truth
 
+NATS permissions (#409, #410): newly enrolled agent credentials are limited to
+their exact tenant/account subtree, and browser credentials publish only their
+own `.in`/`.register` subjects. Real nats-server tests prove sibling-account
+and agent-direction publication rejection. SaaS/plugin require a lockstep
+upgrade and explicit reissue to narrow existing credentials; doctor identifies
+legacy broad agent grants. Existing grants are accepted until expiry/revocation,
+including non-expiring grants that require explicit replacement. See
+[credential rollout](AUTH.md#nats-credential-scope-and-rollout).
+
 Quiet-turn liveness (#396): normal turns send an initial typing indicator and
 renew ephemeral `typing` with `keepalive: true` every 4 seconds until completion,
 error, or dispatch abort. Renewals refresh existing application watches without

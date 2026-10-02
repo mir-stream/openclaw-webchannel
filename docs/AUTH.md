@@ -137,6 +137,36 @@ produce a targeted migration error. Remove it and rerun
 
 See [`TRUST_AND_ONBOARDING.md`](TRUST_AND_ONBOARDING.md) for the complete trust model.
 
+## NATS credential scope and rollout
+
+The next lockstep SaaS/plugin release narrows freshly minted credentials:
+
+| Role | Publish | Subscribe |
+| --- | --- | --- |
+| Agent | `webchannel.{tenant}.{accountId}.>` | Same account subtree |
+| Browser | `webchannel.{tenant}.*.{peerId}.in`, `webchannel.{tenant}.*.{peerId}.register` | `webchannel.{tenant}.*.{peerId}.>` |
+| Observer (demo wiretap) | Deny all | `webchannel.{tenant}.>` |
+
+The agent scope comes from the approved enrollment's exact account. Browser
+identity comes from the authenticated SaaS session. Reply subjects require only
+browser subscriptions; the browser never needs to publish agent frames.
+
+Existing JWTs are immutable and retain their old privileges until expiry or
+explicit revocation. Doctor warns when an enrolled agent grant is broader than
+its account; it does not reject or revoke that grant. To narrow it, upgrade SaaS
+and plugin together, stop the account, archive only its credential file, complete
+the existing SaaS active-key replacement procedure, and explicitly re-enroll with
+`openclaw channels add --channel webchannel --account <id>`. Verify the new grant
+before revoking the old one. Preserve history and conversation keys. An old JWT
+without `exp` needs explicit replacement/revocation; waiting does not narrow it.
+Browser sessions likewise need newly issued credentials for the new publish
+restrictions to apply.
+
+This changes relay permissions without changing encrypted frames or protocol 7.
+Direction binding in envelope AAD is a separate defense-in-depth follow-up
+[#436](https://github.com/mir-stream/openclaw-webchannel/issues/436); client replay
+and freshness are tracked by #415 E4.
+
 ## Agent identity-key lifecycle
 
 An account is the isolation axis and represents one logical agent. Agent HA replicas must share the same identity key; independently keyed replicas are unsupported and surface as replacement conflicts. Enrollment wire formats do not contain an `agentId`.

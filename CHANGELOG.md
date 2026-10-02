@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Breaking: NATS credential scope (#409, #410)
+
+- Release SaaS and plugin together in the next lockstep release. Newly enrolled
+  agent credentials grant only `webchannel.{tenant}.{accountId}.>` pub/sub;
+  sibling accounts' register plaintext and conversation traffic are inaccessible.
+  Internal/admin agent mint calls must supply the exact WebChannel `accountId`
+  (distinct from the NATS signing-account `issuerAccountId`).
+- Newly issued browser credentials publish only their own `.in` and `.register`
+  subjects. `.out`, `.reginbox` and other agent-to-browser publications are denied
+  by NATS. Existing subscriptions and multi-account browser access are unchanged.
+- Existing credentials remain usable until their original expiry or explicit
+  revocation. Doctor warns about old broad agent grants and explains reissue:
+  upgrade both packages, stop the affected account, archive its credential file,
+  complete any required SaaS active-key replacement, then explicitly re-enroll.
+  Keep conversation keys and history. Credentials without `exp` do not expire
+  automatically; replace and explicitly revoke them to end their old privileges.
+  Browser users must obtain new credentials to receive the publish restriction.
+  Encrypted frames and protocol version 7 are unchanged. AAD direction binding
+  remains tracked in #436, and client replay/freshness in #415 E4.
+
 ### Changed
 
 - **Case-distinct JWT peers now have distinct core sessions (#372).** Raw peer
