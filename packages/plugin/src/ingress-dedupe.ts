@@ -1032,14 +1032,11 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             //  - a row exists: the ordinary deduped retry, re-echoing the FIRST
             //    admission's id and seq (to a conforming client; an older one is
             //    acked bare, as above).
-            // #399: a later retry of an already-retried original was accepted by
-            // converging on the first retry's row, so its own key never has a
-            // row. That is the answer this marker recorded, not a lost
-            // admission: re-echo it (seq-less, as the first time) without the
-            // re-admission warning.
+            // #399/#425: a converged alias has no user row, so only its exact
+            // transactional receipt may answer this marker. Without that proof
+            // the marker is orphaned and normal admission repairs it below.
             const converged = row === undefined && deps.dispatchRecovery
               ? deps.deliveryJournal?.dispatch?.convergence(peerId, idempotencyKey)
-                ?? (typeof item.message.retry_of === "string" ? deps.deliveryJournal?.dispatch?.retryOf(peerId, item.message.retry_of) : undefined)
               : undefined;
             if (converged !== undefined) {
               release();

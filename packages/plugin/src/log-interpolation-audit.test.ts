@@ -308,8 +308,10 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // not name an interrupted request (17→18) and its ONE interpolation (16),
   // `peerId`, which is peer-controlled and `logSafe`-wrapped. KNOWN_RAW is
   // unchanged for the same reason #344's line left it unchanged.
-  // Stop and scoped acceptance lookup failures each add a constant diagnostic.
-  "ingress-dedupe.ts": { statements: 20, interpolations: 16 },
+  // Stop and scoped acceptance lookup failures added two constant diagnostics
+  // (18→20); optional never-accepted classification adds one more (20→21).
+  // Interpolation count stays 16.
+  "ingress-dedupe.ts": { statements: 21, interpolations: 16 },
   "approvals.ts": { statements: 9, interpolations: 24 },
   // #240 half 2 rewired both history read sites onto the delivery journal, then
   // review round 1 EXTRACTED both into `history-serve.ts`. 23→19 statements,

@@ -748,7 +748,7 @@ describe("BoundedOverflowResolver — the journal is the accept authority (#344)
       const resolver = new BoundedOverflowResolver({
         outcomeStore,
         lookupUserRow: ({ peerId }, idempotencyKey) => journal.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
-        lookupConvergedRetry: ({ peerId }, retryOf) => dispatch.convergence(peerId, "r-2") ?? dispatch.retryOf(peerId, retryOf),
+        lookupConvergedRetry: ({ peerId }) => dispatch.convergence(peerId, "r-2"),
         sendAck: ({ id }, committed) => { acks.push({ id, committed }); return true; },
         sendRejected: () => true,
       });
@@ -763,6 +763,38 @@ describe("BoundedOverflowResolver — the journal is the accept authority (#344)
       start("u-2");
       await tick(); await tick();
       expect(acks).toHaveLength(1);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("#425 leaves an accepted retry marker unresolved when its exact convergence receipt is missing", async () => {
+    const journal = openIn();
+    try {
+      const dispatch = journal.dispatch!;
+      const owner = dispatch.activate();
+      const [original] = dispatch.accept(owner, PEER, [{ text: "transfer", turnId: "u-0", randomId: "r-0" }]);
+      dispatch.claim(owner, PEER, ["r-0"]);
+      dispatch.recoverInterrupted(dispatch.activate());
+      const replacement = dispatch.activate();
+      dispatch.accept(replacement, PEER, [{ text: "transfer", turnId: "u-1", randomId: "r-1", retryOf: original!.messageId }]);
+      const outcomeStore = await seedAcceptedMarker(`${PEER}:r-2`);
+      const acks: unknown[] = [];
+      const resolver = new BoundedOverflowResolver({
+        outcomeStore,
+        lookupUserRow: ({ peerId }, idempotencyKey) => journal.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
+        lookupConvergedRetry: ({ peerId }) => dispatch.convergence(peerId, "r-2"),
+        sendAck: (...args) => { acks.push(args); return true; },
+        sendRejected: () => true,
+      });
+      resolver.tryStart({
+        accountId: ACCOUNT, peerId: PEER, key: `${PEER}:r-2`, id: "u-2", randomId: "r-2", retryOf: original!.messageId,
+        sessionToken: new InboundRetentionBudget().createSessionToken(),
+      });
+      await tick(); await tick();
+      expect(dispatch.convergence(PEER, "r-2")).toBeUndefined();
+      expect(acks).toEqual([]);
+      expect(resolver.usage().tasks).toBe(0);
     } finally {
       journal.close();
     }
@@ -788,7 +820,7 @@ describe("BoundedOverflowResolver — the journal is the accept authority (#344)
       const resolver = new BoundedOverflowResolver({
         outcomeStore,
         lookupUserRow: ({ peerId }, idempotencyKey) => journal.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
-        lookupConvergedRetry: ({ peerId }, retryOf) => dispatch.convergence(peerId, "r-2") ?? dispatch.retryOf(peerId, retryOf),
+        lookupConvergedRetry: ({ peerId }) => dispatch.convergence(peerId, "r-2"),
         sendAck: ({ id }, committed, cancelled) => { acks.push({ id, committed, cancelled }); return true; },
         sendRejected: () => true,
       });

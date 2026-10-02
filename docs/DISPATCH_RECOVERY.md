@@ -115,7 +115,7 @@ conforming clients always supply one. Control user-bubble history remains the
 separate #281 gap. This change does not migrate old SDK terminal markers or fix
 their separate legacy namespace issue (review R5).
 
-Control receipts and target metadata have the same indefinite on-disk retention
+Control receipts and server-held target metadata have the same indefinite on-disk retention
 as dispatch lifecycle records; evicting them would permit old replays to execute.
 No message payload is copied into the stop tables. Target capture uses the
 existing bounded debounce reservations and one already-charged overflow key per

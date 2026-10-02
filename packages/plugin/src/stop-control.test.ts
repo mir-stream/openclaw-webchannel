@@ -769,6 +769,41 @@ it("#425 a never-processed retry remains unaccepted even when another retry alre
   });
 });
 
+it("#425 normal admission repairs an orphan accepted marker before stop replays its receipt", async () => {
+  const root = temporaryRoot();
+  const paths = tupleStoragePaths({ storageRoot: root, tenant: "tenant-a", accountId: "ExactAccount" });
+  const seed = openDeliveryJournal({ databasePath: paths.deliveryJournalPath });
+  const firstOwner = seed.dispatch!.activate();
+  const [original] = seed.dispatch!.accept(firstOwner, "RawPeer", [{ text: "transfer", turnId: "wire-O", randomId: "logical-O" }]);
+  seed.dispatch!.claim(firstOwner, "RawPeer", ["logical-O"]);
+  const owner = seed.dispatch!.activate();
+  seed.dispatch!.recoverInterrupted(owner);
+  const [first] = seed.dispatch!.accept(owner, "RawPeer", [{ text: "transfer", turnId: "wire-R1", randomId: "logical-R1", retryOf: original!.messageId }]);
+  const [claimed] = seed.dispatch!.claim(owner, "RawPeer", ["logical-R1"]);
+  seed.dispatch!.settle(owner, "RawPeer", claimed!.batch!, "completed");
+  seed.close();
+
+  const h = setup({ root });
+  const marker = await h.store.record("ExactAccount", "RawPeer:logical-R2", "accepted");
+  if (marker.status !== "recorded") throw new Error("could not seed accepted marker");
+  marker.write.commit();
+  const alias = { ...item("R2"), message: { ...item("R2").message, text: "transfer", retry_of: original!.messageId } };
+  await h.flush([alias]);
+  expect(h.journal.dispatch!.convergence("RawPeer", "logical-R2")).toMatchObject({
+    messageId: first!.messageId, retryOf: original!.messageId,
+  });
+  expect(h.acks.at(-1)).toMatchObject({
+    ids: ["device-1:R2"], committed: [{ random_id: "logical-R2", messageId: first!.messageId, converged: true }],
+  });
+  h.acks.length = 0;
+  expect(h.stop.handle(stop("S", "device-2", [alias]), true)).toMatchObject({ fresh: true, targetCount: 0 });
+  expect(h.acks.find(ack => ack.ids.includes("device-1:R2"))).toEqual({
+    peerId: "RawPeer", ids: ["device-1:R2"],
+    committed: [{ random_id: "logical-R2", messageId: first!.messageId, converged: true }],
+    cancelled: undefined,
+  });
+});
+
 it("#425 emits 256 maximum-size converged aliases as independently sealed ACKs", () => {
   const root = temporaryRoot();
   const aliases = Array.from({ length: 256 }, (_, index) => {
