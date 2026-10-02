@@ -1,5 +1,16 @@
 # Project Status — single source of truth
 
+DM policy (#406): canonical `dmPolicy` uses SDK `pairing | allowlist | open |
+disabled` semantics. The default remains `open` (TD-1), requiring an explicit
+`allowFrom: ["*"]`; setup writes both and preserves existing restrictions on
+re-enrollment. `disabled` rejects every sender including allowlisted peers.
+Allowlist matching honors `*` and `webchannel:` prefixes while preserving peer
+case. Pairing uses the SDK's account-scoped approval store and challenge flow.
+Manifest validation checks inherited account policy/allowlist combinations;
+runtime independently refuses invalid account configuration. Core security audit
+reports the same policy and real fix paths. Doctor guides migration from legacy
+`dmSecurity` aliases. See [DM configuration](AUTH.md#dm-policy).
+
 Quiet-turn liveness (#396): normal turns send an initial typing indicator and
 renew ephemeral `typing` with `keepalive: true` every 4 seconds until completion,
 error, or dispatch abort. Renewals refresh existing application watches without

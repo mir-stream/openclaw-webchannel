@@ -28,7 +28,7 @@ import { StorageDocumentError } from "./storage-document.js";
 import { STORAGE_IDENTITY_VERSION } from "./storage-identity.js";
 import { tupleStoragePaths } from "./storage-paths.js";
 
-const cfg = (webchannel: Record<string, unknown>): OpenClawConfig => ({ channels: { webchannel } } as never);
+const cfg = (webchannel: Record<string, unknown>): OpenClawConfig => ({ channels: { webchannel: { allowFrom: ["*"], ...webchannel } } } as never);
 const identityKey = { publicKey: new Uint8Array(32), privateKey: new Uint8Array(32) };
 const persisted = {
   userJwt: "J",
@@ -130,7 +130,7 @@ function futureTupleFixture(
           jwksUrl: "https://issuer.example/jwks",
         },
       },
-      dmSecurity: "allowlist",
+      dmPolicy: "allowlist", allowFrom: ["alice"],
     }),
     storageRoot,
     targetPath,
@@ -153,15 +153,15 @@ function expectFutureFixtureUntouched(
 
 describe("evaluateWebchannelDoctor findings", () => {
   const cases: Array<[DoctorCheckId, OpenClawConfig, Record<string, string | undefined>, () => PersistedEnrolledCreds | undefined]> = [
-    ["encryption-disabled", cfg({ encryption: { mode: "disabled" }, auth: validAuth("default"), dmSecurity: "allowlist" }), {}, () => persisted],
-    ["creds-missing", cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }), {}, () => undefined],
-    ["identity-key-missing", cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }), {}, () => ({ userJwt: "J", userSeed: "S" })],
-    ["verifier-unbuildable", cfg({ auth: { strategy: "jwt", jwt: { issuer: "", jwks: { keys: [] } } }, dmSecurity: "allowlist" }), {}, () => persisted],
-    ["audience-override-removed", cfg({ auth: { strategy: "jwt", jwt: { issuer: "https://issuer", jwks: { keys: [] }, audience: "legacy" } }, dmSecurity: "allowlist" }), {}, () => persisted],
-    ["obsolete-cors", cfg({ auth: { ...validAuth("default"), cors: {} }, dmSecurity: "allowlist" }), {}, () => persisted],
-    ["credential-source-invalid", cfg({ auth: validAuth("default"), nats: { credentials: { mode: "static", userJwt: "J" } }, dmSecurity: "allowlist" }), {}, () => persisted],
-    ["orphaned-default", cfg({ auth: validAuth("shared"), dmSecurity: "allowlist", accounts: { named: {} } }), {}, () => persisted],
-    ["deprecated-acquisition-env", cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }), { WEBCHANNEL_TENANT: "old" }, () => persisted],
+    ["encryption-disabled", cfg({ encryption: { mode: "disabled" }, auth: validAuth("default"), dmPolicy: "allowlist", allowFrom: ["alice"] }), {}, () => persisted],
+    ["creds-missing", cfg({ auth: validAuth("default"), dmPolicy: "allowlist", allowFrom: ["alice"] }), {}, () => undefined],
+    ["identity-key-missing", cfg({ auth: validAuth("default"), dmPolicy: "allowlist", allowFrom: ["alice"] }), {}, () => ({ userJwt: "J", userSeed: "S" })],
+    ["verifier-unbuildable", cfg({ auth: { strategy: "jwt", jwt: { issuer: "", jwks: { keys: [] } } }, dmPolicy: "allowlist", allowFrom: ["alice"] }), {}, () => persisted],
+    ["audience-override-removed", cfg({ auth: { strategy: "jwt", jwt: { issuer: "https://issuer", jwks: { keys: [] }, audience: "legacy" } }, dmPolicy: "allowlist", allowFrom: ["alice"] }), {}, () => persisted],
+    ["obsolete-cors", cfg({ auth: { ...validAuth("default"), cors: {} }, dmPolicy: "allowlist", allowFrom: ["alice"] }), {}, () => persisted],
+    ["credential-source-invalid", cfg({ auth: validAuth("default"), nats: { credentials: { mode: "static", userJwt: "J" } }, dmPolicy: "allowlist", allowFrom: ["alice"] }), {}, () => persisted],
+    ["orphaned-default", cfg({ auth: validAuth("shared"), dmPolicy: "allowlist", allowFrom: ["alice"], accounts: { named: {} } }), {}, () => persisted],
+    ["deprecated-acquisition-env", cfg({ auth: validAuth("default"), dmPolicy: "allowlist", allowFrom: ["alice"] }), { WEBCHANNEL_TENANT: "old" }, () => persisted],
   ];
 
   it.each(cases)("fires %s", (checkId, config, env, load) => {
@@ -170,7 +170,7 @@ describe("evaluateWebchannelDoctor findings", () => {
 
   it("verifier-unbuildable fires for absent and strategyless auth (every account is register-hop)", () => {
     for (const auth of [undefined, {}]) {
-      const config = cfg({ ...(auth === undefined ? {} : { auth }), dmSecurity: "allowlist" });
+      const config = cfg({ ...(auth === undefined ? {} : { auth }), dmPolicy: "allowlist", allowFrom: ["alice"] });
       const finding = evaluateWebchannelDoctor(config, { env: {}, loadPersistedEnrolledCreds: () => persisted }).find((item) => item.checkId === "verifier-unbuildable");
       expect(finding?.message).toContain("auth.strategy is required (jwt)");
     }
@@ -178,7 +178,7 @@ describe("evaluateWebchannelDoctor findings", () => {
 
   it("allows healthy accounts to share one issuer/JWKS", () => {
     const findings = evaluateWebchannelDoctor(cfg({
-      dmSecurity: "allowlist",
+      dmPolicy: "allowlist", allowFrom: ["alice"],
       accounts: {
         a: { auth: validAuth("shared") },
         b: { auth: { strategy: "jwt", jwt: { issuer: "https://issuer/", jwks: { keys: [] } } } },
@@ -190,7 +190,7 @@ describe("evaluateWebchannelDoctor findings", () => {
 
   it("reports a disabled tombstone as non-serving warning only", () => {
     const findings = evaluateWebchannelDoctor(cfg({
-      dmSecurity: "allowlist",
+      dmPolicy: "allowlist", allowFrom: ["alice"],
       accounts: {
         disabled: { enabled: false, auth: { strategy: "jwt", jwt: { audience: null } } },
         valid: { auth: validAuth("valid") },
@@ -204,27 +204,27 @@ describe("evaluateWebchannelDoctor findings", () => {
   });
 
   it("reports a static creds config as credential-source-invalid (BYO-NATS pending P0-3)", () => {
-    const config = cfg({ auth: validAuth("default"), nats: { credentials: { mode: "static", credsFile: "/account.creds" } }, dmSecurity: "allowlist" });
+    const config = cfg({ auth: validAuth("default"), nats: { credentials: { mode: "static", credsFile: "/account.creds" } }, dmPolicy: "allowlist", allowFrom: ["alice"] });
     const finding = evaluateWebchannelDoctor(config, { env: {}, loadPersistedEnrolledCreds: () => persisted }).find((f) => f.checkId === "credential-source-invalid");
     expect(finding?.message).toMatch(/static NATS credentials/);
   });
 
   it("stays quiet on orphaned-default with accounts.default and for tenant/saas-only shared bases", () => {
-    const withDefault = cfg({ auth: validAuth("shared"), accounts: { default: {}, named: {} }, dmSecurity: "allowlist" });
-    const sharedBase = cfg({ tenant: "t", saas: { baseUrl: "https://saas" }, accounts: { named: {} }, dmSecurity: "allowlist" });
+    const withDefault = cfg({ auth: validAuth("shared"), accounts: { default: {}, named: {} }, dmPolicy: "allowlist", allowFrom: ["alice"] });
+    const sharedBase = cfg({ tenant: "t", saas: { baseUrl: "https://saas" }, accounts: { named: {} }, dmPolicy: "allowlist", allowFrom: ["alice"] });
     expect(ids(withDefault)).not.toContain("orphaned-default");
     expect(ids(sharedBase)).not.toContain("orphaned-default");
   });
 
   it("is latch-free across consecutive evaluations for deprecated-acquisition-env", () => {
-    const config = cfg({ auth: validAuth("default"), dmSecurity: "allowlist" });
+    const config = cfg({ auth: validAuth("default"), dmPolicy: "allowlist", allowFrom: ["alice"] });
     for (let i = 0; i < 2; i += 1) {
       expect(ids(config, { WEBCHANNEL_TENANT: "old" })).toContain("deprecated-acquisition-env");
     }
   });
 
   it("C11 distinguishes ignored tenant env from the still-effective SaaS override", () => {
-    const config = cfg({ dmSecurity: "allowlist" });
+    const config = cfg({ dmPolicy: "allowlist", allowFrom: ["alice"] });
     const findings = evaluateWebchannelDoctor(config, {
       env: {
         WEBCHANNEL_TENANT: "old-tenant",
@@ -242,7 +242,7 @@ describe("evaluateWebchannelDoctor findings", () => {
   });
 
   it("does not diagnose acquisition env that is honored beside lifecycle metadata only", () => {
-    const findings = evaluateWebchannelDoctor(cfg({ enabled: true }), {
+    const findings = evaluateWebchannelDoctor({ channels: { webchannel: { enabled: true } } }, {
       env: {
         WEBCHANNEL_TENANT: "legacy-tenant",
         WEBCHANNEL_SAAS_BASE_URL: "https://legacy-saas.example",
@@ -257,10 +257,10 @@ describe("evaluateWebchannelDoctor findings", () => {
 
   it("keeps healthy compatibility fixtures at zero findings", () => {
     const fixtures = [
-      cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }),
-      cfg({ auth: validAuth("default"), nats: { admission: "register-hop" }, dmSecurity: "allowlist" }),
-      cfg({ auth: validAuth("default"), nats: { url: "ws://relay" }, dmSecurity: "allowlist" }),
-      cfg({ auth: { strategy: "jwt", jwt: { issuer: "https://issuer", jwksUrl: "https://issuer/keys" } }, dmSecurity: "allowlist" }),
+      cfg({ auth: validAuth("default"), dmPolicy: "allowlist", allowFrom: ["alice"] }),
+      cfg({ auth: validAuth("default"), nats: { admission: "register-hop" }, dmPolicy: "allowlist", allowFrom: ["alice"] }),
+      cfg({ auth: validAuth("default"), nats: { url: "ws://relay" }, dmPolicy: "allowlist", allowFrom: ["alice"] }),
+      cfg({ auth: { strategy: "jwt", jwt: { issuer: "https://issuer", jwksUrl: "https://issuer/keys" } }, dmPolicy: "allowlist", allowFrom: ["alice"] }),
     ];
     for (const fixture of fixtures) expect(evaluateWebchannelDoctor(fixture, { env: {}, loadPersistedEnrolledCreds: () => persisted })).toEqual([]);
   });
@@ -365,7 +365,7 @@ describe("evaluateWebchannelDoctor findings", () => {
 
   it("keeps a throwing credential loader account-scoped", () => {
     const findings = evaluateWebchannelDoctor(
-      cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }),
+      cfg({ auth: validAuth("default"), dmPolicy: "allowlist", allowFrom: ["alice"] }),
       {
         env: {},
         loadPersistedEnrolledCreds: () => { throw new Error("credential store unavailable"); },
@@ -385,7 +385,7 @@ describe("evaluateWebchannelDoctor findings", () => {
 
   it("keeps future credential remediation free of contradictory re-enrollment advice", () => {
     const findings = evaluateWebchannelDoctor(
-      cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }),
+      cfg({ auth: validAuth("default"), dmPolicy: "allowlist", allowFrom: ["alice"] }),
       {
         env: {},
         loadPersistedEnrolledCreds: () => {
@@ -569,7 +569,7 @@ describe("status probe", () => {
 
   it("probes inline effective JWKS plus relay and returns success", async () => {
     const dial = vi.fn(async () => ({ ok: true as const }));
-    const result = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => persisted, dial });
+    const result = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: validAuth("default"), dmPolicy: "allowlist", allowFrom: ["alice"] }) }, { env: {}, loadCreds: () => persisted, dial });
     expect(result).toMatchObject({ ok: true, admission: "register-hop", jwks: { source: "inline", keyCount: 1 }, relay: { ok: true } });
     expect(result.relay).toEqual({ ok: true });
     expect(dial).toHaveBeenCalledWith(expect.objectContaining({ subject: "webchannel.default-tenant.default.*.register" }));
@@ -587,7 +587,7 @@ describe("status probe", () => {
         cfg: cfg({
           accounts: {
             bad: { auth: { strategy: "anonymous" } },
-            good: { auth: validAuth("good"), dmSecurity: "allowlist" },
+            good: { auth: validAuth("good"), dmPolicy: "allowlist", allowFrom: ["alice"] },
           },
         }),
       },
@@ -610,11 +610,11 @@ describe("status probe", () => {
 
   it("probes the effective file and URL JWKS sources through injected seams", async () => {
     const dial = vi.fn(async () => ({ ok: true as const }));
-    const file = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: { strategy: "jwt", jwt: { issuer: "i", jwksFile: "/keys.json" } }, dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => persisted, dial, readFile: () => JSON.stringify({ keys: [{ kty: "RSA" }] }) });
+    const file = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: { strategy: "jwt", jwt: { issuer: "i", jwksFile: "/keys.json" } }, dmPolicy: "allowlist", allowFrom: ["alice"] }) }, { env: {}, loadCreds: () => persisted, dial, readFile: () => JSON.stringify({ keys: [{ kty: "RSA" }] }) });
     expect(file.jwks).toEqual({ source: "file", keyCount: 1 });
 
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ keys: [{ kty: "RSA" }] }), { status: 200, headers: { "content-type": "application/json" } }));
-    const url = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: { strategy: "jwt", jwt: { issuer: "i", jwksUrl: "https://idp/keys" } }, dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => persisted, dial, fetchImpl });
+    const url = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: { strategy: "jwt", jwt: { issuer: "i", jwksUrl: "https://idp/keys" } }, dmPolicy: "allowlist", allowFrom: ["alice"] }) }, { env: {}, loadCreds: () => persisted, dial, fetchImpl });
     expect(url.jwks).toEqual({ source: "url", keyCount: 1 });
     expect(fetchImpl).toHaveBeenCalled();
   });
@@ -661,7 +661,7 @@ describe("status probe", () => {
             strategy: "jwt",
             jwt: { issuer: "i", jwksUrl },
           },
-          dmSecurity: "allowlist",
+          dmPolicy: "allowlist", allowFrom: ["alice"],
         }),
       },
       {
@@ -718,7 +718,7 @@ describe("status probe", () => {
 
     for (const fixture of cases) {
       const result = await probeWebchannelAccount(
-        { account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: fixture.auth, dmSecurity: "allowlist" }) },
+        { account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: fixture.auth, dmPolicy: "allowlist", allowFrom: ["alice"] }) },
         { env: {}, loadCreds: () => persisted, dial, ...fixture.deps },
       );
       expect(result).toMatchObject({
@@ -731,14 +731,14 @@ describe("status probe", () => {
   });
 
   it("is fail-soft on dial failure and timeout-shaped errors", async () => {
-    const result = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 1, cfg: cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => persisted, dial: async () => ({ error: "relay dial timed out" }) });
+    const result = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 1, cfg: cfg({ auth: validAuth("default"), dmPolicy: "allowlist", allowFrom: ["alice"] }) }, { env: {}, loadCreds: () => persisted, dial: async () => ({ error: "relay dial timed out" }) });
     expect(result).toMatchObject({ ok: false, error: expect.stringContaining("timed out") });
   });
 
   it("never starts enrollment when enrolled credentials are missing", async () => {
     const deviceFlow = vi.fn();
     const dial = vi.fn(async () => { deviceFlow(); return { ok: true as const }; });
-    const result = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 10, cfg: cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => undefined, dial });
+    const result = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 10, cfg: cfg({ auth: validAuth("default"), dmPolicy: "allowlist", allowFrom: ["alice"] }) }, { env: {}, loadCreds: () => undefined, dial });
     expect(result.ok).toBe(false);
     expect(dial).not.toHaveBeenCalled();
     expect(deviceFlow).not.toHaveBeenCalled();

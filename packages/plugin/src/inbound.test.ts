@@ -140,7 +140,7 @@ function makeFakeApi(params: {
   const config = {
     ...(params.commandsConfig ? { commands: params.commandsConfig } : {}),
     channels: {
-      webchannel: { streaming: { mode: params.streamingMode }, ...params.channelConfig },
+      webchannel: { allowFrom: ["*"], streaming: { mode: params.streamingMode }, ...params.channelConfig },
     },
   };
 

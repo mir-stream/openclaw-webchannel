@@ -219,7 +219,7 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
               "issuer": "$SAAS_ISSUER"
             }
           },
-          "dmSecurity": "allowlist",
+          "dmPolicy": "allowlist",
           "allowFrom": ["$PEER_ID"]
         }
       }
@@ -277,10 +277,10 @@ CRED_FILE="$(node --import tsx "$REPO/scripts/resolve-storage-path.ts" \
 [ -f "$CRED_FILE" ] || { echo "[run-all-real] creds NOT persisted at $CRED_FILE — log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-all-real] ✓ credentials persisted at $CRED_FILE"
 
-# 6b². Tighten dmSecurity AFTER `channels add`. The setup adapter writes the
+# 6b². Tighten dmPolicy AFTER `channels add`. The setup adapter writes the
 #      demo-proven block (`admission: "register-hop"` — the sole admission path —
-#      with `dmSecurity: "open"`) into the account; this step narrows it to
-#      `dmSecurity: "allowlist"` plus an explicit `allowFrom` pin so the harness
+#      with `dmPolicy: "open"`) into the account; this step narrows it to
+#      `dmPolicy: "allowlist"` plus an explicit `allowFrom` pin so the harness
 #      exercises the allowlist path. (admission stays register-hop throughout.)
 node -e '
   const fs = require("fs");
@@ -288,11 +288,11 @@ node -e '
   const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
   const a = cfg.channels.webchannel.accounts[acct];
   a.nats = { ...(a.nats ?? {}), admission: "register-hop" };
-  a.dmSecurity = "allowlist";
+  a.dmPolicy = "allowlist";
   a.allowFrom = [peer];
   fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
 ' "$OCH/.openclaw/openclaw.json" "$ACCOUNT_ID" "$PEER_ID"
-echo "[run-all-real] ✓ re-asserted admission=register-hop + dmSecurity=allowlist for account $ACCOUNT_ID"
+echo "[run-all-real] ✓ re-asserted admission=register-hop + dmPolicy=allowlist for account $ACCOUNT_ID"
 
 # ---------------------------------------------------------------------------
 # 6c. Boot the isolated gateway — CONSUME-ONLY. No acquisition env: identity

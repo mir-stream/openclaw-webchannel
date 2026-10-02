@@ -163,8 +163,8 @@ describe("resolvePeerCommandAuthorization", () => {
 
   it("authorizes every admitted peer, whatever admitted it", () => {
     for (const cfg of [
-      undefined,
-      { dmSecurity: "open" },
+      { allowFrom: ["*"] },
+      { dmSecurity: "open", allowFrom: ["*"] },
       { dmSecurity: "allowlist", allowFrom: ["alice"] },
     ]) {
       const admission = resolveDmAdmission("alice", cfg);
@@ -186,7 +186,7 @@ describe("resolvePeerCommandAuthorization", () => {
   });
 
   it("uses provider-specific commands.allowFrom before the global fallback", () => {
-    const admission = resolveDmAdmission("bob", undefined);
+    const admission = resolveDmAdmission("bob", { allowFrom: ["*"] });
     expect(resolvePeerCommandAuthorization({
       admission,
       cfg: { commands: { allowFrom: { webchannel: ["alice"], "*": ["bob"] } } },

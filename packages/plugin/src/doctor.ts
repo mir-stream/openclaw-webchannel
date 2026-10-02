@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { resolveDmPolicy, validateDmConfig } from "./dm-allowlist.js";
 
 import type {
   BaseProbeResult,
@@ -54,6 +55,8 @@ export type DoctorCheckId =
   | "invalid-account-id"
   | "invalid-default-account"
   | "configuration-invalid"
+  | "dm-policy-invalid"
+  | "legacy-dm-security"
   | "encryption-disabled"
   | "creds-missing"
   | "credential-binding-failed"
@@ -172,6 +175,22 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
 
   for (const plan of plans) {
     const { accountId, account, tenant } = plan;
+    try {
+      validateDmConfig(account);
+    } catch (error) {
+      findings.push({ accountId, checkId: "dm-policy-invalid", kind: "config", severity: "error",
+        message: errorMessage(error),
+        fix: 'Set dmPolicy to pairing, allowlist, open or disabled. For open (including the default), explicitly set allowFrom: ["*"]. For allowlist, provide at least one sender ID.',
+      });
+    }
+    if (account.dmSecurity !== undefined) {
+      let policy: string;
+      try { policy = resolveDmPolicy(account); } catch { policy = "a valid SDK policy"; }
+      findings.push({ accountId, checkId: "legacy-dm-security", kind: "config", severity: "warn",
+        message: "dmSecurity is deprecated; dmPolicy is the canonical SDK field.",
+        fix: `Replace dmSecurity with dmPolicy=${JSON.stringify(policy)} in the defining channel/account config. Open requires explicit allowFrom: ["*"]. Keep peer IDs case-sensitive; webchannel: prefixes are normalized.`,
+      });
+    }
     const nats = account.nats as WebchannelNatsConfig | undefined;
     try {
       resolveEncryptionPolicy(account.encryption as WebchannelEncryptionConfig | undefined);

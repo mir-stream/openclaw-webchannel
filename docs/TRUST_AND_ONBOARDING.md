@@ -192,5 +192,5 @@ NATS config에 SaaS의 account 공개키 박기. 1회, 끝.
 - E2E crypto 세부(cnf 검증·키핀·핸드셰이크·키 wrap)는 `AUTH.md`/seed 참조. 본 문서는 **결합·온보딩**만.
 - 브라우저 NATS dial + cnf 검증 wiring + allowlist 인가는 모두 **구현·라이브 검증됨** (production
   `WebChannelNatsClient`가 직접 NATS를 dial하고 X25519 핸드셰이크·PoP register hop을 수행; `auto`
-  admission + `dmSecurity` allowlist가 실제로 게이트한다). 더는 갭 아님 — `STATUS.md` 참조.
+  admission + `dmPolicy` allowlist가 실제로 게이트한다). 더는 갭 아님 — `STATUS.md` 참조.
 - 키 로테이션/revocation은 enrollment 엔드포인트 재호출로 흡수 예정(deferred).

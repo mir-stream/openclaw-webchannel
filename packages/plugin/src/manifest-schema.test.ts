@@ -26,9 +26,12 @@ const manifest = JSON.parse(
 };
 
 describe("shipped WebChannel manifest schema", () => {
-  const runtime = buildJsonChannelConfigSchema(
-    manifest.channelConfigs.webchannel.schema,
-  ).runtime!;
+  const rawRuntime = buildJsonChannelConfigSchema(manifest.channelConfigs.webchannel.schema).runtime!;
+  // These are unrelated feature fixtures; give each active account the required
+  // explicit open grant. DM-specific negative cases use the raw schema below.
+  const runtime = { safeParse: (value: Record<string, unknown>) => rawRuntime.safeParse(
+    value.enabled === false ? value : { allowFrom: ["*"], ...value },
+  ) };
 
   it("accepts the channel lifecycle enabled flag", () => {
     expect(runtime.safeParse({ enabled: false })).toEqual({
@@ -105,7 +108,7 @@ describe("shipped WebChannel manifest schema", () => {
         schema: manifest.channelConfigs.webchannel.schema as JsonSchemaObject,
         // Unique per call: the validator caches compiled schemas by this key.
         cacheKey: `webchannel-manifest-default-${Math.random()}`,
-        value,
+        value: { allowFrom: ["*"], ...(value as object) },
         applyDefaults: true,
       });
       if (!result.ok) throw new Error(`unexpected validation failure: ${JSON.stringify(result.errors)}`);
@@ -198,7 +201,7 @@ describe("shipped WebChannel manifest schema", () => {
       const result = validateJsonSchemaValue({
         schema: manifest.channelConfigs.webchannel.schema as JsonSchemaObject,
         cacheKey: `webchannel-manifest-durable-default-${Math.random()}`,
-        value,
+        value: { allowFrom: ["*"], ...(value as object) },
         applyDefaults: true,
       });
       if (!result.ok) throw new Error(`unexpected validation failure: ${JSON.stringify(result.errors)}`);
@@ -285,7 +288,7 @@ describe("shipped WebChannel manifest schema", () => {
       validateJsonSchemaValue({
         schema: manifest.channelConfigs.webchannel.schema as JsonSchemaObject,
         cacheKey: `webchannel-manifest-runtime-keys-${Math.random()}`,
-        value,
+        value: { allowFrom: ["*"], ...(value as object) },
         applyDefaults: true,
       });
 

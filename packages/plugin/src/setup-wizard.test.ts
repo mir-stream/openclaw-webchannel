@@ -108,7 +108,8 @@ describe("setup-wizard: buildFullAccountPatch (ground-truth demo block)", () => 
       tenant: "default-tenant",
       saas: { baseUrl: "http://host.docker.internal:3951" },
       auth: { strategy: "jwt" },
-      dmSecurity: "open",
+      dmPolicy: "open",
+          allowFrom: ["*"],
       nats: { admission: "register-hop", credentials: { mode: "enrolled" } },
     });
   });
@@ -492,7 +493,8 @@ describe("setup-wizard: per-field funnel safety", () => {
       tenant: "t",
       saas: { baseUrl: "http://s" },
       auth: { strategy: "jwt" },
-      dmSecurity: "open",
+      dmPolicy: "open",
+          allowFrom: ["*"],
       nats: { admission: "register-hop", credentials: { mode: "enrolled" } },
     });
   });

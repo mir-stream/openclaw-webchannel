@@ -22,6 +22,7 @@ import { ConversationKeyStore } from "./conversation-key-store.js";
 import { openDeliveryJournal } from "./delivery-journal.js";
 import type { DeliveryJournal } from "./delivery-journal.js";
 import { tupleStoragePaths } from "./storage-paths.js";
+import { resolveDmPolicy, validateDmConfig } from "./dm-allowlist.js";
 import { createCapacityDiagnostics } from "./capacity-diagnostics.js";
 import { resolveEncryptionPolicy } from "./encryption-policy.js";
 import type { WebchannelEncryptionConfig } from "./encryption-policy.js";
@@ -429,7 +430,16 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       const storageScope = Object.freeze({ tenant, accountId });
       const accountNatsCfg = account.nats as WebchannelNatsConfig | undefined;
       const accountEncryption = account.encryption as WebchannelEncryptionConfig | undefined;
-      const accountDmSecurity = account.dmSecurity as string | undefined;
+      try {
+        validateDmConfig(account);
+      } catch (error) {
+        const detail = `Invalid DM policy: ${error instanceof Error ? error.message : String(error)}. Run openclaw doctor.`;
+        reportPermanent(accountId, "dm-policy-config-invalid", detail);
+        setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: detail }));
+        await waitForAbort(ctx.abortSignal);
+        return undefined;
+      }
+      const accountDmPolicy = resolveDmPolicy(account);
       const admission = "register-hop" as const;
 
       // Resolve the effective source before reading enrolled material. In
@@ -548,8 +558,8 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             admission: "register-hop",
             audience: accountId,
             buildError,
-            ...(account.dmSecurity !== undefined
-              ? { dmSecurity: String(account.dmSecurity) }
+            ...((account.dmPolicy ?? account.dmSecurity) !== undefined
+              ? { dmPolicy: String(account.dmPolicy ?? account.dmSecurity) }
               : {}),
           }).line;
         } catch { /* the stable permanent event below remains available */ }
@@ -1513,7 +1523,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         ...(effIssuer !== undefined ? { issuer: effIssuer } : {}),
         ...(effAudience !== undefined ? { audience: effAudience } : {}),
         ...(jwks !== undefined ? { jwks } : {}),
-        ...(accountDmSecurity !== undefined ? { dmSecurity: accountDmSecurity } : {}),
+        ...(accountDmPolicy !== undefined ? { dmPolicy: accountDmPolicy } : {}),
       });
       if (readiness.verdict === "FAIL") log("error", readiness.line);
       else if (readiness.verdict === "WARN") log("warn", readiness.line);

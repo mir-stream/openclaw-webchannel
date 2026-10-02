@@ -5,6 +5,8 @@ import {
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import type { ChannelDoctorAdapter, ChannelStatusAdapter } from "openclaw/plugin-sdk/channel-contract";
 import { waitUntilAbort } from "openclaw/plugin-sdk/channel-runtime";
+import type { DmPolicy } from "openclaw/plugin-sdk/config-contracts";
+import { normalizeDmAllowEntry, resolveDmPolicy } from "./dm-allowlist.js";
 
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
@@ -56,7 +58,7 @@ type ResolvedAccount = {
   accountId: string;
   enabled: boolean;
   allowFrom: string[];
-  dmPolicy: string | undefined;
+  dmPolicy: DmPolicy;
 };
 
 // `createChatChannelPlugin`'s `base` param requires a non-optional `capabilities`,
@@ -95,8 +97,8 @@ function resolveAccount(
     // An unresolved request remains visible but carries no usable account data.
     accountId: id ?? accountId ?? resolveDefaultWebchannelAccountId(cfg),
     enabled: isWebchannelAccountEnabled(cfg, accountId),
-    allowFrom: (account.allowFrom as string[] | undefined) ?? [],
-    dmPolicy: account.dmSecurity as string | undefined,
+    allowFrom: ((account.allowFrom as string[] | undefined) ?? []).map(normalizeDmAllowEntry),
+    dmPolicy: resolveDmPolicy(account),
   };
 }
 
@@ -284,13 +286,28 @@ export function createWebChannelPlugin(
       },
     } satisfies WebchannelAdapters & Record<string, unknown>)),
 
-    // DM security: who may message the bot. Phase 0 uses config allowlist only.
+    pairing: {
+      text: {
+        idLabel: "webchannelUserId",
+        message: "WebChannel pairing approved. You can now send messages.",
+        normalizeAllowEntry: normalizeDmAllowEntry,
+        notify: async ({ cfg, id, message, accountId }) => {
+          const target = resolveOutboundTransport({ cfg, accountId }, transport, opts?.resolveOutboundTransport);
+          if (!target.sendText(id, message, nextMessageId())) throw new Error("webchannel: pairing approval delivery failed");
+        },
+      },
+    },
+
+    // The SaaS JWT grant is the default admission approval (TD-1).
     security: {
       dm: {
         channelKey: WEBCHANNEL_ID,
         resolvePolicy: (account) => account.dmPolicy,
         resolveAllowFrom: (account) => account.allowFrom,
-        defaultPolicy: "allowlist",
+        defaultPolicy: "open",
+        policyPathSuffix: "dmPolicy",
+        allowFromPathSuffix: "allowFrom",
+        normalizeEntry: normalizeDmAllowEntry,
       },
     },
 

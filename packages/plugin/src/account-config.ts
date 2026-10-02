@@ -305,6 +305,9 @@ function mergeAccountConfig(
   override: WebchannelAccountConfig,
 ): WebchannelAccountConfig {
   const merged: WebchannelAccountConfig = { ...base, ...override };
+  // An account-local legacy spelling must still override a shared canonical
+  // policy. Within the same layer the canonical field always wins.
+  if (override.dmSecurity !== undefined && override.dmPolicy === undefined) delete merged.dmPolicy;
   for (const key of NESTED_OBJECT_KEYS) {
     const baseVal = base[key];
     const overrideVal = override[key];

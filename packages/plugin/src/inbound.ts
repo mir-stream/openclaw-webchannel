@@ -13,7 +13,7 @@ import {
 
 import { WEBCHANNEL_ID, ANON_PEER_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel, InboundWsMessage } from "./channel-contract.js";
-import { resolveDmAdmission } from "./dm-allowlist.js";
+import { enforceDmAdmission, type DmSecurityConfig } from "./dm-allowlist.js";
 import { resolvePeerCommandAuthorization } from "./command-gate.js";
 import { usableId } from "./ingress-dedupe.js";
 import {
@@ -1070,15 +1070,16 @@ export async function handleInboundMessage(
   // single `"default"` account this is identical to the flat block (regression).
   const channelConfig = resolveWebchannelAccountConfig(api.config, accountId);
 
-  // DM allowlist admission (split-authz, plugin-owned half). When the operator
-  // sets `channels.webchannel.dmSecurity: "allowlist"`, a non-allowlisted peer
-  // is denied here — BEFORE the agent turn runs — so `inbound.run` is never
-  // invoked and no reply is emitted (default-deny). With no `dmSecurity` set,
-  // admission is open, preserving the shipping Gateway-WS behavior.
-  const cc = channelConfig as { allowFrom?: readonly string[]; dmSecurity?: string } | undefined;
-  const admission = resolveDmAdmission(wsKey, {
-    allowFrom: cc?.allowFrom,
-    dmSecurity: cc?.dmSecurity,
+  // DM admission runs before route selection/dispatch. SDK pairing may reply
+  // with a challenge, but only an admitted sender reaches the core turn.
+  // Default open still requires an explicit wildcard in the validated config.
+  const admission = await enforceDmAdmission({
+    peerId: wsKey,
+    accountId,
+    config: channelConfig as DmSecurityConfig,
+    sendPairingReply: async (text) => {
+      if (!transport.sendText(wsKey, text, nextMessageId())) throw new Error("webchannel: pairing challenge delivery failed");
+    },
   });
   if (!admission.allowed) {
     settlementEligible = false;
