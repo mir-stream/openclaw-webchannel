@@ -67,4 +67,29 @@ it("real widget recreates interrupted history and only its Retry click sends a n
   expect(sent[0]).toMatchObject({ type: "user_message", text: "Check the transfer", retry_of: original.messageId });
   expect(sent[0].id).not.toBe("original-wire"); expect(sent[0].random_id).not.toBe("original-random");
   expect(root.textContent).toContain("Interrupted · result unknown");
+  // #399: the click spends the original's one retry at once, before any echo.
+  const spent = () => Array.from(root.querySelectorAll("button")).find(b => b.textContent === "Retry")!;
+  await settleUntil(() => spent().disabled, { label: "local retry spends the original" });
+  spent().click(); await new Promise(setImmediate);
+  expect(sent).toHaveLength(1);
+  expect(root.textContent).toContain("Retried →");
+  // A retry the server refused never reached it, so it spends nothing.
+  deliver({ type: "inbound_rejected", ids: [sent[0].id], reason: "overloaded" });
+  await settleUntil(() => !spent().disabled, { label: "refused retry re-enables Retry" });
+  expect(root.textContent).not.toContain("Retried →");
+  spent().click();
+  await settleUntil(() => sent.length === 2, { label: "retry after refusal" });
+  expect(sent[1]).toMatchObject({ retry_of: original.messageId });
+  await settleUntil(() => spent().disabled, { label: "second retry spends the original" });
+  // The server records that retry; a recreated widget renders it from history.
+  const [retried] = journal.dispatch!.accept(replacement, PEER, [{ text: String(sent[1].text), turnId: String(sent[1].id), randomId: String(sent[1].random_id), retryOf: original.messageId }]);
+  expect(retried.retried?.retriedBy).toBe(retried.messageId);
+  unmount();
+  unmount = await createWidget(root, cfg, AGENT); cleanup.push(unmount);
+  FakeNatsWS.instances.at(-1)!.onmessage?.({ data: 'INFO {"nonce":"widget-fixture-3"}\r\n' });
+  await settleUntil(() => root.textContent!.includes("● connected"), { label: "third widget registration" });
+  deliver({ type: "history", highWaterSeq: journal.maxSeq(PEER), messages: projectJournalHistory(journal.read, PEER).messages });
+  await settleUntil(() => root.textContent!.includes("Retried →"), { label: "server retriedBy link" });
+  expect(spent().disabled).toBe(true);
+  expect(root.querySelector(`[data-message-id="${retried.messageId}"]`)?.textContent).toContain("Retry of an interrupted request");
 });

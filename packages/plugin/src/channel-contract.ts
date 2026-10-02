@@ -81,6 +81,8 @@ export { ANON_PEER_ID };
 export type HistoryTextMessage = {
   requestState?: RequestState;
   retryOf?: string;
+  /** The one retry this interrupted original admitted (#399). */
+  retriedBy?: string;
   /** Explicit origin mapping; absent for legacy journal rows. */
   randomId?: string;
   turnId?: string;
@@ -541,7 +543,7 @@ export type OutboundWsMessage =
       /** #244 half A — see `agent_message`. Every `tool_activity` delta is durable. */
       seq?: number;
     }
-  | { type: "request_state"; id: string; state: RequestState; turnId: string; seq: number }
+  | { type: "request_state"; id: string; state: RequestState; turnId: string; seq: number; retriedBy?: string }
   | { type: "turn_settled"; turnId: string; outcome: "ok" | "error" }
   /**
    * #212 (Phase 3, targeted): the plugin's authoritative, ordered set of the
@@ -642,7 +644,7 @@ export type OutboundWsMessage =
        * gap that heals it. Telegram has the same split for free — a sent-message
        * update goes to the session that sent it.
        */
-      committed?: Array<{ random_id: string; messageId: string; seq: number }>;
+      committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>;
     }
   | { type: "inbound_rejected"; ids: string[]; reason: "overloaded" }
   /**
@@ -934,7 +936,7 @@ export interface WebChannelPeerChannel {
   sendAck?(
     peerId: string,
     ids: string[],
-    committed?: Array<{ random_id: string; messageId: string; seq: number }>,
+    committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>,
     cancelled?: string[],
   ): boolean;
   sendInboundRejected?(peerId: string, ids: string[]): boolean;
@@ -961,6 +963,6 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload, _options?: { redelivery?: boolean }): ApprovalRequestSendResult { return { delivered: false, journaled: false }; }
   sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision, options?: ApprovalResolutionSendOptions): ApprovalResolutionSendResult { options?.onClaim?.(); return { accepted: true, delivered: false, journaled: false, status: "unavailable" }; }
   sendApprovalSnapshot(_peerId: string, _approvals: ApprovalRequestPayload[], _resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean { return false; }
-  sendAck(_peerId: string, ids: string[], _committed?: Array<{ random_id: string; messageId: string; seq: number }>, _cancelled?: string[]): boolean { return ids.length === 0; }
+  sendAck(_peerId: string, ids: string[], _committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>, _cancelled?: string[]): boolean { return ids.length === 0; }
   sendInboundRejected(_peerId: string, ids: string[]): boolean { return ids.length === 0; }
 }

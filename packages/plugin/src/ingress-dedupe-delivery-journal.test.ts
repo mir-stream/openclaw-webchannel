@@ -99,7 +99,7 @@ type Item = {
  */
 type Call =
   | { call: "append"; conversationId: string; event: JournalEvent }
-  | { call: "ack"; ids: string[]; committed?: Array<{ random_id: string; messageId: string; seq: number }> }
+  | { call: "ack"; ids: string[]; committed?: Array<{ random_id: string; messageId: string; seq?: number }> }
   // #245 Part B: the multi-device broadcast of a just-committed user message.
   | { call: "user_committed"; peerId: string; message: { id: string; text: string; turnId?: string; seq: number; random_id?: string } }
   | { call: "rejected"; ids: string[] }

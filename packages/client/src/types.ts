@@ -152,6 +152,12 @@ export type ChatBubble = {
    */
   requestState?: RequestState;
   retryOf?: string;
+  /**
+   * The server row of the ONE retry this interrupted original admitted (#399).
+   * Present means the original is spent: render "Retried →" to that row, not a
+   * Retry action. A retry that is itself interrupted can be retried in turn.
+   */
+  retriedBy?: string;
   sendState?: "queued" | "sent" | "accepted" | "completed" | "failed" | "interrupted";
   /** P0-4: present only when `sendState === "failed"` — the failure detail. */
   sendFailure?: SendFailure;

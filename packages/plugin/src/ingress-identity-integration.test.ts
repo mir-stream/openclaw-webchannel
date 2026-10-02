@@ -13,7 +13,7 @@ import { estimateRetainedMessageBytes, InboundRetentionBudget } from "./inbound-
 import { coalesceUserMessages, createSerializedInboundDispatcher, type UserMessageLike } from "./inbound-queue.js";
 
 type Item = { peerId: string; message: UserMessageLike & { random_id?: string } };
-type Echo = Array<{ random_id: string; messageId: string; seq: number }>;
+type Echo = Array<{ random_id: string; messageId: string; seq?: number }>;
 const item = (id: string, random_id?: string, peerId = "peer"): Item => ({
   peerId, message: { type: "user_message", text: `text-${id}`, id, random_id },
 });

@@ -341,6 +341,7 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
 
     case "request_state": {
       if (!isNonEmptyString(field(raw, "id")) || !isNonEmptyString(field(raw, "turnId")) || !isRequestState(field(raw, "state"))) return invalid(known, "invalid request state");
+      if (field(raw, "retriedBy") !== undefined && !isNonEmptyString(field(raw, "retriedBy"))) return invalid(known, "retriedBy must be a message id");
       return accept(raw);
     }
     case "turn_settled": {
@@ -712,6 +713,7 @@ export function decodeDurableEvent(event: unknown): DurableEventDecodeResult {
   switch (kind) {
     case "requestState":
       if (!isNonEmptyString(field(event, "id")) || !isRequestState(field(event, "state"))) return bad("invalid request state");
+      if (field(event, "retriedBy") !== undefined && !isNonEmptyString(field(event, "retriedBy"))) return bad("retriedBy must be a message id");
       return ok();
     case "user":
       // The journal refuses an id-less user row at its own mechanism

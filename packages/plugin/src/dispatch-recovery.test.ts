@@ -15,26 +15,28 @@ const cleanup: Array<() => void> = [];
 afterEach(() => { for (const fn of cleanup.splice(0).reverse()) fn(); });
 const message = (id: string, peerId = "RawPeer", text = id) => ({ peerId, message: { type: "user_message" as const, id, random_id: `logical-${id}`, text } });
 const dirFor = () => { const dir = mkdtempSync(join(tmpdir(), "dispatch369-")); cleanup.push(() => rmSync(dir, { recursive: true, force: true })); return dir; };
-function open(dir = dirFor(), options: { hold?: Promise<void>; fail?: string; budget?: InboundRetentionBudget; key?: boolean } = {}) {
+function open(dir = dirFor(), options: { hold?: Promise<void>; fail?: string | string[]; budget?: InboundRetentionBudget; key?: boolean } = {}) {
   const persistent = (namespacePrefix: string) => createPersistentDedupe({ pluginId: "webchannel", namespacePrefix, ttlMs: 60_000, memoryMaxSize: 100, stateMaxEntries: 100, env: { ...process.env, OPENCLAW_STATE_DIR: dir } });
   const store = createIngressOutcomeStore({ accepted: persistent("accepted"), overloaded: persistent("overloaded"), cancelled: persistent("cancelled") });
   const journal = openDeliveryJournal({ databasePath: join(dir, "journal.sqlite") });
   const runs: UserMessageLike[] = [];
   const acks: Array<{ ids: string[]; committed: unknown }> = [];
   const changes: unknown[] = [];
+  const states: unknown[] = [];
+  const warnings: string[] = [];
   const errors: unknown[] = [];
   const recovery = createDispatchRecovery({ store: journal.dispatch!, handler: async (peer, m, settle) => {
     expect(peer).toBe("RawPeer"); runs.push(m);
     if (m.id === "A") await options.hold;
-    if (options.fail !== undefined && options.fail === m.id) throw new Error("injected after effect");
+    if (options.fail !== undefined && [options.fail].flat().includes(m.id!)) throw new Error("injected after effect");
     journal.append(peer, { kind: "bubble", answerId: `answer-${m.id}`, text: `result ${m.text}`, turnId: m.id });
     settle("ok");
   }, acquirePeer: () => options.key === false ? undefined : () => {}, notify: c => changes.push(c), isActive: () => true, warn: e => errors.push(e), dispatcherOptions: { budget: options.budget } });
   recovery.start();
-  const flush = createIngressOnFlush<{ peerId: string; message: UserMessageLike }>({ accountId: "ExactAccount", outcomeStore: store, deliveryJournal: journal, dispatchRecovery: recovery, beginBatch: p => recovery.beginBatch(p), sendAck: (_, ids, committed) => { acks.push({ ids, committed }); return true; } });
+  const flush = createIngressOnFlush<{ peerId: string; message: UserMessageLike }>({ accountId: "ExactAccount", outcomeStore: store, deliveryJournal: journal, dispatchRecovery: recovery, beginBatch: p => recovery.beginBatch(p), sendAck: (_, ids, committed) => { acks.push({ ids, committed }); return true; }, sendRequestState: c => { states.push(c); return true; }, logWarn: w => { warnings.push(w); } });
   const close = () => { recovery.dispose(); journal.close(); };
   cleanup.push(close);
-  return { dir, journal, recovery, store, runs, acks, changes, errors, flush, close };
+  return { dir, journal, recovery, store, runs, acks, changes, states, warnings, errors, flush, close };
 }
 
 it("recovers B automatically behind interrupted A, preserving IDs and recorded output across repeated recovery", async () => {
@@ -134,6 +136,79 @@ it("intentional retry is a new request with provenance; original transport repla
   expect(h.runs.map(m => m.id)).toEqual(["B", "retry"]);
   expect(h.journal.dispatch!.lookup("RawPeer", "logical-retry")?.input.retryOf).toBe(old.messageId);
   await h.flush([message("B")]); expect(h.runs).toHaveLength(2);
+});
+
+const retryOf = (id: string, original: string) => ({ ...message(id), message: { ...message(id).message, text: "B", retry_of: original } });
+
+it("#399 one retry per original: a second Retry gets the first retry's receipt, never a second execution, across restart", async () => {
+  const h = open(undefined, { fail: "B" });
+  await h.flush([message("B")]); await new Promise(setImmediate);
+  const old = h.journal.dispatch!.lookup("RawPeer", "logical-B")!;
+  await h.flush([retryOf("R1", old.messageId)]);
+  const first = h.journal.dispatch!.lookup("RawPeer", "logical-R1")!;
+  expect(h.states).toEqual([{ peerId: "RawPeer", id: old.messageId, turnId: "B", state: "interrupted", seq: expect.any(Number), retriedBy: first.messageId }]);
+  // Double click / second device: a different random_id naming the same original.
+  await h.flush([retryOf("R2", old.messageId)]);
+  expect(h.runs.map(m => m.id)).toEqual(["B", "R1"]);
+  expect(h.journal.dispatch!.lookup("RawPeer", "logical-R2")).toBeUndefined();
+  // The converged echo names a row this send did not open, so it carries no seq.
+  expect(h.acks.at(-1)).toEqual({ ids: ["R2"], committed: [{ random_id: "logical-R2", messageId: first.messageId, converged: true }] });
+  expect(h.states).toHaveLength(1);
+  // Its retransmission finds the accepted marker and no own row: the same
+  // converged answer, not a re-admission warning.
+  await h.flush([retryOf("R2", old.messageId)]);
+  expect(h.acks.at(-1)).toEqual({ ids: ["R2"], committed: [{ random_id: "logical-R2", messageId: first.messageId, converged: true }] });
+  expect(h.warnings).toEqual([]);
+  expect(h.runs.map(m => m.id)).toEqual(["B", "R1"]);
+  const rows = projectJournalHistory(h.journal.read, "RawPeer").messages;
+  expect(rows.filter(m => "retryOf" in m)).toEqual([expect.objectContaining({ id: first.messageId, retryOf: old.messageId })]);
+  expect(rows.find(m => m.id === old.messageId)).toMatchObject({ requestState: "interrupted", retriedBy: first.messageId });
+  h.close();
+  // Reload re-click after a restart: the durable retry row still spends it.
+  const fresh = open(h.dir);
+  await fresh.flush([retryOf("R3", old.messageId)]); await new Promise(setImmediate);
+  expect(fresh.runs).toEqual([]);
+  expect(fresh.journal.dispatch!.lookup("RawPeer", "logical-R3")).toBeUndefined();
+  expect(fresh.acks.at(-1)?.committed).toEqual([{ random_id: "logical-R3", messageId: first.messageId, converged: true }]);
+  // The production materialized history serves the same link after restart.
+  let page = fresh.journal.historyPage!("RawPeer", { kind: "recent", limit: 50 });
+  for (let i = 0; page.pending && i < 100; i++) page = fresh.journal.historyPage!("RawPeer", { kind: "recent", limit: 50 });
+  if (page.pending) throw new Error("history did not converge");
+  expect(page.messages).toContainEqual(expect.objectContaining({ id: old.messageId, requestState: "interrupted", retriedBy: first.messageId }));
+});
+
+it("#399 racing retries of one original in one admission batch admit exactly one row", async () => {
+  const h = open(undefined, { fail: "B" });
+  await h.flush([message("B")]); await new Promise(setImmediate);
+  const old = h.journal.dispatch!.lookup("RawPeer", "logical-B")!;
+  await h.flush([retryOf("R1", old.messageId), retryOf("R2", old.messageId)]);
+  await vi.waitFor(() => expect(h.runs.map(m => m.id)).toEqual(["B", "R1"]));
+  const first = h.journal.dispatch!.lookup("RawPeer", "logical-R1")!;
+  expect(h.journal.dispatch!.lookup("RawPeer", "logical-R2")).toBeUndefined();
+  expect(h.acks.at(-1)?.committed).toEqual([
+    { random_id: "logical-R1", messageId: first.messageId, seq: first.seq },
+    { random_id: "logical-R2", messageId: first.messageId, converged: true },
+  ]);
+  expect(h.journal.read("RawPeer").filter(e => e.kind === "user")).toHaveLength(2);
+});
+
+it("#399 an interrupted retry continues the chain only from itself, never again from the original", async () => {
+  const h = open(undefined, { fail: ["B", "R1"] });
+  await h.flush([message("B")]); await new Promise(setImmediate);
+  const old = h.journal.dispatch!.lookup("RawPeer", "logical-B")!;
+  await h.flush([retryOf("R1", old.messageId)]); await new Promise(setImmediate);
+  const first = h.journal.dispatch!.lookup("RawPeer", "logical-R1")!;
+  expect(first.state).toBe("interrupted");
+  await h.flush([retryOf("again", old.messageId)]); await new Promise(setImmediate);
+  expect(h.runs.map(m => m.id)).toEqual(["B", "R1"]);
+  expect(h.acks.at(-1)?.committed).toEqual([{ random_id: "logical-again", messageId: first.messageId, converged: true }]);
+  await h.flush([retryOf("R2", first.messageId)]); await new Promise(setImmediate);
+  expect(h.runs.map(m => m.id)).toEqual(["B", "R1", "R2"]);
+  const second = h.journal.dispatch!.lookup("RawPeer", "logical-R2")!;
+  expect(second.input.retryOf).toBe(first.messageId);
+  const rows = projectJournalHistory(h.journal.read, "RawPeer").messages;
+  expect(rows.find(m => m.id === old.messageId)).toMatchObject({ retriedBy: first.messageId });
+  expect(rows.find(m => m.id === first.messageId)).toMatchObject({ requestState: "interrupted", retryOf: old.messageId, retriedBy: second.messageId });
 });
 
 it("an invalid retry_of is dropped, never thrown: the batch runs and carries no provenance", async () => {

@@ -2457,3 +2457,17 @@ describe("#244 half B — applyUser is id-idempotent (re-delivery safe)", () => 
     expect(twice.filter((m) => m.kind === "text" && m.role === "user")).toHaveLength(1);
   });
 });
+
+describe("#399 requestState retriedBy", () => {
+  it("links an interrupted original to its first retry once, without changing its state", () => {
+    const base = reduceDurableView([
+      { kind: "user", id: "u1", text: "transfer", requestState: "queued" },
+      { kind: "requestState", id: "u1", state: "interrupted" },
+    ]);
+    const linked = applyDurableEvent(base, { kind: "requestState", id: "u1", state: "interrupted", retriedBy: "u2" });
+    expect(linked[0]).toMatchObject({ requestState: "interrupted", retriedBy: "u2" });
+    expect(applyDurableEvent(linked, { kind: "requestState", id: "u1", state: "interrupted", retriedBy: "u3" })).toBe(linked);
+    expect(applyDurableEvent(linked, { kind: "requestState", id: "u1", state: "interrupted" })).toBe(linked);
+    expect(projectDurableFromClient([{ id: "u1", role: "user", text: "transfer", requestState: "interrupted", retriedBy: "u2" }])[0]).toMatchObject({ retriedBy: "u2" });
+  });
+});

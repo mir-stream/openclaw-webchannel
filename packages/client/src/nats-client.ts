@@ -212,8 +212,11 @@ export type InboundMessage = {
    * #244 half A: each entry also carries the user message's per-conversation
    * `seq` (its only wire carrier — the user opener rides no durable frame). Still
    * IGNORED in half A; declared optional here so the loose wire shape typechecks.
+   *
+   * #399: `converged` marks a later retry the server answered with the FIRST
+   * retry's row instead of running it; such an entry carries no `seq`.
    */
-  committed?: Array<{ random_id: string; messageId: string; seq?: number }>;
+  committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: boolean }>;
   reason?: "overloaded";
   text?: string;
   turnId?: string;
@@ -238,6 +241,8 @@ export type InboundMessage = {
   state?: RequestState;
   requestState?: RequestState;
   retryOf?: string;
+  /** `request_state`: the one retry an interrupted original admitted (#399). */
+  retriedBy?: string;
   kind?: "exec" | "plugin";
   title?: string;
   /**
@@ -306,6 +311,7 @@ export type InboundMessage = {
     randomId?: string;
     requestState?: RequestState;
     retryOf?: string;
+    retriedBy?: string;
     revision?: number;
     edited?: boolean;
     id: string;

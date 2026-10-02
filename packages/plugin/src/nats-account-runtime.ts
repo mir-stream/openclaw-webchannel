@@ -252,6 +252,8 @@ const processOverflowResolver = new BoundedOverflowResolver({
   // fail-safe direction (the client replays and the flush path decides).
   lookupUserRow: (request, idempotencyKey) => runtimeForOverflow(request)
     ?.deliveryJournal?.lookupUserMessageIdByRandomId(request.peerId, idempotencyKey),
+  lookupConvergedRetry: (request, retryOf) => runtimeForOverflow(request)
+    ?.deliveryJournal?.dispatch?.retryOf(request.peerId, retryOf),
   sendAck: (request, committed, cancelled) => runtimeForOverflow(request)
     ?.channel.sendAck(request.peerId, [request.id], committed, cancelled ? [request.id] : undefined) ?? false,
   sendRejected: (request) => runtimeForOverflow(request)
@@ -1125,6 +1127,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         // devices for immediate multi-device echo (Telegram model). One publish to
         // the shared `.out` subject; the gap-sync path stays the fallback.
         sendUserCommitted: (peerId, message) => channel.sendUserCommitted(peerId, message),
+        sendRequestState: (change) => channel.sendRequestState(change),
         // v6 (#239 half 3): the SAME handle the channel got for the egress seam,
         // opened above from this account's (tenant, accountId) tuple. Doc §15.7
         // makes this write part of accepting a user message, so a missing handle
