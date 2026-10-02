@@ -873,7 +873,8 @@ function startTypingKeepalive(
 ): () => void {
   const send = (keepalive = false) => {
     try {
-      transport.sendTyping(peerId, keepalive);
+      if (keepalive) transport.sendTyping(peerId, true);
+      else transport.sendTyping(peerId);
     } catch {
       // Best-effort indicator; the next tick or the turn's own frames follow.
     }

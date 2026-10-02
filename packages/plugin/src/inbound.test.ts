@@ -599,7 +599,7 @@ describe("handleInboundMessage — typing keepalive (#396)", () => {
     });
     await turn.inCore;
     expect(typing).toEqual(["peer-1"]);
-    expect(sendTyping).toHaveBeenNthCalledWith(1, "peer-1", false);
+    expect(sendTyping).toHaveBeenNthCalledWith(1, "peer-1");
 
     // A 40s tool call with streaming off emits nothing else; without a renewal
     // inside every 30s window the client reads the turn as a dead connection.
