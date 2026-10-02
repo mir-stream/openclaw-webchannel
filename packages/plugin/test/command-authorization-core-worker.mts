@@ -91,7 +91,7 @@ for (const [index, scenario] of scenarios.entries()) {
     MessageSid: `command-auth-${index}`,
   };
   const authorized = resolvePeerCommandAuthorization({
-    admission: resolveDmAdmission(peer, undefined),
+    admission: resolveDmAdmission(peer, { allowFrom: ["*"] }),
     cfg,
     ctx: identity,
   });

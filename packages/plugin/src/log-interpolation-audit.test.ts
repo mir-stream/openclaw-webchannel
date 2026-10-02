@@ -287,7 +287,8 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // makes the emitted record undecodable, so the shape is the fix and there is
   // no baseline entry to add.
   // Stop ownership adds one constant pre-context retirement error.
-  "inbound.ts": { statements: 10, interpolations: 16 },
+  // #406 adds one constant pairing-challenge delivery error (no interpolation).
+  "inbound.ts": { statements: 11, interpolations: 16 },
   // #239 half 3 adds the two delivery-journal warnings (13→15) and their six
   // interpolations (7→13): `peerId` twice, plus `reason`/`action` on the gap
   // line and `journalable.length`/`journalFailureDiagnostic(error)` on the
