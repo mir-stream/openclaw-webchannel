@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Enrollment continues after `slow_down`, increasing every subsequent poll interval
+  by five seconds per response. JWT verification rejects unsupported or malformed
+  `crit` headers before resolving signing keys (#415 E6/E7).
+
 - Explicit exec approvers accept an optional `webchannel:` prefix, including
   account-scoped wildcards. Peer case and explicit-list precedence are preserved;
   an empty prefixed entry cannot widen to owner fallback (#415 D6).
