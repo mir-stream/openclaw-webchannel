@@ -4,6 +4,12 @@
 
 ### Changed
 
+- **CLI WebChannel sends use the running gateway (#418).** Core's gateway
+  `send` RPC delivers through the selected account's NATS runtime instead of
+  looking for that runtime in the CLI process. Agent `message` actions and cron
+  remain deliverable. Gateway connection failures retain core's diagnostics and
+  `openclaw doctor` guidance. No wire protocol change.
+
 - **Case-distinct JWT peers now have distinct core sessions (#372).** Raw peer
   IDs such as `Alice` and `alice` are encoded before SDK session normalization;
   configured bindings and intentional `identityLinks` keep their SDK selection,

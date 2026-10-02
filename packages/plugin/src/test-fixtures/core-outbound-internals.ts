@@ -1,5 +1,5 @@
 /**
- * Test-only access to core's outbound target resolver and session-route
+ * Test-only access to core's outbound target, session-route and delivery
  * orchestration. The pinned SDK (2026.7.1-2) runs them for `message send`, the
  * agent `message` tool and cron but does not export them. Each module is
  * located by its source-region marker and each function by its original
@@ -13,7 +13,7 @@ import { pathToFileURL } from "node:url";
 
 const distDir = dirname(dirname(createRequire(import.meta.url).resolve("openclaw/plugin-sdk/routing")));
 
-async function loadCoreExport<T>(filePrefix: string, region: string, name: string): Promise<T> {
+export async function loadCoreExport<T>(filePrefix: string, region: string, name: string): Promise<T> {
   for (const file of readdirSync(distDir)) {
     if (!file.startsWith(filePrefix) || !file.endsWith(".js")) continue;
     const source = readFileSync(join(distDir, file), "utf8");

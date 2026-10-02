@@ -1,5 +1,14 @@
 # Project Status — single source of truth
 
+CLI outbound delivery (#418): `openclaw message send --channel webchannel` uses
+the pinned SDK `2026.7.1-2` gateway `send` RPC. The running gateway resolves the
+selected account's NATS transport, conversation key and journal. Agent `message`
+actions use the same RPC; cron continues to deliver inside the gateway. A stopped
+or unreachable gateway reports core's connection diagnostic and `openclaw doctor`
+remedy. See [CLI delivery and troubleshooting](../packages/plugin/README.md#cli-outbound-delivery)
+and [TD-6](TELEGRAM_DIVERGENCES.md#td-6-cli-발신은-실행-중인-gateway를-경유한다).
+Offline-peer delivery remains outside #418. There is no wire protocol change.
+
 Quiet-turn liveness (#396): normal turns send an initial typing indicator and
 renew ephemeral `typing` with `keepalive: true` every 4 seconds until completion,
 error, or dispatch abort. Renewals refresh existing application watches without
