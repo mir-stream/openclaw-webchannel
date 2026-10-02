@@ -924,8 +924,9 @@ export async function handleInboundMessage(
   // things differ for a control-lane turn: (1) no progress draft — the abort's
   // reply is a single short final text, so a "Working…" bubble for it is noise;
   // (2) it never settles (see `settlementEligible`). Core's fast-abort accepts
-  // it through the CommandAuthorized stamp every admitted turn carries (#407,
-  // see the buildContext call).
+  // it through the effective CommandAuthorized stamp every admitted turn
+  // carries, after applicable core command policy is resolved (#407, see the
+  // buildContext call).
   const controlLane = options?.controlLane === true;
   // Core's dedupe route omits tenant and reduces a session key to its agent.
   // Supply a stable, fully scoped platform ID; the wire ID remains ACK-only.
@@ -1034,7 +1035,22 @@ export async function handleInboundMessage(
     );
     return;
   }
-  const commandAuthorized = resolvePeerCommandAuthorization({ admission, peerId: wsKey, accountId });
+  const commandAuthorized = resolvePeerCommandAuthorization({
+    admission,
+    cfg: api.config,
+    // Mirror the identity fields `buildContext` projects onto the real core
+    // context below so authorization is computed for that exact turn identity.
+    ctx: {
+      Provider: WEBCHANNEL_ID,
+      Surface: WEBCHANNEL_ID,
+      OriginatingChannel: WEBCHANNEL_ID,
+      AccountId: accountId,
+      SenderId: wsKey,
+      From: wsKey,
+      To: wsKey,
+      ChatType: "direct",
+    },
+  });
 
   // Draft enabled for the two streaming modes ("progress" tool-lines-only,
   // "partial" answer-text); answer-text streaming (onPartialReply) is wired
@@ -1219,16 +1235,12 @@ export async function handleInboundMessage(
             // turns' approvals (and the prompt deliver on the right channel).
             accountId,
             // #407: stamp CommandAuthorized on EVERY turn from the single
-            // decision in command-gate.ts. Core's fast-abort for the control
-            // lane (`tryFastAbortFromMessage`) and its whole-message command
-            // handling (`/new`, `/reset`, `/model`, …) both require
-            // `isAuthorizedSender`, which with no `commands.allowFrom` reduces to
-            // `ctx.CommandAuthorized`; `buildContext` sets that to false unless
-            // `access.commands.authorized` is passed, and an unauthorized
-            // command is then dropped with no reply. Safe because webchannel
-            // peers are JWT-authenticated with FORCED per-peer session isolation
-            // (`resolveWebchannelSessionRoute`) — a command can only ever act on
-            // the sender's OWN session, never another peer's.
+            // policy-aware decision in command-gate.ts. Core's fast-abort,
+            // early reset guard, and whole-message command handling all consume
+            // this value at different stages, so the stamp must already include
+            // applicable core command/owner allowlists. Webchannel routes the
+            // session per peer (subject to configured identity links); actual
+            // command/tool effects remain governed by core policy.
             access: { commands: { authorized: commandAuthorized } },
             timestamp: input.timestamp,
             from: wsKey,

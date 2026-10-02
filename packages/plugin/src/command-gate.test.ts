@@ -147,8 +147,20 @@ describe("resolveCommandGate — commands.ownerAllowFrom (owner enforcement)", (
 });
 
 // #407 / TD-2: the single command-authorization decision. Every peer the DM
-// policy admits is authorized for every registered command.
+// policy admits supplies the default authorization; core command/owner policy
+// may narrow it before the effective stamp reaches any command path.
 describe("resolvePeerCommandAuthorization", () => {
+  const ctx = (peerId: string) => ({
+    Provider: "webchannel",
+    Surface: "webchannel",
+    OriginatingChannel: "webchannel",
+    AccountId: ACCOUNT,
+    SenderId: peerId,
+    From: peerId,
+    To: peerId,
+    ChatType: "direct",
+  });
+
   it("authorizes every admitted peer, whatever admitted it", () => {
     for (const cfg of [
       undefined,
@@ -157,7 +169,7 @@ describe("resolvePeerCommandAuthorization", () => {
     ]) {
       const admission = resolveDmAdmission("alice", cfg);
       expect(admission.allowed).toBe(true);
-      expect(resolvePeerCommandAuthorization({ admission, peerId: "alice", accountId: ACCOUNT }))
+      expect(resolvePeerCommandAuthorization({ admission, cfg: {}, ctx: ctx("alice") }))
         .toBe(true);
     }
   });
@@ -168,8 +180,22 @@ describe("resolvePeerCommandAuthorization", () => {
       { dmSecurity: "allowlist", allowFrom: [] },
     ]) {
       const admission = resolveDmAdmission("alice", cfg);
-      expect(resolvePeerCommandAuthorization({ admission, peerId: "alice", accountId: ACCOUNT }))
+      expect(resolvePeerCommandAuthorization({ admission, cfg: {}, ctx: ctx("alice") }))
         .toBe(false);
     }
+  });
+
+  it("uses provider-specific commands.allowFrom before the global fallback", () => {
+    const admission = resolveDmAdmission("bob", undefined);
+    expect(resolvePeerCommandAuthorization({
+      admission,
+      cfg: { commands: { allowFrom: { webchannel: ["alice"], "*": ["bob"] } } },
+      ctx: ctx("bob"),
+    })).toBe(false);
+    expect(resolvePeerCommandAuthorization({
+      admission,
+      cfg: { commands: { allowFrom: { "*": ["bob"] } } },
+      ctx: ctx("bob"),
+    })).toBe(true);
   });
 });

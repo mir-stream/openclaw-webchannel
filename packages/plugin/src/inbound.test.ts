@@ -64,10 +64,11 @@ function handleInboundMessage(
  * P1-8a — `handleInboundMessage` control-lane behaviour.
  *
  * Two invariants:
- *  - The command authorization stamp (`access.commands.authorized`) is passed
- *    into core's `buildContext` for EVERY admitted turn, control-lane and
- *    ordinary alike (#407, TD-2: every admitted peer may run every registered
- *    command; the decision lives in `resolvePeerCommandAuthorization`).
+ *  - The effective command authorization stamp
+ *    (`access.commands.authorized`) is passed into core's `buildContext` for
+ *    EVERY admitted turn, control-lane and ordinary alike (#407). DM admission
+ *    supplies the default and the decision in
+ *    `resolvePeerCommandAuthorization` applies core command/owner policy.
  *  - Terminal draft drain: when core aborts the RUNNING turn its `inbound.run`
  *    resolves WITHOUT delivering a final. The controller settles real lane
  *    text in generation order, or a lone visible tool scaffold for the
@@ -122,6 +123,8 @@ function makeFakeApi(params: {
   withAgentEvents?: boolean;
   /** Extra `channels.webchannel` keys, e.g. the DM allowlist (#99 denial case). */
   channelConfig?: Record<string, unknown>;
+  /** Top-level core command policy applied to the effective authorization stamp. */
+  commandsConfig?: Record<string, unknown>;
 }): {
   api: OpenClawPluginApi;
   captured: { buildContext?: BuildContextParams };
@@ -134,6 +137,7 @@ function makeFakeApi(params: {
   const warnings: string[] = [];
 
   const config = {
+    ...(params.commandsConfig ? { commands: params.commandsConfig } : {}),
     channels: {
       webchannel: { streaming: { mode: params.streamingMode }, ...params.channelConfig },
     },
@@ -460,6 +464,33 @@ describe("handleInboundMessage — control-lane authorization stamp", () => {
         commandAuthorized: ctx.CommandAuthorized === true,
       }).isAuthorizedSender,
     ).toBe(false);
+  });
+
+  it("stamps the effective core policy result instead of a raw DM-admission true", async () => {
+    for (const commandsConfig of [
+      { allowFrom: { webchannel: ["someone-else"] } },
+      { ownerAllowFrom: ["someone-else"] },
+    ]) {
+      const { api, captured } = makeFakeApi({
+        streamingMode: "off",
+        runImpl: async () => {},
+        commandsConfig,
+      });
+      const { transport } = makeFakeTransport();
+
+      await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text: "/new" });
+
+      const ctx = buildChannelInboundEventContext(
+        captured.buildContext as unknown as Parameters<typeof buildChannelInboundEventContext>[0],
+      );
+      const expected = resolveCommandAuthorization({
+        ctx,
+        cfg: api.config,
+        commandAuthorized: true,
+      }).isAuthorizedSender;
+      expect(expected).toBe(false);
+      expect(captured.buildContext?.access?.commands?.authorized).toBe(expected);
+    }
   });
 
   it("never builds a context for a peer the DM policy denies", async () => {
