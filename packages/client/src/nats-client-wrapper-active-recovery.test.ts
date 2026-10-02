@@ -250,6 +250,91 @@ describe("#396 quiet-turn liveness (plugin typing keepalive)", () => {
   });
 });
 
+describe("#398 explicit stop names earlier unacknowledged input", () => {
+  it("names only earlier sends without a result, and shows a named input as cancelled on the server's proof", async () => {
+    const h = await setup();
+    const accepted = h.wrapper.send("already accepted")!;
+    h.control.ack = false;
+    const pending = h.wrapper.send("sent before stop")!;
+    const [a, m] = h.received;
+    h.wrapper.send("stop");
+    expect(h.received[2]).not.toHaveProperty("cancel_pending");
+    h.wrapper.send("/stop");
+    const stop = h.received[3]!;
+    expect(stop.cancel_pending).toEqual([
+      { id: m!.id, random_id: m!.random_id },
+      { id: h.received[2]!.id, random_id: h.received[2]!.random_id },
+    ]);
+    expect(stop.cancel_pending!.map((entry) => entry.id)).not.toContain(a!.id);
+    h.control.ack = true;
+    const later = h.wrapper.send("after stop")!;
+    expect(h.received[4]).not.toHaveProperty("cancel_pending");
+    h.deliver({ type: "ack", ids: [m!.id!], cancelled: [m!.id!], unaccepted: [m!.id!] });
+    expect(pending.snapshot()).toEqual({ state: "failed", failure: { reason: "cancelled", retryable: false } });
+    expect(h.wrapper.getState().messages.find((row) => row.wireId === m!.id)).toMatchObject({
+      text: "sent before stop", sendState: "failed", sendFailure: { reason: "cancelled", retryable: false },
+    });
+    expect(inside(h.wrapper).client.unackedLedger.has(m!.id!)).toBe(false);
+    expect(inside(h.wrapper).applicationTurns.has(m!.id!)).toBe(false);
+    expect([accepted, later].map((receipt) => receipt.snapshot().state)).toEqual(["accepted", "accepted"]);
+  });
+
+  it("only the server's per-ID declaration fails a named input, wherever a 64-ID split puts it", async () => {
+    const h = await setup();
+    h.control.ack = false;
+    const receipts = ["first", "second", "accepted X", "never accepted M"].map((text) => h.wrapper.send(text)!);
+    const [m0, m1, x, m] = h.received;
+    h.wrapper.send("/stop");
+    expect(h.received[4]!.cancel_pending!.map((entry) => entry.id)).toEqual([m0!.id, m1!.id, x!.id, m!.id]);
+    // The server's chunk writer puts the whole committed echo on the FIRST frame
+    // only; a later frame carries X's row-backed cancellation without it.
+    h.deliver({ type: "ack", ids: [m0!.id!, m1!.id!], committed: [m0, m1, x].map((sent, seq) =>
+      ({ random_id: sent!.random_id!, messageId: `durable-${seq}`, seq: seq + 1 })) });
+    h.deliver({ type: "ack", ids: [x!.id!, m!.id!], cancelled: [x!.id!, m!.id!], unaccepted: [m!.id!] });
+    expect(receipts.map((receipt) => receipt.snapshot())).toEqual([
+      { state: "accepted" }, { state: "accepted" }, { state: "accepted" },
+      { state: "failed", failure: { reason: "cancelled", retryable: false } },
+    ]);
+    // A repeated row-backed cancellation (another device's stop, a replay) changes nothing.
+    h.deliver({ type: "ack", ids: [x!.id!], cancelled: [x!.id!] });
+    expect(receipts[2]!.snapshot()).toEqual({ state: "accepted" });
+    expect(h.wrapper.getState().messages.find((row) => row.wireId === m!.id)).toMatchObject({
+      sendFailure: { reason: "cancelled", retryable: false },
+    });
+  });
+});
+
+describe("#398 same-frame cancellation receipts survive subscriber teardown", () => {
+  it.each([false, true])("applies every terminal result when the first failed receipt closes the wrapper (reconnect=%s)", async reconnect => {
+    const h = await setup();
+    h.control.ack = false;
+    const receipts = [h.wrapper.send("first pending")!, h.wrapper.send("second pending")!];
+    const ids = h.received.map(message => message.id!);
+    let replacement: ReturnType<typeof h.wrapper.send> | undefined;
+    receipts[0]!.subscribe(snapshot => {
+      if (snapshot.state !== "failed") return;
+      h.wrapper.close();
+      if (reconnect) {
+        h.control.ack = true;
+        h.wrapper.connect();
+        replacement = h.wrapper.send("replacement work");
+      }
+    });
+    h.deliver({ type: "ack", ids, cancelled: ids, unaccepted: ids });
+    for (const [index, receipt] of receipts.entries()) {
+      expect(receipt.snapshot()).toEqual({ state: "failed", failure: { reason: "cancelled", retryable: false } });
+      expect(h.wrapper.getState().messages.find(row => row.wireId === ids[index])).toMatchObject({
+        sendState: "failed", sendFailure: { reason: "cancelled", retryable: false },
+      });
+      expect(inside(h.wrapper).client.unackedLedger.has(ids[index]!)).toBe(false);
+    }
+    if (reconnect) {
+      await settleUntil(() => replacement?.snapshot().state === "accepted", { label: "replacement send accepted" });
+      expect(h.wrapper.getState().turnActive).toBe(true);
+    }
+  });
+});
+
 // #399 runs before the suite below: its "cleans up on %s" case spies on a FAKE
 // `setTimeout`, and every later `restoreAllMocks` re-installs that dead timer.
 describe("#399 one retry per interrupted original", () => {

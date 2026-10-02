@@ -16,6 +16,23 @@ describe("ingress result chunks", () => {
     expect(writer.retainedIds()).toBe(0);
   });
 
+  it("#398 carries the never-accepted declaration with its own ID across a 64-ID split, apart from the first-frame echo", () => {
+    const frames: IngressResultFrame[] = [];
+    const ids = Array.from({ length: 66 }, (_, index) => `id-${index}`);
+    const committed = ids.slice(0, 65).map((id, seq) => ({ random_id: `r-${id}`, messageId: `m-${id}`, seq }));
+    const writer = createIngressResultChunkWriter({ type: "ack", committed,
+      publish: frame => { frames.push(frame); return true; } });
+    for (const id of ids) writer.add(id, id === "id-0" || id === "id-64" || id === "id-65", id === "id-65");
+    // Without proof the declaration means nothing and is not emitted; a duplicate upgrades.
+    writer.add("id-1", false, true);
+    writer.add("id-65", true, true);
+    expect(writer.finish()).toBe(true);
+    expect(frames).toEqual([
+      { type: "ack", ids: ids.slice(0, 64), committed, cancelled: ["id-0"] },
+      { type: "ack", ids: ["id-64", "id-65", "id-1"], cancelled: ["id-64", "id-65"], unaccepted: ["id-65"] },
+    ]);
+  });
+
   it("measures cancellation proof on byte splits and never falls back to a bare ACK when it cannot fit", () => {
     const frames: IngressResultFrame[] = [];
     const one = { type: "ack", ids: ["한글"], cancelled: ["한글"] };

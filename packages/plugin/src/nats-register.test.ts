@@ -209,7 +209,7 @@ async function runProvenRegister(h: Harness, device: ReturnType<typeof makeDevic
 describe("handleRegisterRequest (register over NATS)", () => {
   it.each([
     ["absent", undefined],
-    ["v6 without history page correlation", 6],
+    ["v6 without stop pending-input cancellation or history page correlation", 6],
     ["future", WEBCHANNEL_PROTOCOL_VERSION + 1],
     // A numeric STRING that would coerce to a match — derived from the constant so
     // it stays the coercion case after a bump. Presence with the wrong type is the

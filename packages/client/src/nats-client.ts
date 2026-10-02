@@ -202,6 +202,8 @@ export type InboundMessage = {
   ids?: string[];
   /** Protocol 6: exact ack.ids durably cancelled by the server, not task admissions. */
   cancelled?: string[];
+  /** Protocol 7 (#398): the subset of `cancelled` the server declares it never accepted. */
+  unaccepted?: string[];
   /**
    * #243 half 2a: the server-assigned durable `messageId` per client `random_id`,
    * echoed on an `ack` frame. DELIBERATELY IGNORED in 2a — `drainAcked` still
@@ -431,7 +433,11 @@ export type OutboundMessage =
   // is still the durable id, but half 2 makes the server mint the durable id, at
   // which point retry idempotency can no longer ride the journal's message_id and
   // must already be riding `random_id`. Typed optional to mirror the wire union.
-  | { type: "user_message"; text: string; id?: string; random_id?: string; retry_of?: string }
+  //
+  // Protocol 7 (#398): an explicit `/stop` names, in `cancel_pending`, every
+  // earlier user message still queued or awaiting its ACK. The server durably
+  // cancels the ones it has not accepted, so they never run after the stop.
+  | { type: "user_message"; text: string; id?: string; random_id?: string; retry_of?: string; cancel_pending?: Array<{ id: string; random_id?: string }> }
   | { type: "approval_decision"; id: string; decision: string }
   // #320: `beforeTurnId` completes the page cursor for a TOOL row, which is
   // addressed by the pair `(turnId, id)`. Additive — omitting it is the id-only
@@ -1388,6 +1394,8 @@ export class WebChannelNatsClient {
     lastAttemptAt?: number;
     ingressCancelled?: boolean;
   }>();
+  /** Mirrors the plugin's `MAX_STOP_PENDING_INPUTS`; the oldest names win. */
+  private static readonly MAX_STOP_PENDING = 256;
   /** Forward rank for the monotonic guard; `failed` is handled separately (terminal). */
   private static readonly SEND_RANK: Record<"queued" | "sent" | "accepted", number> = {
     queued: 0,
@@ -1610,7 +1618,7 @@ export class WebChannelNatsClient {
    * exactly as today. Defaulted to a fresh token; injectable for deterministic
    * tests.
    */
-  sendUserMessage(text: string, reservedId?: string, randomId: string = randomInboxToken(), retryOf?: string): string {
+  sendUserMessage(text: string, reservedId?: string, randomId: string = randomInboxToken(), retryOf?: string, cancelPending = false): string {
     const id = reservedId === undefined ? this.reserveWireId() : reservedId;
     this.consumeReservedId(id);
     // Seed without notifying. For a live send, its queue position must be owned
@@ -1649,10 +1657,32 @@ export class WebChannelNatsClient {
     // Authoritative outbound ownership precedes every public callback. A nested
     // send appends behind this entry; whichever stack frame starts the drain will
     // therefore publish in logical call order.
-    this.outboundQueue.push({ type: "user_message", text, id, random_id: randomId, ...(retryOf ? { retry_of: retryOf } : {}) });
+    // #398: the snapshot is taken where this frame takes its FIFO position, so
+    // it names exactly the user messages ordered before it and nothing later.
+    const pending = cancelPending ? this.takeStopPendingInputs() : [];
+    this.outboundQueue.push({ type: "user_message", text, id, random_id: randomId, ...(retryOf ? { retry_of: retryOf } : {}),
+      ...(pending.length ? { cancel_pending: pending } : {}) });
     this.emitSendState(id, "queued");
     this.drainOutboundQueue();
     return id;
+  }
+
+  /**
+   * Every earlier user message still without a server result, in send order.
+   * Past the cap the OLDEST are named: they have waited longest and are the
+   * likeliest to arrive late. A newer excess entry stays unnamed and can still
+   * run if it reaches the server after the stop.
+   */
+  private takeStopPendingInputs(): Array<{ id: string; random_id?: string }> {
+    const pending = new Map<string, { id: string; random_id?: string }>();
+    const add = (message: OutboundMessage) => {
+      if (message.type !== "user_message" || !message.id || pending.has(message.id)) return;
+      if (pending.size >= WebChannelNatsClient.MAX_STOP_PENDING) return;
+      pending.set(message.id, { id: message.id, ...(message.random_id ? { random_id: message.random_id } : {}) });
+    };
+    for (const entry of this.unackedLedger.values()) add(entry.message);
+    for (const message of this.outboundQueue) add(message);
+    return [...pending.values()];
   }
 
   /**

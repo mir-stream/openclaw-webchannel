@@ -151,6 +151,7 @@ it("#399 one retry per original: a second Retry gets the first retry's receipt, 
   await h.flush([retryOf("R2", old.messageId)]);
   expect(h.runs.map(m => m.id)).toEqual(["B", "R1"]);
   expect(h.journal.dispatch!.lookup("RawPeer", "logical-R2")).toBeUndefined();
+  expect(h.journal.dispatch!.convergence("RawPeer", "logical-R2")).toMatchObject({ messageId: first.messageId, seq: first.seq, retryOf: old.messageId });
   // The converged echo names a row this send did not open, so it carries no seq.
   expect(h.acks.at(-1)).toEqual({ ids: ["R2"], committed: [{ random_id: "logical-R2", messageId: first.messageId, converged: true }] });
   expect(h.states).toHaveLength(1);
@@ -169,6 +170,8 @@ it("#399 one retry per original: a second Retry gets the first retry's receipt, 
   await fresh.flush([retryOf("R3", old.messageId)]); await new Promise(setImmediate);
   expect(fresh.runs).toEqual([]);
   expect(fresh.journal.dispatch!.lookup("RawPeer", "logical-R3")).toBeUndefined();
+  expect(fresh.journal.dispatch!.convergence("RawPeer", "logical-R2")).toMatchObject({ messageId: first.messageId, seq: first.seq, retryOf: old.messageId });
+  expect(fresh.journal.dispatch!.convergence("RawPeer", "logical-R3")).toMatchObject({ messageId: first.messageId, seq: first.seq, retryOf: old.messageId });
   expect(fresh.acks.at(-1)?.committed).toEqual([{ random_id: "logical-R3", messageId: first.messageId, converged: true }]);
   // The production materialized history serves the same link after restart.
   let page = fresh.journal.historyPage!("RawPeer", { kind: "recent", limit: 50 });

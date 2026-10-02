@@ -452,6 +452,20 @@ describe("normalizeInboundUserMessage", () => {
     });
   });
 
+  it("#398 keeps an explicit stop's named earlier inputs with only their two id fields, and no other message's", () => {
+    const raw = {
+      type: "user_message", text: "/stop", id: "wire-s",
+      cancel_pending: [{ id: "wire-m", random_id: "logical-m", coalescedIds: ["victim"] }, { id: "wire-n" }],
+    } as unknown as UserMessageLike;
+    expect(normalizeInboundUserMessage(raw)).toEqual({
+      type: "user_message", text: "/stop", id: "wire-s",
+      cancel_pending: [{ id: "wire-m", random_id: "logical-m" }, { id: "wire-n" }],
+    });
+    for (const text of ["hello", "stop"]) {
+      expect(normalizeInboundUserMessage({ ...raw, text })).not.toHaveProperty("cancel_pending");
+    }
+  });
+
   it("strips a peer-supplied member list of EVERY shape", () => {
     for (const value of [["victim"], 5, "abc", [{}], [""], null, { a: 1 }]) {
       const raw = { type: "user_message", text: "hi", coalescedIds: value } as unknown as UserMessageLike;
