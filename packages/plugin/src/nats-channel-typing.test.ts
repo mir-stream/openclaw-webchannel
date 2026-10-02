@@ -157,6 +157,37 @@ describe("#320 — the composite history cursor crosses the inbound dispatch", (
   });
 });
 
+describe("#401 — a history page's correlation crosses the channel both ways", () => {
+  it("forwards `load_history.nonce` to the load-history handler", () => {
+    const transport = new RecordingTransport();
+    const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant");
+    const onLoadHistory = vi.fn();
+    channel.setLoadHistoryHandler(onLoadHistory);
+
+    transport.emit("message", {
+      subject: "webchannel.tenant.acct.peer-0.in",
+      payload: Buffer.from(JSON.stringify({ type: "load_history", before: "a101", nonce: "page-b" })),
+    });
+
+    // The field is read directly, for the reason the #320 case above gives.
+    const [, request] = onLoadHistory.mock.calls[0] as [string, { before?: string; nonce?: string }];
+    expect(request.nonce).toBe("page-b");
+    expect(request.before).toBe("a101");
+  });
+
+  it("echoes the nonce on the page frame, and puts none on a frame without one", () => {
+    const transport = new RecordingTransport();
+    const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant");
+
+    expect(channel.sendHistory("peer-0", [], undefined, undefined, "page-b")).toBe(true);
+    expect(channel.sendHistory("peer-0", [], 7, true)).toBe(true);
+    const frames = transport.published.map((p) => JSON.parse(p.payload) as Record<string, unknown>);
+    expect(frames.map((f) => f.type)).toEqual(["history", "history"]);
+    expect(frames[0]!.nonce).toBe("page-b");
+    expect(Object.hasOwn(frames[1]!, "nonce")).toBe(false);
+  });
+});
+
 describe("approval decision reverse path", () => {
   it("dispatches a decoded decision with peer/id/decision and rejects malformed input", () => {
     const transport = new RecordingTransport();

@@ -312,6 +312,8 @@ export type DurableMessage =
       readonly role: DurableRole;
       readonly requestState?: RequestState;
       readonly retryOf?: string;
+      /** The one retry this interrupted original admitted (#399); set once. */
+      readonly retriedBy?: string;
       readonly text: string;
       readonly turnId?: string;
       /**
@@ -723,7 +725,7 @@ export type DurableEvent =
    * an older row / an older client's send ⇒ the fold falls back to append (safe).
    */
   | { kind: "user"; id: string; text: string; turnId?: string; randomId?: string; requestState?: RequestState; retryOf?: string }
-  | { kind: "requestState"; id: string; state: RequestState }
+  | { kind: "requestState"; id: string; state: RequestState; retriedBy?: string }
   | { kind: "placement"; answerId: string; turnId?: string }
   | { kind: "bubble"; answerId: string; text: string; turnId?: string }
   | {
@@ -900,9 +902,12 @@ export function applyDurableEvent(
       const index = view.findIndex(m => m.kind === "text" && m.role === "user" && m.id === event.id);
       if (index === -1) return view;
       const prior = view[index];
-      if (prior.kind !== "text" || prior.deleted || prior.requestState === event.state) return view;
+      if (prior.kind !== "text" || prior.deleted) return view;
+      // The server admits one retry per original, so the first link wins.
+      const retriedBy = prior.retriedBy ?? event.retriedBy;
+      if (prior.requestState === event.state && prior.retriedBy === retriedBy) return view;
       const next = view.slice();
-      next[index] = { ...prior, requestState: event.state };
+      next[index] = { ...prior, requestState: event.state, ...(retriedBy !== undefined ? { retriedBy } : {}) };
       return next;
     }
     case "placement":
@@ -1684,7 +1689,7 @@ function applySeal(
  * durable fields is a compile error there.
  */
 type ClientTranscriptEntry =
-  | { kind?: undefined; id: string; role: DurableRole; text: string; turnId?: string; draftOnly?: boolean; revision?: number; edited?: boolean; requestState?: RequestState; retryOf?: string }
+  | { kind?: undefined; id: string; role: DurableRole; text: string; turnId?: string; draftOnly?: boolean; revision?: number; edited?: boolean; requestState?: RequestState; retryOf?: string; retriedBy?: string }
   | { kind: "reasoning"; id: string; turnId: string; text: string }
   | {
       kind: "tool";
@@ -1790,6 +1795,7 @@ export function projectDurable(messages: ClientTranscriptEntry[]): DurableView {
       turnId: m.turnId,
       ...(m.requestState !== undefined ? { requestState: m.requestState } : {}),
       ...(m.retryOf !== undefined ? { retryOf: m.retryOf } : {}),
+      ...(m.retriedBy !== undefined ? { retriedBy: m.retriedBy } : {}),
       ...(m.revision !== undefined ? { revision: m.revision } : {}),
       ...(m.edited !== undefined ? { edited: m.edited } : {}),
     };

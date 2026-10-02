@@ -1130,16 +1130,23 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
     };
     resolveApprovalOverGateway.mockClear();
     __approvalAccountBindingTestHook.clear();
-    // Binding missing — already resolved / expired / never delivered here.
+    // Binding missing — expired / never delivered here.
     expect(await reasonOf(handleApprovalDecision(cfgTwoAccounts, "exec-ghost", "deny", "bob", "b")))
       .toBe("not-pending");
-    // Delivered on a, decided on b's channel. Collapsed into `not-approver` on
-    // purpose — information minimisation: a distinct reason would tell an
-    // approver replaying a foreign id that it is live on another account.
+    // A live foreign-account id is indistinguishable from a missing id for both
+    // an approver and a non-approver on the receiving account. Authorization is
+    // checked only after the account binding, so caller privilege cannot reveal
+    // that the id is live elsewhere.
     __approvalAccountBindingTestHook.record("exec-a9", "a");
     expect(await reasonOf(handleApprovalDecision(cfgTwoAccounts, "exec-a9", "allow-once", "bob", "b")))
-      .toBe("not-approver");
-    // ann approves on a only.
+      .toBe("not-pending");
+    expect(await reasonOf(handleApprovalDecision(cfgTwoAccounts, "exec-a9", "allow-once", "ann", "b")))
+      .toBe("not-pending");
+    // Once finalized, the same id still yields the same public reason.
+    __approvalAccountBindingTestHook.clear();
+    expect(await reasonOf(handleApprovalDecision(cfgTwoAccounts, "exec-a9", "allow-once", "bob", "b")))
+      .toBe("not-pending");
+    // Only an unauthorized sender on the approval's own account is distinct.
     __approvalAccountBindingTestHook.record("exec-b4", "b");
     expect(await reasonOf(handleApprovalDecision(cfgTwoAccounts, "exec-b4", "deny", "ann", "b")))
       .toBe("not-approver");

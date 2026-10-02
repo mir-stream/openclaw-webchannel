@@ -342,6 +342,7 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
 
     case "request_state": {
       if (!isNonEmptyString(field(raw, "id")) || !isNonEmptyString(field(raw, "turnId")) || !isRequestState(field(raw, "state"))) return invalid(known, "invalid request state");
+      if (field(raw, "retriedBy") !== undefined && !isNonEmptyString(field(raw, "retriedBy"))) return invalid(known, "retriedBy must be a message id");
       return accept(raw);
     }
     case "turn_settled": {
@@ -478,6 +479,13 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
       const complete = field(raw, "snapshotComplete");
       if (complete !== undefined && typeof complete !== "boolean") {
         return invalid(known, "snapshotComplete must be a boolean");
+      }
+      // #401: a page's correlation echo. Optional (a snapshot, or an older
+      // plugin's page, carries none); a present one must be a usable token, or
+      // the wrapper's match against its own outstanding nonces is meaningless.
+      const nonce = field(raw, "nonce");
+      if (nonce !== undefined && !isNonEmptyString(nonce)) {
+        return invalid(known, "nonce must be a non-empty string");
       }
       for (const row of messages) {
         if (!isRecord(row)) continue;
@@ -720,6 +728,7 @@ export function decodeDurableEvent(event: unknown): DurableEventDecodeResult {
   switch (kind) {
     case "requestState":
       if (!isNonEmptyString(field(event, "id")) || !isRequestState(field(event, "state"))) return bad("invalid request state");
+      if (field(event, "retriedBy") !== undefined && !isNonEmptyString(field(event, "retriedBy"))) return bad("retriedBy must be a message id");
       return ok();
     case "user":
       // The journal refuses an id-less user row at its own mechanism

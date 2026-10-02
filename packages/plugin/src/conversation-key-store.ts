@@ -291,6 +291,18 @@ export class ConversationKeyStore {
   }
 
   /**
+   * Non-mutating durable membership probe for core-initiated outbound target
+   * resolution (#402). It may run in a process that does not own this store
+   * (`openclaw message send` resolves targets in the CLI), so it never
+   * migrates, quarantines, creates or caches. An unreadable or foreign document
+   * throws; a missing one means no peer has registered under this tuple.
+   */
+  hasDurableKey(peerId: string): boolean {
+    assertPeerId(peerId);
+    return this.readFresh().has(peerId);
+  }
+
+  /**
    * Return the audit-only generation label for `peerId`, or `null` when absent.
    * This diagnostic is not a lock, writer census, or proof of quiescence.
    */

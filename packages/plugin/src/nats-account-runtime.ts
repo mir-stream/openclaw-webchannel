@@ -197,6 +197,8 @@ export type {
 type AccountRuntime = {
   accountId: string;
   tenant: string;
+  /** Storage root the account's key store and journal were opened under. */
+  storageRoot?: string;
   channel: NatsChannel;
   transport: NatsTransport;
   enrolled?: EnrolledNatsConnection;
@@ -252,6 +254,8 @@ const processOverflowResolver = new BoundedOverflowResolver({
   // fail-safe direction (the client replays and the flush path decides).
   lookupUserRow: (request, idempotencyKey) => runtimeForOverflow(request)
     ?.deliveryJournal?.lookupUserMessageIdByRandomId(request.peerId, idempotencyKey),
+  lookupConvergedRetry: (request, retryOf) => runtimeForOverflow(request)
+    ?.deliveryJournal?.dispatch?.retryOf(request.peerId, retryOf),
   sendAck: (request, committed, cancelled) => runtimeForOverflow(request)
     ?.channel.sendAck(request.peerId, [request.id], committed, cancelled ? [request.id] : undefined) ?? false,
   sendRejected: (request) => runtimeForOverflow(request)
@@ -294,19 +298,32 @@ function reportServingAggregate(api: any): void {
 
 /** Build the production facade over the account lifecycle's live runtime map. */
 export function createNatsWebChannelPlugin(
-  runtimes: ReadonlyMap<string, Pick<AccountRuntime, "channel">>,
+  runtimes: ReadonlyMap<
+    string,
+    Pick<AccountRuntime, "channel"> & Partial<Pick<AccountRuntime, "tenant" | "storageRoot">>
+  >,
   opts?: Omit<
     NonNullable<Parameters<typeof createWebChannelPlugin>[1]>,
-    "resolveApprovalTransport" | "resolveOutboundTransport"
+    "resolveApprovalTransport" | "resolveOutboundTransport" | "resolveServingScope"
   >,
 ) {
   // The outbound adapter resolves the current config to its exact listed id
   // before consulting this live map. A stale/absent runtime cannot redirect it.
   // Both capabilities use live account resolvers; there is no primary binding.
+  // Target admission and outbound routes prefer the live serving tuple, which
+  // is what inbound keyed this account's sessions and key store under.
   return createWebChannelPlugin(new NullPeerChannel(), {
     ...opts,
     resolveOutboundTransport: (accountId) => runtimes.get(accountId)?.channel,
     resolveApprovalTransport: (accountId) => runtimes.get(accountId ?? "default")?.channel,
+    resolveServingScope: (accountId) => {
+      const runtime = runtimes.get(accountId);
+      if (runtime?.tenant === undefined) return undefined;
+      return {
+        tenant: runtime.tenant,
+        ...(runtime.storageRoot !== undefined ? { storageRoot: runtime.storageRoot } : {}),
+      };
+    },
   });
 }
 
@@ -404,7 +421,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
     }
 
     {
-      const { accountId, tenant, account } = plan;
+      const { accountId, tenant, account, storageRoot } = plan;
       const storageScope = Object.freeze({ tenant, accountId });
       const accountNatsCfg = account.nats as WebchannelNatsConfig | undefined;
       const accountEncryption = account.encryption as WebchannelEncryptionConfig | undefined;
@@ -1112,6 +1129,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         // devices for immediate multi-device echo (Telegram model). One publish to
         // the shared `.out` subject; the gap-sync path stays the fallback.
         sendUserCommitted: (peerId, message) => channel.sendUserCommitted(peerId, message),
+        sendRequestState: (change) => channel.sendRequestState(change),
         // v6 (#239 half 3): the SAME handle the channel got for the egress seam,
         // opened above from this account's (tenant, accountId) tuple. Doc §15.7
         // makes this write part of accepting a user message, so a missing handle
@@ -1521,6 +1539,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             runtimeRef = {
               accountId,
               tenant,
+              ...(storageRoot !== undefined ? { storageRoot } : {}),
               channel,
               transport,
               ...(enrolled ? { enrolled } : {}),

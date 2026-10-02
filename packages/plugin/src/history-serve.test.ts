@@ -94,7 +94,7 @@ function thread(prefix: string): JournalEvent[] {
  */
 function recordingChannel(limit = 8 * 1024 * 1024): {
   channel: HistoryChannelSurface;
-  sent: Array<{ peerId: string; messages: HistoryMessage[]; highWaterSeq?: number; snapshotComplete?: boolean }>;
+  sent: Array<{ peerId: string; messages: HistoryMessage[]; highWaterSeq?: number; snapshotComplete?: boolean; nonce?: string }>;
   // #244 half B / #356: the `difference` frames the serve path emitted, with the
   // whole reply body — the echo and the two catch-up signals are as much of the
   // contract as the events are.
@@ -109,7 +109,7 @@ function recordingChannel(limit = 8 * 1024 * 1024): {
    */
   rowMeasurements: number;
 } {
-  const sent: Array<{ peerId: string; messages: HistoryMessage[]; highWaterSeq?: number; snapshotComplete?: boolean }> = [];
+  const sent: Array<{ peerId: string; messages: HistoryMessage[]; highWaterSeq?: number; snapshotComplete?: boolean; nonce?: string }> = [];
   const differences: Array<{ peerId: string } & DifferenceReply> = [];
   const counter = { n: 0, rows: 0 };
   return {
@@ -123,8 +123,14 @@ function recordingChannel(limit = 8 * 1024 * 1024): {
     },
     channel: {
       // #244 half A: capture the high-water baseline the snapshot path stamps.
-      sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number, snapshotComplete?: boolean) {
-        sent.push({ peerId, messages, highWaterSeq, snapshotComplete });
+      sendHistory(
+        peerId: string,
+        messages: HistoryMessage[],
+        highWaterSeq?: number,
+        snapshotComplete?: boolean,
+        nonce?: string,
+      ) {
+        sent.push({ peerId, messages, highWaterSeq, snapshotComplete, nonce });
         return true;
       },
       sendDifference(peerId, reply) {
@@ -275,6 +281,71 @@ describe("createHistoryServer — #244 half A snapshot high-water", () => {
 
     expect(sent).toHaveLength(1);
     expect(sent[0].highWaterSeq).toBeUndefined();
+  });
+});
+
+describe("createHistoryServer — #401 page correlation", () => {
+  it("echoes the request's nonce on its PAGE, and only there", () => {
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+
+    const { server, sent, scheduler } = harness(journal);
+    server.servePage(PEER, { before: "a3", nonce: "page-b" });
+    scheduler.flush();
+    // An older client's request carries no nonce; its page carries none back.
+    server.servePage(PEER, { before: "a3" });
+    scheduler.flush();
+    // The snapshot is every device's, so it is never correlated.
+    server.sendSnapshot(PEER);
+    scheduler.flush();
+
+    expect(sent).toHaveLength(3);
+    expect(sent[0].nonce).toBe("page-b");
+    expect(sent[0].messages.map((m) => m.id)).toEqual(["a1", "a2"]);
+    expect(sent[1].nonce).toBeUndefined();
+    expect(sent[2].nonce).toBeUndefined();
+    expect(sent[2].highWaterSeq).toBeDefined();
+  });
+
+  it("budgets the nonce's bytes: a page that fits bare is shortened once it carries one", () => {
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    const probe = harness(journal);
+    probe.server.servePage(PEER, {});
+    probe.scheduler.flush();
+    const rows = probe.sent[0].messages;
+    expect(rows.length).toBeGreaterThan(1);
+    // The exact size of the bare page frame — what `outboundWireSize` measures.
+    const bare = Buffer.byteLength(JSON.stringify({ type: "history", messages: rows }), "utf8");
+
+    const { server, sent, scheduler } = harness(journal, {}, bare);
+    server.servePage(PEER, {});
+    scheduler.flush();
+    expect(sent[0].messages).toHaveLength(rows.length);
+
+    // Same page, same limit, plus the echo: it no longer fits whole, so the
+    // fitter drops the oldest rows rather than handing the transport an
+    // oversized frame.
+    const nonce = "n".repeat(64);
+    server.servePage(PEER, { nonce });
+    scheduler.flush();
+    expect(sent[1].nonce).toBe(nonce);
+    expect(sent[1].messages.length).toBeLessThan(rows.length);
+    expect(Buffer.byteLength(JSON.stringify({ type: "history", messages: sent[1].messages, nonce }), "utf8"))
+      .toBeLessThanOrEqual(bare);
+  });
+
+  it("echoes it on an EMPTY page too — the requester's answer is still its own", () => {
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+
+    const { server, sent, scheduler } = harness(journal);
+    server.servePage(PEER, { before: "a1", nonce: "page-end" });
+    scheduler.flush();
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0].messages).toEqual([]);
+    expect(sent[0].nonce).toBe("page-end");
   });
 });
 
@@ -564,18 +635,156 @@ describe("createHistoryServer — the per-peer in-flight CONCURRENCY bound", () 
     expect(sent[1].messages.at(-1)).toMatchObject({ id: "a402", seq: 402 });
   });
 
-  it("drops a concurrent PAGE for the same peer and warns", () => {
+  it("#401 — QUEUES a concurrent PAGE for the same peer and answers each, one fold at a time", () => {
+    // Before #401 the second request was dropped. Each page now answers one
+    // device's nonce and is folded only there, so a drop is an ignored click.
     const journal = openJournal();
     for (const event of thread("a")) journal.append(PEER, event);
     const { server, sent, scheduler, warns } = harness(journal);
 
-    server.servePage(PEER, {});
-    server.servePage(PEER, { before: "a3" });
+    server.servePage(PEER, { nonce: "device-a" });
+    server.servePage(PEER, { before: "a3", nonce: "device-b" });
+    // Still one fold scheduled: the second waits behind it, not beside it.
     expect(scheduler.pending).toBe(1);
+    expect(warns).toEqual([]);
+
+    scheduler.flush();
+    expect(sent.map((s) => s.nonce)).toEqual(["device-a", "device-b"]);
+    expect(sent[0].messages.map((m) => m.id)).toEqual(["a1", "a2", "a3"]);
+    expect(sent[1].messages.map((m) => m.id)).toEqual(["a1", "a2"]);
+  });
+
+  it("#401 — bounds the page queue: past it a NEW request is dropped and warned", () => {
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    const { server, sent, scheduler, warns } = harness(journal);
+
+    // One folding plus eight queued is the whole outstanding set.
+    for (let i = 0; i < 9; i++) server.servePage(PEER, { nonce: `n${i}` });
+    expect(warns).toEqual([]);
+    server.servePage(PEER, { nonce: "n9" });
     expect(warns[0]).toContain("history page dropped");
 
     scheduler.flush();
-    expect(sent).toHaveLength(1);
+    expect(sent.map((s) => s.nonce)).toEqual(Array.from({ length: 9 }, (_, i) => `n${i}`));
+
+    // Drained, so the queue is gone and the next request runs on its own.
+    server.servePage(PEER, { nonce: "after" });
+    expect(scheduler.flush()).toBe(1);
+    expect(sent.at(-1)?.nonce).toBe("after");
+  });
+
+  it("#401 — refuses an oversized waiting cursor but preserves active and later fitting pages", () => {
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    const { server, sent, scheduler, warns } = harness(journal);
+    const before = "x".repeat(64 * 1024);
+
+    // The active request still accepts an arbitrary-length cursor. This one
+    // misses the journal, so it must receive the usual empty page answer.
+    server.servePage(PEER, { before, nonce: "active" });
+    server.servePage(PEER, { before, nonce: "oversized" });
+    server.servePage(PEER, { before, nonce: "also-oversized" });
+    server.servePage(PEER, { before: "a3", nonce: "fits" });
+    expect(warns).toHaveLength(1); // The existing dropped throttle also applies.
+    expect(warns[0]).toContain("history page dropped");
+    expect(scheduler.pending).toBe(1);
+
+    scheduler.flush();
+    expect(sent.map((s) => s.nonce)).toEqual(["active", "fits"]);
+    expect(sent[0].messages).toEqual([]);
+    expect(sent[1].messages.map((m) => m.id)).toEqual(["a1", "a2"]);
+  });
+
+  it("#401 — charges both cursor strings and the nonce, including non-ASCII, per peer", () => {
+    const { server, sent, scheduler, warns } = harness(openJournal());
+    server.servePage(PEER, { nonce: "active" });
+    // Exactly 64 KiB: 8192 BMP units + 24572 surrogate units + 4 nonce units,
+    // at two bytes each. Omitting ANY field lets the next request slip in.
+    server.servePage(PEER, {
+      before: "界".repeat(8192),
+      beforeTurnId: "🦀".repeat(12286),
+      nonce: "fits",
+    });
+    expect(warns).toEqual([]);
+    server.servePage(PEER, { nonce: "x" });
+    expect(warns).toHaveLength(1);
+    server.servePage(OTHER_PEER, { nonce: "other-active" });
+    server.servePage(OTHER_PEER, { nonce: "other-waiting" });
+
+    scheduler.flush();
+    expect(sent.filter((s) => s.peerId === PEER).map((s) => s.nonce))
+      .toEqual(["active", "fits"]);
+    expect(sent.filter((s) => s.peerId === OTHER_PEER).map((s) => s.nonce))
+      .toEqual(["other-active", "other-waiting"]);
+  });
+
+  it.each(["success", "read fault", "publish throw", "publish refusal"] as const)(
+    "#401 — releases waiting charge before starting the next page after %s",
+    (outcome) => {
+      const journal = openJournal();
+      const callbacks: Array<() => void> = [];
+      const { server, sent, warns, errors, recording } = harness(journal, {
+        schedule: (fn) => void callbacks.push(fn),
+      });
+      // Each waiting request alone fills the byte budget (including its nonce).
+      const before = "x".repeat(32767);
+      server.servePage(PEER, { nonce: "active" });
+      server.servePage(PEER, { before, nonce: "a" });
+      callbacks.shift()!(); // Active finishes; a now owns the active slot.
+      server.servePage(PEER, { before, nonce: "b" });
+      expect(warns).toEqual([]);
+
+      const historyPage = journal.historyPage;
+      const sendHistory = recording.channel.sendHistory;
+      if (outcome === "read fault") {
+        journal.historyPage = () => { throw new Error("injected page read failure"); };
+      } else if (outcome === "publish throw") {
+        recording.channel.sendHistory = () => { throw new Error("injected publish failure"); };
+      } else if (outcome === "publish refusal") {
+        recording.channel.sendHistory = () => false;
+      }
+      callbacks.shift()!(); // a settles on every path; b becomes active.
+      journal.historyPage = historyPage;
+      recording.channel.sendHistory = sendHistory;
+      expect(errors).toHaveLength(outcome === "success" ? 0 : 1);
+
+      server.servePage(PEER, { before, nonce: "c" });
+      expect(warns).toEqual([]);
+      while (callbacks.length) callbacks.shift()!();
+      expect(sent.map((s) => s.nonce)).toEqual(
+        outcome === "success" ? ["active", "a", "b", "c"] : ["active", "b", "c"],
+      );
+
+      // A completely drained peer can again retain a full waiting budget.
+      server.servePage(PEER, { nonce: "after" });
+      server.servePage(PEER, { before, nonce: "d" });
+      expect(warns).toEqual([]);
+      while (callbacks.length) callbacks.shift()!();
+      expect(sent.slice(-2).map((s) => s.nonce)).toEqual(["after", "d"]);
+    },
+  );
+
+  it("#401 — a read fault still starts the next queued page", () => {
+    const journal = openJournal();
+    for (const event of thread("a")) journal.append(PEER, event);
+    let clock = 0;
+    const { server, sent, scheduler, errors } = harness(journal, { now: () => clock });
+
+    server.servePage(PEER, { nonce: "faulted" });
+    server.servePage(PEER, { nonce: "next" });
+    journal.close();
+    scheduler.flush();
+    expect(sent).toEqual([]);
+    expect(errors).toHaveLength(1);
+
+    // The throttle swallowed one more read fault: the queued request WAS
+    // attempted after the first failed, rather than stranded behind it.
+    clock += 60_001;
+    server.servePage(PEER, { nonce: "probe" });
+    scheduler.flush();
+    expect(errors[1]).toContain("history page journal read failed");
+    expect(errors[1]).toContain("suppressed=1");
   });
 
   it("⚠️ a page in flight NEVER drops that peer's snapshot (separate latches)", () => {
@@ -631,7 +840,8 @@ describe("createHistoryServer — the per-peer in-flight CONCURRENCY bound", () 
     let clock = 0;
     const { server, scheduler, warns } = harness(journal, { now: () => clock });
 
-    server.servePage(PEER, {});
+    // #401: one folding plus a full queue of eight, so the next six drop.
+    for (let i = 0; i < 9; i++) server.servePage(PEER, {});
     for (let i = 0; i < 5; i++) server.servePage(PEER, {});
     expect(warns).toHaveLength(1);
     expect(warns[0]).toContain("suppressed=0");

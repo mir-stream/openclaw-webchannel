@@ -11,6 +11,7 @@ import {
   type DurableView,
 } from "./durable-view-reducer.js";
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
+import { ownHistoryPage } from "./history-page.test-harness.js";
 import type { InboundMessage } from "./nats-client.js";
 
 // v6 slice 1 (#237). These tests feed ordered event streams through the PURE
@@ -1581,10 +1582,10 @@ describe("live == history for reasoning: a reload reproduces what was watched", 
     // Reasoning rows carry NO `role`; `toEqual` on the durable projection below
     // would fail if one appeared.
     const fresh = newWrapper() as unknown as WrapperInternals;
-    fresh.handleMessage({
+    fresh.handleMessage(ownHistoryPage(fresh, {
       type: "history",
       messages: ORDINARY_TURN_ROWS.map(servedRow),
-    } as unknown as InboundMessage);
+    } as unknown as InboundMessage));
 
     // ⭐ SAME CONTENT, SAME POSITION.
     expect(durable(fresh.state.messages)).toEqual(durable(live));
@@ -1612,10 +1613,10 @@ describe("live == history for reasoning: a reload reproduces what was watched", 
     for (const frame of ORDINARY_TURN_FRAMES) w.handleMessage(inbound(frame));
     const before = w.state.messages.map((m) => m.id);
 
-    w.handleMessage({
+    w.handleMessage(ownHistoryPage(w, {
       type: "history",
       messages: ORDINARY_TURN_ROWS.map(servedRow),
-    } as unknown as InboundMessage);
+    } as unknown as InboundMessage));
 
     expect(w.state.messages.map((m) => m.id)).toEqual(before);
     expect(w.state.messages.map((m) => m.id)).toEqual(["r1", "A", "r2", "B"]);
@@ -1701,10 +1702,10 @@ describe("live == history for tool activity: a reload reproduces what was watche
 
     // ── REPLAY ── the rows the plugin's projection emits for that same journal.
     const fresh = newWrapper() as unknown as WrapperInternals;
-    fresh.handleMessage({
+    fresh.handleMessage(ownHistoryPage(fresh, {
       type: "history",
       messages: TOOL_TURN_ROWS.map((row, i) => ({ ...row, ts: i + 1 })),
-    } as unknown as InboundMessage);
+    } as unknown as InboundMessage));
 
     // ⭐ SAME CONTENT, SAME POSITION.
     expect(durable(fresh.state.messages)).toEqual(durable(live));
@@ -1741,10 +1742,10 @@ describe("live == history for tool activity: a reload reproduces what was watche
       w.handleMessage(frame as unknown as InboundMessage);
     }
     const fresh = newWrapper() as unknown as WrapperInternals;
-    fresh.handleMessage({
+    fresh.handleMessage(ownHistoryPage(fresh, {
       type: "history",
       messages: TOOL_TURN_ROWS.map((row, i) => ({ ...row, ts: i + 1 })),
-    } as unknown as InboundMessage);
+    } as unknown as InboundMessage));
 
     expect(toolOf(fresh)).toEqual(toolOf(w));
     expect(toolOf(w)).toEqual([
@@ -1770,10 +1771,10 @@ describe("live == history for tool activity: a reload reproduces what was watche
     }
     const before = durable(w.state.messages);
     for (let i = 0; i < 3; i++) {
-      w.handleMessage({
+      w.handleMessage(ownHistoryPage(w, {
         type: "history",
         messages: TOOL_TURN_ROWS.map((row, j) => ({ ...row, ts: j + 1 })),
-      } as unknown as InboundMessage);
+      } as unknown as InboundMessage));
     }
     expect(durable(w.state.messages)).toEqual(before);
   });
@@ -1787,10 +1788,10 @@ describe("live == history for tool activity: a reload reproduces what was watche
     // previous entry's is copied onto it. Delete the line and a reload's
     // timestamp stays on screen only until the next frame of any kind arrives.
     const w = newWrapper() as unknown as WrapperInternals;
-    w.handleMessage({
+    w.handleMessage(ownHistoryPage(w, {
       type: "history",
       messages: TOOL_TURN_ROWS.map((row, i) => ({ ...row, ts: 1000 + i })),
-    } as unknown as InboundMessage);
+    } as unknown as InboundMessage));
     expect(w.state.messages.find((m) => m.id === "call-1")).toMatchObject({
       kind: "tool",
       ts: 1000,
@@ -1903,10 +1904,10 @@ describe("live == history for approvals: a reload reproduces the card and its ve
 
   function driveReplay(): WrapperInternals {
     const fresh = newWrapper() as unknown as WrapperInternals;
-    fresh.handleMessage({
+    fresh.handleMessage(ownHistoryPage(fresh, {
       type: "history",
       messages: APPROVAL_TURN_ROWS.map((row, i) => ({ ...row, ts: i + 1 })),
-    } as unknown as InboundMessage);
+    } as unknown as InboundMessage));
     return fresh;
   }
 
@@ -1978,10 +1979,10 @@ describe("live == history for approvals: a reload reproduces the card and its ve
     const w = driveLive();
     const before = durable(w.state.messages);
     for (let i = 0; i < 3; i++) {
-      w.handleMessage({
+      w.handleMessage(ownHistoryPage(w, {
         type: "history",
         messages: APPROVAL_TURN_ROWS.map((row, j) => ({ ...row, ts: j + 1 })),
-      } as unknown as InboundMessage);
+      } as unknown as InboundMessage));
     }
     expect(durable(w.state.messages)).toEqual(before);
   });
@@ -2038,10 +2039,10 @@ describe("#242 half 4: a REPLAYED approval is never clickable", () => {
 
   function replayPending(): WrapperInternals {
     const w = newWrapper() as unknown as WrapperInternals;
-    w.handleMessage({
+    w.handleMessage(ownHistoryPage(w, {
       type: "history",
       messages: [pendingRow],
-    } as unknown as InboundMessage);
+    } as unknown as InboundMessage));
     return w;
   }
 
@@ -2121,10 +2122,10 @@ describe("#242 half 4: a REPLAYED approval is never clickable", () => {
     // N8/N10: live showed the decision, so history must not hide it — but the
     // buttons stay off.
     const w = newWrapper() as unknown as WrapperInternals;
-    w.handleMessage({
+    w.handleMessage(ownHistoryPage(w, {
       type: "history",
       messages: [{ ...pendingRow, resolvedDecision: "deny" }],
-    } as unknown as InboundMessage);
+    } as unknown as InboundMessage));
     const [card] = approvalsOf(w);
     expect(card.resolvedDecision).toBe("deny");
     expect(card.actionable).toBe(false);
@@ -2135,10 +2136,10 @@ describe("#242 half 4: a REPLAYED approval is never clickable", () => {
     // the server cannot journal one, so admitting it from the wire would render
     // a resolution that never happened. The card stays pending — and inert.
     const w = newWrapper() as unknown as WrapperInternals;
-    w.handleMessage({
+    w.handleMessage(ownHistoryPage(w, {
       type: "history",
       messages: [{ ...pendingRow, resolvedDecision: "unknown" }],
-    } as unknown as InboundMessage);
+    } as unknown as InboundMessage));
     const [card] = approvalsOf(w);
     expect(card.resolvedDecision).toBeUndefined();
     expect(card.actionable).toBe(false);
@@ -2454,5 +2455,19 @@ describe("#244 half B — applyUser is id-idempotent (re-delivery safe)", () => 
     expect(twice).toEqual(once);
     // And specifically: exactly one user bubble survives the double fold.
     expect(twice.filter((m) => m.kind === "text" && m.role === "user")).toHaveLength(1);
+  });
+});
+
+describe("#399 requestState retriedBy", () => {
+  it("links an interrupted original to its first retry once, without changing its state", () => {
+    const base = reduceDurableView([
+      { kind: "user", id: "u1", text: "transfer", requestState: "queued" },
+      { kind: "requestState", id: "u1", state: "interrupted" },
+    ]);
+    const linked = applyDurableEvent(base, { kind: "requestState", id: "u1", state: "interrupted", retriedBy: "u2" });
+    expect(linked[0]).toMatchObject({ requestState: "interrupted", retriedBy: "u2" });
+    expect(applyDurableEvent(linked, { kind: "requestState", id: "u1", state: "interrupted", retriedBy: "u3" })).toBe(linked);
+    expect(applyDurableEvent(linked, { kind: "requestState", id: "u1", state: "interrupted" })).toBe(linked);
+    expect(projectDurableFromClient([{ id: "u1", role: "user", text: "transfer", requestState: "interrupted", retriedBy: "u2" }])[0]).toMatchObject({ retriedBy: "u2" });
   });
 });

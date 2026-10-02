@@ -1,6 +1,7 @@
 import { ingressScopeNamespace, type IngressScope } from "./ingress-scope.js";
 import type { StorageScopeIdentity } from "./storage-identity.js";
 import type { DispatchRecovery } from "./dispatch-recovery.js";
+import type { DispatchChange } from "./dispatch-store.js";
 /**
  * P0-7a — browser→agent ingress idempotency (first half).
  *
@@ -344,7 +345,7 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
   sendAck?: (
     peerId: string,
     ids: string[],
-    committed?: Array<{ random_id: string; messageId: string; seq: number }>,
+    committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>,
     cancelled?: string[],
   ) => boolean;
   /**
@@ -361,6 +362,12 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
     message: { id: string; text: string; turnId?: string; seq: number; random_id?: string; requestState?: "queued"; retryOf?: string },
   ) => boolean;
   sendInboundRejected?: (peerId: string, ids: string[]) => boolean;
+  /**
+   * #399: publish an interrupted original's committed `retriedBy` change after
+   * the retry row's own broadcast, so devices disable that original's Retry
+   * immediately. Optional like the broadcast: history/difference carry it too.
+   */
+  sendRequestState?: (change: DispatchChange) => boolean;
   outcomeStore?: IngressOutcomeStore;
   beginBatch?: (peerId: string) => DispatcherBatchLease<T["message"]>;
   measureResultWireBytes?: (peerId: string, frame: IngressResultFrame) => number;
@@ -606,7 +613,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
        * the first `ack` frame (see the footer). Empty for older clients that sent
        * no usable `random_id` — those are still acked, just not echoed.
        */
-      const committedBatch: Array<{ random_id: string; messageId: string; seq: number }> = [];
+      const committedBatch: CommittedUserMessage[] = [];
       /**
        * The chosen results, held until the footer. **NOTHING may be `add`ed to
        * either chunk writer inside the item loop.**
@@ -1014,6 +1021,19 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             //  - a row exists: the ordinary deduped retry, re-echoing the FIRST
             //    admission's id and seq (to a conforming client; an older one is
             //    acked bare, as above).
+            // #399: a later retry of an already-retried original was accepted by
+            // converging on the first retry's row, so its own key never has a
+            // row. That is the answer this marker recorded, not a lost
+            // admission: re-echo it (seq-less, as the first time) without the
+            // re-admission warning.
+            const retryOf = row === undefined && deps.dispatchRecovery && typeof item.message.retry_of === "string"
+              ? deps.deliveryJournal?.dispatch?.retryOf(peerId, item.message.retry_of) : undefined;
+            if (retryOf !== undefined) {
+              release();
+              ackIds.push(id);
+              if (randomId !== undefined) committedBatch.push({ random_id: randomId, messageId: retryOf.messageId, converged: true });
+              continue;
+            }
             const orphanedMarker = deps.deliveryJournal !== undefined && row === undefined;
             if (!orphanedMarker) {
               release();
@@ -1368,8 +1388,12 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               // #244 half A: the echo carries the user message's `seq` too — this
               // is its ONLY wire carrier (the user opener rides no durable frame),
               // and without it the turn's first agent frame reads as a phantom gap.
+              //
+              // #399: a CONVERGED retry names the first retry's row, which this
+              // send did not open, so its echo carries no seq (see
+              // `CommittedUserMessage`).
               if (pending.randomId !== undefined) {
-                committedBatch.push({ random_id: pending.randomId, messageId, seq });
+                committedBatch.push({ random_id: pending.randomId, messageId, ...(durable?.converged ? { converged: true as const } : { seq }) });
               }
               // #245 Part B: broadcast the committed user event to the account's
               // OTHER devices so a user's own send appears there immediately (the
@@ -1403,6 +1427,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
                   ...(durableBatch ? { requestState: "queued" as const, ...(durable?.retryOf ? { retryOf: durable.retryOf } : {}) } : {}),
                   ...(pending.randomId !== undefined ? { random_id: pending.randomId } : {}),
                 });
+                if (durable?.retried) deps.sendRequestState?.(durable.retried);
               }
             }
           } catch (error) {
@@ -1741,7 +1766,7 @@ import type {
 } from "./ingress-outcome.js";
 import { createRateLimitedOutcomeFailureWarning, isLegacyIngressOutcomeAmbiguity } from "./ingress-outcome.js";
 import { createIngressResultChunkWriter } from "./ingress-result-chunks.js";
-import type { IngressResultFrame } from "./ingress-result-chunks.js";
+import type { CommittedUserMessage, IngressResultFrame } from "./ingress-result-chunks.js";
 // #123: peer ids and message ids reach these log lines straight off the wire.
 import { logSafe } from "./log-safe.js";
 /**

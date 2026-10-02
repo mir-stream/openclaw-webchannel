@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 
-import { resolveCommandGate } from "./command-gate.js";
+import { resolveCommandGate, resolvePeerCommandAuthorization } from "./command-gate.js";
+import { resolveDmAdmission } from "./dm-allowlist.js";
 import type { CommandGateConfig } from "./command-gate.js";
 
 /**
@@ -142,5 +143,59 @@ describe("resolveCommandGate — commands.ownerAllowFrom (owner enforcement)", (
     const gate = resolveCommandGate(cfg, ACCOUNT);
     expect(gate.isListed("alice")).toBe(true);
     expect(gate.isListed("bob")).toBe(false);
+  });
+});
+
+// #407 / TD-2: the single command-authorization decision. Every peer the DM
+// policy admits supplies the default authorization; core command/owner policy
+// may narrow it before the effective stamp reaches any command path.
+describe("resolvePeerCommandAuthorization", () => {
+  const ctx = (peerId: string) => ({
+    Provider: "webchannel",
+    Surface: "webchannel",
+    OriginatingChannel: "webchannel",
+    AccountId: ACCOUNT,
+    SenderId: peerId,
+    From: peerId,
+    To: peerId,
+    ChatType: "direct",
+  });
+
+  it("authorizes every admitted peer, whatever admitted it", () => {
+    for (const cfg of [
+      undefined,
+      { dmSecurity: "open" },
+      { dmSecurity: "allowlist", allowFrom: ["alice"] },
+    ]) {
+      const admission = resolveDmAdmission("alice", cfg);
+      expect(admission.allowed).toBe(true);
+      expect(resolvePeerCommandAuthorization({ admission, cfg: {}, ctx: ctx("alice") }))
+        .toBe(true);
+    }
+  });
+
+  it("does not authorize a peer the DM policy denies", () => {
+    for (const cfg of [
+      { dmSecurity: "allowlist", allowFrom: ["bob"] },
+      { dmSecurity: "allowlist", allowFrom: [] },
+    ]) {
+      const admission = resolveDmAdmission("alice", cfg);
+      expect(resolvePeerCommandAuthorization({ admission, cfg: {}, ctx: ctx("alice") }))
+        .toBe(false);
+    }
+  });
+
+  it("uses provider-specific commands.allowFrom before the global fallback", () => {
+    const admission = resolveDmAdmission("bob", undefined);
+    expect(resolvePeerCommandAuthorization({
+      admission,
+      cfg: { commands: { allowFrom: { webchannel: ["alice"], "*": ["bob"] } } },
+      ctx: ctx("bob"),
+    })).toBe(false);
+    expect(resolvePeerCommandAuthorization({
+      admission,
+      cfg: { commands: { allowFrom: { "*": ["bob"] } } },
+      ctx: ctx("bob"),
+    })).toBe(true);
   });
 });

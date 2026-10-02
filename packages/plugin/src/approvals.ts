@@ -1553,9 +1553,13 @@ export class ApprovalDecisionForbiddenError extends Error {
  */
 export function approvalDecisionRejectReason(err: unknown): ApprovalDecisionRejectReason | undefined {
   if (err instanceof ApprovalBindingMissingError) return "not-pending";
-  // Both authz refusals leave as `not-approver` (see the wire type): the
-  // distinction stays in the server log, never on the peer's wire.
-  if (err instanceof ApprovalDecisionForbiddenError) return "not-approver";
+  if (err instanceof ApprovalDecisionForbiddenError) {
+    // A foreign-account live binding is indistinguishable from an id that is
+    // absent or finalized. Only a sender rejected within the bound account is
+    // told that it lacks approver authority. The server log keeps the more
+    // specific cross-account refusal unchanged.
+    return err.reason === "cross-account" ? "not-pending" : "not-approver";
+  }
   return undefined;
 }
 

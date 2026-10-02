@@ -239,6 +239,13 @@ describe("#246 half A — decodeInboundMessage: the bulk frames", () => {
     accepts({ type: "history", messages: [{ nonsense: true }] });
   });
 
+  it("#401 — a page's nonce echo is optional, and a present one must be usable", () => {
+    accepts({ type: "history", messages: [], nonce: "page-b" });
+    refuses({ type: "history", messages: [], nonce: "" });
+    refuses({ type: "history", messages: [], nonce: 7 });
+    refuses({ type: "history", messages: [], nonce: null });
+  });
+
   it("difference requires an events ARRAY and leaves each event to the fold", () => {
     const envelope = { afterSeq: 1, nonce: "n0", partial: false, maxSeq: 1 };
     refuses({ type: "difference", ...envelope, events: {} });
@@ -391,6 +398,15 @@ describe("#246 half A — decodeDurableEvent: the difference fold's events", () 
     expect(bad({ kind: "messageEdited", id: "a1", text: "x" })).toBe("malformed");
     expect(bad({ kind: "messageEdited", id: "a1", text: "x", revision: "2" })).toBe("malformed");
     expect(bad({ kind: "messageDeleted", id: "a1" })).toBe("malformed");
+  });
+
+  it("#399 retriedBy is optional on request state but must name a message when present", () => {
+    const live = { type: "request_state", id: "u1", turnId: "t1", state: "interrupted", seq: 3 };
+    expect(decode({ ...live, retriedBy: "u2" })).toEqual({ ok: true });
+    expect(decode({ ...live, retriedBy: "" })).toMatchObject({ ok: false });
+    expect(decode({ ...live, retriedBy: 7 })).toMatchObject({ ok: false });
+    expect(decodeDurableEvent({ kind: "requestState", id: "u1", state: "interrupted", retriedBy: "u2" }).ok).toBe(true);
+    expect(decodeDurableEvent({ kind: "requestState", id: "u1", state: "interrupted", retriedBy: "" }).ok).toBe(false);
   });
 
   it("keeps `placement.answerId: \"\"` foldable where `bubble.answerId: \"\"` is not", () => {

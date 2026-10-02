@@ -1,5 +1,5 @@
 /**
- * Command-authorization gate mirror — WIDGET UX FEEDBACK ONLY.
+ * Command authorization: effective inbound stamp plus widget UX mirror.
  *
  * WHY THIS EXISTS
  * ---------------
@@ -12,10 +12,10 @@
  * is NOT in the list gets `handled:false` from fast-abort, the abort falls
  * through to a normal turn, races the running turn, and is dropped as busy. The
  * turn is NOT aborted and the widget gets ZERO feedback — its Stop button sits
- * silently inert. This module lets the plugin DETECT that configuration so the
- * caller can send a hedged "Stop may not be permitted" notice to the peer.
+ * silently inert. `resolveCommandGate` lets the plugin DETECT that configuration
+ * so the caller can send a hedged "Stop may not be permitted" notice to the peer.
  *
- * This is a BEST-EFFORT MIRROR for UX only. Core remains the sole authority: we
+ * That gate is a BEST-EFFORT MIRROR for UX only. Core remains the sole authority: we
  * still always dispatch the abort (core decides whether it takes effect). A
  * mismatch between this mirror and core can only ever change whether the hedged
  * NOTICE is shown, never whether the abort happens. The mirror is deliberately
@@ -81,8 +81,63 @@
  * peerId against the trimmed list entries, plus the `"*"` wildcard.
  */
 
+import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
+import { resolveCommandAuthorization } from "openclaw/plugin-sdk/command-auth";
+import type { MsgContext } from "openclaw/plugin-sdk/reply-runtime";
+
+import type { DmAdmission } from "./dm-allowlist.js";
+
 /** Core resolves `commands.allowFrom` by the channel's provider id. */
 const WEBCHANNEL_PROVIDER_ID = "webchannel";
+
+/**
+ * The plugin's single command-authorization decision (#407): the effective
+ * value stamped as `access.commands.authorized` on EVERY turn context we hand
+ * core, ordinary and control-lane alike.
+ *
+ * Core reads that stamp as `ctx.CommandAuthorized`. Unstamped, it is false, and
+ * core then drops a whole-message control command (`/new`, `/reset`, `/model`,
+ * …) with NO reply — the widget's slash menu offered a command that does
+ * nothing. Telegram stamps every message with the result of its DM-allowlist
+ * command gate (`bot-message-context.body.ts`); we stamp the result of ours.
+ *
+ * DECISION (TD-2, see docs/TELEGRAM_DIVERGENCES.md): DM admission supplies the
+ * default/open authorization, then core's public resolver applies the existing
+ * `commands.allowFrom` and `commands.ownerAllowFrom` policies for the exact
+ * provider/account/peer identity that the inbound context will carry. This is
+ * necessary even though core resolves authorization again: its early reset
+ * guard accepts a raw true stamp before reaching the normal policy-aware path.
+ * Stamping the already-resolved result keeps both paths consistent.
+ *
+ * Webchannel routes sessions per peer (subject to configured identity links).
+ * What a command or tool may actually affect remains governed by core's command
+ * and tool policies. Tenant-managed command permissions can plug in HERE later;
+ * keep every call site going through this function so that hook has one home.
+ */
+export function resolvePeerCommandAuthorization(params: {
+  admission: DmAdmission;
+  cfg: OpenClawConfig;
+  ctx: Pick<
+    MsgContext,
+    | "Provider"
+    | "Surface"
+    | "OriginatingChannel"
+    | "AccountId"
+    | "SenderId"
+    | "From"
+    | "To"
+    | "ChatType"
+  >;
+}): boolean {
+  if (!params.admission.allowed) return false;
+  return resolveCommandAuthorization({
+    ctx: params.ctx,
+    cfg: params.cfg,
+    // DM admission is webchannel's default authorization. Core's resolver
+    // narrows it when an applicable command/owner policy is configured.
+    commandAuthorized: true,
+  }).isAuthorizedSender;
+}
 
 /**
  * Structural view of the only config we read. Kept loose (not the full

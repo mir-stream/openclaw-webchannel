@@ -10,6 +10,7 @@ import {
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
+import { ownHistoryPage } from "./history-page.test-harness.js";
 import type { InboundMessage, NatsClientOptions } from "./nats-client.js";
 
 function randomIdForReceipt(wrapper: WebChannelNATSClient, receiptId: string): string {
@@ -343,7 +344,7 @@ describe("WebChannelNATSClient — W6 idempotent history hydration", () => {
 
   /** Drive the private inbound dispatcher directly (no socket needed). */
   function deliver(wrapper: WebChannelNATSClient, frame: HistoryFrame): void {
-    (wrapper as unknown as { handleMessage: (m: HistoryFrame) => void }).handleMessage(frame);
+    (wrapper as unknown as { handleMessage: (m: HistoryFrame) => void }).handleMessage(ownHistoryPage(wrapper, frame));
   }
 
   it("re-delivered snapshot is a no-op (dedup by server id)", () => {
@@ -450,7 +451,7 @@ describe("WebChannelNATSClient — W6 agent-bubble id adoption", () => {
   }
   type AnyFrame = { type: string; [k: string]: unknown };
   function deliver(wrapper: WebChannelNATSClient, frame: AnyFrame): void {
-    (wrapper as unknown as { handleMessage: (m: AnyFrame) => void }).handleMessage(frame);
+    (wrapper as unknown as { handleMessage: (m: AnyFrame) => void }).handleMessage(ownHistoryPage(wrapper, frame));
   }
 
   /**
@@ -632,7 +633,7 @@ describe("WebChannelNATSClient — #16 ordered history insertion", () => {
     });
   }
   function deliver(wrapper: WebChannelNATSClient, frame: AnyFrame): void {
-    (wrapper as unknown as { handleMessage: (m: AnyFrame) => void }).handleMessage(frame);
+    (wrapper as unknown as { handleMessage: (m: AnyFrame) => void }).handleMessage(ownHistoryPage(wrapper, frame));
   }
 
   it("regression: a snapshot's newer tail is APPENDED after the matched local prefix, not prepended", () => {
@@ -821,7 +822,7 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
     });
   }
   function deliver(wrapper: WebChannelNATSClient, frame: AnyFrame): void {
-    (wrapper as unknown as { handleMessage: (m: AnyFrame) => void }).handleMessage(frame);
+    (wrapper as unknown as { handleMessage: (m: AnyFrame) => void }).handleMessage(ownHistoryPage(wrapper, frame));
   }
 
   /**
@@ -1806,7 +1807,7 @@ describe("WebChannelNATSClient — approval_snapshot reconciliation (#15)", () =
     });
   }
   function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
-    (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(frame);
+    (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(ownHistoryPage(wrapper, frame));
   }
   function pendingPayload(id: string) {
     return {
@@ -2189,7 +2190,7 @@ describe("WebChannelNATSClient — P0-3 command discovery", () => {
     });
   }
   function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
-    (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(frame);
+    (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(ownHistoryPage(wrapper, frame));
   }
 
   it("a `commands` frame sets state.commands", () => {
@@ -2353,7 +2354,7 @@ describe("WebChannelNATSClient — reasoning lane", () => {
   }
 
   function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
-    (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(frame);
+    (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(ownHistoryPage(wrapper, frame));
   }
 
   it("is correlated, replaceable, and UNBOUNDED — the .slice(-100) cap is gone", () => {
@@ -2459,7 +2460,7 @@ describe("WebChannelNATSClient — #97 tool activity lane", () => {
   }
 
   function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
-    (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(frame);
+    (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(ownHistoryPage(wrapper, frame));
   }
 
   function toolActivityOf(wrapper: WebChannelNATSClient) {
@@ -2903,7 +2904,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
   }
   const inner = (w: Wrapper) => (w as unknown as { client: { sendUserMessage: (t: string) => string; notifySessionListeners: () => void } }).client;
   const lowLevel = (w: Wrapper) => (w as unknown as { client: { client: { connected: boolean; notifyStateListeners: () => void } } }).client.client;
-  const deliver = (w: Wrapper, frame: Frame) => (w as unknown as { handleMessage: (m: Frame) => void }).handleMessage(frame);
+  const deliver = (w: Wrapper, frame: Frame) => (w as unknown as { handleMessage: (m: Frame) => void }).handleMessage(ownHistoryPage(w, frame));
   const messages = (w: Wrapper) => w.getState().messages;
   const held = (w: Wrapper) => (w as unknown as { held: Array<{ localId: string; text: string }> }).held;
   const heldTexts = (w: Wrapper) => held(w).map((h) => h.text);
