@@ -9,8 +9,9 @@ Recovery restores only this client's published unsettled turns from durable
 `queued`/`started` state, in publish order. Explicit stop, settlement, cancellation,
 terminal receipts, and foreign turns cannot resurrect activity; stale-draft expiry
 retains eligible server-confirmed turns. Durable state alone does not re-arm the
-one-recovery-per-silent-interval watch. Protocol 8 requires client and plugin to
-roll out together: older clients treat renewals as input-holding typing.
+one-recovery-per-silent-interval watch. #396 joins scoped stop and history
+correlation in the same unreleased protocol 7 contract. Client and plugin must
+roll out together; ignoring the renewal marker would hold followup input.
 
 History page correlation (#401): `load_history` carries a per-request `nonce` that
 the `history` page echoes. Pages ride the peer's shared `.out`; a device folds only
@@ -54,7 +55,7 @@ keys, even when account transport startup fails; on a persistent storage or
 account-planning fault it deliberately holds core's remaining plugin-service
 startup (and every channel's restart recovery) rather than let core re-run
 interrupted work. Core session resets remain available. Historical rows without lifecycle metadata are never replayed or
-assigned invented statuses. Client/plugin protocol 8 requires lockstep rollout.
+assigned invented statuses. Client/plugin protocol 7 requires lockstep rollout.
 See [dispatch recovery and upgrade boundaries](DISPATCH_RECOVERY.md).
 
 Round 6 (#378): config reads, account inspection, acquisition/planning, status

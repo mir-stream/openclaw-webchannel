@@ -27,15 +27,17 @@
   reports a publish failure as a failed send, and the three refusals above the
   journal (disposed, transport down, no session key) are unchanged.
 
-### Breaking (wire protocol v8)
+### Breaking (wire protocol v7)
 
-Gateway plugin and browser client require a paired upgrade to protocol 8
+Gateway plugin and browser client require a paired upgrade to protocol 7
 (protocol 6 was never released); the exact-match register gate refuses every
-other version. One reason per bullet, matching `protocol.ts`:
+other version. Protocol 7 is unreleased; #396 joins scoped stop and history
+correlation in the same release contract. One reason per bullet, matching
+`protocol.ts`:
 
-- **v8 — liveness-only typing renewals (#396).** Periodic `typing.keepalive`
+- **v7 — liveness-only typing renewals (#396).** Periodic `typing.keepalive`
   frames refresh application watches without re-arming typing or holding
-  followups after output or approval. Older clients would queue those inputs.
+  followups after output or approval. Ignoring the marker would queue those inputs.
 - **v6 — durable cancellation ACK evidence.** `ack.cancelled` carries the exact
   wire ids whose cancellation is durable, a subset of the same frame's `ids`.
 - **v7 — stop covers earlier unacknowledged input (#397, #398).** An explicit

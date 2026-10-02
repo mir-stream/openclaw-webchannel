@@ -23,16 +23,17 @@
   check it after the ordered recovery drain. Empty or terminal recovery completes
   cleanup; newer typing and connection teardown retire the pending decision.
 
-### Breaking (wire protocol v8)
+### Breaking (wire protocol v7)
 
-Client and plugin require a paired upgrade to protocol 8 (protocol 6 was never
+Client and plugin require a paired upgrade to protocol 7 (protocol 6 was never
 released). The existing exact-match registration gate rejects every other
-version. No package-version bump. One reason per bullet, matching
-`protocol.ts`:
+version. Protocol 7 is unreleased; #396 joins scoped stop and history correlation
+in the same release contract. No package-version bump. One reason per bullet,
+matching `protocol.ts`:
 
-- **v8 — liveness-only typing renewals (#396).** Periodic `typing.keepalive`
+- **v7 — liveness-only typing renewals (#396).** Periodic `typing.keepalive`
   frames refresh application watches without re-arming typing or holding
-  followups after output or approval. Older clients would queue those inputs.
+  followups after output or approval. Ignoring the marker would queue those inputs.
 - **v6 — durable cancellation ACK evidence.** `ack.cancelled` must be understood
   to distinguish delivery acceptance from work that still needs recovery.
 - **v7 — stop covers earlier unacknowledged input (#397, #398).** An explicit

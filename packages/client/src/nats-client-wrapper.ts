@@ -3758,7 +3758,7 @@ export class WebChannelNATSClient {
 
   private handleMessage(msg: InboundMessage): void {
     if (msg.type === "typing" && msg.keepalive === true) {
-      // Protocol 8 renewals are activity only. In particular they must not
+      // Protocol 7 renewals are activity only. In particular they must not
       // re-arm typing/input holds or consume a deferred cancellation decision.
       const lifecycle = this.wrapperLifecycleGeneration;
       const preFrameLiveTurn = this.turnInFlight();

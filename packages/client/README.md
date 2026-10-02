@@ -322,10 +322,10 @@ becomes `failed { reason: "overloaded", retryable: true }`; retry is a deliberat
 caller/user action and creates a new id. Before either ACK or rejection arrives,
 the client reliability layer replays the same id live with capped exponential
 backoff, as well as immediately on reconnect. Client and plugin must be upgraded
-together — the wire protocol is now **v8** (v3 in `0.4.0`, the register hop
-described below; v4 in #246; v6 adds durable cancellation ACK evidence; v7
-correlates history pages to the requesting device, #401; v8 separates typing
-renewals from input-holding indicators, #396).
+together — the unreleased wire protocol is **v7** (v3 in `0.4.0`, the register hop
+described below; v4 in #246; v6 adds durable cancellation ACK evidence). Protocol 7
+combines scoped stop (#398), history page correlation (#401), and typing renewals
+that preserve immediate followup admission (#396) in the same release contract.
 
 ### BREAKING: protocol v3 register hop
 
@@ -347,7 +347,7 @@ The boolean `delivered` is gone. Migration: `delivered === true` ↔
 `sendState === "accepted" || sendState === "completed"`; render a failure from
 `sendState === "failed"` + `sendFailure`. `openclaw-webchannel-client` and
 `openclaw-webchannel` ship in lockstep — upgrade both together (the register
-protocol version is mandatory in both directions, and is **v8** today).
+protocol version is mandatory in both directions, and is **v7** today).
 
 See [`../../docs/STATUS.md`](../../docs/STATUS.md) for current deployment status
 and [`../../docs/TRUST_AND_ONBOARDING.md`](../../docs/TRUST_AND_ONBOARDING.md) for

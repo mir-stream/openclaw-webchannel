@@ -18,7 +18,7 @@ no browser-facing connection or token route.
 5. The agent returns the conversation key wrapped to the SaaS-attested device key,
    with both the peer id and that `clientNonce` bound into the wrap AAD.
 
-The wire protocol version is **8**. Client and plugin must ship
+The unreleased wire protocol version is **7**. Client and plugin must ship
 together; a mismatch is refused with a terminal `protocol_mismatch` (426) before
 any key work. Version 6 adds authenticated `ack.cancelled`: exact wire IDs whose
 cancellation is durable, restricted to the same frame's `ack.ids`. A client must
@@ -35,9 +35,10 @@ envelope remains version 1 and package versions are unchanged. Version 7 (#401)
 adds `load_history.nonce`, echoed on the `history` page that answers it: pages
 ride the peer's shared `.out`, and a device folds only a page echoing its own
 nonce, so another device's page cannot leave a hole in a different window.
-Version 8 (#396) marks periodic typing renewals with `keepalive: true`. Clients
-must treat these as liveness only; an older client would re-arm typing and queue
-ordinary followups after output or approval. This also requires paired rollout.
+Version 7 (#396) marks periodic typing renewals with `keepalive: true`. Clients
+must treat these as liveness only; ignoring the marker would re-arm typing and
+queue ordinary followups after output or approval. These changes share the same
+unreleased protocol 7 contract and ship in one paired client/plugin rollout.
 
 ### Register-reply freshness (`clientNonce`)
 

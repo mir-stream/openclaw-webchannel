@@ -26,6 +26,9 @@
  * supply no such proof. The exact-match gate requires the client/server change
  * together; this adds no capability negotiation or envelope/package version bump.
  *
+ * Protocol 7 is unreleased: #398, #401 and #396 share this release contract.
+ * All three ship in one paired client/plugin release.
+ *
  * v7 (breaking, #398): an explicit `/stop` carries `cancel_pending`, the
  * earlier user messages that device has no server result for. The server must
  * durably cancel the ones it has not accepted; a peer that ignored the field
@@ -43,9 +46,9 @@
  * #356 `get_difference.nonce` echo exists for. The register snapshot is never
  * correlated. Exact-match gate, no negotiation, no envelope/package bump.
  *
- * v8 (breaking, #396): `typing.keepalive: true` renews application liveness
- * without re-arming typing or holding user input. An older client treats every
- * renewal as ordinary typing and queues followups after output or approval.
+ * v7 (breaking, #396): `typing.keepalive: true` renews application liveness
+ * without re-arming typing or holding user input. Ignoring the marker would
+ * treat renewals as ordinary typing and queue followups after output or approval.
  * Both sides must upgrade together; no envelope/package bump or negotiation.
  *
  * When to bump (#160)
@@ -123,4 +126,4 @@
  * NOTE: this is a DIFFERENT layer from the E2E message-envelope version
  * (`ENVELOPE_VERSION` / `v:1`), which versions the encrypted payload format.
  */
-export const WEBCHANNEL_PROTOCOL_VERSION = 8;
+export const WEBCHANNEL_PROTOCOL_VERSION = 7;

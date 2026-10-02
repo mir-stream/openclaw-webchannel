@@ -105,7 +105,7 @@ describe("#246 half A — decodeInboundMessage: the frame envelope", () => {
   });
 });
 
-describe("protocol 8 typing renewals", () => {
+describe("protocol 7 typing renewals", () => {
   it("preserves optional boolean keepalive markers and rejects malformed markers", () => {
     accepts({ type: "typing" });
     for (const keepalive of [true, false]) {
