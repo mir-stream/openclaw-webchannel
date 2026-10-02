@@ -199,8 +199,8 @@ export const MAX_OUTSTANDING_HISTORY_PAGES = 9;
  *    never calls `getDifference` before it holds a `pts`. The FIRST seq this
  *    client observes — the snapshot's `highWaterSeq` (`getState`, the normal
  *    case) or, if a durable frame beats it, that frame's own seq — becomes the
- *    baseline, and the frame that carried it folds. A byte-incomplete snapshot
- *    explicitly cannot seed that baseline; it recovers from zero instead.
+ *    baseline, and the frame that carried it folds. Byte fitting limits the
+ *    historical window, never the authority of that snapshot baseline (#413).
  *
  *    ⚠️ ADOPTING THE FIRST OBSERVATION IS THE POINT, AND WAITING FOR THE SNAPSHOT
  *    WOULD BE A WORSE BUG THAN THE ONE THIS FIXES. `lastAppliedSeq` used to start
@@ -3381,10 +3381,11 @@ export class WebChannelNATSClient {
   // register-time `history` snapshot's `highWaterSeq` arrives, and Telegram's app
   // asks for nothing before then. See `SeqCursor` for the states and the rules.
   private cursor: SeqCursor = { state: "unseeded" };
-  private readonly rowVersions = new DurableRowVersions();
+  private rowVersions = new DurableRowVersions();
+  private journalEpoch: string | undefined;
+  private readonly retiredJournalEpochs = new Set<string>();
   private frameSeq: number | undefined;
   private observedHistoryHighWater = 0;
-  private historyBaselineEstablished = false;
   private pendingHistorySnapshots: InboundMessage[] = [];
   /**
    * #401 — this device's outstanding `load_history` nonces, oldest first. A page
@@ -3398,9 +3399,8 @@ export class WebChannelNATSClient {
    * stale slot can only ever match its own echo, never another device's page.
    */
   private historyPageNonces: string[] = [];
-  // Only a first, explicitly incomplete snapshot needs reconstruction from
-  // zero. The ordinary view keeps live content/receipts while this canonical
-  // replay supplies the missing prefix's order, including seal reordering.
+  // A genuine retained gap starting at zero can reconstruct canonical order.
+  // Cold snapshots never open that gap merely because their window was trimmed.
   private recoveringHistoryOrder: DurableView | undefined;
 
   private applyVersionedDurable(view: DurableView, event: DurableEvent, floor = 0): DurableView {
@@ -3756,23 +3756,81 @@ export class WebChannelNATSClient {
   // Message handling
   // ---------------------------------------------------------------------------
 
+  /** Epoch belongs to the journal, not the transport session or numeric cursor. */
+  private observeJournalEpoch(msg: InboundMessage): "ignore" | "current" | "recover" {
+    if (msg.epoch === undefined) return this.journalEpoch === undefined ? "current" : "ignore";
+    if (this.retiredJournalEpochs.has(msg.epoch)) return "ignore";
+    // Correlation precedes epoch adoption: shared-subject replies to another
+    // device (or an earlier request) cannot invalidate this device's cache.
+    if (msg.type === "difference" && (this.cursor.state !== "catching-up"
+      || msg.nonce !== this.cursor.nonce || msg.afterSeq !== this.cursor.afterSeq)) return "ignore";
+    if (msg.type === "history" && msg.highWaterSeq === undefined
+      && (msg.nonce === undefined || !this.historyPageNonces.includes(msg.nonce))
+      && msg.epoch !== this.journalEpoch) return "ignore";
+    if (msg.epoch === this.journalEpoch) return "current";
+    const prior = this.journalEpoch;
+    this.journalEpoch = msg.epoch;
+    if (prior === undefined && this.cursor.state === "unseeded") return "current";
+    if (prior !== undefined) this.retiredJournalEpochs.add(prior);
+
+    // Keep unpublished/unconfirmed local sends and their receipt linkage. A new
+    // epoch's ACK may be the very first frame, before its snapshot/broadcast.
+    const pendingReceipts = new Set(this.randomIdToReceiptKey.values());
+    const messages = this.state.messages.filter(row => row.kind === undefined && row.role === "user"
+      && (row.pending || (row.receiptKey !== undefined && pendingReceipts.has(row.receiptKey))));
+    const wires = new Set(messages.flatMap(row => row.wireId ? [row.wireId] : []));
+    const lifecycle = ++this.wrapperLifecycleGeneration;
+    this.resetCursorForConnection();
+    this.cursor = { state: "unseeded" };
+    this.rowVersions = new DurableRowVersions();
+    this.frameSeq = undefined;
+    this.observedHistoryHighWater = 0;
+    this.pendingHistorySnapshots = [];
+    this.historyPageNonces = [];
+    this.recoveringHistoryOrder = undefined;
+    this.replayPlacementIds.clear();
+    this.activeReplayBuffers.clear();
+    this.clearStaleDraftWatch();
+    this.cancelActiveTurnStallTimer();
+    this.activeTurnRecoveryIssued = false;
+    this.convergedApplicationTurns.clear();
+    for (const id of this.applicationTurns.keys()) if (!wires.has(id)) this.applicationTurns.delete(id);
+    for (const id of this.openTurns) if (!wires.has(id)) this.openTurns.delete(id);
+    this.typingLocalCandidates = new Set();
+    this.deferredCancelledTyping = undefined;
+    this.setState({ messages, historyOmissions: [], isTyping: false, turnActive: this.openTurns.size > 0 });
+    if (this.wrapperLifecycleGeneration !== lifecycle) return "ignore";
+    // A snapshot already supplies the new baseline. A live frame or a reply to
+    // an old floor needs the register path to obtain the new journal's window.
+    return msg.type === "history" && msg.highWaterSeq !== undefined ? "current" : "recover";
+  }
+
   private handleMessage(msg: InboundMessage): void {
-    if (msg.type === "typing" && msg.keepalive === true) {
-      // Protocol 7 renewals are activity only. In particular they must not
-      // re-arm typing/input holds or consume a deferred cancellation decision.
-      const lifecycle = this.wrapperLifecycleGeneration;
-      const preFrameLiveTurn = this.turnInFlight();
-      this.observeActiveTurnActivity(msg);
-      if (this.wrapperLifecycleGeneration === lifecycle) {
-        this.observeHeldTurnActivity(msg, preFrameLiveTurn);
+    const epochAction = this.observeJournalEpoch(msg);
+    if (epochAction === "ignore") return;
+    const epochLifecycle = this.wrapperLifecycleGeneration;
+    try {
+      if (msg.type === "typing" && msg.keepalive === true) {
+        // Protocol 7 renewals are activity only. In particular they must not
+        // re-arm typing/input holds or consume a deferred cancellation decision.
+        const lifecycle = this.wrapperLifecycleGeneration;
+        const preFrameLiveTurn = this.turnInFlight();
+        this.observeActiveTurnActivity(msg);
+        if (this.wrapperLifecycleGeneration === lifecycle) {
+          this.observeHeldTurnActivity(msg, preFrameLiveTurn);
+        }
+        return;
       }
-      return;
-    }
-    this.cancellationReconciliationDepth++;
-    try { this.handleInboundMessage(msg); }
-    finally {
-      this.cancellationReconciliationDepth--;
-      this.reconcileCancelledTyping();
+      this.cancellationReconciliationDepth++;
+      try { this.handleInboundMessage(msg); }
+      finally {
+        this.cancellationReconciliationDepth--;
+        this.reconcileCancelledTyping();
+      }
+    } finally {
+      if (epochAction === "recover" && this.wrapperLifecycleGeneration === epochLifecycle) {
+        this.client.requestApplicationRecovery();
+      }
     }
   }
 
@@ -3882,26 +3940,6 @@ export class WebChannelNATSClient {
     if (msg.type === "history" && isWireSeq(msg.highWaterSeq)) {
       const cursor = this.cursor;
       this.observedHistoryHighWater = Math.max(this.observedHistoryHighWater, msg.highWaterSeq);
-      if (!this.historyBaselineEstablished && this.recoveringHistoryOrder === undefined
-        && msg.snapshotComplete === false) {
-        // A live frame can seed the cursor before the first snapshot. That
-        // observation proves no historical prefix, even if it is newer than
-        // this byte-trimmed snapshot or already opened an ordinary catch-up.
-        const last = cursor.state === "unseeded" ? 0
-          : cursor.state === "synced" ? cursor.last : cursor.afterSeq;
-        this.observedHistoryHighWater = Math.max(this.observedHistoryHighWater, last);
-        this.pendingHistorySnapshots.push(msg);
-        this.recoveringHistoryOrder = [];
-        if (cursor.state === "catching-up") this.clearCatchUpTimer(cursor);
-        this.openCatchUp(0, cursor.state === "catching-up" ? cursor.buffer : []);
-        return;
-      }
-      if (msg.snapshotComplete !== false && this.recoveringHistoryOrder === undefined) {
-        // This complete prefix may await catch-up, but is retained with the
-        // view even across reconnect. A later trimmed snapshot need not restart
-        // its already-established baseline from zero.
-        this.historyBaselineEstablished = true;
-      }
       if (cursor.state === "catching-up") {
         this.pendingHistorySnapshots.push(msg);
         return;
@@ -4117,7 +4155,6 @@ export class WebChannelNATSClient {
       after.last = seq;
       if (this.recoveringHistoryOrder !== undefined && seq >= this.observedHistoryHighWater) {
         this.recoveringHistoryOrder = undefined;
-        this.historyBaselineEstablished = true;
       }
     }
   }
@@ -4140,6 +4177,7 @@ export class WebChannelNATSClient {
    * nothing gets an unbounded fresh budget every round-trip.
    */
   private openCatchUp(afterSeq: number, buffer: InboundMessage[]): void {
+    if (afterSeq === 0 && this.recoveringHistoryOrder === undefined) this.recoveringHistoryOrder = [];
     const cursor: CatchingUpCursor = {
       state: "catching-up",
       afterSeq,
@@ -4192,7 +4230,6 @@ export class WebChannelNATSClient {
     if (carried !== undefined && last >= this.observedHistoryHighWater
       && this.recoveringHistoryOrder !== undefined) {
       this.recoveringHistoryOrder = undefined;
-      this.historyBaselineEstablished = true;
     }
     const lifecycle = this.wrapperLifecycleGeneration;
     this.hydratePendingHistory();
@@ -4933,6 +4970,7 @@ export class WebChannelNATSClient {
       }
     }
     if (!foldRows) return;
+    const supplied = new Map<string, number>();
     const existing = this.state.messages;
     const indexes = new Map(existing.map((row, i) => [transcriptEntryKey(row), i]));
     let view = this.durableProjection();
@@ -4971,6 +5009,7 @@ export class WebChannelNATSClient {
       const decoded = decodeDurableEvent(raw);
       if (!decoded.ok) continue;
       const key = transcriptEntryKey({ ...row, kind: row.kind } as KeyedTranscriptEntry);
+      if (row.seq !== undefined) supplied.set(key, row.seq);
       if (seen.has(key)) continue;
       seen.add(key);
       const index = indexes.get(key);
@@ -5018,7 +5057,15 @@ export class WebChannelNATSClient {
       }
       changed ||= view !== before || placeholder || timestamps.has(key);
     }
-    if (!changed) return;
+    const historyOmissions = msg.highWaterSeq !== undefined ? msg.omitted ?? []
+      : this.state.historyOmissions?.filter(row => {
+        const seq = supplied.get(transcriptEntryKey(row as KeyedTranscriptEntry));
+        return seq === undefined || (row.seq !== undefined && seq < row.seq);
+      });
+    if (!changed) {
+      if (historyOmissions !== undefined) this.setState({ historyOmissions });
+      return;
+    }
     const folded = this.mergeDurable(existing, view, local).map((row) => {
       const ts = timestamps.get(transcriptEntryKey(row));
       let next = ts === undefined ? row : { ...row, ts };
@@ -5039,7 +5086,7 @@ export class WebChannelNATSClient {
         if (row !== undefined) messages.push(row);
       }
     }
-    this.setState({ messages });
+    this.setState({ messages, ...(historyOmissions !== undefined ? { historyOmissions } : {}) });
   }
 
   /**

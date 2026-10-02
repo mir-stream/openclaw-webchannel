@@ -387,8 +387,12 @@ export type InboundMessage = {
   seq?: number;
   /** #244 half A — see `seq`. */
   highWaterSeq?: number;
+  /** Journal instance identity. Sequence numbers and server IDs are scoped to it. */
+  epoch?: string;
   /** False when byte fitting omitted requested snapshot content. */
   snapshotComplete?: boolean;
+  /** #413: byte-omitted row identities, independent of the snapshot baseline. */
+  omitted?: import("./types.js").HistoryOmission[];
   /**
    * #245 Part B: on a `user_committed` frame, the client-minted idempotency
    * `random_id` of the send this echoes — the origin device's reconciliation key

@@ -70,6 +70,58 @@ function setup(limit = 1_000_000) {
 }
 
 describe("history producer → sealed frame → browser decoder → wrapper", () => {
+  it("#414: stamps the journal epoch on snapshots, differences, ACKs and live frames", () => {
+    const h = setup();
+    expect(h.journal.epoch).toEqual(expect.any(String));
+    expect(h.journal.epoch!.length).toBeGreaterThan(0);
+    h.snapshot();
+    const baseline = h.decode(h.transport.frames[0]!);
+    expect(baseline).toMatchObject({ epoch: h.journal.epoch, highWaterSeq: 0 });
+    h.deliver();
+    const user = h.journal.appendInboundUser("peer", { text: "question", randomId: "random" });
+    h.channel.sendAck("peer", ["wire"], [{ random_id: "random", messageId: user.messageId, seq: user.seq }]);
+    h.channel.sendUserCommitted("peer", { id: user.messageId, text: "question", seq: user.seq, random_id: "random" });
+    h.channel.sendText("peer", "answer", "answer");
+    expect(h.transport.frames.map(frame => h.decode(frame).epoch)).toEqual(Array(3).fill(h.journal.epoch));
+    h.transport.frames.length = 0;
+    h.server.serveDifference("peer", 0, "nonce");
+    while (h.queue.length) h.queue.shift()!();
+    expect(h.decode(h.transport.frames[0]!)).toMatchObject({ epoch: h.journal.epoch,
+      type: "difference", afterSeq: 0, nonce: "nonce", maxSeq: 2 });
+  });
+  it("#413: incomplete cold snapshots do linear storage work and never replay the journal", () => {
+    const costs: number[] = [];
+    for (const count of [2000, 4000]) {
+      const h = setup(20_000);
+      for (let i = 1; i <= count; i++) {
+        h.journal.append("peer", { kind: "bubble", answerId: `a${i}`,
+          text: i === count - 1 ? "x".repeat(30_000) : `answer ${i}` });
+      }
+      h.snapshot();
+      const snapshot = h.decode(h.transport.frames[0]!);
+      expect(snapshot.snapshotComplete).toBe(false);
+      h.deliver();
+      expect(h.inner.cursor).toMatchObject({ state: "synced", last: count });
+      expect(h.queue).toEqual([]);
+      expect(h.wrapper.getState().messages).toHaveLength(49);
+      expect(h.wrapper.getState().historyOmissions).toEqual([{ id: `a${count - 1}`, seq: count - 1 }]);
+      expect(h.channel.sendText("peer", "live", "live")).toBe(true);
+      h.deliver();
+      expect(h.wrapper.getState().messages.at(-1)).toMatchObject({ id: "live", text: "live" });
+      expect(h.inner.cursor.last).toBe(count + 1);
+      const sum = (key: keyof HistoryWork) => h.work.reduce((n, w) => n + w[key], 0);
+      expect(sum("rawEventsApplied")).toBe(count);
+      expect(sum("pageRowsRead")).toBe(50);
+      costs.push(sum("rawEventsRead") + sum("materializedRowsRead") + sum("materializedRowsWritten"));
+      h.work.length = 0;
+      h.snapshot(); h.deliver();
+      expect(sum("rawEventsRead")).toBe(1); // Only the new live row needs materialization.
+      expect(h.queue).toEqual([]);
+    }
+    // Structural work, not a noisy wall-clock threshold: doubling rows doubles
+    // cold materialization; browser hydration remains one bounded window.
+    expect(costs[1]).toBeLessThanOrEqual(costs[0]! * 2 + 10);
+  });
   it("keeps absent seal removals hidden even when a later journal retry names the ID", () => {
     const h = setup();
     h.journal.append("peer", { kind: "seal", turnId: "t", answers: [], remove: ["unseen"] });
@@ -164,9 +216,17 @@ describe("history producer → sealed frame → browser decoder → wrapper", ()
     expect(snapshot.snapshotComplete).toBe(false);
     expect(snapshot.messages!.length).toBeLessThan(8);
     h.deliver();
-    expect(h.inner.cursor.afterSeq).toBe(0);
-    expect(h.wrapper.getState().messages).toEqual([]);
-    for (let requests = 0; h.queue.length && requests < 10; requests++) { h.queue.shift()!(); h.deliver(); }
+    expect(h.inner.cursor.last).toBe(8);
+    expect(h.wrapper.getState().messages).toHaveLength(snapshot.messages!.length);
+    expect(h.queue).toEqual([]);
+    const internals = h.wrapper as unknown as { mintHistoryPageNonce(): string };
+    for (let pages = 0; h.wrapper.getState().messages[0]?.id !== "a1" && pages < 8; pages++) {
+      h.server.servePage("peer", { before: h.wrapper.getState().messages[0]!.id,
+        nonce: internals.mintHistoryPageNonce() });
+      while (h.queue.length) h.queue.shift()!();
+      h.deliver();
+    }
+    expect(h.wrapper.getState().historyOmissions).toEqual([]);
     expect(h.inner.cursor.last).toBe(8);
     expect(h.work.some(w => w.pageRowsRead > 0)).toBe(true);
     expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(Array.from({ length: 8 }, (_, i) => `a${i + 1}`));

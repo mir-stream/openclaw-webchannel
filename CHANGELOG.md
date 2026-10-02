@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Breaking (unreleased wire protocol v7)
+
+- **Journal identity and bounded cold synchronization (#413/#414).** Protocol
+  stays **7**, alongside scoped stop, history-page correlation and typing
+  keepalive. Deploy client and plugin together. `epoch` now accompanies
+  snapshots, differences and live frames/ACKs. A changed epoch discards the
+  prior view/cursor/version fences before adopting server IDs that may repeat.
+  Normal restarts preserve the epoch; existing journals gain one without
+  rewriting rows. Renew it when restoring a backup; see
+  [the upgrade and restore procedure](docs/GAP_SYNC.md).
+- **Incomplete cold snapshots seed their high-water.** `history.omitted`
+  carries the byte-omitted row identities and the client exposes
+  `state.historyOmissions`. Old trimmed rows remain pageable. One unsendable
+  row no longer triggers full-journal replay or holds later live frames.
+  Warm differences and the existing individually oversized-row skip policy
+  remain in force; this does not implement #325 body chunking or #299 retention.
+
 ### Changed
 
 - **Case-distinct JWT peers now have distinct core sessions (#372).** Raw peer
