@@ -212,4 +212,15 @@ describe("approval decision reverse path", () => {
     );
     warnSpy.mockRestore();
   });
+
+  it("#400: publishes a refused decision back to the peer's .out, decision echoed, unsequenced", () => {
+    const transport = new RecordingTransport();
+    const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant");
+    expect(channel.sendApprovalDecisionRejected("peer-0", "exec-1", "allow-once", "not-approver")).toBe(true);
+    expect(transport.published).toHaveLength(1);
+    expect(transport.published[0].subject).toBe("webchannel.tenant.acct.peer-0.out");
+    expect(JSON.parse(transport.published[0].payload)).toEqual({
+      type: "approval_decision_rejected", id: "exec-1", decision: "allow-once", reason: "not-approver",
+    });
+  });
 });

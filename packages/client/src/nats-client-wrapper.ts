@@ -567,11 +567,47 @@ function markApprovalActionable(messages: ChatMessage[], id: string): ChatMessag
 function markApprovalConfirmed(messages: ChatMessage[], id: string): ChatMessage[] {
   let changed = false;
   const next = messages.map((m) => {
-    if (m.kind !== "approval" || m.id !== id || m.resolutionConfirmed === true) return m;
+    if (m.kind !== "approval" || m.id !== id) return m;
+    const settled = settleApprovalFromServer(m);
+    if (settled === m) return m;
     changed = true;
-    return { ...m, resolutionConfirmed: true };
+    return settled;
   });
   return changed ? next : messages;
+}
+
+/**
+ * #400: the client-local half of ANY server-sourced decision — the live
+ * `approval_resolved` frame, a difference `approvalResolution`, a `history`
+ * row's resolved decision, or a snapshot `resolved` entry. Confirms the card
+ * and clears what a `not-pending` refusal (or Leg B) left behind: the
+ * `resolvedElsewhere` sentinel and `decisionRejectedReason`.
+ *
+ * A refusal frame is unsequenced, so it can overtake a resolution still held
+ * for catch-up; without this, the verdict would land on a card still saying
+ * "not applied". `decision`, when given, is written too (the snapshot path
+ * carries the verdict itself; the others fold it through the reducer).
+ *
+ * Returns the entry by reference when nothing changes.
+ */
+function settleApprovalFromServer(
+  m: ChatApprovalMessage,
+  decision?: ApprovalDecision,
+): ChatApprovalMessage {
+  if (
+    m.resolutionConfirmed === true &&
+    m.resolvedElsewhere === undefined &&
+    m.decisionRejectedReason === undefined &&
+    (decision === undefined || m.resolvedDecision === decision)
+  ) {
+    return m;
+  }
+  const { resolvedElsewhere: _elsewhere, decisionRejectedReason: _refused, ...card } = m;
+  return {
+    ...card,
+    ...(decision !== undefined ? { resolvedDecision: decision } : {}),
+    resolutionConfirmed: true,
+  };
 }
 
 function deriveApprovals(messages: readonly ChatMessage[]): ApprovalRequest[] {
@@ -595,6 +631,9 @@ function deriveApprovals(messages: readonly ChatMessage[]): ApprovalRequest[] {
       ...(resolvedDecision !== undefined ? { resolvedDecision } : {}),
       ...(m.resolutionConfirmed !== undefined
         ? { resolutionConfirmed: m.resolutionConfirmed }
+        : {}),
+      ...(m.decisionRejectedReason !== undefined
+        ? { decisionRejectedReason: m.decisionRejectedReason }
         : {}),
       actionable: isActionableApproval(m),
     });
@@ -2742,7 +2781,9 @@ export class WebChannelNATSClient {
     const next = this.state.messages.map((m) => {
       if (m.kind !== "approval" || m.id !== id) return m;
       changed = true;
-      return { ...m, resolvedDecision: decision };
+      // #400: a new click supersedes the previous click's refusal.
+      const { decisionRejectedReason: _refused, ...card } = m;
+      return { ...card, resolvedDecision: decision };
     });
     return changed ? next : this.state.messages;
   }
@@ -3118,6 +3159,9 @@ export class WebChannelNATSClient {
         }
         if (prevApproval?.resolvedElsewhere !== undefined) {
           nextApproval.resolvedElsewhere = prevApproval.resolvedElsewhere;
+        }
+        if (prevApproval?.decisionRejectedReason !== undefined) {
+          nextApproval.decisionRejectedReason = prevApproval.decisionRejectedReason;
         }
         if (prevApproval?.ts !== undefined) nextApproval.ts = prevApproval.ts;
         out.push(
@@ -4682,6 +4726,22 @@ export class WebChannelNATSClient {
         this.foldUserEvent(event);
         return;
       }
+      case "approvalResolution": {
+        // #400: a server-sourced decision, like the live `approval_resolved`
+        // frame and a `history` row — so it is CONFIRMED, which is what keeps
+        // the snapshot reconciler from reading it as an unconfirmed guess.
+        // Only when the card now shows THAT verdict: a version-fenced event
+        // leaves whatever the card held, and a different guess must not be
+        // confirmed by proxy.
+        this.applyDurable(event);
+        const held = this.state.messages.find(
+          (m): m is ChatApprovalMessage => m.kind === "approval" && m.id === event.id,
+        );
+        if (held?.resolvedDecision === event.decision) {
+          this.setState({ messages: markApprovalConfirmed(this.state.messages, event.id) });
+        }
+        return;
+      }
       default:
         this.applyDurable(event);
     }
@@ -4888,7 +4948,7 @@ export class WebChannelNATSClient {
       const ts = timestamps.get(transcriptEntryKey(row));
       let next = ts === undefined ? row : { ...row, ts };
       if (row.kind === "approval" && resolved.has(row.id)) {
-        next = { ...next, resolutionConfirmed: true } as ChatApprovalMessage;
+        next = settleApprovalFromServer(next as ChatApprovalMessage);
       }
       return next;
     });
@@ -5077,6 +5137,37 @@ export class WebChannelNATSClient {
         return true;
       }
 
+      case "approval_decision_rejected": {
+        // #400: the plugin refused a decision before it reached the gateway —
+        // the server owns the outcome, so the optimistic mark is undone. The
+        // frame rides the peer's shared `.out`, so it touches ONLY a card still
+        // showing THIS decision as an unconfirmed guess: a device that did not
+        // click holds no guess, and a server-confirmed card is never reopened.
+        //
+        // `not-pending` is Telegram's "no longer pending" terminal receipt: the
+        // card leaves the actionable set with an unknown outcome (a later
+        // `approval_resolved` still writes the real decision over it). Every
+        // other reason — `not-approver`, or one this build
+        // does not know — restores the pre-click card, buttons included, like
+        // Telegram leaving the keyboard on an unauthorized callback.
+        const id = msg.id ?? "";
+        const decision = msg.decision;
+        const reason = msg.reason ?? "";
+        if (id.length === 0 || !isApprovalDecision(decision) || reason.length === 0) return false;
+        let changed = false;
+        const next = this.state.messages.map((m) => {
+          if (m.kind !== "approval" || m.id !== id) return m;
+          if (m.resolutionConfirmed === true || m.resolvedDecision !== decision) return m;
+          changed = true;
+          const { resolvedDecision: _guess, ...card } = m;
+          return reason === "not-pending"
+            ? { ...card, resolvedElsewhere: true, resolutionConfirmed: true, decisionRejectedReason: reason }
+            : { ...card, decisionRejectedReason: reason };
+        });
+        if (changed) this.setState({ messages: next });
+        return true;
+      }
+
       case "approval_snapshot": {
         // Authoritative pending-approval reconciliation (#15). The snapshot is
         // the account's COMPLETE still-pending set for this peer at publish time;
@@ -5217,24 +5308,42 @@ export class WebChannelNATSClient {
             const outcome = resolvedById.get(m.id);
             next.push(
               outcome !== undefined
-                ? { ...m, resolvedDecision: outcome, resolutionConfirmed: true }
+                ? settleApprovalFromServer(m, outcome)
                 : { ...m, resolvedElsewhere: true, resolutionConfirmed: true },
             );
             changed = true;
           } else if (m.resolutionConfirmed !== true) {
-            // Optimistic decision the server no longer has pending — our decision
-            // (or another device's) won. #19: if the snapshot's resolved outcome
-            // DIFFERS from our optimistic guess, the SERVER decision wins;
-            // otherwise just confirm what we already showed.
+            // Optimistic decision the server no longer has pending. #19: the
+            // snapshot's resolved outcome, when it carries one, is the SERVER's
+            // decision and wins over our guess.
+            //
+            // #400: when it carries NONE, the guess is NOT confirmed. Absence
+            // from both lists proves only "no longer pending here" — a plugin
+            // restart, the 60-min TTL or the 512 cap drops a card the click
+            // never resolved (a refused or lost decision included). So the
+            // guess is dropped and the card lands on Leg B's "unknown" sentinel.
+            // Every server-sourced decision (live frame, history row,
+            // difference event) is already confirmed, so the only
+            // `resolvedDecision` reaching this branch is a guess.
             const outcome = resolvedById.get(m.id);
-            next.push(
-              outcome !== undefined && outcome !== m.resolvedDecision
-                ? { ...m, resolvedDecision: outcome, resolutionConfirmed: true }
-                : { ...m, resolutionConfirmed: true },
-            );
+            if (outcome !== undefined) {
+              next.push(settleApprovalFromServer(m, outcome));
+            } else {
+              const { resolvedDecision: _guess, ...card } = m;
+              next.push({ ...card, resolvedElsewhere: true, resolutionConfirmed: true });
+            }
             changed = true;
           } else {
-            next.push(m);
+            // Confirmed already. #400: a card retired as "unknown" (Leg B or a
+            // `not-pending` refusal) is upgraded when the snapshot now names
+            // the verdict; any other confirmed card is left as it is.
+            const outcome = resolvedById.get(m.id);
+            const settled =
+              outcome !== undefined && m.resolvedElsewhere === true
+                ? settleApprovalFromServer(m, outcome)
+                : m;
+            if (settled !== m) changed = true;
+            next.push(settled);
           }
         }
 

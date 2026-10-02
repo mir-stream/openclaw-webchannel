@@ -710,6 +710,10 @@ export function journalEventForOutbound(
       // Transport control (backpressure), not a message. The user message it
       // refers to was never accepted, so nothing durable exists to record.
       return null;
+    case "approval_decision_rejected":
+      // #400: one click's fate, not a transcript change. The card's durable
+      // state is untouched — nothing was resolved.
+      return null;
     default: {
       // Exhaustiveness gate: a new `OutboundWsMessage` variant fails to compile
       // here instead of being silently dropped from the durable stream.

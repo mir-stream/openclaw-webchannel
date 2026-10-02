@@ -1982,13 +1982,155 @@ describe("WebChannelNATSClient — approval_snapshot reconciliation (#15)", () =
     expect(a.resolvedDecision).toBe("allow-once"); // card stays resolved
     expect(a.resolutionConfirmed).toBeFalsy(); // still unconfirmed → retries next register
 
-    // Now the server has it resolved: a1 is ABSENT → confirm, do NOT re-send.
+    // Now a1 is ABSENT from both lists → do NOT re-send. #400: and do NOT
+    // confirm the guess either — absence is not the server naming a verdict.
     spy.mockClear();
     deliver(w, snapshotFrame([]));
     expect(spy).not.toHaveBeenCalled();
     const after = w.getState().approvals[0];
-    expect(after.resolvedDecision).toBe("allow-once");
+    expect(after.resolvedDecision).toBe("unknown");
     expect(after.resolutionConfirmed).toBe(true);
+  });
+
+  it("#400 probe: an allow-once the server never applied, gone from the snapshot, is NOT shown as confirmed", () => {
+    // The audit probe: the click's frame was refused or lost, then the card fell
+    // out of the server's stores (plugin restart / 60-min TTL / 512 cap). The
+    // snapshot names it in NEITHER list — the guess must not become the outcome.
+    const w = makeWrapper();
+    deliver(w, requestFrame("a1"));
+    w.decide("a1", "allow-once");
+    deliver(w, snapshotFrame([], [{ id: "other", decision: "deny" }]));
+    const a = w.getState().approvals[0];
+    expect(a.resolvedDecision).toBe("unknown");
+    expect(a.resolutionConfirmed).toBe(true);
+    expect(a.actionable).toBe(false);
+    // The guess is gone from the transcript entry too, so the next unrelated
+    // durable frame cannot re-project it.
+    deliver(w, { type: "agent_message", id: "m1", text: "later", turnId: "t1" });
+    expect(w.getState().approvals[0].resolvedDecision).toBe("unknown");
+  });
+
+  it("#400: a not-approver refusal undoes the optimistic mark, re-arms the card and exposes the reason", () => {
+    const w = makeWrapper();
+    const spy = spyDecision(w);
+    deliver(w, requestFrame("a1"));
+    w.decide("a1", "allow-once");
+    expect(w.getState().approvals[0].actionable).toBe(false);
+    deliver(w, {
+      type: "approval_decision_rejected", id: "a1", decision: "allow-once", reason: "not-approver",
+    });
+    const a = w.getState().approvals[0];
+    expect(a.resolvedDecision).toBeUndefined();
+    expect(a.resolutionConfirmed).toBeUndefined();
+    expect(a.actionable).toBe(true);
+    expect(a.decisionRejectedReason).toBe("not-approver");
+    // The client-local reason survives an unrelated durable frame…
+    deliver(w, { type: "agent_message", id: "m1", text: "later", turnId: "t1" });
+    expect(w.getState().approvals[0].decisionRejectedReason).toBe("not-approver");
+    // …and a new click supersedes it.
+    spy.mockClear();
+    w.decide("a1", "deny");
+    expect(spy).toHaveBeenCalledWith("a1", "deny");
+    const again = w.getState().approvals[0];
+    expect(again.resolvedDecision).toBe("deny");
+    expect(again.decisionRejectedReason).toBeUndefined();
+  });
+
+  it("#400: a not-pending refusal retires the card as 'unknown'; a later approval_resolved still writes the verdict", () => {
+    const w = makeWrapper();
+    deliver(w, requestFrame("a1"));
+    w.decide("a1", "deny");
+    deliver(w, { type: "approval_decision_rejected", id: "a1", decision: "deny", reason: "not-pending" });
+    const a = w.getState().approvals[0];
+    expect(a.resolvedDecision).toBe("unknown");
+    expect(a.resolutionConfirmed).toBe(true);
+    expect(a.actionable).toBe(false);
+    expect(a.decisionRejectedReason).toBe("not-pending");
+    deliver(w, { type: "approval_resolved", id: "a1", decision: "allow-once" });
+    expect(w.getState().approvals[0].resolvedDecision).toBe("allow-once");
+    // The server's verdict clears the refusal it overtook.
+    expect(w.getState().approvals[0].decisionRejectedReason).toBeUndefined();
+  });
+
+  it("#400: a snapshot naming the verdict also clears a not-pending refusal and upgrades its 'unknown'", () => {
+    const w = makeWrapper();
+    deliver(w, requestFrame("a1"));
+    w.decide("a1", "deny");
+    deliver(w, { type: "approval_decision_rejected", id: "a1", decision: "deny", reason: "not-pending" });
+    expect(w.getState().approvals[0].resolvedDecision).toBe("unknown");
+    deliver(w, snapshotFrame([], [{ id: "a1", decision: "deny" }]));
+    const a = w.getState().approvals[0];
+    expect(a.resolvedDecision).toBe("deny");
+    expect(a.resolutionConfirmed).toBe(true);
+    expect(a.decisionRejectedReason).toBeUndefined();
+  });
+
+  it("#400: a history row carrying the verdict clears a not-pending refusal", () => {
+    const w = makeWrapper();
+    deliver(w, requestFrame("a1"));
+    w.decide("a1", "deny");
+    deliver(w, { type: "approval_decision_rejected", id: "a1", decision: "deny", reason: "not-pending" });
+    deliver(w, {
+      type: "history",
+      messages: [{
+        kind: "approval", id: "a1", approvalKind: "exec", title: "Run", prompt: "cmd-a1",
+        options: [{ decision: "allow-once", label: "Allow", style: "success" }],
+        resolvedDecision: "deny", seq: 7,
+      }],
+    } as unknown as InboundMessage);
+    const a = w.getState().approvals[0];
+    expect(a.resolvedDecision).toBe("deny");
+    expect(a.resolutionConfirmed).toBe(true);
+    expect(a.decisionRejectedReason).toBeUndefined();
+  });
+
+  it("#400: a not-approver refusal is cleared by the snapshot's resolved verdict (another approver answered)", () => {
+    const w = makeWrapper();
+    deliver(w, requestFrame("a1"));
+    w.decide("a1", "allow-once");
+    deliver(w, { type: "approval_decision_rejected", id: "a1", decision: "allow-once", reason: "not-approver" });
+    deliver(w, snapshotFrame([], [{ id: "a1", decision: "deny" }]));
+    const a = w.getState().approvals[0];
+    expect(a.resolvedDecision).toBe("deny");
+    expect(a.decisionRejectedReason).toBeUndefined();
+  });
+
+  it("#400: an unknown refusal reason from a newer plugin is the generic undo", () => {
+    const w = makeWrapper();
+    deliver(w, requestFrame("a1"));
+    w.decide("a1", "allow-once");
+    deliver(w, { type: "approval_decision_rejected", id: "a1", decision: "allow-once", reason: "rate-limited" });
+    const a = w.getState().approvals[0];
+    expect(a.resolvedDecision).toBeUndefined();
+    expect(a.actionable).toBe(true);
+    expect(a.decisionRejectedReason).toBe("rate-limited");
+  });
+
+  it("#400: a refusal touches only a card still showing THAT decision as an unconfirmed guess", () => {
+    // The frame rides the peer's shared `.out`, so every device of the peer
+    // receives it. A device that did not click, a card holding a different
+    // guess, and a server-confirmed card are all left exactly as they were.
+    const untouched = makeWrapper();
+    deliver(untouched, requestFrame("a1"));
+    const before = untouched.getState();
+    deliver(untouched, { type: "approval_decision_rejected", id: "a1", decision: "deny", reason: "not-pending" });
+    expect(untouched.getState()).toBe(before);
+
+    const otherGuess = makeWrapper();
+    deliver(otherGuess, requestFrame("a1"));
+    otherGuess.decide("a1", "allow-once");
+    const guessed = otherGuess.getState();
+    deliver(otherGuess, { type: "approval_decision_rejected", id: "a1", decision: "deny", reason: "not-approver" });
+    expect(otherGuess.getState()).toBe(guessed);
+
+    const confirmed = makeWrapper();
+    deliver(confirmed, requestFrame("a1"));
+    confirmed.decide("a1", "deny");
+    deliver(confirmed, { type: "approval_resolved", id: "a1", decision: "deny" });
+    const settled = confirmed.getState();
+    deliver(confirmed, { type: "approval_decision_rejected", id: "a1", decision: "deny", reason: "not-pending" });
+    expect(confirmed.getState()).toBe(settled);
+    expect(confirmed.getState().approvals[0].resolvedDecision).toBe("deny");
   });
 
   it("a server-confirmed resolution present in the snapshot does NOT re-send a decision (guards the Leg C gate)", () => {

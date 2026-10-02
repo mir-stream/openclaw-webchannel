@@ -84,9 +84,9 @@ Telegram Bot API/MTProto 계약을 그대로 따르는 것이다.
 | | |
 | --- | --- |
 | Telegram | 승인 권한이 없는 sender가 승인 버튼을 누르면 서버 로그만 남긴다. 사용자에게는 사유를 보여 주지 않고 버튼을 그대로 둔다(`extensions/telegram/src/approval-*.ts`, callback query 처리). |
-| WebChannel 목표 결정 | 플러그인이 결정을 거부하면 비영속 프레임 `approval_decision_rejected {id, decision, reason}`을 보낸다. 사유는 `not-approver`와 `not-pending`이다. 다른 계정의 승인을 replay한 경우도 `not-approver`로 합쳐, 그 승인이 다른 계정에 살아 있다는 사실을 드러내지 않는다. 클라이언트는 자기 미확정 추측인 카드만 되돌리고 사유를 표시한다. |
-| 의도 | 승인 결과는 서버가 확정하는 사실이고, 우리는 앱도 함께 만든다(TD-3과 같은 원칙). 사유 없이 버튼만 남으면 사용자는 결정이 적용됐는지 알 수 없다. 대신 노출하는 정보는 최소로 줄였다. |
-| 결정 | 2026-10-01, 프로젝트 오너 |
+| WebChannel 목표 결정 | 플러그인이 결정을 거부하면 비영속 프레임 `approval_decision_rejected {id, decision, reason}`을 보낸다. 사유는 `not-approver`와 `not-pending`이다. 같은 계정에 살아 있는 승인을 권한 없는 sender가 결정하면 `not-approver`로 응답한다. 다른 계정에 살아 있는 승인 ID는 없거나 종료된 ID와 같이 `not-pending`으로 응답한다. 클라이언트는 자기 미확정 추측인 카드만 되돌리고 사유를 표시한다. |
+| 의도 | 승인 결과는 서버가 확정하는 사실이고, 우리는 앱도 함께 만든다(TD-3과 같은 원칙). 사유 없이 버튼만 남으면 사용자는 결정이 적용됐는지 알 수 없다. 같은 계정 안에서는 권한 문제를 알려 주되, 다른 계정의 승인 ID가 현재 살아 있는지는 없는 ID나 종료된 ID와 구별할 수 없게 해 노출 정보를 최소화한다. |
+| 결정 | 2026-10-01, 프로젝트 오너. 2026-10-02, 프로젝트 오너 정정: 최초 결정의 cross-account `not-approver` 합침을 `not-pending` 합침으로 바꿨다. |
 | 재검토 | 사유 노출이 권한 구조 탐색에 쓰일 수 있다는 근거가 생길 때. |
-| 구현 상태 (2026-10-02) | 거부 프레임 구현은 PR #421에서 대기 중이다. |
+| 구현 상태 (2026-10-02) | 거부 프레임과 정정된 cross-account 사유 매핑은 PR #421에서 구현 중이다. 아직 `develop`에 병합되지 않았다. |
 | 관련 | #400, [PR #421](https://github.com/mir-stream/openclaw-webchannel/pull/421) |
