@@ -99,9 +99,9 @@ export async function runJwtRegister(
   const timeoutMs = opts.timeoutMs ?? 25000;
   const fetchImpl = deps.fetchImpl ?? fetch;
 
-  // 1. Device X25519 key → devicePublicKey (b64url raw 32B). Extractable so we
-  //    can export the raw public key; the server stamps it as cnf.jwk.
-  const x25519 = (await crypto.subtle.generateKey({ name: "X25519" }, true, [
+  // 1. Device X25519 key → devicePublicKey (b64url raw 32B). Only the public
+  //    half is exportable; the private key can derive the unwrap key in-page.
+  const x25519 = (await crypto.subtle.generateKey({ name: "X25519" }, false, [
     "deriveBits",
   ])) as CryptoKeyPair;
   const x25519Raw = await crypto.subtle.exportKey("raw", x25519.publicKey);
@@ -253,8 +253,9 @@ export async function runAllReal(
 ): Promise<{ replyText: string }> {
   const timeoutMs = opts.timeoutMs ?? 25000;
 
-  // 1. Device X25519 key → cnf.jwk (b64url raw 32B). Extractable to export raw pub.
-  const x25519 = (await crypto.subtle.generateKey({ name: "X25519" }, true, [
+  // 1. Device X25519 key → cnf.jwk (b64url raw 32B). Public halves stay
+  //    exportable even when the private key is non-extractable.
+  const x25519 = (await crypto.subtle.generateKey({ name: "X25519" }, false, [
     "deriveBits",
   ])) as CryptoKeyPair;
   const x25519Raw = await crypto.subtle.exportKey("raw", x25519.publicKey);
