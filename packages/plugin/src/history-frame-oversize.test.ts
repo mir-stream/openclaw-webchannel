@@ -201,9 +201,15 @@ function harness(opts: {
     // The REAL channel, wrapped only to observe the boolean `history-serve.ts`
     // discards. Every byte still goes through `NatsChannel.sendHistory`.
     channel: {
-      sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number, snapshotComplete?: boolean): boolean {
+      sendHistory(
+        peerId: string,
+        messages: HistoryMessage[],
+        highWaterSeq?: number,
+        snapshotComplete?: boolean,
+        nonce?: string,
+      ): boolean {
         servedFrames.push(messages);
-        const ok = channel.sendHistory(peerId, messages, highWaterSeq, snapshotComplete);
+        const ok = channel.sendHistory(peerId, messages, highWaterSeq, snapshotComplete, nonce);
         sendHistoryResults.push(ok);
         return ok;
       },

@@ -28,6 +28,7 @@ import { describe, it, expect } from "vitest";
 import { historyPageBefore } from "../../../packages/plugin/src/journal-history.js";
 import type { ProjectedHistoryMessage } from "../../../packages/plugin/src/history.js";
 import { WebChannelNATSClient } from "../../../packages/client/src/index.js";
+import { ownHistoryPage } from "../../../packages/client/src/history-page.test-harness.js";
 import type { ChatMessage } from "../../../packages/client/src/types.js";
 
 import { oldestHistoryCursor, HISTORY_PAGE_SIZE } from "./presentation.js";
@@ -121,7 +122,8 @@ function clickLoadOlder(
     cursor === undefined
       ? []
       : historyPageBefore(projection, cursor.id, WIDGET_LIMIT, cursor.turnId);
-  deliver(client, { type: "history", messages: page });
+  // #401: the page answers THIS device's request, so it echoes this device's nonce.
+  deliver(client, ownHistoryPage(client, { type: "history", messages: page }));
   return { cursor, page: page.map((m) => m.id) };
 }
 

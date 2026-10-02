@@ -465,6 +465,13 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
       if (complete !== undefined && typeof complete !== "boolean") {
         return invalid(known, "snapshotComplete must be a boolean");
       }
+      // #401: a page's correlation echo. Optional (a snapshot, or an older
+      // plugin's page, carries none); a present one must be a usable token, or
+      // the wrapper's match against its own outstanding nonces is meaningless.
+      const nonce = field(raw, "nonce");
+      if (nonce !== undefined && !isNonEmptyString(nonce)) {
+        return invalid(known, "nonce must be a non-empty string");
+      }
       for (const row of messages) {
         if (!isRecord(row)) continue;
         const rowSeq = field(row, "seq");

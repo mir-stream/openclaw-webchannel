@@ -26,6 +26,14 @@
  * supply no such proof. The exact-match gate requires the client/server change
  * together; this adds no capability negotiation or envelope/package version bump.
  *
+ * v7 (breaking, #401): `load_history.nonce`, echoed VERBATIM on the `history`
+ * page that answers it. A page rides the peer's shared `.out`, so every device
+ * receives it; a client folds a page only when it echoes its own nonce. A peer
+ * that ignores the echo prepends another device's page onto a different window
+ * and leaves a hole its own "load older" never reaches — the same failure the
+ * #356 `get_difference.nonce` echo exists for. The register snapshot is never
+ * correlated. Exact-match gate, no negotiation, no envelope/package bump.
+ *
  * When to bump (#160)
  * ───────────────────
  * Bumping is breaking for every deployment simultaneously: both sides reject a
@@ -46,6 +54,9 @@
  *    `difference` with `afterSeq`, plus `partial` and `maxSeq` — all four of
  *    which a peer must ACT on (ignore the echo and it folds another device's
  *    reply; ignore `partial` and it strands the rest of a sliced range).
+ *    v7 added the same correlation for the pager: #401's `load_history.nonce`,
+ *    echoed on the `history` page (ignore it and a device prepends another
+ *    device's page onto a different window — a permanent hole).
  *
  *    A v3 peer stays on the wire, looks healthy, and is wrong in two ways it
  *    cannot itself detect:
@@ -98,4 +109,4 @@
  * NOTE: this is a DIFFERENT layer from the E2E message-envelope version
  * (`ENVELOPE_VERSION` / `v:1`), which versions the encrypted payload format.
  */
-export const WEBCHANNEL_PROTOCOL_VERSION = 6;
+export const WEBCHANNEL_PROTOCOL_VERSION = 7;

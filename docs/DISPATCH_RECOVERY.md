@@ -201,7 +201,7 @@ Id-less legacy sends still execute, but have no durable dispatch recovery.
 The new dispatch schema rejects future versions before migrations; the history
 projection is rebuilt at version 2. Existing credential/key downgrade guards remain.
 Older binaries cannot enforce a lifecycle they do not understand: do not downgrade
-with pending work. Client and plugin must deploy together at protocol version 6.
+with pending work. Client and plugin must deploy together at protocol version 7.
 
 ## Evidence boundaries
 

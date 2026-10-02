@@ -227,6 +227,13 @@ describe("#246 half A — decodeInboundMessage: the bulk frames", () => {
     accepts({ type: "history", messages: [{ nonsense: true }] });
   });
 
+  it("#401 — a page's nonce echo is optional, and a present one must be usable", () => {
+    accepts({ type: "history", messages: [], nonce: "page-b" });
+    refuses({ type: "history", messages: [], nonce: "" });
+    refuses({ type: "history", messages: [], nonce: 7 });
+    refuses({ type: "history", messages: [], nonce: null });
+  });
+
   it("difference requires an events ARRAY and leaves each event to the fold", () => {
     const envelope = { afterSeq: 1, nonce: "n0", partial: false, maxSeq: 1 };
     refuses({ type: "difference", ...envelope, events: {} });
