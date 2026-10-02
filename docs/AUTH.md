@@ -131,6 +131,16 @@ unnecessary: the signed tenant claim and account-id `aud` binding distinguish
 token populations even when accounts share an issuer. JWKS outages fail closed
 but are retryable; invalid tokens are terminal rejects.
 
+Unknown kids share a single in-flight refresh and a 30-second cooldown across
+all kids. A failed refresh or one without the requested kid retains previously
+cached keys only until their original TTL expires. A known fresh key remains
+usable during that refresh; no expired key is used as an outage fallback.
+Malformed JWT segments and payloads are rejected before JWKS lookup (#408).
+
+SaaS base URLs require HTTPS, except HTTP on `localhost`, `127.0.0.0/8` or `::1`.
+There is no insecure transport bypass. Enrollment, derived JWKS URLs, preflight
+and doctor enforce this same rule (#411).
+
 The deprecated `auth.ticketParam` schema key remains accepted only so loading can
 produce a targeted migration error. Remove it and rerun
 `openclaw channels add --channel webchannel`.

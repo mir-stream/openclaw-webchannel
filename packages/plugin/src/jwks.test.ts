@@ -310,6 +310,63 @@ describe("JWKSCache input validation", () => {
   });
 });
 
+describe("JWKSCache hostile kid misses (#408)", () => {
+  const good = { keys: [{ kty: "RSA", kid: "known", n: "n", e: "AQAB" }] };
+
+  it("limits sequential random kids across a cooldown, then permits rotation", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    let document = good;
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(document)));
+    const cache = JWKSCache.create({ jwksUrl: "https://idp.test/jwks" }, { fetchImpl });
+    await cache.getKey("known");
+    for (let i = 0; i < 12; i++) {
+      await expect(cache.getKey(`random-${i}`)).rejects.toThrow(/not found/);
+    }
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    document = { keys: [...good.keys, { ...good.keys[0], kid: "rotated" }] };
+    now.mockReturnValue(31_000);
+    expect((await cache.getKey("rotated")).kid).toBe("rotated");
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it.each(["outage", "missing"])("preserves the fresh cache and its original TTL after a %s refresh", async (mode) => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(good)));
+    const cache = JWKSCache.create({ jwksUrl: "https://idp.test/jwks" }, { fetchImpl, ttlMs: 60_000 });
+    await cache.getKey("known");
+    fetchImpl.mockImplementation(async () => mode === "outage"
+      ? new Response("rate limited", { status: 429 })
+      : new Response(JSON.stringify({ keys: [] })));
+    now.mockReturnValue(20_000);
+    await expect(cache.getKey("random")).rejects.toThrow();
+    expect((await cache.getKey("known")).kid).toBe("known");
+    await expect(cache.getKey("another-random")).rejects.toThrow(/not found/);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    // Preserving a good document must never extend its original validity.
+    now.mockReturnValue(61_000);
+    await expect(cache.getKey("known")).rejects.toThrow();
+    expect(fetchImpl.mock.calls.length).toBeGreaterThan(2);
+  });
+
+  it("serves a known key while one hostile refresh is still in flight", async () => {
+    let finish!: (response: Response) => void;
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(good)));
+    const cache = JWKSCache.create({ jwksUrl: "https://idp.test/jwks" }, { fetchImpl });
+    await cache.getKey("known");
+    fetchImpl.mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    const miss = cache.getKey("random").catch(error => error);
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    let known: string | undefined;
+    const hit = cache.getKey("known").then(key => { known = key.kid; }).catch(() => {});
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const servedDuringRefresh = known;
+    finish(new Response("rate limited", { status: 429 }));
+    await Promise.all([miss, hit]);
+    expect(servedDuringRefresh).toBe("known");
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("JWKSCache TTL boundary", () => {
   it("still serves from cache at exactly ttlMs - 1 (no refetch)", async () => {
     const jwks = await mintRsaJwks("k1");

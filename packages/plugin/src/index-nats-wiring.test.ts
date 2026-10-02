@@ -62,6 +62,13 @@ describe("index-nats.ts wiring contract — typing gate (P0-6)", () => {
 });
 
 describe("index-nats.ts wiring contract — account-bound auth and startup", () => {
+  it("binds the issuer before dialing or opening conversation state (#412)", () => {
+    const binding = RUNTIME_SOURCE.indexOf("ensureStorageIssuer({");
+    expect(binding).toBeGreaterThan(RUNTIME_SOURCE.indexOf("accountAuth = prepareAccountAuth("));
+    expect(binding).toBeLessThan(RUNTIME_SOURCE.indexOf("consumeCredentialSource(source, {"));
+    expect(binding).toBeLessThan(RUNTIME_SOURCE.indexOf("const keyStore = new ConversationKeyStore({"));
+    expect(RUNTIME_SOURCE).toContain('"storage-issuer-failed"');
+  });
   it("validates the full credential document before verifier or connector use", () => {
     expect(RUNTIME_SOURCE).toContain("createMemoizedPersistedAccessor(");
     expect(RUNTIME_SOURCE).toContain("accountAuth = prepareAccountAuth(");

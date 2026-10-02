@@ -8,6 +8,40 @@ consume. The executable contract lives in
 This foundation does **not** change runtime behavior, persistence paths, file
 formats, or package versions. It does not resolve either issue by itself.
 
+## Issuer binding (#412)
+
+The current runtime additionally records the effective JWT issuer in the tuple's
+owner-only `storage-issuer.json` (version 1, exact tenant/account, issuer). The
+physical namespace remains `(tenant, accountId)`. Issuer comparison removes only
+trailing slashes, matching JWT verification; pin > delivered > derived precedence
+is unchanged. Changing SaaS credentials cannot transfer ownership of old keys or
+history to another issuer's identically named `sub`.
+
+Startup and doctor inspect this metadata before admission. A fresh tuple may
+contain enrollment credentials, but no conversation keys, generations or journal
+(including SQLite sidecars); only such a tuple is automatically initialized.
+Existing unbound state, live legacy keys, a different issuer, malformed metadata
+or an unsupported version refuses the affected account. Checks do not rewrite,
+delete, or automatically bind those stores. Other accounts can still start.
+
+For a refused account:
+
+1. Stop every gateway serving the account and run doctor to identify the tuple.
+2. If the issuer change was accidental, restore the original issuer configuration
+   and matching credentials. This option requires already valid issuer metadata.
+3. To switch issuer, or upgrade an unbound store, archive the **whole** tuple
+   directory offline, including the issuer marker, keys and all journal sidecars.
+   Archive any live legacy state identified by doctor as well. Preserve file modes.
+4. Explicitly re-enroll and initialize fresh state at the intended issuer. Honor
+   existing SaaS active-key replacement procedures; an exact credential-file
+   override is separate from the tuple directory and must be handled explicitly.
+5. Keep the archive offline. Do not edit the marker or copy old keys/history into
+   the fresh tuple. There is no supported automatic issuer migration.
+
+The upgrade requires an operator maintenance window for existing stores. It does
+not reset browsers' existing history cursors; journal epoch recovery is tracked
+separately in #299. Core dispatch retirement policy remains unchanged (#426).
+
 ## 1. Logical storage scope
 
 One logical account store is identified by the exact tuple:

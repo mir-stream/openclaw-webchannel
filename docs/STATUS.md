@@ -1,5 +1,14 @@
 # Project Status — single source of truth
 
+Security trust (#408, #411, #412): unknown JWT kids share one refresh and a
+30-second cooldown; failed/missing-key refreshes preserve fresh cached keys
+without extending their TTL. SaaS URLs require HTTPS except loopback HTTP
+(`localhost`, `127.0.0.0/8`, `::1`). Each tuple's history and conversation keys
+are bound to the effective JWT issuer by `storage-issuer.json`. Changed,
+unrecorded or invalid ownership refuses that account's startup. Existing
+unbound state requires explicit operator archiving and fresh initialization;
+doctor explains the exact paths. See [issuer binding](STORAGE_IDENTITY_V2.md#issuer-binding-412).
+
 Quiet-turn liveness (#396): normal turns send an initial typing indicator and
 renew ephemeral `typing` with `keepalive: true` every 4 seconds until completion,
 error, or dispatch abort. Renewals refresh existing application watches without
