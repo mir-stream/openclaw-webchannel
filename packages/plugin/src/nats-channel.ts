@@ -749,9 +749,9 @@ export class NatsChannel implements WebChannelPeerChannel {
   /**
    * Send typing indicator to peer.
    */
-  sendTyping(peerId: string): boolean {
+  sendTyping(peerId: string, keepalive = false): boolean {
     if (!this.typingEnabled) return false;
-    const payload: OutboundWsMessage = { type: "typing" };
+    const payload: OutboundWsMessage = { type: "typing", ...(keepalive ? { keepalive: true } : {}) };
     return this.sendToPeer(peerId, payload);
   }
 

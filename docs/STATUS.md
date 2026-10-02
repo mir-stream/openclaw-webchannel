@@ -1,5 +1,18 @@
 # Project Status — single source of truth
 
+Quiet-turn liveness (#396): normal turns send an initial typing indicator and
+renew ephemeral `typing` with `keepalive: true` every 4 seconds until completion,
+error, or dispatch abort. Renewals refresh existing application watches without
+re-arming typing or holding ordinary followups after output or approval. Typing
+capability and offline drops still apply; control-lane aborts emit no keepalive.
+Recovery restores only this client's published unsettled turns from durable
+`queued`/`started` state, in publish order. Explicit stop, settlement, cancellation,
+terminal receipts, and foreign turns cannot resurrect activity; stale-draft expiry
+retains eligible server-confirmed turns. Durable state alone does not re-arm the
+one-recovery-per-silent-interval watch. #396 joins scoped stop and history
+correlation in the same unreleased protocol 7 contract. Client and plugin must
+roll out together; ignoring the renewal marker would hold followup input.
+
 History page correlation (#401): `load_history` carries a per-request `nonce` that
 the `history` page echoes. Pages ride the peer's shared `.out`; a device folds only
 a page echoing its own nonce, so another device's page no longer leaves a permanent
@@ -8,7 +21,7 @@ page requests from one peer's devices are queued: at most 8 waiting and a 64 KiB
 waiting-string charge (two bytes per UTF-16 code unit across both cursors and the
 nonce). Exceeding either bound drops the newest request with a throttled warning;
 the active request keeps its existing cursor semantics.
-Protocol 7; client and plugin require lockstep rollout.
+History correlation was introduced in protocol 7.
 
 `/stop` cancellation (review R1/R2): control receipts and exact cancellation targets
 now commit together in the tenant/account SQLite journal before ACK. This includes

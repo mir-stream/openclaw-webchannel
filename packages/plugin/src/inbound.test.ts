@@ -21,6 +21,7 @@ import type { GetReplyOptions } from "openclaw/plugin-sdk/reply-runtime";
 import {
   deliverDraftFinalPayload,
   handleInboundMessage as handleInboundMessageForServingTenant,
+  TYPING_KEEPALIVE_INTERVAL_MS,
   startAgentLifecycleSubscription,
   stopAgentLifecycleSubscription,
   type FinalReconciliationState,
@@ -555,6 +556,147 @@ describe("handleInboundMessage — typing indicator gating", () => {
     // ever follows, which would otherwise leave the widget's Stop button armed
     // with nothing to release it.
     expect(typing).toEqual([]);
+  });
+});
+
+describe("handleInboundMessage — typing keepalive (#396)", () => {
+  // Only the interval is faked: the turn's other timers keep real semantics.
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** A turn that stays inside core until `release()` (or `fail()`) is called. */
+  function quietTurn() {
+    let release!: () => void;
+    let fail!: (error: Error) => void;
+    const held = new Promise<void>((resolve, reject) => {
+      release = resolve;
+      fail = reject;
+    });
+    let entered!: () => void;
+    const inCore = new Promise<void>((resolve) => { entered = resolve; });
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async () => {
+        entered();
+        await held;
+      },
+    });
+    return { api, inCore, release: () => release(), fail: (error: Error) => fail(error) };
+  }
+
+  it("re-sends typing while a quiet turn runs past the client's 30s stall window, then stops at settle", async () => {
+    const turn = quietTurn();
+    const { transport, typing, settles } = makeFakeTransport();
+    const sendTyping = vi.spyOn(transport, "sendTyping");
+    const done = handleInboundMessage(turn.api, transport, "peer-1", {
+      type: "user_message",
+      text: "run the long tool",
+      id: "turn-1",
+    });
+    await turn.inCore;
+    expect(typing).toEqual(["peer-1"]);
+    expect(sendTyping).toHaveBeenNthCalledWith(1, "peer-1");
+
+    // A 40s tool call with streaming off emits nothing else; without a renewal
+    // inside every 30s window the client reads the turn as a dead connection.
+    vi.advanceTimersByTime(40_000);
+    expect(typing.length).toBe(1 + Math.floor(40_000 / TYPING_KEEPALIVE_INTERVAL_MS));
+    expect(TYPING_KEEPALIVE_INTERVAL_MS).toBeLessThan(30_000 / 2);
+    expect(sendTyping.mock.calls.slice(1)).toEqual(Array.from({ length: 10 }, () => ["peer-1", true]));
+
+    turn.release();
+    await done;
+    expect(settles).toEqual(["ok"]);
+    const atSettle = typing.length;
+    vi.advanceTimersByTime(60_000);
+    // No renewal may follow `turn_settled`: the turn no longer owns activity.
+    expect(typing.length).toBe(atSettle);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("stops the keepalive when the turn throws", async () => {
+    const turn = quietTurn();
+    const { transport, typing } = makeFakeTransport();
+    const done = handleInboundMessage(turn.api, transport, "peer-1", {
+      type: "user_message",
+      text: "boom",
+      id: "turn-err",
+    });
+    await turn.inCore;
+    vi.advanceTimersByTime(TYPING_KEEPALIVE_INTERVAL_MS);
+    turn.fail(new Error("core exploded"));
+    await done;
+    const atEnd = typing.length;
+    vi.advanceTimersByTime(60_000);
+    expect(typing.length).toBe(atEnd);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("stops the keepalive as soon as dispatch ownership aborts (/stop, account dispose), before core returns", async () => {
+    const turn = quietTurn();
+    const { transport, typing } = makeFakeTransport();
+    const ownership = new AbortController();
+    const done = handleInboundMessage(turn.api, transport, "peer-1", {
+      type: "user_message",
+      text: "long",
+      id: "turn-abort",
+    }, "default", { dispatchAbortSignal: ownership.signal });
+    await turn.inCore;
+    vi.advanceTimersByTime(TYPING_KEEPALIVE_INTERVAL_MS);
+    expect(typing).toHaveLength(2);
+
+    ownership.abort();
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(60_000);
+    expect(typing).toHaveLength(2);
+    turn.release();
+    await done;
+  });
+
+  it("never starts a keepalive for a control-lane abort turn", async () => {
+    const turn = quietTurn();
+    const { transport, typing } = makeFakeTransport();
+    const done = handleInboundMessage(turn.api, transport, "peer-1", userMessage, "default", {
+      controlLane: true,
+    });
+    await turn.inCore;
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(60_000);
+    expect(typing).toEqual([]);
+    turn.release();
+    await done;
+  });
+
+  it("keeps renewing when a send is dropped or throws (relay down), without escaping the timer", async () => {
+    const turn = quietTurn();
+    const made = makeFakeTransport();
+    let calls = 0;
+    const transport = {
+      ...made.transport,
+      sendTyping: (peerId: string) => {
+        calls++;
+        if (calls === 2) throw new Error("publish failed");
+        if (calls === 3) return false;
+        made.typing.push(peerId);
+        return true;
+      },
+    } as WebChannelPeerChannel;
+    const done = handleInboundMessage(turn.api, transport, "peer-1", {
+      type: "user_message",
+      text: "long",
+      id: "turn-flaky",
+    });
+    await turn.inCore;
+    expect(() => vi.advanceTimersByTime(TYPING_KEEPALIVE_INTERVAL_MS * 3)).not.toThrow();
+    expect(calls).toBe(4);
+    expect(made.typing).toEqual(["peer-1", "peer-1"]);
+    turn.release();
+    await done;
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 

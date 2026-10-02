@@ -148,10 +148,11 @@ idle tab has no active-work signal and is not proactively probed by this mode.
 
 ### Turn activity: `turnActive` vs `isTyping`
 
-`state.isTyping` mirrors the agent's single per-turn `typing` frame and is
-cleared by the first `progress` / `agent_message` / `approval_*` frame. It answers
-"is an answer being composed right now?", so it is deliberately silent for the
-rest of a multi-step turn.
+`state.isTyping` mirrors the agent's initial `typing` frame and is cleared by
+the first `progress` / `agent_message` / `approval_*` frame. Periodic renewals
+marked `keepalive: true` refresh liveness without re-arming the indicator or
+holding ordinary followups after output or approval. A later ordinary typing
+frame can set the indicator again.
 
 `state.turnActive` answers the other question — "is the agent still working on
 this turn?" — and is owned by the client, not the wire. It becomes `true` the
@@ -197,14 +198,12 @@ disconnected opens no turn until its first successful publication after
 reconnect. An explicit `/stop` also consumes ordinary sends already queued at
 that boundary, so their later publication cannot re-open the stopped work; a
 follow-up created by the stop's own cancellation fanout belongs after that
-boundary and remains eligible. The post-reconnect staleness valve force-closes
-open turns too, but only in the case where it arms at all — when a `working`
-draft was live as the session re-established — so it is a bonus rescue, not a
-general timeout.
-Force-closing an already-open turn is one-way: unlike `isTyping`, which a later
-`typing` frame re-arms, an ack or replay does not re-open it, so a transient
-reconnect in the middle of a long turn leaves `turnActive` false for the rest of
-it.
+boundary and remains eligible. After recovery, durable `queued`/`started` state
+can restore this client's published unsettled turns in publish order. Explicitly
+stopped, settled, cancelled, terminal-receipt, and foreign turns cannot reopen.
+The post-reconnect staleness valve closes unconfirmed open turns when an old
+working draft expires; eligible server-confirmed turns stay open. Durable state
+alone does not re-arm the one-recovery-per-silent-interval watchdog.
 
 The residual has one shape, and no attempt is made to enumerate its causes: **any
 published turn whose settle never arrives — or arrives naming an id this client
@@ -323,9 +322,10 @@ becomes `failed { reason: "overloaded", retryable: true }`; retry is a deliberat
 caller/user action and creates a new id. Before either ACK or rejection arrives,
 the client reliability layer replays the same id live with capped exponential
 backoff, as well as immediately on reconnect. Client and plugin must be upgraded
-together — the wire protocol is now **v7** (v3 in `0.4.0`, the register hop
-described below; v4 in #246; v6 adds durable cancellation ACK evidence; v7
-correlates history pages to the requesting device, #401).
+together — the unreleased wire protocol is **v7** (v3 in `0.4.0`, the register hop
+described below; v4 in #246; v6 adds durable cancellation ACK evidence). Protocol 7
+combines scoped stop (#398), history page correlation (#401), and typing renewals
+that preserve immediate followup admission (#396) in the same release contract.
 
 ### BREAKING: protocol v3 register hop
 

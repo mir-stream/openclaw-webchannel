@@ -844,6 +844,56 @@ function releaseAgentLifecycleSubscription(options: {
 }
 
 /**
+ * #396: re-send cadence for the turn's `typing` frame. Telegram renews its
+ * typing chat action every 4s for the life of the turn
+ * (`TELEGRAM_CHAT_ACTION_INTERVAL_MS`); we use the same cadence. It must stay
+ * well under the client's application-stall timeout (`ackStallTimeoutMs`,
+ * default 30s): `typing` is the only frame a quiet turn — a long tool call with
+ * `streaming.mode:"off"` — emits, and the client treats a silent accepted turn
+ * as a stalled connection and reconnects, which drops its Stop button.
+ */
+export const TYPING_KEEPALIVE_INTERVAL_MS = 4_000;
+
+/**
+ * #396: emit `typing` now and every {@link TYPING_KEEPALIVE_INTERVAL_MS} until
+ * the returned stop runs or `abortSignal` fires (`/stop` and account dispose
+ * both abort the dispatch ownership). The turn's `finally` owns the stop, so
+ * every exit path clears the timer.
+ *
+ * Each send is best-effort exactly like the single send it replaces: the
+ * transport gates it on `capabilities.typing`, drops it while the relay is down
+ * (`typing` is never journaled, so nothing queues for a later flush), and
+ * reports `false` instead of throwing. A throwing transport is still caught —
+ * an exception escaping a timer callback would crash the gateway process.
+ */
+function startTypingKeepalive(
+  transport: WebChannelPeerChannel,
+  peerId: string,
+  abortSignal: AbortSignal | undefined,
+): () => void {
+  const send = (keepalive = false) => {
+    try {
+      if (keepalive) transport.sendTyping(peerId, true);
+      else transport.sendTyping(peerId);
+    } catch {
+      // Best-effort indicator; the next tick or the turn's own frames follow.
+    }
+  };
+  send();
+  if (abortSignal?.aborted) return () => {};
+  // Renewals prove liveness only: the initial indicator must stay cleared after
+  // output or approval so ordinary followups retain immediate admission.
+  const timer = setInterval(() => send(true), TYPING_KEEPALIVE_INTERVAL_MS);
+  timer.unref?.();
+  const stop = () => {
+    clearInterval(timer);
+    abortSignal?.removeEventListener("abort", stop);
+  };
+  abortSignal?.addEventListener("abort", stop, { once: true });
+  return stop;
+}
+
+/**
  * Handle one inbound user message from the browser widget.
  *
  * Phase 0 inbound path (walking skeleton) — proper channel inbound lifecycle:
@@ -985,6 +1035,8 @@ export async function handleInboundMessage(
    * not be in scope there.
    */
   let originLease: ApprovalOriginLease | undefined;
+  /** #396: stops this turn's typing keepalive; the `finally` below owns it. */
+  let stopTypingKeepalive: (() => void) | undefined;
 
   try {
     const channelRuntime = api.runtime.channel;
@@ -1193,6 +1245,12 @@ export async function handleInboundMessage(
   // frame from the agent settles the indicator client-side; we never send a
   // matching "stop" frame.
   //
+  // #396: renew liveness with marked typing frames until the turn ends. These
+  // renewals do not re-arm the indicator or hold followup input. "Is this turn still running" is a fact only this side
+  // knows; a single frame at turn start left a long quiet tool call looking
+  // like a dead connection to the client, whose stall recovery then dropped
+  // the turn's Stop button. The `finally` stops the timer on every exit.
+  //
   // The transport gates the frame on `channels.webchannel.capabilities.typing`
   // (default "on"), so when an operator sets it to "off" this call is a no-op.
   // It is also best-effort (no ack/retry) and drop-only under backpressure —
@@ -1210,7 +1268,7 @@ export async function handleInboundMessage(
   // leave the button stuck in Stop mode with nothing to release it. Skipping
   // typing keeps the abort lane silent unless it has a real terminal frame.
   if (!controlLane) {
-    transport.sendTyping(wsKey);
+    stopTypingKeepalive = startTypingKeepalive(transport, wsKey, options?.dispatchAbortSignal);
   }
 
     await channelRuntime.inbound.run({
@@ -1724,6 +1782,8 @@ export async function handleInboundMessage(
     // here; the claim is removed by its own id, so a run retained when an
     // approval-stream restart rotates the barrier releases only itself.
     originLease?.release();
+    // #396: retire this turn's liveness source before later cleanup can throw.
+    stopTypingKeepalive?.();
     if (toolActivitySink) {
       for (const runId of agentRunIds) {
         unregisterAgentRunToolActivitySink(runId, toolActivitySink);

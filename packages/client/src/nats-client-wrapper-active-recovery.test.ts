@@ -31,6 +31,9 @@ function inside(wrapper: WebChannelNATSClient) {
     cursor: { state: string; last?: number; buffer?: InboundMessage[] };
     pendingHistorySnapshots: InboundMessage[];
     deferredCancelledTyping: unknown;
+    typingLocalCandidates: Set<string>;
+    reconcileCancelledTyping: () => void;
+    maybeRelease: () => void;
     client: {
       requestApplicationRecovery: () => boolean;
       liveRetryTimer: unknown;
@@ -47,7 +50,7 @@ async function setup(options: { timeout?: number; heartbeat?: number; recovery?:
   const key = new Uint8Array(32).fill(39);
   const registration = registerAgent(key, x.publicRaw, identity);
   const control = { admitted: true, ack: true, answerDifferences: true, registrations: 0, interrupted: false, settleBeforeAck: false,
-    cancelled: new Set<string>(),
+    cancelled: new Set<string>(), started: false,
     recoveryTargetStates: [] as Array<{ state: "queued" | "started" | "completed"; seq: number }> };
   const received: Array<Extract<OutboundMessage, { type: "user_message" }>> = [];
   const differences: Array<Extract<OutboundMessage, { type: "get_difference" }>> = [];
@@ -68,7 +71,9 @@ async function setup(options: { timeout?: number; heartbeat?: number; recovery?:
         control.admitted = true;
       }
       return Promise.resolve(registration(subject, payload, server, reply)).then(() => {
-        if (isRegister) {
+        if (isRegister && control.started) deliver({ type: "history", highWaterSeq: 2,
+          messages: [{ ...row(), requestState: "started" }] }, server);
+        else if (isRegister) {
           const target = control.recoveryTargetStates[control.registrations - 2];
           deliver({ type: "history", highWaterSeq: target?.seq ?? (control.interrupted ? 2 : 0),
             messages: target ? [{ id: "M1", role: "user", text: "transfer", turnId: "other-wire",
@@ -116,6 +121,134 @@ async function withClock() {
   expect(receipt.snapshot().state).toBe("accepted");
   return { ...h, receipt, request, turnId: h.received[0]!.id! };
 }
+
+// Runs before the fake-timer suite below: these real-time cases must not inherit
+// a restored `setTimeout` spy that was taken while fake timers were installed.
+describe("#396 quiet-turn liveness (plugin typing keepalive)", () => {
+  it("keeps a quiet accepted turn active, without recovery, while typing keepalives arrive inside every stall window", async () => {
+    const h = await setup({ timeout: 200 });
+    const receipt = h.wrapper.send("long tool call, streaming off")!;
+    expect(receipt.snapshot().state).toBe("accepted");
+    h.deliver({ type: "typing" });
+    // Several stall windows of silence except the keepalive (cadence < timeout,
+    // as the plugin's 4s against the client's 30s default).
+    for (let i = 0; i < 15; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      h.deliver({ type: "typing", keepalive: true });
+      expect(h.wrapper.getState()).toMatchObject({ connected: true, isTyping: true, turnActive: true });
+    }
+    expect(h.control.registrations).toBe(1);
+    expect(receipt.snapshot().state).toBe("accepted");
+    expect(h.received).toHaveLength(1);
+    // Sensitivity: the same turn without the keepalive does trip recovery.
+    await settleUntil(() => h.control.registrations === 2, { label: "recovery once the keepalive stops" });
+  });
+
+  it("restores turnActive from the server's started state after a recovery, keeping one recovery per silent interval", async () => {
+    const h = await setup({ timeout: 80 });
+    const receipt = h.wrapper.send("silent operation")!;
+    expect(h.wrapper.getState().turnActive).toBe(true);
+    h.control.started = true; // The replacement plugin is still running the turn.
+    await settleUntil(() => h.control.registrations === 2 && h.wrapper.getState().connected,
+      { label: "one active-turn recovery" });
+    await settleUntil(() => h.wrapper.getState().turnActive === true, { label: "turnActive from server state" });
+    expect(receipt.snapshot().state).toBe("accepted");
+    expect(h.received).toHaveLength(1);
+    // Server state is not activity evidence: no second recovery for this interval.
+    await new Promise((resolve) => setTimeout(resolve, 5 * 80));
+    expect(h.control.registrations).toBe(2);
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+    expect(h.wrapper.getState().turnActive).toBe(true);
+
+    // The re-opened turn still ends on its own settle, and a later reconcile of
+    // the same (still `started`) row cannot resurrect a settled turn.
+    h.deliver({ type: "turn_settled", turnId: h.received[0]!.id, outcome: "ok" });
+    expect(receipt.snapshot().state).toBe("completed");
+    expect(h.wrapper.getState()).toMatchObject({ turnActive: false, isTyping: false });
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [] });
+    expect(h.wrapper.getState().turnActive).toBe(false);
+  });
+
+  it("re-opens behind a newer post-reconnect send in publish order, so the older settle cannot close it", async () => {
+    const h = await setup({ timeout: 300 });
+    const older = h.wrapper.send("silent operation")!;
+    await settleUntil(() => h.control.registrations === 2 && h.wrapper.getState().connected,
+      { label: "one active-turn recovery" });
+    expect(h.wrapper.getState().turnActive).toBe(false); // Snapshot carried no open row.
+    const newer = h.wrapper.send("follow-up")!;
+    expect(newer.snapshot().state).toBe("accepted");
+    expect(h.wrapper.getState().turnActive).toBe(true);
+    // Later server evidence that the OLDER turn is still running.
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [{ ...h.row(), requestState: "started" }] });
+    // Settling the older turn sweeps only its publish-order prefix.
+    h.deliver({ type: "turn_settled", turnId: h.received[0]!.id, outcome: "ok" });
+    expect(older.snapshot().state).toBe("completed");
+    expect(h.wrapper.getState().turnActive).toBe(true);
+    h.deliver({ type: "turn_settled", turnId: h.received[1]!.id, outcome: "ok" });
+    expect(h.wrapper.getState().turnActive).toBe(false);
+  });
+
+  it("does not let cached server state undo an explicit stop, while later work can still reopen", async () => {
+    const h = await setup({ timeout: 10_000 });
+    const stopped = h.wrapper.send("quiet operation")!;
+    h.deliver({ type: "history", highWaterSeq: 2,
+      messages: [{ ...h.row(), requestState: "started" }] });
+    expect(h.wrapper.getState().turnActive).toBe(true);
+
+    h.wrapper.send("/stop");
+    expect(h.wrapper.getState().turnActive).toBe(false);
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [] });
+    expect(stopped.snapshot().state).toBe("accepted");
+    expect(inside(h.wrapper).applicationTurns.size).toBe(1);
+    expect(h.wrapper.getState().turnActive).toBe(false);
+
+    const later = h.wrapper.send("work after stop")!;
+    const laterFrame = h.received[2]!;
+    expect(inside(h.wrapper).client.requestApplicationRecovery()).toBe(true);
+    await settleUntil(() => h.control.registrations === 2 && h.wrapper.getState().connected,
+      { label: "replacement session after stop" });
+    expect(h.wrapper.getState().turnActive).toBe(false);
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [{
+      id: "server-later", role: "user", text: laterFrame.text!, turnId: laterFrame.id!,
+      randomId: laterFrame.random_id!, requestState: "started", seq: 2,
+    }] });
+    expect(later.snapshot().state).toBe("accepted");
+    expect(h.wrapper.getState().turnActive).toBe(true);
+  });
+
+  it("keeps a server-restored active turn when a stale sibling draft expires", async () => {
+    const config = WebChannelNATSClient as unknown as { STALE_DRAFT_GRACE_MS: number };
+    const previous = config.STALE_DRAFT_GRACE_MS;
+    config.STALE_DRAFT_GRACE_MS = 100;
+    try {
+      const h = await setup({ timeout: 10_000 });
+      const receipt = h.wrapper.send("quiet operation after a draft")!;
+      const turnId = h.received[0]!.id!;
+      h.deliver({ type: "progress", id: "draft-before-loss", turnId, text: "working" });
+      h.control.started = true;
+      expect(inside(h.wrapper).client.requestApplicationRecovery()).toBe(true);
+      await settleUntil(() => h.control.registrations === 2 && h.wrapper.getState().connected,
+        { label: "replacement session" });
+      expect(h.wrapper.getState().turnActive).toBe(true);
+      const turnActiveFanouts: Array<boolean | undefined> = [];
+      const unsubscribe = h.wrapper.subscribe((state) => { turnActiveFanouts.push(state.turnActive); });
+      for (let i = 0; i < 8; i++) {
+        h.deliver({ type: "typing", keepalive: true });
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      unsubscribe();
+      expect(h.control.registrations).toBe(2);
+      expect(receipt.snapshot().state).toBe("accepted");
+      expect(h.wrapper.getState().isTyping).toBe(false);
+      expect(h.wrapper.getState().messages.find((row) => row.id === "server-user")?.requestState).toBe("started");
+      expect(h.wrapper.getState().messages.find((row) => row.id === "draft-before-loss")?.working).toBe(false);
+      expect(turnActiveFanouts).not.toContain(false);
+      expect(h.wrapper.getState().turnActive).toBe(true);
+    } finally {
+      config.STALE_DRAFT_GRACE_MS = previous;
+    }
+  });
+});
 
 describe("#398 explicit stop names earlier unacknowledged input", () => {
   it("names only earlier sends without a result, and shows a named input as cancelled on the server's proof", async () => {
@@ -431,6 +564,7 @@ describe("accepted-turn application recovery", () => {
   });
 
   it.each([
+    { type: "typing", keepalive: true },
     { type: "typing" },
     { type: "progress", id: "draft", text: "still running" },
     { type: "request_state", id: "remote-user", turnId: "remote-B", state: "started" },
@@ -483,6 +617,7 @@ describe("accepted-turn application recovery", () => {
   });
 
   it.each([
+    { type: "typing", keepalive: true },
     { type: "typing" },
     { type: "progress", id: "draft", text: "still running" },
     { type: "reasoning", id: "reason", turnId: "turn", text: "thinking" },
@@ -497,6 +632,90 @@ describe("accepted-turn application recovery", () => {
     vi.advanceTimersByTime(1);
     expect(h.request).toHaveBeenCalledTimes(1);
     expect(h.receipt.snapshot().state).toBe("accepted");
+  });
+
+  it.each([
+    { type: "agent_message", id: "first-answer", text: "first output" },
+    { type: "approval_request", id: "approval", kind: "exec", title: "Approve", prompt: "Run?", options: [] },
+  ] satisfies InboundMessage[])("typing renewals after $type keep followups immediate and the accepted watch alive", async (frame) => {
+    const h = await withClock();
+    h.deliver({ type: "typing" });
+    expect(h.wrapper.getState().isTyping).toBe(true);
+    h.deliver(frame);
+    expect(h.wrapper.getState().isTyping).toBe(false);
+    for (let i = 0; i < 3; i++) {
+      vi.advanceTimersByTime(900);
+      h.deliver({ type: "typing", keepalive: true });
+      expect(h.wrapper.getState()).toMatchObject({ isTyping: false, turnActive: true });
+    }
+    expect(h.request).not.toHaveBeenCalled();
+    const followup = h.wrapper.send("ordinary followup")!;
+    expect(followup.snapshot().state).toBe("accepted");
+    expect(h.received.map((message) => message.text)).toEqual(["work", "ordinary followup"]);
+    vi.advanceTimersByTime(TIMEOUT);
+    expect(h.request).toHaveBeenCalledTimes(1);
+  });
+
+  it("typing renewals refresh an existing held watch without releasing or changing its hold", async () => {
+    const h = await withClock();
+    h.deliver({ type: "typing" });
+    const held = h.wrapper.send("held before output")!;
+    const candidates = inside(h.wrapper).typingLocalCandidates;
+    const release = vi.spyOn(inside(h.wrapper), "maybeRelease");
+    for (let i = 0; i < 3; i++) {
+      vi.advanceTimersByTime(900);
+      h.deliver({ type: "typing", keepalive: true });
+      expect(held.snapshot().state).toBe("queued");
+      expect(h.wrapper.getState().isTyping).toBe(true);
+      expect(inside(h.wrapper).typingLocalCandidates).toBe(candidates);
+      expect(inside(h.wrapper).heldStallTimer).not.toBeNull();
+    }
+    expect(release).not.toHaveBeenCalled();
+    expect(h.request).not.toHaveBeenCalled();
+    expect(h.received).toHaveLength(1);
+    h.deliver({ type: "agent_message", id: "answer", text: "ready" });
+    expect(held.snapshot().state).toBe("accepted");
+  });
+
+  it("typing renewals preserve pending cancellation cleanup until recovery drains", async () => {
+    const h = await withClock();
+    h.control.answerDifferences = false;
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [] });
+    h.deliver({ type: "typing" });
+    const held = h.wrapper.send("held C")!;
+    h.deliver({ type: "ack", ids: [h.turnId], cancelled: [h.turnId] });
+    const pending = inside(h.wrapper).deferredCancelledTyping;
+    const candidates = inside(h.wrapper).typingLocalCandidates;
+    expect(pending).toBeDefined();
+    const cleanup = vi.spyOn(inside(h.wrapper), "reconcileCancelledTyping");
+    h.deliver({ type: "typing", keepalive: true });
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(inside(h.wrapper).deferredCancelledTyping).toBe(pending);
+    expect(inside(h.wrapper).typingLocalCandidates).toBe(candidates);
+    expect(h.wrapper.getState().isTyping).toBe(true);
+    expect(held.snapshot().state).toBe("queued");
+    const request = h.differences[0]!;
+    h.deliver({ type: "difference", afterSeq: request.afterSeq, nonce: request.nonce,
+      maxSeq: 2, partial: false, events: [] });
+    expect(inside(h.wrapper).deferredCancelledTyping).toBeUndefined();
+    expect(h.wrapper.getState().isTyping).toBe(false);
+    expect(held.snapshot().state).toBe("accepted");
+  });
+
+  it("late typing renewals after settlement cannot create typing, turn ownership, or watchdogs", async () => {
+    const h = await withClock();
+    h.deliver({ type: "typing" });
+    h.deliver({ type: "turn_settled", turnId: h.turnId, outcome: "ok" });
+    expect(h.receipt.snapshot().state).toBe("completed");
+    const state = h.wrapper.getState();
+    h.deliver({ type: "typing", keepalive: true });
+    expect(h.wrapper.getState()).toBe(state);
+    expect(state).toMatchObject({ isTyping: false, turnActive: false });
+    expect(inside(h.wrapper).applicationTurns.size).toBe(0);
+    expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
+    expect(inside(h.wrapper).heldStallTimer).toBeNull();
+    vi.advanceTimersByTime(3 * TIMEOUT);
+    expect(h.request).not.toHaveBeenCalled();
   });
 
   it("counts authenticated activity at arrival even when gap recovery buffers the frame", async () => {

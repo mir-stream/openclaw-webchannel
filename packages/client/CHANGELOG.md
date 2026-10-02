@@ -27,9 +27,13 @@
 
 Client and plugin require a paired upgrade to protocol 7 (protocol 6 was never
 released). The existing exact-match registration gate rejects every other
-version. No package-version bump. One reason per bullet, matching
-`protocol.ts`:
+version. Protocol 7 is unreleased; #396 joins scoped stop and history correlation
+in the same release contract. No package-version bump. One reason per bullet,
+matching `protocol.ts`:
 
+- **v7 — liveness-only typing renewals (#396).** Periodic `typing.keepalive`
+  frames refresh application watches without re-arming typing or holding
+  followups after output or approval. Ignoring the marker would queue those inputs.
 - **v6 — durable cancellation ACK evidence.** `ack.cancelled` must be understood
   to distinguish delivery acceptance from work that still needs recovery.
 - **v7 — stop covers earlier unacknowledged input (#397, #398).** An explicit

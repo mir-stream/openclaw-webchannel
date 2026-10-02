@@ -199,6 +199,8 @@ export type InboundMessage = {
     // wrapper folds each raw event through its reducer and advances its seq cursor.
     | "difference";
   id?: string;
+  /** Protocol 7: a typing renewal proves liveness without changing input admission. */
+  keepalive?: boolean;
   /** P0-7b: the acknowledged `user_message` ids on an `ack` frame. */
   ids?: string[];
   /** Protocol 6: exact ack.ids durably cancelled by the server, not task admissions. */

@@ -105,6 +105,17 @@ describe("#246 half A — decodeInboundMessage: the frame envelope", () => {
   });
 });
 
+describe("protocol 7 typing renewals", () => {
+  it("preserves optional boolean keepalive markers and rejects malformed markers", () => {
+    accepts({ type: "typing" });
+    for (const keepalive of [true, false]) {
+      const result = decodeInboundMessage({ type: "typing", keepalive });
+      expect(result).toMatchObject({ ok: true, message: { type: "typing", keepalive } });
+    }
+    for (const keepalive of [null, 1, "true", {}, []]) refuses({ type: "typing", keepalive });
+  });
+});
+
 describe("#246 half A — decodeInboundMessage: the durable frames", () => {
   it("agent_message requires text but tolerates an absent id (the legacy mint path)", () => {
     const { id: _id, ...noId } = VALID.agent_message as { id: string };

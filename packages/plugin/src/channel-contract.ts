@@ -610,7 +610,7 @@ export type OutboundWsMessage =
    * confirming it — ignoring the frame costs feedback, not correctness.
    */
   | { type: "approval_decision_rejected"; id: string; decision: ApprovalDecision; reason: ApprovalDecisionRejectReason }
-  | { type: "typing" }
+  | { type: "typing"; keepalive?: boolean }
   | {
       type: "history";
       messages: HistoryMessage[];
@@ -891,7 +891,8 @@ export interface WebChannelPeerChannel {
     answers: Array<{ id: string; text: string }>,
     remove: string[],
   ): boolean;
-  sendTyping(peerId: string): boolean;
+  /** `keepalive` renews liveness without re-arming the client input hold. */
+  sendTyping(peerId: string, keepalive?: boolean): boolean;
   /**
    * #244 half A: `highWaterSeq` is the conversation's authoritative `MAX(seq)`,
    * attached to the register-time SNAPSHOT frame only (the pager omits it).
@@ -993,7 +994,7 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendToolActivity(_peerId: string, _activity: { id: string; turnId: string; name?: string; phase?: string; status?: string; summary?: string; argKeys?: string[] }): boolean { return false; }
   sendTurnSettled(_peerId: string, _turnId: string, _outcome: "ok" | "error"): boolean { return false; }
   sendTurnSnapshot(_peerId: string, _turnId: string, _answers: Array<{ id: string; text: string }>, _remove: string[]): boolean { return false; }
-  sendTyping(_peerId: string): boolean { return false; }
+  sendTyping(_peerId: string, _keepalive?: boolean): boolean { return false; }
   sendHistory(
     _peerId: string,
     _messages: HistoryMessage[],

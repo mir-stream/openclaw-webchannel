@@ -12,6 +12,7 @@ import { EventEmitter } from "node:events";
 import { describe, it, expect, vi } from "vitest";
 
 import { NatsChannel } from "./nats-channel.js";
+import type { DeliveryJournal } from "./delivery-journal.js";
 import type { NatsTransport } from "./nats-transport.js";
 
 /** Transport that RECORDS published subject/payload pairs (plaintext mode). */
@@ -49,6 +50,7 @@ describe("P0-6 — NatsChannel typing gate", () => {
     const frames = typingFrames(transport);
     expect(frames).toHaveLength(1);
     expect(frames[0].subject).toBe("webchannel.tenant.acct.peer-0.out");
+    expect(JSON.parse(frames[0].payload)).toEqual({ type: "typing" });
   });
 
   it("is a no-op after setTypingEnabled(false) — returns false, publishes nothing", () => {
@@ -57,7 +59,25 @@ describe("P0-6 — NatsChannel typing gate", () => {
 
     channel.setTypingEnabled(false);
     expect(channel.sendTyping("peer-0")).toBe(false);
+    expect(channel.sendTyping("peer-0", true)).toBe(false);
     expect(typingFrames(transport)).toHaveLength(0);
+  });
+
+  it("marks liveness renewals, never journals them, and drops them during relay loss", () => {
+    const transport = new RecordingTransport();
+    const append = vi.fn(() => ({ seq: 1 }));
+    const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant",
+      undefined, undefined, { deliveryJournal: { append } as unknown as DeliveryJournal });
+    expect(channel.sendTyping("peer-0", true)).toBe(true);
+    expect(JSON.parse(typingFrames(transport)[0]!.payload)).toEqual({ type: "typing", keepalive: true });
+    transport.connected = false;
+    expect(channel.sendTyping("peer-0")).toBe(false);
+    expect(channel.sendTyping("peer-0", true)).toBe(false);
+    expect(typingFrames(transport)).toHaveLength(1);
+    transport.connected = true;
+    expect(channel.sendTyping("peer-0", true)).toBe(true);
+    expect(typingFrames(transport)).toHaveLength(2);
+    expect(append).not.toHaveBeenCalled();
   });
 
   it("emits again after re-enabling", () => {

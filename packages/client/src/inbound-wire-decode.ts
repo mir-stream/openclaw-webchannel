@@ -459,9 +459,13 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
       return accept(raw);
     }
 
-    case "typing":
-      // No fields. The type alone is the signal.
+    case "typing": {
+      const keepalive = field(raw, "keepalive");
+      if (keepalive !== undefined && typeof keepalive !== "boolean") {
+        return invalid(known, "keepalive must be a boolean");
+      }
       return accept(raw);
+    }
 
     case "history": {
       // TOP LEVEL ONLY, and that boundary is deliberate: `case "history"` is the
