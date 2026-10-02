@@ -479,7 +479,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   setDispatchOwnerFence(active: () => boolean): void { this.dispatchOwnerActive = active; }
 
   sendRequestState(change: DispatchChange): boolean {
-    return this.sendToPeer(change.peerId, { type: "request_state", id: change.id, state: change.state, turnId: change.turnId, seq: change.seq });
+    return this.sendToPeer(change.peerId, { type: "request_state", id: change.id, state: change.state, turnId: change.turnId, seq: change.seq, ...(change.retriedBy ? { retriedBy: change.retriedBy } : {}) });
   }
 
   registerPeer(peerId: string): void {
@@ -846,7 +846,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   sendAck(
     peerId: string,
     ids: string[],
-    committed?: Array<{ random_id: string; messageId: string; seq: number }>,
+    committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>,
     cancelled?: string[],
   ): boolean {
     return this.sendIngressResult(peerId, "ack", ids, committed, cancelled);
@@ -1128,7 +1128,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     // #243 half 2a: the server-assigned-id echo for an `ack`, attached to the
     // first published frame by the chunk writer and measured on the wire with it.
     // #244 half A: each entry also carries the user message's per-conversation seq.
-    committed?: Array<{ random_id: string; messageId: string; seq: number }>,
+    committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>,
     cancelled?: string[],
   ): boolean {
     if (candidates.length === 0) return true;

@@ -909,6 +909,13 @@ export class WebChannelNATSClient {
    * Unlike the advisory openTurns set, transport loss cannot retire this work.
    */
   private readonly applicationTurns = new Map<string, ReceiptRecord>();
+  /**
+   * #399: converged sends no longer own a publish-order turn, but their receipts
+   * still owe the first retry row's authoritative outcome. Key by the retired
+   * local wire id so terminal receipt transitions discard exact ownership
+   * without putting the alias back into the prefix-settlement collection.
+   */
+  private readonly convergedApplicationTurns = new Map<string, ReceiptRecord>();
   /** Local candidates at the latest typing frame; not exclusive activity owners. */
   private typingLocalCandidates = new Set<string>();
   /** One cancellation cleanup decision for this typing episode, never a task outcome. */
@@ -1177,6 +1184,7 @@ export class WebChannelNATSClient {
       this.wrapperLifecycleGeneration++;
       this.deferredCancelledTyping = undefined;
       this.applicationTurns.clear();
+      this.convergedApplicationTurns.clear();
       this.activeTurnRecoveryIssued = false;
       this.cancelActiveTurnStallTimer();
       const deferredEntries = this.deferredReplacementOperations.splice(0);
@@ -1301,6 +1309,7 @@ export class WebChannelNATSClient {
     this.closeTransactionDepth++;
     try {
       this.applicationTurns.clear();
+      this.convergedApplicationTurns.clear();
       this.activeTurnRecoveryIssued = false;
       // Detach only this lifecycle's wrapper ownership before any timer or raw
       // teardown callout. Work created after a reentrant connect is replacement
@@ -1411,10 +1420,19 @@ export class WebChannelNATSClient {
    */
   send(text: string): SendReceipt | undefined { return this.sendWithProvenance(text); }
 
-  /** A deliberate new execution; the interrupted original and its result remain visible. */
+  /**
+   * A deliberate new execution; the interrupted original and its result remain
+   * visible. One retry per original (#399): the server answers a second one with
+   * the first retry's receipt, and this refuses it locally once either the
+   * server's `retriedBy` or this device's own live retry row names the
+   * original. A retry the server refused (`failed`) or that was retracted
+   * before sending never reached it, so it spends nothing.
+   */
   retryInterrupted(messageId: string): SendReceipt | undefined {
     const original = this.state.messages.find(m => m.kind === undefined && m.role === "user" && m.id === messageId);
-    if (!original || original.requestState !== "interrupted" || isLikelyAbortText(original.text)) return undefined;
+    if (!original || original.requestState !== "interrupted" || original.retriedBy !== undefined || isLikelyAbortText(original.text)) return undefined;
+    if (this.state.messages.some(m => m.kind === undefined && m.role === "user" && m.retryOf === messageId
+      && m.sendState !== "failed" && !m.retracted)) return undefined;
     return this.sendWithProvenance(original.text, original.id);
   }
 
@@ -1816,6 +1834,7 @@ export class WebChannelNATSClient {
       text: trimmed,
       receiptKey,
       sendState: "queued",
+      ...(retryOf ? { retryOf } : {}),
     });
     return this.makeReceipt(receiptKey);
   }
@@ -2107,6 +2126,13 @@ export class WebChannelNATSClient {
       // receipt callback is queued behind a subscriber. It already owns the
       // verdict: no timer may request recovery during that callback window.
       if (receipt.state === "accepted" && !this.client.isIngressCancelled(id)) return true;
+    }
+    return this.hasAcceptedConvergedTurn();
+  }
+
+  private hasAcceptedConvergedTurn(): boolean {
+    for (const receipt of this.convergedApplicationTurns.values()) {
+      if (receipt.state === "accepted") return true;
     }
     return false;
   }
@@ -3113,6 +3139,7 @@ export class WebChannelNATSClient {
         role: entry.role,
         ...(entry.requestState ? { requestState: entry.requestState } : {}),
         ...(entry.retryOf ? { retryOf: entry.retryOf } : {}),
+        ...(entry.retriedBy ? { retriedBy: entry.retriedBy } : {}),
         ...(entry.revision !== undefined ? { revision: entry.revision } : {}),
         ...(entry.edited !== undefined ? { edited: entry.edited } : {}),
         // Rule 2's carve-out: while the bubble holds only a draft, `text` is the
@@ -3514,7 +3541,10 @@ export class WebChannelNATSClient {
           && next.failure?.reason === "overloaded"
           && this.closeTurn(rec.wireId));
         if (next.state === "completed" || next.state === "interrupted" || next.state === "failed") {
-          if (rec.wireId) this.applicationTurns.delete(rec.wireId);
+          if (rec.wireId) {
+            this.applicationTurns.delete(rec.wireId);
+            this.convergedApplicationTurns.delete(rec.wireId);
+          }
         }
         this.patchBubbleByReceiptKey(
           receiptKey,
@@ -3536,8 +3566,11 @@ export class WebChannelNATSClient {
             console.error("[nats-wrapper] receipt subscriber threw:", e);
           }
         }
-        if (next.state === "accepted" && rec.wireId && this.applicationTurns.has(rec.wireId)) {
-          // A newly accepted turn is new work, not the recovered silent one.
+        if (next.state === "accepted" && rec.wireId
+          && (this.applicationTurns.has(rec.wireId) || this.convergedApplicationTurns.has(rec.wireId))) {
+          // Newly accepted work starts a fresh silent interval. A split ACK may
+          // already have retired a converged alias from publish-order ownership,
+          // while its receipt still owns the target outcome in the recovery map.
           this.activeTurnRecoveryIssued = false;
           this.refreshActiveTurnWatch(true);
         } else if (!this.hasAcceptedApplicationTurn()) {
@@ -3584,14 +3617,35 @@ export class WebChannelNATSClient {
   private adoptCommittedIds(
     // #244 half A adds an optional `seq` to each entry (the user message's wire
     // seq). Adoption ignores it — this method re-keys by `messageId` only.
-    committed: Array<{ random_id: string; messageId: string; seq?: number }> | undefined,
+    committed: Array<{ random_id: string; messageId: string; seq?: number; converged?: boolean }> | undefined,
   ): void {
     if (!Array.isArray(committed) || committed.length === 0) return;
     const lifecycle = this.wrapperLifecycleGeneration;
     for (const entry of committed) {
       if (this.wrapperLifecycleGeneration !== lifecycle) return;
-      if (isCommittedEcho(entry)) this.adoptUserBubbleByRandomId(entry.random_id, entry.messageId);
+      if (!isCommittedEcho(entry)) continue;
+      if (entry.converged === true) this.retireConvergedSend(entry.random_id);
+      this.adoptUserBubbleByRandomId(entry.random_id, entry.messageId);
     }
+  }
+
+  /**
+   * #399: a `converged` echo is the server's verdict that this send converged on
+   * another send's row (a second retry of one original) and is NOT a new
+   * execution. Retire exactly its own turn now, like a cancellation. Its wire id
+   * then rides that row, whose terminal state only promotes this receipt: the
+   * publish-order prefix sweep in `reconcileRequestStates` finds the turn
+   * already gone and cannot close earlier sends that are still running.
+   */
+  private retireConvergedSend(randomId: string): void {
+    const key = this.randomIdToReceiptKey.get(randomId);
+    const receipt = key ? this.receipts.get(key) : undefined;
+    const wireId = receipt?.wireId;
+    if (!wireId || !receipt) return;
+    const closed = this.retireCancelledApplicationTurn(wireId);
+    this.convergedApplicationTurns.set(wireId, receipt);
+    if (closed) this.setState({ turnActive: false });
+    if (!this.hasAcceptedApplicationTurn()) this.cancelActiveTurnStallTimer();
   }
 
   /**
@@ -3754,6 +3808,7 @@ export class WebChannelNATSClient {
     // thing that distinguishes this device's own receipt from another device's —
     // see `originCommittedSeqs`. Asking afterwards would always answer "not mine".
     const ownCommittedSeqs = msg.type === "ack" ? this.originCommittedSeqs(msg) : undefined;
+    const ownConvergedIds = msg.type === "ack" ? this.originConvergedIds(msg) : undefined;
 
     const lifecycle = this.wrapperLifecycleGeneration;
     this.applyFrame(msg);
@@ -3787,7 +3842,24 @@ export class WebChannelNATSClient {
         if (this.wrapperLifecycleGeneration !== lifecycle) return;
         this.observeSeq(seq, undefined);
       }
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
+      // #399: a converged echo carries no seq, so nothing above moved the
+      // cursor over a row this device never folded. When its server lifecycle
+      // is missing or only queued/started (and therefore possibly stale), fetch
+      // it rather than wait for an unrelated later frame to open the gap.
+      const cursor = this.cursor;
+      if (cursor.state === "synced" && ownConvergedIds?.some(id => !this.state.messages.some(m =>
+        m.kind === undefined && m.role === "user" && m.id === id && m.requestState !== undefined
+          && m.requestState !== "queued" && m.requestState !== "started"))) {
+        this.openCatchUp(cursor.last, []);
+      }
     }
+  }
+
+  /** #399: this device's own `converged` echoes — retries answered with another row. */
+  private originConvergedIds(msg: InboundMessage): string[] {
+    return (msg.committed ?? []).filter(entry => isCommittedEcho(entry) && entry.converged === true
+      && this.randomIdToReceiptKey.has(entry.random_id)).map(entry => entry.messageId);
   }
 
   /**
@@ -4704,7 +4776,8 @@ export class WebChannelNATSClient {
       view = completeToolVersion ? applyDurableEvent(view, decoded.event)
         : this.rowVersions.apply(view, decoded.event, row.seq);
       if (decoded.event.kind === "user" && decoded.event.requestState) {
-        view = applyDurableEvent(view, { kind: "requestState", id: row.id, state: decoded.event.requestState });
+        view = applyDurableEvent(view, { kind: "requestState", id: row.id, state: decoded.event.requestState,
+          ...(row.role === "user" && typeof row.retriedBy === "string" && row.retriedBy.length > 0 ? { retriedBy: row.retriedBy } : {}) });
       }
       if (row.kind === undefined && row.revision !== undefined && isWireSeq(row.revision)) {
         view = applyDurableEvent(view, { kind: "messageEdited", id: row.id,
@@ -4818,7 +4891,13 @@ export class WebChannelNATSClient {
         // after `onSendState` has already flipped the bubble to `accepted`; the
         // re-key preserves that overlay. An ack without `committed` is a no-op
         // here; later history/difference can still carry the exact mapping.
+        const lifecycle = this.wrapperLifecycleGeneration;
         this.adoptCommittedIds(msg.committed);
+        if (this.wrapperLifecycleGeneration !== lifecycle) return true;
+        // #399: a converged retry re-keys this send onto the FIRST retry's row,
+        // which may already be terminal. No later `request_state` will name it,
+        // so settle from the row now (idempotent for an ordinary fresh row).
+        this.reconcileRequestStates();
         return true;
       }
 
@@ -5235,7 +5314,8 @@ export class WebChannelNATSClient {
 
       case "request_state": {
         if (!msg.id || !msg.state) return false;
-        this.applyDurable({ kind: "requestState", id: msg.id, state: msg.state });
+        this.applyDurable({ kind: "requestState", id: msg.id, state: msg.state,
+          ...(typeof msg.retriedBy === "string" && msg.retriedBy.length > 0 ? { retriedBy: msg.retriedBy } : {}) });
         this.reconcileRequestStates();
         return true;
       }

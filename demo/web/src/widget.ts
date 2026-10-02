@@ -447,13 +447,29 @@ export async function createWidget(
         [child],
       );
       if (isUser) {
+        bubble.dataset.messageId = m.id;
         const status = renderSendStatus(m);
         if (status) bubble.append(status);
       }
       if (isUser && m.requestState === "interrupted") {
+        // #399: one retry per original. The server's `retriedBy`, or this
+        // device's own live retry row, spends it; only that retry can be
+        // retried next. A refused or retracted retry never reached the server.
+        const retriedBy = m.retriedBy ?? state.messages.find((r) => r.kind === undefined && r.role === "user" && r.retryOf === m.id
+          && r.sendState !== "failed" && !r.retracted)?.id;
         const retry = el("button", {}, ["Retry"]) as HTMLButtonElement;
-        retry.onclick = () => { client?.retryInterrupted(m.id); };
-        bubble.append(el("div", {}, ["Interrupted · result unknown. Check any effects before retrying.", retry]));
+        const line = el("div", {}, ["Interrupted · result unknown. Check any effects before retrying.", retry]);
+        if (retriedBy === undefined) retry.onclick = () => { client?.retryInterrupted(m.id); };
+        else {
+          retry.disabled = true;
+          const link = el("a", { href: "#" }, ["Retried →"]);
+          link.onclick = (event) => {
+            event.preventDefault();
+            Array.from(list.querySelectorAll<HTMLElement>("[data-message-id]")).find((n) => n.dataset.messageId === retriedBy)?.scrollIntoView?.({ block: "center" });
+          };
+          line.append(" ", link);
+        }
+        bubble.append(line);
       } else if (isUser && m.requestState === "cancelled") {
         bubble.append(el("div", {}, ["Cancelled · the task may have started. Check any effects before sending again."]));
       }

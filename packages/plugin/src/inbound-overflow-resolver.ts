@@ -20,6 +20,8 @@ export type OverflowResolutionRequest = {
   sessionToken: RetentionSessionToken;
   /** `/stop` fallback recovery is authoritative over ordinary overload lookup. */
   recoverCancelled?: boolean;
+  /** #399: the frame's `retry_of`, so a converged retry is not mistaken for an orphan. */
+  retryOf?: string;
 };
 
 export type OverflowResolverStart =
@@ -43,9 +45,18 @@ export type BoundedOverflowResolverOptions = {
     request: OverflowResolutionRequest,
     idempotencyKey: string,
   ): { messageId: string; seq: number } | undefined;
+  /**
+   * #399: the first retry that already consumed `retryOf`'s one retry. A later
+   * retry of the same original is accepted by converging on that row, so its
+   * own key never has one; this is its accept proof, not a crash orphan.
+   */
+  lookupConvergedRetry?(
+    request: OverflowResolutionRequest,
+    retryOf: string,
+  ): { messageId: string } | undefined;
   sendAck(
     request: OverflowResolutionRequest,
-    committed?: Array<{ random_id: string; messageId: string; seq: number }>,
+    committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>,
     cancelled?: boolean,
   ): boolean | Promise<boolean>;
   sendRejected(request: OverflowResolutionRequest): boolean | Promise<boolean>;
@@ -59,6 +70,9 @@ function idempotencyKeyOf(request: OverflowResolutionRequest): string {
   const prefix = `${request.peerId}:`;
   return request.key.startsWith(prefix) ? request.key.slice(prefix.length) : request.id;
 }
+
+/** This id's own journal row, or the first retry a converged retry was answered with. */
+type UserRow = { messageId: string; seq: number; converged?: undefined } | { messageId: string; seq?: undefined; converged: true };
 
 type ActiveTask = {
   request: OverflowResolutionRequest;
@@ -76,6 +90,7 @@ export function overflowResolverMetadataBytes(request: OverflowResolutionRequest
     + Buffer.byteLength(request.key, "utf8")
     + Buffer.byteLength(request.id, "utf8")
     + Buffer.byteLength(request.randomId ?? "", "utf8")
+    + Buffer.byteLength(request.retryOf ?? "", "utf8")
     + 1 // recoverCancelled mode bit
     + OVERFLOW_RESOLVER_METADATA_OVERHEAD;
 }
@@ -109,6 +124,8 @@ export class BoundedOverflowResolver {
       || (request.randomId !== undefined && (typeof request.randomId !== "string"
         || request.randomId.length === 0 || request.randomId.length > 128))
       || (request.recoverCancelled !== undefined && typeof request.recoverCancelled !== "boolean")
+      || (request.retryOf !== undefined && (typeof request.retryOf !== "string"
+        || request.retryOf.length === 0 || request.retryOf.length > 128))
     ) return { status: "invalid" };
     try {
       if (request.storageScope && request.storageScope.accountId !== request.accountId) return { status: "invalid" };
@@ -198,6 +215,7 @@ export class BoundedOverflowResolver {
       peerId: request.peerId, key: request.key,
       id: request.id, randomId: request.randomId, sessionToken: request.sessionToken,
       recoverCancelled: request.recoverCancelled === true,
+      ...(request.retryOf !== undefined ? { retryOf: request.retryOf } : {}),
     };
   }
 
@@ -205,7 +223,7 @@ export class BoundedOverflowResolver {
     const request = task.request;
     try {
       let outcome: "accepted" | "cancelled" | "overloaded";
-      let row: { messageId: string; seq: number } | undefined;
+      let row: UserRow | undefined;
       if (request.recoverCancelled) {
         // /stop fallback is authoritative over an ordinary overload marker.
         const recorded = await this.options.outcomeStore.record(
@@ -233,7 +251,10 @@ export class BoundedOverflowResolver {
         if (task.cancelled || this.disposed || known.status === "unknown") return;
         if (known.status === "found") {
           outcome = known.outcome;
-          if (outcome !== "overloaded") row = this.userRowFor(request, idempotencyKeyOf(request));
+          // Only an ACCEPTED marker may be a converged retry (#399). A cancelled
+          // one echoes its own row, as the flush seam does, never the first
+          // retry's: that would promote a stopped send to another row's result.
+          if (outcome !== "overloaded") row = this.userRowFor(request, idempotencyKeyOf(request), outcome === "accepted");
           // #364: a marker alone cannot prove acceptance. Leave an orphan
           // unresolved for normal admission; cancelled needs no journal row.
           if (outcome === "accepted" && this.options.lookupUserRow !== undefined && row === undefined) return;
@@ -285,9 +306,13 @@ export class BoundedOverflowResolver {
   private userRowFor(
     request: OverflowResolutionRequest,
     idempotencyKey: string,
-  ): { messageId: string; seq: number } | undefined {
+    convergedRetry = false,
+  ): UserRow | undefined {
     try {
-      return this.options.lookupUserRow?.(request, idempotencyKey);
+      const row = this.options.lookupUserRow?.(request, idempotencyKey);
+      if (row !== undefined || !convergedRetry || request.retryOf === undefined) return row;
+      const converged = this.options.lookupConvergedRetry?.(request, request.retryOf);
+      return converged && { messageId: converged.messageId, converged: true };
     } catch {
       return undefined;
     }
@@ -296,10 +321,11 @@ export class BoundedOverflowResolver {
   /** Echo only an explicitly supplied, usable random_id, even when it equals id. */
   private committedEchoFor(
     request: OverflowResolutionRequest,
-    row: { messageId: string; seq: number } | undefined,
-  ): Array<{ random_id: string; messageId: string; seq: number }> | undefined {
+    row: UserRow | undefined,
+  ): Array<{ random_id: string; messageId: string; seq?: number; converged?: true }> | undefined {
     if (row === undefined || request.randomId === undefined) return undefined;
-    return [{ random_id: request.randomId, messageId: row.messageId, seq: row.seq }];
+    // A converged row is not this send's opener: no seq (see `CommittedUserMessage`).
+    return [{ random_id: request.randomId, messageId: row.messageId, ...(row.converged ? { converged: true as const } : { seq: row.seq }) }];
   }
 
   private release(task: ActiveTask): void {

@@ -15,8 +15,13 @@ export const MAX_INGRESS_RESULT_ID_LENGTH = 128;
  * user turn-opener consumes a seq (`appendInboundUser`) but rides no durable wire
  * frame, so this echo is the only way the client learns it — without it the first
  * agent frame of every turn reads as a phantom gap (doc §16.2-6).
+ *
+ * #399: a second retry of one interrupted original converges on the FIRST
+ * retry's row, which this send did not open. Its echo omits `seq` (the row is
+ * not this device's opener, so the cursor must not move over it unfolded) and
+ * says `converged`, so the client settles only that send's own id.
  */
-export type CommittedUserMessage = { random_id: string; messageId: string; seq: number };
+export type CommittedUserMessage = { random_id: string; messageId: string; seq?: number; converged?: true };
 
 export type IngressResultFrame =
   // cancelled is durable proof for a subset of this frame's exact wire ids.
