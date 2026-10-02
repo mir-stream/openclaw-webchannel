@@ -25,6 +25,7 @@ function inside(wrapper: WebChannelNATSClient) {
   return wrapper as unknown as {
     activeTurnStallTimer: unknown;
     applicationTurns: Map<string, unknown>;
+    convergedApplicationTurns: Map<string, unknown>;
     heldStallTimer: unknown;
     cursor: { state: string; last?: number; buffer?: InboundMessage[] };
     pendingHistorySnapshots: InboundMessage[];
@@ -45,7 +46,8 @@ async function setup(options: { timeout?: number; heartbeat?: number; recovery?:
   const key = new Uint8Array(32).fill(39);
   const registration = registerAgent(key, x.publicRaw, identity);
   const control = { admitted: true, ack: true, answerDifferences: true, registrations: 0, interrupted: false, settleBeforeAck: false,
-    cancelled: new Set<string>() };
+    cancelled: new Set<string>(),
+    recoveryTargetStates: [] as Array<{ state: "queued" | "started" | "completed"; seq: number }> };
   const received: Array<Extract<OutboundMessage, { type: "user_message" }>> = [];
   const differences: Array<Extract<OutboundMessage, { type: "get_difference" }>> = [];
   const deliver = (frame: InboundMessage, server = FakeNatsWS.instances.at(-1)!) => {
@@ -64,8 +66,13 @@ async function setup(options: { timeout?: number; heartbeat?: number; recovery?:
         control.admitted = true;
       }
       return Promise.resolve(registration(subject, payload, server, reply)).then(() => {
-        if (isRegister) deliver({ type: "history", highWaterSeq: control.interrupted ? 2 : 0,
-          messages: control.interrupted && options.recovery === "snapshot" ? [row()] : [] }, server);
+        if (isRegister) {
+          const target = control.recoveryTargetStates[control.registrations - 2];
+          deliver({ type: "history", highWaterSeq: target?.seq ?? (control.interrupted ? 2 : 0),
+            messages: target ? [{ id: "M1", role: "user", text: "transfer", turnId: "other-wire",
+              randomId: "other-random", requestState: target.state, retryOf: "O", seq: target.seq }]
+              : control.interrupted && options.recovery === "snapshot" ? [row()] : [] }, server);
+        }
       });
     }
     if (subject !== IN || !control.admitted) return;
@@ -136,8 +143,8 @@ describe("#399 one retry per interrupted original", () => {
   });
 
   const original = { id: "O", role: "user" as const, text: "transfer", turnId: "wire-0", randomId: "random-0", requestState: "interrupted" as const, seq: 2 };
-  async function staleRetry() {
-    const h = await setup();
+  async function staleRetry(options: { timeout?: number } = {}) {
+    const h = await setup(options);
     h.control.ack = false;
     // The fixture's catch-up answers up to seq 2.
     h.deliver({ type: "history", highWaterSeq: 2, messages: [original] });
@@ -203,11 +210,41 @@ describe("#399 one retry per interrupted original", () => {
       seq: 3, requestState: "queued", retryOf: "O" } as unknown as InboundMessage);
     h.deliver({ type: "request_state", id: "O", turnId: "wire-0", state: "interrupted", seq: 4, retriedBy: "M1" });
     h.deliver({ type: "ack", ids: [h.received[1]!.id!], committed: [{ random_id: h.received[1]!.random_id!, messageId: "M1", converged: true }] });
-    h.deliver({ type: "request_state", id: "M1", turnId: "other-wire", state: "completed", seq: 5 });
+    expect(h.differences).toHaveLength(1); // A held queued row may be stale too.
+    expect([...inside(h.wrapper).applicationTurns.keys()]).toEqual([h.received[0]!.id]);
+    expect(inside(h.wrapper).convergedApplicationTurns.size).toBe(1);
+    h.deliver({ type: "difference", afterSeq: 4, nonce: h.differences[0]!.nonce, maxSeq: 5, partial: false,
+      events: [{ seq: 5, event: { kind: "requestState", id: "M1", state: "completed" } }] });
     await settleUntil(() => retry.snapshot().state === "completed", { label: "converged receipt follows M1", timeoutMs: TIMEOUT / 4 });
     expect(z.snapshot().state).toBe("accepted");
     expect(h.wrapper.getState()).toMatchObject({ turnActive: true, isTyping: true });
     expect([...inside(h.wrapper).applicationTurns.keys()]).toEqual([h.received[0]!.id]);
+    expect(inside(h.wrapper).convergedApplicationTurns.size).toBe(0);
+  });
+
+  it("recovers a converged receipt from the target's terminal replacement snapshot", async () => {
+    const h = await staleRetry({ timeout: 40 });
+    h.deliver({ type: "user_committed", id: "M1", text: "transfer", turnId: "other-wire", random_id: "other-random",
+      seq: 3, requestState: "started", retryOf: "O" } as unknown as InboundMessage);
+    h.deliver({ type: "request_state", id: "O", turnId: "wire-0", state: "interrupted", seq: 4, retriedBy: "M1" });
+    h.control.recoveryTargetStates.push({ state: "completed", seq: 5 });
+    h.converge();
+    expect(h.differences).toHaveLength(1);
+    h.deliver({ type: "difference", afterSeq: 4, nonce: h.differences[0]!.nonce,
+      maxSeq: 4, partial: false, events: [] });
+
+    await settleUntil(() => h.control.registrations === 2 && h.differences.length === 2,
+      { label: "converged receipt replacement catch-up", timeoutMs: 500 });
+    h.deliver({ type: "difference", afterSeq: 4, nonce: h.differences[1]!.nonce,
+      maxSeq: 5, partial: false, events: [] });
+
+    await settleUntil(() => h.receipt.snapshot().state === "completed",
+      { label: "converged target recovered terminal snapshot", timeoutMs: 500 });
+    expect(h.control.registrations).toBe(2);
+    expect(h.received).toHaveLength(1);
+    expect(inside(h.wrapper).applicationTurns.size).toBe(0);
+    expect(inside(h.wrapper).convergedApplicationTurns.size).toBe(0);
+    expect(h.wrapper.getState().messages.find(m => m.id === "M1")).toMatchObject({ requestState: "completed" });
   });
 
   it("a retry the server refused does not spend the original", async () => {

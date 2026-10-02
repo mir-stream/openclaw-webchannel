@@ -164,7 +164,10 @@ retransmission gets the same echo, through the overflow resolver too. The
 client retires only that send's own turn at once (never the publish-order
 prefix of earlier sends still running), adopts its bubble onto that row and
 follows that row's outcome, immediately when the row is already terminal. If this device does not hold
-that row yet, it fetches it with `get_difference`. Locally, a retry row whose
+that row yet, or holds only a possibly stale queued/started view, it fetches it
+with `get_difference`. While the adopted receipt remains nonterminal, the normal
+application-stall deadline retains its bounded recovery opportunity; the retired
+alias never rejoins publish-order turn ownership. Locally, a retry row whose
 send state is `failed` or that was retracted does not spend the original. That
 covers a retry the server refused, and also one it accepted that then failed
 or was cancelled: if this device lacks the original's `retriedBy`, Retry is

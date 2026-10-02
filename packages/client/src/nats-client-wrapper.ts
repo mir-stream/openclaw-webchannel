@@ -909,6 +909,13 @@ export class WebChannelNATSClient {
    * Unlike the advisory openTurns set, transport loss cannot retire this work.
    */
   private readonly applicationTurns = new Map<string, ReceiptRecord>();
+  /**
+   * #399: converged sends no longer own a publish-order turn, but their receipts
+   * still owe the first retry row's authoritative outcome. Key by the retired
+   * local wire id so terminal receipt transitions discard exact ownership
+   * without putting the alias back into the prefix-settlement collection.
+   */
+  private readonly convergedApplicationTurns = new Map<string, ReceiptRecord>();
   /** Local candidates at the latest typing frame; not exclusive activity owners. */
   private typingLocalCandidates = new Set<string>();
   /** One cancellation cleanup decision for this typing episode, never a task outcome. */
@@ -1177,6 +1184,7 @@ export class WebChannelNATSClient {
       this.wrapperLifecycleGeneration++;
       this.deferredCancelledTyping = undefined;
       this.applicationTurns.clear();
+      this.convergedApplicationTurns.clear();
       this.activeTurnRecoveryIssued = false;
       this.cancelActiveTurnStallTimer();
       const deferredEntries = this.deferredReplacementOperations.splice(0);
@@ -1301,6 +1309,7 @@ export class WebChannelNATSClient {
     this.closeTransactionDepth++;
     try {
       this.applicationTurns.clear();
+      this.convergedApplicationTurns.clear();
       this.activeTurnRecoveryIssued = false;
       // Detach only this lifecycle's wrapper ownership before any timer or raw
       // teardown callout. Work created after a reentrant connect is replacement
@@ -2117,6 +2126,13 @@ export class WebChannelNATSClient {
       // receipt callback is queued behind a subscriber. It already owns the
       // verdict: no timer may request recovery during that callback window.
       if (receipt.state === "accepted" && !this.client.isIngressCancelled(id)) return true;
+    }
+    return this.hasAcceptedConvergedTurn();
+  }
+
+  private hasAcceptedConvergedTurn(): boolean {
+    for (const receipt of this.convergedApplicationTurns.values()) {
+      if (receipt.state === "accepted") return true;
     }
     return false;
   }
@@ -3525,7 +3541,10 @@ export class WebChannelNATSClient {
           && next.failure?.reason === "overloaded"
           && this.closeTurn(rec.wireId));
         if (next.state === "completed" || next.state === "interrupted" || next.state === "failed") {
-          if (rec.wireId) this.applicationTurns.delete(rec.wireId);
+          if (rec.wireId) {
+            this.applicationTurns.delete(rec.wireId);
+            this.convergedApplicationTurns.delete(rec.wireId);
+          }
         }
         this.patchBubbleByReceiptKey(
           receiptKey,
@@ -3617,9 +3636,12 @@ export class WebChannelNATSClient {
    */
   private retireConvergedSend(randomId: string): void {
     const key = this.randomIdToReceiptKey.get(randomId);
-    const wireId = key ? this.receipts.get(key)?.wireId : undefined;
-    if (!wireId) return;
-    if (this.retireCancelledApplicationTurn(wireId)) this.setState({ turnActive: false });
+    const receipt = key ? this.receipts.get(key) : undefined;
+    const wireId = receipt?.wireId;
+    if (!wireId || !receipt) return;
+    const closed = this.retireCancelledApplicationTurn(wireId);
+    this.convergedApplicationTurns.set(wireId, receipt);
+    if (closed) this.setState({ turnActive: false });
     if (!this.hasAcceptedApplicationTurn()) this.cancelActiveTurnStallTimer();
   }
 
@@ -3819,12 +3841,13 @@ export class WebChannelNATSClient {
       }
       if (this.wrapperLifecycleGeneration !== lifecycle) return;
       // #399: a converged echo carries no seq, so nothing above moved the
-      // cursor over a row this device never folded. When that row's server
-      // lifecycle is not held here yet, fetch it rather than wait for an
-      // unrelated later frame to open the gap.
+      // cursor over a row this device never folded. When its server lifecycle
+      // is missing or only queued/started (and therefore possibly stale), fetch
+      // it rather than wait for an unrelated later frame to open the gap.
       const cursor = this.cursor;
       if (cursor.state === "synced" && ownConvergedIds?.some(id => !this.state.messages.some(m =>
-        m.kind === undefined && m.role === "user" && m.id === id && m.requestState !== undefined))) {
+        m.kind === undefined && m.role === "user" && m.id === id && m.requestState !== undefined
+          && m.requestState !== "queued" && m.requestState !== "started"))) {
         this.openCatchUp(cursor.last, []);
       }
     }
