@@ -311,6 +311,8 @@ export class BoundedOverflowResolver {
     try {
       const row = this.options.lookupUserRow?.(request, idempotencyKey);
       if (row !== undefined || !convergedRetry || request.retryOf === undefined) return row;
+      // Production prefers the exact alias receipt. Its legacy fallback is safe
+      // only here because this arm is already gated by this alias's accepted marker.
       const converged = this.options.lookupConvergedRetry?.(request, request.retryOf);
       return converged && { messageId: converged.messageId, converged: true };
     } catch {

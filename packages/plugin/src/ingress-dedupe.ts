@@ -798,11 +798,17 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           try {
             if (deps.deliveryJournal?.dispatch?.isCancelled(peerId, idempotencyKey)) {
               const row = deps.deliveryJournal.lookupUserMessageIdByRandomId(peerId, idempotencyKey);
-              const neverAccepted = deps.deliveryJournal.dispatch.isUnaccepted(peerId, idempotencyKey);
+              const converged = row === undefined ? deps.deliveryJournal.dispatch.convergence(peerId, idempotencyKey) : undefined;
+              // Optional presentation evidence must not suppress the proven
+              // cancellation receipt or turn this item into a FIFO blocker.
+              let neverAccepted = false;
+              try { neverAccepted = deps.deliveryJournal.dispatch.isUnaccepted(peerId, idempotencyKey); }
+              catch { warnJournal("stop-unaccepted-lookup-failed", "webchannel: optional never-accepted classification lookup failed"); }
               ackIds.push(id);
               cancelledIds.add(id);
               if (neverAccepted) unacceptedIds.add(id);
               if (row && randomId !== undefined) committedBatch.push({ random_id: randomId, ...row });
+              else if (converged && randomId !== undefined) committedBatch.push({ random_id: randomId, messageId: converged.messageId, converged: true });
               release();
               continue;
             }
@@ -1031,12 +1037,14 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             // row. That is the answer this marker recorded, not a lost
             // admission: re-echo it (seq-less, as the first time) without the
             // re-admission warning.
-            const retryOf = row === undefined && deps.dispatchRecovery && typeof item.message.retry_of === "string"
-              ? deps.deliveryJournal?.dispatch?.retryOf(peerId, item.message.retry_of) : undefined;
-            if (retryOf !== undefined) {
+            const converged = row === undefined && deps.dispatchRecovery
+              ? deps.deliveryJournal?.dispatch?.convergence(peerId, idempotencyKey)
+                ?? (typeof item.message.retry_of === "string" ? deps.deliveryJournal?.dispatch?.retryOf(peerId, item.message.retry_of) : undefined)
+              : undefined;
+            if (converged !== undefined) {
               release();
               ackIds.push(id);
-              if (randomId !== undefined) committedBatch.push({ random_id: randomId, messageId: retryOf.messageId, converged: true });
+              if (randomId !== undefined) committedBatch.push({ random_id: randomId, messageId: converged.messageId, converged: true });
               continue;
             }
             const orphanedMarker = deps.deliveryJournal !== undefined && row === undefined;

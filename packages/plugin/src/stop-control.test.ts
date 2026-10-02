@@ -509,7 +509,7 @@ it("teardown drains the old core control invocation before an account replacemen
   expect(fresh.journal.dispatch!.isCancelled("RawPeer", "logical-A")).toBe(true);
 });
 
-it("upgrades a schema 1 journal without changing existing queued or historical requests", async () => {
+it.each(["1", "2"])("upgrades a schema %s journal without changing existing queued or historical requests", async version => {
   const h = setup();
   h.recovery.accept("RawPeer", [{ text: "B", turnId: "device-1:B", randomId: "logical-B" }]);
   h.journal.appendInboundUser("RawPeer", { text: "old", turnId: "old-wire", randomId: "old-logical" });
@@ -519,14 +519,15 @@ it("upgrades a schema 1 journal without changing existing queued or historical r
   const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
   const db = new DatabaseSync(h.paths.deliveryJournalPath);
   try {
-    db.exec("DROP TABLE journal_stop_target; DROP TABLE journal_stop; UPDATE journal_meta SET value='1' WHERE key='dispatch_schema_version'");
+    if (version === "1") db.exec("DROP TABLE journal_stop_target; DROP TABLE journal_stop");
+    db.exec(`DROP TABLE journal_dispatch_convergence; UPDATE journal_meta SET value='${version}' WHERE key='dispatch_schema_version'`);
     const migrated = openDeliveryJournal({ databasePath: h.paths.deliveryJournalPath });
     try {
       expect(migrated.read("RawPeer")).toEqual(events);
       expect(migrated.dispatch!.lookup("RawPeer", "logical-B")).toEqual(queued);
       expect(migrated.dispatch!.lookup("RawPeer", "old-logical")).toBeUndefined();
       expect(migrated.dispatch!.lookupStop("RawPeer", "logical-S")).toBeUndefined();
-      expect(db.prepare("SELECT value FROM journal_meta WHERE key='dispatch_schema_version'").get()).toMatchObject({ value: "2" });
+      expect(db.prepare("SELECT value FROM journal_meta WHERE key='dispatch_schema_version'").get()).toMatchObject({ value: "3" });
     } finally { migrated.close(); }
   } finally { db.close(); }
 });
@@ -680,4 +681,91 @@ it("#398 a fault reading the never-accepted evidence omits only that declaration
     { peerId: "RawPeer", ids: ["device-2:S"], committed: undefined, cancelled: undefined },
   ]);
   expect(h.errors.map(String).join("\n")).toContain("SQLite read unavailable");
+});
+
+it.each([false, true])("#425 a stopped accepted convergence alias preserves its exact receipt after ACK loss (reopen=%s)", async reopen => {
+  const root = temporaryRoot();
+  const paths = tupleStoragePaths({ storageRoot: root, tenant: "tenant-a", accountId: "ExactAccount" });
+  const seed = openDeliveryJournal({ databasePath: paths.deliveryJournalPath });
+  const firstOwner = seed.dispatch!.activate();
+  const [original] = seed.dispatch!.accept(firstOwner, "RawPeer", [{ text: "transfer", turnId: "wire-O", randomId: "logical-O" }]);
+  seed.dispatch!.claim(firstOwner, "RawPeer", ["logical-O"]);
+  const owner = seed.dispatch!.activate();
+  seed.dispatch!.recoverInterrupted(owner);
+  const [first] = seed.dispatch!.accept(owner, "RawPeer", [{ text: "transfer", turnId: "wire-R1", randomId: "logical-R1", retryOf: original!.messageId }]);
+  expect(seed.dispatch!.accept(owner, "RawPeer", [{ text: "transfer", turnId: "wire-R2", randomId: "logical-R2", retryOf: original!.messageId }]))
+    .toEqual([expect.objectContaining({ messageId: first!.messageId, converged: true })]);
+  seed.close();
+
+  const originalRuntime = setup({ root });
+  const alias = { ...item("R2", "buffered"), message: { ...item("R2", "buffered").message, text: "transfer", retry_of: original!.messageId } };
+  expect(originalRuntime.stop.handle(stop("S", "device-2", [alias]), true)).toMatchObject({ fresh: true });
+  expect(originalRuntime.acks.find(ack => ack.ids.includes("buffered:R2"))).toEqual({
+    peerId: "RawPeer", ids: ["buffered:R2"],
+    committed: [{ random_id: "logical-R2", messageId: first!.messageId, converged: true }],
+    cancelled: undefined,
+  });
+  originalRuntime.acks.length = 0;
+  expect(originalRuntime.debouncer.push(alias)).toEqual({ status: "accepted" });
+  expect(originalRuntime.stop.handle(stop("S2", "device-2"), true)).toMatchObject({ fresh: true });
+  expect(originalRuntime.acks.find(ack => ack.ids.includes("buffered:R2"))).toEqual({
+    peerId: "RawPeer", ids: ["buffered:R2"],
+    committed: [{ random_id: "logical-R2", messageId: first!.messageId, converged: true }],
+    cancelled: ["buffered:R2"],
+  });
+  if (reopen) await originalRuntime.close();
+  const h = reopen ? setup({ root }) : originalRuntime;
+  h.acks.length = 0;
+  await h.flush([{ ...alias, message: { ...alias.message, id: "cold:R2" } }]);
+  expect(h.acks).toEqual([{
+    peerId: "RawPeer", ids: ["cold:R2"],
+    committed: [{ random_id: "logical-R2", messageId: first!.messageId, converged: true }],
+    cancelled: ["cold:R2"],
+  }]);
+  const hot = await h.store.record("ExactAccount", "RawPeer:logical-R2", "cancelled");
+  if (hot.status === "recorded") hot.write.commit();
+  await h.store.lookup("ExactAccount", "RawPeer:logical-R2");
+  h.acks.length = 0;
+  expect(h.debouncer.push({ ...alias, message: { ...alias.message, id: "hot:R2" } }))
+    .toEqual({ status: "known-outcome", outcome: "cancelled" });
+  expect(h.acks).toEqual([{
+    peerId: "RawPeer", ids: ["hot:R2"],
+    committed: [{ random_id: "logical-R2", messageId: first!.messageId, converged: true }],
+    cancelled: ["hot:R2"],
+  }]);
+  expect(h.journal.dispatch!.convergence("RawPeer", "logical-R2")).toMatchObject({ messageId: first!.messageId });
+});
+
+it("#425 a never-processed retry remains unaccepted even when another retry already exists", () => {
+  const root = temporaryRoot();
+  const paths = tupleStoragePaths({ storageRoot: root, tenant: "tenant-a", accountId: "ExactAccount" });
+  const seed = openDeliveryJournal({ databasePath: paths.deliveryJournalPath });
+  const firstOwner = seed.dispatch!.activate();
+  const [original] = seed.dispatch!.accept(firstOwner, "RawPeer", [{ text: "transfer", turnId: "wire-O", randomId: "logical-O" }]);
+  seed.dispatch!.claim(firstOwner, "RawPeer", ["logical-O"]);
+  const owner = seed.dispatch!.activate();
+  seed.dispatch!.recoverInterrupted(owner);
+  seed.dispatch!.accept(owner, "RawPeer", [{ text: "transfer", turnId: "wire-R1", randomId: "logical-R1", retryOf: original!.messageId }]);
+  seed.close();
+  const h = setup({ root });
+  const unknown = { ...item("R2", "device-1"), message: { ...item("R2", "device-1").message, text: "transfer", retry_of: original!.messageId } };
+  expect(h.stop.handle(stop("S", "device-2", [unknown]), true)).toMatchObject({ fresh: true });
+  expect(h.journal.dispatch!.convergence("RawPeer", "logical-R2")).toBeUndefined();
+  expect(h.acks.find(ack => ack.ids.includes("device-1:R2"))).toMatchObject({
+    cancelled: ["device-1:R2"], unaccepted: ["device-1:R2"], committed: undefined,
+  });
+});
+
+it("#398 an optional unaccepted-classification fault keeps the cancellation ACK and later work", async () => {
+  const h = setup();
+  h.debouncer.push(item("A"));
+  h.stop.handle(item("S", "device-2"), true);
+  h.acks.length = 0;
+  vi.spyOn(h.journal.dispatch!, "isUnaccepted").mockImplementation(() => { throw new Error("optional read unavailable"); });
+  await h.flush([item("A", "cancelled-retry"), item("B", "later")]);
+  expect(h.acks).toEqual([{ peerId: "RawPeer", ids: ["cancelled-retry:A", "later:B"], committed: [
+    expect.objectContaining({ random_id: "logical-B" }),
+  ], cancelled: ["cancelled-retry:A"] }]);
+  await vi.waitFor(() => expect(h.runs.map(run => run.message.text)).toContain("B"));
+  expect(h.journal.dispatch!.lookup("RawPeer", "logical-B")?.state).toBe("completed");
 });

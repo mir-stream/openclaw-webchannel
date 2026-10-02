@@ -17,13 +17,16 @@ export type CoreDispatchBinding = { processId: string; agentId: string; sessionK
  * `converged` marks a later retry answered with that first retry's row. */
 export type UserCommit = { messageId: string; seq: number; inserted: boolean; retryOf?: string; retried?: DispatchChange; converged?: true };
 export type StopReceipt = { key: string; cancelBuffered: boolean; targetCount: number };
+export type ConvergenceReceipt = { messageId: string; seq: number; retryOf: string };
 export interface DispatchStore {
   lookupStop(peerId: string, key: string): StopReceipt | undefined;
   /** `pendingCancelled`: the named earlier keys this call itself made targets. */
   recordStop(owner: string, peerId: string, key: string, bufferedKeys: readonly string[], cancelBuffered: boolean, pendingKeys?: readonly string[]): StopReceipt & { fresh: boolean; pendingCancelled?: string[] };
   isCancelled(peerId: string, key: string): boolean;
-  /** #398: durably cancelled with no dispatch row and no user row: never accepted. */
+  /** #398: durably cancelled with no user/dispatch row or convergence receipt. */
   isUnaccepted(peerId: string, key: string): boolean;
+  /** #425: exact durable proof that this rowless alias was accepted by convergence. */
+  convergence(peerId: string, key: string): ConvergenceReceipt | undefined;
   stopChanges(peerId: string, key: string, after?: number): DispatchChange[];
   bindCore(binding: CoreDispatchBinding): void;
   coreBindings(): CoreDispatchBinding[];
@@ -52,7 +55,7 @@ const decode = (r: Stored): DispatchRow => ({ peerId: r.peer_id, key: r.logical_
 /** Shares the journal connection: user row, recoverable payload and status commit together. */
 export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string, input: DispatchInput & { requestState: RequestState }) => UserCommit, appendEvent: (peer: string, event: DurableEvent) => { seq: number }): DispatchStore {
   const version = db.prepare("SELECT value FROM journal_meta WHERE key='dispatch_schema_version'").get() as { value: string } | undefined;
-  if (version && version.value !== "1" && version.value !== "2") throw new Error("webchannel: unsupported dispatch schema version; use the writer version or newer");
+  if (version && version.value !== "1" && version.value !== "2" && version.value !== "3") throw new Error("webchannel: unsupported dispatch schema version; use the writer version or newer");
   runSqliteImmediateTransactionSync(db, () => {
     db.exec(`CREATE TABLE IF NOT EXISTS journal_dispatch_core (batch TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS journal_dispatch (
@@ -69,8 +72,11 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
         state_seq INTEGER, PRIMARY KEY(peer_id,logical_key));
       CREATE INDEX IF NOT EXISTS journal_stop_result ON journal_stop_target(peer_id,stop_key,state_seq);
       CREATE TABLE IF NOT EXISTS journal_stop_pending (
-        peer_id TEXT NOT NULL, logical_key TEXT NOT NULL, PRIMARY KEY(peer_id,logical_key));`);
-    db.prepare("INSERT INTO journal_meta VALUES('dispatch_schema_version','2') ON CONFLICT(key) DO UPDATE SET value='2'").run();
+        peer_id TEXT NOT NULL, logical_key TEXT NOT NULL, PRIMARY KEY(peer_id,logical_key));
+      CREATE TABLE IF NOT EXISTS journal_dispatch_convergence (
+        peer_id TEXT NOT NULL, logical_key TEXT NOT NULL, message_id TEXT NOT NULL,
+        user_seq INTEGER NOT NULL, retry_of TEXT NOT NULL, PRIMARY KEY(peer_id,logical_key));`);
+    db.prepare("INSERT INTO journal_meta VALUES('dispatch_schema_version','3') ON CONFLICT(key) DO UPDATE SET value='3'").run();
   });
   const sql = (s: string) => db.prepare(s);
   const owns = (owner: string) => (sql("SELECT value FROM journal_meta WHERE key='dispatch_owner'").get() as { value: string } | undefined)?.value === owner;
@@ -84,6 +90,10 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
     return row && { messageId: row.message_id, seq: Number(row.user_seq) };
   };
   const isCancelled = (peer: string, key: string) => !!sql("SELECT 1 FROM journal_stop_target WHERE peer_id=? AND logical_key=?").get(peer, key);
+  const convergence = (peer: string, key: string): ConvergenceReceipt | undefined => {
+    const row = sql("SELECT message_id,user_seq,retry_of FROM journal_dispatch_convergence WHERE peer_id=? AND logical_key=?").get(peer, key) as { message_id: string; user_seq: number; retry_of: string } | undefined;
+    return row && { messageId: row.message_id, seq: Number(row.user_seq), retryOf: row.retry_of };
+  };
   const lookupStop = (peer: string, key: string): StopReceipt | undefined => {
     const row = sql("SELECT cancel_buffered,target_count FROM journal_stop WHERE peer_id=? AND logical_key=?").get(peer, key) as { cancel_buffered: number; target_count: number } | undefined;
     return row && { key, cancelBuffered: row.cancel_buffered === 1, targetCount: Number(row.target_count) };
@@ -99,7 +109,9 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
     isCancelled,
     isUnaccepted: (peer, key) => !!sql(`SELECT 1 FROM journal_stop_target t WHERE t.peer_id=? AND t.logical_key=?
       AND NOT EXISTS (SELECT 1 FROM journal_dispatch WHERE peer_id=t.peer_id AND logical_key=t.logical_key)
-      AND NOT EXISTS (SELECT 1 FROM journal_event WHERE conversation_id=t.peer_id AND kind='user' AND idempotency_key=t.logical_key)`).get(peer, key),
+      AND NOT EXISTS (SELECT 1 FROM journal_event WHERE conversation_id=t.peer_id AND kind='user' AND idempotency_key=t.logical_key)
+      AND NOT EXISTS (SELECT 1 FROM journal_dispatch_convergence WHERE peer_id=t.peer_id AND logical_key=t.logical_key)`).get(peer, key),
+    convergence,
     recordStop: (owner, peer, key, bufferedKeys, cancelBuffered, pendingKeys = []) => runSqliteImmediateTransactionSync(db, () => {
       checkOwner(owner);
       const previous = lookupStop(peer, key);
@@ -118,11 +130,16 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
         // control request already ran and must keep answering with its real
         // outcome, never a false cancellation.
         for (const target of new Set(pendingKeys)) {
-          const inserted = sql(`INSERT OR IGNORE INTO journal_stop_target SELECT ?,?,?,NULL
-            WHERE NOT EXISTS (SELECT 1 FROM journal_dispatch WHERE peer_id=? AND logical_key=?)
-              AND NOT EXISTS (SELECT 1 FROM journal_event WHERE conversation_id=? AND kind='user' AND idempotency_key=?)
-              AND NOT EXISTS (SELECT 1 FROM journal_stop WHERE peer_id=? AND logical_key=?)`)
-            .run(peer, target, key, peer, target, peer, target, peer, target);
+          const alias = convergence(peer, target);
+          // The mapped first retry is already covered by the ordinary
+          // queued/started scan. Its accepted alias needs only its exact receipt
+          // re-echoed; it is not a second cancellation target of its own.
+          const inserted = alias === undefined ? sql(`INSERT OR IGNORE INTO journal_stop_target SELECT ?,?,?,NULL
+              WHERE NOT EXISTS (SELECT 1 FROM journal_dispatch WHERE peer_id=? AND logical_key=?)
+                AND NOT EXISTS (SELECT 1 FROM journal_event WHERE conversation_id=? AND kind='user' AND idempotency_key=?)
+                AND NOT EXISTS (SELECT 1 FROM journal_stop WHERE peer_id=? AND logical_key=?)`)
+              .run(peer, target, key, peer, target, peer, target, peer, target)
+            : { changes: 0 };
           if (Number(inserted.changes) === 1) {
             sql("INSERT OR IGNORE INTO journal_stop_pending VALUES(?,?)").run(peer, target);
             pendingCancelled.push(target);
@@ -185,6 +202,8 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
         // A retransmission echoes the provenance of the row it already has, not
         // the one it just asked for again.
         if (existing) return { messageId: existing.messageId, seq: existing.seq, inserted: false, ...(existing.input.retryOf ? { retryOf: existing.input.retryOf } : {}) };
+        const converged = convergence(peer, key);
+        if (converged) return { ...converged, inserted: false, converged: true };
         if (isCancelled(peer, key)) throw new Error("webchannel: cancelled ingress cannot be accepted");
         // Provenance can only name an interrupted request in this exact
         // conversation. An unknown or ineligible `retry_of` is DROPPED, never
@@ -205,7 +224,13 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
         // itself interrupted is an original too, so the chain continues only
         // from its newest link.
         const prior = original === undefined ? undefined : firstRetry(peer, input.retryOf!);
-        if (prior) return { ...prior, inserted: false, retryOf: input.retryOf, converged: true };
+        if (prior) {
+          // This exact alias was processed. Persist its answer in the same
+          // acceptance transaction so ACK loss, /stop and restart never infer
+          // acceptance merely from another device's first retry.
+          sql("INSERT INTO journal_dispatch_convergence VALUES(?,?,?,?,?)").run(peer, key, prior.messageId, prior.seq, input.retryOf);
+          return { ...prior, inserted: false, retryOf: input.retryOf, converged: true };
+        }
         const accepted: DispatchInput = original?.state === "interrupted" ? input : { ...input, retryOf: undefined };
         const row = appendUser(peer, { ...accepted, requestState: "queued" });
         // An existing historical user row cannot prove it was never started.

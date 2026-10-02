@@ -64,8 +64,8 @@ later. Same-ID retries immediately receive the existing receipt.
 
 An authorized explicit `/stop` also carries `cancel_pending` (protocol 7, #398):
 the earlier user messages that device still has no server result for. Each one
-without a dispatch row, user row or stop receipt becomes a target in the same
-transaction, and the stop answers exactly those with `cancelled` and
+without a dispatch row, user row, exact convergence receipt or stop receipt
+becomes a target in the same transaction, and the stop answers exactly those with `cancelled` and
 `unaccepted`, split into ACK frames of at most 64 IDs like any other result. If
 that input arrives later, for example after an overloaded or blocked first
 delivery, it is cancelled rather than run. A named input the server already
@@ -73,9 +73,9 @@ accepted keeps its ordinary receipt: a settled one keeps its real outcome, and a
 queued/started one is cancelled as above and reported through its request state.
 
 `ack.unaccepted` (protocol 7) is the server's per-ID declaration that a cancelled
-ID was never accepted: the SQLite stop ledger holds it with no dispatch row and
-no user row. Every ledger-backed cancellation ACK computes it the same way — the
-stop's own target ACKs, and later hot or cold arrivals — so an input cancelled in
+ID was never accepted: the SQLite stop ledger holds it with no dispatch row,
+user row or exact convergence receipt. Every ledger-backed cancellation ACK
+computes it the same way — the stop's own target ACKs, and later hot or cold arrivals — so an input cancelled in
 the debounce window is declared too. It rides the same frame as its ID; the
 `committed` echo, which rides only the first frame of a split, is never evidence
 for it. A journal fault, or an SDK-only cancellation without ledger evidence,
@@ -120,8 +120,8 @@ as dispatch lifecycle records; evicting them would permit old replays to execute
 No message payload is copied into the stop tables. Target capture uses the
 existing bounded debounce reservations and one already-charged overflow key per
 session, and dispatch updates/notifications page
-32 rows at a time without collecting a whole durable backlog. Dispatch schema 2
-upgrades schema 1 transactionally; earlier schema-1 writers refuse the file.
+32 rows at a time without collecting a whole durable backlog. Dispatch schema 3
+upgrades schemas 1 and 2 transactionally; earlier writers refuse the file.
 Protocol 6 requires the matching client cancellation handling; the SDK pin is
 unchanged. Do not downgrade this database.
 
@@ -186,11 +186,16 @@ Each interrupted original admits **one** retry (#399). The accept transaction
 looks for a stored dispatch row whose `retryOf` names the original; the first
 retry's row is that durable mark. A later retry naming the same original — a
 double click, a second device, a reload re-click, or a restart in between —
-inserts no row and never runs: its ACK echoes the first retry's server ID
+inserts no user or dispatch row and never runs: its ACK echoes the first retry's server ID
 with `converged: true` and without a seq, because that row is not this send's
 opener and the client's cursor must not move over it unfolded. Its
 retransmission gets the same echo, through the overflow resolver too. The
-client retires only that send's own turn at once (never the publish-order
+alias-to-retry receipt is committed in the same SQLite acceptance transaction
+(dispatch schema 3 upgrades schemas 1 and 2), so ACK loss, restart and `/stop`
+re-echo that exact mapping without inferring acceptance merely because some
+other device's retry row exists. Journals created
+before this receipt existed do not manufacture historical proof. The client
+retires only that send's own turn at once (never the publish-order
 prefix of earlier sends still running), adopts its bubble onto that row and
 follows that row's outcome, immediately when the row is already terminal. If this device does not hold
 that row yet, or holds only a possibly stale queued/started view, it fetches it
@@ -212,8 +217,8 @@ In the same transaction, after the retry's user row, the journal records a
 `request_state` frame (published after the retry's `user_committed`) carry it.
 The reducer sets it once, and the app renders **Retried →** linked to that row
 with Retry disabled. It also disables Retry as soon as this device's own retry
-row exists. The dispatch schema is unchanged and `retriedBy` is an optional
-additive field, so this change needs no protocol bump of its own. The protocol
+row exists. `retriedBy` is an optional additive field using existing journal
+events, so the retry link needs no protocol bump of its own. The protocol
 version is an exact-match gate, so a client at another version never connects.
 A same-version client built before this change ignores the link and the
 `converged` marker, and the server still enforces one retry. Its double click

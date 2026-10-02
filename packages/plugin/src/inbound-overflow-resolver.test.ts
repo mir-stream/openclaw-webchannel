@@ -748,7 +748,7 @@ describe("BoundedOverflowResolver — the journal is the accept authority (#344)
       const resolver = new BoundedOverflowResolver({
         outcomeStore,
         lookupUserRow: ({ peerId }, idempotencyKey) => journal.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
-        lookupConvergedRetry: ({ peerId }, retryOf) => dispatch.retryOf(peerId, retryOf),
+        lookupConvergedRetry: ({ peerId }, retryOf) => dispatch.convergence(peerId, "r-2") ?? dispatch.retryOf(peerId, retryOf),
         sendAck: ({ id }, committed) => { acks.push({ id, committed }); return true; },
         sendRejected: () => true,
       });
@@ -788,7 +788,7 @@ describe("BoundedOverflowResolver — the journal is the accept authority (#344)
       const resolver = new BoundedOverflowResolver({
         outcomeStore,
         lookupUserRow: ({ peerId }, idempotencyKey) => journal.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
-        lookupConvergedRetry: ({ peerId }, retryOf) => dispatch.retryOf(peerId, retryOf),
+        lookupConvergedRetry: ({ peerId }, retryOf) => dispatch.convergence(peerId, "r-2") ?? dispatch.retryOf(peerId, retryOf),
         sendAck: ({ id }, committed, cancelled) => { acks.push({ id, committed, cancelled }); return true; },
         sendRejected: () => true,
       });

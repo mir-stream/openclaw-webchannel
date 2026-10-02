@@ -52,15 +52,22 @@ export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(d
         // row from before /stop. Preserve its echo even on the hot-cache path.
         const identity = ingressIdentity(item)!;
         let row;
+        let converged;
         // #398: "never accepted" is declared only on positive SQLite evidence;
         // a fault leaves the input as an ordinary (accepted) cancellation.
         let neverAccepted = false;
         try {
           row = deps.deliveryJournal.lookupUserMessageIdByRandomId(peerId, identity.idempotencyKey);
-          neverAccepted = outcome === "cancelled" && deps.deliveryJournal.dispatch?.isUnaccepted(peerId, identity.idempotencyKey) === true;
+          if (row === undefined) converged = deps.deliveryJournal.dispatch?.convergence(peerId, identity.idempotencyKey);
         } catch { /* A journal fault does not undo a known cancellation. */ }
+        try {
+          neverAccepted = outcome === "cancelled" && deps.deliveryJournal.dispatch?.isUnaccepted(peerId, identity.idempotencyKey) === true;
+        } catch { /* Optional classification does not undo a known cancellation. */ }
         const cancelled = outcome === "cancelled" ? [id] : undefined;
-        const committed = row && identity.randomId !== undefined ? [{ random_id: identity.randomId, ...row }] : undefined;
+        const committed = identity.randomId === undefined ? undefined
+          : row ? [{ random_id: identity.randomId, ...row }]
+            : converged ? [{ random_id: identity.randomId, messageId: converged.messageId, converged: true as const }]
+              : undefined;
         if (neverAccepted) deps.sendAck(peerId, [id], committed, cancelled, [id]);
         else deps.sendAck(peerId, [id], committed, cancelled);
       }

@@ -26,7 +26,11 @@ export function createStopControl<Item extends IngressDedupeItem & { message: { 
     const identity = ingressIdentity(item);
     if (!identity || !active()) return;
     const row = deps.journal.lookupUserMessageIdByRandomId(item.peerId, identity.idempotencyKey);
-    const committed = row && identity.randomId !== undefined ? [{ random_id: identity.randomId, ...row }] : undefined;
+    const converged = row === undefined ? deps.journal.dispatch!.convergence(item.peerId, identity.idempotencyKey) : undefined;
+    const committed = identity.randomId === undefined ? undefined
+      : row ? [{ random_id: identity.randomId, ...row }]
+        : converged ? [{ random_id: identity.randomId, messageId: converged.messageId, converged: true as const }]
+          : undefined;
     const ids = [identity.wireId];
     // #398: the server, not the client, declares that a cancelled input was never
     // accepted. A read fault omits only the declaration, never the receipt.
@@ -45,11 +49,27 @@ export function createStopControl<Item extends IngressDedupeItem & { message: { 
   const ackPending = (peer: string, named: IngressDedupeItem[], cancelledKeys: readonly string[]) => {
     if (!active()) return;
     const keys = new Set(cancelledKeys);
-    const ids = named.flatMap(entry => {
+    const ids: string[] = [];
+    const cancelled: string[] = [];
+    const unaccepted: string[] = [];
+    const committed: Array<{ random_id: string; messageId: string; converged: true }> = [];
+    for (const entry of named) {
       const identity = ingressIdentity(entry)!;
-      return keys.has(identity.idempotencyKey) ? [identity.wireId] : [];
-    });
-    if (ids.length && !deps.sendAck(peer, ids, undefined, ids, ids)) {
+      const converged = deps.journal.dispatch!.convergence(peer, identity.idempotencyKey);
+      if (!keys.has(identity.idempotencyKey) && !converged) continue;
+      ids.push(identity.wireId);
+      if (converged && identity.randomId !== undefined) {
+        committed.push({ random_id: identity.randomId, messageId: converged.messageId, converged: true });
+      }
+      if (keys.has(identity.idempotencyKey)) {
+        // recordStop returned this key only after transactionally proving and
+        // inserting its never-accepted target; no fallible re-read is needed.
+        cancelled.push(identity.wireId);
+        unaccepted.push(identity.wireId);
+      }
+    }
+    if (ids.length && !deps.sendAck(peer, ids, committed.length ? committed : undefined,
+      cancelled.length ? cancelled : undefined, unaccepted.length ? unaccepted : undefined)) {
       warn(new Error("webchannel: control receipt delivery failed"));
     }
   };

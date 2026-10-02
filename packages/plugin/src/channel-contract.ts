@@ -620,7 +620,7 @@ export type OutboundWsMessage =
        * frame's ids. Authenticated by the same sealed envelope as the ACK. */
       cancelled?: string[];
       /** Protocol 7 (#398): the subset of `cancelled` this server never accepted
-       * (no dispatch row and no user row). Only these were never run. */
+       * (no dispatch/user row or exact convergence receipt). */
       unaccepted?: string[];
       /**
        * #243 half 2a (doc §16.2-1): the durable user messageId the SERVER minted

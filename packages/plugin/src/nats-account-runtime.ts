@@ -252,8 +252,12 @@ const processOverflowResolver = new BoundedOverflowResolver({
   // fail-safe direction (the client replays and the flush path decides).
   lookupUserRow: (request, idempotencyKey) => runtimeForOverflow(request)
     ?.deliveryJournal?.lookupUserMessageIdByRandomId(request.peerId, idempotencyKey),
-  lookupConvergedRetry: (request, retryOf) => runtimeForOverflow(request)
-    ?.deliveryJournal?.dispatch?.retryOf(request.peerId, retryOf),
+  lookupConvergedRetry: (request, retryOf) => {
+    const dispatch = runtimeForOverflow(request)?.deliveryJournal?.dispatch;
+    const prefix = `${request.peerId}:`;
+    const key = request.key.startsWith(prefix) ? request.key.slice(prefix.length) : request.id;
+    return dispatch?.convergence(request.peerId, key) ?? dispatch?.retryOf(request.peerId, retryOf);
+  },
   sendAck: (request, committed, cancelled) => runtimeForOverflow(request)
     ?.channel.sendAck(request.peerId, [request.id], committed, cancelled ? [request.id] : undefined) ?? false,
   sendRejected: (request) => runtimeForOverflow(request)

@@ -21,12 +21,14 @@ its own receipt. An explicit `/stop` also names earlier input that its device ha
 not yet seen the server accept; the server durably cancels still-unaccepted named
 input, while accepted input keeps its receipt and records only request cancellation.
 `ack.unaccepted`, scoped to cancelled IDs in the same ACK frame, is the server's
-evidence that a named input never became accepted.
+evidence that a named input never became accepted. A rowless retry alias that
+already converged on the first retry now has its own transactional SQLite receipt,
+so stop/replay preserves its accepted mapping instead of declaring it unaccepted.
 Cancelled core bindings survive an early SDK abort return until verified startup
 retirement. Protocol 6 introduced authenticated same-frame `ack.cancelled` proof,
 including cancellation replays with no journal row; protocol 7 adds the scoped stop
 and `ack.unaccepted` contract. Matching client consumption is required.
-Dispatch schema 2 upgrades schema 1 and prevents older writers from opening it.
+Dispatch schema 3 upgrades schemas 1 and 2 and prevents older writers from opening it.
 See [cancellation boundaries](DISPATCH_RECOVERY.md#stop-cancellation).
 
 Round 7 (#369), option 2: newly accepted normal requests retain their original
