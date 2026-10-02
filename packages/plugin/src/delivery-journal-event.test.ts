@@ -738,6 +738,10 @@ describe("#244 half A — isSeqBearingFrame tracks the mapper's non-null set", (
     // NON-DURABLE — mapper returns null, predicate must reject.
     turn_settled: { type: "turn_settled", turnId: TURN, outcome: "ok" },
     approval_snapshot: { type: "approval_snapshot", approvals: [] },
+    // #400 — one click's fate, not a transcript change.
+    approval_decision_rejected: {
+      type: "approval_decision_rejected", id: "ap-1", decision: "allow-once", reason: "not-approver",
+    },
     typing: { type: "typing" },
     history: { type: "history", messages: [] },
     commands: { type: "commands", commands: [] },

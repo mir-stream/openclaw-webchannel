@@ -346,7 +346,12 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // numbers rather than just the floor: a raw value would have shown up there
   // instead, and the baseline is exact-multiset.
   // Atomic stop coordination replaces the old callback/drop/ACK diagnostics.
-  "nats-account-runtime.ts": { statements: 21, interpolations: 35 },
+  //
+  // #400 adds ONE statement (21→22) and TWO interpolations (35→37): the warn
+  // when publishing an approval-refusal notice back to the peer throws. Both
+  // interpolations — the approval `id` (peer-supplied) and the error — are
+  // `logSafe`-wrapped, so KNOWN_RAW is unchanged.
+  "nats-account-runtime.ts": { statements: 22, interpolations: 37 },
   "auth.ts": { statements: 16, interpolations: 5 },
   // #244 half B added the `Invalid get_difference` guard warn (one statement,
   // one `logSafe(peerId)` interpolation): 22→23 statements, 33→34 interpolations.

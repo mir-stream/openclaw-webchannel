@@ -330,7 +330,8 @@ export type ChatToolMessage = ChatToolCore & BubbleOnlyFieldsAbsentOnTool;
  *  - DURABLE STATE (`resolvedDecision`) — folded from the `approvalResolution`
  *    event, and the one field a replay can set;
  *  - CLIENT-LOCAL (`actionable`, `resolutionConfirmed`, `resolvedElsewhere`,
- *    `ts`) — never journaled, never on the history wire.
+ *    `decisionRejectedReason`, `ts`) — never journaled, never on the history
+ *    wire.
  *
  * ⚠️ `actionable` IS THE SAFETY BIT OF THIS ENTIRE SLICE, AND ITS DEFAULT IS THE
  * WHOLE POINT: ABSENT MEANS NOT CLICKABLE. An approval replayed from `history`
@@ -377,6 +378,11 @@ type ChatApprovalCore = {
   resolutionConfirmed?: boolean;
   /** CLIENT-LOCAL: resolved while this device was away, outcome unknown (#15). */
   resolvedElsewhere?: boolean;
+  /**
+   * CLIENT-LOCAL (#400): the server REFUSED this device's last decision — see
+   * `ApprovalRequest.decisionRejectedReason`. Cleared by the next `decide()`.
+   */
+  decisionRejectedReason?: string;
   /** CLIENT-LOCAL: this device may offer decision buttons for this card. */
   actionable?: boolean;
   /** Hydration metadata, exactly as on a bubble. Absent on a live card. */
@@ -506,6 +512,9 @@ export type ApprovalOption = {
  * while this device wasn't looking (a register-time `approval_snapshot` no longer
  * lists it), so the card is no longer actionable but the actual outcome is not
  * known. A view should render it as a neutral "resolved elsewhere" state.
+ * #400: an OPTIMISTIC decision the snapshot no longer lists and does not report
+ * as resolved ends here too — the click's guess is never promoted to a confirmed
+ * outcome without a server answer naming it.
  *
  * `resolutionConfirmed` distinguishes a SERVER-confirmed resolution (an
  * `approval_resolved` frame, or a snapshot marking the card resolved) from
@@ -544,6 +553,15 @@ export type ApprovalRequest = {
   expiresAtMs?: number;
   resolvedDecision?: ApprovalDecision | "unknown";
   resolutionConfirmed?: boolean;
+  /**
+   * #400: the server REFUSED this device's decision, so the optimistic mark was
+   * undone. `"not-approver"`: the card is back to its
+   * pre-click state (still pending — another approver can answer it).
+   * `"not-pending"`: it is no longer pending here, outcome unknown (`"unknown"`
+   * resolution). Any other string comes from a newer plugin and means the same
+   * as `"not-approver"`. Absent when nothing was refused.
+   */
+  decisionRejectedReason?: string;
   /**
    * May this device offer decision buttons for this card? See the ⚠️ above —
    * ABSENT/false is the safe default and is what a history replay produces.

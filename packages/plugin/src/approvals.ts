@@ -84,6 +84,7 @@ import { WEBCHANNEL_ID } from "./channel-contract.js";
 import type {
   WebChannelPeerChannel,
   ApprovalDecision,
+  ApprovalDecisionRejectReason,
   ApprovalOption,
   ApprovalRequestPayload,
 } from "./channel-contract.js";
@@ -1526,6 +1527,42 @@ export class ApprovalBindingMissingError extends Error {
   }
 }
 
+/**
+ * #400: thrown by `handleApprovalDecision` for an AUTHZ refusal — a
+ * non-approver, or an approval delivered on another account. Still an
+ * error-level rejection (unlike `ApprovalBindingMissingError`); the class exists
+ * so the caller can tell the peer WHICH refusal without parsing the message.
+ *
+ * ⚠️ `name` IS DELIBERATELY LEFT AS `"Error"`: these were plain `Error`s, and
+ * the handler logs `logSafe(err)`, whose `String(err)` starts with the name. An
+ * override would change the operator-visible line. Identify it by `instanceof`.
+ */
+export class ApprovalDecisionForbiddenError extends Error {
+  constructor(
+    message: string,
+    readonly reason: "not-approver" | "cross-account",
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * #400: the wire reason for a `handleApprovalDecision` failure that PROVES the
+ * decision was not applied, or `undefined` for one that does not (a gateway RPC
+ * failure may have applied — a timeout — so it is not reported as a refusal).
+ */
+export function approvalDecisionRejectReason(err: unknown): ApprovalDecisionRejectReason | undefined {
+  if (err instanceof ApprovalBindingMissingError) return "not-pending";
+  if (err instanceof ApprovalDecisionForbiddenError) {
+    // A foreign-account live binding is indistinguishable from an id that is
+    // absent or finalized. Only a sender rejected within the bound account is
+    // told that it lacks approver authority. The server log keeps the more
+    // specific cross-account refusal unchanged.
+    return err.reason === "cross-account" ? "not-pending" : "not-approver";
+  }
+  return undefined;
+}
+
 export async function handleApprovalDecision(
   cfg: OpenClawConfig,
   approvalId: string,
@@ -1548,9 +1585,10 @@ export async function handleApprovalDecision(
     throw new ApprovalBindingMissingError(approvalId);
   }
   if (boundAccount !== bindingAccountKey(accountId)) {
-    throw new Error(
+    throw new ApprovalDecisionForbiddenError(
       `webchannel: approval ${logSafe(approvalId)} was delivered on account ` +
         `${logSafe(boundAccount)}, not ${logSafe(bindingAccountKey(accountId))} — refusing cross-account resolve`,
+      "cross-account",
     );
   }
 
@@ -1561,9 +1599,10 @@ export async function handleApprovalDecision(
   // an approver configured only on account A cannot resolve via account B's
   // channel. Legacy callers omit accountId and keep the default-account read.
   if (!isWebChannelExecApprovalApprover({ cfg, senderId, accountId })) {
-    throw new Error(
+    throw new ApprovalDecisionForbiddenError(
       `webchannel: peer ${logSafe(senderId)} is not a configured exec approver` +
         (accountId ? ` for account ${logSafe(accountId)}` : ""),
+      "not-approver",
     );
   }
   await resolveApprovalOverGateway({

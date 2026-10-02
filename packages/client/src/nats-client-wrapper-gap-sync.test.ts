@@ -810,6 +810,67 @@ describe("#356 — partial replies (Telegram's differenceSlice)", () => {
     expect(cursorLast(w)).toBe(20);
   });
 
+  it("#400 — a resolution served by a difference is CONFIRMED, so a later snapshot keeps the verdict", () => {
+    // A server-sourced decision, exactly like the live frame and a history row.
+    // Unconfirmed, it would read as `decide()`'s guess, and a snapshot that has
+    // aged it out of both lists would downgrade the real verdict to "unknown".
+    const { w } = spied();
+    seed(w, 9);
+    w.handleMessage({
+      type: "approval_request",
+      id: "ap1", kind: "exec", title: "run it", prompt: "ok?", options: [], seq: 10,
+    });
+    w.handleMessage({ type: "agent_message", id: "z20", text: "answer 20", turnId: "t1", seq: 20 });
+    w.handleMessage(
+      reply(
+        w,
+        [{ seq: 12, event: { kind: "approvalResolution", id: "ap1", decision: "deny" } }],
+        { maxSeq: 20 },
+      ),
+    );
+    const cardOf = () => (w.state as unknown as {
+      approvals: Array<{ id: string; resolvedDecision?: string; resolutionConfirmed?: boolean }>;
+    }).approvals.find((a) => a.id === "ap1");
+    expect(cardOf()?.resolvedDecision).toBe("deny");
+    expect(cardOf()?.resolutionConfirmed).toBe(true);
+    w.handleMessage({ type: "approval_snapshot", approvals: [] });
+    expect(cardOf()?.resolvedDecision).toBe("deny");
+  });
+
+  it("#400 — a refusal that OVERTAKES a held resolution is cleared when the resolution folds", () => {
+    // The refusal frame is unsequenced, so it applies at once; the resolution
+    // it raced is held behind a gap. When the difference folds the verdict, the
+    // stale "not applied" must go with the "unknown" sentinel it set.
+    const { w } = spied();
+    seed(w, 9);
+    w.handleMessage({
+      type: "approval_request",
+      id: "ap1", kind: "exec", title: "t", prompt: "p", options: [], seq: 10,
+    });
+    (w as unknown as WebChannelNATSClient).decide("ap1", "deny");
+    w.handleMessage({ type: "approval_resolved", id: "ap1", decision: "deny", seq: 12 });
+    expect(isCatchingUp(w)).toBe(true);
+    w.handleMessage({ type: "approval_decision_rejected", id: "ap1", decision: "deny", reason: "not-pending" });
+    w.handleMessage(
+      reply(
+        w,
+        [
+          { seq: 11, event: { kind: "user", id: "u1", text: "hi", turnId: "u1" } },
+          { seq: 12, event: { kind: "approvalResolution", id: "ap1", decision: "deny" } },
+        ],
+        { maxSeq: 12 },
+      ),
+    );
+    const card = (w.state as unknown as {
+      approvals: Array<{
+        id: string; resolvedDecision?: string; resolutionConfirmed?: boolean; decisionRejectedReason?: string;
+      }>;
+    }).approvals.find((a) => a.id === "ap1");
+    expect(card?.resolvedDecision).toBe("deny");
+    expect(card?.resolutionConfirmed).toBe(true);
+    expect(card?.decisionRejectedReason).toBeUndefined();
+  });
+
   it("#356 — a held tool phase BELOW the reply's rows does not overwrite the phase it delivered", () => {
     // P1 shape 1. Cursor 9; the live START phase opens the gap and is held; the
     // server skips row 11 as undeliverable (#343) and serves the END phase at 12.

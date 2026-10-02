@@ -309,6 +309,22 @@ export type ApprovalRequestPayload = {
   expiresAtMs?: number;
 };
 
+/**
+ * #400: why the plugin REFUSED an `approval_decision` before it reached the
+ * gateway — i.e. the decision was definitely NOT applied by that click.
+ *
+ *  - `not-approver` — the approval is live on this account, but the sender is
+ *    not in this account's approver set.
+ *  - `not-pending` — no live delivery binding on this account: already
+ *    resolved, expired, never delivered here, or live only on another account.
+ *    Collapsing the cross-account case prevents a replay from revealing that
+ *    the id is live elsewhere. Telegram's "no longer pending" terminal receipt.
+ *
+ * A gateway RPC failure is NOT reported here: it may have applied (a timeout),
+ * so it is not a proof of refusal.
+ */
+export type ApprovalDecisionRejectReason = "not-approver" | "not-pending";
+
 /** One earlier unacknowledged send an explicit `/stop` names (#398). */
 export type StopPendingInput = { id: string; random_id?: string };
 /** Matches the client's own cap; a conforming stop never names more. */
@@ -580,6 +596,20 @@ export type OutboundWsMessage =
   | ({ type: "approval_request"; /** #244 half A — see `agent_message`. */ seq?: number } & ApprovalRequestPayload)
   | { type: "approval_resolved"; id: string; decision: ApprovalDecision; /** #244 half A — see `agent_message`. */ seq?: number }
   | { type: "approval_snapshot"; approvals: ApprovalRequestPayload[]; resolved?: Array<{ id: string; decision: ApprovalDecision }> }
+  /**
+   * #400: the plugin refused an `approval_decision` (see
+   * `ApprovalDecisionRejectReason`). Telegram answers the callback query; our
+   * devices share one `.out`, so the frame echoes `id` AND the refused
+   * `decision` and the client acts only on a card still showing that exact
+   * decision optimistically — a device that did not click, or whose card the
+   * server already confirmed, ignores it.
+   *
+   * NOT durable, NOT seq-bearing: it reports one click's fate, not a transcript
+   * change. No protocol bump: a peer that drops it keeps an unconfirmed guess,
+   * which the next register's `approval_snapshot` reconciles without ever
+   * confirming it — ignoring the frame costs feedback, not correctness.
+   */
+  | { type: "approval_decision_rejected"; id: string; decision: ApprovalDecision; reason: ApprovalDecisionRejectReason }
   | { type: "typing"; keepalive?: boolean }
   | {
       type: "history";

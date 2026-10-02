@@ -21,7 +21,7 @@ import { inspect } from "node:util";
 import { DurableSendError } from "./durable-send-error.js";
 import { ApprovalOutputRecovery } from "./approval-output-recovery.js";
 import type { NatsTransport, NatsMessage } from "./nats-transport.js";
-import type { ApprovalDecision, ApprovalRequestPayload, ApprovalRequestSendResult, ApprovalResolutionSendOptions, ApprovalResolutionSendResult, DifferenceReply, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
+import type { ApprovalDecision, ApprovalDecisionRejectReason, ApprovalRequestPayload, ApprovalRequestSendResult, ApprovalResolutionSendOptions, ApprovalResolutionSendResult, DifferenceReply, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
 import type { KeyPair } from "./e2e-crypto.js";
 import type { ConversationKeyStore } from "./conversation-key-store.js";
 import { wrapConversationKey } from "./late-join-decryptor.js";
@@ -976,6 +976,21 @@ export class NatsChannel implements WebChannelPeerChannel {
       ...(resolved && resolved.length > 0 ? { resolved } : {}),
     };
     return this.sendToPeer(peerId, payload);
+  }
+
+  /**
+   * #400: tell the peer the plugin REFUSED its `approval_decision`, so the
+   * clicking device can undo its optimistic mark and show why. Ephemeral and
+   * fanned out like every `.out` frame — the echoed `decision` is what lets the
+   * client pick the card it applies to (see the wire type).
+   */
+  sendApprovalDecisionRejected(
+    peerId: string,
+    id: string,
+    decision: ApprovalDecision,
+    reason: ApprovalDecisionRejectReason,
+  ): boolean {
+    return this.sendToPeer(peerId, { type: "approval_decision_rejected", id, decision, reason });
   }
 
   /**
