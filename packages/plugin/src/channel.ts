@@ -12,6 +12,11 @@ import { logSafe } from "./log-safe.js";
 import { createClawMessageAdapter, nextMessageId } from "./message-adapter.js";
 import { resolveOutboundTransport, type ResolveOutboundTransport } from "./outbound-account.js";
 import {
+  createWebchannelMessagingAdapter,
+  requireOutboundPeerId,
+  type ResolveServingScope,
+} from "./outbound-target.js";
+import {
   createClawApprovalCapability,
   startClawApprovalMonitor,
   shouldSuppressClawNativeExecApprovalPrompt,
@@ -126,6 +131,8 @@ export function createWebChannelPlugin(
      * finalize. A miss fails closed; single-transport callers can omit this.
     */
     resolveApprovalTransport?: ResolveAccountTransport;
+    /** Live serving scope for target admission and outbound session routes. */
+    resolveServingScope?: ResolveServingScope;
     startNatsAccount?: (ctx: any) => Promise<void>;
     onInvalidAccountId?: (cfg: OpenClawConfig, invalid: { id: string; reason: string }) => void;
   },
@@ -220,6 +227,10 @@ export function createWebChannelPlugin(
       setupWizard: webchannelSetupWizard,
     })), {
       message: createClawMessageAdapter(transport, opts?.resolveOutboundTransport),
+      // `messaging` (ChannelMessagingAdapter) names a peer for core-initiated
+      // sends and mirrors them into that peer's session. It rides the same
+      // base-field mechanism as `message`. See src/outbound-target.ts.
+      messaging: createWebchannelMessagingAdapter(opts?.resolveServingScope),
       doctor: createWebchannelDoctorAdapter(),
       status: createWebchannelStatusAdapter(),
       // `approvalCapability` is a top-level ChannelPlugin field (sibling of
@@ -295,8 +306,10 @@ export function createWebChannelPlugin(
           // outbound seam handles core-initiated sends to the requested account.
           // `ctx.to` is the recorded reply target — now the REAL per-peer
           // `wsKey` (inbound.ts records `reply.to = wsKey`), so target it
-          // directly. If it is absent or stale, throw so core observes a failed
-          // outbound delivery; recipient guessing is intentionally unsupported.
+          // directly. An explicit target may still carry the `webchannel:` or
+          // `user:` prefix, which the shared grammar strips (#402). If it is
+          // absent, malformed or stale, throw so core observes a failed outbound
+          // delivery; recipient guessing is intentionally unsupported.
           //
           // P0-4 (review R2): throwing is safe ONLY because core never re-sends a
           // thrown outbound — traced in openclaw 2026.6.10 (the installed version
@@ -317,11 +330,12 @@ export function createWebChannelPlugin(
           // the same message (and the fabricated one was millisecond-collision
           // prone). Mint order matters: the id must exist before the send, and a
           // failed send still throws exactly as before.
+          const peerId = requireOutboundPeerId(ctx.to);
           const id = nextMessageId();
           const target = resolveOutboundTransport(ctx, transport, opts?.resolveOutboundTransport);
-          if (!target.sendText(ctx.to, ctx.text, id)) {
+          if (!target.sendText(peerId, ctx.text, id)) {
             throw new Error(
-              `[webchannel] outbound send failed: targeted send returned false for peer ${ctx.to}`,
+              `[webchannel] outbound send failed: targeted send returned false for peer ${peerId}`,
             );
           }
           return { messageId: id };
