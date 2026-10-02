@@ -155,7 +155,7 @@ describe("#396 quiet-turn liveness (plugin typing keepalive)", () => {
     h.deliver({ type: "turn_settled", turnId: h.received[0]!.id, outcome: "ok" });
     expect(receipt.snapshot().state).toBe("completed");
     expect(h.wrapper.getState()).toMatchObject({ turnActive: false, isTyping: false });
-    h.deliver({ type: "request_state", id: "unrelated-row", state: "completed" });
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [] });
     expect(h.wrapper.getState().turnActive).toBe(false);
   });
 
@@ -176,6 +176,67 @@ describe("#396 quiet-turn liveness (plugin typing keepalive)", () => {
     expect(h.wrapper.getState().turnActive).toBe(true);
     h.deliver({ type: "turn_settled", turnId: h.received[1]!.id, outcome: "ok" });
     expect(h.wrapper.getState().turnActive).toBe(false);
+  });
+
+  it("does not let cached server state undo an explicit stop, while later work can still reopen", async () => {
+    const h = await setup({ timeout: 10_000 });
+    const stopped = h.wrapper.send("quiet operation")!;
+    h.deliver({ type: "history", highWaterSeq: 2,
+      messages: [{ ...h.row(), requestState: "started" }] });
+    expect(h.wrapper.getState().turnActive).toBe(true);
+
+    h.wrapper.send("/stop");
+    expect(h.wrapper.getState().turnActive).toBe(false);
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [] });
+    expect(stopped.snapshot().state).toBe("accepted");
+    expect(inside(h.wrapper).applicationTurns.size).toBe(1);
+    expect(h.wrapper.getState().turnActive).toBe(false);
+
+    const later = h.wrapper.send("work after stop")!;
+    const laterFrame = h.received[2]!;
+    expect(inside(h.wrapper).client.requestApplicationRecovery()).toBe(true);
+    await settleUntil(() => h.control.registrations === 2 && h.wrapper.getState().connected,
+      { label: "replacement session after stop" });
+    expect(h.wrapper.getState().turnActive).toBe(false);
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [{
+      id: "server-later", role: "user", text: laterFrame.text!, turnId: laterFrame.id!,
+      randomId: laterFrame.random_id!, requestState: "started", seq: 2,
+    }] });
+    expect(later.snapshot().state).toBe("accepted");
+    expect(h.wrapper.getState().turnActive).toBe(true);
+  });
+
+  it("keeps a server-restored active turn when a stale sibling draft expires", async () => {
+    const config = WebChannelNATSClient as unknown as { STALE_DRAFT_GRACE_MS: number };
+    const previous = config.STALE_DRAFT_GRACE_MS;
+    config.STALE_DRAFT_GRACE_MS = 100;
+    try {
+      const h = await setup({ timeout: 10_000 });
+      const receipt = h.wrapper.send("quiet operation after a draft")!;
+      const turnId = h.received[0]!.id!;
+      h.deliver({ type: "progress", id: "draft-before-loss", turnId, text: "working" });
+      h.control.started = true;
+      expect(inside(h.wrapper).client.requestApplicationRecovery()).toBe(true);
+      await settleUntil(() => h.control.registrations === 2 && h.wrapper.getState().connected,
+        { label: "replacement session" });
+      expect(h.wrapper.getState().turnActive).toBe(true);
+      const turnActiveFanouts: Array<boolean | undefined> = [];
+      const unsubscribe = h.wrapper.subscribe((state) => { turnActiveFanouts.push(state.turnActive); });
+      for (let i = 0; i < 8; i++) {
+        h.deliver({ type: "typing" });
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      unsubscribe();
+      expect(h.control.registrations).toBe(2);
+      expect(receipt.snapshot().state).toBe("accepted");
+      expect(h.wrapper.getState().isTyping).toBe(true);
+      expect(h.wrapper.getState().messages.find((row) => row.id === "server-user")?.requestState).toBe("started");
+      expect(h.wrapper.getState().messages.find((row) => row.id === "draft-before-loss")?.working).toBe(false);
+      expect(turnActiveFanouts).not.toContain(false);
+      expect(h.wrapper.getState().turnActive).toBe(true);
+    } finally {
+      config.STALE_DRAFT_GRACE_MS = previous;
+    }
   });
 });
 

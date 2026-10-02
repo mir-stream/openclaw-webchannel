@@ -59,6 +59,8 @@ type ReceiptRecord = {
   settlementEligible: boolean;
   /** One-way latch: the first authoritative publish/settle decision consumes it. */
   turnOpeningConsumed: boolean;
+  /** Explicit local `/stop` permanently fences this pre-stop turn from server re-open. */
+  stoppedAtExplicitBoundary?: boolean;
   /** A repeated cancellation proof cannot clear a later turn's unscoped typing. */
   cancellationUiReconciled?: boolean;
   state: NonNullable<ChatMessage["sendState"]>;
@@ -1707,7 +1709,10 @@ export class WebChannelNATSClient {
   /** Consume every candidate that exists at an explicit-stop boundary. */
   private consumeAllTurnOpenings(): void {
     for (const receipt of this.receipts.values()) {
-      if (receipt.settlementEligible) receipt.turnOpeningConsumed = true;
+      if (receipt.settlementEligible) {
+        receipt.turnOpeningConsumed = true;
+        receipt.stoppedAtExplicitBoundary = true;
+      }
     }
   }
 
@@ -2609,28 +2614,32 @@ export class WebChannelNATSClient {
       }
       return m;
     });
-    // #96: the same verdict applies to the turn-open signal — the grace expired
-    // with no proof of life, so stop claiming a turn is running.
-    //
-    // SCOPE, stated honestly: the evidence is PER-DRAFT but this sweep is
-    // ALL-OR-NOTHING. One wedged draft expiring therefore also drops the signal
-    // for any other turn that happens to be open, healthy or not (drafts are
-    // watched by id; turns are not correlated to them at all). Accepted: the
-    // error is one-sided, which is strictly better than a spinner for a turn that
-    // is already dead. But be precise about the cost — unlike a swept `isTyping`,
-    // which a later `typing` frame re-arms, a swept turn cannot re-open through
-    // its receipt: that already consumed the one-way opening latch. #396: only the
-    // server's own `queued`/`started` request state re-opens it, on the next
-    // reconcile (`reopenTurnFromServerState`); its own settle (or a later one
-    // sweeping past it) still tidies the set. Swept BEFORE `maybeRelease()`, so a
-    // follow-up released right here opens its own fresh turn rather than being
-    // caught by this same sweep.
-    const turnsCleared = this.clearOpenTurns();
+    // #96: the same verdict applies only to unconfirmed turn-open signals. A
+    // durable `queued`/`started` row is stronger evidence than this draft-local
+    // silence guess, so keep an eligible turn that the server still reports as
+    // open. Settled, cancelled, foreign, and explicitly stopped turns fail the
+    // same eligibility check used by server-state reopening. Prune BEFORE
+    // `maybeRelease()`, so a follow-up released here opens its own fresh turn.
+    const serverConfirmed = new Set<string>();
+    for (const row of this.state.messages) {
+      if (
+        row.kind !== undefined
+        || row.role !== "user"
+        || (row.requestState !== "queued" && row.requestState !== "started")
+      ) continue;
+      const turnId = row.wireId ?? row.turnId;
+      if (this.canReopenTurnFromServerState(turnId)) serverConfirmed.add(turnId!);
+    }
+    for (const turnId of [...this.openTurns]) {
+      if (!serverConfirmed.has(turnId)) this.openTurns.delete(turnId);
+    }
+    const turnActive = this.openTurns.size > 0;
+    const turnActiveChanged = (this.state.turnActive === true) !== turnActive;
     this.staleDraftWatch.clear();
-    if (changed || turnsCleared) {
+    if (changed || turnActiveChanged) {
       this.setState({
         ...(changed ? { messages } : {}),
-        ...(turnsCleared ? { turnActive: false } : {}),
+        ...(turnActiveChanged ? { turnActive } : {}),
       });
     }
     this.maybeRelease();
@@ -4664,15 +4673,7 @@ export class WebChannelNATSClient {
    */
   private reopenTurnFromServerState(turnId: string | undefined): boolean {
     if (!turnId || this.openTurns.has(turnId)) return false;
-    if (!this.rawTransportConnected || this.terminal || this.closed) return false;
-    const receipt = this.applicationTurns.get(turnId);
-    if (
-      !receipt?.settlementEligible
-      || (receipt.state !== "sent" && receipt.state !== "accepted")
-      || this.client.isIngressCancelled(turnId)
-    ) {
-      return false;
-    }
+    if (!this.canReopenTurnFromServerState(turnId)) return false;
     // `openTurns` iteration order must stay publish order (`closeTurnsThrough`
     // sweeps a settle's prefix), and a send made after the reconnect may
     // already be open. Rebuild in the retained publish order.
@@ -4683,6 +4684,16 @@ export class WebChannelNATSClient {
     }
     for (const wireId of open) this.openTurns.add(wireId);
     return true;
+  }
+
+  /** Central proof required before durable server state may open a local turn. */
+  private canReopenTurnFromServerState(turnId: string | undefined): boolean {
+    if (!turnId || !this.rawTransportConnected || this.terminal || this.closed) return false;
+    const receipt = this.applicationTurns.get(turnId);
+    return receipt?.settlementEligible === true
+      && receipt.stoppedAtExplicitBoundary !== true
+      && (receipt.state === "sent" || receipt.state === "accepted")
+      && !this.client.isIngressCancelled(turnId);
   }
 
   private hydrateHistory(msg: InboundMessage): void {
