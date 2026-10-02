@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Enrollment continues after `slow_down`, increasing every subsequent poll interval
+  by five seconds per response. JWT verification rejects unsupported or malformed
+  `crit` headers before resolving signing keys (#415 E6/E7).
+
 - Historical Phase A crypto wrappers are explicitly test-only helpers; their
   conformance tests remain intact. Production no longer allocates or injects
   the unwritten legacy cancellation fallback. Current cancellation authority
