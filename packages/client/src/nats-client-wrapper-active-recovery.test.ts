@@ -171,6 +171,37 @@ describe("#398 explicit stop names earlier unacknowledged input", () => {
   });
 });
 
+describe("#398 same-frame cancellation receipts survive subscriber teardown", () => {
+  it.each([false, true])("applies every terminal result when the first failed receipt closes the wrapper (reconnect=%s)", async reconnect => {
+    const h = await setup();
+    h.control.ack = false;
+    const receipts = [h.wrapper.send("first pending")!, h.wrapper.send("second pending")!];
+    const ids = h.received.map(message => message.id!);
+    let replacement: ReturnType<typeof h.wrapper.send> | undefined;
+    receipts[0]!.subscribe(snapshot => {
+      if (snapshot.state !== "failed") return;
+      h.wrapper.close();
+      if (reconnect) {
+        h.control.ack = true;
+        h.wrapper.connect();
+        replacement = h.wrapper.send("replacement work");
+      }
+    });
+    h.deliver({ type: "ack", ids, cancelled: ids, unaccepted: ids });
+    for (const [index, receipt] of receipts.entries()) {
+      expect(receipt.snapshot()).toEqual({ state: "failed", failure: { reason: "cancelled", retryable: false } });
+      expect(h.wrapper.getState().messages.find(row => row.wireId === ids[index])).toMatchObject({
+        sendState: "failed", sendFailure: { reason: "cancelled", retryable: false },
+      });
+      expect(inside(h.wrapper).client.unackedLedger.has(ids[index]!)).toBe(false);
+    }
+    if (reconnect) {
+      await settleUntil(() => replacement?.snapshot().state === "accepted", { label: "replacement send accepted" });
+      expect(h.wrapper.getState().turnActive).toBe(true);
+    }
+  });
+});
+
 // #399 runs before the suite below: its "cleans up on %s" case spies on a FAKE
 // `setTimeout`, and every later `restoreAllMocks` re-installs that dead timer.
 describe("#399 one retry per interrupted original", () => {

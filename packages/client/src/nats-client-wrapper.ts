@@ -3762,6 +3762,14 @@ export class WebChannelNATSClient {
       if (cancelsTypingCandidate) {
         this.deferredCancelledTyping = { candidates: typingCandidates, lifecycle };
       }
+      // These terminal facts belong to the whole authenticated ACK, whose IDs
+      // have already left the replay ledger. A receipt subscriber may close or
+      // reconnect during the first transition; every remaining receipt still
+      // needs its result before lifecycle-scoped presentation work can stop.
+      for (const key of notSent) {
+        this.receiptTransition(key, "failed", { reason: "cancelled", retryable: false });
+      }
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
       if (!this.hasAcceptedApplicationTurn()) this.cancelActiveTurnStallTimer();
       if (this.wrapperLifecycleGeneration !== lifecycle) return;
       for (const id of finalize) {
@@ -3774,11 +3782,6 @@ export class WebChannelNATSClient {
       const clearActive = closed && this.openTurns.size === 0;
       if (clearActive) this.setState({ turnActive: false });
       if (this.wrapperLifecycleGeneration !== lifecycle) return;
-      // The bubble stays as cancelled input that never ran.
-      for (const key of notSent) {
-        this.receiptTransition(key, "failed", { reason: "cancelled", retryable: false });
-        if (this.wrapperLifecycleGeneration !== lifecycle) return;
-      }
     }
     // Observe authenticated live arrival before gap buffering. Replaying that
     // buffer later is not new evidence of application activity.
