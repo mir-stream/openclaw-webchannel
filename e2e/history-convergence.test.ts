@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { HistoryWork } from "../packages/plugin/src/materialized-history.js";
 import { openDeliveryJournal } from "../packages/plugin/src/delivery-journal.js";
 import { ConversationKeyStore } from "../packages/plugin/src/conversation-key-store.js";
@@ -70,6 +70,19 @@ function setup(limit = 1_000_000) {
 }
 
 describe("history producer → sealed frame → browser decoder → wrapper", () => {
+  it("#413: an entirely oversized snapshot still seeds and lets the next live row through", () => {
+    const h = setup(1200);
+    for (let i = 1; i <= 3; i++) h.journal.append("peer", { kind: "bubble", answerId: `a${i}`, text: "x".repeat(3000) });
+    h.snapshot(); h.deliver();
+    expect(h.wrapper.getState().messages).toEqual([]);
+    expect(h.wrapper.getState().historyOmissions).toEqual([1, 2, 3].map(seq => ({ id: `a${seq}`, seq })));
+    expect(h.inner.cursor).toMatchObject({ state: "synced", last: 3 });
+    expect(h.queue).toEqual([]);
+    h.channel.sendText("peer", "small live", "a4"); h.deliver();
+    expect(h.wrapper.getState().messages.map(m => m.id)).toEqual(["a4"]);
+    expect(h.inner.cursor.last).toBe(4);
+  });
+
   it("#414: stamps the journal epoch on snapshots, differences, ACKs and live frames", () => {
     const h = setup();
     expect(h.journal.epoch).toEqual(expect.any(String));
@@ -90,37 +103,44 @@ describe("history producer → sealed frame → browser decoder → wrapper", ()
       type: "difference", afterSeq: 0, nonce: "nonce", maxSeq: 2 });
   });
   it("#413: incomplete cold snapshots do linear storage work and never replay the journal", () => {
-    const costs: number[] = [];
-    for (const count of [2000, 4000]) {
-      const h = setup(20_000);
-      for (let i = 1; i <= count; i++) {
-        h.journal.append("peer", { kind: "bubble", answerId: `a${i}`,
-          text: i === count - 1 ? "x".repeat(30_000) : `answer ${i}` });
+    // Pin the materializer's time-slice clock: CI contention may yield midway
+    // through a fetched 128-row batch and reread its tail on the next callback.
+    // Row-count yielding still runs; this isolates structural work from load.
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    try {
+      const costs: number[] = [];
+      for (const count of [2000, 4000]) {
+        const h = setup(20_000);
+        for (let i = 1; i <= count; i++) {
+          h.journal.append("peer", { kind: "bubble", answerId: `a${i}`,
+            text: i === count - 1 ? "x".repeat(30_000) : `answer ${i}` });
+        }
+        h.snapshot();
+        const snapshot = h.decode(h.transport.frames[0]!);
+        expect(snapshot.snapshotComplete).toBe(false);
+        h.deliver();
+        expect(h.inner.cursor).toMatchObject({ state: "synced", last: count });
+        expect(h.queue).toEqual([]);
+        expect(h.wrapper.getState().messages).toHaveLength(49);
+        expect(h.wrapper.getState().historyOmissions).toEqual([{ id: `a${count - 1}`, seq: count - 1 }]);
+        expect(h.channel.sendText("peer", "live", "live")).toBe(true);
+        h.deliver();
+        expect(h.wrapper.getState().messages.at(-1)).toMatchObject({ id: "live", text: "live" });
+        expect(h.inner.cursor.last).toBe(count + 1);
+        const sum = (key: keyof HistoryWork) => h.work.reduce((n, w) => n + w[key], 0);
+        expect(sum("rawEventsApplied")).toBe(count);
+        expect(sum("rawEventsRead")).toBe(count);
+        expect(sum("pageRowsRead")).toBe(50);
+        costs.push(sum("rawEventsRead") + sum("materializedRowsRead") + sum("materializedRowsWritten"));
+        h.work.length = 0;
+        h.snapshot(); h.deliver();
+        expect(sum("rawEventsRead")).toBe(1); // Only the new live row needs materialization.
+        expect(h.queue).toEqual([]);
       }
-      h.snapshot();
-      const snapshot = h.decode(h.transport.frames[0]!);
-      expect(snapshot.snapshotComplete).toBe(false);
-      h.deliver();
-      expect(h.inner.cursor).toMatchObject({ state: "synced", last: count });
-      expect(h.queue).toEqual([]);
-      expect(h.wrapper.getState().messages).toHaveLength(49);
-      expect(h.wrapper.getState().historyOmissions).toEqual([{ id: `a${count - 1}`, seq: count - 1 }]);
-      expect(h.channel.sendText("peer", "live", "live")).toBe(true);
-      h.deliver();
-      expect(h.wrapper.getState().messages.at(-1)).toMatchObject({ id: "live", text: "live" });
-      expect(h.inner.cursor.last).toBe(count + 1);
-      const sum = (key: keyof HistoryWork) => h.work.reduce((n, w) => n + w[key], 0);
-      expect(sum("rawEventsApplied")).toBe(count);
-      expect(sum("pageRowsRead")).toBe(50);
-      costs.push(sum("rawEventsRead") + sum("materializedRowsRead") + sum("materializedRowsWritten"));
-      h.work.length = 0;
-      h.snapshot(); h.deliver();
-      expect(sum("rawEventsRead")).toBe(1); // Only the new live row needs materialization.
-      expect(h.queue).toEqual([]);
-    }
-    // Structural work, not a noisy wall-clock threshold: doubling rows doubles
-    // cold materialization; browser hydration remains one bounded window.
-    expect(costs[1]).toBeLessThanOrEqual(costs[0]! * 2 + 10);
+      // Structural work, not a noisy wall-clock threshold: doubling rows doubles
+      // cold materialization; browser hydration remains one bounded window.
+      expect(costs[1]).toBeLessThanOrEqual(costs[0]! * 2 + 10);
+    } finally { clock.mockRestore(); }
   });
   it("keeps absent seal removals hidden even when a later journal retry names the ID", () => {
     const h = setup();

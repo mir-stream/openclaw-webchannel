@@ -115,7 +115,8 @@ history serving and NatsChannel encryption through the browser decoder and
 wrapper. At 2,000 and 4,000 rows with an oversized row in the newest window, it
 asserts N raw events applied, 50 projected page rows, no difference request and
 immediate next-live delivery. Doubling N is bounded to twice the measured
-storage row work plus constant overhead. The browser hydrates only the bounded
+storage row work plus constant overhead with the time-slice clock pinned (row-count
+yielding remains active, independent of CI contention). The browser hydrates only the bounded
 snapshot window; warm materialization reads only newly appended events.
 
 Other focused regressions cover epoch persistence, legacy migration, a real

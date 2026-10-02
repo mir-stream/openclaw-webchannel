@@ -75,6 +75,20 @@ const bubble = (answerId: string, text: string): JournalEvent => ({
 });
 
 describe("seq allocation", () => {
+  it.each(["", "x".repeat(129)])("#414: refuses an invalid stored epoch without rewriting history (%#)", (epoch) => {
+    const path = newJournalPath();
+    const journal = open(path);
+    journal.appendInboundUser("peer", { text: "retained", randomId: "origin" });
+    journal.close();
+    const db = new DatabaseSync(path);
+    try {
+      db.prepare("UPDATE journal_meta SET value = ? WHERE key = 'epoch'").run(epoch);
+      expect(() => openDeliveryJournal({ databasePath: path })).toThrow("invalid delivery journal epoch");
+      expect(db.prepare("SELECT value FROM journal_meta WHERE key = 'epoch'").get()).toEqual({ value: epoch });
+      expect(db.prepare("SELECT count(*) AS n FROM journal_event").get()).toEqual({ n: 1 });
+    } finally { db.close(); }
+  });
+
   it("#414: retains the epoch across reopen and forks it when a backup is restored", () => {
     const path = newJournalPath();
     const backup = newJournalPath();
