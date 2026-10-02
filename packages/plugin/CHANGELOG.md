@@ -35,6 +35,16 @@ other version. One reason per bullet, matching `protocol.ts`:
 
 - **v6 — durable cancellation ACK evidence.** `ack.cancelled` carries the exact
   wire ids whose cancellation is durable, a subset of the same frame's `ids`.
+- **v7 — stop covers earlier unacknowledged input (#397, #398).** An explicit
+  `/stop` may carry `cancel_pending`; each named input this server has not
+  accepted is durably cancelled with the stop, so it cannot run when it arrives
+  later. `ack.unaccepted` declares, per ID and in that ID's own frame, the
+  cancelled IDs that have no dispatch row, user row or exact convergence receipt.
+  A rowless accepted retry alias persists that receipt transactionally, so ACK
+  loss and `/stop` re-echo its original `converged` mapping. Dispatch schema 3
+  upgrades schemas 1 and 2 and prevents older writers from reopening it. A
+  second stop that arrives during an in-flight core abort now joins it with its
+  own receipt.
 - **v7 — history page correlation (#401).** A `load_history` request's `nonce`
   (optional on the wire; refused at the door only when present and unusable,
   same bound as `get_difference.nonce`) is echoed verbatim as `history.nonce` on

@@ -325,6 +325,11 @@ export type ApprovalRequestPayload = {
  */
 export type ApprovalDecisionRejectReason = "not-approver" | "not-pending";
 
+/** One earlier unacknowledged send an explicit `/stop` names (#398). */
+export type StopPendingInput = { id: string; random_id?: string };
+/** Matches the client's own cap; a conforming stop never names more. */
+export const MAX_STOP_PENDING_INPUTS = 256;
+
 export type InboundWsMessage =
   // #243 half 1: `random_id` is the client's idempotency key — a fresh token the
   // client mints per logical user message and reuses on every retry. The plugin's
@@ -333,7 +338,11 @@ export type InboundWsMessage =
   // durable-id ownership to the server and this key is what carries retry
   // idempotency once it can no longer ride the journal's message_id. Optional to
   // mirror the wire (older clients omit it).
-  | { type: "user_message"; text: string; id?: string; random_id?: string; retry_of?: string }
+  //
+  // Protocol 7 (#398): `cancel_pending` rides an explicit `/stop` only. It names
+  // every earlier user message this device sent but the server has not yet
+  // acknowledged, so the stop also covers input that reaches the server after it.
+  | { type: "user_message"; text: string; id?: string; random_id?: string; retry_of?: string; cancel_pending?: StopPendingInput[] }
   | { type: "approval_decision"; id: string; decision: ApprovalDecision }
   /**
    * Page older history.
@@ -640,6 +649,9 @@ export type OutboundWsMessage =
       /** Protocol 6: exact wire IDs with durable cancellation, a subset of this
        * frame's ids. Authenticated by the same sealed envelope as the ACK. */
       cancelled?: string[];
+      /** Protocol 7 (#398): the subset of `cancelled` this server never accepted
+       * (no dispatch/user row or exact convergence receipt). */
+      unaccepted?: string[];
       /**
        * #243 half 2a (doc §16.2-1): the durable user messageId the SERVER minted
        * for each fresh admission, and the SAME id re-echoed for a deduped retry,
@@ -968,6 +980,7 @@ export interface WebChannelPeerChannel {
     ids: string[],
     committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>,
     cancelled?: string[],
+    unaccepted?: string[],
   ): boolean;
   sendInboundRejected?(peerId: string, ids: string[]): boolean;
 }
@@ -993,6 +1006,6 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload, _options?: { redelivery?: boolean }): ApprovalRequestSendResult { return { delivered: false, journaled: false }; }
   sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision, options?: ApprovalResolutionSendOptions): ApprovalResolutionSendResult { options?.onClaim?.(); return { accepted: true, delivered: false, journaled: false, status: "unavailable" }; }
   sendApprovalSnapshot(_peerId: string, _approvals: ApprovalRequestPayload[], _resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean { return false; }
-  sendAck(_peerId: string, ids: string[], _committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>, _cancelled?: string[]): boolean { return ids.length === 0; }
+  sendAck(_peerId: string, ids: string[], _committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>, _cancelled?: string[], _unaccepted?: string[]): boolean { return ids.length === 0; }
   sendInboundRejected(_peerId: string, ids: string[]): boolean { return ids.length === 0; }
 }

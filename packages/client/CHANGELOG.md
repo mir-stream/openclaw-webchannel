@@ -32,6 +32,12 @@ version. No package-version bump. One reason per bullet, matching
 
 - **v6 — durable cancellation ACK evidence.** `ack.cancelled` must be understood
   to distinguish delivery acceptance from work that still needs recovery.
+- **v7 — stop covers earlier unacknowledged input (#397, #398).** An explicit
+  `/stop` sends `cancel_pending`, the earlier user messages this device still
+  has no server result for. `ack.unaccepted` is the server's declaration that a
+  cancelled ID was never accepted; it rides the same frame as that ID, and only
+  it turns the receipt into `failed{cancelled}`. A cancelled ID without it keeps
+  its accepted receipt; its request state reports the cancellation.
 - **v7 — history page correlation (#401).** `load_history` carries a per-request
   `nonce` and the `history` page that answers it echoes it as `history.nonce`;
   the register-time snapshot carries none. Pages ride the peer's shared `.out`,

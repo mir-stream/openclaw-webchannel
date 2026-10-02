@@ -21,6 +21,15 @@
  * supply no such proof. The exact-match gate requires the client/server change
  * together; this adds no capability negotiation or envelope/package version bump.
  *
+ * v7 (breaking, #398): an explicit `/stop` carries `cancel_pending`, the
+ * earlier user messages that device has no server result for. The server must
+ * durably cancel the ones it has not accepted; a peer that ignored the field
+ * would let that input run after the stop. `ack.unaccepted` (a subset of
+ * `ack.cancelled`, riding each ID's own frame) is the server's declaration that
+ * a cancelled ID was never accepted, and the only evidence a client may use to
+ * show it as cancelled input. No negotiation; the exact-match gate is the
+ * enforcement.
+ *
  * v7 (breaking, #401): `load_history.nonce`, echoed VERBATIM on the `history`
  * page that answers it. A page rides the peer's shared `.out`, so every device
  * receives it; a client folds a page only when it echoes its own nonce. A peer

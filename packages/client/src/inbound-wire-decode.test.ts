@@ -315,6 +315,15 @@ describe("#246 half A — decodeInboundMessage: the bulk frames", () => {
     accepts({ type: "ack", ids: ["u-0"], cancelled: ["u-0", "u-0"] });
     accepts({ type: "ack", ids: [], cancelled: [] });
   });
+
+  it("#398 never-accepted evidence must narrow this frame's cancellation evidence", () => {
+    for (const unaccepted of [null, "u-0", {}, [7], [""], ["u-1"], ["foreign"]]) {
+      refuses({ type: "ack", ids: ["u-0", "u-1"], cancelled: ["u-0"], unaccepted });
+    }
+    refuses({ type: "ack", ids: ["u-0"], unaccepted: ["u-0"] });
+    accepts({ type: "ack", ids: ["u-0", "u-1"], cancelled: ["u-0", "u-1"], unaccepted: ["u-1"] });
+    accepts({ type: "ack", ids: [], cancelled: [], unaccepted: [] });
+  });
 });
 
 describe("#246 half A — isWireSeq / isCommittedEcho", () => {
