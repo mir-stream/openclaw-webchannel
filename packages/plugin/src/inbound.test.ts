@@ -4161,6 +4161,22 @@ describe("#415 C4: native reply prefix pipeline", () => {
 });
 
 describe("#415 C7: unsupported media-only finals", () => {
+  it("refuses a media-only final through the actual SDK prefix pipeline", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+    api.config.messages = { responsePrefix: "[configured]" };
+    api.runtime.channel.inbound.run = runChannelInboundEvent;
+    api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = async params => {
+      const dispatcher = createReplyDispatcher(params.dispatcherOptions);
+      dispatcher.sendFinalReply({ mediaUrls: ["https://private.invalid/image"] });
+      await dispatcher.waitForIdle();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } };
+    };
+    const { transport, texts, settles } = makeFakeTransport();
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", text: "image" });
+    expect(texts).toEqual([]);
+    expect(settles).toEqual(["error"]);
+  });
+
   it.each(["off", "partial", "block", "progress"] as const)("settles an undelivered media final as error in %s mode", async streamingMode => {
     for (const payload of [{ mediaUrl: "https://private.invalid/file" }, { mediaUrls: ["https://private.invalid/file"], text: "  " }]) {
       const { api, warnings } = makeFakeApi({ streamingMode, runImpl: async turn => {
