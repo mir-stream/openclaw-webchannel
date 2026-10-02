@@ -27,6 +27,37 @@
   reports a publish failure as a failed send, and the three refusals above the
   journal (disposed, transport down, no session key) are unchanged.
 
+### Breaking (wire protocol v8)
+
+Gateway plugin and browser client require a paired upgrade to protocol 8
+(protocol 6 was never released); the exact-match register gate refuses every
+other version. One reason per bullet, matching `protocol.ts`:
+
+- **v8 — liveness-only typing renewals (#396).** Periodic `typing.keepalive`
+  frames refresh application watches without re-arming typing or holding
+  followups after output or approval. Older clients would queue those inputs.
+- **v6 — durable cancellation ACK evidence.** `ack.cancelled` carries the exact
+  wire ids whose cancellation is durable, a subset of the same frame's `ids`.
+- **v7 — history page correlation (#401).** A `load_history` request's `nonce`
+  (optional on the wire; refused at the door only when present and unusable,
+  same bound as `get_difference.nonce`) is echoed verbatim as `history.nonce` on
+  the page that answers it, and is counted in that page's `max_payload` byte
+  budget. The register snapshot is never correlated. `sendHistory` gained an
+  optional 5th `nonce` argument.
+
+### Changed (history pages)
+
+- **Concurrent page requests from one peer are queued, not dropped (#401).** A
+  page now answers exactly one device's nonce, so the old drop-a-concurrent-page
+  latch turned a second device's click into nothing. Requests are answered one
+  fold at a time, in order, with at most 8 queued behind the one in flight
+  (`MAX_QUEUED_PAGE_REQUESTS`) and a 64 KiB waiting-string charge per peer:
+  two bytes per UTF-16 code unit across `before`, `beforeTurnId`, and `nonce`.
+  Exceeding either waiting limit drops the new request under the existing
+  throttled `dropped` diagnostic. The active request is not charged or limited
+  by this queue budget. Charge is released before a waiting request starts,
+  including after a read or publish failure.
+
 ### Breaking (wire protocol v4)
 
 - **`WEBCHANNEL_PROTOCOL_VERSION` goes 3 → 4 (#246).** The register gate is

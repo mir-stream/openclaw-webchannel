@@ -152,6 +152,12 @@ export type ChatBubble = {
    */
   requestState?: RequestState;
   retryOf?: string;
+  /**
+   * The server row of the ONE retry this interrupted original admitted (#399).
+   * Present means the original is spent: render "Retried →" to that row, not a
+   * Retry action. A retry that is itself interrupted can be retried in turn.
+   */
+  retriedBy?: string;
   sendState?: "queued" | "sent" | "accepted" | "completed" | "failed" | "interrupted";
   /** P0-4: present only when `sendState === "failed"` — the failure detail. */
   sendFailure?: SendFailure;
@@ -742,17 +748,17 @@ export type WebChannelState = {
    */
   errorCause?: WebChannelErrorCause;
   /**
-   * Native "Bot is typing…" affordance. The server pushes a single `typing`
-   * frame at the start of a turn, which flips this to `true`. The first
-   * `progress` / `agent_message` (or `approval_*`) frame automatically flips
-   * it back to `false`; the field is absent before the first typing frame
-   * arrives, and stays `false` once it has settled.
+   * Native "Bot is typing…" affordance. The initial ordinary `typing` frame
+   * sets this to `true`; `progress`, `agent_message`, or `approval_*` clears it.
+   * Periodic `typing` frames marked `keepalive: true` renew application liveness
+   * only: they neither change this indicator nor hold followup input. A later
+   * ordinary typing frame can set it again. Absent before the first indicator.
    */
   isTyping?: boolean;
   /**
    * True while at least one turn this client started is still open — i.e. the
    * user message has been published and its `turn_settled` has not arrived yet.
-   * Unlike `isTyping` (which the server pushes ONCE per turn and which the first
+   * Unlike `isTyping` (which the initial typing frame sets and the first
    * `progress`/`agent_message`/`approval_*` frame clears), this is client-owned
    * and TURN-SCOPED: it stays `true` across the whole turn, including the gaps
    * after a first agent bubble has settled while more tool calls, another
@@ -785,11 +791,13 @@ export type WebChannelState = {
    * disconnect, a terminal error, and `close()` force-close every open turn. An
    * explicit `/stop` also consumes existing queued turn candidates so their
    * later publication cannot re-open stopped work. The post-reconnect staleness
-   * valve force-closes open turns too — though only where it arms at all, i.e.
-   * when a `working` draft was live when the session re-established.
-   * Force-closing is one-way: no inbound frame re-opens a turn
-   * (unlike `isTyping`, which a later `typing` frame re-arms), so a mid-turn
-   * reconnect leaves this `false` for the remainder of that turn.
+   * valve closes unconfirmed open turns too — though only where it arms at all,
+   * i.e. when a `working` draft was live when the session re-established.
+   * After recovery, durable `queued`/`started` state can restore this client's
+   * published, unsettled turns in publish order. Explicitly stopped, settled,
+   * cancelled, terminal-receipt, and foreign turns cannot reopen. Stale-draft
+   * expiry retains eligible server-confirmed turns. This durable state is not
+   * fresh activity and does not re-arm the one-recovery-per-silent-interval watch.
    *
    * The guarantee is therefore BOUNDED, not absolute. Any published turn whose
    * settle never arrives — or arrives naming an id this client cannot place —

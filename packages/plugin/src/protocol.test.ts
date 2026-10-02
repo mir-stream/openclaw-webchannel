@@ -8,8 +8,8 @@ import { createRequire } from "node:module";
 import { WEBCHANNEL_PROTOCOL_VERSION, readPluginVersion } from "./protocol.js";
 
 describe("plugin protocol module", () => {
-  it("declares wire-protocol version 6 for durable cancellation proof (lockstep with the client constant)", () => {
-    expect(WEBCHANNEL_PROTOCOL_VERSION).toBe(6);
+  it("declares wire-protocol version 8 for liveness-only typing renewals (lockstep with the client constant)", () => {
+    expect(WEBCHANNEL_PROTOCOL_VERSION).toBe(8);
   });
 
   it("reads this plugin's package.json version at runtime (createRequire)", () => {

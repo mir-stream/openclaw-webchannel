@@ -14,6 +14,8 @@ import { DurableSendError } from "./durable-send-error.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
+import { buildChannelInboundEventContext } from "openclaw/plugin-sdk/channel-inbound";
+import { resolveCommandAuthorization } from "openclaw/plugin-sdk/command-auth";
 import type { GetReplyOptions } from "openclaw/plugin-sdk/reply-runtime";
 
 import {
@@ -63,9 +65,11 @@ function handleInboundMessage(
  * P1-8a — `handleInboundMessage` control-lane behaviour.
  *
  * Two invariants:
- *  - The abort authorization stamp (`access.commands.authorized`) is passed into
- *    core's `buildContext` ONLY for control-lane turns — never for ordinary
- *    turns (we must not broadly authorize text commands for every peer).
+ *  - The effective command authorization stamp
+ *    (`access.commands.authorized`) is passed into core's `buildContext` for
+ *    EVERY admitted turn, control-lane and ordinary alike (#407). DM admission
+ *    supplies the default and the decision in
+ *    `resolvePeerCommandAuthorization` applies core command/owner policy.
  *  - Terminal draft drain: when core aborts the RUNNING turn its `inbound.run`
  *    resolves WITHOUT delivering a final. The controller settles real lane
  *    text in generation order, or a lone visible tool scaffold for the
@@ -120,6 +124,8 @@ function makeFakeApi(params: {
   withAgentEvents?: boolean;
   /** Extra `channels.webchannel` keys, e.g. the DM allowlist (#99 denial case). */
   channelConfig?: Record<string, unknown>;
+  /** Top-level core command policy applied to the effective authorization stamp. */
+  commandsConfig?: Record<string, unknown>;
 }): {
   api: OpenClawPluginApi;
   captured: { buildContext?: BuildContextParams };
@@ -132,6 +138,7 @@ function makeFakeApi(params: {
   const warnings: string[] = [];
 
   const config = {
+    ...(params.commandsConfig ? { commands: params.commandsConfig } : {}),
     channels: {
       webchannel: { streaming: { mode: params.streamingMode }, ...params.channelConfig },
     },
@@ -396,7 +403,7 @@ describe("handleInboundMessage — control-lane authorization stamp", () => {
     expect(finalizes).toEqual([]);
   });
 
-  it("stamps access.commands.authorized=true ONLY for controlLane turns", async () => {
+  it("stamps access.commands.authorized=true for controlLane turns", async () => {
     const { api, captured } = makeFakeApi({
       streamingMode: "off",
       runImpl: async () => {},
@@ -410,20 +417,94 @@ describe("handleInboundMessage — control-lane authorization stamp", () => {
     expect(captured.buildContext?.access?.commands?.authorized).toBe(true);
   });
 
-  it("does NOT stamp authorization for ordinary (non-control-lane) turns", async () => {
+  // #407. This replaces the earlier "does NOT stamp ordinary turns" contract:
+  // without the stamp core silently dropped `/new`, `/reset`, `/model`, … for
+  // every peer, while the widget's slash menu still offered them.
+  it("stamps access.commands.authorized=true for ordinary admitted turns", async () => {
+    for (const text of ["hello there", "/new", "/reset", "/model"]) {
+      const { api, captured } = makeFakeApi({
+        streamingMode: "off",
+        runImpl: async () => {},
+      });
+      const { transport } = makeFakeTransport();
+
+      await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text });
+
+      expect(captured.buildContext?.access?.commands?.authorized, text).toBe(true);
+    }
+  });
+
+  it("makes core treat an admitted peer's /new as an authorized command", async () => {
+    // The stamp only matters through core: rebuild the turn context with the
+    // pinned SDK's real builder (the one behind `channelRuntime.inbound.
+    // buildContext`) and ask core's own command authorization. Unauthorized,
+    // core's get-reply returns with no reply for a whole-message `/new`.
     const { api, captured } = makeFakeApi({
       streamingMode: "off",
       runImpl: async () => {},
+      channelConfig: { dmSecurity: "allowlist", allowFrom: ["peer-1"] },
     });
     const { transport } = makeFakeTransport();
 
-    await handleInboundMessage(api, transport, "peer-1", {
-      type: "user_message",
-      text: "hello there",
-    });
+    await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text: "/new" });
 
-    // No `access` key at all — the ordinary path must not touch command authz.
-    expect(captured.buildContext?.access).toBeUndefined();
+    const ctx = buildChannelInboundEventContext(
+      captured.buildContext as unknown as Parameters<typeof buildChannelInboundEventContext>[0],
+    );
+    expect(ctx.CommandAuthorized).toBe(true);
+    expect(
+      resolveCommandAuthorization({ ctx, cfg: {}, commandAuthorized: ctx.CommandAuthorized === true })
+        .isAuthorizedSender,
+    ).toBe(true);
+    // The operator allowlist trap is unchanged: core ignores the stamp and
+    // decides by membership (command-gate.ts).
+    expect(
+      resolveCommandAuthorization({
+        ctx,
+        cfg: { commands: { allowFrom: { webchannel: ["someone-else"] } } },
+        commandAuthorized: ctx.CommandAuthorized === true,
+      }).isAuthorizedSender,
+    ).toBe(false);
+  });
+
+  it("stamps the effective core policy result instead of a raw DM-admission true", async () => {
+    for (const commandsConfig of [
+      { allowFrom: { webchannel: ["someone-else"] } },
+      { ownerAllowFrom: ["someone-else"] },
+    ]) {
+      const { api, captured } = makeFakeApi({
+        streamingMode: "off",
+        runImpl: async () => {},
+        commandsConfig,
+      });
+      const { transport } = makeFakeTransport();
+
+      await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text: "/new" });
+
+      const ctx = buildChannelInboundEventContext(
+        captured.buildContext as unknown as Parameters<typeof buildChannelInboundEventContext>[0],
+      );
+      const expected = resolveCommandAuthorization({
+        ctx,
+        cfg: api.config,
+        commandAuthorized: true,
+      }).isAuthorizedSender;
+      expect(expected).toBe(false);
+      expect(captured.buildContext?.access?.commands?.authorized).toBe(expected);
+    }
+  });
+
+  it("never builds a context for a peer the DM policy denies", async () => {
+    const { api, captured } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async () => {},
+      channelConfig: { dmSecurity: "allowlist", allowFrom: ["someone-else"] },
+    });
+    const { transport } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text: "/new" });
+
+    expect(captured.buildContext).toBeUndefined();
   });
 });
 
@@ -510,6 +591,7 @@ describe("handleInboundMessage — typing keepalive (#396)", () => {
   it("re-sends typing while a quiet turn runs past the client's 30s stall window, then stops at settle", async () => {
     const turn = quietTurn();
     const { transport, typing, settles } = makeFakeTransport();
+    const sendTyping = vi.spyOn(transport, "sendTyping");
     const done = handleInboundMessage(turn.api, transport, "peer-1", {
       type: "user_message",
       text: "run the long tool",
@@ -517,20 +599,21 @@ describe("handleInboundMessage — typing keepalive (#396)", () => {
     });
     await turn.inCore;
     expect(typing).toEqual(["peer-1"]);
+    expect(sendTyping).toHaveBeenNthCalledWith(1, "peer-1", false);
 
     // A 40s tool call with streaming off emits nothing else; without a renewal
     // inside every 30s window the client reads the turn as a dead connection.
     vi.advanceTimersByTime(40_000);
     expect(typing.length).toBe(1 + Math.floor(40_000 / TYPING_KEEPALIVE_INTERVAL_MS));
     expect(TYPING_KEEPALIVE_INTERVAL_MS).toBeLessThan(30_000 / 2);
+    expect(sendTyping.mock.calls.slice(1)).toEqual(Array.from({ length: 10 }, () => ["peer-1", true]));
 
     turn.release();
     await done;
     expect(settles).toEqual(["ok"]);
     const atSettle = typing.length;
     vi.advanceTimersByTime(60_000);
-    // No renewal may follow `turn_settled`: it would re-arm the client's
-    // indicator for a turn that already ended.
+    // No renewal may follow `turn_settled`: the turn no longer owns activity.
     expect(typing.length).toBe(atSettle);
     expect(vi.getTimerCount()).toBe(0);
   });

@@ -104,6 +104,17 @@ describe("#246 half A — decodeInboundMessage: the frame envelope", () => {
   });
 });
 
+describe("protocol 8 typing renewals", () => {
+  it("preserves optional boolean keepalive markers and rejects malformed markers", () => {
+    accepts({ type: "typing" });
+    for (const keepalive of [true, false]) {
+      const result = decodeInboundMessage({ type: "typing", keepalive });
+      expect(result).toMatchObject({ ok: true, message: { type: "typing", keepalive } });
+    }
+    for (const keepalive of [null, 1, "true", {}, []]) refuses({ type: "typing", keepalive });
+  });
+});
+
 describe("#246 half A — decodeInboundMessage: the durable frames", () => {
   it("agent_message requires text but tolerates an absent id (the legacy mint path)", () => {
     const { id: _id, ...noId } = VALID.agent_message as { id: string };
@@ -225,6 +236,13 @@ describe("#246 half A — decodeInboundMessage: the bulk frames", () => {
     // Rows are NOT re-validated here — `case "history"` discriminates the row
     // union variant by variant, and a second schema would be free to disagree.
     accepts({ type: "history", messages: [{ nonsense: true }] });
+  });
+
+  it("#401 — a page's nonce echo is optional, and a present one must be usable", () => {
+    accepts({ type: "history", messages: [], nonce: "page-b" });
+    refuses({ type: "history", messages: [], nonce: "" });
+    refuses({ type: "history", messages: [], nonce: 7 });
+    refuses({ type: "history", messages: [], nonce: null });
   });
 
   it("difference requires an events ARRAY and leaves each event to the fold", () => {
@@ -379,6 +397,15 @@ describe("#246 half A — decodeDurableEvent: the difference fold's events", () 
     expect(bad({ kind: "messageEdited", id: "a1", text: "x" })).toBe("malformed");
     expect(bad({ kind: "messageEdited", id: "a1", text: "x", revision: "2" })).toBe("malformed");
     expect(bad({ kind: "messageDeleted", id: "a1" })).toBe("malformed");
+  });
+
+  it("#399 retriedBy is optional on request state but must name a message when present", () => {
+    const live = { type: "request_state", id: "u1", turnId: "t1", state: "interrupted", seq: 3 };
+    expect(decode({ ...live, retriedBy: "u2" })).toEqual({ ok: true });
+    expect(decode({ ...live, retriedBy: "" })).toMatchObject({ ok: false });
+    expect(decode({ ...live, retriedBy: 7 })).toMatchObject({ ok: false });
+    expect(decodeDurableEvent({ kind: "requestState", id: "u1", state: "interrupted", retriedBy: "u2" }).ok).toBe(true);
+    expect(decodeDurableEvent({ kind: "requestState", id: "u1", state: "interrupted", retriedBy: "" }).ok).toBe(false);
   });
 
   it("keeps `placement.answerId: \"\"` foldable where `bubble.answerId: \"\"` is not", () => {

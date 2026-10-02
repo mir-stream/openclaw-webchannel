@@ -67,7 +67,7 @@ function runtime(path: string, storageScope: StorageScopeIdentity, persisted = p
     return tokens.get(peer)!;
   };
   const runs: UserMessageLike[] = [];
-  const acks: Array<{ ids: string[]; cancelled?: string[]; committed?: Array<{ random_id: string; messageId: string; seq: number }> }> = [];
+  const acks: Array<{ ids: string[]; cancelled?: string[]; committed?: Array<{ random_id: string; messageId: string; seq?: number }> }> = [];
   const rejected: string[][] = [];
   const errors: unknown[] = [];
   const sendAck = (_peer: string, ids: string[], committed?: typeof acks[number]["committed"], cancelled?: string[]) => {

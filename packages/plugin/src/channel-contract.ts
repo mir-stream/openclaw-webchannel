@@ -81,6 +81,8 @@ export { ANON_PEER_ID };
 export type HistoryTextMessage = {
   requestState?: RequestState;
   retryOf?: string;
+  /** The one retry this interrupted original admitted (#399). */
+  retriedBy?: string;
   /** Explicit origin mapping; absent for legacy journal rows. */
   randomId?: string;
   turnId?: string;
@@ -338,8 +340,20 @@ export type InboundWsMessage =
    * `demo/web/src/presentation.ts`'s `oldestHistoryCursor` argues it. Do not
    * summarise either as "these ids are globally unique": user bubble ids are
    * peer-supplied (#293) and that claim is false of them.
+   *
+   * ⚠️ #401 — `nonce` IS THE PAGE'S CORRELATION, FOR THE SAME REASON AS
+   * `get_difference.nonce` BELOW. Telegram answers `messages.getHistory` on the
+   * requesting session's own connection; our page rides the peer's shared `.out`,
+   * so every device of the peer receives it. A device whose window differs from
+   * the requester's would prepend a page that is not contiguous with its view and
+   * leave a hole its own "load older" can never reach. The server echoes `nonce`
+   * VERBATIM on the `history` page that answers this request, and a device folds
+   * only a page echoing a nonce it is waiting for. Protocol 7 (a peer that
+   * ignored the echo would fold other devices' pages). Typed optional and served
+   * when absent — the door decoder refuses only a PRESENT-and-unusable one — but
+   * a page without an echo is folded by no v7 client.
    */
-  | { type: "load_history"; before?: string; beforeTurnId?: string; limit?: number }
+  | { type: "load_history"; before?: string; beforeTurnId?: string; limit?: number; nonce?: string }
   /**
    * #244 half B / #356 (doc §16.7, Telegram `updates.getDifference`): request the
    * durable events the client is MISSING — everything with `seq > afterSeq`. The
@@ -529,7 +543,7 @@ export type OutboundWsMessage =
       /** #244 half A — see `agent_message`. Every `tool_activity` delta is durable. */
       seq?: number;
     }
-  | { type: "request_state"; id: string; state: RequestState; turnId: string; seq: number }
+  | { type: "request_state"; id: string; state: RequestState; turnId: string; seq: number; retriedBy?: string }
   | { type: "turn_settled"; turnId: string; outcome: "ok" | "error" }
   /**
    * #212 (Phase 3, targeted): the plugin's authoritative, ordered set of the
@@ -557,7 +571,7 @@ export type OutboundWsMessage =
   | ({ type: "approval_request"; /** #244 half A — see `agent_message`. */ seq?: number } & ApprovalRequestPayload)
   | { type: "approval_resolved"; id: string; decision: ApprovalDecision; /** #244 half A — see `agent_message`. */ seq?: number }
   | { type: "approval_snapshot"; approvals: ApprovalRequestPayload[]; resolved?: Array<{ id: string; decision: ApprovalDecision }> }
-  | { type: "typing" }
+  | { type: "typing"; keepalive?: boolean }
   | {
       type: "history";
       messages: HistoryMessage[];
@@ -581,6 +595,13 @@ export type OutboundWsMessage =
       highWaterSeq?: number;
       /** False when byte fitting omitted requested snapshot content. */
       snapshotComplete?: boolean;
+      /**
+       * #401: the `load_history.nonce` this PAGE answers, echoed verbatim — see
+       * that member. Present only on a page whose request carried one; never on
+       * the register-time snapshot, which every device of the peer is meant to
+       * fold.
+       */
+      nonce?: string;
     }
   | { type: "commands"; commands: CommandCatalogEntry[] }
   | {
@@ -623,7 +644,7 @@ export type OutboundWsMessage =
        * gap that heals it. Telegram has the same split for free — a sent-message
        * update goes to the session that sent it.
        */
-      committed?: Array<{ random_id: string; messageId: string; seq: number }>;
+      committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>;
     }
   | { type: "inbound_rejected"; ids: string[]; reason: "overloaded" }
   /**
@@ -828,13 +849,21 @@ export interface WebChannelPeerChannel {
     answers: Array<{ id: string; text: string }>,
     remove: string[],
   ): boolean;
-  sendTyping(peerId: string): boolean;
+  /** `keepalive` renews liveness without re-arming the client input hold. */
+  sendTyping(peerId: string, keepalive?: boolean): boolean;
   /**
    * #244 half A: `highWaterSeq` is the conversation's authoritative `MAX(seq)`,
    * attached to the register-time SNAPSHOT frame only (the pager omits it).
    * Additive and optional — see the `history` member of `OutboundWsMessage`.
+   * #401: `nonce` is the page request's correlation, echoed on the page only.
    */
-  sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number, snapshotComplete?: boolean): boolean;
+  sendHistory(
+    peerId: string,
+    messages: HistoryMessage[],
+    highWaterSeq?: number,
+    snapshotComplete?: boolean,
+    nonce?: string,
+  ): boolean;
   /**
    * #244 half B / #356: answer a `get_difference` with RAW events
    * (`seq > afterSeq`), in ascending `seq` order, plus the correlation echo and
@@ -908,7 +937,7 @@ export interface WebChannelPeerChannel {
   sendAck?(
     peerId: string,
     ids: string[],
-    committed?: Array<{ random_id: string; messageId: string; seq: number }>,
+    committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>,
     cancelled?: string[],
   ): boolean;
   sendInboundRejected?(peerId: string, ids: string[]): boolean;
@@ -922,13 +951,19 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendToolActivity(_peerId: string, _activity: { id: string; turnId: string; name?: string; phase?: string; status?: string; summary?: string; argKeys?: string[] }): boolean { return false; }
   sendTurnSettled(_peerId: string, _turnId: string, _outcome: "ok" | "error"): boolean { return false; }
   sendTurnSnapshot(_peerId: string, _turnId: string, _answers: Array<{ id: string; text: string }>, _remove: string[]): boolean { return false; }
-  sendTyping(_peerId: string): boolean { return false; }
-  sendHistory(_peerId: string, _messages: HistoryMessage[], _highWaterSeq?: number, _snapshotComplete?: boolean): boolean { return false; }
+  sendTyping(_peerId: string, _keepalive?: boolean): boolean { return false; }
+  sendHistory(
+    _peerId: string,
+    _messages: HistoryMessage[],
+    _highWaterSeq?: number,
+    _snapshotComplete?: boolean,
+    _nonce?: string,
+  ): boolean { return false; }
   sendDifference(_peerId: string, _reply: DifferenceReply): boolean { return false; }
   sendUserCommitted(_peerId: string, _message: { id: string; text: string; turnId?: string; seq: number; random_id?: string }): boolean { return false; }
   sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload, _options?: { redelivery?: boolean }): ApprovalRequestSendResult { return { delivered: false, journaled: false }; }
   sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision, options?: ApprovalResolutionSendOptions): ApprovalResolutionSendResult { options?.onClaim?.(); return { accepted: true, delivered: false, journaled: false, status: "unavailable" }; }
   sendApprovalSnapshot(_peerId: string, _approvals: ApprovalRequestPayload[], _resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean { return false; }
-  sendAck(_peerId: string, ids: string[], _committed?: Array<{ random_id: string; messageId: string; seq: number }>, _cancelled?: string[]): boolean { return ids.length === 0; }
+  sendAck(_peerId: string, ids: string[], _committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>, _cancelled?: string[]): boolean { return ids.length === 0; }
   sendInboundRejected(_peerId: string, ids: string[]): boolean { return ids.length === 0; }
 }

@@ -1,7 +1,7 @@
 import type { StorageScopeIdentity } from "./storage-identity.js";
 import type { BoundedInboundDebouncerOptions } from "./bounded-inbound-debouncer.js";
 import type { CancelledInboundFallbackTombstones, IngressDedupeItem } from "./ingress-dedupe.js";
-import { ingressDedupeKey, ingressIdentity } from "./ingress-dedupe.js";
+import { ingressDedupeKey, ingressIdentity, usableId } from "./ingress-dedupe.js";
 import type { DeliveryJournal } from "./delivery-journal.js";
 import type { IngressOutcomeStore } from "./ingress-outcome.js";
 import type { BoundedOverflowResolver } from "./inbound-overflow-resolver.js";
@@ -10,6 +10,10 @@ import type { RetentionSessionToken } from "./inbound-retention.js";
 type CallbackOptions<Item> = Pick<BoundedInboundDebouncerOptions<Item>,
   "getId" | "getDedupeKey" | "isOverflowClaimed" | "onOverflowClaimed" | "isCancelledFallback" | "peekOutcome" | "onKnownOutcome" | "onOverflow"
 >;
+
+/** #399: carry a usable `retry_of` so the resolver can recognize a converged retry. */
+const retryOfFor = (item: IngressDedupeItem): { retryOf?: string } =>
+  usableId(item.message.retry_of) ? { retryOf: item.message.retry_of } : {};
 
 /** The account runtime's pre-debounce and overflow wiring, shared with integration tests. */
 export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(deps: {
@@ -20,7 +24,7 @@ export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(d
   cancelledFallback: CancelledInboundFallbackTombstones;
   deliveryJournal: Pick<DeliveryJournal, "lookupUserMessageIdByRandomId" | "dispatch">;
   sessionToken(peerId: string): RetentionSessionToken;
-  sendAck(peerId: string, ids: string[], committed?: Array<{ random_id: string; messageId: string; seq: number }>, cancelled?: string[]): boolean;
+  sendAck(peerId: string, ids: string[], committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>, cancelled?: string[]): boolean;
   sendRejected(peerId: string, ids: string[]): boolean;
   onPressure?: BoundedInboundDebouncerOptions<Item>["onOverflow"];
 }): CallbackOptions<Item> {
@@ -35,7 +39,7 @@ export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(d
       overflowResolver.tryStart({
         accountId, storageScope: deps.storageScope, peerId: item.peerId, id: identity.wireId, key: identity.key,
         randomId: identity.randomId, sessionToken: deps.sessionToken(item.peerId),
-        recoverCancelled: cancelledFallback.has(identity.key, outcomeScope),
+        recoverCancelled: cancelledFallback.has(identity.key, outcomeScope), ...retryOfFor(item),
       });
     },
     isCancelledFallback: (peerId, key) => !deps.deliveryJournal.dispatch?.isCancelled(peerId, key.slice(peerId.length + 1)) && cancelledFallback.has(key, outcomeScope),
@@ -67,7 +71,7 @@ export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(d
       if (!identity) return;
       overflowResolver.tryStart({
         accountId, storageScope: deps.storageScope, peerId, id: identity.wireId, key: identity.key, randomId: identity.randomId,
-        sessionToken: deps.sessionToken(peerId), recoverCancelled,
+        sessionToken: deps.sessionToken(peerId), recoverCancelled, ...retryOfFor(item),
       });
     },
   };

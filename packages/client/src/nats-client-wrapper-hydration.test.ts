@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
+import { ownHistoryPage } from "./history-page.test-harness.js";
 
 /**
  * WP B (#95): hydration contract — given a `history` frame, reproduce the
@@ -57,7 +58,7 @@ type AnyFrame = { type: string; [k: string]: unknown };
 
 /** Drive the private inbound dispatcher directly (no socket needed). */
 function deliver(wrapper: WebChannelNATSClient, frame: AnyFrame): void {
-  (wrapper as unknown as { handleMessage: (m: AnyFrame) => void }).handleMessage(frame);
+  (wrapper as unknown as { handleMessage: (m: AnyFrame) => void }).handleMessage(ownHistoryPage(wrapper, frame));
 }
 
 type Row = { id: string; role: string; text: string; ts?: number; [k: string]: unknown };

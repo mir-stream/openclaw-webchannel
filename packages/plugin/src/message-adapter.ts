@@ -21,6 +21,7 @@ import { DurableSendError } from "./durable-send-error.js";
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
 import { resolveOutboundTransport, type ResolveOutboundTransport } from "./outbound-account.js";
+import { requireOutboundPeerId } from "./outbound-target.js";
 
 /**
  * Stable per-message id we generate for each outbound logical send. This becomes
@@ -141,9 +142,11 @@ export function createClawMessageAdapter(
       text: async (ctx): Promise<ChannelMessageSendResult> => {
         const id = nextMessageId();
         // `ctx.to` is the recorded reply target — the REAL per-peer `wsKey`
-        // (inbound.ts records `reply.to = wsKey`). Target it directly; if it's
-        // absent or the targeted send fails, throw before fabricating any
-        // receipt (P0-1 removed recipient guessing; P0-4 makes failure honest).
+        // (inbound.ts records `reply.to = wsKey`). Target it directly after the
+        // shared grammar strips an explicit `webchannel:`/`user:` prefix (#402);
+        // if it's absent, malformed or the targeted send fails, throw before
+        // fabricating any receipt (P0-1 removed recipient guessing; P0-4 makes
+        // failure honest).
         //
         // P0-4 (review R2): throwing is safe ONLY because core never re-sends a
         // thrown outbound. Traced in openclaw 2026.6.10 (the installed version and
@@ -160,10 +163,11 @@ export function createClawMessageAdapter(
         if (!ctx.to) {
           throw new Error("[webchannel] message.send.text failed: ctx.to is absent");
         }
+        const peerId = requireOutboundPeerId(ctx.to);
         const target = resolveOutboundTransport(ctx, transport, resolveAccountTransport);
-        if (!target.sendText(ctx.to, ctx.text, id)) {
+        if (!target.sendText(peerId, ctx.text, id)) {
           throw new Error(
-            `[webchannel] message.send.text failed: targeted send returned false for peer ${ctx.to}`,
+            `[webchannel] message.send.text failed: targeted send returned false for peer ${peerId}`,
           );
         }
         return { receipt: buildClawReceipt(id), messageId: id };

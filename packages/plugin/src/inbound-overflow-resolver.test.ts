@@ -17,6 +17,7 @@ import {
   recordCancelledInboundItems,
 } from "./ingress-dedupe.js";
 import { openDeliveryJournal, type DeliveryJournal } from "./delivery-journal.js";
+import { createIngressDebounceCallbacks } from "./ingress-debounce-callbacks.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -727,6 +728,100 @@ describe("BoundedOverflowResolver — the journal is the accept authority (#344)
     } finally {
       journal.close();
     }
+  });
+
+  it("#399 acks a converged retry with the first retry's row instead of treating it as an orphan", async () => {
+    const journal = openIn();
+    try {
+      const dispatch = journal.dispatch!;
+      const owner = dispatch.activate();
+      const [original] = dispatch.accept(owner, PEER, [{ text: "transfer", turnId: "u-0", randomId: "r-0" }]);
+      dispatch.claim(owner, PEER, ["r-0"]);
+      dispatch.recoverInterrupted(dispatch.activate());
+      const replacement = dispatch.activate();
+      const [first] = dispatch.accept(replacement, PEER, [{ text: "transfer", turnId: "u-1", randomId: "r-1", retryOf: original!.messageId }]);
+      // The second retry was accepted by converging on `first`: a marker, no own row.
+      expect(dispatch.accept(replacement, PEER, [{ text: "transfer", turnId: "u-2", randomId: "r-2", retryOf: original!.messageId }]))
+        .toEqual([expect.objectContaining({ messageId: first!.messageId, inserted: false, converged: true })]);
+      const outcomeStore = await seedAcceptedMarker(`${PEER}:r-2`);
+      const acks: Array<{ id: string; committed: unknown }> = [];
+      const resolver = new BoundedOverflowResolver({
+        outcomeStore,
+        lookupUserRow: ({ peerId }, idempotencyKey) => journal.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
+        lookupConvergedRetry: ({ peerId }, retryOf) => dispatch.retryOf(peerId, retryOf),
+        sendAck: ({ id }, committed) => { acks.push({ id, committed }); return true; },
+        sendRejected: () => true,
+      });
+      const start = (id: string, retryOf?: string) => resolver.tryStart({
+        accountId: ACCOUNT, peerId: PEER, key: `${PEER}:r-2`, id, randomId: "r-2",
+        sessionToken: new InboundRetentionBudget().createSessionToken(), ...(retryOf ? { retryOf } : {}),
+      });
+      expect(start("u-2", original!.messageId)).toEqual({ status: "started" });
+      await tick(); await tick();
+      expect(acks).toEqual([{ id: "u-2", committed: [{ random_id: "r-2", messageId: first!.messageId, converged: true }] }]);
+      // Without its provenance the same marker is still an unproven orphan.
+      start("u-2");
+      await tick(); await tick();
+      expect(acks).toHaveLength(1);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it.each(["recovered", "found"] as const)("#399 a %s cancellation of a converged retry echoes no other row", async (mode) => {
+    const journal = openIn();
+    try {
+      const dispatch = journal.dispatch!;
+      const owner = dispatch.activate();
+      const [original] = dispatch.accept(owner, PEER, [{ text: "transfer", turnId: "u-0", randomId: "r-0" }]);
+      dispatch.claim(owner, PEER, ["r-0"]);
+      dispatch.recoverInterrupted(dispatch.activate());
+      const replacement = dispatch.activate();
+      dispatch.accept(replacement, PEER, [{ text: "transfer", turnId: "u-1", randomId: "r-1", retryOf: original!.messageId }]);
+      const outcomeStore = createIngressOutcomeStore({ accepted: memoryDedupe(), overloaded: memoryDedupe(), cancelled: memoryDedupe() });
+      if (mode === "found") {
+        const seeded = await outcomeStore.record(ACCOUNT, `${PEER}:r-2`, "cancelled");
+        if (seeded.status !== "recorded") throw new Error("could not seed the marker");
+        seeded.write.commit();
+      }
+      const acks: Array<{ id: string; committed: unknown; cancelled: unknown }> = [];
+      const resolver = new BoundedOverflowResolver({
+        outcomeStore,
+        lookupUserRow: ({ peerId }, idempotencyKey) => journal.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
+        lookupConvergedRetry: ({ peerId }, retryOf) => dispatch.retryOf(peerId, retryOf),
+        sendAck: ({ id }, committed, cancelled) => { acks.push({ id, committed, cancelled }); return true; },
+        sendRejected: () => true,
+      });
+      resolver.tryStart({
+        accountId: ACCOUNT, peerId: PEER, key: `${PEER}:r-2`, id: "u-2", randomId: "r-2", retryOf: original!.messageId,
+        sessionToken: new InboundRetentionBudget().createSessionToken(), ...(mode === "recovered" ? { recoverCancelled: true } : {}),
+      });
+      await tick(); await tick();
+      expect(acks).toEqual([{ id: "u-2", committed: undefined, cancelled: true }]);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("#399 overflow requests carry the frame's retry_of", () => {
+    const starts: unknown[] = [];
+    const callbacks = createIngressDebounceCallbacks({
+      accountId: ACCOUNT,
+      outcomeStore: createIngressOutcomeStore({ accepted: memoryDedupe(), overloaded: memoryDedupe(), cancelled: memoryDedupe() }),
+      overflowResolver: { tryStart: (request: unknown) => { starts.push(request); return { status: "started" }; }, hasActiveClaim: () => false } as unknown as BoundedOverflowResolver,
+      cancelledFallback: new CancelledInboundFallbackTombstones(),
+      deliveryJournal: { lookupUserMessageIdByRandomId: () => undefined },
+      sessionToken: () => new InboundRetentionBudget().createSessionToken(),
+      sendAck: () => true,
+      sendRejected: () => true,
+    });
+    const item = { peerId: PEER, message: { type: "user_message" as const, id: "u-2", random_id: "r-2", text: "transfer", retry_of: "webchannel-user-1" } };
+    callbacks.onOverflow!({ key: PEER, item, recoverCancelled: false } as never);
+    callbacks.onOverflowClaimed!(item);
+    expect(starts).toEqual([
+      expect.objectContaining({ id: "u-2", retryOf: "webchannel-user-1" }),
+      expect.objectContaining({ id: "u-2", retryOf: "webchannel-user-1" }),
+    ]);
   });
 
   it("keeps the pre-#344 ack when no journal is wired at all", async () => {

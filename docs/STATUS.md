@@ -1,5 +1,27 @@
 # Project Status — single source of truth
 
+Quiet-turn liveness (#396): normal turns send an initial typing indicator and
+renew ephemeral `typing` with `keepalive: true` every 4 seconds until completion,
+error, or dispatch abort. Renewals refresh existing application watches without
+re-arming typing or holding ordinary followups after output or approval. Typing
+capability and offline drops still apply; control-lane aborts emit no keepalive.
+Recovery restores only this client's published unsettled turns from durable
+`queued`/`started` state, in publish order. Explicit stop, settlement, cancellation,
+terminal receipts, and foreign turns cannot resurrect activity; stale-draft expiry
+retains eligible server-confirmed turns. Durable state alone does not re-arm the
+one-recovery-per-silent-interval watch. Protocol 8 requires client and plugin to
+roll out together: older clients treat renewals as input-holding typing.
+
+History page correlation (#401): `load_history` carries a per-request `nonce` that
+the `history` page echoes. Pages ride the peer's shared `.out`; a device folds only
+a page echoing its own nonce, so another device's page no longer leaves a permanent
+hole in a different window. The register snapshot stays uncorrelated. Concurrent
+page requests from one peer's devices are queued: at most 8 waiting and a 64 KiB
+waiting-string charge (two bytes per UTF-16 code unit across both cursors and the
+nonce). Exceeding either bound drops the newest request with a throttled warning;
+the active request keeps its existing cursor semantics.
+History correlation was introduced in protocol 7.
+
 `/stop` cancellation (review R1/R2): control receipts and exact cancellation targets
 now commit together in the tenant/account SQLite journal before ACK. This includes
 debounce entries not yet accepted, the pending overflow-only ID, durable queued work and the current started
@@ -23,7 +45,7 @@ keys, even when account transport startup fails; on a persistent storage or
 account-planning fault it deliberately holds core's remaining plugin-service
 startup (and every channel's restart recovery) rather than let core re-run
 interrupted work. Core session resets remain available. Historical rows without lifecycle metadata are never replayed or
-assigned invented statuses. Client/plugin protocol 6 requires lockstep rollout.
+assigned invented statuses. Client/plugin protocol 8 requires lockstep rollout.
 See [dispatch recovery and upgrade boundaries](DISPATCH_RECOVERY.md).
 
 Round 6 (#378): config reads, account inspection, acquisition/planning, status

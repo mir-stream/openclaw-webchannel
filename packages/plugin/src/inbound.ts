@@ -14,6 +14,7 @@ import {
 import { WEBCHANNEL_ID, ANON_PEER_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel, InboundWsMessage } from "./channel-contract.js";
 import { resolveDmAdmission } from "./dm-allowlist.js";
+import { resolvePeerCommandAuthorization } from "./command-gate.js";
 import { usableId } from "./ingress-dedupe.js";
 import {
   resolveWebchannelAccountConfig,
@@ -870,16 +871,18 @@ function startTypingKeepalive(
   peerId: string,
   abortSignal: AbortSignal | undefined,
 ): () => void {
-  const send = () => {
+  const send = (keepalive = false) => {
     try {
-      transport.sendTyping(peerId);
+      transport.sendTyping(peerId, keepalive);
     } catch {
       // Best-effort indicator; the next tick or the turn's own frames follow.
     }
   };
   send();
   if (abortSignal?.aborted) return () => {};
-  const timer = setInterval(send, TYPING_KEEPALIVE_INTERVAL_MS);
+  // Renewals prove liveness only: the initial indicator must stay cleared after
+  // output or approval so ordinary followups retain immediate admission.
+  const timer = setInterval(() => send(true), TYPING_KEEPALIVE_INTERVAL_MS);
   timer.unref?.();
   const stop = () => {
     clearInterval(timer);
@@ -969,8 +972,10 @@ export async function handleInboundMessage(
   // still-live running turn — see `src/control-lane.ts` and index-nats.ts. Two
   // things differ for a control-lane turn: (1) no progress draft — the abort's
   // reply is a single short final text, so a "Working…" bubble for it is noise;
-  // (2) we stamp CommandAuthorized on the turn context (see the buildContext
-  // call) so core's fast-abort accepts it.
+  // (2) it never settles (see `settlementEligible`). Core's fast-abort accepts
+  // it through the effective CommandAuthorized stamp every admitted turn
+  // carries, after applicable core command policy is resolved (#407, see the
+  // buildContext call).
   const controlLane = options?.controlLane === true;
   // Core's dedupe route omits tenant and reduces a session key to its agent.
   // Supply a stable, fully scoped platform ID; the wire ID remains ACK-only.
@@ -1081,6 +1086,22 @@ export async function handleInboundMessage(
     );
     return;
   }
+  const commandAuthorized = resolvePeerCommandAuthorization({
+    admission,
+    cfg: api.config,
+    // Mirror the identity fields `buildContext` projects onto the real core
+    // context below so authorization is computed for that exact turn identity.
+    ctx: {
+      Provider: WEBCHANNEL_ID,
+      Surface: WEBCHANNEL_ID,
+      OriginatingChannel: WEBCHANNEL_ID,
+      AccountId: accountId,
+      SenderId: wsKey,
+      From: wsKey,
+      To: wsKey,
+      ChatType: "direct",
+    },
+  });
 
   // Draft enabled for the two streaming modes ("progress" tool-lines-only,
   // "partial" answer-text); answer-text streaming (onPartialReply) is wired
@@ -1130,6 +1151,9 @@ export async function handleInboundMessage(
   // remaining `resolveWebchannelSessionRoute` in production. The forced scope is
   // NOT vestigial — the write-side reason above is the stronger one, and it is
   // now the whole reason. See `session-route.ts`'s module docblock.
+  // Core-initiated outbound (#403) mirrors into this same session through the
+  // shared `buildWebchannelPeerSessionKey`; it is an outbound route, not an
+  // inbound dispatch site.
   const route = resolveWebchannelSessionRoute(api, accountId, wsKey, servingTenant);
   options?.beforeCore?.(route.agentId, route.sessionKey);
 
@@ -1177,10 +1201,12 @@ export async function handleInboundMessage(
   // never emitted — so the lane could not be turned on at all, and failed
   // SILENTLY: the turn settled `ok` with the answer intact and simply zero
   // reasoning frames. A channel-private key that core does not co-parse is the
-  // whole point. Deployments may separately authorize named peers through core's
-  // supported command allowlist; the explicit-session veto below covers them.
+  // whole point. Since #407 admitted peers ARE command-authorized, so core now
+  // honors `reasoningDefault` and session reasoning state for them as well; the
+  // lane gate stays channel-owned regardless, and the explicit-session veto
+  // below covers the persisted opt-out.
   //
-  // One session value remains authoritative as a privacy VETO: an allowlisted
+  // One session value remains authoritative as a privacy VETO: a command-authorized
   // browser peer can legitimately run `/reasoning off`, and core persists that
   // explicit choice as `sessionEntry.reasoningLevel="off"`. The non-stream lever
   // treats core mode `off` as streamable, so without this narrow read a later
@@ -1218,8 +1244,8 @@ export async function handleInboundMessage(
   // frame from the agent settles the indicator client-side; we never send a
   // matching "stop" frame.
   //
-  // #396: and we keep re-sending it until the turn ends, as Telegram renews its
-  // typing chat action. "Is this turn still running" is a fact only this side
+  // #396: renew liveness with marked typing frames until the turn ends. These
+  // renewals do not re-arm the indicator or hold followup input. "Is this turn still running" is a fact only this side
   // knows; a single frame at turn start left a long quiet tool call looking
   // like a dead connection to the client, whose stall recovery then dropped
   // the turn's Stop button. The `finally` stops the timer on every exit.
@@ -1268,20 +1294,14 @@ export async function handleInboundMessage(
             // lets each account's native approval handler claim ONLY its own
             // turns' approvals (and the prompt deliver on the right channel).
             accountId,
-            // Control lane (P1-8a): stamp CommandAuthorized for THIS turn only.
-            // Core's fast-abort (`tryFastAbortFromMessage`) runs before the
-            // per-session busy gate but requires `resolveCommandAuthorization`'s
-            // `isAuthorizedSender`, which with no `commands.allowFrom` reduces to
-            // `ctx.CommandAuthorized`. `buildContext` sets that to false unless
-            // `access.commands.authorized` is passed. We stamp it ONLY on the
-            // abort lane (not every turn) so we don't broadly enable text
-            // commands for every peer. It is safe here because webchannel peers
-            // are JWT-authenticated with FORCED per-peer session isolation
-            // (`resolveWebchannelSessionRoute`) — an abort can only ever target
-            // the sender's OWN session, never another peer's.
-            ...(controlLane
-              ? { access: { commands: { authorized: true } } }
-              : {}),
+            // #407: stamp CommandAuthorized on EVERY turn from the single
+            // policy-aware decision in command-gate.ts. Core's fast-abort,
+            // early reset guard, and whole-message command handling all consume
+            // this value at different stages, so the stamp must already include
+            // applicable core command/owner allowlists. Webchannel routes the
+            // session per peer (subject to configured identity links); actual
+            // command/tool effects remain governed by core policy.
+            access: { commands: { authorized: commandAuthorized } },
             timestamp: input.timestamp,
             from: wsKey,
             sender: { id: wsKey, name: wsKey },
@@ -1761,8 +1781,7 @@ export async function handleInboundMessage(
     // here; the claim is removed by its own id, so a run retained when an
     // approval-stream restart rotates the barrier releases only itself.
     originLease?.release();
-    // #396: before anything below can throw — a surviving timer would keep
-    // re-arming the client's typing indicator after `turn_settled` cleared it.
+    // #396: retire this turn's liveness source before later cleanup can throw.
     stopTypingKeepalive?.();
     if (toolActivitySink) {
       for (const runId of agentRunIds) {
