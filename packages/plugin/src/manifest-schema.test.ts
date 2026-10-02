@@ -7,7 +7,13 @@ import {
   type JsonSchemaObject,
 } from "openclaw/plugin-sdk/json-schema-runtime";
 
-import { resolveReasoningDurable, resolveReasoningEnabled } from "./account-config.js";
+import {
+  resolveDefaultWebchannelAccountId,
+  resolveReasoningDurable,
+  resolveReasoningEnabled,
+  resolveWebchannelAccountConfig,
+} from "./account-config.js";
+import { EncryptionDisabledError, resolveEncryptionPolicy } from "./encryption-policy.js";
 
 const manifest = JSON.parse(
   readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
@@ -264,6 +270,99 @@ describe("shipped WebChannel manifest schema", () => {
       });
       expect(resolveReasoningEnabled(hydrated)).toBe(false);
       expect(resolveReasoningDurable(hydrated)).toBe(true);
+    });
+  });
+
+  // #405. Core validates `channels.webchannel` with exactly this call
+  // (`validateJsonSchemaValue({ schema, cacheKey: "channel:webchannel", value,
+  // applyDefaults: true })` in the pinned core's config loader) and refuses the
+  // WHOLE config on any error. Because the root is `additionalProperties:false`,
+  // a key the runtime reads but the schema omits is a key no operator can set:
+  // the runtime branch is unreachable, and following doctor's own fix text
+  // breaks every channel at once.
+  describe("every channel-level key the runtime reads is declared (#405)", () => {
+    const validate = (value: unknown) =>
+      validateJsonSchemaValue({
+        schema: manifest.channelConfigs.webchannel.schema as JsonSchemaObject,
+        cacheKey: `webchannel-manifest-runtime-keys-${Math.random()}`,
+        value,
+        applyDefaults: true,
+      });
+
+    // Keep in step with account-config.ts STRUCTURAL_KEYS and
+    // NESTED_OBJECT_KEYS plus the flat leaves the runtime reads off the
+    // resolved account (tenant, storageRoot, allowFrom, dmSecurity).
+    const RUNTIME_READ_KEYS = [
+      "accounts",
+      "defaultAccount",
+      "enabled",
+      "tenant",
+      "storageRoot",
+      "allowFrom",
+      "dmSecurity",
+      "auth",
+      "nats",
+      "saas",
+      "capabilities",
+      "history",
+      "streaming",
+      "execApprovals",
+      "encryption",
+    ];
+
+    it("declares each runtime-read key in the strict root schema", () => {
+      const declared = Object.keys(
+        (manifest.channelConfigs.webchannel.schema as { properties: Record<string, unknown> })
+          .properties,
+      );
+      expect(RUNTIME_READ_KEYS.filter((key) => !declared.includes(key))).toEqual([]);
+    });
+
+    it("accepts defaultAccount and the runtime selects it after core validation", () => {
+      const section = {
+        defaultAccount: "beta",
+        accounts: { alpha: { tenant: "t-a" }, beta: { tenant: "t-b" } },
+      };
+      const result = validate(section);
+      expect(result.ok, JSON.stringify(result.ok ? null : result.errors)).toBe(true);
+      if (!result.ok) return;
+      // The hydrated value is what core writes back over channels.webchannel.
+      expect(result.value).toMatchObject({ defaultAccount: "beta" });
+      expect(resolveDefaultWebchannelAccountId({ channels: { webchannel: result.value } }))
+        .toBe("beta");
+    });
+
+    it("rejects a non-string defaultAccount", () => {
+      for (const value of [1, true, null, {}, ["beta"]]) {
+        expect(
+          validate({ defaultAccount: value }).ok,
+          `defaultAccount: ${JSON.stringify(value)} must be rejected`,
+        ).toBe(false);
+      }
+    });
+
+    it("accepts channel-level encryption.mode so the runtime boot guard is reachable", () => {
+      const required = validate({ encryption: { mode: "required" } });
+      expect(required.ok).toBe(true);
+
+      // `disabled` stays schema-valid on purpose, like auth.strategy
+      // "anonymous": the runtime refuses only this channel with a targeted
+      // error and doctor reports encryption-disabled, instead of the schema
+      // invalidating every channel's config.
+      const disabled = validate({ encryption: { mode: "disabled" } });
+      expect(disabled.ok).toBe(true);
+      if (!disabled.ok) return;
+      const account = resolveWebchannelAccountConfig(
+        { channels: { webchannel: disabled.value } },
+        "default",
+      );
+      expect(() => resolveEncryptionPolicy(account.encryption as never))
+        .toThrow(EncryptionDisabledError);
+    });
+
+    it("rejects unknown encryption modes and sibling keys", () => {
+      expect(validate({ encryption: { mode: "off" } }).ok).toBe(false);
+      expect(validate({ encryption: { mode: "required", cipher: "none" } }).ok).toBe(false);
     });
   });
 
