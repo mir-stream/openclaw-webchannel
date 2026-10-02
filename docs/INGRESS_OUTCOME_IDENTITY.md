@@ -81,8 +81,8 @@ the same scoped fallback; the parent `/stop` implementation retains its atomic
 SQLite receipt/target transaction and replay behavior.
 
 Tenant scoping adds no journal schema, credential format or dispatch policy
-change. It is stacked on the protocol 6 stop parent, whose cancellation ACK
-contract requires the matching client consumer. Downgrading to an account-only
+change. It is stacked on the stop parent (protocol 6 at the time), whose
+cancellation ACK contract requires the matching client consumer. Downgrading to an account-only
 outcome reader does not provide these identity guarantees.
 
 ## Focused evidence

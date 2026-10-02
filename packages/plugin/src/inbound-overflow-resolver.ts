@@ -311,6 +311,9 @@ export class BoundedOverflowResolver {
     try {
       const row = this.options.lookupUserRow?.(request, idempotencyKey);
       if (row !== undefined || !convergedRetry || request.retryOf === undefined) return row;
+      // Only the exact alias receipt proves this accepted marker reached the
+      // current writer's convergence transaction. Without it, stay unresolved
+      // so normal admission can repair the orphan marker.
       const converged = this.options.lookupConvergedRetry?.(request, request.retryOf);
       return converged && { messageId: converged.messageId, converged: true };
     } catch {

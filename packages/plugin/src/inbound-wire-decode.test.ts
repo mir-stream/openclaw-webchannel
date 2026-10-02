@@ -20,6 +20,7 @@ import {
   decodeInboundWsMessage,
 } from "./inbound-wire-decode.js";
 import { MAX_INBOUND_USER_ID_LENGTH } from "./delivery-journal-event.js";
+import { MAX_STOP_PENDING_INPUTS } from "./channel-contract.js";
 
 /** The decoded message, or a failure description that reads in a diff. */
 function decode(raw: unknown): { ok: true } | { ok: false; type: unknown; reason: string } {
@@ -127,6 +128,19 @@ describe("#246 half A — decodeInboundWsMessage: user_message", () => {
       type: "user_message", text: "hi",
       random_id: "r".repeat(MAX_INBOUND_USER_ID_LENGTH + 1),
     });
+  });
+
+  it("#398 — admits a bounded `cancel_pending` list keyed like user messages, and refuses any other shape", () => {
+    accepts({ type: "user_message", text: "/stop", cancel_pending: [] });
+    accepts({ type: "user_message", text: "/stop", cancel_pending: [{ id: "w-1", random_id: "r-1" }, { id: "w-2" }] });
+    accepts({ type: "user_message", text: "/stop",
+      cancel_pending: Array.from({ length: MAX_STOP_PENDING_INPUTS }, (_, index) => ({ id: `w-${index}` })) });
+    refuses({ type: "user_message", text: "/stop",
+      cancel_pending: Array.from({ length: MAX_STOP_PENDING_INPUTS + 1 }, (_, index) => ({ id: `w-${index}` })) });
+    for (const value of [{ id: "w" }, "w", [null], ["w"], [{}], [{ id: "" }], [{ id: 7 }],
+      [{ id: "w", random_id: "" }], [{ id: "a".repeat(MAX_INBOUND_USER_ID_LENGTH + 1) }]]) {
+      refuses({ type: "user_message", text: "/stop", cancel_pending: value });
+    }
   });
 
   it("does NOT strip unknown fields — that is `normalizeInboundUserMessage`'s job, at a different door", () => {

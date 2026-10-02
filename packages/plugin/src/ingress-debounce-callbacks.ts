@@ -24,7 +24,7 @@ export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(d
   cancelledFallback: CancelledInboundFallbackTombstones;
   deliveryJournal: Pick<DeliveryJournal, "lookupUserMessageIdByRandomId" | "dispatch">;
   sessionToken(peerId: string): RetentionSessionToken;
-  sendAck(peerId: string, ids: string[], committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>, cancelled?: string[]): boolean;
+  sendAck(peerId: string, ids: string[], committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>, cancelled?: string[], unaccepted?: string[]): boolean;
   sendRejected(peerId: string, ids: string[]): boolean;
   onPressure?: BoundedInboundDebouncerOptions<Item>["onOverflow"];
 }): CallbackOptions<Item> {
@@ -52,12 +52,24 @@ export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(d
         // row from before /stop. Preserve its echo even on the hot-cache path.
         const identity = ingressIdentity(item)!;
         let row;
+        let converged;
+        // #398: "never accepted" is declared only on positive SQLite evidence;
+        // a fault leaves the input as an ordinary (accepted) cancellation.
+        let neverAccepted = false;
         try {
           row = deps.deliveryJournal.lookupUserMessageIdByRandomId(peerId, identity.idempotencyKey);
+          if (row === undefined) converged = deps.deliveryJournal.dispatch?.convergence(peerId, identity.idempotencyKey);
         } catch { /* A journal fault does not undo a known cancellation. */ }
-        deps.sendAck(peerId, [id], row && identity.randomId !== undefined
-          ? [{ random_id: identity.randomId, ...row }]
-          : undefined, outcome === "cancelled" ? [id] : undefined);
+        try {
+          neverAccepted = outcome === "cancelled" && deps.deliveryJournal.dispatch?.isUnaccepted(peerId, identity.idempotencyKey) === true;
+        } catch { /* Optional classification does not undo a known cancellation. */ }
+        const cancelled = outcome === "cancelled" ? [id] : undefined;
+        const committed = identity.randomId === undefined ? undefined
+          : row ? [{ random_id: identity.randomId, ...row }]
+            : converged ? [{ random_id: identity.randomId, messageId: converged.messageId, converged: true as const }]
+              : undefined;
+        if (neverAccepted) deps.sendAck(peerId, [id], committed, cancelled, [id]);
+        else deps.sendAck(peerId, [id], committed, cancelled);
       }
     },
     onOverflow: (params) => {

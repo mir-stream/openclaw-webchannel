@@ -252,8 +252,12 @@ const processOverflowResolver = new BoundedOverflowResolver({
   // fail-safe direction (the client replays and the flush path decides).
   lookupUserRow: (request, idempotencyKey) => runtimeForOverflow(request)
     ?.deliveryJournal?.lookupUserMessageIdByRandomId(request.peerId, idempotencyKey),
-  lookupConvergedRetry: (request, retryOf) => runtimeForOverflow(request)
-    ?.deliveryJournal?.dispatch?.retryOf(request.peerId, retryOf),
+  lookupConvergedRetry: (request) => {
+    const dispatch = runtimeForOverflow(request)?.deliveryJournal?.dispatch;
+    const prefix = `${request.peerId}:`;
+    const key = request.key.startsWith(prefix) ? request.key.slice(prefix.length) : request.id;
+    return dispatch?.convergence(request.peerId, key);
+  },
   sendAck: (request, committed, cancelled) => runtimeForOverflow(request)
     ?.channel.sendAck(request.peerId, [request.id], committed, cancelled ? [request.id] : undefined) ?? false,
   sendRejected: (request) => runtimeForOverflow(request)
@@ -1121,7 +1125,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         beginBatch: (peerId) => dispatchRecovery!.beginBatch(peerId),
         dispatchRecovery,
         // #243 half 2a: forward the server-assigned-id echo so it rides the ack.
-        sendAck: (peerId, ids, committed, cancelled) => channel.sendAck(peerId, ids, committed, cancelled),
+        sendAck: (peerId, ids, committed, cancelled, unaccepted) => channel.sendAck(peerId, ids, committed, cancelled, unaccepted),
         sendInboundRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids),
         // #245 Part B: broadcast a just-committed user message to the account's
         // devices for immediate multi-device echo (Telegram model). One publish to
@@ -1154,7 +1158,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           cancelledFallback: cancelledInboundFallback,
           deliveryJournal,
           sessionToken,
-          sendAck: (peerId, ids, committed, cancelled) => channel.sendAck(peerId, ids, committed, cancelled),
+          sendAck: (peerId, ids, committed, cancelled, unaccepted) => channel.sendAck(peerId, ids, committed, cancelled, unaccepted),
           sendRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids),
           onPressure: ({ key: peerId, reason, chargedBytes }) => {
             pressureLogger.record({
@@ -1201,7 +1205,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           if (token) processOverflowResolver.invalidateSession(token);
         },
         isActive: () => runtimeActive,
-        sendAck: (peerId, ids, committed, cancelled) => channel.sendAck(peerId, ids, committed, cancelled),
+        sendAck: (peerId, ids, committed, cancelled, unaccepted) => channel.sendAck(peerId, ids, committed, cancelled, unaccepted),
         warn: (error) => api.logger?.warn?.(`webchannel: stop control failed: ${logSafe(error)}`),
         dispatchControl: (peerId, message) => {
           const operation = handleInboundMessage(api, channel, peerId, message, accountId, tenant, {

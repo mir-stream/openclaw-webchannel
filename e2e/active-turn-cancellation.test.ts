@@ -35,7 +35,7 @@ afterEach(async () => {
 
 // The relay and registered device are fixtures. Cancellation capture, SQLite,
 // ingress replay, ACK construction/packing/encryption, and the client are real.
-it.each([false, true])("pre-admission stop does not become permanent active recovery (lost ACK/cold restart=%s)", async (cold) => {
+async function connectStopHarness(cold: boolean) {
   const root = mkdtempSync(join(tmpdir(), "webchannel-stop-client-"));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   cleanups.push(installFakeWebSocket());
@@ -48,8 +48,7 @@ it.each([false, true])("pre-admission stop does not become permanent active reco
   const identityKeyPair = { publicKey: identity.publicRaw,
     privateKey: new Uint8Array((createPrivateKey(identity.privatePem).export({ type: "pkcs8", format: "der" }) as Buffer).subarray(-32)) };
   let socket: FakeNatsWS | undefined;
-  let loseCancellation = cold;
-  let registrations = 0;
+  const relay = { loseCancellation: cold, registrations: 0, dropInput: undefined as string | undefined };
   const clientPublishes: UserMessageLike[] = [];
   const serverFrames: InboundMessage[] = [];
   const executions: UserMessageLike[] = [];
@@ -66,7 +65,7 @@ it.each([false, true])("pre-admission stop does not become permanent active reco
       const wire = typeof payload === "string" ? payload : Buffer.from(payload).toString("utf8");
       const frame = openMessage(wire, key) as InboundMessage;
       serverFrames.push(frame);
-      if (loseCancellation && frame.type === "ack" && frame.cancelled?.length) return;
+      if (relay.loseCancellation && frame.type === "ack" && frame.cancelled?.length) return;
       socket?.deliverToClient(subject, wire);
     }
   }
@@ -145,13 +144,16 @@ it.each([false, true])("pre-admission stop does not become permanent active reco
       const isRegister = JSON.parse(payload).op === "register";
       if (isRegister) {
         socket = server;
-        registrations++;
+        relay.registrations++;
         runtime.channel.registerPeer(PEER);
       }
       await registration(subject, payload, server, reply);
       if (isRegister) runtime.channel.sendHistory(PEER, [], runtime.journal.maxSeq(PEER));
     } else if (subject === IN) {
-      clientPublishes.push(openMessage(payload, key) as UserMessageLike);
+      const message = openMessage(payload, key) as UserMessageLike;
+      clientPublishes.push(message);
+      // Models an input this server never admitted, e.g. an overloaded tail.
+      if (message.text === relay.dropInput) return;
       runtime.transport.emit("message", { subject, payload: Buffer.from(payload) });
     }
   };
@@ -164,6 +166,20 @@ it.each([false, true])("pre-admission stop does not become permanent active reco
   cleanups.push(() => wrapper.close());
   wrapper.connect();
   await settleUntil(() => wrapper.getState().connected, { label: "registered client" });
+  return {
+    wrapper, relay, key, IN, clientPublishes, serverFrames, executions, controls, errors,
+    get runtime() { return runtime; },
+    reopen: async () => { await runtime.close(); runtime = openRuntime(); },
+    closeSocket: () => { socket!.close(); },
+    deliverAgain: (message: UserMessageLike) => runtime.transport.emit("message", { subject: IN,
+      payload: Buffer.from(sealMessage({ accountId: AGENT, tenant: TENANT, sub: PEER }, key, message)) }),
+  };
+}
+
+it.each([false, true])("pre-admission stop does not become permanent active recovery (lost ACK/cold restart=%s)", async (cold) => {
+  const h = await connectStopHarness(cold);
+  const { wrapper, clientPublishes, serverFrames, executions, controls, errors, key, IN } = h;
+  let runtime = h.runtime;
   const receipt = wrapper.send("cancel before debounce flush")!;
   expect(receipt.snapshot().state).toBe("sent");
   const input = clientPublishes[0]!;
@@ -178,26 +194,57 @@ it.each([false, true])("pre-admission stop does not become permanent active reco
   expect(runtime.journal.read(PEER)).toEqual([]);
   if (cold) {
     expect(receipt.snapshot().state).toBe("sent");
-    await runtime.close();
-    runtime = openRuntime();
-    loseCancellation = false;
-    socket!.close();
-    await settleUntil(() => receipt.snapshot().state === "accepted" && wrapper.getState().connected,
+    await h.reopen();
+    runtime = h.runtime;
+    h.relay.loseCancellation = false;
+    h.closeSocket();
+    await settleUntil(() => receipt.snapshot().state === "failed" && wrapper.getState().connected,
       { label: "cold cancellation replay received" });
     expect(clientPublishes.map((message) => message.id)).toEqual([input.id, input.id]);
   } else {
-    expect(receipt.snapshot().state).toBe("accepted");
+    expect(receipt.snapshot().state).toBe("failed");
     expect(clientPublishes).toHaveLength(1);
   }
+  // #398: the server declares this pre-admission input never accepted, so the
+  // bubble stays as cancelled input instead of an accepted delivery.
+  expect(serverFrames.some((frame) => frame.type === "ack" && frame.unaccepted?.includes(input.id!))).toBe(true);
+  expect(receipt.snapshot().failure).toEqual({ reason: "cancelled", retryable: false });
   expect(serverFrames.some((frame) => frame.type === "ack" && frame.cancelled?.includes(input.id!))).toBe(true);
   expect(wrapper.getState().turnActive).not.toBe(true);
   expect(executions).toEqual([]);
   expect(controls).toHaveLength(1);
   expect(runtime.journal.read(PEER)).toEqual([]);
   expect(runtime.budget.usage()).toEqual({ messages: 0, bytes: 0 });
-  const registeredAtCancellation = registrations;
+  const registeredAtCancellation = h.relay.registrations;
   await new Promise((resolve) => setTimeout(resolve, 350));
-  expect(registrations).toBe(registeredAtCancellation);
-  expect(receipt.snapshot().state).toBe("accepted");
+  expect(h.relay.registrations).toBe(registeredAtCancellation);
+  expect(receipt.snapshot().state).toBe("failed");
   expect(errors).toEqual([]);
+});
+
+it("#398 /stop cancels earlier input this server never admitted, so its later arrival cannot run", async () => {
+  const h = await connectStopHarness(false);
+  h.relay.dropInput = "sent before stop";
+  const receipt = h.wrapper.send("sent before stop")!;
+  expect(receipt.snapshot().state).toBe("sent");
+  const input = h.clientPublishes[0]!;
+  h.wrapper.send("/stop");
+  await settleUntil(() => receipt.snapshot().state === "failed", { label: "named input cancelled" });
+  expect(h.clientPublishes[1]).toMatchObject({ text: "/stop", cancel_pending: [{ id: input.id, random_id: input.random_id }] });
+  expect(receipt.snapshot()).toEqual({ state: "failed", failure: { reason: "cancelled", retryable: false } });
+  expect(h.wrapper.getState().messages.find((row) => row.wireId === input.id)).toMatchObject({
+    text: "sent before stop", sendFailure: { reason: "cancelled", retryable: false },
+  });
+  expect(h.runtime.journal.dispatch!.isCancelled(PEER, input.random_id!)).toBe(true);
+  // The first delivery, delayed past the stop, finally reaches the server.
+  h.relay.dropInput = undefined;
+  h.deliverAgain(input);
+  await settleUntil(() => h.serverFrames.filter((frame) => frame.type === "ack"
+    && frame.cancelled?.includes(input.id!)).length === 2, { label: "late arrival answered as cancelled" });
+  expect(h.runtime.debouncer.retainedItems(PEER)).toEqual([]);
+  expect(h.executions).toEqual([]);
+  expect(h.runtime.journal.read(PEER)).toEqual([]);
+  expect(h.controls).toHaveLength(1);
+  expect(h.wrapper.getState().turnActive).not.toBe(true);
+  expect(h.errors).toEqual([]);
 });

@@ -154,9 +154,9 @@ export function createDispatchRecovery(options: {
     timer.unref?.();
   }
   return {
-    recordStop(peer: string, key: string, bufferedKeys: readonly string[], cancelBuffered: boolean) {
+    recordStop(peer: string, key: string, bufferedKeys: readonly string[], cancelBuffered: boolean, pendingKeys: readonly string[] = []) {
       if (!active()) throw new Error("webchannel: dispatch recovery is not active");
-      return store.recordStop(owner!, peer, key, bufferedKeys, cancelBuffered);
+      return store.recordStop(owner!, peer, key, bufferedKeys, cancelBuffered, pendingKeys);
     },
     signalStop(peer: string) { cancelLegacy(peer); running.get(peer)?.abort(); },
     publishStop(peer: string, key: string) {

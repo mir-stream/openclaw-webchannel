@@ -533,6 +533,14 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
           return invalid(known, "cancelled ids must belong to this ack");
         }
       }
+      // #398: never-accepted is a property of a cancellation, so it narrows it.
+      const unaccepted = field(raw, "unaccepted");
+      if (unaccepted !== undefined) {
+        const proven = new Set(Array.isArray(cancelled) ? cancelled as string[] : []);
+        if (!isNonEmptyStringArray(unaccepted) || (unaccepted as string[]).some((id) => !proven.has(id))) {
+          return invalid(known, "unaccepted ids must belong to this ack's cancelled ids");
+        }
+      }
       const committed = field(raw, "committed");
       if (committed !== undefined) {
         if (!Array.isArray(committed) || !committed.every(isCommittedEcho)) {

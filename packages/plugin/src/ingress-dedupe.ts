@@ -347,6 +347,7 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
     ids: string[],
     committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>,
     cancelled?: string[],
+    unaccepted?: string[],
   ) => boolean;
   /**
    * #245 Part B: broadcast a just-committed inbound user message to the account's
@@ -646,6 +647,8 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
       // At most one flag per retained wire ID; the footer splits proofs together
       // with those IDs, after every write/journal decision has committed.
       const cancelledIds = new Set<string>();
+      // #398: the subset of cancelledIds the SQLite ledger proves never accepted.
+      const unacceptedIds = new Set<string>();
       const rejectedIds: string[] = [];
       // A write holds this key's outcome gate until the footer. Repeated logical
       // requests in this batch share that decision, retaining each wire ID for
@@ -795,9 +798,17 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           try {
             if (deps.deliveryJournal?.dispatch?.isCancelled(peerId, idempotencyKey)) {
               const row = deps.deliveryJournal.lookupUserMessageIdByRandomId(peerId, idempotencyKey);
+              const converged = row === undefined ? deps.deliveryJournal.dispatch.convergence(peerId, idempotencyKey) : undefined;
+              // Optional presentation evidence must not suppress the proven
+              // cancellation receipt or turn this item into a FIFO blocker.
+              let neverAccepted = false;
+              try { neverAccepted = deps.deliveryJournal.dispatch.isUnaccepted(peerId, idempotencyKey); }
+              catch { warnJournal("stop-lookup-failed", "webchannel: optional never-accepted classification lookup failed"); }
               ackIds.push(id);
               cancelledIds.add(id);
+              if (neverAccepted) unacceptedIds.add(id);
               if (row && randomId !== undefined) committedBatch.push({ random_id: randomId, ...row });
+              else if (converged && randomId !== undefined) committedBatch.push({ random_id: randomId, messageId: converged.messageId, converged: true });
               release();
               continue;
             }
@@ -1021,17 +1032,16 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             //  - a row exists: the ordinary deduped retry, re-echoing the FIRST
             //    admission's id and seq (to a conforming client; an older one is
             //    acked bare, as above).
-            // #399: a later retry of an already-retried original was accepted by
-            // converging on the first retry's row, so its own key never has a
-            // row. That is the answer this marker recorded, not a lost
-            // admission: re-echo it (seq-less, as the first time) without the
-            // re-admission warning.
-            const retryOf = row === undefined && deps.dispatchRecovery && typeof item.message.retry_of === "string"
-              ? deps.deliveryJournal?.dispatch?.retryOf(peerId, item.message.retry_of) : undefined;
-            if (retryOf !== undefined) {
+            // #399/#425: a converged alias has no user row, so only its exact
+            // transactional receipt may answer this marker. Without that proof
+            // the marker is orphaned and normal admission repairs it below.
+            const converged = row === undefined && deps.dispatchRecovery
+              ? deps.deliveryJournal?.dispatch?.convergence(peerId, idempotencyKey)
+              : undefined;
+            if (converged !== undefined) {
               release();
               ackIds.push(id);
-              if (randomId !== undefined) committedBatch.push({ random_id: randomId, messageId: retryOf.messageId, converged: true });
+              if (randomId !== undefined) committedBatch.push({ random_id: randomId, messageId: converged.messageId, converged: true });
               continue;
             }
             const orphanedMarker = deps.deliveryJournal !== undefined && row === undefined;
@@ -1593,7 +1603,9 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           // for the IDs the writer put in this frame (including after splitting).
           publish: (frame) => {
             const committed = frame.type === "ack" ? frame.committed : undefined;
-            return (frame.type === "ack" && frame.cancelled
+            return (frame.type === "ack" && frame.unaccepted
+              ? deps.sendAck?.(peerId, frame.ids, committed, frame.cancelled, frame.unaccepted)
+              : frame.type === "ack" && frame.cancelled
               ? deps.sendAck?.(peerId, frame.ids, committed, frame.cancelled)
               : committed && committed.length > 0
               ? deps.sendAck?.(peerId, frame.ids, committed)
@@ -1604,7 +1616,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           ...(committedBatch.length > 0 ? { committed: committedBatch } : {}),
           onTooSmall: () => logWarn?.("webchannel: result frame cannot fit effective NATS max_payload"),
         });
-        for (const id of ackIds) ack.add(id, cancelledIds.has(id));
+        for (const id of ackIds) ack.add(id, cancelledIds.has(id), unacceptedIds.has(id));
         ack.finish();
         for (const id of rejectedIds) rejected.add(id);
         rejected.finish();

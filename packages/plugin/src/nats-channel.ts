@@ -856,8 +856,9 @@ export class NatsChannel implements WebChannelPeerChannel {
     ids: string[],
     committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>,
     cancelled?: string[],
+    unaccepted?: string[],
   ): boolean {
-    return this.sendIngressResult(peerId, "ack", ids, committed, cancelled);
+    return this.sendIngressResult(peerId, "ack", ids, committed, cancelled, unaccepted);
   }
 
   sendInboundRejected(peerId: string, ids: string[]): boolean {
@@ -1138,6 +1139,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     // #244 half A: each entry also carries the user message's per-conversation seq.
     committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>,
     cancelled?: string[],
+    unaccepted?: string[],
   ): boolean {
     if (candidates.length === 0) return true;
     const advertisedLimit = this.transport.effectiveOutboundLimit;
@@ -1157,8 +1159,10 @@ export class NatsChannel implements WebChannelPeerChannel {
       });
       // Match only exact wire IDs from this ACK; never reflect stray proof IDs.
       // The writer carries each proof with its own ID through count/byte splits.
-      for (const candidate of candidates) writer.add(candidate, type === "ack"
-        && typeof candidate === "string" && cancelled?.includes(candidate));
+      for (const candidate of candidates) {
+        const proof = type === "ack" && typeof candidate === "string" && cancelled?.includes(candidate) === true;
+        writer.add(candidate, proof, proof && unaccepted?.includes(candidate as string) === true);
+      }
       return writer.finish();
     } catch (err) {
       console.error(

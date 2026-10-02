@@ -1645,7 +1645,10 @@ export class WebChannelNATSClient {
       // delivered synchronously by the transport, before the sent callback.
       this.applicationTurns.set(wireId, receipt);
     }
-    if (retryOf === undefined) this.client.sendUserMessage(text, wireId, randomId);
+    // #398: the explicit stop names earlier unacknowledged input for durable
+    // cancellation. The low level snapshots it at this frame's queue position.
+    if (isExplicitStop(text)) this.client.sendUserMessage(text, wireId, randomId, undefined, true);
+    else if (retryOf === undefined) this.client.sendUserMessage(text, wireId, randomId);
     else this.client.sendUserMessage(text, wireId, randomId, retryOf);
   }
 
@@ -3739,6 +3742,7 @@ export class WebChannelNATSClient {
       const lifecycle = this.wrapperLifecycleGeneration;
       let closed = false;
       const finalize: string[] = [];
+      const notSent: string[] = [];
       for (const id of msg.cancelled) {
         if (!msg.ids?.includes(id)) continue;
         closed = this.retireCancelledApplicationTurn(id) || closed;
@@ -3748,6 +3752,9 @@ export class WebChannelNATSClient {
           receipt.cancellationUiReconciled = true;
           finalize.push(id);
         }
+        // #398: only the server knows it never accepted this input; it says so
+        // per id, in the same frame as the id.
+        if (receipt?.settlementEligible && msg.unaccepted?.includes(id)) notSent.push(key!);
       }
       const typingCandidates = this.typingLocalCandidates;
       const cancelsTypingCandidate = finalize.some((id) => typingCandidates.has(id));
@@ -3755,6 +3762,14 @@ export class WebChannelNATSClient {
       if (cancelsTypingCandidate) {
         this.deferredCancelledTyping = { candidates: typingCandidates, lifecycle };
       }
+      // These terminal facts belong to the whole authenticated ACK, whose IDs
+      // have already left the replay ledger. A receipt subscriber may close or
+      // reconnect during the first transition; every remaining receipt still
+      // needs its result before lifecycle-scoped presentation work can stop.
+      for (const key of notSent) {
+        this.receiptTransition(key, "failed", { reason: "cancelled", retryable: false });
+      }
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
       if (!this.hasAcceptedApplicationTurn()) this.cancelActiveTurnStallTimer();
       if (this.wrapperLifecycleGeneration !== lifecycle) return;
       for (const id of finalize) {
