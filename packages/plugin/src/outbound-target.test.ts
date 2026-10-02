@@ -203,20 +203,24 @@ describe("core target resolution (#402)", () => {
     },
   );
 
-  it("a peer named like a reserved word cannot be targeted explicitly at all", async () => {
-    // `user:me` passes target resolution, but core's send step rechecks the
-    // bare normalized target it hands to the outbound adapter and refuses it.
-    register("acme", "me");
+  it("rejects prefixed reserved peers during cron-shaped target resolution", async () => {
     const plugin = createWebChannelPlugin(new NullPeerChannel());
-    const resolved = await resolveChannelTarget({
-      cfg: config(), channel: "webchannel", input: "user:me", accountId: "acme", plugin,
-    });
-    expect(resolved).toMatchObject({ ok: true, target: { to: "me" } });
-    const send = resolveOutboundTargetWithPlugin({
-      plugin,
-      target: { channel: "webchannel", to: "me", cfg: config(), accountId: "acme", mode: "explicit" },
-    });
-    expect(send?.ok === false && send.error.message).toMatch(/Reserved target "me"/);
+    for (const peerId of ["current", "self", "this", "me", "Me"]) {
+      register("acme", peerId);
+      for (const input of [`user:${peerId}`, `webchannel:user:${peerId}`]) {
+        // Cron first docks the raw target. Core permits the explicit `user:`
+        // grammar here, then asks the channel resolver to normalize it.
+        const docked = resolveOutboundTargetWithPlugin({
+          plugin,
+          target: { channel: "webchannel", to: input, cfg: config(), accountId: "acme", mode: "explicit" },
+        });
+        expect(docked).toEqual({ ok: true, to: input });
+        await expect(resolveChannelTarget({
+          cfg: config(), channel: "webchannel", input, accountId: "acme", plugin,
+          unknownTargetMode: "normalized",
+        })).rejects.toThrow(new RegExp(`reserved target ${JSON.stringify(peerId)}`, "i"));
+      }
+    }
   });
 
   it("never quarantines a corrupt key document it only reads", async () => {
@@ -380,6 +384,8 @@ describe("send surfaces accept the target grammar (#402)", () => {
     const plugin = createWebChannelPlugin(transport) as any;
     await plugin.outbound.sendText({ to: "webchannel:user:Alice", text: "hi" });
     expect(sendText.mock.calls[0]![0]).toBe("Alice");
+    await plugin.outbound.sendText({ to: "me", text: "reply" });
+    expect(sendText.mock.calls[1]![0]).toBe("me");
     await expect(plugin.outbound.sendText({ to: "a.b", text: "hi" }))
       .rejects.toThrow(/outbound target "a\.b" is not a valid peer id/);
   });
@@ -390,6 +396,8 @@ describe("send surfaces accept the target grammar (#402)", () => {
     const adapter = createClawMessageAdapter(transport) as any;
     await adapter.send.text({ to: "user:Alice", text: "hi" });
     expect(sendText.mock.calls[0]![0]).toBe("Alice");
+    await adapter.send.text({ to: "me", text: "reply" });
+    expect(sendText.mock.calls[1]![0]).toBe("me");
     await expect(adapter.send.text({ to: "group:room", text: "hi" }))
       .rejects.toThrow(/outbound target "group:room" is not a valid peer id/);
   });

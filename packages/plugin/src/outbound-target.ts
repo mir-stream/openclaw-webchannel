@@ -32,9 +32,9 @@
  * Reserved words. As in Telegram, `current`, `self`, `this` and `me` are
  * reserved. Pinned core (2026.7.1-2) does not resolve them to the current
  * conversation; it refuses them as literal destinations ("Reserved target").
- * A peer whose id is one of them cannot be targeted explicitly: even when
- * `user:<word>` passes target resolution, core rechecks the bare normalized
- * target before sending and refuses it.
+ * Core's raw-literal check intentionally permits typed forms such as
+ * `user:<word>`, so the resolver repeats the check after plugin normalization.
+ * A peer whose id is one of them therefore cannot be targeted explicitly.
  */
 
 import type {
@@ -62,6 +62,7 @@ export type ResolveServingScope = (accountId: string) => OutboundServingScope | 
 
 const PROVIDER_PREFIX = new RegExp(`^${WEBCHANNEL_ID}:`, "i");
 const USER_PREFIX = /^user:/i;
+const RESERVED_LITERALS = ["current", "self", "this", "me"];
 
 /** Accept `peer`, `webchannel:peer`, `user:peer` and `webchannel:user:peer`. */
 export function normalizeWebchannelTarget(raw: string): string | undefined {
@@ -137,12 +138,16 @@ export function createWebchannelMessagingAdapter(
     targetResolver: {
       looksLikeId: (raw) => normalizeWebchannelTarget(raw) !== undefined,
       hint: "<peerId>",
-      reservedLiterals: ["current", "self", "this", "me"],
+      reservedLiterals: RESERVED_LITERALS,
       // Core keeps a normalized id-like target when this returns null, so an
-      // unregistered peer must throw to be rejected rather than sent blind.
+      // unregistered or normalized reserved peer must throw to be rejected
+      // rather than sent blind.
       resolveTarget: async ({ cfg, accountId, input, normalized }) => {
         const peerId = normalizeWebchannelTarget(normalized) ?? normalizeWebchannelTarget(input);
         if (peerId === undefined) return null;
+        if (RESERVED_LITERALS.includes(peerId.toLowerCase())) {
+          throw new Error(`[webchannel] reserved target ${JSON.stringify(peerId)} cannot be addressed explicitly`);
+        }
         requireRegisteredPeer(cfg, accountId, peerId, resolveServingScope);
         return { to: peerId, kind: "user", display: peerId, source: "normalized" };
       },
