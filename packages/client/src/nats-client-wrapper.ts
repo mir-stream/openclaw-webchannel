@@ -3566,8 +3566,11 @@ export class WebChannelNATSClient {
             console.error("[nats-wrapper] receipt subscriber threw:", e);
           }
         }
-        if (next.state === "accepted" && rec.wireId && this.applicationTurns.has(rec.wireId)) {
-          // A newly accepted turn is new work, not the recovered silent one.
+        if (next.state === "accepted" && rec.wireId
+          && (this.applicationTurns.has(rec.wireId) || this.convergedApplicationTurns.has(rec.wireId))) {
+          // Newly accepted work starts a fresh silent interval. A split ACK may
+          // already have retired a converged alias from publish-order ownership,
+          // while its receipt still owns the target outcome in the recovery map.
           this.activeTurnRecoveryIssued = false;
           this.refreshActiveTurnWatch(true);
         } else if (!this.hasAcceptedApplicationTurn()) {

@@ -197,6 +197,7 @@ describe("#399 one retry per interrupted original", () => {
     const h = await setup();
     h.deliver({ type: "history", highWaterSeq: 2, messages: [original] });
     await settleUntil(() => h.wrapper.getState().messages.some(m => m.id === "O"), { label: "interrupted original" });
+    h.differences.splice(0); // Ignore setup's high-water reconciliation request.
     h.control.answerDifferences = false;
     const z = h.wrapper.send("unrelated work")!;
     await settleUntil(() => z.snapshot().state === "accepted", { label: "z accepted" });
@@ -222,13 +223,21 @@ describe("#399 one retry per interrupted original", () => {
     expect(inside(h.wrapper).convergedApplicationTurns.size).toBe(0);
   });
 
-  it("recovers a converged receipt from the target's terminal replacement snapshot", async () => {
+  it.each([false, true])("recovers a converged receipt from the target's terminal replacement snapshot (split ACK=%s)", async (splitAck) => {
     const h = await staleRetry({ timeout: 40 });
     h.deliver({ type: "user_committed", id: "M1", text: "transfer", turnId: "other-wire", random_id: "other-random",
       seq: 3, requestState: "started", retryOf: "O" } as unknown as InboundMessage);
     h.deliver({ type: "request_state", id: "O", turnId: "wire-0", state: "interrupted", seq: 4, retriedBy: "M1" });
     h.control.recoveryTargetStates.push({ state: "completed", seq: 5 });
-    h.converge();
+    if (splitAck) {
+      const sent = h.received[0]!;
+      h.deliver({ type: "ack", ids: ["other-chunk-id"],
+        committed: [{ random_id: sent.random_id!, messageId: "M1", converged: true }] });
+      expect(h.receipt.snapshot().state).toBe("sent");
+      h.deliver({ type: "ack", ids: [sent.id!] });
+    } else {
+      h.converge();
+    }
     expect(h.differences).toHaveLength(1);
     h.deliver({ type: "difference", afterSeq: 4, nonce: h.differences[0]!.nonce,
       maxSeq: 4, partial: false, events: [] });
@@ -1188,4 +1197,3 @@ describe("accepted-turn application recovery", () => {
     expect(inside(idle.wrapper).activeTurnStallTimer).toBeNull();
   });
 });
-
