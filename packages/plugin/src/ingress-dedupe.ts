@@ -803,7 +803,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
               // cancellation receipt or turn this item into a FIFO blocker.
               let neverAccepted = false;
               try { neverAccepted = deps.deliveryJournal.dispatch.isUnaccepted(peerId, idempotencyKey); }
-              catch { warnJournal("stop-unaccepted-lookup-failed", "webchannel: optional never-accepted classification lookup failed"); }
+              catch { warnJournal("stop-lookup-failed", "webchannel: optional never-accepted classification lookup failed"); }
               ackIds.push(id);
               cancelledIds.add(id);
               if (neverAccepted) unacceptedIds.add(id);

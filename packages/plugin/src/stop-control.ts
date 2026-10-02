@@ -50,26 +50,23 @@ export function createStopControl<Item extends IngressDedupeItem & { message: { 
     if (!active()) return;
     const keys = new Set(cancelledKeys);
     const ids: string[] = [];
-    const cancelled: string[] = [];
-    const unaccepted: string[] = [];
-    const committed: Array<{ random_id: string; messageId: string; converged: true }> = [];
     for (const entry of named) {
       const identity = ingressIdentity(entry)!;
       const converged = deps.journal.dispatch!.convergence(peer, identity.idempotencyKey);
       if (!keys.has(identity.idempotencyKey) && !converged) continue;
-      ids.push(identity.wireId);
-      if (converged && identity.randomId !== undefined) {
-        committed.push({ random_id: identity.randomId, messageId: converged.messageId, converged: true });
+      if (converged) {
+        const committed = identity.randomId === undefined ? undefined
+          : [{ random_id: identity.randomId, messageId: converged.messageId, converged: true as const }];
+        if (!deps.sendAck(peer, [identity.wireId], committed)) warn(new Error("webchannel: control receipt delivery failed"));
+        continue;
       }
       if (keys.has(identity.idempotencyKey)) {
         // recordStop returned this key only after transactionally proving and
         // inserting its never-accepted target; no fallible re-read is needed.
-        cancelled.push(identity.wireId);
-        unaccepted.push(identity.wireId);
+        ids.push(identity.wireId);
       }
     }
-    if (ids.length && !deps.sendAck(peer, ids, committed.length ? committed : undefined,
-      cancelled.length ? cancelled : undefined, unaccepted.length ? unaccepted : undefined)) {
+    if (ids.length && !deps.sendAck(peer, ids, undefined, ids, ids)) {
       warn(new Error("webchannel: control receipt delivery failed"));
     }
   };

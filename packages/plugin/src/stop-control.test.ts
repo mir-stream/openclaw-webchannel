@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
@@ -15,6 +16,9 @@ import { DEFAULT_BUSY_TURN_LIMITS, estimateRetainedMessageBytes, InboundRetentio
 import type { UserMessageLike } from "./inbound-queue.js";
 import { tupleStoragePaths } from "./storage-paths.js";
 import { createStopControl } from "./stop-control.js";
+import { NatsChannel } from "./nats-channel.js";
+import type { NatsTransport } from "./nats-transport.js";
+import { generateKeyPair } from "./e2e-crypto.js";
 
 type Item = { peerId: string; message: UserMessageLike };
 type Ack = { peerId: string; ids: string[]; cancelled?: string[]; unaccepted?: string[]; committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }> };
@@ -26,6 +30,15 @@ const gate = () => {
   const promise = new Promise<void>(done => { resolve = done; });
   return { promise, resolve };
 };
+class AckTransport extends EventEmitter {
+  connected = true;
+  effectiveOutboundLimit = 64 * 1024;
+  published: string[] = [];
+  private sid = 0;
+  subscribe() { return ++this.sid; }
+  unsubscribe() {}
+  publish(_subject: string, payload: string) { this.published.push(payload); }
+}
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
   for (const close of cleanups.splice(0).reverse()) await close();
@@ -754,6 +767,52 @@ it("#425 a never-processed retry remains unaccepted even when another retry alre
   expect(h.acks.find(ack => ack.ids.includes("device-1:R2"))).toMatchObject({
     cancelled: ["device-1:R2"], unaccepted: ["device-1:R2"], committed: undefined,
   });
+});
+
+it("#425 emits 256 maximum-size converged aliases as independently sealed ACKs", () => {
+  const root = temporaryRoot();
+  const aliases = Array.from({ length: 256 }, (_, index) => {
+    const suffix = String(index).padStart(3, "0");
+    return { peerId: "RawPeer", message: {
+      type: "user_message" as const,
+      id: `i${suffix}${"x".repeat(124)}`,
+      random_id: `r${suffix}${"y".repeat(124)}`,
+      text: "transfer",
+    } };
+  });
+  const paths = tupleStoragePaths({ storageRoot: root, tenant: "tenant-a", accountId: "ExactAccount" });
+  const seed = openDeliveryJournal({ databasePath: paths.deliveryJournalPath });
+  const firstOwner = seed.dispatch!.activate();
+  const [original] = seed.dispatch!.accept(firstOwner, "RawPeer", [{ text: "transfer", turnId: "wire-O", randomId: "logical-O" }]);
+  seed.dispatch!.claim(firstOwner, "RawPeer", ["logical-O"]);
+  const owner = seed.dispatch!.activate();
+  seed.dispatch!.recoverInterrupted(owner);
+  seed.dispatch!.accept(owner, "RawPeer", [{ text: "transfer", turnId: "wire-R1", randomId: "logical-R1", retryOf: original!.messageId }]);
+  const [claimed] = seed.dispatch!.claim(owner, "RawPeer", ["logical-R1"]);
+  seed.dispatch!.settle(owner, "RawPeer", claimed!.batch!, "completed");
+  seed.dispatch!.accept(owner, "RawPeer", aliases.map(alias => ({
+    text: alias.message.text,
+    turnId: alias.message.id,
+    randomId: alias.message.random_id,
+    retryOf: original!.messageId,
+  })));
+  seed.close();
+
+  const transport = new AckTransport();
+  const key = new Uint8Array(32).fill(27);
+  const channel = new NatsChannel(transport as unknown as NatsTransport, "ExactAccount", "tenant-a",
+    { keyStore: { getOrCreate: () => key } as never, identityKeyPair: generateKeyPair() });
+  cleanups.push(() => channel.dispose());
+  channel.registerPeer("RawPeer");
+  const h = setup({ root, onAck: ack => {
+    expect(channel.sendAck(ack.peerId, ack.ids, ack.committed, ack.cancelled, ack.unaccepted)).toBe(true);
+  } });
+  expect(h.stop.handle(stop("S", "device-2", aliases), true)).toMatchObject({ fresh: true, targetCount: 0 });
+  const aliasAcks = h.acks.filter(ack => !ack.ids.includes("device-2:S"));
+  expect(aliasAcks).toHaveLength(256);
+  expect(aliasAcks.every(ack => ack.ids.length === 1 && ack.committed?.length === 1)).toBe(true);
+  expect(transport.published).toHaveLength(257);
+  expect(transport.published.every(payload => Buffer.byteLength(payload) <= transport.effectiveOutboundLimit)).toBe(true);
 });
 
 it("#398 an optional unaccepted-classification fault keeps the cancellation ACK and later work", async () => {

@@ -46,7 +46,8 @@ export interface DispatchStore {
 }
 
 /** Per-peer bound on stop targets a client named but this server never held.
- * Equal to the per-stop name cap, so one stop's names always fit. */
+ * Equal to the per-stop name cap. Re-naming an existing target does not refresh
+ * its insertion age; cumulative overflow still evicts the oldest insertion. */
 export const MAX_STOP_PENDING_TARGETS = 256;
 
 type Stored = { peer_id: string; logical_key: string; message_id: string; user_seq: number; payload: string; state: RequestState; owner: string | null; batch: string | null };
@@ -225,11 +226,12 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
         // from its newest link.
         const prior = original === undefined ? undefined : firstRetry(peer, input.retryOf!);
         if (prior) {
+          const retryOf = input.retryOf!;
           // This exact alias was processed. Persist its answer in the same
           // acceptance transaction so ACK loss, /stop and restart never infer
           // acceptance merely from another device's first retry.
-          sql("INSERT INTO journal_dispatch_convergence VALUES(?,?,?,?,?)").run(peer, key, prior.messageId, prior.seq, input.retryOf);
-          return { ...prior, inserted: false, retryOf: input.retryOf, converged: true };
+          sql("INSERT INTO journal_dispatch_convergence VALUES(?,?,?,?,?)").run(peer, key, prior.messageId, prior.seq, retryOf);
+          return { ...prior, inserted: false, retryOf, converged: true };
         }
         const accepted: DispatchInput = original?.state === "interrupted" ? input : { ...input, retryOf: undefined };
         const row = appendUser(peer, { ...accepted, requestState: "queued" });

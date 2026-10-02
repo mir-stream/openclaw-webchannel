@@ -167,7 +167,7 @@
     "packages/plugin/src/session-route.test.ts": 18,
     "packages/plugin/src/setup-wizard.test.ts": 27,
     "packages/plugin/src/setup.test.ts": 39,
-    "packages/plugin/src/stop-control.test.ts": 39,
+    "packages/plugin/src/stop-control.test.ts": 40,
     "packages/plugin/src/stop-core-recovery.test.ts": 1,
     "packages/plugin/src/stop-crash.test.ts": 3,
     "packages/plugin/src/storage-identity.test.ts": 25,
