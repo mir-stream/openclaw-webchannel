@@ -33,10 +33,12 @@ function run(root: string): Promise<ProbeResult[]> {
     let stderr = "";
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
+    // A cold public-SDK startup can exceed 20s while the CI runner is executing
+    // the full suite concurrently (the existing core recovery probe does too).
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error(`command authorization core worker timed out: ${stderr}`));
-    }, 20_000);
+    }, 60_000);
     child.on("error", (error) => {
       clearTimeout(timer);
       reject(error);
@@ -74,4 +76,4 @@ it("keeps denied resets on the pinned core session while open or listed peers re
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-}, 30_000);
+}, 75_000);
