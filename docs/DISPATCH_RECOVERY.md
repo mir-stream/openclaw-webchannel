@@ -182,6 +182,47 @@ peer is DROPPED, not refused: the message is accepted and runs as an ordinary se
 with no recorded `retryOf`, so one bad value can never refuse the batch it arrived
 in. An automatic retransmission retains its original IDs.
 
+Each interrupted original admits **one** retry (#399). The accept transaction
+looks for a stored dispatch row whose `retryOf` names the original; the first
+retry's row is that durable mark. A later retry naming the same original — a
+double click, a second device, a reload re-click, or a restart in between —
+inserts no row and never runs: its ACK echoes the first retry's server ID
+with `converged: true` and without a seq, because that row is not this send's
+opener and the client's cursor must not move over it unfolded. Its
+retransmission gets the same echo, through the overflow resolver too. The
+client retires only that send's own turn at once (never the publish-order
+prefix of earlier sends still running), adopts its bubble onto that row and
+follows that row's outcome, immediately when the row is already terminal. If this device does not hold
+that row yet, or holds only a possibly stale queued/started view, it fetches it
+with `get_difference`. While the adopted receipt remains nonterminal, the normal
+application-stall deadline retains its bounded recovery opportunity; the retired
+alias never rejoins publish-order turn ownership. Locally, a retry row whose
+send state is `failed` or that was retracted does not spend the original. That
+covers a retry the server refused, and also one it accepted that then failed
+or was cancelled: if this device lacks the original's `retriedBy`, Retry is
+enabled again, and the server converges the new click without running it.
+Provenance that names an already-retried original is answered
+this way instead of being dropped, because dropping it would run the message
+as an ordinary send. A retry that is itself interrupted is an original too, so
+only its newest link can be retried and the chain stays a single line.
+
+In the same transaction, after the retry's user row, the journal records a
+`requestState` event for the original that keeps it `interrupted` and adds
+`retriedBy: <retry server ID>`. History rows, `difference` and the live
+`request_state` frame (published after the retry's `user_committed`) carry it.
+The reducer sets it once, and the app renders **Retried →** linked to that row
+with Retry disabled. It also disables Retry as soon as this device's own retry
+row exists. The dispatch schema is unchanged and `retriedBy` is an optional
+additive field, so this change needs no protocol bump of its own. The protocol
+version is an exact-match gate, so a client at another version never connects.
+A same-version client built before this change ignores the link and the
+`converged` marker, and the server still enforces one retry. Its double click
+sends two retries that converge on one row, so one of the two receipts can be
+left unsettled. That is better than running the request twice. An older plugin ignores the
+event and admits further retries, so a downgrade loses only that guard.
+Originals retried more than once before this build have no link event. Later
+retries of them converge on their earliest retry.
+
 Only lifecycle-bearing requests accepted by this build have recovery evidence.
 Historical rows get no new status and cannot become queued merely because an
 optimization marker expires. Marker-without-row repair remains available.

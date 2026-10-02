@@ -17,8 +17,9 @@
  *    primitive type;
  *  - every OPTIONAL field, when present, has the declared primitive type;
  *  - the ONE bound that already exists on this path — `MAX_INBOUND_USER_ID_LENGTH`
- *    — is applied to the three client-supplied tokens (`user_message`'s `id` and
- *    `random_id`, and #356's `get_difference.nonce`; each `case` says why).
+ *    — is applied to the four client-supplied tokens (`user_message`'s `id` and
+ *    `random_id`, #356's `get_difference.nonce` and #401's `load_history.nonce`;
+ *    each `case` says why).
  *
  * ⚠️ SHAPE, NOT SEMANTICS, AND THE LINE IS DELIBERATE. `load_history` is checked
  * to the TYPES the contract declares and no further — `before`/`beforeTurnId`
@@ -255,6 +256,15 @@ export function decodeInboundWsMessage(raw: unknown): InboundWsDecodeResult {
       // entirely: the frame is dropped with a warn and no page ever comes back.
       if (limit !== undefined && typeof limit !== "number") {
         return invalid(known, "limit must be a number");
+      }
+      // #401: the page's correlation token, echoed VERBATIM onto the `history`
+      // page — so it is bounded for the same downstream reason as
+      // `get_difference.nonce` below (its bytes come out of that reply's
+      // `max_payload` budget). OPTIONAL here, unlike that one: a request without
+      // one is still served — uncorrelated, so no v7 wrapper folds its page.
+      const nonce = field(raw, "nonce");
+      if (nonce !== undefined && !isUsableWireId(nonce)) {
+        return invalid(known, "nonce must be a non-empty string within the id length bound");
       }
       return { ok: true, message: raw as unknown as InboundWsMessage };
     }

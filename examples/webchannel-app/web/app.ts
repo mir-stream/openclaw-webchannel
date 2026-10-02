@@ -271,13 +271,31 @@ async function mountBrowserUi(): Promise<void> {
           }
           if (badge.textContent) div.append(badge);
         }
+        if (m.role === "user") div.dataset.messageId = m.id;
         if (m.role === "user" && m.requestState === "interrupted") {
           const status = document.createElement("div");
           status.textContent = "Interrupted · result unknown. Check any effects before retrying.";
           const retry = document.createElement("button");
           retry.textContent = "Retry";
-          retry.onclick = () => { client?.retryInterrupted(m.id); };
+          // One retry per original: once the server's `retriedBy` (or this
+          // device's own live retry, not a refused or retracted one) names it,
+          // link there instead. Only that retry row can be retried if it is
+          // interrupted too.
+          const retriedBy = m.retriedBy ?? state.messages.find((r) => r.kind === undefined && r.role === "user" && r.retryOf === m.id
+            && r.sendState !== "failed" && !r.retracted)?.id;
+          if (retriedBy === undefined) retry.onclick = () => { client?.retryInterrupted(m.id); };
+          else retry.disabled = true;
           status.append(retry);
+          if (retriedBy !== undefined) {
+            const link = document.createElement("a");
+            link.href = "#";
+            link.textContent = "Retried →";
+            link.onclick = (event) => {
+              event.preventDefault();
+              Array.from(chatEl.querySelectorAll<HTMLElement>("[data-message-id]")).find((n) => n.dataset.messageId === retriedBy)?.scrollIntoView?.({ block: "center" });
+            };
+            status.append(" ", link);
+          }
           div.append(status);
         } else if (m.role === "user" && m.requestState === "cancelled") {
           const status = document.createElement("div"); status.textContent = "Cancelled"; div.append(status);

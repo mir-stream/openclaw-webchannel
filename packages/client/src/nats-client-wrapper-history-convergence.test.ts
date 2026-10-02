@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
+import { ownHistoryPage } from "./history-page.test-harness.js";
 import type { InboundMessage } from "./nats-client.js";
 
 function setup() {
@@ -14,7 +15,7 @@ function setup() {
     resetCursorForConnection(): void;
   };
   inner.client.getDifference = vi.fn();
-  return { wrapper, inner, send: (m: InboundMessage) => inner.handleMessage(m) };
+  return { wrapper, inner, send: (m: InboundMessage) => inner.handleMessage(ownHistoryPage(wrapper, m)) };
 }
 
 describe("#342 history row authority", () => {
@@ -392,6 +393,28 @@ describe("#342 history row authority", () => {
   });
 });
 
+
+it("#399 an original's one retry is linked by live, history and recreation, and spends local Retry", () => {
+  const h = setup();
+  const original = { id: "server-user", role: "user" as const, text: "request", turnId: "wire", randomId: "random", requestState: "interrupted" as const, seq: 3 };
+  try {
+    h.send({ type: "history", highWaterSeq: 3, messages: [original] });
+    expect(h.wrapper.retryInterrupted("server-user")).toBeDefined();
+    // Double click before any server answer: this device's own retry row spends it.
+    expect(h.wrapper.retryInterrupted("server-user")).toBeUndefined();
+    expect(h.wrapper.getState().messages.filter(m => m.kind === undefined && m.retryOf === "server-user")).toHaveLength(1);
+    h.send({ type: "request_state", id: "server-user", turnId: "wire", state: "interrupted", seq: 4, retriedBy: "server-retry" });
+    // A delayed older page cannot erase the link.
+    h.send({ type: "history", messages: [original] });
+    expect(h.wrapper.getState().messages.find(m => m.id === "server-user")).toMatchObject({ requestState: "interrupted", retriedBy: "server-retry" });
+    const fresh = setup();
+    try {
+      fresh.send({ type: "history", highWaterSeq: 4, messages: [{ ...original, retriedBy: "server-retry", seq: 4 }] });
+      expect(fresh.wrapper.getState().messages[0]).toMatchObject({ id: "server-user", requestState: "interrupted", retriedBy: "server-retry" });
+      expect(fresh.wrapper.retryInterrupted("server-user")).toBeUndefined();
+    } finally { fresh.wrapper.close(); }
+  } finally { h.wrapper.close(); }
+});
 
 it("durable started/interrupted states survive delayed older history and client recreation", () => {
   const h = setup();

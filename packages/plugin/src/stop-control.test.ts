@@ -17,7 +17,7 @@ import { tupleStoragePaths } from "./storage-paths.js";
 import { createStopControl } from "./stop-control.js";
 
 type Item = { peerId: string; message: UserMessageLike };
-type Ack = { peerId: string; ids: string[]; cancelled?: string[]; unaccepted?: string[]; committed?: Array<{ random_id: string; messageId: string; seq: number }> };
+type Ack = { peerId: string; ids: string[]; cancelled?: string[]; unaccepted?: string[]; committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }> };
 const item = (key: string, device = "device-1", peerId = "RawPeer"): Item => ({
   peerId, message: { type: "user_message", id: `${device}:${key}`, random_id: `logical-${key}`, text: key === "S" ? "/stop" : key },
 });

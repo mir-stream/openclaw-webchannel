@@ -1,14 +1,31 @@
 # Project Status — single source of truth
 
+History page correlation (#401): `load_history` carries a per-request `nonce` that
+the `history` page echoes. Pages ride the peer's shared `.out`; a device folds only
+a page echoing its own nonce, so another device's page no longer leaves a permanent
+hole in a different window. The register snapshot stays uncorrelated. Concurrent
+page requests from one peer's devices are queued: at most 8 waiting and a 64 KiB
+waiting-string charge (two bytes per UTF-16 code unit across both cursors and the
+nonce). Exceeding either bound drops the newest request with a throttled warning;
+the active request keeps its existing cursor semantics.
+Protocol 7; client and plugin require lockstep rollout.
+
 `/stop` cancellation (review R1/R2): control receipts and exact cancellation targets
 now commit together in the tenant/account SQLite journal before ACK. This includes
 debounce entries not yet accepted, the pending overflow-only ID, durable queued work and the current started
 request. Original input replays stay suppressed across restart; replaying an
 accepted stop returns its receipt without aborting later work. New dispatch waits
 for the first live core abort to settle, including across account replacement.
+Another stop received during that abort joins the in-flight operation and commits
+its own receipt. An explicit `/stop` also names earlier input that its device has
+not yet seen the server accept; the server durably cancels still-unaccepted named
+input, while accepted input keeps its receipt and records only request cancellation.
+`ack.unaccepted`, scoped to cancelled IDs in the same ACK frame, is the server's
+evidence that a named input never became accepted.
 Cancelled core bindings survive an early SDK abort return until verified startup
-retirement. Protocol 6 adds authenticated same-frame `ack.cancelled` proof, including
-cancellation replays with no journal row; matching client consumption is required.
+retirement. Protocol 6 introduced authenticated same-frame `ack.cancelled` proof,
+including cancellation replays with no journal row; protocol 7 adds the scoped stop
+and `ack.unaccepted` contract. Matching client consumption is required.
 Dispatch schema 2 upgrades schema 1 and prevents older writers from opening it.
 See [cancellation boundaries](DISPATCH_RECOVERY.md#stop-cancellation).
 

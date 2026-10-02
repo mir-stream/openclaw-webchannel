@@ -4,6 +4,22 @@ import { isWebchannelAccountEnabled, resolveWebchannelAccountId } from "./accoun
 
 export type ResolveOutboundTransport = (accountId: string) => WebChannelPeerChannel | undefined;
 
+/**
+ * The exact listed account a core-initiated outbound act names. Target
+ * resolution (#402) and both send surfaces share it, so a target is never
+ * admitted under one account and delivered under another.
+ */
+export function resolveOutboundAccountId(cfg: unknown, accountId?: string | null): string {
+  const resolved = resolveWebchannelAccountId(cfg, accountId);
+  if (resolved === undefined) {
+    throw new Error(`[webchannel] outbound account ${JSON.stringify(accountId)} is not a valid listed account`);
+  }
+  if (!isWebchannelAccountEnabled(cfg, resolved)) {
+    throw new Error(`[webchannel] outbound account ${JSON.stringify(resolved)} is disabled`);
+  }
+  return resolved;
+}
+
 /** Both SDK send surfaces resolve the selected account at the delivery act. */
 export function resolveOutboundTransport(
   ctx: Pick<ChannelOutboundContext, "cfg" | "accountId">,
@@ -11,13 +27,7 @@ export function resolveOutboundTransport(
   resolveAccountTransport?: ResolveOutboundTransport,
 ): WebChannelPeerChannel {
   if (!resolveAccountTransport) return transport;
-  const accountId = resolveWebchannelAccountId(ctx.cfg, ctx.accountId);
-  if (accountId === undefined) {
-    throw new Error(`[webchannel] outbound account ${JSON.stringify(ctx.accountId)} is not a valid listed account`);
-  }
-  if (!isWebchannelAccountEnabled(ctx.cfg, accountId)) {
-    throw new Error(`[webchannel] outbound account ${JSON.stringify(accountId)} is disabled`);
-  }
+  const accountId = resolveOutboundAccountId(ctx.cfg, ctx.accountId);
   const target = resolveAccountTransport(accountId);
   if (!target) {
     throw new Error(`[webchannel] outbound account ${JSON.stringify(accountId)} is not running`);

@@ -8,10 +8,14 @@ export type DispatchRow = {
   peerId: string; key: string; messageId: string; seq: number;
   input: DispatchInput; state: RequestState; owner?: string; batch?: string; stateSeq?: number;
 };
-export type DispatchChange = { peerId: string; id: string; turnId: string; state: RequestState; seq: number };
+/** `retriedBy` names the one retry an interrupted original admitted (#399). */
+export type DispatchChange = { peerId: string; id: string; turnId: string; state: RequestState; seq: number; retriedBy?: string };
 export type CoreDispatchBinding = { processId: string; agentId: string; sessionKey: string; storePath: string; owner: string; batch: string; peerId: string };
-/** `retryOf` is the VALIDATED provenance actually stored, never the requested one. */
-export type UserCommit = { messageId: string; seq: number; inserted: boolean; retryOf?: string };
+/** `retryOf` is the VALIDATED provenance actually stored, never the requested one.
+ * `retried` is the original's committed "retried by this row" change, present
+ * only on the fresh admission that consumed the original's one retry.
+ * `converged` marks a later retry answered with that first retry's row. */
+export type UserCommit = { messageId: string; seq: number; inserted: boolean; retryOf?: string; retried?: DispatchChange; converged?: true };
 export type StopReceipt = { key: string; cancelBuffered: boolean; targetCount: number };
 export interface DispatchStore {
   lookupStop(peerId: string, key: string): StopReceipt | undefined;
@@ -28,6 +32,8 @@ export interface DispatchStore {
   owns(owner: string): boolean;
   accept(owner: string, peerId: string, inputs: DispatchInput[]): UserCommit[];
   lookup(peerId: string, key: string): DispatchRow | undefined;
+  /** The first retry row that consumed `original`'s one retry (#399). */
+  retryOf(peerId: string, original: string): { messageId: string; seq: number } | undefined;
   queued(peerId?: string, after?: number, limit?: number): DispatchRow[];
   peers(after?: string, limit?: number): string[];
   claim(owner: string, peerId: string, keys: readonly string[]): DispatchRow[];
@@ -72,6 +78,10 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
   const lookup = (peer: string, key: string) => {
     const row = sql("SELECT * FROM journal_dispatch WHERE peer_id=? AND logical_key=?").get(peer, key) as Stored | undefined;
     return row && decode(row);
+  };
+  const firstRetry = (peer: string, original: string) => {
+    const row = sql("SELECT message_id,user_seq FROM journal_dispatch WHERE peer_id=? AND json_extract(payload,'$.retryOf')=? ORDER BY user_seq LIMIT 1").get(peer, original) as { message_id: string; user_seq: number } | undefined;
+    return row && { messageId: row.message_id, seq: Number(row.user_seq) };
   };
   const isCancelled = (peer: string, key: string) => !!sql("SELECT 1 FROM journal_stop_target WHERE peer_id=? AND logical_key=?").get(peer, key);
   const lookupStop = (peer: string, key: string): StopReceipt | undefined => {
@@ -184,16 +194,33 @@ export function createDispatchStore(db: DatabaseSync, appendUser: (peer: string,
         // retransmitting that frame until its ledger evicts it. The message is
         // an ordinary send instead, and every surface reads the stored value.
         const original = input.retryOf === undefined ? undefined
-          : sql("SELECT state FROM journal_dispatch WHERE peer_id=? AND message_id=?").get(peer, input.retryOf) as { state: RequestState } | undefined;
+          : sql("SELECT state,payload FROM journal_dispatch WHERE peer_id=? AND message_id=?").get(peer, input.retryOf) as { state: RequestState; payload: string } | undefined;
+        // ONE RETRY PER ORIGINAL (#399). Retry is a deliberate new execution of
+        // a request whose effect is unknown, so a double click, a second device
+        // or a reload re-click must not each run it again. The stored retry row
+        // IS the durable mark: this transaction is serialized with every other
+        // accept, so a second retry naming the same original — in this batch or
+        // after a restart — finds the first and converges on its receipt. No
+        // row, no dispatch: its own key has nothing to claim. A retry that is
+        // itself interrupted is an original too, so the chain continues only
+        // from its newest link.
+        const prior = original === undefined ? undefined : firstRetry(peer, input.retryOf!);
+        if (prior) return { ...prior, inserted: false, retryOf: input.retryOf, converged: true };
         const accepted: DispatchInput = original?.state === "interrupted" ? input : { ...input, retryOf: undefined };
         const row = appendUser(peer, { ...accepted, requestState: "queued" });
         // An existing historical user row cannot prove it was never started.
         if (!row.inserted) return row;
         sql("INSERT INTO journal_dispatch VALUES(?,?,?,?,?,'queued',NULL,NULL)").run(peer, key, row.messageId, row.seq, JSON.stringify(accepted));
-        return accepted.retryOf === undefined ? row : { ...row, retryOf: accepted.retryOf };
+        if (accepted.retryOf === undefined) return row;
+        // The original stays interrupted; this event only records which row
+        // consumed its retry, after that row, so every surface can link to it.
+        const { seq } = appendEvent(peer, { kind: "requestState", id: accepted.retryOf, state: "interrupted", retriedBy: row.messageId });
+        const retried: DispatchChange = { peerId: peer, id: accepted.retryOf, turnId: (JSON.parse(original!.payload) as DispatchInput).turnId, state: "interrupted", seq, retriedBy: row.messageId };
+        return { ...row, retryOf: accepted.retryOf, retried };
       });
     }),
     lookup,
+    retryOf: firstRetry,
     queued: (peer, after = 0, limit = 32) => (sql("SELECT * FROM journal_dispatch WHERE state='queued' AND peer_id=? AND user_seq>? ORDER BY user_seq LIMIT ?").all(peer ?? "", after, Math.min(32, limit)) as Stored[]).map(decode),
     peers: (after = "", limit = 32) => (sql("SELECT DISTINCT peer_id FROM journal_dispatch WHERE state='queued' AND peer_id>? ORDER BY peer_id LIMIT ?").all(after, Math.min(32, limit)) as { peer_id: string }[]).map(r => r.peer_id),
     claim: (owner, peer, keys) => runSqliteImmediateTransactionSync(db, () => {

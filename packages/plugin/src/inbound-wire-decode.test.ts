@@ -186,6 +186,9 @@ describe("#246 half A — decodeInboundWsMessage: load_history", () => {
     accepts({ type: "load_history" });
     accepts({ type: "load_history", before: "row-1" });
     accepts({ type: "load_history", before: "tool-1", beforeTurnId: "turn-b", limit: 10 });
+    // #401: the page correlation is optional; a present one is echoed verbatim.
+    accepts({ type: "load_history", before: "row-1", nonce: "page-n" });
+    accepts({ type: "load_history", nonce: "a".repeat(128) });
   });
 
   it("refuses a non-string cursor or a non-number limit", () => {
@@ -195,6 +198,15 @@ describe("#246 half A — decodeInboundWsMessage: load_history", () => {
     refuses({ type: "load_history", limit: "10" });
     refuses({ type: "load_history", limit: [10] });
     refuses({ type: "load_history", limit: null });
+  });
+
+  it("#401 — refuses a present-but-unusable page nonce", () => {
+    // Same bound as `get_difference.nonce`: the echo is spent from the page
+    // reply's `max_payload` budget.
+    refuses({ type: "load_history", nonce: "" });
+    refuses({ type: "load_history", nonce: 7 });
+    refuses({ type: "load_history", nonce: null });
+    refuses({ type: "load_history", nonce: "a".repeat(129) });
   });
 
   it("ACCEPTS a fractional limit — `planHistoryFetch` floors it and serves a page", () => {

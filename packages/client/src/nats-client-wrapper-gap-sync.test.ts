@@ -2286,4 +2286,27 @@ describe("#369 — a catch-up consumes requestState the way live does", () => {
       wrapper.close();
     }
   });
+
+  it("#399 carries an original's retriedBy link through a catch-up", () => {
+    const wrapper = newWrapper();
+    const w = wrapper as unknown as Internals;
+    try {
+      seed(w, 0);
+      w.handleMessage({
+        type: "user_committed", id: "webchannel-user-1", text: "check the transfer",
+        turnId: "wire-1", seq: 1, requestState: "queued",
+      } as unknown as InboundMessage);
+      w.handleMessage({ type: "agent_message", id: "a4", text: "partial", turnId: "wire-2", seq: 4 });
+      expect(isCatchingUp(w)).toBe(true);
+      w.handleMessage(reply(w, [
+        { seq: 2, event: { kind: "requestState", id: "webchannel-user-1", state: "interrupted" } },
+        { seq: 3, event: { kind: "requestState", id: "webchannel-user-1", state: "interrupted", retriedBy: "webchannel-user-2" } },
+      ], { maxSeq: 4 }));
+      const row = w.state.messages.find((m) => m.role === "user") as Record<string, unknown>;
+      expect(row).toMatchObject({ requestState: "interrupted", retriedBy: "webchannel-user-2" });
+      expect(wrapper.retryInterrupted("webchannel-user-1")).toBeUndefined();
+    } finally {
+      wrapper.close();
+    }
+  });
 });

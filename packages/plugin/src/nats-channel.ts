@@ -337,7 +337,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   private onApprovalDecision?: (peerId: string, id: string, decision: ApprovalDecision) => void;
   private onLoadHistory?: (
     peerId: string,
-    request: { before?: string; beforeTurnId?: string; limit?: number },
+    request: { before?: string; beforeTurnId?: string; limit?: number; nonce?: string },
   ) => void;
   // #244 half B: `get_difference` catch-up handler.
   private onGetDifference?: (peerId: string, afterSeq: number, nonce: string) => void;
@@ -479,7 +479,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   setDispatchOwnerFence(active: () => boolean): void { this.dispatchOwnerActive = active; }
 
   sendRequestState(change: DispatchChange): boolean {
-    return this.sendToPeer(change.peerId, { type: "request_state", id: change.id, state: change.state, turnId: change.turnId, seq: change.seq });
+    return this.sendToPeer(change.peerId, { type: "request_state", id: change.id, state: change.state, turnId: change.turnId, seq: change.seq, ...(change.retriedBy ? { retriedBy: change.retriedBy } : {}) });
   }
 
   registerPeer(peerId: string): void {
@@ -758,7 +758,13 @@ export class NatsChannel implements WebChannelPeerChannel {
   /**
    * Send history snapshot to peer.
    */
-  sendHistory(peerId: string, messages: HistoryMessage[], highWaterSeq?: number, snapshotComplete?: boolean): boolean {
+  sendHistory(
+    peerId: string,
+    messages: HistoryMessage[],
+    highWaterSeq?: number,
+    snapshotComplete?: boolean,
+    nonce?: string,
+  ): boolean {
     // #244 half A: `highWaterSeq` is the conversation's authoritative MAX(seq),
     // attached to the register-time SNAPSHOT only (`history-serve.ts` passes it
     // there and omits it for the pager). Additive/optional — a `history` frame is
@@ -769,6 +775,8 @@ export class NatsChannel implements WebChannelPeerChannel {
       messages,
       ...(highWaterSeq !== undefined ? { highWaterSeq } : {}),
       ...(snapshotComplete !== undefined ? { snapshotComplete } : {}),
+      // #401: a page's correlation echo — the `load_history.nonce` it answers.
+      ...(nonce !== undefined ? { nonce } : {}),
     };
     return this.sendToPeer(peerId, payload);
   }
@@ -846,7 +854,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   sendAck(
     peerId: string,
     ids: string[],
-    committed?: Array<{ random_id: string; messageId: string; seq: number }>,
+    committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>,
     cancelled?: string[],
     unaccepted?: string[],
   ): boolean {
@@ -992,7 +1000,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   setLoadHistoryHandler(
     handler: (
       peerId: string,
-      request: { before?: string; beforeTurnId?: string; limit?: number },
+      request: { before?: string; beforeTurnId?: string; limit?: number; nonce?: string },
     ) => void
   ): void {
     this.onLoadHistory = handler;
@@ -1129,7 +1137,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     // #243 half 2a: the server-assigned-id echo for an `ack`, attached to the
     // first published frame by the chunk writer and measured on the wire with it.
     // #244 half A: each entry also carries the user message's per-conversation seq.
-    committed?: Array<{ random_id: string; messageId: string; seq: number }>,
+    committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>,
     cancelled?: string[],
     unaccepted?: string[],
   ): boolean {
@@ -1489,6 +1497,8 @@ export class NatsChannel implements WebChannelPeerChannel {
           before: message.before,
           beforeTurnId: message.beforeTurnId,
           limit: message.limit,
+          // #401: bounded at the door; carried through to be echoed on the page.
+          nonce: message.nonce,
         });
         break;
 

@@ -30,19 +30,27 @@ released). The existing exact-match registration gate rejects every other
 version. No package-version bump. One reason per bullet, matching
 `protocol.ts`:
 
+- **v6 — durable cancellation ACK evidence.** `ack.cancelled` must be understood
+  to distinguish delivery acceptance from work that still needs recovery.
 - **v7 — stop covers earlier unacknowledged input (#397, #398).** An explicit
   `/stop` sends `cancel_pending`, the earlier user messages this device still
   has no server result for. `ack.unaccepted` is the server's declaration that a
   cancelled ID was never accepted; it rides the same frame as that ID, and only
   it turns the receipt into `failed{cancelled}`. A cancelled ID without it keeps
   its accepted receipt; its request state reports the cancellation.
-
-### Breaking (wire protocol v6)
-
-- Client and plugin require a paired upgrade to protocol 6. The existing
-  exact-match registration gate rejects older peers: durable cancellation ACK
-  evidence must be understood to distinguish delivery acceptance from work that
-  still needs recovery. No new public SDK method or package-version bump is added.
+- **v7 — history page correlation (#401).** `load_history` carries a per-request
+  `nonce` and the `history` page that answers it echoes it as `history.nonce`;
+  the register-time snapshot carries none. Pages ride the peer's shared `.out`,
+  and a device that folded another device's page into a different window kept
+  a permanent hole its own "load older" could not reach. The wrapper now folds a
+  page **only** when it echoes one of this device's own outstanding nonces; a
+  page with no nonce, or someone else's, is not folded (an explicit `randomId`
+  adoption on it still applies). A self-hosted server that does not echo the
+  nonce therefore makes "load older" do nothing.
+  - The low-level `NatsClient.loadHistory(before, limit, beforeTurnId, nonce)`
+    gained an optional 4th argument, appended so existing calls compile. The
+    wrapper's `loadHistory({...})` mints the nonce itself; a direct caller of
+    the low-level method owns minting and matching it.
 
 ### Breaking (wire protocol v4)
 

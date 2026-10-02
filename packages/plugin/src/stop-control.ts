@@ -142,4 +142,4 @@ export function createStopControl<Item extends IngressDedupeItem & { message: { 
     },
   };
 }
-type DeliveryAck = (peer: string, ids: string[], committed?: Array<{ random_id: string; messageId: string; seq: number }>, cancelled?: string[], unaccepted?: string[]) => boolean;
+type DeliveryAck = (peer: string, ids: string[], committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>, cancelled?: string[], unaccepted?: string[]) => boolean;

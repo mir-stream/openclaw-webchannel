@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
+import { ownHistoryPage } from "./history-page.test-harness.js";
 import {
   inboundSubject,
   outboundSubject,
@@ -654,10 +655,10 @@ describe("WebChannelNATSClient — P0-4 receipt handle (T-rc)", () => {
 
     // History adoption rewrites the bubble id — the receipt id is unchanged and
     // no send-state callback fires.
-    deliverOut(h.K, {
+    deliverOut(h.K, ownHistoryPage(h.wrapper, {
       type: "history",
       messages: [{ id: "srv-held", role: "user", text: "held-msg" }],
-    });
+    }));
     await settle();
     expect(receipt.id).toBe(idBefore);
     expect(cbs.map((c) => c.state)).toEqual(["sent", "accepted"]); // no extra callback
@@ -1488,10 +1489,10 @@ describe("WebChannelNATSClient — P0-4 teardown-then-notify (R3-1)", () => {
     // (`u-0`) and replacement-before-stop (`u-1`). The replacement staging path
     // must skip this hydrated transcript row rather than seed a duplicate for
     // its later reducer-backed materialization.
-    deliverOut(h.K, {
+    deliverOut(h.K, ownHistoryPage(h.wrapper, {
       type: "history",
       messages: [{ id: "u-2", role: "user", text: "historic u-2", ts: 1 }],
-    });
+    }));
     await settle();
     deliverOut(h.K, {
       type: "progress", id: "webchannel-d", text: "working", turnId: "T",
@@ -2205,7 +2206,7 @@ describe("WebChannelNATSClient — #243 half 2b: client adopts the server messag
 
     // The journal serves the user row under the SAME server id. It must match by
     // id (tier 1) and touch nothing — one bubble, still the server id.
-    deliverOut(h.K, { type: "history", messages: [{ role: "user", id: SERVER_ID, text: "hello" }] });
+    deliverOut(h.K, ownHistoryPage(h.wrapper, { type: "history", messages: [{ role: "user", id: SERVER_ID, text: "hello" }] }));
     await settle();
 
     const hellos = h.wrapper.getState().messages.filter((m) => m.role === "user" && m.text === "hello");
@@ -2228,7 +2229,7 @@ describe("WebChannelNATSClient — #243 half 2b: client adopts the server messag
     // The tier-2/3 text/position fallback (deliberately kept) reconciles it when
     // the snapshot arrives carrying the server id for the same text.
     const FALLBACK_ID = "webchannel-user-9";
-    deliverOut(h.K, { type: "history", messages: [{ role: "user", id: FALLBACK_ID, text: "hello" }] });
+    deliverOut(h.K, ownHistoryPage(h.wrapper, { type: "history", messages: [{ role: "user", id: FALLBACK_ID, text: "hello" }] }));
     await settle();
 
     const hellos = h.wrapper.getState().messages.filter((m) => m.role === "user" && m.text === "hello");
@@ -2391,7 +2392,7 @@ describe("#349 — replay placements preserve order without inventing live activ
       expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(["B"]);
       if (source === "history") {
         await answerDifference(h, [], { maxSeq: 3 });
-        deliverOut(h.K, { type: "history", messages: [{ id: "P", role: "agent", text: "first", ts: 123 }] });
+        deliverOut(h.K, ownHistoryPage(h.wrapper, { type: "history", messages: [{ id: "P", role: "agent", text: "first", ts: 123 }] }));
         await settle();
       } else {
         const event = source === "bubble"

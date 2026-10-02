@@ -31,7 +31,10 @@ not accepted and answers it with `ack.cancelled`, so it cannot run after the sto
 `ack.unaccepted`, a subset of `cancelled` in each ID's own frame, declares the
 cancelled IDs the server never accepted; only those show as cancelled input.
 This uses the existing exact-match gate without negotiation; the encrypted
-envelope remains version 1 and package versions are unchanged.
+envelope remains version 1 and package versions are unchanged. Version 7 (#401)
+adds `load_history.nonce`, echoed on the `history` page that answers it: pages
+ride the peer's shared `.out`, and a device folds only a page echoing its own
+nonce, so another device's page cannot leave a hole in a different window.
 
 ### Register-reply freshness (`clientNonce`)
 

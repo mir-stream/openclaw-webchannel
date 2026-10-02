@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
+import { ownHistoryPage } from "./history-page.test-harness.js";
 import { inboundSubject, outboundSubject, type InboundMessage, type OutboundMessage } from "./nats-client.js";
 import { openMessage, sealMessage } from "./e2e-crypto-browser.js";
 import { generateDevicePopKeyPair } from "./pop-register.js";
@@ -25,6 +26,7 @@ function inside(wrapper: WebChannelNATSClient) {
   return wrapper as unknown as {
     activeTurnStallTimer: unknown;
     applicationTurns: Map<string, unknown>;
+    convergedApplicationTurns: Map<string, unknown>;
     heldStallTimer: unknown;
     cursor: { state: string; last?: number; buffer?: InboundMessage[] };
     pendingHistorySnapshots: InboundMessage[];
@@ -45,11 +47,13 @@ async function setup(options: { timeout?: number; heartbeat?: number; recovery?:
   const key = new Uint8Array(32).fill(39);
   const registration = registerAgent(key, x.publicRaw, identity);
   const control = { admitted: true, ack: true, answerDifferences: true, registrations: 0, interrupted: false, settleBeforeAck: false,
-    cancelled: new Set<string>() };
+    cancelled: new Set<string>(),
+    recoveryTargetStates: [] as Array<{ state: "queued" | "started" | "completed"; seq: number }> };
   const received: Array<Extract<OutboundMessage, { type: "user_message" }>> = [];
   const differences: Array<Extract<OutboundMessage, { type: "get_difference" }>> = [];
   const deliver = (frame: InboundMessage, server = FakeNatsWS.instances.at(-1)!) => {
-    server.deliverToClient(OUT, sealMessage({ accountId: AGENT, tenant: TENANT, sub: PEER }, key, frame));
+    server.deliverToClient(OUT, sealMessage({ accountId: AGENT, tenant: TENANT, sub: PEER }, key,
+      ownHistoryPage(wrapper, frame)));
   };
   const row = () => ({
     id: "server-user", role: "user" as const, text: received[0]!.text!,
@@ -64,8 +68,13 @@ async function setup(options: { timeout?: number; heartbeat?: number; recovery?:
         control.admitted = true;
       }
       return Promise.resolve(registration(subject, payload, server, reply)).then(() => {
-        if (isRegister) deliver({ type: "history", highWaterSeq: control.interrupted ? 2 : 0,
-          messages: control.interrupted && options.recovery === "snapshot" ? [row()] : [] }, server);
+        if (isRegister) {
+          const target = control.recoveryTargetStates[control.registrations - 2];
+          deliver({ type: "history", highWaterSeq: target?.seq ?? (control.interrupted ? 2 : 0),
+            messages: target ? [{ id: "M1", role: "user", text: "transfer", turnId: "other-wire",
+              randomId: "other-random", requestState: target.state, retryOf: "O", seq: target.seq }]
+              : control.interrupted && options.recovery === "snapshot" ? [row()] : [] }, server);
+        }
       });
     }
     if (subject !== IN || !control.admitted) return;
@@ -159,6 +168,182 @@ describe("#398 explicit stop names earlier unacknowledged input", () => {
     expect(h.wrapper.getState().messages.find((row) => row.wireId === m!.id)).toMatchObject({
       sendFailure: { reason: "cancelled", retryable: false },
     });
+  });
+});
+
+// #399 runs before the suite below: its "cleans up on %s" case spies on a FAKE
+// `setTimeout`, and every later `restoreAllMocks` re-installs that dead timer.
+describe("#399 one retry per interrupted original", () => {
+  it("a racing second-device Retry converges on the first retry's receipt and outcome", async () => {
+    const h = await setup();
+    h.control.ack = false;
+    const original = { id: "server-user", role: "user" as const, text: "transfer", turnId: "wire-0", randomId: "random-0", requestState: "interrupted" as const, seq: 1 };
+    h.deliver({ type: "history", highWaterSeq: 1, messages: [original] });
+    await settleUntil(() => h.wrapper.getState().messages.some(m => m.id === "server-user"), { label: "interrupted original" });
+    const receipt = h.wrapper.retryInterrupted("server-user")!;
+    await settleUntil(() => h.received.length === 1, { label: "retry publication" });
+    // The other device's retry won the server's one-retry slot first.
+    h.deliver({ type: "user_committed", id: "server-retry", text: "transfer", turnId: "other-wire", random_id: "other-random",
+      seq: 2, requestState: "queued", retryOf: "server-user" } as unknown as InboundMessage);
+    h.deliver({ type: "request_state", id: "server-user", turnId: "wire-0", state: "interrupted", seq: 3, retriedBy: "server-retry" });
+    // A converged echo carries no seq: the row is not this send's opener.
+    h.deliver({ type: "ack", ids: [h.received[0]!.id!], committed: [{ random_id: h.received[0]!.random_id!, messageId: "server-retry", converged: true }] });
+    await settleUntil(() => receipt.snapshot().state === "accepted", { label: "redirected receipt" });
+    const users = () => h.wrapper.getState().messages.filter(m => m.kind === undefined && m.role === "user");
+    expect(users().map(m => m.id)).toEqual(["server-user", "server-retry"]);
+    expect(users()[0]).toMatchObject({ retriedBy: "server-retry" });
+    h.deliver({ type: "request_state", id: "server-retry", turnId: "other-wire", state: "completed", seq: 4 });
+    await settleUntil(() => receipt.snapshot().state === "completed", { label: "first retry's outcome" });
+    expect(users().map(m => m.id)).toEqual(["server-user", "server-retry"]);
+    expect(h.wrapper.retryInterrupted("server-user")).toBeUndefined();
+  });
+
+  const original = { id: "O", role: "user" as const, text: "transfer", turnId: "wire-0", randomId: "random-0", requestState: "interrupted" as const, seq: 2 };
+  async function staleRetry(options: { timeout?: number } = {}) {
+    const h = await setup(options);
+    h.control.ack = false;
+    // The fixture's catch-up answers up to seq 2.
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [original] });
+    await settleUntil(() => h.wrapper.getState().messages.some(m => m.id === "O"), { label: "interrupted original" });
+    h.control.answerDifferences = false;
+    h.differences.splice(0);
+    expect(inside(h.wrapper).cursor).toMatchObject({ state: "synced", last: 2 });
+    const receipt = h.wrapper.retryInterrupted("O")!;
+    await settleUntil(() => h.received.length === 1, { label: "retry publication" });
+    const converge = () => h.deliver({ type: "ack", ids: [h.received[0]!.id!], committed: [{ random_id: h.received[0]!.random_id!, messageId: "M1", converged: true }] });
+    return { ...h, receipt, converge };
+  }
+
+  it("settles a send converged onto a first retry this device already holds as completed", async () => {
+    const h = await staleRetry();
+    h.deliver({ type: "user_committed", id: "M1", text: "transfer", turnId: "other-wire", random_id: "other-random",
+      seq: 3, requestState: "queued", retryOf: "O" } as unknown as InboundMessage);
+    h.deliver({ type: "request_state", id: "O", turnId: "wire-0", state: "interrupted", seq: 4, retriedBy: "M1" });
+    h.deliver({ type: "request_state", id: "M1", turnId: "other-wire", state: "started", seq: 5 });
+    h.deliver({ type: "request_state", id: "M1", turnId: "other-wire", state: "completed", seq: 6 });
+    await settleUntil(() => h.wrapper.getState().messages.some(m => m.id === "M1" && m.requestState === "completed"), { label: "first retry completed" });
+    const registrations = h.control.registrations;
+    h.converge();
+    // Settled by the ack itself, well before the stall watchdog would recover it.
+    await settleUntil(() => h.receipt.snapshot().state === "completed", { label: "converged receipt settles", timeoutMs: TIMEOUT / 4 });
+    expect(h.control.registrations).toBe(registrations);
+    expect(h.wrapper.getState()).toMatchObject({ turnActive: false });
+    expect(h.wrapper.getState().messages.filter(m => m.kind === undefined && m.role === "user").map(m => m.id)).toEqual(["O", "M1"]);
+    expect(h.differences).toHaveLength(0);
+  });
+
+  it("fetches an unheld first retry instead of moving the cursor over it, then settles from it", async () => {
+    const h = await staleRetry();
+    h.converge();
+    await settleUntil(() => h.differences.length === 1, { label: "converged row fetched", timeoutMs: TIMEOUT / 4 });
+    expect(h.differences[0]!.afterSeq).toBe(2);
+    expect(inside(h.wrapper).cursor.state).toBe("catching-up");
+    h.deliver({ type: "difference", afterSeq: 2, nonce: h.differences[0]!.nonce, maxSeq: 5, partial: false, events: [
+      { seq: 3, event: { kind: "user", id: "M1", text: "transfer", turnId: "other-wire", randomId: "other-random", requestState: "queued", retryOf: "O" } },
+      { seq: 4, event: { kind: "requestState", id: "O", state: "interrupted", retriedBy: "M1" } },
+      { seq: 5, event: { kind: "requestState", id: "M1", state: "completed" } },
+    ] });
+    await settleUntil(() => h.receipt.snapshot().state === "completed", { label: "converged receipt settles", timeoutMs: TIMEOUT / 4 });
+    expect(inside(h.wrapper).cursor).toMatchObject({ state: "synced", last: 5 });
+    expect(h.wrapper.getState().messages.find(m => m.id === "O")).toMatchObject({ retriedBy: "M1" });
+    expect(h.wrapper.getState()).toMatchObject({ turnActive: false });
+  });
+
+  it("a converged send settles only its own id: an earlier send still running keeps its turn", async () => {
+    const h = await setup();
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [original] });
+    await settleUntil(() => h.wrapper.getState().messages.some(m => m.id === "O"), { label: "interrupted original" });
+    h.differences.splice(0); // Ignore setup's high-water reconciliation request.
+    h.control.answerDifferences = false;
+    const z = h.wrapper.send("unrelated work")!;
+    await settleUntil(() => z.snapshot().state === "accepted", { label: "z accepted" });
+    h.control.ack = false;
+    // Published behind z (no typing yet, so nothing holds it): publish order is [z, y].
+    const retry = h.wrapper.retryInterrupted("O")!;
+    await settleUntil(() => h.received.length === 2, { label: "retry publication" });
+    h.deliver({ type: "typing" });
+    await settleUntil(() => h.wrapper.getState().isTyping === true, { label: "z typing" });
+    h.deliver({ type: "user_committed", id: "M1", text: "transfer", turnId: "other-wire", random_id: "other-random",
+      seq: 3, requestState: "queued", retryOf: "O" } as unknown as InboundMessage);
+    h.deliver({ type: "request_state", id: "O", turnId: "wire-0", state: "interrupted", seq: 4, retriedBy: "M1" });
+    h.deliver({ type: "ack", ids: [h.received[1]!.id!], committed: [{ random_id: h.received[1]!.random_id!, messageId: "M1", converged: true }] });
+    expect(h.differences).toHaveLength(1); // A held queued row may be stale too.
+    expect([...inside(h.wrapper).applicationTurns.keys()]).toEqual([h.received[0]!.id]);
+    expect(inside(h.wrapper).convergedApplicationTurns.size).toBe(1);
+    h.deliver({ type: "difference", afterSeq: 4, nonce: h.differences[0]!.nonce, maxSeq: 5, partial: false,
+      events: [{ seq: 5, event: { kind: "requestState", id: "M1", state: "completed" } }] });
+    await settleUntil(() => retry.snapshot().state === "completed", { label: "converged receipt follows M1", timeoutMs: TIMEOUT / 4 });
+    expect(z.snapshot().state).toBe("accepted");
+    expect(h.wrapper.getState()).toMatchObject({ turnActive: true, isTyping: true });
+    expect([...inside(h.wrapper).applicationTurns.keys()]).toEqual([h.received[0]!.id]);
+    expect(inside(h.wrapper).convergedApplicationTurns.size).toBe(0);
+  });
+
+  it.each([false, true])("recovers a converged receipt from the target's terminal replacement snapshot (split ACK=%s)", async (splitAck) => {
+    const h = await staleRetry({ timeout: 40 });
+    h.deliver({ type: "user_committed", id: "M1", text: "transfer", turnId: "other-wire", random_id: "other-random",
+      seq: 3, requestState: "started", retryOf: "O" } as unknown as InboundMessage);
+    h.deliver({ type: "request_state", id: "O", turnId: "wire-0", state: "interrupted", seq: 4, retriedBy: "M1" });
+    h.control.recoveryTargetStates.push({ state: "completed", seq: 5 });
+    if (splitAck) {
+      const sent = h.received[0]!;
+      h.deliver({ type: "ack", ids: ["other-chunk-id"],
+        committed: [{ random_id: sent.random_id!, messageId: "M1", converged: true }] });
+      expect(h.receipt.snapshot().state).toBe("sent");
+      h.deliver({ type: "ack", ids: [sent.id!] });
+    } else {
+      h.converge();
+    }
+    expect(h.differences).toHaveLength(1);
+    h.deliver({ type: "difference", afterSeq: 4, nonce: h.differences[0]!.nonce,
+      maxSeq: 4, partial: false, events: [] });
+
+    await settleUntil(() => h.control.registrations === 2 && h.differences.length === 2,
+      { label: "converged receipt replacement catch-up", timeoutMs: 500 });
+    h.deliver({ type: "difference", afterSeq: 4, nonce: h.differences[1]!.nonce,
+      maxSeq: 5, partial: false, events: [] });
+
+    await settleUntil(() => h.receipt.snapshot().state === "completed",
+      { label: "converged target recovered terminal snapshot", timeoutMs: 500 });
+    expect(h.control.registrations).toBe(2);
+    expect(h.received).toHaveLength(1);
+    expect(inside(h.wrapper).applicationTurns.size).toBe(0);
+    expect(inside(h.wrapper).convergedApplicationTurns.size).toBe(0);
+    expect(h.wrapper.getState().messages.find(m => m.id === "M1")).toMatchObject({ requestState: "completed" });
+  });
+
+  it("a retry the server refused does not spend the original", async () => {
+    const h = await staleRetry();
+    h.deliver({ type: "inbound_rejected", ids: [h.received[0]!.id!], reason: "overloaded" });
+    await settleUntil(() => h.receipt.snapshot().state === "failed", { label: "refused retry" });
+    const again = h.wrapper.retryInterrupted("O");
+    expect(again).toBeDefined();
+    await settleUntil(() => h.received.length === 2, { label: "second retry publication" });
+    expect(h.received[1]).toMatchObject({ retry_of: "O" });
+    expect(h.wrapper.retryInterrupted("O")).toBeUndefined();
+  });
+
+  it("a double click while a replacement connection is deferred still sends one retry", async () => {
+    const h = await setup();
+    h.deliver({ type: "history", highWaterSeq: 2, messages: [original] });
+    await settleUntil(() => h.wrapper.getState().messages.some(m => m.id === "O"), { label: "interrupted original" });
+    vi.useFakeTimers();
+    h.wrapper.send("old turn");
+    const timer = inside(h.wrapper).activeTurnStallTimer;
+    const clear = globalThis.clearTimeout;
+    const clicks: Array<ReturnType<WebChannelNATSClient["retryInterrupted"]>> = [];
+    vi.spyOn(globalThis, "clearTimeout").mockImplementation((handle) => {
+      clear(handle);
+      if (clicks.length === 0 && handle === timer) {
+        h.wrapper.connect();
+        clicks.push(h.wrapper.retryInterrupted("O"), h.wrapper.retryInterrupted("O"));
+      }
+    });
+    h.wrapper.close();
+    expect(clicks[0]).toBeDefined();
+    expect(clicks[1]).toBeUndefined();
+    await vi.waitFor(() => expect(clicks[0]?.snapshot().state).toBe("accepted"));
+    expect(h.received.filter(m => m.retry_of === "O")).toHaveLength(1);
   });
 });
 

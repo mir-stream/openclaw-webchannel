@@ -6,6 +6,8 @@
  * transactions, then select indexed rows in canonical reducer order. The two
  * in-flight latches remain held across every yield. They bound concurrent work
  * per peer/kind; they impose no history depth limit or request-rate policy.
+ * Pages additionally QUEUE (bounded) behind the latch, because each page now
+ * answers one device's nonce (#401) and a dropped request is an ignored click.
  *
  * A snapshot's high-water comes from the same transaction as its selected rows.
  * Byte fitting may mark it incomplete so client recovery starts from the proper
@@ -78,6 +80,42 @@ type DifferenceRequest = { afterSeq: number; nonce: string };
  */
 const MAX_QUEUED_DIFFERENCE_REQUESTS = 8;
 
+/** #401 — one `load_history` request, its correlation nonce included. */
+type PageRequest = { before?: string; beforeTurnId?: string; limit?: number; nonce?: string };
+
+/**
+ * #401 — how many `load_history` requests one peer may have QUEUED behind the
+ * one being folded. Same number and the same device-bound reasoning as
+ * `MAX_QUEUED_DIFFERENCE_REQUESTS`.
+ *
+ * Before #401 a page arriving while another was folding was DROPPED, and that
+ * was tolerable only by accident: the page being folded went to every device of
+ * the peer, so a second device that clicked in the same window usually got the
+ * rows anyway. Now each page answers exactly one nonce and is folded only by the
+ * device that minted it, so a dropped request is a click that does nothing. The
+ * queue answers each one, still one fold at a time; the bound keeps one device
+ * clicking repeatedly from building a backlog, which is what the drop-only latch
+ * prevented. Past it, the NEW request is dropped (warned under `dropped`).
+ */
+const MAX_QUEUED_PAGE_REQUESTS = 8;
+
+/**
+ * Waiting pages also share a 64 KiB charge per peer: two bytes per UTF-16
+ * code unit in `before`, `beforeTurnId`, and `nonce`. This conservatively
+ * charges string contents without serializing/scanning them; the count bound
+ * covers fixed request overhead. The active page is not charged or restricted.
+ */
+const MAX_QUEUED_PAGE_BYTES = 64 * 1024;
+
+/**
+ * #401 — the most page requests one peer can have OUTSTANDING here: one folding
+ * plus a full queue. The client's `MAX_OUTSTANDING_HISTORY_PAGES`
+ * (`nats-client-wrapper.ts`) must be at least this, or a device could forget a
+ * nonce this server is still going to answer. `e2e/history-convergence.test.ts`
+ * imports both and pins the relation.
+ */
+export const MAX_OUTSTANDING_PAGE_REQUESTS = MAX_QUEUED_PAGE_REQUESTS + 1;
+
 /**
  * #343 — a difference row that alone exceeds this peer's wire, with the size
  * that proved it. The `history` twin is `SkippedHistoryRow`; this one is keyed by
@@ -141,14 +179,15 @@ export type HistoryServer = {
   sendSnapshot(peerId: string): void;
   /**
    * Serve one `load_history` request. Same deferral, different reason — below.
+   * #401: requests for one peer are answered one at a time, in order, with at
+   * most `MAX_QUEUED_PAGE_REQUESTS` waiting, within `MAX_QUEUED_PAGE_BYTES`;
+   * exceeding either waiting bound drops the new request.
    *
    * `beforeTurnId` completes the cursor for a tool row and is optional on the
-   * wire; see `channel-contract.ts`'s `load_history` member.
+   * wire; see `channel-contract.ts`'s `load_history` member. So is #401's
+   * `nonce`, which the page echoes so only the requesting device folds it.
    */
-  servePage(
-    peerId: string,
-    request: { before?: string; beforeTurnId?: string; limit?: number },
-  ): void;
+  servePage(peerId: string, request: PageRequest): void;
   /**
    * #244 half B / #356 — answer a `get_difference(afterSeq, nonce)`: read this
    * peer's journal for `seq > afterSeq`, byte-fit the RAW events, and
@@ -166,8 +205,9 @@ export type HistoryServer = {
    * with nothing bounding this path an authenticated peer could loop
    * `get_difference{afterSeq:0}` and hold the account's dispatch. It is now
    * `schedule`d like the other two, with a bounded per-peer QUEUE rather than
-   * their drop-a-concurrent-request latch: a difference names a floor and a
-   * nonce, so dropping one leaves a device waiting on its timeout. What is
+   * the snapshot's coalescing: a difference names a floor and a nonce, so
+   * dropping or merging one leaves a device waiting on its timeout. (Pages
+   * queue the same way since #401; see `MAX_QUEUED_PAGE_REQUESTS`.) What is
    * bounded is CONCURRENCY (one read+publish in flight) and DEPTH
    * (`MAX_QUEUED_DIFFERENCE_REQUESTS`), not rate — see the file header, which
    * says the same of the other two.
@@ -271,6 +311,14 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
   const snapshotsInFlight = new Set<string>();
   const snapshotsNeedingRefresh = new Set<string>();
   const pagesInFlight = new Set<string>();
+  /**
+   * #401 — the per-peer page queue. Present ⇒ this peer has a page scheduled or
+   * folding; the array holds the requests still to answer, oldest first.
+   */
+  const pendingPages = new Map<string, {
+    requests: Array<{ request: PageRequest; chargedBytes: number }>;
+    chargedBytes: number;
+  }>();
   /**
    * #356 — the per-peer `get_difference` queue. Present ⇒ this peer has a read
    * scheduled or running; the array holds the requests still to answer, oldest
@@ -440,7 +488,8 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
     // SNAPSHOT path passes it; the PAGE path leaves it `undefined` (a page serves
     // older rows and carries no high-water). Both the wire frame and the byte
     // measurement below include it so the budget accounts for the extra field.
-    options: { sendEmpty: boolean; highWaterSeq?: number },
+    // #401: `nonce` is the PAGE path's correlation echo, measured the same way.
+    options: { sendEmpty: boolean; highWaterSeq?: number; nonce?: string },
   ): void => {
     const limit = channel.effectiveOutboundLimit();
     const fitted = fitHistoryFrame(messages, {
@@ -457,6 +506,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
           ...(options.highWaterSeq !== undefined ? {
             highWaterSeq: options.highWaterSeq, snapshotComplete: rows.length === messages.length,
           } : {}),
+          ...(options.nonce !== undefined ? { nonce: options.nonce } : {}),
         }),
     });
 
@@ -510,7 +560,8 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
     if (fitted.rows.length === 0 && !options.sendEmpty && options.highWaterSeq === undefined) return;
 
     if (!channel.sendHistory(peerId, fitted.rows, options.highWaterSeq,
-      options.highWaterSeq === undefined ? undefined : fitted.rows.length === messages.length)) {
+      options.highWaterSeq === undefined ? undefined : fitted.rows.length === messages.length,
+      options.nonce)) {
       const suppressed = admit(kind, "publish-failed");
       if (suppressed !== undefined) {
         try {
@@ -524,13 +575,19 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
     }
   };
 
-  /** Keep the latch through catch-up yields; release it on success or failure. */
+  /**
+   * Keep the latch through catch-up yields; release it on success or failure.
+   * `settled` runs once the run has finished — after its publish, or after a
+   * read fault that published nothing — which is when the page queue (#401)
+   * starts its next request.
+   */
   const runDeferred = (
     kind: ServeKind,
     inFlight: Set<string>,
     peerId: string,
     produce: () => HistoryMessage[] | { pending: true },
     emit: (messages: HistoryMessage[]) => void,
+    settled?: () => void,
   ): void => {
     if (inFlight.has(peerId)) {
       const suppressed = admit(kind, "dropped");
@@ -598,7 +655,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
         }
       }
       if (pending) { schedule(run); return; }
-      if (messages === undefined) return;
+      if (messages === undefined) { settled?.(); return; }
       try {
         emit(messages);
       } catch (err) {
@@ -612,6 +669,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
           } catch { /* a faulting logger must not escape this callback */ }
         }
       }
+      settled?.();
     };
     schedule(run);
   };
@@ -896,11 +954,59 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
     }
   };
 
+  /** Fold and publish one queued page, then start the peer's next one (#401). */
+  const startPage = (peerId: string, request: PageRequest): void => {
+    // PURE, so it stays on the dispatch turn: `planHistoryFetch` validates the
+    // wire `limit` (the NATS receive door's decoder checks only that it is a
+    // number or absent — #246 half A — and forwards every other question
+    // here: range, finiteness, flooring) and picks paginate-vs-tail from
+    // `before`, carrying `beforeTurnId` into
+    // the page plan. It cannot throw and it does not touch the store.
+    const plan = planHistoryFetch(request, config.pageSize);
+    let targetSeq: number | undefined;
+    // ⚠️ DEFERRED FOR A DIFFERENT REASON THAN THE SNAPSHOT — name which one.
+    // Nothing is racing this handler (a `load_history` answer is an ordinary
+    // publish, not a request/reply), so no reply is being unblocked. What the
+    // deferral buys is that the fold does not run ON the inbound dispatch
+    // turn.
+    runDeferred(
+      "page",
+      pagesInFlight,
+      peerId,
+      () => {
+        const served = serveHistoryRequestStep(journal, peerId, plan, targetSeq);
+        if (served.pending) { targetSeq = served.targetSeq; return served; }
+        reportProjectionHealth("page", peerId, served);
+        return served.messages;
+      },
+      (messages) => {
+        // Always sent, empty included. For OUR client an empty page adds no
+        // rows but still answers — and retires — the requesting device's
+        // nonce (#401); for any client it is the end-of-history answer.
+        // Sending nothing would leave the request outstanding.
+        // #401: the request's `nonce` rides back on its own page, so the one
+        // device that asked can tell this page from another device's.
+        publishFitted("page", peerId, messages, { sendEmpty: true, nonce: request.nonce });
+      },
+      () => {
+        const queued = pendingPages.get(peerId)!;
+        const next = queued.requests.shift();
+        if (next === undefined) pendingPages.delete(peerId);
+        else {
+          // Release before starting it: only WAITING requests are charged,
+          // including when the preceding read or publish failed.
+          queued.chargedBytes -= next.chargedBytes;
+          startPage(peerId, next.request);
+        }
+      },
+    );
+  };
+
   return {
     serveDifference(peerId: string, afterSeq: number, nonce: string): void {
       // ONE READ+PUBLISH IN FLIGHT PER PEER, WITH A BOUNDED FIFO QUEUE.
       // Snapshots coalesce concurrent requests by refreshing their finite target;
-      // pages retain their separate per-peer latch. A `get_difference`
+      // pages queue the same way since #401 (`servePage`). A `get_difference`
       // names a FLOOR and carries a `nonce`, and the reply is addressed to that
       // pair — so a dropped request is a device left waiting on its 5 s timeout.
       //
@@ -986,44 +1092,34 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
       );
     },
 
-    servePage(
-      peerId: string,
-      request: { before?: string; beforeTurnId?: string; limit?: number },
-    ): void {
-      // PURE, so it stays on the dispatch turn: `planHistoryFetch` validates the
-      // wire `limit` (the NATS receive door's decoder checks only that it is a
-      // number or absent — #246 half A — and forwards every other question
-      // here: range, finiteness, flooring) and picks paginate-vs-tail from
-      // `before`, carrying `beforeTurnId` into
-      // the page plan. It cannot throw and it does not touch the store.
-      const plan = planHistoryFetch(request, config.pageSize);
-      let targetSeq: number | undefined;
-      // ⚠️ DEFERRED FOR A DIFFERENT REASON THAN THE SNAPSHOT — name which one.
-      // Nothing is racing this handler (a `load_history` answer is an ordinary
-      // publish, not a request/reply), so no reply is being unblocked. What the
-      // deferral buys is that the fold does not run ON the inbound dispatch
-      // turn.
-      runDeferred(
-        "page",
-        pagesInFlight,
-        peerId,
-        () => {
-          const served = serveHistoryRequestStep(journal, peerId, plan, targetSeq);
-          if (served.pending) { targetSeq = served.targetSeq; return served; }
-          reportProjectionHealth("page", peerId, served);
-          return served.messages;
-        },
-        (messages) => {
-          // Always sent, empty included. For OUR client an empty `history` frame
-          // is a no-op (`nats-client-wrapper.ts`'s `case "history"` returns
-          // early on a zero-length list, and `loadHistory` keeps no pending
-          // state to clear), so this does not "stop it asking" — it simply
-          // changes nothing, which is the honest outcome. For a third-party
-          // client that does track a request, an empty page is the end-of-history
-          // answer. Sending nothing would be worse for both.
-          publishFitted("page", peerId, messages, { sendEmpty: true });
-        },
-      );
+    servePage(peerId: string, request: PageRequest): void {
+      // #401: ONE FOLD AT A TIME PER PEER, WITH A BOUNDED FIFO QUEUE — the
+      // `serveDifference` shape, for the same reason: each request carries the
+      // nonce of the one device that will fold its answer.
+      const queued = pendingPages.get(peerId);
+      if (queued !== undefined) {
+        const chargedBytes = 2 * ((request.before?.length ?? 0) +
+          (request.beforeTurnId?.length ?? 0) + (request.nonce?.length ?? 0));
+        if (queued.requests.length >= MAX_QUEUED_PAGE_REQUESTS ||
+            queued.chargedBytes + chargedBytes > MAX_QUEUED_PAGE_BYTES) {
+          const suppressed = admit("page", "dropped");
+          if (suppressed !== undefined) {
+            try {
+              logger?.warn?.(
+                `webchannel: history page dropped for ${logSafe(peerId)}; ` +
+                  `waiting queue would exceed ${MAX_QUEUED_PAGE_REQUESTS} requests ` +
+                  `or ${MAX_QUEUED_PAGE_BYTES} charged bytes (suppressed=${suppressed})`,
+              );
+            } catch { /* a faulting logger must not fail the dispatch turn */ }
+          }
+          return;
+        }
+        queued.requests.push({ request, chargedBytes });
+        queued.chargedBytes += chargedBytes;
+        return;
+      }
+      pendingPages.set(peerId, { requests: [], chargedBytes: 0 });
+      startPage(peerId, request);
     },
   };
 }
