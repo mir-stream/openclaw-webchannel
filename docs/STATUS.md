@@ -1,5 +1,11 @@
 # Project Status — single source of truth
 
+P3 reply delivery (#415 C4/C7): inbound dispatch enables the SDK reply-prefix
+pipeline, including selected-model interpolation. Media remains unsupported; a
+media-only final now reports delivery failure through the existing durable turn
+settlement and client failure state, without inventing an assistant message.
+Text-bearing replies and intentional silence retain their previous behavior.
+
 Quiet-turn liveness (#396): normal turns send an initial typing indicator and
 renew ephemeral `typing` with `keepalive: true` every 4 seconds until completion,
 error, or dispatch abort. Renewals refresh existing application watches without

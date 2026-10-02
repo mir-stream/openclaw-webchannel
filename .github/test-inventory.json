@@ -108,7 +108,7 @@
     "packages/plugin/src/inbound-queue.test.ts": 42,
     "packages/plugin/src/inbound-retention.test.ts": 3,
     "packages/plugin/src/inbound-wire-decode.test.ts": 24,
-    "packages/plugin/src/inbound.test.ts": 127,
+    "packages/plugin/src/inbound.test.ts": 138,
     "packages/plugin/src/index-nats-wiring.test.ts": 35,
     "packages/plugin/src/ingress-cancellation-integration.test.ts": 20,
     "packages/plugin/src/ingress-dedupe-delivery-journal.test.ts": 33,

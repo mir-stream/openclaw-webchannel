@@ -1331,6 +1331,7 @@ export async function handleInboundMessage(
           return {
             cfg: api.config,
             channel: WEBCHANNEL_ID,
+            accountId,
             agentId: route.agentId,
             routeSessionKey: route.sessionKey,
             storePath,
@@ -1338,6 +1339,10 @@ export async function handleInboundMessage(
             recordInboundSession: channelRuntime.session.recordInboundSession,
             dispatchReplyWithBufferedBlockDispatcher:
               channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher,
+            // Opt into core's responsePrefix and model-selection context. An
+            // omitted pipeline bypasses both, even when messages config sets a
+            // prefix. Typing remains owned by this turn's existing keepalive.
+            replyPipeline: {},
             // `replyOptions` is UNCONDITIONAL — it is present on every turn,
             // including block/off streaming and the control lane, because
             // `onAgentRunStart` (below) must fire for all of them. Only the
@@ -1564,6 +1569,16 @@ export async function handleInboundMessage(
                 const noticeFlags = noticeFlagsOf(payload);
                 const isNotice = isCoreNoticePayload(payload);
                 const text = payload.text;
+                // Media is not supported by this channel. A final consisting
+                // only of attachments is a refused delivery, just like a
+                // failed sendText, even when core finished its work cleanly.
+                // Silence and text-bearing replies keep their existing rules.
+                if (kind === "final" && !text?.trim()
+                  && (payload.mediaUrl?.trim() || payload.mediaUrls?.some(url => url.trim()))) {
+                  turnOutcome = "error";
+                  api.logger?.warn?.(`webchannel: media-only final was not delivered for peer=${logSafe(wsKey)} turn=${logSafe(turnId)}`);
+                  return { visibleReplySent: false };
+                }
                 if (!text) {
                   // #94: a text-less BLOCK — media-only, or text stripped by a
                   // hook — sends nothing, but core still SETTLES it at the

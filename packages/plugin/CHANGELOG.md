@@ -4,6 +4,11 @@
 
 ### Changed
 
+- The inbound reply pipeline honors configured response prefixes and selected
+  model interpolation. Unsupported media-only final replies now settle as
+  delivery errors rather than silently succeeding; empty/text replies keep
+  their existing behavior (#415 C4/C7).
+
 - **Case-distinct JWT peers now have distinct core sessions (#372).** Raw peer
   IDs such as `Alice` and `alice` are encoded before SDK session normalization;
   configured bindings and intentional `identityLinks` keep their SDK selection,
