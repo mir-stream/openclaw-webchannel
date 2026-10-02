@@ -445,10 +445,11 @@ export class EnrollmentClient {
 
     // Test-only override: when set, it REPLACES the computed interval (tests
     // inject 0 to poll instantly). Production uses the RFC 8628 5s floor.
+    const pollStepMs = 5000;
     let intervalMs =
       this.options._minPollIntervalMs !== undefined
         ? this.options._minPollIntervalMs
-        : Math.max(enrollResponse.interval * 1000, 5000);
+        : Math.max(enrollResponse.interval * 1000, pollStepMs);
     const expiresAt = Date.now() + enrollResponse.expires_in * 1000;
 
     while (Date.now() < expiresAt) {
@@ -467,7 +468,7 @@ export class EnrollmentClient {
         } else if (pollResult.error === "slow_down") {
           // RFC 8628 §3.5: each slow_down adds 5s to ALL remaining polls,
           // including after a later authorization_pending response.
-          intervalMs += 5000;
+          intervalMs += pollStepMs;
           continue;
         } else {
           throw new Error(`Enrollment failed: ${pollResult.error} (${pollResult.error_description})`);
