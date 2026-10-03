@@ -77,6 +77,7 @@ function boundCredentialJson(
 }
 
 beforeEach(() => {
+  vi.unstubAllEnvs();
   readMock.mockReset();
   readMock.mockImplementation(() => {
     throw Object.assign(new Error("missing"), { code: "ENOENT" });
@@ -183,6 +184,34 @@ describe("setup-wizard: declarative detection", () => {
     const cfg = { channels: { webchannel: { accounts: { accta: {} } } } } as never;
     expect(webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" })).toBe(false);
   });
+
+  it.each(["configured", "environment"] as const)(
+    "status.resolveConfigured contains an invalid %s SaaS URL before credential lookup",
+    (source) => {
+      if (source === "environment") {
+        vi.stubEnv("WEBCHANNEL_SAAS_BASE_URL", "http://saas.internal:3951");
+      }
+      const cfg = {
+        channels: {
+          webchannel: {
+            accounts: {
+              accta: {
+                tenant: "tenant-a",
+                saas: {
+                  baseUrl: source === "configured"
+                    ? "http://saas.internal:3951"
+                    : "https://saas.example",
+                },
+              },
+            },
+          },
+        },
+      } as never;
+      expect(webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" }))
+        .toBe(false);
+      expect(readMock).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([42, "relative/state"])(
     "status.resolveConfigured contains invalid storageRoot %j",

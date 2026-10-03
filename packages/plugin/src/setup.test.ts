@@ -103,6 +103,7 @@ function section(next: unknown): Record<string, unknown> {
 }
 
 beforeEach(() => {
+  vi.unstubAllEnvs();
   acquireMock.mockClear();
   preflightMock.mockClear();
   migrationMock.mockReset();
@@ -211,6 +212,17 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
     expect((section(next).accounts as Record<string, unknown>).accta).toEqual({
       tenant: "t",
     });
+  });
+
+  it("rejects an insecure direct SaaS URL before changing config", () => {
+    const cfg = { channels: { webchannel: { accounts: { accta: { tenant: "old" } } } } } as never;
+    const before = JSON.stringify(cfg);
+    expect(() => webchannelSetup.applyAccountConfig({
+      cfg,
+      accountId: "accta",
+      input: { saasBaseUrl: "http://host.docker.internal:3951", tenant: "new" },
+    })).toThrow(/use HTTPS/);
+    expect(JSON.stringify(cfg)).toBe(before);
   });
 
   it("fails closed before writing when existing config contains removed auth.jwt.audience", () => {
@@ -387,6 +399,44 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     expect(readMock).not.toHaveBeenCalled();
     expect(acquireMock).not.toHaveBeenCalled();
   });
+
+  it.each(["credentials override", "environment override"] as const)(
+    "contains an invalid SaaS %s without reading or acquiring credentials",
+    async (source) => {
+      if (source === "environment override") {
+        vi.stubEnv("WEBCHANNEL_SAAS_BASE_URL", "http://saas.internal:3951");
+      }
+      const runtime = makeRuntime();
+      const cfg = {
+        channels: {
+          webchannel: {
+            accounts: {
+              accta: {
+                tenant: "tenant-a",
+                saas: { baseUrl: "https://saas.example" },
+                ...(source === "credentials override"
+                  ? { nats: { credentials: { mode: "enrolled", saasBaseUrl: "http://saas.internal:3951" } } }
+                  : {}),
+              },
+            },
+          },
+        },
+      } as never;
+
+      await expect(webchannelSetup.afterAccountConfigWritten({
+        previousCfg: cfg,
+        cfg,
+        accountId: "accta",
+        input: {},
+        runtime,
+      })).resolves.toBeUndefined();
+
+      expect(runtime.log.mock.calls.flat().join("\n")).toMatch(/invalid SaaS base URL.*use HTTPS/);
+      expect(readMock).not.toHaveBeenCalled();
+      expect(migrationMock).not.toHaveBeenCalled();
+      expect(acquireMock).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([42, "relative/state"])(
     "contains invalid storageRoot %j as an account-scoped setup diagnostic",
