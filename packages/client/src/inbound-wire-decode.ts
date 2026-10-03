@@ -259,6 +259,10 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
   const known = type as KnownInboundType;
 
   // ── Envelope: fields any frame may carry, checked once. ──
+  const epoch = field(raw, "epoch");
+  if (epoch !== undefined && (!isNonEmptyString(epoch) || epoch.length > 128)) {
+    return invalid(known, "epoch must be a non-empty string of at most 128 characters");
+  }
   const seq = field(raw, "seq");
   if (seq !== undefined && !isWireSeq(seq)) {
     return invalid(known, "seq must be a non-negative safe integer");
@@ -483,6 +487,15 @@ export function decodeInboundMessage(raw: unknown): InboundDecodeResult {
       const complete = field(raw, "snapshotComplete");
       if (complete !== undefined && typeof complete !== "boolean") {
         return invalid(known, "snapshotComplete must be a boolean");
+      }
+      const omitted = field(raw, "omitted");
+      if (omitted !== undefined && (!Array.isArray(omitted) || omitted.some(row =>
+        !isRecord(row) || !isNonEmptyString(row.id)
+        || (row.kind !== undefined && !["reasoning", "tool", "approval"].includes(row.kind as string))
+        || (row.turnId !== undefined && !isString(row.turnId))
+        || (row.seq !== undefined && (!isWireSeq(row.seq)
+          || (isWireSeq(highWaterSeq) && row.seq > highWaterSeq)))))) {
+        return invalid(known, "omitted must contain valid history row identities");
       }
       // #401: a page's correlation echo. Optional (a snapshot, or an older
       // plugin's page, carries none); a present one must be a usable token, or

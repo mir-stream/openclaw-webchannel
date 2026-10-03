@@ -14,9 +14,9 @@ import { DurableSendError } from "./durable-send-error.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
-import { buildChannelInboundEventContext } from "openclaw/plugin-sdk/channel-inbound";
+import { buildChannelInboundEventContext, runChannelInboundEvent } from "openclaw/plugin-sdk/channel-inbound";
 import { resolveCommandAuthorization } from "openclaw/plugin-sdk/command-auth";
-import type { GetReplyOptions } from "openclaw/plugin-sdk/reply-runtime";
+import { createReplyDispatcher, type GetReplyOptions } from "openclaw/plugin-sdk/reply-runtime";
 
 import {
   deliverDraftFinalPayload,
@@ -108,6 +108,8 @@ type AssembledTurnLike = {
         isCompactionNotice?: boolean;
         isReasoning?: boolean;
         isReasoningSnapshot?: boolean;
+        mediaUrl?: string;
+        mediaUrls?: string[];
       },
       info?: { kind?: string; assistantMessageIndex?: number },
     ) => Promise<{ visibleReplySent: boolean }>;
@@ -4117,5 +4119,167 @@ describe("durable dispatch hooks (#369)", () => {
     expect(texts.map((f) => f.text)).toEqual([
       "Sorry — something went wrong while answering. Please try again.",
     ]);
+  });
+});
+
+
+describe("#415 C4: native reply prefix pipeline", () => {
+  it.each(["off", "partial", "block", "progress"] as const)("delivers model-interpolated prefixes through the real SDK in %s mode", async streamingMode => {
+    const { api } = makeFakeApi({ streamingMode, runImpl: async () => {} });
+    const { transport, texts, finalizes } = makeFakeTransport();
+    api.config.messages = { responsePrefix: "[{provider}/{model}]" };
+    api.runtime.channel.inbound.run = runChannelInboundEvent;
+    const dispatch = vi.fn<NonNullable<typeof api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher>>(async params => {
+      await params.replyOptions?.onModelSelected?.({ provider: "fixture", model: "model-test", thinkLevel: "off" });
+      const dispatcher = createReplyDispatcher(params.dispatcherOptions);
+      dispatcher.sendFinalReply({ text: "answer" });
+      await dispatcher.waitForIdle();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } };
+    });
+    api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = dispatch;
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", id: "prefix-turn", text: "hello" });
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect([...texts, ...finalizes].map(frame => frame.text)).toContain("[fixture/model-test] answer");
+  });
+
+  it("uses the serving account's prefix override", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {}, channelConfig: {
+      responsePrefix: "channel", accounts: { chosen: { responsePrefix: "account" } },
+    } });
+    const { transport, texts } = makeFakeTransport();
+    api.config.messages = { responsePrefix: "global" };
+    api.runtime.channel.inbound.run = runChannelInboundEvent;
+    api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = async params => {
+      const dispatcher = createReplyDispatcher(params.dispatcherOptions);
+      dispatcher.sendFinalReply({ text: "answer" });
+      await dispatcher.waitForIdle();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } };
+    };
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", id: "prefix-turn", text: "hello" }, "chosen");
+    expect(texts.map(frame => frame.text)).toEqual(["account answer"]);
+  });
+
+  it("keeps the prefix out of a CLI reasoning replay and renders one reasoning row", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+    const { transport, texts, settles } = makeFakeTransport();
+    const reasoning = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+    api.config.messages = { responsePrefix: "[{model}]" };
+    api.runtime.channel.inbound.run = runChannelInboundEvent;
+    api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = async params => {
+      const callbacks = params.replyOptions!;
+      await callbacks.onModelSelected?.({ provider: "fixture", model: "model-test", thinkLevel: "off" });
+      callbacks.onAgentRunStart?.("prefix-reasoning-run");
+      await callbacks.onReasoningStream?.({ text: "AAA", isReasoningSnapshot: true });
+      await callbacks.onReasoningStream?.({ text: "AAA\n\nBBB", isReasoningSnapshot: true });
+      const dispatcher = createReplyDispatcher(params.dispatcherOptions);
+      // The CLI runtime's final replay of the open snapshot, then the answer.
+      dispatcher.sendFinalReply({ text: "AAA\n\nBBB", isReasoning: true });
+      dispatcher.sendFinalReply({ text: "answer" });
+      await dispatcher.waitForIdle();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 2 } };
+    };
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", id: "prefix-reasoning", text: "hello" });
+    const finals = reasoning.mock.calls.filter(args => args[4] === true);
+    expect(finals.map(args => args[3])).toEqual(["AAA\n\nBBB"]);
+    expect(new Set(reasoning.mock.calls.map(args => args[1])).size).toBe(1);
+    expect(reasoning.mock.calls.some(args => String(args[3]).includes("[model-test]"))).toBe(false);
+    expect(texts.map(frame => frame.text)).toEqual(["[model-test] answer"]);
+    expect(settles).toEqual(["ok"]);
+  });
+});
+
+describe("#415 C7: unsupported media-only finals", () => {
+  it("refuses a media-only final through the actual SDK prefix pipeline", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+    api.config.messages = { responsePrefix: "[configured]" };
+    api.runtime.channel.inbound.run = runChannelInboundEvent;
+    api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = async params => {
+      const dispatcher = createReplyDispatcher(params.dispatcherOptions);
+      dispatcher.sendFinalReply({ mediaUrls: ["https://private.invalid/image"] });
+      await dispatcher.waitForIdle();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } };
+    };
+    const { transport, texts, settles } = makeFakeTransport();
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", text: "image" });
+    expect(texts).toEqual([]);
+    expect(settles).toEqual(["error"]);
+  });
+
+  it.each(["off", "partial", "block", "progress"] as const)("settles an undelivered media final as error in %s mode", async streamingMode => {
+    for (const payload of [{ mediaUrl: "https://private.invalid/file" }, { mediaUrls: ["https://private.invalid/file"], text: "  " }]) {
+      const { api, warnings } = makeFakeApi({ streamingMode, runImpl: async turn => {
+        expect(await turn.delivery.deliver(payload, { kind: "final" })).toEqual({ visibleReplySent: false });
+      } });
+      const { transport, settles, texts, finalizes } = makeFakeTransport();
+      const durableSettlement = vi.fn();
+      await handleInboundMessage(api, transport, "peer", { type: "user_message", id: "media-turn", text: "make an image" }, "default", { onSettled: durableSettlement });
+      expect(settles).toEqual(["error"]);
+      expect(durableSettlement).toHaveBeenCalledWith("error");
+      expect([...texts, ...finalizes]).toEqual([]);
+      expect(warnings.join(" ")).toContain("media-only final was not delivered");
+      expect(warnings.join(" ")).not.toContain("private.invalid");
+    }
+  });
+
+  it("preserves a core success verdict but records media delivery failure", async () => {
+    let emit!: (event: LifecycleEvent) => void;
+    const made = makeFakeApi({ streamingMode: "off", withAgentEvents: true, runImpl: async turn => {
+      turn.replyOptions?.onAgentRunStart?.("media-run");
+      await turn.delivery.deliver({ mediaUrls: ["file:///private/image.png"] }, { kind: "final" });
+      emit({ stream: "lifecycle", runId: "media-run", data: { phase: "end" } });
+    } });
+    emit = made.emitLifecycle;
+    startAgentLifecycleSubscription(made.api);
+    const { transport, settles } = makeFakeTransport();
+    await handleInboundMessage(made.api, transport, "peer", { type: "user_message", text: "image" });
+    expect(settles).toEqual(["error"]);
+  });
+
+  it.each(["off", "partial", "block", "progress"] as const)("settles ok when block-streamed answer text precedes a media-only final in %s mode", async streamingMode => {
+    const { api } = makeFakeApi({ streamingMode, runImpl: async turn => {
+      await turn.delivery.deliver({ text: "here is the image" }, { kind: "block" });
+      // Core's preserveUnsentMediaAfterBlockSend: the final re-sent as media only.
+      await turn.delivery.deliver({ mediaUrl: "https://private.invalid/file" }, { kind: "final" });
+    } });
+    const { transport, settles, texts, finalizes, progress } = makeFakeTransport();
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", text: "image" });
+    expect([...texts, ...finalizes, ...progress].map(frame => frame.text)).toContain("here is the image");
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it("settles ok when the streamed lane owns the answer and its redundant block is suppressed", async () => {
+    const { api } = makeFakeApi({ streamingMode: "partial", runImpl: async turn => {
+      turn.replyOptions?.onAssistantMessageStart?.();
+      turn.replyOptions?.onPartialReply?.({ text: "here is the image" });
+      await turn.delivery.deliver({ text: "here is the image" }, { kind: "block", assistantMessageIndex: 1 });
+      await turn.delivery.deliver({ mediaUrl: "https://private.invalid/file" }, { kind: "final" });
+    } });
+    const { transport, settles, texts, finalizes, progress } = makeFakeTransport();
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", text: "image" });
+    expect([...texts, ...finalizes, ...progress].map(frame => frame.text)).toContain("here is the image");
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it.each(["off", "partial", "block", "progress"] as const)("settles ok when a media-only final is followed by a text final in %s mode", async streamingMode => {
+    const { api } = makeFakeApi({ streamingMode, runImpl: async turn => {
+      await turn.delivery.deliver({ mediaUrls: ["https://private.invalid/file"] }, { kind: "final" });
+      await turn.delivery.deliver({ text: "answer" }, { kind: "final" });
+    } });
+    const { transport, settles, texts, finalizes } = makeFakeTransport();
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", text: "image" });
+    expect([...texts, ...finalizes].map(frame => frame.text)).toContain("answer");
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it("does not classify silence or a text-bearing final as a missing media final", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async turn => {
+      await turn.delivery.deliver({}, { kind: "final" });
+      await turn.delivery.deliver({ mediaUrls: [] }, { kind: "final" });
+      await turn.delivery.deliver({ text: "answer", mediaUrl: "https://private.invalid/file" }, { kind: "final" });
+    } });
+    const { transport, settles, texts } = makeFakeTransport();
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", text: "hello" });
+    expect(settles).toEqual(["ok"]);
+    expect(texts.map(frame => frame.text)).toEqual(["answer"]);
   });
 });

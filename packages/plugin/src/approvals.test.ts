@@ -682,14 +682,39 @@ describe("webchannel approver resolution", () => {
     expect(isWebChannelExecApprovalApprover({ cfg, senderId: "alice" })).toBe(false);
   });
 
-  it("preserves explicit peer IDs as literal strings instead of treating them as global owners", () => {
+  it("#415 D6: strips the channel's own explicit prefix and preserves other literal peer IDs", () => {
     const cfg: any = {
       commands: { ownerAllowFrom: ["*"] },
       channels: { webchannel: { execApprovals: { approvers: [" webchannel:alice ", "telegram:bob"] } } },
     };
-    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual(["webchannel:alice", "telegram:bob"]);
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual(["alice", "telegram:bob"]);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "alice" })).toBe(true);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "webchannel:alice" })).toBe(false);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "telegram:bob" })).toBe(true);
+  });
+
+  it("#415 D6: normalizes and deduplicates explicit prefixes without changing peer case", () => {
+    const cfg: any = { channels: { webchannel: { execApprovals: { approvers: [
+      " WEBCHANNEL : Alice ", "Alice", "webchannel:alice", "webchannel: ",
+    ] } } } };
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual(["Alice", "alice"]);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "ALICE" })).toBe(false);
+  });
+
+  it("#415 D6: an empty prefixed explicit peer cannot broaden to owner fallback", () => {
+    const cfg: any = { commands: { ownerAllowFrom: ["*"] }, channels: { webchannel: { execApprovals: { approvers: ["webchannel: "] } } } };
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual([]);
     expect(isWebChannelExecApprovalApprover({ cfg, senderId: "alice" })).toBe(false);
-    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "webchannel:alice" })).toBe(true);
+  });
+
+  it("#415 D6: resolves an account-qualified wildcard only on its selected account", () => {
+    const cfg: any = { channels: { webchannel: { accounts: {
+      a: { execApprovals: { approvers: ["webchannel:*"] } },
+      b: { execApprovals: { approvers: ["webchannel:bob"] } },
+    } } } };
+    expect(isWebChannelExecApprovalApprover({ cfg, accountId: "a", senderId: "alice" })).toBe(true);
+    expect(isWebChannelExecApprovalApprover({ cfg, accountId: "b", senderId: "alice" })).toBe(false);
+    expect(isWebChannelExecApprovalApprover({ cfg, accountId: "b", senderId: "bob" })).toBe(true);
   });
 
   it("preserves a channel-qualified owner wildcard for authenticated peers", () => {

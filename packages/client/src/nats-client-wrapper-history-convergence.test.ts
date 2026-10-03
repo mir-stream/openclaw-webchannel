@@ -41,34 +41,36 @@ describe("#342 history row authority", () => {
     } finally { wrapper.close(); }
   });
 
-  it.each([false, true])("reconstructs sparse tool content during cold recovery while fencing newer state: %s", (newerHistory) => {
+  it.each([false, true])("fills an omitted sparse tool from full history while fencing newer state: %s", (newerHistory) => {
     const { wrapper, inner, send } = setup();
     try {
       send({ type: "tool_activity", id: "tool", turnId: "t", phase: "end", status: "ok", seq: 4 });
-      const snapshot: InboundMessage = { type: "history", highWaterSeq: 4, snapshotComplete: false, messages: [] };
+      const snapshot: InboundMessage = { type: "history", highWaterSeq: 4, snapshotComplete: false,
+        messages: [], omitted: [{ kind: "tool", id: "tool", turnId: "t", seq: 4 }] };
       send(snapshot); send(snapshot);
       if (newerHistory) {
         send({ type: "history", messages: [{ kind: "tool", id: "tool", turnId: "t", name: "new name",
           argKeys: ["new"], summary: "New outcome", phase: "end", status: "error", seq: 6 }] });
       }
-      send({ type: "difference", afterSeq: 0, nonce: inner.cursor.nonce, maxSeq: 2, partial: true, events: [
-        { seq: 1, event: { kind: "tool", id: "tool", turnId: "t", name: "read_file", phase: "start", argKeys: ["path", "limit"] } },
-        { seq: 2, event: { kind: "tool", id: "tool", turnId: "t", phase: "update", summary: "Read file" } },
-      ] });
+      send({ type: "history", messages: [{ kind: "tool", id: "tool", turnId: "t", seq: 2,
+        name: "read_file", phase: "start", argKeys: ["path", "limit"], summary: "Read file" }] });
       expect(wrapper.getState().messages[0]).toMatchObject({ phase: "end", status: newerHistory ? "error" : "ok" });
-      send({ type: "difference", afterSeq: 2, nonce: inner.cursor.nonce, maxSeq: 4, partial: false, events: [
-        { seq: 3, event: { kind: "bubble", answerId: "a3", text: "done" } },
-        { seq: 4, event: { kind: "tool", id: "tool", turnId: "t", phase: "end", status: "ok" } },
+      if (!newerHistory) expect(wrapper.getState().historyOmissions).toEqual(snapshot.omitted);
+      send({ type: "history", messages: [
+        { kind: "tool", id: "tool", turnId: "t", seq: 4, name: "read_file", argKeys: ["path", "limit"],
+          summary: "Read file", phase: "end", status: "ok" },
+        { id: "a3", role: "agent", text: "done", seq: 3 },
       ] });
       const expected = wrapper.getState().messages;
       expect(expected.map((row) => row.id)).toEqual(["tool", "a3"]);
       expect(expected[0]).toMatchObject(newerHistory
         ? { name: "new name", argKeys: ["new"], summary: "New outcome", phase: "end", status: "error" }
         : { name: "read_file", argKeys: ["path", "limit"], summary: "Read file", phase: "end", status: "ok" });
+      expect(wrapper.getState().historyOmissions).toEqual([]);
       send(snapshot); send(snapshot);
       expect(wrapper.getState().messages).toEqual(expected);
       expect(inner.cursor.last).toBe(4);
-      expect(inner.client.getDifference).toHaveBeenCalledTimes(2);
+      expect(inner.client.getDifference).not.toHaveBeenCalled();
     } finally { wrapper.close(); }
   });
 
@@ -100,57 +102,58 @@ describe("#342 history row authority", () => {
     } finally { wrapper.close(); }
   });
 
-  it.each([98, 99, 100])("recovers an incomplete first snapshot at %i after live99 in journal order", (highWaterSeq) => {
+  it.each([98, 99, 100])("bounds recovery to the retained cursor for an incomplete snapshot at %i after live99", (highWaterSeq) => {
     const { wrapper, inner, send } = setup();
     try {
       send({ type: "agent_message", id: "a99", text: "live", seq: 99 });
       const snapshot: InboundMessage = { type: "history", highWaterSeq, snapshotComplete: false,
         messages: [{ id: `a${highWaterSeq}`, role: "agent", text: "snapshot", seq: highWaterSeq }] };
       send(snapshot); send(snapshot);
-      expect(inner.cursor.afterSeq).toBe(0);
-      const maxSeq = Math.max(99, highWaterSeq);
-      send({ type: "difference", afterSeq: 0, nonce: inner.cursor.nonce, maxSeq, partial: false,
-        events: Array.from({ length: maxSeq }, (_, i) => ({ seq: i + 1,
-          event: { kind: "bubble", answerId: `a${i + 1}`, text: `${i + 1}` } })) });
+      if (highWaterSeq > 99) {
+        expect(inner.cursor.afterSeq).toBe(99);
+        send({ type: "difference", afterSeq: 99, nonce: inner.cursor.nonce, maxSeq: 100, partial: false,
+          events: [{ seq: 100, event: { kind: "bubble", answerId: "a100", text: "100" } }] });
+      }
       const expected = wrapper.getState().messages;
-      expect(expected.map((m) => m.id)).toEqual(Array.from({ length: maxSeq }, (_, i) => `a${i + 1}`));
-      expect(expected[98].text).toBe("live");
+      expect(expected.map((m) => m.id)).toEqual(highWaterSeq === 99 ? ["a99"] : highWaterSeq === 98 ? ["a98", "a99"] : ["a99", "a100"]);
+      expect(expected.find(m => m.id === "a99")?.text).toBe("live");
       send(snapshot);
       expect(wrapper.getState().messages).toEqual(expected);
-      expect(inner.cursor.last).toBe(maxSeq);
-      expect(inner.client.getDifference).toHaveBeenCalledTimes(1);
+      expect(inner.cursor.last).toBe(Math.max(99, highWaterSeq));
+      expect(inner.client.getDifference.mock.calls.map(([floor]) => floor)).toEqual(highWaterSeq > 99 ? [99] : []);
     } finally { wrapper.close(); }
   });
 
-  it("restarts an existing live-seeded catch-up at zero for the first incomplete snapshot", () => {
+  it("keeps an existing live-seeded catch-up and its nonce for the first incomplete snapshot", () => {
     const { wrapper, inner, send } = setup();
     try {
       send({ type: "agent_message", id: "a99", text: "99", seq: 99 });
       send({ type: "agent_message", id: "a101", text: "101", seq: 101 });
       const oldNonce = inner.cursor.nonce;
       send({ type: "history", highWaterSeq: 99, snapshotComplete: false, messages: [] });
-      expect(inner.client.getDifference.mock.calls.map(([afterSeq]) => afterSeq)).toEqual([99, 0]);
-      send({ type: "difference", afterSeq: 99, nonce: oldNonce, maxSeq: 101, partial: false, events: [] });
-      expect(inner.cursor.afterSeq).toBe(0);
-      send({ type: "difference", afterSeq: 0, nonce: inner.cursor.nonce, maxSeq: 100, partial: false,
-        events: Array.from({ length: 100 }, (_, i) => ({ seq: i + 1,
-          event: { kind: "bubble", answerId: `a${i + 1}`, text: `${i + 1}` } })) });
-      expect(wrapper.getState().messages.map((m) => m.id)).toEqual(Array.from({ length: 101 }, (_, i) => `a${i + 1}`));
+      expect(inner.client.getDifference.mock.calls.map(([afterSeq]) => afterSeq)).toEqual([99]);
+      expect(inner.cursor.nonce).toBe(oldNonce);
+      send({ type: "difference", afterSeq: 0, nonce: "stale", maxSeq: 101, partial: false, events: [] });
+      expect(inner.cursor.afterSeq).toBe(99);
+      send({ type: "difference", afterSeq: 99, nonce: oldNonce, maxSeq: 100, partial: false,
+        events: [{ seq: 100, event: { kind: "bubble", answerId: "a100", text: "100" } }] });
+      expect(wrapper.getState().messages.map((m) => m.id)).toEqual(["a99", "a100", "a101"]);
       expect(inner.cursor.last).toBe(101);
     } finally { wrapper.close(); }
   });
 
-  it("keeps cold recovery order through paging and a higher snapshot received between pages", () => {
+  it("keeps retained-gap order through paging and a higher snapshot received between pages", () => {
     const { wrapper, inner, send } = setup();
     const reply = (afterSeq: number, maxSeq: number, partial: boolean) => send({ type: "difference",
       afterSeq, nonce: inner.cursor.nonce, maxSeq, partial,
       events: Array.from({ length: maxSeq - afterSeq }, (_, i) => ({ seq: afterSeq + i + 1,
         event: { kind: "bubble", answerId: `a${afterSeq + i + 1}`, text: `${afterSeq + i + 1}` } })) });
     try {
+      send({ type: "history", highWaterSeq: 0, messages: [] });
       send({ type: "agent_message", id: "a99", text: "99", seq: 99 });
       send({ type: "history", highWaterSeq: 100, snapshotComplete: false, messages: [] });
       reply(0, 50, true);
-      expect(wrapper.getState().messages.map((m) => m.id)).toEqual([...Array.from({ length: 50 }, (_, i) => `a${i + 1}`), "a99"]);
+      expect(wrapper.getState().messages.map((m) => m.id)).toEqual(Array.from({ length: 50 }, (_, i) => `a${i + 1}`));
       send({ type: "history", highWaterSeq: 102, messages: [{ id: "a102", role: "agent", text: "102", seq: 102 }] });
       reply(50, 100, false);
       expect(inner.cursor.afterSeq).toBe(100);
@@ -160,9 +163,10 @@ describe("#342 history row authority", () => {
     } finally { wrapper.close(); }
   });
 
-  it("uses canonical seal order during cold recovery while retaining newer live text", () => {
+  it("uses canonical seal order during retained-gap recovery while retaining newer live text", () => {
     const { wrapper, inner, send } = setup();
     try {
+      send({ type: "history", highWaterSeq: 0, messages: [] });
       send({ type: "agent_message", id: "A", text: "new A", turnId: "t", seq: 4 });
       send({ type: "history", highWaterSeq: 4, snapshotComplete: false, messages: [] });
       send({ type: "difference", afterSeq: 0, nonce: inner.cursor.nonce, maxSeq: 4, partial: false, events: [
@@ -203,11 +207,12 @@ describe("#342 history row authority", () => {
     } finally { wrapper.close(); }
   });
 
-  it("retains partially reconstructed cold order across timeout and reconnect", () => {
+  it("retains partially reconstructed gap order across timeout and reconnect", () => {
     vi.useFakeTimers();
     const { wrapper, inner, send } = setup();
     try {
-      send({ type: "agent_message", id: "a4", text: "4", seq: 4 });
+      send({ type: "history", highWaterSeq: 0, messages: [] });
+      send({ type: "history", messages: [{ id: "a4", role: "agent", text: "4", seq: 4 }] });
       send({ type: "history", highWaterSeq: 5, snapshotComplete: false, messages: [] });
       send({ type: "difference", afterSeq: 0, nonce: inner.cursor.nonce, maxSeq: 2, partial: true,
         events: [1, 2].map((seq) => ({ seq, event: { kind: "bubble", answerId: `a${seq}`, text: `${seq}` } })) });
@@ -342,12 +347,13 @@ describe("#342 history row authority", () => {
     } finally { wrapper.close(); }
   });
 
-  it("starts an incomplete cold snapshot at zero and keeps recreated state unseeded", () => {
+  it("seeds an incomplete cold snapshot at its high-water and keeps recreated state unseeded", () => {
     const { wrapper, inner, send } = setup();
     try {
       send({ type: "history", highWaterSeq: 9, snapshotComplete: false, messages: [{ id: "tail", role: "agent", text: "tail", seq: 9 }] });
-      expect(inner.cursor.afterSeq).toBe(0);
-      expect(wrapper.getState().messages).toEqual([]);
+      expect(inner.cursor).toMatchObject({ state: "synced", last: 9 });
+      expect(inner.client.getDifference).not.toHaveBeenCalled();
+      expect(wrapper.getState().messages).toMatchObject([{ id: "tail", text: "tail" }]);
       const fresh = setup();
       try {
         expect(fresh.inner.cursor.state).toBe("unseeded");

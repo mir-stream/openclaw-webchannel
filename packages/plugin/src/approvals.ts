@@ -646,9 +646,9 @@ function isExecApprovalsEnabled(cfg: OpenClawConfig, accountId?: string | null):
  * (mirrors Discord's exec-approvals.ts):
  *   1. channels.webchannel.execApprovals.approvers (typed array of peer ids)
  *   2. commands.ownerAllowFrom (global fallback)
- * Explicit approvers are literal peer ids (trimmed). The global owner fallback
- * follows command-gate.ts: bare ids apply here, `webchannel:` is stripped, and
- * other channel prefixes are excluded. Peer identity remains case-sensitive;
+ * Explicit approvers strip an optional `webchannel:` prefix; other colon-bearing
+ * peer ids remain literal. The global owner fallback follows command-gate.ts:
+ * bare ids apply here and other channel prefixes are excluded. Peer identity remains case-sensitive;
  * `*` keeps its account-scoped meaning. resolveApprovalApprovers also dedupes.
  */
 export function getWebChannelExecApprovalApprovers(params: {
@@ -669,7 +669,7 @@ export function getWebChannelExecApprovalApprovers(params: {
       // peer ids, so drop them (schema permits numbers only for cross-channel
       // config reuse like Discord/Telegram user ids).
       const s = typeof value === "string" ? value.trim() : "";
-      if (!useExplicit) {
+      if (!useExplicit || /^webchannel\s*:/i.test(s)) {
         const sep = s.indexOf(":");
         if (sep > 0) {
           if (s.slice(0, sep).trim().toLowerCase() !== WEBCHANNEL_ID) return undefined;

@@ -1,4 +1,5 @@
 import type { RequestState } from "../../client/src/durable-view-reducer.js";
+import type { HistoryOmission } from "../../client/src/types.js";
 import { ANON_PEER_ID } from "./auth.js";
 import type { CommandCatalogEntry } from "./commands-catalog.js";
 // #244 half B: the `difference` frame carries RAW journal events for the client
@@ -407,7 +408,7 @@ export type InboundWsMessage =
   | { type: "get_difference"; afterSeq: number; nonce: string }
   | { type: "load_commands" };
 
-export type OutboundWsMessage =
+export type OutboundWsMessage = { epoch?: string } & (
   | {
       type: "agent_message";
       text: string;
@@ -614,6 +615,7 @@ export type OutboundWsMessage =
   | {
       type: "history";
       messages: HistoryMessage[];
+      omitted?: HistoryOmission[];
       /**
        * #244 half A (doc §16.2-6): the conversation's authoritative high-water
        * `seq` at snapshot time — the journal's current `MAX(seq)` for this
@@ -786,7 +788,7 @@ export type OutboundWsMessage =
       events: Array<{ seq: number; event: DurableEvent }>;
       partial: boolean;
       maxSeq: number;
-    };
+    });
 
 /**
  * #356 — the body of a `difference` frame, minus its `type`. Named because three
@@ -795,6 +797,7 @@ export type OutboundWsMessage =
  * already grown to five arguments.
  */
 export type DifferenceReply = {
+  epoch?: string;
   /** The `get_difference.afterSeq` this answers, echoed verbatim. */
   afterSeq: number;
   /** The `get_difference.nonce` this answers, echoed verbatim. */

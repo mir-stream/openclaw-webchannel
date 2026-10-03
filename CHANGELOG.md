@@ -22,7 +22,55 @@
   Encrypted frames and protocol version 7 are unchanged. AAD direction binding
   remains tracked in #436, and client replay/freshness in #415 E4.
 
+### Breaking (unreleased wire protocol v7)
+
+- **Journal identity and bounded cold synchronization (#413/#414).** Protocol
+  stays **7**, alongside scoped stop, history-page correlation and typing
+  keepalive. Deploy client and plugin together. `epoch` now accompanies
+  snapshots, differences and live frames/ACKs. A changed epoch discards the
+  prior view/cursor/version fences before adopting server IDs that may repeat.
+  Normal restarts preserve the epoch; existing journals gain one without
+  rewriting rows. Renew it when restoring a backup; see
+  [the upgrade and restore procedure](docs/GAP_SYNC.md).
+- **Incomplete cold snapshots seed their high-water.** `history.omitted`
+  carries the byte-omitted row identities and the client exposes
+  `state.historyOmissions`. Old trimmed rows remain pageable. One unsendable
+  row no longer triggers full-journal replay or holds later live frames.
+  Warm differences and the existing individually oversized-row skip policy
+  remain in force; this does not implement #325 body chunking or #299 retention.
+
 ### Changed
+
+- Browser receive doors now reject replayed envelopes, timestamps outside ±10 minutes,
+  and mismatched tenant/account/peer routing (#415 E4). The 16,384-ID cache survives
+  reconnects and refuses new frames at capacity until IDs expire; a new client
+  instance retains only the timestamp defense. Direction-bound AAD/key separation
+  remains outside this change (see #410). Reference/demo X25519 private keys are
+  non-extractable; their public halves still export for bootstrap (#415 E8).
+
+- The inbound reply pipeline honors configured response prefixes and selected
+  model interpolation on answers; reasoning stays unprefixed. Unsupported
+  media-only final replies now settle as delivery errors rather than silently
+  succeeding when the turn delivered no answer text; empty/text replies keep
+  their existing behavior (#415 C4/C7).
+
+- Enrollment continues after `slow_down`, increasing every subsequent poll interval
+  by five seconds per response. JWT verification rejects unsupported or malformed
+  `crit` headers before resolving signing keys (#415 E6/E7).
+
+- Historical Phase A crypto wrappers are explicitly test-only helpers; their
+  conformance tests remain intact. Production no longer allocates or injects
+  the unwritten legacy cancellation fallback. Current cancellation authority
+  remains the SQLite stop transaction (#415 dead-code findings).
+
+- The reference app fences replaced login/connect attempts and unsubscribes
+  retired clients. Terminal recovery uses `errorCause`; transient registration
+  remains connecting/reconnecting. The minimal consumer filters approvals by
+  `actionable`, excluding inert historical cards (#415 F4/F5).
+
+- Explicit exec approvers accept an optional `webchannel:` prefix, including
+  account-scoped wildcards. Peer case and explicit-list precedence are preserved;
+  an empty prefixed entry cannot widen to owner fallback (#415 D6).
 
 - **Case-distinct JWT peers now have distinct core sessions (#372).** Raw peer
   IDs such as `Alice` and `alice` are encoded before SDK session normalization;

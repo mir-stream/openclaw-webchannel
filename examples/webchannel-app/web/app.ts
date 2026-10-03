@@ -31,18 +31,14 @@ export type AppUiState =
   | "connecting"
   | "connected"
   | "reconnecting"
-  | "waiting-for-agent"
   | "error";
 
 /**
  * Map a raw WebChannelState to the app's UI intent.
  *
- * NOTE (demo-grade contract): the wrapper FLATTENS the underlying error into
- * `state.error` (it surfaces `err.message`, which is derived from `err.name`), so
- * we string-match it. This is a demo-grade convention, not a stable typed API —
- * a production app should push for a typed error code upstream. The no-agent case
- * is the register request-reply timeout ("[nats-client] request timeout"); an
- * authoritative NATS auth rejection surfaces as "…unauthorized/authorization".
+ * The public SDK exposes connecting/reconnecting while registration retries.
+ * It does not identify an absent agent separately from other transient failures;
+ * only a typed terminal errorCause can select terminal recovery guidance.
  */
 export function classify(state: WebChannelState): AppUiState {
   switch (state.status) {
@@ -52,11 +48,8 @@ export function classify(state: WebChannelState): AppUiState {
       return "connecting";
     case "reconnecting":
       return "reconnecting";
-    case "error": {
-      const msg = (state.error ?? "").toLowerCase();
-      if (msg.includes("request timeout")) return "waiting-for-agent";
+    case "error":
       return "error";
-    }
     default:
       return "error";
   }
@@ -77,9 +70,10 @@ function b64url(buf: ArrayBuffer): string {
   return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-async function postJson<T>(path: string, body: unknown, token?: string): Promise<T> {
+async function postJson<T>(path: string, body: unknown, token?: string, signal?: AbortSignal): Promise<T> {
   const res = await fetch(path, {
     method: "POST",
+    signal,
     headers: {
       "content-type": "application/json",
       ...(token ? { authorization: `Bearer ${token}` } : {}),
@@ -99,7 +93,9 @@ async function postJson<T>(path: string, body: unknown, token?: string): Promise
 export async function connectLane(
   session: LoginResponse,
   onState: (state: WebChannelState) => void,
-): Promise<WebChannelNATSClient> {
+  signal?: AbortSignal,
+): Promise<{ client: WebChannelNATSClient; close: () => void }> {
+  signal?.throwIfAborted();
   // Device keys. X25519 private key is NON-EXTRACTABLE (`false`); the public key
   // is still exportable (WebCrypto always keeps public halves extractable).
   const x25519 = (await crypto.subtle.generateKey({ name: "X25519" }, false, [
@@ -107,6 +103,7 @@ export async function connectLane(
   ])) as CryptoKeyPair;
   const deviceX25519PublicKey = b64url(await crypto.subtle.exportKey("raw", x25519.publicKey));
   const pop = await generateDevicePopKeyPair(); // Ed25519 { privateKey, publicJwk }
+  signal?.throwIfAborted();
 
   const boot = await postJson<BootstrapResponse>(
     "/bootstrap",
@@ -116,8 +113,11 @@ export async function connectLane(
       devicePopPublicKey: pop.publicJwk.x,
     },
     session.token,
+    signal,
   );
-  const creds = await postJson<NatsUserResponse>("/nats-user", {}, session.token);
+  signal?.throwIfAborted();
+  const creds = await postJson<NatsUserResponse>("/nats-user", {}, session.token, signal);
+  signal?.throwIfAborted();
   // F2: the register hop unwraps the delivered K against this SaaS-pinned key.
   if (!boot.agentPublicKey) {
     throw new Error("bootstrap response missing agentPublicKey (register-hop requires it)");
@@ -139,10 +139,26 @@ export async function connectLane(
       pinnedAgentPublicKey: boot.agentPublicKey,
     },
   });
-  client.subscribe(onState);
-  onState(client.getState());
-  client.connect();
-  return client;
+  let closed = false;
+  let unsubscribe = () => {};
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    signal?.removeEventListener("abort", close);
+    unsubscribe();
+    client.close();
+  };
+  signal?.addEventListener("abort", close, { once: true });
+  try {
+    unsubscribe = client.subscribe(state => { if (!closed) onState(state); });
+    if (closed) unsubscribe();
+    else onState(client.getState());
+    if (!closed) client.connect();
+    return { client, close };
+  } catch (error) {
+    close();
+    throw error;
+  }
 }
 
 // The DOM wiring only runs in a browser. In Node (smoke test) the module import
@@ -162,23 +178,41 @@ async function mountBrowserUi(): Promise<void> {
 
   let client: WebChannelNATSClient | null = null;
   let session: LoginResponse | null = null;
+  let lane: Awaited<ReturnType<typeof connectLane>> | null = null;
+  let generation = 0;
+  let request: AbortController | undefined;
+
+  function retire(): void {
+    generation++;
+    request?.abort();
+    request = undefined;
+    lane?.close();
+    lane = null;
+    client = null;
+  }
+  const current = (owner: number) => generation === owner;
 
   function render(state: WebChannelState): void {
     const ui = classify(state);
     statusEl.textContent = `status: ${state.status} → ${ui}`;
     bannerEl.replaceChildren();
-    if (ui === "waiting-for-agent") {
-      const retry = document.createElement("button");
-      retry.textContent = "Retry";
-      retry.onclick = () => void reconnect();
-      bannerEl.append(
-        Object.assign(document.createElement("span"), {
-          textContent: "⏳ Waiting for an agent — attach openclaw, then ",
-        }),
-        retry,
-      );
+    if (ui === "connecting" || ui === "reconnecting") {
+      bannerEl.textContent = "Connecting to the agent… retrying automatically.";
     } else if (ui === "error") {
-      bannerEl.textContent = `⚠ ${state.error ?? "connection error"}`;
+      const cause = state.errorCause;
+      const reauth = cause === "auth-expired" || cause === "auth-rejected" || cause === "secure-channel-failed";
+      bannerEl.textContent = cause === "protocol-mismatch"
+        ? "Upgrade the client and agent to matching versions."
+        : cause === "config" ? "Check the application's connection configuration."
+        : cause === "capacity" ? "This account is full. Contact the operator."
+        : reauth ? "Authentication needs to be renewed."
+        : `Connection failed: ${state.error ?? "unknown error"}`;
+      if (reauth || cause === "server" || cause === "unknown" || cause === undefined) {
+        const retry = document.createElement("button");
+        retry.textContent = reauth ? "Re-authenticate" : "Retry";
+        retry.onclick = () => void reconnect();
+        bannerEl.append(retry);
+      }
     }
     chatEl.replaceChildren(
       // ⚠️ NARROW ON `kind` — DO NOT MAP OVER `state.messages` AND READ
@@ -310,23 +344,43 @@ async function mountBrowserUi(): Promise<void> {
 
   async function reconnect(): Promise<void> {
     if (!session) return;
-    client?.close();
-    client = await connectLane(session, render);
+    retire();
+    const owner = generation;
+    request = new AbortController();
+    try {
+      const connected = await connectLane(session, state => {
+        if (current(owner)) render(state);
+      }, request.signal);
+      if (!current(owner)) { connected.close(); return; }
+      lane = connected;
+      client = connected.client;
+    } catch (error) {
+      if (!current(owner)) return;
+      render({ status: "error", connected: false, messages: [], approvals: [],
+        reasoning: [], toolActivity: [], agentProtocolVersion: null, agentPluginVersion: null,
+        error: (error as Error).message, errorCause: "unknown" });
+    }
   }
 
   loginForm.onsubmit = async (e) => {
     e.preventDefault();
+    retire();
+    session = null;
+    const owner = generation;
+    request = new AbortController();
     const fd = new FormData(loginForm);
     try {
-      session = await postJson<LoginResponse>("/login", {
+      const loggedIn = await postJson<LoginResponse>("/login", {
         username: String(fd.get("username") ?? ""),
         password: String(fd.get("password") ?? ""),
-      });
+      }, undefined, request.signal);
+      if (!current(owner)) return;
+      session = loggedIn;
       loginForm.style.display = "none";
       composer.style.display = "flex";
       await reconnect();
     } catch (err) {
-      statusEl.textContent = `login failed: ${(err as Error).message}`;
+      if (current(owner)) statusEl.textContent = `login failed: ${(err as Error).message}`;
     }
   };
 
@@ -334,7 +388,7 @@ async function mountBrowserUi(): Promise<void> {
     e.preventDefault();
     const text = input.value.trim();
     if (!text || !client) return;
-    client.send(text);
+    if (!client.send(text)) return;
     input.value = "";
   };
 }

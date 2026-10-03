@@ -46,6 +46,7 @@ export type {
   ConnectionStatus,
   WebChannelErrorCause,
   WebChannelState,
+  HistoryOmission,
   WebChannelOptions,
   Listener,
   CommandCatalogEntry,
