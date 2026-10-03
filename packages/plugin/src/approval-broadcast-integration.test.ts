@@ -79,8 +79,8 @@ import {
   serializeApprovalEnvelope,
   deserializeApprovalEnvelope,
   APPROVAL_KEY_INFO,
-} from "./approval-e2e-crypto.js";
-import type { ApprovalRequestBody } from "./approval-e2e-crypto.js";
+} from "./approval-e2e-crypto.test-harness.js";
+import type { ApprovalRequestBody } from "./approval-e2e-crypto.test-harness.js";
 import {
   generateKeyPair,
   deriveSharedSecret,
