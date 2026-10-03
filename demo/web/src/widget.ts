@@ -122,9 +122,9 @@ export async function createWidget(
     client = null;
     for (const message of previous?.getState().messages ?? []) {
       if (message.kind !== undefined || message.role !== "user") continue;
-      // A terminal auth failure already clears `pending`. No publish attempt
-      // on an owned receipt still proves that text never left this client.
-      const terminalHold = message.receiptKey && message.sendState === "failed"
+      // A terminal auth failure already clears `pending`. Only this client's own
+      // sends carry sendState; no publish attempt proves the text never left it.
+      const terminalHold = message.sendState === "failed"
         && message.sendFailure?.reason === "terminal" && message.sendFailure.lastAttemptAt === undefined;
       if (message.sendState === "queued" || terminalHold) {
         heldDrafts.set(crypto.randomUUID(), message.text);
