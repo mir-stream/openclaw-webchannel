@@ -354,8 +354,9 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // interpolations — the approval `id` (peer-supplied) and the error — are
   // `logSafe`-wrapped, so KNOWN_RAW is unchanged.
   // #442 adds one policy-receipt warning with one logSafe-wrapped error.
-  // #406 adds one SDK pairing warning with one logSafe-wrapped error.
-  "nats-account-runtime.ts": { statements: 24, interpolations: 39 },
+  // #406 adds two SDK pairing statements: a warning with one logSafe-wrapped
+  // error and a constant delivery Error. The raw interpolation baseline stays unchanged.
+  "nats-account-runtime.ts": { statements: 25, interpolations: 39 },
   "auth.ts": { statements: 16, interpolations: 5 },
   // #244 half B added the `Invalid get_difference` guard warn (one statement,
   // one `logSafe(peerId)` interpolation): 22→23 statements, 33→34 interpolations.
