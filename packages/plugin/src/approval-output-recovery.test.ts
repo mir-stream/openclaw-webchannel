@@ -27,6 +27,7 @@ const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
 const ACCOUNT = "Team-A";
 const PEER = "Raw.Peer+Case";
 const cleanup: Array<() => void> = [];
+const realTimers = { setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout };
 class ControlledTransport extends EventEmitter {
   connected = true;
   effectiveOutboundLimit = 1_000_000;
@@ -102,8 +103,11 @@ beforeEach(() => {
 });
 afterEach(() => {
   for (const fn of cleanup.splice(0).reverse()) fn();
-  vi.useRealTimers();
   vi.restoreAllMocks();
+  // Vitest 2 re-restores old spies, so timer hooks use scoped global stubs.
+  // Remove those stubs before uninstalling the fake clock they captured.
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
   expect(gatewayResolve).not.toHaveBeenCalled(); // Output recovery never re-resolves the approved action.
 });
 
@@ -295,7 +299,8 @@ describe("#381 production approval finalization with SQLite storage faults", () 
     const f = fixture();
     f.fault("approval");
     const entry = await f.deliver();
-    const scheduled = vi.spyOn(globalThis, "setTimeout");
+    const scheduled = vi.fn(globalThis.setTimeout);
+    vi.stubGlobal("setTimeout", scheduled);
     await f.finalize(entry);
     const callback = scheduled.mock.calls.at(-1)![0] as () => void;
     f.channel[close]();
@@ -425,7 +430,8 @@ describe("#381 production approval finalization with SQLite storage faults", () 
   it("processes at most the visible retry batch in one scheduled callback", async () => {
     const f = fixture();
     f.fault("approval");
-    const scheduled = vi.spyOn(globalThis, "setTimeout");
+    const scheduled = vi.fn(globalThis.setTimeout);
+    vi.stubGlobal("setTimeout", scheduled);
     for (let i = 0; i <= APPROVAL_OUTPUT_RETRY_BATCH; i++) await f.finalize(await f.deliver({ ...f.card, id: `batch-${i}` }));
     const callback = scheduled.mock.calls.at(-1)![0] as () => void;
     f.recover();
@@ -437,5 +443,14 @@ describe("#381 production approval finalization with SQLite storage faults", () 
     expect(f.journal.maxSeq(PEER)).toBe(APPROVAL_OUTPUT_RETRY_BATCH * 2);
     await vi.advanceTimersByTimeAsync(1_000);
     expect(f.channel.getApprovalOutputRecoveryStatus().pending).toBe(0);
+  });
+});
+
+describe("#423 real timers after approval output recovery cleanup", () => {
+  it.each([1, 2, 3])("runs a real timer after cleanup (%s)", async () => {
+    vi.useRealTimers();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(globalThis.setTimeout).toBe(realTimers.setTimeout);
+    expect(globalThis.clearTimeout).toBe(realTimers.clearTimeout);
   });
 });

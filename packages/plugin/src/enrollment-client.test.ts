@@ -105,6 +105,40 @@ describe("EnrollmentClient", () => {
   });
 
   describe("enroll() - first boot", () => {
+    it("#415 E6: increases every remaining poll interval after each HTTP 400 slow_down", async () => {
+      vi.useFakeTimers();
+      try {
+        const intervalClient = new EnrollmentClient(createTestOptions({ credentialPath, _minPollIntervalMs: 5000 }));
+        const started = Date.now();
+        const polls: number[] = [];
+        const outcomes = ["slow_down", "authorization_pending", "slow_down", "authorization_pending"];
+        mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({
+          device_code: "slow-device", user_code: "SLOW-1234",
+          verification_uri_complete: "https://saas.com/enroll", expires_in: 600, interval: 5,
+        }) });
+        mockFetch.mockImplementation(async () => {
+          polls.push(Date.now() - started);
+          const error = outcomes.shift();
+          return error
+            ? { ok: false, text: async () => JSON.stringify({ error }) }
+            : { ok: true, json: async () => ({
+                creds: { userJwt: "jwt", userSeed: "seed" }, peerId: "peer",
+                jwksUrl: "https://saas.com/.well-known/jwks.json",
+                bootstrapUrl: "https://saas.com/bootstrap", natsUrl: "wss://nats.saas.com",
+              }) };
+        });
+        // Attach both handlers before advancing time: a regression must report
+        // the rejected enrollment, not leave an unhandled promise rejection.
+        const result = intervalClient.enroll().then(value => ({ value }), error => ({ error }));
+        await vi.advanceTimersByTimeAsync(55_000);
+        expect(await result).toMatchObject({ value: { peerId: "peer" } });
+        expect(polls).toEqual([5_000, 15_000, 25_000, 40_000, 55_000]);
+        expect(existsSync(credentialPath)).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("25: accepts a final poll that reaches the server just after expiresAt", async () => {
       let repositoryNow = 1_001;
       const repository = new MemoryEnrollmentRepository({ autoSweep: false, retentionMs: 50, clock: () => repositoryNow });
