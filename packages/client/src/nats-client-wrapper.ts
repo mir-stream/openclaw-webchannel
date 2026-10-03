@@ -1094,6 +1094,12 @@ export class WebChannelNATSClient {
 
     this.client = new WebChannelNatsClient(this.natsOptions);
 
+    // Epoch validity must be decided before the low-level client consumes a
+    // result frame from its replay ledger/tracker. The wrapper remains the one
+    // journal-epoch authority; the low-level gate only enforces its verdict at
+    // that earlier side-effect boundary.
+    this.client.setInboundMessageGate((msg: InboundMessage) => this.prepareJournalEpoch(msg));
+
     // Wire up message listener
     this.client.onMessage((msg: InboundMessage) => this.handleMessage(msg));
 
@@ -3384,6 +3390,11 @@ export class WebChannelNATSClient {
   private rowVersions = new DurableRowVersions();
   private journalEpoch: string | undefined;
   private readonly retiredJournalEpochs = new Set<string>();
+  private readonly preparedEpochActions = new WeakMap<InboundMessage, {
+    action: "current" | "recover";
+    lifecycle: number;
+    epoch: string | undefined;
+  }>();
   private frameSeq: number | undefined;
   private observedHistoryHighWater = 0;
   private pendingHistorySnapshots: InboundMessage[] = [];
@@ -3775,9 +3786,22 @@ export class WebChannelNATSClient {
 
     // Keep unpublished/unconfirmed local sends and their receipt linkage. A new
     // epoch's ACK may be the very first frame, before its snapshot/broadcast.
-    const pendingReceipts = new Set(this.randomIdToReceiptKey.values());
+    const pendingMappings = [...this.randomIdToReceiptKey].filter(([randomId]) =>
+      this.client.hasPendingRandomId(randomId));
+    this.randomIdToReceiptKey.clear();
+    for (const [randomId, receiptKey] of pendingMappings) {
+      this.randomIdToReceiptKey.set(randomId, receiptKey);
+    }
+    const pendingReceipts = new Set(pendingMappings.map(([, receiptKey]) => receiptKey));
     const messages = this.state.messages.filter(row => row.kind === undefined && row.role === "user"
-      && (row.pending || (row.receiptKey !== undefined && pendingReceipts.has(row.receiptKey))));
+      && (row.pending || (row.receiptKey !== undefined && pendingReceipts.has(row.receiptKey))))
+      .map(row => row.pending
+        ? row
+        // A durable echo may have re-keyed this still-unacknowledged optimistic
+        // row onto an old-epoch server ID, including through an uncorrelated
+        // history page that did not advance row versions. Restore a local
+        // identity before the new epoch hydrates IDs that may be reused.
+        : { ...row, id: this.mintLocalBubbleId("u") });
     const wires = new Set(messages.flatMap(row => row.wireId ? [row.wireId] : []));
     const lifecycle = ++this.wrapperLifecycleGeneration;
     this.resetCursorForConnection();
@@ -3805,8 +3829,28 @@ export class WebChannelNATSClient {
     return msg.type === "history" && msg.highWaterSeq !== undefined ? "current" : "recover";
   }
 
+  /** Run once at the low-level result boundary, before ledger/tracker effects. */
+  private prepareJournalEpoch(msg: InboundMessage): boolean {
+    const action = this.observeJournalEpoch(msg);
+    if (action === "ignore") return false;
+    this.preparedEpochActions.set(msg, {
+      action,
+      lifecycle: this.wrapperLifecycleGeneration,
+      epoch: this.journalEpoch,
+    });
+    return true;
+  }
+
   private handleMessage(msg: InboundMessage): void {
-    const epochAction = this.observeJournalEpoch(msg);
+    const prepared = this.preparedEpochActions.get(msg);
+    if (prepared !== undefined) this.preparedEpochActions.delete(msg);
+    // Tracker fanout runs between prepare and delivery. A subscriber can close,
+    // reconnect or synchronously deliver another epoch there; keep the already
+    // applied low-level receipt result, but do not fold this frame's content into
+    // the replacement wrapper lifecycle.
+    if (prepared !== undefined && (prepared.lifecycle !== this.wrapperLifecycleGeneration
+      || prepared.epoch !== this.journalEpoch)) return;
+    const epochAction = prepared?.action ?? this.observeJournalEpoch(msg);
     if (epochAction === "ignore") return;
     const epochLifecycle = this.wrapperLifecycleGeneration;
     try {
@@ -4832,8 +4876,10 @@ export class WebChannelNATSClient {
   /** Merge an exact origin echo with an already-hydrated server row atomically. */
   private adoptUserBubbleByRandomId(randomId: string, serverId: string): void {
     const receiptKey = this.randomIdToReceiptKey.get(randomId);
-    // Consume the linkage — terminal for this random_id (mirrors adoptCommittedIds).
-    this.randomIdToReceiptKey.delete(randomId);
+    // A durable broadcast/history row can beat its ACK. Keep the exact linkage
+    // while the low-level queue/replay ledger still owns this send, so an epoch
+    // reset can retain it and a later new-epoch ACK can adopt its new identity.
+    if (!this.client.hasPendingRandomId(randomId)) this.randomIdToReceiptKey.delete(randomId);
     if (receiptKey === undefined) return;
     const own = this.state.messages.find((m): m is ChatBubble => m.kind === undefined && m.role === "user" && m.receiptKey === receiptKey);
     if (own === undefined) return;

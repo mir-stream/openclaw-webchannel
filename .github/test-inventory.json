@@ -46,7 +46,7 @@
     "packages/client/src/nats-client-wrapper-history-convergence.test.ts": 26,
     "packages/client/src/nats-client-wrapper-history-page-correlation.test.ts": 7,
     "packages/client/src/nats-client-wrapper-hydration.test.ts": 32,
-    "packages/client/src/nats-client-wrapper-journal-epoch.test.ts": 6,
+    "packages/client/src/nats-client-wrapper-journal-epoch.test.ts": 8,
     "packages/client/src/nats-client-wrapper-sendstate.test.ts": 83,
     "packages/client/src/nats-client-wrapper-turn-active.test.ts": 38,
     "packages/client/src/nats-client-wrapper.test.ts": 119,
