@@ -171,3 +171,18 @@ cannot replace credentials held by a running transport.
 6. Restart the gateway only after enrollment completes.
 
 Until the restart, an already-running transport continues using its old in-memory credentials; online hot-swap is not supported.
+
+
+## Bootstrap JWT lifetime (#447)
+
+The plugin requires finite `iat` and `exp`, with `0 < exp - iat <= 3600` seconds.
+Issued-at may not be later than the verification clock plus configured skew;
+expiry retains the existing clock-skew check. Skew never increases the one-hour
+lifetime cap. Tokens without `iat` or with a longer lifetime are rejected.
+
+Before this change, the demo SaaS, both reference servers and the example app
+all used `buildBootstrapClaims`' 300-second default. The public builder's optional
+TTL and the direct signer had no upper bound; both now enforce the same lifetime
+contract. No first-party deployed bootstrap route requests a longer lifetime.
+This applies to RS256 browser bootstrap tokens. NATS operator/account/user
+credentials are separate relay credentials with separate issuance policies.

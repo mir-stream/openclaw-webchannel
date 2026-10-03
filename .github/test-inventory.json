@@ -123,6 +123,7 @@
     "packages/plugin/src/journal-history.test.ts": 67,
     "packages/plugin/src/jwks.test.ts": 24,
     "packages/plugin/src/jwt-cnf.test.ts": 9,
+    "packages/plugin/src/jwt-lifetime.test.ts": 22,
     "packages/plugin/src/jwt-middleware.test.ts": 20,
     "packages/plugin/src/jwt.test.ts": 58,
     "packages/plugin/src/late-join-decryptor.test.ts": 27,
