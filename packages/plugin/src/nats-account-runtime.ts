@@ -22,6 +22,7 @@ import { ConversationKeyStore } from "./conversation-key-store.js";
 import { openDeliveryJournal } from "./delivery-journal.js";
 import type { DeliveryJournal } from "./delivery-journal.js";
 import { tupleStoragePaths } from "./storage-paths.js";
+import { resolveDmPolicy, validateDmConfig } from "./dm-allowlist.js";
 import { ensureStorageIssuer, StorageIssuerError } from "./storage-issuer.js";
 import { createCapacityDiagnostics } from "./capacity-diagnostics.js";
 import { resolveEncryptionPolicy } from "./encryption-policy.js";
@@ -53,7 +54,7 @@ import { getProcessIngressOutcomeStore } from "./ingress-outcome.js";
 import { BoundedOverflowResolver, type OverflowResolutionRequest } from "./inbound-overflow-resolver.js";
 import { createIngressDebounceCallbacks } from "./ingress-debounce-callbacks.js";
 import { createIngressPolicyGate } from "./ingress-policy.js";
-import { resolveDmAdmission } from "./dm-allowlist.js";
+import { createDmIngressPolicy } from "./dm-allowlist.js";
 import { InboundPressureLogger } from "./inbound-pressure-log.js";
 import { isControlLaneMessage, shouldDropBufferedInputOnStop } from "./control-lane.js";
 import { resolveCommandGate } from "./command-gate.js";
@@ -425,7 +426,16 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       const storageScope = Object.freeze({ tenant, accountId });
       const accountNatsCfg = account.nats as WebchannelNatsConfig | undefined;
       const accountEncryption = account.encryption as WebchannelEncryptionConfig | undefined;
-      const accountDmSecurity = account.dmSecurity as string | undefined;
+      try {
+        validateDmConfig(account);
+      } catch (error) {
+        const detail = `Invalid DM policy: ${error instanceof Error ? error.message : String(error)}. Run openclaw doctor.`;
+        reportPermanent(accountId, "dm-policy-config-invalid", detail);
+        setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: detail }));
+        await waitForAbort(ctx.abortSignal);
+        return undefined;
+      }
+      const accountDmPolicy = resolveDmPolicy(account);
       const admission = "register-hop" as const;
 
       // Resolve the effective source before reading enrolled material. In
@@ -545,8 +555,8 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             admission: "register-hop",
             audience: accountId,
             buildError,
-            ...(account.dmSecurity !== undefined
-              ? { dmSecurity: String(account.dmSecurity) }
+            ...((account.dmPolicy ?? account.dmSecurity) !== undefined
+              ? { dmPolicy: String(account.dmPolicy ?? account.dmSecurity) }
               : {}),
           }).line;
         } catch { /* the stable permanent event below remains available */ }
@@ -1218,9 +1228,18 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           return operation;
         },
       });
+      const dmIngressPolicy = createDmIngressPolicy({
+        accountId,
+        config: account,
+        isActive: () => runtimeActive,
+        sendPairingReply: async (peerId, text) => {
+          if (!channel.sendText(peerId, text, nextMessageId())) throw new Error("webchannel: pairing challenge delivery failed");
+        },
+        warn: (error) => api.logger?.warn?.(`webchannel: ingress pairing failed: ${logSafe(error)}`),
+      });
       const admitInbound = createIngressPolicyGate({
         journal: deliveryJournal,
-        isAllowed: (peerId) => resolveDmAdmission(peerId, account).allowed,
+        ...dmIngressPolicy,
         sendRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids, "policy-denied"),
         sendAck: (peerId, ids, committed, cancelled, unaccepted) => channel.sendAck(peerId, ids, committed, cancelled, unaccepted),
         warn: (error) => api.logger?.warn?.(`webchannel: ingress policy receipt failed: ${logSafe(error)}`),
@@ -1514,7 +1533,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         ...(effIssuer !== undefined ? { issuer: effIssuer } : {}),
         ...(effAudience !== undefined ? { audience: effAudience } : {}),
         ...(jwks !== undefined ? { jwks } : {}),
-        ...(accountDmSecurity !== undefined ? { dmSecurity: accountDmSecurity } : {}),
+        ...(accountDmPolicy !== undefined ? { dmPolicy: accountDmPolicy } : {}),
       });
       if (readiness.verdict === "FAIL") log("error", readiness.line);
       else if (readiness.verdict === "WARN") log("warn", readiness.line);

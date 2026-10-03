@@ -287,8 +287,9 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // makes the emitted record undecodable, so the shape is the fix and there is
   // no baseline entry to add.
   // Stop ownership adds one constant pre-context retirement error.
+  // #406 adds one constant pairing-challenge delivery error (no interpolation).
   // #415 C7 adds one media-delivery warning with two logSafe identities.
-  "inbound.ts": { statements: 11, interpolations: 18 },
+  "inbound.ts": { statements: 12, interpolations: 18 },
   // #239 half 3 adds the two delivery-journal warnings (13→15) and their six
   // interpolations (7→13): `peerId` twice, plus `reason`/`action` on the gap
   // line and `journalable.length`/`journalFailureDiagnostic(error)` on the
@@ -353,7 +354,9 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   // interpolations — the approval `id` (peer-supplied) and the error — are
   // `logSafe`-wrapped, so KNOWN_RAW is unchanged.
   // #442 adds one policy-receipt warning with one logSafe-wrapped error.
-  "nats-account-runtime.ts": { statements: 23, interpolations: 38 },
+  // #406 adds two SDK pairing statements: a warning with one logSafe-wrapped
+  // error and a constant delivery Error. The raw interpolation baseline stays unchanged.
+  "nats-account-runtime.ts": { statements: 25, interpolations: 39 },
   "auth.ts": { statements: 16, interpolations: 5 },
   // #244 half B added the `Invalid get_difference` guard warn (one statement,
   // one `logSafe(peerId)` interpolation): 22→23 statements, 33→34 interpolations.

@@ -6,6 +6,7 @@ import type { CommittedUserMessage } from "./ingress-result-chunks.js";
 export function createIngressPolicyGate(deps: {
   journal: DeliveryJournal;
   isAllowed(peerId: string): boolean;
+  onFreshDenied?(peerId: string): void;
   sendRejected(peerId: string, ids: string[]): boolean;
   sendAck(peerId: string, ids: string[], committed?: CommittedUserMessage[], cancelled?: string[], unaccepted?: string[]): boolean;
   warn(error: unknown): void;
@@ -48,6 +49,7 @@ export function createIngressPolicyGate(deps: {
       if (!deps.sendRejected(item.peerId, [identity.wireId])) {
         warn(new Error("webchannel: ingress policy rejection delivery failed"));
       }
+      deps.onFreshDenied?.(item.peerId);
     } catch (error) {
       // Unknown acceptance cannot be truthfully classified as a fresh refusal.
       // Withhold both admission and receipt so a later retry can resolve it.

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### DM policy alignment (#406)
+
+- `dmPolicy` now accepts the SDK enum `pairing | allowlist | open | disabled`.
+  The default is still **open** (TD-1), but **open requires an explicitly
+  configured `allowFrom: ["*"]`**. Allowlist requires a nonempty list. The
+  shipped manifest validates effective inherited account combinations and
+  startup independently rejects invalid configurations. Existing open/unset
+  configurations without the wildcard need an explicit config update.
+- Disabled rejects every sender, including allowlisted peers. Wildcards and
+  `webchannel:` prefixes work without lowercasing peer IDs. Pairing uses SDK
+  pending requests and approved account-scoped entries; allowlist does not
+  inherit pairing approvals. Core audit and startup report the effective policy.
+- `dmSecurity` remains a deprecated alias. Its legacy open spellings normalize
+  to `open`; unknown values fail closed. Doctor gives migration steps to the
+  canonical field. New setup writes `dmPolicy` and the required wildcard,
+  preserving existing restrictions on re-enrollment. No wire version change.
+
 ### Breaking: NATS credential scope (#409, #410)
 
 - Release SaaS and plugin together in the next lockstep release. Newly enrolled

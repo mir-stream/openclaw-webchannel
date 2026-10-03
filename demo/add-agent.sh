@@ -82,7 +82,7 @@ cat > "$HOME_DIR/.openclaw/openclaw.json" <<JSON
             "jwksUrl": "$SAAS_URL/.well-known/jwks.json",
             "issuer": "https://saas.local/demo-issuer"
           } },
-          "dmSecurity": "allowlist",
+          "dmPolicy": "allowlist",
           "allowFrom": ["$UUID_ALICE", "$UUID_BOB", "$UUID_ADMIN"]
         }
       }

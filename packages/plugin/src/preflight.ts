@@ -13,7 +13,7 @@ import { assertSaasBaseUrl } from "./saas-authority.js";
  *     SERVED account reporting the EFFECTIVE (derived) trust facts — issuer,
  *     resolved JWKS key count, audience, admission, the ENFORCED dmScope
  *     (per-account-channel-peer — webchannel forces it, see `session-route.ts`),
- *     dmSecurity — or the precise failure. This is the higher-value gate: it runs
+ *     dmPolicy — or the precise failure. This is the higher-value gate: it runs
  *     on every boot and its JWKS-key-count line is the single most useful
  *     diagnostic (an empty/unreachable JWKS ⇒ no bootstrap JWT can ever verify).
  *     Implemented as the pure {@link formatAccountReadiness} below, called from
@@ -101,8 +101,8 @@ export type AccountReadinessInput = {
    * issuer/aud state alongside the reason.
    */
   buildError?: string;
-  /** `account.dmSecurity`. */
-  dmSecurity?: string;
+  /** `account.dmPolicy`. */
+  dmPolicy?: string;
 };
 
 export type AccountReadinessReport = { verdict: ReadinessVerdict; line: string };
@@ -131,7 +131,7 @@ export function formatAccountReadiness(
 ): AccountReadinessReport {
   const id = input.accountId;
   const tail =
-    ` · dmScope=${WEBCHANNEL_ENFORCED_DM_SCOPE_LABEL} · dmSecurity=${input.dmSecurity ?? '(unset)'}`;
+    ` · dmScope=${WEBCHANNEL_ENFORCED_DM_SCOPE_LABEL} · dmPolicy=${input.dmPolicy ?? 'open'}`;
 
   // ── Hard CONFIG fault: the verifier could not be built. Fail-closed — the
   //    account is skipped by the loop; here we just name the trust state so the

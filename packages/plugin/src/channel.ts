@@ -4,7 +4,10 @@ import {
 } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import type { ChannelDoctorAdapter, ChannelStatusAdapter } from "openclaw/plugin-sdk/channel-contract";
+import { buildAccountScopedDmSecurityPolicy } from "openclaw/plugin-sdk/channel-policy";
 import { waitUntilAbort } from "openclaw/plugin-sdk/channel-runtime";
+import type { DmPolicy } from "openclaw/plugin-sdk/config-contracts";
+import { normalizeDmAllowEntry, resolveDmPolicy } from "./dm-allowlist.js";
 
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
@@ -56,7 +59,7 @@ type ResolvedAccount = {
   accountId: string;
   enabled: boolean;
   allowFrom: string[];
-  dmPolicy: string | undefined;
+  dmPolicy: DmPolicy;
 };
 
 // `createChatChannelPlugin`'s `base` param requires a non-optional `capabilities`,
@@ -95,8 +98,53 @@ function resolveAccount(
     // An unresolved request remains visible but carries no usable account data.
     accountId: id ?? accountId ?? resolveDefaultWebchannelAccountId(cfg),
     enabled: isWebchannelAccountEnabled(cfg, accountId),
-    allowFrom: (account.allowFrom as string[] | undefined) ?? [],
-    dmPolicy: account.dmSecurity as string | undefined,
+    allowFrom: ((account.allowFrom as string[] | undefined) ?? []).map(normalizeDmAllowEntry),
+    dmPolicy: resolveDmPolicy(account),
+  };
+}
+
+function configRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+/** Resolve effective DM values and canonical edit paths without reading secrets. */
+function resolveDmSecurityConfig(cfg: OpenClawConfig, accountId: string): {
+  policy: DmPolicy;
+  allowFrom: string[];
+  policyPath: string;
+  allowFromPath: string;
+} {
+  const section = configRecord(cfg.channels?.[WEBCHANNEL_ID]);
+  const accounts = configRecord(section?.accounts);
+  const hasScopedAccount = accounts !== undefined && Object.prototype.hasOwnProperty.call(accounts, accountId);
+  const scoped = hasScopedAccount ? configRecord(accounts[accountId]) : undefined;
+  const rootBase = `channels.${WEBCHANNEL_ID}.`;
+  const scopedBase = `channels.${WEBCHANNEL_ID}.accounts.${accountId}.`;
+  const fallbackBase = hasScopedAccount ? scopedBase : rootBase;
+  const policyBase = scoped && (scoped.dmPolicy !== undefined || scoped.dmSecurity !== undefined)
+    ? scopedBase
+    : section && (section.dmPolicy !== undefined || section.dmSecurity !== undefined)
+      ? rootBase
+      : fallbackBase;
+  const allowFromBase = scoped?.allowFrom !== undefined
+    ? scopedBase
+    : section?.allowFrom !== undefined
+      ? rootBase
+      : fallbackBase;
+  const policyConfig = scoped && (scoped.dmPolicy !== undefined || scoped.dmSecurity !== undefined)
+    ? scoped
+    : section;
+  const rawAllowFrom = scoped?.allowFrom !== undefined ? scoped.allowFrom : section?.allowFrom;
+  return {
+    policy: resolveDmPolicy(policyConfig),
+    allowFrom: Array.isArray(rawAllowFrom)
+      ? rawAllowFrom.filter((value): value is string => typeof value === "string").map(normalizeDmAllowEntry)
+      : [],
+    policyPath: `${policyBase}dmPolicy`,
+    // Core audit and doctor append the field name to this prefix.
+    allowFromPath: allowFromBase,
   };
 }
 
@@ -284,13 +332,40 @@ export function createWebChannelPlugin(
       },
     } satisfies WebchannelAdapters & Record<string, unknown>)),
 
-    // DM security: who may message the bot. Phase 0 uses config allowlist only.
+    pairing: {
+      text: {
+        idLabel: "webchannelUserId",
+        message: "WebChannel pairing approved. You can now send messages.",
+        normalizeAllowEntry: normalizeDmAllowEntry,
+        notify: async ({ cfg, id, message, accountId }) => {
+          const target = resolveOutboundTransport({ cfg, accountId }, transport, opts?.resolveOutboundTransport);
+          if (!target.sendText(id, message, nextMessageId())) throw new Error("webchannel: pairing approval delivery failed");
+        },
+      },
+    },
+
+    // The SaaS JWT grant is the default admission approval (TD-1).
     security: {
-      dm: {
-        channelKey: WEBCHANNEL_ID,
-        resolvePolicy: (account) => account.dmPolicy,
-        resolveAllowFrom: (account) => account.allowFrom,
-        defaultPolicy: "allowlist",
+      resolveDmPolicy: ({ cfg, account }) => {
+        // resolveAccount preserves the exact listed spelling even when the
+        // caller used a canonical alias; diagnostics must point at that key.
+        const resolvedAccountId = account.accountId;
+        const dm = resolveDmSecurityConfig(cfg, resolvedAccountId);
+        return {
+          ...buildAccountScopedDmSecurityPolicy({
+            cfg,
+            channelKey: WEBCHANNEL_ID,
+            accountId: resolvedAccountId,
+            policy: dm.policy,
+            allowFrom: dm.allowFrom,
+            defaultPolicy: "open",
+            policyPathSuffix: "dmPolicy",
+            allowFromPathSuffix: "",
+            normalizeEntry: normalizeDmAllowEntry,
+          }),
+          policyPath: dm.policyPath,
+          allowFromPath: dm.allowFromPath,
+        };
       },
     },
 

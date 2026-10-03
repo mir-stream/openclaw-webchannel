@@ -47,11 +47,11 @@ Telegram Bot API/MTProto 계약을 그대로 따르는 것이다.
 | | |
 | --- | --- |
 | Telegram | 기본 `dmPolicy`는 `pairing`이다. 처음 보는 사용자에게 pairing 코드를 주고, 봇 주인이 승인한다(코어 `zod-schema.channel-messaging-common.ts`의 기본값, `extensions/telegram/src/dm-access.ts`). |
-| WebChannel 목표 결정 | 기본값은 `open`이다. `open`·`allowlist`·`disabled`의 의미와 schema 검증은 SDK `DmPolicy`·Telegram을 그대로 따른다. |
+| WebChannel 목표 결정 | 기본값은 `open`이다. `pairing`·`open`·`allowlist`·`disabled`의 의미와 schema 검증은 SDK `DmPolicy`·Telegram을 그대로 따른다. 기본 `open`도 `allowFrom: ["*"]`를 명시해야 하며 setup이 이를 함께 기록한다. |
 | 의도 | Telegram 봇에는 인터넷의 누구나 DM할 수 있으므로 닫힌 기본값이 필요하다. WebChannel에는 SaaS가 해당 계정(JWT `aud`)용 토큰을 발급한 사용자만 닿는다. **SaaS의 JWT 발급이 pairing 승인에 해당한다.** 같은 일을 두 번 심사하지 않는다. |
 | 결정 | 2026-09-30, 프로젝트 오너 |
 | 재검토 | SaaS 밖의 주체가 이 계정 JWT를 얻을 수 있게 되는 경우. 또는 tenant 매니저 권한 API(TD-2)가 도입되는 경우. |
-| 구현 상태 (2026-10-02) | 기본 `open` 동작은 있다. SDK `dmPolicy` 의미·schema 정합화는 #406에서 대기 중이다. |
+| 구현 상태 (2026-10-02) | #406 구현: canonical `dmPolicy` enum, 상속 후 schema 교차검증, disabled 전면 거부, wildcard·접두 정규화, SDK pairing, core audit와 doctor 정합화. 기존 `dmSecurity`는 정규화되는 legacy 별칭이며 doctor가 이전을 안내한다. |
 | 관련 | #406 |
 
 ### TD-2. 입장한 모든 peer를 명령 권한이 있는 sender로 인정한다

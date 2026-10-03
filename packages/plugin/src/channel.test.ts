@@ -808,7 +808,7 @@ describe("webchannel inbound round-trip", () => {
       // key these tests assert. Per-test `channelConfig` still wins on any key.
       config: {
         channels: {
-          webchannel: { tenant: FIXTURE_TENANT, ...(opts?.channelConfig ?? {}) },
+          webchannel: { tenant: FIXTURE_TENANT, allowFrom: ["*"], ...(opts?.channelConfig ?? {}) },
         },
       },
       runtime: {
@@ -880,6 +880,19 @@ describe("webchannel inbound round-trip", () => {
     expect(resolveAgentRoute).not.toHaveBeenCalled();
     expect(sendSpy).not.toHaveBeenCalled();
     expect(settledSpy).not.toHaveBeenCalled();
+  });
+
+  it.each(["dmPolicy", "dmSecurity"])("disabled %s blocks an allowlisted peer before routing (#406)", async (field) => {
+    const transport = new FakePeerChannel();
+    const sendSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    const { api, resolveAgentRoute } = makeFakeApi({}, {
+      channelConfig: { [field]: "disabled", allowFrom: ["alice", "*"] },
+    });
+    const inboundRun = (api.runtime as { channel: { inbound: { run: ReturnType<typeof vi.fn> } } }).channel.inbound.run;
+    await handleInboundMessage(api, transport, "alice", { type: "user_message", text: "blocked" });
+    expect(inboundRun).not.toHaveBeenCalled();
+    expect(resolveAgentRoute).not.toHaveBeenCalled();
+    expect(sendSpy).not.toHaveBeenCalled();
   });
 
   it("default-deny allowlist (gap ③): an allowlisted peer is admitted — inbound.run runs and reply is delivered", async () => {

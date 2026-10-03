@@ -1,7 +1,9 @@
 {
   "id": "webchannel",
   "kind": "channel",
-  "channels": ["webchannel"],
+  "channels": [
+    "webchannel"
+  ],
   "name": "WebChannel",
   "description": "Self-hosted web chat channel plugin for OpenClaw.",
   "configSchema": {
@@ -22,10 +24,33 @@
           },
           "accounts": {
             "type": "object",
-            "description": "Per-account overrides keyed by accountId (channels.webchannel.accounts.<id>). Each account inherits the channel-level (flat) fields as a shared base; account fields override. By design the per-account leaf schema is NOT enumerated here (additionalProperties:true / unvalidated) — it mirrors the channel-level fields; validating it twice would couple the two trees. Named accounts are created by 'openclaw channels add --channel webchannel --account <id>'.",
+            "description": "Per-account overrides inherit channel-level fields. DM policy and allowFrom are validated together after inheritance; other account fields retain their runtime validation.",
             "additionalProperties": {
               "type": "object",
-              "additionalProperties": true
+              "additionalProperties": true,
+              "properties": {
+                "dmPolicy": {
+                  "type": "string",
+                  "enum": [
+                    "pairing",
+                    "allowlist",
+                    "open",
+                    "disabled"
+                  ],
+                  "description": "SDK DM policy. Default open; open requires explicit allowFrom containing \"*\"."
+                },
+                "dmSecurity": {
+                  "type": "string",
+                  "pattern": "^\\s*(?:[oO][pP][eE][nN]|[aA][lL][lL]|[aA][nN][yY]|[aA][nN][yY][oO][nN][eE]|[eE][vV][eE][rR][yY][oO][nN][eE]|[pP][uU][bB][lL][iI][cC]|[aA][lL][lL][oO][wW][lL][iI][sS][tT]|[pP][aA][iI][rR][iI][nN][gG]|[dD][iI][sS][aA][bB][lL][eE][dD])\\s*$",
+                  "description": "Deprecated dmPolicy alias. Legacy open spellings normalize to open; migrate with doctor."
+                },
+                "allowFrom": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
             }
           },
           "defaultAccount": {
@@ -58,7 +83,10 @@
             "properties": {
               "strategy": {
                 "type": "string",
-                "enum": ["anonymous", "jwt"],
+                "enum": [
+                  "anonymous",
+                  "jwt"
+                ],
                 "description": "jwt is required. anonymous is REMOVED and reaches a startup migration error."
               },
               "ticketParam": {
@@ -107,14 +135,20 @@
           },
           "allowFrom": {
             "type": "array",
-            "items": { "type": "string" }
+            "items": {
+              "type": "string"
+            }
           },
           "groupAllowFrom": {
             "type": "array",
-            "items": { "type": "string" }
+            "items": {
+              "type": "string"
+            }
           },
           "dmSecurity": {
-            "type": "string"
+            "type": "string",
+            "pattern": "^\\s*(?:[oO][pP][eE][nN]|[aA][lL][lL]|[aA][nN][yY]|[aA][nN][yY][oO][nN][eE]|[eE][vV][eE][rR][yY][oO][nN][eE]|[pP][uU][bB][lL][iI][cC]|[aA][lL][lL][oO][wW][lL][iI][sS][tT]|[pP][aA][iI][rR][iI][nN][gG]|[dD][iI][sS][aA][bB][lL][eE][dD])\\s*$",
+            "description": "Deprecated dmPolicy alias. Legacy open spellings normalize to open; migrate with doctor."
           },
           "streaming": {
             "type": "object",
@@ -122,18 +156,45 @@
             "properties": {
               "mode": {
                 "type": "string",
-                "enum": ["off", "partial", "block", "progress"]
+                "enum": [
+                  "off",
+                  "partial",
+                  "block",
+                  "progress"
+                ]
               },
               "progress": {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                  "label": { "type": ["string", "boolean"] },
-                  "labels": { "type": "array", "items": { "type": "string" } },
-                  "maxLines": { "type": "integer" },
-                  "maxLineChars": { "type": "integer" },
-                  "toolProgress": { "type": "boolean" },
-                  "commandText": { "type": "string", "enum": ["raw", "status"] }
+                  "label": {
+                    "type": [
+                      "string",
+                      "boolean"
+                    ]
+                  },
+                  "labels": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "maxLines": {
+                    "type": "integer"
+                  },
+                  "maxLineChars": {
+                    "type": "integer"
+                  },
+                  "toolProgress": {
+                    "type": "boolean"
+                  },
+                  "commandText": {
+                    "type": "string",
+                    "enum": [
+                      "raw",
+                      "status"
+                    ]
+                  }
                 }
               }
             }
@@ -144,19 +205,35 @@
             "properties": {
               "enabled": {
                 "anyOf": [
-                  { "type": "boolean" },
-                  { "type": "string", "const": "auto" }
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "string",
+                    "const": "auto"
+                  }
                 ]
               },
               "approvers": {
                 "type": "array",
                 "items": {
-                  "anyOf": [{ "type": "string" }, { "type": "number" }]
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "number"
+                    }
+                  ]
                 }
               },
               "target": {
                 "type": "string",
-                "enum": ["dm", "channel", "both"]
+                "enum": [
+                  "dm",
+                  "channel",
+                  "both"
+                ]
               }
             }
           },
@@ -166,11 +243,20 @@
             "properties": {
               "inlineButtons": {
                 "type": "string",
-                "enum": ["dm", "group", "allowlist", "all", "off"]
+                "enum": [
+                  "dm",
+                  "group",
+                  "allowlist",
+                  "all",
+                  "off"
+                ]
               },
               "typing": {
                 "type": "string",
-                "enum": ["on", "off"],
+                "enum": [
+                  "on",
+                  "off"
+                ],
                 "default": "on"
               },
               "reasoning": {
@@ -218,7 +304,10 @@
               },
               "admission": {
                 "type": "string",
-                "enum": ["auto", "register-hop"],
+                "enum": [
+                  "auto",
+                  "register-hop"
+                ],
                 "description": "register-hop is required. auto is REMOVED and reaches a startup migration error."
               },
               "credentials": {
@@ -228,29 +317,49 @@
                 "properties": {
                   "mode": {
                     "type": "string",
-                    "enum": ["static", "enrolled", "open"],
+                    "enum": [
+                      "static",
+                      "enrolled",
+                      "open"
+                    ],
                     "description": "enrolled is the supported mode. static is rejected until P0-3; open is REMOVED and reaches a startup migration error."
                   },
                   "userJwt": {
                     "anyOf": [
-                      { "type": "string" },
+                      {
+                        "type": "string"
+                      },
                       {
                         "type": "object",
                         "additionalProperties": false,
-                        "properties": { "env": { "type": "string" } },
-                        "required": ["env"]
+                        "properties": {
+                          "env": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "env"
+                        ]
                       }
                     ],
                     "description": "Static mode: NATS user JWT. Env override: WEBCHANNEL_NATS_USER_JWT. Use { \"env\": \"VAR\" } rather than inlining the secret."
                   },
                   "userSeed": {
                     "anyOf": [
-                      { "type": "string" },
+                      {
+                        "type": "string"
+                      },
                       {
                         "type": "object",
                         "additionalProperties": false,
-                        "properties": { "env": { "type": "string" } },
-                        "required": ["env"]
+                        "properties": {
+                          "env": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "env"
+                        ]
                       }
                     ],
                     "description": "Static mode: NATS user NKEY seed (\"SU…\"). Env override: WEBCHANNEL_NATS_USER_SEED. Use { \"env\": \"VAR\" } rather than inlining the secret."
@@ -273,11 +382,528 @@
             "properties": {
               "mode": {
                 "type": "string",
-                "enum": ["required", "disabled"],
+                "enum": [
+                  "required",
+                  "disabled"
+                ],
                 "description": "required (or unset) keeps the NATS channel encrypt-by-construction. disabled is unsupported: the account refuses to start and 'openclaw doctor' reports encryption-disabled."
               }
             }
+          },
+          "dmPolicy": {
+            "type": "string",
+            "enum": [
+              "pairing",
+              "allowlist",
+              "open",
+              "disabled"
+            ],
+            "description": "SDK DM policy. Default open; open requires explicit allowFrom containing \"*\"."
           }
+        },
+        "definitions": {
+          "dmEnabled": {
+            "not": {
+              "properties": {
+                "enabled": {
+                  "const": false
+                }
+              },
+              "required": [
+                "enabled"
+              ]
+            }
+          },
+          "dmConfiguredRoot": {
+            "allOf": [
+              {
+                "anyOf": [
+                  {
+                    "required": [
+                      "tenant"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "storageRoot"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "saas"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "auth"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "allowFrom"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "groupAllowFrom"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "dmSecurity"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "streaming"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "execApprovals"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "capabilities"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "history"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "nats"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "encryption"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "dmPolicy"
+                    ]
+                  }
+                ]
+              },
+              {
+                "anyOf": [
+                  {
+                    "not": {
+                      "required": [
+                        "accounts"
+                      ]
+                    }
+                  },
+                  {
+                    "properties": {
+                      "accounts": {
+                        "maxProperties": 0
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "$ref": "#/definitions/dmEnabled"
+              }
+            ]
+          },
+          "dmOpen": {
+            "anyOf": [
+              {
+                "properties": {
+                  "dmPolicy": {
+                    "const": "open"
+                  }
+                },
+                "required": [
+                  "dmPolicy"
+                ]
+              },
+              {
+                "not": {
+                  "required": [
+                    "dmPolicy"
+                  ]
+                },
+                "properties": {
+                  "dmSecurity": {
+                    "pattern": "^\\s*(?:[oO][pP][eE][nN]|[aA][lL][lL]|[aA][nN][yY]|[aA][nN][yY][oO][nN][eE]|[eE][vV][eE][rR][yY][oO][nN][eE]|[pP][uU][bB][lL][iI][cC])\\s*$"
+                  }
+                },
+                "required": [
+                  "dmSecurity"
+                ]
+              }
+            ]
+          },
+          "dmOpenDefault": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/dmOpen"
+              },
+              {
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "dmPolicy"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "dmSecurity"
+                      ]
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "dmOpenAllow": {
+            "properties": {
+              "allowFrom": {
+                "type": "array",
+                "contains": {
+                  "type": "string",
+                  "pattern": "^\\s*\\*\\s*$"
+                }
+              }
+            },
+            "required": [
+              "allowFrom"
+            ]
+          },
+          "dmOpenAllowOptional": {
+            "properties": {
+              "allowFrom": {
+                "type": "array",
+                "contains": {
+                  "type": "string",
+                  "pattern": "^\\s*\\*\\s*$"
+                }
+              }
+            }
+          },
+          "dmAllowlist": {
+            "anyOf": [
+              {
+                "properties": {
+                  "dmPolicy": {
+                    "const": "allowlist"
+                  }
+                },
+                "required": [
+                  "dmPolicy"
+                ]
+              },
+              {
+                "not": {
+                  "required": [
+                    "dmPolicy"
+                  ]
+                },
+                "properties": {
+                  "dmSecurity": {
+                    "pattern": "^\\s*(?:[aA][lL][lL][oO][wW][lL][iI][sS][tT])\\s*$"
+                  }
+                },
+                "required": [
+                  "dmSecurity"
+                ]
+              }
+            ]
+          },
+          "dmAllowlistDefault": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/dmAllowlist"
+              },
+              {
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "dmPolicy"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "dmSecurity"
+                      ]
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "dmAllowlistAllow": {
+            "properties": {
+              "allowFrom": {
+                "type": "array",
+                "minItems": 1,
+                "contains": {
+                  "type": "string",
+                  "pattern": "^(?!\\s*(?:[wW][eE][bB][cC][hH][aA][nN][nN][eE][lL]:)?\\s*$)[\\s\\S]+$"
+                }
+              }
+            },
+            "required": [
+              "allowFrom"
+            ]
+          },
+          "dmAllowlistAllowOptional": {
+            "properties": {
+              "allowFrom": {
+                "type": "array",
+                "minItems": 1,
+                "contains": {
+                  "type": "string",
+                  "pattern": "^(?!\\s*(?:[wW][eE][bB][cC][hH][aA][nN][nN][eE][lL]:)?\\s*$)[\\s\\S]+$"
+                }
+              }
+            }
+          }
+        },
+        "if": {
+          "$ref": "#/definitions/dmEnabled"
+        },
+        "then": {
+          "allOf": [
+          {
+            "if": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/dmConfiguredRoot"
+                },
+                {
+                  "$ref": "#/definitions/dmOpenDefault"
+                }
+              ]
+            },
+            "then": {
+              "$ref": "#/definitions/dmOpenAllow"
+            }
+          },
+          {
+            "if": {
+              "$ref": "#/definitions/dmOpenDefault"
+            },
+            "then": {
+              "if": {
+                "$ref": "#/definitions/dmOpenAllow"
+              },
+              "then": {
+                "properties": {
+                  "accounts": {
+                    "additionalProperties": {
+                      "if": {
+                        "allOf": [
+                          {
+                            "$ref": "#/definitions/dmEnabled"
+                          },
+                          {
+                            "$ref": "#/definitions/dmOpenDefault"
+                          }
+                        ]
+                      },
+                      "then": {
+                        "$ref": "#/definitions/dmOpenAllowOptional"
+                      }
+                    }
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "accounts": {
+                    "additionalProperties": {
+                      "if": {
+                        "allOf": [
+                          {
+                            "$ref": "#/definitions/dmEnabled"
+                          },
+                          {
+                            "$ref": "#/definitions/dmOpenDefault"
+                          }
+                        ]
+                      },
+                      "then": {
+                        "$ref": "#/definitions/dmOpenAllow"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "else": {
+              "if": {
+                "$ref": "#/definitions/dmOpenAllow"
+              },
+              "then": {
+                "properties": {
+                  "accounts": {
+                    "additionalProperties": {
+                      "if": {
+                        "allOf": [
+                          {
+                            "$ref": "#/definitions/dmEnabled"
+                          },
+                          {
+                            "$ref": "#/definitions/dmOpen"
+                          }
+                        ]
+                      },
+                      "then": {
+                        "$ref": "#/definitions/dmOpenAllowOptional"
+                      }
+                    }
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "accounts": {
+                    "additionalProperties": {
+                      "if": {
+                        "allOf": [
+                          {
+                            "$ref": "#/definitions/dmEnabled"
+                          },
+                          {
+                            "$ref": "#/definitions/dmOpen"
+                          }
+                        ]
+                      },
+                      "then": {
+                        "$ref": "#/definitions/dmOpenAllow"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/dmConfiguredRoot"
+                },
+                {
+                  "$ref": "#/definitions/dmAllowlist"
+                }
+              ]
+            },
+            "then": {
+              "$ref": "#/definitions/dmAllowlistAllow"
+            }
+          },
+          {
+            "if": {
+              "$ref": "#/definitions/dmAllowlist"
+            },
+            "then": {
+              "if": {
+                "$ref": "#/definitions/dmAllowlistAllow"
+              },
+              "then": {
+                "properties": {
+                  "accounts": {
+                    "additionalProperties": {
+                      "if": {
+                        "allOf": [
+                          {
+                            "$ref": "#/definitions/dmEnabled"
+                          },
+                          {
+                            "$ref": "#/definitions/dmAllowlistDefault"
+                          }
+                        ]
+                      },
+                      "then": {
+                        "$ref": "#/definitions/dmAllowlistAllowOptional"
+                      }
+                    }
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "accounts": {
+                    "additionalProperties": {
+                      "if": {
+                        "allOf": [
+                          {
+                            "$ref": "#/definitions/dmEnabled"
+                          },
+                          {
+                            "$ref": "#/definitions/dmAllowlistDefault"
+                          }
+                        ]
+                      },
+                      "then": {
+                        "$ref": "#/definitions/dmAllowlistAllow"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "else": {
+              "if": {
+                "$ref": "#/definitions/dmAllowlistAllow"
+              },
+              "then": {
+                "properties": {
+                  "accounts": {
+                    "additionalProperties": {
+                      "if": {
+                        "allOf": [
+                          {
+                            "$ref": "#/definitions/dmEnabled"
+                          },
+                          {
+                            "$ref": "#/definitions/dmAllowlist"
+                          }
+                        ]
+                      },
+                      "then": {
+                        "$ref": "#/definitions/dmAllowlistAllowOptional"
+                      }
+                    }
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "accounts": {
+                    "additionalProperties": {
+                      "if": {
+                        "allOf": [
+                          {
+                            "$ref": "#/definitions/dmEnabled"
+                          },
+                          {
+                            "$ref": "#/definitions/dmAllowlist"
+                          }
+                        ]
+                      },
+                      "then": {
+                        "$ref": "#/definitions/dmAllowlistAllow"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          ]
         }
       },
       "uiHints": {
@@ -354,7 +980,7 @@
         },
         "capabilities.reasoningDurable": {
           "label": "Persist reasoning to disk",
-          "help": "Whether the agent's reasoning/thinking content is written to this plugin's delivery journal on disk as plaintext. Default false when omitted; set boolean true to opt in. This is NOT capabilities.reasoning \u2014 that key controls the live lane and defaults to true. Rendering a volatile live lane and permanently recording plaintext are separate decisions. Nothing ages out of the journal yet, and no client can read these rows back until #242 half 2, so leave it off unless you specifically want the record. Necessary but NOT sufficient: durability records the same lane the live stream carries. If the lane never opens — capabilities.reasoning false, or a session /reasoning off — no frames are produced and no rows are written, with no warning, because the empty-lane diagnostic only watches lanes that opened. Setting this to true while the lane is off records nothing. (An agent thinking level of \"off\" also produces no rows, but that one does warn: the lane opens and receives nothing.)"
+          "help": "Whether the agent's reasoning/thinking content is written to this plugin's delivery journal on disk as plaintext. Default false when omitted; set boolean true to opt in. This is NOT capabilities.reasoning — that key controls the live lane and defaults to true. Rendering a volatile live lane and permanently recording plaintext are separate decisions. Nothing ages out of the journal yet, and no client can read these rows back until #242 half 2, so leave it off unless you specifically want the record. Necessary but NOT sufficient: durability records the same lane the live stream carries. If the lane never opens — capabilities.reasoning false, or a session /reasoning off — no frames are produced and no rows are written, with no warning, because the empty-lane diagnostic only watches lanes that opened. Setting this to true while the lane is off records nothing. (An agent thinking level of \"off\" also produces no rows, but that one does warn: the lane opens and receives nothing.)"
         },
         "history.enabled": {
           "label": "History pagination",

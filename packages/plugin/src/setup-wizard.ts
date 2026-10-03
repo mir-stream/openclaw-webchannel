@@ -243,9 +243,8 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       "  openclaw agents bind --bind webchannel:<account> --agent <agent>",
       "  openclaw gateway run",
       "",
-      'Note: dmSecurity is set to "open" (demo-grade). It admits ALL inbound DMs ' +
-        "and is NOT a safe production default — tighten it before exposing the " +
-        "account publicly.",
+      'New accounts default to DM policy open with explicit allowFrom ["*"]. Existing account DM restrictions are preserved. ' +
+        "Users must still hold a SaaS JWT for this account. Use allowlist, pairing or disabled for additional DM restrictions.",
     ],
   },
 };

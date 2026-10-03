@@ -49,6 +49,7 @@
  * README.md ("Enrollment & credentials → CLI flag mapping").
  */
 
+import { resolveDmPolicy, type DmSecurityConfig } from "./dm-allowlist.js";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 
@@ -57,6 +58,7 @@ import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   accountCredentialPath,
   assertNoRemovedAudienceConfig,
+  hasWebchannelConfig,
   loadPersistedCredentialDocument,
   readAccountsMap,
   readWebchannelSection,
@@ -185,7 +187,7 @@ function mergePatch(
 /**
  * Build the COMPLETE, enroll-ready account block — the proven demo config
  * (`e2e/local/run-demo-synadia.sh`): tenant + saas.baseUrl + jwt auth strategy +
- * `dmSecurity: "open"` + enrolled NATS credentials under `admission:
+ * `dmPolicy: "open", allowFrom: ["*"]` + enrolled NATS credentials under `admission:
  * "register-hop"`.
  *
  * TRUST-ANCHOR (design §4 change 2): the builder NO LONGER writes the JWT-verify
@@ -219,11 +221,15 @@ export function buildFullAccountPatch(params: {
    * a specific issuer; when absent, issuer DERIVES at runtime from saas.baseUrl.
    */
   issuer?: string;
+  /** Preserve the existing effective policy during explicit re-enrollment. */
+  dm?: DmSecurityConfig;
 }): Record<string, unknown> {
   // `accountId` remains a required param (callers pass it, and it documents that
   // expected JWT aud derives from it at runtime) but is no longer read here —
   // the account-bound verifier closes over `accountId` directly.
   const { tenant, saasBaseUrl, issuer } = params;
+  const dmPolicy = resolveDmPolicy(params.dm);
+  const allowFrom = params.dm?.allowFrom ?? (dmPolicy === "open" ? ["*"] : undefined);
   // Emit auth.jwt ONLY for the explicit issuer pin. jwksUrl
   // is never written here — it derives at runtime. If neither pin is supplied,
   // omit auth.jwt entirely so nothing is guessed (strategy alone is written).
@@ -235,7 +241,8 @@ export function buildFullAccountPatch(params: {
     tenant,
     saas: { baseUrl: saasBaseUrl },
     auth,
-    dmSecurity: "open",
+    dmPolicy,
+    ...(allowFrom !== undefined ? { allowFrom } : {}),
     nats: { admission: "register-hop", credentials: { mode: "enrolled" } },
   };
 }
@@ -288,6 +295,23 @@ function writeAccountConfig(
   }
 
   return { ...(cfg as object), channels } as OpenClawConfig;
+}
+
+function hasConfiguredSetupTarget(cfg: OpenClawConfig, accountId: string): boolean {
+  const section = readWebchannelSection(cfg);
+  const accounts = readAccountsMap(section);
+  if (Object.keys(accounts).length > 0) {
+    return Object.prototype.hasOwnProperty.call(accounts, accountId);
+  }
+  return accountId === DEFAULT_WEBCHANNEL_ACCOUNT_ID && hasWebchannelConfig(cfg);
+}
+
+function hasEffectiveDmField(cfg: OpenClawConfig, accountId: string): boolean {
+  const section = readWebchannelSection(cfg);
+  const account = readAccountsMap(section)[accountId];
+  return ["dmPolicy", "dmSecurity", "allowFrom"].some((field) =>
+    account?.[field] !== undefined || section?.[field] !== undefined,
+  );
 }
 
 /**
@@ -357,14 +381,17 @@ export const webchannelSetup = {
         saasBaseUrl: identity.saasBaseUrl,
         accountId: id,
         issuer: input.issuer ?? existingJwt?.issuer,
+        dm: existing as DmSecurityConfig,
       });
       return writeAccountConfig(cfg, id, patch);
     }
 
-    const patch = buildAccountPatch(input);
-    // Always write (even an empty patch) so the account exists for `gateway run`
-    // to list. For default with an empty patch on an empty config this is a no-op
-    // shape-wise.
+    let patch = buildAccountPatch(input);
+    if (!hasConfiguredSetupTarget(cfg, id) && !hasEffectiveDmField(cfg, id)) {
+      patch = { dmPolicy: "open", allowFrom: ["*"], ...patch };
+    }
+    // Always write so the account exists for `gateway run` to list. A genuinely
+    // fresh target also receives the minimum valid DM defaults above.
     return writeAccountConfig(cfg, id, patch);
   },
 

@@ -194,7 +194,8 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
           tenant: "t",
           saas: { baseUrl: "https://s" },
           auth: { strategy: "jwt" },
-          dmSecurity: "open",
+          dmPolicy: "open",
+          allowFrom: ["*"],
           nats: { admission: "register-hop", credentials: { mode: "enrolled" } },
         },
       },
@@ -208,9 +209,11 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
       accountId: "accta",
       input: { tenant: "t" },
     });
-    // No saasBaseUrl ⇒ partial write only (no auth/nats/dmSecurity emitted).
+    // No saasBaseUrl ⇒ partial acquisition fields, plus valid fresh-account DM defaults.
     expect((section(next).accounts as Record<string, unknown>).accta).toEqual({
       tenant: "t",
+      dmPolicy: "open",
+      allowFrom: ["*"],
     });
   });
 
@@ -310,12 +313,13 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
       input: { tenant: "tDefault" },
     });
     const s = section(next);
-    // Channel-level shared base untouched; default written under accounts.default.
+    // Channel-level shared base untouched; the fresh default and its valid DM
+    // defaults are written under accounts.default.
     expect(s.auth).toEqual({ strategy: "jwt" });
     expect(s.tenant).toBeUndefined();
     expect(s.accounts).toEqual({
       acctb: { tenant: "tB" },
-      default: { tenant: "tDefault" },
+      default: { tenant: "tDefault", dmPolicy: "open", allowFrom: ["*"] },
     });
     // Both accounts are now servable — no phantom, no silent drop.
     expect(listWebchannelAccountIds(next)).toEqual(["acctb", "default"]);
@@ -341,7 +345,7 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
     expect(s.auth).toEqual({ strategy: "jwt" });
     expect(s.accounts).toEqual({
       default: { allowFrom: ["x"] },
-      acctb: { tenant: "tB" },
+      acctb: { tenant: "tB", dmPolicy: "open", allowFrom: ["*"] },
     });
   });
 
@@ -369,7 +373,10 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
   it("ensures a named account exists even with no flags", () => {
     const cfg = { channels: {} } as never;
     const next = webchannelSetup.applyAccountConfig({ cfg, accountId: "acctz", input: {} });
-    expect((section(next).accounts as Record<string, unknown>).acctz).toEqual({});
+    expect((section(next).accounts as Record<string, unknown>).acctz).toEqual({
+      dmPolicy: "open",
+      allowFrom: ["*"],
+    });
   });
 
   it("canonicalizes the account id before writing (no traversal key)", () => {

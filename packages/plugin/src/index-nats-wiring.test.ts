@@ -599,6 +599,7 @@ describe("nats-account-runtime.ts wiring contract — #99 inbound frame normaliz
     // Guard first: a missing statement makes `indexOf` -1, which is "before"
     // everything and would let this ordering check pass vacuously.
     expect(NORMALIZE).toBeGreaterThan(HANDLER_START);
+    expect(NORMALIZE).toBeLessThan(RUNTIME_SOURCE.indexOf("if (!admitInbound({ peerId, message })) return;"));
     expect(NORMALIZE).toBeLessThan(RUNTIME_SOURCE.indexOf("isControlLaneMessage(message)"));
     expect(NORMALIZE).toBeLessThan(RUNTIME_SOURCE.indexOf("stopControl!.handle({ peerId, message }"));
     expect(NORMALIZE).toBeLessThan(RUNTIME_SOURCE.indexOf(".enqueue({ peerId, message })"));
@@ -655,8 +656,8 @@ describe("nats-account-runtime.ts wiring contract — #99 inbound frame normaliz
 
 describe("nats-account-runtime.ts wiring contract — #238 identity at the delivery act", () => {
   /**
-   * The command-gate warning notice is this runtime's one durable-text egress
-   * site: a real `agent_message` bubble on the client. Since #238 the plugin —
+   * The command-gate warning notice is a durable-text egress site in this
+   * runtime: a real `agent_message` bubble on the client. Since #238 the plugin —
    * never the viewer — names every such bubble, so this send must pass a
    * `nextMessageId()` as `sendText`'s THIRD argument. An id-less send hands the
    * client an unnamed durable bubble and it falls back to minting `a-N` from a
@@ -707,9 +708,19 @@ describe("nats-account-runtime.ts wiring contract — #238 identity at the deliv
 
   it("keeps the notice best-effort: the boolean return stays ignored", () => {
     // The notice hedges a gate that is deliberately a conservative mirror, so a
-    // failed send must not become a thrown or logged error here.
-    expect(RUNTIME_FLAT).not.toContain("if (!channel.sendText(");
-    expect(RUNTIME_FLAT).not.toMatch(/=\s*channel\.sendText\(/);
+    // failed send must not become a thrown or logged error here. Other sends,
+    // including SDK pairing challenges, intentionally check delivery failure.
+    const start = RUNTIME_FLAT.indexOf("dispatchControl: (peerId, message) => {");
+    const end = RUNTIME_FLAT.indexOf("return operation;", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const notice = RUNTIME_FLAT.slice(start, end);
+    expect(notice).toContain("if (commandGate.delegated && !commandGate.isListed(peerId))");
+    expect(notice).toContain("channel.sendText(peerId,");
+    expect(notice).toContain('"Stop may not be permitted for this user: this agent restricts "');
+    expect(notice).toContain('"commands to an operator allowlist.", nextMessageId()');
+    expect(notice).not.toContain("if (!channel.sendText(");
+    expect(notice).not.toMatch(/=\s*channel\.sendText\(/);
   });
 });
 

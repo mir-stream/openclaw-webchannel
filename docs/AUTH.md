@@ -149,6 +149,35 @@ produce a targeted migration error. Remove it and rerun
 
 See [`TRUST_AND_ONBOARDING.md`](TRUST_AND_ONBOARDING.md) for the complete trust model.
 
+## DM policy
+
+`channels.webchannel.dmPolicy` (or the account override) uses the SDK enum:
+
+| Policy | Admission |
+| --- | --- |
+| `open` (default) | Explicit `allowFrom: ["*"]` admits every peer already authenticated for this account by the SaaS JWT. |
+| `allowlist` | A nonempty configured sender list; `*` matches all and `webchannel:` prefixes normalize. Peer identity remains case-sensitive. |
+| `pairing` | Configured senders and SDK-approved peers can send; others receive an SDK pairing challenge. |
+| `disabled` | No sender, including a listed sender, may dispatch a DM turn. |
+
+The default differs from Telegram's pairing because SaaS token issuance already
+authorizes this account's peers (TD-1). It does not synthesize a wildcard when
+loading old configuration. Explicitly add `allowFrom: ["*"]` if open admission
+is intended. Setup writes both values for a fresh account and preserves existing
+restrictions when run again.
+
+`dmSecurity` is a deprecated alias. Legacy `all`, `any`, `anyone`, `everyone` and
+`public` (case/whitespace normalized) map to `open`; unknown values are rejected.
+Within one config layer `dmPolicy` wins, while an account-local legacy field can
+override a shared canonical policy. Doctor reports the migration and missing
+wildcard/empty allowlist; core audit points to `dmPolicy` and `allowFrom` at their
+actual channel/account location.
+
+The manifest's DM definitions specialize named-account checks by the inherited
+policy and allowlist, since JSON Schema has no upward property reference. Other
+named-account fields retain their existing runtime validation. The account
+startup gate repeats effective DM validation before credential/network work.
+
 ## NATS credential scope and rollout
 
 The next lockstep SaaS/plugin release narrows freshly minted credentials:

@@ -74,7 +74,7 @@ for acct in "${ACCOUNTS[@]}"; do
             \"jwksUrl\": \"$SAAS_URL/.well-known/jwks.json\",
             \"issuer\": \"$ISSUER\"
           } },
-          \"dmSecurity\": \"allowlist\",
+          \"dmPolicy\": \"allowlist\",
           \"allowFrom\": [\"$UUID_ALICE\", \"$UUID_BOB\", \"$UUID_ADMIN\"]
         }"
 done

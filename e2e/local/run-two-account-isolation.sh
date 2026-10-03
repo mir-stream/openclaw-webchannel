@@ -200,14 +200,14 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
           "tenant": "$TENANT",
           "auth": { "strategy": "jwt", "jwt": {
             "jwksUrl": "$ISS/.well-known/jwks.json", "issuer": "$ISS" } },
-          "dmSecurity": "allowlist",
+          "dmPolicy": "allowlist",
           "allowFrom": ["$PEER_A"]
         },
         "$ACCT_B": {
           "tenant": "$TENANT",
           "auth": { "strategy": "jwt", "jwt": {
             "jwksUrl": "$ISS/.well-known/jwks.json", "issuer": "$ISS" } },
-          "dmSecurity": "allowlist",
+          "dmPolicy": "allowlist",
           "allowFrom": ["$PEER_B"]
         }
       }

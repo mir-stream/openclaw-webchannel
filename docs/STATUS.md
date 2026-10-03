@@ -1,5 +1,18 @@
 # Project Status — single source of truth
 
+DM policy (#406): canonical `dmPolicy` uses SDK `pairing | allowlist | open |
+disabled` semantics. The default remains `open` (TD-1), requiring an explicit
+`allowFrom: ["*"]`; setup writes both and preserves existing restrictions on
+re-enrollment. `disabled` rejects every sender including allowlisted peers.
+Allowlist matching honors `*` and `webchannel:` prefixes while preserving peer
+case. Pairing reads the SDK's account-scoped approval store before normal/control
+ingress admission. Fresh denials can issue SDK challenges through bounded,
+per-peer coalesced work; receipt replays never initiate a new pairing request.
+Manifest validation checks inherited account policy/allowlist combinations;
+runtime independently refuses invalid account configuration. Core security audit
+reports the same policy and real fix paths. Doctor guides migration from legacy
+`dmSecurity` aliases. See [DM configuration](AUTH.md#dm-policy).
+
 NATS permissions (#409, #410): newly enrolled agent credentials are limited to
 their exact tenant/account subtree, and browser credentials publish only their
 own `.in`/`.register` subjects. Real nats-server tests prove sibling-account
