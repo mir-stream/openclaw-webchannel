@@ -2594,3 +2594,79 @@ it("#442 late policy refusal cannot downgrade an already accepted receipt", asyn
     expect(h.wrapper.getState().turnActive).toBe(true);
   } finally { h.wrapper.close(); }
 });
+
+it.each(["user_committed", "history", "difference"] as const)(
+  "#442 exact durable %s adoption keeps replay ownership through a late policy refusal",
+  async (source) => {
+    const h = await connectWrapper({ ack: false });
+    try {
+      const receipt = h.wrapper.send(`durable before refusal: ${source}`)!;
+      await settle();
+      const sent = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .find((message): message is Extract<OutboundMessage, { type: "user_message" }> =>
+          message.type === "user_message" && message.text === `durable before refusal: ${source}`)!;
+      const serverId = `server-${source}`;
+
+      if (source === "user_committed") {
+        deliverOut(h.K, { type: "user_committed", id: serverId, text: sent.text,
+          random_id: sent.random_id, turnId: sent.id, seq: 1 });
+      } else if (source === "history") {
+        deliverOut(h.K, { type: "history", highWaterSeq: 1, messages: [{
+          id: serverId, role: "user", text: sent.text, randomId: sent.random_id,
+          turnId: sent.id, seq: 1,
+        }] });
+      } else {
+        deliverOut(h.K, { type: "history", highWaterSeq: 0, messages: [] });
+        await settle();
+        deliverOut(h.K, { type: "history", highWaterSeq: 1, messages: [] });
+        await settle();
+        const request = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+          .filter((message) => message.type === "get_difference").at(-1);
+        expect(request?.type).toBe("get_difference");
+        if (request?.type !== "get_difference") throw new Error("difference request missing");
+        deliverOut(h.K, { type: "difference", afterSeq: request.afterSeq, nonce: request.nonce,
+          partial: false, maxSeq: 1, events: [{ seq: 1, event: {
+            kind: "user", id: serverId, text: sent.text, randomId: sent.random_id, turnId: sent.id,
+          } }] });
+      }
+      await settle();
+      expect(userBubble(h.wrapper, sent.text)).toMatchObject({ id: serverId, wireId: sent.id, sendState: "sent" });
+
+      deliverOut(h.K, { type: "inbound_rejected", ids: [sent.id, "other-device"], reason: "policy-denied" });
+      await settle();
+      expect(receipt.snapshot().state).toBe("sent");
+      expect(h.wrapper.getState().turnActive).toBe(true);
+
+      FakeNatsWS.instances.at(-1)!.close();
+      await settleUntil(() => h.received.length >= 2, { label: `${source} send replay` });
+      expect(h.received).toEqual([sent.id, sent.id]);
+
+      deliverOut(h.K, { type: "ack", ids: [sent.id] });
+      await settle();
+      expect(receipt.snapshot().state).toBe("accepted");
+      deliverOut(h.K, { type: "turn_settled", turnId: sent.id, outcome: "ok" });
+      await settle();
+      expect(receipt.snapshot().state).toBe("completed");
+    } finally { h.wrapper.close(); }
+  },
+);
+
+it("#442 a durable row with another random ID does not suppress the owned refusal", async () => {
+  const h = await connectWrapper({ ack: false });
+  try {
+    const receipt = h.wrapper.send("unmatched durable evidence")!;
+    await settle();
+    const sent = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+      .find((message): message is Extract<OutboundMessage, { type: "user_message" }> =>
+        message.type === "user_message" && message.text === "unmatched durable evidence")!;
+    deliverOut(h.K, { type: "history", highWaterSeq: 1, messages: [{
+      id: "other-device-row", role: "user", text: sent.text, randomId: "other-device-random", seq: 1,
+    }] });
+    await settle();
+    deliverOut(h.K, { type: "inbound_rejected", ids: [sent.id, "other-device"], reason: "policy-denied" });
+    await settle();
+    expect(receipt.snapshot()).toMatchObject({
+      state: "failed", failure: { reason: "policy-denied", retryable: false },
+    });
+  } finally { h.wrapper.close(); }
+});

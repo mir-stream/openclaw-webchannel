@@ -3786,6 +3786,11 @@ export class WebChannelNATSClient {
     if (prior === undefined && this.cursor.state === "unseeded") return "current";
     if (prior !== undefined) this.retiredJournalEpochs.add(prior);
 
+    // Durable adoption proves acceptance only inside the journal that authored
+    // the row. Clear it before any reset callout or low-level result side effect
+    // so an old-epoch echo cannot suppress a valid new-epoch refusal.
+    this.client.clearDurableAdoptions();
+
     // Keep unpublished/unconfirmed local sends and their receipt linkage. A new
     // epoch's ACK may be the very first frame, before its snapshot/broadcast.
     const pendingMappings = [...this.randomIdToReceiptKey].filter(([randomId]) =>
@@ -4878,6 +4883,11 @@ export class WebChannelNATSClient {
   /** Merge an exact origin echo with an already-hydrated server row atomically. */
   private adoptUserBubbleByRandomId(randomId: string, serverId: string): void {
     const receiptKey = this.randomIdToReceiptKey.get(randomId);
+    const receipt = receiptKey === undefined ? undefined : this.receipts.get(receiptKey);
+    // Establish refusal-ordering evidence before adoption can publish state and
+    // synchronously reenter through a subscriber. The low level independently
+    // verifies this exact wireId/randomId still owns replay delivery.
+    if (receipt?.wireId !== undefined) this.client.recordDurableAdoption(receipt.wireId, randomId);
     // A durable broadcast/history row can beat its ACK. Keep the exact linkage
     // while the low-level queue/replay ledger still owns this send, so an epoch
     // reset can retain it and a later new-epoch ACK can adopt its new identity.
