@@ -30,6 +30,18 @@ Telegram Bot API/MTProto 계약을 그대로 따르는 것이다.
 
 ## 항목
 
+### TD-6. issuer가 달라진 저장소는 자동 리셋하지 않고 기동을 거부한다
+
+| | |
+| --- | --- |
+| Telegram | update offset 상태를 bot ID와 token fingerprint에 결속하고 바뀐 상태를 리셋한다(`extensions/telegram/src/update-offset-store.ts`). |
+| WebChannel 목표 결정 | history·대화 키를 유효 JWT issuer에 결속한다. issuer 불일치나 기존 미기록 상태는 해당 계정 기동을 거부하고 doctor에서 보관 후 명시적 초기화를 안내한다. 자동 마이그레이션·삭제는 하지 않는다. |
+| 의도 | 같은 `sub`를 쓰는 새 issuer의 사용자가 이전 사용자의 평문 대화·키를 상속하지 못하게 하고, 데이터 보관과 초기화는 운영자가 명시적으로 결정하게 한다. |
+| 결정 | 2026-09-30, 프로젝트 오너. 2026-10-02 과제에서 자동 마이그레이션·삭제 금지를 재확인. |
+| 구현 상태 (2026-10-02) | #412 구현: tuple별 issuer 메타데이터, 기동 거부와 doctor 안내. 기존 데이터는 운영자 절차가 필요하다. |
+| 재검토 | 별도 승인된 issuer 간 데이터 이전 절차를 설계할 때. |
+| 관련 | #412, [수동 절차](STORAGE_IDENTITY_V2.md#issuer-binding-412) |
+
 ### TD-1. DM 정책 기본값은 `open`이다
 
 | | |
@@ -90,6 +102,19 @@ Telegram Bot API/MTProto 계약을 그대로 따르는 것이다.
 | 재검토 | 사유 노출이 권한 구조 탐색에 쓰일 수 있다는 근거가 생길 때. |
 | 구현 상태 (2026-10-02) | 거부 프레임과 정정된 cross-account 사유 매핑은 PR #421에서 구현 중이다. 아직 `develop`에 병합되지 않았다. |
 | 관련 | #400, [PR #421](https://github.com/mir-stream/openclaw-webchannel/pull/421) |
+
+
+### TD-E7. 브라우저 bootstrap JWT는 최대 1시간으로 제한한다
+
+| | |
+| --- | --- |
+| Telegram | 플러그인은 Bot API bot token을 사용하며, 브라우저 기기마다 SaaS bootstrap JWT의 `iat`/`exp`를 검증하는 단계가 없다(레퍼런스 `extensions/telegram/src/channel.ts`의 account/token 경로). |
+| WebChannel 목표 결정 | RS256 bootstrap JWT의 `iat`를 필수로 하고 `0 < exp−iat ≤ 3600초`를 검증한다. 미래 발급/만료의 clock skew는 수명 상한과 별도로 검사한다. SaaS builder·signer도 같은 상한을 지킨다. |
+| 의도 | 기기 등록에 쓰는 bearer 토큰의 노출 시간을 제한하고, 발급 시각을 모르는 토큰이나 무제한 수명을 허용하지 않는다. |
+| 결정 | 2026-10-02, 프로젝트 오너가 #415 제품 선택지 권장안 승인. |
+| 구현 상태 (2026-10-03) | #447 별도 PR에서 구현. 데모·레퍼런스·예제는 기존 5분 기본값을 유지한다. NATS 자체 credentials는 별도 계약이다. |
+| 재검토 | 신뢰하는 외부 IdP가 이 수명 계약을 지원하지 못하거나 다른 기기 등록 계약이 필요할 때. |
+| 관련 | #415 E7, #447 |
 
 ### TD-F7. 클라이언트 교체 뒤 held 입력은 수동 복원하는 메모리 초안으로 남긴다
 

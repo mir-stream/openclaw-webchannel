@@ -43,7 +43,7 @@ describe("consumeCredentialSource", () => {
     const source: NatsCredentialSource = {
       mode: "enrolled",
       url: "ws://relay",
-      saasBaseUrl: "http://s",
+      saasBaseUrl: "https://s",
       tenant: "t",
       accountId: "a",
     };
@@ -72,7 +72,7 @@ describe("consumeCredentialSource", () => {
     const source: NatsCredentialSource = {
       mode: "enrolled",
       url: "ws://relay",
-      saasBaseUrl: "http://s",
+      saasBaseUrl: "https://s",
       tenant: "tenant-A",
       accountId: "account-A",
       storageRoot: "/common/state",
@@ -89,7 +89,7 @@ describe("consumeCredentialSource", () => {
       {
         tenant: "tenant-A",
         accountId: "account-A",
-        saasBaseUrl: "http://s",
+        saasBaseUrl: "https://s",
       },
       {
         storageRoot: "/common/state",
@@ -109,7 +109,7 @@ describe("consumeCredentialSource", () => {
     const source: NatsCredentialSource = {
       mode: "enrolled",
       url: "ws://operator-configured-relay", // the local/config URL — must be ignored
-      saasBaseUrl: "http://s",
+      saasBaseUrl: "https://s",
       tenant: "t",
       accountId: "a",
     };
@@ -140,7 +140,7 @@ describe("consumeCredentialSource", () => {
     const source: NatsCredentialSource = {
       mode: "enrolled",
       url: "ws://configured-fallback",
-      saasBaseUrl: "http://s",
+      saasBaseUrl: "https://s",
       tenant: "t",
       accountId: "a",
     };
@@ -165,7 +165,7 @@ describe("consumeCredentialSource", () => {
     const source: NatsCredentialSource = {
       mode: "enrolled",
       url: "ws://relay",
-      saasBaseUrl: "http://s",
+      saasBaseUrl: "https://s",
       tenant: "t",
       accountId: "a",
     };
@@ -183,7 +183,7 @@ describe("consumeCredentialSource", () => {
     const source: NatsCredentialSource = {
       mode: "enrolled",
       url: "ws://relay",
-      saasBaseUrl: "http://s",
+      saasBaseUrl: "https://s",
       tenant: "t",
       accountId: "a",
     };
@@ -211,7 +211,7 @@ describe("consumeCredentialSource", () => {
     const source: NatsCredentialSource = {
       mode: "enrolled",
       url: "ws://relay",
-      saasBaseUrl: "http://s",
+      saasBaseUrl: "https://s",
       tenant: "t",
       accountId: "acctMissing",
     };
@@ -232,7 +232,7 @@ describe("consumeCredentialSource", () => {
     const source: NatsCredentialSource = {
       mode: "enrolled",
       url: "ws://relay",
-      saasBaseUrl: "http://s",
+      saasBaseUrl: "https://s",
       tenant: "tenant-A",
       accountId: "account-A",
     };

@@ -131,6 +131,18 @@ unnecessary: the signed tenant claim and account-id `aud` binding distinguish
 token populations even when accounts share an issuer. JWKS outages fail closed
 but are retryable; invalid tokens are terminal rejects.
 
+Unknown kids share a single in-flight refresh and a 30-second cooldown across
+all kids. A failed refresh or one without the requested kid retains previously
+cached keys only until their original TTL expires. A known fresh key remains
+usable during that refresh; no expired key is used as an outage fallback.
+Malformed JWT segments and payloads are rejected before JWKS lookup (#408).
+
+Configured SaaS base URLs require HTTPS, except HTTP on `localhost`,
+`127.0.0.0/8` or `::1`. There is no bypass flag. Enrollment,
+derived JWKS URLs, preflight and doctor enforce this same configured-URL rule
+(#411). Redirect-target validation is separate pre-existing behavior tracked in
+[#452](https://github.com/mir-stream/openclaw-webchannel/issues/452).
+
 The deprecated `auth.ticketParam` schema key remains accepted only so loading can
 produce a targeted migration error. Remove it and rerun
 `openclaw channels add --channel webchannel`.
@@ -171,3 +183,18 @@ cannot replace credentials held by a running transport.
 6. Restart the gateway only after enrollment completes.
 
 Until the restart, an already-running transport continues using its old in-memory credentials; online hot-swap is not supported.
+
+
+## Bootstrap JWT lifetime (#447)
+
+The plugin requires finite `iat` and `exp`, with `0 < exp - iat <= 3600` seconds.
+Issued-at may not be later than the verification clock plus configured skew;
+expiry retains the existing clock-skew check. Skew never increases the one-hour
+lifetime cap. Tokens without `iat` or with a longer lifetime are rejected.
+
+Before this change, the demo SaaS, both reference servers and the example app
+all used `buildBootstrapClaims`' 300-second default. The public builder's optional
+TTL and the direct signer had no upper bound; both now enforce the same lifetime
+contract. No first-party deployed bootstrap route requests a longer lifetime.
+This applies to RS256 browser bootstrap tokens. NATS operator/account/user
+credentials are separate relay credentials with separate issuance policies.

@@ -129,15 +129,15 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       }
       // A path by itself is not readiness. Count enrolled material only when
       // its complete v2 identity matches the effective configured account.
-      const identity = resolveAcquisitionIdentity(cfg, id);
-      const saasBaseUrl = resolveEnrolledSaasBaseUrl({
-        natsConfig: account.nats as WebchannelNatsConfig | undefined,
-        ...(identity.saasBaseUrl !== undefined
-          ? { saasBaseUrl: identity.saasBaseUrl }
-          : {}),
-      });
-      if (!saasBaseUrl) return false;
       try {
+        const identity = resolveAcquisitionIdentity(cfg, id);
+        const saasBaseUrl = resolveEnrolledSaasBaseUrl({
+          natsConfig: account.nats as WebchannelNatsConfig | undefined,
+          ...(identity.saasBaseUrl !== undefined
+            ? { saasBaseUrl: identity.saasBaseUrl }
+            : {}),
+        });
+        if (!saasBaseUrl) return false;
         const storageRoot = resolveAccountStorageRoot(account);
         return loadPersistedCredentialDocument({
           tenant: identity.tenant,
