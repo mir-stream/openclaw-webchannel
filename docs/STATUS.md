@@ -25,6 +25,14 @@ journals acquire an ID without rewriting events. Backup restoration must renew
 that ID before startup. These wire semantics join unreleased protocol 7 and
 require paired client/plugin deployment. See [sync and restore](GAP_SYNC.md).
 
+Messaging policy gates new normal/control input before retention, acceptance,
+ACK and broadcast (#442). A denied request receives only an encrypted correlated
+`inbound_rejected{reason:"policy-denied"}`; the client retires its replay and
+shows the generic failure. Exact earlier user/control/cancellation/convergence
+receipts remain authoritative after policy changes. This is part of unreleased
+protocol 7 and requires client/plugin lockstep. DM policy interpretation remains
+owned by #406; this change moves its existing result to the admission boundary.
+
 Inbound acceptance precedes execution debounce (#441): each input receives its
 durable server ID, multi-device broadcast and ACK immediately after admission.
 Only execution waits for the configured fixed window, with the same retained

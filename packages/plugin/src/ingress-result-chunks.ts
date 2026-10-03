@@ -22,12 +22,13 @@ export const MAX_INGRESS_RESULT_ID_LENGTH = 128;
  * says `converged`, so the client settles only that send's own id.
  */
 export type CommittedUserMessage = { random_id: string; messageId: string; seq?: number; converged?: true };
+export type IngressRejectionReason = "overloaded" | "policy-denied";
 
 export type IngressResultFrame =
   // cancelled is durable proof for a subset of this frame's exact wire ids;
   // unaccepted (#398) is the subset of cancelled this server never accepted.
   | { type: "ack"; ids: string[]; committed?: CommittedUserMessage[]; cancelled?: string[]; unaccepted?: string[] }
-  | { type: "inbound_rejected"; ids: string[]; reason: "overloaded" };
+  | { type: "inbound_rejected"; ids: string[]; reason: IngressRejectionReason };
 
 export type IngressResultChunkWriter = {
   /** cancelled requires durable evidence and always rides this ID's frame, as
@@ -39,6 +40,7 @@ export type IngressResultChunkWriter = {
 
 export type IngressResultChunkOptions = {
   type: IngressResultFrame["type"];
+  reason?: IngressRejectionReason;
   publish(frame: IngressResultFrame): boolean;
   /** Actual sealed wire measurement for this peer/route. */
   measureWireBytes?: (frame: IngressResultFrame) => number;
@@ -104,7 +106,7 @@ export function createIngressResultChunkWriter(
   const frameFor = (values: string[], cancelled: string[], unaccepted: string[]): IngressResultFrame => options.type === "ack"
     ? { type: "ack", ids: values, ...(committedPending.length > 0 ? { committed: committedPending } : {}),
       ...(cancelled.length > 0 ? { cancelled } : {}), ...(unaccepted.length > 0 ? { unaccepted } : {}) }
-    : { type: "inbound_rejected", ids: values, reason: "overloaded" };
+    : { type: "inbound_rejected", ids: values, reason: options.reason ?? "overloaded" };
 
   const flush = (): boolean => {
     if (ids.length === 0) return true;

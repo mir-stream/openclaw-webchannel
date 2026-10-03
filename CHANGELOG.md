@@ -45,6 +45,11 @@
   Warm differences and the existing individually oversized-row skip policy
   remain in force; this does not implement #325 body chunking or #299 retention.
 
+- Messaging policy now rejects new inputs before acceptance, broadcast or
+  dispatch. The originating client shows a generic `policy-denied` failure
+  without exposing allowlist configuration. This extends unreleased protocol 7
+  and requires client/plugin lockstep; existing receipts still replay (#442).
+
 ### Security trust (#408, #411, #412)
 
 - Unknown JWT kids can trigger at most one shared JWKS refresh per 30 seconds.

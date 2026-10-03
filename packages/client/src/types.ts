@@ -44,18 +44,20 @@ export type SendState = "queued" | "sent" | "accepted" | "failed";
  *                   `cause` carries the original `WebChannelErrorCause`.
  * - `overloaded`  — plugin rejected ingress due to bounded retained-work pressure;
  *                   caller-directed retry is allowed, but never automatic.
+ * - `policy-denied` — the plugin refused new input before acceptance under its
+ *                   messaging policy; contact the operator, with no auto retry.
  * - `turn-failed` — the turn was admitted but settled with `outcome:"error"`;
  *                   caller-directed re-sending is allowed when ready.
  * - `cancelled`   — the user intentionally cancelled the send (a `/stop`
  *                   hold-retraction or `retract()`); never retryable.
  *
  * Runtime policy is `true` for `evicted`/`overloaded`/`turn-failed`, and `false`
- * for `closed`/`terminal`/`cancelled`. Readiness is separate: a caller still must not
+ * for `closed`/`terminal`/`cancelled`/`policy-denied`. Readiness is separate: a caller still must not
  * retry until the current instance is ready (and terminal recovery needs a new
  * instance), even where the surrounding application offers a recovery action.
  */
 export type SendFailure = {
-  reason: "closed" | "evicted" | "terminal" | "overloaded" | "turn-failed" | "cancelled";
+  reason: "closed" | "evicted" | "terminal" | "overloaded" | "policy-denied" | "turn-failed" | "cancelled";
   /** For `reason === "terminal"`: the original connection-failure classification. */
   cause?: WebChannelErrorCause;
   retryable: boolean;

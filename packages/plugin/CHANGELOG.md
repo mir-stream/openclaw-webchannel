@@ -59,10 +59,15 @@
 
 Gateway plugin and browser client require a paired upgrade to protocol 7
 (protocol 6 was never released); the exact-match register gate refuses every
-other version. Protocol 7 is unreleased; #396 joins scoped stop and history
+other version. Protocol 7 is unreleased; #396 and #442 join scoped stop and history
 correlation in the same release contract. One reason per bullet, matching
 `protocol.ts`:
 
+- **v7 — pre-admission policy refusal (#442).** `inbound_rejected` adds
+  `reason: "policy-denied"`. The client retires only the matching pending send,
+  displays a generic non-retryable policy failure and stops replaying it.
+  Existing accepted/cancelled receipts remain authoritative. No allowlist
+  configuration is exposed; paired client/plugin deployment is required.
 - **v7 — liveness-only typing renewals (#396).** Periodic `typing.keepalive`
   frames refresh application watches without re-arming typing or holding
   followups after output or approval. Ignoring the marker would queue those inputs.

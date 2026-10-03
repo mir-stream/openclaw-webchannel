@@ -258,6 +258,22 @@ it("shows terminal auth failures with re-authentication rather than a send retry
   expect(sent).toHaveLength(1);
 });
 
+it("#442 shows generic policy refusal on the originating send without implying acceptance or exposing configuration", async () => {
+  await mount();
+  submit("policy denied text");
+  await settleUntil(() => sent.length === 1, { label: "policy attempt" });
+  deliver({ type: "inbound_rejected", ids: [sent[0].id], reason: "policy-denied" });
+  const status = root.querySelector('[data-send-state="failed"]');
+  expect(status?.textContent).toContain("Not accepted · messaging policy");
+  expect(status?.textContent).toContain("Contact the operator");
+  expect(status?.textContent).not.toContain("allowlist");
+  expect(root.textContent).not.toContain("Accepted by agent");
+  expect(root.textContent).toContain("● connected");
+  expect(button("Restore draft")).toBeUndefined();
+  await setImmediate();
+  expect(sent).toHaveLength(1);
+});
+
 it.each(["replacement", "expired auth"])("#395 preserves held text across %s without resending", async reason => {
   await mount();
   submit("already published");

@@ -30,7 +30,7 @@ import { sealEnvelope, openEnvelope } from "./e2e-session.js";
 import { isValidSubjectToken } from "./subject-token.js";
 import type { CommandCatalogEntry } from "./commands-catalog.js";
 import { createIngressResultChunkWriter } from "./ingress-result-chunks.js";
-import type { IngressResultFrame } from "./ingress-result-chunks.js";
+import type { IngressRejectionReason, IngressResultFrame } from "./ingress-result-chunks.js";
 import { logSafe } from "./log-safe.js";
 // #246 half A: the runtime decoder both receive doors run before anything acts on
 // a frame. Pure and dependency-light (types + one shared length bound), so it adds
@@ -863,8 +863,8 @@ export class NatsChannel implements WebChannelPeerChannel {
     return this.sendIngressResult(peerId, "ack", ids, committed, cancelled, unaccepted);
   }
 
-  sendInboundRejected(peerId: string, ids: string[]): boolean {
-    return this.sendIngressResult(peerId, "inbound_rejected", ids);
+  sendInboundRejected(peerId: string, ids: string[], reason: IngressRejectionReason = "overloaded"): boolean {
+    return this.sendIngressResult(peerId, "inbound_rejected", ids, undefined, undefined, undefined, reason);
   }
 
   /** Actual serialized/sealed length for result-frame admission chunking. */
@@ -1164,6 +1164,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>,
     cancelled?: string[],
     unaccepted?: string[],
+    reason?: IngressRejectionReason,
   ): boolean {
     if (candidates.length === 0) return true;
     const advertisedLimit = this.transport.effectiveOutboundLimit;
@@ -1173,6 +1174,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     try {
       const writer = createIngressResultChunkWriter({
         type,
+        reason,
         publish: (frame) => this.sendToPeer(peerId, frame),
         measureWireBytes: (frame) =>
           this.outboundWireSize(peerId, frame)

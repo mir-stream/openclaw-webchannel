@@ -256,4 +256,54 @@ describe("#414 encrypted receive ordering", () => {
       ]));
     } finally { h.wrapper.close(); }
   });
+
+  it("scopes durable-adoption refusal evidence to the journal epoch", async () => {
+    const h = await setupEncryptedEpochHarness();
+    try {
+      const receipt = h.wrapper.send("accepted only in epoch A")!;
+      await settleUntil(() => h.received.length === 1, { label: "epoch A publish" });
+      const sent = h.received[0]!;
+      h.deliver({ type: "user_committed", epoch: "A", id: "a-user-1",
+        text: sent.text, random_id: sent.random_id, turnId: sent.id, seq: 1 });
+
+      h.deliver({ type: "inbound_rejected", epoch: "A", ids: [sent.id!], reason: "policy-denied" });
+      expect(receipt.snapshot().state).toBe("sent");
+      expect(h.lowLevel().unackedLedger.size).toBe(1);
+
+      h.deliver({ type: "inbound_rejected", epoch: "B", ids: [sent.id!], reason: "policy-denied" });
+      expect(receipt.snapshot()).toMatchObject({
+        state: "failed", failure: { reason: "policy-denied", retryable: false },
+      });
+      expect(h.lowLevel().unackedLedger.size).toBe(0);
+    } finally { h.wrapper.close(); }
+  });
+
+  it("records a new-epoch snapshot before its reset subscriber can inject a refusal", async () => {
+    const h = await setupEncryptedEpochHarness();
+    try {
+      const receipt = h.wrapper.send("new epoch durable send")!;
+      await settleUntil(() => h.received.length === 1, { label: "old epoch publish" });
+      const sent = h.received[0]!;
+      let injected = false;
+      const unsubscribe = h.wrapper.subscribe(state => {
+        if (!injected && state.messages.some(row => row.text === sent.text)) {
+          injected = true;
+          h.deliver({ type: "inbound_rejected", epoch: "B", ids: [sent.id!], reason: "policy-denied" });
+        }
+      });
+      h.deliver({ type: "history", epoch: "B", highWaterSeq: 1, messages: [{
+        id: "b-user-1", role: "user", text: sent.text, randomId: sent.random_id,
+        turnId: sent.id, seq: 1,
+      }] });
+      unsubscribe();
+      expect(injected).toBe(true);
+      expect(receipt.snapshot().state).toBe("sent");
+      expect(h.lowLevel().unackedLedger.size).toBe(1);
+
+      h.deliver({ type: "ack", epoch: "B", ids: [sent.id!] });
+      expect(receipt.snapshot().state).toBe("accepted");
+      h.deliver({ type: "turn_settled", epoch: "B", turnId: sent.id, outcome: "ok" });
+      expect(receipt.snapshot().state).toBe("completed");
+    } finally { h.wrapper.close(); }
+  });
 });

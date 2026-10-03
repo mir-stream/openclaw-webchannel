@@ -21,7 +21,7 @@
  * supply no such proof. The exact-match gate requires the client/server change
  * together; this adds no capability negotiation or envelope/package version bump.
  *
- * Protocol 7 is unreleased: #398, #401, #396, #413 and #414 share this contract.
+ * Protocol 7 is unreleased: #398, #401, #396, #413, #414 and #442 share this contract.
  * All ship in one paired client/plugin release.
  *
  * v7 (breaking, #398): an explicit `/stop` carries `cancel_pending`, the
@@ -59,6 +59,12 @@
  * snapshots seed their high-water; `history.omitted` identifies byte-omitted
  * rows without replaying the journal from zero. Client/plugin ship together;
  * ignoring epoch can hide new messages behind reused IDs after reset/restore.
+ *
+ * v7 (breaking, #442): `inbound_rejected.reason: "policy-denied"` refuses
+ * new input before durable acceptance. The client must retire the matching
+ * send/replay ledger and show the generic policy failure; ignoring this reason
+ * would retry a denied request forever. Client/plugin ship together in the
+ * same unreleased v7 contract, with no version increment or negotiation.
  *
  * When to bump (#160)
  * ───────────────────

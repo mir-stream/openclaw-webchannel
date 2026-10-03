@@ -87,6 +87,10 @@ export function sendStatusCopy(message: ChatBubble): { label: string; hint?: str
       const failure = message.sendFailure;
       const restoreDraft = failure?.retryable === true;
       switch (failure?.reason) {
+        case "policy-denied": return {
+          label: "Not accepted · messaging policy",
+          hint: "Contact the operator to request access. This message was not accepted.",
+        };
         case "overloaded": return {
           label: "Send failed · agent overloaded",
           hint: "The agent did not accept this message. Restore the draft and send when ready.",

@@ -103,6 +103,17 @@ Telegram Bot API/MTProto 계약을 그대로 따르는 것이다.
 | 구현 상태 (2026-10-02) | 거부 프레임과 정정된 cross-account 사유 매핑은 PR #421에서 구현 중이다. 아직 `develop`에 병합되지 않았다. |
 | 관련 | #400, [PR #421](https://github.com/mir-stream/openclaw-webchannel/pull/421) |
 
+### TD-A5. 입장 정책 거부는 수락 전 요청 상태로 알린다
+
+| | |
+| --- | --- |
+| Telegram | 앱의 메시지는 Telegram 서버가 수락하고, 봇 플러그인은 별도 sender 정책으로 실행을 차단한다. 로컬 레퍼런스 `extensions/telegram/src/bot-message-context.ts`의 `resolveTelegramDmAllow`/DM policy gate 참조. |
+| WebChannel 목표 결정 | 플러그인이 서버 역할도 소유하므로 새 입력은 수락·broadcast 전에 거부한다. 해당 요청 ID에 `inbound_rejected{reason:"policy-denied"}`를 보내며 allowlist 내용·상세 이유는 공개하지 않는다. client는 자동 재시도 없이 일반적인 정책 거부를 표시한다. |
+| 의도 | 실행할 권한이 없는 새 입력을 수락한 대화 행으로 만들지 않고, 사용자는 요청이 거부됐다는 사실을 알 수 있게 한다. 가짜 agent 메시지로 상태를 대체하지 않는다. |
+| 결정 | 2026-10-02, 프로젝트 오너. 2026-10-03 재개 지시로 재확인. |
+| 구현 상태 (2026-10-03) | 일반/제어 입력 앞의 gate, 암호화·크기 제한을 지키는 결과 프레임, client의 상관된 terminal send 상태 및 데모 안내로 구현. 이미 확정된 수락·취소·stop·convergence 영수증은 정책 변경 후에도 그대로 응답한다. 거부 자체는 새 durable 대화 행이나 영구 tombstone이 아니다. |
+| 재검토 | 서버 입장 정책과 실행 시점 권한 정책을 분리하는 제품 요구가 생길 때. |
+| 관련 | #442, #415 A5, #406, protocol 7 |
 
 ### TD-E7. 브라우저 bootstrap JWT는 최대 1시간으로 제한한다
 

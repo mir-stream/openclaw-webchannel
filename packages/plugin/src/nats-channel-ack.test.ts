@@ -273,3 +273,28 @@ describe("P0-7b — NatsChannel.sendAck", () => {
     expect(transport.published).toHaveLength(0);
   });
 });
+
+it("#442 sends bounded, encrypted policy refusals without ACK fields or policy configuration", () => {
+  const transport = new RecordingTransport();
+  const key = new Uint8Array(32).fill(9);
+  const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant", {
+    identityKeyPair: generateKeyPair(), keyStore: { getOrCreate: () => key } as never,
+  });
+  channel.registerPeer("peer");
+  transport.published.length = 0;
+  transport.effectiveOutboundLimit = 600;
+  const ids = Array.from({ length: 70 }, (_, i) => `id-${i}-${"x".repeat(64)}`);
+  try {
+    expect(channel.sendInboundRejected("peer", ids, "policy-denied")).toBe(true);
+    const frames = transport.published.map(({ payload }) => {
+      expect(Buffer.byteLength(payload)).toBeLessThanOrEqual(600);
+      return openEnvelope(Buffer.from(payload), key).message as Extract<IngressResultFrame, { type: "inbound_rejected" }>;
+    });
+    expect(frames.length).toBeGreaterThan(1);
+    expect(frames.flatMap(frame => frame.ids)).toEqual(ids);
+    for (const frame of frames) {
+      expect(frame.reason).toBe("policy-denied");
+      expect(Object.keys(frame).sort()).toEqual(["ids", "reason", "type"]);
+    }
+  } finally { channel.dispose(); }
+});
