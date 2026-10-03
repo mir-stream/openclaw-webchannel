@@ -603,3 +603,26 @@ it.each(["user", "tenant"])("#395 retires held memory when /me observes a differ
   expect(byId("chat-lane").textContent).not.toContain("old login's unsent text");
   expect(FakeNatsWS.instances[0].readyState).toBe(FakeNatsWS.CLOSED);
 });
+
+it.each(["network", "server error"])("#395 preserves held text through a transient BFCache session lookup %s", async failure => {
+  await boot();
+  await settleUntil(() => FakeNatsWS.instances.length === 1, { label: "initial client" });
+  queueDraft("held through session lookup failure");
+  tab("beta").click();
+  await settleUntil(() => FakeNatsWS.instances.length === 2, { label: "beta client" });
+  tab("alpha").click();
+  await settleUntil(() => FakeNatsWS.instances.length === 3, { label: "alpha return" });
+  expect(heldDrafts()).toHaveLength(1);
+  pageEvent("pagehide");
+  if (failure === "network") beforeFetch = async path => { if (path === "/me") throw new Error("offline"); };
+  else meStatus = 503;
+  pageEvent("pageshow");
+  await setImmediate();
+  expect(byId("app").classList.contains("hidden")).toBe(true);
+  pageEvent("pagehide");
+  beforeFetch = undefined; meStatus = 200;
+  pageEvent("pageshow");
+  await settleUntil(() => FakeNatsWS.instances.length === 4, { label: "revalidated same login" });
+  expect(heldDrafts()).toEqual([expect.stringContaining("held through session lookup failure")]);
+  expect(composer().value).toBe("");
+});

@@ -285,19 +285,20 @@ async function mountForSession(me: Me, owner: AbortController, restore?: SavedLa
 async function tryResumeSession(): Promise<void> {
   const owner = sessionOwner;
   try {
-    const { ok, data } = await api<Me>("/me", { signal: owner.signal });
+    const { ok, data, status } = await api<Me>("/me", { signal: owner.signal });
     if (!ownsSession(owner)) return;
     const restore = savedLane;
     savedLane = undefined;
     if (ok && data.username) await mountForSession(data, owner, restore);
     else {
-      forgetHeldDrafts();
+      // A transient lookup failure does not prove that this login ended.
+      // Keep its hidden memory until revalidation or an explicit new login.
+      if (ok || status === 401 || status === 403) forgetHeldDrafts();
       showSignIn();
     }
   } catch {
     if (!ownsSession(owner)) return;
     savedLane = undefined;
-    forgetHeldDrafts();
     showSignIn();
     $("login-err").textContent = "Session lookup failed. Sign in to continue.";
   }
