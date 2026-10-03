@@ -8,6 +8,10 @@
   demo/reference/example issuers keep their existing five-minute default.
   External issuers must supply `iat` and shorten longer-lived tokens.
 
+- Inline NATS user JWTs and seeds now carry sensitive config hints for both
+  flat and named accounts. Core config/UI responses mask them; inline parsing
+  remains compatible and SecretRef resolution is deferred (#443, #415 D7).
+
 ### Changed
 
 - The inbound reply pipeline honors configured response prefixes and selected

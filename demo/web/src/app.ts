@@ -38,6 +38,20 @@ let suspended = false;
 let logoutState: "idle" | "pending" | "failed" = "idle";
 type SavedLane = { username: string; accountId: string; draft: string };
 let savedLane: SavedLane | undefined;
+// Survives lane replacement and BFCache in this document only. A new login or
+// identity retires the whole store; each account owns a separate draft map.
+let heldSession: { username: string; tenant: string; accounts: Map<string, Map<string, string>> } | undefined;
+
+function forgetHeldDrafts(): void {
+  for (const drafts of heldSession?.accounts.values() ?? []) drafts.clear();
+  heldSession = undefined;
+}
+
+function reconcileHeldAccounts(accounts: string[]): void {
+  for (const id of heldSession?.accounts.keys() ?? []) {
+    if (!accounts.includes(id)) heldSession!.accounts.delete(id);
+  }
+}
 
 function ownsSession(owner: AbortController): boolean {
   return !suspended && sessionOwner === owner && !owner.signal.aborted;
@@ -90,8 +104,13 @@ async function mountLane(accountId: string, draft = ""): Promise<void> {
   const laneBody = $("chat-lane");
   const mount = el("div");
   laneBody.replaceChildren(mount);
+  let drafts = heldSession?.accounts.get(accountId);
+  if (!drafts) {
+    drafts = new Map();
+    heldSession?.accounts.set(accountId, drafts);
+  }
   try {
-    const teardown = await createWidget(mount, config, accountId, owner.signal, draft);
+    const teardown = await createWidget(mount, config, accountId, owner.signal, draft, drafts);
     if (laneOwner !== owner || owner.signal.aborted) {
       teardown();
       return;
@@ -158,6 +177,7 @@ async function reconcileGrants(accounts: string[], owner: AbortController): Prom
     clearLane();
     $("chat-lane").replaceChildren();
   }
+  reconcileHeldAccounts(accounts);
   if (!activeAccount && accounts.length > 0) {
     activeAccount = accounts[0];
     await mountLane(accounts[0]);
@@ -169,6 +189,11 @@ async function reconcileGrants(accounts: string[], owner: AbortController): Prom
 async function mountForSession(me: Me, owner: AbortController, restore?: SavedLane): Promise<void> {
   if (!ownsSession(owner)) return;
   sessionUsername = me.username;
+  if (heldSession?.username !== me.username || heldSession.tenant !== me.tenant) {
+    forgetHeldDrafts();
+    heldSession = { username: me.username, tenant: me.tenant, accounts: new Map() };
+  }
+  reconcileHeldAccounts(Object.keys(me.accounts));
   const appEl = $("app");
   const who = $("whoami");
   who.textContent = `${me.username}${me.isAdmin ? " (admin)" : ""}`;
@@ -208,6 +233,12 @@ async function mountForSession(me: Me, owner: AbortController, restore?: SavedLa
       const res = await api<Me>("/me", { signal: owner.signal });
       if (!ownsSession(owner)) return;
       if (res.ok && res.data.accounts) {
+        if (res.data.username !== heldSession?.username || res.data.tenant !== heldSession?.tenant) {
+          const replacement = resetSession();
+          forgetHeldDrafts();
+          await mountForSession(res.data, replacement);
+          return;
+        }
         Object.assign(config.accounts, res.data.accounts);
         await reconcileGrants(Object.keys(res.data.accounts), owner);
       }
@@ -254,12 +285,17 @@ async function mountForSession(me: Me, owner: AbortController, restore?: SavedLa
 async function tryResumeSession(): Promise<void> {
   const owner = sessionOwner;
   try {
-    const { ok, data } = await api<Me>("/me", { signal: owner.signal });
+    const { ok, data, status } = await api<Me>("/me", { signal: owner.signal });
     if (!ownsSession(owner)) return;
     const restore = savedLane;
     savedLane = undefined;
     if (ok && data.username) await mountForSession(data, owner, restore);
-    else showSignIn();
+    else {
+      // A transient lookup failure does not prove that this login ended.
+      // Keep its hidden memory until revalidation or an explicit new login.
+      if (ok || status === 401 || status === 403) forgetHeldDrafts();
+      showSignIn();
+    }
   } catch {
     if (!ownsSession(owner)) return;
     savedLane = undefined;
@@ -305,6 +341,7 @@ function wireLogin(): void {
     if (suspended || logoutState !== "idle" || btn.disabled) return;
     savedLane = undefined;
     const owner = resetSession();
+    forgetHeldDrafts();
     err.textContent = "";
     btn.disabled = true;
     const username = ($("username") as HTMLInputElement).value.trim();
@@ -341,6 +378,7 @@ function wireLogout(): void {
     logoutState = "pending";
     savedLane = undefined;
     const owner = resetSession();
+    forgetHeldDrafts();
     logout.disabled = true;
     logout.textContent = "Signing out…";
     const login = $("login-btn") as HTMLButtonElement;
