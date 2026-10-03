@@ -69,6 +69,22 @@ function resolver(): JWKSCache {
   return JWKSCache.create({ jwks }, {});
 }
 
+describe("malformed JWTs do not reach JWKS (#408)", () => {
+  it.each([" ", "=", "AA+/"])("rejects a non-base64url signature %j before resolving kid", async (signature) => {
+    const getKey = vi.fn().mockRejectedValue(new Error("unexpected fetch"));
+    const token = `${b64url({ alg: "RS256", kid: "random" })}.${b64url({})}.${signature}`;
+    await expect(verifyJwt(token, { jwks: { getKey }, issuer: ISSUER, audience: AUDIENCE })).resolves.toBeNull();
+    expect(getKey).not.toHaveBeenCalled();
+  });
+
+  it.each(["not-json", "null", "[]"])("rejects payload %s before resolving kid", async (payload) => {
+    const getKey = vi.fn().mockRejectedValue(new Error("unexpected fetch"));
+    const token = `${b64url({ alg: "RS256", kid: "random" })}.${Buffer.from(payload).toString("base64url")}.AAAA`;
+    await expect(verifyJwt(token, { jwks: { getKey }, issuer: ISSUER, audience: AUDIENCE })).resolves.toBeNull();
+    expect(getKey).not.toHaveBeenCalled();
+  });
+});
+
 describe("verifyJwt critical headers (#415 E7)", () => {
   it.each([ ["extension"], [], null, "extension", ["alg"], ["extension", "extension"] ].map(crit => ({ crit })))(
     "rejects unsupported or malformed crit=$crit before resolving a key",

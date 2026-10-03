@@ -6,8 +6,13 @@ own `.in`/`.register` subjects. Real nats-server tests prove sibling-account
 and agent-direction publication rejection. SaaS/plugin require a lockstep
 upgrade and explicit reissue to narrow existing credentials; doctor identifies
 legacy broad agent grants. Existing grants are accepted until expiry/revocation,
-including non-expiring grants that require explicit replacement. See
-[credential rollout](AUTH.md#nats-credential-scope-and-rollout).
+including non-expiring grants that require explicit replacement. Credential-only
+reissue retains history and keys only when storage remains bound to the same
+trusted issuer; a storage-issuer failure requires the
+[issuer-recovery procedure](STORAGE_IDENTITY_V2.md#issuer-binding-412) first:
+restore the original trusted issuer and matching credentials where supported,
+or archive the complete tuple and initialize fresh state. Credential-only reissue
+cannot bypass it. See [credential rollout](AUTH.md#nats-credential-scope-and-rollout).
 
 Sync robustness (#413/#414): byte-incomplete cold snapshots seed their journal
 high-water immediately. Omitted row identities are exposed separately; older
@@ -27,6 +32,15 @@ delivered no answer text now reports delivery failure through the existing
 durable turn settlement and client failure state, without inventing an
 assistant message.
 Text-bearing replies and intentional silence retain their previous behavior.
+
+Security trust (#408, #411, #412): unknown JWT kids share one refresh and a
+30-second cooldown; failed/missing-key refreshes preserve fresh cached keys
+without extending their TTL. SaaS URLs require HTTPS except loopback HTTP
+(`localhost`, `127.0.0.0/8`, `::1`). Each tuple's history and conversation keys
+are bound to the effective JWT issuer by `storage-issuer.json`. Changed,
+unrecorded or invalid ownership refuses that account's startup. Existing
+unbound state requires explicit operator archiving and fresh initialization;
+doctor explains the exact paths. See [issuer binding](STORAGE_IDENTITY_V2.md#issuer-binding-412).
 
 Quiet-turn liveness (#396): normal turns send an initial typing indicator and
 renew ephemeral `typing` with `keepalive: true` every 4 seconds until completion,

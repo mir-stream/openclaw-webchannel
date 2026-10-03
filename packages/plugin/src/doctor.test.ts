@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import { assertValidAccountId, type PersistedEnrolledCreds } from "./account-config.js";
@@ -28,7 +28,10 @@ import { StorageDocumentError } from "./storage-document.js";
 import { STORAGE_IDENTITY_VERSION } from "./storage-identity.js";
 import { tupleStoragePaths } from "./storage-paths.js";
 
-const cfg = (webchannel: Record<string, unknown>): OpenClawConfig => ({ channels: { webchannel } } as never);
+let doctorStorageRoot: string;
+beforeEach(() => { doctorStorageRoot = mkdtempSync(join(tmpdir(), "webchannel-doctor-")); });
+afterEach(() => { rmSync(doctorStorageRoot, { recursive: true, force: true }); });
+const cfg = (webchannel: Record<string, unknown>): OpenClawConfig => ({ channels: { webchannel: { storageRoot: doctorStorageRoot, ...webchannel } } } as never);
 const identityKey = { publicKey: new Uint8Array(32), privateKey: new Uint8Array(32) };
 const persisted = {
   userJwt: "J",
@@ -75,6 +78,41 @@ describe("legacy agent NATS grants (#409)", () => {
       env: {}, loadPersistedEnrolledCreds: () => ({ ...persisted, userJwt: jwt(["webchannel.t.>"]) }),
     });
     expect(findings.find(f => f.checkId === "legacy-agent-nats-scope")?.message).toContain("no expiry");
+  });
+
+  it("keeps issuer-mismatched storage blocked across broad and narrow credential diagnosis", () => {
+    const paths = tupleStoragePaths({ tenant: "t", accountId: "default", storageRoot: doctorStorageRoot });
+    const markerPath = join(paths.directory, "storage-issuer.json");
+    mkdirSync(paths.directory, { recursive: true });
+    writeFileSync(markerPath, JSON.stringify({
+      version: 1,
+      tenant: "t",
+      accountId: "default",
+      issuer: "https://old-issuer",
+    }));
+    writeFileSync(paths.conversationKeyPath, "existing private state");
+    const before = [markerPath, paths.conversationKeyPath].map(path => readFileSync(path));
+    const config = cfg({ tenant: "t", auth: validAuth() });
+
+    const diagnose = (allow: string[]) => evaluateWebchannelDoctor(config, {
+      env: {},
+      loadPersistedEnrolledCreds: () => ({ ...persisted, userJwt: jwt(allow) }),
+    });
+    const broad = diagnose(["webchannel.t.>"]);
+    expect(broad).toEqual(expect.arrayContaining([
+      expect.objectContaining({ checkId: "legacy-agent-nats-scope", severity: "warn" }),
+      expect.objectContaining({ checkId: "storage-issuer-failed", severity: "error" }),
+    ]));
+    expect(broad.find(f => f.checkId === "legacy-agent-nats-scope")?.fix)
+      .toMatch(/credential reissue cannot bypass/i);
+
+    const narrow = diagnose(["webchannel.t.default.>"]);
+    expect(narrow.some(f => f.checkId === "legacy-agent-nats-scope")).toBe(false);
+    expect(narrow).toContainEqual(expect.objectContaining({
+      checkId: "storage-issuer-failed",
+      severity: "error",
+    }));
+    expect([markerPath, paths.conversationKeyPath].map(path => readFileSync(path))).toEqual(before);
   });
 });
 
@@ -278,7 +316,7 @@ describe("evaluateWebchannelDoctor findings", () => {
   });
 
   it("does not diagnose acquisition env that is honored beside lifecycle metadata only", () => {
-    const findings = evaluateWebchannelDoctor(cfg({ enabled: true }), {
+    const findings = evaluateWebchannelDoctor({ channels: { webchannel: { enabled: true } } }, {
       env: {
         WEBCHANNEL_TENANT: "legacy-tenant",
         WEBCHANNEL_SAAS_BASE_URL: "https://legacy-saas.example",

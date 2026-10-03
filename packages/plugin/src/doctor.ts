@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { StorageIssuerError } from "./storage-issuer.js";
 
 import type {
   BaseProbeResult,
@@ -59,6 +60,7 @@ export type DoctorCheckId =
   | "credential-binding-failed"
   | "credential-storage-failed"
   | "legacy-agent-nats-scope"
+  | "storage-issuer-failed"
   | "identity-key-missing"
   | "verifier-unbuildable"
   | "audience-override-removed"
@@ -267,6 +269,7 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
             accountId,
             saasBaseUrl: source.saasBaseUrl,
           }, {
+            migrateLegacy: false,
             ...(source.storageRoot !== undefined
               ? { storageRoot: source.storageRoot }
               : {}),
@@ -344,8 +347,10 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
       findings.push({
         accountId, checkId: "legacy-agent-nats-scope", kind: "auth", severity: "warn",
         message: legacyScope,
-        fix: "Upgrade SaaS and plugin together. Stop this account, archive its credential file (keep history and conversation keys), " +
+        fix: "Upgrade SaaS and plugin together. If storage issuer checks pass for the same trusted issuer, stop this account, " +
+          "archive only its credential file (keep history and conversation keys), " +
           `complete any required SaaS active-key replacement, then re-enroll: ${reEnrollFix(accountId)}. ` +
+          "If storage-issuer-failed is also reported, first follow docs/STORAGE_IDENTITY_V2.md#issuer-binding-412 to restore the original trusted issuer and matching credentials where supported, or archive the complete tuple and initialize fresh state; credential reissue cannot bypass that error. " +
           "Confirm the new grant before explicitly revoking an old non-expiring credential.",
       });
     }
@@ -391,11 +396,11 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
     } catch (err) {
       findings.push({
         accountId,
-        checkId: "verifier-unbuildable",
+        checkId: err instanceof StorageIssuerError ? "storage-issuer-failed" : "verifier-unbuildable",
         kind: "config",
         severity: "error",
         message: errorMessage(err),
-        fix: "Correct the effective JWT issuer and exactly-one JWKS source named above.",
+        fix: err instanceof StorageIssuerError ? err.fix : "Correct the effective JWT issuer and exactly-one JWKS source named above.",
       });
     }
   }
@@ -534,6 +539,7 @@ export async function probeWebchannelAccount(params: {
             accountId,
             saasBaseUrl: source.saasBaseUrl,
           }, {
+            migrateLegacy: false,
             ...(source.storageRoot !== undefined
               ? { storageRoot: source.storageRoot }
               : {}),

@@ -14,10 +14,16 @@
   by NATS. Existing subscriptions and multi-account browser access are unchanged.
 - Existing credentials remain usable until their original expiry or explicit
   revocation. Doctor warns about old broad agent grants and explains reissue:
-  upgrade both packages, stop the affected account, archive its credential file,
-  complete any required SaaS active-key replacement, then explicitly re-enroll.
-  Keep conversation keys and history. Credentials without `exp` do not expire
-  automatically; replace and explicitly revoke them to end their old privileges.
+  for state already bound to the same trusted issuer, upgrade both packages,
+  stop the affected account, archive only its credential file, complete any
+  required SaaS active-key replacement, then explicitly re-enroll while keeping
+  conversation keys and history. A storage-issuer failure must instead follow
+  [the issuer-recovery procedure](docs/STORAGE_IDENTITY_V2.md#issuer-binding-412)
+  first: restore the original trusted issuer and matching credentials where
+  supported, or archive the complete tuple and initialize fresh state.
+  Credential-only reissue cannot bypass it. Credentials without `exp` do not
+  expire automatically; replace and explicitly revoke them to end their old
+  privileges.
   Browser users must obtain new credentials to receive the publish restriction.
   Encrypted frames and protocol version 7 are unchanged. AAD direction binding
   remains tracked in #436, and client replay/freshness in #415 E4.
@@ -38,6 +44,24 @@
   row no longer triggers full-journal replay or holds later live frames.
   Warm differences and the existing individually oversized-row skip policy
   remain in force; this does not implement #325 body chunking or #299 retention.
+
+### Security trust (#408, #411, #412)
+
+- Unknown JWT kids can trigger at most one shared JWKS refresh per 30 seconds.
+  Failed refreshes and responses without that kid preserve the original fresh
+  cache and expiry; expired keys still fail closed. Malformed compact JWTs are
+  rejected before key lookup.
+- **Breaking:** SaaS base URLs require HTTPS; HTTP is permitted only for
+  `localhost`, `127.0.0.0/8` and `::1`, with no bypass flag. Enrollment, runtime,
+  preflight and doctor use the same rule. Local loopback demos still work.
+- **Breaking storage upgrade:** the effective issuer now owns the account's
+  history and conversation keys. Fresh state gets a private issuer marker;
+  existing unbound state, resumable legacy migration archives, a changed issuer,
+  or invalid metadata refuses that account's startup. There is no automatic
+  migration or deletion. Stop affected gateways, archive the complete tuple and
+  any pending migration claim, and explicitly initialize/re-enroll fresh state.
+  Doctor and the [runbook](docs/STORAGE_IDENTITY_V2.md#issuer-binding-412) give
+  the procedure. Re-enrolling credentials alone cannot relabel old data.
 
 ### Changed
 

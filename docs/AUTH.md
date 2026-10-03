@@ -131,6 +131,18 @@ unnecessary: the signed tenant claim and account-id `aud` binding distinguish
 token populations even when accounts share an issuer. JWKS outages fail closed
 but are retryable; invalid tokens are terminal rejects.
 
+Unknown kids share a single in-flight refresh and a 30-second cooldown across
+all kids. A failed refresh or one without the requested kid retains previously
+cached keys only until their original TTL expires. A known fresh key remains
+usable during that refresh; no expired key is used as an outage fallback.
+Malformed JWT segments and payloads are rejected before JWKS lookup (#408).
+
+Configured SaaS base URLs require HTTPS, except HTTP on `localhost`,
+`127.0.0.0/8` or `::1`. There is no bypass flag. Enrollment,
+derived JWKS URLs, preflight and doctor enforce this same configured-URL rule
+(#411). Redirect-target validation is separate pre-existing behavior tracked in
+[#452](https://github.com/mir-stream/openclaw-webchannel/issues/452).
+
 The deprecated `auth.ticketParam` schema key remains accepted only so loading can
 produce a targeted migration error. Remove it and rerun
 `openclaw channels add --channel webchannel`.
@@ -154,13 +166,18 @@ browser subscriptions; the browser never needs to publish agent frames.
 Existing JWTs are immutable and retain their old privileges until expiry or
 explicit revocation. Doctor warns when an enrolled agent grant is broader than
 its account; it does not reject or revoke that grant. To narrow it, upgrade SaaS
-and plugin together, stop the account, archive only its credential file, complete
-the existing SaaS active-key replacement procedure, and explicitly re-enroll with
-`openclaw channels add --channel webchannel --account <id>`. Verify the new grant
-before revoking the old one. Preserve history and conversation keys. An old JWT
-without `exp` needs explicit replacement/revocation; waiting does not narrow it.
-Browser sessions likewise need newly issued credentials for the new publish
-restrictions to apply.
+and plugin together. For state already bound to the same trusted issuer, stop the
+account, archive only its credential file, complete the existing SaaS active-key
+replacement procedure, and explicitly re-enroll with
+`openclaw channels add --channel webchannel --account <id>`; this retains history
+and conversation keys. If doctor reports a storage-issuer failure, credential-only
+reissue cannot bypass it: first follow the
+[issuer-recovery procedure](STORAGE_IDENTITY_V2.md#issuer-binding-412) to restore
+the original trusted issuer and matching credentials where supported, or archive
+the complete tuple and initialize fresh state without reusing its history or keys.
+Verify the new grant before revoking the old one. An old JWT without `exp` needs
+explicit replacement/revocation; waiting does not narrow it. Browser sessions
+likewise need newly issued credentials for the new publish restrictions to apply.
 
 This changes relay permissions without changing encrypted frames or protocol 7.
 Direction binding in envelope AAD is a separate defense-in-depth follow-up

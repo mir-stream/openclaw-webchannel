@@ -271,12 +271,13 @@ openclaw config get channels.webchannel    # verify
 | `auth.jwt.*` | verifies browser bootstrap JWTs (issuer JWKS) |
 | `admission` | `register-hop` (SaaS bootstrap+PoP) — the sole admission path, see §6 |
 
-> **Container caveat:** from inside a container the SaaS is **not** `127.0.0.1` — use
-> `host.docker.internal:3951` for `saasBaseUrl` **and** `jwksUrl`. The `issuer` value
-> stays as-is (it is a JWT claim string, not an address). NATS is public so its URL is
-> unchanged. On the `channels add` happy path, pass
-> `--base-url http://host.docker.internal:3951` so the **derived** `jwksUrl`/`issuer` come
-> out container-correct.
+> **Container requirement:** the container must reach the SaaS through a trusted
+> HTTPS endpoint, for example `https://saas.example.com`; that same base derives
+> the JWKS URL. Alternatively, use secure forwarding whose HTTP endpoint terminates
+> on loopback inside the container. Plain HTTP through `host.docker.internal` or a
+> LAN address does not satisfy the loopback exception. The logical `issuer` remains
+> the delivered or explicitly configured JWT claim and need not be the network
+> address used by the container.
 
 After hand-writing config this way, still enroll with `openclaw channels add` (§5) — the
 device flow is what persists the creds `gateway run` consumes.
