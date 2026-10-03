@@ -1,4 +1,8 @@
 /**
+ * Historical Phase A test harness; not a production transport or approval path.
+ * Retained for codec conformance tests. Production encryption is owned by
+ * nats-channel.ts and e2e-session.ts, including approval frames.
+ *
  * Approval E2E Crypto — Sub-AC 7.1
  *
  * Typed helpers for encrypt-before-publish / decrypt-on-receive of approval

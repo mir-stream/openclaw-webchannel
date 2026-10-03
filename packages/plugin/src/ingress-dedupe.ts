@@ -159,7 +159,7 @@ export function ingressDedupeKey(item: IngressDedupeItem): string | undefined {
   return ingressIdentity(item)?.key;
 }
 
-/** Scoped, insertion-ordered safety net for cancelled-item record failures. */
+/** Legacy test/compatibility safety net. Production uses SQLite stop targets. */
 export class CancelledInboundFallbackTombstones {
   private readonly keys = new Map<string, number>();
   private bytes = 0;
@@ -1704,7 +1704,9 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
 }
 
 /**
- * P0-7b — handle the inbound items a `/stop` CANCELLED out of the debounce window.
+ * P0-7b legacy callback seam, retained for compatibility tests only. No production
+ * caller records these fallback tombstones; stop-control.ts owns current /stop.
+ * Handle the inbound items a `/stop` CANCELLED out of the debounce window.
  *
  * A message that is still buffered in the pre-run debounce window when the user
  * sends `/stop` is dropped by `cancelKey` (P1-8b's control-lane contract) BEFORE

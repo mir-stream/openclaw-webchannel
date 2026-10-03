@@ -2,7 +2,23 @@
 
 ## Unreleased
 
+- Browser receive doors now reject replayed envelopes, timestamps outside ±10 minutes,
+  and mismatched tenant/account/peer routing (#415 E4). The 16,384-ID cache survives
+  reconnects and refuses new frames at capacity until IDs expire; a new client
+  instance retains only the timestamp defense. Direction-bound AAD/key separation
+  remains outside this change (see #410). Reference/demo X25519 private keys are
+  non-extractable; their public halves still export for bootstrap (#415 E8).
+
 ### Changed
+
+- Enrollment continues after `slow_down`, increasing every subsequent poll interval
+  by five seconds per response. JWT verification rejects unsupported or malformed
+  `crit` headers before resolving signing keys (#415 E6/E7).
+
+- Historical Phase A crypto wrappers are explicitly test-only helpers; their
+  conformance tests remain intact. Production no longer allocates or injects
+  the unwritten legacy cancellation fallback. Current cancellation authority
+  remains the SQLite stop transaction (#415 dead-code findings).
 
 - The reference app fences replaced login/connect attempts and unsubscribes
   retired clients. Terminal recovery uses `errorCause`; transient registration
