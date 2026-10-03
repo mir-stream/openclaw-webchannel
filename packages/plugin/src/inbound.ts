@@ -552,6 +552,38 @@ function deliveryAssistantMessageIndex(info: unknown): number | undefined {
 }
 
 /**
+ * #415 C4: core's reply pipeline prefixes EVERY normalized payload, durable
+ * reasoning included, but the response prefix belongs to the answer only. The
+ * payload transform is the pipeline's one per-payload hook that runs before the
+ * prefix is applied, so it records the reasoning text there; delivery recovers
+ * it below. A prefixed copy would also miss the exact-text CLI snapshot replay
+ * suppression and render a second reasoning row.
+ */
+const REASONING_TEXT_BEFORE_PREFIX = Symbol("webchannel.reasoningTextBeforePrefix");
+type ReasoningTextTaggedPayload = ReplyPayload & {
+  [REASONING_TEXT_BEFORE_PREFIX]?: string;
+};
+
+function tagReasoningTextBeforePrefix(payload: ReplyPayload): ReplyPayload {
+  if (payload.isReasoning !== true || typeof payload.text !== "string") return payload;
+  const tagged: ReasoningTextTaggedPayload = {
+    ...payload,
+    [REASONING_TEXT_BEFORE_PREFIX]: payload.text,
+  };
+  return tagged;
+}
+
+/**
+ * Core prepends `${prefix} `, so the delivered text still ends with the tagged
+ * text. Anything else (a later hook rewrote the payload, or no tag survived)
+ * keeps the delivered text unchanged.
+ */
+function reasoningTextWithoutPrefix(payload: ReplyPayload): string | undefined {
+  const before = (payload as ReasoningTextTaggedPayload)[REASONING_TEXT_BEFORE_PREFIX];
+  return before !== undefined && payload.text?.endsWith(before) ? before : payload.text;
+}
+
+/**
  * Route one draft-mode final without consuming a lane more than once.
  *
  * Notice classification is the only guard here that the downstream lane state
@@ -1016,6 +1048,10 @@ export async function handleInboundMessage(
   // suppressed in favor of its draft. Store acceptance is checked separately.
   let answerPayloadSeen = false;
   let terminalErrorSeen = false;
+  // #415 C7: a final that carried only (unsupported) media. Decided at
+  // settlement, because core re-sends media as its own final after the answer
+  // text was block-streamed, and a media-only final may precede a text final.
+  let undeliveredMediaFinalSeen = false;
   // Final reconciliation is deliberately independent of block callback counts
   // and of `answerDelivered` (which also tracks actual block output for #87).
   // Only the first ordinary, non-notice final before a leading terminal error
@@ -1331,6 +1367,7 @@ export async function handleInboundMessage(
           return {
             cfg: api.config,
             channel: WEBCHANNEL_ID,
+            accountId,
             agentId: route.agentId,
             routeSessionKey: route.sessionKey,
             storePath,
@@ -1338,6 +1375,12 @@ export async function handleInboundMessage(
             recordInboundSession: channelRuntime.session.recordInboundSession,
             dispatchReplyWithBufferedBlockDispatcher:
               channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher,
+            // Opt into core's responsePrefix and model-selection context. An
+            // omitted pipeline bypasses both, even when messages config sets a
+            // prefix. Typing remains owned by this turn's existing keepalive.
+            // The explicit transform keeps reasoning recoverable unprefixed;
+            // this channel registers no plugin transform it would displace.
+            replyPipeline: { transformReplyPayload: tagReasoningTextBeforePrefix },
             // `replyOptions` is UNCONDITIONAL — it is present on every turn,
             // including block/off streaming and the control lane, because
             // `onAgentRunStart` (below) must fire for all of them. Only the
@@ -1555,7 +1598,7 @@ export async function handleInboundMessage(
                   if (reasoning) {
                     reasoningPayloadSeen = true;
                     reasoning.pushDurableBlock({
-                      text: payload.text,
+                      text: reasoningTextWithoutPrefix(payload),
                       isReasoningSnapshot: payload.isReasoningSnapshot,
                     });
                   }
@@ -1564,6 +1607,18 @@ export async function handleInboundMessage(
                 const noticeFlags = noticeFlagsOf(payload);
                 const isNotice = isCoreNoticePayload(payload);
                 const text = payload.text;
+                // Media is not supported by this channel. A final consisting
+                // only of attachments is a refused delivery, just like a
+                // failed sendText, even when core finished its work cleanly —
+                // unless the turn's answer text reached the widget anyway (see
+                // settlement in `finally`). Silence and text-bearing replies
+                // keep their existing rules.
+                if (kind === "final" && !text?.trim()
+                  && (payload.mediaUrl?.trim() || payload.mediaUrls?.some(url => url.trim()))) {
+                  undeliveredMediaFinalSeen = true;
+                  api.logger?.warn?.(`webchannel: media-only final was not delivered for peer=${logSafe(wsKey)} turn=${logSafe(turnId)}`);
+                  return { visibleReplySent: false };
+                }
                 if (!text) {
                   // #94: a text-less BLOCK — media-only, or text stripped by a
                   // hook — sends nothing, but core still SETTLES it at the
@@ -1795,6 +1850,11 @@ export async function handleInboundMessage(
     draft?.stop();
     reasoning?.stop();
     if (draft?.deliveryFailed || reasoning?.deliveryFailed) turnOutcome = "error";
+    // #415 C7: dropped media fails the turn only when it was the whole answer.
+    // `answerPayloadSeen` (not `answerDelivered`) because a partial-mode block
+    // suppressed as redundant with its streamed lane is still visible answer
+    // text; a failed answer delivery already settles `error` on its own path.
+    if (undeliveredMediaFinalSeen && !answerPayloadSeen) turnOutcome = "error";
     // #87: settle `error` when core handed us a terminal failure instead of an
     // answer (see the classification in the delivery seam). This only ever
     // ASSIGNS `"error"`, so it can never downgrade the `catch` above. A turn
