@@ -75,6 +75,11 @@
   flat and named accounts. Core config/UI responses mask them; inline parsing
   remains compatible and SecretRef resolution is deferred (#443, #415 D7).
 
+- Demo held/queued input survives account tabs, re-authentication and BFCache
+  in login/account-scoped memory. Replaced connections show recoverable unsent
+  drafts without automatic resend; logout clears them. Reload persistence
+  remains #368 (#395, #415 F7).
+
 - Browser receive doors now reject replayed envelopes, timestamps outside ±10 minutes,
   and mismatched tenant/account/peer routing (#415 E4). The 16,384-ID cache survives
   reconnects and refuses new frames at capacity until IDs expire; a new client

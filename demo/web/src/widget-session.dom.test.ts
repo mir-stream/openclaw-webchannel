@@ -257,3 +257,59 @@ it("shows terminal auth failures with re-authentication rather than a send retry
   expect(button("Restore draft")).toBeUndefined();
   expect(sent).toHaveLength(1);
 });
+
+it.each(["replacement", "expired auth"])("#395 preserves held text across %s without resending", async reason => {
+  await mount();
+  submit("already published");
+  await settleUntil(() => sent.length === 1, { label: "active turn" });
+  deliver({ type: "typing", turnId: sent[0].id });
+  submit("held first");
+  submit("held second");
+  expect(sent).toHaveLength(1);
+  if (reason === "expired auth") {
+    FakeNatsWS.instances[0].onmessage?.({ data: "-ERR 'Authentication Expired'\r\n" });
+    await settleUntil(() => !!button("Re-authenticate"), { label: "expired auth" });
+    button("Re-authenticate").click();
+  } else button("short-lived").click();
+  await ready(2);
+  const drafts = () => Array.from(root.querySelectorAll<HTMLElement>("[data-held-draft]"));
+  expect(drafts().map(n => n.dataset.heldDraft)).toHaveLength(2);
+  expect(drafts().map(n => n.textContent)).toEqual([
+    expect.stringContaining("held first"), expect.stringContaining("held second"),
+  ]);
+  expect(drafts().every(n => n.textContent!.includes("Not sent"))).toBe(true);
+  expect(drafts().some(n => n.textContent!.includes("already published"))).toBe(false);
+  button("short-lived").click();
+  await ready(3);
+  expect(drafts()).toHaveLength(2);
+  const input = root.querySelector("input")!;
+  input.value = "existing draft";
+  drafts()[0].querySelector<HTMLButtonElement>("button")!.click();
+  expect(input.value).toBe("existing draft held first");
+  expect(drafts()).toHaveLength(1);
+  drafts()[0].querySelector<HTMLButtonElement>('[title="dismiss"]')!.click();
+  expect(drafts()).toHaveLength(0);
+  await setImmediate();
+  expect(sent).toHaveLength(1);
+  button("Send").click();
+  await settleUntil(() => sent.length === 2, { label: "explicit send" });
+  expect(sent[1].text).toBe("existing draft held first");
+  expect(sent[1].id).not.toBe(sent[0].id);
+});
+
+it("#395 keeps held drafts available during failed re-authentication", async () => {
+  await mount();
+  deliver({ type: "typing", turnId: "foreign-turn" });
+  submit("held through failure");
+  beforeFetch = async () => { throw new Error("auth offline"); };
+  button("short-lived").click();
+  await settleUntil(() => root.textContent!.includes("Re-authentication failed"), { label: "failed re-auth" });
+  expect(root.querySelector("[data-held-draft]")?.textContent).toContain("held through failure");
+  expect(root.querySelector('[data-send-state="queued"]')).toBeNull();
+  expect(sent).toEqual([]);
+  beforeFetch = undefined;
+  button("Re-authenticate").click();
+  await ready(2);
+  expect(root.querySelectorAll("[data-held-draft]")).toHaveLength(1);
+  expect(sent).toEqual([]);
+});
