@@ -58,6 +58,7 @@ import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   accountCredentialPath,
   assertNoRemovedAudienceConfig,
+  hasWebchannelConfig,
   loadPersistedCredentialDocument,
   readAccountsMap,
   readWebchannelSection,
@@ -296,6 +297,23 @@ function writeAccountConfig(
   return { ...(cfg as object), channels } as OpenClawConfig;
 }
 
+function hasConfiguredSetupTarget(cfg: OpenClawConfig, accountId: string): boolean {
+  const section = readWebchannelSection(cfg);
+  const accounts = readAccountsMap(section);
+  if (Object.keys(accounts).length > 0) {
+    return Object.prototype.hasOwnProperty.call(accounts, accountId);
+  }
+  return accountId === DEFAULT_WEBCHANNEL_ACCOUNT_ID && hasWebchannelConfig(cfg);
+}
+
+function hasEffectiveDmField(cfg: OpenClawConfig, accountId: string): boolean {
+  const section = readWebchannelSection(cfg);
+  const account = readAccountsMap(section)[accountId];
+  return ["dmPolicy", "dmSecurity", "allowFrom"].some((field) =>
+    account?.[field] !== undefined || section?.[field] !== undefined,
+  );
+}
+
 /**
  * The webchannel `ChannelSetupAdapter`. Attached on the plugin descriptor so
  * `openclaw channels add --channel webchannel --account X …` writes the account
@@ -368,10 +386,12 @@ export const webchannelSetup = {
       return writeAccountConfig(cfg, id, patch);
     }
 
-    const patch = buildAccountPatch(input);
-    // Always write (even an empty patch) so the account exists for `gateway run`
-    // to list. For default with an empty patch on an empty config this is a no-op
-    // shape-wise.
+    let patch = buildAccountPatch(input);
+    if (!hasConfiguredSetupTarget(cfg, id) && !hasEffectiveDmField(cfg, id)) {
+      patch = { dmPolicy: "open", allowFrom: ["*"], ...patch };
+    }
+    // Always write so the account exists for `gateway run` to list. A genuinely
+    // fresh target also receives the minimum valid DM defaults above.
     return writeAccountConfig(cfg, id, patch);
   },
 

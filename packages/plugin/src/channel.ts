@@ -109,8 +109,10 @@ function configRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-/** Return canonical edit paths for the layer that defines each effective DM field. */
-function resolveDmSecurityPaths(cfg: OpenClawConfig, accountId: string): {
+/** Resolve effective DM values and canonical edit paths without reading secrets. */
+function resolveDmSecurityConfig(cfg: OpenClawConfig, accountId: string): {
+  policy: DmPolicy;
+  allowFrom: string[];
   policyPath: string;
   allowFromPath: string;
 } {
@@ -131,7 +133,15 @@ function resolveDmSecurityPaths(cfg: OpenClawConfig, accountId: string): {
     : section?.allowFrom !== undefined
       ? rootBase
       : fallbackBase;
+  const policyConfig = scoped && (scoped.dmPolicy !== undefined || scoped.dmSecurity !== undefined)
+    ? scoped
+    : section;
+  const rawAllowFrom = scoped?.allowFrom !== undefined ? scoped.allowFrom : section?.allowFrom;
   return {
+    policy: resolveDmPolicy(policyConfig),
+    allowFrom: Array.isArray(rawAllowFrom)
+      ? rawAllowFrom.filter((value): value is string => typeof value === "string").map(normalizeDmAllowEntry)
+      : [],
     policyPath: `${policyBase}dmPolicy`,
     // Core audit and doctor append the field name to this prefix.
     allowFromPath: allowFromBase,
@@ -340,20 +350,21 @@ export function createWebChannelPlugin(
         // resolveAccount preserves the exact listed spelling even when the
         // caller used a canonical alias; diagnostics must point at that key.
         const resolvedAccountId = account.accountId;
-        const paths = resolveDmSecurityPaths(cfg, resolvedAccountId);
+        const dm = resolveDmSecurityConfig(cfg, resolvedAccountId);
         return {
           ...buildAccountScopedDmSecurityPolicy({
             cfg,
             channelKey: WEBCHANNEL_ID,
             accountId: resolvedAccountId,
-            policy: account.dmPolicy,
-            allowFrom: account.allowFrom,
+            policy: dm.policy,
+            allowFrom: dm.allowFrom,
             defaultPolicy: "open",
             policyPathSuffix: "dmPolicy",
             allowFromPathSuffix: "",
             normalizeEntry: normalizeDmAllowEntry,
           }),
-          ...paths,
+          policyPath: dm.policyPath,
+          allowFromPath: dm.allowFromPath,
         };
       },
     },

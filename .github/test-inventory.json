@@ -92,7 +92,7 @@
     "packages/plugin/src/dispatch-crash.test.ts": 6,
     "packages/plugin/src/dispatch-recovery.test.ts": 21,
     "packages/plugin/src/dm-allowlist.test.ts": 5,
-    "packages/plugin/src/dm-policy.test.ts": 41,
+    "packages/plugin/src/dm-policy.test.ts": 49,
     "packages/plugin/src/doctor.test.ts": 53,
     "packages/plugin/src/durable-send.test.ts": 31,
     "packages/plugin/src/durable-view-reducer-contract.test.ts": 2,

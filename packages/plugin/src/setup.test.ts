@@ -209,9 +209,11 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
       accountId: "accta",
       input: { tenant: "t" },
     });
-    // No saasBaseUrl ⇒ partial write only (no auth/nats/dmSecurity emitted).
+    // No saasBaseUrl ⇒ partial acquisition fields, plus valid fresh-account DM defaults.
     expect((section(next).accounts as Record<string, unknown>).accta).toEqual({
       tenant: "t",
+      dmPolicy: "open",
+      allowFrom: ["*"],
     });
   });
 
@@ -370,7 +372,10 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
   it("ensures a named account exists even with no flags", () => {
     const cfg = { channels: {} } as never;
     const next = webchannelSetup.applyAccountConfig({ cfg, accountId: "acctz", input: {} });
-    expect((section(next).accounts as Record<string, unknown>).acctz).toEqual({});
+    expect((section(next).accounts as Record<string, unknown>).acctz).toEqual({
+      dmPolicy: "open",
+      allowFrom: ["*"],
+    });
   });
 
   it("canonicalizes the account id before writing (no traversal key)", () => {

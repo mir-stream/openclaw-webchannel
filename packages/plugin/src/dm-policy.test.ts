@@ -11,6 +11,8 @@ import { vi } from "vitest";
 
 const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"));
 const schema = buildJsonChannelConfigSchema(manifest.channelConfigs.webchannel.schema).runtime!;
+const webchannelSection = (cfg: unknown): Record<string, unknown> =>
+  ((cfg as { channels?: { webchannel?: Record<string, unknown> } }).channels?.webchannel ?? {});
 
 describe("SDK DM policy contract (#406)", () => {
   it.each(["dmPolicy", "dmSecurity"])("disabled via %s rejects even an allowlisted/wildcard peer", (field) => {
@@ -101,6 +103,21 @@ describe("SDK DM policy contract (#406)", () => {
     expect(`${policy!.allowFromPath}allowFrom`).toBe("channels.webchannel.accounts.a.allowFrom");
   });
 
+  it.each([
+    { accountId: "default", webchannel: { dmPolicy: "disabled", allowFrom: ["*"] }, policy: "disabled", allowFrom: ["*"] },
+    { accountId: "a", webchannel: { dmPolicy: "allowlist", allowFrom: ["WebChannel:Alice"], accounts: { a: { tenant: "t" } } }, policy: "allowlist", allowFrom: ["Alice"] },
+    { accountId: "a", webchannel: { dmPolicy: "disabled", accounts: { a: { dmSecurity: "pairing", allowFrom: ["webchannel:Bob"] } } }, policy: "pairing", allowFrom: ["Bob"] },
+    { accountId: "a", webchannel: { dmPolicy: "allowlist", allowFrom: ["root"], accounts: { a: { dmPolicy: "open", allowFrom: ["*"] } } }, policy: "open", allowFrom: ["*"] },
+  ])("audits effective $policy policy through the core inspectAccount snapshot path %#", ({ accountId, webchannel, policy, allowFrom }) => {
+    const plugin = createWebChannelPlugin({} as never);
+    const cfg = { channels: { webchannel } } as never;
+    const inspected = plugin.config.inspectAccount!(cfg, accountId) as never;
+    expect(plugin.security!.resolveDmPolicy!({ cfg, accountId, account: inspected })).toMatchObject({
+      policy,
+      allowFrom,
+    });
+  });
+
   it("lets an account-local legacy policy override the shared canonical policy", () => {
     const cfg = { channels: { webchannel: { dmPolicy: "disabled", allowFrom: ["*"], accounts: {
       a: { dmSecurity: "open" }, b: { dmPolicy: "allowlist", allowFrom: ["webchannel:bob"] },
@@ -159,6 +176,43 @@ describe("SDK DM policy contract (#406)", () => {
     const account = resolveWebchannelAccountConfig(next, "default");
     expect(account.dmPolicy).toBe(dmSecurity);
     expect(account.allowFrom).toEqual(["alice"]);
+  });
+
+  it.each(["default", "work"])("partial setup seeds valid DM defaults for a fresh %s account", (accountId) => {
+    const next = webchannelSetup.applyAccountConfig!({ cfg: {} as never, accountId, input: { tenant: "t" } });
+    const section = webchannelSection(next);
+    expect(schema.safeParse(section).success).toBe(true);
+    expect(resolveWebchannelAccountConfig(next, accountId)).toMatchObject({
+      tenant: "t", dmPolicy: "open", allowFrom: ["*"],
+    });
+  });
+
+  it("partial setup preserves existing and inherited restrictive DM configuration", () => {
+    const existing = { channels: { webchannel: { accounts: {
+      a: { dmPolicy: "allowlist", allowFrom: ["alice"] },
+    } } } } as never;
+    const updated = webchannelSetup.applyAccountConfig!({ cfg: existing, accountId: "a", input: { tenant: "t" } });
+    expect(resolveWebchannelAccountConfig(updated, "a")).toMatchObject({
+      tenant: "t", dmPolicy: "allowlist", allowFrom: ["alice"],
+    });
+
+    const existingEmpty = { channels: { webchannel: { accounts: { a: {} } } } } as never;
+    const unchanged = webchannelSetup.applyAccountConfig!({ cfg: existingEmpty, accountId: "a", input: { tenant: "t" } });
+    expect((webchannelSection(unchanged).accounts as Record<string, unknown>).a).toEqual({ tenant: "t" });
+
+    const inherited = { channels: { webchannel: { dmPolicy: "disabled", accounts: { other: {} } } } } as never;
+    const added = webchannelSetup.applyAccountConfig!({ cfg: inherited, accountId: "work", input: { tenant: "t" } });
+    expect((webchannelSection(added).accounts as Record<string, unknown>).work).toEqual({ tenant: "t" });
+    expect(resolveWebchannelAccountConfig(added, "work").dmPolicy).toBe("disabled");
+    expect(schema.safeParse(webchannelSection(added)).success).toBe(true);
+  });
+
+  it("partial credentials-only setup seeds DM defaults for a fresh account", () => {
+    const next = webchannelSetup.applyAccountConfig!({ cfg: {} as never, accountId: "work", input: { credentialsMode: "static" } });
+    expect(resolveWebchannelAccountConfig(next, "work")).toMatchObject({
+      dmPolicy: "open", allowFrom: ["*"], nats: { credentials: { mode: "static" } },
+    });
+    expect(schema.safeParse(webchannelSection(next)).success).toBe(true);
   });
 });
 
