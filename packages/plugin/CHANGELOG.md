@@ -3,8 +3,18 @@
 ## Unreleased
 
 - Inbound debounce now delays execution only. Durable acceptance, ACK and
-  multi-device echo precede the quiet interval, while bounded retention,
+  multi-device echo precede the fixed execution window, while bounded retention,
   cancellation and restart recovery keep their existing contracts (#441).
+
+- Bootstrap JWTs now require finite `iat < exp` and a lifetime of at most one
+  hour (#447). Clock skew applies to issuance/expiry checks, not the lifetime
+  bound. SaaS claim builders and signers enforce the same cap; first-party
+  demo/reference/example issuers keep their existing five-minute default.
+  External issuers must supply `iat` and shorten longer-lived tokens.
+
+- Inline NATS user JWTs and seeds now carry sensitive config hints for both
+  flat and named accounts. Core config/UI responses mask them; inline parsing
+  remains compatible and SecretRef resolution is deferred (#443, #415 D7).
 
 ### Changed
 

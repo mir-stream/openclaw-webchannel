@@ -77,7 +77,7 @@ describe("issueBrowserCredentials", () => {
     expect(creds.userSeedRaw).not.toMatch(/^SU/);
     expect(Buffer.from(creds.userSeedRaw, "base64url")).toHaveLength(32);
     // Pinned to this peer's own subtree.
-    expect(creds.permissions.pub).toEqual(["webchannel.tenant-x.*.peer-1.>"]);
+    expect(creds.permissions.pub).toEqual(["webchannel.tenant-x.*.peer-1.in", "webchannel.tenant-x.*.peer-1.register"]);
     expect(creds.permissions.sub).toEqual(["webchannel.tenant-x.*.peer-1.>"]);
     // base32 userSeed is intentionally dropped from the public shape.
     expect((creds as Record<string, unknown>).userSeed).toBeUndefined();

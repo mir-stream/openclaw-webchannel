@@ -16,10 +16,12 @@ A failed transaction leaves no partial user/pending batch.
 
 Configured inbound debounce applies to execution only (#441). The bounded ingress
 worker has no timed delay: each input commits, broadcasts its server user row and
-receives its ACK before the execution quiet interval. Every newly committed input
-restarts that peer's interval; duplicate replays, recovery polls and rolled-back
-offers do not. The dispatcher still holds the count/byte reservation throughout
-the interval and waits for any running turn or open admission/control lease.
+receives its ACK before the execution debounce window. The first committed input
+opens a fixed window; later inputs join it without moving its deadline. Duplicate
+receipts, recovery polls for already scheduled work and rolled-back offers do not
+move its deadline.
+The dispatcher still holds the count/byte reservation throughout the interval
+and waits for any running turn or open admission/control lease.
 The config source and default remain `messages.inbound` (default zero).
 
 | State | Restart behavior |

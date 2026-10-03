@@ -95,6 +95,12 @@ const EXPECTED: Record<string, InventoryEntry> = {
   "packages/client/src/browser-jwt-entry.ts :: /test/bootstrap-jwt template": {
     count: 1, classification: "explicitly gated negative/E2E harness consumer",
   },
+  "packages/plugin/src/jwt-lifetime.test.ts :: buildBootstrapClaims call": {
+    count: 3, classification: "test-only lifetime boundaries and SaaS-to-plugin JWT verification",
+  },
+  "packages/plugin/src/jwt-lifetime.test.ts :: createBootstrapIssuer call": {
+    count: 2, classification: "test-only signer bypass rejection and real RS256 roundtrip",
+  },
   "packages/saas/reference/bootstrap-server.ts :: /bootstrap literal": {
     count: 1, classification: "test-only fixed-tuple route",
   },

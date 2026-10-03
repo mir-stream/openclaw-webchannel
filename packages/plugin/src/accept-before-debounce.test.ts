@@ -15,7 +15,7 @@ const cleanup: Array<() => void> = [];
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => { for (const fn of cleanup.splice(0).reverse()) fn(); vi.restoreAllMocks(); vi.useRealTimers(); });
 const item = (id: string, logical = id) => ({ peerId: "peer", message: { type: "user_message" as const, id, random_id: logical, text: logical } });
-function open(path?: string, capacity = 32, hold?: Promise<void>) {
+function open(path?: string, capacity = 32, hold?: Promise<void>, fail?: string) {
   if (!path) {
     path = mkdtempSync(join(tmpdir(), "accept-debounce-"));
     const root = path;
@@ -31,7 +31,12 @@ function open(path?: string, capacity = 32, hold?: Promise<void>) {
   const rejected: string[][] = [];
   const recovery = createDispatchRecovery({ store: journal.dispatch!, acquirePeer: () => () => {}, isActive: () => true,
     notify: () => {}, warn: e => { throw e; }, dispatcherOptions: { budget, debounceMs: 1000 },
-    handler: async (_peer, message, settle) => { runs.push(message); if (message.id === "A") await hold; settle("ok"); },
+    handler: async (_peer, message, settle) => {
+      runs.push(message);
+      if (message.id === "A") await hold;
+      if (message.id === fail) throw new Error("injected after effect");
+      settle("ok");
+    },
   });
   recovery.start();
   const sendAck = (_peer: string, ids: string[], committed?: unknown, cancelled?: string[], unaccepted?: string[]) => { acks.push({ ids, committed, cancelled, unaccepted }); return true; };
@@ -49,7 +54,7 @@ function open(path?: string, capacity = 32, hold?: Promise<void>) {
   return { path, journal, budget, recovery, runs, acks, broadcasts, rejected, flush, stop, close };
 }
 
-it("#441 persists and echoes each input before execution debounce; replay cannot postpone the turn", async () => {
+it("#441 keeps the original fixed window while persisting and echoing before execution", async () => {
   const h = open();
   await h.flush([item("A")]);
   const rowA = h.journal.dispatch!.lookup("peer", "A")!;
@@ -57,14 +62,14 @@ it("#441 persists and echoes each input before execution debounce; replay cannot
   expect(h.acks[0].committed).toEqual([{ random_id: "A", messageId: rowA.messageId, seq: rowA.seq }]);
   expect(h.broadcasts).toEqual([expect.objectContaining({ id: rowA.messageId, seq: rowA.seq, text: "A" })]);
   expect(h.runs).toEqual([]);
-  await vi.advanceTimersByTimeAsync(500);
+  await vi.advanceTimersByTimeAsync(700);
   await h.flush([item("B")]);
   expect(h.broadcasts).toHaveLength(2);
   expect(h.journal.read("peer").filter(event => event.kind === "user")).toHaveLength(2);
-  await vi.advanceTimersByTimeAsync(400);
+  await vi.advanceTimersByTimeAsync(200);
   await h.flush([item("A-replay", "A")]);
   expect(h.broadcasts).toHaveLength(2);
-  await vi.advanceTimersByTimeAsync(599);
+  await vi.advanceTimersByTimeAsync(99);
   expect(h.runs).toEqual([]);
   await vi.advanceTimersByTimeAsync(1);
   expect(h.runs).toEqual([expect.objectContaining({ text: "A\n\nB", coalescedIds: ["A", "B"] })]);
@@ -131,20 +136,47 @@ it("#441 a failed journal acceptance never ACKs, broadcasts or arms execution", 
   expect(h.runs).toHaveLength(1);
 });
 
-it("#441 busy followups wait for both the current turn and their own quiet interval", async () => {
+it("#441 drains an elapsed busy-turn window without running a newer window early", async () => {
   let release!: () => void;
   const h = open(undefined, 32, new Promise<void>(resolve => { release = resolve; }));
   await h.flush([item("A")]);
   await vi.advanceTimersByTimeAsync(1000);
   expect(h.runs.map(m => m.id)).toEqual(["A"]);
   await h.flush([item("B")]);
-  await vi.advanceTimersByTimeAsync(500);
+  await vi.advanceTimersByTimeAsync(1000);
   await h.flush([item("C")]);
   release();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(h.runs.map(m => m.text)).toEqual(["A", "B"]);
   await vi.advanceTimersByTimeAsync(999);
-  expect(h.runs.map(m => m.id)).toEqual(["A"]);
+  expect(h.runs.map(m => m.text)).toEqual(["A", "B"]);
   await vi.advanceTimersByTimeAsync(1);
-  expect(h.runs.map(m => m.text)).toEqual(["A", "B\n\nC"]);
+  expect(h.runs.map(m => m.text)).toEqual(["A", "B", "C"]);
+});
+
+it("#441 a converged retry alias at 0.7s does not postpone the accepted retry's fixed window", async () => {
+  const h = open(undefined, 32, undefined, "original");
+  await h.flush([item("original")]);
+  await vi.advanceTimersByTimeAsync(1000);
+  const original = h.journal.dispatch!.lookup("peer", "original")!;
+  expect(original.state).toBe("interrupted");
+
+  const retry = (id: string) => ({
+    ...item(id),
+    message: { ...item(id).message, retry_of: original.messageId },
+  });
+  await h.flush([retry("R1")]);
+  const first = h.journal.dispatch!.lookup("peer", "R1")!;
+  await vi.advanceTimersByTimeAsync(700);
+  await h.flush([retry("R2")]);
+  expect(h.journal.dispatch!.lookup("peer", "R2")).toBeUndefined();
+  expect(h.acks.at(-1)?.committed).toEqual([
+    { random_id: "R2", messageId: first.messageId, converged: true },
+  ]);
+  await vi.advanceTimersByTimeAsync(299);
+  expect(h.runs.map(m => m.id)).toEqual(["original"]);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(h.runs.map(m => m.id)).toEqual(["original", "R1"]);
 });
 
 it("#441 empty/rolled-back leases cannot extend debounce, and an open lease still fences execution", async () => {

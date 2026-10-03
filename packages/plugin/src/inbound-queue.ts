@@ -254,6 +254,9 @@ type InternalLease<Message> = {
 
 type SessionState<Message> = {
   running?: Promise<void>;
+  /** Entries whose fixed debounce window has elapsed, in arrival order. */
+  ready: RetainedEntry<Message>[];
+  /** Entries in the one currently open fixed debounce window. */
   pending: RetainedEntry<Message>[];
   openLeases: Set<InternalLease<Message>>;
   readyToDrain: boolean;
@@ -262,7 +265,7 @@ type SessionState<Message> = {
 
 export type SerializedInboundDispatcherOptions<Message> = {
   coalesce?: (messages: Message[]) => Message;
-  /** Delay execution after committed admission, on the coalescing path only. */
+  /** Fixed execution window opened by committed admission, on the coalescing path only. */
   debounceMs?: number;
   budget?: InboundRetentionBudget;
   sessionToken?: (sessionKey: string) => RetentionSessionToken;
@@ -319,7 +322,7 @@ export function createSerializedInboundDispatcher<Message>(
   };
 
   const maybeForget = (key: string, state: SessionState<Message>) => {
-    if (!state.running && state.pending.length === 0 && state.openLeases.size === 0) {
+    if (!state.running && state.ready.length === 0 && state.pending.length === 0 && state.openLeases.size === 0) {
       clearDebounce(state);
       sessions.delete(key);
       if (!options?.sessionToken) tokens.delete(key);
@@ -329,7 +332,7 @@ export function createSerializedInboundDispatcher<Message>(
   const sessionFor = (key: string): SessionState<Message> => {
     let state = sessions.get(key);
     if (!state) {
-      state = { pending: [], openLeases: new Set(), readyToDrain: false };
+      state = { ready: [], pending: [], openLeases: new Set(), readyToDrain: false };
       sessions.set(key, state);
     }
     return state;
@@ -360,6 +363,7 @@ export function createSerializedInboundDispatcher<Message>(
       if (state.running !== settled) return;
       state.running = undefined;
       if (disposed) {
+        for (const entry of state.ready.splice(0)) release(entry);
         for (const entry of state.pending.splice(0)) release(entry);
         maybeForget(key, state);
         return;
@@ -373,11 +377,16 @@ export function createSerializedInboundDispatcher<Message>(
   };
 
   const drain = (key: string, state: SessionState<Message>) => {
-    if (state.running || state.openLeases.size > 0 || state.debounceTimer !== undefined) return;
+    if (state.running || state.openLeases.size > 0) return;
     state.readyToDrain = false;
-    const entries = state.pending.splice(0);
+    const entries = state.ready.splice(0);
     if (entries.length > 0) startTurn(key, state, entries);
     else maybeForget(key, state);
+  };
+
+  const maturePending = (key: string, state: SessionState<Message>) => {
+    state.ready.push(...state.pending.splice(0));
+    drain(key, state);
   };
 
   const disposedLease = (): DispatcherBatchLease<Message> => ({
@@ -475,16 +484,18 @@ export function createSerializedInboundDispatcher<Message>(
         }
       }
       internal.entries = [];
-      // Only newly committed work extends the quiet interval. Recovery polls,
-      // duplicate receipts and rolled-back offers must not postpone execution.
-      // Pending entries retain their original count/byte reservations here.
-      if (attached && debounceMs > 0) {
-        clearDebounce(state);
+      // The first committed entry opens a fixed debounce window. Later entries
+      // join that window without moving its deadline, matching the original
+      // bounded ingress debouncer. Exact-ID replay receipts and rolled-back
+      // offers attach no work and therefore cannot move its deadline.
+      if (attached && debounceMs > 0 && state.debounceTimer === undefined) {
         state.debounceTimer = setTimeout(() => {
           state.debounceTimer = undefined;
-          if (!disposed && sessions.get(sessionKey) === state) drain(sessionKey, state);
+          if (!disposed && sessions.get(sessionKey) === state) maturePending(sessionKey, state);
         }, debounceMs);
         state.debounceTimer.unref?.();
+      } else if (attached && debounceMs === 0) {
+        maturePending(sessionKey, state);
       }
       if (!state.running && state.openLeases.size === 0) drain(sessionKey, state);
       else if (state.readyToDrain && state.openLeases.size === 0) drain(sessionKey, state);
@@ -567,6 +578,10 @@ export function createSerializedInboundDispatcher<Message>(
     if (!state) return [];
     clearDebounce(state);
     const dropped: Message[] = [];
+    for (const entry of state.ready.splice(0)) {
+      dropped.push(entry.message);
+      release(entry);
+    }
     for (const entry of state.pending.splice(0)) {
       dropped.push(entry.message);
       release(entry);
@@ -591,6 +606,10 @@ export function createSerializedInboundDispatcher<Message>(
     let provisional = 0;
     for (const [key, state] of sessions) {
       clearDebounce(state);
+      for (const entry of state.ready.splice(0)) {
+        pending++;
+        release(entry);
+      }
       for (const entry of state.pending.splice(0)) {
         pending++;
         release(entry);
@@ -621,7 +640,10 @@ export function createSerializedInboundDispatcher<Message>(
     beginBatch,
     pendingSessions: () => chains.size + sessions.size,
     clearPending,
-    pendingBuffered: (key) => sessions.get(key)?.pending.length ?? 0,
+    pendingBuffered: (key) => {
+      const state = sessions.get(key);
+      return state ? state.ready.length + state.pending.length : 0;
+    },
     dispose,
     close: () => {
       void dispose();

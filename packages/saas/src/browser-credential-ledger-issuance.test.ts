@@ -161,7 +161,7 @@ describe("issueBrowserCredentials × BrowserCredentialLedger", () => {
     const creds = await pending;
     const payload = JSON.parse(Buffer.from(creds.userJwt.split(".")[1] as string, "base64url").toString());
     const record = await ledger.get(creds.userPubkey);
-    expect(creds.permissions.pub).toEqual(["webchannel.tenant-original.*.peer-original.>"]);
+    expect(creds.permissions.pub).toEqual(["webchannel.tenant-original.*.peer-original.in", "webchannel.tenant-original.*.peer-original.register"]);
     // Same two-clock skew as above, and pinned the same way. This was a loose
     // tolerance (`> 3500`); it is tightened to the two values the skew can
     // actually produce, because a loose form sitting next to the exact one is
@@ -318,6 +318,6 @@ describe("issueBrowserCredentials × BrowserCredentialLedger", () => {
       accountSeed: built.private.natsAccountSeed, tenant: "tenant-x", peerId: "peer-1",
     });
     expect(Object.keys(creds).sort()).toEqual(["permissions", "userJwt", "userPubkey", "userSeedRaw"]);
-    expect(creds.permissions.pub).toEqual(["webchannel.tenant-x.*.peer-1.>"]);
+    expect(creds.permissions.pub).toEqual(["webchannel.tenant-x.*.peer-1.in", "webchannel.tenant-x.*.peer-1.register"]);
   });
 });

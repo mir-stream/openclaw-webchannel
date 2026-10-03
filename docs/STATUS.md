@@ -1,5 +1,19 @@
 # Project Status — single source of truth
 
+NATS permissions (#409, #410): newly enrolled agent credentials are limited to
+their exact tenant/account subtree, and browser credentials publish only their
+own `.in`/`.register` subjects. Real nats-server tests prove sibling-account
+and agent-direction publication rejection. SaaS/plugin require a lockstep
+upgrade and explicit reissue to narrow existing credentials; doctor identifies
+legacy broad agent grants. Existing grants are accepted until expiry/revocation,
+including non-expiring grants that require explicit replacement. Credential-only
+reissue retains history and keys only when storage remains bound to the same
+trusted issuer; a storage-issuer failure requires the
+[issuer-recovery procedure](STORAGE_IDENTITY_V2.md#issuer-binding-412) first:
+restore the original trusted issuer and matching credentials where supported,
+or archive the complete tuple and initialize fresh state. Credential-only reissue
+cannot bypass it. See [credential rollout](AUTH.md#nats-credential-scope-and-rollout).
+
 Sync robustness (#413/#414): byte-incomplete cold snapshots seed their journal
 high-water immediately. Omitted row identities are exposed separately; older
 trimmed rows remain reachable by history paging, while genuine warm gaps still
@@ -13,7 +27,7 @@ require paired client/plugin deployment. See [sync and restore](GAP_SYNC.md).
 
 Inbound acceptance precedes execution debounce (#441): each input receives its
 durable server ID, multi-device broadcast and ACK immediately after admission.
-Only execution waits for the configured quiet interval, with the same retained
+Only execution waits for the configured fixed window, with the same retained
 count/byte budget. `/stop` cancels those accepted queued rows without declaring
 them unaccepted; restart recovers proven unstarted work with the original IDs.
 

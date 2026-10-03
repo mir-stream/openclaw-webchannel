@@ -1111,7 +1111,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       inboundDispatcher = dispatchRecovery.dispatcher;
 
       // The bounded ingress worker persists each input and emits its receipt
-      // immediately. Only execution waits for the configured quiet interval;
+      // immediately. Only execution waits for the configured fixed window;
       // dispatch retains the shared budget until the accepted work starts.
       const onIngressFlush = createIngressOnFlush<DebounceItem>({
         accountId,
