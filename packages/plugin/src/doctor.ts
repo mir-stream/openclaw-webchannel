@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { StorageIssuerError } from "./storage-issuer.js";
 
 import type {
   BaseProbeResult,
@@ -58,6 +59,7 @@ export type DoctorCheckId =
   | "creds-missing"
   | "credential-binding-failed"
   | "credential-storage-failed"
+  | "storage-issuer-failed"
   | "identity-key-missing"
   | "verifier-unbuildable"
   | "audience-override-removed"
@@ -245,6 +247,7 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
             accountId,
             saasBaseUrl: source.saasBaseUrl,
           }, {
+            migrateLegacy: false,
             ...(source.storageRoot !== undefined
               ? { storageRoot: source.storageRoot }
               : {}),
@@ -357,11 +360,11 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
     } catch (err) {
       findings.push({
         accountId,
-        checkId: "verifier-unbuildable",
+        checkId: err instanceof StorageIssuerError ? "storage-issuer-failed" : "verifier-unbuildable",
         kind: "config",
         severity: "error",
         message: errorMessage(err),
-        fix: "Correct the effective JWT issuer and exactly-one JWKS source named above.",
+        fix: err instanceof StorageIssuerError ? err.fix : "Correct the effective JWT issuer and exactly-one JWKS source named above.",
       });
     }
   }
@@ -500,6 +503,7 @@ export async function probeWebchannelAccount(params: {
             accountId,
             saasBaseUrl: source.saasBaseUrl,
           }, {
+            migrateLegacy: false,
             ...(source.storageRoot !== undefined
               ? { storageRoot: source.storageRoot }
               : {}),

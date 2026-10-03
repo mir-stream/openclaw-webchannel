@@ -22,6 +22,7 @@ import { ConversationKeyStore } from "./conversation-key-store.js";
 import { openDeliveryJournal } from "./delivery-journal.js";
 import type { DeliveryJournal } from "./delivery-journal.js";
 import { tupleStoragePaths } from "./storage-paths.js";
+import { ensureStorageIssuer, StorageIssuerError } from "./storage-issuer.js";
 import { createCapacityDiagnostics } from "./capacity-diagnostics.js";
 import { resolveEncryptionPolicy } from "./encryption-policy.js";
 import type { WebchannelEncryptionConfig } from "./encryption-policy.js";
@@ -460,6 +461,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             accountId,
             saasBaseUrl: source.saasBaseUrl,
           }, {
+            migrateLegacy: false,
             ...(source.storageRoot !== undefined
               ? { storageRoot: source.storageRoot }
               : {}),
@@ -548,7 +550,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         } catch { /* the stable permanent event below remains available */ }
         reportPermanent(
           accountId,
-          "jwt-auth-config-invalid",
+          err instanceof StorageIssuerError ? "storage-issuer-failed" : "jwt-auth-config-invalid",
           `${buildDetail}; fix the account JWT issuer and exactly-one JWKS source`,
         );
         setStatus(accountNeverServedStatusPatch({
@@ -615,6 +617,15 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       }
 
       const preflightIdentityKey = identityKey;
+      try {
+        ensureStorageIssuer({ tenant, accountId, storageRoot, issuer: effIssuer });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        reportPermanent(accountId, "storage-issuer-failed", detail);
+        setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: detail }));
+        await waitForAbort(ctx.abortSignal);
+        return undefined;
+      }
       // Keep one limiter per account lifecycle so transport restart attempts do
       // not reset capacity-rejection suppression and create a fresh log burst.
       const capacityDiagnostics = createCapacityDiagnostics({ logger: api.logger });

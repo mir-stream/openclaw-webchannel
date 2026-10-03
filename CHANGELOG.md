@@ -19,6 +19,24 @@
   Warm differences and the existing individually oversized-row skip policy
   remain in force; this does not implement #325 body chunking or #299 retention.
 
+### Security trust (#408, #411, #412)
+
+- Unknown JWT kids can trigger at most one shared JWKS refresh per 30 seconds.
+  Failed refreshes and responses without that kid preserve the original fresh
+  cache and expiry; expired keys still fail closed. Malformed compact JWTs are
+  rejected before key lookup.
+- **Breaking:** SaaS base URLs require HTTPS; HTTP is permitted only for
+  `localhost`, `127.0.0.0/8` and `::1`, with no bypass flag. Enrollment, runtime,
+  preflight and doctor use the same rule. Local loopback demos still work.
+- **Breaking storage upgrade:** the effective issuer now owns the account's
+  history and conversation keys. Fresh state gets a private issuer marker;
+  existing unbound state, resumable legacy migration archives, a changed issuer,
+  or invalid metadata refuses that account's startup. There is no automatic
+  migration or deletion. Stop affected gateways, archive the complete tuple and
+  any pending migration claim, and explicitly initialize/re-enroll fresh state.
+  Doctor and the [runbook](docs/STORAGE_IDENTITY_V2.md#issuer-binding-412) give
+  the procedure. Re-enrolling credentials alone cannot relabel old data.
+
 ### Changed
 
 - Browser receive doors now reject replayed envelopes, timestamps outside ±10 minutes,

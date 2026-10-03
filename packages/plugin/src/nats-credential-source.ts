@@ -1,3 +1,4 @@
+import { assertSaasBaseUrl } from "./saas-authority.js";
 /**
  * NATS credential source — Axis A of the agent↔NATS decoupling.
  *
@@ -176,12 +177,14 @@ export function resolveEnrolledSaasBaseUrl(
   input: ResolveEnrolledSaasBaseUrlInput,
 ): string | undefined {
   const env = input.env ?? process.env;
-  return (
+  const value = (
     env["WEBCHANNEL_SAAS_BASE_URL"] ??
     input.natsConfig?.credentials?.saasBaseUrl ??
     input.saasBaseUrl ??
     input.fallback
   );
+  if (value !== undefined) assertSaasBaseUrl(value);
+  return value;
 }
 
 // ---------------------------------------------------------------------------
