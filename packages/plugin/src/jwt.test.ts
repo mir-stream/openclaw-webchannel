@@ -90,7 +90,7 @@ describe("verifyJwt critical headers (#415 E7)", () => {
     "rejects unsupported or malformed crit=$crit before resolving a key",
     async ({ crit }) => {
       const now = Math.floor(Date.now() / 1000);
-      const token = await signJwt({ iss: ISSUER, aud: AUDIENCE, sub: "peer", exp: now + 60 }, {
+      const token = await signJwt({ iss: ISSUER, aud: AUDIENCE, sub: "peer", iat: now, exp: now + 60 }, {
         header: { crit, extension: true },
       });
       const keys = resolver();
@@ -102,7 +102,7 @@ describe("verifyJwt critical headers (#415 E7)", () => {
 
   it("still accepts an unknown non-critical header", async () => {
     const now = Math.floor(Date.now() / 1000);
-    const token = await signJwt({ iss: ISSUER, aud: AUDIENCE, sub: "peer", exp: now + 60 }, {
+    const token = await signJwt({ iss: ISSUER, aud: AUDIENCE, sub: "peer", iat: now, exp: now + 60 }, {
       header: { extension: true },
     });
     expect(await verifyJwt(token, { jwks: resolver(), issuer: ISSUER, audience: AUDIENCE })).toEqual({ peerId: "peer" });
@@ -583,7 +583,7 @@ describe("verifyJwt claim validation (AC3)", () => {
 
 describe("verifyJwt not-before validation", () => {
   const nowSec = 1_800_000_000;
-  const claims = { iss: ISSUER, aud: AUDIENCE, sub: "user-42", exp: nowSec + 7200 };
+  const claims = { iss: ISSUER, aud: AUDIENCE, sub: "user-42", iat: nowSec, exp: nowSec + 3600 };
   beforeEach(() => { vi.spyOn(Date, "now").mockReturnValue(nowSec * 1000); });
   afterEach(() => { vi.restoreAllMocks(); });
 

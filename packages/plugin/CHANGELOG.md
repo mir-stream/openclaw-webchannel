@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Bootstrap JWTs now require finite `iat < exp` and a lifetime of at most one
+  hour (#447). Clock skew applies to issuance/expiry checks, not the lifetime
+  bound. SaaS claim builders and signers enforce the same cap; first-party
+  demo/reference/example issuers keep their existing five-minute default.
+  External issuers must supply `iat` and shorten longer-lived tokens.
+
 ### Changed
 
 - The inbound reply pipeline honors configured response prefixes and selected
