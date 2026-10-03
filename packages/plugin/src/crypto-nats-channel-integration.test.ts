@@ -44,8 +44,8 @@ import WebSocket from "ws";
 
 import { NatsTransport } from "./nats-transport.js";
 import type { NatsMessage } from "./nats-transport.js";
-import { CryptoNatsChannel } from "./crypto-nats-channel.js";
-import type { DecryptedMessage } from "./crypto-nats-channel.js";
+import { CryptoNatsChannel } from "./crypto-nats-channel.test-harness.js";
+import type { DecryptedMessage } from "./crypto-nats-channel.test-harness.js";
 import { deserializeEnvelope } from "./e2e-envelope.js";
 import type { MessageEnvelope } from "./e2e-envelope.js";
 import {

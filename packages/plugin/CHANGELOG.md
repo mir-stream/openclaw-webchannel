@@ -9,6 +9,10 @@
   delivery errors rather than silently succeeding; empty/text replies keep
   their existing behavior (#415 C4/C7).
 
+- Enrollment continues after `slow_down`, increasing every subsequent poll interval
+  by five seconds per response. JWT verification rejects unsupported or malformed
+  `crit` headers before resolving signing keys (#415 E6/E7).
+
 - **Case-distinct JWT peers now have distinct core sessions (#372).** Raw peer
   IDs such as `Alice` and `alice` are encoded before SDK session normalization;
   configured bindings and intentional `identityLinks` keep their SDK selection,

@@ -425,8 +425,11 @@ describe("index-nats.ts wiring contract — ingress dedupe onFlush (P0-7a)", () 
     expect(RUNTIME_SOURCE).not.toContain("createPersistentDedupe");
     expect(RUNTIME_SOURCE).toMatch(/\.\.\.createIngressDebounceCallbacks<DebounceItem>\(\{/);
     expect(RUNTIME_SOURCE).toMatch(/overflowResolver:\s*processOverflowResolver/);
-    expect(RUNTIME_SOURCE).toMatch(/cancelledFallback:\s*cancelledInboundFallback/);
-    expect(RUNTIME_SOURCE).toMatch(/onCancelledRecovered:/);
+    // Cancellation is already committed by stopControl's SQLite transaction;
+    // the former fallback injection was never written by production.
+    expect(RUNTIME_SOURCE).not.toMatch(/cancelledFallback:/);
+    expect(RUNTIME_SOURCE).not.toMatch(/onCancelledRecovered:/);
+    expect(RUNTIME_SOURCE).toMatch(/stopControl = createStopControl<DebounceItem>\(/);
   });
 
   it("charges only the wire message, excluding the peer routing wrapper", () => {
@@ -443,6 +446,13 @@ describe("index-nats.ts wiring contract — ingress dedupe onFlush (P0-7a)", () 
 });
 
 describe("index-nats.ts wiring contract — ingress ack (P0-7b)", () => {
+  it("#415: production cancellation has no unwritten fallback store", () => {
+    expect(RUNTIME_SOURCE).not.toContain("CancelledInboundFallbackTombstones");
+    expect(RUNTIME_SOURCE).not.toContain("cancelledFallback:");
+    expect(RUNTIME_SOURCE).not.toContain("onCancelledRecovered:");
+    expect(RUNTIME_SOURCE).toContain("createStopControl<DebounceItem>");
+  });
+
   it("wires normal receipts and atomic stop receipts into the account channel", () => {
     // The onFlush factory must be handed a sendAck so admitted (fresh + duplicate)
     // ids drain the client's replay ledger.
