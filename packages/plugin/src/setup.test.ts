@@ -313,12 +313,13 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
       input: { tenant: "tDefault" },
     });
     const s = section(next);
-    // Channel-level shared base untouched; default written under accounts.default.
+    // Channel-level shared base untouched; the fresh default and its valid DM
+    // defaults are written under accounts.default.
     expect(s.auth).toEqual({ strategy: "jwt" });
     expect(s.tenant).toBeUndefined();
     expect(s.accounts).toEqual({
       acctb: { tenant: "tB" },
-      default: { tenant: "tDefault" },
+      default: { tenant: "tDefault", dmPolicy: "open", allowFrom: ["*"] },
     });
     // Both accounts are now servable — no phantom, no silent drop.
     expect(listWebchannelAccountIds(next)).toEqual(["acctb", "default"]);
@@ -344,7 +345,7 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
     expect(s.auth).toEqual({ strategy: "jwt" });
     expect(s.accounts).toEqual({
       default: { allowFrom: ["x"] },
-      acctb: { tenant: "tB" },
+      acctb: { tenant: "tB", dmPolicy: "open", allowFrom: ["*"] },
     });
   });
 
