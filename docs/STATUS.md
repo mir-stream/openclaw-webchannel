@@ -33,6 +33,12 @@ receipts remain authoritative after policy changes. This is part of unreleased
 protocol 7 and requires client/plugin lockstep. DM policy interpretation remains
 owned by #406; this change moves its existing result to the admission boundary.
 
+Inbound acceptance precedes execution debounce (#441): each input receives its
+durable server ID, multi-device broadcast and ACK immediately after admission.
+Only execution waits for the configured fixed window, with the same retained
+count/byte budget. `/stop` cancels those accepted queued rows without declaring
+them unaccepted; restart recovers proven unstarted work with the original IDs.
+
 P3 reply delivery (#415 C4/C7): inbound dispatch enables the SDK reply-prefix
 pipeline, including selected-model interpolation, for answers (reasoning stays
 unprefixed). Media remains unsupported; a media-only final in a turn that
@@ -75,7 +81,7 @@ History correlation was introduced in protocol 7.
 
 `/stop` cancellation (review R1/R2): control receipts and exact cancellation targets
 now commit together in the tenant/account SQLite journal before ACK. This includes
-debounce entries not yet accepted, the pending overflow-only ID, durable queued work and the current started
+ingress entries not yet accepted, the pending overflow-only ID, durable queued work and the current started
 request. Original input replays stay suppressed across restart; replaying an
 accepted stop returns its receipt without aborting later work. New dispatch waits
 for the first live core abort to settle, including across account replacement.

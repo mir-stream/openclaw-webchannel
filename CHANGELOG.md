@@ -70,6 +70,10 @@
 
 ### Changed
 
+- Inbound debounce now delays execution only. Durable acceptance, ACK and
+  multi-device echo precede the fixed execution window, while bounded retention,
+  cancellation and restart recovery keep their existing contracts (#441).
+
 - Bootstrap JWTs now require finite `iat < exp` and a lifetime of at most one
   hour (#447). Clock skew applies to issuance/expiry checks, not the lifetime
   bound. SaaS claim builders and signers enforce the same cap; first-party
