@@ -4,6 +4,12 @@
 
 ### Changed
 
+- The inbound reply pipeline honors configured response prefixes and selected
+  model interpolation on answers; reasoning stays unprefixed. Unsupported
+  media-only final replies now settle as delivery errors rather than silently
+  succeeding when the turn delivered no answer text; empty/text replies keep
+  their existing behavior (#415 C4/C7).
+
 - Enrollment continues after `slow_down`, increasing every subsequent poll interval
   by five seconds per response. JWT verification rejects unsupported or malformed
   `crit` headers before resolving signing keys (#415 E6/E7).

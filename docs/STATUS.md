@@ -9,6 +9,14 @@ unrecorded or invalid ownership refuses that account's startup. Existing
 unbound state requires explicit operator archiving and fresh initialization;
 doctor explains the exact paths. See [issuer binding](STORAGE_IDENTITY_V2.md#issuer-binding-412).
 
+P3 reply delivery (#415 C4/C7): inbound dispatch enables the SDK reply-prefix
+pipeline, including selected-model interpolation, for answers (reasoning stays
+unprefixed). Media remains unsupported; a media-only final in a turn that
+delivered no answer text now reports delivery failure through the existing
+durable turn settlement and client failure state, without inventing an
+assistant message.
+Text-bearing replies and intentional silence retain their previous behavior.
+
 Quiet-turn liveness (#396): normal turns send an initial typing indicator and
 renew ephemeral `typing` with `keepalive: true` every 4 seconds until completion,
 error, or dispatch abort. Renewals refresh existing application watches without

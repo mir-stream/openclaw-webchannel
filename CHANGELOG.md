@@ -29,6 +29,12 @@
 
 ### Changed
 
+- The inbound reply pipeline honors configured response prefixes and selected
+  model interpolation on answers; reasoning stays unprefixed. Unsupported
+  media-only final replies now settle as delivery errors rather than silently
+  succeeding when the turn delivered no answer text; empty/text replies keep
+  their existing behavior (#415 C4/C7).
+
 - Enrollment continues after `slow_down`, increasing every subsequent poll interval
   by five seconds per response. JWT verification rejects unsupported or malformed
   `crit` headers before resolving signing keys (#415 E6/E7).
@@ -37,6 +43,11 @@
   conformance tests remain intact. Production no longer allocates or injects
   the unwritten legacy cancellation fallback. Current cancellation authority
   remains the SQLite stop transaction (#415 dead-code findings).
+
+- The reference app fences replaced login/connect attempts and unsubscribes
+  retired clients. Terminal recovery uses `errorCause`; transient registration
+  remains connecting/reconnecting. The minimal consumer filters approvals by
+  `actionable`, excluding inert historical cards (#415 F4/F5).
 
 - **Case-distinct JWT peers now have distinct core sessions (#372).** Raw peer
   IDs such as `Alice` and `alice` are encoded before SDK session normalization;

@@ -40,6 +40,6 @@ export function summarize(state: WebChannelState): {
 } {
   return {
     status: state.status,
-    pendingApprovals: state.approvals.filter((a) => a.resolvedDecision === undefined),
+    pendingApprovals: state.approvals.filter((a) => a.actionable),
   };
 }
