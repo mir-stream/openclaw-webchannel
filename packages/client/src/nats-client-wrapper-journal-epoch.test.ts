@@ -277,4 +277,33 @@ describe("#414 encrypted receive ordering", () => {
       expect(h.lowLevel().unackedLedger.size).toBe(0);
     } finally { h.wrapper.close(); }
   });
+
+  it("records a new-epoch snapshot before its reset subscriber can inject a refusal", async () => {
+    const h = await setupEncryptedEpochHarness();
+    try {
+      const receipt = h.wrapper.send("new epoch durable send")!;
+      await settleUntil(() => h.received.length === 1, { label: "old epoch publish" });
+      const sent = h.received[0]!;
+      let injected = false;
+      const unsubscribe = h.wrapper.subscribe(state => {
+        if (!injected && state.messages.some(row => row.text === sent.text)) {
+          injected = true;
+          h.deliver({ type: "inbound_rejected", epoch: "B", ids: [sent.id!], reason: "policy-denied" });
+        }
+      });
+      h.deliver({ type: "history", epoch: "B", highWaterSeq: 1, messages: [{
+        id: "b-user-1", role: "user", text: sent.text, randomId: sent.random_id,
+        turnId: sent.id, seq: 1,
+      }] });
+      unsubscribe();
+      expect(injected).toBe(true);
+      expect(receipt.snapshot().state).toBe("sent");
+      expect(h.lowLevel().unackedLedger.size).toBe(1);
+
+      h.deliver({ type: "ack", epoch: "B", ids: [sent.id!] });
+      expect(receipt.snapshot().state).toBe("accepted");
+      h.deliver({ type: "turn_settled", epoch: "B", turnId: sent.id, outcome: "ok" });
+      expect(receipt.snapshot().state).toBe("completed");
+    } finally { h.wrapper.close(); }
+  });
 });

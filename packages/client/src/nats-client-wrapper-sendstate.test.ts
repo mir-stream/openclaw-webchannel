@@ -2670,3 +2670,86 @@ it("#442 a durable row with another random ID does not suppress the owned refusa
     });
   } finally { h.wrapper.close(); }
 });
+
+it.each(["gap-user_committed", "ahead-history"] as const)(
+  "#442 %s proves acceptance before ordered recovery and preserves replay through a late refusal",
+  async (source) => {
+    const h = await connectWrapper({ ack: false });
+    try {
+      deliverOut(h.K, { type: "history", highWaterSeq: 0, messages: [] });
+      await settle();
+      const text = `buffered durable evidence: ${source}`;
+      const receipt = h.wrapper.send(text)!;
+      await settle();
+      const sent = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .find((message): message is Extract<OutboundMessage, { type: "user_message" }> =>
+          message.type === "user_message" && message.text === text)!;
+      const serverId = `buffered-${source}`;
+      if (source === "gap-user_committed") {
+        deliverOut(h.K, { type: "user_committed", id: serverId, text,
+          random_id: sent.random_id, turnId: sent.id, seq: 2 });
+      } else {
+        deliverOut(h.K, { type: "history", highWaterSeq: 2, messages: [{
+          id: serverId, role: "user", text, randomId: sent.random_id, turnId: sent.id, seq: 2,
+        }] });
+      }
+      await settle();
+      const request = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .filter((message) => message.type === "get_difference").at(-1);
+      expect(request?.type).toBe("get_difference");
+      if (request?.type !== "get_difference") throw new Error("difference request missing");
+
+      deliverOut(h.K, { type: "inbound_rejected", ids: [sent.id], reason: "policy-denied" });
+      await settle();
+      expect(receipt.snapshot().state).toBe("sent");
+      expect(h.wrapper.getState().turnActive).toBe(true);
+      expect((h.wrapper as unknown as { client: { unackedLedger: Map<string, unknown> } })
+        .client.unackedLedger.size).toBe(1);
+
+      deliverOut(h.K, { type: "difference", afterSeq: request.afterSeq, nonce: request.nonce,
+        partial: false, maxSeq: 2, events: [] });
+      await settle();
+      deliverOut(h.K, { type: "ack", ids: [sent.id] });
+      await settle();
+      expect(receipt.snapshot().state).toBe("accepted");
+      deliverOut(h.K, { type: "turn_settled", turnId: sent.id, outcome: "ok" });
+      await settle();
+      expect(receipt.snapshot().state).toBe("completed");
+    } finally { h.wrapper.close(); }
+  },
+);
+
+it.each(["uncorrelated", "malformed"] as const)(
+  "#442 %s difference user evidence cannot suppress a valid refusal",
+  async (boundary) => {
+    const h = await connectWrapper({ ack: false });
+    try {
+      deliverOut(h.K, { type: "history", highWaterSeq: 0, messages: [] });
+      await settle();
+      const receipt = h.wrapper.send(`invalid difference evidence: ${boundary}`)!;
+      await settle();
+      const sent = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .find((message): message is Extract<OutboundMessage, { type: "user_message" }> =>
+          message.type === "user_message" && message.text === `invalid difference evidence: ${boundary}`)!;
+      deliverOut(h.K, { type: "agent_message", id: "gap-opener", text: "later", turnId: sent.id, seq: 2 });
+      await settle();
+      const request = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .filter((message) => message.type === "get_difference").at(-1);
+      expect(request?.type).toBe("get_difference");
+      if (request?.type !== "get_difference") throw new Error("difference request missing");
+      const event = boundary === "uncorrelated"
+        ? { kind: "user", id: "foreign-user", text: sent.text, randomId: sent.random_id, turnId: sent.id }
+        : { kind: "user", id: "malformed-user", randomId: sent.random_id, turnId: sent.id };
+      deliverOut(h.K, { type: "difference", afterSeq: request.afterSeq,
+        nonce: boundary === "uncorrelated" ? "another-device" : request.nonce,
+        partial: false, maxSeq: 1, events: [{ seq: 1, event }] });
+      await settle();
+
+      deliverOut(h.K, { type: "inbound_rejected", ids: [sent.id], reason: "policy-denied" });
+      await settle();
+      expect(receipt.snapshot()).toMatchObject({
+        state: "failed", failure: { reason: "policy-denied", retryable: false },
+      });
+    } finally { h.wrapper.close(); }
+  },
+);
