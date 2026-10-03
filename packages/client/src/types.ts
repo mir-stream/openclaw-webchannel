@@ -625,8 +625,18 @@ export type WebChannelErrorCause =
  * detect updates by identity — and a React adapter can feed it straight into
  * `useSyncExternalStore` without tearing.
  */
+/** A row omitted by the latest snapshot's byte budget. Content is still journal-owned. */
+export type HistoryOmission = {
+  id: string;
+  kind?: "reasoning" | "tool" | "approval";
+  turnId?: string;
+  seq?: number;
+};
+
 export type WebChannelState = {
   messages: ChatMessage[];
+  /** Individual holes in the latest snapshot; older trimmed rows remain pageable. */
+  historyOmissions?: HistoryOmission[];
   /**
    * The conversation's reasoning bursts, in transcript order.
    *

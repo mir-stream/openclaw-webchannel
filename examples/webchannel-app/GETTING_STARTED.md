@@ -244,7 +244,7 @@ replies over the E2E-encrypted NGS relay.
 ## What’s verified vs. the frontier
 
 - ✅ **Registry install + SaaS + browser flow** is verified: the app ran off the
-  downloaded tarballs up to the `connected → waiting-for-agent` state,
+  downloaded tarballs up to the `connecting` (or `connected → reconnecting` after a prior session) state,
   public-API-only. That verification was performed at `0.1.3`, when these
   packages were still published under the old scoped `@mir-stream/webchannel-*`
   names.

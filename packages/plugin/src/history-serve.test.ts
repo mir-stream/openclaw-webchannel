@@ -316,7 +316,7 @@ describe("createHistoryServer — #401 page correlation", () => {
     const rows = probe.sent[0].messages;
     expect(rows.length).toBeGreaterThan(1);
     // The exact size of the bare page frame — what `outboundWireSize` measures.
-    const bare = Buffer.byteLength(JSON.stringify({ type: "history", messages: rows }), "utf8");
+    const bare = Buffer.byteLength(JSON.stringify({ type: "history", epoch: journal.epoch, messages: rows }), "utf8");
 
     const { server, sent, scheduler } = harness(journal, {}, bare);
     server.servePage(PEER, {});
@@ -331,7 +331,7 @@ describe("createHistoryServer — #401 page correlation", () => {
     scheduler.flush();
     expect(sent[1].nonce).toBe(nonce);
     expect(sent[1].messages.length).toBeLessThan(rows.length);
-    expect(Buffer.byteLength(JSON.stringify({ type: "history", messages: sent[1].messages, nonce }), "utf8"))
+    expect(Buffer.byteLength(JSON.stringify({ type: "history", epoch: journal.epoch, messages: sent[1].messages, nonce }), "utf8"))
       .toBeLessThanOrEqual(bare);
   });
 
@@ -1201,7 +1201,7 @@ describe("createHistoryServer.serveDifference — #244 half B / #356", () => {
     const wireSize = (payload: unknown) => sealEnvelope(routing, key, payload).length;
     const row = journal.read(PEER, { afterSeq, limit: 1 })[0]!;
     const singleton = {
-      type: "difference", afterSeq, nonce: "request-nonce",
+      type: "difference", epoch: journal.epoch, afterSeq, nonce: "request-nonce",
       events: [{ seq: row.seq, event: row.event }], partial: true, maxSeq: firstSeq,
     };
     const limit = wireSize(singleton);
@@ -1283,7 +1283,9 @@ describe("createHistoryServer.serveDifference — #244 half B / #356", () => {
     }
     // Small enough that no single row fits, large enough that an EMPTY frame does
     // (below that the budget hands the reply on whole instead, by design).
-    const h = harness(journal, {}, 120);
+    const emptyBytes = Buffer.byteLength(JSON.stringify({ type: "difference", epoch: journal.epoch,
+      afterSeq: 0, nonce: "nonce-a", events: [], partial: false, maxSeq: MAX_DIFFERENCE_EVENTS }));
+    const h = harness(journal, {}, emptyBytes);
     serveDifference(h, 0);
 
     expect(h.differences).toHaveLength(1);
@@ -1342,7 +1344,9 @@ describe("createHistoryServer.serveDifference — #244 half B / #356", () => {
     }
     // No single row fits; an EMPTY frame still does (below that the budget hands
     // the reply on whole instead, by design).
-    const h = harness(journal, {}, 120);
+    const emptyBytes = Buffer.byteLength(JSON.stringify({ type: "difference", epoch: journal.epoch,
+      afterSeq: 0, nonce: "nonce-a", events: [], partial: false, maxSeq: MAX_DIFFERENCE_EVENTS }));
+    const h = harness(journal, {}, emptyBytes);
     serveDifference(h, 0);
 
     expect(h.recording.measurements).toBeLessThanOrEqual(600);

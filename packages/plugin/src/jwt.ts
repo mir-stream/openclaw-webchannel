@@ -69,7 +69,7 @@ function stripTrailingSlashes(s: string): string {
  * `BufferSource` parameter and Workers' lack of `Buffer`).
  */
 function base64UrlDecode(input: string): Uint8Array {
-  if (typeof input !== "string" || input.length === 0) {
+  if (typeof input !== "string" || !/^[A-Za-z0-9_-]+$/.test(input)) {
     throw new Error("webchannel: empty base64url segment");
   }
   // base64url → base64: replace chars and add padding.
@@ -201,12 +201,16 @@ export async function verifyJwt(
     const decoded = base64UrlDecode(headerSegment);
     const text = new TextDecoder("utf-8").decode(decoded);
     const parsed = JSON.parse(text) as unknown;
-    if (!parsed || typeof parsed !== "object") return null;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
     header = parsed as Record<string, unknown>;
   } catch {
     return null;
   }
   if (header.alg !== "RS256") return null;
+  // RFC 7515 §4.1.11: critical extensions must be understood. This verifier
+  // supports none; an empty or malformed crit is invalid too. Reject before
+  // key lookup so unsupported headers cannot trigger a JWKS fetch.
+  if (Object.hasOwn(header, "crit")) return null;
 
   // Step 2: extract kid. Missing kid is a hard reject — we never default to a
   // single key (the operator's IdP could rotate).
@@ -219,6 +223,19 @@ export async function verifyJwt(
   let signatureBytes: Uint8Array;
   try {
     signatureBytes = base64UrlDecode(signatureSegment);
+  } catch {
+    return null;
+  }
+
+  // Reject malformed payloads before untrusted kid lookup can cause I/O.
+  // These claims remain untrusted until the signature below verifies.
+  let payload: Record<string, unknown>;
+  try {
+    const decoded = base64UrlDecode(payloadSegment);
+    const text = new TextDecoder("utf-8").decode(decoded);
+    const parsed = JSON.parse(text) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    payload = parsed as Record<string, unknown>;
   } catch {
     return null;
   }
@@ -250,18 +267,6 @@ export async function verifyJwt(
     new TextEncoder().encode(signingInput).slice().buffer,
   );
   if (!ok) return null;
-
-  // Step 5: payload. Signature is valid; now validate the claims.
-  let payload: Record<string, unknown>;
-  try {
-    const decoded = base64UrlDecode(payloadSegment);
-    const text = new TextDecoder("utf-8").decode(decoded);
-    const parsed = JSON.parse(text) as unknown;
-    if (!parsed || typeof parsed !== "object") return null;
-    payload = parsed as Record<string, unknown>;
-  } catch {
-    return null;
-  }
 
   // iss — constant-time compare against expected issuer, tolerant of a trailing
   // slash. A URL issuer `https://x` and `https://x/` denote the same origin, but

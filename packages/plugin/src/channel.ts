@@ -4,6 +4,7 @@ import {
 } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import type { ChannelDoctorAdapter, ChannelStatusAdapter } from "openclaw/plugin-sdk/channel-contract";
+import { buildAccountScopedDmSecurityPolicy } from "openclaw/plugin-sdk/channel-policy";
 import { waitUntilAbort } from "openclaw/plugin-sdk/channel-runtime";
 import type { DmPolicy } from "openclaw/plugin-sdk/config-contracts";
 import { normalizeDmAllowEntry, resolveDmPolicy } from "./dm-allowlist.js";
@@ -99,6 +100,41 @@ function resolveAccount(
     enabled: isWebchannelAccountEnabled(cfg, accountId),
     allowFrom: ((account.allowFrom as string[] | undefined) ?? []).map(normalizeDmAllowEntry),
     dmPolicy: resolveDmPolicy(account),
+  };
+}
+
+function configRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+/** Return canonical edit paths for the layer that defines each effective DM field. */
+function resolveDmSecurityPaths(cfg: OpenClawConfig, accountId: string): {
+  policyPath: string;
+  allowFromPath: string;
+} {
+  const section = configRecord(cfg.channels?.[WEBCHANNEL_ID]);
+  const accounts = configRecord(section?.accounts);
+  const hasScopedAccount = accounts !== undefined && Object.prototype.hasOwnProperty.call(accounts, accountId);
+  const scoped = hasScopedAccount ? configRecord(accounts[accountId]) : undefined;
+  const rootBase = `channels.${WEBCHANNEL_ID}.`;
+  const scopedBase = `channels.${WEBCHANNEL_ID}.accounts.${accountId}.`;
+  const fallbackBase = hasScopedAccount ? scopedBase : rootBase;
+  const policyBase = scoped && (scoped.dmPolicy !== undefined || scoped.dmSecurity !== undefined)
+    ? scopedBase
+    : section && (section.dmPolicy !== undefined || section.dmSecurity !== undefined)
+      ? rootBase
+      : fallbackBase;
+  const allowFromBase = scoped?.allowFrom !== undefined
+    ? scopedBase
+    : section?.allowFrom !== undefined
+      ? rootBase
+      : fallbackBase;
+  return {
+    policyPath: `${policyBase}dmPolicy`,
+    // Core audit and doctor append the field name to this prefix.
+    allowFromPath: allowFromBase,
   };
 }
 
@@ -300,14 +336,25 @@ export function createWebChannelPlugin(
 
     // The SaaS JWT grant is the default admission approval (TD-1).
     security: {
-      dm: {
-        channelKey: WEBCHANNEL_ID,
-        resolvePolicy: (account) => account.dmPolicy,
-        resolveAllowFrom: (account) => account.allowFrom,
-        defaultPolicy: "open",
-        policyPathSuffix: "dmPolicy",
-        allowFromPathSuffix: "allowFrom",
-        normalizeEntry: normalizeDmAllowEntry,
+      resolveDmPolicy: ({ cfg, account }) => {
+        // resolveAccount preserves the exact listed spelling even when the
+        // caller used a canonical alias; diagnostics must point at that key.
+        const resolvedAccountId = account.accountId;
+        const paths = resolveDmSecurityPaths(cfg, resolvedAccountId);
+        return {
+          ...buildAccountScopedDmSecurityPolicy({
+            cfg,
+            channelKey: WEBCHANNEL_ID,
+            accountId: resolvedAccountId,
+            policy: account.dmPolicy,
+            allowFrom: account.allowFrom,
+            defaultPolicy: "open",
+            policyPathSuffix: "dmPolicy",
+            allowFromPathSuffix: "",
+            normalizeEntry: normalizeDmAllowEntry,
+          }),
+          ...paths,
+        };
       },
     },
 

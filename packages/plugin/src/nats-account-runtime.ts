@@ -23,6 +23,7 @@ import { openDeliveryJournal } from "./delivery-journal.js";
 import type { DeliveryJournal } from "./delivery-journal.js";
 import { tupleStoragePaths } from "./storage-paths.js";
 import { resolveDmPolicy, validateDmConfig } from "./dm-allowlist.js";
+import { ensureStorageIssuer, StorageIssuerError } from "./storage-issuer.js";
 import { createCapacityDiagnostics } from "./capacity-diagnostics.js";
 import { resolveEncryptionPolicy } from "./encryption-policy.js";
 import type { WebchannelEncryptionConfig } from "./encryption-policy.js";
@@ -58,7 +59,6 @@ import { resolveCommandGate } from "./command-gate.js";
 import { createStopControl } from "./stop-control.js";
 import { resolveInboundDebounceMs } from "openclaw/plugin-sdk/reply-runtime";
 import {
-  CancelledInboundFallbackTombstones,
   createIngressOnFlush,
 } from "./ingress-dedupe.js";
 import {
@@ -238,9 +238,6 @@ const accountRuntimes = new Map<string, AccountRuntime>();
 /** One heap/failure-domain budget and outcome cache across every account. */
 const processInboundRetention = new InboundRetentionBudget();
 const processIngressOutcomes = getProcessIngressOutcomeStore();
-const processCancelledInboundFallback = new CancelledInboundFallbackTombstones(
-  (message) => console.warn(message),
-);
 function runtimeForOverflow(request: OverflowResolutionRequest): AccountRuntime | undefined {
   const runtime = accountRuntimes.get(request.accountId);
   return runtime && request.storageScope?.accountId === runtime.accountId
@@ -265,9 +262,6 @@ const processOverflowResolver = new BoundedOverflowResolver({
     ?.channel.sendAck(request.peerId, [request.id], committed, cancelled ? [request.id] : undefined) ?? false,
   sendRejected: (request) => runtimeForOverflow(request)
     ?.channel.sendInboundRejected(request.peerId, [request.id]) ?? false,
-  onCancelledRecovered: ({ accountId, storageScope, key }) => {
-    processCancelledInboundFallback.delete(key, storageScope ?? accountId);
-  },
 });
 const accountCoordinator = new NatsAccountRuntimeCoordinator();
 const aggregateTracker = new AccountServingAggregateTracker();
@@ -477,6 +471,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             accountId,
             saasBaseUrl: source.saasBaseUrl,
           }, {
+            migrateLegacy: false,
             ...(source.storageRoot !== undefined
               ? { storageRoot: source.storageRoot }
               : {}),
@@ -565,7 +560,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         } catch { /* the stable permanent event below remains available */ }
         reportPermanent(
           accountId,
-          "jwt-auth-config-invalid",
+          err instanceof StorageIssuerError ? "storage-issuer-failed" : "jwt-auth-config-invalid",
           `${buildDetail}; fix the account JWT issuer and exactly-one JWKS source`,
         );
         setStatus(accountNeverServedStatusPatch({
@@ -632,6 +627,15 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       }
 
       const preflightIdentityKey = identityKey;
+      try {
+        ensureStorageIssuer({ tenant, accountId, storageRoot, issuer: effIssuer });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        reportPermanent(accountId, "storage-issuer-failed", detail);
+        setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: detail }));
+        await waitForAbort(ctx.abortSignal);
+        return undefined;
+      }
       // Keep one limiter per account lifecycle so transport restart attempts do
       // not reset capacity-rejection suppression and create a fresh log burst.
       const capacityDiagnostics = createCapacityDiagnostics({ logger: api.logger });
@@ -1111,7 +1115,6 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         dispatcherOptions: { budget: processInboundRetention, sessionToken },
       });
       inboundDispatcher = dispatchRecovery.dispatcher;
-      const cancelledInboundFallback = processCancelledInboundFallback;
 
       // P1-8b layer (a): repo-owned bounded idle pre-run debounce (Telegram
       // parity). It replaces core's unbounded primitive and sits IN FRONT of the
@@ -1149,7 +1152,6 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         // makes this write part of accepting a user message, so a missing handle
         // here is not a degrade mode — `index-nats-wiring.test.ts` pins the line.
         deliveryJournal,
-        cancelledFallback: cancelledInboundFallback,
         logInfo: (message) => api.logger?.info?.(message),
         logWarn: (message) => api.logger?.warn?.(message),
         isActive: () => runtimeActive,
@@ -1167,7 +1169,6 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           storageScope,
           outcomeStore: processIngressOutcomes,
           overflowResolver: processOverflowResolver,
-          cancelledFallback: cancelledInboundFallback,
           deliveryJournal,
           sessionToken,
           sendAck: (peerId, ids, committed, cancelled, unaccepted) => channel.sendAck(peerId, ids, committed, cancelled, unaccepted),

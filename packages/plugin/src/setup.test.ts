@@ -73,7 +73,7 @@ function credentialJson(input: {
 } = {}): string {
   const tenant = input.tenant ?? "t";
   const accountId = input.accountId ?? "accta";
-  const saasBaseUrl = input.saasBaseUrl ?? "http://s";
+  const saasBaseUrl = input.saasBaseUrl ?? "https://s";
   return JSON.stringify({
     credentialIdentity: createCredentialIdentityForEnrollment({
       tenant,
@@ -103,6 +103,7 @@ function section(next: unknown): Record<string, unknown> {
 }
 
 beforeEach(() => {
+  vi.unstubAllEnvs();
   acquireMock.mockClear();
   preflightMock.mockClear();
   migrationMock.mockReset();
@@ -126,26 +127,26 @@ describe("setup: resolveSetupIdentity", () => {
   it("prefers dedicated keys over generic flags", () => {
     expect(
       resolveSetupIdentity({
-        saasBaseUrl: "http://s",
+        saasBaseUrl: "https://s",
         tenant: "t",
         baseUrl: "http://ignored",
         url: "ignored",
       }),
-    ).toEqual({ saasBaseUrl: "http://s", tenant: "t" });
+    ).toEqual({ saasBaseUrl: "https://s", tenant: "t" });
   });
 
   it("falls back to generic flags when dedicated keys are absent", () => {
     expect(
-      resolveSetupIdentity({ baseUrl: "http://s", url: "tenant-x" }),
-    ).toEqual({ saasBaseUrl: "http://s", tenant: "tenant-x" });
+      resolveSetupIdentity({ baseUrl: "https://s", url: "tenant-x" }),
+    ).toEqual({ saasBaseUrl: "https://s", tenant: "tenant-x" });
   });
 });
 
 describe("setup: buildAccountPatch", () => {
   it("maps identity into the account config shape", () => {
     expect(
-      buildAccountPatch({ saasBaseUrl: "http://s", tenant: "t" }),
-    ).toEqual({ tenant: "t", saas: { baseUrl: "http://s" } });
+      buildAccountPatch({ saasBaseUrl: "https://s", tenant: "t" }),
+    ).toEqual({ tenant: "t", saas: { baseUrl: "https://s" } });
   });
 
   it("includes only defined fields", () => {
@@ -180,7 +181,7 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
     const next = webchannelSetup.applyAccountConfig({
       cfg,
       accountId: "accta",
-      input: { saasBaseUrl: "http://s", tenant: "t" },
+      input: { saasBaseUrl: "https://s", tenant: "t" },
     });
     // saasBaseUrl present ⇒ the complete enroll-ready block is written under the
     // named account. Trust-anchor change 2: issuer/jwksUrl/audience are NOT
@@ -191,7 +192,7 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
       accounts: {
         accta: {
           tenant: "t",
-          saas: { baseUrl: "http://s" },
+          saas: { baseUrl: "https://s" },
           auth: { strategy: "jwt" },
           dmPolicy: "open",
           allowFrom: ["*"],
@@ -214,6 +215,17 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
     });
   });
 
+  it("rejects an insecure direct SaaS URL before changing config", () => {
+    const cfg = { channels: { webchannel: { accounts: { accta: { tenant: "old" } } } } } as never;
+    const before = JSON.stringify(cfg);
+    expect(() => webchannelSetup.applyAccountConfig({
+      cfg,
+      accountId: "accta",
+      input: { saasBaseUrl: "http://host.docker.internal:3951", tenant: "new" },
+    })).toThrow(/use HTTPS/);
+    expect(JSON.stringify(cfg)).toBe(before);
+  });
+
   it("fails closed before writing when existing config contains removed auth.jwt.audience", () => {
     const cfg = {
       channels: {
@@ -223,7 +235,7 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
               auth: {
                 strategy: "jwt",
                 jwt: {
-                  jwksUrl: "http://s/.well-known/jwks.json",
+                  jwksUrl: "https://s/.well-known/jwks.json",
                   issuer: "http://custom-issuer",
                   audience: "custom-aud",
                 },
@@ -236,7 +248,7 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
     expect(() => webchannelSetup.applyAccountConfig({
       cfg,
       accountId: "accta",
-      input: { saasBaseUrl: "http://s", tenant: "t2" },
+      input: { saasBaseUrl: "https://s", tenant: "t2" },
     })).toThrow(/delete auth\.jwt\.audience/i);
     expect(((section(cfg).accounts as Record<string, unknown>).accta as { tenant?: string }).tenant)
       .toBeUndefined();
@@ -248,7 +260,7 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
       cfg,
       accountId: "accta",
       input: {
-        saasBaseUrl: "http://host.docker.internal:3951",
+        saasBaseUrl: "https://host.docker.internal:3951",
         tenant: "t",
         issuer: "http://127.0.0.1:3951",
       },
@@ -389,6 +401,44 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     expect(acquireMock).not.toHaveBeenCalled();
   });
 
+  it.each(["credentials override", "environment override"] as const)(
+    "contains an invalid SaaS %s without reading or acquiring credentials",
+    async (source) => {
+      if (source === "environment override") {
+        vi.stubEnv("WEBCHANNEL_SAAS_BASE_URL", "http://saas.internal:3951");
+      }
+      const runtime = makeRuntime();
+      const cfg = {
+        channels: {
+          webchannel: {
+            accounts: {
+              accta: {
+                tenant: "tenant-a",
+                saas: { baseUrl: "https://saas.example" },
+                ...(source === "credentials override"
+                  ? { nats: { credentials: { mode: "enrolled", saasBaseUrl: "http://saas.internal:3951" } } }
+                  : {}),
+              },
+            },
+          },
+        },
+      } as never;
+
+      await expect(webchannelSetup.afterAccountConfigWritten({
+        previousCfg: cfg,
+        cfg,
+        accountId: "accta",
+        input: {},
+        runtime,
+      })).resolves.toBeUndefined();
+
+      expect(runtime.log.mock.calls.flat().join("\n")).toMatch(/invalid SaaS base URL.*use HTTPS/);
+      expect(readMock).not.toHaveBeenCalled();
+      expect(migrationMock).not.toHaveBeenCalled();
+      expect(acquireMock).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([42, "relative/state"])(
     "contains invalid storageRoot %j as an account-scoped setup diagnostic",
     async (storageRoot) => {
@@ -400,7 +450,7 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
               accta: {
                 tenant: "tA",
                 storageRoot,
-                saas: { baseUrl: "http://s" },
+                saas: { baseUrl: "https://s" },
               },
             },
           },
@@ -431,20 +481,20 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
       channels: { webchannel: { accounts: { accta: {
         tenant: "tA",
         storageRoot: "/operator/state",
-        saas: { baseUrl: "http://s" },
+        saas: { baseUrl: "https://s" },
       } } } },
     } as never;
     await webchannelSetup.afterAccountConfigWritten({
       previousCfg: cfg,
       cfg,
       accountId: "accta",
-      input: { saasBaseUrl: "http://s", tenant: "tA" },
+      input: { saasBaseUrl: "https://s", tenant: "tA" },
       runtime,
     });
     expect(acquireMock).toHaveBeenCalledOnce();
     expect(acquireMock.mock.calls[0][0]).toMatchObject({
       accountId: "accta",
-      saasBaseUrl: "http://s",
+      saasBaseUrl: "https://s",
       storageRoot: "/operator/state",
       tenant: "tA",
     });
@@ -452,7 +502,7 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     expect(preflightMock).toHaveBeenCalledOnce();
     expect(preflightMock.mock.calls[0][0]).toMatchObject({
       accountId: "accta",
-      saasBaseUrl: "http://s",
+      saasBaseUrl: "https://s",
       tenant: "tA",
       enrollment: { userJwt: "JWT", userSeed: "SEED" },
     });
@@ -466,7 +516,7 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
           accounts: {
             accta: {
               tenant: "invalid.tenant",
-              saas: { baseUrl: "http://s" },
+              saas: { baseUrl: "https://s" },
             },
           },
         },
@@ -496,7 +546,7 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
       channels: {
         webchannel: {
           accounts: {
-            accta: { tenant: "tA", saas: { baseUrl: "http://s" } },
+            accta: { tenant: "tA", saas: { baseUrl: "https://s" } },
           },
         },
       },
@@ -532,7 +582,7 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
       channels: {
         webchannel: {
           accounts: {
-            accta: { tenant: "tA", saas: { baseUrl: "http://s" } },
+            accta: { tenant: "tA", saas: { baseUrl: "https://s" } },
           },
         },
       },
@@ -564,7 +614,7 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
       accountId: "accta",
       // Generic-flag mapping: --base-url/--url. The wire identity is the account
       // id itself (가-2) — there is no --token → agentId mapping anymore.
-      input: { baseUrl: "http://s", url: "tenant-x" },
+      input: { baseUrl: "https://s", url: "tenant-x" },
       runtime,
     });
     const echoed = runtime.log.mock.calls.find((c) =>
@@ -573,7 +623,7 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     expect(echoed).toBeDefined();
     expect(String(echoed![0])).toContain("tenant=tenant-x");
     expect(String(echoed![0])).toContain("accountId=accta");
-    expect(String(echoed![0])).toContain("saasBaseUrl=http://s");
+    expect(String(echoed![0])).toContain("saasBaseUrl=https://s");
   });
 
   it("acquires against nats.credentials.saasBaseUrl instead of the lower account SaaS base", async () => {
@@ -677,12 +727,12 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
   it("skips acquisition when per-account creds already exist", async () => {
     readMock.mockReturnValue(credentialJson());
     const runtime = makeRuntime();
-    const cfg = { channels: { webchannel: { accounts: { accta: { saas: { baseUrl: "http://s" } } } } } } as never;
+    const cfg = { channels: { webchannel: { accounts: { accta: { saas: { baseUrl: "https://s" } } } } } } as never;
     await webchannelSetup.afterAccountConfigWritten({
       previousCfg: cfg,
       cfg,
       accountId: "accta",
-      input: { saasBaseUrl: "http://s", tenant: "t" },
+      input: { saasBaseUrl: "https://s", tenant: "t" },
       runtime,
     });
     expect(acquireMock).not.toHaveBeenCalled();
@@ -700,7 +750,7 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
       channels: {
         webchannel: {
           accounts: {
-            accta: { tenant: "t", saas: { baseUrl: "http://s" } },
+            accta: { tenant: "t", saas: { baseUrl: "https://s" } },
           },
         },
       },
@@ -738,7 +788,7 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
       channels: {
         webchannel: {
           accounts: {
-            accta: { tenant: "t", saas: { baseUrl: "http://s" } },
+            accta: { tenant: "t", saas: { baseUrl: "https://s" } },
           },
         },
       },
@@ -767,7 +817,7 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     readMock.mockReturnValue(JSON.stringify(candidate));
     const runtime = makeRuntime();
     const cfg = {
-      channels: { webchannel: { accounts: { accta: { tenant: "t", saas: { baseUrl: "http://s" } } } } },
+      channels: { webchannel: { accounts: { accta: { tenant: "t", saas: { baseUrl: "https://s" } } } } },
     } as never;
 
     await webchannelSetup.afterAccountConfigWritten({
@@ -826,13 +876,13 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
   it("does NOT throw when acquisition fails (channels add still exits cleanly)", async () => {
     acquireMock.mockRejectedValueOnce(new Error("enroll boom"));
     const runtime = makeRuntime();
-    const cfg = { channels: { webchannel: { accounts: { accta: { saas: { baseUrl: "http://s" } } } } } } as never;
+    const cfg = { channels: { webchannel: { accounts: { accta: { saas: { baseUrl: "https://s" } } } } } } as never;
     await expect(
       webchannelSetup.afterAccountConfigWritten({
         previousCfg: cfg,
         cfg,
         accountId: "accta",
-        input: { saasBaseUrl: "http://s", tenant: "t" },
+        input: { saasBaseUrl: "https://s", tenant: "t" },
         runtime,
       }),
     ).resolves.toBeUndefined();

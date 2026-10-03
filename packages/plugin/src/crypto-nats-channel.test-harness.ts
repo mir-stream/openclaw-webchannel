@@ -1,4 +1,8 @@
 /**
+ * Historical Phase A test harness; not a production transport or approval path.
+ * Retained for codec conformance tests. Production encryption is owned by
+ * nats-channel.ts and e2e-session.ts, including approval frames.
+ *
  * CryptoNatsChannel — E2E encrypted NATS channel (Sub-AC 2).
  *
  * Integrates the e2e-envelope crypto codec into the NATS-WebSocket chat

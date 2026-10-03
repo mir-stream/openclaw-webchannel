@@ -50,7 +50,7 @@ export function validateDmConfig(cfg: Record<string, unknown>): void {
   if (policy === "open" && !(allow as string[] | undefined)?.some(value => value.trim() === "*")) {
     throw new Error('dmPolicy="open" (the default) requires allowFrom to explicitly include "*"');
   }
-  if (policy === "allowlist" && !(allow as string[] | undefined)?.some(value => value.trim().length > 0)) {
+  if (policy === "allowlist" && !(allow as string[] | undefined)?.some(value => normalizeDmAllowEntry(value).length > 0)) {
     throw new Error('dmPolicy="allowlist" requires at least one allowFrom sender ID');
   }
 }

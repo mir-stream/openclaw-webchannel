@@ -1,3 +1,4 @@
+import { assertSaasBaseUrl } from "./saas-authority.js";
 /**
  * Trust-anchor preflight (design §4 change 4) — the PRIMARY safety net.
  *
@@ -47,6 +48,7 @@ export function joinUrl(baseUrl: string, path: string): string {
 
 /** The `/.well-known/jwks.json` URL derived from a SaaS base URL (invariant #1). */
 export function deriveJwksUrl(saasBaseUrl: string): string {
+  assertSaasBaseUrl(saasBaseUrl);
   return joinUrl(saasBaseUrl, ".well-known/jwks.json");
 }
 
@@ -357,6 +359,13 @@ export type RunAddPreflightOptions = {
 export async function runAddPreflight(
   opts: RunAddPreflightOptions,
 ): Promise<AddPreflightReport> {
+  try {
+    assertSaasBaseUrl(opts.saasBaseUrl);
+  } catch (error) {
+    const report = { ok: false, line: `channels add preflight: FAIL — ${String(error)}` };
+    opts.log(`[webchannel] ${report.line}`);
+    return report;
+  }
   const timeoutMs = opts.timeoutMs ?? 5000;
   // Issuer precedence MUST match the runtime's `deriveAccountAuth`:
   // pin > SaaS-delivered (enrollment.issuer) > derived from --base-url.

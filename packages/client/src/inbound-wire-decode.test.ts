@@ -103,6 +103,20 @@ describe("#246 half A — decodeInboundMessage: the frame envelope", () => {
     refuses({ ...(VALID.agent_message as object), turnId: {} });
     refuses({ ...(VALID.progress as object), text: 5 });
   });
+
+  it("#414: refuses malformed journal epochs before any receipt or cursor work", () => {
+    for (const frame of [VALID.history, VALID.difference, VALID.ack, VALID.agent_message]) {
+      for (const epoch of [null, 1, "", "x".repeat(129)]) refuses({ ...frame as object, epoch });
+      accepts({ ...frame as object, epoch: "journal-instance" });
+    }
+  });
+
+  it("#413: validates omission identities and their snapshot range", () => {
+    const frame = { type: "history", highWaterSeq: 5, messages: [], snapshotComplete: false };
+    accepts({ ...frame, omitted: [{ id: "tool", kind: "tool", turnId: "turn", seq: 5 }] });
+    for (const omitted of [null, {}, [null], [{ id: 1 }], [{ id: "x", seq: 6 }],
+      [{ id: "x", kind: "unknown" }], [{ id: "x", turnId: 2 }]]) refuses({ ...frame, omitted });
+  });
 });
 
 describe("protocol 7 typing renewals", () => {

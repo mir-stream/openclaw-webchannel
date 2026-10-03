@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import { assertValidAccountId, type PersistedEnrolledCreds } from "./account-config.js";
@@ -28,7 +28,10 @@ import { StorageDocumentError } from "./storage-document.js";
 import { STORAGE_IDENTITY_VERSION } from "./storage-identity.js";
 import { tupleStoragePaths } from "./storage-paths.js";
 
-const cfg = (webchannel: Record<string, unknown>): OpenClawConfig => ({ channels: { webchannel: { allowFrom: ["*"], ...webchannel } } } as never);
+let doctorStorageRoot: string;
+beforeEach(() => { doctorStorageRoot = mkdtempSync(join(tmpdir(), "webchannel-doctor-")); });
+afterEach(() => { rmSync(doctorStorageRoot, { recursive: true, force: true }); });
+const cfg = (webchannel: Record<string, unknown>): OpenClawConfig => ({ channels: { webchannel: { storageRoot: doctorStorageRoot, allowFrom: ["*"], ...webchannel } } } as never);
 const identityKey = { publicKey: new Uint8Array(32), privateKey: new Uint8Array(32) };
 const persisted = {
   userJwt: "J",

@@ -43,6 +43,8 @@ import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 export const MAX_CONTROL_LINE = 64 * 1024;
 export const MAX_PAYLOAD = 8 * 1024 * 1024;
 export const MAX_BUFFERED_BYTES = MAX_CONTROL_LINE + MAX_PAYLOAD + 4;
+const INBOUND_REPLAY_WINDOW_MS = 10 * 60 * 1000;
+const MAX_SEEN_INBOUND_ENVELOPES = 16_384;
 
 /**
  * A random, subject-safe token (hex only, so it never contains a `.`/`*`/`>`
@@ -387,8 +389,12 @@ export type InboundMessage = {
   seq?: number;
   /** #244 half A — see `seq`. */
   highWaterSeq?: number;
+  /** Journal instance identity. Sequence numbers and server IDs are scoped to it. */
+  epoch?: string;
   /** False when byte fitting omitted requested snapshot content. */
   snapshotComplete?: boolean;
+  /** #413: byte-omitted row identities, independent of the snapshot baseline. */
+  omitted?: import("./types.js").HistoryOmission[];
   /**
    * #245 Part B: on a `user_committed` frame, the client-minted idempotency
    * `random_id` of the send this echoes — the origin device's reconciliation key
@@ -463,6 +469,7 @@ export type OutboundMessage =
 
 /** Message listener callback (decrypted, high-level). */
 export type MessageListener = (msg: InboundMessage) => void;
+type InboundMessageGate = (msg: InboundMessage) => boolean;
 
 /** Raw NATS message listener: (subject, payload) before any decryption. */
 export type RawMessageListener = (subject: string, payload: string) => void;
@@ -1368,7 +1375,14 @@ export function registerSubject(tenant: string, accountId: string, peerId: strin
 export class WebChannelNatsClient {
   private readonly client: NatsClient;
   private readonly options: WebChannelNatsClientOptions;
+  // #415 E4: authenticated envelope IDs survive transport reconnects. The
+  // ±10-minute clock window matches the plugin. Never evict still-fresh IDs:
+  // at capacity refuse new frames until expiry instead of reopening replay.
+  // This is instance-local; a new page/client has only the timestamp defense.
+  private readonly seenInboundEnvelopes = new Map<string, number>();
+  private nextInboundReplaySweepAt = 0;
   private readonly messageListeners = new Set<MessageListener>();
+  private inboundMessageGate: InboundMessageGate | undefined;
   private readonly errorListeners = new Set<ErrorListener>();
   private readonly protocolListeners = new Set<ProtocolListener>();
   private readonly sessionListeners = new Set<SessionListener>();
@@ -1760,6 +1774,24 @@ export class WebChannelNatsClient {
     return () => { this.messageListeners.delete(listener); };
   }
 
+  /**
+   * @internal Let the state wrapper reject a retired journal epoch before an
+   * ACK/rejection mutates this client's replay ledger or send tracker. Journal
+   * epoch ownership stays in the wrapper; this client only honors its verdict at
+   * the one ordering boundary where result side effects begin.
+   */
+  setInboundMessageGate(gate: InboundMessageGate): void {
+    this.inboundMessageGate = gate;
+  }
+
+  /** @internal True while this client still owns delivery of the exact send. */
+  hasPendingRandomId(randomId: string): boolean {
+    const owns = (message: OutboundMessage) =>
+      message.type === "user_message" && message.random_id === randomId;
+    return this.outboundQueue.some(owns)
+      || [...this.unackedLedger.values()].some((entry) => owns(entry.message));
+  }
+
   /** Add connection state listener. */
   onState(listener: StateListener): () => void {
     return this.client.onState(listener);
@@ -1942,6 +1974,25 @@ export class WebChannelNatsClient {
   private openInboundFrame(payload: string, key: Uint8Array): InboundMessage | null {
     const raw = openMessage(payload, key);
     if (raw === null) return null;
+    // openMessage authenticated these exact envelope fields before we trust
+    // them or reserve an ID. Both the live and pre-key-buffer doors come here.
+    const envelope = JSON.parse(payload) as Record<string, unknown>;
+    const { messageId, ts } = envelope;
+    const now = Date.now();
+    if (envelope.tenant !== this.options.tenant || envelope.accountId !== this.options.accountId
+      || envelope.sub !== this.options.peerId || typeof messageId !== "string"
+      || messageId.length === 0 || messageId.length > 256
+      || typeof ts !== "number" || !Number.isFinite(ts) || Math.abs(now - ts) > INBOUND_REPLAY_WINDOW_MS) return null;
+    // Bound sweeping work even if a relay floods the full cache. Expiry is the
+    // last instant at which this authenticated timestamp could be accepted.
+    if (now >= this.nextInboundReplaySweepAt) {
+      for (const [id, expiresAt] of this.seenInboundEnvelopes) {
+        if (expiresAt < now) this.seenInboundEnvelopes.delete(id);
+      }
+      this.nextInboundReplaySweepAt = now + 1000;
+    }
+    if (this.seenInboundEnvelopes.has(messageId) || this.seenInboundEnvelopes.size >= MAX_SEEN_INBOUND_ENVELOPES) return null;
+    this.seenInboundEnvelopes.set(messageId, ts + INBOUND_REPLAY_WINDOW_MS);
     const decoded = decodeInboundMessage(raw);
     if (decoded.ok) return decoded.message;
     const failure = decoded.failure;
@@ -1965,6 +2016,7 @@ export class WebChannelNatsClient {
    * `drainAcked`'s `new Set(ids)` has always assumed and never checked.
    */
   private deliverInbound(msg: InboundMessage): void {
+    if (this.inboundMessageGate?.(msg) === false) return;
     if (msg.type === "ack") this.drainAcked(msg.ids, msg.cancelled);
     if (msg.type === "inbound_rejected" && msg.reason === "overloaded") {
       this.drainRejected(msg.ids);

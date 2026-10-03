@@ -649,7 +649,7 @@
                 "minItems": 1,
                 "contains": {
                   "type": "string",
-                  "pattern": "\\S"
+                  "pattern": "^(?!\\s*(?:[wW][eE][bB][cC][hH][aA][nN][nN][eE][lL]:)?\\s*$)[\\s\\S]+$"
                 }
               }
             },
@@ -664,13 +664,17 @@
                 "minItems": 1,
                 "contains": {
                   "type": "string",
-                  "pattern": "\\S"
+                  "pattern": "^(?!\\s*(?:[wW][eE][bB][cC][hH][aA][nN][nN][eE][lL]:)?\\s*$)[\\s\\S]+$"
                 }
               }
             }
           }
         },
-        "allOf": [
+        "if": {
+          "$ref": "#/definitions/dmEnabled"
+        },
+        "then": {
+          "allOf": [
           {
             "if": {
               "allOf": [
@@ -899,7 +903,8 @@
               }
             }
           }
-        ]
+          ]
+        }
       },
       "uiHints": {
         "auth.strategy": {

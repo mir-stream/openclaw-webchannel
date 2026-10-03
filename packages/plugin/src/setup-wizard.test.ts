@@ -77,6 +77,7 @@ function boundCredentialJson(
 }
 
 beforeEach(() => {
+  vi.unstubAllEnvs();
   readMock.mockReset();
   readMock.mockImplementation(() => {
     throw Object.assign(new Error("missing"), { code: "ENOENT" });
@@ -101,12 +102,12 @@ describe("setup-wizard: buildFullAccountPatch (ground-truth demo block)", () => 
     expect(
       buildFullAccountPatch({
         tenant: "default-tenant",
-        saasBaseUrl: "http://host.docker.internal:3951",
+        saasBaseUrl: "https://host.docker.internal:3951",
         accountId: "default-agent",
       }),
     ).toEqual({
       tenant: "default-tenant",
-      saas: { baseUrl: "http://host.docker.internal:3951" },
+      saas: { baseUrl: "https://host.docker.internal:3951" },
       auth: { strategy: "jwt" },
       dmPolicy: "open",
           allowFrom: ["*"],
@@ -127,7 +128,7 @@ describe("setup-wizard: buildFullAccountPatch (ground-truth demo block)", () => 
   it("(b) with an explicit issuer pin writes it but never audience/jwksUrl", () => {
     const patch = buildFullAccountPatch({
       tenant: "default-tenant",
-      saasBaseUrl: "http://host.docker.internal:3951",
+      saasBaseUrl: "https://host.docker.internal:3951",
       accountId: "default-agent",
       issuer: "http://127.0.0.1:3951",
     });
@@ -140,7 +141,7 @@ describe("setup-wizard: buildFullAccountPatch (ground-truth demo block)", () => 
   it("(b) with ONLY an issuer pin: writes issuer, omits audience (audience still derives)", () => {
     const patch = buildFullAccountPatch({
       tenant: "t",
-      saasBaseUrl: "http://s",
+      saasBaseUrl: "https://s",
       accountId: "acct",
       issuer: "https://logical-issuer.example",
     });
@@ -155,7 +156,7 @@ describe("setup-wizard: buildFullAccountPatch (ground-truth demo block)", () => 
     // ONE assertion that guards the default from regressing back to `auto`.
     const patch = buildFullAccountPatch({
       tenant: "t",
-      saasBaseUrl: "http://s",
+      saasBaseUrl: "https://s",
       accountId: "acct",
     });
     expect((patch.nats as { admission: string }).admission).toBe("register-hop");
@@ -184,6 +185,34 @@ describe("setup-wizard: declarative detection", () => {
     const cfg = { channels: { webchannel: { accounts: { accta: {} } } } } as never;
     expect(webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" })).toBe(false);
   });
+
+  it.each(["configured", "environment"] as const)(
+    "status.resolveConfigured contains an invalid %s SaaS URL before credential lookup",
+    (source) => {
+      if (source === "environment") {
+        vi.stubEnv("WEBCHANNEL_SAAS_BASE_URL", "http://saas.internal:3951");
+      }
+      const cfg = {
+        channels: {
+          webchannel: {
+            accounts: {
+              accta: {
+                tenant: "tenant-a",
+                saas: {
+                  baseUrl: source === "configured"
+                    ? "http://saas.internal:3951"
+                    : "https://saas.example",
+                },
+              },
+            },
+          },
+        },
+      } as never;
+      expect(webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" }))
+        .toBe(false);
+      expect(readMock).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([42, "relative/state"])(
     "status.resolveConfigured contains invalid storageRoot %j",
@@ -485,13 +514,13 @@ describe("setup-wizard: per-field funnel safety", () => {
     const finalized = webchannelSetupWizard.finalize?.({
       cfg,
       accountId: "accta",
-      credentialValues: { tenant: "t", saasBaseUrl: "http://s" },
+      credentialValues: { tenant: "t", saasBaseUrl: "https://s" },
     } as never) as { cfg: unknown };
     // No issuer/audience collected ⇒ the JWT-verify params are OMITTED and derive
     // at runtime; only the anchor + strategy + admission/creds/dmSecurity persist.
     expect(account(finalized.cfg, "accta")).toEqual({
       tenant: "t",
-      saas: { baseUrl: "http://s" },
+      saas: { baseUrl: "https://s" },
       auth: { strategy: "jwt" },
       dmPolicy: "open",
           allowFrom: ["*"],
@@ -504,7 +533,7 @@ describe("setup-wizard: per-field funnel safety", () => {
     const finalized = webchannelSetupWizard.finalize?.({
       cfg,
       accountId: "AcctA",
-      credentialValues: { tenant: "t", saasBaseUrl: "http://s" },
+      credentialValues: { tenant: "t", saasBaseUrl: "https://s" },
     } as never) as { cfg: unknown };
     // The account key is the JWT audience; there is no independently writable
     // audience field that can drift from it.
@@ -561,10 +590,12 @@ describe("setup-wizard: per-field funnel safety", () => {
 });
 
 describe("setup-wizard: validateHttpUrl", () => {
-  it("accepts http and https URLs", () => {
-    expect(validateHttpUrl("http://saas.example.com")).toBeUndefined();
+  it("accepts HTTPS and only loopback HTTP URLs", () => {
+    expect(validateHttpUrl("http://localhost:3001")).toBeUndefined();
+    expect(validateHttpUrl("http://saas.example.com")).toBeDefined();
+    expect(validateHttpUrl("http://host.docker.internal:3951")).toBeDefined();
     expect(validateHttpUrl("https://saas.example.com:3951/path")).toBeUndefined();
-    expect(validateHttpUrl("http://host.docker.internal:3951")).toBeUndefined();
+    expect(validateHttpUrl("https://host.docker.internal:3951")).toBeUndefined();
   });
 
   it("rejects non-http(s) schemes", () => {

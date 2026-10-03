@@ -80,6 +80,7 @@ import {
   type WebchannelNatsConfig,
 } from "./nats-credential-source.js";
 import { runAddPreflight } from "./preflight.js";
+import { assertSaasBaseUrl } from "./saas-authority.js";
 
 /**
  * The slice of `ChannelSetupInput` this adapter reads. The host type is a closed
@@ -349,6 +350,9 @@ export const webchannelSetup = {
     const identity = resolveSetupIdentity(input);
 
     if (identity.saasBaseUrl !== undefined) {
+      // Validate before constructing or writing the next config. A direct
+      // non-interactive URL must never persist an authority runtime will reject.
+      assertSaasBaseUrl(identity.saasBaseUrl);
       // Full-block seam. Read the existing account so a re-run preserves the
       // operator's manual issuer pin unless the flag explicitly overrides.
       const existing = resolveWebchannelAccountConfigForSetup(cfg, id);
@@ -452,12 +456,22 @@ export const webchannelSetup = {
     const identity = resolveSetupIdentity(input);
     const tenant =
       identity.tenant ?? configuredIdentity.tenant;
-    const saasBaseUrl = resolveEnrolledSaasBaseUrl({
-      natsConfig: account.nats as WebchannelNatsConfig | undefined,
-      saasBaseUrl:
-        identity.saasBaseUrl ??
-        configuredIdentity.saasBaseUrl,
-    });
+    let saasBaseUrl: string | undefined;
+    try {
+      saasBaseUrl = resolveEnrolledSaasBaseUrl({
+        natsConfig: account.nats as WebchannelNatsConfig | undefined,
+        saasBaseUrl:
+          identity.saasBaseUrl ??
+          configuredIdentity.saasBaseUrl,
+      });
+    } catch {
+      runtime.log(
+        `[webchannel] account "${id}": invalid SaaS base URL; use HTTPS ` +
+          `(HTTP is allowed only for localhost, 127.0.0.0/8 or ::1). ` +
+          `Correct the account configuration or WEBCHANNEL_SAAS_BASE_URL and retry.`,
+      );
+      return;
+    }
 
     if (!saasBaseUrl) {
       runtime.log(

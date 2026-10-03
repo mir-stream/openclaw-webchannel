@@ -55,6 +55,23 @@ describe("SDK DM policy contract (#406)", () => {
     expect(schema.safeParse(config).success).toBe(true);
   });
 
+  it.each([
+    { config: { dmPolicy: "allowlist", allowFrom: ["webchannel:  "] }, accountId: "default" },
+    { config: { accounts: { a: { dmPolicy: "allowlist", allowFrom: [" WebChannel: \t"] } } }, accountId: "a" },
+    { config: { dmPolicy: "allowlist", allowFrom: ["webchannel:  "], accounts: { a: { tenant: "t" } } }, accountId: "a" },
+  ])("rejects an effectively empty normalized allowlist in flat/named/inherited config %#", ({ config, accountId }) => {
+    expect(schema.safeParse(config).success).toBe(false);
+    const cfg = { channels: { webchannel: config } } as never;
+    expect(() => validateDmConfig(resolveWebchannelAccountConfig(cfg, accountId))).toThrow(/at least one allowFrom/);
+  });
+
+  it.each([
+    { enabled: false, accounts: { a: { tenant: "t" } } },
+    { enabled: false, accounts: { a: { dmPolicy: "allowlist", allowFrom: [] } } },
+  ])("schema skips effective DM cross-validation when the channel is disabled %j", (config) => {
+    expect(schema.safeParse(config).success).toBe(true);
+  });
+
   it("reports the open default and real flat/named audit fix paths", () => {
     const plugin = createWebChannelPlugin({} as never);
     for (const named of [false, true]) {
@@ -64,19 +81,45 @@ describe("SDK DM policy contract (#406)", () => {
       const account = plugin.config.resolveAccount(cfg, accountId);
       const policy = plugin.security!.resolveDmPolicy!({ cfg, accountId, account });
       const base = named ? "channels.webchannel.accounts.a" : "channels.webchannel";
-      expect(policy).toMatchObject({ policy: "open", allowFrom: ["*"], policyPath: `${base}.dmPolicy`, allowFromPath: `${base}.allowFrom` });
+      expect(policy).toMatchObject({ policy: "open", allowFrom: ["*"], policyPath: `${base}.dmPolicy`, allowFromPath: `${base}.` });
+      expect(`${policy!.allowFromPath}allowFrom`).toBe(`${base}.allowFrom`);
     }
   });
 
+  it("reports independent inherited audit paths for policy and allowFrom", () => {
+    const plugin = createWebChannelPlugin({} as never);
+    const cfg = { channels: { webchannel: {
+      dmPolicy: "allowlist", accounts: { a: { allowFrom: ["alice"] } },
+    } } } as never;
+    const account = plugin.config.resolveAccount(cfg, "a");
+    const policy = plugin.security!.resolveDmPolicy!({ cfg, accountId: "a", account });
+    expect(policy).toMatchObject({
+      policy: "allowlist",
+      policyPath: "channels.webchannel.dmPolicy",
+      allowFromPath: "channels.webchannel.accounts.a.",
+    });
+    expect(`${policy!.allowFromPath}allowFrom`).toBe("channels.webchannel.accounts.a.allowFrom");
+  });
+
   it("lets an account-local legacy policy override the shared canonical policy", () => {
-    const cfg = { channels: { webchannel: { dmPolicy: "open", allowFrom: ["*"], accounts: {
-      a: { dmSecurity: "disabled" }, b: { dmPolicy: "allowlist", allowFrom: ["webchannel:bob"] },
+    const cfg = { channels: { webchannel: { dmPolicy: "disabled", allowFrom: ["*"], accounts: {
+      a: { dmSecurity: "open" }, b: { dmPolicy: "allowlist", allowFrom: ["webchannel:bob"] },
     } } } };
     const account = resolveWebchannelAccountConfig(cfg, "a");
-    expect(resolveDmPolicy(account)).toBe("disabled");
-    expect(resolveDmAdmission("alice", account).allowed).toBe(false);
+    expect(resolveDmPolicy(account)).toBe("open");
+    expect(resolveDmAdmission("alice", account).allowed).toBe(true);
     expect(schema.safeParse(cfg.channels.webchannel).success).toBe(true);
     expect(() => validateDmConfig(resolveWebchannelAccountConfig(cfg, "b"))).not.toThrow();
+
+    const plugin = createWebChannelPlugin({} as never);
+    const resolved = plugin.config.resolveAccount(cfg as never, "a");
+    const auditPolicy = plugin.security!.resolveDmPolicy!({ cfg: cfg as never, accountId: "a", account: resolved });
+    expect(auditPolicy).toMatchObject({ policy: "open", policyPath: "channels.webchannel.accounts.a.dmPolicy" });
+    const fixed = { channels: { webchannel: { ...cfg.channels.webchannel, accounts: {
+      ...cfg.channels.webchannel.accounts,
+      a: { ...cfg.channels.webchannel.accounts.a, dmPolicy: "disabled" },
+    } } } };
+    expect(resolveDmPolicy(resolveWebchannelAccountConfig(fixed, "a"))).toBe("disabled");
   });
 
   it("doctor reports legacy spellings and a missing open wildcard", () => {
