@@ -86,6 +86,24 @@ afterEach(() => {
   document.body.replaceChildren();
 });
 
+it("#415 E8: registers and unwraps with a non-extractable X25519 private key", async () => {
+  const generate = crypto.subtle.generateKey.bind(crypto.subtle);
+  let device: CryptoKeyPair | undefined;
+  const spy = vi.spyOn(crypto.subtle, "generateKey").mockImplementation(async (...args: Parameters<typeof generate>) => {
+    const pair = await generate(...args) as CryptoKeyPair;
+    if (pair.privateKey.algorithm.name === "X25519") device = pair;
+    return pair;
+  });
+  try {
+    await mount();
+    expect(device!.privateKey.extractable).toBe(false);
+    await expect(crypto.subtle.exportKey("pkcs8", device!.privateKey)).rejects.toThrow();
+    expect((await crypto.subtle.exportKey("raw", device!.publicKey)).byteLength).toBe(32);
+    deliver({ type: "agent_message", text: "unwrapped successfully" });
+    expect(root.textContent).toContain("unwrapped successfully");
+  } finally { spy.mockRestore(); }
+});
+
 it("preserves a draft submitted during slow re-auth until the new SDK owns it", async () => {
   await mount();
   const gate = deferred();

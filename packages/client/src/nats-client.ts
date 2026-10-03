@@ -43,6 +43,8 @@ import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 export const MAX_CONTROL_LINE = 64 * 1024;
 export const MAX_PAYLOAD = 8 * 1024 * 1024;
 export const MAX_BUFFERED_BYTES = MAX_CONTROL_LINE + MAX_PAYLOAD + 4;
+const INBOUND_REPLAY_WINDOW_MS = 10 * 60 * 1000;
+const MAX_SEEN_INBOUND_ENVELOPES = 16_384;
 
 /**
  * A random, subject-safe token (hex only, so it never contains a `.`/`*`/`>`
@@ -1372,6 +1374,12 @@ export function registerSubject(tenant: string, accountId: string, peerId: strin
 export class WebChannelNatsClient {
   private readonly client: NatsClient;
   private readonly options: WebChannelNatsClientOptions;
+  // #415 E4: authenticated envelope IDs survive transport reconnects. The
+  // ±10-minute clock window matches the plugin. Never evict still-fresh IDs:
+  // at capacity refuse new frames until expiry instead of reopening replay.
+  // This is instance-local; a new page/client has only the timestamp defense.
+  private readonly seenInboundEnvelopes = new Map<string, number>();
+  private nextInboundReplaySweepAt = 0;
   private readonly messageListeners = new Set<MessageListener>();
   private readonly errorListeners = new Set<ErrorListener>();
   private readonly protocolListeners = new Set<ProtocolListener>();
@@ -1946,6 +1954,25 @@ export class WebChannelNatsClient {
   private openInboundFrame(payload: string, key: Uint8Array): InboundMessage | null {
     const raw = openMessage(payload, key);
     if (raw === null) return null;
+    // openMessage authenticated these exact envelope fields before we trust
+    // them or reserve an ID. Both the live and pre-key-buffer doors come here.
+    const envelope = JSON.parse(payload) as Record<string, unknown>;
+    const { messageId, ts } = envelope;
+    const now = Date.now();
+    if (envelope.tenant !== this.options.tenant || envelope.accountId !== this.options.accountId
+      || envelope.sub !== this.options.peerId || typeof messageId !== "string"
+      || messageId.length === 0 || messageId.length > 256
+      || typeof ts !== "number" || !Number.isFinite(ts) || Math.abs(now - ts) > INBOUND_REPLAY_WINDOW_MS) return null;
+    // Bound sweeping work even if a relay floods the full cache. Expiry is the
+    // last instant at which this authenticated timestamp could be accepted.
+    if (now >= this.nextInboundReplaySweepAt) {
+      for (const [id, expiresAt] of this.seenInboundEnvelopes) {
+        if (expiresAt < now) this.seenInboundEnvelopes.delete(id);
+      }
+      this.nextInboundReplaySweepAt = now + 1000;
+    }
+    if (this.seenInboundEnvelopes.has(messageId) || this.seenInboundEnvelopes.size >= MAX_SEEN_INBOUND_ENVELOPES) return null;
+    this.seenInboundEnvelopes.set(messageId, ts + INBOUND_REPLAY_WINDOW_MS);
     const decoded = decodeInboundMessage(raw);
     if (decoded.ok) return decoded.message;
     const failure = decoded.failure;

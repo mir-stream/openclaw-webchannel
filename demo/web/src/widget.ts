@@ -596,8 +596,8 @@ export async function createWidget(
     renderMenu();
 
     try {
-      // Device keys (PoP private key non-extractable).
-      const x25519 = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])) as CryptoKeyPair;
+      // Device private keys are non-extractable; public halves remain exportable.
+      const x25519 = (await crypto.subtle.generateKey({ name: "X25519" }, false, ["deriveBits"])) as CryptoKeyPair;
       if (!ownsAuth()) return;
       const deviceX25519PublicKey = b64url(await crypto.subtle.exportKey("raw", x25519.publicKey));
       if (!ownsAuth()) return;

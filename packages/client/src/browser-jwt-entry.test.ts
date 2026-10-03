@@ -1,10 +1,37 @@
 import { describe, expect, it, vi } from "vitest";
+import { runDemo } from "./browser-demo-entry.js";
 
 import {
   buildReferenceBootstrapRequest,
   resolveReferenceBootstrapTuple,
   runJwtRegister,
+  runAllReal,
 } from "./browser-jwt-entry.js";
+
+it.each(["reference", "all-real", "demo"])("#415 E8: %s never creates an exportable device private key", async entry => {
+  const generate = crypto.subtle.generateKey.bind(crypto.subtle);
+  const pairs: CryptoKeyPair[] = [];
+  const spy = vi.spyOn(crypto.subtle, "generateKey").mockImplementation(async (...args: Parameters<typeof generate>) => {
+    const pair = await generate(...args) as CryptoKeyPair;
+    pairs.push(pair);
+    return pair;
+  });
+  const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("stop after key generation"));
+  const opts = { natsUrl: "ws://unused", issuerUrl: "https://issuer.test", gwUrl: "unused", accountId: "a", tenant: "t", peerId: "p", text: "hello" };
+  try {
+    const result = entry === "reference" ? runJwtRegister(opts)
+      : entry === "all-real" ? runAllReal(opts)
+      : runDemo(opts, { onReply: () => {}, onError: () => {}, onStatus: () => {} });
+    await expect(result).rejects.toThrow("stop after key generation");
+    const device = pairs.find(pair => pair.privateKey.algorithm.name === "X25519")!;
+    expect(device).toBeDefined();
+    expect(device.privateKey.extractable).toBe(false);
+    await expect(crypto.subtle.exportKey("pkcs8", device.privateKey)).rejects.toThrow();
+    expect((await crypto.subtle.exportKey("raw", device.publicKey)).byteLength).toBe(32);
+  } finally {
+    spy.mockRestore(); fetchSpy.mockRestore();
+  }
+});
 
 describe("reference bootstrap tuple ownership", () => {
   it("never sends tenant/accountId as caller-chosen mint inputs", () => {

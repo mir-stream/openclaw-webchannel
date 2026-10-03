@@ -12,12 +12,16 @@ import {
 const IN = inboundSubject(TENANT, AGENT, PEER);
 const OUT = outboundSubject(TENANT, AGENT, PEER);
 const TIMEOUT = 1_000;
+const realTimers = { setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout };
 const wrappers: WebChannelNATSClient[] = [];
 let restore: () => void;
 beforeEach(() => { restore = installFakeWebSocket(); });
 afterEach(() => {
   for (const wrapper of wrappers.splice(0)) wrapper.close();
   vi.restoreAllMocks();
+  // Vitest 2 re-restores old spies, so timer hooks use scoped global stubs.
+  // Remove those stubs before uninstalling the fake clock they captured.
+  vi.unstubAllGlobals();
   vi.useRealTimers();
   restore();
 });
@@ -122,8 +126,6 @@ async function withClock() {
   return { ...h, receipt, request, turnId: h.received[0]!.id! };
 }
 
-// Runs before the fake-timer suite below: these real-time cases must not inherit
-// a restored `setTimeout` spy that was taken while fake timers were installed.
 describe("#396 quiet-turn liveness (plugin typing keepalive)", () => {
   it("keeps a quiet accepted turn active, without recovery, while typing keepalives arrive inside every stall window", async () => {
     const h = await setup({ timeout: 200 });
@@ -335,8 +337,6 @@ describe("#398 same-frame cancellation receipts survive subscriber teardown", ()
   });
 });
 
-// #399 runs before the suite below: its "cleans up on %s" case spies on a FAKE
-// `setTimeout`, and every later `restoreAllMocks` re-installs that dead timer.
 describe("#399 one retry per interrupted original", () => {
   it("a racing second-device Retry converges on the first retry's receipt and outcome", async () => {
     const h = await setup();
@@ -496,13 +496,13 @@ describe("#399 one retry per interrupted original", () => {
     const timer = inside(h.wrapper).activeTurnStallTimer;
     const clear = globalThis.clearTimeout;
     const clicks: Array<ReturnType<WebChannelNATSClient["retryInterrupted"]>> = [];
-    vi.spyOn(globalThis, "clearTimeout").mockImplementation((handle) => {
+    vi.stubGlobal("clearTimeout", vi.fn(clear).mockImplementation((handle) => {
       clear(handle);
       if (clicks.length === 0 && handle === timer) {
         h.wrapper.connect();
         clicks.push(h.wrapper.retryInterrupted("O"), h.wrapper.retryInterrupted("O"));
       }
-    });
+    }));
     h.wrapper.close();
     expect(clicks[0]).toBeDefined();
     expect(clicks[1]).toBeUndefined();
@@ -790,7 +790,8 @@ describe("accepted-turn application recovery", () => {
   it("ignores an expired callback from before newer authenticated activity", async () => {
     const h = await setup();
     vi.useFakeTimers();
-    const scheduled = vi.spyOn(globalThis, "setTimeout");
+    const scheduled = vi.fn(globalThis.setTimeout);
+    vi.stubGlobal("setTimeout", scheduled);
     h.wrapper.send("work");
     const callback = scheduled.mock.calls.find(([, ms]) => ms === TIMEOUT)![0] as () => void;
     const request = vi.spyOn(inside(h.wrapper).client, "requestApplicationRecovery").mockReturnValue(true);
@@ -895,13 +896,13 @@ describe("accepted-turn application recovery", () => {
     const oldTimer = inside(h.wrapper).activeTurnStallTimer;
     const clear = globalThis.clearTimeout;
     let sent = false;
-    vi.spyOn(globalThis, "clearTimeout").mockImplementation((timer) => {
+    vi.stubGlobal("clearTimeout", vi.fn(clear).mockImplementation((timer) => {
       clear(timer);
       if (timer === oldTimer && !sent) {
         sent = true;
         h.wrapper.send("replacement work");
       }
-    });
+    }));
     h.deliver({ type: "ack", ids: [h.turnId], cancelled: [h.turnId] });
     expect(sent).toBe(true);
     expect([...inside(h.wrapper).applicationTurns.keys()]).toEqual([h.received[1]!.id]);
@@ -1411,7 +1412,8 @@ describe("accepted-turn application recovery", () => {
     const h = await setup();
     vi.useFakeTimers();
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const scheduled = vi.spyOn(globalThis, "setTimeout");
+    const scheduled = vi.fn(globalThis.setTimeout);
+    vi.stubGlobal("setTimeout", scheduled);
     h.wrapper.send("work");
     const callback = scheduled.mock.calls.find(([, ms]) => ms === TIMEOUT)![0] as () => void;
     const request = vi.spyOn(inside(h.wrapper).client, "requestApplicationRecovery");
@@ -1428,10 +1430,10 @@ describe("accepted-turn application recovery", () => {
     const h = await withClock();
     const clear = globalThis.clearTimeout;
     let closed = false;
-    vi.spyOn(globalThis, "clearTimeout").mockImplementation((timer) => {
+    vi.stubGlobal("clearTimeout", vi.fn(clear).mockImplementation((timer) => {
       clear(timer);
       if (!closed) { closed = true; h.wrapper.close(); }
-    });
+    }));
     h.deliver({ type: "typing" });
     expect(inside(h.wrapper).activeTurnStallTimer).toBeNull();
     expect(h.wrapper.getState().isTyping).toBe(false);
@@ -1447,17 +1449,16 @@ describe("accepted-turn application recovery", () => {
     const clear = globalThis.clearTimeout;
     let replacement: ReturnType<WebChannelNATSClient["send"]>;
     let reopened = false;
-    vi.spyOn(globalThis, "clearTimeout").mockImplementation((handle) => {
+    vi.stubGlobal("clearTimeout", vi.fn(clear).mockImplementation((handle) => {
       clear(handle);
       if (!reopened && handle === timer) {
         reopened = true;
         h.wrapper.connect();
         replacement = h.wrapper.send("replacement turn");
       }
-    });
+    }));
     h.wrapper.close();
     // vi.waitFor advances this clock while native registration crypto settles.
-    // Keep the timer spy in the same fake-clock lifetime through afterEach.
     await vi.waitFor(() => expect(replacement?.snapshot().state).toBe("accepted"));
     expect(h.received.map((msg) => msg.text)).toEqual(["old turn", "replacement turn"]);
     expect(inside(h.wrapper).applicationTurns.size).toBe(1);
@@ -1501,5 +1502,20 @@ describe("accepted-turn application recovery", () => {
     idle.control.ack = false;
     idle.wrapper.send("unaccepted");
     expect(inside(idle.wrapper).activeTurnStallTimer).toBeNull();
+  });
+});
+
+describe("#423 real timers after application recovery cleanup", () => {
+  it.each([1, 2, 3])("registers and settles a turn after cleanup (%s)", async () => {
+    const h = await setup();
+    expect(vi.isFakeTimers()).toBe(false);
+    expect(globalThis.setTimeout).toBe(realTimers.setTimeout);
+    expect(globalThis.clearTimeout).toBe(realTimers.clearTimeout);
+    expect(h.control.registrations).toBe(1);
+    const receipt = h.wrapper.send("work after timer cleanup")!;
+    expect(receipt.snapshot().state).toBe("accepted");
+    h.deliver({ type: "turn_settled", turnId: h.received[0]!.id!, outcome: "ok" });
+    expect(receipt.snapshot().state).toBe("completed");
+    expect(h.wrapper.getState().turnActive).toBe(false);
   });
 });

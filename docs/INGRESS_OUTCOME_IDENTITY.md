@@ -14,8 +14,8 @@ namespace `tenant:v2_<hash>` with key `peer:logical`. Legacy probes disable the
 SDK memory cache, retaining the existing process cache bound. Persisted
 namespaces and marker lifetimes remain unchanged.
 
-The outcome operation gates, hot cache, cancellation fallback tombstones and
-pending overflow claims all use that scope. Overflow replies also require the
+The outcome operation gates, hot cache and pending overflow claims all use that
+scope. The legacy callback fallback uses it too, but has no production writer. Overflow replies also require the
 original tenant and peer session token to match the currently published runtime,
 so an account replacement cannot receive an old runtime's result. Reservations
 and the process resource limits remain shared as before.
@@ -66,7 +66,7 @@ frame's wire IDs. A committed user row proves acceptance but does not disprove a
 later scoped cancellation. Flush and overflow lookup therefore check the current
 tenant's cancellation marker before emitting that row's receipt, without reading
 or adopting legacy markers for this purpose. Initial stop receipts for targets,
-cold/hot replays and durable fallback recovery preserve both the cancellation
+cold/hot journal replays preserve both the cancellation
 proof and any committed echo; the stop command's own ACK is receipt-only.
 
 The stop transaction also captures the resolver's one bounded overflow-only
@@ -76,9 +76,17 @@ the target belongs only to that tenant's journal and peer session.
 New tenant-scoped accepted markers still use ordinary orphan repair: if the
 matching journal row is absent, the normal admission path journals and dispatches
 once. Journaled requests remain deduplicated when the optimization marker is
-absent. Cancellation write failures still withhold a receipt and recover through
-the same scoped fallback; the parent `/stop` implementation retains its atomic
-SQLite receipt/target transaction and replay behavior.
+absent. Production cancellation is `createStopControl` → `DispatchRecovery.recordStop`
+→ the SQLite receipt/target transaction. A failed transaction withholds the
+receipt and leaves retained input in place; retry can repeat the transaction.
+There is no production in-memory cancellation fallback recovery. An ACK failure
+after commit is recovered from the journal's exact stop receipt/targets.
+
+`recordCancelledInboundItems` and `CancelledInboundFallbackTombstones` remain
+legacy test/compatibility seams. Production never called the recording function;
+#415 removes the unwritten fallback instance and its injection from the account
+runtime. Tests that inject fallback entries exercise those legacy seams, not a
+second production durability mechanism.
 
 Tenant scoping adds no journal schema, credential format or dispatch policy
 change. It is stacked on the stop parent (protocol 6 at the time), whose
@@ -92,7 +100,7 @@ outcome reader does not provide these identity guarantees.
 production ingress/recovery/debounce functions. It covers tenant/account/peer
 separation, warm and cold reads, journal reopen, all three ambiguous legacy
 outcomes, exact tuple acceptance and cancellation proof, accepted orphan repair,
-missing markers, cancellation failure/recovery, pending overflow isolation,
+missing markers, injected legacy fallback recovery, pending overflow isolation,
 legacy read faults, cache-key collisions in both directions and the existing
 TTL boundary. Protocol 6 cases additionally
 check cancellation proof with a committed row, initial target versus command
@@ -100,3 +108,6 @@ receipts, and overflow-only cancellation held at lookup/write then reopened.
 The agent dispatch recipient
 is controlled; these are not live gateway or browser tests. The parent's
 separate stop crash tests exercise actual child-process SIGKILL and reopen.
+`stop-control.test.ts` exercises the production transactional cancellation boundary;
+`index-nats-wiring.test.ts` guards that the runtime uses it without an unwritten
+fallback store.
