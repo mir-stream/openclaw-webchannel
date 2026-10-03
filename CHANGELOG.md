@@ -71,6 +71,10 @@
   demo/reference/example issuers keep their existing five-minute default.
   External issuers must supply `iat` and shorten longer-lived tokens.
 
+- Inline NATS user JWTs and seeds now carry sensitive config hints for both
+  flat and named accounts. Core config/UI responses mask them; inline parsing
+  remains compatible and SecretRef resolution is deferred (#443, #415 D7).
+
 - Browser receive doors now reject replayed envelopes, timestamps outside ±10 minutes,
   and mismatched tenant/account/peer routing (#415 E4). The 16,384-ID cache survives
   reconnects and refuses new frames at capacity until IDs expire; a new client
