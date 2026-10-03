@@ -61,7 +61,7 @@ describe.each([false, true])("browser credential TTL validation (ledger=%s)", (w
     expect(claim.exp).toBe(nowSec + ttlSeconds);
     expect(claim.sub).toBe(creds.userPubkey);
     expect(creds.permissions).toEqual({
-      pub: ["webchannel.tenant-x.*.alice.>"], sub: ["webchannel.tenant-x.*.alice.>"],
+      pub: ["webchannel.tenant-x.*.alice.in", "webchannel.tenant-x.*.alice.register"], sub: ["webchannel.tenant-x.*.alice.>"],
     });
     expect(recordIssuance).toHaveBeenCalledTimes(withLedger ? 1 : 0);
     if (withLedger) expect((await ledger.get(creds.userPubkey))?.expiresAtSec).toBe(claim.exp);
@@ -95,4 +95,18 @@ it("keeps integer expiry and issuer-account binding in external signing mode", a
   const claim = decode<User>(creds.userJwt);
   expect(claim.exp).toBe(nowSec + 60);
   expect(claim.nats.issuer_account).toBe(issuerAccountId);
+});
+
+
+describe("agent account scope (#409)", () => {
+  it.each([undefined, "", "*", ">", "a.b", "a b"])("refuses missing/unsafe accountId %s", async (accountId) => {
+    await expect(mintNatsUserCreds({ ...base, role: "agent", accountId })).rejects.toThrow(/accountId/);
+  });
+
+  it("signs the exact account in both permission directions", async () => {
+    const creds = await mintNatsUserCreds({ ...base, role: "agent", accountId: "Account_A" });
+    const claim = decode<User>(creds.userJwt);
+    expect(claim.nats.pub?.allow).toEqual(["webchannel.tenant-x.Account_A.>"]);
+    expect(claim.nats.sub?.allow).toEqual(["webchannel.tenant-x.Account_A.>"]);
+  });
 });

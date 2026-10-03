@@ -661,9 +661,9 @@ export class DeviceFlowEnrollment {
    * Creates:
    *  - NATS user NKEY seed (U... category)
    *  - NATS user JWT (signed by account NKEY)
-   *  - Subject permissions scoped to tenant
+   *  - Subject permissions scoped to tenant/account
    *
-   * The user JWT includes tenant-scoped permissions in the NATS JWT claims format:
+   * The user JWT includes account-scoped permissions in the NATS JWT claims format:
    *  - nats.pub.allow: Publish permissions for tenant's outbound subjects
    *  - nats.sub.allow: Subscribe permissions for tenant's inbound subjects
    */
@@ -671,19 +671,19 @@ export class DeviceFlowEnrollment {
     enrollment: PendingEnrollment,
   ): Promise<NatsUserCredentials> {
     // Defense-in-depth: re-validate the tenant immediately before building the
-    // `webchannel.{tenant}.>` grant (enroll() also validates at ingress).
+    // `webchannel.{tenant}.{accountId}.>` grant (enroll() also validates at ingress).
     // mintNatsUserCreds re-validates too; this keeps the guard local & explicit.
     assertValidSubjectToken(enrollment.tenant, "tenant");
 
     // Single minting code path shared with the browser/`/test/nats-user` path
-    // (nats-user-creds.ts). It mints a real, tenant-scoped NATS user JWT:
+    // (nats-user-creds.ts). It mints a real, account-scoped NATS user JWT:
     //   - self-contained mode (no natsIssuerAccountId): signed by the account
     //     NKEY, `iss` = account public — accepted by a SaaS-run nats-server.
     //   - external mode (natsIssuerAccountId set): signed by the account signing
     //     key with `nats.issuer_account` = the managed account id — accepted by
     //     Synadia's nats-server.
     //
-    // Tenant scope `webchannel.{tenant}.>` covers the live per-peer channel
+    // Account scope `webchannel.{tenant}.{accountId}.>` covers the live per-peer channel
     // subjects `webchannel.{tenant}.{accountId}.{peerId}.{in,out}` plus the
     // `.register`/`.reginbox` admission subjects (see
     // packages/plugin/src/nats-channel.ts) while preserving cross-tenant isolation.
@@ -691,6 +691,7 @@ export class DeviceFlowEnrollment {
       accountSeed: this.options.saasTrustChain.natsAccountSeed,
       tenant: enrollment.tenant,
       role: "agent",
+      accountId: enrollment.accountId,
       issuerAccountId: this.options.natsIssuerAccountId,
     });
 
