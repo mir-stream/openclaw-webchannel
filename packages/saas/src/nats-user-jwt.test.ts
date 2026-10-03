@@ -53,10 +53,10 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
     expect(creds.userSeed).toMatch(/^SU/); // User NKEY seed prefix (S=seed, U=user)
     expect(creds.permissions).toBeDefined();
     expect(creds.permissions?.pub).toEqual([
-      "webchannel.tenant-abc.>",
+      "webchannel.tenant-abc.test-agent.>",
     ]);
     expect(creds.permissions?.sub).toEqual([
-      "webchannel.tenant-abc.>",
+      "webchannel.tenant-abc.test-agent.>",
     ]);
   });
 
@@ -103,11 +103,11 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
     expect(payload.nats).toBeDefined();
     expect(payload.nats.pub).toBeDefined();
     expect(payload.nats.pub.allow).toEqual([
-      "webchannel.tenant-xyz.>",
+      "webchannel.tenant-xyz.agent-123.>",
     ]);
     expect(payload.nats.sub).toBeDefined();
     expect(payload.nats.sub.allow).toEqual([
-      "webchannel.tenant-xyz.>",
+      "webchannel.tenant-xyz.agent-123.>",
     ]);
   });
 
@@ -155,9 +155,9 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
     expect(creds1.userSeed).not.toBe(creds2.userSeed);
     expect(creds1.userJwt).not.toBe(creds2.userJwt);
 
-    // Verify they have the same tenant-scoped permissions
-    expect(creds1.permissions?.pub).toEqual(creds2.permissions?.pub);
-    expect(creds1.permissions?.sub).toEqual(creds2.permissions?.sub);
+    // Accounts within one tenant now carry distinct signed grants.
+    expect(creds1.permissions).toEqual({ pub: ["webchannel.tenant-a.agent-1.>"], sub: ["webchannel.tenant-a.agent-1.>"] });
+    expect(creds2.permissions).toEqual({ pub: ["webchannel.tenant-a.agent-2.>"], sub: ["webchannel.tenant-a.agent-2.>"] });
   });
 
   it("should scope permissions to different tenants correctly", async () => {
@@ -202,17 +202,17 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
 
     // Verify tenant-scoped permissions
     expect(credsA.permissions?.pub).toEqual([
-      "webchannel.tenant-alpha.>",
+      "webchannel.tenant-alpha.agent-a.>",
     ]);
     expect(credsA.permissions?.sub).toEqual([
-      "webchannel.tenant-alpha.>",
+      "webchannel.tenant-alpha.agent-a.>",
     ]);
 
     expect(credsB.permissions?.pub).toEqual([
-      "webchannel.tenant-beta.>",
+      "webchannel.tenant-beta.agent-b.>",
     ]);
     expect(credsB.permissions?.sub).toEqual([
-      "webchannel.tenant-beta.>",
+      "webchannel.tenant-beta.agent-b.>",
     ]);
 
     // Parse JWTs to verify tenant is in the claims
@@ -286,6 +286,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
       user_code: "TEST-1234",
       agentPublicKey: "test-public-key",
       tenant: "tenant-123",
+      accountId: "test-agent",
       createdAt: Date.now(),
       expiresAt: Date.now() + 600000,
       status: "pending" as const,

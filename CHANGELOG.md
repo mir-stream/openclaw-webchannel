@@ -19,6 +19,32 @@
   canonical field. New setup writes `dmPolicy` and the required wildcard,
   preserving existing restrictions on re-enrollment. No wire version change.
 
+### Breaking: NATS credential scope (#409, #410)
+
+- Release SaaS and plugin together in the next lockstep release. Newly enrolled
+  agent credentials grant only `webchannel.{tenant}.{accountId}.>` pub/sub;
+  sibling accounts' register plaintext and conversation traffic are inaccessible.
+  Internal/admin agent mint calls must supply the exact WebChannel `accountId`
+  (distinct from the NATS signing-account `issuerAccountId`).
+- Newly issued browser credentials publish only their own `.in` and `.register`
+  subjects. `.out`, `.reginbox` and other agent-to-browser publications are denied
+  by NATS. Existing subscriptions and multi-account browser access are unchanged.
+- Existing credentials remain usable until their original expiry or explicit
+  revocation. Doctor warns about old broad agent grants and explains reissue:
+  for state already bound to the same trusted issuer, upgrade both packages,
+  stop the affected account, archive only its credential file, complete any
+  required SaaS active-key replacement, then explicitly re-enroll while keeping
+  conversation keys and history. A storage-issuer failure must instead follow
+  [the issuer-recovery procedure](docs/STORAGE_IDENTITY_V2.md#issuer-binding-412)
+  first: restore the original trusted issuer and matching credentials where
+  supported, or archive the complete tuple and initialize fresh state.
+  Credential-only reissue cannot bypass it. Credentials without `exp` do not
+  expire automatically; replace and explicitly revoke them to end their old
+  privileges.
+  Browser users must obtain new credentials to receive the publish restriction.
+  Encrypted frames and protocol version 7 are unchanged. AAD direction binding
+  remains tracked in #436, and client replay/freshness in #415 E4.
+
 ### Breaking (unreleased wire protocol v7)
 
 - **Journal identity and bounded cold synchronization (#413/#414).** Protocol
@@ -55,6 +81,12 @@
   the procedure. Re-enrolling credentials alone cannot relabel old data.
 
 ### Changed
+
+- Bootstrap JWTs now require finite `iat < exp` and a lifetime of at most one
+  hour (#447). Clock skew applies to issuance/expiry checks, not the lifetime
+  bound. SaaS claim builders and signers enforce the same cap; first-party
+  demo/reference/example issuers keep their existing five-minute default.
+  External issuers must supply `iat` and shorten longer-lived tokens.
 
 - Browser receive doors now reject replayed envelopes, timestamps outside ±10 minutes,
   and mismatched tenant/account/peer routing (#415 E4). The 16,384-ID cache survives

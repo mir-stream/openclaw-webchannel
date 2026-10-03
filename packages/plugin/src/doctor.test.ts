@@ -45,6 +45,77 @@ const removedDevModeSetting = ["nats.", removedDevModeKey].join("");
 const ids = (config: OpenClawConfig, env: Record<string, string | undefined> = {}, load: () => PersistedEnrolledCreds | undefined = () => persisted) =>
   evaluateWebchannelDoctor(config, { env, loadPersistedEnrolledCreds: load }).map((finding) => finding.checkId);
 
+describe("legacy agent NATS grants (#409)", () => {
+  function jwt(allow: string[], exp?: number) {
+    return `header.${Buffer.from(JSON.stringify({ exp, nats: { pub: { allow }, sub: { allow } } })).toString("base64url")}.signature`;
+  }
+
+  it.each(["enrolled", "static"])("diagnoses old %s credentials without changing the supported modes", (mode) => {
+    const userJwt = jwt(["webchannel.t.>"], Math.floor(Date.now() / 1000) + 3600);
+    const config = cfg({ tenant: "t", auth: validAuth(), nats: { credentials: mode === "static"
+      ? { mode, userJwt, userSeed: "S" } : { mode } } });
+    const findings = evaluateWebchannelDoctor(config, { env: {}, loadPersistedEnrolledCreds: () => ({ ...persisted, userJwt }) });
+    if (mode === "static") {
+      expect(findings).toContainEqual(expect.objectContaining({ checkId: "credential-source-invalid", severity: "error" }));
+      return;
+    }
+    const finding = findings.find(f => f.checkId === "legacy-agent-nats-scope");
+    expect(finding).toMatchObject({ severity: "warn", accountId: "default" });
+    expect(finding?.fix).toMatch(/archive.*re-enroll/i);
+    expect(finding?.message).toMatch(/expir/i);
+    expect(JSON.stringify(findings)).not.toContain(userJwt);
+  });
+
+  it("does not warn for account-scoped credentials", () => {
+    const findings = evaluateWebchannelDoctor(cfg({ tenant: "t", auth: validAuth() }), {
+      env: {}, loadPersistedEnrolledCreds: () => ({ ...persisted, userJwt: jwt(["webchannel.t.default.>"]) }),
+    });
+    expect(findings.some(f => f.checkId === "legacy-agent-nats-scope")).toBe(false);
+  });
+
+  it("explains that a credential without exp will not narrow automatically", () => {
+    const findings = evaluateWebchannelDoctor(cfg({ tenant: "t", auth: validAuth() }), {
+      env: {}, loadPersistedEnrolledCreds: () => ({ ...persisted, userJwt: jwt(["webchannel.t.>"]) }),
+    });
+    expect(findings.find(f => f.checkId === "legacy-agent-nats-scope")?.message).toContain("no expiry");
+  });
+
+  it("keeps issuer-mismatched storage blocked across broad and narrow credential diagnosis", () => {
+    const paths = tupleStoragePaths({ tenant: "t", accountId: "default", storageRoot: doctorStorageRoot });
+    const markerPath = join(paths.directory, "storage-issuer.json");
+    mkdirSync(paths.directory, { recursive: true });
+    writeFileSync(markerPath, JSON.stringify({
+      version: 1,
+      tenant: "t",
+      accountId: "default",
+      issuer: "https://old-issuer",
+    }));
+    writeFileSync(paths.conversationKeyPath, "existing private state");
+    const before = [markerPath, paths.conversationKeyPath].map(path => readFileSync(path));
+    const config = cfg({ tenant: "t", auth: validAuth() });
+
+    const diagnose = (allow: string[]) => evaluateWebchannelDoctor(config, {
+      env: {},
+      loadPersistedEnrolledCreds: () => ({ ...persisted, userJwt: jwt(allow) }),
+    });
+    const broad = diagnose(["webchannel.t.>"]);
+    expect(broad).toEqual(expect.arrayContaining([
+      expect.objectContaining({ checkId: "legacy-agent-nats-scope", severity: "warn" }),
+      expect.objectContaining({ checkId: "storage-issuer-failed", severity: "error" }),
+    ]));
+    expect(broad.find(f => f.checkId === "legacy-agent-nats-scope")?.fix)
+      .toMatch(/credential reissue cannot bypass/i);
+
+    const narrow = diagnose(["webchannel.t.default.>"]);
+    expect(narrow.some(f => f.checkId === "legacy-agent-nats-scope")).toBe(false);
+    expect(narrow).toContainEqual(expect.objectContaining({
+      checkId: "storage-issuer-failed",
+      severity: "error",
+    }));
+    expect([markerPath, paths.conversationKeyPath].map(path => readFileSync(path))).toEqual(before);
+  });
+});
+
 const FUTURE_FIXTURE_TENANT = "future-storage-tenant";
 const FUTURE_FIXTURE_ACCOUNT = "default";
 const FUTURE_FIXTURE_SAAS = "https://saas.example";

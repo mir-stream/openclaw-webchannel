@@ -130,6 +130,29 @@ describe("SDK DM policy contract (#406)", () => {
     expect(findings).toContainEqual(expect.objectContaining({ checkId: "legacy-dm-security", fix: expect.stringContaining('dmPolicy="open"') }));
   });
 
+  it("doctor derives legacy migration from the alias while preserving a same-layer canonical policy", () => {
+    const inherited = evaluateWebchannelDoctor({ channels: { webchannel: {
+      tenant: "t", dmSecurity: "disabled", allowFrom: ["*"], accounts: {
+        a: { dmPolicy: "open" }, b: {},
+      },
+    } } }, { env: {}, loadPersistedEnrolledCreds: () => undefined });
+    for (const accountId of ["a", "b"]) {
+      expect(inherited).toContainEqual(expect.objectContaining({
+        accountId,
+        checkId: "legacy-dm-security",
+        fix: expect.stringContaining('otherwise replace dmSecurity with dmPolicy="disabled"'),
+      }));
+    }
+
+    const sameLayer = evaluateWebchannelDoctor({ channels: { webchannel: {
+      tenant: "t", dmSecurity: "disabled", dmPolicy: "open", allowFrom: ["*"],
+    } } }, { env: {}, loadPersistedEnrolledCreds: () => undefined });
+    expect(sameLayer).toContainEqual(expect.objectContaining({
+      checkId: "legacy-dm-security",
+      fix: expect.stringContaining("preserve it and remove only dmSecurity"),
+    }));
+  });
+
   it.each(["disabled", "allowlist", "pairing"] as const)("setup preserves an existing legacy %s policy", (dmSecurity) => {
     const cfg = { channels: { webchannel: { dmSecurity, allowFrom: ["alice"] } } } as never;
     const next = webchannelSetup.applyAccountConfig!({ cfg, accountId: "default", input: { saasBaseUrl: "https://saas.example", tenant: "t" } });

@@ -11,6 +11,20 @@ runtime independently refuses invalid account configuration. Core security audit
 reports the same policy and real fix paths. Doctor guides migration from legacy
 `dmSecurity` aliases. See [DM configuration](AUTH.md#dm-policy).
 
+NATS permissions (#409, #410): newly enrolled agent credentials are limited to
+their exact tenant/account subtree, and browser credentials publish only their
+own `.in`/`.register` subjects. Real nats-server tests prove sibling-account
+and agent-direction publication rejection. SaaS/plugin require a lockstep
+upgrade and explicit reissue to narrow existing credentials; doctor identifies
+legacy broad agent grants. Existing grants are accepted until expiry/revocation,
+including non-expiring grants that require explicit replacement. Credential-only
+reissue retains history and keys only when storage remains bound to the same
+trusted issuer; a storage-issuer failure requires the
+[issuer-recovery procedure](STORAGE_IDENTITY_V2.md#issuer-binding-412) first:
+restore the original trusted issuer and matching credentials where supported,
+or archive the complete tuple and initialize fresh state. Credential-only reissue
+cannot bypass it. See [credential rollout](AUTH.md#nats-credential-scope-and-rollout).
+
 Sync robustness (#413/#414): byte-incomplete cold snapshots seed their journal
 high-water immediately. Omitted row identities are exposed separately; older
 trimmed rows remain reachable by history paging, while genuine warm gaps still

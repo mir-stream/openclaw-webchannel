@@ -243,8 +243,8 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       "  openclaw agents bind --bind webchannel:<account> --agent <agent>",
       "  openclaw gateway run",
       "",
-      'DM policy: open with allowFrom ["*"]. Users must still hold a SaaS JWT ' +
-        "for this account. Use allowlist, pairing or disabled for additional DM restrictions.",
+      'New accounts default to DM policy open with explicit allowFrom ["*"]. Existing account DM restrictions are preserved. ' +
+        "Users must still hold a SaaS JWT for this account. Use allowlist, pairing or disabled for additional DM restrictions.",
     ],
   },
 };

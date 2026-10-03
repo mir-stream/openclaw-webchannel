@@ -183,16 +183,16 @@ async function tamper(): Promise<number> {
   const cookie = await adminCookie();
   // Wire-position adversary: this scene captures ANOTHER peer's `.out` frame and
   // republishes a bit-flipped copy, modelling a tampering relay. That needs
-  // tenant-wide read AND write, so it uses AGENT creds — browser creds are now
+  // account-wide read AND write, so it uses AGENT creds — browser creds are now
   // pinned to the caller's own peer subtree (per-peer scoping) and observer creds
-  // are sub-only, so neither can write to a victim peer's `.out`. Tenant-wide agent
+  // are sub-only, so neither can write to a victim peer's `.out`. Account-scoped agent
   // creds are OPERATOR-only: they come from the admin-gated /admin/nats-user route
   // (the browser-facing /nats-user no longer honors a body `role`), so this scene
   // authenticates as admin first (adminCookie above).
   const res = await fetch(`${SAAS_URL}/admin/nats-user`, {
     method: "POST",
     headers: { "Content-Type": "application/json", cookie },
-    body: JSON.stringify({ role: "agent" }),
+    body: JSON.stringify({ role: "agent", accountId: ACCOUNT }),
   });
   if (!res.ok) throw new Error(`tamper mint failed: HTTP ${res.status}`);
   const creds = (await res.json()) as Creds;
@@ -201,7 +201,7 @@ async function tamper(): Promise<number> {
   nats.onMsg((subject, payload) => {
     if (!captured && subject.endsWith(".out") && payload.length > 0) captured = { subject, payload };
   });
-  nats.sub(`webchannel.${TENANT}.>`);
+  nats.sub(`webchannel.${TENANT}.${ACCOUNT}.>`);
   console.log("[chaos] observing for a live .out frame — send a message in the widget now…");
   for (let i = 0; i < 60 && !captured; i++) await sleep(500);
   if (!captured) { console.error("[chaos] ✗ no .out frame captured (open the widget + send a message, then retry)"); nats.close(); return 3; }
