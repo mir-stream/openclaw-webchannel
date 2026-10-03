@@ -25,6 +25,8 @@
 
 import type { KeyResolver } from "./jwks.js";
 
+const MAX_BOOTSTRAP_LIFETIME_SEC = 60 * 60;
+
 /**
  * Constant-time string equality. XOR-accumulating byte differences across the
  * full length defeats timing oracles; if the lengths differ we still walk a
@@ -69,7 +71,7 @@ function stripTrailingSlashes(s: string): string {
  * `BufferSource` parameter and Workers' lack of `Buffer`).
  */
 function base64UrlDecode(input: string): Uint8Array {
-  if (typeof input !== "string" || input.length === 0) {
+  if (typeof input !== "string" || !/^[A-Za-z0-9_-]+$/.test(input)) {
     throw new Error("webchannel: empty base64url segment");
   }
   // base64url → base64: replace chars and add padding.
@@ -201,7 +203,7 @@ export async function verifyJwt(
     const decoded = base64UrlDecode(headerSegment);
     const text = new TextDecoder("utf-8").decode(decoded);
     const parsed = JSON.parse(text) as unknown;
-    if (!parsed || typeof parsed !== "object") return null;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
     header = parsed as Record<string, unknown>;
   } catch {
     return null;
@@ -223,6 +225,19 @@ export async function verifyJwt(
   let signatureBytes: Uint8Array;
   try {
     signatureBytes = base64UrlDecode(signatureSegment);
+  } catch {
+    return null;
+  }
+
+  // Reject malformed payloads before untrusted kid lookup can cause I/O.
+  // These claims remain untrusted until the signature below verifies.
+  let payload: Record<string, unknown>;
+  try {
+    const decoded = base64UrlDecode(payloadSegment);
+    const text = new TextDecoder("utf-8").decode(decoded);
+    const parsed = JSON.parse(text) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    payload = parsed as Record<string, unknown>;
   } catch {
     return null;
   }
@@ -254,18 +269,6 @@ export async function verifyJwt(
     new TextEncoder().encode(signingInput).slice().buffer,
   );
   if (!ok) return null;
-
-  // Step 5: payload. Signature is valid; now validate the claims.
-  let payload: Record<string, unknown>;
-  try {
-    const decoded = base64UrlDecode(payloadSegment);
-    const text = new TextDecoder("utf-8").decode(decoded);
-    const parsed = JSON.parse(text) as unknown;
-    if (!parsed || typeof parsed !== "object") return null;
-    payload = parsed as Record<string, unknown>;
-  } catch {
-    return null;
-  }
 
   // iss — constant-time compare against expected issuer, tolerant of a trailing
   // slash. A URL issuer `https://x` and `https://x/` denote the same origin, but
@@ -308,6 +311,13 @@ export async function verifyJwt(
   if (typeof exp !== "number" || !Number.isFinite(exp)) return null;
   const leeway = opts.clockSkewSec ?? 60;
   const now = Date.now() / 1000;
+  // Owner-approved bootstrap contract (#447): clock tolerance must not extend
+  // the issuer's lifetime allowance. Requiring iat also prevents a token with
+  // an unknown issuance date from borrowing an arbitrary future exp.
+  const iat = payload.iat;
+  if (typeof iat !== "number" || !Number.isFinite(iat)) return null;
+  if (exp <= iat || exp - iat > MAX_BOOTSTRAP_LIFETIME_SEC) return null;
+  if (iat > now + leeway) return null;
   // Preserve the existing whole-second expiry check (allowing leeway).
   if (Math.floor(now) >= exp + leeway) return null;
 

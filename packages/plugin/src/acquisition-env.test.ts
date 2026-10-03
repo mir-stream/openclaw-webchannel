@@ -15,14 +15,14 @@ describe("resolveAcquisitionEnvPrecedence", () => {
     const { identity, usedLegacyEnv } = resolveAcquisitionEnvPrecedence({}, "default", {
       env: {
         WEBCHANNEL_TENANT: "envTenant",
-        WEBCHANNEL_SAAS_BASE_URL: "http://env-saas",
+        WEBCHANNEL_SAAS_BASE_URL: "https://env-saas",
       },
       warn,
     });
     expect(identity).toEqual({
       accountId: "default",
       tenant: "envTenant",
-      saasBaseUrl: "http://env-saas",
+      saasBaseUrl: "https://env-saas",
     });
     expect(usedLegacyEnv).toBe(true);
     // No config ⇒ no deprecation warning (env is the intended legacy path).
