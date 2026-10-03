@@ -106,6 +106,10 @@ credentials and skips enrollment only when their complete v2 identity matches th
 tenant, account, SaaS base, delivered issuer/relay, and local public key.
 
 **Credential storage:**
+- **Config output:** inline `nats.credentials.userJwt` and `userSeed`, including
+  named-account overrides, carry sensitive UI hints. Core config snapshots and
+  UI responses mask these values. This does not encrypt the configuration file
+  or add SecretRef/provider resolution; existing inline parsing is unchanged.
 - **Default location:** `~/.openclaw-webchannel-v2/<v2_namespace>/credentials.json`,
   where `<v2_namespace>` is the fixed path-safe id derived from the exact,
   case-sensitive `(tenant, accountId)`.

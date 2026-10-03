@@ -85,6 +85,7 @@
     "packages/plugin/src/conversation-key-rotation.test.ts": 25,
     "packages/plugin/src/conversation-key-store.test.ts": 30,
     "packages/plugin/src/credential-document.test.ts": 46,
+    "packages/plugin/src/credential-redaction.test.ts": 3,
     "packages/plugin/src/crypto-nats-channel-integration.test.ts": 10,
     "packages/plugin/src/delivery-journal-event.test.ts": 51,
     "packages/plugin/src/delivery-journal.test.ts": 41,
