@@ -4158,6 +4158,34 @@ describe("#415 C4: native reply prefix pipeline", () => {
     await handleInboundMessage(api, transport, "peer", { type: "user_message", id: "prefix-turn", text: "hello" }, "chosen");
     expect(texts.map(frame => frame.text)).toEqual(["account answer"]);
   });
+
+  it("keeps the prefix out of a CLI reasoning replay and renders one reasoning row", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+    const { transport, texts, settles } = makeFakeTransport();
+    const reasoning = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+    api.config.messages = { responsePrefix: "[{model}]" };
+    api.runtime.channel.inbound.run = runChannelInboundEvent;
+    api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = async params => {
+      const callbacks = params.replyOptions!;
+      await callbacks.onModelSelected?.({ provider: "fixture", model: "model-test", thinkLevel: "off" });
+      callbacks.onAgentRunStart?.("prefix-reasoning-run");
+      await callbacks.onReasoningStream?.({ text: "AAA", isReasoningSnapshot: true });
+      await callbacks.onReasoningStream?.({ text: "AAA\n\nBBB", isReasoningSnapshot: true });
+      const dispatcher = createReplyDispatcher(params.dispatcherOptions);
+      // The CLI runtime's final replay of the open snapshot, then the answer.
+      dispatcher.sendFinalReply({ text: "AAA\n\nBBB", isReasoning: true });
+      dispatcher.sendFinalReply({ text: "answer" });
+      await dispatcher.waitForIdle();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 2 } };
+    };
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", id: "prefix-reasoning", text: "hello" });
+    const finals = reasoning.mock.calls.filter(args => args[4] === true);
+    expect(finals.map(args => args[3])).toEqual(["AAA\n\nBBB"]);
+    expect(new Set(reasoning.mock.calls.map(args => args[1])).size).toBe(1);
+    expect(reasoning.mock.calls.some(args => String(args[3]).includes("[model-test]"))).toBe(false);
+    expect(texts.map(frame => frame.text)).toEqual(["[model-test] answer"]);
+    expect(settles).toEqual(["ok"]);
+  });
 });
 
 describe("#415 C7: unsupported media-only finals", () => {
@@ -4205,6 +4233,42 @@ describe("#415 C7: unsupported media-only finals", () => {
     const { transport, settles } = makeFakeTransport();
     await handleInboundMessage(made.api, transport, "peer", { type: "user_message", text: "image" });
     expect(settles).toEqual(["error"]);
+  });
+
+  it.each(["off", "partial", "block", "progress"] as const)("settles ok when block-streamed answer text precedes a media-only final in %s mode", async streamingMode => {
+    const { api } = makeFakeApi({ streamingMode, runImpl: async turn => {
+      await turn.delivery.deliver({ text: "here is the image" }, { kind: "block" });
+      // Core's preserveUnsentMediaAfterBlockSend: the final re-sent as media only.
+      await turn.delivery.deliver({ mediaUrl: "https://private.invalid/file" }, { kind: "final" });
+    } });
+    const { transport, settles, texts, finalizes, progress } = makeFakeTransport();
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", text: "image" });
+    expect([...texts, ...finalizes, ...progress].map(frame => frame.text)).toContain("here is the image");
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it("settles ok when the streamed lane owns the answer and its redundant block is suppressed", async () => {
+    const { api } = makeFakeApi({ streamingMode: "partial", runImpl: async turn => {
+      turn.replyOptions?.onAssistantMessageStart?.();
+      turn.replyOptions?.onPartialReply?.({ text: "here is the image" });
+      await turn.delivery.deliver({ text: "here is the image" }, { kind: "block", assistantMessageIndex: 1 });
+      await turn.delivery.deliver({ mediaUrl: "https://private.invalid/file" }, { kind: "final" });
+    } });
+    const { transport, settles, texts, finalizes, progress } = makeFakeTransport();
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", text: "image" });
+    expect([...texts, ...finalizes, ...progress].map(frame => frame.text)).toContain("here is the image");
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it.each(["off", "partial", "block", "progress"] as const)("settles ok when a media-only final is followed by a text final in %s mode", async streamingMode => {
+    const { api } = makeFakeApi({ streamingMode, runImpl: async turn => {
+      await turn.delivery.deliver({ mediaUrls: ["https://private.invalid/file"] }, { kind: "final" });
+      await turn.delivery.deliver({ text: "answer" }, { kind: "final" });
+    } });
+    const { transport, settles, texts, finalizes } = makeFakeTransport();
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", text: "image" });
+    expect([...texts, ...finalizes].map(frame => frame.text)).toContain("answer");
+    expect(settles).toEqual(["ok"]);
   });
 
   it("does not classify silence or a text-bearing final as a missing media final", async () => {
