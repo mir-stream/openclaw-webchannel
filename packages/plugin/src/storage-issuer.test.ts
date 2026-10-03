@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -6,8 +6,10 @@ import { evaluateWebchannelDoctor } from "./doctor.js";
 import { prepareAccountAuth } from "./account-auth.js";
 import { ConversationKeyStore } from "./conversation-key-store.js";
 import { openDeliveryJournal } from "./delivery-journal.js";
-import { ensureStorageIssuer, inspectStorageIssuer } from "./storage-issuer.js";
-import { tupleStoragePaths } from "./storage-paths.js";
+import { derivePublicKey } from "./e2e-crypto.js";
+import { migrateLegacyTupleState } from "./legacy-storage-migration.js";
+import { ensureStorageIssuer, inspectStorageIssuer, StorageIssuerError } from "./storage-issuer.js";
+import { legacyTuplePaths, tupleStoragePaths } from "./storage-paths.js";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -22,6 +24,38 @@ function fixture() {
     getPersisted: () => undefined,
   });
   return { scope, paths, prepare };
+}
+
+const LEGACY_PRIVATE_KEY = Buffer.alloc(32, 17);
+const LEGACY_PUBLIC_KEY = Buffer.from(derivePublicKey(LEGACY_PRIVATE_KEY));
+const LEGACY_CONVERSATION_KEY = Buffer.alloc(32, 23);
+
+function writeLegacyFixture(scope: ReturnType<typeof fixture>["scope"]): ReturnType<typeof legacyTuplePaths> {
+  const legacy = legacyTuplePaths(scope.accountId, scope.home);
+  mkdirSync(legacy.directory, { recursive: true, mode: 0o700 });
+  writeFileSync(legacy.credentialPath, JSON.stringify({
+    identityKey: {
+      publicKey: LEGACY_PUBLIC_KEY.toString("base64url"),
+      privateKey: LEGACY_PRIVATE_KEY.toString("base64url"),
+    },
+    enrollment: {
+      creds: { userJwt: "old-jwt", userSeed: "old-seed" },
+      peerId: "old-agent",
+      jwksUrl: "https://old.example/jwks",
+      bootstrapUrl: "https://old.example/bootstrap",
+      natsUrl: "wss://old.example/nats",
+      issuer: "https://old.example",
+    },
+    accountId: scope.accountId,
+    tenant: scope.tenant,
+    saasEnrollUrl: "https://old.example/api/enroll",
+    saasPollUrl: "https://old.example/api/poll",
+  }), { mode: 0o600 });
+  writeFileSync(legacy.conversationKeyPath, JSON.stringify({
+    version: 1,
+    keys: { "old-peer": LEGACY_CONVERSATION_KEY.toString("base64url") },
+  }), { mode: 0o600 });
+  return legacy;
 }
 
 describe("storage issuer admission (#412)", () => {
@@ -90,5 +124,82 @@ describe("storage issuer admission (#412)", () => {
     ]);
     expect(findings.find(f => f.checkId === "storage-issuer-failed")?.fix).toMatch(/archive.*explicit/i);
     expect(readdirSync(paths.directory)).toEqual(["storage-issuer.json"]);
+  });
+
+  it.each(["tuple", "exact-credential"] as const)(
+    "refuses a resumable %s migration archive before binding a new issuer",
+    (kind) => {
+      const { scope, paths } = fixture();
+      const legacy = writeLegacyFixture(scope);
+      const originalKeyBytes = readFileSync(legacy.conversationKeyPath);
+      const credentialPath = kind === "exact-credential"
+        ? join(scope.storageRoot, "exact", "credentials.json")
+        : undefined;
+      if (credentialPath) {
+        mkdirSync(join(scope.storageRoot, "exact"), { recursive: true });
+        writeFileSync(credentialPath, readFileSync(legacy.credentialPath), { mode: 0o600 });
+      }
+      const crash = new Error("simulated migration crash");
+      expect(() => migrateLegacyTupleState({
+        ...scope,
+        ...(credentialPath ? { credentialPath } : {}),
+        ...(kind === "tuple"
+          ? { _afterSourceMove: () => { throw crash; } }
+          : {
+              _linkExactSource: (source: string, archive: string) => {
+                linkSync(source, archive);
+                throw crash;
+              },
+            }),
+      })).toThrow();
+
+      const backupRoot = join(legacy.root, ".legacy-v1-backups");
+      const claim = join(backupRoot, readdirSync(backupRoot).find(name => name.includes("--v2_"))!);
+      const retainedKeyPath = kind === "tuple"
+        ? join(claim, "source", "conversation-keys.json")
+        : legacy.conversationKeyPath;
+      expect(readFileSync(retainedKeyPath)).toEqual(originalKeyBytes);
+      const marker = join(paths.directory, "storage-issuer.json");
+      const markerBefore = kind === "exact-credential"
+        ? Buffer.from(JSON.stringify({
+            version: 1,
+            tenant: scope.tenant,
+            accountId: scope.accountId,
+            issuer: "https://new.example",
+          }))
+        : undefined;
+      if (markerBefore) {
+        mkdirSync(paths.directory, { recursive: true });
+        writeFileSync(marker, markerBefore, { mode: 0o600 });
+      }
+      let thrown: unknown;
+      try {
+        ensureStorageIssuer({ ...scope, issuer: "https://new.example" });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(StorageIssuerError);
+      expect(String(thrown)).toMatch(new RegExp(`pending legacy migration archive.*${paths.namespaceId}`));
+      expect((thrown as StorageIssuerError).fix).toContain(claim);
+      expect(existsSync(marker)).toBe(markerBefore !== undefined);
+      if (markerBefore) expect(readFileSync(marker)).toEqual(markerBefore);
+      expect(readFileSync(retainedKeyPath)).toEqual(originalKeyBytes);
+    },
+  );
+
+  it("permits a completed inactive migration backup", () => {
+    const { scope, paths } = fixture();
+    const legacy = writeLegacyFixture(scope);
+    migrateLegacyTupleState(scope);
+    const backupRoot = join(legacy.root, ".legacy-v1-backups");
+    const claim = join(backupRoot, readdirSync(backupRoot).find(name => name.includes("--v2_"))!);
+    const archivedKeys = join(claim, "source", "conversation-keys.json");
+    const originalKeyBytes = readFileSync(archivedKeys);
+    unlinkSync(paths.conversationKeyPath);
+
+    expect(inspectStorageIssuer({ ...scope, issuer: "https://old.example" })).toBe("fresh");
+    ensureStorageIssuer({ ...scope, issuer: "https://old.example" });
+    expect(existsSync(join(paths.directory, "storage-issuer.json"))).toBe(true);
+    expect(readFileSync(archivedKeys)).toEqual(originalKeyBytes);
   });
 });

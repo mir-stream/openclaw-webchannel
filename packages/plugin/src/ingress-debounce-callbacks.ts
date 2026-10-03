@@ -21,7 +21,8 @@ export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(d
   storageScope?: StorageScopeIdentity;
   outcomeStore: IngressOutcomeStore;
   overflowResolver: BoundedOverflowResolver;
-  cancelledFallback: CancelledInboundFallbackTombstones;
+  /** Legacy test/compatibility seam; production stop targets live in SQLite. */
+  cancelledFallback?: CancelledInboundFallbackTombstones;
   deliveryJournal: Pick<DeliveryJournal, "lookupUserMessageIdByRandomId" | "dispatch">;
   sessionToken(peerId: string): RetentionSessionToken;
   sendAck(peerId: string, ids: string[], committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>, cancelled?: string[], unaccepted?: string[]): boolean;
@@ -39,10 +40,10 @@ export function createIngressDebounceCallbacks<Item extends IngressDedupeItem>(d
       overflowResolver.tryStart({
         accountId, storageScope: deps.storageScope, peerId: item.peerId, id: identity.wireId, key: identity.key,
         randomId: identity.randomId, sessionToken: deps.sessionToken(item.peerId),
-        recoverCancelled: cancelledFallback.has(identity.key, outcomeScope), ...retryOfFor(item),
+        recoverCancelled: cancelledFallback?.has(identity.key, outcomeScope) ?? false, ...retryOfFor(item),
       });
     },
-    isCancelledFallback: (peerId, key) => !deps.deliveryJournal.dispatch?.isCancelled(peerId, key.slice(peerId.length + 1)) && cancelledFallback.has(key, outcomeScope),
+    isCancelledFallback: (peerId, key) => !deps.deliveryJournal.dispatch?.isCancelled(peerId, key.slice(peerId.length + 1)) && (cancelledFallback?.has(key, outcomeScope) ?? false),
     peekOutcome: (peerId, key) => deps.deliveryJournal.dispatch?.isCancelled(peerId, key.slice(peerId.length + 1))
       ? "cancelled" : outcomeStore.peek(outcomeScope, key),
     onKnownOutcome: (peerId, id, outcome, item) => {

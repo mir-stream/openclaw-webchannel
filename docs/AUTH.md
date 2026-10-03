@@ -137,9 +137,11 @@ cached keys only until their original TTL expires. A known fresh key remains
 usable during that refresh; no expired key is used as an outage fallback.
 Malformed JWT segments and payloads are rejected before JWKS lookup (#408).
 
-SaaS base URLs require HTTPS, except HTTP on `localhost`, `127.0.0.0/8` or `::1`.
-There is no insecure transport bypass. Enrollment, derived JWKS URLs, preflight
-and doctor enforce this same rule (#411).
+Configured SaaS base URLs require HTTPS, except HTTP on `localhost`,
+`127.0.0.0/8` or `::1`. There is no bypass flag. Enrollment,
+derived JWKS URLs, preflight and doctor enforce this same configured-URL rule
+(#411). Redirect-target validation is separate pre-existing behavior tracked in
+[#452](https://github.com/mir-stream/openclaw-webchannel/issues/452).
 
 The deprecated `auth.ticketParam` schema key remains accepted only so loading can
 produce a targeted migration error. Remove it and rerun

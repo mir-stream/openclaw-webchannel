@@ -58,7 +58,6 @@ import { resolveCommandGate } from "./command-gate.js";
 import { createStopControl } from "./stop-control.js";
 import { resolveInboundDebounceMs } from "openclaw/plugin-sdk/reply-runtime";
 import {
-  CancelledInboundFallbackTombstones,
   createIngressOnFlush,
 } from "./ingress-dedupe.js";
 import {
@@ -238,9 +237,6 @@ const accountRuntimes = new Map<string, AccountRuntime>();
 /** One heap/failure-domain budget and outcome cache across every account. */
 const processInboundRetention = new InboundRetentionBudget();
 const processIngressOutcomes = getProcessIngressOutcomeStore();
-const processCancelledInboundFallback = new CancelledInboundFallbackTombstones(
-  (message) => console.warn(message),
-);
 function runtimeForOverflow(request: OverflowResolutionRequest): AccountRuntime | undefined {
   const runtime = accountRuntimes.get(request.accountId);
   return runtime && request.storageScope?.accountId === runtime.accountId
@@ -265,9 +261,6 @@ const processOverflowResolver = new BoundedOverflowResolver({
     ?.channel.sendAck(request.peerId, [request.id], committed, cancelled ? [request.id] : undefined) ?? false,
   sendRejected: (request) => runtimeForOverflow(request)
     ?.channel.sendInboundRejected(request.peerId, [request.id]) ?? false,
-  onCancelledRecovered: ({ accountId, storageScope, key }) => {
-    processCancelledInboundFallback.delete(key, storageScope ?? accountId);
-  },
 });
 const accountCoordinator = new NatsAccountRuntimeCoordinator();
 const aggregateTracker = new AccountServingAggregateTracker();
@@ -1112,7 +1105,6 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         dispatcherOptions: { budget: processInboundRetention, sessionToken },
       });
       inboundDispatcher = dispatchRecovery.dispatcher;
-      const cancelledInboundFallback = processCancelledInboundFallback;
 
       // P1-8b layer (a): repo-owned bounded idle pre-run debounce (Telegram
       // parity). It replaces core's unbounded primitive and sits IN FRONT of the
@@ -1150,7 +1142,6 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         // makes this write part of accepting a user message, so a missing handle
         // here is not a degrade mode — `index-nats-wiring.test.ts` pins the line.
         deliveryJournal,
-        cancelledFallback: cancelledInboundFallback,
         logInfo: (message) => api.logger?.info?.(message),
         logWarn: (message) => api.logger?.warn?.(message),
         isActive: () => runtimeActive,
@@ -1168,7 +1159,6 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           storageScope,
           outcomeStore: processIngressOutcomes,
           overflowResolver: processOverflowResolver,
-          cancelledFallback: cancelledInboundFallback,
           deliveryJournal,
           sessionToken,
           sendAck: (peerId, ids, committed, cancelled, unaccepted) => channel.sendAck(peerId, ids, committed, cancelled, unaccepted),

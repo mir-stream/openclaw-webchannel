@@ -4,7 +4,7 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { JWKSCache, JwksLifecycleAbortError, type JsonWebKeySet } from "./jwks.js";
+import { JWKSCache, JwksLifecycleAbortError, JwksUnavailableError, type JsonWebKeySet } from "./jwks.js";
 
 /**
  * Tests for the JWKS fetcher + TTL cache + kid lookup + fail-closed semantics.
@@ -76,6 +76,7 @@ describe("JWKSCache TTL cache (AC4)", () => {
   });
 
   it("refetches once after the TTL expires", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
     const jwksA = await mintRsaJwks("k1");
     const jwksB = await mintRsaJwks("k1");
     let call = 0;
@@ -96,8 +97,7 @@ describe("JWKSCache TTL cache (AC4)", () => {
     await cache.getKey("k1");
     expect(fetchImpl).toHaveBeenCalledTimes(1);
 
-    // Wait past the TTL.
-    await new Promise((r) => setTimeout(r, 70));
+    now.mockReturnValue(31_000);
     await cache.getKey("k1");
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
@@ -120,8 +120,8 @@ describe("JWKSCache kid miss (AC4)", () => {
     );
 
     await expect(cache.getKey("unknown")).rejects.toThrow(/not found in JWKS/);
-    // Two fetches: one cold fetch + one refetch because kid was missing.
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    // The cold acquisition is already the one cooldown-bounded attempt.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("returns the kid on the refetch (rotation: fresh JWKS now contains the new kid)", async () => {
@@ -143,6 +143,7 @@ describe("JWKSCache kid miss (AC4)", () => {
       { jwksUrl: "https://idp.test/jwks.json" },
       { fetchImpl, ttlMs: 60_000 },
     );
+    await cache.warm();
     const key = await cache.getKey("k2");
     expect(key.kid).toBe("k2");
     expect(fetchImpl).toHaveBeenCalledTimes(2);
@@ -169,6 +170,7 @@ describe("JWKSCache kid miss (AC4)", () => {
       { jwksUrl: "https://idp.test/jwks.json" },
       { fetchImpl, ttlMs: 60_000 },
     );
+    await cache.warm();
     const results = await Promise.allSettled([cache.getKey("k2"), cache.getKey("k2"), cache.getKey("k2")]);
     for (const r of results) {
       expect(r.status).toBe("fulfilled");
@@ -194,8 +196,10 @@ describe("JWKSCache fail-closed (AC5)", () => {
       { fetchImpl, ttlMs: 60_000 },
     );
 
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
     await expect(cache.getKey("k1")).rejects.toThrow(/JWKS fetch failed.*500/);
     // The next call should NOT serve a stale cache entry — it must refetch.
+    now.mockReturnValue(31_000);
     const key = await cache.getKey("k1");
     expect(key.kid).toBe("k1");
     expect(fetchImpl).toHaveBeenCalledTimes(2);
@@ -215,7 +219,9 @@ describe("JWKSCache fail-closed (AC5)", () => {
       { fetchImpl, ttlMs: 60_000 },
     );
 
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
     await expect(cache.getKey("k1")).rejects.toThrow(/ECONNREFUSED/);
+    now.mockReturnValue(31_000);
     const key = await cache.getKey("k1");
     expect(key.kid).toBe("k1");
     expect(fetchImpl).toHaveBeenCalledTimes(2);
@@ -235,7 +241,9 @@ describe("JWKSCache fail-closed (AC5)", () => {
       { fetchImpl, ttlMs: 60_000 },
     );
 
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
     await expect(cache.getKey("k1")).rejects.toThrow(/non-JSON/);
+    now.mockReturnValue(31_000);
     const key = await cache.getKey("k1");
     expect(key.kid).toBe("k1");
     expect(fetchImpl).toHaveBeenCalledTimes(2);
@@ -322,11 +330,11 @@ describe("JWKSCache hostile kid misses (#408)", () => {
     for (let i = 0; i < 12; i++) {
       await expect(cache.getKey(`random-${i}`)).rejects.toThrow(/not found/);
     }
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
     document = { keys: [...good.keys, { ...good.keys[0], kid: "rotated" }] };
     now.mockReturnValue(31_000);
     expect((await cache.getKey("rotated")).kid).toBe("rotated");
-    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
   it.each(["outage", "missing"])("preserves the fresh cache and its original TTL after a %s refresh", async (mode) => {
@@ -337,10 +345,14 @@ describe("JWKSCache hostile kid misses (#408)", () => {
     fetchImpl.mockImplementation(async () => mode === "outage"
       ? new Response("rate limited", { status: 429 })
       : new Response(JSON.stringify({ keys: [] })));
-    now.mockReturnValue(20_000);
+    now.mockReturnValue(31_000);
     await expect(cache.getKey("random")).rejects.toThrow();
     expect((await cache.getKey("known")).kid).toBe("known");
-    await expect(cache.getKey("another-random")).rejects.toThrow(/not found/);
+    if (mode === "outage") {
+      await expect(cache.getKey("another-random")).rejects.toBeInstanceOf(JwksUnavailableError);
+    } else {
+      await expect(cache.getKey("another-random")).rejects.toThrow(/not found/);
+    }
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     // Preserving a good document must never extend its original validity.
     now.mockReturnValue(61_000);
@@ -348,11 +360,77 @@ describe("JWKSCache hostile kid misses (#408)", () => {
     expect(fetchImpl.mock.calls.length).toBeGreaterThan(2);
   });
 
+  it("bounds a cold 429 across serial callers and keeps the cooldown retryable", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const fetchImpl = mockFetchStatus(429);
+    const cache = JWKSCache.create({ jwksUrl: "https://idp.test/jwks" }, { fetchImpl });
+
+    for (let i = 0; i < 10; i++) {
+      await expect(cache.getKey(`random-${i}`)).rejects.toBeInstanceOf(JwksUnavailableError);
+    }
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+    now.mockReturnValue(31_000);
+    await expect(cache.getKey("random-retry")).rejects.toBeInstanceOf(JwksUnavailableError);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("never serves an expired key during outage and recovers after the cooldown", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    let document = good;
+    let outage = false;
+    const fetchImpl = vi.fn(async () => outage
+      ? new Response("unavailable", { status: 503 })
+      : new Response(JSON.stringify(document))) as unknown as typeof fetch;
+    const cache = JWKSCache.create(
+      { jwksUrl: "https://idp.test/jwks" },
+      { fetchImpl, ttlMs: 1_000 },
+    );
+    await cache.getKey("known");
+
+    outage = true;
+    now.mockReturnValue(31_000);
+    await expect(cache.getKey("known")).rejects.toBeInstanceOf(JwksUnavailableError);
+    await expect(cache.getKey("known")).rejects.toBeInstanceOf(JwksUnavailableError);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+
+    outage = false;
+    document = { keys: [{ ...good.keys[0], kid: "rotated" }] };
+    now.mockReturnValue(61_000);
+    await expect(cache.getKey("known")).rejects.toThrow(/not found/);
+    expect((await cache.getKey("rotated")).kid).toBe("rotated");
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("lets a valid joiner publish a hostile starter's rotation result", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const old = { keys: [{ ...good.keys[0], kid: "old" }] };
+    const rotated = { keys: [{ ...good.keys[0], kid: "rotated" }] };
+    let resolveRefresh!: (response: Response) => void;
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(old)))
+      .mockImplementationOnce(() => new Promise<Response>((resolve) => { resolveRefresh = resolve; })) as unknown as typeof fetch;
+    const cache = JWKSCache.create({ jwksUrl: "https://idp.test/jwks" }, { fetchImpl });
+    await cache.getKey("old");
+
+    now.mockReturnValue(31_000);
+    const hostile = cache.getKey("random");
+    await vi.waitFor(() => expect(resolveRefresh).toBeTypeOf("function"));
+    const valid = cache.getKey("rotated");
+    resolveRefresh(new Response(JSON.stringify(rotated)));
+
+    await expect(hostile).rejects.toThrow(/not found/);
+    await expect(valid).resolves.toMatchObject({ kid: "rotated" });
+    await expect(cache.getKey("rotated")).resolves.toMatchObject({ kid: "rotated" });
+    await expect(cache.getKey("old")).rejects.toThrow(/not found/);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   it("serves a known key while one hostile refresh is still in flight", async () => {
     let finish!: (response: Response) => void;
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify(good)));
     const cache = JWKSCache.create({ jwksUrl: "https://idp.test/jwks" }, { fetchImpl });
-    await cache.getKey("known");
+    await cache.warm();
     fetchImpl.mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
     const miss = cache.getKey("random").catch(error => error);
     await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
@@ -369,6 +447,7 @@ describe("JWKSCache hostile kid misses (#408)", () => {
 
 describe("JWKSCache TTL boundary", () => {
   it("still serves from cache at exactly ttlMs - 1 (no refetch)", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
     const jwks = await mintRsaJwks("k1");
     const fetchImpl = mockFetchWith(jwks);
     const cache = JWKSCache.create(
@@ -376,12 +455,13 @@ describe("JWKSCache TTL boundary", () => {
       { fetchImpl, ttlMs: 100 },
     );
     await cache.getKey("k1");
-    await new Promise((r) => setTimeout(r, 90));
+    now.mockReturnValue(1_099);
     await cache.getKey("k1");
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("refetches after ttlMs (expiry)", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
     const jwks = await mintRsaJwks("k1");
     const fetchImpl = mockFetchWith(jwks);
     const cache = JWKSCache.create(
@@ -389,7 +469,7 @@ describe("JWKSCache TTL boundary", () => {
       { fetchImpl, ttlMs: 50 },
     );
     await cache.getKey("k1");
-    await new Promise((r) => setTimeout(r, 70));
+    now.mockReturnValue(31_000);
     await cache.getKey("k1");
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });

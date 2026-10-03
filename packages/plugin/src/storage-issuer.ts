@@ -1,5 +1,6 @@
 import { lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { inspectPendingLegacyKeyMigration } from "./legacy-storage-migration.js";
 import { atomicWritePrivateFile } from "./private-file.js";
 import { legacyTuplePaths, tupleStoragePaths, type TupleStoragePathOptions } from "./storage-paths.js";
 
@@ -15,11 +16,14 @@ function canonicalIssuer(issuer: string): string {
 
 export class StorageIssuerError extends Error {
   readonly fix: string;
-  constructor(scope: TupleStoragePathOptions, reason: string) {
+  constructor(scope: TupleStoragePathOptions, reason: string, relatedArchivePath?: string) {
     const paths = tupleStoragePaths(scope);
     const legacy = legacyTuplePaths(scope.accountId, scope.home);
     const fix = `Stop all gateways serving this account. Restore the original issuer, or archive the complete tuple directory ${JSON.stringify(paths.directory)} ` +
       `(history, conversation keys and storage-issuer.json together), and any live legacy state at ${JSON.stringify(legacy.directory)}. ` +
+      (relatedArchivePath
+        ? `Preserve and archive the incomplete legacy migration claim at ${JSON.stringify(relatedArchivePath)} as well. `
+        : "") +
       `Then explicitly initialize fresh state by re-enrolling account ${JSON.stringify(scope.accountId)} and starting it with the intended issuer. ` +
       "Keep the archive offline; never copy old history or keys into the new tuple or edit the issuer marker to relabel them.";
     super(`webchannel: storage issuer ${reason}; account start refused. ${fix}`);
@@ -37,6 +41,14 @@ function present(path: string): boolean {
 export function inspectStorageIssuer(scope: IssuerScope): "fresh" | "match" {
   const paths = tupleStoragePaths(scope);
   const issuer = canonicalIssuer(scope.issuer);
+  const pendingMigration = inspectPendingLegacyKeyMigration(scope);
+  if (pendingMigration) {
+    throw new StorageIssuerError(
+      scope,
+      `unbound pending legacy migration archive at ${JSON.stringify(pendingMigration.claimDirectory)}`,
+      pendingMigration.claimDirectory,
+    );
+  }
   // A later lazy key read can import legacy state. It has no issuer proof and
   // must not be silently adopted even when the new tuple is otherwise empty.
   if (present(legacyTuplePaths(scope.accountId, scope.home).conversationKeyPath)) {

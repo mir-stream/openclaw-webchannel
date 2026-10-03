@@ -207,6 +207,10 @@ export async function verifyJwt(
     return null;
   }
   if (header.alg !== "RS256") return null;
+  // RFC 7515 §4.1.11: critical extensions must be understood. This verifier
+  // supports none; an empty or malformed crit is invalid too. Reject before
+  // key lookup so unsupported headers cannot trigger a JWKS fetch.
+  if (Object.hasOwn(header, "crit")) return null;
 
   // Step 2: extract kid. Missing kid is a hard reject — we never default to a
   // single key (the operator's IdP could rotate).

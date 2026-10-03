@@ -20,9 +20,11 @@ history to another issuer's identically named `sub`.
 Startup and doctor inspect this metadata before admission. A fresh tuple may
 contain enrollment credentials, but no conversation keys, generations or journal
 (including SQLite sidecars); only such a tuple is automatically initialized.
-Existing unbound state, live legacy keys, a different issuer, malformed metadata
-or an unsupported version refuses the affected account. Checks do not rewrite,
-delete, or automatically bind those stores. Other accounts can still start.
+Existing unbound state, live legacy keys, an incomplete legacy migration claim
+that can still restore archived keys, a different issuer, malformed metadata or
+an unsupported version refuses the affected account. Completed migration backups
+are inactive and remain permitted. Checks do not rewrite, delete, resume, or
+automatically bind those stores. Other accounts can still start.
 
 For a refused account:
 
@@ -31,7 +33,9 @@ For a refused account:
    and matching credentials. This option requires already valid issuer metadata.
 3. To switch issuer, or upgrade an unbound store, archive the **whole** tuple
    directory offline, including the issuer marker, keys and all journal sidecars.
-   Archive any live legacy state identified by doctor as well. Preserve file modes.
+   Archive any live legacy state and incomplete migration-claim path identified
+   by doctor as well. Preserve file modes. Do not let the lazy store resume that
+   claim under a newly initialized issuer marker.
 4. Explicitly re-enroll and initialize fresh state at the intended issuer. Honor
    existing SaaS active-key replacement procedures; an exact credential-file
    override is separate from the tuple directory and must be handled explicitly.

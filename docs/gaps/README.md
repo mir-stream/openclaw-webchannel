@@ -52,7 +52,7 @@ which glues together the split modules:
 | register hop + handler wiring | `packages/plugin/index-nats.ts` (**NATS request/reply — no HTTP**): `setRegisterRequestHandler` (wired `:638`), `setApprovalDecisionHandler` (`:530`), `setLoadHistoryHandler` (`:548`), `setLoadCommandsHandler` (`:917-925`); the register success path sends **both** a history snapshot (`sendHistory`, detached read) **and** an approval snapshot (`sendApprovalSnapshot`, synchronous, `:668-673`) — stateless per register. |
 | `/stop` control lane (P1-8a) | `src/control-lane.ts` (`isControlLaneMessage`, `isExplicitAbortCommand`, `shouldDropBufferedInputOnStop`) + `src/command-gate.ts` (allowlist-trap hedge) |
 | slash-command discovery (P0-3) | `src/commands-catalog.ts` (`buildCommandCatalog`, `createCommandCatalogProvider`) |
-| ingress dedupe + ack (P0-7a) | `src/ingress-dedupe.ts` (`filterFreshInboundItems`, `createIngressOnFlush`, `recordCancelledInboundItems`) |
+| ingress dedupe + ack (P0-7a) | `src/ingress-dedupe.ts` (`filterFreshInboundItems`, `createIngressOnFlush`); production cancellation: `src/stop-control.ts` (legacy callback tests retain `recordCancelledInboundItems`) |
 | protocol version (#33) | `src/protocol.ts` (`WEBCHANNEL_PROTOCOL_VERSION`, `readPluginVersion`) |
 | inbound turn / streaming / typing | `src/inbound.ts` (streaming-mode resolve `:124-136`, control-lane branch, `sendTyping` `:160`, `commandBody` `:200`) |
 | debounce / coalesce (P1-8b) | `src/inbound-queue.ts` (`coalesceUserMessages`, `startCoalesceTurn`, `clearPending`/`pendingBuffered`) + core `createInboundDebouncer` |
