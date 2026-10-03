@@ -14,6 +14,14 @@ namespace isolates tenant/account. Admission still reserves the shared count and
 byte budget first; neither an ACK nor a dispatcher commit precedes persistence.
 A failed transaction leaves no partial user/pending batch.
 
+Configured inbound debounce applies to execution only (#441). The bounded ingress
+worker has no timed delay: each input commits, broadcasts its server user row and
+receives its ACK before the execution quiet interval. Every newly committed input
+restarts that peer's interval; duplicate replays, recovery polls and rolled-back
+offers do not. The dispatcher still holds the count/byte reservation throughout
+the interval and waits for any running turn or open admission/control lease.
+The config source and default remain `messages.inbound` (default zero).
+
 | State | Restart behavior |
 | --- | --- |
 | queued | Automatically offer the stored payload in conversation sequence order. |
@@ -75,8 +83,9 @@ queued/started one is cancelled as above and reported through its request state.
 `ack.unaccepted` (protocol 7) is the server's per-ID declaration that a cancelled
 ID was never accepted: the SQLite stop ledger holds it with no dispatch row,
 user row or exact convergence receipt. Every ledger-backed cancellation ACK
-computes it the same way — the stop's own target ACKs, and later hot or cold arrivals — so an input cancelled in
-the debounce window is declared too. It rides the same frame as its ID; the
+computes it the same way — the stop's own target ACKs, and later hot or cold arrivals.
+Input already accepted and waiting for execution debounce keeps its accepted row;
+only input cancelled before admission receives `unaccepted`. It rides the same frame as its ID; the
 `committed` echo, which rides only the first frame of a split, is never evidence
 for it. A journal fault, or an SDK-only cancellation without ledger evidence,
 omits it.

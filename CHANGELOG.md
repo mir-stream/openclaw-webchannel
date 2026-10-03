@@ -39,6 +39,10 @@
 
 ### Changed
 
+- Inbound debounce now delays execution only. Durable acceptance, ACK and
+  multi-device echo precede the quiet interval, while bounded retention,
+  cancellation and restart recovery keep their existing contracts (#441).
+
 - Browser receive doors now reject replayed envelopes, timestamps outside ±10 minutes,
   and mismatched tenant/account/peer routing (#415 E4). The 16,384-ID cache survives
   reconnects and refuses new frames at capacity until IDs expire; a new client

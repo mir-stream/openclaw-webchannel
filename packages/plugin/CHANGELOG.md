@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Inbound debounce now delays execution only. Durable acceptance, ACK and
+  multi-device echo precede the quiet interval, while bounded retention,
+  cancellation and restart recovery keep their existing contracts (#441).
+
 ### Changed
 
 - The inbound reply pipeline honors configured response prefixes and selected

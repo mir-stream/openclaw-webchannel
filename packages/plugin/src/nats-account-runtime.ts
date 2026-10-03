@@ -1089,6 +1089,10 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // accountId, so inbound turns resolve THIS account's route (binding.account)
       // and replies deliver back over THIS account's channel.
       if (!deliveryJournal?.dispatch) throw new Error("webchannel: durable dispatch store required");
+      const inboundDebounceMs = resolveInboundDebounceMs({
+        cfg: api.config,
+        channel: WEBCHANNEL_ID,
+      });
       dispatchRecovery = createDispatchRecovery({
         store: deliveryJournal.dispatch,
         handler: (peerId, message, onSettled, ownership) => handleInboundMessage(api, channel, peerId, message, accountId, tenant, {
@@ -1102,27 +1106,13 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         notify: (change) => { channel.sendRequestState(change); },
         isActive: () => runtimeActive,
         warn: (error) => api.logger?.warn?.(`webchannel: dispatch recovery failed: ${logSafe(error)}`),
-        dispatcherOptions: { budget: processInboundRetention, sessionToken },
+        dispatcherOptions: { budget: processInboundRetention, sessionToken, debounceMs: inboundDebounceMs },
       });
       inboundDispatcher = dispatchRecovery.dispatcher;
 
-      // P1-8b layer (a): repo-owned bounded idle pre-run debounce (Telegram
-      // parity). It replaces core's unbounded primitive and sits IN FRONT of the
-      // per-session FIFO: rapid
-      // same-peer messages within the debounce window flush together as ONE
-      // merged turn. `resolveInboundDebounceMs` reads the GLOBAL config
-      // (`messages.inbound.byChannel.webchannel ?? messages.inbound.debounceMs ??
-      // 0`) — resolved ONCE here per account. The core default is 0ms, which makes
-      // this layer inert (each message flushes immediately) unless an operator
-      // opts in; layer (b) still coalesces busy-time regardless. We keep that
-      // default (do NOT invent a nonzero one). Items carry `peerId` so `buildKey`
-      // and `onFlush` can route; one explicit bounded worker owns each same-key
-      // sequence. Forced retirement severs queued batch captures, while a callback
-      // that already began keeps its copied entries charged until settlement.
-      const inboundDebounceMs = resolveInboundDebounceMs({
-        cfg: api.config,
-        channel: WEBCHANNEL_ID,
-      });
+      // The bounded ingress worker persists each input and emits its receipt
+      // immediately. Only execution waits for the configured quiet interval;
+      // dispatch retains the shared budget until the accepted work starts.
       const onIngressFlush = createIngressOnFlush<DebounceItem>({
         accountId,
         storageScope,
@@ -1147,7 +1137,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         isActive: () => runtimeActive,
       });
       inboundDebouncer = createBoundedInboundDebouncer<DebounceItem>({
-        debounceMs: inboundDebounceMs,
+        debounceMs: 0,
         buildKey: (item) => item.peerId,
         sessionToken: (peerId) => sessionToken(peerId),
         budget: processInboundRetention,

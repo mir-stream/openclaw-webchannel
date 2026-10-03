@@ -257,10 +257,13 @@ type SessionState<Message> = {
   pending: RetainedEntry<Message>[];
   openLeases: Set<InternalLease<Message>>;
   readyToDrain: boolean;
+  debounceTimer?: ReturnType<typeof setTimeout>;
 };
 
 export type SerializedInboundDispatcherOptions<Message> = {
   coalesce?: (messages: Message[]) => Message;
+  /** Delay execution after committed admission, on the coalescing path only. */
+  debounceMs?: number;
   budget?: InboundRetentionBudget;
   sessionToken?: (sessionKey: string) => RetentionSessionToken;
   measure?: (message: Message) => number;
@@ -283,6 +286,10 @@ export function createSerializedInboundDispatcher<Message>(
   options?: SerializedInboundDispatcherOptions<Message>,
 ): SerializedInboundDispatcher<Message> {
   const coalesce = options?.coalesce;
+  const debounceMs = options?.debounceMs ?? 0;
+  if (!Number.isSafeInteger(debounceMs) || debounceMs < 0) {
+    throw new TypeError("debounceMs must be a non-negative safe integer");
+  }
   const budget = options?.budget ?? new InboundRetentionBudget();
   const measure = options?.measure ?? estimateRetainedMessageBytes;
   // Validate injected measurement at construction without retaining an item.
@@ -306,8 +313,14 @@ export function createSerializedInboundDispatcher<Message>(
     entry.reservation.requestRelease();
   };
 
+  const clearDebounce = (state: SessionState<Message>) => {
+    if (state.debounceTimer !== undefined) clearTimeout(state.debounceTimer);
+    state.debounceTimer = undefined;
+  };
+
   const maybeForget = (key: string, state: SessionState<Message>) => {
     if (!state.running && state.pending.length === 0 && state.openLeases.size === 0) {
+      clearDebounce(state);
       sessions.delete(key);
       if (!options?.sessionToken) tokens.delete(key);
     }
@@ -360,7 +373,7 @@ export function createSerializedInboundDispatcher<Message>(
   };
 
   const drain = (key: string, state: SessionState<Message>) => {
-    if (state.running || state.openLeases.size > 0) return;
+    if (state.running || state.openLeases.size > 0 || state.debounceTimer !== undefined) return;
     state.readyToDrain = false;
     const entries = state.pending.splice(0);
     if (entries.length > 0) startTurn(key, state, entries);
@@ -450,6 +463,7 @@ export function createSerializedInboundDispatcher<Message>(
       if (internal.finished) return;
       internal.finished = true;
       state.openLeases.delete(internal);
+      let attached = false;
       for (const entry of internal.entries) {
         if (entry.state === "provisional") {
           entry.state = "rolled-back";
@@ -457,9 +471,21 @@ export function createSerializedInboundDispatcher<Message>(
         } else if (entry.state === "committed") {
           entry.state = "attached";
           state.pending.push(entry);
+          attached = true;
         }
       }
       internal.entries = [];
+      // Only newly committed work extends the quiet interval. Recovery polls,
+      // duplicate receipts and rolled-back offers must not postpone execution.
+      // Pending entries retain their original count/byte reservations here.
+      if (attached && debounceMs > 0) {
+        clearDebounce(state);
+        state.debounceTimer = setTimeout(() => {
+          state.debounceTimer = undefined;
+          if (!disposed && sessions.get(sessionKey) === state) drain(sessionKey, state);
+        }, debounceMs);
+        state.debounceTimer.unref?.();
+      }
       if (!state.running && state.openLeases.size === 0) drain(sessionKey, state);
       else if (state.readyToDrain && state.openLeases.size === 0) drain(sessionKey, state);
     };
@@ -539,6 +565,7 @@ export function createSerializedInboundDispatcher<Message>(
   const clearPending = (sessionKey: string): Message[] => {
     const state = sessions.get(sessionKey);
     if (!state) return [];
+    clearDebounce(state);
     const dropped: Message[] = [];
     for (const entry of state.pending.splice(0)) {
       dropped.push(entry.message);
@@ -563,6 +590,7 @@ export function createSerializedInboundDispatcher<Message>(
     let pending = 0;
     let provisional = 0;
     for (const [key, state] of sessions) {
+      clearDebounce(state);
       for (const entry of state.pending.splice(0)) {
         pending++;
         release(entry);
