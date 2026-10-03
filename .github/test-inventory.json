@@ -66,7 +66,7 @@
     "packages/plugin/src/approval-origin-delivery-integration.test.ts": 9,
     "packages/plugin/src/approval-origin.test.ts": 51,
     "packages/plugin/src/approval-output-recovery.test.ts": 27,
-    "packages/plugin/src/approvals.test.ts": 108,
+    "packages/plugin/src/approvals.test.ts": 111,
     "packages/plugin/src/auth-admission.test.ts": 6,
     "packages/plugin/src/auth.test.ts": 22,
     "packages/plugin/src/bounded-inbound-debouncer.test.ts": 16,

@@ -31,6 +31,10 @@
   remains connecting/reconnecting. The minimal consumer filters approvals by
   `actionable`, excluding inert historical cards (#415 F4/F5).
 
+- Explicit exec approvers accept an optional `webchannel:` prefix, including
+  account-scoped wildcards. Peer case and explicit-list precedence are preserved;
+  an empty prefixed entry cannot widen to owner fallback (#415 D6).
+
 - **Case-distinct JWT peers now have distinct core sessions (#372).** Raw peer
   IDs such as `Alice` and `alice` are encoded before SDK session normalization;
   configured bindings and intentional `identityLinks` keep their SDK selection,
