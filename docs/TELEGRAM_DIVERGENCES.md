@@ -90,3 +90,16 @@ Telegram Bot API/MTProto 계약을 그대로 따르는 것이다.
 | 재검토 | 사유 노출이 권한 구조 탐색에 쓰일 수 있다는 근거가 생길 때. |
 | 구현 상태 (2026-10-02) | 거부 프레임과 정정된 cross-account 사유 매핑은 PR #421에서 구현 중이다. 아직 `develop`에 병합되지 않았다. |
 | 관련 | #400, [PR #421](https://github.com/mir-stream/openclaw-webchannel/pull/421) |
+
+### TD-6. CLI 발신은 실행 중인 gateway를 경유한다
+
+| | |
+| --- | --- |
+| Telegram | `extensions/telegram/src/outbound-adapter.ts`는 `deliveryMode: "direct"`로 Bot API를 호출한다. CLI 프로세스에서도 Telegram 서버에 전달할 수 있다. |
+| WebChannel 목표 결정 | `deliveryMode: "gateway"`로 코어의 `send` RPC를 사용한다. CLI와 agent `message` 발신은 실행 중인 gateway의 선택된 계정 런타임을 사용하며, cron은 gateway 안에서 직접 전달한다. |
+| 의도 | 우리 플러그인이 Telegram 서버 역할도 맡는다. 계정 NATS 연결·대화 키·원장은 gateway가 소유하므로 CLI에 별도 런타임을 만들지 않는다. |
+| 결정 | 2026-10-02, 프로젝트 오너의 #418 작업 지시. pinned SDK가 gateway 전달을 지원할 때 이 경로를 사용하도록 승인했다. |
+| 구현 상태 (2026-10-02) | #418 수정 브랜치에서 구현. 설치된 `openclaw@2026.7.1-2` dist의 `ChannelOutboundAdapter` 계약, `src/infra/outbound/message.ts`의 RPC 분기, `src/gateway/server-methods/send.ts`와 `src/cron/isolated-agent/delivery-dispatch.ts`의 durable send 호출을 확인했다. `outbound-gateway.test.ts`가 실제 코어 action runner·RPC 핸들러·cron dispatcher를 실행해 계정별 암호화·원장·세션 경로를 검증한다. |
+| 오류 안내 | gateway 연결 실패는 코어의 `gateway closed (1006 …)`와 `Run openclaw doctor` 안내를 보존한다. gateway가 살아 있지만 계정 런타임이 없을 때의 `outbound account … is not running`과 구분한다. |
+| 재검토 | SDK의 delivery mode/RPC 계약이 바뀌거나, 계정 런타임 소유권이 gateway 밖으로 옮겨질 때. |
+| 관련 | #418, [PR #419](https://github.com/mir-stream/openclaw-webchannel/pull/419) |

@@ -11,6 +11,12 @@
 
 ### Changed
 
+- **CLI WebChannel sends use the running gateway (#418).** Core's gateway
+  `send` RPC delivers through the selected account's NATS runtime instead of
+  looking for that runtime in the CLI process. Agent `message` actions and cron
+  remain deliverable. Gateway connection failures retain core's diagnostics and
+  `openclaw doctor` guidance. No wire protocol change.
+
 - The inbound reply pipeline honors configured response prefixes and selected
   model interpolation on answers; reasoning stays unprefixed. Unsupported
   media-only final replies now settle as delivery errors rather than silently
