@@ -10,8 +10,8 @@
  * answers one device's nonce (#401) and a dropped request is an ignored click.
  *
  * A snapshot's high-water comes from the same transaction as its selected rows.
- * Byte fitting may mark it incomplete so client recovery starts from the proper
- * prefix. Difference still reads the raw journal and retains the existing
+ * Byte fitting may mark individual omissions without invalidating the snapshot
+ * high-water. Difference still reads the raw journal and retains the existing
  * individually oversized-event skip policy (#343).
  *
  * Read/projection faults log and emit no frame; a successful empty result is
@@ -492,22 +492,34 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
     options: { sendEmpty: boolean; highWaterSeq?: number; nonce?: string },
   ): void => {
     const limit = channel.effectiveOutboundLimit();
+    // Row identity is small even when its content cannot fit. These markers
+    // describe holes in this window; they never ask the client to replay from 0.
+    const omissions = (rows: HistoryMessage[]) => {
+      const included = new Set(rows);
+      return messages.filter(row => !included.has(row)).map(row => ({
+        id: row.id,
+        ...(row.kind !== undefined ? { kind: row.kind } : {}),
+        ...("turnId" in row && row.turnId !== undefined ? { turnId: row.turnId } : {}),
+        ...(row.seq !== undefined ? { seq: row.seq } : {}),
+      }));
+    };
+    let markOmissions = options.highWaterSeq !== undefined;
+    const envelope = (rows: HistoryMessage[]) => ({
+      type: "history" as const, messages: rows,
+      ...(journal.epoch !== undefined ? { epoch: journal.epoch } : {}),
+      ...(options.highWaterSeq !== undefined ? {
+        highWaterSeq: options.highWaterSeq, snapshotComplete: rows.length === messages.length,
+      } : {}),
+      ...(options.nonce !== undefined ? { nonce: options.nonce } : {}),
+      ...(markOmissions && rows.length < messages.length ? { omitted: omissions(rows) } : {}),
+    });
+    // Pathological identities can themselves exceed the wire budget. The same
+    // skip policy applies to an unsendable marker; do not black out valid rows.
+    const markerBytes = channel.outboundWireSize(peerId, envelope([]));
+    if (markerBytes !== undefined && markerBytes > limit) markOmissions = false;
     const fitted = fitHistoryFrame(messages, {
       limit,
-      // The SEALED length — what `publish` compares against the limit. On an
-      // encrypted channel with no session key yet this returns `undefined`, and
-      // `fitHistoryFrame` treats that as "do not budget" rather than falling
-      // back to a plaintext estimate, because the send is about to be refused
-      // fail-closed for the same missing key.
-      measure: (rows) =>
-        channel.outboundWireSize(peerId, {
-          type: "history",
-          messages: rows,
-          ...(options.highWaterSeq !== undefined ? {
-            highWaterSeq: options.highWaterSeq, snapshotComplete: rows.length === messages.length,
-          } : {}),
-          ...(options.nonce !== undefined ? { nonce: options.nonce } : {}),
-        }),
+      measure: rows => channel.outboundWireSize(peerId, envelope(rows)),
     });
 
     if (fitted.skipped.length > 0) {
@@ -561,7 +573,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
 
     if (!channel.sendHistory(peerId, fitted.rows, options.highWaterSeq,
       options.highWaterSeq === undefined ? undefined : fitted.rows.length === messages.length,
-      options.nonce)) {
+      options.nonce, markOmissions ? omissions(fitted.rows) : undefined)) {
       const suppressed = admit(kind, "publish-failed");
       if (suppressed !== undefined) {
         try {
@@ -694,6 +706,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
     const makeReply = (events: DifferenceEntry[], coveredThrough = windowMax): DifferenceReply => {
       const partial = produced.capped || coveredThrough < windowMax;
       return {
+        ...(journal.epoch !== undefined ? { epoch: journal.epoch } : {}),
         afterSeq: request.afterSeq,
         nonce: request.nonce,
         events,
@@ -1086,7 +1099,7 @@ export function createHistoryServer(deps: HistoryServerDeps): HistoryServer {
         },
         (messages) => {
           // An empty conversation still supplies its baseline. If byte fitting
-          // removes content, snapshotComplete=false prevents false cold seeding.
+          // removes content, individual omissions leave the high-water usable.
           publishFitted("snapshot", peerId, messages, { sendEmpty: true, highWaterSeq });
         },
       );

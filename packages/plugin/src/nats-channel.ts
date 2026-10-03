@@ -764,6 +764,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     highWaterSeq?: number,
     snapshotComplete?: boolean,
     nonce?: string,
+    omitted?: import("../../client/src/types.js").HistoryOmission[],
   ): boolean {
     // #244 half A: `highWaterSeq` is the conversation's authoritative MAX(seq),
     // attached to the register-time SNAPSHOT only (`history-serve.ts` passes it
@@ -773,6 +774,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     const payload: OutboundWsMessage = {
       type: "history",
       messages,
+      ...(omitted?.length ? { omitted } : {}),
       ...(highWaterSeq !== undefined ? { highWaterSeq } : {}),
       ...(snapshotComplete !== undefined ? { snapshotComplete } : {}),
       // #401: a page's correlation echo — the `load_history.nonce` it answers.
@@ -867,6 +869,7 @@ export class NatsChannel implements WebChannelPeerChannel {
 
   /** Actual serialized/sealed length for result-frame admission chunking. */
   outboundWireSize(peerId: string, payload: OutboundWsMessage): number | undefined {
+    payload = this.withJournalEpoch(payload);
     if (!this.encryptionRequired) return Buffer.byteLength(JSON.stringify(payload), "utf8");
     const key = this.peerSessionKeys.get(peerId);
     if (!key) return undefined;
@@ -878,6 +881,11 @@ export class NatsChannel implements WebChannelPeerChannel {
   }
 
   effectiveOutboundLimit(): number { return this.transport.effectiveOutboundLimit; }
+
+  private withJournalEpoch(payload: OutboundWsMessage): OutboundWsMessage {
+    const epoch = this.deliveryJournal?.epoch;
+    return epoch === undefined ? payload : { ...payload, epoch };
+  }
 
   /**
    * Send approval request to peer.
@@ -1107,6 +1115,7 @@ export class NatsChannel implements WebChannelPeerChannel {
    * success here, keeping delivered independent from journaled.
    */
   private sendToPeer(peerId: string, payload: OutboundWsMessage): boolean {
+    payload = this.withJournalEpoch(payload);
     if (this.disposed || (this.dispatchOwnerActive && !this.dispatchOwnerActive())) return false;
     const sessionKey = this.encryptionRequired ? (this.peerSessionKeys.get(peerId) ?? this.recoveryKeys.get(peerId)?.key) : undefined;
     if (this.encryptionRequired && !sessionKey) {
