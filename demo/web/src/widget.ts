@@ -55,6 +55,7 @@ export async function createWidget(
   accountId: string,
   signal?: AbortSignal,
   initialDraft = "",
+  heldDrafts: Map<string, string> = new Map(),
 ): Promise<() => void> {
   if (signal?.aborted) return () => {};
 
@@ -80,6 +81,9 @@ export async function createWidget(
     style: "font-size:11px;color:var(--muted);margin-bottom:8px",
   }, ["↔ multi-device: open another tab as the same user — it syncs (each tab is its own device key)"]);
   const list = el("div", { style: "display:flex;flex-direction:column;gap:8px;min-height:120px" });
+  // Owned by the login/account shell, not by a transport instance. These are
+  // inert drafts: a replacement client must never enqueue them automatically.
+  const heldList = el("div", { style: "display:flex;flex-direction:column;gap:8px;margin-top:8px" });
   const errBox = el("div", {
     class: "hidden",
     style:
@@ -100,7 +104,7 @@ export async function createWidget(
   });
   const composer = el("div", { style: "display:flex;gap:8px;margin-top:10px" }, [input, sendBtn]);
   // A stale teardown may remove only its own mount, never a newer account's UI.
-  const root = el("div", {}, [topBar, mdHint, errBox, list, cmdMenu, composer]);
+  const root = el("div", {}, [topBar, mdHint, errBox, list, heldList, cmdMenu, composer]);
   bodyEl.replaceChildren(root);
 
   let client: WebChannelNATSClient | null = null;
@@ -116,7 +120,20 @@ export async function createWidget(
     unsubscribe = null;
     const previous = client;
     client = null;
+    for (const message of previous?.getState().messages ?? []) {
+      if (message.kind !== undefined || message.role !== "user") continue;
+      // A terminal auth failure already clears `pending`. No publish attempt
+      // on an owned receipt still proves that text never left this client.
+      const terminalHold = message.receiptKey && message.sendState === "failed"
+        && message.sendFailure?.reason === "terminal" && message.sendFailure.lastAttemptAt === undefined;
+      if (message.sendState === "queued" || terminalHold) {
+        heldDrafts.set(crypto.randomUUID(), message.text);
+      }
+    }
     previous?.close();
+    // The retired instance's queued labels/actions cannot describe this lane.
+    list.replaceChildren();
+    renderHeldDrafts();
   }
 
   function dispose(): void {
@@ -177,6 +194,31 @@ export async function createWidget(
     const s = client?.getState();
     if (s) applyComposerMode(s);
   };
+
+  function renderHeldDrafts(): void {
+    heldList.replaceChildren(...Array.from(heldDrafts, ([id, text]) => {
+      const restore = el("button", {}, ["Restore draft"]) as HTMLButtonElement;
+      const dismiss = el("button", { title: "dismiss" }, ["✕"]) as HTMLButtonElement;
+      restore.onclick = () => {
+        if (disposed || !heldDrafts.has(id)) return;
+        input.value = input.value.trim() ? `${input.value} ${text}` : text;
+        heldDrafts.delete(id);
+        renderHeldDrafts();
+        renderMenu();
+        refreshComposerMode();
+        input.focus();
+      };
+      dismiss.onclick = () => {
+        if (disposed) return;
+        heldDrafts.delete(id);
+        renderHeldDrafts();
+      };
+      return el("div", {
+        "data-held-draft": id,
+        style: "white-space:pre-wrap;padding:8px;border:1px solid var(--border);border-radius:8px;font-size:12px",
+      }, [el("div", {}, [text]), el("div", {}, ["Not sent · connection replaced. Restore to edit and send."]), restore, dismiss]);
+    }));
+  }
 
   // ── Render ───────────────────────────────────────────────────────────────
   /**

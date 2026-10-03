@@ -523,3 +523,83 @@ it("restores the admin observer once and fences its pre-suspension credential re
   expect(byId("whoami").textContent).toBe("admin (admin)");
   expect(polls.size).toBe(1);
 });
+
+function queueDraft(text: string): void {
+  composer().value = text;
+  composer().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
+  expect(composer().value).toBe("");
+}
+function heldDrafts(): string[] {
+  return Array.from(byId("chat-lane").querySelectorAll("[data-held-draft]")).map(n => n.textContent!);
+}
+
+it("#395 keeps unsent inputs in their account across tabs and repeated BFCache restores", async () => {
+  await boot();
+  await settleUntil(() => FakeNatsWS.instances.length === 1, { label: "alpha client" });
+  queueDraft("alpha private held input");
+  tab("beta").click();
+  await settleUntil(() => FakeNatsWS.instances.length === 2, { label: "beta client" });
+  expect(heldDrafts()).toEqual([]);
+  queueDraft("beta private held input");
+  tab("alpha").click();
+  await settleUntil(() => FakeNatsWS.instances.length === 3, { label: "alpha return" });
+  expect(heldDrafts()).toEqual([expect.stringContaining("alpha private held input")]);
+  expect(byId("chat-lane").textContent).not.toContain("beta private held input");
+  for (let cycle = 0; cycle < 2; cycle++) {
+    pageEvent("pagehide");
+    pageEvent("pageshow");
+    await settleUntil(() => FakeNatsWS.instances.length === cycle + 4, { label: "BFCache restore" });
+    expect(heldDrafts()).toEqual([expect.stringContaining("alpha private held input")]);
+  }
+  tab("beta").click();
+  await settleUntil(() => FakeNatsWS.instances.length === 6, { label: "beta return" });
+  expect(heldDrafts()).toEqual([expect.stringContaining("beta private held input")]);
+  expect(composer().value).toBe("");
+});
+
+it.each(["logout", "different user", "different tenant", "revoked account"])("#395 discards held memory after %s", async change => {
+  await boot();
+  await settleUntil(() => FakeNatsWS.instances.length === 1, { label: "initial client" });
+  queueDraft("private held input");
+  tab("beta").click();
+  await settleUntil(() => FakeNatsWS.instances.length === 2, { label: "tab change" });
+  tab("alpha").click();
+  await settleUntil(() => FakeNatsWS.instances.length === 3, { label: "saved alpha" });
+  expect(heldDrafts()).toHaveLength(1);
+  if (change === "logout") {
+    byId<HTMLButtonElement>("logout").click();
+    await settleUntil(() => !byId<HTMLButtonElement>("login-btn").disabled, { label: "logout" });
+    byId<HTMLInputElement>("username").value = "alice";
+    byId<HTMLInputElement>("password").value = "demo";
+    byId<HTMLButtonElement>("login-btn").click();
+  } else {
+    pageEvent("pagehide");
+    if (change === "different user") me = { ...me, username: "bob" };
+    if (change === "different tenant") Object.assign(me, { tenant: "other-tenant" });
+    if (change === "revoked account") me = { ...me, accounts: { beta: accounts.beta } };
+    pageEvent("pageshow");
+  }
+  await settleUntil(() => FakeNatsWS.instances.length === 4, { label: "new scope" });
+  expect(heldDrafts()).toEqual([]);
+  expect(byId("chat-lane").textContent).not.toContain("private held input");
+  if (change === "revoked account") {
+    me = { ...me, accounts };
+    await poll();
+    tab("alpha").click();
+    await settleUntil(() => FakeNatsWS.instances.length === 5, { label: "regranted alpha" });
+    expect(heldDrafts()).toEqual([]);
+  }
+});
+
+it.each(["user", "tenant"])("#395 retires held memory when /me observes a different %s", async change => {
+  await boot();
+  await settleUntil(() => FakeNatsWS.instances.length === 1, { label: "initial client" });
+  queueDraft("old login's unsent text");
+  if (change === "user") me = { ...me, username: "bob" };
+  else Object.assign(me, { tenant: "other-tenant" });
+  await poll();
+  await settleUntil(() => FakeNatsWS.instances.length === 2, { label: "new identity client" });
+  expect(heldDrafts()).toEqual([]);
+  expect(byId("chat-lane").textContent).not.toContain("old login's unsent text");
+  expect(FakeNatsWS.instances[0].readyState).toBe(FakeNatsWS.CLOSED);
+});
