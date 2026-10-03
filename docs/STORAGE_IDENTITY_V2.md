@@ -42,9 +42,10 @@ For a refused account:
 5. Keep the archive offline. Do not edit the marker or copy old keys/history into
    the fresh tuple. There is no supported automatic issuer migration.
 
-The upgrade requires an operator maintenance window for existing stores. It does
-not reset browsers' existing history cursors; journal epoch recovery is tracked
-separately in #299. Core dispatch retirement policy remains unchanged (#426).
+The upgrade requires an operator maintenance window for existing stores. For
+browser cursor recovery after journal replacement, see
+[journal epoch recovery](GAP_SYNC.md). Core dispatch retirement policy remains
+unchanged (#426).
 
 ## 1. Logical storage scope
 

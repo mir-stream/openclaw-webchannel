@@ -21,8 +21,8 @@
  * supply no such proof. The exact-match gate requires the client/server change
  * together; this adds no capability negotiation or envelope/package version bump.
  *
- * Protocol 7 is unreleased: #398, #401 and #396 share this release contract.
- * All three ship in one paired client/plugin release.
+ * Protocol 7 is unreleased: #398, #401, #396, #413 and #414 share this contract.
+ * All ship in one paired client/plugin release.
  *
  * v7 (breaking, #398): an explicit `/stop` carries `cancel_pending`, the
  * earlier user messages that device has no server result for. The server must
@@ -52,6 +52,13 @@
  * without re-arming typing or holding user input. Ignoring the marker would
  * treat renewals as ordinary typing and queue followups after output or approval.
  * Both sides must upgrade together; no envelope/package bump or negotiation.
+ *
+ * v7 (breaking, #413/#414): journal `epoch` scopes sequence numbers and server
+ * row IDs on history, difference and live frames (including ACKs). A changed
+ * epoch requires a cold view/cursor reset before ID adoption. Incomplete cold
+ * snapshots seed their high-water; `history.omitted` identifies byte-omitted
+ * rows without replaying the journal from zero. Client/plugin ship together;
+ * ignoring epoch can hide new messages behind reused IDs after reset/restore.
  *
  * When to bump (#160)
  * ───────────────────

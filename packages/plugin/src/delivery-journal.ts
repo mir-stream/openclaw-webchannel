@@ -49,6 +49,7 @@
 import { createDispatchStore, type DispatchStore } from "./dispatch-store.js";
 import type { RequestState } from "../../client/src/durable-view-reducer.js";
 import { chmodSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 
 import { configureSqliteConnectionPragmas } from "openclaw/plugin-sdk/plugin-state-runtime";
@@ -214,6 +215,8 @@ export type DeliveryJournalRow = {
 };
 
 export interface DeliveryJournal {
+  /** Stable journal identity; absent only on injected legacy test adapters. */
+  readonly epoch?: string;
   /** Present on the production SQLite journal; absent only on legacy test adapters. */
   dispatch?: DispatchStore;
   /**
@@ -419,6 +422,7 @@ function openJournalConnection(
 ): {
   maintenance: ReturnType<typeof configureSqliteConnectionPragmas>;
   statements: JournalStatements;
+  epoch: string;
 } {
   // 3. chmod 0600 before anything can create the WAL sidecars. SQLite copies
   //    the MAIN database file's mode onto `-wal`/`-shm` when it creates them, so
@@ -632,6 +636,15 @@ function openJournalConnection(
         "ON CONFLICT DO NOTHING",
     ).run(DELIVERY_JOURNAL_SCHEMA_VERSION);
 
+    // New and pre-epoch databases use the same non-destructive upgrade. The
+    // primary key arbitrates concurrent opens; every reader takes the winner.
+    db.prepare("INSERT INTO journal_meta (key, value) VALUES ('epoch', ?) ON CONFLICT DO NOTHING")
+      .run(randomUUID());
+    const epoch = (db.prepare("SELECT value FROM journal_meta WHERE key = 'epoch'").get() as { value: string }).value;
+    if (typeof epoch !== "string" || epoch.length === 0 || epoch.length > 128) {
+      throw new Error("webchannel: invalid delivery journal epoch");
+    }
+
     // ── statements ──
     //
     // The seq allocation is per-CONVERSATION and runs INSIDE the append's
@@ -696,6 +709,7 @@ function openJournalConnection(
 
     return {
       maintenance,
+      epoch,
       statements: {
         selectNextSeq,
         selectMaxSeq,
@@ -883,6 +897,7 @@ export function openDeliveryJournal(options: {
   catch (error) { maintenance.close(); closeQuietly(db); throw error; }
   return {
     dispatch,
+    epoch: connection.epoch,
     historyPage(conversationId, plan, targetSeq) {
       if (closed) throw new Error("webchannel: delivery journal is closed");
       return history.page(conversationId, plan, targetSeq);

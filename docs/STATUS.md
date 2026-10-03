@@ -1,13 +1,15 @@
 # Project Status — single source of truth
 
-Security trust (#408, #411, #412): unknown JWT kids share one refresh and a
-30-second cooldown; failed/missing-key refreshes preserve fresh cached keys
-without extending their TTL. SaaS URLs require HTTPS except loopback HTTP
-(`localhost`, `127.0.0.0/8`, `::1`). Each tuple's history and conversation keys
-are bound to the effective JWT issuer by `storage-issuer.json`. Changed,
-unrecorded or invalid ownership refuses that account's startup. Existing
-unbound state requires explicit operator archiving and fresh initialization;
-doctor explains the exact paths. See [issuer binding](STORAGE_IDENTITY_V2.md#issuer-binding-412).
+Sync robustness (#413/#414): byte-incomplete cold snapshots seed their journal
+high-water immediately. Omitted row identities are exposed separately; older
+trimmed rows remain reachable by history paging, while genuine warm gaps still
+use ordered difference recovery. SQLite `journal_meta.epoch` persists across
+normal restart and scopes snapshots, differences and live frames/ACKs. Epoch
+changes cold-reset view, versions and pending recovery before adopting reused
+server IDs; unconfirmed local sends retain their receipt linkage. Pre-epoch
+journals acquire an ID without rewriting events. Backup restoration must renew
+that ID before startup. These wire semantics join unreleased protocol 7 and
+require paired client/plugin deployment. See [sync and restore](GAP_SYNC.md).
 
 P3 reply delivery (#415 C4/C7): inbound dispatch enables the SDK reply-prefix
 pipeline, including selected-model interpolation, for answers (reasoning stays
@@ -16,6 +18,15 @@ delivered no answer text now reports delivery failure through the existing
 durable turn settlement and client failure state, without inventing an
 assistant message.
 Text-bearing replies and intentional silence retain their previous behavior.
+
+Security trust (#408, #411, #412): unknown JWT kids share one refresh and a
+30-second cooldown; failed/missing-key refreshes preserve fresh cached keys
+without extending their TTL. SaaS URLs require HTTPS except loopback HTTP
+(`localhost`, `127.0.0.0/8`, `::1`). Each tuple's history and conversation keys
+are bound to the effective JWT issuer by `storage-issuer.json`. Changed,
+unrecorded or invalid ownership refuses that account's startup. Existing
+unbound state requires explicit operator archiving and fresh initialization;
+doctor explains the exact paths. See [issuer binding](STORAGE_IDENTITY_V2.md#issuer-binding-412).
 
 Quiet-turn liveness (#396): normal turns send an initial typing indicator and
 renew ephemeral `typing` with `keepalive: true` every 4 seconds until completion,
@@ -132,8 +143,8 @@ probes use real SQLite, NatsChannel, encryption and materialized/raw history.
 
 Round 3B (#346 + #342): history reconciles user sends by explicit random ID
 mappings and refreshes rows using journal modification sequences. Warm snapshots
-recover the retained gap before hydration; byte-trimmed cold snapshots recover
-from zero. Cursor and row-version state remain scoped to the in-memory view.
+recover the retained gap before hydration; byte-trimmed cold snapshots seed their
+high-water and track individual omissions (#413). Cursor and row-version state remain scoped to the in-memory view.
 Individually oversized difference events retain the existing skip policy (#343);
 this work does not recover content that cannot fit one difference frame.
 

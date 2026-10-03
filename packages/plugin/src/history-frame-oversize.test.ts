@@ -201,15 +201,9 @@ function harness(opts: {
     // The REAL channel, wrapped only to observe the boolean `history-serve.ts`
     // discards. Every byte still goes through `NatsChannel.sendHistory`.
     channel: {
-      sendHistory(
-        peerId: string,
-        messages: HistoryMessage[],
-        highWaterSeq?: number,
-        snapshotComplete?: boolean,
-        nonce?: string,
-      ): boolean {
-        servedFrames.push(messages);
-        const ok = channel.sendHistory(peerId, messages, highWaterSeq, snapshotComplete, nonce);
+      sendHistory(...args: Parameters<NatsChannel["sendHistory"]>): boolean {
+        servedFrames.push(args[1]);
+        const ok = channel.sendHistory(...args);
         sendHistoryResults.push(ok);
         return ok;
       },
@@ -691,7 +685,10 @@ describe("#311 — a row too big to send is SKIPPED, and the page spans across i
     h.server.sendSnapshot(PEER);
     h.flush();
 
-    const expected = { type: "history" as const, messages: [], highWaterSeq: 2, snapshotComplete: false };
+    const expected = { type: "history" as const, epoch: h.journal.epoch,
+      messages: [], highWaterSeq: 2, snapshotComplete: false,
+      omitted: [0, 1].map(i => ({ id: `r-big-${i}`, kind: "reasoning" as const, turnId: `turn-big-${i}`, seq: i + 1 })),
+    };
     expect(h.journal.maxSeq(PEER)).toBe(expected.highWaterSeq);
     expect(h.transport.payloads).toHaveLength(1);
     expect(openEnvelope(h.transport.payloads[0]!, h.sessionKey).message).toEqual(expected);

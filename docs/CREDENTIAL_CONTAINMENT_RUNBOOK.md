@@ -266,6 +266,12 @@ do not hand-edit or delete these files, and in particular **never delete
 once and is exactly the destructive, unauditable action step ④ exists to
 replace.
 
+A newly created journal receives a new epoch, so connected clients discard their
+old cursor and server-ID cache when they observe it. If an authorized recovery
+restores a journal backup instead, renew its epoch before gateway startup using
+[the journal restore procedure](GAP_SYNC.md#restoring-a-journal-backup).
+This does not make deletion reversible or authorize restoring forensic backups.
+
 ### 0.4 Keep secrets out of your incident record
 
 Nothing in this procedure requires you to print a key, a seed, or a JWT. The

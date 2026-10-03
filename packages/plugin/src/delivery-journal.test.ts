@@ -9,6 +9,7 @@
 import { createHook } from "node:async_hooks";
 import {
   chmodSync,
+  copyFileSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
@@ -74,6 +75,70 @@ const bubble = (answerId: string, text: string): JournalEvent => ({
 });
 
 describe("seq allocation", () => {
+  it.each(["", "x".repeat(129)])("#414: refuses an invalid stored epoch without rewriting history (%#)", (epoch) => {
+    const path = newJournalPath();
+    const journal = open(path);
+    journal.appendInboundUser("peer", { text: "retained", randomId: "origin" });
+    journal.close();
+    const db = new DatabaseSync(path);
+    try {
+      db.prepare("UPDATE journal_meta SET value = ? WHERE key = 'epoch'").run(epoch);
+      expect(() => openDeliveryJournal({ databasePath: path })).toThrow("invalid delivery journal epoch");
+      expect(db.prepare("SELECT value FROM journal_meta WHERE key = 'epoch'").get()).toEqual({ value: epoch });
+      expect(db.prepare("SELECT count(*) AS n FROM journal_event").get()).toEqual({ n: 1 });
+    } finally { db.close(); }
+  });
+
+  it("#414: retains the epoch across reopen and forks it when a backup is restored", () => {
+    const path = newJournalPath();
+    const backup = newJournalPath();
+    const journal = open(path);
+    journal.appendInboundUser("peer", { text: "before backup", randomId: "first" });
+    const epoch = journal.epoch;
+    journal.close();
+    mkdirSync(dirname(backup), { recursive: true });
+    copyFileSync(path, backup);
+    const restarted = open(path);
+    expect(restarted.epoch).toBe(epoch);
+    restarted.appendInboundUser("peer", { text: "after backup", randomId: "second" });
+    restarted.close();
+    copyFileSync(backup, path);
+    // The offline restore procedure drops only identity metadata. Opening the
+    // restored file mints a new epoch without resetting rows or idempotency.
+    const db = new DatabaseSync(path);
+    db.prepare("DELETE FROM journal_meta WHERE key = 'epoch'").run();
+    db.close();
+    const restored = open(path);
+    expect(restored.epoch).not.toBe(epoch);
+    expect(restored.maxSeq("peer")).toBe(1);
+    expect(restored.appendInboundUser("peer", { text: "new branch", randomId: "third" }))
+      .toMatchObject({ seq: 2, messageId: "webchannel-user-2" });
+    expect(restored.read("peer").map(row => row.event)).toMatchObject([
+      { text: "before backup" }, { text: "new branch" },
+    ]);
+  });
+
+  it("#414: gives new journals distinct epochs and adopts a legacy journal without changing its rows", () => {
+    const path = newJournalPath();
+    const journal = open(path);
+    const epoch = journal.epoch;
+    expect(epoch).toEqual(expect.any(String));
+    expect(epoch!.length).toBeGreaterThan(0);
+    journal.appendInboundUser("peer", { text: "legacy", randomId: "origin" });
+    const rows = journal.read("peer");
+    journal.close();
+    const db = new DatabaseSync(path);
+    db.prepare("DELETE FROM journal_meta WHERE key = 'epoch'").run();
+    db.close();
+    const upgraded = open(path);
+    expect(upgraded.epoch).toEqual(expect.any(String));
+    expect(upgraded.epoch).not.toBe(epoch);
+    expect(upgraded.read("peer")).toEqual(rows);
+    expect(upgraded.appendInboundUser("peer", { text: "legacy", randomId: "origin" }))
+      .toMatchObject({ seq: 1, inserted: false, messageId: "webchannel-user-1" });
+    expect(open(newJournalPath()).epoch).not.toBe(upgraded.epoch);
+  });
+
   it("numbers each conversation contiguously from 1, interleaved", () => {
     // The §16.2-6 phantom-gap property: a DB-global AUTOINCREMENT exposed to the
     // client as its gap-sync cursor makes conversation A see holes the moment

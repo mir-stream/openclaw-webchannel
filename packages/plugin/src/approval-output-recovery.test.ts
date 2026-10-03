@@ -122,7 +122,7 @@ describe("#381 production approval finalization with SQLite storage faults", () 
     expect(listPendingApprovalsForPeer(ACCOUNT, PEER)).toEqual([]);
     expect(listResolvedApprovalsForPeer(ACCOUNT, PEER)).toEqual([{ id: f.card.id, decision: "allow-once" }]);
     expect(f.journal.read(PEER).map(row => row.event.kind)).toEqual(kind === "approval" ? [] : ["approval"]);
-    expect(f.transport.published).toEqual([{ subject: `webchannel.tenant.${ACCOUNT}.${PEER}.out`, payload: { type: "approval_snapshot", approvals: [], resolved: [{ id: f.card.id, decision: "allow-once" }] } }]);
+    expect(f.transport.published).toEqual([{ subject: `webchannel.tenant.${ACCOUNT}.${PEER}.out`, payload: { type: "approval_snapshot", epoch: f.journal.epoch, approvals: [], resolved: [{ id: f.card.id, decision: "allow-once" }] } }]);
     f.history(); // Materialize the incomplete prefix before recovery.
     f.recover();
     await vi.advanceTimersByTimeAsync(60_000);
@@ -130,7 +130,7 @@ describe("#381 production approval finalization with SQLite storage faults", () 
     expect(f.journal.read(PEER).map(row => ("id" in row.event ? row.event.id : undefined))).toEqual([f.card.id, f.card.id]);
     expect(f.history()).toEqual([expect.objectContaining({ kind: "approval", id: f.card.id, resolvedDecision: "allow-once", prompt: "Original request" })]);
     expect(f.channel.getApprovalOutputRecoveryStatus()).toEqual({ pending: 0, exhausted: 0, abandoned: 0, retainedBytes: 0 });
-    expect(f.transport.published.at(-1)).toEqual({ subject: `webchannel.tenant.${ACCOUNT}.${PEER}.out`, payload: { type: "approval_resolved", id: f.card.id, decision: "allow-once", seq: 2 } });
+    expect(f.transport.published.at(-1)).toEqual({ subject: `webchannel.tenant.${ACCOUNT}.${PEER}.out`, payload: { type: "approval_resolved", epoch: f.journal.epoch, id: f.card.id, decision: "allow-once", seq: 2 } });
     expect(f.resolve.mock.calls.every(args => args[0] === ACCOUNT)).toBe(true);
   });
 
