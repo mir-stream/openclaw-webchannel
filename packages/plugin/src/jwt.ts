@@ -25,6 +25,8 @@
 
 import type { KeyResolver } from "./jwks.js";
 
+const MAX_BOOTSTRAP_LIFETIME_SEC = 60 * 60;
+
 /**
  * Constant-time string equality. XOR-accumulating byte differences across the
  * full length defeats timing oracles; if the lengths differ we still walk a
@@ -309,6 +311,13 @@ export async function verifyJwt(
   if (typeof exp !== "number" || !Number.isFinite(exp)) return null;
   const leeway = opts.clockSkewSec ?? 60;
   const now = Date.now() / 1000;
+  // Owner-approved bootstrap contract (#447): clock tolerance must not extend
+  // the issuer's lifetime allowance. Requiring iat also prevents a token with
+  // an unknown issuance date from borrowing an arbitrary future exp.
+  const iat = payload.iat;
+  if (typeof iat !== "number" || !Number.isFinite(iat)) return null;
+  if (exp <= iat || exp - iat > MAX_BOOTSTRAP_LIFETIME_SEC) return null;
+  if (iat > now + leeway) return null;
   // Preserve the existing whole-second expiry check (allowing leeway).
   if (Math.floor(now) >= exp + leeway) return null;
 

@@ -114,3 +114,15 @@ Telegram Bot API/MTProto 계약을 그대로 따르는 것이다.
 | 구현 상태 (2026-10-03) | 일반/제어 입력 앞의 gate, 암호화·크기 제한을 지키는 결과 프레임, client의 상관된 terminal send 상태 및 데모 안내로 구현. 이미 확정된 수락·취소·stop·convergence 영수증은 정책 변경 후에도 그대로 응답한다. 거부 자체는 새 durable 대화 행이나 영구 tombstone이 아니다. |
 | 재검토 | 서버 입장 정책과 실행 시점 권한 정책을 분리하는 제품 요구가 생길 때. |
 | 관련 | #442, #415 A5, #406, protocol 7 |
+
+### TD-E7. 브라우저 bootstrap JWT는 최대 1시간으로 제한한다
+
+| | |
+| --- | --- |
+| Telegram | 플러그인은 Bot API bot token을 사용하며, 브라우저 기기마다 SaaS bootstrap JWT의 `iat`/`exp`를 검증하는 단계가 없다(레퍼런스 `extensions/telegram/src/channel.ts`의 account/token 경로). |
+| WebChannel 목표 결정 | RS256 bootstrap JWT의 `iat`를 필수로 하고 `0 < exp−iat ≤ 3600초`를 검증한다. 미래 발급/만료의 clock skew는 수명 상한과 별도로 검사한다. SaaS builder·signer도 같은 상한을 지킨다. |
+| 의도 | 기기 등록에 쓰는 bearer 토큰의 노출 시간을 제한하고, 발급 시각을 모르는 토큰이나 무제한 수명을 허용하지 않는다. |
+| 결정 | 2026-10-02, 프로젝트 오너가 #415 제품 선택지 권장안 승인. |
+| 구현 상태 (2026-10-03) | #447 별도 PR에서 구현. 데모·레퍼런스·예제는 기존 5분 기본값을 유지한다. NATS 자체 credentials는 별도 계약이다. |
+| 재검토 | 신뢰하는 외부 IdP가 이 수명 계약을 지원하지 못하거나 다른 기기 등록 계약이 필요할 때. |
+| 관련 | #415 E7, #447 |
