@@ -1114,6 +1114,7 @@ export async function handleInboundMessage(
     accountId,
     config: channelConfig as DmSecurityConfig,
     sendPairingReply: async (text) => {
+      if (options?.dispatchAbortSignal?.aborted) return;
       if (!transport.sendText(wsKey, text, nextMessageId())) throw new Error("webchannel: pairing challenge delivery failed");
     },
   });

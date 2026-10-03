@@ -53,6 +53,8 @@ import {
 import { getProcessIngressOutcomeStore } from "./ingress-outcome.js";
 import { BoundedOverflowResolver, type OverflowResolutionRequest } from "./inbound-overflow-resolver.js";
 import { createIngressDebounceCallbacks } from "./ingress-debounce-callbacks.js";
+import { createIngressPolicyGate } from "./ingress-policy.js";
+import { createDmIngressPolicy } from "./dm-allowlist.js";
 import { InboundPressureLogger } from "./inbound-pressure-log.js";
 import { isControlLaneMessage, shouldDropBufferedInputOnStop } from "./control-lane.js";
 import { resolveCommandGate } from "./command-gate.js";
@@ -1099,6 +1101,10 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // accountId, so inbound turns resolve THIS account's route (binding.account)
       // and replies deliver back over THIS account's channel.
       if (!deliveryJournal?.dispatch) throw new Error("webchannel: durable dispatch store required");
+      const inboundDebounceMs = resolveInboundDebounceMs({
+        cfg: api.config,
+        channel: WEBCHANNEL_ID,
+      });
       dispatchRecovery = createDispatchRecovery({
         store: deliveryJournal.dispatch,
         handler: (peerId, message, onSettled, ownership) => handleInboundMessage(api, channel, peerId, message, accountId, tenant, {
@@ -1112,27 +1118,13 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         notify: (change) => { channel.sendRequestState(change); },
         isActive: () => runtimeActive,
         warn: (error) => api.logger?.warn?.(`webchannel: dispatch recovery failed: ${logSafe(error)}`),
-        dispatcherOptions: { budget: processInboundRetention, sessionToken },
+        dispatcherOptions: { budget: processInboundRetention, sessionToken, debounceMs: inboundDebounceMs },
       });
       inboundDispatcher = dispatchRecovery.dispatcher;
 
-      // P1-8b layer (a): repo-owned bounded idle pre-run debounce (Telegram
-      // parity). It replaces core's unbounded primitive and sits IN FRONT of the
-      // per-session FIFO: rapid
-      // same-peer messages within the debounce window flush together as ONE
-      // merged turn. `resolveInboundDebounceMs` reads the GLOBAL config
-      // (`messages.inbound.byChannel.webchannel ?? messages.inbound.debounceMs ??
-      // 0`) — resolved ONCE here per account. The core default is 0ms, which makes
-      // this layer inert (each message flushes immediately) unless an operator
-      // opts in; layer (b) still coalesces busy-time regardless. We keep that
-      // default (do NOT invent a nonzero one). Items carry `peerId` so `buildKey`
-      // and `onFlush` can route; one explicit bounded worker owns each same-key
-      // sequence. Forced retirement severs queued batch captures, while a callback
-      // that already began keeps its copied entries charged until settlement.
-      const inboundDebounceMs = resolveInboundDebounceMs({
-        cfg: api.config,
-        channel: WEBCHANNEL_ID,
-      });
+      // The bounded ingress worker persists each input and emits its receipt
+      // immediately. Only execution waits for the configured fixed window;
+      // dispatch retains the shared budget until the accepted work starts.
       const onIngressFlush = createIngressOnFlush<DebounceItem>({
         accountId,
         storageScope,
@@ -1157,7 +1149,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         isActive: () => runtimeActive,
       });
       inboundDebouncer = createBoundedInboundDebouncer<DebounceItem>({
-        debounceMs: inboundDebounceMs,
+        debounceMs: 0,
         buildKey: (item) => item.peerId,
         sessionToken: (peerId) => sessionToken(peerId),
         budget: processInboundRetention,
@@ -1236,6 +1228,22 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           return operation;
         },
       });
+      const dmIngressPolicy = createDmIngressPolicy({
+        accountId,
+        config: account,
+        isActive: () => runtimeActive,
+        sendPairingReply: async (peerId, text) => {
+          if (!channel.sendText(peerId, text, nextMessageId())) throw new Error("webchannel: pairing challenge delivery failed");
+        },
+        warn: (error) => api.logger?.warn?.(`webchannel: ingress pairing failed: ${logSafe(error)}`),
+      });
+      const admitInbound = createIngressPolicyGate({
+        journal: deliveryJournal,
+        ...dmIngressPolicy,
+        sendRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids, "policy-denied"),
+        sendAck: (peerId, ids, committed, cancelled, unaccepted) => channel.sendAck(peerId, ids, committed, cancelled, unaccepted),
+        warn: (error) => api.logger?.warn?.(`webchannel: ingress policy receipt failed: ${logSafe(error)}`),
+      });
       channel.setMessageHandler((peerId, rawMessage) => {
         if (!runtimeActive) return;
         if (rawMessage.type !== "user_message") return; // approvals routed below
@@ -1261,6 +1269,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         // ack, not the debouncer — may see the raw frame, and that guard counts
         // the reads above this line, so do not add one.
         const message: WebchannelUserMessage = normalizeInboundUserMessage(rawMessage);
+        if (!admitInbound({ peerId, message })) return;
         // Control receipts and exact cancellation targets commit together before
         // ACK. A replay returns that receipt without invoking core or clearing
         // input accepted after the original stop.

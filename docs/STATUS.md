@@ -5,7 +5,9 @@ disabled` semantics. The default remains `open` (TD-1), requiring an explicit
 `allowFrom: ["*"]`; setup writes both and preserves existing restrictions on
 re-enrollment. `disabled` rejects every sender including allowlisted peers.
 Allowlist matching honors `*` and `webchannel:` prefixes while preserving peer
-case. Pairing uses the SDK's account-scoped approval store and challenge flow.
+case. Pairing reads the SDK's account-scoped approval store before normal/control
+ingress admission. Fresh denials can issue SDK challenges through bounded,
+per-peer coalesced work; receipt replays never initiate a new pairing request.
 Manifest validation checks inherited account policy/allowlist combinations;
 runtime independently refuses invalid account configuration. Core security audit
 reports the same policy and real fix paths. Doctor guides migration from legacy
@@ -35,6 +37,20 @@ server IDs; unconfirmed local sends retain their receipt linkage. Pre-epoch
 journals acquire an ID without rewriting events. Backup restoration must renew
 that ID before startup. These wire semantics join unreleased protocol 7 and
 require paired client/plugin deployment. See [sync and restore](GAP_SYNC.md).
+
+Messaging policy gates new normal/control input before retention, acceptance,
+ACK and broadcast (#442). A denied request receives only an encrypted correlated
+`inbound_rejected{reason:"policy-denied"}`; the client retires its replay and
+shows the generic failure. Exact earlier user/control/cancellation/convergence
+receipts remain authoritative after policy changes. This is part of unreleased
+protocol 7 and requires client/plugin lockstep. DM policy interpretation remains
+owned by #406; this change moves its existing result to the admission boundary.
+
+Inbound acceptance precedes execution debounce (#441): each input receives its
+durable server ID, multi-device broadcast and ACK immediately after admission.
+Only execution waits for the configured fixed window, with the same retained
+count/byte budget. `/stop` cancels those accepted queued rows without declaring
+them unaccepted; restart recovers proven unstarted work with the original IDs.
 
 P3 reply delivery (#415 C4/C7): inbound dispatch enables the SDK reply-prefix
 pipeline, including selected-model interpolation, for answers (reasoning stays
@@ -78,7 +94,7 @@ History correlation was introduced in protocol 7.
 
 `/stop` cancellation (review R1/R2): control receipts and exact cancellation targets
 now commit together in the tenant/account SQLite journal before ACK. This includes
-debounce entries not yet accepted, the pending overflow-only ID, durable queued work and the current started
+ingress entries not yet accepted, the pending overflow-only ID, durable queued work and the current started
 request. Original input replays stay suppressed across restart; replaying an
 accepted stop returns its receipt without aborting later work. New dispatch waits
 for the first live core abort to settle, including across account replacement.

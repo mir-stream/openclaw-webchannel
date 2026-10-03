@@ -907,6 +907,22 @@
         }
       },
       "uiHints": {
+        "nats.credentials.userJwt": {
+          "label": "NATS user JWT",
+          "sensitive": true
+        },
+        "nats.credentials.userSeed": {
+          "label": "NATS user seed",
+          "sensitive": true
+        },
+        "accounts.*.nats.credentials.userJwt": {
+          "label": "NATS user JWT",
+          "sensitive": true
+        },
+        "accounts.*.nats.credentials.userSeed": {
+          "label": "NATS user seed",
+          "sensitive": true
+        },
         "auth.strategy": {
           "label": "Auth strategy",
           "help": "Browser connections require JWT verification plus Proof-of-Possession over the authenticated NATS register hop. anonymous is removed and causes a targeted startup migration error."

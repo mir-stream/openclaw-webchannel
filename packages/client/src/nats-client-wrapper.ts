@@ -3612,7 +3612,9 @@ export class WebChannelNATSClient {
         // so the next settle sweeps them as part of its prefix — bounded, the
         // same way the control-lane residual is bounded.
         //
-        // `overloaded` is the only reason we treat as clearing that bar — as the
+        // `policy-denied` is a pre-acceptance refusal with no turn to settle.
+        // The server preserves earlier receipts instead of rejecting replays.
+        // `overloaded` also clears that bar — as the
         // best available PROXY for non-delivery, not as proof of it. The common
         // case is an ingress rejection before any turn was dispatched, and closing
         // immediately is worth having. But the agent can also reject a message it
@@ -3639,7 +3641,7 @@ export class WebChannelNATSClient {
         // reach an open turn, so neither is a turn-closing mechanism.)
         const turnClosed = cancelledTurnClosed || (
           next.state === "failed"
-          && next.failure?.reason === "overloaded"
+          && (next.failure?.reason === "overloaded" || next.failure?.reason === "policy-denied")
           && this.closeTurn(rec.wireId));
         if (next.state === "completed" || next.state === "interrupted" || next.state === "failed") {
           if (rec.wireId) {
@@ -3767,9 +3769,55 @@ export class WebChannelNATSClient {
   // Message handling
   // ---------------------------------------------------------------------------
 
+  /** Record one exact local send's durable identity without folding or adopting it. */
+  private observeDurableUserEvidence(randomId: string): void {
+    const receiptKey = this.randomIdToReceiptKey.get(randomId);
+    const receipt = receiptKey === undefined ? undefined : this.receipts.get(receiptKey);
+    if (receipt?.wireId !== undefined) this.client.recordDurableAdoption(receipt.wireId, randomId);
+  }
+
+  /**
+   * Observe all validated durable user rows in one accepted inbound frame before
+   * ordered buffering or any reducer callback. Difference bodies retain their
+   * existing per-event decoder and request-correlation boundary; history mapping
+   * remains valid independently of whether this device folds the page.
+   */
+  private observeDurableAcceptanceEvidence(msg: InboundMessage): void {
+    if (msg.type === "user_committed") {
+      if (typeof msg.random_id === "string" && msg.random_id.length > 0) {
+        this.observeDurableUserEvidence(msg.random_id);
+      }
+      return;
+    }
+    if (msg.type === "history") {
+      for (const row of Array.isArray(msg.messages) ? msg.messages : []) {
+        if (row && row.kind === undefined && row.role === "user" && typeof row.id === "string"
+          && row.id.length > 0 && typeof row.text === "string"
+          && typeof row.randomId === "string" && row.randomId.length > 0) {
+          this.observeDurableUserEvidence(row.randomId);
+        }
+      }
+      return;
+    }
+    if (msg.type !== "difference" || this.cursor.state !== "catching-up"
+      || msg.nonce !== this.cursor.nonce || msg.afterSeq !== this.cursor.afterSeq) return;
+    for (const entry of Array.isArray(msg.events) ? msg.events : []) {
+      if (!entry || typeof entry !== "object" || !isWireSeq((entry as { seq?: unknown }).seq)) continue;
+      const decoded = decodeDurableEvent((entry as { event?: unknown }).event);
+      if (decoded.ok && decoded.event.kind === "user"
+        && typeof decoded.event.randomId === "string" && decoded.event.randomId.length > 0) {
+        this.observeDurableUserEvidence(decoded.event.randomId);
+      }
+    }
+  }
+
   /** Epoch belongs to the journal, not the transport session or numeric cursor. */
   private observeJournalEpoch(msg: InboundMessage): "ignore" | "current" | "recover" {
-    if (msg.epoch === undefined) return this.journalEpoch === undefined ? "current" : "ignore";
+    if (msg.epoch === undefined) {
+      if (this.journalEpoch !== undefined) return "ignore";
+      this.observeDurableAcceptanceEvidence(msg);
+      return "current";
+    }
     if (this.retiredJournalEpochs.has(msg.epoch)) return "ignore";
     // Correlation precedes epoch adoption: shared-subject replies to another
     // device (or an earlier request) cannot invalidate this device's cache.
@@ -3778,11 +3826,23 @@ export class WebChannelNATSClient {
     if (msg.type === "history" && msg.highWaterSeq === undefined
       && (msg.nonce === undefined || !this.historyPageNonces.includes(msg.nonce))
       && msg.epoch !== this.journalEpoch) return "ignore";
-    if (msg.epoch === this.journalEpoch) return "current";
+    if (msg.epoch === this.journalEpoch) {
+      this.observeDurableAcceptanceEvidence(msg);
+      return "current";
+    }
     const prior = this.journalEpoch;
     this.journalEpoch = msg.epoch;
-    if (prior === undefined && this.cursor.state === "unseeded") return "current";
+    if (prior === undefined && this.cursor.state === "unseeded") {
+      this.observeDurableAcceptanceEvidence(msg);
+      return "current";
+    }
     if (prior !== undefined) this.retiredJournalEpochs.add(prior);
+
+    // Durable adoption proves acceptance only inside the journal that authored
+    // the row. Clear it before any reset callout or low-level result side effect
+    // so an old-epoch echo cannot suppress a valid new-epoch refusal.
+    this.client.clearDurableAdoptions();
+    this.observeDurableAcceptanceEvidence(msg);
 
     // Keep unpublished/unconfirmed local sends and their receipt linkage. A new
     // epoch's ACK may be the very first frame, before its snapshot/broadcast.
@@ -5242,7 +5302,7 @@ export class WebChannelNATSClient {
 
       case "inbound_rejected": {
         // The low-level client has already removed ledger entries and emitted
-        // failed{overloaded}; receipt/bubble state arrives through onSendState.
+        // failed{overloaded|policy-denied}; receipt/bubble state arrives through onSendState.
         return true;
       }
 

@@ -62,6 +62,11 @@
   Warm differences and the existing individually oversized-row skip policy
   remain in force; this does not implement #325 body chunking or #299 retention.
 
+- Messaging policy now rejects new inputs before acceptance, broadcast or
+  dispatch. The originating client shows a generic `policy-denied` failure
+  without exposing allowlist configuration. This extends unreleased protocol 7
+  and requires client/plugin lockstep; existing receipts still replay (#442).
+
 ### Security trust (#408, #411, #412)
 
 - Unknown JWT kids can trigger at most one shared JWKS refresh per 30 seconds.
@@ -82,11 +87,24 @@
 
 ### Changed
 
+- Inbound debounce now delays execution only. Durable acceptance, ACK and
+  multi-device echo precede the fixed execution window, while bounded retention,
+  cancellation and restart recovery keep their existing contracts (#441).
+
 - Bootstrap JWTs now require finite `iat < exp` and a lifetime of at most one
   hour (#447). Clock skew applies to issuance/expiry checks, not the lifetime
   bound. SaaS claim builders and signers enforce the same cap; first-party
   demo/reference/example issuers keep their existing five-minute default.
   External issuers must supply `iat` and shorten longer-lived tokens.
+
+- Inline NATS user JWTs and seeds now carry sensitive config hints for both
+  flat and named accounts. Core config/UI responses mask them; inline parsing
+  remains compatible and SecretRef resolution is deferred (#443, #415 D7).
+
+- Demo held/queued input survives account tabs, re-authentication and BFCache
+  in login/account-scoped memory. Replaced connections show recoverable unsent
+  drafts without automatic resend; logout clears them. Reload persistence
+  remains #368 (#395, #415 F7).
 
 - Browser receive doors now reject replayed envelopes, timestamps outside ±10 minutes,
   and mismatched tenant/account/peer routing (#415 E4). The 16,384-ID cache survives

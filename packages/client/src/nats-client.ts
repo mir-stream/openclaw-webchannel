@@ -227,7 +227,7 @@ export type InboundMessage = {
    */
   committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: boolean }>;
   /**
-   * `"overloaded"` on `inbound_rejected`; on `approval_decision_rejected` (#400)
+   * `"overloaded" | "policy-denied"` on `inbound_rejected`; on `approval_decision_rejected` (#400)
    * one of `"not-approver" | "not-pending"` today, and any
    * other non-empty string from a newer plugin.
    */
@@ -1415,6 +1415,8 @@ export class WebChannelNatsClient {
     failure?: SendFailure;
     lastAttemptAt?: number;
     ingressCancelled?: boolean;
+    /** Exact durable-row evidence for this send in the wrapper's current journal epoch. */
+    durablyAdopted?: boolean;
   }>();
   /** Mirrors the plugin's `MAX_STOP_PENDING_INPUTS`; the oldest names win. */
   private static readonly MAX_STOP_PENDING = 256;
@@ -1792,6 +1794,26 @@ export class WebChannelNatsClient {
       || [...this.unackedLedger.values()].some((entry) => owns(entry.message));
   }
 
+  /**
+   * @internal Record that the wrapper adopted the exact pending send from a
+   * durable row in its current journal epoch. This is refusal-ordering evidence
+   * only: replay ownership and receipt state remain unchanged until a real ACK.
+   */
+  recordDurableAdoption(id: string, randomId: string): void {
+    const owns = (message: OutboundMessage) => message.type === "user_message"
+      && message.id === id && message.random_id === randomId;
+    const ledgerMessage = this.unackedLedger.get(id)?.message;
+    const pending = this.outboundQueue.some(owns)
+      || (ledgerMessage !== undefined && owns(ledgerMessage));
+    const entry = this.sendTracker.get(id);
+    if (pending && entry && entry.state !== "failed") entry.durablyAdopted = true;
+  }
+
+  /** @internal Durable-row evidence is scoped to one wrapper-owned journal epoch. */
+  clearDurableAdoptions(): void {
+    for (const entry of this.sendTracker.values()) entry.durablyAdopted = false;
+  }
+
   /** Add connection state listener. */
   onState(listener: StateListener): () => void {
     return this.client.onState(listener);
@@ -2018,8 +2040,8 @@ export class WebChannelNatsClient {
   private deliverInbound(msg: InboundMessage): void {
     if (this.inboundMessageGate?.(msg) === false) return;
     if (msg.type === "ack") this.drainAcked(msg.ids, msg.cancelled);
-    if (msg.type === "inbound_rejected" && msg.reason === "overloaded") {
-      this.drainRejected(msg.ids);
+    if (msg.type === "inbound_rejected" && (msg.reason === "overloaded" || msg.reason === "policy-denied")) {
+      this.drainRejected(msg.ids, msg.reason);
     }
     this.notifyMessageListeners(msg);
   }
@@ -2045,12 +2067,22 @@ export class WebChannelNatsClient {
     });
   }
 
-  private drainRejected(ids?: string[]): void {
+  private drainRejected(ids: string[] | undefined, reason: "overloaded" | "policy-denied"): void {
     if (!ids) return;
-    this.drainOwnedResult([...new Set(ids)], (id) => {
+    const pending = (id: string) => {
+      const entry = this.sendTracker.get(id);
+      return (entry?.state === "queued" || entry?.state === "sent")
+        && entry.durablyAdopted !== true;
+    };
+    // A delayed per-attempt policy refusal cannot override either an ACK or the
+    // current journal epoch's exact durable adoption. Filter before detaching
+    // ledger ownership, then recheck after callouts too.
+    const candidates = [...new Set(ids)].filter(id => reason !== "policy-denied" || pending(id));
+    this.drainOwnedResult(candidates, (id) => {
+      if (reason === "policy-denied" && !pending(id)) return;
       this.trackerFail(id, {
-        reason: "overloaded",
-        retryable: true,
+        reason,
+        retryable: reason === "overloaded",
         lastAttemptAt: this.sendTracker.get(id)?.lastAttemptAt,
       });
     });

@@ -599,6 +599,7 @@ describe("nats-account-runtime.ts wiring contract — #99 inbound frame normaliz
     // Guard first: a missing statement makes `indexOf` -1, which is "before"
     // everything and would let this ordering check pass vacuously.
     expect(NORMALIZE).toBeGreaterThan(HANDLER_START);
+    expect(NORMALIZE).toBeLessThan(RUNTIME_SOURCE.indexOf("if (!admitInbound({ peerId, message })) return;"));
     expect(NORMALIZE).toBeLessThan(RUNTIME_SOURCE.indexOf("isControlLaneMessage(message)"));
     expect(NORMALIZE).toBeLessThan(RUNTIME_SOURCE.indexOf("stopControl!.handle({ peerId, message }"));
     expect(NORMALIZE).toBeLessThan(RUNTIME_SOURCE.indexOf(".enqueue({ peerId, message })"));

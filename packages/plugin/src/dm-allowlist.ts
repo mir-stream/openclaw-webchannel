@@ -1,6 +1,6 @@
 /** DM policy shared by runtime admission, schema diagnostics and core audit. */
 import type { DmPolicy } from "openclaw/plugin-sdk/config-contracts";
-import { createChannelPairingChallengeIssuer, readChannelAllowFromStore } from "openclaw/plugin-sdk/channel-pairing";
+import { createChannelPairingChallengeIssuer, readChannelAllowFromStore, readChannelAllowFromStoreSync } from "openclaw/plugin-sdk/channel-pairing";
 import { upsertChannelPairingRequest } from "openclaw/plugin-sdk/conversation-runtime";
 
 export type DmSecurityConfig = {
@@ -70,6 +70,61 @@ export function resolveDmAdmission(peerId: string, cfg: DmSecurityConfig | undef
   return { allowed: false, reason: allow.length ? "not-allowlisted" : "default-deny-empty-allowlist" };
 }
 
+function pairingIssuer(accountId: string, upsert = upsertChannelPairingRequest) {
+  return createChannelPairingChallengeIssuer({
+    channel: "webchannel", accountId,
+    upsertPairingRequest: params => upsert({ ...params, channel: "webchannel", accountId }),
+  });
+}
+
+/** Bound pre-retention work across distinct peers as well as duplicate attempts. */
+export const MAX_INGRESS_PAIRING_CHALLENGES = 8;
+
+/** Synchronous admission; only a proven fresh refusal may start SDK pairing. */
+export function createDmIngressPolicy(input: {
+  accountId: string;
+  config: DmSecurityConfig;
+  isActive(): boolean;
+  sendPairingReply(peerId: string, text: string): Promise<void>;
+  warn(error: unknown): void;
+  readStore?: typeof readChannelAllowFromStoreSync;
+  upsertPairingRequest?: typeof upsertChannelPairingRequest;
+}) {
+  const pending = new Set<string>();
+  const issue = pairingIssuer(input.accountId, input.upsertPairingRequest);
+  const warn = (error: unknown) => {
+    if (input.isActive()) { try { input.warn(error); } catch { /* diagnostics */ } }
+  };
+  const isAllowed = (peerId: string): boolean => {
+    if (!input.isActive()) return false;
+    const configured = resolveDmAdmission(peerId, input.config);
+    if (configured.reason !== "pairing-required") return configured.allowed;
+    return resolveDmAdmission(peerId, input.config,
+      (input.readStore ?? readChannelAllowFromStoreSync)("webchannel", process.env, input.accountId)).allowed;
+  };
+  return {
+    isAllowed,
+    onFreshDenied(peerId: string): void {
+      if (!input.isActive() || resolveDmAdmission(peerId, input.config).reason !== "pairing-required"
+        || pending.has(peerId) || pending.size >= MAX_INGRESS_PAIRING_CHALLENGES) return;
+      pending.add(peerId);
+      // Capture only the peer, never raw input. There is no waiting queue when
+      // full: a later fresh attempt can try again under the SDK's own limits.
+      void Promise.resolve().then(async () => {
+        if (!input.isActive() || isAllowed(peerId)) return;
+        await issue({
+          senderId: peerId, senderIdLine: `Your WebChannel user id: ${peerId}`,
+          sendPairingReply: async text => {
+            if (!input.isActive()) return;
+            await input.sendPairingReply(peerId, text);
+          },
+          onReplyError: warn,
+        });
+      }).catch(warn).finally(() => { pending.delete(peerId); });
+    },
+  };
+}
+
 /** SDK-owned challenge issuance keeps pending-request limits and code semantics. */
 export async function enforceDmAdmission(input: {
   peerId: string;
@@ -87,12 +142,9 @@ export async function enforceDmAdmission(input: {
     : [];
   const admission = resolveDmAdmission(input.peerId, input.config, store);
   if (admission.reason === "pairing-required") {
-    await createChannelPairingChallengeIssuer({
-      channel: "webchannel", accountId: input.accountId,
-      upsertPairingRequest: params => (input.upsertPairingRequest ?? upsertChannelPairingRequest)({
-        ...params, channel: "webchannel", accountId: input.accountId,
-      }),
-    })({ senderId: input.peerId, senderIdLine: `Your WebChannel user id: ${input.peerId}`, sendPairingReply: input.sendPairingReply });
+    await pairingIssuer(input.accountId, input.upsertPairingRequest)({
+      senderId: input.peerId, senderIdLine: `Your WebChannel user id: ${input.peerId}`, sendPairingReply: input.sendPairingReply,
+    });
   }
   return admission;
 }

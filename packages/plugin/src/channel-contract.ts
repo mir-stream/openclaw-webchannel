@@ -2,6 +2,7 @@ import type { RequestState } from "../../client/src/durable-view-reducer.js";
 import type { HistoryOmission } from "../../client/src/types.js";
 import { ANON_PEER_ID } from "./auth.js";
 import type { CommandCatalogEntry } from "./commands-catalog.js";
+import type { IngressRejectionReason } from "./ingress-result-chunks.js";
 // #244 half B: the `difference` frame carries RAW journal events for the client
 // to fold onto the view it already holds — so it is typed by the client reducer's
 // `DurableEvent`, the SAME type the journal stores (`delivery-journal-event.ts`'s
@@ -690,7 +691,7 @@ export type OutboundWsMessage = { epoch?: string } & (
        */
       committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>;
     }
-  | { type: "inbound_rejected"; ids: string[]; reason: "overloaded" }
+  | { type: "inbound_rejected"; ids: string[]; reason: IngressRejectionReason }
   /**
    * #245 Part B (doc §16.2-8, the Telegram multi-device model): the immediate
    * BROADCAST of a just-committed inbound USER message to ALL of the account's
@@ -986,7 +987,7 @@ export interface WebChannelPeerChannel {
     cancelled?: string[],
     unaccepted?: string[],
   ): boolean;
-  sendInboundRejected?(peerId: string, ids: string[]): boolean;
+  sendInboundRejected?(peerId: string, ids: string[], reason?: IngressRejectionReason): boolean;
 }
 
 export class NullPeerChannel implements WebChannelPeerChannel {
@@ -1011,5 +1012,5 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision, options?: ApprovalResolutionSendOptions): ApprovalResolutionSendResult { options?.onClaim?.(); return { accepted: true, delivered: false, journaled: false, status: "unavailable" }; }
   sendApprovalSnapshot(_peerId: string, _approvals: ApprovalRequestPayload[], _resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean { return false; }
   sendAck(_peerId: string, ids: string[], _committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>, _cancelled?: string[], _unaccepted?: string[]): boolean { return ids.length === 0; }
-  sendInboundRejected(_peerId: string, ids: string[]): boolean { return ids.length === 0; }
+  sendInboundRejected(_peerId: string, ids: string[], _reason?: IngressRejectionReason): boolean { return ids.length === 0; }
 }

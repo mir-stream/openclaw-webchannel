@@ -2,11 +2,19 @@
 
 ## Unreleased
 
+- Inbound debounce now delays execution only. Durable acceptance, ACK and
+  multi-device echo precede the fixed execution window, while bounded retention,
+  cancellation and restart recovery keep their existing contracts (#441).
+
 - Bootstrap JWTs now require finite `iat < exp` and a lifetime of at most one
   hour (#447). Clock skew applies to issuance/expiry checks, not the lifetime
   bound. SaaS claim builders and signers enforce the same cap; first-party
   demo/reference/example issuers keep their existing five-minute default.
   External issuers must supply `iat` and shorten longer-lived tokens.
+
+- Inline NATS user JWTs and seeds now carry sensitive config hints for both
+  flat and named accounts. Core config/UI responses mask them; inline parsing
+  remains compatible and SecretRef resolution is deferred (#443, #415 D7).
 
 ### Changed
 
@@ -51,10 +59,15 @@
 
 Gateway plugin and browser client require a paired upgrade to protocol 7
 (protocol 6 was never released); the exact-match register gate refuses every
-other version. Protocol 7 is unreleased; #396 joins scoped stop and history
+other version. Protocol 7 is unreleased; #396 and #442 join scoped stop and history
 correlation in the same release contract. One reason per bullet, matching
 `protocol.ts`:
 
+- **v7 — pre-admission policy refusal (#442).** `inbound_rejected` adds
+  `reason: "policy-denied"`. The client retires only the matching pending send,
+  displays a generic non-retryable policy failure and stops replaying it.
+  Existing accepted/cancelled receipts remain authoritative. No allowlist
+  configuration is exposed; paired client/plugin deployment is required.
 - **v7 — liveness-only typing renewals (#396).** Periodic `typing.keepalive`
   frames refresh application watches without re-arming typing or holding
   followups after output or approval. Ignoring the marker would queue those inputs.
