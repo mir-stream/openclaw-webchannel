@@ -2557,3 +2557,40 @@ describe("#349 — replay placements preserve order without inventing live activ
     }
   });
 });
+
+it("#442 correlates policy denial, retires its turn and never retries or changes another receipt", async () => {
+  const h = await connectWrapper({ ack: false });
+  try {
+    const receipt = h.wrapper.send("policy denied")!;
+    await settle();
+    const id = userBubble(h.wrapper, "policy denied")!.wireId!;
+    expect(h.wrapper.getState().turnActive).toBe(true);
+    deliverOut(h.K, { type: "inbound_rejected", ids: ["other-device"], reason: "policy-denied" });
+    await settle();
+    expect(receipt.snapshot().state).toBe("sent");
+    deliverOut(h.K, { type: "inbound_rejected", ids: [id], reason: "policy-denied" });
+    await settle();
+    expect(receipt.snapshot()).toMatchObject({ state: "failed", failure: { reason: "policy-denied", retryable: false } });
+    expect(userBubble(h.wrapper, "policy denied")).toMatchObject({ sendState: "failed", sendFailure: { reason: "policy-denied" } });
+    expect(h.wrapper.getState().turnActive).toBe(false);
+    deliverOut(h.K, { type: "ack", ids: [id] });
+    await settle();
+    expect(receipt.snapshot().state).toBe("failed");
+    expect(h.received).toEqual([id]);
+    expect(h.wrapper.getState().status).toBe("connected");
+  } finally { h.wrapper.close(); }
+});
+
+it("#442 late policy refusal cannot downgrade an already accepted receipt", async () => {
+  const h = await connectWrapper();
+  try {
+    const receipt = h.wrapper.send("accepted before late refusal")!;
+    await settle();
+    const id = userBubble(h.wrapper, "accepted before late refusal")!.wireId!;
+    expect(receipt.snapshot().state).toBe("accepted");
+    deliverOut(h.K, { type: "inbound_rejected", ids: [id], reason: "policy-denied" });
+    await settle();
+    expect(receipt.snapshot().state).toBe("accepted");
+    expect(h.wrapper.getState().turnActive).toBe(true);
+  } finally { h.wrapper.close(); }
+});

@@ -227,7 +227,7 @@ export type InboundMessage = {
    */
   committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: boolean }>;
   /**
-   * `"overloaded"` on `inbound_rejected`; on `approval_decision_rejected` (#400)
+   * `"overloaded" | "policy-denied"` on `inbound_rejected`; on `approval_decision_rejected` (#400)
    * one of `"not-approver" | "not-pending"` today, and any
    * other non-empty string from a newer plugin.
    */
@@ -2018,8 +2018,8 @@ export class WebChannelNatsClient {
   private deliverInbound(msg: InboundMessage): void {
     if (this.inboundMessageGate?.(msg) === false) return;
     if (msg.type === "ack") this.drainAcked(msg.ids, msg.cancelled);
-    if (msg.type === "inbound_rejected" && msg.reason === "overloaded") {
-      this.drainRejected(msg.ids);
+    if (msg.type === "inbound_rejected" && (msg.reason === "overloaded" || msg.reason === "policy-denied")) {
+      this.drainRejected(msg.ids, msg.reason);
     }
     this.notifyMessageListeners(msg);
   }
@@ -2045,12 +2045,20 @@ export class WebChannelNatsClient {
     });
   }
 
-  private drainRejected(ids?: string[]): void {
+  private drainRejected(ids: string[] | undefined, reason: "overloaded" | "policy-denied"): void {
     if (!ids) return;
-    this.drainOwnedResult([...new Set(ids)], (id) => {
+    const pending = (id: string) => {
+      const state = this.sendTracker.get(id)?.state;
+      return state === "queued" || state === "sent";
+    };
+    // A delayed per-attempt refusal cannot override proven acceptance. Recheck
+    // after callouts too: another receipt callback may have accepted this ID.
+    const candidates = [...new Set(ids)].filter(id => reason !== "policy-denied" || pending(id));
+    this.drainOwnedResult(candidates, (id) => {
+      if (reason === "policy-denied" && !pending(id)) return;
       this.trackerFail(id, {
-        reason: "overloaded",
-        retryable: true,
+        reason,
+        retryable: reason === "overloaded",
         lastAttemptAt: this.sendTracker.get(id)?.lastAttemptAt,
       });
     });

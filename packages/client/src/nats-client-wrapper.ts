@@ -3612,7 +3612,9 @@ export class WebChannelNATSClient {
         // so the next settle sweeps them as part of its prefix — bounded, the
         // same way the control-lane residual is bounded.
         //
-        // `overloaded` is the only reason we treat as clearing that bar — as the
+        // `policy-denied` is a pre-acceptance refusal with no turn to settle.
+        // The server preserves earlier receipts instead of rejecting replays.
+        // `overloaded` also clears that bar — as the
         // best available PROXY for non-delivery, not as proof of it. The common
         // case is an ingress rejection before any turn was dispatched, and closing
         // immediately is worth having. But the agent can also reject a message it
@@ -3639,7 +3641,7 @@ export class WebChannelNATSClient {
         // reach an open turn, so neither is a turn-closing mechanism.)
         const turnClosed = cancelledTurnClosed || (
           next.state === "failed"
-          && next.failure?.reason === "overloaded"
+          && (next.failure?.reason === "overloaded" || next.failure?.reason === "policy-denied")
           && this.closeTurn(rec.wireId));
         if (next.state === "completed" || next.state === "interrupted" || next.state === "failed") {
           if (rec.wireId) {
@@ -5242,7 +5244,7 @@ export class WebChannelNATSClient {
 
       case "inbound_rejected": {
         // The low-level client has already removed ledger entries and emitted
-        // failed{overloaded}; receipt/bubble state arrives through onSendState.
+        // failed{overloaded|policy-denied}; receipt/bubble state arrives through onSendState.
         return true;
       }
 

@@ -52,6 +52,8 @@ import {
 import { getProcessIngressOutcomeStore } from "./ingress-outcome.js";
 import { BoundedOverflowResolver, type OverflowResolutionRequest } from "./inbound-overflow-resolver.js";
 import { createIngressDebounceCallbacks } from "./ingress-debounce-callbacks.js";
+import { createIngressPolicyGate } from "./ingress-policy.js";
+import { resolveDmAdmission } from "./dm-allowlist.js";
 import { InboundPressureLogger } from "./inbound-pressure-log.js";
 import { isControlLaneMessage, shouldDropBufferedInputOnStop } from "./control-lane.js";
 import { resolveCommandGate } from "./command-gate.js";
@@ -1226,6 +1228,13 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           return operation;
         },
       });
+      const admitInbound = createIngressPolicyGate({
+        journal: deliveryJournal,
+        isAllowed: (peerId) => resolveDmAdmission(peerId, account).allowed,
+        sendRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids, "policy-denied"),
+        sendAck: (peerId, ids, committed, cancelled, unaccepted) => channel.sendAck(peerId, ids, committed, cancelled, unaccepted),
+        warn: (error) => api.logger?.warn?.(`webchannel: ingress policy receipt failed: ${logSafe(error)}`),
+      });
       channel.setMessageHandler((peerId, rawMessage) => {
         if (!runtimeActive) return;
         if (rawMessage.type !== "user_message") return; // approvals routed below
@@ -1251,6 +1260,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         // ack, not the debouncer — may see the raw frame, and that guard counts
         // the reads above this line, so do not add one.
         const message: WebchannelUserMessage = normalizeInboundUserMessage(rawMessage);
+        if (!admitInbound({ peerId, message })) return;
         // Control receipts and exact cancellation targets commit together before
         // ACK. A replay returns that receipt without invoking core or clearing
         // input accepted after the original stop.
