@@ -8,7 +8,7 @@ import type { DispatchChange } from "./dispatch-store.js";
  * - Publishes to per-peer outbound subjects
  * - Handles multi-peer session routing via peerId
  * - Integrates approvals with first-write-wins exactly-once over NATS
- * - Wires Phase A CryptoNatsChannel for E2E encryption
+ * - Seals frames through e2e-session and the shared envelope codec
  *
  * Architecture:
  * - Plugin subscribes to webchannel.{tenant}.{accountId}.{peerId}.in
