@@ -20,6 +20,11 @@
   the unwritten legacy cancellation fallback. Current cancellation authority
   remains the SQLite stop transaction (#415 dead-code findings).
 
+- The reference app fences replaced login/connect attempts and unsubscribes
+  retired clients. Terminal recovery uses `errorCause`; transient registration
+  remains connecting/reconnecting. The minimal consumer filters approvals by
+  `actionable`, excluding inert historical cards (#415 F4/F5).
+
 - **Case-distinct JWT peers now have distinct core sessions (#372).** Raw peer
   IDs such as `Alice` and `alice` are encoded before SDK session normalization;
   configured bindings and intentional `identityLinks` keep their SDK selection,

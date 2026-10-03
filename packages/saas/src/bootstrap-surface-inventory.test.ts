@@ -47,6 +47,9 @@ const EXPECTED: Record<string, InventoryEntry> = {
   "demo/web/src/widget.ts :: /bootstrap literal": {
     count: 1, classification: "deployable demo single-lane consumer",
   },
+  "e2e/example-app.dom.test.ts :: /bootstrap literal": {
+    count: 3, classification: "test-only mock response and stale authentication success/failure selectors",
+  },
   "e2e/local/enrolled-transport-roundtrip.ts :: /test/bootstrap-jwt template": {
     count: 1, classification: "explicitly gated local E2E harness consumer",
   },
