@@ -489,6 +489,7 @@ describe("DeviceFlowEnrollment", () => {
         creds: {
           userJwt: expect.any(String),
           userSeed: expect.any(String),
+          permissions: { pub: ["webchannel.test-tenant.test-agent.>"], sub: ["webchannel.test-tenant.test-agent.>"] },
         },
         peerId: expect.any(String),
         jwksUrl: "https://saas.com/.well-known/jwks.json",

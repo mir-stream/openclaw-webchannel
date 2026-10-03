@@ -33,7 +33,7 @@ describe("addRevocation (issue #7)", () => {
     const minted = await mintNatsUserCreds({
       accountSeed: chain.private.natsAccountSeed,
       tenant: "t1",
-      role: "agent",
+      role: "agent", accountId: "test-agent",
     });
     return { chain, operatorSeed, accountJwt, userPubkey: minted.userPubkey };
   }
@@ -129,7 +129,7 @@ describe("addRevocation (issue #7)", () => {
   it("merges a second revocation without dropping the first", async () => {
     const { chain, accountJwt, operatorSeed, userPubkey } = await fixture();
     const other = (
-      await mintNatsUserCreds({ accountSeed: chain.private.natsAccountSeed, tenant: "t1", role: "agent" })
+      await mintNatsUserCreds({ accountSeed: chain.private.natsAccountSeed, tenant: "t1", role: "agent", accountId: "test-agent" })
     ).userPubkey;
 
     const once = await addRevocation(accountJwt, operatorSeed, userPubkey, 1000);
@@ -204,7 +204,7 @@ describe("mintNatsUserCreds.userPubkey (issue #12)", () => {
     const minted = await mintNatsUserCreds({
       accountSeed: chain.private.natsAccountSeed,
       tenant: "t1",
-      role: "agent",
+      role: "agent", accountId: "test-agent",
     });
     expect(minted.userPubkey).toMatch(/^U/);
     const sub = decode(minted.userJwt).sub;

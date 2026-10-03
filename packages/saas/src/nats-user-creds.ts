@@ -16,13 +16,13 @@
  *     `nats.issuer_account` set to the managed account identity.
  *
  * Subject scope depends on `role`:
- *   - "agent": tenant-wide (`webchannel.{tenant}.>`) pub+sub. The enrolled agent
- *     legitimately serves EVERY peer of its accounts (it must publish each
- *     browser's `.out`/`.reginbox` and subscribe each browser's `.in`/`.register`),
- *     so it keeps the tenant-wide grant.
+ *   - "agent": account-scoped (`webchannel.{tenant}.{accountId}.>`) pub+sub.
+ *     Every peer in that account is served, while sibling accounts' register
+ *     plaintext and data stay outside the credential's permissions.
  *   - "browser": scoped to the peer's OWN subtree across all of the tenant's
  *     accounts (`webchannel.{tenant}.*.{peerId}.>`, the `*` matching the accountId
- *     segment). A browser therefore cannot publish to (or subscribe) another
+ *     segment), with publication limited to `.in` and `.register`. A browser
+ *     therefore cannot publish to (or subscribe) another
  *     peerId's `.register`/`.reginbox`/`.in`/`.out` — this structurally
  *     closes the register-reply forgery / K-poisoning vector (a same-tenant peer
  *     could otherwise publish a forged `registered:true` reply to a victim's
@@ -52,7 +52,7 @@ const MAX_NATS_USER_TTL_SECONDS = 9_223_372_036;
  * Logical role of the minted peer. Unlike the original design (perms identical
  * across roles), the role now DETERMINES the subject scope — see the module
  * docstring. "observer" is sub-only (wiretap); "browser" is per-peer-scoped;
- * "agent" is tenant-wide.
+ * "agent" is account-scoped.
  */
 export type NatsUserRole = "browser" | "agent" | "observer";
 
@@ -63,6 +63,8 @@ export type MintNatsUserCredsOptions = {
   tenant: string;
   /** Logical role (default "browser"). Determines the subject scope + JWT name. */
   role?: NatsUserRole;
+  /** Required for agents: exact WebChannel account, distinct from issuerAccountId. */
+  accountId?: string;
   /**
    * The peer's stable identity (JWT `sub` = user uuid). REQUIRED for role
    * "browser": the grant is scoped to `webchannel.{tenant}.*.{peerId}.>` so the
@@ -119,7 +121,7 @@ export type MintedNatsUserCreds = {
 
 /**
  * Mint role-scoped NATS user credentials for a peer. The subject grant depends
- * on `role` (see the module docstring): "agent" is tenant-wide, "browser" is
+ * on `role` (see the module docstring): "agent" is account-scoped, "browser" is
  * pinned to `webchannel.{tenant}.*.{peerId}.>`, "observer" is sub-only.
  */
 export async function mintNatsUserCreds(
@@ -175,8 +177,9 @@ export async function mintNatsUserCreds(
   // needs an explicit `pub.deny: [">"]` to actually refuse every publish.
   let observerNoPub = false;
   if (role === "agent") {
-    pub = [`webchannel.${opts.tenant}.>`];
-    sub = [`webchannel.${opts.tenant}.>`];
+    assertValidSubjectToken(opts.accountId ?? "", "accountId");
+    pub = [`webchannel.${opts.tenant}.${opts.accountId}.>`];
+    sub = [`webchannel.${opts.tenant}.${opts.accountId}.>`];
   } else if (role === "observer") {
     // Wiretap: read the whole tenant subtree, NEVER publish (explicit deny-all).
     pub = [];
@@ -193,7 +196,12 @@ export async function mintNatsUserCreds(
       );
     }
     assertValidSubjectToken(opts.peerId, "peerId");
-    pub = [`webchannel.${opts.tenant}.*.${opts.peerId}.>`];
+    // Browsers publish only toward the agent. Replies are received through
+    // subscriptions; no browser needs to publish .out or .reginbox messages.
+    pub = [
+      `webchannel.${opts.tenant}.*.${opts.peerId}.in`,
+      `webchannel.${opts.tenant}.*.${opts.peerId}.register`,
+    ];
     sub = [`webchannel.${opts.tenant}.*.${opts.peerId}.>`];
   }
   const perms = observerNoPub
