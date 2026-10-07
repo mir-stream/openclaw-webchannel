@@ -113,6 +113,13 @@
   remains outside this change (see #410). Reference/demo X25519 private keys are
   non-extractable; their public halves still export for bootstrap (#415 E8).
 
+- **Pending: CLI WebChannel sends use the running gateway (#418).** PR #430
+  remains blocked by the account/tenant transcript mismatch in #457. Core's gateway
+  `send` RPC delivers through the selected account's NATS runtime instead of
+  looking for that runtime in the CLI process. Agent `message` actions and cron
+  remain deliverable. Gateway connection failures retain core's diagnostics and
+  `openclaw doctor` guidance. No wire protocol change.
+
 - The inbound reply pipeline honors configured response prefixes and selected
   model interpolation on answers; reasoning stays unprefixed. Unsupported
   media-only final replies now settle as delivery errors rather than silently

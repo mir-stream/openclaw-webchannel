@@ -54,6 +54,40 @@ Setup keeps its existing write-ID policy. `openclaw doctor` reports an invalid
 `channels.webchannel.defaultAccount`, its selected fallback and a remedy;
 selection alone does not establish runtime availability.
 
+### CLI outbound delivery
+
+**Pending in PR #430; blocked by [#457](https://github.com/mir-stream/openclaw-webchannel/issues/457).**
+The candidate below can send and record the core transcript under different
+account/tenant identities when CLI and gateway settings or serving tuples differ.
+It is not ready to merge; the plugin-side handoff redesign remains pending.
+
+Core-initiated sends require the gateway that owns the selected WebChannel
+account to be running. For a peer already registered with that account:
+
+```sh
+openclaw message send --channel webchannel --account other --target Alice --message "Hello"
+```
+
+The CLI resolves the target and uses core's gateway `send` RPC. The gateway uses
+that account's NATS connection, conversation key and delivery journal. Agent
+`message` actions use the same RPC; cron delivers in the gateway process. This
+does not change offline-peer delivery or admission requirements.
+
+Target resolution still requires this account's local conversation-key store.
+A remote CLI without that store fails before the gateway RPC; remote-host support
+remains tracked in [#451](https://github.com/mir-stream/openclaw-webchannel/issues/451).
+
+If the gateway is stopped or unreachable, core reports
+`gateway closed (1006 abnormal closure (no close frame))` with the connection
+details, possible causes, and ``Run `openclaw doctor` for diagnostics.`` Run
+`openclaw doctor`, correct the reported gateway or connection problem, and retry
+after the configured gateway is running. A timeout retains core's
+`gateway timeout after …ms` diagnostic. If the gateway is reachable but the
+selected account has not started, the separate error remains
+`[webchannel] outbound account "<id>" is not running`; check
+`openclaw channels status --probe` and the account's gateway logs. The plugin
+does not replace core authentication or connection errors with account errors.
+
 ## Enrollment & credentials (NATS mode)
 
 `src/enrollment-client.ts` implements plugin-side onboarding over the **RFC 8628 device flow**

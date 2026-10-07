@@ -416,10 +416,10 @@ export function createWebChannelPlugin(
           return { messageId: id };
         },
       },
-      // No media in Phase 0. `deliveryMode` is required on the outbound base
-      // (`ChannelOutboundAdapter`, exported by
-      // `openclaw/plugin-sdk/channel-contract`). We deliver directly over our
-      // own WebSocket, so "direct".
+      // #418: the pinned SDK (2026.7.1-2) routes `sendMessage` through the
+      // gateway's `send` RPC for this mode. The CLI has no account NATS runtime;
+      // the gateway owns its transport, keys and journal. The RPC handler and
+      // cron call durable send in-process, so they still reach our send adapters.
       //
       // GATE 2: `shouldSuppressLocalPayloadPrompt` lets us drop the in-band
       // `/approve …` text once the native approval route is live (core passes
@@ -429,7 +429,7 @@ export function createWebChannelPlugin(
       // `openclaw/plugin-sdk/channel-contract`. We delegate to the
       // SDK helper via shouldSuppressClawNativeExecApprovalPrompt (src/approvals.ts).
       base: {
-        deliveryMode: "direct",
+        deliveryMode: "gateway",
         shouldSuppressLocalPayloadPrompt: ({ cfg, accountId, payload, hint }) =>
           shouldSuppressClawNativeExecApprovalPrompt({
             cfg,
