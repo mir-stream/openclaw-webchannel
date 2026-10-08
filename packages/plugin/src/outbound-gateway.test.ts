@@ -436,3 +436,55 @@ describe("CLI/gateway identity boundary (#457)", () => {
     expect(transcript(sessionKey("other", "tenant-b")).split(TEXT)).toHaveLength(2);
   });
 });
+
+
+describe("text-only outbound suppression", () => {
+  afterEach(async () => {
+    const { resetGlobalHookRunner } = await import("openclaw/plugin-sdk/plugin-runtime");
+    resetGlobalHookRunner();
+  });
+
+  it("preserves presentation until core renders its fallback text", async () => {
+    const { sendDurableMessageBatch } = await import("openclaw/plugin-sdk/channel-outbound");
+    activate(gatewayPlugin);
+    const result = await sendDurableMessageBatch({ cfg: gatewayCfg, channel: "webchannel", accountId: "other", to: PEER,
+      payloads: [{ presentation: { blocks: [{ type: "text", text: TEXT }] } }],
+    });
+    expect(result.status).toBe("sent");
+    expect(named.transport.frames).toHaveLength(1);
+    expect(openEnvelope(named.transport.frames[0].payload, named.keyStore.getOrCreate(PEER)).message)
+      .toMatchObject({ type: "agent_message", text: TEXT });
+    expect(named.journal.read(PEER)[0].event).toMatchObject({ kind: "bubble", text: TEXT });
+  });
+
+  it.each(["cli", "backend"] as const)("suppresses hook-emptied %s sends without a frame, bubble or transcript", async (mode) => {
+    const { initializeGlobalHookRunner } = await import("openclaw/plugin-sdk/plugin-runtime");
+    const registry = createEmptyRegistry() as any;
+    registry.typedHooks.push({ pluginId: "empty-outbound-test", hookName: "message_sending", handler: () => ({ content: "" }) });
+    initializeGlobalHookRunner(registry);
+    activate(mode === "cli" ? cliPlugin : gatewayPlugin);
+    const result = await messageAction(mode === "cli"
+      ? { clientName: "cli", mode: "cli" }
+      : { clientName: "gateway-client", mode: "backend" });
+    expect(result.payload.deliveryStatus).toBe("suppressed");
+    expect(primary.transport.frames).toEqual([]);
+    expect(named.transport.frames).toEqual([]);
+    expect(named.journal.read(PEER)).toEqual([]);
+    expect(transcript(sessionKey("other", "tenant-b"))).toBe("");
+  });
+
+  it("suppresses unbound metadata-only payloads after hooks too", async () => {
+    const { initializeGlobalHookRunner } = await import("openclaw/plugin-sdk/plugin-runtime");
+    const { sendDurableMessageBatch } = await import("openclaw/plugin-sdk/channel-outbound");
+    const registry = createEmptyRegistry() as any;
+    registry.typedHooks.push({ pluginId: "empty-outbound-test", hookName: "message_sending", handler: () => ({ content: "" }) });
+    initializeGlobalHookRunner(registry);
+    activate(gatewayPlugin);
+    const result = await sendDurableMessageBatch({ cfg: gatewayCfg, channel: "webchannel", accountId: "other", to: PEER,
+      payloads: [{ text: TEXT, channelData: { extra: "metadata" }, audioAsVoice: true }],
+    });
+    expect(result.status).toBe("suppressed");
+    expect(named.transport.frames).toEqual([]);
+    expect(named.journal.read(PEER)).toEqual([]);
+  });
+});

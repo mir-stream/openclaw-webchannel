@@ -436,7 +436,15 @@ export function createWebChannelPlugin(
       // SDK helper via shouldSuppressClawNativeExecApprovalPrompt (src/approvals.ts).
       base: {
         deliveryMode: "direct",
-        ...(handoff ? { sendPayload: createHandoffPayloadSender(handoff) } : {}),
+        ...(handoff ? {
+          sendPayload: createHandoffPayloadSender(handoff),
+          // WebChannel sends text only. Metadata (including the handoff
+          // binding) must not turn a hook-emptied payload into a blank bubble.
+          // Core normalizes both before and after rendering presentation;
+          // keep it until core converts it to text. Media keeps its error path.
+          normalizePayload: ({ payload }) =>
+            payload.text?.trim() || payload.presentation || payload.mediaUrl || payload.mediaUrls?.length ? payload : null,
+        } : {}),
         shouldSuppressLocalPayloadPrompt: ({ cfg, accountId, payload, hint }) =>
           shouldSuppressClawNativeExecApprovalPrompt({
             cfg,
