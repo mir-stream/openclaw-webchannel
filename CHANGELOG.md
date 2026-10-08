@@ -113,6 +113,12 @@
   remains outside this change (see #410). Reference/demo X25519 private keys are
   non-extractable; their public halves still export for bootstrap (#415 E8).
 
+- **CLI WebChannel sends use a plugin-owned gateway handoff (#418/#457).**
+  The CLI fixes the selected account and expected tenant/store; the gateway
+  rejects identity drift and owns delivery and the core transcript. Agent and
+  cron sends remain direct. CLI/gateway plugin updates and a gateway restart
+  are required. Gateway diagnostics are preserved; client/SaaS wire unchanged.
+
 - The inbound reply pipeline honors configured response prefixes and selected
   model interpolation on answers; reasoning stays unprefixed. Unsupported
   media-only final replies now settle as delivery errors rather than silently

@@ -54,6 +54,46 @@ Setup keeps its existing write-ID policy. `openclaw doctor` reports an invalid
 `channels.webchannel.defaultAccount`, its selected fallback and a remedy;
 selection alone does not establish runtime availability.
 
+### CLI outbound delivery
+
+CLI sends require the gateway that owns the selected WebChannel account to be
+running. For a peer already registered with that account:
+
+```sh
+openclaw message send --channel webchannel --account other --target Alice --message "Hello"
+```
+
+The CLI resolves the target and pins the exact listed account ID, peer, tenant
+and storage root in the plugin's authenticated `webchannel.send` RPC. Omitting
+`--account` preserves the account selected by the CLI, even if the gateway has a
+different default. The gateway checks that the selected runtime serves the same
+tenant/store, then uses its NATS connection, conversation key and delivery
+journal. It derives and writes the core transcript using gateway configuration;
+the CLI writes no transcript and supplies no transcript session key.
+
+A changed tenant/store or exact account identity is rejected before delivery.
+Refresh the CLI configuration and retry after the intended account is running.
+The tuple is checked again at the actual send, so replacing a runtime while the
+request is pending cannot redirect it to a different tenant/store. Agent
+`message` actions and cron in the serving gateway keep direct core delivery.
+
+Target resolution still requires the selected tuple's local conversation-key
+store. A remote CLI without it fails before the RPC; remote-host support remains
+tracked in [#451](https://github.com/mir-stream/openclaw-webchannel/issues/451).
+Offline-peer delivery and admission requirements are unchanged.
+
+If the gateway is stopped or unreachable, core's connection diagnostics and
+`openclaw doctor` guidance are preserved. A reachable gateway without the selected
+account reports `[webchannel] outbound account "<id>" is not running`; check
+`openclaw channels status --probe` and its gateway logs. Update the plugin on both
+CLI and gateway and restart the gateway: an older gateway lacks `webchannel.send`
+and the CLI refuses the send instead of falling back to the generic `send` RPC.
+
+Identical RPC requests with the same idempotency key share one result for ten
+minutes in the current gateway handler (up to 1,000 retained requests). Reusing
+a key with different content is rejected. This cache does not survive gateway
+restart; it does not provide a persistent CLI outbox or offline delivery.
+
 ## Enrollment & credentials (NATS mode)
 
 `src/enrollment-client.ts` implements plugin-side onboarding over the **RFC 8628 device flow**
