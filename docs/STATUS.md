@@ -66,7 +66,7 @@ changed tuples have distinct errors. CLI and gateway plugin versions must be
 updated together and the gateway restarted. A remote CLI still needs the selected
 tuple's local conversation-key store (#451); offline-peer delivery is unchanged.
 See [CLI delivery](../packages/plugin/README.md#cli-outbound-delivery) and
-[TD-6](TELEGRAM_DIVERGENCES.md#td-6-cli-발신은-실행-중인-gateway를-경유한다).
+[TD-7](TELEGRAM_DIVERGENCES.md#td-7-cli-발신은-실행-중인-gateway를-경유한다).
 There is no client/SaaS wire protocol change.
 
 P3 reply delivery (#415 C4/C7): inbound dispatch enables the SDK reply-prefix
