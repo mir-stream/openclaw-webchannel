@@ -14,6 +14,7 @@ import type { WebChannelPeerChannel } from "./channel-contract.js";
 import { logSafe } from "./log-safe.js";
 import { createClawMessageAdapter, nextMessageId } from "./message-adapter.js";
 import { resolveOutboundTransport, type ResolveOutboundTransport } from "./outbound-account.js";
+import { createOutboundHandoffActions, createHandoffPayloadSender } from "./outbound-handoff.js";
 import {
   createWebchannelMessagingAdapter,
   requireOutboundPeerId,
@@ -181,10 +182,15 @@ export function createWebChannelPlugin(
     resolveApprovalTransport?: ResolveAccountTransport;
     /** Live serving scope for target admission and outbound session routes. */
     resolveServingScope?: ResolveServingScope;
+    /** CLI actions hand off to the account-owning gateway over a scoped RPC. */
+    gatewayHandoff?: boolean;
     startNatsAccount?: (ctx: any) => Promise<void>;
     onInvalidAccountId?: (cfg: OpenClawConfig, invalid: { id: string; reason: string }) => void;
   },
 ) {
+  const handoff = opts?.gatewayHandoff && opts.resolveServingScope && opts.resolveOutboundTransport
+    ? { resolveServingScope: opts.resolveServingScope, resolveOutboundTransport: opts.resolveOutboundTransport }
+    : undefined;
   return createChatChannelPlugin<ResolvedAccount, WebchannelProbe>({
     // `message` (ChannelMessageAdapter) declares our outbound text send plus the
     // `live` progress-draft capabilities. It is attached on the base object here
@@ -278,7 +284,8 @@ export function createWebChannelPlugin(
       // `messaging` (ChannelMessagingAdapter) names a peer for core-initiated
       // sends and mirrors them into that peer's session. It rides the same
       // base-field mechanism as `message`. See src/outbound-target.ts.
-      messaging: createWebchannelMessagingAdapter(opts?.resolveServingScope),
+      messaging: createWebchannelMessagingAdapter(opts?.resolveServingScope, Boolean(handoff)),
+      ...(handoff ? { actions: createOutboundHandoffActions(handoff) } : {}),
       doctor: createWebchannelDoctorAdapter(),
       status: createWebchannelStatusAdapter(),
       // `approvalCapability` is a top-level ChannelPlugin field (sibling of
@@ -416,10 +423,9 @@ export function createWebChannelPlugin(
           return { messageId: id };
         },
       },
-      // #418: the pinned SDK (2026.7.1-2) routes `sendMessage` through the
-      // gateway's `send` RPC for this mode. The CLI has no account NATS runtime;
-      // the gateway owns its transport, keys and journal. The RPC handler and
-      // cron call durable send in-process, so they still reach our send adapters.
+      // Like Telegram, serving accounts use direct core delivery. CLI actions
+      // use webchannel.send so the gateway owns both delivery and transcript
+      // identity (#418/#457); core's generic send RPC accepts a caller override.
       //
       // GATE 2: `shouldSuppressLocalPayloadPrompt` lets us drop the in-band
       // `/approve …` text once the native approval route is live (core passes
@@ -429,7 +435,8 @@ export function createWebChannelPlugin(
       // `openclaw/plugin-sdk/channel-contract`. We delegate to the
       // SDK helper via shouldSuppressClawNativeExecApprovalPrompt (src/approvals.ts).
       base: {
-        deliveryMode: "gateway",
+        deliveryMode: "direct",
+        ...(handoff ? { sendPayload: createHandoffPayloadSender(handoff) } : {}),
         shouldSuppressLocalPayloadPrompt: ({ cfg, accountId, payload, hint }) =>
           shouldSuppressClawNativeExecApprovalPrompt({
             cfg,

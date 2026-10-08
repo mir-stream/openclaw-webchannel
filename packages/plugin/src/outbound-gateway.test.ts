@@ -1,13 +1,13 @@
 /**
- * #418: exercise the pinned core's message-action -> send RPC -> durable send
+ * #418: exercise the pinned core's message-action -> plugin handoff RPC -> durable send
  * path. The gateway socket is replaced: its client hands serialized RPC
- * params to core's real server handler under the gateway's plugin registry.
+ * params to the plugin's server handler under the gateway's plugin registry.
  * The CLI registry has no account runtimes. NATS publish is recorded in memory;
- * encryption and SQLite are real. Both processes share config and every send
- * selects an explicit account; config/serving identity drift remains open (#457).
+ * encryption and SQLite are real. CLI and gateway use separate configurations.
+ * Tests assert actual transcript content as well as frames and journal entries.
  */
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -20,6 +20,7 @@ import { openEnvelope } from "./e2e-session.js";
 import { createNatsWebChannelPlugin } from "./nats-account-runtime.js";
 import { NatsChannel } from "./nats-channel.js";
 import type { NatsTransport } from "./nats-transport.js";
+import { createOutboundHandoffHandler, registerOutboundHandoff, WEBCHANNEL_SEND_METHOD } from "./outbound-handoff.js";
 import { buildWebchannelPeerSessionKey } from "./session-route.js";
 import { tupleStoragePaths } from "./storage-paths.js";
 import { loadCoreExport } from "./test-fixtures/core-outbound-internals.js";
@@ -37,7 +38,8 @@ type GatewayClientOptions = {
 };
 let runMessageAction: CoreCall;
 let dispatchCronDelivery: CoreCall;
-let sendHandlers: { send: CoreCall };
+let handoffHandler: ReturnType<typeof createOutboundHandoffHandler>;
+let gatewayRuntimes: Map<string, ReturnType<typeof createRuntime>>;
 let createEmptyRegistry: () => Registry;
 let setActiveRegistry: (registry: Registry) => void;
 let gatewayTesting: {
@@ -47,6 +49,7 @@ let gatewayTesting: {
 let suiteRoot: string;
 let root: string;
 let cfg: OpenClawConfig;
+let gatewayCfg: OpenClawConfig;
 let primary: ReturnType<typeof createRuntime>;
 let named: ReturnType<typeof createRuntime>;
 let gatewayPlugin: Plugin;
@@ -94,7 +97,6 @@ beforeAll(async () => {
   vi.stubEnv("OPENCLAW_CONFIG_PATH", join(suiteRoot, "openclaw.json"));
   runMessageAction = await loadCoreExport("message-action-runner-", "src/infra/outbound/message-action-runner.ts", "runMessageAction");
   dispatchCronDelivery = await loadCoreExport("run-delivery.runtime-", "src/cron/isolated-agent/delivery-dispatch.ts", "dispatchCronDelivery");
-  sendHandlers = await loadCoreExport("send-", "src/gateway/server-methods/send.ts", "sendHandlers");
   createEmptyRegistry = await loadCoreExport("runtime-", "src/plugins/registry-empty.ts", "createEmptyPluginRegistry");
   setActiveRegistry = await loadCoreExport("runtime-", "src/plugins/runtime.ts", "setActivePluginRegistry");
   gatewayTesting = await loadCoreExport("call-", "src/gateway/call.ts", "testing");
@@ -114,16 +116,22 @@ beforeEach(() => {
       accounts: { default: { tenant: "tenant-a" }, other: { tenant: "tenant-b" } },
     } },
   };
+  gatewayCfg = structuredClone(cfg);
   primary = createRuntime("default", "tenant-a");
   named = createRuntime("other", "tenant-b");
-  gatewayPlugin = createNatsWebChannelPlugin(new Map([["default", primary], ["other", named]]));
+  gatewayRuntimes = new Map([["default", primary], ["other", named]]);
+  gatewayPlugin = createNatsWebChannelPlugin(gatewayRuntimes);
+  handoffHandler = createOutboundHandoffHandler({
+    resolveOutboundTransport: (id) => gatewayRuntimes.get(id)?.channel,
+    resolveServingScope: (id) => gatewayRuntimes.get(id),
+  });
   cliPlugin = createNatsWebChannelPlugin(new Map());
   gatewayUnavailable = false;
   connections = [];
   requests = [];
-  const context = { getRuntimeConfig: () => cfg, dedupe: new Map() };
+  const context = { getRuntimeConfig: () => gatewayCfg, dedupe: new Map() };
   gatewayTesting.setDepsForTests({
-    getRuntimeConfig: () => cfg,
+    getRuntimeConfig: () => gatewayCfg,
     loadOrCreateDeviceIdentity: () => { throw new Error("fixture must use local shared-token auth"); },
     createGatewayClient: (options: GatewayClientOptions) => {
       connections.push(options);
@@ -137,17 +145,17 @@ beforeEach(() => {
         request: async (method: string, params: Record<string, any>) => {
           const wireParams = JSON.parse(JSON.stringify(params));
           requests.push({ method, params: wireParams });
-          expect(method).toBe("send");
+          expect(method).toBe(WEBCHANNEL_SEND_METHOD);
           activate(gatewayPlugin);
           return new Promise((resolve, reject) => {
-            void sendHandlers.send({
+            void handoffHandler({
               params: wireParams, context,
               client: { connect: { scopes: ["operator.write"] } },
               respond: (ok: boolean, payload: unknown, error?: { message: string }) => {
                 if (ok) resolve(payload);
                 else reject(new Error(error?.message));
               },
-            }).catch(reject);
+            } as any)?.catch(reject);
           });
         },
       };
@@ -173,7 +181,7 @@ function messageAction(gateway?: object) {
   return runMessageAction({
     cfg, action: "send", agentId: "main",
     params: { channel: "webchannel", target: `webchannel:${PEER}`, accountId: "other", message: TEXT },
-    ...(gateway ? { gateway } : {}),
+    gateway: gateway ?? { clientName: "cli", mode: "cli" },
   });
 }
 
@@ -191,6 +199,7 @@ function expectDelivered() {
   ]);
   const sessionKey = buildWebchannelPeerSessionKey({ cfg, agentId: "main", servingTenant: "tenant-b", accountId: "other", peerId: PEER });
   const sessions = JSON.parse(readFileSync(join(root, "sessions.json"), "utf8"));
+  expect(transcript(sessionKey)).toContain(TEXT);
   expect(Object.keys(sessions)).toContain(sessionKey);
   expect(Object.keys(sessions)).not.toContain("agent:main:main");
   return (message as { id: string }).id;
@@ -204,21 +213,20 @@ describe("gateway-owned core outbound delivery (#418)", () => {
     expect(result.payload).toMatchObject({ via: "gateway", result: { messageId } });
     expect(connections).toHaveLength(1);
     expect(connections[0]).toMatchObject({ clientName: "cli", mode: "cli" });
-    expect(requests).toEqual([{ method: "send", params: expect.objectContaining({
-      channel: "webchannel", accountId: "other", to: PEER, message: TEXT,
+    expect(requests).toEqual([{ method: WEBCHANNEL_SEND_METHOD, params: expect.objectContaining({
+      accountId: "other", peerId: PEER, text: TEXT, tenant: "tenant-b", storageRoot: root,
     }) }]);
   });
 
-  it("keeps the agent message tool's backend path deliverable without recursive RPC", async () => {
+  it("keeps the agent message tool in the serving process without an RPC", async () => {
     activate(gatewayPlugin);
     // createMessageTool in the pinned core passes this backend identity to
     // runMessageAction, the same action runner used by the CLI above.
     const result = await messageAction({ clientName: "gateway-client", clientDisplayName: "agent", mode: "backend" });
     const messageId = expectDelivered();
-    expect(result.payload).toMatchObject({ via: "gateway", result: { messageId } });
-    expect(connections).toHaveLength(1);
-    expect(connections[0]).toMatchObject({ clientName: "gateway-client", mode: "backend" });
-    expect(requests).toHaveLength(1);
+    expect(result.payload).toMatchObject({ via: "direct", result: { messageId } });
+    expect(connections).toEqual([]);
+    expect(requests).toEqual([]);
   });
 
   it("keeps cron delivery inside the gateway without opening an RPC client", async () => {
@@ -253,12 +261,178 @@ describe("gateway-owned core outbound delivery (#418)", () => {
 
   it("distinguishes an unavailable account on a reachable gateway without a sibling send", async () => {
     activate(cliPlugin);
-    gatewayPlugin = createNatsWebChannelPlugin(new Map([["default", primary]]));
+    gatewayRuntimes.delete("other");
     await expect(messageAction()).rejects.toThrow('[webchannel] outbound account "other" is not running');
     expect(requests).toHaveLength(1);
     expect(primary.transport.frames).toEqual([]);
     expect(primary.journal.read(PEER)).toEqual([]);
     expect(named.transport.frames).toEqual([]);
     expect(named.journal.read(PEER)).toEqual([]);
+  });
+});
+
+
+function sessionKey(accountId: string, tenant: string, config = cfg) {
+  return buildWebchannelPeerSessionKey({ cfg: config, agentId: "main", servingTenant: tenant, accountId, peerId: PEER });
+}
+
+function transcript(key: string, store = join(root, "sessions.json")): string {
+  if (!existsSync(store)) return "";
+  const session = JSON.parse(readFileSync(store, "utf8"))[key];
+  const file = session && (session.sessionFile ?? join(root, `${session.sessionId}.jsonl`));
+  return file && existsSync(file) ? readFileSync(file, "utf8") : "";
+}
+
+function expectNothingSent() {
+  expect(primary.transport.frames).toEqual([]);
+  expect(named.transport.frames).toEqual([]);
+  expect(primary.journal.read(PEER)).toEqual([]);
+  expect(named.journal.read(PEER)).toEqual([]);
+  expect(existsSync(join(root, "sessions.json"))).toBe(false);
+}
+
+describe("CLI/gateway identity boundary (#457)", () => {
+  it("rejects an explicit account's different tenant and store before send or transcript", async () => {
+    const local = cfg.channels!.webchannel as any;
+    local.storageRoot = join(root, "cli-store");
+    local.accounts.other.tenant = "tenant-cli";
+    new ConversationKeyStore({ storageRoot: local.storageRoot, tenant: "tenant-cli", accountId: "other" }).getOrCreate(PEER);
+    activate(cliPlugin);
+    await expect(messageAction()).rejects.toThrow("handoff tenant/store changed");
+    expectNothingSent();
+  });
+
+  it("rejects a different store even when tenant and account names match", async () => {
+    const local = cfg.channels!.webchannel as any;
+    local.storageRoot = join(root, "cli-store");
+    new ConversationKeyStore({ storageRoot: local.storageRoot, tenant: "tenant-b", accountId: "other" }).getOrCreate(PEER);
+    activate(cliPlugin);
+    await expect(messageAction()).rejects.toThrow("handoff tenant/store changed");
+    expectNothingSent();
+  });
+
+  it("pins the CLI default even when the gateway has a different default", async () => {
+    (gatewayCfg.channels!.webchannel as any).defaultAccount = "other";
+    activate(cliPlugin);
+    const result = await runMessageAction({ cfg, action: "send", agentId: "main", gateway: { clientName: "cli", mode: "cli" },
+      params: { channel: "webchannel", target: PEER, message: TEXT } });
+    expect(result.payload.via).toBe("gateway");
+    expect(requests[0].params.accountId).toBe("default");
+    expect(primary.transport.frames).toHaveLength(1);
+    expect(named.transport.frames).toEqual([]);
+    expect(primary.journal.read(PEER)).toHaveLength(1);
+    expect(transcript(sessionKey("default", "tenant-a"))).toContain(TEXT);
+    expect(transcript(sessionKey("other", "tenant-b"))).toBe("");
+  });
+
+  it("lets the gateway choose transcript configuration without writing a CLI transcript", async () => {
+    cfg.session = { store: join(root, "cli-sessions.json"), identityLinks: { cli: [`webchannel:${PEER}`] } };
+    gatewayCfg.session = { store: join(root, "sessions.json"), identityLinks: { server: [`webchannel:${PEER}`] } };
+    activate(cliPlugin);
+    await messageAction();
+    expect(named.transport.frames).toHaveLength(1);
+    expect(transcript(sessionKey("other", "tenant-b", gatewayCfg))).toContain(TEXT);
+    expect(existsSync(join(root, "cli-sessions.json"))).toBe(false);
+    expect(transcript(sessionKey("other", "tenant-b", cfg))).toBe("");
+  });
+
+  it("preserves exact listed account spelling across a canonical CLI alias", async () => {
+    for (const config of [cfg, gatewayCfg]) {
+      const accounts = (config.channels!.webchannel as any).accounts;
+      accounts.Other = accounts.other;
+      delete accounts.other;
+    }
+    named.channel.dispose(); named.journal.close();
+    named = createRuntime("Other", "tenant-b");
+    gatewayRuntimes.delete("other"); gatewayRuntimes.set("Other", named);
+    activate(cliPlugin);
+    await messageAction();
+    expect(requests[0].params.accountId).toBe("Other");
+    expect(named.transport.frames[0].subject).toBe("webchannel.tenant-b.Other.Alice.out");
+    expect(transcript(sessionKey("Other", "tenant-b"))).toContain(TEXT);
+  });
+
+  it("does not reinterpret an exact listed account as an alias on the gateway", async () => {
+    const accounts = (gatewayCfg.channels!.webchannel as any).accounts;
+    accounts.Other = accounts.other; delete accounts.other;
+    activate(cliPlugin);
+    await expect(messageAction()).rejects.toThrow("handoff account identity changed");
+    expectNothingSent();
+  });
+
+  it("refuses disabled gateway accounts before any write", async () => {
+    (gatewayCfg.channels!.webchannel as any).accounts.other.enabled = false;
+    activate(cliPlugin);
+    await expect(messageAction()).rejects.toThrow('outbound account "other" is disabled');
+    expectNothingSent();
+  });
+
+  it("keeps dry run side-effect free", async () => {
+    activate(cliPlugin);
+    const result = await runMessageAction({ cfg, action: "send", agentId: "main", dryRun: true,
+      params: { channel: "webchannel", target: PEER, accountId: "other", message: TEXT } });
+    expect(result.dryRun).toBe(true);
+    expect(connections).toEqual([]);
+    expectNothingSent();
+  });
+
+  it("refuses an agent account outage instead of handing an already-routed send to another runtime", async () => {
+    gatewayRuntimes.delete("other");
+    activate(gatewayPlugin);
+    await expect(messageAction({ clientName: "gateway-client", mode: "backend" })).rejects.toThrow('outbound account "other" is not running');
+    expect(connections).toEqual([]);
+    expect(named.transport.frames).toEqual([]);
+    expect(transcript(sessionKey("other", "tenant-b"))).toBe("");
+  });
+
+  it("registers the handoff RPC with operator.write scope", () => {
+    const registerGatewayMethod = vi.fn();
+    registerOutboundHandoff({ registerGatewayMethod } as any, {
+      resolveOutboundTransport: (id) => gatewayRuntimes.get(id)?.channel,
+      resolveServingScope: (id) => gatewayRuntimes.get(id),
+    });
+    expect(registerGatewayMethod).toHaveBeenCalledWith(WEBCHANNEL_SEND_METHOD, expect.any(Function), { scope: "operator.write" });
+  });
+
+  it("rejects a live serving tenant that differs from both config files", async () => {
+    named.channel.dispose(); named.journal.close();
+    named = createRuntime("other", "tenant-live");
+    gatewayRuntimes.set("other", named);
+    activate(cliPlugin);
+    await expect(messageAction()).rejects.toThrow("handoff tenant/store changed");
+    expectNothingSent();
+  });
+
+  it("rechecks the tuple at delivery after a runtime changes during the durable pipeline", async () => {
+    const original = gatewayPlugin.outbound!.sendPayload!;
+    gatewayPlugin.outbound!.sendPayload = async (ctx) => {
+      named.channel.dispose(); named.journal.close();
+      named = createRuntime("other", "tenant-replacement");
+      gatewayRuntimes.set("other", named);
+      return original(ctx);
+    };
+    activate(cliPlugin);
+    await expect(messageAction()).rejects.toThrow("handoff tenant/store changed");
+    expect(named.transport.frames).toEqual([]);
+    expect(named.journal.read(PEER)).toEqual([]);
+    expect(transcript(sessionKey("other", "tenant-b"))).toBe("");
+    expect(transcript(sessionKey("other", "tenant-replacement"))).toBe("");
+  });
+
+  it("deduplicates concurrent repeated RPCs and rejects reuse for different text", async () => {
+    activate(gatewayPlugin);
+    const params = { accountId: "other", tenant: "tenant-b", storageRoot: root, peerId: PEER,
+      agentId: "main", text: TEXT, idempotencyKey: "same-request" };
+    const call = (request = params) => new Promise<any>((resolve, reject) => {
+      void handoffHandler({ params: request, context: { getRuntimeConfig: () => gatewayCfg },
+        client: { connect: { scopes: ["operator.write"] } },
+        respond: (ok: boolean, value: unknown, error?: { message: string }) => ok ? resolve(value) : reject(new Error(error?.message)),
+      } as any);
+    });
+    const [a, b] = await Promise.all([call(), call()]);
+    expect(a).toEqual(b);
+    await expect(call({ ...params, text: "different" })).rejects.toThrow("reused for a different request");
+    expectDelivered();
+    expect(transcript(sessionKey("other", "tenant-b")).split(TEXT)).toHaveLength(2);
   });
 });

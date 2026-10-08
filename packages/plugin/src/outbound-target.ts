@@ -83,12 +83,12 @@ export function requireOutboundPeerId(to: string): string {
 }
 
 /** Resolve the account and fail unless `peerId` has registered with it. */
-function requireRegisteredPeer(
+export function requireRegisteredPeer(
   cfg: unknown,
   accountId: string | null | undefined,
   peerId: string,
   resolveServingScope?: ResolveServingScope,
-): { accountId: string; tenant: string } {
+): { accountId: string; tenant: string; storageRoot?: string } {
   const id = resolveOutboundAccountId(cfg, accountId);
   const scope = resolveServingScope?.(id) ?? planServingScope(cfg, id);
   let registered: boolean;
@@ -111,7 +111,7 @@ function requireRegisteredPeer(
         "only a peer that has registered with this account can be messaged",
     );
   }
-  return { accountId: id, tenant: scope.tenant };
+  return { accountId: id, ...scope };
 }
 
 function planServingScope(cfg: unknown, accountId: string): OutboundServingScope {
@@ -129,6 +129,7 @@ function planServingScope(cfg: unknown, accountId: string): OutboundServingScope
 /** The `messaging` adapter for core-initiated sends. */
 export function createWebchannelMessagingAdapter(
   resolveServingScope?: ResolveServingScope,
+  deferNonServingSession = false,
 ): ChannelMessagingAdapter {
   return {
     targetPrefixes: [WEBCHANNEL_ID],
@@ -156,6 +157,9 @@ export function createWebchannelMessagingAdapter(
       const peerId = normalizeWebchannelTarget(target);
       if (peerId === undefined) return null;
       const scope = requireRegisteredPeer(cfg, accountId, peerId, resolveServingScope);
+      // A CLI action hands off to webchannel.send. Only the serving gateway
+      // creates its transcript; returning null prevents core's local mirror.
+      if (deferNonServingSession && !resolveServingScope?.(scope.accountId)) return null;
       const sessionKey = buildWebchannelPeerSessionKey({
         cfg,
         agentId,
