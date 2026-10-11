@@ -140,8 +140,15 @@ done
 # ── Install ONLY production dependencies (currently just `ws`) ───────────────
 # The whole point: a runtime import misplaced into devDependencies won't be
 # installed here, so the load step below catches it.
+# Install the tarball as a consumer dependency, as OpenClaw's managed installer
+# does. Installing inside the extracted package still resolves its development
+# peer graph even with --omit=dev, which crashes npm 10 on Vitest 4's peers.
 echo "==> Installing production deps only (--omit=dev) …"
-(cd "$PKG" && npm_config_cache="$WORK/npm-cache" npm install --omit=dev --no-audit --no-fund)
+CONSUMER_DIR="$WORK/consumer"
+mkdir -p "$CONSUMER_DIR"
+printf '%s\n' '{"private":true}' > "$CONSUMER_DIR/package.json"
+(cd "$CONSUMER_DIR" && npm_config_cache="$WORK/npm-cache" npm install --omit=dev --no-audit --no-fund "$WORK/$TARBALL")
+PKG="$CONSUMER_DIR/node_modules/openclaw-webchannel"
 
 # Make host openclaw (peer, provides openclaw/plugin-sdk/*) resolvable.
 mkdir -p "$PKG/node_modules"
