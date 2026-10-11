@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll, type MockInstance } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1451,7 +1451,7 @@ describe("#93 origin routing — active lease + persisted session store", () => 
   let savedRegistry: unknown;
   let registry: ApprovalOriginLeaseRegistry;
   let nowMs: number;
-  let warnSpy: ReturnType<typeof vi.spyOn>;
+  let warnSpy: MockInstance<typeof console.warn>;
 
   beforeAll(() => {
     dir = mkdtempSync(join(tmpdir(), "webchannel-approval-origin-"));

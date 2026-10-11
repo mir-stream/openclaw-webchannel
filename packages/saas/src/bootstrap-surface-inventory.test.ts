@@ -190,7 +190,8 @@ function inventory(): Record<string, number> {
 }
 
 describe("first-party bootstrap issuance/caller inventory", () => {
-  it("contains only explicitly classified security-relevant occurrences", () => {
+  // Parsing the whole repository can exceed Vitest 4's synchronous timeout.
+  it("contains only explicitly classified security-relevant occurrences", { timeout: 30_000 }, () => {
     expect(inventory()).toEqual(
       Object.fromEntries(Object.entries(EXPECTED).map(([key, value]) => [key, value.count])),
     );

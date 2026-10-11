@@ -21,6 +21,11 @@ import { MemoryEnrollmentRepository, UserCodeCollisionError, type EnrollmentRepo
 import type { SaasTrustChainPrivate, NatsAccountConfig } from "./types.js";
 import type { EnrollmentRequest, PollRequest, PendingEnrollment } from "./device-flow-types.js";
 
+// Observe the private mint boundary without replacing its implementation.
+type EnrollmentMint = {
+  generateNatsUserCredentials: DeviceFlowEnrollment["generateNatsUserCredentials"];
+};
+
 // ---------------------------------------------------------------------------
 // Test fixtures
 // ---------------------------------------------------------------------------
@@ -967,8 +972,8 @@ describe("P1-2 shared-repository integration", () => {
     const repository = new MemoryEnrollmentRepository({ autoSweep: false });
     const first = createEnrollment(repository);
     const second = createEnrollment(repository);
-    const firstMint = vi.spyOn(first as never, "generateNatsUserCredentials" as never);
-    const secondMint = vi.spyOn(second as never, "generateNatsUserCredentials" as never);
+    const firstMint = vi.spyOn(first as unknown as EnrollmentMint, "generateNatsUserCredentials");
+    const secondMint = vi.spyOn(second as unknown as EnrollmentMint, "generateNatsUserCredentials");
     const request = await first.enroll(validEnrollmentRequest);
 
     // Calling the inner method is intentional: correctness must come from the

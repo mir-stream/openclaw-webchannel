@@ -5,6 +5,11 @@ import { interpose } from "./enrollment-repository-conformance.js";
 import { MemoryEnrollmentRepository, type EnrollmentRepository } from "./enrollment-repository.js";
 import type { EnrollmentRequest } from "./device-flow-types.js";
 
+// Observe the private mint boundary without replacing its implementation.
+type EnrollmentMint = {
+  generateNatsUserCredentials: DeviceFlowEnrollment["generateNatsUserCredentials"];
+};
+
 const KEY_A = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const KEY_B = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 const account = createAccount();
@@ -32,7 +37,7 @@ describe("P1-2 atomic enrollment integration", () => {
   it("gates replacement before mint and preserves CAS confirmation", async () => {
     const repo = new MemoryEnrollmentRepository({ autoSweep: false }); const svc = service(repo);
     approved(await svc.approve((await pending(svc)).user_code));
-    const next = await pending(svc, KEY_B); const mint = vi.spyOn(svc as never, "generateNatsUserCredentials" as never);
+    const next = await pending(svc, KEY_B); const mint = vi.spyOn(svc as unknown as EnrollmentMint, "generateNatsUserCredentials");
     const conflict = await svc.approve(next.user_code); expect(conflict.kind).toBe("conflict"); expect(mint).not.toHaveBeenCalled();
     expect((await repo.getEnrollment(next.device_code))?.status).toBe("pending");
     if (conflict.kind !== "conflict" || !conflict.existing) throw new Error("missing conflict token");
@@ -107,7 +112,7 @@ describe("P1-2 atomic enrollment integration", () => {
   it("15: conflict and revoked-key gates release claims without minting or changing pending", async () => {
     const raw = new MemoryEnrollmentRepository({ autoSweep: false }); const svc = service(raw);
     approved(await svc.approve((await pending(svc, KEY_A)).user_code));
-    const blocked = await pending(svc, KEY_B); const mint = vi.spyOn(svc as never, "generateNatsUserCredentials" as never);
+    const blocked = await pending(svc, KEY_B); const mint = vi.spyOn(svc as unknown as EnrollmentMint, "generateNatsUserCredentials");
     expect((await svc.approve(blocked.user_code)).kind).toBe("conflict");
     expect(mint).not.toHaveBeenCalled(); expect((await raw.getEnrollment(blocked.device_code))?.status).toBe("pending");
     await raw.revokeActive("tenant", "account");

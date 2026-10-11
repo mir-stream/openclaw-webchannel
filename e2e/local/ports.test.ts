@@ -690,7 +690,8 @@ describe("e2e/local/ports.json", () => {
     expect(registered).toEqual(scripts);
   });
 
-  it("discovers WebSocketServer constructor listeners", () => {
+  // Repository scans can exceed 5s; Vitest 4 also times synchronous test bodies.
+  it("discovers WebSocketServer constructor listeners", { timeout: 30_000 }, () => {
     expect(bindingSources()).toContain(
       "packages/plugin/src/nats-cutover-e2e.test.ts",
     );
@@ -809,7 +810,7 @@ describe("e2e/local/ports.json", () => {
     );
   });
 
-  it("keeps product binder entrypoints out of root Vitest suites", () => {
+  it("keeps product binder entrypoints out of root Vitest suites", { timeout: 30_000 }, () => {
     expect(
       nonTestBinderEntrypointProblems(),
       "non-test binder entrypoint boundary violations",
@@ -1046,7 +1047,7 @@ describe("e2e/local/ports.json", () => {
     expect(clashes, `literal budget hides owned ports:\n${clashes.join("\n")}`).toEqual([]);
   });
 
-  it("keeps every literal occurrence budget exact", () => {
+  it("keeps every literal occurrence budget exact", { timeout: 30_000 }, () => {
     const literals = scanLiterals();
     const dead = [
       ...literalBudgetProblems(literals, NOT_PORTS, "NOT_PORTS"),
@@ -1131,7 +1132,7 @@ describe("e2e/local/ports.json", () => {
     expect(bad, `literal rights granted where they must not be:\n${bad.join("\n")}`).toEqual([]);
   });
 
-  it("contains no port literal outside the authority", () => {
+  it("contains no port literal outside the authority", { timeout: 30_000 }, () => {
     const offenders: string[] = [];
     const allocatedBy = new Map<number, string>();
     for (const [o, k, p] of allocations) {
