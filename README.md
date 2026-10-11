@@ -71,8 +71,13 @@ walkthrough (real browser on the Mac ↔ agent in a container over the LAN), see
 
 ## Develop / test
 
+Vitest is shared from the monorepo root. Install the root lockfile before running
+the root suite or a workspace's `npm test`; published packages do not carry the
+test runner in their development manifests. This also keeps npm 10 from resolving
+Vitest's optional peers during an OpenClaw production plugin install.
+
 ```bash
-npm install
+npm ci
 npm run typecheck     # all workspaces
 npm test              # component/unit level — see STATUS.md on coverage gaps
 ```

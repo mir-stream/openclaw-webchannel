@@ -139,14 +139,9 @@ openclaw plugins list | grep -i webchannel
 ```bash
 docker cp packages/plugin <container>:/root/plugin
 docker exec <container> sh -c "chown -R 0:0 /root/plugin"          # else: "suspicious ownership" → BLOCKED
-docker exec <container> sh -c "cd /root/plugin && npm install --omit=dev --legacy-peer-deps"   # installs ws (the only runtime dep)
+docker exec <container> sh -c "cd /root/plugin && npm install --omit=dev"   # installs ws (the only runtime dep)
 docker exec <container> openclaw plugins install --link /root/plugin
 ```
-
-For this copied-directory install, `--legacy-peer-deps` avoids npm 10's
-[Vitest optional-peer resolver crash](https://github.com/npm/cli/issues/9787),
-which can occur even with `--omit=dev`. The OpenClaw host supplies the plugin's
-optional OpenClaw peer; development dependencies remain omitted.
 
 ---
 
@@ -441,7 +436,7 @@ The `#token=` fragment auto-authenticates; a missing/wrong token → `AUTH_RATE_
 | Symptom | Cause | Fix |
 |---|---|---|
 | plugin `blocked: suspicious ownership` | source dir `uid≠0` in a root container | `chown -R 0:0 <dir>` |
-| `Cannot find module 'ws'` | node_modules not installed for the linked plugin | `npm install --omit=dev --legacy-peer-deps` in the plugin dir |
+| `Cannot find module 'ws'` | node_modules not installed for the linked plugin | `npm install --omit=dev` in the plugin dir |
 | `NATS connection failed (fetch failed)` | wrong `saasBaseUrl` / issuer down | issuer up? container → `host.docker.internal`, not `127.0.0.1` |
 | approve → `Enrollment not found … {{USER_CODE}}` | opened bare `/enroll`, or cached approval page | open the full `?user_code=…` URL / hard-refresh / curl `/approve` |
 | polls re-enroll every ~5s, never pairs | client treated `authorization_pending` (HTTP 400) as a hard error | ensure poll handles the 400 `{error}` body (don't throw) |

@@ -227,14 +227,14 @@ caller-selected tenant or return a cross-account pin map.
 
 ## Installation notes
 
-If you hit npm registry permission issues in some environments, either use an
-alternative registry (`npm install --registry=https://registry.yarnpkg.com`) or
-install dev deps manually (`npm install typescript @types/node vitest`).
+For development, run `npm ci` from the monorepo root. Vitest is shared from the
+root's development dependencies; it is not part of this package's manifest.
 
 ## Testing
 
 ```bash
-npm test
+# From the monorepo root, after npm ci:
+npm test --workspace=packages/saas
 ```
 
 Covers RSA/NKEY generation and PEM/format checks, operator/account JWT claims,
