@@ -281,7 +281,7 @@ boot_agent() {
           "auth": { "strategy": "jwt", "jwt": {
             "jwksUrl": "$SAAS_URL/.well-known/jwks.json"
           } },
-          "dmSecurity": "allowlist",
+          "dmPolicy": "allowlist",
           "allowFrom": ["$UUID_ALICE", "$UUID_BOB", "$UUID_ADMIN"],
           "streaming": { "mode": "partial" }
         }

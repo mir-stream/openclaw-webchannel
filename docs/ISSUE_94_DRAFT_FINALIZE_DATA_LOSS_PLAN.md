@@ -1,5 +1,19 @@
 # Issue #94 — partial draft가 어시스턴트 메시지 경계를 잃고 마지막 메시지로 덮이는 문제
 
+> ⚠️ **#240 half 2 DELETED the client's agent-side adoption tiers.** Every C-case
+> analysis below reasons about tier-2/tier-3 reconciliation of `core-…` snapshot
+> rows against live bubbles. History no longer comes from core's transcript and
+> never carries a `core-…` id: the journal serves the delivery-act id, so an agent
+> row matches by ID or has no local counterpart. Most convergence conclusions
+> here still hold and only the PATHS to them changed — but ⚠️ **not all of them**:
+> §6.5.1's conclusion was a predicted session-vs-reload GAP (a rotated rewrite
+> showing 4 bubbles live and 3 after a full reload), and the cutover CLOSES that
+> gap — both rotated lanes were delivered, so both are journaled, and reload now
+> equals session. The double-render itself is untouched and remains live-path
+> routing (#215/#223). Do not cite this file for how history reconciliation
+> works.
+
+
 - 이슈: [#94](https://github.com/mir-stream/openclaw-webchannel/issues/94) (P1 / kind/bug / area/plugin)
 - 상류 리포트: rota-crew#281-A (Rota 0.4.0 제품 리뷰)
 - PR 1 브랜치: `mir-stream/issue-94-pr1` (base `develop`)

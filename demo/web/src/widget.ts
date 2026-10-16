@@ -20,10 +20,10 @@
  * hides the (useless) re-auth button.
  */
 import { WebChannelNATSClient, filterCommandCatalog } from "../../../packages/client/src/index.js";
-import type { WebChannelState, ApprovalRequest, ChatMessage } from "../../../packages/client/src/types.js";
+import type { WebChannelState, ApprovalRequest, ChatBubble } from "../../../packages/client/src/types.js";
 import { api, b64url, el, type DemoConfig } from "./config.js";
 import { renderMarkdown } from "./markdown.js";
-import { terminalErrorCopy } from "./error-copy.js";
+import { sendStatusCopy, terminalErrorCopy } from "./error-copy.js";
 import {
   orderConversationPresentation,
   captureOpenReasoningIds,
@@ -31,6 +31,8 @@ import {
   buildToolActivityChip,
   composerButtonMode,
   activityHint,
+  oldestHistoryCursor,
+  HISTORY_PAGE_SIZE,
 } from "./presentation.js";
 
 const STATUS_LABEL: Record<WebChannelState["status"], string> = {
@@ -51,8 +53,11 @@ export async function createWidget(
   bodyEl: HTMLElement,
   config: DemoConfig,
   accountId: string,
+  signal?: AbortSignal,
+  initialDraft = "",
+  heldDrafts: Map<string, string> = new Map(),
 ): Promise<() => void> {
-  bodyEl.replaceChildren();
+  if (signal?.aborted) return () => {};
 
   const rv = config.accounts[accountId];
   if (!rv) throw new Error(`no rendezvous entry for account "${accountId}"`);
@@ -76,7 +81,9 @@ export async function createWidget(
     style: "font-size:11px;color:var(--muted);margin-bottom:8px",
   }, ["↔ multi-device: open another tab as the same user — it syncs (each tab is its own device key)"]);
   const list = el("div", { style: "display:flex;flex-direction:column;gap:8px;min-height:120px" });
-  const approvalsBox = el("div", { style: "display:flex;flex-direction:column;gap:8px" });
+  // Owned by the login/account shell, not by a transport instance. These are
+  // inert drafts: a replacement client must never enqueue them automatically.
+  const heldList = el("div", { style: "display:flex;flex-direction:column;gap:8px;margin-top:8px" });
   const errBox = el("div", {
     class: "hidden",
     style:
@@ -84,6 +91,8 @@ export async function createWidget(
       "font-size:12px;background:rgba(248,81,73,.08)",
   });
   const input = el("input", { placeholder: "Type a message…", style: "flex:1" }) as HTMLInputElement;
+  // Restore before asynchronous authentication so continued edits stay intact.
+  input.value = initialDraft;
   const sendBtn = el("button", { class: "primary" }, ["Send"]) as HTMLButtonElement;
   // P0-3 slash-command typeahead menu — a column of command buttons rendered
   // above the composer while the user is typing a `/command`. Hidden otherwise.
@@ -94,9 +103,50 @@ export async function createWidget(
       "border:1px solid var(--border);border-radius:6px;background:#161b22;max-height:180px;overflow:auto",
   });
   const composer = el("div", { style: "display:flex;gap:8px;margin-top:10px" }, [input, sendBtn]);
-  bodyEl.append(topBar, mdHint, errBox, list, approvalsBox, cmdMenu, composer);
+  // A stale teardown may remove only its own mount, never a newer account's UI.
+  const root = el("div", {}, [topBar, mdHint, errBox, list, heldList, cmdMenu, composer]);
+  bodyEl.replaceChildren(root);
 
   let client: WebChannelNATSClient | null = null;
+  let unsubscribe: (() => void) | null = null;
+  let disposed = false;
+  let authGeneration = 0;
+  let authController: AbortController | null = null;
+  const debug = globalThis as unknown as Record<string, unknown>;
+  const readState = () => client?.getState();
+
+  function releaseClient(): void {
+    unsubscribe?.();
+    unsubscribe = null;
+    const previous = client;
+    client = null;
+    for (const message of previous?.getState().messages ?? []) {
+      if (message.kind !== undefined || message.role !== "user") continue;
+      // A terminal auth failure already clears `pending`. Only this client's own
+      // sends carry sendState; no publish attempt proves the text never left it.
+      const terminalHold = message.sendState === "failed"
+        && message.sendFailure?.reason === "terminal" && message.sendFailure.lastAttemptAt === undefined;
+      if (message.sendState === "queued" || terminalHold) {
+        heldDrafts.set(crypto.randomUUID(), message.text);
+      }
+    }
+    previous?.close();
+    // The retired instance's queued labels/actions cannot describe this lane.
+    list.replaceChildren();
+    renderHeldDrafts();
+  }
+
+  function dispose(): void {
+    if (disposed) return;
+    disposed = true;
+    authGeneration++;
+    authController?.abort();
+    releaseClient();
+    signal?.removeEventListener("abort", dispose);
+    if (debug.__webchannelState === readState) delete debug.__webchannelState;
+    root.remove();
+  }
+  signal?.addEventListener("abort", dispose, { once: true });
   // P0-3 typeahead state. `commandsRequestedAt` makes catalog discovery LAZY
   // and self-healing: we record WHEN we last asked (reset to null in
   // connectLane, so a re-auth re-requests for the fresh client). If the catalog
@@ -145,14 +195,53 @@ export async function createWidget(
     if (s) applyComposerMode(s);
   };
 
+  function renderHeldDrafts(): void {
+    heldList.replaceChildren(...Array.from(heldDrafts, ([id, text]) => {
+      const restore = el("button", {}, ["Restore draft"]) as HTMLButtonElement;
+      const dismiss = el("button", { title: "dismiss" }, ["✕"]) as HTMLButtonElement;
+      restore.onclick = () => {
+        if (disposed || !heldDrafts.has(id)) return;
+        input.value = input.value.trim() ? `${input.value} ${text}` : text;
+        heldDrafts.delete(id);
+        renderHeldDrafts();
+        renderMenu();
+        refreshComposerMode();
+        input.focus();
+      };
+      dismiss.onclick = () => {
+        if (disposed) return;
+        heldDrafts.delete(id);
+        renderHeldDrafts();
+      };
+      return el("div", {
+        "data-held-draft": id,
+        style: "white-space:pre-wrap;padding:8px;border:1px solid var(--border);border-radius:8px;font-size:12px",
+      }, [el("div", {}, [text]), el("div", {}, ["Not sent · connection replaced. Restore to edit and send."]), restore, dismiss]);
+    }));
+  }
+
   // ── Render ───────────────────────────────────────────────────────────────
+  /**
+   * ⚠️ #242 half 4: THE BUTTONS KEY OFF `actionable`, NOT OFF
+   * `resolvedDecision !== undefined`. Approvals are durable messages now, so a
+   * card can be REPLAYED from history: unresolved as far as the durable stream
+   * records, and yet not something to click, because between the disconnect and
+   * this render it may have expired or been decided on another device. A click
+   * would send a decision nobody is waiting for.
+   *
+   * `state.approvals` reports `actionable` as "the live session says this card
+   * is still open AND nothing has answered it", so the old test is subsumed
+   * rather than dropped — a resolved card is never actionable. `decide()`
+   * enforces the same predicate, so a stale click is refused even if a renderer
+   * gets this wrong; that is the belt, this is the braces.
+   */
   function renderApproval(a: ApprovalRequest): HTMLElement {
     const resolved = a.resolvedDecision !== undefined;
     const buttons = a.options.map((opt) => {
       const bt = el("button", {}, [opt.label]) as HTMLButtonElement;
       if (opt.style === "danger") bt.style.borderColor = "var(--bad)";
       if (opt.style === "success" || opt.style === "primary") bt.className = "primary";
-      bt.disabled = resolved;
+      bt.disabled = a.actionable !== true;
       bt.onclick = () => client?.decide(a.id, opt.decision);
       return bt;
     });
@@ -179,6 +268,15 @@ export async function createWidget(
               ]),
             ]
           : []),
+        // #400: the server refused this device's decision; the card shows the
+        // server's state again, and this says why the click did not land.
+        ...(a.decisionRejectedReason !== undefined
+          ? [
+              el("div", { style: "font-size:11px;color:var(--bad);margin-top:6px" }, [
+                `Decision not applied: ${a.decisionRejectedReason}`,
+              ]),
+            ]
+          : []),
       ],
     );
   }
@@ -186,7 +284,15 @@ export async function createWidget(
   // P1-9: a HELD (pending) user message — a dimmed chip with the "queued" hint
   // and a ✕ to retract it BEFORE it publishes (the local twin of the server-side
   // coalesce buffer; retracting means the agent never sees the text).
-  function renderPendingBubble(m: ChatMessage): HTMLElement {
+  // ⚠️ `ChatBubble`, NOT `ChatMessage` — both of these render a USER bubble
+  // (a held or retracted send) and read `m.text`, which only the bubble arm of
+  // the union has. The parameter said `ChatMessage` while the union had a
+  // `text` on every arm; #242 half 3's tool arm has none, so the wider type
+  // stopped compiling. Narrowed at the DECLARATION rather than guarded inside:
+  // the sole call site already holds a `ChatBubble` (`orderConversationPresentation`
+  // hands back `{kind:"message", value: ChatBubble}`), so a guard would be
+  // unreachable code standing in for a type that was simply too loose.
+  function renderPendingBubble(m: ChatBubble): HTMLElement {
     const dismiss = el("button", {
       title: "retract",
       style: "background:transparent;border:none;color:inherit;cursor:pointer;font-size:12px;padding:0 2px",
@@ -201,7 +307,7 @@ export async function createWidget(
       el("div", {
         style: "display:flex;align-items:center;gap:6px;margin-top:4px;font-size:11px;opacity:.9",
       }, [
-        el("span", { style: "flex:1" }, ["⏳ queued — sends when the agent finishes"]),
+        renderSendStatus(m) ?? el("span", { style: "flex:1" }, ["Queued · waiting for the agent to finish"]),
         dismiss,
       ]),
     ]);
@@ -211,7 +317,7 @@ export async function createWidget(
   // instead of destroying it (client-held text exists nowhere else). Struck and
   // dimmed, with a one-tap RESTORE (into the composer, appended so it never
   // clobbers a draft the user is mid-typing) and a ✕ to dismiss it for good.
-  function renderRetractedBubble(m: ChatMessage): HTMLElement {
+  function renderRetractedBubble(m: ChatBubble): HTMLElement {
     const restore = el("button", {
       style: "background:transparent;border:none;color:var(--accent);cursor:pointer;font-size:11px;padding:0",
     }, ["restore"]) as HTMLButtonElement;
@@ -244,6 +350,30 @@ export async function createWidget(
         dismiss,
       ]),
     ]);
+  }
+
+  function renderSendStatus(message: ChatBubble): HTMLElement | undefined {
+    const copy = sendStatusCopy(message);
+    if (!copy) return undefined;
+    const status = el("div", {
+      class: "send-status",
+      "data-send-state": message.sendState!,
+      style: "font-size:11px;margin-top:4px",
+    }, [el("strong", {}, [copy.label])]);
+    if (copy.hint) status.append(el("div", {}, [copy.hint]));
+    if (copy.restoreDraft) {
+      // Restoring text never re-executes a task; Send remains a separate choice.
+      const restore = el("button", { style: "margin-top:4px;font-size:11px" }, ["Restore draft"]) as HTMLButtonElement;
+      restore.onclick = () => {
+        if (disposed) return;
+        input.value = input.value.trim() ? `${input.value} ${message.text}` : message.text;
+        input.focus();
+        renderMenu();
+        refreshComposerMode();
+      };
+      status.append(restore);
+    }
+    return status;
   }
 
   function render(state: WebChannelState): void {
@@ -290,11 +420,20 @@ export async function createWidget(
     const nextMdCache = new Map<string, HTMLElement>();
     const openReasoningIds = captureOpenReasoningIds(list);
     const bubbles: HTMLElement[] = [];
-    for (const presentation of orderConversationPresentation(
-      state.messages,
-      state.reasoning,
-      state.toolActivity ?? [],
-    )) {
+    // #242 half 2 stopped passing `state.reasoning`, half 3 stopped passing
+    // `state.toolActivity` and half 4 removed the `approvalsBox` entirely, all
+    // for the same reason: every one of those lanes lives in `state.messages` at
+    // its own position now, and every side array is DERIVED from it, so
+    // re-supplying one would ask this function to place the same blocks twice.
+    // The parameters are gone, not merely unused.
+    //
+    // ⚠️ `state.approvals` IS STILL READ — as a LOOKUP, not as a lane. The
+    // presentation item carries only the card's id (see
+    // `ConversationPresentationItem`), because the card's render state
+    // (`resolvedDecision`, `actionable`) is a fold the library already performs
+    // and a renderer must not perform twice.
+    const approvalById = new Map(state.approvals.map((a) => [a.id, a]));
+    for (const presentation of orderConversationPresentation(state.messages)) {
       if (presentation.kind === "reasoning") {
         const item = presentation.value;
         const key = `reasoning:${item.id}\n${item.text}`;
@@ -305,9 +444,21 @@ export async function createWidget(
         );
         continue;
       }
-      // #97: minimal, muted tool-activity chip (structured lane, not history).
+      // #97: minimal, muted tool-activity chip. ⚠️ It USED to say "structured
+      // lane, not history" — false since #242 half 3 made tool activity a
+      // durable message; this chip now renders from the transcript on a reload
+      // exactly as it does live.
       if (presentation.kind === "tool_activity") {
         bubbles.push(buildToolActivityChip(presentation.value));
+        continue;
+      }
+      // #242 half 4: the approval card renders IN PLACE, where the prompt
+      // interrupted the conversation, instead of in a box below everything. A
+      // card whose id is not in `state.approvals` cannot happen (both are
+      // derived from the same array) and is skipped rather than guessed at.
+      if (presentation.kind === "approval") {
+        const approval = approvalById.get(presentation.id);
+        if (approval) bubbles.push(renderApproval(approval));
         continue;
       }
       const m = presentation.value;
@@ -323,14 +474,16 @@ export async function createWidget(
       // the renderer handles line breaks itself, so no pre-wrap (it'd double up).
       let child: Node | string;
       if (isUser) {
-        child = m.text;
+        // Own leaf: send-status children must not hide the text from exact-leaf
+        // drivers (verify-multidevice.mjs counts `#chat-body div` text leaves).
+        child = el("div", {}, [m.text]);
       } else {
         const key = `${m.id}\n${m.text}`;
         const rendered = mdCache.get(key) ?? renderMarkdown(m.text);
         nextMdCache.set(key, rendered);
         child = rendered;
       }
-      bubbles.push(el(
+      const bubble = el(
         "div",
         {
           style:
@@ -343,7 +496,36 @@ export async function createWidget(
             (m.working ? ";opacity:.7;font-style:italic" : ""),
         },
         [child],
-      ));
+      );
+      if (isUser) {
+        bubble.dataset.messageId = m.id;
+        const status = renderSendStatus(m);
+        if (status) bubble.append(status);
+      }
+      if (isUser && m.requestState === "interrupted") {
+        // #399: one retry per original. The server's `retriedBy`, or this
+        // device's own live retry row, spends it; only that retry can be
+        // retried next. A refused or retracted retry never reached the server.
+        const retriedBy = m.retriedBy ?? state.messages.find((r) => r.kind === undefined && r.role === "user" && r.retryOf === m.id
+          && r.sendState !== "failed" && !r.retracted)?.id;
+        const retry = el("button", {}, ["Retry"]) as HTMLButtonElement;
+        const line = el("div", {}, ["Interrupted · result unknown. Check any effects before retrying.", retry]);
+        if (retriedBy === undefined) retry.onclick = () => { client?.retryInterrupted(m.id); };
+        else {
+          retry.disabled = true;
+          const link = el("a", { href: "#" }, ["Retried →"]);
+          link.onclick = (event) => {
+            event.preventDefault();
+            Array.from(list.querySelectorAll<HTMLElement>("[data-message-id]")).find((n) => n.dataset.messageId === retriedBy)?.scrollIntoView?.({ block: "center" });
+          };
+          line.append(" ", link);
+        }
+        bubble.append(line);
+      } else if (isUser && m.requestState === "cancelled") {
+        bubble.append(el("div", {}, ["Cancelled · the task may have started. Check any effects before sending again."]));
+      }
+      if (isUser && m.retryOf) bubble.append(el("small", {}, ["Retry of an interrupted request"]));
+      bubbles.push(bubble);
     }
 
     // Activity hint (#96). `activityHint` owns the decision: the reasoning lane
@@ -360,7 +542,6 @@ export async function createWidget(
     }
     list.replaceChildren(...bubbles);
     mdCache = nextMdCache;
-    approvalsBox.replaceChildren(...state.approvals.map(renderApproval));
     // Keep the typeahead in sync when the catalog frame lands mid-typing.
     renderMenu();
   }
@@ -435,8 +616,13 @@ export async function createWidget(
    * Device keys are regenerated per connect; the prior client is disconnected.
    */
   async function connectLane(ttlSeconds?: number): Promise<void> {
-    client?.close();
-    client = null;
+    if (disposed) return;
+    const generation = ++authGeneration;
+    authController?.abort();
+    const controller = new AbortController();
+    authController = controller;
+    const ownsAuth = () => !disposed && generation === authGeneration;
+    releaseClient();
     // Fresh client → re-request the command catalog on the next `/` (its state
     // starts without a catalog).
     commandsRequestedAt = null;
@@ -444,70 +630,78 @@ export async function createWidget(
     statusPill.textContent = "● connecting…";
     statusPill.style.color = "var(--warn)";
     errBox.classList.add("hidden");
+    // Drafting is allowed during authentication, but there is no SDK owner yet.
+    input.disabled = false;
+    sendBtn.disabled = true;
+    sendBtn.dataset.mode = "send";
+    sendBtn.textContent = "Send";
+    renderMenu();
 
-    // Device keys (PoP private key non-extractable).
-    const x25519 = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])) as CryptoKeyPair;
-    const deviceX25519PublicKey = b64url(await crypto.subtle.exportKey("raw", x25519.publicKey));
-    const ed25519 = (await crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign", "verify"])) as CryptoKeyPair;
-    const edPubJwk = (await crypto.subtle.exportKey("jwk", ed25519.publicKey)) as { x?: string };
-    if (!edPubJwk.x) throw new Error("Ed25519 public JWK missing 'x'");
-    const devicePopPublicKey = edPubJwk.x;
+    try {
+      // Device private keys are non-extractable; public halves remain exportable.
+      const x25519 = (await crypto.subtle.generateKey({ name: "X25519" }, false, ["deriveBits"])) as CryptoKeyPair;
+      if (!ownsAuth()) return;
+      const deviceX25519PublicKey = b64url(await crypto.subtle.exportKey("raw", x25519.publicKey));
+      if (!ownsAuth()) return;
+      const ed25519 = (await crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign", "verify"])) as CryptoKeyPair;
+      if (!ownsAuth()) return;
+      const edPubJwk = (await crypto.subtle.exportKey("jwk", ed25519.publicKey)) as { x?: string };
+      if (!ownsAuth()) return;
+      if (!edPubJwk.x) throw new Error("Ed25519 public JWK missing 'x'");
+      const devicePopPublicKey = edPubJwk.x;
 
-    const creds = await api<{ userJwt?: string; userSeedRaw?: string; natsUrl?: string }>(
-      "/nats-user",
-      { method: "POST", body: ttlSeconds ? { role: "browser", ttlSeconds } : { role: "browser" } },
-    );
-    if (!creds.ok || !creds.data.userJwt || !creds.data.userSeedRaw) {
-      throw new Error(`nats-user failed (HTTP ${creds.status})`);
-    }
-    const boot = await api<{ jwt?: string; peerId?: string; natsUrl?: string; agentPublicKey?: string }>(
-      "/bootstrap",
-      { method: "POST", body: { accountId, deviceX25519PublicKey, devicePopPublicKey } },
-    );
-    if (!boot.ok || !boot.data.jwt || !boot.data.peerId) {
-      throw new Error(`bootstrap failed (HTTP ${boot.status}) ${JSON.stringify(boot.data)}`);
-    }
-    // F2: the register hop unwraps K against this SaaS-pinned agent key.
-    if (!boot.data.agentPublicKey) {
-      throw new Error("bootstrap response missing agentPublicKey (register-hop requires it)");
-    }
+      const creds = await api<{ userJwt?: string; userSeedRaw?: string; natsUrl?: string }>(
+        "/nats-user",
+        { method: "POST", body: ttlSeconds ? { role: "browser", ttlSeconds } : { role: "browser" }, signal: controller.signal },
+      );
+      if (!ownsAuth()) return;
+      if (!creds.ok || !creds.data.userJwt || !creds.data.userSeedRaw) {
+        throw new Error(`nats-user failed (HTTP ${creds.status})`);
+      }
+      const boot = await api<{ jwt?: string; peerId?: string; natsUrl?: string; agentPublicKey?: string }>(
+        "/bootstrap",
+        { method: "POST", body: { accountId, deviceX25519PublicKey, devicePopPublicKey }, signal: controller.signal },
+      );
+      if (!ownsAuth()) return;
+      if (!boot.ok || !boot.data.jwt || !boot.data.peerId) {
+        throw new Error(`bootstrap failed (HTTP ${boot.status}) ${JSON.stringify(boot.data)}`);
+      }
+      // F2: the register hop unwraps K against this SaaS-pinned agent key.
+      if (!boot.data.agentPublicKey) {
+        throw new Error("bootstrap response missing agentPublicKey (register-hop requires it)");
+      }
 
-    const natsUrl = boot.data.natsUrl ?? creds.data.natsUrl ?? rv.natsUrl;
+      const natsUrl = boot.data.natsUrl ?? creds.data.natsUrl ?? rv.natsUrl;
 
-    client = new WebChannelNATSClient({
-      natsUrl,
-      bootstrapJwt: boot.data.jwt,
-      accountId,
-      tenant: config.tenant,
-      peerId: boot.data.peerId,
-      natsCredentials: { userJwt: creds.data.userJwt, userSeedRaw: creds.data.userSeedRaw },
-      registration: {
-        // The register subject is derived from tenant/accountId/peerId; the
-        // client drives challenge→register over NATS request/reply (no gateway URL).
-        devicePrivateKey: ed25519.privateKey,
-        // Phase 6: register-delivered conversation key (no registration).
-        deviceX25519PrivateKey: x25519.privateKey,
-        // F2: pin the SaaS-attested agent key for K authentication.
-        pinnedAgentPublicKey: boot.data.agentPublicKey,
-      },
-    });
-    client.subscribe(render);
-    // Driver/debug hook: the verify-*.mjs drivers read message ids to make
-    // dedup assertions stronger than DOM text matching allows.
-    (globalThis as unknown as Record<string, unknown>).__webchannelState = () => client?.getState();
-    render(client.getState());
-    client.connect();
-  }
-
-  /**
-   * Fire-and-forget lane (re)connect. A failed re-auth (the /nats-user or
-   * /bootstrap SaaS fetch) rejects BEFORE any client exists, so no state event
-   * renders it — without this catch the errBox stays hidden and the pill sticks
-   * on "connecting…". Renders the failure into errBox with a retry that repeats
-   * the SAME request (incl. scene ⑤'s short TTL).
-   */
-  function connectLaneGuarded(ttlSeconds?: number): void {
-    connectLane(ttlSeconds).catch((err: unknown) => {
+      const nextClient = new WebChannelNATSClient({
+        natsUrl,
+        bootstrapJwt: boot.data.jwt,
+        accountId,
+        tenant: config.tenant,
+        peerId: boot.data.peerId,
+        natsCredentials: { userJwt: creds.data.userJwt, userSeedRaw: creds.data.userSeedRaw },
+        registration: {
+          // The register subject is derived from tenant/accountId/peerId; the
+          // client drives challenge→register over NATS request/reply (no gateway URL).
+          devicePrivateKey: ed25519.privateKey,
+          // Phase 6: register-delivered conversation key (no registration).
+          deviceX25519PrivateKey: x25519.privateKey,
+          // F2: pin the SaaS-attested agent key for K authentication.
+          pinnedAgentPublicKey: boot.data.agentPublicKey,
+        },
+      });
+      client = nextClient;
+      unsubscribe = nextClient.subscribe((state) => {
+        if (ownsAuth() && client === nextClient) render(state);
+      });
+      // Driver/debug hook: the verify-*.mjs drivers read message ids to make
+      // dedup assertions stronger than DOM text matching allows.
+      debug.__webchannelState = readState;
+      render(nextClient.getState());
+      nextClient.connect();
+    } catch (err: unknown) {
+      if (!ownsAuth()) return;
+      releaseClient();
       statusPill.textContent = "● error";
       statusPill.style.color = "var(--bad)";
       const retry = el("button", { class: "primary", style: "margin-top:8px;font-size:12px" }, ["Re-authenticate"]) as HTMLButtonElement;
@@ -519,25 +713,35 @@ export async function createWidget(
         retry,
       );
       errBox.classList.remove("hidden");
-      input.disabled = true;
+      input.disabled = false;
       sendBtn.disabled = true;
-    });
+    }
+  }
+
+  function connectLaneGuarded(ttlSeconds?: number): void {
+    void connectLane(ttlSeconds);
   }
 
   // ── Wiring ────────────────────────────────────────────────────────────────
   historyBtn.onclick = () => {
-    // P1-9: a local-only id (held pending / retracted) must never be sent as a
-    // `before` cursor — exclude them from the oldest-cursor pick.
-    const oldest = client?.getState().messages.find(
-      (m) => !m.working && !m.pending && !m.retracted,
-    );
-    client?.loadHistory({ before: oldest?.id, limit: 20 });
+    // The pick is `presentation.ts`'s `oldestHistoryCursor`; the paging LOOP it
+    // participates in is driven end to end by `history-paging.test.ts`. It
+    // returns an IDENTITY — `turnId` is set for a tool cursor only, and both
+    // halves go on the wire (#320).
+    const cursor = client ? oldestHistoryCursor(client.getState().messages) : undefined;
+    client?.loadHistory({
+      before: cursor?.id,
+      beforeTurnId: cursor?.turnId,
+      // Shared with `history-paging.test.ts`; see `HISTORY_PAGE_SIZE`.
+      limit: HISTORY_PAGE_SIZE,
+    });
   };
   shortBtn.onclick = () => { connectLaneGuarded(SHORT_TTL_SECONDS); };
   const submit = () => {
     const text = input.value.trim();
-    if (!text) return;
-    client?.send(text);
+    if (!text || disposed || !client || client.getState().status === "error") return;
+    // send() returns a receipt only once the SDK owns the draft.
+    if (!client.send(text)) return;
     input.value = "";
     renderMenu(); // hide the typeahead once the message is sent
     // Clearing the draft programmatically fires no `oninput`, and send()'s own
@@ -551,6 +755,7 @@ export async function createWidget(
   // can never disagree. Stop sends the literal "/stop" through the SAME send
   // path a typed "/stop" would take.
   sendBtn.onclick = () => {
+    if (disposed || sendBtn.disabled) return;
     if (sendBtn.dataset.mode === "stop") {
       client?.send("/stop");
       return;
@@ -577,8 +782,5 @@ export async function createWidget(
 
   await connectLane();
 
-  return () => {
-    client?.close();
-    bodyEl.replaceChildren();
-  };
+  return dispose;
 }

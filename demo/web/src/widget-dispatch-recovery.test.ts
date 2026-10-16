@@ -1,0 +1,95 @@
+// @vitest-environment jsdom
+import { webcrypto } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, expect, it, vi } from "vitest";
+import { createWidget } from "./widget.js";
+import { openDeliveryJournal } from "../../../packages/plugin/src/delivery-journal.js";
+import { projectJournalHistory } from "../../../packages/plugin/src/journal-history.js";
+import { openMessage, sealMessage } from "../../../packages/client/src/e2e-crypto-browser.js";
+import { outboundSubject, type OutboundMessage } from "../../../packages/client/src/nats-client.js";
+import { AGENT, TENANT, PEER, JWT, FakeNatsWS, installFakeWebSocket, makeAgentIdentity, registerAgent, settleUntil } from "../../../packages/client/src/nats-client-wrapped.test-harness.js";
+const cleanup: Array<() => void> = [];
+afterEach(() => { for (const fn of cleanup.splice(0).reverse()) fn(); vi.unstubAllGlobals(); document.body.replaceChildren(); });
+
+it("real widget recreates interrupted history and only its Retry click sends a new intentional request", async () => {
+  vi.stubGlobal("crypto", webcrypto);
+  cleanup.push(installFakeWebSocket());
+  const dir = mkdtempSync(join(tmpdir(), "widget369-"));
+  cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+  const journal = openDeliveryJournal({ databasePath: join(dir, "journal.sqlite") });
+  cleanup.push(() => journal.close());
+  const owner = journal.dispatch!.activate();
+  const [original] = journal.dispatch!.accept(owner, PEER, [{ text: "Check the transfer", turnId: "original-wire", randomId: "original-random" }]);
+  journal.dispatch!.claim(owner, PEER, ["original-random"]);
+  journal.append(PEER, { kind: "bubble", answerId: "partial-result", text: "Transfer submitted", turnId: "original-wire" });
+  const replacement = journal.dispatch!.activate();
+  journal.dispatch!.recoverInterrupted(replacement);
+  const history = projectJournalHistory(journal.read, PEER).messages;
+  const K = new Uint8Array(32).fill(77);
+  const identity = makeAgentIdentity();
+  const sent: Array<Record<string, unknown>> = [];
+  const context = { tenant: TENANT, accountId: AGENT, sub: PEER };
+  vi.stubGlobal("fetch", vi.fn(async (path: string, options: { body?: string }) => {
+    if (path === "/nats-user") return { ok: true, status: 200, json: async () => ({ userJwt: JWT, userSeedRaw: Buffer.alloc(32, 4).toString("base64url") }) };
+    const body = JSON.parse(options.body!);
+    const register = registerAgent(K, new Uint8Array(Buffer.from(body.deviceX25519PublicKey, "base64url")), identity);
+    FakeNatsWS.sharedHandler = async (subject, payload, server, reply) => {
+      await register(subject, payload, server, reply);
+      if (!subject.endsWith(".in")) return;
+      const frame = openMessage(payload, K) as Record<string, unknown> | null;
+      if (frame?.type === "user_message") sent.push(frame);
+    };
+    return { ok: true, status: 200, json: async () => ({ jwt: JWT, peerId: PEER, agentPublicKey: identity.publicB64url }) };
+  }));
+  const root = document.createElement("div"); document.body.append(root);
+  const cfg = { tenant: TENANT, issuerUrl: "https://issuer.invalid", accounts: { [AGENT]: { natsUrl: "ws://127.0.0.1:4222" } }, llmMode: "echo" as const };
+  const deliver = (frame: Record<string, unknown>) => FakeNatsWS.instances.at(-1)!.deliverToClient(outboundSubject(TENANT, AGENT, PEER), sealMessage(context, K, frame as unknown as OutboundMessage));
+  let unmount = await createWidget(root, cfg, AGENT);
+  cleanup.push(unmount);
+  FakeNatsWS.instances.at(-1)!.onmessage?.({ data: 'INFO {"nonce":"widget-fixture"}\r\n' });
+  await settleUntil(() => root.textContent!.includes("● connected"), { label: "widget registration" });
+  deliver({ type: "history", highWaterSeq: journal.maxSeq(PEER), messages: history });
+  await settleUntil(() => root.textContent!.includes("Interrupted · result unknown"), { label: "durable interrupted UI" });
+  expect(root.textContent).toContain("Transfer submitted");
+  expect(sent).toEqual([]);
+  unmount();
+  unmount = await createWidget(root, cfg, AGENT); cleanup.push(unmount);
+  FakeNatsWS.instances.at(-1)!.onmessage?.({ data: 'INFO {"nonce":"widget-fixture-2"}\r\n' });
+  await settleUntil(() => root.textContent!.includes("● connected"), { label: "recreated widget registration" });
+  deliver({ type: "history", highWaterSeq: journal.maxSeq(PEER), messages: history });
+  await settleUntil(() => root.textContent!.includes("Interrupted · result unknown"), { label: "recreated interrupted UI" });
+  expect(sent).toEqual([]);
+  const retry = Array.from(root.querySelectorAll("button")).find(b => b.textContent === "Retry")!;
+  expect(retry).toBeDefined(); retry.click();
+  await settleUntil(() => sent.length === 1, { label: "intentional retry publication" });
+  expect(sent[0]).toMatchObject({ type: "user_message", text: "Check the transfer", retry_of: original.messageId });
+  expect(sent[0].id).not.toBe("original-wire"); expect(sent[0].random_id).not.toBe("original-random");
+  expect(root.textContent).toContain("Interrupted · result unknown");
+  // #399: the click spends the original's one retry at once, before any echo.
+  const spent = () => Array.from(root.querySelectorAll("button")).find(b => b.textContent === "Retry")!;
+  await settleUntil(() => spent().disabled, { label: "local retry spends the original" });
+  spent().click(); await new Promise(setImmediate);
+  expect(sent).toHaveLength(1);
+  expect(root.textContent).toContain("Retried →");
+  // A retry the server refused never reached it, so it spends nothing.
+  deliver({ type: "inbound_rejected", ids: [sent[0].id], reason: "overloaded" });
+  await settleUntil(() => !spent().disabled, { label: "refused retry re-enables Retry" });
+  expect(root.textContent).not.toContain("Retried →");
+  spent().click();
+  await settleUntil(() => sent.length === 2, { label: "retry after refusal" });
+  expect(sent[1]).toMatchObject({ retry_of: original.messageId });
+  await settleUntil(() => spent().disabled, { label: "second retry spends the original" });
+  // The server records that retry; a recreated widget renders it from history.
+  const [retried] = journal.dispatch!.accept(replacement, PEER, [{ text: String(sent[1].text), turnId: String(sent[1].id), randomId: String(sent[1].random_id), retryOf: original.messageId }]);
+  expect(retried.retried?.retriedBy).toBe(retried.messageId);
+  unmount();
+  unmount = await createWidget(root, cfg, AGENT); cleanup.push(unmount);
+  FakeNatsWS.instances.at(-1)!.onmessage?.({ data: 'INFO {"nonce":"widget-fixture-3"}\r\n' });
+  await settleUntil(() => root.textContent!.includes("● connected"), { label: "third widget registration" });
+  deliver({ type: "history", highWaterSeq: journal.maxSeq(PEER), messages: projectJournalHistory(journal.read, PEER).messages });
+  await settleUntil(() => root.textContent!.includes("Retried →"), { label: "server retriedBy link" });
+  expect(spent().disabled).toBe(true);
+  expect(root.querySelector(`[data-message-id="${retried.messageId}"]`)?.textContent).toContain("Retry of an interrupted request");
+});

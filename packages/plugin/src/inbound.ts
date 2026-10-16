@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 // #113: the reply-options contract, used to compile-check the reasoning fragment
 // below against the SDK rather than trusting the field name by eye.
@@ -12,7 +13,9 @@ import {
 
 import { WEBCHANNEL_ID, ANON_PEER_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel, InboundWsMessage } from "./channel-contract.js";
-import { resolveDmAdmission } from "./dm-allowlist.js";
+import { enforceDmAdmission, type DmSecurityConfig } from "./dm-allowlist.js";
+import { resolvePeerCommandAuthorization } from "./command-gate.js";
+import { usableId } from "./ingress-dedupe.js";
 import {
   resolveWebchannelAccountConfig,
   resolveReasoningEnabled,
@@ -48,6 +51,7 @@ import {
   resolveStreamingMode,
   createProgressDraftController,
   createReasoningDraftController,
+  nextMessageId,
 } from "./message-adapter.js";
 import type {
   ProgressDraftController,
@@ -548,6 +552,38 @@ function deliveryAssistantMessageIndex(info: unknown): number | undefined {
 }
 
 /**
+ * #415 C4: core's reply pipeline prefixes EVERY normalized payload, durable
+ * reasoning included, but the response prefix belongs to the answer only. The
+ * payload transform is the pipeline's one per-payload hook that runs before the
+ * prefix is applied, so it records the reasoning text there; delivery recovers
+ * it below. A prefixed copy would also miss the exact-text CLI snapshot replay
+ * suppression and render a second reasoning row.
+ */
+const REASONING_TEXT_BEFORE_PREFIX = Symbol("webchannel.reasoningTextBeforePrefix");
+type ReasoningTextTaggedPayload = ReplyPayload & {
+  [REASONING_TEXT_BEFORE_PREFIX]?: string;
+};
+
+function tagReasoningTextBeforePrefix(payload: ReplyPayload): ReplyPayload {
+  if (payload.isReasoning !== true || typeof payload.text !== "string") return payload;
+  const tagged: ReasoningTextTaggedPayload = {
+    ...payload,
+    [REASONING_TEXT_BEFORE_PREFIX]: payload.text,
+  };
+  return tagged;
+}
+
+/**
+ * Core prepends `${prefix} `, so the delivered text still ends with the tagged
+ * text. Anything else (a later hook rewrote the payload, or no tag survived)
+ * keeps the delivered text unchanged.
+ */
+function reasoningTextWithoutPrefix(payload: ReplyPayload): string | undefined {
+  const before = (payload as ReasoningTextTaggedPayload)[REASONING_TEXT_BEFORE_PREFIX];
+  return before !== undefined && payload.text?.endsWith(before) ? before : payload.text;
+}
+
+/**
  * Route one draft-mode final without consuming a lane more than once.
  *
  * Notice classification is the only guard here that the downstream lane state
@@ -816,25 +852,77 @@ function releaseAgentLifecycleSubscription(options: {
     agentRunToolActivitySinks.clear();
   }
   if (options.rearmDiagnostics) reasoningEmptyLaneWarned.clear();
-  // #93: host teardown draws a new approval-origin barrier. Any request the
-  // gateway replays from BEFORE this point can no longer be attributed to a
-  // live run, so it is refused rather than matched against whatever is running
-  // after the reload. Rotation deliberately does NOT drop active claims: the
-  // queue lets a running handler settle instead of aborting it
-  // (`inbound-queue.ts:393`), and that handler still owns its lease until its
-  // own `finally` — it can still legitimately emit approvals for requests it
-  // creates after the new barrier.
+  // #267: this function does NOT rotate the approval-origin epoch, and must not
+  // start doing so again.
   //
-  // Swallowed on failure: the getter throws when the versioned global slot holds
-  // an incompatible registry, and a teardown that cannot rotate must not take
-  // the rest of the host's cleanup down with it. That condition is never silent
-  // overall — the same getter throws loudly at `startAgentLifecycleSubscription`
-  // and on every turn, which is where it is actionable.
-  try {
-    getApprovalOriginRegistry().rotateEpoch();
-  } catch {
-    /* teardown continues */
-  }
+  // #93 drew the barrier here on the reading that releasing this subscription is
+  // a host teardown. It is not one. `registerFull` wires BOTH ends of this
+  // function — it calls `startAgentLifecycleSubscription` (whose replace-don't-
+  // stack path lands here) and registers a runtime lifecycle whose `cleanup`
+  // calls `stopAgentLifecycleSubscription` (which also lands here) — and the
+  // host re-registers plugins per load profile, several times inside a single
+  // turn. Measured on a live gateway: four rotations between `createLease()` and
+  // `onAgentRunStart`, from both entry points, on every turn. The lease was then
+  // recorded unprovable and EVERY approval was dropped as `active_no_match`.
+  //
+  // The listener this function owns carries turn verdicts and tool activity. It
+  // does not own the approval request stream, so replacing it cannot replay an
+  // approval request and no barrier is owed here. The barrier lives with the
+  // `approval.native` runtime context instead — see `startClawApprovalMonitor`.
+  //
+  // This is the same shape as #113's `rearmDiagnostics`: shared teardown state
+  // that a mere (re)start must not touch. That flag exists two lines above for
+  // exactly this reason.
+}
+
+/**
+ * #396: re-send cadence for the turn's `typing` frame. Telegram renews its
+ * typing chat action every 4s for the life of the turn
+ * (`TELEGRAM_CHAT_ACTION_INTERVAL_MS`); we use the same cadence. It must stay
+ * well under the client's application-stall timeout (`ackStallTimeoutMs`,
+ * default 30s): `typing` is the only frame a quiet turn — a long tool call with
+ * `streaming.mode:"off"` — emits, and the client treats a silent accepted turn
+ * as a stalled connection and reconnects, which drops its Stop button.
+ */
+export const TYPING_KEEPALIVE_INTERVAL_MS = 4_000;
+
+/**
+ * #396: emit `typing` now and every {@link TYPING_KEEPALIVE_INTERVAL_MS} until
+ * the returned stop runs or `abortSignal` fires (`/stop` and account dispose
+ * both abort the dispatch ownership). The turn's `finally` owns the stop, so
+ * every exit path clears the timer.
+ *
+ * Each send is best-effort exactly like the single send it replaces: the
+ * transport gates it on `capabilities.typing`, drops it while the relay is down
+ * (`typing` is never journaled, so nothing queues for a later flush), and
+ * reports `false` instead of throwing. A throwing transport is still caught —
+ * an exception escaping a timer callback would crash the gateway process.
+ */
+function startTypingKeepalive(
+  transport: WebChannelPeerChannel,
+  peerId: string,
+  abortSignal: AbortSignal | undefined,
+): () => void {
+  const send = (keepalive = false) => {
+    try {
+      if (keepalive) transport.sendTyping(peerId, true);
+      else transport.sendTyping(peerId);
+    } catch {
+      // Best-effort indicator; the next tick or the turn's own frames follow.
+    }
+  };
+  send();
+  if (abortSignal?.aborted) return () => {};
+  // Renewals prove liveness only: the initial indicator must stay cleared after
+  // output or approval so ordinary followups retain immediate admission.
+  const timer = setInterval(() => send(true), TYPING_KEEPALIVE_INTERVAL_MS);
+  timer.unref?.();
+  const stop = () => {
+    clearInterval(timer);
+    abortSignal?.removeEventListener("abort", stop);
+  };
+  abortSignal?.addEventListener("abort", stop, { once: true });
+  return stop;
 }
 
 /**
@@ -894,6 +982,10 @@ export async function handleInboundMessage(
   servingTenant: string,
   options?: {
     controlLane?: boolean;
+    dispatchAbortSignal?: AbortSignal;
+    /** Persist the exact dispatch batch before a successful transient settlement. */
+    onSettled?: (outcome: "ok" | "error") => boolean;
+    beforeCore?: (agentId: string, sessionKey: string) => void;
     /** Injectable only so the session opt-out privacy boundary is testable. */
     reasoningOptOutStore?: ReasoningOptOutStoreAccess;
   },
@@ -913,9 +1005,22 @@ export async function handleInboundMessage(
   // still-live running turn — see `src/control-lane.ts` and index-nats.ts. Two
   // things differ for a control-lane turn: (1) no progress draft — the abort's
   // reply is a single short final text, so a "Working…" bubble for it is noise;
-  // (2) we stamp CommandAuthorized on the turn context (see the buildContext
-  // call) so core's fast-abort accepts it.
+  // (2) it never settles (see `settlementEligible`). Core's fast-abort accepts
+  // it through the effective CommandAuthorized stamp every admitted turn
+  // carries, after applicable core command policy is resolved (#407, see the
+  // buildContext call).
   const controlLane = options?.controlLane === true;
+  // Core's dedupe route omits tenant and reduces a session key to its agent.
+  // Supply a stable, fully scoped platform ID; the wire ID remains ACK-only.
+  const coreMessageId = usableId(message.id) ? `webchannel-${createHash("sha256")
+    .update(JSON.stringify([servingTenant, accountId, peerId, usableId(message.random_id) ? message.random_id : message.id]))
+    .digest("hex")}` : undefined;
+  // ⚠️ The non-fallback branch (`message.id`) is UNTRUSTED peer input used as an
+  // identity: since #242 half 3, `(turnId, id)` keys durable tool rows in the
+  // client reducer's `applyTool`, so a reused `message.id` (outside #275's
+  // windowed dedupe) silently merges two distinct tool calls. Known/accepted —
+  // #323; real fix is server-minted turn ids (#243). The fallback below only
+  // covers a message that carries no id at all.
   const turnId =
     message.id ??
     `webchannel-turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -939,7 +1044,14 @@ export async function handleInboundMessage(
   // turn's ANSWER, which is what the outcome actually means (see the settle
   // computation in `finally`).
   let answerDelivered = false;
+  // Payload order classifies trailing tool warnings even when a block was
+  // suppressed in favor of its draft. Store acceptance is checked separately.
+  let answerPayloadSeen = false;
   let terminalErrorSeen = false;
+  // #415 C7: a final that carried only (unsupported) media. Decided at
+  // settlement, because core re-sends media as its own final after the answer
+  // text was block-streamed, and a media-only final may precede a text final.
+  let undeliveredMediaFinalSeen = false;
   // Final reconciliation is deliberately independent of block callback counts
   // and of `answerDelivered` (which also tracks actual block output for #87).
   // Only the first ordinary, non-notice final before a leading terminal error
@@ -959,6 +1071,8 @@ export async function handleInboundMessage(
    * not be in scope there.
    */
   let originLease: ApprovalOriginLease | undefined;
+  /** #396: stops this turn's typing keepalive; the `finally` below owns it. */
+  let stopTypingKeepalive: (() => void) | undefined;
 
   try {
     const channelRuntime = api.runtime.channel;
@@ -982,23 +1096,27 @@ export async function handleInboundMessage(
   //    the answer text replaces the scaffold in the same draft.
   //  - "progress": tool-lines-only. Draft is created but `onPartialReply` is
   //    NOT wired — answer text never streams (the deliberate mode distinction).
-  //  - "block"/"off": NO draft. Falls through to the plain no-id `agent_message`
-  //    atomic append (see delivery.deliver below); `replyOptions` is omitted.
+  //  - "block"/"off": NO draft. Falls through to the plain `agent_message`
+  //    atomic append (see delivery.deliver below), which since #238 carries a
+  //    plugin-minted id like every other durable-text egress; `replyOptions` is
+  //    omitted.
   // 가-1 Cycle 2: read the PER-ACCOUNT resolved config (channel-level shared
   // base merged under this account's override), not the flat block, so each
   // account's streaming/dmSecurity/allowFrom apply to its own turns. For the
   // single `"default"` account this is identical to the flat block (regression).
   const channelConfig = resolveWebchannelAccountConfig(api.config, accountId);
 
-  // DM allowlist admission (split-authz, plugin-owned half). When the operator
-  // sets `channels.webchannel.dmSecurity: "allowlist"`, a non-allowlisted peer
-  // is denied here — BEFORE the agent turn runs — so `inbound.run` is never
-  // invoked and no reply is emitted (default-deny). With no `dmSecurity` set,
-  // admission is open, preserving the shipping Gateway-WS behavior.
-  const cc = channelConfig as { allowFrom?: readonly string[]; dmSecurity?: string } | undefined;
-  const admission = resolveDmAdmission(wsKey, {
-    allowFrom: cc?.allowFrom,
-    dmSecurity: cc?.dmSecurity,
+  // DM admission runs before route selection/dispatch. SDK pairing may reply
+  // with a challenge, but only an admitted sender reaches the core turn.
+  // Default open still requires an explicit wildcard in the validated config.
+  const admission = await enforceDmAdmission({
+    peerId: wsKey,
+    accountId,
+    config: channelConfig as DmSecurityConfig,
+    sendPairingReply: async (text) => {
+      if (options?.dispatchAbortSignal?.aborted) return;
+      if (!transport.sendText(wsKey, text, nextMessageId())) throw new Error("webchannel: pairing challenge delivery failed");
+    },
   });
   if (!admission.allowed) {
     settlementEligible = false;
@@ -1007,6 +1125,22 @@ export async function handleInboundMessage(
     );
     return;
   }
+  const commandAuthorized = resolvePeerCommandAuthorization({
+    admission,
+    cfg: api.config,
+    // Mirror the identity fields `buildContext` projects onto the real core
+    // context below so authorization is computed for that exact turn identity.
+    ctx: {
+      Provider: WEBCHANNEL_ID,
+      Surface: WEBCHANNEL_ID,
+      OriginatingChannel: WEBCHANNEL_ID,
+      AccountId: accountId,
+      SenderId: wsKey,
+      From: wsKey,
+      To: wsKey,
+      ChatType: "direct",
+    },
+  });
 
   // Draft enabled for the two streaming modes ("progress" tool-lines-only,
   // "partial" answer-text); answer-text streaming (onPartialReply) is wired
@@ -1026,7 +1160,11 @@ export async function handleInboundMessage(
     toolActivitySink = createAgentToolActivitySink({
       turnId,
       send: (activity) => {
-        transport.sendToolActivity(wsKey, activity);
+        try {
+          if (!transport.sendToolActivity(wsKey, activity)) turnOutcome = "error";
+        } catch {
+          turnOutcome = "error";
+        }
       },
     });
   }
@@ -1039,11 +1177,24 @@ export async function handleInboundMessage(
   // routing is preserved (`agents bind --agent X --bind webchannel:<account>`
   // still routes THIS account's inbound to agent X), but the session key NEVER
   // inherits the operator's global `session.dmScope="main"` — every user's uuid
-  // gets its OWN agent session, so the cross-user transcript leak on the history
-  // snapshot / load_history read paths cannot happen. This is the WRITE site: the
-  // turn is dispatched under this key, and the history READ sites resolve the
-  // SAME key via the SAME helper, so paging/snapshot stay consistent.
+  // gets its OWN agent session, so one user's turns are never appended to
+  // another's transcript and the agent never answers with a context it built
+  // from someone else's conversation.
+  //
+  // ⚠️ THIS IS THE ONLY SITE. An earlier revision of this comment justified the
+  // forced scope by a cross-user leak on "the history snapshot / load_history
+  // read paths", and closed by saying "the history READ sites resolve the SAME
+  // key via the SAME helper". Both are false since #240 half 2: those read paths
+  // are deleted, history is projected from the plugin's own delivery journal
+  // (keyed by peerId, not by the session key), and this call is the last
+  // remaining `resolveWebchannelSessionRoute` in production. The forced scope is
+  // NOT vestigial — the write-side reason above is the stronger one, and it is
+  // now the whole reason. See `session-route.ts`'s module docblock.
+  // Core-initiated outbound (#403) mirrors into this same session through the
+  // shared `buildWebchannelPeerSessionKey`; it is an outbound route, not an
+  // inbound dispatch site.
   const route = resolveWebchannelSessionRoute(api, accountId, wsKey, servingTenant);
+  options?.beforeCore?.(route.agentId, route.sessionKey);
 
   // #93: build this turn's approval-origin lease handle. Creating it claims
   // NOTHING — `activate()` in `onAgentRunStart` is what publishes the claim, so
@@ -1089,10 +1240,12 @@ export async function handleInboundMessage(
   // never emitted — so the lane could not be turned on at all, and failed
   // SILENTLY: the turn settled `ok` with the answer intact and simply zero
   // reasoning frames. A channel-private key that core does not co-parse is the
-  // whole point. Deployments may separately authorize named peers through core's
-  // supported command allowlist; the explicit-session veto below covers them.
+  // whole point. Since #407 admitted peers ARE command-authorized, so core now
+  // honors `reasoningDefault` and session reasoning state for them as well; the
+  // lane gate stays channel-owned regardless, and the explicit-session veto
+  // below covers the persisted opt-out.
   //
-  // One session value remains authoritative as a privacy VETO: an allowlisted
+  // One session value remains authoritative as a privacy VETO: a command-authorized
   // browser peer can legitimately run `/reasoning off`, and core persists that
   // explicit choice as `sessionEntry.reasoningLevel="off"`. The non-stream lever
   // treats core mode `off` as streamable, so without this narrow read a later
@@ -1130,6 +1283,12 @@ export async function handleInboundMessage(
   // frame from the agent settles the indicator client-side; we never send a
   // matching "stop" frame.
   //
+  // #396: renew liveness with marked typing frames until the turn ends. These
+  // renewals do not re-arm the indicator or hold followup input. "Is this turn still running" is a fact only this side
+  // knows; a single frame at turn start left a long quiet tool call looking
+  // like a dead connection to the client, whose stall recovery then dropped
+  // the turn's Stop button. The `finally` stops the timer on every exit.
+  //
   // The transport gates the frame on `channels.webchannel.capabilities.typing`
   // (default "on"), so when an operator sets it to "off" this call is a no-op.
   // It is also best-effort (no ack/retry) and drop-only under backpressure —
@@ -1147,7 +1306,7 @@ export async function handleInboundMessage(
   // leave the button stuck in Stop mode with nothing to release it. Skipping
   // typing keeps the abort lane silent unless it has a real terminal frame.
   if (!controlLane) {
-    transport.sendTyping(wsKey);
+    stopTypingKeepalive = startTypingKeepalive(transport, wsKey, options?.dispatchAbortSignal);
   }
 
     await channelRuntime.inbound.run({
@@ -1156,7 +1315,7 @@ export async function handleInboundMessage(
       raw: message,
       adapter: {
         ingest: (raw) => ({
-          id: `webchannel-${Date.now()}`,
+          id: coreMessageId ?? `webchannel-${Date.now()}`,
           timestamp: Date.now(),
           rawText: raw.text,
           textForAgent: raw.text,
@@ -1164,28 +1323,24 @@ export async function handleInboundMessage(
           raw,
         }),
         resolveTurn: (input) => {
+          if (options?.dispatchAbortSignal?.aborted) throw new Error("webchannel: dispatch retired before context resolution");
           const ctxPayload = channelRuntime.inbound.buildContext({
             channel: WEBCHANNEL_ID,
+            ...(coreMessageId ? { messageId: coreMessageId } : {}),
             // S1: stamp the serving account on the turn context. Core copies
             // this into `ctx.AccountId` → the agent-run request's `accountId`
             // → the approval request's `turnSourceAccountId`, which is what
             // lets each account's native approval handler claim ONLY its own
             // turns' approvals (and the prompt deliver on the right channel).
             accountId,
-            // Control lane (P1-8a): stamp CommandAuthorized for THIS turn only.
-            // Core's fast-abort (`tryFastAbortFromMessage`) runs before the
-            // per-session busy gate but requires `resolveCommandAuthorization`'s
-            // `isAuthorizedSender`, which with no `commands.allowFrom` reduces to
-            // `ctx.CommandAuthorized`. `buildContext` sets that to false unless
-            // `access.commands.authorized` is passed. We stamp it ONLY on the
-            // abort lane (not every turn) so we don't broadly enable text
-            // commands for every peer. It is safe here because webchannel peers
-            // are JWT-authenticated with FORCED per-peer session isolation
-            // (`resolveWebchannelSessionRoute`) — an abort can only ever target
-            // the sender's OWN session, never another peer's.
-            ...(controlLane
-              ? { access: { commands: { authorized: true } } }
-              : {}),
+            // #407: stamp CommandAuthorized on EVERY turn from the single
+            // policy-aware decision in command-gate.ts. Core's fast-abort,
+            // early reset guard, and whole-message command handling all consume
+            // this value at different stages, so the stamp must already include
+            // applicable core command/owner allowlists. Webchannel routes the
+            // session per peer (subject to configured identity links); actual
+            // command/tool effects remain governed by core policy.
+            access: { commands: { authorized: commandAuthorized } },
             timestamp: input.timestamp,
             from: wsKey,
             sender: { id: wsKey, name: wsKey },
@@ -1214,6 +1369,7 @@ export async function handleInboundMessage(
           return {
             cfg: api.config,
             channel: WEBCHANNEL_ID,
+            accountId,
             agentId: route.agentId,
             routeSessionKey: route.sessionKey,
             storePath,
@@ -1221,12 +1377,20 @@ export async function handleInboundMessage(
             recordInboundSession: channelRuntime.session.recordInboundSession,
             dispatchReplyWithBufferedBlockDispatcher:
               channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher,
+            // Opt into core's responsePrefix and model-selection context. An
+            // omitted pipeline bypasses both, even when messages config sets a
+            // prefix. Typing remains owned by this turn's existing keepalive.
+            // The explicit transform keeps reasoning recoverable unprefixed;
+            // this channel registers no plugin transform it would displace.
+            replyPipeline: { transformReplyPayload: tagReasoningTextBeforePrefix },
             // `replyOptions` is UNCONDITIONAL — it is present on every turn,
             // including block/off streaming and the control lane, because
             // `onAgentRunStart` (below) must fire for all of them. Only the
             // reasoning and draft callbacks inside it are conditional, each on
             // its own lane having opened.
             replyOptions: {
+                    ...(options?.dispatchAbortSignal ? { abortSignal: options.dispatchAbortSignal } : {}),
+                    ...(options?.dispatchAbortSignal ? { onTurnAdopted: () => { if (options.dispatchAbortSignal!.aborted) throw new Error("webchannel: dispatch retired before core run"); } } : {}),
                     // #87: always wired, on every turn and every streaming mode
                     // — this is how the turn learns which agent run's lifecycle
                     // terminal is its own.
@@ -1239,6 +1403,7 @@ export async function handleInboundMessage(
                     // this far is a real agent run and claims too — as
                     // `presence`, so it is recorded but never selectable.
                     onAgentRunStart: (runId) => {
+                      reasoning?.startRun(runId);
                       agentRunId = runId;
                       agentRunIds.add(runId);
                       if (
@@ -1303,6 +1468,17 @@ export async function handleInboundMessage(
                           | "onReasoningEnd"
                         >)
                       : {}),
+                    // Native reasoning resets per assistant message, independently
+                    // of answer streaming mode. Both controllers receive the same
+                    // public boundary, before that message's partial callbacks.
+                    ...(reasoning || (draft && answerStreamingEnabled)
+                      ? ({
+                          onAssistantMessageStart: () => {
+                            reasoning?.startMessage();
+                            if (draft && answerStreamingEnabled) draft.handleAssistantMessageBoundary();
+                          },
+                        } satisfies Pick<GetReplyOptions, "onAssistantMessageStart">)
+                      : {}),
                     // Progress-draft callbacks (only when a draft exists, i.e.
                     // streaming.mode "progress"/"partial"). These fire DURING the
                     // agent run and feed the rolling draft. We also set
@@ -1353,12 +1529,6 @@ export async function handleInboundMessage(
                                     replace: p.replace,
                                   });
                                 },
-                                onAssistantMessageStart: () => {
-                                  // Core fires this before that message's first
-                                  // chunk, and the two callbacks share one FIFO,
-                                  // so neither can overtake the other.
-                                  draft!.handleAssistantMessageBoundary();
-                                },
                                 onBlockReplyQueued: (payload, context) => {
                                   // Durable reasoning belongs exclusively to the
                                   // reasoning lane. Letting it reserve an answer
@@ -1379,7 +1549,6 @@ export async function handleInboundMessage(
                           | "onToolStart"
                           | "onItemEvent"
                           | "onPartialReply"
-                          | "onAssistantMessageStart"
                           | "onBlockReplyQueued"
                         >)
                       : {}),
@@ -1431,7 +1600,7 @@ export async function handleInboundMessage(
                   if (reasoning) {
                     reasoningPayloadSeen = true;
                     reasoning.pushDurableBlock({
-                      text: payload.text,
+                      text: reasoningTextWithoutPrefix(payload),
                       isReasoningSnapshot: payload.isReasoningSnapshot,
                     });
                   }
@@ -1440,6 +1609,18 @@ export async function handleInboundMessage(
                 const noticeFlags = noticeFlagsOf(payload);
                 const isNotice = isCoreNoticePayload(payload);
                 const text = payload.text;
+                // Media is not supported by this channel. A final consisting
+                // only of attachments is a refused delivery, just like a
+                // failed sendText, even when core finished its work cleanly —
+                // unless the turn's answer text reached the widget anyway (see
+                // settlement in `finally`). Silence and text-bearing replies
+                // keep their existing rules.
+                if (kind === "final" && !text?.trim()
+                  && (payload.mediaUrl?.trim() || payload.mediaUrls?.some(url => url.trim()))) {
+                  undeliveredMediaFinalSeen = true;
+                  api.logger?.warn?.(`webchannel: media-only final was not delivered for peer=${logSafe(wsKey)} turn=${logSafe(turnId)}`);
+                  return { visibleReplySent: false };
+                }
                 if (!text) {
                   // #94: a text-less BLOCK — media-only, or text stripped by a
                   // hook — sends nothing, but core still SETTLES it at the
@@ -1470,7 +1651,7 @@ export async function handleInboundMessage(
                 // resolving different copies of the openclaw module would make
                 // the lookup silently return false.
                 //
-                // `!answerDelivered` carries those cases. Core builds the payload
+                // `!answerPayloadSeen` carries those cases. Core builds the payload
                 // array as [terminal error?, ..., answers..., tool warning?]
                 // (payloads-*.js:180/:251/:285) and the dispatcher sends every
                 // element (dispatch-*.js:1966), so a terminal error PRECEDES the
@@ -1498,22 +1679,16 @@ export async function handleInboundMessage(
                     if (
                       kind === "final" &&
                       !isReplyPayloadNonTerminalToolErrorWarning(payload) &&
-                      !answerDelivered
+                      !answerPayloadSeen
                     ) {
                       terminalErrorSeen = true;
                     }
                   } else if (!isNotice) {
-                    answerDelivered = true;
+                    answerPayloadSeen = true;
                   }
                 }
-                // P0-4 DECISION: `visibleReplySent:false` (a final-frame send that
-                // failed) does NOT suppress the later `turn_settled{outcome:"ok"}`
-                // — the turn genuinely settled without error, so the client's
-                // send-receipt correctly reaches `completed` (it tracks the USER
-                // message's fate, not answer delivery). The dropped answer text is
-                // recovered by the register-time history snapshot (recovery lanes
-                // §5 L3/L6), never by faking the turn outcome.
-                //
+                // Acceptance is recorded only after the channel accepts the
+                // output. Buffered draft finals also require the drain verdict.
                 // #111: only an authorized BLOCK may expose the pinned
                 // runtime's observed assistant ordinal. It is attempt-local and
                 // may repeat inside one user turn after model fallback, so it is
@@ -1532,6 +1707,7 @@ export async function handleInboundMessage(
                       : {}),
                     ...noticeFlags,
                   });
+                  if (sent && payload.isError !== true && !isNotice) answerDelivered = true;
                   return { visibleReplySent: sent };
                 }
                 if (draft && kind === "final") {
@@ -1541,23 +1717,51 @@ export async function handleInboundMessage(
                     text,
                     finalReconciliation,
                   );
-                  if (sent) finalReplyDelivered = true;
+                  if (sent) {
+                    finalReplyDelivered = true;
+                    if (payload.isError !== true && !isNotice) answerDelivered = true;
+                  }
                   return { visibleReplySent: sent };
                 }
+                // #238: the plugin owns identity and mints it AT the delivery
+                // act.
+                //
+                // ⚠️ This is the fall-through for a delivery NO DRAFT CLAIMED —
+                // NOT "the no-draft path". The two guards above claim only
+                // `draft && kind === "block"` and `draft && kind === "final"`,
+                // and `ReplyDispatchKind` is `"tool" | "block" | "final"`, so we
+                // arrive here either with no draft at all OR with a LIVE draft
+                // that does not handle this `kind` — a `kind: "tool"` delivery
+                // alongside a live draft is the shape the types permit (not a
+                // measured case; nothing here depends on how often core takes
+                // it). Do not read this branch as
+                // "no draft can exist here" and conclude there is no lane state
+                // nearby — there may be one; this send simply is not part of it.
+                //
+                // Each such send is its own new bubble, so mint a fresh id per
+                // call and never reuse one across calls. Before this the frame
+                // went out id-less and the client invented `a-N` from a
+                // client-local counter, which is exactly the viewer-minted
+                // durable id the NOT-list forbids (N4/N5). Behavior is otherwise
+                // unchanged: same text, same order, same `turnId`, same ordinal.
+                const messageId = nextMessageId();
                 const sent =
                   assistantMessageIndex === undefined
-                    ? transport.sendText(wsKey, text, undefined, turnId)
+                    ? transport.sendText(wsKey, text, messageId, turnId)
                     : transport.sendText(
                         wsKey,
                         text,
-                        undefined,
+                        messageId,
                         turnId,
                         assistantMessageIndex,
                       );
                 if (sent && kind === "final") finalReplyDelivered = true;
+                if (sent && (kind === "final" || kind === "block") && payload.isError !== true && !isNotice) answerDelivered = true;
+                if (!sent) turnOutcome = "error";
                 return { visibleReplySent: sent };
               },
               onError: (_error, info) => {
+                turnOutcome = "error";
                 draft?.noteDeliveryLifecycle("error", {
                   deliveryKind: info.kind,
                 });
@@ -1576,7 +1780,19 @@ export async function handleInboundMessage(
     await draft?.drain();
   } catch (err) {
     turnOutcome = "error";
-    api.logger.error?.(`webchannel: inbound dispatch failed: ${logSafe(err)}`);
+    // A CANCELLED dispatch is not a failure to apologize for. `/stop` between
+    // the claim and core's admission (or the `onTurnAdopted` refusal above)
+    // makes core throw the abort reason, and the user has already been told
+    // what they asked for: an apology bubble here is a durable, journaled
+    // "something went wrong" for a turn the user themselves stopped. The
+    // outcome stays `error` and the drain still runs — only the bubble and the
+    // severity change.
+    const dispatchAborted = options?.dispatchAbortSignal?.aborted === true;
+    if (dispatchAborted) {
+      api.logger.info?.(`webchannel: inbound dispatch was cancelled before core admission: ${logSafe(err)}`);
+    } else {
+      api.logger.error?.(`webchannel: inbound dispatch failed: ${logSafe(err)}`);
+    }
     // Surface a thrown turn independently before terminal cleanup. That gives
     // the apology the first claim attempt on an ownerless tool preview without
     // replacing any assistant lane that already streamed real text. A turn
@@ -1584,7 +1800,7 @@ export async function handleInboundMessage(
     // below remains its idempotent terminal cleanup.
     if (draft) {
       try {
-        if (!finalReplyDelivered) {
+        if (!finalReplyDelivered && !dispatchAborted) {
           await draft.deliverIndependentFinal({
             text: "Sorry — something went wrong while answering. Please try again.",
           });
@@ -1595,13 +1811,20 @@ export async function handleInboundMessage(
           `webchannel: draft error-drain failed: ${logSafe(drainErr)}`,
         );
       }
-    } else if (!controlLane && !finalReplyDelivered) {
-      const sent = transport.sendText(
-        wsKey,
-        "Sorry — something went wrong while answering. Please try again.",
-        undefined,
-        turnId,
-      );
+    } else if (!controlLane && !finalReplyDelivered && !dispatchAborted) {
+      // #238: mint at the delivery act here too — the apology is a real durable
+      // bubble on the client, so the plugin (not the viewer) names it.
+      let sent = false;
+      try {
+        sent = transport.sendText(
+          wsKey,
+          "Sorry — something went wrong while answering. Please try again.",
+          nextMessageId(),
+          turnId,
+        );
+      } catch {
+        // A store failure must not escape cleanup or manufacture a receipt.
+      }
       if (!sent) {
         api.logger?.warn?.(
           `webchannel: error fallback reply was not delivered for peer=${logSafe(wsKey)} turn=${logSafe(turnId)}`,
@@ -1613,9 +1836,11 @@ export async function handleInboundMessage(
     // the only thing keeping this run's claim in the registry, and a claim that
     // outlives its run poisons its tuple for every later origin on the same
     // key. Normal return, throw, provider error and abort all pass through
-    // here; the claim is removed by its own id, so a run retained across a
-    // teardown rotation releases only itself.
+    // here; the claim is removed by its own id, so a run retained when an
+    // approval-stream restart rotates the barrier releases only itself.
     originLease?.release();
+    // #396: retire this turn's liveness source before later cleanup can throw.
+    stopTypingKeepalive?.();
     if (toolActivitySink) {
       for (const runId of agentRunIds) {
         unregisterAgentRunToolActivitySink(runId, toolActivitySink);
@@ -1626,6 +1851,12 @@ export async function handleInboundMessage(
     // no-op when no draft was created or it was already stopped by finalize().
     draft?.stop();
     reasoning?.stop();
+    if (draft?.deliveryFailed || reasoning?.deliveryFailed) turnOutcome = "error";
+    // #415 C7: dropped media fails the turn only when it was the whole answer.
+    // `answerPayloadSeen` (not `answerDelivered`) because a partial-mode block
+    // suppressed as redundant with its streamed lane is still visible answer
+    // text; a failed answer delivery already settles `error` on its own path.
+    if (undeliveredMediaFinalSeen && !answerPayloadSeen) turnOutcome = "error";
     // #87: settle `error` when core handed us a terminal failure instead of an
     // answer (see the classification in the delivery seam). This only ever
     // ASSIGNS `"error"`, so it can never downgrade the `catch` above. A turn
@@ -1635,10 +1866,6 @@ export async function handleInboundMessage(
     // A terminal error that arrives BEFORE partial answer text still wins — the
     // turn failed, and partial output is not a completed answer.
     //
-    // This is distinct from the `visibleReplySent:false` decision at the
-    // delivery seam: that one is about our transport failing to ship an answer
-    // the turn DID produce, which is recovered by the history snapshot. This is
-    // about the turn producing no answer at all.
     // #87: core's own verdict for this turn's agent run decides the outcome.
     // It is authoritative — it separates the two payload shapes this seam
     // cannot (an answered turn reporting a failed mutating tool vs an answered
@@ -1664,6 +1891,28 @@ export async function handleInboundMessage(
     // lane opened and core delivered neither a live callback nor a durable
     // reasoning payload, so the widget showed an empty Reasoning section — the
     // silent failure this issue exists to end.
+    //
+    // ⚠️ IT WATCHES ONLY LANES THAT OPENED, AND #242 half 2 ADDED ITS
+    // COUNTERPART FOR THE LANES THAT DID NOT. The `reasoning &&` guard below
+    // means this says nothing when `capabilities.reasoning` is off — which is
+    // exactly when `capabilities.reasoningDurable: true` records zero rows.
+    // `nats-account-runtime.ts` now warns for that combination at config time,
+    // where it is fixable by flipping one key. The two do not overlap: that one
+    // is about a lane that never opens, this one is about a lane that opened and
+    // stayed empty (whose most likely cause is core's `thinkingLevel === "off"`,
+    // which no channel config can force). Do not merge them.
+    //
+    // ⚠️ THE REASON GIVEN HERE FOR NOT RELAXING THE GUARD WAS FALSE, AND IS CUT:
+    // it read "do not relax this guard to cover the other case — per-turn is the
+    // wrong cadence for a config mistake". This warning is NOT per-turn —
+    // `reasoningEmptyLaneWarned` makes it ONE PER ACCOUNT PER PROCESS, the
+    // scope this file uses everywhere (a real teardown re-arms it on purpose —
+    // see the latch's declaration and `releaseAgentLifecycleSubscription`).
+    // Relaxing
+    // the guard would not produce per-turn output, so that was an argument
+    // against something the code does not do. The real reason to keep the cases
+    // apart is the one above: they have different causes and different fixes,
+    // and only one of them is knowable before a turn runs.
     //
     // Placed AFTER the verdict resolution on purpose. It fires on a turn that
     // ANSWERED SUCCESSFULLY and was not positively known to be aborted — that is
@@ -1748,6 +1997,25 @@ export async function handleInboundMessage(
       );
     }
 
+    // ⚠️ THE DURABLE WRITE IS NOT A GATE ON THE FRAME. `onSettled` persists this
+    // batch's dispatch outcome and reports whether it moved any row; a batch
+    // `/stop` already cancelled moves none. Withholding `turn_settled` for that
+    // is a regression: the frame is what every OTHER device's `isTyping` waits
+    // on in the pre-first-token window, and nothing re-sends it. Eligibility
+    // alone decides the frame, exactly as it did before durable dispatch —
+    // including when the store THROWS. A SQLite fault at this exact instant
+    // would otherwise escape from inside this `finally`, skipping the block
+    // below entirely (and masking any in-flight error on its way into the
+    // dispatcher's `.catch`), so the one promise this comment makes would be
+    // broken by the one failure mode it exists for. The outcome is already
+    // decided; this call only records it.
+    try {
+      options?.onSettled?.(settlementEligible ? turnOutcome : "error");
+    } catch (error) {
+      api.logger?.warn?.(
+        `webchannel: durable settle failed for peer=${logSafe(wsKey)} turn=${logSafe(turnId)} error=${logSafe(error)}`,
+      );
+    }
     if (settlementEligible) {
       // #99: this turn may be the merge of N buffered user messages (P1-8b layer
       // (b) coalescing). Each of them was ACKed and holds its own P0-4 receipt,

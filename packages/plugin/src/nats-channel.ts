@@ -1,3 +1,4 @@
+import type { DispatchChange } from "./dispatch-store.js";
 /**
  * NATS Channel — Plugin-side NATS message channel.
  *
@@ -7,7 +8,7 @@
  * - Publishes to per-peer outbound subjects
  * - Handles multi-peer session routing via peerId
  * - Integrates approvals with first-write-wins exactly-once over NATS
- * - Wires Phase A CryptoNatsChannel for E2E encryption
+ * - Seals frames through e2e-session and the shared envelope codec
  *
  * Architecture:
  * - Plugin subscribes to webchannel.{tenant}.{accountId}.{peerId}.in
@@ -17,8 +18,10 @@
  */
 
 import { inspect } from "node:util";
+import { DurableSendError } from "./durable-send-error.js";
+import { ApprovalOutputRecovery } from "./approval-output-recovery.js";
 import type { NatsTransport, NatsMessage } from "./nats-transport.js";
-import type { ApprovalDecision, ApprovalRequestPayload, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
+import type { ApprovalDecision, ApprovalDecisionRejectReason, ApprovalRequestPayload, ApprovalRequestSendResult, ApprovalResolutionSendOptions, ApprovalResolutionSendResult, DifferenceReply, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
 import type { KeyPair } from "./e2e-crypto.js";
 import type { ConversationKeyStore } from "./conversation-key-store.js";
 import { wrapConversationKey } from "./late-join-decryptor.js";
@@ -27,8 +30,29 @@ import { sealEnvelope, openEnvelope } from "./e2e-session.js";
 import { isValidSubjectToken } from "./subject-token.js";
 import type { CommandCatalogEntry } from "./commands-catalog.js";
 import { createIngressResultChunkWriter } from "./ingress-result-chunks.js";
-import type { IngressResultFrame } from "./ingress-result-chunks.js";
+import type { IngressRejectionReason, IngressResultFrame } from "./ingress-result-chunks.js";
 import { logSafe } from "./log-safe.js";
+// #246 half A: the runtime decoder both receive doors run before anything acts on
+// a frame. Pure and dependency-light (types + one shared length bound), so it adds
+// no runtime dependency of its own.
+import { decodeInboundWsMessage } from "./inbound-wire-decode.js";
+import type { InboundWsDecodeFailure } from "./inbound-wire-decode.js";
+/**
+ * v6 delivery journal (#239). TYPE-ONLY on purpose — the store resolves
+ * `node:sqlite` lazily and this import is erased, so `nats-channel.ts` keeps
+ * pulling in no database runtime. The symbols below are ordinary value imports
+ * because `delivery-journal-event.ts` carries no database/IO runtime dependency
+ * of its own — the property stated at that file's `log-safe.js` import.
+ */
+import type { DeliveryJournal } from "./delivery-journal.js";
+import {
+  isIdlessDurableFrame,
+  isSeqBearingFrame,
+  journalEventForOutbound,
+  type JournalEvent,
+  type JournalPolicy,
+  journalFailureDiagnostic,
+} from "./delivery-journal-event.js";
 
 /** Preserve caught-error detail without changing primitive thrown-value rendering. */
 function formatCaughtDiagnostic(value: unknown): unknown {
@@ -130,6 +154,67 @@ export type NatsChannelLimits = {
   maxSeenMessageIdsPerPeer?: number;
 };
 
+/**
+ * v6 durable-store wiring for `NatsChannel` (#239 half 2).
+ *
+ * ⚠️ ITS OWN PARAMETER, NOT A FIELD OF `NatsChannelLimits`. `NatsChannelLimits`
+ * is memory ceilings; a durable store is not a ceiling, and folding it in there
+ * would make "tune the bounds" and "attach the SSOT" the same argument.
+ *
+ * ⚠️ CONSTRUCTOR-ONLY, DELIBERATELY — there is no `setDeliveryJournal`. The
+ * journal is persist-BEFORE-publish (see `sendToPeer`), so a channel that
+ * acquires one mid-life has already published frames that were never journaled,
+ * and a channel that swaps one has split its conversation across two files. Both
+ * are silent `live ≠ history` divergences (N8). Ownership is decided once, by
+ * whoever constructs the channel.
+ *
+ * OPTIONAL because the plaintext/test construction has no tuple directory to
+ * open a journal in; `nats-account-runtime.ts` is the production owner and
+ * always supplies one (pinned by a source guard in `index-nats-wiring.test.ts`,
+ * precisely because "optional" must not quietly become "absent in production").
+ */
+export type NatsChannelDurability = {
+  /** v6 delivery journal (#239). Absent = no journaling (tests, legacy plaintext mode). */
+  deliveryJournal?: DeliveryJournal;
+  /**
+   * #242 half 1: does this account journal REASONING content
+   * (`capabilities.reasoningDurable`)? Absent = NO, which is the shipped
+   * default — see `account-config.ts`'s `resolveReasoningDurable` for why this
+   * is a separate switch from the default-ON live lane.
+   *
+   * Resolved ONCE at account start and carried here, alongside the journal it
+   * governs, rather than read from config per frame: `sendToPeer` is on the hot
+   * egress path, and a policy that can change under a live channel is the same
+   * split-conversation hazard the journal itself is constructor-only to avoid.
+   */
+  reasoningDurable?: boolean;
+};
+
+/**
+ * #341: the two frames whose journal append happens in `publishApprovalFrame`,
+ * ABOVE `sendToPeer`'s refusals, instead of inside it below them. Written as an
+ * `Extract` over the wire union rather than a hand-rolled shape so the `seq`
+ * stamping in `publishApprovalFrame` needs no cast and a change to either wire
+ * member reaches it as a compile error.
+ */
+type ApprovalOutboundFrame = Extract<
+  OutboundWsMessage,
+  { type: "approval_request" | "approval_resolved" }
+>;
+
+/**
+ * The runtime half of `ApprovalOutboundFrame`, used by `sendToPeer` to skip the
+ * generic journal hook for the two frames `publishApprovalFrame` already
+ * appended. Deliberately NOT folded into `isSeqBearingFrame`: that predicate
+ * answers "does this type carry a seq on the wire", which is still YES for both
+ * of these (they just get stamped one layer up).
+ */
+function isApprovalOutboundFrame(
+  frame: OutboundWsMessage,
+): frame is ApprovalOutboundFrame {
+  return frame.type === "approval_request" || frame.type === "approval_resolved";
+}
+
 /** S2 defaults — high enough that normal operation never evicts. */
 const DEFAULT_MAX_PEERS = 10_000;
 const DEFAULT_MAX_APPROVAL_RESOLUTIONS = 10_000;
@@ -141,6 +226,29 @@ const DEFAULT_MAX_APPROVAL_RESOLUTIONS = 10_000;
 const DEFAULT_REPLAY_WINDOW_MS = 10 * 60 * 1_000;
 const DEFAULT_MAX_SEEN_MESSAGE_IDS_PER_PEER = 2_000;
 const RESULT_LIMIT_WARNING_INTERVAL_MS = 60_000;
+/**
+ * Rate-limit window for the two delivery-journal warnings, matching
+ * `RESULT_LIMIT_WARNING_INTERVAL_MS` and `ingress-outcome.ts`'s limiter. Both
+ * categories fire once per frame when they fire at all, so an unthrottled log
+ * would be one line per outbound message.
+ */
+const DELIVERY_JOURNAL_WARNING_INTERVAL_MS = 60_000;
+
+/**
+ * The FIXED set of delivery-journal warning categories.
+ *
+ * Fixed on purpose, exactly like `ingress-outcome.ts`'s
+ * `OUTCOME_FAILURE_CATEGORIES`: the limiter's keyspace is a closed union, so no
+ * peer-controlled value (an id, a turn id, an error message) can ever become a
+ * map key and grow the warning state, and the emitted line is a fixed template
+ * plus a `logSafe`-quoted peerId plus — for a failure only — the value-free
+ * status `journalFailureDiagnostic` extracts. Never message text.
+ */
+type DeliveryJournalWarning =
+  /** Mapper or append failed; the durable push is refused. */
+  | "append-failed"
+  /** A durable frame carrying no usable id reached egress. Post-#238 a regression. */
+  | "idless-durable-frame";
 
 /**
  * NATS-based message channel for WebChannel.
@@ -159,8 +267,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   // Per-peer subscriptions (peerId -> sid)
   private readonly peerSubscriptions = new Map<string, number>();
 
-  // Per-peer approval deduplication (approvalId -> peerId who first resolved)
-  private readonly approvalResolutions = new Map<string, string>();
+  private readonly approvalOutputs: ApprovalOutputRecovery;
 
   /**
    * S2: unconditional memory bounds. The NATS path has no peer-disconnect
@@ -173,7 +280,6 @@ export class NatsChannel implements WebChannelPeerChannel {
    * unbounded growth (churn or abuse), turning a slow OOM into a fixed ceiling.
    */
   private readonly maxPeers: number;
-  private readonly maxApprovalResolutions: number;
 
   /**
    * F4 anti-replay state. The untrusted relay can re-publish a captured sealed
@@ -215,6 +321,8 @@ export class NatsChannel implements WebChannelPeerChannel {
    * channel (the constructor requires it when `encryptionRequired`); null only
    * in the non-encrypted test construction. See NatsChannelCryptoOptions.
    */
+  private readonly recoveryKeys = new Map<string, { key: Uint8Array; refs: number }>();
+  private dispatchOwnerActive: (() => boolean) | undefined;
   private readonly keyStore: ConversationKeyStore | null;
   /**
    * F2: agent SaaS-attested static identity key pair used to wrap K to a device
@@ -227,12 +335,50 @@ export class NatsChannel implements WebChannelPeerChannel {
   // Message handlers
   private onMessage?: (peerId: string, message: InboundWsMessage) => void;
   private onApprovalDecision?: (peerId: string, id: string, decision: ApprovalDecision) => void;
-  private onLoadHistory?: (peerId: string, request: { before?: string; limit?: number }) => void;
+  private onLoadHistory?: (
+    peerId: string,
+    request: { before?: string; beforeTurnId?: string; limit?: number; nonce?: string },
+  ) => void;
+  // #244 half B: `get_difference` catch-up handler.
+  private onGetDifference?: (peerId: string, afterSeq: number, nonce: string) => void;
   private onLoadCommands?: (peerId: string) => void;
   private onPeerUnregister?: (peerId: string) => void;
   /** Bounded, content-free configuration-warning state for result max_payload. */
   private lastResultLimitWarningAt = Number.NEGATIVE_INFINITY;
   private suppressedResultLimitWarnings = 0;
+
+  // ---- v6 delivery journal (#239 half 2) -----------------------------------
+
+  /** Plugin-owned acceptance authority; history/difference read it elsewhere. */
+  private readonly deliveryJournal: DeliveryJournal | null;
+  /**
+   * #242 half 1: the per-account journaling policy, resolved once at account
+   * start, in the shape the mapper takes.
+   *
+   * ⚠️ THAT IS NOT "the mapper can gain a field without this class gaining one",
+   * which an earlier revision claimed — `NatsChannelDurability` carries a FLAT
+   * `reasoningDurable?: boolean` and the constructor rebuilds the object key by
+   * key, so a second policy field is an edit here either way. Holding the mapper's
+   * own type buys one real thing and it is smaller: the value handed to
+   * `journalEventForOutbound` is constructed once, not per frame.
+   *
+   * `readonly`, like the journal beside it, and for the same reason: a policy
+   * that flipped mid-life would split one conversation into a journaled half and
+   * an unjournaled half, with nothing recording where the seam is.
+   */
+  private readonly journalPolicy: JournalPolicy;
+  /**
+   * Bounded, content-free warning state, one entry per FIXED category. Same
+   * shape as `lastResultLimitWarningAt`/`suppressedResultLimitWarnings` above,
+   * just keyed — see `warnDeliveryJournal`.
+   */
+  private readonly deliveryJournalWarnings: Record<
+    DeliveryJournalWarning,
+    { lastAt: number; suppressed: number }
+  > = {
+    "append-failed": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
+    "idless-durable-frame": { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
+  };
   /**
    * Register-hop admission over NATS (replaces the deleted HTTP register routes).
    * Fired for a plaintext JSON request on `…{peerId}.register`; the handler runs
@@ -252,6 +398,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     tenant: string,
     crypto?: NatsChannelCryptoOptions,
     limits?: NatsChannelLimits,
+    durability?: NatsChannelDurability,
   ) {
     this.transport = transport;
     this.accountId = accountId;
@@ -272,11 +419,32 @@ export class NatsChannel implements WebChannelPeerChannel {
       );
     }
     this.maxPeers = limits?.maxPeers ?? DEFAULT_MAX_PEERS;
-    this.maxApprovalResolutions =
-      limits?.maxApprovalResolutions ?? DEFAULT_MAX_APPROVAL_RESOLUTIONS;
     this.replayWindowMs = limits?.replayWindowMs ?? DEFAULT_REPLAY_WINDOW_MS;
     this.maxSeenMessageIdsPerPeer =
       limits?.maxSeenMessageIdsPerPeer ?? DEFAULT_MAX_SEEN_MESSAGE_IDS_PER_PEER;
+    this.deliveryJournal = durability?.deliveryJournal ?? null;
+    // `=== true`, not `?? false`: a non-boolean reaching here (a hand-built
+    // durability object in a test, a future caller) must fail CLOSED, matching
+    // `resolveReasoningDurable`'s own rule for a present malformed value.
+    this.journalPolicy = { reasoningDurable: durability?.reasoningDurable === true };
+
+    this.approvalOutputs = new ApprovalOutputRecovery({
+      maxResolutions: limits?.maxApprovalResolutions ?? DEFAULT_MAX_APPROVAL_RESOLUTIONS,
+      hasJournal: this.deliveryJournal !== null,
+      journalRequest: (peerId, request) => {
+        if (this.journalOutbound(peerId, { type: "approval_request", ...request }) === undefined) {
+          throw new DurableSendError("approval_request", request.id);
+        }
+      },
+      sendResolution: (peerId, id, decision, journal) =>
+        this.publishApprovalFrame(peerId, { type: "approval_resolved", id, decision }, journal),
+      onFailure: (id, reason, attempts) => {
+        console.warn(
+          `[nats-channel] approval output unjournaled account=${logSafe(this.accountId)} ` +
+            `approval=${logSafe(id)} reason=${logSafe(reason)} attempts=${logSafe(attempts)}`,
+        );
+      },
+    });
 
     // Retain the exact listener identity so account teardown can detach it.
     this.transportMessageListener = (msg: NatsMessage) => {
@@ -291,6 +459,29 @@ export class NatsChannel implements WebChannelPeerChannel {
    * Subscribes to the peer's inbound subject. Called when a browser
    * connects with its bootstrap JWT (peerId from JWT sub claim).
    */
+  /** Accepted work already has peer authority. Restore outbound only; never subscribe inbound. */
+  acquireRecoveryPeer(peerId: string): (() => void) | undefined {
+    if (this.disposed) return undefined;
+    const held = this.recoveryKeys.get(peerId);
+    const key = held?.key ?? this.keyStore?.get(peerId);
+    if (!key) return undefined;
+    const entry = held ?? { key, refs: 0 };
+    entry.refs++;
+    this.recoveryKeys.set(peerId, entry);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (--entry.refs === 0 && this.recoveryKeys.get(peerId) === entry) this.recoveryKeys.delete(peerId);
+    };
+  }
+
+  setDispatchOwnerFence(active: () => boolean): void { this.dispatchOwnerActive = active; }
+
+  sendRequestState(change: DispatchChange): boolean {
+    return this.sendToPeer(change.peerId, { type: "request_state", id: change.id, state: change.state, turnId: change.turnId, seq: change.seq, ...(change.retriedBy ? { retriedBy: change.retriedBy } : {}) });
+  }
+
   registerPeer(peerId: string): void {
     if (this.disposed) throw new Error("NatsChannel is disposed");
     // Phase 6 (keyStore mode): establish the peer's STABLE conversation key K
@@ -415,6 +606,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.approvalOutputs.dispose();
     this.transport.off("message", this.transportMessageListener);
     if (this.registerSid !== undefined) {
       this.transport.unsubscribe(this.registerSid);
@@ -423,11 +615,12 @@ export class NatsChannel implements WebChannelPeerChannel {
     for (const sid of this.peerSubscriptions.values()) this.transport.unsubscribe(sid);
     this.peerSubscriptions.clear();
     this.peerSessionKeys.clear();
+    this.recoveryKeys.clear();
     this.seenMessageIds.clear();
-    this.approvalResolutions.clear();
     this.onMessage = undefined;
     this.onApprovalDecision = undefined;
     this.onLoadHistory = undefined;
+    this.onGetDifference = undefined;
     this.onLoadCommands = undefined;
     this.onPeerUnregister = undefined;
     this.onRegisterRequest = undefined;
@@ -483,8 +676,26 @@ export class NatsChannel implements WebChannelPeerChannel {
     return this.sendText(peerId, text, id, turnId, assistantMessageIndex);
   }
 
-  sendReasoning(peerId: string, id: string, turnId: string, text: string): boolean {
-    return this.sendToPeer(peerId, { type: "reasoning", id, turnId, text });
+  /**
+   * #242 half 1: `final` marks the burst-closing frame — the ONE `reasoning`
+   * frame `journalOutbound` turns into a durable row. The key is omitted when
+   * the flag is absent/false so a live draft frame is byte-identical to what it
+   * was before the flag existed.
+   */
+  sendReasoning(
+    peerId: string,
+    id: string,
+    turnId: string,
+    text: string,
+    final?: boolean,
+  ): boolean {
+    return this.sendToPeer(peerId, {
+      type: "reasoning",
+      id,
+      turnId,
+      text,
+      ...(final === true ? { final: true } : {}),
+    });
   }
 
   sendToolActivity(
@@ -516,6 +727,15 @@ export class NatsChannel implements WebChannelPeerChannel {
     return this.sendToPeer(peerId, { type: "turn_settled", turnId, outcome });
   }
 
+  sendTurnSnapshot(
+    peerId: string,
+    turnId: string,
+    answers: Array<{ id: string; text: string }>,
+    remove: string[],
+  ): boolean {
+    return this.sendToPeer(peerId, { type: "turn_snapshot", turnId, answers, remove });
+  }
+
   /**
    * P0-6: toggle the typing-indicator wire frame for this account's channel.
    * Called once at channel start (index-nats) with the account's resolved
@@ -529,17 +749,91 @@ export class NatsChannel implements WebChannelPeerChannel {
   /**
    * Send typing indicator to peer.
    */
-  sendTyping(peerId: string): boolean {
+  sendTyping(peerId: string, keepalive = false): boolean {
     if (!this.typingEnabled) return false;
-    const payload: OutboundWsMessage = { type: "typing" };
+    const payload: OutboundWsMessage = { type: "typing", ...(keepalive ? { keepalive: true } : {}) };
     return this.sendToPeer(peerId, payload);
   }
 
   /**
    * Send history snapshot to peer.
    */
-  sendHistory(peerId: string, messages: HistoryMessage[]): boolean {
-    const payload: OutboundWsMessage = { type: "history", messages };
+  sendHistory(
+    peerId: string,
+    messages: HistoryMessage[],
+    highWaterSeq?: number,
+    snapshotComplete?: boolean,
+    nonce?: string,
+    omitted?: import("../../client/src/types.js").HistoryOmission[],
+  ): boolean {
+    // #244 half A: `highWaterSeq` is the conversation's authoritative MAX(seq),
+    // attached to the register-time SNAPSHOT only (`history-serve.ts` passes it
+    // there and omits it for the pager). Additive/optional — a `history` frame is
+    // not journaled (`journalEventForOutbound` returns null for it), so it carries
+    // no per-frame `seq`; the high-water is a distinct baseline field.
+    const payload: OutboundWsMessage = {
+      type: "history",
+      messages,
+      ...(omitted?.length ? { omitted } : {}),
+      ...(highWaterSeq !== undefined ? { highWaterSeq } : {}),
+      ...(snapshotComplete !== undefined ? { snapshotComplete } : {}),
+      // #401: a page's correlation echo — the `load_history.nonce` it answers.
+      ...(nonce !== undefined ? { nonce } : {}),
+    };
+    return this.sendToPeer(peerId, payload);
+  }
+
+  /**
+   * #244 half B / #356: answer a `get_difference` with RAW journal events
+   * (`seq > afterSeq`), in ascending `seq` order, for the client to fold onto the
+   * view it already holds. Rides the same sealed `.out` path as every other frame.
+   *
+   * ⚠️ NOT journaled and NOT seq-bearing — a `difference` is a server→client
+   * REPLAY (`journalEventForOutbound` returns null, `isSeqBearingFrame` rejects
+   * it), so `sendToPeer` stamps no `seq` on the FRAME; the per-event `seq` inside
+   * `events` is the cursor. This is the #286-free path: the server ships raw rows
+   * and does NOT run the reducer/projection (contrast `sendHistory`).
+   *
+   * ⚠️ `.out` IS SHARED BY EVERY DEVICE OF THE PEER (#245 Part B — the subject IS
+   * the fan-out, there is no per-device registry), so this reply reaches devices
+   * that did not ask for it. `afterSeq`/`nonce` ride the frame for exactly that
+   * reason: they are echoed straight from the request, and a device folds only
+   * the reply matching its own outstanding one (#351). This method does not mint
+   * or check them — it carries what `history-serve.ts` echoed.
+   */
+  sendDifference(peerId: string, reply: DifferenceReply): boolean {
+    const payload: OutboundWsMessage = { type: "difference", ...reply };
+    return this.sendToPeer(peerId, payload);
+  }
+
+  /**
+   * #245 Part B: broadcast a just-committed inbound USER message to all of the
+   * account's devices on the shared `.out` subject (the fan-out — there is no
+   * per-device registry, doc §16.2-8). The origin reconciles its optimistic
+   * bubble via `random_id`; a non-origin device appends it and advances its seq
+   * cursor so the turn's first agent frame reads as contiguous.
+   *
+   * ⚠️ NOT journaled and NOT seq-bearing — the `user` event is ALREADY committed
+   * (this frame's `id`/`seq`/`random_id` come from `appendInboundUser`), so
+   * `journalEventForOutbound` returns null and `isSeqBearingFrame` rejects it.
+   * The `seq` is set HERE, at construction; `sendToPeer` leaves it untouched
+   * (it only stamps `seq` onto frames `isSeqBearingFrame` accepts). Contrast the
+   * durable senders, whose `seq` is allocated by `sendToPeer`'s persist step.
+   */
+  sendUserCommitted(
+    peerId: string,
+    message: { id: string; text: string; turnId?: string; seq: number; random_id?: string; requestState?: "queued"; retryOf?: string },
+  ): boolean {
+    const payload: OutboundWsMessage = {
+      type: "user_committed",
+      id: message.id,
+      text: message.text,
+      seq: message.seq,
+      ...(message.requestState ? { requestState: message.requestState } : {}),
+      ...(message.retryOf ? { retryOf: message.retryOf } : {}),
+      ...(message.turnId !== undefined ? { turnId: message.turnId } : {}),
+      ...(message.random_id !== undefined ? { random_id: message.random_id } : {}),
+    };
     return this.sendToPeer(peerId, payload);
   }
 
@@ -559,16 +853,23 @@ export class NatsChannel implements WebChannelPeerChannel {
    * key exists (returns false, never plaintext). An EMPTY `ids` is a no-op that
    * returns true without publishing (nothing to ack — e.g. an all-id-less batch).
    */
-  sendAck(peerId: string, ids: string[]): boolean {
-    return this.sendIngressResult(peerId, "ack", ids);
+  sendAck(
+    peerId: string,
+    ids: string[],
+    committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>,
+    cancelled?: string[],
+    unaccepted?: string[],
+  ): boolean {
+    return this.sendIngressResult(peerId, "ack", ids, committed, cancelled, unaccepted);
   }
 
-  sendInboundRejected(peerId: string, ids: string[]): boolean {
-    return this.sendIngressResult(peerId, "inbound_rejected", ids);
+  sendInboundRejected(peerId: string, ids: string[], reason: IngressRejectionReason = "overloaded"): boolean {
+    return this.sendIngressResult(peerId, "inbound_rejected", ids, undefined, undefined, undefined, reason);
   }
 
   /** Actual serialized/sealed length for result-frame admission chunking. */
   outboundWireSize(peerId: string, payload: OutboundWsMessage): number | undefined {
+    payload = this.withJournalEpoch(payload);
     if (!this.encryptionRequired) return Buffer.byteLength(JSON.stringify(payload), "utf8");
     const key = this.peerSessionKeys.get(peerId);
     if (!key) return undefined;
@@ -581,52 +882,79 @@ export class NatsChannel implements WebChannelPeerChannel {
 
   effectiveOutboundLimit(): number { return this.transport.effectiveOutboundLimit; }
 
+  private withJournalEpoch(payload: OutboundWsMessage): OutboundWsMessage {
+    const epoch = this.deliveryJournal?.epoch;
+    return epoch === undefined ? payload : { ...payload, epoch };
+  }
+
   /**
    * Send approval request to peer.
+   *
+   * #341: journals BEFORE the refusals rather than below them — see
+   * `publishApprovalFrame`. `options.redelivery` marks a re-arming push of a
+   * card this plugin already recorded, which publishes without a second row
+   * (`channel-contract.ts` states why the CALLER owns that fact).
    */
   sendApprovalRequest(
     peerId: string,
     request: ApprovalRequestPayload,
-  ): boolean {
-    const payload: OutboundWsMessage = {
+    options?: { redelivery?: boolean },
+  ): ApprovalRequestSendResult {
+    const payload: ApprovalOutboundFrame = {
       type: "approval_request",
       ...request,
     };
-    return this.sendToPeer(peerId, payload);
+    try {
+      return this.publishApprovalFrame(peerId, payload, options?.redelivery !== true);
+    } catch (error) {
+      if (!(error instanceof DurableSendError)) throw error;
+      return { delivered: false, journaled: false };
+    }
+  }
+
+  /** Pending approvals exist server-side independently of peer registration.
+   * Preserve that admission exception and report storage and push separately.
+   * Store faults refuse the push; a redelivery already owns its stored row.
+   */
+  private publishApprovalFrame(
+    peerId: string,
+    payload: ApprovalOutboundFrame,
+    journal: boolean,
+  ): ApprovalRequestSendResult {
+    if (this.disposed) return { delivered: false, journaled: false };
+    const seq = journal ? this.journalOutbound(peerId, payload) : undefined;
+    let delivered = false;
+    try {
+      delivered = this.sendToPeer(
+        peerId,
+        seq !== undefined ? { ...payload, seq } : payload,
+      );
+    } catch {
+      // A failed live push or its diagnostic cannot revoke the journal commit
+      // and make approval output recovery append the same resolution again.
+    }
+    return { delivered, journaled: seq !== undefined };
   }
 
   /**
-   * Resolve approval request (send decision back to peer).
-   *
-   * Implements first-write-wins exactly-once:
-   * - The first peer to resolve an approvalId wins
-   * - Subsequent resolutions for the same approvalId are dropped
+   * Retain the first peer AND decision before attempting storage. Recovery only
+   * retries this output on this channel; journal acceptance is independent from
+   * live delivery. A repeated pending call joins the scheduled work.
    */
-  sendApprovalResolved(peerId: string, id: string, decision: ApprovalDecision): boolean {
-    // First-write-wins exactly-once: check if already resolved
-    const existingResolver = this.approvalResolutions.get(id);
-    if (existingResolver !== undefined) {
-      if (existingResolver !== peerId) {
-        console.log(
-          `[nats-channel] Approval ${logSafe(id)} already resolved by ${logSafe(existingResolver)}, dropping duplicate from ${logSafe(peerId)}`,
-        );
-        return false;
-      }
-    } else {
-      // First resolution: record it
-      this.approvalResolutions.set(id, peerId);
-      // S2: bound the dedup map. It only needs to remember an id long enough to
-      // drop near-simultaneous duplicate resolutions; evicting the oldest once
-      // over the cap keeps memory fixed without weakening that window.
-      while (this.approvalResolutions.size > this.maxApprovalResolutions) {
-        const oldest = this.approvalResolutions.keys().next().value as string | undefined;
-        if (oldest === undefined) break;
-        this.approvalResolutions.delete(oldest);
-      }
-    }
+  sendApprovalResolved(
+    peerId: string,
+    id: string,
+    decision: ApprovalDecision,
+    options?: ApprovalResolutionSendOptions,
+  ): ApprovalResolutionSendResult {
+    return this.approvalOutputs.send(peerId, id, decision, options);
+  }
 
-    const payload: OutboundWsMessage = { type: "approval_resolved", id, decision };
-    return this.sendToPeer(peerId, payload);
+  /** Failed output remains distinguishable from accepted journal rows, including
+   * exhaustion and cancellation/eviction. Counts survive channel disposal.
+   */
+  getApprovalOutputRecoveryStatus() {
+    return this.approvalOutputs.status();
   }
 
   /**
@@ -659,6 +987,21 @@ export class NatsChannel implements WebChannelPeerChannel {
   }
 
   /**
+   * #400: tell the peer the plugin REFUSED its `approval_decision`, so the
+   * clicking device can undo its optimistic mark and show why. Ephemeral and
+   * fanned out like every `.out` frame — the echoed `decision` is what lets the
+   * client pick the card it applies to (see the wire type).
+   */
+  sendApprovalDecisionRejected(
+    peerId: string,
+    id: string,
+    decision: ApprovalDecision,
+    reason: ApprovalDecisionRejectReason,
+  ): boolean {
+    return this.sendToPeer(peerId, { type: "approval_decision_rejected", id, decision, reason });
+  }
+
+  /**
    * Set message handler for user messages.
    */
   setMessageHandler(handler: (peerId: string, message: InboundWsMessage) => void): void {
@@ -678,9 +1021,25 @@ export class NatsChannel implements WebChannelPeerChannel {
    * Set history load handler.
    */
   setLoadHistoryHandler(
-    handler: (peerId: string, request: { before?: string; limit?: number }) => void
+    handler: (
+      peerId: string,
+      request: { before?: string; beforeTurnId?: string; limit?: number; nonce?: string },
+    ) => void
   ): void {
     this.onLoadHistory = handler;
+  }
+
+  /**
+   * #244 half B / #356: set the `get_difference` catch-up handler. Fires on a
+   * `get_difference` request; the handler reads the journal for `seq > afterSeq`
+   * and calls `sendDifference` with `afterSeq`/`nonce` echoed back, so the
+   * requesting device can tell the reply from another device's on the shared
+   * `.out` subject.
+   */
+  setGetDifferenceHandler(
+    handler: (peerId: string, afterSeq: number, nonce: string) => void,
+  ): void {
+    this.onGetDifference = handler;
   }
 
   /**
@@ -749,41 +1108,43 @@ export class NatsChannel implements WebChannelPeerChannel {
     return `webchannel.${this.tenant}.${this.accountId}.${peerId}.out`;
   }
 
+  /** Durable acceptance is the commit; publishing is a separate best-effort push.
+   * Lifecycle and key authority precede both. A relay outage does not revoke
+   * an active conversation's authority to store already-authored output.
+   * Approvals arrive stamped by their own pending-state seam and report push
+   * success here, keeping delivered independent from journaled.
+   */
   private sendToPeer(peerId: string, payload: OutboundWsMessage): boolean {
-    if (this.disposed || !this.transport.connected) {
-      console.warn("[nats-channel] Transport not connected, cannot send");
+    payload = this.withJournalEpoch(payload);
+    if (this.disposed || (this.dispatchOwnerActive && !this.dispatchOwnerActive())) return false;
+    const sessionKey = this.encryptionRequired ? (this.peerSessionKeys.get(peerId) ?? this.recoveryKeys.get(peerId)?.key) : undefined;
+    if (this.encryptionRequired && !sessionKey) {
+      console.warn(
+        `[nats-channel] Refusing to send to ${logSafe(peerId)}: no session key yet (fail-closed, no plaintext)`,
+      );
       return false;
     }
-
-    const subject = this.outboundSubject(peerId);
-
+    const seq = isApprovalOutboundFrame(payload)
+      ? undefined
+      : this.journalOutbound(peerId, payload);
+    if (!this.transport.connected) return seq !== undefined;
+    const outbound: OutboundWsMessage = seq !== undefined && isSeqBearingFrame(payload)
+      ? { ...payload, seq }
+      : payload;
     try {
-      if (this.encryptionRequired) {
-        // Fail-closed: refuse to publish until registration established a
-        // session key. We NEVER fall back to plaintext on the relay.
-        const key = this.peerSessionKeys.get(peerId);
-        if (!key) {
-          console.warn(
-            `[nats-channel] Refusing to send to ${logSafe(peerId)}: no session key yet (fail-closed, no plaintext)`,
-          );
-          return false;
-        }
-        const wire = sealEnvelope(
-          { accountId: this.accountId, tenant: this.tenant, sub: peerId },
-          key,
-          payload,
-        );
-        this.transport.publish(subject, wire);
-        return true;
-      }
-
-      this.transport.publish(subject, JSON.stringify(payload));
+      const subject = this.outboundSubject(peerId);
+      const wire = sessionKey
+        ? sealEnvelope({ accountId: this.accountId, tenant: this.tenant, sub: peerId }, sessionKey, outbound)
+        : JSON.stringify(outbound);
+      this.transport.publish(subject, wire);
       return true;
     } catch (err) {
       console.error(
-        `[nats-channel] Failed to send to peer ${logSafe(peerId)}: ${logSafe(formatCaughtDiagnostic(err))}`,
+        `[nats-channel] Push failed for peer ${logSafe(peerId)} committedSeq=${logSafe(seq ?? "none")} error=${logSafe(formatCaughtDiagnostic(err))}`,
       );
-      return false;
+      // #363: once committed, callers retain the same ID; difference/history
+      // carries the stored frame even if encryption or publishing failed.
+      return seq !== undefined;
     }
   }
 
@@ -797,6 +1158,13 @@ export class NatsChannel implements WebChannelPeerChannel {
     peerId: string,
     type: IngressResultFrame["type"],
     candidates: readonly unknown[],
+    // #243 half 2a: the server-assigned-id echo for an `ack`, attached to the
+    // first published frame by the chunk writer and measured on the wire with it.
+    // #244 half A: each entry also carries the user message's per-conversation seq.
+    committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: true }>,
+    cancelled?: string[],
+    unaccepted?: string[],
+    reason?: IngressRejectionReason,
   ): boolean {
     if (candidates.length === 0) return true;
     const advertisedLimit = this.transport.effectiveOutboundLimit;
@@ -806,14 +1174,21 @@ export class NatsChannel implements WebChannelPeerChannel {
     try {
       const writer = createIngressResultChunkWriter({
         type,
+        reason,
         publish: (frame) => this.sendToPeer(peerId, frame),
         measureWireBytes: (frame) =>
           this.outboundWireSize(peerId, frame)
             ?? Buffer.byteLength(JSON.stringify(frame), "utf8"),
         ...(effectiveOutboundLimit !== undefined ? { effectiveOutboundLimit } : {}),
+        ...(type === "ack" && committed && committed.length > 0 ? { committed } : {}),
         onTooSmall: () => this.warnResultLimitTooSmall(),
       });
-      for (const candidate of candidates) writer.add(candidate);
+      // Match only exact wire IDs from this ACK; never reflect stray proof IDs.
+      // The writer carries each proof with its own ID through count/byte splits.
+      for (const candidate of candidates) {
+        const proof = type === "ack" && typeof candidate === "string" && cancelled?.includes(candidate) === true;
+        writer.add(candidate, proof, proof && unaccepted?.includes(candidate as string) === true);
+      }
       return writer.finish();
     } catch (err) {
       console.error(
@@ -835,6 +1210,50 @@ export class NatsChannel implements WebChannelPeerChannel {
     console.warn(
       "[nats-channel] ingress result frame cannot fit effective NATS max_payload; " +
         `increase the server limit (suppressed=${suppressed})`,
+    );
+  }
+
+  /** Synchronous persist-before-publish. Undefined means policy-excluded or
+   * legacy no-store mode, never a swallowed store failure. Production always
+   * supplies a journal. Refusing an invalid durable text ID avoids live output
+   * that the server could never identify or recover.
+   */
+  private journalOutbound(peerId: string, payload: OutboundWsMessage): number | undefined {
+    if (!this.deliveryJournal) return undefined;
+    if (isIdlessDurableFrame(payload)) {
+      this.warnDeliveryJournal("idless-durable-frame", peerId);
+      throw new DurableSendError(payload.type);
+    }
+    try {
+      const event = journalEventForOutbound(payload, this.journalPolicy);
+      if (!event) return undefined;
+      return this.deliveryJournal.append(peerId, event).seq;
+    } catch (error) {
+      this.warnDeliveryJournal("append-failed", peerId, journalFailureDiagnostic(error));
+      throw new DurableSendError(payload.type, "id" in payload ? payload.id : undefined);
+    }
+  }
+
+  /** Rate-limited, value-free diagnostics. The caller observes every failure
+   * through DurableSendError even while repeated log records are suppressed.
+   */
+  private warnDeliveryJournal(
+    category: DeliveryJournalWarning,
+    peerId: string,
+    diagnostic?: string,
+  ): void {
+    const entry = this.deliveryJournalWarnings[category];
+    const now = Date.now();
+    if (now - entry.lastAt < DELIVERY_JOURNAL_WARNING_INTERVAL_MS) {
+      entry.suppressed++;
+      return;
+    }
+    const suppressed = entry.suppressed;
+    entry.lastAt = now;
+    entry.suppressed = 0;
+    console.error(
+      `[nats-channel] delivery journal ${logSafe(category)} for peer ${logSafe(peerId)}; ` +
+        `durable send refused; diagnostic=${logSafe(diagnostic ?? "none")} suppressed=${logSafe(suppressed)}`,
     );
   }
 
@@ -864,9 +1283,19 @@ export class NatsChannel implements WebChannelPeerChannel {
     }
 
     // Plaintext mode (legacy / gateway-parity): payload is JSON.
+    //
+    // ⚠️ THE `try` STILL WRAPS THE DISPATCH, NOT JUST THE PARSE, AND THAT IS
+    // PRE-EXISTING BEHAVIOUR THIS SLICE DELIBERATELY LEFT ALONE: a handler that
+    // throws is reported on the line below rather than escaping into the
+    // transport's `message` emit. #246 half A only inserts the decode between
+    // the two.
     try {
-      const message = JSON.parse(msg.payload.toString()) as InboundWsMessage;
-      this.dispatchInbound(peerId, message);
+      const decoded = decodeInboundWsMessage(JSON.parse(msg.payload.toString()) as unknown);
+      if (!decoded.ok) {
+        this.warnRefusedInbound(peerId, decoded.failure);
+        return;
+      }
+      this.dispatchInbound(peerId, decoded.message);
     } catch (err) {
       console.error(
         `[nats-channel] Failed to parse message from ${logSafe(peerId)}: ${logSafe(formatCaughtDiagnostic(err))}`,
@@ -947,12 +1376,16 @@ export class NatsChannel implements WebChannelPeerChannel {
       );
       return;
     }
-    let message: InboundWsMessage;
+    // #246 half A: `openEnvelope` returns the decrypted payload as `unknown` and
+    // this used to cast it straight to `InboundWsMessage`. It is decoded below
+    // instead — the cast was the second of the two doors that let an arbitrary
+    // JSON value reach `dispatchInbound`.
+    let raw: unknown;
     let messageId: string;
     let ts: number;
     try {
       const opened = openEnvelope(msg.payload, key);
-      message = opened.message as InboundWsMessage;
+      raw = opened.message;
       messageId = opened.routing.messageId;
       ts = opened.routing.ts;
     } catch (err) {
@@ -965,10 +1398,41 @@ export class NatsChannel implements WebChannelPeerChannel {
     // relay can neither forge nor mutate them — a replay is a byte-identical
     // re-publish. Enforce freshness BEFORE dispatch so a captured frame can't
     // re-run the turn.
+    //
+    // ⚠️ FRESHNESS RUNS BEFORE THE DECODE, DELIBERATELY. The gate is not a
+    // filter, it RECORDS: it inserts `messageId` into the per-peer replay LRU.
+    // Decoding first would drop a malformed frame before its id was recorded, so
+    // a later byte-identical re-publish of that same frame would look fresh.
     if (!this.acceptFreshInbound(peerId, messageId, ts)) {
       return;
     }
-    this.dispatchInbound(peerId, message);
+    const decoded = decodeInboundWsMessage(raw);
+    if (!decoded.ok) {
+      this.warnRefusedInbound(peerId, decoded.failure);
+      return;
+    }
+    this.dispatchInbound(peerId, decoded.message);
+  }
+
+  /**
+   * #246 half A — the ONE log line a refused inbound frame produces, at either
+   * door. Exactly one warn per dropped frame, and never the frame's body: an
+   * `unknown-type` failure carries the peer's raw `type` (wrapped), and every
+   * other failure carries a KNOWN type plus a reason string this codebase owns.
+   *
+   * The two texts are the ones that were already here — `dispatchInbound`'s
+   * `default:` emitted the first and its `approval_decision`/`get_difference`
+   * guards emitted the second — so an operator's greps and the tests that pin
+   * them keep matching after the validation moved to the door.
+   */
+  private warnRefusedInbound(peerId: string, failure: InboundWsDecodeFailure): void {
+    if (failure.kind === "unknown-type") {
+      console.warn(`[nats-channel] Unknown message type: ${logSafe(failure.type)}`);
+      return;
+    }
+    console.warn(
+      `[nats-channel] Invalid ${failure.type} from ${logSafe(peerId)}: ${logSafe(failure.reason)}`,
+    );
   }
 
   /**
@@ -1016,7 +1480,30 @@ export class NatsChannel implements WebChannelPeerChannel {
     return true;
   }
 
-  /** Route a decoded inbound message to the registered handler. */
+  /**
+   * Route a DECODED inbound message to the registered handler.
+   *
+   * ⚠️ PURE ROUTING SINCE #246 half A — every frame reaching this method has
+   * already passed `decodeInboundWsMessage` at the door it came through, so this
+   * is not a validation seam and must not grow back into one. The
+   * `approval_decision` and `get_difference` guards that used to live here are
+   * the decoder's `case`s now, unchanged in effect; keeping a copy here would be
+   * a second schema free to disagree with the first.
+   *
+   * There is likewise no `default:` any more: an unknown `type` never gets past
+   * the decoder, and the `Unknown message type` warn it used to emit is now on
+   * `warnRefusedInbound`.
+   *
+   * ⚠️ THAT DOES NOT MAKE THIS SWITCH tsc-EXHAUSTIVE, AND DO NOT WRITE THAT IT
+   * DOES. This method returns `void`, so a `switch` missing a union member
+   * compiles clean and silently routes nothing. What IS checked at compile time
+   * is one step earlier: `inbound-wire-decode.ts`'s `KnownInboundWsTypesAreExact`
+   * fails tsc if `InboundWsMessage` grows a member the decoder does not list, and
+   * the decoder's own switch RETURNS a value so a missing `case` there cannot
+   * compile. A new member therefore cannot reach this method unrouted without
+   * someone having edited the decoder — but adding the `case` here is still a
+   * manual step.
+   */
   private dispatchInbound(peerId: string, message: InboundWsMessage): void {
     switch (message.type) {
       case "user_message":
@@ -1024,39 +1511,53 @@ export class NatsChannel implements WebChannelPeerChannel {
         break;
 
       case "approval_decision":
-        if (
-          typeof message.id !== "string" ||
-          !(["allow-once", "allow-always", "deny"] as const).includes(message.decision)
-        ) {
-          console.warn(`[nats-channel] Invalid approval_decision from ${logSafe(peerId)}`);
-          break;
-        }
         this.onApprovalDecision?.(peerId, message.id, message.decision);
         break;
 
       case "load_history":
-        this.onLoadHistory?.(peerId, { before: message.before, limit: message.limit });
+        // Shape-checked at the door; the CURSOR SEMANTICS are still owned
+        // downstream — `planHistoryFetch` is the one validator for what
+        // `before`/`beforeTurnId`/`limit` MEAN, and `historyPageBefore` answers a
+        // non-matching pair with an honest empty page rather than an error.
+        this.onLoadHistory?.(peerId, {
+          before: message.before,
+          beforeTurnId: message.beforeTurnId,
+          limit: message.limit,
+          // #401: bounded at the door; carried through to be echoed on the page.
+          nonce: message.nonce,
+        });
+        break;
+
+      case "get_difference":
+        // #244 half B: the serve path passes `afterSeq` straight to
+        // `delivery-journal.read`, which requires a non-negative integer. That
+        // check now runs at the door (#246 half A), which is why nothing is
+        // repeated here — and #356's `nonce` is checked there too (non-empty,
+        // bounded), so this hop carries both through untouched.
+        this.onGetDifference?.(peerId, message.afterSeq, message.nonce);
         break;
 
       case "load_commands":
         this.onLoadCommands?.(peerId);
         break;
-
-      default:
-        console.warn(
-          `[nats-channel] Unknown message type: ${logSafe((message as { type: string }).type)}`,
-        );
     }
   }
 }
 
 /**
  * The exact `NatsChannel` method surface the register-hop wiring reaches to feed
- * `RegisterHandlerDeps` (see index-nats.ts). The register deps are function-
- * injected, and index-nats.ts sits OUTSIDE this package's `tsc` include set, so
- * without this contract nothing would force these methods to keep existing on
- * `NatsChannel`. Derived via `Pick`, so dropping any listed method from the
- * class turns THIS type into a compile error in a type-checked file.
+ * `RegisterHandlerDeps`. The register deps are FUNCTION-INJECTED —
+ * `nats-account-runtime.ts` passes closures like `(pid) =>
+ * registerChannel.registerPeer(pid)` — and a closure body is only checked
+ * against the method it calls, so dropping a method from `NatsChannel` would
+ * surface as an error at that one call site and nowhere else. This `Pick`
+ * makes the whole surface a single named contract instead.
+ *
+ * ⚠️ AN EARLIER VERSION JUSTIFIED THIS BY CLAIMING `index-nats.ts` "sits
+ * OUTSIDE this package's `tsc` include set". VERIFIED FALSE:
+ * `packages/plugin/tsconfig.json` lists `index-nats.ts` in `include`
+ * explicitly (that file records #32 as the fix). The type earns its keep for
+ * the reason above, which does not depend on anything being unchecked.
  */
 export type RegisterChannelSurface = Pick<
   NatsChannel,
@@ -1074,14 +1575,10 @@ export type RegisterChannelSurface = Pick<
  * Clear approval resolution record (for testing or cleanup).
  */
 export function clearApprovalResolutions(channel: NatsChannel): void {
-  // Access private field via type cast
-  (channel as unknown as { approvalResolutions: Map<string, string> }).approvalResolutions.clear();
+  channel["approvalOutputs"].clear();
 }
 
-/**
- * Get approval resolution record (for testing).
- */
+/** Get the retained first resolver (test seam). */
 export function getApprovalResolution(channel: NatsChannel, approvalId: string): string | undefined {
-  const map = (channel as unknown as { approvalResolutions: Map<string, string> }).approvalResolutions as Map<string, string>;
-  return map.get(approvalId);
+  return channel["approvalOutputs"].resolver(approvalId);
 }

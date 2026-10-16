@@ -287,6 +287,8 @@ async function driveTurn(label: string, text: string): Promise<Frame[]> {
     inboundSubj,
     sealMessage({ accountId: ACCOUNT_ID, tenant: TENANT, sub: PEER_ID }, sessionKey, {
       type: "user_message",
+      id: `wire-${randomBytes(8).toString("hex")}`,
+      random_id: `logical-${randomBytes(8).toString("hex")}`,
       text,
     }),
   );
@@ -530,5 +532,12 @@ console.log(
     `progress frame(s) and settled once, in the same bubble (id=${toolFirstAnswer.id}); ` +
     `turn_settled outcome=ok`,
 );
+// Round 7: the real core reset must remain usable with durable dispatch ownership.
+const resetFrames = await driveTurn("Round 7 reset", "/new Confirm the new session is ready.");
+if (resetFrames.find(frame => frame.type === "turn_settled")?.outcome !== "ok"
+  || !resetFrames.some(frame => frame.type === "request_state" && (frame as Frame & { state?: string }).state === "completed")) {
+  fail(6, "Round 7 reset did not complete through durable dispatch");
+}
+console.log("[PROOF] #369 real core /new completed through durable dispatch");
 transport.disconnect();
 process.exit(0);

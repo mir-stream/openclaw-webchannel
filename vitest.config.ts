@@ -10,7 +10,7 @@ export default defineConfig({
     // treat the copy as a test surface.
     //
     // `examples/**` are CONSUMER tests: plain `node` (node:test/TAP) scripts
-    // that import @mir-stream/* by package ENTRY (dist/), run via each
+    // that import openclaw-webchannel-* by package ENTRY (dist/), run via each
     // example's own `npm test`. Under vitest they both need a pre-built dist
     // AND assert node-resolver error codes vite doesn't produce
     // (ERR_PACKAGE_PATH_NOT_EXPORTED) — so vitest must not collect them. The

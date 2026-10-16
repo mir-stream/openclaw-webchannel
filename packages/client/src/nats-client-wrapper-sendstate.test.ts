@@ -1,8 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
+import { ownHistoryPage } from "./history-page.test-harness.js";
 import {
   inboundSubject,
   outboundSubject,
+  registerSubject,
   type OutboundMessage,
 } from "./nats-client.js";
 import { openMessage, sealMessage } from "./e2e-crypto-browser.js";
@@ -18,6 +20,7 @@ import {
   makeAgentIdentity,
   registerAgent,
   settle,
+  settleUntil,
   type AgentIdentity,
   type ServerHandler,
 } from "./nats-client-wrapped.test-harness.js";
@@ -104,6 +107,96 @@ const publishedInputs = (socket: FakeNatsWS, K: Uint8Array): OutboundMessage[] =
     .filter(({ subject }) => subject === IN)
     .map(({ payload }) => openMessage(payload, K) as OutboundMessage | null)
     .filter((message): message is OutboundMessage => message !== null);
+
+describe("#346 public send history reconciliation", () => {
+  it.each([
+    ["history", "ack"], ["ack", "history"], ["committed", "history", "ack"],
+    ["history", "committed", "ack"], ["difference", "history", "ack"], ["unmapped", "ack"],
+  ])("converges equal other-device text through %j", async (...order: string[]) => {
+    const h = await connectWrapper({ ack: false });
+    try {
+      const receipt = h.wrapper.send("same")!;
+      await settle();
+      const sent = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .find((m) => m.type === "user_message")! as Extract<OutboundMessage, { type: "user_message" }>;
+      const snapshot = { type: "history", highWaterSeq: 2, messages: [
+        { id: "other-server", role: "user", text: "same", seq: 1, randomId: "other-random" },
+        { id: "own-server", role: "user", text: "same", seq: 2, randomId: sent.random_id },
+      ] };
+      for (const step of order) {
+        if (step === "ack") deliverOut(h.K, { type: "ack", ids: [sent.id], committed: [
+          { random_id: sent.random_id, messageId: "own-server", seq: 2 },
+        ] });
+        else if (step === "committed") deliverOut(h.K, { type: "user_committed", id: "own-server",
+          text: "same", random_id: sent.random_id, turnId: sent.id, seq: 2 });
+        else if (step === "unmapped") deliverOut(h.K, { ...snapshot,
+          messages: snapshot.messages.map(({ randomId: _randomId, ...row }) => row) });
+        else if (step === "difference") {
+          deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 0 });
+          await settle();
+          deliverOut(h.K, snapshot);
+          await settle();
+          const request = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+            .find((m) => m.type === "get_difference")! as Extract<OutboundMessage, { type: "get_difference" }>;
+          deliverOut(h.K, { type: "difference", afterSeq: request.afterSeq, nonce: request.nonce,
+            partial: false, maxSeq: 2, events: snapshot.messages.map((row) => ({ seq: row.seq,
+              event: { kind: "user", id: row.id, text: row.text, randomId: row.randomId } })) });
+        } else deliverOut(h.K, snapshot);
+        await settle();
+      }
+      deliverOut(h.K, snapshot);
+      deliverOut(h.K, snapshot);
+      await settle();
+      expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(["other-server", "own-server"]);
+      expect(h.wrapper.getState().messages[1]).toMatchObject({ receiptKey: receipt.id, wireId: sent.id, sendState: "accepted" });
+      deliverOut(h.K, { type: "turn_settled", turnId: sent.id, outcome: "ok" });
+      await settle();
+      expect(receipt.snapshot().state).toBe("completed");
+      expect(h.wrapper.getState().messages[1].sendState).toBe("completed");
+    } finally { h.wrapper.close(); }
+  });
+
+  it("hydrates the buffered reconnect snapshot before ledger replay, retaining the own receipt", async () => {
+    const h = await connectWrapper({ ack: false });
+    try {
+      const receipt = h.wrapper.send("same")!;
+      await settle();
+      const sent = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .find((m) => m.type === "user_message")! as Extract<OutboundMessage, { type: "user_message" }>;
+      const events: string[] = [];
+      h.wrapper.subscribe((state) => {
+        if (state.messages.some((row) => row.id === "own-server")) events.push("hydrated");
+      });
+      const original = FakeNatsWS.sharedHandler!;
+      FakeNatsWS.sharedHandler = async (subject, payload, server, replyTo) => {
+        if (subject === registerSubject(TENANT, AGENT, PEER) && JSON.parse(payload).op === "register") {
+          events.push("snapshot");
+          server.deliverToClient(OUT, sealMessage({ accountId: AGENT, tenant: TENANT, sub: PEER }, h.K,
+            { type: "history", highWaterSeq: 2, messages: [
+              { id: "other-server", role: "user", text: "same", seq: 1, randomId: "other" },
+              { id: "own-server", role: "user", text: "same", seq: 2, randomId: sent.random_id },
+            ] } as unknown as OutboundMessage));
+        }
+        await original(subject, payload, server, replyTo);
+        if (subject === IN && (openMessage(payload, h.K) as { type?: string } | null)?.type === "user_message") {
+          events.push("replay");
+          server.deliverToClient(OUT, sealMessage({ accountId: AGENT, tenant: TENANT, sub: PEER }, h.K,
+            { type: "ack", ids: [sent.id], committed: [{ random_id: sent.random_id, messageId: "own-server", seq: 2 }] } as unknown as OutboundMessage));
+        }
+      };
+      FakeNatsWS.instances.at(-1)!.close();
+      await settleUntil(() => events.includes("replay") && receipt.snapshot().state === "accepted", { label: "reconnect replay acknowledged" });
+      expect(events.indexOf("snapshot")).toBeLessThan(events.indexOf("hydrated"));
+      expect(events.indexOf("hydrated")).toBeLessThan(events.indexOf("replay"));
+      expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(["other-server", "own-server"]);
+      expect(h.wrapper.getState().messages[1]).toMatchObject({ receiptKey: receipt.id, wireId: sent.id, sendState: "accepted" });
+      deliverOut(h.K, { type: "turn_settled", turnId: sent.id, outcome: "ok" });
+      await settle();
+      expect(receipt.snapshot().state).toBe("completed");
+      expect(h.wrapper.getState().messages[1].sendState).toBe("completed");
+    } finally { h.wrapper.close(); }
+  });
+});
 /** Record the distinct sendState sequence of the first user bubble matching `text`. */
 function trackBubble(w: WebChannelNATSClient, text: string): string[] {
   const seq: string[] = [];
@@ -562,10 +655,10 @@ describe("WebChannelNATSClient — P0-4 receipt handle (T-rc)", () => {
 
     // History adoption rewrites the bubble id — the receipt id is unchanged and
     // no send-state callback fires.
-    deliverOut(h.K, {
+    deliverOut(h.K, ownHistoryPage(h.wrapper, {
       type: "history",
       messages: [{ id: "srv-held", role: "user", text: "held-msg" }],
-    });
+    }));
     await settle();
     expect(receipt.id).toBe(idBefore);
     expect(cbs.map((c) => c.state)).toEqual(["sent", "accepted"]); // no extra callback
@@ -789,7 +882,7 @@ describe("WebChannelNATSClient — P0-4 held/terminal ownership (T-cl, T-re)", (
 // the receipt at `queued` forever.
 // ---------------------------------------------------------------------------
 describe("WebChannelNATSClient — P0-4 state-listener fault isolation (T-lg)", () => {
-  let errSpy: ReturnType<typeof vi.spyOn>;
+  let errSpy: MockInstance<typeof console.error>;
   beforeEach(() => { errSpy = vi.spyOn(console, "error").mockImplementation(() => {}); });
   afterEach(() => errSpy.mockRestore());
 
@@ -1063,8 +1156,8 @@ describe("WebChannelNATSClient — P0-4 eviction callout vs. the seal (F-A)", ()
   // The ledger cap is a private constant; 101 unacked sends is the first size
   // that evicts. Keep in sync with `MAX_UNACKED` in nats-client.ts.
   const CAP = 100;
-  let errSpy: ReturnType<typeof vi.spyOn>;
-  let warnSpy: ReturnType<typeof vi.spyOn>;
+  let errSpy: MockInstance<typeof console.error>;
+  let warnSpy: MockInstance<typeof console.warn>;
   beforeEach(() => {
     errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -1392,6 +1485,15 @@ describe("WebChannelNATSClient — P0-4 teardown-then-notify (R3-1)", () => {
 
   it("stages /stop from a clear-hook reconnect so it never publishes on the old socket", async () => {
     const h = await connectWrapper();
+    // Reserve the id the deferred /stop would otherwise mint after old-held
+    // (`u-0`) and replacement-before-stop (`u-1`). The replacement staging path
+    // must skip this hydrated transcript row rather than seed a duplicate for
+    // its later reducer-backed materialization.
+    deliverOut(h.K, ownHistoryPage(h.wrapper, {
+      type: "history",
+      messages: [{ id: "u-2", role: "user", text: "historic u-2", ts: 1 }],
+    }));
+    await settle();
     deliverOut(h.K, {
       type: "progress", id: "webchannel-d", text: "working", turnId: "T",
     });
@@ -1402,6 +1504,29 @@ describe("WebChannelNATSClient — P0-4 teardown-then-notify (R3-1)", () => {
     }).heldStallTimer;
     expect(oldTimer).not.toBeNull();
     const oldSocket = FakeNatsWS.instances.at(-1)!;
+
+    // A synchronous replacement-connect callout lands after /stop is staged but
+    // before its wire id is reserved. Final materialization must therefore put
+    // /stop after this durable frame, matching publication order rather than the
+    // staging row's earlier UI position.
+    const innerClient = (h.wrapper as unknown as {
+      client: { connect: () => void };
+    }).client;
+    const realInnerConnect = innerClient.connect.bind(innerClient);
+    let injectedDuringCommit = false;
+    const connectSpy = vi.spyOn(innerClient, "connect").mockImplementation(() => {
+      if (!injectedDuringCommit) {
+        injectedDuringCommit = true;
+        (h.wrapper as unknown as {
+          handleMessage: (message: Record<string, unknown> & { type: string }) => void;
+        }).handleMessage({
+          type: "agent_message",
+          id: "between-stage-and-publish",
+          text: "between staged and published",
+        });
+      }
+      realInnerConnect();
+    });
 
     const realClearTimeout = globalThis.clearTimeout;
     let hookRan = false;
@@ -1444,9 +1569,25 @@ describe("WebChannelNATSClient — P0-4 teardown-then-notify (R3-1)", () => {
       expect(publishedInputs(FakeNatsWS.instances[1], h.K)).toMatchObject([
         { type: "user_message", text: "/stop" },
       ]);
-      expect(h.received).toContain(userBubble(h.wrapper, "/stop")!.wireId!);
+      const stopBubble = userBubble(h.wrapper, "/stop")!;
+      expect(stopBubble.id).toBe("u-3");
+      expect(h.received).toContain(stopBubble.wireId!);
+      expect(stopBubble.turnId).toBe(stopBubble.wireId);
+      expect(stopBubble.pending).toBeUndefined();
+      expect(stopBubble.receiptKey).toBeDefined();
+      expect(injectedDuringCommit).toBe(true);
+      expect(h.wrapper.getState().messages.map((message) => message.id).indexOf(stopBubble.id))
+        .toBeGreaterThan(
+          h.wrapper.getState().messages.map((message) => message.id)
+            .indexOf("between-stage-and-publish"),
+        );
+      expect(h.wrapper.getState().messages.find((message) => message.id === "u-2"))
+        .toMatchObject({ text: "historic u-2", role: "user" });
+      expect(h.wrapper.getState().messages.find((message) => message.id === "u-2"))
+        .not.toHaveProperty("wireId");
     } finally {
       clearSpy.mockRestore();
+      connectSpy.mockRestore();
       h.wrapper.close();
     }
   });
@@ -1910,7 +2051,7 @@ describe("WebChannelNATSClient — P0-4 terminal settles the live-turn UI", () =
     expect(h.wrapper.getState().isTyping).toBe(false);
   });
 
-  it("terminal while a working draft is live flips it working:false in place", async () => {
+  it("terminal while an unfinalized draft is live settles it — #251: by dropping it", async () => {
     const h = await connectWrapper();
     deliverOut(h.K, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
     await settle();
@@ -1920,9 +2061,15 @@ describe("WebChannelNATSClient — P0-4 terminal settles the live-turn UI", () =
     await settle();
 
     expect(h.wrapper.getState().status).toBe("error");
-    const draft = h.wrapper.getState().messages.find((m) => m.id === "webchannel-d")!;
-    expect(draft.working).toBe(false); // settled in place
-    expect(draft.text).toBe("partial…"); // text untouched
+    // A retired instance can never receive the lane's final, so there is nothing
+    // for this draft to settle INTO. This used to assert settled-in-place with
+    // the text untouched — i.e. "partial…" left on screen forever behind an error
+    // banner. #251 drops it instead, as core's built-in Telegram extension does
+    // with an unfinalized preview
+    // (`[core] extensions/telegram/src/bot-message-dispatch.ts:2971-2975`).
+    expect(h.wrapper.getState().messages.some((m) => m.id === "webchannel-d")).toBe(false);
+    // The point of the terminal sweep survives: nothing is left claiming to work.
+    expect(h.wrapper.getState().messages.some((m) => m.working)).toBe(false);
   });
 });
 
@@ -1943,3 +2090,666 @@ describe("P0-4 turn_settled.outcome sealing (T-sl)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// #243 half 2b — the client ADOPTS the server-assigned durable messageId echoed
+// on the `ack` (`committed: {random_id, messageId}[]`, minted by half 2a). After
+// adoption the optimistic `u-<n>` user bubble carries the SERVER id, so client
+// and journal agree on ONE id and a later history/full-replay matches by id
+// (tier 1) instead of by text (`case "history"` tier 2). The tier-2/3 text
+// fallback stays — a send whose ack carries NO `committed` is left at `u-<n>`
+// and reconciled by text on the next snapshot, exactly as before (removing that
+// fallback is half 3).
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — #243 half 2b: client adopts the server messageId (ack echo)", () => {
+  type Inbound = { type?: string; id?: string; random_id?: string };
+
+  /**
+   * A registered wrapper whose server, per inbound `user_message`, records
+   * `{id, random_id}` and (when `ack`) replies `ack{ids}` — optionally carrying
+   * a `committed` echo whose `messageId` is `committedId(inbound)`. Returning
+   * `undefined` from `committedId` acks WITHOUT `committed` (the fast-path / no
+   * echo case), which is how the fallback is exercised.
+   */
+  async function connect(opts: {
+    committedId?: (inbound: Inbound) => string | undefined;
+    ack?: boolean;
+  } = {}): Promise<{ wrapper: WebChannelNATSClient; K: Uint8Array; inbound: Inbound[] }> {
+    const ack = opts.ack ?? true;
+    const pop = await generateDevicePopKeyPair();
+    const x = await generateDeviceX25519();
+    const identity = makeAgentIdentity();
+    const K = new Uint8Array(32).fill(55);
+    const inbound: Inbound[] = [];
+    const registration = registerAgent(K, x.publicRaw, identity);
+    const handler: ServerHandler = async (s, p, server, reply) => {
+      await registration(s, p, server, reply);
+      if (s !== IN) return;
+      const msg = openMessage(p, K) as Inbound | null;
+      if (msg?.type !== "user_message" || !msg.id) return;
+      inbound.push({ id: msg.id, random_id: msg.random_id });
+      if (!ack) return;
+      const frame: Record<string, unknown> = { type: "ack", ids: [msg.id] };
+      const messageId = opts.committedId?.(msg);
+      if (messageId !== undefined && msg.random_id) {
+        frame.committed = [{ random_id: msg.random_id, messageId }];
+      }
+      server.deliverToClient(
+        OUT,
+        sealMessage({ accountId: AGENT, tenant: TENANT, sub: PEER }, K, frame as unknown as OutboundMessage),
+      );
+    };
+    FakeNatsWS.sharedHandler = handler;
+    const wrapper = new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: JWT,
+      accountId: AGENT,
+      tenant: TENANT,
+      peerId: PEER,
+      heartbeatIntervalMs: 0,
+      registration: {
+        devicePrivateKey: pop.privateKey,
+        deviceX25519PrivateKey: x.privateKey,
+        pinnedAgentPublicKey: identity.publicB64url,
+      },
+    });
+    wrapper.connect();
+    await settle();
+    return { wrapper, K, inbound };
+  }
+
+  const SERVER_ID = "webchannel-user-1";
+
+  it("re-keys the optimistic bubble to the SERVER id, matched by random_id", async () => {
+    const h = await connect({ committedId: () => SERVER_ID });
+    h.wrapper.send("hello");
+    await settle();
+
+    const bubble = userBubble(h.wrapper, "hello")!;
+    // The durable id is now the server id — NOT the local `u-<n>` echo.
+    expect(bubble.id).toBe(SERVER_ID);
+    expect(bubble.id.startsWith("u-")).toBe(false);
+    // The echo it adopted was matched by THIS send's random_id.
+    expect(h.inbound).toHaveLength(1);
+    expect(h.inbound[0]!.random_id).toBeTruthy();
+    h.wrapper.close();
+  });
+
+  it("preserves the receipt/send-state overlay across the re-key", async () => {
+    const h = await connect({ committedId: () => SERVER_ID });
+    const receipt = h.wrapper.send("hello")!;
+    await settle();
+
+    const bubble = userBubble(h.wrapper, "hello")!;
+    expect(bubble.id).toBe(SERVER_ID);
+    // The overlay the receipt path depends on survives the id churn.
+    expect(bubble.receiptKey).toBeDefined();
+    expect(bubble.wireId).toBeDefined();
+    expect(bubble.sendState).toBe("accepted");
+    // The receipt handle (keyed by receiptKey, not the bubble id) still tracks it.
+    expect(receipt.snapshot().state).toBe("accepted");
+
+    // And a later turn_settled{ok} still promotes THIS bubble to completed —
+    // proving `promoteAnchor` (wireId-keyed) reaches the re-keyed bubble.
+    deliverOut(h.K, { type: "turn_settled", turnId: bubble.wireId!, outcome: "ok" });
+    await settle();
+    expect(userBubble(h.wrapper, "hello")!.sendState).toBe("completed");
+    expect(receipt.snapshot().state).toBe("completed");
+    h.wrapper.close();
+  });
+
+  it("live == history: after adoption a snapshot row of the server id tier-1 matches (no duplicate)", async () => {
+    const h = await connect({ committedId: () => SERVER_ID });
+    h.wrapper.send("hello");
+    await settle();
+    expect(userBubble(h.wrapper, "hello")!.id).toBe(SERVER_ID);
+
+    // The journal serves the user row under the SAME server id. It must match by
+    // id (tier 1) and touch nothing — one bubble, still the server id.
+    deliverOut(h.K, ownHistoryPage(h.wrapper, { type: "history", messages: [{ role: "user", id: SERVER_ID, text: "hello" }] }));
+    await settle();
+
+    const hellos = h.wrapper.getState().messages.filter((m) => m.role === "user" && m.text === "hello");
+    expect(hellos).toHaveLength(1);
+    expect(hellos[0]!.id).toBe(SERVER_ID);
+    h.wrapper.close();
+  });
+
+  it("legacy unmapped ACK/history preserve both identities without text guessing", async () => {
+    // `committedId` returns undefined → the server acks WITHOUT a `committed`
+    // echo (the plugin fast-path / overflow / cancelled ack gaps).
+    const h = await connect({ committedId: () => undefined });
+    h.wrapper.send("hello");
+    await settle();
+
+    // Not adopted — still the local echo.
+    const local = userBubble(h.wrapper, "hello")!;
+    expect(local.id.startsWith("u-")).toBe(true);
+
+    // The tier-2/3 text/position fallback (deliberately kept) reconciles it when
+    // the snapshot arrives carrying the server id for the same text.
+    const FALLBACK_ID = "webchannel-user-9";
+    deliverOut(h.K, ownHistoryPage(h.wrapper, { type: "history", messages: [{ role: "user", id: FALLBACK_ID, text: "hello" }] }));
+    await settle();
+
+    const hellos = h.wrapper.getState().messages.filter((m) => m.role === "user" && m.text === "hello");
+    expect(hellos).toHaveLength(2);
+    expect(hellos[1]!.id).toBe(local.id);
+    expect(hellos[0]!.id).toBe(FALLBACK_ID);
+    h.wrapper.close();
+  });
+
+  it("a committed echo whose random_id we never sent is a silent no-op", async () => {
+    const h = await connect({ committedId: () => SERVER_ID });
+    h.wrapper.send("hello");
+    await settle();
+    const before = userBubble(h.wrapper, "hello")!.id;
+    expect(before).toBe(SERVER_ID);
+
+    // A stray echo for an unknown random_id must not touch any bubble.
+    deliverOut(h.K, {
+      type: "ack",
+      ids: [],
+      committed: [{ random_id: "not-a-real-token", messageId: "webchannel-user-999" }],
+    });
+    await settle();
+    const hellos = h.wrapper.getState().messages.filter((m) => m.role === "user" && m.text === "hello");
+    expect(hellos).toHaveLength(1);
+    expect(hellos[0]!.id).toBe(before); // unchanged
+    h.wrapper.close();
+  });
+
+  it("retry reuses the SAME random_id on a reconnect replay (wrapper-minted, ledgered once)", async () => {
+    // Never ack → the frame stays in the unacked ledger; a reconnect replays it.
+    const h = await connect({ ack: false });
+    h.wrapper.send("retry-me");
+    await settle();
+    expect(h.inbound).toHaveLength(1);
+    const first = h.inbound[0]!.random_id;
+    expect(first).toBeTruthy();
+
+    // Drop the socket → auto-reconnect → flushQueue replays the ledger.
+    FakeNatsWS.instances.at(-1)!.close();
+    await settleUntil(() => h.inbound.length >= 2, {
+      label: "the unacked send is re-delivered after reconnect",
+    });
+
+    const replayed = h.inbound.filter((m) => m.random_id !== undefined);
+    expect(h.inbound.length).toBeGreaterThanOrEqual(2);
+    // Every re-delivery of this ledgered send carries the SAME random_id.
+    for (const m of replayed) expect(m.random_id).toBe(first);
+    h.wrapper.close();
+  });
+});
+
+describe("#349 — replay placements preserve order without inventing live activity", () => {
+  async function answerDifference(
+    h: Setup,
+    events: Array<{ seq: number; event: unknown }>,
+    opts: { partial?: boolean; maxSeq: number },
+  ): Promise<void> {
+    const request = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+      .filter((message) => message.type === "get_difference").at(-1);
+    expect(request?.type).toBe("get_difference");
+    if (request?.type !== "get_difference") throw new Error("difference request missing");
+    deliverOut(h.K, {
+      type: "difference", afterSeq: request.afterSeq, nonce: request.nonce,
+      events, partial: opts.partial ?? false, maxSeq: opts.maxSeq,
+    });
+    await settle();
+  }
+
+  it.each([false, true])("publishes after replaying an abandoned placement (reconnect=%s)", async (reconnect) => {
+    const h = await connectWrapper();
+    const snapshots: string[][] = [];
+    const snapshotMatchesGetter: boolean[] = [];
+    const unsubscribe = h.wrapper.subscribe((state) => {
+      snapshots.push(state.messages.map((m) => m.id));
+      snapshotMatchesGetter.push(state === h.wrapper.getState());
+    });
+    try {
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 1 });
+      await settle();
+      if (reconnect) {
+        h.wrapper.close();
+        h.wrapper.connect();
+        await settle();
+        deliverOut(h.K, {
+          type: "history", messages: [{ id: "B", role: "agent", text: "done" }], highWaterSeq: 4,
+        });
+      } else {
+        deliverOut(h.K, { type: "agent_message", id: "B", text: "done", turnId: "later", seq: 3 });
+      }
+      await settle();
+      await answerDifference(h, [
+        { seq: 2, event: { kind: "placement", answerId: "P", turnId: "abandoned" } },
+        { seq: 3, event: { kind: "bubble", answerId: "B", text: "done", turnId: "later" } },
+        { seq: 4, event: { kind: "seal", turnId: "later", answers: [{ id: "B", text: "done" }], remove: [] } },
+      ], { maxSeq: 4 });
+      deliverOut(h.K, { type: "turn_settled", turnId: "later", outcome: "ok" });
+      await settle();
+      expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(["B"]);
+      expect(snapshots.every((ids) => !ids.includes("P"))).toBe(true);
+      expect(snapshotMatchesGetter.every(Boolean)).toBe(true);
+      expect(h.wrapper.getState()).toBe(h.wrapper.getState());
+      const receipt = h.wrapper.send("after completed replay")!;
+      await settle();
+      expect(receipt.snapshot().state).toBe("accepted");
+      expect(h.received).toEqual([userBubble(h.wrapper, "after completed replay")?.wireId]);
+    } finally {
+      unsubscribe();
+      h.wrapper.close();
+    }
+  });
+
+  it("preserves an existing live draft and holds sends until actual completion", async () => {
+    const h = await connectWrapper();
+    try {
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 1 });
+      // A live draft may lack a seq when its placement journal write failed.
+      deliverOut(h.K, { type: "progress", id: "A", text: "live partial", turnId: "live" });
+      deliverOut(h.K, { type: "agent_message", id: "B", text: "other", turnId: "live", seq: 4 });
+      await settle();
+      await answerDifference(h, [
+        { seq: 2, event: { kind: "placement", answerId: "A", turnId: "live" } },
+      ], { partial: true, maxSeq: 2 });
+      expect(h.wrapper.getState().messages.find((m) => m.id === "A"))
+        .toMatchObject({ text: "live partial", working: true, draftOnly: true });
+      const receipt = h.wrapper.send("held behind real draft")!;
+      await settle();
+      expect(receipt.snapshot().state).toBe("queued");
+      expect(h.received).toEqual([]);
+      await answerDifference(h, [
+        { seq: 3, event: { kind: "bubble", answerId: "A", text: "authored answer", turnId: "live" } },
+        { seq: 4, event: { kind: "bubble", answerId: "B", text: "other", turnId: "live" } },
+        { seq: 5, event: { kind: "seal", turnId: "live", answers: [{ id: "A", text: "authored answer" }, { id: "B", text: "other" }], remove: [] } },
+      ], { maxSeq: 5 });
+      deliverOut(h.K, { type: "turn_settled", turnId: "live", outcome: "ok" });
+      await settle();
+      const answer = h.wrapper.getState().messages.find((m) => m.id === "A");
+      expect(answer).toMatchObject({ text: "authored answer", working: false });
+      expect(answer?.draftOnly).toBeUndefined();
+      expect(receipt.snapshot().state).toBe("accepted");
+      expect(h.received).toEqual([userBubble(h.wrapper, "held behind real draft")?.wireId]);
+    } finally {
+      h.wrapper.close();
+    }
+  });
+
+  it.each(["bubble", "seal", "history"])("materializes the original slot from %s after partial replies", async (source) => {
+    const h = await connectWrapper();
+    try {
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 1 });
+      deliverOut(h.K, { type: "agent_message", id: "B", text: "second", turnId: "T", seq: 3 });
+      await settle();
+      await answerDifference(h, [
+        { seq: 2, event: { kind: "placement", answerId: "P", turnId: "T" } },
+      ], { partial: true, maxSeq: 2 });
+      expect(h.wrapper.getState().messages).toEqual([]);
+      await answerDifference(h, [
+        { seq: 3, event: { kind: "bubble", answerId: "B", text: "second", turnId: "T" } },
+      ], { partial: true, maxSeq: 3 });
+      expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(["B"]);
+      if (source === "history") {
+        await answerDifference(h, [], { maxSeq: 3 });
+        deliverOut(h.K, ownHistoryPage(h.wrapper, { type: "history", messages: [{ id: "P", role: "agent", text: "first", ts: 123 }] }));
+        await settle();
+      } else {
+        const event = source === "bubble"
+          ? { kind: "bubble", answerId: "P", text: "first", turnId: "T" }
+          : { kind: "seal", turnId: "T", answers: [{ id: "P", text: "first" }], remove: [] };
+        await answerDifference(h, [{ seq: 4, event }], { maxSeq: 4 });
+      }
+      expect(h.wrapper.getState().messages.map((m) => [m.id, m.text])).toEqual([["P", "first"], ["B", "second"]]);
+      expect(h.wrapper.getState().messages.some((m) => m.working || m.draftOnly)).toBe(false);
+    } finally {
+      h.wrapper.close();
+    }
+  });
+
+  it("turns a private replay slot into a live draft that still settles normally", async () => {
+    const h = await connectWrapper();
+    try {
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 1 });
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 3 });
+      await settle();
+      await answerDifference(h, [
+        { seq: 2, event: { kind: "placement", answerId: "P", turnId: "live" } },
+        { seq: 3, event: { kind: "bubble", answerId: "B", text: "other", turnId: "earlier" } },
+      ], { maxSeq: 3 });
+      deliverOut(h.K, { type: "progress", id: "P", text: "live now", turnId: "live", seq: 2 });
+      await settle();
+      expect(h.wrapper.getState().messages.map((m) => m.id)).toEqual(["P", "B"]);
+      expect(h.wrapper.getState().messages[0]).toMatchObject({ text: "live now", working: true, draftOnly: true });
+      const receipt = h.wrapper.send("held behind materialized draft")!;
+      expect(receipt.snapshot().state).toBe("queued");
+      deliverOut(h.K, { type: "turn_settled", turnId: "live", outcome: "ok" });
+      await settle();
+      expect(h.wrapper.getState().messages.some((m) => m.id === "P")).toBe(false);
+      expect(receipt.snapshot().state).toBe("accepted");
+      expect(h.received).toEqual([userBubble(h.wrapper, "held behind materialized draft")?.wireId]);
+    } finally {
+      h.wrapper.close();
+    }
+  });
+
+  it.each(["turn_settled", "/stop"])("retires buffered progress on %s before catch-up replays it", async (end) => {
+    const h = await connectWrapper();
+    try {
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 1 });
+      deliverOut(h.K, { type: "tool_activity", id: "T", name: "bash", phase: "end", turnId: "done", seq: 3 });
+      deliverOut(h.K, { type: "progress", id: "P", text: "past draft", turnId: "done", seq: 2 });
+      deliverOut(h.K, { type: "progress", id: "Q", text: "another live turn", turnId: "other", seq: 4 });
+      await settle();
+      if (end === "/stop") h.wrapper.send("/stop");
+      else deliverOut(h.K, { type: "turn_settled", turnId: "done", outcome: "ok" });
+      await settle();
+      await answerDifference(h, [
+        { seq: 2, event: { kind: "placement", answerId: "P", turnId: "done" } },
+        { seq: 3, event: { kind: "tool", id: "T", name: "bash", phase: "end", turnId: "done" } },
+        { seq: 4, event: { kind: "placement", answerId: "Q", turnId: "other" } },
+      ], { maxSeq: 4 });
+      expect(h.wrapper.getState().messages.some((m) => m.id === "P")).toBe(false);
+      expect(h.wrapper.getState().messages.find((m) => m.id === "T")?.kind).toBe("tool");
+      const receipt = h.wrapper.send("after buffered turn end")!;
+      if (end === "turn_settled") {
+        expect(h.wrapper.getState().messages.find((m) => m.id === "Q"))
+          .toMatchObject({ text: "another live turn", working: true });
+        expect(receipt.snapshot().state).toBe("queued");
+        expect(h.received).toEqual([]);
+        deliverOut(h.K, { type: "turn_settled", turnId: "other", outcome: "ok" });
+      } else {
+        expect(h.wrapper.getState().messages.some((m) => m.id === "Q")).toBe(false);
+      }
+      await settle();
+      expect(receipt.snapshot().state).toBe("accepted");
+      expect(publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .filter((message) => message.type === "user_message").map((message) => message.text))
+        .toEqual(end === "/stop" ? ["/stop", "after buffered turn end"] : ["after buffered turn end"]);
+    } finally {
+      h.wrapper.close();
+    }
+  });
+
+  it.each(["difference", "give-up"])("honors a subscriber's /stop during %s before replaying later held progress", async (path) => {
+    const h = await connectWrapper();
+    let stopped = false;
+    const unsubscribe = h.wrapper.subscribe((state) => {
+      if (!stopped && state.messages.some((m) => m.kind === "tool" && m.id === "T")) {
+        stopped = true;
+        h.wrapper.send("/stop");
+      }
+    });
+    try {
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 1 });
+      if (path === "difference") {
+        deliverOut(h.K, { type: "progress", id: "P", text: "held draft", turnId: "T1", seq: 3 });
+        await settle();
+        await answerDifference(h, [
+          { seq: 2, event: { kind: "tool", id: "T", name: "bash", phase: "end", turnId: "T1" } },
+          { seq: 3, event: { kind: "placement", answerId: "P", turnId: "T1" } },
+        ], { maxSeq: 3 });
+      } else {
+        deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 4 });
+        deliverOut(h.K, { type: "tool_activity", id: "T", name: "bash", phase: "end", turnId: "T1" });
+        deliverOut(h.K, { type: "progress", id: "P", text: "held draft", turnId: "T1" });
+        await settle();
+        // Drive the timeout callback of the real request to its give-up branch.
+        // Notification, /stop, and subsequent publication still use the wrapper
+        // and encrypted fake NATS transport, without a private state injection.
+        const internals = h.wrapper as unknown as {
+          cursor: unknown;
+          clearCatchUpTimer: (cursor: unknown) => void;
+          onCatchUpTimeout: (cursor: unknown) => void;
+        };
+        const cursor = internals.cursor;
+        internals.clearCatchUpTimer(cursor);
+        for (let retry = 0; retry < 4; retry++) {
+          internals.onCatchUpTimeout(cursor);
+          internals.clearCatchUpTimer(cursor);
+        }
+        await settle();
+      }
+      expect(stopped).toBe(true);
+      expect(h.wrapper.getState().messages.some((m) => m.id === "P")).toBe(false);
+      expect(h.wrapper.getState().messages.find((m) => m.id === "T")?.kind).toBe("tool");
+      const receipt = h.wrapper.send("after callback stop")!;
+      await settle();
+      expect(receipt.snapshot().state).toBe("accepted");
+      expect(publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .filter((message) => message.type === "user_message").map((message) => message.text))
+        .toEqual(["/stop", "after callback stop"]);
+      // Retirement is per frame object, so a fresh delivery for the same id
+      // remains eligible and can establish new live activity.
+      deliverOut(h.K, { type: "progress", id: "P", text: "fresh progress", turnId: "T1" });
+      await settle();
+      expect(h.wrapper.getState().messages.find((m) => m.id === "P"))
+        .toMatchObject({ text: "fresh progress", working: true, draftOnly: true });
+    } finally {
+      unsubscribe();
+      h.wrapper.close();
+    }
+  });
+
+  it("keeps other message kinds visible at the same id and exposes an authored empty answer", async () => {
+    const h = await connectWrapper();
+    try {
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 1 });
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 5 });
+      await settle();
+      await answerDifference(h, [
+        { seq: 2, event: { kind: "placement", answerId: "P", turnId: "T" } },
+        { seq: 3, event: { kind: "reasoning", id: "P", text: "thinking", turnId: "T" } },
+        { seq: 4, event: { kind: "tool", id: "P", name: "bash", phase: "end", turnId: "T" } },
+        { seq: 5, event: { kind: "approval", id: "P", approvalKind: "exec", title: "request", prompt: "run", options: [] } },
+      ], { maxSeq: 5 });
+      expect(h.wrapper.getState().messages.map((m) => m.kind)).toEqual(["reasoning", "tool", "approval"]);
+      deliverOut(h.K, { type: "history", messages: [], highWaterSeq: 7 });
+      await settle();
+      await answerDifference(h, [
+        { seq: 6, event: { kind: "bubble", answerId: "P", text: "", turnId: "T" } },
+        { seq: 7, event: { kind: "seal", turnId: "T", answers: [{ id: "P", text: "" }], remove: [] } },
+      ], { maxSeq: 7 });
+      expect(h.wrapper.getState().messages[0]).toMatchObject({ id: "P", role: "agent", text: "", working: false });
+      expect(h.wrapper.getState().messages.map((m) => m.kind)).toEqual([undefined, "reasoning", "tool", "approval"]);
+    } finally {
+      h.wrapper.close();
+    }
+  });
+});
+
+it("#442 correlates policy denial, retires its turn and never retries or changes another receipt", async () => {
+  const h = await connectWrapper({ ack: false });
+  try {
+    const receipt = h.wrapper.send("policy denied")!;
+    await settle();
+    const id = userBubble(h.wrapper, "policy denied")!.wireId!;
+    expect(h.wrapper.getState().turnActive).toBe(true);
+    deliverOut(h.K, { type: "inbound_rejected", ids: ["other-device"], reason: "policy-denied" });
+    await settle();
+    expect(receipt.snapshot().state).toBe("sent");
+    deliverOut(h.K, { type: "inbound_rejected", ids: [id], reason: "policy-denied" });
+    await settle();
+    expect(receipt.snapshot()).toMatchObject({ state: "failed", failure: { reason: "policy-denied", retryable: false } });
+    expect(userBubble(h.wrapper, "policy denied")).toMatchObject({ sendState: "failed", sendFailure: { reason: "policy-denied" } });
+    expect(h.wrapper.getState().turnActive).toBe(false);
+    deliverOut(h.K, { type: "ack", ids: [id] });
+    await settle();
+    expect(receipt.snapshot().state).toBe("failed");
+    expect(h.received).toEqual([id]);
+    expect(h.wrapper.getState().status).toBe("connected");
+  } finally { h.wrapper.close(); }
+});
+
+it("#442 late policy refusal cannot downgrade an already accepted receipt", async () => {
+  const h = await connectWrapper();
+  try {
+    const receipt = h.wrapper.send("accepted before late refusal")!;
+    await settle();
+    const id = userBubble(h.wrapper, "accepted before late refusal")!.wireId!;
+    expect(receipt.snapshot().state).toBe("accepted");
+    deliverOut(h.K, { type: "inbound_rejected", ids: [id], reason: "policy-denied" });
+    await settle();
+    expect(receipt.snapshot().state).toBe("accepted");
+    expect(h.wrapper.getState().turnActive).toBe(true);
+  } finally { h.wrapper.close(); }
+});
+
+it.each(["user_committed", "history", "difference"] as const)(
+  "#442 exact durable %s adoption keeps replay ownership through a late policy refusal",
+  async (source) => {
+    const h = await connectWrapper({ ack: false });
+    try {
+      const receipt = h.wrapper.send(`durable before refusal: ${source}`)!;
+      await settle();
+      const sent = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .find((message): message is Extract<OutboundMessage, { type: "user_message" }> =>
+          message.type === "user_message" && message.text === `durable before refusal: ${source}`)!;
+      const serverId = `server-${source}`;
+
+      if (source === "user_committed") {
+        deliverOut(h.K, { type: "user_committed", id: serverId, text: sent.text,
+          random_id: sent.random_id, turnId: sent.id, seq: 1 });
+      } else if (source === "history") {
+        deliverOut(h.K, { type: "history", highWaterSeq: 1, messages: [{
+          id: serverId, role: "user", text: sent.text, randomId: sent.random_id,
+          turnId: sent.id, seq: 1,
+        }] });
+      } else {
+        deliverOut(h.K, { type: "history", highWaterSeq: 0, messages: [] });
+        await settle();
+        deliverOut(h.K, { type: "history", highWaterSeq: 1, messages: [] });
+        await settle();
+        const request = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+          .filter((message) => message.type === "get_difference").at(-1);
+        expect(request?.type).toBe("get_difference");
+        if (request?.type !== "get_difference") throw new Error("difference request missing");
+        deliverOut(h.K, { type: "difference", afterSeq: request.afterSeq, nonce: request.nonce,
+          partial: false, maxSeq: 1, events: [{ seq: 1, event: {
+            kind: "user", id: serverId, text: sent.text, randomId: sent.random_id, turnId: sent.id,
+          } }] });
+      }
+      await settle();
+      expect(userBubble(h.wrapper, sent.text)).toMatchObject({ id: serverId, wireId: sent.id, sendState: "sent" });
+
+      deliverOut(h.K, { type: "inbound_rejected", ids: [sent.id, "other-device"], reason: "policy-denied" });
+      await settle();
+      expect(receipt.snapshot().state).toBe("sent");
+      expect(h.wrapper.getState().turnActive).toBe(true);
+
+      FakeNatsWS.instances.at(-1)!.close();
+      await settleUntil(() => h.received.length >= 2, { label: `${source} send replay` });
+      expect(h.received).toEqual([sent.id, sent.id]);
+
+      deliverOut(h.K, { type: "ack", ids: [sent.id] });
+      await settle();
+      expect(receipt.snapshot().state).toBe("accepted");
+      deliverOut(h.K, { type: "turn_settled", turnId: sent.id, outcome: "ok" });
+      await settle();
+      expect(receipt.snapshot().state).toBe("completed");
+    } finally { h.wrapper.close(); }
+  },
+);
+
+it("#442 a durable row with another random ID does not suppress the owned refusal", async () => {
+  const h = await connectWrapper({ ack: false });
+  try {
+    const receipt = h.wrapper.send("unmatched durable evidence")!;
+    await settle();
+    const sent = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+      .find((message): message is Extract<OutboundMessage, { type: "user_message" }> =>
+        message.type === "user_message" && message.text === "unmatched durable evidence")!;
+    deliverOut(h.K, { type: "history", highWaterSeq: 1, messages: [{
+      id: "other-device-row", role: "user", text: sent.text, randomId: "other-device-random", seq: 1,
+    }] });
+    await settle();
+    deliverOut(h.K, { type: "inbound_rejected", ids: [sent.id, "other-device"], reason: "policy-denied" });
+    await settle();
+    expect(receipt.snapshot()).toMatchObject({
+      state: "failed", failure: { reason: "policy-denied", retryable: false },
+    });
+  } finally { h.wrapper.close(); }
+});
+
+it.each(["gap-user_committed", "ahead-history"] as const)(
+  "#442 %s proves acceptance before ordered recovery and preserves replay through a late refusal",
+  async (source) => {
+    const h = await connectWrapper({ ack: false });
+    try {
+      deliverOut(h.K, { type: "history", highWaterSeq: 0, messages: [] });
+      await settle();
+      const text = `buffered durable evidence: ${source}`;
+      const receipt = h.wrapper.send(text)!;
+      await settle();
+      const sent = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .find((message): message is Extract<OutboundMessage, { type: "user_message" }> =>
+          message.type === "user_message" && message.text === text)!;
+      const serverId = `buffered-${source}`;
+      if (source === "gap-user_committed") {
+        deliverOut(h.K, { type: "user_committed", id: serverId, text,
+          random_id: sent.random_id, turnId: sent.id, seq: 2 });
+      } else {
+        deliverOut(h.K, { type: "history", highWaterSeq: 2, messages: [{
+          id: serverId, role: "user", text, randomId: sent.random_id, turnId: sent.id, seq: 2,
+        }] });
+      }
+      await settle();
+      const request = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .filter((message) => message.type === "get_difference").at(-1);
+      expect(request?.type).toBe("get_difference");
+      if (request?.type !== "get_difference") throw new Error("difference request missing");
+
+      deliverOut(h.K, { type: "inbound_rejected", ids: [sent.id], reason: "policy-denied" });
+      await settle();
+      expect(receipt.snapshot().state).toBe("sent");
+      expect(h.wrapper.getState().turnActive).toBe(true);
+      expect((h.wrapper as unknown as { client: { unackedLedger: Map<string, unknown> } })
+        .client.unackedLedger.size).toBe(1);
+
+      deliverOut(h.K, { type: "difference", afterSeq: request.afterSeq, nonce: request.nonce,
+        partial: false, maxSeq: 2, events: [] });
+      await settle();
+      deliverOut(h.K, { type: "ack", ids: [sent.id] });
+      await settle();
+      expect(receipt.snapshot().state).toBe("accepted");
+      deliverOut(h.K, { type: "turn_settled", turnId: sent.id, outcome: "ok" });
+      await settle();
+      expect(receipt.snapshot().state).toBe("completed");
+    } finally { h.wrapper.close(); }
+  },
+);
+
+it.each(["uncorrelated", "malformed"] as const)(
+  "#442 %s difference user evidence cannot suppress a valid refusal",
+  async (boundary) => {
+    const h = await connectWrapper({ ack: false });
+    try {
+      deliverOut(h.K, { type: "history", highWaterSeq: 0, messages: [] });
+      await settle();
+      const receipt = h.wrapper.send(`invalid difference evidence: ${boundary}`)!;
+      await settle();
+      const sent = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .find((message): message is Extract<OutboundMessage, { type: "user_message" }> =>
+          message.type === "user_message" && message.text === `invalid difference evidence: ${boundary}`)!;
+      deliverOut(h.K, { type: "agent_message", id: "gap-opener", text: "later", turnId: sent.id, seq: 2 });
+      await settle();
+      const request = publishedInputs(FakeNatsWS.instances.at(-1)!, h.K)
+        .filter((message) => message.type === "get_difference").at(-1);
+      expect(request?.type).toBe("get_difference");
+      if (request?.type !== "get_difference") throw new Error("difference request missing");
+      const event = boundary === "uncorrelated"
+        ? { kind: "user", id: "foreign-user", text: sent.text, randomId: sent.random_id, turnId: sent.id }
+        : { kind: "user", id: "malformed-user", randomId: sent.random_id, turnId: sent.id };
+      deliverOut(h.K, { type: "difference", afterSeq: request.afterSeq,
+        nonce: boundary === "uncorrelated" ? "another-device" : request.nonce,
+        partial: false, maxSeq: 1, events: [{ seq: 1, event }] });
+      await settle();
+
+      deliverOut(h.K, { type: "inbound_rejected", ids: [sent.id], reason: "policy-denied" });
+      await settle();
+      expect(receipt.snapshot()).toMatchObject({
+        state: "failed", failure: { reason: "policy-denied", retryable: false },
+      });
+    } finally { h.wrapper.close(); }
+  },
+);

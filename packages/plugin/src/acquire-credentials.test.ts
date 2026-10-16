@@ -9,8 +9,8 @@ function fakeEnrollmentResult() {
   return {
     creds: { userJwt: "JWT", userSeed: "SEED" },
     peerId: "peer-1",
-    jwksUrl: "http://s/.well-known/jwks.json",
-    bootstrapUrl: "http://s/bootstrap",
+    jwksUrl: "https://s/.well-known/jwks.json",
+    bootstrapUrl: "https://s/bootstrap",
   };
 }
 
@@ -49,7 +49,7 @@ describe("acquireCredentials", () => {
 
     const result = await acquireCredentials({
       accountId: "acctA",
-      saasBaseUrl: "http://saas.example",
+      saasBaseUrl: "https://saas.example",
       tenant: "tA",
       home: HOME,
       log,
@@ -62,9 +62,9 @@ describe("acquireCredentials", () => {
     expect(result.peerId).toBe("peer-1");
     expect(enroll).toHaveBeenCalledOnce();
     // Derives /api/enroll + /api/poll from the base URL.
-    expect(capturedOpts?.saasBaseUrl).toBe("http://saas.example");
-    expect(capturedOpts?.saasEnrollUrl).toBe("http://saas.example/api/enroll");
-    expect(capturedOpts?.saasPollUrl).toBe("http://saas.example/api/poll");
+    expect(capturedOpts?.saasBaseUrl).toBe("https://saas.example");
+    expect(capturedOpts?.saasEnrollUrl).toBe("https://saas.example/api/enroll");
+    expect(capturedOpts?.saasPollUrl).toBe("https://saas.example/api/poll");
     expect(capturedOpts?.tenant).toBe("tA");
     // The wire identity sent to enrollment is the accountId (가-2).
     expect(capturedOpts?.accountId).toBe("acctA");
@@ -83,7 +83,7 @@ describe("acquireCredentials", () => {
     let capturedOpts: ConstructorParameters<typeof EnrollmentClient>[0] | undefined;
     await acquireCredentials({
       accountId: "default",
-      saasBaseUrl: "http://saas.example/",
+      saasBaseUrl: "https://saas.example/",
       tenant: "t",
       home: HOME,
       log: () => {},
@@ -92,15 +92,15 @@ describe("acquireCredentials", () => {
         return { enroll: async () => fakeEnrollmentResult() } as unknown as EnrollmentClient;
       },
     });
-    expect(capturedOpts?.saasBaseUrl).toBe("http://saas.example/");
-    expect(capturedOpts?.saasEnrollUrl).toBe("http://saas.example/api/enroll");
+    expect(capturedOpts?.saasBaseUrl).toBe("https://saas.example/");
+    expect(capturedOpts?.saasEnrollUrl).toBe("https://saas.example/api/enroll");
   });
 
   it("honors an explicit credentialPath override", async () => {
     let capturedOpts: ConstructorParameters<typeof EnrollmentClient>[0] | undefined;
     await acquireCredentials({
       accountId: "default",
-      saasBaseUrl: "http://s",
+      saasBaseUrl: "https://s",
       tenant: "t",
       credentialPath: "/custom/path/creds.json",
       log: () => {},
@@ -116,7 +116,7 @@ describe("acquireCredentials", () => {
     await expect(
       acquireCredentials({
       accountId: "default",
-        saasBaseUrl: "http://s",
+        saasBaseUrl: "https://s",
         tenant: "t",
         log: () => {},
         _clientFactory: () =>
@@ -129,7 +129,7 @@ describe("acquireCredentials", () => {
     let capturedOpts: ConstructorParameters<typeof EnrollmentClient>[0] | undefined;
     await acquireCredentials({
       accountId: "default",
-      saasBaseUrl: "http://s",
+      saasBaseUrl: "https://s",
       tenant: "t",
       home: HOME,
       log: () => {},

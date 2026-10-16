@@ -11,6 +11,7 @@
  * - Message format preserved (compatible with existing UI)
  */
 
+import { DurableRowVersions, durableRowKey } from "./durable-row-versions.js";
 import type {
   WebChannelOptions,
   WebChannelState,
@@ -18,7 +19,11 @@ import type {
   Listener,
   ApprovalDecision,
   ApprovalOption,
+  ChatApprovalMessage,
+  ChatBubble,
   ChatMessage,
+  ChatReasoningMessage,
+  ChatToolMessage,
   ReasoningItem,
   ToolActivityItem,
   ApprovalRequest,
@@ -28,9 +33,16 @@ import type {
 } from "./types.js";
 import {
   WebChannelNatsClient,
+  randomInboxToken,
   type WebChannelNatsClientOptions as DirectClientOptions,
   type InboundMessage,
 } from "./nats-client.js";
+import {
+  applyDurableEvent,
+  projectDurableFromClient,
+  type DurableEvent,
+  type DurableView,
+} from "./durable-view-reducer.js";
 
 /**
  * P0-4: the state a `SendReceipt` observes. A separate `receiptKey`-keyed record
@@ -47,6 +59,10 @@ type ReceiptRecord = {
   settlementEligible: boolean;
   /** One-way latch: the first authoritative publish/settle decision consumes it. */
   turnOpeningConsumed: boolean;
+  /** Explicit local `/stop` permanently fences this pre-stop turn from server re-open. */
+  stoppedAtExplicitBoundary?: boolean;
+  /** A repeated cancellation proof cannot clear a later turn's unscoped typing. */
+  cancellationUiReconciled?: boolean;
   state: NonNullable<ChatMessage["sendState"]>;
   failure?: SendFailure;
   // P0-4 (review R5): mirrors `SendReceipt.snapshot()` — a concrete, non-optional
@@ -57,7 +73,7 @@ type ReceiptRecord = {
   pendingTransitions: Array<{
     state: NonNullable<ChatMessage["sendState"]>;
     failure?: SendFailure;
-    extraBubblePatch?: Partial<ChatMessage>;
+    extraBubblePatch?: Partial<ChatBubble>;
   }>;
   drainingTransitions: boolean;
 };
@@ -78,9 +94,10 @@ type DeferredReplacementOperation =
       localId: string;
       text: string;
       receiptKey: string;
+      retryOf?: string;
     }
   | { kind: "approval-decision"; id: string; decision: ApprovalDecision }
-  | { kind: "load-history"; before?: string; limit?: number }
+  | { kind: "load-history"; before?: string; beforeTurnId?: string; limit?: number }
   | { kind: "load-commands" };
 
 function normalizeAssistantMessageIndex(value: unknown): number | undefined {
@@ -88,10 +105,254 @@ function normalizeAssistantMessageIndex(value: unknown): number | undefined {
     ? value
     : undefined;
 }
+
+/**
+ * #244 half B — the inbound frame types that carry a per-conversation `seq`, i.e.
+ * the DURABLE frames the plugin stamps `seq` on. `isSeqBearingFrame`
+ * (`delivery-journal-event.ts`) is the server-side twin of the OUTBOUND seven,
+ * and its drift test pins those seven against the journal mapper — it does NOT
+ * pin this list, which has an eighth member: `user_committed`, which that
+ * predicate explicitly REJECTS (its seq is set at construction, not stamped at
+ * egress). Seven plus that echo is what makes this client's stream contiguous.
+ * These are the frames gap detection watches and the ones held while a
+ * `get_difference` is outstanding. A frame of one of these types WITHOUT a `seq`
+ * (an id-less `agent_message`, a live reasoning DRAFT) is still handled normally —
+ * it just carries no cursor, so it neither advances nor gaps.
+ */
+const SEQ_BEARING_INBOUND_TYPES: ReadonlySet<string> = new Set([
+  "request_state",
+  "agent_message",
+  "progress",
+  "turn_snapshot",
+  "reasoning",
+  "tool_activity",
+  "approval_request",
+  "approval_resolved",
+  // #245 Part B: the multi-device user-message broadcast carries the user opener's
+  // `seq`, so it drives gap detection and advances the cursor like any durable
+  // frame — a non-origin device that receives it stays contiguous with the turn's
+  // first agent frame at `seq+1` (rather than reading it as a phantom gap), and a
+  // missed broadcast surfaces as a gap the next agent frame's `get_difference`
+  // heals. Unlike the durable frames it is NOT journaled server-side (the `user`
+  // event already is); its `seq` is the committed opener's, set at the plugin.
+  "user_committed",
+]);
+
+function isSeqBearingInbound(msg: { type?: unknown }): boolean {
+  return typeof msg.type === "string" && SEQ_BEARING_INBOUND_TYPES.has(msg.type);
+}
+
+/**
+ * #244 half B (HIGH-2) — how long to wait for a `difference` reply before
+ * re-issuing the request, and how many times to re-issue before giving up into a
+ * re-detect. The request and reply both ride the at-most-once `.out`, so either
+ * can vanish; this is what keeps a dropped one from wedging the stream in-session.
+ *
+ * Telegram has no equivalent because its `getDifference` is an RPC on a session
+ * connection: the transport tells the app when a call was lost. Ours is a
+ * fire-and-forget publish answered by another publish, so the timer is the only
+ * thing that can notice.
+ */
+const GET_DIFFERENCE_TIMEOUT_MS = 5_000;
+const GET_DIFFERENCE_MAX_RETRIES = 3;
+
+/**
+ * #401 — how many `load_history` nonces one device remembers. A page request
+ * has no timeout (an unanswered one costs the user a second click, not data), so
+ * this bound is what keeps a page lost en route from accumulating forever.
+ *
+ * ⚠️ IT MUST BE AT LEAST THE PLUGIN'S `MAX_OUTSTANDING_PAGE_REQUESTS`
+ * (`history-serve.ts`: one page folding + `MAX_QUEUED_PAGE_REQUESTS` = 8 queued
+ * = 9). The server answers up to that many of one peer's requests, in order; a
+ * smaller bound here would evict a nonce whose page is still coming, and that
+ * page would then be dropped as another device's. The client is zero-dependency
+ * and cannot import the plugin constant, so the relation is pinned where both
+ * packages meet: `e2e/history-convergence.test.ts` imports both ("the client
+ * remembers every page the server can owe").
+ */
+export const MAX_OUTSTANDING_HISTORY_PAGES = 9;
+
+/**
+ * #356 — THE SEQ CURSOR, AS THE STATE MACHINE TELEGRAM SPECIFIES.
+ *
+ * This replaces a cursor number plus five satellite fields (`differenceInFlight`,
+ * `gapBuffer`, `pendingAfterSeq`, `pendingDeferredSeq`, a timer generation) that
+ * SEVEN reviewers found EIGHT defects in — every one of them a pair of those
+ * fields disagreeing about what was already applied. The fix is not a ninth rule:
+ * it is that the states are now the type, so the disagreeing combinations cannot
+ * be written down.
+ *
+ * The model is `core.telegram.org/api/updates`, which our roles map onto exactly
+ * (our plugin = Telegram's plugin AND server; our client = the Telegram APP).
+ * `seq` is `pts`; this cursor is the app's `local_pts`; `get_difference` is
+ * `updates.getDifference`; the `history` snapshot's `highWaterSeq` is
+ * `updates.getState`. Our `pts_count` is always 1 — every durable frame is one
+ * journal row — so Telegram's three-way test collapses to:
+ *
+ *   seq === last + 1  → apply           ("the update can be applied")
+ *   seq <= last       → already covered ("the update was already applied")
+ *   seq >  last + 1   → GAP             ("an update gap that must be filled")
+ *
+ * ── THE STATES ──
+ *
+ *  - `unseeded` — NO baseline yet, so no gap can be computed: Telegram's app
+ *    never calls `getDifference` before it holds a `pts`. The FIRST seq this
+ *    client observes — the snapshot's `highWaterSeq` (`getState`, the normal
+ *    case) or, if a durable frame beats it, that frame's own seq — becomes the
+ *    baseline, and the frame that carried it folds. Byte fitting limits the
+ *    historical window, never the authority of that snapshot baseline (#413).
+ *
+ *    ⚠️ ADOPTING THE FIRST OBSERVATION IS THE POINT, AND WAITING FOR THE SNAPSHOT
+ *    WOULD BE A WORSE BUG THAN THE ONE THIS FIXES. `lastAppliedSeq` used to start
+ *    at 0, so the first live frame of a reload mid-turn read as a gap from 0 and
+ *    pulled the ENTIRE conversation back through the fold in 500-event pages
+ *    (#350). But holding frames until a `history` snapshot arrives is not the
+ *    cure: live traffic may beat the baseline. A client that just connected cannot know
+ *    of a hole BELOW its first observation, and must not invent one; what it can
+ *    see from there on is contiguous.
+ *
+ *    ⚠️ AND THAT LEAVES A REAL RESIDUAL, NAMED HERE RATHER THAN LEFT IMPLICIT:
+ *    rows BELOW the first observation arrive only in the register-time snapshot's
+ *    projection. If that snapshot is lost on the at-most-once `.out`, nothing
+ *    in-session fetches them — the cursor is already above them, so no gap is
+ *    detected — and the transcript is short until the next register. A persisted
+ *    cursor plus a reconnect `get_difference` is what closes it (half B, #342);
+ *    seeding from 0 to cover it is NOT, because that is #350.
+ *  - `synced` — the ordinary state. `last` is `local_pts`.
+ *  - `catching-up` — one `get_difference` is outstanding. `afterSeq` is BOTH the
+ *    floor that request asked about AND the cursor: while a reply is in flight
+ *    NOTHING else may move the cursor, which is why there is no second number
+ *    here. The old code had one (`pendingDeferredSeq`), and applying it on top of
+ *    a PARTIAL reply is precisely how a range got skipped (#352). EVERY frame of a
+ *    seq-bearing type is held in `buffer`, in arrival order — with a seq or
+ *    without one, because order is the reason to hold a seq-less frame; an
+ *    `ack`/`history` seq is ignored outright (its frame's live effects — id
+ *    adoption, hydration — have already run, and its seq is re-learned from the
+ *    reply or from the next live frame).
+ *
+ * ── THE CORRELATION ──
+ *
+ * `nonce` is minted per REQUEST (a retry gets a fresh one) and the reply echoes
+ * it with `afterSeq`. Both must match or the reply is ignored. Telegram does not
+ * need this: each session has its own connection, so a `difference` cannot reach
+ * a device that did not ask for it. Our devices share one `.out` subject and have
+ * no wire identity, so without the echo device A folds device B's reply and
+ * silently skips its own range (#351, NOT-list N8).
+ */
+type SeqCursor =
+  | { state: "unseeded" }
+  | { state: "synced"; last: number }
+  | {
+      state: "catching-up";
+      /** The outstanding request's floor, which is also the cursor. */
+      afterSeq: number;
+      /** Re-minted on every re-issue; the reply must echo THIS one. */
+      nonce: string;
+      buffer: InboundMessage[];
+      retries: number;
+      timer: ReturnType<typeof setTimeout> | null;
+    };
+
+/**
+ * #356 — what ONE `difference` reply actually delivered, which is what decides
+ * whether a frame held during the round-trip is now redundant.
+ *
+ * TWO sets, because a held frame can be superseded on either of two keys and the
+ * seq alone is not enough:
+ *  - `seqs` — the seqs the reply FOLDED. Not the range it covers: a row the
+ *    server could not send to this peer is covered but absent, and a row this
+ *    build could not decode was carried but not applied. Neither may drop a held
+ *    frame that IS foldable.
+ *  - `authoredIds` — the ids the reply authored durable TEXT for. This is what
+ *    supersedes a DRAFT, which carries no seq of its own when the account has
+ *    `reasoningDurable` off (only a closing reasoning frame is ever journaled).
+ *    A `placement` contributes NOTHING here on purpose: it claims a slot and
+ *    authors no text, so it cannot supersede the draft that fills it.
+ */
+type CarriedRows = { seqs: ReadonlySet<number>; authoredIds: ReadonlySet<string> };
+
+/**
+ * The ids ONE folded durable event AUTHORED RENDERABLE TEXT for — what a held
+ * DRAFT is measured against in `uncarried`.
+ *
+ * ⚠️ EXPLICIT PER KIND, WITH AN EXHAUSTIVENESS CHECK, BECAUSE A `default` ARM WAS
+ * A DEFECT. Round 3 wrote `default: return [event.id]`, which quietly enrolled
+ * every id-bearing kind — including `approvalResolution`, whose id is the
+ * APPROVAL's and which `durable-view-reducer.ts` says outright "carries no
+ * content of its own". A reply serving a resolution therefore looked like it had
+ * authored the card, and a held `approval_request` for that card was dropped: the
+ * card the user was looking at vanished for the session. Only three kinds author
+ * text a draft can be superseded by, and the `never` below makes a new kind a
+ * compile error rather than a silent enrolment.
+ *
+ * `placement` is the load-bearing `[]`: it claims a slot and journals no text
+ * (§15.9 — the draft text is deliberately never journaled), so it cannot
+ * supersede the `progress` frames that fill that slot, and a test pins that.
+ *
+ * ⚠️ THE OTHER `[]` ARMS ARE REACHABLE ONLY THROUGH ONE NARROW PATH, AND NO TEST
+ * PINS THEM — say which path, rather than implying a guard that fires. This
+ * function is consulted only for a DRAFT-SHAPED held frame (seq-less, or a
+ * `progress`), and a `tool_activity`/`approval_request` normally carries its own
+ * seq. It can arrive WITHOUT one: `nats-channel.ts` ships a durable frame
+ * unstamped when the journal append fails (§15.8), and such a frame is seq-less
+ * and lands in the draft branch. `[]` is the safe direction there — it keeps the
+ * held frame, and a held frame the reply already delivered is at worst an
+ * idempotent re-fold, where dropping one the reply did NOT deliver is content
+ * gone for the session.
+ *
+ * Which is why the `approvalResolution` defect this table was rewritten for is
+ * actually closed by the seq/id dichotomy in `uncarried` and by the seq-ordered
+ * merge in `applyDifference`: defeating this table alone leaves the suite green
+ * (measured). What the arms buy is that the next kind cannot default into
+ * "authors text" — exactly how `approvalResolution` got in — and
+ * `messageEdited`/`messageDeleted` (no producer on this wire) are listed so the
+ * `never` below has to be re-answered if one ever appears.
+ */
+function authoredIdsOf(event: DurableEvent): string[] {
+  switch (event.kind) {
+    case "bubble":
+      return [event.answerId];
+    case "seal":
+      return event.answers.map((a) => a.id);
+    case "reasoning":
+      return [event.id];
+    case "placement":
+    case "user":
+    case "tool":
+    case "approval":
+    case "approvalResolution":
+    case "requestState":
+    case "messageEdited":
+    case "messageDeleted":
+      return [];
+    default: {
+      // A new `DurableEvent` kind must be classified here, not defaulted into
+      // "authors text" — which is exactly how `approvalResolution` got in.
+      const exhaustive: never = event;
+      void exhaustive;
+      return [];
+    }
+  }
+}
+
+type SyncedCursor = Extract<SeqCursor, { state: "synced" }>;
+type CatchingUpCursor = Extract<SeqCursor, { state: "catching-up" }>;
+
+// #244 half B's `KNOWN_DURABLE_EVENT_KINDS` / `isFoldableDurableEvent` MOVED to
+// `inbound-wire-decode.ts` as `decodeDurableEvent` (#246 half A). The kind check
+// was only ever half the question — `foldDifferenceEvent` dereferences fields the
+// reducer never sees (it iterates a `seal`'s `answers`), so a known-kind event
+// with a malformed body threw INSIDE the fold. The replacement validates the
+// shape each arm actually uses and reports WHY, while treating an unknown kind
+// exactly as before: skipped, cursor still advanced.
 // P1-9: the client-side mirror of core's abort predicate (§3.3). Intentionally
 // NOT re-exported from the public barrel; imported directly here and by the
 // plugin-side contract test.
 import { isLikelyAbortText, isExplicitStop } from "./abort-mirror.js";
+// #246 half A: the runtime wire decoder. `decodeDurableEvent` validates ONE raw
+// journal event before the catch-up fold touches it; `isWireSeq` is the shared
+// "this number may move the cursor" predicate.
+import { decodeDurableEvent, isCommittedEcho, isWireSeq } from "./inbound-wire-decode.js";
 
 // ---------------------------------------------------------------------------
 // WebChannel NATS Client
@@ -122,6 +383,477 @@ type InitializedWebChannelState = Omit<WebChannelState, "toolActivity"> & {
   toolActivity: ToolActivityItem[];
 };
 
+/**
+ * v6 §15.4: the per-id CLIENT-LOCAL overlay `mergeDurable` lays on top of the
+ * shared reducer's durable view. Keyed by bubble id because one event can touch
+ * many bubbles — a `turn_snapshot` finalizes every answer it names.
+ *
+ * An explicit `undefined` value DELETES the field (see `mergeDurable` rule 3);
+ * that is how `draftOnly` is cleared when a frame authors durable text.
+ *
+ * ⚠️ `Partial<ChatBubble>`, NOT `Partial<ChatMessage>` (#242 half 2). Every field
+ * an overlay can carry — `working`, `draftOnly`, `sendState`, `receiptKey`,
+ * `pending`, `wireId` — is bubble-only, and a reasoning entry has none of them
+ * (see `ChatReasoningMessage`). Typing it to the bubble arm makes an overlay
+ * aimed at a reasoning id a COMPILE error at the call site rather than a silent
+ * no-op inside `mergeDurable`, which is where it would otherwise be discovered.
+ */
+type DurableLocalOverlay = Record<string, Partial<ChatBubble>>;
+
+/**
+ * What a state mutation may carry.
+ *
+ * ⚠️ `reasoning` (#242 half 2), `toolActivity` (half 3) AND `approvals` (half 4)
+ * ARE EXCLUDED AT THE TYPE LEVEL, and that exclusion IS the "one source of truth"
+ * guarantee. All three are DERIVED from `state.messages` by `nextStateFrom`
+ * below; a patch that could also set one would let the two disagree, which is the
+ * whole defect class these slices close. Writing `setState({ reasoning: … })`,
+ * `setState({ toolActivity: … })` or `setState({ approvals: … })` is a compile
+ * error, not a convention.
+ */
+type StatePatch = Omit<
+  Partial<InitializedWebChannelState>,
+  "reasoning" | "toolActivity" | "approvals"
+>;
+
+/**
+ * The reasoning bursts inside a transcript, in transcript order — what
+ * `state.reasoning` exposes.
+ *
+ * ⚠️ NO CAP. `upsertReasoning`'s `.slice(-100)` is deliberately not reproduced
+ * here: the durable view is uncapped, so a live cap would be exactly the
+ * live≠history divergence #242 half 2 exists to close (the argument is at the
+ * reducer's `applyReasoning`; retention is #299's, at the store). Do not add one.
+ */
+function deriveReasoning(messages: readonly ChatMessage[]): ReasoningItem[] {
+  const out: ReasoningItem[] = [];
+  for (const m of messages) {
+    if (m.kind === "reasoning") out.push({ id: m.id, turnId: m.turnId, text: m.text });
+  }
+  return out;
+}
+
+/**
+ * The tool calls inside a transcript, in transcript order — what
+ * `state.toolActivity` exposes (#242 half 3).
+ *
+ * ⚠️ NO CAP. `upsertToolActivity`'s `.slice(-100)` is deliberately not reproduced
+ * here, for the reason `deriveReasoning` gives and with the same honest
+ * conditional attached: a live cap over an uncapped durable view IS the
+ * live≠history divergence this slice closes, and where no journal is wired there
+ * is no durable view to disagree with, so the removal closes nothing there while
+ * the array grows unbounded (#310's twin). Retention is #299's, at the store.
+ * Do not add one.
+ *
+ * ⚠️ EACH OPTIONAL FIELD IS OMITTED, NOT WRITTEN AS `undefined`. `setState`
+ * hands these items straight to embedders and `sameChatMessage`-style key-count
+ * comparisons exist elsewhere in this file; an own `name: undefined` key would
+ * make an item that reads identically compare as different.
+ */
+function deriveToolActivity(messages: readonly ChatMessage[]): ToolActivityItem[] {
+  const out: ToolActivityItem[] = [];
+  for (const m of messages) {
+    if (m.kind !== "tool") continue;
+    out.push({
+      id: m.id,
+      turnId: m.turnId,
+      ...(m.name !== undefined ? { name: m.name } : {}),
+      ...(m.phase !== undefined ? { phase: m.phase } : {}),
+      ...(m.status !== undefined ? { status: m.status } : {}),
+      ...(m.summary !== undefined ? { summary: m.summary } : {}),
+      ...(m.argKeys !== undefined ? { argKeys: m.argKeys } : {}),
+    });
+  }
+  return out;
+}
+
+/**
+ * The approval cards inside a transcript, in transcript order — what
+ * `state.approvals` exposes (#242 half 4).
+ *
+ * ⚠️ `actionable` IS RECOMPUTED HERE, NOT COPIED, AND THAT IS THE ONE PLACE THE
+ * TWO CONDITIONS MEET. A card is offered to the embedder as actionable only when
+ * BOTH hold:
+ *   1. this device was told it is still open — `entry.actionable === true`, set
+ *      ONLY by a live `approval_request` or by an `approval_snapshot` that lists
+ *      the id as pending, and therefore ABSENT on anything replayed from
+ *      `history`; and
+ *   2. it is not resolved — no server decision, no optimistic local decision,
+ *      no `resolvedElsewhere` sentinel.
+ *
+ * Deriving (2) rather than clearing the bit at each resolution site is
+ * deliberate: there are four sites that can resolve a card (the live
+ * `approval_resolved` frame, `decide()`, and two snapshot legs), and a rule that
+ * each of them must remember to also clear a flag is a rule one of them will
+ * eventually forget. One expression cannot be forgotten. `isActionableApproval`
+ * is that expression, and `decide()` enforces the same one.
+ *
+ * ⚠️ THE `"unknown"` SENTINEL IS RE-COMPOSED HERE TOO. It is not a decision, so
+ * it is not stored in `resolvedDecision` (see `ChatApprovalMessage`); the entry
+ * carries `resolvedElsewhere` and this is where the public shape #15 defined
+ * gets its value back. Only when there is no real decision — a confirmed real
+ * outcome, from a snapshot's `resolved` list, must not be downgraded to the
+ * sentinel.
+ *
+ * ⚠️ NO CAP, the same position `deriveReasoning`/`deriveToolActivity` take, and
+ * for the same reasons: a live cap over an uncapped durable view is exactly the
+ * live≠history divergence this slice closes, and retention belongs at the store
+ * (**#299**, client-side twin **#310**).
+ */
+/**
+ * May this device offer decision buttons for this approval entry? ONE
+ * definition, shared by `deriveApprovals` (what the embedder sees) and by
+ * `decide()` (what the API will actually send) — so the button the UI draws and
+ * the call the UI makes can never disagree about the same card.
+ *
+ * BOTH conjuncts are load-bearing and they answer different questions:
+ * `actionable` is "is this card still OPEN as far as the live session knows"
+ * (absent on anything replayed from `history`), and the resolution tests are "has
+ * it already been answered" (by the server, by this device optimistically, or by
+ * another device per `approval_snapshot`'s Leg B).
+ */
+/**
+ * Is this UNVALIDATED wire value one of the three real approval decisions?
+ *
+ * ⚠️ IT DELIBERATELY REJECTS `"unknown"`. That is the client's own resolution
+ * SENTINEL (#15 — "answered while this device wasn't looking"), produced only by
+ * `approval_snapshot`'s Leg B and stored as `resolvedElsewhere`, never as a
+ * decision. Nothing on the server can journal it, so a `history` row carrying
+ * one is either a forged frame or a future meaning this build does not have;
+ * either way, admitting it would render a resolution that never happened.
+ */
+function isApprovalDecision(value: unknown): value is ApprovalDecision {
+  return value === "allow-once" || value === "allow-always" || value === "deny";
+}
+
+function isActionableApproval(entry: ChatApprovalMessage): boolean {
+  return (
+    entry.actionable === true &&
+    entry.resolvedDecision === undefined &&
+    entry.resolvedElsewhere !== true
+  );
+}
+
+/**
+ * Mark ONE approval entry actionable — the only door through which a card
+ * becomes clickable (#242 half 4).
+ *
+ * Two callers, both of which are an authority for "this card is open RIGHT NOW":
+ * the live `approval_request` frame, and `approval_snapshot`'s still-pending
+ * listing. `case "history"` deliberately does NOT call it, which is what makes a
+ * replayed card inert.
+ *
+ * Returns the input array by reference when the bit is already set, so a
+ * re-delivered request does not churn `state.messages`.
+ */
+function markApprovalActionable(messages: ChatMessage[], id: string): ChatMessage[] {
+  let changed = false;
+  const next = messages.map((m) => {
+    if (m.kind !== "approval" || m.id !== id || m.actionable === true) return m;
+    changed = true;
+    return { ...m, actionable: true };
+  });
+  return changed ? next : messages;
+}
+
+/**
+ * Mark ONE approval entry's resolution SERVER-CONFIRMED — the client-local half
+ * of an `approval_resolved` frame (the decision itself is durable and is folded
+ * by the reducer).
+ *
+ * Confirmed means the snapshot reconciler treats the card as authoritative: it
+ * never re-sends the decision as lost (Leg C) and never downgrades it to the
+ * `"unknown"` sentinel (Leg B). Returns the input array by reference when the
+ * bit is already set.
+ */
+function markApprovalConfirmed(messages: ChatMessage[], id: string): ChatMessage[] {
+  let changed = false;
+  const next = messages.map((m) => {
+    if (m.kind !== "approval" || m.id !== id) return m;
+    const settled = settleApprovalFromServer(m);
+    if (settled === m) return m;
+    changed = true;
+    return settled;
+  });
+  return changed ? next : messages;
+}
+
+/**
+ * #400: the client-local half of ANY server-sourced decision — the live
+ * `approval_resolved` frame, a difference `approvalResolution`, a `history`
+ * row's resolved decision, or a snapshot `resolved` entry. Confirms the card
+ * and clears what a `not-pending` refusal (or Leg B) left behind: the
+ * `resolvedElsewhere` sentinel and `decisionRejectedReason`.
+ *
+ * A refusal frame is unsequenced, so it can overtake a resolution still held
+ * for catch-up; without this, the verdict would land on a card still saying
+ * "not applied". `decision`, when given, is written too (the snapshot path
+ * carries the verdict itself; the others fold it through the reducer).
+ *
+ * Returns the entry by reference when nothing changes.
+ */
+function settleApprovalFromServer(
+  m: ChatApprovalMessage,
+  decision?: ApprovalDecision,
+): ChatApprovalMessage {
+  if (
+    m.resolutionConfirmed === true &&
+    m.resolvedElsewhere === undefined &&
+    m.decisionRejectedReason === undefined &&
+    (decision === undefined || m.resolvedDecision === decision)
+  ) {
+    return m;
+  }
+  const { resolvedElsewhere: _elsewhere, decisionRejectedReason: _refused, ...card } = m;
+  return {
+    ...card,
+    ...(decision !== undefined ? { resolvedDecision: decision } : {}),
+    resolutionConfirmed: true,
+  };
+}
+
+function deriveApprovals(messages: readonly ChatMessage[]): ApprovalRequest[] {
+  const out: ApprovalRequest[] = [];
+  for (const m of messages) {
+    if (m.kind !== "approval") continue;
+    const resolvedDecision: ApprovalDecision | "unknown" | undefined =
+      m.resolvedDecision ?? (m.resolvedElsewhere === true ? "unknown" : undefined);
+    out.push({
+      id: m.id,
+      kind: m.approvalKind,
+      title: m.title,
+      ...(m.description !== undefined ? { description: m.description } : {}),
+      prompt: m.prompt,
+      // A fresh array: `ApprovalRequest.options` is a MUTABLE `ApprovalOption[]`
+      // in the public type while the entry holds a `readonly` one, and handing
+      // the entry's own array out would let an embedder mutate a transcript
+      // entry the reducer shares by reference.
+      options: m.options.map((o) => ({ ...o })),
+      ...(m.expiresAtMs !== undefined ? { expiresAtMs: m.expiresAtMs } : {}),
+      ...(resolvedDecision !== undefined ? { resolvedDecision } : {}),
+      ...(m.resolutionConfirmed !== undefined
+        ? { resolutionConfirmed: m.resolutionConfirmed }
+        : {}),
+      ...(m.decisionRejectedReason !== undefined
+        ? { decisionRejectedReason: m.decisionRejectedReason }
+        : {}),
+      actionable: isActionableApproval(m),
+    });
+  }
+  return out;
+}
+
+/**
+ * Apply one patch and recompute every DERIVED field.
+ *
+ * The derivation is conditional on `messages` being in the patch, so
+ * `state.reasoning` keeps its ARRAY IDENTITY across patches that do not touch
+ * the transcript — `typing`, `commands`, `approvals`, connection status.
+ *
+ * ⚠️ BE HONEST ABOUT WHAT THAT DOES AND DOES NOT BUY. An earlier revision said
+ * the alternative "would report a change on every `typing` frame", which is true
+ * and also the least of it. MEASURED: `state.reasoning` gets a FRESH array on
+ * EVERY patch that touches `messages`, contents identical or not — two
+ * consecutive `progress` frames each produce a new one. `progress` is far more
+ * frequent during a turn than `typing` is, so a listener that keys off
+ * `state.reasoning`'s identity still sees churn; what this condition removes is
+ * the churn OUTSIDE a turn, not inside one.
+ *
+ * That is consistent with the rest of the object rather than a compromise —
+ * `WebChannelState`'s docblock promises a new object per change, "the arrays
+ * too", and `messages` itself is rebuilt by `mergeDurable` on every durable
+ * frame. A content-equality memo here would be a fourth opinion about when a
+ * view changed; the reducer's own header already refuses that reasoning for
+ * array identity.
+ */
+function nextStateFrom(
+  prev: InitializedWebChannelState,
+  patch: StatePatch,
+): InitializedWebChannelState {
+  const next = { ...prev, ...patch };
+  if (patch.messages !== undefined) {
+    next.reasoning = deriveReasoning(patch.messages);
+    next.toolActivity = deriveToolActivity(patch.messages);
+    next.approvals = deriveApprovals(patch.messages);
+  }
+  return next;
+}
+
+/**
+ * THE KIND-SCOPED IDENTITY OF ONE TRANSCRIPT ENTRY — one definition, every
+ * index, BOTH the local entry and the wire row (#242 half 3).
+ *
+ * ⚠️ THIS EXISTS BECAUSE THE COPY-PASTE ENDS HERE. `state.messages` holds FOUR
+ * kinds since #242 half 4 added approvals — and the device did its job on the
+ * way in: adding the arm below turned every call site red until it was handled,
+ * which is exactly what the two-way inline key it replaced could not do. Half 2
+ * shipped THREE
+ * separate defects of one shape — an id-keyed index over a mixed array — and its
+ * conclusion is the rule this function enforces mechanically rather than by
+ * memory: NEVER KEY A MIXED TRANSCRIPT BY ID ALONE. The two id spaces are not
+ * provably disjoint (`durable-view-reducer.ts`'s `findTextIndex` docblock
+ * retracts the id-shape argument outright), and `case "history"` deliberately
+ * produces same-id pairs of different kinds.
+ *
+ * ⚠️ AND A FORGOTTEN KIND IS A COMPILE ERROR, WHICH IS THE ACTUAL POINT. The
+ * inline key this replaced was
+ * `` `${kind === "reasoning" ? "r" : "t"}\0${id}` `` — a two-way test with an
+ * `else` fallback, so adding a third kind would have SILENTLY mapped every tool
+ * entry into the BUBBLE key space and reintroduced the exact collision half 2
+ * spent three rounds removing. The `never` default below makes that fail to
+ * compile, the same device `KNOWN_EVENT_KINDS` uses in `journal-history.ts`.
+ *
+ * ⚠️ THE PARAMETER IS THE STRUCTURAL MINIMUM, NOT `ChatMessage`, AND THAT IS
+ * WHAT LETS ONE FUNCTION SERVE BOTH SIDES. `case "history"` keys UNVALIDATED
+ * WIRE ROWS and `mergeDurable` keys VALIDATED LOCAL ENTRIES; those are different
+ * types carrying the same identity. An earlier revision of this slice wrote TWO
+ * functions with identical bodies — two things that must agree and nothing to
+ * make them go red together, which is the defect class this whole module is
+ * organised against. Widening the parameter instead costs nothing: every
+ * `ChatMessage` arm is assignable to the matching arm below, so a FOURTH
+ * `ChatMessage` kind stops compiling at each call site rather than being keyed
+ * wrongly.
+ *
+ * ⚠️ TOOL IS KEYED BY THE PAIR `(turnId, id)`, the other two by `id`. That is
+ * not stylistic — the producer's tool id is unique within a RUN, and both the
+ * live upsert and `applyTool` address a call by both fields. A key function per
+ * kind is exactly what lets one index serve all three.
+ *
+ * NUL separates, so no id can spell another kind's key. The residual ambiguity
+ * is a NUL *inside* an id or turnId; that is the pre-existing convention here
+ * and its blast radius is two tool calls sharing a key, which is a visible
+ * duplicate rather than a loss.
+ */
+type KeyedTranscriptEntry =
+  | { kind?: undefined; id: string }
+  | { kind: "reasoning"; id: string }
+  | { kind: "tool"; id: string; turnId: string }
+  | { kind: "approval"; id: string };
+
+function transcriptEntryKey(entry: KeyedTranscriptEntry): string {
+  switch (entry.kind) {
+    case undefined:
+      return JSON.stringify(["text", entry.id]);
+    case "reasoning":
+      return JSON.stringify(["reasoning", entry.id]);
+    case "tool":
+      return JSON.stringify(["tool", entry.turnId, entry.id]);
+    // #242 half 4. Keyed by `id` alone, like the first two and unlike `tool`:
+    // an approval id is the gateway's own `approvalId` (the value the client
+    // sends back on `approval_decision`), so it is the whole identity and there
+    // is no second field to compose.
+    case "approval":
+      return JSON.stringify(["approval", entry.id]);
+    default: {
+      const unhandled: never = entry;
+      void unhandled;
+      // Unreachable: every arm is handled above, and a new one fails to compile
+      // at the assignment. Returning a key that can collide with nothing keeps
+      // this total for a value forged past the type system.
+      return `?\0${String((entry as { id?: unknown }).id)}`;
+    }
+  }
+}
+
+/**
+ * Index a transcript by KIND, each kind under its own key space and its own
+ * TYPE (#242 half 3).
+ *
+ * ⚠️ ONE INDEX, NOT ONE MAP PER KIND BOLTED ON AS KINDS ARRIVE. `mergeDurable`
+ * used to build `prevBubbleById` and `prevReasoningById` side by side; tool made
+ * three and half 4's approvals four, with every call site needing to
+ * remember which map to reach into. The record below is built by ONE exhaustive
+ * switch, so adding a kind is two compile errors — a missing field on
+ * `TranscriptIndex` and an unhandled arm here — instead of a map somebody forgot
+ * to populate.
+ *
+ * ⚠️ THE MAPS STAY SEPARATELY TYPED RATHER THAN COLLAPSING TO
+ * `Map<string, ChatMessage>` KEYED BY `transcriptEntryKey`. That would work and
+ * would need a narrowing read at every lookup to recover the arm — a guard on
+ * the read, which is the shape half 2 proved dangerous. Typed buckets give each
+ * caller the exact arm with no guard at all, which is the property the
+ * "the key does the work" conclusion was actually about.
+ */
+type TranscriptIndex = {
+  bubble: Map<string, ChatBubble>;
+  reasoning: Map<string, ChatReasoningMessage>;
+  tool: Map<string, ChatToolMessage>;
+  approval: Map<string, ChatApprovalMessage>;
+};
+
+function indexTranscriptByKind(messages: readonly ChatMessage[]): TranscriptIndex {
+  const index: TranscriptIndex = {
+    bubble: new Map(),
+    reasoning: new Map(),
+    tool: new Map(),
+    approval: new Map(),
+  };
+  for (const m of messages) {
+    switch (m.kind) {
+      case undefined:
+        index.bubble.set(m.id, m);
+        break;
+      case "reasoning":
+        index.reasoning.set(m.id, m);
+        break;
+      case "tool":
+        index.tool.set(toolEntryKey(m.turnId, m.id), m);
+        break;
+      case "approval":
+        index.approval.set(m.id, m);
+        break;
+      default: {
+        const unhandled: never = m;
+        void unhandled;
+        break;
+      }
+    }
+  }
+  return index;
+}
+
+/**
+ * The composite key a tool call is addressed by, in ONE place.
+ *
+ * Both `transcriptEntryKey` and `indexTranscriptByKind` compose it, so the
+ * "(turnId, id), never id alone" rule has a single definition rather than two
+ * sites that must remember it.
+ */
+function toolEntryKey(turnId: string, id: string): string {
+  return JSON.stringify([turnId, id]);
+}
+
+/**
+ * Shallow equality over a transcript entry's own enumerable fields, so
+ * `mergeDurable` can hand an UNCHANGED entry back by reference. `Object.is`
+ * rather than `===` only to keep `NaN` (a plausible `ts`/`assistantMessageIndex`
+ * corruption) from reporting a spurious change on every apply.
+ *
+ * ⚠️ "ENTRY", NOT "BUBBLE" — this said `bubble` while it only ever saw bubbles,
+ * and #242 half 2 gave it a second caller (`mergeDurable`'s reasoning branch,
+ * `sameChatMessage(prevEntry, nextReasoning)`). The key-count check is what makes
+ * that work for BOTH kinds, which is why `ChatBubble.kind` and a reasoning
+ * entry's `ts` are absent as OWN KEYS rather than present-and-`undefined`.
+ *
+ * ⚠️ ONLY ONE OF THOSE TWO CITES THIS FUNCTION, so do not go looking for a pair.
+ * `ChatBubble.kind`'s declaration in `types.ts` carries the reason; the reasoning
+ * `ts` is explained at its ASSIGNMENT site (`mergeDurable`'s reasoning branch),
+ * not at its declaration. An earlier revision of this block claimed both
+ * declarations did — corrected rather than deleted, because "both declarations
+ * say so" is exactly the kind of census a reader trusts without checking.
+ */
+function sameChatMessage(a: ChatMessage, b: ChatMessage): boolean {
+  const aKeys = Object.keys(a);
+  if (aKeys.length !== Object.keys(b).length) return false;
+  for (const key of aKeys) {
+    if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+    if (!Object.is((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export class WebChannelNATSClient {
   private readonly natsOptions: DirectClientOptions;
   private readonly client: WebChannelNatsClient;
@@ -137,6 +869,13 @@ export class WebChannelNATSClient {
     agentProtocolVersion: null,
     agentPluginVersion: null,
   };
+  /** Replayed empty slots retain reducer order without becoming visible drafts. */
+  private readonly replayPlacementIds = new Set<string>();
+  /** Only synchronous fold/drain scopes hold these arrays; retired frames stay weak. */
+  private readonly activeReplayBuffers = new Set<InboundMessage[]>();
+  private readonly retiredBufferedProgress = new WeakSet<InboundMessage>();
+  private visibleStateSource = this.state;
+  private visibleState = this.state;
 
   private readonly listeners = new Set<Listener>();
   /** Counts public state fanouts so a staged bubble is exposed exactly once. */
@@ -150,7 +889,7 @@ export class WebChannelNATSClient {
    * released FIFO once the turn settles AND the session key exists. Each entry's
    * `localId` is the id of its `pending: true` transcript bubble.
    */
-  private readonly held: Array<{ localId: string; text: string; receiptKey: string }> = [];
+  private readonly held: Array<{ localId: string; text: string; receiptKey: string; retryOf?: string }> = [];
   /** Every outbound operation staged for a connect requested inside close(). */
   private readonly deferredReplacementOperations: DeferredReplacementOperation[] = [];
   /** Keeps reentrant operations behind entries already staged for replacement. */
@@ -172,12 +911,33 @@ export class WebChannelNATSClient {
    */
   private readonly receipts = new Map<string, ReceiptRecord>();
   private readonly wireIdToReceiptKey = new Map<string, string>();
+  /**
+   * #243 half 2b: the idempotency `random_id → receiptKey` linkage for the
+   * bubbles this client sent. The wrapper mints the `random_id` (see
+   * `mintRandomId`) so it — not the low-level `sendUserMessage` — owns the
+   * `random_id ↔ bubble` correlation. On an `ack` carrying `committed`
+   * (`{random_id, messageId}[]`), `adoptCommittedIds` looks up the receiptKey
+   * here, finds the optimistic `u-<n>` bubble carrying that receiptKey, and
+   * re-keys its durable id to the SERVER `messageId` — so the client's `user`
+   * id becomes the id the delivery journal already holds, and a later
+   * history/full-replay tier-1 matches by id instead of by text (`case
+   * "history"` tier 2). Keyed by receiptKey (not the mutating bubble id) so it
+   * survives the very re-key it enables. An entry is consumed when its echo is
+   * adopted; a send that never draws a `committed` echo (control-lane text; the
+   * plugin's fast-path/overflow/cancelled ack gaps — a documented follow-up)
+   * leaves one residue entry per un-echoed send — bounded per send, but NOT
+   * cleared until half 3 closes those echo gaps, so it grows with un-echoed
+   * sends over a session (tiny string entries; a stale one can only no-op). Its
+   * bubble stays `u-<n>`, where the tier-2/3 text fallback still reconciles it on
+   * reconnect.
+   */
+  private readonly randomIdToReceiptKey = new Map<string, string>();
   /** P0-4: forward rank for the receipt-level monotonic guard (incl. `completed`). */
-  private static readonly RECEIPT_RANK: Record<"queued" | "sent" | "accepted" | "completed", number> = {
+  private static readonly RECEIPT_RANK: Record<"queued" | "sent" | "accepted" | "completed" | "interrupted", number> = {
     queued: 0,
     sent: 1,
     accepted: 2,
-    completed: 3,
+    completed: 3, interrupted: 3,
   };
   /**
    * P1-9 §3.2: true only between a session KEY establishment (onSession, fired
@@ -200,6 +960,35 @@ export class WebChannelNATSClient {
   private heldStallMutationEpoch = 0;
   private heldStallTimer: ReturnType<typeof setTimeout> | null = null;
   private heldStallTimerGeneration = 0;
+  /**
+   * Published candidates in send order, retained across raw reconnects. Only
+   * accepted receipts arm recovery; delivery acceptance is not task settlement.
+   * Unlike the advisory openTurns set, transport loss cannot retire this work.
+   */
+  private readonly applicationTurns = new Map<string, ReceiptRecord>();
+  /**
+   * #399: converged sends no longer own a publish-order turn, but their receipts
+   * still owe the first retry row's authoritative outcome. Key by the retired
+   * local wire id so terminal receipt transitions discard exact ownership
+   * without putting the alias back into the prefix-settlement collection.
+   */
+  private readonly convergedApplicationTurns = new Map<string, ReceiptRecord>();
+  /** Local candidates at the latest typing frame; not exclusive activity owners. */
+  private typingLocalCandidates = new Set<string>();
+  /** One cancellation cleanup decision for this typing episode, never a task outcome. */
+  private deferredCancelledTyping: { candidates: Set<string>; lifecycle: number } | undefined;
+  /** Prevent cleanup from observing a partially folded inbound/recovery transaction. */
+  private cancellationReconciliationDepth = 0;
+  /** Release only after cleanup subscribers finish supplying reentrant activity. */
+  private cancellationTypingCleanupDepth = 0;
+  private activeTurnStallTimer: ReturnType<typeof setTimeout> | null = null;
+  private activeTurnStallGeneration = 0;
+  /**
+   * One recovery per silent interval, like the held lane: recovery itself is
+   * not activity, so re-arming on each replacement session would loop. Only new
+   * evidence (live activity, a newly accepted turn, teardown) re-enables it.
+   */
+  private activeTurnRecoveryIssued = false;
   /** Defers held-admission UI fanout until the first owner's timer commit ends. */
   private heldAdmissionNotificationDepth = 0;
   private heldAdmissionNotificationPending = false;
@@ -237,8 +1026,11 @@ export class WebChannelNATSClient {
   /**
    * P1-9 §3.6.2: post-reconnect staleness valve. `staleDraftWatch` holds the ids
    * of `working` drafts recorded when onSession fired; the timer flips any still
-   * in the set to `working: false` in place (never swapping the id) after the
-   * grace. Both are connection-scoped: cleared on every onState(false)/close()
+   * in the set to `working: false` in place after the grace, never swapping the
+   * id and never dropping the bubble — this valve GUESSES that a turn died, so it
+   * promotes the partial to durable rather than deleting it (see
+   * `expireStaleDrafts` for why this site differs from the three turn-end sites).
+   * Both are connection-scoped: cleared on every onState(false)/close()
    * and re-armed FRESH on every onSession, so the grace counts only connected
    * time. A draft-touching frame (progress/agent_message by id, reasoning by
    * turnId) disarms its entry — the turn is demonstrably alive.
@@ -302,6 +1094,12 @@ export class WebChannelNATSClient {
 
     this.client = new WebChannelNatsClient(this.natsOptions);
 
+    // Epoch validity must be decided before the low-level client consumes a
+    // result frame from its replay ledger/tracker. The wrapper remains the one
+    // journal-epoch authority; the low-level gate only enforces its verdict at
+    // that earlier side-effect boundary.
+    this.client.setInboundMessageGate((msg: InboundMessage) => this.prepareJournalEpoch(msg));
+
     // Wire up message listener
     this.client.onMessage((msg: InboundMessage) => this.handleMessage(msg));
 
@@ -312,12 +1110,19 @@ export class WebChannelNATSClient {
       // tracker `sent` must see false and consume without opening.
       this.rawTransportConnected = connected;
       const wasSessionEstablished = this.sessionEstablished;
-      this.wrapperLifecycleGeneration++;
+      const lifecycle = ++this.wrapperLifecycleGeneration;
+      this.deferredCancelledTyping = undefined;
       // Raw transport is never public readiness. Invalidate the release gate
       // before timer cleanup or any wrapper state callback.
       this.sessionEstablished = false;
+      this.cancelActiveTurnStallTimer();
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
       if (!connected || wasSessionEstablished) this.consumeHeldStallForRawLoss();
       this.clearStaleDraftWatch();
+      // #244 half B: the in-flight catch-up and its buffer belong to the connection
+      // that just dropped; the cursor itself survives, and the reconnect snapshot's
+      // high-water re-detects any gap through the ordinary check.
+      this.resetCursorForConnection();
       // P0-4: a CL2 terminal instance is PERMANENTLY retired — the onState handler
       // must not mutate status/error at all, on EITHER edge. This matters because
       // a registration-path terminal sets only the WCNC-level `terminalReached`
@@ -341,10 +1146,13 @@ export class WebChannelNATSClient {
       // NOT symmetric with isTyping, though: a later `typing` frame re-arms
       // isTyping, but a receipt whose first successful publish already opened a
       // turn has consumed its one-way opening latch. A later accepted/replay
-      // transition therefore cannot re-open it after this sweep, so a transient
-      // reconnect during a long multi-step turn leaves `turnActive` false for
-      // the REST of that turn. A still-queued, never-published receipt retains
-      // its latch and may open for the first time after reconnect.
+      // transition therefore cannot re-open it after this sweep. #396: the
+      // server's own `queued`/`started` request state can — the replacement
+      // session's history re-opens a turn still running there (see
+      // `reopenTurnFromServerState`), so a transient reconnect during a long
+      // turn clears `turnActive` only while the server is unreachable. A
+      // still-queued, never-published receipt retains its latch and may open
+      // for the first time after reconnect.
       const turnsCleared = !connected && this.clearOpenTurns();
       this.setState({
         status: this.everSessionEstablished ? "reconnecting" : "connecting",
@@ -404,6 +1212,10 @@ export class WebChannelNATSClient {
         return;
       }
       this.maybeRelease();
+      // A successful replacement registration proves application readiness,
+      // not completion. Keep watching accepted work if its snapshot has not
+      // settled it, including a legitimately silent turn that is still running.
+      if (this.wrapperLifecycleGeneration === lifecycle) this.refreshActiveTurnWatch();
     });
 
     // P0-4: the authoritative tracker drives every send-state transition. Route
@@ -436,6 +1248,11 @@ export class WebChannelNATSClient {
       this.connectDeferredUntilCloseCompletes = false;
       this.replacementHeldNeedsFreshEpisode = false;
       this.wrapperLifecycleGeneration++;
+      this.deferredCancelledTyping = undefined;
+      this.applicationTurns.clear();
+      this.convergedApplicationTurns.clear();
+      this.activeTurnRecoveryIssued = false;
+      this.cancelActiveTurnStallTimer();
       const deferredEntries = this.deferredReplacementOperations.splice(0);
       // P0-4 (D5 held/terminal): the queued/ledgered sends were already swept to
       // failed{terminal} by the low-level terminal sequence BEFORE this listener
@@ -453,15 +1270,19 @@ export class WebChannelNATSClient {
       // Flip isTyping off and every `working` draft to `working:false` in place
       // (id/text untouched — the /stop idiom), atomically with the error status so
       // there is no intermediate flicker. Does NOT touch status/error semantics.
+      // #251: a lane that never received durable text has nothing to settle INTO,
+      // so it is dropped rather than frozen at its last partial.
       let draftsSettled = false;
-      const settledMessages = this.state.messages.map((m) => {
-        if (m.working) {
-          draftsSettled = true;
-          this.staleDraftWatch.delete(m.id);
-          return { ...m, working: false };
-        }
-        return m;
-      });
+      const settledMessages = this.dropSpentDrafts(
+        this.state.messages.map((m) => {
+          if (m.working) {
+            draftsSettled = true;
+            this.staleDraftWatch.delete(m.id);
+            return { ...m, working: false };
+          }
+          return m;
+        }),
+      );
       // #96: a retired instance can never see another `turn_settled`, so every
       // open turn ends here too — in the SAME atomic update as isTyping.
       const turnsCleared = this.clearOpenTurns();
@@ -492,7 +1313,25 @@ export class WebChannelNATSClient {
 
   /** Get current state */
   getState(): WebChannelState {
-    return this.state;
+    if (this.visibleStateSource !== this.state) {
+      this.visibleStateSource = this.state;
+      this.visibleState = this.state;
+      if (this.replayPlacementIds.size > 0) {
+        const retained = new Set<string>();
+        const messages = this.state.messages.filter((m) => {
+          if (m.kind !== undefined || m.role !== "agent" || !this.replayPlacementIds.has(m.id)) return true;
+          retained.add(m.id);
+          return false;
+        });
+        for (const id of this.replayPlacementIds) {
+          if (!retained.has(id)) this.replayPlacementIds.delete(id);
+        }
+        if (messages.length !== this.state.messages.length) {
+          this.visibleState = { ...this.state, messages };
+        }
+      }
+    }
+    return this.visibleState;
   }
 
   /** Subscribe to state changes */
@@ -532,15 +1371,25 @@ export class WebChannelNATSClient {
     // occurring from one of THIS close's callouts can set the intent again.
     this.connectDeferredUntilCloseCompletes = false;
     this.wrapperLifecycleGeneration++;
+    this.deferredCancelledTyping = undefined;
     this.closeTransactionDepth++;
     try {
+      this.applicationTurns.clear();
+      this.convergedApplicationTurns.clear();
+      this.activeTurnRecoveryIssued = false;
       // Detach only this lifecycle's wrapper ownership before any timer or raw
       // teardown callout. Work created after a reentrant connect is replacement
       // ownership and remains in the live collections.
       const deferredEntries = this.deferredReplacementOperations.splice(0);
       const heldEntries = this.takeHeld();
+      this.cancelActiveTurnStallTimer();
       // P1-9: tear down the connection-scoped staleness valve (§3.6.2).
       this.clearStaleDraftWatch();
+      // #244 half B: this lifecycle will never receive its pending `difference`;
+      // stop the timer and drop the buffer so nothing leaks past close().
+      this.resetCursorForConnection();
+      // #401: close drops the queued page requests, so their nonces go too.
+      this.historyPageNonces = [];
       // #96: this lifecycle will never see another `turn_settled`. Clear its
       // turns before raw teardown, but delay the public flip until disconnect()
       // has completed so no state listener can reopen onto the old socket.
@@ -637,7 +1486,25 @@ export class WebChannelNATSClient {
    * ignore it). `undefined` ONLY for trimmed-empty input (R2b-3): no bubble, no
    * tracker mutation, no fabricated receipt.
    */
-  send(text: string): SendReceipt | undefined {
+  send(text: string): SendReceipt | undefined { return this.sendWithProvenance(text); }
+
+  /**
+   * A deliberate new execution; the interrupted original and its result remain
+   * visible. One retry per original (#399): the server answers a second one with
+   * the first retry's receipt, and this refuses it locally once either the
+   * server's `retriedBy` or this device's own live retry row names the
+   * original. A retry the server refused (`failed`) or that was retracted
+   * before sending never reached it, so it spends nothing.
+   */
+  retryInterrupted(messageId: string): SendReceipt | undefined {
+    const original = this.state.messages.find(m => m.kind === undefined && m.role === "user" && m.id === messageId);
+    if (!original || original.requestState !== "interrupted" || original.retriedBy !== undefined || isLikelyAbortText(original.text)) return undefined;
+    if (this.state.messages.some(m => m.kind === undefined && m.role === "user" && m.retryOf === messageId
+      && m.sendState !== "failed" && !m.retracted)) return undefined;
+    return this.sendWithProvenance(original.text, original.id);
+  }
+
+  private sendWithProvenance(text: string, retryOf?: string): SendReceipt | undefined {
     const trimmed = text.trim();
     if (!trimmed) return undefined;
 
@@ -652,6 +1519,7 @@ export class WebChannelNATSClient {
     // explicit command clears the buffer).
     if (isLikelyAbortText(trimmed)) {
       if (isExplicitStop(trimmed)) {
+        this.retireBufferedProgress();
         this.stopCommitDepth++;
         let stopCommitted = false;
         try {
@@ -696,8 +1564,8 @@ export class WebChannelNATSClient {
     // window would publish ahead of an earlier held message).
     if (this.shouldHold()) {
       const receiptKey = this.newReceiptKey();
-      const localId = `u-${this.uid()}`;
-      const heldEntry = { localId, text: trimmed, receiptKey };
+      const localId = this.mintLocalBubbleId("u");
+      const heldEntry = { localId, text: trimmed, receiptKey, ...(retryOf ? { retryOf } : {}) };
       this.held.push(heldEntry);
       if (this.deferredReplacementOpen()) {
         this.replacementHeldNeedsFreshEpisode = true;
@@ -721,7 +1589,7 @@ export class WebChannelNATSClient {
       this.heldAdmissionNotificationDepth++;
       try {
         this.appendMessage({
-          id: localId, role: "user", text: trimmed, pending: true, receiptKey, sendState: "queued",
+          id: localId, role: "user", text: trimmed, pending: true, receiptKey, sendState: "queued", ...(retryOf ? { retryOf } : {}),
         });
         this.ensureHeldStallEpisode();
       } finally {
@@ -740,7 +1608,7 @@ export class WebChannelNATSClient {
     // #96: an ordinary user message — the plugin runs it as a normal turn and
     // answers with `turn_settled`, so its first `sent`/`accepted` transition can
     // open a turn.
-    return this.publish(trimmed, true);
+    return this.publish(trimmed, true, retryOf);
   }
 
   /**
@@ -784,9 +1652,9 @@ export class WebChannelNATSClient {
    * text the server routes onto the control lane. The CALLER already knows which
    * branch it is; publish must never re-sniff the text.
    */
-  private publish(trimmed: string, settlementEligible: boolean): SendReceipt {
+  private publish(trimmed: string, settlementEligible: boolean, retryOf?: string): SendReceipt {
     if (this.shouldDeferReplacementOperation()) {
-      return this.deferReplacementPublish(trimmed, settlementEligible);
+      return this.deferReplacementPublish(trimmed, settlementEligible, retryOf);
     }
     const receiptKey = this.newReceiptKey();
     const wireId = this.client.reserveWireId();
@@ -801,21 +1669,37 @@ export class WebChannelNATSClient {
       pendingTransitions: [],
       drainingTransitions: false,
     });
-    const bubble: ChatMessage = {
-      id: `u-${this.uid()}`,
-      role: "user",
-      text: trimmed,
+    // v6 §15.4: the echo's durable half (id/role/text/turnId + tail placement) is
+    // the reducer's `user` transition; the receipt overlay is the client's.
+    const bubbleId = this.mintLocalBubbleId("u");
+    const messages = this.nextPublishedUserMessages(
+      bubbleId,
+      trimmed,
       wireId,
-      turnId: wireId,
-      receiptKey,
-      sendState: "queued",
-    };
+      { wireId, receiptKey, sendState: "queued", ...(retryOf ? { retryOf } : {}) },
+    );
+    const randomId = this.mintRandomId(receiptKey);
     this.stageReceiptStateThenCommit(
       receiptKey,
-      { messages: [...this.state.messages, bubble] },
-      () => { this.client.sendUserMessage(trimmed, wireId); },
+      { messages },
+      () => { this.sendUserMessage(trimmed, wireId, randomId, retryOf); },
     );
     return this.makeReceipt(receiptKey);
+  }
+
+  private sendUserMessage(text: string, wireId: string, randomId: string, retryOf?: string): void {
+    const receiptKey = this.wireIdToReceiptKey.get(wireId);
+    const receipt = receiptKey ? this.receipts.get(receiptKey) : undefined;
+    if (receipt?.settlementEligible && receipt.state === "queued") {
+      // Install before publishing: an authenticated ACK or settlement can be
+      // delivered synchronously by the transport, before the sent callback.
+      this.applicationTurns.set(wireId, receipt);
+    }
+    // #398: the explicit stop names earlier unacknowledged input for durable
+    // cancellation. The low level snapshots it at this frame's queue position.
+    if (isExplicitStop(text)) this.client.sendUserMessage(text, wireId, randomId, undefined, true);
+    else if (retryOf === undefined) this.client.sendUserMessage(text, wireId, randomId);
+    else this.client.sendUserMessage(text, wireId, randomId, retryOf);
   }
 
   // ---------------------------------------------------------------------------
@@ -909,7 +1793,10 @@ export class WebChannelNATSClient {
   /** Consume every candidate that exists at an explicit-stop boundary. */
   private consumeAllTurnOpenings(): void {
     for (const receipt of this.receipts.values()) {
-      if (receipt.settlementEligible) receipt.turnOpeningConsumed = true;
+      if (receipt.settlementEligible) {
+        receipt.turnOpeningConsumed = true;
+        receipt.stoppedAtExplicitBoundary = true;
+      }
     }
   }
 
@@ -999,11 +1886,12 @@ export class WebChannelNATSClient {
   private deferReplacementPublish(
     trimmed: string,
     settlementEligible: boolean,
+    retryOf?: string,
   ): SendReceipt {
     const receiptKey = this.newReceiptKey();
-    const localId = `u-${this.uid()}`;
+    const localId = this.mintLocalBubbleId("u");
     this.deferredReplacementOperations.push({
-      kind: "user", localId, text: trimmed, receiptKey,
+      kind: "user", localId, text: trimmed, receiptKey, ...(retryOf ? { retryOf } : {}),
     });
     this.receipts.set(receiptKey, {
       id: receiptKey,
@@ -1020,6 +1908,7 @@ export class WebChannelNATSClient {
       text: trimmed,
       receiptKey,
       sendState: "queued",
+      ...(retryOf ? { retryOf } : {}),
     });
     return this.makeReceipt(receiptKey);
   }
@@ -1057,7 +1946,7 @@ export class WebChannelNATSClient {
       return;
     }
     if (entry.kind === "load-history") {
-      this.client.loadHistory(entry.before, entry.limit);
+      this.client.loadHistory(entry.before, entry.limit, entry.beforeTurnId, this.mintHistoryPageNonce());
       return;
     }
     if (entry.kind === "load-commands") {
@@ -1074,19 +1963,22 @@ export class WebChannelNATSClient {
     const bubble = this.state.messages.find(
       (message) => message.receiptKey === entry.receiptKey,
     );
+    const randomId = this.mintRandomId(entry.receiptKey);
     if (bubble) {
-      const messages = this.state.messages.map((message) =>
-        message.receiptKey === entry.receiptKey
-          ? { ...message, wireId, turnId: wireId }
-          : message,
+      const messages = this.nextPublishedUserMessages(
+        bubble.id,
+        entry.text,
+        wireId,
+        { wireId },
+        bubble,
       );
       this.stageReceiptStateThenCommit(
         entry.receiptKey,
         { messages },
-        () => { this.client.sendUserMessage(entry.text, wireId); },
+        () => { this.sendUserMessage(entry.text, wireId, randomId, entry.retryOf); },
       );
     } else {
-      this.client.sendUserMessage(entry.text, wireId);
+      this.sendUserMessage(entry.text, wireId, randomId, entry.retryOf);
     }
   }
 
@@ -1112,6 +2004,7 @@ export class WebChannelNATSClient {
     // transaction. They release only after the outer stop owns its queue slot.
     if (this.stopCommitDepth > 0) return true;
     if (this.heldReleaseCommitDepth > 0) return true;
+    if (this.cancellationTypingCleanupDepth > 0) return true;
     return this.turnInFlight() || this.held.length > 0;
   }
 
@@ -1123,11 +2016,20 @@ export class WebChannelNATSClient {
    * Each released bubble is published, patched `{pending:false, wireId, turnId}`,
    * AND MOVED TO THE TAIL of `state.messages` (display position = publish
    * position). Moving to the tail is load-bearing, not cosmetic: the history
-   * merge assumes local order mirrors transcript order (the tier-3 probe + the
-   * insertion cursor). An in-place release would order a held chip ABOVE the
-   * reply it delayed while the server transcript orders it after — the next
-   * snapshot would mis-adopt or duplicate. Moving to the tail makes a released
-   * bubble an ordinary send in an ordinary position.
+   * merge assumes local order mirrors the ORDER THE JOURNAL REPLAYS. An
+   * in-place release would order a held chip ABOVE the reply it delayed while
+   * the journal orders it after — a later user row could then adopt at a lower
+   * index and drag the insertion cursor backwards, misplacing the rows after it.
+   * Moving to the tail makes a released bubble an ordinary send in an ordinary
+   * position.
+   *
+   * ⚠️ THE REASON NARROWED AT #240 HALF 2 AND STILL HOLDS. It used to cite the
+   * tier-3 positional probe (deleted) and "the server transcript" (never read
+   * any more — N2). What carries it now is the insertion cursor alone, on the
+   * USER path, which is the one tier that still adopts. Also worth keeping from
+   * the deleted tier: a fresh row inserting at the plain `cursor`, AHEAD of a
+   * held chip, is chronologically right — anything a snapshot carries predates
+   * an unpublished chip.
    *
    * Re-entrancy: drain `held[]` LIVE — `shift()` one entry per iteration rather
    * than snapshot-and-clear before the loop. Each staged bubble is exposed to
@@ -1149,6 +2051,7 @@ export class WebChannelNATSClient {
       this.deferredReplacementOpen() ||
       this.stopCommitDepth > 0 ||
       this.heldReleaseCommitDepth > 0 ||
+      this.cancellationTypingCleanupDepth > 0 ||
       this.held.length === 0 ||
       this.turnInFlight() ||
       !this.state.connected ||
@@ -1186,7 +2089,7 @@ export class WebChannelNATSClient {
         // final entry the timer/lifecycle transaction has now committed.
         if (this.held[0] !== heldEntry) return;
         this.held.shift();
-        const { localId, text, receiptKey } = heldEntry;
+        const { localId, text, receiptKey, retryOf } = heldEntry;
         // P0-4 commit order: reserve the wireId, register the alias, stage the bubble
         // at the tail, THEN let the low level own/publish A before exposing that move.
         const wireId = this.client.reserveWireId();
@@ -1194,22 +2097,28 @@ export class WebChannelNATSClient {
         const receipt = this.receipts.get(receiptKey);
         if (receipt) receipt.wireId = wireId;
         const bubble = this.state.messages.find((m) => m.id === localId);
+        const randomId = this.mintRandomId(receiptKey);
         // A re-entrant listener may have already removed the bubble; the text is
         // still published (correct — release is a commit), so just skip the patch.
         if (bubble) {
-          const messages = this.state.messages.filter((m) => m.id !== localId);
-          messages.push({ ...bubble, pending: false, wireId, turnId: wireId });
+          const messages = this.nextPublishedUserMessages(
+            bubble.id,
+            text,
+            wireId,
+            { pending: false, wireId },
+            bubble,
+          );
           this.stageReceiptStateThenCommit(
             receiptKey,
             { messages },
-            () => { this.client.sendUserMessage(text, wireId); },
+            () => { this.sendUserMessage(text, wireId, randomId, retryOf); },
           );
         } else {
           // No bubble remains to stage. The authoritative `sent`/`accepted`
           // receipt callback still opens and exposes the turn only after the
           // low-level publish succeeds; `heldReleaseCommitDepth` keeps a listener
           // reached by that fanout from jumping this entry's FIFO position.
-          this.client.sendUserMessage(text, wireId);
+          this.sendUserMessage(text, wireId, randomId, retryOf);
         }
       }
     } finally {
@@ -1252,7 +2161,7 @@ export class WebChannelNATSClient {
     this.failHeldEntries(this.takeHeld(), failure);
   }
 
-  private takeHeld(): Array<{ localId: string; text: string; receiptKey: string }> {
+  private takeHeld(): Array<{ localId: string; text: string; receiptKey: string; retryOf?: string }> {
     const entries = this.held.splice(0);
     if (entries.length > 0) {
       this.endHeldStallEpisode();
@@ -1278,6 +2187,106 @@ export class WebChannelNATSClient {
     for (const entry of entries) {
       if (entry.kind !== "user") continue;
       this.receiptTransition(entry.receiptKey, "failed", failure);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Accepted-turn application liveness (independent of delivery retries)
+  // ---------------------------------------------------------------------------
+
+  private hasAcceptedApplicationTurn(): boolean {
+    for (const [id, receipt] of this.applicationTurns) {
+      // A cancellation ACK can be committed in the inner tracker while its
+      // receipt callback is queued behind a subscriber. It already owns the
+      // verdict: no timer may request recovery during that callback window.
+      if (receipt.state === "accepted" && !this.client.isIngressCancelled(id)) return true;
+    }
+    return this.hasAcceptedConvergedTurn();
+  }
+
+  private hasAcceptedConvergedTurn(): boolean {
+    for (const receipt of this.convergedApplicationTurns.values()) {
+      if (receipt.state === "accepted") return true;
+    }
+    return false;
+  }
+
+  /** Cancel only the named input; it proves nothing about a coalesced prefix. */
+  private retireCancelledApplicationTurn(wireId: string): boolean {
+    this.applicationTurns.delete(wireId);
+    const key = this.wireIdToReceiptKey.get(wireId);
+    const receipt = key ? this.receipts.get(key) : undefined;
+    if (receipt) receipt.turnOpeningConsumed = true;
+    return this.closeTurn(wireId);
+  }
+
+  private cancelActiveTurnStallTimer(): number {
+    const generation = ++this.activeTurnStallGeneration;
+    const timer = this.activeTurnStallTimer;
+    this.activeTurnStallTimer = null;
+    if (timer !== null) clearTimeout(timer);
+    return generation;
+  }
+
+  /** Retire the same coalesced prefix as turn_settled, even after raw loss. */
+  private settleApplicationTurnsThrough(turnId: string): void {
+    if (!this.applicationTurns.has(turnId)) return;
+    for (const id of this.applicationTurns.keys()) {
+      this.applicationTurns.delete(id);
+      if (id === turnId) break;
+    }
+  }
+
+  private refreshActiveTurnWatch(reset = false): void {
+    const timeout = this.client.getAckStallTimeoutMs();
+    const ready = () => timeout > 0 && this.heldSessionReady() && this.hasAcceptedApplicationTurn();
+    if (!ready()) {
+      this.cancelActiveTurnStallTimer();
+      return;
+    }
+    // The issued recovery owns this silent interval until new evidence clears it.
+    if (this.activeTurnRecoveryIssued) return;
+    if (!reset && this.activeTurnStallTimer !== null) return;
+    const lifecycle = this.wrapperLifecycleGeneration;
+    const generation = this.cancelActiveTurnStallTimer();
+    const current = () => this.activeTurnStallGeneration === generation
+      && this.wrapperLifecycleGeneration === lifecycle && ready();
+    if (!current()) return;
+    const timer = setTimeout(() => {
+      if (!current()) return;
+      this.activeTurnStallTimer = null;
+      this.activeTurnStallGeneration++;
+      this.activeTurnRecoveryIssued = true;
+      // The shared recovery path consumes unacked recovery; its raw-loss edge
+      // cancels both wrapper watchdogs before any replacement session can arm.
+      // ACKed payloads are absent from the replay ledger and are never resent.
+      this.client.requestApplicationRecovery();
+    }, timeout);
+    // Timer hooks may close/reopen, settle, or deliver newer activity. Never
+    // install this handle over the newer generation's ownership.
+    if (!current() || this.activeTurnStallTimer !== null) {
+      clearTimeout(timer);
+      return;
+    }
+    this.activeTurnStallTimer = timer;
+    (timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+  }
+
+  private observeActiveTurnActivity(msg: InboundMessage): void {
+    if (!this.hasAcceptedApplicationTurn()) return;
+    switch (msg.type) {
+      case "typing":
+      case "progress":
+      case "reasoning":
+      case "tool_activity":
+      case "agent_message":
+      case "turn_snapshot":
+      case "turn_settled":
+      case "request_state":
+      case "approval_request":
+      case "approval_resolved":
+        this.activeTurnRecoveryIssued = false;
+        this.refreshActiveTurnWatch(true);
     }
   }
 
@@ -1458,47 +2467,155 @@ export class WebChannelNATSClient {
   // ---------------------------------------------------------------------------
 
   /**
-   * §3.6.1: finalize any `working` draft whose turnId matches a settled turn
-   * (flip `working: false` in place — id/text untouched). Settled means no more
-   * upserts are coming; if `turnInFlight` drops as a result, the end-of-frame
-   * `maybeRelease()` releases held messages.
+   * §3.6.1: settle any `working` draft whose turnId matches a settled turn.
+   * Settled means no more upserts are coming; if `turnInFlight` drops as a
+   * result, the end-of-frame `maybeRelease()` releases held messages.
+   *
+   * "Settle" is TWO outcomes since #251, not the flip-in-place this used to
+   * promise: a draft that received durable text flips `working: false` with its
+   * id and text untouched, while one that never did is DROPPED. `turn_settled` is
+   * a genuine turn-end signal, so an unfinalized lane has nothing left to become.
    */
+  /**
+   * #212 (Phase 3, targeted): reconcile the live turn's AGENT ANSWER bubbles to
+   * the plugin's authoritative `turn_snapshot`. The plugin owns per-message
+   * identity; this is a PURE VIEW of its `answers` (ordered {id,text}) with a
+   * `remove` set naming the bubbles it mis-routed answer content onto.
+   *
+   * The contract is EXPLICIT, never a blanket "drop everything not listed":
+   *  - `answers` bubbles are upserted by id (existing bubble updated in place; an
+   *    id we do not hold yet is MINTED — a lane that streamed but whose wire
+   *    frames failed, e.g. the #215 mid-lane B recovery) and then reordered into
+   *    snapshot order among the slots answer bubbles already occupy;
+   *  - `remove` ids are dropped (an overflow final, or a recovery block now
+   *    represented by an `answers` lane);
+   *  - EVERYTHING else is untouched: user bubbles (receipts/held/sendState),
+   *    notices/errors, an adopted durable-history agent row that shares the turn,
+   *    and every non-answer agent bubble keeps its slot — only answer bubbles
+   *    reorder, and only among themselves.
+   * Case X is unaffected: its tool bubble is neither in `answers` (it never
+   * streamed) nor in `remove`, so it is preserved exactly as before.
+   *
+   * v6 §15.4: that whole reconciliation now lives in the shared reducer's `seal`
+   * transition (`durable-view-reducer.ts`'s `applySeal`, which was already a
+   * line-for-line port of the body this method used to hold). What survives here
+   * is the FRAME → EVENT mapper plus the client-local half:
+   *
+   *  - the two early returns are reproduced EXACTLY, including that neither sets
+   *    `isTyping: false`. A no-op snapshot must stay a no-op — emitting a state
+   *    patch and a listener notification for a frame that changes nothing is a
+   *    real regression, however small;
+   *  - the wire filters are applied HERE as well as inside `applySeal` (which
+   *    re-applies them idempotently) because the early-return decision and the
+   *    per-answer overlay both need the FILTERED set. An answer with a blank id
+   *    is dropped by the reducer, so it must not contribute an overlay either;
+   *  - `working: false` + clearing `draftOnly` on every answer is the overlay
+   *    that reproduces the old body's answer objects, for the reused and the
+   *    minted branch alike.
+   */
+  /**
+   * ⚠️ RETURNS "WAS THIS FRAME FOLDED" (#246 half A) — `turn_snapshot` is
+   * SEQ-BEARING, so this verdict is what `handleFrame` hands the cursor. The two
+   * early returns are deliberately DIFFERENT answers: a `turnId`-less frame is
+   * REFUSED (`false` — nothing this method can key on, so the gap must stay open
+   * until the canonical `seal` is re-served), while a snapshot with nothing to
+   * seal and nothing to remove is ACCEPTED (`true` — an empty seal is a real,
+   * foldable no-op; refusing it would buy a `get_difference` round-trip to
+   * re-fetch a row that changes nothing). "Nothing" means the wire arrays were
+   * absent or empty: the door (`decodeInboundMessage`) refuses an empty answer
+   * id or remove entry, so the filters below cannot reduce a frame that carried
+   * content to this early return.
+   */
+  private applyTurnSnapshot(msg: InboundMessage): boolean {
+    const turnId = msg.turnId;
+    if (typeof turnId !== "string" || turnId.length === 0) return false;
+    const rawAnswers = (Array.isArray(msg.answers) ? msg.answers : []).filter(
+      (a): a is { id: string; text: string } =>
+        !!a &&
+        typeof a.id === "string" &&
+        a.id.length > 0 &&
+        typeof a.text === "string",
+    );
+    // Defense-in-depth: the plugin never repeats an id (lane ids and minted ids
+    // are unique), but a duplicate would break the slot-refill's
+    // `slots.length === answers.length` assumption. Keep the FIRST occurrence.
+    const answerSeen = new Set<string>();
+    const answers = rawAnswers.filter((a) =>
+      answerSeen.has(a.id) ? false : (answerSeen.add(a.id), true),
+    );
+    const remove = (Array.isArray(msg.remove) ? msg.remove : []).filter(
+      (r): r is string => typeof r === "string" && r.length > 0,
+    );
+    if (answers.length === 0 && remove.length === 0) return true;
+
+    // Answer ids are wire-controlled; `__proto__` must be an ordinary overlay key.
+    const local = Object.create(null) as DurableLocalOverlay;
+    for (const a of answers) {
+      // A sealed answer is authored durable text, so it is no longer a draft.
+      local[a.id] = { working: false, draftOnly: undefined };
+    }
+    this.applyDurable({ kind: "seal", turnId, answers, remove }, local, { isTyping: false });
+    return true;
+  }
+
   private finalizeDraftsForTurn(turnId?: string): void {
     if (!turnId) return;
     let changed = false;
-    const messages = this.state.messages.map((m) => {
-      if (m.working && m.turnId === turnId) {
-        changed = true;
-        this.staleDraftWatch.delete(m.id);
-        return { ...m, working: false };
-      }
-      return m;
-    });
+    // #251: the ordinary turn end. A lane whose draft never became durable text
+    // disappears here — the same thing Telegram's user sees when an unfinalized
+    // preview is cleared at turn end.
+    const messages = this.dropSpentDrafts(
+      this.state.messages.map((m) => {
+        if (m.working && m.turnId === turnId) {
+          changed = true;
+          this.staleDraftWatch.delete(m.id);
+          return { ...m, working: false };
+        }
+        return m;
+      }),
+    );
     if (changed) this.setState({ messages });
   }
 
   /**
-   * §3.4: finalize the local turn-in-flight state — flip EVERY live `working`
-   * draft to `working: false` in place (id/text untouched, staleness-watch entry
-   * dropped) AND clear the `isTyping` indicator. Both feed `turnInFlight()`, so
-   * clearing them is what actually unwedges the composer. Called only from the
-   * explicit-`/stop` branch of send(): "stop everything" must unwedge
-   * immediately, not wait for a `turn_settled`/final frame that may never arrive
-   * (agent died with the socket alive). Covers BOTH a working-draft hang and a
-   * pre-first-token typing-only hang (isTyping true, zero drafts). Same
-   * self-healing invariant as the staleness valve: if the turn is actually still
-   * alive, a later `typing`/`progress` frame re-sets the state it cleared.
+   * §3.4: settle the local turn-in-flight state — flip EVERY live `working` draft
+   * to `working: false` (staleness-watch entry dropped) AND clear the `isTyping`
+   * indicator. Both feed `turnInFlight()`, so clearing them is what actually
+   * unwedges the composer. Called only from the explicit-`/stop` branch of send():
+   * "stop everything" must unwedge immediately, not wait for a
+   * `turn_settled`/final frame that may never arrive (agent died with the socket
+   * alive). Covers BOTH a working-draft hang and a pre-first-token typing-only
+   * hang (isTyping true, zero drafts).
+   *
+   * #251: a draft that never received durable text is DROPPED rather than flipped
+   * in place — an explicit `/stop` is a genuine turn end, so an unfinalized lane
+   * has nothing to become. A draft that DID receive durable text keeps its id and
+   * text exactly as before.
+   *
+   * The self-healing invariant survives the drop, but ONLY FOR IDENTITY, not for
+   * position: if the turn was actually still alive, a later `typing`/`progress`
+   * re-sets the state this cleared and the lane comes back under the SAME id (one
+   * bubble, and its eventual final still matches it) — but `applyPlacement`
+   * appends, so it re-materialises at the TAIL rather than in its old slot. A
+   * `/stop` mid-turn can therefore leave the late answer BELOW the user's `/stop`
+   * bubble. That is Telegram-faithful: the preview was deleted, so the lane
+   * returning is a new delivery act. Pinned in `durable-view-reducer.test.ts`
+   * ("late progress after a drop re-materialises the lane at the TAIL (#251)").
    */
   private finalizeLocalTurnState(): void {
     let changed = false;
-    const messages = this.state.messages.map((m) => {
-      if (m.working) {
-        changed = true;
-        this.staleDraftWatch.delete(m.id);
-        return { ...m, working: false };
-      }
-      return m;
-    });
+    // #251: "stop everything" ends the turn, so an unfinalized lane's bubble goes
+    // with it rather than freezing at its last partial.
+    const messages = this.dropSpentDrafts(
+      this.state.messages.map((m) => {
+        if (m.working) {
+          changed = true;
+          this.staleDraftWatch.delete(m.id);
+          return { ...m, working: false };
+        }
+        return m;
+      }),
+    );
     const clearTyping = this.state.isTyping === true;
     // #96: "stop everything" includes the turn-open signal — otherwise a widget
     // would keep claiming the agent is working on a turn the user just killed
@@ -1552,66 +2669,159 @@ export class WebChannelNATSClient {
   /**
    * §3.6.2: grace expired. Any draft still in the watch set (no draft-touching
    * frame arrived across the grace) is presumed stale — flip `working: false` IN
-   * PLACE (id and text untouched, so a WRONG guess self-heals: a later progress
-   * upsert re-matches the id and re-flips it working, re-engaging the hold). Then
+   * PLACE and PROMOTE its partial text to durable (id, text and slot untouched,
+   * so a WRONG guess self-heals: a later progress upsert re-matches the id and
+   * re-flips it working, in its original slot, re-engaging the hold). Then
    * re-evaluate the release gate.
    */
   private expireStaleDrafts(): void {
     this.staleDraftTimer = null;
     if (this.staleDraftWatch.size === 0) return;
     let changed = false;
+    // #251 DOES NOT APPLY HERE, and the difference is the whole point: this is
+    // the ONE draft-settling site that is not a turn-end signal. The reference
+    // deletes an unfinalized preview inside a `finally` around the whole dispatch
+    // — `[core] extensions/telegram/src/bot-message-dispatch.ts:2954-2975`, i.e.
+    // the turn genuinely ENDED, abort path included. This valve is a
+    // CONSUMER-SIDE GUESS fired MID-TURN: armed at session re-establish, tripped
+    // by 30s of quiet on a turn that may be perfectly healthy. Deleting content on
+    // a guess is the wrong side of N10, so the other three sites (terminal settle,
+    // `turn_settled`, explicit `/stop` — all real turn-end signals) drop, and this
+    // one PROMOTES: `draftOnly` is cleared, the partial the user was already
+    // reading becomes durable, and the bubble stays in its slot.
+    //
+    // Clearing the bit is required, not cosmetic — merely SKIPPING the drop here
+    // would commit `working:false && draftOnly:true`, which `mergeDurable`'s rule
+    // 4 would then drop on the next unrelated frame anyway.
+    //
+    // Honest consequence: a dropped connection whose turn never settles leaves the
+    // frozen partial bubble on screen. That is the pre-#251 status quo at this
+    // site, not a regression — we only delete when we KNOW the turn ended.
     const messages = this.state.messages.map((m) => {
       if (this.staleDraftWatch.has(m.id) && m.working) {
         changed = true;
-        return { ...m, working: false };
+        const promoted: ChatMessage = { ...m, working: false };
+        delete promoted.draftOnly;
+        return promoted;
       }
       return m;
     });
-    // #96: the same verdict applies to the turn-open signal — the grace expired
-    // with no proof of life, so stop claiming a turn is running.
-    //
-    // SCOPE, stated honestly: the evidence is PER-DRAFT but this sweep is
-    // ALL-OR-NOTHING. One wedged draft expiring therefore also drops the signal
-    // for any other turn that happens to be open, healthy or not (drafts are
-    // watched by id; turns are not correlated to them at all). Accepted: the
-    // error is one-sided, which is strictly better than a spinner for a turn that
-    // is already dead. But be precise about the cost — unlike a swept `isTyping`,
-    // which a later `typing` frame re-arms, a swept turn is NOT recoverable: its
-    // receipt already consumed the one-way opening latch. A turn that was really
-    // alive loses its indicator for good, and only its own settle (or a later one
-    // sweeping past it) tidies the set. Swept BEFORE `maybeRelease()`, so a
-    // follow-up released right here opens its own fresh turn rather than being
-    // caught by this same sweep.
-    const turnsCleared = this.clearOpenTurns();
+    // #96: the same verdict applies only to unconfirmed turn-open signals. A
+    // durable `queued`/`started` row is stronger evidence than this draft-local
+    // silence guess, so keep an eligible turn that the server still reports as
+    // open. Settled, cancelled, foreign, and explicitly stopped turns fail the
+    // same eligibility check used by server-state reopening. Prune BEFORE
+    // `maybeRelease()`, so a follow-up released here opens its own fresh turn.
+    const serverConfirmed = new Set<string>();
+    for (const row of this.state.messages) {
+      if (
+        row.kind !== undefined
+        || row.role !== "user"
+        || (row.requestState !== "queued" && row.requestState !== "started")
+      ) continue;
+      const turnId = row.wireId ?? row.turnId;
+      if (this.canReopenTurnFromServerState(turnId)) serverConfirmed.add(turnId!);
+    }
+    for (const turnId of [...this.openTurns]) {
+      if (!serverConfirmed.has(turnId)) this.openTurns.delete(turnId);
+    }
+    const turnActive = this.openTurns.size > 0;
+    const turnActiveChanged = (this.state.turnActive === true) !== turnActive;
     this.staleDraftWatch.clear();
-    if (changed || turnsCleared) {
+    if (changed || turnActiveChanged) {
       this.setState({
         ...(changed ? { messages } : {}),
-        ...(turnsCleared ? { turnActive: false } : {}),
+        ...(turnActiveChanged ? { turnActive } : {}),
       });
     }
     this.maybeRelease();
   }
 
-  /** Send approval decision */
+  /**
+   * Send approval decision.
+   *
+   * ⚠️ #242 half 4: A CARD THIS DEVICE HOLDS AND KNOWS IS NOT ACTIONABLE IS
+   * REFUSED HERE, NOT ONLY GREYED OUT IN A RENDERER. Approvals became durable
+   * messages in this slice, so a REPLAYED card sits in the transcript looking
+   * exactly like a live one — unresolved as far as the durable stream records,
+   * while it may have expired or been decided elsewhere since. Sending a
+   * decision for it means answering a question nobody is waiting for. The
+   * renderer is the wrong and only place to enforce that: an embedder writes its
+   * own renderer, and the shipped demo used to key its buttons purely off
+   * `resolvedDecision !== undefined` — which a replayed pending card satisfies.
+   * `isActionableApproval` is the same predicate `state.approvals` reports, so
+   * the button and the call agree by construction.
+   *
+   * ⚠️ AN UNKNOWN ID IS STILL SENT, AND THAT ASYMMETRY IS DELIBERATE. This
+   * refuses only what it can PROVE stale. A card this client never held carries
+   * no evidence either way — an embedder answering out of band is the documented
+   * behaviour and the wrapper has no basis to override it — so the operation
+   * goes out exactly as before. (It is also unreachable from a UI: nothing
+   * renders a card that is not in `state.approvals`.)
+   *
+   * ⚠️ THE `setState` IS UNCONDITIONAL ON PURPOSE. It fires even when the
+   * optimistic mark changes nothing, because that has always been true here
+   * (`patchApproval` mapped and committed regardless) and the replacement-FIFO
+   * ordering depends on it: a state listener may synchronously raise another
+   * outbound operation, and it must land BEHIND the decision reserved above.
+   */
   decide(id: string, decision: ApprovalDecision): void {
+    const held = this.state.messages.find(
+      (m): m is ChatApprovalMessage => m.kind === "approval" && m.id === id,
+    );
+    if (held !== undefined && !isActionableApproval(held)) return;
     const operation = { kind: "approval-decision", id, decision } as const;
     // In a replacement transaction, reserve the decision's FIFO position before
     // optimistic UI fanout. A state listener may synchronously emit another
     // outbound operation; it belongs behind this already-invoked decision.
     const deferred = this.deferReplacementOperation(operation);
-    this.patchApproval(id, (a) =>
-      a.resolvedDecision === undefined
-        ? { ...a, resolvedDecision: decision }
-        : a,
-    );
+    this.setState({ messages: this.optimisticApprovalDecision(id, decision) });
     if (!deferred) this.deferOrRunReplacementOperation(operation);
   }
 
-  /** Request history page */
-  loadHistory(request?: { before?: string; limit?: number }): void {
+  /**
+   * Record `decide()`'s OPTIMISTIC decision on the card, leaving
+   * `resolutionConfirmed` falsy so `approval_snapshot`'s Leg C can detect a lost
+   * decision frame and re-send it (#15).
+   *
+   * It rides `resolvedDecision`, the same field the server's answer folds into,
+   * because that is what makes the card stop offering buttons immediately — and
+   * because `projectDurable` carries the field, the guess survives the next
+   * unrelated durable frame instead of being re-projected away. Nothing local
+   * is ever journaled; the plugin builds its own events from wire frames.
+   *
+   * Returns the input array by reference when no card matched.
+   */
+  private optimisticApprovalDecision(
+    id: string,
+    decision: ApprovalDecision,
+  ): ChatMessage[] {
+    let changed = false;
+    const next = this.state.messages.map((m) => {
+      if (m.kind !== "approval" || m.id !== id) return m;
+      changed = true;
+      // #400: a new click supersedes the previous click's refusal.
+      const { decisionRejectedReason: _refused, ...card } = m;
+      return { ...card, resolvedDecision: decision };
+    });
+    return changed ? next : this.state.messages;
+  }
+
+  /**
+   * Request history page.
+   *
+   * `beforeTurnId` completes the cursor when `before` names a TOOL row, which is
+   * identified by the pair `(turnId, id)` — an id-only cursor over a repeated
+   * tool id is ambiguous and the server refuses it (#320). Optional and additive:
+   * omitting it is the id-only cursor. `demo/web/src/presentation.ts`'s
+   * `oldestHistoryCursor` is the reference picker.
+   */
+  loadHistory(request?: { before?: string; beforeTurnId?: string; limit?: number }): void {
     this.deferOrRunReplacementOperation({
-      kind: "load-history", before: request?.before, limit: request?.limit,
+      kind: "load-history",
+      before: request?.before,
+      beforeTurnId: request?.beforeTurnId,
+      limit: request?.limit,
     });
   }
 
@@ -1633,8 +2843,9 @@ export class WebChannelNATSClient {
    * Public state listeners are isolated so an embedder render bug cannot abort a
    * send, a staged-bubble exposure, or a held drain midway through its FIFO commit.
    */
-  private setState(patch: Partial<InitializedWebChannelState>): void {
-    this.state = { ...this.state, ...patch };
+  private setState(patch: StatePatch): void {
+    if (patch.isTyping === false) this.deferredCancelledTyping = undefined;
+    this.state = nextStateFrom(this.state, patch);
     this.notifyStateListeners();
   }
 
@@ -1646,7 +2857,7 @@ export class WebChannelNATSClient {
     this.stateNotificationSeq++;
     for (const listener of this.listeners) {
       try {
-        listener(this.state);
+        listener(this.getState());
       } catch (e) {
         console.error("[nats-wrapper] state listener threw:", e);
       }
@@ -1661,11 +2872,14 @@ export class WebChannelNATSClient {
    */
   private stageReceiptStateThenCommit(
     receiptKey: string,
-    patch: Partial<InitializedWebChannelState>,
+    patch: StatePatch,
     commit: () => void,
   ): void {
     const notificationSeq = this.stateNotificationSeq;
-    this.state = { ...this.state, ...patch };
+    // Routed through the SAME derivation as `setState` — this is the other door
+    // into `this.state`, and a direct spread here would leave `reasoning` stale
+    // for any staged patch that touches `messages`.
+    this.state = nextStateFrom(this.state, patch);
     this.stagedReceiptExposures.add(receiptKey);
     try {
       commit();
@@ -1679,60 +2893,578 @@ export class WebChannelNATSClient {
     this.setState({ messages: [...this.state.messages, message] });
   }
 
-  private upsertReasoning(item: ReasoningItem): void {
-    const current = this.state.reasoning;
-    const idx = current.findIndex((entry) => entry.id === item.id);
-    const next = idx === -1
-      ? [...current, item]
-      : current.map((entry, i) => (i === idx ? item : entry));
-    this.setState({ reasoning: next.slice(-100) });
+  // ---------------------------------------------------------------------------
+  // v6 §15.4 (#237) — the durable half of `state.messages` is computed by the
+  // SHARED REDUCER, not by hand-rolled reconciliation here.
+  // ---------------------------------------------------------------------------
+  //
+  // The design's central bet is `history == the live view` BY CONSTRUCTION: one
+  // pure reducer (`durable-view-reducer.ts`) produces both this client's live
+  // view and — later, from the journal — the server's history projection. A
+  // reducer with no runtime consumer guarantees nothing, so THIS is its first
+  // consumer (NOT-list N8).
+  //
+  // Shape: `state.messages` stays the ONE array. There is deliberately no
+  // parallel durable event log and no retained `DurableView` field — we PROJECT
+  // `state.messages`, apply exactly one event, and merge the result back. That
+  // keeps bubbles the reducer never authored (adopted history rows, notices)
+  // inside the view, so they hold their slots through a `seal` exactly as
+  // `applySeal` promises, and it means the history merge's adoption of a
+  // snapshot row (which writes `state.messages` directly) automatically seeds
+  // the next projection without being routed through the reducer.
+  //
+  // Split of ownership, per §0.1 / the north star: the REDUCER owns id, role,
+  // durable text, turnId and ORDER; the CLIENT owns its own overlay (`working`,
+  // `ts`, `sendState`/`sendFailure`, `receiptKey`, `wireId`, `pending`,
+  // `retracted`, `assistantMessageIndex`, `draftOnly`), which is never journaled.
+
+  /**
+   * Project `state.messages` down to the durable view the reducer operates on.
+   *
+   * The §15.9 rule it applies (a `draftOnly` bubble contributes `text: ""`) lives
+   * in the reducer module, NOT here: it is the durability boundary itself, and
+   * the eventual server projection must inherit the same one. A second copy in
+   * the render path would be an N8 live≠history divergence with nothing to make
+   * it go red.
+   */
+  private durableProjection(): DurableView {
+    return projectDurableFromClient(this.state.messages);
   }
 
-  // #97: upsert a tool-activity item by turn-scoped `(turnId, id)`. A later
-  // sparse lifecycle frame refines the same call without erasing name/argKeys
-  // learned at start. Bounded like `reasoning`; ephemeral, NOT cleared on
-  // turn_settled (a live-not-durable surface).
-  private upsertToolActivity(item: ToolActivityItem): void {
-    const current = this.state.toolActivity;
-    const idx = current.findIndex(
-      (entry) => entry.turnId === item.turnId && entry.id === item.id,
-    );
-    const next = idx === -1
-      ? [...current, item]
-      : current.map((entry, i) => (i === idx ? { ...entry, ...item } : entry));
-    this.setState({ toolActivity: next.slice(-100) });
+  /**
+   * #251: an agent bubble that claimed a slot via `progress` and never received
+   * durable text renders NOTHING once it stops working.
+   *
+   * Settled from the reference, not chosen: core's built-in Telegram extension
+   * DELETES an unfinalized preview at turn end —
+   * `[core] extensions/telegram/src/bot-message-dispatch.ts:2971-2975`
+   * (`lane.finalized ? stream.stop() : stream.clear()`), and `clear()` really
+   * deletes (`draft-stream.ts:653-668` → `:634 api.deleteMessage`). A preview
+   * becomes durable in exactly two cases — it finalized, or it is a completed
+   * overflow chunk (`draft-stream.ts:409`, `:479`, the only two `retain: true`
+   * sites). `draft-stream.ts:277` says it outright: "ephemeral preview to
+   * delete, NOT a durable content chunk to retain."
+   *
+   * The predicate keys on `draftOnly`, NOT on `text === ""`. Two reasons:
+   *  - `draftOnly` OUTLIVES the `working` flip, so the drop is actually
+   *    reachable at turn end. A text test is not: by then `text` holds the last
+   *    partial, so the bubble would freeze forever — today's bug;
+   *  - it cannot swallow a legitimately empty durable message. Every answer /
+   *    final path guards non-empty text (`message-adapter.ts:944`, `:1716`,
+   *    `:2521`; `inbound.ts:1446`), but the generic outbound seam
+   *    (`channel.ts:311`) forwards core's `ctx.text` unchecked, so empty durable
+   *    text is not structurally impossible. Keying on `draftOnly` makes that
+   *    moot instead of relying on the guarantee.
+   */
+  private isSpentDraft(m: ChatMessage): boolean {
+    return m.role === "agent" && m.working !== true && m.draftOnly === true;
   }
 
-  private upsertMessage(
-    id: string,
-    update: (prev: ChatMessage) => ChatMessage,
-    fallback: ChatMessage,
-  ): void {
-    const messages = this.state.messages;
-    const idx = messages.findIndex((m) => m.id === id);
-    if (idx === -1) {
-      this.setState({ messages: [...messages, fallback] });
-      return;
+  /**
+   * Apply the #251 drop to a messages array the caller built WITHOUT the
+   * reducer. THREE sites call this — terminal settle, `finalizeDraftsForTurn`
+   * and `finalizeLocalTurnState`. Each is a real turn-end signal, which is what
+   * makes the drop safe: core deletes an unfinalized preview at TURN END
+   * (`[core] extensions/telegram/src/bot-message-dispatch.ts:2954-2975`).
+   *
+   * ⚠️ `expireStaleDrafts` also flips `working: false` and is deliberately NOT
+   * routed here — it PROMOTES instead (see its body). Do not "fix" that
+   * asymmetry: that valve is a consumer-side guess fired mid-turn on a possibly
+   * healthy turn, and deleting a partial the user is reading on a guess is the
+   * N10 violation this split exists to prevent. Wiring it in would look like a
+   * consistency cleanup and would silently restore content deletion.
+   *
+   * Doing the drop here rather than routing these sites through `applyDurable`
+   * keeps them event-free: there is no "nothing happened" `DurableEvent`, and
+   * BOUNDARY 2 forbids inventing one.
+   */
+  private dropSpentDrafts(messages: ChatMessage[]): ChatMessage[] {
+    return messages.some((m) => this.isSpentDraft(m))
+      ? messages.filter((m) => !this.isSpentDraft(m))
+      : messages;
+  }
+
+  /**
+   * Merge a reducer-produced `DurableView` back onto `state.messages`.
+   *
+   *  1. every client-local field is carried from the `prev` bubble with the same
+   *     id (the whole overlay — `ts`, `working`, `sendState`, `receiptKey`, …).
+   *     ⚠️ THE CARRY IS KEYED BY (KIND, id), NOT BY id: `state.messages` can
+   *     hold a same-id pair of different kinds (`case "history"`'s cross-kind
+   *     fresh insert), and each member keeps its OWN overlay. This sentence was
+   *     false while `prev` was indexed by id alone — see the two kind-scoped
+   *     maps below for what went wrong and how;
+   *  2. `id`, `role`, `text` and `turnId` come from the view (`turnId` falls back
+   *     to `prev`'s), EXCEPT that a still-`draftOnly` entry keeps `prev.text` —
+   *     its durable text is `""` by construction and the rendered text is the
+   *     client-local draft, so taking the view's `""` would blank a live draft
+   *     whenever an unrelated frame triggers an apply;
+   *  3. an OWN `local[id]` is applied LAST and wins. Prototype properties are
+   *     never overlays. A key set to `undefined` DELETES it (that is how
+   *     `draftOnly` is cleared), rather than leaving an `undefined`-valued key
+   *     that would defeat the identity reuse below;
+   *  4. a spent draft (see `isSpentDraft`) is OMITTED;
+   *  5. an id in `prev` but absent from the view is dropped — that is `seal`'s
+   *     `remove` working as designed. ⚠️ SINCE #241 half 2 a `seal.remove` no longer makes the
+ *     id ABSENT — it leaves a tombstone (`kind: "text", deleted: true`) in the
+ *     view at its slot — so the drop now happens via the tombstone strip at the
+ *     TOP of the loop rather than by absence. Either way a removed id is not
+ *     rendered.
+   *
+   * ⚠️ RULES 1-4 ARE ABOUT BUBBLES. A `kind: "reasoning"` or `kind: "tool"`
+   * entry takes a short branch at the top of the loop: it has no `local[id]`
+   * overlay to lay on (rule 1/3), no `draftOnly` carve-out (rule 2) and no
+   * spent-draft state (rule 4). Rule 5 and the reference-reuse guarantee below
+   * apply to it unchanged. #242 half 2 / half 3.
+   *
+   * ⚠️ AN APPROVAL ENTRY IS THE ONE TAGGED ARM THAT PARTIALLY BREAKS THAT — read
+   * its branch before assuming "tagged ⇒ no client state". It takes no
+   * `local[id]` overlay either, but it DOES carry client-local fields
+   * (`actionable`, `resolutionConfirmed`, `resolvedElsewhere`) that must be
+   * inherited from `prev` exactly the way rule 1 inherits a bubble's overlay.
+   * #242 half 4.
+   *
+   * Entries whose emitted fields are unchanged are returned BY REFERENCE. That
+   * is required, not an optimization: `nats-client-wrapper.test.ts` asserts
+   * `.toBe` identity for untouched user/notice/history bubbles across a
+   * `turn_snapshot`. It is also the reducer's own structural-sharing discipline
+   * — `DurableMessage` being `readonly` forbids writing THROUGH a shared entry,
+   * not handing an unchanged one back. Note this is entry identity only: do NOT
+   * build an ARRAY-identity no-op signal on top (the reducer's header is
+   * explicit that array identity is a partial property).
+   */
+  private mergeDurable(
+    prev: ChatMessage[],
+    view: DurableView,
+    local?: DurableLocalOverlay,
+  ): ChatMessage[] {
+    // `base` is looked up in the PRE-`remove` `prev`, so an id appearing in BOTH
+    // `seal.remove` and `seal.answers` would inherit the removed bubble's
+    // client-local fields rather than starting clean. Unreachable by construction
+    // rather than by a guard here: `emitTurnSnapshot` builds `answers` from lane
+    // ids and `remove` from `supersededAnswerBubbleIds`, which are disjoint sets.
+    // Recorded rather than branched on — an unreachable branch with no test is
+    // worse than a stated invariant.
+    // ⚠️ KIND-SCOPED INDEXES, NEVER ONE KEYED BY ID. The id spaces (answer/user
+    // bubbles, reasoning blocks, and — since #242 half 3 — tool calls) are not
+    // provably disjoint — the reducer's `findTextIndex` docblock retracts the
+    // id-shape argument that used to claim they were — and `case "history"` now
+    // DELIBERATELY produces a same-id pair of different kinds when a snapshot row
+    // collides with a local entry of the other kind.
+    //
+    // ⚠️ A SINGLE `Map<string, ChatMessage>` WITH A KIND GUARD ON THE LOOKUP WAS
+    // TRIED AND WAS WRONG, in exactly the way `case "history"`'s id-keyed index
+    // was wrong: a Map is LAST-WINS, so `get(id)` on such a pair returned
+    // whichever member sat later in the array and the guard turned that into
+    // `undefined` for the EARLIER one — dropping its WHOLE overlay (rule 1), not
+    // one field. Measured: a hydrated bubble lost its `ts` on the next unrelated
+    // durable frame; the same loss takes `receiptKey` (after which
+    // `patchBubbleByReceiptKey` can never find that bubble), `wireId` (breaking
+    // `promoteAnchor`) and `pending` (making `retract()` return false for a
+    // bubble still in `this.held[]`). Scoping the INDEX makes each member find
+    // its own `prev`, and the guards disappear because the key does the work.
+    //
+    // ⚠️ THE THREE MAPS ARE NO LONGER BUILT HERE. Half 3 moved the construction
+    // into `indexTranscriptByKind`, whose exhaustive switch makes a FORGOTTEN
+    // KIND a compile error — the copy-paste that would have made this loop's
+    // `if/else` silently file tool entries under the bubble key space. See that
+    // function for why the buckets stay separately typed.
+    const prevByKind = indexTranscriptByKind(prev);
+    const out: ChatMessage[] = [];
+    for (const entry of view) {
+      // ⚠️ #241 half 2: STRIP TOMBSTONES. A permanent typed delete — today only a
+      // `seal.remove` — leaves a `{ kind: "text", deleted: true, text: "" }`
+      // entry in the durable view at its slot so a later same-id event cannot
+      // resurrect it (the reducer's no-resurrect guards). It must never become a
+      // rendered `ChatMessage`: dropping it here makes a removed id invisible,
+      // exactly as the old `filter`-based `seal` did (rule 5). This is the CLIENT
+      // half of the strip; `journal-history.ts` drops the same entries when it
+      // serves history, and both fold the SAME reducer — so live == history.
+      if (entry.kind === "text" && entry.deleted === true) continue;
+      // ⚠️ #242 half 2: A REASONING ENTRY IS CARRIED, NOT SKIPPED. Half 1 had a
+      // `continue` here because `state.messages` was the chat-BUBBLE list and
+      // the client rendered reasoning from a separate `state.reasoning` array.
+      // Half 2 made `ChatMessage` a tagged union and moved reasoning into this
+      // array, so the entry maps across as itself.
+      //
+      // It carries NO overlay and NO `role` — see `ChatReasoningMessage` for why
+      // neither can apply. The one client-local field it can hold is `ts`
+      // (hydration metadata off a `history` row), and it is inherited from the
+      // previous entry exactly the way rule 1 inherits the bubble overlay.
+      //
+      // ⚠️ THE `ts` INHERITANCE IS WHY THIS BRANCH CANNOT BE A BARE `push`. A
+      // reload hydrates the block with a `ts`; the very next durable frame
+      // re-projects and re-merges the whole view, and building a fresh
+      // `{kind,id,turnId,text}` would silently drop it.
+      //
+      // ⚠️ THAT REASONING WAS RIGHT AND THE CODE STILL LOST THE `ts` — measured,
+      // and worth recording because the paragraph above reads as a guarantee.
+      // The inheritance only ever held for the LAST-WINS member of a same-id
+      // pair: `prev` was indexed by id alone, so a reasoning entry sharing an id
+      // with a bubble later in the array looked up as `undefined` and this
+      // branch built exactly the fresh `{kind,id,turnId,text}` it says it
+      // avoids. Keying the index by kind is what made the paragraph true.
+      // ⚠️ #242 half 3: A TOOL ENTRY IS CARRIED THE SAME WAY, and for the same
+      // reasons the reasoning branch above spells out — it holds no overlay and
+      // no `role`, and its one client-local field is the hydration `ts`, which
+      // must be inherited or a reload's timestamp is dropped by the next
+      // unrelated durable frame.
+      //
+      // ⚠️ THE LOOKUP KEY IS `(turnId, id)`, NOT `id`. `indexTranscriptByKind`
+      // files tool entries under `toolEntryKey`, so reading them back by id alone
+      // would miss every one of them — and a miss here is not a no-op, it is the
+      // `ts` loss described above plus a needlessly fresh object defeating the
+      // `.toBe` identity reuse.
+      if (entry.kind === "tool") {
+        const prevTool = prevByKind.tool.get(toolEntryKey(entry.turnId, entry.id));
+        const nextTool: ChatToolMessage = {
+          kind: "tool",
+          id: entry.id,
+          turnId: entry.turnId,
+          ...(entry.name !== undefined ? { name: entry.name } : {}),
+          ...(entry.phase !== undefined ? { phase: entry.phase } : {}),
+          ...(entry.status !== undefined ? { status: entry.status } : {}),
+          ...(entry.summary !== undefined ? { summary: entry.summary } : {}),
+          ...(entry.argKeys !== undefined ? { argKeys: entry.argKeys } : {}),
+        };
+        // Assigned rather than written in the literal, exactly as the two
+        // branches around it do: an own `ts: undefined` key would fail
+        // `sameChatMessage`'s key-count check and defeat the identity reuse.
+        if (prevTool?.ts !== undefined) nextTool.ts = prevTool.ts;
+        out.push(
+          prevTool !== undefined && sameChatMessage(prevTool, nextTool)
+            ? prevTool
+            : nextTool,
+        );
+        continue;
+      }
+      // ⚠️ #242 half 4: AN APPROVAL ENTRY CARRIES A CLIENT-LOCAL OVERLAY THAT
+      // THE OTHER TWO TAGGED ARMS DO NOT, AND LOSING IT IS THE SAFETY BUG. Three
+      // fields are inherited from `prev` rather than rebuilt: `actionable` (may
+      // this device offer buttons — absent means NO, and rebuilding without it
+      // would silently disarm a live card on the next unrelated frame),
+      // `resolutionConfirmed` and `resolvedElsewhere` (the #15 pair that tells a
+      // server answer from `decide()`'s optimistic one), plus the hydration `ts`
+      // the other arms also inherit.
+      //
+      // ⚠️ THE INHERITANCE RUNS ONE WAY ONLY. `resolvedDecision` comes from the
+      // VIEW, never from `prev`: it is durable state, the reducer owns it, and
+      // `applyApproval`'s upsert-preserve is what keeps a re-delivered request
+      // from clearing it. Taking it from `prev` here would be a second copy of
+      // that rule, in a different module, free to drift.
+      if (entry.kind === "approval") {
+        const prevApproval = prevByKind.approval.get(entry.id);
+        const nextApproval: ChatApprovalMessage = {
+          kind: "approval",
+          id: entry.id,
+          approvalKind: entry.approvalKind,
+          title: entry.title,
+          ...(entry.description !== undefined ? { description: entry.description } : {}),
+          prompt: entry.prompt,
+          options: entry.options,
+          ...(entry.expiresAtMs !== undefined ? { expiresAtMs: entry.expiresAtMs } : {}),
+          ...(entry.resolvedDecision !== undefined
+            ? { resolvedDecision: entry.resolvedDecision }
+            : {}),
+        };
+        // Assigned rather than written in the literal, exactly as the two
+        // branches below do: an own `…: undefined` key would fail
+        // `sameChatMessage`'s key-count check and defeat the identity reuse.
+        if (prevApproval?.actionable !== undefined) {
+          nextApproval.actionable = prevApproval.actionable;
+        }
+        if (prevApproval?.resolutionConfirmed !== undefined) {
+          nextApproval.resolutionConfirmed = prevApproval.resolutionConfirmed;
+        }
+        if (prevApproval?.resolvedElsewhere !== undefined) {
+          nextApproval.resolvedElsewhere = prevApproval.resolvedElsewhere;
+        }
+        if (prevApproval?.decisionRejectedReason !== undefined) {
+          nextApproval.decisionRejectedReason = prevApproval.decisionRejectedReason;
+        }
+        if (prevApproval?.ts !== undefined) nextApproval.ts = prevApproval.ts;
+        out.push(
+          prevApproval !== undefined && sameChatMessage(prevApproval, nextApproval)
+            ? prevApproval
+            : nextApproval,
+        );
+        continue;
+      }
+      if (entry.kind === "reasoning") {
+        const prevEntry = prevByKind.reasoning.get(entry.id);
+        const nextReasoning: ChatReasoningMessage = {
+          kind: "reasoning",
+          id: entry.id,
+          turnId: entry.turnId,
+          text: entry.text,
+        };
+        // Assigned rather than written in the literal for the same reason the
+        // bubble branch assigns `turnId`: an own `ts: undefined` key would fail
+        // `sameChatMessage`'s key-count check and defeat the identity reuse.
+        if (prevEntry?.ts !== undefined) nextReasoning.ts = prevEntry.ts;
+        out.push(
+          prevEntry !== undefined && sameChatMessage(prevEntry, nextReasoning)
+            ? prevEntry
+            : nextReasoning,
+        );
+        continue;
+      }
+      const base = prevByKind.bubble.get(entry.id);
+      const overlay = local !== undefined && Object.hasOwn(local, entry.id)
+        ? local[entry.id]
+        : undefined;
+      const overlaySetsText = overlay !== undefined && "text" in overlay;
+      const overlaySetsDraftOnly = overlay !== undefined && "draftOnly" in overlay;
+      const draftOnly = overlaySetsDraftOnly ? overlay.draftOnly : base?.draftOnly;
+      const turnId = entry.turnId ?? base?.turnId;
+      const next: ChatBubble = {
+        ...base,
+        id: entry.id,
+        role: entry.role,
+        ...(entry.requestState ? { requestState: entry.requestState } : {}),
+        ...(entry.retryOf ? { retryOf: entry.retryOf } : {}),
+        ...(entry.retriedBy ? { retriedBy: entry.retriedBy } : {}),
+        ...(entry.revision !== undefined ? { revision: entry.revision } : {}),
+        ...(entry.edited !== undefined ? { edited: entry.edited } : {}),
+        // Rule 2's carve-out: while the bubble holds only a draft, `text` is the
+        // client's, not the view's.
+        text: draftOnly === true && !overlaySetsText && base !== undefined
+          ? base.text
+          : entry.text,
+      };
+      // Assigned rather than written in the literal so an ABSENT turnId does not
+      // become an own `turnId: undefined` key. A history-hydrated bubble is
+      // created without one (`case "history"`'s fresh-insert for a TEXT row that
+      // matched no tier — the `inserts` push in the `m.role` branch, not the
+      // reasoning one above it — emits exactly `{id, role, text, ts, working}`),
+      // and adding the key fails
+      // `sameChatMessage`'s key-count check on the very first durable event —
+      // silently re-creating a bubble the `.toBe` guarantee says must be reused.
+      if (turnId !== undefined) next.turnId = turnId;
+      if (overlay !== undefined) {
+        for (const [key, value] of Object.entries(overlay)) {
+          if (value === undefined) delete (next as Record<string, unknown>)[key];
+          else (next as Record<string, unknown>)[key] = value;
+        }
+      }
+      if (this.isSpentDraft(next)) continue;
+      out.push(base !== undefined && sameChatMessage(base, next) ? base : next);
     }
-    const next = messages.slice();
-    next[idx] = update(next[idx]);
-    this.setState({ messages: next });
+    return out;
   }
 
-  private patchApproval(
-    id: string,
-    update: (prev: ApprovalRequest) => ApprovalRequest,
-  ): void {
-    this.setState({
-      approvals: this.state.approvals.map((a) => (a.id === id ? update(a) : a)),
-    });
+  /**
+   * Compute the next `state.messages` for ONE durable event, without committing
+   * it. Receipt-bound user publication uses the specialized sibling below;
+   * inbound durable frames use this form through `applyDurable`.
+   */
+  private nextDurableMessages(
+    event: DurableEvent,
+    local?: DurableLocalOverlay,
+  ): ChatMessage[] {
+    const before = this.durableProjection();
+    const floor = this.cursor.state === "unseeded" ? 0
+      : this.cursor.state === "synced" ? this.cursor.last : this.cursor.afterSeq;
+    const allowedLocal = local === undefined ? undefined : Object.fromEntries(
+      Object.entries(local).filter(([id]) => {
+        const key = transcriptEntryKey({ id });
+        const held = this.state.messages.find((row) => row.kind === undefined && row.id === id);
+        return this.rowVersions.allows(key, this.frameSeq)
+          || (event.kind === "placement" && !this.rowVersions.deleted(key)
+            && (held?.draftOnly === true || local[id]?.draftOnly === true || this.replayPlacementIds.has(id))
+            && this.frameSeq === this.rowVersions.seq(key));
+      }),
+    );
+    const after = this.applyVersionedDurable(before, event, floor);
+    return this.orderRecoveredMessages(this.mergeDurable(this.state.messages, after, allowedLocal));
   }
+
+  /**
+   * Materialize one successfully published user echo through the shared reducer.
+   * A held/deferred bubble is only local staging until its wire id is reserved:
+   * remove that one row from the reducer input so `user` appends its FINAL
+   * durable identity/content/turnId at the tail, then merge against the full
+   * client view so the staging row's receipt/UI fields survive. `local` applies
+   * the path-specific publication changes (`pending:false` for held release,
+   * absent for deferred publication). A caller whose staging row disappeared
+   * deliberately skips this helper, so publication never resurrects a bubble.
+   */
+  private nextPublishedUserMessages(
+    bubbleId: string,
+    text: string,
+    wireId: string,
+    local: Partial<ChatBubble>,
+    stagedBubble?: ChatMessage,
+  ): ChatMessage[] {
+    let reducerInput = this.state.messages;
+    if (stagedBubble !== undefined) {
+      const stagedIndex = reducerInput.indexOf(stagedBubble);
+      if (stagedIndex !== -1) {
+        reducerInput = [
+          ...reducerInput.slice(0, stagedIndex),
+          ...reducerInput.slice(stagedIndex + 1),
+        ];
+      }
+    }
+    const before = projectDurableFromClient(reducerInput);
+    const after = applyDurableEvent(before, {
+      kind: "user",
+      id: bubbleId,
+      text,
+      turnId: wireId,
+    });
+    return this.mergeDurable(this.state.messages, after, { [bubbleId]: local });
+  }
+
+  /** Apply ONE durable event to `state.messages`, optionally folding in a
+   *  sibling state patch the same frame owes (e.g. `turn_snapshot`'s
+   *  `isTyping: false`) so it lands in a single notification. */
+  private applyDurable(
+    event: DurableEvent,
+    local?: DurableLocalOverlay,
+    // ⚠️ `StatePatch`, NOT `Partial<InitializedWebChannelState>` — this was the
+    // ONE door left unnarrowed in #242 half 2, and a spread hole is still a
+    // hole: `setState({ messages, ...extra })` does not error on a `reasoning`
+    // key arriving through the spread, so `StatePatch`'s claim that assigning
+    // `reasoning` is "a compile error, not a convention" was true of every
+    // caller except this one. Closed rather than weakened, because a guarantee
+    // with a documented exception is the shape nobody checks.
+    extra?: StatePatch,
+  ): void {
+    // Authored content exposes a retained replay slot, including an explicitly
+    // empty durable answer. Placement alone never establishes live activity.
+    if (event.kind === "bubble") this.replayPlacementIds.delete(event.answerId);
+    if (event.kind === "seal") {
+      for (const answer of event.answers) this.replayPlacementIds.delete(answer.id);
+    }
+    this.setState({ messages: this.nextDurableMessages(event, local), ...extra });
+  }
+
+  // ⚠️ `upsertToolActivity` IS GONE (#242 half 3). It maintained
+  // `state.toolActivity` as an independent, `.slice(-100)`-capped side array —
+  // a second opinion about which tool calls a conversation contains and where
+  // they sit. Tool activity is a DURABLE MESSAGE now: `case "tool_activity"`
+  // routes each frame through `applyDurable`, `durable-view-reducer.ts`'s
+  // `applyTool` performs the ONE merge, and `state.toolActivity` is derived from
+  // `state.messages` by `deriveToolActivity`. The cap went with it — see
+  // `WebChannelState.toolActivity` for the honest version of what that does and
+  // does not close.
+
+  // ⚠️ `patchApproval` IS GONE (#242 half 4). It mapped over `state.approvals`
+  // as an independently maintained side array — a second opinion about which
+  // approvals a conversation contains and, since that array had no transcript
+  // position at all, about where they sit. An approval is a DURABLE MESSAGE now:
+  // `case "approval_request"`/`case "approval_resolved"` route through
+  // `applyDurable`, `durable-view-reducer.ts` performs the ONE fold, and
+  // `state.approvals` is derived from `state.messages` by `deriveApprovals`.
+  // `StatePatch` excludes `approvals` so a `setState({approvals})` regression is
+  // a compile error rather than a divergence.
 
   private uid(): string {
     return `${this.seq++}`;
   }
 
+  /** Mint a viewer-local bubble id without colliding with hydrated transcript ids. */
+  private mintLocalBubbleId(prefix: "u" | "a"): string {
+    let id: string;
+    do {
+      id = `${prefix}-${this.uid()}`;
+    } while (this.state.messages.some((message) => message.id === id));
+    return id;
+  }
+
   private seq = 0;
+
+  /** One-shot latch: the id-less durable `agent_message` warning is per client
+   *  instance, not per frame — a legacy plugin emits one per reply. */
+  private warnedIdlessDurableFrame = false;
+
+  // ---- #244 half B / #356 — the per-conversation seq cursor -----------------
+  //
+  // ONE conversation per client here (`peerId` is fixed at construction and the
+  // `.out` stream is single-conversation), so a single cursor suffices — no
+  // per-conversation map. It starts UNSEEDED: this client holds no `pts` until the
+  // register-time `history` snapshot's `highWaterSeq` arrives, and Telegram's app
+  // asks for nothing before then. See `SeqCursor` for the states and the rules.
+  private cursor: SeqCursor = { state: "unseeded" };
+  private rowVersions = new DurableRowVersions();
+  private journalEpoch: string | undefined;
+  private readonly retiredJournalEpochs = new Set<string>();
+  private readonly preparedEpochActions = new WeakMap<InboundMessage, {
+    action: "current" | "recover";
+    lifecycle: number;
+    epoch: string | undefined;
+  }>();
+  private frameSeq: number | undefined;
+  private observedHistoryHighWater = 0;
+  private pendingHistorySnapshots: InboundMessage[] = [];
+  /**
+   * #401 — this device's outstanding `load_history` nonces, oldest first. A page
+   * rides the peer's shared `.out`, so every device receives every page; only one
+   * echoing a nonce held here is this device's. See `claimHistoryPage`.
+   *
+   * NOT cleared on raw transport loss: a request still queued in the low-level
+   * client is published on the next session and answered there. Bounded instead
+   * (`MAX_OUTSTANDING_HISTORY_PAGES`), so a page lost en route costs one slot,
+   * not a leak; cleared on `close()`, which drops the queued requests too. A
+   * stale slot can only ever match its own echo, never another device's page.
+   */
+  private historyPageNonces: string[] = [];
+  // A genuine retained gap starting at zero can reconstruct canonical order.
+  // Cold snapshots never open that gap merely because their window was trimmed.
+  private recoveringHistoryOrder: DurableView | undefined;
+
+  private applyVersionedDurable(view: DurableView, event: DurableEvent, floor = 0): DurableView {
+    const cursor = this.cursor;
+    if (this.recoveringHistoryOrder !== undefined && this.frameSeq !== undefined
+      && ((cursor.state === "catching-up" && this.frameSeq > cursor.afterSeq)
+        || (cursor.state === "synced" && this.frameSeq === cursor.last + 1))) {
+      this.recoveringHistoryOrder = applyDurableEvent(this.recoveringHistoryOrder, event);
+      if (event.kind === "tool") {
+        const tool = event;
+        const reconstructed = this.recoveringHistoryOrder.find(
+          (row) => row.kind === "tool" && row.turnId === tool.turnId && row.id === tool.id,
+        );
+        if (reconstructed?.kind === "tool") {
+          // A terminal tool delta can omit fields supplied by its opener. The
+          // recovered prefix supplies the full row, once replay reaches the
+          // held version; an earlier prefix still passes through the fence.
+          if (this.rowVersions.seq(durableRowKey(reconstructed)) === this.frameSeq) {
+            return applyDurableEvent(view, reconstructed);
+          }
+          event = reconstructed;
+        }
+      }
+    }
+    return this.rowVersions.apply(view, event, this.frameSeq, floor);
+  }
+
+  private orderRecoveredMessages(messages: ChatMessage[]): ChatMessage[] {
+    if (this.recoveringHistoryOrder === undefined) return messages;
+    const byKey = new Map(messages.map((row) => [transcriptEntryKey(row), row]));
+    const ordered: ChatMessage[] = [];
+    for (const row of this.recoveringHistoryOrder) {
+      const key = durableRowKey(row);
+      const held = byKey.get(key);
+      if (held !== undefined) {
+        ordered.push(held);
+        byKey.delete(key);
+      }
+    }
+    // Rows outside the recovered prefix retain their content and local state.
+    return ordered.concat(messages.filter((row) => byKey.has(transcriptEntryKey(row))));
+  }
+
+  private hydratePendingHistory(): void {
+    const lifecycle = this.wrapperLifecycleGeneration;
+    while (this.pendingHistorySnapshots.length > 0) {
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
+      const snapshot = this.pendingHistorySnapshots.shift()!;
+      // Hydration consumes content only. Re-dispatching an ahead high-water on
+      // timeout would reopen the same gap with a fresh retry budget.
+      this.applyFrame(snapshot);
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // P0-4 — receipt records + send-state projection (D5)
@@ -1742,6 +3474,22 @@ export class WebChannelNATSClient {
   private receiptSeq = 0;
   private newReceiptKey(): string {
     return `r-${this.receiptSeq++}`;
+  }
+
+  /**
+   * #243 half 2b: mint the `user_message` idempotency `random_id` for one send
+   * and remember `random_id → receiptKey` so a later `ack` echo can adopt the
+   * server id onto this exact bubble (`adoptCommittedIds`). Minting it HERE — not
+   * in the low-level `sendUserMessage` default — is what gives the wrapper the
+   * `random_id ↔ bubble` correlation. Called once per logical send; the token is
+   * stamped on the outbound frame the low-level ledgers, so every reconnect
+   * REPLAY re-publishes the same `random_id` (half 1's idempotency) without the
+   * wrapper re-minting.
+   */
+  private mintRandomId(receiptKey: string): string {
+    const randomId = randomInboxToken();
+    this.randomIdToReceiptKey.set(randomId, receiptKey);
+    return randomId;
   }
 
   /** A thin observable view over the receiptKey-keyed record (no state duplication). */
@@ -1782,6 +3530,7 @@ export class WebChannelNATSClient {
       rec.drainingTransitions ||
       wrapperState === "failed" ||
       wrapperState === "completed" ||
+      wrapperState === "interrupted" ||
       !rec.wireId
     ) {
       return wrapperSnapshot;
@@ -1801,7 +3550,7 @@ export class WebChannelNATSClient {
   /** Monotonic receipt guard (wrapper-level, incl. `completed`): queued<sent<accepted<completed; failed/completed terminal. */
   private receiptAdvances(from: ReceiptRecord["state"], to: NonNullable<ChatMessage["sendState"]>): boolean {
     if (from === to) return false;
-    if (from === "failed" || from === "completed") return false; // terminal
+    if (from === "failed" || from === "completed" || from === "interrupted") return false; // terminal
     if (to === "failed") return true; // failable from any non-terminal state
     return WebChannelNATSClient.RECEIPT_RANK[to] > WebChannelNATSClient.RECEIPT_RANK[from];
   }
@@ -1819,7 +3568,7 @@ export class WebChannelNATSClient {
     receiptKey: string,
     state: NonNullable<ChatMessage["sendState"]>,
     failure?: SendFailure,
-    extraBubblePatch?: Partial<ChatMessage>,
+    extraBubblePatch?: Partial<ChatBubble>,
   ): void {
     const rec = this.receipts.get(receiptKey);
     if (!rec) return;
@@ -1841,6 +3590,11 @@ export class WebChannelNATSClient {
         // #96: publication authority lives in the low-level tracker. Fold the
         // first `sent`/`accepted` opening into this same bubble/state fanout;
         // queued ownership alone never claims that the agent has a live turn.
+        // A durable cancellation ACK still accepts delivery, but cannot open
+        // application work even if it beat the first sent/accepted callback.
+        const cancelledTurnClosed = rec.wireId !== undefined
+          && this.client.isIngressCancelled(rec.wireId)
+          && this.retireCancelledApplicationTurn(rec.wireId);
         const turnOpened = this.openTurnFromReceipt(rec, next.state);
         // #96: close the turn of a send whose failure is our best evidence that
         // no turn will ever settle for it (see the `overloaded` note below — it
@@ -1858,7 +3612,9 @@ export class WebChannelNATSClient {
         // so the next settle sweeps them as part of its prefix — bounded, the
         // same way the control-lane residual is bounded.
         //
-        // `overloaded` is the only reason we treat as clearing that bar — as the
+        // `policy-denied` is a pre-acceptance refusal with no turn to settle.
+        // The server preserves earlier receipts instead of rejecting replays.
+        // `overloaded` also clears that bar — as the
         // best available PROXY for non-delivery, not as proof of it. The common
         // case is an ingress rejection before any turn was dispatched, and closing
         // immediately is worth having. But the agent can also reject a message it
@@ -1883,10 +3639,16 @@ export class WebChannelNATSClient {
         // still held and has no wireId, while a `closed` receipt becomes terminal
         // before any authoritative publish transition can open it. Neither can
         // reach an open turn, so neither is a turn-closing mechanism.)
-        const turnClosed =
+        const turnClosed = cancelledTurnClosed || (
           next.state === "failed"
-          && next.failure?.reason === "overloaded"
-          && this.closeTurn(rec.wireId);
+          && (next.failure?.reason === "overloaded" || next.failure?.reason === "policy-denied")
+          && this.closeTurn(rec.wireId));
+        if (next.state === "completed" || next.state === "interrupted" || next.state === "failed") {
+          if (rec.wireId) {
+            this.applicationTurns.delete(rec.wireId);
+            this.convergedApplicationTurns.delete(rec.wireId);
+          }
+        }
         this.patchBubbleByReceiptKey(
           receiptKey,
           {
@@ -1907,6 +3669,16 @@ export class WebChannelNATSClient {
             console.error("[nats-wrapper] receipt subscriber threw:", e);
           }
         }
+        if (next.state === "accepted" && rec.wireId
+          && (this.applicationTurns.has(rec.wireId) || this.convergedApplicationTurns.has(rec.wireId))) {
+          // Newly accepted work starts a fresh silent interval. A split ACK may
+          // already have retired a converged alias from publish-order ownership,
+          // while its receipt still owns the target outcome in the recovery map.
+          this.activeTurnRecoveryIssued = false;
+          this.refreshActiveTurnWatch(true);
+        } else if (!this.hasAcceptedApplicationTurn()) {
+          this.cancelActiveTurnStallTimer();
+        }
       }
     } finally {
       rec.drainingTransitions = false;
@@ -1921,17 +3693,62 @@ export class WebChannelNATSClient {
    */
   private patchBubbleByReceiptKey(
     receiptKey: string,
-    patch: Partial<ChatMessage>,
-    extraState?: Partial<InitializedWebChannelState>,
+    patch: Partial<ChatBubble>,
+    extraState?: StatePatch,
   ): void {
-    const idx = this.state.messages.findIndex((m) => m.receiptKey === receiptKey);
+    // ⚠️ `m.kind === undefined` IS PART OF THE PREDICATE, not decoration.
+    // `receiptKey` is a bubble-only field — a reasoning block is never SENT by
+    // this client, so it has no receipt — which makes a match a bubble by
+    // construction. The conjunct is here anyway because "cannot happen" is not a
+    // reason to spread a bubble patch over an entry of another kind. The cast
+    // below records what this predicate already decided; TS cannot carry a
+    // `findIndex` callback's narrowing to the element (the same limitation the
+    // reducer's `applyPlacement` documents).
+    const idx = this.state.messages.findIndex(
+      (m) => m.kind === undefined && m.receiptKey === receiptKey,
+    );
     if (idx === -1) {
       if (extraState) this.setState(extraState);
       return;
     }
     const messages = this.state.messages.slice();
-    messages[idx] = { ...messages[idx], ...patch };
+    messages[idx] = { ...(messages[idx] as ChatBubble), ...patch };
     this.setState({ messages, ...(extraState ?? {}) });
+  }
+
+  /** Reconcile an ACK's explicit random_id → server ID mapping with local receipts. */
+  private adoptCommittedIds(
+    // #244 half A adds an optional `seq` to each entry (the user message's wire
+    // seq). Adoption ignores it — this method re-keys by `messageId` only.
+    committed: Array<{ random_id: string; messageId: string; seq?: number; converged?: boolean }> | undefined,
+  ): void {
+    if (!Array.isArray(committed) || committed.length === 0) return;
+    const lifecycle = this.wrapperLifecycleGeneration;
+    for (const entry of committed) {
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
+      if (!isCommittedEcho(entry)) continue;
+      if (entry.converged === true) this.retireConvergedSend(entry.random_id);
+      this.adoptUserBubbleByRandomId(entry.random_id, entry.messageId);
+    }
+  }
+
+  /**
+   * #399: a `converged` echo is the server's verdict that this send converged on
+   * another send's row (a second retry of one original) and is NOT a new
+   * execution. Retire exactly its own turn now, like a cancellation. Its wire id
+   * then rides that row, whose terminal state only promotes this receipt: the
+   * publish-order prefix sweep in `reconcileRequestStates` finds the turn
+   * already gone and cannot close earlier sends that are still running.
+   */
+  private retireConvergedSend(randomId: string): void {
+    const key = this.randomIdToReceiptKey.get(randomId);
+    const receipt = key ? this.receipts.get(key) : undefined;
+    const wireId = receipt?.wireId;
+    if (!wireId || !receipt) return;
+    const closed = this.retireCancelledApplicationTurn(wireId);
+    this.convergedApplicationTurns.set(wireId, receipt);
+    if (closed) this.setState({ turnActive: false });
+    if (!this.hasAcceptedApplicationTurn()) this.cancelActiveTurnStallTimer();
   }
 
   /**
@@ -1943,7 +3760,7 @@ export class WebChannelNATSClient {
    * non-anchor receipt at `accepted`; the turn-activity prefix sweep does not
    * fabricate a receipt outcome.
    */
-  private promoteAnchor(turnId: string, state: "completed" | "failed", failure?: SendFailure): void {
+  private promoteAnchor(turnId: string, state: "completed" | "failed" | "interrupted", failure?: SendFailure): void {
     const anchor = this.state.messages.find((m) => m.role === "user" && m.wireId === turnId);
     if (anchor?.receiptKey) this.receiptTransition(anchor.receiptKey, state, failure);
   }
@@ -1952,221 +3769,1475 @@ export class WebChannelNATSClient {
   // Message handling
   // ---------------------------------------------------------------------------
 
+  /** Record one exact local send's durable identity without folding or adopting it. */
+  private observeDurableUserEvidence(randomId: string): void {
+    const receiptKey = this.randomIdToReceiptKey.get(randomId);
+    const receipt = receiptKey === undefined ? undefined : this.receipts.get(receiptKey);
+    if (receipt?.wireId !== undefined) this.client.recordDurableAdoption(receipt.wireId, randomId);
+  }
+
+  /**
+   * Observe all validated durable user rows in one accepted inbound frame before
+   * ordered buffering or any reducer callback. Difference bodies retain their
+   * existing per-event decoder and request-correlation boundary; history mapping
+   * remains valid independently of whether this device folds the page.
+   */
+  private observeDurableAcceptanceEvidence(msg: InboundMessage): void {
+    if (msg.type === "user_committed") {
+      if (typeof msg.random_id === "string" && msg.random_id.length > 0) {
+        this.observeDurableUserEvidence(msg.random_id);
+      }
+      return;
+    }
+    if (msg.type === "history") {
+      for (const row of Array.isArray(msg.messages) ? msg.messages : []) {
+        if (row && row.kind === undefined && row.role === "user" && typeof row.id === "string"
+          && row.id.length > 0 && typeof row.text === "string"
+          && typeof row.randomId === "string" && row.randomId.length > 0) {
+          this.observeDurableUserEvidence(row.randomId);
+        }
+      }
+      return;
+    }
+    if (msg.type !== "difference" || this.cursor.state !== "catching-up"
+      || msg.nonce !== this.cursor.nonce || msg.afterSeq !== this.cursor.afterSeq) return;
+    for (const entry of Array.isArray(msg.events) ? msg.events : []) {
+      if (!entry || typeof entry !== "object" || !isWireSeq((entry as { seq?: unknown }).seq)) continue;
+      const decoded = decodeDurableEvent((entry as { event?: unknown }).event);
+      if (decoded.ok && decoded.event.kind === "user"
+        && typeof decoded.event.randomId === "string" && decoded.event.randomId.length > 0) {
+        this.observeDurableUserEvidence(decoded.event.randomId);
+      }
+    }
+  }
+
+  /** Epoch belongs to the journal, not the transport session or numeric cursor. */
+  private observeJournalEpoch(msg: InboundMessage): "ignore" | "current" | "recover" {
+    if (msg.epoch === undefined) {
+      if (this.journalEpoch !== undefined) return "ignore";
+      this.observeDurableAcceptanceEvidence(msg);
+      return "current";
+    }
+    if (this.retiredJournalEpochs.has(msg.epoch)) return "ignore";
+    // Correlation precedes epoch adoption: shared-subject replies to another
+    // device (or an earlier request) cannot invalidate this device's cache.
+    if (msg.type === "difference" && (this.cursor.state !== "catching-up"
+      || msg.nonce !== this.cursor.nonce || msg.afterSeq !== this.cursor.afterSeq)) return "ignore";
+    if (msg.type === "history" && msg.highWaterSeq === undefined
+      && (msg.nonce === undefined || !this.historyPageNonces.includes(msg.nonce))
+      && msg.epoch !== this.journalEpoch) return "ignore";
+    if (msg.epoch === this.journalEpoch) {
+      this.observeDurableAcceptanceEvidence(msg);
+      return "current";
+    }
+    const prior = this.journalEpoch;
+    this.journalEpoch = msg.epoch;
+    if (prior === undefined && this.cursor.state === "unseeded") {
+      this.observeDurableAcceptanceEvidence(msg);
+      return "current";
+    }
+    if (prior !== undefined) this.retiredJournalEpochs.add(prior);
+
+    // Durable adoption proves acceptance only inside the journal that authored
+    // the row. Clear it before any reset callout or low-level result side effect
+    // so an old-epoch echo cannot suppress a valid new-epoch refusal.
+    this.client.clearDurableAdoptions();
+    this.observeDurableAcceptanceEvidence(msg);
+
+    // Keep unpublished/unconfirmed local sends and their receipt linkage. A new
+    // epoch's ACK may be the very first frame, before its snapshot/broadcast.
+    const pendingMappings = [...this.randomIdToReceiptKey].filter(([randomId]) =>
+      this.client.hasPendingRandomId(randomId));
+    this.randomIdToReceiptKey.clear();
+    for (const [randomId, receiptKey] of pendingMappings) {
+      this.randomIdToReceiptKey.set(randomId, receiptKey);
+    }
+    const pendingReceipts = new Set(pendingMappings.map(([, receiptKey]) => receiptKey));
+    const messages = this.state.messages.filter(row => row.kind === undefined && row.role === "user"
+      && (row.pending || (row.receiptKey !== undefined && pendingReceipts.has(row.receiptKey))))
+      .map(row => row.pending
+        ? row
+        // A durable echo may have re-keyed this still-unacknowledged optimistic
+        // row onto an old-epoch server ID, including through an uncorrelated
+        // history page that did not advance row versions. Restore a local
+        // identity before the new epoch hydrates IDs that may be reused.
+        : { ...row, id: this.mintLocalBubbleId("u") });
+    const wires = new Set(messages.flatMap(row => row.wireId ? [row.wireId] : []));
+    const lifecycle = ++this.wrapperLifecycleGeneration;
+    this.resetCursorForConnection();
+    this.cursor = { state: "unseeded" };
+    this.rowVersions = new DurableRowVersions();
+    this.frameSeq = undefined;
+    this.observedHistoryHighWater = 0;
+    this.pendingHistorySnapshots = [];
+    this.historyPageNonces = [];
+    this.recoveringHistoryOrder = undefined;
+    this.replayPlacementIds.clear();
+    this.activeReplayBuffers.clear();
+    this.clearStaleDraftWatch();
+    this.cancelActiveTurnStallTimer();
+    this.activeTurnRecoveryIssued = false;
+    this.convergedApplicationTurns.clear();
+    for (const id of this.applicationTurns.keys()) if (!wires.has(id)) this.applicationTurns.delete(id);
+    for (const id of this.openTurns) if (!wires.has(id)) this.openTurns.delete(id);
+    this.typingLocalCandidates = new Set();
+    this.deferredCancelledTyping = undefined;
+    this.setState({ messages, historyOmissions: [], isTyping: false, turnActive: this.openTurns.size > 0 });
+    if (this.wrapperLifecycleGeneration !== lifecycle) return "ignore";
+    // A snapshot already supplies the new baseline. A live frame or a reply to
+    // an old floor needs the register path to obtain the new journal's window.
+    return msg.type === "history" && msg.highWaterSeq !== undefined ? "current" : "recover";
+  }
+
+  /** Run once at the low-level result boundary, before ledger/tracker effects. */
+  private prepareJournalEpoch(msg: InboundMessage): boolean {
+    const action = this.observeJournalEpoch(msg);
+    if (action === "ignore") return false;
+    this.preparedEpochActions.set(msg, {
+      action,
+      lifecycle: this.wrapperLifecycleGeneration,
+      epoch: this.journalEpoch,
+    });
+    return true;
+  }
+
   private handleMessage(msg: InboundMessage): void {
+    const prepared = this.preparedEpochActions.get(msg);
+    if (prepared !== undefined) this.preparedEpochActions.delete(msg);
+    // Tracker fanout runs between prepare and delivery. A subscriber can close,
+    // reconnect or synchronously deliver another epoch there; keep the already
+    // applied low-level receipt result, but do not fold this frame's content into
+    // the replacement wrapper lifecycle.
+    if (prepared !== undefined && (prepared.lifecycle !== this.wrapperLifecycleGeneration
+      || prepared.epoch !== this.journalEpoch)) return;
+    const epochAction = prepared?.action ?? this.observeJournalEpoch(msg);
+    if (epochAction === "ignore") return;
+    const epochLifecycle = this.wrapperLifecycleGeneration;
+    try {
+      if (msg.type === "typing" && msg.keepalive === true) {
+        // Protocol 7 renewals are activity only. In particular they must not
+        // re-arm typing/input holds or consume a deferred cancellation decision.
+        const lifecycle = this.wrapperLifecycleGeneration;
+        const preFrameLiveTurn = this.turnInFlight();
+        this.observeActiveTurnActivity(msg);
+        if (this.wrapperLifecycleGeneration === lifecycle) {
+          this.observeHeldTurnActivity(msg, preFrameLiveTurn);
+        }
+        return;
+      }
+      this.cancellationReconciliationDepth++;
+      try { this.handleInboundMessage(msg); }
+      finally {
+        this.cancellationReconciliationDepth--;
+        this.reconcileCancelledTyping();
+      }
+    } finally {
+      if (epochAction === "recover" && this.wrapperLifecycleGeneration === epochLifecycle) {
+        this.client.requestApplicationRecovery();
+      }
+    }
+  }
+
+  /** Consume a cancellation decision only after ordered recovery has drained. */
+  private reconcileCancelledTyping(): void {
+    const pending = this.deferredCancelledTyping;
+    if (!pending) return;
+    if (pending.lifecycle !== this.wrapperLifecycleGeneration
+      || pending.candidates !== this.typingLocalCandidates || !this.state.isTyping) {
+      this.deferredCancelledTyping = undefined;
+      return;
+    }
+    if (this.cancellationReconciliationDepth > 0 || this.cursor.state === "catching-up"
+      || this.pendingHistorySnapshots.length > 0) return;
+    // One decision, consumed before fanout. Live, history and buffered evidence
+    // now share the existing versioned projection; do not fold a second view or
+    // keep a proof around to erase activity when an unrelated owner later ends.
+    this.deferredCancelledTyping = undefined;
+    if (this.applicationTurns.size > 0 || this.openTurns.size > 0
+      || this.state.messages.some((row) => row.working
+        || (row.kind === undefined && row.role === "user"
+          && (row.requestState === "queued" || row.requestState === "started")
+          && !this.client.isIngressCancelled(row.wireId ?? row.turnId ?? "")))) return;
+    this.cancellationTypingCleanupDepth++;
+    try { this.setState({ isTyping: false }); }
+    finally { this.cancellationTypingCleanupDepth--; }
+    if (pending.lifecycle === this.wrapperLifecycleGeneration) this.maybeRelease();
+  }
+
+  private handleInboundMessage(msg: InboundMessage): void {
+    // Duplicate cancellation ACKs have no new receipt transition. Retire their
+    // exact ownership here too, before any reducer/subscriber callout. Keep the
+    // accepted delivery receipt; this signal does not invent a journal row.
+    if (msg.type === "ack" && msg.cancelled !== undefined) {
+      const lifecycle = this.wrapperLifecycleGeneration;
+      let closed = false;
+      const finalize: string[] = [];
+      const notSent: string[] = [];
+      for (const id of msg.cancelled) {
+        if (!msg.ids?.includes(id)) continue;
+        closed = this.retireCancelledApplicationTurn(id) || closed;
+        const key = this.wireIdToReceiptKey.get(id);
+        const receipt = key ? this.receipts.get(key) : undefined;
+        if (receipt?.settlementEligible && !receipt.cancellationUiReconciled) {
+          receipt.cancellationUiReconciled = true;
+          finalize.push(id);
+        }
+        // #398: only the server knows it never accepted this input; it says so
+        // per id, in the same frame as the id.
+        if (receipt?.settlementEligible && msg.unaccepted?.includes(id)) notSent.push(key!);
+      }
+      const typingCandidates = this.typingLocalCandidates;
+      const cancelsTypingCandidate = finalize.some((id) => typingCandidates.has(id));
+      for (const id of finalize) typingCandidates.delete(id);
+      if (cancelsTypingCandidate) {
+        this.deferredCancelledTyping = { candidates: typingCandidates, lifecycle };
+      }
+      // These terminal facts belong to the whole authenticated ACK, whose IDs
+      // have already left the replay ledger. A receipt subscriber may close or
+      // reconnect during the first transition; every remaining receipt still
+      // needs its result before lifecycle-scoped presentation work can stop.
+      for (const key of notSent) {
+        this.receiptTransition(key, "failed", { reason: "cancelled", retryable: false });
+      }
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
+      if (!this.hasAcceptedApplicationTurn()) this.cancelActiveTurnStallTimer();
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
+      for (const id of finalize) {
+        this.retireBufferedProgress(id);
+        this.finalizeDraftsForTurn(id);
+        if (this.wrapperLifecycleGeneration !== lifecycle) return;
+      }
+      // Exact turn/draft retirement is immediate. Unscoped typing cleanup waits
+      // for the outer fold and any outstanding gap/history reconciliation.
+      const clearActive = closed && this.openTurns.size === 0;
+      if (clearActive) this.setState({ turnActive: false });
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
+    }
+    // Observe authenticated live arrival before gap buffering. Replaying that
+    // buffer later is not new evidence of application activity.
+    const activityLifecycle = this.wrapperLifecycleGeneration;
+    this.observeActiveTurnActivity(msg);
+    if (this.wrapperLifecycleGeneration !== activityLifecycle) return;
+    // #244 half B: the catch-up response is orchestration (fold N events, then
+    // either re-request or settle and drain), not a single state transition, so
+    // it is handled ahead of the ordinary dispatch and outside the seq-bearing
+    // path below.
+    if (msg.type === "difference") {
+      this.applyDifference(msg);
+      return;
+    }
+
+    // #244 half B: DURABLE (seq-bearing) frames are what the cursor is about.
+    // Every other frame passes straight through — a `difference` is the only
+    // inbound frame that itself moves the cursor without being folded live.
+    if (isSeqBearingInbound(msg)) {
+      // #246 half A: `isWireSeq`, the same predicate every other cursor site
+      // uses. The door refuses a non-wire `seq` before this runs; this keeps the
+      // cursor site independent of the decoder being complete (an `Infinity`
+      // here would be a gap that no difference can ever close). A seq-bearing
+      // TYPE without a seq (an id-less `agent_message`, a live reasoning DRAFT)
+      // is still handled — it just carries no cursor.
+      this.observeSeq(isWireSeq(msg.seq) ? msg.seq : undefined, msg);
+      return;
+    }
+
+    if (msg.type === "history" && isWireSeq(msg.highWaterSeq)) {
+      const cursor = this.cursor;
+      this.observedHistoryHighWater = Math.max(this.observedHistoryHighWater, msg.highWaterSeq);
+      if (cursor.state === "catching-up") {
+        this.pendingHistorySnapshots.push(msg);
+        return;
+      }
+      if (cursor.state === "synced" && this.observedHistoryHighWater > cursor.last) {
+        this.pendingHistorySnapshots.push(msg);
+        this.openCatchUp(cursor.last, []);
+        return;
+      }
+      const lifecycle = this.wrapperLifecycleGeneration;
+      this.hydratePendingHistory();
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
+    }
+
+    // ⚠️ READ BEFORE `applyFrame`, WHICH CONSUMES THE EVIDENCE. `adoptCommittedIds`
+    // DELETES each `random_id` linkage it resolves, and that linkage is the only
+    // thing that distinguishes this device's own receipt from another device's —
+    // see `originCommittedSeqs`. Asking afterwards would always answer "not mine".
+    const ownCommittedSeqs = msg.type === "ack" ? this.originCommittedSeqs(msg) : undefined;
+    const ownConvergedIds = msg.type === "ack" ? this.originConvergedIds(msg) : undefined;
+
+    const lifecycle = this.wrapperLifecycleGeneration;
+    this.applyFrame(msg);
+    // Public subscribers may close or reconnect while the frame is applied.
+    // Its trailing observations belong only to the lifecycle that received it.
+    if (this.wrapperLifecycleGeneration !== lifecycle) return;
+
+    // Two NON-seq-bearing frames still carry a seq the cursor tracks. Both go
+    // through the SAME three-way check as a durable frame (#345, #352): a value
+    // above the contiguous next seq is a GAP, never a bare advance.
+    if (msg.type === "history") {
+      // The register-time snapshot's authoritative high-water — Telegram's
+      // `updates.getState`, and the normal way an unseeded cursor gets its
+      // baseline. `case "history"` has already hydrated. A `load_history` PAGE
+      // omits `highWaterSeq`, so this only fires for the register-time snapshot.
+      //
+      // #246 half A: `isWireSeq`, not `typeof === "number"`. The cursor is a
+      // monotone high-water, so a `NaN`/fractional/over-large value accepted here
+      // would park it beyond every real seq and gate out the whole stream after
+      // it. The frame's own decoder already refuses such a value at the door;
+      // this is the second guard, at the site that would suffer.
+      if (isWireSeq(msg.highWaterSeq)) {
+        this.observedHistoryHighWater = Math.max(this.observedHistoryHighWater, msg.highWaterSeq);
+        this.observeSeq(msg.highWaterSeq, undefined);
+      }
+    } else if (ownCommittedSeqs !== undefined) {
+      // The inbound USER opener consumes a seq but rides no durable frame — half A
+      // echoes that seq on the ack. Only THIS DEVICE'S echoes reach here.
+      for (const seq of ownCommittedSeqs) {
+        // Opening a gap publishes a request, which can also retire this lifecycle.
+        if (this.wrapperLifecycleGeneration !== lifecycle) return;
+        this.observeSeq(seq, undefined);
+      }
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
+      // #399: a converged echo carries no seq, so nothing above moved the
+      // cursor over a row this device never folded. When its server lifecycle
+      // is missing or only queued/started (and therefore possibly stale), fetch
+      // it rather than wait for an unrelated later frame to open the gap.
+      const cursor = this.cursor;
+      if (cursor.state === "synced" && ownConvergedIds?.some(id => !this.state.messages.some(m =>
+        m.kind === undefined && m.role === "user" && m.id === id && m.requestState !== undefined
+          && m.requestState !== "queued" && m.requestState !== "started"))) {
+        this.openCatchUp(cursor.last, []);
+      }
+    }
+  }
+
+  /** #399: this device's own `converged` echoes — retries answered with another row. */
+  private originConvergedIds(msg: InboundMessage): string[] {
+    return (msg.committed ?? []).filter(entry => isCommittedEcho(entry) && entry.converged === true
+      && this.randomIdToReceiptKey.has(entry.random_id)).map(entry => entry.messageId);
+  }
+
+  /**
+   * #345 — the `ack.committed` seqs that are THIS DEVICE'S OWN RECEIPT: an entry
+   * whose `random_id` still resolves a local send linkage.
+   *
+   * ⚠️ THE FILTER IS THE FIX, AND IT IS THE TELEGRAM SPLIT WE OTHERWISE LACK. An
+   * ack rides the per-peer `.out`, which #245 Part B uses as the multi-device
+   * fan-out, so every device of the peer receives the origin's ack. On the ORIGIN
+   * the echoed seq names a row this device is already holding (the optimistic
+   * bubble, re-keyed onto `webchannel-user-<seq>` by `adoptCommittedIds` in the
+   * same frame), so the cursor may move over it. On any OTHER device it names a
+   * row that was never folded: advancing there closes the very gap that would
+   * have fetched it, and the turn renders an answer with no question (#345 shape
+   * A). Telegram gets this split for free — a sent-message update goes to the
+   * session that sent it — and the linkage is our only substitute for a session.
+   *
+   * A non-origin device therefore IGNORES the seq entirely rather than gap-testing
+   * it: the row it names may legitimately be one this device has not seen, and the
+   * turn's first agent frame at `seq + 1` opens the gap that heals it one moment
+   * later. So the cost of ignoring is at most one round-trip, and only when the
+   * `user_committed` broadcast for that row was also dropped.
+   *
+   * ⚠️ MUST BE CALLED BEFORE `applyFrame`. `adoptCommittedIds` consumes each
+   * linkage it resolves, so afterwards every entry looks foreign.
+   */
+  private originCommittedSeqs(msg: InboundMessage): number[] {
+    const seqs: number[] = [];
+    for (const entry of msg.committed ?? []) {
+      // #246 half A: the WHOLE entry must be well-formed, not just its `seq` —
+      // the same `isCommittedEcho` predicate `adoptCommittedIds` and the door
+      // decoder apply. A `seq` is evidence that a row was committed only if the
+      // entry naming that row is intact.
+      if (!isCommittedEcho(entry) || entry.seq === undefined) continue;
+      if (!this.randomIdToReceiptKey.has(entry.random_id)) continue;
+      seqs.push(entry.seq);
+    }
+    return seqs;
+  }
+
+  /**
+   * #356 — THE ONE CURSOR FUNCTION. Every seq this client learns about goes
+   * through here, and it is the only place the cursor moves or a gap is opened.
+   *
+   * `frame` is the seq-bearing frame that CARRIED the seq, or `undefined` for a
+   * carrier that is not itself durable content (an `ack` echo, a `history`
+   * high-water): those have already had their live effect, so there is nothing to
+   * hold or to fold — only their seq passes through.
+   *
+   * The three-way test is Telegram's, with `pts_count` fixed at 1:
+   *
+   *  - `seq > last + 1` — GAP. Hold the frame and ask for everything after the
+   *    cursor. This is the only path into `catching-up`.
+   *  - `seq === last + 1` — apply, and advance IFF the fold accepted it (#246
+   *    half A: a REFUSED frame must not move the cursor, or the event is lost AND
+   *    the gap that would re-fetch it is closed by the same statement).
+   *  - `seq <= last` — already covered by the cursor, so it can never be a gap and
+   *    never moves the cursor backward.
+   *
+   * ⚠️ `seq <= last` IS STILL FOLDED, WHICH IS THE ONE PLACE WE DO NOT DO WHAT
+   * TELEGRAM SAYS ("the update was already applied, and must be ignored"), AND
+   * THE REASON IS THAT OUR SEQ IS NOT A `pts`. A `pts` counts EVENTS; our `seq`
+   * numbers durable ROWS, and several live frames legitimately map onto ONE row:
+   * `delivery-journal.ts` dedupes `placement` on its answer id, so every
+   * `progress` frame of a streaming answer — the whole draft, chunk by chunk —
+   * carries the SAME seq as the first one. Ignoring them would freeze every
+   * streaming draft at its first chunk. So the cursor treats a repeated seq as
+   * "nothing new to learn", while the frame itself folds exactly as it did
+   * before this slice. (The BUFFER is the other story: a frame the catch-up has
+   * just authoritatively answered for is dropped rather than re-folded — see
+   * `redispatchBuffered`, where dropping is about the reply, not about the seq.)
+   */
+  private observeSeq(seq: number | undefined, frame: InboundMessage | undefined): void {
+    const cursor = this.cursor;
+
+    // CATCHING-UP: a reply is owed, so no durable frame may be applied or advanced
+    // until it lands. EVERY seq-bearing-type frame is held, in arrival order —
+    // with a seq or without one — and a bare carrier (an `ack` echo, a snapshot
+    // high-water) is DROPPED, because its frame's live effects already ran and
+    // applying its seq on top of a PARTIAL reply is exactly how a range got
+    // skipped (#352).
+    //
+    // ⚠️ A SEQ-LESS FRAME IS HELD TOO, AND THAT IS ABOUT ORDER, NOT ABOUT
+    // DOUBLE-APPLYING. It has no journal row, so no reply can re-deliver it —
+    // but the reply's events are the rows BELOW it, and applying it first puts it
+    // above them for the session. Concretely: `reasoningDurable` is OFF by
+    // default, so EVERY reasoning frame is seq-less; applied during a catch-up
+    // for `user@11`/`bubble@12`, the reasoning lane renders ABOVE the user
+    // question that opened the turn (`applyReasoning` upserts by id and keeps its
+    // position), and a reload re-projects it from seq order — live ≠ history on
+    // the ordinary gap path.
+    //
+    // What it must NOT cost is the draft being overwritten by its own stale
+    // prefix on the way back in; `uncarried` owns that, by dropping a held frame
+    // whose id the reply AUTHORED durable text for.
+    if (cursor.state === "catching-up") {
+      if (frame !== undefined) cursor.buffer.push(frame);
+      return;
+    }
+
+    // UNSEEDED: adopt this observation as the baseline. `seq - 1` rather than
+    // `seq`, so the frame that carried it goes through the ordinary apply path
+    // below — including the #246 gate, which leaves the cursor one short if the
+    // fold refuses it, so the NEXT frame reads as the gap that re-serves it. A
+    // frame of a seq-bearing TYPE that carries NO seq establishes nothing and is
+    // simply folded (it is a live draft with no durable row behind it).
+    let synced: SyncedCursor;
+    if (cursor.state === "unseeded") {
+      if (seq === undefined) {
+        if (frame !== undefined) this.applyFrame(frame);
+        return;
+      }
+      synced = { state: "synced", last: Math.max(0, seq - 1) };
+      this.cursor = synced;
+    } else {
+      synced = cursor;
+    }
+
+    // SYNCED — Telegram's three-way test, against the baseline above.
+
+    if (seq !== undefined && seq > synced.last + 1) {
+      // GAP: the seqs between are gone — NATS is at-most-once, so a hole in the
+      // contiguous stream is a real drop. Ask for everything after the cursor and
+      // hold this frame until the answer lands.
+      this.openCatchUp(synced.last, frame === undefined ? [] : [frame]);
+      return;
+    }
+
+    if (frame === undefined) {
+      // A bare carrier at or below `last + 1`: nothing to fold, so the seq is the
+      // whole content. Never backward.
+      if (seq !== undefined && seq > synced.last) synced.last = seq;
+      return;
+    }
+
+    const folded = this.applyFrame(frame);
+    // Re-read: `applyFrame` runs reducers and public listeners, so the cursor it
+    // returns to may not be the object read above. Advancing only in `synced` is
+    // the same rule stated once more, at the one site that could violate it.
+    const after = this.cursor;
+    if (folded && seq !== undefined && after.state === "synced" && seq > after.last) {
+      after.last = seq;
+      if (this.recoveringHistoryOrder !== undefined && seq >= this.observedHistoryHighWater) {
+        this.recoveringHistoryOrder = undefined;
+      }
+    }
+  }
+
+  /**
+   * Enter `catching-up`: mint a fresh nonce, send `get_difference(afterSeq, nonce)`,
+   * arm the liveness timer, and take ownership of the frames to hold meanwhile.
+   *
+   * `buffer` is passed in rather than started empty because the two callers hand
+   * over different things: a fresh gap contributes the frame that revealed it,
+   * while a PARTIAL reply hands back the frames it did not itself deliver
+   * (Telegram: "the query must be repeated, using the intermediate status as the
+   * current status").
+   *
+   * ⚠️ THIS MINTS A FRESH CURSOR, SO IT RESETS `retries` TO 0 — and that is only
+   * correct because both callers have PROGRESS behind them: a gap newly detected
+   * from a moved cursor, or a slice that covered past the floor it answered. A
+   * reply that moved NOTHING must never come through here — `stalled` diverts it,
+   * keeping the budget and the deadline, because otherwise a peer that answers
+   * nothing gets an unbounded fresh budget every round-trip.
+   */
+  private openCatchUp(afterSeq: number, buffer: InboundMessage[]): void {
+    if (afterSeq === 0 && this.recoveringHistoryOrder === undefined) this.recoveringHistoryOrder = [];
+    const cursor: CatchingUpCursor = {
+      state: "catching-up",
+      afterSeq,
+      nonce: randomInboxToken(),
+      buffer,
+      retries: 0,
+      timer: null,
+    };
+    this.cursor = cursor;
+    // ⚠️ ARM BEFORE PUBLISHING. `getDifference` reaches the transport, and a throw
+    // out of it is swallowed by `notifyMessageListeners` when this runs inside a
+    // fold — which would leave the cursor `catching-up` with `timer: null`: no
+    // re-issue, no give-up, every later durable frame held in silence. Arming
+    // first costs one timer that fires into an unchanged cursor at worst.
+    this.armCatchUpTimer(cursor);
+    this.client.getDifference(afterSeq, cursor.nonce);
+  }
+
+  /**
+   * Land in `synced` at `last` and re-dispatch what was held.
+   *
+   * The two ways a catch-up ENDS — a complete reply, and a give-up after the
+   * retry budget — and nothing else: the `unseeded` seed installs its cursor
+   * inline (it holds no buffer to re-dispatch), a partial reply hands straight
+   * to `openCatchUp`, and `resetCursorForConnection` drops the buffer rather
+   * than folding it.
+   *
+   * `carried` is the reply's own — `undefined` on the give-up and stall paths,
+   * where no reply delivered anything and therefore nothing may be dropped. See
+   * `uncarried`.
+   */
+  private settleSynced(
+    last: number,
+    buffered: InboundMessage[],
+    carried: CarriedRows | undefined,
+  ): void {
+    // Timeout fallback also drains outside handleMessage. Nested ACK callbacks
+    // must wait for every pending snapshot and buffered frame, not the temporary
+    // synced cursor installed before that drain.
+    this.cancellationReconciliationDepth++;
+    try { this.drainSynced(last, buffered, carried); }
+    finally {
+      this.cancellationReconciliationDepth--;
+      this.reconcileCancelledTyping();
+    }
+  }
+
+  private drainSynced(last: number, buffered: InboundMessage[], carried: CarriedRows | undefined): void {
+    this.cursor = { state: "synced", last };
+    if (carried !== undefined && last >= this.observedHistoryHighWater
+      && this.recoveringHistoryOrder !== undefined) {
+      this.recoveringHistoryOrder = undefined;
+    }
+    const lifecycle = this.wrapperLifecycleGeneration;
+    this.hydratePendingHistory();
+    if (this.wrapperLifecycleGeneration !== lifecycle) return;
+    this.redispatchBuffered(buffered, carried);
+  }
+
+  /**
+   * Re-dispatch held frames in ARRIVAL ORDER, minus the ones the reply
+   * superseded. `uncarried` owns which those are and argues every case; this
+   * method owns only the order, and the order is the point — a held frame folds
+   * after the reply's events, which is where a reload's seq-ordered projection
+   * puts it.
+   */
+  private redispatchBuffered(
+    buffered: InboundMessage[],
+    carried: CarriedRows | undefined,
+  ): void {
+    const lifecycle = this.wrapperLifecycleGeneration;
+    this.activeReplayBuffers.add(buffered);
+    try {
+      for (const m of this.uncarried(buffered, carried)) {
+        // A callback can retire this lifecycle or stop a later buffered draft.
+        if (this.wrapperLifecycleGeneration !== lifecycle) return;
+        if (!this.retiredBufferedProgress.has(m)) this.handleMessage(m);
+      }
+    } finally {
+      this.activeReplayBuffers.delete(buffered);
+    }
+  }
+
+  /** A genuine turn end retires its already-received drafts before replay. */
+  private retireBufferedProgress(turnId?: string): void {
+    const retire = (frame: InboundMessage): boolean => {
+      if (frame.type !== "progress" || (turnId !== undefined && frame.turnId !== turnId)) return false;
+      this.retiredBufferedProgress.add(frame);
+      return true;
+    };
+    if (this.cursor.state === "catching-up") {
+      this.cursor.buffer = this.cursor.buffer.filter((frame) => !retire(frame));
+    }
+    // A fold may already have copied below/rest, or installed synced for a
+    // give-up drain. Retire those exact objects too, never future frames by id.
+    for (const buffer of this.activeReplayBuffers) {
+      for (const frame of buffer) retire(frame);
+    }
+  }
+
+  /**
+   * The held frames a reply did NOT supersede — the ones still owed to the view.
+   *
+   * Split out because BOTH exits from a reply need it and they need it at
+   * different moments: a complete reply re-dispatches these (`settleSynced`),
+   * while a PARTIAL one carries them into the next request. Filtering only on the
+   * re-dispatch would let a frame the first slice delivered survive across the
+   * boundary and fold after the second one.
+   *
+   * `undefined` means the caller has nothing to measure against: the ONE give-up
+   * path, in `onCatchUpTimeout`, where the budget ran out. A reply that lands and
+   * delivers nothing never reaches here — it is a STALL, and a stall ends nothing.
+   *
+   * ── ONE DICHOTOMY, ON WHETHER THE HELD FRAME CARRIES DURABLE TEXT OF ITS OWN ──
+   *
+   * **A DRAFT-SHAPED frame** — one with no seq (an unthrottled reasoning frame,
+   * which is every reasoning frame while `reasoningDurable` is off), or a
+   * `progress`, whose row is a text-less `placement` — is superseded only by the
+   * reply AUTHORING its id. Nothing else can supersede a draft: the seq it shares
+   * with its `placement` says the SLOT was delivered, not the text, and dropping
+   * on that blanks the draft the user is watching, permanently for an answer that
+   * never produces another frame.
+   *
+   * **Every other held frame** is superseded only by the reply FOLDING its seq.
+   * Not by the id: an id-authored drop is unbounded above the range the reply
+   * covered, and a tool card is the proof — tool rows are not deduped, so every
+   * phase is its own row, and a slice carrying `tool{T, phase:"start"}@12` would
+   * otherwise drop a held `tool_activity{T, phase:"end"}@20` that the next slice
+   * then skips as undeliverable (#343). The card stays "running" for the session.
+   * Not by the cursor either: after a reply the cursor also covers seqs the
+   * server SKIPPED (#343) — inside `maxSeq`, carried by no event — and a frame
+   * sitting in this buffer is PROOF that its own live send succeeded. A
+   * `difference` envelope for the same content is larger than the live frame that
+   * carried it, so a row inside that band is live-deliverable and
+   * difference-undeliverable: #343's own razor edge, arriving from the other side.
+   *
+   * ⚠️ AND "FOLDED", NOT "CARRIED": an event this build could not decode advances
+   * the cursor past itself (the documented asymmetry) and delivers nothing, so it
+   * may not drop the held frame that is the only usable copy of that row.
+   *
+   * ⚠️ THIS IS NOT A SECOND CURSOR SITE, AND MUST NOT BECOME ONE (#246 half A).
+   * `redispatchBuffered` re-enters through `handleMessage`, so a re-dispatched
+   * frame moves the cursor through the ONE gated statement in `observeSeq` —
+   * refused ⇒ no advance. A frame that still reveals a gap re-opens one cleanly,
+   * re-buffering the remainder onto the fresh cursor's buffer.
+   */
+  private uncarried(
+    buffered: InboundMessage[],
+    carried: CarriedRows | undefined,
+  ): InboundMessage[] {
+    return buffered.filter((m) => {
+      if (this.retiredBufferedProgress.has(m)) return false;
+      if (carried === undefined) return true;
+      const seq = isWireSeq(m.seq) ? m.seq : undefined;
+      if (seq === undefined || m.type === "progress") {
+        const id = typeof m.id === "string" && m.id.length > 0 ? m.id : undefined;
+        return id === undefined || !carried.authoredIds.has(id);
+      }
+      return !carried.seqs.has(seq);
+    });
+  }
+
+  /** HIGH-2 — arm (or re-arm) the reply timeout for this catch-up. */
+  private armCatchUpTimer(cursor: CatchingUpCursor): void {
+    this.clearCatchUpTimer(cursor);
+    cursor.timer = setTimeout(() => {
+      // ⚠️ OBJECT IDENTITY REPLACES THE OLD GENERATION COUNTER. Every transition
+      // installs a NEW cursor object, so "is the cursor still the one that armed
+      // me" is exactly the question the counter used to answer — with no second
+      // number to keep in step.
+      if (this.cursor !== cursor) return;
+      cursor.timer = null;
+      this.onCatchUpTimeout(cursor);
+    }, GET_DIFFERENCE_TIMEOUT_MS);
+  }
+
+  private clearCatchUpTimer(cursor: CatchingUpCursor): void {
+    if (cursor.timer !== null) {
+      clearTimeout(cursor.timer);
+      cursor.timer = null;
+    }
+  }
+
+  /**
+   * #356 — did this reply FAIL TO MOVE THE FLOOR, i.e. answer nothing?
+   *
+   * A stall is treated exactly as a LOST reply: the round-trip stays open on its
+   * original deadline, and `onCatchUpTimeout` re-issues on its own cadence and
+   * gives up when the budget is spent. Settling instead re-dispatches the buffer,
+   * the held frame re-opens the same gap on the spot, and `openCatchUp` hands out
+   * a fresh retry budget — an unbounded request loop at round-trip speed
+   * (measured: 51 requests for 50 non-advancing replies, no time passing).
+   *
+   * Two shapes, one condition. A `partial: true` reply whose coverage does not
+   * exceed the floor it answered, and a reply whose fold threw before a single
+   * event landed — in both the client learned nothing and the request is, in
+   * effect, still outstanding.
+   *
+   * ⚠️ AND THE SPURIOUS-GAP UNWIND IS THE ONE EXEMPTION, WHICH TURNS ON THE
+   * BUFFER — not on `partial`. `partial: false` with no events is the server
+   * saying "there is nothing past your floor", and a detection that was spurious
+   * must be able to close on it. But that is only true when the buffer is EMPTY.
+   * With a frame still held, settling re-dispatches it, the frame re-opens the
+   * same gap on the spot, and `openCatchUp` hands out a fresh retry budget —
+   * round 2's storm, arriving through the `partial: false` door: measured at 51
+   * requests for 50 empty complete replies, with no time passing. A held frame
+   * means the gap was real, so an answer that covers nothing is a stall whatever
+   * the flag says.
+   */
+  private stalled(
+    msg: InboundMessage,
+    covered: number,
+    completed: boolean,
+    cursor: CatchingUpCursor,
+  ): boolean {
+    if (covered > cursor.afterSeq) return false;
+    return msg.partial === true || !completed || cursor.buffer.length > 0
+      || covered < this.observedHistoryHighWater;
+  }
+
+  /**
+   * HIGH-2 — the reply (or the request) was lost on the at-most-once `.out`, or
+   * the server's read faulted and it sent nothing.
+   *
+   * Re-issue the SAME `afterSeq` with a FRESH nonce, a bounded number of times.
+   * The nonce is re-minted rather than reused so the two replies of a
+   * request/retry race are distinguishable: the first to arrive matches, and the
+   * second matches nothing and is dropped whole, which is a cheaper guard against
+   * a double fold than making every event kind idempotent.
+   *
+   * On giving up, settle at the current floor and re-dispatch what was held: the
+   * frames are still foldable content and the give-up path must not throw away
+   * ones it can still use (#343). A frame that is still beyond the cursor re-opens
+   * the gap with a fresh retry budget, so a persistently unanswerable request
+   * settles into one attempt per `GET_DIFFERENCE_TIMEOUT_MS` rather than stopping
+   * — the same rate the old "freeze and wait for the next live frame" path
+   * produced whenever traffic continued, and now also present when it does not.
+   * A transport drop stops it (`resetCursorForConnection`).
+   */
+  private onCatchUpTimeout(cursor: CatchingUpCursor): void {
+    if (cursor.retries < GET_DIFFERENCE_MAX_RETRIES) {
+      cursor.retries += 1;
+      cursor.nonce = randomInboxToken();
+      this.client.getDifference(cursor.afterSeq, cursor.nonce);
+      this.armCatchUpTimer(cursor);
+      return;
+    }
+    // `undefined`: no reply landed, so nothing was carried and nothing may be
+    // dropped — every held frame re-dispatches, repeated-seq `progress` frames
+    // included (#343: the give-up path must not throw away what it can fold).
+    this.settleSynced(cursor.afterSeq, cursor.buffer, undefined);
+  }
+
+  /**
+   * #244 half B — connection-scoped reset: the outstanding request and the frames
+   * held for it belong to the connection that just dropped. Called on raw
+   * transport loss and on `close()`, alongside the other connection-scoped valves
+   * (`clearStaleDraftWatch`).
+   *
+   * The CURSOR IS KEPT — Telegram's app keeps its `pts` across connections, and so
+   * do we; only the in-flight request, its timer and its buffer go. A reconnect
+   * re-runs `updates.getState` (the register-time snapshot), and its `highWaterSeq`
+   * re-detects any gap through the ordinary three-way check.
+   */
+  private resetCursorForConnection(): void {
+    // Received snapshot rows and any recovered prefix belong to the retained
+    // view, unlike the transport-correlated request and its live-frame buffer.
+    const cursor = this.cursor;
+    if (cursor.state === "catching-up") {
+      this.clearCatchUpTimer(cursor);
+      this.cursor = { state: "synced", last: cursor.afterSeq };
+      return;
+    }
+    // `synced`/`unseeded` hold nothing connection-scoped: there is no request, no
+    // timer and no buffer, and the baseline (or the absence of one) is exactly
+    // what the next connection should resume from.
+  }
+
+  /**
+   * The ordinary per-frame dispatch: observe held-turn activity against the
+   * pre-frame latch, fold the frame, then re-evaluate the release gate. Split out
+   * of `handleMessage` so the #244 gap-sync path can gate/buffer around it.
+   */
+  private applyFrame(msg: InboundMessage): boolean {
     // Observe authenticated turn activity against the pre-frame live-turn latch.
     // Reducers may settle that latch or invoke public listeners, so this must be
     // the first operation for every decrypted frame.
     const preFrameLiveTurn = this.turnInFlight();
     this.observeHeldTurnActivity(msg, preFrameLiveTurn);
-    this.handleFrame(msg);
+    // #246 half A: the verdict travels to the caller — the seq cursor advances
+    // only for a frame that was actually folded. See `handleFrame`.
+    const previousSeq = this.frameSeq;
+    this.frameSeq = isWireSeq(msg.seq) ? msg.seq : undefined;
+    let folded: boolean;
+    try { folded = this.handleFrame(msg); }
+    finally { this.frameSeq = previousSeq; }
     // P1-9 §3.2: every handled frame is a state transition — re-evaluate the
     // release gate after the reducer settles (a no-op when nothing is held or a
-    // turn is still in flight).
+    // turn is still in flight). Deliberately NOT gated on `folded`: the latch
+    // observation above already ran, and a re-evaluation is idempotent.
     this.maybeRelease();
+    return folded;
   }
 
-  private handleFrame(msg: InboundMessage): void {
-    switch (msg.type) {
-      case "history": {
-        const incoming = Array.isArray(msg.messages) ? msg.messages : [];
-        if (incoming.length === 0) return;
+  /**
+   * #244 half B / #356 — fold a `difference` catch-up onto the view, then either
+   * re-request (the reply was a slice) or settle and re-dispatch what was held.
+   *
+   * The events are folded through the SAME `applyDurable` reducer path live frames
+   * fold through — RAW journal events, no client-local overlays beyond the ones
+   * `foldDifferenceEvent` re-supplies — so the result converges on the durable
+   * (history) truth for the caught-up range.
+   *
+   * ⚠️ TWO GATES BEFORE ANYTHING IS TOUCHED, AND THEY ARE DIFFERENT QUESTIONS.
+   *  1. Is a request outstanding at all? A `difference` is only meaningful in
+   *     `catching-up`; one arriving in any other state is stale (a reply that lost
+   *     the race with a retry's reply, or one landing after a give-up or a
+   *     reconnect) and is DROPPED WHOLE, which is the exact guard against a
+   *     re-fold for EVERY event kind.
+   *  2. Is it MINE? `.out` is shared by every device of this peer (#245 Part B —
+   *     the subject IS the fan-out), so a reply to ANOTHER device's request lands
+   *     here too. Before #356 nothing asked: device A, catching up from floor 100,
+   *     folded device B's reply for floor 300, advanced its cursor to B's max, and
+   *     silently lost 101..300 (#351, NOT-list N8). The reply echoes the request's
+   *     `afterSeq` and `nonce`; both must match this cursor's, or it is ignored in
+   *     silence — the other device is being answered, not us, and our own reply or
+   *     our timeout is still coming.
+   *
+   * ⚠️ THE FOLD FLOOR IS THE CURSOR, AND THAT IS NOW A TAUTOLOGY RATHER THAN A
+   * COINCIDENCE. `catching-up` holds ONE number: nothing may move the cursor while
+   * a reply is owed, so there is no "live cursor" that could drift away from the
+   * floor the request was issued with, and no deferred advance to reconcile
+   * afterwards. That drift, plus a PARTIAL reply, was #352 — the deferred `ack`
+   * seq landed above the reply's range and the drain then discarded the buffered
+   * events between them.
+   *
+   * ⚠️ A REFUSED EVENT IS SKIPPED AND ITS SEQ STILL ADVANCES — the DELIBERATE
+   * OPPOSITE of the live path, where a refused frame must NOT advance. A difference
+   * is the authoritative answer to a gap, so freezing the cursor on a row this
+   * build cannot fold would re-request that same row forever. The server's
+   * `projectJournalHistory` treats such a row the same way (an `unsupportedEvents`
+   * skip). `decodeDurableEvent`'s docblock states the asymmetry once, for both
+   * sites.
+   */
+  private applyDifference(msg: InboundMessage): void {
+    const cursor = this.cursor;
+    // Gate 1: no request outstanding ⇒ stale/duplicate. Drop it WITHOUT touching
+    // any timer (none belongs to it) or draining anything.
+    if (cursor.state !== "catching-up") return;
+    // Gate 2: not the reply to OUR request ⇒ another device's, or a superseded
+    // retry's. Silent: on a shared subject this is ordinary traffic, not a fault.
+    if (msg.nonce !== cursor.nonce || msg.afterSeq !== cursor.afterSeq) return;
+    // ⚠️ THE LIVENESS TIMER IS *NOT* STOPPED HERE, AND THAT IS THE ROUND-4 FIX.
+    // It used to be cleared the moment a matching reply arrived, on the theory
+    // that the round-trip was over. A STALL is a reply that ends nothing — so
+    // clearing here and re-arming there handed the deadline to the peer: any
+    // peer stalling faster than `GET_DIFFERENCE_TIMEOUT_MS` pushed the deadline
+    // back forever and the timer never fired. Measured over 10 simulated minutes
+    // at a 50 ms stall cadence: ONE request, still catching-up, 12 001 frames
+    // held, nothing rendered. The deadline now belongs to the REQUEST: only a
+    // reply that actually ends the round-trip clears it (see the `finally`).
 
-        const existing = this.state.messages;
-        const seen = new Set(existing.map((m) => m.id));
+    const raw = Array.isArray(msg.events) ? msg.events : [];
+    const events = raw
+      .filter(
+        (e): e is { seq: number; event: unknown } =>
+          // #246 half A: `isWireSeq`, not `typeof === "number"`. These seqs become
+          // the cursor, so a `NaN` (which loses every comparison and would leave
+          // the cursor short) or an over-large value (which would park it past
+          // every real seq) is worse here than a missing entry.
+          !!e && typeof e === "object" && isWireSeq((e as { seq?: unknown }).seq),
+      )
+      // The server sends ascending `seq`; sort defensively so the fold order is a
+      // property of this method, not of the wire.
+      .sort((a, b) => a.seq - b.seq);
 
-        // Phase 6 (stateless register, shared conversation key): a snapshot
-        // triggered by ANY device's register — this device's reconnect or a
-        // second device joining — arrives at every device mid-session on the
-        // shared `.out`. Messages already rendered LIVE on this device sit in
-        // state under LOCAL id namespaces while the snapshot carries the core
-        // transcript's canonical ids, so plain id-dedup would duplicate them:
-        //   - user sends → synthetic local echo ids (`u-<n>`);
-        //   - agent replies → the plugin's live-frame ids (`webchannel-…`
-        //     from nextMessageId(), or `a-<n>` when a frame had no id) — the
-        //     core transcript NEVER stores that platform id, so history ids
-        //     can never match live ids for agent messages either.
-        // Matching happens in three tiers, in snapshot order:
-        //   1. id — a message whose canonical id we already hold (a prior
-        //      snapshot placed or adopted it) is a no-op;
-        //   2. exact text+role — adopt the server id onto the first
-        //      text-matching local bubble (covers user echoes always; covers
-        //      agent replies only when live text == stored text);
-        //   3. POSITIONAL (agent only) — openclaw's live reply text is NOT
-        //      byte-equal to the stored transcript text (core strips metadata
-        //      sections from live replies but stores the raw model output), so
-        //      tier 2 can miss agent bubbles entirely. Structure saves us: an
-        //      agent reply in the snapshot immediately FOLLOWS the message it
-        //      answered, and that predecessor matched some local index i via
-        //      tier 1/2 — so if the local message at i+1 is a live-id agent
-        //      bubble, it IS this reply's live rendering; adopt onto it (and
-        //      keep the canonical stored text). Chains across multi-frame
-        //      replies because each adoption advances the anchor.
-        // PLACEMENT of the unmatched (fresh) messages is ORDERED, not a blanket
-        // prepend (#16). We carry an insertion CURSOR = the index into `next`
-        // before which the next fresh message lands; every match/adoption walks
-        // it to `matchedIndex + 1`. So a mid-session snapshot whose overlapping
-        // prefix matches the local tail inserts its unseen suffix chronologically
-        // AFTER that prefix (a turn sent from another device, or turns that
-        // landed while this tab was disconnected, appear at the bottom — not the
-        // top). Pagination and zero-overlap frames match nothing → the cursor
-        // stays 0 → the whole page prepends in order (unchanged); initial
-        // hydration into empty state inserts everything at 0 in order (unchanged).
-        // A `working:true` progress draft is never an adoption target: its
-        // live id must survive for the upcoming progress/final upserts.
-        // Known cosmetic edge (accepted): if TWO devices send the identical
-        // text near-simultaneously, text-only matching can adopt the OTHER
-        // device's server id onto this device's bubble — the ids swap between
-        // the two bubbles, but the bubble COUNT stays exactly right and every
-        // later snapshot still dedups, so nothing duplicates or disappears.
-        // P1-9 §6.3: a held (pending) or /stop-retracted user bubble is
-        // LOCAL-ONLY (never on the wire, never in the transcript). It must NEVER
-        // be an adoption target — a snapshot row with identical text (the same
-        // text sent from another device) would otherwise steal its server id onto
-        // our UNSENT bubble, and the later release would run/duplicate it. Exclude
-        // both from the tier-2 text-match pool.
-        const isLocalLiveId = (m: ChatMessage): boolean =>
-          m.role === "user"
-            ? m.id.startsWith("u-") && m.pending !== true && m.retracted !== true
-            : !m.working && (m.id.startsWith("a-") || m.id.startsWith("webchannel-"));
-        const adoptKey = (role: string, text: string): string => `${role} ${text}`;
+    // ── THE MERGE PLAN, DECIDED BEFORE ANYTHING FOLDS ──
+    //
+    // ⚠️ A HELD FRAME BELOW THE REPLY'S ROWS MUST FOLD *AMONG* THEM, NOT AFTER.
+    // The reducers are last-write-wins, so re-dispatching the buffer in arrival
+    // order after the fold lets a stale frame overwrite what the reply just
+    // established. Measured three ways, all of them the #343-skip shape this
+    // branch exists for — the reply covers the seq and carries no event for it:
+    // a held `tool_activity{start}@11` re-applied after a folded `tool{end,ok}@12`
+    // left the card `{phase:"start", status:"ok"}` for the session; a held
+    // `approval_request@11` re-applied after a folded `approvalResolution@12`
+    // appended a CLICKABLE card for an approval the server had already resolved;
+    // a held `agent_message{A}@11` re-applied after a `seal@12` whose `remove`
+    // names A brought A back.
+    //
+    // So the buffer is split at the upper bound this reply ANSWERS:
+    //  - `below` — seq-bearing held frames at or below `declaredCovered`, including
+    //    repeated progress at/below `afterSeq` (its placement seq is reused).
+    //    Merged with the reply's events in SEQ ORDER and applied through
+    //    `applyFrame` DIRECTLY: the cursor is `catching-up`, so `observeSeq` would
+    //    only re-buffer them, and their seqs are already inside `covered`.
+    //  - `rest` — everything else: seq-less frames, whose order relative to the
+    //    reply is all they have, and seq-bearing frames ABOVE the range, which the
+    //    next request or the settle is for.
+    //
+    // `declaredCovered` is what the reply CLAIMS to answer. It is computed here,
+    // before the fold, because the merge order cannot depend on the fold's
+    // outcome; the fold can only ever end at or below it.
+    const declaredCovered = Math.max(
+      cursor.afterSeq,
+      isWireSeq(msg.maxSeq) ? msg.maxSeq : 0,
+      events.length > 0 ? events[events.length - 1]!.seq : 0,
+    );
+    const below: InboundMessage[] = [];
+    const rest: InboundMessage[] = [];
+    for (const held of cursor.buffer) {
+      const heldSeq = isWireSeq(held.seq) ? held.seq : undefined;
+      if (heldSeq !== undefined && heldSeq <= declaredCovered) {
+        below.push(held);
+      } else {
+        rest.push(held);
+      }
+    }
+    below.sort((a, b) => (a.seq as number) - (b.seq as number));
 
-        const next = existing.slice();
-        const localIndexById = new Map<string, number>();
-        next.forEach((m, i) => localIndexById.set(m.id, i));
-        const claimed = new Set<number>();
-        const adoptable = new Map<string, number[]>();
-        next.forEach((m, i) => {
-          if ((m.role === "user" || m.role === "agent") && isLocalLiveId(m)) {
-            const key = adoptKey(m.role, m.text);
-            const idxs = adoptable.get(key) ?? [];
-            idxs.push(i);
-            adoptable.set(key, idxs);
+    let last = cursor.afterSeq;
+    let completed = false;
+    let nextEvent = 0;
+    let nextHeld = 0;
+    // What this reply actually DELIVERED — see `CarriedRows`. Both sets take an
+    // entry only for an event that was decoded AND folded: a row this build
+    // cannot read advances the cursor past itself (the documented asymmetry) but
+    // delivers nothing, so it may not drop a held frame that IS foldable.
+    const carriedSeqs = new Set<number>();
+    const authoredIds = new Set<string>();
+    // ⚠️ `try/finally` (#246 half A): the transition below MUST run even if a fold
+    // throws. `notifyMessageListeners` (`nats-client.ts`) swallows a listener's
+    // throw, so an escape from here would leave the cursor stuck in `catching-up`
+    // with every later durable frame silently held. `decodeDurableEvent` is what
+    // makes such a throw unreachable; this is the belt to its braces, and it is
+    // cheap.
+    //
+    // ⚠️ IT DEGRADES, IT DOES NOT PRETEND. `last` is raised AFTER each event is
+    // handled, so a throw leaves the cursor at the last event actually applied —
+    // and `completed` is what stops the server's `maxSeq` from papering over the
+    // rest.
+    //
+    // ⚠️ AND THE RECOVERY AFTER A THROW IS THE TIMER'S, NOT THE BUFFER'S. A throw
+    // before the first event folds moves no floor, so it is a STALL: the cursor,
+    // its budget and its deadline all stay, nothing is re-dispatched, and
+    // `onCatchUpTimeout` re-issues on its own cadence and eventually gives up. A
+    // throw PART-WAY leaves the cursor at the last applied event and settles or
+    // re-requests from there. Either way the buffer is not consulted for recovery.
+    const replayBuffer = cursor.buffer;
+    this.activeReplayBuffers.add(replayBuffer);
+    try {
+      // ONE ASCENDING PASS over the reply's events and `below`, together. At an
+      // equal seq the reply's event goes FIRST: it is the durable row, and the
+      // held frame is a live rendering of that same row.
+      while (nextEvent < events.length || nextHeld < below.length) {
+        // A subscriber may close/reconnect while an earlier row is folded.
+        if (this.cursor !== cursor) return;
+        const entry = events[nextEvent];
+        const held = below[nextHeld];
+        const heldSeq = held === undefined ? undefined : (held.seq as number);
+        if (entry !== undefined && (heldSeq === undefined || entry.seq <= heldSeq)) {
+          nextEvent += 1;
+          const seq = entry.seq;
+          // Fold everything the request asked for; a `seq <= last` is a
+          // raced/duplicate overlap we already hold.
+          if (seq <= last) continue;
+          const decoded = decodeDurableEvent(entry.event);
+          if (decoded.ok) {
+            const previousSeq = this.frameSeq;
+            this.frameSeq = seq;
+            try { this.foldDifferenceEvent(decoded.event); }
+            finally { this.frameSeq = previousSeq; }
+            carriedSeqs.add(seq);
+            for (const id of authoredIdsOf(decoded.event)) authoredIds.add(id);
+          } else if (decoded.kind === "malformed") {
+            // Only the MALFORMED case is reported: an unknown kind is an ordinary
+            // version skew and would be noise on every frame from a newer server,
+            // while a known kind we cannot fold is a real defect somewhere
+            // upstream.
+            console.warn(
+              `[nats-wrapper] skipping malformed ${decoded.eventKind} event at seq ${seq} ` +
+                `in a difference: ${decoded.reason}`,
+            );
           }
+          last = seq;
+          continue;
+        }
+        nextHeld += 1;
+        // The reply's event for this seq, if it had one, has already been handled
+        // — both sequences ascend and ties go to the event — so `carriedSeqs` is
+        // authoritative here: this held frame folds iff the reply did not deliver
+        // its row.
+        //
+        // A `progress` folds ANYWAY, and by ORDER rather than by an exemption:
+        // its row is a text-less `placement`, so folding it immediately after that
+        // placement is what keeps the draft the user is watching, and a
+        // `bubble`/`seal` later in the same merge then authors over it — exactly
+        // as it would have live.
+        if (!this.retiredBufferedProgress.has(held!)
+          && (held!.type === "progress" || !carriedSeqs.has(heldSeq!))) {
+          this.applyFrame(held!);
+        }
+      }
+      completed = true;
+    } finally {
+      this.activeReplayBuffers.delete(replayBuffer);
+      // ⚠️ ONLY IF THIS CATCH-UP IS STILL THE LIVE ONE. The fold runs reducers and
+      // public listeners, and a listener may call `close()` — which runs
+      // `resetCursorForConnection` and lands a valid `synced` cursor. Transitioning
+      // on top of that would re-enter `catching-up` on a closed client, with a
+      // request nothing will answer and a timer nothing will clear. Object
+      // identity, the same test the timer uses.
+      if (this.cursor === cursor) {
+        // `maxSeq` is the highest seq this reply ACCOUNTS FOR, which is more than
+        // the events it carried: a seq the server SKIPPED as undeliverable at this
+        // peer's `max_payload` (#343) is covered but unsendable, and freezing on
+        // it would wedge this device for the session. It is adopted only when the
+        // whole reply was processed — after a throw it would claim a range that
+        // was never applied.
+        const covered = completed && isWireSeq(msg.maxSeq) ? Math.max(last, msg.maxSeq) : last;
+        const carried: CarriedRows = { seqs: carriedSeqs, authoredIds };
+        // ⚠️ A STALL ENDS NOTHING, AND "NOTHING" INCLUDES THE DEADLINE. The
+        // cursor stays, its retry budget is preserved, and the timer the REQUEST
+        // armed is left exactly where it was — `onCatchUpTimeout` is the only
+        // thing that re-issues and the only thing that gives up. Round 3 re-armed
+        // here instead, which starts a FRESH `GET_DIFFERENCE_TIMEOUT_MS`: a peer
+        // stalling faster than that pushed the deadline back on every reply and
+        // the timeout never fired. Measured over 10 simulated minutes at a 50 ms
+        // stall cadence: ONE request, still catching-up, nothing ever re-asked —
+        // worse than the loop the stall rule replaced. (What this bounds is the
+        // REQUEST RATE. Frames still accumulate while a catch-up is open, which is
+        // the design; the defect was that nothing could ever answer them.)
+        if (!this.stalled(msg, covered, completed, cursor)) {
+          // The round-trip IS over, so the request's deadline has nothing left to
+          // protect. Both branches below install a NEW cursor, and this is the one
+          // place that retires the old one's timer.
+          this.clearCatchUpTimer(cursor);
+          if (msg.partial === true || covered < this.observedHistoryHighWater) {
+            // Telegram's `updates.differenceSlice`: "the query must be repeated,
+            // using the intermediate status as the current status." The
+            // intermediate status is `covered`; what carries forward is `rest` —
+            // `below` was consumed by the merge above.
+            this.openCatchUp(covered, this.uncarried(rest, carried));
+          } else {
+            this.settleSynced(covered, rest, carried);
+          }
+        }
+      }
+      // A difference can settle a held-turn condition (it is durable turn content),
+      // and the fold above bypassed the per-frame gate; re-evaluate it once here.
+      this.maybeRelease();
+    }
+  }
+
+  /**
+   * Replay durable content without inventing current activity (#349). A
+   * placement preserves an existing live draft or reserves a hidden empty slot.
+   * Bubble/seal authoring still clears draftOnly so the durable projection keeps
+   * the authored text. Other event kinds retain their usual replay handling.
+   */
+  private foldDifferenceEvent(event: DurableEvent): void {
+    switch (event.kind) {
+      case "bubble":
+        // Mirror `case "agent_message"`: durable text authored ⇒ no longer a draft.
+        this.applyDurable(event, {
+          [event.answerId]: { working: false, draftOnly: undefined },
         });
-
-        let adopted = false;
-        /**
-         * Fresh (unmatched) snapshot messages, grouped by the INSERTION CURSOR
-         * value in effect when each was seen — the index into `next` BEFORE
-         * which they must land. We cannot splice into `next` mid-loop (that
-         * invalidates every cached local index in
-         * `localIndexById`/`claimed`/`adoptable`), so the placement is deferred
-         * to a single rebuild after the loop. Multiple fresh messages sharing a
-         * cursor keep their snapshot order (appended to the same array).
-         */
-        const inserts = new Map<number, ChatMessage[]>();
-        /** Local index the PREVIOUS snapshot message resolved to (tier-3 anchor). */
-        let anchor: number | null = null;
-        /**
-         * Index into `next` before which the NEXT fresh message is inserted.
-         * Advances to `matchedIndex + 1` past every matched (tier 1) or adopted
-         * (tier 2/3) message, so a snapshot's unseen tail lands chronologically
-         * AFTER the overlapping matched prefix instead of being prepended (#16).
-         */
-        let cursor = 0;
-
-        const adoptAt = (idx: number, m: { id: string; text: string; ts?: number }): void => {
-          // Keep the canonical stored text on adoption, so this device
-          // converges to exactly what a reloading device would render. The
-          // observed live block ordinal is deliberately discarded: history
-          // cannot validate or persist this run/attempt-local metadata.
-          const { assistantMessageIndex: _liveOrdinal, ...adoptedMessage } = next[idx];
-          next[idx] = {
-            ...adoptedMessage,
-            id: m.id,
-            text: m.text,
-            ts: m.ts,
-          };
-          claimed.add(idx);
-          localIndexById.set(m.id, idx);
-          adopted = true;
-          anchor = idx;
-          cursor = idx + 1;
-        };
-
-        for (const m of incoming) {
-          if (!m || typeof m !== "object") continue;
-          if (typeof m.id !== "string" || m.id.length === 0) continue;
-          if (m.role !== "user" && m.role !== "agent") continue;
-          if (typeof m.text !== "string") continue;
-          if (seen.has(m.id)) {
-            const li = localIndexById.get(m.id);
-            anchor = li ?? null;
-            // Tier-1 match: walk the cursor past this already-held message so
-            // later fresh messages insert after it. An id we can't locate
-            // locally (should not happen — `seen` is seeded from `next`) leaves
-            // the cursor untouched.
-            if (li !== undefined) cursor = li + 1;
-            continue;
-          }
-
-          seen.add(m.id);
-          // Tier 2: exact text+role.
-          const idxs = adoptable.get(adoptKey(m.role, m.text));
-          while (idxs && idxs.length > 0 && claimed.has(idxs[0])) idxs.shift();
-          if (idxs && idxs.length > 0) {
-            adoptAt(idxs.shift()!, m);
-            continue;
-          }
-          // Tier 3: positional (agent replies whose live text was reformatted).
-          if (m.role === "agent" && anchor !== null) {
-            // P1-9 §6.3: a held (pending) or retracted user chip is local-only
-            // and sits BETWEEN the anchor and the agent reply it delayed
-            // (`[u2, h3(pending), A]`). The probe was hard-coded to `anchor + 1`,
-            // which would land on the chip (role user) and miss `A` → the
-            // snapshot row fresh-inserts → duplicate agent bubble. Skip past
-            // pending/retracted bubbles (they can never correspond to a snapshot
-            // row) and probe the first NON-local candidate after the anchor.
-            // CURSOR MECHANICS ARE UNTOUCHED — fresh rows still insert at the
-            // plain `cursor` (before a held chip is chronologically correct;
-            // anything the snapshot carries predates the unpublished chip).
-            let cand = anchor + 1;
-            while (
-              cand < next.length &&
-              (next[cand].pending === true || next[cand].retracted === true)
-            ) {
-              cand++;
-            }
-            if (
-              cand < next.length &&
-              !claimed.has(cand) &&
-              next[cand].role === "agent" &&
-              isLocalLiveId(next[cand])
-            ) {
-              adoptAt(cand, m);
-              continue;
-            }
-          }
-          const atCursor = inserts.get(cursor) ?? [];
-          atCursor.push({
-            id: m.id,
-            role: m.role,
-            text: m.text,
-            ts: m.ts,
-            working: false,
-          });
-          inserts.set(cursor, atCursor);
-          anchor = null;
-        }
-
-        if (inserts.size === 0 && !adopted) return;
-
-        // Rebuild `next` with each fresh group spliced in at its cursor. Slot i
-        // holds the messages that must precede `next[i]`; slot `next.length`
-        // holds any tail appended after the last local message.
-        const merged: ChatMessage[] = [];
-        for (let i = 0; i <= next.length; i++) {
-          const ins = inserts.get(i);
-          if (ins) merged.push(...ins);
-          if (i < next.length) merged.push(next[i]);
-        }
-        this.setState({ messages: merged });
+        return;
+      case "placement": {
+        const held = this.state.messages.find(
+          (m) => m.kind === undefined && m.id === event.answerId,
+        );
+        if (held === undefined) this.replayPlacementIds.add(event.answerId);
+        this.applyDurable(event);
         return;
       }
+      case "seal": {
+        // Mirror `applyTurnSnapshot`: each sealed answer is authored durable text.
+        const local = Object.create(null) as DurableLocalOverlay;
+        for (const a of event.answers) {
+          local[a.id] = { working: false, draftOnly: undefined };
+        }
+        this.applyDurable(event, local);
+        return;
+      }
+      case "requestState": {
+        // A catch-up consumes a lifecycle row exactly like `history` and the
+        // live `request_state` frame do. `applyDurable` alone only paints the
+        // row: the receipt promotion, the buffered-progress retirement and the
+        // turn closure all live in `reconcileRequestStates`, so without this the
+        // send stays `accepted` and the turn stays open until the next history
+        // load — for the interrupted case, exactly the state the user is being
+        // asked to act on.
+        this.applyDurable(event);
+        this.reconcileRequestStates();
+        return;
+      }
+      case "user": {
+        // #337 — a LOST ack leaves the optimistic user bubble un-adopted at its
+        // local id (`adoptCommittedIds` runs only on the ack). The turn's first
+        // agent frame opens a gap, and this difference re-delivers the same user
+        // event under the SERVER id (`webchannel-user-<seq>`) — a DISTINCT id — so
+        // a bare `applyDurable` would `applyUser`-append a SECOND user bubble.
+        //
+        // #245 Part B folds the live broadcast the SAME way (`case "user_committed"`
+        // in `handleFrame`), so the adopt-then-fold body lives in ONE place.
+        this.foldUserEvent(event);
+        return;
+      }
+      case "approvalResolution": {
+        // #400: a server-sourced decision, like the live `approval_resolved`
+        // frame and a `history` row — so it is CONFIRMED, which is what keeps
+        // the snapshot reconciler from reading it as an unconfirmed guess.
+        // Only when the card now shows THAT verdict: a version-fenced event
+        // leaves whatever the card held, and a different guess must not be
+        // confirmed by proxy.
+        this.applyDurable(event);
+        const held = this.state.messages.find(
+          (m): m is ChatApprovalMessage => m.kind === "approval" && m.id === event.id,
+        );
+        if (held?.resolvedDecision === event.decision) {
+          this.setState({ messages: markApprovalConfirmed(this.state.messages, event.id) });
+        }
+        return;
+      }
+      default:
+        this.applyDurable(event);
+    }
+  }
+
+  /** Fold the actual user event in stream order, retaining exact local send identity. */
+  private foldUserEvent(event: Extract<DurableEvent, { kind: "user" }>): void {
+    const lifecycle = this.wrapperLifecycleGeneration;
+    if (typeof event.randomId === "string" && event.randomId.length > 0) {
+      this.adoptUserBubbleByRandomId(event.randomId, event.id);
+      if (this.wrapperLifecycleGeneration !== lifecycle) return;
+    }
+    // An ACK gives identity, not a journal position. When the actual user event
+    // first arrives, let the canonical append place it after earlier events in
+    // this difference/live stream, carrying the optimistic receipt as overlay.
+    const optimistic = this.state.messages.find((m) => m.role === "user" && m.id === event.id
+      && m.receiptKey !== undefined && this.rowVersions.seq(transcriptEntryKey(m)) === undefined);
+    if (optimistic !== undefined) {
+      const before = projectDurableFromClient(this.state.messages.filter((m) => m !== optimistic));
+      const after = this.applyVersionedDurable(before, event);
+      this.setState({ messages: this.orderRecoveredMessages(this.mergeDurable(this.state.messages, after)) });
+      return;
+    }
+    this.applyDurable(event);
+  }
+
+  /** Merge an exact origin echo with an already-hydrated server row atomically. */
+  private adoptUserBubbleByRandomId(randomId: string, serverId: string): void {
+    const receiptKey = this.randomIdToReceiptKey.get(randomId);
+    // A durable broadcast/history row can beat its ACK. Keep the exact linkage
+    // while the low-level queue/replay ledger still owns this send, so an epoch
+    // reset can retain it and a later new-epoch ACK can adopt its new identity.
+    if (!this.client.hasPendingRandomId(randomId)) this.randomIdToReceiptKey.delete(randomId);
+    if (receiptKey === undefined) return;
+    const own = this.state.messages.find((m): m is ChatBubble => m.kind === undefined && m.role === "user" && m.receiptKey === receiptKey);
+    if (own === undefined) return;
+    const server = this.state.messages.find((m): m is ChatBubble => m.kind === undefined && m.role === "user" && m.id === serverId && m !== own);
+    const adopted: ChatMessage = { ...own, ...(server ?? {}), id: serverId,
+      receiptKey: own.receiptKey, wireId: own.wireId, sendState: own.sendState,
+      sendFailure: own.sendFailure, pending: own.pending,
+    };
+    const anchor = server ?? own;
+    const messages: ChatMessage[] = [];
+    for (const row of this.state.messages) {
+      if (row === anchor) messages.push(adopted);
+      else if (row !== own && !(row.role === "user" && row.id === serverId)) messages.push(row);
+    }
+    this.setState({ messages });
+  }
+
+  /** Merge projected rows by explicit identity and modification evidence. */
+  private reconcileRequestStates(): void {
+    let reopened = false;
+    for (const row of [...this.state.messages]) {
+      if (row.kind !== undefined || row.role !== "user" || !row.requestState) continue;
+      if (row.requestState === "queued" || row.requestState === "started") {
+        reopened = this.reopenTurnFromServerState(row.wireId ?? row.turnId) || reopened;
+        continue;
+      }
+      const turnId = row.wireId ?? row.turnId;
+      if (!turnId) continue;
+      const placement = this.consumeTurnOpeningsThrough(turnId);
+      this.settleApplicationTurnsThrough(turnId);
+      if (row.requestState === "interrupted") this.promoteAnchor(turnId, "interrupted");
+      else if (row.requestState === "completed") this.promoteAnchor(turnId, "completed");
+      else this.promoteAnchor(turnId, "failed", { reason: row.requestState === "cancelled" ? "cancelled" : "turn-failed", retryable: row.requestState === "failed" });
+      this.retireBufferedProgress(turnId);
+      const closed = this.closeTurnsThrough(placement);
+      this.finalizeDraftsForTurn(turnId);
+      if (closed) this.setState({ turnActive: false, isTyping: false });
+    }
+    if (reopened && this.openTurns.size > 0 && this.state.turnActive !== true) {
+      this.setState({ turnActive: true });
+    }
+    if (!this.hasAcceptedApplicationTurn()) this.cancelActiveTurnStallTimer();
+  }
+
+  /**
+   * #396: re-open one of THIS client's turns that the server still reports as
+   * `queued`/`started`. "Is this turn still running" is the server's fact; the
+   * disconnect sweep in `onState` only drops our copy of it so a lost settle
+   * cannot leave Stop armed while we are offline. Once a replacement session's
+   * history (or a live `request_state`) says the turn is still open, a soft
+   * recovery must not leave it looking finished for the rest of the turn.
+   *
+   * This is not the stale ack/replay the opening latch guards against: the row
+   * is a versioned journal projection, and only a turn this client published
+   * and has NOT seen settle qualifies — `applicationTurns` drops an id on its
+   * settle, terminal request state, cancellation, or terminal receipt, so a
+   * settle that already closed the turn can never be undone here. Foreign rows
+   * are skipped: no settle this client acts on could close them again.
+   *
+   * Not activity evidence — it never re-arms the stall watch (that stays the
+   * job of live frames in `observeActiveTurnActivity`).
+   */
+  private reopenTurnFromServerState(turnId: string | undefined): boolean {
+    if (!turnId || this.openTurns.has(turnId)) return false;
+    if (!this.canReopenTurnFromServerState(turnId)) return false;
+    // `openTurns` iteration order must stay publish order (`closeTurnsThrough`
+    // sweeps a settle's prefix), and a send made after the reconnect may
+    // already be open. Rebuild in the retained publish order.
+    const open = new Set(this.openTurns).add(turnId);
+    this.openTurns.clear();
+    for (const wireId of this.wireIdToReceiptKey.keys()) {
+      if (open.delete(wireId)) this.openTurns.add(wireId);
+    }
+    for (const wireId of open) this.openTurns.add(wireId);
+    return true;
+  }
+
+  /** Central proof required before durable server state may open a local turn. */
+  private canReopenTurnFromServerState(turnId: string | undefined): boolean {
+    if (!turnId || !this.rawTransportConnected || this.terminal || this.closed) return false;
+    const receipt = this.applicationTurns.get(turnId);
+    return receipt?.settlementEligible === true
+      && receipt.stoppedAtExplicitBoundary !== true
+      && (receipt.state === "sent" || receipt.state === "accepted")
+      && !this.client.isIngressCancelled(turnId);
+  }
+
+  /** Mint, remember and return the correlation nonce for one page request. */
+  private mintHistoryPageNonce(): string {
+    const nonce = randomInboxToken();
+    this.historyPageNonces.push(nonce);
+    if (this.historyPageNonces.length > MAX_OUTSTANDING_HISTORY_PAGES) this.historyPageNonces.shift();
+    return nonce;
+  }
+
+  /**
+   * #401 — may this `history` frame's rows be folded into THIS device's view?
+   *
+   * A register-time SNAPSHOT (it carries `highWaterSeq`) is the newest window and
+   * is meant for every device: always yes. A load-older PAGE is the requester's
+   * alone. Telegram answers `messages.getHistory` on the asking session only; our
+   * page rides the peer's shared `.out`, and `hydrateHistory` inserts unmatched
+   * rows at the head of the view. A device whose window differs from the
+   * requester's would therefore prepend a page that is not contiguous with it,
+   * and its own "load older" — which pages from the view's oldest row — could
+   * never reach the rows in between.
+   *
+   * So a page is folded iff it echoes one of THIS device's outstanding nonces,
+   * which it consumes. A page with no nonce, or another device's, is not. There
+   * is no un-nonced fallback: the protocol 7 exact-match gate means the plugin
+   * on the other end echoes every nonce this wrapper sends.
+   */
+  private claimHistoryPage(msg: InboundMessage): boolean {
+    if (msg.highWaterSeq !== undefined) return true;
+    if (typeof msg.nonce !== "string") return false;
+    const index = this.historyPageNonces.indexOf(msg.nonce);
+    if (index < 0) return false;
+    this.historyPageNonces.splice(index, 1);
+    return true;
+  }
+
+  private hydrateHistory(msg: InboundMessage, foldRows = true): void {
+    const rows = Array.isArray(msg.messages) ? msg.messages : [];
+    const lifecycle = this.wrapperLifecycleGeneration;
+    // Mapping is independent of content freshness. A stale page may still carry
+    // the first explicit acknowledgement of a locally published send — and so
+    // may another device's page, whose rows are otherwise not folded (#401):
+    // adoption re-keys a bubble this device already holds and inserts nothing.
+    for (const row of rows) {
+      if (row && row.kind === undefined && row.role === "user" && typeof row.id === "string"
+        && row.id.length > 0 && typeof row.text === "string" && typeof row.randomId === "string" && row.randomId.length > 0) {
+        this.adoptUserBubbleByRandomId(row.randomId, row.id);
+        if (this.wrapperLifecycleGeneration !== lifecycle) return;
+      }
+    }
+    if (!foldRows) return;
+    const supplied = new Map<string, number>();
+    const existing = this.state.messages;
+    const indexes = new Map(existing.map((row, i) => [transcriptEntryKey(row), i]));
+    let view = this.durableProjection();
+    const local: DurableLocalOverlay = Object.create(null);
+    const timestamps = new Map<string, number>();
+    const resolved = new Set<string>();
+    const inserts = new Map<number, string[]>();
+    const seen = new Set<string>();
+    let cursor = 0;
+    let changed = false;
+    for (const row of rows) {
+      if (!row || typeof row.id !== "string" || row.id.length === 0) continue;
+      if (row.seq !== undefined && !isWireSeq(row.seq)) continue;
+      let raw: unknown;
+      if (row.kind === "tool") {
+        raw = { kind: "tool", id: row.id, turnId: row.turnId,
+          ...(row.name !== undefined ? { name: row.name } : {}),
+          ...(row.phase !== undefined ? { phase: row.phase } : {}),
+          ...(row.status !== undefined ? { status: row.status } : {}),
+          ...(row.summary !== undefined ? { summary: row.summary } : {}),
+          ...(Array.isArray(row.argKeys) ? { argKeys: row.argKeys.filter((k): k is string => typeof k === "string") } : {}),
+        };
+      } else if (row.kind === "approval") {
+        raw = { kind: "approval", id: row.id, approvalKind: row.approvalKind,
+          title: row.title, description: row.description, prompt: row.prompt,
+          options: row.options, expiresAtMs: row.expiresAtMs };
+      } else if (row.kind === "reasoning") {
+        if (row.text === "") continue;
+        raw = { kind: "reasoning", id: row.id, turnId: row.turnId, text: row.text };
+      } else if (row.kind === undefined && (row.role === "user" || row.role === "agent")) {
+        if (row.role === "agent" && row.text === "") continue;
+        raw = row.role === "user"
+          ? { kind: "user", id: row.id, text: row.text, turnId: row.turnId, requestState: row.requestState, retryOf: row.retryOf }
+          : { kind: "bubble", answerId: row.id, text: row.text, turnId: row.turnId };
+      } else continue;
+      const decoded = decodeDurableEvent(raw);
+      if (!decoded.ok) continue;
+      const key = transcriptEntryKey({ ...row, kind: row.kind } as KeyedTranscriptEntry);
+      if (row.seq !== undefined) supplied.set(key, row.seq);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const index = indexes.get(key);
+      if (index !== undefined) cursor = index + 1;
+      if (this.rowVersions.deleted(key)) continue;
+      // Missing version evidence permits insertion, never an overwrite of live
+      // state. Replay-only empty placements are the existing #362 exception.
+      const placeholder = row.kind === undefined && row.role === "agent"
+        && this.replayPlacementIds.has(row.id);
+      // Unlike a sparse live delta, a projected tool row contains the fold of
+      // all its events. Equal-version projection can restore omitted metadata.
+      const completeToolVersion = row.kind === "tool" && row.seq !== undefined
+        && row.seq === this.rowVersions.seq(key);
+      if (index !== undefined && !placeholder && (row.seq === undefined
+        || (!completeToolVersion && !this.rowVersions.allows(key, row.seq)))) continue;
+      const before = view;
+      // A snapshot row is already the full result of its journal prefix. Fold
+      // its fields through the existing event arms; the row's seq fences later
+      // delayed live/difference frames as well as other history pages.
+      view = completeToolVersion ? applyDurableEvent(view, decoded.event)
+        : this.rowVersions.apply(view, decoded.event, row.seq);
+      if (decoded.event.kind === "user" && decoded.event.requestState) {
+        view = applyDurableEvent(view, { kind: "requestState", id: row.id, state: decoded.event.requestState,
+          ...(row.role === "user" && typeof row.retriedBy === "string" && row.retriedBy.length > 0 ? { retriedBy: row.retriedBy } : {}) });
+      }
+      if (row.kind === undefined && row.revision !== undefined && isWireSeq(row.revision)) {
+        view = applyDurableEvent(view, { kind: "messageEdited", id: row.id,
+          text: row.text!, revision: row.revision, turnId: row.turnId });
+      }
+      if (row.kind === "approval" && isApprovalDecision(row.resolvedDecision)) {
+        view = applyDurableEvent(view, { kind: "approvalResolution", id: row.id, decision: row.resolvedDecision });
+        resolved.add(row.id);
+      }
+      if (!view.some((entry) => durableRowKey(entry) === key)) continue;
+      if (row.seq !== undefined) this.rowVersions.remember(key, row.seq);
+      if (row.kind === undefined && row.role === "agent") {
+        local[row.id] = { working: false, draftOnly: undefined };
+        this.replayPlacementIds.delete(row.id);
+      }
+      if (typeof row.ts === "number") timestamps.set(key, row.ts);
+      if (index === undefined) {
+        const at = inserts.get(cursor) ?? [];
+        at.push(key);
+        inserts.set(cursor, at);
+      }
+      changed ||= view !== before || placeholder || timestamps.has(key);
+    }
+    const historyOmissions = msg.highWaterSeq !== undefined ? msg.omitted ?? []
+      : this.state.historyOmissions?.filter(row => {
+        const seq = supplied.get(transcriptEntryKey(row as KeyedTranscriptEntry));
+        return seq === undefined || (row.seq !== undefined && seq < row.seq);
+      });
+    if (!changed) {
+      if (historyOmissions !== undefined) this.setState({ historyOmissions });
+      return;
+    }
+    const folded = this.mergeDurable(existing, view, local).map((row) => {
+      const ts = timestamps.get(transcriptEntryKey(row));
+      let next = ts === undefined ? row : { ...row, ts };
+      if (row.kind === "approval" && resolved.has(row.id)) {
+        next = settleApprovalFromServer(next as ChatApprovalMessage);
+      }
+      return next;
+    });
+    const byKey = new Map(folded.map((row) => [transcriptEntryKey(row), row]));
+    const messages: ChatMessage[] = [];
+    for (let i = 0; i <= existing.length; i++) {
+      for (const key of inserts.get(i) ?? []) {
+        const row = byKey.get(key);
+        if (row !== undefined) messages.push(row);
+      }
+      if (i < existing.length) {
+        const row = byKey.get(transcriptEntryKey(existing[i]!));
+        if (row !== undefined) messages.push(row);
+      }
+    }
+    this.setState({ messages, ...(historyOmissions !== undefined ? { historyOmissions } : {}) });
+  }
+
+  /**
+   * Fold ONE inbound frame onto the view.
+   *
+   * ⚠️ RETURNS "WAS THIS FRAME FOLDED", AND THE SEQ CURSOR DEPENDS ON IT (#246
+   * half A). `true` means the frame was ACCEPTED and applied — INCLUDING an
+   * accepted no-op (an empty `history`, a `turn_snapshot` with nothing to seal,
+   * an `approval_resolved` naming a card this view does not hold). `false` means
+   * the frame was REFUSED as malformed and NOTHING was applied.
+   *
+   * ⚠️ THIS USED TO RETURN `void`, AND THAT WAS THE BUG. Every shape check in
+   * here is a bare early `return`, indistinguishable from a successful fold to
+   * the caller — so the cursor advanced past a seq-bearing frame it had just
+   * REFUSED. The event was then lost forever: the cursor
+   * covered its seq, so no later frame read a gap, and the `get_difference` that
+   * would have re-served the canonical journal row was never sent. The invariant
+   * is now: A SEQ-BEARING FRAME ADVANCES THE CURSOR IFF IT WAS FOLDED.
+   *
+   * ⚠️ AND THE INVARIANT LIVES HERE, NOT IN THE DOOR DECODER. `decodeInboundMessage`
+   * makes most of these refusals unreachable in production, which is exactly why
+   * the cursor must not be wired to it: a decoder that misses a case would
+   * silently reintroduce the loss. Two independent guards, and the cheap one is
+   * the one that cannot be incomplete.
+   *
+   * See `inbound-wire-decode.ts`'s `decodeDurableEvent` for why a refusal inside
+   * a `difference` does the OPPOSITE (skip, but advance) — one rule, two doors.
+   */
+  private handleFrame(msg: InboundMessage): boolean {
+    switch (msg.type) {
+      case "history":
+        this.hydrateHistory(msg, this.claimHistoryPage(msg));
+        this.reconcileRequestStates();
+        return true;
 
       case "typing": {
+        if (msg.keepalive === true) return true;
+        // Cancellation facts are committed before ACK callbacks. A new typing
+        // frame arriving reentrantly after that proof cannot belong to a
+        // cancelled local candidate, even before the ACK's UI cleanup runs.
+        this.typingLocalCandidates = new Set([...this.applicationTurns.keys()]
+          .filter((id) => !this.client.isIngressCancelled(id)));
+        this.deferredCancelledTyping = undefined;
         this.setState({ isTyping: true });
-        return;
+        return true;
       }
 
       case "commands": {
@@ -2174,77 +5245,156 @@ export class WebChannelNATSClient {
         // request just refreshes it). NOT turn activity, so isTyping is left
         // untouched.
         this.setState({ commands: Array.isArray(msg.commands) ? msg.commands : [] });
-        return;
+        return true;
       }
 
       case "ack": {
         // P0-4: acceptance is now driven authoritatively by the low-level
         // tracker — the same `ack` frame already advanced each matching wireId to
         // `accepted` via `onSendState` (which patched the bubble's sendState).
-        // Nothing to do at the reducer level; `handleMessage` runs the release
-        // gate (`maybeRelease`) AFTER this reducer returns, so the ack still
-        // participates in re-evaluating held-message release.
-        return;
+        // `handleMessage` runs the release gate (`maybeRelease`) AFTER this
+        // reducer returns, so the ack still participates in re-evaluating
+        // held-message release.
+        //
+        // #243 half 2b: an `ack` MAY also carry `committed` — the server's
+        // durable id per `random_id`. Adopt each onto its optimistic bubble so
+        // client and server converge on one id (`adoptCommittedIds`). It runs
+        // after `onSendState` has already flipped the bubble to `accepted`; the
+        // re-key preserves that overlay. An ack without `committed` is a no-op
+        // here; later history/difference can still carry the exact mapping.
+        const lifecycle = this.wrapperLifecycleGeneration;
+        this.adoptCommittedIds(msg.committed);
+        if (this.wrapperLifecycleGeneration !== lifecycle) return true;
+        // #399: a converged retry re-keys this send onto the FIRST retry's row,
+        // which may already be terminal. No later `request_state` will name it,
+        // so settle from the row now (idempotent for an ordinary fresh row).
+        this.reconcileRequestStates();
+        return true;
+      }
+
+      case "user_committed": {
+        // #245 Part B: the immediate multi-device broadcast of a just-committed
+        // inbound user message. Fold it exactly as the `get_difference` catch-up
+        // folds a `user` event (`foldDifferenceEvent`'s `case "user"`) — adopt by
+        // `random_id` THEN fold — so the two paths cannot diverge:
+        //  - ORIGIN device: the adopt re-keys its optimistic bubble onto the server
+        //    `id` (or no-ops if the ack already drained the `random_id` linkage),
+        //    and `applyUser` then no-ops — ONE bubble.
+        //  - NON-ORIGIN device: no linkage for this `random_id`, so the adopt is a
+        //    no-op and `applyUser` APPENDS the user bubble. The seq-bearing path in
+        //    `handleMessage` has already advanced this device's cursor, so the
+        //    turn's first agent frame is contiguous (no false gap).
+        // `applyUser` is id-idempotent, so a re-delivery (this broadcast PLUS a
+        // later gap-sync difference of the same event) is a no-op.
+        const id = typeof msg.id === "string" ? msg.id : "";
+        if (id.length === 0 || typeof msg.text !== "string") return false;
+        this.foldUserEvent({
+          kind: "user",
+          id,
+          text: msg.text,
+          ...(typeof msg.turnId === "string" ? { turnId: msg.turnId } : {}),
+          ...(typeof msg.random_id === "string" ? { randomId: msg.random_id } : {}),
+          ...(msg.requestState ? { requestState: msg.requestState } : {}),
+          ...(msg.retryOf ? { retryOf: msg.retryOf } : {}),
+        });
+        return true;
       }
 
       case "inbound_rejected": {
         // The low-level client has already removed ledger entries and emitted
-        // failed{overloaded}; receipt/bubble state arrives through onSendState.
-        return;
+        // failed{overloaded|policy-denied}; receipt/bubble state arrives through onSendState.
+        return true;
       }
 
       case "approval_request": {
-        const req: ApprovalRequest = {
-          id: msg.id ?? "",
-          kind: msg.kind ?? "exec",
+        // ⚠️ #242 half 4: AN id-LESS FRAME IS NOW REFUSED, AND THAT IS A
+        // DELIBERATE (SMALL) BEHAVIOUR CHANGE. This used to build a card under
+        // `id: msg.id ?? ""`. `journalEventForOutbound` refuses an empty id
+        // (`isUsableMessageId`, the one definition of "id-less" the whole store
+        // shares), so keeping the old default would render a card live that
+        // history can never hold — N8 in the GAINING direction, manufactured at
+        // this line. It costs nothing real: an approval id is the gateway's
+        // `approvalId` and is what `approval_decision` sends back, so a card
+        // under `""` was undecidable anyway.
+        const id = msg.id ?? "";
+        if (id.length === 0) return false;
+        const merged = this.nextDurableMessages({
+          kind: "approval",
+          id,
+          approvalKind: msg.kind ?? "exec",
           title: msg.title ?? "",
-          description: msg.description,
+          ...(msg.description !== undefined ? { description: msg.description } : {}),
           prompt: msg.prompt ?? "",
           options: (msg.options ?? []) as ApprovalOption[],
-          expiresAtMs: msg.expiresAtMs,
-        };
-
-        const approvals = this.state.approvals;
-        const idx = approvals.findIndex((a) => a.id === req.id);
-
-        if (idx === -1) {
-          this.setState({
-            approvals: [...approvals, req],
-            isTyping: false,
-          });
-        } else {
-          // Upsert-preserve (#15): a re-delivered `approval_request` (stateless
-          // register, retry) rebuilds a FRESH entry from the frame, which would
-          // otherwise CLOBBER a locally-set resolution and resurrect actionable
-          // buttons for an already-decided card. Carry the existing resolution
-          // (and its server-confirmed flag) over the refreshed payload.
-          const prev = approvals[idx];
-          const next = approvals.slice();
-          next[idx] =
-            prev.resolvedDecision !== undefined
-              ? {
-                  ...req,
-                  resolvedDecision: prev.resolvedDecision,
-                  resolutionConfirmed: prev.resolutionConfirmed,
-                }
-              : req;
-          this.setState({ approvals: next, isTyping: false });
-        }
-        return;
+          ...(msg.expiresAtMs !== undefined ? { expiresAtMs: msg.expiresAtMs } : {}),
+        });
+        // Upsert-preserve (#15) is NOT repeated here — `applyApproval` owns it,
+        // so a re-delivered `approval_request` (stateless register, retry)
+        // cannot clobber a resolution and resurrect the buttons. The rule lives
+        // in the shared reducer precisely so a REPLAY obeys it too.
+        //
+        // The LIVE frame is one of the two authorities for "this card is open
+        // right now", so it is also the one that (re-)arms interactivity.
+        this.setState({
+          messages: markApprovalActionable(merged, id),
+          isTyping: false,
+        });
+        return true;
       }
 
       case "approval_resolved": {
         const id = msg.id ?? "";
         const decision = msg.decision as ApprovalDecision | undefined;
-        // Server-confirmed resolution: set the decision AND mark it confirmed, so
-        // the snapshot reconciler treats it as authoritative (never re-sends it
-        // as a lost decision, never overwrites it with "unknown"). (#15)
-        this.patchApproval(id, (a) => ({
-          ...a,
-          resolvedDecision: decision,
-          resolutionConfirmed: true,
-        }));
-        return;
+        // ⚠️ A DECISION-LESS FRAME IS REFUSED, where this used to write
+        // `resolvedDecision: undefined` alongside `resolutionConfirmed: true` —
+        // i.e. mark a card confirmed-resolved with no outcome, which no renderer
+        // can express. The wire types `decision` as an `ApprovalDecision`, so
+        // only a malformed peer produces one, and the journal mapper refuses the
+        // same shape.
+        if (id.length === 0 || decision === undefined) return false;
+        // Server-confirmed resolution: the DECISION is durable state and the
+        // reducer folds it (`applyApprovalResolution`); `resolutionConfirmed` is
+        // client-local and marks it authoritative, so the snapshot reconciler
+        // never re-sends it as a lost decision (Leg C) and never downgrades it to
+        // the "unknown" sentinel (Leg B). (#15)
+        const merged = this.nextDurableMessages({
+          kind: "approvalResolution",
+          id,
+          decision,
+        });
+        this.setState({ messages: markApprovalConfirmed(merged, id) });
+        return true;
+      }
+
+      case "approval_decision_rejected": {
+        // #400: the plugin refused a decision before it reached the gateway —
+        // the server owns the outcome, so the optimistic mark is undone. The
+        // frame rides the peer's shared `.out`, so it touches ONLY a card still
+        // showing THIS decision as an unconfirmed guess: a device that did not
+        // click holds no guess, and a server-confirmed card is never reopened.
+        //
+        // `not-pending` is Telegram's "no longer pending" terminal receipt: the
+        // card leaves the actionable set with an unknown outcome (a later
+        // `approval_resolved` still writes the real decision over it). Every
+        // other reason — `not-approver`, or one this build
+        // does not know — restores the pre-click card, buttons included, like
+        // Telegram leaving the keyboard on an unauthorized callback.
+        const id = msg.id ?? "";
+        const decision = msg.decision;
+        const reason = msg.reason ?? "";
+        if (id.length === 0 || !isApprovalDecision(decision) || reason.length === 0) return false;
+        let changed = false;
+        const next = this.state.messages.map((m) => {
+          if (m.kind !== "approval" || m.id !== id) return m;
+          if (m.resolutionConfirmed === true || m.resolvedDecision !== decision) return m;
+          changed = true;
+          const { resolvedDecision: _guess, ...card } = m;
+          return reason === "not-pending"
+            ? { ...card, resolvedElsewhere: true, resolutionConfirmed: true, decisionRejectedReason: reason }
+            : { ...card, decisionRejectedReason: reason };
+        });
+        if (changed) this.setState({ messages: next });
+        return true;
       }
 
       case "approval_snapshot": {
@@ -2262,18 +5412,53 @@ export class WebChannelNATSClient {
         //     card the snapshot STILL lists as pending → the decision frame was
         //     lost; re-send it and keep the card resolved (every future register
         //     retries until the server confirms, so it converges hands-free).
+        //
+        // ⚠️ #242 half 4 GAVE THIS FRAME A FOURTH JOB, AND IT IS THE ONE THE
+        // SLICE EXISTS FOR: THIS IS THE ONLY THING THAT MAKES A CARD CLICKABLE
+        // AGAIN. Approvals are durable messages now, so a reconnect ALSO replays
+        // them out of `history` — and a replayed card is built without
+        // `actionable`, deliberately, because between the disconnect and now it
+        // may have expired or been decided on another device. The snapshot is
+        // exactly the authority for "what is still open", and it is emitted on
+        // EVERY successful register, unconditionally, in the same success block
+        // as the history snapshot (`nats-register.ts`'s
+        // `deps.sendApprovalSnapshot(peerId)`), so nothing has to be invented
+        // to carry that role.
+        //
+        // ⚠️ THE ARRIVAL ORDER OF `history` AND THIS FRAME IS NOT FIXED, AND
+        // BOTH ORDERS ARE HANDLED HERE. The register path calls
+        // `sendHistorySnapshot` first, but #240 half 2 made that read DEFERRED,
+        // so the approval snapshot can win the race. If the snapshot lands
+        // FIRST, Leg A inserts the card actionable and the later history row
+        // tier-1 matches it (`case "history"` walks its cursor past a match and
+        // touches nothing). If `history` lands FIRST, the card is already in the
+        // transcript and INERT — which is why the still-pending branch below
+        // RE-ARMS an existing entry instead of assuming "present ⇒ already
+        // actionable". That assumption is what the pre-half-4 code made, and it
+        // was correct only while cards could not arrive from history at all.
+        //
+        // ⚠️ THE RECONCILIATION RUNS OVER `state.messages`, NOT OVER A SIDE
+        // ARRAY. `state.approvals` is derived (`deriveApprovals`), so a card's
+        // transcript POSITION is preserved by every leg below: each patched
+        // entry is rebuilt in place, and only Leg A appends.
         const incoming = Array.isArray(msg.approvals) ? msg.approvals : [];
-        const snapshotById = new Map<string, ApprovalRequest>();
+        const snapshotById = new Map<string, ChatApprovalMessage>();
         for (const p of incoming) {
           if (!p || typeof p.id !== "string" || p.id.length === 0) continue;
           snapshotById.set(p.id, {
+            kind: "approval",
             id: p.id,
-            kind: p.kind ?? "exec",
+            approvalKind: p.kind ?? "exec",
             title: p.title ?? "",
-            description: p.description,
+            ...(p.description !== undefined ? { description: p.description } : {}),
             prompt: p.prompt ?? "",
             options: (p.options ?? []) as ApprovalOption[],
-            expiresAtMs: p.expiresAtMs,
+            ...(p.expiresAtMs !== undefined ? { expiresAtMs: p.expiresAtMs } : {}),
+            // Leg A's inserts are actionable BY CONSTRUCTION — the snapshot is
+            // the authority that says so. This is the second (and last) door
+            // through which the bit is ever set; the other is the live
+            // `approval_request` frame.
+            actionable: true,
           });
         }
         // #19: the recently-RESOLVED outcomes riding alongside the pending set.
@@ -2286,9 +5471,8 @@ export class WebChannelNATSClient {
           resolvedById.set(r.id, r.decision as ApprovalDecision);
         }
 
-        const existing = this.state.approvals;
         const seen = new Set<string>();
-        const next: ApprovalRequest[] = [];
+        const next: ChatMessage[] = [];
         let changed = false;
         // Tracks whether a NEW actionable (pending) card was rehydrated (Leg A),
         // so we clear the typing indicator in parity with the live
@@ -2296,62 +5480,108 @@ export class WebChannelNATSClient {
         // BLOCKED on the user, not still working.
         let rehydratedActionable = false;
 
-        for (const a of existing) {
-          seen.add(a.id);
+        for (const m of this.state.messages) {
+          // Every other transcript kind passes straight through: this frame
+          // reconciles approval state and says nothing about bubbles, reasoning
+          // blocks or tool calls.
+          if (m.kind !== "approval") {
+            next.push(m);
+            continue;
+          }
+          seen.add(m.id);
           // Defense in depth: an id in BOTH the pending `approvals` and the
           // `resolved` lists is impossible server-side (finalize deletes the
           // pending entry and records the resolved outcome in ONE synchronous
           // step before publishing), but if it ever happens the TERMINAL outcome
           // must win — never keep/make the card actionable. So a resolved-listed
           // id is routed to the resolved-upgrade branches below, ignoring `snap`.
-          const snap = resolvedById.has(a.id) ? undefined : snapshotById.get(a.id);
+          const snap = resolvedById.has(m.id) ? undefined : snapshotById.get(m.id);
+          // "Answered" in ANY of the three ways a card can be: the server told
+          // us, we guessed optimistically in `decide()`, or a previous Leg B
+          // recorded that somebody else answered it.
+          const answered =
+            m.resolvedDecision !== undefined || m.resolvedElsewhere === true;
           if (snap) {
-            if (a.resolvedDecision === undefined) {
-              // Present + unresolved: already actionable with the full payload
-              // (an approval is immutable once minted), so keep the existing
-              // entry — a duplicate snapshot stays a no-op.
-              next.push(a);
-            } else if (!a.resolutionConfirmed && a.resolvedDecision !== "unknown") {
+            if (!answered) {
+              // Present + unresolved: actionable with the full payload (an
+              // approval is immutable once minted), so the payload is NOT
+              // rebuilt from the snapshot — a duplicate snapshot must stay a
+              // no-op. The one thing that may need changing is the bit: a card
+              // hydrated from `history` is inert until this frame arms it.
+              if (m.actionable !== true) {
+                next.push({ ...m, actionable: true });
+                changed = true;
+              } else {
+                next.push(m);
+              }
+            } else if (m.resolutionConfirmed !== true && m.resolvedDecision !== undefined) {
               // Leg C: re-send the lost decision, keep the card resolved. Stays
               // unconfirmed so the next register retries until the server echoes
-              // an authoritative `approval_resolved`.
+              // an authoritative `approval_resolved`. A `resolvedElsewhere` card
+              // has no decision to re-send and is excluded by the second
+              // conjunct — the same carve-out the old `!== "unknown"` test made.
               this.deferOrRunReplacementOperation({
-                kind: "approval-decision", id: a.id, decision: a.resolvedDecision,
+                kind: "approval-decision", id: m.id, decision: m.resolvedDecision,
               });
-              next.push(a);
+              next.push(m);
             } else {
               // Server-confirmed resolution wins over a stale-by-ms snapshot.
-              next.push(a);
+              next.push(m);
             }
-          } else if (a.resolvedDecision === undefined) {
+          } else if (!answered) {
             // Leg B: decided/expired while we weren't looking — no longer
             // actionable, server-confirmed (authoritative). #19: show the ACTUAL
-            // outcome if the snapshot carried it, else the "unknown" sentinel.
-            const outcome = resolvedById.get(a.id);
-            next.push({
-              ...a,
-              resolvedDecision: outcome ?? "unknown",
-              resolutionConfirmed: true,
-            });
-            changed = true;
-          } else if (!a.resolutionConfirmed) {
-            // Optimistic decision the server no longer has pending — our decision
-            // (or another device's) won. #19: if the snapshot's resolved outcome
-            // DIFFERS from our optimistic guess, the SERVER decision wins;
-            // otherwise just confirm what we already showed.
-            const outcome = resolvedById.get(a.id);
+            // outcome if the snapshot carried it, else the "unknown" sentinel,
+            // which rides `resolvedElsewhere` because it is a reconciliation
+            // outcome and not a decision anyone made.
+            const outcome = resolvedById.get(m.id);
             next.push(
-              outcome !== undefined && outcome !== a.resolvedDecision
-                ? { ...a, resolvedDecision: outcome, resolutionConfirmed: true }
-                : { ...a, resolutionConfirmed: true },
+              outcome !== undefined
+                ? settleApprovalFromServer(m, outcome)
+                : { ...m, resolvedElsewhere: true, resolutionConfirmed: true },
             );
             changed = true;
+          } else if (m.resolutionConfirmed !== true) {
+            // Optimistic decision the server no longer has pending. #19: the
+            // snapshot's resolved outcome, when it carries one, is the SERVER's
+            // decision and wins over our guess.
+            //
+            // #400: when it carries NONE, the guess is NOT confirmed. Absence
+            // from both lists proves only "no longer pending here" — a plugin
+            // restart, the 60-min TTL or the 512 cap drops a card the click
+            // never resolved (a refused or lost decision included). So the
+            // guess is dropped and the card lands on Leg B's "unknown" sentinel.
+            // Every server-sourced decision (live frame, history row,
+            // difference event) is already confirmed, so the only
+            // `resolvedDecision` reaching this branch is a guess.
+            const outcome = resolvedById.get(m.id);
+            if (outcome !== undefined) {
+              next.push(settleApprovalFromServer(m, outcome));
+            } else {
+              const { resolvedDecision: _guess, ...card } = m;
+              next.push({ ...card, resolvedElsewhere: true, resolutionConfirmed: true });
+            }
+            changed = true;
           } else {
-            next.push(a);
+            // Confirmed already. #400: a card retired as "unknown" (Leg B or a
+            // `not-pending` refusal) is upgraded when the snapshot now names
+            // the verdict; any other confirmed card is left as it is.
+            const outcome = resolvedById.get(m.id);
+            const settled =
+              outcome !== undefined && m.resolvedElsewhere === true
+                ? settleApprovalFromServer(m, outcome)
+                : m;
+            if (settled !== m) changed = true;
+            next.push(settled);
           }
         }
 
         // Leg A: snapshot ids with no local entry → rehydrate as pending cards.
+        //
+        // Appended at the TAIL, which is where a still-open prompt belongs and is
+        // also what `applyApproval` would do for a first-seen id. A later
+        // `history` page carrying the same card tier-1 matches it by
+        // (kind, id) and does not duplicate it.
         for (const [id, snap] of snapshotById) {
           if (seen.has(id)) continue;
           // Defense in depth (see the loop above): an id present in BOTH lists is
@@ -2364,44 +5594,124 @@ export class WebChannelNATSClient {
 
         if (changed) {
           this.setState({
-            approvals: next,
+            messages: next,
             ...(rehydratedActionable ? { isTyping: false } : {}),
           });
         }
-        return;
+        return true;
       }
 
       case "progress": {
         const { id } = msg;
         const text = msg.text ?? "";
-        this.upsertMessage(
-          id ?? "",
-          (prev) => ({ ...prev, text, working: true, turnId: msg.turnId ?? prev.turnId }),
-          { id: id ?? "", role: "agent", text, working: true, turnId: msg.turnId },
+        // NULLISH, not truthy: `""` survives as a real id here, and the reducer's
+        // `placement` mirrors that (BOUNDARY 1 — it is the `bubble` site below
+        // that treats `""` as id-less, and the two genuinely differ).
+        const answerId = id ?? "";
+        // `draftOnly` is only ever CLAIMED, never ADDED to a bubble that already
+        // exists without it. The bit is what makes a bubble droppable at turn end
+        // (`isSpentDraft`), so adding it to a bubble that already holds authored
+        // durable text would let a single stray `progress` frame turn a delivered
+        // answer into a DELETED one:
+        //
+        //   agent_message A "FINAL ANSWER"  → [A "FINAL ANSWER"]
+        //   progress      A "Working…"      → [A "Working…", draftOnly]
+        //   turn_settled                    → []            ← answer destroyed
+        //
+        // Such a frame should never arrive (see the UNGUARDED INVARIANT note on
+        // `applyPlacement`), but "should never" is not a reason to make the
+        // failure unrecoverable. This project's own ordering says so:
+        // `message-adapter.ts:1760-1761` — a visible duplicate is recoverable
+        // where a deletion is not (M212g). So a plugin-guard regression stays a
+        // wrong-text bug, repairable by the turn's `turn_snapshot`, exactly as it
+        // was before the reducer rewiring.
+        //
+        // A bubble that is ALREADY `draftOnly` keeps the bit (idempotent
+        // re-claim), and an absent one claims it — that is the normal path, and
+        // it is what keeps the rolling draft out of the durable projection
+        // (§15.9) while it still renders.
+        // ⚠️ `m.kind === undefined` IS PART OF THE PREDICATE, exactly as in
+        // `patchBubbleByReceiptKey` — the two id spaces are not provably
+        // disjoint (`durable-view-reducer.ts`'s `findTextIndex` docblock), and a
+        // reasoning entry found here reads as a bubble with `draftOnly`
+        // undefined, so `claimsDraft` goes false, the overlay omits `draftOnly`,
+        // and the rolling draft never becomes droppable at turn end — it freezes
+        // as durable text.
+        const heldBubble = this.state.messages.find(
+          (m) => m.kind === undefined && m.id === answerId,
+        );
+        const claimsDraft = heldBubble === undefined || heldBubble.draftOnly === true
+          || this.replayPlacementIds.has(answerId);
+        this.replayPlacementIds.delete(answerId);
+        this.applyDurable(
+          {
+            kind: "placement",
+            answerId,
+            ...(msg.turnId === undefined ? {} : { turnId: msg.turnId }),
+          },
+          { [answerId]: { working: true, text, ...(claimsDraft ? { draftOnly: true } : {}) } },
         );
         this.setState({ isTyping: false });
         // P1-9 §3.6.2: a progress upsert on a watched draft proves the turn is
         // still alive — disarm its staleness entry.
-        this.staleDraftWatch.delete(id ?? "");
-        return;
+        this.staleDraftWatch.delete(answerId);
+        return true;
       }
 
       case "reasoning": {
-        if (!msg.id || !msg.turnId || typeof msg.text !== "string" || msg.text.length === 0) return;
-        this.upsertReasoning({ id: msg.id, turnId: msg.turnId, text: msg.text });
+        if (!msg.id || !msg.turnId || typeof msg.text !== "string" || msg.text.length === 0) {
+          return false;
+        }
+        // ⚠️ #242 half 2: THROUGH THE SHARED REDUCER, like every other durable
+        // frame. Half 1 called a private `upsertReasoning` over a side array;
+        // that method is deleted, and with it the second implementation the v6
+        // bet cannot afford (N8). The event is byte-identical to the one
+        // `journalEventForOutbound` records for this burst's `final` frame, so a
+        // replay folds the same transition this line does.
+        //
+        // ⚠️ EVERY FRAME, NOT JUST `final`. `msg.final` is deliberately not read
+        // here: the lane streams cumulative FULL text and `applyReasoning` is an
+        // upsert by id, so applying each frame renders the burst live and
+        // converges on exactly the text the `final` frame carries — which is the
+        // text that gets journaled. Gating on `final` would leave the live lane
+        // blank until the burst closed.
+        //
+        // ⚠️ WHAT THIS COSTS. A reasoning frame arrives per cumulative token
+        // update with no throttle, and each one now projects and re-merges the
+        // WHOLE transcript instead of walking a ≤100-entry side array. It is the
+        // same per-frame O(messages) the other durable frames already pay, and
+        // taking a cheaper private path would be the second implementation
+        // again — so the cost is accepted here and tracked as **#310**, not
+        // worked around. (Named rather than left as "its own issue": every other
+        // deferral in this slice cites a number, and an uncited one is a claim
+        // the next reader cannot check.)
+        this.applyDurable({
+          kind: "reasoning",
+          id: msg.id,
+          turnId: msg.turnId,
+          text: msg.text,
+        });
         // P1-9 §3.6.2: reasoning correlates by turnId — disarm any watched draft
         // for this turn (the turn is demonstrably still producing frames).
         this.disarmStaleDraftsByTurn(msg.turnId);
-        return;
+        return true;
       }
 
       case "tool_activity": {
         // #97: structured tool-call activity. Required correlation keys `id` and
         // `turnId` must be non-empty strings; drop otherwise. Only the KEY NAMES
         // in `argKeys` are carried — no arg values ever reach state.
-        if (typeof msg.id !== "string" || msg.id.length === 0) return;
-        if (typeof msg.turnId !== "string" || msg.turnId.length === 0) return;
-        this.upsertToolActivity({
+        if (typeof msg.id !== "string" || msg.id.length === 0) return false;
+        if (typeof msg.turnId !== "string" || msg.turnId.length === 0) return false;
+        // ⚠️ #242 half 3: THROUGH THE SHARED REDUCER, NOT A SIDE ARRAY. The
+        // event is the FRAME, verbatim — a delta. `applyTool` folds it onto the
+        // call it refines, which is why the terminal frame's missing `name` and
+        // `argKeys` do not blank the ones `start` carried. The admission rule
+        // (non-empty string id AND turnId) is the one `journalEventForOutbound`
+        // tracks, so nothing is journaled that this refuses and nothing is
+        // refused that gets journaled.
+        this.applyDurable({
+          kind: "tool",
           id: msg.id,
           turnId: msg.turnId,
           ...(typeof msg.name === "string" ? { name: msg.name } : {}),
@@ -2410,6 +5720,8 @@ export class WebChannelNATSClient {
           ...(typeof msg.summary === "string" ? { summary: msg.summary } : {}),
           // Trust boundary: the wire is untrusted; keep only string key names
           // (the "argKeys are key names only" contract) and drop anything else.
+          // It survives to disk unchanged — the plugin's mapper applies the SAME
+          // filter, so a hostile value cannot enter the journal by either door.
           ...(Array.isArray(msg.argKeys)
             ? { argKeys: msg.argKeys.filter((k): k is string => typeof k === "string") }
             : {}),
@@ -2417,14 +5729,23 @@ export class WebChannelNATSClient {
         // Like reasoning, a tool_activity frame correlates by turnId and proves
         // the turn is still producing frames — disarm any watched stale draft.
         this.disarmStaleDraftsByTurn(msg.turnId);
-        return;
+        return true;
       }
 
+      case "request_state": {
+        if (!msg.id || !msg.state) return false;
+        this.applyDurable({ kind: "requestState", id: msg.id, state: msg.state,
+          ...(typeof msg.retriedBy === "string" && msg.retriedBy.length > 0 ? { retriedBy: msg.retriedBy } : {}) });
+        this.reconcileRequestStates();
+        return true;
+      }
       case "turn_settled": {
+        if (msg.turnId) this.retireBufferedProgress(msg.turnId);
         // Consume before outcome promotion or UI settlement: either operation
         // can fan out synchronously, and a delayed publish callback must not open
         // a turn whose settle has already arrived.
         const turnPlacement = this.consumeTurnOpeningsThrough(msg.turnId);
+        if (msg.turnId) this.settleApplicationTurnsThrough(msg.turnId);
         // P0-4 (§1): promote the exact send named by an EXPLICIT outcome.
         // `"ok"` → `accepted → completed` where turnId === wireId; `"error"`
         // → `failed{turn-failed, retryable:true}`. The current plugin emits one
@@ -2458,7 +5779,12 @@ export class WebChannelNATSClient {
         // draft whose turnId matches (in the normal flow the final agent_message
         // already did this, a no-op). Never swaps the id.
         this.finalizeDraftsForTurn(msg.turnId);
-        return;
+        if (!this.hasAcceptedApplicationTurn()) this.cancelActiveTurnStallTimer();
+        return true;
+      }
+
+      case "turn_snapshot": {
+        return this.applyTurnSnapshot(msg);
       }
 
       case "agent_message": {
@@ -2466,41 +5792,79 @@ export class WebChannelNATSClient {
         const assistantMessageIndex = normalizeAssistantMessageIndex(
           msg.assistantMessageIndex,
         );
-        this.setState({ isTyping: false });
 
         if (id) {
-          this.upsertMessage(
-            id,
-            (prev) => ({
-              ...prev,
-              text: text ?? "",
-              working: false,
-              turnId: msg.turnId ?? prev.turnId,
-              ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
-            }),
+          this.applyDurable(
             {
-              id,
-              role: "agent",
+              kind: "bubble",
+              answerId: id,
               text: text ?? "",
-              working: false,
-              turnId: msg.turnId,
-              ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
+              ...(msg.turnId === undefined ? {} : { turnId: msg.turnId }),
             },
+            {
+              [id]: {
+                working: false,
+                // Durable text has been authored, so the bubble is no longer a
+                // draft — this is what makes it survive the turn end.
+                draftOnly: undefined,
+                ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
+              },
+            },
+            { isTyping: false },
           );
           // P1-9 §3.6.2: the final upsert also proves liveness — disarm.
           this.staleDraftWatch.delete(id);
-          return;
+          return true;
         }
 
-        this.appendMessage({
-          id: `a-${this.uid()}`,
-          role: "agent",
-          text: text ?? "",
-          turnId: msg.turnId,
-          ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
-        });
-        return;
+        // Preserve the legacy id-less path's existing two public transitions:
+        // typing clears before the client-local bubble id is minted/applied.
+        this.setState({ isTyping: false });
+
+        // LEGACY-PLUGIN PATH ONLY. Since #238 every durable egress site mints an
+        // id at the delivery act, so a durable frame reaching here means an older
+        // plugin build. The text is never dropped (NOT-list N10): it still gets a
+        // bubble, via a client-local `a-<n>`.
+        //
+        // Minting that id and feeding it to the reducer is admissible precisely
+        // because it NEVER LEAVES THE CLIENT. What BOUNDARY 1 forbids (N4/N5) is
+        // a viewer-minted id entering the SHARED EVENT STREAM, where it would
+        // write viewer-side identity into the SSOT. Kept inside this local view
+        // it does the opposite of harm: routing it through the reducer is what
+        // removes the N8 divergence the old `appendMessage` branch created, where
+        // the live view held a bubble the reducer's view did not.
+        const mintedId = this.mintLocalBubbleId("a");
+        if (!this.warnedIdlessDurableFrame) {
+          this.warnedIdlessDurableFrame = true;
+          console.warn(
+            "[nats-wrapper] durable agent_message arrived without an id; " +
+              "rendering it under a client-local id. This is a legacy-plugin " +
+              "path — since #238 the plugin mints the id at the delivery act.",
+          );
+        }
+        this.applyDurable(
+          {
+            kind: "bubble",
+            answerId: mintedId,
+            text: text ?? "",
+            ...(msg.turnId === undefined ? {} : { turnId: msg.turnId }),
+          },
+          assistantMessageIndex !== undefined
+            ? { [mintedId]: { assistantMessageIndex } }
+            : undefined,
+        );
+        return true;
       }
     }
+    // ⚠️ NO `default:`, AND FALLING OFF THE END IS STILL THE IGNORE — this is
+    // the same deliberate absence `durable-view-reducer.ts`'s BOUNDARY note
+    // describes for LIVE frames: a type from a newer server does nothing rather
+    // than throwing. What changed in #246 half A is only that the ignore is now
+    // EXPLICIT (`false` — not folded) instead of an implicit `undefined`, and
+    // that the frame no longer gets this far: the door decoder refuses an
+    // unknown type with one warn. Nothing hangs on the value either way, because
+    // an unknown type is not in `SEQ_BEARING_INBOUND_TYPES` and so never reaches
+    // the cursor.
+    return false;
   }
 }

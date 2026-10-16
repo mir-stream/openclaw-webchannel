@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs";
+import { resolveDmPolicy, validateDmConfig } from "./dm-allowlist.js";
+import { StorageIssuerError } from "./storage-issuer.js";
 
 import type {
   BaseProbeResult,
@@ -22,6 +24,8 @@ import {
   listWebchannelAccountIds,
   loadPersistedCredentialDocument,
   RemovedAudienceConfigError,
+  resolveDefaultWebchannelAccountSelection,
+  resolveWebchannelAccountId,
 } from "./account-config.js";
 import { createMemoizedPersistedAccessor, prepareAccountAuth } from "./account-auth.js";
 import type { AuthConfig, ResolvedJwtVerifierConfig } from "./auth.js";
@@ -50,11 +54,16 @@ import {
 
 export type DoctorCheckId =
   | "invalid-account-id"
+  | "invalid-default-account"
   | "configuration-invalid"
+  | "dm-policy-invalid"
+  | "legacy-dm-security"
   | "encryption-disabled"
   | "creds-missing"
   | "credential-binding-failed"
   | "credential-storage-failed"
+  | "legacy-agent-nats-scope"
+  | "storage-issuer-failed"
   | "identity-key-missing"
   | "verifier-unbuildable"
   | "audience-override-removed"
@@ -83,6 +92,26 @@ export type DoctorDeps = {
 const reEnrollFix = (accountId: string) =>
   `Run: openclaw channels add --channel webchannel --account ${accountId}`;
 
+/** Advisory only: the relay verifies the JWT; old grants remain valid. */
+function legacyAgentScope(userJwt: string, tenant: string, accountId: string): string | undefined {
+  try {
+    const claim = JSON.parse(Buffer.from(userJwt.split(".")[1], "base64url").toString("utf8"));
+    if (!claim?.nats || typeof claim.nats !== "object") return undefined;
+    const own = `webchannel.${tenant}.${accountId}.`;
+    const broad = [claim.nats.pub, claim.nats.sub].some(permission => {
+      const allow = permission?.allow;
+      return !Array.isArray(allow) || allow.length === 0 ||
+        allow.some((subject: unknown) => typeof subject !== "string" || !subject.startsWith(own));
+    });
+    if (!broad) return undefined;
+    return typeof claim.exp === "number" && Number.isFinite(claim.exp)
+      ? "Previously issued NATS grants are not limited to this account and remain accepted until expiry (unless revoked)."
+      : "Previously issued NATS grants are not limited to this account and have no expiry; they will not narrow automatically.";
+  } catch {
+    return undefined;
+  }
+}
+
 function futureConversationKeyDiagnostic(input: {
   tenant: string;
   accountId: string;
@@ -102,6 +131,27 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
   const injectedLoadCreds = deps.loadPersistedEnrolledCreds;
   const findings: DoctorFinding[] = [];
   const top = cfg as { nats?: { url?: string }; saas?: { baseUrl?: string } };
+
+  const selection = resolveDefaultWebchannelAccountSelection(cfg);
+  if (selection.invalidConfiguredDefault) {
+    const hasFallback = selection.accountIds.includes(selection.accountId);
+    const fallback = !hasFallback
+      ? "No valid listed account is available; no fallback account can start."
+      : `The selected fallback is ${JSON.stringify(selection.accountId)}` +
+        (isWebchannelAccountEnabled(cfg, selection.accountId)
+          ? "; selection does not imply that it is running."
+          : ", which is disabled and will not serve.");
+    findings.push({
+      accountId: selection.accountId,
+      checkId: "invalid-default-account",
+      kind: "config",
+      severity: "warn",
+      message: `Configured defaultAccount ${JSON.stringify(selection.configuredDefaultAccount)} does not exactly name a valid listed account. ${fallback}`,
+      fix: hasFallback
+        ? `Set channels.webchannel.defaultAccount to an exact listed id (${selection.accountIds.map((id) => JSON.stringify(id)).join(", ")}), or remove defaultAccount to use the existing fallback order.`
+        : "Correct the invalid/colliding account entries, then set channels.webchannel.defaultAccount to an exact valid listed id or remove the preference.",
+    });
+  }
 
   const inspection = inspectWebchannelAccountIds(cfg);
   for (const invalid of inspection.invalid) {
@@ -148,6 +198,25 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
 
   for (const plan of plans) {
     const { accountId, account, tenant } = plan;
+    try {
+      validateDmConfig(account);
+    } catch (error) {
+      findings.push({ accountId, checkId: "dm-policy-invalid", kind: "config", severity: "error",
+        message: errorMessage(error),
+        fix: 'Set dmPolicy to pairing, allowlist, open or disabled. For open (including the default), explicitly set allowFrom: ["*"]. For allowlist, provide at least one sender ID.',
+      });
+    }
+    if (account.dmSecurity !== undefined) {
+      let policy: string | undefined;
+      try { policy = resolveDmPolicy({ dmSecurity: account.dmSecurity }); } catch { policy = undefined; }
+      const migration = policy === undefined
+        ? "otherwise choose an explicit supported dmPolicy (pairing, allowlist, open or disabled), then remove dmSecurity"
+        : `otherwise replace dmSecurity with dmPolicy=${JSON.stringify(policy)}`;
+      findings.push({ accountId, checkId: "legacy-dm-security", kind: "config", severity: "warn",
+        message: "dmSecurity is deprecated; dmPolicy is the canonical SDK field.",
+        fix: `At the defining channel/account config block, if dmPolicy is already set there, preserve it and remove only dmSecurity; ${migration}. Open requires explicit allowFrom: ["*"]. Keep peer IDs case-sensitive; webchannel: prefixes are normalized.`,
+      });
+    }
     const nats = account.nats as WebchannelNatsConfig | undefined;
     try {
       resolveEncryptionPolicy(account.encryption as WebchannelEncryptionConfig | undefined);
@@ -210,6 +279,7 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
       return persisted;
     };
 
+    let agentUserJwt = source.mode === "static" ? source.userJwt : undefined;
     if (source.mode === "enrolled") {
       let enrolled: PersistedEnrolledCreds | undefined;
       try {
@@ -221,6 +291,7 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
             accountId,
             saasBaseUrl: source.saasBaseUrl,
           }, {
+            migrateLegacy: false,
             ...(source.storageRoot !== undefined
               ? { storageRoot: source.storageRoot }
               : {}),
@@ -290,6 +361,20 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
           fix: `${reEnrollFix(accountId)} to mint an attested identity key.`,
         });
       }
+      agentUserJwt = enrolled?.userJwt;
+    }
+
+    const legacyScope = agentUserJwt && legacyAgentScope(agentUserJwt, tenant, accountId);
+    if (legacyScope) {
+      findings.push({
+        accountId, checkId: "legacy-agent-nats-scope", kind: "auth", severity: "warn",
+        message: legacyScope,
+        fix: "Upgrade SaaS and plugin together. If storage issuer checks pass for the same trusted issuer, stop this account, " +
+          "archive only its credential file (keep history and conversation keys), " +
+          `complete any required SaaS active-key replacement, then re-enroll: ${reEnrollFix(accountId)}. ` +
+          "If storage-issuer-failed is also reported, first follow docs/STORAGE_IDENTITY_V2.md#issuer-binding-412 to restore the original trusted issuer and matching credentials where supported, or archive the complete tuple and initialize fresh state; credential reissue cannot bypass that error. " +
+          "Confirm the new grant before explicitly revoking an old non-expiring credential.",
+      });
     }
 
     // An injected credential reader is a complete persistence seam for doctor
@@ -333,11 +418,11 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
     } catch (err) {
       findings.push({
         accountId,
-        checkId: "verifier-unbuildable",
+        checkId: err instanceof StorageIssuerError ? "storage-issuer-failed" : "verifier-unbuildable",
         kind: "config",
         severity: "error",
         message: errorMessage(err),
-        fix: "Correct the effective JWT issuer and exactly-one JWKS source named above.",
+        fix: err instanceof StorageIssuerError ? err.fix : "Correct the effective JWT issuer and exactly-one JWKS source named above.",
       });
     }
   }
@@ -382,7 +467,9 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
 }
 
 export function formatDoctorWarning(finding: DoctorFinding): string {
-  const prefix = finding.checkId === "invalid-account-id"
+  const prefix = finding.checkId === "invalid-default-account"
+    ? "channels.webchannel.defaultAccount"
+    : finding.checkId === "invalid-account-id"
     ? `channels.webchannel.accounts[${JSON.stringify(finding.accountId)}]`
     : `channels.webchannel.${finding.accountId}`;
   return `- ${prefix}: ${finding.severity.toUpperCase()} [${finding.checkId}] ${finding.message} Fix: ${finding.fix}`;
@@ -428,9 +515,10 @@ export async function probeWebchannelAccount(params: {
   timeoutMs: number;
   cfg: OpenClawConfig;
 }, deps: ProbeDeps = {}): Promise<WebchannelProbe> {
-  const accountId = params.account.accountId ?? "default";
+  const resolvedId = resolveWebchannelAccountId(params.cfg, params.account.accountId);
+  const accountId = resolvedId ?? params.account.accountId ?? "default";
   try {
-    if (!listWebchannelAccountIds(params.cfg).includes(accountId)) {
+    if (resolvedId === undefined) {
       throw new Error(`account ${accountId} is not configured`);
     }
     const plan = planWebchannelAccount(params.cfg, accountId, {
@@ -473,6 +561,7 @@ export async function probeWebchannelAccount(params: {
             accountId,
             saasBaseUrl: source.saasBaseUrl,
           }, {
+            migrateLegacy: false,
             ...(source.storageRoot !== undefined
               ? { storageRoot: source.storageRoot }
               : {}),

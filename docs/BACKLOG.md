@@ -24,12 +24,12 @@ delay traffic and observe who-talks-to-whom.
 compromise / revocation (handled via re-enrollment); real-time allowlist authz (a core-delegated
 stub).
 
-## S1 — accountId-aware outbound facade (proactive/approval outbound is primary-account-only) — **cross-account disclosure risk**
+## S1 — accountId-aware outbound facade (approvals ✅ 2026-07-04, outbound ✅ 2026-09-14; F3 residual open) — **cross-account disclosure risk**
 
 **Origin:** PR #5 (multiplex / 가-2 rename) adversarial review, 2026-07-01. Deferred, previously
 untracked (this entry is the first written record outside the session notes).
 
-**Current behavior** (`packages/plugin/index-nats.ts`, "lazy transport facade"): the plugin core
+**Behavior before #376** (`packages/plugin/src/nats-account-runtime.ts`, "lazy transport facade"): the plugin core
 is created once at module load against a single `lazyTransport` Proxy; after `account startup` builds
 one `NatsChannel` per account, the Proxy is bound to **one PRIMARY channel** (`"default"`, else the
 first built account). Everything the core initiates **without a per-message account context** rides
@@ -83,18 +83,25 @@ accounts via `listAccountIds`, reads per-account `execApprovals`, and `deliverPe
   but `account startup` skipped — creds-missing/connect-fail), the prompt is DROPPED, never routed to
   the closure/primary channel (which would re-open the misroute). Legacy WS (no resolver) keeps the
   single closure transport.
-- [ ] **F3 (residual, deferred to the outbound leg)** — an approval with NEITHER `turnSourceAccountId`
-  NOR a session-bound account is claimed by every account's handler (SDK matcher) → fans out to all
-  LIVE accounts' channels. Only reachable via AGENT-INITIATED / cron approvals (a user turn always
-  carries the account). Belongs to the proactive/untargeted outbound leg below (needs outbound-
-  account semantics). F2 bounds the blast radius to live channels.
+- [ ] **F3 (residual, now standalone — the only open item in §S1)** — an approval with NEITHER
+  `turnSourceAccountId` NOR a session-bound account is claimed by every account's handler (SDK
+  matcher) → fans out to all LIVE accounts' channels. Only reachable via AGENT-INITIATED / cron
+  approvals (a user turn always carries the account). It no longer waits on the outbound leg (that
+  landed in #376, below); the open question is how an approval with no account context at all should
+  be scoped. F2 bounds the blast radius to live channels.
 
-**Proactive/untargeted outbound leg (separate, still open):** core-initiated untargeted sends
-(`untargeted recipient guessing` etc.) may still be account-blind at a different seam — decide semantics
-(all accounts? per-account targeting? startup guard on the unsupported combination?) when
-agent-initiated outbound is built. Until the approvals leg lands, the interim posture stands:
-approvals on a multi-account gateway deliver via the primary channel only (misroute/drop for
-non-primary turns).
+**Proactive/untargeted outbound leg — ✅ DONE 2026-09-14 (PR #376, closes the #371 defect):** both
+core-initiated send surfaces (`outbound.sendText` in `channel.ts`, `message.send.text` in
+`message-adapter.ts`) now resolve the LIVE runtime of `ctx.accountId` at each send
+(`outbound-account.ts`), so the tenant, conversation key, delivery journal and subject are that
+account's. Decided semantics: **per-account by `ctx.accountId`**; an **unscoped** (null/undefined)
+send selects the listed default — configured `defaultAccount` when it exactly names a listed
+account, else `default`, else the alphabetically first configured account; a target that is missing, removed, disposed or
+disconnected **fails the send with no fallback** to any other account; and core's **canonical id
+form** (it lowercases/dash-trims on the message-tool, heartbeat and routed-reply paths while
+starting accounts under the listed spelling) is tolerated at the runtime lookup — unambiguous
+because `inspectWebchannelAccountIds` already rejects configured ids that share a normalized form.
+The primary-channel Proxy binding described above is deleted.
 
 **Telegram benchmark (2026-07-04, analysis only — deferred):** Telegram has no equivalent
 ambiguity: (1) its addressing is account-scoped by construction (a chatId belongs to one

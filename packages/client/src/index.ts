@@ -1,5 +1,5 @@
 /**
- * Public API for `@mir-stream/webchannel-client` — a framework-agnostic, zero-dependency
+ * Public API for `openclaw-webchannel-client` — a framework-agnostic, zero-dependency
  * browser client carrying WebChannel's *functionality* (NATS connection,
  * reconnect, wire protocol, progress drafts, approvals, transcript state)
  * WITHOUT React. Wrap it in any UI (vanilla DOM, Vue, or a thin React hook).
@@ -31,6 +31,13 @@ export { filterCommandCatalog } from "./command-filter.js";
 export type {
   ChatRole,
   ChatMessage,
+  // #242 half 2: `ChatMessage` is a tagged union now, so an embedder that wants
+  // to name ONE arm — a `renderBubble(m: ChatBubble)` helper, say — needs the
+  // members too. Exporting only the union would force `Extract<…>` gymnastics at
+  // every call site.
+  ChatBubble,
+  ChatReasoningMessage,
+  ChatToolMessage,
   ReasoningItem,
   ToolActivityItem,
   ApprovalDecision,
@@ -39,11 +46,13 @@ export type {
   ConnectionStatus,
   WebChannelErrorCause,
   WebChannelState,
+  HistoryOmission,
   WebChannelOptions,
   Listener,
   CommandCatalogEntry,
   CommandCatalogArg,
   // P0-4: the observable send-result contract.
+  RequestState,
   SendState,
   SendFailure,
   SendReceipt,

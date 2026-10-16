@@ -6,6 +6,21 @@
 - OpenClaw 기준 버전: `2026.6.10` (plugin/gateway minimum과 devDependency 모두 동일)
 - 후속: transport-generation 격리는 이 기획서에서 분리해 [#100](https://github.com/mir-stream/openclaw-webchannel/issues/100) (Phase 2)로 넘긴다 → §7
 
+> 🔴 **정정 ([#267](https://github.com/mir-stream/openclaw-webchannel/issues/267), 0.7.0 실측)** — 이 기획서의
+> 전제 하나가 틀렸다. §2·§7의 *"`stopAgentLifecycleSubscription()`은 host teardown에서만 호출된다"* 는
+> 거짓이다: `registerFull`이 이 함수의 **양쪽 끝**을 배선하고(`startAgentLifecycleSubscription`의
+> replace-don't-stack 경로 + runtime-lifecycle `cleanup`), 호스트는 load profile마다 플러그인을 재등록한다.
+> 라이브 게이트웨이 실측으로 **한 턴 안에서 4회** 회전했고, 그 결과 `createLease()`→`onAgentRunStart` 창을
+> 넘긴 lease가 증명 불가로 박혀 **모든 승인이 `active_no_match`로 드롭**됐다.
+> 지금 barrier는 승인 스트림 자신의 수명(`startClawApprovalMonitor`)에 붙어 있고, `activate()`는 생성
+> epoch을 보지 않는다(시작 시각을 activate에서 읽으므로 항상 post-barrier다).
+>
+> - 시계 연속성도 함께 정정한다: backwards baseline은 epoch를 닫되 clock high-water를 낮추지 않고,
+>   이후 rotation이 그 high-water 이상에 도달할 때만 trust를 복구한다. 새 barrier는 관측된 모든 pre-jump stamp를
+>   가두며, 미관측 stamp의 잔여 사례는 [#274](https://github.com/mir-stream/openclaw-webchannel/issues/274)가 소유한다.
+>
+> 아래 본문의 rotate 위치·dormant handle 서술은 **그 정정 전 기준**으로 읽어라.
+
 ---
 
 ## 1. 고정 의도와 범위

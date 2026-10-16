@@ -4,10 +4,21 @@ import {
 } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import type { ChannelDoctorAdapter, ChannelStatusAdapter } from "openclaw/plugin-sdk/channel-contract";
+import { buildAccountScopedDmSecurityPolicy } from "openclaw/plugin-sdk/channel-policy";
+import { waitUntilAbort } from "openclaw/plugin-sdk/channel-runtime";
+import type { DmPolicy } from "openclaw/plugin-sdk/config-contracts";
+import { normalizeDmAllowEntry, resolveDmPolicy } from "./dm-allowlist.js";
 
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
-import { createClawMessageAdapter } from "./message-adapter.js";
+import { logSafe } from "./log-safe.js";
+import { createClawMessageAdapter, nextMessageId } from "./message-adapter.js";
+import { resolveOutboundTransport, type ResolveOutboundTransport } from "./outbound-account.js";
+import {
+  createWebchannelMessagingAdapter,
+  requireOutboundPeerId,
+  type ResolveServingScope,
+} from "./outbound-target.js";
 import {
   createClawApprovalCapability,
   startClawApprovalMonitor,
@@ -19,9 +30,8 @@ import {
   hasWebchannelConfig,
   inspectWebchannelAccountIds,
   isWebchannelAccountEnabled,
-  listWebchannelAccountIds,
-  readAccountsMap,
-  readWebchannelSection,
+  resolveDefaultWebchannelAccountId,
+  resolveWebchannelAccountId,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { webchannelSetup } from "./setup.js";
@@ -32,10 +42,8 @@ import {
   type WebchannelProbe,
 } from "./doctor.js";
 
-// Single default account id for Phase 1. `listAccountIds` MUST return ≥1 entry
-// and the plugin MUST expose `gateway.startAccount`, otherwise core's channel
-// monitor (`startChannelInternal`) short-circuits and never starts the native
-// approval bootstrap (verified at 2026.7.1-2). We
+// The plugin exposes `gateway.startAccount` so core's channel monitor can start
+// the native approval bootstrap for each valid listed account. We
 // register the `approval.native` runtime context from that monitor; see
 // startClawApprovalMonitor in src/approvals.ts.
 //
@@ -48,10 +56,10 @@ import {
 export const DEFAULT_WEBCHANNEL_ACCOUNT_ID = ACCOUNT_CONFIG_DEFAULT_WEBCHANNEL_ACCOUNT_ID;
 
 type ResolvedAccount = {
-  accountId: string | null;
+  accountId: string;
   enabled: boolean;
   allowFrom: string[];
-  dmPolicy: string | undefined;
+  dmPolicy: DmPolicy;
 };
 
 // `createChatChannelPlugin`'s `base` param requires a non-optional `capabilities`,
@@ -84,19 +92,59 @@ function resolveAccount(
   cfg: OpenClawConfig,
   accountId?: string | null,
 ): ResolvedAccount {
-  // 가-1: account-aware resolution. A flat (legacy single-account) config is
-  // treated as the `"default"` account; a per-account config resolves the named
-  // account's leaf fields. `resolveWebchannelAccountConfig` owns the shape
-  // detection so a single-account deployment is a regression-free pass-through.
-  const account = resolveWebchannelAccountConfig(
-    cfg,
-    accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID,
-  );
+  const id = resolveWebchannelAccountId(cfg, accountId);
+  const account = resolveWebchannelAccountConfig(cfg, accountId);
   return {
-    accountId: accountId ?? null,
+    // An unresolved request remains visible but carries no usable account data.
+    accountId: id ?? accountId ?? resolveDefaultWebchannelAccountId(cfg),
     enabled: isWebchannelAccountEnabled(cfg, accountId),
-    allowFrom: (account.allowFrom as string[] | undefined) ?? [],
-    dmPolicy: account.dmSecurity as string | undefined,
+    allowFrom: ((account.allowFrom as string[] | undefined) ?? []).map(normalizeDmAllowEntry),
+    dmPolicy: resolveDmPolicy(account),
+  };
+}
+
+function configRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+/** Resolve effective DM values and canonical edit paths without reading secrets. */
+function resolveDmSecurityConfig(cfg: OpenClawConfig, accountId: string): {
+  policy: DmPolicy;
+  allowFrom: string[];
+  policyPath: string;
+  allowFromPath: string;
+} {
+  const section = configRecord(cfg.channels?.[WEBCHANNEL_ID]);
+  const accounts = configRecord(section?.accounts);
+  const hasScopedAccount = accounts !== undefined && Object.prototype.hasOwnProperty.call(accounts, accountId);
+  const scoped = hasScopedAccount ? configRecord(accounts[accountId]) : undefined;
+  const rootBase = `channels.${WEBCHANNEL_ID}.`;
+  const scopedBase = `channels.${WEBCHANNEL_ID}.accounts.${accountId}.`;
+  const fallbackBase = hasScopedAccount ? scopedBase : rootBase;
+  const policyBase = scoped && (scoped.dmPolicy !== undefined || scoped.dmSecurity !== undefined)
+    ? scopedBase
+    : section && (section.dmPolicy !== undefined || section.dmSecurity !== undefined)
+      ? rootBase
+      : fallbackBase;
+  const allowFromBase = scoped?.allowFrom !== undefined
+    ? scopedBase
+    : section?.allowFrom !== undefined
+      ? rootBase
+      : fallbackBase;
+  const policyConfig = scoped && (scoped.dmPolicy !== undefined || scoped.dmSecurity !== undefined)
+    ? scoped
+    : section;
+  const rawAllowFrom = scoped?.allowFrom !== undefined ? scoped.allowFrom : section?.allowFrom;
+  return {
+    policy: resolveDmPolicy(policyConfig),
+    allowFrom: Array.isArray(rawAllowFrom)
+      ? rawAllowFrom.filter((value): value is string => typeof value === "string").map(normalizeDmAllowEntry)
+      : [],
+    policyPath: `${policyBase}dmPolicy`,
+    // Core audit and doctor append the field name to this prefix.
+    allowFromPath: allowFromBase,
   };
 }
 
@@ -104,19 +152,7 @@ function isWebchannelAccountConfigured(
   cfg: OpenClawConfig,
   accountId?: string | null,
 ): boolean {
-  const section = readWebchannelSection(cfg);
-  if (!section || !hasWebchannelConfig(cfg)) return false;
-
-  const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
-  const accounts = readAccountsMap(section);
-  if (Object.keys(accounts).length > 0) {
-    return listWebchannelAccountIds(cfg).includes(id);
-  }
-
-  // Flat configuration represents only the implicit default account. Structural
-  // keys alone do not configure that account, and must not configure arbitrary
-  // account ids synthesized by a caller.
-  return id === DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+  return hasWebchannelConfig(cfg) && resolveWebchannelAccountId(cfg, accountId) !== undefined;
 }
 
 /**
@@ -136,13 +172,15 @@ function isWebchannelAccountConfigured(
 export function createWebChannelPlugin(
   transport: WebChannelPeerChannel,
   opts?: {
+    /** Live account lookup for both outbound send surfaces; a miss must fail. */
+    resolveOutboundTransport?: ResolveOutboundTransport;
     /**
-     * S1 (accountId-aware approvals): resolve a specific account's transport
-     * for native approval delivery/finalize. The NATS entry passes a resolver
-     * over its per-account runtimes; the legacy single-transport WS entry omits
-     * it and every account falls back to `transport` (unchanged behavior).
+     * Resolve a specific account's transport for native approval delivery and
+     * finalize. A miss fails closed; single-transport callers can omit this.
     */
     resolveApprovalTransport?: ResolveAccountTransport;
+    /** Live serving scope for target admission and outbound session routes. */
+    resolveServingScope?: ResolveServingScope;
     startNatsAccount?: (ctx: any) => Promise<void>;
     onInvalidAccountId?: (cfg: OpenClawConfig, invalid: { id: string; reason: string }) => void;
   },
@@ -209,9 +247,11 @@ export function createWebChannelPlugin(
           return inspection.validIds;
         },
         resolveAccount,
+        defaultAccountId: resolveDefaultWebchannelAccountId,
         inspectAccount: (cfg: OpenClawConfig, accountId?: string | null) => {
           const configured = isWebchannelAccountConfigured(cfg, accountId);
           return {
+            accountId: resolveWebchannelAccountId(cfg, accountId) ?? accountId ?? resolveDefaultWebchannelAccountId(cfg),
             enabled: isWebchannelAccountEnabled(cfg, accountId),
             configured,
             tokenStatus: configured ? "available" : "missing",
@@ -234,7 +274,11 @@ export function createWebChannelPlugin(
       // See src/setup-wizard.ts.
       setupWizard: webchannelSetupWizard,
     })), {
-      message: createClawMessageAdapter(transport),
+      message: createClawMessageAdapter(transport, opts?.resolveOutboundTransport),
+      // `messaging` (ChannelMessagingAdapter) names a peer for core-initiated
+      // sends and mirrors them into that peer's session. It rides the same
+      // base-field mechanism as `message`. See src/outbound-target.ts.
+      messaging: createWebchannelMessagingAdapter(opts?.resolveServingScope),
       doctor: createWebchannelDoctorAdapter(),
       status: createWebchannelStatusAdapter(),
       // `approvalCapability` is a top-level ChannelPlugin field (sibling of
@@ -257,19 +301,71 @@ export function createWebChannelPlugin(
       // Contract: `ChannelGatewayAdapter` is exported by
       // `openclaw/plugin-sdk/channel-runtime`.
       gateway: {
-        startAccount: (ctx: any) => opts?.startNatsAccount
-          ? composeAccountLifecycles(ctx, opts.startNatsAccount)
-          : startClawApprovalMonitor(ctx),
+        startAccount: async (ctx: any) => {
+          if (ctx.abortSignal.aborted) return;
+          // Reads accept aliases, but core retains the raw task key. Starting
+          // either monitor under an alias would split lifecycle ownership from
+          // the listed account's storage and live runtime identity.
+          const accountId = resolveWebchannelAccountId(ctx.cfg, ctx.accountId);
+          if (accountId === undefined || accountId !== ctx.accountId) {
+            const remedy = accountId === undefined
+              ? "choose an exact valid listed account ID"
+              : `use the exact listed account ID ${logSafe(accountId)}`;
+            const lastError = `webchannel: cannot start account ${logSafe(ctx.accountId)}; ${remedy}.`;
+            try {
+              ctx.setStatus?.({
+                accountId: ctx.accountId,
+                configured: false, running: false, connected: undefined, restartPending: false,
+                lastError,
+              });
+            } catch { /* diagnostic failure must not start an invalid owner */ }
+            try { ctx.log?.error?.(lastError); } catch { /* refusal survives logger failure */ }
+            // A completed task triggers core's restart loop. Keep this refused
+            // task dormant until its host stops it, without owning any runtime.
+            await waitUntilAbort(ctx.abortSignal);
+            return;
+          }
+          return opts?.startNatsAccount
+            ? composeAccountLifecycles(ctx, opts.startNatsAccount)
+            : startClawApprovalMonitor(ctx);
+        },
       },
     } satisfies WebchannelAdapters & Record<string, unknown>)),
 
-    // DM security: who may message the bot. Phase 0 uses config allowlist only.
+    pairing: {
+      text: {
+        idLabel: "webchannelUserId",
+        message: "WebChannel pairing approved. You can now send messages.",
+        normalizeAllowEntry: normalizeDmAllowEntry,
+        notify: async ({ cfg, id, message, accountId }) => {
+          const target = resolveOutboundTransport({ cfg, accountId }, transport, opts?.resolveOutboundTransport);
+          if (!target.sendText(id, message, nextMessageId())) throw new Error("webchannel: pairing approval delivery failed");
+        },
+      },
+    },
+
+    // The SaaS JWT grant is the default admission approval (TD-1).
     security: {
-      dm: {
-        channelKey: WEBCHANNEL_ID,
-        resolvePolicy: (account) => account.dmPolicy,
-        resolveAllowFrom: (account) => account.allowFrom,
-        defaultPolicy: "allowlist",
+      resolveDmPolicy: ({ cfg, account }) => {
+        // resolveAccount preserves the exact listed spelling even when the
+        // caller used a canonical alias; diagnostics must point at that key.
+        const resolvedAccountId = account.accountId;
+        const dm = resolveDmSecurityConfig(cfg, resolvedAccountId);
+        return {
+          ...buildAccountScopedDmSecurityPolicy({
+            cfg,
+            channelKey: WEBCHANNEL_ID,
+            accountId: resolvedAccountId,
+            policy: dm.policy,
+            allowFrom: dm.allowFrom,
+            defaultPolicy: "open",
+            policyPathSuffix: "dmPolicy",
+            allowFromPathSuffix: "",
+            normalizeEntry: normalizeDmAllowEntry,
+          }),
+          policyPath: dm.policyPath,
+          allowFromPath: dm.allowFromPath,
+        };
       },
     },
 
@@ -282,11 +378,13 @@ export function createWebChannelPlugin(
         sendText: async (ctx) => {
           // The inbound round-trip delivers replies through the turn's
           // `delivery.deliver` adapter (see src/inbound.ts), NOT here. This
-          // outbound seam only fires for core-initiated (untargeted) sends.
+          // outbound seam handles core-initiated sends to the requested account.
           // `ctx.to` is the recorded reply target — now the REAL per-peer
           // `wsKey` (inbound.ts records `reply.to = wsKey`), so target it
-          // directly. If it is absent or stale, throw so core observes a failed
-          // outbound delivery; recipient guessing is intentionally unsupported.
+          // directly. An explicit target may still carry the `webchannel:` or
+          // `user:` prefix, which the shared grammar strips (#402). If it is
+          // absent, malformed or stale, throw so core observes a failed outbound
+          // delivery; recipient guessing is intentionally unsupported.
           //
           // P0-4 (review R2): throwing is safe ONLY because core never re-sends a
           // thrown outbound — traced in openclaw 2026.6.10 (the installed version
@@ -300,12 +398,22 @@ export function createWebChannelPlugin(
           if (!ctx.to) {
             throw new Error("[webchannel] outbound send failed: ctx.to is absent");
           }
-          if (!transport.sendText(ctx.to, ctx.text)) {
+          // #238: ONE id, minted before the send, put on the wire AND reported
+          // back to core. This seam used to fabricate `webchannel-${Date.now()}`
+          // for core's receipt while sending the frame id-less, so core's
+          // receipt id and the client's bubble id were two different names for
+          // the same message (and the fabricated one was millisecond-collision
+          // prone). Mint order matters: the id must exist before the send, and a
+          // failed send still throws exactly as before.
+          const peerId = requireOutboundPeerId(ctx.to);
+          const id = nextMessageId();
+          const target = resolveOutboundTransport(ctx, transport, opts?.resolveOutboundTransport);
+          if (!target.sendText(peerId, ctx.text, id)) {
             throw new Error(
-              `[webchannel] outbound send failed: targeted send returned false for peer ${ctx.to}`,
+              `[webchannel] outbound send failed: targeted send returned false for peer ${peerId}`,
             );
           }
-          return { messageId: `webchannel-${Date.now()}` };
+          return { messageId: id };
         },
       },
       // No media in Phase 0. `deliveryMode` is required on the outbound base

@@ -1,6 +1,6 @@
 {
-  "name": "@mir-stream/webchannel-saas",
-  "version": "0.6.1",
+  "name": "openclaw-webchannel-saas",
+  "version": "0.7.0",
   "description": "Headless SaaS trust chain core + reference harness for WebChannel NATS relay",
   "license": "MIT",
   "type": "module",
@@ -36,8 +36,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsx": "^4.22.4",
-    "typescript": "^5.5.0",
-    "vitest": "^2.0.0"
+    "typescript": "^5.5.0"
   },
   "dependencies": {
     "@nats-io/jwt": "0.0.10-5",

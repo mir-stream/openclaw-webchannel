@@ -205,4 +205,53 @@ export function installFakeWebSocket(): () => void {
 export async function settle(rounds=12):Promise<void> {
   for(let i=0;i<rounds;i++) await new Promise(r=>setTimeout(r,3));
 }
+
+/**
+ * Wait for a CONDITION instead of for a fixed number of ticks.
+ *
+ * `settle()` is a wall-clock budget (12 × 3 ms), not a queue drain: when the work
+ * it is standing in for is slower than 36 ms — a loaded CI runner stretching the
+ * X25519 unwrap and the register round-trip — the assertion after it reads a
+ * state that simply has not arrived yet. Adding rounds moves that race rather
+ * than removing it, so anything whose precondition is "the handshake/publish has
+ * completed" should wait for the completion itself.
+ *
+ * Poll on a REAL timer, deliberately: everything being waited on here is driven
+ * by timers and I/O callbacks, so a microtask spin would burn the budget without
+ * ever letting the pending work run. That also means this helper cannot be used
+ * under `vi.useFakeTimers()` — it would never advance.
+ *
+ * THROWS on timeout, by design. A waiter that gives up quietly and lets the
+ * assertion run anyway converts a red into a differently-worded red at best, and
+ * into a false green at worst; the gate is this project's only test evidence, so
+ * a helper that can silently disarm it is worse than the fixed budget it
+ * replaces. The message names what was awaited and for how long.
+ *
+ * @param predicate the condition to wait for; polled until it returns true
+ * @param label     what is being awaited — quoted verbatim in the timeout error
+ * @param timeoutMs ceiling (default 2 s). Chosen as ~55× the 36 ms budget it
+ *   replaces, so a runner would have to be ~55× slower than the local box to
+ *   trip it — comfortably past the ~10× stretch measured on a contended runner,
+ *   while staying under vitest's 5 s default test timeout. A genuine hang then
+ *   surfaces as THIS message rather than as an anonymous "test timed out",
+ *   which is the difference between a diagnosable red and another argued-away
+ *   one. That holds while a test's waits total under 5 s; because this throws,
+ *   only the FIRST to time out can fire, so today's max of two waits is safe.
+ * @param intervalMs poll period (default 2 ms)
+ */
+export async function settleUntil(
+  predicate: () => boolean,
+  { label, timeoutMs = 2000, intervalMs = 2 }: { label: string; timeoutMs?: number; intervalMs?: number },
+): Promise<void> {
+  const startedAt = Date.now();
+  for (;;) {
+    if (predicate()) return;
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error(
+        `settleUntil: timed out after ${Date.now() - startedAt}ms (limit ${timeoutMs}ms) waiting for: ${label}`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
 export type { ProtocolInfo };

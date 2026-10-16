@@ -11,14 +11,13 @@
  * CONSTRAINTS:
  *  - Zero new dependencies. Uses only `globalThis.fetch` (Workers + Node 18+
  *    both expose it) and the Node `node:fs` module when `jwksFile` is set.
- *  - Fail-closed: a fetch error or non-2xx response NEVER falls back to a stale
- *    cache. The cache is cleared on any failure so a transient outage cannot
- *    mint credentials from a stale key (see kid-rotation note in AUTH.md §10).
+ *  - Fail-closed: expired keys are never served. A failed kid-miss refresh or
+ *    one lacking the requested kid retains the previous document's original
+ *    TTL, so unverified input cannot evict still-valid keys.
  *  - 5-minute TTL by default. Tunable via `ttlMs` so tests can drive expiry.
- *  - Kid miss in cached JWKS → ONE immediate refetch. If still missing after
- *    refetch, THROW (so the verifier can fail closed). This is the one allowed
- *    "best-effort" revalidation because a key can be rotated between TTLs and
- *    a stale cache must not silently wedge new connections.
+ *  - Every getKey-triggered acquisition shares one in-flight refetch and a 30s
+ *    cooldown across all kids. A miss is never admitted; rotation can be
+ *    discovered after the cooldown.
  */
 
 import { readFile } from "node:fs/promises";
@@ -108,6 +107,9 @@ export type JWKSCacheOptions = {
 
 /** Default TTL: 5 minutes, matching the spec and the OWASP JWT guidance. */
 const DEFAULT_TTL_MS = 5 * 60 * 1000;
+
+/** Global per-cache bound: attacker-chosen kids must not become an IdP request loop. */
+const KID_MISS_COOLDOWN_MS = 30_000;
 
 /** Default JWKS-fetch timeout: 10s — generous for a slow IdP, bounded for boot. */
 const DEFAULT_FETCH_TIMEOUT_MS = 10 * 1000;
@@ -284,10 +286,12 @@ export class JWKSCache implements KeyResolver {
    * fetch time rather than the expiry time so tests can advance `Date.now`
    * without having to keep the absolute expiry in sync.
    *
-   * `null` means no successful fetch has happened yet (initial state) or the
-   * most recent fetch failed and we cleared the cache per the fail-closed rule.
+   * `null` means no successful fetch has happened yet. Failed refreshes never
+   * change this timestamp, so they cannot prolong the lifetime of old keys.
    */
   private cache: { doc: JsonWebKeySet; fetchedAtMs: number } | null = null;
+  private lastGetKeyAttemptMs = -Infinity;
+  private lastGetKeyUnavailable: JwksUnavailableError | null = null;
 
   /**
    * Per-instance guard against re-entrant fetches. A refetch triggered by a kid
@@ -297,7 +301,7 @@ export class JWKSCache implements KeyResolver {
    */
   private inflightRefetch: {
     controller: AbortController;
-    promise: Promise<JsonWebKeySet>;
+    promise: Promise<{ doc: JsonWebKeySet; fetchedAtMs: number }>;
     subscribers: number;
   } | null = null;
 
@@ -350,12 +354,11 @@ export class JWKSCache implements KeyResolver {
    * Semantics (AC4 / AC5):
    *  1. Try the freshest available doc (inline → cache → fresh fetch). If the
    *     kid is present, return it. (TTL hit = 0 additional fetches.)
-   *  2. If the kid is missing from that doc, refetch ONCE (kid-rotation safety
-   *     net — a key can be rotated between TTLs, and a stale cache must not
-   *     silently wedge new connections).
+   *  2. If the kid is missing, join a refetch or start one when the shared
+   *     kid-miss cooldown permits (rotation safety net).
    *  3. If the refetch STILL lacks the kid, THROW.
-   *  4. On any fetch failure or non-2xx response, the cache is CLEARED and the
-   *     error is rethrown (fail-closed; never serve stale).
+   *  4. Preserve still-fresh keys on failure/miss without extending their TTL.
+   *     The failed lookup still throws; expired keys are never served.
    *
    * THROWS on miss-after-refetch, fetch error, or non-2xx response. Callers
    * MUST treat throw as a hard auth failure (the gateway rejects the upgrade).
@@ -365,21 +368,30 @@ export class JWKSCache implements KeyResolver {
       throw new Error("webchannel: getKey requires a non-empty kid");
     }
 
-    // Step 1: best-effort doc. `maybeLoadFromCache` returns inline JWKS
-    // directly (no fetch), or the cached doc if fresh, or null.
-    const initial =
-      (await this.maybeLoadFromCache()) ?? (await this.loadFresh());
-
-    const initialHit = this.findKey(initial, kid);
-    if (initialHit) return initialHit;
+    // Step 1: inline or a fresh cache entry never needs an acquisition.
+    const initial = await this.maybeLoadFromCache();
+    if (initial) {
+      const initialHit = this.findKey(initial, kid);
+      if (initialHit) return initialHit;
+    }
 
     // Step 2: kid miss → ONE refetch (rotation safety net). Inline JWKS has
     // no remote source to refresh, so a miss on inline is a hard miss.
     if (this.source.kind === "inline") {
       throw new Error(`webchannel: kid "${kid}" not found in JWKS`);
     }
-    this.cache = null;
-    const refreshed = await this.loadFresh();
+
+    // A cold/expired lookup is itself the one permitted acquisition. Publish
+    // its successful document even when it lacks this kid: an immediate second
+    // fetch has no newer information and would bypass the global rate bound.
+    if (!initial) {
+      const fetched = await this.loadForGetKey();
+      const hit = this.findKey(fetched, kid);
+      if (hit) return hit;
+      throw new Error(`webchannel: kid "${kid}" not found in JWKS (after refresh)`);
+    }
+
+    const refreshed = await this.loadForGetKey(kid, true);
     const refreshedHit = this.findKey(refreshed, kid);
     if (!refreshedHit) {
       throw new Error(
@@ -387,6 +399,37 @@ export class JWKSCache implements KeyResolver {
       );
     }
     return refreshedHit;
+  }
+
+  private async loadForGetKey(
+    refreshKid?: string,
+    cooldownIsKidMiss = false,
+  ): Promise<JsonWebKeySet> {
+    if (!this.inflightRefetch) {
+      const now = Date.now();
+      if (now - this.lastGetKeyAttemptMs < KID_MISS_COOLDOWN_MS) {
+        if (this.lastGetKeyUnavailable) throw this.lastGetKeyUnavailable;
+        if (cooldownIsKidMiss && refreshKid !== undefined) {
+          throw new Error(
+            `webchannel: kid "${refreshKid}" not found in JWKS (refresh cooldown)`,
+          );
+        }
+        throw new JwksUnavailableError(
+          "webchannel: JWKS refresh temporarily unavailable (refresh cooldown)",
+        );
+      }
+      this.lastGetKeyAttemptMs = now;
+    }
+    try {
+      const doc = await this.loadFresh(undefined, undefined, refreshKid);
+      this.lastGetKeyUnavailable = null;
+      return doc;
+    } catch (error) {
+      if (error instanceof JwksUnavailableError) {
+        this.lastGetKeyUnavailable = error;
+      }
+      throw error;
+    }
   }
 
   /**
@@ -407,7 +450,10 @@ export class JWKSCache implements KeyResolver {
     if (signal?.aborted) throw new JwksLifecycleAbortError();
     const cached = await this.maybeLoadFromCache();
     if (signal?.aborted) throw new JwksLifecycleAbortError();
-    return cached ?? (await this.loadFresh(fetchTimeoutMsOverride, signal));
+    if (cached) return cached;
+    const doc = await this.loadFresh(fetchTimeoutMsOverride, signal);
+    this.lastGetKeyUnavailable = null;
+    return doc;
   }
 
   /**
@@ -430,7 +476,7 @@ export class JWKSCache implements KeyResolver {
 
   /**
    * Force a fresh fetch from the underlying source, updating the cache on
-   * success and clearing it on failure. Concurrent callers share the same
+   * success (a kid probe commits only if that kid exists). Concurrent callers share the same
    * in-flight promise so a kid miss during a fan-out triggers one fetch, not N.
    *
    * `fetchTimeoutMsOverride` lets a specific caller widen/narrow the per-request
@@ -445,12 +491,12 @@ export class JWKSCache implements KeyResolver {
    * (cache hit) or failed (next fetch uses the tight instance default). Racing a
    * second, shorter fetch instead would defeat the dedup this exists for.
    */
-  private async loadFresh(fetchTimeoutMsOverride?: number, signal?: AbortSignal): Promise<JsonWebKeySet> {
+  private async loadFresh(fetchTimeoutMsOverride?: number, signal?: AbortSignal, refreshKid?: string): Promise<JsonWebKeySet> {
     let operation = this.inflightRefetch;
     if (!operation) {
       const controller = new AbortController();
-      const created = { controller, promise: Promise.resolve(null as unknown as JsonWebKeySet), subscribers: 0 };
-      const promise = (async (): Promise<JsonWebKeySet> => {
+      const created = { controller, promise: Promise.resolve(null as unknown as { doc: JsonWebKeySet; fetchedAtMs: number }), subscribers: 0 };
+      const promise = (async (): Promise<{ doc: JsonWebKeySet; fetchedAtMs: number }> => {
       try {
         let doc: JsonWebKeySet;
         if (this.source.kind === "url") {
@@ -472,17 +518,11 @@ export class JWKSCache implements KeyResolver {
           // defensive only.
           doc = this.source.jwks;
         }
-        // Only cache when the source can actually change (URL, file). Inline
-        // docs are immutable for the life of the cache instance.
-        if (this.source.kind !== "inline" && !controller.signal.aborted && this.inflightRefetch === created) {
-          this.cache = { doc, fetchedAtMs: Date.now() };
-        }
-        return doc;
+        return { doc, fetchedAtMs: Date.now() };
       } catch (err) {
-        // Fail-closed: clear the cache so the next call re-attempts instead of
-        // serving the previous (now-stale) document. Re-throw so the caller
-        // surfaces the failure.
-        if (this.inflightRefetch === created) this.cache = null;
+        // Preserve the prior document and its ORIGINAL expiry. A failed kid
+        // probe must not evict healthy keys; an expired document is still never
+        // served because every lookup checks its TTL before using it.
         throw err;
       }
       })();
@@ -495,7 +535,19 @@ export class JWKSCache implements KeyResolver {
     }
     operation.subscribers++;
     try {
-      return await raceAbort(operation.promise, signal);
+      const result = await raceAbort(operation.promise, signal);
+      // Every subscriber decides whether the shared result proves its own
+      // requested rotation. This lets a valid joiner publish a document even
+      // when the hostile caller that started the fetch cannot resolve.
+      if (
+        this.source.kind !== "inline" &&
+        !operation.controller.signal.aborted &&
+        this.inflightRefetch === operation &&
+        (refreshKid === undefined || this.findKey(result.doc, refreshKid))
+      ) {
+        this.cache = result;
+      }
+      return result.doc;
     } finally {
       operation.subscribers--;
       if (operation.subscribers === 0) {

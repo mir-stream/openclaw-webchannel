@@ -1,5 +1,194 @@
 # Project Status — single source of truth
 
+DM policy (#406): canonical `dmPolicy` uses SDK `pairing | allowlist | open |
+disabled` semantics. The default remains `open` (TD-1), requiring an explicit
+`allowFrom: ["*"]`; setup writes both and preserves existing restrictions on
+re-enrollment. `disabled` rejects every sender including allowlisted peers.
+Allowlist matching honors `*` and `webchannel:` prefixes while preserving peer
+case. Pairing reads the SDK's account-scoped approval store before normal/control
+ingress admission. Fresh denials can issue SDK challenges through bounded,
+per-peer coalesced work; receipt replays never initiate a new pairing request.
+Manifest validation checks inherited account policy/allowlist combinations;
+runtime independently refuses invalid account configuration. Core security audit
+reports the same policy and real fix paths. Doctor guides migration from legacy
+`dmSecurity` aliases. See [DM configuration](AUTH.md#dm-policy).
+
+NATS permissions (#409, #410): newly enrolled agent credentials are limited to
+their exact tenant/account subtree, and browser credentials publish only their
+own `.in`/`.register` subjects. Real nats-server tests prove sibling-account
+and agent-direction publication rejection. SaaS/plugin require a lockstep
+upgrade and explicit reissue to narrow existing credentials; doctor identifies
+legacy broad agent grants. Existing grants are accepted until expiry/revocation,
+including non-expiring grants that require explicit replacement. Credential-only
+reissue retains history and keys only when storage remains bound to the same
+trusted issuer; a storage-issuer failure requires the
+[issuer-recovery procedure](STORAGE_IDENTITY_V2.md#issuer-binding-412) first:
+restore the original trusted issuer and matching credentials where supported,
+or archive the complete tuple and initialize fresh state. Credential-only reissue
+cannot bypass it. See [credential rollout](AUTH.md#nats-credential-scope-and-rollout).
+
+Sync robustness (#413/#414): byte-incomplete cold snapshots seed their journal
+high-water immediately. Omitted row identities are exposed separately; older
+trimmed rows remain reachable by history paging, while genuine warm gaps still
+use ordered difference recovery. SQLite `journal_meta.epoch` persists across
+normal restart and scopes snapshots, differences and live frames/ACKs. Epoch
+changes cold-reset view, versions and pending recovery before adopting reused
+server IDs; unconfirmed local sends retain their receipt linkage. Pre-epoch
+journals acquire an ID without rewriting events. Backup restoration must renew
+that ID before startup. These wire semantics join unreleased protocol 7 and
+require paired client/plugin deployment. See [sync and restore](GAP_SYNC.md).
+
+Messaging policy gates new normal/control input before retention, acceptance,
+ACK and broadcast (#442). A denied request receives only an encrypted correlated
+`inbound_rejected{reason:"policy-denied"}`; the client retires its replay and
+shows the generic failure. Exact earlier user/control/cancellation/convergence
+receipts remain authoritative after policy changes. This is part of unreleased
+protocol 7 and requires client/plugin lockstep. DM policy interpretation remains
+owned by #406; this change moves its existing result to the admission boundary.
+
+Inbound acceptance precedes execution debounce (#441): each input receives its
+durable server ID, multi-device broadcast and ACK immediately after admission.
+Only execution waits for the configured fixed window, with the same retained
+count/byte budget. `/stop` cancels those accepted queued rows without declaring
+them unaccepted; restart recovers proven unstarted work with the original IDs.
+
+P3 reply delivery (#415 C4/C7): inbound dispatch enables the SDK reply-prefix
+pipeline, including selected-model interpolation, for answers (reasoning stays
+unprefixed). Media remains unsupported; a media-only final in a turn that
+delivered no answer text now reports delivery failure through the existing
+durable turn settlement and client failure state, without inventing an
+assistant message.
+Text-bearing replies and intentional silence retain their previous behavior.
+
+Security trust (#408, #411, #412): unknown JWT kids share one refresh and a
+30-second cooldown; failed/missing-key refreshes preserve fresh cached keys
+without extending their TTL. SaaS URLs require HTTPS except loopback HTTP
+(`localhost`, `127.0.0.0/8`, `::1`). Each tuple's history and conversation keys
+are bound to the effective JWT issuer by `storage-issuer.json`. Changed,
+unrecorded or invalid ownership refuses that account's startup. Existing
+unbound state requires explicit operator archiving and fresh initialization;
+doctor explains the exact paths. See [issuer binding](STORAGE_IDENTITY_V2.md#issuer-binding-412).
+
+Quiet-turn liveness (#396): normal turns send an initial typing indicator and
+renew ephemeral `typing` with `keepalive: true` every 4 seconds until completion,
+error, or dispatch abort. Renewals refresh existing application watches without
+re-arming typing or holding ordinary followups after output or approval. Typing
+capability and offline drops still apply; control-lane aborts emit no keepalive.
+Recovery restores only this client's published unsettled turns from durable
+`queued`/`started` state, in publish order. Explicit stop, settlement, cancellation,
+terminal receipts, and foreign turns cannot resurrect activity; stale-draft expiry
+retains eligible server-confirmed turns. Durable state alone does not re-arm the
+one-recovery-per-silent-interval watch. #396 joins scoped stop and history
+correlation in the same unreleased protocol 7 contract. Client and plugin must
+roll out together; ignoring the renewal marker would hold followup input.
+
+History page correlation (#401): `load_history` carries a per-request `nonce` that
+the `history` page echoes. Pages ride the peer's shared `.out`; a device folds only
+a page echoing its own nonce, so another device's page no longer leaves a permanent
+hole in a different window. The register snapshot stays uncorrelated. Concurrent
+page requests from one peer's devices are queued: at most 8 waiting and a 64 KiB
+waiting-string charge (two bytes per UTF-16 code unit across both cursors and the
+nonce). Exceeding either bound drops the newest request with a throttled warning;
+the active request keeps its existing cursor semantics.
+History correlation was introduced in protocol 7.
+
+`/stop` cancellation (review R1/R2): control receipts and exact cancellation targets
+now commit together in the tenant/account SQLite journal before ACK. This includes
+ingress entries not yet accepted, the pending overflow-only ID, durable queued work and the current started
+request. Original input replays stay suppressed across restart; replaying an
+accepted stop returns its receipt without aborting later work. New dispatch waits
+for the first live core abort to settle, including across account replacement.
+Another stop received during that abort joins the in-flight operation and commits
+its own receipt. An explicit `/stop` also names earlier input that its device has
+not yet seen the server accept; the server durably cancels still-unaccepted named
+input, while accepted input keeps its receipt and records only request cancellation.
+`ack.unaccepted`, scoped to cancelled IDs in the same ACK frame, is the server's
+evidence that a named input never became accepted. A rowless retry alias that
+already converged on the first retry now has its own transactional SQLite receipt,
+so stop/replay preserves its accepted mapping instead of declaring it unaccepted.
+Cancelled core bindings survive an early SDK abort return until verified startup
+retirement. Protocol 6 introduced authenticated same-frame `ack.cancelled` proof,
+including cancellation replays with no journal row; protocol 7 adds the scoped stop
+and `ack.unaccepted` contract. Matching client consumption is required.
+Dispatch schema 3 upgrades schemas 1 and 2 and prevents older writers from opening it.
+See [cancellation boundaries](DISPATCH_RECOVERY.md#stop-cancellation).
+
+Round 7 (#369), option 2: newly accepted normal requests retain their original
+payload and dispatch lifecycle in SQLite. Startup automatically recovers proven
+unstarted work; started requests without confirmed completion become durable
+“Interrupted · result unknown” messages. Existing output stays visible, and the
+app's Retry action creates a new logical send linked to the original. Explicit
+cancellation and completed work do not auto-run again. An awaited startup service
+retires only restart-aborted core work at explicitly recorded WebChannel session
+keys, even when account transport startup fails; on a persistent storage or
+account-planning fault it deliberately holds core's remaining plugin-service
+startup (and every channel's restart recovery) rather than let core re-run
+interrupted work. Core session resets remain available. Historical rows without lifecycle metadata are never replayed or
+assigned invented statuses. Client/plugin protocol 7 requires lockstep rollout.
+See [dispatch recovery and upgrade boundaries](DISPATCH_RECOVERY.md).
+
+Round 6 (#378): config reads, account inspection, acquisition/planning, status
+credential probes and both core outbound adapters share account lookup. Nullish
+and blank IDs use the configured selection; exact and unique SDK canonical
+matches return the listed spelling. Unknown, malformed and colliding targets
+cannot borrow another account. Exact listed tenant/JWT/subject/storage identity
+and setup write semantics remain stable. Doctor reports invalid explicit
+`defaultAccount` values, the unchanged fallback and a remedy, including disabled
+or absent fallback accounts. See the [account rule](../packages/plugin/src/account-config.ts).
+
+Round 5 (#382): `/stop` can cancel batches containing retained terminal replays
+while a later outcome lookup or write is pending. Indexed entries acquire their
+cancellation hold before any release request; running callbacks stay charged
+until settlement, and cancelled generations sever queued batch captures. The
+committed replay row keeps its identity, cancellation suppresses fresh work,
+and subsequent ingress proceeds after ownership settles.
+
+Round 4 (#286): snapshots and history pages use an incrementally maintained SQLite
+read model. The raw journal remains authoritative; canonical reducer rows,
+positions, tombstones and metadata are committed with their checkpoint. Cold
+builds, catch-up and dense-slot rank rebuilding yield between transactions.
+Unchanged pages, including after reopen, read indexed page rows without raw replay
+or conversation hydration. Durable append acceptance and raw difference recovery
+retain their existing contracts. See [design, measurements and validation](benchmarks/history-materialization.md).
+
+Round 3A (#262): turn-end finals no longer match past assistant drafts by count
+or position. Closed draft IDs keep their authored text; a final without an owned
+current draft gets an independent delivery ID. Full final text survives live,
+snapshot reconciliation, and journal history, including deduped finals and
+messages with no partial callbacks. See [delivery identity](MESSAGE_DELIVERY_IDENTITY.md).
+Reasoning (#373) now consumes native assistant-message boundaries in every
+streaming mode, preserving independent equal text and repeated prefixes. Btw
+accumulation remains scoped to its one message; marked snapshots replace in full
+and only an accepted open snapshot can be consumed by its durable replay.
+
+Round 2 (#370 + #295): active admitted conversations accept authored durable
+output into the journal during relay outages. Store failure refuses the push and
+success receipt; draft output retries retain their original IDs and unresolved
+failures settle the turn as an error. History/difference recovers committed output.
+Reasoning previews remain policy-controlled, tool failures do not replay tool
+execution, and approval results still distinguish delivery from journaling.
+This work does not provide durable agent task scheduling or replay external effects.
+
+Round 5 (#381): approval finalization retains the original account channel, raw
+peer, decision and any owed request. SQLite failures retry only that output on
+the active channel (three retries after 1s, 5s and 30s; one timer, 16 outputs per
+callback, at most 512 failed outputs / 2 MiB of charged payload). Request rows
+already committed during catch-up are not duplicated. Journal acceptance is
+separate from live delivery, so relay loss does not retry committed output.
+Approval snapshots retire actions immediately while storage remains pending.
+Exhaustion, capacity eviction and teardown remain observable failures; monitor
+abort and channel disposal cancel recovery. No channel at finalization means no
+recovery owner. This is in-memory recovery within the active runtime, with no
+action/task replay or restart-persistent recovery. Controlled production-handler
+probes use real SQLite, NatsChannel, encryption and materialized/raw history.
+
+Round 3B (#346 + #342): history reconciles user sends by explicit random ID
+mappings and refreshes rows using journal modification sequences. Warm snapshots
+recover the retained gap before hydration; byte-trimmed cold snapshots seed their
+high-water and track individual omissions (#413). Cursor and row-version state remain scoped to the in-memory view.
+Individually oversized difference events retain the existing skip policy (#343);
+this work does not recover content that cannot fit one difference frame.
+
 Issue #57 / protocol v2 bounds pre-debounce and busy-turn retained work by
 shared per-session/process count and charged-byte limits. Newest overflow is
 tail-rejected with a durable correlated client failure, and peer/account teardown
@@ -12,8 +201,8 @@ superseded the 2026-07-01 snapshot, which predated register-over-NATS, the showc
 multi-device, the setup wizard, publishing, and the delivered-issuer fix)._
 
 This document supersedes any "AC 100% / complete / verified" claim found in commit messages,
-Ouroboros seeds (`.ouroboros/*`), evaluator scores, or older notes. Where those conflict with
-this file, **this file is correct.**
+historical plans, evaluator scores, or older notes. Where those conflict with this file,
+**this file is correct.**
 
 > **Branch note:** `main` and `develop` are converged (merged `--no-ff`, both E2E-gate GREEN:
 > develop `79f082e`+`7603b85`, main `9a157eb`). Feature history flowed
@@ -40,7 +229,7 @@ this file, **this file is correct.**
   peer (`conversation-key-store.ts`, 0600 on disk) and **wrap-delivers it in the register
   response to the JWT-attested device key** — the register path has NO unauthenticated
   registration anymore (the old `handshake-verifier` is deleted). Two devices on one user each
-  decrypt live traffic + snapshots; W6 id/text/positional dedup handles echo adoption.
+  decrypt live traffic + snapshots; exact random-ID mappings reconcile local echoes.
   Register-hop (bootstrap JWT + PoP) is now the SOLE admission path — P0-2 deleted the
   unauthenticated X25519 handshake and the dev/open-NATS mode entirely.
 - **Multi-account multiplex** — one gateway serves `channels.webchannel.accounts.<id>` with
@@ -48,10 +237,12 @@ this file, **this file is correct.**
   (`multiplex.ts`; 가-1/가-2). Exec/plugin approvals are **accountId-aware** (per-account
   claim/deliver/authz — S1 approvals half, `approvals.ts`).
 - **Published & consumable:** plugin `openclaw-webchannel@0.1.0` on **ClawHub**
-  (`clawhub:mir-stream/openclaw-webchannel`); libraries `@mir-stream/webchannel-{saas,client}`
-  target the **public npm registry** as of 0.6.1 — zero-auth install, OIDC trusted publishing
-  with provenance (tag-triggered `publish.yml`, lockstep versioning; the one-time bootstrap in
-  `docs/PUBLISHING.md` gates the first release). Public-API-only consumers exist and are CI-gated:
+  (`clawhub:mir-stream/openclaw-webchannel`); libraries target the **public npm registry**
+  as of 0.6.1 — zero-auth install, OIDC trusted publishing with provenance (tag-triggered
+  `publish.yml`, lockstep versioning). They shipped through `0.6.1` as
+  `@mir-stream/webchannel-{saas,client}`, which is what is installable today; they are renamed
+  to `openclaw-webchannel-{saas,client}` from the next release, and the one-time bootstrap in
+  `docs/PUBLISHING.md` gates that first release under the new names. Public-API-only consumers exist and are CI-gated:
   `examples/minimal-consumer` (boundary test) and `examples/webchannel-app` (full flow,
   Synadia/NGS external-relay mode, `GETTING_STARTED.md` attach-your-own-openclaw guide).
 - **The showcase demo is `demo/run.sh`** (SaaS+admin UI, nats relay, echo/real LLM, 2-agent
@@ -92,6 +283,7 @@ long-lived branches:
 | Device-flow enrollment + `channels add` wizard (config-only interactive; `--flag` form enrolls) | `setup-wizard.ts` + Gate A preflight; AC6 real-HTTP device-flow E2E; `run-enrolled-transport` real-NATS harness |
 | Multi-device conversation keys (wrap-delivered at register; no registration on register path) | `conversation-key-store.ts`, `nats-client-wrapped-key.test.ts` (fail-closed terminals), `demo/verify-multidevice.mjs` 6/6 |
 | Multi-account multiplex + accountId-aware approvals | `multiplex.ts`, `approvals.ts` (+3-lens adversarial review F1/F2 fixed); `demo/verify-multiplex.mjs`, `demo/multiplex.sh` |
+| Account-selected outbound sends (both core send surfaces resolve `ctx.accountId`'s live runtime — tenant, key, journal, subject; no fallback to another account; listed default for unscoped sends) | `outbound-account.ts`, `nats-account-runtime.test.ts` (#371 describe), PR #376 |
 | JWKS rotation + eviction (admin-driven, 500→401 fix) | `jwks.ts`; `demo/verify-rotate.mjs`, `verify-evict.mjs` |
 | Trust chain, NATS user-cred minting, external (Synadia/NGS) account signing | `packages/saas`; `external-nats-account.test.ts`, `nats-permissions-realserver.test.ts`; demo `DEMO_RELAY=synadia` live |
 | Public API boundary (barrel = contract; internals unreachable) | `examples/minimal-consumer/test/boundary.test.mjs`, `examples/webchannel-app/test/no-internal-imports.test.mjs` (CI) |
@@ -101,12 +293,12 @@ long-lived branches:
 
 | Gap | Detail |
 |---|---|
-| **S1 outbound facade** (proactive/approval outbound is primary-account-only) | Cross-account disclosure risk on the agent-initiated leg; the approvals half is done, the outbound facade is the open half. [`BACKLOG.md`](BACKLOG.md) §S1. |
+| **S1 residual — unscoped agent-initiated approvals** | An approval carrying neither `turnSourceAccountId` nor a session-bound account is claimed by every LIVE account's handler, so it fans out to all of them (reachable only from agent-initiated/cron approvals; a user turn always carries the account). [`BACKLOG.md`](BACKLOG.md) §S1 F3. |
 | **C2 (unauthenticated registration) — residual scope only** | Closed on the production register path (conversation key is register-delivered to the JWT-attested device key; `handshake-verifier` deleted). Register-hop is now the sole admission path; the residual is the accepted-risk/untrusted-relay caveat there (the relay carries the admission frames but cannot forge admission). [`BACKLOG.md`](BACKLOG.md) §C2. |
 | Direct gateway transport removal | ✅ complete; browser traffic uses the NATS relay only. |
 | Demo/reference server hardening (review SEC1/2/5) | The reference/demo SaaS servers are deliberately demo-grade (in-memory stores, printed admin token); production-hardening rewrite is a pending decision. |
 | Pre-v2 credential documents | Legacy files without complete credential-binding identity are not reused. Stop the gateway, archive the exact file, complete any required SaaS active-key replacement, and explicitly re-enroll the account. |
-| Example app is not a scaffold | The registry half of this gap closes with 0.6.1 — `@mir-stream/*` moves to public npm and needs no token, **pending the one-time trusted-publishing bootstrap** (`docs/PUBLISHING.md`), which no release has run yet. The example app is still not a standalone `npm create` scaffold. |
+| Example app is not a scaffold | The registry half of this gap closed with 0.6.1 — the libraries moved to public npm and need no token, shipping as `@mir-stream/webchannel-*`. That bootstrap has run and `0.6.1` shipped; the renamed `openclaw-webchannel-*` packages had their own one-time bootstrap publish and trusted-publisher attach done on 2026-08-22, and still need the **publishing-access lockdown** before the next release (`docs/PUBLISHING.md`). The example app is still not a standalone `npm create` scaffold. |
 | Telegram-parity gaps | Depth cap, discovery, idempotency, markdown, turn control (`/stop`), etc. — analysis lives on branch `feature/webchannel-telegram-parity` (`docs/gaps/`), not merged. |
 | Follow-ups | Live-gateway admission migration (+`dmScope`), conversation-key rotation, agent-initiated-outbound demo scene. |
 

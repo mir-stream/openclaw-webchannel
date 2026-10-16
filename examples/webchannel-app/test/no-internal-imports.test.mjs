@@ -3,10 +3,10 @@
  *
  * Asserts the app's OWN source (server/** + web/**) never reaches into package
  * internals — every library import must be the bare published package name
- * `@mir-stream/webchannel-saas` / `@mir-stream/webchannel-client`. It forbids:
+ * `openclaw-webchannel-saas` / `openclaw-webchannel-client`. It forbids:
  *   1. any `../packages/` path (relative reach into monorepo source), and
  *   2. any deep-subpath import of the two packages
- *      (`@mir-stream/webchannel-saas/<something>`), which the exports map would
+ *      (`openclaw-webchannel-saas/<something>`), which the exports map would
  *      block at runtime anyway.
  *
  * The RUNTIME assertion that internals are unreachable through the exports map
@@ -28,7 +28,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const APP_ROOT = join(__dirname, "..");
 const SCAN_DIRS = ["server", "web"];
 const SOURCE_EXTS = new Set([".ts", ".mts", ".js", ".mjs"]);
-const PKGS = ["@mir-stream/webchannel-saas", "@mir-stream/webchannel-client"];
+const PKGS = ["openclaw-webchannel-saas", "openclaw-webchannel-client"];
 
 function walk(dir) {
   const out = [];

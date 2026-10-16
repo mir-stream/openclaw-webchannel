@@ -1,3 +1,5 @@
+import type { RequestState } from "./durable-view-reducer.js";
+export type { RequestState } from "./durable-view-reducer.js";
 /**
  * Public types for the headless WebChannel client.
  *
@@ -42,18 +44,20 @@ export type SendState = "queued" | "sent" | "accepted" | "failed";
  *                   `cause` carries the original `WebChannelErrorCause`.
  * - `overloaded`  — plugin rejected ingress due to bounded retained-work pressure;
  *                   caller-directed retry is allowed, but never automatic.
+ * - `policy-denied` — the plugin refused new input before acceptance under its
+ *                   messaging policy; contact the operator, with no auto retry.
  * - `turn-failed` — the turn was admitted but settled with `outcome:"error"`;
  *                   caller-directed re-sending is allowed when ready.
  * - `cancelled`   — the user intentionally cancelled the send (a `/stop`
  *                   hold-retraction or `retract()`); never retryable.
  *
  * Runtime policy is `true` for `evicted`/`overloaded`/`turn-failed`, and `false`
- * for `closed`/`terminal`/`cancelled`. Readiness is separate: a caller still must not
+ * for `closed`/`terminal`/`cancelled`/`policy-denied`. Readiness is separate: a caller still must not
  * retry until the current instance is ready (and terminal recovery needs a new
  * instance), even where the surrounding application offers a recovery action.
  */
 export type SendFailure = {
-  reason: "closed" | "evicted" | "terminal" | "overloaded" | "turn-failed" | "cancelled";
+  reason: "closed" | "evicted" | "terminal" | "overloaded" | "policy-denied" | "turn-failed" | "cancelled";
   /** For `reason === "terminal"`: the original connection-failure classification. */
   cause?: WebChannelErrorCause;
   retryable: boolean;
@@ -91,12 +95,30 @@ export type SendReceipt = {
  * rolling "Working…" bubble); it flips to false when the same id is finalized
  * into the agent's answer.
  *
- * `ts` is hydration metadata: server-recorded millisecond timestamp carried
- * over from the core session transcript. The server uses it to sort the
- * initial snapshot in recency order. Local sends (a user typing in the
- * widget) keep `ts` absent — the server stamps it on receive.
+ * `ts` is hydration metadata: a server-recorded millisecond timestamp. Local
+ * sends (a user typing in the widget) keep `ts` absent — the server stamps it on
+ * receive. ⚠️ IT IS NOT AN ORDERING KEY: order is the array's, which comes from
+ * the shared reducer. (An earlier version of this docblock said "the server uses
+ * it to sort the initial snapshot in recency order"; that was stale — nothing in
+ * this package or the widget tree sorts on it, and `journal-history.ts`'s NEVER
+ * SORT block carries the measurement.)
  */
-export type ChatMessage = {
+export type ChatBubble = {
+  revision?: number;
+  edited?: boolean;
+  /**
+   * Never present on a bubble — the discriminant of the `ChatMessage` union,
+   * declared as `undefined` here so that (a) tsc narrows the union on it and
+   * (b) writing a `kind` onto a bubble is a compile error.
+   *
+   * ⚠️ IT MUST STAY ABSENT AS AN OWN KEY AT RUNTIME, not merely `undefined`.
+   * `nats-client-wrapper.ts`'s `sameChatMessage` compares `Object.keys` COUNTS
+   * to decide whether an unchanged bubble can be handed back by reference, and
+   * the wrapper's suite asserts that reference identity with `.toBe`. A
+   * `kind: undefined` key on every bubble would break the count on the first
+   * durable event.
+   */
+  kind?: undefined;
   id: string;
   role: ChatRole;
   text: string;
@@ -113,7 +135,7 @@ export type ChatMessage = {
    * `user_message` this bubble echoes (user role only). Set at send/release time
    * so an `ack` frame's `accepted` transition can find the bubble. Absent on
    * server-hydrated bubbles, on agent messages, and on a still-`queued` P1-9
-   * hold (assigned only at release); not used by the history three-tier adoption.
+   * hold (assigned only at release); not used by the history adoption tiers.
    */
   wireId?: string;
   /**
@@ -130,7 +152,15 @@ export type ChatMessage = {
    * `accepted`; an outcome-less legacy frame
    * leaves even the member it names at `accepted`.
    */
-  sendState?: "queued" | "sent" | "accepted" | "completed" | "failed";
+  requestState?: RequestState;
+  retryOf?: string;
+  /**
+   * The server row of the ONE retry this interrupted original admitted (#399).
+   * Present means the original is spent: render "Retried →" to that row, not a
+   * Retry action. A retry that is itself interrupted can be retried in turn.
+   */
+  retriedBy?: string;
+  sendState?: "queued" | "sent" | "accepted" | "completed" | "failed" | "interrupted";
   /** P0-4: present only when `sendState === "failed"` — the failure detail. */
   sendFailure?: SendFailure;
   /**
@@ -148,6 +178,32 @@ export type ChatMessage = {
    */
   turnId?: string;
   /**
+   * v6 (#251): this bubble has received a `progress` draft but NO durable text
+   * yet. Client-local and never on the wire — it is the one bit that keeps the
+   * rolling draft distinguishable from authored content once the draft has been
+   * written into `text` for rendering.
+   *
+   * §15.9 classifies the rolling "Working…" draft as a 표시기 (indicator), not a
+   * message, so a `draftOnly` bubble contributes `text: ""` to the durable view
+   * (`nats-client-wrapper.ts`'s `durableProjection`).
+   *
+   * CLAIMED, NEVER ADDED — the one invariant to keep. Only an absent bubble, or
+   * one that already carries the bit, may take it. Adding it to a bubble that
+   * already holds authored durable text would let a single stray `progress`
+   * frame turn a delivered answer into a DELETED one at turn end (M212g: a
+   * visible duplicate is recoverable where a deletion is not).
+   *
+   * Three writers CLEAR it: an `agent_message` or `turn_snapshot` that authors
+   * durable text for the same id, and `expireStaleDrafts`, which promotes the
+   * partial to durable rather than deleting it on a mid-turn guess.
+   *
+   * It outlives the `working` flip on purpose: that is what lets an unfinalized
+   * lane's bubble be dropped at turn end instead of freezing its partial text
+   * forever, matching how core's built-in Telegram extension deletes an
+   * unfinalized preview (`[core] extensions/telegram/src/bot-message-dispatch.ts:2971-2975`).
+   */
+  draftOnly?: true;
+  /**
    * P1-9: true while this user message is HELD locally (a turn was in flight
    * at send time) and not yet published. Local-only — never on the wire,
    * never in history. Flips off (with wireId/turnId assigned) at release.
@@ -160,6 +216,225 @@ export type ChatMessage = {
   retracted?: boolean;
 };
 
+/**
+ * ONE COMPLETED REASONING BURST, as a member of the transcript (#242 half 2).
+ *
+ * ⚠️ NO `role`, AND NO CLIENT-LOCAL SEND STATE. Both absences are deliberate and
+ * they have different reasons:
+ *  - `role` is absent because the wire carries none and `DurableMessage` refuses
+ *    to invent one. Overloading `role` — "reasoning is an agent bubble with a
+ *    flag" — was the alternative and is the shape v6 exists to remove: it makes
+ *    every renderer decide what a special role means at the point it draws.
+ *  - `working`/`draftOnly`/`pending`/`sendState`/`wireId`/`receiptKey` are
+ *    absent because none of them can apply. A reasoning block is never sent BY
+ *    this client, so it has no receipt; and the lane streams cumulative FULL
+ *    text through an upsert rather than a rolling draft, so it has no
+ *    draft/finalize state either.
+ *
+ * `turnId` is REQUIRED, following both the live `reasoning` frame and the wire
+ * history row.
+ */
+type ChatReasoningCore = {
+  kind: "reasoning";
+  id: string;
+  turnId: string;
+  text: string;
+  /** Hydration metadata, exactly as on a bubble. Absent on a live burst. */
+  ts?: number;
+};
+
+/**
+ * Every `ChatBubble` field a reasoning entry cannot have, pinned to `undefined`.
+ *
+ * ⚠️ DERIVED FROM `ChatBubble`, NEVER LISTED. Add a field to the bubble and it
+ * lands here automatically as "provably absent on a reasoning entry"; a hand-
+ * written list would silently stop covering it.
+ *
+ * WHAT THIS BUYS, AND WHAT IT COSTS — both are real, so the trade is stated
+ * rather than implied:
+ *  + WRITING one of these onto a reasoning entry stays a COMPILE ERROR. That is
+ *    the property that matters most here: `{kind:"reasoning", role:"agent"}` —
+ *    the fabricated author `DurableMessage` refuses — cannot be constructed.
+ *  + READING one off an unnarrowed `ChatMessage` compiles, and yields
+ *    `undefined`, which is the TRUE answer: a reasoning entry is never
+ *    `working`, never `pending`, has no receipt and no author. The wrapper's
+ *    two dozen transcript predicates (`m.working`, `m.role === "user"`,
+ *    `isSpentDraft`, …) therefore keep their exact behaviour, and comparing any
+ *    of them against a literal still NARROWS to `ChatBubble`.
+ *  − A RENDERER that forgets `kind` entirely does not fail to compile; it draws
+ *    a reasoning block as an agent bubble (`role === "user"` is false). That is
+ *    the one guarantee a fields-absent union gives up against a strict one.
+ *    It is bought back where it is actually needed — at the render boundary —
+ *    by `demo/web/src/presentation.ts`'s `ConversationPresentationItem`, whose
+ *    `message` member carries a `ChatBubble`, so a widget MUST switch on the
+ *    presentation kind before it can draw anything.
+ */
+type BubbleOnlyFieldsAbsent = {
+  [K in Exclude<keyof ChatBubble, keyof ChatReasoningCore>]?: undefined;
+};
+
+export type ChatReasoningMessage = ChatReasoningCore & BubbleOnlyFieldsAbsent;
+
+/**
+ * ONE TOOL CALL in the transcript, MERGED from its lifecycle frames
+ * (#242 half 3, doc §15.9).
+ *
+ * ⚠️ THE ENTRY IS THE FOLD OF SEVERAL FRAMES, NOT A COPY OF ONE. Measured on
+ * `inbound.ts`'s producer, a single call emits `start` (carrying `name` and
+ * `argKeys`), zero or more `update`s, and a terminal frame carrying `status` but
+ * NEITHER `name` NOR `argKeys`. `durable-view-reducer.ts`'s `applyTool` merges
+ * them by `(turnId, id)`; this type is what that merge produces.
+ *
+ * ⚠️ NO `role`, exactly as on `ChatReasoningMessage` — the wire carries no
+ * author and neither `DurableMessage` nor this type invents one.
+ *
+ * ⚠️ `turnId` IS PART OF THE IDENTITY HERE, NOT DECORATION. Bubbles and
+ * reasoning blocks are addressed by `id`; a tool call is addressed by the PAIR,
+ * because the producer's id is unique within a run rather than globally. Every
+ * index over `state.messages` therefore has to key tool entries on both fields —
+ * `nats-client-wrapper.ts`'s `transcriptEntryKey` is the one place that is
+ * written down.
+ *
+ * `argKeys` holds argument KEY NAMES ONLY, never arg values.
+ */
+type ChatToolCore = {
+  kind: "tool";
+  id: string;
+  turnId: string;
+  name?: string;
+  phase?: string;
+  status?: string;
+  summary?: string;
+  argKeys?: readonly string[];
+  /** Hydration metadata, exactly as on a bubble. Absent on a live call. */
+  ts?: number;
+};
+
+/**
+ * Every `ChatBubble` field a tool entry cannot have, pinned to `undefined` —
+ * the same device as `BubbleOnlyFieldsAbsent`, derived rather than listed for
+ * the same reason. See that type for the full trade this shape makes.
+ */
+type BubbleOnlyFieldsAbsentOnTool = {
+  [K in Exclude<keyof ChatBubble, keyof ChatToolCore>]?: undefined;
+};
+
+export type ChatToolMessage = ChatToolCore & BubbleOnlyFieldsAbsentOnTool;
+
+/**
+ * ONE NATIVE HITL APPROVAL CARD in the transcript (#242 half 4, doc §15.9).
+ *
+ * ⚠️ THIS IS THE FIRST DURABLE MESSAGE THE USER INTERACTS WITH, and the fields
+ * below split three ways rather than two. Read the split before changing any of
+ * them:
+ *  - DURABLE CONTENT (`id`, `approvalKind`, `title`, `description`, `prompt`,
+ *    `options`, `expiresAtMs`) — the request payload, journaled verbatim;
+ *  - DURABLE STATE (`resolvedDecision`) — folded from the `approvalResolution`
+ *    event, and the one field a replay can set;
+ *  - CLIENT-LOCAL (`actionable`, `resolutionConfirmed`, `resolvedElsewhere`,
+ *    `decisionRejectedReason`, `ts`) — never journaled, never on the history
+ *    wire.
+ *
+ * ⚠️ `actionable` IS THE SAFETY BIT OF THIS ENTIRE SLICE, AND ITS DEFAULT IS THE
+ * WHOLE POINT: ABSENT MEANS NOT CLICKABLE. An approval replayed from `history`
+ * is built without it, so a card the user saw three days ago can never offer
+ * buttons again. Only a LIVE `approval_request`, or an `approval_snapshot` that
+ * still lists the id as pending, may set it — and the snapshot is exactly the
+ * authority for "what is still open", emitted on EVERY successful register
+ * (`nats-register.ts`'s `deps.sendApprovalSnapshot(peerId)`, in the same success
+ * block as the history snapshot and unconditionally).
+ *
+ * Writing it the other way round — a `stale` bit set by the history path —
+ * would be one forgotten branch away from a clickable replay, and the branch
+ * that forgets is always the new one. Fail-closed costs nothing here: the
+ * snapshot re-arms every card that is genuinely still open, on every reconnect.
+ *
+ * ⚠️ `resolvedDecision` CARRIES BOTH THE SERVER'S ANSWER AND `decide()`'s
+ * OPTIMISTIC GUESS, and `resolutionConfirmed` is what tells them apart — the
+ * same #15 arrangement `ApprovalRequest` has always had, moved onto the
+ * transcript entry. `"unknown"` is NOT a member here: it is a reconciliation
+ * OUTCOME, not a decision, so it rides its own `resolvedElsewhere` bit and is
+ * re-composed for the public `ApprovalRequest`. Keeping the sentinel out of the
+ * decision field is what lets the durable arm of `DurableMessage` refuse it.
+ *
+ * ⚠️ NO `role`, exactly as on `ChatReasoningMessage` and `ChatToolMessage` — the
+ * wire carries no author and no layer invents one. That absence is also what
+ * makes the new history row safe for every released client (see
+ * `channel-contract.ts`'s approval variant for the measured argument).
+ *
+ * ⚠️ THE PAYLOAD'S OWN `kind` IS CARRIED AS `approvalKind`, because `kind` is
+ * this union's DISCRIMINANT. Same rename, same reason, at all three layers.
+ */
+type ChatApprovalCore = {
+  kind: "approval";
+  id: string;
+  approvalKind: "exec" | "plugin";
+  title: string;
+  description?: string;
+  prompt: string;
+  options: readonly ApprovalOption[];
+  expiresAtMs?: number;
+  /** DURABLE state, or `decide()`'s optimistic guess — see `resolutionConfirmed`. */
+  resolvedDecision?: ApprovalDecision;
+  /** CLIENT-LOCAL: a server frame (or a snapshot) confirmed the resolution. */
+  resolutionConfirmed?: boolean;
+  /** CLIENT-LOCAL: resolved while this device was away, outcome unknown (#15). */
+  resolvedElsewhere?: boolean;
+  /**
+   * CLIENT-LOCAL (#400): the server REFUSED this device's last decision — see
+   * `ApprovalRequest.decisionRejectedReason`. Cleared by the next `decide()`.
+   */
+  decisionRejectedReason?: string;
+  /** CLIENT-LOCAL: this device may offer decision buttons for this card. */
+  actionable?: boolean;
+  /** Hydration metadata, exactly as on a bubble. Absent on a live card. */
+  ts?: number;
+};
+
+/**
+ * Every `ChatBubble` field an approval entry cannot have, pinned to `undefined`
+ * — the same device as `BubbleOnlyFieldsAbsent`, derived rather than listed for
+ * the same reason. See that type for the full trade this shape makes.
+ */
+type BubbleOnlyFieldsAbsentOnApproval = {
+  [K in Exclude<keyof ChatBubble, keyof ChatApprovalCore>]?: undefined;
+};
+
+export type ChatApprovalMessage = ChatApprovalCore & BubbleOnlyFieldsAbsentOnApproval;
+
+/**
+ * One entry in `state.messages` — a chat bubble, a reasoning block, a tool call,
+ * or an approval card.
+ *
+ * ⚠️ A TAGGED UNION, MIRRORING THE REDUCER'S `DurableMessage` AND THE WIRE'S
+ * `HistoryMessage`. #242 half 2 moved reasoning INTO this array, half 3 did the
+ * same for tool activity and half 4 for approvals, because such a block's
+ * POSITION is the transcript's, and the transcript's order is the array's. The
+ * alternative — keeping a side list and re-interleaving it by `turnId` at render
+ * time — is a SECOND opinion about ordering held by the renderer, which is what
+ * the widget used to do and what those three halves deleted, one lane each. (The
+ * approval lane was not even ordered by `turnId`: the demo drew `state.approvals`
+ * in a BOX BELOW the transcript, so a card had no position at all.)
+ *
+ * ⚠️ NARROW ON `kind`, NEVER ON A MISSING FIELD. `m.kind === "reasoning"` is the
+ * test. Reading `m.role`/`m.working` off an unnarrowed entry does compile (see
+ * `BubbleOnlyFieldsAbsent` for exactly what that does and does not guarantee),
+ * but "no role, therefore reasoning" is the inference v6 exists to remove — a
+ * future variant would break it silently, where a `kind` test would not.
+ */
+export type ChatMessage =
+  | ChatBubble
+  | ChatReasoningMessage
+  | ChatToolMessage
+  | ChatApprovalMessage;
+
+/**
+ * One live/durable reasoning burst, as `state.reasoning` exposes it.
+ *
+ * ⚠️ `state.reasoning` IS DERIVED FROM `state.messages` SINCE #242 half 2 — it is
+ * no longer independently maintained, and it is no longer capped. See
+ * `WebChannelState.reasoning`.
+ */
 export type ReasoningItem = {
   id: string;
   turnId: string;
@@ -167,12 +442,23 @@ export type ReasoningItem = {
 };
 
 /**
- * #97: one live, turn-scoped tool-call activity item. Structured per-tool
- * surface (name/phase/status/summary/argKeys) delivered on its own
- * `tool_activity` wire frame — independent of the progress-draft text path, so
- * short tool calls that never flush a draft are still visible. Like
- * `ReasoningItem`, it is ephemeral and NOT durable history. `argKeys` carries
- * ONLY the argument KEY NAMES — never arg values.
+ * #97: one turn-scoped tool-call activity item, as `state.toolActivity` exposes
+ * it. Structured per-tool surface (name/phase/status/summary/argKeys) delivered
+ * on its own `tool_activity` wire frame — independent of the progress-draft text
+ * path, so short tool calls that never flush a draft are still visible.
+ * `argKeys` carries ONLY the argument KEY NAMES — never arg values.
+ *
+ * ⚠️ "EPHEMERAL AND NOT DURABLE HISTORY" WAS TRUE AND IS NO LONGER — #242 half 3
+ * made tool activity a DURABLE MESSAGE (doc §15.9; NOT-list N3 names the old
+ * claim as the forbidden one). Like `ReasoningItem` since half 2, this type is
+ * now a DERIVED VIEW of the `tool` entries in `state.messages`, not an
+ * independently maintained array, and it is no longer capped. See
+ * `WebChannelState.toolActivity`.
+ *
+ * The ITEM shape is unchanged, so an embedder READING `state.toolActivity` needs
+ * no edit — but one field did widen: `argKeys` is now `readonly string[]`, so an
+ * embedder that ASSIGNS `item.argKeys` to a `string[]` no longer compiles (copy
+ * it, or widen the annotation).
  */
 export type ToolActivityItem = {
   id: string;
@@ -181,7 +467,7 @@ export type ToolActivityItem = {
   phase?: string;
   status?: string;
   summary?: string;
-  argKeys?: string[];
+  argKeys?: readonly string[];
 };
 
 /** Native HITL approval decision; mirrors the plugin/SDK union. */
@@ -228,13 +514,36 @@ export type ApprovalOption = {
  * while this device wasn't looking (a register-time `approval_snapshot` no longer
  * lists it), so the card is no longer actionable but the actual outcome is not
  * known. A view should render it as a neutral "resolved elsewhere" state.
+ * #400: an OPTIMISTIC decision the snapshot no longer lists and does not report
+ * as resolved ends here too — the click's guess is never promoted to a confirmed
+ * outcome without a server answer naming it.
  *
  * `resolutionConfirmed` distinguishes a SERVER-confirmed resolution (an
  * `approval_resolved` frame, or a snapshot marking the card resolved) from
  * `decide()`'s OPTIMISTIC local set. It stays falsy for an optimistic decision
  * so the snapshot reconciler can detect a lost decision frame (Leg C) and
- * re-send it. It is internal-ish plumbing; the demo widget still keys its UI
- * purely off `resolvedDecision !== undefined`.
+ * re-send it. It is internal-ish plumbing.
+ *
+ * ⚠️ `state.approvals` IS DERIVED FROM `state.messages` SINCE #242 half 4 — an
+ * approval is a durable transcript message now, not a side array. The ITEM shape
+ * below is unchanged except for one ADDED field, so an existing embedder needs
+ * no edit to keep working; it needs one to stay CORRECT. See `actionable`.
+ *
+ * ⚠️ `actionable` IS NOT COSMETIC, AND `resolvedDecision !== undefined` IS NO
+ * LONGER A SUFFICIENT UI KEY. Before half 4 an approval card existed only while
+ * the live session knew about it, so "unresolved" and "clickable" were the same
+ * state. Now a card can be REPLAYED FROM HISTORY: still unresolved as far as the
+ * durable stream records, but possibly expired or decided on another device
+ * since, and a click on it would send a decision nobody is waiting for. A
+ * history-replayed card therefore reports `actionable !== true` while
+ * `resolvedDecision` stays `undefined`, and only the live `approval_request`
+ * frame or a register-time `approval_snapshot` that still lists the id as
+ * pending makes it true again.
+ *
+ * `decide()` enforces the same rule at the API, so an embedder that renders
+ * buttons off `resolvedDecision` alone shows a dead button rather than sending a
+ * stale decision. That is a degradation, not a hole — but render off
+ * `actionable`.
  */
 export type ApprovalRequest = {
   id: string;
@@ -246,6 +555,20 @@ export type ApprovalRequest = {
   expiresAtMs?: number;
   resolvedDecision?: ApprovalDecision | "unknown";
   resolutionConfirmed?: boolean;
+  /**
+   * #400: the server REFUSED this device's decision, so the optimistic mark was
+   * undone. `"not-approver"`: the card is back to its
+   * pre-click state (still pending — another approver can answer it).
+   * `"not-pending"`: it is no longer pending here, outcome unknown (`"unknown"`
+   * resolution). Any other string comes from a newer plugin and means the same
+   * as `"not-approver"`. Absent when nothing was refused.
+   */
+  decisionRejectedReason?: string;
+  /**
+   * May this device offer decision buttons for this card? See the ⚠️ above —
+   * ABSENT/false is the safe default and is what a history replay produces.
+   */
+  actionable?: boolean;
 };
 
 /**
@@ -304,16 +627,137 @@ export type WebChannelErrorCause =
  * detect updates by identity — and a React adapter can feed it straight into
  * `useSyncExternalStore` without tearing.
  */
+/** A row omitted by the latest snapshot's byte budget. Content is still journal-owned. */
+export type HistoryOmission = {
+  id: string;
+  kind?: "reasoning" | "tool" | "approval";
+  turnId?: string;
+  seq?: number;
+};
+
 export type WebChannelState = {
   messages: ChatMessage[];
-  /** Ephemeral, non-history reasoning previews, bounded by the clients. */
+  /** Individual holes in the latest snapshot; older trimmed rows remain pageable. */
+  historyOmissions?: HistoryOmission[];
+  /**
+   * The conversation's reasoning bursts, in transcript order.
+   *
+   * ⚠️ DERIVED, NOT MAINTAINED (#242 half 2). This is `state.messages`'s
+   * reasoning entries, recomputed whenever `messages` changes — there is no
+   * second store and nothing writes it directly, so it cannot drift from the
+   * transcript. The wrapper's `setState` refuses a `reasoning` patch at the type
+   * level for that reason.
+   *
+   * ⚠️ AND IT IS NO LONGER "EPHEMERAL, BOUNDED BY THE CLIENTS", which is what
+   * this comment used to say. Both halves changed:
+   *  - the `.slice(-100)` cap is GONE. A live cap over an uncapped durable view
+   *    is itself a live≠history divergence (the reducer's `applyReasoning`
+   *    carries the argument); retention is #299's, at the store;
+   *  - the content is DURABLE for an account that opted into
+   *    `capabilities.reasoningDurable` (default OFF), and a reload replays it.
+   *    With the opt-in off it is still live-only — the lane renders, nothing is
+   *    journaled, and a reload shows none of it.
+   *
+   * ⚠️ KNOWN LIMITATION, EVEN WITH THE OPT-IN ON — **#304**. A burst is journaled
+   * by the ONE frame that closes it, and the plugin's send path refuses a frame
+   * outright while the transport is down (a NATS reconnect, or its fail-closed
+   * no-session-key window) — above the journaling hook, so a refused frame is
+   * never offered to it. If the transport is still refusing when the burst
+   * closes, that burst gets NO row while this client is still rendering the text
+   * it already received. The user-visible shape is "reasoning I watched vanished
+   * on reload". It is deferred, not overlooked: the seam cannot journal a
+   * refused send, and a second hook inside the reasoning controller is exactly
+   * what the v6 NOT-list forbids, so #304 needs a design round rather than a
+   * patch. Do not work around it in a renderer.
+   *
+   * The ITEM shape is unchanged, so an embedder reading `state.reasoning` needs
+   * no edit.
+   */
   reasoning: ReasoningItem[];
   /**
-   * Ephemeral, non-history tool-call activity, bounded by the clients (#97).
+   * The conversation's tool calls, in transcript order (#97, durable since
+   * #242 half 3).
+   *
+   * ⚠️ DERIVED FROM `state.messages`, NOT INDEPENDENTLY MAINTAINED. It is a
+   * projection of that array's `tool` entries, recomputed whenever `messages`
+   * changes — there is no second list and no second opinion about which calls a
+   * conversation contains, or where they sit. The wrapper's `setState` refuses a
+   * `toolActivity` patch at the type level (`StatePatch`), exactly as it refuses
+   * a `reasoning` one.
+   *
+   * ⚠️ THE `.slice(-100)` CAP IS GONE, AND THE HONEST VERSION OF WHY MATTERS.
+   * The old `upsertToolActivity` kept the newest 100 items. A live cap over an
+   * UNCAPPED durable view is itself a live≠history divergence, which is the
+   * defect class this slice closes — so removing it is right. But the same
+   * conditional half 1 recorded for reasoning in **#310** applies verbatim here:
+   * tool durability has no opt-in of its own (see the note below), so the durable
+   * view exists whenever the journal does, and where it does NOT — a build with
+   * no journal wired — there is no durable view to disagree with, so the removal
+   * closes nothing there while the array grows unbounded. Retention belongs at
+   * the STORE (#299), not here. Do not re-add a cap.
+   *
+   * ⚠️ NO SEPARATE OPT-IN, UNLIKE REASONING — a deliberate asymmetry, not an
+   * omission. `capabilities.reasoningDurable` guards the model's chain-of-thought
+   * PLAINTEXT, and that noun is what carries the argument. The two fields that
+   * could carry content do not: `argKeys` is `Object.keys(args)` (key NAMES only,
+   * never values) and `summary` is count-only — `inbound.ts`'s
+   * `readSafePatchSummary` either derives it from array LENGTHS or matches it
+   * against an anchored count grammar, so no free text can pass. Both are
+   * enforced at the PRODUCER. Storing that is not the new disclosure class a
+   * separate switch exists to gate. The live lane gates it instead, and does so
+   * for free: the producer is only constructed when streaming mode is
+   * `progress`/`partial`, so a `block`/`off` account emits no `tool_activity`
+   * frames at all and therefore journals no rows.
+   *
+   * ⚠️ THIS ARGUMENT USED TO LEAN ON TWO MORE CLAUSES, AND BOTH WERE FALSE —
+   * MEASURED, so do not restore them as reassurance in the published `.d.ts`.
+   * They read "`phase` comes from a five-member set, `status` from the producer's
+   * enumerated verdicts":
+   *   - `status` IS A PASS-THROUGH. `inbound.ts`'s `explicitTerminalToolStatus`
+   *     returns `readEventString(data, "status")` verbatim for ANY non-empty
+   *     string, mapping only `"error"` → `"failed"`;
+   *   - `phase` is checked against `TOOL_EVENT_PHASES` on the `tool` and `item`
+   *     streams ONLY. The `command_output`/`patch` branch gates on
+   *     `isTerminalToolActivity` — which can pass on `status` alone — and then
+   *     forwards `phase` UNCHECKED.
+   * Neither weakens the no-opt-in decision — both are verdict labels, not content
+   * — but the decision now rests on `argKeys` and `summary` alone rather than on
+   * an enumeration nothing enforces. SIZE is a separate, open caveat: nothing
+   * caps `argKeys`'s key count or key length anywhere on the path (**#321**), so
+   * "a tool row is small" is an observation about today's tools, not a property.
+   *
+   * ⚠️ KNOWN LIMITATION — **#304**, inherited unchanged. The plugin's send path
+   * refuses a frame outright while the transport is down, ABOVE the journaling
+   * hook, so a refused frame is never offered to it. Tool rides that same seam:
+   * frames dropped during a refusing window leave the fold with a partial call —
+   * a `start` with no terminal `status`, or a terminal with no `name`. Deferred,
+   * not overlooked; do not work around it in a renderer.
+   *
    * Optional so existing `WebChannelState` object literals remain source
    * compatible; current wrapper snapshots always initialize this to an array.
    */
   toolActivity?: ToolActivityItem[];
+  /**
+   * The approval cards in this transcript, in TRANSCRIPT ORDER.
+   *
+   * ⚠️ DERIVED FROM `state.messages` SINCE #242 half 4 — no longer an
+   * independently maintained array, and no longer position-less. An approval is
+   * a durable message: it is journaled (`approval` + `approvalResolution`
+   * events), replayed on reload, and it sits between the messages it
+   * interrupted. The public shape is unchanged apart from the added
+   * `actionable`, so reading this field still works; see `ApprovalRequest` for
+   * why rendering off `resolvedDecision` alone no longer does.
+   *
+   * ⚠️ NO CAP AND NO PRUNE, the same honest position `reasoning`/`toolActivity`
+   * take: this grows with the conversation, retention belongs at the store
+   * (**#299**), and the client-retention twin is **#310**.
+   *
+   * ⚠️ KNOWN LIMITATION — **#311**, and an approval is the WORST row for it. A
+   * history page is bounded by ROW COUNT, never by bytes, and an approval row
+   * carries `title`, `prompt`, `description` and an `options[]` array, so it is
+   * LARGER than a tool row. Unlike reasoning it has no opt-in, so — exactly like
+   * tool — it appears at the DEFAULT configuration. #311 is not fixed here.
+   */
   approvals: ApprovalRequest[];
   status: ConnectionStatus;
   /** Convenience mirror of `status === "connected"`. */
@@ -334,17 +778,17 @@ export type WebChannelState = {
    */
   errorCause?: WebChannelErrorCause;
   /**
-   * Native "Bot is typing…" affordance. The server pushes a single `typing`
-   * frame at the start of a turn, which flips this to `true`. The first
-   * `progress` / `agent_message` (or `approval_*`) frame automatically flips
-   * it back to `false`; the field is absent before the first typing frame
-   * arrives, and stays `false` once it has settled.
+   * Native "Bot is typing…" affordance. The initial ordinary `typing` frame
+   * sets this to `true`; `progress`, `agent_message`, or `approval_*` clears it.
+   * Periodic `typing` frames marked `keepalive: true` renew application liveness
+   * only: they neither change this indicator nor hold followup input. A later
+   * ordinary typing frame can set it again. Absent before the first indicator.
    */
   isTyping?: boolean;
   /**
    * True while at least one turn this client started is still open — i.e. the
    * user message has been published and its `turn_settled` has not arrived yet.
-   * Unlike `isTyping` (which the server pushes ONCE per turn and which the first
+   * Unlike `isTyping` (which the initial typing frame sets and the first
    * `progress`/`agent_message`/`approval_*` frame clears), this is client-owned
    * and TURN-SCOPED: it stays `true` across the whole turn, including the gaps
    * after a first agent bubble has settled while more tool calls, another
@@ -377,11 +821,13 @@ export type WebChannelState = {
    * disconnect, a terminal error, and `close()` force-close every open turn. An
    * explicit `/stop` also consumes existing queued turn candidates so their
    * later publication cannot re-open stopped work. The post-reconnect staleness
-   * valve force-closes open turns too — though only where it arms at all, i.e.
-   * when a `working` draft was live when the session re-established.
-   * Force-closing is one-way: no inbound frame re-opens a turn
-   * (unlike `isTyping`, which a later `typing` frame re-arms), so a mid-turn
-   * reconnect leaves this `false` for the remainder of that turn.
+   * valve closes unconfirmed open turns too — though only where it arms at all,
+   * i.e. when a `working` draft was live when the session re-established.
+   * After recovery, durable `queued`/`started` state can restore this client's
+   * published, unsettled turns in publish order. Explicitly stopped, settled,
+   * cancelled, terminal-receipt, and foreign turns cannot reopen. Stale-draft
+   * expiry retains eligible server-confirmed turns. This durable state is not
+   * fresh activity and does not re-arm the one-recovery-per-silent-interval watch.
    *
    * The guarantee is therefore BOUNDED, not absolute. Any published turn whose
    * settle never arrives — or arrives naming an id this client cannot place —

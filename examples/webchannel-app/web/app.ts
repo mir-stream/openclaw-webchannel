@@ -1,7 +1,7 @@
 /**
  * Reference WebChannel browser client — PUBLIC API ONLY.
  *
- * Imports come solely from the published package `@mir-stream/webchannel-client`.
+ * Imports come solely from the published package `openclaw-webchannel-client`.
  * This is the full production connect flow:
  *
  *   login → generate device keys (X25519 ECDH + Ed25519 PoP) →
@@ -21,7 +21,7 @@ import {
   WebChannelNATSClient,
   generateDevicePopKeyPair,
   type WebChannelState,
-} from "@mir-stream/webchannel-client";
+} from "openclaw-webchannel-client";
 
 // ---------------------------------------------------------------------------
 // Pure classifier (exported for the headless smoke test).
@@ -31,18 +31,14 @@ export type AppUiState =
   | "connecting"
   | "connected"
   | "reconnecting"
-  | "waiting-for-agent"
   | "error";
 
 /**
  * Map a raw WebChannelState to the app's UI intent.
  *
- * NOTE (demo-grade contract): the wrapper FLATTENS the underlying error into
- * `state.error` (it surfaces `err.message`, which is derived from `err.name`), so
- * we string-match it. This is a demo-grade convention, not a stable typed API —
- * a production app should push for a typed error code upstream. The no-agent case
- * is the register request-reply timeout ("[nats-client] request timeout"); an
- * authoritative NATS auth rejection surfaces as "…unauthorized/authorization".
+ * The public SDK exposes connecting/reconnecting while registration retries.
+ * It does not identify an absent agent separately from other transient failures;
+ * only a typed terminal errorCause can select terminal recovery guidance.
  */
 export function classify(state: WebChannelState): AppUiState {
   switch (state.status) {
@@ -52,11 +48,8 @@ export function classify(state: WebChannelState): AppUiState {
       return "connecting";
     case "reconnecting":
       return "reconnecting";
-    case "error": {
-      const msg = (state.error ?? "").toLowerCase();
-      if (msg.includes("request timeout")) return "waiting-for-agent";
+    case "error":
       return "error";
-    }
     default:
       return "error";
   }
@@ -77,9 +70,10 @@ function b64url(buf: ArrayBuffer): string {
   return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-async function postJson<T>(path: string, body: unknown, token?: string): Promise<T> {
+async function postJson<T>(path: string, body: unknown, token?: string, signal?: AbortSignal): Promise<T> {
   const res = await fetch(path, {
     method: "POST",
+    signal,
     headers: {
       "content-type": "application/json",
       ...(token ? { authorization: `Bearer ${token}` } : {}),
@@ -99,7 +93,9 @@ async function postJson<T>(path: string, body: unknown, token?: string): Promise
 export async function connectLane(
   session: LoginResponse,
   onState: (state: WebChannelState) => void,
-): Promise<WebChannelNATSClient> {
+  signal?: AbortSignal,
+): Promise<{ client: WebChannelNATSClient; close: () => void }> {
+  signal?.throwIfAborted();
   // Device keys. X25519 private key is NON-EXTRACTABLE (`false`); the public key
   // is still exportable (WebCrypto always keeps public halves extractable).
   const x25519 = (await crypto.subtle.generateKey({ name: "X25519" }, false, [
@@ -107,6 +103,7 @@ export async function connectLane(
   ])) as CryptoKeyPair;
   const deviceX25519PublicKey = b64url(await crypto.subtle.exportKey("raw", x25519.publicKey));
   const pop = await generateDevicePopKeyPair(); // Ed25519 { privateKey, publicJwk }
+  signal?.throwIfAborted();
 
   const boot = await postJson<BootstrapResponse>(
     "/bootstrap",
@@ -116,8 +113,11 @@ export async function connectLane(
       devicePopPublicKey: pop.publicJwk.x,
     },
     session.token,
+    signal,
   );
-  const creds = await postJson<NatsUserResponse>("/nats-user", {}, session.token);
+  signal?.throwIfAborted();
+  const creds = await postJson<NatsUserResponse>("/nats-user", {}, session.token, signal);
+  signal?.throwIfAborted();
   // F2: the register hop unwraps the delivered K against this SaaS-pinned key.
   if (!boot.agentPublicKey) {
     throw new Error("bootstrap response missing agentPublicKey (register-hop requires it)");
@@ -139,10 +139,26 @@ export async function connectLane(
       pinnedAgentPublicKey: boot.agentPublicKey,
     },
   });
-  client.subscribe(onState);
-  onState(client.getState());
-  client.connect();
-  return client;
+  let closed = false;
+  let unsubscribe = () => {};
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    signal?.removeEventListener("abort", close);
+    unsubscribe();
+    client.close();
+  };
+  signal?.addEventListener("abort", close, { once: true });
+  try {
+    unsubscribe = client.subscribe(state => { if (!closed) onState(state); });
+    if (closed) unsubscribe();
+    else onState(client.getState());
+    if (!closed) client.connect();
+    return { client, close };
+  } catch (error) {
+    close();
+    throw error;
+  }
 }
 
 // The DOM wiring only runs in a browser. In Node (smoke test) the module import
@@ -162,27 +178,116 @@ async function mountBrowserUi(): Promise<void> {
 
   let client: WebChannelNATSClient | null = null;
   let session: LoginResponse | null = null;
+  let lane: Awaited<ReturnType<typeof connectLane>> | null = null;
+  let generation = 0;
+  let request: AbortController | undefined;
+
+  function retire(): void {
+    generation++;
+    request?.abort();
+    request = undefined;
+    lane?.close();
+    lane = null;
+    client = null;
+  }
+  const current = (owner: number) => generation === owner;
 
   function render(state: WebChannelState): void {
     const ui = classify(state);
     statusEl.textContent = `status: ${state.status} → ${ui}`;
     bannerEl.replaceChildren();
-    if (ui === "waiting-for-agent") {
-      const retry = document.createElement("button");
-      retry.textContent = "Retry";
-      retry.onclick = () => void reconnect();
-      bannerEl.append(
-        Object.assign(document.createElement("span"), {
-          textContent: "⏳ Waiting for an agent — attach openclaw, then ",
-        }),
-        retry,
-      );
+    if (ui === "connecting" || ui === "reconnecting") {
+      bannerEl.textContent = "Connecting to the agent… retrying automatically.";
     } else if (ui === "error") {
-      bannerEl.textContent = `⚠ ${state.error ?? "connection error"}`;
+      const cause = state.errorCause;
+      const reauth = cause === "auth-expired" || cause === "auth-rejected" || cause === "secure-channel-failed";
+      bannerEl.textContent = cause === "protocol-mismatch"
+        ? "Upgrade the client and agent to matching versions."
+        : cause === "config" ? "Check the application's connection configuration."
+        : cause === "capacity" ? "This account is full. Contact the operator."
+        : reauth ? "Authentication needs to be renewed."
+        : `Connection failed: ${state.error ?? "unknown error"}`;
+      if (reauth || cause === "server" || cause === "unknown" || cause === undefined) {
+        const retry = document.createElement("button");
+        retry.textContent = reauth ? "Re-authenticate" : "Retry";
+        retry.onclick = () => void reconnect();
+        bannerEl.append(retry);
+      }
     }
     chatEl.replaceChildren(
+      // ⚠️ NARROW ON `kind` — DO NOT MAP OVER `state.messages` AND READ
+      // `role`/`text` DIRECTLY. `ChatMessage` is a TAGGED UNION: a chat bubble
+      // (no `kind`), a reasoning block (`kind: "reasoning"`), a tool call
+      // (`kind: "tool"`) or an approval card (`kind: "approval"`). Only the
+      // bubble arm has `role`, and only the bubble and reasoning arms have
+      // `text` — a tool call's content is its name/phase/status/argKeys surface,
+      // and an approval's is its title/prompt/options.
+      //
+      // This example previously did map straight over the array, and that is
+      // precisely what broke when the union grew a third arm: `m.text` became
+      // `string | undefined` and `m.role` `undefined`. It broke again, in the
+      // same place, when half 4 added the fourth — which is the argument for the
+      // narrowing, not against it. The pattern below is the one a real client
+      // should copy, and the reason it is spelled out here rather than collapsed
+      // into a one-liner — this file is the worked example of consuming the API,
+      // so the habit it demonstrates matters more than its length.
       ...state.messages.map((m) => {
         const div = document.createElement("div");
+
+        if (m.kind === "reasoning") {
+          // A completed reasoning burst. It has NO `role` — the wire carries no
+          // author and the client refuses to invent one — so it is rendered as
+          // its own kind rather than as an agent bubble.
+          div.className = "msg reasoning";
+          div.textContent = m.text;
+          return div;
+        }
+
+        if (m.kind === "tool") {
+          // One tool call, merged from its lifecycle frames. `argKeys` carries
+          // argument KEY NAMES ONLY — never argument values — so it is safe to
+          // display; do not present it as the call's arguments.
+          div.className = "msg tool";
+          const label = m.name ?? "tool";
+          // ⚠️ NOT `state` — that name SHADOWS the outer `state: WebChannelState`
+          // whose `.messages` this very `.map` is walking. It was correct only
+          // because nothing in the arm reads the outer one, and the gate would
+          // not have caught it becoming wrong: CI typechecks the three published
+          // packages only and lints nothing at all (**#318**), so this workspace's
+          // own `typecheck` script runs only when someone runs it locally. This
+          // file is the worked example of consuming the API — the habits it
+          // demonstrates are its product, so it does not get to lean on that.
+          const phaseLabel = m.status ?? m.phase;
+          const args = m.argKeys && m.argKeys.length > 0 ? ` (${m.argKeys.join(", ")})` : "";
+          div.textContent =
+            `🔧 ${label}${phaseLabel !== undefined ? ` — ${phaseLabel}` : ""}${args}` +
+            (m.summary !== undefined ? ` · ${m.summary}` : "");
+          return div;
+        }
+
+        if (m.kind === "approval") {
+          // A native HITL approval card. It has NO `role` and NO `text`, and it
+          // is a DURABLE message — a reload replays it, so this arm draws both
+          // the live card and the historical record of one.
+          //
+          // ⚠️ THIS EXAMPLE IS READ-ONLY AND DRAWS NO BUTTONS, which is the safe
+          // default rather than a shortcut. A real client that offers decision
+          // buttons must gate them on `state.approvals`' `actionable`, NEVER on
+          // `resolvedDecision === undefined`: a card replayed from history is
+          // unresolved as far as the stored stream records, and may still have
+          // expired or been decided elsewhere. `decide()` refuses such a card
+          // too, so the worst case is a dead button rather than a stale
+          // decision — but do not rely on that.
+          div.className = "msg approval";
+          div.textContent =
+            `🔐 ${m.title}` +
+            (m.prompt ? ` — ${m.prompt}` : "") +
+            (m.resolvedDecision !== undefined ? ` · ${m.resolvedDecision}` : " · pending");
+          return div;
+        }
+
+        // The chat bubble arm. `m` is narrowed to `ChatBubble` here, so `role`
+        // and `text` are both present.
         div.className = `msg ${m.role}`;
         div.textContent = m.text;
         // P0-4: minimal send-status affordance on the user's own bubbles. The
@@ -200,6 +305,38 @@ async function mountBrowserUi(): Promise<void> {
           }
           if (badge.textContent) div.append(badge);
         }
+        if (m.role === "user") div.dataset.messageId = m.id;
+        if (m.role === "user" && m.requestState === "interrupted") {
+          const status = document.createElement("div");
+          status.textContent = "Interrupted · result unknown. Check any effects before retrying.";
+          const retry = document.createElement("button");
+          retry.textContent = "Retry";
+          // One retry per original: once the server's `retriedBy` (or this
+          // device's own live retry, not a refused or retracted one) names it,
+          // link there instead. Only that retry row can be retried if it is
+          // interrupted too.
+          const retriedBy = m.retriedBy ?? state.messages.find((r) => r.kind === undefined && r.role === "user" && r.retryOf === m.id
+            && r.sendState !== "failed" && !r.retracted)?.id;
+          if (retriedBy === undefined) retry.onclick = () => { client?.retryInterrupted(m.id); };
+          else retry.disabled = true;
+          status.append(retry);
+          if (retriedBy !== undefined) {
+            const link = document.createElement("a");
+            link.href = "#";
+            link.textContent = "Retried →";
+            link.onclick = (event) => {
+              event.preventDefault();
+              Array.from(chatEl.querySelectorAll<HTMLElement>("[data-message-id]")).find((n) => n.dataset.messageId === retriedBy)?.scrollIntoView?.({ block: "center" });
+            };
+            status.append(" ", link);
+          }
+          div.append(status);
+        } else if (m.role === "user" && m.requestState === "cancelled") {
+          const status = document.createElement("div"); status.textContent = "Cancelled"; div.append(status);
+        }
+        if (m.role === "user" && m.retryOf) {
+          const provenance = document.createElement("small"); provenance.textContent = "Retry of an interrupted request"; div.append(provenance);
+        }
         return div;
       }),
     );
@@ -207,23 +344,43 @@ async function mountBrowserUi(): Promise<void> {
 
   async function reconnect(): Promise<void> {
     if (!session) return;
-    client?.close();
-    client = await connectLane(session, render);
+    retire();
+    const owner = generation;
+    request = new AbortController();
+    try {
+      const connected = await connectLane(session, state => {
+        if (current(owner)) render(state);
+      }, request.signal);
+      if (!current(owner)) { connected.close(); return; }
+      lane = connected;
+      client = connected.client;
+    } catch (error) {
+      if (!current(owner)) return;
+      render({ status: "error", connected: false, messages: [], approvals: [],
+        reasoning: [], toolActivity: [], agentProtocolVersion: null, agentPluginVersion: null,
+        error: (error as Error).message, errorCause: "unknown" });
+    }
   }
 
   loginForm.onsubmit = async (e) => {
     e.preventDefault();
+    retire();
+    session = null;
+    const owner = generation;
+    request = new AbortController();
     const fd = new FormData(loginForm);
     try {
-      session = await postJson<LoginResponse>("/login", {
+      const loggedIn = await postJson<LoginResponse>("/login", {
         username: String(fd.get("username") ?? ""),
         password: String(fd.get("password") ?? ""),
-      });
+      }, undefined, request.signal);
+      if (!current(owner)) return;
+      session = loggedIn;
       loginForm.style.display = "none";
       composer.style.display = "flex";
       await reconnect();
     } catch (err) {
-      statusEl.textContent = `login failed: ${(err as Error).message}`;
+      if (current(owner)) statusEl.textContent = `login failed: ${(err as Error).message}`;
     }
   };
 
@@ -231,7 +388,7 @@ async function mountBrowserUi(): Promise<void> {
     e.preventDefault();
     const text = input.value.trim();
     if (!text || !client) return;
-    client.send(text);
+    if (!client.send(text)) return;
     input.value = "";
   };
 }

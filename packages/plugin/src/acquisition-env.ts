@@ -24,6 +24,7 @@ import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   DEFAULT_WEBCHANNEL_TENANT,
   hasWebchannelConfig,
+  requireWebchannelAccountId,
   resolveAcquisitionIdentity,
   type WebchannelAcquisitionIdentity,
 } from "./account-config.js";
@@ -90,12 +91,13 @@ export type AcquisitionEnvResult = {
  */
 export function resolveAcquisitionEnvPrecedence(
   cfg: unknown,
-  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  accountId?: string | null,
   opts: {
     env?: Record<string, string | undefined>;
     warn?: (msg: string) => void;
   } = {},
 ): AcquisitionEnvResult {
+  const id = requireWebchannelAccountId(cfg, accountId);
   const env = opts.env ?? process.env;
   const warn = opts.warn ?? ((msg: string) => console.warn(msg));
 
@@ -122,13 +124,13 @@ export function resolveAcquisitionEnvPrecedence(
           `environment-variable support will be removed after 2026-08-15.`,
       );
     }
-    return { identity: resolveAcquisitionIdentity(cfg, accountId), usedLegacyEnv: false };
+    return { identity: resolveAcquisitionIdentity(cfg, id), usedLegacyEnv: false };
   }
 
   // No config: synthesize the legacy "default" account identity from env.
   const identity: WebchannelAcquisitionIdentity = {
-    accountId,
-    tenant: resolveAccountTenant(cfg, accountId, env),
+    accountId: id,
+    tenant: resolveAccountTenant(cfg, id, env),
     ...(env["WEBCHANNEL_SAAS_BASE_URL"] !== undefined
       ? { saasBaseUrl: env["WEBCHANNEL_SAAS_BASE_URL"] }
       : {}),

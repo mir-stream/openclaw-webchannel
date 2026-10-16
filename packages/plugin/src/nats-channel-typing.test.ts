@@ -12,6 +12,7 @@ import { EventEmitter } from "node:events";
 import { describe, it, expect, vi } from "vitest";
 
 import { NatsChannel } from "./nats-channel.js";
+import type { DeliveryJournal } from "./delivery-journal.js";
 import type { NatsTransport } from "./nats-transport.js";
 
 /** Transport that RECORDS published subject/payload pairs (plaintext mode). */
@@ -49,6 +50,7 @@ describe("P0-6 — NatsChannel typing gate", () => {
     const frames = typingFrames(transport);
     expect(frames).toHaveLength(1);
     expect(frames[0].subject).toBe("webchannel.tenant.acct.peer-0.out");
+    expect(JSON.parse(frames[0].payload)).toEqual({ type: "typing" });
   });
 
   it("is a no-op after setTypingEnabled(false) — returns false, publishes nothing", () => {
@@ -57,7 +59,25 @@ describe("P0-6 — NatsChannel typing gate", () => {
 
     channel.setTypingEnabled(false);
     expect(channel.sendTyping("peer-0")).toBe(false);
+    expect(channel.sendTyping("peer-0", true)).toBe(false);
     expect(typingFrames(transport)).toHaveLength(0);
+  });
+
+  it("marks liveness renewals, never journals them, and drops them during relay loss", () => {
+    const transport = new RecordingTransport();
+    const append = vi.fn(() => ({ seq: 1 }));
+    const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant",
+      undefined, undefined, { deliveryJournal: { append } as unknown as DeliveryJournal });
+    expect(channel.sendTyping("peer-0", true)).toBe(true);
+    expect(JSON.parse(typingFrames(transport)[0]!.payload)).toEqual({ type: "typing", keepalive: true });
+    transport.connected = false;
+    expect(channel.sendTyping("peer-0")).toBe(false);
+    expect(channel.sendTyping("peer-0", true)).toBe(false);
+    expect(typingFrames(transport)).toHaveLength(1);
+    transport.connected = true;
+    expect(channel.sendTyping("peer-0", true)).toBe(true);
+    expect(typingFrames(transport)).toHaveLength(2);
+    expect(append).not.toHaveBeenCalled();
   });
 
   it("emits again after re-enabling", () => {
@@ -115,6 +135,79 @@ describe("#153 — live inbound typing/history boundary", () => {
   });
 });
 
+describe("#320 — the composite history cursor crosses the inbound dispatch", () => {
+  it("forwards `beforeTurnId` to the load-history handler", () => {
+    const transport = new RecordingTransport();
+    const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant");
+    const onLoadHistory = vi.fn();
+    channel.setLoadHistoryHandler(onLoadHistory);
+
+    transport.emit("message", {
+      subject: "webchannel.tenant.acct.peer-0.in",
+      payload: Buffer.from(
+        JSON.stringify({
+          type: "load_history",
+          before: "tool-activity-1",
+          beforeTurnId: "turn-b",
+          limit: 10,
+        }),
+      ),
+    });
+
+    // ⚠️ THE FIELD IS ASSERTED DIRECTLY, NOT VIA A WHOLE-OBJECT
+    // `toHaveBeenCalledWith`, AND THAT IS THE WHOLE POINT OF THIS TEST.
+    // `toHaveBeenCalledWith` compares with `toEqual` semantics, which treat an
+    // ABSENT key and a present-but-`undefined` key as equal — so the sibling
+    // expectation above (`{before, limit}`) passes identically whether or not
+    // `nats-channel.ts` puts `beforeTurnId` on the request it builds, and an
+    // expectation naming all three fields would too. The field is OPTIONAL on
+    // the wire type, so deleting the forwarding line also typechecks; without a
+    // direct read the composite cursor degrades to id-only in silence and the
+    // tool-cursor paging repair (#320) is undone at the very first hop.
+    const [peerId, request] = onLoadHistory.mock.calls[0] as [
+      string,
+      { before?: string; beforeTurnId?: string; limit?: number },
+    ];
+    expect(peerId).toBe("peer-0");
+    expect(request.beforeTurnId).toBe("turn-b");
+    // Positive controls: the two halves that already travelled still do, so a
+    // failure above names the new field rather than a broken dispatch.
+    expect(request.before).toBe("tool-activity-1");
+    expect(request.limit).toBe(10);
+  });
+});
+
+describe("#401 — a history page's correlation crosses the channel both ways", () => {
+  it("forwards `load_history.nonce` to the load-history handler", () => {
+    const transport = new RecordingTransport();
+    const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant");
+    const onLoadHistory = vi.fn();
+    channel.setLoadHistoryHandler(onLoadHistory);
+
+    transport.emit("message", {
+      subject: "webchannel.tenant.acct.peer-0.in",
+      payload: Buffer.from(JSON.stringify({ type: "load_history", before: "a101", nonce: "page-b" })),
+    });
+
+    // The field is read directly, for the reason the #320 case above gives.
+    const [, request] = onLoadHistory.mock.calls[0] as [string, { before?: string; nonce?: string }];
+    expect(request.nonce).toBe("page-b");
+    expect(request.before).toBe("a101");
+  });
+
+  it("echoes the nonce on the page frame, and puts none on a frame without one", () => {
+    const transport = new RecordingTransport();
+    const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant");
+
+    expect(channel.sendHistory("peer-0", [], undefined, undefined, "page-b")).toBe(true);
+    expect(channel.sendHistory("peer-0", [], 7, true)).toBe(true);
+    const frames = transport.published.map((p) => JSON.parse(p.payload) as Record<string, unknown>);
+    expect(frames.map((f) => f.type)).toEqual(["history", "history"]);
+    expect(frames[0]!.nonce).toBe("page-b");
+    expect(Object.hasOwn(frames[1]!, "nonce")).toBe(false);
+  });
+});
+
 describe("approval decision reverse path", () => {
   it("dispatches a decoded decision with peer/id/decision and rejects malformed input", () => {
     const transport = new RecordingTransport();
@@ -138,5 +231,16 @@ describe("approval decision reverse path", () => {
       expect.stringContaining('Invalid approval_decision from "peer-0"'),
     );
     warnSpy.mockRestore();
+  });
+
+  it("#400: publishes a refused decision back to the peer's .out, decision echoed, unsequenced", () => {
+    const transport = new RecordingTransport();
+    const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant");
+    expect(channel.sendApprovalDecisionRejected("peer-0", "exec-1", "allow-once", "not-approver")).toBe(true);
+    expect(transport.published).toHaveLength(1);
+    expect(transport.published[0].subject).toBe("webchannel.tenant.acct.peer-0.out");
+    expect(JSON.parse(transport.published[0].payload)).toEqual({
+      type: "approval_decision_rejected", id: "exec-1", decision: "allow-once", reason: "not-approver",
+    });
   });
 });

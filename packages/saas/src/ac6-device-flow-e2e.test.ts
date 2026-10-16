@@ -493,12 +493,12 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     expect(pollResponse.creds?.permissions?.pub).toBeDefined();
     expect(pollResponse.creds?.permissions?.sub).toBeDefined();
 
-    // Permissions should be tenant-scoped
+    // Permissions bind the exact enrolled account, including the full-flow suffix.
     const pubPerms = pollResponse.creds?.permissions?.pub || [];
     const subPerms = pollResponse.creds?.permissions?.sub || [];
 
-    expect(pubPerms.some(perm => perm.includes(TEST_TENANT))).toBe(true);
-    expect(subPerms.some(perm => perm.includes(TEST_TENANT))).toBe(true);
+    expect(pubPerms).toEqual([`webchannel.${TEST_TENANT}.${accountId}.>`]);
+    expect(subPerms).toEqual([`webchannel.${TEST_TENANT}.${accountId}.>`]);
 
     console.log(`[AC6 E2E] Step 4: Credentials verified with tenant-scoped permissions`);
   });

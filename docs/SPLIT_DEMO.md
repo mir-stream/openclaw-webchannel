@@ -1,5 +1,14 @@
 # Split demo — real browser (Mac) ↔ agent (container), live over NATS
 
+> **Historical guide / current compatibility:** the referenced `docker/mac-demo.sh`
+> and related Docker scripts are no longer present. The HTTP LAN enrollment commands
+> below are not valid with current SaaS authority validation. Current split
+> deployments must expose the SaaS through trusted HTTPS or use secure forwarding
+> that terminates HTTP on loopback inside the container. Use the maintained
+> [single-host demo](../demo/README.md) for the runnable example. Repair of this
+> historical guide is tracked in
+> [#456](https://github.com/mir-stream/openclaw-webchannel/issues/456).
+
 This is the reproducible walkthrough for the **split** live demo: the SaaS side + web page run
 on the **host** (a Mac), the OpenClaw agent + this plugin run in a **container**, and a real
 browser talks to the real agent over a real JWT-auth `nats-server` — ingress-free, end-to-end
@@ -75,7 +84,7 @@ openclaw plugins install /plugin --link
 #    `channels add`; use the generic mapped flags above.
 openclaw channels add --channel webchannel \
   --account default-agent \
-  --base-url http://192.168.10.5:3942 \
+  --base-url https://saas.example.com \
   --url default-tenant
 
 # 3. approve the enrollment on the host by opening http://<LAN_IP>:3942/ and

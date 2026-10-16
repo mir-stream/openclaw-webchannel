@@ -124,7 +124,7 @@ describe("P1-1 HTTP callers and reference approval UI", () => {
       path: string;
       enrollment?: Record<string, ReturnType<typeof vi.fn>>;
       registry?: Record<string, ReturnType<typeof vi.fn>>;
-      onApproved?: ReturnType<typeof vi.fn>;
+      onApproved?: Parameters<typeof createReferenceEnrollmentHttpHandler>[0]["onApproved"];
     }> = [
       { name: "enroll store failure", path: "/enroll", enrollment: { enroll: vi.fn().mockRejectedValue(new Error("enroll store secret detail")) } },
       { name: "poll store failure", path: "/poll", enrollment: { poll: vi.fn().mockRejectedValue(new Error("poll store secret detail")) } },

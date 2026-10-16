@@ -1,3 +1,4 @@
+import type { RequestState } from "./durable-view-reducer.js";
 /**
  * WebChannel NATS Client — Browser-side NATS connection.
  *
@@ -25,6 +26,9 @@ import {
   unwrapConversationKey,
 } from "./e2e-crypto-browser.js";
 import { importEd25519SeedKey, signNonce } from "./nats-nkey-browser.js";
+// #246 half A: the runtime decoder every decrypted frame passes through before
+// any listener sees it. Zero-dependency and hand-rolled, like this package.
+import { decodeInboundMessage } from "./inbound-wire-decode.js";
 import {
   registerWithPop,
   isTerminalRegisterError,
@@ -39,15 +43,19 @@ import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 export const MAX_CONTROL_LINE = 64 * 1024;
 export const MAX_PAYLOAD = 8 * 1024 * 1024;
 export const MAX_BUFFERED_BYTES = MAX_CONTROL_LINE + MAX_PAYLOAD + 4;
+const INBOUND_REPLAY_WINDOW_MS = 10 * 60 * 1000;
+const MAX_SEEN_INBOUND_ENVELOPES = 16_384;
 
 /**
- * A random, subject-safe token for a request/reply inbox segment (hex only, so
- * it never contains a `.`/`*`/`>` that would break the subject hierarchy).
- * Prefers `crypto.getRandomValues`; falls back to `Math.random` in hosts without
- * WebCrypto (the reply subject is not a secret — it only needs to be unguessable
- * enough to avoid collisions).
+ * A random, subject-safe token (hex only, so it never contains a `.`/`*`/`>`
+ * that would break the subject hierarchy). Two callers: a request/reply inbox
+ * segment, and (#243) the `user_message` idempotency `random_id` the wrapper
+ * mints per send. Exported for the latter so the wrapper and the low-level
+ * client share one generator. Prefers `crypto.getRandomValues`; falls back to
+ * `Math.random` in hosts without WebCrypto (neither use is a secret — the token
+ * only needs to be unguessable enough to avoid collisions).
  */
-function randomInboxToken(): string {
+export function randomInboxToken(): string {
   const g = (globalThis as { crypto?: { getRandomValues?: (a: Uint8Array) => Uint8Array } }).crypto;
   if (g?.getRandomValues) {
     const b = new Uint8Array(12);
@@ -152,15 +160,29 @@ export type InboundMessage = {
     | "agent_message"
     | "progress"
     | "reasoning"
-    // #97: structured, live, turn-scoped tool-call activity. Carries
-    // name/phase/status/summary/argKeys. Ephemeral (like `reasoning`), not
-    // durable history. `argKeys` are argument KEY NAMES only — never values.
+    // #97: structured, turn-scoped tool-call activity. Carries
+    // name/phase/status/summary/argKeys, and the frames are SPARSE DELTAS —
+    // several refine ONE call, keyed by `(turnId, id)`.
+    // ⚠️ "Ephemeral (like `reasoning`), not durable history" WAS WRITTEN HERE
+    // AND IS NOW FALSE ON BOTH COUNTS: #242 half 1/2 made reasoning durable and
+    // half 3 did the same for this frame (doc §15.9; NOT-list N3 names the old
+    // claim as the forbidden one). Every frame is journaled and the reducer's
+    // `applyTool` folds them into one durable message.
+    // `argKeys` are argument KEY NAMES only — never values.
     | "tool_activity"
+    | "request_state"
     | "turn_settled"
+    // #212 (Phase 3): the plugin's authoritative ordered set of the turn's agent
+    // ANSWER bubbles (carries `answers` + `remove`, keyed by `turnId`). Additive
+    // and safely ignorable by an old client.
+    | "turn_snapshot"
     | "approval_request"
     | "approval_resolved"
     // #15: authoritative pending-approval snapshot (carries `approvals`).
     | "approval_snapshot"
+    // #400: the plugin REFUSED this device's `approval_decision` (carries
+    // `id`/`decision`/`reason`). Ephemeral; the wrapper undoes the optimistic mark.
+    | "approval_decision_rejected"
     | "typing"
     | "history"
     // P0-3: slash-command discovery catalog (carries `commands`).
@@ -169,11 +191,47 @@ export type InboundMessage = {
     // id-carrying `user_message` at ingress so the client can drain its unacked
     // replay ledger; unknown ids are a silent no-op.
     | "ack"
-    | "inbound_rejected";
+    | "inbound_rejected"
+    // #245 Part B: the immediate multi-device broadcast of a just-committed inbound
+    // USER message (carries `id`/`text`/`turnId`/`seq`/`random_id`). Seq-bearing on
+    // the client — it flows through the wrapper's gap-detection/cursor path. The
+    // origin reconciles by `random_id`; a non-origin device appends it.
+    | "user_committed"
+    // #244 half B: the gap-recovery catch-up response (carries `events`). The
+    // wrapper folds each raw event through its reducer and advances its seq cursor.
+    | "difference";
   id?: string;
+  /** Protocol 7: a typing renewal proves liveness without changing input admission. */
+  keepalive?: boolean;
   /** P0-7b: the acknowledged `user_message` ids on an `ack` frame. */
   ids?: string[];
-  reason?: "overloaded";
+  /** Protocol 6: exact ack.ids durably cancelled by the server, not task admissions. */
+  cancelled?: string[];
+  /** Protocol 7 (#398): the subset of `cancelled` the server declares it never accepted. */
+  unaccepted?: string[];
+  /**
+   * #243 half 2a: the server-assigned durable `messageId` per client `random_id`,
+   * echoed on an `ack` frame. DELIBERATELY IGNORED in 2a — `drainAcked` still
+   * keys on `ids`, and the durable id is still reconciled by text/position (the
+   * `case "history"` tiers). Adopting this echo (re-keying the local message to
+   * the server id) is half 2b; the field is declared now only so the wire
+   * TYPECHECKS. Re-declared loosely, like every other field here (zero-dep
+   * package; runtime discrimination).
+   *
+   * #244 half A: each entry also carries the user message's per-conversation
+   * `seq` (its only wire carrier — the user opener rides no durable frame). Still
+   * IGNORED in half A; declared optional here so the loose wire shape typechecks.
+   *
+   * #399: `converged` marks a later retry the server answered with the FIRST
+   * retry's row instead of running it; such an entry carries no `seq`.
+   */
+  committed?: Array<{ random_id: string; messageId: string; seq?: number; converged?: boolean }>;
+  /**
+   * `"overloaded" | "policy-denied"` on `inbound_rejected`; on `approval_decision_rejected` (#400)
+   * one of `"not-approver" | "not-pending"` today, and any
+   * other non-empty string from a newer plugin.
+   */
+  reason?: string;
   text?: string;
   turnId?: string;
   /**
@@ -194,6 +252,11 @@ export type InboundMessage = {
    * plugin import.
    */
   outcome?: "ok" | "error";
+  state?: RequestState;
+  requestState?: RequestState;
+  retryOf?: string;
+  /** `request_state`: the one retry an interrupted original admitted (#399). */
+  retriedBy?: string;
   kind?: "exec" | "plugin";
   title?: string;
   /**
@@ -211,8 +274,91 @@ export type InboundMessage = {
   options?: Array<{ decision: string; label: string; style: string }>;
   expiresAtMs?: number;
   decision?: string;
-  /** Transcript rows on a `history` (additive merge) frame. */
-  messages?: Array<{ id: string; role: string; text: string; ts?: number }>;
+  /**
+   * Transcript rows on a `history` (additive merge) frame.
+   *
+   * ⚠️ RE-DECLARED LOOSELY ON PURPOSE — this package is zero-dependency and does
+   * not import the plugin's `HistoryMessage`. It mirrors that TAGGED UNION
+   * (#242 half 2) flattened into one optional-field record, so the wrapper's
+   * `case "history"` does the discrimination at runtime, where it has to anyway:
+   * these values come off the wire and NOTHING HAS VALIDATED THE ROWS. #246
+   * half A's door decoder stops at the frame envelope here — it checks that
+   * `messages` IS an array and nothing about what is in it — deliberately, so
+   * that the row union has exactly one runtime discriminator instead of two
+   * free to disagree.
+   *  - `kind` absent  → a chat bubble; `role` is `"user" | "agent"`;
+   *  - `kind: "reasoning"` → a completed reasoning burst; NO `role`, and
+   *    `turnId` is required.
+   *  - `kind: "tool"` → a MERGED tool call (#242 half 3); NO `role`, NO `text`,
+   *    `turnId` required, and the tool surface below.
+   *  - `kind: "approval"` → a native HITL approval CARD with its state
+   *    (#242 half 4); NO `role`, NO `text`, NO `turnId`, and the approval
+   *    surface below (`approvalKind`/`title`/`prompt`/`options`/…).
+   * `role` is optional here because none of the tagged variants carries one —
+   * the wrapper's existing `m.role !== "user" && m.role !== "agent"` guard is
+   * what keeps an unrecognised shape out of the transcript.
+   *
+   * ⚠️ `text` IS OPTIONAL HERE, AND IT WAS REQUIRED UNTIL #242 half 3. A tool row
+   * genuinely has none — its content is the name/phase/status/argKeys surface —
+   * so a required `text` would have made the tool variant unrepresentable, and
+   * the approval variant has none either. The wrapper's
+   * `typeof m.text !== "string"` guard still runs for the two variants that DO
+   * carry text; the tool and approval branches are deliberately placed AHEAD of
+   * it.
+   *
+   * ⚠️ `argKeys` IS KEY NAMES ONLY, NEVER ARG VALUES — and nothing has validated
+   * that here. The wrapper re-filters it to strings on the way in; this
+   * declaration is the unvalidated wire shape, not a promise about it.
+   *
+   * ⚠️ THE APPROVAL FIELDS ARE NAMED `approvalKind`/`resolvedDecision`, NOT
+   * `kind`/`decision`. The frame-level `kind` and `decision` above belong to the
+   * live `approval_request`/`approval_resolved` FRAMES; on a history ROW the
+   * card's own kind is renamed because `kind` is the row union's discriminant.
+   * The rename happens at all three layers — do not "harmonise" it back here.
+   * `resolvedDecision` is typed loosely and is VALIDATED by the wrapper against
+   * the three real decisions; the `"unknown"` sentinel is client-local and must
+   * never be admitted from the wire.
+   */
+  messages?: Array<{
+    /** Last row modification in the journal, not an ordering key. */
+    seq?: number;
+    randomId?: string;
+    requestState?: RequestState;
+    retryOf?: string;
+    retriedBy?: string;
+    revision?: number;
+    edited?: boolean;
+    id: string;
+    kind?: string;
+    role?: string;
+    text?: string;
+    ts?: number;
+    turnId?: string;
+    name?: string;
+    phase?: string;
+    status?: string;
+    summary?: string;
+    argKeys?: unknown;
+    approvalKind?: string;
+    title?: string;
+    description?: string;
+    prompt?: string;
+    options?: unknown;
+    expiresAtMs?: number;
+    resolvedDecision?: unknown;
+  }>;
+  /**
+   * #212: on a `turn_snapshot` frame, the plugin's authoritative ordered agent
+   * ANSWER bubbles for the turn (each `{id, text}`). The client re-declares this
+   * wire type (zero-dep package), so a new field here needs no plugin import.
+   */
+  answers?: Array<{ id: string; text: string }>;
+  /**
+   * #212: on a `turn_snapshot` frame, the bubble ids the plugin mis-routed answer
+   * content onto (overflow finals; recovery blocks now represented in `answers`).
+   * The client removes ONLY these and preserves every other turn agent bubble.
+   */
+  remove?: string[];
   /** #15: the still-pending approval set on an `approval_snapshot` frame. */
   approvals?: Array<{
     id: string;
@@ -231,6 +377,60 @@ export type InboundMessage = {
   resolved?: Array<{ id: string; decision: string }>;
   before?: string;
   limit?: number;
+  /**
+   * #244 half A (doc §16.2-6): the per-conversation `seq` on a DURABLE frame
+   * (`agent_message`/`progress`/`turn_snapshot`), and `highWaterSeq` the
+   * conversation's authoritative baseline on the register-time `history`
+   * snapshot. DELIBERATELY IGNORED in half A — nothing here tracks a last-applied
+   * seq or detects gaps; that is half B. Declared now only so the wire
+   * TYPECHECKS. Re-declared loosely, like every other field here (zero-dep
+   * package; runtime discrimination).
+   */
+  seq?: number;
+  /** #244 half A — see `seq`. */
+  highWaterSeq?: number;
+  /** Journal instance identity. Sequence numbers and server IDs are scoped to it. */
+  epoch?: string;
+  /** False when byte fitting omitted requested snapshot content. */
+  snapshotComplete?: boolean;
+  /** #413: byte-omitted row identities, independent of the snapshot baseline. */
+  omitted?: import("./types.js").HistoryOmission[];
+  /**
+   * #245 Part B: on a `user_committed` frame, the client-minted idempotency
+   * `random_id` of the send this echoes — the origin device's reconciliation key
+   * (re-key the optimistic bubble onto the server `id`), a no-op on a non-origin
+   * device. Optional (an older client's send omits it). Re-declared loosely, like
+   * every other field here (zero-dep package; runtime discrimination).
+   */
+  random_id?: string;
+  /**
+   * #244 half B: the RAW journal events on a `difference` frame — each `event` is
+   * an untyped wire object the wrapper folds through its reducer, paired with the
+   * per-conversation `seq` the wrapper advances its cursor to. Loose here (zero-dep
+   * package, runtime discrimination); the strong shape is `channel-contract.ts`'s
+   * `difference` member.
+   */
+  events?: Array<{ seq: number; event: unknown }>;
+  /**
+   * #356: the four non-`events` fields of a `difference`. `afterSeq`/`nonce` echo
+   * the `get_difference` this answers — the correlation that lets a device tell
+   * its own reply from another device's on the shared `.out` subject; `partial`
+   * is Telegram's `differenceSlice` ("re-request from where you got to");
+   * `maxSeq` is the highest seq the reply ACCOUNTS FOR — the client's new cursor,
+   * which on a complete reply is the conversation's high-water and on a partial
+   * one is the boundary of the window the server examined, NOT the high-water
+   * (`history-serve.ts` is the producer and owns that rule). Loose here like every
+   * other field (zero-dep package; runtime discrimination in
+   * `inbound-wire-decode.ts`, which REQUIRES all four on a `difference`).
+   *
+   * #401: `nonce` ALSO rides a `history` PAGE, echoing the `load_history.nonce`
+   * it answers; the wrapper folds a page only when that echo is one of its own
+   * outstanding nonces. Optional there (never on the register snapshot).
+   */
+  afterSeq?: number;
+  nonce?: string;
+  partial?: boolean;
+  maxSeq?: number;
   /** P0-3: the slash-command catalog on a `commands` frame. */
   commands?: CommandCatalogEntry[];
 };
@@ -239,14 +439,37 @@ export type OutboundMessage =
   // P0-7a: `id` is a stable, unique id stamped per logical send so the agent can
   // dedupe a re-delivered frame at ingress. Always set on the send path below;
   // typed optional to mirror the wire union (older clients omit it).
-  | { type: "user_message"; text: string; id?: string }
+  //
+  // #243 half 1: `random_id` is the client's idempotency key — a fresh token
+  // minted once per logical user message and REUSED on every retry (it rides the
+  // stored ledger entry, so a replayed frame carries the same value). The plugin
+  // deduplicates on `random_id` when present. It is SEPARATE from `id`: today `id`
+  // is still the durable id, but half 2 makes the server mint the durable id, at
+  // which point retry idempotency can no longer ride the journal's message_id and
+  // must already be riding `random_id`. Typed optional to mirror the wire union.
+  //
+  // Protocol 7 (#398): an explicit `/stop` names, in `cancel_pending`, every
+  // earlier user message still queued or awaiting its ACK. The server durably
+  // cancels the ones it has not accepted, so they never run after the stop.
+  | { type: "user_message"; text: string; id?: string; random_id?: string; retry_of?: string; cancel_pending?: Array<{ id: string; random_id?: string }> }
   | { type: "approval_decision"; id: string; decision: string }
-  | { type: "load_history"; before?: string; limit?: number }
+  // #320: `beforeTurnId` completes the page cursor for a TOOL row, which is
+  // addressed by the pair `(turnId, id)`. Additive — omitting it is the id-only
+  // cursor every older peer sends.
+  // #401: `nonce` is the per-request correlation the answering `history` page
+  // echoes, so only the requesting device folds it off the shared `.out`.
+  | { type: "load_history"; before?: string; beforeTurnId?: string; limit?: number; nonce?: string }
+  // #244 half B: request the durable events with `seq > afterSeq` — the client's
+  // gap-recovery round-trip. Mirrors `channel-contract.ts`'s `get_difference`
+  // (zero-dep package, so declared here rather than imported). #356's `nonce` is
+  // the per-request correlation the reply echoes back.
+  | { type: "get_difference"; afterSeq: number; nonce: string }
   // P0-3: request the slash-command discovery catalog.
   | { type: "load_commands" };
 
 /** Message listener callback (decrypted, high-level). */
 export type MessageListener = (msg: InboundMessage) => void;
+type InboundMessageGate = (msg: InboundMessage) => boolean;
 
 /** Raw NATS message listener: (subject, payload) before any decryption. */
 export type RawMessageListener = (subject: string, payload: string) => void;
@@ -300,9 +523,12 @@ export type WebChannelNatsClientOptions = Omit<NatsClientOptions, "jwt" | "regis
   jwt: string;
   registration: NonNullable<NatsClientOptions["registration"]>;
   /**
-   * Maximum time published or locally-held application work may receive no
+   * Maximum time published, accepted, or locally-held application work may receive no
    * authenticated ingress/turn activity before one soft reconnect is requested.
-   * Default 30,000ms; 0 disables both automatic application-recovery lanes.
+   * Default 30,000ms; 0 disables automatic application-stall recovery.
+   * The state wrapper watches accepted turns until server settlement, issuing at
+   * most one recovery per silent interval; silence never fails or re-executes
+   * accepted work.
    */
   ackStallTimeoutMs?: number;
   /** Deterministic live ingress-outcome retry seams (tests/embedded runtimes). */
@@ -1149,7 +1375,14 @@ export function registerSubject(tenant: string, accountId: string, peerId: strin
 export class WebChannelNatsClient {
   private readonly client: NatsClient;
   private readonly options: WebChannelNatsClientOptions;
+  // #415 E4: authenticated envelope IDs survive transport reconnects. The
+  // ±10-minute clock window matches the plugin. Never evict still-fresh IDs:
+  // at capacity refuse new frames until expiry instead of reopening replay.
+  // This is instance-local; a new page/client has only the timestamp defense.
+  private readonly seenInboundEnvelopes = new Map<string, number>();
+  private nextInboundReplaySweepAt = 0;
   private readonly messageListeners = new Set<MessageListener>();
+  private inboundMessageGate: InboundMessageGate | undefined;
   private readonly errorListeners = new Set<ErrorListener>();
   private readonly protocolListeners = new Set<ProtocolListener>();
   private readonly sessionListeners = new Set<SessionListener>();
@@ -1177,7 +1410,16 @@ export class WebChannelNatsClient {
    * duplicate ack (or an ack after eviction) is correctly rejected; the set is
    * conversation-bounded (the same order of magnitude as `state.messages`).
    */
-  private readonly sendTracker = new Map<string, { state: SendState; failure?: SendFailure; lastAttemptAt?: number }>();
+  private readonly sendTracker = new Map<string, {
+    state: SendState;
+    failure?: SendFailure;
+    lastAttemptAt?: number;
+    ingressCancelled?: boolean;
+    /** Exact durable-row evidence for this send in the wrapper's current journal epoch. */
+    durablyAdopted?: boolean;
+  }>();
+  /** Mirrors the plugin's `MAX_STOP_PENDING_INPUTS`; the oldest names win. */
+  private static readonly MAX_STOP_PENDING = 256;
   /** Forward rank for the monotonic guard; `failed` is handled separately (terminal). */
   private static readonly SEND_RANK: Record<"queued" | "sent" | "accepted", number> = {
     queued: 0,
@@ -1391,8 +1633,16 @@ export class WebChannelNatsClient {
    * once and MUST be currently reserved and absent from the tracker/queue/ledger
    * — a violation THROWS (a programmer error, never a fabricated receipt). Omit
    * it (direct callers, tests) to self-reserve a fresh id.
+   *
+   * `randomId` (#243 half 1): the idempotency key the plugin deduplicates on. It
+   * is minted ONCE here per logical send and stamped onto the outbound frame; the
+   * unacked ledger stores that exact frame object, so every reconnect replay
+   * (`flushQueue`) re-publishes the SAME `random_id` — idempotency across retries
+   * without relying on the durable `id`. Distinct from the wire `id`, which stays
+   * exactly as today. Defaulted to a fresh token; injectable for deterministic
+   * tests.
    */
-  sendUserMessage(text: string, reservedId?: string): string {
+  sendUserMessage(text: string, reservedId?: string, randomId: string = randomInboxToken(), retryOf?: string, cancelPending = false): string {
     const id = reservedId === undefined ? this.reserveWireId() : reservedId;
     this.consumeReservedId(id);
     // Seed without notifying. For a live send, its queue position must be owned
@@ -1431,10 +1681,32 @@ export class WebChannelNatsClient {
     // Authoritative outbound ownership precedes every public callback. A nested
     // send appends behind this entry; whichever stack frame starts the drain will
     // therefore publish in logical call order.
-    this.outboundQueue.push({ type: "user_message", text, id });
+    // #398: the snapshot is taken where this frame takes its FIFO position, so
+    // it names exactly the user messages ordered before it and nothing later.
+    const pending = cancelPending ? this.takeStopPendingInputs() : [];
+    this.outboundQueue.push({ type: "user_message", text, id, random_id: randomId, ...(retryOf ? { retry_of: retryOf } : {}),
+      ...(pending.length ? { cancel_pending: pending } : {}) });
     this.emitSendState(id, "queued");
     this.drainOutboundQueue();
     return id;
+  }
+
+  /**
+   * Every earlier user message still without a server result, in send order.
+   * Past the cap the OLDEST are named: they have waited longest and are the
+   * likeliest to arrive late. A newer excess entry stays unnamed and can still
+   * run if it reaches the server after the stop.
+   */
+  private takeStopPendingInputs(): Array<{ id: string; random_id?: string }> {
+    const pending = new Map<string, { id: string; random_id?: string }>();
+    const add = (message: OutboundMessage) => {
+      if (message.type !== "user_message" || !message.id || pending.has(message.id)) return;
+      if (pending.size >= WebChannelNatsClient.MAX_STOP_PENDING) return;
+      pending.set(message.id, { id: message.id, ...(message.random_id ? { random_id: message.random_id } : {}) });
+    };
+    for (const entry of this.unackedLedger.values()) add(entry.message);
+    for (const message of this.outboundQueue) add(message);
+    return [...pending.values()];
   }
 
   /**
@@ -1462,9 +1734,35 @@ export class WebChannelNatsClient {
     this.enqueue({ type: "approval_decision", id, decision });
   }
 
-  /** Request history page (buffered until the handshake completes). */
-  loadHistory(before?: string, limit?: number): void {
-    this.enqueue({ type: "load_history", before, limit });
+  /**
+   * Request history page (buffered until the handshake completes).
+   *
+   * `beforeTurnId` is LAST rather than beside `before` on purpose: the two-arg
+   * form is this class's shipped public signature, and appending keeps every
+   * existing call site compiling and behaving identically. Pass it only for a
+   * tool cursor — see `channel-contract.ts`'s `load_history` member.
+   *
+   * #401: `nonce` is appended last for the same reason. It is the caller's to
+   * mint and remember, like `getDifference`'s: the answering page echoes it, and
+   * the wrapper folds only a page echoing a nonce it is waiting for.
+   */
+  loadHistory(before?: string, limit?: number, beforeTurnId?: string, nonce?: string): void {
+    this.enqueue({ type: "load_history", before, beforeTurnId, limit, ...(nonce !== undefined ? { nonce } : {}) });
+  }
+
+  /**
+   * #244 half B / #356: request the durable events with `seq > afterSeq` (gap
+   * recovery). Buffered until the handshake completes, like `loadHistory`. The
+   * wrapper calls this when it detects a seq gap; the server answers with a
+   * `difference` frame echoing `afterSeq` and `nonce`.
+   *
+   * `nonce` is REQUIRED and is the caller's to mint — one fresh token per
+   * request, including per retry — because it is what the wrapper matches the
+   * reply against. Minting it here would hide the identity the caller has to
+   * remember. `randomInboxToken()` is the generator both sides already share.
+   */
+  getDifference(afterSeq: number, nonce: string): void {
+    this.enqueue({ type: "get_difference", afterSeq, nonce });
   }
 
   /** Request the slash-command catalog (buffered until the handshake completes). */
@@ -1476,6 +1774,44 @@ export class WebChannelNatsClient {
   onMessage(listener: MessageListener): () => void {
     this.messageListeners.add(listener);
     return () => { this.messageListeners.delete(listener); };
+  }
+
+  /**
+   * @internal Let the state wrapper reject a retired journal epoch before an
+   * ACK/rejection mutates this client's replay ledger or send tracker. Journal
+   * epoch ownership stays in the wrapper; this client only honors its verdict at
+   * the one ordering boundary where result side effects begin.
+   */
+  setInboundMessageGate(gate: InboundMessageGate): void {
+    this.inboundMessageGate = gate;
+  }
+
+  /** @internal True while this client still owns delivery of the exact send. */
+  hasPendingRandomId(randomId: string): boolean {
+    const owns = (message: OutboundMessage) =>
+      message.type === "user_message" && message.random_id === randomId;
+    return this.outboundQueue.some(owns)
+      || [...this.unackedLedger.values()].some((entry) => owns(entry.message));
+  }
+
+  /**
+   * @internal Record that the wrapper adopted the exact pending send from a
+   * durable row in its current journal epoch. This is refusal-ordering evidence
+   * only: replay ownership and receipt state remain unchanged until a real ACK.
+   */
+  recordDurableAdoption(id: string, randomId: string): void {
+    const owns = (message: OutboundMessage) => message.type === "user_message"
+      && message.id === id && message.random_id === randomId;
+    const ledgerMessage = this.unackedLedger.get(id)?.message;
+    const pending = this.outboundQueue.some(owns)
+      || (ledgerMessage !== undefined && owns(ledgerMessage));
+    const entry = this.sendTracker.get(id);
+    if (pending && entry && entry.state !== "failed") entry.durablyAdopted = true;
+  }
+
+  /** @internal Durable-row evidence is scoped to one wrapper-owned journal epoch. */
+  clearDurableAdoptions(): void {
+    for (const entry of this.sendTracker.values()) entry.durablyAdopted = false;
   }
 
   /** Add connection state listener. */
@@ -1564,6 +1900,11 @@ export class WebChannelNatsClient {
     };
   }
 
+  /** @internal Durable cancellation is separate from the delivery receipt state. */
+  isIngressCancelled(id: string): boolean {
+    return this.sendTracker.get(id)?.ingressCancelled === true;
+  }
+
   /**
    * P0-4 (R5-1/R6-1): mint a unique wire id and RESERVE it, one-shot. The wrapper
    * calls this BEFORE creating the bubble/receipt so a `sendUserMessage(text, id)`
@@ -1624,20 +1965,83 @@ export class WebChannelNatsClient {
       // (disconnect() → resetSession nulls sessionKey). Bail mid-loop rather than
       // decrypting the rest against a key that no longer belongs to this session.
       if (!this.sessionKey) return;
-      const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
+      const msg = this.openInboundFrame(payload, this.sessionKey);
       if (msg) this.deliverInbound(msg);
     }
   }
 
   /**
-   * Deliver a decrypted inbound frame. P0-7b: an `ack` frame first drains the
+   * #246 half A — the ONE decode door. Decrypt a sealed `.out` payload, then
+   * DECODE it against this build's wire contract; a frame that fails is logged
+   * once and dropped, so nothing downstream (listeners, the wrapper's reducer,
+   * its seq cursor) ever sees a shape it cannot express.
+   *
+   * ⚠️ THIS REPLACED `openMessage(...) as InboundMessage`, AT BOTH DOORS. The
+   * cast was a claim, not a check: `openMessage` returns `unknown` (it can only
+   * promise the envelope decrypted, never what was inside), and `deliverInbound`
+   * forwarded whatever came back to every listener, whatever its type.
+   *
+   * A null return covers both failures on purpose — an undecryptable payload and
+   * a decrypted-but-malformed one are both "drop this frame" to every caller.
+   * Only the SECOND is logged, and the reason is not that the first is harmless:
+   * it is that the first is the door's PRE-EXISTING fail-closed drop and this
+   * slice did not touch it. `openMessage` returns null for anything that is not a
+   * v1 envelope or that fails to decrypt/parse, both callers have always read that
+   * as "drop, never process as plaintext" (the same rule the pre-key buffering in
+   * `handleRaw` states), and it was silent before #246 half A. Adding a line there
+   * would be a separate change with its own volume question — a peer publishing
+   * junk to `.out` would log per frame — so the new diagnostic is scoped to what
+   * the decoder itself refuses.
+   */
+  private openInboundFrame(payload: string, key: Uint8Array): InboundMessage | null {
+    const raw = openMessage(payload, key);
+    if (raw === null) return null;
+    // openMessage authenticated these exact envelope fields before we trust
+    // them or reserve an ID. Both the live and pre-key-buffer doors come here.
+    const envelope = JSON.parse(payload) as Record<string, unknown>;
+    const { messageId, ts } = envelope;
+    const now = Date.now();
+    if (envelope.tenant !== this.options.tenant || envelope.accountId !== this.options.accountId
+      || envelope.sub !== this.options.peerId || typeof messageId !== "string"
+      || messageId.length === 0 || messageId.length > 256
+      || typeof ts !== "number" || !Number.isFinite(ts) || Math.abs(now - ts) > INBOUND_REPLAY_WINDOW_MS) return null;
+    // Bound sweeping work even if a relay floods the full cache. Expiry is the
+    // last instant at which this authenticated timestamp could be accepted.
+    if (now >= this.nextInboundReplaySweepAt) {
+      for (const [id, expiresAt] of this.seenInboundEnvelopes) {
+        if (expiresAt < now) this.seenInboundEnvelopes.delete(id);
+      }
+      this.nextInboundReplaySweepAt = now + 1000;
+    }
+    if (this.seenInboundEnvelopes.has(messageId) || this.seenInboundEnvelopes.size >= MAX_SEEN_INBOUND_ENVELOPES) return null;
+    this.seenInboundEnvelopes.set(messageId, ts + INBOUND_REPLAY_WINDOW_MS);
+    const decoded = decodeInboundMessage(raw);
+    if (decoded.ok) return decoded.message;
+    const failure = decoded.failure;
+    console.warn(
+      `[nats-client] dropping malformed inbound frame: ` +
+        (failure.kind === "unknown-type"
+          ? `unknown type ${JSON.stringify(failure.type)}`
+          : `${failure.type} — ${failure.reason}`),
+    );
+    return null;
+  }
+
+  /**
+   * Deliver a DECODED inbound frame. P0-7b: an `ack` frame first drains the
    * matching ids from the unacked ledger, then (like every other frame) is
    * forwarded to the message listeners — the wrapper reducer consumes it too.
+   *
+   * "Every frame" now means every frame of a KNOWN type whose shape this build
+   * understands: `openInboundFrame` refuses anything else before this runs
+   * (#246 half A). So `msg.ids` below is a string array or absent, which is what
+   * `drainAcked`'s `new Set(ids)` has always assumed and never checked.
    */
   private deliverInbound(msg: InboundMessage): void {
-    if (msg.type === "ack") this.drainAcked(msg.ids);
-    if (msg.type === "inbound_rejected" && msg.reason === "overloaded") {
-      this.drainRejected(msg.ids);
+    if (this.inboundMessageGate?.(msg) === false) return;
+    if (msg.type === "ack") this.drainAcked(msg.ids, msg.cancelled);
+    if (msg.type === "inbound_rejected" && (msg.reason === "overloaded" || msg.reason === "policy-denied")) {
+      this.drainRejected(msg.ids, msg.reason);
     }
     this.notifyMessageListeners(msg);
   }
@@ -1647,19 +2051,38 @@ export class WebChannelNatsClient {
    * P0-4: also advance each acked id to `accepted` (the tracker's guard makes a
    * duplicate/late/post-terminal ack a no-op).
    */
-  private drainAcked(ids?: string[]): void {
+  private drainAcked(ids?: string[], cancelled?: string[]): void {
     if (!ids) return;
-    this.drainOwnedResult([...new Set(ids)], (id) => {
+    const frameIds = new Set(ids);
+    // The decoder validated the entire frame. Commit EVERY owned cancellation
+    // before timer cleanup or the first acceptance callback can reenter. This
+    // also records a late cancellation whose ordinary ACK was already consumed.
+    // Unknown/other-device IDs allocate no tracker state.
+    for (const id of cancelled ?? []) {
+      const entry = frameIds.has(id) ? this.sendTracker.get(id) : undefined;
+      if (entry) entry.ingressCancelled = true;
+    }
+    this.drainOwnedResult([...frameIds], (id) => {
       this.trackerAdvance(id, "accepted");
     });
   }
 
-  private drainRejected(ids?: string[]): void {
+  private drainRejected(ids: string[] | undefined, reason: "overloaded" | "policy-denied"): void {
     if (!ids) return;
-    this.drainOwnedResult([...new Set(ids)], (id) => {
+    const pending = (id: string) => {
+      const entry = this.sendTracker.get(id);
+      return (entry?.state === "queued" || entry?.state === "sent")
+        && entry.durablyAdopted !== true;
+    };
+    // A delayed per-attempt policy refusal cannot override either an ACK or the
+    // current journal epoch's exact durable adoption. Filter before detaching
+    // ledger ownership, then recheck after callouts too.
+    const candidates = [...new Set(ids)].filter(id => reason !== "policy-denied" || pending(id));
+    this.drainOwnedResult(candidates, (id) => {
+      if (reason === "policy-denied" && !pending(id)) return;
       this.trackerFail(id, {
-        reason: "overloaded",
-        retryable: true,
+        reason,
+        retryable: reason === "overloaded",
         lastAttemptAt: this.sendTracker.get(id)?.lastAttemptAt,
       });
     });
@@ -2055,7 +2478,7 @@ export class WebChannelNatsClient {
         }
         return;
       }
-      const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
+      const msg = this.openInboundFrame(payload, this.sessionKey);
       if (msg) this.deliverInbound(msg);
       return;
     }

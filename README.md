@@ -30,7 +30,7 @@ to the JWT-attested device key, so review finding **C2** — active-relay MITM �
 | E2E crypto (X25519 + HKDF + ChaCha20-Poly1305), envelope, NATS transport | ✅ done, component-tested |
 | Trust chain (`packages/saas`): `setupTrustChain`, device-flow enrollment, NATS user creds | ✅ done, tested on a real nats-server |
 | Browser dialing NATS in the production client (`WebChannelNatsClient`) | ✅ live (NKEY-auth + register-delivered conversation key, ciphertext-only) |
-| Packaging / publishing | ✅ **shipped** — plugin `openclaw-webchannel@0.1.0` on ClawHub (`clawhub:mir-stream/openclaw-webchannel`); `@mir-stream/webchannel-{saas,client}` on public npm (zero-auth install, provenance) via tag-triggered CI (`docs/PUBLISHING.md`) |
+| Packaging / publishing | ✅ **shipped** — plugin `openclaw-webchannel@0.1.0` on ClawHub (`clawhub:mir-stream/openclaw-webchannel`); libraries on public npm (zero-auth install, provenance) via tag-triggered CI — shipped through `0.6.1` as `@mir-stream/webchannel-{saas,client}`, renamed to `openclaw-webchannel-{saas,client}` from the next release (`docs/PUBLISHING.md`) |
 
 Full detail, and reconciliation of the conflicting "AC 100% / complete" signals, is in
 [`docs/STATUS.md`](docs/STATUS.md).
@@ -50,7 +50,6 @@ packages/plugin   The OpenClaw channel plugin (NATS transport)
 packages/client   Framework-agnostic browser client (headless connection + protocol + state)
 packages/saas     Trust-chain core + reference enrollment/bootstrap servers (reference, NOT prod)
 docs/             Design + status docs (start with STATUS.md and TRUST_AND_ONBOARDING.md)
-.ouroboros/       Ouroboros seeds / handoffs that drove the build (historical record)
 ```
 
 ## Run it (the production NATS path)
@@ -71,8 +70,13 @@ walkthrough (real browser on the Mac ↔ agent in a container over the LAN), see
 
 ## Develop / test
 
+Vitest is shared from the monorepo root. Install the root lockfile before running
+the root suite or a workspace's `npm test`; published packages do not carry the
+test runner in their development manifests. This also keeps npm 10 from resolving
+Vitest's optional peers during an OpenClaw production plugin install.
+
 ```bash
-npm install
+npm ci
 npm run typecheck     # all workspaces
 npm test              # component/unit level — see STATUS.md on coverage gaps
 ```
@@ -116,4 +120,4 @@ excluded from that sweep and is guarded only by each example's own `npm test`.
 ## License
 
 [MIT](LICENSE) — all three published packages (`openclaw-webchannel`,
-`@mir-stream/webchannel-client`, `@mir-stream/webchannel-saas`).
+`openclaw-webchannel-client`, `openclaw-webchannel-saas`).

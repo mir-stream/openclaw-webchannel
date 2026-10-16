@@ -10,13 +10,35 @@ no browser-facing connection or token route.
 3. The browser generates a fresh random `clientNonce` for this register attempt and
    sends it, with its JWT and proof-of-possession response, on the account-scoped
    register subject.
-4. The plugin verifies the wire protocol version, then signature, issuer, audience,
-   `clientNonce` format, and proof of possession before registering peer subjects.
+4. The plugin verifies signature, issuer, audience, and tenant/subject FIRST, then
+   the wire protocol version, then `clientNonce` format and proof of possession,
+   before registering peer subjects. The version check deliberately sits behind
+   authentication so an unauthenticated request gains no account/version oracle
+   (`nats-register.ts` carries the ordering rationale).
 5. The agent returns the conversation key wrapped to the SaaS-attested device key,
    with both the peer id and that `clientNonce` bound into the wrap AAD.
 
-The wire protocol version is **3**. Client and plugin must ship together; a
-mismatch is refused with a terminal `protocol_mismatch` (426) before any key work.
+The unreleased wire protocol version is **7**. Client and plugin must ship
+together; a mismatch is refused with a terminal `protocol_mismatch` (426) before
+any key work. Version 6 adds authenticated `ack.cancelled`: exact wire IDs whose
+cancellation is durable, restricted to the same frame's `ack.ids`. A client must
+retire the active watch for those IDs even when no journal row was created;
+otherwise it reconnects indefinitely for a cancelled pre-admission message.
+An ordinary ACK, including a stop-command receipt, supplies no cancellation proof.
+Version 7 adds `cancel_pending` on an explicit `/stop`: the earlier user messages
+that device has no server result for. The server durably cancels each one it has
+not accepted and answers it with `ack.cancelled`, so it cannot run after the stop.
+`ack.unaccepted`, a subset of `cancelled` in each ID's own frame, declares the
+cancelled IDs the server never accepted; only those show as cancelled input.
+This uses the existing exact-match gate without negotiation; the encrypted
+envelope remains version 1 and package versions are unchanged. Version 7 (#401)
+adds `load_history.nonce`, echoed on the `history` page that answers it: pages
+ride the peer's shared `.out`, and a device folds only a page echoing its own
+nonce, so another device's page cannot leave a hole in a different window.
+Version 7 (#396) marks periodic typing renewals with `keepalive: true`. Clients
+must treat these as liveness only; ignoring the marker would re-arm typing and
+queue ordinary followups after output or approval. These changes share the same
+unreleased protocol 7 contract and ship in one paired client/plugin rollout.
 
 ### Register-reply freshness (`clientNonce`)
 
@@ -109,11 +131,87 @@ unnecessary: the signed tenant claim and account-id `aud` binding distinguish
 token populations even when accounts share an issuer. JWKS outages fail closed
 but are retryable; invalid tokens are terminal rejects.
 
+Unknown kids share a single in-flight refresh and a 30-second cooldown across
+all kids. A failed refresh or one without the requested kid retains previously
+cached keys only until their original TTL expires. A known fresh key remains
+usable during that refresh; no expired key is used as an outage fallback.
+Malformed JWT segments and payloads are rejected before JWKS lookup (#408).
+
+Configured SaaS base URLs require HTTPS, except HTTP on `localhost`,
+`127.0.0.0/8` or `::1`. There is no bypass flag. Enrollment,
+derived JWKS URLs, preflight and doctor enforce this same configured-URL rule
+(#411). Redirect-target validation is separate pre-existing behavior tracked in
+[#452](https://github.com/mir-stream/openclaw-webchannel/issues/452).
+
 The deprecated `auth.ticketParam` schema key remains accepted only so loading can
 produce a targeted migration error. Remove it and rerun
 `openclaw channels add --channel webchannel`.
 
 See [`TRUST_AND_ONBOARDING.md`](TRUST_AND_ONBOARDING.md) for the complete trust model.
+
+## DM policy
+
+`channels.webchannel.dmPolicy` (or the account override) uses the SDK enum:
+
+| Policy | Admission |
+| --- | --- |
+| `open` (default) | Explicit `allowFrom: ["*"]` admits every peer already authenticated for this account by the SaaS JWT. |
+| `allowlist` | A nonempty configured sender list; `*` matches all and `webchannel:` prefixes normalize. Peer identity remains case-sensitive. |
+| `pairing` | Configured senders and SDK-approved peers can send; others receive an SDK pairing challenge. |
+| `disabled` | No sender, including a listed sender, may dispatch a DM turn. |
+
+The default differs from Telegram's pairing because SaaS token issuance already
+authorizes this account's peers (TD-1). It does not synthesize a wildcard when
+loading old configuration. Explicitly add `allowFrom: ["*"]` if open admission
+is intended. Setup writes both values for a fresh account and preserves existing
+restrictions when run again.
+
+`dmSecurity` is a deprecated alias. Legacy `all`, `any`, `anyone`, `everyone` and
+`public` (case/whitespace normalized) map to `open`; unknown values are rejected.
+Within one config layer `dmPolicy` wins, while an account-local legacy field can
+override a shared canonical policy. Doctor reports the migration and missing
+wildcard/empty allowlist; core audit points to `dmPolicy` and `allowFrom` at their
+actual channel/account location.
+
+The manifest's DM definitions specialize named-account checks by the inherited
+policy and allowlist, since JSON Schema has no upward property reference. Other
+named-account fields retain their existing runtime validation. The account
+startup gate repeats effective DM validation before credential/network work.
+
+## NATS credential scope and rollout
+
+The next lockstep SaaS/plugin release narrows freshly minted credentials:
+
+| Role | Publish | Subscribe |
+| --- | --- | --- |
+| Agent | `webchannel.{tenant}.{accountId}.>` | Same account subtree |
+| Browser | `webchannel.{tenant}.*.{peerId}.in`, `webchannel.{tenant}.*.{peerId}.register` | `webchannel.{tenant}.*.{peerId}.>` |
+| Observer (demo wiretap) | Deny all | `webchannel.{tenant}.>` |
+
+The agent scope comes from the approved enrollment's exact account. Browser
+identity comes from the authenticated SaaS session. Reply subjects require only
+browser subscriptions; the browser never needs to publish agent frames.
+
+Existing JWTs are immutable and retain their old privileges until expiry or
+explicit revocation. Doctor warns when an enrolled agent grant is broader than
+its account; it does not reject or revoke that grant. To narrow it, upgrade SaaS
+and plugin together. For state already bound to the same trusted issuer, stop the
+account, archive only its credential file, complete the existing SaaS active-key
+replacement procedure, and explicitly re-enroll with
+`openclaw channels add --channel webchannel --account <id>`; this retains history
+and conversation keys. If doctor reports a storage-issuer failure, credential-only
+reissue cannot bypass it: first follow the
+[issuer-recovery procedure](STORAGE_IDENTITY_V2.md#issuer-binding-412) to restore
+the original trusted issuer and matching credentials where supported, or archive
+the complete tuple and initialize fresh state without reusing its history or keys.
+Verify the new grant before revoking the old one. An old JWT without `exp` needs
+explicit replacement/revocation; waiting does not narrow it. Browser sessions
+likewise need newly issued credentials for the new publish restrictions to apply.
+
+This changes relay permissions without changing encrypted frames or protocol 7.
+Direction binding in envelope AAD is a separate defense-in-depth follow-up
+[#436](https://github.com/mir-stream/openclaw-webchannel/issues/436); client replay
+and freshness are tracked by #415 E4.
 
 ## Agent identity-key lifecycle
 
@@ -149,3 +247,18 @@ cannot replace credentials held by a running transport.
 6. Restart the gateway only after enrollment completes.
 
 Until the restart, an already-running transport continues using its old in-memory credentials; online hot-swap is not supported.
+
+
+## Bootstrap JWT lifetime (#447)
+
+The plugin requires finite `iat` and `exp`, with `0 < exp - iat <= 3600` seconds.
+Issued-at may not be later than the verification clock plus configured skew;
+expiry retains the existing clock-skew check. Skew never increases the one-hour
+lifetime cap. Tokens without `iat` or with a longer lifetime are rejected.
+
+Before this change, the demo SaaS, both reference servers and the example app
+all used `buildBootstrapClaims`' 300-second default. The public builder's optional
+TTL and the direct signer had no upper bound; both now enforce the same lifetime
+contract. No first-party deployed bootstrap route requests a longer lifetime.
+This applies to RS256 browser bootstrap tokens. NATS operator/account/user
+credentials are separate relay credentials with separate issuance policies.

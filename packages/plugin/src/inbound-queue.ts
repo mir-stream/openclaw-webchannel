@@ -6,8 +6,10 @@ import {
   type RetentionReservation,
   type RetentionSessionToken,
 } from "./inbound-retention.js";
+import type { StopPendingInput } from "./channel-contract.js";
+import { isExplicitAbortCommand } from "./control-lane.js";
 
-export type UserMessageLike = { type: "user_message"; text: string; id?: string };
+export type UserMessageLike = { type: "user_message"; text: string; id?: string; random_id?: string; retry_of?: string; cancel_pending?: StopPendingInput[] };
 
 /**
  * #99: the wireIds of every message folded into one coalesced turn, in arrival
@@ -31,11 +33,22 @@ export const MAX_COALESCED_MEMBER_ID_LENGTH = 128;
  * everything else — in particular `coalescedIds`, which is plugin-internal
  * state that no peer may supply.
  *
- * The decode path casts rather than validates (`JSON.parse(...) as
- * InboundWsMessage`, `nats-channel.ts`) and its `user_message` case forwards the
- * object untouched, so without this every extra property a peer attaches
- * reaches the turn handler. Applying it at the runtime's message handler makes
- * `coalesceUserMessages` the only producer of a member list.
+ * The `user_message` case forwards the object untouched, so without this every
+ * extra property a peer attaches reaches the turn handler. Applying it at the
+ * runtime's message handler makes `coalesceUserMessages` the only producer of a
+ * member list.
+ *
+ * ⚠️ THE "THE DECODE PATH CASTS RATHER THAN VALIDATES" PREMISE THIS USED TO OPEN
+ * WITH IS NO LONGER TRUE, AND THE FUNCTION IS STILL NEEDED. #246 half A replaced
+ * the `JSON.parse(...) as InboundWsMessage` cast at both of `nats-channel.ts`'s
+ * receive doors with `decodeInboundWsMessage`, so a frame reaching here has a
+ * `text` that IS a string and an `id`/`random_id` that are usable ids or absent.
+ * What that decoder deliberately does NOT do is strip: it refuses malformed
+ * KNOWN fields and passes unknown ones through untouched, because the wire is
+ * additive and an unrecognised field may belong to a newer peer. So the two are
+ * complementary — the decoder decides what is well-formed, this decides what a
+ * peer is allowed to supply at all — and `coalescedIds` still needs dropping
+ * here.
  *
  * It lives here, beside the field's type/producer/reader, so the whole "never
  * from the wire" contract is one file's worth of code; the runtime handler
@@ -44,20 +57,36 @@ export const MAX_COALESCED_MEMBER_ID_LENGTH = 128;
  *
  * A non-string `id` is dropped rather than carried: retention already ignores
  * one (`offer`, below), so this only makes the frame consistent with how the
- * rest of the pipeline reads it.
+ * rest of the pipeline reads it. `random_id` (#243 half 1) is a KNOWN wire field
+ * and is preserved on the same non-string-drop rule, so it survives this strip
+ * and reaches `ingressDedupeKey`; dropping it here would silently defeat the
+ * random_id dedupe by always falling back to the wire `id`.
  *
  * WHAT THIS DOES NOT DO: it strips fields, it does not validate them. `text` is
- * copied through UNVALIDATED — a missing or non-string `text` reaches
- * `isAbortRequestText` and core exactly as it did before, which is the
- * pre-existing decode contract (the cast in `nats-channel.ts` never checked it
- * either). Do not read the name as a validation boundary; adding one is a
- * separate change with its own blast radius.
+ * copied through as-is — this function asks no question about it — and that is
+ * still the right reading of the name: it is not a validation boundary.
+ *
+ * ⚠️ WHAT CHANGED IS WHERE THE ANSWER COMES FROM, NOT WHAT THIS DOES. The old
+ * text said a missing or non-string `text` "reaches `isAbortRequestText` and core
+ * exactly as it did before"; since #246 half A it cannot arrive from the NATS
+ * wire at all, because `decodeInboundWsMessage` refuses a `user_message` whose
+ * `text` is not a string. The type below still permits one, and this function
+ * still copies whatever it is given — the guarantee belongs to the door, so a
+ * DIRECT caller of this function (the tests, any future non-wire producer) gets
+ * no such promise.
  */
 export function normalizeInboundUserMessage(raw: UserMessageLike): UserMessageLike {
   return {
     type: "user_message",
     text: raw.text,
     ...(typeof raw.id === "string" ? { id: raw.id } : {}),
+    ...(typeof raw.random_id === "string" ? { random_id: raw.random_id } : {}),
+    ...(typeof raw.retry_of === "string" ? { retry_of: raw.retry_of } : {}),
+    // Rebuilt from the decoded entries' two known fields only (#398), and kept
+    // only on the explicit stop that reads it; ordinary input never carries it.
+    ...(Array.isArray(raw.cancel_pending) && isExplicitAbortCommand(raw) ? { cancel_pending: raw.cancel_pending.map(entry => ({
+      id: entry.id, ...(typeof entry.random_id === "string" ? { random_id: entry.random_id } : {}),
+    })) } : {}),
   };
 }
 
@@ -65,14 +94,21 @@ export function normalizeInboundUserMessage(raw: UserMessageLike): UserMessageLi
  * Read `coalescedIds` off a message that may NOT be trustworthy, and never
  * throw doing it.
  *
- * The frame this field rides on is decoded with a cast (`JSON.parse(...) as
- * InboundWsMessage` in `nats-channel.ts`) and the `user_message` case forwards
- * it unvalidated, so historically any peer-supplied property survived into the
- * handler. `nats-account-runtime.ts` now strips the frame down to its known
- * wire fields at ingress, which makes `coalesceUserMessages` the field's only
- * producer — this helper is the second layer, so that a future path that
- * forgets to strip degrades to "no members settled beyond the anchor" instead
- * of a thrown turn. Both read sites go through it.
+ * The frame this field rides on used to be decoded with a cast
+ * (`JSON.parse(...) as InboundWsMessage` in `nats-channel.ts`), and the
+ * `user_message` case forwards whatever it gets, so historically any
+ * peer-supplied property survived into the handler. Two layers closed that:
+ * `nats-account-runtime.ts` strips the frame down to its known wire fields at
+ * ingress, which makes `coalesceUserMessages` the field's only producer, and
+ * this helper is the second, so that a future path that forgets to strip
+ * degrades to "no members settled beyond the anchor" instead of a thrown turn.
+ * Both read sites go through it.
+ *
+ * ⚠️ #246 half A ADDED A RUNTIME DECODER AT THE DOOR, AND IT DOES NOT REPLACE
+ * EITHER LAYER. `decodeInboundWsMessage` refuses malformed KNOWN fields and
+ * passes UNKNOWN ones through untouched (the wire is additive), so a peer can
+ * still attach `coalescedIds` to a perfectly well-formed `user_message`.
+ * Stripping remains the only thing that stops it.
  *
  * Hostile shapes and what they become:
  *  - not an array (`5`, `"abc"`, an object) → `[]`. A bare `for…of` over `5`
@@ -218,13 +254,19 @@ type InternalLease<Message> = {
 
 type SessionState<Message> = {
   running?: Promise<void>;
+  /** Entries whose fixed debounce window has elapsed, in arrival order. */
+  ready: RetainedEntry<Message>[];
+  /** Entries in the one currently open fixed debounce window. */
   pending: RetainedEntry<Message>[];
   openLeases: Set<InternalLease<Message>>;
   readyToDrain: boolean;
+  debounceTimer?: ReturnType<typeof setTimeout>;
 };
 
 export type SerializedInboundDispatcherOptions<Message> = {
   coalesce?: (messages: Message[]) => Message;
+  /** Fixed execution window opened by committed admission, on the coalescing path only. */
+  debounceMs?: number;
   budget?: InboundRetentionBudget;
   sessionToken?: (sessionKey: string) => RetentionSessionToken;
   measure?: (message: Message) => number;
@@ -247,6 +289,10 @@ export function createSerializedInboundDispatcher<Message>(
   options?: SerializedInboundDispatcherOptions<Message>,
 ): SerializedInboundDispatcher<Message> {
   const coalesce = options?.coalesce;
+  const debounceMs = options?.debounceMs ?? 0;
+  if (!Number.isSafeInteger(debounceMs) || debounceMs < 0) {
+    throw new TypeError("debounceMs must be a non-negative safe integer");
+  }
   const budget = options?.budget ?? new InboundRetentionBudget();
   const measure = options?.measure ?? estimateRetainedMessageBytes;
   // Validate injected measurement at construction without retaining an item.
@@ -270,8 +316,14 @@ export function createSerializedInboundDispatcher<Message>(
     entry.reservation.requestRelease();
   };
 
+  const clearDebounce = (state: SessionState<Message>) => {
+    if (state.debounceTimer !== undefined) clearTimeout(state.debounceTimer);
+    state.debounceTimer = undefined;
+  };
+
   const maybeForget = (key: string, state: SessionState<Message>) => {
-    if (!state.running && state.pending.length === 0 && state.openLeases.size === 0) {
+    if (!state.running && state.ready.length === 0 && state.pending.length === 0 && state.openLeases.size === 0) {
+      clearDebounce(state);
       sessions.delete(key);
       if (!options?.sessionToken) tokens.delete(key);
     }
@@ -280,7 +332,7 @@ export function createSerializedInboundDispatcher<Message>(
   const sessionFor = (key: string): SessionState<Message> => {
     let state = sessions.get(key);
     if (!state) {
-      state = { pending: [], openLeases: new Set(), readyToDrain: false };
+      state = { ready: [], pending: [], openLeases: new Set(), readyToDrain: false };
       sessions.set(key, state);
     }
     return state;
@@ -311,6 +363,7 @@ export function createSerializedInboundDispatcher<Message>(
       if (state.running !== settled) return;
       state.running = undefined;
       if (disposed) {
+        for (const entry of state.ready.splice(0)) release(entry);
         for (const entry of state.pending.splice(0)) release(entry);
         maybeForget(key, state);
         return;
@@ -326,9 +379,14 @@ export function createSerializedInboundDispatcher<Message>(
   const drain = (key: string, state: SessionState<Message>) => {
     if (state.running || state.openLeases.size > 0) return;
     state.readyToDrain = false;
-    const entries = state.pending.splice(0);
+    const entries = state.ready.splice(0);
     if (entries.length > 0) startTurn(key, state, entries);
     else maybeForget(key, state);
+  };
+
+  const maturePending = (key: string, state: SessionState<Message>) => {
+    state.ready.push(...state.pending.splice(0));
+    drain(key, state);
   };
 
   const disposedLease = (): DispatcherBatchLease<Message> => ({
@@ -414,6 +472,7 @@ export function createSerializedInboundDispatcher<Message>(
       if (internal.finished) return;
       internal.finished = true;
       state.openLeases.delete(internal);
+      let attached = false;
       for (const entry of internal.entries) {
         if (entry.state === "provisional") {
           entry.state = "rolled-back";
@@ -421,9 +480,23 @@ export function createSerializedInboundDispatcher<Message>(
         } else if (entry.state === "committed") {
           entry.state = "attached";
           state.pending.push(entry);
+          attached = true;
         }
       }
       internal.entries = [];
+      // The first committed entry opens a fixed debounce window. Later entries
+      // join that window without moving its deadline, matching the original
+      // bounded ingress debouncer. Exact-ID replay receipts and rolled-back
+      // offers attach no work and therefore cannot move its deadline.
+      if (attached && debounceMs > 0 && state.debounceTimer === undefined) {
+        state.debounceTimer = setTimeout(() => {
+          state.debounceTimer = undefined;
+          if (!disposed && sessions.get(sessionKey) === state) maturePending(sessionKey, state);
+        }, debounceMs);
+        state.debounceTimer.unref?.();
+      } else if (attached && debounceMs === 0) {
+        maturePending(sessionKey, state);
+      }
       if (!state.running && state.openLeases.size === 0) drain(sessionKey, state);
       else if (state.readyToDrain && state.openLeases.size === 0) drain(sessionKey, state);
     };
@@ -503,7 +576,12 @@ export function createSerializedInboundDispatcher<Message>(
   const clearPending = (sessionKey: string): Message[] => {
     const state = sessions.get(sessionKey);
     if (!state) return [];
+    clearDebounce(state);
     const dropped: Message[] = [];
+    for (const entry of state.ready.splice(0)) {
+      dropped.push(entry.message);
+      release(entry);
+    }
     for (const entry of state.pending.splice(0)) {
       dropped.push(entry.message);
       release(entry);
@@ -527,6 +605,11 @@ export function createSerializedInboundDispatcher<Message>(
     let pending = 0;
     let provisional = 0;
     for (const [key, state] of sessions) {
+      clearDebounce(state);
+      for (const entry of state.ready.splice(0)) {
+        pending++;
+        release(entry);
+      }
       for (const entry of state.pending.splice(0)) {
         pending++;
         release(entry);
@@ -557,7 +640,10 @@ export function createSerializedInboundDispatcher<Message>(
     beginBatch,
     pendingSessions: () => chains.size + sessions.size,
     clearPending,
-    pendingBuffered: (key) => sessions.get(key)?.pending.length ?? 0,
+    pendingBuffered: (key) => {
+      const state = sessions.get(key);
+      return state ? state.ready.length + state.pending.length : 0;
+    },
     dispose,
     close: () => {
       void dispose();

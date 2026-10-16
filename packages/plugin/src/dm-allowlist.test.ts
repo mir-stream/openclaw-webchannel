@@ -2,20 +2,15 @@ import { describe, it, expect } from "vitest";
 import { resolveDmAdmission } from "./dm-allowlist.js";
 
 describe("resolveDmAdmission (DM allowlist, split-authz plugin half)", () => {
-  it("admits everyone when no dmSecurity policy is set (Phase A preserved)", () => {
-    expect(resolveDmAdmission("anyone", undefined)).toEqual({
-      allowed: true,
-      reason: "policy-unset",
-    });
-    expect(resolveDmAdmission("anyone", { allowFrom: ["alice"] })).toEqual({
-      allowed: true,
-      reason: "policy-unset",
-    });
+  it("defaults to open but requires an explicit wildcard to admit everyone", () => {
+    expect(resolveDmAdmission("anyone", undefined).allowed).toBe(false);
+    expect(resolveDmAdmission("anyone", { allowFrom: ["alice"] }).allowed).toBe(false);
+    expect(resolveDmAdmission("anyone", { allowFrom: ["*"] })).toEqual({ allowed: true, reason: "open-policy" });
   });
 
   it("admits everyone under an open policy", () => {
     for (const dmSecurity of ["open", "all", "anyone", "everyone", "public", "ANY"]) {
-      expect(resolveDmAdmission("mallory", { dmSecurity }).allowed).toBe(true);
+      expect(resolveDmAdmission("mallory", { dmSecurity, allowFrom: ["*"] }).allowed).toBe(true);
     }
   });
 

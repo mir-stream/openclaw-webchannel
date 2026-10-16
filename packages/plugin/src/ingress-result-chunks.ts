@@ -4,18 +4,43 @@ export const MAX_INGRESS_RESULT_IDS = 64;
 export const MAX_INGRESS_RESULT_WIRE_BYTES = 64 * 1024;
 export const MAX_INGRESS_RESULT_ID_LENGTH = 128;
 
+/**
+ * #243 half 2a: the durable id the server assigned to a fresh (or deduped-retry)
+ * user message, paired with the client `random_id` that keyed it. Rides the `ack`
+ * frame — the frame that already tells the client "this inbound id was accepted"
+ * is the natural place to also say "and here is the durable id we minted for it".
+ * The client IGNORES it in 2a (adoption is half 2b); see `nats-client.ts`.
+ *
+ * #244 half A: `seq` carries the user message's per-conversation sequence. The
+ * user turn-opener consumes a seq (`appendInboundUser`) but rides no durable wire
+ * frame, so this echo is the only way the client learns it — without it the first
+ * agent frame of every turn reads as a phantom gap (doc §16.2-6).
+ *
+ * #399: a second retry of one interrupted original converges on the FIRST
+ * retry's row, which this send did not open. Its echo omits `seq` (the row is
+ * not this device's opener, so the cursor must not move over it unfolded) and
+ * says `converged`, so the client settles only that send's own id.
+ */
+export type CommittedUserMessage = { random_id: string; messageId: string; seq?: number; converged?: true };
+export type IngressRejectionReason = "overloaded" | "policy-denied";
+
 export type IngressResultFrame =
-  | { type: "ack"; ids: string[] }
-  | { type: "inbound_rejected"; ids: string[]; reason: "overloaded" };
+  // cancelled is durable proof for a subset of this frame's exact wire ids;
+  // unaccepted (#398) is the subset of cancelled this server never accepted.
+  | { type: "ack"; ids: string[]; committed?: CommittedUserMessage[]; cancelled?: string[]; unaccepted?: string[] }
+  | { type: "inbound_rejected"; ids: string[]; reason: IngressRejectionReason };
 
 export type IngressResultChunkWriter = {
-  add(id: unknown): boolean;
+  /** cancelled requires durable evidence and always rides this ID's frame, as
+   * does unaccepted (meaningful only with cancelled). */
+  add(id: unknown, cancelled?: boolean, unaccepted?: boolean): boolean;
   finish(): boolean;
   retainedIds(): number;
 };
 
 export type IngressResultChunkOptions = {
   type: IngressResultFrame["type"];
+  reason?: IngressRejectionReason;
   publish(frame: IngressResultFrame): boolean;
   /** Actual sealed wire measurement for this peer/route. */
   measureWireBytes?: (frame: IngressResultFrame) => number;
@@ -23,6 +48,19 @@ export type IngressResultChunkOptions = {
   maxIds?: number;
   maxWireBytes?: number;
   onTooSmall?: () => void;
+  /**
+   * #243 half 2a: the batch's `random_id → messageId` echo, carried on the FIRST
+   * published `ack` frame only (a one-shot) and then dropped. Ignored for
+   * `inbound_rejected`.
+   *
+   * ⚠️ NOT SPLIT ALONGSIDE `ids`, ON PURPOSE. Each entry is SELF-CONTAINED (it
+   * names its own `random_id`), so the client keys on it regardless of which ack
+   * frame it arrives on — there is no id↔entry correspondence to preserve across
+   * chunk boundaries. Riding one frame keeps it off the wire N times over when a
+   * batch chunks, and the frame's wire size is measured WITH it (see `frameFor`),
+   * so the fit invariant still holds.
+   */
+  committed?: CommittedUserMessage[];
 };
 
 /**
@@ -37,7 +75,8 @@ export function base64UrlLength(bytes: number): number {
 
 /**
  * Stream result ids through a single bounded chunk. No whole-flush id array or
- * Set is retained. Each frame deduplicates only its own at-most-64 ids.
+ * Set is retained. Each frame deduplicates only its own at-most-64 ids and carries
+ * only their cancellation flags; no proof may be separated from its wire ID.
  */
 export function createIngressResultChunkWriter(
   options: IngressResultChunkOptions,
@@ -53,35 +92,57 @@ export function createIngressResultChunkWriter(
     Buffer.byteLength(JSON.stringify(frame), "utf8"));
   let ids: string[] = [];
   let inChunk = new Set<string>();
+  let cancelledIds: string[] = [];
+  let unacceptedIds: string[] = [];
   let ok = true;
+  // One-shot: attached to the first `ack` frame `flush` publishes, then cleared
+  // so later frames in a chunked batch do not repeat it. `frameFor` reads it, so
+  // the frame the wire limit is measured against already includes it.
+  let committedPending: CommittedUserMessage[] =
+    options.type === "ack" && options.committed && options.committed.length > 0
+      ? options.committed
+      : [];
 
-  const frameFor = (values: string[]): IngressResultFrame => options.type === "ack"
-    ? { type: "ack", ids: values }
-    : { type: "inbound_rejected", ids: values, reason: "overloaded" };
+  const frameFor = (values: string[], cancelled: string[], unaccepted: string[]): IngressResultFrame => options.type === "ack"
+    ? { type: "ack", ids: values, ...(committedPending.length > 0 ? { committed: committedPending } : {}),
+      ...(cancelled.length > 0 ? { cancelled } : {}), ...(unaccepted.length > 0 ? { unaccepted } : {}) }
+    : { type: "inbound_rejected", ids: values, reason: options.reason ?? "overloaded" };
 
   const flush = (): boolean => {
     if (ids.length === 0) return true;
-    const frame = frameFor(ids);
+    const frame = frameFor(ids, cancelledIds, unacceptedIds);
     const sent = options.publish(frame);
     ok = sent && ok;
     ids = [];
     inChunk = new Set();
+    cancelledIds = [];
+    unacceptedIds = [];
+    // The echo has now ridden a frame; every subsequent frame omits it.
+    committedPending = [];
     return sent;
   };
 
-  const add = (candidate: unknown): boolean => {
+  const add = (candidate: unknown, cancelled = false, unaccepted = false): boolean => {
     if (typeof candidate !== "string" || candidate.length === 0 || candidate.length > MAX_INGRESS_RESULT_ID_LENGTH) {
       return false;
     }
-    if (inChunk.has(candidate)) return true;
-    if (ids.length >= maxIds) flush();
-    let next = [...ids, candidate]; // bounded to maxIds (64)
-    let bytes = measure(frameFor(next));
+    const proof = options.type === "ack" && cancelled;
+    const neverAccepted = proof && unaccepted;
+    if (inChunk.has(candidate) && (!proof || cancelledIds.includes(candidate))
+      && (!neverAccepted || unacceptedIds.includes(candidate))) return true;
+    if (!inChunk.has(candidate) && ids.length >= maxIds) flush();
+    let next = inChunk.has(candidate) ? ids : [...ids, candidate]; // bounded to maxIds (64)
+    let nextCancelled = proof && !cancelledIds.includes(candidate) ? [...cancelledIds, candidate] : cancelledIds;
+    let nextUnaccepted = neverAccepted && !unacceptedIds.includes(candidate) ? [...unacceptedIds, candidate] : unacceptedIds;
+    let bytes = measure(frameFor(next, nextCancelled, nextUnaccepted));
     if (!Number.isSafeInteger(bytes) || bytes < 0) throw new TypeError("wire measurement is invalid");
     if (bytes > effectiveLimit && ids.length > 0) {
       flush();
       next = [candidate];
-      bytes = measure(frameFor(next));
+      nextCancelled = proof ? [candidate] : [];
+      nextUnaccepted = neverAccepted ? [candidate] : [];
+      bytes = measure(frameFor(next, nextCancelled, nextUnaccepted));
+      if (!Number.isSafeInteger(bytes) || bytes < 0) throw new TypeError("wire measurement is invalid");
     }
     if (bytes > effectiveLimit) {
       options.onTooSmall?.();
@@ -89,6 +150,8 @@ export function createIngressResultChunkWriter(
       return false;
     }
     ids = next;
+    cancelledIds = nextCancelled;
+    unacceptedIds = nextUnaccepted;
     inChunk.add(candidate);
     return true;
   };

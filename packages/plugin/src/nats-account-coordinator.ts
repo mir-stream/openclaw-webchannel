@@ -211,11 +211,6 @@ export function formatRelayOrigin(raw: string): string {
   } catch { return "[invalid-relay-url]"; }
 }
 
-export function selectPrimaryRuntime<T>(runtimes: ReadonlyMap<string, T>): T | undefined {
-  return runtimes.get("default") ?? [...runtimes.entries()]
-    .sort(([left], [right]) => left.localeCompare(right))[0]?.[1];
-}
-
 export type AccountAttemptOutcome =
   | { kind: "completed"; closeReport?: TransportCloseReport }
   | { kind: "failed"; cause: unknown; closeReport?: TransportCloseReport };

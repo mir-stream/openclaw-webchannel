@@ -244,8 +244,8 @@ describe("#93 approval delivery — exact origin subject or nothing", () => {
 
   it("#131: derives delivery's persisted session key through production routing", () => {
     expect(SESSION_KEY).toBe(
-      "agent:rota:webchannel:acct:direct:peercase-a:tenant:" +
-        "e9da86d351cf9a7642d8c50195c3f466220911a15c177809bd1161a51e8c5f24",
+      "agent:rota:webchannel:acct:direct:p:50656572436173652d41:tenant:" +
+        "e9da86d351cf9a7642d8c50195c3f466220911a15c177809bd1161a51e8c5f24:peer-v2",
     );
   });
 

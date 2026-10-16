@@ -14,6 +14,11 @@
       .msg { padding: 6px 10px; border-radius: 8px; font-size: 13px; max-width: 80%; }
       .msg.user { align-self: flex-end; background: #2f81f7; color: #fff; }
       .msg.agent { align-self: flex-start; background: #eee; }
+      /* Reasoning bursts and tool calls are transcript members in their own
+         right, not agent bubbles — they carry no author. Rendered muted and
+         visually subordinate so they read as context rather than as answers. */
+      .msg.reasoning { align-self: flex-start; background: #f6f6fa; color: #555; font-style: italic; }
+      .msg.tool { align-self: flex-start; background: #f4f4f4; color: #666; font-family: ui-monospace, monospace; font-size: 12px; }
       form { display: flex; gap: 8px; }
       input { flex: 1; padding: 6px 8px; }
     </style>

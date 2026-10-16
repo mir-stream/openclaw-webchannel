@@ -22,9 +22,6 @@
  * Reading through `resolveWebchannelAccountConfig` reconstructs the full account
  * config regardless of which fields ended up where.
  *
- * Cycle 1 keeps single-account `"default"` working end-to-end; multi-account
- * multiplex SERVING is Cycle 2. `"default"` is a NORMAL account id.
- *
  * ── Account id is a TRUST BOUNDARY ──────────────────────────────────────────
  * accountId participates in the exact storage identity, so it MUST be validated
  * before deriving an opaque tuple namespace. Raw tenant/account values are
@@ -43,7 +40,9 @@ import { dirname, isAbsolute, join } from "node:path";
 import {
   DEFAULT_ACCOUNT_ID,
   normalizeAccountId,
+  normalizeOptionalAccountId,
 } from "openclaw/plugin-sdk/account-id";
+import { resolveListedDefaultAccountId } from "openclaw/plugin-sdk/account-core";
 
 import {
   assertValidAccountId,
@@ -267,7 +266,8 @@ export function hasWebchannelConfig(cfg: unknown): boolean {
 /**
  * Resolve whether an account is enabled for both status and runtime planning.
  * A channel-level false disables every account; otherwise an explicit named
- * account false disables only that account. Missing flags default to enabled.
+ * account false disables only that account. Missing flags default to enabled
+ * for a resolved listed account; an unresolved id is disabled.
  */
 export function isWebchannelAccountEnabled(
   cfg: unknown,
@@ -276,7 +276,8 @@ export function isWebchannelAccountEnabled(
   const section = readWebchannelSection(cfg);
   if (section?.enabled === false) return false;
 
-  const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+  const id = resolveWebchannelAccountId(cfg, accountId);
+  if (id === undefined) return false;
   const account = readAccountsMap(section)[id];
   return !(account && typeof account === "object" && account.enabled === false);
 }
@@ -304,6 +305,9 @@ function mergeAccountConfig(
   override: WebchannelAccountConfig,
 ): WebchannelAccountConfig {
   const merged: WebchannelAccountConfig = { ...base, ...override };
+  // An account-local legacy spelling must still override a shared canonical
+  // policy. Within the same layer the canonical field always wins.
+  if (override.dmSecurity !== undefined && override.dmPolicy === undefined) delete merged.dmPolicy;
   for (const key of NESTED_OBJECT_KEYS) {
     const baseVal = base[key];
     const overrideVal = override[key];
@@ -359,11 +363,81 @@ function assertNoRemovedConfig(account: WebchannelAccountConfig): void {
  * accounts (issue #17). `"default"` is listed only when it is an explicit key of
  * `accounts`, or when `accounts` is empty/absent (the fallback).
  *
- * MUST return ≥1 entry (core's channel monitor short-circuits otherwise).
- * Sorted for stable ordering (mirrors core).
+ * An explicit all-invalid/colliding map returns [] so no runtime can start.
+ * Valid ids are sorted for stable ordering (mirrors core).
  */
 export function listWebchannelAccountIds(cfg: unknown): string[] {
   return inspectWebchannelAccountIds(cfg).validIds;
+}
+
+/** Pure selection plus explicit-invalid diagnostics, consumed by doctor. */
+export function resolveDefaultWebchannelAccountSelection(cfg: unknown) {
+  const preferred = readWebchannelSection(cfg)?.defaultAccount;
+  const accountIds = listWebchannelAccountIds(cfg);
+  const accountId = resolveListedDefaultAccountId({
+    accountIds,
+    configuredDefaultAccountId: typeof preferred === "string" ? preferred.trim() : undefined,
+    // Preference is exact even though read/send lookup accepts canonical aliases.
+    normalizeListedAccountId: (id) => id,
+  });
+  return {
+    accountId,
+    accountIds,
+    configuredDefaultAccount: preferred,
+    invalidConfiguredDefault: preferred !== undefined &&
+      !(typeof preferred === "string" && accountIds.includes(preferred.trim())),
+  };
+}
+
+/** Select from configuration, so unavailable accounts never redirect a send. */
+export function resolveDefaultWebchannelAccountId(cfg: unknown): string {
+  return resolveDefaultWebchannelAccountSelection(cfg).accountId;
+}
+
+/**
+ * Account READ / LOOKUP rule (config facade, acquisition, planning, outbound):
+ * nullish/blank means the configured default selection. Nonblank input is trimmed,
+ * validated, then matched exactly against valid listed ids, then by a unique
+ * public SDK canonical equivalent. Always return the LISTED spelling: it owns
+ * tenant bindings, JWT audience, subjects, keys and storage. Never rename it.
+ *
+ * Unknown, malformed and colliding identities return undefined. In particular,
+ * the SDK's malformed-input fallback to "default" is not a lookup alias. An
+ * empty valid list has no resolved id, even if default selection returns the
+ * SDK placeholder. Availability never changes selection to a sibling account.
+ *
+ * defaultAccount preference separately requires exact listed spelling after
+ * trimming; a case-mismatched preference stays invalid and diagnosable. Setup
+ * writes use their existing ID policy and resolveWebchannelAccountConfigForSetup
+ * for exact write-target merges, including shared base for a new account.
+ * Gateway lifecycle starts require the exact listed ID before either approval
+ * or NATS ownership starts; core's task key must match the storage identity.
+ */
+export function resolveWebchannelAccountId(
+  cfg: unknown,
+  accountId?: string | null,
+): string | undefined {
+  if (accountId != null && typeof accountId !== "string") return undefined;
+  const requested = accountId?.trim();
+  const selection = resolveDefaultWebchannelAccountSelection(cfg);
+  if (!requested) {
+    return selection.accountIds.includes(selection.accountId) ? selection.accountId : undefined;
+  }
+  if (!isValidAccountId(requested)) return undefined;
+  if (selection.accountIds.includes(requested)) return requested;
+  const canonical = normalizeOptionalAccountId(requested);
+  if (canonical === undefined) return undefined;
+  const matches = selection.accountIds.filter((id) => normalizeAccountId(id) === canonical);
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+/** Identity-producing callers must not manufacture a scope for a lookup miss. */
+export function requireWebchannelAccountId(cfg: unknown, accountId?: string | null): string {
+  const id = resolveWebchannelAccountId(cfg, accountId);
+  if (id === undefined) {
+    throw new Error(`webchannel: account ${JSON.stringify(accountId)} does not resolve to a valid listed account`);
+  }
+  return id;
 }
 
 /**
@@ -373,15 +447,29 @@ export function listWebchannelAccountIds(cfg: unknown): string[] {
  *   - Flat single-account config (no `accounts`) + `"default"` ⇒ the flat base
  *     (backward-compatible single-account behavior).
  *   - Per-account config ⇒ shared base + the named account's override.
+ *   - Unresolved read id ⇒ no account data ({}); see resolveWebchannelAccountId.
  */
 export function resolveWebchannelAccountConfig(
+  cfg: unknown,
+  accountId?: string | null,
+): WebchannelAccountConfig {
+  const id = resolveWebchannelAccountId(cfg, accountId);
+  return id === undefined ? {} : resolveWebchannelAccountConfigForSetup(cfg, id);
+}
+
+/**
+ * Exact write-target merge for setup, including shared base for a NEW id.
+ * This does not resolve aliases or prove that an account exists/is servable.
+ */
+export function resolveWebchannelAccountConfigForSetup(
   cfg: unknown,
   accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
 ): WebchannelAccountConfig {
   const section = readWebchannelSection(cfg);
   if (!section) return {};
   const base = channelLevelBase(section);
-  const override = readAccountsMap(section)[accountId] ?? {};
+  const accounts = readAccountsMap(section);
+  const override = Object.prototype.hasOwnProperty.call(accounts, accountId) ? accounts[accountId] ?? {} : {};
   const resolved = mergeAccountConfig(base, override);
   assertNoRemovedConfig(resolved);
   return resolved;
@@ -398,17 +486,18 @@ export function resolveWebchannelAccountConfig(
  */
 export function resolveAcquisitionIdentity(
   cfg: unknown,
-  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  accountId?: string | null,
 ): WebchannelAcquisitionIdentity {
-  const account = resolveWebchannelAccountConfig(cfg, accountId);
+  const id = requireWebchannelAccountId(cfg, accountId);
+  const account = resolveWebchannelAccountConfig(cfg, id);
   const top = cfg as
     | { tenant?: string; saas?: { baseUrl?: string } }
     | undefined;
   const accountSaas = (account.saas as { baseUrl?: string } | undefined)?.baseUrl;
 
-  const isDefault = accountId === DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+  const isDefault = id === DEFAULT_WEBCHANNEL_ACCOUNT_ID;
   return {
-    accountId,
+    accountId: id,
     tenant:
       (account.tenant as string | undefined) ??
       (isDefault ? top?.tenant : undefined) ??
@@ -504,10 +593,159 @@ export function resolveReasoningEnabled(accountConfig: WebchannelAccountConfig):
   return (capabilities as { reasoning?: unknown }).reasoning === true;
 }
 
+/**
+ * Resolve whether reasoning content is DURABLE — journaled to disk — for an
+ * account (#242 half 1). Reads `capabilities.reasoningDurable`.
+ *
+ * DEFAULT **OFF**. An absent key, an absent container, and every malformed
+ * shape all resolve `false`; only a plain object carrying literal boolean `true`
+ * as an OWN property opens it.
+ *
+ * ⚠️ THIS IS A SECOND SWITCH ON PURPOSE, AND MERGING IT BACK INTO
+ * `capabilities.reasoning` IS THE MISTAKE THIS DOCBLOCK EXISTS TO PREVENT.
+ * **#113's default-ON was a decision to render a volatile live lane, and it does
+ * not inherit to a decision to permanently record plaintext to disk.** Those are
+ * two different questions with two different blast radii:
+ *  - the LANE is ephemeral: it is drawn, and with durability OFF nothing of it
+ *    survives a reload. Defaulting it ON costs a UI section.
+ *    ⚠️ THIS BULLET USED TO SAY "the client's own `state.reasoning` is capped
+ *    and eventually dropped, and nothing survives a reload", and #242 half 2
+ *    falsified BOTH clauses — four lines above the paragraph that was rewritten
+ *    for exactly this reason. The `.slice(-100)` cap is GONE (`upsertReasoning`
+ *    was deleted; `state.reasoning` is derived from `state.messages` and
+ *    uncapped), and for an OPTED-IN account a reload does replay it. The
+ *    ephemerality that survives is conditional on the opt-in being off, which is
+ *    the distinction this whole docblock is drawing — so the sentence had to
+ *    name it rather than assert the old absolute;
+ *  - the JOURNAL is permanent plaintext on disk. `resolveReasoningEnabled` one
+ *    function up already treats this content as sensitive for the SAME reason,
+ *    in its own words: reasoning "can restate file contents, credentials, or the
+ *    user's own prompt to the least trusted surface this plugin serves". Add
+ *    TOOL OUTPUT to that list for the durable case — it is the material most
+ *    likely to appear in deliberation and in neither side of the conversation —
+ *    and note there is no retention path yet (**#299** is unshipped), so nothing
+ *    ages out.
+ *
+ * ⚠️ THE "BENEFIT SIDE IS CURRENTLY ZERO" ARGUMENT HAS EXPIRED — AND THE
+ * DEFAULT STILL DOES NOT MOVE IN THIS SLICE. Half 1 justified the opt-in partly
+ * on the ground that nothing could read the rows back: the projection dropped
+ * reasoning because the wire row's `role` could not express a role-less message,
+ * so the window had a real cost and no benefit at all. #242 half 2 widened the
+ * wire row into a tagged union, emitted reasoning, and moved the client render
+ * onto the shared reducer — so the rows ARE readable now and that half of the
+ * argument is gone.
+ *
+ * What is left is the half that decided it anyway, and it is untouched: the
+ * JOURNAL is permanent plaintext on disk, holding content the user never chose
+ * to publish, with no retention path (**#299** is unshipped). Turning that on by
+ * default is not a rendering decision, so it is not #113's to inherit. Changing
+ * the default is a deliberate privacy call — **#306** owns it, and it is OPEN —
+ * not a consequence of half 2 shipping. Do not read "the reason is stale" as
+ * "the default is wrong".
+ *
+ * ⚠️ SEPARATE SWITCH, BUT NOT AN INDEPENDENT ONE — THE DEPENDENCY RUNS ONE WAY
+ * AND IT IS SILENT. This resolver's `true` is NECESSARY BUT NOT SUFFICIENT.
+ * `inbound.ts` builds `createReasoningDraftController` only when
+ * `resolveReasoningEnabled` (plus `!controlLane` and no session `/reasoning
+ * off`) says the LANE is open, and the journal hook sits on the outbound frame
+ * funnel — so with the lane closed there are no `reasoning` frames to map, and
+ * `capabilities.reasoningDurable: true` writes ZERO ROWS.
+ *
+ * ✅ IT IS NO LONGER SILENT. This used to end "with no warning… the
+ * opted-in-lane-received-nothing diagnostic does not fire either; it only
+ * watches lanes that OPENED." That second sentence is still true, and #242
+ * half 2 added the counterpart it exposes: `nats-account-runtime.ts` warns once
+ * per account start when `reasoningDurable` is on and `resolveReasoningEnabled`
+ * is off, naming both keys and which one to change. A peer's own persisted
+ * `/reasoning off` is still silent, deliberately — that one is a user choice,
+ * not an operator mistake.
+ *
+ * So "record the deliberation but do not stream it to browser peers" is NOT a
+ * configuration these two keys can express, and the asymmetry is inherent
+ * rather than incidental: durability is recorded AT THE DELIVERY ACT, which is
+ * the whole principle (doc §0, and NOT-list N6b/N6c forbids a second journal
+ * hook inside the controller to route around it). Changing it is a design
+ * question, not a flag.
+ *
+ * The two keys ARE independent in the direction that matters for the decision
+ * below — lane ON + durable OFF is the default and is fully supported — and
+ * they are independent at THIS function's boundary, which is all
+ * `manifest-schema.test.ts`'s hydration case asserts. Do not read that test as
+ * saying the runtime honours every combination.
+ *
+ * ── WHY THIS IS SHORTER THAN `resolveReasoningEnabled`, AND WHAT MUST STAY ──
+ *
+ * That function's longer ladder — the separate `capabilities === undefined`
+ * arm, the "only an omitted container gets the default" comment — exists because
+ * its default is ON: there, mistaking a malformed container for an absent one
+ * would ERASE AN INHERITED OPT-OUT and leak the lane back on. Here the default
+ * is OFF, so every one of those paths already lands on `false` and writing them
+ * out separately would be branch structure with no behaviour behind it.
+ *
+ * ⚠️ TWO OF ITS GUARDS MUST SURVIVE, BUT THEY DO NOT DO WHAT AN EARLIER REVISION
+ * OF THIS DOCBLOCK CLAIMED. That revision said the PROTOTYPE CHECK is what stops
+ * "a poisoned `Object.prototype` (or a class instance whose prototype declares
+ * it)" from supplying `reasoningDurable: true` through the chain. It is not —
+ * the OWN-property test below already blocks both, and would block them with the
+ * prototype check deleted. MEASURED against that exact counterfactual:
+ *
+ *   capabilities                                    shipped | no prototype check
+ *   Object.create({reasoningDurable:true})           false  | false
+ *   class instance, PROTOTYPE declares it            false  | false
+ *   plain {} under a poisoned Object.prototype       false  | false
+ *   class instance with an OWN reasoningDurable=true false  | TRUE
+ *
+ * So the prototype check contributes EXACTLY ONE behaviour, and it is the last
+ * row: it refuses an explicit, OWN-property opt-in carried on an object whose
+ * prototype is not plain. Nothing about inheritance.
+ *
+ *  - the PROTOTYPE CHECK, kept for the reason that is actually true: this is a
+ *    CONFIG boundary, and config is JSON. A `Date`, a class instance, a `Map` —
+ *    anything with a non-plain prototype — cannot have come from a parsed
+ *    config file, so whatever produced it did something this resolver has no
+ *    model of. Refusing the whole container is the right posture for a switch
+ *    that turns on plaintext-at-rest; "it carries the key, so honour it" is not.
+ *    It is a shape check, not an inheritance defence.
+ *  - `Object.prototype.hasOwnProperty.call`, which IS the inheritance defence and
+ *    is doing that work alone. A bare `capabilities.reasoningDurable` read walks
+ *    the prototype chain, so this is what stops a poisoned `Object.prototype`
+ *    from opting every account in. It is `.call`ed off `Object.prototype` rather
+ *    than invoked as a method because `capabilities` may be a null-prototype
+ *    record, which has no `hasOwnProperty` of its own.
+ *
+ * `account-config.test.ts`'s prototype-chain case already attributed these
+ * correctly — its case (b) says the poisoned-`Object.prototype` shape "is
+ * carried entirely by the OWN-property test". The two files now agree; when they
+ * disagreed, the test was right.
+ *
+ * A null prototype is ACCEPTED (`Object.create(null)` is the safest plain record
+ * there is, and it is what a hardened config loader produces); what is refused
+ * is a prototype that is neither `Object.prototype` nor absent.
+ */
+export function resolveReasoningDurable(accountConfig: WebchannelAccountConfig): boolean {
+  const capabilities = accountConfig?.capabilities;
+  // `typeof null === "object"`, so null is excluded explicitly; `undefined`
+  // falls out of the `typeof` test and needs no arm of its own under a
+  // default-OFF gate.
+  if (
+    capabilities === null ||
+    typeof capabilities !== "object" ||
+    Array.isArray(capabilities)
+  ) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(capabilities);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  if (!Object.prototype.hasOwnProperty.call(capabilities, "reasoningDurable")) {
+    return false;
+  }
+  return (capabilities as { reasoningDurable?: unknown }).reasoningDurable === true;
+}
+
 /** Read an account's merged `nats` config block (for credential-source resolution). */
 export function resolveAccountNatsConfig(
   cfg: unknown,
-  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  accountId?: string | null,
 ): WebchannelNatsConfig | undefined {
   const account = resolveWebchannelAccountConfig(cfg, accountId);
   return account.nats as WebchannelNatsConfig | undefined;

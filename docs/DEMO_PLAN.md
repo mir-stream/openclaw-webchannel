@@ -322,25 +322,28 @@ gap (below).
   core change.** Two independent causes were stacked; fixing the first exposed the
   second. (This trace predates the register-over-NATS migration — the register hop
   named below was an HTTP plugin route at the time; it is now a NATS request/reply,
-  but the detached-async-context read and register-complete snapshot carried
-  forward unchanged, and Phase 6 later added the register-delivered snapshot on top.)
+  and Phase 6 later added the register-delivered snapshot on top.)
 
-  **Cause 1 — scope (`missing scope: operator.read`).** `historyRecent` runs inside
-  webchannel's `auth:"plugin"` register route. openclaw wraps every plugin-route
-  handler in an async-local (ALS) gateway scope whose operator client scopes are `[]`
-  whenever `route.auth !== "gateway"` (`plugins-http-CM1BGr1B.js:37`); the in-process
-  `sessions.get` dispatch (`getSessionMessages`) inherits that empty-scope client,
-  which shadows the fallback synthetic `operator.write` client
-  (`server-plugins-CLZE4NgR.js:221,233`), so `operator.read` is denied. No
-  openclaw.json key or gateway flag changes it — `getSessionMessages` (unlike
-  `deleteSession`, `server-plugins:363-372`) exposes no `forceSyntheticClient`.
-  **Fix:** run the read inside a `node:async_hooks` `AsyncResource` constructed at
-  module-evaluation time — before any request scope exists — so `runInAsyncScope`
-  re-establishes that clean, client-less context. With no ambient scoped client the
-  dispatcher falls through to the synthetic `operator.write` client (which implies
-  `operator.read`) and the read succeeds. This is option (2) from the original
-  trace; the "openclaw doesn't expose the ALS seam" caveat was wrong — `AsyncResource`
-  IS the seam. See `runDetachedHistoryRead` in `index-nats.ts`.
+  **Cause 1 — scope (`missing scope: operator.read`) — ⚠️ SUPERSEDED AND DELETED
+  (#240, 2026-08-26).** Kept as history because the trace is instructive, not
+  because the code exists: **there is no operator-scope detour any more, and the
+  problem it solved cannot recur.** Since #240 half 2 the plugin serves history
+  from its OWN delivery journal (`journal-history.ts`), so a history read makes
+  no in-process gateway dispatch at all — no `sessions.get`, no ambient operator
+  client, nothing to authorize. The `node:async_hooks` `AsyncResource`
+  workaround (`runDetachedHistoryRead`) and the core-transcript reader it
+  wrapped were both deleted. What used to happen, for the record: the read ran
+  inside webchannel's `auth:"plugin"` register route; openclaw wraps every
+  plugin-route handler in an async-local (ALS) gateway scope whose operator
+  client scopes are `[]` whenever `route.auth !== "gateway"`
+  (`plugins-http-CM1BGr1B.js:37`), and the in-process transcript dispatch
+  inherited that empty-scope client, which shadowed the fallback synthetic
+  `operator.write` client (`server-plugins-CLZE4NgR.js:221,233`), so
+  `operator.read` was denied. The fix was to run the read inside an
+  `AsyncResource` constructed at module-evaluation time, before any request
+  scope existed, so `runInAsyncScope` re-established a clean client-less context
+  and the dispatcher fell through to the synthetic client. Do not reintroduce
+  any of this: reading core's transcript for the client is NOT-list N2.
 
   **Cause 2 — historical timing.** The former unauthenticated handshake path did
   not have a peer key when register attempted the snapshot. That path is gone.
@@ -353,9 +356,10 @@ gap (below).
   the prior turn. (This paragraph used to contrast it with a plugin-side
   `HistoryStore`; that module never had a production caller and was deleted in
   #153 — late-join/multi-device is served by `sendHistory` +
-  `late-join-decryptor.ts`.) No upstream dependency; the openclaw
-  `getSessionMessages`/`deleteSession` asymmetry remains worth filing but is no
-  longer blocking.
+  `late-join-decryptor.ts`.) No upstream dependency. The openclaw
+  transcript-read/`deleteSession` synthetic-client asymmetry that Cause 1 turned
+  on is **moot for us as of #240**: we no longer make that dispatch, so there is
+  nothing left here to file upstream on our own behalf.
 
 ## Phase 2 status (2026-07-03) — fleet built + verified
 

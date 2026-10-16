@@ -43,6 +43,17 @@ browser/Playwright variant against a hosted SaaS issuer is follow-up #13. See ST
   [`../../e2e/local/README.md`](../../e2e/local/README.md) to reproduce browser↔agent locally.
 - Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md) for the current authoritative state.
 
+### Account selection
+
+Account read/lookup rules are defined in
+[`resolveWebchannelAccountId`](src/account-config.ts): core aliases resolve to
+the exact listed account spelling, which remains the tenant/JWT/subject/storage
+identity. Gateway lifecycle starts require the exact listed ID; an alias is
+refused before approval or NATS startup.
+Setup keeps its existing write-ID policy. `openclaw doctor` reports an invalid
+`channels.webchannel.defaultAccount`, its selected fallback and a remedy;
+selection alone does not establish runtime availability.
+
 ## Enrollment & credentials (NATS mode)
 
 `src/enrollment-client.ts` implements plugin-side onboarding over the **RFC 8628 device flow**
@@ -95,6 +106,10 @@ credentials and skips enrollment only when their complete v2 identity matches th
 tenant, account, SaaS base, delivered issuer/relay, and local public key.
 
 **Credential storage:**
+- **Config output:** inline `nats.credentials.userJwt` and `userSeed`, including
+  named-account overrides, carry sensitive UI hints. Core config snapshots and
+  UI responses mask these values. This does not encrypt the configuration file
+  or add SecretRef/provider resolution; existing inline parsing is unchanged.
 - **Default location:** `~/.openclaw-webchannel-v2/<v2_namespace>/credentials.json`,
   where `<v2_namespace>` is the fixed path-safe id derived from the exact,
   case-sensitive `(tenant, accountId)`.
@@ -294,15 +309,19 @@ user credentials' pub/sub permissions minted during enrollment.
 
 ## Develop / test
 
+Run these commands from the monorepo root so the shared Vitest dependency is
+installed alongside the workspaces:
+
 ```bash
-npm install
-npm run typecheck     # tsc --noEmit
-npm test              # vitest run
+npm ci
+npm run typecheck --workspace=packages/plugin
+npm test --workspace=packages/plugin
+npm run build --workspace=packages/plugin
 ```
 
-**Note:** this package currently has **no `build` script** (only `test` and `typecheck` in
-`package.json`); the plugin is loaded as TypeScript via OpenClaw's plugin loader. Packaging /
-publish to ClawHub is a known open question — see `../../docs/PACKAGING.md` and STATUS.md.
+The build produces the `dist/` entries loaded by OpenClaw. Vitest stays in the
+repository root's development dependencies so production plugin installs do not
+resolve the test runner's peer dependencies.
 
 The plugin serves no static UI and no inbound
 HTTP routes at all: register admission (`register-hop` mode) rides NATS request/reply on the

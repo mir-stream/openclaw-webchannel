@@ -11,7 +11,7 @@ framework.
 ## Usage
 
 ```ts
-import { WebChannelNATSClient } from "@mir-stream/webchannel-client";
+import { WebChannelNATSClient } from "openclaw-webchannel-client";
 
 const client = new WebChannelNATSClient({
   natsUrl: "wss://relay.example.com",
@@ -39,6 +39,43 @@ Public state types include `ChatMessage`, `ApprovalRequest`, `ReasoningItem`,
 `WebChannelState`, `WebChannelErrorCause`, `WebChannelOptions`, and the P0-4
 send-result types `SendState`, `SendFailure`, and `SendReceipt`.
 
+### BREAKING: `ChatMessage` is a tagged union, and reasoning is in the transcript
+
+`state.messages` now carries reasoning blocks alongside chat bubbles, because a
+reasoning block has a POSITION in the conversation and the transcript array is
+what holds positions. `ChatMessage` is therefore
+`ChatBubble | ChatReasoningMessage`, discriminated on `kind`:
+
+```ts
+if (m.kind === "reasoning") {
+  // { kind, id, turnId, text, ts? } — no `role`, no send/draft state.
+} else {
+  // ChatBubble — exactly the old ChatMessage, with no `kind` key.
+}
+```
+
+Migration, in practice:
+
+- a renderer that walks `state.messages` **must** handle `kind === "reasoning"`,
+  or it will draw a reasoning block as an agent bubble (a reasoning entry has no
+  `role`, so `role === "user"` is false);
+- reads that ask "is this bubble in state X" — `m.role === "user"`, `m.working`,
+  `m.pending` — keep compiling and keep their exact behaviour. Those fields are
+  declared absent on the reasoning arm, so they answer `undefined`, and comparing
+  one against a literal narrows to `ChatBubble`;
+- **never** construct a reasoning entry with a `role`. The wire carries none and
+  inventing one puts a fabricated author in the system of record; the type makes
+  it a compile error.
+
+`state.reasoning` keeps its `ReasoningItem[]` shape, so code that only reads it
+needs no edit — but it is now **derived** from `state.messages` rather than
+separately maintained, and the previous 100-item cap is **gone** (the durable
+view is uncapped; a live cap made a reload disagree with what was watched).
+
+Whether reasoning survives a reload is an agent-side opt-in
+(`channels.webchannel.capabilities.reasoningDurable`, default **off**). With it
+off the lane still renders live and a reload shows none of it.
+
 ### Terminal connection causes
 
 `WebChannelState.errorCause` distinguishes failures that need re-authentication
@@ -58,7 +95,7 @@ was installed, and the replay ledger drained. A raw socket open by itself remain
 with `connected: false`. This avoids releasing locally-held work into a keyless
 replacement connection.
 
-`ackStallTimeoutMs` controls two reactive recovery signals with one shared policy:
+`ackStallTimeoutMs` controls three reactive recovery signals with one shared policy:
 
 - default `30_000` ms; accepted values are integers from `0` through
   `2_147_483_647`;
@@ -66,7 +103,9 @@ replacement connection.
   requests at most one soft reconnect per continuous no-result interval;
 - an ordinary follow-up held behind a live turn/FIFO gate with no authenticated
   turn activity requests the same recovery path once;
-- `0` disables both automatic signals. It does not disable live publish retries,
+- an accepted, unsettled local turn with no authenticated application activity
+  requests reconnect/register recovery even when the relay still answers PING;
+- `0` disables all three automatic signals. It does not disable live publish retries,
   heartbeat/raw-loss recovery, manual reconnect, or authenticated readiness.
 
 The timeout is a recovery policy, not a delivery deadline. Missing ACK is
@@ -76,17 +115,44 @@ wire ID; the detector never synthesizes `/stop`, releases it, or bypasses FIFO.
 Only the existing reconnect → register → key → same-ID replay → session-ready and
 stale-draft/FIFO paths change those states.
 
-A legitimately silent turn with a held follow-up can therefore cause one harmless
-extra reconnect. Raise the timeout or set it to `0` for workloads where long
-silent turns are normal. A completely idle tab has no active-work signal and is
-not proactively probed by this recovery mode.
+Accepted turns stay under observation across transport replacement until a server
+settlement arrives (or the client is closed/retired). Authenticated live activity
+and successful replacement readiness start a fresh interval. Registration snapshots
+and difference recovery can therefore surface a missed `interrupted`, completed,
+cancelled, or failed outcome. An accepted task is absent from the replay ledger:
+recovery never republishes it or infers an execution outcome from silence.
+
+Protocol 6 ACKs may carry `cancelled`, an authenticated subset of that frame's
+acknowledged wire IDs. This is explicit server evidence that those inputs were
+durably cancelled, including inputs stopped before a journal row existed. The
+client retires only those IDs from the activity watch before acceptance callbacks
+can run. Their delivery receipts remain `accepted`; no task result or journal row
+is fabricated. Ordinary ACKs, empty/truncated history, and a local `/stop` request
+alone do not prove cancellation. Upgrade the client and plugin together.
+
+Cancellation cleanup preserves typing and held follow-ups when another request
+is known to be queued or started, including work sent by another device. A late
+first cancellation ACK cannot claim that request's unscoped typing merely because
+the cancelled input was still a local send candidate.
+While a gap or pending history is being reconciled, typing cleanup waits for the
+existing ordered recovery drain. It then checks the reconciled work once; newer
+typing or a connection lifecycle change discards the old cleanup decision.
+Cancellation receipt acceptance and exact activity-watch retirement stay immediate.
+
+Like a held-only episode, a silent accepted turn requests at most one reconnect
+per silent interval: recovery itself is not activity, so the watch re-arms only
+after new live activity or a newly accepted send. A second plugin restart during
+the same silent turn is therefore detected at the next activity frame. The watchdogs share the existing
+recovery path so coincident deadlines do not start duplicate reconnects. A completely
+idle tab has no active-work signal and is not proactively probed by this mode.
 
 ### Turn activity: `turnActive` vs `isTyping`
 
-`state.isTyping` mirrors the agent's single per-turn `typing` frame and is
-cleared by the first `progress` / `agent_message` / `approval_*` frame. It answers
-"is an answer being composed right now?", so it is deliberately silent for the
-rest of a multi-step turn.
+`state.isTyping` mirrors the agent's initial `typing` frame and is cleared by
+the first `progress` / `agent_message` / `approval_*` frame. Periodic renewals
+marked `keepalive: true` refresh liveness without re-arming the indicator or
+holding ordinary followups after output or approval. A later ordinary typing
+frame can set the indicator again.
 
 `state.turnActive` answers the other question — "is the agent still working on
 this turn?" — and is owned by the client, not the wire. It becomes `true` the
@@ -101,8 +167,7 @@ buffered and coalesced into a single turn keyed by the last of them. The current
 plugin emits one same-outcome `turn_settled` per coalesced member, in arrival
 order with the anchor last; the client promotes the exact receipt each frame
 names. A settle also closes the turn it names **and every turn published before
-it**. That prefix sweep remains for older anchor-only v3 plugin builds and for
-lost/missing earlier member frames. Both outcomes
+it**. That prefix sweep remains for lost/missing earlier member frames. Both outcomes
 sweep, as does an outcome-less legacy settle; sweeping turn activity never
 fabricates a receipt outcome.
 
@@ -133,14 +198,12 @@ disconnected opens no turn until its first successful publication after
 reconnect. An explicit `/stop` also consumes ordinary sends already queued at
 that boundary, so their later publication cannot re-open the stopped work; a
 follow-up created by the stop's own cancellation fanout belongs after that
-boundary and remains eligible. The post-reconnect staleness valve force-closes
-open turns too, but only in the case where it arms at all — when a `working`
-draft was live as the session re-established — so it is a bonus rescue, not a
-general timeout.
-Force-closing an already-open turn is one-way: unlike `isTyping`, which a later
-`typing` frame re-arms, an ack or replay does not re-open it, so a transient
-reconnect in the middle of a long turn leaves `turnActive` false for the rest of
-it.
+boundary and remains eligible. After recovery, durable `queued`/`started` state
+can restore this client's published unsettled turns in publish order. Explicitly
+stopped, settled, cancelled, terminal-receipt, and foreign turns cannot reopen.
+The post-reconnect staleness valve closes unconfirmed open turns when an old
+working draft expires; eligible server-confirmed turns stay open. Durable state
+alone does not re-arm the one-recovery-per-silent-interval watchdog.
 
 The residual has one shape, and no attempt is made to enumerate its causes: **any
 published turn whose settle never arrives — or arrives naming an id this client
@@ -222,10 +285,12 @@ unsupported.
 **Coalesced receipts:** a burst still has one ANCHOR (the last member, used by
 draft and answer frames), but the current plugin emits a `turn_settled` for every
 member with the same outcome, anchor last. The client promotes only the exact
-`turnId === wireId` match, so all member receipts resolve. Older anchor-only v3
-plugin builds leave non-anchor receipts at
-`accepted`; the turn-activity prefix sweep closes their indicators without
-inventing receipt success.
+`turnId === wireId` match, so all member receipts resolve. (Historically,
+plugin builds before `0.5.0`, where per-member `turn_settled` shipped, left
+non-anchor receipts at `accepted`, and the turn-activity prefix sweep closed
+their indicators without inventing receipt success. Those builds speak protocol
+v3 or older, which a v4 client refuses, so that path is no longer reachable; the
+sweep remains for lost or missing member frames.)
 
 **Answer-delivery vs turn outcome:** if the agent's final answer frame fails to
 send but the turn itself settled without error, the message still reaches
@@ -257,7 +322,10 @@ becomes `failed { reason: "overloaded", retryable: true }`; retry is a deliberat
 caller/user action and creates a new id. Before either ACK or rejection arrives,
 the client reliability layer replays the same id live with capped exponential
 backoff, as well as immediately on reconnect. Client and plugin must be upgraded
-together — the wire protocol is now **v3**.
+together — the unreleased wire protocol is **v7** (v3 in `0.4.0`, the register hop
+described below; v4 in #246; v6 adds durable cancellation ACK evidence). Protocol 7
+combines scoped stop (#398), history page correlation (#401), and typing renewals
+that preserve immediate followup admission (#396) in the same release contract.
 
 ### BREAKING: protocol v3 register hop
 
@@ -277,9 +345,9 @@ See [`../../docs/AUTH.md`](../../docs/AUTH.md) for the reasoning.
 
 The boolean `delivered` is gone. Migration: `delivered === true` ↔
 `sendState === "accepted" || sendState === "completed"`; render a failure from
-`sendState === "failed"` + `sendFailure`. `@mir-stream/webchannel-client` and
-`@mir-stream/webchannel-plugin` ship in lockstep — upgrade both together (the
-protocol v3 registration is mandatory in both directions).
+`sendState === "failed"` + `sendFailure`. `openclaw-webchannel-client` and
+`openclaw-webchannel` ship in lockstep — upgrade both together (the register
+protocol version is mandatory in both directions, and is **v7** today).
 
 See [`../../docs/STATUS.md`](../../docs/STATUS.md) for current deployment status
 and [`../../docs/TRUST_AND_ONBOARDING.md`](../../docs/TRUST_AND_ONBOARDING.md) for
@@ -287,8 +355,26 @@ the enrollment and trust model.
 
 ## Build / test
 
+Run from the monorepo root; Vitest is a shared root development dependency.
+
 ```bash
-npm run build
-npm run typecheck
-npm test
+npm ci
+npm run build --workspace=packages/client
+npm run typecheck --workspace=packages/client
+npm test --workspace=packages/client
 ```
+
+### Interrupted requests (protocol 5)
+
+`ChatBubble.requestState` is server-authoritative and survives history hydration:
+`queued`, `started`, `completed`, `failed`, `interrupted`, or `cancelled`. Transport
+`sendState: "accepted"` only means acceptance. An own receipt can also become
+`interrupted`; this is an unknown result, not an ordinary retry-safe failure.
+
+Show **Interrupted · result unknown** with any retained output. A deliberate
+`client.retryInterrupted(message.id)` creates a new execution with fresh wire and
+logical IDs and `retry_of` provenance. The interrupted original remains visible.
+The method refuses completed, cancelled, missing and non-user messages. Ordinary
+transport retransmission uses the original IDs and never becomes this action.
+The demo and reference app expose a Retry button with a reminder to check effects.
+Deploy client and plugin together; protocol 5 is required on both.

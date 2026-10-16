@@ -5,14 +5,20 @@ import type {
   RetentionSessionToken,
 } from "./inbound-retention.js";
 import { estimateRetainedMessageBytes } from "./inbound-retention.js";
+// #344: `IngressRefusal` is the subset a reader without the journal may act on —
+// see THE READER RULE on `OutcomeLookup` in that file. Bound as types rather than
+// restated as literals, so a fourth outcome does not need an edit here and an
+// `accepted` fast-path decision does not typecheck.
+import type { IngressOutcome, IngressRefusal } from "./ingress-outcome.js";
 
 export type RetainedDebounceEntry<Item> = {
   item: Item;
   reservation: RetentionReservation;
   id?: string;
+  dedupeKey?: string;
   /** False after this key/account generation has been retired. */
   isActive(): boolean;
-  /** True when `/stop` owns this pre-run entry's terminal accepted outcome. */
+  /** True when `/stop` owns this pre-run entry's terminal `cancelled` outcome. */
   isCancellationRequested(): boolean;
   /** True after peer/account teardown revokes cancellation delivery ownership. */
   isRetired(): boolean;
@@ -24,7 +30,7 @@ export type BoundedDebouncePushResult =
   | { status: "accepted" }
   | { status: "duplicate-inflight" }
   | { status: "overflow-inflight" }
-  | { status: "known-outcome"; outcome: "accepted" | "overloaded" }
+  | { status: "known-outcome"; outcome: IngressRefusal }
   | { status: "overflow"; reason: RetentionLimitReason; chargedBytes?: number }
   | { status: "disposed" };
 
@@ -33,6 +39,8 @@ export type BoundedInboundDebouncer<Item> = {
   /** Compatibility alias for the pinned SDK primitive's call sites. */
   enqueue(item: Item): Promise<BoundedDebouncePushResult>;
   cancelKey(key: string, options?: { notify?: boolean }): boolean;
+  /** Synchronous bounded snapshot; persist before invalidating this generation. */
+  retainedItems(key: string): readonly Item[];
   /** Retires all work; `inflight` includes callbacks that still physically retain entries. */
   dispose(): { waiting: number; inflight: number };
   /** Live physical entry/key ownership, including invalidated callbacks awaiting settlement. */
@@ -49,18 +57,25 @@ export type BoundedInboundDebouncerOptions<Item> = {
   onFlush(entries: readonly RetainedDebounceEntry<Item>[]): Promise<void> | void;
   onCancel?: (entries: readonly RetainedDebounceEntry<Item>[]) => Promise<void> | void;
   getId?: (item: Item) => string | undefined;
-  peekOutcome?: (key: string, id: string) => "accepted" | "overloaded" | undefined;
-  isOverflowClaimed?: (key: string, id: string) => boolean;
+  /** Logical outcome identity. Defaults to the wire ID for generic callers. */
+  getDedupeKey?: (item: Item) => string | undefined;
+  peekOutcome?: (key: string, dedupeKey: string) => IngressOutcome | undefined;
+  isOverflowClaimed?: (key: string, dedupeKey: string) => boolean;
+  /** Attach a new wire correlation to a bounded, active logical resolution. */
+  onOverflowClaimed?: (item: Item) => void;
   /** Synchronous `/stop` tombstone lookup; authoritative over cached outcomes. */
-  isCancelledFallback?: (key: string, id: string) => boolean;
-  onKnownOutcome?: (key: string, id: string, outcome: "accepted" | "overloaded") => void;
+  isCancelledFallback?: (key: string, dedupeKey: string) => boolean;
+  onKnownOutcome?: (key: string, id: string, outcome: IngressRefusal, item: Item) => void;
   onOverflow?: (params: {
     key: string;
     item: Item;
     id?: string;
+    dedupeKey?: string;
     reason: RetentionLimitReason;
     chargedBytes?: number;
     recoverCancelled: boolean;
+    /** A retained entry owns this logical verdict; leave this alias for retry. */
+    deferToRetained: boolean;
   }) => void;
   measure?: (item: Item) => number;
   setTimer?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
@@ -133,7 +148,7 @@ export function createBoundedInboundDebouncer<Item>(
       retired: boolean;
       cancellationSettled?: Promise<void>;
       resolveCancellation?: () => void;
-      releaseCancellationHold?: () => void;
+      releaseIndexedHold?: () => void;
     }
   >();
   const runningCallbacks = new Map<
@@ -145,6 +160,16 @@ export function createBoundedInboundDebouncer<Item>(
   let disposed = false;
 
   const idIndexKey = (key: string, id: string) => `${key.length}:${key}${id}`;
+  const correlationKey = (key: string, dedupeKey: string, id: string) =>
+    idIndexKey(key, idIndexKey(dedupeKey, id));
+  const hasRetainedLogicalKey = (key: string, dedupeKey: string | undefined) => {
+    if (dedupeKey === undefined) return false;
+    if (waiting.get(key)?.entries.some((entry) => entry.dedupeKey === dedupeKey)) return true;
+    for (const entry of inflightByKey.get(key) ?? []) {
+      if (entry.dedupeKey === dedupeKey) return true;
+    }
+    return false;
+  };
   const generation = (key: string) => keyGeneration.get(key) ?? 0;
   const bumpGeneration = (key: string) => keyGeneration.set(key, generation(key) + 1);
 
@@ -194,16 +219,16 @@ export function createBoundedInboundDebouncer<Item>(
       // drops its indexes. Cancellation/retirement always requests release.
       const requestRelease = owner !== "flush" || entry.reservation.owner !== "pending";
       releaseEntry(key, entry, requestRelease);
-      if (owner === "cancel" || owner === "retire") {
-        // A cancellation callback that already began may have copied the entry.
-        // Its pre-acquired hold remains the physical-retention charge until that
-        // callback settles. A queued callback that never began is severable.
-        if (owner === "cancel" || !state?.cancellationCallbackRunning) {
-          state?.releaseCancellationHold?.();
-          if (state) state.releaseCancellationHold = undefined;
-        }
+      // Index removal returns its hold unless a started cancellation callback
+      // still owns copies. Retirement may let the flush unwind before that
+      // callback, so *any* settling owner must preserve its hold until it ends.
+      if (!state?.cancellationCallbackRunning) {
+        state?.releaseIndexedHold?.();
+        if (state) state.releaseIndexedHold = undefined;
       }
-      if (validId(entry.id)) inflightIds.delete(idIndexKey(key, entry.id));
+      if (validId(entry.id) && entry.dedupeKey !== undefined) {
+        inflightIds.delete(correlationKey(key, entry.dedupeKey, entry.id));
+      }
       if (owner === "cancel" || owner === "retire") state?.resolveCancellation?.();
     }
     if (!chains.has(key) && !waiting.has(key) && !inflightByKey.has(key)) {
@@ -315,14 +340,15 @@ export function createBoundedInboundDebouncer<Item>(
     });
   };
 
-  const clearCapturedBatches = (key: string) => {
+  const clearCapturedBatches = (key: string, retireRunning = true) => {
     const chain = chains.get(key);
     if (!chain) return;
     // The one currently executing callback cannot be aborted, but its explicit
     // reservation holds keep every possibly copied entry charged. Clearing its
-    // caller-owned array removes one reference; queued batches that never began
-    // are removed wholesale without per-generation Promise continuations.
-    if (chain.running) chain.running.entries.length = 0;
+    // caller-owned array on retirement removes one reference. Queued batches
+    // cannot start after any generation cancellation: sever them before their
+    // cancellation owner settles and releases the charge for those captures.
+    if (retireRunning && chain.running) chain.running.entries.length = 0;
     for (const batch of chain.queued) batch.entries.length = 0;
     chain.queued.length = 0;
   };
@@ -372,20 +398,43 @@ export function createBoundedInboundDebouncer<Item>(
     if (disposed) return { status: "disposed" };
     const key = options.buildKey(item);
     const id = options.getId?.(item);
+    const dedupeKey = options.getDedupeKey ? options.getDedupeKey(item) : id;
     let recoverCancelled = false;
-    if (validId(id)) {
-      if (options.isOverflowClaimed?.(key, id)) return { status: "overflow-inflight" };
-      recoverCancelled = options.isCancelledFallback?.(key, id) ?? false;
+    if (validId(id) && dedupeKey !== undefined) {
+      if (options.isOverflowClaimed?.(key, dedupeKey)) {
+        options.onOverflowClaimed?.(item);
+        return { status: "overflow-inflight" };
+      }
+      recoverCancelled = options.isCancelledFallback?.(key, dedupeKey) ?? false;
       // A cancellation fallback represents text `/stop` already killed. It must
-      // recover accepted/ACK even if a stale/conflicting hot overload exists.
+      // recover its suppression/ACK even if a stale/conflicting hot overload
+      // exists.
       if (!recoverCancelled) {
-        const known = options.peekOutcome?.(key, id);
-        if (known) {
-          options.onKnownOutcome?.(key, id, known);
+        const known = options.peekOutcome?.(key, dedupeKey);
+        // ⭐ #344 — A REFUSAL SHORT-CIRCUITS; AN `accepted` DOES NOT. This is THE
+        // READER RULE (`OutcomeLookup` in `ingress-outcome.ts`): this path can
+        // neither read the journal row nor ADMIT a message, so nothing it could
+        // say about `accepted` is safe. Answering `accepted` here would ack
+        // an orphan away and drain the client's ledger entry — the message would
+        // never be journaled and never answered, and no later replay would exist
+        // to fix it.
+        //
+        // ⚠️ THIS FAST PATH IS EXACTLY WHERE THAT BIT. `peek` reads a HOT CACHE
+        // that `lookupUnlocked`'s found path and `write.commit()` both warm, so
+        // an orphan the overflow resolver had just declined to answer was
+        // instantly decidable here — the resolver's silence bought nothing while
+        // this arm still spoke. Deferring costs a retention reservation plus one
+        // flush per genuine accepted replay (under FULL retention such replays
+        // overflow and drain ~1 per round instead of N — the client re-drains on
+        // a later replay, nothing is lost).
+        if (known !== undefined && known !== "accepted") {
+          options.onKnownOutcome?.(key, id, known, item);
           return { status: "known-outcome", outcome: known };
         }
       }
-      if (inflightIds.has(idIndexKey(key, id))) return { status: "duplicate-inflight" };
+      // Only an identical wire correlation may be dropped while pending. A new
+      // wire ID for this logical key needs its own bounded entry and response.
+      if (inflightIds.has(correlationKey(key, dedupeKey, id))) return { status: "duplicate-inflight" };
     }
 
     let charge: number | undefined;
@@ -393,7 +442,10 @@ export function createBoundedInboundDebouncer<Item>(
       charge = checkedCharge(measure, item);
     } catch {
       const reason: RetentionLimitReason = "session-byte-count";
-      options.onOverflow?.({ key, item, id, reason, recoverCancelled });
+      options.onOverflow?.({
+        key, item, id, dedupeKey, reason, recoverCancelled,
+        deferToRetained: hasRetainedLogicalKey(key, dedupeKey),
+      });
       return { status: "overflow", reason };
     }
     const result = options.budget.tryReserve(
@@ -406,9 +458,11 @@ export function createBoundedInboundDebouncer<Item>(
         key,
         item,
         id,
+        dedupeKey,
         reason: result.reason,
         chargedBytes: charge,
         recoverCancelled,
+        deferToRetained: hasRetainedLogicalKey(key, dedupeKey),
       });
       return { status: "overflow", reason: result.reason, chargedBytes: charge };
     }
@@ -422,12 +476,18 @@ export function createBoundedInboundDebouncer<Item>(
       retired: boolean;
       cancellationSettled?: Promise<void>;
       resolveCancellation?: () => void;
-      releaseCancellationHold?: () => void;
+      releaseIndexedHold?: () => void;
     } = {
       cancellationRequested: false,
       cancellationPending: false,
       cancellationCallbackRunning: false,
       retired: false,
+      // Acquire before publishing into waiting/inflight indexes, while the
+      // reservation is open. A flush/dispatcher may request release while this
+      // entry is still indexed; /stop must already own the hold it will use for
+      // async suppression and delivery. Normal settlement returns it on index
+      // removal; cancellation transfers it through its callback's settlement.
+      releaseIndexedHold: result.reservation.hold(),
     };
     const entry: RetainedDebounceEntry<Item> = {
       item,
@@ -438,9 +498,10 @@ export function createBoundedInboundDebouncer<Item>(
       isRetired: () => state.retired,
       waitForCancellation: () => state.cancellationSettled ?? Promise.resolve(),
       ...(validId(id) ? { id } : {}),
+      dedupeKey,
     };
     entryStates.set(entry, state);
-    if (validId(id)) inflightIds.add(idIndexKey(key, id));
+    if (validId(id) && dedupeKey !== undefined) inflightIds.add(correlationKey(key, dedupeKey, id));
     const existing = waiting.get(key);
     if (existing) {
       existing.entries.push(entry);
@@ -471,6 +532,7 @@ export function createBoundedInboundDebouncer<Item>(
     // Invalidate the whole old key generation before either cancellation
     // persistence or a stalled normal continuation can resume.
     bumpGeneration(key);
+    clearCapturedBatches(key, retireInflight);
 
     if (cancelOptions?.notify && options.onCancel) {
       for (const entry of newlyCancelled) {
@@ -478,10 +540,9 @@ export function createBoundedInboundDebouncer<Item>(
         if (state) {
           state.cancellationRequested = true;
           state.cancellationPending = true;
-          // Pin before returning from cancelKey; `/stop` immediately calls the
-          // dispatcher clear path, whose release request must remain charged
-          // until this entry's async suppression + ACK settles.
-          state.releaseCancellationHold ??= entry.reservation.hold();
+          // The index already owns the hold, even if onFlush requested release.
+          // Transfer it to cancellation without reacquiring: a failed hold here
+          // would leave earlier cancellation promises without a scheduled owner.
           state.cancellationSettled ??= new Promise<void>((resolve) => {
             state.resolveCancellation = resolve;
           });
@@ -534,7 +595,6 @@ export function createBoundedInboundDebouncer<Item>(
     } else {
       settleEntries(key, newlyCancelled, retireInflight ? "retire" : "cancel");
       if (retireInflight) {
-        clearCapturedBatches(key);
         clearQueuedCancellationBatches(key);
       }
     }
@@ -548,6 +608,7 @@ export function createBoundedInboundDebouncer<Item>(
     push,
     enqueue: async (item) => push(item),
     cancelKey,
+    retainedItems: (key) => [...new Set([...(inflightByKey.get(key) ?? []), ...(waiting.get(key)?.entries ?? [])])].map(entry => entry.item),
     dispose: () => {
       if (disposed) return { waiting: 0, inflight: runningCallbacks.size };
       disposed = true;

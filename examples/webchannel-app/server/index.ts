@@ -2,7 +2,7 @@
  * Reference WebChannel SaaS backend — PUBLIC API ONLY.
  *
  * Every library import below is the published package name
- * `@mir-stream/webchannel-saas`; there are ZERO relative `../packages/` or deep
+ * `openclaw-webchannel-saas`; there are ZERO relative `../packages/` or deep
  * subpath imports. This file shows the full production trust flow a third-party
  * SaaS would build:
  *
@@ -38,7 +38,7 @@ import {
   type EnrollmentRequest,
   type PollRequest,
   type SetupTrustChainResult,
-} from "@mir-stream/webchannel-saas";
+} from "openclaw-webchannel-saas";
 import esbuild from "esbuild";
 
 import { bootNatsServer, type NatsHandle } from "./nats.js";

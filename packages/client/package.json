@@ -1,6 +1,6 @@
 {
-  "name": "@mir-stream/webchannel-client",
-  "version": "0.6.1",
+  "name": "openclaw-webchannel-client",
+  "version": "0.7.0",
   "description": "Framework-agnostic, zero-dependency browser client for WebChannel (headless connection + protocol + state).",
   "license": "MIT",
   "type": "module",
@@ -35,7 +35,6 @@
     "prepack": "npm run build"
   },
   "devDependencies": {
-    "typescript": "^5.5.0",
-    "vitest": "^2.0.0"
+    "typescript": "^5.5.0"
   }
 }

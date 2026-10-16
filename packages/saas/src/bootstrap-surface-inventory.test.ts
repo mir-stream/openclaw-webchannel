@@ -23,6 +23,9 @@ const EXPECTED: Record<string, InventoryEntry> = {
   "demo/chaos-nats.ts :: /bootstrap template": {
     count: 1, classification: "demo attack/replay harness consumer",
   },
+  "demo/saas-server-auth.test.ts :: /bootstrap literal": {
+    count: 1, classification: "negative logout test proving an invalidated session cannot bootstrap",
+  },
   "demo/saas-server.ts :: /bootstrap literal": {
     count: 1, classification: "deployable session-authorized scalar route",
   },
@@ -35,8 +38,17 @@ const EXPECTED: Record<string, InventoryEntry> = {
   "demo/verify-evict.mjs :: /bootstrap template": {
     count: 1, classification: "demo signing-key eviction harness consumer",
   },
+  "demo/web/src/app-session.dom.test.ts :: /bootstrap literal": {
+    count: 3, classification: "test-only mocked bootstrap response and account-switch/logout delay selectors",
+  },
+  "demo/web/src/widget-session.dom.test.ts :: /bootstrap literal": {
+    count: 3, classification: "test-only mocked bootstrap registration fixture and teardown/initial-mount cancellation selectors",
+  },
   "demo/web/src/widget.ts :: /bootstrap literal": {
     count: 1, classification: "deployable demo single-lane consumer",
+  },
+  "e2e/example-app.dom.test.ts :: /bootstrap literal": {
+    count: 3, classification: "test-only mock response and stale authentication success/failure selectors",
   },
   "e2e/local/enrolled-transport-roundtrip.ts :: /test/bootstrap-jwt template": {
     count: 1, classification: "explicitly gated local E2E harness consumer",
@@ -82,6 +94,12 @@ const EXPECTED: Record<string, InventoryEntry> = {
   },
   "packages/client/src/browser-jwt-entry.ts :: /test/bootstrap-jwt template": {
     count: 1, classification: "explicitly gated negative/E2E harness consumer",
+  },
+  "packages/plugin/src/jwt-lifetime.test.ts :: buildBootstrapClaims call": {
+    count: 3, classification: "test-only lifetime boundaries and SaaS-to-plugin JWT verification",
+  },
+  "packages/plugin/src/jwt-lifetime.test.ts :: createBootstrapIssuer call": {
+    count: 2, classification: "test-only signer bypass rejection and real RS256 roundtrip",
   },
   "packages/saas/reference/bootstrap-server.ts :: /bootstrap literal": {
     count: 1, classification: "test-only fixed-tuple route",
@@ -190,7 +208,8 @@ function inventory(): Record<string, number> {
 }
 
 describe("first-party bootstrap issuance/caller inventory", () => {
-  it("contains only explicitly classified security-relevant occurrences", () => {
+  // Parsing the whole repository can exceed Vitest 4's synchronous timeout.
+  it("contains only explicitly classified security-relevant occurrences", { timeout: 30_000 }, () => {
     expect(inventory()).toEqual(
       Object.fromEntries(Object.entries(EXPECTED).map(([key, value]) => [key, value.count])),
     );

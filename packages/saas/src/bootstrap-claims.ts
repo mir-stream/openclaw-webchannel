@@ -80,6 +80,16 @@ export type BootstrapClaims = {
 };
 
 const DEFAULT_TTL_SECONDS = 300;
+const MAX_BOOTSTRAP_LIFETIME_SECONDS = 60 * 60;
+
+/** Shared by the claim builder and signer so direct sign callers cannot bypass it. */
+export function assertBootstrapLifetime(claims: { iat: number; exp: number }): void {
+  if (typeof claims.iat !== "number" || !Number.isFinite(claims.iat)
+    || typeof claims.exp !== "number" || !Number.isFinite(claims.exp)
+    || claims.exp <= claims.iat || claims.exp - claims.iat > MAX_BOOTSTRAP_LIFETIME_SECONDS) {
+    throw new Error("bootstrap-claims: lifetime requires finite iat < exp and at most one hour");
+  }
+}
 
 /** Assert a base64url string decodes to exactly 32 bytes (an OKP public key). */
 function assert32Bytes(label: string, b64url: string): void {
@@ -101,6 +111,9 @@ export function buildBootstrapClaims(input: BootstrapClaimsInput): BootstrapClai
 
   const now = input.nowSeconds ?? Math.floor(Date.now() / 1000);
   const ttl = input.ttlSeconds ?? DEFAULT_TTL_SECONDS;
+  // Validate the resulting NumericDates too: addition can overflow or lose a
+  // tiny positive lifetime at an extreme issued-at value.
+  assertBootstrapLifetime({ iat: now, exp: now + ttl });
 
   const audience = input.accountId;
   const isMulti = Array.isArray(audience);

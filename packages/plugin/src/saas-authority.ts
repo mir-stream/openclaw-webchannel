@@ -15,7 +15,9 @@ export function isAbsoluteHttpUrl(value: unknown): value is string {
   try {
     const parsed = new URL(value);
     return (
-      (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+      (parsed.protocol === "https:" || (parsed.protocol === "http:" &&
+        (parsed.hostname === "localhost" || parsed.hostname === "[::1]" ||
+          /^127\.\d+\.\d+\.\d+$/.test(parsed.hostname)))) &&
       parsed.hostname.length > 0 &&
       parsed.username.length === 0 &&
       parsed.password.length === 0 &&
@@ -27,15 +29,20 @@ export function isAbsoluteHttpUrl(value: unknown): value is string {
   }
 }
 
+/** The same transport policy applies before enrollment, derivation and probes. */
+export function assertSaasBaseUrl(value: unknown): asserts value is string {
+  if (!isAbsoluteHttpUrl(value)) {
+    throw new Error(
+      "webchannel: invalid SaaS enrollment authority fields=saasBaseUrl; use HTTPS (http is allowed only for localhost, 127.0.0.0/8 or ::1)",
+    );
+  }
+}
+
 /** Derive enrollment endpoints using trailing-slash normalization only. */
 export function deriveEnrollmentEndpoints(
   saasBaseUrl: string,
 ): EnrollmentEndpoints {
-  if (!isAbsoluteHttpUrl(saasBaseUrl)) {
-    throw new Error(
-      "webchannel: invalid SaaS enrollment authority fields=saasBaseUrl",
-    );
-  }
+  assertSaasBaseUrl(saasBaseUrl);
   const normalizedBase = saasBaseUrl.replace(/\/+$/, "");
   return Object.freeze({
     saasEnrollUrl: `${normalizedBase}/api/enroll`,

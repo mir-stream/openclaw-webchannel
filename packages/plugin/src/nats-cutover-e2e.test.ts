@@ -358,18 +358,18 @@ describe("AC 5 E2E: NATS Cutover", () => {
 
     // First resolution from peer1 should succeed
     const success1 = agentChannel.sendApprovalResolved(peer1, approvalId, "allow-once");
-    expect(success1).toBe(true);
+    expect(success1).toMatchObject({ accepted: true, delivered: true });
 
     // Check that resolution was recorded
     expect(getApprovalResolution(agentChannel, approvalId)).toBe(peer1);
 
-    // Second resolution from peer1 should succeed (same peer)
+    // Same-peer alternate decision must not replace the original verdict.
     const success2 = agentChannel.sendApprovalResolved(peer1, approvalId, "deny");
-    expect(success2).toBe(true);
+    expect(success2).toMatchObject({ accepted: false, delivered: false, status: "conflict" });
 
     // Resolution from peer2 should fail (different peer)
     const success3 = agentChannel.sendApprovalResolved(peer2, approvalId, "allow-always");
-    expect(success3).toBe(false);
+    expect(success3).toMatchObject({ accepted: false, delivered: false, status: "conflict" });
 
     // Resolution should still belong to peer1
     expect(getApprovalResolution(agentChannel, approvalId)).toBe(peer1);

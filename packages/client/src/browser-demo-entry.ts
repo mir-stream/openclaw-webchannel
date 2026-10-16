@@ -80,9 +80,10 @@ export async function runDemo(
   opts: RunDemoOptions,
   callbacks: RunDemoCallbacks,
 ): Promise<DemoController> {
-  // 1. Device X25519 key → cnf.jwk (b64url raw 32B). Extractable to export raw pub.
+  // 1. Device X25519 key → cnf.jwk (b64url raw 32B). Only the public half
+  //    stays exportable; unwrap uses the non-extractable private key in-page.
   callbacks.onStatus("generating keys");
-  const x25519 = (await crypto.subtle.generateKey({ name: "X25519" }, true, [
+  const x25519 = (await crypto.subtle.generateKey({ name: "X25519" }, false, [
     "deriveBits",
   ])) as CryptoKeyPair;
   const x25519Raw = await crypto.subtle.exportKey("raw", x25519.publicKey);

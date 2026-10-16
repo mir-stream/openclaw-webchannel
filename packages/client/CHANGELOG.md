@@ -1,6 +1,256 @@
-# Changelog — @mir-stream/webchannel-client
+# Changelog — openclaw-webchannel-client
 
 ## Unreleased
+
+- Browser receive doors now reject replayed envelopes, timestamps outside ±10 minutes,
+  and mismatched tenant/account/peer routing (#415 E4). The 16,384-ID cache survives
+  reconnects and refuses new frames at capacity until IDs expire; a new client
+  instance retains only the timestamp defense. Direction-bound AAD/key separation
+  remains outside this change (see #410). Reference/demo X25519 private keys are
+  non-extractable; their public halves still export for bootstrap (#415 E8).
+
+### Fixed
+
+- Recover accepted, unsettled local turns after a plugin-only restart even when
+  the relay remains healthy. The existing `ackStallTimeoutMs` policy now watches
+  authenticated application activity after ACK and refreshes registration and
+  history/difference state once per silent interval; only new live activity or
+  a newly accepted send re-arms the watch, so a long silent turn does not cause
+  repeated reconnects. Accepted tasks are never republished or
+  failed by the timeout; server settlement, close, and terminal errors retire the
+  watch. Idle tabs remain unpolled, and `0` disables the new watch as well.
+- Consume protocol 6 `ack.cancelled` evidence before acceptance callbacks, so an
+  input durably stopped before admission does not become permanent recovery work.
+  Cancelled IDs must belong to the same ACK; malformed frames are rejected before
+  any ACK effect. Other accepted work and ordinary coalesced settlement are preserved.
+- Preserve another device's queued/started typing and held follow-ups when a
+  delayed first cancellation ACK arrives for an unrelated local input. Cleanup
+  consults reconciled request state, including history and callback updates.
+- Defer cancellation typing cleanup while gap/history evidence is buffered, then
+  check it after the ordered recovery drain. Empty or terminal recovery completes
+  cleanup; newer typing and connection teardown retire the pending decision.
+
+### Breaking (wire protocol v7)
+
+Client and plugin require a paired upgrade to protocol 7 (protocol 6 was never
+released). The existing exact-match registration gate rejects every other
+version. Protocol 7 is unreleased; #396 and #442 join scoped stop and history correlation
+in the same release contract. No package-version bump. One reason per bullet,
+matching `protocol.ts`:
+
+- **v7 — pre-admission policy refusal (#442).** `inbound_rejected` adds
+  `reason: "policy-denied"`. The client retires only the matching pending send,
+  displays a generic non-retryable policy failure and stops replaying it.
+  Existing accepted/cancelled receipts remain authoritative. No allowlist
+  configuration is exposed; paired client/plugin deployment is required.
+- **v7 — liveness-only typing renewals (#396).** Periodic `typing.keepalive`
+  frames refresh application watches without re-arming typing or holding
+  followups after output or approval. Ignoring the marker would queue those inputs.
+- **v6 — durable cancellation ACK evidence.** `ack.cancelled` must be understood
+  to distinguish delivery acceptance from work that still needs recovery.
+- **v7 — stop covers earlier unacknowledged input (#397, #398).** An explicit
+  `/stop` sends `cancel_pending`, the earlier user messages this device still
+  has no server result for. `ack.unaccepted` is the server's declaration that a
+  cancelled ID was never accepted; it rides the same frame as that ID, and only
+  it turns the receipt into `failed{cancelled}`. A cancelled ID without it keeps
+  its accepted receipt; its request state reports the cancellation.
+- **v7 — history page correlation (#401).** `load_history` carries a per-request
+  `nonce` and the `history` page that answers it echoes it as `history.nonce`;
+  the register-time snapshot carries none. Pages ride the peer's shared `.out`,
+  and a device that folded another device's page into a different window kept
+  a permanent hole its own "load older" could not reach. The wrapper now folds a
+  page **only** when it echoes one of this device's own outstanding nonces; a
+  page with no nonce, or someone else's, is not folded (an explicit `randomId`
+  adoption on it still applies). A self-hosted server that does not echo the
+  nonce therefore makes "load older" do nothing.
+  - The low-level `NatsClient.loadHistory(before, limit, beforeTurnId, nonce)`
+    gained an optional 4th argument, appended so existing calls compile. The
+    wrapper's `loadHistory({...})` mints the nonce itself; a direct caller of
+    the low-level method owns minting and matching it.
+
+### Breaking (wire protocol v4)
+
+- **`WEBCHANNEL_PROTOCOL_VERSION` goes 3 → 4 (#246).** The exported constant
+  changes value; no client API changes. The client sends it on the register
+  request and requires it on the register reply, both already exact-match and
+  both already terminal (`pop-register.ts`), so this release adds no new gate —
+  it changes the number those gates compare against. Against a `0.7.0` (v3)
+  agent this client now fails with a terminal `protocol-mismatch` and no re-auth
+  affordance, instead of connecting. Upgrade the gateway plugin and the browser
+  bundle together.
+
+  **Why this is a bump and not another additive frame.** The v6 frames stayed
+  safely ignorable for RENDERING and are not for CORRECTNESS. A `0.7.0` browser
+  also declares `3`, so it passed the old gate and then ignored the durable
+  `seq` and the `get_difference`/`difference` gap-sync (#244), `user_committed`
+  (#245), the `reasoning`/`tool`/`approval` `history` rows (#242), and
+  `ack.committed[]` (#243). The transport is core NATS pub/sub — at-most-once,
+  no retention — so a browser with no `seq` cannot detect a dropped frame and
+  never asks for the heal. Its transcript is then invisibly wrong. What reaches
+  it unasked — the history snapshot requested on every successful register, a
+  `turn_snapshot` at the end of a streamed turn — is incidental, not a repair
+  path: it rides the same at-most-once transport and nothing aims it at the
+  hole. The browser also drops role-less `history` rows, which stalls "load
+  older" forever once the agent has `capabilities.reasoningDurable` on
+  (**#309**, closed by this).
+
+  **No capability negotiation was added.** Under an exact-match gate every peer
+  is at this exact version, so there is nothing to withhold per peer, and the one
+  frame shape that would need it — a live delete/edit — is not on this wire
+  (`messageDeleted`/`messageEdited` are durable event kinds with no producer).
+  `protocol.ts` carries v4 as the second worked example under "When to bump", and
+  the next slice that adds a frame an equal-version peer must act on decides
+  bump-vs-negotiate there.
+
+- **`get_difference` / `difference` gain correlation and catch-up fields (#356).**
+  `get_difference` now carries a required `nonce` alongside `afterSeq`, and the
+  `difference` reply echoes both back and adds `partial` and `maxSeq`. All four
+  are required on the v4 wire and both receive doors refuse a frame missing one.
+  They are not decoration: our devices share one `.out` subject and have no wire
+  identity, so the echo is the only thing that tells a device its own reply from
+  another device's (without it, a device folds a stranger's reply and skips its
+  own range); `partial` is Telegram's `differenceSlice` signal, without which the
+  remainder of a sliced range is stranded until the next durable frame; and
+  `maxSeq` is what a complete reply advances the cursor to, so an individually
+  oversized difference row no longer wedges catch-up.
+
+### Fixed
+
+- **The client's gap-sync state machine is now one modelled cursor (#356).**
+  Seven reviewers found eight defects concentrated in one seam — a cursor number
+  surrounded by an in-flight flag, a gap buffer, deferred advances and a timer
+  generation, all able to disagree about what had already been applied. It is
+  replaced by an explicit three-state cursor following Telegram's update-delivery
+  rules, and the fields that disagreed are deleted rather than re-guarded. Closes:
+  - **#350** — the cursor gap-detected from `0` before the register snapshot
+    seeded it, so a reload mid-turn pulled the entire conversation back through
+    the fold in 500-event pages. It now adopts its first observation as the
+    baseline and asks for nothing.
+  - **#351** — `difference` carried no echo of the request it answered and every
+    device of a peer shares the `.out` subject, so a device could fold another
+    device's reply and silently skip its own range.
+  - **#352** — a partial reply plus an `ack`/`highWaterSeq` advance deferred
+    during the round-trip pushed the cursor past events the reply never carried,
+    and the buffer drain then discarded them.
+  - **#345** — `ack.committed[].seq` was advance-only. It now moves the cursor
+    only on the device that originated the send (the `random_id` resolves a local
+    linkage), and a seq above the contiguous next one opens a gap instead of
+    closing it.
+  - **#349** — Catch-up no longer turns past placement rows into working
+    drafts. Empty slots stay internal to preserve order across slices; live
+    progress or authored content makes them visible. Existing live drafts stay
+    active, while explicit turn completion or `/stop` retires buffered progress.
+  - **#343 (client half)** — a frame held during a catch-up is now dropped only
+    when the reply actually carried an event for its seq, never merely because the
+    cursor covers it: a row the server could not send is covered but absent, and
+    the held frame is proof its own live send succeeded. The give-up path carries
+    nothing and so drops nothing.
+  - Frames held during a catch-up are folded in SEQ ORDER, merged with the
+    reply's own events rather than re-dispatched after them. The reducers are
+    last-write-wins, so a held frame BELOW the reply's rows — the shape that
+    arises whenever the server skips a row as undeliverable (#343) — overwrote
+    what the reply had just established: a stale tool `start` phase buried a
+    delivered `end`, a held `approval_request` re-appended a clickable card for an
+    approval the server had already resolved, and an answer a folded `seal`
+    removed came back. Seq-less frames, which have no place in that order, fold
+    after it in arrival order — applying those immediately put a
+    reasoning lane ABOVE the user question that opened the turn
+    (`reasoningDurable` is off by default, so every reasoning frame is seq-less),
+    which a reload then re-projects the other way. For those, what the reply
+    supersedes is decided by id: a held draft whose id the reply authored durable
+    text for is dropped, so a cumulative draft can no longer overwrite the durable
+    row with a prefix of itself.
+  - A held `progress` is never dropped for a carried `placement`. It maps to that
+    row, which claims the slot and journals no text, so dropping it on "the reply
+    delivered this seq" blanked the draft the user was watching — permanently, for
+    an answer that never produced another frame. What DOES supersede a draft is
+    the reply authoring its id, which is the same rule that governs a seq-less
+    frame: a held frame carrying no durable text of its own is measured by id, and
+    every other held frame by seq alone.
+  - A reply that MOVES NO FLOOR — a `partial` one whose coverage does not exceed
+    the floor it answers, or one whose fold threw before a single event landed —
+    is a STALL, not a settle: the round-trip stays open, the retry budget is preserved,
+    and the timer the REQUEST armed — never re-armed by the stall, which would
+    hand the deadline to a peer that stalls faster than the timeout — re-issues
+    on its own cadence. Settling instead
+    re-dispatched the buffer, which re-opened the gap on the spot with a fresh
+    budget: measured at 51 requests for 50 non-advancing replies, at round-trip
+    speed, each costing the server a read and a byte fit. An empty COMPLETE reply is a
+    stall too whenever a frame is still HELD — a held frame is evidence the gap
+    was real. Only an empty complete reply with an EMPTY buffer is the
+    spurious-gap unwind, and that one settles. The price is named: a spurious
+    detection now costs a full give-up cycle whenever anything is held, which is
+    strictly better than the storm it replaces.
+
+## 0.7.0
+
+### Added
+
+- **The client now renders the agent's authoritative answer order (#174,
+  #215).** A `0.7.0` agent emits one new inbound frame at settlement —
+  `turn_snapshot`, carrying `{ turnId, answers: Array<{ id, text }>, remove:
+  string[] }`, delivered after the turn's last answer frame and immediately
+  before `turn_settled`. The client reconciles the agent **answer** bubbles of
+  the turn the snapshot names to it, and clears the typing indicator. Previously
+  the transcript order was whatever order the frames arrived in, which is why a
+  later assistant message could sit above an earlier one (#174) and why a middle
+  answer whose frames failed left a corrupted bubble plus a stray duplicate
+  (#215).
+  - The reduction is explicit, never a blanket "drop anything not listed":
+    `remove` ids are dropped; each `answers` entry is upserted by id — an id the
+    client does not hold yet is **minted**, which is how an answer whose own
+    frames never arrived is recovered; and answer bubbles are then reordered
+    **among the slots answer bubbles already occupy**.
+  - **Everything else is preserved as the same object reference.** User bubbles
+    and their send state (receipts, held, `sendState`), notices and errors,
+    reasoning, tool activity, and an adopted durable-history agent row sharing
+    the turn all keep their identity and their slot. Only answer bubbles move,
+    and only past each other — so a `useSyncExternalStore` / memo consumer sees
+    no spurious change on the rows the snapshot did not touch.
+  - **No protocol break.** `WEBCHANNEL_PROTOCOL_VERSION` stays `3`; the frame is
+    additive in both directions. A `0.6.x` agent simply never sends it, and this
+    client behaves exactly as `0.6.1` did against one. Upgrading only the client
+    changes nothing on its own — the frame comes from the agent.
+  - **Known limitation: a snapshot that crosses durable history is not
+    reconciled correctly.** The upsert above matches on the bubble id the client
+    currently holds, and history adoption renames those ids. That read is
+    detached, so either order is legal: a snapshot arriving **before** adoption
+    is overwritten by it and the authoritative correction is lost for the
+    session (**#227**), and one arriving **after** adoption misses the renamed
+    bubble, so the "minted" path above adds a duplicate instead of recovering a
+    lane (**#228**, heals on reload). Neither is fixed here, on purpose —
+    resolving them inside the client means matching on text or position, which
+    is the guessing the delivery-journal redesign (**#236**) exists to retire,
+    and which adversarial review found could delete another device's answer
+    outright. Reaching either needs a durable-history read for the turn to
+    interleave with the snapshot — a second device, a reconnect, and a
+    cursor-less `loadHistory()` refresh around a live turn all produce that.
+
+### Changed
+
+- **BREAKING (package name): `@mir-stream/webchannel-client` is now
+  `openclaw-webchannel-client`.** The `@mir-stream` scope was only ever a GitHub
+  Packages requirement (scope must equal repo owner); these packages moved to
+  public npm in `0.6.1`, so the scope is a vestige of a registry they no longer
+  use. All three published packages now share the `openclaw-webchannel` prefix.
+  No API, behaviour, or protocol change — only the specifier you import.
+  **The old scoped name will be unpublished after this release**, so migration
+  is not optional — and a plain `npm update` will not do it, because nothing
+  resolves an old name to a new one. Follow the pinned, ordered procedure in
+  [Migrating an existing consumer](../../docs/PUBLISHING.md#migrating-an-existing-consumer);
+  it also covers rewriting your import specifiers.
+- **`InboundMessage` gained the shape of the new frame.** `type` adds the
+  `"turn_snapshot"` member and two optional fields appear —
+  `answers?: Array<{ id: string; text: string }>` and `remove?: string[]` — both
+  meaningful only on a `turn_snapshot`. This is additive: existing
+  `InboundMessage` values stay valid. It is only a source break if you
+  exhaustively `switch` on `InboundMessage["type"]` with no `default`, in which
+  case TypeScript will now point at the missing case. The client re-declares the
+  wire type rather than importing it (this package stays dependency-free), so
+  the field docs live here too.
+- If you write your own frame handler rather than using
+  `WebChannelNATSClient`, **an unrecognized `turn_snapshot` must stay inert** —
+  do not treat it as a message-bearing frame.
 
 ## 0.6.1
 
@@ -63,7 +313,7 @@
 - **No protocol break.** `WEBCHANNEL_PROTOCOL_VERSION` stays `3`. Both additions
   are optional and additive in both directions: this client ignores their
   absence against an older agent, and an older client ignores them against a
-  `0.6.0` agent. Lockstep with `@mir-stream/webchannel-plugin` at `0.6.0` is
+  `0.6.0` agent. Lockstep with `openclaw-webchannel` at `0.6.0` is
   still the supported configuration and is required to see the new surface, but
   nothing in this release refuses a mismatched peer.
 
@@ -183,7 +433,7 @@
   replaced by `sendState?: "queued" | "sent" | "accepted" | "completed" | "failed"`
   and `sendFailure?: SendFailure`. Migration: `delivered === true` ↔
   `sendState === "accepted" || sendState === "completed"`. Lockstep with
-  `@mir-stream/webchannel-plugin` — upgrade both together.
+  `openclaw-webchannel` — upgrade both together.
 - `WebChannelErrorCause` adds the `"capacity"` member. This is wire-compatible,
   but downstream exhaustive switches over the union must add the new terminal,
   non-reauth case.

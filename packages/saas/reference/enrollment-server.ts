@@ -973,7 +973,7 @@ export const referenceEnrollmentRequestHandler = async (req: import("node:http")
           sendJson(res, { error: "Invalid JSON body" }, 400);
           return;
         }
-        const { tenant, role, peerId } = body as { tenant?: string; role?: NatsUserRole; peerId?: string };
+        const { tenant, role, peerId, accountId } = body as { tenant?: string; role?: NatsUserRole; peerId?: string; accountId?: string };
         if (!tenant) {
           sendJson(res, { error: "Missing tenant" }, 400);
           return;
@@ -986,10 +986,15 @@ export const referenceEnrollmentRequestHandler = async (req: import("node:http")
           sendJson(res, { error: "Missing peerId (required for role 'browser')" }, 400);
           return;
         }
+        if (resolvedRole === "agent") {
+          try { assertValidSubjectToken(accountId ?? "", "accountId"); }
+          catch (err) { sendJson(res, { error: (err as Error).message }, 400); return; }
+        }
         mintNatsUserCreds({
           accountSeed: mockTrustChain.natsAccountSeed,
           tenant,
           role: resolvedRole,
+          accountId,
           ...(resolvedRole === "browser" ? { peerId } : {}),
           issuerAccountId: natsIssuerAccountId,
         })

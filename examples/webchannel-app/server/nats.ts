@@ -17,7 +17,7 @@ import {
   atomicWritePrivateFile,
   prepareFullResolverNatsConfig,
   type NatsSelfContainedAccountConfig,
-} from "@mir-stream/webchannel-saas";
+} from "openclaw-webchannel-saas";
 
 export type NatsBootOptions = {
   /** Public self-contained NATS config from the trust chain. */
