@@ -309,15 +309,19 @@ user credentials' pub/sub permissions minted during enrollment.
 
 ## Develop / test
 
+Run these commands from the monorepo root so the shared Vitest dependency is
+installed alongside the workspaces:
+
 ```bash
-npm install
-npm run typecheck     # tsc --noEmit
-npm test              # vitest run
+npm ci
+npm run typecheck --workspace=packages/plugin
+npm test --workspace=packages/plugin
+npm run build --workspace=packages/plugin
 ```
 
-**Note:** this package currently has **no `build` script** (only `test` and `typecheck` in
-`package.json`); the plugin is loaded as TypeScript via OpenClaw's plugin loader. Packaging /
-publish to ClawHub is a known open question — see `../../docs/PACKAGING.md` and STATUS.md.
+The build produces the `dist/` entries loaded by OpenClaw. Vitest stays in the
+repository root's development dependencies so production plugin installs do not
+resolve the test runner's peer dependencies.
 
 The plugin serves no static UI and no inbound
 HTTP routes at all: register admission (`register-hop` mode) rides NATS request/reply on the

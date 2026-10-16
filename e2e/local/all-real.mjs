@@ -65,7 +65,7 @@ hardTimer.unref?.();
 // 1. Build the browser bundle (esbuild → IIFE; footer pins globalThis global).
 // ---------------------------------------------------------------------------
 function buildBundle() {
-  const esbuildBin = join(ROOT, "node_modules/tsx/node_modules/esbuild/bin/esbuild");
+  const esbuildBin = require.resolve("esbuild/bin/esbuild");
   const entryPoint = join(ROOT, "packages/client/src/browser-jwt-entry.ts");
   const outFile = join(tmpdir(), `all-real-bundle-${process.pid}.js`);
   execFileSync(esbuildBin, [

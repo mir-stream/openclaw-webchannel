@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
 import { ownHistoryPage } from "./history-page.test-harness.js";
 import {
@@ -882,7 +882,7 @@ describe("WebChannelNATSClient — P0-4 held/terminal ownership (T-cl, T-re)", (
 // the receipt at `queued` forever.
 // ---------------------------------------------------------------------------
 describe("WebChannelNATSClient — P0-4 state-listener fault isolation (T-lg)", () => {
-  let errSpy: ReturnType<typeof vi.spyOn>;
+  let errSpy: MockInstance<typeof console.error>;
   beforeEach(() => { errSpy = vi.spyOn(console, "error").mockImplementation(() => {}); });
   afterEach(() => errSpy.mockRestore());
 
@@ -1156,8 +1156,8 @@ describe("WebChannelNATSClient — P0-4 eviction callout vs. the seal (F-A)", ()
   // The ledger cap is a private constant; 101 unacked sends is the first size
   // that evicts. Keep in sync with `MAX_UNACKED` in nats-client.ts.
   const CAP = 100;
-  let errSpy: ReturnType<typeof vi.spyOn>;
-  let warnSpy: ReturnType<typeof vi.spyOn>;
+  let errSpy: MockInstance<typeof console.error>;
+  let warnSpy: MockInstance<typeof console.warn>;
   beforeEach(() => {
     errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});

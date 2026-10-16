@@ -355,10 +355,13 @@ the enrollment and trust model.
 
 ## Build / test
 
+Run from the monorepo root; Vitest is a shared root development dependency.
+
 ```bash
-npm run build
-npm run typecheck
-npm test
+npm ci
+npm run build --workspace=packages/client
+npm run typecheck --workspace=packages/client
+npm test --workspace=packages/client
 ```
 
 ### Interrupted requests (protocol 5)
