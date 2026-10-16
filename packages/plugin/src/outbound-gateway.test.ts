@@ -7,7 +7,7 @@
  * Tests assert actual transcript content as well as frames and journal entries.
  */
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -540,6 +540,8 @@ describe("structured content across the handoff (PR #430)", () => {
     // Core renders no interactive fallback for a text-only channel.
     ["interactive only", { interactive: INTERACTIVE }, null],
     ["message and interactive", { message: "Body text", interactive: INTERACTIVE }, "Body text"],
+    // `--pin`: webchannel cannot pin, so core only warns.
+    ["message with an optional pin", { message: "Body text", pin: true }, "Body text"],
   ];
   it.each(cases.flatMap(([name, params, text]) => (["backend", "cli"] as const).map((mode) => [name, mode, params, text] as const)))(
     "delivers %s via %s exactly as the direct path renders it", async (_name, mode, params, text) => {
@@ -577,10 +579,38 @@ describe("structured content across the handoff (PR #430)", () => {
     ["presentation", { blocks: [{ type: "unknown", text: TEXT }] }],
     ["presentation", "Deploy"],
     ["interactive", { blocks: [] }],
+    ["delivery", [{ pin: true }]],
+    ["delivery", "pin"],
   ])("refuses an RPC with an unusable %s before any send", async (field, value) => {
     activate(gatewayPlugin);
     await expect(rpc(rpcRequest("invalid", { [field]: value }))).rejects.toThrow(`[webchannel] invalid outbound handoff field ${field}`);
     expectNothingSent();
+  });
+
+  it.each(["backend", "cli"] as const)("fails a required pin via %s after the same frame and journal, without a transcript", async (mode) => {
+    await expect(sendAs(mode, { message: TEXT, delivery: { pin: { enabled: true, required: true } } }))
+      .rejects.toThrow(/^Delivery pin is not supported by channel: webchannel$/);
+    expect(requests.map(({ params }) => params.delivery)).toEqual(mode === "cli" ? [{ pin: { enabled: true, required: true } }] : []);
+    expect(delivered()).toEqual({ frames: [{ type: "agent_message", text: TEXT }], transcript: [] });
+  });
+
+  it("binds delivery into the RPC idempotency fingerprint", async () => {
+    activate(gatewayPlugin);
+    const first = await rpc(rpcRequest("pinned", { delivery: { pin: { enabled: true } } }));
+    await expect(rpc(rpcRequest("pinned", { delivery: { pin: { enabled: true, required: true } } })))
+      .rejects.toThrow("reused for a different request");
+    await expect(rpc(rpcRequest("pinned"))).rejects.toThrow("reused for a different request");
+    await expect(rpc(rpcRequest("pinned", { delivery: { pin: { enabled: true } } }))).resolves.toEqual(first);
+    expect(delivered()).toEqual({ frames: [{ type: "agent_message", text: TEXT }], transcript: [TEXT] });
+  });
+
+  it.each(["backend", "cli"] as const)("still delivers via %s when the gateway session store cannot be written", async (mode) => {
+    writeFileSync(join(root, "blocker"), "");
+    cfg.session = { store: join(root, "blocker", "sessions.json") };
+    gatewayCfg.session = { store: join(root, "blocker", "sessions.json") };
+    const result = await sendAs(mode, { message: TEXT });
+    expect(result.payload).toMatchObject({ via: mode === "cli" ? "gateway" : "direct", deliveryStatus: "sent" });
+    expect(delivered()).toEqual({ frames: [{ type: "agent_message", text: TEXT }], transcript: [] });
   });
 });
 
