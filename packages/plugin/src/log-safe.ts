@@ -42,9 +42,13 @@ const UNESCAPED_BY_JSON = /[\u007f-\u009f\u2028\u2029]/g;
  * Render a peer-controlled value for a log line: quoted, with every character
  * that could end the record or forge a field escaped.
  *
- * Accepts `unknown` on purpose. `turnId` traces back to `message.id` off the
- * wire, and the inbound frame is not schema-validated at this boundary, so a
- * non-string can reach a warn site. This must also never throw: several call
+ * Accepts `unknown` on purpose, and #246 half A narrowed the reason without
+ * removing it. Inbound frames ARE schema-validated now — `decodeInboundWsMessage`
+ * runs at both of `nats-channel.ts`'s receive doors — so a `turnId` that traces
+ * back to a decoded `user_message.id` really is a string by the time it reaches a
+ * warn site. What still reaches these sites unchecked is everything that is not
+ * that: a caught `err`, a value read off a store document, a field on a frame
+ * type no decoder covers. This must also never throw: several call
  * sites are inside the settle loop's `finally`, where a throw would escape into
  * the dispatcher's `.catch(() => {})` and strand every receipt in the turn.
  */

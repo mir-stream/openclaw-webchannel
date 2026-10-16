@@ -42,6 +42,7 @@ import {
   resolveCredentialPath,
   tupleStoragePaths,
   type CredentialPathOptions,
+  type TupleStoragePathOptions,
 } from "./storage-paths.js";
 import {
   createStorageIdentityV2,
@@ -133,6 +134,49 @@ export type LegacyMigrationOptions = CredentialPathOptions & {
   /** @internal Test-only seam for simulating a cross-device hard-link. */
   _linkExactSource?: (sourcePath: string, archivePath: string) => void;
 };
+
+export type PendingLegacyKeyMigration = Readonly<{
+  claimDirectory: string;
+  keySourcePath: string;
+}>;
+
+/**
+ * Read-only inspection for an incomplete migration that a later lazy key-store
+ * open can resume. Completed backups are inert and intentionally ignored.
+ */
+export function inspectPendingLegacyKeyMigration(
+  options: TupleStoragePathOptions,
+): PendingLegacyKeyMigration | null {
+  const destination = tupleStoragePaths(options);
+  const legacy = legacyTuplePaths(options.accountId, options.home);
+  const claimDirectory = join(
+    legacy.root,
+    BACKUP_DIRECTORY_NAME,
+    `${options.accountId}--${destination.namespaceId}`,
+  );
+  if (existsSync(join(claimDirectory, COMPLETE_FILE_NAME))) return null;
+
+  const archivedKeyPath = join(
+    claimDirectory,
+    SOURCE_DIRECTORY_NAME,
+    "conversation-keys.json",
+  );
+  if (existsSync(archivedKeyPath)) {
+    return Object.freeze({ claimDirectory, keySourcePath: archivedKeyPath });
+  }
+
+  const hasClaim =
+    existsSync(join(claimDirectory, CLAIM_FILE_NAME)) ||
+    existsSync(join(claimDirectory, EXACT_SOURCE_FILE_NAME)) ||
+    existsSync(join(claimDirectory, EXACT_SOURCE_METADATA_FILE_NAME));
+  if (hasClaim && existsSync(legacy.conversationKeyPath)) {
+    return Object.freeze({
+      claimDirectory,
+      keySourcePath: legacy.conversationKeyPath,
+    });
+  }
+  return null;
+}
 
 /**
  * Inspect and, when provenance is proven, migrate the complete legacy tuple.

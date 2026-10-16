@@ -1,6 +1,442 @@
-# Changelog — @mir-stream/webchannel-plugin
+# Changelog — openclaw-webchannel
 
 ## Unreleased
+
+- Inbound debounce now delays execution only. Durable acceptance, ACK and
+  multi-device echo precede the fixed execution window, while bounded retention,
+  cancellation and restart recovery keep their existing contracts (#441).
+
+- Bootstrap JWTs now require finite `iat < exp` and a lifetime of at most one
+  hour (#447). Clock skew applies to issuance/expiry checks, not the lifetime
+  bound. SaaS claim builders and signers enforce the same cap; first-party
+  demo/reference/example issuers keep their existing five-minute default.
+  External issuers must supply `iat` and shorten longer-lived tokens.
+
+- Inline NATS user JWTs and seeds now carry sensitive config hints for both
+  flat and named accounts. Core config/UI responses mask them; inline parsing
+  remains compatible and SecretRef resolution is deferred (#443, #415 D7).
+
+### Changed
+
+- The inbound reply pipeline honors configured response prefixes and selected
+  model interpolation on answers; reasoning stays unprefixed. Unsupported
+  media-only final replies now settle as delivery errors rather than silently
+  succeeding when the turn delivered no answer text; empty/text replies keep
+  their existing behavior (#415 C4/C7).
+
+- Enrollment continues after `slow_down`, increasing every subsequent poll interval
+  by five seconds per response. JWT verification rejects unsupported or malformed
+  `crit` headers before resolving signing keys (#415 E6/E7).
+
+- Explicit exec approvers accept an optional `webchannel:` prefix, including
+  account-scoped wildcards. Peer case and explicit-list precedence are preserved;
+  an empty prefixed entry cannot widen to owner fallback (#415 D6).
+
+- **Case-distinct JWT peers now have distinct core sessions (#372).** Raw peer
+  IDs such as `Alice` and `alice` are encoded before SDK session normalization;
+  configured bindings and intentional `identityLinks` keep their SDK selection,
+  while an unlinked peer whose raw ID merely equals a canonical link name no
+  longer shares that group's context. Every peer starts fresh core context on
+  upgrade, including numeric IDs and linked groups; old context is never
+  automatically adopted. Journal history, wire identities and encryption keys
+  are retained. Drain active turns and restart the gateway; see
+  [session identity and rollout](../../docs/SESSION_IDENTITY.md).
+
+- **A durable frame the delivery journal COMMITTED is reported as sent, even if
+  its publish fails (#347, extends #278/#325).** The plugin is the Telegram
+  *server*: a message exists once the store holds it under an id and a
+  per-conversation `seq`, and the publish is the *push*. A push that fails is now
+  left to the client's next `get_difference` (the gap-sync machine #244
+  shipped; for this shape it needs #356 half A's cursor — PR #362, which lands
+  first — to gap-test its own ack echo) instead of being re-sent under a second id — which is what the old
+  `false` return made the adapter do, producing one answer's text twice in
+  history while live showed it once. A frame that got no row — every non-durable
+  type, an id-less durable frame, or one whose journal write faulted — still
+  reports a publish failure as a failed send, and the three refusals above the
+  journal (disposed, transport down, no session key) are unchanged.
+
+### Breaking (wire protocol v7)
+
+Gateway plugin and browser client require a paired upgrade to protocol 7
+(protocol 6 was never released); the exact-match register gate refuses every
+other version. Protocol 7 is unreleased; #396 and #442 join scoped stop and history
+correlation in the same release contract. One reason per bullet, matching
+`protocol.ts`:
+
+- **v7 — pre-admission policy refusal (#442).** `inbound_rejected` adds
+  `reason: "policy-denied"`. The client retires only the matching pending send,
+  displays a generic non-retryable policy failure and stops replaying it.
+  Existing accepted/cancelled receipts remain authoritative. No allowlist
+  configuration is exposed; paired client/plugin deployment is required.
+- **v7 — liveness-only typing renewals (#396).** Periodic `typing.keepalive`
+  frames refresh application watches without re-arming typing or holding
+  followups after output or approval. Ignoring the marker would queue those inputs.
+- **v6 — durable cancellation ACK evidence.** `ack.cancelled` carries the exact
+  wire ids whose cancellation is durable, a subset of the same frame's `ids`.
+- **v7 — stop covers earlier unacknowledged input (#397, #398).** An explicit
+  `/stop` may carry `cancel_pending`; each named input this server has not
+  accepted is durably cancelled with the stop, so it cannot run when it arrives
+  later. `ack.unaccepted` declares, per ID and in that ID's own frame, the
+  cancelled IDs that have no dispatch row, user row or exact convergence receipt.
+  A rowless accepted retry alias persists that receipt transactionally, so ACK
+  loss and `/stop` re-echo its original `converged` mapping. Dispatch schema 3
+  upgrades schemas 1 and 2 and prevents older writers from reopening it. A
+  second stop that arrives during an in-flight core abort now joins it with its
+  own receipt.
+- **v7 — history page correlation (#401).** A `load_history` request's `nonce`
+  (optional on the wire; refused at the door only when present and unusable,
+  same bound as `get_difference.nonce`) is echoed verbatim as `history.nonce` on
+  the page that answers it, and is counted in that page's `max_payload` byte
+  budget. The register snapshot is never correlated. `sendHistory` gained an
+  optional 5th `nonce` argument.
+
+### Changed (history pages)
+
+- **Concurrent page requests from one peer are queued, not dropped (#401).** A
+  page now answers exactly one device's nonce, so the old drop-a-concurrent-page
+  latch turned a second device's click into nothing. Requests are answered one
+  fold at a time, in order, with at most 8 queued behind the one in flight
+  (`MAX_QUEUED_PAGE_REQUESTS`) and a 64 KiB waiting-string charge per peer:
+  two bytes per UTF-16 code unit across `before`, `beforeTurnId`, and `nonce`.
+  Exceeding either waiting limit drops the new request under the existing
+  throttled `dropped` diagnostic. The active request is not charged or limited
+  by this queue budget. Charge is released before a waiting request starts,
+  including after a read or publish failure.
+
+### Breaking (wire protocol v4)
+
+- **`WEBCHANNEL_PROTOCOL_VERSION` goes 3 → 4 (#246).** The register gate is
+  unchanged in shape — it was already exact-match and already ran before PoP and
+  key establishment (`nats-register.ts`) — so this release adds no new gate. It
+  changes the number the gate compares against, which is the whole enforcement:
+  a browser declaring `3` now gets `{ error: "protocol_mismatch", code: 426,
+  protocolVersion: 4 }` and never reaches key delivery, and a `4` plugin is
+  refused by a `3` client for the mirror reason. Release the plugin, client, and
+  SaaS packages together.
+
+  **Why the v6 frames stopped being "additive and safely ignorable".** They are
+  still safely ignorable for RENDERING; they are not for CORRECTNESS. The shipped
+  `0.7.0` client also declares `3`, so before this bump it passed the gate and
+  then ignored the per-conversation `seq` on durable frames and the
+  `get_difference`/`difference` gap-sync (#244), the `user_committed` broadcast
+  (#245), the `reasoning`/`tool`/`approval` `history` rows (#242), and
+  `ack.committed[]` (#243). The `seq` case is the one that forces the bump:
+  transport here is core NATS pub/sub, at-most-once with no retention, so a peer
+  that cannot detect a hole never asks to heal one. What reaches it unasked — the
+  history snapshot requested on every successful register, a `turn_snapshot` at
+  the end of a streamed turn — is incidental, not a repair path: it rides the
+  same at-most-once transport and nothing aims it at the hole.
+
+  **#309 is closed by this.** An older client drops role-less `history` rows, so
+  its cursor can never cite a reasoning id and "load older" stalls permanently
+  once `capabilities.reasoningDurable` is on. #309 named exactly two fixes —
+  withhold the row per peer, or refuse the connection — and this is the refusal.
+  Its operator-side mitigation ("do not enable `reasoningDurable` while serving
+  stale clients") is retired. The forbidden server-side repair is still
+  forbidden: "every page must contain at least one role-bearing row" invents a
+  supersession rule inside the projection, which is NOT-list N8. See
+  `journal-history.ts`'s `historyPageBefore` docblock.
+
+  **No capability negotiation was added.** Under an exact-match gate there is no
+  peer to withhold a frame from, and the one shape that would need per-peer
+  withholding — a live delete/edit frame — does not exist here:
+  `messageDeleted`/`messageEdited` are durable event kinds with no producer. A
+  carrier with zero consumers is an unexercised mechanism. The rule for the next
+  slice is in `protocol.ts`'s "When to bump", which now carries v4 as its second
+  worked example.
+
+- **`get_difference` / `difference` gain correlation and catch-up fields (#356).**
+  `get_difference` now carries a required `nonce` alongside `afterSeq`, and the
+  `difference` reply echoes both back and adds `partial` and `maxSeq`. All four
+  are required on the v4 wire and both receive doors refuse a frame missing one.
+  They are not decoration: our devices share one `.out` subject and have no wire
+  identity, so the echo is the only thing that tells a device its own reply from
+  another device's (without it, a device folds a stranger's reply and skips its
+  own range); `partial` is Telegram's `differenceSlice` signal, without which the
+  remainder of a sliced range is stranded until the next durable frame; and
+  `maxSeq` is what a complete reply advances the cursor to, so an individually
+  oversized difference row no longer wedges catch-up.
+
+### Fixed
+
+- **Approval frames are journaled at the moment the plugin records them, not at
+  publish (#341, extends #304).** `approval_request`/`approval_resolved` were
+  appended inside `sendToPeer`, below its disposed/transport-down/no-session-key
+  refusals, so a refused prompt got no `approval` row while `deliverPending` had
+  already written the pending record and the register-time `approval_snapshot`
+  re-delivered the card live. The user decided, the `approvalResolution` row
+  landed with no `approval` row to fold onto, and history showed neither (N8/N3).
+  The append moved up to `NatsChannel.publishApprovalFrame`, which runs above the
+  refusals and stamps the row's `seq` onto the frame it then publishes;
+  `sendToPeer` skips those two types so no row is written twice, and
+  `deliverPending` passes `{ redelivery }` so a re-armed card is not journaled
+  again (approval rows carry no `message_id`, so nothing downstream would dedupe
+  them — #355). The exception is scoped to these two frame types: an approval's
+  state exists server-side whether or not the push lands and its id is core's,
+  stable across attempts, neither of which holds for the reasoning residual
+  (#304).
+
+  **An account with no live channel has no journal either, and that state is
+  TRANSIENT** — `nats-account-runtime.ts` deletes the runtime on stop and
+  re-adds it on the next start, so an approval can be delivered with no channel
+  and resolved (or expired) with one. Journaling the resolution there would
+  reproduce the original orphan, so the invariant is stated as a producer rule
+  and enforced at both legs: *a resolution row is journaled only once its request
+  row exists.* `deliverPending` records on the pending entry whether the row was
+  actually written (`sendApprovalRequest` now returns `{ delivered, journaled }`
+  — a refused push journals, a swallowed append does not), and `updateEntry`
+  hands the card's payload to `sendApprovalResolved` as `journalRequestFirst`
+  when it is still owed. The channel writes the request row first and the
+  resolution second; if the request row cannot be written, neither is. The rule
+  and its one exception — a pending record already evicted, where the verdict is
+  journaled alone and the reducer's no-op is the fallback — are stated once, at
+  `approvals.ts`'s `updateEntry`; every other site points there rather than
+  restating them.
+
+  Two supporting changes fall out of that. `listPendingApprovalsForPeer` now
+  WITHHOLDS an expired card from the snapshot instead of deleting its record —
+  deletion is left to the cap and the abandonment backstop (which now covers both
+  entry shapes, one grace period after a finalize was due) — because it runs for
+  every registering peer and was routinely destroying the payload the expiry
+  finalize still needed to write the card's row. And `requestJournaled` is now
+  enforced as peer-scoped on the READ side as well as the write: the journal's
+  conversation id is the peerId, so a row written for one peer does not satisfy
+  another peer's resolution.
+
+  **Disclosed N8-gaining direction.** The journal keeps a card forever while
+  `approval_snapshot` replays only what is still pending, so a card created while
+  the peer was disconnected, never pushed, and then EXPIRED before it returned is
+  served by `projectJournalHistory` with the denial-equivalent verdict
+  `buildExpiredResult` produced — history showing a decision live never showed.
+  That is the Telegram-server model working as intended (the server created the
+  service message and recorded its outcome; the device missed the window), and it
+  is accepted knowingly rather than overlooked.
+
+  The same applies to ORDER on the catch-up path: a card whose `approval` row is
+  minted at resolution time takes a seq from that moment, so
+  `projectJournalHistory` places it after anything delivered while it was open,
+  where the client's `approval_snapshot` leg placed it at register time. Same
+  card, later slot. Repairing it would mean reordering rows on a timestamp the
+  store does not have — the server-side invention N8 forbids — so it is disclosed
+  rather than fixed.
+
+- **`ingress-dedupe.ts`'s accept seam treats the delivery journal as the dedupe
+  authority (#344, extends #292).** `outcomeStore.record(…, "accepted")` persists
+  through the SDK dedupe store at call time while `appendInboundUser` runs in the
+  batch footer, so the durable order is marker-first, row-second and a crash
+  between them stranded the message: the replay hit the `existing.status ===
+  "found"` branch, was re-acked as a duplicate, and never reached the journal.
+  The found/accepted branch now calls `lookupUserMessageIdByRandomId` and, when
+  the row is missing, falls through to the fresh-accept path — one journal call
+  site still, and `appendInboundUser`'s `journal_user_idempotency_once` guard
+  keeps it idempotent. The order is deliberately NOT reversed: a row without a
+  marker replays as a fresh admission and answers the same text twice.
+
+- **The overflow resolver applies the same journal authority (#344).**
+  `inbound-overflow-resolver.ts` is the second door onto a durable `accepted`
+  marker — the path an id takes when its raw frame could not be retained — and it
+  read the marker as a terminal accept. For a crash-window orphan (or any marker
+  orphaned by §15.6's journal cutover) it ACKED, so the client drained its replay
+  ledger and the message was lost permanently, which is worse than the accept
+  seam's version of the same bug. It now takes an optional `lookupUserRow` dep
+  and, when the journal has no row, publishes nothing at all: a resolver can only
+  report a verdict, so withholding one leaves the ledger entry for the ordinary
+  flush path to admit, journal and answer. It also carries the `committed` echo
+  when a row does exist, which that arm never did.
+
+- **…and so does the debouncer's known-outcome fast path (#344).** Withholding a
+  verdict only preserves a replay if every reader withholds it.
+  `outcomeStore.lookup()` warms the process hot cache on its found path (so does
+  `write.commit()`), and `bounded-inbound-debouncer.ts`'s `peekOutcome`
+  short-circuit reads that cache *before* charging retention — so the replay the
+  resolver had just declined to answer was acked away there instead, and never
+  reached `onFlush`, the journal, or the found branch. The short-circuit now
+  fires only for a refusal: `onKnownOutcome` and the `known-outcome` push result
+  are typed `IngressRefusal` (`Exclude<IngressOutcome, "accepted">`), so a
+  fast-path decision on `accepted` no longer typechecks. The cost is a
+  retention reservation plus one flush per genuine accepted replay; under full
+  retention such replays overflow and drain about one per round instead of all
+  at once (nothing is lost — the client re-drains later), on a path only a
+  client without `random_id` reaches. This is now one rule with one statement —
+  THE READER RULE, on `OutcomeLookup` in `ingress-outcome.ts`: the reader that
+  can ADMIT a message is the only one that may answer an `accepted` outcome
+  with no row; a reader that cannot admit may answer it only when the row exists.
+
+- **The accept seam's journal question covers older clients too (#344).** The
+  lookup is keyed by `randomId ?? wireId` — the dedupe key's body, which is
+  exactly what `appendInboundUser` stores as `idempotency_key` — instead of
+  `random_id` alone. A client that sends no idempotency token now has its
+  crash-window message recovered like any other; it is simply acked bare, since a
+  `committed` entry needs a `random_id` to key it by.
+
+- **The dual-marker warning names the outcome that actually won (#344).**
+  `createRateLimitedOutcomeInvariantWarning` accepted a message, discarded it,
+  and emitted a hardcoded "overloaded wins". Harmless while `overloaded` was the
+  only possible winner; with `cancelled` it told the operator the peer had been
+  sent `inbound_rejected` when it had been silently acked. It now takes the
+  winning outcome — a closed union, so the throttle keyspace stays three static
+  entries — and builds the line itself, with one window per winner.
+
+- **A faulted `cancelled` write fails closed (#344).** `record()`'s disk-error
+  cleanup was gated on `overloaded`; it now covers both refusals. A memory-only
+  suppression dies with the process, and its next replay would run the turn
+  `/stop` killed. `accepted` deliberately keeps its memory-only receipt: losing
+  that marker only re-admits, which the journal's idempotency collapses.
+
+- **`/stop` suppression is its own terminal outcome (#344).** `IngressOutcome`
+  gains `cancelled`, with its own `PersistentDedupe` namespace
+  (`webchannel-inbound-cancelled`) and its own rung — above `overloaded`, above
+  `accepted` — in the lookup precedence. The three suppression writers
+  (`nats-account-runtime.ts`'s `onCancel`, `ingress-dedupe.ts`'s
+  cancelled-inbound fallback, `inbound-overflow-resolver.ts`'s `recoverCancelled`)
+  record it instead of borrowing `accepted`. They write no journal row on
+  purpose, which is byte-identical to the crash window above, so without the split
+  a cancelled message whose ack was lost would have been re-admitted and its
+  aborted turn re-run. A `cancelled` replay is acked and dropped — never
+  `inbound_rejected` and never re-admitted. It still carries the `committed` echo
+  when a row happens to exist (a message journaled before the `/stop` landed).
+  `record()`'s `replaceOpposite` option is renamed `replaceOthers`. Cancellation
+  persists first and retains weaker markers until a later lookup cleans them,
+  so failure or rollback of the replacement preserves the previous verdict. **Upgrade note:** cancellations recorded by an earlier build remain
+  in the `accepted` namespace for their 7-day TTL and are indistinguishable from a
+  crash-window marker; one whose ack was also lost re-runs its turn once on the
+  next replay.
+
+- **A K>=2 count shortfall no longer routes buffered finals onto lanes (#340,
+  extends #260).** `flushBufferedOrdinaryFinals` used to fall back to
+  `materializedAnswerLanes()` when the finals and the streamed lanes disagreed in
+  number; every landing there is non-authoritative, so `emitTurnSnapshot`
+  republished the lane with its `streamedAnswerText` and destroyed the final —
+  permanently, since #240 removed the core-transcript read that healed it on
+  reload. `targets` is now empty in that case and each unpaired final goes out
+  through `deliverTerminalIndependent` in order, matching the built-in Telegram
+  channel: a final finalizes the one draft it provably owns or becomes a new
+  message, never an edit of a past bubble.
+
+- **The `get_difference` serve path is byte-fit, bounded and queued (#356).**
+  Seven reviewers found eight defects concentrated in the gap-sync seam; the ones
+  that live on this side of the wire are below. (The client half — the cursor
+  state machine, #350/#351/#352/#345 — is in the client package's changelog.) The
+  wire also gained the correlation and catch-up fields that make the client half
+  possible, under Breaking above. Closes:
+  - **#343** — one journal row too large for a peer's `max_payload` wedged
+    `fitDifference`, so that device received nothing for the rest of the session.
+    Rows that individually exceed the difference envelope's budget are now
+    omitted with a diagnostic, and `maxSeq` carries the client past them. This
+    does not establish whether their differently sized live frames were delivered.
+  - **#348** — `fitDifference` re-measured the surviving prefix once per removed
+    row on the account's dispatch turn, and `get_difference` had no per-peer bound
+    at all. It now uses one per-row pass and one bisection over surviving prefixes.
+    Singleton checks and prefix fitting use the same actual `partial`/`maxSeq`
+    envelope that is published, so conservative metadata cannot falsely skip a
+    fitting row. A skipped tail is covered in a later request if including its
+    coverage metadata would overflow an otherwise fitting partial reply.
+  - **#348 (the dispatch turn)** — `serveDifference` is deferred like the other
+    two read paths, with a bounded per-peer QUEUE rather than their
+    drop-a-concurrent-request latch: a difference names a floor and a nonce, so a
+    dropped request leaves a device waiting on its 5 s timeout, and N tabs of one
+    account gap on the same frame at the same instant. One read+publish runs per
+    peer with at most 8 queued requests; overflow replaces the newest pending
+    request, whose device can retry on timeout. Both halves of the
+    deferred body are now guarded — out there a throw would be an
+    `uncaughtException`, not a dropped frame.
+
+## 0.7.0
+
+### Added
+
+- **The plugin is now the authoritative source of the live turn's answer order
+  (#174, #215).** It has always known which assistant message produced which
+  bubble; it had no way to say so, so the browser's transcript was decided by
+  whatever order the wire happened to deliver. At the terminal drain — after
+  `flushBufferedOrdinaryFinals`, before `turn_settled` — the channel now emits
+  one additional frame:
+  `{ type: "turn_snapshot", turnId, answers: Array<{ id, text }>, remove: string[] }`.
+  - `answers` is every lane that streamed visible answer text, **in generation
+    order**. `id` reuses the lane's materialized wire id, or a freshly minted id
+    for a lane that streamed but whose frames never reached the wire — that
+    minted entry is what *recovers* the #215 mid-lane, which previously rendered
+    as a corrupted bubble. (Across a durable-history read the client turns that
+    same mint into a duplicate instead — see the client-side known limitation
+    below.)
+  - `text` is the lane's new per-lane **`streamedAnswerText`**, captured at
+    stream time and never overwritten by a final topping the lane up. That is
+    what makes the snapshot immune to #215 final mis-routing: a final landing on
+    the wrong lane can no longer corrupt what the snapshot reports. Where the
+    routing is *provable* — the immediate collapse / current-lane-has-text /
+    lone-message paths, and the buffered path when the finals map one-to-one
+    onto materialized targets and every text-bearing message streamed
+    (`answerTextIsAuthoritative`) — the snapshot carries the lane's full
+    `answerText` instead, so a final's tail beyond the last partial is not
+    dropped.
+  - `remove` names only bubbles the plugin **can prove** duplicate an `answers`
+    entry: an overflow final's independent bubble, and a recovery block for a
+    lane already in `answers`. The two carry **independent** proofs — the
+    overflow bubble is guarded by a turn-level invariant (a cardinality
+    condition — every ordinary final being routed must have a streamed answer
+    lane), the recovery block by its own lane having streamed visible text.
+    Both rest on `streamedVisibleAnswerText`, the predicate `answers` itself
+    filters on, so a marked bubble is provably represented there — as its
+    *streamed* text. The one gap that leaves: an overflow bubble named on the
+    mis-routable path can carry a final-only tail the last partial never
+    emitted (the open VERIFY-1 edge), which the live view then loses and a
+    reload restores. Where the relevant proof fails the plugin marks nothing
+    and leaves the bubble visible-but-misplaced rather than tell the client to
+    delete content that exists nowhere else. A notice, an error, or any stray
+    independent bubble is **never** named.
+  - Emission is best-effort by design. A transport without `sendTurnSnapshot`
+    is skipped, a throw is caught and warned, and either way the drain and
+    `turn_settled` proceed — the turn degrades to the pre-#212 arrival-order
+    render rather than failing.
+
+### Changed
+
+- **`WebChannelPeerChannel` gains a required `sendTurnSnapshot(peerId, turnId,
+  answers, remove)`.** `NatsChannel` and `NullPeerChannel` implement it. This is
+  an internal channel contract, not a published entry point — the plugin ships
+  no JS API — but an out-of-tree implementer of the interface must add the
+  method.
+- **The two companion libraries were renamed** —
+  `@mir-stream/webchannel-client` → `openclaw-webchannel-client` and
+  `@mir-stream/webchannel-saas` → `openclaw-webchannel-saas`. **This plugin's own
+  name is unchanged**; it has always been the unscoped `openclaw-webchannel`, and
+  all three now share that prefix. No API, behaviour, or protocol change.
+  **The old scoped names will be unpublished after this release**, so consumers
+  of the client or saas packages must migrate — see
+  [Migrating an existing consumer](../../docs/PUBLISHING.md#migrating-an-existing-consumer).
+
+### Notes
+
+- **No protocol break.** `WEBCHANNEL_PROTOCOL_VERSION` stays `3`. `turn_snapshot`
+  is purely additive and safely ignorable: no existing frame or field changed,
+  and a `0.6.x` client that has never heard of the type ignores it and renders
+  exactly as it does today. The order fix does need a `0.7.0` client to be seen,
+  but nothing here refuses a mismatched peer.
+- **Known limitation, deliberate.** A text-bearing message that streams **zero**
+  partials has no `streamedAnswerText`, so it cannot appear in `answers` and the
+  snapshot cannot place it — and in a `K>=2` tool-only-last turn its mis-routed
+  final can still leave the live view reading `[A][C][C]` with `B` absent. This
+  is the same #111 final-identity ceiling as the Case-X shape, not a defect in
+  the snapshot: finals are identity-less on the wire, and the pinned core does
+  not produce a non-streaming message at the middle position. It reload-heals.
+  The `remove` guard above exists precisely so this shape loses *ordering*, never
+  *content*. Pinned by tests; do not add mitigation at this layer.
+- **Known limitation, client-side.** What the plugin states authoritatively is
+  only as good as the client's reconciliation of it, and that reconciliation is
+  not yet ordered against durable history. A second device, a reconnect, or a
+  cursor-less `loadHistory()` refresh around a live turn can all put a
+  `turn_snapshot` across its own turn's history frame, and the snapshot is
+  then either overwritten by history adoption (**#227**) or mints a duplicate
+  bubble rather than recovering a lane (**#228**). Both are client-side and
+  neither is fixed here. Nothing in the emission above changes to work around
+  them.
+- This snapshot follows #172 and #173, which shipped in `0.6.1`, and corrects
+  the one shape #173 left imperfect (3+ text-bearing lanes, a tool-only last
+  message, a middle frame dropped mid-turn). **It is not the end of the
+  delivery-render work.** That design has since been reboarded onto **#236**,
+  which supersedes the older umbrella and absorbs the limitations above. Treat
+  #236 as the live tracker; the issue numbers here are historical labels for
+  the behaviours they describe.
 
 ## 0.6.1
 

@@ -47,7 +47,9 @@ import {
   loadPersistedCredentialDocument,
   resolveAcquisitionIdentity,
   resolveAccountStorageRoot,
+  resolveWebchannelAccountId,
   resolveWebchannelAccountConfig,
+  resolveWebchannelAccountConfigForSetup,
 } from "./account-config.js";
 import {
   parseNatsCredentialMode,
@@ -106,8 +108,8 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
     configuredLabel: "configured",
     unconfiguredLabel: "not configured",
     resolveConfigured: ({ cfg, accountId }) => {
-      const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
-      if (!inspectWebchannelAccountIds(cfg).validIds.includes(id)) return false;
+      const id = resolveWebchannelAccountId(cfg, accountId);
+      if (id === undefined) return false;
       const account = resolveWebchannelAccountConfig(cfg, id);
       let mode: "static" | "enrolled";
       try {
@@ -127,15 +129,15 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       }
       // A path by itself is not readiness. Count enrolled material only when
       // its complete v2 identity matches the effective configured account.
-      const identity = resolveAcquisitionIdentity(cfg, id);
-      const saasBaseUrl = resolveEnrolledSaasBaseUrl({
-        natsConfig: account.nats as WebchannelNatsConfig | undefined,
-        ...(identity.saasBaseUrl !== undefined
-          ? { saasBaseUrl: identity.saasBaseUrl }
-          : {}),
-      });
-      if (!saasBaseUrl) return false;
       try {
+        const identity = resolveAcquisitionIdentity(cfg, id);
+        const saasBaseUrl = resolveEnrolledSaasBaseUrl({
+          natsConfig: account.nats as WebchannelNatsConfig | undefined,
+          ...(identity.saasBaseUrl !== undefined
+            ? { saasBaseUrl: identity.saasBaseUrl }
+            : {}),
+        });
+        if (!saasBaseUrl) return false;
         const storageRoot = resolveAccountStorageRoot(account);
         return loadPersistedCredentialDocument({
           tenant: identity.tenant,
@@ -151,7 +153,7 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       }
     },
     resolveStatusLines: ({ cfg, accountId, configured }) => {
-      const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+      const id = resolveWebchannelAccountId(cfg, accountId) ?? accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
       const inspectedInvalid = inspectWebchannelAccountIds(cfg).invalid.find(
         (candidate) => candidate.id === id,
       );
@@ -183,7 +185,7 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       message: "WebChannel tenant id",
       required: true,
       initialValue: ({ cfg, accountId }) =>
-        accountString(resolveWebchannelAccountConfig(cfg, accountId), "tenant") ??
+        accountString(resolveWebchannelAccountConfigForSetup(cfg, accountId), "tenant") ??
         "default-tenant",
       applySet: noopApplySet,
     },
@@ -192,7 +194,7 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       message: "WebChannel SaaS base URL (e.g. https://saas.example.com)",
       required: true,
       initialValue: ({ cfg, accountId }) =>
-        (resolveWebchannelAccountConfig(cfg, accountId).saas as { baseUrl?: string } | undefined)
+        (resolveWebchannelAccountConfigForSetup(cfg, accountId).saas as { baseUrl?: string } | undefined)
           ?.baseUrl,
       validate: ({ value }) => validateHttpUrl(value),
       applySet: noopApplySet,
@@ -241,9 +243,8 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       "  openclaw agents bind --bind webchannel:<account> --agent <agent>",
       "  openclaw gateway run",
       "",
-      'Note: dmSecurity is set to "open" (demo-grade). It admits ALL inbound DMs ' +
-        "and is NOT a safe production default — tighten it before exposing the " +
-        "account publicly.",
+      'New accounts default to DM policy open with explicit allowFrom ["*"]. Existing account DM restrictions are preserved. ' +
+        "Users must still hold a SaaS JWT for this account. Use allowlist, pairing or disabled for additional DM restrictions.",
     ],
   },
 };

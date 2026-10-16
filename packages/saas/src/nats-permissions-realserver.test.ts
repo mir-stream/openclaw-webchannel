@@ -513,12 +513,12 @@ const TENANT_A = "tenant-a";
 const TENANT_B = "tenant-b";
 
 // Tenant A subjects
-const A_OUTBOUND = "webchannel.tenant-a.outbound.test";
-const A_INBOUND = "webchannel.tenant-a.inbound.test";
+const A_OUTBOUND = "webchannel.tenant-a.test-agent.peer.out";
+const A_INBOUND = "webchannel.tenant-a.test-agent.peer.in";
 
 // Tenant B subjects
-const B_OUTBOUND = "webchannel.tenant-b.outbound.test";
-const B_INBOUND = "webchannel.tenant-b.inbound.test";
+const B_OUTBOUND = "webchannel.tenant-b.test-agent.peer.out";
+const B_INBOUND = "webchannel.tenant-b.test-agent.peer.in";
 
 // ---------------------------------------------------------------------------
 // Generate test credentials
@@ -564,8 +564,8 @@ async function generateAgentCredentials(
   );
   const userKp = createUser();
   const userSeed = new TextDecoder().decode(userKp.getSeed());
-  const pub = [`webchannel.${tenant}.inbound.>`];
-  const sub = [`webchannel.${tenant}.outbound.>`];
+  const pub = [`webchannel.${tenant}.test-agent.*.in`];
+  const sub = [`webchannel.${tenant}.test-agent.*.out`];
   const userJwt = await encodeUser(`agent-${tenant}`, userKp, accountSigner, {
     pub: { allow: pub },
     sub: { allow: sub },
@@ -1249,7 +1249,7 @@ describe.skipIf(!NATS_SERVER_BIN)(
 // Browser creds are scoped to `webchannel.{tenant}.*.{peerId}.>` so a browser
 // can only touch its OWN peer subtree — it cannot publish a forged register
 // reply to (or subscribe) another peerId's reginbox/register. Observer creds are
-// sub-only (tenant-wide read, no publish). Agent creds stay tenant-wide.
+// sub-only (tenant-wide read, no publish). Agent creds are account-scoped.
 // ---------------------------------------------------------------------------
 
 const T = "tenant-a";
@@ -1340,16 +1340,49 @@ describe.skipIf(!NATS_SERVER_BIN)("Per-peer browser + observer scoping", () => {
     expect(denied).toBe(true);
   });
 
-  it("agent creds remain tenant-wide (pub + sub)", async () => {
+  it("agent creds serve their account and reject the tenant wildcard (#409)", async () => {
     const creds = await mintNatsUserCreds({
       accountSeed: trustChain!.private.natsAccountSeed,
       tenant: T,
       role: "agent",
+      accountId: ACCT,
     });
     const pub = await probe(creds, `PUB webchannel.${T}.${ACCT}.${OTHER}.out 2\r\nhi\r\n`);
     expect(pub.denied).toBe(false);
+    const own = await probe(creds, `SUB webchannel.${T}.${ACCT}.*.register 1\r\n`);
+    expect(own.denied).toBe(false);
     const sub = await probe(creds, `SUB webchannel.${T}.> 1\r\n`);
-    expect(sub.denied).toBe(false);
+    expect(sub.denied).toBe(true);
+  });
+
+  it.each(["out", "reginbox.nonce", "reply", "in.extra", "register.extra"])("browser cannot publish agent/undefined direction %s (#410)", async (suffix) => {
+    const creds = await browserCreds(SELF);
+    const result = await probe(creds, `PUB webchannel.${T}.${ACCT}.${SELF}.${suffix} 2\r\nhi\r\n`);
+    expect(result.denied).toBe(true);
+  });
+
+  it.each(["in", "register"])("browser can still publish %s (#410)", async (suffix) => {
+    const creds = await browserCreds(SELF);
+    expect((await probe(creds, `PUB webchannel.${T}.${ACCT}.${SELF}.${suffix} 2\r\nhi\r\n`)).denied).toBe(false);
+  });
+
+  it.each(["SUB", "PUB"])("agent cannot %s a sibling account's register or data (#409)", async (command) => {
+    const creds = await mintNatsUserCreds({ accountSeed: trustChain!.private.natsAccountSeed, tenant: T, role: "agent", accountId: ACCT });
+    for (const suffix of ["register", "in", "out", "reginbox.nonce"]) {
+      const subject = `webchannel.${T}.sibling.${SELF}.${suffix}`;
+      const wire = command === "SUB" ? `SUB ${subject} 1\r\n` : `PUB ${subject} 2\r\nhi\r\n`;
+      expect((await probe(creds, wire)).denied).toBe(true);
+    }
+  });
+
+  it("continues accepting a previously issued unexpired tenant-wide credential (#409)", async () => {
+    const signer = fromSeed(new TextEncoder().encode(trustChain!.private.natsAccountSeed));
+    const user = createUser();
+    const userJwt = await encodeUser("legacy-agent", user, signer, {
+      pub: { allow: [`webchannel.${T}.>`] }, sub: { allow: [`webchannel.${T}.>`] },
+    }, { exp: Math.floor(Date.now() / 1000) + 60 });
+    const creds = { userJwt, userSeed: new TextDecoder().decode(user.getSeed()) };
+    expect((await probe(creds, `SUB webchannel.${T}.> 1\r\n`)).denied).toBe(false);
   });
 
   it("mintNatsUserCreds throws for role 'browser' without a peerId", async () => {

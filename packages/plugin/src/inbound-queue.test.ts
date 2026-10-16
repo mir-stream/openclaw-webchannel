@@ -351,11 +351,12 @@ describe("coalesceUserMessages", () => {
     });
 
     /**
-     * Hostile shapes. `coalescedIds` used to be reachable from the wire (the
-     * decode path casts instead of validating), and a throw here is NOT a safe
-     * failure: `startTurn` catches it with `maybeForget(); return;`, so the
-     * whole turn is discarded — ACKed, never run, never answered, never settled.
-     * Strictly worse than the bug #99 fixes.
+     * Hostile shapes. `coalescedIds` is reachable from the wire — #246 half A's
+     * door decoder validates the KNOWN fields of a `user_message` and passes
+     * unknown ones through, so an attached member list still arrives — and a
+     * throw here is NOT a safe failure: `startTurn` catches it with
+     * `maybeForget(); return;`, so the whole turn is discarded — ACKed, never
+     * run, never answered, never settled. Strictly worse than the bug #99 fixes.
      */
     describe("#99 hostile `coalescedIds` shapes never throw", () => {
       const hostile: Array<[string, unknown]> = [
@@ -451,6 +452,20 @@ describe("normalizeInboundUserMessage", () => {
     });
   });
 
+  it("#398 keeps an explicit stop's named earlier inputs with only their two id fields, and no other message's", () => {
+    const raw = {
+      type: "user_message", text: "/stop", id: "wire-s",
+      cancel_pending: [{ id: "wire-m", random_id: "logical-m", coalescedIds: ["victim"] }, { id: "wire-n" }],
+    } as unknown as UserMessageLike;
+    expect(normalizeInboundUserMessage(raw)).toEqual({
+      type: "user_message", text: "/stop", id: "wire-s",
+      cancel_pending: [{ id: "wire-m", random_id: "logical-m" }, { id: "wire-n" }],
+    });
+    for (const text of ["hello", "stop"]) {
+      expect(normalizeInboundUserMessage({ ...raw, text })).not.toHaveProperty("cancel_pending");
+    }
+  });
+
   it("strips a peer-supplied member list of EVERY shape", () => {
     for (const value of [["victim"], 5, "abc", [{}], [""], null, { a: 1 }]) {
       const raw = { type: "user_message", text: "hi", coalescedIds: value } as unknown as UserMessageLike;
@@ -480,6 +495,29 @@ describe("normalizeInboundUserMessage", () => {
   it("drops a non-string id (retention already ignores one)", () => {
     const raw = { type: "user_message", text: "hi", id: 5 } as unknown as UserMessageLike;
     expect(normalizeInboundUserMessage(raw)).toEqual({ type: "user_message", text: "hi" });
+  });
+
+  it("#243: PRESERVES a string random_id (a known wire field the dedupe reads)", () => {
+    const raw = {
+      type: "user_message",
+      text: "hi",
+      id: "wire-1",
+      random_id: "rand-1",
+      junk: "x",
+    } as unknown as UserMessageLike;
+    // Dropping random_id here would silently defeat the #243 dedupe (it would
+    // always fall back to the wire id), so it must survive the strip.
+    expect(normalizeInboundUserMessage(raw)).toEqual({
+      type: "user_message",
+      text: "hi",
+      id: "wire-1",
+      random_id: "rand-1",
+    });
+  });
+
+  it("#243: drops a non-string random_id (same rule as a non-string id)", () => {
+    const raw = { type: "user_message", text: "hi", id: "w", random_id: 7 } as unknown as UserMessageLike;
+    expect(normalizeInboundUserMessage(raw)).toEqual({ type: "user_message", text: "hi", id: "w" });
   });
 });
 

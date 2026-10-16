@@ -1,4 +1,4 @@
-# @openclaw/webchannel-saas
+# openclaw-webchannel-saas
 
 Headless SaaS trust-chain core + reference harness for the WebChannel NATS relay.
 
@@ -44,7 +44,7 @@ Generates the complete SaaS trust-chain artifacts:
 - `kid` — a UUID minted per invocation, embedded in JWT headers for JWKS lookup
 
 ```typescript
-import { setupTrustChain } from '@openclaw/webchannel-saas';
+import { setupTrustChain } from 'openclaw-webchannel-saas';
 
 const trustChain = await setupTrustChain({
   operatorName: 'my-saas-operator',

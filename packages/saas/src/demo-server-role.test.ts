@@ -135,7 +135,7 @@ describe("demo SaaS /nats-user role-escalation guard (F6)", () => {
     const cookie = await loginCookie("alice", "demo");
     const { status, data } = await post("/nats-user", cookie, { role: "agent" });
     expect(status).toBe(200);
-    expect(data.permissions?.pub).toEqual([perPeer]);
+    expect(data.permissions?.pub).toEqual([perPeer.replace(/>$/, "in"), perPeer.replace(/>$/, "register")]);
     expect(data.permissions?.sub).toEqual([perPeer]);
     expect(data.permissions?.pub).not.toContain(tenantWide);
     expect(data.permissions?.sub).not.toContain(tenantWide);
@@ -145,7 +145,7 @@ describe("demo SaaS /nats-user role-escalation guard (F6)", () => {
     const cookie = await loginCookie("alice", "demo");
     const { status, data } = await post("/nats-user", cookie, { role: "observer" });
     expect(status).toBe(200);
-    expect(data.permissions?.pub).toEqual([perPeer]);
+    expect(data.permissions?.pub).toEqual([perPeer.replace(/>$/, "in"), perPeer.replace(/>$/, "register")]);
     expect(data.permissions?.sub).toEqual([perPeer]);
   });
 
@@ -228,17 +228,17 @@ describe("demo SaaS /nats-user role-escalation guard (F6)", () => {
     expect(data.permissions?.pub).toEqual([]);
   });
 
-  it("lets an ADMIN session mint tenant-wide agent creds via /admin/nats-user", async () => {
+  it("lets an ADMIN session mint account-scoped agent creds via /admin/nats-user", async () => {
     const cookie = await loginCookie("admin", "demo");
-    const { status, data } = await post("/admin/nats-user", cookie, { role: "agent" });
+    const { status, data } = await post("/admin/nats-user", cookie, { role: "agent", accountId: "account-a" });
     expect(status).toBe(200);
-    expect(data.permissions?.pub).toEqual([tenantWide]);
-    expect(data.permissions?.sub).toEqual([tenantWide]);
+    expect(data.permissions?.pub).toEqual([`webchannel.${TENANT}.account-a.>`]);
+    expect(data.permissions?.sub).toEqual([`webchannel.${TENANT}.account-a.>`]);
   });
 
   it("refuses /admin/nats-user for a NON-admin session (403)", async () => {
     const cookie = await loginCookie("alice", "demo");
-    const { status } = await post("/admin/nats-user", cookie, { role: "agent" });
+    const { status } = await post("/admin/nats-user", cookie, { role: "agent", accountId: "account-a" });
     expect(status).toBe(403);
   });
 });

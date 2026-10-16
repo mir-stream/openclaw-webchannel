@@ -576,6 +576,21 @@ export const demoSaasRequestHandler = async (req: IncomingMessage, res: ServerRe
       return;
     }
 
+    // Retire only the caller's current browser session. Already-issued NATS
+    // credentials and other devices' sid values have separate lifetimes.
+    if (path === "/logout") {
+      if (req.method !== "POST") {
+        res.setHeader("Allow", "POST");
+        return sendJson(res, { error: "Method not allowed" }, 405);
+      }
+      const user = sessionUser(req);
+      const sid = readCookie(req, "sid");
+      if (sid) sessions.delete(sid);
+      res.setHeader("Set-Cookie", "sid=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0");
+      if (!user) return sendJson(res, { error: "not authenticated" }, 401);
+      return sendJson(res, { ok: true });
+    }
+
     // ── /me — who am I + my rendezvous map (for the agent switcher). ──────
     if (req.method === "GET" && path === "/me") {
       const user = sessionUser(req);
@@ -786,7 +801,7 @@ export const demoSaasRequestHandler = async (req: IncomingMessage, res: ServerRe
       if (req.method === "POST" && path === "/admin/chaos/nats-user") {
         parseJsonBody(req, (body) => {
           if (!body || typeof body !== "object") return sendJson(res, { error: "Invalid JSON body" }, 400);
-          const { tenant, role } = body as { tenant?: string; role?: NatsUserRole };
+          const { tenant, role, accountId } = body as { tenant?: string; role?: NatsUserRole; accountId?: string };
           if (!tenant) return sendJson(res, { error: "Missing tenant" }, 400);
           try {
             assertValidSubjectToken(tenant, "tenant");
@@ -795,10 +810,15 @@ export const demoSaasRequestHandler = async (req: IncomingMessage, res: ServerRe
           }
           const chaosRole: NatsUserRole =
             role === "agent" ? "agent" : role === "observer" ? "observer" : "browser";
+          if (chaosRole === "agent") {
+            try { assertValidSubjectToken(accountId ?? "", "accountId"); }
+            catch (err) { return sendJson(res, { error: (err as Error).message }, 400); }
+          }
           mintNatsUserCreds({
             accountSeed: privateChain.natsAccountSeed,
             tenant,
             role: chaosRole,
+            accountId,
             // Cross-tenant chaos: the boundary under test is the tenant segment,
             // not the peer subtree — a fixed synthetic peerId satisfies the
             // per-peer browser scope without affecting what the probe proves.
@@ -825,14 +845,19 @@ export const demoSaasRequestHandler = async (req: IncomingMessage, res: ServerRe
       if (req.method === "POST" && path === "/admin/nats-user") {
         parseJsonBody(req, (body) => {
           if (!body || typeof body !== "object") return sendJson(res, { error: "Invalid JSON body" }, 400);
-          const { role, ttlSeconds } = body as { role?: NatsUserRole; ttlSeconds?: number };
+          const { role, ttlSeconds, accountId } = body as { role?: NatsUserRole; ttlSeconds?: number; accountId?: string };
           const ttl = typeof ttlSeconds === "number" && ttlSeconds > 0 && ttlSeconds <= 3600 ? ttlSeconds : undefined;
           const resolvedRole: NatsUserRole =
             role === "agent" ? "agent" : role === "observer" ? "observer" : "browser";
+          if (resolvedRole === "agent") {
+            try { assertValidSubjectToken(accountId ?? "", "accountId"); }
+            catch (err) { return sendJson(res, { error: (err as Error).message }, 400); }
+          }
           mintNatsUserCreds({
             accountSeed: privateChain.natsAccountSeed,
             tenant: DEMO_TENANT,
             role: resolvedRole,
+            accountId,
             // A "browser" mint here (rare) stays pinned to the admin's own subject.
             ...(resolvedRole === "browser" ? { peerId: user.uuid } : {}),
             issuerAccountId: natsIssuerAccountId,
@@ -873,7 +898,7 @@ export const demoSaasRequestHandler = async (req: IncomingMessage, res: ServerRe
             return sendJson(res, { error: "Missing accountId" }, 400);
           }
           try {
-            assertValidSubjectToken(accountId, "accountId");
+            assertValidSubjectToken(accountId ?? "", "accountId");
           } catch (err) {
             return sendJson(res, { error: (err as Error).message }, 400);
           }

@@ -19,7 +19,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 
-import { WebChannelNATSClient, generateDevicePopKeyPair } from "@mir-stream/webchannel-client";
+import { WebChannelNATSClient, generateDevicePopKeyPair } from "openclaw-webchannel-client";
 import { classify } from "../web/app.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));

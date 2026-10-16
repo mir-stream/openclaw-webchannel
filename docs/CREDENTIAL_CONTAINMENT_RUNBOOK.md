@@ -30,21 +30,219 @@ Earlier guidance (CHANGELOG, #54) told operators to "invalidate the old
 encrypted peer state". An operator following that instruction has nowhere to go,
 because the thing it names does not exist. The correction:
 
-- **K seals no history at rest.** The history authority is OpenClaw core's
-  session transcript: plaintext JSONL at owner-only permissions, written by
-  core, never by this plugin. `NatsChannel.sendHistory` seals the frame with the
-  **current** K at delivery time. Replacing K therefore costs no re-encryption —
-  the next read-and-deliver cycle simply reseals under the new key
+- **K seals no history at rest.** Since #240 the history authority is **this
+  plugin's own `delivery-journal.sqlite`** (described below) — a chat reload is
+  served by replaying that file, not by reading core's session transcript. Core
+  still writes its own transcript, and it is still plaintext JSONL at owner-only
+  permissions, but this plugin no longer reads it for history.
+  `NatsChannel.sendHistory` seals the frame with the **current** K at delivery
+  time. Replacing K therefore costs no re-encryption — the next
+  read-and-deliver cycle simply reseals under the new key
   (`ISSUE_72_CONTAINMENT_PLAN.md` §1.4, RETAIN + RESEAL).
 - **What this plugin writes**, per exact `(tenant, accountId)` tuple, under
   `$HOME/.openclaw-webchannel-v2/<v2_namespace>/`:
   - `credentials.json` — NATS user seed and agent identity key. Owner-only.
   - `conversation-keys.json` — the per-peer K store.
   - `conversation-key-generations.json` — the audit-only generation sidecar.
+  - `storage-issuer.json` — effective issuer ownership of history and keys.
+    Preserve it with the complete tuple during backup/restore. Issuer changes
+    refuse startup; see the [manual procedure](STORAGE_IDENTITY_V2.md#issuer-binding-412).
+  - `delivery-journal.sqlite`, plus its `-wal`, `-shm` and `-journal` sidecars
+    (the last only on volumes where WAL is unavailable) — the v6 delivery
+    journal, opened at account start unconditionally, with no config to
+    disable it. It holds message **plaintext**, not ciphertext, written by
+    **two** seams:
+      - on the **EGRESS** path (`nats-channel.ts`'s `sendToPeer`): `agent_message`
+        text, `progress` placements, and the `turn_snapshot` rows written at
+        turn end; **`tool_activity` rows** and **approval rows** (both #242, both
+        with **no opt-in** — see the two notes below); plus, **only for an
+        account that has opted in**, the model's REASONING text (#242 half 1);
+      - on the **INGRESS** path (`ingress-dedupe.ts` → `journalEventForInboundUser`):
+        `kind:"user"` rows carrying **the message the user typed, verbatim**.
+        ⚠️ THIS ONE WAS MISSING FROM THIS LIST UNTIL 2026-08-27 AND IS THE ONE AN
+        OPERATOR IS LEAST LIKELY TO GUESS. An earlier revision said the journal's
+        contents were "all recorded on the egress path", which reads as "this
+        file holds what the agent said" — but doc §15.7 makes this plugin the
+        ONLY store for user messages, so every prompt your users sent is here in
+        the clear. `journal-history.ts` names both appenders; the runbook simply
+        did not.
+    Owner-only (0600) inside the 0700
+    tuple directory, and nothing ages out of it — no slice has shipped
+    retention (the pruning path is #299, the operator-facing procedure is
+    #290) — so it accumulates for the life of the account. This used to say
+    "that is #240"; #240 is history-from-the-journal plus the destructive
+    cutover, and neither of its two halves touches retention, so an operator
+    following that pointer would land on the wrong issue.
+
+    ⚠️ **REASONING IS OFF BY DEFAULT, AND IT IS AN OPT-IN — BUT READ THE CONTENT
+    WARNING BEFORE YOU TURN IT ON.** Nothing writes a reasoning row unless the
+    account sets `capabilities.reasoningDurable: true`. An earlier revision of
+    this runbook said rows are written unless an operator turns them off; that
+    is what stopped being true when #242 half 1 shipped the separate,
+    default-OFF switch, and the lever is now an opt-IN rather than an opt-out.
+    ⚠️ ONLY THAT HALF CHANGED. The same revision also said the rows accumulate
+    with **no user-visible benefit**, and that is STILL TRUE — see the paragraph
+    below, which says so in as many words. The default flipped; the value of
+    opting in did not.
+
+    ⚠️ **IT IS STILL A NEW CLASS OF CONTENT AT REST**, and that is the part an
+    operator needs when they DO turn it on. Be precise about what is new,
+    because an earlier revision was not: it said the other rows are "text the
+    user was shown", contrasting reasoning as the only thing quoting *user
+    data* — which is false, since the `kind:"user"` rows above already hold
+    every prompt verbatim. What is actually distinctive is that a reasoning row
+    is content **nobody ever chose to send**: the user's rows are what they
+    typed and the agent's rows are what it published, but reasoning is the
+    model's *private deliberation*, drafted on the assumption that it is
+    working notes. It routinely restates **tool output and file contents** that
+    appear in neither side of the conversation — a third source of material,
+    landing on disk from a surface that was never addressed to anyone. One row
+    per burst, stored verbatim — e.g.
+    `{"kind":"reasoning","id":"R1","turnId":"T","text":"…"}`.
+    The plugin's own `resolveReasoningEnabled` says the same thing about the
+    content ("reasoning can restate file contents, credentials, or the user's
+    own prompt to the least trusted surface this plugin serves") — that
+    judgement applies to bytes at rest, not only to a wire frame.
+
+    ⚠️ **DO NOT CONFUSE THE TWO KEYS.** `capabilities.reasoning` (default **ON**)
+    controls the ephemeral LIVE lane the widget renders; it writes nothing to
+    disk. `capabilities.reasoningDurable` (default **OFF**) is what puts the
+    content in this file. #113's default-ON was a decision to render a volatile
+    live lane, and it does not inherit to a decision to permanently record
+    plaintext to disk — which is exactly why they are two keys.
+
+    Before opting in, note what the opt-in currently buys: nothing ages out of
+    the journal (#299 is unshipped). ⚠️ **THE OTHER HALF OF THIS PARAGRAPH HAS
+    EXPIRED AND IS CORRECTED RATHER THAN DELETED**, because "you are accumulating
+    plaintext that no user can see" was a real argument for staying opted out and
+    someone will otherwise re-derive it. It read: #242 half 1 leaves the content
+    unreadable by any client, since the `history` wire frame cannot carry a
+    role-less message and the projection drops it. **Half 2 shipped**: the wire
+    row became a tagged union, the projection stops dropping, and the client
+    renders reasoning from the transcript — so opting in now genuinely restores
+    the lane on reload. The privacy cost is unchanged; the "buys you nothing"
+    half is gone, and the default is still OFF (revisit tracked by #306). If you
+    have already opted in
+    and want to stop, set `capabilities.reasoningDurable` back to `false` (any
+    present value other than boolean `true` also fails closed — see
+    `resolveReasoningDurable`); the data-minimization note below applies to the
+    rows already written.
+
+    ⚠️ **TOOL ACTIVITY IS ON DISK, WITH NO OPT-IN — AND IT IS THE CHEAP ONE.**
+    #242 half 3 made the structured tool lane durable: one row per `tool_activity`
+    frame, carrying the tool's **name**, its **phase/status**, a count-only
+    `summary`, and `argKeys`. ⚠️ **`argKeys` IS ARGUMENT KEY *NAMES* ONLY — NEVER
+    ARGUMENT VALUES**, and that is the whole reason this class needed no separate
+    switch: the boundary is enforced at the producer (`Object.keys(args)`) and
+    again where the wire is read, so no argument value reaches this file through
+    a tool row. What you can learn from these rows is **which tools ran, in what
+    order, on what named parameters, and whether they succeeded** — real
+    operational metadata, but not content. Judge it accordingly; it is not in the
+    same class as the two paragraphs around it.
+
+    ⚠️ **APPROVAL ROWS ARE THE SHARPEST ITEM IN THIS INVENTORY. READ THIS BEFORE
+    YOU DECIDE WHETHER TO KEEP THE FILE.** #242 half 4 made native HITL approval
+    cards durable, with **no opt-in**, so they are written **at the default
+    configuration**. An approval is stored as **two** rows — the request
+    (`approval_request`) and, separately, its outcome (`approval_resolved`) —
+    and the request row carries the card's `title`, `description`, `options` and
+    `prompt`.
+
+    **`prompt` is the part that matters: for an exec approval it is the command
+    line the agent asked to run, INCLUDING ITS ARGUMENT VALUES.** Concretely,
+    `approvals.ts` composes it as *title*, then the command preview — so a row
+    can read
+    `{"kind":"approval","id":"ap-1","prompt":"Run a command: psql \"postgres://svc:hunter2@db/prod\" -c …"}`.
+    Contrast the tool rows one paragraph up, which deliberately hold key **names**
+    only: **the approval row is where argument values land on disk**, and it does
+    so without anyone opting in. If your agents approve commands that carry
+    secrets in their arguments — connection strings, tokens, `--password` flags —
+    those strings are in this file, in the clear, and they are in the §0.1
+    exposure set.
+
+    **Why that was accepted, so you can weigh it rather than just discover it.**
+    An approval card is a message the user was **shown and clicked**: it cannot
+    be withheld from the browser, because nobody can approve a command they
+    cannot see. So there is no *disclosure* decision left at this seam — only a
+    *retention* one. And the alternative was worse in the other direction: with
+    the card dropped, a reloaded conversation would show the agent having run a
+    command with **nothing recording that anyone authorised it**, erasing the
+    audit trail of the user's own consent. That trade is defensible; it is not a
+    reason to be unaware of it.
+
+    **What it costs you.** Nothing ages out (#299 is unshipped), so approval rows
+    — argument values included — accumulate **for the life of the account**.
+    There is no switch to turn this off; the only lever is the deletion described
+    below, and since #240 that deletion also erases every peer's chat history.
+    If that is unacceptable for your deployment, the thing to raise is #299
+    (retention), not a config change, because there is no config for it.
+
+    **K does not seal this file, and rotating K does not touch it.**
+    `sendToPeer` journals the payload *before* `sealEnvelope` runs, so K covers
+    the wire and nothing else here. Two consequences. Count this file in the
+    §0.1 exposure assessment: whoever could read `conversation-keys.json` could
+    read this too, so the exposed set is what the list above names, not only
+    what K could decrypt. And deleting it is available to you as **data
+    minimization** — it removes plaintext standing on disk from here on. That
+    is not containment and it does not undo past exposure (§0.1), so it is your
+    call to make, not a step this procedure requires.
+
+    ⚠️ **AND SINCE #240 THAT DELETION IS DESTRUCTIVE TO YOUR USERS, NOT JUST TO
+    THE DISK.** This file is now the ONLY history store — a chat reload replays
+    it, and nothing else is consulted. Deleting it does not merely stop
+    retaining plaintext going forward; every affected peer's conversation
+    reloads **empty**, with no recovery and no signal to them that anything was
+    removed. Core's own transcript survives, but this plugin does not read it,
+    so it is not a fallback. Price that against the minimization benefit before
+    pulling the lever; it was a much cheaper action while the journal was a
+    shadow store.
+
+    ⚠️ **TYPED EDIT/DELETE ROWS (`messageEdited` / `messageDeleted`) ARE IN THE
+    MODEL BUT NOT YET ON DISK.** #241 half 1 added the v6 typed-mutation kinds to
+    the event union so the store can express an edit or a permanent delete without
+    the old order-sensitive overwrite/revive. They are listed here because this
+    inventory names every kind the journal *can* hold and the enforcing test binds
+    to the union — but half 1 ships **no producer**, so no `messageEdited` or
+    `messageDeleted` row is written at any configuration today. When half 2 wires
+    the egress producer, the content class each carries is: **`messageEdited`
+    holds the REVISED message text** — the same plaintext class as the
+    `agent_message`/`kind:"user"` row it revises, nothing new in kind — and
+    **`messageDeleted` holds NO message text at all**, only the target id, a
+    monotonic `revision`, and an optional `turnId` (it is a tombstone; the text is
+    replaced by `""`). Re-price this note the moment a producer lands.
   - legacy migration artifacts under `$HOME/.openclaw-webchannel/`.
 
-  That is the complete list. There is no separate ciphertext store to purge.
-  (`packages/plugin/src/history-store.ts` exists but has no production caller.)
+  That is the complete list of FILES, and — since the corrections above — of the
+  content classes inside the journal too. ⚠️ TREAT THAT SECOND CLAIM AS THE
+  FRAGILE ONE. This list has now been wrong **four** times in the same
+  direction, and the last two are the damning ones:
+   1. when the journal itself was added and the file was simply absent;
+   2. when it named only the EGRESS seam and silently omitted every message
+      users typed (#242 half 2 fixed it);
+   3. **#242 half 3** made `tool_activity` durable and did not touch this list.
+      That one SHIPPED wrong: the omission stood from half 3 until half 4;
+   4. **#242 half 4** made approval rows durable — the first class to put command
+      ARGUMENT VALUES on disk, with no opt-in — and its implementation did not
+      touch this list either. Caught in review before the commit, which is why
+      both #3 and #4 are repaired by the same change rather than left as two more
+      entries. Do not read "caught" as "so the rule works": it was caught by a
+      person who happened to check, not by anything in the repo.
+  ⚠️ **BOTH OF THE LAST TWO VIOLATED A RULE WRITTEN IN THIS PARAGRAPH.** The
+  sentence "a slice that teaches either seam to write a new kind must edit THIS
+  list in the same change" was already here when they shipped, so the wording was
+  never what was missing. That is why the rule now has a TEST behind it —
+  `packages/plugin/src/containment-runbook-inventory.test.ts` derives the durable
+  kinds from `journal-history.ts`'s `KNOWN_EVENT_KINDS` and fails when one of
+  them is not named in this section. If you are adding a durable kind, that test
+  is what will tell you to come back here; do not "fix" it by loosening its
+  token map. An operator running the §0.1 exposure assessment reads this
+  paragraph and stops, so the cost of it being stale is theirs, not ours.
+  Nothing on this list is a ciphertext store to invalidate:
+  the one file holding conversation content, `delivery-journal.sqlite`, holds it
+  in the clear, so the only lever over it is deletion, not invalidation.
+  Dispatch payloads and `requestState` transitions also persist in that journal;
+  interrupted requests retain any committed output and need deliberate retry.
+
 - **Rotating K does not disconnect anyone and does not revoke anything.** It is
   one of two independent controls. Section 2 tells you which ones you need.
 
@@ -55,13 +253,24 @@ deleting the plugin's state files as normal operations, because doing so breaks
 encrypted-history continuity and can strand live devices. **This runbook is the
 exception that rule anticipates.** During a confirmed containment you may move
 `credentials.json` aside when the current agent credential was revoked (step
-④-bis, per `AUTH.md`), and you replace K in `conversation-keys.json` only when K
-is in scope (step ④). Both mutations use the documented paths below with the
-gateway stopped. Outside an incident, the README rule stands:
+④-bis, per `AUTH.md`), you replace K in `conversation-keys.json` only when K
+is in scope (step ④), and you **may** delete `delivery-journal.sqlite` together
+with its `-wal`/`-shm`/`-journal` sidecars if you choose to clear the conversation
+plaintext they hold (§0.2 — optional, not containment, and since #240 it also
+**erases every affected peer's chat history irrecoverably**) — unlike the other
+two, that one is an outright delete, not a move-aside or an in-place
+replacement. All are done with the gateway stopped; the first two use the
+documented paths below. Outside an incident, the README rule stands:
 do not hand-edit or delete these files, and in particular **never delete
 `conversation-keys.json` to "rotate" K** — that destroys every peer's key at
 once and is exactly the destructive, unauditable action step ④ exists to
 replace.
+
+A newly created journal receives a new epoch, so connected clients discard their
+old cursor and server-ID cache when they observe it. If an authorized recovery
+restores a journal backup instead, renew its epoch before gateway startup using
+[the journal restore procedure](GAP_SYNC.md#restoring-a-journal-backup).
+This does not make deletion reversible or authorize restoring forensic backups.
 
 ### 0.4 Keep secrets out of your incident record
 
@@ -306,7 +515,7 @@ re-derive the floor later:
 ```js
 import { readFileSync, writeFileSync } from "node:fs";
 import { decode } from "@nats-io/jwt";
-import { addRevocation } from "@mir-stream/webchannel-saas";
+import { addRevocation } from "openclaw-webchannel-saas";
 
 const currentAccountJwt = readFileSync("./current-account.jwt", "utf8").trim();
 const currentClaim = decode(currentAccountJwt);
@@ -796,7 +1005,10 @@ added to a chain afterwards.
 ### 6.6 "Invalidate the old encrypted peer state" — there is nothing to invalidate
 
 See §0.2. If you are following an older instruction that says this, the
-instruction is wrong, not your deployment.
+instruction is wrong, not your deployment. Do not read it as "nothing is stored"
+either: `delivery-journal.sqlite` holds conversation plaintext, so the lever
+there is **deletion**, not invalidation — §0.2 has the trade-off and whether to
+pull it is your call.
 
 ---
 

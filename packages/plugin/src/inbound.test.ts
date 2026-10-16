@@ -10,13 +10,18 @@ vi.mock("openclaw/plugin-sdk/reply-payload", () => ({
     typeof payload?.text === "string" && payload.text.includes(WARNING_SENTINEL),
 }));
 
+import { DurableSendError } from "./durable-send-error.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
+import { buildChannelInboundEventContext, runChannelInboundEvent } from "openclaw/plugin-sdk/channel-inbound";
+import { resolveCommandAuthorization } from "openclaw/plugin-sdk/command-auth";
+import { createReplyDispatcher, type GetReplyOptions } from "openclaw/plugin-sdk/reply-runtime";
 
 import {
   deliverDraftFinalPayload,
   handleInboundMessage as handleInboundMessageForServingTenant,
+  TYPING_KEEPALIVE_INTERVAL_MS,
   startAgentLifecycleSubscription,
   stopAgentLifecycleSubscription,
   type FinalReconciliationState,
@@ -60,9 +65,11 @@ function handleInboundMessage(
  * P1-8a — `handleInboundMessage` control-lane behaviour.
  *
  * Two invariants:
- *  - The abort authorization stamp (`access.commands.authorized`) is passed into
- *    core's `buildContext` ONLY for control-lane turns — never for ordinary
- *    turns (we must not broadly authorize text commands for every peer).
+ *  - The effective command authorization stamp
+ *    (`access.commands.authorized`) is passed into core's `buildContext` for
+ *    EVERY admitted turn, control-lane and ordinary alike (#407). DM admission
+ *    supplies the default and the decision in
+ *    `resolvePeerCommandAuthorization` applies core command/owner policy.
  *  - Terminal draft drain: when core aborts the RUNNING turn its `inbound.run`
  *    resolves WITHOUT delivering a final. The controller settles real lane
  *    text in generation order, or a lone visible tool scaffold for the
@@ -88,6 +95,8 @@ type AssembledTurnLike = {
     onPatchSummary?: (p: unknown) => void;
     onPartialReply?: (p: { text?: string }) => void;
     onAssistantMessageStart?: () => void;
+    onReasoningStream?: GetReplyOptions["onReasoningStream"];
+    onReasoningEnd?: GetReplyOptions["onReasoningEnd"];
   };
   delivery: {
     deliver: (
@@ -97,6 +106,10 @@ type AssembledTurnLike = {
         isStatusNotice?: boolean;
         isFallbackNotice?: boolean;
         isCompactionNotice?: boolean;
+        isReasoning?: boolean;
+        isReasoningSnapshot?: boolean;
+        mediaUrl?: string;
+        mediaUrls?: string[];
       },
       info?: { kind?: string; assistantMessageIndex?: number },
     ) => Promise<{ visibleReplySent: boolean }>;
@@ -107,12 +120,14 @@ type LifecycleEvent = { stream?: string; runId?: string; data?: unknown };
 type LifecycleListener = (evt: LifecycleEvent) => void;
 
 function makeFakeApi(params: {
-  streamingMode: "off" | "partial" | "progress";
+  streamingMode: "off" | "partial" | "progress" | "block";
   runImpl: (turn: AssembledTurnLike) => Promise<void>;
   /** Expose the host's agent-events surface (#87 lifecycle verdict). */
   withAgentEvents?: boolean;
   /** Extra `channels.webchannel` keys, e.g. the DM allowlist (#99 denial case). */
   channelConfig?: Record<string, unknown>;
+  /** Top-level core command policy applied to the effective authorization stamp. */
+  commandsConfig?: Record<string, unknown>;
 }): {
   api: OpenClawPluginApi;
   captured: { buildContext?: BuildContextParams };
@@ -125,8 +140,9 @@ function makeFakeApi(params: {
   const warnings: string[] = [];
 
   const config = {
+    ...(params.commandsConfig ? { commands: params.commandsConfig } : {}),
     channels: {
-      webchannel: { streaming: { mode: params.streamingMode }, ...params.channelConfig },
+      webchannel: { allowFrom: ["*"], streaming: { mode: params.streamingMode }, ...params.channelConfig },
     },
   };
 
@@ -205,7 +221,18 @@ function makeFakeTransport(options?: {
 }): {
   transport: WebChannelPeerChannel;
   finalizes: Array<{ id: string; text: string; assistantMessageIndex?: number }>;
-  texts: Array<{ text: string; assistantMessageIndex?: number }>;
+  /**
+   * The plain `agent_message` frames, in emission order. #238: `id`/`turnId`
+   * are recorded exactly the way `NatsChannel.sendText` puts them on the wire
+   * (present only when supplied), so a test can assert either presence or
+   * absence of the plugin-minted id.
+   */
+  texts: Array<{
+    text: string;
+    id?: string;
+    turnId?: string;
+    assistantMessageIndex?: number;
+  }>;
   progress: Array<{ id: string; text: string }>;
   /** #97: the structured tool-activity frames, in emission order. */
   toolActivities: Array<{
@@ -222,17 +249,33 @@ function makeFakeTransport(options?: {
   settles: Array<"ok" | "error">;
   /** #99: the full settle frames, in emission order — turnId matters per member. */
   settleFrames: Array<{ turnId: string; outcome: "ok" | "error" }>;
+  /** #212: the turn_snapshot frames, in emission order. */
+  snapshotFrames: Array<{
+    turnId: string;
+    answers: Array<{ id: string; text: string }>;
+    remove: string[];
+  }>;
 } {
   const finalizes: Array<{
     id: string;
     text: string;
     assistantMessageIndex?: number;
   }> = [];
-  const texts: Array<{ text: string; assistantMessageIndex?: number }> = [];
+  const texts: Array<{
+    text: string;
+    id?: string;
+    turnId?: string;
+    assistantMessageIndex?: number;
+  }> = [];
   const progress: Array<{ id: string; text: string }> = [];
   const typing: string[] = [];
   const settles: Array<"ok" | "error"> = [];
   const settleFrames: Array<{ turnId: string; outcome: "ok" | "error" }> = [];
+  const snapshotFrames: Array<{
+    turnId: string;
+    answers: Array<{ id: string; text: string }>;
+    remove: string[];
+  }> = [];
   const toolActivities: Array<{
     sessionKey: string;
     id: string;
@@ -251,12 +294,16 @@ function makeFakeTransport(options?: {
     sendText: (
       _sessionKey: string,
       text: string,
-      _id?: string,
-      _turnId?: string,
+      id?: string,
+      turnId?: string,
       assistantMessageIndex?: number,
     ) => {
+      // Mirror `NatsChannel.sendText`'s payload assembly exactly: an absent or
+      // empty id/turnId never reaches the wire as a key.
       texts.push({
         text,
+        ...(id ? { id } : {}),
+        ...(turnId ? { turnId } : {}),
         ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
       });
       return true;
@@ -285,6 +332,15 @@ function makeFakeTransport(options?: {
       }
       return !options?.failSettleFor?.includes(turnId);
     },
+    sendTurnSnapshot: (
+      _sessionKey: string,
+      turnId: string,
+      answers: Array<{ id: string; text: string }>,
+      remove: string[],
+    ) => {
+      snapshotFrames.push({ turnId, answers, remove });
+      return true;
+    },
     sendProgress: (_sessionKey: string, id: string, text: string) => {
       progress.push({ id, text });
       return true;
@@ -304,17 +360,52 @@ function makeFakeTransport(options?: {
       return true;
     },
     sendHistory: () => true,
-    sendApprovalRequest: () => true,
-    sendApprovalResolved: () => true,
+    // #341: the result reports delivery AND whether the durable row was written;
+    // this stub owns no journal, so `journaled` is false.
+    sendApprovalRequest: () => ({ delivered: true, journaled: false }),
+    sendApprovalResolved: () => ({ accepted: true, delivered: true, journaled: true, status: "journaled" as const }),
     sendApprovalSnapshot: () => true,
   } as WebChannelPeerChannel;
-  return { transport, finalizes, texts, progress, toolActivities, typing, settles, settleFrames };
+  return { transport, finalizes, texts, progress, toolActivities, typing, settles, settleFrames, snapshotFrames };
 }
 
 const userMessage = { type: "user_message" as const, text: "/stop" };
 
 describe("handleInboundMessage — control-lane authorization stamp", () => {
-  it("stamps access.commands.authorized=true ONLY for controlLane turns", async () => {
+  it("delivers a partial-mode control turn without wiring a draft message boundary", async () => {
+    let sawMessageBoundary: boolean | undefined;
+    let visibleReplySent: boolean | undefined;
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      runImpl: async (turn) => {
+        // Controlled public callback sequence after core continues a plain-text
+        // control turn; this fixture does not run core's abort/command authorization.
+        turn.replyOptions?.onAgentRunStart?.("control-run");
+        sawMessageBoundary = typeof turn.replyOptions?.onAssistantMessageStart === "function";
+        turn.replyOptions?.onAssistantMessageStart?.();
+        turn.replyOptions?.onPartialReply?.({ text: "I can help." });
+        visibleReplySent = (await turn.delivery.deliver(
+          { text: "I can help." },
+          { kind: "final" },
+        )).visibleReplySent;
+      },
+    });
+    const { transport, texts, progress, finalizes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "stop",
+      id: "control-turn",
+    }, "default", { controlLane: true });
+
+    expect(visibleReplySent).toBe(true);
+    expect(sawMessageBoundary).toBe(false);
+    expect(texts.map(({ text }) => text)).toEqual(["I can help."]);
+    expect(progress).toEqual([]);
+    expect(finalizes).toEqual([]);
+  });
+
+  it("stamps access.commands.authorized=true for controlLane turns", async () => {
     const { api, captured } = makeFakeApi({
       streamingMode: "off",
       runImpl: async () => {},
@@ -328,24 +419,119 @@ describe("handleInboundMessage — control-lane authorization stamp", () => {
     expect(captured.buildContext?.access?.commands?.authorized).toBe(true);
   });
 
-  it("does NOT stamp authorization for ordinary (non-control-lane) turns", async () => {
+  // #407. This replaces the earlier "does NOT stamp ordinary turns" contract:
+  // without the stamp core silently dropped `/new`, `/reset`, `/model`, … for
+  // every peer, while the widget's slash menu still offered them.
+  it("stamps access.commands.authorized=true for ordinary admitted turns", async () => {
+    for (const text of ["hello there", "/new", "/reset", "/model"]) {
+      const { api, captured } = makeFakeApi({
+        streamingMode: "off",
+        runImpl: async () => {},
+      });
+      const { transport } = makeFakeTransport();
+
+      await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text });
+
+      expect(captured.buildContext?.access?.commands?.authorized, text).toBe(true);
+    }
+  });
+
+  it("makes core treat an admitted peer's /new as an authorized command", async () => {
+    // The stamp only matters through core: rebuild the turn context with the
+    // pinned SDK's real builder (the one behind `channelRuntime.inbound.
+    // buildContext`) and ask core's own command authorization. Unauthorized,
+    // core's get-reply returns with no reply for a whole-message `/new`.
     const { api, captured } = makeFakeApi({
       streamingMode: "off",
       runImpl: async () => {},
+      channelConfig: { dmSecurity: "allowlist", allowFrom: ["peer-1"] },
     });
     const { transport } = makeFakeTransport();
 
-    await handleInboundMessage(api, transport, "peer-1", {
-      type: "user_message",
-      text: "hello there",
-    });
+    await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text: "/new" });
 
-    // No `access` key at all — the ordinary path must not touch command authz.
-    expect(captured.buildContext?.access).toBeUndefined();
+    const ctx = buildChannelInboundEventContext(
+      captured.buildContext as unknown as Parameters<typeof buildChannelInboundEventContext>[0],
+    );
+    expect(ctx.CommandAuthorized).toBe(true);
+    expect(
+      resolveCommandAuthorization({ ctx, cfg: {}, commandAuthorized: ctx.CommandAuthorized === true })
+        .isAuthorizedSender,
+    ).toBe(true);
+    // The operator allowlist trap is unchanged: core ignores the stamp and
+    // decides by membership (command-gate.ts).
+    expect(
+      resolveCommandAuthorization({
+        ctx,
+        cfg: { commands: { allowFrom: { webchannel: ["someone-else"] } } },
+        commandAuthorized: ctx.CommandAuthorized === true,
+      }).isAuthorizedSender,
+    ).toBe(false);
+  });
+
+  it("stamps the effective core policy result instead of a raw DM-admission true", async () => {
+    for (const commandsConfig of [
+      { allowFrom: { webchannel: ["someone-else"] } },
+      { ownerAllowFrom: ["someone-else"] },
+    ]) {
+      const { api, captured } = makeFakeApi({
+        streamingMode: "off",
+        runImpl: async () => {},
+        commandsConfig,
+      });
+      const { transport } = makeFakeTransport();
+
+      await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text: "/new" });
+
+      const ctx = buildChannelInboundEventContext(
+        captured.buildContext as unknown as Parameters<typeof buildChannelInboundEventContext>[0],
+      );
+      const expected = resolveCommandAuthorization({
+        ctx,
+        cfg: api.config,
+        commandAuthorized: true,
+      }).isAuthorizedSender;
+      expect(expected).toBe(false);
+      expect(captured.buildContext?.access?.commands?.authorized).toBe(expected);
+    }
+  });
+
+  it("never builds a context for a peer the DM policy denies", async () => {
+    const { api, captured } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async () => {},
+      channelConfig: { dmSecurity: "allowlist", allowFrom: ["someone-else"] },
+    });
+    const { transport } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text: "/new" });
+
+    expect(captured.buildContext).toBeUndefined();
   });
 });
 
 describe("handleInboundMessage — typing indicator gating", () => {
+  it("keeps core control identity stable across wire retries and isolated by tenant/account/peer", async () => {
+    const ids: unknown[] = [];
+    for (const [peer, account, tenant, wire] of [
+      ["peer", "default", "tenant", "wire-1"],
+      ["peer", "default", "tenant", "wire-2"],
+      ["peer", "default", "other-tenant", "wire-1"],
+      ["other-peer", "default", "tenant", "wire-1"],
+      ["peer", "other", "tenant", "wire-1"],
+    ]) {
+      const { api, captured } = makeFakeApi({ streamingMode: "off", runImpl: async () => {},
+        channelConfig: { accounts: { default: {}, other: {} } } });
+      const { transport } = makeFakeTransport();
+      await handleInboundMessageForServingTenant(api, transport, peer,
+        { ...userMessage, id: wire, random_id: "same-logical-stop" }, account, tenant, { controlLane: true });
+      expect(captured.buildContext?.messageId).toEqual(expect.any(String));
+      ids.push(captured.buildContext?.messageId);
+    }
+    expect(ids[0]).toBe(ids[1]);
+    expect(new Set(ids)).toHaveProperty("size", 4);
+  });
+
   it("sends a typing frame for an ordinary turn", async () => {
     const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
     const { transport, typing } = makeFakeTransport();
@@ -372,6 +558,147 @@ describe("handleInboundMessage — typing indicator gating", () => {
     // ever follows, which would otherwise leave the widget's Stop button armed
     // with nothing to release it.
     expect(typing).toEqual([]);
+  });
+});
+
+describe("handleInboundMessage — typing keepalive (#396)", () => {
+  // Only the interval is faked: the turn's other timers keep real semantics.
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** A turn that stays inside core until `release()` (or `fail()`) is called. */
+  function quietTurn() {
+    let release!: () => void;
+    let fail!: (error: Error) => void;
+    const held = new Promise<void>((resolve, reject) => {
+      release = resolve;
+      fail = reject;
+    });
+    let entered!: () => void;
+    const inCore = new Promise<void>((resolve) => { entered = resolve; });
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async () => {
+        entered();
+        await held;
+      },
+    });
+    return { api, inCore, release: () => release(), fail: (error: Error) => fail(error) };
+  }
+
+  it("re-sends typing while a quiet turn runs past the client's 30s stall window, then stops at settle", async () => {
+    const turn = quietTurn();
+    const { transport, typing, settles } = makeFakeTransport();
+    const sendTyping = vi.spyOn(transport, "sendTyping");
+    const done = handleInboundMessage(turn.api, transport, "peer-1", {
+      type: "user_message",
+      text: "run the long tool",
+      id: "turn-1",
+    });
+    await turn.inCore;
+    expect(typing).toEqual(["peer-1"]);
+    expect(sendTyping).toHaveBeenNthCalledWith(1, "peer-1");
+
+    // A 40s tool call with streaming off emits nothing else; without a renewal
+    // inside every 30s window the client reads the turn as a dead connection.
+    vi.advanceTimersByTime(40_000);
+    expect(typing.length).toBe(1 + Math.floor(40_000 / TYPING_KEEPALIVE_INTERVAL_MS));
+    expect(TYPING_KEEPALIVE_INTERVAL_MS).toBeLessThan(30_000 / 2);
+    expect(sendTyping.mock.calls.slice(1)).toEqual(Array.from({ length: 10 }, () => ["peer-1", true]));
+
+    turn.release();
+    await done;
+    expect(settles).toEqual(["ok"]);
+    const atSettle = typing.length;
+    vi.advanceTimersByTime(60_000);
+    // No renewal may follow `turn_settled`: the turn no longer owns activity.
+    expect(typing.length).toBe(atSettle);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("stops the keepalive when the turn throws", async () => {
+    const turn = quietTurn();
+    const { transport, typing } = makeFakeTransport();
+    const done = handleInboundMessage(turn.api, transport, "peer-1", {
+      type: "user_message",
+      text: "boom",
+      id: "turn-err",
+    });
+    await turn.inCore;
+    vi.advanceTimersByTime(TYPING_KEEPALIVE_INTERVAL_MS);
+    turn.fail(new Error("core exploded"));
+    await done;
+    const atEnd = typing.length;
+    vi.advanceTimersByTime(60_000);
+    expect(typing.length).toBe(atEnd);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("stops the keepalive as soon as dispatch ownership aborts (/stop, account dispose), before core returns", async () => {
+    const turn = quietTurn();
+    const { transport, typing } = makeFakeTransport();
+    const ownership = new AbortController();
+    const done = handleInboundMessage(turn.api, transport, "peer-1", {
+      type: "user_message",
+      text: "long",
+      id: "turn-abort",
+    }, "default", { dispatchAbortSignal: ownership.signal });
+    await turn.inCore;
+    vi.advanceTimersByTime(TYPING_KEEPALIVE_INTERVAL_MS);
+    expect(typing).toHaveLength(2);
+
+    ownership.abort();
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(60_000);
+    expect(typing).toHaveLength(2);
+    turn.release();
+    await done;
+  });
+
+  it("never starts a keepalive for a control-lane abort turn", async () => {
+    const turn = quietTurn();
+    const { transport, typing } = makeFakeTransport();
+    const done = handleInboundMessage(turn.api, transport, "peer-1", userMessage, "default", {
+      controlLane: true,
+    });
+    await turn.inCore;
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(60_000);
+    expect(typing).toEqual([]);
+    turn.release();
+    await done;
+  });
+
+  it("keeps renewing when a send is dropped or throws (relay down), without escaping the timer", async () => {
+    const turn = quietTurn();
+    const made = makeFakeTransport();
+    let calls = 0;
+    const transport = {
+      ...made.transport,
+      sendTyping: (peerId: string) => {
+        calls++;
+        if (calls === 2) throw new Error("publish failed");
+        if (calls === 3) return false;
+        made.typing.push(peerId);
+        return true;
+      },
+    } as WebChannelPeerChannel;
+    const done = handleInboundMessage(turn.api, transport, "peer-1", {
+      type: "user_message",
+      text: "long",
+      id: "turn-flaky",
+    });
+    await turn.inCore;
+    expect(() => vi.advanceTimersByTime(TYPING_KEEPALIVE_INTERVAL_MS * 3)).not.toThrow();
+    expect(calls).toBe(4);
+    expect(made.typing).toEqual(["peer-1", "peer-1"]);
+    turn.release();
+    await done;
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 
@@ -499,6 +826,20 @@ describe("handleInboundMessage — #97 structured tool activity", () => {
   }
 
   afterEach(() => stopAgentLifecycleSubscription());
+
+  it("reports a tool journal failure without replaying the tool or hiding it behind an accepted answer", async () => {
+    const made = makeActivityApi(async (turn, emit) => {
+      turn.replyOptions?.onAgentRunStart?.("run-store-fault");
+      emit({ stream: "tool", runId: "run-store-fault", data: { phase: "result", name: "bash", toolCallId: "tool-store-fault" } });
+      await turn.delivery.deliver({ text: "answer" }, { kind: "final" });
+    });
+    const { transport, settles } = makeFakeTransport();
+    const sends = vi.fn(() => { throw new DurableSendError("tool_activity", "tool-store-fault"); });
+    transport.sendToolActivity = sends;
+    await handleInboundMessage(made.api, transport, "peer-1", { type: "user_message", text: "hi", id: "turn-tool-fault" });
+    expect(sends).toHaveBeenCalledTimes(1);
+    expect(settles).toEqual(["error"]);
+  });
 
   it("uses run-scoped global tool events as the sole structured source while preserving reply draft callbacks", async () => {
     const made = makeActivityApi(async (turn, emit) => {
@@ -1662,6 +2003,11 @@ describe("handleInboundMessage — #111 live block ordinal", () => {
 
         const frames = streamingMode === "partial" ? finalizes : texts;
         expect(frames).toHaveLength(1);
+        // #238: the ordinal now rides ALONGSIDE a plugin-minted id on both
+        // paths — the draft finalize (already true before this slice) and the
+        // no-draft plain send (new). The ordinal itself is untouched: the
+        // assertions below are the pre-#238 ones, verbatim.
+        expect(frames[0]!.id).toEqual(expect.stringMatching(/\S/));
         if (testCase.expected === undefined) {
           expect(frames[0]).not.toHaveProperty("assistantMessageIndex");
         } else {
@@ -1712,6 +2058,131 @@ describe("handleInboundMessage — #111 live block ordinal", () => {
         expect(frames[0]).not.toHaveProperty("assistantMessageIndex");
       }
     }
+  });
+});
+
+/**
+ * #238 — the plugin mints message identity AT the delivery act.
+ *
+ * Governing principle: our plugin is the Telegram plugin AND the Telegram
+ * server, our client is the Telegram app. The platform names the message when
+ * it delivers it; the viewer never does. These two sites used to send id-less
+ * `agent_message` frames, which forced the client to invent `a-N` from a
+ * client-local counter — a viewer-minted durable id, NOT-list N4/N5.
+ */
+describe("handleInboundMessage — #238 identity at the delivery act", () => {
+  it("site 1: every no-draft reply carries a fresh plugin-minted id", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "first block" }, { kind: "block" });
+        await turn.delivery.deliver({ text: "second block" }, { kind: "block" });
+      },
+    });
+    const { transport, texts } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "answer twice",
+      id: "turn-two-sends",
+    });
+
+    // Behavior preservation: same two bubbles, same order, same text, same
+    // turnId as before the id was added.
+    expect(texts.map((frame) => frame.text)).toEqual([
+      "first block",
+      "second block",
+    ]);
+    expect(texts.map((frame) => frame.turnId)).toEqual([
+      "turn-two-sends",
+      "turn-two-sends",
+    ]);
+    // The only wire difference: each frame now carries a non-empty id...
+    for (const frame of texts) {
+      expect(typeof frame.id).toBe("string");
+      expect(frame.id).not.toBe("");
+    }
+    // ...and the no-draft path is one-new-bubble-per-send, so an id is NEVER
+    // reused across delivery acts (reuse would make the client top up the
+    // first bubble instead of appending a second).
+    expect(texts[0]!.id).not.toBe(texts[1]!.id);
+  });
+
+  it("site 1: an ordinal-bearing no-draft reply keeps the ordinal alongside the id", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver(
+          { text: "ordinal block" },
+          { kind: "block", assistantMessageIndex: 3 },
+        );
+      },
+    });
+    const { transport, texts } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "answer with an ordinal",
+      id: "turn-ordinal",
+    });
+
+    expect(texts).toHaveLength(1);
+    expect(texts[0]!.text).toBe("ordinal block");
+    expect(texts[0]!.turnId).toBe("turn-ordinal");
+    // #238 adds identity WITHOUT disturbing the ordinal — the two coexist on
+    // one frame. (Retiring the ordinal is a later slice, deliberately not
+    // this one.)
+    expect(texts[0]!.assistantMessageIndex).toBe(3);
+    expect(typeof texts[0]!.id).toBe("string");
+    expect(texts[0]!.id).not.toBe("");
+  });
+
+  it("site 2: the thrown-turn apology carries a plugin-minted id", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async () => {
+        throw new Error("provider exploded");
+      },
+    });
+    const { transport, texts } = makeFakeTransport();
+
+    // TWO thrown turns, because the id must be FRESH PER DELIVERY ACT and one
+    // send cannot show that. The client keys durable bubbles by id
+    // (`upsertMessage(id, …)`, nats-client-wrapper.ts), so a cached or reused
+    // id would silently collapse every apology across every turn and peer into
+    // ONE bubble, overwritten in place instead of appended.
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "this turn throws",
+      id: "turn-apology",
+    });
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "this turn throws too",
+      id: "turn-apology-2",
+    });
+
+    // Behavior preservation: still exactly one apology bubble per thrown turn,
+    // same text, each under its own turnId — only the id is new.
+    expect(texts).toHaveLength(2);
+    for (const frame of texts) {
+      expect(frame.text).toBe(
+        "Sorry — something went wrong while answering. Please try again.",
+      );
+      expect(typeof frame.id).toBe("string");
+      expect(frame.id).not.toBe("");
+    }
+    expect(texts.map((frame) => frame.turnId)).toEqual([
+      "turn-apology",
+      "turn-apology-2",
+    ]);
+    // Fresh per act, and DISTINCT FROM THE TURN ID. Both halves are load-
+    // bearing: reusing the turnId as the message id passes any "non-empty
+    // string" check while giving one turn's apology the same name as its turn,
+    // and a hard-coded constant passes every per-frame check while making all
+    // apologies one bubble forever.
+    expect(texts[0]!.id).not.toBe(texts[1]!.id);
+    for (const frame of texts) expect(frame.id).not.toBe(frame.turnId);
   });
 });
 
@@ -1816,15 +2287,7 @@ describe("deliverDraftFinalPayload — independent routing policy", () => {
   });
 });
 
-/**
- * #173 — the plugin now emits the corrected sequence DIRECTLY over its lane
- * frames. No keyframe, no client-side reconstruction.
- *
- * The tool-only-last shape (core emits ordinary finals [A,B] for two streamed
- * messages, then a tool-only last message whose boundary makes the current lane
- * textless) is settled at drain: final#1 tops up lane A on its OWN id, final#2
- * settles lane B on its OWN id. No independent bubble is created.
- */
+// #262: delivery owns IDs. Textless-terminal finals cannot reopen past drafts.
 describe("handleInboundMessage — #173 collapse-aware final routing", () => {
   const ordinary = { type: "user_message" as const, text: "do the thing" };
 
@@ -1849,7 +2312,37 @@ describe("handleInboundMessage — #173 collapse-aware final routing", () => {
     requireCallback(turn.replyOptions?.onAssistantMessageStart, "onAssistantMessageStart")();
   };
 
-  it("tool-only last message: final#1 tops up lane A's id, final#2 settles lane B's id, no independent bubble", async () => {
+  it("#262: deduped A/A/final-only B/textless terminal preserves both authored A IDs", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      runImpl: async (turn) => {
+        openNextAnswerLane(turn);
+        streamAnswerLane(turn, "Repeated answer");
+        openNextAnswerLane(turn);
+        streamAnswerLane(turn, "Repeated answer");
+        openNextAnswerLane(turn); // B: text only at message-end; no partial callback.
+        openNextAnswerLane(turn); // Textless terminal message; no canonical collapse.
+        // Trace-confirmed dispatch result of [A,A,B] after core's final dedupe.
+        await turn.delivery.deliver({ text: "Repeated answer" }, { kind: "final" });
+        await turn.delivery.deliver({ text: "New final-only answer" }, { kind: "final" });
+      },
+    });
+    const { transport, finalizes, snapshotFrames, settles } = makeFakeTransport();
+    await handleInboundMessage(api, transport, "peer-1", { ...ordinary, id: "compensating-turn" });
+    const authoredIds = finalizes.slice(0, 2).map(({ id }) => id);
+    expect(new Set(authoredIds).size).toBe(2);
+    for (const id of authoredIds) {
+      expect(finalizes.filter((frame) => frame.id === id).map(({ text }) => text)).toEqual(["Repeated answer"]);
+      expect(snapshotFrames.at(-1)!.answers).toContainEqual({ id, text: "Repeated answer" });
+    }
+    const unclaimed = finalizes.filter((frame) => !authoredIds.includes(frame.id));
+    expect(unclaimed.map(({ text }) => text)).toEqual(["Repeated answer", "New final-only answer"]);
+    expect(new Set(unclaimed.map(({ id }) => id)).size).toBe(2);
+    expect(snapshotFrames.at(-1)!.remove).toEqual([]);
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it("tool-only last message: past IDs retain their own text and finals get independent IDs", async () => {
     const { api } = makeFakeApi({
       streamingMode: "partial",
       runImpl: async (turn) => {
@@ -1876,14 +2369,12 @@ describe("handleInboundMessage — #173 collapse-aware final routing", () => {
     const laneBId = finalizes.find((f) => f.text === "second ans")!.id;
     expect(laneAId).not.toBe(laneBId);
 
-    // Every finalizeDraft landed on lane A's or lane B's own id — no third
-    // (independent) bubble id, which is what [A,A,B] would have required.
-    expect(new Set(finalizes.map((f) => f.id))).toEqual(new Set([laneAId, laneBId]));
-    // Each lane ends on its OWN authoritative final text, in order → [A][B].
-    const lastFinalOn = (id: string) =>
-      finalizes.filter((f) => f.id === id).at(-1)!.text;
-    expect(lastFinalOn(laneAId)).toBe("first answer");
-    expect(lastFinalOn(laneBId)).toBe("second answer");
+    const lastFinalOn = (id: string) => finalizes.filter((f) => f.id === id).at(-1)!.text;
+    expect(lastFinalOn(laneAId)).toBe("first ans");
+    expect(lastFinalOn(laneBId)).toBe("second ans");
+    const independent = finalizes.filter((f) => f.id !== laneAId && f.id !== laneBId);
+    expect(independent.map((f) => f.text)).toEqual(["first answer", "second answer"]);
+    expect(new Set(independent.map((f) => f.id)).size).toBe(2);
     // final#1 ("first answer") is applied before final#2 ("second answer").
     const firstAnswerAt = finalizes.findIndex((f) => f.text === "first answer");
     const secondAnswerAt = finalizes.findIndex((f) => f.text === "second answer");
@@ -1938,6 +2429,72 @@ describe("handleInboundMessage — #173 collapse-aware final routing", () => {
     expect(independentFinal).toBeDefined();
     if (laneId) expect(independentFinal!.id).not.toBe(laneId);
   });
+});
+
+describe("handleInboundMessage — #373 native reasoning boundaries", () => {
+  it.each(["partial", "progress", "off", "block"] as const)(
+    "%s mode preserves repeated prefixes and equal independent reasoning messages",
+    async (streamingMode) => {
+      const texts = ["Check the file.", "Check the file. Then run tests.", "Check the file. Then run tests."];
+      const { transport, settles } = makeFakeTransport();
+      const reasoning = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+      let sawMessageBoundary = false;
+      const { api } = makeFakeApi({
+        streamingMode,
+        runImpl: async (turn) => {
+          turn.replyOptions?.onAgentRunStart?.("reasoning-run");
+          for (const text of texts) {
+            // These are the actual public callbacks, in embedded message order.
+            sawMessageBoundary = typeof turn.replyOptions?.onAssistantMessageStart === "function";
+            await turn.replyOptions?.onAssistantMessageStart?.();
+            await turn.replyOptions?.onReasoningStream?.({ text });
+            await turn.replyOptions?.onReasoningEnd?.();
+          }
+          await turn.delivery.deliver({ text: "done" }, { kind: "final" });
+        },
+      });
+      await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text: "check", id: `reasoning-${streamingMode}` });
+      const finals = reasoning.mock.calls.filter((args) => args[4] === true);
+      expect(finals.map((args) => args[3])).toEqual(texts);
+      expect(new Set(finals.map((args) => args[1])).size).toBe(3);
+      expect(sawMessageBoundary).toBe(true);
+      expect(settles).toEqual(["ok"]);
+    },
+  );
+
+  it.each(["btw", "codex-snapshot", "cli-replay"] as const)(
+    "%s public callback sequence preserves cumulative text and replay ownership",
+    async (source) => {
+      const { transport, settles } = makeFakeTransport();
+      const reasoning = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+      const { api } = makeFakeApi({
+        streamingMode: "off",
+        runImpl: async (turn) => {
+          const callbacks = turn.replyOptions!;
+          callbacks.onAgentRunStart?.("cumulative-run");
+          if (source === "btw") {
+            callbacks.onAssistantMessageStart?.();
+            await callbacks.onReasoningStream?.({ text: "AAA", isReasoning: true });
+            await callbacks.onReasoningEnd?.();
+            await callbacks.onReasoningStream?.({ text: "AAA\nBBB", isReasoning: true });
+            await callbacks.onReasoningEnd?.();
+          } else {
+            await callbacks.onReasoningStream?.({ text: "AAA", isReasoningSnapshot: true });
+            if (source === "codex-snapshot") callbacks.onAssistantMessageStart?.();
+            await callbacks.onReasoningStream?.({ text: "AAA\n\nBBB", isReasoningSnapshot: true });
+            if (source === "codex-snapshot") await callbacks.onReasoningEnd?.();
+            else await turn.delivery.deliver({ text: "AAA\n\nBBB", isReasoning: true }, { kind: "final" });
+          }
+          await turn.delivery.deliver({ text: "done" }, { kind: "final" });
+        },
+      });
+      await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text: "check", id: `reasoning-${source}` });
+      const finals = reasoning.mock.calls.filter((args) => args[4] === true);
+      expect(finals.map((args) => args[3])).toEqual(source === "btw" ? ["AAA", "BBB"] : ["AAA\n\nBBB"]);
+      expect(new Set(reasoning.mock.calls.map((args) => args[1])).size).toBe(source === "btw" ? 2 : 1);
+      expect(settles).toEqual(["ok"]);
+    },
+  );
 });
 
 
@@ -2281,11 +2838,12 @@ describe("handleInboundMessage — #99 coalesced-group settlement", () => {
   });
 
   /**
-   * The settle loop reads `coalescedIds` off the turn message, and that message
-   * used to be reachable from the wire verbatim (the decode path casts instead
-   * of validating). Layer (a) strips the field at ingress; these pin layer (b),
-   * the read-site guard, so a path that ever forgets to strip degrades to "only
-   * the anchor settles" instead of stranding the whole turn.
+   * The settle loop reads `coalescedIds` off the turn message, and a peer can
+   * still attach that field: #246 half A's door decoder refuses malformed KNOWN
+   * fields but passes UNKNOWN ones through untouched, because the wire is
+   * additive. Layer (a) strips the field at ingress; these pin layer (b), the
+   * read-site guard, so a path that ever forgets to strip degrades to "only the
+   * anchor settles" instead of stranding the whole turn.
    *
    * The failure this prevents is severe and silent: the member loop runs BEFORE
    * the anchor is pushed, so a throw here emits ZERO settle frames, the
@@ -3205,7 +3763,7 @@ describe("handleInboundMessage — approval-origin lease", () => {
     await ordinaryTurn;
   });
 
-  it("rotates the epoch on teardown, refusing requests stamped before it", async () => {
+  it("refuses requests stamped before an approval-stream restart's barrier", async () => {
     const started = deferred();
     const finish = deferred();
     const made = makeFakeApi({
@@ -3227,7 +3785,11 @@ describe("handleInboundMessage — approval-origin lease", () => {
       peerId: "peer-1",
     });
 
-    stopAgentLifecycleSubscription(); // draws a new barrier at 1_030
+    // #267: the barrier is drawn by the approval stream restarting, which in
+    // production is `startClawApprovalMonitor`. Called directly here so this
+    // test stays about the lease WINDOW; where the call lives is pinned
+    // separately in approvals.test.ts.
+    registry.rotateEpoch(); // draws a new barrier at 1_030
     // The same request the registry answered a moment ago is now unattributable:
     // it predates the barrier, so a gateway replay of it cannot be delivered.
     expect(resolveOrigin(made.api, 1_020)).toEqual({ kind: "invalid_request_time" });
@@ -3236,8 +3798,15 @@ describe("handleInboundMessage — approval-origin lease", () => {
     await turnPromise;
   });
 
-  it("never resolves a handle left dormant across the rotation", async () => {
+  it("resolves a handle whose run starts AFTER a rotation, from its real start time (#267)", async () => {
+    // This inverts what #93 originally asserted. The handle's start time is read
+    // at `onAgentRunStart`, not at lease creation, so a run that begins after the
+    // barrier records a post-barrier time and is provable like any other. Gating
+    // on the CREATION epoch instead threw that proof away, and since the barrier
+    // was drawn on ordinary plugin re-registration it happened on every turn:
+    // every approval was dropped as `active_no_match`.
     let afterLateStart: unknown;
+    let beforeLateStart: unknown;
     const started = deferred();
     const finish = deferred();
     const made = makeFakeApi({
@@ -3249,7 +3818,11 @@ describe("handleInboundMessage — approval-origin lease", () => {
         nowMs = 1_040;
         turn.replyOptions?.onAgentRunStart?.("run-1");
         nowMs = 1_060;
+        // Created after the barrier AND after the run started: deliverable.
         afterLateStart = resolveOrigin(made.api, 1_050);
+        // Created after the barrier but BEFORE the run started: still refused —
+        // strict ordering is untouched by #267.
+        beforeLateStart = resolveOrigin(made.api, 1_035);
       },
     });
     const { transport } = makeFakeTransport();
@@ -3257,14 +3830,50 @@ describe("handleInboundMessage — approval-origin lease", () => {
     const turnPromise = handleInboundMessage(made.api, transport, "peer-1", ordinary);
     await started.promise;
     nowMs = 1_030;
-    stopAgentLifecycleSubscription(); // barrier 1_030, epoch rotated
+    registry.rotateEpoch(); // barrier 1_030, epoch rotated
 
     finish.resolve();
     await turnPromise;
 
-    expect(afterLateStart).toEqual({ kind: "no_match" });
+    expect(afterLateStart).toEqual({ kind: "resolved", peerId: "peer-1" });
+    expect(beforeLateStart).toEqual({ kind: "no_match" });
+    // The outer `finally` still releases it, so nothing survives the turn.
     nowMs = 1_080;
     expect(resolveOrigin(made.api, 1_070)).toEqual({ kind: "no_match" });
+  });
+
+  it("draws NO barrier when the agent-lifecycle subscription is torn down (#267)", async () => {
+    // The regression guard for the outage: `registerFull` wires both ends of
+    // this seam and the host re-registers plugins several times per turn, so a
+    // barrier here fences off the in-flight turn's own lease.
+    const started = deferred();
+    const finish = deferred();
+    const made = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        nowMs = 1_010;
+        turn.replyOptions?.onAgentRunStart?.("run-1");
+        started.resolve();
+        await finish.promise;
+      },
+    });
+    const { transport } = makeFakeTransport();
+
+    const turnPromise = handleInboundMessage(made.api, transport, "peer-1", ordinary);
+    await started.promise;
+    nowMs = 1_030;
+    stopAgentLifecycleSubscription();
+
+    nowMs = 1_060;
+    // No barrier was drawn, so a request older than the teardown is still
+    // answerable — the teardown is not a replay boundary.
+    expect(resolveOrigin(made.api, 1_020)).toEqual({
+      kind: "resolved",
+      peerId: "peer-1",
+    });
+
+    finish.resolve();
+    await turnPromise;
   });
 
   it("keeps a run active across the rotation, post-barrier only, released by its own finally", async () => {
@@ -3284,7 +3893,7 @@ describe("handleInboundMessage — approval-origin lease", () => {
     const turnPromise = handleInboundMessage(made.api, transport, "peer-1", ordinary);
     await started.promise;
     nowMs = 1_030;
-    stopAgentLifecycleSubscription(); // barrier 1_030; the claim is NOT cleared
+    registry.rotateEpoch(); // barrier 1_030; the claim is NOT cleared
 
     nowMs = 1_060;
     // A replayed pre-barrier request stays refused …
@@ -3379,5 +3988,298 @@ describe("dispatch-failure logging cannot itself throw (#123)", () => {
       .filter((text) => text.includes("inbound dispatch failed"));
     expect(records).toHaveLength(1);
     expect(records[0]!.split("\n")).toHaveLength(1);
+  });
+});
+
+
+describe("durable output completion (#295)", () => {
+  it.each(["off", "immediate", "buffered", "snapshot"] as const)("does not settle ok after a persistent %s storage failure", async (mode) => {
+    const { transport, settles } = makeFakeTransport();
+    const fail = () => { throw new DurableSendError("agent_message", "failed-id"); };
+    if (mode === "off") transport.sendText = fail;
+    else if (mode === "snapshot") transport.sendTurnSnapshot = fail;
+    else {
+      const original = transport.finalizeDraft;
+      transport.finalizeDraft = (...args) => args[2] === "first" ? original(...args) : fail();
+    }
+    const { api } = makeFakeApi({ streamingMode: mode === "off" ? "off" : "partial", runImpl: async (turn) => {
+      turn.replyOptions?.onAssistantMessageStart?.();
+      if (mode === "buffered" || mode === "snapshot") {
+        turn.replyOptions?.onPartialReply?.({ text: "first" });
+        if (mode === "buffered") turn.replyOptions?.onAssistantMessageStart?.();
+      }
+      await turn.delivery.deliver({ text: "authored final" }, { kind: "final" });
+    } });
+    await handleInboundMessage(api, transport, "peer-1", { type: "user_message", id: "turn-failure", text: "hi" });
+    expect(settles).toEqual(["error"]);
+  });
+
+  it.each(["immediate", "notice", "buffered", "snapshot"] as const)("settles ok after %s output-only recovery without a stale failure latch", async (mode) => {
+    const { transport, settles } = makeFakeTransport();
+    const original = mode === "snapshot" ? transport.sendTurnSnapshot : transport.finalizeDraft;
+    let failed = false;
+    if (mode === "snapshot") {
+      transport.sendTurnSnapshot = (...args) => {
+        if (!failed) { failed = true; throw new DurableSendError("turn_snapshot"); }
+        return (original as WebChannelPeerChannel["sendTurnSnapshot"])(...args);
+      };
+    } else {
+      transport.finalizeDraft = (...args) => {
+        if (args[2] !== "first" && !failed) { failed = true; throw new DurableSendError("agent_message", args[1]); }
+        return (original as WebChannelPeerChannel["finalizeDraft"])(...args);
+      };
+    }
+    const { api } = makeFakeApi({ streamingMode: "partial", runImpl: async (turn) => {
+      turn.replyOptions?.onAssistantMessageStart?.();
+      if (mode === "buffered" || mode === "snapshot") {
+        turn.replyOptions?.onPartialReply?.({ text: "first" });
+        if (mode === "buffered") turn.replyOptions?.onAssistantMessageStart?.();
+      }
+      await turn.delivery.deliver({ text: "authored final", ...(mode === "notice" ? { isStatusNotice: true } : {}) }, { kind: "final" });
+    } });
+    await handleInboundMessage(api, transport, "peer-1", { type: "user_message", id: "turn-recovered", text: "hi" });
+    expect(failed).toBe(true);
+    expect(settles).toEqual(["ok"]);
+  });
+});
+
+describe("durable dispatch hooks (#369)", () => {
+  it("emits turn_settled for every eligible turn even when the durable settle stored nothing", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async (turn) => {
+      await turn.delivery.deliver({ text: "answered" }, { kind: "final" });
+    } });
+    const { transport, settleFrames } = makeFakeTransport();
+    const outcomes: Array<"ok" | "error"> = [];
+
+    // `/stop` already cancelled this batch, so the store moves no row and the
+    // hook reports `false`. The frame is what the account's OTHER devices clear
+    // `isTyping` on, and nothing re-sends it — so it must go out regardless.
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message", text: "hi", id: "turn-unstored",
+    }, "default", { onSettled: (outcome) => { outcomes.push(outcome); return false; } });
+
+    expect(outcomes).toEqual(["ok"]);
+    expect(settleFrames).toEqual([{ turnId: "turn-unstored", outcome: "ok" }]);
+  });
+
+  it("emits turn_settled even when the durable settle THROWS, and says so once", async () => {
+    const { api, warnings } = makeFakeApi({ streamingMode: "off", runImpl: async (turn) => {
+      await turn.delivery.deliver({ text: "answered" }, { kind: "final" });
+    } });
+    const { transport, settleFrames } = makeFakeTransport();
+
+    // A store fault at the settle instant. Unguarded it escapes from inside the
+    // `finally`, so the settle block below it never runs and no device is ever
+    // told this turn ended — the one failure mode the frame matters most for.
+    await expect(handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message", text: "hi", id: "turn-throwing-settle",
+    }, "default", { onSettled: () => { throw new Error("injected settle fault"); } })).resolves.toBeUndefined();
+
+    expect(settleFrames).toEqual([{ turnId: "turn-throwing-settle", outcome: "ok" }]);
+    // Exactly one line, naming the peer, the turn and the fault — filtered
+    // rather than compared whole, because the #113 reasoning diagnostic is a
+    // once-per-process latch whose firing depends on test order in this file.
+    expect(warnings.filter((w) => w.includes("durable settle failed"))).toEqual([
+      'webchannel: durable settle failed for peer="peer-1" turn="turn-throwing-settle" error="Error: injected settle fault"',
+    ]);
+  });
+
+  it.each(["off", "progress"] as const)("delivers no apology when /stop aborted the dispatch before core admitted it (%s)", async (streamingMode) => {
+    const { api, warnings } = makeFakeApi({ streamingMode, runImpl: async () => {
+      // Core throws the abort reason when the dispatch signal fires between the
+      // claim and admission (and from `onTurnAdopted`'s refusal).
+      throw new Error("webchannel: dispatch retired before core run");
+    } });
+    const { transport, texts, finalizes, settles } = makeFakeTransport();
+    const aborted = new AbortController();
+    aborted.abort();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message", text: "cancel me", id: "turn-aborted",
+    }, "default", { dispatchAbortSignal: aborted.signal });
+
+    // The user asked for the stop; a durable "something went wrong" bubble is
+    // not an answer to it. The outcome is still `error`.
+    expect(texts).toEqual([]);
+    expect(finalizes).toEqual([]);
+    expect(settles).toEqual(["error"]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("still apologizes for an ordinary thrown turn while a dispatch signal is wired", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {
+      throw new Error("provider exploded");
+    } });
+    const { transport, texts } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message", text: "boom", id: "turn-thrown",
+    }, "default", { dispatchAbortSignal: new AbortController().signal });
+
+    expect(texts.map((f) => f.text)).toEqual([
+      "Sorry — something went wrong while answering. Please try again.",
+    ]);
+  });
+});
+
+
+describe("#415 C4: native reply prefix pipeline", () => {
+  it.each(["off", "partial", "block", "progress"] as const)("delivers model-interpolated prefixes through the real SDK in %s mode", async streamingMode => {
+    const { api } = makeFakeApi({ streamingMode, runImpl: async () => {} });
+    const { transport, texts, finalizes } = makeFakeTransport();
+    api.config.messages = { responsePrefix: "[{provider}/{model}]" };
+    api.runtime.channel.inbound.run = runChannelInboundEvent;
+    const dispatch = vi.fn<NonNullable<typeof api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher>>(async params => {
+      await params.replyOptions?.onModelSelected?.({ provider: "fixture", model: "model-test", thinkLevel: "off" });
+      const dispatcher = createReplyDispatcher(params.dispatcherOptions);
+      dispatcher.sendFinalReply({ text: "answer" });
+      await dispatcher.waitForIdle();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } };
+    });
+    api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = dispatch;
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", id: "prefix-turn", text: "hello" });
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect([...texts, ...finalizes].map(frame => frame.text)).toContain("[fixture/model-test] answer");
+  });
+
+  it("uses the serving account's prefix override", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {}, channelConfig: {
+      responsePrefix: "channel", accounts: { chosen: { responsePrefix: "account" } },
+    } });
+    const { transport, texts } = makeFakeTransport();
+    api.config.messages = { responsePrefix: "global" };
+    api.runtime.channel.inbound.run = runChannelInboundEvent;
+    api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = async params => {
+      const dispatcher = createReplyDispatcher(params.dispatcherOptions);
+      dispatcher.sendFinalReply({ text: "answer" });
+      await dispatcher.waitForIdle();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } };
+    };
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", id: "prefix-turn", text: "hello" }, "chosen");
+    expect(texts.map(frame => frame.text)).toEqual(["account answer"]);
+  });
+
+  it("keeps the prefix out of a CLI reasoning replay and renders one reasoning row", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+    const { transport, texts, settles } = makeFakeTransport();
+    const reasoning = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+    api.config.messages = { responsePrefix: "[{model}]" };
+    api.runtime.channel.inbound.run = runChannelInboundEvent;
+    api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = async params => {
+      const callbacks = params.replyOptions!;
+      await callbacks.onModelSelected?.({ provider: "fixture", model: "model-test", thinkLevel: "off" });
+      callbacks.onAgentRunStart?.("prefix-reasoning-run");
+      await callbacks.onReasoningStream?.({ text: "AAA", isReasoningSnapshot: true });
+      await callbacks.onReasoningStream?.({ text: "AAA\n\nBBB", isReasoningSnapshot: true });
+      const dispatcher = createReplyDispatcher(params.dispatcherOptions);
+      // The CLI runtime's final replay of the open snapshot, then the answer.
+      dispatcher.sendFinalReply({ text: "AAA\n\nBBB", isReasoning: true });
+      dispatcher.sendFinalReply({ text: "answer" });
+      await dispatcher.waitForIdle();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 2 } };
+    };
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", id: "prefix-reasoning", text: "hello" });
+    const finals = reasoning.mock.calls.filter(args => args[4] === true);
+    expect(finals.map(args => args[3])).toEqual(["AAA\n\nBBB"]);
+    expect(new Set(reasoning.mock.calls.map(args => args[1])).size).toBe(1);
+    expect(reasoning.mock.calls.some(args => String(args[3]).includes("[model-test]"))).toBe(false);
+    expect(texts.map(frame => frame.text)).toEqual(["[model-test] answer"]);
+    expect(settles).toEqual(["ok"]);
+  });
+});
+
+describe("#415 C7: unsupported media-only finals", () => {
+  it("refuses a media-only final through the actual SDK prefix pipeline", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+    api.config.messages = { responsePrefix: "[configured]" };
+    api.runtime.channel.inbound.run = runChannelInboundEvent;
+    api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = async params => {
+      const dispatcher = createReplyDispatcher(params.dispatcherOptions);
+      dispatcher.sendFinalReply({ mediaUrls: ["https://private.invalid/image"] });
+      await dispatcher.waitForIdle();
+      return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } };
+    };
+    const { transport, texts, settles } = makeFakeTransport();
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", text: "image" });
+    expect(texts).toEqual([]);
+    expect(settles).toEqual(["error"]);
+  });
+
+  it.each(["off", "partial", "block", "progress"] as const)("settles an undelivered media final as error in %s mode", async streamingMode => {
+    for (const payload of [{ mediaUrl: "https://private.invalid/file" }, { mediaUrls: ["https://private.invalid/file"], text: "  " }]) {
+      const { api, warnings } = makeFakeApi({ streamingMode, runImpl: async turn => {
+        expect(await turn.delivery.deliver(payload, { kind: "final" })).toEqual({ visibleReplySent: false });
+      } });
+      const { transport, settles, texts, finalizes } = makeFakeTransport();
+      const durableSettlement = vi.fn();
+      await handleInboundMessage(api, transport, "peer", { type: "user_message", id: "media-turn", text: "make an image" }, "default", { onSettled: durableSettlement });
+      expect(settles).toEqual(["error"]);
+      expect(durableSettlement).toHaveBeenCalledWith("error");
+      expect([...texts, ...finalizes]).toEqual([]);
+      expect(warnings.join(" ")).toContain("media-only final was not delivered");
+      expect(warnings.join(" ")).not.toContain("private.invalid");
+    }
+  });
+
+  it("preserves a core success verdict but records media delivery failure", async () => {
+    let emit!: (event: LifecycleEvent) => void;
+    const made = makeFakeApi({ streamingMode: "off", withAgentEvents: true, runImpl: async turn => {
+      turn.replyOptions?.onAgentRunStart?.("media-run");
+      await turn.delivery.deliver({ mediaUrls: ["file:///private/image.png"] }, { kind: "final" });
+      emit({ stream: "lifecycle", runId: "media-run", data: { phase: "end" } });
+    } });
+    emit = made.emitLifecycle;
+    startAgentLifecycleSubscription(made.api);
+    const { transport, settles } = makeFakeTransport();
+    await handleInboundMessage(made.api, transport, "peer", { type: "user_message", text: "image" });
+    expect(settles).toEqual(["error"]);
+  });
+
+  it.each(["off", "partial", "block", "progress"] as const)("settles ok when block-streamed answer text precedes a media-only final in %s mode", async streamingMode => {
+    const { api } = makeFakeApi({ streamingMode, runImpl: async turn => {
+      await turn.delivery.deliver({ text: "here is the image" }, { kind: "block" });
+      // Core's preserveUnsentMediaAfterBlockSend: the final re-sent as media only.
+      await turn.delivery.deliver({ mediaUrl: "https://private.invalid/file" }, { kind: "final" });
+    } });
+    const { transport, settles, texts, finalizes, progress } = makeFakeTransport();
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", text: "image" });
+    expect([...texts, ...finalizes, ...progress].map(frame => frame.text)).toContain("here is the image");
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it("settles ok when the streamed lane owns the answer and its redundant block is suppressed", async () => {
+    const { api } = makeFakeApi({ streamingMode: "partial", runImpl: async turn => {
+      turn.replyOptions?.onAssistantMessageStart?.();
+      turn.replyOptions?.onPartialReply?.({ text: "here is the image" });
+      await turn.delivery.deliver({ text: "here is the image" }, { kind: "block", assistantMessageIndex: 1 });
+      await turn.delivery.deliver({ mediaUrl: "https://private.invalid/file" }, { kind: "final" });
+    } });
+    const { transport, settles, texts, finalizes, progress } = makeFakeTransport();
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", text: "image" });
+    expect([...texts, ...finalizes, ...progress].map(frame => frame.text)).toContain("here is the image");
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it.each(["off", "partial", "block", "progress"] as const)("settles ok when a media-only final is followed by a text final in %s mode", async streamingMode => {
+    const { api } = makeFakeApi({ streamingMode, runImpl: async turn => {
+      await turn.delivery.deliver({ mediaUrls: ["https://private.invalid/file"] }, { kind: "final" });
+      await turn.delivery.deliver({ text: "answer" }, { kind: "final" });
+    } });
+    const { transport, settles, texts, finalizes } = makeFakeTransport();
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", text: "image" });
+    expect([...texts, ...finalizes].map(frame => frame.text)).toContain("answer");
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it("does not classify silence or a text-bearing final as a missing media final", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async turn => {
+      await turn.delivery.deliver({}, { kind: "final" });
+      await turn.delivery.deliver({ mediaUrls: [] }, { kind: "final" });
+      await turn.delivery.deliver({ text: "answer", mediaUrl: "https://private.invalid/file" }, { kind: "final" });
+    } });
+    const { transport, settles, texts } = makeFakeTransport();
+    await handleInboundMessage(api, transport, "peer", { type: "user_message", text: "hello" });
+    expect(settles).toEqual(["ok"]);
+    expect(texts.map(frame => frame.text)).toEqual(["answer"]);
   });
 });

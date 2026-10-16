@@ -47,7 +47,7 @@ describe("mintNatsUserCreds — external account (issuer_account)", () => {
     const creds = await mintNatsUserCreds({
       accountSeed: signingSeed,
       tenant: "tenant-ext",
-      role: "agent",
+      role: "agent", accountId: "test-agent",
       issuerAccountId: accountId,
     });
 
@@ -59,11 +59,11 @@ describe("mintNatsUserCreds — external account (issuer_account)", () => {
     // sub = the freshly-minted user NKEY public.
     expect(claims.sub).toMatch(/^U/);
     // Tenant-scoped perms unchanged.
-    expect(claims.nats.pub?.allow).toEqual(["webchannel.tenant-ext.>"]);
-    expect(claims.nats.sub?.allow).toEqual(["webchannel.tenant-ext.>"]);
+    expect(claims.nats.pub?.allow).toEqual(["webchannel.tenant-ext.test-agent.>"]);
+    expect(claims.nats.sub?.allow).toEqual(["webchannel.tenant-ext.test-agent.>"]);
     expect(creds.permissions).toEqual({
-      pub: ["webchannel.tenant-ext.>"],
-      sub: ["webchannel.tenant-ext.>"],
+      pub: ["webchannel.tenant-ext.test-agent.>"],
+      sub: ["webchannel.tenant-ext.test-agent.>"],
     });
     // Still returns the browser-friendly raw seed.
     expect(creds.userSeed).toMatch(/^SU/);
@@ -79,7 +79,7 @@ describe("mintNatsUserCreds — external account (issuer_account)", () => {
     const creds = await mintNatsUserCreds({
       accountSeed,
       tenant: "tenant-self",
-      role: "agent",
+      role: "agent", accountId: "test-agent",
     });
 
     const claims = decodeUser(creds.userJwt);
@@ -87,15 +87,15 @@ describe("mintNatsUserCreds — external account (issuer_account)", () => {
     // No issuer_account when self-signed (or, if present, equal to iss).
     expect(claims.nats.issuer_account ?? claims.iss).toBe(claims.iss);
     expect(claims.nats.issuer_account).toBeFalsy();
-    expect(claims.nats.pub?.allow).toEqual(["webchannel.tenant-self.>"]);
+    expect(claims.nats.pub?.allow).toEqual(["webchannel.tenant-self.test-agent.>"]);
   });
 
   it("isolates tenants across the external path", async () => {
     const { accountId, signingSeed } = makeExternalAccount();
-    const a = await mintNatsUserCreds({ accountSeed: signingSeed, tenant: "alpha", role: "agent", issuerAccountId: accountId });
-    const b = await mintNatsUserCreds({ accountSeed: signingSeed, tenant: "beta", role: "agent", issuerAccountId: accountId });
-    expect(decodeUser(a.userJwt).nats.pub?.allow).toEqual(["webchannel.alpha.>"]);
-    expect(decodeUser(b.userJwt).nats.pub?.allow).toEqual(["webchannel.beta.>"]);
+    const a = await mintNatsUserCreds({ accountSeed: signingSeed, tenant: "alpha", role: "agent", accountId: "test-agent", issuerAccountId: accountId });
+    const b = await mintNatsUserCreds({ accountSeed: signingSeed, tenant: "beta", role: "agent", accountId: "test-agent", issuerAccountId: accountId });
+    expect(decodeUser(a.userJwt).nats.pub?.allow).toEqual(["webchannel.alpha.test-agent.>"]);
+    expect(decodeUser(b.userJwt).nats.pub?.allow).toEqual(["webchannel.beta.test-agent.>"]);
     // Same issuer_account, distinct users.
     expect(decodeUser(a.userJwt).nats.issuer_account).toBe(accountId);
     expect(decodeUser(b.userJwt).nats.issuer_account).toBe(accountId);
@@ -130,7 +130,7 @@ describe("setupTrustChain — external account mode", () => {
     const creds = await mintNatsUserCreds({
       accountSeed: chain.private.natsAccountSeed,
       tenant: "t1",
-      role: "agent",
+      role: "agent", accountId: "test-agent",
       issuerAccountId: chain.natsConfig.mode === "external" ? chain.natsConfig.accountPublicKey : undefined,
     });
     const claims = decodeUser(creds.userJwt);
@@ -185,7 +185,7 @@ describe("DeviceFlowEnrollment — agent path mints against the external account
     const claims = decodeUser(result.result.creds.userJwt);
     expect(claims.iss).toBe(signingPublic);
     expect(claims.nats.issuer_account).toBe(accountId);
-    expect(claims.nats.pub?.allow).toEqual(["webchannel.tenant-ext.>"]);
+    expect(claims.nats.pub?.allow).toEqual(["webchannel.tenant-ext.agent-1.>"]);
   });
 });
 

@@ -29,7 +29,7 @@ function ok(name, fn) {
 // 1. PUBLIC surface is importable and exposes the expected symbols.
 // ---------------------------------------------------------------------------
 await ok("saas barrel exposes operator symbols", async () => {
-  const saas = await import("@mir-stream/webchannel-saas");
+  const saas = await import("openclaw-webchannel-saas");
   for (const sym of [
     "setupTrustChain",
     "loadOrCreateTrustChain",
@@ -50,14 +50,14 @@ await ok("saas barrel exposes operator symbols", async () => {
 });
 
 await ok("saas barrel does NOT leak raw mint / subject-token guards", async () => {
-  const saas = await import("@mir-stream/webchannel-saas");
+  const saas = await import("openclaw-webchannel-saas");
   for (const sym of ["mintNatsUserCreds", "assertValidSubjectToken", "MemoryEnrollmentStore", "MemoryAgentKeyRegistry"]) {
     assert.equal(saas[sym], undefined, `${sym} must NOT be re-exported by the barrel`);
   }
 });
 
 await ok("client barrel exposes the widget client", async () => {
-  const client = await import("@mir-stream/webchannel-client");
+  const client = await import("openclaw-webchannel-client");
   assert.equal(typeof client.WebChannelNATSClient, "function");
 });
 
@@ -78,13 +78,13 @@ async function assertNotExported(specifier) {
 }
 
 await ok("saas internal nats-user-creds is not exported", () =>
-  assertNotExported("@mir-stream/webchannel-saas/nats-user-creds"),
+  assertNotExported("openclaw-webchannel-saas/nats-user-creds"),
 );
 await ok("saas internal subject-token is not exported", () =>
-  assertNotExported("@mir-stream/webchannel-saas/subject-token"),
+  assertNotExported("openclaw-webchannel-saas/subject-token"),
 );
 await ok("client internal nats-client is not exported", () =>
-  assertNotExported("@mir-stream/webchannel-client/nats-client"),
+  assertNotExported("openclaw-webchannel-client/nats-client"),
 );
 
 if (failed > 0) console.error(`\n${failed} assertion(s) failed`);

@@ -84,6 +84,7 @@ import { WEBCHANNEL_ID } from "./channel-contract.js";
 import type {
   WebChannelPeerChannel,
   ApprovalDecision,
+  ApprovalDecisionRejectReason,
   ApprovalOption,
   ApprovalRequestPayload,
 } from "./channel-contract.js";
@@ -101,10 +102,9 @@ import { logSafe } from "./log-safe.js";
 /**
  * Resolve the transport a given account's approval frames should ride. `null`/
  * `undefined` accountId means "unscoped" (legacy single-account callers); a
- * resolver may map that to the default account. Returning `undefined` makes the
- * caller fall back to the capability's closure-bound transport (the single-
- * account / legacy-WS path), so a missing resolver or unknown account degrades
- * to today's behavior instead of dropping the frame.
+ * resolver may map that to the default account. With a resolver wired,
+ * `undefined` FAILS CLOSED — the frame is dropped rather than misrouted; only a
+ * resolver-less single-transport wiring uses the closure-bound transport.
  */
 export type ResolveAccountTransport = (
   accountId: string | null | undefined,
@@ -186,8 +186,11 @@ function recordApprovalAccount(approvalId: string, accountId: string | null | un
  * Bounded (evict oldest) exactly like `deliveredApprovalAccounts`: approvals are
  * agent-minted (a browser cannot forge one), so the cap is a backstop against an
  * abandoned entry whose finalize never ran, not a client-reachable growth
- * vector. Entries are erased at finalize (`updateEntry`) and lazily pruned on
- * read (past-`expiresAtMs`, or no-`expiresAtMs` older than the max age).
+ * vector. Entries are erased at finalize (`updateEntry`), or deleted by the
+ * abandonment backstop on read — `PENDING_APPROVAL_MAX_AGE_MS` after a finalize
+ * was DUE (`expiresAtMs` when set, else `deliveredAtMs`). A past-`expiresAtMs`
+ * entry is WITHHELD from listings but kept (#341: `updateEntry` still needs its
+ * payload to write the request row).
  */
 export const PENDING_APPROVAL_MAX_AGE_MS = 60 * 60 * 1000; // 60 min
 export const PENDING_APPROVAL_CAP = 512;
@@ -201,6 +204,14 @@ type PendingApprovalEntry = {
   accountKey: string;
   /** `Date.now()` at delivery — the max-age prune uses it for no-`expiresAtMs` entries. */
   deliveredAtMs: number;
+  /**
+   * Whether this peer's request row was accepted in the recorded channel
+   * generation. Re-delivery consults this shared flag; each SDK entry also
+   * retains its original payload and its own delivery's acceptance bit (#381).
+   */
+  requestJournaled: boolean;
+  /** Channel generation in which the row was accepted, if one existed. */
+  channel?: WeakRef<WebChannelPeerChannel>;
 };
 
 const pendingApprovals = new Map<string, PendingApprovalEntry>();
@@ -209,14 +220,34 @@ function pendingApprovalKey(accountId: string | null | undefined, approvalId: st
   return `${bindingAccountKey(accountId)}${PENDING_APPROVAL_KEY_SEP}${approvalId}`;
 }
 
-/** Record (or refresh) a pending approval; bounded, evicts oldest at the cap. */
+/**
+ * Record (or refresh) a pending approval; bounded, evicts oldest at the cap.
+ *
+ * Returns the entry's `requestJournaled` state AS IT STOOD BEFORE this call — i.e.
+ * "does a durable `approval` row for this card already exist in this peer's
+ * conversation". #341 gates the journal on it rather than on "is this a new
+ * record", and the difference matters: a first delivery whose append was
+ * SWALLOWED (§15.8) leaves a record with no row, and the next re-delivery must
+ * write it rather than skip it as a duplicate. Nothing downstream can dedupe
+ * approval rows for us — `delivery-journal.ts`'s `extractMessageId` has no
+ * `approval` arm, so they carry a null `message_id` and no unique index sees them
+ * (#355).
+ */
 function recordPendingApproval(
   accountId: string | null | undefined,
   payload: ApprovalRequestPayload,
   sessionKey: string,
   deliveredAtMs: number,
-): void {
+  channel?: WebChannelPeerChannel,
+): boolean {
   const key = pendingApprovalKey(accountId, payload.id);
+  // Read BEFORE the delete-then-set below, which would erase the very state this
+  // returns. A record for a DIFFERENT peer carries no claim about this one's
+  // conversation, so it reads as not-journaled (see the field's docblock).
+  const previous = pendingApprovals.get(key);
+  const requestJournaled =
+    previous !== undefined && previous.sessionKey === sessionKey &&
+    (channel ? previous.channel?.deref() === channel : previous.channel === undefined) && previous.requestJournaled;
   // Insertion-ordered Map: delete-then-set moves a repeat delivery to the newest
   // slot so a re-delivery refreshes rather than dupes (and never evicts itself).
   pendingApprovals.delete(key);
@@ -240,11 +271,41 @@ function recordPendingApproval(
     pendingApprovals.delete(oldest);
   }
   pendingApprovals.set(key, {
-    payload,
+    payload: structuredClone(payload),
     sessionKey,
     accountKey: bindingAccountKey(accountId),
     deliveredAtMs,
+    requestJournaled,
+    channel: channel ? new WeakRef(channel) : undefined,
   });
+  return requestJournaled;
+}
+
+/**
+ * #341: note that this card's durable `approval` row now exists, so neither a
+ * re-delivery nor the resolution leg writes a second one. No-op if the record is
+ * already gone (finalized/evicted between the send and this call) — the flag only
+ * ever suppresses a duplicate write, so losing it is the safe direction.
+ */
+function markPendingApprovalJournaled(
+  accountId: string | null | undefined,
+  approvalId: string,
+): void {
+  const entry = pendingApprovals.get(pendingApprovalKey(accountId, approvalId));
+  if (entry) entry.requestJournaled = true;
+}
+
+/**
+ * #341: read this account's pending record without disturbing it. `updateEntry`
+ * needs BOTH of its fields before it erases the record — the payload, to write a
+ * durable `approval` row that delivery could not write, and `requestJournaled`, to
+ * know whether it has to.
+ */
+function readPendingApproval(
+  accountId: string | null | undefined,
+  approvalId: string,
+): PendingApprovalEntry | undefined {
+  return pendingApprovals.get(pendingApprovalKey(accountId, approvalId));
 }
 
 /** Erase this account's pending record for an approval (called at finalize). */
@@ -254,12 +315,28 @@ function deletePendingApproval(accountId: string | null | undefined, approvalId:
 
 /**
  * List the approvals STILL PENDING for a specific (account, peer) — the payload
- * set the register-time `approval_snapshot` carries. Lazy-prunes on read:
- * an entry whose `expiresAtMs` is in the past (defense in depth — the runtime's
- * expiry path normally erases it via `updateEntry`), and an entry WITHOUT an
- * `expiresAtMs` older than `PENDING_APPROVAL_MAX_AGE_MS`, so an orphan whose
- * finalize never fired (e.g. the approval monitor was disposed on channel stop)
- * can never be re-delivered as an actionable zombie card forever.
+ * set the register-time `approval_snapshot` carries.
+ *
+ * ⚠️ EXPIRY HIDES AN ENTRY FROM THE LISTING; ONLY THE ABANDONMENT BACKSTOP
+ * DELETES ONE. The two used to be the same branch, and collapsing them cost
+ * #341 its invariant on a third path (round 2 shipped with it). This function
+ * runs for EVERY registering peer of EVERY account, so the old code deleted any
+ * past-`expiresAtMs` record the moment anyone registered — including one whose
+ * durable `approval` row is still OWED (raised while the account had no channel,
+ * so `deliverPending` had nowhere to write). Core's expiry finalize is a timer,
+ * and a poll-phase register callback runs before a due timer under load, so the
+ * record was routinely gone by the time `updateEntry` needed its payload to
+ * write that row — leaving the lone `approvalResolution` this slice exists to
+ * prevent. The record now survives until `updateEntry` clears it — or until the
+ * cap or the backstop below deletes it, the two paths the pair rule's exception
+ * names.
+ *
+ * The backstop that ACTUALLY frees memory is unchanged in purpose and now covers
+ * both shapes: an entry is deleted `PENDING_APPROVAL_MAX_AGE_MS` after the
+ * moment its finalize should have run (its expiry, or its delivery when it has
+ * none), so an orphan whose finalize never fired — the approval monitor disposed
+ * on channel stop — can never be re-delivered as an actionable zombie card
+ * forever, and cannot accumulate either.
  */
 export function listPendingApprovalsForPeer(
   accountId: string | null | undefined,
@@ -271,23 +348,31 @@ export function listPendingApprovalsForPeer(
   for (const [key, entry] of pendingApprovals) {
     const expiresAtMs = entry.payload.expiresAtMs;
     const expired = typeof expiresAtMs === "number" && expiresAtMs <= now;
-    const tooOld =
-      expiresAtMs === undefined && now - entry.deliveredAtMs > PENDING_APPROVAL_MAX_AGE_MS;
-    if (expired || tooOld) {
-      // A no-expiry entry pruned by the max-age backstop is an ORPHAN whose
-      // finalize hook never fired (e.g. the approval monitor was disposed on
-      // channel stop). Warn so a systematic finalize leak is visible — an
-      // expiry-driven prune is routine and stays quiet.
-      if (tooOld) {
-        console.warn(
-          `[webchannel] pending-approval ${logSafe(entry.payload.id)} (account ${logSafe(entry.accountKey)}, ` +
-            `peer ${logSafe(entry.sessionKey)}) pruned after ${PENDING_APPROVAL_MAX_AGE_MS}ms with no ` +
-            `finalize — likely an orphaned approval (monitor disposed?)`,
-        );
-      }
+    // The moment a finalize was due, plus the grace period. For a card with an
+    // expiry that is its expiry (core fires the expiry finalize then); for one
+    // without, its delivery, exactly as before.
+    const finalizeDueAtMs = typeof expiresAtMs === "number" ? expiresAtMs : entry.deliveredAtMs;
+    const abandoned = now - finalizeDueAtMs > PENDING_APPROVAL_MAX_AGE_MS;
+    if (abandoned) {
+      // Reaching here means no finalize ran for a full grace period after one was
+      // due, whether or not the card had an expiry — an ORPHAN either way (e.g.
+      // the approval monitor was disposed on channel stop), so both shapes warn.
+      // The old "an expiry-driven prune is routine and stays quiet" no longer
+      // applies: routine expiry no longer deletes anything here.
+      // Production finalization retains its own request copy (#381); pruning
+      // this snapshot entry cannot remove that output's catch-up payload.
+      console.warn(
+        `[webchannel] pending-approval ${logSafe(entry.payload.id)} (account ${logSafe(entry.accountKey)}, ` +
+          `peer ${logSafe(entry.sessionKey)}) pruned after ${PENDING_APPROVAL_MAX_AGE_MS}ms with no ` +
+          `finalize — likely an orphaned approval (monitor disposed?)`,
+      );
       pendingApprovals.delete(key);
       continue;
     }
+    // Past its expiry: withheld from the snapshot (the client must never be
+    // handed an expired card as actionable) but KEPT, because `updateEntry` may
+    // still owe this card its durable row. Deliberately not a delete.
+    if (expired) continue;
     if (entry.accountKey === accountKey && entry.sessionKey === sessionKey) {
       result.push(entry.payload);
     }
@@ -497,12 +582,7 @@ export const __resolvedApprovalsTestHook = {
 type ClawApprovalEntry = {
   approvalId: string;
   sessionKey: string;
-  /**
-   * The account this entry was DELIVERED on (normalized; null = unscoped
-   * legacy). `updateEntry` re-resolves the same account's transport from this
-   * (preferring the live hook context's accountId), so the resolved/expired
-   * finalize frame always lands on the channel that showed the prompt.
-   */
+  /** Original delivering account; later hook contexts cannot override it. */
   accountId: string | null;
 };
 
@@ -530,8 +610,7 @@ void _assertDecisionInSync;
  * `resolveWebchannelAccountConfig` merges the channel-level shared base under
  * the `accounts.<id>` override (execApprovals is one of its NESTED_OBJECT_KEYS,
  * so per-field account overrides compose with channel-wide defaults). A null/
- * absent accountId reads the `"default"` account, which for a flat single-
- * account config is exactly the old channel-level read (regression-free).
+ * absent/blank accountId uses the shared account read/lookup rule.
  */
 function readExecApprovals(
   cfg: OpenClawConfig,
@@ -542,7 +621,7 @@ function readExecApprovals(
   agentFilter?: string[];
   sessionFilter?: string[];
 } | undefined {
-  const account = resolveWebchannelAccountConfig(cfg, accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID);
+  const account = resolveWebchannelAccountConfig(cfg, accountId);
   return account.execApprovals as ReturnType<typeof readExecApprovals>;
 }
 
@@ -567,19 +646,22 @@ function isExecApprovalsEnabled(cfg: OpenClawConfig, accountId?: string | null):
  * (mirrors Discord's exec-approvals.ts):
  *   1. channels.webchannel.execApprovals.approvers (typed array of peer ids)
  *   2. commands.ownerAllowFrom (global fallback)
- * Webchannel peer ids are arbitrary verified strings (the verifier's peerId),
- * so no normalization is needed beyond trim+drop-empty (cf. Discord's numeric
- * user-id parsing). resolveApprovalApprovers also dedupes.
+ * Explicit approvers strip an optional `webchannel:` prefix; other colon-bearing
+ * peer ids remain literal. The global owner fallback follows command-gate.ts:
+ * bare ids apply here and other channel prefixes are excluded. Peer identity remains case-sensitive;
+ * `*` keeps its account-scoped meaning. resolveApprovalApprovers also dedupes.
  */
 export function getWebChannelExecApprovalApprovers(params: {
   cfg: OpenClawConfig;
   accountId?: string | null;
 }): string[] {
   const explicit = readExecApprovals(params.cfg, params.accountId)?.approvers;
-  const source: readonly (string | number)[] =
-    Array.isArray(explicit) && explicit.length > 0
-      ? explicit
-      : (params.cfg.commands?.ownerAllowFrom ?? []);
+  // A nonempty explicit list still wins even if every entry is invalid. Do not
+  // turn an invalid explicit list into a broader owner/wildcard fallback.
+  const useExplicit = Array.isArray(explicit) && explicit.length > 0;
+  const source: readonly (string | number)[] = useExplicit
+    ? explicit
+    : (params.cfg.commands?.ownerAllowFrom ?? []);
   return resolveApprovalApprovers({
     explicit: source,
     normalizeApprover: (value) => {
@@ -587,10 +669,39 @@ export function getWebChannelExecApprovalApprovers(params: {
       // peer ids, so drop them (schema permits numbers only for cross-channel
       // config reuse like Discord/Telegram user ids).
       const s = typeof value === "string" ? value.trim() : "";
+      if (!useExplicit || /^webchannel\s*:/i.test(s)) {
+        const sep = s.indexOf(":");
+        if (sep > 0) {
+          if (s.slice(0, sep).trim().toLowerCase() !== WEBCHANNEL_ID) return undefined;
+          return s.slice(sep + 1).trim() || undefined;
+        }
+      }
       return s.length > 0 ? s : undefined;
     },
   });
 }
+
+/**
+ * The one approver entry that is not a peer id: `"*"` admits every peer that is
+ * already authenticated on THIS account.
+ *
+ * It is not a hole in the gate, because it is not the gate. A peer only reaches
+ * an approval decision by holding a live, verified transport session on this
+ * exact account, and the deployment's own enrolment/authorisation decides who
+ * can obtain one — rota, for instance, refuses to sign a browser's bootstrap
+ * unless the caller is the user this agent is ASSIGNED to. `approvers` then asks
+ * the same question a second time, in a place that cannot see the answer, which
+ * is why a deployment whose peer ids are already authorisation-bearing has
+ * nothing to put here. `"*"` lets it say so, instead of shipping a list it must
+ * keep in sync with the real one.
+ *
+ * `"*"` is never a valid peer id (peer ids are opaque verified strings a
+ * verifier hands out, and no verifier issues this one), so no real approver is
+ * shadowed by it. It stays account-scoped like every other entry: `"*"` on
+ * account A says nothing about account B. An empty/blank sender is still refused
+ * — "any authenticated peer" still requires a peer.
+ */
+export const WEBCHANNEL_ANY_APPROVER = "*";
 
 /** Whether `senderId` is one of the ACCOUNT's configured webchannel approvers. */
 export function isWebChannelExecApprovalApprover(params: {
@@ -600,10 +711,12 @@ export function isWebChannelExecApprovalApprover(params: {
 }): boolean {
   const senderId = params.senderId?.trim();
   if (!senderId) return false;
-  return getWebChannelExecApprovalApprovers({
+  const approvers = getWebChannelExecApprovalApprovers({
     cfg: params.cfg,
     accountId: params.accountId,
-  }).includes(senderId);
+  });
+  if (approvers.includes(WEBCHANNEL_ANY_APPROVER)) return true;
+  return approvers.includes(senderId);
 }
 
 function hasConfiguredApprovers(cfg: OpenClawConfig, accountId?: string | null): boolean {
@@ -722,17 +835,26 @@ export function createClawApprovalNativeRuntimeSpec(
   //
   // FAIL-CLOSED (adversarial-round F2): when a resolver IS wired (the NATS
   // multi-account entry), a MISS returns `undefined` and the caller DROPS the
-  // frame — it must NEVER fall back to the closure `transport` (the primary
-  // channel), or an account that `registerFull` skipped (creds-missing /
-  // connect-fail) would have its prompt delivered on the PRIMARY account's
-  // channel — re-opening the exact cross-account misroute S1 closes. Only a
-  // resolver-less single-channel wiring uses the closure transport, where
+  // frame — it must NEVER fall back to the closure `transport`, or an account
+  // that `registerFull` skipped (creds-missing / connect-fail) would have its
+  // prompt delivered on ANOTHER account's channel — re-opening the exact
+  // cross-account misroute S1 closes. Only a resolver-less single-channel
+  // wiring uses the closure transport, where
   // there is exactly one account and no misroute is possible.
   const hasResolver = typeof resolveAccountTransport === "function";
   const transportFor = (
     accountId: string | null | undefined,
   ): WebChannelPeerChannel | undefined =>
     hasResolver ? resolveAccountTransport!(accountId) : transport;
+  // Core owns each returned entry until finalization. Weak keys retain no
+  // independent work after core releases it; the channel owns failed output.
+  const deliveries = new WeakMap<ClawApprovalEntry, {
+    channel?: WebChannelPeerChannel;
+    payload: ApprovalRequestPayload;
+    requestJournaled: boolean;
+    abortSignal?: AbortSignal;
+  }>();
+  const finalizedEntries = new WeakSet<ClawApprovalEntry>();
   return {
     // We can render BOTH exec and plugin approvals natively in the widget.
     eventKinds: ["exec", "plugin"],
@@ -795,8 +917,16 @@ export function createClawApprovalNativeRuntimeSpec(
       // Emit the `approval_request` frame ON THE ORIGINATING ACCOUNT's channel.
       // Returning a non-null entry tells the runtime the prompt was delivered;
       // the entry is handed back on finalize.
-      deliverPending: ({ accountId, preparedTarget, pendingPayload }) => {
+      deliverPending: ({ accountId, preparedTarget, pendingPayload, context }) => {
         const sessionKey = preparedTarget.sessionKey;
+        const channel = transportFor(accountId);
+        const entry = Object.freeze({ approvalId: pendingPayload.id, sessionKey, accountId: accountId ?? null });
+        const originalPayload = structuredClone(pendingPayload);
+        const state = {
+          channel, payload: originalPayload, requestJournaled: false,
+          abortSignal: (context as { approvalAbortSignal?: AbortSignal } | undefined)?.approvalAbortSignal,
+        };
+        deliveries.set(entry, state);
         // Bind this approval to its delivering account BEFORE sending, so the
         // widget-click reverse path can enforce the per-account boundary (F1)
         // even if the frame itself never reaches a socket.
@@ -806,16 +936,48 @@ export function createClawApprovalNativeRuntimeSpec(
         // socket" drop below too. A prompt that could not be delivered live thus
         // becomes recoverable on the peer's next register (its register-time
         // `approval_snapshot`) instead of being permanently lost.
-        recordPendingApproval(accountId, pendingPayload, sessionKey, Date.now());
-        const channel = transportFor(accountId);
+        //
+        // Since #341 the snapshot is no longer the SOLE carrier of such a card
+        // whenever a channel exists: the send below journals the durable
+        // `approval` row on the refused paths too, so history holds it. When no
+        // channel exists at all there is no journal either, and the resolution leg
+        // writes the row late (see `updateEntry`). The record here is what makes
+        // the card actionable again on the next register, and it is where the
+        // "row already written?" bit lives.
+        const requestJournaled = recordPendingApproval(
+          accountId,
+          originalPayload,
+          sessionKey,
+          Date.now(),
+          channel,
+        );
+        state.requestJournaled = requestJournaled;
         if (!channel) {
           // F2 fail-closed: no live channel for this account (skipped/unknown).
-          // Refuse to misroute onto the primary channel; drop with a warn.
+          // Refuse to misroute onto the closure transport; drop with a warn.
+          //
+          // ⚠️ THIS BRANCH WRITES NO DURABLE ROW *YET*, AND THE DELAY IS THE
+          // DESIGN. The delivery journal is opened per account by
+          // `nats-account-runtime.ts` and handed to that account's channel, so
+          // "no live channel for this account" means "no journal for this
+          // account" — there is nowhere to write. Journaling onto the
+          // closure transport instead would file one account's card in
+          // another account's history, which is worse than waiting.
+          //
+          // It does NOT leave the card unstorable, which is what round 1 of #341
+          // assumed. This state is TRANSIENT: the runtime map is deleted and
+          // re-populated across a restart/reconnect, so the account is usually
+          // back by the time the card is resolved (the snapshot re-armed it live
+          // on the peer's next register, or it simply expired). `updateEntry`
+          // therefore writes this row LATE, from the pending payload recorded
+          // above, immediately before the resolution's — see the
+          // `journalRequestFirst` argument there. `requestJournaled` stays false
+          // here precisely so that leg knows it still owes the row.
           console.warn(
             `[webchannel] approval ${logSafe(pendingPayload.id)} not delivered: no live channel for ` +
               `account ${logSafe(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)} (skipped or unknown) — refusing to misroute`,
           );
-          return { approvalId: pendingPayload.id, sessionKey, accountId: accountId ?? null };
+          return entry;
         }
         // An unproven origin never reaches here — it is dropped at
         // `resolveOriginTarget`/`prepareTarget` (#93). This drop is the
@@ -823,56 +985,88 @@ export function createClawApprovalNativeRuntimeSpec(
         // disconnected between the request and the prompt). The frame is
         // correctly not delivered, and that is otherwise invisible, so log it
         // (no logger in scope here; match the `[webchannel]` console style).
-        const delivered = channel.sendApprovalRequest(sessionKey, pendingPayload);
-        if (!delivered) {
+        //
+        // #341: the channel journals the `approval` row ABOVE its refusals, so
+        // this call persists the card whether or not the push lands — and
+        // `redelivery` tells it whether a row for this peer's conversation
+        // already exists, which only the pending store knows. That keeps the
+        // durable row and the pending record one act: the state is stored when it
+        // is created, delivery is a separate attempt
+        // (`nats-channel.ts`'s `publishApprovalFrame`).
+        const sent = channel.sendApprovalRequest(sessionKey, originalPayload, {
+          redelivery: requestJournaled,
+        });
+        // Note it only when the append actually landed. A swallowed one (§15.8)
+        // leaves the flag false, so the next re-delivery writes the row, and
+        // failing that the resolution leg does.
+        if (sent.journaled) {
+          markPendingApprovalJournaled(accountId, pendingPayload.id);
+          state.requestJournaled = true;
+        }
+        if (!sent.delivered) {
           console.warn(
             `[webchannel] approval ${logSafe(pendingPayload.id)} not delivered: no matching open ` +
               `socket for ${logSafe(sessionKey)} (account ${logSafe(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)})`,
           );
         }
-        return { approvalId: pendingPayload.id, sessionKey, accountId: accountId ?? null };
+        return entry;
       },
-      // Finalize: emit `approval_resolved` so the widget disables buttons and
-      // shows the outcome. Fires for both resolved and expired `update` actions.
-      // Route via the DELIVERING account's channel (context accountId, with the
-      // entry's recorded account as fallback) so finalize matches delivery.
-      updateEntry: async ({ entry, payload, accountId }) => {
-        // Finalize is terminal for this approval — release the id→account
-        // binding (resolved AND expired both route here).
-        deliveredApprovalAccounts.delete(entry.approvalId);
-        // #15: drop THIS handler's account-scoped pending record, so a later
-        // register no longer re-delivers a finalized card. Placed next to the
-        // binding delete — BEFORE the channel-resolution early return — so the
-        // erase always runs even when the resolve frame itself can't be sent.
-        // Account-scoped by the SAME normalized key used at delivery, so account
-        // A's finalize never erases account B's still-pending entry for the id.
-        deletePendingApproval(accountId ?? entry.accountId, entry.approvalId);
-        // #19: record the RESOLVED outcome adjacent to (and synchronously with)
-        // the pending erase and BEFORE `approval_resolved` publishes, so a
-        // snapshot can never omit an approval from BOTH pending and resolved
-        // while the client legitimately awaits its verdict. `payload.decision` is
-        // always a real ApprovalDecision; an expiry records as "deny" (see the
-        // resolved-store docstring), matching the live resolve frame below.
-        recordResolvedApproval(
-          accountId ?? entry.accountId,
-          entry.approvalId,
-          payload.decision,
-          entry.sessionKey,
-          Date.now(),
+      // The SDK consumes the entry and awaits Promise<void>; throwing cannot
+      // request another finalize. The account channel owns output recovery.
+      updateEntry: async ({ entry, payload }) => {
+        if (finalizedEntries.has(entry)) return;
+        finalizedEntries.add(entry);
+        const state = deliveries.get(entry);
+        if (state?.abortSignal?.aborted) return;
+        const accountId = entry.accountId;
+        const channel = state?.channel ?? transportFor(accountId);
+        // A channel captured at delivery may never be replaced by a later
+        // lookup. A delivery with no channel may bind once at finalization,
+        // provided its original approval monitor is still active.
+        if (state?.channel && transportFor(accountId) !== state.channel) return;
+        const pending = readPendingApproval(accountId, entry.approvalId);
+        // THE APPROVAL PAIR RULE (#341): request first, then resolution. The
+        // production entry keeps its own payload even if the snapshot store
+        // evicts it. Only legacy hand-built entries without that payload retain
+        // the prior best-effort resolution-only fallback.
+        const request = state?.payload ?? pending?.payload;
+        const requestJournaled = state?.requestJournaled || (
+          pending?.sessionKey === entry.sessionKey && pending.channel?.deref() === channel && pending.requestJournaled
         );
-        const channel = transportFor(accountId ?? entry.accountId);
+        const decision = payload.decision;
+        const onClaim = () => {
+          deliveredApprovalAccounts.delete(entry.approvalId);
+          deletePendingApproval(accountId, entry.approvalId);
+          const previous = resolvedApprovals.get(pendingApprovalKey(accountId, entry.approvalId));
+          if (!previous) recordResolvedApproval(accountId, entry.approvalId, decision, entry.sessionKey, Date.now());
+        };
+        const options = {
+          onClaim,
+          ...(!requestJournaled && request ? { journalRequestFirst: request } : {}),
+          ...(state?.abortSignal ? { abortSignal: state.abortSignal } : {}),
+        };
+        const result = channel?.sendApprovalResolved(
+          entry.sessionKey, entry.approvalId, decision, options,
+        );
+        // A rejected alternate peer/decision must not change the first winner's
+        // snapshot or delete another entry's pending state.
+        if (result && !result.accepted) return;
         if (!channel) {
+          onClaim();
           console.warn(
-            `[webchannel] approval ${logSafe(entry.approvalId)} resolve frame dropped: no live channel ` +
-              `for account ${logSafe(accountId ?? entry.accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)}`,
+            `[webchannel] approval output unjournaled: no live channel for account ${logSafe(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)} ` +
+              `approval=${logSafe(entry.approvalId)} — no active output recovery owner`,
           );
           return;
         }
-        channel.sendApprovalResolved(
-          entry.sessionKey,
-          entry.approvalId,
-          payload.decision,
-        );
+        if (!result?.delivered) {
+          // A decided card must stop offering actions immediately, even when
+          // storage refuses its durable frame. This ephemeral reconciliation is
+          // not a journal receipt; the channel still reports pending/exhausted.
+          channel.sendApprovalSnapshot(entry.sessionKey,
+            listPendingApprovalsForPeer(accountId, entry.sessionKey),
+            listResolvedApprovalsForPeer(accountId, entry.sessionKey));
+        }
       },
     },
   };
@@ -893,8 +1087,8 @@ type OriginUnresolvedReason =
   | "active_ambiguous"
   // Distinct from `active_ambiguous` on purpose: this one means the registry's
   // whole epoch failed closed, so EVERY fallback approval in the process is
-  // being dropped until the next teardown — a process-wide outage, not one
-  // confusable tuple.
+  // being dropped until the next approval-stream start rotates the epoch — a
+  // process-wide outage, not one confusable tuple.
   | "epoch_poisoned"
   // The process-global registry itself is unusable (an incompatible co-installed
   // build owns the versioned slot). Never folded into `sdk_error`, which would
@@ -1114,7 +1308,7 @@ export function createClawApprovalCapability(
         accountId && accountId !== "default"
           ? `channels.webchannel.accounts.${accountId}`
           : "channels.webchannel";
-      return `WebChannel supports native exec approvals for this account. Configure \`${prefix}.execApprovals.approvers\` (peer ids from your verifier) and set \`${prefix}.execApprovals.enabled\` to \`true\` or \`"auto"\`. The global fallback is \`commands.ownerAllowFrom\`.`;
+      return `WebChannel supports native exec approvals for this account. Configure \`${prefix}.execApprovals.approvers\` (peer ids from your verifier, or \`["*"]\` for every peer already authenticated on this account) and set \`${prefix}.execApprovals.enabled\` to \`true\` or \`"auto"\`. The global fallback is \`commands.ownerAllowFrom\`.`;
     },
     // Core's approval bootstrap checks the outer adapter's `isConfigured`
     // (above, which requires approvers AND enabled) BEFORE the native handler
@@ -1227,15 +1421,47 @@ export function shouldSuppressClawNativeExecApprovalPrompt(params: {
 export async function startClawApprovalMonitor(
   ctx: ChannelGatewayContext,
 ): Promise<void> {
+  // #267: THIS is the approval stream's lifetime boundary, so this is where the
+  // approval-origin replay barrier belongs. Registering the context below is
+  // what flips core's native approval handler on; a request the gateway replays
+  // from before this moment cannot be attributed to a run started after it, so
+  // it is refused rather than matched against whatever is running now.
+  //
+  // Rotation deliberately does NOT drop active claims: the queue lets a running
+  // handler settle instead of aborting it (`inbound-queue.ts:393`), and that
+  // handler still owns its lease until its own `finally`. A run already active
+  // at rotation retains its original pre-barrier `activatedAtMs`, which still
+  // orders strictly before a request it genuinely creates after the barrier. A
+  // handle created before rotation but activated after it instead reads and
+  // records a post-barrier start time at `onAgentRunStart` — the #267 case.
+  //
+  // Rotating here also keeps clock-trust recovery reachable: an anomalous clock
+  // read closes the epoch until the next rotation, and channel start is the only
+  // event left that draws one.
+  //
+  // Swallowed on failure: the getter throws when the versioned global slot holds
+  // an incompatible registry, and that must not take the channel down. It is not
+  // silent overall — the same getter throws loudly at
+  // `startAgentLifecycleSubscription` and on every turn, which is where it is
+  // actionable.
+  //
+  // ⚠️ Known gap, tracked separately: this monitor is per ACCOUNT while the
+  // registry's barrier is process-global, so one account's channel start fences
+  // another account's in-flight request. Same shape as #113. Correct fix is an
+  // account-scoped barrier; it is not in this change.
+  try {
+    getApprovalOriginRegistry().rotateEpoch();
+  } catch {
+    /* channel start continues */
+  }
   const registry = ctx.channelRuntime?.runtimeContexts;
   const registration = registry?.register({
     channelId: WEBCHANNEL_ID,
     accountId: ctx.accountId,
     capability: CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY,
-    // The native runtime spec talks straight to the transport WebSocket session
-    // map, so it needs no per-channel context payload; the registration's mere
-    // PRESENCE is what flips the bootstrap on. Empty object documents that.
-    context: {},
+    // The original monitor's signal fences late finalizers and cancels queued
+    // approval OUTPUT when this native handler stops.
+    context: { approvalAbortSignal: ctx.abortSignal },
     abortSignal: ctx.abortSignal,
   });
   try {
@@ -1301,6 +1527,42 @@ export class ApprovalBindingMissingError extends Error {
   }
 }
 
+/**
+ * #400: thrown by `handleApprovalDecision` for an AUTHZ refusal — a
+ * non-approver, or an approval delivered on another account. Still an
+ * error-level rejection (unlike `ApprovalBindingMissingError`); the class exists
+ * so the caller can tell the peer WHICH refusal without parsing the message.
+ *
+ * ⚠️ `name` IS DELIBERATELY LEFT AS `"Error"`: these were plain `Error`s, and
+ * the handler logs `logSafe(err)`, whose `String(err)` starts with the name. An
+ * override would change the operator-visible line. Identify it by `instanceof`.
+ */
+export class ApprovalDecisionForbiddenError extends Error {
+  constructor(
+    message: string,
+    readonly reason: "not-approver" | "cross-account",
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * #400: the wire reason for a `handleApprovalDecision` failure that PROVES the
+ * decision was not applied, or `undefined` for one that does not (a gateway RPC
+ * failure may have applied — a timeout — so it is not reported as a refusal).
+ */
+export function approvalDecisionRejectReason(err: unknown): ApprovalDecisionRejectReason | undefined {
+  if (err instanceof ApprovalBindingMissingError) return "not-pending";
+  if (err instanceof ApprovalDecisionForbiddenError) {
+    // A foreign-account live binding is indistinguishable from an id that is
+    // absent or finalized. Only a sender rejected within the bound account is
+    // told that it lacks approver authority. The server log keeps the more
+    // specific cross-account refusal unchanged.
+    return err.reason === "cross-account" ? "not-pending" : "not-approver";
+  }
+  return undefined;
+}
+
 export async function handleApprovalDecision(
   cfg: OpenClawConfig,
   approvalId: string,
@@ -1323,9 +1585,10 @@ export async function handleApprovalDecision(
     throw new ApprovalBindingMissingError(approvalId);
   }
   if (boundAccount !== bindingAccountKey(accountId)) {
-    throw new Error(
+    throw new ApprovalDecisionForbiddenError(
       `webchannel: approval ${logSafe(approvalId)} was delivered on account ` +
         `${logSafe(boundAccount)}, not ${logSafe(bindingAccountKey(accountId))} — refusing cross-account resolve`,
+      "cross-account",
     );
   }
 
@@ -1336,9 +1599,10 @@ export async function handleApprovalDecision(
   // an approver configured only on account A cannot resolve via account B's
   // channel. Legacy callers omit accountId and keep the default-account read.
   if (!isWebChannelExecApprovalApprover({ cfg, senderId, accountId })) {
-    throw new Error(
+    throw new ApprovalDecisionForbiddenError(
       `webchannel: peer ${logSafe(senderId)} is not a configured exec approver` +
         (accountId ? ` for account ${logSafe(accountId)}` : ""),
+      "not-approver",
     );
   }
   await resolveApprovalOverGateway({

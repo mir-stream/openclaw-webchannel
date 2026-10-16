@@ -1,3 +1,5 @@
+import { prepareCoreDispatch, registerCoreDispatchRecoveryService, waitForCoreDispatchRecovery } from "./dispatch-core-recovery.js";
+import { createDispatchRecovery, type DispatchRecovery } from "./dispatch-recovery.js";
 /**
  * WebChannel NATS per-account runtime and plugin definition.
  *
@@ -17,18 +19,22 @@ import { NatsChannel } from "./nats-channel.js";
 import type { RegisterChannelSurface } from "./nats-channel.js";
 import type { InboundWsMessage, NatsChannelCryptoOptions } from "./nats-channel.js";
 import { ConversationKeyStore } from "./conversation-key-store.js";
+import { openDeliveryJournal } from "./delivery-journal.js";
+import type { DeliveryJournal } from "./delivery-journal.js";
+import { tupleStoragePaths } from "./storage-paths.js";
+import { resolveDmPolicy, validateDmConfig } from "./dm-allowlist.js";
+import { ensureStorageIssuer, StorageIssuerError } from "./storage-issuer.js";
 import { createCapacityDiagnostics } from "./capacity-diagnostics.js";
 import { resolveEncryptionPolicy } from "./encryption-policy.js";
 import type { WebchannelEncryptionConfig } from "./encryption-policy.js";
 import { createWebChannelPlugin } from "./channel.js";
+import { nextMessageId } from "./message-adapter.js";
 import {
   handleInboundMessage,
   startAgentLifecycleSubscription,
   stopAgentLifecycleSubscription,
 } from "./inbound.js";
 import {
-  createSerializedInboundDispatcher,
-  coalesceUserMessages,
   normalizeInboundUserMessage,
 } from "./inbound-queue.js";
 import type { CoalescedMemberIds, SerializedInboundDispatcher } from "./inbound-queue.js";
@@ -45,21 +51,24 @@ import {
   type BoundedInboundDebouncer,
 } from "./bounded-inbound-debouncer.js";
 import { getProcessIngressOutcomeStore } from "./ingress-outcome.js";
-import { BoundedOverflowResolver } from "./inbound-overflow-resolver.js";
+import { BoundedOverflowResolver, type OverflowResolutionRequest } from "./inbound-overflow-resolver.js";
+import { createIngressDebounceCallbacks } from "./ingress-debounce-callbacks.js";
+import { createIngressPolicyGate } from "./ingress-policy.js";
+import { createDmIngressPolicy } from "./dm-allowlist.js";
 import { InboundPressureLogger } from "./inbound-pressure-log.js";
 import { isControlLaneMessage, shouldDropBufferedInputOnStop } from "./control-lane.js";
 import { resolveCommandGate } from "./command-gate.js";
+import { createStopControl } from "./stop-control.js";
 import { resolveInboundDebounceMs } from "openclaw/plugin-sdk/reply-runtime";
 import {
-  CancelledInboundFallbackTombstones,
   createIngressOnFlush,
-  recordCancelledInboundItems,
 } from "./ingress-dedupe.js";
 import {
   handleApprovalDecision,
   listPendingApprovalsForPeer,
   listResolvedApprovalsForPeer,
   ApprovalBindingMissingError,
+  approvalDecisionRejectReason,
 } from "./approvals.js";
 import type { ResolvedJwtVerifierConfig } from "./auth.js";
 import { formatAccountReadiness, type JwksReadiness } from "./preflight.js";
@@ -69,16 +78,11 @@ import {
 } from "./account-auth.js";
 import { PopChallengeStore } from "./pop-challenge.js";
 import { handleRegisterRequest } from "./nats-register.js";
-import {
-  recent as historyRecent,
-  pageBefore as historyPageBefore,
-  resolveHistoryConfig,
-  planHistoryFetch,
-  runDetachedHistoryRead,
-} from "./history.js";
+import { resolveHistoryConfig } from "./history.js";
+import { createHistoryServer, type HistoryServer } from "./history-serve.js";
 import { createCommandCatalogProvider } from "./commands-catalog.js";
-import { resolveWebchannelSessionRoute } from "./session-route.js";
-import { WEBCHANNEL_ID, type WebChannelPeerChannel } from "./channel-contract.js";
+import { WEBCHANNEL_ID, NullPeerChannel } from "./channel-contract.js";
+import type { ApprovalDecision, ApprovalDecisionRejectReason } from "./channel-contract.js";
 import {
   NatsConnectionClosedError,
   type NatsTransport,
@@ -98,6 +102,8 @@ import {
 import { planWebchannelAccount } from "./multiplex.js";
 import {
   loadPersistedCredentialDocument,
+  resolveReasoningDurable,
+  resolveReasoningEnabled,
   resolveTypingEnabled,
 } from "./account-config.js";
 import {
@@ -125,7 +131,6 @@ import {
   resolveAccountPublicationFailure,
   runAccountStartupLoop,
   resolvePrivateReadiness,
-  selectPrimaryRuntime,
   shouldLogRetryAttempt,
   waitForAbort,
 } from "./nats-account-coordinator.js";
@@ -160,7 +165,6 @@ export {
   runAccountStartupLoop,
   resolvePrivateReadiness,
   retryCeilingMs,
-  selectPrimaryRuntime,
   shouldLogRetryAttempt,
   waitForAbort,
 } from "./nats-account-coordinator.js";
@@ -196,6 +200,8 @@ export type {
 type AccountRuntime = {
   accountId: string;
   tenant: string;
+  /** Storage root the account's key store and journal were opened under. */
+  storageRoot?: string;
   channel: NatsChannel;
   transport: NatsTransport;
   enrolled?: EnrolledNatsConnection;
@@ -205,6 +211,13 @@ type AccountRuntime = {
   sessionTokens: Map<string, RetentionSessionToken>;
   inboundDebouncer: BoundedInboundDebouncer<any>;
   inboundDispatcher: SerializedInboundDispatcher<any>;
+  /**
+   * #344: the module-scope overflow resolver reaches this account's journal the
+   * same way it reaches its channel — through this map. Absent only for a
+   * runtime published before its journal opened, which cannot happen on the
+   * start path but is typed honestly rather than asserted.
+   */
+  deliveryJournal?: DeliveryJournal;
   owner: object;
   dispose: () => Promise<import("./nats-account-coordinator.js").DisposeReport>;
 };
@@ -227,18 +240,30 @@ const accountRuntimes = new Map<string, AccountRuntime>();
 /** One heap/failure-domain budget and outcome cache across every account. */
 const processInboundRetention = new InboundRetentionBudget();
 const processIngressOutcomes = getProcessIngressOutcomeStore();
-const processCancelledInboundFallback = new CancelledInboundFallbackTombstones(
-  (message) => console.warn(message),
-);
+function runtimeForOverflow(request: OverflowResolutionRequest): AccountRuntime | undefined {
+  const runtime = accountRuntimes.get(request.accountId);
+  return runtime && request.storageScope?.accountId === runtime.accountId
+    && request.storageScope.tenant === runtime.tenant
+    && runtime.sessionTokens.get(request.peerId) === request.sessionToken ? runtime : undefined;
+}
 const processOverflowResolver = new BoundedOverflowResolver({
   outcomeStore: processIngressOutcomes,
-  sendAck: ({ accountId, peerId, id }) =>
-    accountRuntimes.get(accountId)?.channel.sendAck(peerId, [id]) ?? false,
-  sendRejected: ({ accountId, peerId, id }) =>
-    accountRuntimes.get(accountId)?.channel.sendInboundRejected(peerId, [id]) ?? false,
-  onCancelledRecovered: ({ accountId, key }) => {
-    processCancelledInboundFallback.delete(key, accountId);
+  // #344: the accept authority, resolved per account exactly like `sendAck`
+  // below. A disposed runtime yields `undefined`, and a closed handle throws
+  // into the resolver's own catch — both leave the id unresolved, which is the
+  // fail-safe direction (the client replays and the flush path decides).
+  lookupUserRow: (request, idempotencyKey) => runtimeForOverflow(request)
+    ?.deliveryJournal?.lookupUserMessageIdByRandomId(request.peerId, idempotencyKey),
+  lookupConvergedRetry: (request) => {
+    const dispatch = runtimeForOverflow(request)?.deliveryJournal?.dispatch;
+    const prefix = `${request.peerId}:`;
+    const key = request.key.startsWith(prefix) ? request.key.slice(prefix.length) : request.id;
+    return dispatch?.convergence(request.peerId, key);
   },
+  sendAck: (request, committed, cancelled) => runtimeForOverflow(request)
+    ?.channel.sendAck(request.peerId, [request.id], committed, cancelled ? [request.id] : undefined) ?? false,
+  sendRejected: (request) => runtimeForOverflow(request)
+    ?.channel.sendInboundRejected(request.peerId, [request.id]) ?? false,
 });
 const accountCoordinator = new NatsAccountRuntimeCoordinator();
 const aggregateTracker = new AccountServingAggregateTracker();
@@ -272,47 +297,38 @@ function reportServingAggregate(api: any): void {
   });
 }
 
-/**
- * Lazy transport facade.
- *
- * `createWebChannelPlugin` needs a transport at module-load time, but in NATS
- * mode the real `NatsChannel` only exists after its account lifecycle commits.
- * This Proxy forwards every transport method call to the live
- * `NatsChannel` once it is bound; before binding, method calls are no-ops
- * returning `false`. `NatsChannel` implements the outbound surface the plugin's
- * message/outbound adapters use (sendText, sendProgress, finalizeDraft,
- * sendTyping, sendApprovalRequest/Resolved — see `WebChannelPeerChannel`).
- */
-let boundChannel: NatsChannel | null = null;
-function rebindPrimary(): void {
-  const primary = selectPrimaryRuntime(accountRuntimes);
-  boundChannel = primary?.channel ?? null;
+/** Build the production facade over the account lifecycle's live runtime map. */
+export function createNatsWebChannelPlugin(
+  runtimes: ReadonlyMap<
+    string,
+    Pick<AccountRuntime, "channel"> & Partial<Pick<AccountRuntime, "tenant" | "storageRoot">>
+  >,
+  opts?: Omit<
+    NonNullable<Parameters<typeof createWebChannelPlugin>[1]>,
+    "resolveApprovalTransport" | "resolveOutboundTransport" | "resolveServingScope"
+  >,
+) {
+  // The outbound adapter resolves the current config to its exact listed id
+  // before consulting this live map. A stale/absent runtime cannot redirect it.
+  // Both capabilities use live account resolvers; there is no primary binding.
+  // Target admission and outbound routes prefer the live serving tuple, which
+  // is what inbound keyed this account's sessions and key store under.
+  return createWebChannelPlugin(new NullPeerChannel(), {
+    ...opts,
+    resolveOutboundTransport: (accountId) => runtimes.get(accountId)?.channel,
+    resolveApprovalTransport: (accountId) => runtimes.get(accountId ?? "default")?.channel,
+    resolveServingScope: (accountId) => {
+      const runtime = runtimes.get(accountId);
+      if (runtime?.tenant === undefined) return undefined;
+      return {
+        tenant: runtime.tenant,
+        ...(runtime.storageRoot !== undefined ? { storageRoot: runtime.storageRoot } : {}),
+      };
+    },
+  });
 }
 
-const lazyTransport: WebChannelPeerChannel = new Proxy({} as WebChannelPeerChannel, {
-  get(_t, prop) {
-    const target = boundChannel as unknown as Record<string, unknown> | null;
-    if (!target) return () => false;
-    const value = target[prop as string];
-    return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
-  },
-});
-
-/**
- * Create the WebChannel plugin, backed by the lazy NATS transport facade.
- *
- * S1 (accountId-aware approvals): the approval capability additionally gets a
- * PER-ACCOUNT transport resolver over `accountRuntimes`, so each account's
- * native approval handler (core starts one per configured account) delivers
- * and finalizes prompts on ITS OWN channel — never the primary facade. The
- * resolver reads the live map at call time (each account lifecycle publishes
- * only after its private wiring fence); an unscoped (null) context reads the
- * `"default"` account, and an unknown account falls back to the lazy facade
- * inside the capability (legacy primary behavior, never a dropped frame).
- */
-const webChannelPlugin = createWebChannelPlugin(lazyTransport, {
-  resolveApprovalTransport: (accountId) =>
-    accountRuntimes.get(accountId ?? "default")?.channel,
+const webChannelPlugin = createNatsWebChannelPlugin(accountRuntimes, {
   startNatsAccount: (ctx) => startNatsAccountLifecycle(ctx),
   onInvalidAccountId: (_cfg, invalid) => {
     const install = accountCoordinator.currentInstall();
@@ -374,46 +390,6 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
     // The account-specific I/O — JWT verify + the history snapshot — is injected
     // here; every identity check the HTTP route performed is preserved verbatim.
 
-    // Fire the STATELESS initial history snapshot for a just-registered peer:
-    // resolve the agent route, self-read the recent transcript detached (so
-    // `sessions.get` authorizes against a synthetic operator client — see
-    // historyReadScope), and seal it to the peer over `.out`. K is already
-    // established at register time and the client subscribes `.out` BEFORE it
-    // registers, so nothing is lost.
-    const sendHistorySnapshot = (
-      accountId: string,
-      servingTenant: string,
-      channel: NatsChannel,
-      historyConfig: ReturnType<typeof resolveHistoryConfig>,
-      peerId: string,
-    ): void => {
-      try {
-        // Same forced per-account-channel-peer key as the inbound WRITE site —
-        // so the snapshot reads THIS user's session, never the shared "main" one.
-        const route = resolveWebchannelSessionRoute(
-          api,
-          accountId,
-          peerId,
-          servingTenant,
-        );
-        void runDetachedHistoryRead(() =>
-          historyRecent(api, route.sessionKey, historyConfig.limit, api.logger),
-        )
-          .then((messages) => {
-            if (messages.length > 0) channel.sendHistory(peerId, messages);
-          })
-          .catch((err) => {
-            api.logger.error?.(
-              `webchannel: history snapshot failed for ${logSafe(peerId)}: ${logSafe(err)}`,
-            );
-          });
-      } catch (err) {
-        api.logger.error?.(
-          `webchannel: history snapshot resolution failed for ${logSafe(peerId)}: ${logSafe(err)}`,
-        );
-      }
-    };
-
     // -----------------------------------------------------------------------
     // Steps 0–7 (per account): build ONE serving runtime per configured account
     // -----------------------------------------------------------------------
@@ -446,10 +422,20 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
     }
 
     {
-      const { accountId, tenant, account } = plan;
+      const { accountId, tenant, account, storageRoot } = plan;
+      const storageScope = Object.freeze({ tenant, accountId });
       const accountNatsCfg = account.nats as WebchannelNatsConfig | undefined;
       const accountEncryption = account.encryption as WebchannelEncryptionConfig | undefined;
-      const accountDmSecurity = account.dmSecurity as string | undefined;
+      try {
+        validateDmConfig(account);
+      } catch (error) {
+        const detail = `Invalid DM policy: ${error instanceof Error ? error.message : String(error)}. Run openclaw doctor.`;
+        reportPermanent(accountId, "dm-policy-config-invalid", detail);
+        setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: detail }));
+        await waitForAbort(ctx.abortSignal);
+        return undefined;
+      }
+      const accountDmPolicy = resolveDmPolicy(account);
       const admission = "register-hop" as const;
 
       // Resolve the effective source before reading enrolled material. In
@@ -487,6 +473,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             accountId,
             saasBaseUrl: source.saasBaseUrl,
           }, {
+            migrateLegacy: false,
             ...(source.storageRoot !== undefined
               ? { storageRoot: source.storageRoot }
               : {}),
@@ -568,14 +555,14 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             admission: "register-hop",
             audience: accountId,
             buildError,
-            ...(account.dmSecurity !== undefined
-              ? { dmSecurity: String(account.dmSecurity) }
+            ...((account.dmPolicy ?? account.dmSecurity) !== undefined
+              ? { dmPolicy: String(account.dmPolicy ?? account.dmSecurity) }
               : {}),
           }).line;
         } catch { /* the stable permanent event below remains available */ }
         reportPermanent(
           accountId,
-          "jwt-auth-config-invalid",
+          err instanceof StorageIssuerError ? "storage-issuer-failed" : "jwt-auth-config-invalid",
           `${buildDetail}; fix the account JWT issuer and exactly-one JWKS source`,
         );
         setStatus(accountNeverServedStatusPatch({
@@ -642,6 +629,15 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       }
 
       const preflightIdentityKey = identityKey;
+      try {
+        ensureStorageIssuer({ tenant, accountId, storageRoot, issuer: effIssuer });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        reportPermanent(accountId, "storage-issuer-failed", detail);
+        setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: detail }));
+        await waitForAbort(ctx.abortSignal);
+        return undefined;
+      }
       // Keep one limiter per account lifecycle so transport restart attempts do
       // not reset capacity-rejection suppression and create a fresh log burst.
       const capacityDiagnostics = createCapacityDiagnostics({ logger: api.logger });
@@ -800,17 +796,62 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       }
 
       // Phase 6 review finding 1 (RESOLVED, not warned): a multi-user
-      // (register-hop) account no longer risks the SHARED-transcript leak on the
-      // history snapshot / load_history paths — webchannel FORCES its own
-      // per-account-channel-peer session scope regardless of the operator's
-      // global session.dmScope (see src/session-route.ts). The old startup
-      // dmScope="main" warning is therefore gone; the readiness line below
-      // reports the ENFORCED scope instead.
+      // (register-hop) account does not risk a SHARED-transcript leak on the
+      // WRITE path — webchannel FORCES its own per-account-channel-peer session
+      // scope regardless of the operator's global session.dmScope (see
+      // src/session-route.ts and `inbound.ts`). The old startup dmScope="main"
+      // warning is therefore gone; the readiness line below reports the ENFORCED
+      // scope instead.
+      //
+      // ⚠️ THE READ SIDE OF THAT FINDING IS NOW ANSWERED BY A DIFFERENT
+      // MECHANISM, so do not cite the session scope for it. Since #240 the
+      // history snapshot and `load_history` do not read core at all: they replay
+      // the plugin's delivery journal, which is scoped by its FILE PATH to one
+      // (tenant, accountId) and then by `conversationId === peerId` inside it.
+      // `session-route-tenant-isolation.test.ts` asserts the property against
+      // that mechanism.
 
       // ---- Step 2 (per account): create the encrypted NATS channel ---------
       // Subject namespace is webchannel.{tenant}.{accountId}.{peerId} — the
       // accountId is the wire identity (one namespace per account).
       let channel: NatsChannel;
+      // Resolved BEFORE the try so the history server can be constructed
+      // alongside the journal it reads; it is pure config and cannot throw.
+      const historyConfig = resolveHistoryConfig(
+        account as { capabilities?: { typing?: "on" | "off" } } | undefined,
+      );
+      // #242 half 1: does THIS account journal reasoning content? Resolved here,
+      // beside the other pure-config reads and from the same `account` binding
+      // `setTypingEnabled` uses below, so the policy is decided ONCE per account
+      // start rather than per outbound frame.
+      //
+      // ⚠️ DEFAULT OFF, AND IT IS NOT `capabilities.reasoning`. That key governs
+      // the LIVE LANE and keeps its #113 default-ON; this one governs plaintext
+      // on disk. `resolveReasoningDurable`'s docblock carries the argument —
+      // #113's default-ON was a decision to render a volatile live lane, and it
+      // does not inherit to a decision to permanently record plaintext to disk.
+      const reasoningDurable = resolveReasoningDurable(account);
+      // `| undefined` because the failure path below and `dispose()` further
+      // down both run on paths where the open never happened.
+      let deliveryJournal: DeliveryJournal | undefined;
+      // #240 half 2's history read path. Built INSIDE the try, from the `const`
+      // the open returns, so "a failed journal open fails the account start" is
+      // carried by `HistoryServerDeps.journal` being non-optional — an ordinary
+      // parameter type the compiler actually checks.
+      //
+      // ⚠️ THIS BINDING ITSELF IS NOT COMPILER-GUARDED, and an earlier revision
+      // of this comment claimed the equivalent and was wrong. Every read of it
+      // is inside a closure, and TypeScript suppresses definite-assignment
+      // analysis there — MEASURED: a `let x: T` never assigned on ANY path
+      // typechecks clean when its only reads are in closures.
+      //
+      // ⚠️ EXACTLY ONE THING CATCHES AN UNWIRED SERVER: the source-shape
+      // assertion in `index-nats-wiring.test.ts`. MEASURED — delete the
+      // `createHistoryServer({…})` block below and that file goes red while
+      // `history-serve.test.ts` stays GREEN, because the latter constructs its
+      // own server and structurally never reads this file. Do not delete that
+      // assertion believing the unit tests cover it; nothing else does.
+      let historyServer: HistoryServer;
       try {
         const keyStore = new ConversationKeyStore({
           tenant,
@@ -825,12 +866,57 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         // This probe is version-only and non-mutating; ordinary corruption
         // keeps the key store's existing lazy quarantine/audit policy.
         keyStore.assertNoFutureDocuments();
+        // v6 (#239): open the plugin's OWN durable store, from the SAME
+        // (tenant, accountId) tuple as the key store above —
+        // `deliveryJournalPath` is a field of that one path record, and
+        // `storage-paths.ts` records why the journal belongs beside the secrets
+        // rather than in core's shared state dir (it holds message PLAINTEXT).
+        //
+        // ⚠️ A FAILED OPEN FAILS THE ACCOUNT START — there is deliberately NO
+        // degrade-to-unjournaled path, which is why this sits inside the same
+        // `try` whose `catch` already converts `assertNoFutureDocuments()`'s
+        // throw into a failed start. Since #240 the journal is the ONLY history
+        // store, so a degrade path would serve normally while silently keeping
+        // and showing no history — the "green pipeline that ships nothing"
+        // failure mode. (It was already refused when the journal was still a
+        // shadow store, on the grounds that the cutover would make it mandatory.
+        // The cutover has landed; the rule now rests on the store itself.)
+        const journal = openDeliveryJournal({
+          databasePath: tupleStoragePaths({
+            tenant,
+            accountId,
+            ...(plan.storageRoot !== undefined
+              ? { storageRoot: plan.storageRoot }
+              : {}),
+          }).deliveryJournalPath,
+        });
+        deliveryJournal = journal;
+        // The 5th argument is `NatsChannelLimits` and stays defaulted here; the
+        // 6th is the v6 durability wiring. Constructor-only by design — see
+        // `NatsChannelDurability`.
         channel = new NatsChannel(transport, accountId, tenant, {
           ...cryptoOptions,
           keyStore,
           identityKeyPair: attemptIdentityKey,
+        }, undefined, { deliveryJournal, reasoningDurable });
+        // #240 half 2 — the read path, built here so it receives the SAME open
+        // handle as the channel's write path, as a `const` in direct flow. All
+        // history policy (deferral, the per-peer in-flight bound, the
+        // no-frame-on-failure rule) lives in `history-serve.ts`; what is left
+        // below is wiring.
+        historyServer = createHistoryServer({
+          journal,
+          channel,
+          config: historyConfig,
+          logger: api.logger,
         });
       } catch (err) {
+        // The journal can be open by the time `new NatsChannel(...)` throws (it
+        // is fail-closed on a missing attested identity key). A failed start is
+        // RETRIED by the startup loop, and `delivery-journal.ts`'s open docblock
+        // measured what each leaked handle costs — two descriptors plus a live
+        // WAL-checkpoint `Timeout` — so this must not accumulate per attempt.
+        try { deliveryJournal?.close(); } catch { /* the failed start owns no further cleanup */ }
         try { detachTransportListeners?.(); } catch { /* close still owns cleanup */ }
         const closeReport = await transport.closeGracefully();
         attemptAbort.dispose();
@@ -848,6 +934,76 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       log("info",
         `[webchannel] account "${accountId}" ✓ encrypted NATS channel (tenant=${tenant}, accountId=${accountId})`,
       );
+
+      // ── #242 half 2: THE CONFIG-TIME HALF OF THE REASONING DIAGNOSTIC ──
+      //
+      // `capabilities.reasoningDurable: true` yields ZERO journal rows whenever
+      // the lane never opens or opens empty, and there are THREE independent
+      // reasons for that — see the note below, which enumerates all three. Two
+      // of them are warned about, in two different places, and this warning is
+      // one of that pair; the split is why it exists rather than duplicating
+      // what already ships. (This line said "TWO independent reasons", which the
+      // note below has always contradicted with "⚠️ THERE IS A THIRD WAY". One
+      // of the two counts had to go, and the enumeration is the one that is
+      // checkable.)
+      //
+      //   THIS LINE          — `capabilities.reasoning` is OFF (channel config).
+      //                        Knowable AT CONFIG TIME, before a single turn
+      //                        runs, and FIXABLE by the operator: flip one key.
+      //   `inbound.ts`'s     — the lane OPENED and core delivered nothing all
+      //   `finally` warning    turn. That covers the other reason — core's
+      //                        `canShowReasoning` (`thinkingLevel === "off"`),
+      //                        which no channel config can force — and it can
+      //                        only be observed at RUNTIME, per turn.
+      //
+      // They are complementary, not redundant: the runtime one explicitly
+      // "only watches lanes that OPENED", so with `capabilities.reasoning` off
+      // it never fires at all. Without this line that combination is silent in
+      // both places, and half 2 is what makes the silence visible to a user —
+      // "I turned on durable reasoning and my history is empty."
+      //
+      // ⚠️ THERE IS A THIRD WAY THE LANE STAYS SHUT AND NEITHER WARNING COVERS
+      // IT — stated so the pair is not read as exhaustive. `inbound.ts` builds
+      // `reasoningEnabled` as `!controlLane && resolveReasoningEnabled(…) &&
+      // !hasExplicitSessionReasoningOptOut(…)`, and that last CONJUNCT (it read
+      // "disjunct"; the chain is `&&`) is a
+      // PEER's own persisted `/reasoning off`. Both warnings are silent for it,
+      // deliberately: it is a per-session user choice, not an operator
+      // misconfiguration, and there is nothing for the operator to fix. This
+      // line reads the SAME value `inbound.ts` does —
+      // `resolveWebchannelAccountConfig(api.config, accountId)`, which is what
+      // `plan.account` already is — so the two cannot disagree about the key.
+      //
+      // ⚠️ AND IT IS A DIAGNOSTIC, NEVER AN OVERRIDE. Do not make
+      // `reasoningDurable: true` imply the lane. `capabilities.reasoning: false`
+      // is an explicit privacy opt-OUT for a live surface, and letting a
+      // storage key silently reverse it defeats the reason the two keys were
+      // split (#113's default-ON is about RENDERING a volatile lane; it does
+      // not inherit to RECORDING plaintext at rest — `resolveReasoningDurable`'s
+      // docblock carries the argument).
+      //
+      // ⚠️ CADENCE: ONCE PER ATTEMPT THAT REACHES CHANNEL CREATION — not "once
+      // per SUCCESSFUL account start", which is what this said and is false.
+      // Failure returns exist BELOW this line as well as above it (the SUB/flush
+      // barrier and the outer catch both `return { kind: "failed" … }`), so a
+      // start that gets this far and then fails has already logged, and the
+      // retry loop logs again on every attempt. That is acceptable for a
+      // config-time diagnostic — the condition it reports is genuinely still
+      // true on each retry — but do not cite this line as a once-per-account
+      // guarantee the way `inbound.ts`'s `reasoningEmptyLaneWarned` latch is.
+      // That latch is once per account per process, re-armed only by a real
+      // teardown; this line has no latch at all.
+      if (reasoningDurable && !resolveReasoningEnabled(account)) {
+        log("warn",
+          `webchannel: capabilities.reasoningDurable is ON but capabilities.reasoning is OFF for ` +
+            `account=${logSafe(accountId)} — the reasoning lane never opens, so no reasoning frame ` +
+            `is ever produced and the delivery journal will record ZERO reasoning rows. History ` +
+            `will show none. To record reasoning, set channels.webchannel.capabilities.reasoning=true ` +
+            `(it defaults to true; something has switched it off). To stop recording, set ` +
+            `capabilities.reasoningDurable=false. Note the reverse combination — lane on, durable ` +
+            `off — is the shipped default and is fully supported.`,
+        );
+      }
 
       // #99: the dispatcher's message type is the wire frame PLUS the internal
       // member-id list `coalesceUserMessages` stamps on a merged turn. Widened
@@ -875,6 +1031,8 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       const pressureLogger = new InboundPressureLogger(
         (message) => (api.logger?.warn ?? console.warn)?.(message),
       );
+      let dispatchRecovery: DispatchRecovery | undefined;
+      let stopControl: ReturnType<typeof createStopControl<DebounceItem>> | undefined;
       let inboundDispatcher: SerializedInboundDispatcher<WebchannelUserMessage> | undefined;
       let inboundDebouncer: BoundedInboundDebouncer<DebounceItem> | undefined;
       let disposePromise: Promise<import("./nats-account-coordinator.js").DisposeReport> | undefined;
@@ -883,13 +1041,41 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         disposePromise = (async () => {
           const errors: Array<{ phase: string; error: unknown }> = [];
           runtimeActive = false;
+          try { dispatchRecovery?.dispose(); } catch (error) { errors.push({ phase: "dispatch-recovery", error }); }
           try { attemptAbort.dispose(); } catch (error) { errors.push({ phase: "attempt-abort-listener", error }); }
           try { inboundDebouncer?.dispose(); } catch (error) { errors.push({ phase: "debouncer", error }); }
           try { inboundDispatcher?.dispose(); } catch (error) { errors.push({ phase: "dispatcher", error }); }
-          try { processOverflowResolver.invalidateAccount(accountId); } catch (error) { errors.push({ phase: "overflow-resolver", error }); }
+          try { processOverflowResolver.invalidateAccount(storageScope); } catch (error) { errors.push({ phase: "overflow-resolver", error }); }
           sessionTokens.clear();
           try { detachTransportListeners?.(); } catch (error) { errors.push({ phase: "transport-listeners", error }); }
           try { channel.dispose(); } catch (error) { errors.push({ phase: "channel", error }); }
+          // ⚠️ AFTER `channel.dispose()`, NOT BEFORE. The channel journals on its
+          // egress path (persist-before-publish), so closing the handle first
+          // would leave a window where a send writes to a closed database. A
+          // disposed channel refuses to send at all, so nothing can reach the
+          // journal past this line. The ingress accept seam (wired below) writes
+          // WITHOUT going through the channel, so it needs its own reason: this
+          // function sets `runtimeActive = false` with no `await` before
+          // `close()`, and `createIngressOnFlush`'s span from its `isActive()`
+          // check to its last `append` is entirely synchronous — so an in-flight
+          // flush either resumes after dispose and takes the `invalidated` early
+          // return, or is already past it and cannot interleave. Inserting an
+          // `await` on either side of that span breaks this argument.
+          //
+          // ⚠️ THIS ENUMERATES WRITERS, AND SINCE #240 THERE IS ALSO A DEFERRED
+          // READER. `history-serve.ts` schedules its fold with `setImmediate`,
+          // so a snapshot or page scheduled just before teardown can run after
+          // `close()` and read a closed handle. That is contained rather than
+          // argued away: the read sits inside `runDeferred`'s `try`, so it
+          // logs "journal read failed" and sends no frame. The residual is a
+          // spurious `error`-level line during an ordinary shutdown, not a
+          // crash and not a lost message — the peer is going away with the
+          // account. Do not "fix" it by moving `close()` earlier; that trades a
+          // log line for the write window this ordering exists to prevent.
+          // `close()` is idempotent.
+          // Drain old session-wide aborts before a replacement can start new turns.
+          try { await stopControl?.dispose(); } catch (error) { errors.push({ phase: "stop-control", error }); }
+          try { deliveryJournal?.close(); } catch (error) { errors.push({ phase: "delivery-journal", error }); }
           const transportReport = await transport.closeGracefully();
           return { errors, transport: transportReport };
         })();
@@ -914,130 +1100,88 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // Each account gets its OWN serialized dispatcher bound to its channel and
       // accountId, so inbound turns resolve THIS account's route (binding.account)
       // and replies deliver back over THIS account's channel.
-      inboundDispatcher =
-        createSerializedInboundDispatcher<WebchannelUserMessage>(
-          (peerId, message) =>
-            handleInboundMessage(
-              api,
-              channel,
-              peerId,
-              message,
-              accountId,
-              tenant,
-            ),
-          {
-            // P1-8b layer (b): busy-time coalesce. A message that arrives while a
-            // turn is already running for its session buffers and is merged into
-            // ONE follow-up turn on completion (Telegram parity), instead of
-            // chaining a separate turn each.
-            coalesce: coalesceUserMessages,
-            budget: processInboundRetention,
-            sessionToken,
-          },
-        );
-      const cancelledInboundFallback = processCancelledInboundFallback;
-
-      // P1-8b layer (a): repo-owned bounded idle pre-run debounce (Telegram
-      // parity). It replaces core's unbounded primitive and sits IN FRONT of the
-      // per-session FIFO: rapid
-      // same-peer messages within the debounce window flush together as ONE
-      // merged turn. `resolveInboundDebounceMs` reads the GLOBAL config
-      // (`messages.inbound.byChannel.webchannel ?? messages.inbound.debounceMs ??
-      // 0`) — resolved ONCE here per account. The core default is 0ms, which makes
-      // this layer inert (each message flushes immediately) unless an operator
-      // opts in; layer (b) still coalesces busy-time regardless. We keep that
-      // default (do NOT invent a nonzero one). Items carry `peerId` so `buildKey`
-      // and `onFlush` can route; one explicit bounded worker owns each same-key
-      // sequence. Forced retirement severs queued batch captures, while a callback
-      // that already began keeps its copied entries charged until settlement.
+      if (!deliveryJournal?.dispatch) throw new Error("webchannel: durable dispatch store required");
       const inboundDebounceMs = resolveInboundDebounceMs({
         cfg: api.config,
         channel: WEBCHANNEL_ID,
       });
+      dispatchRecovery = createDispatchRecovery({
+        store: deliveryJournal.dispatch,
+        handler: (peerId, message, onSettled, ownership) => handleInboundMessage(api, channel, peerId, message, accountId, tenant, {
+          onSettled,
+          ...(ownership ? { dispatchAbortSignal: ownership.abortSignal } : {}),          ...(ownership ? { beforeCore: (agentId: string, sessionKey: string) => {
+            if (!dispatchRecovery!.owns()) throw new Error("webchannel: dispatch owner retired before core call");
+            prepareCoreDispatch(api.config, agentId, sessionKey, { owner: ownership.owner, batch: ownership.batch, peerId }, deliveryJournal!);
+          } } : {}),
+        }),
+        acquirePeer: (peerId) => channel.acquireRecoveryPeer(peerId),
+        notify: (change) => { channel.sendRequestState(change); },
+        isActive: () => runtimeActive,
+        warn: (error) => api.logger?.warn?.(`webchannel: dispatch recovery failed: ${logSafe(error)}`),
+        dispatcherOptions: { budget: processInboundRetention, sessionToken, debounceMs: inboundDebounceMs },
+      });
+      inboundDispatcher = dispatchRecovery.dispatcher;
+
+      // The bounded ingress worker persists each input and emits its receipt
+      // immediately. Only execution waits for the configured fixed window;
+      // dispatch retains the shared budget until the accepted work starts.
       const onIngressFlush = createIngressOnFlush<DebounceItem>({
         accountId,
+        storageScope,
         outcomeStore: processIngressOutcomes,
-        beginBatch: (peerId) => inboundDispatcher!.beginBatch(peerId),
-        sendAck: (peerId, ids) => channel.sendAck(peerId, ids),
+        beginBatch: (peerId) => dispatchRecovery!.beginBatch(peerId),
+        dispatchRecovery,
+        // #243 half 2a: forward the server-assigned-id echo so it rides the ack.
+        sendAck: (peerId, ids, committed, cancelled, unaccepted) => channel.sendAck(peerId, ids, committed, cancelled, unaccepted),
         sendInboundRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids),
-        cancelledFallback: cancelledInboundFallback,
+        // #245 Part B: broadcast a just-committed user message to the account's
+        // devices for immediate multi-device echo (Telegram model). One publish to
+        // the shared `.out` subject; the gap-sync path stays the fallback.
+        sendUserCommitted: (peerId, message) => channel.sendUserCommitted(peerId, message),
+        sendRequestState: (change) => channel.sendRequestState(change),
+        // v6 (#239 half 3): the SAME handle the channel got for the egress seam,
+        // opened above from this account's (tenant, accountId) tuple. Doc §15.7
+        // makes this write part of accepting a user message, so a missing handle
+        // here is not a degrade mode — `index-nats-wiring.test.ts` pins the line.
+        deliveryJournal,
         logInfo: (message) => api.logger?.info?.(message),
         logWarn: (message) => api.logger?.warn?.(message),
         isActive: () => runtimeActive,
       });
       inboundDebouncer = createBoundedInboundDebouncer<DebounceItem>({
-        debounceMs: inboundDebounceMs,
+        debounceMs: 0,
         buildKey: (item) => item.peerId,
         sessionToken: (peerId) => sessionToken(peerId),
         budget: processInboundRetention,
         // Charge the authenticated wire message only. `peerId` is routing
         // metadata on the repo-owned wrapper.
         measure: (item) => estimateRetainedMessageBytes(item.message),
-        getId: (item) => item.message.id,
-        isOverflowClaimed: (peerId, id) =>
-          processOverflowResolver.hasActiveClaim(accountId, `${peerId}:${id}`),
-        isCancelledFallback: (peerId, id) =>
-          cancelledInboundFallback.has(`${peerId}:${id}`, accountId),
-        peekOutcome: (peerId, id) =>
-          processIngressOutcomes.peek(accountId, `${peerId}:${id}`),
-        onKnownOutcome: (peerId, id, outcome) => {
-          if (outcome === "accepted") channel.sendAck(peerId, [id]);
-          else channel.sendInboundRejected(peerId, [id]);
-        },
-        onOverflow: ({ key: peerId, id, reason, chargedBytes, recoverCancelled }) => {
-          pressureLogger.record({
-            accountId,
-            internalReason: reason,
-            rejectedMessages: 1,
-            rejectedChargedBytes: chargedBytes ?? 0,
-            snapshot: processInboundRetention.snapshot(sessionToken(peerId)),
-          });
-          if (typeof id !== "string" || id.length === 0 || id.length > 128) return;
-          processOverflowResolver.tryStart({
-            accountId,
-            peerId,
-            id,
-            key: `${peerId}:${id}`,
-            sessionToken: sessionToken(peerId),
-            recoverCancelled,
-          });
-        },
+        ...createIngressDebounceCallbacks<DebounceItem>({
+          accountId,
+          storageScope,
+          outcomeStore: processIngressOutcomes,
+          overflowResolver: processOverflowResolver,
+          deliveryJournal,
+          sessionToken,
+          sendAck: (peerId, ids, committed, cancelled, unaccepted) => channel.sendAck(peerId, ids, committed, cancelled, unaccepted),
+          sendRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids),
+          onPressure: ({ key: peerId, reason, chargedBytes }) => {
+            pressureLogger.record({
+              accountId,
+              internalReason: reason,
+              rejectedMessages: 1,
+              rejectedChargedBytes: chargedBytes ?? 0,
+              snapshot: processInboundRetention.snapshot(sessionToken(peerId)),
+            });
+          },
+        }),
         onFlush: onIngressFlush,
-        onCancel: async (entries) => {
-          // P0-7b: a `/stop` cancels debounce-buffered messages that never reached
-          // onFlush, so they were never dedupe-recorded and never acked — yet the
-          // client's replay ledger still holds them. Record their ids (so an
-          // in-flight replay is dropped as accepted) and ACK them. The bounded
-          // debouncer keeps reservations charged until this callback settles.
-          await recordCancelledInboundItems(
-            entries.map((entry) => entry.item),
-            accountId,
-            async (key) => {
-              const result = await processIngressOutcomes.record(
-                accountId,
-                key,
-                "accepted",
-                { replaceOpposite: true },
-              );
-              if (result.status !== "recorded") throw result.error;
-              result.write.commit();
-              return true;
-            },
-            (peerId, ids) => channel.sendAck(peerId, ids),
-            (message) => api.logger?.warn?.(message),
-            cancelledInboundFallback,
-            () => entries.every((entry) => !entry.isRetired()),
-          ).catch((err) => {
-            api.logger?.warn?.(
-              `webchannel: cancelled-inbound handling failed: ${logSafe(err)}`,
-            );
-          });
-        },
+
       });
 
       const retirePeerIngress = (peerId: string): void => {
         inboundDebouncer!.cancelKey(peerId, { notify: false });
-        inboundDispatcher!.clearPending(peerId);
+        dispatchRecovery!.retirePeer(peerId);
         const token = sessionTokens.get(peerId);
         if (token) processOverflowResolver.invalidateSession(token);
         sessionTokens.delete(peerId);
@@ -1053,14 +1197,63 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // send the peer a hedged notice. See src/command-gate.ts for the traced
       // core paths (all testable logic lives in the imported typed helpers).
       const commandGate = resolveCommandGate(api.config, accountId);
+      stopControl = createStopControl<DebounceItem>({
+        journal: deliveryJournal,
+        recovery: dispatchRecovery,
+        debouncer: inboundDebouncer,
+        pendingOverflowKey: (peerId) => {
+          const token = sessionTokens.get(peerId);
+          return token ? processOverflowResolver.pendingLogicalKey(token) : undefined;
+        },
+        retireOverflow: (peerId) => {
+          const token = sessionTokens.get(peerId);
+          if (token) processOverflowResolver.invalidateSession(token);
+        },
+        isActive: () => runtimeActive,
+        sendAck: (peerId, ids, committed, cancelled, unaccepted) => channel.sendAck(peerId, ids, committed, cancelled, unaccepted),
+        warn: (error) => api.logger?.warn?.(`webchannel: stop control failed: ${logSafe(error)}`),
+        dispatchControl: (peerId, message) => {
+          const operation = handleInboundMessage(api, channel, peerId, message, accountId, tenant, {
+            controlLane: true,
+            dispatchAbortSignal: attemptAbort.signal,
+          });
+          if (commandGate.delegated && !commandGate.isListed(peerId)) {
+            try {
+              channel.sendText(peerId,
+                "Stop may not be permitted for this user: this agent restricts " +
+                  "commands to an operator allowlist.",
+                nextMessageId());
+            } catch { /* Feedback failure cannot release ownership of the core call. */ }
+          }
+          return operation;
+        },
+      });
+      const dmIngressPolicy = createDmIngressPolicy({
+        accountId,
+        config: account,
+        isActive: () => runtimeActive,
+        sendPairingReply: async (peerId, text) => {
+          if (!channel.sendText(peerId, text, nextMessageId())) throw new Error("webchannel: pairing challenge delivery failed");
+        },
+        warn: (error) => api.logger?.warn?.(`webchannel: ingress pairing failed: ${logSafe(error)}`),
+      });
+      const admitInbound = createIngressPolicyGate({
+        journal: deliveryJournal,
+        ...dmIngressPolicy,
+        sendRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids, "policy-denied"),
+        sendAck: (peerId, ids, committed, cancelled, unaccepted) => channel.sendAck(peerId, ids, committed, cancelled, unaccepted),
+        warn: (error) => api.logger?.warn?.(`webchannel: ingress policy receipt failed: ${logSafe(error)}`),
+      });
       channel.setMessageHandler((peerId, rawMessage) => {
         if (!runtimeActive) return;
         if (rawMessage.type !== "user_message") return; // approvals routed below
         // #99: rebuild the frame from its KNOWN wire fields before anything else
-        // touches it. The decode path is a cast (`JSON.parse(...) as
-        // InboundWsMessage`, nats-channel.ts) and its `user_message` case
-        // forwards the object with no field checks, so a peer could attach ANY
-        // property — including `coalescedIds`, which is plugin-internal state
+        // touches it. The door's decoder (#246 half A) refuses a malformed KNOWN
+        // field but passes UNKNOWN ones through untouched — the wire is additive,
+        // so an unrecognised field may belong to a newer peer — and the
+        // `user_message` case forwards the object as it stands. A peer can
+        // therefore still attach ANY property to a well-formed frame — including
+        // `coalescedIds`, which is plugin-internal state
         // meaning "these receipts settle with this turn". Stripping it here is
         // what makes `coalesceUserMessages` its ONLY producer: a peer cannot
         // name ids it never sent, cannot make the settle loop iterate a
@@ -1076,106 +1269,12 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         // ack, not the debouncer — may see the raw frame, and that guard counts
         // the reads above this line, so do not add one.
         const message: WebchannelUserMessage = normalizeInboundUserMessage(rawMessage);
-        // Control lane (P1-8a): an abort ("/stop"/"stop"/…) must reach core's
-        // fast-abort WHILE the running turn is live, so it must NOT queue behind
-        // that turn on the per-session FIFO. Dispatch it directly, fire-and-
-        // forget, as an authorized control-lane turn. All the testable logic
-        // lives in `isControlLaneMessage` + `handleInboundMessage` (both under
-        // tsc + vitest); this file just routes.
-        //
-        // Unlike the FIFO path (inbound-queue.ts swallows a rejected turn), this
-        // direct dispatch has no chain to absorb a throw, and the pre-try work in
-        // handleInboundMessage (config/admission/route resolution, sendTyping)
-        // runs OUTSIDE its internal try/catch — so we MUST attach a rejection
-        // handler here or an unhandledRejection would take down the gateway.
-        //
-        // Authorization note: if an operator sets `commands.allowFrom` that
-        // EXCLUDES this peer, core's fast-abort returns handled:false (verified
-        // dist-B2e1grFo.js:1281) and the abort frame falls through to a NORMAL
-        // turn that races the running one, hits core's busy gate, and is dropped
-        // as busy. No wedge and no double-delivery — the /stop is simply ignored
-        // for an unauthorized sender.
+        if (!admitInbound({ peerId, message })) return;
+        // Control receipts and exact cancellation targets commit together before
+        // ACK. A replay returns that receipt without invoking core or clearing
+        // input accepted after the original stop.
         if (isControlLaneMessage(message)) {
-          // P1-8b: an EXPLICIT "/stop" (typed, or the widget Stop button which
-          // sends the literal "/stop") wants the text queued behind the running
-          // turn gone too — mirroring core fast-abort clearing its own followup
-          // lanes. Drop this peer's buffered input on BOTH layers before
-          // dispatching the abort: (a) any messages waiting in the pre-run
-          // debounce window (`cancelKey`), and (b) any messages buffered during
-          // the running turn (`clearPending`). Log at info only when something
-          // was actually dropped.
-          //
-          // The destructive drop is gated by `shouldDropBufferedInputOnStop`,
-          // which narrows on TWO axes (both live in the tested predicate):
-          //  1. EXPLICIT "/stop" only, NOT the broader `isControlLaneMessage`
-          //     vocabulary — a "halt"/"stop please" still aborts the running turn
-          //     for core parity, but a false-positive NL match must never
-          //     silently destroy a queued follow-up. Only the unambiguous "/stop"
-          //     opts in.
-          //  2. AUTHZ ASYMMETRY — the drop is all-or-nothing with the abort, and
-          //     the abort is core's call. When a commands/owner allowlist is
-          //     configured, core IGNORES our control-lane stamp (see the hedge
-          //     below + command-gate.ts): a non-listed peer's abort is refused,
-          //     the running turn keeps going. Dropping their buffers then would be
-          //     a PARTIAL /stop — turn survives, queued input destroyed. So we
-          //     drop only when the gate says core will honor this peer's abort
-          //     (`!delegated || isListed`). The mirror is biased toward NOT
-          //     dropping, so its only error is skipping cleanup for a peer whose
-          //     abort actually succeeded (their follow-up runs after the abort) —
-          //     accepted over destroying input for a peer whose turn survives.
-          if (shouldDropBufferedInputOnStop(message, commandGate, peerId)) {
-            const debounceCancelled = inboundDebouncer!.cancelKey(peerId, { notify: true });
-            const pendingDropped = inboundDispatcher!.clearPending(peerId);
-            if (debounceCancelled || pendingDropped.length > 0) {
-              api.logger?.info?.(
-                `webchannel: /stop dropped buffered input (debounced=${debounceCancelled}, pending=${pendingDropped.length})`,
-              );
-            }
-          }
-          // P0-7b: ack the control-lane frame here too. It bypasses the
-          // debouncer/onFlush (and is never deduped), so without this its
-          // client-side ledger entry would never drain and every reconnect would
-          // replay the /stop. A replayed /stop that lands before this ack is a
-          // harmless no-op abort (accepted).
-          if (message.id && !channel.sendAck(peerId, [message.id])) {
-            api.logger?.warn?.(
-              `webchannel: control-lane ack failed for peer=${logSafe(peerId)} id=${logSafe(message.id)}`,
-            );
-          }
-          void handleInboundMessage(
-            api,
-            channel,
-            peerId,
-            message,
-            accountId,
-            tenant,
-            { controlLane: true },
-          ).catch((err) =>
-            api.logger?.error?.(
-              `webchannel: control-lane dispatch failed: ${logSafe(err)}`,
-            ),
-          );
-          // Feedback-only hedge for the stamp-ignored trap. Core's
-          // `resolveCommandSenderAuthorization` IGNORES our control-lane
-          // `access.commands.authorized` stamp whenever a commands/owner
-          // allowlist is configured (see src/command-gate.ts): a non-listed
-          // peer's /stop returns handled:false, falls through to a normal turn,
-          // and is dropped as busy — the run is NOT aborted and the widget's
-          // Stop button would otherwise sit silently inert with zero feedback.
-          // We STILL dispatch the abort above (core is the authority — the
-          // mirror can be wrong), and here we ADDITIONALLY warn the peer when
-          // our best-effort mirror says core will reject this sender. The gate
-          // is a conservative mirror biased toward showing this notice, so a
-          // false positive is only an extra hedged message, never a missed one.
-          // Best-effort send (ignore the boolean return), matching the rest of
-          // the outbound surface.
-          if (commandGate.delegated && !commandGate.isListed(peerId)) {
-            channel.sendText(
-              peerId,
-              "Stop may not be permitted for this user: this agent restricts " +
-                "commands to an operator allowlist.",
-            );
-          }
+          stopControl!.handle({ peerId, message }, shouldDropBufferedInputOnStop(message, commandGate, peerId));
           return;
         }
         // Normal inbound: through layer (a) debounce → onFlush → per-session FIFO
@@ -1196,46 +1295,66 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // S1: pass THIS account's id so the fail-closed approver check reads the
       // account's own `execApprovals.approvers` — a peer who is an approver on
       // another account cannot resolve approvals via this account's channel.
+      const notifyApprovalDecisionRejected = (
+        peerId: string,
+        id: string,
+        decision: ApprovalDecision,
+        reason: ApprovalDecisionRejectReason,
+      ): void => {
+        if (!runtimeActive) return;
+        try {
+          channel.sendApprovalDecisionRejected(peerId, id, decision, reason);
+        } catch (err) {
+          api.logger.warn?.(`webchannel: approval rejection notice failed (${logSafe(id)}): ${logSafe(err)}`);
+        }
+      };
       channel.setApprovalDecisionHandler((peerId, id, decision) => {
         void handleApprovalDecision(api.config, id, decision, peerId, accountId).catch((err) => {
           // A missing delivery binding is EXPECTED in normal multi-device flows
           // (a Leg C snapshot re-send racing a finalize, or two devices both
           // clicking) — log it at warn, not error. Genuine authz rejections
           // (non-approver, cross-account) stay at error.
+          //
+          // #400: both are PROOF the click was not applied, so the peer is told
+          // (the server, not the app, owns the outcome). Any other failure is
+          // the gateway RPC, which may have applied — no proof, no frame
+          // (`approvalDecisionRejectReason` returns undefined); the next
+          // register's snapshot reconciles that card.
           if (err instanceof ApprovalBindingMissingError) {
             api.logger.warn?.(`webchannel: approval resolve ignored (${logSafe(id)}): ${logSafe(err.message)}`);
           } else {
             api.logger.error?.(`webchannel: approval resolve failed (${logSafe(id)}): ${logSafe(err)}`);
           }
+          const reason = approvalDecisionRejectReason(err);
+          if (reason !== undefined) notifyApprovalDecisionRejected(peerId, id, decision, reason);
         });
       });
 
       // ---- Step 5 (per account): history load handler ----------------------
-      const historyConfig = resolveHistoryConfig(
-        account as { capabilities?: { typing?: "on" | "off" } } | undefined,
-      );
+      // Pure wiring. Everything that used to be inline here — the plan, the
+      // deferral, the per-peer in-flight bound, the failure policy — moved into
+      // `history-serve.ts`, where it can be tested against a real journal. The
+      // outer try/catch that used to wrap this went with it: it guarded
+      // `planHistoryFetch` (which cannot throw for any wire input — it is
+      // `typeof`/`Number.isFinite`/`Math.floor` over a literal the dispatcher
+      // always constructs) and `setImmediate`, so its `error` line was
+      // unreachable while still counting toward the #123 audit's coverage floor
+      // as if it were live. `servePage` is internally guarded end to end.
       channel.setLoadHistoryHandler((peerId, request) => {
-        try {
-          // Same forced key as the WRITE + snapshot sites — pagination reads
-          // THIS user's session, so older pages never leak another user's turns.
-          const route = resolveWebchannelSessionRoute(api, accountId, peerId, tenant);
-          // `planHistoryFetch` validates the wire `limit` (the NATS dispatch
-          // forwards it unvalidated) and picks paginate-vs-tail from `before`.
-          const plan = planHistoryFetch(request, historyConfig.pageSize);
-          void runDetachedHistoryRead(() =>
-            plan.kind === "page"
-              ? historyPageBefore(api, route.sessionKey, plan.beforeId, plan.limit, api.logger)
-              : historyRecent(api, route.sessionKey, plan.limit, api.logger),
-          )
-            .then((messages) => {
-              channel.sendHistory(peerId, messages);
-            })
-            .catch((err) => {
-              api.logger.error?.(`webchannel: history page failed for ${logSafe(peerId)}: ${logSafe(err)}`);
-            });
-        } catch (err) {
-          api.logger.error?.(`webchannel: history resolution failed for ${logSafe(peerId)}: ${logSafe(err)}`);
-        }
+        historyServer.servePage(peerId, request);
+      });
+
+      // ---- #244 half B (per account): get_difference catch-up handler --------
+      // Serves RAW events (`seq > afterSeq`) for the client to fold onto the view
+      // it already holds — NO reducer/projection, so it does not touch the #286
+      // quadratic replay. `afterSeq` and #356's `nonce` are both validated at the
+      // receive door (`inbound-wire-decode.ts`), so this hop only carries them;
+      // `serveDifference` echoes the pair back so the requesting device can
+      // recognise its own reply on the shared `.out`. It runs DEFERRED, so its
+      // read and its publish each carry their own catch — out there an escape
+      // would be an `uncaughtException`, not a dropped frame.
+      channel.setGetDifferenceHandler((peerId, afterSeq, nonce) => {
+        historyServer.serveDifference(peerId, afterSeq, nonce);
       });
 
       // ---- Step 5b (per account): command-catalog load handler (P0-3) ------
@@ -1313,12 +1432,12 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             wrapConversationKeyForDevice: (pid, key, clientNonce) =>
               registerChannel.wrapConversationKeyForDevice(pid, key, clientNonce),
             unregisterPeer: (pid) => registerChannel.unregisterPeer(pid),
-            sendHistorySnapshot: (pid) =>
-              sendHistorySnapshot(accountId, tenant, channel, historyConfig, pid),
+            sendHistorySnapshot: (pid) => historyServer.sendSnapshot(pid),
             // #15/#19: authoritative pending-approval snapshot PLUS recently-
             // resolved outcomes. BOTH store reads and the publish MUST be
-            // synchronous — one event-loop turn, NO await/.then() between them (do
-            // NOT imitate sendHistorySnapshot's detached-read shape above). The
+            // synchronous — one event-loop turn, NO await/.then()/`setImmediate`
+            // between them (do NOT imitate `sendSnapshot`'s deferred shape;
+            // history can afford a later turn, this cannot). The
             // §3.4 race analysis holds precisely BECAUSE finalize deletes the
             // pending entry AND records the resolved outcome before publishing
             // `approval_resolved`, and this is list→list→publish atomically — so a
@@ -1414,7 +1533,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         ...(effIssuer !== undefined ? { issuer: effIssuer } : {}),
         ...(effAudience !== undefined ? { audience: effAudience } : {}),
         ...(jwks !== undefined ? { jwks } : {}),
-        ...(accountDmSecurity !== undefined ? { dmSecurity: accountDmSecurity } : {}),
+        ...(accountDmPolicy !== undefined ? { dmPolicy: accountDmPolicy } : {}),
       });
       if (readiness.verdict === "FAIL") log("error", readiness.line);
       else if (readiness.verdict === "WARN") log("warn", readiness.line);
@@ -1424,8 +1543,6 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         if (runtimeRef && accountRuntimes.get(accountId) === runtimeRef) accountRuntimes.delete(accountId);
         published = false;
         try { reportServingAggregate(api); } catch { /* rollback continues */ }
-        if (boundChannel === channel) boundChannel = null;
-        try { rebindPrimary(); } catch { boundChannel = null; }
         setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: failedAttempts, lastError: "account publication rolled back" }));
       };
       let publicationFailureState: {
@@ -1446,6 +1563,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             runtimeRef = {
               accountId,
               tenant,
+              ...(storageRoot !== undefined ? { storageRoot } : {}),
               channel,
               transport,
               ...(enrolled ? { enrolled } : {}),
@@ -1454,12 +1572,14 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
               sessionTokens,
               inboundDebouncer: inboundDebouncer!,
               inboundDispatcher: inboundDispatcher!,
+              // #344: the overflow resolver's accept authority. Same handle the
+              // channel and the accept seam already hold.
+              ...(deliveryJournal ? { deliveryJournal } : {}),
               owner: ownerIdentity,
               dispose,
             };
             accountRuntimes.set(accountId, runtimeRef);
             published = true;
-            rebindPrimary();
             return runtimeRef;
           },
           writeServingStatus: () => writeStatus({
@@ -1481,6 +1601,11 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         });
         if (committed instanceof Promise) await committed;
         reportServingAggregate(api);
+        void waitForCoreDispatchRecovery().then(() => {
+          if (!runtimeActive) return;
+          dispatchRecovery!.start();
+          channel.setDispatchOwnerFence(() => dispatchRecovery!.owns());
+        }).catch(error => api.logger?.error?.(`webchannel: dispatch startup failed: ${logSafe(error)}`));
         markCommitted();
       } catch (err) {
         // If the helper already disposed, its synchronous snapshot still
@@ -1508,8 +1633,6 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         accountRuntimes.delete(accountId);
         published = false;
         reportServingAggregate(api);
-        if (boundChannel === channel) boundChannel = null;
-        try { rebindPrimary(); } catch { boundChannel = null; }
         setStatus({ connected: false, restartPending: false, reconnectAttempts: 0, lastError: null });
       }
       const disposeReport = await dispose();
@@ -1572,6 +1695,7 @@ export default defineChannelPluginEntry({
         stopAgentLifecycleSubscription();
       },
     });
+    registerCoreDispatchRecoveryService(api);
     accountCoordinator.installFull(api);
     api.logger.info(
       `webchannel: loaded plugin bundle (plugin=webchannel, source=${LOADED_PLUGIN_BUNDLE_PATH})`,

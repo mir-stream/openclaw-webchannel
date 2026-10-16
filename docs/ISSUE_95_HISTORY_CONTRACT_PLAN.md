@@ -1,5 +1,23 @@
 # Issue #95 — history 계약이 보존하는 범위
 
+> ⚠️ **SUPERSEDED 2026-08-26 by #240 half 2 — 이 문서가 기술하는 메커니즘은 더 이상
+> 존재하지 않는다.** 아래 본문 전체는 history 가 **core session transcript**
+> (`runtime.subagent` 의 session-message read) 에서 온다는 전제 위에 서 있고, 보존
+> 범위의 한계도 그 reader 가 받는 자료의 한계로 설명한다. 그 reader 는 패키지에서
+> 삭제됐다: 이제 history 는 플러그인 자신의 delivery journal 을 클라이언트의 reducer 로
+> replay 해서 만든다 (`journal-history.ts` + `history-serve.ts`, doc §15.6, NOT-list
+> N2).
+>
+> 결론이 바뀐 것은 **왜** 4 필드인가이다. 이 문서 자신의 판단(§1: "(2) 를 택한다 —
+> 보존 못 하는 것을 계약에 명시한다" — #95 는 두 선택지를 제시했을 뿐이고 (2) 를 고른
+> 것은 이 문서다)과 그 4 필드 wire 자체는 그대로지만, 그 한계가 이제 core 자료의
+> 한계에서 **journal event 모델의 한계**로 옮겨갔다 (#241 이 event union 을 넓히는
+> 슬라이스다). **"core transcript 가 X 를 안 갖고 있어서 못 한다" 는 형태의 논증을 이
+> 문서에서 인용하지 말 것** — 전제가 사라졌다.
+>
+> 역사 기록으로 남긴다. 본문은 고치지 않는다.
+
+
 - 이슈: [#95](https://github.com/mir-stream/openclaw-webchannel/issues/95)
 - OpenClaw 기준 버전: `2026.6.10`
 - 관련: [#114](https://github.com/mir-stream/openclaw-webchannel/issues/114) (delivery mirror), [#111](https://github.com/mir-stream/openclaw-webchannel/issues/111) (live bubble 대응), [#109](https://github.com/mir-stream/openclaw-webchannel/pull/109) (tool-calling fixture)

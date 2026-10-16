@@ -17,16 +17,51 @@ import {
   stripInlineDirectiveTagsForDelivery,
 } from "openclaw/plugin-sdk/text-chunking";
 
+import { DurableSendError } from "./durable-send-error.js";
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
+import { resolveOutboundTransport, type ResolveOutboundTransport } from "./outbound-account.js";
+import { requireOutboundPeerId } from "./outbound-target.js";
 
 /**
  * Stable per-message id we generate for each outbound logical send. This becomes
  * the receipt's primary platform id (the editable handle core would use) AND the
  * WS frame id the widget keys its bubble on, so a progress draft and its final
  * answer share one id.
+ *
+ * #238: this is now THE mint point for every delivery act on this channel, not
+ * just this adapter's. The plugin owns message identity and assigns it at the
+ * moment it delivers — exactly like core's built-in Telegram extension keeps the
+ * `message_id` the platform hands back at first send. We ARE the platform here,
+ * so we mint locally.
+ *
+ * THE INVARIANT: one mint point, one id shape, and every durable-text egress
+ * site calls it. All six, deliberately UNNUMBERED here — the tests own the
+ * "site N" numbering and it counts only the four sites #238 changed, so a
+ * second numbering in this docblock would make "site 4" mean two different
+ * files depending on which file you are reading:
+ *   - inbound.ts's unclaimed-delivery reply         -> tests' site 1
+ *   - inbound.ts's thrown-turn apology              -> tests' site 2
+ *   - channel.ts's core-initiated outbound seam     -> tests' site 3
+ *   - nats-account-runtime.ts's command-gate notice -> tests' site 4
+ *   - this adapter's own `send.text`                -> already minted at base
+ *   - the progress-draft finalize path (nats-channel.ts's `finalizeDraft` ->
+ *     `sendText`), minted right here                -> already minted at base
+ * So #238 changed the first four; the adapter's `send.text` and the draft path
+ * already minted through this function before the slice. The draft path is
+ * listed anyway because under `streaming.mode: "partial"` — what the product
+ * actually runs — it is the channel's PRIMARY durable-text egress, so an
+ * enumeration that omits it reads as complete while being the least
+ * representative half of the truth. No other id shape may be introduced, and
+ * the client must never mint one for a durable bubble (NOT-list N4/N5).
+ *
+ * The receipt half is SEPARATE and narrower: only two of these six report an id
+ * to core at all (this adapter's `send.text` and channel.ts's outbound seam —
+ * the other four return neither a `messageId` nor a receipt). Where a site does
+ * report one, it reports this same id, so core's receipt and the client's
+ * bubble never end up as two names for one message.
  */
-function nextMessageId(): string {
+export function nextMessageId(): string {
   return `webchannel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
@@ -88,7 +123,10 @@ export function buildClawReceipt(id: string): MessageReceipt {
  * We return a real receipt whose primary id is our generated per-message id;
  * this is also the fallback send used if core ever drives the adapter directly.
  */
-export function createClawMessageAdapter(transport: WebChannelPeerChannel) {
+export function createClawMessageAdapter(
+  transport: WebChannelPeerChannel,
+  resolveAccountTransport?: ResolveOutboundTransport,
+) {
   return defineChannelMessageAdapter({
     id: WEBCHANNEL_ID,
     // Final delivery is plain text only.
@@ -104,9 +142,11 @@ export function createClawMessageAdapter(transport: WebChannelPeerChannel) {
       text: async (ctx): Promise<ChannelMessageSendResult> => {
         const id = nextMessageId();
         // `ctx.to` is the recorded reply target — the REAL per-peer `wsKey`
-        // (inbound.ts records `reply.to = wsKey`). Target it directly; if it's
-        // absent or the targeted send fails, throw before fabricating any
-        // receipt (P0-1 removed recipient guessing; P0-4 makes failure honest).
+        // (inbound.ts records `reply.to = wsKey`). Target it directly after the
+        // shared grammar strips an explicit `webchannel:`/`user:` prefix (#402);
+        // if it's absent, malformed or the targeted send fails, throw before
+        // fabricating any receipt (P0-1 removed recipient guessing; P0-4 makes
+        // failure honest).
         //
         // P0-4 (review R2): throwing is safe ONLY because core never re-sends a
         // thrown outbound. Traced in openclaw 2026.6.10 (the installed version and
@@ -123,9 +163,11 @@ export function createClawMessageAdapter(transport: WebChannelPeerChannel) {
         if (!ctx.to) {
           throw new Error("[webchannel] message.send.text failed: ctx.to is absent");
         }
-        if (!transport.sendText(ctx.to, ctx.text, id)) {
+        const peerId = requireOutboundPeerId(ctx.to);
+        const target = resolveOutboundTransport(ctx, transport, resolveAccountTransport);
+        if (!target.sendText(peerId, ctx.text, id)) {
           throw new Error(
-            `[webchannel] message.send.text failed: targeted send returned false for peer ${ctx.to}`,
+            `[webchannel] message.send.text failed: targeted send returned false for peer ${peerId}`,
           );
         }
         return { receipt: buildClawReceipt(id), messageId: id };
@@ -176,28 +218,39 @@ type AssistantDraftLane = {
    * identity, so its block cannot be matched and degrades to independent
    * delivery (recovery preserved).
    *
-   * DELIBERATELY SEPARATE from the barrier/reservation system, which keys off
-   * `lane.generation` via the knowingly-off-by-one `assistantMessageIndexMatchesLane`
-   * (:1401). This field is used ONLY by `laneForAssistantMessageIndex` for the
-   * #172 block-suppression decision and never feeds ordering.
+   * DELIBERATELY SEPARATE from the barrier/reservation system, which picks its
+   * lanes from lane STATE: no ordinal chooses a LANE there. That is the whole of
+   * the claim — the reservation system still READS the ordinal in three live
+   * places (it stores it on the reservation, it arms an indexless reservation's
+   * lane, and `outstandingRecordsAtIndex`/`retireOneRecordAtIndex` match on it to
+   * retire a barrier), and every one of those is load-bearing. Do not read
+   * "separate" as "the ordinal is unused over there" and delete a read on that
+   * basis; a review pass did exactly that to the arming branch and measured 19
+   * red on this tree, all of them the same shape — a lane held past the point it
+   * should have released, so the next message never streams.
+   *
+   * This field is used ONLY by `laneForAssistantMessageIndex` for the #172
+   * block-suppression decision and never feeds ordering.
+   *
+   * That separation is the whole point, so keep it: this stamp answers "which
+   * assistant message does this lane carry", which is a rendering question about
+   * a lane that already exists. It must never be inverted into "which lane does
+   * this record belong to" — an ordinal deciding a record's lane is the
+   * forbidden move (plan §0.2 N5), whatever the base arithmetic.
    */
   assistantMessageIndex?: number;
   /** Assigned only after a successful first wire frame for this lane. */
   id?: string;
+  /** A failed store retains this reservation for output-only retry. */
+  pendingReservation?: ProvisionalReservation;
   /** A provisional id is tentative for the duration of one send transaction. */
   tentativeProvisionalId?: string;
   answerText: string;
-  /**
-   * #173: did this lane ever receive non-empty VISIBLE answer text? Set true at
-   * the `lane.answerText = cleaned` assignment, which is AFTER the reasoning
-   * filter's early-return, so a reasoning-only partial never sets it. It is
-   * PERSISTENT: never cleared on close/rotate, so a lane the fail-safe rotated
-   * away still counts. `finalize` uses it as the answer-lane routing predicate:
-   * an ordinary final is paired with a text-bearing lane in generation order,
-   * never a tool-only/reasoning-only lane (see the collapse-aware routing in
-   * `finalize`). It tracks BOTH rotation paths (boundary and the `closeAndRotate`
-   * fail-safe) and never counts a reasoning partial the adapter filtered.
-   */
+  /** Last visible preview authored by this lane, never replaced by other finals. */
+  streamedAnswerText: string;
+  /** The current draft's own final was accepted for same-ID replacement. */
+  answerTextIsAuthoritative: boolean;
+  /** This lane received visible partial text, after reasoning/directive filtering. */
   streamedVisibleAnswerText: boolean;
   /**
    * The last RAW cumulative partial accepted into this lane, before reasoning /
@@ -289,17 +342,6 @@ type AuthorizedBlockDisposition = {
 type FinalReconciliationState = {
   ordinaryAnswerSettled: boolean;
   leadingTerminalErrorSeen: boolean;
-  /**
-   * #173: per-turn cursor counting how many ordinary (non-error, non-notice)
-   * answer-finals have already been routed to a lane this turn. The Nth such
-   * final settles the Nth target lane in generation order — see `finalize`. Core
-   * emits one ordinary final per text-bearing message when the last assistant
-   * message is tool-only (the #173 topology), and exactly ONE collapsed final
-   * (the last message's text) when the last message itself has text. The cursor
-   * lets order-based routing pair each final with the lane it belongs to instead
-   * of always overwriting `currentLane()`.
-   */
-  ordinaryAnswerFinalsRoutedToLanes: number;
 };
 
 type PendingProgressFrame =
@@ -526,6 +568,8 @@ function deferAngleMarkerTail(
  * they are delivered independently with their own sequence and wire id.
  */
 export type ProgressDraftController = {
+  /** True while any authored terminal output has not been accepted. */
+  readonly deliveryFailed: boolean;
   /**
    * Legacy cleanup signal for inbound: true means some wire frame succeeded
    * while the ordinary-answer terminal slot is still open. Inbound may use it
@@ -611,6 +655,8 @@ export function createProgressDraftController(params: {
   const newLane = (generation: number): AssistantDraftLane => ({
     generation,
     answerText: "",
+    streamedAnswerText: "",
+    answerTextIsAuthoritative: false,
     streamedVisibleAnswerText: false,
     lastRawAnswerText: "",
     lastPartialSourceText: "",
@@ -641,7 +687,6 @@ export function createProgressDraftController(params: {
     finalReconciliation: {
       ordinaryAnswerSettled: false,
       leadingTerminalErrorSeen: false,
-      ordinaryAnswerFinalsRoutedToLanes: 0,
     },
     lines: [],
     lastProgressSentAt: 0,
@@ -656,13 +701,46 @@ export function createProgressDraftController(params: {
   };
   const queue: SerialQueueState = { running: false, tasks: [] };
   let ordinaryFinalSendInProgress = false;
-  // #173: ordinary finals that arrived while the current lane was TEXTLESS, held
-  // in arrival order until drain. At finalize time the collapse-with-nonstreaming-
-  // last shape (K==1 → the final is the last/current lane's own text) is
-  // indistinguishable from the tool-only-last shape (K>=2 → one final per
-  // text-bearing lane); only the drain-time COUNT tells them apart. See
-  // `flushBufferedOrdinaryFinals` and `finalize`.
-  const bufferedOrdinaryFinals: string[] = [];
+  // Finals without an owned current draft wait for held predecessors to drain.
+  // Buffering controls delivery timing only; it never assigns a past lane.
+  const bufferedOrdinaryFinals: Array<{
+    text: string;
+    started: boolean;
+    complete: boolean;
+  }> = [];
+  // #212: wire ids of independent bubbles the plugin KNOWS carry answer content
+  // already represented by a lane in the `turn_snapshot`. Since #238 there is
+  // exactly ONE producer — the failed-lane recovery block in
+  // `deliverAuthorizedBlock`, the only `sendIndependent(…, { supersedesAnswerLane })`
+  // call — whose lane is in `answers` by its streamed text. (The overflow-final
+  // producer is gone: its flag's value was `streamed.length === finals.length`,
+  // unreachable at an overflow under the new candidate list.) The snapshot names
+  // these in `remove`
+  // so the client drops exactly them and preserves every other agent bubble
+  // (notices/errors). A missed id leaves a corruption bubble; a wrongly-added id
+  // would lose content — captured ONLY at that one mint site, never from a
+  // notice/error path.
+  const supersededAnswerBubbleIds = new Map<string, AssistantDraftLane>();
+  // Retry only known-rejected channel output, never the agent task. Each closure
+  // retains its delivery reservation and authored payload. Later revisions of a
+  // lane replace that lane's pending attempt under the same reserved ID.
+  const pendingDurableSends = new Map<string, () => boolean>();
+  const failedTerminalSends = new Set<string>();
+  const attemptSend = (key: string, terminal: boolean, send: () => boolean): boolean => {
+    try {
+      const accepted = send();
+      pendingDurableSends.delete(key);
+      if (accepted) failedTerminalSends.delete(key);
+      else if (terminal) failedTerminalSends.add(key);
+      return accepted;
+    } catch (error) {
+      if (error instanceof DurableSendError) {
+        pendingDurableSends.set(key, () => attemptSend(key, terminal, send));
+      }
+      if (terminal) failedTerminalSends.add(key);
+      return false;
+    }
+  };
 
   const warn = (message: string): void => {
     try {
@@ -804,28 +882,37 @@ export function createProgressDraftController(params: {
     options?: { speculative?: boolean },
   ): boolean => {
     const owner: ProvisionalClaimOwner = { kind: "lane", generation: lane.generation };
-    const reservation = lane.id
+    const reservation = lane.pendingReservation ?? (lane.id
       ? { owner, id: lane.id, usesPreview: false }
-      : reserveProvisional(owner, lane);
-    let sent = false;
-    let failure: DeliveryFailureKind | undefined;
-    try {
-      sent =
-        frameType === "progress"
+      : reserveProvisional(owner, lane));
+    const key = `lane:${lane.generation}`;
+    let failure: DeliveryFailureKind = "false";
+    const sent = attemptSend(key, frameType === "final", () => {
+      let accepted: boolean;
+      try {
+        accepted = frameType === "progress"
           ? transport.sendProgress(sessionKey, reservation.id, text, params.turnId) === true
           : transport.finalizeDraft(sessionKey, reservation.id, text, params.turnId) === true;
-      if (!sent) failure = "false";
-    } catch {
-      failure = "throw";
-    }
-    if (sent) {
-      lane.id ??= reservation.id;
-      lane.started = true;
-      lane.resolution = "materialized";
-      commitReservation(reservation, lane);
-      return true;
-    }
-    rollbackReservation(reservation, lane);
+      } catch (error) {
+        failure = "throw";
+        if (error instanceof DurableSendError) lane.pendingReservation = reservation;
+        throw error;
+      }
+      if (accepted) {
+        lane.id ??= reservation.id;
+        lane.pendingReservation = undefined;
+        lane.started = true;
+        lane.resolution = "materialized";
+        if (frameType === "final") lane.settleOutcome = true;
+        commitReservation(reservation, lane);
+      } else {
+        lane.pendingReservation = undefined;
+        rollbackReservation(reservation, lane);
+      }
+      return accepted;
+    });
+    if (sent) return true;
+    if (!pendingDurableSends.has(key)) rollbackReservation(reservation, lane);
     // A speculative attempt must never reduce what the lane is guaranteed at
     // drain: stamping `lastFailedDelivery` here would make
     // `laneTerminalSuppressed` true and delete text that was only ever HELD, not
@@ -839,6 +926,20 @@ export function createProgressDraftController(params: {
   const sendIndependent = (
     text: string,
     assistantMessageIndex?: number,
+    // #212: when this independent bubble carries answer content a lane ALSO
+    // represents in the snapshot's `answers`, record its wire id so the snapshot
+    // can name it in `remove` (the client then drops this duplicate). Set at ONE
+    // site — the failed-lane recovery block, whose lane is in `answers` by its
+    // streamed text. Never a notice, and (since #238) never an overflow final: the
+    // flag's old value there was `streamedLanes.length === finals.length`, which
+    // UNDER THE NEW CANDIDATE LIST is mutually exclusive with overflow, so it had
+    // no reachable true case. Scope that to the new list — under the OLD one
+    // (`materializedAnswerLanes()`) the two were perfectly compatible: 3 streamed,
+    // 2 materialized, 3 finals made the flag true WITH an overflow, which is the
+    // `remove: [tcId]` base's M212a asserted. And NOT because an overflow bubble's
+    // content never streamed — measured false, it often has (see the flush's
+    // no-target branch, which on a shortfall takes every final).
+    options?: { supersedesAnswerLane?: AssistantDraftLane; markComplete?: () => void },
   ): boolean => {
     if (!text) {
       warn("independent delivery skipped empty text without a transport attempt");
@@ -847,33 +948,23 @@ export function createProgressDraftController(params: {
     const sequence = ++state.nextDeliverySequence;
     const owner: ProvisionalClaimOwner = { kind: "independent", deliverySequence: sequence };
     const reservation = reserveProvisional(owner);
-    let sent = false;
-    let failure: DeliveryFailureKind | undefined;
-    try {
-      sent =
-        (assistantMessageIndex === undefined
-          ? transport.finalizeDraft(sessionKey, reservation.id, text, params.turnId)
-          : transport.finalizeDraft(
-              sessionKey,
-              reservation.id,
-              text,
-              params.turnId,
-              assistantMessageIndex,
-            )) === true;
-      if (!sent) failure = "false";
-    } catch {
-      failure = "throw";
+    const key = `independent:${sequence}`;
+    const sent = attemptSend(key, true, () => {
+      const accepted = (assistantMessageIndex === undefined
+        ? transport.finalizeDraft(sessionKey, reservation.id, text, params.turnId)
+        : transport.finalizeDraft(sessionKey, reservation.id, text, params.turnId, assistantMessageIndex)) === true;
+      if (accepted) {
+        commitReservation(reservation);
+        if (options?.supersedesAnswerLane) supersededAnswerBubbleIds.set(reservation.id, options.supersedesAnswerLane);
+      } else rollbackReservation(reservation);
+      options?.markComplete?.();
+      return accepted;
+    });
+    if (!sent && !pendingDurableSends.has(key)) {
+      rollbackReservation(reservation);
+      options?.markComplete?.();
     }
-    if (sent) {
-      commitReservation(reservation);
-      return true;
-    }
-    rollbackReservation(reservation);
-    warn(
-      `independent delivery sequence ${sequence} returned ${failure ?? "false"}; ` +
-        "its provisional claim was rolled back",
-    );
-    return false;
+    return sent;
   };
 
   /**
@@ -926,6 +1017,9 @@ export function createProgressDraftController(params: {
     const restored = deferred.terminalFallbackText;
     if (restored === lane.answerText) return;
     lane.answerText = restored;
+    // #212: a restored incomplete-prose tail is genuine streamed content — keep
+    // the snapshot's streamed source in step with it.
+    lane.streamedAnswerText = restored;
     lane.answerRevision += 1;
     acceptRawBaseline(lane, restored, { replace: true });
     if (lane.resolution === "empty" || lane.resolution === "unresolved") {
@@ -960,28 +1054,29 @@ export function createProgressDraftController(params: {
    * `sendLaneFrame` sets it on any successful send. A lane that never
    * materialized has shown the user nothing, so suppressing its terminal frame
    * invents no bubble — that is the defensible case M13g pins, and it stays.
+   *
+   * An authored final may still retry its own current-draft reservation. A
+   * buffered independent final never reopens a rejected past preview.
    */
   const laneTerminalSuppressed = (lane: AssistantDraftLane): boolean =>
     lane.resolution !== "materialized" && laneHasFailedCurrentRevision(lane);
 
-  // #173: the answer lanes an ordinary final may be routed to — lanes that
-  // streamed VISIBLE answer text AND actually reached the client
-  // (`resolution === "materialized"`). Requiring materialization excludes a lane
-  // that streamed but whose frame failed to ship (a transient disconnect): it
-  // rendered nothing, so it owns no bubble a final could top up, and a final that
-  // is really its own message's (arriving only in the final) must fall to the
-  // current-lane path instead — this is what keeps M13g's failed-lane-A shape
-  // settling B on its own preview id. Same predicate the removed keyframe count
-  // used, for the same reason.
-  const materializedAnswerLanes = (): AssistantDraftLane[] =>
-    state.lanes.filter(
+  // Used only to defer a new final behind already visible draft output. This
+  // predicate does not choose an ID or infer which assistant authored a final.
+  const hasMaterializedAnswerLane = (): boolean =>
+    state.lanes.some(
       (lane) => lane.streamedVisibleAnswerText && lane.resolution === "materialized",
     );
 
+  // Snapshot candidates carry only their own accepted terminal content.
+  const streamedAnswerLanes = (): AssistantDraftLane[] =>
+    state.lanes.filter((lane) => lane.streamedVisibleAnswerText);
+
   // #172: the lane carrying core's assistant message `assistantMessageIndex`, by
-  // the sound per-message stamp (NOT the barrier system's generation mapping).
-  // Read-only. Undefined for an unstamped index (no boundary opened a lane for
-  // it — e.g. a fail-safe rotation) or an indexless block.
+  // the sound per-message stamp this controller wrote itself. Read-only, and
+  // used ONLY for the #172 block-suppression decision — it never picks the lane
+  // a record attaches to. Undefined for an unstamped index (no boundary opened a
+  // lane for it — e.g. a fail-safe rotation) or an indexless block.
   const laneForAssistantMessageIndex = (
     assistantMessageIndex: number | undefined,
   ): AssistantDraftLane | undefined => {
@@ -1030,12 +1125,21 @@ export function createProgressDraftController(params: {
   ): AssistantDraftLane[] | undefined => {
     // A block queued ANYWHERE in this turn and not yet retired means we cannot
     // know a text-less predecessor is genuinely empty — its body may still be in
-    // flight. Deliberately turn-wide and lane-agnostic: which lane a reservation
-    // attached to (or whether it attached at all) is decided by
-    // `assistantMessageIndexMatchesLane`, whose index base is known-unsound on
-    // the pinned core, so the release must not depend on that answer. With a
-    // block outstanding we fall back to the documented turn-bounded delay, which
-    // `retireReservation` and terminal drain both clear.
+    // flight, and "text-less" is exactly what a lane whose only content is an
+    // undelivered block looks like. Releasing on that evidence would let the
+    // successor stream ahead of a block still on its way, which is a permanent
+    // bubble inversion, not a delay.
+    //
+    // Deliberately turn-wide and lane-agnostic, and it stays that way now that
+    // reservations attach by lane state rather than by an ordinal comparison.
+    // Attachment answers "which lane is held", which is a strictly narrower
+    // question than "is any block still owed in this turn" — a reservation whose
+    // own lane is the current one holds no successor at all, and this gate is
+    // what still covers that. It never depended on the attachment answer and
+    // must not start depending on it.
+    //
+    // With a block outstanding we fall back to the documented turn-bounded
+    // delay, which `retireReservation` and terminal drain both clear.
     if (state.blockReservations.some((reservation) => reservation.state === "pending")) {
       return undefined;
     }
@@ -1407,54 +1511,6 @@ export function createProgressDraftController(params: {
     }
   };
 
-  const assistantMessageIndexMatchesLane = (
-    assistantMessageIndex: number,
-    lane: AssistantDraftLane,
-  ): boolean => {
-    // KNOWN-UNSOUND ON THE PINNED CORE, and tolerated deliberately.
-    //
-    // Core stamps the queued-block context from the same payload metadata the
-    // delivery seam reads, and that stream is 1-BASED (measured on a real
-    // gateway: message A = 1, B = 2). Lane generations are 0-based, so this
-    // predicate is wrong on EVERY indexed turn, not in some edge case:
-    //   - it matches A's reservation (index 1) against lane generation 1 = B, so
-    //     the barrier lands on the SUCCESSOR, which never blocks that lane's own
-    //     progress (`predecessorsResolved` looks only at predecessors); and
-    //   - more commonly, when the block is queued while its own lane is still
-    //     current, generation 1 does not exist yet, `state.lanes.find` returns
-    //     undefined and NO barrier is created at all until the next rotation.
-    //
-    // An earlier version of this comment called the consequence a turn-bounded
-    // delay. That stopped being true when the empty-predecessor release timer
-    // landed: a mis-attached (or unattached) reservation leaves the real
-    // predecessor text-less with an empty barrier list, i.e. releasable, and the
-    // successor then streams ahead of a block that is still in flight —
-    // inverting the two bubbles rather than delaying one.
-    //
-    // What makes tolerating it safe is `releasableEmptyPredecessors`, which
-    // refuses to release while ANY reservation in the turn is still pending,
-    // whatever lane it did or did not attach to. Correcting the mapping itself
-    // needs a real index→lane identity and belongs to #111; guessing an offset
-    // here would bind us to an observed core version instead of a contract.
-    return assistantMessageIndex === lane.generation;
-  };
-
-  const attachIndexedReservations = (lane: AssistantDraftLane): void => {
-    if (!state.lateReservationEpochOpen) return;
-    for (const reservation of state.blockReservations) {
-      if (
-        reservation.state !== "pending" ||
-        reservation.barrierGeneration !== undefined ||
-        reservation.assistantMessageIndex === undefined ||
-        !assistantMessageIndexMatchesLane(reservation.assistantMessageIndex, lane)
-      ) {
-        continue;
-      }
-      reservation.barrierGeneration = lane.generation;
-      lane.tentativeBarrierReservationIds.push(reservation.token);
-    }
-  };
-
   const closeAndRotate = (): void => {
     const lane = currentLane();
     resolveDeferredAngleMarkerTail(lane);
@@ -1471,7 +1527,12 @@ export function createProgressDraftController(params: {
     }
     const next = newLane(lane.generation + 1);
     state.lanes.push(next);
-    attachIndexedReservations(next);
+    // No late attachment pass here on purpose. Every block reservation picks its
+    // barrier lane from LANE STATE at queue time (`noteBlockReplyQueued`), so
+    // there is no such thing as a reservation still waiting for the lane that
+    // will "match" it. The rotation-time rescan that used to live here existed
+    // only to retry an ordinal→generation comparison; see the reservation
+    // docblock for why that comparison is gone.
     releaseReadyLanes({ emitCurrentProgress: false });
   };
 
@@ -1540,6 +1601,16 @@ export function createProgressDraftController(params: {
    * retiring one record per settlement drains them all whatever order they
    * arrive in, and the block reservation — the only record that is an ordering
    * barrier — is released last at its index.
+   *
+   * CALLER DEPENDENCY, so a change here does not silently break it:
+   * `noteBlockReplyQueued`'s arming branch is a capability test on THIS
+   * function. It arms a lane exactly when a reservation is un-retirable before
+   * drain, and "un-retirable" means precisely what this function refuses — the
+   * `undefined` bail below, and the strict-equality index match in
+   * `outstandingRecordsAtIndex`. Widen either one so that indexless records can
+   * be matched, and that arming predicate becomes wrong: it would keep arming
+   * lanes that are now retirable, over-holding them. (Safe direction — it stalls,
+   * it never inverts — but it is still a stall, so go update the branch.)
    */
   const retireOneRecordAtIndex = (
     assistantMessageIndex: number | undefined,
@@ -1592,19 +1663,44 @@ export function createProgressDraftController(params: {
       resolveSettle = resolve;
     });
     invalidateScaffoldWriter();
-    let sent = false;
-    try {
-      sent = transport.finalizeDraft(sessionKey, preview.id, preview.text, params.turnId) === true;
-    } catch {
-      warn("provisional preview cleanup delivery threw");
-    }
+    const sent = attemptSend("preview", true, () => {
+      const accepted = transport.finalizeDraft(sessionKey, preview.id, preview.text, params.turnId) === true;
+      preview.settleOutcome = accepted;
+      if (accepted) {
+        state.durableDeliverySucceeded = true;
+        state.started = true;
+      }
+      return accepted;
+    });
     preview.settleOutcome = sent;
-    if (sent) {
-      state.durableDeliverySucceeded = true;
-      state.started = true;
-    }
     resolveSettle(sent);
     return sent;
+  };
+
+  // Reconcile only lanes with an accepted terminal frame, reusing their IDs.
+  // An unfinalized or rejected lane cannot become durable just because this
+  // callback ran. Recovery bubbles are removed only when their replacement is
+  // included in this snapshot. Pending store writes must complete first.
+  const emitTurnSnapshot = (): void => {
+    const turnId = params.turnId;
+    // No correlation key ⇒ the client cannot scope the reconciliation to a turn.
+    if (turnId === undefined) return;
+    if (typeof transport.sendTurnSnapshot !== "function") return;
+    if (pendingDurableSends.size > 0) return;
+    const answers = streamedAnswerLanes()
+      .filter((lane) => lane.id !== undefined && lane.settleOutcome === true)
+      .map((lane) => ({
+        id: lane.id!,
+        text: lane.answerTextIsAuthoritative ? lane.answerText : lane.streamedAnswerText,
+      }));
+    const answerIds = new Set(answers.map((answer) => answer.id));
+    const remove = [...supersededAnswerBubbleIds]
+      .filter(([, lane]) => lane.id !== undefined && answerIds.has(lane.id))
+      .map(([id]) => id);
+    if (answers.length === 0 && remove.length === 0) return;
+    attemptSend("snapshot", true, () =>
+      transport.sendTurnSnapshot(sessionKey, turnId, answers, remove) === true,
+    );
   };
 
   const terminalDrain = (settleCurrent: boolean): void => {
@@ -1616,13 +1712,16 @@ export function createProgressDraftController(params: {
     });
     if (settleCurrent) {
       settlePreviewIfAlone();
-      // #173: the terminal settle is the point where the buffered-final count is
-      // finally known, so it is where the textless-currentLane finals resolve.
+      // Held predecessors are settled before independent buffered delivery.
       flushBufferedOrdinaryFinals();
+      // #212: emit AFTER the flush (lane text + superseded ids now final).
+      emitTurnSnapshot();
     }
   };
 
-  const deliverTerminalIndependent = (text: string): boolean => {
+  // Independent delivery owns its own ID, including unclaimed ordinary finals.
+  // Only an explicitly known recovery block may later supersede another ID.
+  const deliverTerminalIndependent = (text: string, markComplete?: () => void): boolean => {
     // ONE STORY, in the order it happens:
     //
     // 1. Retire tentative state, which opens ordering barriers.
@@ -1643,24 +1742,22 @@ export function createProgressDraftController(params: {
     resolveDeferredAngleMarkerTail(currentLane(), { preserveExact: true });
     retireTentativeState();
     emitHeldLaneTextBeforeIndependentDelivery();
-    const sent = sendIndependent(text);
+    const sent = sendIndependent(text, undefined, { markComplete });
     releaseReadyLanes({ emitCurrentProgress: false });
     return sent;
   };
 
-  // #173: apply an ordinary final's authoritative text to a lane and settle it on
-  // that lane's OWN id. A lane other than the current one has already auto-settled
-  // with its last partial (`releaseReadyLanes` at its boundary); the final may
-  // carry a tail the partials never emitted, so top it up on the same id rather
-  // than dropping it (`settleLane` no-ops on an already-settled lane). Wrapped in
-  // the re-entrancy latch because the synchronous transport send can call back
-  // into `finalize`. Does NOT reset the deferred-angle-marker tail — callers do
-  // that first, before any `terminalDrain`, so the tail resolver sees it cleared.
+  // Complete the owned current draft on its retained delivery handle, including
+  // a final-only tail. The re-entrancy latch prevents a synchronous transport
+  // callback from consuming that same handle twice. The caller clears deferred
+  // marker state before terminalDrain so provisional text cannot replace a final.
   const emitAuthoritativeFinalOnLane = (
     target: AssistantDraftLane,
     text: string,
+    options?: { authoritative?: boolean },
   ): boolean => {
     target.answerText = text;
+    if (options?.authoritative === true) target.answerTextIsAuthoritative = true;
     target.answerRevision += 1;
     discardPendingProgress(
       (frame) => frame.kind === "lane" && frame.generation === target.generation,
@@ -1675,47 +1772,30 @@ export function createProgressDraftController(params: {
     }
   };
 
-  // #173: resolve the finals that `finalize` buffered while the current lane was
-  // textless. Called from the terminal drain, where the count K is known.
+  // These delivery acts arrived with no owned current answer draft. Retain their
+  // arrival order until terminal drain, then mint/claim a separate delivery ID
+  // for EACH one. Closed lanes are never candidates: core may dedupe finals or
+  // produce text only at message-end, so neither count nor order correlates this
+  // array with past drafts. A retry stays inside sendIndependent and reuses that
+  // act's reservation. The rejected head keeps its unsent suffix here; completion
+  // only marks that entry, and drain resumes the FIFO without recursive sends.
+  // The snapshot leaves all these independent IDs intact.
   const flushBufferedOrdinaryFinals = (): void => {
-    if (bufferedOrdinaryFinals.length === 0) return;
-    const finals = bufferedOrdinaryFinals.splice(0);
-    //   K == 1 → the single final is the last (current, textless) message's own
-    //            text: a collapse whose last message streamed no partial, or a
-    //            lone message with no partial. Settle the current lane on its id.
-    //            (Case X — a single streamed answer followed by a tool-only last
-    //            message — also lands here: the final tops up the tool-only
-    //            current lane, matching prior behaviour. The sound fix needs a
-    //            per-message final identity core does not expose; deferred to the
-    //            Phase 3 snapshot.)
-    //   K >= 2 → the tool-only-last (#173) shape: one final per text-bearing
-    //            message, in generation order. The textless current (tool-only)
-    //            lane receives none. Overflow → an independent bubble.
-    //
-    // KNOWN LIMITATION (K>=2), same #111 final-identity ceiling as Case X above:
-    // this positional pairing assumes every text-bearing lane materialized. If a
-    // MIDDLE lane's frame dropped on a transient wire failure (topology
-    // A,B,C[,tool]; B never ships), `materializedAnswerLanes()` correctly excludes
-    // B (per M13g), so pairing shifts — tB lands on C, tC overflows to an
-    // independent bubble. Finals are identity-less, so nothing at this layer can
-    // soundly recover which lane tB belongs to; any "safer" degradation only
-    // trades lane corruption for a stray bubble. Exotic (3+ text lanes + tool-only
-    // last + a mid-sequence drop) and self-heals on reload. The sound fix is the
-    // Phase 3 authoritative snapshot. Pinned by M173e; do NOT add mitigation here.
-    const targets = finals.length === 1 ? [currentLane()] : materializedAnswerLanes();
-    finals.forEach((text, index) => {
-      const target = targets[index];
-      if (!target) {
-        deliverTerminalIndependent(text);
-        return;
+    while (bufferedOrdinaryFinals.length > 0) {
+      const head = bufferedOrdinaryFinals[0]!;
+      if (!head.started) {
+        head.started = true;
+        deliverTerminalIndependent(head.text, () => { head.complete = true; });
       }
-      target.deferredAngleMarkerTail = undefined;
-      target.lastPartialSourceText = "";
-      emitAuthoritativeFinalOnLane(target, text);
-    });
+      if (!head.complete) return;
+      bufferedOrdinaryFinals.shift();
+    }
   };
 
   return {
+    get deliveryFailed() {
+      return pendingDurableSends.size > 0 || failedTerminalSends.size > 0;
+    },
     get started() {
       return state.started && !state.finalReconciliation.ordinaryAnswerSettled;
     },
@@ -1870,10 +1950,10 @@ export function createProgressDraftController(params: {
           lane.deferredAngleMarkerTail = deferredResult.deferred;
           if (!cleaned || cleaned.startsWith("Reasoning:\n")) return;
           lane.answerText = cleaned;
-          // #173: this lane has now streamed visible answer text. Set AFTER the
-          // reasoning-filter early-return above, so a `Reasoning:\n...` partial
-          // never counts. Persistent: settlement counts lanes with this flag to
-          // recognise the [A,A,B] overwrite (see the field's own comment).
+          // #212: capture the streamed text on a field a later authoritative final
+          // never overwrites, so the `turn_snapshot` is immune to #215 mis-routing.
+          lane.streamedAnswerText = cleaned;
+          // Reasoning-only partials never become answer snapshot candidates.
           lane.streamedVisibleAnswerText = true;
           acceptRawBaseline(lane, visibleRaw, { replace: update.replace === true });
           lane.answerRevision += 1;
@@ -1952,28 +2032,64 @@ export function createProgressDraftController(params: {
           state.blockReservations.push(reservation);
           if (reservation.state === "retired") return;
 
-          let barrierLane: AssistantDraftLane | undefined;
-          if (input.assistantMessageIndex !== undefined) {
-            barrierLane = state.lanes.find(
-              (lane) => assistantMessageIndexMatchesLane(input.assistantMessageIndex!, lane),
+          // ONE attachment path for every reservation, indexed or not, keyed on
+          // LANE STATE alone.
+          //
+          // There used to be a second path that picked the barrier lane by
+          // comparing `input.assistantMessageIndex` to `lane.generation`. It is
+          // deleted, and not because the comparison had the wrong base: there is
+          // no sound ordinal→lane mapping to correct it to. The ordinal is a
+          // source-stream counter core resets per subscription, and using it as
+          // the key that decides WHICH lane a record belongs to is the
+          // self-inflicted #215/#223 defect (plan §0.2 N5, §16.5 precision note
+          // 1). Core's own Telegram extension draws the same line: it reads the
+          // ordinal as a block-ROTATION hint and never as an identity key.
+          //
+          // Lane state answers the question the ordinal was being asked for, and
+          // answers it soundly: the earliest lane that is still unresolved is the
+          // one a block can still be owed to, and if none is, the block belongs
+          // to the message being streamed right now.
+          const unresolvedCandidates = state.lanes.filter(
+            (lane) => lane.resolution === "unresolved",
+          );
+          if (unresolvedCandidates.length > 1) {
+            warn(
+              `ambiguous block reservation has ${unresolvedCandidates.length} ` +
+                "unresolved predecessors; retaining the earliest ordering barrier",
             );
-          } else {
-            const unresolvedCandidates = state.lanes.filter(
-              (lane) => lane.resolution === "unresolved",
-            );
-            if (unresolvedCandidates.length > 1) {
-              warn(
-                `ambiguous indexless block reservation has ${unresolvedCandidates.length} ` +
-                  "unresolved predecessors; retaining the earliest ordering barrier",
-              );
-            }
-            barrierLane =
-              state.lanes.find((lane) => lane.acceptsLateIndexlessReservations) ??
-              unresolvedCandidates[0] ??
-              currentLane();
+          }
+          const barrierLane =
+            state.lanes.find((lane) => lane.acceptsLateIndexlessReservations) ??
+            unresolvedCandidates[0] ??
+            currentLane();
+          // Arming is about RETIRABILITY, not about which lane was chosen above —
+          // the choice is already made, and the same way for both kinds.
+          //
+          // A settlement carries an `assistantMessageIndex`, and
+          // `retireOneRecordAtIndex` uses it to retire the one pending record
+          // that settled. An INDEXLESS reservation can never be matched that way,
+          // so nothing short of terminal drain can prove it is done, and its lane
+          // stays armed. An indexed one is individually retirable, so arming it
+          // would only stall its lane's successor until drain (measured: the
+          // whole M6b/M6h/M6u/I11/I18 family goes red, all as "B never streams").
+          // This is lifecycle bookkeeping, the same category as
+          // `outstandingRecordsAtIndex`; it is not an ordinal deciding a lane.
+          //
+          // ARMING HAS TWO EFFECTS, and the second one reaches further than the
+          // flag's name suggests. It keeps this lane from pre-resolving to
+          // `"empty"` when its barrier list empties — that is the local one. It
+          // also makes the `find(acceptsLateIndexlessReservations)` lookup above
+          // return this lane FIRST, and that lookup is now on the single unified
+          // path, so the armed lane captures the next reservation of EITHER kind,
+          // not just the next indexless one. Consequence worth stating plainly:
+          // whether reservation N carried an ordinal transitively selects the
+          // barrier lane for reservation N+1. That is still lane state deciding —
+          // the flag is lane state — but it is the one place where an ordinal's
+          // presence has a downstream effect on a lane choice, so a change to the
+          // condition below is not local to this statement.
+          if (input.assistantMessageIndex === undefined) {
             barrierLane.acceptsLateIndexlessReservations = true;
           }
-          if (!barrierLane) return;
           reservation.barrierGeneration = barrierLane.generation;
           barrierLane.tentativeBarrierReservationIds.push(reservation.token);
         },
@@ -2015,9 +2131,14 @@ export function createProgressDraftController(params: {
           // case — bookkeeping above (disposition + barriers) is untouched, so
           // the ordering/release gate is unaffected.
           //
-          // The match uses the sound per-message stamp (see the lane field and
-          // boundary-counter docblocks), NOT the barrier system's generation
-          // mapping.
+          // The match uses the sound per-message stamp this controller wrote
+          // itself (see the lane field and boundary-counter docblocks). It is a
+          // RENDERING decision about a lane that already exists — "has this lane
+          // already shown this text" — and deliberately not an attachment
+          // decision: no ordinal picks the lane a record ATTACHES TO for ordering
+          // anywhere in this controller (plan §0.2 N5). Read narrowly: this very
+          // line maps an ordinal onto a lane, and is allowed precisely because it
+          // decides rendering rather than order.
           //
           // PREDICATE = `streamedVisibleAnswerText && !laneTerminalSuppressed`,
           // i.e. the lane streamed visible answer text and is either MATERIALIZED
@@ -2056,7 +2177,11 @@ export function createProgressDraftController(params: {
             return false;
           }
           emitHeldLaneTextBeforeIndependentDelivery();
-          return sendIndependent(input.text, input.assistantMessageIndex);
+          // Retain the candidate lane with this recovery bubble. The snapshot
+          // may remove it only if that lane later has an accepted replacement.
+          return sendIndependent(input.text, input.assistantMessageIndex, {
+            supersedesAnswerLane: targetLane?.streamedVisibleAnswerText ? targetLane : undefined,
+          });
         },
         false,
       ),
@@ -2073,10 +2198,24 @@ export function createProgressDraftController(params: {
           if (kind === "error") {
             // Retires nothing on purpose: an adapter error says a delivery
             // failed, not WHICH record it belonged to, and this seam has no
-            // payload to classify. Terminal drain clears whatever is left. Note
-            // the cost is now turn-wide rather than per-lane — a reservation
-            // surviving here keeps the empty-predecessor release gate closed for
-            // the rest of the turn — which is the price of not guessing.
+            // payload to classify. Terminal drain clears whatever is left.
+            //
+            // PRICE THE COST HONESTLY, because it grew. A reservation surviving
+            // here still keeps the turn-wide empty-predecessor release gate
+            // closed, and it now ALSO hard-holds the lane it attached to: since
+            // #238 every reservation attaches to a real lane, so the barrier
+            // token sits on that lane's list, `laneOrderResolved` refuses it, and
+            // `predecessorsResolved` blocks every successor. No timer clears
+            // that — `releasableEmptyPredecessors` bails on the same pending
+            // reservation — so the successor streams NOTHING and arrives only as
+            // its terminal frame at drain.
+            //
+            // Measured: lane A streams "A text", A's block is queued at core's
+            // real ordinal 1, this error fires, then B streams "B text". Before
+            // #238 the wire carried B's progress frame pre-drain; now it does
+            // not. That is the intended conservative direction — an ordering
+            // barrier we cannot prove is discharged is held, not guessed away —
+            // but it is a stalled lane, not merely a disarmed timer.
             warn("delivery adapter reported an error; ambiguous reservations await terminal drain");
           } else if (kind === "settled") {
             // `onDeliverySettled` carries no payload — core hands this seam only
@@ -2149,45 +2288,28 @@ export function createProgressDraftController(params: {
           if (state.finalReconciliation.leadingTerminalErrorSeen) {
             return deliverTerminalIndependent(text);
           }
-          // #173 — collapse-aware final routing. Core produces ordinary answer
-          // finals in one of two shapes (verified against the pinned bundle,
-          // payloads-1r4oLFNi.js:335/:424/:426):
-          //   - COLLAPSE: the last assistant message has visible text, so core
-          //     emits exactly ONE final = that last message's text. Earlier
-          //     messages only ever reached the user via live streaming.
-          //   - #173: the last assistant message is tool-only (no text), so the
-          //     collapse cannot fire and core emits one final PER text-bearing
-          //     message, IN ORDER. Tool-only messages still fire
-          //     `onAssistantMessageStart`, so at finalize time `currentLane()` is
-          //     the tool-only message's TEXTLESS lane — never a last answer lane.
+          // The first ordinary final may complete the currently streamed draft.
+          // That delivery act consumes the current handle; later finals are new
+          // acts, even when their text is identical. Closed drafts are never
+          // reopened by turn-end payloads. Core's canonical-last-answer path
+          // feeds this live handle; the tool-only-last path has no current text
+          // and its possibly deduped finals remain independent (see #262).
           //
-          // The routing target is unambiguous ONLY when the current lane bears
-          // text (collapse → the current lane) or there is no text-bearing lane
-          // at all (a lone message whose text arrived only in the final → the
-          // current lane). When the current lane is TEXTLESS *and* text-bearing
-          // lanes exist, the shape is undecidable at this instant: it is the
-          // collapse-with-nonstreaming-last shape (K==1 → the final is the
-          // current lane's own text) OR the tool-only-last #173 shape (K>=2 →
-          // one final per text-bearing lane). Only the drain-time COUNT tells
-          // them apart, so buffer and resolve in `flushBufferedOrdinaryFinals`.
-          const textBearingLanes = materializedAnswerLanes();
-          if (!active.streamedVisibleAnswerText && textBearingLanes.length > 0) {
+          // If prior drafts are visible, defer unclaimed finals so held output
+          // keeps its place. This is only scheduling, not identity correlation.
+          // Once buffering starts, later callbacks cannot retroactively claim
+          // a draft that begins streaming after the final's delivery decision.
+          if (
+            bufferedOrdinaryFinals.length > 0 ||
+            (!active.streamedVisibleAnswerText && hasMaterializedAnswerLane())
+          ) {
             state.finalReconciliation.ordinaryAnswerSettled = true;
-            bufferedOrdinaryFinals.push(text);
-            // Provisional: the real send happens at drain (a synchronous status is
-            // impossible here). Deliberately optimistic — inbound treats the final
-            // as delivered, and it will be unless the turn is `stop`ped before
-            // drain, in which case the streamed lane text still stands and a reload
-            // heals. Never leaves a dangling promise.
-            return true;
+            bufferedOrdinaryFinals.push({ text, started: false, complete: false });
+            return true; // drain owns delivery and reports any unresolved failure
           }
-          // Immediate path: the current lane is the sole, unambiguous target. The
-          // first final settles it; a second ordinary final in this shape has no
-          // lane left and falls back to an independent bubble (today's behaviour).
-          if (state.finalReconciliation.ordinaryAnswerFinalsRoutedToLanes >= 1) {
+          if (state.finalReconciliation.ordinaryAnswerSettled) {
             return deliverTerminalIndependent(text);
           }
-          state.finalReconciliation.ordinaryAnswerFinalsRoutedToLanes += 1;
           state.finalReconciliation.ordinaryAnswerSettled = true;
           // Unlike partial callbacks, the ordinary final is durable and
           // authoritative. It is the only event allowed to replace an exact
@@ -2197,7 +2319,9 @@ export function createProgressDraftController(params: {
           active.deferredAngleMarkerTail = undefined;
           active.lastPartialSourceText = "";
           terminalDrain(false);
-          return emitAuthoritativeFinalOnLane(active, text);
+          // #212: the immediate path routes the final to its OWN lane — the
+          // snapshot may show this authoritative text verbatim (final tail kept).
+          return emitAuthoritativeFinalOnLane(active, text, { authoritative: true });
         },
         false,
       );
@@ -2227,7 +2351,24 @@ export function createProgressDraftController(params: {
           clearProgressTimer();
           clearEmptyPredecessorTimer();
           state.pendingProgress = undefined;
+          const retried = new Set(pendingDurableSends.keys());
+          for (const retry of [...pendingDurableSends.values()]) retry();
           terminalDrain(true);
+          // Buffered finals first attempt storage during drain. Retry their
+          // rejected output before the snapshot, under the same reservations.
+          let recoveredOutput = false;
+          // Iterate the live map: advancing the FIFO may introduce a newly
+          // rejected suffix, which gets the same one retry as its predecessor.
+          for (const [key, retry] of pendingDurableSends) {
+            if (key !== "snapshot" && !retried.has(key)) {
+              if (retry()) recoveredOutput = true;
+              flushBufferedOrdinaryFinals();
+            }
+          }
+          if (recoveredOutput && pendingDurableSends.size === 0) emitTurnSnapshot();
+          // The first snapshot attempt can happen above, after output recovers.
+          // Give it one retry here, unless its key was already retried at entry.
+          if (!retried.has("snapshot")) pendingDurableSends.get("snapshot")?.();
         },
         undefined,
       ),
@@ -2241,15 +2382,9 @@ export function createProgressDraftController(params: {
           clearProgressTimer();
           clearEmptyPredecessorTimer();
           state.pendingProgress = undefined;
-          // #173: a stop without a drain discards any buffered finals. This can
-          // lose content, not just a re-send: an ordinary final may carry a tail
-          // the last streamed partial never emitted (VERIFY-1 is still open), so a
-          // dropped buffered final can lose a final-only tail the streamed lane
-          // does NOT hold. Accepted by design — a reload heals it from durable
-          // history — and what must not happen is a dangling promise, which
-          // `finalize` already prevents by resolving each buffered final
-          // provisionally.
-          bufferedOrdinaryFinals.length = 0;
+          // Stop must not silently discard already-authored buffered finals.
+          // It does not finalize unfinalized partial text.
+          flushBufferedOrdinaryFinals();
         },
         undefined,
       );
@@ -2270,6 +2405,11 @@ export type ReasoningStreamUpdate = {
 };
 
 export type ReasoningDraftController = {
+  readonly deliveryFailed: boolean;
+  /** A new public agent run starts a fresh accumulator; duplicate notification is inert. */
+  startRun: (runId: string) => void;
+  /** The public assistant-message-start boundary, interpreted with the next payload. */
+  startMessage: () => void;
   /** Consume one cumulative update from the native live-reasoning callback. */
   push: (update: ReasoningStreamUpdate) => void;
   /** Consume one complete durable reasoning block from the delivery adapter. */
@@ -2279,49 +2419,24 @@ export type ReasoningDraftController = {
 };
 
 /**
- * Normalizes OpenClaw's LIVE reasoning updates into cumulative, replace-by-id
- * wire frames. Each `onReasoningEnd` boundary rotates the id so separate live
- * reasoning bursts remain distinct in the UI. Complete durable blocks take the
- * separate `pushDurableBlock` path: each is emitted whole under a fresh id and
- * never participates in live-stream stale-prefix accounting. The sole replay
- * exception is pinned core's CLI path: while a live burst is still OPEN, its
- * exact final raw/display snapshot is delivered again as a durable block. A
- * successfully delivered exact match closes the live burst without emitting a
- * duplicate; equality or prefix overlap between independent durable blocks is
- * never deduplicated. If the live transport rejected its latest snapshot, the
- * durable block remains the fallback and is emitted normally.
+ * Reasoning updates replace the current live draft; endBurst closes its accepted
+ * preview under the same ID. A new assistant-message boundary resets the native
+ * accumulator, so independent equal messages and repeated prefixes stay whole.
  *
- * VERIFIED INTERNAL BEHAVIOR (OpenClaw 2026.7.1-2): every emitter sends either
- * a snapshot or the cumulative FULL text so far — NEVER a bare delta:
- *  - the ACP runner emits the full accumulated text with `isReasoningSnapshot:
- *    true`;
- *  - the btw runner emits cumulative full text (`reasoningText += delta` then
- *    emits `reasoningText`, no snapshot flag).
- * So normalization is a plain REPLACE: ignore empty/non-string text, no-op an
- * exact duplicate of the current text, otherwise replace and send. No
- * snapshot/startsWith/endsWith/concat heuristic is needed.
+ * Unmarked updates can accumulate across thinking_end within ONE message (btw
+ * emits one message-start and retains reasoningText; embedded full thinking also
+ * accumulates within a message). Only that scope may subtract already closed
+ * accumulator text. Explicit isReasoningSnapshot updates replace in full: the
+ * Codex app-server projector aggregates reasoning items across its one answer
+ * start and closes at turn completion. A message-start alone cannot reset it.
+ * A new run resets either scope, using the public onAgentRunStart callback.
  *
- * btw STALE-BURST DEFENSE: the btw `reasoningText` accumulator (declared
- * internally and verified at OpenClaw 2026.7.1-2) is NEVER reset at
- * `thinking_end`, even though that same event fires `onReasoningEnd`. So a
- * SECOND thinking burst in one attempt emits cumulative text that still carries
- * burst 1's full text as a raw prefix (btw concatenates raw deltas, whitespace
- * and all). Under our per-burst id
- * rotation that would render burst 1 duplicated inside burst 2's lane. We defend
- * with a `stalePrefix`: on `endBurst` we set it to the just-closed burst's LAST
- * RAW payload (that raw cumulative text already contains every prior burst — so
- * assign, don't append our trimmed display text, which loses inter-burst
- * whitespace and misfires from burst 3 on), and on `push` we strip that prefix
- * (plus any leading whitespace) from an incoming cumulative payload before the
- * replace logic runs. The ACP runner cannot hit this — its internal
- * `maybeEndReasoning` fires `onReasoningEnd` at most once per attempt (a
- * `reasoningEnded` guard), verified at OpenClaw 2026.7.1-2. The strip is
- * conservative: a payload that does NOT start with the accumulated prefix falls
- * through unchanged, so the worst case is the pre-fix duplicated display,
- * never lost text — as long as the emitter's accumulator persists for the
- * controller's lifetime (the pinned single-invocation contract). A fresh runner
- * re-streaming byte-identical reasoning into a reused controller could jump-strip
- * mid-stream; no pinned path does that today.
+ * Complete durable blocks author independent IDs. An exact accepted open live
+ * snapshot replay can close its existing ID; after a message/run boundary or
+ * burst close, equality cannot suppress an independent block. Rejected final storage
+ * retains the exact ID/text for output-only retry. Only final:true is journaled,
+ * subject to reasoningDurable; ephemeral previews and last-accepted-text policy
+ * remain unchanged. Source trace and deliberate limits: MESSAGE_DELIVERY_IDENTITY.md.
  */
 export function createReasoningDraftController(params: {
   transport: WebChannelPeerChannel;
@@ -2330,70 +2445,131 @@ export function createReasoningDraftController(params: {
 }): ReasoningDraftController {
   let id = nextMessageId();
   let currentText = "";
-  // Prefix a later burst's payload carries under btw (stale-burst defense). btw's
-  // `reasoningText` is its RAW cumulative accumulator, so the prefix is exactly the
-  // last raw payload of the just-closed burst — NOT our trimmed display text (the
-  // two differ whenever whitespace separates bursts, e.g. "\n\n" from a thinking
-  // model). `endBurst` therefore ASSIGNS `stalePrefix = lastRawText` (the raw
-  // payload already contains every prior burst), not `+=` our stripped text.
-  let stalePrefix = "";
-  // The last raw payload seen this burst (before stripping), captured so endBurst
-  // can hand the raw cumulative text to `stalePrefix`.
+  // Raw text closed within the current message's cumulative stream, never a
+  // cross-message identity key. Preserve whitespace in this source baseline.
+  let closedAccumulatorText = "";
   let lastRawText = "";
+  let lastUpdateIsSnapshot = false;
+  let messageBoundaryPending = false;
+  let runId: string | undefined;
   // Replay suppression is safe only when the matching live snapshot actually
   // reached the transport. A rejected live send leaves the durable result as the
   // only delivery path, so it must not be discarded merely because its text
   // matches the controller's in-memory snapshot.
+  //
+  // ⚠️ THIS FLAG IS ABOUT THE *LAST* SEND, AND THAT IS THE ONLY QUESTION IT MAY
+  // BE ASKED. It is deliberately NOT the gate on the burst's durable frame — see
+  // `lastDeliveredText` below retains earlier accepted snapshots too.
   let liveSnapshotDelivered = false;
+  // Live reasoning is ephemeral. Close only text accepted by a live preview;
+  // a durable block separately authors its complete text. When reasoningDurable
+  // is enabled this close can commit even while the relay is disconnected.
+  let lastDeliveredText = "";
   let stopped = false;
+  const pendingReasoning = new Map<string, Parameters<WebChannelPeerChannel["sendReasoning"]>>();
+  const sendReasoning: WebChannelPeerChannel["sendReasoning"] = (...args) => {
+    try {
+      const sent = params.transport.sendReasoning(...args);
+      if (sent) pendingReasoning.delete(args[1]);
+      return sent;
+    } catch (error) {
+      if (!(error instanceof DurableSendError)) throw error;
+      pendingReasoning.set(args[1], args);
+      return false;
+    }
+  };
 
   const closeLiveBurst = (): void => {
     if (currentText.length === 0) return;
-    // The NEXT live burst's raw payload carries this closed burst's LAST RAW text
-    // as its prefix (btw's accumulator is cumulative and already holds all prior
-    // bursts), so assign — don't append our trimmed display text, which would
-    // drop any inter-burst whitespace and break the prefix match from burst 3 on.
-    stalePrefix = lastRawText;
+    // Persist one close frame for the displayed burst, subject to account
+    // policy. An output-only retry retains this ID and this exact text.
+    if (lastDeliveredText.length > 0) {
+      sendReasoning(
+        params.sessionKey,
+        id,
+        params.turnId,
+        lastDeliveredText,
+        true,
+      );
+    }
+    closedAccumulatorText = lastRawText;
     id = nextMessageId();
     currentText = "";
+    lastDeliveredText = "";
     liveSnapshotDelivered = false;
+  };
+
+  const resetAccumulator = (): void => {
+    closeLiveBurst();
+    closedAccumulatorText = "";
+    lastRawText = "";
+    lastUpdateIsSnapshot = false;
+    messageBoundaryPending = false;
+  };
+
+  // Defer interpreting message-start until the next payload declares its form.
+  // A turn snapshot can cross that callback without resetting its accumulator;
+  // an unmarked native update belongs to the newly opened assistant message.
+  const acceptMessageBoundary = (snapshot: boolean): void => {
+    if (!messageBoundaryPending) return;
+    if (!snapshot) resetAccumulator();
+    messageBoundaryPending = false;
   };
 
   const push = (update: ReasoningStreamUpdate): void => {
     if (stopped) return;
     const text = typeof update.text === "string" ? update.text : "";
     if (text.length === 0) return;
-    // Remember the RAW payload before any stripping (see stalePrefix above).
+    const snapshot = update.isReasoningSnapshot === true;
+    acceptMessageBoundary(snapshot);
+    lastUpdateIsSnapshot = snapshot;
     lastRawText = text;
-    // btw stale-burst defense (see the contract above): a later burst's cumulative
-    // payload still carries every prior burst's text as a leading prefix. Strip it
-    // (and any whitespace the deltas left between bursts) so this burst's lane
-    // shows only its own text. A payload that does not carry the prefix is left
-    // as-is (conservative — never drop text we can't confidently attribute).
+    // Within one explicitly bounded cumulative stream, remove only text already
+    // closed by that stream. Snapshot payloads always replace with their full text.
     let normalized = text;
-    if (stalePrefix.length > 0 && normalized.startsWith(stalePrefix)) {
-      normalized = normalized.slice(stalePrefix.length).replace(/^\s+/, "");
+    if (!snapshot && closedAccumulatorText && normalized.startsWith(closedAccumulatorText)) {
+      normalized = normalized.slice(closedAccumulatorText.length).replace(/^\s+/, "");
       if (normalized.length === 0) return;
     }
-    // Cumulative/snapshot REPLACE (see the verified contract above): a payload is
-    // always the full text so far, so an exact match is a no-op and anything else
-    // replaces the current text wholesale.
+    // Replace the current burst's preview. Equality is a no-op only inside this
+    // open delivery scope, after consuming any native message boundary.
     if (normalized === currentText) return;
     currentText = normalized;
-    liveSnapshotDelivered = params.transport.sendReasoning(
+    liveSnapshotDelivered = sendReasoning(
       params.sessionKey,
       id,
       params.turnId,
       currentText,
     );
+    // Only a send the transport ACCEPTED changes what the client holds, so this
+    // lags `currentText` across a refusal instead of tracking it. (This push
+    // omits `final`, so it is never journaled: `true` here still means the wire
+    // write succeeded — #347's committed-row case cannot arise.) That lag is
+    // the whole mechanism — see `lastDeliveredText`'s declaration and
+    // `closeLiveBurst`'s case table.
+    if (liveSnapshotDelivered) lastDeliveredText = currentText;
   };
 
   return {
+    get deliveryFailed() { return pendingReasoning.size > 0; },
+    startRun: (nextRunId) => {
+      if (stopped || runId === nextRunId) return;
+      resetAccumulator();
+      runId = nextRunId;
+    },
+    startMessage: () => {
+      if (!stopped) messageBoundaryPending = true;
+    },
     push,
     pushDurableBlock: (update) => {
       if (stopped) return;
       const text = typeof update.text === "string" ? update.text : "";
       if (text.length === 0) return;
+
+      // A complete block cannot inherit replay ownership across a message
+      // boundary. CLI's marked live snapshot has no intervening message-start
+      // callback on its bridge before the unmarked durable result arrives.
+      acceptMessageBoundary(false);
 
       // Pinned core's CLI runtime bridges each thinking snapshot to the live
       // callback, then prepends the captured FINAL snapshot to its result as an
@@ -2401,7 +2577,17 @@ export function createReasoningDraftController(params: {
       // that proven shape: an exact raw/display match while the live burst is
       // still OPEN. No prefix matching, and no memory after close — equal
       // independent durable blocks must each render.
+      //
+      // #242 half 1: `closeLiveBurst` emits the burst's ONE `final` frame here,
+      // and this branch must NOT also send the durable block — that is what
+      // "suppress the replay" means, and sending both would be two durable rows
+      // for one burst. This branch requires `liveSnapshotDelivered`, and that
+      // condition is only reachable when the last `push` was accepted, so
+      // `lastDeliveredText === currentText` here: the final really is emitted on
+      // this path, and it carries the burst's full text rather than a truncated
+      // prefix.
       if (
+        lastUpdateIsSnapshot &&
         liveSnapshotDelivered &&
         currentText.length > 0 &&
         (text === currentText || text === lastRawText)
@@ -2411,10 +2597,14 @@ export function createReasoningDraftController(params: {
       }
 
       // Preserve an in-flight live burst before emitting this independent block.
-      // Only closing LIVE state updates `stalePrefix`; the durable text itself is
+      // Only closing LIVE state updates the accumulator; the durable text itself is
       // sent whole and then rotates the id without touching that accumulator.
       closeLiveBurst();
-      params.transport.sendReasoning(params.sessionKey, id, params.turnId, text);
+      // #242 half 1: this block is ALREADY COMPLETE when it is sent — it is a
+      // whole durable reasoning block, not a cumulative draft — so it carries
+      // `final: true` on its single frame. There is deliberately no second
+      // "closing" frame for it: that would be two durable rows for one block.
+      sendReasoning(params.sessionKey, id, params.turnId, text, true);
       id = nextMessageId();
     },
     endBurst: () => {
@@ -2422,6 +2612,60 @@ export function createReasoningDraftController(params: {
       closeLiveBurst();
     },
     stop: () => {
+      // #242 half 1: CLOSE AN OPEN BURST BEFORE LATCHING. `inbound.ts` calls
+      // `reasoning?.stop()` on the turn's way out, so an aborted turn (/stop) or
+      // a turn that ended without a reasoning-end boundary used to drop whatever
+      // the user had already watched stream — live showed it, history would not,
+      // which is the N8-losing hole this slice exists to close.
+      //
+      // ⚠️ IT CALLS `closeLiveBurst`, NOT `endBurst`, AND THAT IS WHY THE ORDER
+      // READS AS IF IT MATTERS WHEN IT DOES NOT. `closeLiveBurst` never consults
+      // `stopped`, so latching first would work identically; `endBurst` DOES
+      // return early on `stopped`, so writing `endBurst(); stopped = true;` here
+      // would be correct today and would silently become a no-op the moment
+      // anyone reordered these two lines. The direct call has no such edge.
+      //
+      // Idempotent: `closeLiveBurst` early-returns on an empty burst, and it
+      // clears `currentText`, so a second `stop()` — or a `stop()` after
+      // `endBurst` — only retries any rejected output.
+      //
+      // ⚠️ THIS FRAME IS JOURNALED AFTER THE TURN'S `seal`, AND THAT IS A KNOWN
+      // ORDERING DIVERGENCE. `inbound.ts` awaits `draft?.drain()` — which emits
+      // the `turn_snapshot` — and calls `reasoning?.stop()` afterwards, from its
+      // `finally`. So a burst that streamed BEFORE the answer but never received
+      // a reasoning-end boundary gets a later `seq` than the seal and replays at
+      // the tail, past the turn's answers. Unobservable in half 1 because the
+      // projection dropped reasoning before the wire; half 2 emits it, and the
+      // divergence became live.
+      //
+      // ⚠️ THIS `stop()` PATH IS AN INSTANCE, NOT THE CONDITION. An earlier
+      // revision added "Bursts closed by `endBurst` are unaffected (they close
+      // mid-turn)" — a false universal. The real invariant is that live and
+      // replay agree for a burst IFF no `placement`/`bubble` row is journaled
+      // between its first delivered frame and its closing frame; `endBurst`
+      // guarantees nothing of the sort, and `pushDurableBlock` closes bursts
+      // from inside the `delivery.deliver` seam itself. The canonical statement
+      // and its frame-level counterexample live in `journal-history.ts`'s
+      // conversion loop (GAP 2b) — do not restate the condition here.
+      //
+      // ⚠️ THE FIX THIS COMMENT USED TO NAME DOES NOT WORK, AND HALF 2 DID NOT
+      // MAKE IT. It read "half 2 … owns the fix, which is the order of those two
+      // calls in the turn teardown". Hoisting `reasoning?.stop()` above
+      // `await draft?.drain()` moves the row before the SEAL — but the lane's
+      // `placement`/`bubble` rows were journaled while it was streaming, long
+      // before either call, so the block still lands after the turn's answers,
+      // and `applySeal` deliberately leaves every non-answer slot where it is.
+      // The old sentence was true about the seal and read as if it covered the
+      // answers. `journal-history.ts`'s conversion loop (GAP 2b) is where the
+      // divergence is now stated; still NOT a change to make here.
+      const pendingAtStop = new Map(pendingReasoning);
+      for (const args of pendingAtStop.values()) sendReasoning(...args);
+      const closingId = id;
+      closeLiveBurst();
+      // Production stops once. Give a newly rejected close its one output-only
+      // retry here, without retrying earlier pending failures a second time.
+      const pendingClose = pendingReasoning.get(closingId);
+      if (pendingClose && !pendingAtStop.has(closingId)) sendReasoning(...pendingClose);
       stopped = true;
     },
   };

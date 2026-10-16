@@ -257,7 +257,7 @@ describe("unified-demo server surface (ENABLE_DEMO_UI)", () => {
     const perPeer = `webchannel.${TENANT}.*.${ALICE_UUID}.>`;
     const tenantWide = `webchannel.${TENANT}.>`;
     // Pinned to alice's own peer subtree — NOT the tenant-wide agent grant.
-    expect(data.permissions?.pub).toEqual([perPeer]);
+    expect(data.permissions?.pub).toEqual([perPeer.replace(/>$/, "in"), perPeer.replace(/>$/, "register")]);
     expect(data.permissions?.sub).toEqual([perPeer]);
     expect(data.permissions?.pub).not.toContain(tenantWide);
     expect(data.permissions?.sub).not.toContain(tenantWide);
@@ -269,7 +269,7 @@ describe("unified-demo server surface (ENABLE_DEMO_UI)", () => {
     expect(status).toBe(200);
     const perPeer = `webchannel.${TENANT}.*.${ALICE_UUID}.>`;
     // observer would be sub-only tenant-wide; the browser route must ignore it.
-    expect(data.permissions?.pub).toEqual([perPeer]);
+    expect(data.permissions?.pub).toEqual([perPeer.replace(/>$/, "in"), perPeer.replace(/>$/, "register")]);
     expect(data.permissions?.sub).toEqual([perPeer]);
   });
 

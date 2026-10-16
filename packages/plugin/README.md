@@ -43,6 +43,17 @@ browser/Playwright variant against a hosted SaaS issuer is follow-up #13. See ST
   [`../../e2e/local/README.md`](../../e2e/local/README.md) to reproduce browser↔agent locally.
 - Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md) for the current authoritative state.
 
+### Account selection
+
+Account read/lookup rules are defined in
+[`resolveWebchannelAccountId`](src/account-config.ts): core aliases resolve to
+the exact listed account spelling, which remains the tenant/JWT/subject/storage
+identity. Gateway lifecycle starts require the exact listed ID; an alias is
+refused before approval or NATS startup.
+Setup keeps its existing write-ID policy. `openclaw doctor` reports an invalid
+`channels.webchannel.defaultAccount`, its selected fallback and a remedy;
+selection alone does not establish runtime availability.
+
 ## Enrollment & credentials (NATS mode)
 
 `src/enrollment-client.ts` implements plugin-side onboarding over the **RFC 8628 device flow**
@@ -95,6 +106,10 @@ credentials and skips enrollment only when their complete v2 identity matches th
 tenant, account, SaaS base, delivered issuer/relay, and local public key.
 
 **Credential storage:**
+- **Config output:** inline `nats.credentials.userJwt` and `userSeed`, including
+  named-account overrides, carry sensitive UI hints. Core config snapshots and
+  UI responses mask these values. This does not encrypt the configuration file
+  or add SecretRef/provider resolution; existing inline parsing is unchanged.
 - **Default location:** `~/.openclaw-webchannel-v2/<v2_namespace>/credentials.json`,
   where `<v2_namespace>` is the fixed path-safe id derived from the exact,
   case-sensitive `(tenant, accountId)`.

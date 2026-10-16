@@ -1,6 +1,6 @@
 /**
  * Operator surface — imports ONLY from the published package name
- * `@mir-stream/webchannel-saas` (never a relative source path). This proves the
+ * `openclaw-webchannel-saas` (never a relative source path). This proves the
  * legitimate SaaS-operator flow is fully expressible through the public barrel:
  * build a trust chain, stand up a DeviceFlowEnrollment, and drive an
  * enroll -> approve -> poll cycle. It deliberately never touches raw
@@ -25,7 +25,7 @@ import {
   type BootstrapClaims,
   type JwkRsaPublicKey,
   type AgentKeyRegistry,
-} from "@mir-stream/webchannel-saas";
+} from "openclaw-webchannel-saas";
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   let raw = "";

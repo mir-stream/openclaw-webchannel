@@ -1,3 +1,5 @@
+import { assertSaasBaseUrl } from "./saas-authority.js";
+import { inspectStorageIssuer } from "./storage-issuer.js";
 import {
   createAccountJwtVerifier,
   resolveRequirePoPPolicy,
@@ -68,6 +70,7 @@ export function deriveAccountAuth(
   _accountId: string,
   deliveredIssuer?: string,
 ): RawJwtAuthConfig | undefined {
+  if (saasBaseUrl !== undefined) assertSaasBaseUrl(saasBaseUrl);
   if (!raw || raw.strategy !== "jwt") return raw;
   // An absent jwt object is the setup-produced derivation pointer. An explicitly
   // present malformed value is operator input and must survive unchanged so the
@@ -165,6 +168,12 @@ export function prepareAccountAuth(input: {
     shouldLoadDeliveredIssuer ? input.getPersisted()?.issuer : undefined,
   );
   const auth = resolveVerifierConfig(effective);
+  inspectStorageIssuer({
+    tenant: input.plan.tenant,
+    accountId: input.plan.accountId,
+    storageRoot: input.plan.storageRoot,
+    issuer: auth.jwt.issuer,
+  });
   const requirePoP = resolveRequirePoPPolicy(effective);
   const verifier = createAccountJwtVerifier(
     {

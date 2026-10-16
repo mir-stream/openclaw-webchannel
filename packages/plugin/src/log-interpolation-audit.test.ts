@@ -36,9 +36,10 @@ import { decodeStrictLogfmt } from "./test-fixtures/strict-logfmt.js";
  * without this guard saying anything:
  *
  *   1. VARIABLE-FIRST RECORDS. `const m = `…`; logger.error(m)` needs dataflow.
- *      This is not hypothetical: `nats-account-runtime.ts:339-341` builds
- *      `event=webchannel.invalid_account_id` exactly this way, and this guard
- *      does not see it. (Its one interpolation is `formatAccountIdForLog`, so
+ *      This is not hypothetical: `nats-account-runtime.ts` builds its
+ *      `event=webchannel.invalid_account_id` line exactly this way, and this guard
+ *      does not see it. (Its two interpolations — `formatAccountIdForLog(...)`
+ *      and `JSON.stringify(invalid.reason)` — are both non-peer, so
  *      it is baseline-class debt, not a live hole — but it is invisible here.)
  *   2. UNRECOGNISED CALLEES. `isLogCallee` matches on name shape. An alias
  *      (`const w = logger.warn; w(…)`) or `.call(…)` is missed.
@@ -73,14 +74,25 @@ const WEBCHANNEL_PREFIXES = [
 ];
 
 /** The files #123 hardened. These must stay clean. */
+/**
+ * ⚠️ `journal-history.ts` IS DELIBERATELY ABSENT while its sibling
+ * `history-serve.ts` is enforced. It is a PURE, IO-free projection module: it
+ * has no logger, no `api`, and no `console` call — a sink would have to be
+ * threaded in first, which is a design change review would catch. Adding a 0/0
+ * floor for it would imply a guarantee the scanner does not give anyway (see the
+ * prefix caveat on `history.ts`'s entry below), so the honest position is to say
+ * why it is out rather than bank a floor that proves nothing.
+ */
 const ENFORCED = [
   "inbound.ts",
   "ingress-dedupe.ts",
   "approvals.ts",
   "nats-account-runtime.ts",
+  "dispatch-core-recovery.ts",
   "auth.ts",
   "nats-channel.ts",
   "history.ts",
+  "history-serve.ts",
   "nats-register.ts",
 ] as const;
 
@@ -95,8 +107,41 @@ const ENFORCED = [
  * baseline, which is how this list shrinks to nothing instead of rotting.
  */
 const KNOWN_RAW: Record<string, readonly string[]> = {
+  "dispatch-core-recovery.ts": [],
   "inbound.ts": [],
-  "ingress-dedupe.ts": [],
+
+  /**
+   * #239 half 3's two delivery-journal warnings. The ONE peer-controlled value
+   * on either line — `peerId` — IS wrapped, which is why it is not here. These
+   * four are non-peer, so they fall outside #123's scope for the same reason
+   * `nats-account-runtime.ts`'s startup values do:
+   *  - `reason` and the `action` derived from it are members of a CLOSED
+   *    two-value union (`"no-usable-id" | "non-string-text"`), not data. If that
+   *    union is ever widened to carry anything from a frame, these two
+   *    exemptions stop being sound and must become `logSafe` calls;
+   *  - `journalable.length` is a count;
+   *  - `journalFailureDiagnostic(error)` is a COMPOSITE that already renders each
+   *    field safely — `logSafe` on the two string fields (`code=`, `errstr=`) and
+   *    a `typeof errcode === "number"` guard on `errcode=`, which is interpolated
+   *    raw and is safe because of that guard, not because of `logSafe`; and it
+   *    excludes `error.message` entirely. Wrapping it again would quote the
+   *    whole record and destroy the logfmt structure it exists to produce.
+   *
+   * ⚠️ THE ALTERNATIVE WAS TO HIDE THEM, AND THAT IS WHY THIS LIST GREW INSTEAD.
+   * `nats-channel.ts` builds its sibling journal warning into a local `const
+   * line` and calls `console.warn(line)`. The scanner derives `prefixText` from
+   * the STATIC text of the call's arguments, so a bare identifier yields `""`,
+   * no prefix matches, and the whole statement is skipped — not exempted,
+   * INVISIBLE. Assembling the template one statement earlier would have made
+   * these four disappear with no entry here at all. An exemption a reader can
+   * see and falsify beats a statement the audit never looks at.
+   */
+  "ingress-dedupe.ts": [
+    `ingress-dedupe.ts  ::  reason  @  "unjournalable-user-id""unjournalable-user-text""webchannel: inbound user message admitted but NOT journaled "peer= reason=`,
+    `ingress-dedupe.ts  ::  action  @  "unjournalable-user-id""unjournalable-user-text""webchannel: inbound user message admitted but NOT journaled "peer= reason=`,
+    `ingress-dedupe.ts  ::  journalable.length  @  "append-failed""webchannel: delivery journal append failed at the inbound accept "peer= journalable= action=reject-accept-client-retries`,
+    `ingress-dedupe.ts  ::  journalFailureDiagnostic(error)  @  "append-failed""webchannel: delivery journal append failed at the inbound accept "peer= journalable= action=reject-accept-client-retries`,
+  ],
 
   "approvals.ts": [],
 
@@ -125,6 +170,86 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
   "auth.ts": [],
   "nats-channel.ts": [],
   "history.ts": [],
+
+  /**
+   * #240 half 2's five history-server diagnostics, plus #311's three. THREE
+   * peer-derived values appear across them — `peerId`, `err` and the skipped-row
+   * summary — and ALL THREE are `logSafe`-wrapped, which is why none is listed
+   * here. (An earlier version of this sentence said `peerId` was the only one;
+   * `err` is on the read- and publish-failure lines, and #311's `detail` carries
+   * journal row ids.)
+   * The rest are non-peer, on the same footing as `ingress-dedupe.ts`'s entries:
+   *  - `kind` is a member of a CLOSED two-value union (`"snapshot" | "page"`),
+   *    not data. If it is ever widened to carry anything from a frame, these
+   *    exemptions stop being sound and must become `logSafe` calls;
+   *  - `suppressed`, `served.unsupportedEvents`, `served.tsFallbacks`,
+   *    `fitted.skipped.length`, `fitted.trimmed` and `fitted.rows.length` are
+   *    counts;
+   *  - `limit` is `NatsChannel.effectiveOutboundLimit()`, i.e. the NATS server's
+   *    advertised `max_payload`. Operator/server configuration, never peer data.
+   */
+  "history-serve.ts": [
+    // #244 half B / #356 — the difference (get_difference catch-up) diagnostics.
+    // Their peer id, error and skipped-row detail are `logSafe`-wrapped (covered,
+    // not here); what remains raw is `request.afterSeq` (a client-supplied value
+    // VALIDATED to a non-negative integer at the receive door, so a number, on the
+    // same footing as the counts below), the three budget counts, the peer's
+    // advertised `limit`, and the throttle's own `suppressed`.
+    //
+    // #356 moved these lines onto the SAME `admit` throttle the history lines use
+    // — before it they were the one failure path in this file that bypassed it —
+    // which is why each carries a `(suppressed=)`, and it added the byte budget's
+    // two reports plus the queue-bound warn.
+    //
+    // Round 2 added the SIXTH line: `publish failed … (afterSeq=…)`, for a THROWN
+    // send as against a refused one. Both report `publish-failed`; only the thrown
+    // one names the request, because the refused one already names the frame it
+    // refused. `MAX_QUEUED_DIFFERENCE_REQUESTS` is raw and is a module constant,
+    // not peer data.
+    "history-serve.ts  ::  request.afterSeq  @  webchannel: difference read failed for (afterSeq=): (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: difference read failed for (afterSeq=): (suppressed=)",
+    "history-serve.ts  ::  request.afterSeq  @  webchannel: difference publish failed for (afterSeq=): (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: difference publish failed for (afterSeq=): (suppressed=)",
+    "history-serve.ts  ::  reply.events.length  @  webchannel: difference publish failed for : the channel refused a -event frame; see the channel log (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: difference publish failed for : the channel refused a -event frame; see the channel log (suppressed=)",
+    "history-serve.ts  ::  fitted.skipped.length  @  webchannel: difference skipped oversized row(s) for ; each one alone in a difference exceeds this peer's effective max_payload of bytes (#311/#343): (suppressed=)",
+    "history-serve.ts  ::  limit  @  webchannel: difference skipped oversized row(s) for ; each one alone in a difference exceeds this peer's effective max_payload of bytes (#311/#343): (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: difference skipped oversized row(s) for ; each one alone in a difference exceeds this peer's effective max_payload of bytes (#311/#343): (suppressed=)",
+    "history-serve.ts  ::  fitted.trimmed  @  webchannel: difference for was shortened to fit the peer's effective max_payload of bytes: newer event(s) left for the next request (partial=true) (suppressed=)",
+    "history-serve.ts  ::  limit  @  webchannel: difference for was shortened to fit the peer's effective max_payload of bytes: newer event(s) left for the next request (partial=true) (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: difference for was shortened to fit the peer's effective max_payload of bytes: newer event(s) left for the next request (partial=true) (suppressed=)",
+    "history-serve.ts  ::  MAX_QUEUED_DIFFERENCE_REQUESTS  @  webchannel: difference request for displaced the newest of already queued for this peer; the displaced request re-issues on its own timeout (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: difference request for displaced the newest of already queued for this peer; the displaced request re-issues on its own timeout (suppressed=)",
+    // #401 — the page queue's bound warn, the page twin of the line above.
+    // Both queue limits are module constants; the peer id is wrapped.
+    "history-serve.ts  ::  MAX_QUEUED_PAGE_REQUESTS  @  webchannel: history page dropped for ; waiting queue would exceed requests or charged bytes (suppressed=)",
+    "history-serve.ts  ::  MAX_QUEUED_PAGE_BYTES  @  webchannel: history page dropped for ; waiting queue would exceed requests or charged bytes (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: history page dropped for ; waiting queue would exceed requests or charged bytes (suppressed=)",
+    "history-serve.ts  ::  fitted.rows.length  @  webchannel: history publish failed for : the channel refused a -row frame; see the channel log for the cause (suppressed=)",
+    "history-serve.ts  ::  fitted.skipped.length  @  webchannel: history skipped undeliverable row(s) for ; each one alone exceeds this peer's effective max_payload of bytes and can never be sent, live or replayed (#311): (suppressed=)",
+    "history-serve.ts  ::  fitted.trimmed  @  webchannel: history for was shortened to fit the peer's effective max_payload of bytes: older row(s) left out of this page and still reachable with load_history (suppressed=)",
+    "history-serve.ts  ::  kind  @  webchannel: history for was shortened to fit the peer's effective max_payload of bytes: older row(s) left out of this page and still reachable with load_history (suppressed=)",
+    "history-serve.ts  ::  kind  @  webchannel: history publish failed for : the channel refused a -row frame; see the channel log for the cause (suppressed=)",
+    "history-serve.ts  ::  kind  @  webchannel: history skipped undeliverable row(s) for ; each one alone exceeds this peer's effective max_payload of bytes and can never be sent, live or replayed (#311): (suppressed=)",
+    "history-serve.ts  ::  limit  @  webchannel: history for was shortened to fit the peer's effective max_payload of bytes: older row(s) left out of this page and still reachable with load_history (suppressed=)",
+    "history-serve.ts  ::  limit  @  webchannel: history skipped undeliverable row(s) for ; each one alone exceeds this peer's effective max_payload of bytes and can never be sent, live or replayed (#311): (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: history for was shortened to fit the peer's effective max_payload of bytes: older row(s) left out of this page and still reachable with load_history (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: history publish failed for : the channel refused a -row frame; see the channel log for the cause (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: history skipped undeliverable row(s) for ; each one alone exceeds this peer's effective max_payload of bytes and can never be sent, live or replayed (#311): (suppressed=)",
+    "history-serve.ts  ::  kind  @  webchannel: history projection is NOT authoritative for ; skipped journal event(s) this build cannot fold — history may be missing messages (suppressed=)",
+    "history-serve.ts  ::  served.unsupportedEvents  @  webchannel: history projection is NOT authoritative for ; skipped journal event(s) this build cannot fold — history may be missing messages (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: history projection is NOT authoritative for ; skipped journal event(s) this build cannot fold — history may be missing messages (suppressed=)",
+    "history-serve.ts  ::  kind  @  webchannel: history dated message(s) for from a fallback rather than a first appearance — timestamps may read early (suppressed=)",
+    "history-serve.ts  ::  served.tsFallbacks  @  webchannel: history dated message(s) for from a fallback rather than a first appearance — timestamps may read early (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: history dated message(s) for from a fallback rather than a first appearance — timestamps may read early (suppressed=)",
+    "history-serve.ts  ::  kind  @  webchannel: history dropped for ; a replay for this peer is already in flight (suppressed=)",
+    "history-serve.ts  ::  kind  @  webchannel: history dropped for ; a replay for this peer is already in flight (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: history dropped for ; a replay for this peer is already in flight (suppressed=)",
+    "history-serve.ts  ::  kind  @  webchannel: history journal read failed for : (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: history journal read failed for : (suppressed=)",
+    "history-serve.ts  ::  kind  @  webchannel: history publish failed for : (suppressed=)",
+    "history-serve.ts  ::  suppressed  @  webchannel: history publish failed for : (suppressed=)",
+  ],
   "nats-register.ts": [],
 };
 
@@ -141,17 +266,194 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
  * DELIBERATELY — that is the point.
  */
 const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: number }> = {
+  "dispatch-core-recovery.ts": { statements: 6, interpolations: 1 },
   // #173 (Phase 1) removed the settlement keyframe and its three warns (the
   // timed-out read, the not-delivered send, and the empty-projection skip —
   // 4+2+3 interpolations), restoring this to 6/12 now that the plugin emits the
   // corrected [A][B] sequence directly and no resync read exists to narrate.
-  "inbound.ts": { statements: 6, interpolations: 12 },
-  "ingress-dedupe.ts": { statements: 13, interpolations: 7 },
+  //
+  // #369 adds ONE — the cancelled-before-core-admission info line that replaces
+  // the apology's `error` for a dispatch the user's own `/stop` aborted (7→8)
+  // and its ONE interpolation (12→13), `logSafe(err)`. Same value and same
+  // wrapping as the `inbound dispatch failed` line it stands beside, so this
+  // file's KNOWN_RAW list above is unchanged.
+  //
+  // Round 2 adds ONE more — the guarded durable-settle warn that keeps a
+  // THROWING `onSettled` from suppressing `turn_settled` (8→9) and its THREE
+  // interpolations (13→16), `wsKey`, `turnId` and the caught `error`, all
+  // `logSafe`-wrapped. It is written in the `peer=… turn=… error=…` logfmt
+  // shape rather than with a trailing `: ${…}`, because EVASION 17 below
+  // rejects punctuation directly after a quoted value — that adjacency is what
+  // makes the emitted record undecodable, so the shape is the fix and there is
+  // no baseline entry to add.
+  // Stop ownership adds one constant pre-context retirement error.
+  // #406 adds one constant pairing-challenge delivery error (no interpolation).
+  // #415 C7 adds one media-delivery warning with two logSafe identities.
+  "inbound.ts": { statements: 12, interpolations: 18 },
+  // #239 half 3 adds the two delivery-journal warnings (13→15) and their six
+  // interpolations (7→13): `peerId` twice, plus `reason`/`action` on the gap
+  // line and `journalable.length`/`journalFailureDiagnostic(error)` on the
+  // failure line. Only `peerId` is peer-controlled and only `peerId` is wrapped;
+  // the other four are in KNOWN_RAW above with the property each one rests on.
+  //
+  // #344 adds ONE more — the `orphaned-accept-marker` recovery line (15→16) and
+  // its TWO interpolations (13→15), `peerId` and `dedupe_id`. BOTH are
+  // peer-controlled and BOTH are `logSafe`-wrapped, which is why this file's
+  // KNOWN_RAW list above is unchanged: the new line adds coverage without adding
+  // debt. (`dedupe_id` — `random_id ?? wireId` — is bounded to 128 chars by
+  // `usableId` before it ever reaches the log, but the wrapping is what makes it
+  // safe, not the bound. It was spelled `random_id=` until round 3 widened the
+  // journal lookup to cover clients that send no `random_id`.)
+  //
+  // #369 adds ONE more — the `retry provenance dropped` info line the accept
+  // seam emits when the dispatch store refuses to record a `retry_of` that does
+  // not name an interrupted request (17→18) and its ONE interpolation (16),
+  // `peerId`, which is peer-controlled and `logSafe`-wrapped. KNOWN_RAW is
+  // unchanged for the same reason #344's line left it unchanged.
+  // Stop and scoped acceptance lookup failures added two constant diagnostics
+  // (18→20); optional never-accepted classification adds one more (20→21).
+  // Interpolation count stays 16.
+  "ingress-dedupe.ts": { statements: 21, interpolations: 16 },
   "approvals.ts": { statements: 9, interpolations: 24 },
-  "nats-account-runtime.ts": { statements: 23, interpolations: 45 },
+  // #240 half 2 rewired both history read sites onto the delivery journal, then
+  // review round 1 EXTRACTED both into `history-serve.ts`. 23→19 statements,
+  // 45→37 interpolations — accounted exactly, because an earlier version of this
+  // comment mis-stated all three terms:
+  // COUNTED FROM THE SOURCE, not reasoned about: HEAD had exactly FOUR
+  // `webchannel: history …` statements here and now has none.
+  //   1. `history snapshot failed`            → RELOCATED (now the snapshot's
+  //                                              read-failure line below);
+  //   2. `history snapshot resolution failed` → DELETED with the route
+  //                                              resolution it guarded;
+  //   3. `history page failed`                → RELOCATED (the pager's);
+  //   4. `history resolution failed`          → DELETED as unreachable (it
+  //                                              wrapped only `planHistoryFetch`
+  //                                              and `setImmediate`).
+  // Two relocated, two deleted: 23 − 4 = 19, and 45 − (4 × 2 interpolations,
+  // each line carrying `logSafe(peerId)` and `logSafe(err)`) = 37. An earlier
+  // version of this comment said "one route-resolution error" and named the
+  // deleted catch `history plan failed`; there were two, and that string never
+  // existed in a shipped revision.
+  //
+  // ⚠️ THE MOVE IS EXACTLY WHY `history-serve.ts` HAD TO JOIN `ENFORCED` in the
+  // same edit: a floor that drops while the lines merely relocate to an
+  // unwatched file is the audit going blind, which is the failure this per-file
+  // floor exists to make visible.
+  //
+  // #242 half 2 adds ONE statement (19→20) and ONE interpolation (37→38): the
+  // config-time reasoning diagnostic, which fires when
+  // `capabilities.reasoningDurable` is on while `capabilities.reasoning` is off.
+  // Its single interpolation is `logSafe(accountId)`, so it is WRAPPED and adds
+  // NO entry to `KNOWN_RAW` above — which is the whole point of checking both
+  // numbers rather than just the floor: a raw value would have shown up there
+  // instead, and the baseline is exact-multiset.
+  // Atomic stop coordination replaces the old callback/drop/ACK diagnostics.
+  //
+  // #400 adds ONE statement (21→22) and TWO interpolations (35→37): the warn
+  // when publishing an approval-refusal notice back to the peer throws. Both
+  // interpolations — the approval `id` (peer-supplied) and the error — are
+  // `logSafe`-wrapped, so KNOWN_RAW is unchanged.
+  // #442 adds one policy-receipt warning with one logSafe-wrapped error.
+  // #406 adds two SDK pairing statements: a warning with one logSafe-wrapped
+  // error and a constant delivery Error. The raw interpolation baseline stays unchanged.
+  "nats-account-runtime.ts": { statements: 25, interpolations: 39 },
   "auth.ts": { statements: 16, interpolations: 5 },
-  "nats-channel.ts": { statements: 22, interpolations: 33 },
-  "history.ts": { statements: 5, interpolations: 4 },
+  // #244 half B added the `Invalid get_difference` guard warn (one statement,
+  // one `logSafe(peerId)` interpolation): 22→23 statements, 33→34 interpolations.
+  //
+  // #246 half A moved inbound validation to the receive door and left ONE warn
+  // helper (`warnRefusedInbound`) where `dispatchInbound` had three guards.
+  // 23→22 statements and 34→35 interpolations, accounted exactly:
+  //   REMOVED (3 statements, 3 interpolations) — `Invalid approval_decision from `
+  //     and `Invalid get_difference from ` (one `logSafe(peerId)` each) and the
+  //     `default:`'s `Unknown message type: ` (one `logSafe(…type)`);
+  //   ADDED (2 statements, 4 interpolations) — the helper's unknown-type line
+  //     (`logSafe(failure.type)`) and its invalid-fields line (`failure.type`
+  //     raw, `logSafe(peerId)`, `logSafe(failure.reason)`).
+  // The one raw value is the five-literal `KnownInboundWsType`, allowlisted with
+  // its reason in `ALLOWED_RAW_INTERPOLATIONS` rather than banked here as debt —
+  // both PREFIXES are unchanged (the invalid-fields line gained a `: <reason>`
+  // suffix), which is what keeps the existing greps and the
+  // `nats-channel-typing.test.ts` assertions matching.
+  //
+  // Round 2 combines push diagnostics and brings the formerly hoisted journal
+  // diagnostic into the AST audit. Every interpolation uses logSafe.
+  "nats-channel.ts": { statements: 22, interpolations: 41 },
+  // ⚠️ ZERO, AND THE ENTRY STAYS — BUT IT GUARANTEES LESS THAN IT LOOKS LIKE.
+  // #240 half 2 deleted the whole core-transcript reader out of `history.ts`
+  // (the shape-drift warn, the two cursor-miss warns and the two best-effort
+  // catch warns), leaving a module that logs nothing.
+  //
+  // An earlier version of this note claimed "the day a log line comes back into
+  // it, this floor goes red". MEASURED FALSE: enforcement here is
+  // PREFIX-CONDITIONAL. `findLogStatements` only sees a call whose static text
+  // starts with one of `WEBCHANNEL_PREFIXES`, so adding
+  // `console.warn(\`[history] planning fetch for \${peerId}\`)` to `history.ts`
+  // leaves this suite 89/89 GREEN — an unwrapped, peer-controlled value, fully
+  // invisible. The same line under a `webchannel:` prefix DOES turn it red
+  // (verified both ways). So what this 0/0 entry actually enforces is "no new
+  // WEBCHANNEL-PREFIXED log line appears here unnoticed" — worth keeping, and
+  // not the blanket guarantee the old sentence promised.
+  //
+  // That is #123's deliberate design (the prefix is how it scopes itself to our
+  // records), so it is not widened here — a wider scanner would move every
+  // floor in this table at once.
+  "history.ts": { statements: 0, interpolations: 0 },
+  // FIVE statements, 20 interpolations: the read-failure line that left
+  // `nats-account-runtime.ts`, plus four this module added — the in-flight drop
+  // (the concurrency bound), the publish failure (so a throwing `sendHistory` is
+  // not misreported as a journal fault), the non-authoritative-projection report
+  // (#241 rollback), and the `ts`-fallback report. `peerId` appears in all five
+  // and is `logSafe`-wrapped in all five; everything else is a closed union or a
+  // count, enumerated in KNOWN_RAW above.
+  //
+  // ⚠️ AND THE SAME PREFIX CAVEAT APPLIES HERE, not just to the 0/0 entry above:
+  // a raw `logger?.warn?.(\`[history] serving \${peerId}\`)` inserted into this
+  // file leaves the suite GREEN (measured). This floor catches a
+  // `webchannel:`-prefixed line appearing or disappearing; it does not catch a
+  // peer value smuggled out under a different prefix.
+  //
+  // ⚠️ SECOND NEAR-MISS, SAME AXIS: wrapping each emission in a throw-guard was
+  // first done by routing it through an `emitDiagnostic(sink, message)` helper.
+  // That kept the statements visible but made the scanner report the SINK
+  // argument as two unreadable bare values per line — 10 fake violations to
+  // baseline, which would have buried the real ones. The `try { logger.x?.(…) }`
+  // shape keeps the template a direct argument of a log-shaped callee AND gets
+  // the guard. Check BOTH counts after touching these lines, not just the floor.
+  //
+  // ⚠️ THIS FLOOR ALREADY EARNED ITS KEEP ONCE. Mid-review the throttle was
+  // refactored to take a `build: (suppressed) => string` callback, which moved
+  // every template out of the log call's argument list — and the scanner, which
+  // matches on a template literal passed AS AN ARGUMENT, silently reported 0/0.
+  // Not exempt: INVISIBLE. Two numbers, deliberately kept apart because an
+  // earlier note ran them together: FOUR statements existed in the source at
+  // that moment, and the test reported `{2,7} → {0,0}` — 2/7 being the stored
+  // baseline from before that same edit added lines three and four (2 lines
+  // × {kind, peerId, kind, suppressed} and {kind, peerId, err} = 7). The
+  // failure was the only signal, and it is why the throttle now returns a count
+  // instead of taking a message.
+  // #311 adds the three byte-budget diagnostics (5→8 statements) and their
+  // fifteen interpolations (20→35): the skipped-row report and the shortened
+  // report carry {kind, peerId, count, limit, detail-or-nothing, suppressed},
+  // and the refused-send report carries {kind, peerId, rows, suppressed}. Of
+  // those, `peerId` and the skipped-row `detail` are the peer-derived ones and
+  // both are `logSafe`-wrapped; the rest are in KNOWN_RAW above with the
+  // property each rests on.
+  // #244 half B adds the two `serveDifference` failure lines (8→10 statements):
+  // the read failure {peerId, afterSeq, err} and the publish failure
+  // {peerId, fitted.length} = 5 more interpolations (35→40). `peerId` and `err`
+  // are `logSafe`-wrapped; `afterSeq` (validated integer) and `fitted.length`
+  // (count) are in KNOWN_RAW above.
+  // #356 takes the difference path to SIX statements (10→14) and 58
+  // interpolations (40→58). Four are new lines — the byte budget's skipped-row
+  // and shortened reports (mirroring the history ones), the queue-bound warn, and
+  // the THROWN-publish report round 2 added — and the two pre-existing ones each
+  // gained a `suppressed` because this path now goes through `admit` like every
+  // other failure path in the file.
+  // #401 adds the page queue's bound warn {peerId, MAX_QUEUED_PAGE_REQUESTS,
+  // suppressed} (14→15, 58→61); `peerId` is `logSafe`-wrapped.
+  // Its waiting-byte ceiling adds MAX_QUEUED_PAGE_BYTES (61→62).
+  "history-serve.ts": { statements: 15, interpolations: 62 },
   "nats-register.ts": { statements: 18, interpolations: 20 },
 };
 
@@ -323,7 +625,7 @@ describe("the checker catches every known evasion (#123)", () => {
   });
 
   it("EVASION 4: `${(err as Error).message}`, a live idiom in this repo", () => {
-    // Used in jwks.ts, nats-register.ts:278 and nats-credential-source.ts:352 —
+    // Used in jwks.ts, nats-register.ts:289 and nats-credential-source.ts:352 —
     // not an invented shape.
     const violations = check(
       "api.logger.error?.(`webchannel: probe failed: ${(err as Error).message}`);",

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll, type MockInstance } from "vitest";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +18,10 @@ vi.mock("openclaw/plugin-sdk/approval-handler-runtime", async (importOriginal) =
   return { ...actual, resolveApprovalOverGateway };
 });
 
+import {
+  startAgentLifecycleSubscription,
+  stopAgentLifecycleSubscription,
+} from "./inbound.js";
 import { NullPeerChannel } from "./channel-contract.js";
 class FakePeerChannel extends NullPeerChannel {
   setFirstLivenessHandler(_handler: any) {}
@@ -34,6 +39,8 @@ import {
   isWebChannelExecApprovalApprover,
   __approvalAccountBindingTestHook,
   ApprovalBindingMissingError,
+  approvalDecisionRejectReason,
+  ApprovalDecisionForbiddenError,
   listPendingApprovalsForPeer,
   PENDING_APPROVAL_MAX_AGE_MS,
   PENDING_APPROVAL_CAP,
@@ -50,6 +57,18 @@ import {
 import { DEFAULT_WEBCHANNEL_TENANT } from "./account-config.js";
 import { resolveWebchannelSessionRoute } from "./session-route.js";
 import { decodeStrictLogfmt } from "./test-fixtures/strict-logfmt.js";
+// #341 drives the REAL channel, because the approval journal seam lives on it.
+import { NatsChannel } from "./nats-channel.js";
+import type { NatsTransport } from "./nats-transport.js";
+import type { DeliveryJournal } from "./delivery-journal.js";
+import type { JournalEvent } from "./delivery-journal-event.js";
+// The shared reducer, folded here for the same reason `delivery-journal.test.ts`
+// and `message-adapter.test.ts` fold it: it is what a client replays, so it is
+// the only honest statement of "history shows the card and the decision".
+import {
+  reduceDurableView,
+  type DurableEvent,
+} from "../../client/src/durable-view-reducer.js";
 
 // A minimal valid pending exec approval view (the shape core hands to
 // `presentation.buildPendingPayload`). Contract: the
@@ -102,7 +121,7 @@ describe("webchannel native approval runtime", () => {
     const transport = new FakePeerChannel();
     const requestSpy = vi
       .spyOn(transport, "sendApprovalRequest")
-      .mockReturnValue(true);
+      .mockReturnValue({ delivered: true, journaled: false });
 
     const spec = createClawApprovalNativeRuntimeSpec(transport);
     const view = fakePendingExecView();
@@ -166,10 +185,10 @@ describe("webchannel native approval runtime", () => {
 
   it("emits an approval_resolved frame when the gateway resolves the approval", async () => {
     const transport = new FakePeerChannel();
-    vi.spyOn(transport, "sendApprovalRequest").mockReturnValue(true);
+    vi.spyOn(transport, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
     const resolvedSpy = vi
       .spyOn(transport, "sendApprovalResolved")
-      .mockReturnValue(true);
+      .mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
 
     const spec = createClawApprovalNativeRuntimeSpec(transport);
     const view = fakePendingExecView();
@@ -213,7 +232,14 @@ describe("webchannel native approval runtime", () => {
       phase: "resolved",
     });
 
-    expect(resolvedSpy).toHaveBeenCalledWith("web-anon", "exec-1", "allow-once");
+    // #341: the fourth argument hands the card's payload over so the channel can
+    // store the `approval` row it never got to store. This double journals
+    // nothing, so it is always owed here — with a real channel that already wrote
+    // the row at delivery only the onClaim snapshot hook is needed.
+    expect(resolvedSpy).toHaveBeenCalledWith("web-anon", "exec-1", "allow-once", {
+      journalRequestFirst: expect.objectContaining({ id: "exec-1" }),
+      onClaim: expect.any(Function),
+    });
   });
 });
 
@@ -315,7 +341,7 @@ describe("webchannel native approval origin routing (multi-user)", () => {
     const transport = new FakePeerChannel();
     const requestSpy = vi
       .spyOn(transport, "sendApprovalRequest")
-      .mockReturnValue(true);
+      .mockReturnValue({ delivered: true, journaled: false });
     const spec = createClawApprovalNativeRuntimeSpec(transport);
     const view = fakePendingExecView();
     const baseCtx = { cfg: cfgEnabled, accountId: null, context: undefined };
@@ -548,6 +574,28 @@ describe("webchannel approval decision -> gateway", () => {
     );
   });
 
+  it("allows a widget click from a channel-qualified owner fallback", async () => {
+    const cfg: any = {
+      commands: { ownerAllowFrom: ["webchannel:alice"] },
+      channels: { webchannel: { execApprovals: { enabled: true } } },
+    };
+    await handleApprovalDecision(cfg, "exec-1", "deny", "alice");
+    expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(1);
+    expect(resolveApprovalOverGateway).toHaveBeenCalledWith(
+      expect.objectContaining({ approvalId: "exec-1", decision: "deny", senderId: "alice" }),
+    );
+  });
+
+  it("refuses a widget click from an owner of another channel", async () => {
+    const cfg: any = {
+      commands: { ownerAllowFrom: ["telegram:alice", "telegram:*"] },
+      channels: { webchannel: { execApprovals: { enabled: true } } },
+    };
+    await expect(handleApprovalDecision(cfg, "exec-1", "deny", "alice"))
+      .rejects.toThrow(/not a configured exec approver/);
+    expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
+  });
+
 });
 
 describe("webchannel approver resolution", () => {
@@ -595,6 +643,154 @@ describe("webchannel approver resolution", () => {
       "alice",
       "bob",
     ]);
+  });
+
+  it("normalizes and deduplicates webchannel owners without folding peer identity case", () => {
+    const cfg: any = {
+      commands: {
+        ownerAllowFrom: ["alice", " webchannel:alice ", " WEBCHANNEL : Bob ", "bob", "webchannel: ", "", 123],
+      },
+    };
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual(["alice", "Bob", "bob"]);
+  });
+
+  it("ignores other channel owners when deciding whether the native surface is configured", () => {
+    const cfg: any = {
+      commands: { ownerAllowFrom: ["telegram:alice", "discord:*", "unknown:bob"] },
+      channels: { webchannel: { execApprovals: { enabled: true } } },
+    };
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual([]);
+    const capability = createClawApprovalCapability(new FakePeerChannel()) as any;
+    expect(capability.getExecInitiatingSurfaceState({ cfg, action: "approve" }))
+      .toEqual({ kind: "disabled" });
+  });
+
+  it("uses normalized owners when explicit approvers is empty", () => {
+    const cfg: any = {
+      commands: { ownerAllowFrom: ["webchannel:alice"] },
+      channels: { webchannel: { execApprovals: { approvers: [] } } },
+    };
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual(["alice"]);
+  });
+
+  it.each([[" "], [123]])("does not fall back from a nonempty invalid explicit list (%j)", (entry) => {
+    const cfg: any = {
+      commands: { ownerAllowFrom: ["*"] },
+      channels: { webchannel: { execApprovals: { approvers: [entry] } } },
+    };
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual([]);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "alice" })).toBe(false);
+  });
+
+  it("#415 D6: strips the channel's own explicit prefix and preserves other literal peer IDs", () => {
+    const cfg: any = {
+      commands: { ownerAllowFrom: ["*"] },
+      channels: { webchannel: { execApprovals: { approvers: [" webchannel:alice ", "telegram:bob"] } } },
+    };
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual(["alice", "telegram:bob"]);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "alice" })).toBe(true);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "webchannel:alice" })).toBe(false);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "telegram:bob" })).toBe(true);
+  });
+
+  it("#415 D6: normalizes and deduplicates explicit prefixes without changing peer case", () => {
+    const cfg: any = { channels: { webchannel: { execApprovals: { approvers: [
+      " WEBCHANNEL : Alice ", "Alice", "webchannel:alice", "webchannel: ",
+    ] } } } };
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual(["Alice", "alice"]);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "ALICE" })).toBe(false);
+  });
+
+  it("#415 D6: an empty prefixed explicit peer cannot broaden to owner fallback", () => {
+    const cfg: any = { commands: { ownerAllowFrom: ["*"] }, channels: { webchannel: { execApprovals: { approvers: ["webchannel: "] } } } };
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual([]);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "alice" })).toBe(false);
+  });
+
+  it("#415 D6: resolves an account-qualified wildcard only on its selected account", () => {
+    const cfg: any = { channels: { webchannel: { accounts: {
+      a: { execApprovals: { approvers: ["webchannel:*"] } },
+      b: { execApprovals: { approvers: ["webchannel:bob"] } },
+    } } } };
+    expect(isWebChannelExecApprovalApprover({ cfg, accountId: "a", senderId: "alice" })).toBe(true);
+    expect(isWebChannelExecApprovalApprover({ cfg, accountId: "b", senderId: "alice" })).toBe(false);
+    expect(isWebChannelExecApprovalApprover({ cfg, accountId: "b", senderId: "bob" })).toBe(true);
+  });
+
+  it("preserves a channel-qualified owner wildcard for authenticated peers", () => {
+    const cfg: any = { commands: { ownerAllowFrom: ["webchannel:*"] } };
+    expect(getWebChannelExecApprovalApprovers({ cfg })).toEqual(["*"]);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "alice" })).toBe(true);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: " " })).toBe(false);
+  });
+});
+
+describe('webchannel approver wildcard "*"', () => {
+  const wildcard = (accounts?: unknown) =>
+    ({
+      channels: {
+        webchannel: {
+          execApprovals: { enabled: true, approvers: ["*"] },
+          ...(accounts ? { accounts } : {}),
+        },
+      },
+    }) as any;
+
+  it("admits any peer already authenticated on the account", () => {
+    const cfg = wildcard();
+    for (const senderId of ["alice", "bob", "255f5a1e-4d5a-48d3-b983-782d3fa600da"]) {
+      expect(isWebChannelExecApprovalApprover({ cfg, senderId })).toBe(true);
+    }
+  });
+
+  it("still refuses an absent or blank sender — 'any peer' still needs a peer", () => {
+    const cfg = wildcard();
+    for (const senderId of [undefined, null, "", "   "]) {
+      expect(isWebChannelExecApprovalApprover({ cfg, senderId })).toBe(false);
+    }
+  });
+
+  it("stays account-scoped: '*' on one account says nothing about another", () => {
+    // A's list is the wildcard, B's names one peer. B must not inherit A's.
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            a: { execApprovals: { enabled: true, approvers: ["*"] } },
+            b: { execApprovals: { enabled: true, approvers: ["bob"] } },
+          },
+        },
+      },
+    } as any;
+    expect(isWebChannelExecApprovalApprover({ cfg, accountId: "a", senderId: "carol" })).toBe(true);
+    expect(isWebChannelExecApprovalApprover({ cfg, accountId: "b", senderId: "carol" })).toBe(false);
+    expect(isWebChannelExecApprovalApprover({ cfg, accountId: "b", senderId: "bob" })).toBe(true);
+  });
+
+  it("counts as a configured approver, so the native surface stays enabled", () => {
+    // `approverCount` gates the native approval client. A wildcard that read as
+    // "no approvers configured" would silently fall back to text delivery — the
+    // exact `no approval route` failure this replaces.
+    expect(getWebChannelExecApprovalApprovers({ cfg: wildcard() })).toEqual(["*"]);
+  });
+
+  it("works through the ownerAllowFrom fallback too", () => {
+    const cfg = {
+      commands: { ownerAllowFrom: ["*"] },
+      channels: { webchannel: { execApprovals: { enabled: true } } },
+    } as any;
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "alice" })).toBe(true);
+  });
+
+  it("does NOT admit anyone when the list merely CONTAINS a star-ish entry", () => {
+    // Exact match only: no globbing, no prefix matching. `"*"` is the whole
+    // entry or it is an ordinary (never-issued) peer id.
+    const cfg = {
+      channels: { webchannel: { execApprovals: { enabled: true, approvers: ["a*", "*b", "**"] } } },
+    } as any;
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "alice" })).toBe(false);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "ab" })).toBe(false);
+    expect(isWebChannelExecApprovalApprover({ cfg, senderId: "a*" })).toBe(true);
   });
 });
 
@@ -716,12 +912,12 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
   function makeAccountTransports() {
     const transportA = new FakePeerChannel();
     const transportB = new FakePeerChannel();
-    const sentA = vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue(true);
-    const sentB = vi.spyOn(transportB, "sendApprovalRequest").mockReturnValue(true);
-    const resolvedA = vi.spyOn(transportA, "sendApprovalResolved").mockReturnValue(true);
-    const resolvedB = vi.spyOn(transportB, "sendApprovalResolved").mockReturnValue(true);
+    const sentA = vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
+    const sentB = vi.spyOn(transportB, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
+    const resolvedA = vi.spyOn(transportA, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
+    const resolvedB = vi.spyOn(transportB, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
     const fallback = new FakePeerChannel();
-    const sentFallback = vi.spyOn(fallback, "sendApprovalRequest").mockReturnValue(true);
+    const sentFallback = vi.spyOn(fallback, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
     const byAccount: Record<string, FakePeerChannel> = { a: transportA, b: transportB };
     const spec = createClawApprovalNativeRuntimeSpec(
       fallback,
@@ -815,7 +1011,9 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
       pendingPayload,
     });
 
-    expect(sentB).toHaveBeenCalledWith("alice", pendingPayload);
+    // #341: the third argument is the record-time signal — this call CREATED the
+    // pending record, so the channel journals the card's row.
+    expect(sentB).toHaveBeenCalledWith("alice", pendingPayload, { redelivery: false });
     expect(sentA).not.toHaveBeenCalled();
     expect(sentFallback).not.toHaveBeenCalled();
     // The entry records the delivering account for the finalize leg.
@@ -835,10 +1033,15 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
       payload: { decision: "deny" },
       phase: "resolved",
     } as any);
-    expect(resolvedB).toHaveBeenCalledWith("alice", "exec-b3", "deny");
+    // #341: no catch-up payload because this test hand-builds the entry and never ran
+    // `deliverPending`, so there is no pending record to read. That is the same
+    // shape as a record evicted before finalize, and it takes the same answer —
+    // no catch-up payload to offer, so the resolution row is written on its own
+    // (see `updateEntry`'s note on why that is the right side to err on).
+    expect(resolvedB).toHaveBeenCalledWith("alice", "exec-b3", "deny", { onClaim: expect.any(Function) });
     expect(resolvedA).not.toHaveBeenCalled();
 
-    // Defensive path: unscoped context falls back to the entry's recorded account.
+    // A second callback for this entry is terminal, including an alternate decision.
     resolvedB.mockClear();
     await spec.transport.updateEntry!({
       cfg: cfgTwoAccounts,
@@ -848,7 +1051,7 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
       payload: { decision: "allow-once" },
       phase: "resolved",
     } as any);
-    expect(resolvedB).toHaveBeenCalledWith("alice", "exec-b3", "allow-once");
+    expect(resolvedB).not.toHaveBeenCalled(); // Finalization is terminal even with an alternate decision.
     expect(resolvedA).not.toHaveBeenCalled();
   });
 
@@ -877,7 +1080,7 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
     // The legacy single-account WS entry passes NO resolver → every account uses
     // the closure transport (there is exactly one account, no misroute possible).
     const only = new FakePeerChannel();
-    const onlySent = vi.spyOn(only, "sendApprovalRequest").mockReturnValue(true);
+    const onlySent = vi.spyOn(only, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
     const spec = createClawApprovalNativeRuntimeSpec(only); // no resolver
     const view = fakePendingExecView("exec-legacy");
     await spec.transport.deliverPending({
@@ -891,7 +1094,11 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
       view: view as any,
       pendingPayload: buildApprovalRequestPayload(view),
     });
-    expect(onlySent).toHaveBeenCalledWith("web-anon", expect.objectContaining({ id: "exec-legacy" }));
+    expect(onlySent).toHaveBeenCalledWith(
+      "web-anon",
+      expect.objectContaining({ id: "exec-legacy" }),
+      { redelivery: false },
+    );
   });
 
   it("widget-click authz is PER ACCOUNT: account-A approver cannot resolve via account B", async () => {
@@ -937,6 +1144,52 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
     expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
   });
 
+  it("#400: every pre-RPC refusal maps to the reason the peer is told; an RPC failure maps to none", async () => {
+    const reasonOf = async (call: Promise<void>) => {
+      try {
+        await call;
+      } catch (err) {
+        return approvalDecisionRejectReason(err);
+      }
+      throw new Error("expected a rejection");
+    };
+    resolveApprovalOverGateway.mockClear();
+    __approvalAccountBindingTestHook.clear();
+    // Binding missing — expired / never delivered here.
+    expect(await reasonOf(handleApprovalDecision(cfgTwoAccounts, "exec-ghost", "deny", "bob", "b")))
+      .toBe("not-pending");
+    // A live foreign-account id is indistinguishable from a missing id for both
+    // an approver and a non-approver on the receiving account. Authorization is
+    // checked only after the account binding, so caller privilege cannot reveal
+    // that the id is live elsewhere.
+    __approvalAccountBindingTestHook.record("exec-a9", "a");
+    expect(await reasonOf(handleApprovalDecision(cfgTwoAccounts, "exec-a9", "allow-once", "bob", "b")))
+      .toBe("not-pending");
+    expect(await reasonOf(handleApprovalDecision(cfgTwoAccounts, "exec-a9", "allow-once", "ann", "b")))
+      .toBe("not-pending");
+    // Once finalized, the same id still yields the same public reason.
+    __approvalAccountBindingTestHook.clear();
+    expect(await reasonOf(handleApprovalDecision(cfgTwoAccounts, "exec-a9", "allow-once", "bob", "b")))
+      .toBe("not-pending");
+    // Only an unauthorized sender on the approval's own account is distinct.
+    __approvalAccountBindingTestHook.record("exec-b4", "b");
+    expect(await reasonOf(handleApprovalDecision(cfgTwoAccounts, "exec-b4", "deny", "ann", "b")))
+      .toBe("not-approver");
+    expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
+    // The authz refusals are still logged exactly as the plain `Error`s they
+    // replaced: `logSafe(err)` renders `String(err)`, which leads with `name`.
+    const forbidden = await handleApprovalDecision(cfgTwoAccounts, "exec-b4", "deny", "ann", "b")
+      .then(() => undefined, (err: unknown) => err);
+    expect(forbidden).toBeInstanceOf(ApprovalDecisionForbiddenError);
+    expect(String(forbidden)).toBe(
+      'Error: webchannel: peer "ann" is not a configured exec approver for account "b"',
+    );
+    // The gateway RPC may have applied (a timeout), so it is NOT a refusal.
+    resolveApprovalOverGateway.mockRejectedValueOnce(new Error("gateway timeout"));
+    expect(await reasonOf(handleApprovalDecision(cfgTwoAccounts, "exec-b4", "deny", "bob", "b")))
+      .toBeUndefined();
+  });
+
   it("F1: a finalize (updateEntry) releases the binding so a later replay is rejected", async () => {
     const { spec, resolvedB } = makeAccountTransports();
     __approvalAccountBindingTestHook.clear();
@@ -951,7 +1204,9 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
       payload: { decision: "deny" },
       phase: "resolved",
     } as any);
-    expect(resolvedB).toHaveBeenCalledWith("alice", "exec-b7", "deny");
+    // `undefined` for the same reason as the finalize-routing test above: no
+    // `deliverPending` ran, so there is no pending record to catch up from.
+    expect(resolvedB).toHaveBeenCalledWith("alice", "exec-b7", "deny", { onClaim: expect.any(Function) });
 
     // Binding released → a post-finalize resolve attempt is rejected.
     resolveApprovalOverGateway.mockClear();
@@ -966,9 +1221,9 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
     // if registerFull skipped it (creds-missing). The closure/fallback transport
     // is the PRIMARY (a). A prompt for b must NOT land on the fallback.
     const primary = new FakePeerChannel();
-    const primarySent = vi.spyOn(primary, "sendApprovalRequest").mockReturnValue(true);
+    const primarySent = vi.spyOn(primary, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
     const transportA = new FakePeerChannel();
-    const aSent = vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue(true);
+    const aSent = vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
     const spec = createClawApprovalNativeRuntimeSpec(
       primary,
       (accountId) => (accountId === "a" ? transportA : undefined), // 'b' → undefined (skipped)
@@ -1063,7 +1318,7 @@ describe("webchannel pending-approval store (#15)", () => {
 
   it("deliverPending records the entry even when the socket send returns false", async () => {
     const transport = new FakePeerChannel();
-    vi.spyOn(transport, "sendApprovalRequest").mockReturnValue(false);
+    vi.spyOn(transport, "sendApprovalRequest").mockReturnValue({ delivered: false, journaled: false });
     const spec = createClawApprovalNativeRuntimeSpec(transport);
     const p = payload("exec-nf");
     await deliver(spec, null, "web-anon", p);
@@ -1073,8 +1328,8 @@ describe("webchannel pending-approval store (#15)", () => {
 
   it("updateEntry erases the entry for BOTH resolved and expired finalize", async () => {
     const transport = new FakePeerChannel();
-    vi.spyOn(transport, "sendApprovalRequest").mockReturnValue(true);
-    vi.spyOn(transport, "sendApprovalResolved").mockReturnValue(true);
+    vi.spyOn(transport, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
+    vi.spyOn(transport, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
     const spec = createClawApprovalNativeRuntimeSpec(transport);
 
     const resolved = payload("exec-r");
@@ -1093,10 +1348,10 @@ describe("webchannel pending-approval store (#15)", () => {
   it("updateEntry erases ONLY its own account's entry (same id on A and B is independent)", async () => {
     const transportA = new FakePeerChannel();
     const transportB = new FakePeerChannel();
-    vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue(true);
-    vi.spyOn(transportB, "sendApprovalRequest").mockReturnValue(true);
-    vi.spyOn(transportA, "sendApprovalResolved").mockReturnValue(true);
-    vi.spyOn(transportB, "sendApprovalResolved").mockReturnValue(true);
+    vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
+    vi.spyOn(transportB, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
+    vi.spyOn(transportA, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
+    vi.spyOn(transportB, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
     const byAccount: Record<string, FakePeerChannel> = { a: transportA, b: transportB };
     const spec = createClawApprovalNativeRuntimeSpec(
       new FakePeerChannel(),
@@ -1131,28 +1386,43 @@ describe("webchannel pending-approval store (#15)", () => {
     expect(listPendingApprovalsForPeer("a", "nobody")).toEqual([]);
   });
 
-  it("listPendingApprovalsForPeer prunes past-expiresAtMs and stale no-expiry entries, keeps fresh ones", () => {
+  it("listPendingApprovalsForPeer withholds expired entries but only DELETES abandoned ones", () => {
+    // ⚠️ WITHHOLDING AND DELETING ARE DIFFERENT BRANCHES SINCE #341, and this test
+    // was rewritten when they split. Expiry alone used to delete, and because this
+    // function runs for every registering peer of every account, that routinely
+    // destroyed the payload a still-owed durable row needed at finalize (see the
+    // "#341 … EXPIRED card keeps its record" test). Deletion is now the
+    // abandonment backstop's job alone: one grace period after a finalize was due.
     const now = Date.now();
-    // Past expiry → pruned even though its deliveredAt is recent.
+    // Past expiry, inside the grace period → withheld from the listing, KEPT.
     __pendingApprovalsTestHook.record("a", payload("expired", now - 1_000), "alice", now);
-    // No expiry, delivered longer ago than the max age → pruned.
+    // Past expiry by more than the grace period → abandoned, deleted.
+    __pendingApprovalsTestHook.record(
+      "a",
+      payload("expired-abandoned", now - PENDING_APPROVAL_MAX_AGE_MS - 1_000),
+      "alice",
+      now - PENDING_APPROVAL_MAX_AGE_MS - 1_000,
+    );
+    // No expiry, delivered longer ago than the max age → abandoned, deleted.
     __pendingApprovalsTestHook.record(
       "a",
       payload("stale-no-expiry"),
       "alice",
       now - PENDING_APPROVAL_MAX_AGE_MS - 1_000,
     );
-    // No expiry, delivered just now → kept.
+    // No expiry, delivered just now → listed.
     __pendingApprovalsTestHook.record("a", payload("fresh-no-expiry"), "alice", now);
-    // Future expiry → kept.
+    // Future expiry → listed.
     __pendingApprovalsTestHook.record("a", payload("future", now + 60_000), "alice", now);
 
+    // An expired card is NEVER offered as actionable, whether or not it survives.
     expect(listPendingApprovalsForPeer("a", "alice").map((p) => p.id).sort()).toEqual([
       "fresh-no-expiry",
       "future",
     ]);
-    // Prune is destructive: the pruned entries are gone from the store entirely.
-    expect(__pendingApprovalsTestHook.size()).toBe(2);
+    // Three survive the walk: the two listed, plus the expired-but-recent one held
+    // for a finalize that may still owe it a durable row.
+    expect(__pendingApprovalsTestHook.size()).toBe(3);
   });
 
   it("caps the store, evicting the oldest and retaining the newest", () => {
@@ -1270,8 +1540,8 @@ describe("webchannel recently-resolved store (#19)", () => {
 
   it("updateEntry records the REAL decision at finalize (captured for the snapshot)", async () => {
     const transport = new FakePeerChannel();
-    vi.spyOn(transport, "sendApprovalRequest").mockReturnValue(true);
-    vi.spyOn(transport, "sendApprovalResolved").mockReturnValue(true);
+    vi.spyOn(transport, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
+    vi.spyOn(transport, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
     const spec = createClawApprovalNativeRuntimeSpec(transport);
 
     const p = payload("exec-r");
@@ -1287,8 +1557,8 @@ describe("webchannel recently-resolved store (#19)", () => {
 
   it("an EXPIRY records the decision the builder produces ('deny'), driven through buildExpiredResult", async () => {
     const transport = new FakePeerChannel();
-    vi.spyOn(transport, "sendApprovalRequest").mockReturnValue(true);
-    vi.spyOn(transport, "sendApprovalResolved").mockReturnValue(true);
+    vi.spyOn(transport, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
+    vi.spyOn(transport, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
     const spec = createClawApprovalNativeRuntimeSpec(transport);
 
     // Prove the recorded decision comes from the BUILDER, not a test literal: take
@@ -1319,10 +1589,10 @@ describe("webchannel recently-resolved store (#19)", () => {
   it("records under the SAME account's composite key: A's finalize doesn't mask B", async () => {
     const transportA = new FakePeerChannel();
     const transportB = new FakePeerChannel();
-    vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue(true);
-    vi.spyOn(transportB, "sendApprovalRequest").mockReturnValue(true);
-    vi.spyOn(transportA, "sendApprovalResolved").mockReturnValue(true);
-    vi.spyOn(transportB, "sendApprovalResolved").mockReturnValue(true);
+    vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
+    vi.spyOn(transportB, "sendApprovalRequest").mockReturnValue({ delivered: true, journaled: false });
+    vi.spyOn(transportA, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
+    vi.spyOn(transportB, "sendApprovalResolved").mockImplementation((_peer, _id, _decision, options) => { options?.onClaim?.(); return { accepted: true, delivered: true, journaled: true, status: "journaled" }; });
     const byAccount: Record<string, FakePeerChannel> = { a: transportA, b: transportB };
     const spec = createClawApprovalNativeRuntimeSpec(
       new FakePeerChannel(),
@@ -1543,8 +1813,8 @@ describe("#93 origin routing — active lease + persisted session store", () => 
 
   it("#131: derives the persisted approval-origin key through production routing", () => {
     expect(SESSION_KEY).toBe(
-      "agent:rota:webchannel:default:direct:peercase-1:tenant:" +
-        "91e0a4247f5124d880e9876cb8ff7fefdfd74782832996312741357aa8b7fa4e",
+      "agent:rota:webchannel:default:direct:p:50656572436173652d31:tenant:" +
+        "91e0a4247f5124d880e9876cb8ff7fefdfd74782832996312741357aa8b7fa4e:peer-v2",
     );
   });
 
@@ -1934,5 +2204,565 @@ describe("approval error messages are single log records (#123)", () => {
       'webchannel: approval "exec-1" is unknown or already resolved ' +
         "(no live delivery binding) — refusing to resolve",
     );
+  });
+});
+
+describe("approval-origin barrier placement (#267)", () => {
+  // The FIX is a move, not a deletion, so the guard has to be a move too: one
+  // assertion that the agent-lifecycle seam no longer draws a barrier, and one
+  // that the approval stream's own lifetime does. Testing only the registry
+  // would let someone re-add `rotateEpoch()` to the teardown and stay green,
+  // which is exactly how the outage was introduced.
+  const slots = globalThis as unknown as Record<symbol, unknown>;
+  let saved: unknown;
+  let rotate: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    saved = slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY];
+    rotate = vi.fn();
+    slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY] = {
+      contractVersion: 1,
+      createLease: () => ({ activate() {}, release() {} }),
+      resolve: () => ({ kind: "no_match" }),
+      rotateEpoch: rotate,
+    };
+  });
+
+  afterEach(() => {
+    if (saved === undefined) delete slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY];
+    else slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY] = saved;
+  });
+
+  it("does NOT rotate when the agent-lifecycle subscription starts or stops", () => {
+    // `registerFull` wires BOTH of these, and the host re-registers plugins per
+    // load profile — several times inside one turn. Rotating here fenced off the
+    // in-flight turn's own lease and dropped every approval.
+    const api: any = {
+      registrationMode: "full",
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      runtime: { events: { onAgentEvent: () => () => {} } },
+    };
+    startAgentLifecycleSubscription(api);
+    startAgentLifecycleSubscription(api); // replace-don't-stack path
+    stopAgentLifecycleSubscription(); // the runtime-lifecycle cleanup path
+    expect(rotate).not.toHaveBeenCalled();
+  });
+
+  it("rotates exactly once when the approval stream starts", async () => {
+    const abort = new AbortController();
+    const ctx: any = {
+      cfg: cfgEnabled,
+      accountId: "default",
+      abortSignal: abort.signal,
+      channelRuntime: { runtimeContexts: { register: () => ({ dispose() {} }) } },
+    };
+    const monitorPromise = startClawApprovalMonitor(ctx);
+    expect(rotate).toHaveBeenCalledTimes(1);
+    abort.abort();
+    await monitorPromise;
+    // Teardown does not draw a second barrier; only a start does.
+    expect(rotate).toHaveBeenCalledTimes(1);
+  });
+
+  it("survives an incompatible planted registry rather than failing channel start", async () => {
+    // The getter throws on a hostile global. A channel must still come up: the
+    // same getter throws loudly on every turn, which is where it is actionable.
+    slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY] = "not-a-registry";
+    const abort = new AbortController();
+    const register = vi.fn(() => ({ dispose() {} }));
+    const ctx: any = {
+      cfg: cfgEnabled,
+      accountId: "default",
+      abortSignal: abort.signal,
+      channelRuntime: { runtimeContexts: { register } },
+    };
+    const monitorPromise = startClawApprovalMonitor(ctx);
+    expect(register).toHaveBeenCalledTimes(1);
+    abort.abort();
+    await monitorPromise;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #341 — a refused approval_request is journaled anyway, so its resolution is
+// never an orphan.
+//
+// The whole slice is about the case the transport REFUSES, so these drive the
+// real `NatsChannel` (a `FakePeerChannel` would journal nothing — the append
+// lives on the channel, at `publishApprovalFrame`) and fold the rows the journal
+// actually received through the SHARED reducer, which is what a client replays.
+// Asserting the rows alone would prove the store was written and not that
+// history shows the card and the consent, which is the bug.
+// ---------------------------------------------------------------------------
+describe("#341 approval rows survive a refused push", () => {
+  /** Transport that can be taken offline mid-test; records published types. */
+  class ToggleTransport extends EventEmitter {
+    connected = true;
+    effectiveOutboundLimit = 1_000_000;
+    readonly published: string[] = [];
+    private sid = 0;
+    subscribe(): number {
+      return ++this.sid;
+    }
+    unsubscribe(): void {
+      /* no-op */
+    }
+    publish(_subject: string, payload: string): void {
+      this.published.push((JSON.parse(payload) as { type: string }).type);
+    }
+  }
+
+  /** Journal stand-in recording the events the channel appends, in order. */
+  class RecordingJournal {
+    readonly events: JournalEvent[] = [];
+    /** The seq each recorded event was allocated — the order the projection folds. */
+    readonly seqs: number[] = [];
+    /** The conversation (peerId) each recorded event landed in, index-aligned. */
+    readonly conversations: string[] = [];
+    /** One-shot: make the NEXT append throw, the way a real store failure does. */
+    failNext = false;
+    /** Persistent: make every append of these kinds throw. */
+    readonly failKinds = new Set<JournalEvent["kind"]>();
+    private seq = 0;
+    append(conversationId: string, event: JournalEvent) {
+      if (this.failNext || this.failKinds.has(event.kind)) {
+        this.failNext = false;
+        throw new Error("journal unavailable");
+      }
+      this.events.push(event);
+      this.conversations.push(conversationId);
+      this.seqs.push(++this.seq);
+      return { seq: this.seq, inserted: true };
+    }
+    appendInboundUser(): never {
+      throw new Error("not exercised by the approval seam");
+    }
+    lookupUserMessageIdByRandomId(): undefined {
+      return undefined;
+    }
+    read(): [] {
+      return [];
+    }
+    maxSeq(): number {
+      return this.seq;
+    }
+    close(): void {
+      /* no-op */
+    }
+  }
+
+  const PEER = "web-anon";
+
+  function makeChannel(): { transport: ToggleTransport; journal: RecordingJournal; channel: NatsChannel } {
+    const transport = new ToggleTransport();
+    const journal = new RecordingJournal();
+    const channel = new NatsChannel(
+      transport as unknown as NatsTransport,
+      "acct",
+      "tenant",
+      undefined,
+      undefined,
+      { deliveryJournal: journal as unknown as DeliveryJournal },
+    );
+    return { transport, journal, channel };
+  }
+
+  function payload(id: string): ApprovalRequestPayload {
+    return {
+      id,
+      kind: "exec",
+      title: "Exec Approval Required",
+      description: "A command needs your approval.",
+      prompt: "Exec Approval Required: rm -rf /tmp/cache",
+      options: [
+        { decision: "allow-once", label: "Allow Once", style: "success" },
+        { decision: "deny", label: "Deny", style: "danger" },
+      ],
+    };
+  }
+
+  async function deliver(
+    spec: ReturnType<typeof createClawApprovalNativeRuntimeSpec>,
+    p: ApprovalRequestPayload,
+  ) {
+    return spec.transport.deliverPending({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      plannedTarget: {} as any,
+      preparedTarget: { sessionKey: PEER },
+      request: {} as any,
+      approvalKind: "exec",
+      view: fakePendingExecView(p.id) as any,
+      pendingPayload: p,
+    } as any);
+  }
+
+  beforeEach(() => {
+    __pendingApprovalsTestHook.clear();
+    __resolvedApprovalsTestHook.clear();
+    __approvalAccountBindingTestHook.clear();
+  });
+
+  it("journals the card while the transport refuses, then the decision — and history holds both", async () => {
+    const { transport, journal, channel } = makeChannel();
+    const spec = createClawApprovalNativeRuntimeSpec(channel as unknown as any);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // The #341 window: the transport is down when the prompt is delivered, so the
+    // frame is refused and the register-time snapshot is what shows the card.
+    transport.connected = false;
+    const entry = await deliver(spec, payload("exec-341"));
+    expect(transport.published).toEqual([]);
+    expect(journal.events).toEqual([
+      {
+        kind: "approval",
+        id: "exec-341",
+        approvalKind: "exec",
+        title: "Exec Approval Required",
+        description: "A command needs your approval.",
+        prompt: "Exec Approval Required: rm -rf /tmp/cache",
+        options: [
+          { decision: "allow-once", label: "Allow Once", style: "success" },
+          { decision: "deny", label: "Deny", style: "danger" },
+        ],
+      },
+    ]);
+    // The pending record is still written too — the two are one act now.
+    expect(listPendingApprovalsForPeer(null, PEER).map((p) => p.id)).toEqual(["exec-341"]);
+
+    // The peer re-registers, sees the snapshot's card and decides. By now the
+    // transport is back, so the resolve frame really is published.
+    transport.connected = true;
+    await spec.transport.updateEntry!({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      entry,
+      payload: { decision: "allow-once" },
+      phase: "resolved",
+    } as any);
+    warn.mockRestore();
+
+    expect(transport.published).toEqual(["approval_resolved"]);
+    expect(journal.events.map((e) => e.kind)).toEqual(["approval", "approvalResolution"]);
+
+    // ⭐ THE ASSERTION THE ISSUE IS ABOUT. Before #341 the stream was
+    // [approvalResolution] alone, `applyApprovalResolution` folded it onto
+    // nothing, and history showed neither the card nor the consent.
+    const view = reduceDurableView(journal.events as unknown as DurableEvent[]);
+    expect(view).toEqual([
+      {
+        kind: "approval",
+        id: "exec-341",
+        approvalKind: "exec",
+        title: "Exec Approval Required",
+        description: "A command needs your approval.",
+        prompt: "Exec Approval Required: rm -rf /tmp/cache",
+        options: [
+          { decision: "allow-once", label: "Allow Once", style: "success" },
+          { decision: "deny", label: "Deny", style: "danger" },
+        ],
+        resolvedDecision: "allow-once",
+      },
+    ]);
+  });
+
+  it("a re-delivered prompt refreshes the pending record and writes NO second row", async () => {
+    // `deliverPending` runs again for a still-pending card (stateless register /
+    // retry). The card was created once, so the journal holds one row — nothing
+    // downstream could collapse a second one (#355).
+    const { journal, channel } = makeChannel();
+    const spec = createClawApprovalNativeRuntimeSpec(channel as unknown as any);
+
+    const p = payload("exec-redelivered");
+    await deliver(spec, p);
+    await deliver(spec, p);
+
+    expect(journal.events.map((e) => e.kind)).toEqual(["approval"]);
+    expect(listPendingApprovalsForPeer(null, PEER).map((x) => x.id)).toEqual([
+      "exec-redelivered",
+    ]);
+  });
+
+  /**
+   * F2 — NO LIVE CHANNEL FOR THE ACCOUNT — IS A TRANSIENT STATE, NOT A PERMANENT
+   * ONE, and round 1 of #341 shipped as if it were permanent.
+   *
+   * `resolveApprovalTransport` reads the LIVE account map, which
+   * `nats-account-runtime.ts` deletes on a stop and re-populates on the next
+   * successful start. So a restart or a reconnect straddling one approval gives
+   * exactly: no channel at `deliverPending` (no `approval` row), a channel again
+   * at `updateEntry` — and a resolution needs no user at all, since an expiry
+   * routes through the same hook. Round 1 journaled the resolution there
+   * unconditionally and reproduced the ORIGINAL defect on this path: an orphan
+   * verdict, no card. These three drive the flip.
+   */
+  it("F2 then RECOVERED: the card's row is written late, before its decision", async () => {
+    const { journal, channel } = makeChannel();
+    // The resolver returns nothing at delivery and the live channel afterwards —
+    // the account map losing and regaining this account.
+    let live = false;
+    const spec = createClawApprovalNativeRuntimeSpec(
+      new FakePeerChannel(),
+      () => (live ? (channel as unknown as any) : undefined),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const entry = await deliver(spec, payload("exec-f2"));
+    // Delivery had nowhere to write: no channel for the account means no journal
+    // for it either.
+    expect(journal.events).toEqual([]);
+
+    live = true;
+    await spec.transport.updateEntry!({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      entry,
+      payload: { decision: "allow-once" },
+      phase: "resolved",
+    } as any);
+    warn.mockRestore();
+
+    // ⭐ REQUEST ROW FIRST, RESOLUTION SECOND — in seq order, which is what the
+    // projection folds on. Round 1 produced `[approvalResolution]` alone here.
+    expect(journal.events.map((e) => e.kind)).toEqual(["approval", "approvalResolution"]);
+    expect(journal.seqs).toEqual([1, 2]);
+    const view = reduceDurableView(journal.events as unknown as DurableEvent[]);
+    expect(view).toEqual([
+      expect.objectContaining({
+        kind: "approval",
+        id: "exec-f2",
+        title: "Exec Approval Required",
+        resolvedDecision: "allow-once",
+      }),
+    ]);
+  });
+
+  it("F2 all the way through the resolve: ZERO rows, never a lone verdict", async () => {
+    // The account never comes back. A resolution row on its own is the orphan, so
+    // history holds neither half rather than a decision attached to nothing.
+    const { journal } = makeChannel();
+    const spec = createClawApprovalNativeRuntimeSpec(
+      new FakePeerChannel(),
+      () => undefined,
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const entry = await deliver(spec, payload("exec-no-channel"));
+    await spec.transport.updateEntry!({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      entry,
+      payload: { decision: "deny" },
+      phase: "resolved",
+    } as any);
+    warn.mockRestore();
+
+    expect(journal.events).toEqual([]);
+    // The pending record was still written at delivery and erased at finalize, so
+    // the snapshot behaved normally throughout.
+    expect(listPendingApprovalsForPeer(null, PEER)).toEqual([]);
+  });
+
+  it("a SWALLOWED request append is caught up at resolution time too", async () => {
+    // The twin of the F2 flip, and the reason the pending record tracks the ROW
+    // rather than "was a channel there": §15.8 makes a failed append a swallowed
+    // warning, so delivery can publish the card and store nothing. The resolution
+    // append is independent and would succeed on its own — the orphan again.
+    const { journal, channel } = makeChannel();
+    const spec = createClawApprovalNativeRuntimeSpec(channel as unknown as any);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    journal.failNext = true;
+    const entry = await deliver(spec, payload("exec-swallowed"));
+    expect(journal.events).toEqual([]);
+
+    await spec.transport.updateEntry!({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      entry,
+      payload: { decision: "deny" },
+      phase: "resolved",
+    } as any);
+    warn.mockRestore();
+
+    expect(journal.events.map((e) => e.kind)).toEqual(["approval", "approvalResolution"]);
+    const view = reduceDurableView(journal.events as unknown as DurableEvent[]);
+    expect(view).toEqual([
+      expect.objectContaining({ id: "exec-swallowed", resolvedDecision: "deny" }),
+    ]);
+  });
+
+  it("an EXPIRED card keeps its record, so the expiry finalize can still write the row", async () => {
+    // P2-1: `listPendingApprovalsForPeer` runs for every registering peer of every
+    // account and used to DELETE any past-`expiresAtMs` entry. A card raised under
+    // F2 owes its row to the resolve leg, and core fires the expiry finalize from a
+    // timer — a poll-phase register callback beats a due timer under load — so the
+    // register routinely destroyed the payload the finalize was about to need, and
+    // the verdict landed alone. The record now survives the listing.
+    const { journal, channel } = makeChannel();
+    let live = false;
+    const spec = createClawApprovalNativeRuntimeSpec(
+      new FakePeerChannel(),
+      () => (live ? (channel as unknown as any) : undefined),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // Raised with no channel for the account, and already past its expiry.
+    const expiring = { ...payload("exec-expired"), expiresAtMs: Date.now() - 1_000 };
+    const entry = await deliver(spec, expiring);
+    expect(journal.events).toEqual([]);
+
+    // Any peer registering anywhere walks every entry. The card is withheld from
+    // the snapshot (it is expired — never offer it as actionable) but KEPT.
+    expect(listPendingApprovalsForPeer(null, PEER)).toEqual([]);
+
+    // The account is back by the time core's expiry finalize runs.
+    live = true;
+    await spec.transport.updateEntry!({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      entry,
+      payload: { decision: "deny" },
+      phase: "expired",
+    } as any);
+    warn.mockRestore();
+
+    expect(journal.events.map((e) => e.kind)).toEqual(["approval", "approvalResolution"]);
+    expect(journal.seqs).toEqual([1, 2]);
+    expect(reduceDurableView(journal.events as unknown as DurableEvent[])).toEqual([
+      expect.objectContaining({ id: "exec-expired", resolvedDecision: "deny" }),
+    ]);
+  });
+
+  it("a row written for peer B does not satisfy peer A's resolution", async () => {
+    // `requestJournaled` is scoped to the peer it was set for, because the
+    // journal's conversation id IS the peerId. The store keeps ONE record per
+    // (account, approvalId), so the second delivery's success would otherwise read
+    // as "the row exists" when A's finalize came along — and A's conversation
+    // would get a verdict with no card. Latent today (core plans one target), but
+    // `finalizeWrappedEntries` iterates entries.
+    const { journal, channel } = makeChannel();
+    let live = false;
+    const spec = createClawApprovalNativeRuntimeSpec(
+      new FakePeerChannel(),
+      () => (live ? (channel as unknown as any) : undefined),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const card = payload("exec-two-peers");
+
+    // Peer A: no channel, so no row is written for A's conversation.
+    const entryA = await spec.transport.deliverPending({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      plannedTarget: {} as any,
+      preparedTarget: { sessionKey: "peer-A" },
+      request: {} as any,
+      approvalKind: "exec",
+      view: fakePendingExecView(card.id) as any,
+      pendingPayload: card,
+    } as any);
+
+    // Peer B: the channel is back, so B's conversation DOES get the row.
+    live = true;
+    await spec.transport.deliverPending({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      plannedTarget: {} as any,
+      preparedTarget: { sessionKey: "peer-B" },
+      request: {} as any,
+      approvalKind: "exec",
+      view: fakePendingExecView(card.id) as any,
+      pendingPayload: card,
+    } as any);
+    expect(journal.conversations).toEqual(["peer-B"]);
+
+    // Finalizing A must NOT read B's success as its own.
+    await spec.transport.updateEntry!({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      entry: entryA,
+      payload: { decision: "allow-once" },
+      phase: "resolved",
+    } as any);
+    warn.mockRestore();
+
+    expect(journal.conversations).toEqual(["peer-B", "peer-A", "peer-A"]);
+    expect(journal.events.map((e) => e.kind)).toEqual([
+      "approval",
+      "approval",
+      "approvalResolution",
+    ]);
+    // A's own conversation folds to a card WITH its decision, not a lone verdict.
+    const inA = journal.events.filter((_e, i) => journal.conversations[i] === "peer-A");
+    expect(reduceDurableView(inA as unknown as DurableEvent[])).toEqual([
+      expect.objectContaining({ id: "exec-two-peers", resolvedDecision: "allow-once" }),
+    ]);
+  });
+
+  it("a caught-up card with a FAILED verdict append leaves the card, not nothing", async () => {
+    // The other leg of `journalRequestFirst`, which had no proof: the catch-up
+    // request row lands and the resolution append then fails (swallowed, §15.8).
+    // History holds an undecided card — the safe direction, and the one the
+    // reducer renders without inventing anything.
+    const { journal, channel } = makeChannel();
+    let live = false;
+    const spec = createClawApprovalNativeRuntimeSpec(
+      new FakePeerChannel(),
+      () => (live ? (channel as unknown as any) : undefined),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const entry = await deliver(spec, payload("exec-verdict-lost"));
+    live = true;
+    journal.failKinds.add("approvalResolution");
+    await spec.transport.updateEntry!({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      entry,
+      payload: { decision: "deny" },
+      phase: "resolved",
+    } as any);
+    warn.mockRestore();
+
+    expect(journal.events.map((e) => e.kind)).toEqual(["approval"]);
+    const view = reduceDurableView(journal.events as unknown as DurableEvent[]);
+    expect(view).toEqual([expect.objectContaining({ id: "exec-verdict-lost" })]);
+    // Undecided, and by an ABSENT key rather than an explicit undefined — the
+    // shape `applyApproval` builds when no resolution ever folded in.
+    expect(view[0]).not.toHaveProperty("resolvedDecision");
+  });
+
+  it("when the LATE request row cannot be written either, the verdict row is skipped too", async () => {
+    // The "or neither" half of the invariant, isolated: the store rejects every
+    // `approval` append and would happily take the `approvalResolution`. Writing
+    // it would manufacture the exact orphan this slice removes, so the channel
+    // declines — history holds nothing rather than a decision attached to no card.
+    const { journal, channel } = makeChannel();
+    const spec = createClawApprovalNativeRuntimeSpec(channel as unknown as any);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    journal.failKinds.add("approval");
+    const entry = await deliver(spec, payload("exec-both-fail"));
+    await spec.transport.updateEntry!({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      entry,
+      payload: { decision: "deny" },
+      phase: "resolved",
+    } as any);
+    warn.mockRestore();
+
+    expect(journal.events).toEqual([]);
   });
 });

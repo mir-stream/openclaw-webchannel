@@ -20,6 +20,7 @@
 import { webcrypto } from "node:crypto";
 
 import type { BootstrapClaims } from "./bootstrap-claims.js";
+import { assertBootstrapLifetime } from "./bootstrap-claims.js";
 
 /** An immutable RS256 signer for bootstrap JWTs. */
 export type BootstrapIssuer = {
@@ -64,6 +65,7 @@ export async function createBootstrapIssuer(opts: {
 
   return {
     async sign(claims: BootstrapClaims): Promise<string> {
+      assertBootstrapLifetime(claims);
       const header = { alg: "RS256", typ: "JWT", kid };
       const signingInput = `${b64urlJson(header)}.${b64urlJson(claims)}`;
       const sig = await webcrypto.subtle.sign(

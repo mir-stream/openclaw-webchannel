@@ -1,19 +1,46 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
 import {
   BoundedOverflowResolver,
   overflowResolverMetadataBytes,
 } from "./inbound-overflow-resolver.js";
 import { InboundRetentionBudget } from "./inbound-retention.js";
-import { createIngressOutcomeStore, type IngressOutcomeStore } from "./ingress-outcome.js";
+import {
+  createIngressOutcomeStore,
+  type IngressOutcome,
+  type IngressOutcomeStore,
+} from "./ingress-outcome.js";
 import { createBoundedInboundDebouncer } from "./bounded-inbound-debouncer.js";
 import {
   CancelledInboundFallbackTombstones,
+  createIngressOnFlush,
   recordCancelledInboundItems,
 } from "./ingress-dedupe.js";
+import { openDeliveryJournal, type DeliveryJournal } from "./delivery-journal.js";
+import { createIngressDebounceCallbacks } from "./ingress-debounce-callbacks.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+/** In-memory `PersistentDedupe`, so tests can drive the REAL outcome store. */
+function memoryDedupe(): PersistentDedupe {
+  const values = new Set<string>();
+  const scoped = (key: string, options?: { namespace?: string }) => `${options?.namespace}:${key}`;
+  return {
+    hasRecent: async (key: string, options?: { namespace?: string }) => values.has(scoped(key, options)),
+    checkAndRecord: async (key: string, options?: { namespace?: string }) => {
+      const scopedKey = scoped(key, options);
+      const fresh = !values.has(scopedKey);
+      values.add(scopedKey);
+      return fresh;
+    },
+    forget: async (key: string, options?: { namespace?: string }) => values.delete(scoped(key, options)),
+    warmup: vi.fn(), clearMemory: vi.fn(), memorySize: vi.fn(),
+  } as unknown as PersistentDedupe;
+}
 
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
-const recorded = (outcome: "accepted" | "overloaded" = "overloaded") => {
+const recorded = (outcome: IngressOutcome = "overloaded") => {
   const write = {
     outcome,
     created: true,
@@ -25,6 +52,83 @@ const recorded = (outcome: "accepted" | "overloaded" = "overloaded") => {
 };
 
 describe("BoundedOverflowResolver", () => {
+  it("bounds joined wire correlations by count and charged metadata, then releases all claims", async () => {
+    let finish!: (value: any) => void;
+    const lookup = new Promise<any>((resolve) => { finish = resolve; });
+    const store = { lookup: vi.fn(() => lookup) } as unknown as IngressOutcomeStore;
+    const token = new InboundRetentionBudget().createSessionToken();
+    const request = (i: number) => ({
+      accountId: "a", peerId: "p", key: "p:logical", id: `wire-${i}`, randomId: "logical", sessionToken: token,
+    });
+    const sendRejected = vi.fn((_request: { id: string }) => true);
+    const resolver = new BoundedOverflowResolver({ outcomeStore: store, sendAck: () => true, sendRejected });
+    expect(resolver.tryStart(request(0))).toEqual({ status: "started" });
+    let bytes = overflowResolverMetadataBytes(request(0));
+    for (let i = 1; i < 64; i++) {
+      expect(resolver.tryStart(request(i))).toEqual({ status: "joined" });
+      bytes += overflowResolverMetadataBytes(request(i));
+    }
+    expect(resolver.usage()).toEqual({ tasks: 1, metadataBytes: bytes });
+    expect(resolver.tryStart(request(64))).toEqual({ status: "correlation-count" });
+    const byteLimited = new BoundedOverflowResolver({
+      outcomeStore: store, sendAck: () => true, sendRejected: () => true,
+      maxMetadataBytes: overflowResolverMetadataBytes(request(0)) * 2,
+    });
+    expect(byteLimited.tryStart(request(0))).toEqual({ status: "started" });
+    expect(byteLimited.tryStart(request(1))).toEqual({ status: "joined" });
+    expect(byteLimited.tryStart(request(2))).toEqual({ status: "process-bytes" });
+    expect(store.lookup).toHaveBeenCalledTimes(2);
+    finish({ status: "found", outcome: "overloaded" });
+    await vi.waitFor(() => expect(resolver.usage()).toEqual({ tasks: 0, metadataBytes: 0 }));
+    expect(byteLimited.usage()).toEqual({ tasks: 0, metadataBytes: 0 });
+    expect(sendRejected.mock.calls.map(([value]) => value.id)).toEqual(Array.from({ length: 64 }, (_, i) => `wire-${i}`));
+    expect(resolver.hasActiveClaim("a", "p:logical")).toBe(false);
+  });
+
+  it("drains new correlations added during async delivery before releasing the logical claim", async () => {
+    let finishAck!: () => void;
+    const gate = new Promise<void>((resolve) => { finishAck = resolve; });
+    const store = { record: vi.fn(async () => recorded("cancelled").result) } as unknown as IngressOutcomeStore;
+    const ids: string[] = [];
+    const resolver = new BoundedOverflowResolver({
+      outcomeStore: store, sendRejected: () => true,
+      sendAck: async ({ id }) => { ids.push(id); if (id === "first") await gate; return true; },
+    });
+    const request = { accountId: "a", peerId: "p", key: "p:logical", id: "first", randomId: "logical", recoverCancelled: true, sessionToken: new InboundRetentionBudget().createSessionToken() };
+    resolver.tryStart(request);
+    await vi.waitFor(() => expect(ids).toEqual(["first"]));
+    expect(resolver.tryStart({ ...request, id: "retry", recoverCancelled: false })).toEqual({ status: "joined" });
+    finishAck();
+    await vi.waitFor(() => expect(resolver.usage()).toEqual({ tasks: 0, metadataBytes: 0 }));
+    expect(ids).toEqual(["first", "retry"]);
+  });
+
+  it("keeps joined metadata charged through retirement and isolates account and peer claims", async () => {
+    let finish!: (value: any) => void;
+    const lookup = new Promise<any>((resolve) => { finish = resolve; });
+    const store = { lookup: vi.fn(() => lookup) } as unknown as IngressOutcomeStore;
+    const budget = new InboundRetentionBudget();
+    const sendAck = vi.fn(() => true);
+    const resolver = new BoundedOverflowResolver({ outcomeStore: store, sendAck, sendRejected: () => true });
+    const first = { accountId: "a", peerId: "p", key: "p:logical", id: "first", randomId: "logical", sessionToken: budget.createSessionToken() };
+    resolver.tryStart(first);
+    resolver.tryStart({ ...first, id: "retry" });
+    resolver.tryStart({ ...first, accountId: "b", sessionToken: budget.createSessionToken() });
+    resolver.tryStart({ ...first, peerId: "q", key: "q:logical", sessionToken: budget.createSessionToken() });
+    expect(resolver.usage().tasks).toBe(3);
+    expect(resolver.invalidateSession(first.sessionToken)).toBe(true);
+    const retained = resolver.usage();
+    expect(resolver.tryStart({ ...first, id: "later" })).toEqual({ status: "busy-session" });
+    expect(resolver.usage()).toEqual(retained);
+    expect(resolver.hasActiveClaim("a", "p:logical")).toBe(true);
+    finish({ status: "found", outcome: "cancelled" });
+    await vi.waitFor(() => expect(resolver.usage()).toEqual({ tasks: 0, metadataBytes: 0 }));
+    expect(sendAck).toHaveBeenCalledTimes(2);
+    expect(resolver.hasActiveClaim("a", "p:logical")).toBe(false);
+    expect(resolver.hasActiveClaim("b", "p:logical")).toBe(false);
+    expect(resolver.hasActiveClaim("a", "q:logical")).toBe(false);
+  });
+
   it("requires a durable overload marker and enforces one task per session", async () => {
     let finish!: (value: any) => void;
     const lookup = new Promise<any>((resolve) => { finish = resolve; });
@@ -98,11 +202,14 @@ describe("BoundedOverflowResolver", () => {
       accountId: "a", peerId: "p", key: "p:i", id: "i", sessionToken: token,
       recoverCancelled: true,
     })).toEqual({ status: "started" });
-    expect(store.record).toHaveBeenCalledWith("a", "p:i", "accepted", {
-      replaceOpposite: true,
+    // #344: the cancelled-recovery write records `cancelled`, not `accepted` —
+    // it writes no journal row on purpose, and under `accepted` the accept seam
+    // read that as its crash window and re-ran the killed text.
+    expect(store.record).toHaveBeenCalledWith("a", "p:i", "cancelled", {
+      replaceOthers: true,
     });
     expect(resolver.invalidateSession(token)).toBe(true);
-    const late = recorded("accepted");
+    const late = recorded("cancelled");
     finishRecord(late.result);
     await tick();
     await tick();
@@ -178,7 +285,13 @@ describe("BoundedOverflowResolver", () => {
       overloadedValues.add(scoped);
       return fresh;
     });
-    const store = createIngressOutcomeStore({ accepted, overloaded });
+    // #344: a third outcome store. This test never records `cancelled`, so an
+    // empty one is enough.
+    const store = createIngressOutcomeStore({
+      accepted,
+      overloaded,
+      cancelled: persistent(new Set<string>()),
+    });
     const sendRejected = vi.fn(() => true);
     const resolver = new BoundedOverflowResolver({
       outcomeStore: store, sendAck: () => true, sendRejected,
@@ -339,7 +452,7 @@ describe("BoundedOverflowResolver", () => {
     expect(resolver.hasActiveClaim("a", "p:i")).toBe(false);
   });
 
-  it("recovers a stopped replay as accepted through the bounded overflow gate", async () => {
+  it("recovers a stopped replay as CANCELLED through the bounded overflow gate", async () => {
     const accountId = "acct";
     const peerId = "peer";
     const id = "stopped";
@@ -355,21 +468,21 @@ describe("BoundedOverflowResolver", () => {
       fallback,
     );
     expect(fallback.has(key, accountId)).toBe(true);
-    expect(lostCancellationAck).toHaveBeenCalledWith(peerId, [id]);
+    expect(lostCancellationAck).not.toHaveBeenCalled();
 
     const accepted = new Set<string>();
     const overloaded = new Set<string>([`${accountId}:${key}`]);
     let finishRecord!: (value: any) => void;
     const recordGate = new Promise<any>((resolve) => { finishRecord = resolve; });
-    const recovery = recorded("accepted");
+    const recovery = recorded("cancelled");
     recovery.write.commit.mockImplementation(() => {
       accepted.add(`${accountId}:${key}`);
     });
     const store = {
       peek: vi.fn(() => "overloaded" as const),
       lookup: vi.fn(),
-      record: vi.fn((recordAccount: string, recordKey: string, outcome: string, options?: { replaceOpposite?: boolean }) => {
-        if (options?.replaceOpposite && outcome === "accepted") {
+      record: vi.fn((recordAccount: string, recordKey: string, outcome: string, options?: { replaceOthers?: boolean }) => {
+        if (options?.replaceOthers && outcome === "cancelled") {
           overloaded.delete(`${recordAccount}:${recordKey}`);
         }
         return recordGate;
@@ -431,8 +544,10 @@ describe("BoundedOverflowResolver", () => {
     expect(overflowRequest?.recoverCancelled).toBe(true);
     expect(store.peek).not.toHaveBeenCalled();
     expect(store.lookup).not.toHaveBeenCalled();
-    expect(store.record).toHaveBeenCalledWith(accountId, key, "accepted", {
-      replaceOpposite: true,
+    // #344: `cancelled` — see the resolver's own comment on why this id must
+    // never be reclassified, and why borrowing `accepted` for it was the bug.
+    expect(store.record).toHaveBeenCalledWith(accountId, key, "cancelled", {
+      replaceOthers: true,
     });
     expect(resolver.usage()).toEqual({
       tasks: 1,
@@ -452,12 +567,471 @@ describe("BoundedOverflowResolver", () => {
     expect(overloaded).toEqual(new Set());
     expect(acked).toHaveBeenCalledWith(expect.objectContaining({
       accountId, peerId, id, key, recoverCancelled: true,
-    }));
+    }), undefined, true);
     expect(rejected).not.toHaveBeenCalled();
     expect(dispatched).not.toHaveBeenCalled();
     expect(fallback.has(key, accountId)).toBe(false);
     expect(resolver.usage()).toEqual({ tasks: 0, metadataBytes: 0 });
     occupied.reservation.release();
     debouncer.dispose();
+  });
+});
+
+/**
+ * #344 round 3 — THE SECOND DOOR ONTO AN ORPHANED `accepted` MARKER.
+ *
+ * Round 2 taught `ingress-dedupe.ts`'s found branch that the journal is the
+ * accept authority, and stopped there. This resolver reaches the SAME marker by a
+ * different route — an id whose raw frame could not be retained — and its
+ * accepted arm still read the marker as a terminal accept. The consequence is
+ * strictly worse than the bug round 2 fixed: the resolver ACKS, so the client
+ * drains its ledger entry and never replays, and the message is lost for good.
+ *
+ * Reachable without a crash: §15.6's destructive cutover regenerates the journal
+ * file and orphans EVERY surviving marker, and `DEFAULT_BUSY_TURN_LIMITS` caps a
+ * session at 32 messages, so a reconnect that replays an offline backlog
+ * overflows past entry 32 straight into `onOverflow` → `tryStart` → `resolve()`.
+ */
+describe("BoundedOverflowResolver — the journal is the accept authority (#344)", () => {
+  const dirs: string[] = [];
+  const openIn = (): DeliveryJournal => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-overflow-journal-"));
+    dirs.push(dir);
+    return openDeliveryJournal({ databasePath: join(dir, "journal.db") });
+  };
+  afterEach(() => {
+    while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
+  });
+
+  const ACCOUNT = "acct";
+  const PEER = "peer-0";
+
+  /** The real outcome store, seeded with a committed `accepted` marker. */
+  const seedAcceptedMarker = async (key: string) => {
+    const store = createIngressOutcomeStore({
+      accepted: memoryDedupe(),
+      overloaded: memoryDedupe(),
+      cancelled: memoryDedupe(),
+    });
+    const seeded = await store.record(ACCOUNT, key, "accepted");
+    if (seeded.status !== "recorded") throw new Error("could not seed the marker");
+    seeded.write.commit();
+    return store;
+  };
+
+  it("publishes NOTHING for an accepted marker with no journal row, so the replay survives", async () => {
+    const journal = openIn();
+    try {
+      const outcomeStore = await seedAcceptedMarker(`${PEER}:r-1`);
+      expect(journal.read(PEER)).toEqual([]);
+      const acks: Array<{ id: string; committed: unknown }> = [];
+      const rejects: string[] = [];
+      const resolver = new BoundedOverflowResolver({
+        outcomeStore,
+        lookupUserRow: ({ peerId }, idempotencyKey) =>
+          journal.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
+        sendAck: ({ id }, committed) => { acks.push({ id, committed }); return true; },
+        sendRejected: ({ id }) => { rejects.push(id); return true; },
+      });
+
+      expect(resolver.tryStart({
+        accountId: ACCOUNT, peerId: PEER, key: `${PEER}:r-1`, id: "u-1", randomId: "r-1",
+        sessionToken: new InboundRetentionBudget().createSessionToken(),
+      })).toEqual({ status: "started" });
+      await tick(); await tick();
+
+      // The whole point: no ack, so the client's ledger entry stays and the
+      // message comes back — and no rejection either, since it was not refused.
+      expect(acks).toEqual([]);
+      expect(rejects).toEqual([]);
+      expect(journal.read(PEER)).toEqual([]);
+      expect(resolver.usage()).toEqual({ tasks: 0, metadataBytes: 0 });
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("and the replay it preserved is then journaled, dispatched and echoed by the flush path", async () => {
+    // The end-to-end claim the withheld ack rests on. Same orphan, same store —
+    // once retention frees, the ordinary seam admits it for real.
+    const journal = openIn();
+    try {
+      const outcomeStore = await seedAcceptedMarker(`${PEER}:r-1`);
+      const dispatched: string[] = [];
+      const acked: Array<{ ids: string[]; committed: unknown }> = [];
+      const onFlush = createIngressOnFlush<{
+        peerId: string;
+        message: { type: "user_message"; text: string; id: string; random_id: string };
+      }>({
+        accountId: ACCOUNT,
+        outcomeStore,
+        beginBatch: () => ({
+          offer: (message) => ({
+            status: "accepted" as const,
+            commit: () => dispatched.push(message.text),
+            rollback: () => {},
+          }),
+          finish: vi.fn(),
+        }),
+        sendAck: (_peerId, ids, committed) => { acked.push({ ids: [...ids], committed }); return true; },
+        sendInboundRejected: () => true,
+        deliveryJournal: journal,
+        logWarn: () => {},
+      });
+
+      await onFlush([{
+        peerId: PEER,
+        message: { type: "user_message", text: "hello", id: "u-1", random_id: "r-1" },
+      }]);
+
+      expect(journal.read(PEER).map((row) => row.event)).toEqual([
+        { kind: "user", id: "webchannel-user-1", text: "hello", turnId: "u-1", randomId: "r-1" },
+      ]);
+      expect(dispatched).toEqual(["hello"]);
+      expect(acked).toEqual([{
+        ids: ["u-1"],
+        committed: [{ random_id: "r-1", messageId: "webchannel-user-1", seq: 1 }],
+      }]);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("acks WITH the committed echo when the row exists (#333 path 6)", async () => {
+    const journal = openIn();
+    try {
+      const outcomeStore = await seedAcceptedMarker(`${PEER}:r-1`);
+      const { messageId, seq } = journal.appendInboundUser(PEER, {
+        text: "hello", turnId: "u-1", randomId: "r-1",
+      });
+      const acks: Array<{ id: string; committed: unknown }> = [];
+      const resolver = new BoundedOverflowResolver({
+        outcomeStore,
+        lookupUserRow: ({ peerId }, idempotencyKey) =>
+          journal.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
+        sendAck: ({ id }, committed) => { acks.push({ id, committed }); return true; },
+        sendRejected: () => true,
+      });
+
+      resolver.tryStart({
+        accountId: ACCOUNT, peerId: PEER, key: `${PEER}:r-1`, id: "u-1", randomId: "r-1",
+        sessionToken: new InboundRetentionBudget().createSessionToken(),
+      });
+      await tick(); await tick();
+
+      // Before round 3 this arm acked BARE, so a replay resolved through overflow
+      // left the client's optimistic bubble un-adopted until the next gap-sync.
+      expect(acks).toEqual([{
+        id: "u-1",
+        committed: [{ random_id: "r-1", messageId, seq }],
+      }]);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("#399 acks a converged retry with the first retry's row instead of treating it as an orphan", async () => {
+    const journal = openIn();
+    try {
+      const dispatch = journal.dispatch!;
+      const owner = dispatch.activate();
+      const [original] = dispatch.accept(owner, PEER, [{ text: "transfer", turnId: "u-0", randomId: "r-0" }]);
+      dispatch.claim(owner, PEER, ["r-0"]);
+      dispatch.recoverInterrupted(dispatch.activate());
+      const replacement = dispatch.activate();
+      const [first] = dispatch.accept(replacement, PEER, [{ text: "transfer", turnId: "u-1", randomId: "r-1", retryOf: original!.messageId }]);
+      // The second retry was accepted by converging on `first`: a marker, no own row.
+      expect(dispatch.accept(replacement, PEER, [{ text: "transfer", turnId: "u-2", randomId: "r-2", retryOf: original!.messageId }]))
+        .toEqual([expect.objectContaining({ messageId: first!.messageId, inserted: false, converged: true })]);
+      const outcomeStore = await seedAcceptedMarker(`${PEER}:r-2`);
+      const acks: Array<{ id: string; committed: unknown }> = [];
+      const resolver = new BoundedOverflowResolver({
+        outcomeStore,
+        lookupUserRow: ({ peerId }, idempotencyKey) => journal.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
+        lookupConvergedRetry: ({ peerId }) => dispatch.convergence(peerId, "r-2"),
+        sendAck: ({ id }, committed) => { acks.push({ id, committed }); return true; },
+        sendRejected: () => true,
+      });
+      const start = (id: string, retryOf?: string) => resolver.tryStart({
+        accountId: ACCOUNT, peerId: PEER, key: `${PEER}:r-2`, id, randomId: "r-2",
+        sessionToken: new InboundRetentionBudget().createSessionToken(), ...(retryOf ? { retryOf } : {}),
+      });
+      expect(start("u-2", original!.messageId)).toEqual({ status: "started" });
+      await tick(); await tick();
+      expect(acks).toEqual([{ id: "u-2", committed: [{ random_id: "r-2", messageId: first!.messageId, converged: true }] }]);
+      // Without its provenance the same marker is still an unproven orphan.
+      start("u-2");
+      await tick(); await tick();
+      expect(acks).toHaveLength(1);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("#425 leaves an accepted retry marker unresolved when its exact convergence receipt is missing", async () => {
+    const journal = openIn();
+    try {
+      const dispatch = journal.dispatch!;
+      const owner = dispatch.activate();
+      const [original] = dispatch.accept(owner, PEER, [{ text: "transfer", turnId: "u-0", randomId: "r-0" }]);
+      dispatch.claim(owner, PEER, ["r-0"]);
+      dispatch.recoverInterrupted(dispatch.activate());
+      const replacement = dispatch.activate();
+      dispatch.accept(replacement, PEER, [{ text: "transfer", turnId: "u-1", randomId: "r-1", retryOf: original!.messageId }]);
+      const outcomeStore = await seedAcceptedMarker(`${PEER}:r-2`);
+      const acks: unknown[] = [];
+      const resolver = new BoundedOverflowResolver({
+        outcomeStore,
+        lookupUserRow: ({ peerId }, idempotencyKey) => journal.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
+        lookupConvergedRetry: ({ peerId }) => dispatch.convergence(peerId, "r-2"),
+        sendAck: (...args) => { acks.push(args); return true; },
+        sendRejected: () => true,
+      });
+      resolver.tryStart({
+        accountId: ACCOUNT, peerId: PEER, key: `${PEER}:r-2`, id: "u-2", randomId: "r-2", retryOf: original!.messageId,
+        sessionToken: new InboundRetentionBudget().createSessionToken(),
+      });
+      await tick(); await tick();
+      expect(dispatch.convergence(PEER, "r-2")).toBeUndefined();
+      expect(acks).toEqual([]);
+      expect(resolver.usage().tasks).toBe(0);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it.each(["recovered", "found"] as const)("#399 a %s cancellation of a converged retry echoes no other row", async (mode) => {
+    const journal = openIn();
+    try {
+      const dispatch = journal.dispatch!;
+      const owner = dispatch.activate();
+      const [original] = dispatch.accept(owner, PEER, [{ text: "transfer", turnId: "u-0", randomId: "r-0" }]);
+      dispatch.claim(owner, PEER, ["r-0"]);
+      dispatch.recoverInterrupted(dispatch.activate());
+      const replacement = dispatch.activate();
+      dispatch.accept(replacement, PEER, [{ text: "transfer", turnId: "u-1", randomId: "r-1", retryOf: original!.messageId }]);
+      const outcomeStore = createIngressOutcomeStore({ accepted: memoryDedupe(), overloaded: memoryDedupe(), cancelled: memoryDedupe() });
+      if (mode === "found") {
+        const seeded = await outcomeStore.record(ACCOUNT, `${PEER}:r-2`, "cancelled");
+        if (seeded.status !== "recorded") throw new Error("could not seed the marker");
+        seeded.write.commit();
+      }
+      const acks: Array<{ id: string; committed: unknown; cancelled: unknown }> = [];
+      const resolver = new BoundedOverflowResolver({
+        outcomeStore,
+        lookupUserRow: ({ peerId }, idempotencyKey) => journal.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
+        lookupConvergedRetry: ({ peerId }) => dispatch.convergence(peerId, "r-2"),
+        sendAck: ({ id }, committed, cancelled) => { acks.push({ id, committed, cancelled }); return true; },
+        sendRejected: () => true,
+      });
+      resolver.tryStart({
+        accountId: ACCOUNT, peerId: PEER, key: `${PEER}:r-2`, id: "u-2", randomId: "r-2", retryOf: original!.messageId,
+        sessionToken: new InboundRetentionBudget().createSessionToken(), ...(mode === "recovered" ? { recoverCancelled: true } : {}),
+      });
+      await tick(); await tick();
+      expect(acks).toEqual([{ id: "u-2", committed: undefined, cancelled: true }]);
+    } finally {
+      journal.close();
+    }
+  });
+
+  it("#399 overflow requests carry the frame's retry_of", () => {
+    const starts: unknown[] = [];
+    const callbacks = createIngressDebounceCallbacks({
+      accountId: ACCOUNT,
+      outcomeStore: createIngressOutcomeStore({ accepted: memoryDedupe(), overloaded: memoryDedupe(), cancelled: memoryDedupe() }),
+      overflowResolver: { tryStart: (request: unknown) => { starts.push(request); return { status: "started" }; }, hasActiveClaim: () => false } as unknown as BoundedOverflowResolver,
+      cancelledFallback: new CancelledInboundFallbackTombstones(),
+      deliveryJournal: { lookupUserMessageIdByRandomId: () => undefined },
+      sessionToken: () => new InboundRetentionBudget().createSessionToken(),
+      sendAck: () => true,
+      sendRejected: () => true,
+    });
+    const item = { peerId: PEER, message: { type: "user_message" as const, id: "u-2", random_id: "r-2", text: "transfer", retry_of: "webchannel-user-1" } };
+    callbacks.onOverflow!({ key: PEER, item, recoverCancelled: false } as never);
+    callbacks.onOverflowClaimed!(item);
+    expect(starts).toEqual([
+      expect.objectContaining({ id: "u-2", retryOf: "webchannel-user-1" }),
+      expect.objectContaining({ id: "u-2", retryOf: "webchannel-user-1" }),
+    ]);
+  });
+
+  it("keeps the pre-#344 ack when no journal is wired at all", async () => {
+    // The resolver is built at module scope, before any account opens a journal,
+    // and callers that predate it still construct one. No authority to consult ⇒
+    // the marker decides, exactly as it did.
+    const outcomeStore = await seedAcceptedMarker(`${PEER}:r-1`);
+    const acks: string[] = [];
+    const resolver = new BoundedOverflowResolver({
+      outcomeStore,
+      sendAck: ({ id }) => { acks.push(id); return true; },
+      sendRejected: () => true,
+    });
+
+    resolver.tryStart({
+      accountId: ACCOUNT, peerId: PEER, key: `${PEER}:r-1`, id: "u-1", randomId: "r-1",
+      sessionToken: new InboundRetentionBudget().createSessionToken(),
+    });
+    await tick(); await tick();
+
+    expect(acks).toEqual(["u-1"]);
+  });
+});
+
+/**
+ * #344 round 4 — SILENCE ONLY PRESERVES A REPLAY IF EVERY READER STAYS SILENT.
+ *
+ * Round 3 taught this resolver to withhold a verdict for an `accepted` marker
+ * with no journal row, on the reasoning that the client's ledger entry survives
+ * and the next replay reaches the flush path. It did not. `outcomeStore.lookup()`
+ * WARMS THE PROCESS HOT CACHE on its found path (so does `write.commit()`), and
+ * the debouncer's `peekOutcome` fast path reads that cache BEFORE it charges
+ * retention — so the very next replay was acked away by `onKnownOutcome` and
+ * never reached `onFlush`, the journal, or the found branch. The resolver's
+ * silence bought nothing while a second reader still answered.
+ *
+ * These drive the REAL debouncer + resolver + outcome store + journal + flush
+ * seam, in the older-client key shape (no `random_id`, so the overflow request's
+ * `${peer}:${wireId}` and the marker's key agree — the shape that makes the
+ * resolver's accepted arm reachable at all, per #355).
+ */
+describe("#344: an accepted orphan survives the fast path, the resolver and the budget", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true });
+  });
+
+  const ACCOUNT = "acct";
+  const PEER = "peer-0";
+
+  /** The whole ingress chain, wired the way `nats-account-runtime.ts` wires it. */
+  const buildChain = async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-p1-journal-"));
+    dirs.push(dir);
+    const journal = openDeliveryJournal({ databasePath: join(dir, "journal.db") });
+    const outcomeStore = createIngressOutcomeStore({
+      accepted: memoryDedupe(), overloaded: memoryDedupe(), cancelled: memoryDedupe(),
+    });
+    // The crash-window state: a durable `accepted` marker, an empty journal.
+    const seeded = await outcomeStore.record(ACCOUNT, `${PEER}:u-1`, "accepted");
+    if (seeded.status !== "recorded") throw new Error("could not seed the marker");
+    seeded.write.commit();
+
+    const acks: string[] = [];
+    const rejects: string[] = [];
+    const dispatched: string[] = [];
+    const resolver = new BoundedOverflowResolver({
+      outcomeStore,
+      lookupUserRow: ({ peerId }, idempotencyKey) =>
+        journal.lookupUserMessageIdByRandomId(peerId, idempotencyKey),
+      sendAck: ({ id }) => { acks.push(id); return true; },
+      sendRejected: ({ id }) => { rejects.push(id); return true; },
+    });
+    const budget = new InboundRetentionBudget({
+      maxMessagesPerSession: 1, maxBytesPerSession: 1,
+      maxMessagesPerProcess: 1, maxBytesPerProcess: 1,
+    });
+    const tokens = new Map<string, ReturnType<InboundRetentionBudget["createSessionToken"]>>();
+    const sessionToken = (peer: string) => {
+      let token = tokens.get(peer);
+      if (!token) { token = budget.createSessionToken(); tokens.set(peer, token); }
+      return token;
+    };
+    const debouncer = createBoundedInboundDebouncer<any>({
+      debounceMs: 0,
+      buildKey: (item: any) => item.peerId,
+      sessionToken,
+      budget,
+      measure: () => 1,
+      getId: (item: any) => item.message.id,
+      isOverflowClaimed: (peer, id) => resolver.hasActiveClaim(ACCOUNT, `${peer}:${id}`),
+      peekOutcome: (peer, id) => outcomeStore.peek(ACCOUNT, `${peer}:${id}`),
+      onKnownOutcome: (_peer, id, outcome) => {
+        if (outcome === "overloaded") rejects.push(id);
+        else acks.push(id);
+      },
+      onOverflow: ({ key: peer, id }) => {
+        resolver.tryStart({
+          accountId: ACCOUNT, peerId: peer, key: `${peer}:${id}`, id: id!,
+          sessionToken: sessionToken(peer),
+        });
+      },
+      onFlush: createIngressOnFlush<any>({
+        accountId: ACCOUNT,
+        outcomeStore,
+        beginBatch: () => ({
+          offer: (message: any, reservation: any) => {
+            reservation?.transfer("pending");
+            return {
+              status: "accepted" as const,
+              commit: () => { dispatched.push(message.text); reservation?.release(); },
+              rollback: () => reservation?.release(),
+            };
+          },
+          finish: vi.fn(),
+        }),
+        sendAck: (_peer, ids) => { acks.push(...ids); return true; },
+        sendInboundRejected: (_peer, ids) => { rejects.push(...ids); return true; },
+        deliveryJournal: journal,
+        logWarn: () => {},
+      }),
+    });
+    const replay = () => debouncer.push({
+      peerId: PEER, message: { type: "user_message", text: "hello", id: "u-1" },
+    });
+    return { journal, budget, debouncer, replay, acks, rejects, dispatched };
+  };
+
+  it("stays silent through BOTH replays while retention is still full", async () => {
+    const chain = await buildChain();
+    try {
+      const blocker = chain.budget.tryReserve(chain.budget.createSessionToken(), 1, "pending");
+      if (blocker.status !== "accepted") throw new Error("unexpected blocker rejection");
+
+      // Replay 1 overflows into the resolver, which declines to answer.
+      expect(chain.replay()).toMatchObject({ status: "overflow" });
+      await tick(); await tick();
+
+      // Replay 2, with the budget STILL full. Before round 4 this one was acked
+      // by the fast path off the hot entry replay 1's lookup had just warmed.
+      expect(chain.replay()).toMatchObject({ status: "overflow" });
+      await tick(); await tick();
+
+      expect(chain.acks).toEqual([]);
+      expect(chain.rejects).toEqual([]);
+      expect(chain.journal.read(PEER)).toEqual([]);
+      blocker.reservation.release();
+    } finally {
+      chain.debouncer.dispose();
+      chain.journal.close();
+    }
+  });
+
+  it("and once retention frees, the replay is journaled, dispatched and acked", async () => {
+    const chain = await buildChain();
+    try {
+      const blocker = chain.budget.tryReserve(chain.budget.createSessionToken(), 1, "pending");
+      if (blocker.status !== "accepted") throw new Error("unexpected blocker rejection");
+      expect(chain.replay()).toMatchObject({ status: "overflow" });
+      await tick(); await tick();
+      expect(chain.journal.read(PEER)).toEqual([]);
+
+      blocker.reservation.release();
+      expect(chain.replay()).toEqual({ status: "accepted" });
+      await tick(); await tick();
+
+      // The message the marker said was already accepted is finally in the SSOT,
+      // answered, and acked once — by the flush path, the only reader that can
+      // ADMIT. Acked BARE: this client sent no `random_id` to key an echo by.
+      expect(chain.journal.read(PEER).map((row) => row.event)).toEqual([
+        { kind: "user", id: "webchannel-user-1", text: "hello", turnId: "u-1" },
+      ]);
+      expect(chain.dispatched).toEqual(["hello"]);
+      expect(chain.acks).toEqual(["u-1"]);
+      expect(chain.rejects).toEqual([]);
+    } finally {
+      chain.debouncer.dispose();
+      chain.journal.close();
+    }
   });
 });

@@ -44,15 +44,16 @@ import { decodeStrictLogfmt } from "./test-fixtures/strict-logfmt.js";
 
 type Item = {
   peerId: string;
-  message: { type: "user_message"; text: string; id?: string };
+  message: { type: "user_message"; text: string; id?: string; random_id?: string };
 };
 
-const item = (peerId: string, text: string, id?: string): Item => ({
+const item = (peerId: string, text: string, id?: string, randomId?: string): Item => ({
   peerId,
   message: {
     type: "user_message",
     text,
     ...(id !== undefined ? { id } : {}),
+    ...(randomId !== undefined ? { random_id: randomId } : {}),
   },
 });
 
@@ -302,6 +303,108 @@ describe("filterFreshInboundItems", () => {
   });
 });
 
+// #243 half 1: the DEDUPE key source moves from the wire `id` to the client
+// idempotency `random_id`, while the wire `id` stays the durable id (unchanged).
+// These pin the three behaviours the slice must have — key on random_id, do NOT
+// dedupe distinct random_ids, and fall back to the wire id when random_id is
+// absent — plus the invariant that keeps `journalEventForInboundUser` unable to
+// refuse anything: a usable WIRE id is still required to produce a key at all.
+describe("ingressDedupeKey — #243 half 1 random_id dedupe", () => {
+  it("keys on random_id (not the wire id) when present", async () => {
+    const { checkAndRecord, calls } = fakeChecker();
+    await filterFreshInboundItems(
+      [item("peerX", "hi", "wire-id-1", "rand-abc")],
+      "acctY",
+      checkAndRecord,
+    );
+    // The key BODY is the random_id, NOT the wire id.
+    expect(calls).toEqual([{ key: "peerX:rand-abc", namespace: "acctY" }]);
+  });
+
+  it("dedupes a RETRY that reuses the SAME random_id (even with a different wire id)", async () => {
+    // A reconnect replay carries the same random_id; the durable wire id is what
+    // the client re-mints per attempt in the FUTURE (half 2), so prove the
+    // dedupe survives a differing wire id as long as random_id is stable.
+    const { checkAndRecord } = fakeChecker();
+    const out = await filterFreshInboundItems(
+      [
+        item("p1", "hello", "wire-1", "same-random"),
+        item("p1", "hello", "wire-2", "same-random"), // retry → dropped
+      ],
+      "acct",
+      checkAndRecord,
+    );
+    expect(out).toEqual([item("p1", "hello", "wire-1", "same-random")]);
+  });
+
+  it("does NOT dedupe two messages with DIFFERENT random_ids (even on the same wire id)", async () => {
+    const { checkAndRecord } = fakeChecker();
+    const out = await filterFreshInboundItems(
+      [
+        item("p1", "a", "wire-1", "rand-1"),
+        item("p1", "b", "wire-1", "rand-2"), // distinct random_id → kept
+      ],
+      "acct",
+      checkAndRecord,
+    );
+    expect(out).toHaveLength(2);
+  });
+
+  it("falls back to the wire id when random_id is ABSENT (dedupes exactly as before)", async () => {
+    const { checkAndRecord, calls } = fakeChecker();
+    const out = await filterFreshInboundItems(
+      [
+        item("p1", "a", "wire-id-9"), // no random_id
+        item("p1", "b", "wire-id-9"), // same wire id → duplicate
+      ],
+      "acct",
+      checkAndRecord,
+    );
+    expect(out).toEqual([item("p1", "a", "wire-id-9")]);
+    // The key body is the wire id, exactly as pre-#243.
+    expect(calls[0]).toEqual({ key: "p1:wire-id-9", namespace: "acct" });
+  });
+
+  it("falls back to the wire id when random_id is present but OUT OF BOUNDS (>128)", async () => {
+    const { checkAndRecord, calls } = fakeChecker();
+    const rid129 = "r".repeat(129);
+    await filterFreshInboundItems(
+      [item("p1", "a", "wire-id-7", rid129)],
+      "acct",
+      checkAndRecord,
+    );
+    // Unusable random_id → key on the (usable) wire id, never the junk value.
+    expect(calls).toEqual([{ key: "p1:wire-id-7", namespace: "acct" }]);
+  });
+
+  it("dedupes a 128-char random_id at the length bound", async () => {
+    const { checkAndRecord } = fakeChecker();
+    const rid128 = "r".repeat(128);
+    const out = await filterFreshInboundItems(
+      [item("p1", "first", "w1", rid128), item("p1", "second", "w2", rid128)],
+      "acct",
+      checkAndRecord,
+    );
+    expect(out).toEqual([item("p1", "first", "w1", rid128)]);
+  });
+
+  it("keeps the invariant: a valid random_id with an UNUSABLE wire id is id-less (no key, never journaled)", async () => {
+    // The journal/ack path still needs a usable WIRE id (half 1 keeps the durable
+    // id = wire id). So a valid random_id CANNOT drag an over-length wire id into
+    // the accept seam — such an item takes the id-less admit path (no checker
+    // call, un-deduped), exactly as an over-length id does today.
+    const { checkAndRecord } = fakeChecker();
+    const id129 = "a".repeat(129);
+    const out = await filterFreshInboundItems(
+      [item("p1", "a", id129, "valid-random"), item("p1", "b", id129, "valid-random")],
+      "acct",
+      checkAndRecord,
+    );
+    expect(out).toHaveLength(2);
+    expect(checkAndRecord).not.toHaveBeenCalled();
+  });
+});
+
 describe("createIngressOnFlush — the REAL onFlush index-nats.ts wires", () => {
   /**
    * Build the real factory with a captured dispatch sink. `dispatched` records
@@ -513,7 +616,7 @@ describe("recordCancelledInboundItems — P0-7b (/stop-cancelled buffered messag
     expect(acks).toEqual([]);
   });
 
-  it("fails open: a throwing checkAndRecord still acks (best-effort) and logs", async () => {
+  it("withholds ACK when cancellation persistence fails", async () => {
     const checkAndRecord = vi.fn(async () => {
       throw new Error("disk boom");
     });
@@ -526,8 +629,8 @@ describe("recordCancelledInboundItems — P0-7b (/stop-cancelled buffered messag
       (peerId, ids) => { acks.push({ peerId, ids }); return true; },
       log,
     );
-    // Record threw, but the ack still fires (drains the ledger) and a warn is logged.
-    expect(acks).toEqual([{ peerId: "p1", ids: ["idA"] }]);
+    // A memory-only result cannot settle the client's durable replay ledger.
+    expect(acks).toEqual([]);
     expect(log).toHaveBeenCalledTimes(1);
   });
 
@@ -728,13 +831,21 @@ describe("real createPersistentDedupe (hermetic, isolated state dir)", () => {
         ...persistentOptions,
         namespacePrefix: "webchannel-inbound-overloaded",
       });
+      // #344: the third outcome namespace, real like its siblings so this
+      // survives-a-restart probe covers it too.
+      const cancelled = createPersistentDedupe({
+        ...persistentOptions,
+        namespacePrefix: "webchannel-inbound-cancelled",
+      });
       return {
         accepted,
         overloaded,
+        cancelled,
         failures,
         store: createIngressOutcomeStore({
           accepted,
           overloaded,
+          cancelled,
           warnFailure: (_accountId, category) => failures.push(category),
         }),
       };
@@ -905,9 +1016,9 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
         _accountId: string,
         key: string,
         _outcome: IngressOutcome,
-        options?: { replaceOpposite?: boolean },
+        options?: { replaceOthers?: boolean },
       ) => {
-        if (!options?.replaceOpposite) return normalA.result;
+        if (!options?.replaceOthers) return normalA.result;
         return key === "p:a" ? cancellationAWait : cancelledB.result;
       }),
       forget: vi.fn(), hotSize: vi.fn(), rollbackRecoverySize: vi.fn(),
@@ -945,7 +1056,7 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
             "acct",
             `${entry.item.peerId}:${entry.id}`,
             "accepted",
-            { replaceOpposite: true },
+            { replaceOthers: true },
           );
           if (result.status === "recorded") result.write.commit();
         }
@@ -958,7 +1069,7 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
     expect(budget.usage()).toEqual({ messages: 2, bytes: 2 });
     expect(debouncer.cancelKey("p", { notify: true })).toBe(true);
     await vi.waitFor(() => expect(store.record).toHaveBeenCalledWith(
-      "acct", "p:a", "accepted", { replaceOpposite: true },
+      "acct", "p:a", "accepted", { replaceOthers: true },
     ));
 
     // Cancellation(A) is now queued behind normal receipt(A). Resolving B's
@@ -1160,7 +1271,7 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
       onCancel: async (entries) => {
         for (const entry of entries) {
           const key = `${entry.item.peerId}:${entry.id}`;
-          const result = await store.record("acct", key, "accepted", { replaceOpposite: true });
+          const result = await store.record("acct", key, "accepted", { replaceOthers: true });
           if (result.status === "recorded") result.write.commit();
         }
         await cancellationAck;
@@ -1288,7 +1399,11 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
     expect(budget.usage()).toEqual({ messages: 0, bytes: 0 });
   });
 
-  it("preserves a cancellation-owned accepted marker when a normal write settles late", async () => {
+  it("preserves the cancellation-owned marker when a normal write settles late", async () => {
+    // #344 renamed this from "…accepted marker": the cancellation now owns a
+    // `cancelled` marker in its own namespace, so the accept path's late rollback
+    // cannot reach it by construction rather than by discipline. Both are
+    // asserted below — the old property and the one that now subsumes it.
     let finishRecord!: (value: any) => void;
     const record = new Promise<any>((resolve) => { finishRecord = resolve; });
     let active = true;
@@ -1341,6 +1456,7 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
     expect(commit).not.toHaveBeenCalled();
     expect(late.write.rollback).toHaveBeenCalledTimes(1);
     expect(store.forget).not.toHaveBeenCalledWith("acct", "p:i", "accepted");
+    expect(store.forget).not.toHaveBeenCalledWith("acct", "p:i", "cancelled");
     expect(sendAck).not.toHaveBeenCalled();
     expect(budget.usage()).toEqual({ messages: 0, bytes: 0 });
   });
@@ -1387,7 +1503,20 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
       forget: vi.fn(async (key: string, options?: { namespace?: string }) =>
         overloadedValues.delete(scoped(key, options))),
     } as unknown as PersistentDedupe;
-    const outcomeStore = createIngressOutcomeStore({ accepted, overloaded });
+    const outcomeStore = createIngressOutcomeStore({
+      accepted,
+      overloaded,
+      // #344: unused by this test — a genuinely EMPTY third namespace. It must
+      // not borrow `overloaded`'s membership: `cancelled` outranks `overloaded`
+      // in the lookup precedence, so a shared `hasRecent` would report every
+      // overloaded key as cancelled.
+      cancelled: {
+        hasRecent: vi.fn(async () => false),
+        checkAndRecord: vi.fn(async () => true),
+        forget: vi.fn(async () => false),
+        warmup: vi.fn(), clearMemory: vi.fn(), memorySize: vi.fn(),
+      } as unknown as PersistentDedupe,
+    });
     let dispatches = 0;
     const offer = vi.fn((_message: Item["message"], reservation?: {
       release(): void;
@@ -1502,10 +1631,13 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
     expect(store.lookup).not.toHaveBeenCalled();
     expect(offer).not.toHaveBeenCalled();
     expect(store.record).toHaveBeenCalledTimes(2);
-    expect(store.record).toHaveBeenNthCalledWith(2, "acct", "p:i", "accepted", {
-      replaceOpposite: true,
+    // #344: the fallback's retry records `cancelled`. It writes no journal row
+    // on purpose, so it must not share a marker value with the accept seam's
+    // crash window — that collision is what re-ran `/stop`-killed text.
+    expect(store.record).toHaveBeenNthCalledWith(2, "acct", "p:i", "cancelled", {
+      replaceOthers: true,
     });
-    expect(sendAck).toHaveBeenCalledWith("p", ["i"]);
+    expect(sendAck).toHaveBeenCalledWith("p", ["i"], undefined, ["i"]);
   });
 });
 

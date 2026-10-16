@@ -27,7 +27,7 @@ describe("formatAccountReadiness (Gate B)", () => {
       issuer: "https://saas.example",
       audience: "acme",
       jwks: { keyCount: 2 },
-      dmSecurity: "open",
+      dmPolicy: "open",
     });
     expect(r.verdict).toBe("READY");
     expect(r.line).toContain('account "acme" READY');
@@ -38,7 +38,7 @@ describe("formatAccountReadiness (Gate B)", () => {
     // The line reports the scope webchannel ENFORCES itself, not the operator's
     // global session.dmScope — proving per-user isolation is active.
     expect(r.line).toContain("dmScope=per-account-channel-peer (webchannel-enforced)");
-    expect(r.line).toContain("dmSecurity=open");
+    expect(r.line).toContain("dmPolicy=open");
   });
 
   it("empty JWKS → FAIL line (cannot verify any bootstrap JWT)", () => {

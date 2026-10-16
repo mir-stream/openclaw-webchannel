@@ -130,9 +130,31 @@ if grep -rnE 'handleUpgrade|[?]ticket=|WebChannelTransport' "$PKG/dist"; then
   exit 1
 fi
 
+# A residual `/src/` reference means the bundle would try to resolve a source
+# path that the published tarball does not ship — the thing this whole smoke
+# test exists to catch.
+#
+# ⚠️ ESBUILD'S MODULE BANNER IS NOT ONE, AND EXCLUDING IT IS NOT A SOFTENING.
+# esbuild prefixes each inlined module with a bare `// <relative path>` comment.
+# Since #240 half 2 the plugin has a PRODUCTION cross-package source import —
+# `journal-history.ts` pulls the client's `durable-view-reducer.ts`, because
+# `history == live` requires literally one reducer — so `index-nats.js` now
+# carries `// ../client/src/durable-view-reducer.ts` with the reducer INLINED
+# directly beneath it. That line is evidence the bundle is self-contained, and
+# the unfiltered grep read it as proof of the opposite. (It only appeared now:
+# in half 1 the module had no callers and was tree-shaken out.)
+#
+# So the filter drops ONLY a line that is entirely an esbuild banner — `// ` and
+# a single token, nothing else. An import specifier, a `require(...)`, a dynamic
+# `import(...)` or any string literal still matches, because none of those can
+# be the whole of such a line. Proven both ways in
+# `scripts/pack-load-smoke-selftest.sh`: the real banner passes, and an injected
+# `require("./src/leak.js")` — on its own line, appended to a banner line, and
+# inside a comment — still fails.
 for f in dist/index-nats.js dist/setup-entry.js dist/rotate-key-entry.js; do
-  if [ "$(grep -cF '/src/' "$PKG/$f" || true)" -ne 0 ]; then
+  if [ "$(grep -F '/src/' "$PKG/$f" | grep -cvE '^// [^[:space:]]+$' || true)" -ne 0 ]; then
     echo "ERROR: $f contains a residual './src/' reference — bundle is not self-contained." >&2
+    grep -F '/src/' "$PKG/$f" | grep -vE '^// [^[:space:]]+$' | head -5 >&2
     exit 1
   fi
 done

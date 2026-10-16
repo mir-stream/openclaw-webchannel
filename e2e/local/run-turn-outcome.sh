@@ -223,7 +223,7 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
               "issuer": "$SAAS_ISSUER"
             }
           },
-          "dmSecurity": "allowlist",
+          "dmPolicy": "allowlist",
           "allowFrom": ["$PEER_ID"]
         }
       }
@@ -284,7 +284,7 @@ echo "[run-turn-outcome] ✓ credentials persisted at $CRED_FILE"
 
 # 6b². Re-assert the register-hop admission shape AFTER `channels add`. The
 #      setup adapter writes the demo-proven block (`admission: "register-hop"`,
-#      `dmSecurity: "open"`) into the account — but "auto" is an EXPLICIT
+#      `dmPolicy: "open"`) into the account — but "auto" is an EXPLICIT
 #      override that disables the account-bound NATS register hop (the live
 #      account subject has no prepared verifier/handler), and this harness
 #      exists precisely to drive the register hop. Restore the pre-add intent:
@@ -295,11 +295,11 @@ node -e '
   const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
   const a = cfg.channels.webchannel.accounts[acct];
   a.nats = { ...(a.nats ?? {}), admission: "register-hop" };
-  a.dmSecurity = "allowlist";
+  a.dmPolicy = "allowlist";
   a.allowFrom = [peer];
   fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
 ' "$OCH/.openclaw/openclaw.json" "$ACCOUNT_ID" "$PEER_ID"
-echo "[run-turn-outcome] ✓ re-asserted admission=register-hop + dmSecurity=allowlist for account $ACCOUNT_ID"
+echo "[run-turn-outcome] ✓ re-asserted admission=register-hop + dmPolicy=allowlist for account $ACCOUNT_ID"
 
 # ---------------------------------------------------------------------------
 # 6c. Boot the isolated gateway — CONSUME-ONLY. No acquisition env

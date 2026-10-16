@@ -20,6 +20,7 @@ import {
   makeAgentIdentity,
   registerAgent,
   settle,
+  settleUntil,
   type AgentIdentity,
   type ServerHandler,
 } from "./nats-client-wrapped.test-harness.js";
@@ -100,9 +101,16 @@ async function connectWrapper(
     tenant: TENANT,
     peerId: PEER,
     heartbeatIntervalMs: 0,
-    // Pin the reconnect backoff far beyond any `settle()` window. The default is
-    // jittered (`Math.random()`), so a test that drops the socket would otherwise
-    // race a redial + re-register against its own assertions.
+    // Push the reconnect backoff's CEILING far beyond any `settle()` window, so a
+    // test that drops the socket is unlikely to race a redial + re-register
+    // against its own assertions.
+    //
+    // NOT a pin, despite what this comment used to claim: `scheduleReconnect()`
+    // uses FULL JITTER — `Math.random() * min(capMs, baseMs * 2 ** attempts)` —
+    // so the delay is uniform on [0, 60_000) and a small draw still redials
+    // inside the window. That residual race is #307. A test that drops the
+    // socket and then asserts on `connected` must use
+    // `closeLiveSocketWithoutRedial()`, which removes it outright.
     reconnectBaseMs: 60_000,
     reconnectCapMs: 60_000,
     registration: {
@@ -131,6 +139,75 @@ const heldOf = (w: WebChannelNATSClient) =>
 const openTurnsOf = (w: WebChannelNATSClient): Set<string> =>
   (w as unknown as { openTurns: Set<string> }).openTurns;
 
+/**
+ * Wait for an opening send to actually reach the wire AND be acked — the
+ * precondition that every "the turn is open" assertion below really has.
+ *
+ * `settle()` is a fixed 36 ms wall-clock budget standing in for the register
+ * handshake (an X25519 unwrap), the queue flush, the publish and the ack
+ * round-trip. On a loaded runner that work does not finish inside the budget and
+ * the next assertion reads a state that has simply not arrived yet — #307. More
+ * `settle()` rounds move that race rather than removing it, so the tests whose
+ * precondition is "the send landed" wait for the landing instead.
+ *
+ * Deliberately scoped to a plain opening send on a healthy connection. A held,
+ * evicted, capacity-refused, post-terminal or post-close send has a different
+ * terminal state — and picking one for it would be inventing the test's intent —
+ * so those keep their explicit waits.
+ *
+ * Two names rather than one parameter, because which state is terminal depends
+ * on the fixture: `connectWrapper()` acks, so its sends end at "accepted";
+ * `connectWrapper({ ack: false })` never does, so its sends stop at "sent" and
+ * waiting for "accepted" there would hang until the timeout. Making that visible
+ * at the call site is the point — a shared default would silently pick wrong.
+ */
+const untilSendState = (w: WebChannelNATSClient, text: string, state: "sent" | "accepted"): Promise<void> =>
+  settleUntil(
+    () => w.getState().messages.some((m) => m.text === text && m.sendState === state),
+    { label: `the send ${JSON.stringify(text)} to reach sendState=${state}` },
+  );
+/** For an ACKING fixture (`connectWrapper()`). */
+const untilAccepted = (w: WebChannelNATSClient, text: string): Promise<void> =>
+  untilSendState(w, text, "accepted");
+/** For a NON-acking fixture (`connectWrapper({ ack: false })`) — "sent" is terminal there. */
+const untilSent = (w: WebChannelNATSClient, text: string): Promise<void> =>
+  untilSendState(w, text, "sent");
+
+/**
+ * Drop the live socket WITHOUT racing the redial that dropping it schedules.
+ *
+ * `ws.onclose` calls `scheduleReconnect()`, which computes
+ * `delay = Math.random() * min(capMs, baseMs * 2 ** attempts)`. That is FULL
+ * JITTER — uniform on [0, 60_000) for this fixture — so `reconnectBaseMs`/
+ * `reconnectCapMs` set the CEILING of the draw, they do not pin the delay. A
+ * draw below the surrounding `settle()` window redials, re-registers, fires
+ * `onSession`, and flips `connected` back to TRUE. That is #307: the observed
+ * `expected true to be false` is a reconnect that genuinely succeeded, not a
+ * disconnect that failed to propagate.
+ *
+ * Measured, and the reason it only ever bites CI: `settle()` is ~37 ms on an
+ * idle box but ~384 ms when the event loop is contended, so a loaded shared
+ * runner widens the window ~10× — from a 0.06% to a 0.64% chance per close.
+ * Rare, load-correlated, and survives a rerun on the same SHA. Raising the
+ * backoff only makes it rarer; it can never make it absent.
+ *
+ * `scheduleReconnect()` runs synchronously inside `close()`, so pinning the draw
+ * across that one call is enough — and `Math.random() → 1` yields the maximum
+ * delay (60 s), which is what the fixture always meant by "far beyond any
+ * settle() window". Stubbing the global is the only lever available: the
+ * reconnect backoff has no injection seam (`_retryRandom` exists on
+ * `WebChannelNatsClient`, but it feeds the SEND-retry scheduler, not
+ * `NatsClient.scheduleReconnect`).
+ */
+const closeLiveSocketWithoutRedial = (socket?: FakeNatsWS): void => {
+  const random = vi.spyOn(Math, "random").mockReturnValue(1);
+  try {
+    (socket ?? FakeNatsWS.instances.at(-1)!).close();
+  } finally {
+    random.mockRestore();
+  }
+};
+
 describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)", () => {
   it("a pre-connect queued send opens only after its first real publication", async () => {
     const h = await connectWrapper({ ack: false }, { connect: false });
@@ -149,7 +226,12 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
     expect(h.wrapper.getState().turnActive).toBeUndefined();
 
     h.wrapper.connect();
-    await settle();
+    // Wait for the publication itself: this leg is the register handshake (an
+    // X25519 unwrap) plus the queue flush, which a loaded runner can stretch
+    // past any fixed tick budget.
+    await settleUntil(() => receipt.snapshot().state === "sent", {
+      label: "the pre-connect queued send to reach the wire after connect()",
+    });
 
     expect(h.received).toEqual([wireId]);
     expect(receipt.snapshot().state).toBe("sent");
@@ -169,7 +251,9 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
     expect([...openTurnsOf(h.wrapper)]).toEqual([]);
     expect(h.wrapper.getState().turnActive).toBeUndefined();
 
-    await settle();
+    await settleUntil(() => receipt.snapshot().state === "accepted", {
+      label: "the queued send to publish and be acked",
+    });
     expect(h.received).toEqual([wireId]);
     expect(receipt.snapshot().state).toBe("accepted");
     expect([...openTurnsOf(h.wrapper)]).toEqual([wireId]);
@@ -183,7 +267,12 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
     expect(h.wrapper.getState().turnActive).toBeUndefined(); // absent before the first turn
 
     h.wrapper.send("do a multi-step thing");
-    await settle();
+    await settleUntil(
+      () => h.wrapper.getState().messages.some(
+        (m) => m.text === "do a multi-step thing" && m.sendState === "accepted",
+      ),
+      { label: "the opening send to publish and be acked" },
+    );
     const turnId = wireIdOf(h.wrapper, "do a multi-step thing");
     expect(h.wrapper.getState().turnActive).toBe(true); // open at publish
 
@@ -216,7 +305,7 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
   it("turn_settled{ok} closes the turn", async () => {
     const h = await connectWrapper();
     h.wrapper.send("hello");
-    await settle();
+    await untilAccepted(h.wrapper, "hello");
     const turnId = wireIdOf(h.wrapper, "hello");
     deliverOut(h.K, { type: "agent_message", text: "hi", turnId });
     await settle();
@@ -231,7 +320,7 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
   it("turn_settled{error} closes the turn", async () => {
     const h = await connectWrapper();
     h.wrapper.send("boom");
-    await settle();
+    await untilAccepted(h.wrapper, "boom");
     deliverOut(h.K, { type: "turn_settled", turnId: wireIdOf(h.wrapper, "boom"), outcome: "error" });
     await settle();
     expect(h.wrapper.getState().turnActive).toBe(false);
@@ -243,7 +332,7 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
   it("a legacy turn_settled with NO outcome still closes the turn", async () => {
     const h = await connectWrapper();
     h.wrapper.send("legacy");
-    await settle();
+    await untilAccepted(h.wrapper, "legacy");
     const bubble = () => h.wrapper.getState().messages.find((m) => m.text === "legacy")!;
     deliverOut(h.K, { type: "turn_settled", turnId: bubble().wireId! });
     await settle();
@@ -258,7 +347,7 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
   it("an approval mid-turn clears isTyping but keeps the turn active", async () => {
     const h = await connectWrapper();
     h.wrapper.send("run something");
-    await settle();
+    await untilAccepted(h.wrapper, "run something");
     deliverOut(h.K, { type: "typing" });
     await settle();
     expect(h.wrapper.getState().isTyping).toBe(true);
@@ -290,7 +379,7 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
   it("a legacy/missing-member anchor settle sweeps the coalesced prefix", async () => {
     const h = await connectWrapper();
     h.wrapper.send("A");
-    await settle();
+    await untilAccepted(h.wrapper, "A");
     const a = wireIdOf(h.wrapper, "A");
 
     // A's first bubble settles, so the hold predicate is quiet again and B and C
@@ -327,7 +416,7 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
   it("a legacy/missing-member error settle sweeps the coalesced prefix too", async () => {
     const h = await connectWrapper();
     h.wrapper.send("A");
-    await settle();
+    await untilAccepted(h.wrapper, "A");
     const a = wireIdOf(h.wrapper, "A");
     deliverOut(h.K, { type: "agent_message", text: "A step one", turnId: a });
     await settle();
@@ -357,7 +446,7 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
   it("a legacy/missing-member anchor settle sweeps a released held burst", async () => {
     const h = await connectWrapper();
     h.wrapper.send("first");
-    await settle();
+    await untilAccepted(h.wrapper, "first");
     const first = wireIdOf(h.wrapper, "first");
     deliverOut(h.K, { type: "typing" });
     await settle();
@@ -387,12 +476,12 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
   it("a turn_settled for an unknown turnId sweeps nothing and corrupts nothing", async () => {
     const h = await connectWrapper();
     h.wrapper.send("keep");
-    await settle();
+    await untilAccepted(h.wrapper, "keep");
     const keep = wireIdOf(h.wrapper, "keep");
     deliverOut(h.K, { type: "agent_message", text: "step one", turnId: keep });
     await settle();
     h.wrapper.send("keep too");
-    await settle();
+    await untilAccepted(h.wrapper, "keep too");
     const keepToo = wireIdOf(h.wrapper, "keep too");
     const before = h.wrapper.getState().messages;
 
@@ -477,7 +566,7 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
     it("closes the turn even when the failing send's bubble is gone", async () => {
       const h = await connectWrapper({ ack: false });
       h.wrapper.send("vanishing");
-      await settle();
+      await untilSent(h.wrapper, "vanishing");
       const wireId = wireIdOf(h.wrapper, "vanishing");
       // Drop the bubble, keeping the receipt — what retraction/adoption does.
       const holder = h.wrapper as unknown as { state: { messages: unknown[] } };
@@ -533,7 +622,7 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
   it("an explicit /stop closes the live turn and does not open one of its own", async () => {
     const h = await connectWrapper();
     h.wrapper.send("long job");
-    await settle();
+    await untilAccepted(h.wrapper, "long job");
     deliverOut(h.K, { type: "typing" });
     await settle();
     expect(h.wrapper.getState().turnActive).toBe(true);
@@ -556,7 +645,14 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
     expect(h.wrapper.getState().turnActive).not.toBe(true);
 
     h.wrapper.connect();
-    await settle();
+    // The fake server acks from an ASYNC handler dispatched (un-awaited) inside
+    // `ws.send`, so the ack for the first replayed send lands at least a
+    // microtask later and can interleave with `/stop`'s publish in either
+    // order. Neither condition alone proves the flush finished — wait for both.
+    await settleUntil(
+      () => h.received.length === 2 && queued.snapshot().state === "accepted",
+      { label: "both pre-connect queued sends to reach the wire and the first to be acked" },
+    );
 
     expect(h.received).toHaveLength(2);
     expect(queued.snapshot().state).toBe("accepted");
@@ -568,7 +664,7 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
   it("an explicit /stop preserves a follow-up created by its cancellation fanout", async () => {
     const h = await connectWrapper();
     h.wrapper.send("active");
-    await settle();
+    await untilAccepted(h.wrapper, "active");
     deliverOut(h.K, { type: "typing" });
     await settle();
     const cancelled = h.wrapper.send("cancel me")!;
@@ -589,14 +685,71 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
   });
 
   describe("safety points force-close every open turn", () => {
+    // #307 mechanism pin. The gate went red-then-green on the identical commit
+    // with `expected true to be false` on the NEXT test's `connected` assertion,
+    // and the issue blamed slow propagation. It is not propagation: it is the
+    // redial that `ws.onclose` schedules with a FULL-JITTER draw over
+    // [0, reconnectCapMs). Forcing that draw to its low end reproduces the exact
+    // CI failure on demand, which is why the sibling test must suppress it
+    // rather than wait longer. Deterministic: it stubs the one draw.
+    it("a sub-settle reconnect draw revives `connected` — the #307 failure, on demand", async () => {
+      const h = await connectWrapper({ ack: false });
+      const receipt = h.wrapper.send("in flight")!;
+      await settleUntil(() => receipt.snapshot().state === "sent", {
+        label: "the in-flight send to reach the wire",
+      });
+      expect(FakeNatsWS.instances).toHaveLength(1);
+
+      // 0 is not a synthetic value: it is the bottom of the range
+      // `scheduleReconnect()` genuinely samples every time a socket drops.
+      const random = vi.spyOn(Math, "random").mockReturnValue(0);
+      FakeNatsWS.instances.at(-1)!.close();
+      random.mockRestore();
+      // NOT a fixed budget: the redial runs a SECOND full register handshake
+      // (challenge round-trip, PoP sign, X25519 unwrap), which is exactly the
+      // work no tick budget can bound on a loaded runner. `settleUntil` throws
+      // on timeout, so the pin stays armed — a redial that never happens is
+      // still red, just deterministically.
+      await settleUntil(
+        () => FakeNatsWS.instances.length === 2 && h.wrapper.getState().connected === true,
+        { label: "the forced sub-settle redial to re-register and revive `connected`" },
+      );
+
+      // A second socket was dialled and re-registered, so `onSession`
+      // re-published `connected: true` over the disconnect sweep.
+      expect(FakeNatsWS.instances).toHaveLength(2);
+      expect(h.wrapper.getState().connected).toBe(true);
+      h.wrapper.close();
+    });
+
     it("a raw disconnect closes them", async () => {
       const h = await connectWrapper({ ack: false });
-      h.wrapper.send("in flight");
-      await settle();
+      const receipt = h.wrapper.send("in flight")!;
+      await settleUntil(() => receipt.snapshot().state === "sent", {
+        label: "the in-flight send to reach the wire and open its turn",
+      });
       const wireId = wireIdOf(h.wrapper, "in flight");
       expect(h.wrapper.getState().turnActive).toBe(true);
 
-      FakeNatsWS.instances.at(-1)!.close();
+      // Tripwire. Without this, deleting `closeLiveSocketWithoutRedial()` below
+      // would reintroduce #307 but only fail ~0.06% of the time — i.e. it would
+      // read as green here and come back as a mystery red on CI months later.
+      // Forcing every UNPROTECTED draw to its worst case makes that deletion fail
+      // this test 100% of the time; the helper's own stub shadows this one for
+      // exactly the duration of the close.
+      const worstCaseDraw = vi.spyOn(Math, "random").mockReturnValue(0);
+      closeLiveSocketWithoutRedial();
+      worstCaseDraw.mockRestore();
+      // Deliberately NOT a `settleUntil`, even though #307 names this exact
+      // assertion. `FakeNatsWS.close()` invokes `ws.onclose` synchronously; the
+      // handler sets `connected = false` and fans out to the wrapper inside that
+      // same call, and `setState` REASSIGNS `this.state` (`{...this.state,
+      // ...patch}`) which `getState()` returns directly — so a fresh
+      // `getState()` after the fanout sees it, though a snapshot captured
+      // before it does not. Measured: both assertions below already hold with NO
+      // settle at all. Waiting was never the fix here — the value #307 saw was
+      // `true`, and a poll would have masked it. The redial is the cause, and
+      // the helper above is what removes it.
       await settle();
       expect(h.wrapper.getState().connected).toBe(false);
       expect(h.wrapper.getState().turnActive).toBe(false);
@@ -619,10 +772,16 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
         if (injected || a?.sendState !== "accepted") return;
         injected = true;
         h.wrapper.send("B"); // low tracker reaches sent; wrapper callback is queued behind A's ack
-        FakeNatsWS.instances.at(-1)!.close();
+        // Same #307 hazard as the sibling above: this close schedules a
+        // full-jitter redial that can land inside the assertions below.
+        closeLiveSocketWithoutRedial();
       });
 
       h.wrapper.send("A");
+      // Left as a fixed budget on purpose: the assertions below are about "B",
+      // which an injected subscriber creates during A's fanout. "A is accepted"
+      // is reached BEFORE B settles, so waiting on it would shorten this wait,
+      // and waiting on B's own state would just restate the assertion.
       await settle();
 
       expect(injected).toBe(true);
@@ -638,7 +797,9 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
       const h = await connectWrapper({ ack: false });
       const socket = FakeNatsWS.instances.at(-1)!;
       socket.handler = (subject, _payload, server) => {
-        if (subject === IN) server.close(); // ws.send still returns normally
+        // ws.send still returns normally. Same #307 hazard: suppress the
+        // full-jitter redial this close schedules.
+        if (subject === IN) closeLiveSocketWithoutRedial(server);
       };
 
       const receipt = h.wrapper.send("loss inside publish")!;
@@ -668,10 +829,16 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
             ) => void;
           };
         }).client.trackerFail(b, { reason: "evicted", retryable: true });
-        FakeNatsWS.instances.at(-1)!.close();
+        // Same #307 hazard as the sibling above: this close schedules a
+        // full-jitter redial that can land inside the assertions below.
+        closeLiveSocketWithoutRedial();
       });
 
       h.wrapper.send("A");
+      // Left as a fixed budget on purpose: the assertions below are about "B",
+      // which an injected subscriber creates during A's fanout. "A is accepted"
+      // is reached BEFORE B settles, so waiting on it would shorten this wait,
+      // and waiting on B's own state would just restate the assertion.
       await settle();
 
       expect(injected).toBe(true);
@@ -687,8 +854,10 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
 
     it("a terminal error closes them", async () => {
       const h = await connectWrapper();
-      h.wrapper.send("in flight");
-      await settle();
+      const receipt = h.wrapper.send("in flight")!;
+      await settleUntil(() => receipt.snapshot().state === "accepted", {
+        label: "the in-flight send to publish, be acked, and open its turn",
+      });
       expect(h.wrapper.getState().turnActive).toBe(true);
 
       FakeNatsWS.instances.at(-1)!.onmessage?.({ data: "-ERR 'Authorization Violation'\r\n" });
@@ -701,8 +870,10 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
 
     it("close() closes them", async () => {
       const h = await connectWrapper();
-      h.wrapper.send("in flight");
-      await settle();
+      const receipt = h.wrapper.send("in flight")!;
+      await settleUntil(() => receipt.snapshot().state === "accepted", {
+        label: "the in-flight send to publish, be acked, and open its turn",
+      });
       expect(h.wrapper.getState().turnActive).toBe(true);
 
       h.wrapper.close();
@@ -714,8 +885,10 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
     // INSIDE the pre-disconnect window (that window carries no state fanout).
     it("close() with a listener that reconnects still closes them", async () => {
       const h = await connectWrapper();
-      h.wrapper.send("in flight");
-      await settle();
+      const receipt = h.wrapper.send("in flight")!;
+      await settleUntil(() => receipt.snapshot().state === "accepted", {
+        label: "the in-flight send to publish, be acked, and open its turn",
+      });
       expect(h.wrapper.getState().turnActive).toBe(true);
 
       // Instrument the teardown boundary: nothing may fan out before it.
@@ -752,8 +925,10 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
     // opens only when that held send is actually published.
     it("close() hands turn ownership to the reopening listener's published replacement", async () => {
       const h = await connectWrapper();
-      h.wrapper.send("in flight");
-      await settle();
+      const receipt = h.wrapper.send("in flight")!;
+      await settleUntil(() => receipt.snapshot().state === "accepted", {
+        label: "the in-flight send to publish, be acked, and open its turn",
+      });
       expect(h.wrapper.getState().turnActive).toBe(true);
 
       let reopened = false;
@@ -772,7 +947,9 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
       expect([...openTurnsOf(h.wrapper)]).toEqual([]);
       expect(h.wrapper.getState().turnActive).toBe(false); // the old turn is gone
 
-      await settle();
+      // The slowest wait in this file: the reopened instance must complete a
+      // SECOND register handshake before the replacement can be published.
+      await untilAccepted(h.wrapper, "replacement");
       replacement = h.wrapper.getState().messages.find((m) => m.text === "replacement")!;
       expect(replacement.pending).not.toBe(true);
       expect(replacement.wireId).toBeDefined();
@@ -785,8 +962,10 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
 
     it("preserves turn eligibility for publishes staged in the replacement FIFO", async () => {
       const h = await connectWrapper();
-      h.wrapper.send("old turn");
-      await settle();
+      const oldTurn = h.wrapper.send("old turn")!;
+      await settleUntil(() => oldTurn.snapshot().state === "accepted", {
+        label: "the opening send to publish, be acked, and open its turn",
+      });
       expect(h.wrapper.getState().turnActive).toBe(true);
 
       const inner = (h.wrapper as unknown as { client: { connect: () => void } }).client;
@@ -827,7 +1006,9 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
         expect(openTurnsOf(h.wrapper).has(stop.wireId!)).toBe(false);
         expect(h.wrapper.getState().turnActive).toBe(false);
 
-        await settle();
+        await settleUntil(() => openTurnsOf(h.wrapper).size === 1, {
+          label: "the replacement FIFO to publish and open exactly one turn",
+        });
         expect([...openTurnsOf(h.wrapper)]).toEqual([replacement.wireId]);
         expect(openTurnsOf(h.wrapper).has(stop.wireId!)).toBe(false);
         expect(h.wrapper.getState().turnActive).toBe(true); // publish/ack opened; no settle yet
@@ -849,7 +1030,7 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
     it("a send during an open-but-quiet turn publishes IMMEDIATELY (never held)", async () => {
       const h = await connectWrapper();
       h.wrapper.send("first");
-      await settle();
+      await untilAccepted(h.wrapper, "first");
       const turnId = wireIdOf(h.wrapper, "first");
       deliverOut(h.K, { type: "typing" });
       deliverOut(h.K, { type: "agent_message", text: "partial answer", turnId });
@@ -874,7 +1055,7 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
         if (seen[seen.length - 1] !== s.turnActive) seen.push(s.turnActive);
       });
       h.wrapper.send("first");
-      await settle();
+      await untilAccepted(h.wrapper, "first");
       const turnId = wireIdOf(h.wrapper, "first");
       deliverOut(h.K, { type: "typing" });
       await settle();

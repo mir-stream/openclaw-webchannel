@@ -66,8 +66,18 @@ jobs:
       contents: read
       actions: read
 
-    # Pin the Node.js version — must match the engines.node range declared
-    # in each published package.json.
+    # Pin the Node.js version — the resolved runtime must SATISFY every
+    # published package.json's engines.node range. Those ranges are no longer
+    # identical: packages/plugin declares
+    # ">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0" — copied verbatim from the
+    # `openclaw` peer it already peer-depends on, so the range makes that peer's
+    # existing transitive floor explicit rather than inventing one. Do NOT read
+    # the numbers as a `node:sqlite` requirement: that builtin landed in 22.5.0,
+    # and none of these three floors is it. Meanwhile client and saas still
+    # declare ">=22.0.0". The plugin's is the tightest, so it is the
+    # one this pin has to clear: "22" resolves to the latest 22.x, which is
+    # >=22.22.3, so all three are satisfied. Bumping the plugin's floor above the
+    # latest 22.x is what would break this — raise the pin then.
     env:
       NODE_VERSION: "22"
       # Signal to real-server test suites that nats-server MUST be present.
@@ -297,7 +307,7 @@ jobs:
       # ──────────────────────────────────────────────────────────────────────
       # 5b. Build the publishable packages (dist/) and run the examples'
       #     CONSUMER tests with their own node:test/TAP runner.
-      #     They import @mir-stream/* by package ENTRY (main/exports → dist/),
+      #     They import openclaw-webchannel-* by package ENTRY (main/exports → dist/),
       #     exactly like a downstream consumer — no dist ⇒ no resolve. They are
       #     deliberately EXCLUDED from the root vitest sweep (vitest.config.ts):
       #     vite's resolver doesn't produce the node error codes they assert.
@@ -326,6 +336,16 @@ jobs:
       #     future change misplaces into devDependencies (builds green,
       #     breaks remote install) — which no other CI step would detect.
       # ──────────────────────────────────────────────────────────────────────
+      # Runs BEFORE the smoke test, not after: it pins the residual-`/src/` scan
+      # inside that script, and a scan that has been disarmed produces a GREEN
+      # smoke test. Order is the only thing that makes this report first.
+      # ⚠️ The 5d banner above describes the SMOKE step below, not this one.
+      # This step guards that step's residual-`/src/` scan and therefore has to
+      # run first — a disarmed scan produces a green smoke test, so only
+      # ordering makes the self-test report the disarming.
+      - name: Pack-load smoke self-test (the residual-/src/ scan still fires)
+        run: bash scripts/pack-load-smoke-selftest.sh
+
       - name: Plugin pack-and-load smoke (F3 remote-install guard)
         run: bash scripts/pack-load-smoke.sh
 
