@@ -19,7 +19,7 @@
     "build": "npm run build --workspaces --if-present"
   },
   "optionalDependencies": {
-    "@rollup/rollup-linux-x64-gnu": "4.62.0"
+    "@rolldown/binding-linux-x64-gnu": "1.2.8"
   },
   "devDependencies": {
     "esbuild": "0.28.1",

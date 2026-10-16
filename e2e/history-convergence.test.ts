@@ -102,7 +102,8 @@ describe("history producer → sealed frame → browser decoder → wrapper", ()
     expect(h.decode(h.transport.frames[0]!)).toMatchObject({ epoch: h.journal.epoch,
       type: "difference", afterSeq: 0, nonce: "nonce", maxSeq: 2 });
   });
-  it("#413: incomplete cold snapshots do linear storage work and never replay the journal", () => {
+  // Two cold materializations (2k + 4k rows) can exceed 5s; Vitest 4 also times synchronous test bodies.
+  it("#413: incomplete cold snapshots do linear storage work and never replay the journal", { timeout: 30_000 }, () => {
     // Pin the materializer's time-slice clock: CI contention may yield midway
     // through a fetched 128-row batch and reread its tail on the next callback.
     // Row-count yielding still runs; this isolates structural work from load.
