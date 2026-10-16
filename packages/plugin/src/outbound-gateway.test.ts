@@ -547,7 +547,9 @@ describe("structured content across the handoff (PR #430)", () => {
     "delivers %s via %s exactly as the direct path renders it", async (_name, mode, params, text) => {
       const result = await sendAs(mode, params);
       expect(result.payload).toMatchObject({ via: mode === "cli" ? "gateway" : "direct", deliveryStatus: text === null ? "suppressed" : "sent" });
-      expect(requests).toHaveLength(mode === "cli" ? 1 : 0);
+      // Core turns `pin: true` into delivery options; the handoff must carry them.
+      expect(requests.map(({ params: wire }) => wire.delivery))
+        .toEqual(mode === "cli" ? [params.pin ? { pin: { enabled: true } } : undefined] : []);
       expect(delivered()).toEqual(text === null
         ? { frames: [], transcript: [] }
         : { frames: [{ type: "agent_message", text }], transcript: [text] });
@@ -610,7 +612,8 @@ describe("structured content across the handoff (PR #430)", () => {
     gatewayCfg.session = { store: join(root, "blocker", "sessions.json") };
     const result = await sendAs(mode, { message: TEXT });
     expect(result.payload).toMatchObject({ via: mode === "cli" ? "gateway" : "direct", deliveryStatus: "sent" });
-    expect(delivered()).toEqual({ frames: [{ type: "agent_message", text: TEXT }], transcript: [] });
+    // The transcript lives under the unwritable store; only delivery is compared.
+    expect(delivered().frames).toEqual([{ type: "agent_message", text: TEXT }]);
   });
 });
 
