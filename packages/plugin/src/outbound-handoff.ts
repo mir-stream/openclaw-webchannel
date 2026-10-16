@@ -12,6 +12,8 @@ import { resolveDefaultAgentId } from "openclaw/plugin-sdk/config-runtime";
 import { buildOutboundSessionContext, sendDurableMessageBatch } from "openclaw/plugin-sdk/channel-outbound";
 import { callGatewayFromCli, ErrorCodes, errorShape } from "openclaw/plugin-sdk/gateway-runtime";
 import type { GatewayRequestHandlers } from "openclaw/plugin-sdk/gateway-runtime";
+import { normalizeInteractiveReply, normalizeMessagePresentation } from "openclaw/plugin-sdk/interactive-runtime";
+import type { InteractiveReply, MessagePresentation } from "openclaw/plugin-sdk/interactive-runtime";
 import { recordSessionMetaFromInbound, resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
 import { resolveOutboundAccountId, type ResolveOutboundTransport } from "./outbound-account.js";
 import { requireOutboundPeerId, requireRegisteredPeer, type ResolveServingScope } from "./outbound-target.js";
@@ -22,7 +24,8 @@ import { nextMessageId } from "./message-adapter.js";
 export const WEBCHANNEL_SEND_METHOD = "webchannel.send";
 const BINDING_FIELD = "webchannelOutboundBinding";
 type Binding = { accountId: string; tenant: string; storageRoot: string };
-type SendRequest = Binding & { peerId: string; agentId: string; text: string; idempotencyKey: string };
+type Content = { text: string; presentation?: MessagePresentation; interactive?: InteractiveReply };
+type SendRequest = Binding & Content & { peerId: string; agentId: string; idempotencyKey: string };
 type Serving = { resolveServingScope: ResolveServingScope; resolveOutboundTransport: ResolveOutboundTransport };
 
 function bindingFor(cfg: OpenClawConfig, accountId: string | null | undefined, peerId: string, resolveScope?: ResolveServingScope): Binding {
@@ -39,6 +42,23 @@ function stringField(value: Record<string, unknown>, field: string): string {
   const text = value[field];
   if (typeof text !== "string" || !text.trim()) throw new Error(`[webchannel] invalid outbound handoff field ${field}`);
   return text;
+}
+
+/**
+ * Core lets presentation/interactive blocks stand in for text. Forward them
+ * unrendered so the gateway's core renders them as on the direct path. The CLI
+ * drops unusable blocks as core does; the RPC (strict) carries only normalized ones.
+ */
+function readContent(fields: Record<string, unknown>, textField: string, strict: boolean): Content {
+  const text = fields[textField] ?? "";
+  const presentation = normalizeMessagePresentation(fields.presentation);
+  const interactive = normalizeInteractiveReply(fields.interactive);
+  if (strict && fields.presentation !== undefined && !presentation) throw new Error("[webchannel] invalid outbound handoff field presentation");
+  if (strict && fields.interactive !== undefined && !interactive) throw new Error("[webchannel] invalid outbound handoff field interactive");
+  if (typeof text !== "string" || (!text.trim() && !presentation && !interactive)) {
+    throw new Error(`[webchannel] invalid outbound handoff field ${textField}`);
+  }
+  return { text, ...(presentation ? { presentation } : {}), ...(interactive ? { interactive } : {}) };
 }
 
 function readBinding(value: unknown): Binding {
@@ -78,16 +98,16 @@ export function createOutboundHandoffActions(serving: Serving): ChannelMessageAc
       if (ctx.action !== "send") throw new Error("[webchannel] unsupported outbound action");
       const peerId = requireOutboundPeerId(stringField(ctx.params, "to"));
       const binding = bindingFor(ctx.cfg, ctx.accountId, peerId, serving.resolveServingScope);
-      if (ctx.gateway?.mode !== "cli") throw new Error(`[webchannel] outbound account ${JSON.stringify(binding.accountId)} is not running`);
-      // Core normally bypasses this action for serving accounts. Refuse an
-      // unexpected direct action rather than mirror twice or recurse into RPC.
+      // Core's send pipeline bypasses this action for serving accounts; its
+      // message.action RPC does not. Refuse rather than mirror twice or recurse.
       if (serving.resolveServingScope(binding.accountId)) throw new Error("[webchannel] use the direct outbound pipeline for a running account");
+      if (ctx.gateway?.mode !== "cli") throw new Error(`[webchannel] outbound account ${JSON.stringify(binding.accountId)} is not running`);
       if (ctx.params.media || ctx.params.mediaUrl || ctx.params.mediaUrls || ctx.params.buffer) {
         throw new Error("[webchannel] outbound media is unsupported");
       }
       const request: SendRequest = {
         ...binding, peerId, agentId: ctx.agentId ?? resolveDefaultAgentId(ctx.cfg),
-        text: stringField(ctx.params, "message"),
+        ...readContent(ctx.params, "message", false),
         idempotencyKey: typeof ctx.params.idempotencyKey === "string" && ctx.params.idempotencyKey.trim()
           ? ctx.params.idempotencyKey : randomUUID(),
       };
@@ -132,9 +152,10 @@ export function createOutboundHandoffHandler(serving: Serving): GatewayRequestHa
   return async ({ params, context, respond, client }) => {
     try {
       const fields = record(params);
+      const content = readContent(fields, "text", true);
       const request: SendRequest = {
         ...readBinding(fields), peerId: stringField(fields, "peerId"), agentId: stringField(fields, "agentId"),
-        text: stringField(fields, "text"), idempotencyKey: stringField(fields, "idempotencyKey"),
+        ...content, idempotencyKey: stringField(fields, "idempotencyKey"),
       };
       if (request.idempotencyKey.length > 200) throw new Error("[webchannel] outbound idempotency key is too long");
       if (request.peerId !== requireOutboundPeerId(request.peerId)) throw new Error("[webchannel] outbound handoff requires a bare peer id");
@@ -144,6 +165,11 @@ export function createOutboundHandoffHandler(serving: Serving): GatewayRequestHa
       let entry = requests.get(request.idempotencyKey);
       if (entry && entry.fingerprint !== fingerprint) throw new Error("[webchannel] outbound idempotency key reused for a different request");
       if (!entry) {
+        // Completed entries only answer retries; make room before refusing.
+        for (const [key, old] of requests) {
+          if (requests.size < 1_000) break;
+          if (old.expires !== Infinity) requests.delete(key);
+        }
         if (requests.size >= 1_000) throw new Error("[webchannel] outbound handoff is busy; retry later");
         const cfg = context.getRuntimeConfig();
         const { binding } = servingBinding(cfg, request, request.peerId, serving);
@@ -156,7 +182,7 @@ export function createOutboundHandoffHandler(serving: Serving): GatewayRequestHa
           });
           const sent = await sendDurableMessageBatch({
             cfg, channel: "webchannel", to: request.peerId, accountId: binding.accountId,
-            payloads: [{ text: request.text, channelData: { [BINDING_FIELD]: binding } }],
+            payloads: [{ ...content, channelData: { [BINDING_FIELD]: binding } }],
             session: buildOutboundSessionContext({ cfg, agentId: request.agentId, sessionKey, conversationType: "direct" }),
             mirror: { agentId: request.agentId, sessionKey, text: request.text, idempotencyKey: request.idempotencyKey },
             gatewayClientScopes: client?.connect?.scopes ?? [],

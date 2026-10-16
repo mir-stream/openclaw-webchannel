@@ -488,3 +488,149 @@ describe("text-only outbound suppression", () => {
     expect(named.journal.read(PEER)).toEqual([]);
   });
 });
+
+
+const PRESENTATION = { title: "Deploy", blocks: [
+  { type: "text", text: "Ready" }, { type: "context", text: "note" },
+  { type: "buttons", buttons: [{ label: "Docs", url: "https://example.com/docs" }, { label: "Approve", value: "approve" }] },
+] };
+// Core's text-only fallback rendering of PRESENTATION on the direct path.
+const RENDERED = "Deploy\n\nReady\n\nnote\n\n- Docs: https://example.com/docs\n- Approve";
+const INTERACTIVE = { blocks: [{ type: "text", text: "Interactive text" }] };
+
+function sendAs(mode: "cli" | "backend", params: Record<string, unknown>) {
+  activate(mode === "cli" ? cliPlugin : gatewayPlugin);
+  return runMessageAction({ cfg, action: "send", agentId: "main",
+    gateway: mode === "cli" ? { clientName: "cli", mode: "cli" } : { clientName: "gateway-client", mode: "backend" },
+    params: { channel: "webchannel", target: `webchannel:${PEER}`, accountId: "other", ...structuredClone(params) } });
+}
+
+/** Decrypted frames, the matching journal bubbles and the mirrored transcript text. */
+function delivered() {
+  expect(primary.transport.frames).toEqual([]);
+  const frames = named.transport.frames.map(({ payload }) =>
+    openEnvelope(payload, named.keyStore.getOrCreate(PEER)).message as { type: string; id: string; text: string });
+  expect(named.journal.read(PEER).map(({ event }) => event))
+    .toEqual(frames.map(({ id, text }) => ({ kind: "bubble", answerId: id, text })));
+  const mirrored = transcript(sessionKey("other", "tenant-b")).split("\n").filter(Boolean).map((line) => JSON.parse(line))
+    .filter((entry) => entry.message?.role === "assistant")
+    .map((entry) => entry.message.content.map((part: { text: string }) => part.text).join(""));
+  return { frames: frames.map(({ type, text }) => ({ type, text })), transcript: mirrored };
+}
+
+function rpc(params: Record<string, unknown>) {
+  return new Promise<any>((resolve, reject) => {
+    void handoffHandler({ params, context: { getRuntimeConfig: () => gatewayCfg },
+      client: { connect: { scopes: ["operator.write"] } },
+      respond: (ok: boolean, value: unknown, error?: { message: string }) => ok ? resolve(value) : reject(new Error(error?.message)),
+    } as any);
+  });
+}
+
+const rpcRequest = (idempotencyKey: string, extra: Record<string, unknown> = {}) => ({
+  accountId: "other", tenant: "tenant-b", storageRoot: root, peerId: PEER, agentId: "main", text: TEXT, idempotencyKey, ...extra,
+});
+
+describe("structured content across the handoff (PR #430)", () => {
+  // Each mode runs against the same expectation: the CLI handoff must look
+  // exactly like the serving gateway's direct send of the same action.
+  const cases: Array<[string, Record<string, unknown>, string | null]> = [
+    ["presentation only", { presentation: PRESENTATION }, RENDERED],
+    ["message and presentation", { message: "Body text", presentation: PRESENTATION }, `Body text\n\n${RENDERED}`],
+    // Core renders no interactive fallback for a text-only channel.
+    ["interactive only", { interactive: INTERACTIVE }, null],
+    ["message and interactive", { message: "Body text", interactive: INTERACTIVE }, "Body text"],
+  ];
+  it.each(cases.flatMap(([name, params, text]) => (["backend", "cli"] as const).map((mode) => [name, mode, params, text] as const)))(
+    "delivers %s via %s exactly as the direct path renders it", async (_name, mode, params, text) => {
+      const result = await sendAs(mode, params);
+      expect(result.payload).toMatchObject({ via: mode === "cli" ? "gateway" : "direct", deliveryStatus: text === null ? "suppressed" : "sent" });
+      expect(requests).toHaveLength(mode === "cli" ? 1 : 0);
+      expect(delivered()).toEqual(text === null
+        ? { frames: [], transcript: [] }
+        : { frames: [{ type: "agent_message", text }], transcript: [text] });
+    });
+
+  it("refuses a CLI send with neither text nor usable blocks before any RPC", async () => {
+    await expect(sendAs("cli", { message: "" })).rejects.toThrow("send requires text or media");
+    activate(cliPlugin);
+    // Core validates first; the handoff keeps the same floor for other callers.
+    await expect(cliPlugin.actions!.handleAction!({
+      channel: "webchannel", action: "send", cfg, accountId: "other", agentId: "main", gateway: { clientName: "cli", mode: "cli" },
+      params: { to: PEER, message: " ", presentation: { blocks: [{ type: "unknown" }] }, interactive: { blocks: [] } },
+    } as any)).rejects.toThrow("[webchannel] invalid outbound handoff field message");
+    expect(requests).toEqual([]);
+    expectNothingSent();
+  });
+
+  it("binds presentation into the RPC idempotency fingerprint", async () => {
+    activate(gatewayPlugin);
+    const first = await rpc(rpcRequest("presented", { presentation: PRESENTATION }));
+    await expect(rpc(rpcRequest("presented", { presentation: { blocks: [{ type: "text", text: "changed" }] } })))
+      .rejects.toThrow("reused for a different request");
+    await expect(rpc(rpcRequest("presented"))).rejects.toThrow("reused for a different request");
+    await expect(rpc(rpcRequest("presented", { presentation: PRESENTATION }))).resolves.toEqual(first);
+    expect(delivered()).toEqual({ frames: [{ type: "agent_message", text: `${TEXT}\n\n${RENDERED}` }], transcript: [`${TEXT}\n\n${RENDERED}`] });
+  });
+
+  it.each([
+    ["presentation", { blocks: [{ type: "unknown", text: TEXT }] }],
+    ["presentation", "Deploy"],
+    ["interactive", { blocks: [] }],
+  ])("refuses an RPC with an unusable %s before any send", async (field, value) => {
+    activate(gatewayPlugin);
+    await expect(rpc(rpcRequest("invalid", { [field]: value }))).rejects.toThrow(`[webchannel] invalid outbound handoff field ${field}`);
+    expectNothingSent();
+  });
+});
+
+describe("handoff RPC retention (PR #430)", () => {
+  afterEach(async () => {
+    const { resetGlobalHookRunner } = await import("openclaw/plugin-sdk/plugin-runtime");
+    resetGlobalHookRunner();
+  });
+
+  it("refuses only while 1,000 requests are in flight and keeps completed retries shared", async () => {
+    const { initializeGlobalHookRunner } = await import("openclaw/plugin-sdk/plugin-runtime");
+    const held: Array<() => void> = [];
+    let hold = true;
+    const registry = createEmptyRegistry() as any;
+    registry.typedHooks.push({ pluginId: "hold-outbound-test", hookName: "message_sending",
+      handler: () => hold ? new Promise<undefined>((release) => held.push(() => release(undefined))) : undefined });
+    initializeGlobalHookRunner(registry);
+    activate(gatewayPlugin);
+    const pending = Array.from({ length: 1_000 }, (_, i) => rpc(rpcRequest(`held-${i}`)));
+    const overCapacity = rpc(rpcRequest("over-capacity")).then(() => "accepted", (error: Error) => error.message);
+    await vi.waitFor(() => expect(held.length).toBeGreaterThanOrEqual(1_000), { timeout: 60_000, interval: 50 });
+    expect(named.transport.frames).toEqual([]);
+    hold = false;
+    for (const release of held) release();
+    const completed = await Promise.all(pending);
+    expect(await overCapacity).toBe("[webchannel] outbound handoff is busy; retry later");
+    expect(named.transport.frames).toHaveLength(1_000);
+    // Every CLI send mints a fresh key, so completed entries must not block new work.
+    await expect(rpc(rpcRequest("after-completed"))).resolves.toMatchObject({ deliveryStatus: "sent" });
+    await expect(rpc(rpcRequest("held-999"))).resolves.toEqual(completed[999]);
+    await expect(rpc(rpcRequest("held-999", { text: "different" }))).rejects.toThrow("reused for a different request");
+    expect(named.transport.frames).toHaveLength(1_001);
+  }, 120_000);
+});
+
+describe("core message.action RPC (PR #430)", () => {
+  it("tells a running account to use the direct pipeline instead of reporting it stopped", async () => {
+    const sendHandlers = await loadCoreExport<any>("send-", "src/gateway/server-methods/send.ts", "sendHandlers");
+    activate(gatewayPlugin);
+    const result = await new Promise<any>((resolve) => {
+      void sendHandlers["message.action"]({
+        params: { channel: "webchannel", action: "send", accountId: "other", idempotencyKey: "message-action", params: { to: PEER, message: TEXT } },
+        context: { getRuntimeConfig: () => gatewayCfg, dedupe: new Map() },
+        client: { connect: { scopes: ["operator.write"] } },
+        respond: (ok: boolean, payload: unknown, error?: { message: string }) => resolve({ ok, payload, error }),
+      });
+    });
+    expect(result).toMatchObject({ ok: false, error: { message: expect.stringContaining("use the direct outbound pipeline for a running account") } });
+    expect(result.error.message).not.toContain("is not running");
+    expect(connections).toEqual([]);
+    expectNothingSent();
+  });
+});

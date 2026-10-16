@@ -89,10 +89,13 @@ account reports `[webchannel] outbound account "<id>" is not running`; check
 CLI and gateway and restart the gateway: an older gateway lacks `webchannel.send`
 and the CLI refuses the send instead of falling back to the generic `send` RPC.
 
-Identical RPC requests with the same idempotency key share one result for ten
-minutes in the current gateway handler (up to 1,000 retained requests). Reusing
-a key with different content is rejected. This cache does not survive gateway
-restart; it does not provide a persistent CLI outbox or offline delivery.
+Identical RPC requests with the same idempotency key share one result in the
+current gateway handler while the request runs and for ten minutes after it
+completes. Reusing a retained key with different content is rejected. New keys
+are refused only while 1,000 requests are in flight; at that size the handler
+first discards the oldest completed results, and retrying a discarded key sends
+again. This cache does not survive gateway restart; it does not provide a
+persistent CLI outbox or offline delivery.
 
 ## Enrollment & credentials (NATS mode)
 
