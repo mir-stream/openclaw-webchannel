@@ -83,11 +83,18 @@ tracked in [#451](https://github.com/mir-stream/openclaw-webchannel/issues/451).
 Offline-peer delivery and admission requirements are unchanged.
 
 If the gateway is stopped or unreachable, core's connection diagnostics and
-`openclaw doctor` guidance are preserved. A reachable gateway without the selected
-account reports `[webchannel] outbound account "<id>" is not running`; check
+`openclaw doctor` guidance are preserved. If the gateway lists the selected
+account but is not serving it, the error is `[webchannel] outbound account "<id>"
+is not running`; if its configuration does not list the account, the error is
+`[webchannel] outbound account "<id>" is not a valid listed account`. Check
 `openclaw channels status --probe` and its gateway logs. Update the plugin on both
-CLI and gateway and restart the gateway: an older gateway lacks `webchannel.send`
-and the CLI refuses the send instead of falling back to the generic `send` RPC.
+CLI and gateway and restart the gateway: an older gateway lacks `webchannel.send`,
+and the CLI reports that gateway's unknown-method error without falling back to
+the generic `send` RPC.
+
+As with direct sends, media is dropped and its text delivered; a send with media
+but no text to deliver is refused. The CLI's transcript records the delivered
+text, while a direct send with media records the media file name.
 
 Identical RPC requests with the same idempotency key share one result in the
 current gateway handler while the request runs and for ten minutes after it

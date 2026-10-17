@@ -150,6 +150,6 @@ Telegram Bot API/MTProto 계약을 그대로 따르는 것이다.
 | 구현 상태 (2026-10-16) | CLI가 선택한 정확한 account ID와 tenant/store를 고정한다. gateway는 실제 serving tuple과 다르면 거부하고 자신의 설정으로 transcript 세션을 계산한다. CLI session key를 받지 않으며 CLI transcript도 생성하지 않는다. durable payload의 tuple을 전송 직전에 재검사한다. presentation·interactive는 CLI가 core와 같이 정규화만 하고 delivery는 그대로 넘기며, 렌더링·적용은 gateway의 core가 direct 경로와 같게 한다. |
 | 검증 | `outbound-gateway.test.ts`: CLI/gateway 설정·기본 계정·serving tuple 차이, 실제 transcript, 런타임 교체, CLI/agent/cron, 중복 RPC 및 오류를 검증한다. gateway socket과 NATS publish는 테스트 대역이며 암호화·SQLite·pinned core action/durable-send 경로는 실제 구현이다. |
 | 배포 | CLI와 gateway 플러그인을 함께 갱신하고 gateway를 재시작한다. 기존 gateway에 전용 RPC가 없으면 발신은 거부된다. |
-| 제한 | 원격 CLI의 로컬 키 저장소 요구(#451), 오프라인 peer 전달은 그대로다. RPC 중복 억제는 현재 handler의 메모리 캐시다. 같은 키는 진행 중일 때와 완료 후 10분 동안 결과를 공유한다. 진행 중 요청이 1,000건일 때만 새 요청을 거부하고, 그 크기에 이르면 가장 오래된 완료 결과부터 버린다(버린 키를 재시도하면 다시 발신한다). 재시작을 넘는 outbox가 아니다. |
+| 제한 | 원격 CLI의 로컬 키 저장소 요구(#451), 오프라인 peer 전달은 그대로다. RPC 중복 억제는 현재 handler의 메모리 캐시다. 같은 키는 진행 중일 때와 완료 후 10분 동안 결과를 공유한다. 진행 중 요청이 1,000건일 때만 새 요청을 거부하고, 그 크기에 이르면 가장 오래된 완료 결과부터 버린다(버린 키를 재시도하면 다시 발신한다). 재시작을 넘는 outbox가 아니다. CLI handoff는 미디어를 RPC로 넘기지 않으므로, 미디어가 있던 발신의 transcript는 direct 경로의 파일 이름 대신 실제 전달된 텍스트를 기록한다. |
 | 재검토 | SDK 전달 계약이나 runtime 소유권이 바뀌는 경우. |
 | 관련 | #418, #457, [PR #430](https://github.com/mir-stream/openclaw-webchannel/pull/430) |

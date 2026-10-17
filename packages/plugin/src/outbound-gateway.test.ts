@@ -7,7 +7,7 @@
  * Tests assert actual transcript content as well as frames and journal entries.
  */
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -664,6 +664,128 @@ describe("core message.action RPC (PR #430)", () => {
     expect(result).toMatchObject({ ok: false, error: { message: expect.stringContaining("use the direct outbound pipeline for a running account") } });
     expect(result.error.message).not.toContain("is not running");
     expect(connections).toEqual([]);
+    expectNothingSent();
+  });
+});
+
+const MEDIA = "https://example.com/voice.ogg";
+const NO_TEXT_FALLBACK = "Plugin outbound adapter does not implement sendMedia and no text fallback is available for media payload";
+const MEDIA_FIELDS = ["media", "mediaUrl", "mediaUrls", "buffer"];
+
+function durableSend(payload: Record<string, unknown>) {
+  return import("openclaw/plugin-sdk/channel-outbound").then(({ sendDurableMessageBatch }) =>
+    sendDurableMessageBatch({ cfg: gatewayCfg, channel: "webchannel", accountId: "other", to: PEER, payloads: [payload] }));
+}
+
+function cronDelivery(payload: Record<string, unknown>) {
+  return dispatchCronDelivery({
+    cfgWithAgentDefaults: cfg, agentId: "main", deps: {},
+    job: { id: `cron-${root}`, name: "outbound fixture", sessionTarget: "isolated", state: {} },
+    agentSessionKey: "agent:main:cron:fixture", runSessionKey: "agent:main:cron:fixture:run:1",
+    runStartedAt: Date.now(), sourceDeliveryOutcome: { satisfiesSourceDelivery: false, verifiedMessageToolDelivery: false },
+    deliveryRequested: true, deliveryBestEffort: false,
+    resolvedDelivery: { ok: true, channel: "webchannel", to: PEER, accountId: "other", mode: "explicit" },
+    deliveryPayloads: [payload], synthesizedText: TEXT, outputText: TEXT,
+    isAborted: () => false, withRunSession: (value: unknown) => value,
+  });
+}
+
+describe("media on the text-only serving path (PR #430)", () => {
+  // Oracle: develop (089dbb2) had no outbound sendPayload/normalizePayload, so
+  // core took its text route. Both adapters must give the same visible result.
+  const cases: Array<[string, () => Promise<unknown>, unknown, { frames: string[]; transcript: string[] }]> = [
+    ["agent text with voice media", () => sendAs("backend", { message: TEXT, media: MEDIA, asVoice: true })
+      .then((result: any) => result.payload.deliveryStatus), "sent", { frames: [TEXT], transcript: ["voice.ogg"] }],
+    ["durable text with media and interactive", () => durableSend({ text: TEXT, mediaUrl: MEDIA, interactive: INTERACTIVE })
+      .then((result) => result.status), "sent", { frames: [TEXT], transcript: [] }],
+    ["cron text with voice media", () => cronDelivery({ text: TEXT, mediaUrl: MEDIA, audioAsVoice: true })
+      .then((result: any) => result.delivered), true, { frames: [TEXT], transcript: [TEXT] }],
+    ["agent voice media with channelData and no text", () => sendAs("backend", { media: MEDIA, asVoice: true, channelData: { extra: "metadata" } }),
+      { error: NO_TEXT_FALLBACK }, { frames: [], transcript: [] }],
+    // A bound payload never carries media from the RPC; it still falls back like core.
+    ["bound durable text with media", () => durableSend({ text: `  ${TEXT}  `, mediaUrl: MEDIA,
+      channelData: { webchannelOutboundBinding: { accountId: "other", tenant: "tenant-b", storageRoot: root } } })
+      .then((result) => result.status), "sent", { frames: [TEXT], transcript: [] }],
+    ["agent voice text the transport refuses", () => {
+      vi.spyOn(named.channel, "sendText").mockReturnValue(false);
+      return sendAs("backend", { message: TEXT, asVoice: true });
+    }, { error: "[webchannel] message.send.text failed: targeted send returned false for peer Alice" }, { frames: [], transcript: [] }],
+  ];
+  it.each(cases.flatMap(([name, run, outcome, visible]) => (["develop", "pr"] as const).map((adapter) => [name, adapter, run, outcome, visible] as const)))(
+    "serves %s with the %s adapter as develop did", async (_name, adapter, run, outcome, visible) => {
+      if (adapter === "develop") {
+        delete gatewayPlugin.outbound!.sendPayload;
+        delete gatewayPlugin.outbound!.normalizePayload;
+      }
+      activate(gatewayPlugin);
+      expect(await run().then((value) => value, (error: Error) => ({ error: error.message }))).toEqual(outcome);
+      const { frames, transcript: mirrored } = delivered();
+      expect({ frames: frames.map(({ text }) => text), transcript: mirrored }).toEqual(visible);
+      expect(requests).toEqual([]);
+    });
+});
+
+describe("media across the CLI handoff (PR #430)", () => {
+  afterEach(async () => {
+    const { clearRuntimeConfigSnapshot } = await import("openclaw/plugin-sdk/runtime-config-snapshot");
+    clearRuntimeConfigSnapshot();
+  });
+
+  it.each(["backend", "cli"] as const)("drops user media and delivers its text via %s", async (mode) => {
+    const result = await sendAs(mode, { message: TEXT, media: MEDIA });
+    expect(result.payload).toMatchObject({ via: mode === "cli" ? "gateway" : "direct", deliveryStatus: "sent" });
+    expect(requests.map(({ params }) => MEDIA_FIELDS.filter((field) => field in params))).toEqual(mode === "cli" ? [[]] : []);
+    // Accepted divergence: the handoff mirrors the delivered text, the direct path the file name.
+    expect(delivered()).toEqual({ frames: [{ type: "agent_message", text: TEXT }], transcript: [mode === "cli" ? TEXT : "voice.ogg"] });
+  });
+
+  it.each(["backend", "cli"] as const)("refuses media with only interactive blocks via %s", async (mode) => {
+    await expect(sendAs(mode, { media: MEDIA, interactive: INTERACTIVE })).rejects.toThrow(mode === "cli"
+      ? "[webchannel] outbound media is unsupported and no text fallback is available" : NO_TEXT_FALLBACK);
+    expect(requests).toEqual([]);
+    expect(delivered()).toEqual({ frames: [], transcript: [] });
+  });
+
+  it.each(["backend", "cli"] as const)("delivers the text when automatic TTS adds audio via %s", async (mode) => {
+    const { setRuntimeConfigSnapshot } = await import("openclaw/plugin-sdk/runtime-config-snapshot");
+    for (const config of [cfg, gatewayCfg]) (config as any).messages = { tts: { auto: "always", provider: "fake" } };
+    // Core TTS reads the process's runtime config snapshot, as a loaded CLI or gateway has.
+    setRuntimeConfigSnapshot(cfg);
+    const ttsRoot = "/tmp/openclaw";
+    const before = new Set(existsSync(ttsRoot) ? readdirSync(ttsRoot) : []);
+    let spoken = 0;
+    const registry = createEmptyRegistry() as any;
+    registry.channels.push({ pluginId: "webchannel", plugin: mode === "cli" ? cliPlugin : gatewayPlugin, source: "outbound-gateway-test" });
+    registry.speechProviders.push({ pluginId: "fake-tts", source: "outbound-gateway-test", provider: {
+      id: "fake", label: "Fake", isConfigured: () => true,
+      synthesize: async () => {
+        spoken++;
+        return { audioBuffer: Buffer.from("ID3fake"), outputFormat: "mp3", fileExtension: ".mp3", voiceCompatible: false };
+      },
+    } });
+    setActiveRegistry(registry);
+    try {
+      const result = await runMessageAction({ cfg, action: "send", agentId: "main",
+        gateway: mode === "cli" ? { clientName: "cli", mode: "cli" } : { clientName: "gateway-client", mode: "backend" },
+        params: { channel: "webchannel", target: `webchannel:${PEER}`, accountId: "other", message: TEXT } });
+      expect(spoken).toBe(1);
+      expect(result.payload).toMatchObject({ via: mode === "cli" ? "gateway" : "direct", deliveryStatus: "sent" });
+      expect(delivered()).toEqual({ frames: [{ type: "agent_message", text: TEXT }],
+        transcript: [mode === "cli" ? TEXT : expect.stringMatching(/^voice-\d+\.mp3$/)] });
+    } finally {
+      // Core removes its TTS temp audio only after five minutes.
+      for (const name of existsSync(ttsRoot) ? readdirSync(ttsRoot) : []) {
+        if (name.startsWith("tts-") && !before.has(name)) rmSync(join(ttsRoot, name), { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("refuses media fields on the RPC before any send", async () => {
+    activate(gatewayPlugin);
+    for (const field of MEDIA_FIELDS) {
+      await expect(rpc(rpcRequest(`media-${field}`, { [field]: field === "mediaUrls" ? [MEDIA] : MEDIA })))
+        .rejects.toThrow("[webchannel] outbound handoff does not carry media");
+    }
     expectNothingSent();
   });
 });

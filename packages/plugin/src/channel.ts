@@ -191,6 +191,7 @@ export function createWebChannelPlugin(
   const handoff = opts?.gatewayHandoff && opts.resolveServingScope && opts.resolveOutboundTransport
     ? { resolveServingScope: opts.resolveServingScope, resolveOutboundTransport: opts.resolveOutboundTransport }
     : undefined;
+  const messageAdapter = createClawMessageAdapter(transport, opts?.resolveOutboundTransport);
   return createChatChannelPlugin<ResolvedAccount, WebchannelProbe>({
     // `message` (ChannelMessageAdapter) declares our outbound text send plus the
     // `live` progress-draft capabilities. It is attached on the base object here
@@ -280,7 +281,7 @@ export function createWebChannelPlugin(
       // See src/setup-wizard.ts.
       setupWizard: webchannelSetupWizard,
     })), {
-      message: createClawMessageAdapter(transport, opts?.resolveOutboundTransport),
+      message: messageAdapter,
       // `messaging` (ChannelMessagingAdapter) names a peer for core-initiated
       // sends and mirrors them into that peer's session. It rides the same
       // base-field mechanism as `message`. See src/outbound-target.ts.
@@ -437,11 +438,11 @@ export function createWebChannelPlugin(
       base: {
         deliveryMode: "direct",
         ...(handoff ? {
-          sendPayload: createHandoffPayloadSender(handoff),
+          sendPayload: createHandoffPayloadSender(handoff, messageAdapter.send.text),
           // WebChannel sends text only. Metadata (including the handoff
           // binding) must not turn a hook-emptied payload into a blank bubble.
           // Core normalizes both before and after rendering presentation;
-          // keep it until core converts it to text. Media keeps its error path.
+          // keep it until core converts it to text. Media keeps its text fallback.
           normalizePayload: ({ payload }) =>
             payload.text?.trim() || payload.presentation || payload.mediaUrl || payload.mediaUrls?.length ? payload : null,
         } : {}),

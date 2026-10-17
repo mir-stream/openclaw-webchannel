@@ -10,10 +10,12 @@ import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/chan
 import { jsonResult } from "openclaw/plugin-sdk/channel-actions";
 import { resolveDefaultAgentId } from "openclaw/plugin-sdk/config-runtime";
 import { buildOutboundSessionContext, sendDurableMessageBatch } from "openclaw/plugin-sdk/channel-outbound";
+import type { ChannelMessageSendResult, ChannelMessageSendTextContext } from "openclaw/plugin-sdk/channel-outbound";
 import { callGatewayFromCli, ErrorCodes, errorShape } from "openclaw/plugin-sdk/gateway-runtime";
 import type { GatewayRequestHandlers } from "openclaw/plugin-sdk/gateway-runtime";
 import { normalizeInteractiveReply, normalizeMessagePresentation } from "openclaw/plugin-sdk/interactive-runtime";
 import type { InteractiveReply, MessagePresentation, ReplyPayloadDelivery } from "openclaw/plugin-sdk/interactive-runtime";
+import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
 import { recordSessionMetaFromInbound, resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
 import { resolveOutboundAccountId, type ResolveOutboundTransport } from "./outbound-account.js";
 import { requireOutboundPeerId, requireRegisteredPeer, type ResolveServingScope } from "./outbound-target.js";
@@ -23,6 +25,7 @@ import { nextMessageId } from "./message-adapter.js";
 
 export const WEBCHANNEL_SEND_METHOD = "webchannel.send";
 const BINDING_FIELD = "webchannelOutboundBinding";
+const MEDIA_FIELDS = ["media", "mediaUrl", "mediaUrls", "buffer"] as const;
 type Binding = { accountId: string; tenant: string; storageRoot: string };
 type Content = { text: string; presentation?: MessagePresentation; interactive?: InteractiveReply; delivery?: ReplyPayloadDelivery };
 type SendRequest = Binding & Content & { peerId: string; agentId: string; idempotencyKey: string };
@@ -50,7 +53,7 @@ function stringField(value: Record<string, unknown>, field: string): string {
  * them as on the direct path. The CLI drops unusable values as core does; the
  * RPC (strict) refuses them.
  */
-function readContent(fields: Record<string, unknown>, textField: string, strict: boolean): Content {
+function readContent(fields: Record<string, unknown>, textField: string, { strict = false, media = false } = {}): Content {
   const text = fields[textField] ?? "";
   const presentation = normalizeMessagePresentation(fields.presentation);
   const interactive = normalizeInteractiveReply(fields.interactive);
@@ -60,9 +63,10 @@ function readContent(fields: Record<string, unknown>, textField: string, strict:
   if (strict && fields.presentation !== undefined && !presentation) throw new Error("[webchannel] invalid outbound handoff field presentation");
   if (strict && fields.interactive !== undefined && !interactive) throw new Error("[webchannel] invalid outbound handoff field interactive");
   if (strict && fields.delivery !== undefined && !delivery) throw new Error("[webchannel] invalid outbound handoff field delivery");
-  if (typeof text !== "string" || (!text.trim() && !presentation && !interactive)) {
-    throw new Error(`[webchannel] invalid outbound handoff field ${textField}`);
-  }
+  if (typeof text !== "string") throw new Error(`[webchannel] invalid outbound handoff field ${textField}`);
+  // Core's fallback for an adapter without sendMedia needs text after rendering.
+  if (media && !text.trim() && !presentation) throw new Error("[webchannel] outbound media is unsupported and no text fallback is available");
+  if (!text.trim() && !presentation && !interactive) throw new Error(`[webchannel] invalid outbound handoff field ${textField}`);
   return { text, ...(presentation ? { presentation } : {}), ...(interactive ? { interactive } : {}), ...(delivery ? { delivery } : {}) };
 }
 
@@ -107,12 +111,15 @@ export function createOutboundHandoffActions(serving: Serving): ChannelMessageAc
       // message.action RPC does not. Refuse rather than mirror twice or recurse.
       if (serving.resolveServingScope(binding.accountId)) throw new Error("[webchannel] use the direct outbound pipeline for a running account");
       if (ctx.gateway?.mode !== "cli") throw new Error(`[webchannel] outbound account ${JSON.stringify(binding.accountId)} is not running`);
-      if (ctx.params.media || ctx.params.mediaUrl || ctx.params.mediaUrls || ctx.params.buffer) {
-        throw new Error("[webchannel] outbound media is unsupported");
-      }
+      // As on the direct path, media (including core's TTS audio) is dropped
+      // and its text delivered. Media never crosses the RPC.
+      const media = MEDIA_FIELDS.some((field) => {
+        const value = ctx.params[field];
+        return Array.isArray(value) ? value.length > 0 : Boolean(value);
+      });
       const request: SendRequest = {
         ...binding, peerId, agentId: ctx.agentId ?? resolveDefaultAgentId(ctx.cfg),
-        ...readContent(ctx.params, "message", false),
+        ...readContent(ctx.params, "message", { media }),
         idempotencyKey: typeof ctx.params.idempotencyKey === "string" && ctx.params.idempotencyKey.trim()
           ? ctx.params.idempotencyKey : randomUUID(),
       };
@@ -125,27 +132,37 @@ export function createOutboundHandoffActions(serving: Serving): ChannelMessageAc
   };
 }
 
-/** The durable payload retains its tuple, including across core queue recovery. */
-export function createHandoffPayloadSender(serving: Serving): NonNullable<ChannelOutboundAdapter["sendPayload"]> {
+/**
+ * Core sends channelData, interactive and voice payloads here rather than down
+ * its text route. Keep that route for this adapter, which has no sendMedia
+ * (deliver.ts): media falls back to trimmed text, and fails without any. An
+ * unbound payload goes to the plugin's message.send.text, as core's text route
+ * would. A bound payload retains its tuple, including across core queue
+ * recovery, and is re-checked at the send.
+ */
+export function createHandoffPayloadSender(
+  serving: Serving, sendText: (ctx: ChannelMessageSendTextContext) => Promise<ChannelMessageSendResult>,
+): NonNullable<ChannelOutboundAdapter["sendPayload"]> {
   return async (ctx) => {
-    if (ctx.payload.mediaUrl || ctx.payload.mediaUrls?.length) throw new Error("[webchannel] outbound media is unsupported");
-    const value = ctx.payload.channelData?.[BINDING_FIELD];
-    const peerId = requireOutboundPeerId(ctx.to);
-    if (value === undefined) {
-      // Preserve ordinary channelData-bearing text delivery.
-      const accountId = resolveOutboundAccountId(ctx.cfg, ctx.accountId);
-      const transport = serving.resolveOutboundTransport(accountId);
-      if (!transport) throw new Error(`[webchannel] outbound account ${JSON.stringify(accountId)} is not running`);
-      const id = nextMessageId();
-      if (!transport.sendText(peerId, ctx.text, id)) throw new Error("[webchannel] outbound send failed");
-      return { channel: "webchannel", messageId: id };
+    const parts = resolveSendableOutboundReplyParts(ctx.payload, { text: ctx.text });
+    if (parts.hasMedia && !parts.trimmedText) {
+      throw new Error("Plugin outbound adapter does not implement sendMedia and no text fallback is available for media payload");
     }
+    const text = parts.hasMedia ? parts.trimmedText : ctx.text;
+    const value = ctx.payload.channelData?.[BINDING_FIELD];
+    if (value === undefined) {
+      // ctx's callback takes core's OutboundDeliveryResult, not this adapter's
+      // ChannelMessageSendResult (core wraps it on its text route); ours never reports.
+      const sent = await sendText({ ...ctx, text, onDeliveryResult: undefined });
+      return { ...sent, channel: "webchannel", messageId: sent.messageId ?? sent.receipt.primaryPlatformMessageId ?? sent.receipt.platformMessageIds[0] ?? "" };
+    }
+    const peerId = requireOutboundPeerId(ctx.to);
     const expected = readBinding(value);
     if (ctx.accountId !== expected.accountId) throw new Error("[webchannel] outbound handoff account identity changed");
     const { transport } = servingBinding(ctx.cfg, expected, peerId, serving);
     // No await between this check and the synchronous journal/encrypted send.
     const id = nextMessageId();
-    if (!transport.sendText(peerId, ctx.text, id)) throw new Error("[webchannel] outbound send failed");
+    if (!transport.sendText(peerId, text, id)) throw new Error("[webchannel] outbound send failed");
     return { channel: "webchannel", messageId: id };
   };
 }
@@ -157,7 +174,8 @@ export function createOutboundHandoffHandler(serving: Serving): GatewayRequestHa
   return async ({ params, context, respond, client }) => {
     try {
       const fields = record(params);
-      const content = readContent(fields, "text", true);
+      if (MEDIA_FIELDS.some((field) => fields[field] !== undefined)) throw new Error("[webchannel] outbound handoff does not carry media");
+      const content = readContent(fields, "text", { strict: true });
       const request: SendRequest = {
         ...readBinding(fields), peerId: stringField(fields, "peerId"), agentId: stringField(fields, "agentId"),
         ...content, idempotencyKey: stringField(fields, "idempotencyKey"),
