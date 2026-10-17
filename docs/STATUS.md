@@ -52,6 +52,23 @@ Only execution waits for the configured fixed window, with the same retained
 count/byte budget. `/stop` cancels those accepted queued rows without declaring
 them unaccepted; restart recovers proven unstarted work with the original IDs.
 
+CLI outbound delivery (#418/#457, PR #430): non-serving CLI actions use the
+plugin's authenticated `webchannel.send` RPC. The CLI pins its exact listed
+account ID (including the selected default), peer, tenant and storage root.
+The gateway rejects a different serving tuple before delivery, derives the core
+session using its own configuration, and owns the durable send and transcript
+mirror. CLI-provided session keys are not used; the CLI creates no transcript.
+A tuple binding travels with the durable payload and is checked again at the
+synchronous send, including after runtime replacement or queue recovery.
+Agent `message` actions and cron in a serving gateway retain direct core delivery.
+Gateway outages retain core connection diagnostics; unavailable accounts and
+changed tuples have distinct errors. CLI and gateway plugin versions must be
+updated together and the gateway restarted. A remote CLI still needs the selected
+tuple's local conversation-key store (#451); offline-peer delivery is unchanged.
+See [CLI delivery](../packages/plugin/README.md#cli-outbound-delivery) and
+[TD-7](TELEGRAM_DIVERGENCES.md#td-7-cli-발신은-실행-중인-gateway를-경유한다).
+There is no client/SaaS wire protocol change.
+
 P3 reply delivery (#415 C4/C7): inbound dispatch enables the SDK reply-prefix
 pipeline, including selected-model interpolation, for answers (reasoning stays
 unprefixed). Media remains unsupported; a media-only final in a turn that

@@ -54,6 +54,56 @@ Setup keeps its existing write-ID policy. `openclaw doctor` reports an invalid
 `channels.webchannel.defaultAccount`, its selected fallback and a remedy;
 selection alone does not establish runtime availability.
 
+### CLI outbound delivery
+
+CLI sends require the gateway that owns the selected WebChannel account to be
+running. For a peer already registered with that account:
+
+```sh
+openclaw message send --channel webchannel --account other --target Alice --message "Hello"
+```
+
+The CLI resolves the target and pins the exact listed account ID, peer, tenant
+and storage root in the plugin's authenticated `webchannel.send` RPC. Omitting
+`--account` preserves the account selected by the CLI, even if the gateway has a
+different default. The gateway checks that the selected runtime serves the same
+tenant/store, then uses its NATS connection, conversation key and delivery
+journal. It derives and writes the core transcript using gateway configuration;
+the CLI writes no transcript and supplies no transcript session key.
+
+A changed tenant/store or exact account identity is rejected before delivery.
+Refresh the CLI configuration and retry after the intended account is running.
+The tuple is checked again at the actual send, so replacing a runtime while the
+request is pending cannot redirect it to a different tenant/store. Agent
+`message` actions and cron in the serving gateway keep direct core delivery.
+
+Target resolution still requires the selected tuple's local conversation-key
+store. A remote CLI without it fails before the RPC; remote-host support remains
+tracked in [#451](https://github.com/mir-stream/openclaw-webchannel/issues/451).
+Offline-peer delivery and admission requirements are unchanged.
+
+If the gateway is stopped or unreachable, core's connection diagnostics and
+`openclaw doctor` guidance are preserved. If the gateway lists the selected
+account but is not serving it, the error is `[webchannel] outbound account "<id>"
+is not running`; if its configuration does not list the account, the error is
+`[webchannel] outbound account "<id>" is not a valid listed account`. Check
+`openclaw channels status --probe` and its gateway logs. Update the plugin on both
+CLI and gateway and restart the gateway: an older gateway lacks `webchannel.send`,
+and the CLI reports that gateway's unknown-method error without falling back to
+the generic `send` RPC.
+
+As with direct sends, media is dropped and its text delivered; a send with media
+but no text to deliver is refused. The CLI's transcript records the delivered
+text, while a direct send with media records the media file name.
+
+Identical RPC requests with the same idempotency key share one result in the
+current gateway handler while the request runs and for ten minutes after it
+completes. Reusing a retained key with different content is rejected. New keys
+are refused only while 1,000 requests are in flight; at that size the handler
+first discards the oldest completed results, and retrying a discarded key sends
+again. This cache does not survive gateway restart; it does not provide a
+persistent CLI outbox or offline delivery.
+
 ## Enrollment & credentials (NATS mode)
 
 `src/enrollment-client.ts` implements plugin-side onboarding over the **RFC 8628 device flow**

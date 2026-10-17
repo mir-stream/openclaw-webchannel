@@ -29,6 +29,7 @@ import { resolveEncryptionPolicy } from "./encryption-policy.js";
 import type { WebchannelEncryptionConfig } from "./encryption-policy.js";
 import { createWebChannelPlugin } from "./channel.js";
 import { nextMessageId } from "./message-adapter.js";
+import { registerOutboundHandoff } from "./outbound-handoff.js";
 import {
   handleInboundMessage,
   startAgentLifecycleSubscription,
@@ -315,6 +316,7 @@ export function createNatsWebChannelPlugin(
   // is what inbound keyed this account's sessions and key store under.
   return createWebChannelPlugin(new NullPeerChannel(), {
     ...opts,
+    gatewayHandoff: true,
     resolveOutboundTransport: (accountId) => runtimes.get(accountId)?.channel,
     resolveApprovalTransport: (accountId) => runtimes.get(accountId ?? "default")?.channel,
     resolveServingScope: (accountId) => {
@@ -1683,6 +1685,13 @@ export default defineChannelPluginEntry({
   plugin: webChannelPlugin,
   registerFull(api) {
     if (api.registrationMode !== "full") return;
+    registerOutboundHandoff(api, {
+      resolveOutboundTransport: (accountId) => accountRuntimes.get(accountId)?.channel,
+      resolveServingScope: (accountId) => {
+        const runtime = accountRuntimes.get(accountId);
+        return runtime ? { tenant: runtime.tenant, storageRoot: runtime.storageRoot } : undefined;
+      },
+    });
     // #87: one lifecycle subscription per plugin generation, owned here so the
     // host can tear it down. `onAgentEvent` registers on a process-global
     // listener set, so without this a reload would stack a listener per
