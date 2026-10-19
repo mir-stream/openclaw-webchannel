@@ -77,6 +77,12 @@ The tuple is checked again at the actual send, so replacing a runtime while the
 request is pending cannot redirect it to a different tenant/store. Agent
 `message` actions and cron in the serving gateway keep direct core delivery.
 
+Agent `message` sends in the serving gateway now hand core the full payload, as
+on Slack and Discord. Presentation renders as fallback text (a presentation-only
+send used to deliver nothing), and delivery pin follows core: an optional pin
+only warns, and a required pin fails after delivery because WebChannel cannot
+pin. Interactive blocks are still not rendered. CLI handoffs behave the same.
+
 Target resolution still requires the selected tuple's local conversation-key
 store. A remote CLI without it fails before the RPC; remote-host support remains
 tracked in [#451](https://github.com/mir-stream/openclaw-webchannel/issues/451).
@@ -93,8 +99,9 @@ and the CLI reports that gateway's unknown-method error without falling back to
 the generic `send` RPC.
 
 As with direct sends, media is dropped and its text delivered; a send with media
-but no text to deliver is refused. The CLI's transcript records the delivered
-text, while a direct send with media records the media file name.
+but no text to deliver is refused. The handoff transcript, which the gateway
+writes, records the delivered text, while a direct send with media records the
+media file name.
 
 Identical RPC requests with the same idempotency key share one result in the
 current gateway handler while the request runs and for ten minutes after it

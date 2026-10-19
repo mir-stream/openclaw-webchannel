@@ -26,6 +26,8 @@ import { nextMessageId } from "./message-adapter.js";
 export const WEBCHANNEL_SEND_METHOD = "webchannel.send";
 const BINDING_FIELD = "webchannelOutboundBinding";
 const MEDIA_FIELDS = ["media", "mediaUrl", "mediaUrls", "buffer"] as const;
+// Core's own error for media without text on an adapter without sendMedia (deliver.ts).
+const NO_TEXT_FALLBACK = "Plugin outbound adapter does not implement sendMedia and no text fallback is available for media payload";
 type Binding = { accountId: string; tenant: string; storageRoot: string };
 type Content = { text: string; presentation?: MessagePresentation; interactive?: InteractiveReply; delivery?: ReplyPayloadDelivery };
 type SendRequest = Binding & Content & { peerId: string; agentId: string; idempotencyKey: string };
@@ -65,7 +67,7 @@ function readContent(fields: Record<string, unknown>, textField: string, { stric
   if (strict && fields.delivery !== undefined && !delivery) throw new Error("[webchannel] invalid outbound handoff field delivery");
   if (typeof text !== "string") throw new Error(`[webchannel] invalid outbound handoff field ${textField}`);
   // Core's fallback for an adapter without sendMedia needs text after rendering.
-  if (media && !text.trim() && !presentation) throw new Error("[webchannel] outbound media is unsupported and no text fallback is available");
+  if (media && !text.trim() && !presentation) throw new Error(NO_TEXT_FALLBACK);
   if (!text.trim() && !presentation && !interactive) throw new Error(`[webchannel] invalid outbound handoff field ${textField}`);
   return { text, ...(presentation ? { presentation } : {}), ...(interactive ? { interactive } : {}), ...(delivery ? { delivery } : {}) };
 }
@@ -145,9 +147,7 @@ export function createHandoffPayloadSender(
 ): NonNullable<ChannelOutboundAdapter["sendPayload"]> {
   return async (ctx) => {
     const parts = resolveSendableOutboundReplyParts(ctx.payload, { text: ctx.text });
-    if (parts.hasMedia && !parts.trimmedText) {
-      throw new Error("Plugin outbound adapter does not implement sendMedia and no text fallback is available for media payload");
-    }
+    if (parts.hasMedia && !parts.trimmedText) throw new Error(NO_TEXT_FALLBACK);
     const text = parts.hasMedia ? parts.trimmedText : ctx.text;
     const value = ctx.payload.channelData?.[BINDING_FIELD];
     if (value === undefined) {
@@ -162,7 +162,10 @@ export function createHandoffPayloadSender(
     const { transport } = servingBinding(ctx.cfg, expected, peerId, serving);
     // No await between this check and the synchronous journal/encrypted send.
     const id = nextMessageId();
-    if (!transport.sendText(peerId, text, id)) throw new Error("[webchannel] outbound send failed");
+    // Same wording as message.send.text, which serves the unbound and direct text routes.
+    if (!transport.sendText(peerId, text, id)) {
+      throw new Error(`[webchannel] message.send.text failed: targeted send returned false for peer ${peerId}`);
+    }
     return { channel: "webchannel", messageId: id };
   };
 }

@@ -9,7 +9,7 @@
 import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 
@@ -596,6 +596,14 @@ describe("structured content across the handoff (PR #430)", () => {
     expect(delivered()).toEqual({ frames: [{ type: "agent_message", text: TEXT }], transcript: [] });
   });
 
+  it.each(["backend", "cli"] as const)("surfaces a transport refusal with the same error via %s", async (mode) => {
+    vi.spyOn(named.channel, "sendText").mockReturnValue(false);
+    await expect(sendAs(mode, { message: TEXT }))
+      .rejects.toThrow(/^\[webchannel\] message\.send\.text failed: targeted send returned false for peer Alice$/);
+    expect(requests).toHaveLength(mode === "cli" ? 1 : 0);
+    expect(delivered()).toEqual({ frames: [], transcript: [] });
+  });
+
   it("binds delivery into the RPC idempotency fingerprint", async () => {
     activate(gatewayPlugin);
     const first = await rpc(rpcRequest("pinned", { delivery: { pin: { enabled: true } } }));
@@ -690,6 +698,13 @@ function cronDelivery(payload: Record<string, unknown>) {
   });
 }
 
+/** develop (089dbb2) had no actions, outbound sendPayload or normalizePayload. */
+function useDevelopAdapter() {
+  delete gatewayPlugin.actions;
+  delete gatewayPlugin.outbound!.sendPayload;
+  delete gatewayPlugin.outbound!.normalizePayload;
+}
+
 describe("media on the text-only serving path (PR #430)", () => {
   // Oracle: develop (089dbb2) had no outbound sendPayload/normalizePayload, so
   // core took its text route. Both adapters must give the same visible result.
@@ -713,14 +728,39 @@ describe("media on the text-only serving path (PR #430)", () => {
   ];
   it.each(cases.flatMap(([name, run, outcome, visible]) => (["develop", "pr"] as const).map((adapter) => [name, adapter, run, outcome, visible] as const)))(
     "serves %s with the %s adapter as develop did", async (_name, adapter, run, outcome, visible) => {
-      if (adapter === "develop") {
-        delete gatewayPlugin.outbound!.sendPayload;
-        delete gatewayPlugin.outbound!.normalizePayload;
-      }
+      if (adapter === "develop") useDevelopAdapter();
       activate(gatewayPlugin);
       expect(await run().then((value) => value, (error: Error) => ({ error: error.message }))).toEqual(outcome);
       const { frames, transcript: mirrored } = delivered();
       expect({ frames: frames.map(({ text }) => text), transcript: mirrored }).toEqual(visible);
+      expect(requests).toEqual([]);
+    });
+});
+
+describe("intentional serving-path change vs develop (PR #430)", () => {
+  // develop sent only an agent message's text and media. Like Slack and Discord,
+  // the serving path now hands core the full payload: presentation renders as
+  // fallback text and delivery pin follows core. Interactive is still not rendered.
+  type Expected = { outcome: unknown; frames: string[]; transcript: string[] };
+  const sent = (text: string, transcript = [text]): Expected => ({ outcome: "sent", frames: [text], transcript });
+  const cases: Array<[string, Record<string, unknown>, Expected, Expected]> = [
+    ["presentation only", { presentation: PRESENTATION }, { outcome: "suppressed", frames: [], transcript: [] }, sent(RENDERED)],
+    ["message and presentation", { message: "Body text", presentation: PRESENTATION }, sent("Body text"), sent(`Body text\n\n${RENDERED}`)],
+    ["message and required pin", { message: TEXT, delivery: { pin: { enabled: true, required: true } } }, sent(TEXT),
+      { outcome: { error: "Delivery pin is not supported by channel: webchannel" }, frames: [TEXT], transcript: [] }],
+    ["presentation and media without text", { presentation: PRESENTATION, media: MEDIA },
+      { outcome: { error: NO_TEXT_FALLBACK }, frames: [], transcript: [] }, sent(RENDERED, ["voice.ogg"])],
+    // Controls: unchanged.
+    ["message and interactive", { message: "Body text", interactive: INTERACTIVE }, sent("Body text"), sent("Body text")],
+    ["message and optional pin", { message: "Body text", pin: true }, sent("Body text"), sent("Body text")],
+  ];
+  it.each(cases.flatMap(([name, params, develop, pr]) => [[name, "develop", params, develop], [name, "pr", params, pr]] as const))(
+    "sends an agent message with %s through the %s adapter", async (_name, adapter, params, expected) => {
+      if (adapter === "develop") useDevelopAdapter();
+      const outcome = await sendAs("backend", params)
+        .then((result: any) => result.payload.deliveryStatus, (error: Error) => ({ error: error.message }));
+      const { frames, transcript: mirrored } = delivered();
+      expect({ outcome, frames: frames.map(({ text }) => text), transcript: mirrored }).toEqual(expected);
       expect(requests).toEqual([]);
     });
 });
@@ -740,8 +780,7 @@ describe("media across the CLI handoff (PR #430)", () => {
   });
 
   it.each(["backend", "cli"] as const)("refuses media with only interactive blocks via %s", async (mode) => {
-    await expect(sendAs(mode, { media: MEDIA, interactive: INTERACTIVE })).rejects.toThrow(mode === "cli"
-      ? "[webchannel] outbound media is unsupported and no text fallback is available" : NO_TEXT_FALLBACK);
+    await expect(sendAs(mode, { media: MEDIA, interactive: INTERACTIVE })).rejects.toThrow(new RegExp(`^${NO_TEXT_FALLBACK}$`));
     expect(requests).toEqual([]);
     expect(delivered()).toEqual({ frames: [], transcript: [] });
   });
@@ -751,16 +790,21 @@ describe("media across the CLI handoff (PR #430)", () => {
     for (const config of [cfg, gatewayCfg]) (config as any).messages = { tts: { auto: "always", provider: "fake" } };
     // Core TTS reads the process's runtime config snapshot, as a loaded CLI or gateway has.
     setRuntimeConfigSnapshot(cfg);
-    const ttsRoot = "/tmp/openclaw";
-    const before = new Set(existsSync(ttsRoot) ? readdirSync(ttsRoot) : []);
+    // Core writes TTS audio under its preferred temp root, /tmp/openclaw or a
+    // per-user os.tmpdir() fallback, with no override (tmp-openclaw-dir.ts).
+    const ttsRoots = ["/tmp/openclaw", join(tmpdir(), `openclaw-${process.getuid?.()}`)];
+    const listed = () => ttsRoots.flatMap((dir) => existsSync(dir) ? readdirSync(dir).map((name) => join(dir, name)) : []);
+    const before = new Set(listed());
+    const audio = Buffer.from("ID3fake outbound-gateway.test");
     let spoken = 0;
+    let removed = 0;
     const registry = createEmptyRegistry() as any;
     registry.channels.push({ pluginId: "webchannel", plugin: mode === "cli" ? cliPlugin : gatewayPlugin, source: "outbound-gateway-test" });
     registry.speechProviders.push({ pluginId: "fake-tts", source: "outbound-gateway-test", provider: {
       id: "fake", label: "Fake", isConfigured: () => true,
       synthesize: async () => {
         spoken++;
-        return { audioBuffer: Buffer.from("ID3fake"), outputFormat: "mp3", fileExtension: ".mp3", voiceCompatible: false };
+        return { audioBuffer: audio, outputFormat: "mp3", fileExtension: ".mp3", voiceCompatible: false };
       },
     } });
     setActiveRegistry(registry);
@@ -773,11 +817,20 @@ describe("media across the CLI handoff (PR #430)", () => {
       expect(delivered()).toEqual({ frames: [{ type: "agent_message", text: TEXT }],
         transcript: [mode === "cli" ? TEXT : expect.stringMatching(/^voice-\d+\.mp3$/)] });
     } finally {
-      // Core removes its TTS temp audio only after five minutes.
-      for (const name of existsSync(ttsRoot) ? readdirSync(ttsRoot) : []) {
-        if (name.startsWith("tts-") && !before.has(name)) rmSync(join(ttsRoot, name), { recursive: true, force: true });
+      // Core keeps TTS audio for five minutes. Remove only this test's own audio,
+      // never a concurrent worker's: new tts-* dirs holding exactly these bytes.
+      for (const dir of listed()) {
+        if (before.has(dir) || !basename(dir).startsWith("tts-")) continue;
+        try {
+          if (!readdirSync(dir).some((file) => readFileSync(join(dir, file)).equals(audio))) continue;
+        } catch {
+          continue;
+        }
+        rmSync(dir, { recursive: true, force: true });
+        removed++;
       }
     }
+    expect(removed).toBe(1);
   });
 
   it("refuses media fields on the RPC before any send", async () => {

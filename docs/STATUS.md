@@ -60,7 +60,9 @@ session using its own configuration, and owns the durable send and transcript
 mirror. CLI-provided session keys are not used; the CLI creates no transcript.
 A tuple binding travels with the durable payload and is checked again at the
 synchronous send, including after runtime replacement or queue recovery.
-Agent `message` actions and cron in a serving gateway retain direct core delivery.
+Agent `message` actions and cron in a serving gateway retain direct core delivery,
+but agent `message` sends now pass core's full payload: presentation renders as
+fallback text and delivery pin follows core (interactive is still not rendered).
 Gateway outages retain core connection diagnostics; unavailable accounts and
 changed tuples have distinct errors. CLI and gateway plugin versions must be
 updated together and the gateway restarted. A remote CLI still needs the selected

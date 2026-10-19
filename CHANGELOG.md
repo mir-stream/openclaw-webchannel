@@ -115,9 +115,12 @@
 
 - **CLI WebChannel sends use a plugin-owned gateway handoff (#418/#457).**
   The CLI fixes the selected account and expected tenant/store; the gateway
-  rejects identity drift and owns delivery and the core transcript, rendering
-  and applying the same structured content (presentation, interactive,
-  delivery) as direct sends. Agent and cron sends remain direct. CLI/gateway
+  rejects identity drift and owns delivery and the core transcript. Agent and
+  cron sends remain direct, but serving agent `message` sends now pass core's
+  full payload: presentation renders as fallback text instead of being dropped
+  (presentation-only sends used to deliver nothing), and delivery pin follows
+  core (an optional pin warns; a required pin fails after delivery).
+  Interactive is still not rendered. The CLI handoff matches. CLI/gateway
   plugin updates and a gateway restart are required. Gateway diagnostics are
   preserved; client/SaaS wire unchanged.
 
